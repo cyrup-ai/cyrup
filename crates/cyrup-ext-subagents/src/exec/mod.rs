@@ -2288,6 +2288,26 @@ async fn drive_attempt(
 // run_sync: the model-fallback attempt loop, wired end to end (arch-SA §6.3.2)
 // ================================================================================================
 
+/// [`run_sync`]'s step 2 (R-SA-023): the effective acceptance contract for this run.
+///
+/// A named function rather than an inline expression because it is the SINGLE seam at which an
+/// explicit, caller-supplied contract meets the heuristically-inferred one, and the rule joining
+/// them is upstream's, not this crate's: pi `resolveEffectiveAcceptance` takes
+/// `max(explicitLevel, inferred.level)` by rank (`runs/shared/acceptance.ts:277-281` @v0.34.0),
+/// so an explicit level may only RAISE the inferred floor. This seam used to read
+/// `opts.acceptance.clone().unwrap_or_else(|| AcceptanceContract::heuristic_default(...))` —
+/// explicit and inferred were mutually exclusive, so `acceptance: "attested"` on a write-capable
+/// task ran a weaker gate than the same policy does under pi, silently. The combination rule
+/// itself lives on [`AcceptanceContract::resolve_effective`]; this function only supplies
+/// `run_sync`'s three inputs to it.
+fn resolve_run_acceptance(
+    opts: &RunOptions,
+    agent: &AgentConfig,
+    task: &str,
+) -> AcceptanceContract {
+    AcceptanceContract::resolve_effective(opts.acceptance.clone(), &agent.name, task)
+}
+
 /// Run one subagent task to completion, synchronously, against `agent`/`opts` (func-SA §5.2;
 /// arch-SA §6.3.2).
 ///
@@ -2306,8 +2326,8 @@ async fn drive_attempt(
 ///    spawns nothing.
 /// 1. R-SA-025: file-only output mode requires an output path — fail fast, before any subprocess
 ///    is spawned, if violated.
-/// 2. Resolve the effective acceptance contract (explicit `opts.acceptance`, or
-///    [`AcceptanceContract::heuristic_default`], R-SA-023).
+/// 2. Resolve the effective acceptance contract — `max(explicit opts.acceptance,
+///    [`AcceptanceContract::heuristic_default`])` via [`resolve_run_acceptance`], R-SA-023.
 /// 3. R-SA-038: build the model-fallback candidate ladder.
 /// 4. Drive [`fallback::run_fallback_ladder`] against a [`SpawnedChildAttemptRunner`] — every
 ///    candidate model gets a FRESH real child OS process (R-SA-039); R-SA-036 (timeout)/R-SA-037
@@ -2409,10 +2429,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     }
 
     // Step 2 (R-SA-023): resolve the effective acceptance contract.
-    let contract = opts
-        .acceptance
-        .clone()
-        .unwrap_or_else(|| AcceptanceContract::heuristic_default(&agent.name, task));
+    let contract = resolve_run_acceptance(opts, agent, task);
 
     // Step 3 (R-SA-038).
     // SUBA-003: pi passes `{ scope: options.modelScope }` here (`execution.ts:1065-1070`), which
@@ -4336,6 +4353,48 @@ mod tests {
         assert_eq!(cfg.skills, vec!["accessibility".to_string()]);
         // The depth is the caller-stamped live envelope, not a plan-time value.
         assert_eq!(cfg.depth, live_depth);
+    }
+
+    // ---- run_sync step 2: the effective contract is max(explicit, inferred) (R-SA-023) ----
+
+    /// The seam itself, not just the rule it delegates to: `run_sync` must combine
+    /// `opts.acceptance` with the inferred contract rather than let it replace it. Pre-fix this
+    /// step read `opts.acceptance.clone().unwrap_or_else(|| heuristic_default(..))`, so the
+    /// explicit `attested` below would have reached the gate verbatim — weaker than the `checked`
+    /// pi resolves for the same policy on the same task
+    /// (`runs/shared/acceptance.ts:277-281` @v0.34.0).
+    #[test]
+    fn run_sync_resolves_an_explicit_acceptance_level_as_a_floor_over_the_inferred_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+
+        // A wire-lowered `acceptance: "attested"` (a floor, never a disable).
+        opts.acceptance = Some(AcceptanceContract::explicit_floor(
+            AcceptanceStatus::Attested,
+            vec![],
+        ));
+        let contract = resolve_run_acceptance(&opts, &agent, "Implement the fix");
+        assert_eq!(
+            contract.required_level,
+            AcceptanceStatus::Checked,
+            "the inferred `checked` floor must win over the explicit `attested`"
+        );
+        assert!(contract.explicit, "R-SA-033's correction stays armed");
+
+        // No explicit policy at all: pi's `auto` — the inferred contract, unchanged.
+        opts.acceptance = None;
+        assert_eq!(
+            resolve_run_acceptance(&opts, &agent, "Implement the fix").required_level,
+            AcceptanceStatus::Checked
+        );
+
+        // An in-Rust `NotRequired` contract still disables the gate outright.
+        opts.acceptance = Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            vec![],
+        ));
+        assert!(resolve_run_acceptance(&opts, &agent, "Implement the fix").is_no_op());
     }
 
     // ---- run_sync: depth guard runs first, before anything else (R-SA-055, SAFETY-CRITICAL) ----

@@ -526,7 +526,8 @@ impl AgentSessionRuntime {
     }
 
     /// Import a session JSONL file and switch the runtime to it (Pi `importFromJsonl`,
-    /// agent-session-runtime.ts:353-388). The file is copied into the factory's sessions dir, the
+    /// agent-session-runtime.ts:353-388). The file is copied into the ACTIVE session's own session
+    /// directory (Pi `sessionManager.getSessionDir()`, :367 — the per-cwd dir, not the root), the
     /// `session_before_switch` veto is offered, the imported session's cwd is asserted to exist, and
     /// the runtime is replaced via the standard teardown→install protocol. Errors with
     /// [`SessionServiceError::ImportFileNotFound`] when the source path does not exist.
@@ -539,7 +540,26 @@ impl AgentSessionRuntime {
         if !resolved.exists() {
             return Err(SessionServiceError::ImportFileNotFound(resolved.display().to_string()));
         }
-        let session_dir = self.factory.session_dir();
+        // Pi copies into `this.session.sessionManager.getSessionDir()`
+        // (agent-session-runtime.ts:367) — the LIVE manager's OWN directory, which in the default
+        // layout is the per-cwd `<root>/--<enc-cwd>--` (`getDefaultSessionDirPath`,
+        // session-manager.ts:484,999-1000) and only equals the sessions root when `--session-dir`
+        // pinned it there. Copying into the root instead would make the imported session invisible
+        // to every listing path: `listing::list` scans `layout.dir()` (listing.rs:43-45) and
+        // `list_all` only descends into the per-project subdirectories (listing.rs:76-83).
+        //
+        // cyrup's `SessionManager` does not retain its `SessionLayout`, so the live session's
+        // directory is read off its own file — identical by construction on both sides: a created
+        // session's file is `layout.dir()/<ts>_<uuid>.jsonl`, and an opened one derives its dir from
+        // exactly that parent (Pi `SessionManager.open`, session-manager.ts:1548).
+        let current = self.session().await;
+        let current_file = current.session_file().await;
+        let session_dir = match current_file.as_deref().and_then(Path::parent) {
+            Some(dir) => dir.to_path_buf(),
+            // A non-persisted session has no file to read a directory off (Pi's in-memory manager
+            // still carries one); fall back to the factory's configured sessions dir.
+            None => self.factory.session_dir(),
+        };
         std::fs::create_dir_all(&session_dir)
             .map_err(|e| SessionServiceError::Io(e.to_string()))?;
         let file_name = resolved
@@ -547,12 +567,11 @@ impl AgentSessionRuntime {
             .ok_or_else(|| SessionServiceError::ImportFileNotFound(resolved.display().to_string()))?;
         let destination = session_dir.join(file_name);
 
-        let current = self.session().await;
         let target_id = destination.display().to_string();
         if self.vetoed(&current, HostEvent::SessionBeforeSwitch { target_id }).await {
             return Ok(SwitchResult { cancelled: true });
         }
-        let previous = current.session_file().await.map(|p| p.display().to_string());
+        let previous = current_file.map(|p| p.display().to_string());
         drop(current);
 
         // Copy the source into the sessions dir (skip when it is already the destination).

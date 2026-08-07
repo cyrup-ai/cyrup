@@ -920,29 +920,74 @@ impl PermissionSystemExtension {
         }
     }
 
-    /// Prompt the human for a bespoke `message` (the skill-read + external-dir asks, which manage their
-    /// own persistence — no dedup/`Always` tail): the pi `canResolveAskPermissionRequest` fail-fast
-    /// pre-check (`yolo-mode.ts:21-23`, consulted via `canRequestPermissionConfirmation` BEFORE any
-    /// prompt/lock work at `index.ts:2263,2351,2452`) — `hasUI || isSubagent || yoloMode` — then yolo
-    /// auto-approve (pi `shouldAutoApprovePermissionState`), the C3 human-interaction lock, the
-    /// live-vs-fallback channel selection, and the P-3 dispatch-budget-forgiveness guard held across
-    /// the BLOCKING dialog — the SAME machinery [`Self::resolve_ask`] uses. `AskOutcome::NoLiveChannel`
-    /// = fail-CLOSED (no reachable human), returned IMMEDIATELY by the pre-check when none of the three
-    /// conditions hold — zero lock/dialog work touched, exactly like pi's early return.
+    /// Remember a resolved decision under `key` (pi `rememberPermissionPromptDecision`,
+    /// `index.ts:1890-1892`) so an identical re-emission reuses it instead of re-prompting. A `None`
+    /// key is pi's uncacheable case (empty `requestId`, `createPermissionPromptCacheKey`
+    /// `index.ts:728-737`) — nothing is stored.
+    fn remember_prompt_decision(&self, key: Option<&String>, decision: &PermissionPromptDecision) {
+        if let Some(k) = key {
+            guard(&self.dedup).remember(k, decision.clone());
+        }
+    }
+
+    /// pi `promptPermission` (`index.ts:1794-1902`), the shared prompting core EVERY ask surface goes
+    /// through: the dedup cache, then the `canResolveAskPermissionRequest` fail-fast pre-check
+    /// (`yolo-mode.ts:21-23`, consulted via `canRequestPermissionConfirmation` BEFORE any prompt/lock
+    /// work at `index.ts:2263,2351,2452`) — `hasUI || isSubagent || yoloMode` — then yolo auto-approve
+    /// (pi `shouldAutoApprovePermissionState`), the C3 human-interaction lock, the live-vs-fallback
+    /// channel selection, and the P-3 dispatch-budget-forgiveness guard held across the BLOCKING
+    /// dialog. `AskOutcome::NoLiveChannel` = fail-CLOSED (no reachable human), returned IMMEDIATELY by
+    /// the pre-check when none of the three conditions hold — zero lock/dialog work touched, exactly
+    /// like pi's early return.
     ///
-    /// Also emits pi `promptPermission`'s four audit entries (`index.ts:1820,1843,1855-1857`):
-    /// `permission_request.auto_approved` (yolo), `.waiting` (before the dialog opens) and
-    /// `.approved`/`.denied` (after the human answers). `details` is pi's `PermissionPromptDetails`
-    /// — `details.message` IS the prompt text, so this takes the record rather than a bare string.
+    /// The DEDUP cache lives here, not in any one caller, because pi puts it inside `promptPermission`
+    /// itself (`index.ts:1798-1815` lookup, `:1890-1892` store): all three ask surfaces — skill-read
+    /// (`index.ts:2282`), external-directory (`:2369`) and the main check (`:2469`) — are therefore
+    /// deduplicated identically, so a re-emitted IDENTICAL `tool_call` renders ZERO additional prompts
+    /// on ANY of them (`tests/edit-decision-deduplication-red.test.ts` is upstream's regression proof).
+    ///
+    /// Also emits pi `promptPermission`'s five audit entries (`index.ts:1805,1820,1843,1855-1857`):
+    /// `permission_request.duplicate_reused` (cache hit), `.auto_approved` (yolo), `.waiting` (before
+    /// the dialog opens) and `.approved`/`.denied` (after the human answers). `details` is pi's
+    /// `PermissionPromptDetails` — `details.message` IS the prompt text, so this takes the record
+    /// rather than a bare string, and is also what the cache key is fingerprinted from.
     async fn prompt_decision(&self, details: &DedupDetails, ctx: &HostCtx) -> AskOutcome {
         let message = details.message.as_str();
         let yolo_mode = guard(&self.config).yolo_mode;
         if !(ctx.has_ui || is_subagent_child() || yolo_mode) {
             // The caller's `confirmation_unavailable` entry covers this branch (pi audits it at
             // each of its three `canRequestPermissionConfirmation` sites, not inside
-            // `promptPermission`).
+            // `promptPermission`). Ordered BEFORE the cache lookup to match pi, whose callers run
+            // `canRequestPermissionConfirmation` before ever entering `promptPermission`.
             return AskOutcome::NoLiveChannel;
         }
+
+        // Dedup hit: reuse the prior decision (collapsed to Allow-Once by `create_duplicate_decision`,
+        // so a re-emitted approval never re-persists an `Always` grant) — zero additional prompts.
+        let key = details.cache_key();
+        if let Some(k) = &key {
+            let cached = guard(&self.dedup).get(k);
+            if let Some(decision) = cached {
+                // pi `index.ts:1804-1812`: a reused decision is STILL audited — otherwise a
+                // re-emitted tool call looks like it was never gated at all.
+                self.review_permission_decision(
+                    "permission_request.duplicate_reused",
+                    details,
+                    json!({
+                        "resolution": decision_state_str(decision.state),
+                        "denialReason": decision.denial_reason,
+                        "denialReasonMetadata":
+                            crate::logging::sensitive_log_metadata(decision.denial_reason.as_deref()),
+                        "decisionPersistence": "none",
+                        "approvalPersistence": "none",
+                        "decisionScope": Self::permission_decision_scope(details),
+                    }),
+                );
+                self.logger.flush();
+                return AskOutcome::Decided(decision);
+            }
+        }
+
         if yolo_mode {
             // pi `index.ts:1820-1826`.
             self.review_permission_decision(
@@ -955,11 +1000,16 @@ impl PermissionSystemExtension {
                 }),
             );
             self.logger.flush();
-            return AskOutcome::Decided(PermissionPromptDecision {
+            let decision = PermissionPromptDecision {
                 approved: true,
                 state: PermissionDecisionState::Approved,
                 denial_reason: None,
-            });
+            };
+            // pi caches the yolo auto-approval too: `rememberPermissionPromptDecision`
+            // (`index.ts:1890`) is handed the SAME `decisionPromise` whose body took the
+            // `shouldAutoApprovePermissionState` early return at `:1817-1841`.
+            self.remember_prompt_decision(key.as_ref(), &decision);
+            return AskOutcome::Decided(decision);
         }
         // pi `index.ts:1843` — recorded BEFORE the dialog opens, so a session killed mid-prompt
         // still leaves evidence of what was asked.
@@ -997,15 +1047,20 @@ impl PermissionSystemExtension {
                     "approvalScope": if d.approved && always { scope.clone() } else { Value::Null },
                 }),
             );
+            // pi `index.ts:1890-1892` — the resolved decision enters the cache, so the NEXT identical
+            // request (same `toolCallId` + same fingerprint) short-circuits at the lookup above.
+            self.remember_prompt_decision(key.as_ref(), d);
         }
         outcome
     }
 
-    /// The main-check `ask` branch (pi `:2444-2496` + `promptPermission :1794-1902` + `confirmPermission
-    /// :1506-1513`): dedup → the shared [`Self::prompt_decision`] core (yolo → C3 human-interaction lock
-    /// → live dialog under a P-3 budget-forgiveness guard) → fail-CLOSED when no human is reachable →
-    /// remember + apply (the `Always` session-persist tail). The prompt subject now names the resolved
-    /// persona (real `agent_name`, pi `formatAskPrompt(check, agentName, input)`).
+    /// The main-check `ask` branch (pi `:2444-2496` + `confirmPermission :1506-1513`): the shared
+    /// [`Self::prompt_decision`] core (pi `promptPermission :1794-1902` — dedup lookup → yolo → C3
+    /// human-interaction lock → live dialog under a P-3 budget-forgiveness guard → dedup store) →
+    /// fail-CLOSED when no human is reachable → apply (the `Always` session-persist tail). The prompt
+    /// subject names the resolved persona (real `agent_name`, pi `formatAskPrompt(check, agentName,
+    /// input)`). Dedup is NOT done here: pi keeps it inside `promptPermission` so every ask surface
+    /// shares it, and cyrup follows (see [`Self::prompt_decision`]).
     async fn resolve_ask(
         &self,
         call_id: &str,
@@ -1016,37 +1071,12 @@ impl PermissionSystemExtension {
         let agent_name = self.agent_name.as_deref();
 
         let details = dedup_details(call_id, input, check, agent_name);
-        let key = details.cache_key();
-
-        // Dedup hit: reuse the prior decision (collapsed to Allow-Once) — zero additional prompts.
-        if let Some(k) = &key {
-            let cached = guard(&self.dedup).get(k);
-            if let Some(decision) = cached {
-                // pi `index.ts:1804-1812`: a reused decision is STILL audited — otherwise a
-                // re-emitted tool call looks like it was never gated at all.
-                self.review_permission_decision(
-                    "permission_request.duplicate_reused",
-                    &details,
-                    json!({
-                        "resolution": decision_state_str(decision.state),
-                        "denialReason": decision.denial_reason,
-                        "denialReasonMetadata":
-                            crate::logging::sensitive_log_metadata(decision.denial_reason.as_deref()),
-                        "decisionPersistence": "none",
-                        "approvalPersistence": "none",
-                        "decisionScope": Self::permission_decision_scope(&details),
-                    }),
-                );
-                self.logger.flush();
-                return self.apply_decision(decision, check, input);
-            }
-        }
 
         // pi `formatAskPrompt` (`index.ts:570-590`) — the human-facing prompt (NOT the headless reason).
-        // The shared prompting core applies yolo auto-approve (pi `shouldAutoApprovePermissionState`),
-        // the C3 human lock, the live-vs-fallback channel, and the P-3 dispatch-budget guard.
-        // `details.message` already IS `format_ask_prompt(check, agent_name, input)` (built by
-        // `dedup_details` above), which is what `prompt_decision` prompts with.
+        // The shared prompting core applies the dedup cache, yolo auto-approve (pi
+        // `shouldAutoApprovePermissionState`), the C3 human lock, the live-vs-fallback channel, and the
+        // P-3 dispatch-budget guard. `details.message` already IS `format_ask_prompt(check, agent_name,
+        // input)` (built by `dedup_details` above), which is what `prompt_decision` prompts with.
         let decision = match self.prompt_decision(&details, ctx).await {
             AskOutcome::Decided(d) => d,
             // Fail-CLOSED: no reachable human (headless / no live UI) → Block, never proceed
@@ -1062,9 +1092,6 @@ impl PermissionSystemExtension {
             }
         };
 
-        if let Some(k) = &key {
-            guard(&self.dedup).remember(k, decision.clone());
-        }
         // pi `index.ts:2481-2494`: audit the SESSION persist an approved-Always produces (only when
         // a real subject was recorded), then `flush()`.
         if decision.approved && decision.state == PermissionDecisionState::Always {

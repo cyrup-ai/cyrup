@@ -10,6 +10,7 @@
 //! stays here (it needs a real terminal and is not unit-tested).
 
 use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -1025,14 +1026,50 @@ fn session_list_layout(dirs: &ConfigDirs) -> SessionLayout {
     }
 }
 
+/// Pi's shared-directory cwd filter for the LOCAL listing:
+/// `const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd)`
+/// (`SessionManager.list`, session-manager.ts:1639-1640), applied as
+/// `.filter((session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd))` (:1641-1643).
+/// A custom `--session-dir` may hold SEVERAL projects' sessions in one flat directory, so the local
+/// listing must keep only this cwd's; the cwd-encoded default already isolates by cwd, so it never
+/// filters — and an explicit dir that happens to BE the cwd-encoded default is likewise not filtered
+/// (Pi compares the resolved paths, not just "was it explicit"). This is the same predicate the
+/// CONTINUE path computes for `continue_recent_filtered` (`SessionServiceBuilder::build`,
+/// builder.rs:576-583; Pi `continueRecent`, session-manager.ts:1558-1559).
+fn session_list_cwd_filter(dirs: &ConfigDirs) -> Option<&Path> {
+    if !dirs.session_dir_explicit {
+        return None;
+    }
+    let default_dir = SessionLayout::new(dirs.agent_dir.join("sessions"), dirs.cwd.clone()).dir();
+    (dirs.session_dir != default_dir).then_some(dirs.cwd.as_path())
+}
+
+/// The cross-project listing, mirroring Pi's TWO `SessionManager.listAll` overloads
+/// (session-manager.ts:1653-1655). With a custom `sessionDir` it degenerates to
+/// `listSessionsFromDir(customSessionDir)` — that ONE directory, newest-first, no cross-project walk
+/// and (unlike `list`) no cwd filter, so the picker can still reach another project's session parked
+/// in the shared dir (session-manager.ts:1660-1665). Without one it walks every project directory
+/// under the sessions root (:1667+). Handing an explicit `--session-dir` to the root walk instead
+/// would scan its SUBdirectories and return nothing for a flat shared dir.
+fn list_global_sessions(dirs: &ConfigDirs) -> Vec<SessionInfo> {
+    if dirs.session_dir_explicit {
+        // Pi's `listAll(sessionDir)` overload — an unfiltered single-directory scan, i.e.
+        // `cyrup_session::listing::list_all_in_dir`, which is `list_in_dir(dir, None, …)`.
+        list_in_dir(&dirs.session_dir, None, None)
+    } else {
+        list_all(&SessionsRoot(dirs.session_dir.clone()))
+    }
+}
+
 /// Scan the cwd's local session listing and the global cross-project listing into a merged
 /// [`SessionInfo`] vector (locals first, globals de-duplicated by path) for the `--resume` picker (Pi
-/// `selectSession`'s `current`/`all` `SessionsLoader`s, session-picker.ts:23-25).
+/// `selectSession`'s `current`/`all` `SessionsLoader`s, session-picker.ts:23-25 — fed by
+/// `SessionManager.list(cwd, sessionDir, onProgress)` / `SessionManager.listAll(sessionDir,
+/// onProgress)`, main.ts:372-373).
 fn gather_session_infos(dirs: &ConfigDirs) -> Vec<SessionInfo> {
-    let root = dirs.session_dir.clone();
     let layout = session_list_layout(dirs);
-    let mut sessions = list_in_dir(&layout.dir(), None, None);
-    for global in list_all(&SessionsRoot(root)) {
+    let mut sessions = list_in_dir(&layout.dir(), session_list_cwd_filter(dirs), None);
+    for global in list_global_sessions(dirs) {
         if !sessions.iter().any(|s| s.path == global.path) {
             sessions.push(global);
         }
@@ -1041,15 +1078,14 @@ fn gather_session_infos(dirs: &ConfigDirs) -> Vec<SessionInfo> {
 }
 
 /// Scan the cwd's session listing and the global cross-project listing into [`SessionRef`]s (Pi
-/// `SessionManager.list(cwd, sessionDir)` + `SessionManager.listAll(sessionDir)`, main.ts:169,179).
+/// `SessionManager.list(cwd, sessionDir)` + `SessionManager.listAll(sessionDir)`, main.ts:218,227).
 fn gather_session_refs(dirs: &ConfigDirs) -> (Vec<SessionRef>, Vec<SessionRef>) {
-    let root = dirs.session_dir.clone();
     let layout = session_list_layout(dirs);
-    let locals: Vec<SessionRef> = list_in_dir(&layout.dir(), None, None)
+    let locals: Vec<SessionRef> = list_in_dir(&layout.dir(), session_list_cwd_filter(dirs), None)
         .iter()
         .map(SessionRef::from)
         .collect();
-    let globals: Vec<SessionRef> = list_all(&SessionsRoot(root))
+    let globals: Vec<SessionRef> = list_global_sessions(dirs)
         .iter()
         .map(SessionRef::from)
         .collect();
@@ -1775,6 +1811,115 @@ mod tests {
 
         // An empty scope yields nothing to pick.
         assert!(pick_scoped_active_model(&[], Some("openai"), Some("gpt-4o")).is_none());
+    }
+
+    /// A flat, shared `--session-dir` holding two projects' sessions must list like Pi:
+    ///
+    /// * the LOCAL listing applies `filterCwd` — `sessionDir !== undefined && dir !==
+    ///   getDefaultSessionDirPath(cwd)` → `sessionCwdMatches` (`SessionManager.list`,
+    ///   session-manager.ts:1639-1643) — so only THIS cwd's sessions appear as "current project";
+    /// * the GLOBAL listing takes Pi's `listAll(sessionDir)` overload — `listSessionsFromDir(
+    ///   customSessionDir)` over that one directory, no cross-project walk, no cwd filter
+    ///   (session-manager.ts:1654,1660-1665) — so the other project's session is still reachable
+    ///   (and reported as "found in a different project", main.ts:227-232).
+    ///
+    /// Before this was wired, both listing paths passed `None` for the cwd filter and handed the
+    /// explicit dir to the cross-project root walk, which scans SUBdirectories: locals leaked the
+    /// foreign session and globals came back empty.
+    #[test]
+    fn shared_session_dir_filters_locals_and_lists_globals_flat_like_pi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let shared = root.join("shared-sessions");
+        let here = root.join("project-here");
+        let other = root.join("project-other");
+        for d in [&shared, &here, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        write_session(&shared, "11111111-1111-7111-8111-111111111111", &here);
+        write_session(&shared, "22222222-2222-7222-8222-222222222222", &other);
+
+        let dirs = config_dirs(&root, shared.clone(), true, here.clone());
+        let (locals, globals) = super::gather_session_refs(&dirs);
+
+        let local_ids: Vec<&str> = locals.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            local_ids,
+            vec!["11111111-1111-7111-8111-111111111111"],
+            "a shared --session-dir must list only THIS cwd's sessions locally (Pi filterCwd)"
+        );
+
+        let mut global_ids: Vec<&str> = globals.iter().map(|s| s.id.as_str()).collect();
+        global_ids.sort_unstable();
+        assert_eq!(
+            global_ids,
+            vec![
+                "11111111-1111-7111-8111-111111111111",
+                "22222222-2222-7222-8222-222222222222"
+            ],
+            "Pi's listAll(sessionDir) overload scans the custom dir itself, unfiltered"
+        );
+
+        // The merged `--resume` listing keeps both, locals first, de-duplicated by path.
+        let infos = super::gather_session_infos(&dirs);
+        assert_eq!(infos.len(), 2, "merged picker listing de-duplicates by path");
+        assert_eq!(
+            infos.first().map(|i| i.cwd.clone()),
+            Some(here.to_string_lossy().into_owned()),
+            "the cwd-filtered locals come first in the merged listing"
+        );
+    }
+
+    /// The DEFAULT (cwd-encoded) session dir must keep its old behavior: `sessionDir === undefined`
+    /// ⇒ `filterCwd` is false and `listAll()` walks every project directory under the root
+    /// (session-manager.ts:1640,1667+). The encoded layout already isolates by cwd.
+    #[test]
+    fn default_session_dir_walks_projects_and_never_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let agent_dir = root.join("agent");
+        let here = root.join("project-here");
+        let other = root.join("project-other");
+        for d in [&here, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let sessions_root = agent_dir.join("sessions");
+        let here_dir = super::SessionLayout::new(sessions_root.clone(), here.clone()).dir();
+        let other_dir = super::SessionLayout::new(sessions_root, other.clone()).dir();
+        std::fs::create_dir_all(&here_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        write_session(&here_dir, "33333333-3333-7333-8333-333333333333", &here);
+        write_session(&other_dir, "44444444-4444-7444-8444-444444444444", &other);
+
+        let dirs = config_dirs(&root, agent_dir.join("sessions"), false, here.clone());
+        let (locals, globals) = super::gather_session_refs(&dirs);
+        assert_eq!(locals.len(), 1, "the encoded dir holds only this cwd's session");
+        assert_eq!(globals.len(), 2, "listAll() walks every project dir under the root");
+    }
+
+    /// One session file: a v3 header line, which is all the listing scanner needs.
+    fn write_session(dir: &std::path::Path, id: &str, cwd: &std::path::Path) {
+        let line = format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n",
+            cwd.to_string_lossy()
+        );
+        std::fs::write(dir.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl")), line).unwrap();
+    }
+
+    fn config_dirs(
+        root: &std::path::Path,
+        session_dir: std::path::PathBuf,
+        session_dir_explicit: bool,
+        cwd: std::path::PathBuf,
+    ) -> cyrup_config::ConfigDirs {
+        cyrup_config::ConfigDirs {
+            agent_dir: root.join("agent"),
+            session_dir,
+            session_dir_explicit,
+            package_dir: root.join("agent").join("packages"),
+            cwd,
+            home: root.to_path_buf(),
+        }
     }
 
     #[test]

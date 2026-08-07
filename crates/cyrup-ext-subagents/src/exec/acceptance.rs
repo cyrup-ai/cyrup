@@ -253,6 +253,26 @@ pub struct AcceptanceContract {
     /// module has no reviewer-dispatch mechanism of its own; it only consumes one a caller
     /// already obtained).
     pub reviewer_result: Option<ReviewerResult>,
+    /// Whether this contract may turn the gate OFF outright, or is merely a FLOOR that the
+    /// heuristically-inferred level can still raise (pi `explicitAcceptanceCanDisable`,
+    /// `runs/shared/acceptance.ts:134-136` @v0.34.0: `explicit.level === "none" && typeof
+    /// explicit.reason === "string" && explicit.reason.trim().length > 0`).
+    ///
+    /// Upstream, only a `level: "none"` that ALSO carries a non-blank `reason` — or the `false`
+    /// shorthand, which `normalizeAcceptanceInput` (`:127-132`) rewrites to exactly that shape
+    /// with the reason `"disabled by deprecated false shorthand"` — actually disables the gate.
+    /// A bare `"none"` string carries no reason at all, so upstream falls through to
+    /// `LEVEL_RANK["none"] >= LEVEL_RANK[inferred.level] ? "none" : inferred.level` (`:277-281`)
+    /// and, since `none` ranks lowest, always ends up back at the inferred level. Before this
+    /// flag existed, [`lower_acceptance_input`] mapped a bare `"none"` onto an explicit
+    /// `NotRequired` contract whose [`is_no_op`](Self::is_no_op) short-circuited the whole gate,
+    /// so a one-word policy silently disarmed acceptance that pi still enforces.
+    ///
+    /// Only ever consulted by [`AcceptanceContract::resolve_effective`]; a contract this crate
+    /// builds directly in Rust (rather than lowering from a wire policy) keeps the historical
+    /// "an explicit `NotRequired` means the caller wants no gate" reading — see
+    /// [`AcceptanceContract::explicit`].
+    pub disables_gate: bool,
 }
 
 impl AcceptanceContract {
@@ -263,13 +283,39 @@ impl AcceptanceContract {
     /// requestable level) defensively rather than accepting a nonsensical contract, since this
     /// crate's no-panic policy forbids failing loudly here and a silently-dropped contract would
     /// be worse than a clamped one.
+    ///
+    /// A contract built here with [`AcceptanceStatus::NotRequired`] DISABLES the gate outright
+    /// (`disables_gate`), i.e. it is upstream's `{ level: "none", reason: <non-blank> }` rather
+    /// than its reasonless bare `"none"`: an in-process caller that hands `run_sync` a
+    /// `NotRequired` contract in Rust has stated its intent directly and there is no reason field
+    /// for it to have omitted. Wire policies that must NOT be able to disable the gate are lowered
+    /// through [`AcceptanceContract::explicit_floor`] instead.
     #[must_use]
     pub fn explicit(required_level: AcceptanceStatus, verify: Vec<VerifyCommand>) -> Self {
+        let required_level = clamp_requestable_level(required_level);
         Self {
-            required_level: clamp_requestable_level(required_level),
+            required_level,
             verify,
             explicit: true,
             reviewer_result: None,
+            disables_gate: required_level == AcceptanceStatus::NotRequired,
+        }
+    }
+
+    /// Build an explicit, caller-supplied contract that acts only as a **floor**: the
+    /// heuristically-inferred level may still raise it, and it can never disable the gate
+    /// (pi `explicitAcceptanceCanDisable` returning `false`, `acceptance.ts:134-136` @v0.34.0).
+    ///
+    /// This is the shape every wire-lowered policy takes EXCEPT the two upstream treats as a
+    /// genuine "off" switch (`acceptance: false`, and `{ level: "none", reason: "…" }` with a
+    /// non-blank reason). For any level above `none` the distinction is invisible — a non-
+    /// `NotRequired` contract has nothing to disable — so this constructor differs from
+    /// [`AcceptanceContract::explicit`] only for `NotRequired`.
+    #[must_use]
+    pub fn explicit_floor(required_level: AcceptanceStatus, verify: Vec<VerifyCommand>) -> Self {
+        Self {
+            disables_gate: false,
+            ..Self::explicit(required_level, verify)
         }
     }
 
@@ -283,6 +329,9 @@ impl AcceptanceContract {
         if self.required_level < AcceptanceStatus::Reviewed {
             self.required_level = AcceptanceStatus::Reviewed;
         }
+        // A contract carrying a reviewer result requires `Reviewed` by construction, so it is no
+        // longer the `level: "none"` shape `disables_gate` describes.
+        self.disables_gate = false;
         self
     }
 
@@ -315,7 +364,60 @@ impl AcceptanceContract {
             verify: Vec::new(),
             explicit: false,
             reviewer_result: None,
+            disables_gate: false,
         }
+    }
+
+    /// Combine an explicit, caller-supplied contract (if any) with the heuristically-inferred one
+    /// — R-SA-023's resolution rule, and a direct port of pi `resolveEffectiveAcceptance`'s level
+    /// arithmetic (`runs/shared/acceptance.ts:265-302` @v0.34.0):
+    ///
+    /// ```text
+    /// level = explicitAcceptanceCanDisable(explicit) ? "none"
+    ///       : explicitLevel === "auto"               ? inferred.level
+    ///       : LEVEL_RANK[explicitLevel] >= LEVEL_RANK[inferred.level] ? explicitLevel
+    ///                                                                 : inferred.level
+    /// ```
+    ///
+    /// The load-bearing property is the MAX in that last branch: an explicit level may only ever
+    /// RAISE the inferred floor, never lower it. Before this function existed, `run_sync` did
+    /// `opts.acceptance.clone().unwrap_or_else(|| heuristic_default(...))` — explicit and inferred
+    /// were mutually exclusive, so `acceptance: "attested"` on a write-capable task was honoured
+    /// verbatim where pi escalates it to the inferred `checked`, and a bare `acceptance: "none"`
+    /// (which cannot disable upstream, see [`disables_gate`](Self::disables_gate)) turned the gate
+    /// off entirely.
+    ///
+    /// `explicit == None` is pi's `explicitLevel === "auto"` — [`lower_acceptance_input`] maps
+    /// both an absent `acceptance` param and a literal `"auto"` onto `None` — and yields the
+    /// inferred contract unchanged.
+    ///
+    /// **[CYRUP-DELTA]** upstream also feeds `async`/`dynamic`/`dynamicGroup` into `inferLevel`
+    /// and downgrades `review.required` when a `reviewed` level was inferred rather than asked
+    /// for (`acceptance.ts:286-289`); neither has an input here, because
+    /// [`AcceptanceContract::heuristic_default`] classifies on agent name + task text alone and
+    /// can never infer [`AcceptanceStatus::Reviewed`]. Both are tracked separately from this
+    /// function's own concern, which is strictly the combination rule.
+    #[must_use]
+    pub fn resolve_effective(
+        explicit: Option<Self>,
+        agent_local_name: &str,
+        task: &str,
+    ) -> Self {
+        let inferred = Self::heuristic_default(agent_local_name, task);
+        let Some(mut contract) = explicit else {
+            return inferred;
+        };
+        if contract.disables_gate {
+            return contract;
+        }
+        // MAX(explicit, inferred) by lattice rank. `AcceptanceStatus`'s derived `Ord` IS that rank
+        // (the enum's own doc comment: declaration order is normative), and neither side can be
+        // `Rejected` — `heuristic_default` never produces it and `explicit`/`explicit_floor` clamp
+        // it away — so the sink variant cannot leak in through this comparison.
+        if inferred.required_level > contract.required_level {
+            contract.required_level = inferred.required_level;
+        }
+        contract
     }
 
     /// Whether this contract requires no gate evaluation at all — `required_level ==
@@ -360,10 +462,17 @@ pub struct ReviewerResult {
 /// verbatim messages.
 ///
 /// Level mapping (pi `AcceptanceLevel` -> [`AcceptanceStatus`]): `auto` yields `None`, i.e. pi's own
-/// "omitted means auto-inferred" — [`crate::exec::run_sync`] then falls through to
+/// "omitted means auto-inferred" — [`crate::exec::run_sync`] then resolves it through
+/// [`AcceptanceContract::resolve_effective`] against
 /// [`AcceptanceContract::heuristic_default`] (R-SA-023), which is this crate's `inferLevel`. Every
 /// other level (and the `false` shorthand, pi's `level: "none"`) becomes an EXPLICIT contract, which
 /// is what arms R-SA-033's post-hoc exit-code correction.
+///
+/// An explicit level is a **floor**, not a replacement ([`AcceptanceContract::explicit_floor`]):
+/// upstream takes `max(explicit, inferred)` by rank (`acceptance.ts:277-281`), so the only inputs
+/// that can lower or remove the inferred requirement are the two `explicitAcceptanceCanDisable`
+/// accepts (`:134-136`) — `false`, and `{ level: "none", reason: <non-blank> }`. A bare `"none"`
+/// string is NOT one of them.
 ///
 /// # Why this lives here and not on one call site
 ///
@@ -406,13 +515,20 @@ pub fn lower_acceptance_input(
     }
 
     match raw {
-        // pi `acceptance: false` is the `level: "none"` shorthand (`acceptance.ts:127-132`).
+        // pi `acceptance: false` is the `level: "none"` shorthand (`acceptance.ts:127-132`) — and
+        // the ONE string-ish form that genuinely disables the gate, because
+        // `normalizeAcceptanceInput` supplies the reason `"disabled by deprecated false shorthand"`
+        // itself, satisfying `explicitAcceptanceCanDisable` (`:134-136`).
         serde_json::Value::Bool(false) => Ok(Some(AcceptanceContract::explicit(
             AcceptanceStatus::NotRequired,
             Vec::new(),
         ))),
+        // A bare level string carries no `reason`, so `explicitAcceptanceCanDisable` is false for
+        // it (`acceptance.ts:127-136`): `"none"` here is a FLOOR of `none`, which
+        // [`AcceptanceContract::resolve_effective`]'s max then discards in favour of the inferred
+        // level — it does not switch the gate off.
         serde_json::Value::String(level) => Ok(level_to_status(level)
-            .map(|status| AcceptanceContract::explicit(status, Vec::new()))),
+            .map(|status| AcceptanceContract::explicit_floor(status, Vec::new()))),
         serde_json::Value::Object(config) => {
             let verify: Vec<VerifyCommand> = config
                 .get("verify")
@@ -426,8 +542,20 @@ pub fn lower_acceptance_input(
                 })
                 .unwrap_or_default();
             let level = config.get("level").and_then(serde_json::Value::as_str);
+            // `explicitAcceptanceCanDisable` (`acceptance.ts:134-136`): only an object whose
+            // `reason` is a non-blank string may turn the gate off. In practice
+            // `validate_acceptance_input` already rejects `{ level: "none" }` with no reason
+            // ("acceptance.reason is required when level is none."), so this is belt-and-braces —
+            // and for every level above `none` the two constructors are identical anyway.
+            let can_disable = config
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reason| !reason.trim().is_empty());
             match level.and_then(level_to_status) {
-                Some(status) => Ok(Some(AcceptanceContract::explicit(status, verify))),
+                Some(status) if can_disable => {
+                    Ok(Some(AcceptanceContract::explicit(status, verify)))
+                }
+                Some(status) => Ok(Some(AcceptanceContract::explicit_floor(status, verify))),
                 // `{ verify: [...] }` with no `level` is pi's `level: "auto"` default
                 // (`acceptance.ts:127-132` normalizes an absent level to `auto`), so the level is
                 // still inferred — but declared `verify[]` commands must not be dropped, so an
@@ -1398,6 +1526,132 @@ mod tests {
     fn explicit_contract_clamps_a_nonsensical_rejected_requested_level() {
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Rejected, vec![]);
         assert_eq!(contract.required_level, AcceptanceStatus::Reviewed);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // resolve_effective: pi `resolveEffectiveAcceptance`'s combination rule
+    // (`runs/shared/acceptance.ts:265-302` @v0.34.0)
+    // ---------------------------------------------------------------------------------------
+
+    /// The MAX at `acceptance.ts:277-281` — an explicit level may only ever RAISE the inferred
+    /// floor. Pre-fix, `run_sync` used `opts.acceptance.unwrap_or_else(heuristic_default)`, so an
+    /// explicit `attested` REPLACED the inferred `checked` on a write-capable task and the run was
+    /// gated more weakly than the identical policy is under pi.
+    #[test]
+    fn an_explicit_level_below_the_inferred_one_is_raised_to_the_inferred_floor() {
+        let inferred = AcceptanceContract::heuristic_default("worker", "Implement the fix");
+        assert_eq!(inferred.required_level, AcceptanceStatus::Checked, "premise");
+
+        let effective = AcceptanceContract::resolve_effective(
+            Some(AcceptanceContract::explicit_floor(
+                AcceptanceStatus::Attested,
+                vec![],
+            )),
+            "worker",
+            "Implement the fix",
+        );
+
+        assert_eq!(
+            effective.required_level,
+            AcceptanceStatus::Checked,
+            "max(attested, checked) is checked — the explicit level is a floor, not a replacement"
+        );
+        assert!(
+            effective.explicit,
+            "it is still an explicitly-declared contract, so R-SA-033's correction stays armed"
+        );
+    }
+
+    /// The other side of the same expression: an explicit level ABOVE the inferred one wins, and
+    /// its declared `verify[]` commands survive the combination.
+    #[test]
+    fn an_explicit_level_above_the_inferred_one_wins_and_keeps_its_verify_commands() {
+        let effective = AcceptanceContract::resolve_effective(
+            Some(AcceptanceContract::explicit_floor(
+                AcceptanceStatus::Verified,
+                vec![vc("true")],
+            )),
+            "researcher",
+            "Investigate the bug",
+        );
+        assert_eq!(effective.required_level, AcceptanceStatus::Verified);
+        assert_eq!(effective.verify, vec!["true".to_string()]);
+    }
+
+    /// `explicit == None` is pi's `explicitLevel === "auto"` branch: the inferred contract, whole.
+    #[test]
+    fn no_explicit_contract_yields_the_inferred_one() {
+        let effective =
+            AcceptanceContract::resolve_effective(None, "worker", "Implement the fix");
+        assert_eq!(effective.required_level, AcceptanceStatus::Checked);
+        assert!(!effective.explicit, "an inferred contract never arms R-SA-033");
+    }
+
+    /// `explicitAcceptanceCanDisable` (`acceptance.ts:134-136`) requires a non-blank `reason`, and
+    /// a bare `"none"` string carries none (`normalizeAcceptanceInput`, `:127-132`). So upstream
+    /// falls through to `LEVEL_RANK["none"] >= LEVEL_RANK[inferred]`, which is false for every
+    /// real level — the gate stays armed at the inferred level. Pre-fix, cyrup lowered `"none"`
+    /// onto an explicit `NotRequired` contract whose `is_no_op()` disabled the gate entirely.
+    #[test]
+    fn a_bare_none_string_cannot_disable_the_gate() {
+        let lowered = lower_acceptance_input(&serde_json::json!("none"))
+            .expect("'none' is a valid level")
+            .expect("a bare level string yields a contract");
+        assert!(
+            !lowered.disables_gate,
+            "a reasonless 'none' fails explicitAcceptanceCanDisable"
+        );
+
+        let effective =
+            AcceptanceContract::resolve_effective(Some(lowered), "worker", "Implement the fix");
+        assert_eq!(
+            effective.required_level,
+            AcceptanceStatus::Checked,
+            "the inferred floor survives a reasonless 'none'"
+        );
+        assert!(!effective.is_no_op(), "the gate must still be evaluated");
+    }
+
+    /// Both forms upstream DOES accept as an "off" switch: the `false` shorthand (whose reason
+    /// `normalizeAcceptanceInput` supplies itself) and an object `{ level: "none", reason }` with
+    /// a non-blank reason.
+    #[test]
+    fn the_two_disabling_forms_still_turn_the_gate_off() {
+        for policy in [
+            serde_json::json!(false),
+            serde_json::json!({ "level": "none", "reason": "prototype spike, no gate wanted" }),
+        ] {
+            let lowered = lower_acceptance_input(&policy)
+                .expect("a valid policy")
+                .expect("a contract");
+            assert!(lowered.disables_gate, "must be able to disable: {policy}");
+
+            let effective =
+                AcceptanceContract::resolve_effective(Some(lowered), "worker", "Implement the fix");
+            assert_eq!(
+                effective.required_level,
+                AcceptanceStatus::NotRequired,
+                "an explicit disable is never raised by the inferred floor: {policy}"
+            );
+            assert!(effective.is_no_op(), "policy {policy}");
+        }
+    }
+
+    /// An in-process caller that builds `AcceptanceContract::explicit(NotRequired, …)` directly in
+    /// Rust (as several of this crate's own callers and tests do) has stated its intent with no
+    /// `reason` field to omit, so that form keeps disabling the gate.
+    #[test]
+    fn a_rust_constructed_not_required_contract_still_disables_the_gate() {
+        let effective = AcceptanceContract::resolve_effective(
+            Some(AcceptanceContract::explicit(
+                AcceptanceStatus::NotRequired,
+                vec![],
+            )),
+            "worker",
+            "Implement the fix",
+        );
+        assert_eq!(effective.required_level, AcceptanceStatus::NotRequired);
+        assert!(effective.is_no_op());
     }
 
     #[test]

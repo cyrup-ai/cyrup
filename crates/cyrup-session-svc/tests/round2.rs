@@ -310,6 +310,71 @@ async fn runtime_import_from_jsonl_switches_session() {
     }
 }
 
+/// Pi `importFromJsonl` copies into `this.session.sessionManager.getSessionDir()`
+/// (agent-session-runtime.ts:367) — the ACTIVE session's own per-cwd directory
+/// (`<root>/--<enc-cwd>--`, session-manager.ts:484,999-1000), never the sessions ROOT. Landing it in
+/// the root leaves the imported session invisible to every listing path: `listing::list` scans
+/// `layout.dir()` and `list_all` only descends into per-project subdirectories.
+#[tokio::test]
+async fn runtime_import_lands_in_the_per_cwd_session_dir_and_is_listable() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let provider: Arc<dyn Provider> = faux.clone();
+
+    // Source transcript exported to a standalone file outside the sessions tree.
+    let source = SessionBuilder::new(provider.clone(), base_config(&fx)).build().await.unwrap();
+    let _ = source.prompt("seed message").await.unwrap();
+    source.wait_for_idle().await;
+    let export_path = fx.cwd.join("exported.jsonl");
+    source.export_to_jsonl(Some(&export_path)).await.unwrap();
+    drop(source);
+
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+
+    // The live session's own directory — the per-cwd `--<enc-cwd>--` dir, one level below the root.
+    let sessions_root = fx.agent_dir.join("sessions");
+    let live_file = runtime.session().await.session_file().await.expect("persisted session");
+    let per_cwd_dir = live_file.parent().expect("session file has a parent").to_path_buf();
+    assert_ne!(
+        per_cwd_dir, sessions_root,
+        "fixture precondition: the default layout must nest a per-cwd dir under the root"
+    );
+
+    let result = runtime.import_from_jsonl(&export_path, None).await.expect("import");
+    assert!(!result.cancelled);
+
+    // The copy lands beside the live session, NOT in the sessions root.
+    assert!(
+        per_cwd_dir.join("exported.jsonl").exists(),
+        "import must copy into the per-cwd session dir {}",
+        per_cwd_dir.display()
+    );
+    assert!(
+        !sessions_root.join("exported.jsonl").exists(),
+        "import must NOT copy into the sessions root {}",
+        sessions_root.display()
+    );
+    // ...and the switched-to session is the copy in that dir.
+    let switched = runtime.session().await.session_file().await.expect("imported session file");
+    assert_eq!(switched, per_cwd_dir.join("exported.jsonl"));
+
+    // Consequence Pi relies on: the imported session is visible to both listing paths.
+    let listed = cyrup_session::listing::list_in_dir(&per_cwd_dir, None, None);
+    assert!(
+        listed.iter().any(|s| s.path == per_cwd_dir.join("exported.jsonl")),
+        "imported session missing from the per-cwd listing: {:?}",
+        listed.iter().map(|s| s.path.clone()).collect::<Vec<_>>()
+    );
+    let all = cyrup_session::listing::list_all(&cyrup_session::layout::SessionsRoot(sessions_root));
+    assert!(
+        all.iter().any(|s| s.path == per_cwd_dir.join("exported.jsonl")),
+        "imported session missing from the cross-project listing: {:?}",
+        all.iter().map(|s| s.path.clone()).collect::<Vec<_>>()
+    );
+}
+
 // ------------------------------------------------------------- custom-message deliverAs ----
 
 #[tokio::test]

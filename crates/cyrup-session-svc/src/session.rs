@@ -322,6 +322,16 @@ pub struct AgentSession {
     model: Mutex<ModelRef>,
     /// The resolved summarization/compaction model (kept in lockstep with `model`).
     compaction_model: Mutex<cyrup_provider::Model>,
+    /// The LIVE base system prompt — the value a run falls back to when no `before_agent_start`
+    /// handler replaced it (Pi `private _baseSystemPrompt`, agent-session.ts:371).
+    ///
+    /// Seeded from the builder-assembled `services.system_prompt`, but MUTABLE thereafter: a
+    /// tool-set rebuild rewrites it ([`Self::push_active_tools`]), exactly as Pi reassigns
+    /// `this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames)` inside
+    /// `setActiveToolsByName` (agent-session.ts:939). `services.system_prompt` is owned by value on
+    /// an all-`&self` type and so is frozen at build time; reading the reset path from it made every
+    /// run with a `before_agent_start` subscriber revert the prompt to the startup tool set.
+    base_system_prompt: Mutex<String>,
     compaction_settings: CompactionSettings,
     branch_summary_settings: BranchSummarySettings,
     /// Long-lived token handed to the extension subscriber (distinct from per-run cancellation).
@@ -455,6 +465,7 @@ impl AgentSession {
         extras: SessionExtras,
     ) -> Self {
         let compaction_model = services.model.clone();
+        let base_system_prompt = services.system_prompt.clone();
         // Seed the queue-mode mirrors from the resolved settings (the builder wired the same modes
         // into the agent), so the getters report the live mode without an agent-side getter.
         let eff = services.settings.effective();
@@ -471,6 +482,7 @@ impl AgentSession {
             services,
             model: Mutex::new(model),
             compaction_model: Mutex::new(compaction_model),
+            base_system_prompt: Mutex::new(base_system_prompt),
             compaction_settings: extras.compaction_settings,
             branch_summary_settings: extras.branch_summary_settings,
             session_cancel,
@@ -1099,7 +1111,11 @@ impl AgentSession {
         // agent-session.ts:1099-1103); they are injected AFTER the user message in the run input.
         let pending: Vec<AgentMessage> = std::mem::take(&mut *Self::lock(&self.pending_next_turn));
 
-        let base = &self.services.system_prompt;
+        // The LIVE base (Pi reads the mutable field: `this._baseSystemPrompt`, agent-session.ts:1228
+        // into `emitBeforeAgentStart`, :1252 for the reset) — NOT the frozen builder-assembled
+        // `services.system_prompt`, which predates every `set_active_tools_by_name` /
+        // `refresh_extension_tools` rebuild this session performed.
+        let base = self.base_system_prompt();
         // Fast path: no extension listens for `before_agent_start` — keep the assembled base prompt.
         if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::BeforeAgentStart)
         {
@@ -1139,7 +1155,7 @@ impl AgentSession {
             && let HostEvent::BeforeAgentStart { system_prompt, injected, .. } = *ev
         {
             // Apply the (possibly handler-replaced / sanitized) system prompt; reset to base otherwise.
-            if &system_prompt == base {
+            if system_prompt == base {
                 self.agent.set_system_prompt(base.clone()).await;
             } else {
                 self.agent.set_system_prompt(system_prompt).await;
@@ -3184,9 +3200,19 @@ impl AgentSession {
         self.manager.try_lock().ok().and_then(|g| g.session_file().map(Path::to_path_buf))
     }
 
-    /// The assembled *base* system prompt for this session (arch-06). Stable across the session.
+    /// The system prompt the builder assembled at session start (arch-06). Frozen — it does NOT
+    /// track mid-session tool-set rebuilds; use [`Self::base_system_prompt`] for the live base or
+    /// [`Self::current_system_prompt`] for the agent's in-flight value.
     pub fn system_prompt(&self) -> &str {
         &self.services.system_prompt
+    }
+
+    /// The LIVE base system prompt (Pi `this._baseSystemPrompt`, agent-session.ts:371) — the value a
+    /// run falls back to when no `before_agent_start` handler replaced it. Equal to
+    /// [`Self::system_prompt`] until a tool-set rebuild (`/tools` toggle, a guest `setActiveTools`,
+    /// or EXT-004 late tool registration) rewrites it via [`Self::push_active_tools`].
+    pub fn base_system_prompt(&self) -> String {
+        Self::lock(&self.base_system_prompt).clone()
     }
 
     /// The agent's *current* system prompt — equal to the base unless a `before_agent_start` handler
@@ -4436,6 +4462,12 @@ impl AgentSession {
     async fn push_active_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>, prompt: String) {
         self.agent.set_tools(tools).await;
         self.agent.set_system_prompt(prompt.clone()).await;
+        // The rebuilt prompt is the new BASE, not just this turn's value (Pi
+        // `this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames)`, agent-session.ts:939).
+        // Without this write the next run's `before_agent_start` reset in
+        // [`Self::assemble_run_messages`] would restore the startup prompt and the model would be
+        // described the startup tool set for the rest of the session.
+        *Self::lock(&self.base_system_prompt) = prompt.clone();
         // EXT-005: keep the guest-visible `ctx.getSystemPrompt()` mirror in step with the agent —
         // a tool-set rebuild rewrites the prompt (Pi `_rebuildSystemPrompt`, agent-session.ts:2304)
         // and a guest reading it back must see the rebuilt one.
