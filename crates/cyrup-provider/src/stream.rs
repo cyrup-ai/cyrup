@@ -216,6 +216,8 @@ pub enum ApiStreamOptions {
     AzureOpenAiResponses(crate::api::azure_openai_responses::AzureOpenAiResponsesOptions),
     /// Options for the `openai-codex-responses` wire protocol.
     OpenAiCodexResponses(crate::api::openai_codex_responses::OpenAiCodexResponsesOptions),
+    /// Options for the `bedrock-converse-stream` wire protocol.
+    Bedrock(crate::api::bedrock_converse_stream::BedrockOptions),
     /// Options for the `google-generative-ai` wire protocol.
     Google(crate::api::google_generative_ai::GoogleOptions),
     /// Options for the `mistral-conversations` wire protocol.
@@ -257,6 +259,14 @@ impl ApiStreamOptions {
     ) -> Option<&crate::api::openai_codex_responses::OpenAiCodexResponsesOptions> {
         match self {
             ApiStreamOptions::OpenAiCodexResponses(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The `bedrock-converse-stream` options, if this is that variant.
+    pub fn bedrock(&self) -> Option<&crate::api::bedrock_converse_stream::BedrockOptions> {
+        match self {
+            ApiStreamOptions::Bedrock(o) => Some(o),
             _ => None,
         }
     }

@@ -1952,14 +1952,25 @@ mod tests {
         let catalog = cyrup::provider::all_available_models(&cyrup_config::ModelFile::default());
 
         // Path-segment awareness: a 1-segment pattern (`anthropic*`, no `**`) can NEVER match the
-        // 2-segment `anthropic/<id>` under minimatch, and `anthropic*` also does not match any bare
-        // `id` (none begin "anthropic"). Pi → 0 matches. The old crude matcher wrongly matched EVERY
-        // anthropic model (its single segment anchored via plain substring across the `/`).
+        // 2-segment `anthropic/<id>` form under minimatch. The old crude matcher wrongly matched
+        // EVERY anthropic model (its single segment anchored via plain substring across the `/`).
+        //
+        // It CAN match a bare id that genuinely begins "anthropic", and since `amazon-bedrock` was
+        // ported that is no longer a hypothetical: Bedrock ids are dotted, e.g.
+        // `anthropic.claude-opus-4-7`. So the assertion is no longer "zero matches" — it is that
+        // every match is a BARE dotted id and none is the provider-qualified `anthropic/…` form.
+        // Asserting emptiness here would have quietly re-encoded "amazon-bedrock is not ported".
         let scoped = resolve_scoped_models(&catalog, &["anthropic*".to_string()]);
         assert!(
-            scoped.is_empty(),
-            "`anthropic*` must scope 0 models (path-segment-aware, like Pi), got {}",
-            scoped.len()
+            scoped.iter().all(|m| !m.model.id.as_str().contains('/')),
+            "`anthropic*` is one segment, so it must never match the 2-segment `anthropic/<id>` \
+             form; got {:?}",
+            scoped.iter().map(|m| m.model.id.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            scoped.iter().all(|m| m.model.id.as_str().starts_with("anthropic")),
+            "every match must actually begin with the literal pattern prefix; got {:?}",
+            scoped.iter().map(|m| m.model.id.as_str()).collect::<Vec<_>>()
         );
 
         // Character classes (`[68]`) are real minimatch syntax the crude matcher could not express

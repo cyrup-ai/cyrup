@@ -63,7 +63,8 @@ use crate::providers::{
     anthropic_provider_with, azure_openai_responses_provider_with,
     cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_provider_with,
     fireworks_provider_with, github_copilot_provider_with, google_provider_with,
-    google_vertex_provider_with, openai_codex_provider_with, mistral_provider_with, openai_provider_with,
+    google_vertex_provider_with, openai_codex_provider_with,
+    amazon_bedrock_provider_with, mistral_provider_with, openai_provider_with,
     opencode_go_provider_with, opencode_provider_with, openrouter_images_provider,
     together_provider_with,
 };
@@ -168,6 +169,12 @@ fn builtin_providers_with(
         registry.clone(),
     )));
     providers.push(Arc::new(cloudflare_workers_ai_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
+
+    // amazon-bedrock (pi `all.ts`) — the last of the seven that were unported.
+    providers.push(Arc::new(amazon_bedrock_provider_with(
         store.clone(),
         registry.clone(),
     )));
@@ -317,6 +324,7 @@ mod tests {
             "github-copilot",
             "openai-codex",
             "google-vertex",
+            "amazon-bedrock",
         ] {
             assert!(
                 ids.iter().any(|id| id == expected),
@@ -328,14 +336,8 @@ mod tests {
         // ports everything, and an id leaves this array by being implemented. It exists so a
         // half-finished provider cannot be registered and silently answer requests it cannot serve
         // — the assertion is "absent until real", never "must stay absent".
-        // One id left. Written as a direct assertion rather than a one-element loop
-        // (clippy::single_element_loop); it becomes a loop again the moment a second id joins it,
-        // and it disappears entirely when `amazon-bedrock` is ported.
-        assert!(
-            !ids.iter().any(|id| id == "amazon-bedrock"),
-            "'amazon-bedrock' is not ported yet, so it must not be registered — if you just \
-             ported it, delete this assertion and add it to the implemented list above"
-        );
+        // Every built-in provider pi ships is now ported, so there is no not-yet list left to
+        // assert against. If a future upstream version adds one, reinstate the assertion here.
 
         // The count matches what `all_providers()` returns and has no duplicate ids.
         assert_eq!(ids.len(), all_providers().len());

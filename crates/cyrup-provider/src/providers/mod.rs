@@ -2,6 +2,7 @@
 //! auth strategy + an api mapping over the shared [`crate::api::ApiRegistry`].
 
 pub mod all;
+pub mod amazon_bedrock;
 pub mod anthropic;
 pub mod azure_openai_responses;
 pub mod cloudflare;
@@ -23,6 +24,7 @@ pub use all::{
     all_providers_with_overlay, builtin_model_data_generated_at, default_images_models,
     default_models,
 };
+pub use amazon_bedrock::*;
 pub use anthropic::{
     ANTHROPIC_BASE_URL, ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID, AnthropicFleetSpec, anthropic_auth,
     anthropic_fleet_providers_with, anthropic_fleet_spec, anthropic_models, anthropic_provider,

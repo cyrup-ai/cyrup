@@ -13359,8 +13359,17 @@ mod tests {
             .find(|m| {
                 counts.get(m.id.as_str()).copied() == Some(1)
                     && !matches!(m.provider.as_str(), "anthropic" | "openai")
+                    // A bare id containing ':' cannot resolve in strict mode, and that is
+                    // UPSTREAM behaviour, not a cyrup gap: `model-resolver.ts:206-234` splits on
+                    // the LAST colon, and when the suffix is not a valid thinking level the strict
+                    // path returns no model rather than guessing (`:228-232`). cyrup's
+                    // `parse_pattern` mirrors it exactly. Since `amazon-bedrock` was ported the
+                    // registry carries such ids — `amazon.nova-2-lite-v1:0` — and this `find`
+                    // picked one, which is what made this test start failing. Excluding them keeps
+                    // the test about bare-id EXPANSION, which is what it is named for.
+                    && !m.id.as_str().contains(':')
             })
-            .expect("the registry must carry a unique bare id outside anthropic/openai");
+            .expect("the registry must carry a unique, colon-free bare id outside anthropic/openai");
         let bare = subject.id.as_str();
         let full = format!("{}/{}", subject.provider.as_str(), bare);
 
