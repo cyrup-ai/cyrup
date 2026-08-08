@@ -259,6 +259,32 @@ checking that their CONSUMERS were ported. Counted separately so the 147 stays c
 | G133c `HostServices` custom-overlay seam, so `/permission-system` can render the real settings modal instead of text | absent | low | medium | `HostServices` has `select`/`input`/`notify`/`set_status`, no custom render | `config-modal.ts:63-123` (`ctx.ui.custom`) |
 | G133d Version-qualify the 334 `index.ts` citations in `cyrup-permission-system` — 26 provably point past EOF at v0.8.0 | absent | medium | medium | 16 files; run `.workflows/check-citations.py` | n/a (provenance hygiene) |
 
+**G136c and G136d are FIXED, not filed** (2026-08-08). They were briefly recorded here as tracked
+items with a rationale for deferring them; that was wrong — deferring a known-broken wire guard is
+shipping a defect, and the fixes were small once pi's source was actually read rather than inferred.
+
+- **G136c** — an overflowing numeric literal (`1e400`) failed the WHOLE frame in `serde_json`
+  (`number out of range`), in positions cyrup does not model and pi never type-checks. Fixed in
+  `transport/framing.rs::from_frame_slice`: on a syntax error, overflowing literals are rewritten to
+  `null` and the frame is re-parsed. That is exactly what pi puts on the wire — `JSON.parse` yields
+  `Infinity`, `JSON.stringify` emits `null` — so an unmodelled key now round-trips byte-identically.
+  The slow path runs only after a real overflow error, so well-formed traffic pays nothing.
+  Six tests, revert-proved; mirrors confirm malformed JSON is still rejected and that a
+  numeric-looking substring inside a string is never touched.
+
+  Correcting the record on the earlier claim that "pi would have served" a `1e400` in a MODELLED
+  field: it would not. pi's broker accepts it, answers the sender `delivered`, relays `null`, and
+  the RECEIVER's own `isMessage` then rejects it and destroys that receiver's socket
+  (v0.9.2 `broker/client.ts:106-116`, `:321-329`) — a hostile sender disconnecting a third party.
+  cyrup answers `delivery_failed` to the sender instead. That is the one place cyrup deliberately
+  does not reproduce upstream, and it is fail-closed.
+
+- **G136d** — the five residual acceptance deltas (`registered.features: null`, the
+  `extension_owner`/`extension_message` XOR-presence rule, `revision` beyond `MAX_SAFE_INTEGER`,
+  `extension_state_result.reason: null`, and absent `payload` wrongly REJECTED where pi accepts it).
+  All fixed in `transport/protocol.rs` with a `js_safe_integer` bound and `present_non_null` guards,
+  each transcribed from the pi guard it ports. Six tests, full revert proof.
+
 **On G133b/G133c**: `set_yolo_mode`, `toggle_yolo_mode` and `yolo_mode` are ported and correct but
 UNREACHABLE, because the host seam they need does not exist. That is a named, tracked gap — not the
 same thing as G133's original defect, where a primitive was unwired with no plan. Do not "fix" it by

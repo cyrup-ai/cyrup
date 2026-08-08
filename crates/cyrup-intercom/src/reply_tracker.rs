@@ -306,22 +306,27 @@ mod tests {
             name: name.map(str::to_string),
             cwd: "/w".to_string(),
             model: "m".to_string(),
-            pid: 1,
-            started_at: 0,
-            last_activity: 0,
+            pid: 1u32.into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
             status: None,
             peer_uid: None,
             trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         }
     }
 
     fn ask(id: &str) -> Message {
         Message {
             id: id.to_string(),
-            timestamp: 0,
+            timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: "q".to_string(), attachments: None },
+            content: MessageContent { text: "q".to_string(), attachments: None, ..Default::default() },
+            ..Default::default()
         }
     }
 
@@ -470,10 +475,11 @@ mod tests {
         let rx = waiter.register("supervisor".to_string(), "q1".to_string()).expect("registers");
         let reply = Message {
             id: "r1".to_string(),
-            timestamp: 0,
+            timestamp: 0u64.into(),
             reply_to: Some("q1".to_string()),
             expects_reply: None,
-            content: MessageContent { text: "answer".to_string(), attachments: None },
+            content: MessageContent { text: "answer".to_string(), attachments: None, ..Default::default() },
+            ..Default::default()
         };
         assert!(waiter.try_deliver(&session("supervisor", Some("supervisor")), &reply));
         let got = rx.await.expect("received").expect("delivered, not failed");
@@ -501,10 +507,11 @@ mod tests {
         let _rx = waiter.register("supervisor".to_string(), "q1".to_string()).expect("registers");
         let wrong = Message {
             id: "r1".to_string(),
-            timestamp: 0,
+            timestamp: 0u64.into(),
             reply_to: Some("q-other".to_string()),
             expects_reply: None,
-            content: MessageContent { text: "answer".to_string(), attachments: None },
+            content: MessageContent { text: "answer".to_string(), attachments: None, ..Default::default() },
+            ..Default::default()
         };
         assert!(!waiter.try_deliver(&session("supervisor", None), &wrong));
         assert!(waiter.is_waiting(), "slot stays occupied on a non-matching reply");

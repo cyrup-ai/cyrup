@@ -82,10 +82,11 @@ async fn run() -> i32 {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
         model: "cyrup-intercom-child-fixture".to_string(),
-        pid: std::process::id(),
-        started_at: now_ms(),
-        last_activity: now_ms(),
+        pid: std::process::id().into(),
+        started_at: now_ms().into(),
+        last_activity: now_ms().into(),
         status: None,
+        extra: Default::default(),
     };
 
     // (2) Register as a genuine broker participant under the deterministic child label.

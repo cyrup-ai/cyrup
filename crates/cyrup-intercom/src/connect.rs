@@ -449,10 +449,11 @@ pub fn build_registration(state: &SharedIntercomState, params: &ConnectParams) -
         name,
         cwd: state.cwd.to_string_lossy().to_string(),
         model: params.model.clone().unwrap_or_else(|| "cyrup".to_string()),
-        pid: std::process::id(),
-        started_at: now_ms(),
-        last_activity: now_ms(),
+        pid: std::process::id().into(),
+        started_at: now_ms().into(),
+        last_activity: now_ms().into(),
         status: state.config.status.clone(),
+        extra: Default::default(),
     }
 }
 

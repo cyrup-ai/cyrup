@@ -133,6 +133,127 @@ impl FrameReader {
     }
 }
 
+/// Deserialize one frame payload with **JavaScript's number-overflow behaviour**, which is not
+/// `serde_json`'s.
+///
+/// pi parses every frame with `JSON.parse` (`v0.9.2 broker/framing.ts:36-42`). ECMA-262 rounds a
+/// numeric literal that overflows the double range to `±Infinity`, so `1e400` parses fine and
+/// `typeof Infinity === "number"` is TRUE — every pi type guard passes. `serde_json` instead fails
+/// the WHOLE FRAME with `number out of range` (verified: `1e400`, `-1e400`, `1e309` all error;
+/// `1e300` parses). Because that happens in the JSON reader, it fires even in positions cyrup does
+/// not model and pi never type-checks: an unmodelled key inside `message`, a top-level frame key, an
+/// `extension_publish` payload. A peer could therefore drop a cyrup connection that pi serves
+/// normally — and on a socket every local process can reach.
+///
+/// The fix reproduces what pi puts ON THE WIRE. pi accepts the overflow as `Infinity`, then relays
+/// through `JSON.stringify`, which emits **`null`** for any non-finite number. So a peer downstream
+/// of a pi broker sees `null` in that position — exactly what this makes cyrup see. For an
+/// unmodelled key that is byte-for-byte parity: pi delivers the message with the key nulled, and so
+/// does cyrup.
+///
+/// **Where this still diverges, and why that is not a silent choice.** For a MODELLED numeric field
+/// (`timestamp`), pi's broker accepts `Infinity`, answers the sender `delivered`, and relays `null`
+/// — at which point the RECEIVER's own `isMessage` rejects it (`typeof null !== "number"`,
+/// `v0.9.2 broker/client.ts:106-116`), throws, and `client.ts:321-329` destroys that receiver's
+/// socket. A hostile sender can thus disconnect an arbitrary third session. cyrup's guard sees the
+/// `null` here and answers `delivery_failed` to the SENDER instead, which is fail-closed and
+/// harms nobody else. That is a deliberate refusal to reproduce an upstream amplification bug, and
+/// it is recorded in `PARITY-GAPS.md` (G136c) rather than left as an undocumented difference.
+///
+/// The slow path runs only after a real `number out of range` error, so well-formed traffic pays
+/// nothing.
+///
+/// # Errors
+///
+/// Returns the `serde_json` error if the payload is not valid JSON for `T` even after the rewrite.
+pub fn from_frame_slice<T: serde::de::DeserializeOwned>(payload: &[u8]) -> serde_json::Result<T> {
+    match serde_json::from_slice::<T>(payload) {
+        Ok(value) => Ok(value),
+        Err(err) if err.classify() == serde_json::error::Category::Syntax => {
+            match null_out_overflowing_numbers(payload) {
+                Some(rewritten) => serde_json::from_slice::<T>(&rewritten),
+                None => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Rewrite every numeric literal whose magnitude overflows the double range to `null`, matching
+/// what `JSON.stringify` emits for the `±Infinity` that `JSON.parse` produced. Returns `None` when
+/// nothing needed rewriting, so the caller keeps the original `serde_json` error.
+///
+/// This is a byte scanner, not a parser: it must recognise string boundaries so a numeric-looking
+/// substring INSIDE a string is never touched, and it must respect backslash escapes so a `\"` does
+/// not end a string early. Both are covered by tests.
+fn null_out_overflowing_numbers(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(payload.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut rewrote = false;
+
+    while i < payload.len() {
+        let Some(&b) = payload.get(i) else { break };
+
+        if in_string {
+            out.push(b);
+            if b == b'\\' {
+                // Copy the escaped byte verbatim so an escaped quote cannot close the string.
+                if let Some(&esc) = payload.get(i + 1) {
+                    out.push(esc);
+                    i += 2;
+                    continue;
+                }
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' {
+            in_string = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+
+        // A number can only start here: `-` or a digit, and only where a value may appear. Scanning
+        // outside strings means the only other `-`/digit bytes are inside numbers we are already
+        // consuming, so this is sufficient.
+        if b == b'-' || b.is_ascii_digit() {
+            let start = i;
+            let mut end = i;
+            while let Some(&c) = payload.get(end) {
+                if c == b'-' || c == b'+' || c == b'.' || c == b'e' || c == b'E' || c.is_ascii_digit()
+                {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            let literal = payload.get(start..end).unwrap_or_default();
+            let overflows = std::str::from_utf8(literal)
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .is_some_and(|f| f.is_infinite());
+            if overflows {
+                out.extend_from_slice(b"null");
+                rewrote = true;
+            } else {
+                out.extend_from_slice(literal);
+            }
+            i = end;
+            continue;
+        }
+
+        out.push(b);
+        i += 1;
+    }
+
+    rewrote.then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]

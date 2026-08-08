@@ -499,10 +499,11 @@ mod tests {
             name: Some(name.to_string()),
             cwd: "/tmp/work".to_string(),
             model: "test-model".to_string(),
-            pid: std::process::id(),
-            started_at: now_ms(),
-            last_activity: now_ms(),
+            pid: std::process::id().into(),
+            started_at: now_ms().into(),
+            last_activity: now_ms().into(),
             status: None,
+            extra: Default::default(),
         }
     }
 
@@ -512,22 +513,27 @@ mod tests {
             name: Some(id.to_string()),
             cwd: cwd.to_string(),
             model: "m".to_string(),
-            pid: 1,
-            started_at: now_ms(),
-            last_activity: now_ms(),
+            pid: 1u32.into(),
+            started_at: now_ms().into(),
+            last_activity: now_ms().into(),
             status: None,
             peer_uid: None,
             trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         }
     }
 
     fn ask_message(id: &str) -> Message {
         Message {
             id: id.to_string(),
-            timestamp: now_ms(),
+            timestamp: now_ms().into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: "hi".to_string(), attachments: None },
+            content: MessageContent { text: "hi".to_string(), attachments: None, ..Default::default() },
+            ..Default::default()
         }
     }
 
@@ -975,7 +981,7 @@ mod tests {
             loop {
                 let event = my_events.recv().await.expect("the event channel delivers");
                 if let crate::transport::client::InboundEvent::Message { from, message } = event {
-                    return (from, message);
+                    return (from, *message);
                 }
             }
         })

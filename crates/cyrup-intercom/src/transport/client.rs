@@ -75,8 +75,11 @@ pub enum InboundEvent {
     Message {
         /// The sender's session info.
         from: SessionInfo,
-        /// The delivered message.
-        message: Message,
+        /// The delivered message. Boxed because `Message` carries the full v0.9.2 envelope
+        /// (`v0.9.2 types.ts:24-40`) plus its `#[serde(flatten)]` spread capture, and this enum is
+        /// fanned out over a `broadcast` channel that clones it once per subscriber — an unboxed
+        /// `Message` would make every `SessionLeft(String)` cost the same as a full message.
+        message: Box<Message>,
     },
     /// A session joined (`client.ts:382-388`).
     SessionJoined(SessionInfo),
@@ -292,10 +295,11 @@ impl IntercomClient {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let message = Message {
             id: message_id.clone(),
-            timestamp: now_ms(),
+            timestamp: now_ms().into(),
             reply_to: options.reply_to,
             expects_reply: options.expects_reply,
-            content: MessageContent { text: options.text, attachments: options.attachments },
+            content: MessageContent { text: options.text, attachments: options.attachments, ..Default::default() },
+            ..Default::default()
         };
         let (tx, rx) = oneshot::channel();
         guard(&self.inner.pending_sends).insert(message_id.clone(), tx);
@@ -365,7 +369,40 @@ impl IntercomClient {
         if self.inner.disconnecting.load(Ordering::SeqCst) || !self.is_connected() {
             return;
         }
-        if let Ok(frame) = encode_json(&ClientMessage::Presence { name, status, model }) {
+        self.update_presence_with_context(name, status, model, None, None, None);
+    }
+
+    /// [`Self::update_presence`] plus the three context-usage fields
+    /// (`v0.9.2 types.ts:86`, applied by the broker at `v0.9.2 broker/broker.ts:918-950`).
+    ///
+    /// Each context argument is a tri-state, exactly as the wire is: `None` omits the key (the
+    /// broker leaves the field untouched), `Some(None)` sends an explicit `null` (the broker
+    /// CLEARS the field — the right thing right after a compaction, when the value is unknown and
+    /// carrying the stale-high one forward would be a lie), and `Some(Some(n))` sets it.
+    ///
+    /// Nothing in cyrup calls this with a populated context yet: producing the numbers needs a
+    /// `getContextUsage()` equivalent from the session layer, which lives in another crate. The
+    /// method exists so the wire model is complete and so the tri-state is exercised end to end.
+    pub fn update_presence_with_context(
+        &self,
+        name: Option<String>,
+        status: Option<String>,
+        model: Option<String>,
+        context_pct: Option<Option<serde_json::Number>>,
+        context_tokens: Option<Option<serde_json::Number>>,
+        context_window: Option<Option<serde_json::Number>>,
+    ) {
+        if self.inner.disconnecting.load(Ordering::SeqCst) || !self.is_connected() {
+            return;
+        }
+        if let Ok(frame) = encode_json(&ClientMessage::Presence {
+            name,
+            status,
+            model,
+            context_pct,
+            context_tokens,
+            context_window,
+        }) {
             let _ = self.inner.send_frame(frame);
         }
     }
@@ -462,6 +499,12 @@ fn broker_message_kind(msg: &BrokerMessage) -> &'static str {
         BrokerMessage::Error { .. } => "error",
         BrokerMessage::Delivered { .. } => "delivered",
         BrokerMessage::DeliveryFailed { .. } => "delivery_failed",
+        BrokerMessage::MessageReceipt { .. } => "message_receipt",
+        BrokerMessage::MessageControl { .. } => "message_control",
+        BrokerMessage::ExtensionOwner { .. } => "extension_owner",
+        BrokerMessage::ExtensionMessage { .. } => "extension_message",
+        BrokerMessage::ExtensionState { .. } => "extension_state",
+        BrokerMessage::ExtensionStateResult { .. } => "extension_state_result",
     }
 }
 
@@ -502,7 +545,9 @@ async fn read_task(
             Err(e) => (e.frames, Some(e.error.to_string())),
         };
         for payload in frames {
-            let msg: BrokerMessage = match serde_json::from_slice(&payload) {
+            // JS-lenient: an overflowing numeric literal must not kill the whole frame — see
+            // `framing::from_frame_slice`.
+            let msg: BrokerMessage = match crate::transport::framing::from_frame_slice(&payload) {
                 Ok(m) => m,
                 Err(e) => {
                     close_reason = format!("intercom protocol error: {e}");
@@ -516,14 +561,15 @@ async fn read_task(
                 }
             };
             let registered = guard(&inner.session_id).is_some();
+            let kind = broker_message_kind(&msg);
             // Any message other than `registered`/`error` arriving before registration is fatal
             // (`client.ts:302-304`) — no frame type is meaningful without a session id yet.
             if !registered && !matches!(msg, BrokerMessage::Registered { .. } | BrokerMessage::Error { .. }) {
-                close_reason = format!("received {} before registered", broker_message_kind(&msg));
+                close_reason = format!("received {kind} before registered");
                 break 'outer;
             }
             match msg {
-                BrokerMessage::Registered { session_id } => {
+                BrokerMessage::Registered { session_id, features: _ } => {
                     if registered {
                         // A second `registered` frame is fatal post-connect (`client.ts:312-314`);
                         // connectionEstablished is already true, so this surfaces as a distinct
@@ -546,7 +592,7 @@ async fn read_task(
                     }
                 }
                 BrokerMessage::Message { from, message } => {
-                    let _ = inner.events.send(InboundEvent::Message { from, message });
+                    let _ = inner.events.send(InboundEvent::Message { from, message: Box::new(message) });
                 }
                 BrokerMessage::Delivered { message_id } => {
                     if let Some(tx) = guard(&inner.pending_sends).remove(&message_id) {
@@ -570,6 +616,38 @@ async fn read_task(
                 }
                 BrokerMessage::PresenceUpdate { session } => {
                     let _ = inner.events.send(InboundEvent::PresenceUpdate(session));
+                }
+                // v0.9.x frames this client decodes but does not yet act on. Decoding them is what
+                // keeps the connection ALIVE: before these variants existed, a `message_receipt`
+                // — which pi's broker forwards to the original sender the moment a route exists
+                // (`v0.9.2 broker/broker.ts:812-818`) — was an `unknown variant` serde error, i.e.
+                // `close_reason` + `break 'outer`, so the first message a cyrup client successfully
+                // sent to a pi peer killed its own connection.
+                //
+                // Reacting to them is deliberately NOT done here: pi's client re-emits them as
+                // `message_receipt`/`message_control` events (`v0.9.2 broker/client.ts:475-491`)
+                // and the session-side handling of those is a separate, larger port. Dropping them
+                // is a strict improvement over disconnecting and loses nothing that was previously
+                // delivered.
+                BrokerMessage::MessageReceipt { .. } | BrokerMessage::MessageControl { .. } => {
+                    tracing::debug!(
+                        kind,
+                        "intercom client: v0.9.x frame decoded but not yet surfaced"
+                    );
+                }
+                // Extension-bus frames (`v0.9.2 types.ts:115-136`). Unreachable in practice: pi's
+                // broker only routes these to a session that advertised `extensions` in its
+                // `register` (`isCapable`, `v0.9.2 broker/broker.ts:1209`), and cyrup's
+                // `SessionRegistration` has no such field. Modelled anyway so a future/misbehaving
+                // broker cannot tear the connection down.
+                BrokerMessage::ExtensionOwner { .. }
+                | BrokerMessage::ExtensionMessage { .. }
+                | BrokerMessage::ExtensionState { .. }
+                | BrokerMessage::ExtensionStateResult { .. } => {
+                    tracing::debug!(
+                        kind,
+                        "intercom client: extension-bus frame ignored (bus not implemented)"
+                    );
                 }
                 BrokerMessage::Error { error } => {
                     if !registered {
@@ -632,10 +710,11 @@ mod tests {
             name: None,
             cwd: "/tmp".to_string(),
             model: "m".to_string(),
-            pid: 1,
-            started_at: now_ms(),
-            last_activity: now_ms(),
+            pid: 1u32.into(),
+            started_at: now_ms().into(),
+            last_activity: now_ms().into(),
             status: None,
+            extra: Default::default(),
         }
     }
 
@@ -654,7 +733,7 @@ mod tests {
             if let Some(payload) = reader.push(&buf[..n]).expect("frames").into_iter().next() {
                 let frame: serde_json::Value = serde_json::from_slice(&payload).expect("json");
                 let registered =
-                    encode_json(&BrokerMessage::Registered { session_id: "s1".to_string() })
+                    encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None })
                         .expect("encodes");
                 stream.write_all(&registered).await.expect("write");
                 return frame;
@@ -806,7 +885,7 @@ mod tests {
         let mut events = inner.events.subscribe();
         tokio::spawn(read_task(read_half, inner, reg_tx));
 
-        let registered = encode_json(&BrokerMessage::Registered { session_id: "s1".to_string() }).expect("encodes");
+        let registered = encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None }).expect("encodes");
         b.write_all(&registered).await.expect("write");
         let first = tokio::time::timeout(Duration::from_secs(2), reg_rx)
             .await
@@ -846,7 +925,7 @@ mod tests {
         let mut events = inner.events.subscribe();
         tokio::spawn(read_task(read_half, inner, reg_tx));
 
-        let registered = encode_json(&BrokerMessage::Registered { session_id: "s1".to_string() }).expect("encodes");
+        let registered = encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None }).expect("encodes");
         b.write_all(&registered).await.expect("write");
         tokio::time::timeout(Duration::from_secs(2), reg_rx)
             .await
@@ -887,7 +966,7 @@ mod tests {
         let mut events = inner.events.subscribe();
         tokio::spawn(read_task(read_half, inner, reg_tx));
 
-        let registered = encode_json(&BrokerMessage::Registered { session_id: "s1".to_string() }).expect("encodes");
+        let registered = encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None }).expect("encodes");
         b.write_all(&registered).await.expect("write");
         tokio::time::timeout(Duration::from_secs(2), reg_rx)
             .await
@@ -902,19 +981,24 @@ mod tests {
             name: Some("sender".to_string()),
             cwd: "/w".to_string(),
             model: "m".to_string(),
-            pid: 1,
-            started_at: 0,
-            last_activity: 0,
+            pid: 1u32.into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
             status: None,
             peer_uid: None,
             trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         };
         let message = Message {
             id: "q1".to_string(),
-            timestamp: 0,
+            timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: "hi".to_string(), attachments: None },
+            content: MessageContent { text: "hi".to_string(), attachments: None, ..Default::default() },
+            ..Default::default()
         };
         let mut chunk = encode_json(&BrokerMessage::Message { from, message }).expect("encodes");
         let bad_len = (crate::transport::framing::MAX_FRAME_BYTES as u32) + 1;
@@ -939,6 +1023,147 @@ mod tests {
             .expect("a disconnected event follows")
             .expect("channel open");
         assert!(matches!(third_evt, InboundEvent::Disconnected(_)), "{third_evt:?}");
+    }
+
+    fn test_session_info(id: &str) -> SessionInfo {
+        SessionInfo {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            cwd: "/w".to_string(),
+            model: "m".to_string(),
+            pid: 1u32.into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
+            status: None,
+            peer_uid: None,
+            trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// Drive `read_task` to a registered state over a socketpair; returns the peer end, an event
+    /// receiver, and the two handles the caller must keep alive for the socket to stay open.
+    #[allow(clippy::type_complexity)]
+    async fn registered_read_task() -> (
+        UnixStream,
+        broadcast::Receiver<InboundEvent>,
+        (BrokerWriteHalf, mpsc::UnboundedReceiver<WriterCmd>),
+    ) {
+        let (a, mut b) = UnixStream::pair().expect("socketpair");
+        let (read_half, write_half) = BrokerStream::new(a).into_split();
+        let (inner, wrx) = bare_inner();
+        let (reg_tx, reg_rx) = oneshot::channel();
+        let events = inner.events.subscribe();
+        tokio::spawn(read_task(read_half, inner, reg_tx));
+        let registered =
+            encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None })
+                .expect("encodes");
+        b.write_all(&registered).await.expect("write");
+        tokio::time::timeout(Duration::from_secs(2), reg_rx)
+            .await
+            .expect("registers")
+            .expect("oneshot not dropped")
+            .expect("registration succeeds");
+        (b, events, (write_half, wrx))
+    }
+
+    // G136(a), client side. pi >= 0.9.0 brokers forward a `message_receipt` to the ORIGINAL SENDER
+    // as soon as a route exists (`v0.9.2 broker/broker.ts:812-818`) and send a `message_control` to
+    // the RECEIVER on any peer cancel (`:852-860`) or supersede (`:684-688`). Regression proof:
+    // before `BrokerMessage` carried these variants, `serde_json::from_slice` returned an
+    // `unknown variant` error, which this reader turns into `close_reason` + `break 'outer` — so
+    // the FIRST message a cyrup client successfully sent to a pi peer killed its own connection.
+    // Against that pre-fix behavior the `Message` assertion below never fires: the reader is gone.
+    #[tokio::test]
+    async fn read_task_survives_v0_9_x_receipt_and_control_frames() {
+        let (mut b, mut events, _keepalive) = registered_read_task().await;
+
+        // Written as RAW wire frames on purpose: these are bytes a pi >= 0.9.0 broker puts on the
+        // socket, and encoding them through `BrokerMessage` would only prove the enum round-trips
+        // to itself.
+        let peer = serde_json::to_value(test_session_info("peer")).expect("encodes");
+        for frame in [
+            serde_json::json!({
+                "type": "message_receipt", "from": peer,
+                "receipt": { "messageId": "m1", "status": "receiver_received", "timestamp": 1 },
+            }),
+            serde_json::json!({
+                "type": "message_control", "from": peer,
+                "control": { "messageId": "m1", "action": "cancel", "timestamp": 1 },
+            }),
+            serde_json::json!({
+                "type": "extension_owner", "namespace": "ns", "ownerId": "s2", "ownerEpoch": "e1",
+            }),
+        ] {
+            b.write_all(&encode_json(&frame).expect("encodes")).await.expect("write");
+        }
+
+        // The connection must still be reading: a normal `message` after all of the above surfaces.
+        let follow_up = encode_json(&BrokerMessage::Message {
+            from: test_session_info("peer"),
+            message: Message {
+                id: "m2".to_string(),
+                timestamp: 0u64.into(),
+                content: MessageContent { text: "still alive".to_string(), ..Default::default() },
+                ..Default::default()
+            },
+        })
+        .expect("encodes");
+        b.write_all(&follow_up).await.expect("write");
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("the connection must still be reading after the v0.9.x frames")
+            .expect("channel open");
+        match evt {
+            InboundEvent::Message { message, .. } => assert_eq!(message.content.text, "still alive"),
+            other => panic!("expected the follow-up message, got {other:?}"),
+        }
+    }
+
+    // MIRROR for the test above. Modelling the v0.9.2 tag set must not make the reader credulous:
+    // a tag from some *later* protocol version is still fatal, exactly as it is upstream
+    // (`default: throw new Error(\`Unknown broker message type\`)`, `v0.9.2 broker/client.ts:599-600`,
+    // routed to `socket.destroy()` by `framing.ts:44-51`), and so is a KNOWN tag whose payload does
+    // not type-check (pi's `isMessageReceipt` guard, `v0.9.2 broker/client.ts:56-65`).
+    #[tokio::test]
+    async fn read_task_still_closes_on_unknown_tag_and_on_malformed_known_tag() {
+        for bad in [
+            serde_json::json!({ "type": "pi_quantum_v2", "whatever": 1 }),
+            serde_json::json!({
+                "type": "message_receipt",
+                "from": { "id": "p", "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+                "receipt": { "messageId": "m1", "status": "teleported", "timestamp": 1 },
+            }),
+            serde_json::json!({
+                "type": "message_control",
+                "from": { "id": "p", "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+                "control": { "messageId": "m1", "timestamp": 1 },
+            }),
+        ] {
+            let (mut b, mut events, _keepalive) = registered_read_task().await;
+            b.write_all(&encode_json(&bad).expect("encodes")).await.expect("write");
+
+            let mut saw_error = false;
+            let mut saw_disconnected = false;
+            for _ in 0..3 {
+                match tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+                    Ok(Ok(InboundEvent::Error(_))) => saw_error = true,
+                    Ok(Ok(InboundEvent::Disconnected(_))) => {
+                        saw_disconnected = true;
+                        break;
+                    }
+                    Ok(Ok(other)) => panic!("unexpected event for {bad}: {other:?}"),
+                    Ok(Err(e)) => panic!("event channel error: {e}"),
+                    Err(_) => break,
+                }
+            }
+            assert!(saw_error, "a protocol error event must precede teardown for {bad}");
+            assert!(saw_disconnected, "the connection must still be torn down for {bad}");
+        }
     }
 
     // dossier item 6 (client.ts:235-240): a write-path failure must propagate the real error and

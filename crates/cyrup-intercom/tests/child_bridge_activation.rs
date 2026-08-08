@@ -81,10 +81,11 @@ fn registration(name: &str) -> SessionRegistration {
         name: Some(name.to_string()),
         cwd: "/tmp/work".to_string(),
         model: "test-model".to_string(),
-        pid: std::process::id(),
-        started_at: now_ms(),
-        last_activity: now_ms(),
+        pid: std::process::id().into(),
+        started_at: now_ms().into(),
+        last_activity: now_ms().into(),
         status: None,
+        extra: Default::default(),
     }
 }
 
@@ -95,7 +96,7 @@ async fn next_message(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(InboundEvent::Message { from, message })) => return (from, message),
+            Ok(Ok(InboundEvent::Message { from, message })) => return (from, *message),
             Ok(Ok(_other)) => continue,
             Ok(Err(e)) => panic!("event channel error: {e}"),
             Err(_) => panic!("timed out waiting for the child's ask over the broker"),

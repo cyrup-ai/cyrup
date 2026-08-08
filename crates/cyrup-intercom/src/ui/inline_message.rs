@@ -196,22 +196,27 @@ mod tests {
             name: Some("sender".to_string()),
             cwd: "/tmp/project".to_string(),
             model: "model".to_string(),
-            pid: 1,
-            started_at: 0,
-            last_activity: 0,
+            pid: 1u32.into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
             status: None,
             peer_uid: None,
             trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         }
     }
 
     fn message(text: &str) -> Message {
         Message {
             id: "message-1".to_string(),
-            timestamp: 0,
+            timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: None,
-            content: MessageContent { text: text.to_string(), attachments: None },
+            content: MessageContent { text: text.to_string(), attachments: None, ..Default::default() },
+            ..Default::default()
         }
     }
 
@@ -260,6 +265,7 @@ mod tests {
             name: "note.txt".to_string(),
             content: "important details".to_string(),
             language: None,
+            extra: Default::default(),
         }]);
         let card = InlineMessage {
             from: from(),

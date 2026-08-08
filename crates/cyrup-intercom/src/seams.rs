@@ -113,19 +113,24 @@ impl DeliveryChannel for IntercomDeliveryChannel {
                     name: Some(LOCAL_RELAY_SENDER.to_string()),
                     cwd: self.state.cwd.display().to_string(),
                     model: LOCAL_RELAY_SENDER.to_string(),
-                    pid: std::process::id(),
-                    started_at: now,
-                    last_activity: now,
+                    pid: std::process::id().into(),
+                    started_at: now.into(),
+                    last_activity: now.into(),
                     status: Some(LOCAL_RELAY_STATUS.to_string()),
                     peer_uid: None,
                     trusted_local: None,
+                    context_pct: None,
+                    context_tokens: None,
+                    context_window: None,
+                    extra: Default::default(),
                 };
                 let message = Message {
                     id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now,
+                    timestamp: now.into(),
                     reply_to: None,
                     expects_reply: None,
-                    content: MessageContent { text, attachments: None },
+                    content: MessageContent { text, attachments: None, ..Default::default() },
+                    ..Default::default()
                 };
                 // Best-effort surface + trigger-turn: neither leg's failure changes "delivered
                 // locally" (a bound live session IS the local delivery target, pi's own semantics).
@@ -329,19 +334,24 @@ mod tests {
             name: Some("subagent-chat-1".to_string()),
             cwd: "/w".to_string(),
             model: "m".to_string(),
-            pid: 1,
-            started_at: 0,
-            last_activity: 0,
+            pid: 1u32.into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
             status: None,
             peer_uid: None,
             trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         };
         let msg = Message {
             id: "question-123".to_string(),
-            timestamp: 0,
+            timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: body, attachments: None },
+            content: MessageContent { text: body, attachments: None, ..Default::default() },
+            ..Default::default()
         };
         state.tracker.lock().unwrap().record_incoming_message(from, msg, now_ms());
 
@@ -367,19 +377,24 @@ mod tests {
             name: Some("subagent-chat-1".to_string()),
             cwd: "/w".to_string(),
             model: "m".to_string(),
-            pid: 1,
-            started_at: 0,
-            last_activity: 0,
+            pid: 1u32.into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
             status: None,
             peer_uid: None,
             trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         };
         let msg = Message {
             id: "question-123".to_string(),
-            timestamp: 0,
+            timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: body, attachments: None },
+            content: MessageContent { text: body, attachments: None, ..Default::default() },
+            ..Default::default()
         };
         state.tracker.lock().unwrap().record_incoming_message(from, msg, now_ms());
 

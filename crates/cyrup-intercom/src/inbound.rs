@@ -345,6 +345,7 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
         loop {
             match rx.recv().await {
                 Ok(InboundEvent::Message { from, message }) => {
+                    let message = *message;
                     // (1) Resolve an outstanding OUTBOUND ask first (index.ts:715-724). When matched,
                     //     the message is the reply to our own ask — do NOT also surface it.
                     if state.waiter.try_deliver(&from, &message) {
@@ -495,22 +496,27 @@ mod tests {
             name: Some("subagent-chat-1".to_string()),
             cwd: "/w".to_string(),
             model: "m".to_string(),
-            pid: 1,
-            started_at: 0,
-            last_activity: 0,
+            pid: 1u32.into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
             status: None,
             peer_uid: None,
             trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         }
     }
 
     fn ask(text: &str) -> Message {
         Message {
             id: "q1".to_string(),
-            timestamp: 0,
+            timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: text.to_string(), attachments: None },
+            content: MessageContent { text: text.to_string(), attachments: None, ..Default::default() },
+            ..Default::default()
         }
     }
 
@@ -533,6 +539,7 @@ mod tests {
             name: "ctx.md".to_string(),
             content: "details".to_string(),
             language: None,
+            extra: Default::default(),
         }]);
         let card = build_inline_message(&s, &from(), &msg);
         assert!(card.body().contains("see this"));
