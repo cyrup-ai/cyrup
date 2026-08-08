@@ -107,9 +107,24 @@ pub enum SelectorKind {
     Trust,
     /// Fork-from-message picker (`/fork`, `user-message-selector.ts`).
     UserMessage,
-    /// Provider login picker (`/login`, `oauth-selector.ts`).
+    /// Provider login picker (`/login`, `oauth-selector.ts`). Confirming carries the chosen row's
+    /// INDEX into [`crate::app::AppState::login_options`] (the resolved `AuthSelectorProvider[]`),
+    /// not the provider id: one provider can offer two rows (oauth + api key) and the id alone
+    /// cannot tell them apart (`getLoginProviderOptions`, `interactive-mode.ts:4938-4968`).
     Login,
-    /// Provider logout picker (`/logout`, `oauth-selector.ts`).
+    /// The auth-method choice shown when `/login` has not yet pinned one — Pi's
+    /// `showLoginAuthTypeSelector` (`interactive-mode.ts:5028-5051`). Confirming carries
+    /// `"oauth"` / `"api_key"`.
+    LoginAuthType,
+    /// The live login dialog (`LoginDialogComponent`, `components/login-dialog.ts`) occupying the
+    /// input slot for the whole flow. Unlike every other kind this one is NOT a picker: it is
+    /// driven by the spawned login task through [`crate::app::App::apply_login_msg`], and its
+    /// `Confirm`/`Cancel` answer the flow's in-flight `AuthInteraction::prompt` rather than
+    /// producing a selection.
+    LoginDialog,
+    /// Provider logout picker (`/logout`, `oauth-selector.ts`). Confirming carries the chosen row's
+    /// INDEX into [`crate::app::AppState::logout_options`] (`getLogoutProviderOptions`,
+    /// `interactive-mode.ts:4970-4979`).
     Logout,
     /// A loaded extension's `ui.confirm` dialog (L4 review §2.1): a Yes/No [`ListSelector`], exactly
     /// Pi's confirm-as-select (`interactive-mode.ts:2172-2179`). Resolved fully in-crate against the
@@ -144,6 +159,9 @@ impl SelectorKind {
                 | SelectorKind::ExtensionSelect
                 | SelectorKind::ExtensionInput
                 | SelectorKind::ExtensionEditor
+                // The login dialog answers the flow's in-flight prompt over a one-shot held on
+                // `AppState::pending_login_prompt`; nothing reaches the run loop as a command.
+                | SelectorKind::LoginDialog
         )
     }
 
@@ -163,8 +181,15 @@ impl SelectorKind {
             SelectorKind::BranchSummaryInstructions => "Custom summarization instructions",
             SelectorKind::Trust => "Project Trust",
             SelectorKind::UserMessage => "Fork from Message",
-            SelectorKind::Login => "Login",
-            SelectorKind::Logout => "Logout",
+            // `OAuthSelectorComponent`'s own titles (`oauth-selector.ts:70`), verbatim.
+            SelectorKind::Login => "Select provider to configure:",
+            // `showLoginAuthTypeSelector`'s bare-`/login` title (`interactive-mode.ts:5058`); the
+            // per-provider form (`Select authentication method for X:`) is set by
+            // `resolve_auth_type_selector` and installed with `Selector::set_title`.
+            SelectorKind::LoginAuthType => "Select authentication method:",
+            // Overwritten with `` `Login to ${providerName}` `` (`login-dialog.ts:41`) at open time.
+            SelectorKind::LoginDialog => "Login",
+            SelectorKind::Logout => "Select provider to logout:",
             SelectorKind::ExtensionConfirm => "Confirm",
             SelectorKind::ExtensionSelect => "Select",
             SelectorKind::ExtensionInput => "Input",
@@ -237,6 +262,19 @@ pub trait Selector: Send {
     /// ExtensionEditorSelector`] overrides it. The chrome calls this ONLY on a clean exit (Pi's
     /// `status === 0` gate), never on a cancelled/failed edit.
     fn apply_external_edit(&mut self, _text: &str) {}
+    /// Downcast to the `/login` dialog, if that is what occupies the slot — `None` (the default) for
+    /// every other selector.
+    ///
+    /// A targeted accessor rather than an `Any` downcast, in the same spirit as
+    /// [`Self::external_edit_text`]/[`Self::apply_external_edit`] above (also overridden by exactly
+    /// one implementor). The `/login` dialog is the only selector whose content is mutated by
+    /// something *other* than a key press: the spawned login task pushes `AuthEvent`s and prompts at
+    /// it through [`crate::app::App::apply_login_msg`], which needs `&mut LoginDialog` out of the
+    /// `Box<dyn Selector>` the slot holds. Pi has the same need and solves it by keeping a typed
+    /// `dialog` local in scope across the `await` (`interactive-mode.ts:5379-5403`).
+    fn as_login_dialog(&mut self) -> Option<&mut crate::login_dialog::LoginDialog> {
+        None
+    }
 }
 
 /// The shared list-selector engine (spec/tui/05 §3.2 `ListView<T>`): a [`SelectList`] body wrapped in

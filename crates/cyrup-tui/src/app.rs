@@ -21,6 +21,10 @@ use cyrup_core::{CancelToken, EventStream, ModelThinkingLevel};
 // label-append the `/tree` `e` rename persists through — the SAME path a guest's `setLabel` uses,
 // host_services.rs:866) into scope.
 use cyrup_ext::host::HostServices;
+use cyrup_config::login::{
+    AuthType, LoginCommand, LoginProviderOption, LoginStep, ProviderLoginInput,
+};
+use cyrup_provider::auth::oauth::OAuthError;
 use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
 use cyrup_session_svc::{
@@ -54,6 +58,10 @@ use crate::error::TuiError;
 use crate::extension_editor::ExtensionEditorSelector;
 use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
 use crate::keymap::{Action, EditorAction, Key, Keymap, SelectKeymap, TreeKeymap};
+use crate::login_dialog::{
+    notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginUiMsg,
+    TuiAuthInteraction,
+};
 use crate::model_selector::{ModelEntry, ModelSelector};
 use crate::overlay::{HotkeyRow, HotkeysOverlay, Overlay, OverlayOutcome};
 use crate::selector::{
@@ -166,6 +174,13 @@ pub enum AppCommand {
     /// otherwise opens the picker pre-filtered to `text`. The run loop resolves the exact-match against
     /// the live catalog (`findExactModelReferenceMatch`), so the search term rides the command.
     ModelCommand(Option<String>),
+    /// `/login [provider]` (`handleLoginCommand`, interactive-mode.ts:4993-5026): bare (`None`)
+    /// opens the auth-method choice; a `Some(ref)` that matches exactly one provider option starts
+    /// that login immediately, one that matches several rows of the SAME provider opens the
+    /// method choice for it, and anything else opens the full provider picker. Resolution needs
+    /// the live registry + credential store, so — like [`Self::ModelCommand`] — the argument rides
+    /// the command and the run loop resolves it.
+    LoginCommand(Option<String>),
     /// Persist an entry's `/tree` label (Pi `onLabelChange` → `sessionManager.appendLabelChange`,
     /// interactive-mode.ts:4589-4591): set/replace when `label` is non-empty, remove when empty
     /// (`apply_label` drops empty labels). The run loop applies it via the session's `set_label` path.
@@ -342,6 +357,31 @@ pub struct AppState {
     /// is what fills [`StatusLine::branch`]. Boots as "no repo" and is pointed at the session cwd by
     /// [`App::set_footer_git_cwd`]; the run loop re-polls it so a `git checkout` elsewhere repaints.
     pub git_branch: crate::footer_data::FooterGitBranch,
+    /// The `AuthSelectorProvider[]` backing the open `/login` picker — Pi's `providerOptions` local
+    /// (`showLoginProviderSelector`, `interactive-mode.ts:5086-5148`). Confirming carries the row
+    /// INDEX into this vector, because one provider can contribute two rows (oauth + api key) and
+    /// the provider id alone cannot disambiguate them.
+    login_options: Vec<cyrup_config::login::LoginProviderOption>,
+    /// The `/logout` twin of [`Self::login_options`] (`getLogoutProviderOptions`,
+    /// `interactive-mode.ts:4970-4979`). Carries each row's `authType`, which picks between Pi's two
+    /// logout status messages (`interactive-mode.ts:5159-5162`).
+    logout_options: Vec<cyrup_config::login::LoginProviderOption>,
+    /// The provider options an open [`SelectorKind::LoginAuthType`] selector is choosing BETWEEN —
+    /// Pi's `providerOptions?` argument to `showLoginAuthTypeSelector`
+    /// (`interactive-mode.ts:5028`). `None` for a bare `/login` (the method choice then opens the
+    /// provider picker filtered to it, `:5063-5070`); `Some` when `/login <provider>` already
+    /// pinned one provider that offers both methods (`:4998-5009`).
+    login_auth_type_options: Option<Vec<cyrup_config::login::LoginProviderOption>>,
+    /// The REPLY half of the login prompt the flow is currently blocked on — the login twin of
+    /// [`Self::pending_ui_reply`]. The spawned login task's `AuthInteraction::prompt` awaits this
+    /// one-shot (`login_dialog::TuiAuthInteraction::prompt`, Pi's `inputResolver`/`inputRejecter`
+    /// pair, `login-dialog.ts:16-17`); [`App::confirm_selector`] resolves it with the typed answer
+    /// and [`App::handle_selector_key`]'s `Cancel` arm rejects it with `"Login cancelled"`.
+    pending_login_prompt: Option<tokio::sync::oneshot::Sender<Result<String, OAuthError>>>,
+    /// The dialog's `AbortController` (`login-dialog.ts:15`, `:73-75`) for the flow currently on
+    /// screen: `cancel()` fires it so a flow blocked on something other than a prompt (a callback
+    /// server, a device-code poll) also unwinds. `None` whenever no login is in flight.
+    login_cancel: Option<CancelToken>,
 }
 
 /// Row values of the "Summarize branch?" prompt. Pi compares the returned LABELS
@@ -408,6 +448,11 @@ impl AppState {
             // the runtime's cwd via [`App::set_footer_git_cwd`] before the first frame. Booting as
             // "no repo" keeps a backend-only `AppState` free of any filesystem probe.
             git_branch: crate::footer_data::FooterGitBranch::none(),
+            login_options: Vec::new(),
+            logout_options: Vec::new(),
+            login_auth_type_options: None,
+            pending_login_prompt: None,
+            login_cancel: None,
         }
     }
 
@@ -596,7 +641,30 @@ pub struct App<B: Backend> {
     /// [`App::run`]; `None` (no channel wired, or the network policy declined) means the run loop
     /// grows no arm for it at all. The producer is `cyrup::update_check::spawn_package_update_check`.
     package_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<String>>>,
+    /// Where the spawned `/login` flow posts prompts, progress events and its final outcome —
+    /// installed by [`App::install_login_channel`], which [`App::run`] calls once at startup (the
+    /// same shape as [`Self::tree_nav_tx`]).
+    ///
+    /// `None` means no run loop is servicing the channel, and [`App::begin_provider_login`] then
+    /// refuses to start a flow rather than spawning a task whose first `prompt` would block
+    /// forever. There is no inline fallback here, unlike `/tree`'s: EVERY login flow is interactive
+    /// by construction (that is what `AuthInteraction` is for), so an unattended one cannot
+    /// complete.
+    login_tx: Option<tokio::sync::mpsc::UnboundedSender<LoginUiMsg>>,
+    /// Where [`App::login_provider_inputs`] sources the provider registry Pi reads off
+    /// `modelRuntime` (`getLoginProviderOptions`, `interactive-mode.ts:4939`).
+    ///
+    /// Defaults to `cyrup_provider::all_providers()` — the compiled-in built-ins, which is where
+    /// all 11 ported OAuth flows and every `env_key` strategy live. Overridable via
+    /// [`App::set_login_provider_source`] so a test can drive the whole `/login` path against a
+    /// stub provider WITHOUT reaching a real endpoint (see `tests/login_flow.rs`).
+    login_providers: Option<LoginProviderSource>,
 }
+
+/// Where `/login` reads the provider registry from — Pi's `modelRuntime.getProviders()`
+/// (`interactive-mode.ts:4943`). See [`App::set_login_provider_source`].
+pub type LoginProviderSource =
+    Arc<dyn Fn() -> Vec<Arc<dyn cyrup_provider::Provider>> + Send + Sync>;
 
 /// A spawned `/tree` navigation's outcome, posted back to [`App::run`]'s `select!` so the summarize
 /// leg never runs on the loop task (the `bash_rx` / `shortcut_status_rx` channel-back pattern).
@@ -641,6 +709,8 @@ impl<B: Backend> App<B> {
             live_floor: 0,
             tree_nav_tx: None,
             package_update_rx: None,
+            login_tx: None,
+            login_providers: None,
         })
     }
 
@@ -1442,7 +1512,9 @@ impl<B: Backend> App<B> {
             "resume" => cmd(C::OpenSelector(SelectorKind::Session)),
             "trust" => cmd(C::OpenSelector(SelectorKind::Trust)),
             "fork" => cmd(C::OpenSelector(SelectorKind::UserMessage)),
-            "login" => cmd(C::OpenSelector(SelectorKind::Login)),
+            // `/login [provider]` threads its argument the same way `/model` does
+            // (`handleLoginCommand(providerRef?)`, interactive-mode.ts:2810).
+            "login" => cmd(C::LoginCommand(arg)),
             "logout" => cmd(C::OpenSelector(SelectorKind::Logout)),
             // --- session lifecycle / IO (run loop) ---
             "new" => cmd(C::NewSession),
@@ -1873,6 +1945,375 @@ impl<B: Backend> App<B> {
         rx
     }
 
+    // ========================================================================
+    // `/login` + `/logout` (Pi `interactive-mode.ts:4941-5051`, `:5229-5403`)
+    // ========================================================================
+
+    /// Install the off-task `/login` channel and hand back its receiver.
+    ///
+    /// [`App::run`] calls this once at startup, exactly like
+    /// [`Self::install_tree_nav_channel`]. Without it [`Self::begin_provider_login`] refuses to
+    /// start a flow — see [`Self::login_tx`] for why there is no inline fallback.
+    ///
+    /// `pub` so `tests/*.rs` can drive a whole login without standing up a run loop (the crate's
+    /// established run-loop-only testing seam, same as [`Self::open_extension_dialog`]).
+    pub fn install_login_channel(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<LoginUiMsg> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<LoginUiMsg>();
+        self.login_tx = Some(tx);
+        rx
+    }
+
+    /// Override where `/login` sources its provider registry (default:
+    /// `cyrup_provider::all_providers()`).
+    ///
+    /// This is the offline-test seam mandated by the "tests must never hit real provider APIs"
+    /// convention: a test injects a provider whose `OAuthAuth::login` is a pure in-process function,
+    /// so the full `/login` path — picker → dialog → `AuthInteraction` → `cyrup_config::login::login`
+    /// → credential store — runs end to end with no socket opened. Production never calls it.
+    pub fn set_login_provider_source(&mut self, source: LoginProviderSource) {
+        self.login_providers = Some(source);
+    }
+
+    /// `this.session.modelRuntime.getProviders()` + `getProviderAuthStatus` + `isUsingOAuth`, the
+    /// three registry reads `getLoginProviderOptions` folds together
+    /// (`interactive-mode.ts:4943-4947`).
+    ///
+    /// Pi's `Provider` interface carries `name`; cyrup's does not (the display name lives on the
+    /// concrete `WireProvider`), so the name comes from [`crate::provider_display_name`] — the same
+    /// `getProviderDisplayName` fallback the picker already used for its labels.
+    async fn login_provider_inputs(&self, session: &Arc<AgentSession>) -> Vec<ProviderLoginInput> {
+        Self::build_login_inputs(session, self.login_providers.as_deref()).await
+    }
+
+    /// The `&self`-free form of [`Self::login_provider_inputs`], so the spawned login task can
+    /// rebuild the inputs itself — `ProviderLoginInput` is not `Clone`, so the vector cannot be
+    /// handed across.
+    ///
+    /// The stored-credential kinds are read ONCE (`listCredentials()`, `auth-storage.ts:252-254`)
+    /// rather than per provider: pi answers `isUsingOAuth` off a single in-memory
+    /// `snapshot.auth` map (`model-runtime.ts:368`), and a read-per-provider would be ~31
+    /// lock-and-parse round trips through `auth.json` every time `/login` opens.
+    async fn build_login_inputs(
+        session: &Arc<AgentSession>,
+        source: Option<&(dyn Fn() -> Vec<Arc<dyn cyrup_provider::Provider>> + Send + Sync)>,
+    ) -> Vec<ProviderLoginInput> {
+        let store = &session.services().auth;
+        let stored = cyrup_config::login::stored_credentials(store)
+            .await
+            .unwrap_or_default();
+        let providers = match source {
+            Some(source) => source(),
+            None => cyrup_provider::all_providers(),
+        };
+        let mut out = Vec::with_capacity(providers.len());
+        for provider in providers {
+            // `provider.auth` — a provider with no auth strategy at all contributes no row
+            // (`:4948`/`:4957` both test a member of it).
+            let Some(auth) = provider.provider_auth().cloned() else {
+                continue;
+            };
+            let id = provider.id().clone();
+            // `isUsingOAuth(id)`: `snapshot.auth.get(id)?.type === "oauth"` — the STORED
+            // credential's kind, not the provider's capability.
+            let using_oauth = stored
+                .iter()
+                .any(|(p, t)| p.as_str() == id.as_str() && *t == AuthType::Oauth);
+            out.push(ProviderLoginInput {
+                name: crate::provider_display_name(id.as_str()),
+                status: cyrup_config::login::provider_auth_status(store, &id, None),
+                id,
+                auth,
+                using_oauth,
+            });
+        }
+        out
+    }
+
+    /// The accumulated body text of the open `/login` dialog (`None` when no dialog is open) —
+    /// test/inspection access to what the flow has drawn so far, the same role
+    /// [`Self::active_selector_kind`] plays for the slot itself.
+    pub fn login_dialog_body(&mut self) -> Option<String> {
+        self.login_dialog_mut().map(|d| d.body_text())
+    }
+
+    /// The open `/login` dialog's title (`` `Login to ${providerName}` ``), for the same reason.
+    pub fn login_dialog_title(&mut self) -> Option<String> {
+        self.login_dialog_mut().map(|d| d.title().to_string())
+    }
+
+    /// The `/login` dialog currently in the input slot, if any.
+    fn login_dialog_mut(&mut self) -> Option<&mut LoginDialog> {
+        self.state
+            .selector
+            .as_mut()
+            .filter(|s| s.kind == SelectorKind::LoginDialog)
+            .and_then(|s| s.inner.as_login_dialog())
+    }
+
+    /// `handleLoginCommand(providerRef?)` (`interactive-mode.ts:4994-5026`), routed through the
+    /// ported [`cyrup_config::login::resolve_login_command`].
+    async fn handle_login_command(&mut self, session: &Arc<AgentSession>, arg: Option<String>) {
+        let inputs = self.login_provider_inputs(session).await;
+        let options = cyrup_config::login::login_provider_options(&inputs, None);
+        match cyrup_config::login::resolve_login_command(arg.as_deref(), &options) {
+            // `startProviderLogin(providerOptions[0])` (`:5000-5003`).
+            LoginCommand::Start(option) => self.begin_provider_login(session, *option),
+            // `showLoginAuthTypeSelector(providerOptions?)` (`:4997`, `:5010`).
+            LoginCommand::AuthTypeSelector { options } => {
+                self.open_login_auth_type_selector(session, options)
+            }
+            // `showLoginProviderSelector(undefined, providerRef)` (`:5013`).
+            LoginCommand::ProviderSelector {
+                auth_type,
+                initial_search,
+            } => self.open_login_provider_selector(&inputs, auth_type, initial_search),
+        }
+    }
+
+    /// `showLoginAuthTypeSelector(providerOptions?)` (`interactive-mode.ts:5028-5051`), routed
+    /// through the ported [`cyrup_config::login::resolve_auth_type_selector`].
+    fn open_login_auth_type_selector(
+        &mut self,
+        session: &Arc<AgentSession>,
+        options: Option<Vec<LoginProviderOption>>,
+    ) {
+        match cyrup_config::login::resolve_auth_type_selector(options.as_deref()) {
+            // `showStatus("No login methods available.")` (`:5046`).
+            cyrup_config::login::AuthTypeSelector::Unavailable => {
+                self.state
+                    .transcript
+                    .push_status(cyrup_config::login::NO_LOGIN_METHODS);
+            }
+            // One provider, one method: the selector is skipped entirely (`:5049-5055`).
+            cyrup_config::login::AuthTypeSelector::Start(option) => {
+                self.state.login_auth_type_options = None;
+                self.begin_provider_login(session, *option);
+            }
+            cyrup_config::login::AuthTypeSelector::Choose {
+                title,
+                subscription_label,
+                api_key_label,
+            } => {
+                // `options` in Pi's order: the subscription label first (`:5036-5041`).
+                let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
+                if let Some(label) = subscription_label {
+                    rows.push((AuthType::Oauth.as_str().to_string(), label, None));
+                }
+                if let Some(label) = api_key_label {
+                    rows.push((AuthType::ApiKey.as_str().to_string(), label, None));
+                }
+                self.state.login_auth_type_options = options;
+                self.open_data_selector(SelectorKind::LoginAuthType, rows, 0);
+                if let Some(active) = self.state.selector.as_mut() {
+                    active.inner.set_title(title);
+                }
+            }
+        }
+    }
+
+    /// `showLoginProviderSelector(authType?, initialSearchInput?)`
+    /// (`interactive-mode.ts:5085-5124`): the options narrowed to `auth_type`, or the empty-state
+    /// status when nothing qualifies.
+    fn open_login_provider_selector(
+        &mut self,
+        inputs: &[ProviderLoginInput],
+        auth_type: Option<AuthType>,
+        initial_search: Option<String>,
+    ) {
+        let options = cyrup_config::login::login_provider_options(inputs, auth_type);
+        if options.is_empty() {
+            self.state
+                .transcript
+                .push_status(cyrup_config::login::provider_selector_empty_message(auth_type));
+            return;
+        }
+        let rows = crate::login_selector_rows(&options);
+        self.state.login_options = options;
+        self.open_data_selector(SelectorKind::Login, rows, 0);
+        // Pi additionally seeds `OAuthSelectorComponent`'s own search field with the unmatched
+        // `/login <ref>` argument (`:5124`). cyrup's `ListSelector` has no search field (only
+        // `ModelSelector` does), so the argument is reported instead of silently vanishing; the
+        // list itself is identical either way.
+        if let Some(term) = initial_search.filter(|t| !t.trim().is_empty()) {
+            self.state
+                .transcript
+                .push_status(format!("no provider matches \"{term}\" — showing all"));
+        }
+    }
+
+    /// `startProviderLogin(providerOption)` (`interactive-mode.ts:5017-5025`), routed through the
+    /// ported [`cyrup_config::login::start_provider_login`].
+    ///
+    /// The OAuth and API-key legs are the SAME code here: both open the dialog and spawn
+    /// `cyrup_config::login::login` with the matching [`AuthType`]. Upstream splits them into
+    /// `showLoginDialog` / `showApiKeyLoginDialog` only because of two cosmetic differences — the
+    /// amazon-bedrock `showDetails` block (`:5266-5272`; that provider is unported, see
+    /// `providers/all.rs`) and the failure-message wording, which [`LoginFinished::oauth`] carries.
+    fn begin_provider_login(&mut self, session: &Arc<AgentSession>, option: LoginProviderOption) {
+        match cyrup_config::login::start_provider_login(&option) {
+            // `showAmbientAuthDialog(providerOption)` (`:5023`, `:5229-5250`): a dialog with a
+            // single info line and a close hint. Nothing to run, so no task is spawned.
+            LoginStep::Ambient {
+                title, message, ..
+            } => {
+                self.open_login_dialog(title);
+                if let Some(dialog) = self.login_dialog_mut() {
+                    dialog.show_info(&message, &[], true);
+                }
+            }
+            LoginStep::Oauth { id, name } | LoginStep::ApiKey { id, name } => {
+                let oauth = option.auth_type == AuthType::Oauth;
+                let Some(tx) = self.login_tx.clone() else {
+                    // No run loop is servicing the channel — refuse rather than spawn a task whose
+                    // first prompt can never be answered.
+                    self.state
+                        .transcript
+                        .push_status("login unavailable: no interactive session");
+                    return;
+                };
+                // `new LoginDialogComponent(ui, providerId, …, providerName)` → title
+                // `` `Login to ${providerName}` `` (`login-dialog.ts:41`).
+                self.open_login_dialog(format!("Login to {name}"));
+                // `dialog.signal` — the dialog's own AbortController (`login-dialog.ts:73-75`).
+                let cancel = CancelToken::new();
+                self.state.login_cancel = Some(cancel.clone());
+                let auth_type = option.auth_type;
+                let store = Arc::clone(&session.services().auth);
+                // `getAuthPath()` (`env.rs:236-238`): the path the success status names.
+                let auth_path = session.services().agent_dir.join("auth.json");
+                let session = Arc::clone(session);
+                let login_providers = self.login_providers.clone();
+                tokio::spawn(async move {
+                    let inputs =
+                        Self::build_login_inputs(&session, login_providers.as_deref()).await;
+                    let interaction = TuiAuthInteraction::new(tx.clone(), cancel);
+                    // `await this.session.modelRuntime.login(providerId, method, {…})`
+                    // (`interactive-mode.ts:5368`) — `Models.login` persists into the credential
+                    // store itself, so there is no separate write here.
+                    let result = cyrup_config::login::login(
+                        &*store,
+                        &inputs,
+                        &id,
+                        auth_type,
+                        &interaction,
+                    )
+                    .await;
+                    let finished = match result {
+                        Ok(_) => LoginFinished {
+                            provider_id: id.as_str().to_string(),
+                            provider_name: name,
+                            oauth,
+                            result: Ok(()),
+                            cancelled: false,
+                            auth_path,
+                        },
+                        Err(e) => LoginFinished {
+                            provider_id: id.as_str().to_string(),
+                            provider_name: name,
+                            oauth,
+                            cancelled: e.is_cancelled(),
+                            result: Err(e.to_string()),
+                            auth_path,
+                        },
+                    };
+                    let _ = tx.send(LoginUiMsg::Finished(Box::new(finished)));
+                });
+            }
+        }
+    }
+
+    /// Put a fresh [`LoginDialog`] in the input slot (`editorContainer.clear(); addChild(dialog);
+    /// setFocus(dialog)`, `interactive-mode.ts:5273-5276`). The hint text is taken from the LIVE
+    /// `tui.select.*` bindings, matching Pi's `keyHint` (`login-dialog.ts:141`, `:164`).
+    fn open_login_dialog(&mut self, title: impl Into<String>) {
+        let dialog = LoginDialog::new(title, &self.state.select_keymap);
+        self.open_boxed_selector(SelectorKind::LoginDialog, Box::new(dialog));
+    }
+
+    /// Apply one message from the spawned login flow (`notifyAuthDialog` / `showAuthPrompt` /
+    /// the `try`/`catch` around `loginProvider`, `interactive-mode.ts:5285-5296`, `:5327-5360`,
+    /// `:5392-5403`).
+    ///
+    /// `pub` for the same reason as [`Self::apply_tree_nav_outcome`]: `tests/*.rs` drives the
+    /// settle half without a live run loop.
+    pub fn apply_login_msg(&mut self, msg: LoginUiMsg) {
+        match msg {
+            LoginUiMsg::Notify(event) => {
+                if let Some(dialog) = self.login_dialog_mut() {
+                    notify_auth_dialog(dialog, *event);
+                }
+            }
+            LoginUiMsg::Prompt { prompt, reply } => {
+                let Some(dialog) = self.login_dialog_mut() else {
+                    // The dialog is already gone (cancelled, or the flow raced the teardown):
+                    // reject exactly as `cancel()` does (`login-dialog.ts:82-88`).
+                    let _ = reply.send(Err(OAuthError::Cancelled));
+                    return;
+                };
+                show_auth_prompt(dialog, &prompt);
+                // A previous prompt still pending would be a flow bug, but resolving it as
+                // cancelled is strictly better than leaking the sender (which would hang the flow).
+                if let Some(stale) = self.state.pending_login_prompt.replace(reply) {
+                    let _ = stale.send(Err(OAuthError::Cancelled));
+                }
+            }
+            LoginUiMsg::Finished(finished) => self.finish_login(*finished),
+        }
+    }
+
+    /// The `try`/`catch` tail of `showLoginDialog` / `showApiKeyLoginDialog`
+    /// (`interactive-mode.ts:5285-5296`, `:5392-5403`): restore the editor, then either the
+    /// success status (`completeProviderAuthentication`, `:5176-5227`) or the error banner — and
+    /// NOTHING at all when the user cancelled, which is what `errorMsg !== "Login cancelled"`
+    /// buys (`:5294`, `:5401`).
+    fn finish_login(&mut self, finished: LoginFinished) {
+        // `restoreEditor()` (`:5276-5281`).
+        if self.active_selector_kind() == Some(SelectorKind::LoginDialog) {
+            self.close_selector(true);
+        }
+        if let Some(reply) = self.state.pending_login_prompt.take() {
+            let _ = reply.send(Err(OAuthError::Cancelled));
+        }
+        self.state.login_cancel = None;
+        let name = &finished.provider_name;
+        match &finished.result {
+            Ok(()) => {
+                // `actionLabel` (`:5183`) + `` `${actionLabel}. Credentials saved to ${getAuthPath()}` ``
+                // (`:5219`). `getAuthPath()` is `<agent_dir>/auth.json` (`env.rs:236`).
+                let action = if finished.oauth {
+                    format!("Logged in to {name}")
+                } else {
+                    format!("Saved API key for {name}")
+                };
+                let path = finished.auth_path.display();
+                self.state
+                    .transcript
+                    .push_status(format!("{action}. Credentials saved to {path}"));
+            }
+            // `if (errorMsg !== "Login cancelled")` (`:5294`, `:5401`) — a cancel is silent.
+            Err(_) if finished.cancelled => {}
+            Err(message) => {
+                let banner = if finished.oauth {
+                    format!("Failed to login to {name}: {message}")
+                } else {
+                    format!("Failed to save API key for {name}: {message}")
+                };
+                self.state.transcript.push_error(banner);
+            }
+        }
+    }
+
+    /// `dialog.cancel()` (`login-dialog.ts:82-88`): abort the flow's signal AND reject the prompt it
+    /// is blocked on with `"Login cancelled"`. Called from the selector `Cancel` arm.
+    fn cancel_login(&mut self) {
+        if let Some(reply) = self.state.pending_login_prompt.take() {
+            let _ = reply.send(Err(OAuthError::Cancelled));
+        }
+        if let Some(cancel) = self.state.login_cancel.take() {
+            cancel.cancel();
+        }
+    }
+
     /// Open Pi's three-option "Summarize branch?" prompt (`interactive-mode.ts:4755-4760`). Pi uses
     /// its generic `showExtensionSelector`; cyrup renders the same three options through a
     /// first-party [`ListSelector`] so the answer arrives as an ordinary
@@ -2300,6 +2741,18 @@ impl<B: Backend> App<B> {
                 AppAction::Redraw
             }
             SelectorOutcome::Confirm(value) => {
+                // The login dialog is the one selector that does NOT close on confirm: submitting
+                // answers the flow's in-flight `AuthInteraction::prompt` and the flow runs on —
+                // Pi's `input.onSubmit` resolves `inputResolver` and leaves `editorContainer`
+                // alone (`login-dialog.ts:56-64`), so the URL/device code stays on screen and a
+                // second prompt can follow. The dialog is torn down by `finish_login` (the login
+                // settled) or by the `Cancel` arm below.
+                if kind == SelectorKind::LoginDialog {
+                    if let Some(reply) = self.state.pending_login_prompt.take() {
+                        let _ = reply.send(Ok(value));
+                    }
+                    return AppAction::Redraw;
+                }
                 let command = self.confirm_selector(kind, &value);
                 self.close_selector(false);
                 match command {
@@ -2353,6 +2806,13 @@ impl<B: Backend> App<B> {
                 // wasm-suspended guest until `ui_roundtrip`'s timeout (or forever, with none set).
                 if let Some(pending) = self.state.pending_ui_reply.take() {
                     let _ = pending.reply.send(default_ui_reply(pending.kind));
+                }
+                // `LoginDialogComponent.cancel()` (`login-dialog.ts:82-88`): abort the flow's signal
+                // AND reject whatever prompt it is blocked on with `"Login cancelled"`. Without the
+                // signal half, a flow parked on a callback server or a device-code poll (neither of
+                // which is a prompt) would keep running with no dialog to talk to.
+                if kind == SelectorKind::LoginDialog {
+                    self.cancel_login();
                 }
                 self.close_selector(true);
                 // The two `/tree` summarization prompts each have their OWN Escape destination in Pi
@@ -2433,6 +2893,15 @@ impl<B: Backend> App<B> {
             | SelectorKind::ExtensionEditor => {
                 if let Some(pending) = self.state.pending_ui_reply.take() {
                     let _ = pending.reply.send(UiReply::Text(Some(value.to_string())));
+                }
+                None
+            }
+            // Unreachable: [`Self::handle_selector_key`] intercepts a login-dialog confirm before
+            // it gets here (the dialog must NOT close on submit). Explicit rather than falling into
+            // the `other` arm, which would emit a bogus `ConfirmSelection` command.
+            SelectorKind::LoginDialog => {
+                if let Some(reply) = self.state.pending_login_prompt.take() {
+                    let _ = reply.send(Ok(value.to_string()));
                 }
                 None
             }
@@ -2544,48 +3013,36 @@ impl<B: Backend> App<B> {
                     self.open_boxed_selector(SelectorKind::Tree, Box::new(tree));
                 }
             }
+            C::LoginCommand(arg) => self.handle_login_command(session, arg).await,
             C::OpenSelector(SelectorKind::Login) => {
-                // `/login` (oauth-selector.ts + getLoginProviderOptions, interactive-mode.ts:4594-4617):
-                // the api-key-configurable providers are the unique providers in the model catalog,
-                // each tagged with its live auth state (stored / env / unconfigured). The oauth
-                // subscription device flow is the provider-tail residual; the picker + status UI is
-                // built here, and confirming surfaces the chosen provider's next step.
-                let auth = &session.services().auth;
-                let mut seen = std::collections::BTreeSet::new();
-                let mut entries = Vec::new();
-                for model in session.model_catalog() {
-                    let id = model.provider.to_string();
-                    if !seen.insert(id.clone()) {
-                        continue;
-                    }
-                    let status = auth.get_auth_status(&cyrup_core::ProviderId::from(id.as_str()), None);
-                    let state = crate::AuthState::from_status(status.configured, status.source.is_some());
-                    entries.push((id, state));
-                }
-                let rows = crate::provider_rows(entries);
-                if rows.is_empty() {
-                    self.state.transcript.push_status("no providers available to configure");
-                } else {
-                    self.open_data_selector(SelectorKind::Login, rows, 0);
-                }
+                // `showOAuthSelector("login")` → `showLoginAuthTypeSelector()`
+                // (`interactive-mode.ts:5127-5130`), i.e. exactly a bare `/login`.
+                self.handle_login_command(session, None).await;
             }
             C::OpenSelector(SelectorKind::Logout) => {
-                // `/logout` (getLogoutProviderOptions, interactive-mode.ts:4619-4636): only providers
-                // with a STORED credential are listed; confirming deletes it. Env/`models.json` config
-                // is untouched (Pi's status-line caveat below).
-                let auth = &session.services().auth;
-                let stored = auth.list().unwrap_or_default();
-                let entries: Vec<(String, crate::AuthState)> =
-                    stored.into_iter().map(|id| (id, crate::AuthState::Configured)).collect();
-                let rows = crate::provider_rows(entries);
-                if rows.is_empty() {
-                    self.state.transcript.push_status(
-                        "no stored credentials to remove (/logout only removes /login credentials; \
-                         env vars and models.json are unchanged)",
-                    );
-                } else {
-                    self.open_data_selector(SelectorKind::Logout, rows, 0);
+                // `showOAuthSelector("logout")` (`interactive-mode.ts:5132-5175`) →
+                // `getLogoutProviderOptions()`: only providers with a STORED credential are listed,
+                // each carrying its credential's `authType` (which picks the confirm message).
+                let inputs = self.login_provider_inputs(session).await;
+                let stored =
+                    match cyrup_config::login::stored_credentials(&session.services().auth).await {
+                        Ok(stored) => stored,
+                        Err(e) => {
+                            self.state.transcript.push_status(format!("logout error: {e}"));
+                            return;
+                        }
+                    };
+                let options = cyrup_config::login::logout_provider_options(&stored, &inputs);
+                if options.is_empty() {
+                    // Pi's verbatim copy (`interactive-mode.ts:5136-5138`).
+                    self.state
+                        .transcript
+                        .push_status(cyrup_config::login::NO_STORED_CREDENTIALS);
+                    return;
                 }
+                let rows = crate::login_selector_rows(&options);
+                self.state.logout_options = options;
+                self.open_data_selector(SelectorKind::Logout, rows, 0);
             }
             C::OpenSelector(SelectorKind::Settings) => {
                 // `/settings` (settings-selector.ts): the curated toggle/choice grid sourced from the
@@ -2850,26 +3307,79 @@ impl<B: Backend> App<B> {
                 }
             }
             C::ConfirmSelection { kind: SelectorKind::Logout, value } => {
-                // Delete the stored credential for the chosen provider (Pi `/logout` onSelect →
-                // `authStorage.delete`, oauth-selector.ts). A real, in-crate effect against the
-                // `AuthStore` the session owns; env/config tiers are untouched.
-                let provider = cyrup_core::ProviderId::from(value.as_str());
-                match session.services().auth.delete(&provider).await {
-                    Ok(()) => self
+                // `/logout` onSelect (`interactive-mode.ts:5149-5166`): `modelRuntime.logout(id)` —
+                // the ported `cyrup_config::login::logout`, which wraps a store failure as
+                // `Credential store delete failed for …` (`ai/src/models.ts:446-452`). Env vars and
+                // `models.json` are untouched, which is what the second message spells out.
+                let Some(option) = value
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.state.logout_options.get(i))
+                    .cloned()
+                else {
+                    // `if (!providerOption) return;` (`:5151-5153`).
+                    return;
+                };
+                match cyrup_config::login::logout(&*session.services().auth, &option.id).await {
+                    Ok(()) => {
+                        let name = &option.name;
+                        // Pi's two verbatim messages (`:5157-5161`).
+                        let message = if option.auth_type == AuthType::Oauth {
+                            format!("Logged out of {name}")
+                        } else {
+                            format!(
+                                "Removed stored API key for {name}. Environment variables and \
+                                 models.json config are unchanged."
+                            )
+                        };
+                        self.state.transcript.push_status(message);
+                    }
+                    // `showError(\`Logout failed: ${message}\`)` (`:5163-5165`).
+                    Err(e) => self
                         .state
                         .transcript
-                        .push_status(format!("removed stored credentials for {value}")),
-                    Err(e) => self.state.transcript.push_status(format!("logout error: {e}")),
+                        .push_error(format!("Logout failed: {e}")),
                 }
             }
             C::ConfirmSelection { kind: SelectorKind::Login, value } => {
-                // The credential write itself — the oauth device/PKCE handshake or the api-key prompt
-                // dialog (Pi `showLoginDialog`/`showApiKeyLoginDialog`) — is the provider-tail residual.
-                // Surface the chosen provider + its next step so the picker is a real path.
-                let name = crate::provider_display_name(&value);
-                self.state.transcript.push_status(format!(
-                    "{name}: set the API key via `{value}` env var or `models.json`"
-                ));
+                // `OAuthSelectorComponent`'s onSelect (`interactive-mode.ts:5106-5117`): re-find the
+                // chosen option and `startProviderLogin(providerOption)`. The value is the row INDEX
+                // (see `SelectorKind::Login`), which is what `(providerId, authType)` collapses to.
+                let Some(option) = value
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.state.login_options.get(i))
+                    .cloned()
+                else {
+                    // `if (!providerOption) return;` (`:5113-5115`).
+                    return;
+                };
+                self.begin_provider_login(session, option);
+            }
+            C::ConfirmSelection { kind: SelectorKind::LoginAuthType, value } => {
+                // `showLoginAuthTypeSelector`'s onSelect (`interactive-mode.ts:5063-5073`): with a
+                // pinned provider, start ITS option of the chosen kind; otherwise open the provider
+                // picker filtered to that kind.
+                let auth_type = if value == AuthType::Oauth.as_str() {
+                    AuthType::Oauth
+                } else {
+                    AuthType::ApiKey
+                };
+                match self.state.login_auth_type_options.take() {
+                    Some(options) => {
+                        // `providerOptions.find(p => p.authType === authType)` (`:5066`).
+                        if let Some(option) =
+                            options.iter().find(|o| o.auth_type == auth_type).cloned()
+                        {
+                            self.begin_provider_login(session, option);
+                        }
+                    }
+                    // `this.showLoginProviderSelector(authType)` (`:5071`).
+                    None => {
+                        let inputs = self.login_provider_inputs(session).await;
+                        self.open_login_provider_selector(&inputs, Some(auth_type), None);
+                    }
+                }
             }
             C::ConfirmSelection { kind: SelectorKind::Trust, value } => {
                 // The trust selector confirms with the chosen option INDEX; re-derive the options and
@@ -4786,6 +5296,10 @@ impl App<CrosstermBackend<Stdout>> {
         // what makes the spawned path (and therefore Escape→abort and the live
         // `IndicatorKind::BranchSummary` spinner) reachable at all.
         let mut tree_nav_rx = self.install_tree_nav_channel();
+        // The `/login` channel (`login_dialog::LoginUiMsg`): the spawned flow's prompts, progress
+        // events and final outcome. Installed for the same reason `tree_nav_rx` is — the flow must
+        // not run on this task, or no keystroke could ever answer its prompts.
+        let mut login_rx = self.install_login_channel();
         // The startup package-update check's answer channel, moved out of `self` so the `select!`
         // arm's borrow does not collide with the `&mut self` the other arms take — the same
         // run-loop-local shape as `bash_rx` / `tree_nav_rx`. `None` when the binary wired no channel
@@ -5081,6 +5595,14 @@ impl App<CrosstermBackend<Stdout>> {
                     // (`interactive-mode.ts:3885-3889`), the same framing the extension `notify`
                     // path uses in `apply_ui_effect`.
                     self.state.transcript.push_warning(format!("Warning: {warning}"));
+                    self.draw_synchronized()?;
+                }
+                Some(msg) = login_rx.recv() => {
+                    // The spawned `/login` flow wants something: a prompt rendered, progress shown,
+                    // or the whole login settled (Pi's `prompt`/`notify` callbacks +
+                    // the `try`/`catch` around `loginProvider`, `interactive-mode.ts:5367-5374`,
+                    // `:5285-5296`). Answers travel back over the one-shot the message carried.
+                    self.apply_login_msg(msg);
                     self.draw_synchronized()?;
                 }
                 Some(msg) = tree_nav_rx.recv() => {

@@ -494,6 +494,15 @@ impl SelectKeymap {
         self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
+    /// The label of the first key bound to `action` (`esc`, `enter`), or `None` if unbound — the
+    /// selector-tier twin of [`Keymap::key_label`]. Drives Pi's `keyHint("tui.select.cancel",
+    /// "to cancel")` dialog hints (`keybinding-hints.ts:12-27`) from the LIVE keymap, so a
+    /// `keybindings.json` rebind of `tui.select.*` changes the hint text too (spec/tui/05 §10; the
+    /// cancel text is never hardcoded).
+    pub fn key_label(&self, action: SelectAction) -> Option<String> {
+        self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+    }
+
     /// Rebind `action` to exactly `keys`.
     pub fn set_action(&mut self, action: SelectAction, keys: Vec<Key>) {
         self.bindings.retain(|(_, a)| *a != action);

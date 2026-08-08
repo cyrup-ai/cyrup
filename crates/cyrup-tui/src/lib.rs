@@ -54,6 +54,7 @@ mod fuzzy;
 mod image;
 mod keyboard_protocol;
 mod keymap;
+mod login_dialog;
 mod markdown;
 mod model_selector;
 mod overlay;
@@ -80,9 +81,12 @@ mod tree_selector;
 pub use app::{
     crossterm_input_stream, extension_render, reanchor_inline_region, render,
     should_honor_extension_shutdown, tree_node_from_dag, App, AppAction, AppCommand, AppState,
-    RebuildBackend, TreeNavMsg,
+    LoginProviderSource, RebuildBackend, TreeNavMsg,
 };
-pub use auth_select::{provider_display_name, provider_rows, AuthState};
+pub use auth_select::{
+    format_auth_selector_provider_type, format_status_indicator, login_selector_rows,
+    provider_display_name, provider_rows, AuthState,
+};
 pub use autocomplete::{
     list_files as mention_list_files, mention_autocomplete, mention_query, Applied, Autocomplete,
     Completion, CompletionContext,
@@ -127,6 +131,10 @@ pub use keyboard_protocol::{
 pub use keymap::{
     Action, AutocompleteAction, AutocompleteKeymap, EditorAction, EditorKeymap, Key, Keymap,
     ModelsAction, ModelsKeymap, SelectAction, SelectKeymap, TreeAction, TreeKeymap,
+};
+pub use login_dialog::{
+    notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginLineKind, LoginUiMsg,
+    TuiAuthInteraction,
 };
 pub use markdown::{render as render_markdown, trim_partial_closing_fence};
 pub use model_selector::{ModelEntry, ModelSelector};

@@ -1431,6 +1431,7 @@ dependencies = [
  "async-trait",
  "base64",
  "cyrup-agent",
+ "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
  "cyrup-provider",

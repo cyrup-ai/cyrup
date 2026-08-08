@@ -49,9 +49,20 @@ fn data_bound_commands_route_to_open_selector() {
         submit(&mut app, "/resume"),
         AppAction::Command(AppCommand::OpenSelector(SelectorKind::Session))
     );
+    // `/login [provider]` threads its argument the same way `/model` does (`handleLoginCommand`,
+    // interactive-mode.ts:2810): the run loop resolves it against the live registry + credential
+    // store, because a match may start the login outright with no picker at all.
     assert_eq!(
         submit(&mut app, "/login"),
-        AppAction::Command(AppCommand::OpenSelector(SelectorKind::Login))
+        AppAction::Command(AppCommand::LoginCommand(None))
+    );
+    assert_eq!(
+        submit(&mut app, "/login anthropic"),
+        AppAction::Command(AppCommand::LoginCommand(Some("anthropic".to_string())))
+    );
+    assert_eq!(
+        submit(&mut app, "/logout"),
+        AppAction::Command(AppCommand::OpenSelector(SelectorKind::Logout))
     );
 }
 

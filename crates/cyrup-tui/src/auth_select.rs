@@ -12,6 +12,14 @@
 //! This module is the **pure** row-builder half (no session, no I/O) so it is unit-testable in
 //! isolation; `app::execute_command` gathers the raw inputs (stored ids, catalog provider ids, per-
 //! provider auth state) from the live `AgentSession` and calls [`provider_rows`].
+//!
+//! [`login_selector_rows`] is the newer, option-shaped builder the live `/login` and `/logout`
+//! pickers use: it takes the resolved `AuthSelectorProvider[]`
+//! (`cyrup_config::login::{login_provider_options, logout_provider_options}`) rather than raw
+//! `(id, state)` pairs, so a provider offering BOTH a subscription and an API-key login gets the two
+//! rows upstream gives it. [`provider_rows`] remains for the id-only shape.
+
+use cyrup_config::login::{AuthType, LoginProviderOption};
 
 /// The three auth states the oauth-selector status line distinguishes (Pi `getStatusText`,
 /// `oauth-selector.ts:151-159`). Kept independent of the `cyrup-config` `AuthStatus` type so the row
@@ -106,6 +114,98 @@ pub fn provider_rows(entries: Vec<(String, AuthState)>) -> Vec<(String, String, 
         .collect();
     rows.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then(a.0.cmp(&b.0)));
     rows
+}
+
+/// `formatAuthSelectorProviderType` (`oauth-selector.ts:22-24`).
+pub fn format_auth_selector_provider_type(auth_type: AuthType) -> &'static str {
+    match auth_type {
+        AuthType::Oauth => "subscription",
+        AuthType::ApiKey => "API key",
+    }
+}
+
+/// `/^[A-Z][A-Z0-9_]*(?:, [A-Z][A-Z0-9_]*)*$/` (`oauth-selector.ts:176`) — "does this source read
+/// like a list of environment-variable names?", which is what makes the row say `✓ env: OPENAI_API_KEY`
+/// instead of echoing the bare source. Hand-rolled rather than pulling in a regex crate for one
+/// pattern (`cyrup/Cargo.toml:174-180` — prefer no new dependency where a small pure function does).
+fn looks_like_env_var_list(source: &str) -> bool {
+    !source.is_empty()
+        && source.split(", ").all(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) if first.is_ascii_uppercase() => {
+                    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                }
+                _ => false,
+            }
+        })
+}
+
+/// `formatStatusIndicator(provider)` (`oauth-selector.ts:164-181`) — the row's trailing status,
+/// verbatim including the mismatch case (a provider whose STORED credential is of the other kind
+/// shows `• subscription configured` / `• API key configured`, not `✓ configured`).
+pub fn format_status_indicator(option: &LoginProviderOption) -> String {
+    // `if (!provider.status) return " • unconfigured"` (`:165`).
+    let Some(status) = option.status.as_ref() else {
+        return "• unconfigured".to_string();
+    };
+    // `if (provider.status.type !== provider.authType)` (`:166-169`).
+    if status.auth_type != option.auth_type {
+        let label = match status.auth_type {
+            AuthType::Oauth => "subscription configured",
+            AuthType::ApiKey => "API key configured",
+        };
+        return format!("• {label}");
+    }
+    // `if (!source || source === "OAuth" || source === "stored credential")` (`:170-176`).
+    let source = match status.source.as_deref() {
+        None | Some("") | Some("OAuth") | Some("stored credential") => {
+            return "✓ configured".to_string();
+        }
+        Some(source) => source,
+    };
+    if looks_like_env_var_list(source) {
+        format!("✓ env: {source}")
+    } else {
+        format!("✓ {source}")
+    }
+}
+
+/// The `OAuthSelectorComponent` rows for a resolved `AuthSelectorProvider[]`
+/// (`oauth-selector.ts:124-145`), as `(value, label, description)`.
+///
+/// * **value** is the row's INDEX into `options`. Pi calls back with `(providerId, authType)` and
+///   re-finds the option (`interactive-mode.ts:5106-5111`); cyrup's selector carries a single
+///   string, and the index is the only key that survives one provider contributing two rows.
+/// * **label** is `` `${name}${authTypeLabel}` ``, where the ` [subscription]` / ` [API key]` suffix
+///   appears only when the list MIXES both kinds (`showAuthTypeLabels`, `oauth-selector.ts:61`).
+/// * **description** is [`format_status_indicator`].
+///
+/// `options` is already sorted by display name by `login_provider_options`/`logout_provider_options`
+/// (Node `localeCompare`, via `feruca`), so this preserves their order.
+pub fn login_selector_rows(
+    options: &[LoginProviderOption],
+) -> Vec<(String, String, Option<String>)> {
+    // `new Set(providers.map(p => p.authType)).size > 1` (`oauth-selector.ts:61`).
+    let show_auth_type_labels = options
+        .iter()
+        .any(|o| o.auth_type != options.first().map_or(o.auth_type, |f| f.auth_type));
+    options
+        .iter()
+        .enumerate()
+        .map(|(i, option)| {
+            let label = if show_auth_type_labels {
+                format!(
+                    "{} [{}]",
+                    option.name,
+                    format_auth_selector_provider_type(option.auth_type)
+                )
+            } else {
+                option.name.clone()
+            };
+            (i.to_string(), label, Some(format_status_indicator(option)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
