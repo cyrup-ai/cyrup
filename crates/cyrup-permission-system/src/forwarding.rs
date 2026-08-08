@@ -569,6 +569,36 @@ pub async fn process_forwarded_requests(
             continue;
         }
 
+        // `request.id` is attacker-controlled: it is read verbatim out of a spool file any child
+        // that can forward a request may write, and it is joined into `responses_dir` below. An id
+        // of `../../../.bashrc` would make THIS process — the parent, which is the trusted one —
+        // write a JSON document outside the spool. `validate_safe_token` rejects `/`, `\` and
+        // `..`, exactly as it already does for the session-id token at `forwarding_location`
+        // (`:187`), and it is what actually stops traversal here.
+        //
+        // `validate_contains_root` is R-SA-087's second clause, but note precisely what it can and
+        // cannot do: it is `resolved.starts_with(root)`, a LEXICAL comparison that does NOT resolve
+        // `..` components — `responses/../../x` "starts with" `responses` as far as it is
+        // concerned. It therefore adds nothing against traversal and must never be mistaken for
+        // the defence. What it does catch is the ABSOLUTE-path shape: `join("/etc/cron.d/x")`
+        // discards the root entirely, and the result fails `starts_with`. Both checks are kept
+        // because they cover different escapes; neither alone is sufficient.
+        //
+        // This runs BEFORE `resolve_forwarded_decision` on purpose. That call surfaces the human
+        // ask dialog, so validating afterwards would still let a hostile request interrupt the
+        // user with a plausible-looking prompt — and the response is written on *either* answer,
+        // so denying it would not prevent the write. A request that cannot be answered safely must
+        // never be shown at all.
+        if validate_safe_token(&request.id).is_err() {
+            let _ = std::fs::remove_file(&request_path);
+            continue;
+        }
+        let response_path = location.responses_dir.join(format!("{}.json", request.id));
+        if validate_contains_root(&location.responses_dir, &response_path).is_err() {
+            let _ = std::fs::remove_file(&request_path);
+            continue;
+        }
+
         let decision = resolve_forwarded_decision(&request, services, config).await;
 
         let response = ForwardedPermissionResponse {
@@ -580,7 +610,6 @@ pub async fn process_forwarded_requests(
             responder_session_id: current.clone(),
             responded_at: now_millis(),
         };
-        let response_path = location.responses_dir.join(format!("{}.json", request.id));
         if write_json_atomic(&response_path, &response).is_err() {
             continue; // pi response-write failure: leave the request for a retry (`:1493-1496`).
         }
