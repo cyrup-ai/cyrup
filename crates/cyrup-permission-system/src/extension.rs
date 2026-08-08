@@ -84,16 +84,42 @@ use crate::manager::{ManagerPaths, PermissionManager};
 use crate::sanitize;
 use crate::skill::{self, SkillPromptEntry};
 use crate::status;
-use crate::stores::{PermanentApprovalStore, SessionApprovalStore};
+use crate::stores::SessionApprovalStore;
 use crate::types::{CheckSource, PermissionCheckResult, PermissionState};
+use crate::yolo_api::{YoloModeControlOptions, YoloModeControlResult};
 
 /// The extension's fixed id (pi `EXTENSION_ID`, `extension-config.ts:8`).
 pub const EXTENSION_ID: &str = "cyrup-permission-system";
 
+/// The slash command this extension registers (pi `pi.registerCommand("permission-system", …)`,
+/// v0.8.0 `index.ts:1502`).
+pub const PERMISSION_SYSTEM_COMMAND: &str = "permission-system";
+
+/// The `source` label the `/permission-system` handler passes to
+/// [`PermissionSystemExtension::set_yolo_mode`], so a `yolo_mode.updated` entry says which surface
+/// moved the flag (pi `options.source`, `yolo-mode-api.ts:3`).
+pub const COMMAND_YOLO_CONTROL_SOURCE: &str = "permission-system-command";
+
+/// pi `saved.error ?? "Failed to persist pi-permission-system config."` (v0.8.0 `index.ts:1439`),
+/// rebranded. Reached only if [`ExtensionConfig::save`] ever reports failure without an error
+/// string, which it does not today — carried because upstream carries it.
+const YOLO_PERSIST_FALLBACK_ERROR: &str = "Failed to persist cyrup-permission-system config.";
+
+/// The `/permission-system` usage line. The two setting ids and the `on`/`off` value set are pi's
+/// (`config-modal.ts:18,27,34`); the textual framing is cyrup's, since upstream renders a modal.
+const COMMAND_USAGE: &str = "Usage: /permission-system [debug|yoloMode on|off]";
+
+/// pi `toOnOff` (`config-modal.ts:20-22`).
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
+}
+
 /// The global policy file (pi `pi-permissions.jsonc`; cyrup analog).
 const POLICY_FILE: &str = "cyrup-permissions.jsonc";
-/// The read-through permanent approvals file (pi `pi-permission-system-approvals.json`; cyrup analog).
-const PERMANENT_APPROVALS_FILE: &str = "cyrup-permission-system-approvals.json";
 /// The extension config dir + file (`<agent_dir>/cyrup-permission-system/config.json`).
 const CONFIG_DIR: &str = "cyrup-permission-system";
 const CONFIG_FILE: &str = "config.json";
@@ -198,17 +224,19 @@ fn manager_with_warnings(paths: ManagerPaths, sink: &Arc<WarningSink>) -> Permis
     PermissionManager::new(paths).with_on_warning(move |message| sink.notify(message))
 }
 
-/// The permission-system extension: the layered policy engine + two approval stores + prompt dedup +
-/// the fail-closed ask channel, gating every tool call via `before_tool_call`.
+/// The permission-system extension: the layered policy engine + the (session-only) approval store +
+/// prompt dedup + the fail-closed ask channel, gating every tool call via `before_tool_call`.
 pub struct PermissionSystemExtension {
     id: ExtensionId,
     manager: Mutex<PermissionManager>,
     session_approvals: Mutex<SessionApprovalStore>,
-    permanent_approvals: Mutex<PermanentApprovalStore>,
     dedup: Mutex<DedupCache>,
     /// The extension `config.json` snapshot. `yolo_mode` is read on the live `ask` path (below);
-    /// `debug` gates the audit/debug JSONL trail ([`Self::logger`], pi `logging.ts:89,97`) AND the
-    /// forwarding "child is waiting" notice (`forwarding.rs`); `forwarded_prompt_timeout_seconds` is
+    /// `debug` gates the DIAGNOSTIC JSONL stream only ([`Self::logger`], v0.8.0 `logging.ts:90-93`)
+    /// AND the forwarding "child is waiting" notice (`forwarding.rs`). It does NOT gate the
+    /// security `review` stream: v0.8.0 deleted that guard (the v0.7.1 guard was `logging.ts:97`),
+    /// so the audit trail is unconditional — see [`crate::logging::Logger::review`].
+    /// `forwarded_prompt_timeout_seconds` is
     /// consumed by forwarding (P-4). `Mutex`-wrapped because
     /// [`Self::refresh_config_and_manager`] re-reads it from disk on `session_start` / a
     /// `resources_discover` reload (pi `refreshExtensionConfig`, `index.ts:1600-1608`).
@@ -280,10 +308,16 @@ impl PermissionSystemExtension {
     /// wired PARENT uses [`Self::new_forwarding_parent`].
     #[must_use]
     pub fn new(agent_dir: PathBuf, cwd: PathBuf) -> Self {
-        let (paths, permanent_path, config) = Self::derive_parts(&agent_dir, cwd);
+        let config = Self::load_config(&agent_dir);
+        Self::new_with_config(agent_dir, cwd, config)
+    }
+
+    /// [`Self::new`] over an ALREADY-LOADED [`ExtensionConfig`] — see [`Self::load_config`] for why
+    /// the read is hoisted out of the constructor.
+    fn new_with_config(agent_dir: PathBuf, cwd: PathBuf, config: ExtensionConfig) -> Self {
+        let paths = Self::manager_paths_for(&agent_dir, &cwd);
         Self::from_parts_full(
             paths,
-            permanent_path,
             config,
             Arc::new(NoOpAskChannel),
             agent_dir,
@@ -298,10 +332,20 @@ impl PermissionSystemExtension {
     /// and `ToolCall` alike (PERM-005; idempotently, so the per-turn hooks do not stack watchers).
     #[must_use]
     pub fn new_forwarding_parent(agent_dir: PathBuf, cwd: PathBuf) -> Self {
-        let (paths, permanent_path, config) = Self::derive_parts(&agent_dir, cwd);
+        let config = Self::load_config(&agent_dir);
+        Self::new_forwarding_parent_with_config(agent_dir, cwd, config)
+    }
+
+    /// [`Self::new_forwarding_parent`] over an ALREADY-LOADED [`ExtensionConfig`] — see
+    /// [`Self::load_config`].
+    fn new_forwarding_parent_with_config(
+        agent_dir: PathBuf,
+        cwd: PathBuf,
+        config: ExtensionConfig,
+    ) -> Self {
+        let paths = Self::manager_paths_for(&agent_dir, &cwd);
         Self::from_parts_full(
             paths,
-            permanent_path,
             config,
             Arc::new(NoOpAskChannel),
             agent_dir,
@@ -318,14 +362,25 @@ impl PermissionSystemExtension {
     /// ops-overridable). No watcher (a child is a responder to no one).
     #[must_use]
     pub fn new_forwarding_child(agent_dir: PathBuf, cwd: PathBuf) -> Self {
-        let (paths, permanent_path, config) = Self::derive_parts(&agent_dir, cwd);
+        let config = Self::load_config(&agent_dir);
+        Self::new_forwarding_child_with_config(agent_dir, cwd, config)
+    }
+
+    /// [`Self::new_forwarding_child`] over an ALREADY-LOADED [`ExtensionConfig`] — see
+    /// [`Self::load_config`].
+    fn new_forwarding_child_with_config(
+        agent_dir: PathBuf,
+        cwd: PathBuf,
+        config: ExtensionConfig,
+    ) -> Self {
+        let paths = Self::manager_paths_for(&agent_dir, &cwd);
         let host_services: Arc<OnceLock<Arc<dyn HostServices>>> = Arc::new(OnceLock::new());
         let channel: Arc<dyn AskChannel> = Arc::new(ForwardingAskChannel::new(
             agent_dir.clone(),
             forwarding::resolve_child_wait_timeout(),
             host_services.clone(),
         ));
-        Self::from_parts_full(paths, permanent_path, config, channel, agent_dir, false, host_services)
+        Self::from_parts_full(paths, config, channel, agent_dir, false, host_services)
     }
 
     /// Derive the [`ManagerPaths`] for `agent_dir` + `cwd` (pi `createPermissionManagerForCwd`'s path
@@ -345,10 +400,32 @@ impl PermissionSystemExtension {
         }
     }
 
-    /// The extension `config.json` path for `agent_dir` (pi `getPermissionSystemConfigPath`,
-    /// `extension-config.ts:43-46`).
+    /// The DEFAULT extension `config.json` path for `agent_dir` — cyrup's analog of pi's
+    /// `CONFIG_PATH` constant (`extension-config.ts:41`, `join(EXTENSION_ROOT, "config.json")`).
+    ///
+    /// This is the *unresolved* default. Nothing outside this crate should read a config from it
+    /// directly: `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` can point the extension at a different file
+    /// entirely, and only [`Self::resolved_config_path_for`] honours that. Every consumer here
+    /// either goes through that helper or through [`ExtensionConfig::load`] /
+    /// [`ExtensionConfig::save`], which resolve internally.
     fn config_path_for(agent_dir: &Path) -> PathBuf {
         agent_dir.join(CONFIG_DIR).join(CONFIG_FILE)
+    }
+
+    /// The RESOLVED extension `config.json` path for `agent_dir`: [`Self::config_path_for`] after
+    /// the `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` override, i.e. pi
+    /// `getPermissionSystemConfigPath()` (v0.8.0 `extension-config.ts:51-53`, over
+    /// `resolveOverridablePath`, `:46-49`).
+    ///
+    /// pi has exactly one such accessor and every consumer of the extension config funnels through
+    /// it — `loadPermissionSystemConfig`'s default argument (`extension-config.ts:117`),
+    /// `savePermissionSystemConfig`'s (`:240`), and the config modal's displayed `Config file:` path
+    /// (`index.ts:1509`). cyrup's [`is_installed`] probe was reading the RAW default path instead,
+    /// so with the override set the install decision and the `enabled` decision could inspect two
+    /// different files and disagree. This helper is the one accessor; use it, not
+    /// [`Self::config_path_for`].
+    fn resolved_config_path_for(agent_dir: &Path) -> PathBuf {
+        ExtensionConfig::resolve_config_path(&Self::config_path_for(agent_dir))
     }
 
     /// The default audit/debug log directory for `agent_dir` (pi `LOGS_DIR =
@@ -361,13 +438,26 @@ impl PermissionSystemExtension {
         agent_dir.join(CONFIG_DIR).join(crate::logging::LOGS_DIR_NAME)
     }
 
-    /// Derive the [`ManagerPaths`] + permanent-store path + extension config from `agent_dir` + `cwd`
-    /// (shared by every constructor).
-    fn derive_parts(agent_dir: &Path, cwd: PathBuf) -> (ManagerPaths, PathBuf, ExtensionConfig) {
-        let paths = Self::manager_paths_for(agent_dir, &cwd);
-        let permanent_path = agent_dir.join(PERMANENT_APPROVALS_FILE);
-        let config = ExtensionConfig::load(&Self::config_path_for(agent_dir));
-        (paths, permanent_path, config)
+    /// Read `config.json` ONCE, through the resolved path (pi `loadPermissionSystemConfig()`,
+    /// `extension-config.ts:117-138`).
+    ///
+    /// pi's entry point calls this exactly once at load — `loadExtensionConfigState()`
+    /// (`index.ts:1350-1354`) is invoked at `index.ts:1473`, the `enabled` master switch tests the
+    /// module-scope `extensionConfig` it just populated (`:1475-1477`), and everything downstream
+    /// reuses that same object. cyrup's [`permission_extension_for_env`] is the analog of that entry
+    /// point, so it performs THE load and hands the result to the `*_with_config` constructor; the
+    /// public constructors keep their standalone signature by doing the load themselves.
+    ///
+    /// Loading twice was not merely wasteful: [`ExtensionConfig::load`] `eprintln!`s on a malformed
+    /// or unreadable config, so an operator with a corrupt `config.json` saw the identical warning
+    /// printed twice per session build where pi prints it once.
+    ///
+    /// v0.7.1's `derive_parts` (which this replaces) also derived a
+    /// `cyrup-permission-system-approvals.json` path for the `PermanentApprovalStore`; upstream
+    /// deleted that store in v0.8.0 (commit `a33ac2c`), so no such file is read any more — see
+    /// [`crate::stores`].
+    fn load_config(agent_dir: &Path) -> ExtensionConfig {
+        ExtensionConfig::load(&Self::config_path_for(agent_dir))
     }
 
     /// pi `refreshSessionRuntimeState` (`index.ts:2077-2085`) + the `resources_discover` "reload"
@@ -427,13 +517,296 @@ impl PermissionSystemExtension {
         }
     }
 
+    // ===================================================== the two v0.8.0 config WRITERS (G133/F1)
+    //
+    // `ExtensionConfig::save` (the atomic merge-into-the-existing-document write, v0.8.0
+    // `extension-config.ts:240-293`) landed with NO non-test call site, which made all three of the
+    // behaviours it exists to guarantee — non-extension keys preserved, a corrupt file refused, a
+    // symlinked config written through — unobservable in cyrup, because cyrup never saved this
+    // config at all. The two functions below are upstream's two callers of it; `execute_command`
+    // (the `/permission-system` handler, pi `index.ts:1502-1512`) is what reaches them.
+
+    /// pi `syncPermissionSystemStatusWhenPossible(config, ctx?)` (v0.8.0 `index.ts:1388-1400`):
+    /// reflect `yoloMode` on the live status bar after a config write.
+    ///
+    /// \[CYRUP-DELTA] pi's two branches — an explicitly-passed `ctx` (`:1392-1395`, the
+    /// `saveExtensionConfig` case) versus the module-scope `runtimeContext?.hasUI` fallback
+    /// (`:1397-1399`, the `setYoloModeFromRuntimeApi` case) — exist because pi's `ui.setStatus` is
+    /// only reachable through whichever `ExtensionContext` object is at hand. cyrup's status seam is
+    /// [`crate::status::sync_status`] over the ONE late-bound [`HostServices`] backend the session
+    /// attaches, which is the same object no matter which handler is running, so both branches
+    /// collapse into this single reachability test. The `hasUI` half is not re-imposed, for the
+    /// reason [`WarningSink::notify`] documents: `HostServices::set_status` already no-ops on a
+    /// backend with no status surface, and re-imposing it would blank the pill in modes that do
+    /// render one. This is the same test the `SessionStart` / `BeforeAgentStart` arms already use.
+    fn sync_status_when_possible(&self, config: &ExtensionConfig) {
+        if let Some(services) = self.host_services.get() {
+            status::sync_status(services, config);
+        }
+    }
+
+    /// pi `saveExtensionConfig(next, ctx)` (v0.8.0 `index.ts:1402-1420`) — registered as the config
+    /// modal's `setConfig` (`index.ts:1508`), i.e. what runs when the human flips a row in
+    /// `/permission-system`.
+    ///
+    /// The ORDER is the contract, and it is the reason this is a function and not three inlined
+    /// statements: normalize, WRITE, and only then touch anything in memory. A failed write returns
+    /// having notified the human and having changed NOTHING — no live config, no status pill, no
+    /// `lastConfigWarning` reset, no debug entry — so cyrup can never end a turn with an in-memory
+    /// config that disagrees with the file the next `session_start` will re-read.
+    ///
+    /// \[CYRUP-DELTA] Two shape differences, neither behavioural:
+    /// - pi takes `ctx: ExtensionCommandContext` purely to reach `ctx.ui.notify` (`:1407`) and to
+    ///   pass to `syncPermissionSystemStatusWhenPossible` (`:1413`). Both of those reach the live
+    ///   [`HostServices`] backend in cyrup, which this extension already holds, so there is no ctx
+    ///   parameter to thread and nothing is lost by its absence.
+    /// - pi returns `void`; this returns whether the save landed. Its one upstream caller recovers
+    ///   the same fact by re-reading `controller.getConfig()` straight after (`config-modal.ts:79`),
+    ///   which is exactly what the returned `bool` saves the cyrup caller from having to do.
+    pub fn save_extension_config(&self, next: &ExtensionConfig) -> bool {
+        // pi `const normalized = normalizePermissionSystemConfig(next)` (`:1403`).
+        let normalized = next.normalized();
+        // pi `const saved = savePermissionSystemConfig(normalized)` (`:1404`).
+        let saved = normalized.save(&Self::config_path_for(&self.agent_dir));
+        if !saved.success {
+            // pi `:1405-1410`: surface the error (an `error`-level notification, NOT the deduped
+            // `warning` sink — a save the human just asked for and did not get must be reported
+            // every time) and return WITHOUT mutating in-memory state.
+            if let Some(error) = saved.error
+                && let Some(services) = self.host_services.get()
+            {
+                services.notify(&error, NotifyKind::Error);
+            }
+            return false;
+        }
+
+        // pi `setExtensionConfig(normalized)` (`:1412`).
+        *guard(&self.config) = normalized.clone();
+        // pi `syncPermissionSystemStatusWhenPossible(normalized, ctx)` (`:1413`).
+        self.sync_status_when_possible(&normalized);
+        // pi `lastConfigWarning = null` (`:1414`): the file on disk is now this extension's own
+        // output, so whatever the last load complained about is resolved — a later recurrence must
+        // be reported again rather than suppressed by the memo.
+        *guard(&self.last_config_warning) = None;
+        // pi `writeDebugEntry("config.saved", {...})` (`:1416-1419`).
+        self.write_debug_entry(
+            "config.saved",
+            &json!({ "debug": normalized.debug, "yoloMode": normalized.yolo_mode }),
+        );
+        true
+    }
+
+    /// pi `getYoloMode: () => extensionConfig.yoloMode` (v0.8.0 `index.ts:1482`).
+    #[must_use]
+    pub fn yolo_mode(&self) -> bool {
+        guard(&self.config).yolo_mode
+    }
+
+    /// pi `setYoloModeFromRuntimeApi(enabled, options)` (v0.8.0 `index.ts:1422-1469`), exposed
+    /// upstream as the runtime API's `setYoloMode` (`:1483`).
+    ///
+    /// The security-relevant property, and the whole reason this is not just "assign the field and
+    /// save": when `persist` is on and the write FAILS, the in-memory yolo mode is left exactly as
+    /// it was and the result reports `changed: false, persisted: false` with the error
+    /// (`:1438-1451`). A caller must never be told that auto-approval was turned on (or off) when
+    /// the gate's live config — and the file the next session will load — still says the opposite.
+    ///
+    /// \[CYRUP-DELTA] pi's first statement is a runtime `typeof enabled !== "boolean"` guard
+    /// returning an unchanged result with `"setYoloMode(enabled) requires a boolean value."`
+    /// (`:1423-1430`). That branch is **unrepresentable in Rust**: `enabled` is typed `bool`, so no
+    /// caller can reach it and there is nothing to check at runtime. It is not ported and no
+    /// stand-in is invented for it — the compiler enforces the same precondition earlier and more
+    /// completely. This is a language difference, not a dropped behaviour; the `error` field of
+    /// [`YoloModeControlResult`] remains, because the persist-failure path (`:1449`) still uses it.
+    pub fn set_yolo_mode(
+        &self,
+        enabled: bool,
+        options: &YoloModeControlOptions,
+    ) -> YoloModeControlResult {
+        // pi `normalizePermissionSystemConfig({ ...extensionConfig, yoloMode: enabled })` (`:1432`).
+        // Cloned out of the mutex first so nothing below runs while the live config is locked.
+        let current = guard(&self.config).clone();
+        let normalized = ExtensionConfig { yolo_mode: enabled, ..current.clone() }.normalized();
+        // pi `const persisted = options.persist !== false` (`:1433`).
+        let persisted = options.persists();
+        // pi `const changed = extensionConfig.yoloMode !== normalized.yoloMode` (`:1434`).
+        let changed = current.yolo_mode != normalized.yolo_mode;
+
+        if persisted {
+            // pi `const saved = savePermissionSystemConfig(normalized)` (`:1437`).
+            let saved = normalized.save(&Self::config_path_for(&self.agent_dir));
+            if !saved.success {
+                // pi `saved.error ?? "Failed to persist pi-permission-system config."` (`:1439`).
+                let error = saved
+                    .error
+                    .unwrap_or_else(|| YOLO_PERSIST_FALLBACK_ERROR.to_string());
+                // pi `writeDebugEntry("yolo_mode.update_failed", {...})` (`:1440-1444`).
+                self.write_debug_entry(
+                    "yolo_mode.update_failed",
+                    &json!({
+                        "error": error,
+                        "requestedYoloMode": normalized.yolo_mode,
+                        "source": options.source_or_default(),
+                    }),
+                );
+                // pi `:1445-1450`: `yoloMode: extensionConfig.yoloMode` — the UNCHANGED live value,
+                // read fresh rather than reported from `normalized`.
+                return YoloModeControlResult {
+                    yolo_mode: guard(&self.config).yolo_mode,
+                    changed: false,
+                    persisted: false,
+                    error: Some(error),
+                };
+            }
+            // pi `lastConfigWarning = null` (`:1452`) — inside the `persisted` branch, so a
+            // `persist: false` call deliberately leaves the memo alone (nothing was written).
+            *guard(&self.last_config_warning) = None;
+        }
+
+        // pi `setExtensionConfig(normalized)` (`:1455`).
+        *guard(&self.config) = normalized.clone();
+        // pi `syncPermissionSystemStatusWhenPossible(normalized)` — no ctx (`:1456`).
+        self.sync_status_when_possible(&normalized);
+        // pi `writeDebugEntry("yolo_mode.updated", {...})` (`:1457-1462`).
+        self.write_debug_entry(
+            "yolo_mode.updated",
+            &json!({
+                "changed": changed,
+                "persisted": persisted,
+                "source": options.source_or_default(),
+                "yoloMode": normalized.yolo_mode,
+            }),
+        );
+        // pi `:1464-1468` — note `error` is absent, not `null`.
+        YoloModeControlResult { yolo_mode: normalized.yolo_mode, changed, persisted, error: None }
+    }
+
+    /// pi `toggleYoloMode: (options?) => setYoloModeFromRuntimeApi(!extensionConfig.yoloMode,
+    /// options)` (v0.8.0 `index.ts:1484`).
+    pub fn toggle_yolo_mode(&self, options: &YoloModeControlOptions) -> YoloModeControlResult {
+        self.set_yolo_mode(!self.yolo_mode(), options)
+    }
+
+    /// The `/permission-system` handler body (pi `index.ts:1504-1511` via
+    /// `createPermissionSystemCommandHandler`, `common.ts:188-198`), reached from
+    /// [`NativeExtension::execute_command`].
+    ///
+    /// \[CYRUP-DELTA] Upstream's body is `openPermissionSystemSettingsModal(ctx, controller)`
+    /// (`config-modal.ts:63-123`): a `ctx.ui.custom` overlay rendering pi's own `ZellijSettingsModal`
+    /// over two rows. cyrup cannot build that here — the crate has no dependency on `cyrup-tui` and
+    /// must not acquire one (dependencies point downward only), and `HostServices` exposes no
+    /// custom-overlay seam. What IS expressible is the modal's *content*, so this handler is a
+    /// textual form of exactly the same controller: the same two setting ids, the same `on`/`off`
+    /// value set (`config-modal.ts:18`), the same `applySetting` mapping (`:43-56`), the same
+    /// `setConfig` writer, and the same `Config file: <path>` help text (`:85`).
+    ///
+    /// Grammar (`<setting> <value>`; no args renders the modal's initial view):
+    /// - `/permission-system` — current values + config path.
+    /// - `/permission-system debug on|off` — pi `applySetting("debug", …)` → `setConfig`.
+    /// - `/permission-system yoloMode on|off` — the yolo row.
+    ///
+    /// BOTH rows go through [`Self::save_extension_config`], matching upstream: the modal's
+    /// `onChange` calls `controller.setConfig` for every setting id (`config-modal.ts:74-76`), and
+    /// `setConfig` is registered as `saveExtensionConfig` (`index.ts:1508`). `setYoloMode` is a
+    /// DIFFERENT surface — upstream's runtime API (`index.ts:1483-1484`), reachable by other
+    /// extensions through `globalThis.__piPermissionSystem`, not by this command.
+    ///
+    /// An earlier revision routed the yolo row through [`Self::set_yolo_mode`] so that method would
+    /// have a caller. That was the wrong trade: it changed the emitted debug event
+    /// (`yolo_mode.updated` instead of `config.saved`) and the error surface, distorting ported
+    /// behaviour to satisfy a reachability rule. [`Self::set_yolo_mode`],
+    /// [`Self::toggle_yolo_mode`] and [`Self::yolo_mode`] are therefore correctly ported and
+    /// currently UNREACHABLE — `cyrup-ext` has no extension-provided-API registry for one extension
+    /// to call another's methods, which is the actual missing piece. Tracked as G133b in
+    /// `PARITY-GAPS.md`; see [`crate::yolo_api`].
+    fn run_permission_system_command(&self, args: &str) -> String {
+        let mut parts = args.split_whitespace();
+        let Some(setting) = parts.next() else {
+            return self.render_settings();
+        };
+        let value = parts.next();
+        if parts.next().is_some() {
+            return format!("Unexpected extra arguments.\n{COMMAND_USAGE}");
+        }
+
+        // pi `ON_OFF = ["on", "off"]` (`config-modal.ts:18`) — the modal can only ever emit one of
+        // these two, so anything else is a usage error rather than `applySetting`'s silent
+        // `value === "on"` coercion.
+        let enabled = match value {
+            Some("on") => true,
+            Some("off") => false,
+            Some(other) => return format!("Unknown value `{other}`.\n{COMMAND_USAGE}"),
+            None => return format!("`{setting}` needs a value.\n{COMMAND_USAGE}"),
+        };
+
+        match setting {
+            // pi `applySetting` `case "debug"` (`config-modal.ts:49-50`) → `setConfig` (`:78`).
+            "debug" => {
+                let next = ExtensionConfig { debug: enabled, ..guard(&self.config).clone() };
+                if self.save_extension_config(&next) {
+                    format!("Debug logging {}.\n{}", on_off(enabled), self.config_path_line())
+                } else {
+                    // pi surfaces this through `ctx.ui.notify(saved.error, "error")` only
+                    // (`index.ts:1407`); `save_extension_config` has already done that.
+                    format!(
+                        "Failed to save the permission-system config; debug logging is unchanged \
+                         ({}).\n{}",
+                        on_off(guard(&self.config).debug),
+                        self.config_path_line()
+                    )
+                }
+            }
+            // pi `applySetting` `case "yoloMode"` (`config-modal.ts:51-52`) → `setConfig` (`:75`),
+            // the SAME writer the debug row uses. Not `setYoloMode` — that is the runtime API.
+            "yoloMode" => {
+                let next = ExtensionConfig { yolo_mode: enabled, ..guard(&self.config).clone() };
+                if self.save_extension_config(&next) {
+                    format!("YOLO mode {}.\n{}", on_off(enabled), self.config_path_line())
+                } else {
+                    // Same failure shape as the debug row: pi notifies through `ctx.ui.notify` and
+                    // leaves the live config untouched (`index.ts:1405-1409`), so the value reported
+                    // here is the one still in effect.
+                    format!(
+                        "Failed to save the permission-system config; YOLO mode is unchanged \
+                         ({}).\n{}",
+                        on_off(guard(&self.config).yolo_mode),
+                        self.config_path_line()
+                    )
+                }
+            }
+            // pi `applySetting`'s `default: return config` (`config-modal.ts:53-54`) — the modal
+            // cannot emit an unknown id, so cyrup's text form reports it instead of silently
+            // no-oping.
+            other => format!("Unknown setting `{other}`.\n{COMMAND_USAGE}"),
+        }
+    }
+
+    /// The modal's initial view (pi `buildSettingItems`, `config-modal.ts:24-41`, plus its
+    /// `helpText: \`Config file: ${controller.getConfigPath()}\``, `:85`), as text.
+    fn render_settings(&self) -> String {
+        let config = guard(&self.config).clone();
+        format!(
+            "Permission System Settings\n  debug     {:<3}  Debug logging\n  yoloMode  {:<3}  YOLO \
+             mode\n{}\n{COMMAND_USAGE}",
+            on_off(config.debug),
+            on_off(config.yolo_mode),
+            self.config_path_line()
+        )
+    }
+
+    /// pi `helpText: \`Config file: ${controller.getConfigPath()}\`` (`config-modal.ts:85`, over
+    /// `getPermissionSystemConfigPath`, `index.ts:1509`) — the RESOLVED path, so the
+    /// `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` override is what the human is told about.
+    fn config_path_line(&self) -> String {
+        format!("Config file: {}", Self::resolved_config_path_for(&self.agent_dir).display())
+    }
+
     /// Assemble from explicit parts (used by tests that point the global policy path at a fixture file
     /// / inject a scripted ask channel). Derives `agent_dir` from the policy path's parent; installs no
     /// watcher and a fresh capability slot.
     #[must_use]
     pub fn from_parts(
         paths: ManagerPaths,
-        permanent_path: PathBuf,
         config: ExtensionConfig,
         ask_channel: Arc<dyn AskChannel>,
     ) -> Self {
@@ -443,7 +816,6 @@ impl PermissionSystemExtension {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         Self::from_parts_full(
             paths,
-            permanent_path,
             config,
             ask_channel,
             agent_dir,
@@ -456,7 +828,6 @@ impl PermissionSystemExtension {
     #[must_use]
     fn from_parts_full(
         paths: ManagerPaths,
-        permanent_path: PathBuf,
         config: ExtensionConfig,
         ask_channel: Arc<dyn AskChannel>,
         agent_dir: PathBuf,
@@ -480,7 +851,6 @@ impl PermissionSystemExtension {
             id: ExtensionId::from(EXTENSION_ID),
             manager: Mutex::new(manager_with_warnings(paths, &warnings)),
             session_approvals: Mutex::new(SessionApprovalStore::new()),
-            permanent_approvals: Mutex::new(PermanentApprovalStore::new(permanent_path)),
             dedup: Mutex::new(DedupCache::new()),
             config: shared_config,
             ask_channel,
@@ -506,7 +876,8 @@ impl PermissionSystemExtension {
         }
     }
 
-    /// pi `writeReviewEntry` (`index.ts:178-183`): the SECURITY-relevant decision stream — the
+    /// pi `writeReviewEntry` (v0.8.0 `index.ts:200-202`, via `writeLogEntry` `:183-194`): the
+    /// SECURITY-relevant decision stream — the
     /// "why was this blocked / who approved this" trail. Same warning funnel.
     fn write_review_entry(&self, event: &str, details: &Value) {
         if let Some(warning) = self.logger.review(event, details) {
@@ -514,7 +885,7 @@ impl PermissionSystemExtension {
         }
     }
 
-    /// pi `reportLoggingWarning` (`index.ts:162-169`): surface a NEW logging failure once through
+    /// pi `reportLoggingWarning` (v0.8.0 `index.ts:174-181`): surface a NEW logging failure once through
     /// the same `ui.notify` channel every other warning uses, and remember it so a persistently
     /// broken trail cannot notify on every gated tool call.
     fn report_logging_warning(&self, message: &str) {
@@ -642,9 +1013,8 @@ impl PermissionSystemExtension {
         // Main check + store overlay — fully synchronous; every lock is dropped before any await.
         let check = {
             let session_rules = guard(&self.session_approvals).get_rules();
-            let permanent_rules = guard(&self.permanent_approvals).get_rules();
             let raw = guard(&self.manager).check_permission(normalized, input, agent_name);
-            gate::apply_pattern_approval_state(raw, input, &session_rules, &permanent_rules)
+            gate::apply_pattern_approval_state(raw, input, &session_rules)
         };
 
         match check.state {
@@ -795,7 +1165,7 @@ impl PermissionSystemExtension {
     }
 
     /// (4) The external-directory guard (pi `index.ts:2312-2413`). Checks the `external_directory`
-    /// special policy for `{path, cwd}` (with the session/permanent overlay applied on an `ask`): `deny`
+    /// special policy for `{path, cwd}` (with the session overlay applied on an `ask`): `deny`
     /// → block; `ask` → live prompt (fail-closed / user-deny → block; approved-Always → session-persist,
     /// then fall through); `allow` → fall through. `None` = allowed (proceed to the main check).
     async fn resolve_external_directory(
@@ -807,11 +1177,10 @@ impl PermissionSystemExtension {
         let GateCall { call_id, tool_name, input, cwd, agent_name } = *call;
         let ext_input = json!({ "path": path, "cwd": cwd });
         let raw = guard(&self.manager).check_permission("external_directory", &ext_input, agent_name);
-        // pi `:2319-2321`: the session/permanent overlay is applied ONLY on an `ask` result.
+        // pi `:2319-2321`: the session overlay is applied ONLY on an `ask` result.
         let ext_check = if raw.state == PermissionState::Ask {
             let session_rules = guard(&self.session_approvals).get_rules();
-            let permanent_rules = guard(&self.permanent_approvals).get_rules();
-            gate::apply_pattern_approval_state(raw, &ext_input, &session_rules, &permanent_rules)
+            gate::apply_pattern_approval_state(raw, &ext_input, &session_rules)
         } else {
             raw
         };
@@ -1115,8 +1484,9 @@ impl PermissionSystemExtension {
     }
 
     /// Apply a resolved decision (pi `:2478-2495`): not-approved → Block (`formatUserDeniedReason`);
-    /// approved-Always → persist an allow rule to the SESSION store (pi `index.ts:905`; §8.2: the
-    /// permanent on-disk store is NEVER written at runtime — it is read-through only). The `Always`
+    /// approved-Always → persist an allow rule to the SESSION store — the ONLY approval sink there is
+    /// (pi v0.8.0 `index.ts:610`, `persistSessionApprovalDecision`; the cross-session
+    /// `PermanentApprovalStore` was deleted upstream in v0.8.0, see [`crate::stores`]). The `Always`
     /// persist branch fires on a real dialog returning "Allow Always" ([`LocalAskChannel`]); a later
     /// same-subject call then auto-allows via the store overlay with no second dialog (proven by
     /// `tests/human_dialog.rs`). `Once`/`Approved` (yolo) approve without persisting.
@@ -1205,7 +1575,7 @@ impl PermissionSystemExtension {
     }
 
     /// pi `shouldExposeTool` (`index.ts:2049-2075`): keep a tool exposed iff its TOOL-LEVEL permission
-    /// ([`PermissionManager::get_tool_permission`]) — with the session/permanent approval overlay (pi
+    /// ([`PermissionManager::get_tool_permission`]) — with the session approval overlay (pi
     /// `applyPatternApprovalState(..., {}, ...)`) — is not `deny`. A `deny` `read` is still exposed when
     /// the agent has allowed skills ([`PermissionManager::has_allowed_skills`], pi `:2070`) so it can
     /// reach skill files; a `deny` `bash` is still exposed when the agent has an explicitly allowed bash
@@ -1213,7 +1583,6 @@ impl PermissionSystemExtension {
     /// (the gate re-checks each — the mandate-directed analog of the read/skills bypass).
     fn should_expose_tool(&self, tool_name: &str, agent_name: Option<&str>) -> bool {
         let session_rules = guard(&self.session_approvals).get_rules();
-        let permanent_rules = guard(&self.permanent_approvals).get_rules();
         let mut mgr = guard(&self.manager);
 
         let raw = PermissionCheckResult {
@@ -1224,9 +1593,7 @@ impl PermissionSystemExtension {
             target: None,
             source: CheckSource::Tool,
         };
-        let state =
-            gate::apply_pattern_approval_state(raw, &json!({}), &session_rules, &permanent_rules)
-                .state;
+        let state = gate::apply_pattern_approval_state(raw, &json!({}), &session_rules).state;
         if state != PermissionState::Deny {
             return true;
         }
@@ -1473,8 +1840,9 @@ impl NativeExtension for PermissionSystemExtension {
         // clear the in-session store + dedup + skill state (and set/clear the status pill).
         // ResourcesDiscover runs pi's `resources_discover` reload branch (`index.ts:2103-2118`):
         // re-reads `config.json`, rebuilds the `PermissionManager` from the current cwd, and
-        // invalidates the agent-start cache. No LLM-visible tool/command is registered — the gate is
-        // invisible to the model (pi none).
+        // invalidates the agent-start cache. No LLM-visible TOOL is registered — the gate is
+        // invisible to the model (pi registers none either). The one HUMAN-visible registration is
+        // the `/permission-system` slash command below, which pi registers at `index.ts:1502-1512`.
         api.subscribe(&[
             EventKind::ToolCall,
             EventKind::BeforeAgentStart,
@@ -1483,7 +1851,55 @@ impl NativeExtension for PermissionSystemExtension {
             EventKind::SessionShutdown,
             EventKind::ResourcesDiscover,
         ]);
+        // pi `pi.registerCommand("permission-system", { description, handler })`
+        // (v0.8.0 `index.ts:1502-1512`). This is what makes `ExtensionConfig::save` reachable at
+        // all: before it, every `.save(` call site in this crate lived inside `#[cfg(test)]`, so the
+        // v0.8.0 save semantics (non-extension keys preserved, corrupt file refused, symlink written
+        // through) could not be observed by anything a human could run. The registration lands in
+        // `ExtensionRegistry`'s command table via `load_native_body`, and `/permission-system` routes
+        // back here through `ExtensionHost::execute_native_command` → [`Self::execute_command`].
+        api.register_command(
+            PERMISSION_SYSTEM_COMMAND,
+            cyrup_ext::CommandDescriptor {
+                description: crate::common::PERMISSION_SYSTEM_COMMAND_DESCRIPTION.to_string(),
+                // The modal's two setting ids (`config-modal.ts:27,34`) as completions.
+                completions: vec!["debug".to_string(), "yoloMode".to_string()],
+            },
+        );
         Ok(())
+    }
+
+    /// Service the `/permission-system` command (pi `createPermissionSystemCommandHandler`,
+    /// v0.8.0 `common.ts:188-198`).
+    ///
+    /// The `has_ui` guard is upstream's, verbatim in effect (`common.ts:192-195`): with no
+    /// interactive UI the handler notifies a `warning` and returns without touching the config.
+    /// cyrup additionally returns that same sentence as the command's text output, because a native
+    /// command here has a return channel pi's `void` handler does not.
+    async fn execute_command(
+        &self,
+        name: &str,
+        args: &str,
+        ctx: &HostCtx,
+    ) -> Result<Option<String>, ExtError> {
+        if name != PERMISSION_SYSTEM_COMMAND {
+            return Err(ExtError::Component(format!(
+                "cyrup-permission-system has no handler for command `{name}`"
+            )));
+        }
+        // pi `common.ts:192-195`.
+        if !ctx.has_ui {
+            if let Some(services) = self.host_services.get() {
+                services.notify(
+                    crate::common::PERMISSION_SYSTEM_COMMAND_REQUIRES_UI,
+                    NotifyKind::Warning,
+                );
+            }
+            return Ok(Some(crate::common::PERMISSION_SYSTEM_COMMAND_REQUIRES_UI.to_string()));
+        }
+        // pi `openPermissionSystemSettingsModal(ctx, { getConfig, setConfig, getConfigPath })`
+        // (`index.ts:1504-1511`).
+        Ok(Some(self.run_permission_system_command(args)))
     }
 
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
@@ -1660,7 +2076,7 @@ fn env_truthy(name: &str) -> bool {
 /// **Every install signal is reversible** (PERM-002). Before this, the probe accepted the bare
 /// EXISTENCE of `<agent_dir>/cyrup-permission-system/config.json` — but that file is written by
 /// this crate itself, unconditionally, as a side effect of constructing the extension
-/// ([`ExtensionConfig::ensure_on_disk`] via [`PermissionSystemExtension::derive_parts`]). So a
+/// (`ExtensionConfig::ensure_on_disk` via the load in [`PermissionSystemExtension::new`]). So a
 /// single `CYRUP_PERMISSION_SYSTEM=1` run left a permanent artifact behind that kept the gate
 /// armed forever after, with no supported way to turn it back off: unsetting the env var did
 /// nothing, and the file silently reappeared on the very next run if deleted.
@@ -1679,9 +2095,14 @@ fn env_truthy(name: &str) -> bool {
 ///
 /// Upstream `pi-permission-system` has no "installed" probe to copy (the extension gates whatever
 /// loads it); its v0.8.0 answer to "how do I turn this off" is a separate `"enabled": false`
-/// master switch in `config.json` (`extension-config.ts:12,88` → `index.ts:1475`), which is
-/// tracked as its own port item and is complementary to — not a substitute for — un-latching this
-/// probe.
+/// master switch in `config.json` (`extension-config.ts:11-12,88` → `index.ts:1473-1477`). That
+/// switch is now ported too (see [`permission_extension_for_env`]) and is complementary to — not a
+/// substitute for — un-latching this probe: it is an explicit operator decision recorded in the
+/// file, whereas this probe is about a file the crate wrote to itself.
+///
+/// The two compose in the only order that works: `"enabled": false` is by definition NOT the
+/// pristine template, so it reads as an install signal here and the `enabled` check downstream is
+/// the thing that actually declines to attach.
 #[must_use]
 pub fn is_installed(agent_dir: &Path, cwd: &Path) -> bool {
     if env_truthy(INSTALL_ENV_VAR) {
@@ -1691,7 +2112,13 @@ pub fn is_installed(agent_dir: &Path, cwd: &Path) -> bool {
     if [agent_dir.join(POLICY_FILE), project_dir.join(POLICY_FILE)].iter().any(|p| p.exists()) {
         return true;
     }
-    let config_path = PermissionSystemExtension::config_path_for(agent_dir);
+    // The RESOLVED path, not the raw default: `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` can point the
+    // extension at a different file entirely, and both `ExtensionConfig::load` (the `enabled`
+    // switch, below) and `ExtensionConfig::save` (the `/permission-system` writers) already honour
+    // it. Reading the raw path here let the install decision and the on/off decision inspect two
+    // different files and disagree — pi has one `getPermissionSystemConfigPath()` and every consumer
+    // goes through it (`extension-config.ts:51-53`).
+    let config_path = PermissionSystemExtension::resolved_config_path_for(agent_dir);
     config_path.exists() && !ExtensionConfig::is_pristine_default_file(&config_path)
 }
 
@@ -1707,7 +2134,8 @@ pub fn is_installed(agent_dir: &Path, cwd: &Path) -> bool {
 /// - **PARENT** (root, `DEPTH == 0`): loads the gate with the [`LocalAskChannel`] in-session dialog +
 ///   the forwarding WATCHER ([`PermissionSystemExtension::new_forwarding_parent`]).
 ///
-/// Returns `None` (attach nothing → DI-5 zero gating) only when the gate is not installed.
+/// Returns `None` (attach nothing → DI-5 zero gating) when the gate is not installed, or when it
+/// is installed but `config.json` sets the `enabled` master switch to `false`.
 #[must_use]
 pub fn permission_extension_for_env(
     agent_dir: PathBuf,
@@ -1716,14 +2144,43 @@ pub fn permission_extension_for_env(
     if !is_installed(&agent_dir, &cwd) {
         return None;
     }
+    // pi's `enabled` master switch (`extension-config.ts:11-12` "When false, the extension skips
+    // all registrations and startup work"): `index.ts:1473-1477` loads the extension config and
+    // then `if (!extensionConfig.enabled) { return; }` — a bare early return out of the extension
+    // entry point `piPermissionSystemExtension(pi)` (`index.ts:1308`), before
+    // `applyExtensionConfigSideEffects` (`:1479`), before the runtime-API registration (`:1481`)
+    // and before every handler / command / status registration.
+    //
+    // This function is cyrup's analog of that entry point: returning `None` means the binary
+    // wiring attaches no `NativeExtension` at all, so nothing subscribes and no startup work runs
+    // — the same observable outcome as pi's early return. Only the literal `false` disables; see
+    // `ExtensionConfig::normalize`.
+    //
+    // Deliberately AFTER `is_installed`: an operator with no config at all must not pay a config
+    // load (nor have the template materialized on their disk merely by our deciding not to attach),
+    // and an `"enabled": false` file is non-pristine, so it passes the install probe and lands here
+    // (which is exactly where it should be declined).
+    //
+    // This is THE load for the whole session — pi's single `loadExtensionConfigState()` at
+    // `index.ts:1473`, whose result both the `enabled` test (`:1475-1477`) and every downstream
+    // consumer reuse. It is threaded into the constructor below rather than re-read there; see
+    // `PermissionSystemExtension::load_config`.
+    let config = PermissionSystemExtension::load_config(&agent_dir);
+    if !config.enabled {
+        return None;
+    }
     if is_subagent_child() {
         // CHILD: forward asks up to the parent (§7.4). The parent-session anchor
         // `CYRUP_SUBAGENT_PARENT_SESSION` (emitted by `cyrup-ext-subagents`, `exec/mod.rs`
         // `PARENT_SESSION_ENV_VAR`) addresses the parent's inbox; the `ForwardingAskChannel` reads it.
-        return Some(Arc::new(PermissionSystemExtension::new_forwarding_child(agent_dir, cwd)));
+        return Some(Arc::new(PermissionSystemExtension::new_forwarding_child_with_config(
+            agent_dir, cwd, config,
+        )));
     }
     // PARENT: in-session dialog + the forwarding watcher (installed on SessionStart).
-    Some(Arc::new(PermissionSystemExtension::new_forwarding_parent(agent_dir, cwd)))
+    Some(Arc::new(PermissionSystemExtension::new_forwarding_parent_with_config(
+        agent_dir, cwd, config,
+    )))
 }
 
 #[cfg(test)]
@@ -1733,28 +2190,23 @@ mod tests {
 
     #[test]
     fn not_installed_without_policy_or_env_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        // No policy file, env not set → DI-5 zero gating. Explicitly sandbox (save/clear/restore)
-        // `INSTALL_ENV_VAR` for this assertion: it is the same opt-in env var
+        // No policy file, env not set → DI-5 zero gating. `INSTALL_ENV_VAR` is sandboxed (and,
+        // crucially, LOCKED) by [`without_install_env`]: it is the same opt-in env var
         // `permission_extension_for_env` reads in production, and a developer/CI shell that has
         // genuinely opted in workspace-wide (exactly as this crate's own module doc documents,
-        // "opt-in per DI-5") would otherwise make this "no opt-in" case flake on ambient state
-        // that has nothing to do with the code path under test. No other test in this crate reads
-        // or writes `INSTALL_ENV_VAR`, so this scoped mutation cannot race a sibling test.
-        let previous = std::env::var(INSTALL_ENV_VAR).ok();
-        // SAFETY: scoped to this test; restored immediately below before any other assertion runs.
-        unsafe {
-            std::env::remove_var(INSTALL_ENV_VAR);
-        }
-        assert!(!is_installed(dir.path(), dir.path()));
-        // SAFETY: restores whatever the ambient shell had (or leaves it unset), symmetric with the
-        // removal above.
-        unsafe {
-            match previous {
-                Some(v) => std::env::set_var(INSTALL_ENV_VAR, v),
-                None => std::env::remove_var(INSTALL_ENV_VAR),
-            }
-        }
+        // "opt-in per DI-5") would otherwise make this "no opt-in" case flake on ambient state that
+        // has nothing to do with the code path under test.
+        //
+        // This test used to save/clear/restore the variable inline with NO lock, on the stated
+        // grounds that "no other test in this crate reads or writes `INSTALL_ENV_VAR`". That is
+        // false — the PERM-002/v0.8.0 tests below all do, via `without_install_env`. A mutex only
+        // serializes the parties that take it, so an unlocked mutator races every locked one in
+        // both directions: it can clear the variable out from under a sibling, and a sibling's
+        // restore can set it back mid-assertion here.
+        without_install_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(!is_installed(dir.path(), dir.path()));
+        });
     }
 
     #[test]
@@ -2037,6 +2489,269 @@ mod tests {
             // A policy file remains an install signal regardless of the config file.
             write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "deny" } }"#);
             assert!(is_installed(&agent_dir, &cwd), "a policy file must still install the gate");
+        });
+    }
+
+    // ============================================================================================
+    // v0.8.0 `enabled` master switch (pi `extension-config.ts:11-12,88` → `index.ts:1473-1477`).
+    // ============================================================================================
+
+    /// pi v0.8.0 added an `enabled` master switch: "When false, the extension skips all
+    /// registrations and startup work" (`extension-config.ts:11-12`), enforced by a bare early
+    /// return out of the extension entry point before any registration happens
+    /// (`index.ts:1473-1477`). cyrup's analog is [`permission_extension_for_env`] returning `None`,
+    /// so the binary attaches no `NativeExtension` at all.
+    ///
+    /// The switch must beat a REAL install signal, which is the whole point of a master switch —
+    /// so this test arms the gate with a policy file first (the strongest signal, untouched by the
+    /// PERM-002 pristine logic) and then turns it off with the config key alone.
+    #[test]
+    fn enabled_false_attaches_nothing_even_with_a_policy_file_present() {
+        without_install_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let cwd = dir.path().join("project");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
+
+            // An unambiguous, operator-authored install signal.
+            write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "deny" } }"#);
+            assert!(
+                permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_some(),
+                "precondition: a policy file installs the gate"
+            );
+
+            // The master switch off.
+            write_file(&config_path, "{\n  \"enabled\": false\n}\n");
+            assert!(
+                is_installed(&agent_dir, &cwd),
+                "`enabled` is NOT the install probe — an edited config still reads as installed; \
+                 the switch has to be enforced downstream of it"
+            );
+            assert!(
+                permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_none(),
+                "`\"enabled\": false` must attach no extension at all (pi `index.ts:1473-1477`)"
+            );
+
+            // MIRROR (must stay green): the switch is not over-broad. Only the literal `false`
+            // disables (pi `record.enabled !== false`, `extension-config.ts:88`) — an explicit
+            // `true`, a non-boolean, and a file with no `enabled` key at all (i.e. every config
+            // written before v0.8.0) all keep the gate attached.
+            for still_enabled in
+                ["{\n  \"enabled\": true\n}\n", "{\n  \"enabled\": 0\n}\n", "{\n  \"yoloMode\": true\n}\n"]
+            {
+                write_file(&config_path, still_enabled);
+                assert!(
+                    permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_some(),
+                    "config {still_enabled:?} must NOT disable the gate"
+                );
+            }
+        });
+    }
+
+    /// The upgrade hazard that comes with adding a fourth key to the auto-materialized template.
+    ///
+    /// [`ExtensionConfig::is_pristine_default_file`] is a BYTE-EXACT compare and it is the third
+    /// install signal in [`is_installed`] (see that function's doc / PERM-002). Every cyrup build
+    /// before `enabled` existed wrote a three-key `config.json`, and those files are sitting on
+    /// disk. If the probe only ever accepted the CURRENT template, every one of them would stop
+    /// reading as pristine the moment this key landed — silently re-arming the permission gate, on
+    /// upgrade, for exactly the population PERM-002 was fixed for: people who opted in once and
+    /// then opted back out.
+    ///
+    /// So the probe accepts a SET of exact templates, and this test pins the legacy member of it.
+    #[test]
+    fn a_legacy_three_key_config_template_still_reads_as_pristine() {
+        without_install_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let cwd = dir.path().join("project");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
+
+            // Byte-for-byte what an older cyrup build left behind. Written as a literal, not via
+            // the constant, so this test still fails if the constant itself is edited.
+            write_file(
+                &config_path,
+                "{\n  \"debug\": false,\n  \"yoloMode\": false,\n  \"forwardedPromptTimeoutSeconds\": 30\n}\n",
+            );
+            assert!(
+                ExtensionConfig::is_pristine_default_file(&config_path),
+                "a config.json written by a pre-`enabled` cyrup build is still the crate's own \
+                 footprint, not an operator decision"
+            );
+            assert!(
+                !is_installed(&agent_dir, &cwd),
+                "upgrading must not re-arm the gate for a user whose only leftover is the old \
+                 auto-written template"
+            );
+            assert!(permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_none());
+
+            // MIRROR (must stay green): the CURRENT template reads as pristine too — accepting the
+            // legacy bytes is additive, it does not replace the live compare.
+            write_file(&config_path, &ExtensionConfig::default_config_content());
+            assert!(ExtensionConfig::is_pristine_default_file(&config_path));
+            assert!(!is_installed(&agent_dir, &cwd));
+
+            // MIRROR (must stay green): the probe did NOT get looser. A file an operator actually
+            // touched still reads as configured and still installs — including one that differs
+            // from the legacy template by a single character, and one that is a strict subset of
+            // the known keys (the semantic "does it normalize to the default" check that was
+            // rejected would have wrongly accepted this second one and disabled a real gate).
+            for edited in [
+                "{\n  \"debug\": true,\n  \"yoloMode\": false,\n  \"forwardedPromptTimeoutSeconds\": 30\n}\n",
+                "{\n  \"yoloMode\": false\n}\n",
+            ] {
+                write_file(&config_path, edited);
+                assert!(
+                    !ExtensionConfig::is_pristine_default_file(&config_path),
+                    "hand-edited config {edited:?} must not read as pristine"
+                );
+                assert!(is_installed(&agent_dir, &cwd), "...and must still install the gate");
+            }
+        });
+    }
+
+    /// Point `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` at `path` for the duration of `body`, restoring
+    /// the ambient value after.
+    ///
+    /// MUST be called from inside [`without_install_env`], which already holds
+    /// [`crate::ext_config::env_lock`]; this helper deliberately does NOT take that lock itself,
+    /// because `std::sync::Mutex` is not reentrant and re-taking it here would deadlock.
+    fn with_config_path_override<T>(path: &Path, body: impl FnOnce() -> T) -> T {
+        let key = crate::ext_config::CONFIG_PATH_ENV_KEY;
+        let previous = std::env::var(key).ok();
+        // SAFETY: serialized by `env_lock` (held by the enclosing `without_install_env`), and
+        // restored below.
+        unsafe { std::env::set_var(key, path) };
+        let out = body();
+        // SAFETY: same scope/serialization; restores whatever the ambient shell had.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        out
+    }
+
+    /// G130(b). The install probe and the `enabled` master switch must read the SAME file.
+    ///
+    /// `is_installed`'s pristine-template probe read the RAW `config_path_for(agent_dir)` with no
+    /// env consultation, while the `enabled` check goes through `ExtensionConfig::load` →
+    /// `resolve_config_path`, which honours `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH`. With the
+    /// override set, the two gates inspected DIFFERENT files, so "is this installed?" and "is it
+    /// switched on?" were answered about two different operator intentions. Upstream has one
+    /// accessor, `getPermissionSystemConfigPath()` (`extension-config.ts:51-53`), and every
+    /// consumer — `loadPermissionSystemConfig` (`:117`), `savePermissionSystemConfig` (`:240`), the
+    /// modal's displayed path (`index.ts:1509`) — defaults to it.
+    ///
+    /// The case neither `enabled` test covered: the override points at a file whose `enabled`
+    /// differs from the pristine template sitting at the default path.
+    #[test]
+    fn the_install_probe_reads_the_same_resolved_config_as_the_enabled_switch() {
+        without_install_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let cwd = dir.path().join("project");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+
+            // The DEFAULT path holds the pristine, crate-written template — the extension's own
+            // footprint, therefore NOT an install signal (PERM-002), and `enabled: true`.
+            let default_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
+            write_file(&default_path, &ExtensionConfig::default_config_content());
+
+            let override_path = dir.path().join("ops").join("permissions.json");
+            with_config_path_override(&override_path, || {
+                // The operator's own file, at the override path, with the master switch OFF — the
+                // opposite of what the default path says.
+                write_file(&override_path, "{\n  \"enabled\": false\n}\n");
+                assert!(
+                    is_installed(&agent_dir, &cwd),
+                    "the install probe must read the OVERRIDE file (hand-authored ⇒ installed), \
+                     not the pristine template still sitting at the default path"
+                );
+                assert!(
+                    permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_none(),
+                    "...and that same file's `\"enabled\": false` is what then declines to attach"
+                );
+
+                // Same file, switch ON: the two gates agree in the other direction too.
+                write_file(&override_path, "{\n  \"enabled\": true,\n  \"yoloMode\": true\n}\n");
+                assert!(is_installed(&agent_dir, &cwd));
+                assert!(
+                    permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_some(),
+                    "an override file that installs AND enables must attach the gate"
+                );
+
+                // The default-path template is inert while the override is in force: nothing reads
+                // it and nothing rewrote it.
+                assert_eq!(
+                    std::fs::read_to_string(&default_path).unwrap(),
+                    ExtensionConfig::default_config_content()
+                );
+            });
+
+            // MIRROR (must stay green): with NO override in force, both gates read the default
+            // path exactly as before, and the pristine template there is still not an install
+            // signal — resolving the path did not make the probe looser.
+            assert!(!is_installed(&agent_dir, &cwd));
+            assert!(permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_none());
+            write_file(&default_path, "{\n  \"yoloMode\": true\n}\n");
+            assert!(is_installed(&agent_dir, &cwd));
+            assert!(permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_some());
+        });
+    }
+
+    /// G130(a). Building the gate reads `config.json` ONCE.
+    ///
+    /// The `enabled` switch landed as its own `ExtensionConfig::load` in
+    /// [`permission_extension_for_env`], and the constructor immediately loaded the SAME file
+    /// again. `load` `eprintln!`s on a malformed or unreadable config, so an operator with a
+    /// corrupt `config.json` saw the identical warning twice per session build where pi — which
+    /// holds one `extensionConfig` populated by one `loadExtensionConfigState()` at
+    /// `index.ts:1473` — prints it once.
+    ///
+    /// Counted rather than observed on stderr: `eprintln!` cannot be captured from inside the same
+    /// process without redirecting fd 2. See `crate::ext_config::LOAD_COUNT`.
+    #[test]
+    fn attaching_the_gate_loads_the_extension_config_exactly_once() {
+        without_install_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let cwd = dir.path().join("project");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            // An install signal that is NOT the config file, so the probe itself performs no load.
+            write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "deny" } }"#);
+
+            crate::ext_config::reset_load_count();
+            let attached = permission_extension_for_env(agent_dir.clone(), cwd.clone());
+            let loads = crate::ext_config::load_count();
+            assert!(attached.is_some(), "precondition: the policy file installs the gate");
+            assert_eq!(
+                loads, 1,
+                "the session build must read config.json once, not once for the `enabled` switch \
+                 and again inside the constructor"
+            );
+
+            // MIRROR (must stay green): declining to attach still reads it once — the `enabled`
+            // switch has to open the file to answer at all, and the constructor never runs.
+            write_file(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE), "{\n  \"enabled\": false\n}\n");
+            crate::ext_config::reset_load_count();
+            assert!(permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_none());
+            assert_eq!(crate::ext_config::load_count(), 1);
+
+            // MIRROR (must stay green): a NOT-installed dir pays no config load at all, and so
+            // never materializes the template as a side effect of deciding not to attach.
+            let clean = tempfile::tempdir().unwrap();
+            crate::ext_config::reset_load_count();
+            assert!(permission_extension_for_env(clean.path().to_path_buf(), cwd.clone()).is_none());
+            assert_eq!(crate::ext_config::load_count(), 0);
+            assert!(!clean.path().join(CONFIG_DIR).join(CONFIG_FILE).exists());
         });
     }
 

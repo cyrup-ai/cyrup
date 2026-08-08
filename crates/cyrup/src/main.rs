@@ -479,7 +479,9 @@ async fn run() -> anyhow::Result<i32> {
         // via the SAME `.with_native_extension(...)` seam. `permission_extension_for_env` selects the
         // role by the `CYRUP_SUBAGENT_CHILD` signal — a subagent child loads the gate with the
         // child→parent ask-FORWARDING channel, this (root) session loads it with the in-session dialog
-        // + the forwarding watcher — and returns `None` only when the gate is not installed (DI-5).
+        // + the forwarding watcher — and returns `None` when the gate is not installed (DI-5) OR
+        // when an installed gate is switched off by `"enabled": false` in its `config.json`
+        // (v0.8.0 `index.ts:1473-1477`, the master switch that early-returns before registration).
         if let Some(ext) = cyrup_permission_system::permission_extension_for_env(
             dirs.agent_dir.clone(),
             session_cwd,

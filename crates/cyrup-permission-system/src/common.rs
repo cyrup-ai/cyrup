@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 use crate::ordered::OrderedValue;
 
-/// pi `common.ts:6-12` `toRecord` — an object's map, or an empty map for non-objects/arrays/null.
+/// pi `common.ts:7-13` `toRecord` — an object's map, or an empty map for non-objects/arrays/null.
 #[must_use]
 pub fn to_record(value: &Value) -> &Map<String, Value> {
     static EMPTY: std::sync::OnceLock<Map<String, Value>> = std::sync::OnceLock::new();
@@ -15,7 +15,7 @@ pub fn to_record(value: &Value) -> &Map<String, Value> {
     }
 }
 
-/// pi `common.ts:14-21` `getNonEmptyString` — a trimmed non-empty string, else `None`.
+/// pi `common.ts:15-22` `getNonEmptyString` — a trimmed non-empty string, else `None`.
 #[must_use]
 pub fn get_non_empty_string(value: Option<&Value>) -> Option<String> {
     let s = value?.as_str()?;
@@ -66,7 +66,7 @@ pub(crate) fn lexical_normalize(input: &str) -> String {
     }
 }
 
-/// pi `common.ts:27-44` `normalizePathForComparison`: strip surrounding quotes, drop a leading `@`,
+/// pi `common.ts:57-74` `normalizePathForComparison`: strip surrounding quotes, drop a leading `@`,
 /// expand `~`, resolve against `cwd`, lexically collapse `..`. Returns a `/`-separated absolute path
 /// (non-win32; cyrup targets unix — win32 lowercasing is intentionally omitted, matching the doc's
 /// unix scope).
@@ -79,7 +79,7 @@ pub fn normalize_path_for_comparison(path_value: &str, cwd: &str) -> String {
 
     let normalized_path = trimmed.strip_prefix('@').unwrap_or(trimmed);
 
-    // `~` / `~/` expansion (pi `common.ts:35-39`).
+    // `~` / `~/` expansion (pi `common.ts:65-69`).
     let expanded: String = if normalized_path == "~" {
         home_dir()
     } else if let Some(rest) = normalized_path.strip_prefix("~/") {
@@ -88,7 +88,7 @@ pub fn normalize_path_for_comparison(path_value: &str, cwd: &str) -> String {
         normalized_path.to_string()
     };
 
-    // `resolve(cwd, path)` — absolute stays; relative joins under cwd (pi `common.ts:41`).
+    // `resolve(cwd, path)` — absolute stays; relative joins under cwd (pi `common.ts:71`).
     let absolute = if expanded.starts_with('/') {
         expanded
     } else {
@@ -98,7 +98,7 @@ pub fn normalize_path_for_comparison(path_value: &str, cwd: &str) -> String {
     lexical_normalize(&absolute)
 }
 
-/// pi `common.ts:46-64` `normalizePathResourceForPermission`: normalize for comparison, force `/`
+/// pi `common.ts:76-94` `normalizePathResourceForPermission`: normalize for comparison, force `/`
 /// separators, collapse a bare root to `/`, then strip a trailing slash.
 #[must_use]
 pub fn normalize_path_resource_for_permission(path_value: &str, cwd: &str) -> String {
@@ -112,7 +112,7 @@ pub fn normalize_path_resource_for_permission(path_value: &str, cwd: &str) -> St
     normalized.trim_end_matches('/').to_string()
 }
 
-/// pi `common.ts:66-77` `isPathWithinDirectory`: `path == dir`, or `path` starts with `dir/`.
+/// pi `common.ts:96-107` `isPathWithinDirectory`: `path == dir`, or `path` starts with `dir/`.
 #[must_use]
 pub fn is_path_within_directory(path_value: &str, directory: &str) -> bool {
     if path_value.is_empty() || directory.is_empty() {
@@ -126,7 +126,7 @@ pub fn is_path_within_directory(path_value: &str, directory: &str) -> bool {
     path_value.starts_with(&prefix)
 }
 
-/// pi `common.ts:125-137` `extractFrontmatter`: the YAML block between a leading `---\n` and the
+/// pi `common.ts:167-179` `extractFrontmatter`: the YAML block between a leading `---\n` and the
 /// next `\n---`, else `""`.
 #[must_use]
 pub fn extract_frontmatter(markdown: &str) -> String {
@@ -141,7 +141,38 @@ pub fn extract_frontmatter(markdown: &str) -> String {
     }
 }
 
-/// pi `common.ts:81-123` `parseSimpleYamlMap`: an indentation-nested map of scalar strings and
+/// pi `PERMISSION_SYSTEM_COMMAND_DESCRIPTION` (v0.8.0 `common.ts:181`), verbatim but for the
+/// rebrand: the description the `/permission-system` slash command registers with
+/// ([`crate::extension::PERMISSION_SYSTEM_COMMAND`], pi `index.ts:1502-1503`).
+pub const PERMISSION_SYSTEM_COMMAND_DESCRIPTION: &str =
+    "Configure cyrup-permission-system debug logging and yolo-mode behavior";
+
+/// pi `createPermissionSystemCommandHandler`'s TUI guard (v0.8.0 `common.ts:188-198`): the
+/// `/permission-system` handler refuses outright when there is no interactive UI, because its whole
+/// body is "open a modal". Emitted as a `warning` notification and as the handler's text output.
+pub const PERMISSION_SYSTEM_COMMAND_REQUIRES_UI: &str =
+    "/permission-system requires interactive TUI mode.";
+
+/// pi `isPrototypePollutionKey` (`common.ts:111-113`): the three key names
+/// [`parse_simple_yaml_map`] refuses to store.
+///
+/// **This is NOT a security fix in Rust, and porting it buys no safety.** Upstream added the guard
+/// at v0.8.0 as a JavaScript prototype-pollution defence: there, `record["__proto__"] = child`
+/// mutates the object's prototype chain instead of adding an own property, and `constructor` /
+/// `prototype` are likewise reachable via `Object.prototype`, so attacker-authored agent
+/// frontmatter could corrupt objects it never touched. Rust has no prototype chain, and this
+/// parser stores keys in an ordinary ordered `Vec<(String, OrderedValue)>` where `"__proto__"` is
+/// just a string like any other — the hazard the guard defends against does not exist here.
+///
+/// It is ported because it is an **observable parity difference**: upstream yields a map WITHOUT
+/// these three keys and cyrup yielded one WITH them, so a `constructor: allow` line under
+/// `permission.bash` in an agent's markdown frontmatter became a live permission rule in cyrup
+/// while pi ignored it outright.
+pub(crate) fn is_prototype_pollution_key(key: &str) -> bool {
+    matches!(key, "__proto__" | "constructor" | "prototype")
+}
+
+/// pi `common.ts:115-161` `parseSimpleYamlMap`: an indentation-nested map of scalar strings and
 /// nested maps. Faithful to pi's minimal parser — NOT a general YAML parser (no lists, no
 /// multi-line scalars); the permission frontmatter never uses those. Returns an [`OrderedValue`] so
 /// pattern-key insertion order is preserved (the engine's last-match-wins depends on it).
@@ -164,6 +195,13 @@ pub fn parse_simple_yaml_map(input: &str) -> OrderedValue {
             continue;
         }
         let key = strip_edge_quotes(line.get(..sep).unwrap_or("").trim()).to_string();
+        // pi `common.ts:133-135`. Placement is load-bearing and matches upstream exactly: the
+        // `continue` lands BEFORE the stack pop below, so a dropped key neither opens a nesting
+        // level nor closes the enclosing one. Any more-indented lines beneath it therefore
+        // re-parent onto the map that was already open, rather than being dropped with it.
+        if is_prototype_pollution_key(&key) {
+            continue;
+        }
         let raw_value = line.get(sep + 1..).unwrap_or("").trim().to_string();
 
         while stack.len() > 1 && stack.last().map(|(i, _)| indent <= *i).unwrap_or(false) {
@@ -223,7 +261,7 @@ fn insert_ordered_at_path(
     }
 }
 
-/// Strip a single pair of matching surrounding single/double quotes (pi `common.ts:115-117`'s
+/// Strip a single pair of matching surrounding single/double quotes (pi `common.ts:152-155`'s
 /// scalar-value unquote: `startsWith('"') && endsWith('"')`, or the same for `'`). Strict/paired —
 /// used only for the YAML scalar VALUE, which pi genuinely requires to match on both ends.
 fn strip_surrounding_quotes(value: &str) -> &str {
@@ -241,8 +279,8 @@ fn strip_surrounding_quotes(value: &str) -> &str {
 }
 
 /// Strip a leading quote char and/or a trailing quote char INDEPENDENTLY (pi's
-/// `.replace(/^["']|["']$/g, "")`, used for `normalizePathForComparison` (`common.ts:28`) and the
-/// YAML map key (`common.ts:98`)). Unlike [`strip_surrounding_quotes`], the two ends need not be
+/// `.replace(/^["']|["']$/g, "")`, used for `normalizePathForComparison` (`common.ts:58`) and the
+/// YAML map key (`common.ts:132`)). Unlike [`strip_surrounding_quotes`], the two ends need not be
 /// present together nor match each other: `"abc` → `abc`, `abc'` → `abc`, `'abc"` → `abc`.
 fn strip_edge_quotes(value: &str) -> &str {
     let mut s = value;
@@ -329,6 +367,78 @@ mod tests {
 
         let parsed = parse_simple_yaml_map("'git *\": allow");
         assert_eq!(parsed.get("git *").and_then(|v| v.as_str()), Some("allow"));
+    }
+
+    // pi `common.ts:111-113` + `:133-135`: `__proto__`, `constructor` and `prototype` are dropped
+    // by the frontmatter parser at EVERY nesting level. Pre-fix cyrup stored them as ordinary
+    // keys, so they reached `normalize_raw_permission` and became live rules.
+    #[test]
+    fn prototype_pollution_keys_are_dropped_at_every_nesting_level() {
+        let parsed = parse_simple_yaml_map(concat!(
+            "__proto__: allow\n",
+            "constructor: allow\n",
+            "prototype: allow\n",
+            "permission:\n",
+            "  bash:\n",
+            "    __proto__: allow\n",
+            "    constructor: allow\n",
+            "    prototype: allow\n",
+            "    echo *: allow\n",
+        ));
+        for k in ["__proto__", "constructor", "prototype"] {
+            assert!(parsed.get(k).is_none(), "top-level key {k:?} must be dropped");
+        }
+        let bash = parsed.get("permission").unwrap().get("bash").unwrap();
+        for k in ["__proto__", "constructor", "prototype"] {
+            assert!(bash.get(k).is_none(), "nested key {k:?} must be dropped");
+        }
+        // MIRROR: dropping the three keys must not disturb their siblings on the same map.
+        assert_eq!(bash.get("echo *").and_then(|v| v.as_str()), Some("allow"));
+        assert_eq!(
+            bash.as_object().unwrap().len(),
+            1,
+            "only the surviving sibling should remain: {:?}",
+            bash.as_object().unwrap()
+        );
+    }
+
+    // MIRROR: only the three exact names are dropped. A key that merely contains or resembles one
+    // of them is an ordinary rule key and must survive — otherwise the port is over-broad and
+    // silently deletes operator-authored rules. (pi's check is `===`, `common.ts:112`.)
+    #[test]
+    fn keys_resembling_prototype_pollution_keys_are_kept() {
+        let parsed = parse_simple_yaml_map(concat!(
+            "__proto__x: a\n",
+            "x__proto__: b\n",
+            "Constructor: c\n",
+            "my-constructor: d\n",
+            "prototypes: e\n",
+            "proto: f\n",
+        ));
+        for (k, v) in [
+            ("__proto__x", "a"),
+            ("x__proto__", "b"),
+            ("Constructor", "c"),
+            ("my-constructor", "d"),
+            ("prototypes", "e"),
+            ("proto", "f"),
+        ] {
+            assert_eq!(parsed.get(k).and_then(|x| x.as_str()), Some(v), "key {k:?} must survive");
+        }
+    }
+
+    // pi `common.ts:133-135` `continue`s BEFORE the stack pop/push at `:139-148`, so a dropped
+    // key that would have opened a nested map opens nothing AND closes nothing: its would-be
+    // children attach to the still-open enclosing map.
+    #[test]
+    fn children_of_a_dropped_key_reparent_onto_the_enclosing_map() {
+        let parsed =
+            parse_simple_yaml_map("permission:\n  constructor:\n    bash: allow\n  skills: ask\n");
+        let permission = parsed.get("permission").unwrap();
+        assert!(permission.get("constructor").is_none());
+        // `bash: allow` (indent 4) lands directly on `permission`, not under a `constructor` map.
+        assert_eq!(permission.get("bash").and_then(|v| v.as_str()), Some("allow"));
+        assert_eq!(permission.get("skills").and_then(|v| v.as_str()), Some("ask"));
     }
 
     #[test]

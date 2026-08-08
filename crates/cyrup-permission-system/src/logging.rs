@@ -3,8 +3,9 @@
 //! `ensurePermissionSystemLogsDirectory` half of `extension-config.ts:38-56,163-171`).
 //!
 //! pi's `createPermissionSystemLogger` exposes exactly three operations — `debug(event, details)`,
-//! `review(event, details)`, `flush()` — where BOTH streams are gated on `getConfig().debug`
-//! (`logging.ts:88-104`) and every entry is one JSON object per line, shaped
+//! `review(event, details)`, `flush()` — where ONLY the `debug` stream is gated on
+//! `getConfig().debug` (v0.8.0 `logging.ts:90-100`: `debug` early-returns at `:91-93`, `review` is
+//! a bare `writeLine` at `:99`) and every entry is one JSON object per line, shaped
 //! `{timestamp, extension, stream, event, ...details}` (`logging.ts:71-77`), appended to
 //! `<logsDir>/<EXTENSION_ID>-debug.jsonl`. `logsDir` is `<extensionRoot>/logs` unless the
 //! `PI_PERMISSION_SYSTEM_LOGS_DIR` env var overrides it — here
@@ -13,8 +14,8 @@
 //!
 //! This is what an operator reaches for FIRST when a gate misbehaves: "why was this tool blocked",
 //! "who approved this", "did the forwarded prompt time out". The `review` stream is the
-//! security-relevant one (every decision the gate reaches); `debug` carries lifecycle/diagnostic
-//! events.
+//! security-relevant one (every decision the gate reaches) and is therefore ALWAYS ON; `debug`
+//! carries lifecycle/diagnostic events and stays opt-in behind `config.debug`.
 //!
 //! `[CYRUP-DELTA]` — three documented deviations, all forced by the sync/async split:
 //!
@@ -144,13 +145,27 @@ impl PermissionSystemLogger {
         self.write_line("debug", event, details)
     }
 
-    /// pi `logger.review` (`logging.ts:96-102`): the SECURITY-relevant stream — every decision the
-    /// gate reaches. Gated on the same `config.debug` flag pi gates it on (`logging.ts:97`); there
-    /// is deliberately no separate switch.
+    /// pi `logger.review` (v0.8.0 `logging.ts:98-100`): the SECURITY-relevant stream — every
+    /// decision the gate reaches — written UNCONDITIONALLY.
+    ///
+    /// At v0.7.1 this stream carried the same `if (!options.getConfig().debug) return undefined;`
+    /// early return `debug` still carries (v0.7.1 `logging.ts:97-100`); v0.8.0 deletes those four
+    /// lines, leaving `review` a bare `return writeLine("review", event, details);`. An audit trail
+    /// that is off unless an operator first opted into diagnostics is not an audit trail: the
+    /// entries that matter most (`permission_request.blocked`, `*.approval_persisted`) are exactly
+    /// the ones nobody thinks to enable before the incident.
+    ///
+    /// SCOPE, stated precisely so this doc does not overstate what un-gating delivers: upstream
+    /// v0.8.0 `index.ts` has 18 `writeReviewEntry` call sites; cyrup currently has 6, all in
+    /// `extension.rs`. The whole FORWARDING half of the trail is unported — `forwarding.rs` holds
+    /// no logger reference at all — so the `forwarded_permission.*` entries an operator wants when
+    /// a child's ask times out or auto-approves are still absent, gate or no gate. Un-gating makes
+    /// the 6 sites we do have reachable; it does not by itself produce v0.8.0's audit trail.
+    /// Tracked as G131b in `PARITY-GAPS.md`.
+    ///
+    /// `debug` — the diagnostic/lifecycle stream — is deliberately still gated; the `debug` flag
+    /// keeps its upstream meaning and this is not a rename of it.
     pub fn review(&self, event: &str, details: &Value) -> Option<String> {
-        if !self.enabled() {
-            return None;
-        }
         self.write_line("review", event, details)
     }
 
@@ -158,7 +173,8 @@ impl PermissionSystemLogger {
     /// the fd when `debug`/`review` returns. Kept so the pi call sites stay 1:1 recognizable.
     pub fn flush(&self) {}
 
-    /// `options.getConfig().debug` (`logging.ts:89,97`).
+    /// `options.getConfig().debug` (v0.8.0 `logging.ts:91`) — read by the `debug` stream ONLY;
+    /// `review` is unconditional since v0.8.0.
     fn enabled(&self) -> bool {
         self.config.lock().map_or_else(|e| e.into_inner().debug, |c| c.debug)
     }
@@ -255,6 +271,17 @@ mod tests {
     use super::*;
     use crate::ext_config::ExtensionConfig;
 
+    /// [`resolve_logs_dir`] re-reads [`LOGS_DIR_ENV_KEY`] on EVERY write, and this crate runs its
+    /// unit tests in one process, so `logs_dir_env_var_overrides_the_default`'s process-global
+    /// `set_var` is visible to any sibling test that happens to write inside that window — it
+    /// silently redirects the sibling's trail into the override directory. Every test that touches
+    /// the trail therefore takes the SAME lock `ext_config` uses for its env-dependent tests
+    /// (`ext_config.rs:234-243`). Without this the module is flaky at HEAD independently of any
+    /// behaviour change, which makes a revert proof unreadable.
+    fn trail_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn logger_with(debug: bool, dir: &Path) -> PermissionSystemLogger {
         let config = ExtensionConfig { debug, ..ExtensionConfig::default() };
         PermissionSystemLogger::new(Arc::new(StdMutex::new(config)), dir.join(LOGS_DIR_NAME))
@@ -272,6 +299,7 @@ mod tests {
     // not exist, so nothing was ever written.
     #[test]
     fn review_entry_appends_a_shaped_jsonl_line() {
+        let _env = trail_lock();
         let dir = tempfile::tempdir().unwrap();
         let logger = logger_with(true, dir.path());
 
@@ -289,23 +317,46 @@ mod tests {
         assert!(ts.ends_with('Z') && ts.len() == 24, "pi `toISOString()` shape, got {ts}");
     }
 
-    // pi `logging.ts:89,97`: BOTH streams are gated on `config.debug`. A disabled logger must not
-    // even create the log directory.
+    // v0.8.0 `logging.ts:98-100`: `review` is a bare `writeLine` — the four-line
+    // `if (!options.getConfig().debug) return undefined;` guard v0.7.1 carried at `:97-100` is
+    // gone. With `"debug": false` (what `default_config_content()` materializes) the trail must
+    // still be written.
     #[test]
-    fn debug_disabled_writes_nothing_and_creates_no_directory() {
+    fn review_is_written_with_debug_disabled() {
+        let _env = trail_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let logger = logger_with(false, dir.path());
+
+        assert_eq!(logger.review("permission_request.blocked", &serde_json::json!({"n": 1})), None);
+
+        let lines = read_lines(dir.path());
+        assert_eq!(lines.len(), 1, "the security-review stream is not gated on `debug`");
+        assert_eq!(lines[0]["stream"], Value::String("review".to_string()));
+        assert_eq!(lines[0]["event"], Value::String("permission_request.blocked".to_string()));
+    }
+
+    // MIRROR for the above: v0.8.0 `logging.ts:90-93` keeps the guard on the DIAGNOSTIC stream, so
+    // un-gating `review` must not un-gate `debug`. `debug` alone under `"debug": false` must touch
+    // no filesystem at all — not even the `mkdir`.
+    #[test]
+    fn debug_stream_stays_gated_and_creates_no_directory() {
+        let _env = trail_lock();
         let dir = tempfile::tempdir().unwrap();
         let logger = logger_with(false, dir.path());
 
         assert_eq!(logger.debug("config.loaded", &serde_json::json!({})), None);
-        assert_eq!(logger.review("permission_request.blocked", &serde_json::json!({})), None);
 
-        assert!(!dir.path().join(LOGS_DIR_NAME).exists(), "a disabled logger must touch no filesystem");
+        assert!(
+            !dir.path().join(LOGS_DIR_NAME).exists(),
+            "a `debug`-disabled diagnostic stream must touch no filesystem"
+        );
     }
 
     // pi `logging.ts:50-62`: successive entries APPEND rather than truncate, and both streams share
     // the one file.
     #[test]
     fn entries_append_and_share_one_file_across_streams() {
+        let _env = trail_lock();
         let dir = tempfile::tempdir().unwrap();
         let logger = logger_with(true, dir.path());
 
@@ -363,6 +414,7 @@ mod tests {
     // instead of writing (and never panics).
     #[test]
     fn unusable_logs_directory_returns_a_warning() {
+        let _env = trail_lock();
         let dir = tempfile::tempdir().unwrap();
         // A regular FILE where the logs directory should be: `mkdir -p` cannot succeed.
         std::fs::write(dir.path().join(LOGS_DIR_NAME), "not a directory").unwrap();

@@ -81,7 +81,6 @@ async fn forwarded_allow_always_persists_a_child_session_rule() {
     let invocations = Arc::new(AtomicUsize::new(0));
     let ext = PermissionSystemExtension::from_parts(
         paths,
-        agent_dir.path().join("cyrup-permission-system-approvals.json"),
         ExtensionConfig::default(),
         Arc::new(AlwaysChannel { invocations: invocations.clone() }),
     );

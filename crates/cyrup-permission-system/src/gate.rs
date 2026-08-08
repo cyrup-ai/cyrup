@@ -1,4 +1,4 @@
-//! Gate helpers (port of pi `index.ts` gate internals): the config+session+permanent approval
+//! Gate helpers (port of pi `index.ts` gate internals): the config+session approval
 //! overlay (`applyPatternApprovalState`), the approval subject (`getPatternApprovalSubject`), the
 //! config evaluation rule (`createConfigEvaluationRule`), and the model-facing reason formatters
 //! (`formatDenyReason` / `formatUserDeniedReason` / the ask-unavailable reason). The orchestration
@@ -154,23 +154,27 @@ pub fn create_config_evaluation_rule(result: &PermissionCheckResult) -> PatternR
     PatternRule { tool: result.tool_name.clone(), pattern, action: result.state }
 }
 
-/// pi `applyPatternApprovalState` (`index.ts:850-874`): fold the config result with the session +
-/// permanent stores (ruleset order `[config, session, permanent]`, last-match-wins → permanent beats
-/// session beats config). A `deny` short-circuits (never relaxed).
+/// pi `applyPatternApprovalState` (v0.8.0 `index.ts:557-579`): fold the config result with the
+/// SESSION store (ruleset order `[config, session]`, last-match-wins → session beats config). A
+/// `deny` short-circuits (never relaxed).
+///
+/// v0.7.1 took a fourth ruleset — `permanentApprovals.getRules()` (v0.7.1 `index.ts:852-874`) — and
+/// ranked it LAST, so an on-disk `cyrup-permission-system-approvals.json` could override both the
+/// session store and the operator's config rule, in either direction (it was tri-state). Upstream
+/// deleted `PermanentApprovalStore` in v0.8.0 (commit `a33ac2c`; CHANGELOG `### Removed`), so that
+/// tier is gone here too — see [`crate::stores`] for the full removal note.
 #[must_use]
 pub fn apply_pattern_approval_state(
     result: PermissionCheckResult,
     input: &Value,
     session_rules: &[PatternRule],
-    permanent_rules: &[PatternRule],
 ) -> PermissionCheckResult {
     if result.state == PermissionState::Deny {
         return result;
     }
     let subject = get_pattern_approval_subject(&result, input);
     let config_rule = [create_config_evaluation_rule(&result)];
-    let evaluated =
-        evaluate::evaluate(&result.tool_name, &subject, &[&config_rule, session_rules, permanent_rules]);
+    let evaluated = evaluate::evaluate(&result.tool_name, &subject, &[&config_rule, session_rules]);
     PermissionCheckResult {
         state: evaluated.action,
         matched_pattern: evaluated.matched_pattern.or(result.matched_pattern),
@@ -752,7 +756,7 @@ mod tests {
             source: CheckSource::Bash,
         };
         let session = [PatternRule { tool: "bash".into(), pattern: "git *".into(), action: PermissionState::Allow }];
-        let out = apply_pattern_approval_state(ask, &serde_json::json!({}), &session, &[]);
+        let out = apply_pattern_approval_state(ask, &serde_json::json!({}), &session);
         assert_eq!(out.state, PermissionState::Allow);
     }
 
@@ -792,7 +796,6 @@ mod tests {
             bash_deny(),
             &serde_json::json!({}),
             &[PatternRule { tool: "bash".into(), pattern: "*".into(), action: PermissionState::Allow }],
-            &[],
         );
         assert_eq!(out.state, PermissionState::Deny);
     }

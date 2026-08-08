@@ -247,6 +247,29 @@ Twelve batches, each independently landable and testable, ordered so nothing dep
 
 **Batch 1 — Permission gate: security, audit, policy surface.** G134 (containment check between the target-session filter at `forwarding.rs:570` and `resolve_forwarded_decision` at `:572`, reusing `common::is_path_within_directory`), G131 (drop the `debug` gate at `logging.rs:148-155`; six live call sites become non-no-ops), G132 (500-char cap in `wildcard.rs:42`), G135 (three-name skip in `common.rs:166`), G129 (delete `PermanentApprovalStore` and its three read sites), G130 (`enabled` switch — see the open question on `is_pristine_default_file` first), G133 (config save: preserve non-extension keys, refuse corrupt, follow symlinks — no save fn exists at all today). No dependencies.
 
+### 2.3a Items discovered while working Batch 1 (not in the original 147)
+
+Each was found by the batch's own review, not by the survey — the survey listed primitives without
+checking that their CONSUMERS were ported. Counted separately so the 147 stays comparable.
+
+| item | status | sev | effort | cyrup location | upstream ref |
+|---|---|---|---|---|---|
+| G131b Forwarding half of the review audit trail — cyrup has 6 of upstream's 18 `writeReviewEntry` sites; `forwarding.rs` holds no logger at all | absent | high | medium | `src/forwarding.rs` (no logger reference) | v0.8.0 `index.ts` (18 sites) |
+| G133b Extension-provided-API registry in `cyrup-ext`, so one extension can call another's methods | absent | medium | large | none; `NativeExtension` has no "publish an API object" hook | `yolo-mode-api.ts:23-43` (`globalThis.__piPermissionSystem`) |
+| G133c `HostServices` custom-overlay seam, so `/permission-system` can render the real settings modal instead of text | absent | low | medium | `HostServices` has `select`/`input`/`notify`/`set_status`, no custom render | `config-modal.ts:63-123` (`ctx.ui.custom`) |
+| G133d Version-qualify the 334 `index.ts` citations in `cyrup-permission-system` — 26 provably point past EOF at v0.8.0 | absent | medium | medium | 16 files; run `.workflows/check-citations.py` | n/a (provenance hygiene) |
+
+**On G133b/G133c**: `set_yolo_mode`, `toggle_yolo_mode` and `yolo_mode` are ported and correct but
+UNREACHABLE, because the host seam they need does not exist. That is a named, tracked gap — not the
+same thing as G133's original defect, where a primitive was unwired with no plan. Do not "fix" it by
+re-routing the `/permission-system` command through them: upstream's modal sends every row through
+`setConfig`, and an earlier revision of this batch distorted that routing to manufacture a caller.
+
+**On G133d**: a BARE `index.ts:1447` is correct when the citing code ports v0.7.1 and wrong when it
+ports v0.8.0. A crate mid-upgrade contains both, so bare citations cannot be checked at all. The
+checker only proves the *impossible* ones (past EOF); a clean run means "no proven breakage", never
+"citations verified".
+
 > **Scheduling correction (2026-08-08).** As first written, §6 scheduled only 144 of the 147 items:
 > **G133, G98 and G113 appeared in the §2 tables but in no batch**, so following the plan literally
 > would have completed 12 batches and silently left three gaps — exactly the "no silent caps"

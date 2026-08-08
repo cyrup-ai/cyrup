@@ -1,17 +1,28 @@
-//! The two approval stores (port of pi `session-approval-store.ts` + `permanent-approval-store.ts`).
+//! The session approval store (port of pi `session-approval-store.ts`).
 //!
-//! - **Session** store: in-memory, allow-only, per session; cleared on session start AND shutdown.
-//!   `approveAlways == approveOnce` (both push an `allow` rule). This is the ONLY runtime sink for an
-//!   `ask` "Allow Always" decision (pi `index.ts:905`).
-//! - **Permanent** store: an on-disk flat JSON array `[{tool,pattern,action}]`, tri-state,
-//!   read-through only at runtime. §8.2: the extension **never writes it** — the `approve_always`
-//!   atomic writer is retained for source fidelity but is NOT wired into the "always" path (which
-//!   goes to the session store). Malformed/absent → `[]` gracefully.
+//! In-memory, allow-only, per session; cleared on session start AND shutdown.
+//! `approveAlways == approveOnce` (both push an `allow` rule). This is the ONLY approval sink the
+//! runtime has (pi v0.8.0 `index.ts:595-612`, `persistSessionApprovalDecision`), and nothing it
+//! records survives the process.
+//!
+//! # `PermanentApprovalStore` is gone (v0.7.1 → v0.8.0)
+//!
+//! Upstream deleted `src/permanent-approval-store.ts` outright in commit `a33ac2c`
+//! (`feat(permissions)!: remove permanent approval store`, released as v0.8.0). There is no
+//! replacement file and no replacement mechanism: v0.8.0's CHANGELOG `### Removed` states that
+//! "`Allow Always` now records session-only (in-memory) approvals via `SessionApprovalStore`...
+//! Cross-session persistent approvals are no longer written to disk." The only cross-session state
+//! left is operator-authored policy (`cyrup-permissions.jsonc` + the extension `config.json`).
+//!
+//! The store was already write-dead here (and upstream at v0.7.1 — `PermanentApprovalStore.
+//! approveAlways` had zero call sites in `index.ts`), so the OBSERVABLE consequence of the deletion
+//! is narrow and exact: a hand-authored or legacy `cyrup-permission-system-approvals.json` on disk
+//! no longer influences any decision. It used to rank LAST in the last-match-wins ruleset
+//! (`[config, session, permanent]`, v0.7.1 `index.ts:850-874`), so it could override both the
+//! session store and the operator's config rule — including with a `deny`, since unlike the
+//! allow-only session store it was tri-state. That whole override tier is removed;
+//! `evaluate` now sees `[config, session]` only (v0.8.0 `index.ts:557-579`).
 
-use std::path::PathBuf;
-
-use crate::error::PermissionError;
-use crate::evaluate::Evaluation;
 use crate::types::{PatternRule, PermissionState};
 
 /// The result of [`SessionApprovalStore::evaluate`] — pi's `{state, matchedPattern}`
@@ -82,127 +93,6 @@ impl SessionApprovalStore {
     }
 }
 
-/// pi `PermanentApprovalStore` — on-disk JSON array, tri-state, READ-THROUGH only.
-#[derive(Debug)]
-pub struct PermanentApprovalStore {
-    persistence_path: PathBuf,
-    rules: Option<Vec<PatternRule>>,
-}
-
-impl PermanentApprovalStore {
-    #[must_use]
-    pub fn new(persistence_path: PathBuf) -> Self {
-        Self { persistence_path, rules: None }
-    }
-
-    fn ensure_loaded(&mut self) {
-        if self.rules.is_none() {
-            self.rules = Some(Self::load_rules(&self.persistence_path));
-        }
-    }
-
-    /// pi `loadRules` (`permanent-approval-store.ts:68-85`): absent → `[]`; malformed JSON → `[]`;
-    /// else keep only well-formed `{tool,pattern,action}` rules, trimmed.
-    fn load_rules(path: &PathBuf) -> Vec<PatternRule> {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Vec::new();
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return Vec::new();
-        };
-        let Some(array) = value.as_array() else {
-            return Vec::new();
-        };
-        array.iter().filter_map(Self::parse_persisted_rule).collect()
-    }
-
-    /// pi `isPersistedRule` + normalize (`permanent-approval-store.ts:6-21,76-80`).
-    fn parse_persisted_rule(value: &serde_json::Value) -> Option<PatternRule> {
-        let obj = value.as_object()?;
-        let tool = obj.get("tool")?.as_str()?.trim();
-        let pattern = obj.get("pattern")?.as_str()?.trim();
-        if tool.is_empty() || pattern.is_empty() {
-            return None;
-        }
-        let action = PermissionState::parse(obj.get("action")?.as_str()?)?;
-        Some(PatternRule { tool: tool.to_string(), pattern: pattern.to_string(), action })
-    }
-
-    /// A clone of the loaded rules (pi `getRules`). Lazy-loads on first call.
-    #[must_use]
-    pub fn get_rules(&mut self) -> Vec<PatternRule> {
-        self.ensure_loaded();
-        self.rules.clone().unwrap_or_default()
-    }
-
-    /// pi `evaluate` (`permanent-approval-store.ts:54-61`): lazily loads, then evaluates
-    /// `tool`/`command` against ONLY this store's own rules (tri-state — unlike the session store's
-    /// `evaluate`, `matchedPattern` is kept regardless of the resolved state).
-    #[must_use]
-    pub fn evaluate(&mut self, tool: &str, command: &str) -> Evaluation {
-        self.ensure_loaded();
-        let rules = self.rules.as_deref().unwrap_or(&[]);
-        crate::evaluate::evaluate(tool, command, &[rules])
-    }
-
-    /// pi `approveAlways` + `saveRules` (`permanent-approval-store.ts:37-52,87-92`): atomic
-    /// `temp+rename` write of the full rules array. **RETAINED FOR SOURCE FIDELITY ONLY — NOT WIRED
-    /// into the runtime "always" path** (§8.2: pi's sole runtime persistence sink is the SESSION
-    /// store, `index.ts:905`). Kept so a future explicit "persist permanently" surface can reuse the
-    /// exact on-disk format without re-deriving it.
-    pub fn approve_always(
-        &mut self,
-        tool: &str,
-        pattern: &str,
-        action: PermissionState,
-    ) -> Result<(), PermissionError> {
-        let t = tool.trim();
-        let p = pattern.trim();
-        if t.is_empty() || p.is_empty() {
-            return Ok(());
-        }
-        self.ensure_loaded();
-        if let Some(rules) = self.rules.as_mut() {
-            rules.push(PatternRule {
-                tool: t.to_string(),
-                pattern: p.to_string(),
-                action,
-            });
-        }
-        self.save_rules()
-    }
-
-    fn save_rules(&self) -> Result<(), PermissionError> {
-        let rules = self.rules.clone().unwrap_or_default();
-        if let Some(parent) = self.persistence_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let serializable: Vec<serde_json::Value> = rules
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "tool": r.tool,
-                    "pattern": r.pattern,
-                    "action": match r.action {
-                        PermissionState::Allow => "allow",
-                        PermissionState::Deny => "deny",
-                        PermissionState::Ask => "ask",
-                    },
-                })
-            })
-            .collect();
-        let body = format!(
-            "{}\n",
-            serde_json::to_string_pretty(&serializable).map_err(|e| PermissionError::Io(e.to_string()))?
-        );
-        let pid = std::process::id();
-        let temp = self.persistence_path.with_extension(format!("{pid}.tmp"));
-        std::fs::write(&temp, body)?;
-        std::fs::rename(&temp, &self.persistence_path)?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -218,18 +108,6 @@ mod tests {
         assert_eq!(rules[0].action, PermissionState::Allow);
         s.clear();
         assert!(s.get_rules().is_empty());
-    }
-
-    #[test]
-    fn permanent_store_absent_and_malformed_yield_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut absent = PermanentApprovalStore::new(dir.path().join("nope.json"));
-        assert!(absent.get_rules().is_empty());
-
-        let bad = dir.path().join("bad.json");
-        std::fs::write(&bad, "not json").unwrap();
-        let mut malformed = PermanentApprovalStore::new(bad);
-        assert!(malformed.get_rules().is_empty());
     }
 
     #[test]
@@ -253,54 +131,5 @@ mod tests {
         assert_eq!(no_match.state, PermissionState::Ask);
         assert_eq!(no_match.matched_pattern, None);
         assert!(!s.has_session_approval("bash", "rm -rf /"));
-    }
-
-    #[test]
-    fn permanent_store_evaluate_scoped_to_own_rules() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("approvals.json");
-        std::fs::write(
-            &path,
-            r#"[
-                {"tool":"bash","pattern":"git *","action":"allow"},
-                {"tool":"bash","pattern":"rm *","action":"deny"}
-            ]"#,
-        )
-        .unwrap();
-        let mut store = PermanentApprovalStore::new(path);
-
-        let allow = store.evaluate("bash", "git push");
-        assert_eq!(allow.action, PermissionState::Allow);
-        assert_eq!(allow.matched_pattern.as_deref(), Some("git *"));
-
-        let deny = store.evaluate("bash", "rm -rf /");
-        assert_eq!(deny.action, PermissionState::Deny);
-        assert_eq!(deny.matched_pattern.as_deref(), Some("rm *"));
-
-        // No match at all -> Ask, no matched pattern.
-        let ask = store.evaluate("bash", "ls");
-        assert_eq!(ask.action, PermissionState::Ask);
-        assert_eq!(ask.matched_pattern, None);
-    }
-
-    #[test]
-    fn permanent_store_reads_tristate_array() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("approvals.json");
-        std::fs::write(
-            &path,
-            r#"[
-                {"tool":"bash","pattern":"git *","action":"allow"},
-                {"tool":"bash","pattern":"rm *","action":"deny"},
-                {"tool":"","pattern":"x","action":"allow"},
-                {"tool":"edit","pattern":"*","action":"bogus"}
-            ]"#,
-        )
-        .unwrap();
-        let mut store = PermanentApprovalStore::new(path);
-        let rules = store.get_rules();
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].action, PermissionState::Allow);
-        assert_eq!(rules[1].action, PermissionState::Deny);
     }
 }
