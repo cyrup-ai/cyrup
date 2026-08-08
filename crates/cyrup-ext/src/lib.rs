@@ -72,7 +72,8 @@ pub use provider::{
     ProviderModelConfig, ProviderRegistration,
 };
 pub use registry::{
-    CommandDescriptor, ExecModeWire, ExtensionRegistry, ResolvedCommand, ToolDescriptor,
+    CommandDescriptor, ExecModeWire, ExtensionConflict, ExtensionRegistry, ResolvedCommand,
+    ToolDescriptor,
 };
 pub use subscriber::ExtSubscriber;
 pub use wrapper::{wrap_registered_tool, ActiveToolNames, RegisteredTool};

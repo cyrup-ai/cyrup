@@ -951,7 +951,42 @@ impl<B: Backend> App<B> {
     /// here we reset the per-session UI state (the transcript, the streaming/indicator status, any
     /// open selector/overlay) for the new session and surface the swap status line. Committed
     /// scrollback already lives in the terminal's native history (`insert_before`) and is preserved.
+    /// Tear down every EXTENSION-owned UI surface before the old session is invalidated — pi
+    /// `resetExtensionUI` (`interactive-mode.ts:1974-2003`), registered on the runtime via
+    /// `setBeforeSessionInvalidate` (`:452`).
+    ///
+    /// The ordering is the point, and it is why this cannot be folded into
+    /// [`Self::rebind_session`]. pi's runtime fires `abort → session_shutdown →
+    /// beforeSessionInvalidate → dispose` (`agent-session-runtime.ts:167-177`), so this runs while
+    /// the OLD session is still alive and its extension host still answerable. `rebind_session`
+    /// runs AFTER the swap and resets session-owned surfaces (transcript, selector, overlays,
+    /// status flags); an extension header, footer, widget, status row or shortcut binding left
+    /// behind by the outgoing session's extensions would otherwise survive into the new one and
+    /// keep rendering, owned by a host that no longer exists.
+    pub fn reset_extension_ui(&mut self) {
+        self.state.extension_header = None;
+        self.state.extension_footer = None;
+        self.state.extension_widget = None;
+        self.state.extension_shortcuts.clear();
+        self.state.status.extension_statuses.clear();
+        // An extension dialog/editor overlay belongs to the outgoing host; leaving it up would
+        // present a prompt whose reply channel is about to be dropped.
+        self.state.overlays.clear();
+        self.state.selector = None;
+    }
+
     pub fn rebind_session(&mut self) {
+        // Extension-owned surfaces first (pi `resetExtensionUI`, `interactive-mode.ts:1974-2003`).
+        //
+        // pi registers this on the runtime's `beforeSessionInvalidate` so it runs while the OLD
+        // session is still alive. cyrup calls it here instead, and the difference is safe for a
+        // specific reason: pi's hook is positioned early because a JS closure over `this` can also
+        // reach into `oldSession.extensionRunner` (its own ordering test asserts exactly that),
+        // whereas this function touches NOTHING but local UI state. There is no old-host resource
+        // to race. The Rust hook cannot capture `&mut App` in an `Arc<dyn Fn()>` anyway — see
+        // `AgentSessionRuntime::set_before_session_invalidate`, which exists as a library surface
+        // for embedders that need the earlier position.
+        self.reset_extension_ui();
         self.state.transcript = TranscriptView::new();
         self.state.selector = None;
         self.state.overlays.clear();

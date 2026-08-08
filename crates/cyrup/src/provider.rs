@@ -205,6 +205,30 @@ fn composed_registry(
     )
 }
 
+/// The composed registry over an EXPLICIT credential store — the shape a caller that must resolve
+/// request auth for a model needs (Pi `ModelRuntime.create({ allowModelNetwork: false })` followed
+/// by `modelRuntime.getAuth(model, …)`, model-runtime.ts:376-384).
+///
+/// [`composed_registry`] can only seed a single runtime `--api-key`; the credential-print surface
+/// (`cyrup auth print-api-key`) must instead present every credential persisted in `auth.json` so
+/// [`cyrup_provider::Models::get_auth_with`] resolves the same way a real request would. Composition
+/// errors are dropped here for the same reason Pi's credential-print path drops them: they are a
+/// once-at-startup concern ([`models_json_composition_errors`]), not part of the printed value.
+pub fn registry_with_credentials(
+    models_json: &ModelFile,
+    credentials: Arc<dyn cyrup_provider::CredentialStore>,
+) -> Models {
+    let (models, _errors) = cyrup_config::compose_provider_registry(
+        models_json,
+        CreateModelsOptions {
+            credentials: Some(credentials),
+            auth_context: None,
+            catalog_overlay: active_catalog_overlay(),
+        },
+    );
+    models
+}
+
 /// Every model across ALL built-in providers — the faithful data source for `--list-models` (Pi
 /// `modelRegistry.getAvailable()`, list-models.ts:35). Independent of `--provider`/`--model`: Pi's
 /// `listModels` always enumerates the full multi-provider registry (`providers/all.ts`), never just

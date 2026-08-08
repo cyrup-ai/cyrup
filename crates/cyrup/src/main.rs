@@ -97,6 +97,15 @@ async fn run() -> anyhow::Result<i32> {
         }
     }
 
+    // `cyrup auth print-api-key|print-bearer-token` pre-dispatch (Pi
+    // `if (await runCredentialPrintCommand(args)) return;`, main.ts:557-559 — immediately after the
+    // config/package block and BEFORE `parseArgs`). Without it `auth` is not a known verb, so the
+    // tokens survive arg leniency as bare positionals and become a chat PROMPT: no credential, no
+    // error, an agent session started and tokens burned on an auth subcommand.
+    if let Some(code) = cyrup::credential_print::dispatch(&argv).await {
+        return Ok(code);
+    }
+
     // Pi-faithful arg leniency (args.ts:80-82,131-139,202-203) BEFORE clap: a bad `--mode` is
     // silently dropped, a bad `--thinking` warns + drops, and an unknown single-dash option becomes a
     // Pi `Unknown option` error (exit 1) rather than a clap usage error (exit 2).

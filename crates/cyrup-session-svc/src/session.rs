@@ -2335,6 +2335,35 @@ impl AgentSession {
     /// let `session_shutdown` be announced — and `session_cancel` fired — while the aborted turn
     /// was still writing its tool results.
     pub async fn dispose(&self, reason: &str) {
+        self.dispose_with(reason, None).await;
+    }
+
+    /// [`Self::dispose`] with the host's `before_session_invalidate` hook (Pi
+    /// `beforeSessionInvalidate`, agent-session-runtime.ts:76/:129-131).
+    ///
+    /// Pi's `teardownCurrent` is `await this.session.abort(); await emitSessionShutdownEvent(…);
+    /// this.beforeSessionInvalidate?.(); this.session.dispose();` (agent-session-runtime.ts:167-177)
+    /// and its `dispose()` repeats the last three lines (:398-404). So the hook's contract is
+    /// positional: it runs **after** every `session_shutdown` handler has finished and **before**
+    /// anything invalidates the session. Because cyrup collapses pi's `teardownCurrent` +
+    /// `AgentSession.dispose` into this one method, the call site is here — after
+    /// `dispatch_notify(SessionShutdown)` and before `session_cancel.cancel()`, which is cyrup's
+    /// analog of pi's `_extensionRunner.invalidate("This extension ctx is stale after session
+    /// replacement or reload…")` (agent-session.ts:848, inside `dispose()` at :837-853).
+    ///
+    /// The hook is deliberately **synchronous** (`Fn()`, pi's `() => void`): it exists so a host can
+    /// detach extension-provided UI without yielding to the executor, i.e. without a window in which
+    /// a component still rendered from the outgoing session's now-stale extension context can be
+    /// driven. Awaiting inside it would reopen exactly that window, so there is nothing to await.
+    ///
+    /// [`Self::dispose`] passes `None`; the only producer of a `Some` is
+    /// [`crate::runtime::AgentSessionRuntime`], which reads whatever the host registered via
+    /// `set_before_session_invalidate`.
+    pub async fn dispose_with(
+        &self,
+        reason: &str,
+        before_invalidate: Option<crate::runtime::BeforeSessionInvalidate>,
+    ) {
         self.abort_and_settle().await;
         self.fanout_emit(AgentSessionEvent::SessionShutdown { reason: reason.to_string() }).await;
         // Notify extensions, then release the long-lived token.
@@ -2344,6 +2373,11 @@ impl AgentSession {
             .dispatcher()
             .dispatch_notify(&HostEvent::SessionShutdown { reason: reason.to_string() }, &cancel)
             .await;
+        // Pi `this.beforeSessionInvalidate?.()` (agent-session-runtime.ts:176 and :403): the last
+        // point at which this session — and the extension context bound to it — is still live.
+        if let Some(hook) = before_invalidate {
+            hook();
+        }
         self.session_cancel.cancel();
     }
 

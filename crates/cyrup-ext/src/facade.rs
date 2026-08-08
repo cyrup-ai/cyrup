@@ -992,6 +992,19 @@ impl ExtensionHost {
         Ok(ext)
     }
 
+    /// Every tool/flag name collision between two DIFFERENT loaded extensions, in load order (Pi
+    /// `ResourceLoader.detectExtensionConflicts`, resource-loader.ts:1059-1094). The FIRST extension
+    /// to claim a name keeps it; each rejected claim is one record here.
+    ///
+    /// [`Self::discover_and_load`] folds these into its returned
+    /// [`LoadExtensionsResult::errors`](crate::LoadExtensionsResult) — Pi's
+    /// `addExtensionConflictDiagnostics` does exactly that (`resource-loader.ts:625-632`) — so a
+    /// collision reaches the session's startup diagnostics without any caller opting in. Call this
+    /// directly when conflicts are needed outside that path (e.g. a native-only host).
+    pub fn extension_conflicts(&self) -> Vec<crate::ExtensionConflict> {
+        self.registry.conflicts().unwrap_or_default()
+    }
+
     /// Discover extensions across the three roots (Pi `discoverAndLoadExtensions`). Pure filesystem
     /// scan; no wasm runtime required. See [`crate::loader::discover`].
     pub fn discover(&self, roots: &DiscoveryRoots) -> Vec<DiscoveredExtension> {
@@ -1023,6 +1036,19 @@ impl ExtensionHost {
                 }),
             }
         }
+        // Pi `addExtensionConflictDiagnostics` (resource-loader.ts:625-632): AFTER every extension
+        // has loaded, the tool/flag name collisions are appended to the SAME `errors` array the load
+        // faults use — "Keep all extensions loaded. Conflicts are reported as diagnostics, and
+        // precedence is handled by load order." `main.ts:735-738` then renders each as
+        // `Failed to load extension "<path>": <message>` and `main.ts:843-848` exits 1, so a
+        // collision is FATAL upstream — hence `fatal: true` (only the project-trust skip is not).
+        // Native built-ins are loaded before this call by the session builder, so their names are in
+        // scope here too, matching Pi's sweep over the whole loaded set (inline extensions included).
+        result.errors.extend(self.extension_conflicts().into_iter().map(|c| LoadError {
+            path: PathBuf::from(c.path.as_str()),
+            fatal: true,
+            error: c.message,
+        }));
         result
     }
 

@@ -104,7 +104,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         let Ok(guest) = guest_of(self) else { return };
         let spec: Value = serde_json::from_str(&spec_json).unwrap_or(Value::Null);
         guest.set_flag(name.clone(), spec.clone());
-        let _ = guest.registry.set_flag(name, spec);
+        // Owner-attributed so Pi's first-wins flag rule (`getFlags`, runner.ts:473-483) and its
+        // `Flag "--x" conflicts with <owner>` diagnostic apply to a guest's `registerFlag`.
+        let _ = guest.registry.register_flag(guest.owner.clone(), name, spec);
     }
 
     async fn get_flag(&mut self, name: String) -> Option<String> {

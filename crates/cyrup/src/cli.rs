@@ -864,7 +864,8 @@ Commands:
   {APP} update [source|self|pi]   Update {APP} (use --all for {APP} and extensions)
   {APP} list                      List installed extensions from settings
   {APP} config                    Open TUI to enable/disable package resources
-  {APP} <command> --help          Show help for install/remove/uninstall/update/list
+  {APP} auth <command>            Print credentials for external clients
+  {APP} <command> --help          Show help for install/remove/uninstall/update/list/config/auth
 
 Options:
   --provider <name>              Provider name (default: google)
@@ -912,6 +913,12 @@ Options:
 Extensions can register additional flags (e.g., --plan from plan-mode extension).{ext_block}
 
 Examples:
+  # Print a provider API key for an external client
+  {APP} auth print-api-key --provider openai --model gpt-5.5
+
+  # Print an OAuth bearer token for an external client (refreshes if expired)
+  {APP} auth print-bearer-token --provider openai-codex --model gpt-5.5
+
   # Interactive mode
   {APP}
 

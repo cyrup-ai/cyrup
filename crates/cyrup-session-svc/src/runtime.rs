@@ -20,6 +20,21 @@ use crate::error::SessionServiceError;
 use crate::factory::SessionFactory;
 use crate::session::{AgentSession, ForkPosition};
 
+/// The host-owned callback pi calls `beforeSessionInvalidate` (agent-session-runtime.ts:76).
+///
+/// Registered once with [`AgentSessionRuntime::set_before_session_invalidate`] and fired on every
+/// teardown — each replacement (`new`/`resume`/`fork`/`import`/`reload`) and the runtime's own
+/// `dispose` — at the single instant after all `session_shutdown` handlers have finished and before
+/// the outgoing session is invalidated.
+///
+/// It is `Fn()`, not a future: pi's own doc is "This is for host-owned UI teardown that must not
+/// yield to the event loop, such as detaching extension-provided TUI components before the old
+/// extension context becomes stale" (agent-session-runtime.ts:122-127). `Send + Sync` because the
+/// runtime is shared across tasks; `Fn` (not `FnOnce`) because a host registers it once and every
+/// subsequent teardown fires the same closure — unlike [`AgentSessionRuntime::reload`]'s one-shot
+/// `before_start`, which is supplied per call.
+pub type BeforeSessionInvalidate = Arc<dyn Fn() + Send + Sync>;
+
 /// The result of a replacement op (Pi `{cancelled}`, agent-session-runtime.ts:200).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SwitchResult {
@@ -218,6 +233,10 @@ pub struct AgentSessionRuntime {
     /// in [`Self::create`] and each replacement in [`Self::install_inner`] (SEAM-003). Built once,
     /// in `create`, because it needs a `Weak<Self>` that only exists after the `Arc` is minted.
     actions: OnceLock<Arc<dyn RuntimeActions>>,
+    /// The host's `beforeSessionInvalidate` hook (Pi `private beforeSessionInvalidate?`,
+    /// agent-session-runtime.ts:76). `None` until a host registers one; re-readable and replaceable
+    /// for the runtime's lifetime, which is why it is a lock rather than a `OnceLock`.
+    before_session_invalidate: RwLock<Option<BeforeSessionInvalidate>>,
 }
 
 impl AgentSessionRuntime {
@@ -286,6 +305,7 @@ impl AgentSessionRuntime {
             }),
             gen_tx,
             actions: OnceLock::new(),
+            before_session_invalidate: RwLock::new(None),
         });
         let actions: Arc<dyn RuntimeActions> = Arc::new(RuntimeHostActions(Arc::downgrade(&this)));
         let _ = this.actions.set(actions.clone());
@@ -320,6 +340,36 @@ impl AgentSessionRuntime {
     /// subscription is stale (R-11-021).
     pub fn watch_generation(&self) -> watch::Receiver<u64> {
         self.gen_tx.subscribe()
+    }
+
+    /// Register (or, with `None`, clear) the host's [`BeforeSessionInvalidate`] hook — Pi
+    /// `setBeforeSessionInvalidate` (agent-session-runtime.ts:129-131).
+    ///
+    /// The hook runs after the outgoing session's `session_shutdown` handlers finish and before that
+    /// session is invalidated, on every teardown path: [`Self::new_session_with`],
+    /// [`Self::switch_session_with`], [`Self::fork`], [`Self::import_from_jsonl`], [`Self::reload`]
+    /// and [`Self::dispose`].
+    ///
+    /// This is the ONE lifecycle point a host cannot reconstruct from [`Self::watch_generation`].
+    /// The generation watch is an *after-the-fact* notification — cyrup's stand-in for pi's
+    /// `setRebindSession`, and the TUI's `rebind_session` is driven by it — so by the time a watcher
+    /// wakes, the outgoing session is already invalidated and any component still rendering from its
+    /// extension context has already been driven against a dead context. Pi's hook is synchronous
+    /// precisely to close that window (`interactive-mode.ts:452` registers
+    /// `() => { this.resetExtensionUI(); }` and nothing else).
+    ///
+    /// Registering replaces any previous hook; pi's setter has the same last-writer-wins shape and
+    /// its own test clears it with `setBeforeSessionInvalidate(undefined)`
+    /// (test/agent-session-runtime-events.test.ts:205).
+    pub async fn set_before_session_invalidate(&self, hook: Option<BeforeSessionInvalidate>) {
+        *self.before_session_invalidate.write().await = hook;
+    }
+
+    /// Snapshot the registered hook for one teardown. Cloning the `Arc` out (rather than holding the
+    /// read guard across the call) keeps a hook that re-enters
+    /// [`Self::set_before_session_invalidate`] from deadlocking against its own lock.
+    async fn before_invalidate_hook(&self) -> Option<BeforeSessionInvalidate> {
+        self.before_session_invalidate.read().await.clone()
     }
 
     /// Whether a `session_before_*` handler vetoes the replacement (Pi `emitBeforeSwitch`/Fork).
@@ -357,7 +407,17 @@ impl AgentSessionRuntime {
         };
         {
             let current = self.session().await;
-            current.dispose(reason).await;
+            // Pi `teardownCurrent` (agent-session-runtime.ts:167-177): abort+settle, emit
+            // `session_shutdown`, run the host's `beforeSessionInvalidate`, THEN invalidate. cyrup's
+            // `dispose_with` carries the middle two and fires the hook at pi's exact position (after
+            // the extension notify, before `session_cancel`).
+            //
+            // Pi's `reload` is session-tier and keeps the same `AgentSession` object, so it does not
+            // route through `teardownCurrent`; its interactive host instead calls `resetExtensionUI()`
+            // by hand at the top of `handleReloadCommand` (interactive-mode.ts:5340). cyrup's
+            // `reload` REPLACES the session object through this same tail, so firing the hook here
+            // gives a cyrup host the identical net effect from one registration.
+            current.dispose_with(reason, self.before_invalidate_hook().await).await;
             // Invalidate prior subscriptions with a terminal `SessionReplaced` (R-11-021).
             current.notify_replaced(new_gen).await;
         }
@@ -626,8 +686,13 @@ impl AgentSessionRuntime {
 
     /// Dispose the runtime (Pi `dispose`, agent-session-runtime.ts:390): `session_shutdown{quit}` +
     /// dispose the active session. The runtime is unusable afterward.
+    ///
+    /// Pi's `dispose` repeats `teardownCurrent`'s tail verbatim — `emitSessionShutdownEvent(…quit);
+    /// this.beforeSessionInvalidate?.(); this.session.dispose();` (agent-session-runtime.ts:398-404)
+    /// — so the registered hook fires on quit exactly as it does on a replacement.
     pub async fn dispose(&self) {
-        self.session().await.dispose("quit").await;
+        let hook = self.before_invalidate_hook().await;
+        self.session().await.dispose_with("quit", hook).await;
     }
 
     /// The factory's base cwd.
