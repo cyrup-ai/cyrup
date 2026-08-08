@@ -62,7 +62,8 @@ use crate::providers::fleet::fleet_providers_with;
 use crate::providers::{
     anthropic_provider_with, azure_openai_responses_provider_with,
     cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_provider_with,
-    fireworks_provider_with, github_copilot_provider_with, google_provider_with, mistral_provider_with, openai_provider_with,
+    fireworks_provider_with, github_copilot_provider_with, google_provider_with,
+    google_vertex_provider_with, openai_codex_provider_with, mistral_provider_with, openai_provider_with,
     opencode_go_provider_with, opencode_provider_with, openrouter_images_provider,
     together_provider_with,
 };
@@ -167,6 +168,16 @@ fn builtin_providers_with(
         registry.clone(),
     )));
     providers.push(Arc::new(cloudflare_workers_ai_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
+
+    // openai-codex and google-vertex (pi `all.ts`). Ported in the unported-work sweep.
+    providers.push(Arc::new(openai_codex_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
+    providers.push(Arc::new(google_vertex_provider_with(
         store.clone(),
         registry.clone(),
     )));
@@ -304,6 +315,8 @@ mod tests {
             "vercel-ai-gateway",
             // ported in the unported-work sweep
             "github-copilot",
+            "openai-codex",
+            "google-vertex",
         ] {
             assert!(
                 ids.iter().any(|id| id == expected),
@@ -315,13 +328,14 @@ mod tests {
         // ports everything, and an id leaves this array by being implemented. It exists so a
         // half-finished provider cannot be registered and silently answer requests it cannot serve
         // — the assertion is "absent until real", never "must stay absent".
-        for unported in ["amazon-bedrock", "google-vertex", "openai-codex"] {
-            assert!(
-                !ids.iter().any(|id| id == unported),
-                "'{unported}' is not ported yet, so it must not be registered — if you just \
-                 ported it, move it into the implemented list above"
-            );
-        }
+        // One id left. Written as a direct assertion rather than a one-element loop
+        // (clippy::single_element_loop); it becomes a loop again the moment a second id joins it,
+        // and it disappears entirely when `amazon-bedrock` is ported.
+        assert!(
+            !ids.iter().any(|id| id == "amazon-bedrock"),
+            "'amazon-bedrock' is not ported yet, so it must not be registered — if you just \
+             ported it, delete this assertion and add it to the implemented list above"
+        );
 
         // The count matches what `all_providers()` returns and has no duplicate ids.
         assert_eq!(ids.len(), all_providers().len());

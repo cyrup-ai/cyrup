@@ -3435,6 +3435,16 @@ mod tests {
         assert_eq!(
             on,
             [
+                // openai-codex, ported in the unported-work sweep. Its catalog carries the same
+                // `supportsToolSearch` rows as `openai`, on the same `openai-responses` wire API —
+                // the assertion is that tool-search stays confined to that API, not to one
+                // provider, so a second responses-based provider legitimately widens this list.
+                "openai-codex/gpt-5.4",
+                "openai-codex/gpt-5.4-mini",
+                "openai-codex/gpt-5.5",
+                "openai-codex/gpt-5.6-luna",
+                "openai-codex/gpt-5.6-sol",
+                "openai-codex/gpt-5.6-terra",
                 "openai/gpt-5.4",
                 "openai/gpt-5.4-mini",
                 "openai/gpt-5.4-pro",

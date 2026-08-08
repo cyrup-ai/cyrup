@@ -29,13 +29,17 @@
 pub mod anthropic;
 pub mod callback;
 pub mod device_code;
+pub mod github_copilot;
 pub mod interaction;
+pub mod kimi_coding;
 pub mod load;
+pub mod openrouter;
 pub mod page;
 pub mod pkce;
 pub mod query;
 pub mod random;
 pub mod sha256;
+pub mod xai;
 
 pub use anthropic::*;
 pub use callback::{

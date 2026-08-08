@@ -9,8 +9,10 @@ pub mod fireworks;
 pub mod fleet;
 pub mod github_copilot;
 pub mod google;
+pub mod google_vertex;
 pub mod mistral;
 pub mod openai;
+pub mod openai_codex;
 pub mod opencode;
 pub mod opencode_go;
 pub mod openrouter_images;
@@ -45,10 +47,12 @@ pub use github_copilot::{
     GITHUB_COPILOT_BASE_URL, GITHUB_COPILOT_PROVIDER_ID, github_copilot_auth,
     github_copilot_models, github_copilot_provider, github_copilot_provider_with,
 };
+pub use google_vertex::*;
 pub use google::{
     GOOGLE_BASE_URL, GOOGLE_PROVIDER_ID, google_auth, google_models, google_provider,
     google_provider_with,
 };
+pub use openai_codex::*;
 pub use mistral::{
     MISTRAL_BASE_URL, MISTRAL_PROVIDER_ID, mistral_auth, mistral_models, mistral_provider,
     mistral_provider_with,
