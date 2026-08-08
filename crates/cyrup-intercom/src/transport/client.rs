@@ -7,6 +7,11 @@
 //! frames fan out on a `broadcast` channel ([`IntercomClient::subscribe`]) — the Rust analog of pi's
 //! `EventEmitter`. There is **no automatic reconnect** (`client.ts:214-251`); a stable identity
 //! across reconnect is achieved by re-`register`ing with the same `session_id` (broker takeover).
+//!
+//! [`IntercomClient::connect_target`] speaks all three of pi-intercom's transports (the connection
+//! itself lives in [`crate::transport::stream`]); [`IntercomClient::connect`] is the socket/pipe
+//! shorthand. Over the opt-in TCP transport the `register` frame additionally carries the endpoint's
+//! `stateId` credential (`client.ts:280-285`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,8 +21,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::task::AbortHandle;
 
@@ -27,6 +30,8 @@ use crate::transport::protocol::{
     Attachment, BrokerMessage, ClientMessage, Message, MessageContent, SessionInfo,
     SessionRegistration, now_ms,
 };
+use crate::transport::stream::{BrokerReadHalf, BrokerStream, BrokerWriteHalf};
+use crate::transport::target::BrokerConnectTarget;
 
 /// The `registered`-frame + `list`/`send` correlation timeouts (`client.ts:182,492,538`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -157,8 +162,9 @@ pub struct IntercomClient {
 }
 
 impl IntercomClient {
-    /// Connect to the broker at `socket_path`, register `registration` (re-adopting `session_id` if
-    /// `Some`), and resolve once the `registered` frame arrives (`connect`, `client.ts:164-293`).
+    /// Connect to the broker over the Unix socket / named pipe at `socket_path` — the
+    /// `typeof target === "string"` arm of [`Self::connect_target`], kept as the ergonomic form
+    /// every existing call site already uses.
     ///
     /// # Errors
     /// [`IntercomError::Io`] if the socket cannot be connected; [`IntercomError::Client`] on a
@@ -168,7 +174,35 @@ impl IntercomClient {
         registration: SessionRegistration,
         session_id: Option<String>,
     ) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path).await?;
+        Self::connect_target(
+            &BrokerConnectTarget::Socket(socket_path.to_path_buf()),
+            registration,
+            session_id,
+        )
+        .await
+    }
+
+    /// Connect to the broker over `target` — a Unix socket, a Windows named pipe, or the opt-in
+    /// loopback TCP endpoint (`connectToBrokerTarget`, `client.ts:26-30,169-176`) — register
+    /// `registration` (re-adopting `session_id` if `Some`), and resolve once the `registered` frame
+    /// arrives (`connect`, `client.ts:164-293`).
+    ///
+    /// Over a TCP target the `register` frame additionally carries the endpoint's `stateId`
+    /// (`client.ts:280-285`: `...(typeof target === "string" ? {} : { stateId: target.stateId })`),
+    /// which the broker requires or it closes the connection with
+    /// `Invalid intercom TCP endpoint credentials` (`broker.ts:263-266`). Over a socket/pipe target
+    /// the field is **omitted**, not sent as null.
+    ///
+    /// # Errors
+    /// [`IntercomError::Io`] if the target cannot be connected; [`IntercomError::Client`] on a
+    /// registration timeout / a pre-registration error / a connection closed before registration.
+    pub async fn connect_target(
+        target: &BrokerConnectTarget,
+        registration: SessionRegistration,
+        session_id: Option<String>,
+    ) -> Result<Self> {
+        let state_id = target.state_id().map(str::to_string);
+        let stream = BrokerStream::connect(target).await?;
         let (read_half, write_half) = stream.into_split();
         let (wtx, wrx) = mpsc::unbounded_channel::<WriterCmd>();
         let (events, _) = broadcast::channel::<InboundEvent>(256);
@@ -197,7 +231,7 @@ impl IntercomClient {
         let register = ClientMessage::Register {
             session: registration,
             session_id,
-            state_id: None,
+            state_id,
         };
         if !inner.send_frame(encode_json(&register)?) {
             return Err(IntercomError::Client("writer closed before register".to_string()));
@@ -386,7 +420,7 @@ impl IntercomClient {
 }
 
 async fn writer_task(
-    mut write_half: OwnedWriteHalf,
+    mut write_half: BrokerWriteHalf,
     mut rx: mpsc::UnboundedReceiver<WriterCmd>,
     inner: Arc<ClientInner>,
 ) {
@@ -432,7 +466,7 @@ fn broker_message_kind(msg: &BrokerMessage) -> &'static str {
 }
 
 async fn read_task(
-    mut read_half: OwnedReadHalf,
+    mut read_half: BrokerReadHalf,
     inner: Arc<ClientInner>,
     reg_tx: oneshot::Sender<std::result::Result<String, String>>,
 ) {
@@ -569,6 +603,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
     use crate::transport::protocol::now_ms;
+    use crate::transport::target::{BrokerTcpEndpoint, INTERCOM_TCP_HOST};
+    use tokio::net::UnixStream;
 
     /// A bare `ClientInner` with a throwaway writer channel — enough to exercise
     /// `IntercomClient` methods without a real socket.
@@ -601,6 +637,82 @@ mod tests {
             last_activity: now_ms(),
             status: None,
         }
+    }
+
+    /// Accept one connection, read the client's first frame, reply `registered`, and hand the
+    /// captured frame back — narrow enough to assert the exact `register` bytes
+    /// `IntercomClient::connect_target` puts on the wire (`client.ts:280-285`).
+    async fn capture_register_frame<S>(mut stream: S) -> serde_json::Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut reader = FrameReader::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "the client closed before registering");
+            if let Some(payload) = reader.push(&buf[..n]).expect("frames").into_iter().next() {
+                let frame: serde_json::Value = serde_json::from_slice(&payload).expect("json");
+                let registered =
+                    encode_json(&BrokerMessage::Registered { session_id: "s1".to_string() })
+                        .expect("encodes");
+                stream.write_all(&registered).await.expect("write");
+                return frame;
+            }
+        }
+    }
+
+    /// `client.ts:26-30,280-285` — the opt-in TCP transport end to end at the client layer: a real
+    /// loopback `TcpStream` (no network), and the `register` frame carries the endpoint's `stateId`,
+    /// which the broker requires (`broker.ts:263-266`). Registration then completes normally.
+    #[tokio::test]
+    async fn connect_target_registers_over_tcp_with_the_endpoint_state_id() {
+        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let broker = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            capture_register_frame(stream).await
+        });
+
+        let target = BrokerConnectTarget::Tcp(BrokerTcpEndpoint {
+            host: INTERCOM_TCP_HOST.to_string(),
+            port,
+            state_id: Some("state-1".to_string()),
+        });
+        let client = IntercomClient::connect_target(&target, registration(), Some("sess-1".into()))
+            .await
+            .expect("registers over TCP");
+        assert_eq!(client.session_id().as_deref(), Some("s1"));
+        assert!(client.is_connected());
+
+        let frame = broker.await.expect("broker task");
+        assert_eq!(frame["type"], "register");
+        assert_eq!(frame["sessionId"], "sess-1");
+        assert_eq!(frame["stateId"], "state-1", "client.ts:284 spreads the TCP endpoint stateId");
+    }
+
+    /// MIRROR (stays green): over a socket target pi spreads `{}` (`client.ts:284`), so `stateId`
+    /// must be **absent** from the register frame — not present-and-null, which the broker's
+    /// `clientMessage.stateId === BROKER_STATE_ID` comparison would treat identically but which
+    /// would differ byte-for-byte from pi's frame.
+    #[tokio::test]
+    async fn connect_over_a_socket_omits_the_state_id_from_register() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("broker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let broker = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            capture_register_frame(stream).await
+        });
+
+        let client = IntercomClient::connect(&socket_path, registration(), Some("sess-1".into()))
+            .await
+            .expect("registers over the socket");
+        assert!(client.is_connected());
+
+        let frame = broker.await.expect("broker task");
+        assert_eq!(frame["type"], "register");
+        assert!(frame.get("stateId").is_none(), "socket registers carry no credential: {frame}");
     }
 
     // dossier item 1 (client.ts:426-467): `disconnect()` must synchronously fail every pending
@@ -663,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn read_task_rejects_message_before_registered() {
         let (a, mut b) = UnixStream::pair().expect("socketpair");
-        let (read_half, _write_half) = a.into_split();
+        let (read_half, _write_half) = BrokerStream::new(a).into_split();
         let (inner, _wrx) = bare_inner();
         let (reg_tx, reg_rx) = oneshot::channel();
         tokio::spawn(read_task(read_half, inner, reg_tx));
@@ -688,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn read_task_rejects_duplicate_registered_message() {
         let (a, mut b) = UnixStream::pair().expect("socketpair");
-        let (read_half, _write_half) = a.into_split();
+        let (read_half, _write_half) = BrokerStream::new(a).into_split();
         let (inner, _wrx) = bare_inner();
         let (reg_tx, reg_rx) = oneshot::channel();
         let mut events = inner.events.subscribe();
@@ -728,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn read_task_emits_error_before_disconnected_on_post_registration_frame_error() {
         let (a, mut b) = UnixStream::pair().expect("socketpair");
-        let (read_half, _write_half) = a.into_split();
+        let (read_half, _write_half) = BrokerStream::new(a).into_split();
         let (inner, _wrx) = bare_inner();
         let (reg_tx, reg_rx) = oneshot::channel();
         let mut events = inner.events.subscribe();
@@ -769,7 +881,7 @@ mod tests {
     #[tokio::test]
     async fn message_reassembled_before_an_oversize_frame_in_the_same_chunk_still_surfaces() {
         let (a, mut b) = UnixStream::pair().expect("socketpair");
-        let (read_half, _write_half) = a.into_split();
+        let (read_half, _write_half) = BrokerStream::new(a).into_split();
         let (inner, _wrx) = bare_inner();
         let (reg_tx, reg_rx) = oneshot::channel();
         let mut events = inner.events.subscribe();
@@ -837,7 +949,7 @@ mod tests {
     #[tokio::test]
     async fn writer_task_propagates_write_failure_and_tears_down() {
         let (a, b) = UnixStream::pair().expect("socketpair");
-        let (_read_half, write_half) = a.into_split();
+        let (_read_half, write_half) = BrokerStream::new(a).into_split();
         drop(b); // Fully close the peer so the next write(s) fail with a real io::Error.
 
         let (wtx, wrx) = mpsc::unbounded_channel::<WriterCmd>();

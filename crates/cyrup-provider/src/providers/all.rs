@@ -18,7 +18,7 @@
 //! | 78      | `cloudflare-workers-ai`  | ✓                                      |
 //! | 79      | `deepseek`               | ✓ fleet                                |
 //! | 80      | `fireworks`              | ✓                                      |
-//! | 81      | `github-copilot`         | **pending** (oauth/device flow)        |
+//! | 81      | `github-copilot`         | ported                                 |
 //! | 82      | `google`                 | ✓                                      |
 //! | 83      | `google-vertex`          | **pending** (vertex auth)              |
 //! | 84      | `groq`                   | ✓ fleet                                |
@@ -62,7 +62,7 @@ use crate::providers::fleet::fleet_providers_with;
 use crate::providers::{
     anthropic_provider_with, azure_openai_responses_provider_with,
     cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_provider_with,
-    fireworks_provider_with, google_provider_with, mistral_provider_with, openai_provider_with,
+    fireworks_provider_with, github_copilot_provider_with, google_provider_with, mistral_provider_with, openai_provider_with,
     opencode_go_provider_with, opencode_provider_with, openrouter_images_provider,
     together_provider_with,
 };
@@ -171,6 +171,13 @@ fn builtin_providers_with(
         registry.clone(),
     )));
 
+    // github-copilot (pi `all.ts`). Ported in the unported-work sweep; `all.rs`'s own port-status
+    // table had it marked *pending*.
+    providers.push(Arc::new(github_copilot_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
+
     // fireworks (Pi `all.ts:80`).
     providers.push(Arc::new(fireworks_provider_with(
         store.clone(),
@@ -262,7 +269,7 @@ pub fn default_images_models(options: CreateModelsOptions) -> ImagesModels {
 mod tests {
     use super::*;
 
-    /// The registry must contain every implemented built-in id and none of the pending ones.
+    /// The registry must contain every ported built-in id and none of the not-yet-ported ones.
     #[test]
     fn registry_contains_implemented_provider_ids() {
         let models = default_models(CreateModelsOptions::default());
@@ -295,6 +302,8 @@ mod tests {
             "kimi-coding",
             "minimax",
             "vercel-ai-gateway",
+            // ported in the unported-work sweep
+            "github-copilot",
         ] {
             assert!(
                 ids.iter().any(|id| id == expected),
@@ -302,16 +311,15 @@ mod tests {
             );
         }
 
-        // Pending providers are intentionally NOT registered (no fabrication).
-        for pending in [
-            "amazon-bedrock",
-            "github-copilot",
-            "google-vertex",
-            "openai-codex",
-        ] {
+        // Providers not yet ported. This is a NOT-YET list, not an exemption list: the project
+        // ports everything, and an id leaves this array by being implemented. It exists so a
+        // half-finished provider cannot be registered and silently answer requests it cannot serve
+        // — the assertion is "absent until real", never "must stay absent".
+        for unported in ["amazon-bedrock", "google-vertex", "openai-codex"] {
             assert!(
-                !ids.iter().any(|id| id == pending),
-                "pending provider '{pending}' must not be registered"
+                !ids.iter().any(|id| id == unported),
+                "'{unported}' is not ported yet, so it must not be registered — if you just \
+                 ported it, move it into the implemented list above"
             );
         }
 

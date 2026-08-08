@@ -174,4 +174,6 @@ pub mod known_api {
     pub const GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
     pub const MISTRAL_CONVERSATIONS: &str = "mistral-conversations";
     pub const BEDROCK_CONVERSE_STREAM: &str = "bedrock-converse-stream";
+    /// pi `KnownApi` (`ai/src/types.ts:16-26`). Ported in the unported-work sweep.
+    pub const PI_MESSAGES: &str = "pi-messages";
 }

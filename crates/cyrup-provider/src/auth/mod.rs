@@ -2,6 +2,7 @@
 //! engine (arch-01 §3.7 / func-01 §7).
 
 pub mod helpers;
+pub mod oauth;
 pub mod resolve;
 pub mod store;
 pub mod types;
@@ -11,6 +12,11 @@ use crate::model::Model;
 use std::sync::Arc;
 
 pub use helpers::{env_key, keyless_local};
+pub use oauth::{
+    AuthEvent, AuthInfoLink, AuthInteraction, AuthPrompt, AuthPromptKind, AuthSelectOption,
+    CallbackServer, CallbackServerConfig, OAuthError, Pkce, generate_pkce, oauth_credential,
+    poll_oauth_device_code_flow, register_bundled_oauth_flow_loaders,
+};
 pub use resolve::{AuthOverrides, resolve_provider_auth};
 pub use store::{CredentialStore, InMemoryCredentialStore, ModifyFn};
 pub use types::{AuthContext, AuthResult, Credential, EnvAuthContext, ModelAuth, ProviderEnv};
@@ -62,9 +68,39 @@ pub trait ApiKeyAuth: Send + Sync {
 }
 
 /// An OAuth strategy. `refresh` runs UNDER the credential-store lock (func-01 R-01-014/067).
+///
+/// Ports `OAuthAuth` (`ai/src/auth/types.ts:189-210`).
 #[async_trait::async_trait]
 pub trait OAuthAuth: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Selector label for the subscription login option, e.g. `"Sign in with SuperGrok or X
+    /// Premium"` (`loginLabel`, `ai/src/auth/types.ts:194`). Optional upstream, hence the
+    /// default.
+    fn login_label(&self) -> Option<&str> {
+        None
+    }
+
+    /// Interactive login — the flow that *obtains* a credential (`login`,
+    /// `ai/src/auth/types.ts:196`). Drives the user through the browser/device dance via
+    /// `interaction` and returns the credential to persist
+    /// (`store.modify(provider.id, async () => credential)`).
+    ///
+    /// The default reports [`oauth::OAuthError::LoginUnsupported`]: upstream makes `login`
+    /// mandatory, but a Rust default keeps strategies that only *use* a stored credential (and
+    /// the tests that fake them) compiling unchanged. Every real flow overrides it.
+    ///
+    /// The substrate to implement it lives in [`oauth`]: [`oauth::generate_pkce`],
+    /// [`oauth::CallbackServer`], [`oauth::poll_oauth_device_code_flow`] and
+    /// [`oauth::oauth_credential`].
+    async fn login(
+        &self,
+        _interaction: &dyn oauth::AuthInteraction,
+    ) -> Result<Credential, oauth::OAuthError> {
+        Err(oauth::OAuthError::LoginUnsupported {
+            name: self.name().to_string(),
+        })
+    }
 
     /// Network refresh of an expired credential. A failure surfaces as `AuthError::OAuth` and MUST
     /// NOT fall back to an env key (func-01 R-01-013).

@@ -135,7 +135,12 @@ pub enum ClientMessage {
         /// A stable session id to re-adopt (broker takeover), if any.
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
-        /// TCP endpoint credential (unused on the Unix-socket milestone).
+        /// The opt-in-TCP endpoint credential (`stateId`, `client.ts:284`): the broker's per-run
+        /// `BROKER_STATE_ID` from `broker.port.json`. Required over TCP (`broker.ts:263-266`
+        /// otherwise throws `Invalid intercom TCP endpoint credentials`), and **omitted** — never
+        /// null — over a Unix socket / named pipe. Filled in by
+        /// [`crate::transport::client::IntercomClient::connect_target`] from the resolved
+        /// [`crate::transport::target::BrokerConnectTarget`].
         #[serde(skip_serializing_if = "Option::is_none")]
         state_id: Option<String>,
     },
@@ -238,7 +243,9 @@ pub enum HealthMessage {
     Health {
         /// The probe correlation id.
         request_id: String,
-        /// TCP endpoint credential (unused on the Unix-socket milestone).
+        /// The opt-in-TCP endpoint credential (`stateId`, `spawn.ts:290`), on the same terms as
+        /// `register`'s: required over TCP (`broker.ts:251-254`), omitted over a socket / pipe.
+        /// Filled in by [`crate::transport::spawn::check_target_connectable`].
         #[serde(skip_serializing_if = "Option::is_none")]
         state_id: Option<String>,
     },

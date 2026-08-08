@@ -7,6 +7,7 @@ pub mod azure_openai_responses;
 pub mod cloudflare;
 pub mod fireworks;
 pub mod fleet;
+pub mod github_copilot;
 pub mod google;
 pub mod mistral;
 pub mod openai;
@@ -39,6 +40,10 @@ pub use cloudflare::{
 pub use fireworks::{
     FIREWORKS_BASE_URL, FIREWORKS_PROVIDER_ID, fireworks_auth, fireworks_models,
     fireworks_provider, fireworks_provider_with,
+};
+pub use github_copilot::{
+    GITHUB_COPILOT_BASE_URL, GITHUB_COPILOT_PROVIDER_ID, github_copilot_auth,
+    github_copilot_models, github_copilot_provider, github_copilot_provider_with,
 };
 pub use google::{
     GOOGLE_BASE_URL, GOOGLE_PROVIDER_ID, google_auth, google_models, google_provider,

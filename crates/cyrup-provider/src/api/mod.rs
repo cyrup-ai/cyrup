@@ -23,6 +23,7 @@ pub mod google_generative_ai;
 pub mod mistral_conversations;
 pub mod openai_completions;
 pub mod openai_responses;
+pub mod pi_messages;
 
 /// Cross-converter regression suite: a truncated stream must never be reported as a completed turn
 /// (PROV-010 / AGENT-014 / DRIFT-012). Lives beside the decoders so it can drive all five directly.
@@ -146,6 +147,7 @@ pub fn register_builtins(reg: &mut ApiRegistry) {
         ApiId::from(crate::known_api::GOOGLE_GENERATIVE_AI),
         google_generative_ai::factory,
     );
+    reg.register(ApiId::from(crate::known_api::PI_MESSAGES), pi_messages::factory);
     reg.register(
         ApiId::from(crate::known_api::MISTRAL_CONVERSATIONS),
         mistral_conversations::factory,
