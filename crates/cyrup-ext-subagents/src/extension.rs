@@ -6527,7 +6527,8 @@ impl Tool for SubagentTool {
         // partial fan-out — once the session has exhausted it. The budget is per SESSION, not per
         // turn, and the reservation is billed up front, so a run that fails later still counts.
         //
-        // [CYRUP-DELTA, deliberate] pi runs `validateExecutionChainBindings` immediately BEFORE this
+        // [CYRUP-DELTA — UNPORTED, not accepted] pi runs
+        // `validateExecutionChainBindings` immediately BEFORE this
         // reserve; in this crate that validation lives inside `route_chain_mode`, so a structurally
         // invalid chain is billed here and rejected a moment later. Moving the reserve past the
         // routing call would instead bill each mode arm separately (and twice for a chain that

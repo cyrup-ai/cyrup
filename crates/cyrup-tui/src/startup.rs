@@ -15,7 +15,13 @@
 //! failed to instantiate was completely invisible (TUI-006). `--verbose` even advertised itself as
 //! overriding `quietStartup` (`cli.rs:818`) while only ever setting the log level.
 //!
-//! # Deliberate divergences (ADR-0001)
+//! # Divergences from pi — UNPORTED WORK
+//!
+//! Earlier revisions headed this section "Deliberate divergences (ADR-0001)". No ADR document
+//! exists in this workspace, so that citation asserted an authority nothing here can verify, and it
+//! read as permission to stop. It was not. Everything below is work: the port's goal is behavioural
+//! equivalence, and where the mechanism must differ (committed entries live in the terminal's own
+//! scrollback and cannot be re-rendered) the BEHAVIOUR still has to be reached by another route.
 //!
 //! * Pi wraps each listing section in an `ExpandableText` bound to `getStartupExpansionState()`, so
 //!   `Ctrl+O` swaps a comma-joined summary for a per-path breakdown. cyrup's committed entries are

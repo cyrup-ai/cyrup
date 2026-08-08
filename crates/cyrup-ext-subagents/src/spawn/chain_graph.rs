@@ -158,7 +158,8 @@ pub struct SingleStepSpec {
     /// the two terms of pi's `sessionEnabled = Boolean(sessionFile || sessionDir) || share`
     /// (`runs/foreground/execution.ts:1039`) and is `mkdir -p`'d before the child spawns.
     ///
-    /// **[CYRUP-DELTA], deliberate.** pi carries a single run-level `config.sessionDir` and derives
+    /// **[CYRUP-DELTA] — UNPORTED, not accepted.** pi carries a single run-level
+    /// `config.sessionDir` and derives
     /// each child's directory at the DISPATCH site — verbatim for a sequential step
     /// (`subagent-runner.ts:2793`), `<root>/parallel-<taskIdx>` for a parallel member (`:2587-2596`),
     /// `<root>/dynamic-<step>-<item>` for a dynamic one (`:2309`). cyrup's `run_single` is the ONE

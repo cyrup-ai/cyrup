@@ -1036,7 +1036,7 @@ impl<B: Backend> App<B> {
     /// * `custom` → the labeled extension block, **only when `display`** (`:3323-3336`);
     /// * `compactionSummary` / `branchSummary` → their own summary blocks (`:3337-3350`).
     ///
-    /// **ADR-0001 divergence, deliberate**: Pi calls `chatContainer.clear()` before replaying, which
+    /// **Divergence from pi — UNPORTED (the `ADR-0001` it once cited does not exist; see CLAUDE.md)**: Pi calls `chatContainer.clear()` before replaying, which
     /// wipes the previous session off the screen. cyrup's committed entries live in the terminal's
     /// native scrollback (`insert_before`) and cannot be erased, so after a mid-session `/resume`
     /// the previous conversation stays visible ABOVE the replayed one. The replay itself needs no
