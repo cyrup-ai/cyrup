@@ -176,4 +176,6 @@ pub mod known_api {
     pub const BEDROCK_CONVERSE_STREAM: &str = "bedrock-converse-stream";
     /// pi `KnownApi` (`ai/src/types.ts:16-26`). Ported in the unported-work sweep.
     pub const PI_MESSAGES: &str = "pi-messages";
+    /// pi `KnownApi` (`ai/src/types.ts:16-26`). Ported in the unported-work sweep.
+    pub const OPENAI_CODEX_RESPONSES: &str = "openai-codex-responses";
 }

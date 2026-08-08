@@ -214,6 +214,8 @@ pub enum ApiStreamOptions {
     OpenAiResponses(crate::api::openai_responses::OpenAiResponsesOptions),
     /// Options for the `azure-openai-responses` wire protocol.
     AzureOpenAiResponses(crate::api::azure_openai_responses::AzureOpenAiResponsesOptions),
+    /// Options for the `openai-codex-responses` wire protocol.
+    OpenAiCodexResponses(crate::api::openai_codex_responses::OpenAiCodexResponsesOptions),
     /// Options for the `google-generative-ai` wire protocol.
     Google(crate::api::google_generative_ai::GoogleOptions),
     /// Options for the `mistral-conversations` wire protocol.
@@ -245,6 +247,16 @@ impl ApiStreamOptions {
     ) -> Option<&crate::api::azure_openai_responses::AzureOpenAiResponsesOptions> {
         match self {
             ApiStreamOptions::AzureOpenAiResponses(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The `openai-codex-responses` options, if this is that variant.
+    pub fn openai_codex_responses(
+        &self,
+    ) -> Option<&crate::api::openai_codex_responses::OpenAiCodexResponsesOptions> {
+        match self {
+            ApiStreamOptions::OpenAiCodexResponses(o) => Some(o),
             _ => None,
         }
     }

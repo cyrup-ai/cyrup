@@ -209,14 +209,27 @@ impl OpenAiCodexResponsesOptions {
     /// here. Note pi's own `buildBaseOptions` (`simple-options.ts`) forwards **no** `toolChoice`
     /// either, so upstream's `streamSimple` path is always `"auto"`.
     pub fn from_stream_options(opts: &StreamOptions) -> Self {
+        // Typed options first, exactly as every sibling Responses api does. Without this branch
+        // three of upstream's four options — `reasoningSummary`, `serviceTier`, `textVerbosity` —
+        // were UNREACHABLE: they had no unified spelling, and nothing read
+        // `StreamOptions::api_options`, so a caller could construct them and they would be
+        // silently discarded.
+        let typed = opts
+            .api_options
+            .as_ref()
+            .and_then(crate::stream::ApiStreamOptions::openai_codex_responses);
+
         Self {
-            reasoning_summary: None,
-            service_tier: None,
-            text_verbosity: None,
+            reasoning_summary: typed.and_then(|t| t.reasoning_summary),
+            service_tier: typed.and_then(|t| t.service_tier.clone()),
+            text_verbosity: typed.and_then(|t| t.text_verbosity.clone()),
+            // `toolChoice` is the one option with a unified spelling, so the unified value wins and
+            // the typed one is the fallback — matching how the other Responses apis rank them.
             tool_choice: opts
                 .tool_choice
                 .as_ref()
-                .and_then(CodexToolChoice::from_unified),
+                .and_then(CodexToolChoice::from_unified)
+                .or_else(|| typed.and_then(|t| t.tool_choice)),
         }
     }
 }
@@ -1218,7 +1231,18 @@ mod tests {
             base_url: String::new(),
             reasoning: true,
             input: vec![Modality::Text],
-            cost: ModelCost::default(),
+            // NON-ZERO rates. With `ModelCost::default()` every rate is 0.0, so any assertion of
+            // the form `|priority_cost - baseline_cost * N| < eps` reduces to `|0.0 - 0.0| < eps`
+            // and holds no matter what the code does — which is exactly how the service-tier
+            // pricing test below shipped vacuous. A reviewer proved it by deleting the whole
+            // feature under test and watching every test stay green.
+            cost: ModelCost {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                tiers: None,
+            },
             context_window: 1000,
             max_tokens: 1000,
             thinking_level_map: None,
@@ -1955,12 +1979,42 @@ mod tests {
             .and_then(StreamEvent::terminal_message)
             .cloned()
             .expect("terminal");
-        // MIRROR: with no requested tier the response's own `default` prices at 1x.
+        // The baseline must be genuinely non-zero, or the ratio assertion below is vacuous — the
+        // model now carries real rates precisely so this can be checked.
+        assert!(
+            baseline.usage.cost.total > 0.0,
+            "the baseline must cost something for the ratio to mean anything (got {})",
+            baseline.usage.cost.total
+        );
         assert!(
             (priority.usage.cost.total - baseline.usage.cost.total * 2.0).abs() < 1e-9,
-            "priority {} vs baseline {}",
+            "a requested `priority` tier must survive a `\"default\"` response tier and price at 2x \
+             (getServiceTierCostMultiplier, :598-610) — priority {} vs baseline {}",
             priority.usage.cost.total,
             baseline.usage.cost.total
+        );
+    }
+
+    /// MIRROR for the test above: the resolution is a real decision, not a blanket doubling. With
+    /// NO requested tier the response's own `"default"` prices at 1x, so the 2x assertion is about
+    /// `resolve_codex_service_tier` keeping the request's tier rather than about the arithmetic.
+    #[tokio::test]
+    async fn an_unrequested_tier_prices_at_the_responses_own_default() {
+        const SSE: &str = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m1\"}}\n\n",
+            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"service_tier\":\"default\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1000,\"total_tokens\":2000}}}\n\n",
+        );
+        let msg = drain(SSE, None)
+            .await
+            .last()
+            .and_then(StreamEvent::terminal_message)
+            .cloned()
+            .expect("terminal");
+        // 1000 input @ $1/1e6 + 1000 output @ $2/1e6 = 0.003, undoubled.
+        assert!(
+            (msg.usage.cost.total - 0.003).abs() < 1e-9,
+            "an unrequested tier must price at 1x, got {}",
+            msg.usage.cost.total
         );
     }
 

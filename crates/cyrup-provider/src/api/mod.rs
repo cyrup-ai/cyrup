@@ -21,6 +21,7 @@ pub mod anthropic_messages;
 pub mod azure_openai_responses;
 pub mod google_generative_ai;
 pub mod mistral_conversations;
+pub mod openai_codex_responses;
 pub mod openai_completions;
 pub mod openai_responses;
 pub mod pi_messages;
@@ -148,6 +149,10 @@ pub fn register_builtins(reg: &mut ApiRegistry) {
         google_generative_ai::factory,
     );
     reg.register(ApiId::from(crate::known_api::PI_MESSAGES), pi_messages::factory);
+    reg.register(
+        ApiId::from(crate::known_api::OPENAI_CODEX_RESPONSES),
+        openai_codex_responses::factory,
+    );
     reg.register(
         ApiId::from(crate::known_api::MISTRAL_CONVERSATIONS),
         mistral_conversations::factory,
