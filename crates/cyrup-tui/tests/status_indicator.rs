@@ -47,10 +47,19 @@ fn working_band_shows_spinner_message_and_cancel_hint() {
     assert_eq!(lines.len(), 2);
     assert!(line_text(&lines[0]).trim().is_empty(), "first band line should be blank (loader spacer)");
     let msg = line_text(&lines[1]);
-    assert!(msg.contains("Working…"), "working message missing: [{msg}]");
-    assert!(msg.contains("(esc to cancel)"), "cancel hint missing: [{msg}]");
-    // The leading glyph is one of the Braille spinner frames.
-    assert!(SPINNER_FRAMES.iter().any(|f| msg.starts_with(f)), "spinner glyph missing: [{msg}]");
+    // `defaultWorkingMessage = "Working..."` — ASCII, v0.84.1 `interactive-mode.ts:420`.
+    assert!(msg.contains("Working..."), "working message missing: [{msg}]");
+    // `WorkingStatusIndicator` passes the message straight through and appends NOTHING
+    // (`status-indicator.ts:29-40`, `interactive-mode.ts:2074-2080`); only retry/compaction/branch
+    // bake a `(<key> to cancel)` into their own copy. The suffix was 18 stray columns on every turn.
+    assert!(!msg.contains("to cancel"), "Working must carry no cancel suffix: [{msg}]");
+    // The line is inset one column — `Loader extends Text` with `paddingX 1` (`loader.ts:35`,
+    // `text.ts:70,76`) — and the glyph after it is one of the Braille spinner frames.
+    assert!(msg.starts_with(' '), "band not inset one column: [{msg}]");
+    assert!(
+        SPINNER_FRAMES.iter().any(|f| msg.trim_start().starts_with(f)),
+        "spinner glyph missing: [{msg}]"
+    );
 }
 
 #[test]
@@ -66,11 +75,11 @@ fn spinner_advances_every_80ms() {
 fn retry_uses_warning_spinner_color() {
     let theme = UiTheme::dark();
     let mut ind = StatusIndicator::new();
-    ind.set(IndicatorKind::Retry, Some("Retrying (1/3)…".to_string()));
+    ind.set(IndicatorKind::Retry, Some("Retrying (1/3)...".to_string()));
     let lines = ind.lines_at(Duration::ZERO, &theme, Some("esc"));
     let spinner_span = &lines[1].spans[0];
     assert_eq!(spinner_span.style.fg, theme.warning_style().fg, "retry spinner not warning-colored");
-    assert!(line_text(&lines[1]).contains("Retrying (1/3)…"), "retry message missing");
+    assert!(line_text(&lines[1]).contains("Retrying (1/3)..."), "retry message missing");
 }
 
 #[test]
@@ -81,8 +90,11 @@ fn agent_start_renders_band_and_agent_end_clears_it() {
     app.ingest_event(&AgentSessionEvent::AgentStart);
     app.draw().unwrap();
     let working = buf_text(&app);
-    assert!(working.contains("Working…"), "working band not rendered after AgentStart:\n{working}");
-    assert!(working.contains("esc to cancel"), "cancel hint not in band:\n{working}");
+    assert!(working.contains("Working..."), "working band not rendered after AgentStart:\n{working}");
+    assert!(
+        !working.contains("to cancel"),
+        "Working carries no cancel suffix (status-indicator.ts:29-40):\n{working}"
+    );
     assert!(
         SPINNER_FRAMES.iter().any(|f| working.contains(f)),
         "spinner glyph not rendered:\n{working}"
@@ -91,12 +103,12 @@ fn agent_start_renders_band_and_agent_end_clears_it() {
     app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();
     let idle = buf_text(&app);
-    assert!(!idle.contains("Working…"), "working band lingered after AgentEnd:\n{idle}");
+    assert!(!idle.contains("Working..."), "working band lingered after AgentEnd:\n{idle}");
 }
 
 #[test]
 fn auto_retry_event_renders_pi_exact_copy_with_delay_seconds() {
-    // Item #9 — the retry band copy is Pi's exact "Retrying (a/max) in Ns…" (status-indicator.ts:47),
+    // Item #9 — the retry band copy is Pi's exact "Retrying (a/max) in Ns..." (status-indicator.ts:47),
     // driven end-to-end through `ingest_event` from the `AutoRetryStart` event (delay in whole
     // seconds, rounded up), with the live-keymap cancel hint appended by the band.
     let mut app = App::new(TestBackend::new(70, 16), UiTheme::dark()).unwrap();
@@ -115,14 +127,14 @@ fn auto_retry_event_renders_pi_exact_copy_with_delay_seconds() {
 
 #[test]
 fn overflow_compaction_event_prefixes_context_overflow_copy() {
-    // Item #9 — an OVERFLOW auto-compaction reads "Context overflow detected, Auto-compacting…"
-    // (status-indicator.ts:82), while a MANUAL one reads "Compacting context…".
+    // Item #9 — an OVERFLOW auto-compaction reads "Context overflow detected, Auto-compacting..."
+    // (status-indicator.ts:82), while a MANUAL one reads "Compacting context...".
     use cyrup_session_svc::CompactionReason;
     let mut app = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
     app.ingest_event(&AgentSessionEvent::CompactionStart { reason: CompactionReason::Overflow });
     app.draw().unwrap();
     assert!(
-        buf_text(&app).contains("Context overflow detected, Auto-compacting…"),
+        buf_text(&app).contains("Context overflow detected, Auto-compacting..."),
         "overflow compaction copy missing:\n{}",
         buf_text(&app)
     );
@@ -131,7 +143,7 @@ fn overflow_compaction_event_prefixes_context_overflow_copy() {
     app2.ingest_event(&AgentSessionEvent::CompactionStart { reason: CompactionReason::Manual });
     app2.draw().unwrap();
     let m = buf_text(&app2);
-    assert!(m.contains("Compacting context…"), "manual compaction copy missing:\n{m}");
+    assert!(m.contains("Compacting context..."), "manual compaction copy missing:\n{m}");
     assert!(!m.contains("Auto-compacting"), "manual must not say Auto-compacting:\n{m}");
 }
 
@@ -142,12 +154,12 @@ fn compaction_band_renders_its_message() {
     let mut app = App::new(TestBackend::new(60, 16), UiTheme::dark()).unwrap();
     app.state_mut().indicator.set(IndicatorKind::Compaction, None);
     app.draw().unwrap();
-    assert!(buf_text(&app).contains("Compacting context…"), "compaction band missing");
+    assert!(buf_text(&app).contains("Compacting context..."), "compaction band missing");
     assert_eq!(app.state().indicator.kind(), IndicatorKind::Compaction);
 
     app.state_mut().indicator.idle();
     app.draw().unwrap();
-    assert!(!buf_text(&app).contains("Compacting context…"), "band should clear when idle");
+    assert!(!buf_text(&app).contains("Compacting context..."), "band should clear when idle");
     assert_eq!(app.state().indicator.kind(), IndicatorKind::Idle);
 }
 
@@ -156,7 +168,7 @@ fn compaction_band_renders_its_message() {
 /// Pi `interactive-mode.ts:3222-3245`: `summarization_retry_scheduled` shows the retry countdown,
 /// `summarization_retry_attempt_start` clears it and RECREATES the compaction/branch indicator from
 /// the event's `source`, `summarization_retry_finished` clears the retry indicator. Before this
-/// change the events did not exist, so a compacting session showed "Compacting context…" frozen for
+/// change the events did not exist, so a compacting session showed "Compacting context..." frozen for
 /// the whole backoff with no indication anything was wrong.
 #[test]
 fn a_summarization_retry_shows_the_countdown_then_restores_the_compaction_band() {
@@ -165,7 +177,7 @@ fn a_summarization_retry_shows_the_countdown_then_restores_the_compaction_band()
 
     app.ingest_event(&AgentSessionEvent::CompactionStart { reason: CompactionReason::Threshold });
     app.draw().unwrap();
-    assert!(buf_text(&app).contains("Auto-compacting…"), "sanity: the compaction band is up");
+    assert!(buf_text(&app).contains("Auto-compacting..."), "sanity: the compaction band is up");
 
     app.ingest_event(&AgentSessionEvent::SummarizationRetryScheduled {
         attempt: 1,
@@ -188,7 +200,7 @@ fn a_summarization_retry_shows_the_countdown_then_restores_the_compaction_band()
         IndicatorKind::Compaction,
         "the underlying indicator is recreated from `source` (interactive-mode.ts:3233-3238)"
     );
-    assert!(out.contains("Auto-compacting…"), "compaction band not restored:\n{out}");
+    assert!(out.contains("Auto-compacting..."), "compaction band not restored:\n{out}");
 }
 
 /// The branch-summary arm of the same event picks a DIFFERENT indicator — that is the whole reason
@@ -210,7 +222,7 @@ fn a_branch_summary_retry_restores_the_branch_summary_band_not_the_compaction_on
     app.draw().unwrap();
     assert_eq!(app.state().indicator.kind(), IndicatorKind::BranchSummary);
     assert!(
-        buf_text(&app).contains("Summarizing branch…"),
+        buf_text(&app).contains("Summarizing branch..."),
         "branch-summary band not restored:\n{}",
         buf_text(&app)
     );

@@ -161,7 +161,15 @@ pub struct ContextUsage {
     pub used_tokens: u64,
     /// The active model's context window.
     pub context_window: u64,
-    /// `used_tokens / context_window` clamped to `[0, 1]` (0 when the window is unknown).
+    /// `used_tokens / context_window` (0 when the window is unknown).
+    ///
+    /// **Unclamped, and may exceed `1.0`.** Pi computes `const percent = (estimate.tokens /
+    /// contextWindow) * 100` with no cap (agent-session.ts:3211) and the footer prints it verbatim
+    /// (`footer.ts:151`), so an over-budget context reads e.g. `112.3%` in `error` red. Clamping to
+    /// `[0, 1]` here made every overflow look like a tidy 100%, hiding the one number that tells a
+    /// user a compaction is overdue. The only consumer is
+    /// [`AgentSession::stats_context_usage`](crate::AgentSession::stats_context_usage), which
+    /// multiplies it by 100 to build pi's `ContextUsage.percent`.
     pub fraction: f64,
 }
 
@@ -174,7 +182,7 @@ impl ContextUsage {
         let fraction = if context_window == 0 {
             0.0
         } else {
-            (used as f64 / context_window as f64).clamp(0.0, 1.0)
+            used as f64 / context_window as f64
         };
         Self { used_tokens: used, context_window, fraction }
     }

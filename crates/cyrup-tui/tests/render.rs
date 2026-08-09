@@ -200,7 +200,12 @@ fn ingest_events_drive_status_and_transcript() {
 
     let text = buf_text(&app);
     assert!(text.contains("openai/gpt"), "model not reflected:\n{text}");
-    assert!(text.contains("3 queued"), "queue depth not reflected:\n{text}");
+    // The queue depth is TRACKED but must NOT reach the footer: `statsParts` (v0.84.1
+    // `footer.ts:129-164`) is exactly `↑ ↓ R W CH% $cost`, the context segment and `xp` — there is no
+    // queue segment upstream under any name. The extra segment pushed the right-aligned model name
+    // over at narrow widths. pi surfaces queued messages in the transcript instead.
+    assert_eq!(app.state().status.queued, 3, "queue depth not tracked");
+    assert!(!text.contains("queued"), "pi's footer has no queue segment:\n{text}");
     // The model-change notification is a committed entry: it lives in scrollback, not the live region.
     let sb = app.scrollback_text();
     assert!(sb.contains("model → openai/gpt"), "model change not logged to scrollback:\n{sb}");

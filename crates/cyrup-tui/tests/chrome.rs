@@ -50,8 +50,11 @@ fn compact_hints_source_keys_from_the_live_keymap() {
     // Pi order: interrupt, clear/exit, /, !, more.
     let descs: Vec<&str> = hints.iter().map(|(_, d)| d.as_str()).collect();
     assert_eq!(descs, vec!["interrupt", "clear/exit", "commands", "bash", "more"]);
-    // Defaults: Esc interrupt, Ctrl+C clear, Ctrl+D exit, Ctrl+O expand.
-    assert_eq!(hints[0].0, "esc");
+    // Defaults: Escape interrupt, Ctrl+C clear, Ctrl+D exit, Ctrl+O expand. The interrupt key spells
+    // out as `escape`: upstream's id is `"app.interrupt": { defaultKeys: "escape" }` (v0.84.1
+    // `coding-agent/src/core/keybindings.ts:66`) and `formatKeyText` (`keybinding-hints.ts:17-27`)
+    // only splits on `/`+`+` and rewrites `alt`→`option` — it never abbreviates.
+    assert_eq!(hints[0].0, "escape");
     assert_eq!(hints[1].0, "ctrl+c/ctrl+d");
     assert_eq!(hints[2].0, "/");
     assert_eq!(hints[4].0, "ctrl+o");
@@ -85,11 +88,14 @@ fn truncate_no_op_when_under_limit() {
 #[test]
 fn bordered_loader_renders_message_cancel_hint_and_rules() {
     let theme = UiTheme::dark();
-    let loader = BorderedLoader::cancellable("Working on it", "esc");
-    assert_eq!(loader.height(), 4);
-    let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+    let loader = BorderedLoader::cancellable("Working on it", "escape/ctrl+c");
+    // 7 rows: `DynamicBorder` + `Loader` (2 — `["", ...super.render(width)]`, v0.84.1
+    // `tui/src/components/loader.ts:43-45`) + `Spacer(1)` + `Text(keyHint, 1, 0)` + `Spacer(1)` +
+    // `DynamicBorder` (`coding-agent/src/modes/interactive/components/bordered-loader.ts:16-39`).
+    assert_eq!(loader.height(), 7);
+    let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
     terminal
-        .draw(|f| loader.render(f, Rect::new(0, 0, 40, 4), &theme, 0))
+        .draw(|f| loader.render(f, Rect::new(0, 0, 40, 7), &theme, 0))
         .unwrap();
     let text = buf_string(&terminal);
     assert!(text.contains("Working on it"), "message: {text}");
@@ -102,10 +108,12 @@ fn bordered_loader_renders_message_cancel_hint_and_rules() {
 fn plain_loader_has_no_cancel_row() {
     let theme = UiTheme::dark();
     let loader = BorderedLoader::plain("Loading");
-    assert_eq!(loader.height(), 3);
-    let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
+    // 5 rows: the cancellable pair (`Spacer(1)` + hint `Text`) is skipped, everything else stands
+    // (`bordered-loader.ts:34-39`).
+    assert_eq!(loader.height(), 5);
+    let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
     terminal
-        .draw(|f| loader.render(f, Rect::new(0, 0, 40, 3), &theme, 1))
+        .draw(|f| loader.render(f, Rect::new(0, 0, 40, 5), &theme, 1))
         .unwrap();
     let text = buf_string(&terminal);
     assert!(text.contains("Loading"));

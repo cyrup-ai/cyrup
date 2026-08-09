@@ -5,10 +5,22 @@
 //! `Loader`: a leading blank line then `{spinner} {message}` (`loader.ts:43-45`); idle is two blank
 //! lines (`IdleStatus`, `status-indicator.ts:105-114`).
 //!
+//! `Loader extends Text` and is constructed `super("", 1, 0)` (`loader.ts:35`) — **paddingX 1** — so
+//! `Text.render` emits `leftMargin + line + rightMargin` (`text.ts:70-76`). The rendered row is
+//! ` ⠋ Working... `, inset one column, not flush against the terminal edge.
+//!
 //! ## States (`status-indicator.ts:7`)
 //! `working | retry | compaction | branchSummary`, plus idle — exactly one active at a time. Each
-//! non-idle state is an accent/warning spinner + a muted message; the trailing `(<key> to cancel)`
-//! text is built from the **live keymap** (`status-indicator.ts:47,78,100`), never hardcoded.
+//! non-idle state is an accent/warning spinner + a muted message.
+//!
+//! The trailing `(<key> to cancel)` is **baked into the message by three of the four constructors**
+//! — retry (`status-indicator.ts:47`), compaction (`:78-82`) and branch summary (`:100`), each from
+//! the live keymap. `WorkingStatusIndicator` (`:29-40`) takes `this.workingMessage ??
+//! defaultWorkingMessage` and appends NOTHING (`interactive-mode.ts:2074-2080`); the only place a
+//! working message ever gains a suffix is `resetExtensionUI` (`:2188-2191`), which spells it
+//! `(… to interrupt)` and fires on an extension reload, not on a turn. cyrup appended
+//! ` ({hint} to cancel)` to every kind, adding 18 columns to `Working...` for the whole duration of
+//! every turn.
 //!
 //! ## Spinner (spec/tui/01 §6.2)
 //! Braille frames `⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏` advancing every **80 ms** (`loader.ts:11-12`). ratatui is
@@ -51,17 +63,44 @@ impl IndicatorKind {
     }
 }
 
+/// A live retry backoff (`RetryStatusIndicator`, `status-indicator.ts:42-72`).
+///
+/// Upstream drives the `{n}s` with a `CountdownTimer` — `remainingSeconds = Math.ceil(timeoutMs /
+/// 1000)`, an immediate `onTick`, then `setInterval(… 1000)` decrementing and re-`setMessage`ing
+/// (`countdown-timer.ts:18-30`). ratatui is immediate-mode, so cyrup stores the same two inputs and
+/// re-derives the remaining seconds from the band's own elapsed clock — the identical treatment the
+/// spinner frame already gets. cyrup previously formatted the message ONCE at
+/// `auto_retry_start`, so a 30-second backoff showed a frozen `in 30s...` while only the spinner
+/// moved, which reads as a hang.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetryCountdown {
+    attempt: u32,
+    max_attempts: u32,
+    /// `Math.ceil(delayMs / 1000)` — the value the timer starts at (`countdown-timer.ts:18`).
+    initial_seconds: u64,
+}
+
+impl RetryCountdown {
+    /// The message at `elapsed` (`status-indicator.ts:46-47`), before the cancel suffix.
+    fn message_at(self, elapsed: Duration) -> String {
+        let remaining = self.initial_seconds.saturating_sub(elapsed.as_secs());
+        format!("Retrying ({}/{}) in {}s...", self.attempt, self.max_attempts, remaining)
+    }
+}
+
 /// The status-band state (`StatusState`, spec/tui/01 §9). `started` anchors the spinner phase.
 #[derive(Clone, Debug)]
 pub struct StatusIndicator {
     kind: IndicatorKind,
     message: Option<String>,
     started: Option<Instant>,
+    /// Set only while a retry backoff is counting down; re-derives `message` per frame.
+    retry: Option<RetryCountdown>,
 }
 
 impl Default for StatusIndicator {
     fn default() -> Self {
-        StatusIndicator { kind: IndicatorKind::Idle, message: None, started: None }
+        StatusIndicator { kind: IndicatorKind::Idle, message: None, started: None, retry: None }
     }
 }
 
@@ -91,6 +130,37 @@ impl StatusIndicator {
         }
         self.kind = kind;
         self.message = message;
+        // A new indicator replaces the old one outright upstream (`showStatusIndicator` disposes the
+        // previous, `interactive-mode.ts`), and `RetryStatusIndicator.dispose` kills its timer
+        // (`status-indicator.ts:67-71`).
+        self.retry = None;
+    }
+
+    /// Enter the retry state with a **live** countdown (`RetryStatusIndicator`,
+    /// `status-indicator.ts:42-65`). The `{n}s` is re-derived every frame from the band's elapsed
+    /// clock, so the message ticks 30→29→…→0 exactly as `CountdownTimer` does.
+    ///
+    /// `started` is re-anchored **unconditionally**. [`Self::set`] only restarts the clock when the
+    /// *kind* changes, but a second `AutoRetryStart` arrives while the band is already `Retry` —
+    /// attempt 2 of 3 — and would otherwise inherit attempt 1's anchor, so its countdown would open
+    /// part-way down (or, past the first delay, pinned at `0s`). Upstream cannot have that bug: each
+    /// `RetryStatusIndicator` is a fresh object with a fresh `CountdownTimer`, and the previous one
+    /// is disposed (`status-indicator.ts:50-64`, `:67-71`).
+    pub fn set_retry(&mut self, attempt: u32, max_attempts: u32, delay_ms: u64) {
+        self.set(IndicatorKind::Retry, None);
+        self.started = Some(Instant::now());
+        self.retry = Some(RetryCountdown {
+            attempt,
+            max_attempts,
+            initial_seconds: delay_ms.div_ceil(1_000),
+        });
+    }
+
+    /// The retry message at the band's current phase, or `None` when no backoff is counting down —
+    /// the same string [`Self::lines`] renders, for the transcript status line that mirrors it.
+    pub fn retry_message(&self) -> Option<String> {
+        let elapsed = self.started.map(|s| s.elapsed()).unwrap_or_default();
+        self.retry.map(|r| r.message_at(elapsed))
     }
 
     /// Shortcut: enter the `Working…` state (`AgentStart`).
@@ -103,14 +173,19 @@ impl StatusIndicator {
         self.set(IndicatorKind::Idle, None);
     }
 
-    /// The default message for the active kind when none was supplied (`status-indicator.ts:38-100`).
+    /// The default message for the active kind when none was supplied.
+    ///
+    /// Verbatim from upstream, ASCII `...` and all: `"Working..."`
+    /// (`interactive-mode.ts:420 defaultWorkingMessage`), `"Retrying …s..."`
+    /// (`status-indicator.ts:47`), `"Compacting context..."` (`:81`), `"Summarizing branch..."`
+    /// (`:100`). cyrup spelled every one with U+2026, which is one column where pi draws three.
     fn default_message(&self) -> &'static str {
         match self.kind {
             IndicatorKind::Idle => "",
-            IndicatorKind::Working => "Working…",
-            IndicatorKind::Retry => "Retrying…",
-            IndicatorKind::Compaction => "Compacting context…",
-            IndicatorKind::BranchSummary => "Summarizing branch…",
+            IndicatorKind::Working => "Working...",
+            IndicatorKind::Retry => "Retrying...",
+            IndicatorKind::Compaction => "Compacting context...",
+            IndicatorKind::BranchSummary => "Summarizing branch...",
         }
     }
 
@@ -122,8 +197,12 @@ impl StatusIndicator {
     }
 
     /// Build the two band lines for a given `elapsed` (testable form). Idle ⇒ two blanks. Active ⇒ a
-    /// leading blank then `{spinner} {message} (<cancel> to cancel)`, spinner colored by kind, message
-    /// muted (`loader.ts:43-45`). `cancel_hint` is the live-keymap label for `app.interrupt` (§6.1).
+    /// leading blank then ` {spinner} {message} `, spinner colored by kind, message muted
+    /// (`loader.ts:43-45`, `text.ts:70-76`). `cancel_hint` is the live-keymap label for
+    /// `app.interrupt` (§6.1); it is appended for retry / compaction / branch-summary, whose upstream
+    /// constructors bake `(${keyText("app.interrupt")} to cancel)` into the message
+    /// (`status-indicator.ts:47,78,100`), and **never** for `Working`, whose constructor appends
+    /// nothing (`:29-40`, `interactive-mode.ts:2074-2080`).
     pub fn lines_at(
         &self,
         elapsed: Duration,
@@ -138,16 +217,23 @@ impl StatusIndicator {
             IndicatorKind::Retry => theme.warning_style(),
             _ => theme.accent_style(),
         };
-        let mut msg = self
-            .message
-            .clone()
-            .unwrap_or_else(|| self.default_message().to_string());
-        if let Some(hint) = cancel_hint {
+        let mut msg = match (self.retry, &self.message) {
+            (Some(retry), _) => retry.message_at(elapsed),
+            (None, Some(m)) => m.clone(),
+            (None, None) => self.default_message().to_string(),
+        };
+        if let Some(hint) = cancel_hint
+            && self.kind != IndicatorKind::Working
+        {
             msg.push_str(&format!(" ({hint} to cancel)"));
         }
         let line = Line::from(vec![
-            Span::styled(format!("{spinner} "), spinner_style),
+            // `Loader extends Text` with `paddingX = 1` (`loader.ts:35`), so `Text.render` emits
+            // `leftMargin + line + rightMargin` (`text.ts:70,76`). The band was starting at column 0,
+            // one column out of alignment with every other component.
+            Span::styled(format!(" {spinner} "), spinner_style),
             Span::styled(msg, theme.muted_style()),
+            Span::styled(" ", theme.muted_style()),
         ]);
         vec![Line::default(), line]
     }

@@ -57,7 +57,9 @@ use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
 use crate::extension_editor::ExtensionEditorSelector;
 use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
-use crate::keymap::{Action, EditorAction, Key, Keymap, SelectKeymap, TreeKeymap};
+use crate::keymap::{
+    Action, EditorAction, Key, Keymap, SelectAction, SelectKeymap, TreeKeymap,
+};
 use crate::login_dialog::{
     notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginUiMsg,
     TuiAuthInteraction,
@@ -421,10 +423,16 @@ struct PendingTreeNav {
 impl AppState {
     /// Fresh state with the given theme.
     pub fn new(theme: UiTheme) -> Self {
+        // `if (areExperimentalFeaturesEnabled()) statsParts.push(… "xp" …)` (`footer.ts:162-164`).
+        // Upstream re-reads `process.env.PI_EXPERIMENTAL` inside `render()`; cyrup reads it once
+        // here, which is the only production writer of the flag — `set_experimental` had no caller
+        // outside a test, so the `• xp` marker was unreachable however the user launched.
+        let mut status = StatusLine::default();
+        status.set_experimental(crate::status::experimental_features_enabled());
         AppState {
             transcript: TranscriptView::new(),
             editor: InputEditor::new(),
-            status: StatusLine::default(),
+            status,
             indicator: StatusIndicator::new(),
             color_mode: theme.color_mode,
             theme,
@@ -1502,8 +1510,11 @@ impl<B: Backend> App<B> {
             Dispatch::Command { name, arg } => self.run_command(&name, arg),
             Dispatch::Bash { command, excluded } => {
                 // Open the live bash block (`bash-execution.ts`) and hand the spawn to the run loop.
-                let cancel = self.state.keymap.key_label(Action::Interrupt);
-                let expand = self.state.keymap.key_label(Action::ToolsExpand);
+                // Both labels are `keyText`-shaped upstream — `Running... (${keyText(…)} to cancel)`
+                // (`bash-execution.ts:59`) and `keyHint("app.tools.expand", …)` (`:180`, `:184`) —
+                // so they join every bound key (`keybinding-hints.ts:29-36`).
+                let cancel = self.state.keymap.keys_label(Action::Interrupt);
+                let expand = self.state.keymap.keys_label(Action::ToolsExpand);
                 self.state.transcript.start_bash(command.clone(), excluded, cancel, expand);
                 AppAction::RunBash { command, excluded }
             }
@@ -2524,7 +2535,7 @@ impl<B: Backend> App<B> {
             self.state.branch_summary_in_flight = true;
             self.state
                 .indicator
-                .set(IndicatorKind::BranchSummary, Some("Summarizing branch…".to_string()));
+                .set(IndicatorKind::BranchSummary, Some("Summarizing branch...".to_string()));
         }
         let session = session.clone();
         tokio::spawn(async move {
@@ -3817,9 +3828,17 @@ impl<B: Backend> App<B> {
             return;
         }
         // Show the bordered loader in the editor slot while gh runs (Pi's `BorderedLoader`).
+        // `keyHint("tui.select.cancel", "cancel")` (`bordered-loader.ts:36`) — the SELECT-tier
+        // action, and `keyText` joins every bound key with `/` (`keybinding-hints.ts:29-36`), so the
+        // stock hint reads `escape/ctrl+c cancel`. This used `Keymap::key_label(Action::Interrupt)`,
+        // a different action resolved to its FIRST key only, which both named the wrong binding and
+        // silently hid the second key the user can actually press.
         self.state.loader = Some(crate::chrome::BorderedLoader::cancellable(
-            "Creating gist…",
-            self.state.keymap.key_label(Action::Interrupt).unwrap_or_else(|| "esc".into()),
+            "Creating gist...",
+            self.state
+                .select_keymap
+                .keys_label(SelectAction::Cancel)
+                .unwrap_or_else(|| "escape/ctrl+c".into()),
         ));
         let result = Command::new("gh")
             .args(["gist", "create", "--public=false"])
@@ -3890,6 +3909,70 @@ impl<B: Backend> App<B> {
     ) {
         let rendered = extension_render(ext_host, ev).await;
         self.ingest_event_rendered(ev, rendered);
+    }
+
+    /// The run loop's per-event fold: [`Self::ingest_event_with_extensions`], then the footer's
+    /// session-derived context segment ([`Self::refresh_context_usage`]).
+    ///
+    /// This is the whole of what pi's `render()` does for the footer for free — it calls
+    /// `this.session.getContextUsage()` on every frame (`footer.ts:108`). cyrup's fold is sync and
+    /// cannot `await` the session, so the refresh is hoisted here, to the one place that both holds
+    /// the session and already runs per event.
+    pub async fn ingest_session_event(
+        &mut self,
+        ev: &AgentSessionEvent,
+        session: &Arc<AgentSession>,
+    ) {
+        let ext_host = session.services().ext_host.clone();
+        self.ingest_event_with_extensions(ev, &ext_host).await;
+        // `autoCompactionEnabled` is a plain `bool` read with no session walk behind it, and
+        // upstream's THIRD `setAutoCompactEnabled` call site is a settings toggle rather than a turn
+        // event (`interactive-mode.ts:4417-4419`), so it must not ride the six-event predicate that
+        // gates the (much more expensive) context recompute below.
+        self.refresh_auto_compact(session);
+        if context_usage_may_have_moved(ev) {
+            self.refresh_context_usage(session).await;
+        }
+    }
+
+    /// Re-read `getContextUsage()` off the live session into the footer (`footer.ts:106-111`), plus
+    /// [`Self::refresh_auto_compact`].
+    ///
+    /// The three answers map straight onto [`StatusLine::set_context_usage`]; `percent` is a 0-100
+    /// percentage session-side and a fraction footer-side, hence the `/ 100.0`.
+    ///
+    /// **The ` (auto)` suffix does not belong to this method alone.** Upstream sets it from three
+    /// places — construction (`interactive-mode.ts:572`), a runtime-settings reapply (`:1902`) and
+    /// the `/settings` auto-compaction toggle's `onAutoCompactChange` callback (`:4417-4419`) — and
+    /// only the first two are turn-shaped. cyrup has no auto-compaction row in its settings selector
+    /// today (`AgentSession::set_auto_compaction_enabled` is reached only from the RPC mode and the
+    /// `SessionCommand` seam), so there is no toggle site to wire; when one is added it must call
+    /// [`Self::refresh_auto_compact`] directly, exactly as `onAutoCompactChange` does. Until then the
+    /// per-event refresh in [`Self::ingest_session_event`] picks up any out-of-band change.
+    pub async fn refresh_context_usage(&mut self, session: &Arc<AgentSession>) {
+        self.refresh_auto_compact(session);
+        match session.stats_context_usage().await {
+            Some(usage) => self.state.status.set_context_usage(
+                usage.percent.map(|p| p / 100.0),
+                Some(usage.context_window),
+                session.auto_compaction_enabled(),
+            ),
+            None => self.state.status.set_context_usage(
+                None,
+                None,
+                session.auto_compaction_enabled(),
+            ),
+        }
+    }
+
+    /// `this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled)` — the ` (auto)`
+    /// suffix on the footer's context segment, on its own (`interactive-mode.ts:572`, `:1902`,
+    /// `:4418`).
+    ///
+    /// Sync and cheap: `auto_compaction_enabled()` is an override-or-default `bool` read, no session
+    /// walk. Any future auto-compaction toggle in cyrup's settings selector calls THIS.
+    pub fn refresh_auto_compact(&mut self, session: &Arc<AgentSession>) {
+        self.state.status.set_auto_compact(session.auto_compaction_enabled());
     }
 
     fn ingest_event_rendered(&mut self, ev: &AgentSessionEvent, rendered: Option<String>) {
@@ -4010,11 +4093,11 @@ impl<B: Backend> App<B> {
                 // "Context overflow detected, " when the overflow path triggered it (item #9). The
                 // ` (<key> to cancel)` suffix is appended by the band from the live keymap.
                 let msg = match reason {
-                    CompactionReason::Manual => "Compacting context…".to_string(),
+                    CompactionReason::Manual => "Compacting context...".to_string(),
                     CompactionReason::Overflow => {
-                        "Context overflow detected, Auto-compacting…".to_string()
+                        "Context overflow detected, Auto-compacting...".to_string()
                     }
-                    CompactionReason::Threshold => "Auto-compacting…".to_string(),
+                    CompactionReason::Threshold => "Auto-compacting...".to_string(),
                 };
                 self.state.indicator.set(IndicatorKind::Compaction, Some(msg.clone()));
                 self.state.transcript.push_status(msg);
@@ -4029,13 +4112,15 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_status("compaction complete");
             }
             AgentSessionEvent::AutoRetryStart { attempt, max_attempts, delay_ms, .. } => {
-                // Pi's exact retry copy (status-indicator.ts:46-47): "Retrying (a/max) in Ns…" where
-                // N is the backoff delay in whole seconds, rounded up (item #9). The ` (<key> to
-                // cancel)` suffix is appended by the band from the live keymap.
-                let seconds = delay_ms.div_ceil(1000);
-                let msg = format!("Retrying ({attempt}/{max_attempts}) in {seconds}s…");
-                self.state.indicator.set(IndicatorKind::Retry, Some(msg.clone()));
-                self.state.transcript.push_status(msg);
+                // Pi's exact retry copy (status-indicator.ts:46-47): `Retrying (a/max) in Ns...`,
+                // where N starts at `Math.ceil(delayMs / 1000)` and is then re-set every second by a
+                // `CountdownTimer` (`:55-64`, `countdown-timer.ts:21-30`). `set_retry` owns that
+                // countdown; formatting the message here would freeze N for the whole backoff. The
+                // ` (<key> to cancel)` suffix is appended by the band from the live keymap.
+                self.state.indicator.set_retry(*attempt, *max_attempts, *delay_ms);
+                if let Some(msg) = self.state.indicator.retry_message() {
+                    self.state.transcript.push_status(msg);
+                }
             }
             AgentSessionEvent::SummarizationRetryScheduled {
                 attempt,
@@ -4047,26 +4132,26 @@ impl<B: Backend> App<B> {
                 // compaction/branch indicator for the same `RetryStatusIndicator` the turn-level
                 // auto-retry uses, so a compacting session shows a countdown rather than hanging.
                 self.state.transcript.push_error(error_message.clone());
-                let seconds = delay_ms.div_ceil(1000);
-                let msg = format!("Retrying ({attempt}/{max_attempts}) in {seconds}s…");
-                self.state.indicator.set(IndicatorKind::Retry, Some(msg.clone()));
-                self.state.transcript.push_status(msg);
+                self.state.indicator.set_retry(*attempt, *max_attempts, *delay_ms);
+                if let Some(msg) = self.state.indicator.retry_message() {
+                    self.state.transcript.push_status(msg);
+                }
             }
             AgentSessionEvent::SummarizationRetryAttemptStart { source } => {
                 // Pi `interactive-mode.ts:3231-3240`: clear the retry indicator and RECREATE the
                 // underlying one from `source` — that is the only reason the event carries it.
                 let (kind, msg) = match source {
                     SummarizationRetrySource::BranchSummary => {
-                        (IndicatorKind::BranchSummary, "Summarizing branch…".to_string())
+                        (IndicatorKind::BranchSummary, "Summarizing branch...".to_string())
                     }
                     SummarizationRetrySource::Compaction { reason } => (
                         IndicatorKind::Compaction,
                         match reason {
-                            CompactionReason::Manual => "Compacting context…".to_string(),
+                            CompactionReason::Manual => "Compacting context...".to_string(),
                             CompactionReason::Overflow => {
-                                "Context overflow detected, Auto-compacting…".to_string()
+                                "Context overflow detected, Auto-compacting...".to_string()
                             }
-                            CompactionReason::Threshold => "Auto-compacting…".to_string(),
+                            CompactionReason::Threshold => "Auto-compacting...".to_string(),
                         },
                     ),
                 };
@@ -4229,6 +4314,25 @@ impl<B: Backend> App<B> {
             _ => {}
         }
     }
+}
+
+/// Whether `ev` can have moved `getContextUsage()`'s answer, and so needs a footer refresh.
+///
+/// Upstream recomputes the segment on every frame, so this predicate exists only to keep cyrup from
+/// walking the session's entries on events that provably cannot change it (a keystroke echo, a
+/// status line). The answer is a function of the branch's last assistant `usage`, the latest
+/// compaction on that branch, and the model's context window — so: a finished message, the end of a
+/// turn, a compaction, a model swap, and a session replacement.
+fn context_usage_may_have_moved(ev: &AgentSessionEvent) -> bool {
+    matches!(
+        ev,
+        AgentSessionEvent::MessageEnd { .. }
+            | AgentSessionEvent::AgentEnd { .. }
+            | AgentSessionEvent::CompactionEnd { .. }
+            | AgentSessionEvent::ModelChanged { .. }
+            | AgentSessionEvent::SessionStart { .. }
+            | AgentSessionEvent::SessionReplaced { .. }
+    )
 }
 
 /// The notice shown under an assistant turn that stopped on `length`, verbatim from Pi v0.84.1
@@ -5033,13 +5137,21 @@ fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 6] {
     remaining = remaining.saturating_sub(band);
     let images = want_images.min(remaining);
     remaining = remaining.saturating_sub(images);
-    // The message region = the active turn's content, plus the one startup-hint row at idle, capped
+    // The message region = the active turn's content, plus the startup-hint block at idle, capped
     // to whatever rows remain (so the inline viewport stays content-sized, not full-screen).
     let active = state.transcript.content_height(width as usize, &state.theme).min(u16::MAX as usize)
         as u16;
-    let hint = u16::from(
-        state.show_startup_hints && state.selector.is_none() && !state.transcript.has_active(),
-    );
+    // …at the block's WRAPPED height (`Text.render` wraps at `contentWidth = width - paddingX * 2`,
+    // `tui/src/components/text.ts:64-67`), so a narrow terminal reserves the extra rows the block
+    // grows into instead of clipping them off.
+    let hint = if state.show_startup_hints
+        && state.selector.is_none()
+        && !state.transcript.has_active()
+    {
+        crate::chrome::compact_hint_height(&state.theme, &state.keymap, width)
+    } else {
+        0
+    };
     let msg = active.max(hint).min(remaining);
     [msg, band, images, slot, popup, footer]
 }
@@ -5074,20 +5186,27 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     ])
     .areas(area);
     state.transcript.render(frame, msg_area, &state.theme);
-    // The compact startup-help bar (`compactInstructions`, interactive-mode.ts:697-703) occupies the
-    // bottom row of the otherwise-empty message area at startup — just above the editor — sourced from
-    // the live keymap so rebinds reflect. It is suppressed once a submission lands (`show_startup_hints`
-    // cleared) and while a selector owns the slot, so it never shifts the editor/footer geometry.
+    // The compact startup-help block (`compactInstructions` + `compactOnboarding` + `onboarding`,
+    // the startup `ExpandableText`'s collapsed body at interactive-mode.ts:936-957, framed by
+    // `Spacer(1)` at `:960-962`) occupies the bottom rows of the otherwise-empty message area at
+    // startup — just above the editor — sourced from the live keymap so rebinds reflect. It is
+    // suppressed once a submission lands (`show_startup_hints` cleared) and while a selector owns
+    // the slot, so it never shifts the editor/footer geometry. `render_compact_hints` degrades the
+    // block from its edges inward when `rows` is short of the block's wrapped height, so the hint
+    // bar itself survives down to a single row.
     if state.show_startup_hints
         && state.selector.is_none()
         && !state.transcript.has_active()
         && msg_area.height >= 1
     {
+        let rows =
+            crate::chrome::compact_hint_height(&state.theme, &state.keymap, msg_area.width)
+                .min(msg_area.height);
         let hint_row = ratatui::layout::Rect {
             x: msg_area.x,
-            y: msg_area.y.saturating_add(msg_area.height - 1),
+            y: msg_area.y.saturating_add(msg_area.height - rows),
             width: msg_area.width,
-            height: 1,
+            height: rows,
         };
         crate::chrome::render_compact_hints(frame, hint_row, &state.theme, &state.keymap);
     }
@@ -5095,7 +5214,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         render_images(frame, images_area, state);
     }
     if band_h > 0 {
-        let cancel = state.keymap.key_label(Action::Interrupt);
+        // `(${keyText("app.interrupt")} to cancel)` (`status-indicator.ts:47,78,100`) — `keyText`,
+        // so ALL bound keys joined with `/` (`keybinding-hints.ts:29-36`), not just the first.
+        let cancel = state.keymap.keys_label(Action::Interrupt);
         state.indicator.render(frame, band_area, &state.theme, cancel.as_deref());
     }
     if let Some(active) = state.selector.as_mut() {
@@ -5411,6 +5532,10 @@ impl App<CrosstermBackend<Stdout>> {
         // started with a stored Pro/Max credential already shows the marker. Refreshed again on
         // every credential change (`finish_login`, the `/logout` arm) and on session swap below.
         self.refresh_auth_snapshot(&session).await;
+        // …and, for the same reason, the context segment: upstream's `render()` reads
+        // `getContextUsage()` per frame (`footer.ts:108`), so a `/resume`d session shows its
+        // occupancy on the very first frame rather than only after the next assistant message.
+        self.refresh_context_usage(&session).await;
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
         // indicator is active, so the Braille frame advances without a timer thread and an idle
@@ -5790,8 +5915,9 @@ impl App<CrosstermBackend<Stdout>> {
                     // EXT-006: fold through the extension-aware path so a registered renderer
                     // actually draws the block (a custom message / a tool row). No renderer for the
                     // event's key ⇒ a sync pre-check short-circuits and this is the old behavior.
-                    let ext_host = session.services().ext_host.clone();
-                    self.ingest_event_with_extensions(&ev, &ext_host).await;
+                    // `ingest_session_event` adds the footer's context-usage refresh, which needs the
+                    // session this arm holds (`footer.ts:108`).
+                    self.ingest_session_event(&ev, &session).await;
                     // A rename recomputed the window title inside `ingest_event`; the OSC 0 write is
                     // this loop's (Pi `session_info_changed` → `updateTerminalTitle`, `:2900-2903`).
                     // Gated on the event kind so no other event pays for a title recomputation.
@@ -5843,6 +5969,9 @@ impl App<CrosstermBackend<Stdout>> {
                         // `auth.json`), so the cached snapshot the ` (sub)` marker answers from is
                         // re-read here for the same reason the ui sinks are re-installed.
                         self.refresh_auth_snapshot(&session).await;
+                        // …and the context segment, which is a property of the NEW branch's entries
+                        // and its model's window (`footer.ts:108-111`).
+                        self.refresh_context_usage(&session).await;
                         // The swapped-in session owns a fresh `LiveHostServices`; re-install the ui
                         // sink so a post-swap guest dialog still reaches this loop (L4 review §2.1,
                         // same re-install this run loop's `AppAction::Command` rebind mirrors from

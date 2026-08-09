@@ -149,11 +149,16 @@ impl LoginDialog {
             lines: Vec::new(),
             input: None,
             select: None,
+            // `keyHint("tui.select.cancel", "to cancel")` / `keyHint("tui.select.confirm", "to
+            // submit")` (`login-dialog.ts:141`, `:163`, `:199`, `:210`) resolve through `keyText`,
+            // which joins EVERY bound key with `/` (`keybinding-hints.ts:29-36`). The stock cancel
+            // set is `["escape", "ctrl+c"]` (`tui/src/keybindings.ts:149-152`), so the first-key
+            // `key_label` printed `esc to cancel` and silently hid the second key the user can press.
             cancel_hint: keymap
-                .key_label(SelectAction::Cancel)
-                .unwrap_or_else(|| "esc".to_string()),
+                .keys_label(SelectAction::Cancel)
+                .unwrap_or_else(|| "escape/ctrl+c".to_string()),
             confirm_hint: keymap
-                .key_label(SelectAction::Confirm)
+                .keys_label(SelectAction::Confirm)
                 .unwrap_or_else(|| "enter".to_string()),
         }
     }

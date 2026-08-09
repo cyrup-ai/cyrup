@@ -3477,7 +3477,12 @@ impl AgentSession {
     /// (`{tokens, contextWindow, percent}`, extensions/types.ts:288-294). `None` when no model /
     /// no known context window — Pi's `getContextUsage` returns `undefined` there
     /// (agent-session.ts:3165-3170).
-    async fn stats_context_usage(&self) -> Option<crate::state::StatsContextUsage> {
+    ///
+    /// Public because it is a 1:1 port of `AgentSession.getContextUsage()`, which upstream's footer
+    /// calls directly on every render (`footer.ts:108`) to build its `{pct}%/{window}` segment. The
+    /// TUI needs exactly this three-state answer — including the `percent: null` case — which the
+    /// coarser [`Self::context_usage`] (always a number) cannot express.
+    pub async fn stats_context_usage(&self) -> Option<crate::state::StatsContextUsage> {
         let usage = self.context_usage().await;
         if usage.context_window == 0 {
             return None;

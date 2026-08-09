@@ -335,7 +335,13 @@ impl Key {
             KeyCode::Enter => "enter".to_string(),
             KeyCode::Tab => "tab".to_string(),
             KeyCode::BackTab => "shift+tab".to_string(),
-            KeyCode::Esc => "esc".to_string(),
+            // Upstream's key id is the full word: `"app.interrupt": { defaultKeys: "escape" }`
+            // (v0.84.1 `coding-agent/src/core/keybindings.ts:66`), `"tui.select.cancel": {
+            // defaultKeys: ["escape", "ctrl+c"] }` (`tui/src/keybindings.ts:149-152`), and
+            // `formatKeyText` (`keybinding-hints.ts:17-27`) never abbreviates — it only splits on
+            // `/` and `+` and rewrites `alt`→`option` on darwin. So every hint reads `escape
+            // interrupt`, not `esc interrupt`. [`Key::parse`] accepts both spellings.
+            KeyCode::Esc => "escape".to_string(),
             KeyCode::Up => "up".to_string(),
             KeyCode::Down => "down".to_string(),
             KeyCode::Left => "left".to_string(),
@@ -423,10 +429,32 @@ impl Keymap {
         self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| *k).collect()
     }
 
-    /// The label of the first key bound to `action` (`esc`, `ctrl+c`), or `None` if unbound. Drives
-    /// status-band hints like `(esc to cancel)` from the live keymap (spec/tui/01 §6.1).
+    /// The label of the first key bound to `action` (`escape`, `ctrl+c`), or `None` if unbound.
+    ///
+    /// Prefer [`keys_label`](Self::keys_label) for anything the user READS: upstream's hint helpers
+    /// all funnel through `keyText`, which joins every bound key. This first-key form is for callers
+    /// that genuinely need one key.
     pub fn key_label(&self, action: Action) -> Option<String> {
         self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+    }
+
+    /// **All** keys bound to `action`, joined with `/` — Pi's `keyText`, i.e.
+    /// `formatKeys(getKeybindings().getKeys(keybinding))` = `formatKeyText(keys.join("/"))`
+    /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's
+    /// `keys.length === 0` → `""`).
+    ///
+    /// This is what every `hint(…)` / `keyHint(…)` in the startup block and the status band renders
+    /// (`interactive-mode.ts:936-946`, `status-indicator.ts:47,78,100`), so a rebind that binds two
+    /// keys shows both instead of silently hiding the second. The app-tier twin of
+    /// [`SelectKeymap::keys_label`].
+    pub fn keys_label(&self, action: Action) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
     }
 
     /// Rebind `action` to exactly `keys`, dropping any keys it was previously bound to **and** taking
@@ -501,6 +529,23 @@ impl SelectKeymap {
     /// cancel text is never hardcoded).
     pub fn key_label(&self, action: SelectAction) -> Option<String> {
         self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+    }
+
+    /// **All** keys bound to `action`, joined with `/` — Pi's `keyText`, which is
+    /// `formatKeys(getKeybindings().getKeys(keybinding))` = `formatKeyText(keys.join("/"))`
+    /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's `keys.length ===
+    /// 0` → `""`).
+    ///
+    /// This is what a `keyHint("tui.select.cancel", …)` renders: with the stock bindings
+    /// (`tui/src/keybindings.ts:149-152`) it is `escape/ctrl+c`, not just the first key.
+    pub fn keys_label(&self, action: SelectAction) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
     }
 
     /// Rebind `action` to exactly `keys`.

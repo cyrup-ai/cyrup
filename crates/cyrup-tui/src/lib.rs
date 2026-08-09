@@ -107,8 +107,9 @@ pub use drain::{
     drain_count, drain_input, drain_stdin_before_exit, InputDrain, DRAIN_IDLE, DRAIN_MAX,
 };
 pub use chrome::{
-    compact_hints, format_key_text, key_hint_line, key_hint_spans, render_compact_hints,
-    truncate_to_visual_lines, BorderedLoader, VisualTruncate,
+    compact_hint_height, compact_hints, compact_onboarding, format_key_text, key_hint_line,
+    key_hint_spans, render_compact_hints, truncate_to_visual_lines, BorderedLoader, VisualTruncate,
+    COMPACT_HINT_ROWS, STARTUP_ONBOARDING,
 };
 pub use editor::{EditorOutcome, InputEditor, VisualLine};
 pub use footer_data::{
@@ -155,7 +156,9 @@ pub use session_search::{
 pub use session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
 pub use settings_selector::{SettingRow, SettingsSelector, TrustSelector, FIELD_SEP};
 pub use startup_selector::run_startup_selector;
-pub use status::{format_tokens, StatusLine};
+pub use status::{
+    experimental_features_enabled, experimental_features_enabled_from, format_tokens, StatusLine,
+};
 pub use text_input::TextInputSelector;
 pub use tree_selector::{FilterMode, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{IndicatorKind, StatusIndicator, SPINNER_FRAMES, SPINNER_INTERVAL};
