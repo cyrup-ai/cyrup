@@ -15,7 +15,7 @@
 
 use cyrup_resources::theme::builtin_themes;
 use ratatui::crossterm::event::KeyEvent;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -73,6 +73,69 @@ pub(crate) fn title_lines(title: &str) -> Vec<Line<'static>> {
 pub(crate) fn title_wrapped_height(title: &str, width: u16) -> u16 {
     let lines = title_lines(title);
     crate::transcript::wrapped_height(&lines, usize::from(width)).min(usize::from(u16::MAX)) as u16
+}
+
+/// Carve `area` top-to-bottom into `N` stacked full-width sub-rects of the given `heights`,
+/// clamping at the bottom edge. **This is the dialog-envelope overflow model**; the doc below is
+/// the anchor every envelope render site points at, including the three that build a `Vec<Line>`
+/// and hand it to a `Paragraph` (`session_selector.rs`, `model_selector.rs`, `TrustSelector`) and
+/// so get the identical clamp from ratatui instead of from here.
+///
+/// **Not** `Layout::vertical`. Ratatui's constraint solver is free to satisfy a set of
+/// `Constraint::Length(1)` regions in any way that minimises its error terms, and when the area is
+/// shorter than their sum it picks an arbitrary subset: probing the four-region `[1,1,1,1]` stack
+/// `text_input.rs` used gives `[0,1,0,0]` at height 1 (the **title** row survives and the top rule
+/// is dropped) and `[1,1,0,1]` at height 3 (the input FIELD is dropped while the rules stay). The
+/// five-region `[1,1,Min(0),1,1]` stack `settings_selector.rs` used resolves to the HINT row alone
+/// at height 1. That is exactly the "a blank row / a hint instead of its content" shape.
+///
+/// This helper is deterministic and strictly top-priority instead: each region gets `min(want, rows
+/// still left)`. That is **exactly** what pi does to an over-tall dialog, read out of the source
+/// rather than inferred:
+///
+/// * A pi dialog component is a plain `Container` (`packages/tui/src/tui.ts:211-245`) whose
+///   `render(width)` concatenates its children's lines. It has no height input at all, so its
+///   `Spacer(1)` children (`packages/tui/src/components/spacer.ts:21-27`, one `""` per line) are
+///   emitted on **every** frame at every terminal size. Nothing in pi drops a `Spacer` because it
+///   does not fit.
+/// * The height decision happens one level up. Selectors are mounted into `editorContainer`
+///   (`interactive-mode.ts:4370-4371`), one entry of the dock `VStack` (`interactive-mode.ts:
+///   876-883`) with `shrink: 1, minSize: 3` — the direct analogue of cyrup's
+///   `region_constraints` slot (`app.rs`, `desired_height(width).clamp(3, max_editor)`). A short
+///   terminal shrinks that entry via `allocateStackSizes`
+///   (`packages/tui/src/components/stack.ts:135-153`).
+/// * `layoutComponent` then renders the component at its NATURAL height and allocates a shorter
+///   box — `const allocatedHeight = height === undefined ? lines.length : Math.max(0,
+///   Math.floor(height))` (`packages/tui/src/layout.ts:113`) — and `paintBox` paints
+///   `box.lines[offset + row - box.rect.y]` for `row` in `[rect.y, rect.y + rect.height)`
+///   (`layout.ts:307-310`), `offset` being 0 unless a `CURSOR_MARKER` sits below the window
+///   (`layout.ts:114-118`).
+///
+/// So pi keeps the **first** `allocatedHeight` lines and drops the trailing ones. Which rows exist
+/// is a strict PREFIX of the natural render, and it is stable across a resize: one row of shrink
+/// costs exactly one row. Callers therefore pass each region's NATURAL height — the same numbers
+/// their `desired_height` sums — never `area.height - fixed`, and never a "does it all fit?" gate
+/// on the blank rows.
+///
+/// Two consequences look like bugs and are not:
+///
+/// * A short `/resume` or `cyrup config` slot leads with a **blank**, because
+///   `session-selector.ts:737` and `config-selector.ts:901` put a `Spacer(1)` *above* the top
+///   `DynamicBorder`. That blank is row 0 of the natural render, hence row 0 of every prefix of it.
+///   Upstream shows the same blank.
+/// * A dialog can be too short to show any list row (an `extension-selector.ts` envelope needs five
+///   rows before `opt0` appears: `:44` `:45` `:47` `:49` come first). pi has no floor here either,
+///   and forcing one would have to drop a `Spacer` — the behaviour this note exists to remove.
+pub(crate) fn stack_rows<const N: usize>(area: Rect, heights: [u16; N]) -> [Rect; N] {
+    let mut out = [Rect { x: area.x, y: area.y, width: area.width, height: 0 }; N];
+    let mut y = area.y;
+    let bottom = area.y.saturating_add(area.height);
+    for (slot, want) in out.iter_mut().zip(heights) {
+        let height = want.min(bottom.saturating_sub(y));
+        *slot = Rect { x: area.x, y, width: area.width, height };
+        y = y.saturating_add(height);
+    }
+    out
 }
 
 /// Which first-party selector occupies the input slot (spec/tui/05 §7 `SelectorKind`). The chrome
@@ -249,6 +312,50 @@ impl SelectorKind {
     pub fn insets_rows(self) -> bool {
         self.draws_hint_row() || matches!(self, SelectorKind::Login | SelectorKind::Logout)
     }
+
+    /// Whether the pi component this kind stands in for separates its structural children with
+    /// `Spacer(1)` rows (SYS-3 / L4), and therefore whether [`ListSelector`] should draw the blank
+    /// rows of the envelope.
+    ///
+    /// Same discipline as [`Self::draws_hint_row`] and [`Self::insets_rows`]: this is a property of
+    /// the individual pi COMPONENT, never of the shared list engine. `SelectList`
+    /// (`packages/tui/src/components/select-list.ts`) emits no blank rows of its own, and the three
+    /// components that add one straight to the container draw **zero** spacers — their whole
+    /// constructor is border/list/border: `ThinkingSelectorComponent` (`thinking-selector.ts:42,66,69`),
+    /// `ShowImagesSelectorComponent` (`show-images-selector.ts:25,41,44`) and `ThemeSelectorComponent`
+    /// (`theme-selector.ts:35,58,61`). Putting the spacers in the engine would give those three a
+    /// four-row envelope pi does not draw.
+    ///
+    /// The kinds that DO get them, with the constructor lines counted:
+    ///
+    /// * `ExtensionSelectorComponent` (`extension-selector.ts:44-75`) — `DynamicBorder`(:44),
+    ///   `Spacer`(:45), title(:47), `Spacer`(:49), list(:61), `Spacer`(:62), hint(:63-73),
+    ///   `Spacer`(:74), `DynamicBorder`(:75). **Four.** Reached by [`Self::ExtensionSelect`],
+    ///   [`Self::ExtensionConfirm`], [`Self::BranchSummary`] and [`Self::LoginAuthType`].
+    /// * `OAuthSelectorComponent` (`oauth-selector.ts:68-96`) — `DynamicBorder`(:68),
+    ///   `Spacer`(:69), title(:73), `Spacer`(:74), search `Input`(:86), `Spacer`(:87), list(:91),
+    ///   `Spacer`(:93), `DynamicBorder`(:96). **Four**, but one of them (`:87`) sits under the
+    ///   search `Input` cyrup's `/login`+`/logout` list does not have yet (§6 "Search `Input` on
+    ///   `/scoped-models`, `/login`, `/logout`, `/settings`"), so only three have a row here; the
+    ///   fourth lands with the `Input`.
+    ///
+    /// [`Self::UserMessage`] (`/fork`) is deliberately NOT in this set even though
+    /// `user-message-selector.ts:122-144` has four spacers, because its envelope is a different
+    /// SHAPE — `Spacer`/title/subtitle/`Spacer`/`DynamicBorder`/`Spacer`/list/`Spacer`/
+    /// `DynamicBorder`, i.e. the header sits **above** the top rule and there is a muted subtitle
+    /// row. Bolting this flag onto it would put blank rows in places upstream does not have them;
+    /// that component needs its own row order, not this one's.
+    pub fn envelope_spacers(self) -> bool {
+        matches!(
+            self,
+            SelectorKind::ExtensionSelect
+                | SelectorKind::ExtensionConfirm
+                | SelectorKind::BranchSummary
+                | SelectorKind::LoginAuthType
+                | SelectorKind::Login
+                | SelectorKind::Logout
+        )
+    }
 }
 
 /// The routing outcome of feeding one key to the active selector (spec/tui/05 §3.1
@@ -303,6 +410,14 @@ pub trait Selector: Send {
     /// `(Ns)` once per second, exactly like `ExtensionSelectorComponent`/`ExtensionInputComponent`'s
     /// `titleText.setText` — see [`App::tick_extension_dialog_countdown`](crate::app::App).
     fn set_title(&mut self, _title: String) {}
+    /// Tell the selector how many rows the host terminal has, so a body that windows can size its
+    /// window from it. A no-op default, because only one pi component takes this input:
+    /// `ConfigSelectorComponent`, whose `terminalHeight` parameter (`config-selector.ts:888`) is
+    /// fed `ui.terminal.rows` at the construction site (`cli/config-selector.ts:47`) and becomes
+    /// `this.maxVisible = Math.max(5, (terminalHeight ?? 24) - chrome)` (`config-selector.ts:
+    /// 264-266`). Called before [`Self::desired_height`] on every frame, so a resize re-sizes the
+    /// window the way a pi restart would.
+    fn set_terminal_height(&mut self, _rows: u16) {}
     /// The current buffer text for a `Ctrl+G` external-editor round trip (Pi `app.editor.external`);
     /// `None` (the default) for every selector kind except
     /// [`crate::extension_editor::ExtensionEditorSelector`], which is the only one whose `handle` can
@@ -351,6 +466,9 @@ pub struct ListSelector {
     hints: bool,
     /// Whether to inset the body one column — OPT-IN, see [`SelectorKind::insets_rows`].
     inset: bool,
+    /// Whether to draw the envelope's `Spacer(1)` rows — OPT-IN, see
+    /// [`SelectorKind::envelope_spacers`].
+    spacers: bool,
 }
 
 impl ListSelector {
@@ -380,6 +498,7 @@ impl ListSelector {
             keymap: SelectKeymap::default(),
             hints: false,
             inset: false,
+            spacers: false,
         }
     }
 
@@ -411,6 +530,7 @@ impl ListSelector {
             keymap: SelectKeymap::default(),
             hints: false,
             inset: false,
+            spacers: false,
         }
     }
 
@@ -444,6 +564,26 @@ impl ListSelector {
         self
     }
 
+    /// **Opt in** to the envelope's `Spacer(1)` rows — see [`SelectorKind::envelope_spacers`].
+    pub fn with_spacers(mut self) -> Self {
+        self.spacers = true;
+        self
+    }
+
+    /// The number of `Spacer(1)` rows this selector's envelope adds when it is drawing them at all:
+    /// **four** with a hint row (`extension-selector.ts:45,49,62,74`), **three** without (the
+    /// `oauth-selector.ts:69,74,93` subset that does not sit under a search `Input`; its fourth,
+    /// `:87`, belongs to the `Input` cyrup has not ported).
+    fn spacer_rows(&self) -> u16 {
+        if !self.spacers {
+            0
+        } else if self.hints {
+            4
+        } else {
+            3
+        }
+    }
+
     /// Apply exactly the chrome the pi component behind `kind` draws: the hint row iff
     /// [`SelectorKind::draws_hint_row`], the one-column inset iff [`SelectorKind::insets_rows`].
     ///
@@ -457,6 +597,9 @@ impl ListSelector {
         }
         if kind.insets_rows() {
             self = self.with_inset();
+        }
+        if kind.envelope_spacers() {
+            self = self.with_spacers();
         }
         self
     }
@@ -564,19 +707,34 @@ impl Selector for ListSelector {
             .saturating_add(2)
             .saturating_add(hint_h)
             .saturating_add(title_h)
+            .saturating_add(self.spacer_rows())
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, area.width));
         let hint_h = u16::from(self.hints);
-        let [top, title_area, body, hint, bottom] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(title_h),
-            Constraint::Min(0),
-            Constraint::Length(hint_h),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        // L4/SYS-3. The envelope row order is `ExtensionSelectorComponent`'s, counted from its
+        // constructor (`extension-selector.ts:44-75`): `DynamicBorder`(:44) · `Spacer`(:45) ·
+        // title(:47) · `Spacer`(:49) · list(:61) · `Spacer`(:62) · hint(:63-73) · `Spacer`(:74) ·
+        // `DynamicBorder`(:75). `OAuthSelectorComponent` (`oauth-selector.ts:68-96`) is the same
+        // order minus the hint row (it has none) — its `:87` spacer sits under a search `Input`
+        // cyrup has not ported, so `sp_after_hint` collapses to 0 there and the count is three.
+        // `spacers` is per-kind (`SelectorKind::envelope_spacers`); thinking/show-images/theme are
+        // border/list/border upstream and keep a zero-spacer envelope.
+        //
+        // Every height below is the NATURAL one — `sp` does not depend on `area.height`, and the
+        // body gets the list's own rendered height rather than "whatever is left". `stack_rows`
+        // then clips top-first, which is what pi's layout engine does; see its doc. The previous
+        // `area.height - fixed` body made `fixed` count the hint unconditionally, so a three-row
+        // slot spent its last row on the HINT and showed no options at all — the list starved
+        // before the trailing chrome did, the exact inversion of upstream's order.
+        let sp = u16::from(self.spacers);
+        let sp_after_hint = sp.min(hint_h);
+        let body_h = self.list.rendered_height();
+        let [top, _, title_area, _, body, _, hint, _, bottom] = stack_rows(
+            area,
+            [1, sp, title_h, sp, body_h, sp, hint_h, sp_after_hint, 1],
+        );
         frame.render_widget(border_rule(top.width, theme), top);
         if let Some(title) = &self.title {
             let style = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);
@@ -825,19 +983,25 @@ impl CheckboxSelector {
 
 impl Selector for CheckboxSelector {
     fn desired_height(&self, _width: u16) -> u16 {
-        // Top rule + title + list body + footer-hint row + bottom rule.
-        self.list.rendered_height().saturating_add(4)
+        // Top rule + `Spacer` + title + `Spacer` + list body + `Spacer` + footer-hint row + bottom
+        // rule (L4/SYS-3 — see `render`).
+        self.list.rendered_height().saturating_add(7)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let [top, title_area, body, hint, bottom] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        // L4/SYS-3, `ScopedModelsSelectorComponent`'s own row order
+        // (`scoped-models-selector.ts:130-156`): `DynamicBorder`(:130) · `Spacer`(:131) ·
+        // title(:132) · subtitle(:133-135) · `Spacer`(:136) · search `Input`(:140) · `Spacer`(:141)
+        // · list(:145) · `Spacer`(:148) · footer(:154) · `DynamicBorder`(:156). **Four** spacers,
+        // but `:141`'s belongs to the search `Input` cyrup has not ported here (§6), so three land.
+        // Note this component — unlike `extension-selector.ts:74` — has NO spacer between its
+        // footer row and the bottom border, so none is drawn.
+        //
+        // Natural heights only; `stack_rows` clips top-first exactly as pi's layout engine does
+        // (see its doc). The blanks are unconditional because upstream's `Spacer` children are.
+        let body_h = self.list.rendered_height();
+        let [top, _, title_area, _, body, _, hint, bottom] =
+            stack_rows(area, [1, 1, 1, 1, body_h, 1, 1, 1]);
         frame.render_widget(border_rule(top.width, theme), top);
         let title = Span::styled(
             " Scoped Models",

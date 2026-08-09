@@ -333,15 +333,37 @@ impl Selector for SessionSelector {
     fn desired_height(&self, width: u16) -> u16 {
         let filtered = self.filtered();
         let body = self.body_lines(&UiTheme::default(), &filtered, width).len() as u16;
-        // top rule + header + search input + blank + body + hints + bottom rule.
+        // blank + top rule + blank + header + blank + search input + blank + body + hints + blank
+        // + bottom rule (L4/SYS-3 — see `render`) = body + hints + 9.
         let hints = self.hint_lines(&UiTheme::default()).len() as u16;
-        body.saturating_add(4).saturating_add(hints).saturating_add(2)
+        body.saturating_add(9).saturating_add(hints)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let filtered = self.filtered();
+        // L4/SYS-3. `SessionSelectorComponent` builds its envelope in one place —
+        // `buildBaseLayout` (`session-selector.ts:735-747`):
+        //   `Spacer`(:737) · `DynamicBorder`(:738) · `Spacer`(:739) · header(:741) ·
+        //   `Spacer`(:742) · content(:744) · `Spacer`(:745) · `DynamicBorder`(:746).
+        // **Four** spacers, and note the FIRST one sits *above* the top rule — this dialog opens
+        // with a blank row, unlike the extension/oauth/trust envelopes.
+        //
+        // The `content` child (:744) is `SessionList`, and its OWN first three lines are the search
+        // `Input`, a blank (`session-selector.ts:418-419` — `lines.push("")`, "Blank line after
+        // search") and then the rows. So cyrup's header block is the title row ALONE: the blank
+        // between it and the search input is `buildBaseLayout`'s `:742`, and the blank cyrup
+        // already drew *below* the input is `SessionList.render`'s `:419` — a different `Spacer`
+        // that does not discharge `:742`. All four of `:737`, `:739`, `:742` and `:745` are added
+        // here; only `:419` was already present.
+        //
+        // Blanks are unconditional (upstream's `Spacer` children are), and `Paragraph` clips the
+        // line vector top-first, which is what pi's layout engine does to an over-tall `Container`
+        // — see `crate::selector::stack_rows`' doc. A short slot therefore leads with `:737`'s
+        // blank, exactly as upstream does.
         let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(""));
         lines.push(border_rule_line(area.width, theme));
+        lines.push(Line::from(""));
         // Header: title (left) + Name/Sort (right, simplified single line).
         lines.push(Line::from(vec![
             Span::styled(
@@ -353,7 +375,10 @@ impl Selector for SessionSelector {
                 theme.muted_style(),
             ),
         ]));
-        // Search / rename input.
+        // `Spacer`(:742) — `buildBaseLayout` puts one between the header child and the content
+        // child, and the content child is the `SessionList` whose first line is the search input.
+        lines.push(Line::from(""));
+        // Search / rename input (`SessionList.render`, `session-selector.ts:418`).
         if let Some((_, buf)) = &self.renaming {
             lines.push(Line::from(vec![
                 Span::styled(" rename ", theme.accent_style()),
@@ -365,9 +390,12 @@ impl Selector for SessionSelector {
             spans.extend(crate::selector::search_input_spans(&self.query, self.cursor, theme));
             lines.push(Line::from(spans));
         }
+        // The blank `SessionList.render` itself pushes after the search input (`:419`).
         lines.push(Line::from(""));
         lines.extend(self.body_lines(theme, &filtered, area.width));
         lines.extend(self.hint_lines(theme));
+        // `Spacer`(:745).
+        lines.push(Line::from(""));
         lines.push(border_rule_line(area.width, theme));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
     }

@@ -298,27 +298,32 @@ impl Selector for ModelSelector {
     fn desired_height(&self, _width: u16) -> u16 {
         let filtered = self.filtered();
         let body = self.body_lines(&filtered, &UiTheme::default()).len() as u16;
-        // top rule + scope + blank + search + blank + body + bottom rule.
-        body.saturating_add(6)
+        // top rule + blank + scope + blank + search + blank + body + blank + bottom rule
+        // (L4/SYS-3 — see `render`).
+        body.saturating_add(8)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let filtered = self.filtered();
-        // Top rule → scope header → blank → search box → blank, then the windowed body + bottom rule.
-        let mut lines: Vec<Line<'static>> = vec![
-            border_rule_line(area.width, theme),
-            self.scope_line(theme),
-            Line::from(""),
-            {
-                // Search box with a visible block cursor (feature #9 "selector IME cursor").
-                let mut spans = vec![Span::styled(" ▏", theme.accent_style())];
-                spans.extend(crate::selector::search_input_spans(&self.query, self.cursor, theme));
-                spans.push(Span::styled("▏", theme.accent_style()));
-                Line::from(spans)
-            },
-            Line::from(""),
-        ];
+        // L4/SYS-3. `ModelSelectorComponent`'s child list (`model-selector.ts:92-129`):
+        //   `DynamicBorder`(:92) · `Spacer`(:93) · scope/hint `Text`(:96-104) · `Spacer`(:105) ·
+        //   search `Input`(:118) · `Spacer`(:120) · listContainer(:124) · `Spacer`(:126) ·
+        //   `DynamicBorder`(:129).
+        // **Four** spacers. cyrup already drew `:105` and `:120`; `:93` and `:126` are added here.
+        // Unconditional, because upstream's `Spacer` children are — `Paragraph` clips the vector
+        // top-first, matching pi's layout engine (see `crate::selector::stack_rows`' doc).
+        let mut lines: Vec<Line<'static>> = vec![border_rule_line(area.width, theme)];
+        lines.push(Line::from(""));
+        lines.push(self.scope_line(theme));
+        lines.push(Line::from(""));
+        // Search box with a visible block cursor (feature #9 "selector IME cursor").
+        let mut spans = vec![Span::styled(" ▏", theme.accent_style())];
+        spans.extend(crate::selector::search_input_spans(&self.query, self.cursor, theme));
+        spans.push(Span::styled("▏", theme.accent_style()));
+        lines.push(Line::from(spans));
+        lines.push(Line::from(""));
         lines.extend(self.body_lines(&filtered, theme));
+        lines.push(Line::from(""));
         lines.push(border_rule_line(area.width, theme));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
     }

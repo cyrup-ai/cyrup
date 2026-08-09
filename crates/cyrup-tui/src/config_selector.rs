@@ -20,7 +20,7 @@
 //! `cyrup-resources`/`cyrup-session-svc`.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -206,7 +206,30 @@ pub struct ConfigSelector {
     flat: Vec<Flat>,
     /// The selected index into `flat` — always kept on an `Item` when any item is visible.
     selected: usize,
+    /// How many body rows the window shows at once (Pi `ResourceList.maxVisible`,
+    /// `config-selector.ts:228,266`). See [`ConfigSelector::max_visible_for`].
+    max_visible: u16,
 }
+
+/// The non-body rows of the `cyrup config` envelope: `Spacer`(`config-selector.ts:901`),
+/// `DynamicBorder`(:902), `Spacer`(:903), header(:905), `Spacer`(:906), \[body], `Spacer`(:929),
+/// `DynamicBorder`(:930) — **seven**.
+///
+/// Upstream's own constant is 8 (`config-selector.ts:264-265`, "8 lines of chrome: top spacer + top
+/// border + spacer + header (2 lines) + spacer + bottom spacer + bottom border") because its
+/// `ConfigSelectorHeader` renders two lines (`:215-218`: the title/hint row and a scope-path row)
+/// where cyrup's renders one. Note upstream's 8 does **not** count the search `Input` and the blank
+/// under it that `ResourceList.render` itself pushes (`:396-397`), so pi's dialog overshoots the
+/// terminal by two rows; cyrup has neither row — its filter lives in the header — so seven is the
+/// exact count here rather than an approximation of pi's.
+const CHROME_ROWS: u16 = 7;
+
+/// The window floor, straight from `Math.max(5, …)` (`config-selector.ts:266`).
+const MIN_MAX_VISIBLE: u16 = 5;
+
+/// Pi's `terminalHeight ?? 24` default (`config-selector.ts:266`), applied before any host has
+/// called [`Selector::set_terminal_height`].
+const DEFAULT_TERMINAL_ROWS: u16 = 24;
 
 impl ConfigSelector {
     /// Build from the resolved resource rows (produced by the bin from a discovery pass).
@@ -219,10 +242,41 @@ impl ConfigSelector {
                 (r.scope.order(), r.base_dir.clone(), r.kind.order(), r.display_name.to_lowercase())
             })
         });
-        let mut sel = ConfigSelector { rows, order, query: String::new(), flat: Vec::new(), selected: 0 };
+        let mut sel = ConfigSelector {
+            rows,
+            order,
+            query: String::new(),
+            flat: Vec::new(),
+            selected: 0,
+            max_visible: Self::max_visible_for(DEFAULT_TERMINAL_ROWS),
+        };
         sel.flat = sel.build_flat();
         sel.selected = sel.first_item().unwrap_or(0);
         sel
+    }
+
+    /// `Math.max(5, (terminalHeight ?? 24) - chrome)` (Pi `config-selector.ts:264-266`) with
+    /// cyrup's exact [`CHROME_ROWS`].
+    ///
+    /// This is what makes the four envelope blanks reachable. Without it `desired_height` was
+    /// `flat.len() + 7` with no cap, so on any real resource set the dialog was taller than the
+    /// terminal and the host clamped the slot — costing the trailing `Spacer`/`DynamicBorder` on
+    /// every frame. Upstream never has that problem: its body is windowed to the terminal, so the
+    /// whole envelope fits whenever the terminal has at least `5 + chrome` rows.
+    fn max_visible_for(terminal_rows: u16) -> u16 {
+        terminal_rows.saturating_sub(CHROME_ROWS).max(MIN_MAX_VISIBLE)
+    }
+
+    /// The current body-window size (tests / inspection).
+    pub fn max_visible(&self) -> u16 {
+        self.max_visible
+    }
+
+    /// The body's natural row count: the flat list windowed at [`Self::max_visible`], floored at 1
+    /// for the `"No resources found"` row (Pi `config-selector.ts:399-401`).
+    fn body_rows(&self) -> u16 {
+        let total = self.flat.len().min(u16::MAX as usize) as u16;
+        total.min(self.max_visible).max(1)
     }
 
     /// Whether a resource passes the current filter (Pi `filterItems`, config-selector.ts:268-317):
@@ -322,21 +376,34 @@ impl ConfigSelector {
 }
 
 impl Selector for ConfigSelector {
+    fn set_terminal_height(&mut self, rows: u16) {
+        self.max_visible = Self::max_visible_for(rows);
+    }
+
     fn desired_height(&self, _width: u16) -> u16 {
-        // Top rule + header + body (one line per flat entry) + bottom rule; the host clamps this to
-        // the terminal height, and `render` windows within whatever slot it is given.
-        let body = self.flat.len().max(1).min(u16::MAX as usize) as u16;
-        body.saturating_add(3)
+        // Blank + top rule + blank + header + blank + body + blank + bottom rule (L4/SYS-3 — see
+        // `render`). The body term is WINDOWED at `max_visible`, exactly as upstream's is
+        // (`config-selector.ts:266` → the `startIndex`/`endIndex` slice at `:405-409`); an
+        // unbounded `flat.len()` here is what made the envelope unreachable on any realistic
+        // resource list.
+        let body = self.body_rows();
+        body.saturating_add(CHROME_ROWS)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let [top, header, body, bottom] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        // L4/SYS-3. `ConfigSelectorComponent`'s child list (`config-selector.ts:901-930`):
+        //   `Spacer`(:901) · `DynamicBorder`(:902) · `Spacer`(:903) · header(:905) ·
+        //   `Spacer`(:906) · resourceList(:926) · `Spacer`(:929) · `DynamicBorder`(:930).
+        // **Four** spacers, all four missing here, and — like `session-selector.ts:737` — the
+        // first sits *above* the top rule.
+        // Natural heights only — the blanks are unconditional, because upstream's `Spacer` children
+        // are, and the body is windowed at `max_visible` rather than sized from the leftover rows.
+        // `stack_rows` clips top-first exactly as pi's layout engine does; see its doc. On a slot
+        // too short for the whole envelope the FIRST row is the `Spacer`(:901), not the rule —
+        // upstream's is too.
+        let body_h = self.body_rows();
+        let [_, top, _, header, _, body, _, bottom] =
+            crate::selector::stack_rows(area, [1, 1, 1, 1, 1, body_h, 1, 1]);
 
         frame.render_widget(border_rule(top.width, theme), top);
 
@@ -350,7 +417,13 @@ impl Selector for ConfigSelector {
             header,
         );
 
-        let visible = body.height as usize;
+        // The window is `maxVisible` rows and NOTHING else — `startIndex`/`endIndex`
+        // (`config-selector.ts:405-409`) are computed from `this.maxVisible`, never from a box
+        // height, because upstream's `ResourceList` has no box height. Deriving it from
+        // `body.height` instead would re-centre the window as the slot shrank, so a one-row resize
+        // would scroll the list; the `Paragraph` below already clips to `body`, which is what pi's
+        // layout does one level up.
+        let visible = usize::from(self.max_visible);
         let total = self.flat.len();
         let mut lines: Vec<Line> = Vec::new();
         if total == 0 {

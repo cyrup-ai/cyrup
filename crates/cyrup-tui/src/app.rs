@@ -2701,7 +2701,13 @@ impl<B: Backend> App<B> {
             UiKind::Input => (
                 SelectorKind::ExtensionInput,
                 prompt.clone(),
-                Box::new(TextInputSelector::new(prompt, placeholder)),
+                // E6: the hint row is built from the LIVE `tui.select.*` table, so the first paint
+                // already names the user's own submit/cancel keys — upstream re-resolves `keyHint`
+                // on every render (`keybinding-hints.ts:34-44`) and so never shows stock defaults.
+                Box::new(
+                    TextInputSelector::new(prompt, placeholder)
+                        .with_keymap(&self.state.select_keymap),
+                ),
             ),
             // L4 review §3: the DEFAULT is an inline dialog (Pi's `ExtensionEditorComponent`,
             // `extension-editor.ts`), not a teardown to `$EDITOR` — `title` on `prompt`, the seed
@@ -3236,23 +3242,28 @@ impl<B: Backend> App<B> {
                 let cwd = session.services().cwd.display().to_string();
                 let saved = session.saved_trust_decision();
                 let saved_label = format_saved_trust(&saved);
-                let selected = options
-                    .iter()
-                    .position(|o| {
-                        saved.as_ref().is_some_and(|s| {
-                            s.decision.is_trusted() == o.trusted
-                                && o.saved_path.as_deref() == Some(s.path.as_path())
-                        })
+                // Pi `isSavedOption` (`trust-selector.ts:92-98`): the option whose trust flag AND
+                // saved path both match the persisted decision. `selectedIndex` falls back to 0
+                // when there is none (`Math.max(0, findIndex(...))`, `:45-48`), but the ` ✓`
+                // marker is driven by the predicate itself (`:109-110`), so keep both (S20).
+                let saved_index = options.iter().position(|o| {
+                    saved.as_ref().is_some_and(|s| {
+                        s.decision.is_trusted() == o.trusted
+                            && o.saved_path.as_deref() == Some(s.path.as_path())
                     })
-                    .unwrap_or(0);
+                });
+                let selected = saved_index.unwrap_or(0);
                 let labels: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
-                let inner: Box<dyn Selector> = Box::new(TrustSelector::new(
-                    cwd,
-                    saved_label,
-                    session.services().project_trusted,
-                    labels,
-                    selected,
-                ));
+                let inner: Box<dyn Selector> = Box::new(
+                    TrustSelector::new(
+                        cwd,
+                        saved_label,
+                        session.services().project_trusted,
+                        labels,
+                        selected,
+                    )
+                    .with_saved_index(saved_index),
+                );
                 self.open_boxed_selector(SelectorKind::Trust, inner);
             }
             C::OpenSelector(SelectorKind::Session) => {
