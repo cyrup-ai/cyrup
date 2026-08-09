@@ -184,7 +184,9 @@ fn assembled_model_and_transcript_renders_footer_model_and_active_turn() {
     // The active streaming turn renders inline in the live region.
     assert!(live.contains("I'll start by reading"), "active turn missing from live region:\n{live}");
     // Committed history is in native scrollback, not the live region (ADR-0001 / audit #1).
-    assert!(app.scrollback_text().contains("you: refactor the auth module"), "user not flushed");
+    // X1: no `you: ` label — `user-message.ts:38-58` renders the body only.
+    assert!(app.scrollback_text().contains("refactor the auth module"), "user not flushed");
+    assert!(!app.scrollback_text().contains("you:"), "invented `you: ` label in scrollback");
     assert!(!live.contains("refactor the auth module"), "committed user leaked into live region:\n{live}");
     // The editor is still present + usable beneath the active turn.
     assert!(live.contains('›'), "editor prompt missing with a transcript:\n{live}");
@@ -270,8 +272,10 @@ fn long_single_paragraph() -> String {
     para
 }
 
+/// The name says "no caret" on purpose: this test asserts the ABSENCE of `▌` (X1), so a name
+/// promising caret coverage would read as the opposite of what it checks.
 #[test]
-fn assembled_long_streaming_paragraph_shows_newest_text_and_caret_and_grows() {
+fn assembled_long_streaming_paragraph_shows_newest_text_and_grows_without_a_caret() {
     let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
     app.status_mut().set_model("anthropic/claude-opus-4-8");
     // Stream the whole paragraph as one delta (no hard newlines): one logical `Line`, many wrapped
@@ -294,10 +298,14 @@ fn assembled_long_streaming_paragraph_shows_newest_text_and_caret_and_grows() {
         live.contains("OMEGAEND"),
         "newest text (last sentence) missing from live region — PROSE-WRAP truncation:\n{live}"
     );
-    // (a) The `▌` stream caret trails the newest grapheme and is visible.
-    assert!(live.contains('▌'), "stream caret `▌` missing from live region:\n{live}");
-    // Sanity: the accent label + some earlier text render too (it is the whole paragraph, wrapped).
-    assert!(live.contains("assistant:"), "assistant label missing:\n{live}");
+    // (a) X1: pi draws NO streaming caret — the only caret in the TUI is the editor's reverse-video
+    // cell (`editor.ts:545-564`), and `git grep "▌" v0.84.1 -- packages/` finds one hit, the pupil of
+    // an eye in `examples/extensions/custom-header.ts:22`.
+    assert!(!live.contains('▌'), "invented stream caret `▌` in live region:\n{live}");
+    // X1: and no `assistant: ` label (`assistant-message.ts:104-114` is the Markdown body alone).
+    assert!(!live.contains("assistant:"), "invented assistant label:\n{live}");
+    // Sanity: earlier text renders too (it is the whole paragraph, wrapped).
+    assert!(live.contains("Sentence 1 adds"), "earlier text missing:\n{live}");
 }
 
 #[test]

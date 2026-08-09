@@ -81,12 +81,12 @@ fn custom_message_event_handles_array_content() {
 #[test]
 fn user_message_renders_as_multiline_markdown_box() {
     // The rich user-message variant (`user-message.ts`): the submitted text renders as multi-line
-    // markdown (not a single label line), keeping a `you:` accent label for legibility.
+    // markdown. X1: no `you: ` label — the block is identified by its `userMessageBg` fill (`:40`).
     let mut app = new_app();
     app.transcript_mut().push_user("# Heading\n\nFirst paragraph.\n\nSecond paragraph.");
     app.draw().unwrap();
     let out = app.scrollback_text();
-    assert!(out.contains("you: "), "user accent label committed:\n{out}");
+    assert!(!out.contains("you:"), "invented `you: ` label committed:\n{out}");
     assert!(out.contains("Heading"), "markdown heading rendered:\n{out}");
     // Multi-paragraph markdown means more than one rendered line (vs. the old single label line).
     assert!(out.contains("First paragraph"), "first paragraph rendered:\n{out}");

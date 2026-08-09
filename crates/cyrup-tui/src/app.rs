@@ -4143,8 +4143,14 @@ impl<B: Backend> App<B> {
                     }
                     CompactionReason::Threshold => "Auto-compacting...".to_string(),
                 };
-                self.state.indicator.set(IndicatorKind::Compaction, Some(msg.clone()));
-                self.state.transcript.push_status(msg);
+                // X18 — the indicator is a BAND, not a message. `interactive-mode.ts:3286-3298`
+                // `case "compaction_start"` calls `showStatusIndicator(new
+                // CompactionStatusIndicator(...))` and nothing else; `StatusIndicator` extends
+                // `Loader` (`status-indicator.ts:9-27`) and is mounted in the fixed status slot, so
+                // it disappears the moment `clearStatusIndicator` runs. cyrup was ALSO pushing the
+                // identical string into the transcript, which `insert_before` then froze into
+                // scrollback as a permanent dim `• Compacting context...` row upstream never writes.
+                self.state.indicator.set(IndicatorKind::Compaction, Some(msg));
             }
             AgentSessionEvent::CompactionEnd { .. } => {
                 // Back to working if the turn is still streaming, else idle.
@@ -4161,10 +4167,12 @@ impl<B: Backend> App<B> {
                 // `CountdownTimer` (`:55-64`, `countdown-timer.ts:21-30`). `set_retry` owns that
                 // countdown; formatting the message here would freeze N for the whole backoff. The
                 // ` (<key> to cancel)` suffix is appended by the band from the live keymap.
+                // X18 — band only, exactly as `interactive-mode.ts:3339-3347` `case
+                // "auto_retry_start"`: `showStatusIndicator(new RetryStatusIndicator(...))`, no
+                // chat write. The mirrored `• Retrying (1/3) in 30s...` row was cyrup-only, and
+                // being a snapshot of a ticking countdown it froze at whatever second it was
+                // pushed.
                 self.state.indicator.set_retry(*attempt, *max_attempts, *delay_ms);
-                if let Some(msg) = self.state.indicator.retry_message() {
-                    self.state.transcript.push_status(msg);
-                }
             }
             AgentSessionEvent::SummarizationRetryScheduled {
                 attempt,
@@ -4175,11 +4183,11 @@ impl<B: Backend> App<B> {
                 // Pi `interactive-mode.ts:3222-3229`: surface the transient error, then swap the
                 // compaction/branch indicator for the same `RetryStatusIndicator` the turn-level
                 // auto-retry uses, so a compacting session shows a countdown rather than hanging.
+                // `showError(event.errorMessage)` then `showStatusIndicator(new
+                // RetryStatusIndicator(...))` (`interactive-mode.ts:3367-3374`) — the error goes to
+                // the chat, the countdown stays in the band (X18).
                 self.state.transcript.push_error(error_message.clone());
                 self.state.indicator.set_retry(*attempt, *max_attempts, *delay_ms);
-                if let Some(msg) = self.state.indicator.retry_message() {
-                    self.state.transcript.push_status(msg);
-                }
             }
             AgentSessionEvent::SummarizationRetryAttemptStart { source } => {
                 // Pi `interactive-mode.ts:3231-3240`: clear the retry indicator and RECREATE the
@@ -5674,7 +5682,13 @@ impl App<CrosstermBackend<Stdout>> {
             };
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = spinner.tick(), if self.state.indicator.is_active() => {
+                // The live `!`/`!!` block owns a `Loader` of its own (`bash-execution.ts:55-61`)
+                // with its own `setInterval` (`loader.ts:77-80`), so its spinner animates whether or
+                // not a turn is streaming — hence the second condition (X4).
+                _ = spinner.tick(),
+                    if self.state.indicator.is_active()
+                        || self.state.transcript.bash_running() =>
+                {
                     self.draw_synchronized()?;
                 }
                 _ = dialog_countdown.tick(),

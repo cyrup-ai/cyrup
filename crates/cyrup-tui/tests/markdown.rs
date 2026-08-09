@@ -159,13 +159,14 @@ fn trim_partial_closing_fence_keeps_open_block_stable() {
 
 #[test]
 fn markdown_assistant_entry_reaches_scrollback_multiline() {
-    // A committed assistant turn with markdown lands in native scrollback as multiple lines, with the
-    // `assistant: ` label on the first line (transcript entry_lines).
+    // A committed assistant turn with markdown lands in native scrollback as multiple lines.
+    // X1: no `assistant: ` label — `assistant-message.ts:104-114` adds one `Markdown` child per text
+    // block and nothing else.
     let mut app = App::new(TestBackend::new(60, 16), UiTheme::dark()).unwrap();
     app.transcript_mut().commit_assistant(Some("## Plan\n\n- step one\n- step two".to_string()));
     app.draw().unwrap();
     let sb = app.scrollback_text();
-    assert!(sb.contains("assistant: "), "assistant label missing from scrollback:\n{sb}");
+    assert!(!sb.contains("assistant:"), "invented assistant label in scrollback:\n{sb}");
     assert!(sb.contains("Plan"), "heading missing from scrollback:\n{sb}");
     assert!(sb.contains("- step one"), "list item missing from scrollback:\n{sb}");
     assert!(sb.contains("- step two"), "second list item missing from scrollback:\n{sb}");
@@ -190,7 +191,9 @@ fn streaming_markdown_partial_renders_in_viewport() {
     }
     assert!(text.contains("Title"), "streaming heading missing from viewport:\n{text}");
     assert!(text.contains("streaming body"), "streaming body missing from viewport:\n{text}");
-    assert!(text.contains('▌'), "soft streaming cursor missing:\n{text}");
+    // X1: pi draws no streaming caret. The `▌` was cyrup-only — `git grep "▌" v0.84.1 -- packages/`
+    // finds one hit and it is the pupil of an eye in `examples/extensions/custom-header.ts:22`.
+    assert!(!text.contains('▌'), "invented soft streaming cursor:\n{text}");
 }
 
 #[test]

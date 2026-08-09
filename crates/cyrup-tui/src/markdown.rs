@@ -48,10 +48,34 @@ pub fn render_with_text_color(
     theme: &UiTheme,
     color: Option<ratatui::style::Color>,
 ) -> Vec<Line<'static>> {
+    render_with_default_style(text, width, theme, color, false)
+}
+
+/// [`render_with_text_color`] plus the `italic` leg of Pi's `defaultTextStyle`
+/// (`applyDefaultStyle`, `tui/src/components/markdown.ts:377-404`: `color` then `bold`, `italic`,
+/// `strikethrough`, `underline`, in that order). Only `color` + `italic` have a caller in
+/// coding-agent — the reasoning block, `new Markdown(thinkingBlocks.join("\n\n"), outputPad, 0,
+/// markdownTheme, { color: (t) => theme.fg("thinkingText", t), italic: true }, …)`
+/// (`assistant-message.ts:146-164`).
+///
+/// Both legs land in the same place the colour does — the plain-prose arm of
+/// [`MdRenderer::inline_style`] — because upstream reaches them only through
+/// `getDefaultInlineStyleContext()` (`markdown.ts:447-452`), which `renderToken` passes to the
+/// `paragraph`/`text` arms. `heading` builds its own context (`:470-480`) and `code` never consults
+/// one (`:520-539`), so a `## Plan` inside a thinking block keeps `mdHeading` and a fence keeps its
+/// syntax colours, exactly as upstream.
+pub fn render_with_default_style(
+    text: &str,
+    width: usize,
+    theme: &UiTheme,
+    color: Option<ratatui::style::Color>,
+    italic: bool,
+) -> Vec<Line<'static>> {
     // Tabs → 3 spaces before parse (`markdown.ts:171`).
     let prepared = text.replace('\t', "   ");
     let mut r = MdRenderer::new(width, theme);
     r.default_text = color;
+    r.default_italic = italic;
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     for ev in Parser::new_ext(&prepared, opts) {
         r.event(ev);
@@ -152,6 +176,9 @@ struct MdRenderer<'t> {
     /// Pi's `Markdown` `{ color }` option: the default foreground for plain prose runs, replacing
     /// the `text` role. `None` ⇒ the ordinary assistant/body colour.
     default_text: Option<ratatui::style::Color>,
+    /// Pi's `Markdown` `{ italic }` option — the second leg of `applyDefaultStyle`
+    /// (`markdown.ts:393-395`). Applied alongside [`Self::default_text`] on plain prose only.
+    default_italic: bool,
 }
 
 #[derive(Default)]
@@ -183,6 +210,7 @@ impl<'t> MdRenderer<'t> {
             code_buf: String::new(),
             table: None,
             default_text: None,
+            default_italic: false,
         }
     }
 
@@ -204,7 +232,9 @@ impl<'t> MdRenderer<'t> {
         } else if let Some(c) = self.default_text {
             // Pi's `{ color }` option replaces the *plain prose* foreground only
             // (`markdown.ts:377-404` `applyDefaultStyle`, reached through the inline style context).
-            Style::default().fg(c)
+            // `{ italic }` is the next line of the same function (`:393-395`) and rides along.
+            let base = Style::default().fg(c);
+            if self.default_italic { base.add_modifier(Modifier::ITALIC) } else { base }
         } else {
             self.theme.assistant_style()
         };

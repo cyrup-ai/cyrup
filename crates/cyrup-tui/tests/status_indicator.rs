@@ -251,3 +251,60 @@ fn summarization_retry_finished_clears_a_still_live_retry_band() {
         "an exhausted retry must not leave the countdown spinning forever"
     );
 }
+
+/// X18 — `interactive-mode.ts:3286-3298` (`compaction_start`) and `:3339-3347`
+/// (`auto_retry_start`) call `showStatusIndicator(...)` and nothing else. A `StatusIndicator`
+/// extends `Loader` (`status-indicator.ts:9-27`) and lives in the fixed status slot, so it vanishes
+/// on `clearStatusIndicator`. Nothing about a compaction or a retry is ever written to the message
+/// list — `showStatus` (`interactive-mode.ts:3411-3428`) exists but is called for other things
+/// (e.g. `"Auto-compaction cancelled"` at `:3313`), never for these two events.
+///
+/// cyrup was mirroring the SAME string into the transcript, which `insert_before` then froze into
+/// native scrollback as a permanent dim `• Compacting context...` / `• Retrying (1/3) in 30s...`
+/// row.
+#[test]
+fn compaction_and_retry_status_is_band_only_never_scrollback() {
+    use cyrup_session_svc::CompactionReason;
+
+    let mut app = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
+    app.ingest_event(&AgentSessionEvent::CompactionStart { reason: CompactionReason::Manual });
+    app.ingest_event(&AgentSessionEvent::AutoRetryStart {
+        attempt: 1,
+        max_attempts: 3,
+        delay_ms: 30_000,
+        error_message: "429".into(),
+    });
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(!sb.contains("Compacting context"), "compaction copy leaked to scrollback:\n{sb}");
+    assert!(!sb.contains("Retrying"), "retry copy leaked to scrollback:\n{sb}");
+    assert!(!sb.contains('•'), "status bullet row leaked to scrollback:\n{sb}");
+
+    // MIRROR: the BAND still shows it — removing the mirror must not remove the affordance.
+    let live = buf_text(&app);
+    assert!(live.contains("Retrying (1/3) in 30s"), "retry band missing:\n{live}");
+    assert_eq!(app.state().indicator.kind(), IndicatorKind::Retry);
+}
+
+/// X18, second half: `summarization_retry_scheduled` (`interactive-mode.ts:3367-3374`) is
+/// `showError(event.errorMessage)` **then** `showStatusIndicator(new RetryStatusIndicator(...))` —
+/// the error text belongs in the chat, the countdown belongs in the band.
+#[test]
+fn summarization_retry_writes_the_error_but_not_the_countdown() {
+    use cyrup_session_svc::AgentSessionEvent as Ev;
+
+    let mut app = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
+    app.ingest_event(&Ev::SummarizationRetryScheduled {
+        attempt: 2,
+        max_attempts: 3,
+        delay_ms: 5_000,
+        error_message: "summarizer overloaded".into(),
+    });
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(sb.contains("summarizer overloaded"), "the error must still reach the chat:\n{sb}");
+    assert!(!sb.contains("Retrying"), "countdown leaked to scrollback:\n{sb}");
+    assert!(buf_text(&app).contains("Retrying (2/3)"), "retry band missing");
+}

@@ -9,9 +9,12 @@
 //! process (`tokio::process`) and feeds it via [`append_output`](BashExecution::append_output) /
 //! [`set_complete`](BashExecution::set_complete), so the same logic is exercised headlessly in tests.
 
+use std::time::{Duration, Instant};
+
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
+use crate::status_indicator::StatusIndicator;
 use crate::theme::UiTheme;
 
 /// Preview-line limit when not expanded (`bash-execution.ts:19`, matches tool-execution behavior).
@@ -45,6 +48,11 @@ pub struct BashExecution {
     exit_code: Option<i32>,
     /// Whether the full output is shown (vs. the [`PREVIEW_LINES`] tail). Toggled by `Ctrl+O`.
     expanded: bool,
+    /// When the block was created — the phase anchor for the `Running...` spinner. Upstream's
+    /// `Loader` owns a `setInterval` (`loader.ts:77-80`); ratatui is immediate-mode, so the frame is
+    /// derived from elapsed time exactly as the status band does
+    /// ([`crate::status_indicator::StatusIndicator::spinner_at`]).
+    started: Instant,
 }
 
 impl BashExecution {
@@ -57,6 +65,7 @@ impl BashExecution {
             status: BashStatus::Running,
             exit_code: None,
             expanded: false,
+            started: Instant::now(),
         }
     }
 
@@ -109,14 +118,23 @@ impl BashExecution {
         }
     }
 
-    /// Mark the run finished (`setComplete`, `bash-execution.ts:98-117`): a `cancelled` run becomes
-    /// [`BashStatus::Cancelled`]; a non-zero/`None` exit code is [`BashStatus::Error`]; else
-    /// [`BashStatus::Complete`].
+    /// Mark the run finished (`setComplete`, `bash-execution.ts:98-117`).
+    ///
+    /// X17 — the classification is verbatim `bash-execution.ts:105-109`:
+    /// ```text
+    /// cancelled ? "cancelled"
+    ///           : exitCode !== 0 && exitCode !== undefined && exitCode !== null ? "error"
+    ///                                                                          : "complete"
+    /// ```
+    /// so an **absent** exit code — a signalled command, where `Option<i32>` is `None` — is
+    /// `complete`, not `error`. cyrup tested `exit_code != Some(0)`, which swept `None` into the
+    /// error arm and then rendered a bold red `  (exit ?)` row upstream never draws (there is no
+    /// `?` fallback anywhere in `bash-execution.ts`; `:192` interpolates the number directly).
     pub fn set_complete(&mut self, exit_code: Option<i32>, cancelled: bool) {
         self.exit_code = exit_code;
         self.status = if cancelled {
             BashStatus::Cancelled
-        } else if exit_code != Some(0) {
+        } else if exit_code.is_some_and(|c| c != 0) {
             BashStatus::Error
         } else {
             BashStatus::Complete
@@ -135,6 +153,19 @@ impl BashExecution {
         cancel_hint: Option<&str>,
         expand_hint: Option<&str>,
     ) -> Vec<Line<'static>> {
+        self.render_lines_at(self.started.elapsed(), width, theme, cancel_hint, expand_hint)
+    }
+
+    /// [`render_lines`](Self::render_lines) with the spinner phase supplied, so the animated frame
+    /// is deterministic in tests (the same split [`crate::status_indicator::StatusIndicator`] uses).
+    pub fn render_lines_at(
+        &self,
+        elapsed: Duration,
+        width: usize,
+        theme: &UiTheme,
+        cancel_hint: Option<&str>,
+        expand_hint: Option<&str>,
+    ) -> Vec<Line<'static>> {
         // The BORDER color is dim for a `!!` (excluded-from-context) run, bash-green otherwise — set
         // once at construction and sticky (Pi bash-execution.ts:37-44,64). The `$ command` HEADER,
         // however, is **always** bash-green (Pi's `updateDisplay` header, bash-execution.ts:138, uses
@@ -146,63 +177,115 @@ impl BashExecution {
         let mut out: Vec<Line<'static>> = Vec::new();
         out.push(Line::default());
         out.push(Line::styled(rule.clone(), border_style));
-        out.push(Line::styled(format!("$ {}", self.command), header_style));
+        // X3 — every child of `contentContainer` is a `new Text(…, 1, 0)`: the header
+        // (`bash-execution.ts:138`), the output (`:146`/`:150`) and the status block (`:202`), all
+        // at **paddingX 1**. `Text.render` lays each row out as `leftMargin + line + rightMargin`
+        // (`text.ts:70-76`), so the whole block sits one column in. cyrup had the header at column 0
+        // and everything below it at column 2 — a two-column stagger upstream does not have.
+        out.push(Line::styled(format!(" $ {}", self.command), header_style));
 
         // Collapse to the trailing [`PREVIEW_LINES`] **visual** (wrap-aware) lines, exactly like Pi's
         // `truncateToVisualLines` (`visual-truncate.ts`): wrapping each logical line to the indented
         // body width so a single long line that wraps counts as multiple preview lines (`hidden` is
         // the number of hidden VISUAL lines). Expanded shows everything.
+        //
+        // X16 — the hidden count is computed OUTSIDE the expanded branch upstream
+        // (`bash-execution.ts:131-132` runs before `:143`'s `if (this.expanded)`), which is what
+        // makes the `(… to collapse)` hint reachable at all: an expanded block still knows how many
+        // lines the collapsed form would have hidden. cyrup zeroed it when expanded, so the collapse
+        // hint was dead code that could never render.
         let body_width = width.saturating_sub(2).max(1);
-        let (visible, hidden): (Vec<String>, usize) = if self.expanded {
-            (self.output_lines.clone(), 0)
-        } else {
-            let joined = self.output_lines.join("\n");
-            let vt = crate::chrome::truncate_to_visual_lines(&joined, PREVIEW_LINES, body_width);
-            (vt.lines, vt.skipped)
-        };
-        for line in &visible {
-            out.push(Line::styled(format!("  {line}"), theme.muted_style()));
+        let joined = self.output_lines.join("\n");
+        let vt = crate::chrome::truncate_to_visual_lines(&joined, PREVIEW_LINES, body_width);
+        let hidden = vt.skipped;
+        let visible: Vec<String> =
+            if self.expanded { self.output_lines.clone() } else { vt.lines };
+        if !visible.is_empty() {
+            // X3 — the output `Text` is constructed with a **leading newline**:
+            // `new Text(`\n${displayText}`, 1, 0)` (`bash-execution.ts:146`), and the collapsed arm
+            // feeds `truncateToVisualLines` the same `` `\n${styledOutput}` `` (`:150`, `:156`).
+            // `wrapTextWithAnsi` splits on `\n` (`utils.ts:839`), so row 0 is empty — a blank row
+            // between the command and its output that cyrup never emitted.
+            out.push(Line::default());
+            for line in &visible {
+                out.push(Line::styled(format!(" {line}"), theme.muted_style()));
+            }
         }
 
         match self.status {
             BashStatus::Running => {
+                // X4 — the running row is a `Loader` (`bash-execution.ts:55-60`), not a static
+                // string. `Loader.render` is `["", ...super.render(width)]` (`loader.ts:44`), so it
+                // carries its own leading blank row; `updateDisplay` (`:83-91`) builds
+                // `` `${spinnerColorFn(frame)} ${messageColorFn(message)}` `` from `DEFAULT_FRAMES`
+                // (`:11`), and the `Text` base is `super("", 1, 0)` (`:35`) — paddingX 1.
+                //
+                // The spinner colour is the block's own `colorKey` — `dim` for a `!!`
+                // excluded-from-context run, `bashMode` otherwise (`bash-execution.ts:37`, `:57`) —
+                // and the message is `theme.fg("muted", …)` (`:58`). cyrup drew no glyph at all, so
+                // the block looked frozen for the entire command.
+                out.push(Line::default());
                 let hint = cancel_hint.unwrap_or("Esc");
-                out.push(Line::styled(format!("  Running... ({hint} to cancel)"), theme.dim_style()));
+                let spinner = StatusIndicator::spinner_at(elapsed);
+                out.push(Line::from(vec![
+                    Span::styled(format!(" {spinner} "), border_style),
+                    Span::styled(
+                        format!("Running... ({hint} to cancel)"),
+                        theme.muted_style(),
+                    ),
+                ]));
             }
             _ => {
-                let mut status_spans: Vec<Span<'static>> = Vec::new();
+                // The finished block's status rows are one `new Text(`\n${statusParts.join("\n")}`,
+                // 1, 0)` (`bash-execution.ts:202`) — so ONE leading blank for the whole group, then
+                // one row per part, each inset by 1.
+                let mut parts: Vec<Line<'static>> = Vec::new();
                 if hidden > 0 {
+                    // X16 — verbatim `bash-execution.ts:178-186`. Collapsed:
+                    // `fg("muted", `... ${n} more lines (`) + keyHint("app.tools.expand",
+                    // "to expand") + fg("muted", ")")`. Expanded: `fg("muted", "(") + keyHint(…,
+                    // "to collapse") + fg("muted", ")")`. `keyHint` is
+                    // `fg("dim", keyText) + fg("muted", ` ${description}`)`
+                    // (`keybinding-hints.ts:42-44`), which is where the two-tone split comes from.
+                    // cyrup rendered `  Ctrl+O (12 more lines, to expand)` — the key first, the
+                    // count inside the parens with the wrong word order, and the collapse form with
+                    // no parens at all.
                     let key = expand_hint.unwrap_or("Ctrl+O");
-                    let (key_label, what) = if self.expanded {
-                        (key.to_string(), "to collapse".to_string())
+                    let (lead, what) = if self.expanded {
+                        ("(".to_string(), " to collapse")
                     } else {
-                        (key.to_string(), format!("({hidden} more lines, to expand)"))
+                        (format!("... {hidden} more lines ("), " to expand")
                     };
-                    status_spans.push(Span::styled(format!("  {key_label} "), theme.dim_style()));
-                    status_spans.push(Span::styled(what, theme.muted_style()));
+                    parts.push(Line::from(vec![
+                        Span::styled(format!(" {lead}"), theme.muted_style()),
+                        Span::styled(key.to_string(), theme.dim_style()),
+                        Span::styled(what.to_string(), theme.muted_style()),
+                        Span::styled(")".to_string(), theme.muted_style()),
+                    ]));
                 }
                 match self.status {
                     BashStatus::Cancelled => {
-                        if !status_spans.is_empty() {
-                            out.push(Line::from(std::mem::take(&mut status_spans)));
-                        }
-                        out.push(Line::styled("  (cancelled)".to_string(), theme.warning_style()));
+                        parts.push(Line::styled(
+                            " (cancelled)".to_string(),
+                            theme.warning_style(),
+                        ));
                     }
                     BashStatus::Error => {
-                        if !status_spans.is_empty() {
-                            out.push(Line::from(std::mem::take(&mut status_spans)));
-                        }
-                        let code = self
-                            .exit_code
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| "?".to_string());
-                        out.push(Line::styled(format!("  (exit {code})"), theme.error_style()));
-                    }
-                    _ => {
-                        if !status_spans.is_empty() {
-                            out.push(Line::from(status_spans));
+                        // X17 — only reachable with a real non-zero code now (see `set_complete`);
+                        // upstream interpolates `this.exitCode` directly (`:192`) and has no `?`
+                        // fallback, because a `null`/`undefined` code never classifies as `error`.
+                        if let Some(code) = self.exit_code {
+                            parts.push(Line::styled(
+                                format!(" (exit {code})"),
+                                theme.error_style(),
+                            ));
                         }
                     }
+                    _ => {}
+                }
+                if !parts.is_empty() {
+                    out.push(Line::default());
+                    out.extend(parts);
                 }
             }
         }
@@ -253,6 +336,132 @@ mod tests {
         let text: Vec<String> = lines.iter().map(plain).collect();
         assert!(text.iter().any(|l| l.contains("$ ls -la")), "header: {text:?}");
         assert!(text.iter().any(|l| l.contains("Running...") && l.contains("Esc")), "{text:?}");
+    }
+
+    /// X17 — `bash-execution.ts:105-109` classifies as `"error"` only when
+    /// `exitCode !== 0 && exitCode !== undefined && exitCode !== null`, so a **signalled** command
+    /// (no exit code) is `"complete"` and draws no `(exit …)` row at all. There is no `?` fallback
+    /// anywhere in the component: `:192` interpolates `this.exitCode` directly.
+    #[test]
+    fn signalled_command_is_complete_not_error_and_draws_no_exit_badge() {
+        let theme = UiTheme::dark();
+        let mut sig = BashExecution::new("sleep 10", false);
+        sig.append_output("partial");
+        sig.set_complete(None, false);
+        assert_eq!(sig.status(), BashStatus::Complete, "a missing exit code is not an error");
+        let text: Vec<String> =
+            sig.render_lines(40, &theme, None, None).iter().map(plain).collect();
+        assert!(!text.iter().any(|l| l.contains("exit")), "invented exit badge: {text:?}");
+
+        // MIRROR: a real non-zero code still classifies as an error and still renders `(exit N)`
+        // with the number, inset one column like every other row of the block.
+        let mut err = BashExecution::new("false", false);
+        err.set_complete(Some(3), false);
+        assert_eq!(err.status(), BashStatus::Error);
+        let etext: Vec<String> =
+            err.render_lines(40, &theme, None, None).iter().map(plain).collect();
+        assert!(etext.iter().any(|l| l == " (exit 3)"), "{etext:?}");
+    }
+
+    /// X3 — every child of `contentContainer` is a `new Text(…, 1, 0)`: the header
+    /// (`bash-execution.ts:138`), the output (`:146`) and the status block (`:202`). `Text.render`
+    /// emits `leftMargin + line + rightMargin` (`text.ts:70-76`), so the whole block is inset by
+    /// exactly one column — cyrup had the header at 0 and everything under it at 2.
+    ///
+    /// X3 — the output and the status block are both built with a **leading newline**, which
+    /// `wrapTextWithAnsi` turns into an empty first row (`utils.ts:839`).
+    #[test]
+    fn block_body_is_inset_one_column_with_blank_rows_before_output_and_status() {
+        let theme = UiTheme::dark();
+        let mut b = BashExecution::new("ls", false);
+        b.append_output("alpha\nbeta");
+        b.set_complete(Some(7), false);
+        let text: Vec<String> =
+            b.render_lines(40, &theme, None, Some("Ctrl+O")).iter().map(plain).collect();
+        // [spacer, rule, header, blank, out, out, blank, (exit 7), rule]
+        assert_eq!(
+            text,
+            vec![
+                "".to_string(),
+                "─".repeat(40),
+                " $ ls".to_string(),
+                String::new(),
+                " alpha".to_string(),
+                " beta".to_string(),
+                String::new(),
+                " (exit 7)".to_string(),
+                "─".repeat(40),
+            ]
+        );
+
+        // MIRROR: with NO output there is no output blank — `bash-execution.ts:142` gates the whole
+        // output `Text` on `availableLines.length > 0`.
+        let mut empty = BashExecution::new("true", false);
+        empty.set_complete(Some(0), false);
+        let etext: Vec<String> =
+            empty.render_lines(40, &theme, None, None).iter().map(plain).collect();
+        assert_eq!(etext, vec!["".to_string(), "─".repeat(40), " $ true".to_string(), "─".repeat(40)]);
+    }
+
+    /// X4 — the running row is a `Loader` (`bash-execution.ts:55-61`), not a static string.
+    /// `Loader.render` is `["", ...super.render(width)]` (`loader.ts:44`) so it carries its own
+    /// leading blank; `updateDisplay` (`:83-91`) prefixes `${spinnerColorFn(frame)} ` from
+    /// `DEFAULT_FRAMES` (`:11`); the message is `theme.fg("muted", …)` (`bash-execution.ts:58`) and
+    /// the spinner takes the block's `colorKey` (`:37`, `:57`).
+    #[test]
+    fn running_row_draws_a_spinner_glyph_inset_one_column() {
+        use crate::status_indicator::SPINNER_FRAMES;
+        let theme = UiTheme::dark();
+        let b = BashExecution::new("sleep 1", false);
+        let lines = b.render_lines_at(Duration::from_millis(0), 40, &theme, Some("escape"), None);
+        let text: Vec<String> = lines.iter().map(plain).collect();
+        assert_eq!(text[3], "", "the Loader's own leading blank row (loader.ts:44)");
+        assert_eq!(text[4], " ⠋ Running... (escape to cancel)");
+        let row = &lines[4];
+        assert_eq!(row.spans[0].content.as_ref(), " ⠋ ");
+        assert_eq!(row.spans[0].style, theme.bash_mode_style(), "spinner takes `colorKey`");
+        assert_eq!(row.spans[1].style, theme.muted_style(), "message is `muted`");
+
+        // The glyph advances with elapsed time (`loader.ts:77-80`'s setInterval, re-derived here).
+        let later = b.render_lines_at(Duration::from_millis(240), 40, &theme, Some("escape"), None);
+        assert_eq!(plain(&later[4]), " ⠸ Running... (escape to cancel)");
+        assert!(SPINNER_FRAMES.contains(&"⠸"));
+
+        // MIRROR: a `!!` (excluded-from-context) run colours its spinner `dim`, the same `colorKey`
+        // its border uses (`bash-execution.ts:37`).
+        let excluded = BashExecution::new("secret", true);
+        let el = excluded.render_lines_at(Duration::from_millis(0), 40, &theme, None, None);
+        assert_eq!(el[4].spans[0].style, theme.dim_style());
+    }
+
+    /// X16 — `bash-execution.ts:178-186`, verbatim. Collapsed is
+    /// `fg("muted", `... ${n} more lines (`) + keyHint("app.tools.expand", "to expand") +
+    /// fg("muted", ")")`; expanded is `fg("muted", "(") + keyHint(…, "to collapse") +
+    /// fg("muted", ")")`. `keyHint` splits into `fg("dim", keyText)` + `fg("muted", " desc")`
+    /// (`keybinding-hints.ts:42-44`).
+    #[test]
+    fn expand_and_collapse_hints_match_upstream_wording() {
+        let theme = UiTheme::dark();
+        let mut b = BashExecution::new("seq 30", false);
+        for i in 1..=30 {
+            b.append_output(&format!("line{i}\n"));
+        }
+        b.set_complete(Some(0), false);
+
+        let lines = b.render_lines(40, &theme, None, Some("ctrl+o"));
+        let hint = lines.iter().find(|l| plain(l).contains("more lines")).unwrap();
+        assert_eq!(plain(hint), " ... 11 more lines (ctrl+o to expand)");
+        assert_eq!(hint.spans[0].style, theme.muted_style());
+        assert_eq!(hint.spans[1].content.as_ref(), "ctrl+o");
+        assert_eq!(hint.spans[1].style, theme.dim_style(), "keyHint's key half is `dim`");
+        assert_eq!(hint.spans[2].style, theme.muted_style(), "keyHint's description half is `muted`");
+
+        // MIRROR: the expanded form keeps its parentheses and drops the count.
+        let mut e = b.clone();
+        e.set_expanded(true);
+        let el = e.render_lines(40, &theme, None, Some("ctrl+o"));
+        let ehint = el.iter().find(|l| plain(l).contains("collapse")).unwrap();
+        assert_eq!(plain(ehint), " (ctrl+o to collapse)");
     }
 
     #[test]

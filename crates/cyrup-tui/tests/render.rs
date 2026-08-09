@@ -71,8 +71,11 @@ fn committed_entries_move_to_scrollback_and_only_active_turn_renders() {
 
     // (a) Committed user + assistant text reached the scrollback accumulator (what insert_before got).
     let sb = app.scrollback_text();
-    assert!(sb.contains("you: hello world"), "scrollback missing user line:\n{sb}");
-    assert!(sb.contains("assistant: hi there"), "scrollback missing assistant line:\n{sb}");
+    // X1: no `you: ` / `assistant: ` labels — `user-message.ts:38-58` and
+    // `assistant-message.ts:104-114` render the body alone.
+    assert!(sb.contains("hello world"), "scrollback missing user line:\n{sb}");
+    assert!(sb.contains("hi there"), "scrollback missing assistant line:\n{sb}");
+    assert!(!sb.contains("you:") && !sb.contains("assistant:"), "invented role label:\n{sb}");
 
     // (b) The live region no longer contains the committed text (it scrolled into native scrollback
     //     above the inline band, audit #1), but DOES show the active streaming turn + editor + footer.
@@ -178,8 +181,15 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
     app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();
     assert!(
-        app.scrollback_text().contains("assistant: The live stream is done"),
+        app.scrollback_text().contains("The live stream is done"),
         "terminal message not committed to scrollback:\n{}",
+        app.scrollback_text()
+    );
+    // X1: dropping `assistant: ` from the needle above only proves the BODY is there — the negative
+    // is what proves the label is gone. `assistant-message.ts:104-114` is the `Markdown` child alone.
+    assert!(
+        !app.scrollback_text().contains("assistant:"),
+        "invented assistant label in scrollback:\n{}",
         app.scrollback_text()
     );
 }
@@ -256,15 +266,24 @@ fn finalized_turn_via_events_flows_to_scrollback_and_clears_viewport() {
     let mid = live_region_text(&app);
     assert!(mid.contains("answer"), "active streaming turn missing from live region mid-turn:\n{mid}");
     assert!(!mid.contains("question?"), "committed user leaked into live region:\n{mid}");
-    assert!(app.scrollback_text().contains("you: question?"), "user not flushed to scrollback");
+    assert!(app.scrollback_text().contains("question?"), "user not flushed to scrollback");
+    // X1: the needle lost its `you: ` prefix, so assert the prefix is actually absent rather than
+    // just unasserted (`user-message.ts:38-58` has no role label).
+    assert!(
+        !app.scrollback_text().contains("you:"),
+        "invented `you: ` label in scrollback:\n{}",
+        app.scrollback_text()
+    );
 
     // AgentEnd finalizes the streaming assistant turn.
     app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
-    assert!(sb.contains("you: question?"), "user missing from scrollback:\n{sb}");
-    assert!(sb.contains("assistant: answer"), "finalized assistant missing from scrollback:\n{sb}");
+    assert!(sb.contains("question?"), "user missing from scrollback:\n{sb}");
+    assert!(sb.contains("answer"), "finalized assistant missing from scrollback:\n{sb}");
+    assert!(!sb.contains("you:"), "invented `you: ` label in scrollback:\n{sb}");
+    assert!(!sb.contains("assistant:"), "invented assistant label in scrollback:\n{sb}");
 
     let view = live_region_text(&app);
     assert!(!view.contains("answer"), "finalized assistant still in live region:\n{view}");
@@ -282,8 +301,14 @@ fn committed_entries_flush_exactly_once() {
     app.draw().unwrap();
     app.draw().unwrap();
 
-    let occurrences = app.scrollback_text().matches("you: only once").count();
+    let occurrences = app.scrollback_text().matches("only once").count();
     assert_eq!(occurrences, 1, "committed entry flushed more than once");
+    // X1: the needle used to be `you: only once`; keep the label assertion alive as a negative.
+    assert!(
+        !app.scrollback_text().contains("you:"),
+        "invented `you: ` label in scrollback:\n{}",
+        app.scrollback_text()
+    );
     assert!(app.state().transcript.pending().is_empty(), "pending buffer not drained");
 }
 
