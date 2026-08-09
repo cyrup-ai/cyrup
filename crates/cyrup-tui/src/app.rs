@@ -382,12 +382,30 @@ pub struct AppState {
     /// screen: `cancel()` fires it so a flow blocked on something other than a prompt (a callback
     /// server, a device-code poll) also unwinds. `None` whenever no login is in flight.
     login_cancel: Option<CancelToken>,
+    /// Provider ids whose STORED credential is an OAuth one — cyrup's standing copy of the half of
+    /// pi's `modelRuntime.snapshot.auth` that `isUsingOAuth` reads
+    /// (`model-runtime.ts:458-460`, pi v0.84.1: `this.snapshot.auth.get(providerId)?.type ===
+    /// "oauth"`).
+    ///
+    /// Pi can answer that question synchronously at footer-render time because the snapshot is an
+    /// in-memory map the runtime keeps warm; cyrup's equivalent read
+    /// ([`cyrup_config::login::stored_credentials`]) parses `auth.json` and is `async`, while the
+    /// footer is folded from a **sync** `&mut self` (`ingest_event_rendered`). So the map is cached
+    /// here and refreshed at exactly the points pi's own snapshot moves: session bind/swap and a
+    /// settled `/login` or `/logout` (each of which ends in `footer.invalidate()`,
+    /// `interactive-mode.ts:5449`, `:5475`). See [`App::refresh_auth_snapshot`].
+    oauth_credential_providers: std::collections::BTreeSet<String>,
 }
 
 /// Row values of the "Summarize branch?" prompt. Pi compares the returned LABELS
 /// (`summaryChoice !== "No summary"`, `=== "Summarize with custom prompt"`,
 /// `interactive-mode.ts:4767,4769`); cyrup's [`ListSelector`] carries a separate value column, so
 /// the labels stay Pi-exact for display while the routing keys stay stable.
+/// The one provider id pi's footer treats as subscription-backed regardless of how it authenticates
+/// — *"Kimi Coding is subscription-backed despite using API-key authentication"*
+/// (pi v0.84.1 `coding-agent/src/modes/interactive/components/footer.ts:138-140`).
+const KIMI_CODING_PROVIDER_ID: &str = "kimi-coding";
+
 const BRANCH_SUMMARY_NONE: &str = "none";
 const BRANCH_SUMMARY_YES: &str = "summarize";
 const BRANCH_SUMMARY_CUSTOM: &str = "custom";
@@ -453,6 +471,7 @@ impl AppState {
             login_auth_type_options: None,
             pending_login_prompt: None,
             login_cancel: None,
+            oauth_credential_providers: std::collections::BTreeSet::new(),
         }
     }
 
@@ -2029,6 +2048,100 @@ impl<B: Backend> App<B> {
         out
     }
 
+    /// Refresh the cached stored-credential kinds ([`AppState::oauth_credential_providers`]) from
+    /// the session's `AuthStore`, then recompute the footer's ` (sub)` marker.
+    ///
+    /// This is cyrup's stand-in for pi keeping `modelRuntime.snapshot.auth` warm: pi's footer reads
+    /// the map synchronously on every repaint (`isUsingOAuth`, `model-runtime.ts:458-460`), cyrup
+    /// reads `auth.json` once per credential-changing event and answers from the cache.
+    ///
+    /// A read failure leaves the previous snapshot alone rather than clearing it — an unreadable
+    /// `auth.json` is not evidence that the user logged out, and blanking the set would make the
+    /// marker flicker off on a transient error.
+    pub async fn refresh_auth_snapshot(&mut self, session: &Arc<AgentSession>) {
+        if let Ok(stored) = cyrup_config::login::stored_credentials(&session.services().auth).await
+        {
+            self.state.oauth_credential_providers = stored
+                .into_iter()
+                .filter(|(_, kind)| *kind == AuthType::Oauth)
+                .map(|(id, _)| id.as_str().to_string())
+                .collect();
+        }
+        self.refresh_subscription_marker();
+    }
+
+    /// The provider registry the subscription predicate reads — pi's `this.models.getProvider(id)`
+    /// (`model-runtime.ts:463`). Same source [`Self::build_login_inputs`] uses, so a test that
+    /// substitutes the registry through [`Self::set_login_provider_source`] substitutes it here too.
+    fn provider_oauth_strategy(
+        &self,
+        provider_id: &str,
+    ) -> Option<Arc<dyn cyrup_provider::auth::OAuthAuth>> {
+        let providers = match self.login_providers.as_deref() {
+            Some(source) => source(),
+            None => cyrup_provider::all_providers(),
+        };
+        providers
+            .iter()
+            .find(|p| p.id().as_str() == provider_id)
+            .and_then(|p| p.provider_auth())
+            .and_then(|auth| auth.oauth.clone())
+    }
+
+    /// The footer's `usingSubscription` predicate, verbatim from pi v0.84.1
+    /// `coding-agent/src/modes/interactive/components/footer.ts:138-141`:
+    ///
+    /// ```text
+    /// // Kimi Coding is subscription-backed despite using API-key authentication.
+    /// const usingSubscription = state.model
+    ///     ? state.model.provider === "kimi-coding" || this.session.modelRuntime.isUsingSubscription(state.model.provider)
+    ///     : false;
+    /// ```
+    ///
+    /// with `isUsingSubscription` expanded from `model-runtime.ts:462-464`:
+    ///
+    /// ```text
+    /// isUsingSubscription(providerId) {
+    ///     return this.isUsingOAuth(providerId) && this.models.getProvider(providerId)?.auth.oauth?.isSubscription === true;
+    /// }
+    /// ```
+    ///
+    /// **Both conjuncts are load-bearing.** `isUsingOAuth` alone — which is what pi itself called
+    /// here until v0.84.0 (`v0.83.0:footer.ts:140`) — prints ` (sub)` for a metered OAuth sign-in
+    /// such as OpenRouter; pi's v0.84.0 changelog records fixing exactly that (*"Fixed the footer
+    /// showing `(sub)` for generic OAuth/OpenID sign-ins without a known subscription"*,
+    /// `coding-agent/CHANGELOG.md:155`). And `isSubscription` alone would print ` (sub)` for an
+    /// Anthropic user paying with `ANTHROPIC_API_KEY`, since that provider carries a subscription
+    /// OAuth *strategy* whether or not the user signed in with it.
+    ///
+    /// The `kimi-coding` short-circuit is upstream's, not cyrup's: that provider is
+    /// subscription-backed while authenticating with an API key, so neither conjunct can see it.
+    fn provider_uses_subscription(&self, provider_id: &str) -> bool {
+        if provider_id == KIMI_CODING_PROVIDER_ID {
+            return true;
+        }
+        self.state.oauth_credential_providers.contains(provider_id)
+            && self
+                .provider_oauth_strategy(provider_id)
+                .is_some_and(|oauth| oauth.is_subscription())
+    }
+
+    /// Recompute the footer's ` (sub)` marker for the currently-active provider. pi has no such
+    /// method because its footer recomputes the flag on every repaint; cyrup's [`StatusLine`] is a
+    /// value struct, so the flag is pushed whenever either of its two inputs moves — the active
+    /// provider (`ModelChanged`) or the stored credentials ([`Self::refresh_auth_snapshot`]).
+    ///
+    /// No active provider ⇒ `false`, which is pi's `state.model ? … : false` (`footer.ts:139-141`).
+    fn refresh_subscription_marker(&mut self) {
+        let sub = self
+            .state
+            .status
+            .provider
+            .clone()
+            .is_some_and(|p| self.provider_uses_subscription(&p));
+        self.state.status.set_using_subscription(sub);
+    }
+
     /// The accumulated body text of the open `/login` dialog (`None` when no dialog is open) —
     /// test/inspection access to what the flow has drawn so far, the same role
     /// [`Self::active_selector_kind`] plays for the slot itself.
@@ -2278,6 +2391,26 @@ impl<B: Backend> App<B> {
         let name = &finished.provider_name;
         match &finished.result {
             Ok(()) => {
+                // The credential the flow just persisted IS the auth snapshot change pi's
+                // `completeProviderAuthentication` follows with `this.footer.invalidate()`
+                // (`interactive-mode.ts:5448-5449`), which re-answers `usingSubscription` off the
+                // now-current `snapshot.auth`. Apply the same delta to the cached map and repaint
+                // the marker, so signing in to a Pro/Max plan lights ` (sub)` on the very next
+                // frame instead of only after a restart.
+                if finished.oauth {
+                    self.state
+                        .oauth_credential_providers
+                        .insert(finished.provider_id.clone());
+                } else {
+                    // An API-key login REPLACES any stored OAuth credential for that provider
+                    // (`auth.json` holds one credential per provider), so the OAuth half of the
+                    // snapshot must drop it — otherwise switching Anthropic from Pro/Max to a
+                    // metered key would keep the ` (sub)` marker on a metered account.
+                    self.state
+                        .oauth_credential_providers
+                        .remove(&finished.provider_id);
+                }
+                self.refresh_subscription_marker();
                 // `actionLabel` (`:5183`) + `` `${actionLabel}. Credentials saved to ${getAuthPath()}` ``
                 // (`:5219`). `getAuthPath()` is `<agent_dir>/auth.json` (`env.rs:236`).
                 let action = if finished.oauth {
@@ -3322,6 +3455,14 @@ impl<B: Backend> App<B> {
                 };
                 match cyrup_config::login::logout(&*session.services().auth, &option.id).await {
                     Ok(()) => {
+                        // The credential is gone, so the auth snapshot pi's footer reads has lost
+                        // this provider (`modelRuntime.logout` updates it before the repaint at
+                        // `interactive-mode.ts:5388-5394`). Drop it here too, or ` (sub)` would
+                        // survive the logout that removed the subscription credential.
+                        self.state
+                            .oauth_credential_providers
+                            .remove(option.id.as_str());
+                        self.refresh_subscription_marker();
                         let name = &option.name;
                         // Pi's two verbatim messages (`:5157-5161`).
                         let message = if option.auth_type == AuthType::Oauth {
@@ -3963,6 +4104,12 @@ impl<B: Backend> App<B> {
                 self.state.status.set_model(label.clone());
                 // Feed the provider into the footer right cluster (`(provider)` prefix, footer.ts:191).
                 self.state.status.set_provider(Some(provider.clone()));
+                // …and re-answer `usingSubscription` for the NEW provider (`footer.ts:139-141`).
+                // pi gets this for free — `model_changed` calls `footer.invalidate()`
+                // (`interactive-mode.ts:3070`) and the flag is recomputed inside `render()`. cyrup
+                // must push it, or a `/model` switch from a subscription provider to a metered one
+                // would keep printing ` (sub)` (and vice versa).
+                self.refresh_subscription_marker();
                 self.state.transcript.push_status(format!("model → {label}"));
             }
             AgentSessionEvent::ThinkingLevelChanged { level } => {
@@ -5258,6 +5405,12 @@ impl App<CrosstermBackend<Stdout>> {
         if let Some(title) = self.update_terminal_title() {
             write_terminal_title(&title);
         }
+        // The footer's ` (sub)` marker (`footer.ts:138-145`). pi answers it per repaint from
+        // `modelRuntime.snapshot.auth`, which the runtime has already loaded by the time the first
+        // frame draws; cyrup reads `auth.json` once, here, so the very FIRST frame of a session
+        // started with a stored Pro/Max credential already shows the marker. Refreshed again on
+        // every credential change (`finish_login`, the `/logout` arm) and on session swap below.
+        self.refresh_auth_snapshot(&session).await;
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
         // indicator is active, so the Braille frame advances without a timer thread and an idle
@@ -5685,6 +5838,11 @@ impl App<CrosstermBackend<Stdout>> {
                         if let Some(title) = self.update_terminal_title() {
                             write_terminal_title(&title);
                         }
+                        // The replacement session brings its own `AuthStore` (a `/resume` of a
+                        // session recorded under a different agent dir reads a different
+                        // `auth.json`), so the cached snapshot the ` (sub)` marker answers from is
+                        // re-read here for the same reason the ui sinks are re-installed.
+                        self.refresh_auth_snapshot(&session).await;
                         // The swapped-in session owns a fresh `LiveHostServices`; re-install the ui
                         // sink so a post-swap guest dialog still reaches this loop (L4 review §2.1,
                         // same re-install this run loop's `AppAction::Command` rebind mirrors from

@@ -444,6 +444,14 @@ impl OAuthAuth for OpenAiCodexOAuth {
         OPENAI_CODEX_OAUTH_NAME
     }
 
+    /// `isSubscription: true` — set on both the flow (pi v0.84.1
+    /// `auth/oauth/openai-codex.ts:517`) and the provider's `lazyOAuth` wrapper
+    /// (`providers/openai-codex.ts:15`). This impl is the one the provider's [`ProviderAuth`]
+    /// actually carries, so it must answer the same.
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// pi `refresh: (credential) => refreshOpenAICodexToken(credential.refresh)`
     /// (`auth/oauth/openai-codex.ts:456`) → `credentialsFromToken(await
     /// refreshAccessToken(refreshToken))` (`:399-401`).

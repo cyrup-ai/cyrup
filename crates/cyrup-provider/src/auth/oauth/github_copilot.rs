@@ -809,6 +809,11 @@ impl OAuthAuth for GitHubCopilotLogin {
         "GitHub Copilot"
     }
 
+    /// `isSubscription: true` (pi v0.84.1 `oauth/github-copilot.ts:402`) — a Copilot seat.
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// 1:1 port of `loginGitHubCopilot` (`github-copilot.ts:329-359`, wired at `:369`): prompt for
     /// an optional GitHub Enterprise domain, run the RFC 8628 device grant against that domain,
     /// exchange the resulting GitHub token for a Copilot token, accept every model policy, then

@@ -15,11 +15,37 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cyrup_core::CancelToken;
-use cyrup_ext::{ExtensionHost, HostConfig, NativeExtension};
+use cyrup_ext::{ExtensionHost, HostConfig, HostServices, NativeExtension, NotifyKind};
 use cyrup_permission_system::{PermissionSystemExtension, PERMISSION_SYSTEM_COMMAND};
+
+/// A `HostServices` backend that records every notification the extension raises, so a test can
+/// assert on the channel the HUMAN actually sees rather than on a returned string.
+///
+/// This is what a handler needing a non-Info level talks to: per the convention on
+/// `NativeExtension::execute_command`, such a handler notifies itself and returns `Ok(None)`, so the
+/// notification IS the whole observable output and asserting on it is strictly stronger than
+/// asserting on a return value the session would only have re-emitted at Info.
+#[derive(Default)]
+struct RecordingHost {
+    notifications: Mutex<Vec<(String, NotifyKind)>>,
+}
+
+impl RecordingHost {
+    fn taken(&self) -> Vec<(String, NotifyKind)> {
+        self.notifications.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+impl HostServices for RecordingHost {
+    fn notify(&self, message: &str, kind: NotifyKind) {
+        if let Ok(mut g) = self.notifications.lock() {
+            g.push((message.to_string(), kind));
+        }
+    }
+}
 
 /// `<agent_dir>/cyrup-permission-system/config.json` — `PermissionSystemExtension::config_path_for`.
 fn config_path(agent_dir: &Path) -> PathBuf {
@@ -52,22 +78,30 @@ const OPERATOR_CONFIG: &str = r#"{
 
 /// Load the extension into a REAL `ExtensionHost` and run `/permission-system <args>` through
 /// `execute_native_command` — the same routing `cyrup-session-svc` performs for a slash command.
-/// Returns the handler's text output plus the live extension handle.
-async fn run_command(
+///
+/// Uses `load_native_with_services`, the route the session builder itself takes (P-1), so the
+/// extension holds a live `HostServices` backend and its notifications are observable. Returns the
+/// handler's output (`None` when it notified at its own level instead), the live extension handle,
+/// and the recorder.
+async fn run_command_observed(
     agent_dir: &Path,
     args: &str,
-) -> (String, Arc<PermissionSystemExtension>) {
+    has_ui: bool,
+) -> (Option<String>, Arc<PermissionSystemExtension>, Arc<RecordingHost>) {
     let ext = Arc::new(PermissionSystemExtension::new(
         agent_dir.to_path_buf(),
         agent_dir.to_path_buf(),
     ));
     let host = ExtensionHost::new(HostConfig {
-        has_ui: true,
+        has_ui,
         cwd: agent_dir.to_path_buf(),
         ..HostConfig::default()
     });
+    let recorder = Arc::new(RecordingHost::default());
     let as_native: Arc<dyn NativeExtension> = ext.clone();
-    host.load_native(as_native).await.expect("load native");
+    host.load_native_with_services(as_native, recorder.clone() as Arc<dyn HostServices>)
+        .await
+        .expect("load native");
 
     let out = host
         .execute_native_command(PERMISSION_SYSTEM_COMMAND, args, &CancelToken::new())
@@ -75,6 +109,20 @@ async fn run_command(
         .expect("routing must not fail")
         .expect("the `permission-system` command must be OWNED by a native extension")
         .expect("the handler must not error");
+    (out, ext, recorder)
+}
+
+/// The SPEAKING-command form: the handler is expected to return text (which the session surfaces as
+/// an Info notification). Also asserts the handler raised no notification of its own — a speaking
+/// command must not ALSO notify, or the human sees the same thing twice.
+async fn run_command(agent_dir: &Path, args: &str) -> (String, Arc<PermissionSystemExtension>) {
+    let (out, ext, recorder) = run_command_observed(agent_dir, args, true).await;
+    let raised = recorder.taken();
+    assert!(
+        raised.is_empty(),
+        "a command that returns text must not ALSO notify — the session already surfaces the \
+         return value, so doing both double-prints: {raised:?}"
+    );
     (out.expect("the handler returns text output"), ext)
 }
 
@@ -183,11 +231,38 @@ async fn a_refused_save_leaves_yolo_mode_off_in_memory_and_on_disk() {
     let corrupt = "{\n  \"yoloMode\": false,\n  \"operatorNotes\": \"do not clobber\"\n";
     write_config(agent_dir.path(), corrupt);
 
-    let (out, ext) = run_command(agent_dir.path(), "yoloMode on").await;
+    let (out, ext, recorder) = run_command_observed(agent_dir.path(), "yoloMode on", true).await;
 
+    // The refusal is reported through the ERROR notification, not the return value: a save failure
+    // needs `NotifyKind::Error`, which the `Ok(Some(String))` channel cannot express (it is always
+    // surfaced as Info), so the handler notifies itself and returns `Ok(None)`. Asserting here is
+    // strictly stronger than the old assertion on the returned string — this is the channel the
+    // human actually sees, and it now also pins the LEVEL.
+    let raised = recorder.taken();
+    assert_eq!(raised.len(), 1, "a refused save raises exactly ONE notification: {raised:?}");
+    assert_eq!(
+        raised[0].1,
+        NotifyKind::Error,
+        "a refused save is an ERROR, not an Info toast: {raised:?}"
+    );
     assert!(
-        out.contains("YOLO mode is unchanged (off)"),
-        "a refused save must report the value STILL in effect: {out}"
+        raised[0].0.contains("YOLO mode is unchanged (off)"),
+        "a refused save must report the value STILL in effect: {raised:?}"
+    );
+    // ...and the same one notification carries the WHY (the raw save error) alongside the what, so
+    // the human is not told "it failed" in one toast and "here is why" in another.
+    assert!(
+        raised[0].0.contains("Config file:"),
+        "the error names the config file it could not write: {raised:?}"
+    );
+    assert!(
+        raised[0].0.lines().count() >= 3,
+        "the single error carries the summary, the path, AND the raw cause: {raised:?}"
+    );
+    assert!(
+        out.is_none(),
+        "the handler must return Ok(None) after notifying at Error — returning the sentence too \
+         would re-surface it as a second, Info-level toast: {out:?}"
     );
     assert!(
         !ext.yolo_mode(),
@@ -208,27 +283,29 @@ async fn without_a_ui_the_command_declines_and_writes_nothing() {
     write_config(agent_dir.path(), OPERATOR_CONFIG);
     let before = std::fs::read_to_string(config_path(agent_dir.path())).unwrap();
 
-    let ext = Arc::new(PermissionSystemExtension::new(
-        agent_dir.path().to_path_buf(),
-        agent_dir.path().to_path_buf(),
-    ));
-    let host = ExtensionHost::new(HostConfig {
-        has_ui: false,
-        cwd: agent_dir.path().to_path_buf(),
-        ..HostConfig::default()
-    });
-    let as_native: Arc<dyn NativeExtension> = ext.clone();
-    host.load_native(as_native).await.expect("load native");
+    let (out, ext, recorder) =
+        run_command_observed(agent_dir.path(), "yoloMode on", /* has_ui */ false).await;
 
-    let out = host
-        .execute_native_command(PERMISSION_SYSTEM_COMMAND, "yoloMode on", &CancelToken::new())
-        .await
-        .expect("routing")
-        .expect("owned")
-        .expect("handler ok")
-        .expect("text");
-
-    assert!(out.contains("requires interactive TUI mode"), "handler output: {out}");
+    // Upstream chose `warning` for this refusal (`common.ts:192-195`), a level the return channel
+    // cannot express, so the handler notifies and returns `Ok(None)`. Asserting on the notification
+    // is strictly stronger than the old assertion on the returned string: it checks the channel the
+    // human sees AND that the level really is `warning`.
+    let raised = recorder.taken();
+    assert_eq!(raised.len(), 1, "the UI-less refusal raises exactly ONE notification: {raised:?}");
+    assert_eq!(
+        raised[0].1,
+        NotifyKind::Warning,
+        "upstream's level for this refusal is `warning` (common.ts:192-195): {raised:?}"
+    );
+    assert!(
+        raised[0].0.contains("requires interactive TUI mode"),
+        "notification: {raised:?}"
+    );
+    assert!(
+        out.is_none(),
+        "the handler must return Ok(None) after notifying at Warning — returning the same sentence \
+         would re-surface it as a second, Info-level toast: {out:?}"
+    );
     assert!(!ext.yolo_mode());
     assert_eq!(
         before,

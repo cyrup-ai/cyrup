@@ -4,6 +4,8 @@
 //! WIRING (all reachable in this phase, no dead primitives):
 //! - `init` registers the `intercom` tool always, and `contact_supervisor` ONLY when child-
 //!   orchestrator metadata is present (`index.ts:1162-1163`); it subscribes the lifecycle events.
+//! - `init` also registers BOTH slash commands: `/intercom` (`index.ts:2360-2363`) and
+//!   `/intercom-id` (`v0.9.2 index.ts:2365-2368`), dispatched by [`IntercomExtension::execute_command`].
 //! - `on_event(SessionStart)` spawns the connect: `ensure_broker` (re-exec the detached broker) →
 //!   `IntercomClient::connect` → stash the live client + start the inbound event loop (the outbound
 //!   waiter match + `ReplyTracker` record, `index.ts:709-764`).
@@ -51,13 +53,51 @@ use crate::ui::{ComposeOverlay, DefaultKeybindings, PlainTheme, SessionListOverl
 
 /// The `/intercom` overlay slash command (pi `pi.registerCommand("intercom", …)`, `index.ts:1877`).
 pub const INTERCOM_COMMAND: &str = "intercom";
+/// The `/intercom-id` handoff-snippet slash command
+/// (`v0.9.2 index.ts:2365-2368` — `pi.registerCommand("intercom-id", { description, handler })`).
+///
+/// VERSION-LAG, not a port bug: added upstream in **v0.8.0** (`v0.9.2 CHANGELOG.md:31`, "Added
+/// `/intercom-id` to insert a stable handoff snippet for the current session into the editor");
+/// `git grep intercom-id v0.7.0` (cyrup's ported baseline) returns nothing.
+pub const INTERCOM_ID_COMMAND: &str = "intercom-id";
 /// The width the `/intercom` session picker renders at (the session-list overlay's max width).
 const INTERCOM_OVERLAY_WIDTH: usize = crate::ui::session_list::SESSION_LIST_MAX_WIDTH;
+
+/// pi `formatIntercomContactSnippet(sessionId)` (`v0.9.2 index.ts:412-414`, 3 lines):
+///
+/// ```text
+/// return `Use pi-intercom: intercom({ action: "send", to: "${sessionId}", message: "..." })`;
+/// ```
+///
+/// `pi-intercom` → `cyrup-intercom` is the standard port rebrand (same class as `.pi/` → `.cyrup/`
+/// and [`EXTENSION_ID`]); the snippet is a hint the user pastes into a prompt so a peer agent knows
+/// how to address this session, and naming an extension that does not exist under this binary would
+/// make it wrong. The wire `protocol` string stays `pi-intercom`
+/// ([`crate::transport::protocol::PROTOCOL_NAME`]) precisely because THAT one is compatibility, not
+/// branding. Everything else — the tool name, the argument names, the literal `"..."` placeholder —
+/// is byte-for-byte upstream.
+#[must_use]
+fn format_intercom_contact_snippet(session_id: &str) -> String {
+    format!(r#"Use cyrup-intercom: intercom({{ action: "send", to: "{session_id}", message: "..." }})"#)
+}
 
 /// The extension's fixed id.
 pub const EXTENSION_ID: &str = "cyrup-intercom";
 /// The explicit opt-in flag: set truthy to attach intercom to a plain (non-child) session.
 pub const INSTALL_ENV_VAR: &str = "CYRUP_INTERCOM";
+
+/// The three context-usage fields of a `presence` frame, in the tri-state the wire has
+/// (`v0.9.2 types.ts:86`): `None` omits the key, `Some(None)` sends an explicit `null` (the broker
+/// CLEARS the field), `Some(Some(n))` sets it. Produced by
+/// [`IntercomExtension::current_context_usage`], which is the port of pi's spread-in-place
+/// `...currentContextUsage()` (`v0.9.2 index.ts:816,847`) — Rust has no object spread, so the three
+/// keys travel as one value.
+#[derive(Debug, Default)]
+struct PresenceContext {
+    pct: Option<Option<serde_json::Number>>,
+    tokens: Option<Option<serde_json::Number>>,
+    window: Option<Option<serde_json::Number>>,
+}
 
 /// The intercom native extension.
 pub struct IntercomExtension {
@@ -158,8 +198,169 @@ impl IntercomExtension {
 
     fn sync_presence(&self, base: &str) {
         if let Some(client) = self.state.client() {
-            client.update_presence(None, Some(self.presence_status(base)), None);
+            // `client.updatePresence({ status: currentStatus(), ...currentContextUsage() })`
+            // (`v0.9.2 index.ts:842-848`, 7 lines) — its own comment: "context% rides the status
+            // heartbeat so peers see live usage at turn boundaries" (`:846`).
+            let ctx_usage = self.current_context_usage();
+            client.update_presence_with_context(
+                None,
+                Some(self.presence_status(base)),
+                None,
+                ctx_usage.pct,
+                ctx_usage.tokens,
+                ctx_usage.window,
+            );
         }
+    }
+
+    /// pi `currentContextUsage()` (`v0.9.2 index.ts:790-808`, 19 lines incl. its 5-line comment):
+    ///
+    /// ```text
+    /// const usage = getLiveContext()?.getContextUsage?.();
+    /// if (!usage) return {};
+    /// const result = {
+    ///   contextPct: typeof usage.percent === "number" && Number.isFinite(usage.percent) ? Math.round(usage.percent) : null,
+    ///   contextTokens: typeof usage.tokens === "number" && Number.isFinite(usage.tokens) ? usage.tokens : null,
+    /// };
+    /// if (typeof usage.contextWindow === "number" && usage.contextWindow > 0) result.contextWindow = usage.contextWindow;
+    /// return result;
+    /// ```
+    ///
+    /// Note the two tiers, which are what the tri-state on
+    /// [`IntercomClient::update_presence_with_context`] exists to carry:
+    /// - no usage at all → **omit** all three keys (the broker leaves the peer's view untouched);
+    /// - usage present but the token count unknown → send explicit **`null`** for
+    ///   `contextPct`/`contextTokens`, which CLEARS a peer's stale value instead of freezing the
+    ///   pre-compaction percentage (upstream's own comment, `v0.9.2 index.ts:791-793`; broker side at
+    ///   `v0.9.2 broker/broker.ts:922-924`).
+    ///
+    /// # Shape mapping
+    ///
+    /// pi's `ContextUsage` is `{tokens: number|null, contextWindow: number, percent: number|null}`
+    /// (`pi v0.84.1 coding-agent/src/core/extensions/types.ts:288-294`). cyrup's
+    /// `HostServices::context_usage()` deliberately answers in cyrup's own spelling,
+    /// `{usedTokens, contextWindow, fraction}` — a KNOWN, documented divergence
+    /// (`cyrup-session-svc/src/state.rs:69-75`: "Converging those onto Pi's spelling is a separate
+    /// divergence"). It lives in another crate, so this reads that shape and translates:
+    ///
+    /// - `contextWindow == 0` ⇒ pi's `getContextUsage()` returns `undefined` outright
+    ///   (`pi v0.84.1 agent-session.ts:3178-3179`: `if (contextWindow <= 0) return undefined;`), so
+    ///   this returns "omit everything", exactly as `if (!usage) return {}` does.
+    /// - `usedTokens == 0` ⇒ pi's `tokens: null` / `percent: null`. This is not an approximation:
+    ///   cyrup's `ContextUsage::from_last_assistant` yields `used_tokens == 0` precisely when there
+    ///   is no usable assistant usage to read (`cyrup-session-svc/src/state.rs:168-180`), which is
+    ///   the same condition pi's post-compaction check tests — `contextTokens > 0` over the
+    ///   post-compaction assistants, else `{ tokens: null, contextWindow, percent: null }`
+    ///   (`pi v0.84.1 agent-session.ts:3196-3207`).
+    /// - `contextPct` is computed from `usedTokens`/`contextWindow` rather than from cyrup's
+    ///   `fraction`, because `fraction` is clamped to `[0, 1]`
+    ///   (`cyrup-session-svc/src/state.rs:164`) while pi's `percent` is not — an over-window session
+    ///   must report pi's `104`, not a clamped `100`. Integer arithmetic (`u128`) rather than f64
+    ///   both matches `Math.round`'s round-half-up on non-negative inputs exactly and avoids a
+    ///   lossy float cast.
+    fn current_context_usage(&self) -> PresenceContext {
+        let Some(services) = self.state.host_services() else {
+            return PresenceContext::default();
+        };
+        let usage = services.context_usage();
+        let Some(obj) = usage.as_object() else {
+            return PresenceContext::default();
+        };
+        // `contextWindow <= 0` ⇒ pi has no usage object at all ⇒ omit all three keys.
+        let window = obj.get("contextWindow").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        if window == 0 {
+            return PresenceContext::default();
+        }
+        let tokens = obj.get("usedTokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let (pct, tokens) = if tokens == 0 {
+            // pi `{ tokens: null, percent: null }` — send the CLEAR, do not omit.
+            (Some(None), Some(None))
+        } else {
+            let pct = u64::try_from((u128::from(tokens) * 100 + u128::from(window) / 2) / u128::from(window))
+                .unwrap_or(u64::MAX);
+            (Some(Some(serde_json::Number::from(pct))), Some(Some(serde_json::Number::from(tokens))))
+        };
+        PresenceContext { pct, tokens, window: Some(Some(serde_json::Number::from(window))) }
+    }
+
+    /// pi `insertIntoEditor(ctx, text)` (`v0.9.2 index.ts:2261-2268`, 8 lines):
+    ///
+    /// ```text
+    /// if (!ctx.hasUI) return false;
+    /// const ui = ctx.ui as { getEditorText?; setEditorText? };
+    /// if (typeof ui.setEditorText !== "function") return false;
+    /// const existing = typeof ui.getEditorText === "function" ? ui.getEditorText() : "";
+    /// ui.setEditorText(existing.trim() ? `${existing.trimEnd()}\n\n${text}` : text);
+    /// return true;
+    /// ```
+    ///
+    /// The two upstream capability probes (`ctx.hasUI`, `typeof ui.setEditorText === "function"`)
+    /// collapse to `ctx.has_ui` + "a live `HostServices` backend is bound": cyrup's trait always
+    /// *has* `set_editor_text`, but its default impl is a silent no-op
+    /// (`cyrup-ext/src/host/services.rs:250`), so an unbound backend is exactly upstream's "the host
+    /// cannot do this" case and must report `false` rather than claim an insert that went nowhere.
+    ///
+    /// `is_paste = false` is upstream's `setEditorText` (REPLACE) rather than `pasteEditorText`
+    /// (`cyrup-ext/src/host/services.rs:247-250`) — the concatenation is done here, not by the host.
+    fn insert_into_editor(&self, ctx: &HostCtx, text: &str) -> bool {
+        if !ctx.has_ui {
+            return false;
+        }
+        let Some(services) = self.state.host_services() else {
+            return false;
+        };
+        let existing = services.editor_text();
+        let next = if existing.trim().is_empty() {
+            text.to_string()
+        } else {
+            format!("{}\n\n{text}", existing.trim_end())
+        };
+        services.set_editor_text(&next, false);
+        true
+    }
+
+    /// The `/intercom-id` command body — pi `insertIntercomId(ctx)`
+    /// (`v0.9.2 index.ts:2270-2289`, 20 lines).
+    ///
+    /// Upstream connects through `ensureConnected("tool")` (`:2276`, NOT the `"overlay"` reason
+    /// `/intercom` uses) because the snippet needs this session's broker-assigned id and that id only
+    /// exists once registered; a connect failure notifies `Intercom unavailable: …` and returns
+    /// (`:2277-2280`). On success it formats the snippet, inserts it, and notifies either
+    /// `Inserted intercom contact target: <id>` (`:2285`) or — when there is no editor to insert
+    /// into — `Intercom contact target: <id>` (`:2288`), so a headless/RPC user still gets the id.
+    ///
+    /// cyrup's degrade (the port doc §4.3, the same one `/intercom` already takes): a command's
+    /// RETURN STRING is this crate's user-visible command surface, so upstream's `notifyIfLive` toast
+    /// becomes the returned text. Both upstream INFO messages are preserved verbatim, and which one
+    /// comes back is exactly upstream's insert-succeeded/insert-failed branch.
+    ///
+    /// The connect-failure path is the exception, and it follows the `Ok(None)` convention on
+    /// [`NativeExtension::execute_command`]: the session surfaces a returned string at
+    /// `NotifyKind::Info`, but upstream raises this one at `"error"` (`v0.9.2 index.ts:2279`). A
+    /// handler needing a non-Info level notifies itself and returns nothing, so the level survives.
+    /// Returning the text here instead would show a connect FAILURE as an ordinary info toast.
+    async fn run_intercom_id_command(&self, ctx: &HostCtx) -> Option<String> {
+        let client = match connect::ensure_connected(&self.state, connect::ConnectReason::Tool).await {
+            Ok(client) => client,
+            Err(e) => {
+                let message = format!("Intercom unavailable: {e}");
+                match self.state.host_services() {
+                    Some(services) => services.notify(&message, cyrup_ext::NotifyKind::Error),
+                    // No live backend (headless with no effect sink): fall back to the return
+                    // channel so the text is not lost entirely.
+                    None => return Some(message),
+                }
+                return None;
+            }
+        };
+        // `const sessionId = contactClient.sessionId; if (!sessionId ...) return;` (`:2281-2282`) —
+        // upstream returns SILENTLY here (no notify), so this yields no command output either.
+        let session_id = client.session_id()?;
+        let snippet = format_intercom_contact_snippet(&session_id);
+        if self.insert_into_editor(ctx, &snippet) {
+            return Some(format!("Inserted intercom contact target: {session_id}"));
+        }
+        Some(format!("Intercom contact target: {session_id}"))
     }
 
     /// The `/intercom` command body (pi `openIntercomOverlay`, `index.ts:1810-1874`, degraded to text
@@ -267,6 +468,17 @@ impl NativeExtension for IntercomExtension {
             INTERCOM_COMMAND,
             CommandDescriptor { description: "Open the session intercom picker / send a message".to_string(), completions: Vec::new() },
         );
+        // `/intercom-id` (`v0.9.2 index.ts:2365-2368`). Description is upstream's verbatim
+        // ("Insert a stable pi-intercom handoff snippet for this session into the editor", `:2366`)
+        // with the same `pi-intercom` → `cyrup-intercom` rebrand the snippet itself takes.
+        api.register_command(
+            INTERCOM_ID_COMMAND,
+            CommandDescriptor {
+                description: "Insert a stable cyrup-intercom handoff snippet for this session into the editor"
+                    .to_string(),
+                completions: Vec::new(),
+            },
+        );
         // Lifecycle: connect/disconnect + presence sync (never blocks/mutates a tool call).
         api.subscribe(&[
             EventKind::SessionStart,
@@ -293,11 +505,17 @@ impl NativeExtension for IntercomExtension {
         self.state.set_host_services(services);
     }
 
-    /// Dispatch the `/intercom` command (command-tier). No args → render the session picker; `<target>
-    /// <message…>` → resolve the target and send it over the broker (the port doc §4.3 degrade of pi's
-    /// interactive overlay).
+    /// Dispatch this extension's two commands (command-tier).
+    ///
+    /// - `/intercom` — no args → render the session picker; `<target> <message…>` → resolve the
+    ///   target and send it over the broker (the port doc §4.3 degrade of pi's interactive overlay).
+    /// - `/intercom-id` — insert this session's handoff snippet into the editor
+    ///   ([`Self::run_intercom_id_command`], pi `v0.9.2 index.ts:2270-2289`).
     async fn execute_command(&self, name: &str, args: &str, ctx: &HostCtx) -> Result<Option<String>, ExtError> {
         ctx.require_command_tier()?;
+        if name == INTERCOM_ID_COMMAND {
+            return Ok(self.run_intercom_id_command(ctx).await);
+        }
         if name != INTERCOM_COMMAND {
             return Err(ExtError::Component(format!("native extension has no handler for command `{name}`")));
         }

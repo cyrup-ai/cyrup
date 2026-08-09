@@ -78,6 +78,7 @@ use crate::fork_context::{
     resolve_effective_context, ContextMode, ForkContext, ForkContextResolver,
 };
 use crate::registration::doctor::{build_doctor_report, DoctorReportInput};
+use crate::registration::prompt_workflows;
 use crate::registration::slash_commands::{self, SlashCommandName, SLASH_COMMANDS};
 use crate::registration::{
     CompanionSuggestionsConfig, CompanionSuggestionsSetting, SubagentExtensionConfig,
@@ -5814,10 +5815,45 @@ impl SubagentTool {
         // finalized delivered output (`run_sync` already folded in the timeout preamble and any
         // saved-output reference), i.e. pi's `finalizedOutput.displayOutput`.
         let display_output = result.final_output.clone().unwrap_or_default();
-        let details = Some(
-            serde_json::to_value(&result)
-                .unwrap_or_else(|_| serde_json::Value::String("subagent result".to_string())),
-        );
+        // pi `runSinglePath`'s `details` (`subagent-executor.ts:3002-3013` @v0.34.0) is
+        // `compactForegroundDetails({ mode: "single", runId, results: [r], progress, … })` — the
+        // `SingleResult` is WRAPPED under `results`, and `mode`/`runId`/`context` sit beside it.
+        // This used to be `serde_json::to_value(&result)`: the bare `SingleResult` at the details
+        // ROOT, with no `mode`, no `runId` and no `results` array at all. That is a port bug at the
+        // ported baseline, and it is what left `renderSubagentResult`'s only settled branch
+        // (`tui/render.ts:1428`, keyed on `d.mode === "single" && d.results.length === 1`)
+        // permanently unreachable — a `details` shape no renderer could read.
+        //
+        // `SubagentUpdatePayload` IS that shape (`{mode, context, progress, results, …}`, its own
+        // doc already says it is attached "to every streamed `ToolUpdate` AND to its final result"),
+        // and `single_final` is the constructor written for exactly this settle, so the live C19
+        // stream and the terminal result now speak ONE wire shape instead of two.
+        //
+        // `progress` follows pi's own gate — `params.includeProgress ? allProgress : undefined`
+        // (`:3008`) — so an unasked-for progress array is not smuggled into the model's context.
+        let details = {
+            // pi `withForkContext` (`subagent-executor.ts:1596-1608`) stamps `details.context` from
+            // the CALL-SITE `params.context`, and only for `"fork"` — never from the resolved
+            // per-persona default. Mirror that exactly.
+            let details_context = if context == Some(ContextMode::Fork) {
+                ContextMode::Fork
+            } else {
+                ContextMode::Fresh
+            };
+            let mut payload = crate::tui::events::SubagentUpdatePayload::single_final(
+                details_context,
+                result.clone(),
+                crate::tui::events::LiveProgressSnapshot::from_settled_result(&result),
+            );
+            if p.include_progress != Some(true) {
+                payload.progress.clear();
+            }
+            payload.run_id = Some(run_id.clone());
+            Some(
+                serde_json::to_value(&payload)
+                    .unwrap_or_else(|_| serde_json::Value::String("subagent result".to_string())),
+            )
+        };
 
         // R-SA-123/124/125 (pi `runSinglePath`, `subagent-executor.ts:2719-2736`): pi attempts
         // out-of-band result-intercom delivery for a SINGLE run too, gated on `!detached &&
@@ -7162,6 +7198,19 @@ impl NativeExtension for SubagentsExtension {
                     wait_enabled,
                 )));
 
+                // C20 / EXT-006: this extension draws its OWN `subagent` tool rows. pi declares the
+                // same thing as `renderCall`/`renderResult` members of its `ToolDefinition`
+                // (`extension/index.ts:465,495` @v0.34.0); cyrup's native tools are already-
+                // executable `Arc<dyn Tool>` values with no descriptor, so the declaration goes
+                // through `InitApi` instead (`cyrup-ext/src/native.rs:277`). Without this the host's
+                // `has_tool_renderer("subagent")` pre-check short-circuits and
+                // `NativeExtension::render_call`/`render_result` are never called at all — which is
+                // why `tui::events::render_inline_result` had no non-test caller.
+                //
+                // Full arm ONLY, matching upstream: `fanout-child.ts`'s restricted `ToolDefinition`
+                // (`:156-168`) deliberately declares NEITHER renderer.
+                api.register_tool_renderer(TOOL_NAME);
+
                 for cmd in SLASH_COMMANDS {
                     api.register_command(
                         cmd.name.as_str(),
@@ -7175,6 +7224,18 @@ impl NativeExtension for SubagentsExtension {
                 api.subscribe(&[
                     cyrup_ext::EventKind::SessionStart,
                     cyrup_ext::EventKind::SessionShutdown,
+                    // R-SA-132/134 — the packaged-resources contribution. Upstream declares it
+                    // statically in `package.json`'s `pi` block (`"skills": ["./skills"]`,
+                    // `"prompts": ["./prompts"]`, `pi-subagents/package.json:52-62` @v0.34.0), which
+                    // pi's package manager reads when the extension package is installed. cyrup's
+                    // subagents extension is a NATIVE built-in with no package.json, so the same
+                    // declaration has to travel the extension seam instead: `resources_discover`
+                    // (R-09-022), whose aggregate `cyrup-session-svc`'s builder folds into the
+                    // discovered resource registry BEFORE the skill pointers and system prompt are
+                    // derived (`builder.rs:975-1002`). Without this subscription the bundled
+                    // `skills/pi-subagents/SKILL.md` — 58 KB of shipped operational guidance — was
+                    // never registered anywhere and `bundled_skill_files()` had no non-test caller.
+                    cyrup_ext::EventKind::ResourcesDiscover,
                 ]);
             }
         }
@@ -7244,6 +7305,35 @@ impl NativeExtension for SubagentsExtension {
             HostEvent::SessionShutdown { .. } => {
                 self.executor.teardown_session().await;
             }
+            // R-SA-132/134: contribute this crate's BUNDLED packaged resources — the
+            // `skills/pi-subagents/SKILL.md` operational skill and the seven `prompts/*.md`
+            // recipes — exactly the two entries upstream's `package.json` `pi` block declares
+            // (`"skills": ["./skills"]`, `"prompts": ["./prompts"]`,
+            // `pi-subagents/package.json:56-61` @v0.34.0).
+            //
+            // The host CONCATENATES every extension's contribution and loads each at the
+            // `Discovered` scope (`cyrup_resources::ResourceRegistry::extend`), so a same-named
+            // user/project/package resource still wins — the bundled skill is a floor, never an
+            // override. A contribution of nothing at all returns `Noop`, which leaves the
+            // discovered registry untouched (the host's own early return, `builder.rs:997`).
+            HostEvent::ResourcesDiscover => {
+                let skill_paths: Vec<String> = crate::registration::resources::bundled_skill_files()
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                let prompt_paths: Vec<String> =
+                    crate::registration::resources::bundled_prompt_files()
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect();
+                if skill_paths.is_empty() && prompt_paths.is_empty() {
+                    return HookOutcome::Noop;
+                }
+                return HookOutcome::Handled(cyrup_ext::HandledValue(serde_json::json!({
+                    "skillPaths": skill_paths,
+                    "promptPaths": prompt_paths,
+                })));
+            }
             _ => {}
         }
         HookOutcome::Noop
@@ -7282,6 +7372,154 @@ impl NativeExtension for SubagentsExtension {
     fn set_host_services(&self, services: Arc<dyn cyrup_ext::host::HostServices>) {
         self.executor.set_host_services(services);
     }
+
+    /// Draw the `subagent` tool's CALL row — a 1:1 port of pi's `renderCall`
+    /// (`extension/index.ts:465-493` @v0.34.0), on the raw tool arguments the host hands over
+    /// (`AgentSessionEvent::ToolExecutionStart.args`).
+    ///
+    /// Reached by: the model issues a `subagent` tool call → `cyrup-tui`'s `extension_render`
+    /// resolves this extension for the tool name and calls here (`cyrup-tui/src/app.rs:4283,4295`).
+    fn render_call(&self, key: &str, call: &serde_json::Value) -> Option<serde_json::Value> {
+        if key != TOOL_NAME {
+            return None;
+        }
+        Some(serde_json::Value::String(render_subagent_call(call)))
+    }
+
+    /// Draw the `subagent` tool's RESULT row — pi's `renderResult` (`extension/index.ts:495-503`),
+    /// which delegates to `renderSubagentResult` (`tui/render.ts:1406`).
+    ///
+    /// The host hands over the whole `AgentToolResult` (`{content, details, terminate}`,
+    /// `cyrup-agent/src/agent.rs:123-142`), which is exactly pi's `renderResult(result, …)`
+    /// argument, so the two branches port directly:
+    ///
+    /// * `!d || !d.results.length` (`:1413-1423`) — an async start, a management action, or any
+    ///   result with no settled run: draw the content text with pi's `[fork]` prefix;
+    /// * `d.mode === "single" && d.results.length === 1` (`:1428-1430`) — the compact settled row,
+    ///   via [`crate::tui::events::render_inline_result`], which reuses the same header/stat
+    ///   primitives `tui::render` already owns.
+    ///
+    /// EXPANDED rendering (pi's `options.expanded` arm, `:1431-1500`) is NOT reachable here: the
+    /// host's renderer contract passes no expansion state (`ExtensionHost::render_tool_result`
+    /// takes only the payload), so this always draws pi's COMPACT tier — the tier a collapsed row
+    /// shows, which is what the transcript draws by default.
+    fn render_result(&self, key: &str, result: &serde_json::Value) -> Option<serde_json::Value> {
+        if key != TOOL_NAME {
+            return None;
+        }
+        Some(render_subagent_result(result))
+    }
+}
+
+/// pi `renderCall` (`extension/index.ts:465-493` @v0.34.0), rendered as plain text: cyrup's
+/// renderer contract returns a serialized widget tree the host flattens, and pi's own return here
+/// is a single `Text` node in every branch.
+fn render_subagent_call(args: &serde_json::Value) -> String {
+    let string_field = |key: &str| args.get(key).and_then(serde_json::Value::as_str).unwrap_or("");
+    // `:466-472` — a management/control action names its target when it has one.
+    let action = string_field("action");
+    if !action.is_empty() {
+        let target = match string_field("agent") {
+            "" => string_field("chainName"),
+            agent => agent,
+        };
+        return if target.is_empty() {
+            format!("subagent {action}")
+        } else {
+            format!("subagent {action} {target}")
+        };
+    }
+    let array_len =
+        |key: &str| args.get(key).and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+    // `:475` — the `[async]` badge, suppressed while clarifying.
+    let async_label = if args.get("async") == Some(&serde_json::Value::Bool(true))
+        && args.get("clarify") != Some(&serde_json::Value::Bool(true))
+    {
+        " [async]"
+    } else {
+        ""
+    };
+    // `:476-481` — a chain names its LENGTH, not its steps.
+    let chain_len = array_len("chain");
+    if chain_len > 0 {
+        return format!("subagent chain ({chain_len}){async_label}");
+    }
+    // `:473-474,482-487` — a parallel fan-out names its EFFECTIVE task count, which is
+    // `effectiveParallelTaskCount` (`:447-453`): each task's integer `count >= 1`, else 1.
+    if array_len("tasks") > 0 {
+        return format!(
+            "subagent parallel ({}){async_label}",
+            effective_parallel_task_count(args)
+        );
+    }
+    // `:488-492` — a single run names its persona, `?` when none was given.
+    let agent = match string_field("agent") {
+        "" => "?",
+        agent => agent,
+    };
+    format!("subagent {agent}{async_label}")
+}
+
+/// pi `effectiveParallelTaskCount` (`extension/index.ts:447-453` @v0.34.0): sum each task's
+/// `count` when it is an integer `>= 1`, else 1 per task.
+fn effective_parallel_task_count(args: &serde_json::Value) -> u64 {
+    let Some(tasks) = args.get("tasks").and_then(serde_json::Value::as_array) else {
+        return 0;
+    };
+    tasks
+        .iter()
+        .map(|task| {
+            task.get("count")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|n| *n >= 1)
+                .unwrap_or(1)
+        })
+        .sum()
+}
+
+/// pi `renderSubagentResult` (`tui/render.ts:1406-1430` @v0.34.0), compact tier — see
+/// [`NativeExtension::render_result`]'s doc for the branch map. Returns a JSON array of line
+/// strings, which the host flattens newline-joined (`cyrup-tui/src/app.rs:4512`).
+fn render_subagent_result(result: &serde_json::Value) -> serde_json::Value {
+    let details = result.get("details");
+    let payload = details
+        .filter(|d| !d.is_null())
+        .and_then(|d| serde_json::from_value::<crate::tui::events::SubagentUpdatePayload>(d.clone()).ok());
+
+    // pi `:1413` — no details, or no settled run: the plain-text branch.
+    let settled = payload.as_ref().filter(|p| !p.results.is_empty());
+    let Some(payload) = settled else {
+        // pi `:1414-1416`: the first text content block, `"(no output)"` when absent, prefixed with
+        // `[fork]` when the (possibly unparsed) details declared a fork context.
+        let text = result
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|blocks| blocks.first())
+            .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .and_then(|b| b.get("text").and_then(serde_json::Value::as_str))
+            .unwrap_or("(no output)");
+        let prefix = if details.and_then(|d| d.get("context")).and_then(serde_json::Value::as_str)
+            == Some("fork")
+        {
+            "[fork] "
+        } else {
+            ""
+        };
+        // pi wraps to the terminal width (`:1420`); cyrup's host owns wrapping, so the lines are
+        // handed over unwrapped and the transcript wraps them.
+        return serde_json::Value::Array(
+            format!("{prefix}{text}")
+                .lines()
+                .map(|l| serde_json::Value::String(l.to_string()))
+                .collect(),
+        );
+    };
+
+    // pi `:1428-1430` — the compact settled row(s), through the shared render primitives.
+    let lines = crate::tui::render::lines_to_plain_text(&crate::tui::events::render_inline_result(
+        payload, 0,
+    ));
+    serde_json::Value::Array(lines.into_iter().map(serde_json::Value::String).collect())
 }
 
 impl SubagentsExtension {
@@ -7605,7 +7843,230 @@ impl SubagentsExtension {
                     .map_err(|e| SubagentError::MalformedSettings(e.message))?;
                 self.handle_companions_command(parsed, cwd).await
             }
+
+            // -----------------------------------------------------------------------------------
+            // /prompt-workflow — run one bundled/user/project `prompts/*.md` recipe (pi
+            // `prompt-workflows.ts:269-301` @v0.34.0). This is the reader that finally makes
+            // `registration::resources::bundled_prompt_files` reachable: the seven recipes this
+            // crate ships were discovered, unit-tested, and invocable by nothing.
+            // -----------------------------------------------------------------------------------
+            SlashCommandName::PromptWorkflow => {
+                let mut words = prompt_workflows::shell_words(args);
+                let name = if words.is_empty() { None } else { Some(words.remove(0)) };
+                let workflows = prompt_workflows::discover_prompt_workflows(cwd);
+                // pi `:275-278`: a bare `/prompt-workflow`, or the literal `list`, prints the list.
+                let Some(name) = name.filter(|n| n != "list") else {
+                    return Ok(prompt_workflows::format_workflow_list(&workflows));
+                };
+                let Some(workflow) = prompt_workflows::find_workflow(&workflows, &name) else {
+                    // pi `:281` notifies `Unknown prompt workflow: {name}` as an error.
+                    return Err(SubagentError::MalformedSettings(format!(
+                        "Unknown prompt workflow: {name}"
+                    )));
+                };
+                let runtime = prompt_workflows::parse_runtime_options(&words);
+                // pi `:286-295`: a recipe carrying `chain:` expands to a chain of OTHER recipes and
+                // never runs its own body.
+                if let Some(chain) = workflow.chain.as_deref() {
+                    let names = prompt_workflows::split_prompt_chain(chain);
+                    let steps = prompt_workflows::build_chain_steps(
+                        &workflows,
+                        &names,
+                        &runtime.args,
+                        &runtime,
+                        Some(&workflow.name),
+                    )
+                    .map_err(SubagentError::MalformedSettings)?;
+                    return self.run_prompt_workflow_chain(cwd, steps, &runtime).await;
+                }
+                let run = prompt_workflows::workflow_params(workflow, &runtime.args, &runtime);
+                self.run_prompt_workflow_single(cwd, &run).await
+            }
+
+            // -----------------------------------------------------------------------------------
+            // /chain-prompts — the same recipes, chained by an inline ` -> ` declaration (pi
+            // `prompt-workflows.ts:303-329` @v0.34.0).
+            // -----------------------------------------------------------------------------------
+            SlashCommandName::ChainPrompts => {
+                let (declaration, args_text) = prompt_workflows::split_chain_declaration(args);
+                let workflows = prompt_workflows::discover_prompt_workflows(cwd);
+                // pi `:308-311`: an empty declaration, or the literal `list`, prints the list.
+                if declaration.is_empty() || declaration == "list" {
+                    return Ok(prompt_workflows::format_workflow_list(&workflows));
+                }
+                let runtime =
+                    prompt_workflows::parse_runtime_options(&prompt_workflows::shell_words(&args_text));
+                let names = prompt_workflows::split_prompt_chain(&declaration);
+                if names.is_empty() {
+                    // pi `:315` — the usage line, verbatim.
+                    return Err(SubagentError::MalformedSettings(
+                        "Usage: /chain-prompts prompt-a -> prompt-b -- args".to_string(),
+                    ));
+                }
+                let steps = prompt_workflows::build_chain_steps(
+                    &workflows,
+                    &names,
+                    &runtime.args,
+                    &runtime,
+                    None,
+                )
+                .map_err(SubagentError::MalformedSettings)?;
+                self.run_prompt_workflow_chain(cwd, steps, &runtime).await
+            }
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // /prompt-workflow + /chain-prompts execution (pi's `run:` callback, which both handlers
+    // share — `slash-commands.ts:1101` binds it to the SAME `runSlashSubagent` every other slash
+    // command uses, so R-SA-130's single-executor rule holds for these two exactly as it does for
+    // `/run` and `/chain`).
+    // ---------------------------------------------------------------------------------------
+
+    /// Run one non-chain recipe. Routes into the identical foreground/background entry points
+    /// `/run` uses, carrying the recipe's own `model`/`skill`/`cwd` overrides.
+    async fn run_prompt_workflow_single(
+        &self,
+        cwd: &Path,
+        run: &prompt_workflows::WorkflowRun,
+    ) -> Result<String, SubagentError> {
+        // pi `resolveChildCwd(baseCwd, params.cwd)` (`shared/utils.ts:85-88`): a relative `cwd:`
+        // resolves against the session cwd; an absolute one is taken as-is.
+        let effective_cwd = match run.cwd.as_deref() {
+            None => cwd.to_path_buf(),
+            Some(child) => {
+                let child = Path::new(child);
+                if child.is_absolute() { child.to_path_buf() } else { cwd.join(child) }
+            }
+        };
+        let model = run.model.clone().map(ModelId::from);
+
+        // Same ordering as the `/run` arm above (SUBA-002): depth guard, then the per-session
+        // spawn charge, then dispatch — a depth-blocked run must not be billed.
+        let cfg = self.executor.config_snapshot().await;
+        let depth = resolve_effective_depth(cfg.max_subagent_depth);
+        if crate::spawn::depth::is_blocked(&depth) {
+            return Err(SubagentError::DepthExceeded {
+                current: depth.current_depth,
+                max: depth.max_depth,
+            });
+        }
+        self.executor
+            .reserve_subagent_spawns(1, cfg.max_subagent_spawns_per_session)
+            .map_err(SubagentError::SpawnLimitExceeded)?;
+
+        if run.background {
+            let run_id = self
+                .executor
+                .spawn_background(BackgroundSingleRequest {
+                    cwd: &effective_cwd,
+                    agent_name: &run.agent,
+                    task: &run.task,
+                    context: run.context,
+                    model_override: model,
+                    agent_scope: AgentReadScope::Both,
+                    acceptance: None,
+                    include_progress: None,
+                    control: None,
+                    output: None,
+                    output_mode: None,
+                    // A recipe's `skill:` IS forwarded — unlike `/run`, whose upstream handler
+                    // parses no `skill=` token (`slash-commands.ts:1193-1196`), `workflowParams`
+                    // sets `skill` from the recipe's frontmatter (`prompt-workflows.ts:233`).
+                    skills: run.skills.clone(),
+                    share: None,
+                    session_dir: None,
+                    artifacts: None,
+                    timeout_ms: None,
+                })
+                .await?;
+            return Ok(format!("Background subagent run started: {run_id}"));
+        }
+
+        let result = self
+            .executor
+            // `run_foreground_impl` rather than the flat `run_foreground`: this surface DOES carry
+            // per-call overrides (a recipe's `skill:`), which the flat entry point cannot express.
+            // `on_update: None` matches `/run` — no host `ToolUpdateSink` reaches slash dispatch.
+            .run_foreground_impl(
+                ForegroundRunRequest {
+                    overrides: SingleRunOverrides {
+                        skills: run.skills.clone(),
+                        ..SingleRunOverrides::default()
+                    },
+                    cwd: &effective_cwd,
+                    agent_name: &run.agent,
+                    task: &run.task,
+                    agent_scope: AgentReadScope::Both,
+                    context: run.context,
+                    model_override: model,
+                    timeout_ms: None,
+                    cancel: CancelToken::new(),
+                },
+                None,
+            )
+            .await
+            .map(|(result, _run_id)| result)?;
+        Ok(format_slash_run_completion(&result))
+    }
+
+    /// Run an expanded recipe chain through the SAME `run_or_background_chain` walker `/chain`
+    /// uses (pi lowers each recipe to a `ChainStep` and hands the whole `chain` array to the one
+    /// executor, `prompt-workflows.ts:288-293`).
+    async fn run_prompt_workflow_chain(
+        &self,
+        cwd: &Path,
+        steps: Vec<prompt_workflows::WorkflowRun>,
+        runtime: &prompt_workflows::RuntimeOptions,
+    ) -> Result<String, SubagentError> {
+        // pi `:293`/`:324`: the run-wide task is the joined positional args, and `clarify: false`/
+        // `agentScope: "both"` are fixed — the chain's own context/async come from the runtime
+        // flags, not from any single step.
+        let task = runtime.args.join(" ");
+        let context = if runtime.fork {
+            Some(ContextMode::Fork)
+        } else if runtime.fresh {
+            Some(ContextMode::Fresh)
+        } else {
+            None
+        };
+        let graph: Vec<RunnerStep> = steps
+            .iter()
+            .map(|step| {
+                RunnerStep::SingleStep(SingleStepSpec {
+                    agent: step.agent.clone(),
+                    task: step.task.clone(),
+                    cwd: step.cwd.as_deref().map(PathBuf::from),
+                    model: step.model.clone().map(ModelId::from),
+                    // pi's `ChainStep` carries `skill` (`prompt-workflows.ts:246`), and cyrup's
+                    // step spec has the same tri-state field, so a recipe's `skill:` survives into
+                    // a chained step exactly as it does into a single run.
+                    skills: step.skills.clone(),
+                    session_dir: None,
+                    tools: None,
+                    extensions: None,
+                    session_file: None,
+                    max_depth_override: None,
+                    structured_output_schema: None,
+                    output: None,
+                    output_path: None,
+                    output_mode: None,
+                    reads: None,
+                    acceptance: None,
+                    context: None,
+                    agent_scope: None,
+                })
+            })
+            .collect();
+        self.run_or_background_chain(
+            cwd,
+            graph,
+            RunMode::Chain,
+            context,
+            runtime.bg,
+            (!task.trim().is_empty()).then_some(task),
+        )
+        .await
     }
 
     // ---------------------------------------------------------------------------------------

@@ -67,9 +67,15 @@ impl FleetSpec {
         serde_json::from_str(self.catalog_json).unwrap_or_default()
     }
 
-    /// The provider's [`ProviderAuth`]: an API key from its env var (Pi `envApiKeyAuth`).
+    /// The provider's [`ProviderAuth`]: an API key from its env var (Pi `envApiKeyAuth`), plus the
+    /// `lazyOAuth` clause for the two fleet members that have one — `xai`
+    /// (`providers/xai.ts:15-20`) and `openrouter` (`providers/openrouter.ts:14-18`). See
+    /// [`super::builtin_oauth::builtin_provider_oauth`].
     pub fn auth(&self) -> ProviderAuth {
-        ProviderAuth::with_api_key(env_key([self.env_var]))
+        ProviderAuth {
+            api_key: Some(env_key([self.env_var])),
+            oauth: super::builtin_oauth::builtin_provider_oauth(self.id),
+        }
     }
 
     /// Build this provider over an explicit credential store + shared api registry.

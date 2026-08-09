@@ -32,15 +32,24 @@
 //! [`render_inline_result`] renders a [`SubagentUpdatePayload`] (C20) and
 //! [`render_async_jobs_widget`] renders `&[AsyncJobSnapshot]` (C21), both reusing those primitives.
 //!
-//! **REMAINING OUTER-LAYER STEP (owned by `cyrup-tui`, not this crate):** `cyrup-tui` must (a)
-//! deserialize [`SubagentUpdatePayload`] from `AgentSessionEvent::ToolExecutionUpdate`'s
-//! `partial_result.details` and paint [`render_inline_result`]'s lines into the inline tool-result
-//! region on every update, and (b) subscribe the persistent async-jobs widget to the background
-//! [`JobTracker`](crate::background::tracker::JobTracker) feed, build `&[AsyncJobSnapshot]` from
-//! each poll (via [`AsyncJobSnapshot::from_run_status`]), and paint [`render_async_jobs_widget`].
-//! `cyrup-ext-subagents` has ZERO dependency on `cyrup-tui` (arch-SA §1.1/§6.1), so it emits these
-//! `ratatui::text::Line` values and typed payloads; whichever crate owns the live terminal paints
-//! them. Until that host wiring lands, C20/C21 stay `outer-layer`.
+//! **C20 IS WIRED.** [`render_inline_result`] is driven by the extension's own
+//! [`NativeExtension::render_result`](cyrup_ext::native::NativeExtension::render_result)
+//! (`crate::extension`), which the host calls on `AgentSessionEvent::ToolExecutionEnd` for the
+//! `subagent` tool once `init` has declared `register_tool_renderer("subagent")` —
+//! `cyrup-tui/src/app.rs:4276-4296`, pi's `renderResult` seam
+//! (`pi-subagents/src/extension/index.ts:495` @v0.34.0). The lines are converted to plain text
+//! there (`tui::render::lines_to_plain_text`) because the renderer contract carries a serialized
+//! widget tree across the boundary rather than live `ratatui` values.
+//!
+//! **C21 IS NOT, AND CANNOT BE FROM THIS CRATE.** [`render_async_jobs_widget`] renders pi's
+//! PERSISTENT widget, which upstream installs with `ctx.ui.setWidget(WIDGET_KEY, …)`
+//! (`tui/render.ts:1265-1273`). cyrup's extension surface has no such capability: neither
+//! `cyrup_ext::native::InitApi` nor `HostCtx` exposes a widget slot, and the renderer contract
+//! covers only tool rows and custom messages. So this function's only caller remains its own test,
+//! and it stays that way until `cyrup-ext` grows a `set_widget` capability — a change outside this
+//! crate. The `render_result` seam is deliberately NOT abused to fake it: upstream's own
+//! `renderSubagentResult` sends an async start down the plain-text branch (`:1413-1423`), it does
+//! not draw a jobs widget there.
 
 use std::collections::VecDeque;
 
@@ -235,6 +244,39 @@ pub struct LiveProgressSnapshot {
 }
 
 impl LiveProgressSnapshot {
+    /// Derive the settled render entry for one [`SingleResult`] — what pi's `renderSingleCompact`
+    /// reads directly off `r` when the result carries no `progress` of its own
+    /// (`tui/render.ts:1275-1308` @v0.34.0: the glyph comes from `r.exitCode`/`r.detached`, the
+    /// counters from `r.usage`/`r.toolCalls`).
+    ///
+    /// The status is pi's own terminal classification, in pi's own precedence order
+    /// (`renderSingleCompact`'s `resultGlyph`/`resultStatusLine` inputs, and `runSinglePath`'s
+    /// detached/interrupted/exit-code ladder, `subagent-executor.ts:3035-3055`): detached wins,
+    /// then a zero exit is complete and anything else failed. `recent_tools`/`recent_output` are
+    /// left empty exactly as [`Self::compact_completed`] leaves them on a settled snapshot.
+    #[must_use]
+    pub fn from_settled_result(result: &SingleResult) -> Self {
+        let status = if result.detached || result.interrupted {
+            LiveProgressStatus::Detached
+        } else if result.exit_code == 0 {
+            LiveProgressStatus::Complete
+        } else {
+            LiveProgressStatus::Failed
+        };
+        Self {
+            agent: (!result.agent.is_empty()).then(|| result.agent.clone()),
+            status,
+            task: result.task.clone(),
+            tool_count: u32::try_from(result.tool_calls.len()).unwrap_or(u32::MAX),
+            tokens: result.usage.input.saturating_add(result.usage.output),
+            model: result.model.as_ref().map(ToString::to_string),
+            input_tokens: Some(result.usage.input),
+            output_tokens: Some(result.usage.output),
+            error: result.error.clone(),
+            ..Self::default()
+        }
+    }
+
     /// pi `compactCompletedProgress` (`pi-subagents/src/shared/utils.ts:329-345`) — the ONLY shape
     /// a SETTLED run's progress is ever published in, and the reason a chatty child cannot inflate
     /// a returned result without bound.
@@ -531,6 +573,11 @@ pub(crate) fn extract_event_text(value: &serde_json::Value) -> String {
 pub struct SubagentUpdatePayload {
     /// Which shape of run produced this update (single/parallel/chain).
     pub mode: RunMode,
+    /// The run's identity (pi `Details.runId`, `shared/types.ts:506` — optional there too). Carried
+    /// on the SETTLED result so a renderer/consumer can name the run; absent on a live update,
+    /// where the run id is not yet meaningful to the row being drawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
     /// The run's *resolved* fork context (drives the `[fork]` badge, R-SA-110/111).
     #[serde(default)]
     pub context: ContextMode,
@@ -555,6 +602,7 @@ impl SubagentUpdatePayload {
     pub fn single_live(context: ContextMode, progress: LiveProgressSnapshot) -> Self {
         Self {
             mode: RunMode::Single,
+            run_id: None,
             context,
             progress: vec![progress],
             results: Vec::new(),
@@ -574,6 +622,7 @@ impl SubagentUpdatePayload {
     ) -> Self {
         Self {
             mode: RunMode::Single,
+            run_id: None,
             context,
             progress: vec![progress],
             results: vec![result],
@@ -605,15 +654,58 @@ impl SubagentUpdatePayload {
 }
 
 /// Render the inline subagent-result surface (C20) for one [`SubagentUpdatePayload`], reusing the
-/// pure primitives in [`crate::tui::render`]: one header line per progress entry (activity glyph +
+/// pure primitives in [`crate::tui::render`]: one header line per rendered entry (activity glyph +
 /// agent + `[fork]` badge, R-SA-109/110/111) followed by its compact dim stats line. `tick` drives
-/// the activity glyph. See the module doc for the remaining `cyrup-tui`-side painting step.
+/// the activity glyph.
+///
+/// Which entries are rendered mirrors pi's `renderSubagentResult`, whose input is the whole
+/// `Details` object (`tui/render.ts:1406-1430` @v0.34.0) and which reads the SETTLED run out of
+/// `d.results[…]` — `renderSingleCompact(d, r, …)` takes `r` from `results`, and only reaches for
+/// `r.progress` for the still-running detail lines (`:1275-1298`). So:
+///
+/// * a LIVE update (`progress` populated, `results` empty — the C19 stream) renders its progress
+///   entries, and
+/// * a SETTLED result (`results` populated) renders one entry per RESULT, derived by
+///   [`LiveProgressSnapshot::from_settled_result`], preferring a matching live progress entry when
+///   the payload carried one so a settled snapshot's real tool/turn counters survive.
+///
+/// Rendering only `progress` — which this function used to do — meant a settled tool result drew
+/// NOTHING at all, because pi's own settle payload carries `results` and gates `progress` on the
+/// caller's `includeProgress` flag (`subagent-executor.ts:3008`).
 #[must_use]
 pub fn render_inline_result(payload: &SubagentUpdatePayload, tick: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    for entry in &payload.progress {
-        let label = entry.agent.as_deref().unwrap_or("subagent");
-        out.push(render_run_header_line(label, entry.status.to_run_state(), payload.context, tick));
+    if payload.results.is_empty() {
+        for entry in &payload.progress {
+            let label = entry.agent.as_deref().unwrap_or("subagent");
+            out.push(render_run_header_line(
+                label,
+                entry.status.to_run_state(),
+                payload.context,
+                tick,
+            ));
+            out.push(entry.stats_line());
+        }
+        return out;
+    }
+    for (index, result) in payload.results.iter().enumerate() {
+        let entry = payload
+            .progress
+            .get(index)
+            .filter(|p| !p.status.is_running())
+            .cloned()
+            .unwrap_or_else(|| LiveProgressSnapshot::from_settled_result(result));
+        let label = if result.agent.is_empty() {
+            entry.agent.clone().unwrap_or_else(|| "subagent".to_string())
+        } else {
+            result.agent.clone()
+        };
+        out.push(render_run_header_line(
+            &label,
+            entry.status.to_run_state(),
+            payload.context,
+            tick,
+        ));
         out.push(entry.stats_line());
     }
     out

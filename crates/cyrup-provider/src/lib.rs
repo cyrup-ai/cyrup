@@ -128,6 +128,7 @@ pub use providers::{
 pub use providers::{
     TOGETHER_BASE_URL, together_models, together_provider, together_provider_with,
 };
+pub use providers::builtin_provider_oauth;
 pub use providers::{openrouter_images_auth, openrouter_images_provider};
 pub use stream::sse::{
     DEFAULT_HTTP_IDLE_TIMEOUT_MS, OnRequest, OnResponse, SseFrame, SseRequest, build_client,

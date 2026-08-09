@@ -268,9 +268,25 @@ async fn run_single_with_control_and_debounce(
     }
 }
 
+/// The raised control events off a SETTLED single-run `details`.
+///
+/// pi's `Details` puts them on `results[i].controlEvents` (`shared/types.ts:480`, populated by
+/// `snapshotResult` at `runs/foreground/execution.ts:160` from `result.controlEvents` set at
+/// `:975`), NOT at the details root: `runSinglePath`'s own details object
+/// (`subagent-executor.ts:3002-3013` @v0.34.0) has no `controlEvents` key at all. The root
+/// `controlEvents` upstream does emit belongs to the LIVE `onUpdate` snapshot only (`:982-987`).
+///
+/// This read used to be `details["controlEvents"]`, which worked solely because cyrup emitted the
+/// bare `SingleResult` AT the details root — the port bug that also made the `subagent` tool's
+/// result unrenderable. With `details` now pi-shaped (`{mode, runId, results:[r], …}`) the correct
+/// path is the nested one, and `results[0].controlEvents` is the SAME `SingleResult::control_events`
+/// value this test has always been about.
 fn control_events(details: &serde_json::Value) -> Vec<serde_json::Value> {
     details
-        .get("controlEvents")
+        .get("results")
+        .and_then(|v| v.as_array())
+        .and_then(|results| results.first())
+        .and_then(|result| result.get("controlEvents"))
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default()

@@ -958,7 +958,50 @@ impl AgentSession {
         match self.services.ext_host.execute_native_command(name, args, &cancel).await {
             // A native extension owned + serviced the command (Pi short-circuits regardless of the
             // handler's own Ok/Err — the command was "handled").
-            Ok(Some(_)) => {
+            Ok(Some(payload)) => {
+                // SURFACE THE HANDLER'S OUTPUT. This arm used to bind the payload to `_`.
+                //
+                // Pi's handler signature is `Promise<void>` and it talks to the user through
+                // `ctx.ui.*` (`agent-session.ts:1278-1301` — the return value genuinely is
+                // discarded there). cyrup's `NativeExtension::execute_command` instead returns
+                // `Result<Option<String>>`, a cyrup-original channel, and its built-ins populate it:
+                // `cyrup-ext-subagents` alone answers all 15 of its slash commands this way and
+                // contains ZERO `notify` calls. Discarding the payload therefore made every one of
+                // those commands silent — `/prompt-workflow list` ran, spawned, and printed nothing;
+                // `/permission-system yoloMode on` wrote the config and said nothing. The seam was
+                // advertised and unread, which is the same defect class as a mechanism wired to no
+                // caller.
+                //
+                // Routing it to `notify` reproduces pi's OBSERVABLE behaviour (the user sees the
+                // command's response) using the one UI channel that is already live end-to-end:
+                // `LiveHostServices::notify` -> `UiEffect::Notify` -> the TUI's `showExtensionNotify`.
+                // An empty payload stays silent, so a handler that deliberately says nothing still
+                // says nothing.
+                // The bind is the HANDLER's own `Result` — `execute_native_command` returns
+                // `Result<Option<Result<Option<String>, ExtError>>, _>`: outer = routing, `Option` =
+                // did a native extension own the name, inner = what the handler itself returned.
+                match &payload {
+                    Ok(Some(text)) if !text.trim().is_empty() => {
+                        cyrup_ext::HostServices::notify(
+                            &*self.services.host_services,
+                            text,
+                            cyrup_ext::NotifyKind::Info,
+                        );
+                    }
+                    // A handler that deliberately returns nothing stays silent.
+                    Ok(_) => {}
+                    // Pi surfaces a THROWN handler through `emitError` with
+                    // `extensionPath: command:<name>` (`agent-session.ts:1294-1299`) and still
+                    // reports the command handled. Same here: show it, do not fall through to
+                    // treating `/name` as a prompt.
+                    Err(e) => {
+                        cyrup_ext::HostServices::notify(
+                            &*self.services.host_services,
+                            &format!("command:{name}: {e}"),
+                            cyrup_ext::NotifyKind::Error,
+                        );
+                    }
+                }
                 // SEAM-003: drain the control ops the native handler queued. This route used to
                 // `return true` with NO drain at all, so a native built-in's `control(...)` sat in
                 // the queue until some later WASM command happened to run. Pi keeps native + wasm

@@ -149,7 +149,9 @@ pub const PERMISSION_SYSTEM_COMMAND_DESCRIPTION: &str =
 
 /// pi `createPermissionSystemCommandHandler`'s TUI guard (v0.8.0 `common.ts:188-198`): the
 /// `/permission-system` handler refuses outright when there is no interactive UI, because its whole
-/// body is "open a modal". Emitted as a `warning` notification and as the handler's text output.
+/// body is "open a modal". Emitted as a `warning` notification, and ONLY as that — the handler
+/// returns `Ok(None)` rather than this same sentence, because the session surfaces an
+/// `Ok(Some(text))` as a second, Info-level notification.
 pub const PERMISSION_SYSTEM_COMMAND_REQUIRES_UI: &str =
     "/permission-system requires interactive TUI mode.";
 

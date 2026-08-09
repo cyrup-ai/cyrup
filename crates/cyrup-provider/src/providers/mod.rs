@@ -5,6 +5,7 @@ pub mod all;
 pub mod amazon_bedrock;
 pub mod anthropic;
 pub mod azure_openai_responses;
+pub mod builtin_oauth;
 pub mod cloudflare;
 pub mod fireworks;
 pub mod fleet;
@@ -25,6 +26,7 @@ pub use all::{
     default_models,
 };
 pub use amazon_bedrock::*;
+pub use builtin_oauth::builtin_provider_oauth;
 pub use anthropic::{
     ANTHROPIC_BASE_URL, ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID, AnthropicFleetSpec, anthropic_auth,
     anthropic_fleet_providers_with, anthropic_fleet_spec, anthropic_models, anthropic_provider,

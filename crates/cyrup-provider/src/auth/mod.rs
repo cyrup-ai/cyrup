@@ -74,6 +74,31 @@ pub trait ApiKeyAuth: Send + Sync {
 pub trait OAuthAuth: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Whether access through this auth method is backed by a provider **subscription** rather
+    /// than metered API billing (`isSubscription`, pi v0.84.1 `ai/src/auth/types.ts:210-211`).
+    ///
+    /// This is NOT "the credential is an OAuth credential". Upstream sets it on exactly five
+    /// flows — Anthropic (Claude Pro/Max) `oauth/anthropic.ts:357`, OpenAI (ChatGPT Plus/Pro)
+    /// `oauth/openai-codex.ts:517`, GitHub Copilot `oauth/github-copilot.ts:402`, Kimi Code
+    /// `oauth/kimi-coding.ts:297` and xAI (Grok/X) `oauth/xai.ts:231` — and deliberately leaves
+    /// it unset on the OAuth flows that still bill per token, i.e. OpenRouter
+    /// (`oauth/openrouter.ts:301-311`) and Radius (`oauth/radius.ts:357-361`). pi's own test
+    /// pins that split: *"identifies only subscription-backed OAuth flows as subscriptions"*,
+    /// `ai/test/oauth-auth.test.ts:30-35`, which asserts `toBe(true)` for the five and
+    /// `not.toBe(true)` for OpenRouter.
+    ///
+    /// Consumers must use this and not `isUsingOAuth`: pi v0.84.0's changelog entry for the TUI
+    /// reads *"Fixed the footer showing `(sub)` for generic OAuth/OpenID sign-ins without a
+    /// known subscription"* (`coding-agent/CHANGELOG.md:155`).
+    ///
+    /// **Shape.** Upstream's field is `isSubscription?: boolean` and every consumer compares
+    /// `=== true` (`coding-agent/src/core/model-runtime.ts:463`), so absent and `false` are
+    /// indistinguishable to a reader; a plain `bool` defaulting to `false` is exactly that
+    /// contract.
+    fn is_subscription(&self) -> bool {
+        false
+    }
+
     /// Selector label for the subscription login option, e.g. `"Sign in with SuperGrok or X
     /// Premium"` (`loginLabel`, `ai/src/auth/types.ts:194`). Optional upstream, hence the
     /// default.

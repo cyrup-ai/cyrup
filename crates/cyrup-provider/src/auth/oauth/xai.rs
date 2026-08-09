@@ -627,6 +627,11 @@ impl OAuthAuth for XaiOAuth {
         "xAI (Grok/X subscription)"
     }
 
+    /// `isSubscription: true` (pi v0.84.1 `oauth/xai.ts:231`) — SuperGrok / X Premium.
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// `xai.ts:231`
     fn login_label(&self) -> Option<&str> {
         Some("Sign in with SuperGrok or X Premium")

@@ -551,33 +551,40 @@ impl PermissionSystemExtension {
     ///
     /// The ORDER is the contract, and it is the reason this is a function and not three inlined
     /// statements: normalize, WRITE, and only then touch anything in memory. A failed write returns
-    /// having notified the human and having changed NOTHING — no live config, no status pill, no
-    /// `lastConfigWarning` reset, no debug entry — so cyrup can never end a turn with an in-memory
-    /// config that disagrees with the file the next `session_start` will re-read.
+    /// the cause and has changed NOTHING — no live config, no status pill, no `lastConfigWarning`
+    /// reset, no debug entry — so cyrup can never end a turn with an in-memory config that
+    /// disagrees with the file the next `session_start` will re-read.
     ///
     /// \[CYRUP-DELTA] Two shape differences, neither behavioural:
     /// - pi takes `ctx: ExtensionCommandContext` purely to reach `ctx.ui.notify` (`:1407`) and to
     ///   pass to `syncPermissionSystemStatusWhenPossible` (`:1413`). Both of those reach the live
     ///   [`HostServices`] backend in cyrup, which this extension already holds, so there is no ctx
     ///   parameter to thread and nothing is lost by its absence.
-    /// - pi returns `void`; this returns whether the save landed. Its one upstream caller recovers
-    ///   the same fact by re-reading `controller.getConfig()` straight after (`config-modal.ts:79`),
-    ///   which is exactly what the returned `bool` saves the cyrup caller from having to do.
-    pub fn save_extension_config(&self, next: &ExtensionConfig) -> bool {
+    /// - pi returns `void`; this returns whether the save landed, and on failure the RAW cause. Its
+    ///   one upstream caller recovers the same fact by re-reading `controller.getConfig()` straight
+    ///   after (`config-modal.ts:79`), which is exactly what the returned `Result` saves the cyrup
+    ///   caller from having to do.
+    ///
+    /// **The `Err` MUST be surfaced by the caller**, at [`NotifyKind::Error`]. pi notifies inline
+    /// here (`:1407`); cyrup hands the cause up one level instead so the human gets ONE error toast
+    /// carrying both the what ("YOLO mode is unchanged (off)") and the why (the raw save error),
+    /// rather than two toasts saying half each. See [`Self::run_permission_system_command`], the
+    /// only caller, and the `Ok(None)` convention documented on
+    /// [`cyrup_ext::NativeExtension::execute_command`].
+    pub fn save_extension_config(&self, next: &ExtensionConfig) -> Result<(), String> {
         // pi `const normalized = normalizePermissionSystemConfig(next)` (`:1403`).
         let normalized = next.normalized();
         // pi `const saved = savePermissionSystemConfig(normalized)` (`:1404`).
         let saved = normalized.save(&Self::config_path_for(&self.agent_dir));
         if !saved.success {
-            // pi `:1405-1410`: surface the error (an `error`-level notification, NOT the deduped
-            // `warning` sink — a save the human just asked for and did not get must be reported
-            // every time) and return WITHOUT mutating in-memory state.
-            if let Some(error) = saved.error
-                && let Some(services) = self.host_services.get()
-            {
-                services.notify(&error, NotifyKind::Error);
-            }
-            return false;
+            // pi `:1405-1410`: report the error (which the caller raises as an `error`-level
+            // notification, NOT the deduped `warning` sink — a save the human just asked for and did
+            // not get must be reported every time) and return WITHOUT mutating in-memory state. A
+            // failure that carries no message still reports one: the caller must never be left with
+            // an empty explanation, which is what an `Option` here would allow.
+            return Err(saved
+                .error
+                .unwrap_or_else(|| "the permission-system config could not be written".to_string()));
         }
 
         // pi `setExtensionConfig(normalized)` (`:1412`).
@@ -593,7 +600,7 @@ impl PermissionSystemExtension {
             "config.saved",
             &json!({ "debug": normalized.debug, "yoloMode": normalized.yolo_mode }),
         );
-        true
+        Ok(())
     }
 
     /// pi `getYoloMode: () => extensionConfig.yoloMode` (v0.8.0 `index.ts:1482`).
@@ -719,14 +726,22 @@ impl PermissionSystemExtension {
     /// currently UNREACHABLE — `cyrup-ext` has no extension-provided-API registry for one extension
     /// to call another's methods, which is the actual missing piece. Tracked as G133b in
     /// `PARITY-GAPS.md`; see [`crate::yolo_api`].
-    fn run_permission_system_command(&self, args: &str) -> String {
+    ///
+    /// Returns `Some(text)` for output the session surfaces as an **Info** notification, and `None`
+    /// when this handler has ALREADY notified at its own level — the convention documented on
+    /// [`cyrup_ext::NativeExtension::execute_command`]. The save-failure branches take the `None`
+    /// route: they raise one [`NotifyKind::Error`] toast carrying both the human sentence and the
+    /// raw cause, instead of returning a sentence that would arrive as a second, Info-level toast
+    /// alongside the error (`cyrup-session-svc/src/session.rs:961-1004` surfaces every
+    /// `Ok(Some(..))`).
+    fn run_permission_system_command(&self, args: &str) -> Option<String> {
         let mut parts = args.split_whitespace();
         let Some(setting) = parts.next() else {
-            return self.render_settings();
+            return Some(self.render_settings());
         };
         let value = parts.next();
         if parts.next().is_some() {
-            return format!("Unexpected extra arguments.\n{COMMAND_USAGE}");
+            return Some(format!("Unexpected extra arguments.\n{COMMAND_USAGE}"));
         }
 
         // pi `ON_OFF = ["on", "off"]` (`config-modal.ts:18`) — the modal can only ever emit one of
@@ -735,49 +750,82 @@ impl PermissionSystemExtension {
         let enabled = match value {
             Some("on") => true,
             Some("off") => false,
-            Some(other) => return format!("Unknown value `{other}`.\n{COMMAND_USAGE}"),
-            None => return format!("`{setting}` needs a value.\n{COMMAND_USAGE}"),
+            Some(other) => return Some(format!("Unknown value `{other}`.\n{COMMAND_USAGE}")),
+            None => return Some(format!("`{setting}` needs a value.\n{COMMAND_USAGE}")),
         };
 
         match setting {
             // pi `applySetting` `case "debug"` (`config-modal.ts:49-50`) → `setConfig` (`:78`).
             "debug" => {
                 let next = ExtensionConfig { debug: enabled, ..guard(&self.config).clone() };
-                if self.save_extension_config(&next) {
-                    format!("Debug logging {}.\n{}", on_off(enabled), self.config_path_line())
-                } else {
-                    // pi surfaces this through `ctx.ui.notify(saved.error, "error")` only
-                    // (`index.ts:1407`); `save_extension_config` has already done that.
-                    format!(
-                        "Failed to save the permission-system config; debug logging is unchanged \
-                         ({}).\n{}",
-                        on_off(guard(&self.config).debug),
+                match self.save_extension_config(&next) {
+                    Ok(()) => Some(format!(
+                        "Debug logging {}.\n{}",
+                        on_off(enabled),
                         self.config_path_line()
-                    )
+                    )),
+                    // pi surfaces this through `ctx.ui.notify(saved.error, "error")` ONLY
+                    // (`index.ts:1407`) — one error-level toast, nothing else. Same here: the
+                    // sentence and the raw cause go out together at Error, and the handler returns
+                    // `None` so the session adds no second Info toast.
+                    Err(cause) => {
+                        self.notify_save_failure(
+                            &format!(
+                                "Failed to save the permission-system config; debug logging is \
+                                 unchanged ({}).",
+                                on_off(guard(&self.config).debug)
+                            ),
+                            &cause,
+                        );
+                        None
+                    }
                 }
             }
             // pi `applySetting` `case "yoloMode"` (`config-modal.ts:51-52`) → `setConfig` (`:75`),
             // the SAME writer the debug row uses. Not `setYoloMode` — that is the runtime API.
             "yoloMode" => {
                 let next = ExtensionConfig { yolo_mode: enabled, ..guard(&self.config).clone() };
-                if self.save_extension_config(&next) {
-                    format!("YOLO mode {}.\n{}", on_off(enabled), self.config_path_line())
-                } else {
+                match self.save_extension_config(&next) {
+                    Ok(()) => {
+                        Some(format!("YOLO mode {}.\n{}", on_off(enabled), self.config_path_line()))
+                    }
                     // Same failure shape as the debug row: pi notifies through `ctx.ui.notify` and
                     // leaves the live config untouched (`index.ts:1405-1409`), so the value reported
                     // here is the one still in effect.
-                    format!(
-                        "Failed to save the permission-system config; YOLO mode is unchanged \
-                         ({}).\n{}",
-                        on_off(guard(&self.config).yolo_mode),
-                        self.config_path_line()
-                    )
+                    Err(cause) => {
+                        self.notify_save_failure(
+                            &format!(
+                                "Failed to save the permission-system config; YOLO mode is \
+                                 unchanged ({}).",
+                                on_off(guard(&self.config).yolo_mode)
+                            ),
+                            &cause,
+                        );
+                        None
+                    }
                 }
             }
             // pi `applySetting`'s `default: return config` (`config-modal.ts:53-54`) — the modal
             // cannot emit an unknown id, so cyrup's text form reports it instead of silently
             // no-oping.
-            other => format!("Unknown setting `{other}`.\n{COMMAND_USAGE}"),
+            other => Some(format!("Unknown setting `{other}`.\n{COMMAND_USAGE}")),
+        }
+    }
+
+    /// Raise the ONE [`NotifyKind::Error`] toast a refused config write produces: the human sentence
+    /// (what did not change, and what is still in effect), the config path, and the raw cause from
+    /// [`Self::save_extension_config`] (why). pi emits only `ctx.ui.notify(saved.error, "error")`
+    /// (`index.ts:1407`) — the raw cause alone — because its modal is still on screen to supply the
+    /// context; cyrup's command has no modal, so the context has to travel in the toast.
+    ///
+    /// Silent when no [`HostServices`] backend is attached, which is the same no-op pi's
+    /// `noOpUIContext` gives a headless run.
+    fn notify_save_failure(&self, summary: &str, cause: &str) {
+        if let Some(services) = self.host_services.get() {
+            services.notify(
+                &format!("{summary}\n{}\n{cause}", self.config_path_line()),
+                NotifyKind::Error,
+            );
         }
     }
 
@@ -1874,8 +1922,12 @@ impl NativeExtension for PermissionSystemExtension {
     ///
     /// The `has_ui` guard is upstream's, verbatim in effect (`common.ts:192-195`): with no
     /// interactive UI the handler notifies a `warning` and returns without touching the config.
-    /// cyrup additionally returns that same sentence as the command's text output, because a native
-    /// command here has a return channel pi's `void` handler does not.
+    ///
+    /// It returns `Ok(None)` afterwards, NOT the sentence it just notified. Per the convention on
+    /// [`cyrup_ext::NativeExtension::execute_command`], an `Ok(Some(text))` is surfaced by the
+    /// session as an **Info** notification, so returning the same sentence would put it on screen
+    /// twice — once as the `warning` this level deliberately chose, once as an Info duplicate. The
+    /// handler owns the level here, so it owns the whole notification.
     async fn execute_command(
         &self,
         name: &str,
@@ -1895,11 +1947,11 @@ impl NativeExtension for PermissionSystemExtension {
                     NotifyKind::Warning,
                 );
             }
-            return Ok(Some(crate::common::PERMISSION_SYSTEM_COMMAND_REQUIRES_UI.to_string()));
+            return Ok(None);
         }
         // pi `openPermissionSystemSettingsModal(ctx, { getConfig, setConfig, getConfigPath })`
-        // (`index.ts:1504-1511`).
-        Ok(Some(self.run_permission_system_command(args)))
+        // (`index.ts:1504-1511`). `None` here means the handler already notified at its own level.
+        Ok(self.run_permission_system_command(args))
     }
 
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {

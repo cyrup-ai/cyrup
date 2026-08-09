@@ -96,7 +96,15 @@ pub struct StatusLine {
     /// Number of configured providers; the `(provider)` prefix is shown only when this is `> 1` and it
     /// still fits (`footer.ts:193-199`).
     pub provider_count: usize,
-    /// Cost paid via an OAuth subscription → ` (sub)` suffix on the cost segment (`footer.ts:142-145`).
+    /// Cost paid via a provider **subscription** → ` (sub)` suffix on the cost segment
+    /// (`footer.ts:142-145`).
+    ///
+    /// Not "the credential is an OAuth credential": pi narrowed this at v0.84.0 from `isUsingOAuth`
+    /// to `isUsingSubscription` (`footer.ts:140` vs `v0.83.0:footer.ts:140`) precisely so a metered
+    /// OAuth sign-in stops being labelled a subscription. The predicate lives in
+    /// [`crate::App`]`::provider_uses_subscription`, which is the only production writer of this
+    /// field; it is pushed on `model_changed` and on every credential change (`/login`, `/logout`,
+    /// session bind/swap).
     pub using_subscription: bool,
     /// Experimental features enabled → trailing `• xp` marker (`footer.ts:163-165`).
     pub experimental: bool,
@@ -181,7 +189,8 @@ impl StatusLine {
     pub fn set_provider_count(&mut self, count: usize) {
         self.provider_count = count;
     }
-    /// Set whether the active cost is paid via an OAuth subscription (` (sub)` suffix).
+    /// Set whether the active cost is paid via a provider subscription (` (sub)` suffix). Production
+    /// callers go through [`crate::App`]`::refresh_subscription_marker`, which owns the predicate.
     pub fn set_using_subscription(&mut self, sub: bool) {
         self.using_subscription = sub;
     }

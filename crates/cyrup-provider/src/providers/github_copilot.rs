@@ -590,6 +590,14 @@ impl OAuthAuth for GitHubCopilotOAuth {
         "GitHub Copilot"
     }
 
+    /// `isSubscription: true` — set on both the flow (pi v0.84.1
+    /// `auth/oauth/github-copilot.ts:402`) and the provider's `lazyOAuth` wrapper
+    /// (`providers/github-copilot.ts:16`). This impl is the one the provider's [`ProviderAuth`]
+    /// actually carries, so it must answer the same.
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// Pi `refreshGitHubCopilotToken` (`auth/oauth/github-copilot.ts:271-277`): mint a fresh Copilot
     /// token, then re-list the account's models onto it. A failure of EITHER call fails the refresh —
     /// Pi awaits the listing inside the returned object literal, so it is not best-effort.

@@ -657,6 +657,12 @@ impl OAuthAuth for AnthropicOAuth {
         "Anthropic (Claude Pro/Max)"
     }
 
+    /// `isSubscription: true` (pi v0.84.1 `oauth/anthropic.ts:357`) — a Claude Pro/Max plan, not
+    /// metered API billing.
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// 1:1 port of `loginAnthropic` (`anthropic.ts:229-303`, wired at `:344`): start the callback
     /// listener, show the authorize URL, race the browser redirect against a manual paste, then
     /// exchange the code.

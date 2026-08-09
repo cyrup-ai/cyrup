@@ -65,11 +65,21 @@
 //!    assembler (`cyrup-session/src/prompt/{builder,skills_inject}.rs`) emits both sections with
 //!    explicit CLOSING tags (`</project_context>`, `</available_skills>`), so the port cuts on the
 //!    real delimiters instead of guessing where a section ends. Same intent, exact boundaries.
-//! 2. pi's `stripSubagentOrchestrationSkill` deletes the `pi-subagents` SKILL.md entry that its own
-//!    package ships (`skills/pi-subagents/SKILL.md` @v0.34.0). cyrup ships NO such skill — this
-//!    crate has no `skills/` directory and registers no skill — so there is no entry to delete and
-//!    the port would be dead code. Deliberately omitted; if a subagents orchestration skill is ever
-//!    added, this is where its strip belongs.
+//! 2. pi's `stripSubagentOrchestrationSkill` (`:83-87`, called UNCONDITIONALLY at `:108`) deletes
+//!    the `pi-subagents` skill entry from an inherited prompt. It matches two shapes: pi's
+//!    attribute form `<skill name="pi-subagents" …>…</skill>`, and the nested form whose body
+//!    contains `<name>pi-subagents</name>`. cyrup's assembler emits ONLY the nested form
+//!    (`cyrup-session/src/prompt/skills_inject.rs:34-46`), so [`strip_subagent_orchestration_skill`]
+//!    ports the second replace and omits the first — there is no attribute form to match.
+//!
+//!    An earlier revision of this comment claimed the port was dead code because "this crate has no
+//!    `skills/` directory and registers no skill". That was FALSE on both counts even when it was
+//!    written: `crates/cyrup-ext-subagents/resources/skills/pi-subagents/SKILL.md` is a 58 KB file
+//!    that has always shipped here, and it is now registered through the extension's
+//!    `resources_discover` contribution (`extension.rs`), so a parent session's
+//!    `<available_skills>` block genuinely carries a `pi-subagents` entry and a forked child
+//!    genuinely inherits it. Stripping it is exactly what stops a delegated worker from reading its
+//!    own prompt as a licence to orchestrate.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -250,6 +260,85 @@ pub fn strip_inherited_skills(prompt: &str) -> String {
     strip_delimited_section(prompt, SKILLS_OPEN, SKILLS_CLOSE)
 }
 
+/// The orchestration skill's name, as it appears inside a `<name>` element of cyrup's
+/// `<available_skills>` block. Deliberately the SAME constant
+/// [`crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL`] carries — one name, two enforcement
+/// points (that module refuses to RESOLVE it for a child; this one removes it from a prompt the
+/// child INHERITED), and they must never drift.
+const SUBAGENT_ORCHESTRATION_SKILL: &str = crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL;
+
+/// pi `stripSubagentOrchestrationSkill` (`subagent-prompt-runtime.ts:83-87`): remove the
+/// `pi-subagents` entry from an inherited `<available_skills>` block, leaving every other skill in
+/// place.
+///
+/// Ports upstream's SECOND replace — the nested `<skill>…<name>pi-subagents</name>…</skill>` form,
+/// which is the only shape cyrup's assembler emits (`skills_inject.rs:34-46`). Upstream's first
+/// replace targets an attribute form (`<skill name="pi-subagents">`) cyrup never produces.
+///
+/// Unlike [`strip_inherited_skills`], this runs for EVERY child — including one that inherits
+/// skills — because the orchestration skill is parent-only regardless of the inherit flag (pi calls
+/// it unconditionally at `:108`, outside both `if` guards).
+#[must_use]
+pub fn strip_subagent_orchestration_skill(prompt: &str) -> String {
+    let mut out = String::with_capacity(prompt.len());
+    let mut rest = prompt;
+    while let Some(open_at) = rest.find(SKILL_OPEN) {
+        let Some(head) = rest.get(..open_at) else { break };
+        let Some(from_open) = rest.get(open_at..) else { break };
+        let Some(close_rel) = from_open.find(SKILL_CLOSE) else {
+            // An unterminated `<skill>` is not a block; emit the remainder verbatim.
+            break;
+        };
+        let end = close_rel.saturating_add(SKILL_CLOSE.len());
+        let Some(block) = from_open.get(..end) else { break };
+        out.push_str(head);
+        if !block_names_orchestration_skill(block) {
+            out.push_str(block);
+        } else {
+            // Upstream's replacement is the empty string AND its pattern consumes the block's
+            // trailing whitespace (`<\/skill>\s*`), so removing the entry leaves no blank line
+            // where it used to be.
+            rest = from_open.get(end..).unwrap_or("");
+            let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+            // Keep the indentation-free remainder, but never swallow the block's own closing
+            // `</available_skills>` line separator entirely: re-emit a single newline so the
+            // following element still starts on its own line.
+            if !trimmed.is_empty() && rest.len() != trimmed.len() {
+                out.push('\n');
+            }
+            rest = trimmed;
+            continue;
+        }
+        rest = from_open.get(end..).unwrap_or("");
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Opening tag of one entry in cyrup's `<available_skills>` block (`skills_inject.rs:34`).
+const SKILL_OPEN: &str = "<skill>";
+/// Closing tag of one entry (`skills_inject.rs:46`).
+const SKILL_CLOSE: &str = "</skill>";
+
+/// pi `SUBAGENT_ORCHESTRATION_SKILL_NAME_PATTERN` (`:47`, `/<name>\s*pi-subagents\s*<\/name>/`):
+/// does this `<skill>` block name the orchestration skill?
+fn block_names_orchestration_skill(block: &str) -> bool {
+    let mut rest = block;
+    while let Some(at) = rest.find("<name>") {
+        let Some(after) = rest.get(at.saturating_add("<name>".len())..) else {
+            return false;
+        };
+        let Some(close) = after.find("</name>") else {
+            return false;
+        };
+        if after.get(..close).unwrap_or("").trim() == SUBAGENT_ORCHESTRATION_SKILL {
+            return true;
+        }
+        rest = after.get(close..).unwrap_or("");
+    }
+    false
+}
+
 /// pi `stripChildBoundaryInstructions` (`subagent-prompt-runtime.ts:89-95`): remove any boundary
 /// block already present, then drop the leading blank lines that removal leaves.
 ///
@@ -295,6 +384,9 @@ pub fn rewrite_subagent_prompt(prompt: &str, opts: &PromptRewriteOptions) -> Str
     if !opts.inherit_skills {
         rewritten = strip_inherited_skills(&rewritten);
     }
+    // pi `:108` — UNCONDITIONAL, outside both `if` guards above: even a child that inherits every
+    // other skill must not inherit the parent's orchestration skill.
+    rewritten = strip_subagent_orchestration_skill(&rewritten);
     rewritten = strip_child_boundary_instructions(&rewritten);
     let boundary = if opts.fanout_child {
         CHILD_FANOUT_BOUNDARY_INSTRUCTIONS
@@ -910,6 +1002,84 @@ mod tests {
     }
 
     /// A prompt with neither section is returned as-is by the strips (only the boundary is added).
+    /// A prompt shaped like the real assembler's output when the subagents extension's
+    /// `resources_discover` contribution HAS registered (`extension.rs`): the `pi-subagents`
+    /// operational skill sits alongside a normal project skill.
+    fn assembled_prompt_with_orchestration_skill() -> String {
+        [
+            "You are a coding assistant operating inside cyrup.",
+            "",
+            SKILLS_OPEN,
+            "<available_skills>",
+            "  <skill>",
+            "    <name>deploy</name>",
+            "    <description>Ship a release</description>",
+            "    <location>/repo/.cyrup/skills/deploy/SKILL.md</location>",
+            "  </skill>",
+            "  <skill>",
+            "    <name>pi-subagents</name>",
+            "    <description>Orchestrate subagents</description>",
+            "    <location>/pkg/resources/skills/pi-subagents/SKILL.md</location>",
+            "  </skill>",
+            "</available_skills>",
+            "",
+            "Current date: 2026-08-09",
+        ]
+        .join("\n")
+    }
+
+    /// The orchestration skill is removed and EVERY other skill survives, byte for byte.
+    #[test]
+    fn the_orchestration_skill_entry_is_removed_and_others_survive() {
+        let out = strip_subagent_orchestration_skill(&assembled_prompt_with_orchestration_skill());
+        assert!(!out.contains("pi-subagents"), "the orchestration entry must be gone: {out}");
+        assert!(!out.contains("Orchestrate subagents"));
+        assert!(out.contains("<name>deploy</name>"), "the unrelated skill survives: {out}");
+        assert!(out.contains("Ship a release"));
+        assert!(out.contains("<available_skills>") && out.contains("</available_skills>"));
+        assert_eq!(out.matches("<skill>").count(), 1, "exactly one entry left: {out}");
+        assert!(out.contains("Current date: 2026-08-09"));
+    }
+
+    /// pi calls it UNCONDITIONALLY (`:108`), outside both inherit guards — so a child that inherits
+    /// every OTHER skill still loses this one.
+    #[test]
+    fn a_child_that_inherits_skills_still_loses_the_orchestration_skill() {
+        let out = rewrite_subagent_prompt(
+            &assembled_prompt_with_orchestration_skill(),
+            &opts(true, true, false),
+        );
+        assert!(out.contains("<name>deploy</name>"), "skills were inherited: {out}");
+        assert!(
+            !out.contains("pi-subagents"),
+            "the parent's orchestration skill must never survive into a child: {out}"
+        );
+    }
+
+    /// A prompt with no orchestration entry is returned unchanged — no stray whitespace edits.
+    #[test]
+    fn stripping_the_orchestration_skill_is_a_no_op_when_absent() {
+        let input = assembled_prompt();
+        assert_eq!(strip_subagent_orchestration_skill(&input), input);
+        assert_eq!(strip_subagent_orchestration_skill("no skills here"), "no skills here");
+    }
+
+    /// Only an exact `<name>pi-subagents</name>` matches — a skill that merely MENTIONS the name in
+    /// its description is left alone (pi's pattern anchors on the `<name>` element, `:47`).
+    #[test]
+    fn a_skill_that_only_mentions_the_name_is_not_removed() {
+        let input = [
+            "<available_skills>",
+            "  <skill>",
+            "    <name>delegation-guide</name>",
+            "    <description>How to use pi-subagents effectively</description>",
+            "  </skill>",
+            "</available_skills>",
+        ]
+        .join("\n");
+        assert_eq!(strip_subagent_orchestration_skill(&input), input);
+    }
+
     #[test]
     fn stripping_a_missing_section_is_a_no_op() {
         assert_eq!(strip_project_context("no sections here"), "no sections here");

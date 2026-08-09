@@ -335,6 +335,35 @@ pub trait NativeExtension: Send + Sync {
     /// WASM `execute-command` shape so the two paths are interchangeable). The default rejects: a
     /// native built-in that registers a command via [`InitApi::register_command`] MUST override this
     /// to service it. Built-ins that only subscribe to events leave it unimplemented.
+    ///
+    /// # How the return value reaches the user — and the `Ok(None)` convention
+    ///
+    /// **`Ok(Some(text))` is surfaced by the session as an [`crate::NotifyKind::Info`]
+    /// notification** (`cyrup-session-svc/src/session.rs`, the `Ok(Some(_))` arm of
+    /// `try_execute_extension_command`). Trimmed-empty text surfaces nothing. An `Err` surfaces as
+    /// an [`crate::NotifyKind::Error`] notification prefixed `command:<name>: `, mirroring Pi's
+    /// `emitError({ extensionPath: \`command:${commandName}\`, … })`
+    /// (agent-session.ts:1295-1299); either way the command counts as HANDLED and the `/name …`
+    /// text never reaches the model as a prompt (Pi `return true`, :1292 and :1300).
+    ///
+    /// This return channel cannot carry a notification LEVEL — it is a `String`, and everything on
+    /// it arrives as Info. So:
+    ///
+    /// - A handler that just wants to say something returns `Ok(Some(text))` and gets Info. This is
+    ///   the common case and needs no thought.
+    /// - **A handler that needs `Warning` or `Error` calls
+    ///   [`crate::HostServices::notify`] itself with the level it wants, and then returns
+    ///   `Ok(None)`.** Returning both the notification AND the text would put the same message on
+    ///   screen twice, once at the chosen level and once as an Info duplicate.
+    ///
+    /// `Ok(None)` therefore means "nothing further to surface" — either the handler genuinely has
+    /// no output, or it has already surfaced its own at a level this channel cannot express. Both
+    /// are silent here, which is correct in both cases.
+    ///
+    /// Reserve `Err` for the command genuinely FAILING (bad routing, a panic, an unserviceable
+    /// name). A user-facing error the handler expects and wants to phrase itself is better sent as
+    /// a self-issued `Error` notify plus `Ok(None)`, which keeps the wording under the handler's
+    /// control instead of wrapping it in the `command:<name>: ` prefix.
     async fn execute_command(
         &self,
         name: &str,

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cyrup_core::{CancelToken, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 
+use crate::format_context::format_context_usage;
 use crate::identity::short_session_id;
 use crate::inbound::format_attachments;
 use crate::session_state::SharedIntercomState;
@@ -341,7 +342,16 @@ fn display_name(session: &SessionInfo) -> &str {
     session.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&session.id)
 }
 
-/// `formatSessionListRow` (`index.ts:400-406`).
+/// `formatSessionListRow` (`v0.9.2 index.ts:423-429`, 7 lines):
+///
+/// ```text
+/// return `• ${name} (${shortSessionId(session.id)}) — ${session.cwd} (${session.model}${formatContextUsage(session)})${suffix}`;
+/// ```
+///
+/// The `formatContextUsage(session)` term sits INSIDE the model parentheses (`v0.9.2 index.ts:428`)
+/// and is the only place upstream surfaces a peer's context usage — `ui/session-list.ts` does not.
+/// It renders the empty string whenever `contextPct` is absent, so a peer that reports nothing is
+/// byte-for-byte the pre-v0.8.0 row.
 fn format_session_list_row(session: &SessionInfo, current_cwd: &str, is_self: bool) -> String {
     let name = session
         .name
@@ -359,11 +369,12 @@ fn format_session_list_row(session: &SessionInfo, current_cwd: &str, is_self: bo
     }
     let suffix = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
     format!(
-        "• {} ({}) — {} ({}){}",
+        "• {} ({}) — {} ({}{}){}",
         name,
         short_session_id(&session.id),
         session.cwd,
         session.model,
+        format_context_usage(session),
         suffix
     )
 }

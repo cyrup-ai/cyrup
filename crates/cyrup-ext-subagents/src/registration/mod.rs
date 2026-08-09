@@ -81,6 +81,13 @@ pub mod cost;
 /// files here.
 pub mod resources;
 
+/// Prompt-template workflows (R-SA-132/134): discovery of the `prompts/*.md` recipes across the
+/// package/user/project tiers plus the argument grammar and recipe→run lowering behind the
+/// `/prompt-workflow` and `/chain-prompts` slash commands. A 1:1 port of
+/// `pi-subagents/src/slash/prompt-workflows.ts` @v0.34.0. See [`prompt_workflows`] for the full
+/// subsystem doc, including which fields of a recipe cyrup's dispatch surface can carry today.
+pub mod prompt_workflows;
+
 // -------------------------------------------------------------------------------------------
 // SubagentExtensionConfig (func-SA §4.7; arch-SA §3.8) — tier 3 of R-SA-133
 // -------------------------------------------------------------------------------------------

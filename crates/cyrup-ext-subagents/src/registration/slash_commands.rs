@@ -90,6 +90,14 @@ pub enum SlashCommandName {
     SubagentsGenerateProfiles,
     SubagentsCheckProfile,
     SubagentsCompanions,
+    /// `/prompt-workflow <name> [args]` — run one `prompts/*.md` recipe (pi
+    /// `prompt-workflows.ts:269` @v0.34.0). NOT one of R-SA-129's thirteen: it comes from
+    /// `registerPromptWorkflowCommands`, which `registerSlashCommands` calls at
+    /// `slash-commands.ts:1099-1102`, so it is a real upstream command on the same surface.
+    PromptWorkflow,
+    /// `/chain-prompts a -> b -- args` — run several recipes as one native subagent chain (pi
+    /// `prompt-workflows.ts:303` @v0.34.0).
+    ChainPrompts,
 }
 
 impl SlashCommandName {
@@ -114,6 +122,8 @@ impl SlashCommandName {
             SlashCommandName::SubagentsGenerateProfiles => "subagents-generate-profiles",
             SlashCommandName::SubagentsCheckProfile => "subagents-check-profile",
             SlashCommandName::SubagentsCompanions => "subagents-companions",
+            SlashCommandName::PromptWorkflow => "prompt-workflow",
+            SlashCommandName::ChainPrompts => "chain-prompts",
         }
     }
 
@@ -212,6 +222,19 @@ pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
         name: SlashCommandName::SubagentsCompanions,
         usage: "Usage: /subagents-companions status | hide <package> <workspace|user> | show <package>",
         description: "Manage companion-extension recommendation visibility",
+    },
+    // The two prompt-template commands `registerPromptWorkflowCommands` adds on top of R-SA-129's
+    // thirteen (`prompt-workflows.ts:269-270,303-304` @v0.34.0). `description` is upstream's
+    // verbatim, with pi's package name rebranded — it is what the command palette shows.
+    SlashCommandDescriptor {
+        name: SlashCommandName::PromptWorkflow,
+        usage: "Usage: /prompt-workflow <name> [args] [--fork|--fresh] [--worktree] [--bg] [--subagent <agent>]",
+        description: "Run a prompt template through native subagents: /prompt-workflow <name> [args]",
+    },
+    SlashCommandDescriptor {
+        name: SlashCommandName::ChainPrompts,
+        usage: "Usage: /chain-prompts prompt-a -> prompt-b -- args",
+        description: "Run prompt templates as a native subagent chain: /chain-prompts analyze -> fix -- args",
     },
 ];
 
@@ -1818,12 +1841,28 @@ mod tests {
     use super::*;
 
     // ---------------------------------------------------------------------------------------
-    // SLASH_COMMANDS table completeness (R-SA-129: exactly 13 commands)
+    // SLASH_COMMANDS table completeness (R-SA-129's 13, plus the 2 prompt-template commands)
     // ---------------------------------------------------------------------------------------
 
+    /// R-SA-129's thirteen, which occupy the table's leading positions and are asserted verbatim by
+    /// [`slash_commands_table_matches_r_sa_129s_exact_list`].
+    const R_SA_129_COMMAND_COUNT: usize = 13;
+
+    /// Upstream's `registerSlashCommands` registers R-SA-129's thirteen AND — at
+    /// `pi-subagents/src/slash/slash-commands.ts:1099-1102` @v0.34.0 —
+    /// `registerPromptWorkflowCommands({ pi, run })`, which registers two more on the SAME command
+    /// surface: `pi.registerCommand("prompt-workflow", …)` (`slash/prompt-workflows.ts:269`) and
+    /// `pi.registerCommand("chain-prompts", …)` (`:303`). This table registers all fifteen, so the
+    /// count is fifteen. The thirteen are still pinned exactly, as a prefix, below.
     #[test]
-    fn slash_commands_table_has_exactly_13_entries() {
-        assert_eq!(SLASH_COMMANDS.len(), 13);
+    fn slash_commands_table_has_the_thirteen_plus_the_two_prompt_commands() {
+        assert_eq!(SLASH_COMMANDS.len(), R_SA_129_COMMAND_COUNT + 2);
+        let tail: Vec<&str> = SLASH_COMMANDS
+            .iter()
+            .skip(R_SA_129_COMMAND_COUNT)
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(tail, ["prompt-workflow", "chain-prompts"]);
     }
 
     #[test]
@@ -1852,7 +1891,11 @@ mod tests {
             "subagents-check-profile",
             "subagents-companions",
         ];
-        let actual: Vec<&str> = SLASH_COMMANDS.iter().map(|d| d.name.as_str()).collect();
+        let actual: Vec<&str> = SLASH_COMMANDS
+            .iter()
+            .take(R_SA_129_COMMAND_COUNT)
+            .map(|d| d.name.as_str())
+            .collect();
         assert_eq!(actual, expected);
     }
 

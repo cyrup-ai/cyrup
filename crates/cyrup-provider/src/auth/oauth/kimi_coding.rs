@@ -700,6 +700,11 @@ impl OAuthAuth for KimiCodingOAuth {
         "Kimi Code (subscription)"
     }
 
+    /// `isSubscription: true` (pi v0.84.1 `oauth/kimi-coding.ts:297`) — a Kimi Code plan.
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// `kimi-coding.ts:290`.
     fn login_label(&self) -> Option<&str> {
         Some("Sign in with Kimi Code")

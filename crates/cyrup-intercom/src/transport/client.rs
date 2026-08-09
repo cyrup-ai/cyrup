@@ -380,9 +380,12 @@ impl IntercomClient {
     /// CLEARS the field — the right thing right after a compaction, when the value is unknown and
     /// carrying the stale-high one forward would be a lie), and `Some(Some(n))` sets it.
     ///
-    /// Nothing in cyrup calls this with a populated context yet: producing the numbers needs a
-    /// `getContextUsage()` equivalent from the session layer, which lives in another crate. The
-    /// method exists so the wire model is complete and so the tri-state is exercised end to end.
+    /// WIRED: the production presence heartbeat calls this with a populated context on every
+    /// agent/tool lifecycle edge — `IntercomExtension::sync_presence` reads
+    /// `HostServices::context_usage()` through `IntercomExtension::current_context_usage`, pi's
+    /// `client.updatePresence({ status: currentStatus(), ...currentContextUsage() })`
+    /// (`v0.9.2 index.ts:842-848`). A peer's `/intercom` picker and `intercom({action:"list"})`
+    /// therefore show this session's live `NN% ctx (used/window)`.
     pub fn update_presence_with_context(
         &self,
         name: Option<String>,

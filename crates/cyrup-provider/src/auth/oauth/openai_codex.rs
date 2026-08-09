@@ -1026,6 +1026,11 @@ impl OAuthAuth for OpenAiCodexOAuthFlow {
         OPENAI_CODEX_OAUTH_NAME
     }
 
+    /// `isSubscription: true` (pi v0.84.1 `oauth/openai-codex.ts:517`) — a ChatGPT Plus/Pro plan.
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// `openaiCodexOAuth.login` (`openai-codex.ts:495-532`): pick a method, then run it.
     ///
     /// The `select` answer is an option **id**, and anything other than the two known ids is
