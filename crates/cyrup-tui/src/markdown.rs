@@ -8,15 +8,20 @@
 //! - **Headings** — H1/H2 drop the `#` prefix and bold (H1 also underlines); H3–H6 keep a literal
 //!   `### ` prefix then bold, with a trailing blank line (`markdown.ts:336-362`).
 //! - **Lists** — `- ` unordered (in `mdListBullet`), `N. ` ordered renumbered from `start`, and
-//!   `[ ] `/`[x] ` task markers; nesting indents two columns per level (`markdown.ts:591-654`).
+//!   `- [ ] `/`- [x] ` task markers (the box is appended to the bullet, `markdown.ts:770-774`);
+//!   nesting indents **four** columns per level (`markdown.ts:758`).
 //! - **Blockquote** — each line prefixed `│ ` in `mdQuoteBorder`, body italic in `mdQuote`
 //!   (`markdown.ts:414-461`).
 //! - **Horizontal rule** — `─` × `min(width, 80)` in `mdHr` (`markdown.ts:463-468`).
 //! - **Fenced code** — literal ```` ``` ````+info fence lines in `mdCodeBlockBorder`, a 2-space indent
 //!   per code line, syntect highlighting when the language is explicitly known (auto-detect **off**,
 //!   spec/tui/06 §3.1) else a flat `mdCodeBlock` body (`markdown.ts:378-398`).
-//! - **Inline** — bold/italic/strikethrough, inline code in `mdCode` (no backticks), links underlined
-//!   in `mdLink` with a trailing ` (url)` in `mdLinkUrl` when the text differs (`markdown.ts:492-589`).
+//! - **Inline** — bold/italic/strikethrough (`~~` only — Pi's `StrictStrikethroughTokenizer`,
+//!   `markdown.ts:7-24`), inline code in `mdCode` (no backticks), links underlined in `mdLink` with a
+//!   trailing ` (url)` in `mdLinkUrl` when the text differs **and** the terminal cannot render OSC-8
+//!   (`markdown.ts:689-708`).
+//! - **Soft line breaks** — a `\n` inside a paragraph stays a row break, because marked leaves it in
+//!   the text token and `wrapTextWithAnsi` splits on it (`markdown.ts:638-641`, `utils.ts:839`).
 //! - **Streaming partial-fence trim** ([`trim_partial_closing_fence`]) keeps a streaming code block
 //!   from flickering open/closed as the closing fence arrives char-by-char (`markdown.ts:25-48`).
 
@@ -26,6 +31,7 @@ use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::UiTheme;
 
@@ -71,14 +77,52 @@ pub fn render_with_default_style(
     color: Option<ratatui::style::Color>,
     italic: bool,
 ) -> Vec<Line<'static>> {
+    render_inner(text, width, theme, color, italic, crate::image::hyperlinks_supported())
+}
+
+/// [`render`] with the terminal's OSC-8 hyperlink capability supplied explicitly instead of read
+/// from the process-wide capability cache — Pi's `getCapabilities().hyperlinks` gate on the inline
+/// ` (url)` suffix (`tui/src/components/markdown.ts:692-707`).
+///
+/// Upstream, a hyperlink-capable terminal gets `hyperlink(styledLink, token.href)` (an OSC-8 escape
+/// wrapping the link text) and the URL is **not** printed inline; an incapable one gets the legacy
+/// `text (url)`. cyrup renders through ratatui's cell buffer, which has no channel for an OSC-8
+/// escape — a `\x1b]8;;…` inside a [`Span`] would be laid into cells as literal text — so the
+/// capable branch here emits the link text alone, matching upstream's *visible* row exactly while
+/// omitting the (unrepresentable) clickable wrapper. The incapable branch is byte-identical to
+/// upstream.
+///
+/// Exists so tests can drive both branches without touching the global cache.
+pub fn render_with_hyperlink_support(
+    text: &str,
+    width: usize,
+    theme: &UiTheme,
+    hyperlinks: bool,
+) -> Vec<Line<'static>> {
+    render_inner(text, width, theme, None, false, hyperlinks)
+}
+
+fn render_inner(
+    text: &str,
+    width: usize,
+    theme: &UiTheme,
+    color: Option<ratatui::style::Color>,
+    italic: bool,
+    hyperlinks: bool,
+) -> Vec<Line<'static>> {
     // Tabs → 3 spaces before parse (`markdown.ts:171`).
     let prepared = text.replace('\t', "   ");
     let mut r = MdRenderer::new(width, theme);
     r.default_text = color;
     r.default_italic = italic;
+    r.hyperlinks = hyperlinks;
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    for ev in Parser::new_ext(&prepared, opts) {
-        r.event(ev);
+    // `into_offset_iter` (rather than the plain event iterator) because two upstream behaviours are
+    // defined on the *source* text, not on the event: the strict `~~`-only strikethrough tokenizer
+    // (`markdown.ts:7-24`) and the too-narrow table fallback to `token.raw` (`markdown.ts:854-861`).
+    for (ev, range) in Parser::new_ext(&prepared, opts).into_offset_iter() {
+        let raw = prepared.get(range).unwrap_or("");
+        r.event(ev, raw);
     }
     r.finish()
 }
@@ -162,6 +206,9 @@ struct MdRenderer<'t> {
     quote: u32,
     /// List context stack: `Some(next_number)` ordered, `None` unordered.
     lists: Vec<Option<u64>>,
+    /// One frame per *open list item*, innermost last — the state behind Pi's `firstPrefix` /
+    /// `continuationPrefix` pair (`markdown.ts:774-775`).
+    items: Vec<ItemFrame>,
     /// Pending list-item marker (emitted lazily before the item's first inline text).
     pending_marker: Option<(String, Style)>,
     /// Active link href (the trailing ` (url)` is emitted on link end).
@@ -179,6 +226,32 @@ struct MdRenderer<'t> {
     /// Pi's `Markdown` `{ italic }` option — the second leg of `applyDefaultStyle`
     /// (`markdown.ts:393-395`). Applied alongside [`Self::default_text`] on plain prose only.
     default_italic: bool,
+    /// `getCapabilities().hyperlinks` (`markdown.ts:692`): when the terminal forwards OSC-8, Pi
+    /// prints the link text ONLY and never the ` (url)` suffix.
+    hyperlinks: bool,
+    /// One entry per open `Tag::Strikethrough`: `true` when the source delimiter was a **single**
+    /// `~`, which Pi's `StrictStrikethroughTokenizer` (`markdown.ts:7-24`) never tokenizes as `del`
+    /// — those levels re-emit their literal tildes instead of striking.
+    strike_literal: Vec<bool>,
+}
+
+/// One open list item's prefix state.
+///
+/// Upstream builds two prefixes per item and picks between them per emitted row:
+/// ```text
+/// const firstPrefix = indent + this.theme.listBullet(marker);
+/// const continuationPrefix = indent + " ".repeat(visibleWidth(marker));
+/// …
+/// const linePrefix = renderedAnyLine ? continuationPrefix : firstPrefix;
+/// ```
+/// (`markdown.ts:774-775`, `:789`). `marker_w` is that `visibleWidth(marker)` — of the WHOLE marker,
+/// bullet + task box (`:772-773`) — and `rendered` is `renderedAnyLine`.
+#[derive(Default)]
+struct ItemFrame {
+    /// `visibleWidth(marker)`; 0 until the marker is actually emitted.
+    marker_w: usize,
+    /// `renderedAnyLine` — false only until this item's first row is opened.
+    rendered: bool,
 }
 
 #[derive(Default)]
@@ -188,6 +261,9 @@ struct TableCapture {
     cur_row: Vec<String>,
     header: Vec<String>,
     rows: Vec<Vec<String>>,
+    /// The table's source Markdown — marked's `token.raw`, the too-narrow fallback body
+    /// (`markdown.ts:856`).
+    raw: String,
 }
 
 impl<'t> MdRenderer<'t> {
@@ -203,6 +279,7 @@ impl<'t> MdRenderer<'t> {
             heading: None,
             quote: 0,
             lists: Vec::new(),
+            items: Vec::new(),
             pending_marker: None,
             link: None,
             link_text: String::new(),
@@ -211,6 +288,8 @@ impl<'t> MdRenderer<'t> {
             table: None,
             default_text: None,
             default_italic: false,
+            hyperlinks: false,
+            strike_literal: Vec::new(),
         }
     }
 
@@ -253,7 +332,14 @@ impl<'t> MdRenderer<'t> {
     /// Push owned styled text onto the current line, materializing any pending list marker first.
     fn push_text(&mut self, text: &str, style: Style) {
         if let Some((marker, mstyle)) = self.pending_marker.take() {
+            // `firstPrefix = indent + this.theme.listBullet(marker)` (`markdown.ts:774`). The frame
+            // records the marker's visible width and flips to `renderedAnyLine` (`:789-791`) so every
+            // LATER row of this item pads instead of re-bulleting.
             self.start_line_prefix();
+            if let Some(frame) = self.items.last_mut() {
+                frame.marker_w = display_width(&marker);
+                frame.rendered = true;
+            }
             self.cur.push(Span::styled(marker, mstyle));
         } else if self.cur.is_empty() {
             self.start_line_prefix();
@@ -264,14 +350,28 @@ impl<'t> MdRenderer<'t> {
         self.cur.push(Span::styled(text.to_string(), style));
     }
 
-    /// Emit the leading quote/indent prefix at the start of a fresh line.
+    /// Emit the leading quote/indent/list prefix at the start of a fresh line.
     fn start_line_prefix(&mut self) {
         for _ in 0..self.quote {
             self.cur.push(Span::styled("│ ".to_string(), self.theme.md_quote_border_style()));
         }
         let depth = self.lists.len().saturating_sub(1);
         if depth > 0 {
-            self.cur.push(Span::raw("  ".repeat(depth)));
+            // `const indent = "    ".repeat(depth)` — FOUR spaces per nesting level
+            // (`markdown.ts:758`), not two.
+            self.cur.push(Span::raw("    ".repeat(depth)));
+        }
+        // `const continuationPrefix = indent + " ".repeat(visibleWidth(marker));` (`markdown.ts:775`)
+        // — every row of a list item AFTER its first is padded past the bullet, so a soft break, a
+        // hard break or a second block inside the item lines up under the item's text instead of
+        // falling back to column 0. Only the INNERMOST open item pads: a nested list's rows are
+        // pushed by `renderList(…, depth + 1, …)` directly (`:781`), never through the parent's
+        // `linePrefix`, which is exactly what the `items.last()` read reproduces.
+        if let Some(frame) = self.items.last()
+            && frame.rendered
+            && frame.marker_w > 0
+        {
+            self.cur.push(Span::raw(" ".repeat(frame.marker_w)));
         }
     }
 
@@ -294,9 +394,22 @@ impl<'t> MdRenderer<'t> {
         }
     }
 
-    fn event(&mut self, ev: Event<'_>) {
+    /// Emit literal source text through the same three-way sink as [`Event::Text`] (table cell /
+    /// code buffer / styled inline run). Used for the tildes of a non-strikethrough `~…~` run.
+    fn emit_literal(&mut self, text: &str) {
+        if let Some(table) = self.table.as_mut() {
+            table.cur_cell.push_str(text);
+        } else if self.code_lang.is_some() {
+            self.code_buf.push_str(text);
+        } else {
+            let style = self.inline_style();
+            self.push_text(text, style);
+        }
+    }
+
+    fn event(&mut self, ev: Event<'_>, raw: &str) {
         match ev {
-            Event::Start(tag) => self.start(tag),
+            Event::Start(tag) => self.start(tag, raw),
             Event::End(tag) => self.end(tag),
             Event::Text(t) => {
                 if let Some(table) = self.table.as_mut() {
@@ -317,9 +430,13 @@ impl<'t> MdRenderer<'t> {
                 }
             }
             Event::SoftBreak => {
+                // A source line break inside a paragraph stays a line break: marked keeps the `\n`
+                // inside the text token (which is why `renderInlineTokens` splits and rejoins on
+                // `\n`, `markdown.ts:638-641`) and `wrapTextWithAnsi` then splits the rendered line
+                // on `/\r\n|\r|\n/` into one output row per source line (`utils.ts:839`). It is NOT
+                // collapsed to a space.
                 if self.table.is_none() {
-                    let style = self.inline_style();
-                    self.push_text(" ", style);
+                    self.flush_line();
                 }
             }
             Event::HardBreak => self.flush_line(),
@@ -327,11 +444,23 @@ impl<'t> MdRenderer<'t> {
                 self.flush_line();
                 let n = self.width.clamp(1, 80);
                 self.out.push(Line::styled("─".repeat(n), self.theme.md_hr_style()));
+                // `case "hr": … if (nextTokenType && nextTokenType !== "space") lines.push("")`
+                // (`markdown.ts:605-610`); when a `space` token *does* follow, `:619-622` supplies
+                // the blank instead. Either way exactly one — which is what `blank()` guarantees.
+                self.blank();
             }
             Event::TaskListMarker(checked) => {
                 let mark = if checked { "[x] " } else { "[ ] " };
-                // Replace the bullet marker that the list item already queued.
-                self.pending_marker = Some((mark.to_string(), self.theme.md_list_bullet_style()));
+                // `marker = bullet + taskMarker` (`markdown.ts:770-773`): the task box is APPENDED to
+                // the `- ` bullet the item already queued, not a replacement for it, and the whole
+                // marker carries `listBullet` (`:774`).
+                match self.pending_marker.as_mut() {
+                    Some((marker, _)) => marker.push_str(mark),
+                    None => {
+                        self.pending_marker =
+                            Some((mark.to_string(), self.theme.md_list_bullet_style()));
+                    }
+                }
             }
             Event::Html(h) | Event::InlineHtml(h) => {
                 let style = self.inline_style();
@@ -341,7 +470,7 @@ impl<'t> MdRenderer<'t> {
         }
     }
 
-    fn start(&mut self, tag: Tag<'_>) {
+    fn start(&mut self, tag: Tag<'_>, raw: &str) {
         match tag {
             Tag::Heading { level, .. } => {
                 self.flush_line();
@@ -361,7 +490,6 @@ impl<'t> MdRenderer<'t> {
                 self.lists.push(start);
             }
             Tag::Item => {
-                let depth = self.lists.len().saturating_sub(1);
                 let marker = match self.lists.last_mut() {
                     Some(Some(n)) => {
                         let s = format!("{n}. ");
@@ -370,7 +498,8 @@ impl<'t> MdRenderer<'t> {
                     }
                     _ => "- ".to_string(),
                 };
-                let _ = depth;
+                // A fresh `renderedAnyLine = false` per item (`markdown.ts:777`).
+                self.items.push(ItemFrame::default());
                 self.pending_marker = Some((marker, self.theme.md_list_bullet_style()));
             }
             Tag::BlockQuote(_) => {
@@ -380,23 +509,46 @@ impl<'t> MdRenderer<'t> {
             Tag::CodeBlock(kind) => {
                 self.flush_line();
                 self.code_lang = Some(match kind {
-                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
-                        info.split_whitespace().next().unwrap_or("").to_string()
-                    }
+                    // The WHOLE (trimmed) info string, not just its first word: marked sets
+                    // `token.lang` to the trimmed info string — which is why every consumer that
+                    // wants the bare language splits it itself, e.g. `mermaid.ts:15`
+                    // `token.lang?.trim().split(/\s+/, 1)[0]?.toLowerCase() === "mermaid"`. Pi's
+                    // fence line is `` `${"```"}${token.lang || ""}` `` (`markdown.ts:522`) and its
+                    // highlighter is handed the same unsplit string (`:524` →
+                    // `theme.ts:1268-1272` `supportsLanguage(lang)`), so `js title="x"` prints in
+                    // full AND falls back to a flat body — which is exactly what
+                    // `highlight_lines`'s `find_syntax_by_token` does with it here.
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => info.trim().to_string(),
                     pulldown_cmark::CodeBlockKind::Indented => String::new(),
                 });
                 self.code_buf.clear();
             }
             Tag::Emphasis => self.italic = self.italic.saturating_add(1),
             Tag::Strong => self.bold = self.bold.saturating_add(1),
-            Tag::Strikethrough => self.strike = self.strike.saturating_add(1),
+            Tag::Strikethrough => {
+                // Pi installs a `StrictStrikethroughTokenizer` whose `del()` only matches
+                // `/^(~~)(?=[^\s~])…\1(?=[^~]|$)/` (`markdown.ts:7-24`, `:171-174`), so a
+                // SINGLE-tilde run is never a `del` token — `~/path~` and `a~b~c` keep their tildes
+                // and their normal styling. pulldown-cmark's GFM strikethrough accepts both `~` and
+                // `~~`, so reject the single-tilde form here from the source delimiter.
+                let literal = !raw.starts_with("~~");
+                self.strike_literal.push(literal);
+                if literal {
+                    self.emit_literal("~");
+                } else {
+                    self.strike = self.strike.saturating_add(1);
+                }
+            }
             Tag::Link { dest_url, .. } => {
                 self.link = Some(dest_url.to_string());
                 self.link_text.clear();
             }
             Tag::Table(_) => {
                 self.flush_line();
-                self.table = Some(TableCapture::default());
+                // `token.raw` — the fallback body when the pane is too narrow for the grid
+                // (`markdown.ts:854-861`). The offset iterator's `Start(Table)` range is the whole
+                // table source (header + delimiter row + body).
+                self.table = Some(TableCapture { raw: raw.to_string(), ..TableCapture::default() });
             }
             Tag::TableHead => {
                 if let Some(t) = self.table.as_mut() {
@@ -434,7 +586,12 @@ impl<'t> MdRenderer<'t> {
                     self.blank();
                 }
             }
-            TagEnd::Item => self.flush_line(),
+            TagEnd::Item => {
+                self.flush_line();
+                self.items.pop();
+                // An item that emitted nothing still leaves no marker queued for the NEXT item.
+                self.pending_marker = None;
+            }
             TagEnd::BlockQuote(_) => {
                 self.flush_line();
                 self.quote = self.quote.saturating_sub(1);
@@ -449,12 +606,29 @@ impl<'t> MdRenderer<'t> {
             }
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
             TagEnd::Strong => self.bold = self.bold.saturating_sub(1),
-            TagEnd::Strikethrough => self.strike = self.strike.saturating_sub(1),
+            TagEnd::Strikethrough => match self.strike_literal.pop() {
+                // A single-tilde run Pi never tokenizes as `del`: close it with its literal `~`.
+                Some(true) => self.emit_literal("~"),
+                _ => self.strike = self.strike.saturating_sub(1),
+            },
             TagEnd::Link => {
                 if let Some(href) = self.link.take() {
                     let text = std::mem::take(&mut self.link_text);
                     let stripped = href.strip_prefix("mailto:").unwrap_or(&href);
-                    if !text.is_empty() && text != stripped {
+                    // `if (getCapabilities().hyperlinks) { result += hyperlink(styledLink,
+                    // token.href) … }` — on a hyperlink-capable terminal the URL is NOT printed
+                    // inline, "regardless of whether it matches href" (`markdown.ts:692-696`). The
+                    // ` (url)` suffix is the incapable-terminal fallback only (`:697-707`).
+                    // The fallback test is EXACTLY `token.text === token.href || token.text ===
+                    // hrefForComparison` (`markdown.ts:701-702`) — there is no emptiness clause. An
+                    // empty-texted link `[](https://x)` is `"" !== href`, so upstream DOES print the
+                    // ` (url)` suffix; suppressing it here swallowed the only trace of the link.
+                    // BOTH disjuncts: `token.text === token.href || token.text ===
+                    // hrefForComparison` (`markdown.ts:701-702`). Testing only the stripped form
+                    // misses a link whose text is the FULL `mailto:` href — `[mailto:a@b](mailto:a@b)`
+                    // — which upstream treats as self-describing and cyrup would have followed with
+                    // a redundant ` (mailto:a@b)`.
+                    if !self.hyperlinks && text != href && text != stripped {
                         let style = self.theme.md_link_url_style();
                         self.push_text(&format!(" ({href})"), style);
                     }
@@ -493,6 +667,18 @@ impl<'t> MdRenderer<'t> {
 
     /// Emit a fenced code block: top fence line, highlighted (or flat) body, bottom fence line.
     fn emit_code_block(&mut self, lang: &str, code: &str) {
+        // marked's `fences` tokenizer is
+        // `/^ {0,3}(`{3,}(?=[^`\n]*\n)|~{3,})([^\n]*)(?:\n|$)(?:|([\s\S]*?)(?:\n|$))(?: {0,3}\1[~`]* *(?=\n|$)|$)/`
+        // — the body is capture 3 and the `(?:\n|$)` that follows it consumes the newline BEFORE the
+        // closing fence, so that newline is not in `token.text`. Pi then does
+        // `token.text.split("\n")` (`markdown.ts:530`, and `highlightCode(token.text, …)` on the
+        // highlighted path at `:524`), which yields ONE line for a one-line body.
+        //
+        // pulldown-cmark's code-block `Text` events DO include that final newline, so splitting the
+        // buffer as-is yields a trailing `""` and every fenced block grew a spurious indent-only row
+        // between the last code line and the closing fence. Strip exactly one trailing `\n` — not
+        // `trim_end`, which would also eat a deliberately blank final code line.
+        let code = code.strip_suffix('\n').unwrap_or(code);
         let border = self.theme.md_code_block_border_style();
         self.out.push(Line::styled(format!("```{lang}"), border));
         for line in highlight_lines(code, lang, self.theme) {
@@ -502,21 +688,57 @@ impl<'t> MdRenderer<'t> {
         self.blank();
     }
 
-    /// Emit the captured table as a full box-drawing grid (`┌┬┐ ├┼┤ └┴┘ │ ─`), a 1:1 port of
-    /// `markdown.ts:685-856` `renderTable`: per-column width fitting to the content width, a bold
-    /// header band, a `├─┼─┤` separator between **every** row, and width-aware cell wrapping. Closes
-    /// gap 12 (tables were previously ` │ `-joined, no grid). Border rows render in `mdHr`, the header
-    /// bold, body cells in the base style.
+    /// Emit the captured table as a full box-drawing grid (`┌┬┐ ├┼┤ └┴┘ │ ─`), a port of
+    /// `markdown.ts:837-1009` `renderTable`: per-column width fitting to the content width, a bold
+    /// header band, and width-aware cell wrapping. Closes gap 12 (tables were previously
+    /// ` │ `-joined, no grid).
+    ///
+    /// Exactly **one** `├─┼─┤` separator follows the header band (`markdown.ts:975-977`), and after
+    /// that a separator is emitted only BETWEEN body rows — `if (rowIndex < token.rows.length - 1)
+    /// lines.push(separatorLine)` (`:996-998`) — so the last body row butts straight onto the
+    /// `└─┴─┘`. (An earlier revision of this comment claimed a separator between *every* row; the
+    /// code never did that, only the prose did.)
+    ///
+    /// The frame is UNSTYLED upstream, so it takes the body colour; header cells are body colour +
+    /// bold; body cells the base style. A pane too narrow for the grid degrades to the raw Markdown
+    /// (`markdown.ts:853-861`).
     fn emit_table(&mut self) {
         let Some(t) = self.table.take() else { return };
         let num_cols = t.header.len();
         if num_cols == 0 {
             return;
         }
-        // Border overhead = "│ " + (n-1)*" │ " + " │" = 3n + 1 (`markdown.ts:700`).
+        // Border overhead = "│ " + (n-1)*" │ " + " │" = 3n + 1 (`markdown.ts:850-852`).
         let overhead = 3usize.saturating_mul(num_cols).saturating_add(1);
-        let avail = self.width.max(overhead.saturating_add(num_cols));
-        let avail_cells = avail.saturating_sub(overhead);
+        // `const availableForCells = availableWidth - borderOverhead; if (availableForCells <
+        // numCols) { … return token.raw ? wrapTextWithAnsi(token.raw, availableWidth) : []; }`
+        // (`markdown.ts:853-861`) — too narrow for a stable grid, so degrade to the raw Markdown
+        // instead of drawing a grid wider than the pane. Signed there, saturating here: the guard is
+        // `width < overhead + numCols`.
+        if self.width < overhead.saturating_add(num_cols) {
+            let style = self.theme.assistant_style();
+            // `wrapTextWithAnsi(token.raw, availableWidth)` (`markdown.ts:856`) — the raw source is
+            // WRAPPED to the pane, not pushed through at its natural width, so the fallback never
+            // draws wider than the grid it replaced. `wrapTextWithAnsi` splits on `\n` first
+            // (`utils.ts:838-839`) and word-wraps each resulting line, which is what running
+            // [`wrap_cell`] per source line does here.
+            //
+            // Routed through `push_text` + `flush_line` rather than straight onto `self.out` so the
+            // rows collect the same `│ `/indent prefixes as everything else: upstream the fallback is
+            // a plain `string[]` return whose caller prefixes it — `this.theme.quoteBorder("│ ") +
+            // wrappedLine` for a blockquote (`markdown.ts:596`), `linePrefix + wrappedLine` for a
+            // list item (`:790`).
+            for src in t.raw.trim_end_matches('\n').split('\n') {
+                for row in wrap_cell(src, self.width) {
+                    self.push_text(&row, style);
+                    self.flush_line();
+                }
+            }
+            // `if (nextTokenType && nextTokenType !== "space") fallbackLines.push("")` (`:857-859`).
+            self.blank();
+            return;
+        }
+        let avail_cells = self.width.saturating_sub(overhead);
 
         // Natural width per column = widest visible cell (header + body), clamped to ≥1. Index-free.
         let natural: Vec<usize> = (0..num_cols)
@@ -569,12 +791,17 @@ impl<'t> MdRenderer<'t> {
             w
         };
 
-        let hr = self.theme.md_hr_style();
-        let heading = self.theme.md_heading_style();
+        // The grid is drawn with NO theme function at all upstream — `` `┌─${…join("─┬─")}─┐` ``
+        // (`markdown.ts:956`), `` `│ ${rowParts.join(" │ ")} │` `` (`:971`), `` `├─…─┼─…─┤` ``
+        // (`:976`) and `` `└─…─┴─…─┘` `` (`:1003`) are plain template strings, so the frame renders
+        // in the same colour as body prose rather than in `mdHr`.
         let base = self.theme.assistant_style();
+        // `return this.theme.bold(padded)` (`:966-970`) — pure SGR-1 over the cell's own text; it
+        // adds NO foreground of its own, so a header cell is body colour + bold, never `mdHeading`.
+        let heading = base.add_modifier(Modifier::BOLD);
         let border = |left: &str, mid: &str, right: &str, ws: &[usize]| -> Line<'static> {
             let cells: Vec<String> = ws.iter().map(|w| "─".repeat(*w)).collect();
-            Line::styled(format!("{left}{}{right}", cells.join(mid)), hr)
+            Line::styled(format!("{left}{}{right}", cells.join(mid)), base)
         };
 
         // Top border ┌─...─┬─...─┐.
@@ -596,10 +823,11 @@ impl<'t> MdRenderer<'t> {
     }
 
     /// Render one table row of `cells` into `│ … │` lines, wrapping each cell to its column width and
-    /// padding short cells with spaces (`markdown.ts:806-842`). The `│` separators render in `mdHr`,
-    /// the cell text in `cell_style`.
+    /// padding short cells with spaces (`markdown.ts:958-994`). The `│` separators are **unstyled**
+    /// upstream (`:971` is a plain template string), so they take the same body colour as the rest of
+    /// the frame; the cell text renders in `cell_style`.
     fn push_table_row(&mut self, cells: &[String], widths: &[usize], cell_style: Style, bar: char) {
-        let hr = self.theme.md_hr_style();
+        let bar_style = self.theme.assistant_style();
         let wrapped: Vec<Vec<String>> = widths
             .iter()
             .enumerate()
@@ -608,16 +836,16 @@ impl<'t> MdRenderer<'t> {
         let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
         for li in 0..height {
             let mut spans: Vec<Span<'static>> = Vec::with_capacity(widths.len() * 2 + 1);
-            spans.push(Span::styled(format!("{bar} "), hr));
+            spans.push(Span::styled(format!("{bar} "), bar_style));
             for (ci, w) in widths.iter().enumerate() {
                 if ci > 0 {
-                    spans.push(Span::styled(format!(" {bar} "), hr));
+                    spans.push(Span::styled(format!(" {bar} "), bar_style));
                 }
                 let text = wrapped.get(ci).and_then(|c| c.get(li)).cloned().unwrap_or_default();
                 let pad = w.saturating_sub(display_width(&text));
                 spans.push(Span::styled(format!("{text}{}", " ".repeat(pad)), cell_style));
             }
-            spans.push(Span::styled(format!(" {bar}"), hr));
+            spans.push(Span::styled(format!(" {bar}"), bar_style));
             self.out.push(Line::from(spans));
         }
     }
@@ -639,11 +867,22 @@ fn display_width(s: &str) -> usize {
     Span::raw(s).width()
 }
 
-/// Greedy word-wrap `text` to a column of `width` cells (`markdown.ts:672` `wrapCellText`): split on
-/// spaces, pack words onto a line, and hard-break any single word wider than the column. Always
-/// returns at least one (possibly empty) line so a cell occupies a row.
+/// Greedy word-wrap `text` to a column of `width` cells — Pi's `wrapCellText` (`markdown.ts:829-831`),
+/// which is `wrapTextWithAnsi(text, Math.max(1, maxWidth))`: split on spaces, pack words onto a line,
+/// and hard-break any single word wider than the column. Always returns at least one (possibly empty)
+/// line so a cell occupies a row.
+///
+/// The long-word break walks **extended grapheme clusters**, not `char`s — Pi's `breakLongWord`
+/// segments with `graphemeSegmenter.segment(textPortion)` and advances one `seg.segment` at a time
+/// (`tui/src/utils.ts:977-979`, `:986-1013`). A `char` walk splits a ZWJ emoji family between its
+/// members and detaches a combining mark from its base, both of which corrupt the cell.
 fn wrap_cell(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
+    // `if (visibleLength <= width) return [line];` (`utils.ts:1006-1009`) — a line that already fits
+    // is returned VERBATIM, keeping its interior spacing rather than being re-packed word by word.
+    if display_width(text) <= width {
+        return vec![text.to_string()];
+    }
     let mut out: Vec<String> = Vec::new();
     let mut line = String::new();
     let mut line_w = 0usize;
@@ -657,13 +896,19 @@ fn wrap_cell(text: &str, width: usize) -> Vec<String> {
             }
             let mut chunk = String::new();
             let mut chunk_w = 0usize;
-            for ch in word.chars() {
-                let cw = display_width(ch.encode_utf8(&mut [0u8; 4]));
+            for cluster in word.graphemes(true) {
+                let cw = display_width(cluster);
+                // `if (currentWidth + graphemeWidth > width) { lines.push(currentLine); … }`
+                // (`utils.ts:1000-1010`) — unguarded upstream, so a cluster WIDER than the column
+                // (a CJK ideograph in a 1-cell column) flushes an empty row and is then emitted
+                // whole. Clusters are never split below the cluster, so the row overflows by design
+                // rather than dropping half a glyph; `Math.max(0, …)` on the pad (`:991`) is what
+                // keeps that from underflowing upstream, and `saturating_sub` here.
                 if chunk_w + cw > width {
                     out.push(std::mem::take(&mut chunk));
                     chunk_w = 0;
                 }
-                chunk.push(ch);
+                chunk.push_str(cluster);
                 chunk_w += cw;
             }
             if !chunk.is_empty() {
@@ -821,4 +1066,3 @@ fn scope_style(stack: &ScopeStack, theme: &UiTheme) -> Option<Style> {
     }
     None
 }
-

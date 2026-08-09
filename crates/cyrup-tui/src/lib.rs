@@ -121,7 +121,8 @@ pub use error::TuiError;
 pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
 pub use image::{
     detect_capabilities, detect_capabilities_from, detect_capabilities_on_platform,
-    image_fallback_text, ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities,
+    hyperlinks_supported, image_fallback_text, seed_hyperlink_support, ImageBlock, ImageProtocol,
+    ImageRenderer, TerminalCapabilities,
 };
 pub use keyboard_protocol::{
     current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,
@@ -138,8 +139,8 @@ pub use login_dialog::{
     TuiAuthInteraction,
 };
 pub use markdown::{
-    render as render_markdown, render_with_text_color as render_markdown_with_text_color,
-    trim_partial_closing_fence,
+    render as render_markdown, render_with_hyperlink_support as render_markdown_with_hyperlinks,
+    render_with_text_color as render_markdown_with_text_color, trim_partial_closing_fence,
 };
 pub use model_selector::{ModelEntry, ModelSelector};
 pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE};

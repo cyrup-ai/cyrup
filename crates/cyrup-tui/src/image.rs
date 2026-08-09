@@ -423,6 +423,41 @@ pub fn detect_capabilities() -> TerminalCapabilities {
     detect_capabilities_from(|k| std::env::var(k).ok(), probe_tmux_hyperlinks())
 }
 
+/// The process-wide OSC-8 answer, Pi's module-level `cachedCapabilities` + `getCapabilities()`
+/// (`tui/src/terminal-image.ts:33`, `:138-143`): detect once, then hand the same answer to every
+/// later caller. Renderers consult it through [`hyperlinks_supported`]; the app seeds it from the
+/// capabilities it already detected at startup via [`seed_hyperlink_support`].
+static HYPERLINKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the controlling terminal forwards OSC-8 hyperlinks — Pi `getCapabilities().hyperlinks`,
+/// the gate on `markdown.ts:692`. Detected once and cached for the life of the process, exactly as
+/// upstream caches `detectCapabilities()`.
+///
+/// **This is a pure environment read, unconditionally — it never spawns a subprocess**, which is
+/// what makes it safe to call from a render path. The lazy fallback therefore uses
+/// [`detect_capabilities_from`] with `tmux_forwards_hyperlinks = false` rather than
+/// [`detect_capabilities`], whose `probe_tmux_hyperlinks` shells out to
+/// `tmux display-message -p '#{client_termfeatures}'`. Redrawing a transcript must not fork.
+///
+/// The probe's answer is not lost: [`App::detect_image_support`](crate::App::detect_image_support)
+/// runs the full [`detect_capabilities`] once at startup and seeds this cache via
+/// [`seed_hyperlink_support`], so a real tmux session with forwarding enabled is already recorded
+/// before the first frame. The non-probing fallback only decides for embedders that render without
+/// ever detecting, and for them `false` is upstream's own stated conservative default — "Default to
+/// the legacy `text (url)` behavior unless we have positively identified a hyperlink-capable
+/// terminal above" (`tui/src/terminal-image.ts:130-134`) — which prints the URL rather than risking
+/// a terminal that swallows OSC-8 and shows nothing.
+pub fn hyperlinks_supported() -> bool {
+    *HYPERLINKS.get_or_init(|| detect_capabilities_from(|k| std::env::var(k).ok(), false).hyperlinks)
+}
+
+/// Seed [`hyperlinks_supported`] from capabilities that have already been detected, so startup's
+/// single `detectCapabilities()` serves the renderer too. First writer wins (later calls are no-ops),
+/// matching upstream's write-once `cachedCapabilities`.
+pub fn seed_hyperlink_support(supported: bool) {
+    let _ = HYPERLINKS.set(supported);
+}
+
 /// The pure core of [`detect_capabilities`] for the *host* platform (Pi `detectCapabilities`,
 /// v0.84.1 `tui/src/terminal-image.ts:68-132`), parameterised over an environment lookup + the
 /// tmux-hyperlink-forwarding flag so both branches are deterministically testable.

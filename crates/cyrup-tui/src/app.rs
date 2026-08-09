@@ -963,6 +963,10 @@ impl<B: Backend> App<B> {
     pub fn detect_image_support(&mut self) {
         let caps = crate::image::detect_capabilities();
         self.state.capabilities = caps;
+        // Seed the process-wide OSC-8 answer the markdown renderer reads (Pi's cached
+        // `getCapabilities()`, terminal-image.ts:138-143) so the link gate at `markdown.ts:692`
+        // sees the same detection this call already paid for.
+        crate::image::seed_hyperlink_support(caps.hyperlinks);
         // …and, when the terminal HAS an image protocol, measure its font cell instead of guessing
         // it (Pi `queryCellSize`, `tui.ts:647`/`:679-686`, gated on `getCapabilities().images` at
         // `:681`). Without this every inline image is laid out against `ratatui-image`'s `10x20`
