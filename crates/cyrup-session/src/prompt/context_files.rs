@@ -1,8 +1,10 @@
-//! Context-file discovery (`AGENTS.md`/`CLAUDE.md`) — arch-06 §6.2, R-06-006/007/008/009.
+//! Context-file discovery (`AGENTS.override.md`/`AGENTS.md`/`CLAUDE.md`) — arch-06 §6.2,
+//! R-06-006/007/008/009.
 //!
 //! Discovery order: the global agent dir, then each ancestor of `cwd` walking up to root, then
-//! `cwd` itself. At each level only the **first** found candidate is used (prefer `AGENTS.md` over
-//! `CLAUDE.md`); the discovered files are concatenated global → parents(top→down) → cwd.
+//! `cwd` itself. At each level only the **first** found candidate is used (prefer
+//! `AGENTS.override.md` over `AGENTS.md` over `CLAUDE.md`); the discovered files are concatenated
+//! global → parents(top→down) → cwd.
 //!
 //! The loader is **owned + blocking** (`std::fs`); callers MUST invoke [`ContextFileLoader::load`]
 //! via `tokio::task::spawn_blocking` (arch-00 §5) so the bounded ancestor walk never stalls the
@@ -60,7 +62,23 @@ pub struct ContextFileLoader {
 }
 
 /// First-found candidate order per directory (R-06-007).
-const CANDIDATES: [&str; 4] = ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+///
+/// Exactly Pi's `loadContextFileFromDir` candidate array, in order
+/// (`v0.84.1 coding-agent/src/core/resource-loader.ts:71`):
+/// `["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]`.
+///
+/// `AGENTS.override.md` was added upstream in `8ecf8a988`
+/// ("feat(coding-agent): support AGENTS.override.md (#7681)", 2026-08-05), i.e. AFTER the ported
+/// v0.83.0 baseline — where the array was the 4-entry
+/// `["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]`
+/// (`v0.83.0 coding-agent/src/core/resource-loader.ts:71`). This is therefore VERSION LAG, not a
+/// port bug: the relative order of the four pre-existing entries is unchanged upstream and here.
+///
+/// Because the loop returns on the FIRST hit, listing the override first is what makes it *win*
+/// over a sibling `AGENTS.md` in the same directory — it is a per-directory override, not an
+/// additional file (Pi never loads two candidates from one dir).
+const CANDIDATES: [&str; 5] =
+    ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 
 impl ContextFileLoader {
     pub fn new(

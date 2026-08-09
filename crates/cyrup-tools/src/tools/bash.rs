@@ -89,13 +89,37 @@ impl Tool for BashTool {
         Some("Execute bash commands (ls, grep, find, etc.)")
     }
 
-    /// Pi: `promptGuidelines: exposeSessionEnvironment ? ["Inspect PI_* environment variables for
-    /// current model and session details."] : undefined` (bash.ts:329-331) — the guideline exists
-    /// precisely because the variables do, so it is gated by the same flag. Renamed to the
-    /// `CYRUP_*` family the injection below actually sets.
+    /// Pi v0.84.1 `coding-agent/src/core/tools/bash.ts:45-48,334`:
+    ///
+    /// ```text
+    /// export const bashToolSystemPromptContribution = {
+    ///     snippet: "Execute bash commands (ls, grep, find, etc.)",
+    ///     guidelines: ["You can inspect PI_* environment variables for current model and session details."],
+    /// } as const;
+    /// ...
+    /// promptGuidelines: exposeSessionEnvironment ? [...bashToolSystemPromptContribution.guidelines] : undefined,
+    /// ```
+    ///
+    /// VERSION LAG, not a port bug: at v0.83.0 (`bash.ts:329-331`) the guideline read
+    /// `"Inspect PI_* environment variables for current model and session details."` — a bare
+    /// imperative. v0.84.0 softened it to `"You can inspect ..."`, turning an instruction into a
+    /// statement of availability, and hoisted the pair into an exported const so
+    /// `src/server/create-harness.ts:121-122` can reuse it. Only the wording is model-facing; the
+    /// hoist is a TS refactor with no behavioural content, and the `snippet` string is byte-identical
+    /// across the two tags. The `exposeSessionEnvironment` gate is unchanged (v0.84.1 bash.ts:334):
+    /// the guideline exists precisely because the variables do.
+    ///
+    /// `PI_*` -> `CYRUP_*` is deliberate and is NOT a blind rebrand of user-environment advice: this
+    /// sentence names the variables THIS TOOL injects into its own child, and cyrup's
+    /// `resolveSpawnContext` port publishes exclusively `CYRUP_SESSION_ID` / `CYRUP_SESSION_FILE` /
+    /// `CYRUP_PROVIDER` / `CYRUP_MODEL` / `CYRUP_REASONING_LEVEL` (see `execute` below), while
+    /// `config::session_env_scrub_keys` DELETES the five `PI_*` names from the child unconditionally.
+    /// Saying `PI_*` here would point the model at variables cyrup guarantees are absent. This is
+    /// also not one of the twelve live `PI_*` lower-precedence fallbacks in
+    /// `cyrup-config/src/env.rs:68-91` — none of those five session-metadata names appears there.
     fn prompt_guidelines(&self) -> &[&str] {
         if self.opts.expose_session_environment {
-            &["Inspect CYRUP_* environment variables for current model and session details."]
+            &["You can inspect CYRUP_* environment variables for current model and session details."]
         } else {
             &[]
         }

@@ -66,7 +66,7 @@ use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tok
 use base64::Engine as _;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, StopReason, ThinkingLevel, ToolCall,
-    ToolCallId, Usage,
+    ToolCallId, Usage, diagnostics::create_assistant_message_diagnostic_from,
 };
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
@@ -270,6 +270,16 @@ impl ApiImpl for BedrockConverseStreamApi {
                 failure.stop_reason
             };
             message.error_message = Some(failure.message);
+            // pi `:318-320`: structured diagnostics ride along ONLY on the `error` terminal — an
+            // aborted turn is not a provider failure and gets none.
+            if message.stop_reason == StopReason::Error {
+                append_bedrock_failure_diagnostic(
+                    &mut message,
+                    failure.status,
+                    failure.error_code.as_deref(),
+                    failure.request_id.as_deref(),
+                );
+            }
             sink.send(StreamEvent::terminal(message)).await;
         }
     }
@@ -277,10 +287,19 @@ impl ApiImpl for BedrockConverseStreamApi {
 
 /// A failure inside the ported `try` block: the partial snapshot to attach plus the composed
 /// `errorMessage` (already run through [`format_bedrock_error`]).
+///
+/// `status`/`error_code` are the parts of upstream's thrown SDK exception that survive into the
+/// structured diagnostic (`error.$metadata.httpStatusCode` and `error.name`); they are `None` for
+/// the failure paths whose upstream counterpart throws a plain `Error` carrying neither.
 struct BedrockFailure {
     partial: AssistantMessage,
     stop_reason: StopReason,
     message: String,
+    status: Option<u16>,
+    error_code: Option<String>,
+    /// Upstream's hoisted `responseRequestId` (pi `:225`, assigned at `:254`), carried on the
+    /// failure so the catch can still correlate a mid-stream throw that has no metadata of its own.
+    request_id: Option<String>,
 }
 
 impl BedrockFailure {
@@ -289,8 +308,105 @@ impl BedrockFailure {
             partial,
             stop_reason: StopReason::Error,
             message,
+            status: None,
+            error_code: None,
+            request_id: None,
         }
     }
+
+    /// Attach the hoisted response request id (pi `:254`) to a failure raised after the response
+    /// headers were seen.
+    fn with_request_id(mut self, request_id: Option<&str>) -> Self {
+        self.request_id = request_id.map(str::to_string);
+        self
+    }
+
+    /// The `client.send()` rejection path: upstream's throw is a `BedrockRuntimeServiceException`,
+    /// so `$metadata.httpStatusCode` and the modeled `.name` are both present.
+    fn service_exception(
+        partial: AssistantMessage,
+        message: String,
+        status: u16,
+        name: &str,
+    ) -> Self {
+        BedrockFailure {
+            partial,
+            stop_reason: StopReason::Error,
+            message,
+            status: Some(status),
+            error_code: extract_bedrock_error_code(name),
+            request_id: None,
+        }
+    }
+}
+
+/// Over-long values are DROPPED rather than truncated (pi `MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS`,
+/// v0.84.1 `ai/src/api/bedrock-converse-stream.ts:379`): a truncated request id is not a request id.
+const MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS: usize = 200;
+
+/// pi `normalizeDiagnosticValue` (v0.84.1 `ai/src/api/bedrock-converse-stream.ts:381-386`).
+///
+/// **Unit**: pi's guard is `trimmed.length > MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS` (`:384`), and JS
+/// `String.prototype.length` counts UTF-16 CODE UNITS, not scalar values. The exact Rust analog is
+/// [`str::encode_utf16`]`().count()`; `chars().count()` (scalars, what this was) and `len()`
+/// (UTF-8 bytes) agree with it only for ASCII. Astral-plane characters are two UTF-16 units each,
+/// so a 150-emoji request id is 300 units to pi — dropped — and 150 scalars to a `chars()`-based
+/// cyrup — kept, emitting a `requestId` diagnostic pi never emits. Same reasoning, and the same
+/// fix, as `cyrup-permission-system/src/wildcard.rs:21-23,81`.
+fn normalize_diagnostic_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.encode_utf16().count() > MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// pi `extractBedrockErrorCode` (v0.84.1 `ai/src/api/bedrock-converse-stream.ts:388-396`): modeled
+/// Bedrock errors all end in `Exception`, unlike transport names such as `TimeoutError`, so a name
+/// that does not is not a code.
+fn extract_bedrock_error_code(name: &str) -> Option<String> {
+    if !name.ends_with("Exception") {
+        return None;
+    }
+    normalize_diagnostic_value(name)
+}
+
+/// pi `appendBedrockFailureDiagnostic` (v0.84.1 `ai/src/api/bedrock-converse-stream.ts:398-421`),
+/// called from the catch at `:318-320` whenever the terminal reason settled on `"error"`.
+///
+/// VERSION LAG (v0.83.0 → v0.84.1): neither `appendBedrockFailureDiagnostic`,
+/// `normalizeDiagnosticValue` nor the hoisted `responseRequestId` (`:225`) exists at v0.83.0 — the
+/// whole structured-diagnostic path is new in v0.84.1.
+///
+/// Structured metadata sits ALONGSIDE `error_message`, which stays byte-identical because the
+/// turn-level retry classifier matches against it. Unknown fields are omitted, never guessed: a
+/// modeled mid-stream exception reaches upstream as a bare object literal (not an `Error`, no
+/// `$metadata`), leaving only the fallback request id — which is why `error_code`/`status` are
+/// passed `None` on that path here too. When nothing is known the diagnostic is not appended at all.
+fn append_bedrock_failure_diagnostic(
+    output: &mut AssistantMessage,
+    status: Option<u16>,
+    error_code: Option<&str>,
+    fallback_request_id: Option<&str>,
+) {
+    let mut details = Map::new();
+    if let Some(status) = status {
+        details.insert("status".to_string(), json!(status));
+    }
+    if let Some(code) = error_code {
+        details.insert("errorCode".to_string(), json!(code));
+    }
+    if let Some(id) = fallback_request_id.and_then(normalize_diagnostic_value) {
+        details.insert("requestId".to_string(), json!(id));
+    }
+    if details.is_empty() {
+        return;
+    }
+    output.append_diagnostic(create_assistant_message_diagnostic_from(
+        "bedrock_response_failure",
+        None,
+        Some(Value::Object(details)),
+    ));
 }
 
 /// pi's `stream()` try block (`bedrock-converse-stream.ts:222-303`).
@@ -363,6 +479,10 @@ async fn run_inner(
         .get("x-amzn-requestid")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // pi `:254`: `responseRequestId = normalizeDiagnosticValue(response.$metadata.requestId)` —
+    // hoisted out of the try so a LATER, metadata-less failure can still be correlated.
+    let response_request_id: Option<String> =
+        request_id.as_deref().and_then(normalize_diagnostic_value);
     let error_type = response
         .headers()
         .get("x-amzn-errortype")
@@ -389,10 +509,15 @@ async fn run_inner(
             .as_deref()
             .and_then(|t| t.split([':', '#']).next_back().filter(|s| !s.is_empty()))
             .unwrap_or("");
-        return Err(BedrockFailure::errored(
+        // pi's `client.send()` rejection: a `BedrockRuntimeServiceException` whose `$metadata`
+        // carries the status and whose `.name` is the modeled shape (pi `:398-421` reads both).
+        return Err(BedrockFailure::service_exception(
             dec.snapshot(model, api),
             format_bedrock_service_error(name, status, &body),
-        ));
+            status,
+            name,
+        )
+        .with_request_id(response_request_id.as_deref()));
     }
 
     // NOTE: the `start` event is NOT pushed here — pi pushes it from the `messageStart` frame
@@ -411,6 +536,9 @@ async fn run_inner(
                 partial: dec.snapshot(model, api),
                 stop_reason: StopReason::Aborted,
                 message: "Request was aborted".to_string(),
+                status: None,
+                error_code: None,
+                request_id: response_request_id.clone(),
             });
         };
         let Some(chunk) = chunk else { break };
@@ -419,11 +547,13 @@ async fn run_inner(
                 dec.snapshot(model, api),
                 format_bedrock_error(&format!("transport error: {e}")),
             )
+            .with_request_id(response_request_id.as_deref())
         })?;
         frames.push(&chunk);
         loop {
             let frame = frames.next_frame().map_err(|e| {
                 BedrockFailure::errored(dec.snapshot(model, api), format_bedrock_error(&e))
+                    .with_request_id(response_request_id.as_deref())
             })?;
             let Some(frame) = frame else { break };
             match dispatch_frame(&frame, &mut dec, model, api, sink).await {
@@ -431,7 +561,10 @@ async fn run_inner(
                 // Consumer dropped the stream.
                 Ok(false) => return Ok(()),
                 Err(message) => {
-                    return Err(BedrockFailure::errored(dec.snapshot(model, api), message));
+                    // pi's `throw item.<x>Exception`: a bare object literal, so only the hoisted
+                    // request id survives into the diagnostic (`:400-402`).
+                    return Err(BedrockFailure::errored(dec.snapshot(model, api), message)
+                        .with_request_id(response_request_id.as_deref()));
                 }
             }
         }
@@ -443,6 +576,9 @@ async fn run_inner(
             partial: dec.snapshot(model, api),
             stop_reason: StopReason::Aborted,
             message: "Request was aborted".to_string(),
+            status: None,
+            error_code: None,
+            request_id: response_request_id.clone(),
         });
     }
 
@@ -453,6 +589,21 @@ async fn run_inner(
     let mut message = dec.snapshot(model, api);
     if dec.stop_reason == Some(StopReason::Error) && dec.error_message.is_none() {
         message.error_message = Some("An unknown error occurred".to_string());
+    }
+    // pi `:301-306` throws for a still-`pending` or already-`error` reason, and the catch then runs
+    // `:318-320`. Upstream's throw here is a plain `Error` with no `$metadata`, so only the hoisted
+    // request id lands — `end_of_stream` settles on `error` for exactly these two cases.
+    let settles_on_error = !matches!(
+        dec.stop_reason,
+        Some(r) if r != StopReason::Pending && r != StopReason::Error
+    );
+    if settles_on_error {
+        append_bedrock_failure_diagnostic(
+            &mut message,
+            None,
+            None,
+            response_request_id.as_deref(),
+        );
     }
     sink.send(StreamEvent::end_of_stream(
         message,
@@ -3852,6 +4003,155 @@ mod tests {
             }
             other => panic!("expected a tool call, got {other:?}"),
         }
+    }
+
+    /// Spawn a one-shot mock HTTP server that writes `raw_response` then closes. Returns its URL.
+    async fn spawn_mock(raw_response: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(raw_response).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Drive the real `ApiImpl::run` (so the ported catch arm runs) against `base_url`.
+    async fn run_against(base_url: String) -> Vec<StreamEvent> {
+        let mut model = sonnet_45();
+        model.base_url = base_url;
+        let (sink, mut rx) = crate::api::channel(64);
+        let auth = AuthResult {
+            auth: Default::default(),
+            env: Some(env_map(&[
+                ("AWS_BEDROCK_SKIP_AUTH", "1"),
+                ("AWS_REGION", "us-east-1"),
+            ])),
+            source: None,
+        };
+        let task = tokio::spawn(async move {
+            BedrockConverseStreamApi::new()
+                .run(
+                    &model,
+                    &user_ctx("hi"),
+                    &auth,
+                    &StreamOptions::default(),
+                    CancelToken::new(),
+                    sink,
+                )
+                .await;
+        });
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            out.push(ev);
+        }
+        let _ = task.await;
+        out
+    }
+
+    /// VERSION LAG (v0.83.0 → v0.84.1): the whole structured-diagnostic path is new in v0.84.1 —
+    /// `appendBedrockFailureDiagnostic` (`ai/src/api/bedrock-converse-stream.ts:398-421`), its
+    /// `normalizeDiagnosticValue`/`extractBedrockErrorCode` helpers (`:381-396`), the hoisted
+    /// `responseRequestId` (`:225`, assigned at `:254`) and the catch-side call (`:318-320`). None
+    /// of those four identifiers exists anywhere in `v0.83.0 ai/src/api/bedrock-converse-stream.ts`.
+    /// `errorMessage` must stay byte-identical, because the retry classifier matches against it.
+    #[tokio::test]
+    async fn a_bedrock_failure_carries_structured_diagnostics() {
+        let url = spawn_mock(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nx-amzn-errortype: com.amazon.coral.validate#ValidationException\r\nx-amzn-requestid: req-abc-123\r\nConnection: close\r\n\r\n{\"message\":\"bad input\"}",
+        )
+        .await;
+        let events = run_against(url).await;
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {:?}", kinds(&events));
+        };
+        // The message is untouched by the diagnostic (pi `:398-402`).
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("Validation error: 400: {\"message\":\"bad input\"}")
+        );
+        let diags = error.diagnostics.as_ref().expect("diagnostics");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].r#type, "bedrock_response_failure");
+        // `details` only — the throw is not always an `Error` (pi `:400-402`).
+        assert_eq!(diags[0].error, None);
+        let details = diags[0].details.as_ref().expect("details");
+        assert_eq!(details["status"], json!(400));
+        assert_eq!(details["errorCode"], json!("ValidationException"));
+        assert_eq!(details["requestId"], json!("req-abc-123"));
+    }
+
+    /// MIRROR: the helpers omit unknown fields rather than guessing them, and drop over-long values
+    /// instead of truncating (pi `:379-396`).
+    #[test]
+    fn diagnostic_values_are_normalized_not_guessed() {
+        assert_eq!(
+            normalize_diagnostic_value("  req-1  ").as_deref(),
+            Some("req-1")
+        );
+        assert_eq!(normalize_diagnostic_value("   "), None);
+        assert_eq!(normalize_diagnostic_value(&"x".repeat(200)).as_deref().map(str::len), Some(200));
+        // 201 chars is DROPPED, not truncated: a truncated request id is not a request id.
+        assert_eq!(normalize_diagnostic_value(&"x".repeat(201)), None);
+
+        // ── The cap counts UTF-16 CODE UNITS, not scalar values ──────────────────────────────
+        // pi v0.84.1 `ai/src/api/bedrock-converse-stream.ts:384`:
+        //     `if (trimmed.length === 0 || trimmed.length > MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS)`
+        // JS `.length` is UTF-16 code units. `\u{1F600}` is ONE scalar but TWO code units, so a
+        // 101-emoji value sits in the window where the units disagree: 101 scalars (<= 200, would
+        // be KEPT by a `chars().count()` cap) but 202 UTF-16 units (> 200, DROPPED by pi). This
+        // case is what distinguishes the two measures — an ASCII string can never separate them.
+        let astral_101 = "\u{1F600}".repeat(101);
+        assert_eq!(astral_101.chars().count(), 101, "under the cap in SCALARS");
+        assert_eq!(astral_101.encode_utf16().count(), 202, "over the cap in UTF-16 UNITS");
+        assert_eq!(
+            normalize_diagnostic_value(&astral_101),
+            None,
+            "pi measures `.length` in UTF-16 units, so 202 > 200 drops this value"
+        );
+
+        // MIRROR: 100 emoji is exactly 200 UTF-16 units, and pi's check is `>`, so it is KEPT.
+        // This pins the boundary from below — a fix that simply dropped everything non-ASCII
+        // would fail here.
+        let astral_100 = "\u{1F600}".repeat(100);
+        assert_eq!(astral_100.encode_utf16().count(), MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS);
+        assert_eq!(
+            normalize_diagnostic_value(&astral_100).as_deref(),
+            Some(astral_100.as_str()),
+            "exactly at the cap: pi's `>` keeps it"
+        );
+
+        // Only modeled Bedrock shapes (which all end in `Exception`) are error codes.
+        assert_eq!(
+            extract_bedrock_error_code("ThrottlingException").as_deref(),
+            Some("ThrottlingException")
+        );
+        assert_eq!(extract_bedrock_error_code("TimeoutError"), None);
+
+        // Nothing known → no diagnostic at all (pi `:419`).
+        let mut msg = AssistantMessage::errored(
+            "amazon-bedrock".into(),
+            "m",
+            None,
+            StopReason::Error,
+            "boom",
+        );
+        append_bedrock_failure_diagnostic(&mut msg, None, None, None);
+        assert_eq!(msg.diagnostics, None);
+
+        // A mid-stream modeled exception reaches upstream as a bare object literal: only the
+        // hoisted request id lands (pi `:400-402`).
+        append_bedrock_failure_diagnostic(&mut msg, None, None, Some("req-9"));
+        let diags = msg.diagnostics.as_ref().expect("diagnostics");
+        let details = diags[0].details.as_ref().expect("details");
+        assert_eq!(details["requestId"], json!("req-9"));
+        assert_eq!(details.get("status"), None);
+        assert_eq!(details.get("errorCode"), None);
     }
 
     /// A stream that ends without `messageStop` is TRUNCATED, never a clean `stop`

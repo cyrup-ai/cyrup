@@ -4084,24 +4084,34 @@ impl<B: Backend> App<B> {
     }
 }
 
-/// The `error`-styled notice Pi appends after an assistant turn that did not finish cleanly
-/// (`assistant-message.ts:175-201`), or `None` for a clean turn.
+/// The notice shown under an assistant turn that stopped on `length`, verbatim from Pi v0.84.1
+/// `coding-agent/src/modes/interactive/components/assistant-message.ts:180`.
 ///
-/// * `length` → the max-output-token sentence, emitted **unconditionally**: a length stop can land
-///   before a tool call is complete, so it is surfaced even on a tool turn (`:177`).
-/// * `aborted` / `error` → emitted only when the message carries NO `toolCall` content (`:189`),
+/// **Version lag, not a port bug.** Through v0.83.0 (`:153-161`) this read
+/// `"Error: Model stopped because it reached the maximum output token limit. The response may be
+/// incomplete."`. Upstream shortened it in `32850ef7c` ("fix(coding-agent): resume after
+/// context-limited length stops", #7540), whose commit message gives the reason: a `length` stop is
+/// no longer necessarily a max-output-token stop — it may be a context overflow that pi then
+/// compacts and retries — so the TUI moved to "neutral truncation wording" that does not assert a
+/// cause. Note the loss of the `Error: ` prefix is part of that change and is deliberate upstream:
+/// only the `error` arm (`:193`) still prefixes.
+pub(crate) const LENGTH_STOP_NOTICE: &str = "Response was truncated before completion.";
+
+/// The `error`-styled notice Pi appends after an assistant turn that did not finish cleanly
+/// (v0.84.1 `coding-agent/src/modes/interactive/components/assistant-message.ts:174-195`), or `None`
+/// for a clean turn.
+///
+/// * `length` → [`LENGTH_STOP_NOTICE`], emitted **unconditionally**: a length stop can land before a
+///   tool call is complete, so it is surfaced even on a tool turn (`:177`).
+/// * `aborted` / `error` → emitted only when the message carries NO `toolCall` content (`:182`),
 ///   because for those the tool-execution component already reports the failure.
 /// * `aborted` shows `errorMessage` unless it is the internal `Request was aborted` sentinel, in
-///   which case the user-facing wording is `Operation aborted` (`:190-197`).
-/// * `error` shows `Error: {errorMessage || "Unknown error"}` (`:198-201`).
+///   which case the user-facing wording is `Operation aborted` (`:183-189`).
+/// * `error` shows `Error: {errorMessage || "Unknown error"}` (`:190-193`).
 fn stop_reason_notice(message: &cyrup_core::AssistantMessage) -> Option<String> {
     use cyrup_core::StopReason;
     if message.stop_reason == StopReason::Length {
-        return Some(
-            "Error: Model stopped because it reached the maximum output token limit. \
-             The response may be incomplete."
-                .to_string(),
-        );
+        return Some(LENGTH_STOP_NOTICE.to_string());
     }
     let has_tool_calls =
         message.content.iter().any(|c| matches!(c, cyrup_core::Content::ToolCall(_)));

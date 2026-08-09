@@ -519,14 +519,23 @@ fn gemini3_variant(id: &str, suffix: &str) -> bool {
     false
 }
 
-/// `modelId.startsWith("claude-") || modelId.startsWith("gpt-oss-")` (Pi `requiresToolCallId`,
-/// google-shared.ts:70-72).
+/// `modelId.startsWith("claude-") || modelId.startsWith("gpt-oss-") ||
+/// (geminiMajorVersion !== undefined && geminiMajorVersion >= 3)` — Pi `requiresToolCallId`,
+/// v0.84.1 `ai/src/api/google-shared.ts:72-79`.
+///
+/// Version lag, not a port bug: at v0.83.0 (`google-shared.ts:71-73`) the function was only the
+/// two `startsWith` arms; the Gemini-3 arm was added upstream for v0.84.1 so Gemini 3 models echo
+/// explicit tool-call ids in `functionCall`/`functionResponse`.
 fn requires_tool_call_id(model_id: &str) -> bool {
-    model_id.starts_with("claude-") || model_id.starts_with("gpt-oss-")
+    model_id.starts_with("claude-")
+        || model_id.starts_with("gpt-oss-")
+        || gemini_major_version(model_id).is_some_and(|v| v >= 3)
 }
 
-/// `getGeminiMajorVersion >= 3` (Pi `supportsMultimodalFunctionResponse`, google-shared.ts:74-86).
-/// A non-Gemini id (no major version) returns `true`.
+/// `getGeminiMajorVersion >= 3` (Pi `supportsMultimodalFunctionResponse`, v0.84.1
+/// `ai/src/api/google-shared.ts:87-93`). A non-Gemini id (no major version) returns `true`.
+/// Body unchanged v0.83.0 → v0.84.1; only the line span moved (v0.83.0 `:81-87`), because the
+/// Gemini-3 arm added to `requiresToolCallId` above pushed everything after it down six lines.
 fn supports_multimodal_function_response(model_id: &str) -> bool {
     match gemini_major_version(model_id) {
         Some(v) => v >= 3,
@@ -534,7 +543,8 @@ fn supports_multimodal_function_response(model_id: &str) -> bool {
     }
 }
 
-/// `/^gemini(?:-live)?-(\d+)/` (Pi `getGeminiMajorVersion`, google-shared.ts:74-78).
+/// `/^gemini(?:-live)?-(\d+)/` (Pi `getGeminiMajorVersion`, v0.84.1
+/// `ai/src/api/google-shared.ts:81-85`; v0.83.0 `:75-79` — same body, shifted).
 fn gemini_major_version(model_id: &str) -> Option<u32> {
     let id = model_id.to_lowercase();
     let rest = id.strip_prefix("gemini")?;
@@ -548,7 +558,8 @@ fn gemini_major_version(model_id: &str) -> Option<u32> {
 }
 
 /// Thought signatures must be valid base64 (`TYPE_BYTES`) — Pi `isValidThoughtSignature`,
-/// google-shared.ts:52-58.
+/// v0.84.1 `ai/src/api/google-shared.ts:53-60` (the `base64SignaturePattern` const plus the fn);
+/// v0.83.0 `:52-59` — same body, shifted.
 fn is_valid_thought_signature(sig: &str) -> bool {
     if sig.is_empty() || !sig.len().is_multiple_of(4) {
         return false;
@@ -562,7 +573,7 @@ fn is_valid_thought_signature(sig: &str) -> bool {
 }
 
 /// Keep a signature only for the same provider/model and valid base64 (Pi `resolveThoughtSignature`,
-/// google-shared.ts:60-65).
+/// v0.84.1 `ai/src/api/google-shared.ts:62-67`; v0.83.0 `:61-66` — same body, shifted).
 fn resolve_thought_signature(same: bool, sig: Option<&str>) -> Option<String> {
     match sig {
         Some(s) if same && is_valid_thought_signature(s) => Some(s.to_string()),
@@ -571,7 +582,7 @@ fn resolve_thought_signature(same: bool, sig: Option<&str>) -> Option<String> {
 }
 
 /// The Gemini tool-call-id normalizer (Pi `convertMessages` `normalizeToolCallId`,
-/// google-shared.ts:93-96).
+/// v0.84.1 `ai/src/api/google-shared.ts:100-103`; v0.83.0 `:94-97` — same body, shifted).
 fn normalize_tool_call_id(model_id: &str, id: &str) -> String {
     if !requires_tool_call_id(model_id) {
         return id.to_string();
@@ -1666,6 +1677,48 @@ mod tests {
         assert_eq!(fr["response"]["output"], "file body");
         // gemini-2.5-pro is < 3, so no `id` field (requiresToolCallId false for gemini).
         assert!(fr.get("id").is_none());
+    }
+
+    /// VERSION LAG (v0.83.0 → v0.84.1): `requiresToolCallId` gained a third arm
+    /// `geminiMajorVersion !== undefined && geminiMajorVersion >= 3`
+    /// (v0.84.1 `ai/src/api/google-shared.ts:72-79`), so Gemini 3 echoes explicit tool-call ids in
+    /// both `functionResponse` (`:215` — `...(includeId ? { id: msg.toolCallId } : {})`) and
+    /// `functionCall` (`:176`). At v0.83.0 (`google-shared.ts:71-73`) only `claude-`/`gpt-oss-`
+    /// qualified, so every Gemini id took the `false` branch.
+    #[test]
+    fn gemini3_echoes_tool_call_ids() {
+        assert!(requires_tool_call_id("gemini-3-pro-preview"));
+        assert!(requires_tool_call_id("gemini-live-3-flash"));
+        // MIRROR: the two pre-existing arms and every sub-3 Gemini are unchanged.
+        assert!(requires_tool_call_id("claude-opus-4-5"));
+        assert!(requires_tool_call_id("gpt-oss-120b"));
+        assert!(!requires_tool_call_id("gemini-2.5-pro"));
+        assert!(!requires_tool_call_id("gemini-1.5-flash"));
+        assert!(!requires_tool_call_id("gemma-4-2b"));
+
+        // End-to-end: the `id` reaches the wire body for a Gemini 3 model.
+        let m = model_with("gemini-3-pro-preview", true);
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::ToolResult {
+                tool_call_id: cyrup_core::ToolCallId::from("call_1"),
+                tool_name: "read".to_string(),
+                content: vec![Content::text("file body")],
+                is_error: false,
+                details: None,
+                timestamp: 0,
+                usage: None,
+                added_tool_names: Vec::new(),
+            }],
+            tools: Vec::new(),
+        };
+        let body = build_body(&m, &ctx, &StreamOptions::default());
+        let contents = body["contents"].as_array().unwrap();
+        let fr = contents
+            .iter()
+            .find_map(|c| c["parts"][0].get("functionResponse"))
+            .expect("functionResponse part");
+        assert_eq!(fr["id"], "call_1");
     }
 
     /// PORT BUG (present at v0.83.0, never ported): pi writes

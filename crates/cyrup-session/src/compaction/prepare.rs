@@ -89,6 +89,27 @@ pub fn prepare_compaction(
                 .and_then(|fk| path.iter().position(|e| &e.id() == fk))
                 .unwrap_or_else(|| prev_idx.map(|i| i + 1).unwrap_or(0));
             // Hook-sourced details may use a custom shape; only absorb our default shape.
+            //
+            // Pi (LIVE fork, UNCHANGED from v0.83.0 through v0.84.1):
+            //   `if (!prevCompaction.fromHook && prevCompaction.details) {`
+            //   `    // fromHook field kept for session file compatibility`
+            //   (`v0.84.1 coding-agent/src/core/compaction/compaction.ts:52-53`).
+            //
+            // FORK DISAGREEMENT, deliberate: the harness fork cyrup nominally ports DROPPED this
+            // guard at v0.84.1 in `44289550a` ("feat(agent): promote durable harness API") — but
+            // only as a consequence of that rewrite deleting the `fromHook` field from
+            // `CompactionEntry` (`v0.84.1 agent/src/harness/session/types.ts:44-51`) together with
+            // the compaction hook that produced it (no `emitHook`/`hookResult` for compaction
+            // survives in `v0.84.1 agent/src/harness/agent-harness.ts`; cf.
+            // `v0.83.0 agent/src/harness/agent-harness.ts:747-755,861,874`). With no producer, the
+            // read-side check there is unreachable, so its removal is a no-op rather than a
+            // decision that hook details should now be inherited.
+            //
+            // cyrup retains BOTH the field (`entry.rs:91`) and a hook that sets it
+            // (`compaction/hooks.rs:35`, `compaction/mod.rs:295,433`), matching the live fork.
+            // Dropping the guard here would match neither upstream: it would feed
+            // extension-defined `details` into pi's `{readFiles, modifiedFiles}` reader.
+            // Pinned by `tests/compaction.rs::g21_prepare_compaction_ignores_from_hook_prev_details`.
             let det = if from_hook.unwrap_or(false) { None } else { details.clone() };
             (Some(summary.clone()), det, bs)
         }

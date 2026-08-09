@@ -7,7 +7,7 @@
 //! tmux-forwards-hyperlinks flag, so both branches are deterministic here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use cyrup_tui::{detect_capabilities_from, ImageProtocol};
+use cyrup_tui::{detect_capabilities_from, detect_capabilities_on_platform, ImageProtocol};
 
 /// Build an env lookup from a fixed table (missing keys ⇒ `None`, exactly like `std::env::var`).
 fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -84,4 +84,95 @@ fn known_no_image_terminals_and_conservative_default() {
         false,
     );
     assert!(unknown_tc.true_color, "COLORTERM=truecolor → truecolor on");
+}
+
+/// Pi v0.84.1 `tui/src/terminal-image.ts:124-129` — a Windows console that set no `WT_SESSION`
+/// (Windows Terminal hosting a `cmd.exe` launched straight from Win+R) still gets truecolor, and
+/// still does not get OSC-8. Added upstream in `fa07e7bd9`, after cyrup's v0.83.0 baseline.
+///
+/// The platform is a compile-time `cfg!(windows)` in `detect_capabilities_from`, so this drives the
+/// decision function directly with a synthesized `is_windows_console` instead of the real platform.
+#[test]
+fn a_bare_windows_console_assumes_truecolor_without_wt_session() {
+    // No COLORTERM hint, no identified terminal — on Windows this is still truecolor.
+    let win = detect_capabilities_on_platform(env_of(&[("TERM", "xterm-256color")]), false, true);
+    assert!(win.true_color, "terminal-image.ts:128 — modern Windows consoles support truecolor");
+    assert!(!win.hyperlinks, "terminal-image.ts:126 — hyperlinks stay off unless positively detected");
+    assert_eq!(win.images, None, "terminal-image.ts:128 — `images: null`");
+
+    // Even with no env at all.
+    let bare = detect_capabilities_on_platform(env_of(&[]), false, true);
+    assert!(bare.true_color);
+    assert!(!bare.hyperlinks);
+
+    // MIRROR 1: the identical environment on a non-Windows platform is unchanged — conservative.
+    let unix = detect_capabilities_on_platform(env_of(&[("TERM", "xterm-256color")]), false, false);
+    assert!(!unix.true_color, "terminal-image.ts:131 — no COLORTERM hint off Windows ⇒ truecolor off");
+    assert!(!unix.hyperlinks);
+
+    // MIRROR 2: the Windows branch sits AFTER every positive identification (terminal-image.ts:124),
+    // so it must not steal a terminal that was already identified.
+    let wt = detect_capabilities_on_platform(env_of(&[("WT_SESSION", "guid")]), false, true);
+    assert!(wt.hyperlinks, "WT_SESSION (`:108-110`) still wins over the bare-console fallback");
+    let kitty = detect_capabilities_on_platform(env_of(&[("KITTY_WINDOW_ID", "1")]), false, true);
+    assert_eq!(kitty.images, Some(ImageProtocol::Kitty));
+    assert!(kitty.hyperlinks);
+    let jb = detect_capabilities_on_platform(
+        env_of(&[("TERMINAL_EMULATOR", "JetBrains-JediTerm")]),
+        false,
+        true,
+    );
+    assert!(!jb.hyperlinks);
+    assert!(jb.true_color);
+
+    // MIRROR 3: the multiplexer branches precede it (`:76-86`), so tmux on Windows keeps its own
+    // `hasTrueColorHint`-derived truecolor rather than the Windows assumption.
+    let tmux = detect_capabilities_on_platform(env_of(&[("TMUX", "x")]), false, true);
+    assert!(!tmux.true_color, "terminal-image.ts:80 — tmux uses hasTrueColorHint, not the win32 rule");
+    let screen = detect_capabilities_on_platform(env_of(&[("TERM", "screen-256color")]), false, true);
+    assert!(!screen.true_color, "terminal-image.ts:85 — screen likewise");
+}
+
+/// Pi v0.84.1 `tui/src/terminal-image.ts:73`:
+/// `const hasTrueColorHint = colorTerm === "truecolor" || colorTerm === "24bit";`
+/// — an equality, not a substring test. Port bug: this was `contains` in cyrup, and was equally
+/// wrong at v0.83.0, where the same line reads identically.
+///
+/// HOST-INDEPENDENCE: this drives [`detect_capabilities_on_platform`] with `is_windows_console`
+/// passed explicitly, NOT the [`detect_capabilities_from`] wrapper that hard-wires `cfg!(windows)`.
+/// The wrapper would make the negative assertions host-dependent: on a Windows host the
+/// `isWindowsConsole` branch (`image.rs:510`, Pi `:124-129`) returns `true_color: true` before the
+/// conservative default at `:131` is ever reached, so `assert!(!hint("not-truecolor"))` would fail
+/// there for a reason that has nothing to do with the equality-vs-substring property under test.
+/// Parameterising pins the property on every host.
+///
+/// NOT COVERED HERE: passing `is_windows_console = true` simulates the platform flag on whatever
+/// host runs the suite — it is NOT coverage of a real Windows console. Nothing in this file has
+/// ever been executed on a Windows host from this workspace; every assertion about the win32 branch
+/// (here and in [`a_bare_windows_console_assumes_truecolor_without_wt_session`]) tests only that
+/// cyrup's port takes Pi's `:124-129` path when told the platform is win32, not that Windows
+/// terminals actually behave that way.
+#[test]
+fn the_colorterm_hint_is_an_equality_not_a_substring() {
+    // LINUX PATH (`is_windows_console = false`) — reaches Pi's conservative default at `:131`,
+    // so `true_color` is exactly `hasTrueColorHint`.
+    let hint =
+        |v: &str| detect_capabilities_on_platform(env_of(&[("COLORTERM", v)]), false, false).true_color;
+    assert!(hint("truecolor"));
+    assert!(hint("24bit"));
+    assert!(hint("TrueColor"), "Pi lowercases COLORTERM first (`:72`)");
+    // Values that merely EMBED the token are not a hint.
+    assert!(!hint("not-truecolor"));
+    assert!(!hint("truecolor-maybe"));
+    assert!(!hint("24bitish"));
+    assert!(!hint("gnome-terminal"));
+    assert!(!hint(""));
+
+    // WINDOWS PATH (`is_windows_console = true`) — Pi `:124-129` returns before the default, so
+    // truecolor is asserted regardless of COLORTERM. Asserted only to document that the equality
+    // fix does NOT change this branch; it is not a substring-vs-equality observation.
+    for v in ["not-truecolor", "truecolor", ""] {
+        let caps = detect_capabilities_on_platform(env_of(&[("COLORTERM", v)]), false, true);
+        assert!(caps.true_color, "terminal-image.ts:124-129 — the win32 branch assumes truecolor");
+    }
 }

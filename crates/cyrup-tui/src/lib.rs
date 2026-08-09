@@ -119,8 +119,8 @@ pub use export::session_jsonl_to_html;
 pub use error::TuiError;
 pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
 pub use image::{
-    detect_capabilities, detect_capabilities_from, image_fallback_text, ImageBlock, ImageProtocol,
-    ImageRenderer, TerminalCapabilities,
+    detect_capabilities, detect_capabilities_from, detect_capabilities_on_platform,
+    image_fallback_text, ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities,
 };
 pub use keyboard_protocol::{
     current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,

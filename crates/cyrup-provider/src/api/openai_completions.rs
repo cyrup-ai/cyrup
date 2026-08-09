@@ -1527,16 +1527,37 @@ where
     let message = build_final_message(dec, model, api);
 
     // Which stop reason the provider actually DELIVERED — `None` is Pi's still-`"pending"` output.
-    // Pi's end-of-stream ladder (openai-completions.ts:567-582), with `compat.supportsFinishReason`
-    // at its default `true` (cyrup exposes no such knob):
+    // Pi's end-of-stream ladder (v0.84.1 `ai/src/api/openai-completions.ts:571-586`):
     //   1. `aborted`/`error` already settled by an abort or an error chunk → throw with THAT
     //      message, so the reason and the recorded `error_message` are used verbatim;
     //   2. a `finish_reason` actually arrived → use it;
-    //   3. otherwise `(supportsFinishReason && !hasFinishReason) || stopReason === "pending"`
-    //      → throw "Stream ended without finish_reason".
+    //   3. `!hasFinishReason && !compat.supportsFinishReason` (`:578-580`) → the provider never
+    //      reports one, so INFER: `toolUse` when the turn produced a tool call, else `stop`;
+    //   4. otherwise `(supportsFinishReason && !hasFinishReason) || stopReason === "pending"`
+    //      (`:584-586`) → throw "Stream ended without finish_reason".
+    //
+    // VERSION LAG (v0.83.0 → v0.84.1): at v0.83.0 (`openai-completions.ts:577`) step 4 was the
+    // unconditional `if (!hasFinishReason || output.stopReason === "pending")` and there was no
+    // `supportsFinishReason` compat key at all (absent from v0.83.0 `ai/src/types.ts`), so a
+    // provider that never sends `finish_reason` always produced the truncated-stream error.
+    //
+    // Step 3 cannot mask a settled `error`: pi only assigns `stopReason = "error"` from
+    // `mapStopReason` (`:465`), which also sets `hasFinishReason = true` (`:469`), so the inference
+    // branch is unreachable whenever the reason is `error`.
     let delivered = match settled {
         Some(r @ (StopReason::Error | StopReason::Aborted)) => Some(r),
         other if saw_finish_reason => other,
+        _ if !get_compat(model).supports_finish_reason => Some(
+            if message
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::ToolCall(_)))
+            {
+                StopReason::ToolUse
+            } else {
+                StopReason::Stop
+            },
+        ),
         _ => None,
     };
 
@@ -2019,6 +2040,7 @@ fn now_millis() -> i64 {
 mod tests {
     use super::*;
     use crate::api::channel;
+    use crate::api::compat::ModelCompat;
     use crate::auth::ModelAuth;
     use crate::model::{Modality, ModelCost};
     use crate::stream::sse::decode_sse_bytes;
@@ -2579,6 +2601,94 @@ mod tests {
             Some("Stream ended without finish_reason")
         );
         assert_eq!(error.raw_stop_reason, None);
+    }
+
+    async fn collect_events_with(m: Model, raw: &'static str) -> Vec<StreamEvent> {
+        let (sink, mut rx) = channel(256);
+        let api = ApiId::from(API_ID);
+        let frames = decode_sse_bytes(raw.as_bytes().to_vec());
+        let handle = tokio::spawn(async move {
+            decode_stream(frames, &m, &api, &sink).await;
+        });
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        handle.await.unwrap();
+        events
+    }
+
+    /// VERSION LAG (v0.83.0 → v0.84.1): the new `compat.supportsFinishReason` key
+    /// (v0.84.1 `ai/src/types.ts:547-548`, detected default `true` at
+    /// `ai/src/api/openai-completions.ts:1499`) makes a stream that ends with no `finish_reason`
+    /// INFER its stop reason instead of erroring:
+    /// `output.stopReason = output.content.some(b => b.type === "toolCall") ? "toolUse" : "stop"`
+    /// (v0.84.1 `ai/src/api/openai-completions.ts:578-580`). At v0.83.0 (`…:577`) the guard was the
+    /// unconditional `if (!hasFinishReason || output.stopReason === "pending") throw`.
+    #[tokio::test]
+    async fn absent_finish_reason_is_inferred_when_the_provider_reports_none() {
+        let quiet = || {
+            let mut m = model();
+            m.compat = Some(ModelCompat {
+                supports_finish_reason: Some(false),
+                ..ModelCompat::default()
+            });
+            m
+        };
+
+        // No tool call in the turn → `"stop"`.
+        let events = collect_events_with(
+            quiet(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.error_message, None);
+
+        // A tool call in the turn → `"toolUse"`.
+        let events = collect_events_with(
+            quiet(),
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"function\":{\"name\":\"add\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(message.stop_reason, StopReason::ToolUse);
+
+        // MIRROR 1: the inference is a FALLBACK — a delivered `finish_reason` still wins, even for
+        // a provider flagged `supportsFinishReason: false` (pi's guard is `!hasFinishReason && …`).
+        let events = collect_events_with(
+            quiet(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(message.stop_reason, StopReason::Length);
+
+        // MIRROR 2: at the DEFAULT `supportsFinishReason: true`, a missing reason is still the
+        // truncated-stream error — the fix must not turn every truncation into a clean `stop`
+        // (v0.84.1 `…:584-586`).
+        let events = collect_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {:?}", events.last());
+        };
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("Stream ended without finish_reason")
+        );
+
+        // MIRROR 3: `detectCompat` leaves the flag `true` for every provider (v0.84.1 `…:1499`),
+        // so an unconfigured model never infers.
+        assert!(get_compat(&model()).supports_finish_reason);
     }
 
     #[tokio::test]

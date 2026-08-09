@@ -170,6 +170,81 @@ fn a06_4_context_discovery_order_and_nc() {
     assert!(files.is_empty() && diags.is_empty(), "-nc loads nothing");
 }
 
+// ── A-06-4b: `AGENTS.override.md` is the FIRST candidate and WINS its directory ──────────────────
+//
+// Pi's `loadContextFileFromDir` returns on the first existing candidate, so the array position is
+// the whole mechanism: `["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]`
+// (`v0.84.1 coding-agent/src/core/resource-loader.ts:71-88`). Added upstream in `8ecf8a988` (#7681,
+// 2026-08-05), after the ported v0.83.0 baseline, whose array was the 4-entry
+// `["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]`
+// (`v0.83.0 coding-agent/src/core/resource-loader.ts:71`) — version lag, not a port bug.
+#[test]
+fn a06_4b_agents_override_wins_over_agents_md() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let global = root.join("global-agent");
+    let parent = root.join("parent");
+    let cwd = parent.join("child");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // Global dir: override present alongside AGENTS.md -> override wins here too (Pi applies the
+    // same `loadContextFileFromDir` to every scope, `resource-loader.ts:118+`).
+    std::fs::write(global.join("AGENTS.override.md"), "GLOBAL_OVERRIDE").unwrap();
+    std::fs::write(global.join("AGENTS.md"), "GLOBAL_AGENTS").unwrap();
+    // Parent dir: NO override -> plain AGENTS.md still used (mirror: prepending a candidate must
+    // not disturb the pre-existing four or their order).
+    std::fs::write(parent.join("AGENTS.md"), "PARENT_AGENTS").unwrap();
+    // cwd: override beats AGENTS.md *and* CLAUDE.md.
+    std::fs::write(cwd.join("AGENTS.override.md"), "CWD_OVERRIDE").unwrap();
+    std::fs::write(cwd.join("AGENTS.md"), "CWD_AGENTS").unwrap();
+    std::fs::write(cwd.join("CLAUDE.md"), "CWD_CLAUDE").unwrap();
+
+    let loader = ContextFileLoader::new(cwd, global, true, false);
+    let (files, _diags) = loader.load();
+    let contents: Vec<&str> = files.iter().map(|f| &*f.content).collect();
+    assert_eq!(
+        contents,
+        vec!["GLOBAL_OVERRIDE", "PARENT_AGENTS", "CWD_OVERRIDE"],
+        "AGENTS.override.md wins its dir; a dir without one still resolves AGENTS.md"
+    );
+    // First-found is exclusive: the shadowed AGENTS.md/CLAUDE.md are NOT also loaded.
+    assert_eq!(files.len(), 3, "one file per directory, never two");
+    assert!(
+        files.iter().all(|f| f.content.as_ref() != "CWD_AGENTS"),
+        "AGENTS.md must be shadowed by AGENTS.override.md, not appended alongside it"
+    );
+    assert!(files[0].path.ends_with("AGENTS.override.md"), "global resolved to the override");
+    assert!(files[2].path.ends_with("AGENTS.override.md"), "cwd resolved to the override");
+}
+
+// ── A-06-4c: MIRROR — `AGENTS.override.md` does not outrank a NEARER scope ───────────────────────
+//
+// Position within `CANDIDATES` orders candidates inside ONE directory; it does not reorder the
+// global→ancestors→cwd concatenation (`resource-loader.ts:118+`). An override in an ancestor must
+// therefore still be listed BEFORE (i.e. outranked by) a plain `CLAUDE.md` in cwd.
+#[test]
+fn a06_4c_override_does_not_reorder_scopes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let global = root.join("global-agent");
+    let parent = root.join("parent");
+    let cwd = parent.join("child");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(parent.join("AGENTS.override.md"), "PARENT_OVERRIDE").unwrap();
+    std::fs::write(cwd.join("CLAUDE.MD"), "CWD_CLAUDE_UPPER").unwrap();
+
+    let loader = ContextFileLoader::new(cwd, global, true, false);
+    let (files, _diags) = loader.load();
+    let contents: Vec<&str> = files.iter().map(|f| &*f.content).collect();
+    assert_eq!(
+        contents,
+        vec!["PARENT_OVERRIDE", "CWD_CLAUDE_UPPER"],
+        "scope order (ancestor→cwd) is unaffected by candidate order"
+    );
+}
+
 // ── A-06-5: untrusted project skips project AGENTS.md but loads global ───────────────────────────
 #[test]
 fn a06_5_untrusted_skips_project_keeps_global() {

@@ -259,6 +259,36 @@ checking that their CONSUMERS were ported. Counted separately so the 147 stays c
 | G133c `HostServices` custom-overlay seam, so `/permission-system` can render the real settings modal instead of text | absent | low | medium | `HostServices` has `select`/`input`/`notify`/`set_status`, no custom render | `config-modal.ts:63-123` (`ctx.ui.custom`) |
 | G133d Version-qualify the 334 `index.ts` citations in `cyrup-permission-system` — 26 provably point past EOF at v0.8.0 | absent | medium | medium | 16 files; run `.workflows/check-citations.py` | n/a (provenance hygiene) |
 
+### 2.5 Found while working Batch 4 (2026-08-09)
+
+| item | status | sev | effort | cyrup location | upstream ref |
+|---|---|---|---|---|---|
+| G30b Compact-resource read classification — `getCompactReadClassification` + `formatCompactReadCall` are entirely unported | absent | medium | medium | `cyrup-tui/src/transcript.rs:1144` (`render_read`, no classification branch) | v0.83.0 `coding-agent/src/core/tools/read.ts:37,117,133-134,331` |
+
+**G30b is a PORT BUG at v0.83.0, not version lag.** Commit `8ecf8a988` (which gave us G30) touched
+TWO files; only `resource-loader.ts` was ported. The other half classifies a read result as
+`{kind:"resource"|"docs", label}` for compact display, and the whole mechanism predates the ported
+baseline — upstream's commit merely prepended `"AGENTS.override.md"` to an existing set.
+
+It is a RENDERING concern (`read.ts:334-343` -> `renderCall`), so it belongs in `cyrup-tui`, not
+`cyrup-tools` where a first search for it looked. It is blocked on plumbing, not on understanding:
+`render_read` has no `cwd` in scope (needed by `resolveToCwd`/`formatPathRelativeToCwdOrAbsolute`)
+and the `docs` arm needs `getReadmePath()` (`config.ts:427`), whose cyrup analog `DocsPaths` lives
+in `cyrup-session/src/prompt/builder.rs` and never reaches the renderer. Landing it means threading
+two inputs into the transcript renderer plus four pi theme keys and the expand-hint text — a feature
+port. A partial version would create a NEW divergence harder to audit than the current clean absence.
+
+**G50 IS COUPLED TO G8 AND G27 — do not verify it alone.** G50 (the shorter length-stop notice) came
+from upstream `32850ef7c`, which also changed four behavioural files cyrup does not yet implement:
+`ai/src/utils/overflow.ts` (classify a length stop by comparing reported output usage against the
+model's output limit), `ai/src/api/openai-responses-shared.ts` (only `max_output_tokens` is a length
+stop; other reasons surface as errors), and `coding-agent/src/core/agent-session.ts`
+(compact-and-retry once, then strip the truncated assistant message). Upstream shortened the wording
+BECAUSE a length stop became ambiguous — pi now sometimes recovers. cyrup shows the neutral notice
+and does not recover, so porting the string alone strictly REDUCES the information a user gets.
+That was a sequencing error in §6: G50 belongs in the batch that lands G8 and G27, and those batches
+must re-verify the notice end-to-end rather than treat G50 as done.
+
 **G136c and G136d are FIXED, not filed** (2026-08-08). They were briefly recorded here as tracked
 items with a rationale for deferring them; that was wrong — deferring a known-broken wire guard is
 shipping a defect, and the fixes were small once pi's source was actually read rather than inferred.

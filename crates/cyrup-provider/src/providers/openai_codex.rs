@@ -561,6 +561,76 @@ mod tests {
         );
     }
 
+    /// Two defects in the Codex GPT-5.6 rows, which upstream spells as three hardcoded literals
+    /// (v0.84.1 `ai/scripts/generate-models.ts:2594-2622`), not models.dev data:
+    ///
+    /// 1. VERSION LAG (v0.83.0 → v0.84.1): luna/terra took the 2026-07-30 price cut via
+    ///    `withOpenAiLongContextPricing(OPENAI_GPT_56_STANDARD_COSTS[...])` (`:2597`, `:2621`).
+    ///    v0.83.0 spelled them inline as `{1, 6, 0.1, 1.25}` / `{2.5, 15, 0.25, 3.125}`
+    ///    (`v0.83.0 …` — the `diff` of the `codexModels` literal is exactly those two lines).
+    /// 2. PORT BUG (wrong at v0.83.0 too): all three rows carry `contextWindow: CODEX_GPT_56_CONTEXT`,
+    ///    which is `272000` at BOTH tags (v0.84.1 `…:2541`, v0.83.0 `…:2352`). cyrup had `372000`
+    ///    — a transposed digit that inflated the window by 100k and would let compaction defer past
+    ///    the real limit.
+    #[test]
+    fn the_gpt_5_6_codex_rows_match_the_upstream_literals() {
+        let models = openai_codex_models();
+        let find = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+                .clone()
+        };
+
+        for id in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+            assert_eq!(find(id).context_window, 272_000, "{id} contextWindow");
+        }
+
+        let luna = find("gpt-5.6-luna");
+        assert_eq!(
+            (
+                luna.cost.input,
+                luna.cost.output,
+                luna.cost.cache_read,
+                luna.cost.cache_write
+            ),
+            (0.2, 1.2, 0.02, 0.25)
+        );
+        let t = &luna.cost.tiers.as_ref().expect("luna tiers")[0];
+        assert_eq!(t.input_tokens_above, 272_000);
+        assert_eq!((t.input, t.output, t.cache_read, t.cache_write), (0.4, 1.8, 0.04, 0.5));
+
+        let terra = find("gpt-5.6-terra");
+        assert_eq!(
+            (
+                terra.cost.input,
+                terra.cost.output,
+                terra.cost.cache_read,
+                terra.cost.cache_write
+            ),
+            (2.0, 12.0, 0.2, 2.5)
+        );
+        let t = &terra.cost.tiers.as_ref().expect("terra tiers")[0];
+        assert_eq!((t.input, t.output, t.cache_read, t.cache_write), (4.0, 18.0, 0.4, 5.0));
+
+        // MIRROR: Sol has no entry in `OPENAI_GPT_56_STANDARD_COSTS`; its literal is the unchanged
+        // inline `{5, 30, 0.5, 6.25}` (v0.84.1 `…:2609`), so only its contextWindow moved.
+        let sol = find("gpt-5.6-sol");
+        assert_eq!(
+            (
+                sol.cost.input,
+                sol.cost.output,
+                sol.cost.cache_read,
+                sol.cost.cache_write
+            ),
+            (5.0, 30.0, 0.5, 6.25)
+        );
+        // MIRROR: the non-5.6 rows keep their own windows (`CODEX_SPARK_CONTEXT` / `CODEX_CONTEXT`).
+        assert_eq!(find("gpt-5.3-codex-spark").context_window, 128_000);
+        assert_eq!(find("gpt-5.4").context_window, 272_000);
+    }
+
     /// `gpt-5.4` verbatim from `openai-codex.models.ts` @`b0c2a90e`, including the long-context
     /// pricing tier that doubles every rate above 272 000 input tokens.
     #[test]
@@ -625,8 +695,14 @@ mod tests {
         }
     }
 
-    /// The `gpt-5.6-*` trio added `max` to the thinking-level map and moved to a 372k window; the
-    /// older rows did not (`openai-codex.models.ts` @`b0c2a90e`).
+    /// The `gpt-5.6-*` trio added `max` to the thinking-level map; its window is the same 272k as
+    /// the 5.4/5.5 rows (`CODEX_GPT_56_CONTEXT === CODEX_CONTEXT === 272000`).
+    ///
+    /// ASSERTION CORRECTED: this test previously pinned `372_000`, which no pi version ever
+    /// emitted — `CODEX_GPT_56_CONTEXT` is `272000` at v0.84.1
+    /// (`ai/scripts/generate-models.ts:2541`) and at v0.83.0 (`…:2352`), and it is the only value
+    /// the three `gpt-5.6-*` codex literals use (v0.84.1 `…:2602`, `:2614`, `:2626`). The old
+    /// expectation pinned cyrup's transposed digit, not upstream.
     #[test]
     fn the_gpt_5_6_trio_carries_the_max_thinking_level() {
         let models = openai_codex_models();
@@ -635,7 +711,7 @@ mod tests {
                 .iter()
                 .find(|m| m.id.as_str() == id)
                 .unwrap_or_else(|| panic!("{id} missing"));
-            assert_eq!(m.context_window, 372_000, "{id}");
+            assert_eq!(m.context_window, 272_000, "{id}");
             let map = m.thinking_level_map.as_ref().expect("thinkingLevelMap");
             assert_eq!(map.get("max"), Some(&Some("max".to_string())), "{id}");
             // Unlike every earlier row, the trio bills cache WRITES.

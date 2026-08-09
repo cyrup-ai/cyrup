@@ -240,6 +240,28 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "high");
     }
 
+    /// VERSION LAG (v0.83.0 → v0.84.1): Groq models get NO `thinkingLevelMap` from the generator
+    /// itself (v0.84.1 `ai/scripts/generate-models.ts:1470-1492` builds the row without one) —
+    /// the only source is a single override, which upstream RETARGETED from `qwen/qwen3-32b`
+    /// (v0.83.0 `…:837`) to `qwen/qwen3.6-27b` (v0.84.1 `…:870`). cyrup still carried the map on
+    /// the 3-32b row, so `high` mapped to the literal `"default"` and `low`/`medium` were pinned to
+    /// `null` for a model upstream no longer special-cases.
+    #[test]
+    fn groq_qwen3_32b_no_longer_carries_the_retargeted_thinking_level_map() {
+        let models = GROQ.models();
+        let qwen = models
+            .iter()
+            .find(|m| m.id.as_str() == "qwen/qwen3-32b")
+            .expect("qwen/qwen3-32b");
+        assert_eq!(qwen.thinking_level_map, None);
+        // MIRROR: no Groq row has a thinking-level map — the generator never sets one, and the sole
+        // override now names an id this catalog does not contain.
+        assert!(models.iter().all(|m| m.thinking_level_map.is_none()));
+        // MIRROR: the row itself is untouched — this is a map removal, not a model removal.
+        assert!(qwen.reasoning);
+        assert_eq!(qwen.context_window, 131_072);
+    }
+
     #[test]
     fn providers_construct_with_correct_identity() {
         let p = GROQ.provider();

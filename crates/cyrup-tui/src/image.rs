@@ -423,13 +423,29 @@ pub fn detect_capabilities() -> TerminalCapabilities {
     detect_capabilities_from(|k| std::env::var(k).ok(), probe_tmux_hyperlinks())
 }
 
-/// The pure core of [`detect_capabilities`] (Pi `detectCapabilities`, terminal-image.ts:65-125),
-/// parameterised over an environment lookup + the tmux-hyperlink-forwarding flag so both branches are
-/// deterministically testable. The ordered checks mirror Pi's exactly (multiplexer suppression first,
-/// then the positively-identified terminals, then the conservative default).
+/// The pure core of [`detect_capabilities`] for the *host* platform (Pi `detectCapabilities`,
+/// v0.84.1 `tui/src/terminal-image.ts:68-132`), parameterised over an environment lookup + the
+/// tmux-hyperlink-forwarding flag so both branches are deterministically testable.
+///
+/// Pi reads `process.platform` inline; here the platform is `cfg!(windows)`, which is a
+/// compile-time constant and therefore untestable on a non-Windows builder. Use
+/// [`detect_capabilities_on_platform`] to exercise the Windows-console branch anywhere.
 pub fn detect_capabilities_from(
     env: impl Fn(&str) -> Option<String>,
     tmux_forwards_hyperlinks: bool,
+) -> TerminalCapabilities {
+    // Pi `const isWindowsConsole = process.platform === "win32"` (v0.84.1 terminal-image.ts:74).
+    detect_capabilities_on_platform(env, tmux_forwards_hyperlinks, cfg!(windows))
+}
+
+/// [`detect_capabilities_from`] with Pi's `isWindowsConsole` (v0.84.1 `terminal-image.ts:74`) lifted
+/// into a parameter. The ordered checks mirror Pi's exactly: multiplexer suppression first
+/// (`:76-86`), then the positively-identified terminals (`:88-118`), then the bare Windows console
+/// (`:124-129`), then the conservative default (`:131`).
+pub fn detect_capabilities_on_platform(
+    env: impl Fn(&str) -> Option<String>,
+    tmux_forwards_hyperlinks: bool,
+    is_windows_console: bool,
 ) -> TerminalCapabilities {
     let has = |k: &str| env(k).is_some_and(|v| !v.is_empty());
     let lower = |k: &str| env(k).unwrap_or_default().to_ascii_lowercase();
@@ -437,7 +453,10 @@ pub fn detect_capabilities_from(
     let terminal_emulator = lower("TERMINAL_EMULATOR");
     let term = lower("TERM");
     let color_term = lower("COLORTERM");
-    let has_true_color = color_term.contains("truecolor") || color_term.contains("24bit");
+    // Pi `colorTerm === "truecolor" || colorTerm === "24bit"` (v0.84.1 terminal-image.ts:73) — an
+    // EQUALITY, not a substring test. `contains` (what this was) also fired on values that merely
+    // embed the word, e.g. `COLORTERM=not-truecolor`. Port bug, present at v0.83.0 too.
+    let has_true_color = color_term == "truecolor" || color_term == "24bit";
     let identified = |images: Option<ImageProtocol>, hyperlinks: bool| TerminalCapabilities {
         images,
         true_color: true,
@@ -480,6 +499,16 @@ pub fn detect_capabilities_from(
     }
     if terminal_emulator == "jetbrains-jediterm" {
         return identified(None, false);
+    }
+    // Pi terminal-image.ts:124-129 — "Windows Terminal does not always set WT_SESSION, for example
+    // when it hosts a cmd.exe launched directly from Win+R. Modern Windows consoles support
+    // truecolor; keep hyperlinks off unless we positively detected support above." So a bare Windows
+    // console gets truecolor WITHOUT a `COLORTERM` hint, while still falling short of OSC-8.
+    //
+    // Version lag, not a port bug: upstream added this in `fa07e7bd9` ("fix(tui): detect truecolor
+    // for Windows consoles"), after the v0.83.0 baseline this crate was ported against.
+    if is_windows_console {
+        return TerminalCapabilities { images: None, true_color: true, hyperlinks: false };
     }
     // Unknown terminal: conservative — OSC-8 off (an unforwarded hyperlink would vanish from output).
     TerminalCapabilities::conservative(has_true_color)

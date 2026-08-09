@@ -113,12 +113,16 @@ const PI_EDIT_GUIDELINES: &[&str] = &[
     "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
 ];
 
-// bash.ts:327-331. `promptGuidelines` is present whenever `exposeSessionEnvironment` is on, and
-// bash.ts:322 defaults that flag to TRUE (`options?.exposeSessionEnvironment ?? true`) — so the
-// DEFAULT `BashOpts` must carry the guideline. Renamed `PI_*` -> `CYRUP_*` because that is the
-// family cyrup's `resolveSpawnContext` port actually publishes (TOOL-008).
+// v0.84.1 bash.ts:45-48,332-334. `promptGuidelines` is present whenever `exposeSessionEnvironment`
+// is on, and bash.ts:327 defaults that flag to TRUE (`options?.exposeSessionEnvironment ?? true`) —
+// so the DEFAULT `BashOpts` must carry the guideline. Renamed `PI_*` -> `CYRUP_*` because that is
+// the family cyrup's `resolveSpawnContext` port actually publishes (TOOL-008).
+//
+// The leading "You can " is v0.84.1 `bash.ts:47` verbatim: v0.83.0 `bash.ts:330` said
+// "Inspect PI_* environment variables for current model and session details." and v0.84.0 softened
+// the imperative to a statement of availability. Version lag, not a port bug.
 const PI_BASH_GUIDELINES: &[&str] =
-    &["Inspect CYRUP_* environment variables for current model and session details."];
+    &["You can inspect CYRUP_* environment variables for current model and session details."];
 const PI_BASH_DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.";
 const PI_BASH_SNIPPET: &str = "Execute bash commands (ls, grep, find, etc.)";
 
@@ -211,6 +215,34 @@ fn all_seven_tool_metadata_match_pi_verbatim() {
         PI_LS_SNIPPET,
         &[],
     );
+}
+
+/// G41 MIRROR: the v0.84.0 softening applied to `bash` ONLY.
+///
+/// `git diff v0.83.0..v0.84.1 -- packages/coding-agent/src/core/tools/` touches all seven tool
+/// files, but the only model-facing STRING it changes is bash's guideline. `read.ts:28` and
+/// `write.ts:21` at v0.84.1 still carry the unprefixed `"Use read to examine files instead of cat
+/// or sed."` / `"Use write only for new files or complete rewrites."`, and all four `edit.ts:58-61`
+/// guidelines are byte-identical to v0.83.0 — the v0.84.0 change hoisted them into exported consts
+/// without rewording them. A find-and-replace that softened every guideline would be over-broad
+/// and is caught here.
+#[test]
+fn only_bash_got_the_v0_84_softening() {
+    for (name, tool) in [
+        ("read", Arc::new(ReadTool::new(fs(), cwd(), ReadOpts::default())) as Arc<dyn Tool>),
+        ("write", Arc::new(WriteTool::new(fs(), locks(), cwd(), WriteOpts))),
+        ("edit", Arc::new(EditTool::new(fs(), locks(), cwd(), Default::default()))),
+    ] {
+        for g in tool.prompt_guidelines() {
+            assert!(
+                !g.starts_with("You can "),
+                "{name}: pi v0.84.1 softened bash's guideline only; this one must stay verbatim: {g}"
+            );
+        }
+    }
+
+    let bash = BashTool::new(proc(), ShellConfig::detect(), cwd(), BashOpts::default());
+    assert!(bash.prompt_guidelines()[0].starts_with("You can inspect "));
 }
 
 /// The registry hands out `Arc<dyn Tool>`; assert the metadata survives that erasure for the whole
