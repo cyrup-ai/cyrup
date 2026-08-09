@@ -256,25 +256,37 @@ pub struct VisualTruncate {
 }
 
 /// Truncate `text` to at most `max` visual lines counted **from the end**, wrapping each logical line
-/// to `width` (`truncateToVisualLines`, `visual-truncate.ts:30-63`). Returns the visible tail and the
+/// to `width` (`truncateToVisualLines`, `visual-truncate.ts:30-53`). Returns the visible tail and the
 /// number of hidden lines. `width == 0` is treated as `1`.
+///
+/// Upstream this function owns no wrapping of its own — it is literally
+/// ```text
+/// const tempText = new Text(text, paddingX, 0);
+/// const allVisualLines = tempText.render(width);
+/// ```
+/// (`visual-truncate.ts:37-38`), i.e. `wrapTextWithAnsi(text, width - paddingX * 2)`
+/// (`text.ts:64`, `:67`). cyrup's callers pass the already-reduced content width and add the margin
+/// themselves, so `width` here is upstream's `width - paddingX * 2`; the WRAP is the shared
+/// [`crate::transcript::wrap_line`] — the same `wrapSingleLine` port `Text`, `Box` and
+/// [`crate::markdown`] use.
+///
+/// It used to be a `chars()`-indexed hard chunker: every logical line was sliced into fixed
+/// `width`-*char* pieces, so it broke mid-word (`… output tha` / `t certainly …`), miscounted every
+/// CJK ideograph, emoji and box-drawing glyph as one column, and could split a ZWJ sequence or
+/// detach a combining mark. That is the same char-vs-grapheme defect already fixed in `wrap_line`,
+/// `wrap_cell` and `word_wrap_line`, and — because the hidden-line count is derived from the row
+/// count — it also reported the wrong `... N more lines`.
 pub fn truncate_to_visual_lines(text: &str, max: usize, width: usize) -> VisualTruncate {
     if text.is_empty() {
         return VisualTruncate { lines: Vec::new(), skipped: 0 };
     }
     let width = width.max(1);
     let mut visual: Vec<String> = Vec::new();
+    // `wrapTextWithAnsi` splits on `/\r\n|\r|\n/` first (`utils.ts:839`) and wraps each piece,
+    // returning `[""]` for an empty one (`:858-860`) so a blank output line keeps its row.
     for logical in text.split('\n') {
-        let chars: Vec<char> = logical.chars().collect();
-        if chars.is_empty() {
-            visual.push(String::new());
-            continue;
-        }
-        let mut start = 0;
-        while start < chars.len() {
-            let end = (start + width).min(chars.len());
-            visual.push(chars.get(start..end).map(|s| s.iter().collect()).unwrap_or_default());
-            start = end;
+        for row in crate::transcript::wrap_line(&Line::from(Span::raw(logical.to_string())), width) {
+            visual.push(row.spans.iter().map(|s| s.content.as_ref()).collect());
         }
     }
     if visual.len() <= max {

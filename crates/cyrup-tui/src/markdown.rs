@@ -24,6 +24,21 @@
 //!   the text token and `wrapTextWithAnsi` splits on it (`markdown.ts:638-641`, `utils.ts:839`).
 //! - **Streaming partial-fence trim** ([`trim_partial_closing_fence`]) keeps a streaming code block
 //!   from flickering open/closed as the closing fence arrives char-by-char (`markdown.ts:25-48`).
+//! - **Wrapping** — every logical row is wrapped to the width of the container it is in and then
+//!   re-prefixed, upstream's order at all three of its wrapping sites (`markdown.ts:322`+`:340`,
+//!   `:594-597`, `:788-791`). See [`MdRenderer::flush_line`].
+//! - **Double wrap** — after the token walk, EVERY produced row goes through the wrap once more at
+//!   the component's own `contentWidth` (`markdown.ts:316-326`). See [`MdRenderer::finish`].
+//!
+//! ## The prefix machinery, and the rule for adding to it
+//! Upstream every block token returns a bare `string[]` from `renderToken` and its **caller**
+//! decorates it: `quoteBorder("│ ") + wrappedLine` inside a blockquote (`markdown.ts:596`),
+//! `linePrefix + wrappedLine` inside a list item (`:790`). cyrup's single event walk has no such
+//! caller, so **every** row must leave through [`MdRenderer::flush_line`] —
+//! [`MdRenderer::emit_prefixed`] for an already-built [`Line`], [`MdRenderer::blank`] for a
+//! separator. A `self.out.push(…)` anywhere else silently drops the blockquote border and swallows
+//! a queued list bullet; that was the shared root cause of three separate defects in `emit_table`,
+//! `Event::Rule` and `emit_code_block`.
 
 use std::sync::OnceLock;
 
@@ -37,6 +52,31 @@ use crate::theme::UiTheme;
 
 /// Render markdown `text` into styled lines at content `width` (spec/tui/06 §2). Total / never panics:
 /// any structure pulldown-cmark cannot parse degrades to plain text spans.
+///
+/// **`width` is the CONTENT width, and the wrap happens in here.** Upstream `Markdown.render(width)`
+/// takes the COMPONENT width and derives `contentWidth = Math.max(1, width - this.paddingX * 2)`
+/// itself (`markdown.ts:284`), because the component owns its `paddingX`. In cyrup the CALLER owns
+/// it, and — this is the part an earlier revision of this comment got wrong — the six call sites do
+/// **not** all reduce by `output_pad * 2`. Each passes the content width of whatever container it
+/// sits in, which is precisely what the seam is for:
+///
+/// | call site (verified at HEAD) | `width` passed | upstream shape |
+/// |---|---|---|
+/// | `transcript.rs:998` — live streaming partial | `width - output_pad * 2` | `new Markdown(text, this.outputPad, 0, …)`, `assistant-message.ts:104-114` |
+/// | `transcript.rs:2234` — committed assistant turn | `width - output_pad * 2` | same |
+/// | `transcript.rs:2196` — user message | `width - output_pad * 2` | `Box(outputPad, 1)`'s `contentWidth` (`box.ts:79`) around a `Markdown(…, 0, 0)`, `user-message.ts:38-58` |
+/// | `transcript.rs:1082` — thinking body | **already reduced by its own callers**: `:974` and `:2256` each hand `transcript::thinking_lines` `width - output_pad * 2`, and it forwards that unchanged | `new Markdown(…, outputPad, 0, …, { color, italic })`, `assistant-message.ts:146-164` |
+/// | `transcript.rs:2374` — `Entry::Block` | the **full** `width`: the block draws its own edge-to-edge `─` rules and carries no `outputPad` | — |
+/// | `transcript.rs:2450` — labeled `[skill]`/custom block | `width - 2` (`:2436` `content_width`), the `Box(1, 1)` `contentWidth` (`box.ts:79`) — **not** `output_pad` | `skill-invocation-message.ts:17` and the three sibling components |
+///
+/// What every one of them shares — and what this argument actually pins — is that the value is
+/// already the CONTENT width. Subtracting padding a second time in here would silently narrow every
+/// message by two columns and re-open M9: an assistant `---` drawing 76 where pi draws 78.
+///
+/// Rows come back already wrapped to `width`: [`MdRenderer::flush_line`] runs
+/// `wrapTextWithAnsi(line, contentWidth)` (`markdown.ts:322`, and the narrower `itemWidth` /
+/// `quoteContentWidth` of `:788` / `:594` inside a container) and re-applies the row prefix. Nothing
+/// downstream needs to reflow them, and reflowing them at a wider width is exactly the L2/M10 bug.
 pub fn render(text: &str, width: usize, theme: &UiTheme) -> Vec<Line<'static>> {
     render_with_text_color(text, width, theme, None)
 }
@@ -196,6 +236,15 @@ struct MdRenderer<'t> {
     theme: &'t UiTheme,
     out: Vec<Line<'static>>,
     cur: Vec<Span<'static>>,
+    /// How many LEADING spans of [`Self::cur`] form this row's `firstPrefix` — the quote borders,
+    /// the nesting indent and (when it has been materialised) the list marker
+    /// (`markdown.ts:774` `firstPrefix = indent + this.theme.listBullet(marker)`).
+    ///
+    /// [`MdRenderer::flush_line`] splits there: the prefix stays verbatim on row 0, the remainder is
+    /// the BODY that gets wrapped at `width - visibleWidth(firstPrefix)` (`markdown.ts:776`
+    /// `itemWidth`), and rows 1..N are re-opened with [`MdRenderer::continuation_prefix`]
+    /// (`:789` `renderedAnyLine ? continuationPrefix : firstPrefix`).
+    prefix_spans: usize,
     /// Active inline emphasis depth counters.
     bold: u32,
     italic: u32,
@@ -273,6 +322,7 @@ impl<'t> MdRenderer<'t> {
             theme,
             out: Vec::new(),
             cur: Vec::new(),
+            prefix_spans: 0,
             bold: 0,
             italic: 0,
             strike: 0,
@@ -331,6 +381,18 @@ impl<'t> MdRenderer<'t> {
 
     /// Push owned styled text onto the current line, materializing any pending list marker first.
     fn push_text(&mut self, text: &str, style: Style) {
+        self.open_line();
+        if self.link.is_some() {
+            self.link_text.push_str(text);
+        }
+        self.cur.push(Span::styled(text.to_string(), style));
+    }
+
+    /// Open a fresh row: lay down its `firstPrefix` and record how many spans that is.
+    ///
+    /// A no-op once the row is already open (mid-line `push_text`), which is what keeps
+    /// [`Self::prefix_spans`] pointing at the row's own prefix and not at a later span.
+    fn open_line(&mut self) {
         if let Some((marker, mstyle)) = self.pending_marker.take() {
             // `firstPrefix = indent + this.theme.listBullet(marker)` (`markdown.ts:774`). The frame
             // records the marker's visible width and flips to `renderedAnyLine` (`:789-791`) so every
@@ -341,57 +403,168 @@ impl<'t> MdRenderer<'t> {
                 frame.rendered = true;
             }
             self.cur.push(Span::styled(marker, mstyle));
+            // The marker is PART of `firstPrefix` upstream (`:774`), so it counts toward the split
+            // point and toward `itemWidth = width - visibleWidth(firstPrefix)` (`:776`).
+            self.prefix_spans = self.cur.len();
         } else if self.cur.is_empty() {
             self.start_line_prefix();
         }
-        if self.link.is_some() {
-            self.link_text.push_str(text);
-        }
-        self.cur.push(Span::styled(text.to_string(), style));
     }
 
     /// Emit the leading quote/indent/list prefix at the start of a fresh line.
     fn start_line_prefix(&mut self) {
+        let prefix = self.continuation_prefix();
+        self.cur.extend(prefix);
+        self.prefix_spans = self.cur.len();
+    }
+
+    /// `continuationPrefix` — the prefix every row of a block AFTER its first carries
+    /// (`markdown.ts:775`, applied at `:789`).
+    ///
+    /// Three components, in upstream's order:
+    /// 1. `this.theme.quoteBorder("│ ")` once per open blockquote — **visible**, because the quote
+    ///    arm re-emits it on every wrapped row (`markdown.ts:594-597`), not just the first.
+    /// 2. `const indent = "    ".repeat(depth)` — FOUR spaces per nesting level (`:758`), not two.
+    /// 3. `" ".repeat(visibleWidth(marker))` for the INNERMOST rendered item only (`:775`). A nested
+    ///    list's rows are pushed by `renderList(…, depth + 1, …)` directly (`:781`) and never go
+    ///    through the parent's `linePrefix`, which is exactly what the `items.last()` read
+    ///    reproduces.
+    ///
+    /// Note (1) is a real glyph and (3) is spaces — they are not the same rule, and a wrapped quoted
+    /// list depends on both being right.
+    ///
+    /// This is also verbatim what a FRESH line's prefix is once the item's marker has been emitted,
+    /// which is why [`Self::start_line_prefix`] is a thin wrapper over it.
+    fn continuation_prefix(&self) -> Vec<Span<'static>> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
         for _ in 0..self.quote {
-            self.cur.push(Span::styled("│ ".to_string(), self.theme.md_quote_border_style()));
+            spans.push(Span::styled("│ ".to_string(), self.theme.md_quote_border_style()));
         }
         let depth = self.lists.len().saturating_sub(1);
         if depth > 0 {
-            // `const indent = "    ".repeat(depth)` — FOUR spaces per nesting level
-            // (`markdown.ts:758`), not two.
-            self.cur.push(Span::raw("    ".repeat(depth)));
+            spans.push(Span::raw("    ".repeat(depth)));
         }
-        // `const continuationPrefix = indent + " ".repeat(visibleWidth(marker));` (`markdown.ts:775`)
-        // — every row of a list item AFTER its first is padded past the bullet, so a soft break, a
-        // hard break or a second block inside the item lines up under the item's text instead of
-        // falling back to column 0. Only the INNERMOST open item pads: a nested list's rows are
-        // pushed by `renderList(…, depth + 1, …)` directly (`:781`), never through the parent's
-        // `linePrefix`, which is exactly what the `items.last()` read reproduces.
         if let Some(frame) = self.items.last()
             && frame.rendered
             && frame.marker_w > 0
         {
-            self.cur.push(Span::raw(" ".repeat(frame.marker_w)));
+            spans.push(Span::raw(" ".repeat(frame.marker_w)));
         }
+        spans
     }
 
-    /// Flush the current spans as one output line (no-op when empty).
+    /// The width a block nested in this container renders at — upstream's `itemWidth`
+    /// (`markdown.ts:776` `Math.max(1, width - visibleWidth(firstPrefix))`) and
+    /// `quoteContentWidth` (`:568` `Math.max(1, width - 2)`) unified, since cyrup's single event
+    /// walk is inside both containers at once where upstream recurses through two `renderToken`
+    /// frames.
+    ///
+    /// A marker still only QUEUED (`pending_marker`) already counts: upstream computes `itemWidth`
+    /// from `firstPrefix` before rendering any of the item's children (`:774-776`, `:786`), so the
+    /// item's first block is sized past the bullet even though the bullet has not been emitted yet.
+    fn content_width(&self) -> usize {
+        let mut used: usize = usize::try_from(self.quote).unwrap_or(usize::MAX).saturating_mul(2);
+        used = used.saturating_add(self.lists.len().saturating_sub(1).saturating_mul(4));
+        let marker_w = match (self.pending_marker.as_ref(), self.items.last()) {
+            (Some((m, _)), _) => display_width(m),
+            (None, Some(frame)) if frame.rendered => frame.marker_w,
+            _ => 0,
+        };
+        used = used.saturating_add(marker_w);
+        self.width.saturating_sub(used).max(1)
+    }
+
+    /// Flush the current spans as output row(s), wrapping the body to the container's content width
+    /// and re-prefixing every produced row (no-op when empty).
+    ///
+    /// **This is where upstream's wrap happens, and the order is the whole point**: `markdown.ts`
+    /// wraps FIRST and prefixes SECOND, in all three of its wrapping sites —
+    /// `:322` `for (const wrappedLine of wrapTextWithAnsi(line, contentWidth))` then `:340`
+    /// `leftMargin + line + rightMargin`; `:594-597` `wrapTextWithAnsi(styledLine,
+    /// quoteContentWidth)` then `quoteBorder("│ ") + wrappedLine`; `:788-791`
+    /// `wrapTextWithAnsi(line, itemWidth)` then `linePrefix + wrappedLine`. Wrapping AFTER the
+    /// margin has been inserted — which is what an outer `Paragraph::wrap` over `pad_lines`' output
+    /// did — leaves row 0 indented and rows 1..N flush at column 0 (L2), and lets the text run into
+    /// the last terminal column with no right gutter (M10).
+    ///
+    /// `wrap_line` returns exactly one (empty) row for an empty body, so a list item that emitted a
+    /// marker and nothing else still produces its `firstPrefix` alone —
+    /// `if (!renderedAnyLine) lines.push(firstPrefix)` (`markdown.ts:796-798`).
     fn flush_line(&mut self) {
-        if !self.cur.is_empty() {
-            self.out.push(Line::from(std::mem::take(&mut self.cur)));
+        // Guard FIRST. `flush_line` is called from `SoftBreak`, `HardBreak`, `Rule` and every
+        // start/end tag boundary; emitting a row for an empty `cur` would put a blank between every
+        // pair of blocks and move every spacer count in the transcript's vertical rhythm.
+        if self.cur.is_empty() {
+            self.prefix_spans = 0;
+            return;
+        }
+        let spans = std::mem::take(&mut self.cur);
+        let split = self.prefix_spans.min(spans.len());
+        self.prefix_spans = 0;
+        let (prefix, body) = spans.split_at(split);
+        // Measure what is ACTUALLY on the row, not a recomputed prefix: `visibleWidth(firstPrefix)`
+        // (`markdown.ts:776`) is taken from the very string that gets prepended.
+        let prefix_w: usize = prefix.iter().map(Span::width).sum();
+        // `Math.max(1, width - visibleWidth(firstPrefix))` (`:776`).
+        let avail = self.width.saturating_sub(prefix_w).max(1);
+        let rows = crate::transcript::wrap_line(&Line::from(body.to_vec()), avail);
+        let cont = self.continuation_prefix();
+        for (i, row) in rows.into_iter().enumerate() {
+            // `const linePrefix = renderedAnyLine ? continuationPrefix : firstPrefix;` (`:789`).
+            let mut out_spans: Vec<Span<'static>> =
+                if i == 0 { prefix.to_vec() } else { cont.clone() };
+            out_spans.extend(row.spans);
+            self.out.push(Line::from(out_spans));
         }
     }
 
-    /// Push a blank separator line unless the output already ends with one.
+    /// Emit an already-built [`Line`] as a block-level row of this container: it collects the same
+    /// `firstPrefix`/`continuationPrefix` and the same wrap every prose row does.
+    ///
+    /// Upstream a block token returns a bare `string[]` from `renderToken` and its CALLER prefixes
+    /// it — `this.theme.quoteBorder("│ ") + wrappedLine` inside a blockquote (`markdown.ts:596`),
+    /// `linePrefix + wrappedLine` inside a list item (`:790`) — and the top-level post-pass at
+    /// `:322` wraps whatever is left. cyrup has no caller to do that, so block emitters route
+    /// through here instead of pushing straight onto `self.out`.
+    fn emit_prefixed(&mut self, line: Line<'static>) {
+        self.open_line();
+        // `Line::styled` puts the colour on the LINE, not on its spans; the prefix spans carry their
+        // own (`mdQuoteBorder`, `mdListBullet`), so the line style has to be folded down onto the
+        // body spans or a prefixed row would repaint the bullet in the body colour.
+        let lstyle = line.style;
+        self.cur.extend(
+            line.spans
+                .into_iter()
+                .map(|s| Span::styled(s.content.into_owned(), lstyle.patch(s.style))),
+        );
+        self.flush_line();
+    }
+
+    /// Push a blank separator row unless the output already ends with one.
+    ///
+    /// Upstream a separator is the string `""` — `case "space"` (`markdown.ts:619-621`), the
+    /// paragraph / heading / code / `hr` trailers (`:484-486`, `:497-499`, `:536-538`, `:607-609`)
+    /// and the loose-list gap (`:800`). Whether it stays bare is decided by the CONTAINER that
+    /// receives it, and the two containers do **not** answer the same way:
+    ///
+    /// * **A blockquote materialises it.** The separator is just another entry of
+    ///   `renderedQuoteLines`, and `:592-598` prepends `quoteBorder("│ ")` to every entry it walks —
+    ///   blanks included — so the border runs unbroken down the block. Pushing a bare
+    ///   `Line::default()` there punched a hole in it.
+    /// * **A list does not, observably.** The loose-list gap at `:800` is pushed by `renderList`
+    ///   straight into its own `lines`, never through `linePrefix`, so it really is bare; a gap
+    ///   *inside* an item goes through `:786-793` instead and comes out as `continuationPrefix + ""`,
+    ///   i.e. a run of trailing SPACES. Both paint an empty terminal row, so only the quote border —
+    ///   the one prefix with a glyph in it — is materialised here.
     fn blank(&mut self) {
-        let trailing_blank = self
-            .out
-            .last()
-            .map(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
-            .unwrap_or(true);
-        if !trailing_blank {
-            self.out.push(Line::default());
+        if self.out.last().map(|l| row_is_blank(l, self.quote)).unwrap_or(true) {
+            return;
         }
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for _ in 0..self.quote {
+            spans.push(Span::styled("│ ".to_string(), self.theme.md_quote_border_style()));
+        }
+        self.out.push(if spans.is_empty() { Line::default() } else { Line::from(spans) });
     }
 
     /// Emit literal source text through the same three-way sink as [`Event::Text`] (table cell /
@@ -442,8 +615,12 @@ impl<'t> MdRenderer<'t> {
             Event::HardBreak => self.flush_line(),
             Event::Rule => {
                 self.flush_line();
-                let n = self.width.clamp(1, 80);
-                self.out.push(Line::styled("─".repeat(n), self.theme.md_hr_style()));
+                // `lines.push(this.theme.hr("─".repeat(Math.min(width, 80))))` (`markdown.ts:606`)
+                // — `width` there is whatever `renderToken` was handed, i.e. `itemWidth` inside a
+                // list item (`:786`) and `quoteContentWidth` inside a blockquote (`:583`), not the
+                // component width. Then `:790`/`:596` prefixes the row.
+                let n = self.content_width().clamp(1, 80);
+                self.emit_prefixed(Line::styled("─".repeat(n), self.theme.md_hr_style()));
                 // `case "hr": … if (nextTokenType && nextTokenType !== "space") lines.push("")`
                 // (`markdown.ts:605-610`); when a `space` token *does* follow, `:619-622` supplies
                 // the blank instead. Either way exactly one — which is what `blank()` guarantees.
@@ -587,6 +764,21 @@ impl<'t> MdRenderer<'t> {
                 }
             }
             TagEnd::Item => {
+                // `if (!renderedAnyLine) { lines.push(firstPrefix); }` (`markdown.ts:796-798`) — an
+                // item whose children produced no row STILL emits its `firstPrefix`, alone, on a row
+                // of its own, so `- \n- x` is two rows and not one. [`Self::flush_line`]'s
+                // empty-`cur` guard fires before `pending_marker` is ever materialised, so nothing
+                // was emitted AND the marker survived into the next `Start(Item)`, which overwrote
+                // it — the bullet vanished from the render entirely.
+                //
+                // The condition is upstream's `renderedAnyLine`, not "the item had children": an
+                // item holding only a NESTED list renders no row of its own here either, and
+                // upstream sets `renderedAnyLine = true` for it at `:779-783` before `continue`, so
+                // its own bullet is legitimately dropped. That case is excluded by
+                // `pending_marker.is_some()` — the nested `Start(Item)` has already taken it.
+                if self.pending_marker.is_some() && self.items.last().is_some_and(|f| !f.rendered) {
+                    self.open_line();
+                }
                 self.flush_line();
                 self.items.pop();
                 // An item that emitted nothing still leaves no marker queued for the NEXT item.
@@ -594,6 +786,15 @@ impl<'t> MdRenderer<'t> {
             }
             TagEnd::BlockQuote(_) => {
                 self.flush_line();
+                // "Avoid rendering an extra empty quote line before the outer blockquote spacing" —
+                // `while (renderedQuoteLines[len - 1] === "") renderedQuoteLines.pop()`
+                // (`markdown.ts:587-590`). The separator this quote's last block queued never
+                // reaches `:592-598`, so the block cannot end on a dangling `│ `; the single blank
+                // that follows a blockquote is `:599-601`'s BARE `""`, which `blank()` supplies once
+                // the depth is back to zero.
+                while self.out.last().is_some_and(|l| is_quote_only_row(l, self.quote)) {
+                    self.out.pop();
+                }
                 self.quote = self.quote.saturating_sub(1);
                 if self.quote == 0 {
                     self.blank();
@@ -680,11 +881,20 @@ impl<'t> MdRenderer<'t> {
         // `trim_end`, which would also eat a deliberately blank final code line.
         let code = code.strip_suffix('\n').unwrap_or(code);
         let border = self.theme.md_code_block_border_style();
-        self.out.push(Line::styled(format!("```{lang}"), border));
+        // Routed through [`Self::emit_prefixed`] rather than straight onto `self.out`: upstream a
+        // `code` token returns a bare `string[]` (`markdown.ts:520-540`) whose caller prefixes it —
+        // `linePrefix + wrappedLine` inside a list item (`:790`) — and whose long rows the top-level
+        // post-pass wraps at `contentWidth` (`:322`). A fence inside a `- ` item therefore lines up
+        // under the item's text, and an over-wide code row breaks instead of running off the pane.
+        //
+        // The `  ` code indent (`:521` `codeBlockIndent ?? "  "`) stays in the BODY, not the prefix,
+        // which is what makes a wrapped code row lose it upstream: `wrapSingleLine` never starts a
+        // produced row with whitespace (`utils.ts:912-915`).
+        self.emit_prefixed(Line::styled(format!("```{lang}"), border));
         for line in highlight_lines(code, lang, self.theme) {
-            self.out.push(line);
+            self.emit_prefixed(line);
         }
-        self.out.push(Line::styled("```".to_string(), border));
+        self.emit_prefixed(Line::styled("```".to_string(), border));
         self.blank();
     }
 
@@ -708,6 +918,11 @@ impl<'t> MdRenderer<'t> {
         if num_cols == 0 {
             return;
         }
+        // `renderTable(token, width, …)` (`markdown.ts:551`) is handed the width `renderToken` was
+        // called with — `itemWidth` inside a list item (`:786`), `quoteContentWidth` inside a
+        // blockquote (`:583`) — so the grid, its too-narrow guard and the raw fallback are all sized
+        // to the CONTAINER, not to the component.
+        let avail_width = self.content_width();
         // Border overhead = "│ " + (n-1)*" │ " + " │" = 3n + 1 (`markdown.ts:850-852`).
         let overhead = 3usize.saturating_mul(num_cols).saturating_add(1);
         // `const availableForCells = availableWidth - borderOverhead; if (availableForCells <
@@ -715,7 +930,7 @@ impl<'t> MdRenderer<'t> {
         // (`markdown.ts:853-861`) — too narrow for a stable grid, so degrade to the raw Markdown
         // instead of drawing a grid wider than the pane. Signed there, saturating here: the guard is
         // `width < overhead + numCols`.
-        if self.width < overhead.saturating_add(num_cols) {
+        if avail_width < overhead.saturating_add(num_cols) {
             let style = self.theme.assistant_style();
             // `wrapTextWithAnsi(token.raw, availableWidth)` (`markdown.ts:856`) — the raw source is
             // WRAPPED to the pane, not pushed through at its natural width, so the fallback never
@@ -729,7 +944,13 @@ impl<'t> MdRenderer<'t> {
             // wrappedLine` for a blockquote (`markdown.ts:596`), `linePrefix + wrappedLine` for a
             // list item (`:790`).
             for src in t.raw.trim_end_matches('\n').split('\n') {
-                for row in wrap_cell(src, self.width) {
+                // marked hands `renderTable` a `token.raw` whose blockquote markers are already gone
+                // — the `blockquote` tokenizer strips them before re-lexing the body — where
+                // pulldown-cmark's offset range is a slice of the untouched source. Without this the
+                // fallback printed `> | Name | Role |`, leaking the quote syntax INSIDE the `│ `
+                // border this batch had just taught it to draw. See [`strip_quote_markers`].
+                let src = strip_quote_markers(src, self.quote);
+                for row in wrap_cell(src, avail_width) {
                     self.push_text(&row, style);
                     self.flush_line();
                 }
@@ -738,7 +959,7 @@ impl<'t> MdRenderer<'t> {
             self.blank();
             return;
         }
-        let avail_cells = self.width.saturating_sub(overhead);
+        let avail_cells = avail_width.saturating_sub(overhead);
 
         // Natural width per column = widest visible cell (header + body), clamped to ≥1. Index-free.
         let natural: Vec<usize> = (0..num_cols)
@@ -804,21 +1025,33 @@ impl<'t> MdRenderer<'t> {
             Line::styled(format!("{left}{}{right}", cells.join(mid)), base)
         };
 
+        // EVERY row — frame and grid alike — leaves through [`Self::emit_prefixed`], for the same
+        // reason the fallback above does. Upstream `renderTable` returns a bare `string[]`
+        // (`markdown.ts:1005`) and its caller decorates it: `quoteBorder("│ ") + wrappedLine` for a
+        // blockquote (`:596`), `linePrefix + wrappedLine` for a list item (`:790`). Pushing straight
+        // onto `self.out` cost two things at once — a table inside a blockquote lost its border, and
+        // a table that was the first block of a `- ` item swallowed the queued bullet outright,
+        // because only `open_line()` consumes `pending_marker` and the next `Start(Item)` overwrote
+        // whatever it left behind.
+        //
+        // The wrap `emit_prefixed` adds is a no-op here by construction: `avail_width` is already
+        // `content_width()`, i.e. `self.width` minus the very prefix `flush_line` will measure.
+
         // Top border ┌─...─┬─...─┐.
-        self.out.push(border("┌─", "─┬─", "─┐", &widths));
+        self.emit_prefixed(border("┌─", "─┬─", "─┐", &widths));
         // Header band (bold), wrapped.
         self.push_table_row(&t.header, &widths, heading, '│');
         // Separator ├─...─┼─...─┤.
         let sep = || border("├─", "─┼─", "─┤", &widths);
-        self.out.push(sep());
+        self.emit_prefixed(sep());
         for (ri, row) in t.rows.iter().enumerate() {
             self.push_table_row(row, &widths, base, '│');
             if ri + 1 < t.rows.len() {
-                self.out.push(sep());
+                self.emit_prefixed(sep());
             }
         }
         // Bottom border └─...─┴─...─┘.
-        self.out.push(border("└─", "─┴─", "─┘", &widths));
+        self.emit_prefixed(border("└─", "─┴─", "─┘", &widths));
         self.blank();
     }
 
@@ -846,12 +1079,29 @@ impl<'t> MdRenderer<'t> {
                 spans.push(Span::styled(format!("{text}{}", " ".repeat(pad)), cell_style));
             }
             spans.push(Span::styled(format!(" {bar}"), bar_style));
-            self.out.push(Line::from(spans));
+            // Through the prefix machinery, never `self.out.push` — see [`Self::emit_table`].
+            self.emit_prefixed(Line::from(spans));
         }
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
         self.flush_line();
+        // **Upstream wraps TWICE.** `renderList` (`:788`) and the blockquote arm (`:594`) wrap a
+        // child at the CONTAINER width and then prefix it; `render()` afterwards runs every line the
+        // token walk produced through `wrapTextWithAnsi(line, contentWidth)` one more time
+        // (`markdown.ts:316-326`), before the margins go on at `:328-340`.
+        //
+        // The second pass is a no-op for every row that already fits — [`crate::transcript::wrap_line`]
+        // returns a verbatim clone then, so span structure, styles and trailing spaces all survive.
+        // It exists for the rows the inner wrap cannot bound: `avail` floors at
+        // `max(1, width - prefix_w)` (`:776` `Math.max(1, …)`), so once the accumulated
+        // `│ `/indent/marker prefix is as wide as the pane, `prefix + body` overruns `self.width`.
+        // Deeply nested quoted lists at a narrow pane are exactly that case.
+        let width = self.width;
+        self.out = std::mem::take(&mut self.out)
+            .into_iter()
+            .flat_map(|line| crate::transcript::wrap_line(&line, width))
+            .collect();
         // Drop a single trailing blank line for tight scrollback packing.
         if self.out.last().map(|l| l.spans.iter().all(|s| s.content.trim().is_empty())).unwrap_or(false)
         {
@@ -859,6 +1109,56 @@ impl<'t> MdRenderer<'t> {
         }
         self.out
     }
+}
+
+/// Whether `line` is one of upstream's `""` rows — a row carrying nothing but its container prefix.
+///
+/// The first `quote` spans of a row emitted inside a blockquote are the `quoteBorder("│ ")` runs
+/// `markdown.ts:596` prepends; blankness is decided by what follows them, exactly as upstream tests
+/// the *unprefixed* string (`:588`). Skipping them matters both ways: without the skip a `│ `
+/// separator reads as content and [`MdRenderer::blank`] emits a second one, and with too generous a
+/// skip a table row whose bars happen to be `│ ` would read as blank.
+fn row_is_blank(line: &Line<'_>, quote: u32) -> bool {
+    let skip = usize::try_from(quote).unwrap_or(usize::MAX);
+    line.spans.iter().skip(skip).all(|s| s.content.trim().is_empty())
+}
+
+/// Whether `line` is a blank row *produced inside* a blockquote of depth `quote` — exactly `quote`
+/// border spans and nothing at all after them.
+///
+/// This is the test behind `while (renderedQuoteLines.at(-1) === "") renderedQuoteLines.pop()`
+/// (`markdown.ts:587-590`). It is deliberately stricter than [`row_is_blank`]: the pop walks
+/// BACKWARDS off the end of the output and must not chew into rows that predate the blockquote (a
+/// bare `Line::default()` left by the preceding paragraph has zero spans and would otherwise match).
+fn is_quote_only_row(line: &Line<'_>, quote: u32) -> bool {
+    let want = usize::try_from(quote).unwrap_or(usize::MAX);
+    want > 0 && line.spans.len() == want && line.spans.iter().all(|s| s.content.as_ref() == "│ ")
+}
+
+/// Strip `depth` levels of blockquote source markers from one line of a table's `token.raw`.
+///
+/// marked's `blockquote` tokenizer removes the `>` markers before re-lexing the quote body, one
+/// level per nesting, so a table nested in a blockquote reaches `renderTable` with a `token.raw`
+/// that carries **none** — and `markdown.ts:856`'s `wrapTextWithAnsi(token.raw, availableWidth)`
+/// fallback therefore prints clean Markdown. pulldown-cmark's offset range is a slice of the
+/// ORIGINAL source, so `Start(Table)`'s raw still has every `> ` on it.
+///
+/// The shape mirrors marked's `/^ {0,3}> ?/`: up to three leading spaces, the `>`, then one optional
+/// space or tab.
+fn strip_quote_markers(line: &str, depth: u32) -> &str {
+    let mut s = line;
+    for _ in 0..depth {
+        let mut t = s;
+        for _ in 0..3 {
+            match t.strip_prefix(' ') {
+                Some(rest) => t = rest,
+                None => break,
+            }
+        }
+        let Some(rest) = t.strip_prefix('>') else { break };
+        s = rest.strip_prefix([' ', '\t']).unwrap_or(rest);
+    }
+    s
 }
 
 /// Visible (terminal-column) width of `s`, unicode-width-correct via ratatui's `Span::width`

@@ -119,3 +119,48 @@ fn plain_loader_has_no_cancel_row() {
     assert!(text.contains("Loading"));
     assert!(!text.contains("cancel"));
 }
+
+/// `truncateToVisualLines` owns no wrapping of its own upstream — it is literally
+/// `new Text(text, paddingX, 0).render(width)` (`visual-truncate.ts:37-38`), i.e.
+/// `wrapTextWithAnsi(text, width - paddingX * 2)` (`text.ts:64`, `:67`). So the rows it returns are
+/// WORD-wrapped and measured in terminal COLUMNS.
+///
+/// cyrup sliced each logical line into fixed `width`-*char* chunks instead: it broke mid-word
+/// (`… output tha` / `t certainly …`, visible on every long `!command` output row), counted a CJK
+/// ideograph as one column when it occupies two, and could split a ZWJ sequence or detach a
+/// combining mark. Because the `... N more lines` count is the row count, it was wrong too.
+#[test]
+fn truncate_word_wraps_and_measures_in_columns_not_chars() {
+    let text = "a very long line of program output that certainly does not fit";
+    let r = truncate_to_visual_lines(text, 20, 38);
+    assert_eq!(r.skipped, 0);
+    // Word boundaries only — no row may start or end mid-word.
+    for row in &r.lines {
+        assert!(row.len() <= 38, "row overflows: {row:?}");
+        assert!(!row.starts_with(' ') && !row.ends_with(' '), "untrimmed row: {row:?}");
+    }
+    let rejoined = r.lines.join(" ");
+    assert_eq!(rejoined, text, "words were split: {:?}", r.lines);
+
+    // A double-width script is measured in COLUMNS: four ideographs are eight columns, so a width of
+    // 4 fits exactly two per row — a `chars()` chunker would put four on a row twice as wide as the
+    // pane.
+    let cjk = truncate_to_visual_lines("日本語だ", 20, 4);
+    assert_eq!(cjk.lines, vec!["日本".to_string(), "語だ".to_string()]);
+
+    // A ZWJ family is one cluster and is never split across rows.
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+    let zwj = truncate_to_visual_lines(&format!("{family}{family}"), 20, 4);
+    for row in &zwj.lines {
+        assert!(
+            !row.starts_with('\u{200d}') && !row.ends_with('\u{200d}'),
+            "ZWJ sequence split: {:?}",
+            zwj.lines
+        );
+    }
+
+    // MIRROR: the tail-truncate and the hidden count still work off the WRAPPED row count.
+    let many = truncate_to_visual_lines(text, 2, 20);
+    assert_eq!(many.lines.len(), 2);
+    assert!(many.skipped > 0, "nothing reported hidden: {many:?}");
+}

@@ -1258,7 +1258,12 @@ fn is_ws_grapheme(g: &str) -> bool {
 /// before measuring it (`:979-980`, `:994-1012`). Wrapping per `char` instead tears a ZWJ emoji
 /// sequence or a combining mark away from its base — a correctness bug, not a spacing one — and it
 /// also measures differently from [`apply_bg`], which is exactly the disagreement L6 is about.
-fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+///
+/// `pub(crate)` because [`crate::markdown`] is upstream's THIRD consumer of the same primitive —
+/// `wrapTextWithAnsi` is called from `text.ts:67`, `box.ts` (transitively, through its child) AND
+/// `markdown.ts:322`/`:594`/`:788`. There is exactly one wrapper here for the same reason there is
+/// exactly one upstream; do not grow a fourth.
+pub(crate) fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     if line.width() <= width {
         return vec![line.clone()];
@@ -2139,8 +2144,23 @@ pub(crate) fn wrapped_height(lines: &[Line<'static>], width: usize) -> usize {
 /// Assistant and user bodies render as **markdown** (spec/tui/06 §2) — multiple lines, no role
 /// label: `assistant-message.ts:104-114` adds one `Markdown` child per text block and
 /// `user-message.ts:38-58` one `Box`-wrapped `Markdown`, and neither contains a prefix (X1).
-/// Left-indent every line by `pad` columns — the horizontal half of Pi's `outputPad` message padding
-/// (`Markdown(content, outputPad, 0)` / `Box(outputPad, 1)`). A no-op at `pad == 0` (flush-left).
+/// Prefix `leftMargin` to every ALREADY-WRAPPED row — the second half of `markdown.ts:334-340`
+/// (`const lineWithMargins = leftMargin + line + rightMargin`), where `leftMargin =
+/// " ".repeat(this.paddingX)` (`:329`) and `paddingX` is the caller's `outputPad`
+/// (`assistant-message.ts:111` `new Markdown(text, this.outputPad, 0, …)`).
+///
+/// **Order matters and this is the back half of it.** Upstream wraps at `contentWidth` FIRST
+/// (`:322`) and margins SECOND (`:340`); [`crate::markdown::render`] now does that wrap internally
+/// (its `width` argument IS `contentWidth` — every call site passes `width - outputPad * 2`), so
+/// every row handed here already fits and the indent lands on rows 1..N as well as on row 0. It
+/// used to be inserted into the single unwrapped logical line and reflowed afterwards by the outer
+/// `Paragraph::wrap` at FULL frame width, which is what put row 0 at column 1 and rows 1..N at
+/// column 0 (L2) with no right gutter (M10).
+///
+/// `rightMargin` (`:330`) and the pad-to-`width` (`:346-348`) are not materialised, for the reason
+/// [`text_lines`] gives: without a background they are an invisible trailing run of blanks in a
+/// ratatui cell grid, and the gutter they buy comes from the narrower wrap instead. A no-op at
+/// `pad == 0` (flush-left).
 fn pad_lines(lines: &mut [Line<'static>], pad: usize) {
     if pad == 0 {
         return;
@@ -2327,19 +2347,19 @@ pub(crate) fn entry_lines(
         Entry::Warning(text) => {
             // Pi `showWarning` (`interactive-mode.ts:3956-3960`): `Spacer(1)` then
             // `Text(theme.fg("warning", …), 1, 0)` — the `Error` shape in the warning colour.
-            let mut out = vec![Line::styled(text.clone(), theme.warning_style())];
-            pad_lines(&mut out, output_pad);
-            out.insert(0, Line::default());
+            let mut out = vec![Line::default()];
+            out.extend(text_lines(text, width, output_pad, theme.warning_style()));
             out
         }
         Entry::Error(text) => {
             // Pi: `Spacer(1)` then `Text(theme.fg("error", text), outputPad, 0)`
-            // (assistant-message.ts:178-188). One logical line — the scrollback flush wraps it at
-            // the content width via `wrapped_height`/`Paragraph::wrap`, exactly like a long prose
-            // paragraph.
-            let mut out = vec![Line::styled(text.clone(), theme.error_style())];
-            pad_lines(&mut out, output_pad);
-            out.insert(0, Line::default());
+            // (assistant-message.ts:180, :189, :193). A `Text` WRAPS at
+            // `contentWidth = width - paddingX * 2` (`text.ts:64`) and margins each produced row
+            // (`:70-76`) — it does not hand one long logical line to an outer reflow. cyrup did the
+            // latter, so a long error printed row 0 at column `outputPad` and every continuation row
+            // at column 0, the same L2 defect the markdown body had.
+            let mut out = vec![Line::default()];
+            out.extend(text_lines(text, width, output_pad, theme.error_style()));
             out
         }
         Entry::Block { title, markdown } => {
@@ -2355,7 +2375,9 @@ pub(crate) fn entry_lines(
             out.push(Line::styled(rule, theme.border_style()));
             out
         }
-        Entry::LoadedResources(lines) => crate::startup::startup_lines(lines, theme, output_pad),
+        Entry::LoadedResources(lines) => {
+            crate::startup::startup_lines(lines, theme, width.max(1), output_pad)
+        }
     }
 }
 
@@ -2648,6 +2670,89 @@ mod output_pad_tests {
         let joined: String = flush.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(!joined.contains("assistant:"), "live label: {joined:?}");
         assert!(!joined.contains('\u{258c}'), "live caret: {joined:?}");
+    }
+
+    /// A sentence long enough to wrap several times at any of the widths this module tests.
+    const LONG: &str = "The quick brown fox jumps over the lazy dog and then keeps running for \
+                        quite a long while indeed before it finally stops.";
+
+    /// **L2 + M10** — EVERY row of a multi-row message carries the `outputPad` margin, and no row
+    /// reaches the last column.
+    ///
+    /// `markdown.ts:316-326` wraps at `contentWidth = width - paddingX * 2` (`:284`) and only then
+    /// does `:334-340` emit `leftMargin + line + rightMargin` for **each** produced row. cyrup used
+    /// to insert the margin into the single unwrapped logical line and let the outer
+    /// `Paragraph::wrap` reflow it at full frame width, so row 0 started at column 1 and rows 1..N
+    /// at column 0 — a ragged left edge on nearly every turn — with nothing holding a right gutter.
+    #[test]
+    fn l2_every_wrapped_row_of_a_message_carries_the_margin_and_a_right_gutter() {
+        let theme = UiTheme::dark();
+        for width in [20usize, 40, 80] {
+            let rows = entry_lines(&Entry::Assistant(LONG.into()), &theme, width, 1, ImageOpts::default());
+            // Row 0 is `assistant-message.ts:100-102`'s `Spacer(1)`; the body follows.
+            let body = &rows[1..];
+            assert!(body.len() > 1, "width={width}: expected a wrapped body, got {body:?}");
+            for row in body {
+                let t = line_text(row);
+                assert!(t.starts_with(' '), "width={width}: row lost its leftMargin: {t:?}");
+                assert!(!t.starts_with("  "), "width={width}: over-indented row: {t:?}");
+                // `contentWidth = width - paddingX*2` plus one column of `leftMargin` — the last
+                // column stays empty, which is the `rightMargin` (`markdown.ts:330`/`:340`).
+                assert!(row.width() < width, "width={width}: no right gutter: {t:?} ({})", row.width());
+            }
+            // MIRROR: at `outputPad = 0` there is no margin, and the wrap uses the full width.
+            let flush = entry_lines(&Entry::Assistant(LONG.into()), &theme, width, 0, ImageOpts::default());
+            for row in &flush[1..] {
+                assert!(row.width() <= width, "pad=0 width={width}: {:?}", line_text(row));
+            }
+            assert!(!line_text(&flush[1]).starts_with(' '), "pad=0 must be flush-left");
+        }
+
+        // MIRROR: a short message still occupies exactly one body row, and an empty turn none.
+        let short = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 1, ImageOpts::default());
+        assert_eq!(short.len(), 2, "spacer + one row: {short:?}");
+        assert!(entry_lines(&Entry::Assistant("   ".into()), &theme, 80, 1, ImageOpts::default())
+            .is_empty());
+    }
+
+    /// The same for the LIVE streaming partial (`transcript.rs:1000`'s call site) — the row a user
+    /// watches for the whole turn.
+    #[test]
+    fn l2_live_streaming_partial_wraps_inside_its_own_padding() {
+        let theme = UiTheme::dark();
+        let mut view = TranscriptView::new();
+        view.push_assistant_delta(LONG);
+        let rows = view.lines(40, &theme);
+        assert!(rows.len() > 2, "expected a wrapped live body: {rows:?}");
+        for row in &rows[1..] {
+            let t = line_text(row);
+            assert!(t.starts_with(' '), "live row lost its leftMargin: {t:?}");
+            assert!(row.width() <= 39, "live row has no right gutter: {t:?}");
+        }
+    }
+
+    /// **Edit 6** — a long `Entry::Error` / `Entry::Warning` is a `Text`, and a `Text` WRAPS at
+    /// `contentWidth = width - paddingX * 2` (`text.ts:64`) before prefixing `leftMargin` to each
+    /// produced row (`:70-76`).
+    ///
+    /// `assistant-message.ts:180`/`:189`/`:193` construct them as `new Text(theme.fg("error", …),
+    /// this.outputPad, 0)`; `interactive-mode.ts:3956-3960` does the same in the warning colour.
+    /// cyrup pushed ONE unwrapped logical line and `pad_lines`'d it, i.e. the L2 defect again.
+    #[test]
+    fn error_and_warning_rows_wrap_inside_the_output_pad() {
+        let theme = UiTheme::dark();
+        for entry in [Entry::Error(LONG.into()), Entry::Warning(LONG.into())] {
+            let rows = entry_lines(&entry, &theme, 40, 1, ImageOpts::default());
+            assert_eq!(line_text(&rows[0]), "", "leading Spacer(1)");
+            assert!(rows.len() > 2, "expected a wrapped body: {rows:?}");
+            for row in &rows[1..] {
+                let t = line_text(row);
+                assert!(t.starts_with(' '), "row lost its leftMargin: {t:?}");
+                assert!(row.width() <= 39, "row has no right gutter: {t:?}");
+            }
+            // The colour rides on the span, inside the margins (`theme.fg("error", text)`).
+            assert!(rows[1].spans.iter().any(|s| s.style.fg.is_some()), "colour lost: {rows:?}");
+        }
     }
 }
 

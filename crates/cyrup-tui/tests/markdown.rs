@@ -525,13 +525,15 @@ fn m11_narrow_tables_never_panic_on_column_arithmetic() {
     // which clamps at zero and never truncates. Truncating here would be a divergence, so the band
     // is excluded from the fit assertion and pinned exactly instead, below.
     //
-    // The band is exactly the widths at which some column is fitted to 1 cell: 0 and 1 (the raw
-    // fallback, wrapped at `Math.max(1, …)`) and 13-15 (the narrowest panes that still draw a
-    // 3-column grid). Everywhere else the fit is strict.
+    // The band is now just the degenerate panes 0 and 1, where `contentWidth` itself floors at
+    // `Math.max(1, …)` and a 2-cell cluster cannot fit in the one column there is. It used to also
+    // cover 13-15 — the narrowest panes that still draw a 3-column grid — and those are now strict,
+    // because the top-level re-wrap post-pass (`markdown.ts:316-326`) catches the overflowing grid
+    // rows before they leave `render`. See the pinned width-13 trace below.
     let md = "| 日本語 | \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} | e\u{301}f |\n\
               |---|---|---|\n\
               | \u{65e5} | \u{1f600}\u{1f600} | a\u{308}b\u{308} |";
-    const CLUSTER_OVERFLOW_BAND: [usize; 5] = [0, 1, 13, 14, 15];
+    const CLUSTER_OVERFLOW_BAND: [usize; 2] = [0, 1];
     const NUM_COLS: usize = 3;
     for w in 0..=40usize {
         let lines = render_markdown(md, w, &theme);
@@ -560,25 +562,50 @@ fn m11_narrow_tables_never_panic_on_column_arithmetic() {
     // `[1,1,1]` (`markdown.ts:887-890`), `extraWidth` is 0 (`:925`), and each header cell then goes
     // through `breakLongWord` at width 1 — "日本語" → `["", "日", "本", "語"]` because the FIRST
     // cluster already exceeds the column and flushes an empty `currentLine` (`utils.ts:1000-1007`).
-    // That leading empty row, the one-cluster-per-row column and the resulting overflow are all
-    // upstream's, reproduced glyph for glyph.
+    // That leading empty row and the one-cluster-per-row column are upstream's, glyph for glyph.
+    //
+    // The rows `renderTable` builds from them, however, are NOT what `render` returns. A grid row
+    // whose 1-cell columns each hold a 2-cell cluster measures `13 + 2` (the pad is
+    // `Math.max(0, …)`, `markdown.ts:991`, so it clamps at zero and never claws the overflow back),
+    // and `render` runs **every** produced line through `wrapTextWithAnsi(line, contentWidth)` once
+    // more at `:322` before the margins go on at `:328-340`. That post-pass splits the over-wide
+    // rows at their last fitting token boundary and `trimEnd`s each piece (`utils.ts:934`), which is
+    // where the bare trailing `│` rows come from:
+    //
+    // ```text
+    // "│ 日 │ 👨‍👩‍👧 │ f │"   15 cells → tokens fill to 13 at "f", the final "│" starts a new row
+    // "│ 本 │   │   │"       14 cells → trailing "   " trimmed off the first piece → 10 cells
+    // ```
+    //
+    // An earlier revision of this expectation was traced through `renderTable` alone and stopped
+    // there, so it pinned the pre-post-pass rows and read as though upstream shipped a table wider
+    // than its own pane. It does not; `:316-326` is the second of upstream's two wraps.
     let pinned = rows(&render_markdown(md, 13, &theme));
     assert_eq!(
         pinned,
         vec![
             "┌───┬───┬───┐".to_string(),
             "│   │   │ e\u{301} │".to_string(),
-            "│ 日 │ \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} │ f │".to_string(),
-            "│ 本 │   │   │".to_string(),
-            "│ 語 │   │   │".to_string(),
+            "│ 日 │ \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} │ f".to_string(),
+            "│".to_string(),
+            "│ 本 │   │".to_string(),
+            "│".to_string(),
+            "│ 語 │   │".to_string(),
+            "│".to_string(),
             "├───┼───┼───┤".to_string(),
             "│   │   │ a\u{308} │".to_string(),
-            "│ 日 │ \u{1f600} │ b\u{308} │".to_string(),
-            "│   │ \u{1f600} │   │".to_string(),
+            "│ 日 │ \u{1f600} │ b\u{308}".to_string(),
+            "│".to_string(),
+            "│   │ \u{1f600} │".to_string(),
+            "│".to_string(),
             "└───┴───┴───┘".to_string(),
         ],
-        "width-13 grid must reproduce upstream's cluster-per-row wrap exactly"
+        "width-13 grid must reproduce upstream's cluster-per-row wrap AND its `:322` re-wrap exactly"
     );
+    // …and every one of those rows now fits the pane, which is the point of the post-pass.
+    for l in &render_markdown(md, 13, &theme) {
+        assert!(l.width() <= 13, "row {:?} is {} cells at a 13-cell pane", line_text(l), l.width());
+    }
 
     // MIRROR — a grapheme cluster is never SPLIT, at any width: the ZWJ family survives whole and
     // each combining mark stays welded to its base (`utils.ts:977-979` segments before measuring).
@@ -868,4 +895,478 @@ fn m14_a_link_whose_text_is_the_full_mailto_href_gets_no_suffix() {
         differing_text.contains("(mailto:a@b.com)"),
         "differing text must still print the url: {differing_text}"
     );
+}
+
+// --- SYS-2: the wrap moved inside `markdown::render` -------------------------------------------
+//
+// Upstream wraps FIRST and prefixes SECOND, at all three of its wrapping sites:
+//   `markdown.ts:322`     `wrapTextWithAnsi(line, contentWidth)`   then `:340` `leftMargin + line`
+//   `markdown.ts:594-597` `wrapTextWithAnsi(styledLine, quoteContentWidth)` then `quoteBorder("│ ") + wrappedLine`
+//   `markdown.ts:788-791` `wrapTextWithAnsi(line, itemWidth)`      then `linePrefix + wrappedLine`
+// cyrup's `render` never wrapped at all; the outer `Paragraph::wrap` reflowed the already-indented
+// logical line at full frame width, which is L2/M5/M10.
+
+/// A sentence long enough to wrap several times at every width these tests use.
+const LONG: &str =
+    "The quick brown fox jumps over the lazy dog and then keeps running for quite a long while.";
+
+/// **L2/M10** — a paragraph wraps at the width `render` was handed and nothing exceeds it.
+#[test]
+fn sys2_a_paragraph_wraps_at_the_content_width() {
+    let theme = UiTheme::dark();
+    for width in [5usize, 20, 40, 80] {
+        let lines = render_markdown(LONG, width, &theme);
+        assert!(lines.len() > 1, "width={width}: nothing wrapped: {:?}", rows(&lines));
+        for l in &lines {
+            assert!(l.width() <= width, "width={width}: row overflows: {:?}", line_text(l));
+        }
+    }
+    // MIRROR: a paragraph that already fits is ONE row, returned verbatim — `wrapSingleLine`'s
+    // `if (visibleLength <= width) return [line]` (`utils.ts:862-865`).
+    let short = render_markdown("hello there", 80, &theme);
+    assert_eq!(rows(&short), vec!["hello there".to_string()]);
+}
+
+/// **M5** — the list-item hanging indent, the half batch 6 left: `itemWidth = Math.max(1, width -
+/// visibleWidth(firstPrefix))` (`markdown.ts:776`) and the wrap loop at `:788-791` that picks
+/// `renderedAnyLine ? continuationPrefix : firstPrefix` per produced row.
+///
+/// Before this, a long bullet emitted ONE logical row and the outer `Paragraph::wrap` broke it with
+/// no prefix at all, so row 2 started under the `- ` instead of under the item's text.
+#[test]
+fn m5_a_wrapped_list_item_hangs_under_its_own_text() {
+    let theme = UiTheme::dark();
+    let lines = render_markdown(&format!("- {LONG}"), 20, &theme);
+    let text = rows(&lines);
+    assert!(text.len() > 1, "expected a wrapped item: {text:?}");
+    assert!(text[0].starts_with("- "), "row 0 is firstPrefix: {:?}", text[0]);
+    for row in &text[1..] {
+        // `continuationPrefix = indent + " ".repeat(visibleWidth(marker))` — `visibleWidth("- ")`
+        // is 2, and the pad is SPACES, not a re-drawn bullet (`markdown.ts:775`).
+        assert!(row.starts_with("  "), "continuation lost the hanging indent: {row:?}");
+        assert!(!row.starts_with("- "), "bullet re-drawn on a continuation row: {row:?}");
+    }
+    for l in &lines {
+        assert!(l.width() <= 20, "row overflows itemWidth + prefix: {:?}", line_text(l));
+    }
+
+    // An ORDERED marker is wider, so `itemWidth` is narrower and the pad is 3 (`10. ` → 4).
+    let ordered = rows(&render_markdown(&format!("1. {LONG}"), 20, &theme));
+    assert!(ordered[0].starts_with("1. "), "{ordered:?}");
+    assert!(ordered[1].starts_with("   ") && !ordered[1].starts_with("    "), "{ordered:?}");
+
+    // A TASK marker is `bullet + taskMarker` — `- [ ] `, visible width 6 (`markdown.ts:772-773`).
+    let task = rows(&render_markdown(&format!("- [ ] {LONG}"), 24, &theme));
+    assert!(task[0].starts_with("- [ ] "), "{task:?}");
+    assert!(task[1].starts_with("      ") && !task[1].starts_with("       "), "{task:?}");
+
+    // MIRROR: a SHORT item is untouched — one row, still the bullet, no phantom continuation.
+    assert_eq!(rows(&render_markdown("- ok", 20, &theme)), vec!["- ok".to_string()]);
+}
+
+/// **M5, compound** — nesting adds `"    ".repeat(depth)` (`markdown.ts:758`) ahead of the marker
+/// pad, and a blockquote adds a **visible** `│ ` that is re-emitted on every wrapped row
+/// (`markdown.ts:596`) where the list pad is spaces (`:775`). Getting those two the same way round
+/// is the whole point.
+#[test]
+fn m5_nested_and_quoted_list_continuations_use_the_right_prefix() {
+    let theme = UiTheme::dark();
+
+    // depth 1: indent "    " + marker pad "  " = 6 columns of continuation.
+    let nested = rows(&render_markdown(&format!("- outer\n    - {LONG}"), 24, &theme));
+    assert_eq!(nested[0], "- outer");
+    assert!(nested[1].starts_with("    - "), "nested firstPrefix: {nested:?}");
+    for row in &nested[2..] {
+        assert!(row.starts_with("      "), "nested continuation: {row:?}");
+        assert!(!row.contains('-'), "bullet re-drawn: {row:?}");
+    }
+
+    // Inside a blockquote the continuation is the BORDER, re-drawn, plus the marker pad.
+    let quoted = render_markdown(&format!("> - {LONG}"), 24, &theme);
+    let qtext = rows(&quoted);
+    assert!(qtext[0].starts_with("│ - "), "quoted firstPrefix: {qtext:?}");
+    for row in &qtext[1..] {
+        assert!(row.starts_with("│   "), "quoted continuation: {row:?}");
+    }
+    for l in &quoted {
+        assert!(l.width() <= 24, "quoted row overflows: {:?}", line_text(l));
+    }
+}
+
+/// **The blockquote wrap cyrup never had** — `quoteContentWidth = Math.max(1, width - 2)`
+/// (`markdown.ts:568`), children rendered into it (`:583`), then every wrapped row gets its own
+/// `quoteBorder("│ ")` (`:594-597`).
+#[test]
+fn sys2_a_long_blockquote_redraws_its_border_on_every_row() {
+    let theme = UiTheme::dark();
+    let lines = render_markdown(&format!("> {LONG}"), 24, &theme);
+    let text = rows(&lines);
+    assert!(text.len() > 1, "expected a wrapped quote: {text:?}");
+    for row in &text {
+        assert!(row.starts_with("│ "), "quote row lost its border: {row:?}");
+    }
+    for l in &lines {
+        assert!(l.width() <= 24, "quote row overflows: {:?}", line_text(l));
+    }
+    // The border is `mdQuoteBorder`, a real glyph with its own colour — not the list pad's spaces.
+    assert!(lines[1].spans[0].style.fg.is_some(), "continuation border unstyled: {:?}", lines[1]);
+}
+
+/// **M9 mirror — must NOT change.** `render`'s `width` argument IS `contentWidth` in cyrup (every
+/// call site already passes `width - outputPad * 2`), so `hr("─".repeat(Math.min(width, 80)))`
+/// (`markdown.ts:606`) draws 78 at a pane of 80 with `outputPad = 1`. Subtracting the padding a
+/// second time inside `render` would silently narrow every message by two columns.
+#[test]
+fn m9_the_rule_still_spans_the_full_content_width() {
+    let theme = UiTheme::dark();
+    let lines = render_markdown("---", 78, &theme);
+    assert_eq!(rows(&lines), vec!["─".repeat(78)]);
+    // `Math.min(width, 80)` still clamps.
+    assert_eq!(rows(&render_markdown("---", 200, &theme)), vec!["─".repeat(80)]);
+    // Inside a container the rule is sized to `itemWidth`/`quoteContentWidth` and PREFIXED —
+    // `renderToken(itemToken, itemWidth, …)` (`:786`) then `linePrefix + wrappedLine` (`:790`).
+    let in_item = rows(&render_markdown("- x\n\n  ---\n", 20, &theme));
+    let rule: Vec<&String> = in_item.iter().filter(|r| r.contains('─')).collect();
+    // ONE row: `min(itemWidth, 80)` is 18, which fits behind the 2-column continuation prefix. Sized
+    // to the component width instead it would be 20, would itself have to wrap, and would spill a
+    // second 2-dash row — the shape cyrup produced before `content_width()`.
+    assert_eq!(rule.len(), 1, "rule not sized to itemWidth: {in_item:?}");
+    assert_eq!(rule[0], &format!("  {}", "─".repeat(18)), "rule not sized/prefixed to the item");
+}
+
+/// **Edit 4, table half** — `renderTable(token, width, …)` (`markdown.ts:551`) receives the width
+/// `renderToken` was called with — `quoteContentWidth` inside a blockquote (`:583`) — so both the
+/// too-narrow guard (`:853-861`) and the fitted column widths follow the CONTAINER, not the
+/// component.
+#[test]
+fn m9_a_table_inside_a_blockquote_is_sized_to_the_quote_not_the_pane() {
+    let theme = UiTheme::dark();
+    let table = "| a | b |\n|---|---|\n| 1 | 2 |";
+    let quoted = format!("> {}\n", table.replace('\n', "\n> "));
+
+    // Border overhead for 2 columns is `3n + 1` = 7, so the grid needs >= 9 columns
+    // (`availableForCells < numCols` → fallback). At a pane of 10 the top level clears it…
+    let top = rows(&render_markdown(table, 10, &theme));
+    assert!(top.iter().any(|r| r.contains('┌')), "top level should draw a grid: {top:?}");
+
+    // …but `quoteContentWidth = width - 2` is 8, which does NOT, so upstream degrades to the raw
+    // Markdown and `:596` prefixes it. Sized to the pane instead, cyrup drew a 10-column grid inside
+    // an 8-column container.
+    let nested = rows(&render_markdown(&quoted, 10, &theme));
+    assert!(!nested.iter().any(|r| r.contains('┌')), "grid drawn too wide: {nested:?}");
+    assert!(nested.iter().any(|r| r.contains("|---")), "no raw fallback: {nested:?}");
+
+    // And when the grid DOES fit, its columns are fitted to `quoteContentWidth`, not to the pane.
+    let wide = render_markdown(&quoted, 30, &theme);
+    let grid: Vec<&Line<'_>> = wide.iter().filter(|l| line_text(l).contains('┌')).collect();
+    assert!(!grid.is_empty(), "no grid: {:?}", rows(&wide));
+    for l in grid {
+        assert!(
+            l.width() <= 28,
+            "grid wider than quoteContentWidth: {:?} ({})",
+            line_text(l),
+            l.width()
+        );
+    }
+}
+
+/// **Edit 5** — a fenced block inside a list item collects the item prefix, and an over-wide code
+/// row breaks instead of running off the pane. Upstream a `code` token returns a bare `string[]`
+/// (`markdown.ts:520-540`) that `:790` prefixes and `:322` wraps.
+///
+/// The `  ` code indent (`:521`) is deliberately part of the BODY, so a wrapped code row loses it —
+/// `wrapSingleLine` never starts a produced row with whitespace (`utils.ts:912-915`).
+#[test]
+fn sys2_a_fenced_block_inside_a_list_item_keeps_the_prefix_and_wraps() {
+    let theme = UiTheme::dark();
+    let src = "- item\n\n  ```\n  let a = 1; let b = 2; let c = 3; let d = 4;\n  ```\n";
+    let lines = render_markdown(src, 30, &theme);
+    let text = rows(&lines);
+    assert_eq!(text[0], "- item");
+    let fence = text.iter().find(|r| r.contains("```")).expect("no fence row");
+    assert_eq!(fence, "  ```", "fence lost the item prefix: {text:?}");
+    let code: Vec<&String> = text.iter().filter(|r| r.contains("let ")).collect();
+    assert!(code.len() > 1, "the long code line did not wrap: {text:?}");
+    assert_eq!(code[0], "    let a = 1; let b = 2; let", "first code row: {text:?}");
+    assert_eq!(code[1], "  c = 3; let d = 4;", "continuation drops the code indent: {text:?}");
+    for l in &lines {
+        assert!(l.width() <= 30, "code row overflows: {:?}", line_text(l));
+    }
+
+    // MIRROR: at top level the block is unprefixed and the `  ` indent is untouched when it fits.
+    let top = rows(&render_markdown("```\nlet a = 1;\n```\n", 80, &theme));
+    assert_eq!(top, vec!["```".to_string(), "  let a = 1;".to_string(), "```".to_string()]);
+}
+
+/// The full width ladder against pathological content — every row must fit, at every width, and no
+/// grapheme cluster may be torn apart.
+#[test]
+fn sys2_width_ladder_holds_for_cjk_zwj_and_combining_marks() {
+    let theme = UiTheme::dark();
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+    let cases = [
+        "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}".repeat(6),
+        format!("{family} ").repeat(8),
+        "e\u{0301}a\u{0308}o\u{0302}".repeat(20),
+        "x".repeat(500),
+    ];
+    for case in &cases {
+        for width in [1usize, 2, 5, 20, 40, 200] {
+            for src in [case.clone(), format!("- {case}"), format!("> {case}")] {
+                let lines = render_markdown(&src, width, &theme);
+                let joined: String = rows(&lines).join("");
+                // A ZWJ family is never split: no row may end or start mid-sequence.
+                assert!(
+                    !joined.contains("\u{200d}\u{1f469}") || joined.contains(family),
+                    "ZWJ family torn at width={width}: {:?}",
+                    rows(&lines)
+                );
+                // A combining mark never leads a row (it would attach to nothing).
+                for l in &lines {
+                    let t = line_text(l);
+                    assert!(
+                        !t.starts_with('\u{0301}') && !t.starts_with('\u{0308}'),
+                        "combining mark orphaned at width={width}: {t:?}"
+                    );
+                }
+                // Rows never exceed the pane once a single cluster fits in it. A cluster WIDER than
+                // the column overflows by design (`utils.ts:1000` is unguarded upstream), which is
+                // only reachable at width 1.
+                if width > 2 {
+                    for l in &lines {
+                        assert!(
+                            l.width() <= width,
+                            "width={width} overflow: {:?}",
+                            line_text(l)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// **Items 1 + 2 — `emit_table` bypassed the prefix machinery.**
+///
+/// Upstream `renderTable` returns a bare `string[]` (`markdown.ts:1005`) and its CALLER decorates
+/// every entry: `this.theme.quoteBorder("│ ") + wrappedLine` inside a blockquote
+/// (`markdown.ts:592-598`) and `linePrefix + wrappedLine` inside a list item (`:786-793`), where
+/// `linePrefix` is `renderedAnyLine ? continuationPrefix : firstPrefix` (`:789`).
+///
+/// cyrup pushed the `┌┬┐`/`└┴┘` frame and every `│ … │` grid row straight onto `self.out`, which
+/// cost two separate things: the blockquote border vanished for the whole grid, and — because only
+/// `open_line()` consumes a queued `pending_marker` — a table that was the first block of a list
+/// item swallowed the bullet outright, the next `Start(Item)` overwriting it before it was ever
+/// emitted. `Event::Rule` and `emit_code_block` had the identical bug and were already routed
+/// through `emit_prefixed`; this is the third caller.
+#[test]
+fn emit_table_routes_the_grid_through_the_container_prefix() {
+    let theme = UiTheme::dark();
+    let table = "| a | b |\n|---|---|\n| 1 | 2 |";
+
+    // ── Item 2: inside a blockquote, EVERY row keeps `│ `, frame rows included.
+    let quoted = format!("> {}\n", table.replace('\n', "\n> "));
+    let lines = render_markdown(&quoted, 30, &theme);
+    let r = rows(&lines);
+    assert!(r.iter().any(|l| l.contains('┌')), "no grid drawn at width 30:\n{r:?}");
+    for l in r.iter().filter(|l| !l.trim().is_empty()) {
+        assert!(l.starts_with("│ "), "grid row escaped the blockquote border:\n{r:?}");
+    }
+    // …and it is the real `mdQuoteBorder` prefix, not the table's own (unstyled) `│` bar.
+    let border_fg = theme.md_quote_border_style().fg;
+    for l in lines.iter().filter(|l| !line_text(l).trim().is_empty()) {
+        assert_eq!(l.spans[0].content.as_ref(), "│ ", "row {:?}", line_text(l));
+        assert_eq!(l.spans[0].style.fg, border_fg, "prefix is not mdQuoteBorder: {:?}", line_text(l));
+    }
+    // The grid is still sized to `quoteContentWidth` and nothing overflows the pane.
+    assert_all_rows_fit(&lines, 30, "quoted table");
+
+    // ── Item 1: inside a list item, the bullet lands on the FIRST produced row (the top border)
+    // and every later row gets the 2-cell continuation pad (`markdown.ts:774-775`, `:789`).
+    let in_list = format!("- {}\n", table.replace('\n', "\n  "));
+    let lr = rows(&render_markdown(&in_list, 30, &theme));
+    let body: Vec<&String> = lr.iter().filter(|l| !l.trim().is_empty()).collect();
+    assert!(body.len() > 4, "expected a full grid inside the item:\n{lr:?}");
+    assert!(
+        body[0].starts_with("- ┌"),
+        "the item's bullet was swallowed by the table:\n{lr:?}"
+    );
+    for l in body.iter().skip(1) {
+        assert!(l.starts_with("  "), "grid row fell back to column 0:\n{lr:?}");
+        assert!(!l.starts_with("- "), "bullet re-emitted on a continuation row:\n{lr:?}");
+    }
+
+    // MIRROR — the bullet is emitted exactly ONCE and is not lost for the item that follows.
+    let two = rows(&render_markdown(&format!("{in_list}- after\n"), 30, &theme));
+    assert_eq!(
+        two.iter().filter(|l| l.starts_with("- ")).count(),
+        2,
+        "one bullet per item, no more and no fewer:\n{two:?}"
+    );
+    assert!(two.iter().any(|l| l == "- after"), "the NEXT item lost its bullet:\n{two:?}");
+
+    // MIRROR — at top level the grid is unprefixed, exactly as before.
+    let top = rows(&render_markdown(table, 30, &theme));
+    assert!(top.iter().any(|l| l.starts_with('┌')), "top-level grid gained a prefix:\n{top:?}");
+}
+
+/// **Item 3 — `blank()` punched a hole in the blockquote border.**
+///
+/// A separator inside a blockquote is one of `renderedQuoteLines` like any other, and
+/// `markdown.ts:592-598` prepends `quoteBorder("│ ")` to every entry it walks, so `> a\n>\n> b`
+/// draws an unbroken border down all three rows. `blank()` pushed a bare `Line::default()`
+/// regardless of container.
+///
+/// The counterpart is `:587-590`, `while (renderedQuoteLines.at(-1) === "") pop()` — the trailing
+/// separator never reaches `:592`, so the block does not END on a dangling `│ `; the one blank
+/// after a blockquote is `:599-601`'s BARE `""`.
+#[test]
+fn a_blank_inside_a_blockquote_keeps_the_border() {
+    let theme = UiTheme::dark();
+
+    let r = rows(&render_markdown("> a\n>\n> b\n", 20, &theme));
+    assert_eq!(r, vec!["│ a".to_string(), "│ ".to_string(), "│ b".to_string()], "{r:?}");
+    // The separator's border is the real `mdQuoteBorder` span, not incidental text.
+    let lines = render_markdown("> a\n>\n> b\n", 20, &theme);
+    assert_eq!(lines[1].spans.len(), 1, "{r:?}");
+    assert_eq!(lines[1].spans[0].content.as_ref(), "│ ");
+    assert_eq!(lines[1].spans[0].style.fg, theme.md_quote_border_style().fg);
+
+    // A block-level child that emits its own trailing blank takes the same path.
+    let code = rows(&render_markdown("> a\n>\n> ```\n> x\n> ```\n", 20, &theme));
+    assert!(code.iter().any(|l| l == "│ "), "code-block separator lost the border:\n{code:?}");
+    assert!(!code.iter().any(|l| l.is_empty()), "bare blank inside the quote:\n{code:?}");
+
+    // A loose list inside the quote: `renderList`'s `:800` gap is bare, but `:596` still borders it.
+    let list = rows(&render_markdown("> - a\n>\n> - b\n", 20, &theme));
+    assert_eq!(list, vec!["│ - a".to_string(), "│ ".to_string(), "│ - b".to_string()], "{list:?}");
+
+    // MIRROR — `:587-590`: the quote does not end on `│ `, and the blank AFTER it is bare.
+    let tail = rows(&render_markdown("> a\n\ntail\n", 20, &theme));
+    assert_eq!(tail, vec!["│ a".to_string(), String::new(), "tail".to_string()], "{tail:?}");
+
+    // MIRROR — outside a blockquote a separator stays bare (`:800` / `:619-621`), no stray glyph.
+    let plain = rows(&render_markdown("a\n\nb\n", 20, &theme));
+    assert_eq!(plain, vec!["a".to_string(), String::new(), "b".to_string()], "{plain:?}");
+}
+
+/// **Item 6 — a marker-only list item rendered NOTHING.**
+///
+/// `if (!renderedAnyLine) { lines.push(firstPrefix); }` (`markdown.ts:796-798`): an item whose
+/// children produced no row still emits its `firstPrefix` — `indent + listBullet(marker)` (`:774`)
+/// — alone, on a row of its own. The trailing space of `"- "` survives because the top-level
+/// re-wrap early-returns a fitting line verbatim (`utils.ts:862-865`), *before* the `trimEnd` at
+/// `:934`.
+///
+/// `flush_line`'s empty-`cur` guard fires before `pending_marker` is ever materialised, so the row
+/// was dropped AND the marker leaked into the next `Start(Item)`, which overwrote it.
+#[test]
+fn a_marker_only_list_item_still_emits_its_bullet() {
+    let theme = UiTheme::dark();
+
+    let r = rows(&render_markdown("- \n- x\n", 20, &theme));
+    assert_eq!(r, vec!["- ".to_string(), "- x".to_string()], "{r:?}");
+    // The bullet carries `mdListBullet` (`markdown.ts:774`), not prose styling.
+    let lines = render_markdown("- \n- x\n", 20, &theme);
+    assert_eq!(lines[0].spans.len(), 1, "{r:?}");
+    assert_eq!(lines[0].spans[0].style.fg, theme.md_list_bullet_style().fg);
+
+    // Ordered lists renumber across the empty item, exactly as `startNumber + i` does (`:762`).
+    let ord = rows(&render_markdown("1. \n2. x\n", 20, &theme));
+    assert_eq!(ord, vec!["1. ".to_string(), "2. x".to_string()], "{ord:?}");
+
+    // `marker = bullet + taskMarker` (`:770-773`) — the whole thing is the `firstPrefix`.
+    let task = rows(&render_markdown("- [ ]\n- x\n", 20, &theme));
+    assert_eq!(task, vec!["- [ ] ".to_string(), "- x".to_string()], "{task:?}");
+
+    // MIRROR — an item whose ONLY child is a nested list legitimately drops its own bullet:
+    // `:779-783` pushes the sublist's rows directly and sets `renderedAnyLine = true`, so `:796`
+    // never fires. Emitting a bullet here would be a divergence in the other direction.
+    let nested = rows(&render_markdown("- \n  - x\n", 20, &theme));
+    assert_eq!(nested, vec!["    - x".to_string()], "{nested:?}");
+
+    // MIRROR — an item WITH content is untouched (one row, one bullet).
+    let normal = rows(&render_markdown("- x\n- y\n", 20, &theme));
+    assert_eq!(normal, vec!["- x".to_string(), "- y".to_string()], "{normal:?}");
+}
+
+/// **Item 8 — the narrow-table fallback leaked `> ` source markers.**
+///
+/// marked's `blockquote` tokenizer strips the `>` markers before re-lexing the quote body, so a
+/// nested table reaches `renderTable` with a `token.raw` that carries none and `markdown.ts:856`'s
+/// `wrapTextWithAnsi(token.raw, availableWidth)` prints clean Markdown. pulldown-cmark's offset
+/// range is a slice of the untouched source, so cyrup's raw still had every `> ` on it — and this
+/// batch's narrowing of the guard from `self.width` to `content_width()` newly routed blockquoted
+/// tables down that path at moderate widths, making the leak reachable in ordinary panes.
+#[test]
+fn the_narrow_table_fallback_strips_blockquote_source_markers() {
+    let theme = UiTheme::dark();
+    let table = "| Name | Role |\n|------|------|\n| Ada | math |";
+    let quoted = format!("> {}\n", table.replace('\n', "\n> "));
+
+    // A 2-column grid needs `3n + 1 + n` = 9 cells of `quoteContentWidth = width - 2`
+    // (`markdown.ts:850-853`), so panes 8..=10 take the fallback and 11 upward draw the grid.
+    for width in [8usize, 9, 10] {
+        let r = rows(&render_markdown(&quoted, width, &theme));
+        assert!(!r.iter().any(|l| l.contains('┌')), "width {width} drew a grid:\n{r:?}");
+        for l in &r {
+            // The ONLY `│` allowed is the quote border cyrup draws; no `>` from the source.
+            let body = l.strip_prefix("│ ").unwrap_or(l);
+            assert!(
+                !body.contains('>'),
+                "width {width}: fallback leaked a `>` source marker:\n{r:?}"
+            );
+        }
+        assert!(r.iter().any(|l| l.contains("Name")), "width {width}: no fallback body:\n{r:?}");
+    }
+
+    // Doubly nested: both levels of marker come off, and both borders stay on.
+    let deep = rows(&render_markdown("> > | a | b |\n> > |---|---|\n> > | 1 | 2 |\n", 10, &theme));
+    for l in deep.iter().filter(|l| !l.trim().is_empty()) {
+        assert!(l.starts_with("│ │ "), "lost a border level:\n{deep:?}");
+        assert!(!l.contains('>'), "leaked a `>` source marker:\n{deep:?}");
+    }
+
+    // MIRROR — at top level there is no marker to strip and a leading `>` in CELL TEXT survives.
+    let top = rows(&render_markdown(table, 8, &theme));
+    assert!(top.iter().any(|l| l.contains("|---")), "raw fallback missing:\n{top:?}");
+    let gt = rows(&render_markdown("| a | b |\n|---|---|\n| > x | 2 |", 8, &theme));
+    assert!(gt.iter().any(|l| l.contains('>')), "stripped a `>` that was content:\n{gt:?}");
+}
+
+/// **Item 7 — upstream's top-level re-wrap post-pass (`markdown.ts:316-326`).**
+///
+/// Upstream wraps TWICE: `renderList` at `itemWidth` (`:788`) and the blockquote arm at
+/// `quoteContentWidth` (`:594`) wrap a child and prefix it, then `render()` runs **every** produced
+/// line through `wrapTextWithAnsi(line, contentWidth)` once more before the margins go on at
+/// `:328-340`. cyrup only had the inner wrap, so a row whose accumulated prefix was as wide as the
+/// pane — `avail` floors at `Math.max(1, width - prefix_w)` (`:776`) — came out longer than `width`.
+#[test]
+fn the_top_level_rewrap_bounds_every_row_when_the_prefix_eats_the_pane() {
+    let theme = UiTheme::dark();
+    // Three quote levels are 6 cells of border before a single character of body.
+    for width in 1..=8usize {
+        let lines = render_markdown("> > > alpha beta\n", width, &theme);
+        assert!(!lines.is_empty(), "width {width} produced nothing");
+        assert_all_rows_fit(&lines, width, "triply quoted paragraph");
+    }
+    // Deep list nesting does the same through `indent` + marker rather than borders.
+    let deep = "- a\n  - b\n    - c\n      - d\n        - e\n          - f\n";
+    for width in 1..=12usize {
+        assert_all_rows_fit(&render_markdown(deep, width, &theme), width, "deep nested list");
+    }
+    // …and a quoted deep list, where both prefixes stack.
+    for width in 1..=14usize {
+        let src: String = deep.lines().map(|l| format!("> {l}\n")).collect();
+        assert_all_rows_fit(&render_markdown(&src, width, &theme), width, "quoted deep list");
+    }
+
+    // MIRROR — the post-pass is a NO-OP for rows that already fit: ordinary prose, a fitting grid
+    // and a marker-only bullet all come back byte-identical, trailing space included.
+    let prose = rows(&render_markdown("alpha beta gamma\n\n- x\n", 40, &theme));
+    assert_eq!(prose, vec!["alpha beta gamma".to_string(), String::new(), "- x".to_string()]);
+    let marker_only = rows(&render_markdown("- \n", 40, &theme));
+    assert_eq!(marker_only, vec!["- ".to_string()], "post-pass trimmed a fitting row");
+    let grid = rows(&render_markdown("| a | b |\n|---|---|\n| 1 | 2 |", 40, &theme));
+    assert_eq!(grid[0], "┌───┬───┐", "{grid:?}");
 }

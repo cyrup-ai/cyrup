@@ -337,23 +337,38 @@ fn format_diagnostics(diagnostics: &[StartupDiagnostic]) -> Vec<StartupLine> {
 }
 
 /// Project the panel onto styled ratatui rows, honouring `outputPad` like every other entry.
+///
+/// **Each row is a `Text`, and a `Text` WRAPS.** Every child upstream adds to
+/// `loadedResourcesContainer` is a `new Text(…, 0, 0)` (`interactive-mode.ts:1766`, `:1775`,
+/// `:1798`, `:1807`) or an `ExpandableText(…, 0, 0)` (`:1626-1632`, which `extends Text`), and
+/// `Text.render` wraps its string at `contentWidth = max(1, width - paddingX * 2)` (`text.ts:64`)
+/// BEFORE prefixing `leftMargin` to each produced row (`:70-76`).
+///
+/// This took no `width` at all: it inserted the margin into the LOGICAL row and handed the result to
+/// the outer `Paragraph::wrap`, which reflowed it at the FULL frame width — the exact shape of the
+/// L2/M10 defect the rest of this batch removed. A single extension-error diagnostic carrying an
+/// absolute path drew 77 and 73 columns inside a 40-column frame, with every continuation row flush
+/// at column 0. Building each row through [`crate::transcript::text_lines_of`] wraps first and
+/// margins second, like every other block.
+///
+/// A structurally empty [`StartupLine`] stays a bare [`Line::default`] rather than a lone margin
+/// space: it is the panel's `Spacer(1)` (`interactive-mode.ts:1637`), not a `Text` with no content.
 pub(crate) fn startup_lines(
     lines: &[StartupLine],
     theme: &UiTheme,
+    width: usize,
     output_pad: usize,
 ) -> Vec<Line<'static>> {
-    let pad = " ".repeat(output_pad);
-    lines
-        .iter()
-        .map(|line| {
-            if line.spans.is_empty() {
-                return Line::default();
-            }
-            let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
-            if output_pad > 0 {
-                spans.push(Span::raw(pad.clone()));
-            }
-            spans.extend(line.spans.iter().map(|s| {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.spans.is_empty() {
+            out.push(Line::default());
+            continue;
+        }
+        let spans: Vec<Span<'static>> = line
+            .spans
+            .iter()
+            .map(|s| {
                 Span::styled(
                     s.text.clone(),
                     match s.role {
@@ -364,10 +379,11 @@ pub(crate) fn startup_lines(
                         StartupRole::Success => theme.success_style(),
                     },
                 )
-            }));
-            Line::from(spans)
-        })
-        .collect()
+            })
+            .collect();
+        out.extend(crate::transcript::text_lines_of(&Line::from(spans), width, output_pad));
+    }
+    out
 }
 
 #[cfg(test)]
