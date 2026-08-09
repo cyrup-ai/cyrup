@@ -680,7 +680,13 @@ fn extension_input_envelope_has_four_spacers_and_the_hint_row() {
     assert_eq!(rows[1], "", "Spacer(1) (:48): {rows:?}");
     assert!(rows[2].contains("Name?"), "the title (:50-51): {rows:?}");
     assert_eq!(rows[3], "", "Spacer(1) (:52): {rows:?}");
-    assert!(rows[4].starts_with(" >"), "the Input (:63-64): {rows:?}");
+    // E10: `Input.render` opens with `const prompt = "> ";` (`input.ts:380`) — TWO columns, at
+    // column 0. `ExtensionInputComponent` adds the `Input` as a bare child (`extension-input.ts:
+    // 63-64`) with no `Text` wrapper, so nothing insets it; the title and hint rows are the only
+    // children carrying `paddingX = 1`. cyrup drew a three-column accent `" > "`, one column in.
+    // (The trailing space of `"> "` is the reverse-video caret cell and is trimmed off by the row
+    // helper, so this pins the `>` at column 0 — E10's actual claim — not the pair's width.)
+    assert!(rows[4].starts_with('>'), "the Input at column 0 (:63-64/input.ts:380): {rows:?}");
     assert_eq!(rows[5], "", "Spacer(1) (:65): {rows:?}");
     // E6: `keyHint("tui.select.confirm","submit")  keyHint("tui.select.cancel","cancel")`, in a
     // `new Text(..., 1, 0)` so it is inset one column.
@@ -732,7 +738,7 @@ fn extension_input_shows_its_first_five_children_on_a_five_row_slot() {
     assert_eq!(rows[1], "", "Spacer(1) (:48): {rows:?}");
     assert!(rows[2].contains("Name?"), "the title (:50-51): {rows:?}");
     assert_eq!(rows[3], "", "Spacer(1) (:52): {rows:?}");
-    assert!(rows[4].starts_with(" >"), "the input FIELD (:63-64): {rows:?}");
+    assert!(rows[4].starts_with('>'), "the input FIELD (:63-64): {rows:?}");
 }
 
 /// E6, first paint. `keyHint` resolves through `keyText` → `getKeybindings().getKeys(...)` on every

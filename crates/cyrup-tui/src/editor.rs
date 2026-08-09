@@ -37,12 +37,6 @@ use crate::component::Component;
 use crate::keymap::{EditorAction, EditorKeymap};
 use crate::theme::UiTheme;
 
-/// The accent prompt glyph drawn at the head of the editor's first line (overview §1.1 glyph
-/// vocabulary `prompt ›`; ADR-0001 live-region mockup). Two columns wide (`› `).
-const PROMPT: &str = "› ";
-/// Visible column width of [`PROMPT`].
-const PROMPT_W: u16 = 2;
-
 /// History ring capacity (`editor.ts:381`).
 const HISTORY_CAP: usize = 100;
 
@@ -116,6 +110,34 @@ pub struct InputEditor {
     /// motion (`editor.ts:1690` `build_visual_line_map(width)`). Updated every render; `80` until the
     /// first render. Vertical Up/Down resolve against the visual map computed at this width.
     view_width: usize,
+    /// First **visual** line of the render window (`editor.ts:288` `scrollOffset`). The editor shows
+    /// at most `maxVisibleLines` rows; anything above/below is scrolled out and announced by the
+    /// `─── ↑ N more ` / `─── ↓ N more ` rules ([`scroll_border`], `editor.ts:259-268`). Kept in range
+    /// and re-pointed at the caret every render (`editor.ts:507-516`) and reset to `0` whenever the
+    /// buffer is replaced wholesale (`editor.ts:471`, `:449`).
+    scroll_offset: usize,
+    /// The host TERMINAL's row count, from which the editor derives its own visible-row budget
+    /// (`editor.ts:499-501`):
+    ///
+    /// ```text
+    /// const terminalRows = this.tui.terminal.rows;
+    /// const maxVisibleLines = Math.max(5, Math.floor(terminalRows * 0.3));
+    /// ```
+    ///
+    /// The cap is INSIDE the component upstream, read from `this.tui` inside a `render(width)` that
+    /// takes no height at all (`:499-501`) — the editor is never told how tall its slot is and never
+    /// trusts a container to have windowed it. cyrup derived the same number solely from
+    /// `area.height - 2`, i.e. from whatever rect the caller happened to hand it, so an
+    /// [`InputEditor`] rendered anywhere other than [`crate::app::region_constraints`]'s slot — a
+    /// bare `Component::render` into a taller rect, an embedder's own layout — silently lost the cap
+    /// and drew as many rows as it was given.
+    ///
+    /// `24` until [`Self::set_terminal_height`] lands, pi's own `?? 24` fallback for a missing
+    /// terminal height (`config-selector.ts:264-266`). The rect still participates: the render
+    /// window is `min(area.height - 2, max(5, floor(rows * 0.3)))`, so a slot CLIPPED shorter than
+    /// the editor asked for still degrades correctly — something pi's height-free `render(width)`
+    /// cannot express.
+    term_rows: u16,
     /// The **sticky preferred column** for vertical motion (`editor.ts:66`
     /// `preferred_visual_col`): the intended visual column Up/Down try to land on across short/long/
     /// rewrapped visual lines. `Some` while a vertical run is in progress; cleared by any horizontal
@@ -199,6 +221,8 @@ impl InputEditor {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             mention_files: None,
             view_width: 80,
+            scroll_offset: 0,
+            term_rows: 24,
             preferred_visual_col: None,
             pastes: BTreeMap::new(),
             paste_counter: 0,
@@ -244,14 +268,23 @@ impl InputEditor {
     /// The padding actually applied at render width `width`, clamped exactly as Pi clamps it
     /// (`editor.ts:483-484`: `min(paddingX, floor((width - 1) / 2))`) so the content column can
     /// never be squeezed out of existence on a narrow terminal.
-    fn effective_padding(&self, width: u16) -> u16 {
+    pub fn effective_padding(&self, width: u16) -> u16 {
         self.padding_x.min(width.saturating_sub(1) / 2)
     }
 
     /// The text layout width inside `width` columns, after padding (Pi `editor.ts:485-489`):
     /// `contentWidth = max(1, width - 2 * paddingX)`, and one column is reserved for the
     /// end-of-line cursor cell ONLY when there is no padding for it to overflow into.
-    fn layout_width(&self, width: u16) -> u16 {
+    ///
+    /// **Public because measurement and render must agree** (E15). Pi computes `layoutWidth` ONCE
+    /// per `render` and feeds the same number to `this.lastWidth` and to `layoutText()`
+    /// (`editor.ts:489-497`), so the row count the container reserves is by construction the row
+    /// count the editor draws. cyrup splits those two across `app::region_constraints` (which sizes
+    /// the slot) and [`Component::render`] (which fills it), and the former used to measure at a
+    /// hardcoded `width - 1` while the latter wrapped at `width - 2 * paddingX`: with
+    /// `editorPaddingX > 0` the render produced MORE rows than the slot had, and the surplus — the
+    /// caret row included — was clipped. Both sides now call this.
+    pub fn layout_width(&self, width: u16) -> u16 {
         let pad = self.effective_padding(width);
         let content = width.saturating_sub(pad.saturating_mul(2)).max(1);
         if pad > 0 { content } else { content.saturating_sub(1).max(1) }
@@ -389,6 +422,8 @@ impl InputEditor {
         }
         self.row = self.lines.len().saturating_sub(1);
         self.col = self.lines.get(self.row).map_or(0, Vec::len);
+        // `editor.ts:471`: "Reset scroll - render() will adjust to show cursor".
+        self.scroll_offset = 0;
     }
 
     /// Clear the buffer back to a single empty line and reset transient state.
@@ -400,6 +435,7 @@ impl InputEditor {
         self.jump = None;
         self.last_action = LastAction::None;
         self.preferred_visual_col = None;
+        self.scroll_offset = 0;
         self.pastes.clear();
         self.exit_history();
     }
@@ -415,6 +451,20 @@ impl InputEditor {
     /// seam). `0` is clamped to `1` so wrapping never divides by zero.
     pub fn set_view_width(&mut self, width: usize) {
         self.view_width = width.max(1);
+    }
+
+    /// Tell the editor how many rows the host TERMINAL has — pi's `this.tui.terminal.rows`
+    /// (`editor.ts:500`). Drives [`term_rows`](Self::term_rows), i.e. the `max(5, floor(rows *
+    /// 0.3))` window the editor caps itself at. The app publishes this every `draw`; an embedder
+    /// that never calls it gets pi's `?? 24` default.
+    pub fn set_terminal_height(&mut self, rows: u16) {
+        self.term_rows = rows.max(1);
+    }
+
+    /// The editor's own visible-row budget at the current [`term_rows`](Self::term_rows) —
+    /// `Math.max(5, Math.floor(terminalRows * 0.3))` (`editor.ts:501`).
+    pub fn max_visible_lines(&self) -> u16 {
+        crate::app::max_visible_editor_lines(self.term_rows)
     }
 
     /// Build the wrap-aware visual-line map at the current [`view_width`](Self::view_width)
@@ -1495,16 +1545,31 @@ impl InputEditor {
         let vi = self.current_visual_line(&map);
         let vl = map.get(vi).copied().unwrap_or(VisualLine { logical: 0, start: 0, len: 0 });
         let vcol = self.col.saturating_sub(vl.start);
-        // Only the first visual row carries the prompt-glyph offset (`› `); later rows start flush.
-        let prompt = if vi == 0 { PROMPT_W } else { 0 };
+        // The caret's COLUMN is the visible width of the text before it, not its char count. Pi never
+        // does this arithmetic — it emits a zero-width `CURSOR_MARKER` *inside* the row string
+        // (`editor.ts:550`) and lets the terminal advance the cursor by the real cell widths — so a
+        // char-count offset is a cyrup-only bug: one emoji ahead of the caret and the hardware cursor
+        // (and hence the IME candidate window) lands a column left of the reverse-video cell.
+        let before_width: usize = self
+            .lines
+            .get(vl.logical)
+            .map(|l| {
+                let s: String = l.iter().skip(vl.start).take(vcol).collect();
+                Span::raw(s).width()
+            })
+            .unwrap_or(0);
         // The text rows start `editorPaddingX` columns in (`Padding::horizontal` on the render
         // block), so the caret must too — Pi prefixes the same `leftPadding` (`editor.ts:522`).
         let x = area
             .x
             .saturating_add(self.effective_padding(area.width))
-            .saturating_add(prompt)
-            .saturating_add(vcol.min(u16::MAX as usize) as u16);
-        let y = area.y.saturating_add(1).saturating_add(vi.min(u16::MAX as usize) as u16);
+            .saturating_add(before_width.min(u16::MAX as usize) as u16);
+        // The caret rides the SCROLLED window: row `vi` is drawn at `vi - scrollOffset` inside the
+        // rules (`editor.ts:519` slices `layoutLines` from `scrollOffset`).
+        let y = area
+            .y
+            .saturating_add(1)
+            .saturating_add(vi.saturating_sub(self.scroll_offset).min(u16::MAX as usize) as u16);
         let max_x = area.x.saturating_add(area.width).saturating_sub(1);
         let max_y = area.y.saturating_add(area.height).saturating_sub(1);
         Some((x.min(max_x), y.min(max_y)))
@@ -1516,46 +1581,197 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// The **display width** of `s` in terminal cells — Pi's `visibleWidth` (`utils.ts:240-...`), which
+/// is what every wrap and caret computation upstream measures with. `Span::width()` is ratatui's
+/// `unicode_width` sum, the same primitive `transcript.rs` already uses for `Box.applyBg`.
+///
+/// Not `chars().count()`: a CJK ideograph is one `char` and TWO columns, a combining mark is one
+/// `char` and ZERO, so a char count is neither an upper nor a lower bound on the cells a string
+/// occupies.
+fn display_width(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// Whether a grapheme counts as whitespace — Pi's `isWhitespaceChar`, which is literally
+/// `/\s/.test(char)` (`utils.ts:943-945`), i.e. *contains* a whitespace code point rather than *is*
+/// one, hence `any` and not `all`.
+///
+/// [CYRUP-DELTA] JS `\s` and Rust's `char::is_whitespace` (Unicode `White_Space`) differ on exactly
+/// two code points in either direction: `\s` includes U+FEFF (which `White_Space` does not) and
+/// `White_Space` includes U+0085 NEL (which `\s` does not). Both are stripped before they can reach
+/// the buffer — U+FEFF and U+0085 are `char::is_control()`/format characters that
+/// [`sanitize_paste`] drops and that no key event produces — so the sets coincide on every input
+/// this function can actually see.
+fn is_whitespace_seg(g: &str) -> bool {
+    g.chars().any(char::is_whitespace)
+}
+
+/// Whether a grapheme offers a CJK line-break opportunity — Pi's `cjkBreakRegex` (`utils.ts:54-55`):
+///
+/// ```text
+/// /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}
+///   \p{Script_Extensions=Hangul}\p{Script_Extensions=Bopomofo}]/u
+/// ```
+///
+/// Tested against the whole grapheme (the regex is unanchored, so it matches if ANY code point in
+/// the cluster qualifies) — hence `any`, matching `cjkBreakRegex.test(grapheme)`.
+///
+/// [CYRUP-DELTA] Rust's standard library carries no `Script_Extensions` data and pulling in a
+/// unicode-script crate for one predicate would be a new external dependency for a table that does
+/// not move (these five scripts' blocks are stable since Unicode 13). The ranges below are the
+/// assigned blocks of those five scripts plus the shared-ideographic code points
+/// (`〄〇〡-〩〸-〻`) that `Script_Extensions=Han` picks up beyond `Script=Han`.
+fn is_cjk_break(g: &str) -> bool {
+    g.chars().map(u32::from).any(|c| {
+        matches!(c,
+            0x1100..=0x11FF   // Hangul Jamo
+            | 0x2E80..=0x2EFF // CJK Radicals Supplement       (Han)
+            | 0x2F00..=0x2FDF // Kangxi Radicals               (Han)
+            | 0x3005          // 々 ideographic iteration mark (Han)
+            | 0x3007          // 〇 ideographic number zero    (Han)
+            | 0x3021..=0x3029 // 〡-〩 Hangzhou numerals        (Han)
+            | 0x3038..=0x303B // 〸-〻                          (Han)
+            | 0x3041..=0x309F // Hiragana (incl. the shared voiced-sound marks)
+            | 0x30A0..=0x30FF // Katakana
+            | 0x3100..=0x312F // Bopomofo
+            | 0x3130..=0x318F // Hangul Compatibility Jamo
+            | 0x31A0..=0x31BF // Bopomofo Extended
+            | 0x31F0..=0x31FF // Katakana Phonetic Extensions
+            | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xA960..=0xA97F // Hangul Jamo Extended-A
+            | 0xAC00..=0xD7AF // Hangul Syllables
+            | 0xD7B0..=0xD7FF // Hangul Jamo Extended-B
+            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0xFE30..=0xFE4F // CJK Compatibility Forms       (Han)
+            | 0xFF66..=0xFF9F // Halfwidth Katakana
+            | 0xFFA0..=0xFFDC // Halfwidth Hangul
+            | 0x1B000..=0x1B16F // Kana Supplement / Extended-A / Small Kana Extension
+            | 0x20000..=0x2FA1F // CJK Extensions B-F + Compatibility Supplement
+            | 0x30000..=0x323AF // CJK Extensions G-H
+        )
+    })
+}
+
 /// Word-aware wrap of one logical line into `(start_col, len)` visual segments fitting `width`
-/// (`wordWrapLine`, `editor.ts:114-206`): break at the last whitespace boundary that fits; force-break
-/// an overlong word at column granularity. An empty line yields one zero-length segment. `width` is
-/// assumed `>= 1` (callers clamp). Columns are char indices into `line`.
+/// **display columns** — a 1:1 port of `wordWrapLine` (`editor.ts:114-206`). An empty line yields
+/// one zero-length segment. `width` is assumed `>= 1` (callers clamp). The returned columns are
+/// char indices into `line` (cyrup's buffer is `Vec<char>`, so char indices are its `string.slice`),
+/// and the segments tile the line contiguously.
+///
+/// The three things the previous implementation got wrong, all from measuring `n - start <= width`
+/// over a `&[char]` — a CHAR COUNT:
+///
+/// 1. **Width.** Upstream accumulates `visibleWidth(grapheme)` (`:139-143`), so 24 CJK ideographs
+///    are 48 columns, not 24. At a layout width of 39 the char count said "fits", the map reported
+///    one visual line, four ideographs rendered past the right edge and — because
+///    [`Self::cursor_in`] resolves the caret through that same map — the caret left the frame.
+/// 2. **Granularity.** Upstream iterates GRAPHEMES and breaks at a cluster's own start index
+///    (`:157-160`), so a break never lands inside a cluster. Breaking at `start + width` char-wise
+///    put `👨` on one row and a bare `\u{200d}👩‍👧‍👦` on the next.
+/// 3. **CJK break opportunities.** Upstream records a wrap opportunity between any two adjacent
+///    non-space graphemes when either is CJK (`:191-198`), because CJK text has no spaces to break
+///    at. Without it a whole CJK paragraph is one unbreakable "word".
+///
+/// The loop below is upstream's, statement for statement: an overflow check that first tries to
+/// backtrack to the last recorded opportunity and otherwise force-breaks at the current cluster's
+/// start (`:145-161`), then the advance and the opportunity bookkeeping (`:180-199`).
+///
+/// [CYRUP-DELTA] `:163-178` handles a single segment wider than `maxWidth` by *recursively*
+/// re-wrapping it, which upstream needs because its segmenter merges a whole `[paste #N …]` marker
+/// into one atomic segment. cyrup's segments are plain extended grapheme clusters — never composite
+/// — so there is nothing to re-wrap: an over-wide cluster (a wide emoji at `width == 1`) is
+/// indivisible and takes a row of its own. That is where upstream's recursion converges for a
+/// splittable segment, and it is also the case upstream cannot express at all: `wordWrapLine("👨",
+/// 1)` recurses on itself forever.
 fn word_wrap_line(line: &[char], width: usize) -> Vec<(usize, usize)> {
     let width = width.max(1);
     let n = line.len();
+    // `if (!line || maxWidth <= 0) return [{ text: "", startIndex: 0, endIndex: 0 }]` (`:115-117`).
     if n == 0 {
         return vec![(0, 0)];
     }
-    let mut segs = Vec::new();
-    let mut start = 0;
-    while start < n {
-        if n - start <= width {
-            segs.push((start, n - start));
-            break;
-        }
-        let hard_end = start + width;
-        // Last whitespace boundary strictly after `start` and within the window — break *after* it so
-        // the trailing space stays on the wrapped line (matching Pi's greedy word wrap).
-        let mut end = hard_end;
-        let mut i = hard_end;
-        while i > start {
-            if line.get(i - 1).is_some_and(|c| c.is_whitespace()) {
-                end = i;
-                break;
+    let s: String = line.iter().collect();
+    // `if (lineWidth <= maxWidth) return [{ text: line, ... }]` (`:119-122`).
+    if display_width(&s) <= width {
+        return vec![(0, n)];
+    }
+
+    // `const segments = [...graphemeSegmenter.segment(line)]` (`:125`), carrying each cluster's
+    // start index — `seg.index` upstream, a char column here.
+    let mut segs: Vec<(usize, &str)> = Vec::with_capacity(n);
+    let mut col = 0usize;
+    for g in s.graphemes(true) {
+        segs.push((col, g));
+        col += g.chars().count();
+    }
+
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut current_width = 0usize;
+    let mut chunk_start = 0usize;
+    // `wrapOppIndex` / `wrapOppWidth` (`:131-133`), as one `Option` so `-1` cannot leak.
+    let mut wrap_opp: Option<(usize, usize)> = None;
+
+    for i in 0..segs.len() {
+        let Some(&(char_index, grapheme)) = segs.get(i) else { continue };
+        let g_width = display_width(grapheme);
+        let is_ws = is_whitespace_seg(grapheme);
+
+        // "Overflow check before advancing" (`:145-161`).
+        if current_width + g_width > width {
+            match wrap_opp {
+                // "Backtrack to last wrap opportunity (the remaining content plus the current
+                // grapheme still fits within maxWidth)" (`:147-153`).
+                Some((opp_index, opp_width))
+                    if current_width.saturating_sub(opp_width) + g_width <= width =>
+                {
+                    chunks.push((chunk_start, opp_index.saturating_sub(chunk_start)));
+                    chunk_start = opp_index;
+                    current_width = current_width.saturating_sub(opp_width);
+                }
+                // "No viable wrap opportunity: force-break at current position" (`:154-160`).
+                _ if chunk_start < char_index => {
+                    chunks.push((chunk_start, char_index - chunk_start));
+                    chunk_start = char_index;
+                    current_width = 0;
+                }
+                _ => {}
             }
-            i -= 1;
+            wrap_opp = None;
         }
-        // No whitespace in the window ⇒ force-break the overlong word at the hard edge.
-        if end <= start {
-            end = hard_end;
+
+        // `if (gWidth > maxWidth)` (`:163`) — see the [CYRUP-DELTA] above.
+        if g_width > width {
+            if chunk_start < char_index {
+                chunks.push((chunk_start, char_index - chunk_start));
+            }
+            chunk_start = char_index;
+            current_width = g_width;
+            wrap_opp = None;
+            continue;
         }
-        segs.push((start, end - start));
-        start = end;
+
+        // "Advance" (`:181`).
+        current_width += g_width;
+
+        // "Record wrap opportunity" (`:183-199`): whitespace followed by non-whitespace (multiple
+        // spaces join; the break point is after the last space), or a boundary where either side is
+        // CJK.
+        if let Some(&(next_index, next)) = segs.get(i + 1)
+            // Upstream spells this as two arms — whitespace→non-whitespace (`:187-189`) and the CJK
+            // boundary (`:190-198`) — that assign the same pair. Merged into one predicate because
+            // clippy's `if_same_then_else` rejects the duplicated arm; `is_ws || cjk || cjk` under a
+            // shared `!next_is_ws` is exactly the disjunction of the two upstream guards.
+            && !is_whitespace_seg(next)
+            && (is_ws || is_cjk_break(grapheme) || is_cjk_break(next))
+        {
+            wrap_opp = Some((next_index, current_width));
+        }
     }
-    if segs.is_empty() {
-        segs.push((0, 0));
-    }
-    segs
+
+    // "Push final chunk" (`:202`).
+    chunks.push((chunk_start, n.saturating_sub(chunk_start)));
+    chunks
 }
 
 /// Sanitize a bracketed-paste payload (`editor.ts:1142-1179`): normalize `\r\n`/`\r` to `\n`, expand
@@ -1574,6 +1790,62 @@ fn sanitize_paste(raw: &str) -> String {
     out
 }
 
+
+/// One scroll-indicator rule, a 1:1 port of `createScrollBorder` (`editor.ts:259-268`):
+///
+/// ```text
+/// const indicator = `─── ${direction} ${hiddenLineCount} more `;
+/// const remaining = availableWidth - visibleWidth(indicator);
+/// if (remaining >= 0) return indicator + "─".repeat(remaining);
+/// const ellipsis = "...".slice(0, availableWidth);
+/// return sliceByColumn(indicator, 0, availableWidth - visibleWidth(ellipsis), true) + ellipsis;
+/// ```
+///
+/// `direction` is `'↑'` (rows scrolled off the top) or `'↓'` (rows still below).
+///
+/// **The trailing `true` is `strict`, not a pad flag.** `sliceByColumn(line, startCol, length,
+/// strict = false)` (`utils.ts:1195-1197`) forwards to `sliceWithWidth`, whose `strict` drops a
+/// grapheme that would straddle the end column (`:1224`, `const fits = !strict || currentCol + w <=
+/// endCol`); it returns `{ text, width }` and pads NOTHING. The `pad` parameter that does exist
+/// upstream belongs to `truncateToWidth`/`finalizeTruncatedResult`, a different function. So
+/// `createScrollBorder`'s fallback is not padded upstream and is not padded here — the loop below is
+/// that strict slice, and it is equivalent statement for statement: upstream skips a non-fitting
+/// grapheme and then breaks on `currentCol >= endCol`, which for a strictly-increasing column count
+/// is the same set of graphemes this `break` keeps.
+///
+/// The result is nevertheless always exactly `width` display columns, and that is a property of the
+/// indicator's ALPHABET rather than of the slice: `─`, the space, `↑`/`↓` (East-Asian Ambiguous,
+/// hence narrow) and the decimal digits are every one of them a single column, so `strict` never has
+/// a wide grapheme to reject. [`tests::the_scroll_rule_is_exactly_as_wide_as_it_is_asked_for`] pins
+/// it across the whole width range, because cyrup — unlike pi, which composes each row from scratch
+/// — paints this string OVER the `Block`'s already-drawn rule, and a short string would leak the
+/// `─`s underneath.
+fn scroll_border(direction: char, hidden: usize, width: u16) -> String {
+    let avail = usize::from(width);
+    let indicator = format!("─── {direction} {hidden} more ");
+    let indicator_w = display_width(&indicator);
+    if avail >= indicator_w {
+        let mut out = indicator;
+        out.push_str(&"─".repeat(avail - indicator_w));
+        return out;
+    }
+    // Too narrow for the whole indicator: keep as many leading columns as fit, then `...` (itself
+    // truncated to the available width on a truly tiny terminal).
+    let ellipsis: String = "...".chars().take(avail).collect();
+    let budget = avail.saturating_sub(display_width(&ellipsis));
+    let mut out = String::new();
+    let mut used = 0usize;
+    for g in indicator.graphemes(true) {
+        let w = display_width(g);
+        if used + w > budget {
+            break;
+        }
+        out.push_str(g);
+        used += w;
+    }
+    out.push_str(&ellipsis);
+    out
+}
 
 /// The grapheme-cluster boundaries of `line` expressed as **char-column** indices, including the
 /// leading `0` and trailing line length (`unicode_segmentation` extended grapheme clusters — the
@@ -1622,12 +1894,23 @@ impl Component for InputEditor {
             .border_set(border::PLAIN)
             .border_style(rule_style)
             .padding(Padding::horizontal(pad));
-        // An accent prompt glyph `›` anchors the editor's first line; a reverse-video soft cursor cell
-        // makes the caret visible every idle frame (overview §1.1 glyph vocab `prompt ›`; spec/tui/03
-        // §3.4 reverse-video cursor; Pi `editor.ts:545-551`). Without these the body row paints blank
-        // because the hardware cursor (`set_cursor_position`) is invisible in a headless buffer.
+        // A reverse-video soft cursor cell makes the caret visible every idle frame (Pi
+        // `editor.ts:545-564`). Without it the body row paints blank, because the hardware cursor
+        // (`set_cursor_position`) is invisible in a headless buffer.
+        //
+        // **E1 — there is no prompt glyph.** cyrup used to open row 0 with an accent `› `. Pi's
+        // `Editor.render` (`editor.ts:482-601`) emits only `${leftPadding}${displayText}${padding}
+        // ${lineRightPadding}` (`:578`); nothing anywhere in the chat editor's construction adds a
+        // leading glyph — the chat editor is a bare `new CustomEditor(this.ui, getEditorTheme(),
+        // this.keybindings, {…})` (`interactive-mode.ts:563-566`) and `CustomEditor`
+        // (`components/custom-editor.ts`, 90 lines) overrides `handleInput` ONLY, with no `render`.
+        // The `›` upstream *does* draw is the SELECTED-ROW cursor of the list selectors
+        // (`session-selector.ts:476`, `tree-selector.ts:689`, `user-message-selector.ts:57`), a
+        // different component. Removing it also fixes **E2**: row 0 was `PROMPT_W + view_width`
+        // columns wide inside a `view_width`-wide area (last character clipped, end-of-line caret off
+        // the right edge) while rows 1..n started two columns to its left — a permanent ragged left
+        // edge. Every row now starts flush at `leftPadding`, exactly as `:578` does.
         let base = theme.base_style();
-        let prompt_style = theme.accent_style();
         let cursor_style = base.add_modifier(Modifier::REVERSED);
         // Expand each LOGICAL line into its wrapped VISUAL lines at `view_width` (`editor.ts:1690`
         // `build_visual_line_map`, the same primitive vertical motion uses) and emit one ratatui
@@ -1635,14 +1918,36 @@ impl Component for InputEditor {
         // (the `Paragraph` has no `.wrap`, so it renders exactly the rows we build). The soft cursor
         // rides its VISUAL row/col, not the logical column.
         let map = self.visual_line_map();
-        let cursor_vl = if self.focused { self.current_visual_line(&map) } else { usize::MAX };
-        let mut lines: Vec<Line> = Vec::with_capacity(map.len());
-        for (vi, vl) in map.iter().enumerate() {
+        // **E13 — the caret survives focus loss.** Pi gates `focused` on the zero-width hardware
+        // `CURSOR_MARKER` alone (`editor.ts:537,550`); the reverse-video cell is emitted purely from
+        // `layoutLine.hasCursor`, which `layoutText` sets from the cursor position and never consults
+        // `focused` (`editor.ts:905-960`). cyrup used to set `cursor_vl = usize::MAX` when unfocused,
+        // so clicking away from the terminal (`FocusLost`) erased the caret entirely. The
+        // focus-gated half lives on in [`Self::cursor_in`], which is cyrup's `CURSOR_MARKER`.
+        let cursor_vl = self.current_visual_line(&map);
+        // **E4 — the visible window scrolls; it does not clip.** Pi slices `layoutLines` to
+        // `maxVisibleLines` after moving `scrollOffset` to keep the caret inside
+        // (`editor.ts:499-519`).
+        //
+        // **E17 — the cap is the component's own.** Upstream reads `this.tui.terminal.rows` inside a
+        // `render(width)` that takes no height (`:499-501`); the budget is intrinsic and the
+        // container is never consulted. cyrup took `area.height - 2` alone — correct only for as
+        // long as the one caller happened to size the slot from the same formula, and silently
+        // uncapped for every other caller. It is now `min(rect, intrinsic)`: the intrinsic budget is
+        // pi's, and the rect stays in the `min` so a slot CLIPPED shorter than the editor asked for
+        // still degrades correctly rather than overdrawing its neighbours.
+        let max_visible = usize::from(area.height.saturating_sub(2))
+            .min(usize::from(self.max_visible_lines()))
+            .max(1);
+        if cursor_vl < self.scroll_offset {
+            self.scroll_offset = cursor_vl;
+        } else if cursor_vl >= self.scroll_offset.saturating_add(max_visible) {
+            self.scroll_offset = cursor_vl.saturating_add(1).saturating_sub(max_visible);
+        }
+        self.scroll_offset = self.scroll_offset.min(map.len().saturating_sub(max_visible));
+        let mut lines: Vec<Line> = Vec::with_capacity(max_visible);
+        for (vi, vl) in map.iter().enumerate().skip(self.scroll_offset).take(max_visible) {
             let mut spans: Vec<Span> = Vec::new();
-            // The prompt glyph anchors only the very first visual row (Pi first-line prompt).
-            if vi == 0 {
-                spans.push(Span::styled(PROMPT, prompt_style));
-            }
             // The chars this visual line slices out of its logical line.
             let seg: Vec<char> = self
                 .lines
@@ -1654,13 +1959,18 @@ impl Component for InputEditor {
                 let vcol = self.col.saturating_sub(vl.start).min(seg.len());
                 let before: String = seg.iter().take(vcol).collect();
                 spans.push(Span::styled(before, base));
-                match seg.get(vcol) {
-                    Some(c) => {
-                        spans.push(Span::styled(c.to_string(), cursor_style));
-                        let after: String = seg.iter().skip(vcol + 1).collect();
+                // The highlighted cell is one whole GRAPHEME, not one `char`: Pi takes
+                // `afterGraphemes[0].segment` and slices the rest past it (`editor.ts:555-559`), so a
+                // ZWJ emoji is inverted as a unit instead of leaving its continuation chars
+                // un-highlighted beside a reversed base character.
+                let rest: String = seg.iter().skip(vcol).collect();
+                match rest.graphemes(true).next() {
+                    Some(g) => {
+                        spans.push(Span::styled(g.to_string(), cursor_style));
+                        let after: String = rest.chars().skip(g.chars().count()).collect();
                         spans.push(Span::styled(after, base));
                     }
-                    // End-of-line caret: a reverse-video space (Pi `editor.ts:550`).
+                    // End-of-line caret: a reverse-video space (Pi `editor.ts:563`).
                     None => spans.push(Span::styled(" ", cursor_style)),
                 }
             } else {
@@ -1668,8 +1978,31 @@ impl Component for InputEditor {
             }
             lines.push(Line::from(spans));
         }
+        let shown = lines.len();
         let para = Paragraph::new(lines).block(block).style(base);
         frame.render_widget(para, area);
+        // E4's other half: the rules ANNOUNCE the hidden rows. `createScrollBorder`
+        // (`editor.ts:259-268`) replaces the plain `─`-repeat with `─── ↑ N more ───…` at the top
+        // when `scrollOffset > 0` (`:526-528`) and `─── ↓ N more ───…` at the bottom when content
+        // remains below (`:582-585`). The `Block` above already painted a plain rule on both edges;
+        // these overwrite it in place, which is byte-identical to pi choosing one string or the other
+        // (both are exactly `width` columns).
+        if self.scroll_offset > 0 && area.height >= 1 {
+            let text = scroll_border('↑', self.scroll_offset, area.width);
+            let row = Rect { x: area.x, y: area.y, width: area.width, height: 1 };
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(text, rule_style))), row);
+        }
+        let below = map.len().saturating_sub(self.scroll_offset.saturating_add(shown));
+        if below > 0 && area.height >= 2 {
+            let text = scroll_border('↓', below, area.width);
+            let row = Rect {
+                x: area.x,
+                y: area.y.saturating_add(area.height.saturating_sub(1)),
+                width: area.width,
+                height: 1,
+            };
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(text, rule_style))), row);
+        }
         // Pi hides the terminal's real cursor unless `showHardwareCursor` is on (`tui.ts:1659-1663`
         // `if (this.showHardwareCursor) showCursor() else hideCursor()`); ratatui's `Terminal::draw`
         // hides it for us whenever no position was set, so the gate is the call itself.
@@ -1677,6 +2010,188 @@ impl Component for InputEditor {
             && let Some((x, y)) = self.cursor_in(area)
         {
             frame.set_cursor_position((x, y));
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// `word_wrap_line` over a `&str`, as `(chunk text)` — the shape `wordWrapLine` returns
+    /// (`editor.ts:114-206` yields `{ text, startIndex, endIndex }`).
+    fn wrap(s: &str, width: usize) -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
+        word_wrap_line(&chars, width)
+            .into_iter()
+            .map(|(start, len)| chars.iter().skip(start).take(len).collect())
+            .collect()
+    }
+
+    /// The chunks tile the line: contiguous, gap-free, and reassembling to the input. Upstream gets
+    /// this for free from `line.slice(chunkStart, …)` + a final `line.slice(chunkStart)` (`:202`).
+    fn assert_tiles(s: &str, width: usize) {
+        let chars: Vec<char> = s.chars().collect();
+        let segs = word_wrap_line(&chars, width);
+        let mut at = 0usize;
+        for (start, len) in &segs {
+            assert_eq!(*start, at, "chunk {segs:?} of {s:?}@{width} is not contiguous");
+            at += len;
+        }
+        assert_eq!(at, chars.len(), "chunks {segs:?} do not cover {s:?}");
+    }
+
+    // -------------------------------------------------------------- wordWrapLine ---------------
+
+    /// The two early returns (`editor.ts:115-122`): an empty line is one empty chunk, and a line
+    /// that already fits is one chunk covering the whole line.
+    #[test]
+    fn a_line_that_fits_is_one_chunk() {
+        assert_eq!(word_wrap_line(&[], 10), vec![(0, 0)]);
+        assert_eq!(wrap("hello", 10), vec!["hello"]);
+        // "fits" is measured in COLUMNS: 5 ideographs are 10 of them.
+        assert_eq!(wrap("日本語です", 10), vec!["日本語です"]);
+        assert_eq!(wrap("日本語です", 9).len(), 2, "…and 9 columns is one short");
+    }
+
+    /// Whitespace is the primary wrap opportunity, and the break lands AFTER the space run so the
+    /// trailing space stays on the wrapped row (`wrapOppIndex = next.index`, `editor.ts:187-189`).
+    #[test]
+    fn wrapping_breaks_after_the_last_space_that_fits() {
+        assert_eq!(wrap("aaa bbb ccc", 5), vec!["aaa ", "bbb ", "ccc"]);
+        assert_eq!(wrap("aaa  bbb", 5), vec!["aaa  ", "bbb"], "a run of spaces joins (`:187`)");
+        // And it is GREEDY, not balanced: at width 7 the tail `"bbb ccc"` is exactly 7 columns, so
+        // the backtrack at the second space finds it already fits and never fires
+        // (`currentWidth - wrapOppWidth + gWidth <= maxWidth`, `editor.ts:147`).
+        assert_eq!(wrap("aaa bbb ccc", 7), vec!["aaa ", "bbb ccc"]);
+        assert_tiles("aaa bbb ccc", 5);
+        assert_tiles("aaa bbb ccc", 7);
+    }
+
+    /// A word longer than the width force-breaks at the current grapheme's own start index
+    /// (`editor.ts:154-160`).
+    #[test]
+    fn an_overlong_word_force_breaks_at_the_width() {
+        assert_eq!(wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_tiles("abcdefghij", 4);
+    }
+
+    /// **The display-width bug.** `visibleWidth(grapheme)` (`editor.ts:139-143`), not a char count:
+    /// 24 ideographs are 48 columns and cannot be one 39-column row. The break also needs
+    /// `cjkBreakRegex` (`utils.ts:54`, used at `editor.ts:191-198`) — CJK has no spaces to break at,
+    /// so without the CJK opportunity the whole run would be one unbreakable "word".
+    #[test]
+    fn cjk_is_measured_and_broken_in_columns() {
+        let cjk: String = "日本語".chars().cycle().take(24).collect();
+        let rows = wrap(&cjk, 39);
+        assert_eq!(rows.len(), 2, "48 columns do not fit 39: {rows:?}");
+        assert_eq!(rows[0].chars().count(), 19, "19 ideographs are 38 columns; a 20th would be 40");
+        assert_eq!(rows.concat(), cjk);
+        assert_tiles(&cjk, 39);
+        for r in &rows {
+            assert!(display_width(r) <= 39, "row overflows: {r:?}");
+        }
+    }
+
+    /// The CJK opportunity is a BOUNDARY rule — it fires when either side is CJK
+    /// (`editor.ts:194-198`), so Latin text abutting CJK may break between them.
+    #[test]
+    fn a_latin_cjk_boundary_is_a_wrap_opportunity() {
+        // `word` is 4 columns and each ideograph 2, so at width 4 the opportunity recorded at the
+        // `d`→`日` boundary is what puts `word` on a row of its own; the two that follow come from
+        // the CJK-to-CJK opportunities.
+        let rows = wrap("word日本語", 4);
+        assert_eq!(rows, vec!["word", "日本", "語"], "the boundary breaks: {rows:?}");
+        assert_tiles("word日本語", 4);
+        // Contrast: an all-Latin run of the same length has NO opportunity anywhere, so it
+        // force-breaks mid-"word" instead.
+        assert_eq!(wrap("wordabcdef", 4), vec!["word", "abcd", "ef"]);
+    }
+
+    /// A grapheme CLUSTER is atomic: the break never lands inside one, whatever the width.
+    #[test]
+    fn a_cluster_is_never_split() {
+        const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        let line = format!("{}{FAMILY}", "a".repeat(38));
+        let rows = wrap(&line, 39);
+        assert_eq!(rows, vec!["a".repeat(38), FAMILY.to_string()], "torn cluster: {rows:?}");
+        assert_tiles(&line, 39);
+
+        // …including when the cluster ALONE is wider than the width: it is indivisible, so it takes
+        // a row of its own rather than recursing forever the way `editor.ts:163-178` would.
+        let rows = wrap(&format!("ab{FAMILY}cd"), 1);
+        assert_eq!(rows, vec!["a", "b", FAMILY, "c", "d"], "{rows:?}");
+        assert_tiles(&format!("ab{FAMILY}cd"), 1);
+    }
+
+    /// Every produced row fits, and the rows always tile the input — swept over a spread of widths
+    /// and mixed scripts, because the failure mode of the old char-count wrap was silent overflow
+    /// rather than a crash.
+    #[test]
+    fn every_wrapped_row_fits_its_width() {
+        const CASES: [&str; 5] = [
+            "the quick brown fox jumps over the lazy dog",
+            "日本語のテキストは空白で区切られていません",
+            "mixed 日本語 and latin with  double  spaces",
+            "e\u{301}combining\u{301}marks\u{301}everywhere",
+            "supercalifragilisticexpialidocious",
+        ];
+        for s in CASES {
+            for width in 1..=45usize {
+                assert_tiles(s, width);
+                for row in wrap(s, width) {
+                    // A single over-wide cluster is the one legal exception (see above): it cannot
+                    // be split, so it is emitted alone.
+                    let clusters = row.graphemes(true).count();
+                    assert!(
+                        display_width(&row) <= width || clusters == 1,
+                        "{s:?}@{width}: row {row:?} is {} columns",
+                        display_width(&row)
+                    );
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- createScrollBorder ------------
+
+    /// The wide path (`editor.ts:262-263`): the indicator, then `─` to the requested width.
+    #[test]
+    fn the_scroll_rule_reads_as_an_indicator_padded_with_rule() {
+        let s = scroll_border('↑', 6, 20);
+        assert!(s.starts_with("─── ↑ 6 more "), "{s:?}");
+        assert_eq!(display_width(&s), 20, "{s:?}");
+        assert!(s.ends_with('─'), "the remainder is rule, not blank: {s:?}");
+    }
+
+    /// The narrow path (`editor.ts:265-267`): a strict slice of the indicator plus `...`, itself
+    /// clipped on a terminal too narrow even for that.
+    #[test]
+    fn a_terminal_too_narrow_for_the_indicator_gets_an_ellipsis() {
+        assert_eq!(scroll_border('↓', 5, 10), "─── ↓ 5...", "{:?}", scroll_border('↓', 5, 10));
+        assert_eq!(scroll_border('↓', 5, 2), "..");
+        assert_eq!(scroll_border('↓', 5, 0), "");
+    }
+
+    /// The invariant the render depends on: the string is EXACTLY `width` columns for every width
+    /// and every hidden count, so it overwrites the `Block`'s pre-painted rule with no `─` leaking
+    /// out from underneath. (Upstream can be one column short here — `strict` may reject a wide
+    /// grapheme at the boundary and nothing pads afterwards — but the indicator's alphabet is
+    /// entirely single-column, so the case does not arise. See [`scroll_border`].)
+    #[test]
+    fn the_scroll_rule_is_exactly_as_wide_as_it_is_asked_for() {
+        for direction in ['↑', '↓'] {
+            for hidden in [0usize, 1, 9, 10, 99, 1234, 1_000_000] {
+                for width in 0..=120u16 {
+                    let s = scroll_border(direction, hidden, width);
+                    assert_eq!(
+                        display_width(&s),
+                        usize::from(width),
+                        "scroll_border({direction:?}, {hidden}, {width}) = {s:?}"
+                    );
+                }
+            }
         }
     }
 }

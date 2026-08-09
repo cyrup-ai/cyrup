@@ -145,6 +145,11 @@ fn hot_reload_theme_data_repaints_the_assembled_app() {
     // consumer application: a freshly-"watched" `ThemeData` with a distinct accent repaints the app.
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
     app.status_mut().set_model("anthropic/claude-opus-4-6");
+    // Put an accent-styled surface on screen: the status band's spinner glyph
+    // (`status_indicator.rs:216-218`, Pi `status-indicator.ts:55-64`). Until E1 the only accent
+    // foreground in an idle assembled frame was the editor's `› ` prompt glyph — a cyrup invention
+    // `editor.ts:482-601` never emits — so this assertion was riding on the very thing E1 removes.
+    app.state_mut().indicator.working();
     app.draw().unwrap();
 
     // A bright-magenta accent no dark/light builtin uses, so its presence is unambiguous.

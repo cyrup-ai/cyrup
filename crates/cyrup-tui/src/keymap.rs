@@ -901,6 +901,21 @@ impl EditorKeymap {
         self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
     }
 
+    /// **All** keys bound to `action`, joined with `/` — Pi's `keyText`
+    /// (`keybinding-hints.ts:29-36`). The editor-tier twin of [`Keymap::keys_label`] /
+    /// [`SelectKeymap::keys_label`]; a hint row that names an editor binding must show every bound
+    /// key, e.g. `tui.input.newLine`'s stock `["shift+enter", "ctrl+j"]`
+    /// (pi `tui/src/keybindings.ts:137`) renders as `shift+enter/ctrl+j`.
+    pub fn keys_label(&self, action: EditorAction) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
+    }
+
     /// Rebind `action` to exactly `keys`.
     pub fn set_action(&mut self, action: EditorAction, keys: Vec<Key>) {
         self.bindings.retain(|(_, a)| *a != action);

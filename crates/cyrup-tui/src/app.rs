@@ -275,6 +275,16 @@ pub struct AppState {
     /// Reserve the 2-row status band even when idle (spec/tui/01 §6.3). Default `false` (Pi's
     /// non-`clearOnShrink` behavior) so the editor/footer never reflow on idle viewports.
     pub reserve_status_rows: bool,
+    /// The host TERMINAL's row count — Pi's `this.tui.terminal.rows` (`editor.ts:500`). Refreshed
+    /// every [`App::draw`] from the backend; `24` until the first draw, matching the `?? 24` default
+    /// pi itself uses when a terminal height is unavailable (`config-selector.ts:264-266`).
+    ///
+    /// **Not** the live-region height. The editor's row budget is `max(5, floor(terminalRows * 0.3))`
+    /// (E3), which must be answered against the SCREEN; `region_constraints` is called once with the
+    /// terminal height (from [`live_region_height`]) and once with the resulting viewport height
+    /// (from [`render`]), and deriving the budget from its `avail` argument would make those two
+    /// calls disagree and the split non-idempotent.
+    pub term_rows: u16,
     /// Whether the compact startup keybinding-hints bar is shown (Pi `compactInstructions`,
     /// interactive-mode.ts:697-703): a one-line `interrupt · clear/exit · / commands · ! bash · more`
     /// affordance bar rendered just above the editor at startup, dismissed on the first submission.
@@ -447,6 +457,7 @@ impl AppState {
             image_renderer: ImageRenderer::default(),
             pending_images: Vec::new(),
             reserve_status_rows: false,
+            term_rows: 24,
             show_startup_hints: true,
             loader: None,
             loader_tick: 0,
@@ -1308,6 +1319,22 @@ impl<B: Backend> App<B> {
         let size = self.terminal.backend().size().ok();
         let term_h = size.map(|s| s.height).unwrap_or(self.viewport_height).max(1);
         let term_w = size.map(|s| s.width).unwrap_or(80);
+        // Publish the SCREEN height before anything measures: the editor's row budget is
+        // `max(5, floor(terminalRows * 0.3))` against the terminal, not the live region
+        // (`editor.ts:499-501`; see [`AppState::term_rows`]). A selector that windows its own body
+        // gets the same number through `Selector::set_terminal_height`, which is documented as
+        // "called before `desired_height` on every frame" and, until now, was called only by the
+        // standalone `startup_selector` loop — so the in-app `/config` grid and the `ui.editor`
+        // dialog (E12) both sized themselves against a default they were never told to update.
+        self.state.term_rows = term_h;
+        // E17: the editor caps ITSELF at `max(5, floor(terminalRows * 0.3))` from inside
+        // `render` (`editor.ts:499-501`), so it needs the screen height too — `region_constraints`
+        // reserving the right number of rows is not the same thing as the component knowing its own
+        // budget.
+        self.state.editor.set_terminal_height(term_h);
+        if let Some(active) = self.state.selector.as_mut() {
+            active.inner.set_terminal_height(term_h);
+        }
         let raw = live_region_height(&self.state, term_w, term_h);
         // Grow-only hysteresis GATED on the turn being active. `status.streaming` is set on
         // `AgentStart` and cleared on `AgentEnd`, so it spans the WHOLE multi-step turn including the
@@ -2517,7 +2544,10 @@ impl<B: Backend> App<B> {
         let title = SelectorKind::BranchSummaryInstructions.title().to_string();
         self.open_boxed_selector(
             SelectorKind::BranchSummaryInstructions,
-            Box::new(ExtensionEditorSelector::new(title, "")),
+            Box::new(
+                ExtensionEditorSelector::new(title, "")
+                    .with_keymaps(&self.state.select_keymap, &self.state.keymap),
+            ),
         );
     }
 
@@ -2719,7 +2749,13 @@ impl<B: Backend> App<B> {
             UiKind::Editor => (
                 SelectorKind::ExtensionEditor,
                 prompt.clone(),
-                Box::new(ExtensionEditorSelector::new(prompt, &message)),
+                // E9: the hint row is built from the LIVE `tui.select.*` + app tables, so the first
+                // paint already names the user's own keys (upstream re-resolves every `keyHint` on
+                // each render, `keybinding-hints.ts:34-44`).
+                Box::new(
+                    ExtensionEditorSelector::new(prompt, &message)
+                        .with_keymaps(&self.state.select_keymap, &self.state.keymap),
+                ),
             ),
         };
         // Pi's `CountdownTimer` (`countdown-timer.ts:7-38`, wired by `ExtensionSelectorComponent`/
@@ -5145,6 +5181,25 @@ fn armin_art() -> String {
 /// balloons into a void (the old `Constraint::Min(1)` flex). The function is idempotent: feeding back
 /// its own sum reproduces the same split, so [`render`] (called with the viewport height) and
 /// [`live_region_height`] (called with the terminal height) never disagree on row counts.
+/// The editor's visible text-row budget on a `term_rows`-row terminal — Pi `editor.ts:499-501`:
+///
+/// ```text
+/// // Calculate max visible lines: 30% of terminal height, minimum 5 lines
+/// const terminalRows = this.tui.terminal.rows;
+/// const maxVisibleLines = Math.max(5, Math.floor(terminalRows * 0.3));
+/// ```
+///
+/// `floor(rows * 0.3)` is computed in integers as `rows * 3 / 10` (identical for every `u16`, and
+/// free of the float rounding that would make e.g. `rows = 10` ambiguous). Rules are NOT counted:
+/// the editor draws `1 + min(layoutLines, maxVisibleLines) + 1` rows.
+///
+/// Shared by [`region_constraints`] (which reserves the slot) and
+/// [`crate::extension_editor::ExtensionEditorSelector`] (E12 — the `ui.editor` dialog embeds the
+/// same `Editor`, `extension-editor.ts:70`, so the same cap applies to its body).
+pub(crate) fn max_visible_editor_lines(term_rows: u16) -> u16 {
+    ((u32::from(term_rows) * 3 / 10).min(u32::from(u16::MAX)) as u16).max(5)
+}
+
 fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 6] {
     let avail = avail.max(1);
     let max_editor = avail.saturating_sub(2).max(3);
@@ -5152,13 +5207,26 @@ fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 6] {
     // the two rule rows (spec/tui/05 §1.1, spec/tui/03 §3.1).
     let want_slot = match state.selector.as_ref() {
         Some(active) => active.inner.desired_height(width).clamp(3, max_editor),
-        // Size from the VISUAL (wrapped) line count at the same content width the editor renders at
-        // (`view_width = area.width - 1`, one col reserved for the end-of-line cursor cell) so a long
-        // or pasted single logical line grows the box one row per wrapped visual line instead of
-        // clipping (Pi `editor.ts:1690`/`471`). The +2 is the two rule rows; the cap is unchanged.
+        // Size from the VISUAL (wrapped) line count, windowed and measured exactly as Pi's
+        // `Editor.render` does:
+        //
+        // * **E15 — measure at the width it renders at.** Pi derives ONE `layoutWidth` and feeds it
+        //   to both `this.lastWidth` and `layoutText()` (`editor.ts:489-497`). cyrup measured at a
+        //   hardcoded `width - 1` while [`crate::editor::InputEditor`]'s render wraps at
+        //   `layout_width(width)` = `width - 2 * paddingX` when `paddingX > 0`, so any
+        //   `editorPaddingX` made the render wrap NARROWER than the measurement and produced rows
+        //   the slot had no space for — clipped, caret row included.
+        // * **E3 — the window is capped at 30% of the terminal.** `maxVisibleLines = Math.max(5,
+        //   Math.floor(terminalRows * 0.3))` (`editor.ts:499-501`), then `layoutLines.slice(...)`
+        //   (`:519`). The old cap was `avail - 2`, so a long paste grew the editor until it owned the
+        //   terminal minus two rows and the transcript collapsed: on a 40-row terminal pi shows 12
+        //   text rows and scrolls, cyrup showed 38.
+        //
+        // The `+2` is the two rule rows; `clamp(3, max_editor)` stays as the viewport backstop.
         None => (state
             .editor
-            .visual_line_count(width.saturating_sub(1) as usize)
+            .visual_line_count(usize::from(state.editor.layout_width(width)))
+            .min(usize::from(max_visible_editor_lines(state.term_rows)))
             .min(u16::MAX as usize) as u16)
             .saturating_add(2)
             .clamp(3, max_editor),
@@ -5283,8 +5351,21 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     } else {
         state.editor.render(frame, slot_area, &state.theme);
         if let Some(ac) = state.editor.autocomplete() {
-            let lines = ac.list.lines(popup_area.width, &state.theme);
-            frame.render_widget(Paragraph::new(lines).style(state.theme.base_style()), popup_area);
+            // E14: the popup lives INSIDE the editor's padding frame. Pi renders it at
+            // `contentWidth` (= `width - paddingX * 2`) and prefixes the same `leftPadding` every
+            // text row gets (`editor.ts:591-597`), so with `editorPaddingX` 1–3 — the values
+            // `/settings` cycles — the completions line up with the text they complete. cyrup drew
+            // them into `popup_area` at full frame width, flush at column 0. No effect at the
+            // default padding of 0, which is why it went unnoticed.
+            let pad = state.editor.effective_padding(popup_area.width);
+            let inner = ratatui::layout::Rect {
+                x: popup_area.x.saturating_add(pad),
+                y: popup_area.y,
+                width: popup_area.width.saturating_sub(pad.saturating_mul(2)),
+                height: popup_area.height,
+            };
+            let lines = ac.list.lines(inner.width, &state.theme);
+            frame.render_widget(Paragraph::new(lines).style(state.theme.base_style()), inner);
         }
     }
     state.status.render(frame, status_area, &state.theme);

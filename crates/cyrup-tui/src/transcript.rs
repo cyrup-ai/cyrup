@@ -1407,6 +1407,32 @@ fn apply_bg(mut line: Line<'static>, width: usize, bg: Style) -> Line<'static> {
     line
 }
 
+/// Port of `Text.render` (`tui/src/components/text.ts:60-87`) for one already-styled **[`Line`]**,
+/// at `paddingY = 0` — the multi-span form, so a row built from several differently-styled pieces
+/// (a `keyHint` pair's dim key + muted description, say) keeps every colour across the wrap.
+///
+/// Upstream has only this form: a `Text` is constructed from ONE string that already carries its
+/// ANSI runs (`theme.fg("dim", …) + theme.fg("muted", …)`), and `wrapTextWithAnsi` carries those
+/// runs through the wrap (`utils.ts:770-798`). [`wrap_line`] is that primitive; this adds `:64`'s
+/// `contentWidth` and `:70-76`'s left margin. See [`text_lines`] for the single-style convenience
+/// wrapper over it.
+pub(crate) fn text_lines_of(
+    src: &Line<'static>,
+    width: usize,
+    padding_x: usize,
+) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(padding_x * 2).max(1);
+    let left = " ".repeat(padding_x);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for mut row in wrap_line(src, content_width) {
+        if padding_x > 0 {
+            row.spans.insert(0, Span::raw(left.clone()));
+        }
+        out.push(row);
+    }
+    out
+}
+
 /// Port of `Text.render` (`tui/src/components/text.ts:60-87`) for one already-styled string, at
 /// `paddingY = 0`.
 ///
@@ -1416,21 +1442,13 @@ fn apply_bg(mut line: Line<'static>, width: usize, bg: Style) -> Line<'static> {
 /// are not materialised here — a trailing run of blanks is invisible in a ratatui cell grid and
 /// would only defeat the right-trim [`wrap_line`] performs.
 fn text_lines(text: &str, width: usize, padding_x: usize, style: Style) -> Vec<Line<'static>> {
-    let content_width = width.saturating_sub(padding_x * 2).max(1);
-    let left = " ".repeat(padding_x);
     let mut out: Vec<Line<'static>> = Vec::new();
     // `wrapTextWithAnsi` splits on newlines first (`utils.ts:839`) and wraps each piece.
     for logical in text.split('\n') {
         // The style rides on the SPAN, not the `Line` — upstream's colour is baked into the string
         // the `Text` was constructed with (`theme.fg("dim", message)`), inside the margins, so it
         // survives being nested in a `Box` that later paints `Line::style` with a background.
-        let src = Line::from(Span::styled(logical.to_string(), style));
-        for mut row in wrap_line(&src, content_width) {
-            if padding_x > 0 {
-                row.spans.insert(0, Span::raw(left.clone()));
-            }
-            out.push(row);
-        }
+        out.extend(text_lines_of(&Line::from(Span::styled(logical.to_string(), style)), width, padding_x));
     }
     out
 }

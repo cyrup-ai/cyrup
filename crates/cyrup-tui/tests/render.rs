@@ -235,10 +235,17 @@ fn ingest_events_drive_status_and_transcript() {
 
 #[test]
 fn theme_colors_reach_rendered_cells() {
-    // Dark theme accent (Pi `accent` token = #8abeb7) styles the active streaming label; assert it
-    // lands on real viewport cells (an in-flight turn stays in the viewport, unlike committed entries).
+    // The accent-styled live-region surface is the status band's spinner glyph
+    // (`status_indicator.rs:216-218`, Pi `status-indicator.ts:55-64` → `loader.ts`), which is
+    // `accent` for every kind except `Retry`. Driving the indicator (rather than a streaming turn)
+    // is deliberate: the comment this test used to carry claimed the accent came from "the active
+    // streaming label", but that label was DELETED as X1 (`user-message.ts:38-58` renders the body
+    // only) and the assertion has been surviving since on the editor's `› ` prompt glyph — a cyrup
+    // invention pi's `editor.ts:482-601` never emits, removed here as E1. An assertion whose only
+    // live subject is the thing under removal proves nothing about themes.
     let accent = Color::Rgb(0x8a, 0xbe, 0xb7);
     let mut app = App::new(TestBackend::new(40, 12), UiTheme::dark()).unwrap();
+    app.state_mut().indicator.working();
     app.transcript_mut().push_assistant_delta("colored");
     app.draw().unwrap();
     assert!(has_fg(&app, accent), "dark accent color did not reach any cell");
@@ -246,6 +253,7 @@ fn theme_colors_reach_rendered_cells() {
     // A different theme yields a different accent on the cells (Pi light `accent` = teal #5a8080).
     let light_accent = Color::Rgb(0x5a, 0x80, 0x80);
     let mut light = App::new(TestBackend::new(40, 12), UiTheme::light()).unwrap();
+    light.state_mut().indicator.working();
     light.transcript_mut().push_assistant_delta("colored");
     light.draw().unwrap();
     assert!(has_fg(&light, light_accent), "light accent color did not reach any cell");
