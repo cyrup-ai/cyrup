@@ -245,8 +245,13 @@ impl SessionSelector {
         }
     }
 
-    /// Build the body display lines for the windowed filtered list.
-    fn body_lines(&self, theme: &UiTheme, filtered: &[SessionRow]) -> Vec<Line<'static>> {
+    /// Build the body display lines for the windowed filtered list at `width` columns.
+    ///
+    /// `width` is needed for the `selectedBg` fill (S2): `session-selector.ts:505-509` builds the
+    /// row as `leftPart + " ".repeat(spacing) + styledRight` where
+    /// `spacing = max(1, width - leftWidth - rightWidth)`, so the string the fill wraps spans the
+    /// whole row — the selection reads as a full-width bar, not a ragged one ending at the label.
+    fn body_lines(&self, theme: &UiTheme, filtered: &[SessionRow], width: u16) -> Vec<Line<'static>> {
         if filtered.is_empty() {
             return vec![Line::from(Span::styled("  No sessions found", theme.muted_style()))];
         }
@@ -259,7 +264,10 @@ impl SessionSelector {
         let mut lines = Vec::new();
         for (i, row) in filtered.iter().enumerate().take(end).skip(start) {
             let is_sel = i == self.selected;
-            let cursor = if is_sel { "→ " } else { "  " };
+            // S10: the cursor glyph is U+203A `› ` (`session-selector.ts:476`
+            // `isSelected ? theme.fg("accent", "› ") : "  "`), not U+2192 `→ `. `→ ` is correct in
+            // `SelectList` (`select-list.ts:146`) — only this selector diverged.
+            let cursor = if is_sel { "› " } else { "  " };
             let style = if is_sel {
                 theme.accent_style().add_modifier(Modifier::BOLD)
             } else {
@@ -269,6 +277,21 @@ impl SessionSelector {
                 vec![Span::styled(cursor.to_string(), style), Span::styled(row.label.clone(), style)];
             if let Some(desc) = &row.desc {
                 spans.push(Span::styled(format!("  {desc}"), theme.muted_style()));
+            }
+            // S2/SYS-4: `session-selector.ts:506-508` `if (isSelected) line = theme.bg("selectedBg",
+            // line);` over the WHOLE row. Upstream's row is width-wide by construction (its
+            // right-hand metadata column is flush-right, S9); cyrup's is short, so pad to `width`
+            // before laying the fill over every span — otherwise the bar ends raggedly mid-row and
+            // a long `/resume` list gives no strong selection cue at all.
+            if is_sel {
+                let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                let pad = usize::from(width).saturating_sub(used);
+                if pad > 0 {
+                    spans.push(Span::styled(" ".repeat(pad), style));
+                }
+                for span in &mut spans {
+                    span.style = theme.selected_bg_over(span.style);
+                }
             }
             lines.push(Line::from(spans));
             if self.show_path {
@@ -307,9 +330,9 @@ impl SessionSelector {
 }
 
 impl Selector for SessionSelector {
-    fn desired_height(&self, _width: u16) -> u16 {
+    fn desired_height(&self, width: u16) -> u16 {
         let filtered = self.filtered();
-        let body = self.body_lines(&UiTheme::default(), &filtered).len() as u16;
+        let body = self.body_lines(&UiTheme::default(), &filtered, width).len() as u16;
         // top rule + header + search input + blank + body + hints + bottom rule.
         let hints = self.hint_lines(&UiTheme::default()).len() as u16;
         body.saturating_add(4).saturating_add(hints).saturating_add(2)
@@ -343,7 +366,7 @@ impl Selector for SessionSelector {
             lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
-        lines.extend(self.body_lines(theme, &filtered));
+        lines.extend(self.body_lines(theme, &filtered, area.width));
         lines.extend(self.hint_lines(theme));
         lines.push(border_rule_line(area.width, theme));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);

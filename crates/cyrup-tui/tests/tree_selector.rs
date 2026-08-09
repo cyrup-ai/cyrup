@@ -18,9 +18,9 @@ fn node(id: &str, depth: usize, label: &str, kind: TreeKind) -> TreeNode {
     n
 }
 
-/// A small DAG:
+/// A small DAG (the connector's middle cell carries the fold state — `tree-selector.ts:721-722`):
 ///   root (●)
-///   ├─⊟ model→opus (◆, foldable open)
+///   ├⊟ model→opus (◆, foldable, expanded)
 ///   │   └─ "streaming" (●)
 ///   ├─ 14 tool calls (⚙)
 ///   └─ "fix footer" (●, labeled)
@@ -70,7 +70,15 @@ fn renders_connectors_glyphs_and_fold_markers() {
     assert!(text.contains('◆'), "model-change glyph");
     assert!(text.contains('⚙'), "tool-group glyph");
     assert!(text.contains("├─") || text.contains("└─"), "connectors: {text}");
-    assert!(text.contains('⊟'), "open-fold marker for the foldable node");
+    // S24 (corrected): pi draws the fold state INSIDE the connector — `tree-selector.ts:722`
+    //   `prefixChars.push(isFolded ? "⊞" : foldable ? "⊟" : "─");`
+    // at `posInLevel === 1`, i.e. in place of the `─` of the node's own `├─ `. `model -> opus` is
+    // depth-1, foldable and expanded, and is not the last child, so its connector is exactly `├⊟ `.
+    // The separate `foldMarker` at `:734` is the connector-LESS fallback (`!showsFoldInConnector`),
+    // not evidence that pi never emits `⊟`.
+    assert!(text.contains("├⊟ "), "expanded foldable node must render `├⊟ `: {text}");
+    // Nothing is folded, so neither fold glyph may appear as `⊞`.
+    assert!(!text.contains('\u{229e}'), "folded marker `⊞` present with nothing folded: {text}");
     assert!(text.contains("☆labeled"), "label star on the labeled node");
 }
 

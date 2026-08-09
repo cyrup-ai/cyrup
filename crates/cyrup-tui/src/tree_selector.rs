@@ -420,13 +420,25 @@ impl TreeSelector {
 
     /// Build the connector prefix for `node` at `nodes` index `idx` (depth-0 has none). Uses the
     /// "is this the last child of its parent" relation derived from the flat pre-order list.
+    ///
+    /// **The fold state lives INSIDE the connector.** Upstream builds the prefix one character at a
+    /// time over `totalChars = displayIndent * 3` (`tree-selector.ts:701-729`); at the node's own
+    /// connector level the three cells are
+    ///
+    /// * `posInLevel === 0` → `flatNode.isLast ? "└" : "├"` (`:719`)
+    /// * `posInLevel === 1` → `isFolded ? "⊞" : foldable ? "⊟" : "─"` (`:721-722`)
+    /// * `posInLevel === 2` → `" "` (`:724`)
+    ///
+    /// so a foldable-and-expanded child renders `├⊟ `, a folded one `├⊞ `, and a leaf `├─ `. The
+    /// whole prefix is then styled `theme.fg("dim", prefix)` (`:746`), which is why the fold cell is
+    /// dim here rather than accent — only the connector-less fallback marker at `:734` is accent.
     fn connector_prefix(&self, idx: usize) -> String {
         let Some(node) = self.nodes.get(idx) else { return String::new() };
         if node.depth == 0 {
             return String::new();
         }
         // For each ancestor level 1..depth, draw `│  ` if that ancestor has a following sibling,
-        // else three spaces; then the node's own `├─ `/`└─ `.
+        // else three spaces; then the node's own `├`/`└` + fold cell + ` `.
         let mut prefix = String::new();
         for level in 1..node.depth {
             if self.ancestor_has_following_sibling(idx, level) {
@@ -435,11 +447,16 @@ impl TreeSelector {
                 prefix.push_str("   ");
             }
         }
-        if self.is_last_child(idx) {
-            prefix.push_str("└─ ");
+        prefix.push(if self.is_last_child(idx) { '└' } else { '├' });
+        // `:722` verbatim — `isFolded` is tested FIRST and independently of `foldable`.
+        prefix.push(if node.folded {
+            '⊞'
+        } else if node.foldable {
+            '⊟'
         } else {
-            prefix.push_str("├─ ");
-        }
+            '─'
+        });
+        prefix.push(' ');
         prefix
     }
 
@@ -487,15 +504,33 @@ impl TreeSelector {
             let Some(node) = self.nodes.get(idx) else { continue };
             let is_sel = row == self.selected;
             let mut spans: Vec<Span<'static>> = Vec::new();
-            // Connector prefix.
+            // Cursor gutter — `tree-selector.ts:689`:
+            //   `const cursor = isSelected ? theme.fg("accent", "› ") : "  ";`
+            // Upstream keeps this as a fixed 2-column gutter (`TREE_GUTTER_WIDTH`, `:49`) that the
+            // horizontal viewport never clips (`:84-89`).
+            spans.push(if is_sel {
+                Span::styled("› ".to_string(), theme.accent_style())
+            } else {
+                Span::raw("  ")
+            });
+            // Connector prefix — this is also where the FOLD STATE is drawn (`:721-722`); see
+            // `connector_prefix`.
             let prefix = self.connector_prefix(idx);
-            if !prefix.is_empty() {
+            let shows_fold_in_connector = !prefix.is_empty();
+            if shows_fold_in_connector {
                 spans.push(Span::styled(prefix, theme.dim_style()));
             }
-            // Fold marker.
-            if node.foldable {
-                let marker = if node.folded { "⊞ " } else { "⊟ " };
-                spans.push(Span::styled(marker, theme.muted_style()));
+            // The connector-less FALLBACK fold marker — `tree-selector.ts:733-734`:
+            //   const showsFoldInConnector = flatNode.showConnector && !flatNode.isVirtualRootChild;
+            //   const foldMarker = isFolded && !showsFoldInConnector ? theme.fg("accent", "⊞ ") : "";
+            //
+            // `!showsFoldInConnector` means "the connector did NOT already show the fold state", so
+            // this branch is reached only by a node that HAS NO CONNECTOR — depth 0 here, a root or
+            // a virtual-root child upstream. It is a fallback, not the general case, and it only
+            // ever emits the FOLDED glyph: an expanded connector-less node draws nothing, because
+            // there is no cell to put `⊟` in.
+            if node.folded && !shows_fold_in_connector {
+                spans.push(Span::styled("⊞ ", theme.accent_style()));
             }
             // Glyph + label.
             let glyph_style = if is_sel { theme.accent_style() } else { theme.base_style() };
@@ -509,12 +544,20 @@ impl TreeSelector {
             if node.has_label {
                 spans.push(Span::styled("  ☆labeled".to_string(), theme.warning_style()));
             }
-            // Right-aligned time column + selected marker.
+            // Right-aligned label-timestamp column.
+            //
+            // S37: this used to ALSO render a `◀ selected` marker on the highlighted row, padded
+            // flush right. There is no upstream analog — `git grep '◀' v0.84.1 -- packages/` finds
+            // nothing anywhere in pi, and `renderHorizontalViewport` (`tree-selector.ts:85-91`)
+            // emits `row.gutter + row.body` truncated to `width` with no right-hand padding at all,
+            // so an upstream row is exactly as wide as its content. The marker was a cyrup
+            // invention that (a) added text pi never draws and (b) padded the row out to `width`,
+            // which is what made the `selectedBg` fill below look full-width. It is removed; the
+            // selection is indicated the way upstream indicates it — the `› ` cursor at `:689` plus
+            // the fill at `:750-753`.
             let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
             let mut right = String::new();
-            if is_sel {
-                right.push_str("◀ selected");
-            } else if self.show_time
+            if self.show_time
                 // Pi's render condition in full (`tree-selector.ts:741-743`): the column is a
                 // *label* timestamp, so an entry with no label never shows one even when the toggle
                 // is on and a timestamp happens to be attached.
@@ -528,6 +571,19 @@ impl TreeSelector {
                 spans.push(Span::raw(" ".repeat(pad + 1)));
                 let style = if is_sel { theme.accent_style() } else { theme.dim_style() };
                 spans.push(Span::styled(right, style));
+            }
+            // S2/SYS-4: the selected row carries the `selectedBg` fill. `tree-selector.ts:750-753`
+            //     if (isSelected) { gutter = theme.bg("selectedBg", gutter); body = theme.bg("selectedBg", body); }
+            // wraps the already-styled gutter and body — the fill is laid OVER the per-span
+            // foregrounds, it does not replace them, and it stops at the end of the body: upstream
+            // does NOT pad the row out to `width` (`:85-91`), so the bar is content-wide, not
+            // full-width. This is one of only two places upstream fills a selection background;
+            // cyrup previously drew it in `SelectList`, where upstream never does, and omitted it
+            // here.
+            if is_sel {
+                for span in &mut spans {
+                    span.style = theme.selected_bg_over(span.style);
+                }
             }
             lines.push(Line::from(spans));
         }

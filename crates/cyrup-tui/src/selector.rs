@@ -196,6 +196,59 @@ impl SelectorKind {
             SelectorKind::ExtensionEditor => "Editor",
         }
     }
+
+    /// Whether the pi component this kind stands in for builds a keyboard-hint row of its own.
+    ///
+    /// S3 (corrected): the hint row is **not** a property of pi's shared list engine — `SelectList`
+    /// (`packages/tui/src/components/select-list.ts`) contains no hint code at all. It is built by
+    /// individual components, and at v0.84.1 exactly two build the
+    /// `rawKeyHint("↑↓","navigate") + keyHint(confirm,…) + keyHint(cancel,…)` row:
+    ///
+    /// * `ExtensionSelectorComponent` (`extension-selector.ts:63-73`) — "select"/"cancel". Four
+    ///   cyrup kinds route through it: [`Self::ExtensionSelect`] and [`Self::BranchSummary`] via
+    ///   `showExtensionSelector`, [`Self::ExtensionConfirm`] via `showExtensionConfirm`
+    ///   (`interactive-mode.ts:2172-2179`), and [`Self::LoginAuthType`], which constructs one
+    ///   directly (`interactive-mode.ts:5286-5289`).
+    /// * `TrustSelectorComponent` (`trust-selector.ts:75-85`) — the same row but with **"save"**
+    ///   rather than "select". cyrup's `/trust` is [`crate::settings_selector`]'s bespoke selector,
+    ///   not a `ListSelector`, so this generic row never reaches it and porting that hint is left
+    ///   as its own item (S40).
+    ///
+    /// Every other kind's component draws no such row: `ThinkingSelectorComponent`
+    /// (`thinking-selector.ts:42-69`), `ShowImagesSelectorComponent`
+    /// (`show-images-selector.ts:25-44`) and `ThemeSelectorComponent` (`theme-selector.ts:35-61`)
+    /// are `DynamicBorder` + `SelectList` + `DynamicBorder` and nothing else;
+    /// `OAuthSelectorComponent` (`/login`, `/logout`) and `UserMessageSelectorComponent` (`/fork`)
+    /// contain no `keyHint` call at all.
+    pub fn draws_hint_row(self) -> bool {
+        matches!(
+            self,
+            SelectorKind::ExtensionSelect
+                | SelectorKind::ExtensionConfirm
+                | SelectorKind::BranchSummary
+                | SelectorKind::LoginAuthType
+        )
+    }
+
+    /// Whether the pi component this kind stands in for wraps its rows in a `paddingX = 1`
+    /// `Text`/`TruncatedText`, i.e. insets them one column.
+    ///
+    /// S28 (corrected): same story as [`Self::draws_hint_row`] — the inset belongs to the
+    /// *component*, not to `SelectList`. The components that inset are the four
+    /// `ExtensionSelectorComponent` kinds (`extension-selector.ts:87` `new Text(text, 1, 0)`) and
+    /// `OAuthSelectorComponent` (`oauth-selector.ts:144` `new TruncatedText(line, 1, 0)`, and
+    /// `:149`/`:160` for its scroll indicator and empty state).
+    ///
+    /// The components that add a `SelectList` straight to the container — thinking, show-images,
+    /// theme — pass it the container's full width, and `/fork`'s `UserMessageList`
+    /// (`user-message-selector.ts:140`) is added unwrapped too. Those rows start at column 0.
+    ///
+    /// The one-column figure is `Text`'s own: `contentWidth = max(1, width - paddingX * 2)`
+    /// (`packages/tui/src/components/text.ts:64`) with a matching left and right margin at
+    /// `:70-76`, which is why the render below narrows the body by **2** and not by 1.
+    pub fn insets_rows(self) -> bool {
+        self.draws_hint_row() || matches!(self, SelectorKind::Login | SelectorKind::Logout)
+    }
 }
 
 /// The routing outcome of feeding one key to the active selector (spec/tui/05 §3.1
@@ -289,6 +342,15 @@ pub struct ListSelector {
     preview: bool,
     /// An optional bold title rendered between the top rule and the list (`*-selector.ts` headers).
     title: Option<String>,
+    /// The live selector bindings, so the hint row names the keys the user actually has bound
+    /// (`keyHint` → `keyText` → `getKeybindings().getKeys(...)`, `keybinding-hints.ts:34-44`).
+    /// Defaults to the stock table; [`ListSelector::with_hints`] adopts the app's merged one, and
+    /// [`Selector::handle`] refreshes it from whatever keymap actually routed the key.
+    keymap: SelectKeymap,
+    /// Whether to draw the keyboard-hint row — OPT-IN, see [`SelectorKind::draws_hint_row`].
+    hints: bool,
+    /// Whether to inset the body one column — OPT-IN, see [`SelectorKind::insets_rows`].
+    inset: bool,
 }
 
 impl ListSelector {
@@ -310,7 +372,15 @@ impl ListSelector {
         let mut list = SelectList::new(items, ColumnLayout::SLASH);
         list.set_max_visible(max_visible);
         list.set_selected(selected);
-        ListSelector { list, values, preview, title: None }
+        ListSelector {
+            list,
+            values,
+            preview,
+            title: None,
+            keymap: SelectKeymap::default(),
+            hints: false,
+            inset: false,
+        }
     }
 
     /// A data-bound selector (`model`/`session`/`tree`/… — `*-selector.ts`): build the windowed list
@@ -333,7 +403,15 @@ impl ListSelector {
         let mut list = SelectList::new(items, ColumnLayout::SLASH).with_no_match(empty);
         list.set_max_visible(10);
         list.set_selected(selected);
-        ListSelector { list, values, preview: false, title: Some(kind.title().to_string()) }
+        ListSelector {
+            list,
+            values,
+            preview: false,
+            title: Some(kind.title().to_string()),
+            keymap: SelectKeymap::default(),
+            hints: false,
+            inset: false,
+        }
     }
 
     /// A generic titled prompt (Pi `showStartupSelector`, startup-ui.ts:134-163): the pre-launch
@@ -345,6 +423,68 @@ impl ListSelector {
         let mut selector = ListSelector::new(rows, count, selected, false);
         selector.title = Some(title);
         selector
+    }
+
+    /// **Opt in** to the keyboard-hint row, binding it to the app's live `tui.select.*` table so it
+    /// names the keys the user has actually bound rather than the stock defaults (`keyHint`
+    /// resolves through `keyText` on every render upstream, `keybinding-hints.ts:34-44`).
+    ///
+    /// Only the kinds whose pi component builds such a row may call this — see
+    /// [`SelectorKind::draws_hint_row`] for the enumeration and the source lines behind it.
+    /// [`Self::with_upstream_chrome`] applies it per-kind and is what callers normally want.
+    pub fn with_hints(mut self, keymap: &SelectKeymap) -> Self {
+        self.keymap = keymap.clone();
+        self.hints = true;
+        self
+    }
+
+    /// **Opt in** to the one-column row inset — see [`SelectorKind::insets_rows`].
+    pub fn with_inset(mut self) -> Self {
+        self.inset = true;
+        self
+    }
+
+    /// Apply exactly the chrome the pi component behind `kind` draws: the hint row iff
+    /// [`SelectorKind::draws_hint_row`], the one-column inset iff [`SelectorKind::insets_rows`].
+    ///
+    /// This is the single place the per-kind decision is made. It exists because the previous batch
+    /// made both a property of the shared [`ListSelector`] engine, which gave every dialog chrome
+    /// that upstream draws on four of them (hint row) and six (inset) — `ThinkingSelectorComponent`
+    /// is 75 lines of `DynamicBorder` + `SelectList` + `DynamicBorder` and has neither.
+    pub fn with_upstream_chrome(mut self, kind: SelectorKind, keymap: &SelectKeymap) -> Self {
+        if kind.draws_hint_row() {
+            self = self.with_hints(keymap);
+        }
+        if kind.insets_rows() {
+            self = self.with_inset();
+        }
+        self
+    }
+
+    /// The keyboard-hint row Pi's `ExtensionSelectorComponent` puts above the bottom border
+    /// (`extension-selector.ts:63-73`): `rawKeyHint("↑↓","navigate") + "  " +
+    /// keyHint("tui.select.confirm","select") + "  " + keyHint("tui.select.cancel","cancel")`,
+    /// rendered as `new Text(..., 1, 0)` so it is inset one column.
+    ///
+    /// Each pair is two-tone — `dim` key, `muted` description (`keybinding-hints.ts:42-44`) — via
+    /// [`crate::chrome::key_hint_spans`]. Keys come from [`SelectKeymap::keys_label`], which joins
+    /// **all** bound keys with `/` exactly as upstream's `keyText` does, so the stock cancel hint
+    /// reads `escape/ctrl+c cancel`, not just the first key.
+    ///
+    /// The `Spacer(1)` rows upstream places either side of this row are L4/SYS-3 and land with the
+    /// rest of the dialog-envelope work; this adds the hint row itself.
+    fn hint_line(&self, theme: &UiTheme) -> Line<'static> {
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(crate::chrome::key_hint_spans("↑↓", "navigate", theme));
+        if let Some(keys) = self.keymap.keys_label(SelectAction::Confirm) {
+            spans.push(Span::raw("  "));
+            spans.extend(crate::chrome::key_hint_spans(&keys, "select", theme));
+        }
+        if let Some(keys) = self.keymap.keys_label(SelectAction::Cancel) {
+            spans.push(Span::raw("  "));
+            spans.extend(crate::chrome::key_hint_spans(&keys, "cancel", theme));
+        }
+        Line::from(spans)
     }
 
     /// The value of the currently-highlighted row (empty string if the list is empty — never panics).
@@ -414,18 +554,26 @@ impl ListSelector {
 
 impl Selector for ListSelector {
     fn desired_height(&self, width: u16) -> u16 {
-        // Top `DynamicBorder` + optional (now auto-sizing, wrapped) title + list body + bottom
-        // `DynamicBorder` (spec/tui/05 §3).
+        // Top `DynamicBorder` + optional (now auto-sizing, wrapped) title + list body + the hint row
+        // **when this kind draws one** + bottom `DynamicBorder` (spec/tui/05 §3;
+        // `extension-selector.ts:44-75`).
         let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, width));
-        self.list.rendered_height().saturating_add(2).saturating_add(title_h)
+        let hint_h = u16::from(self.hints);
+        self.list
+            .rendered_height()
+            .saturating_add(2)
+            .saturating_add(hint_h)
+            .saturating_add(title_h)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, area.width));
-        let [top, title_area, body, bottom] = Layout::vertical([
+        let hint_h = u16::from(self.hints);
+        let [top, title_area, body, hint, bottom] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(title_h),
             Constraint::Min(0),
+            Constraint::Length(hint_h),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -439,12 +587,43 @@ impl Selector for ListSelector {
                 title_area,
             );
         }
-        let lines = self.list.lines(body.width, theme);
+        // S28: where the pi component wraps its rows in `new Text(text, 1, 0)`
+        // (`extension-selector.ts:87`) / `new TruncatedText(line, 1, 0)` (`oauth-selector.ts:144`),
+        // the row gets a one-column left margin and a matching right one, and the list is laid out
+        // in `contentWidth = max(1, width - paddingX * 2)` (`text.ts:64,70-76`) — hence `-2` here
+        // and a single leading space. That reduced width is also what the two-column gate
+        // (`select-list.ts:149` `width > 40`) then sees, which is correct for these kinds and
+        // WRONG for the others: thinking / show-images / theme add the `SelectList` straight to the
+        // container (`thinking-selector.ts:66`), so it is laid out at the full container width and
+        // its rows start at column 0. Applying the inset unconditionally moved that gate by two
+        // columns on every dialog.
+        let lines = if self.inset {
+            self.list
+                .lines(body.width.saturating_sub(2), theme)
+                .into_iter()
+                .map(|line| {
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(line.spans);
+                    Line::from(spans)
+                })
+                .collect()
+        } else {
+            self.list.lines(body.width, theme)
+        };
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), body);
+        if self.hints {
+            frame.render_widget(
+                Paragraph::new(vec![self.hint_line(theme)]).style(theme.base_style()),
+                hint,
+            );
+        }
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
+        // Keep the hint row honest even for a selector constructed without `with_keymap`: adopt
+        // whatever table actually routed this key.
+        self.keymap = keymap.clone();
         match keymap.action_for(key) {
             Some(SelectAction::Up) | Some(SelectAction::PageUp) => {
                 self.list.select_up();

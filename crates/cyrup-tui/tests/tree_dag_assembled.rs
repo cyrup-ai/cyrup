@@ -4,7 +4,8 @@
 //! open the `/tree` selector in the assembled app over a **multi-branch** node set shaped exactly like
 //! `session_dag` → `tree_node_from_dag` produces (a foldable root with two child branches, one nested)
 //! and assert the rendered buffer carries branch **connectors** (`├─`/`└─`), **more than one node**,
-//! and **fold markers** (`⊟`/`⊞`) — the whole tree, not a flat list (Pi `tree-selector.ts:691-727`).
+//! and the **fold state in the connector** (`├⊟ ` expanded, `├⊞ ` folded — `tree-selector.ts:722`)
+//! — the whole tree, not a flat list (Pi `tree-selector.ts:691-727`).
 //!
 //! The getter itself is proven over a REAL multi-branch `AgentSession` in
 //! `cyrup-session-svc/tests/session_dag.rs`; this test proves the assembled TUI render of that data.
@@ -75,8 +76,18 @@ fn assembled_tree_open_shows_connectors_multiple_nodes_and_fold_markers() {
         screen.contains("├─") || screen.contains("└─"),
         "branch connectors (├─/└─) missing — tree rendered flat:\n{screen}"
     );
-    // (fold markers) the foldable nodes draw an open-fold `⊟` marker.
-    assert!(screen.contains('⊟'), "fold marker `⊟` missing from foldable nodes:\n{screen}");
+    // (fold state) S24 (corrected): the fold cell lives in the CONNECTOR — `tree-selector.ts:722`
+    // `prefixChars.push(isFolded ? "⊞" : foldable ? "⊟" : "─")`. `user: wire up streaming` is a
+    // depth-1 foldable node with a following sibling, so pi renders its connector as `├⊟ `.
+    assert!(
+        screen.contains("├⊟ "),
+        "expanded foldable node must render its connector as `├⊟ `:\n{screen}"
+    );
+    // …and with nothing folded, the folded glyph appears nowhere.
+    assert!(
+        !screen.contains('\u{229e}'),
+        "folded marker `⊞` present with nothing folded:\n{screen}"
+    );
     // The header proves the tree selector (not a plain list) owns the slot.
     assert!(screen.contains("Session Tree"), "tree header missing:\n{screen}");
 }
@@ -87,7 +98,14 @@ fn assembled_tree_fold_toggles_marker_in_the_render() {
     let tree = TreeSelector::new(multi_branch_nodes());
     app.open_boxed_selector(SelectorKind::Tree, Box::new(tree));
     app.draw().unwrap();
-    assert!(buf_text(&app).contains('⊟'), "expected an open-fold marker before folding");
+    // A POSITIVE pre-fold anchor. The previous form asserted the ABSENCE of `⊞`, which held in the
+    // fixed and the reverted world alike (the reverted code drew `⊟`, not `⊞`) and so anchored
+    // nothing. The depth-1 foldable node renders `├⊟ ` while expanded (`tree-selector.ts:722`).
+    assert!(
+        buf_text(&app).contains("├⊟ "),
+        "expected the expanded foldable node's `├⊟ ` connector before folding:\n{}",
+        buf_text(&app)
+    );
 
     // `z` folds the highlighted (root) node → its subtree collapses and the marker flips to `⊞`.
     app.handle_input(&key(KeyCode::Char('z')));

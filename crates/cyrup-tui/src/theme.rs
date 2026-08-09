@@ -493,9 +493,22 @@ impl UiTheme {
         }
     }
 
-    /// Selected-row fill in selectors (`selectedBg`, select-list.ts:160-162).
-    pub fn selected_bg_style(&self) -> Style {
-        self.with_bg(self.accent_style(), "selectedBg")
+    /// Selected-row fill (`selectedBg`) laid over an arbitrary foreground style.
+    ///
+    /// SYS-4 (TUI-FIDELITY §5): upstream paints a selection background in exactly **two**
+    /// components — `tree-selector.ts:750-753` (`gutter` and `body`) and `session-selector.ts:506-508`
+    /// (the whole row) — and in neither case does it replace the row's foreground colours. It never
+    /// fills in `SelectList` at all (`git grep selectedBg v0.84.1 -- packages/tui` is empty).
+    /// Callers therefore build their spans first and lay the fill over each one, rather than
+    /// swapping in a single style.
+    /// S39: the old `selected_bg_style()` — `selectedBg` over the accent foreground, as a single
+    /// ready-made style — is gone. After SYS-4 moved the fill out of `SelectList` it had **zero**
+    /// callers under `src/`; being `pub`, nothing would have flagged it. Both remaining fill sites
+    /// (`tree_selector.rs`, `session_selector.rs`) need the layering form above, because upstream
+    /// wraps already-styled text (`theme.bg("selectedBg", body)`) rather than replacing its style.
+    /// Callers that only want the colour ask for `selected_bg_over(Style::default()).bg`.
+    pub fn selected_bg_over(&self, style: Style) -> Style {
+        self.with_bg(style, "selectedBg")
     }
 
     /// User-message block: `userMessageBg` fill **and** `userMessageText` foreground.

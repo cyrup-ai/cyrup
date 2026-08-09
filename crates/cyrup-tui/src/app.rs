@@ -1846,20 +1846,41 @@ impl<B: Backend> App<B> {
     /// theme so a cancel can restore it. Idempotent-ish: opening replaces any already-open selector.
     pub fn open_selector(&mut self, kind: SelectorKind) {
         let saved_editor = self.state.editor.text();
+        // `with_upstream_chrome` applies the hint row / one-column inset ONLY for the kinds whose
+        // pi component builds them (`SelectorKind::draws_hint_row` / `insets_rows`). Thinking,
+        // show-images and theme are `DynamicBorder` + `SelectList` + `DynamicBorder` upstream and
+        // get neither.
         let (inner, restore_theme): (Box<dyn Selector>, Option<UiTheme>) = match kind {
-            SelectorKind::Thinking => {
-                (Box::new(ListSelector::thinking(&self.state.thinking_level)), None)
-            }
-            SelectorKind::ShowImages => {
-                (Box::new(ListSelector::show_images(self.state.show_images)), None)
-            }
+            SelectorKind::Thinking => (
+                Box::new(ListSelector::thinking(&self.state.thinking_level).with_upstream_chrome(
+                    kind,
+                    &self.state.select_keymap,
+                )),
+                None,
+            ),
+            SelectorKind::ShowImages => (
+                Box::new(ListSelector::show_images(self.state.show_images).with_upstream_chrome(
+                    kind,
+                    &self.state.select_keymap,
+                )),
+                None,
+            ),
             SelectorKind::Theme => (
-                Box::new(ListSelector::theme(&self.state.theme.name)),
+                Box::new(
+                    ListSelector::theme(&self.state.theme.name)
+                        .with_upstream_chrome(kind, &self.state.select_keymap),
+                ),
                 Some(self.state.theme.clone()),
             ),
             // Data-bound selectors must be opened via `open_data_selector` (they need L5 rows);
             // opening one with no data yields an empty-state list rather than a panic.
-            other => (Box::new(ListSelector::data(other, Vec::new(), 0)), None),
+            other => (
+                Box::new(
+                    ListSelector::data(other, Vec::new(), 0)
+                        .with_upstream_chrome(other, &self.state.select_keymap),
+                ),
+                None,
+            ),
         };
         self.state.selector = Some(ActiveSelector { kind, inner, saved_editor, restore_theme });
     }
@@ -1875,7 +1896,10 @@ impl<B: Backend> App<B> {
         selected: usize,
     ) {
         let saved_editor = self.state.editor.text();
-        let inner: Box<dyn Selector> = Box::new(ListSelector::data(kind, rows, selected));
+        let inner: Box<dyn Selector> = Box::new(
+            ListSelector::data(kind, rows, selected)
+                .with_upstream_chrome(kind, &self.state.select_keymap),
+        );
         self.state.selector =
             Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None });
     }
@@ -2475,7 +2499,10 @@ impl<B: Backend> App<B> {
         let title = SelectorKind::BranchSummary.title().to_string();
         self.open_boxed_selector(
             SelectorKind::BranchSummary,
-            Box::new(ListSelector::prompt(title, rows, 0)),
+            Box::new(ListSelector::prompt(title, rows, 0).with_upstream_chrome(
+                SelectorKind::BranchSummary,
+                &self.state.select_keymap,
+            )),
         );
     }
 
@@ -2640,7 +2667,10 @@ impl<B: Backend> App<B> {
                 (
                     SelectorKind::ExtensionConfirm,
                     title.clone(),
-                    Box::new(ListSelector::prompt(title, rows, 0)),
+                    Box::new(ListSelector::prompt(title, rows, 0).with_upstream_chrome(
+                        SelectorKind::ExtensionConfirm,
+                        &self.state.select_keymap,
+                    )),
                 )
             }
             UiKind::Select => {
@@ -2662,7 +2692,10 @@ impl<B: Backend> App<B> {
                 (
                     SelectorKind::ExtensionSelect,
                     prompt.clone(),
-                    Box::new(ListSelector::prompt(prompt, rows, 0)),
+                    Box::new(ListSelector::prompt(prompt, rows, 0).with_upstream_chrome(
+                        SelectorKind::ExtensionSelect,
+                        &self.state.select_keymap,
+                    )),
                 )
             }
             UiKind::Input => (
