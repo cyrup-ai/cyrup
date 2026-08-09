@@ -698,6 +698,13 @@ struct Decoder {
     /// derived `Default` now starts. It previously seeded `Stop`, so a Mistral stream that ended
     /// without a truthy `finishReason` was transcribed as a cleanly completed turn (PROV-010).
     stop_reason: Option<StopReason>,
+    /// The choice's own `finishReason`, kept verbatim beside the narrowed [`StopReason`] (pi
+    /// `output.rawStopReason = choice.finishReason`,
+    /// `v0.84.1 ai/src/api/mistral-conversations.ts:356`). PORT BUG, not version lag: the write is
+    /// present at v0.83.0 too, at the same line (`v0.83.0
+    /// ai/src/api/mistral-conversations.ts:356`), and cyrup never ported it. Written under the same
+    /// truthiness guard pi uses (`:355`), so a `null`/`""` `finishReason` leaves it unset.
+    raw_stop_reason: Option<String>,
     error_message: Option<String>,
 }
 
@@ -718,7 +725,9 @@ impl Decoder {
             // TERMINAL event never takes this value: it goes through
             // `StreamEvent::end_of_stream`, which routes `None`/`Pending` to the `error` terminal.
             stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
+            deferred: None,
             error_message: self.error_message.clone(),
+            raw_stop_reason: self.raw_stop_reason.clone(),
             timestamp: now_millis(),
         }
     }
@@ -868,6 +877,9 @@ async fn process_chunk(
         .and_then(Value::as_str)
         .filter(|r| !r.is_empty())
     {
+        // pi records the raw reason first (`v0.84.1 ai/src/api/mistral-conversations.ts:356`), so a
+        // `content_filter` / future reason names itself on the turn even after the narrowing map.
+        dec.raw_stop_reason = Some(reason.to_string());
         let (stop, err) = map_chat_stop_reason(Some(reason));
         dec.stop_reason = Some(stop);
         if let Some(err) = err {
@@ -1599,6 +1611,43 @@ mod tests {
         assert_eq!(n.normalize("call_abc/def!"), a);
         // an already-9-char alphanumeric id passes through unchanged.
         assert_eq!(n.normalize("abcdefghi"), "abcdefghi");
+    }
+
+    /// PORT BUG (present at v0.83.0, never ported): pi writes
+    /// `output.rawStopReason = choice.finishReason`
+    /// (`v0.84.1 ai/src/api/mistral-conversations.ts:356`, same line at v0.83.0). cyrup filled
+    /// `raw_stop_reason: None`, so a `content_filter` stop and an unrecognized future reason were
+    /// indistinguishable once both collapsed into [`StopReason::Error`].
+    #[tokio::test]
+    async fn a_finish_reason_is_recorded_raw_beside_the_narrowed_one() {
+        let m = model_with("codestral-latest", false);
+
+        let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n";
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {:?}", events.last());
+        };
+        assert_eq!(error.raw_stop_reason.as_deref(), Some("content_filter"));
+
+        // MIRROR 1: a clean `stop` keeps its raw word on the `done` terminal.
+        let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finishReason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.raw_stop_reason.as_deref(), Some("stop"));
+
+        // MIRROR 2: pi's guard is `if (choice.finishReason)` (`:355`), so a null one assigns
+        // nothing — the field stays absent on the truncation terminal.
+        let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finishReason\":null}]}\n\ndata: [DONE]\n\n";
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let last = events.last().expect("a terminal");
+        assert_eq!(
+            last.terminal_message()
+                .and_then(|t| t.raw_stop_reason.clone()),
+            None
+        );
     }
 
     async fn collect(frames_bytes: Vec<u8>, m: &Model) -> Vec<StreamEvent> {

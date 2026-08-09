@@ -151,10 +151,13 @@ impl From<ThinkingLevel> for ModelThinkingLevel {
 /// not absorbed.
 ///
 /// The cost of that strictness is that an unknown value fails `Deserialize`. On the session-load
-/// path `cyrup_session::manager::load` catches the error, keeps the valid prefix and raises its
-/// `recovered` flag (which stops the caller from rewriting the file), so nothing is destroyed — but
-/// the dropped entry is not reported to the user. That gap is in `load`, not in this enum, and
-/// widening the enum would hide it rather than close it.
+/// path that failure is absorbed one level up rather than propagated: `cyrup_session::Entry`'s
+/// `Deserialize` (`entry.rs:262-285`) falls back to `Entry::Unknown(Value)` when a known-tag line
+/// does not fit the strict schema, so the line survives verbatim and `manager::load`'s `recovered`
+/// flag is never raised for it. Nothing is destroyed — but the entry stops being interpretable
+/// (`entries_have_assistant` answers `false` for it, `manager.rs:826-831`), so a genuinely new
+/// upstream stop reason must still be added HERE to be understood. Widening the enum with a
+/// tolerant catch-all would not fix that; it would only make the misunderstanding silent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {
@@ -166,6 +169,23 @@ pub enum StopReason {
     ToolUse,
     Error,
     Aborted,
+    /// The provider accepted the request and returned a durable handle instead of a completed turn
+    /// (Pi `"deferred"`, added in v0.84.0 — `v0.84.1 ai/src/types.ts:391`; absent at v0.83.0's
+    /// otherwise identical `types.ts:391`).
+    ///
+    /// It is a **success** terminal, not an error: Pi narrows the `done` event's reason to
+    /// `Extract<StopReason, "stop" | "length" | "toolUse" | "deferred">`
+    /// (`v0.84.1 ai/src/types.ts:527-531`), so [`crate::StopReason::Deferred`] maps to a `done`
+    /// event carrying an assistant message whose `content` is empty and whose payload is the
+    /// [`DeferredHandle`] in [`AssistantMessage::deferred`].
+    ///
+    /// cyrup does not yet PRODUCE one — no cyrup wire api implements Pi's optional
+    /// `fetchDeferred`/`cancelDeferred` (`v0.84.1 ai/src/types.ts:271-276`), and upstream's only
+    /// producer is the faux test provider (`v0.84.1 ai/src/providers/faux.ts:293-305,524`), every
+    /// real provider throwing `"Provider ${model.provider} does not support deferred responses"`
+    /// (`v0.84.1 ai/src/models.ts:714,728`). The variant exists so a Pi-written session containing
+    /// one loads, retains its handle, and re-exports unchanged (R-00-013).
+    Deferred,
 }
 
 impl StopReason {
@@ -439,16 +459,72 @@ pub struct AssistantMessage {
     pub diagnostics: Option<Vec<AssistantMessageDiagnostic>>,
     pub usage: Usage,
     pub stop_reason: StopReason,
+    /// The durable provider handle that accompanies [`StopReason::Deferred`] (Pi
+    /// `deferred?: DeferredHandle`, `v0.84.1 ai/src/types.ts:424`). Present iff `stop_reason` is
+    /// `Deferred` in practice; the type does not enforce that because Pi does not either — its
+    /// harness reducer *validates* the pairing at load time and hard-fails a session whose deferred
+    /// entry lacks a handle (`v0.84.1 agent/src/harness/reducer.ts:274-281`), rather than making it
+    /// unrepresentable.
+    ///
+    /// **Boxed** because it is large (~150 bytes) and, in a port that cannot yet produce one,
+    /// essentially always `None`: inline it would push `Message::Assistant` 247 bytes past its
+    /// nearest sibling variant and trip `clippy::large_enum_variant`, taxing every `Message` in
+    /// every transcript for a field nothing sets. `Box` is transparent to serde, so the wire bytes
+    /// are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub deferred: Option<Box<DeferredHandle>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error_message: Option<String>,
+    /// The provider's own terminal-reason token, verbatim and unmapped (Pi
+    /// `rawStopReason?: string`, `v0.84.1 ai/src/types.ts:426` — and already present, at the same
+    /// line, in `v0.83.0 ai/src/types.ts:411`).
+    ///
+    /// Pi populates it on essentially every settled turn from a streaming api: Anthropic
+    /// `event.delta.stop_reason` (`anthropic-messages.ts:709`), Google `candidate.finishReason`
+    /// (`google-generative-ai.ts:215`), Mistral `choice.finishReason`
+    /// (`mistral-conversations.ts:356`), OpenAI-completions `choice.finish_reason`
+    /// (`openai-completions.ts:459`) and OpenAI-responses `response.status`
+    /// (`openai-responses-shared.ts:567,721`) — line numbers at v0.83.0, unchanged in kind at
+    /// v0.84.1. cyrup does not set it yet on any decoder, but it MUST round-trip: a Pi-written
+    /// session file carries it on every assistant entry, and dropping it on re-export is silent
+    /// loss of the only record of what the provider actually said (R-00-013).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_stop_reason: Option<String>,
     pub timestamp: i64,
+}
+
+/// A durable provider token identifying an in-flight request that will be completed later (Pi
+/// `DeferredHandle`, `v0.84.1 ai/src/types.ts:395-404`; the type does not exist at v0.83.0).
+///
+/// Carried by an [`AssistantMessage`] whose `stop_reason` is [`StopReason::Deferred`]. Every field
+/// is Pi's, in Pi's declaration order; unknown keys are tolerated on read the way Pi's erased TS
+/// types tolerate them, and `data` preserves whatever provider-specific conversion payload the
+/// upstream stored (`JsonValue` in Pi).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredHandle {
+    pub provider: String,
+    pub model_id: String,
+    pub api: String,
+    /// Provider token, such as a response id or batch id plus row id (Pi's own wording,
+    /// `types.ts:398`).
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub poll_after_ms: Option<i64>,
+    /// Provider conversion data required to reconstruct the final assistant message (Pi
+    /// `data?: JsonValue`, `types.ts:403`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub data: Option<serde_json::Value>,
 }
 
 impl serde::Serialize for AssistantMessage {
     /// Self-tagging serializer: emits `role: "assistant"` FIRST (Pi's `AssistantMessage` literal
     /// always carries it, `ai/src/types.ts:384`), then Pi's exact field order — role, content, api,
-    /// provider, model, responseModel?, responseId?, diagnostics?, usage, stopReason, errorMessage?,
-    /// timestamp. So every wire-serialized assistant turn — and every `StreamEvent` `partial`/
+    /// provider, model, responseModel?, responseId?, diagnostics?, usage, stopReason, deferred?,
+    /// errorMessage?, rawStopReason?, timestamp (`v0.84.1 ai/src/types.ts:413-428`, read field for
+    /// field). So every wire-serialized assistant turn — and every `StreamEvent` `partial`/
     /// `done.message`/`error.error` that embeds one — is byte-1:1 with Pi. Verified against captured
     /// Pi bytes (`text-turn.pi-captured` `start` partial begins `{"role":"assistant","content":[],
     /// "api":...}`). The derived `Deserialize` ignores the extra `role` key on read.
@@ -461,7 +537,9 @@ impl serde::Serialize for AssistantMessage {
             + usize::from(self.response_model.is_some())
             + usize::from(self.response_id.is_some())
             + usize::from(self.diagnostics.is_some())
-            + usize::from(self.error_message.is_some());
+            + usize::from(self.deferred.is_some())
+            + usize::from(self.error_message.is_some())
+            + usize::from(self.raw_stop_reason.is_some());
         let mut st = serializer.serialize_struct("AssistantMessage", len)?;
         st.serialize_field("role", "assistant")?;
         st.serialize_field("content", &self.content)?;
@@ -482,9 +560,17 @@ impl serde::Serialize for AssistantMessage {
         }
         st.serialize_field("usage", &self.usage)?;
         st.serialize_field("stopReason", &self.stop_reason)?;
+        match &self.deferred {
+            Some(v) => st.serialize_field("deferred", v)?,
+            None => st.skip_field("deferred")?,
+        }
         match &self.error_message {
             Some(v) => st.serialize_field("errorMessage", v)?,
             None => st.skip_field("errorMessage")?,
+        }
+        match &self.raw_stop_reason {
+            Some(v) => st.serialize_field("rawStopReason", v)?,
+            None => st.skip_field("rawStopReason")?,
         }
         st.serialize_field("timestamp", &self.timestamp)?;
         st.end()
@@ -523,7 +609,9 @@ impl AssistantMessage {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason,
+            deferred: None,
             error_message: Some(message.into()),
+            raw_stop_reason: None,
             timestamp: 0,
         }
     }
@@ -862,7 +950,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         });
         let v = serde_json::to_value(&m).expect("serialize");
@@ -1008,7 +1098,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         };
         // Standalone (as embedded in `StreamEvent.partial`): role:"assistant" FIRST, Pi field order.

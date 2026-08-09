@@ -10,7 +10,7 @@ use serde_json::Value;
 /// A message in the agent transcript: a real LLM message (`user`/`assistant`/`toolResult`) OR an
 /// app/extension `Custom` message that is NOT sent to the model (func-02 R-02-052). `convert_to_llm`
 /// is responsible for dropping/transforming `Custom`.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum AgentMessage {
     User {
@@ -27,6 +27,50 @@ pub enum AgentMessage {
         #[serde(default)]
         timestamp: Option<i64>,
     },
+}
+
+impl serde::Serialize for AgentMessage {
+    /// Manual serializer so the `role` discriminant appears EXACTLY ONCE — the same defect, and the
+    /// same fix, as [`cyrup_core::Message`]'s serializer.
+    ///
+    /// A derived internally-tagged `Serialize` writes `role` itself and THEN delegates the
+    /// `Assistant` newtype payload to [`AssistantMessage`], whose serializer self-tags. The result
+    /// was literally `{"role":"assistant","role":"assistant",…}` — a duplicate key on a contract
+    /// surface (`--json` and RPC stdout, and every transcript this wrapper reaches). JSON permits
+    /// duplicate keys syntactically, so nothing errored; `JSON.parse` silently keeps the LAST, while
+    /// stricter parsers reject the document outright. It was found by capturing real `--json` output
+    /// during the G43 review, not by any test — every existing assertion looked at parsed values,
+    /// where the duplicate is invisible.
+    ///
+    /// The three non-`Assistant` arms delegate to a private mirror enum carrying the identical serde
+    /// attributes, so their bytes are unchanged by construction; only the `Assistant` arm's spurious
+    /// outer tag is removed.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        /// Byte-identical to the old derive for every arm it carries. `AgentMessage::Assistant` is
+        /// deliberately absent: that arm is the one whose payload self-tags.
+        #[derive(serde::Serialize)]
+        #[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
+        enum TaggedNonAssistant<'a> {
+            User { content: &'a Vec<Content>, timestamp: &'a Option<i64> },
+            ToolResult(&'a ToolResultMessage),
+            Custom { kind: &'a str, payload: &'a Value, timestamp: &'a Option<i64> },
+        }
+
+        match self {
+            // Self-tagging: emits `role:"assistant"` first, then Pi's field order.
+            AgentMessage::Assistant(m) => m.serialize(serializer),
+            AgentMessage::User { content, timestamp } => {
+                TaggedNonAssistant::User { content, timestamp }.serialize(serializer)
+            }
+            AgentMessage::ToolResult(m) => TaggedNonAssistant::ToolResult(m).serialize(serializer),
+            AgentMessage::Custom { kind, payload, timestamp } => {
+                TaggedNonAssistant::Custom { kind, payload, timestamp }.serialize(serializer)
+            }
+        }
+    }
 }
 
 impl AgentMessage {

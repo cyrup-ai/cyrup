@@ -707,7 +707,9 @@ mod tests {
                     diagnostics: None,
                     usage: cyrup_core::Usage::default(),
                     stop_reason: cyrup_core::StopReason::ToolUse,
+                    deferred: None,
                     error_message: None,
+                    raw_stop_reason: None,
                     timestamp: 2,
                 }),
                 cyrup_core::Message::ToolResult {

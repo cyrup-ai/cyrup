@@ -11,14 +11,37 @@
 //! Used by tests/demos across the workspace (agent loop, sessions, compaction, tools, hooks) so
 //! they run without real provider APIs (func-00 R-00-011). Available to this crate's own tests and
 //! behind the `faux` feature for downstream consumers.
+//!
+//! ## Deferred turns (pi v0.84.x)
+//!
+//! pi's faux gained a deferred half in v0.84.x — v0.83.0's `faux.ts` contains the string `deferred`
+//! zero times. cyrup ports the part that stands alone: a scripted turn may carry a
+//! [`cyrup_core::DeferredHandle`] ([`FauxMessageOptions::deferred`], pi `:80`/`:94`), and
+//! [`faux_deferred_message`] builds pi's exact `createDeferredMessage` receipt (pi `:293-305`), so
+//! the deferred READ path is exercisable offline against a produced `stopReason: "deferred"` turn.
+//!
+//! What is NOT ported, and precisely what it is blocked on — none of it can be written without
+//! first inventing public API that does not exist in cyrup:
+//!
+//! * **`streamOptions.deferred` submission** (pi `:524-550`) needs `StreamOptions.deferred`
+//!   (pi `v0.84.1 ai/src/types.ts:307`). [`crate::stream::StreamOptions`] has no such field, and no
+//!   cyrup wire api reads one.
+//! * **`fetchDeferred` / `cancelDeferred`** (pi `:567-642`, exposed on the provider at `:694-695`)
+//!   need `Api.fetchDeferred`/`Api.cancelDeferred` (pi `v0.84.1 ai/src/types.ts:271-276`) plus
+//!   `DeferredFetchOptions`/`DeferredCancelOptions` (pi `:223-232`). [`crate::provider::Provider`]
+//!   declares neither method and neither options type exists in the workspace.
+//! * Consequently the `deferredResponses` registry, `RegisterFauxProviderOptions.deferred`
+//!   (`pendingFetches`/`pollAfterMs`, pi `:120-124`) and
+//!   `FauxProviderState.{deferredFetchCount,cancelledDeferred}` (pi `:103-104`) have nothing to
+//!   drive them and are deliberately absent rather than dead-coded.
 
 use crate::context::Context;
 use crate::model::{Modality, Model, ModelCost};
 use crate::provider::Provider;
 use crate::stream::{ErrorReason, StreamEvent, StreamOptions};
 use cyrup_core::{
-    ApiId, AssistantMessage, Content, Cost, EventStream, Message, ProviderId, StopReason, ToolCall,
-    ToolCallId, Usage,
+    ApiId, AssistantMessage, Content, Cost, DeferredHandle, EventStream, Message, ProviderId,
+    StopReason, ToolCall, ToolCallId, Usage,
 };
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -386,20 +409,24 @@ fn split_by_token_size(text: &str, rng: &mut u64, min: usize, max: usize) -> Vec
 fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEvent> {
     let mut rng = chunk.seed | 1;
     let (min, max) = (chunk.min_token_size, chunk.max_token_size);
-    let proto = AssistantMessage {
-        content: Vec::new(),
-        provider: message.provider.clone(),
-        model: message.model.clone(),
-        api: message.api.clone(),
-        response_model: message.response_model.clone(),
-        response_id: message.response_id.clone(),
-        diagnostics: None,
-        usage: message.usage.clone(),
-        // Pi builds the partial prototype as `{ ...message, content: [], stopReason: "pending" }`
-        // (faux.ts:316) — the sentinel, NOT the scripted message's settled reason.
-        stop_reason: StopReason::Pending,
-        error_message: None,
-        timestamp: message.timestamp,
+    // Pi builds the partial prototype as `{ ...message, content: [], stopReason: "pending" }`
+    // (`v0.84.1 ai/src/providers/faux.ts:346`) — a SPREAD, so every other field of the scripted
+    // message rides along and only `content`/`stopReason` are overridden. This used to be a
+    // hand-written literal that dropped `diagnostics`, `deferred`, `errorMessage` and
+    // `rawStopReason` on the floor; a scripted `stopReason: "deferred"` turn then streamed partials
+    // with no handle on them. Cloning is the spread, verbatim.
+    //
+    // The `errorMessage` half moves one stored snapshot:
+    // `cyrup-test-support/fixtures/pi/error-stream.events.jsonl` now carries `"errorMessage":"boom"`
+    // on its `start` partial, because pi's spread carries it there. That file is a cyrup
+    // self-recording (no `_note` pi-capture header), so it recorded the divergence, not pi; it was
+    // regenerated with `CYRUP_UPDATE_GOLDEN=1`. No non-test consumer reads a `start` partial's
+    // `error_message` — `agent.rs:802` and `modes/json_event.rs:127` both match `Start { .. }`.
+    let proto = {
+        let mut p = message.clone();
+        p.content = Vec::new();
+        p.stop_reason = StopReason::Pending;
+        p
     };
     let mk = |content: Vec<Content>| {
         let mut p = proto.clone();
@@ -554,9 +581,10 @@ pub fn faux_event_stream(
         let mut p = message;
         p.content = Vec::new();
         // The abort fallback is a PARTIAL (it is only read before the first event lands), so it
-        // carries Pi's `"pending"` seed, not a settled reason (faux.ts:316).
+        // carries Pi's `"pending"` seed, not a settled reason. Same spread as `build_events`
+        // (`v0.84.1 ai/src/providers/faux.ts:346`): `content` and `stopReason` are the ONLY
+        // overrides — `errorMessage` used to be cleared here, which the spread does not do.
         p.stop_reason = StopReason::Pending;
-        p.error_message = None;
         p
     };
     let state = StreamState {
@@ -889,9 +917,13 @@ pub fn faux_tool_call_with_id(
 }
 
 /// Optional fields for [`faux_assistant_message_with`] (Pi `fauxAssistantMessage` options,
-/// faux.ts:74-80).
+/// `v0.84.1 ai/src/providers/faux.ts:78-84`).
 #[derive(Clone, Debug, Default)]
 pub struct FauxMessageOptions {
+    /// The deferred receipt handle (pi `deferred?: DeferredHandle`,
+    /// `v0.84.1 ai/src/providers/faux.ts:80`, copied onto the message at `:94`). Pair it with
+    /// [`StopReason::Deferred`] to script a turn that is a receipt rather than a reply.
+    pub deferred: Option<DeferredHandle>,
     pub error_message: Option<String>,
     pub response_id: Option<String>,
     pub timestamp: Option<i64>,
@@ -924,8 +956,44 @@ pub fn faux_assistant_message_with(
             ..Default::default()
         },
         stop_reason,
+        deferred: options.deferred.map(Box::new),
         error_message: options.error_message,
+        raw_stop_reason: None,
         timestamp: options.timestamp.unwrap_or(0),
+    }
+}
+
+/// Build the deferred RECEIPT turn pi's faux provider emits when a submission is deferred (pi
+/// `createDeferredMessage`, `v0.84.1 ai/src/providers/faux.ts:293-305`): empty content,
+/// `stopReason: "deferred"`, the handle attached, and the request model's identity —
+/// `api`/`provider`/`model` all taken from `model`, exactly as pi does at `:297-299`.
+///
+/// Version lag, not a port bug: pi's whole deferred half of `faux.ts` arrives in v0.84.x (`git diff
+/// v0.83.0..v0.84.1 -- packages/ai/src/providers/faux.ts` is +178/-11 and v0.83.0's copy contains
+/// zero occurrences of `deferred`).
+///
+/// Script it as a step and the faux provider streams it through the same `streamWithDeltas` engine
+/// pi uses (`:541-548`), producing `start` → `done{reason:"deferred"}` — which is what makes the
+/// deferred READ path (`AssistantMessage::deferred`, [`StopReason::Deferred`],
+/// [`crate::stream::DoneReason::Deferred`]) exercisable offline.
+///
+/// [CYRUP-DELTA] `timestamp` is `0`, not `Date.now()` (`:303`), so snapshots reproduce — the same
+/// substitution [`faux_tool_call_with_id`] already makes for `randomId`.
+pub fn faux_deferred_message(model: &Model, handle: DeferredHandle) -> AssistantMessage {
+    AssistantMessage {
+        content: Vec::new(),
+        provider: model.provider.clone(),
+        model: model.id.as_str().to_string(),
+        api: model.api.clone(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Deferred,
+        deferred: Some(Box::new(handle)),
+        error_message: None,
+        raw_stop_reason: None,
+        timestamp: 0,
     }
 }
 
@@ -1265,6 +1333,100 @@ mod tests {
             m2.usage.cache_read > 0,
             "expected a cache read on the shared prefix"
         );
+    }
+
+    fn handle(model: &Model) -> DeferredHandle {
+        DeferredHandle {
+            provider: model.provider.as_str().to_string(),
+            model_id: model.id.as_str().to_string(),
+            api: model.api.as_str().to_string(),
+            id: "deferred:0:1".to_string(),
+            expires_at: None,
+            poll_after_ms: Some(1500),
+            data: Some(serde_json::json!({"batch": "b-7"})),
+        }
+    }
+
+    /// Version lag (pi's deferred half of `faux.ts` lands in v0.84.x; v0.83.0's copy contains the
+    /// string `deferred` zero times): pi can emit `createDeferredMessage`
+    /// (`v0.84.1 ai/src/providers/faux.ts:293-305`) and cyrup could not, so no test anywhere could
+    /// drive cyrup's deferred READ path from a produced deferred turn.
+    #[tokio::test]
+    async fn a_scripted_deferred_turn_streams_a_deferred_done_carrying_its_handle() {
+        let faux = FauxProvider::new();
+        let model = faux.model().clone();
+        let h = handle(&model);
+        faux.set_responses(vec![faux_deferred_message(&model, h.clone())]);
+
+        let mut stream = faux.stream(&model, &Context::default(), &StreamOptions::default());
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            events.push(ev);
+        }
+
+        // pi's receipt has empty content, so `streamWithDeltas` emits start → done only (`:356`
+        // never enters the block loop).
+        assert_eq!(events.len(), 2, "{events:?}");
+        match events.last() {
+            Some(StreamEvent::Done { reason, message }) => {
+                assert_eq!(*reason, crate::stream::DoneReason::Deferred);
+                assert_eq!(message.stop_reason, StopReason::Deferred);
+                assert!(message.content.is_empty());
+                assert_eq!(message.deferred.as_deref(), Some(&h));
+                assert_eq!(
+                    serde_json::to_value(message).unwrap()["stopReason"],
+                    "deferred",
+                    "wire spelling must be Pi's"
+                );
+            }
+            other => panic!("expected done/deferred, got {other:?}"),
+        }
+
+        // pi's in-flight partial is `{ ...message, content: [], stopReason: "pending" }`
+        // (`:346`) — a SPREAD, so the handle rides along on every partial. cyrup's hand-written
+        // prototype used to drop it.
+        for (i, p) in events.iter().filter_map(StreamEvent::partial).enumerate() {
+            assert_eq!(p.stop_reason, StopReason::Pending, "partial #{i}");
+            assert_eq!(p.deferred.as_deref(), Some(&h), "partial #{i}");
+        }
+    }
+
+    /// The scripting-surface half: pi's `fauxAssistantMessage` takes `deferred` in its options bag
+    /// (`v0.84.1 ai/src/providers/faux.ts:80`, copied at `:94`).
+    ///
+    /// MIRROR: an ordinary scripted reply carries no handle and no partial gains one, so the spread
+    /// fix cannot leak a handle onto a non-deferred turn.
+    #[tokio::test]
+    async fn the_deferred_option_is_scriptable_and_absent_by_default() {
+        let faux = FauxProvider::new();
+        let model = faux.model().clone();
+        let h = handle(&model);
+        faux.set_responses(vec![
+            faux_assistant_message_with(
+                vec![faux_text("receipt")],
+                StopReason::Deferred,
+                FauxMessageOptions {
+                    deferred: Some(h.clone()),
+                    ..Default::default()
+                },
+            ),
+            faux_assistant_message(vec![faux_text("ordinary")], StopReason::Stop),
+        ]);
+
+        let m1 = collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default()))
+            .await;
+        assert_eq!(m1.stop_reason, StopReason::Deferred);
+        assert_eq!(m1.deferred.as_deref(), Some(&h));
+
+        let mut stream = faux.stream(&model, &Context::default(), &StreamOptions::default());
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            events.push(ev);
+        }
+        for p in events.iter().filter_map(StreamEvent::partial) {
+            assert_eq!(p.deferred, None);
+        }
+        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
     }
 
     #[tokio::test]

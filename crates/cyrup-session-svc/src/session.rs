@@ -2014,9 +2014,9 @@ impl AgentSession {
             cyrup_core::StopReason::Aborted => {
                 Err(cyrup_session::compaction::CompactionError::Aborted)
             }
-            // An unsettled response is NOT a summary — same guard as
-            // `cyrup_session::compaction::{summarize,branch}`.
-            cyrup_core::StopReason::Pending => {
+            // An unsettled response is NOT a summary — same guard, and the same `Deferred`
+            // rationale, as `cyrup_session::compaction::{summarize,branch}`.
+            cyrup_core::StopReason::Pending | cyrup_core::StopReason::Deferred => {
                 Err(cyrup_session::compaction::CompactionError::Summarization(
                     resp.error_message.unwrap_or_else(|| {
                         cyrup_session::compaction::PENDING_SUMMARY.to_string()

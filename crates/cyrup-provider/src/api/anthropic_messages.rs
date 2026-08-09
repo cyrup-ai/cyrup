@@ -1299,6 +1299,13 @@ struct Decoder {
     usage: Usage,
     response_id: Option<String>,
     stop_reason: Option<StopReason>,
+    /// The provider's own `stop_reason` string, kept verbatim beside the narrowed [`StopReason`]
+    /// (pi `output.rawStopReason = event.delta.stop_reason`,
+    /// `v0.84.1 ai/src/api/anthropic-messages.ts:709`). PORT BUG, not version lag: the write is
+    /// present at v0.83.0 too (`v0.83.0 ai/src/api/anthropic-messages.ts:709`) and cyrup never
+    /// ported it, so `rawStopReason` was `None` on every anthropic turn. Set once, from
+    /// `message_delta`, and never cleared — a mapped `tool_use`/`refusal` still names itself.
+    raw_stop_reason: Option<String>,
     error_message: Option<String>,
     saw_message_start: bool,
     saw_message_stop: bool,
@@ -1332,7 +1339,9 @@ impl Decoder {
             // it goes through `StreamEvent::end_of_stream`, which rewrites `Pending` to the `error`
             // terminal Pi's throw produces.
             stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
+            deferred: None,
             error_message: self.error_message.clone(),
+            raw_stop_reason: self.raw_stop_reason.clone(),
             timestamp: now_millis(),
         }
     }
@@ -1521,9 +1530,19 @@ async fn process_event(
         Some("content_block_delta") => process_block_delta(event, dec, model, api, sink).await,
         Some("content_block_stop") => process_block_stop(event, dec, model, api, sink).await,
         Some("message_delta") => {
+            // pi guards with `if (event.delta.stop_reason)` (`v0.84.1
+            // ai/src/api/anthropic-messages.ts:708`) — a JS truthiness test, so `""` leaves the
+            // `"pending"` seed alone rather than mapping to `Unhandled stop reason: `.
             if let Some(delta) = event.get("delta")
-                && let Some(reason) = delta.get("stop_reason").and_then(Value::as_str)
+                && let Some(reason) = delta
+                    .get("stop_reason")
+                    .and_then(Value::as_str)
+                    .filter(|r| !r.is_empty())
             {
+                // The raw string is recorded FIRST and unconditionally, exactly where pi records it
+                // (`v0.84.1 ai/src/api/anthropic-messages.ts:709`), so a turn that maps to
+                // `tool_use`/`refusal`/an unknown reason still carries the provider's own word.
+                dec.raw_stop_reason = Some(reason.to_string());
                 let (stop, err) = map_stop_reason(reason, delta.get("stop_details"));
                 dec.stop_reason = Some(stop);
                 if let Some(err) = err {
@@ -2605,6 +2624,84 @@ mod tests {
         assert_eq!(text, "Hello", "the content_block_start head was dropped");
     }
 
+    /// PORT BUG (present at v0.83.0, never ported): pi writes
+    /// `output.rawStopReason = event.delta.stop_reason` at
+    /// `v0.84.1 ai/src/api/anthropic-messages.ts:709`, and cyrup filled `raw_stop_reason: None` at
+    /// every construction site. The narrowing map is lossy — `refusal`, `sensitive` and every
+    /// unknown reason all become [`StopReason::Error`] — so without the raw string the turn no
+    /// longer records WHICH one the provider sent.
+    #[tokio::test]
+    async fn message_delta_records_the_providers_own_stop_reason() {
+        let head = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+        );
+        let stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+        // A refusal maps to `error`; only the raw string says it was a refusal and not a transport
+        // failure. `emit_error` builds its terminal from the same snapshot, so it must survive there.
+        let refusal = format!(
+            "{head}event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"refusal\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n{stop}"
+        );
+        let m = model();
+        let events = collect(refusal.into_bytes(), &m).await;
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {:?}", events.last());
+        };
+        assert_eq!(error.stop_reason, StopReason::Error);
+        assert_eq!(error.raw_stop_reason.as_deref(), Some("refusal"));
+
+        // MIRROR 1: a clean `end_turn` keeps its raw word too, on the `done` terminal AND on every
+        // in-flight partial emitted after the `message_delta`.
+        let clean = format!(
+            "{head}event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n{stop}"
+        );
+        let events = collect(clean.into_bytes(), &m).await;
+        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.raw_stop_reason.as_deref(), Some("end_turn"));
+
+        // MIRROR 2: no `message_delta` at all → nothing to record. pi never assigns, so the field
+        // stays absent rather than being invented from the truncation diagnostic.
+        let truncated = format!("{head}{stop}");
+        let events = collect(truncated.into_bytes(), &m).await;
+        let last = events.last().expect("a terminal");
+        assert_eq!(
+            last.terminal_message()
+                .and_then(|t| t.raw_stop_reason.clone()),
+            None
+        );
+    }
+
+    /// pi's guard is `if (event.delta.stop_reason)` (`v0.84.1
+    /// ai/src/api/anthropic-messages.ts:708`) — JS truthiness, so `""` is not a stop reason. cyrup
+    /// tested only for presence, so an empty string reached `map_stop_reason` and settled the turn
+    /// on `Unhandled stop reason: ` instead of leaving the `"pending"` seed to be reported as the
+    /// truncation it is.
+    #[tokio::test]
+    async fn an_empty_stop_reason_is_not_a_stop_reason() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let m = model();
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {:?}", events.last());
+        };
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("Anthropic stream ended without a stop reason")
+        );
+        assert_eq!(error.raw_stop_reason, None);
+    }
+
     /// DRIFT-003: the same for thinking blocks. The signature matters most — a thinking block
     /// replayed to Anthropic without its signature is rejected, so a signature delivered only on
     /// the open event must survive.
@@ -2703,7 +2800,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         };
         let value = build_assistant(&am, false, false).expect("assistant");
@@ -2727,7 +2826,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         };
         // default: convert to text.
@@ -2778,7 +2879,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 2,
         })
     }

@@ -101,7 +101,9 @@ fn empty_assistant(model: &ModelRef) -> AssistantMessage {
         // `Stop` seed made a `message_start` emitted on a pre-first-event abort claim a completed
         // turn. It never reaches `message_end`: every return path stamps a settled reason.
         stop_reason: StopReason::Pending,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     }
 }

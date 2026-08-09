@@ -49,6 +49,11 @@ pub use event::{
     AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptOptions, StreamingBehavior,
     SummarizationRetrySource, UserInput,
 };
+/// The streaming delta carried on [`AgentSessionEvent::MessageUpdate`]. Re-exported because it is
+/// already part of this crate's public surface (the variant's `assistant_message_event` payload) —
+/// without it a consumer cannot match on the seam's own event without taking a direct
+/// `cyrup-provider` dependency. `cyrup-modes`' wire projection is the first such consumer.
+pub use cyrup_provider::StreamEvent;
 pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;
 pub use cyrup_ext::NotifyKind;

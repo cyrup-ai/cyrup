@@ -47,7 +47,9 @@ fn tool_call_msg(
         diagnostics: None,
         usage: cyrup_core::Usage::default(),
         stop_reason: cyrup_core::StopReason::ToolUse,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     };
     (msg, tc)

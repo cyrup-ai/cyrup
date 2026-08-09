@@ -234,7 +234,9 @@ pub fn build_assistant_message(resp: &FauxResponse) -> AssistantMessage {
         diagnostics: None,
         usage: build_usage(resp.usage.as_ref()),
         stop_reason,
+        deferred: None,
         error_message: resp.error.clone(),
+        raw_stop_reason: None,
         timestamp: 0,
     }
 }

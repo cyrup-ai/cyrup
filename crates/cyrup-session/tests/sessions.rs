@@ -31,7 +31,9 @@ fn assistant(s: &str) -> Message {
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     })
 }

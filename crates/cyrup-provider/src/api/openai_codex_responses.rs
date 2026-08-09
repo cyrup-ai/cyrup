@@ -1941,20 +1941,54 @@ mod tests {
         );
     }
 
+    /// Codex reaches `mapStopReason` through the shared `processResponsesStream`
+    /// (v0.84.1 `openai-codex-responses.ts:52,665`), so the v0.84.1 split of `incomplete` applies
+    /// here too: only `incomplete_details.reason === "max_output_tokens"` is a clean `length` stop
+    /// (`openai-responses-shared.ts:751-753`); a bare `incomplete` is an error terminal
+    /// (`:754-759`). `mapCodexEvents` spreads the response (`openai-codex-responses.ts:745-747`),
+    /// so `incomplete_details` survives the `response.done` → `response.completed` rename.
     #[tokio::test]
-    async fn incomplete_status_maps_to_length() {
-        const SSE: &str = concat!(
-            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m1\"}}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi\"}\n\n",
-            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"r\",\"status\":\"incomplete\"}}\n\n",
+    async fn incomplete_status_splits_on_the_provider_reason() {
+        macro_rules! head {
+            () => {
+                concat!(
+                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m1\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi\"}\n\n",
+                )
+            };
+        }
+        async fn terminal(sse: &'static str) -> AssistantMessage {
+            drain(sse, None)
+                .await
+                .last()
+                .and_then(StreamEvent::terminal_message)
+                .cloned()
+                .expect("terminal")
+        }
+
+        let capped = terminal(concat!(
+            head!(),
+            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"r\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        ))
+        .await;
+        assert_eq!(capped.stop_reason, StopReason::Length);
+        assert_eq!(capped.error_message, None);
+        assert_eq!(
+            capped.raw_stop_reason.as_deref(),
+            Some("incomplete.max_output_tokens")
         );
-        let msg = drain(SSE, None)
-            .await
-            .last()
-            .and_then(StreamEvent::terminal_message)
-            .cloned()
-            .expect("terminal");
-        assert_eq!(msg.stop_reason, StopReason::Length);
+
+        let bare = terminal(concat!(
+            head!(),
+            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"r\",\"status\":\"incomplete\"}}\n\n",
+        ))
+        .await;
+        assert_eq!(bare.stop_reason, StopReason::Error);
+        assert_eq!(
+            bare.error_message.as_deref(),
+            Some("Response incomplete without a provider reason")
+        );
+        assert_eq!(bare.raw_stop_reason.as_deref(), Some("incomplete"));
     }
 
     #[tokio::test]

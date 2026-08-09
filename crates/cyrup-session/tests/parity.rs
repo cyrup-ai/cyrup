@@ -312,7 +312,9 @@ fn assistant_text(s: &str) -> cyrup_core::AssistantMessage {
         diagnostics: None,
         usage: cyrup_core::Usage::default(),
         stop_reason: cyrup_core::StopReason::Stop,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     }
 }
@@ -385,7 +387,9 @@ fn gap17_serialize_separators_json_args_and_skips_empty() {
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     });
     // An empty user message must NOT emit a "[User]: " line.
@@ -825,7 +829,9 @@ fn asst_toolcall(name: &str, key: &str, path: &str) -> Message {
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     })
 }

@@ -256,8 +256,9 @@ pub async fn generate_branch_summary<S: Summarizer>(
             Err(CompactionError::Summarization(resp.error_message.unwrap_or_default()))
         }
         cyrup_core::StopReason::Aborted => Err(CompactionError::Aborted),
-        // An unsettled response is NOT a summary — see the same guard in `summarize.rs`.
-        cyrup_core::StopReason::Pending => Err(CompactionError::Summarization(
+        // An unsettled response is NOT a summary — see the same guard, and the `Deferred`
+        // rationale, in `summarize.rs`.
+        cyrup_core::StopReason::Pending | cyrup_core::StopReason::Deferred => Err(CompactionError::Summarization(
             resp.error_message
                 .unwrap_or_else(|| crate::compaction::summarize::PENDING_SUMMARY.to_string()),
         )),

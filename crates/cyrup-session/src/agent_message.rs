@@ -90,6 +90,18 @@ pub struct CompactionSummaryMessage {
 /// The full Pi `AgentMessage` union. `Core` covers `user`/`assistant`/`toolResult`
 /// ([`cyrup_core::Message`]); the four extra arms carry the coding-agent roles the closed core enum
 /// cannot represent (`messages.ts:68-77`).
+// `Core` is intentionally inline (no `Box`) — the same rationale, and the same call, as
+// `Entry::Known` and `KnownEntry::Message` in `entry.rs:30-32,184-186`: it is the dominant variant
+// on every path (a transcript is overwhelmingly `Core`), and boxing it would force `box`-patterns
+// (unstable) at all 52 `AgentMessage::Core(` match sites to save a branch nothing takes.
+//
+// The gap sat at EXACTLY the 200-byte lint threshold before `AssistantMessage` gained Pi's
+// `rawStopReason`/`deferred` (`v0.84.1 ai/src/types.ts:424,426`), so it was going to trip on
+// whichever field landed next. `deferred` is already boxed at its declaration
+// (`cyrup-core/src/message.rs:466-475`) because it is large AND ~always absent; `rawStopReason`
+// is a plain `Option<String>` because Pi sets it on nearly every settled turn, so indirection
+// there would cost an allocation on the common path to save 16 bytes on the rare one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentMessage {
     Core(Message),

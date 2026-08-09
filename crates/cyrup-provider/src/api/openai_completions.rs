@@ -1365,6 +1365,14 @@ struct Decoder {
     response_id: Option<String>,
     response_model: Option<String>,
     stop_reason: Option<StopReason>,
+    /// The choice's own `finish_reason`, kept verbatim beside the narrowed [`StopReason`] (pi
+    /// `output.rawStopReason = choice.finish_reason`,
+    /// `v0.84.1 ai/src/api/openai-completions.ts:463`). PORT BUG, not version lag: the write is
+    /// present at v0.83.0 too (`v0.83.0 ai/src/api/openai-completions.ts:459`) and cyrup never
+    /// ported it. This is the widest-reach one of the five — `openai-completions` is the fleet wire
+    /// api shared by 16 built-in providers (`providers/fleet.rs`), so it carried the gap for xAI,
+    /// Groq, DeepSeek, Moonshot and the rest.
+    raw_stop_reason: Option<String>,
     error_message: Option<String>,
     /// Whether any chunk carried a `finish_reason` (Pi `hasFinishReason`). A stream that ends
     /// without one is a protocol error (Pi openai-completions.ts:452-454).
@@ -1391,7 +1399,9 @@ impl Decoder {
             diagnostics: None,
             usage,
             stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
+            deferred: None,
             error_message: self.error_message.clone(),
+            raw_stop_reason: self.raw_stop_reason.clone(),
             timestamp: now_millis(),
         }
     }
@@ -1604,6 +1614,10 @@ async fn process_chunk(
     }
 
     if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+        // pi records the raw reason first (`v0.84.1 ai/src/api/openai-completions.ts:463`), before
+        // the narrowing map, so `content_filter` and every provider-specific reason survive on the
+        // turn instead of collapsing into `StopReason::Error`.
+        dec.raw_stop_reason = Some(reason.to_string());
         let (stop, err) = map_stop_reason(reason);
         dec.stop_reason = Some(stop);
         if let Some(err) = err {
@@ -1916,7 +1930,9 @@ fn build_final_message(dec: Decoder, model: &Model, api: &ApiId) -> AssistantMes
         diagnostics: None,
         usage,
         stop_reason,
+        deferred: None,
         error_message: dec.error_message,
+        raw_stop_reason: dec.raw_stop_reason,
         timestamp: now_millis(),
     }
 }
@@ -2146,7 +2162,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         })];
         for id in ids {
@@ -2262,7 +2280,9 @@ mod tests {
                     diagnostics: None,
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
+                    deferred: None,
                     error_message: None,
+                    raw_stop_reason: None,
                     timestamp: 0,
                 }),
                 Message::ToolResult {
@@ -2518,6 +2538,47 @@ mod tests {
         }
         handle.await.unwrap();
         events
+    }
+
+    /// PORT BUG (present at v0.83.0, never ported): pi writes
+    /// `output.rawStopReason = choice.finish_reason`
+    /// (`v0.84.1 ai/src/api/openai-completions.ts:463`; `v0.83.0 …:459`). This is the widest-reach
+    /// of the five missing writers — `openai-completions` is the fleet wire api behind 16 built-in
+    /// providers, whose finish reasons are the least standardized in the workspace.
+    #[tokio::test]
+    async fn a_finish_reason_is_recorded_raw_beside_the_narrowed_one() {
+        let events =
+            collect_events("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n")
+                .await;
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {:?}", events.last());
+        };
+        assert_eq!(error.raw_stop_reason.as_deref(), Some("content_filter"));
+
+        // MIRROR 1: a clean `stop` keeps its raw word on the `done` terminal.
+        let events = collect_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.raw_stop_reason.as_deref(), Some("stop"));
+
+        // MIRROR 2: no `finish_reason` ever arrives → nothing recorded, and the terminal is the
+        // truncation error, not a fabricated raw value.
+        let events =
+            collect_events("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")
+                .await;
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {:?}", events.last());
+        };
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("Stream ended without finish_reason")
+        );
+        assert_eq!(error.raw_stop_reason, None);
     }
 
     #[tokio::test]

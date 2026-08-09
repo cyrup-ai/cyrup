@@ -1602,6 +1602,13 @@ struct Decoder {
     blocks: Vec<Block>,
     usage: Usage,
     stop_reason: Option<StopReason>,
+    /// The provider's own `messageStop.stopReason`, kept verbatim beside the narrowed
+    /// [`StopReason`] (pi `output.rawStopReason = item.messageStop.stopReason`,
+    /// `v0.84.1 ai/src/api/bedrock-converse-stream.ts:276`). PORT BUG, not version lag: the write is
+    /// present at v0.83.0 too (`v0.83.0 ai/src/api/bedrock-converse-stream.ts:270`) and cyrup never
+    /// ported it. Assigned UNCONDITIONALLY at `messageStop` — pi has no truthiness guard there, so a
+    /// `messageStop` with no `stopReason` writes `undefined`, i.e. `None`.
+    raw_stop_reason: Option<String>,
     error_message: Option<String>,
 }
 
@@ -1629,7 +1636,9 @@ impl Decoder {
             // attached to every non-terminal event. The terminal never takes this value — it goes
             // through `StreamEvent::end_of_stream`.
             stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
+            deferred: None,
             error_message: self.error_message.clone(),
+            raw_stop_reason: self.raw_stop_reason.clone(),
             timestamp: now_millis(),
         }
     }
@@ -1729,6 +1738,10 @@ async fn dispatch_frame(
         "contentBlockStop" => Ok(handle_content_block_stop(&payload, dec, model, api, sink).await),
         "messageStop" => {
             let raw = payload.get("stopReason").and_then(Value::as_str);
+            // pi `output.rawStopReason = item.messageStop.stopReason` (`v0.84.1
+            // ai/src/api/bedrock-converse-stream.ts:276`) — recorded before the narrowing map, so
+            // `guardrail_intervened` and every future reason name themselves on the turn.
+            dec.raw_stop_reason = raw.map(str::to_string);
             let (stop_reason, error_message) = map_stop_reason(raw);
             dec.stop_reason = Some(stop_reason);
             if let Some(message) = error_message {
@@ -2963,7 +2976,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         };
         let ctx = Context {
@@ -3011,7 +3026,9 @@ mod tests {
                     diagnostics: None,
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
+                    deferred: None,
                     error_message: None,
+                    raw_stop_reason: None,
                     timestamp: 0,
                 }),
                 Message::ToolResult {
@@ -3070,7 +3087,9 @@ mod tests {
                 diagnostics: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,
+                deferred: None,
                 error_message: None,
+                raw_stop_reason: None,
                 timestamp: 0,
             }),
         ];
@@ -3136,7 +3155,9 @@ mod tests {
                     diagnostics: None,
                     usage: Usage::default(),
                     stop_reason: StopReason::Stop,
+                    deferred: None,
                     error_message: None,
+                    raw_stop_reason: None,
                     timestamp: 0,
                 }),
             ],
@@ -3890,6 +3911,60 @@ mod tests {
             panic!("expected a done terminal");
         };
         assert_eq!(message.stop_reason, StopReason::Length);
+    }
+
+    /// PORT BUG (present at v0.83.0, never ported): pi writes
+    /// `output.rawStopReason = item.messageStop.stopReason`
+    /// (`v0.84.1 ai/src/api/bedrock-converse-stream.ts:276`; `v0.83.0 …:270`). Bedrock's mapping is
+    /// especially lossy — every unrecognized reason falls into the `_ => (Error, None)` arm of
+    /// [`map_stop_reason`] with no message at all, so the raw string is the ONLY record of it.
+    #[tokio::test]
+    async fn message_stop_records_the_providers_own_stop_reason() {
+        let events = collect(
+            vec![
+                event("messageStart", "{\"role\":\"assistant\"}"),
+                event("messageStop", "{\"stopReason\":\"guardrail_intervened\"}"),
+            ],
+            &sonnet_45(),
+        )
+        .await;
+        let StreamEvent::Error { error, .. } = events.last().unwrap() else {
+            panic!("expected an error terminal");
+        };
+        assert_eq!(
+            error.raw_stop_reason.as_deref(),
+            Some("guardrail_intervened")
+        );
+
+        // MIRROR 1: a clean `end_turn` keeps its raw word on the `done` terminal.
+        let events = collect(
+            vec![
+                event("messageStart", "{\"role\":\"assistant\"}"),
+                event("messageStop", "{\"stopReason\":\"end_turn\"}"),
+            ],
+            &sonnet_45(),
+        )
+        .await;
+        let StreamEvent::Done { message, .. } = events.last().unwrap() else {
+            panic!("expected a done terminal");
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.raw_stop_reason.as_deref(), Some("end_turn"));
+
+        // MIRROR 2: pi's assignment at `:276` is UNCONDITIONAL, so a `messageStop` with no
+        // `stopReason` writes `undefined` — `None`, not a fabricated placeholder.
+        let events = collect(
+            vec![
+                event("messageStart", "{\"role\":\"assistant\"}"),
+                event("messageStop", "{}"),
+            ],
+            &sonnet_45(),
+        )
+        .await;
+        let StreamEvent::Error { error, .. } = events.last().unwrap() else {
+            panic!("expected an error terminal");
+        };
+        assert_eq!(error.raw_stop_reason, None);
     }
 
     /// pi `:278-288`: an in-stream exception frame is a throw, prefixed by the legacy label.

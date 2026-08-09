@@ -862,6 +862,15 @@ struct RDecoder {
     usage: Usage,
     response_id: Option<String>,
     stop_reason: StopReason,
+    /// Pi's `output.errorMessage` (v0.84.1 `ai/src/types.ts:425`). Written by `finalizeResponse`
+    /// from `mapStopReason(...).errorMessage` (v0.84.1 `openai-responses-shared.ts:573`), so a
+    /// terminal that settles on `Error` carries the provider's reason instead of nothing.
+    error_message: Option<String>,
+    /// Pi's `output.rawStopReason` (`ai/src/types.ts:426`) — the provider's own status string,
+    /// stamped on **every** settled turn by v0.84.1 `openai-responses-shared.ts:570` and `:726`.
+    /// Present since `v0.83.0 ai/src/types.ts:411` / `openai-responses-shared.ts:567,721`, so its
+    /// absence here was a PORT BUG at the ported baseline, not version lag.
+    raw_stop_reason: Option<String>,
     saw_terminal: bool,
 }
 
@@ -876,6 +885,8 @@ impl Default for RDecoder {
             // event overwrites it (and sets `saw_terminal`). Seeding `Stop` made the in-flight
             // `partial` claim a completed turn.
             stop_reason: StopReason::Pending,
+            error_message: None,
+            raw_stop_reason: None,
             saw_terminal: false,
         }
     }
@@ -893,7 +904,12 @@ impl RDecoder {
             diagnostics: None,
             usage: self.usage.clone(),
             stop_reason: self.stop_reason,
-            error_message: None,
+            deferred: None,
+            // Pi mutates the single `output` object the `partial` frames alias, so whatever
+            // `finalizeResponse` wrote into `errorMessage`/`rawStopReason` is visible on the
+            // snapshot too (v0.84.1 `openai-responses-shared.ts:566-573`).
+            error_message: self.error_message.clone(),
+            raw_stop_reason: self.raw_stop_reason.clone(),
             timestamp: now_millis(),
         }
     }
@@ -993,8 +1009,22 @@ where
     // terminal `response.*` event sets `dec.stop_reason`, so without one the seeded `Stop` is a
     // guess. Routed through the same `end_of_stream` seam as the other four wire APIs so the
     // truncated-stream rule lives in exactly one place (Pi openai-responses.ts:170-172).
+    //
+    // A settled `error` reason is *thrown* upstream as
+    // `throw new Error(output.errorMessage || "An unknown error occurred")` (v0.84.1
+    // `openai-responses.ts:174`, and identically for the Azure sibling that shares this decoder at
+    // v0.84.1 `azure-openai-responses.ts:139`), and the catch stamps that text back onto
+    // `output.errorMessage` (`:188`) — so no Pi build can emit an `error` terminal whose
+    // `errorMessage` is unset. `end_of_stream` only fills the message on the truncated branch, so
+    // the fallback is applied here, the same guard `bedrock_converse_stream.rs:454-457` carries.
+    // The `|| "An unknown error occurred"` fallback dates to `v0.83.0 openai-responses.ts:174`
+    // (unconditional there), so this is a PORT BUG at the ported baseline, not version lag.
+    let mut message = dec.snapshot(model, api);
+    if dec.saw_terminal && dec.stop_reason == StopReason::Error && message.error_message.is_none() {
+        message.error_message = Some("An unknown error occurred".to_string());
+    }
     sink.send(StreamEvent::end_of_stream(
-        dec.snapshot(model, api),
+        message,
         dec.saw_terminal.then_some(dec.stop_reason),
         "OpenAI Responses stream ended before a terminal response event",
     ))
@@ -1227,6 +1257,12 @@ async fn process_event(
         "response.failed" => {
             dec.saw_terminal = true;
             let response = event.get("response");
+            // `output.rawStopReason = event.response?.status` (v0.84.1
+            // `openai-responses-shared.ts:726`; already present at `v0.83.0:721`).
+            dec.raw_stop_reason = response
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let error = response.and_then(|r| r.get("error"));
             let msg = if let Some(error) = error.filter(|e| !e.is_null()) {
                 let code = error
@@ -1387,10 +1423,29 @@ fn finalize_response(response: Option<&Value>, dec: &mut RDecoder, model: &Model
         .and_then(Value::as_str);
     apply_service_tier_pricing(&mut dec.usage, service_tier, model);
 
+    // Map status to stop reason. For incomplete responses, retain the provider's specific reason so
+    // max-output truncation and content filtering stay distinct (v0.84.1
+    // `openai-responses-shared.ts:565-573`).
     let status = response
         .and_then(|r| r.get("status"))
         .and_then(Value::as_str);
-    dec.stop_reason = map_stop_reason(status);
+    let incomplete_reason = response
+        .and_then(|r| r.pointer("/incomplete_details/reason"))
+        .and_then(Value::as_str);
+    // `output.rawStopReason = incompleteReason ? `${status}.${incompleteReason}` : status`
+    // (v0.84.1 `openai-responses-shared.ts:570`). The `(None, Some(_))` arm reproduces the JS
+    // template literal's `"undefined"` stringification of a missing `status` verbatim; a frame with
+    // `incomplete_details.reason` and no `status` is not something the API emits, but guessing a
+    // different answer here would be a divergence rather than a cleanup.
+    dec.raw_stop_reason = match (status, incomplete_reason) {
+        (Some(s), Some(r)) => Some(format!("{s}.{r}")),
+        (Some(s), None) => Some(s.to_string()),
+        (None, Some(r)) => Some(format!("undefined.{r}")),
+        (None, None) => None,
+    };
+    let (stop_reason, error_message) = map_stop_reason(status, incomplete_reason);
+    dec.stop_reason = stop_reason;
+    dec.error_message = error_message;
     let has_tool = dec.blocks.iter().any(|b| matches!(b, RBlock::Tool { .. }));
     if has_tool && dec.stop_reason == StopReason::Stop {
         dec.stop_reason = StopReason::ToolUse;
@@ -1426,15 +1481,44 @@ fn apply_service_tier_pricing(usage: &mut Usage, service_tier: Option<&str>, mod
         usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
-/// Pi `mapStopReason` (openai-responses-shared.ts:533-552).
-fn map_stop_reason(status: Option<&str>) -> StopReason {
+/// Pi `mapStopReason` (v0.84.1 `openai-responses-shared.ts:742-772`) — returns the stop reason
+/// *and* the companion `errorMessage`, which is what Pi assigns at `:572-573`.
+///
+/// The `incomplete` arm is the load-bearing change against the ported v0.83.0 baseline
+/// (`v0.83.0 openai-responses-shared.ts:737-756`, `case "incomplete": return "length";`): only
+/// `incomplete_details.reason === "max_output_tokens"` is a clean `length` stop (`:750-753`).
+/// Every other incomplete reason — `content_filter` above all — is an **error** terminal upstream
+/// (`:754-759`), so mapping them all to `length` reported a blocked response as a successful,
+/// merely-truncated turn.
+///
+/// The unknown-status arm is Pi's `default:` branch, whose `never` exhaustiveness check *throws*
+/// `Unhandled stop reason: <status>` at runtime for a status the SDK union does not name
+/// (`:767-770`); the throw lands in the caller's catch and becomes an `error` terminal
+/// (`openai-responses.ts:184-190`), never a clean stop.
+fn map_stop_reason(
+    status: Option<&str>,
+    incomplete_reason: Option<&str>,
+) -> (StopReason, Option<String>) {
     match status {
-        None => StopReason::Stop,
-        Some("completed") => StopReason::Stop,
-        Some("incomplete") => StopReason::Length,
-        Some("failed") | Some("cancelled") => StopReason::Error,
-        Some("in_progress") | Some("queued") => StopReason::Stop,
-        Some(_) => StopReason::Stop,
+        None => (StopReason::Stop, None),
+        Some("completed") => (StopReason::Stop, None),
+        Some("incomplete") => match incomplete_reason {
+            Some("max_output_tokens") => (StopReason::Length, None),
+            Some(reason) => (
+                StopReason::Error,
+                Some(format!("Response incomplete: {reason}")),
+            ),
+            None => (
+                StopReason::Error,
+                Some("Response incomplete without a provider reason".to_string()),
+            ),
+        },
+        Some("failed") | Some("cancelled") => (StopReason::Error, None),
+        Some("in_progress") | Some("queued") => (StopReason::Stop, None),
+        Some(other) => (
+            StopReason::Error,
+            Some(format!("Unhandled stop reason: {other}")),
+        ),
     }
 }
 
@@ -1728,7 +1812,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         };
         ctx.messages.push(Message::Assistant(am));
@@ -1835,6 +1921,164 @@ mod tests {
         let msg = collect_message(stream).await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         assert!(msg.error_message.unwrap().contains("rate_limit: slow down"));
+        // `output.rawStopReason = event.response?.status` (v0.84.1
+        // openai-responses-shared.ts:726) — absent status stays absent.
+        assert_eq!(msg.raw_stop_reason, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // G12: a Responses terminal must never settle on `error` with no message, and the v0.84.1
+    // `incomplete` split.
+    //
+    // `azure-openai-responses` reaches this decoder through the same `decode_stream` import
+    // (`azure_openai_responses.rs:25-27`, used at `:198`), mirroring upstream's shared
+    // `processResponsesStream` (v0.84.1 `azure-openai-responses.ts:20,129`), and it carries the
+    // identical guard at `azure-openai-responses.ts:138-139`. Both api ids are exercised so a fix
+    // that missed the sibling would be caught.
+    // -----------------------------------------------------------------------
+
+    /// The two api ids that share this decoder and both spell the guard upstream.
+    const RESPONSES_SIBLINGS: [&str; 2] = ["openai-responses", "azure-openai-responses"];
+
+    async fn terminal_for(api_id: &str, raw: &str) -> AssistantMessage {
+        let frames = decode_sse_bytes(raw.as_bytes().to_vec());
+        let (sink, rx) = crate::api::channel(64);
+        let m = model();
+        let api = ApiId::from(api_id);
+        decode_stream(frames, &m, &api, &sink).await;
+        drop(sink);
+        let stream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        collect_message(stream).await
+    }
+
+    /// A settled `error` stop reason with nothing recorded: upstream throws
+    /// `output.errorMessage || "An unknown error occurred"` (v0.84.1 `openai-responses.ts:174`,
+    /// `azure-openai-responses.ts:139`) and the catch writes that text back to `errorMessage`
+    /// (`openai-responses.ts:188`), so the fallback text is always present. `mapStopReason`'s
+    /// `failed`/`cancelled` arm supplies no message (v0.84.1 `openai-responses-shared.ts:760-762`),
+    /// which is exactly how this state is reached.
+    #[tokio::test]
+    async fn settled_error_terminal_always_carries_a_message() {
+        for api_id in RESPONSES_SIBLINGS {
+            for status in ["failed", "cancelled"] {
+                let raw = format!(
+                    "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"r\",\"status\":\"{status}\"}}}}\n\n"
+                );
+                let msg = terminal_for(api_id, &raw).await;
+                assert_eq!(
+                    msg.stop_reason,
+                    StopReason::Error,
+                    "{api_id} / {status} stop reason"
+                );
+                assert_eq!(
+                    msg.error_message.as_deref(),
+                    Some("An unknown error occurred"),
+                    "{api_id} / {status} error message"
+                );
+                assert_eq!(msg.raw_stop_reason.as_deref(), Some(status));
+            }
+        }
+    }
+
+    /// v0.84.1 `openai-responses-shared.ts:750-759`: only `max_output_tokens` is a clean `length`
+    /// stop; every other incomplete reason is an error terminal carrying the provider's reason.
+    /// Mapping them all to `length` (the ported `v0.83.0:744-745` behaviour) reported a
+    /// content-filtered response as a successful turn.
+    #[tokio::test]
+    async fn incomplete_without_max_output_tokens_is_an_error_terminal() {
+        for api_id in RESPONSES_SIBLINGS {
+            let filtered = terminal_for(
+                api_id,
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n",
+            )
+            .await;
+            assert_eq!(filtered.stop_reason, StopReason::Error, "{api_id}");
+            assert_eq!(
+                filtered.error_message.as_deref(),
+                Some("Response incomplete: content_filter"),
+                "{api_id}"
+            );
+            // `${status}.${incompleteReason}` (v0.84.1 openai-responses-shared.ts:570).
+            assert_eq!(
+                filtered.raw_stop_reason.as_deref(),
+                Some("incomplete.content_filter"),
+                "{api_id}"
+            );
+
+            let bare = terminal_for(
+                api_id,
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r\",\"status\":\"incomplete\"}}\n\n",
+            )
+            .await;
+            assert_eq!(bare.stop_reason, StopReason::Error, "{api_id}");
+            assert_eq!(
+                bare.error_message.as_deref(),
+                Some("Response incomplete without a provider reason"),
+                "{api_id}"
+            );
+            assert_eq!(
+                bare.raw_stop_reason.as_deref(),
+                Some("incomplete"),
+                "{api_id}"
+            );
+        }
+    }
+
+    /// Upstream's `default:` arm is a `never` exhaustiveness check that *throws*
+    /// `Unhandled stop reason: <status>` (v0.84.1 `openai-responses-shared.ts:767-770`); the throw
+    /// lands in the caller's catch and becomes an error terminal, never a clean stop.
+    #[tokio::test]
+    async fn unknown_status_is_an_error_terminal() {
+        for api_id in RESPONSES_SIBLINGS {
+            let msg = terminal_for(
+                api_id,
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"bogus\"}}\n\n",
+            )
+            .await;
+            assert_eq!(msg.stop_reason, StopReason::Error, "{api_id}");
+            assert_eq!(
+                msg.error_message.as_deref(),
+                Some("Unhandled stop reason: bogus"),
+                "{api_id}"
+            );
+        }
+    }
+
+    /// MIRROR: the success statuses must stay clean terminals with no error message, and
+    /// `rawStopReason` must be stamped on them too (v0.84.1 `openai-responses-shared.ts:570` runs
+    /// on every settled turn, not just failures). Proves the guard is not over-broad.
+    #[tokio::test]
+    async fn success_statuses_stay_clean_terminals() {
+        let cases = [
+            (
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n",
+                StopReason::Stop,
+                Some("completed"),
+            ),
+            (
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+                StopReason::Length,
+                Some("incomplete.max_output_tokens"),
+            ),
+            (
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"queued\"}}\n\n",
+                StopReason::Stop,
+                Some("queued"),
+            ),
+            (
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n",
+                StopReason::Stop,
+                None,
+            ),
+        ];
+        for api_id in RESPONSES_SIBLINGS {
+            for (raw, want_reason, want_raw) in cases {
+                let msg = terminal_for(api_id, raw).await;
+                assert_eq!(msg.stop_reason, want_reason, "{api_id} / {raw}");
+                assert_eq!(msg.error_message, None, "{api_id} / {raw}");
+                assert_eq!(msg.raw_stop_reason.as_deref(), want_raw, "{api_id} / {raw}");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1885,7 +2129,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 2,
         })
     }
@@ -2178,7 +2424,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 2,
         });
         ctx.messages[2] = marked_tool_result("call_1|fc_item_1", &["late_tool", "later_tool"]);

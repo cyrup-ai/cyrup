@@ -53,10 +53,13 @@ impl SessionContext {
 ///   `buildContextEntries` keeps it at the head and iterates `0..compactionIdx`
 ///   (`session-manager.ts:441-453`);
 /// - everything else (`Custom`, `Label`, `ModelChange`, `ThinkingLevelChange`, `SessionInfo`,
-///   `Unknown`) → skipped.
+///   `Unknown`) → skipped;
+/// - a `message` entry holding a **deferred** assistant turn → skipped, see
+///   [`is_deferred_assistant`].
 pub fn push_as_message(out: &mut Vec<Message>, e: &Entry) {
     if let Entry::Known(k) = e {
         match k {
+            KnownEntry::Message { message, .. } if is_deferred_assistant(message) => {}
             KnownEntry::Message { message, .. } => message.push_llm(out),
             KnownEntry::CustomMessage { content, base, .. } => {
                 out.push(custom_to_message(content, parse_entry_ts(&base.timestamp)));
@@ -74,6 +77,46 @@ pub fn push_as_message(out: &mut Vec<Message>, e: &Entry) {
             _ => {}
         }
     }
+}
+
+/// Whether this message is an assistant turn that was **deferred** — i.e. a receipt for a request
+/// the provider accepted and will complete later, not a turn.
+///
+/// Pi excludes exactly this from the LLM context, at the entry-projection seam:
+///
+/// ```text
+/// // v0.84.1 packages/agent/src/harness/session/context.ts:71-73
+/// if (entry.type === "message") {
+///     if (entry.message.role === "assistant" && entry.message.stopReason === "deferred") return [];
+///     return [entry.message];
+/// }
+/// ```
+///
+/// Why: the entry's `content` is `[]` (`v0.84.1 ai/src/providers/faux.ts:293-296`) and its real payload
+/// is the [`cyrup_core::DeferredHandle`]. Feeding an empty assistant turn to the model corrupts the
+/// user/assistant alternation, so the entry stays a first-class member of the tree — Pi's reducer
+/// even *hard-fails* a session whose deferred entry lacks a handle
+/// (`v0.84.1 agent/src/harness/reducer.ts:274-281`) — while contributing nothing to context.
+///
+/// **Which Pi projection this is.** Pi has two: the harness one quoted above, and the coding-agent
+/// one this module otherwise ports (`v0.84.1 coding-agent/src/core/session-manager.ts:383-395`),
+/// which carries NO deferred arm. cyrup has a single projection serving both roles, so it takes the
+/// harness spelling. That is not a divergence on any input the coding-agent shape can produce:
+/// `deferred` appears nowhere in `coding-agent/src/core/{session-manager,agent-session,
+/// agent-session-runtime}.ts` at v0.84.1, and `CURRENT_SESSION_VERSION` is still `3`
+/// (`session-manager.ts:30`), so Pi's v3 writer never emits a deferred entry for the arm to see.
+/// It differs only on a file Pi's *harness* wrote — and there the harness rule is the correct one.
+///
+/// Applied by all three projections in this module ([`push_as_message`], `push_as_raw`,
+/// [`context_message_role`]) so "context-visible" stays one answer: Pi's
+/// `sessionEntryToContextMessages(entry).length === 0` holds for a deferred entry in every caller,
+/// including the cut-point back-scan and the compaction token estimate.
+pub fn is_deferred_assistant(message: &AgentMessage) -> bool {
+    matches!(
+        message,
+        AgentMessage::Core(Message::Assistant(a))
+            if a.stop_reason == cyrup_core::StopReason::Deferred
+    )
 }
 
 /// Compaction summary rendered as the FIRST message of a compacted context (R-04-012, Pi
@@ -172,6 +215,7 @@ pub fn build_context_messages(path: &[&Entry]) -> Vec<Message> {
 fn push_as_raw(out: &mut Vec<AgentMessage>, e: &Entry) {
     if let Entry::Known(k) = e {
         match k {
+            KnownEntry::Message { message, .. } if is_deferred_assistant(message) => {}
             KnownEntry::Message { message, .. } => out.push(message.clone()),
             KnownEntry::CustomMessage { content, custom_type, display, details, base } => {
                 out.push(AgentMessage::Custom(CustomRoleMessage {
@@ -227,6 +271,7 @@ pub fn raw_context_messages(e: &Entry) -> Vec<AgentMessage> {
 /// `if (entry.type === "branch_summary" && entry.summary)` (`session-manager.ts:400`).
 pub fn context_message_role(e: &Entry) -> Option<MessageRole> {
     match e {
+        Entry::Known(KnownEntry::Message { message, .. }) if is_deferred_assistant(message) => None,
         Entry::Known(KnownEntry::Message { message, .. }) => Some(message.role()),
         Entry::Known(KnownEntry::CustomMessage { .. }) => Some(MessageRole::Custom),
         Entry::Known(KnownEntry::BranchSummary { summary, .. }) if !summary.is_empty() => {

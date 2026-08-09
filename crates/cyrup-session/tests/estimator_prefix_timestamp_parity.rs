@@ -65,7 +65,9 @@ fn assistant_with_usage(text: &str, timestamp: i64, total_tokens: u64) -> Messag
             ..Usage::default()
         },
         stop_reason: StopReason::Stop,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp,
     })
 }

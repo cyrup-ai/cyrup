@@ -14056,7 +14056,9 @@ mod tests {
             diagnostics: None,
             usage: cyrup_core::Usage::default(),
             stop_reason: cyrup_core::StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         })
     }

@@ -259,8 +259,13 @@ impl RpcResponse {
 /// Serialized untagged: a `response` carries `"type":"response"`; an event carries its own
 /// `AgentSessionEvent` `type` tag (`agent_start`, `tool_execution_end`, …) — distinct, so a client
 /// dispatches on `type`. The event is boxed (it is the larger variant).
-#[derive(Debug, serde::Serialize)]
-#[serde(untagged)]
+///
+/// [`RpcOut::Event`] serializes through [`crate::to_json_event`], NOT through
+/// [`AgentSessionEvent`]'s own `Serialize` — Pi's `output(toJsonEvent(event))` (rpc-mode.ts:356).
+/// The `Serialize` impl is hand-written for exactly that reason (see below); the variant keeps its
+/// `Box<AgentSessionEvent>` payload so the projection stays a wire concern and no public signature
+/// changes.
+#[derive(Debug)]
 pub enum RpcOut {
     Response(RpcResponse),
     Event(Box<AgentSessionEvent>),
@@ -275,6 +280,29 @@ pub enum RpcOut {
     /// stdout each time the dispatcher contains + skips a guest handler fault (R-08-036). Untagged, so
     /// the embedded `"type":"extension_error"` is the discriminant a client dispatches on.
     ExtensionError(Value),
+}
+
+/// Untagged serialization — each variant serializes as its inner value and nothing else, exactly as
+/// `#[serde(untagged)]` did — with ONE difference: [`RpcOut::Event`] routes through
+/// [`crate::to_json_event`], so the rpc stdout stream carries the delta-only `message_update` Pi
+/// emits (rpc-mode.ts:356) rather than the cumulative snapshots.
+///
+/// Hand-written rather than derived because the projection has to happen at the point of writing:
+/// `RpcOut::Event` is constructed from an [`AgentSessionEvent`] the driver has in hand (`:807`,
+/// `:830`), which is the analog of Pi's `output(event)` call site, and the projection borrows rather
+/// than owning. Keeping the payload type and moving the projection into the serializer means the two
+/// wire writers ([`crate::run_json`] and [`write_out`]) share ONE projection with no copy to drift.
+/// The match is exhaustive so a new variant cannot silently skip it.
+impl serde::Serialize for RpcOut {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            RpcOut::Response(response) => response.serialize(serializer),
+            RpcOut::Event(event) => crate::to_json_event(event).serialize(serializer),
+            RpcOut::ExtensionUiRequest(value) | RpcOut::ExtensionError(value) => {
+                value.serialize(serializer)
+            }
+        }
+    }
 }
 
 /// A pending extension dialog awaiting its `extension_ui_response` (mirrors Pi's

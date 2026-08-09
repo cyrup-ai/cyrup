@@ -4125,7 +4125,15 @@ fn stop_reason_notice(message: &cyrup_core::AssistantMessage) -> Option<String> 
         // ("error") … }` (assistant-message.ts:177-201), and `"pending"` matches none of them —
         // no notice. Grouped explicitly rather than via a `_ =>` so a future variant still breaks
         // this match, which is how this arm got written in the first place.
-        StopReason::Pending | StopReason::Stop | StopReason::Length | StopReason::ToolUse => None,
+        //
+        // `Deferred` joins it for the same reason, verified the same way: `deferred` appears
+        // NOWHERE in `v0.84.1 coding-agent/src/modes/interactive/components/assistant-message.ts`,
+        // so Pi's chain falls through it too and renders no notice.
+        StopReason::Pending
+        | StopReason::Deferred
+        | StopReason::Stop
+        | StopReason::Length
+        | StopReason::ToolUse => None,
     }
 }
 

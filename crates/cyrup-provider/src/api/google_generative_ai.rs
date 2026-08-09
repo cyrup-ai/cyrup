@@ -879,6 +879,20 @@ struct Decoder {
     /// upstream, which seeds `"pending"`, not `"stop"`), which is what let a truncated Gemini stream
     /// be transcribed as a cleanly completed turn (PROV-010).
     stop_reason: Option<StopReason>,
+    /// The candidate's own `finishReason`, kept verbatim beside the narrowed [`StopReason`] (pi
+    /// `output.rawStopReason = candidate.finishReason`,
+    /// `v0.84.1 ai/src/api/google-generative-ai.ts:216`). PORT BUG, not version lag: the write is
+    /// present at v0.83.0 too (`v0.83.0 ai/src/api/google-generative-ai.ts:215`) and cyrup never
+    /// ported it.
+    ///
+    /// For Gemini this field is doubly load-bearing: pi READS it back to compose the terminal error
+    /// (``output.rawStopReason ? `Provider stopped with: ${output.rawStopReason}` : "An unknown
+    /// error occurred"``, `v0.84.1 ai/src/api/google-generative-ai.ts:271-273`). cyrup reaches the
+    /// same text from the other end — [`map_stop_reason`] bakes it in at map time — so the visible
+    /// message was NOT degraded; only the recorded field was missing. It is NOT cleared by the
+    /// tool-call override below: pi leaves `rawStopReason` set when it rewrites `stopReason` to
+    /// `"toolUse"` (`:218-220`).
+    raw_stop_reason: Option<String>,
     error_message: Option<String>,
 }
 
@@ -903,7 +917,9 @@ impl Decoder {
             // this value — it goes through `StreamEvent::end_of_stream`, which routes
             // `None`/`Pending` to the `error` terminal.
             stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
+            deferred: None,
             error_message: self.error_message.clone(),
+            raw_stop_reason: self.raw_stop_reason.clone(),
             timestamp: now_millis(),
         }
     }
@@ -1034,6 +1050,9 @@ async fn process_chunk(
         .and_then(|c| c.get("finishReason"))
         .and_then(Value::as_str)
     {
+        // pi records the raw reason first (`v0.84.1 ai/src/api/google-generative-ai.ts:216`) and
+        // never unsets it — not even when the tool-call override below rewrites `stopReason`.
+        dec.raw_stop_reason = Some(reason.to_string());
         let (stop, err) = map_stop_reason(reason);
         dec.stop_reason = Some(stop);
         if let Some(err) = err {
@@ -1649,6 +1668,63 @@ mod tests {
         assert!(fr.get("id").is_none());
     }
 
+    /// PORT BUG (present at v0.83.0, never ported): pi writes
+    /// `output.rawStopReason = candidate.finishReason`
+    /// (`v0.84.1 ai/src/api/google-generative-ai.ts:216`) and READS it back to compose the terminal
+    /// error (`:271-273`). cyrup reaches the same message text from the other end — [`map_stop_reason`]
+    /// bakes `Provider stopped with: …` in at map time — so the user-visible message was NOT
+    /// degraded; the RECORDED field was simply never written. Both halves are asserted here.
+    #[tokio::test]
+    async fn a_finish_reason_is_recorded_raw_and_names_itself_in_the_error() {
+        let m = model_with("gemini-2.5-pro", true);
+
+        let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"SAFETY\"}]}\n\n";
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {:?}", events.last());
+        };
+        // The READ half (pi `:271-273`): the reason names itself, never the generic fallback.
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("Provider stopped with: SAFETY")
+        );
+        // The WRITE half (pi `:216`): the raw string is on the turn.
+        assert_eq!(error.raw_stop_reason.as_deref(), Some("SAFETY"));
+
+        // MIRROR 1: a clean STOP records its raw word on the `done` terminal.
+        let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.raw_stop_reason.as_deref(), Some("STOP"));
+
+        // MIRROR 2: pi does NOT unset `rawStopReason` when the tool-call override rewrites
+        // `stopReason` to `"toolUse"` (`:218-220`) — the raw word outlives the override.
+        let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{}}}]},\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n";
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(message.stop_reason, StopReason::ToolUse);
+        assert_eq!(message.error_message, None);
+        assert_eq!(
+            message.raw_stop_reason.as_deref(),
+            Some("MALFORMED_FUNCTION_CALL")
+        );
+
+        // MIRROR 3: a truncated stream never delivered a finishReason, so there is nothing to record.
+        let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n";
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let last = events.last().expect("a terminal");
+        assert_eq!(
+            last.terminal_message()
+                .and_then(|t| t.raw_stop_reason.clone()),
+            None
+        );
+    }
+
     async fn collect(frames_bytes: Vec<u8>, m: &Model) -> Vec<StreamEvent> {
         let (sink, mut rx) = channel(64);
         let api = ApiId::from(API_ID);
@@ -1763,7 +1839,9 @@ mod tests {
                     diagnostics: None,
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
+                    deferred: None,
                     error_message: None,
+                    raw_stop_reason: None,
                     timestamp: 1,
                 }),
             ],

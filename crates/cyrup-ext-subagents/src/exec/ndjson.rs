@@ -96,8 +96,21 @@ pub enum SubagentEvent {
     /// `cyrup_agent::AgentMessage`, left opaque (module docs above).
     MessageStart { message: serde_json::Value },
     /// An assistant message received an incremental streaming update.
+    ///
+    /// Carries ONLY the delta. The producer is `cyrup-modes`' json mode, which since the v0.84.1
+    /// wire projection (Pi `toJsonEvent`, `coding-agent/src/modes/json-event.ts:28-40`, applied at
+    /// `print-mode.ts:110`) emits `message_update` as a two-key object — the cumulative outer
+    /// `message` snapshot and the inner `assistantMessageEvent.partial` are both gone, per
+    /// `coding-agent/docs/rpc.md:952-956`. This mirrors Pi retyping its own RPC client to the
+    /// projected event in the same change (`rpc-client.ts:50`).
+    ///
+    /// Declaring `message` here would be an outright protocol break, not a tolerated extra: it has
+    /// no `#[serde(default)]`, so a missing key fails the whole line's deserialization and
+    /// [`parse_line`]'s `.ok()` (`:316`) drops the event silently — `#[serde(other)]` catches an
+    /// unknown `type` TAG, never a known tag with a missing field. Omitting it instead is tolerant
+    /// in both directions: serde ignores unknown fields, so an OLDER cyrup child still emitting
+    /// `message` parses fine here.
     MessageUpdate {
-        message: serde_json::Value,
         assistant_message_event: serde_json::Value,
     },
     /// An assistant message completed (R-SA-027: usage accumulation and R-SA-029: final-output
@@ -462,6 +475,59 @@ mod tests {
                 args: serde_json::json!({"cmd": "ls"}),
             }
         );
+    }
+
+    /// A subagent child is a real `cyrup --print --mode json` re-exec, so its `message_update`
+    /// lines are whatever `cyrup-modes`' json mode writes. Since the v0.84.1 wire projection (Pi
+    /// `toJsonEvent`, `coding-agent/src/modes/json-event.ts:28-40`, applied at `print-mode.ts:110`)
+    /// that is a TWO-key record with no cumulative `message`. This is the exact line a child emits,
+    /// copied from the json-mode wire.
+    ///
+    /// Before the retype, `MessageUpdate` declared a required `message` field, so this line failed
+    /// to deserialize and [`parse_line`]'s `.ok()` (`:316`) discarded the event entirely — not a
+    /// tolerated degradation to [`SubagentEvent::Unknown`], which `#[serde(other)]` provides only
+    /// for an unrecognized `type` TAG, never for a known tag with a missing field.
+    #[test]
+    fn parses_the_delta_only_message_update_the_json_wire_now_emits() {
+        let line = r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello"}}"#;
+        // `expect` IS the assertion: with a required `message` field this returns `None` and the
+        // child's streaming update vanishes from the parsed stream entirely.
+        let ev = parse_line(line).expect(
+            "the delta-only wire shape must parse — a required `message` field silently drops it",
+        );
+        assert_eq!(ev.kind(), "message_update", "must not degrade to Unknown");
+        // Matched with `..` so this test compiles against either enum shape and therefore fails at
+        // RUNTIME (with the message above) rather than at compile time.
+        let delta = match ev {
+            SubagentEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => Some(assistant_message_event),
+            _ => None,
+        };
+        assert_eq!(
+            delta,
+            Some(serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "Hello"})),
+            "the delta payload survives verbatim"
+        );
+    }
+
+    /// MIRROR: an OLDER cyrup child still emitting the pre-projection record (with the cumulative
+    /// `message`) keeps parsing — serde ignores unknown fields, so dropping the field from the enum
+    /// is tolerant in both directions rather than trading one break for another.
+    #[test]
+    fn still_parses_a_legacy_message_update_that_carries_the_cumulative_message() {
+        let line = r#"{"type":"message_update","message":{"role":"assistant","content":[]},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello","partial":{"role":"assistant","content":[]}}}"#;
+        let ev = parse_line(line).expect("a legacy child's line must still parse");
+        assert_eq!(ev.kind(), "message_update");
+        let delta = match ev {
+            SubagentEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => assistant_message_event,
+            _ => serde_json::Value::Null,
+        };
+        assert_eq!(delta["delta"], "Hello", "the delta payload is still read");
     }
 
     #[test]
