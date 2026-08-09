@@ -58,7 +58,8 @@ use crate::error::TuiError;
 use crate::extension_editor::ExtensionEditorSelector;
 use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
 use crate::keymap::{
-    Action, EditorAction, Key, Keymap, SelectAction, SelectKeymap, TreeKeymap,
+    Action, EditorAction, Key, Keymap, ModelsKeymap, SelectAction, SelectKeymap, SessionKeymap,
+    TreeKeymap,
 };
 use crate::login_dialog::{
     notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginUiMsg,
@@ -252,6 +253,14 @@ pub struct AppState {
     /// The `/tree` bespoke binding table (`app.tree.*`, spec/tui/05 §6.1) handed to each opened
     /// [`TreeSelector`] so JSON rebinds of fold/unfold/label flow through (R-10-018).
     pub tree_keymap: TreeKeymap,
+    /// The `/resume` bespoke binding table (`app.session.*`, `core/keybindings.ts:91-94,135-154`)
+    /// handed to each opened [`SessionSelector`], so a JSON rebind of sort/named/delete/path/rename
+    /// reaches BOTH the handler and the header's hint rows (`session-selector.ts:171-179`).
+    pub session_keymap: SessionKeymap,
+    /// The `/scoped-models` bespoke binding table (`app.models.*`, `core/keybindings.ts:150-175`)
+    /// handed to each opened [`CheckboxSelector`], so a JSON rebind of reorder/all/clear/provider/
+    /// save reaches both the handler and the footer row (`scoped-models-selector.ts:199-204`).
+    pub models_keymap: ModelsKeymap,
     /// The slash-command registry driving dispatch + autocomplete (rebuilt on `/reload`).
     pub commands: CommandRegistry,
     /// The active editor-swap selector, if any (spec/tui/05 §1.1): when `Some`, it replaces the
@@ -449,6 +458,8 @@ impl AppState {
             keymap: Keymap::default(),
             select_keymap: SelectKeymap::default(),
             tree_keymap: TreeKeymap::default(),
+            session_keymap: SessionKeymap::default(),
+            models_keymap: ModelsKeymap::default(),
             commands: CommandRegistry::new(),
             selector: None,
             overlays: Vec::new(),
@@ -832,6 +843,8 @@ impl<B: Backend> App<B> {
         self.state.keymap.merge_json(json)?;
         self.state.select_keymap.merge_json(json)?;
         self.state.tree_keymap.merge_json(json)?;
+        self.state.session_keymap.merge_json(json)?;
+        self.state.models_keymap.merge_json(json)?;
         self.state.editor.merge_keybindings_json(json)?;
         Ok(())
     }
@@ -1945,8 +1958,14 @@ impl<B: Backend> App<B> {
         enabled: Option<Vec<String>>,
     ) {
         let saved_editor = self.state.editor.text();
-        let inner: Box<dyn Selector> =
-            Box::new(CheckboxSelector::scoped_models(catalog, enabled));
+        let mut selector = CheckboxSelector::scoped_models(catalog, enabled);
+        // `getFooterText` resolves the toggle key through `keyText("tui.select.confirm")`
+        // (`scoped-models-selector.ts:198`), so the footer has to read the app's merged table, not
+        // the stock one. Same for the bespoke `app.models.*` keys the rest of the row names
+        // (`:199-204`), which is what `set_models_keymap` is for.
+        selector.set_select_keymap(self.state.select_keymap.clone());
+        selector.set_models_keymap(self.state.models_keymap.clone());
+        let inner: Box<dyn Selector> = Box::new(selector);
         self.state.selector = Some(ActiveSelector {
             kind: SelectorKind::ScopedModels,
             inner,
@@ -1964,6 +1983,9 @@ impl<B: Backend> App<B> {
     pub fn open_model_selector(&mut self, models: Vec<ModelEntry>, search: Option<String>) {
         let saved_editor = self.state.editor.text();
         let mut selector = ModelSelector::new(models);
+        // `getScopeHintText` is `keyHint("tui.input.tab", "scope") + …` (`model-selector.ts:229`),
+        // resolved through the live table; cyrup's editor tier owns that binding.
+        selector.set_editor_keymap(self.state.editor.keymap_ref());
         if let Some(term) = search {
             selector.set_search(term);
         }
@@ -2306,18 +2328,14 @@ impl<B: Backend> App<B> {
                 .push_status(cyrup_config::login::provider_selector_empty_message(auth_type));
             return;
         }
-        let rows = crate::login_selector_rows(&options);
+        // S5/S21: the real `OAuthSelectorComponent` (`oauth-selector.ts`) — search `Input`, fuzzy
+        // filter, coloured status runs — in place of the bare `ListSelector`. `initialSearchInput`
+        // (`:5124`) now lands where upstream puts it: seeded into the search box (`:99`), not
+        // reported as a status line.
+        let selector =
+            crate::OAuthSelector::new(crate::OAuthMode::Login, &options, initial_search);
         self.state.login_options = options;
-        self.open_data_selector(SelectorKind::Login, rows, 0);
-        // Pi additionally seeds `OAuthSelectorComponent`'s own search field with the unmatched
-        // `/login <ref>` argument (`:5124`). cyrup's `ListSelector` has no search field (only
-        // `ModelSelector` does), so the argument is reported instead of silently vanishing; the
-        // list itself is identical either way.
-        if let Some(term) = initial_search.filter(|t| !t.trim().is_empty()) {
-            self.state
-                .transcript
-                .push_status(format!("no provider matches \"{term}\" — showing all"));
-        }
+        self.open_boxed_selector(SelectorKind::Login, Box::new(selector));
     }
 
     /// `startProviderLogin(providerOption)` (`interactive-mode.ts:5017-5025`), routed through the
@@ -3189,20 +3207,27 @@ impl<B: Backend> App<B> {
                 }
             }
             C::OpenSelector(SelectorKind::UserMessage) => {
-                let rows: Vec<(String, String, Option<String>)> = session
+                // S22: the real `UserMessageSelectorComponent` (`user-message-selector.ts`) —
+                // three lines per entry (message / `Message i of N` / blank) under a header that
+                // sits ABOVE the top rule. The `Some(format!("message {}", i + 1))` description
+                // this used to build is gone: the metadata line is the component's own, and its
+                // text is `  Message ${position} of ${this.messages.length}` (`:66`).
+                let rows: Vec<crate::UserMessageRow> = session
                     .user_messages_for_forking()
                     .await
                     .into_iter()
-                    .enumerate()
-                    .map(|(i, a)| {
-                        (a.entry_id.to_string(), a.text.clone(), Some(format!("message {}", i + 1)))
+                    .map(|a| crate::UserMessageRow {
+                        id: a.entry_id.to_string(),
+                        text: a.text.clone(),
                     })
                     .collect();
                 if rows.is_empty() {
                     self.state.transcript.push_status("no user messages to fork from");
                 } else {
-                    let last = rows.len().saturating_sub(1);
-                    self.open_data_selector(SelectorKind::UserMessage, rows, last);
+                    // `initialSelectedId` is unset here, so the constructor preselects the most
+                    // recent message (`:24-26`) — the same row the old `last` index picked.
+                    let selector = crate::UserMessageSelector::new(rows, None);
+                    self.open_boxed_selector(SelectorKind::UserMessage, Box::new(selector));
                 }
             }
             C::OpenSelector(SelectorKind::Tree) => {
@@ -3263,15 +3288,22 @@ impl<B: Backend> App<B> {
                         .push_status(cyrup_config::login::NO_STORED_CREDENTIALS);
                     return;
                 }
-                let rows = crate::login_selector_rows(&options);
+                // S5/S21 — same component as `/login`, in `logout` mode (`:52`), which changes the
+                // title (`:72`) and the empty-catalog copy (`:155-158`).
+                let selector =
+                    crate::OAuthSelector::new(crate::OAuthMode::Logout, &options, None);
                 self.state.logout_options = options;
-                self.open_data_selector(SelectorKind::Logout, rows, 0);
+                self.open_boxed_selector(SelectorKind::Logout, Box::new(selector));
             }
             C::OpenSelector(SelectorKind::Settings) => {
                 // `/settings` (settings-selector.ts): the curated toggle/choice grid sourced from the
                 // live effective settings. Each row cycles in place on `Enter` and persists via
                 // `ApplySetting` (Pi's settings selector applies on `onChange`).
-                let rows = settings_rows(session.services().settings.effective(), &self.state.theme.name);
+                let rows = settings_rows(
+                    session.services().settings.effective(),
+                    &self.state.theme.name,
+                    &self.state.keymap,
+                );
                 let inner: Box<dyn Selector> = Box::new(SettingsSelector::new("Settings", rows));
                 self.open_boxed_selector(SelectorKind::Settings, inner);
             }
@@ -3302,7 +3334,12 @@ impl<B: Backend> App<B> {
                         labels,
                         selected,
                     )
-                    .with_saved_index(saved_index),
+                    .with_saved_index(saved_index)
+                    // `keyHint("tui.select.confirm", "save")` / `…cancel` (`trust-selector.ts:
+                    // 78-82`) read `getKeybindings()`, so the row must be built from the app's
+                    // merged table — `handle` only adopts it once a key has already been pressed,
+                    // which is one paint too late.
+                    .with_hints(&self.state.select_keymap),
                 );
                 self.open_boxed_selector(SelectorKind::Trust, inner);
             }
@@ -3345,7 +3382,36 @@ impl<B: Backend> App<B> {
                             }
                         })
                         .collect();
-                    let inner: Box<dyn Selector> = Box::new(SessionSelector::new(rows));
+                    // `new SessionSelectorComponent(..., { keybindings }, currentSessionFilePath)`
+                    // (`interactive-mode.ts:4867-4884`): the picker is handed the live keybindings
+                    // AND the running session's file path, and each `SessionInfo` carries its
+                    // `parentSessionPath` (`session-manager.ts` → `session-selector.ts:222`).
+                    // Without those three the threaded view has no edges to draw, the row you are
+                    // sitting in is not accented, and the hint rows name stock keys.
+                    let mut selector = SessionSelector::new(rows)
+                        .with_keymaps(&self.state.session_keymap, self.state.editor.keymap_ref());
+                    selector.set_parent_paths(sessions.iter().filter_map(|s| {
+                        s.parent_session_path
+                            .as_ref()
+                            .map(|p| (s.path.display().to_string(), p.display().to_string()))
+                    }));
+                    // `options?.showRenameHint ?? this.canRename` (`session-selector.ts:772`):
+                    // upstream's host declares the capability by passing a `renameSession`
+                    // callback. cyrup's is the `SessionSelectorOutcome::Rename` arm below, which
+                    // lands in `session.rename_session_file` — so the capability is present and the
+                    // hint is on. Stated here rather than defaulted in the component, because the
+                    // component cannot know whether its host wired the apply path.
+                    selector.set_show_rename_hint(true);
+                    // `currentSessionFilePath` — resolved from the listing rather than the manager
+                    // so it is the SAME string the rows carry (a canonicalization mismatch would
+                    // silently never match).
+                    selector.set_current_session_path(
+                        sessions
+                            .iter()
+                            .find(|s| s.id.to_string() == current)
+                            .map(|s| s.path.display().to_string()),
+                    );
+                    let inner: Box<dyn Selector> = Box::new(selector);
                     self.open_boxed_selector(SelectorKind::Session, inner);
                 }
             }
@@ -4960,41 +5026,63 @@ pub fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
 /// `SettingsConfig` → `SettingItem`s, :479-712). Each row's `id` is the dotted settings key persisted
 /// on cycle; toggles cycle `true`/`false`, choices cycle their fixed sets. Read straight off
 /// [`cyrup_session_svc::EffectiveSettings`] so the displayed value matches the merged config.
-fn settings_rows(eff: &cyrup_session_svc::EffectiveSettings, current_theme: &str) -> Vec<SettingRow> {
+fn settings_rows(
+    eff: &cyrup_session_svc::EffectiveSettings,
+    current_theme: &str,
+    keymap: &Keymap,
+) -> Vec<SettingRow> {
     let choices = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // `const followUpKey = keyDisplayText("app.message.followUp")` (`settings-selector.ts:491`),
+    // interpolated into the follow-up row's description at `:513`. `keyDisplayText` is `keyText`
+    // with `{ capitalize: true }` (`keybinding-hints.ts:37-39`), i.e. `Alt+Enter`, and it reads the
+    // LIVE table — a rebind changes the sentence.
+    let follow_up_key = keymap
+        .keys_label(Action::FollowUp)
+        .map(|k| crate::chrome::format_key_text(&k, true))
+        .unwrap_or_default();
     vec![
         // The "Theme" row opens the theme picker (Pi `SettingItem.submenu` → `ThemeSubmenu`,
         // settings-selector.ts:603-610) — the one in-app path Pi reaches theme switching through.
-        SettingRow::submenu("theme", "Theme", current_theme.to_string(), "theme"),
-        SettingRow::toggle("compaction.enabled", "Auto-compact", eff.compaction_enabled()),
-        SettingRow::toggle("terminal.showImages", "Show images", eff.show_images()),
+        SettingRow::submenu("theme", "Theme", current_theme.to_string(), "theme")
+            .with_description("Color theme for the interface"),
+        SettingRow::toggle("compaction.enabled", "Auto-compact", eff.compaction_enabled())
+            .with_description("Automatically compact context when it gets too large"),
+        SettingRow::toggle("terminal.showImages", "Show images", eff.show_images())
+            .with_description("Render images inline in terminal"),
         SettingRow::choice(
             "terminal.imageWidthCells",
             "Image width",
             eff.image_width_cells().to_string(),
             choices(&["60", "80", "120"]),
-        ),
-        SettingRow::toggle("images.autoResize", "Auto-resize images", eff.image_auto_resize()),
-        SettingRow::toggle("images.blockImages", "Block images", eff.block_images()),
-        SettingRow::toggle("enableSkillCommands", "Skill commands", eff.enable_skill_commands()),
+        )
+        .with_description("Preferred inline image width in terminal cells"),
+        SettingRow::toggle("images.autoResize", "Auto-resize images", eff.image_auto_resize())
+            .with_description("Resize large images to 2000x2000 max for better model compatibility"),
+        SettingRow::toggle("images.blockImages", "Block images", eff.block_images())
+            .with_description("Prevent images from being sent to LLM providers"),
+        SettingRow::toggle("enableSkillCommands", "Skill commands", eff.enable_skill_commands())
+            .with_description("Register skills as /skill:name commands"),
         // `showHardwareCursor` / `terminal.clearOnShrink` — the effective getters need the env surface;
         // a default `EnvVars` yields the persisted setting (else `false`), which is what the grid edits.
         SettingRow::toggle(
             "showHardwareCursor",
             "Show hardware cursor",
             eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::default()),
-        ),
+        )
+        .with_description("Show the terminal cursor while still positioning it for IME support"),
         SettingRow::toggle(
             "terminal.clearOnShrink",
             "Clear on shrink",
             eff.clear_on_shrink(&cyrup_session_svc::EnvVars::default()),
-        ),
+        )
+        .with_description("Clear empty rows when content shrinks (may cause flicker)"),
         SettingRow::choice(
             "editorPaddingX",
             "Editor padding",
             eff.editor_padding_x().to_string(),
             choices(&["0", "1", "2", "3"]),
-        ),
+        )
+        .with_description("Horizontal padding for input editor (0-3)"),
         // Inserted right after editor-padding, matching Pi (`settings-selector.ts:681-689` splices the
         // "Output padding" row after "editor-padding"). Cycles 0|1; honored live by the transcript.
         SettingRow::choice(
@@ -5002,13 +5090,17 @@ fn settings_rows(eff: &cyrup_session_svc::EffectiveSettings, current_theme: &str
             "Output padding",
             eff.output_pad().to_string(),
             choices(&["0", "1"]),
+        )
+        .with_description(
+            "Horizontal padding for user messages, assistant messages, and thinking",
         ),
         SettingRow::choice(
             "autocompleteMaxVisible",
             "Autocomplete max items",
             eff.autocomplete_max_visible().to_string(),
             choices(&["3", "5", "7", "10", "15", "20"]),
-        ),
+        )
+        .with_description("Max visible items in autocomplete dropdown (3-20)"),
         // `httpIdleTimeoutMs` — cycle the raw millisecond presets (Pi shows human labels; the persisted
         // value is the same ms number). `disabled` = 0 (`HTTP_IDLE_TIMEOUT_CHOICES`, http-dispatcher.ts:5).
         SettingRow::choice(
@@ -5016,32 +5108,51 @@ fn settings_rows(eff: &cyrup_session_svc::EffectiveSettings, current_theme: &str
             "HTTP idle timeout (ms)",
             eff.http_idle_timeout_ms().unwrap_or(300_000).to_string(),
             choices(&["30000", "60000", "120000", "300000", "0"]),
+        )
+        .with_description(
+            "Maximum idle gap while waiting for HTTP headers or body chunks. Disable for local \
+             models that pause longer than five minutes.",
         ),
-        SettingRow::toggle("hideThinkingBlock", "Hide thinking", eff.hide_thinking_block()),
-        SettingRow::toggle("collapseChangelog", "Collapse changelog", eff.collapse_changelog()),
-        SettingRow::toggle("quietStartup", "Quiet startup", eff.quiet_startup()),
+        SettingRow::toggle("hideThinkingBlock", "Hide thinking", eff.hide_thinking_block())
+            .with_description("Hide thinking blocks in assistant responses"),
+        SettingRow::toggle("collapseChangelog", "Collapse changelog", eff.collapse_changelog())
+            .with_description("Show condensed changelog after updates"),
+        SettingRow::toggle("quietStartup", "Quiet startup", eff.quiet_startup())
+            .with_description("Disable verbose printing at startup"),
         SettingRow::toggle(
             "enableInstallTelemetry",
             "Install telemetry",
             eff.enable_install_telemetry(),
+        )
+        .with_description(
+            "Send an anonymous version/update ping after changelog-detected updates",
         ),
         SettingRow::toggle(
             "terminal.showTerminalProgress",
             "Terminal progress",
             eff.show_terminal_progress(),
-        ),
+        )
+        .with_description("Show OSC 9;4 progress indicators in the terminal tab bar"),
         SettingRow::choice(
             "steeringMode",
             "Steering mode",
             eff.steering_mode(),
             choices(&["all", "one-at-a-time"]),
+        )
+        .with_description(
+            "Enter while streaming queues steering messages. 'one-at-a-time': deliver one, wait \
+             for response. 'all': deliver all at once.",
         ),
         SettingRow::choice(
             "followUpMode",
             "Follow-up mode",
             eff.follow_up_mode(),
             choices(&["all", "one-at-a-time"]),
-        ),
+        )
+        .with_description(format!(
+            "{follow_up_key} queues follow-up messages until agent stops. 'one-at-a-time': \
+             deliver one, wait for response. 'all': deliver all at once."
+        )),
         SettingRow::choice(
             "transport",
             "Transport",
@@ -5051,24 +5162,32 @@ fn settings_rows(eff: &cyrup_session_svc::EffectiveSettings, current_theme: &str
             // missing here, so a value the settings parser and `parse_transport` both accept was
             // unreachable from `/settings` and cycling past `sse` could never select it.
             choices(&["sse", "websocket", "websocket-cached", "auto"]),
+        )
+        .with_description(
+            "Preferred transport for providers that support multiple transports",
         ),
         SettingRow::choice(
             "doubleEscapeAction",
             "Double-escape action",
             eff.double_escape_action(),
             choices(&["fork", "tree", "none"]),
-        ),
+        )
+        .with_description("Action when pressing Escape twice with empty editor"),
         SettingRow::choice(
             "treeFilterMode",
             "Tree filter mode",
             eff.tree_filter_mode(),
             choices(&["default", "no-tools", "user-only", "labeled-only", "all"]),
-        ),
+        )
+        .with_description("Default filter when opening /tree"),
         SettingRow::choice(
             "defaultProjectTrust",
             "Default project trust",
             default_trust_label(eff.default_project_trust()),
             choices(&["ask", "always", "never"]),
+        )
+        .with_description(
+            "Fallback behavior when no extension or saved trust decision decides project trust",
         ),
     ]
 }

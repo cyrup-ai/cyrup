@@ -57,6 +57,7 @@ mod keymap;
 mod login_dialog;
 mod markdown;
 mod model_selector;
+mod oauth_selector;
 mod overlay;
 mod panic_hook;
 mod resume_hint;
@@ -77,6 +78,7 @@ mod theme;
 mod tmux;
 mod transcript;
 mod tree_selector;
+mod user_message_selector;
 
 pub use app::{
     crossterm_input_stream, extension_render, reanchor_inline_region, render,
@@ -85,7 +87,7 @@ pub use app::{
 };
 pub use auth_select::{
     format_auth_selector_provider_type, format_status_indicator, login_selector_rows,
-    provider_display_name, provider_rows, AuthState,
+    provider_display_name, provider_rows, status_indicator_runs, AuthState, StatusTone,
 };
 pub use autocomplete::{
     list_files as mention_list_files, mention_autocomplete, mention_query, Applied, Autocomplete,
@@ -132,7 +134,8 @@ pub use keyboard_protocol::{
 };
 pub use keymap::{
     Action, AutocompleteAction, AutocompleteKeymap, EditorAction, EditorKeymap, Key, Keymap,
-    ModelsAction, ModelsKeymap, SelectAction, SelectKeymap, TreeAction, TreeKeymap,
+    ModelsAction, ModelsKeymap, SelectAction, SelectKeymap, SessionAction, SessionKeymap,
+    TreeAction, TreeKeymap,
 };
 pub use login_dialog::{
     notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginLineKind, LoginUiMsg,
@@ -144,11 +147,16 @@ pub use markdown::{
 };
 pub use model_selector::{ModelEntry, ModelSelector};
 pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE};
-pub use config_selector::{ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle};
-pub use selector::{
-    search_input_spans, CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome,
-    SCOPED_MODELS_ALL,
+pub use config_selector::{
+    ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle, ConfigWriteScope,
+    ProjectOverrideState,
 };
+pub use oauth_selector::{OAuthMode, OAuthSelector};
+pub use selector::{
+    input_line_spans, search_input_spans, CheckboxSelector, ListSelector, Selector, SelectorKind,
+    SelectorOutcome, INPUT_PROMPT, SCOPED_MODELS_ALL,
+};
+pub use user_message_selector::{UserMessageRow, UserMessageSelector};
 pub use session_search::{
     filter_and_sort as filter_and_sort_sessions, match_text as match_session_text,
     parse_search_query, NameFilter, ParsedSearchQuery, QueryMode, SearchRow, SearchToken, SortMode,

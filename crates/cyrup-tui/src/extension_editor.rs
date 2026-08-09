@@ -219,8 +219,9 @@ impl Selector for ExtensionEditorSelector {
         //   `Spacer`(:80) · hint(:83-90) · `Spacer`(:92) · `DynamicBorder`(:95).
         // Identical to `extension-input.ts:47-70`'s shape. E5 is `:95` — the dialog opened with a
         // rule and never closed, bleeding into the footer; `:62` alone was ported. E7 is the four
-        // spacers. All heights are natural and the blanks unconditional; `stack_rows` clips
-        // top-first exactly as pi's layout engine does (see its doc).
+        // spacers. All heights are natural and the blanks unconditional; `stack_rows` fills the
+        // regions from the TOP and starves the trailing ones, so the visible rows are a prefix of
+        // the natural render, exactly as pi's layout engine does (see its doc).
         let [top, _, title_area, _, body, _, hint, _, bottom] =
             stack_rows(area, [1, 1, title_h, 1, body_h, 1, hint_h, 1, 1]);
         let rule = |w: u16| "─".repeat(w.max(1) as usize);

@@ -18,7 +18,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap, TreeAction, TreeKeymap};
-use crate::selector::{search_input_spans, Selector, SelectorOutcome};
+use crate::selector::{Selector, SelectorOutcome};
 use crate::theme::UiTheme;
 
 /// The entry-type glyph key (`tree-selector.ts` switch ~`:638`, render `:691-727`; spec/tui/05 §5.1).
@@ -409,8 +409,12 @@ impl TreeSelector {
     /// the live buffer with a visible caret, and the save/cancel hint — shown in the tree body while a
     /// rename is in progress.
     fn label_edit_lines(&self, edit: &LabelEdit, theme: &UiTheme) -> Vec<Line<'static>> {
+        // S31: `LabelInput.render` splices the `Input`'s own line in behind a literal two-space
+        // `indent` — `lines.push(...this.input.render(availableWidth).map(line => `${indent}${line}`))`
+        // (`tree-selector.ts:1299,1302`) — so the row reads `"  " + "> " + value`. cyrup drew the
+        // indent but dropped `Input.render`'s shared `"> "` prompt (`input.ts:380`) entirely.
         let mut input = vec![Span::raw("  ")];
-        input.extend(search_input_spans(&edit.query, edit.cursor, theme));
+        input.extend(crate::selector::input_line_spans(&edit.query, edit.cursor, theme));
         vec![
             Line::from(Span::styled("  Label (empty to remove):", theme.muted_style())),
             Line::from(input),

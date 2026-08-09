@@ -721,6 +721,24 @@ impl ModelsKeymap {
         self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
+    /// **All** keys bound to `action`, joined with `/` — the `app.models.*` twin of
+    /// [`SelectKeymap::keys_label`], i.e. Pi's `keyText("app.models.…")`
+    /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's
+    /// `keys.length === 0` → `""`).
+    ///
+    /// Read **only** by the `/scoped-models` footer hint
+    /// (`scoped-models-selector.ts:197-205`), which is the only place upstream calls `keyText` on
+    /// an `app.models.*` id.
+    pub fn keys_label(&self, action: ModelsAction) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
+    }
+
     /// Rebind `action` to exactly `keys`.
     pub fn set_action(&mut self, action: ModelsAction, keys: Vec<Key>) {
         self.bindings.retain(|(_, a)| *a != action);
@@ -733,6 +751,101 @@ impl ModelsKeymap {
     pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
         for (id, value) in keybindings_object(json)? {
             if let Some(action) = ModelsAction::from_id(&id) {
+                self.set_action(action, parse_key_values(&value)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `/resume` session-picker actions (`session-selector.ts:532-637`; `core/keybindings.ts:91-94,
+/// 135-154` `app.session.*`). These bind only inside the session selector, on top of the shared
+/// `tui.select.*` navigation; resolved via [`SessionKeymap`] (R-10-018).
+///
+/// The header's second hint row names **every one of them** through `keyHint("app.session.…", …)`
+/// (`session-selector.ts:171-179`), so a rebind has to reach the hint text as well as the handler —
+/// which is exactly what a hardcoded `"ctrl+s sort · ctrl+n named · …"` string cannot do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SessionAction {
+    /// Cycle threaded → recent → fuzzy — `app.session.toggleSort` (Ctrl+S).
+    ToggleSort,
+    /// Toggle the all ↔ named filter — `app.session.toggleNamedFilter` (Ctrl+N).
+    ToggleNamedFilter,
+    /// Ask to delete the highlighted session — `app.session.delete` (Ctrl+D).
+    Delete,
+    /// Fold the session path into the metadata column — `app.session.togglePath` (Ctrl+P).
+    TogglePath,
+    /// Rename the highlighted session — `app.session.rename` (Ctrl+R).
+    Rename,
+}
+
+impl SessionAction {
+    /// Resolve an `app.session.*` binding id (`core/keybindings.ts:91-94,135-154`).
+    pub fn from_id(id: &str) -> Option<SessionAction> {
+        match id {
+            "app.session.toggleSort" => Some(SessionAction::ToggleSort),
+            "app.session.toggleNamedFilter" => Some(SessionAction::ToggleNamedFilter),
+            "app.session.delete" => Some(SessionAction::Delete),
+            "app.session.togglePath" => Some(SessionAction::TogglePath),
+            "app.session.rename" => Some(SessionAction::Rename),
+            _ => None,
+        }
+    }
+}
+
+/// The configurable `/resume` binding table. Defaults are upstream's verbatim
+/// (`core/keybindings.ts:91-94` Ctrl+N, `:135-150` Ctrl+P / Ctrl+S / Ctrl+R / Ctrl+D).
+#[derive(Clone, Debug)]
+pub struct SessionKeymap {
+    bindings: Vec<(Key, SessionAction)>,
+}
+
+impl Default for SessionKeymap {
+    fn default() -> Self {
+        use SessionAction as S;
+        SessionKeymap {
+            bindings: vec![
+                (Key::ctrl('s'), S::ToggleSort),
+                (Key::ctrl('n'), S::ToggleNamedFilter),
+                (Key::ctrl('d'), S::Delete),
+                (Key::ctrl('p'), S::TogglePath),
+                (Key::ctrl('r'), S::Rename),
+            ],
+        }
+    }
+}
+
+impl SessionKeymap {
+    /// Resolve the session-picker action for an event, if any (R-10-018).
+    pub fn action_for(&self, ev: &KeyEvent) -> Option<SessionAction> {
+        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// **All** keys bound to `action`, joined with `/` — Pi's `keyText("app.session.…")`
+    /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's
+    /// `keys.length === 0` → `""`).
+    pub fn keys_label(&self, action: SessionAction) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
+    }
+
+    /// Rebind `action` to exactly `keys`.
+    pub fn set_action(&mut self, action: SessionAction, keys: Vec<Key>) {
+        self.bindings.retain(|(_, a)| *a != action);
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document, applying only the `app.session.*` ids.
+    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
+        for (id, value) in keybindings_object(json)? {
+            if let Some(action) = SessionAction::from_id(&id) {
                 self.set_action(action, parse_key_values(&value)?);
             }
         }

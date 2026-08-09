@@ -367,7 +367,11 @@ impl LoginDialog {
             }
         }
         if let Some(input) = &self.input {
-            let mut spans = vec![Span::styled(" > ", style(UiTheme::accent_style))];
+            // S31: `LoginDialogComponent` adds its `Input` to `contentContainer` as a bare child
+            // (`login-dialog.ts:140`, `:160`) — no `Text` wrapper — so the row is `Input.render`'s
+            // shared, unstyled `"> "` at column 0 (`input.ts:380`). cyrup drew an accent `" > "`.
+            let mut spans =
+                vec![Span::styled(crate::selector::INPUT_PROMPT, style(UiTheme::base_style))];
             match input.placeholder.as_deref().filter(|s| !s.is_empty()) {
                 Some(hint) if input.buffer.is_empty() => {
                     spans.push(Span::styled(hint.to_string(), style(UiTheme::muted_style)));

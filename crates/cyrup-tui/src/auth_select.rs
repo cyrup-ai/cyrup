@@ -141,6 +141,63 @@ fn looks_like_env_var_list(source: &str) -> bool {
         })
 }
 
+/// The theme colour one run of the status indicator is painted in.
+///
+/// **S21.** `formatStatusIndicator` (`oauth-selector.ts:164-181`) does not return one uniformly
+/// coloured string: `" ✓ configured"` is `theme.fg("success", …)` (`:175`), the mismatch case is
+/// `theme.fg("muted", " • ") + theme.fg("warning", label)` (`:168`) — **two** runs — and
+/// `" • unconfigured"` is `theme.fg("muted", …)` (`:165`). cyrup folded the whole thing into a
+/// `SelectItem.description`, which `select_list.rs` paints uniformly `muted` (or, on the highlighted
+/// row, uniformly `accent`), so a configured provider read grey instead of green and a credential
+/// mismatch lost its warning entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusTone {
+    /// `theme.fg("muted", …)`.
+    Muted,
+    /// `theme.fg("warning", …)`.
+    Warning,
+    /// `theme.fg("success", …)`.
+    Success,
+}
+
+/// `formatStatusIndicator(provider)` as the **styled runs** upstream actually emits
+/// (`oauth-selector.ts:164-181`), each keeping its own colour — see [`StatusTone`].
+///
+/// The text is verbatim upstream's, **leading space included**: the indicator is concatenated
+/// straight onto the provider name at `:138`/`:141` (`prefix + text + authTypeLabel +
+/// statusIndicator`), so the single space in `" ✓ configured"` is the entire gap between the name
+/// and its status. [`format_status_indicator`] keeps returning the space-less form, because that one
+/// feeds a padded description column rather than this concatenation.
+pub fn status_indicator_runs(option: &LoginProviderOption) -> Vec<(StatusTone, String)> {
+    // `if (!provider.status) return theme.fg("muted", " • unconfigured")` (`:165`).
+    let Some(status) = option.status.as_ref() else {
+        return vec![(StatusTone::Muted, " • unconfigured".to_string())];
+    };
+    // `:166-169` — a stored credential of the OTHER kind: muted bullet, warning label.
+    if status.auth_type != option.auth_type {
+        let label = match status.auth_type {
+            AuthType::Oauth => "subscription configured",
+            AuthType::ApiKey => "API key configured",
+        };
+        return vec![
+            (StatusTone::Muted, " • ".to_string()),
+            (StatusTone::Warning, label.to_string()),
+        ];
+    }
+    // `:170-176`.
+    let source = match status.source.as_deref() {
+        None | Some("") | Some("OAuth") | Some("stored credential") => {
+            return vec![(StatusTone::Success, " ✓ configured".to_string())];
+        }
+        Some(source) => source,
+    };
+    if looks_like_env_var_list(source) {
+        vec![(StatusTone::Success, format!(" ✓ env: {source}"))]
+    } else {
+        vec![(StatusTone::Success, format!(" ✓ {source}"))]
+    }
+}
+
 /// `formatStatusIndicator(provider)` (`oauth-selector.ts:164-181`) — the row's trailing status,
 /// verbatim including the mismatch case (a provider whose STORED credential is of the other kind
 /// shows `• subscription configured` / `• API key configured`, not `✓ configured`).

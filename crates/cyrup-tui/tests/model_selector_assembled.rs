@@ -73,8 +73,15 @@ fn assembled_model_selector_open_shows_search_check_and_provider_badges() {
     app.draw().unwrap();
 
     let screen = buf_text(&app);
-    // The fuzzy search box (`▏…▏`) renders above the list (Pi `Input`).
-    assert!(screen.contains('▏'), "search box glyph `▏` missing from assembled buffer:\n{screen}");
+    // S31: the fuzzy search box above the list is `Input.render`'s shared, unstyled `"> "` at
+    // column 0 (`input.ts:380`) — `model-selector.ts:118` adds the `Input` as a bare container
+    // child, so nothing insets or colours it. The accent `" \u{258f}"…"\u{258f}"` bars this used to
+    // assert are a cyrup invention: U+258F appears in no pi TUI source.
+    assert!(
+        screen.lines().any(|l| l.starts_with("> ")),
+        "search box `\"> \"` prompt missing from assembled buffer:\n{screen}"
+    );
+    assert!(!screen.contains('\u{258f}'), "no U+258F bars anywhere:\n{screen}");
     // A `[provider]` badge on every provider (Pi `:251`, muted).
     assert!(screen.contains("[anthropic]"), "provider badge [anthropic] missing:\n{screen}");
     assert!(screen.contains("[openai]"), "provider badge [openai] missing:\n{screen}");

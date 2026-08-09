@@ -149,7 +149,8 @@ impl Selector for TextInputSelector {
         //   `Input`(:63-64) · `Spacer`(:65) · hint(:66-68) · `Spacer`(:69) · `DynamicBorder`(:70).
         // Nine rows. cyrup drew four of them (rule/title/input/rule): the four `Spacer(1)`s are E7
         // and the hint row is E6. All heights are natural and the blanks unconditional;
-        // `stack_rows` clips top-first exactly as pi's layout engine does (see its doc).
+        // `stack_rows` fills the regions from the TOP and starves the trailing ones, so the visible
+        // rows are a prefix of the natural render, exactly as pi's layout engine does (see its doc).
         let [top, _, title_area, _, body, _, hint, _, bottom] =
             stack_rows(area, [1, 1, title_h, 1, 1, 1, 1, 1, 1]);
         let rule = |w: u16| "─".repeat(w.max(1) as usize);
