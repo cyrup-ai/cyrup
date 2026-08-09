@@ -1950,10 +1950,34 @@ pub(crate) fn entry_lines(
     }
 }
 
-/// Render a labeled extension/system message (`skill`/`custom`/`branch`/`compaction` variants,
-/// `{skill-invocation,custom,branch-summary,compaction-summary}-message.ts`): a bold-accent
-/// `[label]` line, then the optional bold `header` + the `body` rendered as markdown. The committed
-/// scrollback form is the *expanded* render (the complete record), like committed tools.
+/// Render a labeled extension/system message (`skill`/`custom`/`branch`/`compaction` variants),
+/// then the optional bold `header` + the `body` rendered as markdown. The committed scrollback form
+/// is the *expanded* render (the complete record), like committed tools.
+///
+/// T9 (TUI-FIDELITY §2): the `[label]` bracket is Pi's `customMessageLabel` token, not `accent`.
+/// All four upstream components build it identically — `theme.fg("customMessageLabel",
+/// "\x1b[1m[<name>]\x1b[22m")` — at v0.84.1
+/// `coding-agent/src/modes/interactive/components/skill-invocation-message.ts:38`,
+/// `custom-message.ts:92`, `branch-summary-message.ts:35` and `compaction-summary-message.ts:36`.
+/// The `\x1b[1m…\x1b[22m` pair is SGR bold, so the bold stays; only the colour role changes
+/// (`dark.json:41` `#9575cd`, `light.json:40` `#7e57c2` — purple, where cyrup was painting the teal
+/// accent).
+///
+/// T9 continued — `customMessageBg` + `customMessageText`. All four upstream components are (or
+/// wrap) a `Box` whose fill is `theme.bg("customMessageBg", …)` and hand their body to
+/// `new Markdown(…, { color: (text) => theme.fg("customMessageText", text) })`:
+/// `custom-message.ts:36,107-111`, `skill-invocation-message.ts:17,42-44`,
+/// `branch-summary-message.ts:16,42-44`, `compaction-summary-message.ts:16,43-45`. Both tokens were
+/// dead on screen — [`UiTheme::custom_message_bg_style`] had zero callers — so the block drew no
+/// fill and the body took the plain `text` role. The fill goes on `Line::style` (the same mechanism
+/// the `userMessageBg` block uses) and the body colour goes through
+/// [`crate::markdown::render_with_text_color`], because a span-level `fg` set by the markdown
+/// renderer would otherwise mask a line-level one.
+///
+/// Not ported here: Pi's `Spacer(1)` between the label and the body (`custom-message.ts:94`,
+/// `branch-summary-message.ts:37`, `compaction-summary-message.ts:38`; `skill-invocation-message.ts`
+/// has none). That is the crate-wide vertical-rhythm gap of TUI-FIDELITY §1.1, which moves every
+/// block in the transcript at once, not a colour fix.
 fn labeled_message_lines(
     label: &str,
     header: &str,
@@ -1961,8 +1985,8 @@ fn labeled_message_lines(
     theme: &UiTheme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let bold = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);
-    let mut out = vec![Line::styled(format!("[{label}]"), bold)];
+    let block = theme.custom_message_bg_style();
+    let mut out = vec![Line::styled(format!("[{label}]"), theme.custom_message_label_style())];
     let md_src = if header.is_empty() {
         body.to_string()
     } else if body.is_empty() {
@@ -1971,7 +1995,19 @@ fn labeled_message_lines(
         format!("{header}\n\n{body}")
     };
     if !md_src.is_empty() {
-        out.extend(crate::markdown::render(&md_src, width.max(1), theme));
+        out.extend(crate::markdown::render_with_text_color(
+            &md_src,
+            width.max(1),
+            theme,
+            block.fg,
+        ));
+    }
+    // The `customMessageBg` fill covers the whole box — label row included. A theme that omits the
+    // token leaves `bg` `None` and the terminal default shows through.
+    if let Some(bg) = block.bg {
+        for line in &mut out {
+            line.style = line.style.bg(bg);
+        }
     }
     out
 }

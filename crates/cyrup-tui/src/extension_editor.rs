@@ -59,6 +59,13 @@ impl ExtensionEditorSelector {
         let mut editor = InputEditor::new();
         editor.set_text(initial);
         editor.set_focused(true);
+        // T9 (TUI-FIDELITY §2): Pi builds this dialog's editor as
+        // `new Editor(tui, getEditorTheme(), options)` (v0.84.1 `components/extension-editor.ts:70`)
+        // and never reassigns `borderColor`, so its rule stays `getEditorTheme().borderColor` =
+        // `theme.fg("borderMuted", …)` (`theme.ts:1301-1304`). Only the *chat* editor is repainted
+        // per reasoning level (`interactive-mode.ts:3990-3993`) — this one was inheriting
+        // `InputEditor`'s `"medium"` thinking colour.
+        editor.use_muted_border();
         Self { title, editor, external_editor_requested: false }
     }
 

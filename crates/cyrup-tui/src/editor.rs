@@ -132,6 +132,16 @@ pub struct InputEditor {
     /// (`interactive-mode.ts:3533-3541`, spec/tui/03 §3.3). Recolored green in bash mode. Updated by
     /// the app on `ThinkingLevelChanged`; `"medium"` until set.
     thinking_level: String,
+    /// Whether this editor's rule is owned by a reasoning level at all (T9, TUI-FIDELITY §2).
+    ///
+    /// Pi's shared `Editor` takes its rule colour from `getEditorTheme().borderColor` =
+    /// `theme.fg("borderMuted", …)` (v0.84.1 `theme.ts:1301-1304`, `tui/src/components/editor.ts:348`).
+    /// Only the *chat* editor is then reassigned per thinking level / bash mode
+    /// (`interactive-mode.ts:3990-3993`). An `ExtensionEditorComponent` — `new Editor(tui,
+    /// getEditorTheme(), options)`, `components/extension-editor.ts:70` — never is, so it keeps
+    /// `borderMuted`. `true` (the chat editor) by default; the extension-editor dialog clears it via
+    /// [`InputEditor::use_muted_border`].
+    thinking_level_owns_border: bool,
     /// Horizontal padding, in columns, applied INSIDE the top/bottom rules (Pi `editorPaddingX` →
     /// `CustomEditor({paddingX})`, `tui/src/components/editor.ts:349,484-489`). `0` (Pi's default)
     /// keeps the historical flush layout. The rules themselves still span the full width — Pi pads
@@ -193,6 +203,7 @@ impl InputEditor {
             pastes: BTreeMap::new(),
             paste_counter: 0,
             thinking_level: "medium".to_string(),
+            thinking_level_owns_border: true,
             padding_x: 0,
             show_hardware_cursor: false,
         }
@@ -250,6 +261,16 @@ impl InputEditor {
     /// on `ThinkingLevelChanged` / thinking-selector confirm.
     pub fn set_thinking_level(&mut self, level: impl Into<String>) {
         self.thinking_level = level.into();
+    }
+
+    /// Detach this editor's rule from the reasoning level, leaving it on the `borderMuted` role —
+    /// the state Pi's shared `Editor` is *born* in (`getEditorTheme().borderColor`, v0.84.1
+    /// `theme.ts:1301-1304`) and never leaves unless something reassigns `borderColor`
+    /// (`interactive-mode.ts:3990-3993`, which only ever touches the chat editor). Used by the
+    /// `ui.editor` extension dialog, whose Pi counterpart is a bare
+    /// `new Editor(tui, getEditorTheme(), options)` (`components/extension-editor.ts:70`).
+    pub fn use_muted_border(&mut self) {
+        self.thinking_level_owns_border = false;
     }
 
     /// Replace the command registry used for slash autocomplete (rebuilt on `/reload`).
@@ -1585,8 +1606,12 @@ impl Component for InputEditor {
         // hardwired bright-blue accent-on-focus was wrong (audit #3).
         let rule_style = if self.is_bash_mode() {
             theme.bash_mode_style()
-        } else {
+        } else if self.thinking_level_owns_border {
             theme.thinking_border_style(&self.thinking_level)
+        } else {
+            // T9: an editor nobody reassigned keeps `getEditorTheme().borderColor` = `borderMuted`
+            // (Pi `theme.ts:1301-1304` → `tui/src/components/editor.ts:348`).
+            theme.border_muted_style()
         };
         // `editorPaddingX` insets the TEXT only: ratatui's `Block` draws its top/bottom rules across
         // the full `area` and applies `Padding` to the inner area the `Paragraph` fills, which is

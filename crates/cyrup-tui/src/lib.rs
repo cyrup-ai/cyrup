@@ -136,7 +136,10 @@ pub use login_dialog::{
     notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginLineKind, LoginUiMsg,
     TuiAuthInteraction,
 };
-pub use markdown::{render as render_markdown, trim_partial_closing_fence};
+pub use markdown::{
+    render as render_markdown, render_with_text_color as render_markdown_with_text_color,
+    trim_partial_closing_fence,
+};
 pub use model_selector::{ModelEntry, ModelSelector};
 pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE};
 pub use config_selector::{ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle};

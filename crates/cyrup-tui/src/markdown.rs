@@ -32,9 +32,26 @@ use crate::theme::UiTheme;
 /// Render markdown `text` into styled lines at content `width` (spec/tui/06 §2). Total / never panics:
 /// any structure pulldown-cmark cannot parse degrades to plain text spans.
 pub fn render(text: &str, width: usize, theme: &UiTheme) -> Vec<Line<'static>> {
+    render_with_text_color(text, width, theme, None)
+}
+
+/// [`render`] with an explicit default **prose** colour — Pi's `Markdown(text, …, { color })`
+/// option (`tui/src/components/markdown.ts:182-183`), applied through `applyDefaultStyle` /
+/// `getDefaultStylePrefix` (`:377-404`, `:406-438`) to the inline text runs only. Headings, code,
+/// quotes, rules and links keep their own `MarkdownTheme` colours upstream and here, which is why
+/// this replaces the plain-paragraph arm of [`MdRenderer::inline_style`] and nothing else.
+///
+/// `None` keeps the ordinary `text`-role prose colour.
+pub fn render_with_text_color(
+    text: &str,
+    width: usize,
+    theme: &UiTheme,
+    color: Option<ratatui::style::Color>,
+) -> Vec<Line<'static>> {
     // Tabs → 3 spaces before parse (`markdown.ts:171`).
     let prepared = text.replace('\t', "   ");
     let mut r = MdRenderer::new(width, theme);
+    r.default_text = color;
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     for ev in Parser::new_ext(&prepared, opts) {
         r.event(ev);
@@ -132,6 +149,9 @@ struct MdRenderer<'t> {
     code_buf: String,
     /// Simple table capture (header row + body rows of plain-text cells).
     table: Option<TableCapture>,
+    /// Pi's `Markdown` `{ color }` option: the default foreground for plain prose runs, replacing
+    /// the `text` role. `None` ⇒ the ordinary assistant/body colour.
+    default_text: Option<ratatui::style::Color>,
 }
 
 #[derive(Default)]
@@ -162,6 +182,7 @@ impl<'t> MdRenderer<'t> {
             code_lang: None,
             code_buf: String::new(),
             table: None,
+            default_text: None,
         }
     }
 
@@ -180,6 +201,10 @@ impl<'t> MdRenderer<'t> {
             self.theme.md_link_style()
         } else if self.quote > 0 {
             self.theme.md_quote_style()
+        } else if let Some(c) = self.default_text {
+            // Pi's `{ color }` option replaces the *plain prose* foreground only
+            // (`markdown.ts:377-404` `applyDefaultStyle`, reached through the inline style context).
+            Style::default().fg(c)
         } else {
             self.theme.assistant_style()
         };
@@ -687,7 +712,6 @@ fn highlight_inner(
 ) -> Option<Vec<Line<'static>>> {
     let mut parse = ParseState::new(syntax);
     let mut out: Vec<Line<'static>> = Vec::new();
-    let flat = theme.md_code_block_style();
     for raw in code.split('\n') {
         let line_nl = format!("{raw}\n");
         let ops = parse.parse_line(&line_nl, ss).ok()?;
@@ -698,13 +722,13 @@ fn highlight_inner(
             if idx > last
                 && let Some(piece) = line_nl.get(last..idx)
             {
-                push_code_span(&mut spans, piece, &stack, theme, flat);
+                push_code_span(&mut spans, piece, &stack, theme);
             }
             stack.apply(&op).ok()?;
             last = idx;
         }
         if let Some(piece) = line_nl.get(last..) {
-            push_code_span(&mut spans, piece, &stack, theme, flat);
+            push_code_span(&mut spans, piece, &stack, theme);
         }
         out.push(Line::from(spans));
     }
@@ -712,23 +736,53 @@ fn highlight_inner(
 }
 
 /// Push a highlighted span (newline-stripped) styled by the most specific matching scope.
-fn push_code_span(
-    spans: &mut Vec<Span<'static>>,
-    piece: &str,
-    stack: &ScopeStack,
-    theme: &UiTheme,
-    flat: Style,
-) {
+///
+/// T5 (TUI-FIDELITY §2): a scope the table does not classify gets **no style at all**, not
+/// `mdCodeBlock`. Pi runs the block through cli-highlight and pushes the result verbatim —
+/// `lines.push(`${indent}${hlLine}`)`, v0.84.1 `tui/src/components/markdown.ts:526` — and
+/// cli-highlight only emits an escape for the 24 classes `buildCliHighlightTheme` defines
+/// (`theme.ts:1119-1145`). Everything else (identifiers, whitespace, plain text) carries no escape
+/// and renders at the terminal's default foreground. `mdCodeBlock` is a *whole-block* fallback in
+/// Pi, reached only when the language is unknown or the highlighter throws (`theme.ts:1275`,
+/// `:1284`); that path is [`highlight_lines`]'s `flat()`, not this one. Defaulting each unclassified
+/// run to `mdCodeBlock` painted roughly half of every code block `#b5bd68` green.
+fn push_code_span(spans: &mut Vec<Span<'static>>, piece: &str, stack: &ScopeStack, theme: &UiTheme) {
     let text = piece.trim_end_matches('\n');
     if text.is_empty() {
         return;
     }
-    let style = scope_style(stack, theme).unwrap_or(flat);
+    let style = scope_style(stack, theme).unwrap_or_default();
     spans.push(Span::styled(text.to_string(), style));
 }
 
-/// Map the deepest matching scope on the stack to a theme syntax style (spec/tui/06 §3.2).
+/// Map the scope stack to a theme syntax style.
+///
+/// Two passes, in this order:
+/// 1. **Container scopes** (T6) — an enclosing `meta.annotation` / `meta.preprocessor` colours the
+///    whole construct `muted`, because Pi's highlighter emits a `meta` class for a Rust attribute /
+///    Python decorator / C preprocessor line and maps it to `muted` (v0.84.1 `theme.ts:1128`). This
+///    has to beat the deepest-first walk: syntect nests `punctuation.definition.annotation.rust`
+///    *inside* `meta.annotation.rust`, so a deepest-first match would recolour only the `#`.
+///    A nested **string/comment literal escapes** the container and keeps its own colour, because
+///    highlight.js's `meta` modes declare sub-modes that cli-highlight wraps in their own class —
+///    see [`UiTheme::syntax_meta_nested_style`]. That is what keeps the `"wasm-host"` in
+///    `#[cfg(feature = "wasm-host")]` and the `<stdio.h>` in `#include <stdio.h>` at
+///    `syntaxString` while the annotation around them stays `muted`.
+/// 2. **Deepest-first** — the innermost scope that the prefix table knows wins, so a `string` inside
+///    a `meta.function` still comes out as a string.
 fn scope_style(stack: &ScopeStack, theme: &UiTheme) -> Option<Style> {
+    let container = stack
+        .as_slice()
+        .iter()
+        .find_map(|scope| theme.syntax_meta_container_style(&scope.build_string()));
+    if let Some(container) = container {
+        for scope in stack.as_slice().iter().rev() {
+            if let Some(style) = theme.syntax_meta_nested_style(&scope.build_string()) {
+                return Some(style);
+            }
+        }
+        return Some(container);
+    }
     for scope in stack.as_slice().iter().rev() {
         let s = scope.build_string();
         if let Some(style) = theme.syntax_style_for_scope(&s) {
@@ -737,3 +791,4 @@ fn scope_style(stack: &ScopeStack, theme: &UiTheme) -> Option<Style> {
     }
     None
 }
+
