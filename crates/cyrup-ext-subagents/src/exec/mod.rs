@@ -74,6 +74,11 @@ pub mod output;
 /// Parent-side structured-output extraction and JSON-Schema re-validation (R-SA-030).
 pub mod structured;
 
+/// The shared task mutation-intent classifier — a port of pi-subagents'
+/// `runs/shared/task-intent.ts` @v0.43.0. Consumed by [`completion_guard`] (does the task REQUIRE
+/// file changes?) and by [`acceptance`]'s level inference (COULD it plausibly change files?).
+pub mod task_intent;
+
 /// `{text, expandedText}` tool-call argument previews (R-SA-043's compaction target) — pi
 /// `ToolCallSummary` + `formatToolCall` (`shared/types.ts:225`, `shared/formatters.ts:99`).
 pub mod tool_call_summary;
@@ -154,6 +159,14 @@ pub const RECENT_OUTPUT_LINE_CHARS: usize = 2000;
 /// `RECENT_OUTPUT_LINE_CHARS` `char`s followed by pi's verbatim `… [truncated]` suffix; anything
 /// within the cap is returned unchanged.
 #[must_use]
+/// `serde(skip_serializing_if)` predicate for an optional-on-the-wire `bool` that upstream declares
+/// as `foo?: boolean` and only ever writes when true (e.g. [`SingleResult::stopped`]). A free
+/// function because `skip_serializing_if` is handed a `&bool`, which `std::ops::Not::not` (taking
+/// `self: bool`) cannot accept.
+pub(crate) fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn bound_output_line(line: &str) -> String {
     // `chars().count()` rather than `len()`: the cap is a CHARACTER cap (pi's UTF-16-code-unit
     // `slice`), and a byte length would truncate multi-byte text far too eagerly.
@@ -618,6 +631,17 @@ pub struct RunOptions {
     /// 60s/240s/3 thresholds, NOT "off". Set
     /// [`crate::exec::control::ResolvedControlConfig::enabled`] to `false` to turn it off.
     pub control_config: Option<crate::exec::control::ResolvedControlConfig>,
+    /// G80 — pi `options.artifactsDir` (`runs/foreground/execution.ts:1704`, threaded into
+    /// `evaluateAcceptance` alongside [`Self::run_id`] and from there into
+    /// `runMemoizedVerifyCommand`, `runs/shared/acceptance.ts:1072-1132` @v0.43.0): the run's
+    /// artifacts root, under which a verify command's memoized result is recorded at
+    /// `<artifacts_dir>/acceptance/verify/<run_id>/<cacheKey>.json`.
+    ///
+    /// BOTH this and [`Self::run_id`] must be `Some` for memoization to arm at all
+    /// (`acceptance.ts:1085`); `None` — every caller with no artifacts root, and pi's own
+    /// `artifacts: false` opt-out (SUBA-041) — executes every verify[] command for real, exactly
+    /// as this crate did before G80.
+    pub artifacts_dir: Option<PathBuf>,
     /// pi `options.onControlEvent` (`execution.ts:255`): the per-raise callback the ORCHESTRATOR
     /// installs (`createForegroundControlNotifier`, `subagent-executor.ts:1222-1229` @v0.34.0) to fan a
     /// raised event out to the notice channels. `None` (every non-tool caller, and tests) still
@@ -745,6 +769,34 @@ pub struct SingleResult {
     /// consequences a caller may want to distinguish).
     pub interrupted: bool,
     pub timed_out: bool,
+    /// G77/G104 — pi `SingleResult.stopped` (`shared/types.ts:879`, set by `runSubagent` at
+    /// `subagent-runner.ts:903`/`:921`/`:952`): this child was terminated by an explicit
+    /// user/agent **stop** request, not by an interrupt, a deadline, or its own exit.
+    ///
+    /// A distinct flag from [`Self::interrupted`] and [`Self::timed_out`] because upstream reads
+    /// all three separately and ranks them differently: `resolveSubagentResultStatus` returns
+    /// `"stopped"` for it BEFORE it ever looks at `interrupted`/`success`/`exitCode`
+    /// (`intercom/result-intercom.ts:32`), `chain-root-attachment.ts:87` short-circuits on it ahead
+    /// of the child's own `success`, and `notify.ts:203` ORs it into the run-level stop verdict.
+    ///
+    /// `#[serde(default)]` + omit-when-false so a `status.json`/result file written before this
+    /// field existed still round-trips (the same discipline `saved_output_path`/`control_events`
+    /// follow), matching upstream's own optional `stopped?: boolean`.
+    #[serde(default, skip_serializing_if = "crate::exec::is_false")]
+    pub stopped: bool,
+    /// pi `SingleResult.processSignal` (`shared/types.ts`, set from Node's `proc.on("close",
+    /// (code, signal))` at `subagent-runner.ts:903`): the NAME of the OS signal that killed this
+    /// child (`"SIGKILL"`, `"SIGTERM"`, …), or `None` on a normal exit.
+    ///
+    /// Carried onto the terminal result — not only onto
+    /// [`crate::exec::fallback::StartupEvidence::process_signal`], where this crate already
+    /// computed it — because `resolveSubagentResultStatus`'s fourth branch
+    /// (`result-intercom.ts:35`) resolves an UNEXPLAINED signal death (a signal with no
+    /// interrupt/timeout/stop/turn-budget to explain it, `runs/shared/process-signal.ts:5-19`) to
+    /// `"stopped"`, and that branch is unreachable without this field. Same optional-on-the-wire
+    /// discipline as [`Self::stopped`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_signal: Option<String>,
     pub error: Option<String>,
     /// pi `result.savedOutputPath` (`shared/types.ts:492`, assigned at
     /// `runs/foreground/execution.ts:963` from `resolveSingleOutput(...).savedPath`): the concrete
@@ -1764,7 +1816,16 @@ pub fn build_attempt_spawn_plan(
 /// Empty when the agent/step declares no skills, so the common no-skills case appends nothing. This
 /// is ORTHOGONAL to `agent.inherit_skills` (the `--no-skills` child flag): an agent that does not
 /// inherit skills still receives its explicitly-listed skills through this block.
+///
+/// G82: the output-path instruction is CAPABILITY-AWARE. `agent` is projected to the
+/// [`AgentDefinition`] view [`crate::exec::output::format_output_path_instruction`] reads
+/// (`tools`, via `has_mutation_tool_capability`), so an agent whose whole resolved allowlist is
+/// read-only is told to return the artifact in its final response for the runtime to persist —
+/// pi's `formatOutputPathInstruction` read-only branch (`single-output.ts:87-91`) — instead of
+/// being ordered to write a file it has no tool to write. Upstream threads the same agent object
+/// into both injection sites (`execution.ts:1443`, `chain-execution.ts:363`).
 fn build_task_text(
+    agent: &AgentConfig,
     task: &str,
     opts: &RunOptions,
     contract: &AcceptanceContract,
@@ -1774,7 +1835,8 @@ fn build_task_text(
     let with_output_path = match opts.output_mode {
         OutputMode::FileOnly => {
             let path = opts.output_path.as_deref();
-            match build_output_path_system_prompt_instruction(path) {
+            let capabilities = completion_guard_projection(agent);
+            match build_output_path_system_prompt_instruction(path, Some(&capabilities)) {
                 Some(instruction) => format!("{with_acceptance}\n\n{instruction}"),
                 None => with_acceptance,
             }
@@ -1890,7 +1952,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         );
 
         let task_text =
-            build_task_text(self.task, self.opts, self.contract, &self.skill_injection);
+            build_task_text(self.agent, self.task, self.opts, self.contract, &self.skill_injection);
 
         // R-SA-054/055/056 (SAFETY-CRITICAL, C15): the CHILD about to be spawned is one recursion
         // hop deeper than THIS process, so its env overlay MUST carry the incremented envelope —
@@ -2871,6 +2933,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: Some(err.to_string()),
             saved_output_path: None,
             tool_calls: Vec::new(),
@@ -2897,6 +2961,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: Some(err.to_string()),
             saved_output_path: None,
             tool_calls: Vec::new(),
@@ -2937,6 +3003,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: Some(
                 "no candidate model available for this subagent run (empty fallback ladder)"
                     .to_string(),
@@ -2997,6 +3065,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
                 detached: false,
                 interrupted: false,
                 timed_out: false,
+                stopped: false,
+                process_signal: None,
                 error: Some(format!(
                     "Skills not found: {}",
                     crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL
@@ -3034,6 +3104,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: Some(format!("failed to prepare subagent scratch directory: {err}")),
             saved_output_path: None,
             tool_calls: Vec::new(),
@@ -3085,7 +3157,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     let last_signal = outcome.last_signal;
     let last_attempt = outcome.last_attempt;
 
-    let (timed_out, interrupted, detached, mut exit_code, mut error, mut final_output) =
+    let (timed_out, interrupted, detached, process_signal, mut exit_code, mut error, mut final_output) =
         match (&last_signal, &last_attempt) {
             (Some(signal), Some(record)) => (
                 signal.timed_out,
@@ -3098,6 +3170,12 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
                 // paused-success `final_output` reaches the caller untouched.
                 record.interrupted,
                 signal.detached,
+                // G104 — pi `if (signal) result.processSignal = signal;` (`execution.ts:1081`).
+                // The value was already computed by `process_signal_name` and stashed on the
+                // attempt's `StartupEvidence`; publishing it on the terminal `SingleResult` is what
+                // makes `resolveSubagentResultStatus`'s unexplained-signal → `"stopped"` branch
+                // (`result-intercom.ts:35`) reachable at all.
+                signal.startup.process_signal.clone(),
                 signal.exit_code.unwrap_or(if signal.success { 0 } else { 1 }),
                 signal.error.clone(),
                 record.final_output.clone(),
@@ -3106,6 +3184,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
                 false,
                 false,
                 false,
+                None,
                 1,
                 Some("subagent fallback ladder produced no attempt outcome".to_string()),
                 None,
@@ -3309,12 +3388,47 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         // (`execution.ts:1098`), and the run already failed via the timeout path (exit_code != 0).
         Some(build_timed_out_acceptance_ledger(&contract))
     } else {
+        // G82 — pi `execution.ts:1680-1682`:
+        //   const childWrittenOutput = options.outputPath
+        //       ? extractChildWrittenOutput(result.messages, options.outputPath, options.cwd ?? runtimeCwd)
+        //       : undefined;
+        // Authorship taken from the CHILD'S OWN successful `write` calls, never from disk, so a
+        // sibling run writing the same path cannot have its content misattributed here (#420).
+        // Fed to the acceptance gate as an admissible acceptance-report source — the PRIMARY one
+        // in `outputMode: "file-only"`, where the artifact, not the receipt prose, is the answer.
+        let child_written_output = crate::exec::output::extract_child_written_output(
+            &progress.all_events,
+            opts.output_path.as_deref(),
+            &opts.cwd,
+        );
+        // `fileOutput: childWrittenOutput !== undefined && options.outputPath ? {...} : undefined`
+        // (`execution.ts:1699-1701`).
+        let file_output = match (child_written_output.as_deref(), opts.output_path.as_deref()) {
+            (Some(content), Some(path)) => Some(acceptance::AcceptanceFileOutput {
+                content,
+                path,
+                authoritative: matches!(opts.output_mode, OutputMode::FileOnly),
+            }),
+            _ => None,
+        };
+        // G80 — pi `evaluateAcceptance({ …, artifactsDir: options.artifactsDir, runId:
+        // options.runId })` (`runs/foreground/execution.ts:1704-1705` @v0.43.0). Both must be
+        // present for `runMemoizedVerifyCommand` to consult/record a memo (`acceptance.ts:1085`).
+        let memo = match (opts.artifacts_dir.as_deref(), opts.run_id.as_ref()) {
+            (Some(artifacts_dir), Some(run_id)) => Some(acceptance::model::VerifyMemoContext {
+                artifacts_dir,
+                run_id: run_id.as_str(),
+            }),
+            _ => None,
+        };
         let ledger = evaluate_acceptance(
             &contract,
             post_guard_gate,
             final_output.as_deref(),
             guard_result,
             &opts.cwd,
+            memo,
+            file_output,
         )
         .await;
 
@@ -3460,6 +3574,14 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         detached,
         interrupted,
         timed_out,
+        // G77/G104: pi's FOREGROUND executor never sets `result.stopped` — it only ever READS it
+        // (`execution.ts:1086`/`:1571`/`:1689`), because the stop verb is a background-run control
+        // request consumed by the detached runner (`subagent-runner.ts:2955-2984`), and a
+        // foreground child has no control inbox. `false` here is therefore faithful, not a stub;
+        // the live producers are `background/runner_main.rs`'s stop arm and the stale-run
+        // reconciler.
+        stopped: false,
+        process_signal,
         error,
         // pi `result.savedOutputPath = resolvedOutput.savedPath` (`execution.ts:963`) — the SAME
         // path the saved-output reference message above was built from, published as its own field
@@ -3489,8 +3611,10 @@ fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinition {
         local_name: agent.name.clone(),
         package_name: None,
         description: String::new(),
+        aliases: Vec::new(),
         tools: agent.tools.clone(),
         extensions: None,
+        extensions_from_default: false,
         subagent_only_extensions: Vec::new(),
         model: agent.model.clone(),
         fallback_models: agent.fallback_models.clone(),
@@ -3637,6 +3761,7 @@ mod tests {
             steer_inbox_dir: None,
             control_config: None,
             on_control_event: None,
+            artifacts_dir: None,
         }
     }
 
@@ -3835,7 +3960,7 @@ mod tests {
         opts.output_path = Some(dir.path().join("out.md"));
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
 
-        let text = build_task_text("do the thing", &opts, &contract, "");
+        let text = build_task_text(&agent, "do the thing", &opts, &contract, "");
         assert!(text.starts_with("do the thing"));
         assert!(text.contains("Acceptance Contract"));
         assert!(text.contains("out.md"));
@@ -3860,7 +3985,7 @@ mod tests {
                 description: Some("Use fallback mode.".to_string()),
             },
         ]);
-        let text = build_task_text("do the thing", &opts, &contract, &injection);
+        let text = build_task_text(&agent, "do the thing", &opts, &contract, &injection);
 
         assert!(text.starts_with("do the thing"));
         assert!(text.contains("<available_skills>"));
@@ -4509,7 +4634,7 @@ mod tests {
             max_depth: 5,
         };
 
-        let task_text = build_task_text("do the thing", &opts, &contract, "");
+        let task_text = build_task_text(&agent, "do the thing", &opts, &contract, "");
         let plan =
             build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &task_text, &opts, depth, dir.path(), None)
                 .expect("plan builds");

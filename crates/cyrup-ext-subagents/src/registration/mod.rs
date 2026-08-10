@@ -958,6 +958,8 @@ mod tests {
             model_scope: None,
             overrides,
             default_model: Some("claude-sonnet".to_string()),
+            default_thinking: None,
+            default_extensions: None,
             disable_builtins: Some(true),
             disable_thinking: Some(true),
         };

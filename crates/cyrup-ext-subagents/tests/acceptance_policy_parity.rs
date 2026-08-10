@@ -134,6 +134,8 @@ async fn a_child_report_missing_the_declared_criteria_and_evidence_is_rejected()
         Some(BARE_REPORT),
         guard_did_not_fire(),
         dir.path(),
+        None,
+        None,
     )
     .await;
 
@@ -180,6 +182,8 @@ async fn a_child_report_satisfying_the_declared_policy_reaches_checked() {
         Some(report),
         guard_did_not_fire(),
         dir.path(),
+        None,
+        None,
     )
     .await;
 
@@ -209,6 +213,8 @@ async fn a_criterion_reported_as_not_satisfied_is_rejected_with_pis_wording() {
         Some(report),
         guard_did_not_fire(),
         dir.path(),
+        None,
+        None,
     )
     .await;
 
@@ -245,6 +251,8 @@ async fn a_recommended_criterion_is_prompted_but_never_gates() {
         Some("```acceptance-report\n{\"criteriaSatisfied\": []}\n```"),
         guard_did_not_fire(),
         dir.path(),
+        None,
+        None,
     )
     .await;
 
@@ -295,6 +303,8 @@ async fn declared_no_staged_files_evidence_runs_a_real_git_status_and_rejects_a_
         Some(report),
         guard_did_not_fire(),
         cwd,
+        None,
+        None,
     )
     .await;
 

@@ -233,7 +233,11 @@ async fn single_mode_output_without_file_only_still_inlines_the_full_output() {
                 // `skill: false` (pi's "no skills at all" form), and an explicit acceptance level.
                 "artifacts": false,
                 "skill": false,
-                "acceptance": "none"
+                // G78 — the bare `"none"` string is no longer a valid policy at pi-subagents
+                // v0.43.0 (`acceptance.ts:183`: it must carry a reason). The object form that
+                // still disables the gate is used instead, so this test keeps exercising an
+                // explicit acceptance override rather than dropping the field.
+                "acceptance": { "level": "none", "reason": "trivial fixture run" }
             }),
             CancelToken::new(),
             Box::new(|_u: cyrup_core::ToolUpdate| {}),

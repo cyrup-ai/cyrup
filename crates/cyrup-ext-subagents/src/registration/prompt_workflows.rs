@@ -606,8 +606,10 @@ mod tests {
         shell_words(input)
     }
 
-    /// The SEVEN bundled recipes are reachable through the real discovery entry point — not through
+    /// The FIVE bundled recipes are reachable through the real discovery entry point — not through
     /// `bundled_prompt_files()` directly. This is the package tier of `promptDirs` (`:43`).
+    /// (Seven until `83b9872` deleted `parallel-context-build`/`parallel-handoff-plan` alongside the
+    /// `planner`/`context-builder` roles they drove.)
     #[test]
     fn the_bundled_recipes_are_discoverable_by_name() {
         let empty = tempfile::tempdir().unwrap();
@@ -616,8 +618,6 @@ mod tests {
         for expected in [
             "gather-context-and-clarify",
             "parallel-cleanup",
-            "parallel-context-build",
-            "parallel-handoff-plan",
             "parallel-research",
             "parallel-review",
             "review-loop",

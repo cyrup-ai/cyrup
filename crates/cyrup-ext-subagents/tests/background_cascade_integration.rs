@@ -45,7 +45,7 @@ use tokio::sync::Mutex;
 
 use cyrup_core::ModelId;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
-use cyrup_ext_subagents::background::control::{InterruptRequest, TimeoutRequest};
+use cyrup_ext_subagents::background::control::{InterruptRequest, StopRequest, TimeoutRequest};
 use cyrup_ext_subagents::background::runner_main::{RunnerConfig, run};
 use cyrup_ext_subagents::background::{ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus};
 use cyrup_ext_subagents::discovery::types::SystemPromptMode;
@@ -411,4 +411,105 @@ async fn a_delivered_timeout_request_fails_the_run_and_cascades_to_descendants()
             .exists(),
         "a timeout must not be downgraded into an interrupt on the way down"
     );
+}
+
+
+/// G77 — the STOP verb's own cascade: a `control/stop.json` must end the run `Stopped` (a THIRD
+/// terminal verdict, distinct from the interrupt's `Paused` and the timeout's `Failed` asserted by
+/// the two tests above) and must reach every live async descendant as a STOP, never downgraded into
+/// an interrupt or a timeout on the way down.
+///
+/// Upstream: `stopRunner` (`runs/background/subagent-runner.ts:2955-2984` @v0.43.0) sets
+/// `statusPayload.state = "stopped"`, marks every running-or-pending step `"stopped"`, appends
+/// `subagent.run.stopped`, and calls `stopNestedAsyncDescendants()` (`:2984`), which delivers
+/// `deliverStopRequest({ …, source: "ancestor-stop" })` to each `running`/`queued` descendant
+/// (`:2281-2310`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("real tempdir");
+    let temp_root = dir.path().join("subagents-temp");
+    std::fs::create_dir_all(&temp_root).unwrap();
+    // SAFETY: see the sibling tests above.
+    unsafe {
+        std::env::set_var(TEMP_ROOT_ENV, &temp_root);
+    }
+
+    let harness = build_run(dir.path(), &temp_root, "cascadestp1", "childstp1").await;
+
+    // Planted through the REAL parent-side primitive, so this covers the writer too.
+    let stop_path = cyrup_ext_subagents::background::control::stop_request_path(
+        &harness.run_paths.run_dir,
+    );
+    cyrup_ext_subagents::background::control::deliver_stop_request(
+        &harness.run_paths.run_dir,
+        "stop-action",
+        None,
+    )
+    .await
+    .expect("plant the stop request");
+
+    run(&harness.config_path, &harness.run_paths)
+        .await
+        .expect("run() never returns Err");
+
+    // SAFETY: scoped cleanup inside the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(TEMP_ROOT_ENV);
+    }
+
+    // 1. Consumed at most once.
+    assert!(
+        !stop_path.exists(),
+        "the stop request was never consumed — it is still sitting in the inbox"
+    );
+
+    // 2. A THIRD terminal verdict, not either of the other two.
+    let result: ResultFile = read_json(&harness.run_paths.result).await;
+    assert_eq!(
+        result.state,
+        RunState::Stopped,
+        "a stop is its own terminal state — never `Paused` (interrupt) and never `Failed` (timeout)"
+    );
+    assert!(!result.success);
+    assert!(
+        !result.results.iter().any(|r| r.interrupted),
+        "a stopped run must not be recorded as interrupted (that would read as resumable)"
+    );
+
+    let status: RunStatus = read_json(&harness.run_paths.status).await;
+    assert!(
+        status
+            .steps
+            .iter()
+            .all(|s| s.status == cyrup_ext_subagents::background::StepState::Stopped),
+        "every unfinished step must be marked Stopped by the stop; got {:?}",
+        status.steps.iter().map(|s| s.status).collect::<Vec<_>>()
+    );
+
+    // 3. pi's `subagent.run.stopped` lifecycle event.
+    let events = tokio::fs::read_to_string(&harness.run_paths.events)
+        .await
+        .expect("events.jsonl exists");
+    assert!(
+        events.contains("subagent.run.stopped"),
+        "no subagent.run.stopped event in:\n{events}"
+    );
+
+    // 4. The cascade: the descendant gets a STOP with pi's own `ancestor-stop` source.
+    let descendant_inbox = harness.descendant_dir.join("control").join("stop.json");
+    assert!(
+        descendant_inbox.exists(),
+        "the live async descendant at {} received no stop",
+        harness.descendant_dir.display()
+    );
+    let delivered: StopRequest = read_json(&descendant_inbox).await;
+    assert_eq!(delivered.kind, "stop");
+    assert_eq!(delivered.source, "ancestor-stop");
+    for downgrade in ["interrupt.json", "timeout.json"] {
+        assert!(
+            !harness.descendant_dir.join("control").join(downgrade).exists(),
+            "a stop must not be downgraded into {downgrade} on the way down"
+        );
+    }
 }

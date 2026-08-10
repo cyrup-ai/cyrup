@@ -1164,22 +1164,29 @@ impl SubagentExecutor {
     /// layering — cyrup-config's DI-11 trust decision has no injection point into this extension
     /// today, so this crate never silently trusts a project's installed packages). Global-scope
     /// packages are always enumerated (trust-independent, matching `cyrup-resources`' own gate).
-    fn discovery_dirs_config(cwd: &Path) -> AgentDiscoveryConfig {
+    fn discovery_dirs_config(cwd: &Path) -> Result<AgentDiscoveryConfig, SubagentError> {
         let home = dirs_home();
         let global_dir = home.join(".cyrup");
-        // Upward project-root search (pi `findNearestProjectRoot`, agents.ts:511-522): the nearest
-        // ancestor of `cwd` holding a `.cyrup` config dir or a legacy `.agents` dir, so a cwd deep
-        // inside a project still discovers that project's agents/chains. Absent any such ancestor,
-        // fall back to `cwd` (pi's `findNearestProjectRoot(cwd) ?? cwd`) so package roots and the
-        // project write target still resolve under `cwd/.cyrup`.
-        let project_root =
-            crate::discovery::find_nearest_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        // Upward project-root search — pi `findConfiguredProjectRoot` (`agents.ts:657-672`), which is
+        // what `resolveNearestProjectAgentDirs`/`resolveNearestProjectChainDirs`/
+        // `getProjectAgentSettingsPath`/`collectPackageSubagentPaths` all call, NOT the bare
+        // `findNearestProjectRoot`: the nearest ancestor of `cwd` holding a `.cyrup` config dir or a
+        // legacy `.agents` dir, EXCEPT that `subagents.projectRootResolution: "git-root"` (declared
+        // at either the nearest candidate or at the git root itself) pulls resolution out to the
+        // enclosing repository root, and `"nearest"` pins it in place. Absent any candidate, fall
+        // back to `cwd` (pi's `?? cwd`) so package roots and the project write target still resolve
+        // under `cwd/.cyrup`.
+        //
+        // A malformed `projectRootResolution` at either consulted root ABORTS (R-SA-009) rather than
+        // silently degrading to "nearest" — which is why this function now returns a `Result`.
+        let project_root = crate::discovery::find_configured_project_root(cwd)?
+            .unwrap_or_else(|| cwd.to_path_buf());
         let installed_packages = enumerate_installed_packages(&global_dir, Some(&project_root));
         // Per-scope read dirs from the shared topology helpers (pi resolveNearestProject*Dirs /
         // discoverAgents userDir old+new / getUserChainDir): legacy `.agents` + preferred
         // `.cyrup/agents` for project agents; primary `.cyrup/agents` + second `~/.agents` for user
         // agents; a SEPARATE `.cyrup/chains` dir for each scope's chains (never the agents dir).
-        AgentDiscoveryConfig {
+        Ok(AgentDiscoveryConfig {
             builtin_agents_dir: Some(builtin_agents_dir()),
             project_agent_dirs: crate::discovery::resolve_project_agent_read_dirs(&project_root),
             project_chain_dirs: crate::discovery::resolve_project_chain_read_dirs(&project_root),
@@ -1193,7 +1200,7 @@ impl SubagentExecutor {
         }
         // R-SA-003: fold in `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` — PREPENDED ahead of the user dirs
         // (extras are the lowest-precedence User-tier stream), so the user's own agents win.
-        .with_env_extras()
+        .with_env_extras())
     }
 
     /// Build a real, fully-populated [`AgentDiscoveryConfig`] scoped to `cwd`: the directory/package
@@ -1213,9 +1220,17 @@ impl SubagentExecutor {
     /// `subagents.*` field — the malformed-settings MUST-abort contract this crate's discovery
     /// callers rely on.
     fn discovery_config(cwd: &Path) -> Result<AgentDiscoveryConfig, SubagentError> {
-        let mut cfg = Self::discovery_dirs_config(cwd);
+        let mut cfg = Self::discovery_dirs_config(cwd)?;
         let user_settings = dirs_home().join(".cyrup").join("agents").join("settings.json");
-        let project_settings = cwd.join(".cyrup").join("agents").join("settings.json");
+        // pi `getProjectAgentSettingsPath` (`agents.ts:678-681`) keys the project settings file on
+        // `findConfiguredProjectRoot(cwd)` — the SAME root the project agent/chain dirs came from —
+        // not on the bare cwd. Keying it on `cwd` meant a session started in a subdirectory read a
+        // settings file that does not exist while its agents came from the real project root, and it
+        // made `subagents.projectRootResolution` unobservable: the very setting that MOVES the root
+        // lives in the file the root selects.
+        let project_settings = crate::discovery::project_settings_path(
+            cfg.project_root.as_deref().unwrap_or(cwd),
+        );
         // Tier 7: carry BOTH scopes UNFLATTENED (each with its own path) so `merge.rs` can resolve
         // project-beats-user at application time and record the true winning scope + path in
         // provenance (rather than a pre-flattened single scope that always looked like `Project`).
@@ -1264,11 +1279,22 @@ impl SubagentExecutor {
         let cfg = Self::discovery_config(cwd)?;
         let result = discover_agents(&cfg, Some(scope))?;
         let model_scope = result.model_scope.clone();
-        let agent = result
-            .agents
-            .into_iter()
-            .find(|a| a.name == name)
-            .ok_or_else(|| SubagentError::AgentNotFound(name.to_string()))?;
+        // pi v0.43.0 routes EVERY execution-path agent lookup through `resolveAgentName`
+        // (`subagent-executor.ts:1513-1516`'s `canonicalizeAgentName`, `preflight.ts:228`), so the
+        // requested string may be an alias. It is name-first — a real agent named `x` always beats
+        // another agent that merely lists `x` as an alias — and a non-unique alias is a HARD error
+        // (`Ambiguous agent alias 'x': a, b`), never an arbitrary pick.
+        let agent = match crate::discovery::resolve_agent_name(name, &result.agents) {
+            crate::discovery::AgentNameResolution::Found(agent) => agent.clone(),
+            // `Management` is the "already-exact upstream prose, no prefix" variant — the ambiguity
+            // string is pi's own wording and reaches the caller unaltered.
+            crate::discovery::AgentNameResolution::Ambiguous(msg) => {
+                return Err(SubagentError::Management(msg));
+            }
+            crate::discovery::AgentNameResolution::NotFound => {
+                return Err(SubagentError::AgentNotFound(name.to_string()));
+            }
+        };
         Ok((agent, model_scope))
     }
 
@@ -1741,6 +1767,12 @@ impl SubagentExecutor {
             control_config: Some(resolved_control.clone()),
             // pi `onControlEvent: createForegroundControlNotifier(data, deps)` (`:1222-1229`).
             on_control_event: Some(control_notifier.sink()),
+            // G80 — pi `artifactsDir: options.artifactsDir` reaching `evaluateAcceptance`
+            // (`runs/foreground/execution.ts:1704`), which is `artifactsEnabled ?
+            // getArtifactsDir(...) : undefined` (`api/preflight.ts:288`). Same `art_dir` the
+            // artifact quadruple below writes into, and gated by the SAME `art_cfg.enabled`, so
+            // SUBA-041's `artifacts: false` turns verify memoization off with everything else.
+            artifacts_dir: art_cfg.enabled.then(|| art_dir.clone()),
         };
 
         // pi `state.foregroundControls.set(runId, {interrupt, currentAgent, currentIndex})`
@@ -2920,7 +2952,12 @@ impl SubagentExecutor {
         let parent_model = current_model.and_then(|m| m.split_once('/'));
         let available_models = registry_available_models();
 
-        let cfg = Self::discovery_config(cwd).unwrap_or_else(|_| Self::discovery_dirs_config(cwd));
+        // Both fall-backs are best-effort here (this surface reports, it does not run anything), so a
+        // malformed `settings.json` OR a malformed `projectRootResolution` degrades to the bare
+        // default config rather than aborting the whole report.
+        let cfg = Self::discovery_config(cwd)
+            .or_else(|_| Self::discovery_dirs_config(cwd))
+            .unwrap_or_default();
         let default_model_scope = resolve_default_model_scope(&cfg.override_settings);
         let discovered = match crate::discovery::discover_agents_all(&cfg) {
             Ok(discovered) => discovered,
@@ -3340,6 +3377,133 @@ impl SubagentExecutor {
         }
     }
 
+    /// G77 — `action: "stop"` (pi `stopAsyncRun`, `runs/foreground/async-stop-action.ts:23-64`
+    /// @v0.43.0, dispatched at `subagent-executor.ts:4771-4815`): deliver a TERMINAL,
+    /// non-resumable stop to a background run.
+    ///
+    /// This is deliberately NOT [`Self::control_interrupt`]. An interrupt is a soft, resumable
+    /// pause — the run ends [`RunState::Paused`] and `action: "resume"` is expected to pick it back
+    /// up. A stop is terminal: the run ends [`RunState::Stopped`], every unfinished step ends
+    /// [`crate::background::StepState::Stopped`] with
+    /// [`crate::background::control::STOP_MESSAGE`], the whole descendant subtree is stopped with
+    /// it, and `action: "resume"` MUST refuse it (`async-resume.ts:406`).
+    ///
+    /// pi's guards, in pi's order (`subagent-executor.ts:4771-4815`):
+    ///
+    /// * `targetRunId = params.runId ?? params.id` — `runId` first, same precedence as `interrupt`;
+    /// * with neither `id` nor `dir`, the exact refusal `"action='stop' requires id or dir."`
+    ///   (`:4789`). There is deliberately NO "most recently active run" default here — upstream has
+    ///   one for `interrupt` and not for `stop`, because a stop is unrecoverable;
+    /// * a `foreground` run resolves to `"action='stop' supports async runs only. Use
+    ///   action='interrupt' for foreground runs."` (`:4797`);
+    /// * with `dir`, the id is `location.resolvedId ?? targetRunId ?? basename(dir)` (`:4782`);
+    /// * the reconciled state must be `running` or `queued`, else the exact refusal text
+    ///   `"No running or queued async run was found for '{id}'."` with `isError: true`
+    ///   (`async-stop-action.ts:41-47`);
+    /// * success is the exact text `"Stop requested for async run {id}."` (`:56`);
+    /// * a delivery failure is `"Failed to stop async run {id}: {message}"` (`:60`).
+    ///
+    /// Upstream's `workflowControllers` fast path (`:4773-4777`) and its `mode === "workflow"`
+    /// reload-recovery refusal (`:4800-4805`) have no counterpart here: the WorkflowScript runtime
+    /// they address is not part of the ported baseline, so there is no controller registry to
+    /// consult and no `workflow` run mode to observe.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with whichever of the refusal/failure texts above applies.
+    pub async fn control_stop(
+        &self,
+        cwd: &Path,
+        target: Option<&str>,
+        dir: Option<&str>,
+    ) -> Result<String, String> {
+        if target.is_none() && dir.is_none() {
+            return Err("action='stop' requires id or dir.".to_string());
+        }
+        let async_root = default_async_root(cwd);
+        let results_dir = default_results_dir(cwd);
+
+        // pi `:4796-4797`: a live FOREGROUND run is refused with its own sentence pointing at
+        // `interrupt`, never silently treated as a missing async run.
+        if let Some(id) = target
+            && self.is_live_foreground_run(id)
+        {
+            return Err(STOP_FOREGROUND_RUN_REFUSAL.to_string());
+        }
+
+        // pi `:4782`: `location.resolvedId ?? targetRunId ?? path.basename(location.asyncDir ??
+        // params.dir)`.
+        let run_id = match dir {
+            Some(dir_arg) => run_status::reconcile_by_dir(Path::new(dir_arg), &results_dir)
+                .await
+                .map_err(|e| e.to_string())?
+                .map(|(status, _)| status.run_id.as_str().to_string())
+                .or_else(|| target.map(str::to_string))
+                .or_else(|| {
+                    Path::new(dir_arg)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| "action='stop' requires id or dir.".to_string())?,
+            None => target.unwrap_or_default().to_string(),
+        };
+
+        match control::stop(&async_root, &results_dir, &run_id, "stop-action", None).await {
+            Ok(control::StopOutcome::Requested) => {
+                Ok(format!("Stop requested for async run {run_id}."))
+            }
+            Ok(control::StopOutcome::NotStoppable) => Err(format!(
+                "No running or queued async run was found for '{run_id}'."
+            )),
+            Err(e) => Err(format!("Failed to stop async run {run_id}: {e}")),
+        }
+    }
+
+    /// G77 — pi's no-UI `/subagents-stop` fallback (`slash/slash-commands.ts:206-217,774`
+    /// @v0.43.0's `stopFallbackText`): with no explicit id and no overlay seam, list the stoppable
+    /// targets and the exact commands that stop each, rather than guessing one.
+    ///
+    /// Upstream's target list is `discoverStopTargets` = current-session queued/running async runs
+    /// (`formatAsyncStopTarget`, `:168-178`) PLUS scheduled runs (`scheduledStopTargets`, `:180-196`).
+    /// The `schedule.*` family is unported (it is the one part of pi's `SUBAGENT_ACTIONS` this
+    /// crate's schema deliberately omits, "MUST NOT be advertised until their manager exists"), so
+    /// the scheduled half contributes nothing here and only the async half renders — which is
+    /// exactly what upstream's own `scheduledStopTargets` `catch { return []; }` produces for a
+    /// runtime with no schedule store.
+    pub async fn format_stop_targets(&self, cwd: &Path) -> Result<String, String> {
+        let async_root = default_async_root(cwd);
+        let results_dir = default_results_dir(cwd);
+        let runs = run_status::list_active_runs(&async_root, &results_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+        if runs.is_empty() {
+            return Ok(
+                "No active current-session async runs or scheduled subagent runs to stop."
+                    .to_string(),
+            );
+        }
+        let mut lines = vec!["Subagent stop targets:".to_string(), String::new()];
+        for run in &runs {
+            let id = run.status.run_id.as_str();
+            lines.push(format!(
+                "- {id} · {} · {}",
+                run_status::run_mode_label(run.status.mode),
+                run_status::progress_label(&run.status)
+            ));
+            lines.push(format!(
+                "  {} · {}",
+                run_status::run_state_label(run.status.state),
+                run.dir.display()
+            ));
+            lines.push(format!(
+                "  stop async run: subagent({{ action: \"stop\", id: \"{id}\" }})"
+            ));
+            lines.push(format!("  slash: /subagents-stop {id}"));
+        }
+        Ok(lines.join("\n"))
+    }
+
     /// G90 — `action: "steer"` (pi `subagent-executor.ts:570-626,3194-3220` @v0.34.0): queue
     /// NON-TERMINAL guidance for a still-live background child.
     ///
@@ -3611,6 +3775,12 @@ impl SubagentExecutor {
                 "Resume unavailable: async run '{run_id}' has no persisted transcript to revive \
                  from."
             )),
+            // G77 — pi `async-resume.ts:406` @v0.43.0 throws with this exact sentence, and the
+            // thrown message is what the caller surfaces. `SubagentError::ResumeStopped`'s own
+            // `Display` IS that sentence, so this arm exists to pin it: a stopped run must never
+            // fall into the no-transcript wording above (its children usually DO have transcripts)
+            // and must never be silently revived.
+            Err(e @ SubagentError::ResumeStopped(_)) => Err(e.to_string()),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -4515,6 +4685,7 @@ CONTROL:
 • { action: "interrupt", id?: "..." } - soft-interrupt the current child turn and leave the run paused
 • { action: "resume", id: "...", message: "...", index?: 0 } - interrupt then follow up with a live async child, or revive a completed async/foreground child from its session
 • { action: "steer", id: "...", message: "...", index?: 0 } - queue non-terminal guidance for a live async child WITHOUT interrupting it
+• { action: "stop", id?: "..." } - TERMINALLY stop a running or queued async run and its whole descendant subtree; the run ends "stopped" and CANNOT be resumed
 • { action: "append-step", id: "...", chain: [{agent:"agent-c", task:"Use {previous}"}] } - append one step to the tail of a running async chain
 
 DIAGNOSTICS:
@@ -4527,6 +4698,12 @@ DIAGNOSTICS:
 /// exists and is running RIGHT NOW — steering simply has no transport to it, because the steer
 /// inbox is an async-run directory and a foreground run has none. That is why the text points at
 /// `interrupt`/`resume`, which do work on a foreground run, instead of implying the id was wrong.
+/// G77 — pi's stop-on-a-foreground-run refusal (`subagent-executor.ts:4797` @v0.43.0), verbatim.
+/// A distinct message from [`STEER_FOREGROUND_RUN_REFUSAL`]: it points at `interrupt` only, because
+/// `resume` on a live foreground run is not the alternative to a *stop*.
+const STOP_FOREGROUND_RUN_REFUSAL: &str =
+    "action='stop' supports async runs only. Use action='interrupt' for foreground runs.";
+
 const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently supports live async Cyrup \
      child sessions only; use action='interrupt' or action='resume' for foreground runs.";
 
@@ -4546,7 +4723,7 @@ const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently supports li
 /// [`crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS`], so a child-safe registration
 /// dispatches it exactly as upstream does. Omitting it was therefore the inverse defect — a real,
 /// reachable verb the model in a fanout child was told it did not have.
-const CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate to subagents from child-safe fanout mode.\nAllowed management/control actions: list, get, status, interrupt, resume, steer, append-step, doctor.\nAgent config mutation actions (create, update, delete, eject, disable, enable, reset) are blocked in this mode.";
+const CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate to subagents from child-safe fanout mode.\nAllowed management/control actions: list, get, status, interrupt, stop, resume, steer, append-step, doctor.\nAgent config mutation actions (create, update, delete, eject, disable, enable, reset) are blocked in this mode.";
 
 /// The `subagent` tool's full discriminated-union parameter surface (R-SA-128, C8) — the Rust parse
 /// target for pi's `SubagentParamsSchema` (`src/extension/schemas.ts:195-265`). Every top-level pi
@@ -5330,10 +5507,33 @@ fn sj_output_mode() -> serde_json::Value {
     serde_json::json!({ "type": "string", "enum": ["inline", "file-only"] })
 }
 
-/// `AcceptanceOverride` (`schemas.ts:69-76`): a level enum, `false`, or an object policy.
-fn sj_acceptance_override() -> serde_json::Value {
+/// `AcceptanceOverride` (`schemas.ts:80-93` @v0.43.0): a level enum, `false`, or an object policy.
+///
+/// Upstream is a FOUR-branch `anyOf`, and the split between the first two branches is the whole
+/// point. The requestable enum is exactly `["auto", "attested", "checked"]` (`schemas.ts:82`);
+/// `"reviewed"` lives alone in a second branch marked `deprecated` whose description says
+/// "Recognized only so preflight can explain that reviewed is an achieved status"
+/// (`schemas.ts:83-88`).
+///
+/// This crate previously advertised ONE wide enum that also offered `"none"` and `"verified"`.
+/// Both are hard-rejected by [`crate::exec::acceptance::lower_acceptance_input`]
+/// (`acceptance.ts:183-184`: `none` needs a reason, `verified` needs a non-empty `verify[]`), which
+/// is `AcceptanceInput = Exclude<AcceptanceLevel, "none" | "verified">` (`types.ts:684-685`)
+/// restated. Advertising a value the dispatch refuses is precisely the advertise-vs-dispatch
+/// violation this crate forbids, so the enum is narrowed to upstream's three.
+///
+/// `"reviewed"` is the ONE deliberate exception, and it is upstream's own: it is still advertised
+/// so the model gets the explanatory rejection rather than a bare schema violation. The invariant
+/// holds because a dispatch arm exists — it is the explanatory error, not silence.
+pub(crate) fn sj_acceptance_override() -> serde_json::Value {
     serde_json::json!({ "anyOf": [
-        { "type": "string", "enum": ["auto", "none", "attested", "checked", "verified", "reviewed"] },
+        { "type": "string", "enum": ["auto", "attested", "checked"] },
+        {
+            "type": "string",
+            "enum": ["reviewed"],
+            "deprecated": true,
+            "description": "Invalid as an explicit policy. Recognized only so preflight can explain that reviewed is an achieved status."
+        },
         { "type": "boolean", "enum": [false] },
         { "type": "object", "additionalProperties": true }
     ] })
@@ -5629,7 +5829,12 @@ fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("task".to_string(), serde_json::json!({ "type": "string", "description": "Task (SINGLE mode, optional for self-contained agents)" }));
     props.insert("action".to_string(), serde_json::json!({
         "type": "string",
-        "enum": ["list", "get", "models", "create", "update", "delete", "eject", "disable", "enable", "reset", "status", "interrupt", "resume", "steer", "append-step", "doctor"],
+        // G77: `stop` sits between `steer` and `append-step`, upstream's own position in
+        // `SUBAGENT_ACTIONS` (`shared/types.ts:1885` @v0.43.0: `… "interrupt", "resume", "steer",
+        // "stop", "append-step", …`). Advertised together with its `route_control_action` dispatch
+        // arm (`SubagentExecutor::control_stop`) in this same change, per the crate's
+        // advertise-vs-dispatch invariant.
+        "enum": ["list", "get", "models", "create", "update", "delete", "eject", "disable", "enable", "reset", "status", "interrupt", "resume", "steer", "stop", "append-step", "doctor"],
         "description": "Management/control action. Omit for execution mode."
     }));
     // G90 (advertise-vs-dispatch, the OTHER direction): these three, plus `message` below, are the
@@ -5638,9 +5843,9 @@ fn subagent_tool_parameters() -> serde_json::Value {
     // VERBATIM). With `steer` in the `action` enum and a real dispatch arm, a model told the verb
     // exists but shown no property that mentions it has to guess which of `id`/`runId`/`dir` to
     // address it with — the exact ambiguity these descriptions exist to remove.
-    props.insert("id".to_string(), serde_json::json!({ "type": "string", "description": "Run id or prefix for action='status', action='interrupt', action='resume', action='steer', or action='append-step'." }));
-    props.insert("runId".to_string(), serde_json::json!({ "type": "string", "description": "Target run ID for action='interrupt', action='resume', action='steer', or action='append-step'. Defaults to the most recently active controllable run for interrupt. Prefer id for new calls." }));
-    props.insert("dir".to_string(), serde_json::json!({ "type": "string", "description": "Async run directory for action='status', action='resume', or action='steer'." }));
+    props.insert("id".to_string(), serde_json::json!({ "type": "string", "description": "Run id or prefix for action='status', action='interrupt', action='stop', action='resume', action='steer', or action='append-step'." }));
+    props.insert("runId".to_string(), serde_json::json!({ "type": "string", "description": "Target run ID for action='interrupt', action='stop', action='resume', action='steer', or action='append-step'. Defaults to the most recently active controllable run for interrupt. Prefer id for new calls." }));
+    props.insert("dir".to_string(), serde_json::json!({ "type": "string", "description": "Async run directory for action='status', action='stop', action='resume', or action='steer'." }));
     props.insert("index".to_string(), serde_json::json!({ "type": "integer", "minimum": 0, "description": "Zero-based child index for actions that target a specific child or transcript." }));
     // G92: `view` + `lines` (pi `extension/schemas.ts:233-237` @v0.34.0, descriptions VERBATIM).
     // Both are read by `route_control_action`'s `status` arm — `view` selects
@@ -5967,6 +6172,162 @@ impl SubagentTool {
         } else {
             names.join(", ")
         }
+    }
+
+    /// pi `canonicalizeExecutionParams` (`subagent-executor.ts:1513-1571`, driven from `:4029-4031`
+    /// right after `deps.discoverAgents(...)` and before `applySingleAgentLaunchDefaults`): rewrite
+    /// EVERY agent name this dispatch names — the top-level SINGLE `agent`, each `tasks[i].agent`,
+    /// each chain step's `agent`, each static-parallel step's `parallel[j].agent`, and a dynamic
+    /// step's `parallel.agent` — to the CANONICAL name its alias-aware resolution yields.
+    ///
+    /// Canonicalizing here (rather than only inside each mode's own lookup) is what makes an alias
+    /// invisible downstream: persona maps, chain-step bookkeeping, run status rows and result
+    /// summaries all key off the step's `agent` string, so leaving an alias in place would report a
+    /// run under a name that no agent file carries.
+    ///
+    /// An AMBIGUOUS name/alias aborts the whole dispatch with pi's message, suffixed with the
+    /// per-site location pi appends (`(task 2)`, `(step 3, task 1)`) for everything except the
+    /// top-level `agent`, which carries none.
+    ///
+    /// [CYRUP-DELTA — deliberate, narrow] pi's `canonicalizeAgentName` ALSO turns an unresolvable
+    /// name into `Unknown agent: <name>` right here. cyrup leaves an unresolvable name UNTOUCHED and
+    /// lets the existing per-mode resolution fail as it already does
+    /// ([`SubagentError::AgentNotFound`] -> `agent not found: <name>`): the not-found WORDING is a
+    /// pre-existing, separate difference from pi that this crate's own tests pin, and changing it
+    /// here would be an unrelated behavioural edit smuggled into the alias port. The alias-resolution
+    /// and ambiguity-refusal halves — the parts this port owns — are complete.
+    async fn canonicalize_execution_params(
+        &self,
+        params: &SubagentToolParams,
+        cwd: &Path,
+    ) -> Result<Option<SubagentToolParams>, ToolError> {
+        // Nothing to canonicalize on a dispatch that names no agent anywhere.
+        if params.agent.is_none() && params.tasks.is_none() && params.chain.is_none() {
+            return Ok(None);
+        }
+        // A discovery failure here is not this step's to report: the mode arm below re-runs the same
+        // discovery and surfaces the real error (a malformed `settings.json` MUST abort, R-SA-009,
+        // and it will — one call later, with its own message). Degrading to "no canonicalization"
+        // keeps this step from turning one error into two different ones.
+        let Ok(agents) = SubagentExecutor::discovery_config(cwd)
+            // Same scope the mode arms resolve under (pi canonicalizes against the very
+            // `discoverAgents(effectiveCwd, scope)` result the executor then uses,
+            // `subagent-executor.ts:4027-4030`), so an alias can never resolve here to an agent the
+            // run itself would not have been allowed to see.
+            .and_then(|cfg| {
+                discover_agents(
+                    &cfg,
+                    Some(resolve_execution_agent_scope(params.agent_scope.as_deref())),
+                )
+            })
+            .map(|result| result.agents)
+        else {
+            return Ok(None);
+        };
+
+        // `canonicalizeAgentName` + the `location` suffix (`subagent-executor.ts:1513-1521`).
+        let resolve = |name: &str, location: Option<String>| -> Result<Option<String>, ToolError> {
+            match crate::discovery::resolve_agent_name(name, &agents) {
+                crate::discovery::AgentNameResolution::Found(agent) => {
+                    Ok(Some(agent.name.clone()))
+                }
+                crate::discovery::AgentNameResolution::Ambiguous(msg) => {
+                    Err(ToolError::new(match location {
+                        Some(loc) => format!("{msg} ({loc})"),
+                        None => msg,
+                    }))
+                }
+                // See the CYRUP-DELTA above: pass through, do not manufacture a not-found here.
+                crate::discovery::AgentNameResolution::NotFound => Ok(None),
+            }
+        };
+
+        /// Rewrite `value["agent"]` in place when it is a string that canonicalizes to something
+        /// different. Returns `true` iff anything changed.
+        fn set_agent(value: &mut serde_json::Value, canonical: String) {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("agent".to_string(), serde_json::Value::String(canonical));
+            }
+        }
+
+        let mut next = params.clone();
+        let mut changed = false;
+
+        if let Some(agent) = params.agent.as_deref()
+            && let Some(canonical) = resolve(agent, None)?
+            && canonical != agent
+        {
+            next.agent = Some(canonical);
+            changed = true;
+        }
+
+        if let Some(tasks) = next.tasks.as_mut() {
+            for (index, task) in tasks.iter_mut().enumerate() {
+                let Some(name) = task.get("agent").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let name = name.to_string();
+                if let Some(canonical) = resolve(&name, Some(format!("task {}", index + 1)))?
+                    && canonical != name
+                {
+                    set_agent(task, canonical);
+                    changed = true;
+                }
+            }
+        }
+
+        if let Some(chain) = next.chain.as_mut() {
+            for (index, step) in chain.iter_mut().enumerate() {
+                // Static-parallel step: `parallel` is an ARRAY of task objects.
+                if let Some(parallel) = step.get_mut("parallel").and_then(serde_json::Value::as_array_mut)
+                {
+                    for (task_index, task) in parallel.iter_mut().enumerate() {
+                        let Some(name) = task.get("agent").and_then(serde_json::Value::as_str) else {
+                            continue;
+                        };
+                        let name = name.to_string();
+                        if let Some(canonical) = resolve(
+                            &name,
+                            Some(format!("step {}, task {}", index + 1, task_index + 1)),
+                        )? && canonical != name
+                        {
+                            set_agent(task, canonical);
+                            changed = true;
+                        }
+                    }
+                    continue;
+                }
+                // Dynamic-fanout step: `parallel` is a single template OBJECT carrying one `agent`.
+                if let Some(template) = step.get("parallel").filter(|v| v.is_object()) {
+                    let Some(name) = template.get("agent").and_then(serde_json::Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let name = name.to_string();
+                    if let Some(canonical) = resolve(&name, Some(format!("step {}", index + 1)))?
+                        && canonical != name
+                        && let Some(template) = step.get_mut("parallel")
+                    {
+                        set_agent(template, canonical);
+                        changed = true;
+                    }
+                    continue;
+                }
+                // Ordinary sequential step.
+                let Some(name) = step.get("agent").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let name = name.to_string();
+                if let Some(canonical) = resolve(&name, Some(format!("step {}", index + 1)))?
+                    && canonical != name
+                {
+                    set_agent(step, canonical);
+                    changed = true;
+                }
+            }
+        }
+
+        Ok(if changed { Some(next) } else { None })
     }
 
     /// pi `resolveRequestedCwd` (`subagent-executor.ts:193-195`): an explicit `params.cwd` is
@@ -6443,13 +6804,15 @@ impl SubagentTool {
             // G90: `steer` joins the control arm (it is `route_control_action`'s fifth case, in
             // pi's own dispatch position between `resume` and `append-step`,
             // `subagent-executor.ts:3194` @v0.34.0).
-            "status" | "interrupt" | "resume" | "steer" | "append-step" => {
+            // G77: `stop` joins the control arm, in pi's own dispatch position immediately after
+            // `interrupt` (`extension/rpc.ts:568`, `subagent-executor.ts:4776-4810` @v0.43.0).
+            "status" | "interrupt" | "stop" | "resume" | "steer" | "append-step" => {
                 self.route_control_action(action, p, cwd).await
             }
             other => Err(ToolError::new(format!(
                 "unknown subagent action '{other}'; valid actions are list, get, models, create, \
                  update, delete, eject, disable, enable, reset, status, interrupt, resume, steer, \
-                 append-step, doctor."
+                 stop, append-step, doctor."
             ))),
         }
     }
@@ -6542,6 +6905,14 @@ impl SubagentTool {
                 // pi interrupt prefers `runId` over `id` (`subagent-executor.ts:2872`).
                 let target = p.run_id.as_deref().or(p.id.as_deref());
                 self.executor.control_interrupt(cwd, target).await
+            }
+            // G77: the `stop` dispatch arm the schema enum value is advertised against (the
+            // advertise-vs-dispatch invariant — both land in this same change). pi reads
+            // `targetRunId = params.runId ?? params.id` (`subagent-executor.ts:4772`), the SAME
+            // `runId`-first precedence `interrupt` uses, and also accepts `dir` (`:4779-4787`).
+            "stop" => {
+                let target = p.run_id.as_deref().or(p.id.as_deref());
+                self.executor.control_stop(cwd, target, p.dir.as_deref()).await
             }
             "resume" => {
                 // pi `resumeAsyncRun` (`subagent-executor.ts:1145-1152`): a resume may carry an
@@ -7055,18 +7426,26 @@ impl Tool for SubagentTool {
             return Err(ToolError::new(limit_notice));
         }
 
+        // pi `canonicalizeExecutionParams` (`subagent-executor.ts:4029-4031`), in pi's own position:
+        // after the mode is settled and the budget charged, immediately before the mode arm runs. An
+        // alias is rewritten to the agent's canonical name HERE so every downstream surface (persona
+        // maps, chain bookkeeping, status rows, result summaries) names the real agent; an ambiguous
+        // alias aborts the whole dispatch.
+        let canonicalized = self.canonicalize_execution_params(&parsed, &effective_cwd).await?;
+        let parsed: &SubagentToolParams = canonicalized.as_ref().unwrap_or(&parsed);
+
         if has_tasks {
-            return self.route_parallel_mode(&parsed, &effective_cwd, cancel).await;
+            return self.route_parallel_mode(parsed, &effective_cwd, cancel).await;
         }
         if has_chain {
-            return self.route_chain_mode(&parsed, &effective_cwd, cancel).await;
+            return self.route_chain_mode(parsed, &effective_cwd, cancel).await;
         }
         // C19: SINGLE mode is the one shape wired for live progress today — its foreground child's
         // NDJSON stream is folded and forwarded through `on_update` (`route_single` ->
         // `run_foreground_streaming`). The tool-driven PARALLEL/CHAIN shapes still surface progress
         // only on completion; streaming their fan-out is the remaining live-progress work (their
         // per-child folds would multiplex through the same `SubagentUpdatePayload.progress[]`).
-        self.route_single(&parsed, &effective_cwd, on_update, cancel).await
+        self.route_single(parsed, &effective_cwd, on_update, cancel).await
     }
 }
 
@@ -8205,6 +8584,33 @@ impl SubagentsExtension {
                 )
                 .await
                 .map_err(SubagentError::Management),
+            // G77: pi's `/subagents-stop` handler with an explicit id is exactly
+            // `runSlashSubagent(pi, ctx, { action: "stop", id })` (`slash-commands.ts:754-757`
+            // @v0.43.0) — routed here to the SAME `control_stop` entry point the
+            // `subagent({ action: "stop" })` tool call lands on, so the two surfaces can never
+            // diverge (R-SA-130).
+            //
+            // With NO id upstream opens a TUI selector over the discovered stop targets and then
+            // issues the identical call for the chosen one (`:775-791`); this crate's slash layer
+            // has no overlay seam (see `SLASH_COMMANDS`' own note that `CommandDescriptor` carries
+            // a static completion list, not a closure), so the empty-argument case takes upstream's
+            // OWN documented no-UI fallback path instead — `if (!ctx.hasUI) sendSlashText(pi,
+            // stopFallbackText(targets))` (`:774`) — rather than guessing a target. A stop is
+            // unrecoverable, so guessing is the one thing this command must not do.
+            SlashCommandName::SubagentsStop => {
+                let id = args.trim();
+                if id.is_empty() {
+                    self.executor
+                        .format_stop_targets(cwd)
+                        .await
+                        .map_err(SubagentError::Management)
+                } else {
+                    self.executor
+                        .control_stop(cwd, Some(id), None)
+                        .await
+                        .map_err(SubagentError::Management)
+                }
+            }
             SlashCommandName::SubagentsProfiles => {
                 let profiles_dir = self.profiles_dir();
                 let profiles = crate::registration::profiles::describe_profiles(&profiles_dir)?;
@@ -9298,15 +9704,17 @@ fn render_chain_results(results: &[StepResult], is_group: &[bool], groups: &[Gro
     out
 }
 
-/// pi `BUILTIN_AGENT_NAMES` (`agents.ts:25-33`): the fixed 8 shipped builtin personas, in pi's
-/// declared order. `/subagents-models`' all-agents view (and the single-agent name gate) walks
+/// pi `BUILTIN_AGENT_NAMES` (`agents.ts:38-46` @ v0.43.0): the fixed 7 builtin persona NAMES, in
+/// pi's declared order. `/subagents-models`' all-agents view (and the single-agent name gate) walks
 /// EXACTLY this static list — not whatever discovery happened to find — so a name discovery didn't
 /// resolve renders its own "missing"/"not found" row rather than silently shrinking the report.
-const BUILTIN_AGENT_NAMES: [&str; 8] = [
-    "context-builder",
+///
+/// See [`crate::discovery::management::BUILTIN_AGENT_NAMES`] for why `planner`/`context-builder`
+/// are gone and why `advisor` is here despite shipping no `advisor.md` (it is an `oracle` alias).
+const BUILTIN_AGENT_NAMES: [&str; 7] = [
+    "advisor",
     "delegate",
     "oracle",
-    "planner",
     "researcher",
     "reviewer",
     "scout",
@@ -10628,8 +11036,8 @@ mod tests {
             action_values,
             vec![
                 "list", "get", "models", "create", "update", "delete", "eject", "disable",
-                "enable", "reset", "status", "interrupt", "resume", "steer", "append-step",
-                "doctor"
+                "enable", "reset", "status", "interrupt", "resume", "steer", "stop",
+                "append-step", "doctor"
             ],
             "the action enum must be pi's SUBAGENT_ACTIONS union minus the deferred schedule* four"
         );
@@ -10891,7 +11299,7 @@ mod tests {
         assert_eq!(
             Tool::description(&child_safe),
             "Delegate to subagents from child-safe fanout mode.\n\
-             Allowed management/control actions: list, get, status, interrupt, resume, steer, append-step, doctor.\n\
+             Allowed management/control actions: list, get, status, interrupt, stop, resume, steer, append-step, doctor.\n\
              Agent config mutation actions (create, update, delete, eject, disable, enable, reset) are blocked in this mode.",
             "the child-safe tool must advertise pi's exact fanout-child.ts:159-163 text"
         );
@@ -12787,20 +13195,27 @@ mod tests {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
 
+        // G78 — the bare `"none"`, `"verified"` and `"reviewed"` strings this list used to carry
+        // are no longer valid policies at pi-subagents v0.43.0 (`acceptance.ts:180-185`), so their
+        // still-valid object equivalents take their place and the coverage of the hop-2 boundary
+        // is unchanged in breadth: a disable, three plain levels, an object with verify commands,
+        // and an object with a review gate.
         let policies = [
             serde_json::json!(false),
-            serde_json::json!("none"),
             serde_json::json!("attested"),
             serde_json::json!("checked"),
-            serde_json::json!("verified"),
-            serde_json::json!("reviewed"),
             serde_json::json!("auto"),
+            serde_json::json!({ "level": "none", "reason": "prototype spike" }),
             serde_json::json!({
                 "level": "verified",
                 "verify": [
                     { "id": "unit", "command": "cargo test --workspace" },
                     { "id": "lint", "command": "cargo clippy -- -D warnings" },
                 ],
+            }),
+            serde_json::json!({
+                "level": "checked",
+                "review": { "agent": "reviewer", "required": true },
             }),
         ];
 
@@ -13120,6 +13535,159 @@ mod tests {
             let parsed = SlashCommandName::from_str_exact(descriptor.name.as_str());
             assert_eq!(parsed, Some(descriptor.name));
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // G97 — alias resolution on the LIVE execution path
+    // -----------------------------------------------------------------------------------------
+
+    /// `resolve_agent` is the production lookup every single/plan launch goes through
+    /// (`run_foreground`, `spawn_background`, `resolve_plan_personas`). It must accept an ALIAS —
+    /// and the bundled personas really carry them (`resources/agents/oracle.md` declares
+    /// `aliases: advisor`, `worker.md` declares `developer, coder, implementer, develop`), so this
+    /// exercises the shipped resource root, not a synthetic fixture.
+    #[tokio::test]
+    async fn resolve_agent_accepts_a_bundled_personas_alias() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (alias, canonical) in [
+            ("advisor", "oracle"),
+            ("developer", "worker"),
+            ("coder", "worker"),
+            ("implementer", "worker"),
+            ("develop", "worker"),
+        ] {
+            let agent = executor
+                .resolve_agent(dir.path(), alias, AgentReadScope::Both)
+                .unwrap_or_else(|e| panic!("alias {alias:?} must resolve: {e}"));
+            assert_eq!(agent.name, canonical, "alias {alias:?} resolved to the wrong agent");
+        }
+        // The canonical names still resolve to themselves.
+        assert_eq!(
+            executor
+                .resolve_agent(dir.path(), "oracle", AgentReadScope::Both)
+                .expect("oracle resolves")
+                .name,
+            "oracle"
+        );
+    }
+
+    /// An alias claimed by two DISTINCT agents refuses the launch outright, carrying pi's exact
+    /// wording — never an arbitrary pick, and never a "not found".
+    #[tokio::test]
+    async fn resolve_agent_refuses_an_ambiguous_alias_on_the_live_path() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_agents = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&project_agents).expect("mkdir");
+        std::fs::write(
+            project_agents.join("seer.md"),
+            "---\nname: seer\ndescription: Sees\naliases: prophet\n---\n\nBody\n",
+        )
+        .expect("write");
+        std::fs::write(
+            project_agents.join("augur.md"),
+            "---\nname: augur\ndescription: Augurs\naliases: prophet\n---\n\nBody\n",
+        )
+        .expect("write");
+
+        // Each on its own still resolves, so the refusal below is about the collision and not about
+        // the fixtures failing to be discovered at all.
+        assert_eq!(
+            executor
+                .resolve_agent(dir.path(), "seer", AgentReadScope::Both)
+                .expect("seer resolves by name")
+                .name,
+            "seer"
+        );
+
+        let err = executor
+            .resolve_agent(dir.path(), "prophet", AgentReadScope::Both)
+            .expect_err("an ambiguous alias must refuse");
+        assert_eq!(err.to_string(), "Ambiguous agent alias 'prophet': augur, seer");
+        assert!(
+            !matches!(err, SubagentError::AgentNotFound(_)),
+            "an ambiguous alias must NOT be reported as not found"
+        );
+    }
+
+    /// pi `canonicalizeExecutionParams` (`subagent-executor.ts:1520-1571`): every agent name in the
+    /// dispatch — SINGLE, each `tasks[]` entry, each chain step, each static-parallel task, and a
+    /// dynamic step's template — is rewritten to the CANONICAL name before the mode arm runs, so no
+    /// downstream surface ever reports a run under a name no agent file carries.
+    #[tokio::test]
+    async fn execution_params_are_canonicalized_across_every_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+
+        let params = SubagentToolParams {
+            agent: Some("advisor".to_string()),
+            tasks: Some(vec![
+                serde_json::json!({ "agent": "developer", "task": "a" }),
+                serde_json::json!({ "agent": "scout", "task": "b" }),
+            ]),
+            chain: Some(vec![
+                serde_json::json!({ "agent": "coder", "task": "c" }),
+                serde_json::json!({ "parallel": [{ "agent": "advisor", "task": "d" }] }),
+                serde_json::json!({ "parallel": { "agent": "implementer", "expand": "x" } }),
+            ]),
+            ..serde_json::from_value(serde_json::json!({})).expect("default params")
+        };
+
+        let canonical = tool
+            .canonicalize_execution_params(&params, dir.path())
+            .await
+            .expect("canonicalization succeeds")
+            .expect("at least one name changed");
+
+        assert_eq!(canonical.agent.as_deref(), Some("oracle"));
+        let tasks = canonical.tasks.as_ref().expect("tasks kept");
+        assert_eq!(tasks[0]["agent"], "worker");
+        assert_eq!(tasks[0]["task"], "a", "the rest of the task object must survive untouched");
+        assert_eq!(tasks[1]["agent"], "scout", "an already-canonical name is left alone");
+
+        let chain = canonical.chain.as_ref().expect("chain kept");
+        assert_eq!(chain[0]["agent"], "worker");
+        assert_eq!(chain[1]["parallel"][0]["agent"], "oracle");
+        assert_eq!(chain[2]["parallel"]["agent"], "worker");
+        assert_eq!(chain[2]["parallel"]["expand"], "x");
+    }
+
+    /// An ambiguous alias inside a fan-out aborts the WHOLE dispatch, with pi's per-site location
+    /// suffix (`subagent-executor.ts:1522-1525`).
+    #[tokio::test]
+    async fn an_ambiguous_alias_in_a_task_list_aborts_the_dispatch_with_a_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_agents = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&project_agents).expect("mkdir");
+        std::fs::write(
+            project_agents.join("seer.md"),
+            "---\nname: seer\ndescription: Sees\naliases: prophet\n---\n\nBody\n",
+        )
+        .expect("write");
+        std::fs::write(
+            project_agents.join("augur.md"),
+            "---\nname: augur\ndescription: Augurs\naliases: prophet\n---\n\nBody\n",
+        )
+        .expect("write");
+
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let params = SubagentToolParams {
+            tasks: Some(vec![
+                serde_json::json!({ "agent": "scout", "task": "a" }),
+                serde_json::json!({ "agent": "prophet", "task": "b" }),
+            ]),
+            ..serde_json::from_value(serde_json::json!({})).expect("default params")
+        };
+        let err = tool
+            .canonicalize_execution_params(&params, dir.path())
+            .await
+            .expect_err("an ambiguous alias must abort the dispatch");
+        assert_eq!(
+            err.to_string(),
+            "Ambiguous agent alias 'prophet': augur, seer (task 2)",
+            "the ambiguity must name its position in the fan-out"
+        );
     }
 
     #[tokio::test]
@@ -14495,6 +15063,160 @@ mod tests {
         assert!(
             !text.contains("Progress:"),
             "transcript is a DIFFERENT view, not the ordinary status report: {text}"
+        );
+    }
+
+    /// G77 — the LIVE tool path: `subagent({ action: "stop", id })` must reach
+    /// [`SubagentExecutor::control_stop`] and write a REAL `control/stop.json` into the run's
+    /// control inbox (pi `stopAsyncRun` → `deliverStopRequest`, `async-stop-action.ts:44`), with
+    /// pi's verbatim success text.
+    ///
+    /// This drives `Tool::execute` end to end rather than calling `control_stop` directly, so it
+    /// covers the whole advertise-then-dispatch chain the schema promises the model.
+    #[tokio::test]
+    async fn the_stop_action_dispatches_and_writes_a_real_stop_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = seed_running_run(dir.path(), "stoptool0001", &["scout"]);
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+
+        let out = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "stoptool0001" }))
+            .await
+            .expect("action='stop' must dispatch");
+        assert_eq!(tool_text(&out), "Stop requested for async run stoptool0001.");
+
+        let request = crate::background::control::stop_request_path(&paths.run_dir);
+        assert!(request.exists(), "a real stop request must land at {}", request.display());
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&request).expect("read")).expect("valid json");
+        assert_eq!(raw["type"], serde_json::json!("stop"));
+        assert_eq!(raw["source"], serde_json::json!("stop-action"));
+    }
+
+    /// G77 — the three refusal shapes, each with pi's verbatim text. None of them is "unknown
+    /// subagent action", and none of them is a panic.
+    #[tokio::test]
+    async fn the_stop_action_refusals_use_pis_verbatim_texts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+
+        // An unknown run (`async-stop-action.ts:44`).
+        let err = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "nosuchrun001" }))
+            .await
+            .expect_err("an unknown run must be refused");
+        assert!(
+            err.to_string()
+                .contains("No running or queued async run was found for 'nosuchrun001'."),
+            "the refusal must be pi's own text, not `unknown subagent action`: {err}"
+        );
+
+        // No selector at all (`subagent-executor.ts:4789`). There is deliberately NO
+        // most-recently-active default for `stop` — upstream has one only for `interrupt`.
+        let err = dispatch_tool(&tool, serde_json::json!({ "action": "stop" }))
+            .await
+            .expect_err("a selector-less stop must be refused, never defaulted");
+        assert!(
+            err.to_string().contains("action='stop' requires id or dir."),
+            "a stop is unrecoverable; guessing a target is exactly what upstream refuses: {err}"
+        );
+    }
+
+    /// G77 — a live FOREGROUND run gets its own refusal pointing at `interrupt`
+    /// (`subagent-executor.ts:4797`), not the async not-found text.
+    #[tokio::test]
+    async fn stopping_a_live_foreground_run_points_at_interrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(SubagentExecutor::new());
+        {
+            let mut controls = executor
+                .foreground_controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            controls.insert(
+                "fgstop0001".to_string(),
+                ForegroundControlEntry {
+                    interrupt: CancelToken::new(),
+                    current_agent: Some("scout".to_string()),
+                    current_index: Some(0),
+                    current_activity_state: None,
+                },
+            );
+        }
+        let err = executor
+            .control_stop(dir.path(), Some("fgstop0001"), None)
+            .await
+            .expect_err("a foreground run is not stoppable");
+        assert_eq!(
+            err,
+            "action='stop' supports async runs only. Use action='interrupt' for foreground runs."
+        );
+    }
+
+    /// G77 — the advertise-vs-dispatch invariant for `stop`, both directions in one test: the
+    /// schema names it in pi's own position within `SUBAGENT_ACTIONS`, every surface that TELLS a
+    /// model the action set mentions it, and the dispatcher genuinely answers it.
+    #[test]
+    fn the_stop_action_is_advertised_everywhere_it_is_dispatched() {
+        let params = subagent_tool_parameters();
+        let action_values: Vec<&str> = params["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        let stop_at = action_values
+            .iter()
+            .position(|v| *v == "stop")
+            .expect("`stop` must be an advertised action");
+        let steer_at = action_values.iter().position(|v| *v == "steer").expect("steer");
+        let append_at = action_values
+            .iter()
+            .position(|v| *v == "append-step")
+            .expect("append-step");
+        assert!(
+            steer_at < stop_at && stop_at < append_at,
+            "pi orders `… steer, stop, append-step …` (`shared/types.ts:1885` @v0.43.0): {action_values:?}"
+        );
+
+        // pi's three addressing properties each name `action='stop'` (`extension/schemas.ts:266,
+        // 269,272` @v0.43.0) — a model told the verb exists but shown no property that mentions it
+        // has to guess how to address it.
+        for key in ["id", "runId", "dir"] {
+            let description = params["properties"][key]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                description.contains("action='stop'"),
+                "the `{key}` property description must name action='stop': {description}"
+            );
+        }
+
+        // Both prose surfaces name it too.
+        assert!(SUBAGENT_TOOL_DESCRIPTION.contains("{ action: \"stop\""));
+        assert!(CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION.contains("stop"));
+    }
+
+    /// G77 — `/subagents-stop` is registered on the slash surface (pi
+    /// `pi.registerCommand("subagents-stop", …)`, `slash-commands.ts:751-753` @v0.43.0) and its
+    /// dispatch lands on the SAME `control_stop` entry point the tool action does, so the two
+    /// surfaces can never diverge (R-SA-130).
+    #[tokio::test]
+    async fn the_subagents_stop_slash_command_is_registered_and_drives_the_same_stop() {
+        assert_eq!(
+            SlashCommandName::from_str_exact("subagents-stop"),
+            Some(SlashCommandName::SubagentsStop),
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = seed_running_run(dir.path(), "stopslash001", &["scout"]);
+        let extension = SubagentsExtension::new();
+        let rendered = extension
+            .dispatch_slash(SlashCommandName::SubagentsStop, "stopslash001", dir.path())
+            .await
+            .expect("/subagents-stop must dispatch");
+        assert_eq!(rendered, "Stop requested for async run stopslash001.");
+        assert!(
+            crate::background::control::stop_request_path(&paths.run_dir).exists(),
+            "the slash command must write the same real stop request the tool action does"
         );
     }
 

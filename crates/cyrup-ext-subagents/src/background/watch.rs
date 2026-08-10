@@ -548,6 +548,13 @@ pub enum ClassifiedOutcome {
     Completed,
     Failed,
     Paused,
+    /// G77 — pi `buildCompletionDetails`'s fourth status word (`notify.ts:210`: `const status =
+    /// stopped ? "stopped" : paused ? "paused" : result.success ? "completed" : "failed"`). Note
+    /// upstream evaluates `stopped` FIRST, ahead of both `paused` and `success`, and derives it
+    /// from `result.stopped === true || result.state === "stopped" || …` plus the same test over
+    /// every child (`notify.ts:199-205`) — so a stopped run is never reported as failed, and never
+    /// as paused either.
+    Stopped,
 }
 
 /// Classify `result` per R-SA-100 — a `Paused` state is NEVER reclassified as `Failed` regardless
@@ -558,6 +565,13 @@ pub enum ClassifiedOutcome {
 #[must_use]
 pub fn classify_outcome(result: &ResultFile) -> ClassifiedOutcome {
     match result.state {
+        // G77 — checked BEFORE `Paused`/`success`, mirroring `notify.ts:199-210`'s own ordering:
+        // `stopped` is derived first and wins outright. Also OR'd against the per-child signal
+        // (`result.results?.some((child) => child.stopped === true || …)`, `notify.ts:203-205`) so
+        // a run whose overall `state` was never repaired to `Stopped` but whose children were
+        // stopped still classifies as stopped rather than failed.
+        RunState::Stopped => ClassifiedOutcome::Stopped,
+        _ if result.results.iter().any(|child| child.stopped) => ClassifiedOutcome::Stopped,
         RunState::Paused => ClassifiedOutcome::Paused,
         RunState::Complete if result.success => ClassifiedOutcome::Completed,
         RunState::Complete => ClassifiedOutcome::Failed, // state says done, success says no
@@ -700,6 +714,9 @@ pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
         ClassifiedOutcome::Completed => "completed",
         ClassifiedOutcome::Failed => "failed",
         ClassifiedOutcome::Paused => "paused",
+        // G77 — pi `notify.ts:210`'s own fourth word, rendered verbatim into the
+        // `Background task <status>: **<agent>**` header.
+        ClassifiedOutcome::Stopped => "stopped",
     };
     let agent = if result.agent.is_empty() { "unknown" } else { result.agent.as_str() };
 
@@ -836,6 +853,87 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             session_file: None,
             results: Vec::new(),
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // G77 — `stopped` is the FOURTH completion classification (pi `notify.ts:199-210`)
+    // ---------------------------------------------------------------------------------------
+
+    /// A stopped run classifies as [`ClassifiedOutcome::Stopped`] — never `Failed` (which is what a
+    /// `success: false` run without this arm would produce) and never `Paused`. Both of upstream's
+    /// signals are covered: the run's own `state`, and the per-child `stopped` flag ORed over
+    /// `result.results` (`notify.ts:200-205`).
+    #[test]
+    fn classify_outcome_reports_stopped_from_either_the_run_state_or_a_stopped_child() {
+        let mut by_state = sample_result("run-stop-1", RunState::Stopped, false);
+        assert_eq!(classify_outcome(&by_state), ClassifiedOutcome::Stopped);
+
+        // …and it wins even if `success` were somehow true.
+        by_state.success = true;
+        assert_eq!(classify_outcome(&by_state), ClassifiedOutcome::Stopped);
+
+        // The per-child OR: the run's own state was never repaired, but a child says stopped.
+        let mut by_child = sample_result("run-stop-2", RunState::Failed, false);
+        by_child.results.push(stopped_child());
+        assert_eq!(classify_outcome(&by_child), ClassifiedOutcome::Stopped);
+
+        // Every pre-G77 classification is untouched.
+        assert_eq!(
+            classify_outcome(&sample_result("run-ok", RunState::Complete, true)),
+            ClassifiedOutcome::Completed
+        );
+        assert_eq!(
+            classify_outcome(&sample_result("run-bad", RunState::Failed, false)),
+            ClassifiedOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(&sample_result("run-pause", RunState::Paused, false)),
+            ClassifiedOutcome::Paused
+        );
+    }
+
+    /// pi `notify.ts:210`'s status word reaches the rendered `subagent-notify` body.
+    #[test]
+    fn format_completion_message_renders_pis_fourth_status_word() {
+        let stopped = sample_result("run-stop-3", RunState::Stopped, false);
+        let message = format_completion_message(&stopped);
+        assert!(
+            message.content.starts_with("Background task stopped: **researcher**"),
+            "{}",
+            message.content
+        );
+        assert!(
+            !message.content.contains("Background task failed"),
+            "a stopped run must never be announced as failed: {}",
+            message.content
+        );
+    }
+
+    /// A `SingleResult` that was terminated by an explicit stop.
+    fn stopped_child() -> crate::exec::SingleResult {
+        crate::exec::SingleResult {
+            agent: "researcher".to_string(),
+            task: String::new(),
+            exit_code: 1,
+            usage: cyrup_core::Usage::default(),
+            model: None,
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: None,
+            structured_output: None,
+            acceptance: None,
+            detached: false,
+            interrupted: false,
+            timed_out: false,
+            stopped: true,
+            process_signal: None,
+            error: None,
+            saved_output_path: None,
+            tool_calls: Vec::new(),
+            output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         }
     }
 
@@ -1193,6 +1291,8 @@ mod tests {
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: None,
             saved_output_path: None,
             tool_calls: Vec::new(),

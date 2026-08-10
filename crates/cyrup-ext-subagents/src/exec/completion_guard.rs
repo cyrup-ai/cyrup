@@ -114,449 +114,18 @@ pub(crate) fn any_word_boundary(haystack_lower: &str, needles: &[&str]) -> bool 
 }
 
 // -------------------------------------------------------------------------------------------
-// Pattern groups (mirrors the source's REVIEW_ONLY_PATTERNS / REVIEWER_REQUIRED_EDIT_PATTERNS /
-// EXPLICIT_NO_EDIT_PATTERNS / SCOPED_NO_EDIT_CONSTRAINT_PATTERNS / RESEARCH_AGENT_PATTERNS /
-// WORKER_IMPLEMENTATION_PATTERNS / GENERAL_IMPLEMENTATION_PATTERNS verbatim, one function per
-// source array)
+// Task mutation-intent classification (moved to `exec/task_intent.rs`, mirroring upstream's own
+// `task-intent.ts` split)
 // -------------------------------------------------------------------------------------------
 
-/// Source: `REVIEW_ONLY_PATTERNS` — `/\breview only\b/i`, `/\bsuggest fixes only\b/i`,
-/// `/\bonly return findings\b/i`, `/\breturn findings only\b/i`.
-fn matches_review_only(text_lower: &str) -> bool {
-    any_word_boundary(
-        text_lower,
-        &[
-            "review only",
-            "suggest fixes only",
-            "only return findings",
-            "return findings only",
-        ],
-    )
-}
+/// Re-exported from [`crate::exec::task_intent`], exactly as `completion-guard.ts:3,5` imports
+/// `expectsImplementationMutation` from `./task-intent.ts` and re-exports it. The classifier's
+/// pattern lists, their ORDER and the three-valued
+/// [`crate::exec::task_intent::TaskMutationIntent`] live there because acceptance-level inference
+/// (`exec/acceptance.rs`) is its second consumer and needs all three values plus
+/// [`crate::exec::task_intent::task_may_mutate`], which this guard never sees.
+pub use crate::exec::task_intent::expects_implementation_mutation;
 
-/// Source: `REVIEWER_REQUIRED_EDIT_PATTERNS`. Two entries use a `(?:...)` verb alternation
-/// (`must\s+(?:edit|modify|change|fix|patch|apply)` and its `required to`/`always` siblings) —
-/// ported as one boundary check per (prefix, verb) pair rather than a generic alternation engine,
-/// since the verb set is small and fixed.
-fn matches_reviewer_required_edit(text_lower: &str) -> bool {
-    const VERBS: &[&str] = &["edit", "modify", "change", "fix", "patch", "apply"];
-    const PREFIXES: &[&str] = &["must", "required to", "always"];
-    for prefix in PREFIXES {
-        for verb in VERBS {
-            // `\bmust\s+(?:edit|...)\b` — the source pattern allows arbitrary whitespace between
-            // prefix and verb (`\s+`), collapsed here to a single-space phrase test since prose
-            // task text realistically uses single spaces; `word_boundary_contains` still requires
-            // a non-word boundary on each side of the whole phrase.
-            let phrase = format!("{prefix} {verb}");
-            if word_boundary_contains(text_lower, &phrase) {
-                return true;
-            }
-        }
-    }
-    any_word_boundary(
-        text_lower,
-        &[
-            "regardless of findings",
-            "apply the fix directly",
-            "apply fix directly",
-            "apply the fixes directly",
-            "apply fixes directly",
-            "make the code changes",
-            "make code changes",
-        ],
-    )
-}
-
-/// Source: `EXPLICIT_NO_EDIT_PATTERNS` — `/\bdo not edit\b/i`, `/\bdon't edit\b/i`,
-/// `/\bdo not modify\b/i`, `/\bdo not change files\b/i`.
-fn matches_explicit_no_edit(text_lower: &str) -> bool {
-    any_word_boundary(
-        text_lower,
-        &[
-            "do not edit",
-            "don't edit",
-            "do not modify",
-            "do not change files",
-        ],
-    )
-}
-
-/// Source: `SCOPED_NO_EDIT_CONSTRAINT_PATTERNS` — matched (not merely tested) so
-/// [`strip_scoped_no_edit_constraints`] can excise every occurrence, mirroring the source's
-/// `stripped.replace(pattern, " ")` loop. Returns the byte ranges of every non-overlapping match
-/// of any of the five source phrases, in left-to-right order.
-///
-/// Source patterns: `/\bdo not edit files?\s+outside\b/i`, `/\bdo not edit\s+outside\b/i`,
-/// `/\bdo not edit\s+unrelated files?\b/i`, `/\bdo not change\s+unrelated files?\b/i`,
-/// `/\bdo not modify\s+unrelated files?\b/i`.
-fn scoped_no_edit_constraint_ranges(text_lower: &str) -> Vec<(usize, usize)> {
-    // Each entry: the fixed phrase(s) this one source pattern can match, longest-first within a
-    // group so `find_longest_at` below prefers `"do not edit files outside"` over the shorter
-    // `"do not edit file outside"` when both are literally present is moot (they're mutually
-    // exclusive singular/plural forms) — order here only matters for readability.
-    const PHRASES: &[&str] = &[
-        "do not edit files outside",
-        "do not edit file outside",
-        "do not edit outside",
-        "do not edit unrelated files",
-        "do not edit unrelated file",
-        "do not change unrelated files",
-        "do not change unrelated file",
-        "do not modify unrelated files",
-        "do not modify unrelated file",
-    ];
-
-    let mut ranges = Vec::new();
-    for phrase in PHRASES {
-        let mut start = 0usize;
-        while let Some(rel) = text_lower.get(start..).and_then(|s| s.find(phrase)) {
-            let match_start = start + rel;
-            let match_end = match_start + phrase.len();
-            let before_ok = text_lower[..match_start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !is_word_char(c));
-            let after_ok = text_lower[match_end..]
-                .chars()
-                .next()
-                .is_none_or(|c| !is_word_char(c));
-            if before_ok && after_ok {
-                ranges.push((match_start, match_end));
-            }
-            start = match_start + 1;
-            if start > text_lower.len() {
-                break;
-            }
-        }
-    }
-    ranges.sort_unstable();
-    ranges
-}
-
-/// Source: `RESEARCH_AGENT_PATTERNS` — `/\binvestigate\b/i`, `/\bscout\b/i`,
-/// `/\bresearch(?:er)?\b/i` (matches both `research` and `researcher`; the latter is a strict
-/// extension of the former so a single `word_boundary_contains(.., "research")` covers both —
-/// `\bresearch\b` alone would NOT match inside `"researcher"` since `er` is a word character
-/// continuing past the boundary, so `researcher` is tested as its own literal phrase too).
-fn matches_research_agent(agent_lower: &str) -> bool {
-    any_word_boundary(agent_lower, &["investigate", "scout", "research", "researcher"])
-}
-
-/// Source: `WORKER_IMPLEMENTATION_PATTERNS`. The second source entry,
-/// `/\b(?:update|add|remove|replace|create)\b(?!\s+(?:(?:a|an|the)\s+)?(?:report|summary|findings?)(?:\b|$))/i`,
-/// is a verb match with a **negative lookahead** excluding `"<verb> [a/an/the] report|summary|
-/// finding(s)"` — ported as [`matches_verb_not_followed_by_report_like_noun`] rather than folded
-/// into the plain word-boundary helper, since a negative lookahead has no direct
-/// `word_boundary_contains` equivalent.
-fn matches_worker_implementation(task_lower: &str) -> bool {
-    if any_word_boundary(
-        task_lower,
-        &["implement", "fix", "edit", "modify", "patch", "refactor", "delete"],
-    ) {
-        return true;
-    }
-    if matches_verb_not_followed_by_report_like_noun(
-        task_lower,
-        &["update", "add", "remove", "replace", "create"],
-    ) {
-        return true;
-    }
-    any_word_boundary(
-        task_lower,
-        &[
-            "apply the changes",
-            "apply changes",
-            "apply the change",
-            "apply change",
-            "apply the fix",
-            "apply fix",
-            "apply the fixes",
-            "apply fixes",
-            "apply the patch",
-            "apply patch",
-            "make the changes",
-            "make changes",
-            "do those fixes",
-        ],
-    )
-}
-
-/// Source: `GENERAL_IMPLEMENTATION_PATTERNS`. The last entry is a verb-then-required-noun
-/// alternation (`/\b(?:update|add|remove|replace|delete|create)\s+(?:the\s+)?(?:file|files|...)\b/i`)
-/// — ported as [`matches_verb_then_target_noun`] rather than the negative-lookahead style above,
-/// since this one is a POSITIVE required-noun-after-verb pattern, structurally different from
-/// [`matches_verb_not_followed_by_report_like_noun`].
-fn matches_general_implementation(task_lower: &str) -> bool {
-    if any_word_boundary(
-        task_lower,
-        &["implement", "fix", "edit", "modify", "patch", "refactor"],
-    ) {
-        return true;
-    }
-    if any_word_boundary(
-        task_lower,
-        &[
-            "apply the changes",
-            "apply changes",
-            "apply the change",
-            "apply change",
-            "apply the fix",
-            "apply fix",
-            "apply the fixes",
-            "apply fixes",
-            "apply the patch",
-            "apply patch",
-            "make the changes",
-            "make changes",
-            "do those fixes",
-        ],
-    ) {
-        return true;
-    }
-    const VERBS: &[&str] = &["update", "add", "remove", "replace", "delete", "create"];
-    const NOUNS: &[&str] = &[
-        "file",
-        "files",
-        "code",
-        "source",
-        "implementation",
-        "test",
-        "tests",
-        "component",
-        "function",
-        "module",
-        "class",
-        "method",
-        "logic",
-        "import",
-        "imports",
-        "readme",
-        "docs",
-        "doc",
-        "changelog",
-        "package.json",
-        "config",
-        "manifest",
-        "extension",
-        "prompt",
-        "command",
-    ];
-    matches_verb_then_target_noun(task_lower, VERBS, NOUNS)
-}
-
-/// Ports `/\b(?:V1|V2|...)\b(?!\s+(?:(?:a|an|the)\s+)?(?:N1|N2|...)(?:\b|$))/i`: for every
-/// word-boundary occurrence of a verb in `verbs`, the match is REJECTED (does not count) if,
-/// immediately after the verb (skipping exactly one optional `a `/`an `/`the ` article and any
-/// amount of whitespace, matching the source's `\s+(?:(?:a|an|the)\s+)?`), the following text
-/// starts with `"report"`, `"summary"`, `"finding"`, or `"findings"` at a word boundary (or the
-/// string ends there — the source's `(?:\b|$)`). Returns true iff at least one verb occurrence
-/// survives (is NOT followed by one of those report-like nouns).
-fn matches_verb_not_followed_by_report_like_noun(text_lower: &str, verbs: &[&str]) -> bool {
-    const REPORT_LIKE_NOUNS: &[&str] = &["report", "summary", "finding", "findings"];
-    for verb in verbs {
-        let mut start = 0usize;
-        while let Some(rel) = text_lower.get(start..).and_then(|s| s.find(verb)) {
-            let match_start = start + rel;
-            let match_end = match_start + verb.len();
-            let before_ok = text_lower[..match_start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !is_word_char(c));
-            let after_word_ok = text_lower[match_end..]
-                .chars()
-                .next()
-                .is_none_or(|c| !is_word_char(c));
-            start = match_start + 1;
-            if start > text_lower.len() {
-                start = text_lower.len() + 1;
-            }
-            if !before_ok || !after_word_ok {
-                continue;
-            }
-
-            let rest = &text_lower[match_end..];
-            let after_ws = rest.trim_start_matches([' ', '\t']);
-            if rest == after_ws {
-                // Source requires `\s+` (at least one whitespace char) between the verb and the
-                // optional article/noun for the lookahead to even apply; with no whitespace at
-                // all following the verb (end of string, or punctuation immediately after), the
-                // negative lookahead trivially does not exclude this occurrence.
-                return true;
-            }
-            // Strip one optional `a `/`an `/`the ` article, mirroring `(?:(?:a|an|the)\s+)?`.
-            let after_article = strip_optional_article(after_ws);
-            let excluded = REPORT_LIKE_NOUNS.iter().any(|noun| {
-                after_article.strip_prefix(noun).is_some_and(|tail| {
-                    tail.chars().next().is_none_or(|c| !is_word_char(c))
-                })
-            });
-            if !excluded {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Strips at most one leading `"a "`, `"an "`, or `"the "` article token from `text` — the
-/// `(?:(?:a|an|the)\s+)?` half of the source's negative-lookahead pattern.
-fn strip_optional_article(text: &str) -> &str {
-    for article in ["a ", "an ", "the "] {
-        if let Some(rest) = text.strip_prefix(article) {
-            return rest;
-        }
-    }
-    text
-}
-
-/// Ports `/\b(?:V1|...)\s+(?:the\s+)?(?:N1|...)\b/i`: a verb, optional `"the "`, then one of the
-/// required nouns, all at word boundaries.
-fn matches_verb_then_target_noun(text_lower: &str, verbs: &[&str], nouns: &[&str]) -> bool {
-    for verb in verbs {
-        let mut start = 0usize;
-        while let Some(rel) = text_lower.get(start..).and_then(|s| s.find(verb)) {
-            let match_start = start + rel;
-            let match_end = match_start + verb.len();
-            let before_ok = text_lower[..match_start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !is_word_char(c));
-            start = match_start + 1;
-            if start > text_lower.len() {
-                start = text_lower.len() + 1;
-            }
-            if !before_ok {
-                continue;
-            }
-            let rest = &text_lower[match_end..];
-            let after_ws = rest.trim_start_matches([' ', '\t']);
-            if rest == after_ws {
-                // `\s+` is mandatory before the noun clause; no whitespace at all means this verb
-                // occurrence cannot satisfy the rest of the pattern.
-                continue;
-            }
-            let after_the = after_ws.strip_prefix("the ").unwrap_or(after_ws);
-            let matched_noun = nouns.iter().any(|noun| {
-                after_the.strip_prefix(noun).is_some_and(|tail| {
-                    tail.chars().next().is_none_or(|c| !is_word_char(c))
-                })
-            });
-            if matched_noun {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-// -------------------------------------------------------------------------------------------
-// Task-text preprocessing (mirrors `stripFrameworkInstructions` / `stripScopedNoEditConstraints`)
-// -------------------------------------------------------------------------------------------
-
-/// Source: `stripFrameworkInstructions`. Drops any line that is purely orchestrator-injected
-/// scaffolding (`[Write to: ...]`/`[Read from: ...]` framework markers, and the fixed set of
-/// progress/output-path instruction lines the source enumerates) so those lines' own vocabulary
-/// (`write`, `output`, `update progress`, …) never contributes false-positive implementation
-/// signal. Line-oriented, case-insensitive, anchored at line start (`^\s*...`) per the source's
-/// per-line regex tests.
-fn strip_framework_instructions(task: &str) -> String {
-    task.lines()
-        .filter(|line| !is_write_read_marker_line(line))
-        .filter(|line| !is_progress_or_output_instruction_line(line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// `/^\s*\[(?:Write to|Read from):/i`
-fn is_write_read_marker_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let lower = trimmed.to_lowercase();
-    lower.starts_with("[write to:") || lower.starts_with("[read from:")
-}
-
-/// `/^\s*(?:Create and maintain progress at:|Update progress at:|\*\*Output:\*\*|Write your
-/// findings to(?: exactly this path)?:|This path is authoritative for this run\.|Ignore any other
-/// output filename or output path mentioned elsewhere)/i`
-fn is_progress_or_output_instruction_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let lower = trimmed.to_lowercase();
-    lower.starts_with("create and maintain progress at:")
-        || lower.starts_with("update progress at:")
-        || lower.starts_with("**output:**")
-        || lower.starts_with("write your findings to exactly this path:")
-        || lower.starts_with("write your findings to:")
-        || lower.starts_with("this path is authoritative for this run.")
-        || lower.starts_with("ignore any other output filename or output path mentioned elsewhere")
-}
-
-/// Source: `stripScopedNoEditConstraints` — replaces every match of
-/// [`scoped_no_edit_constraint_ranges`] with a single space, mirroring `stripped.replace(pattern,
-/// " ")` applied once per pattern in sequence (the source loop's net effect on non-overlapping
-/// matches, which is the only case this pattern set can ever produce given how specific each
-/// phrase is).
-fn strip_scoped_no_edit_constraints(task_lower_source: &str) -> String {
-    let ranges = scoped_no_edit_constraint_ranges(task_lower_source);
-    if ranges.is_empty() {
-        return task_lower_source.to_string();
-    }
-    let mut result = String::with_capacity(task_lower_source.len());
-    let mut cursor = 0usize;
-    for (start, end) in ranges {
-        if start < cursor {
-            // Overlapping match already covered by a prior replacement; skip.
-            continue;
-        }
-        result.push_str(&task_lower_source[cursor..start]);
-        result.push(' ');
-        cursor = end;
-    }
-    result.push_str(&task_lower_source[cursor..]);
-    result
-}
-
-// -------------------------------------------------------------------------------------------
-// Public classification API (mirrors `expectsImplementationMutation` / `hasMutationToolCall` /
-// `evaluateCompletionMutationGuard`)
-// -------------------------------------------------------------------------------------------
-
-/// Source: `expectsImplementationMutation(agent, task)`. Classifies whether `task`, given the
-/// declared `agent` (persona) name, is expected to require a mutating tool call to be considered
-/// genuinely complete — the "fixed heuristic-pattern classification" R-SA-034 requires.
-///
-/// This function does NOT consult declared tools at all (that short-circuit —
-/// [`declares_only_read_only_tools`] — is applied by [`evaluate_completion_mutation_guard`],
-/// exactly mirroring the source's own separation between `expectsImplementationMutation` as a
-/// pure task/agent-name classifier and the read-only-tools carve-out living one level up in
-/// `evaluateCompletionMutationGuard`).
-#[must_use]
-pub fn expects_implementation_mutation(agent: &str, task: &str) -> bool {
-    let stripped = strip_framework_instructions(task);
-    let stripped_lower = stripped.to_lowercase();
-    let without_scoped_lower = strip_scoped_no_edit_constraints(&stripped_lower);
-
-    if matches_review_only(&without_scoped_lower) {
-        return false;
-    }
-    if matches_explicit_no_edit(&without_scoped_lower) {
-        return false;
-    }
-
-    let agent_lower = agent.to_lowercase();
-    if matches_research_agent(&agent_lower) {
-        return false;
-    }
-    if word_boundary_contains(&agent_lower, "reviewer") {
-        return matches_reviewer_required_edit(&stripped_lower);
-    }
-
-    let worker_intent =
-        agent == "worker" && matches_worker_implementation(&stripped_lower);
-    if worker_intent {
-        return true;
-    }
-
-    matches_general_implementation(&stripped_lower)
-}
 
 /// Source: `hasMutationToolCall(messages)` (`completion-guard.ts:121-135`), re-scoped to this
 /// crate's dependency-free [`SubagentEvent`] transcript instead of a rich `Message[]` array (this
@@ -1146,6 +715,26 @@ fn declares_only_read_only_tools(agent: &AgentDefinition) -> bool {
     })
 }
 
+/// Source: `hasMutationToolCapability(tools, mcpDirectTools)` (`completion-guard.ts:39-43`
+/// @v0.43.0) — the exact logical complement of [`declares_only_read_only_tools`]:
+///
+/// ```text
+/// if ((mcpDirectTools?.length ?? 0) > 0) return true;
+/// if (tools === undefined) return true;
+/// return !tools.every((tool) => READ_ONLY_BUILTIN_TOOLS.has(tool));
+/// ```
+///
+/// Exposed publicly (the negated form is private) because a SECOND upstream consumer needs it
+/// besides `evaluateCompletionMutationGuard`: `formatOutputPathInstruction`
+/// (`single-output.ts:85-91`) branches the output-path instruction on it, telling an agent with no
+/// write-capable tool to return the artifact in its final response for the runtime to persist,
+/// rather than to write the file itself. See
+/// [`crate::exec::output::format_output_path_instruction`].
+#[must_use]
+pub fn has_mutation_tool_capability(agent: &AgentDefinition) -> bool {
+    !declares_only_read_only_tools(agent)
+}
+
 // -------------------------------------------------------------------------------------------
 // Top-level evaluation (mirrors `evaluateCompletionMutationGuard`)
 // -------------------------------------------------------------------------------------------
@@ -1236,8 +825,10 @@ mod tests {
             local_name: local_name.to_string(),
             package_name: None,
             description: "test agent".to_string(),
+            aliases: Vec::new(),
             tools,
             extensions: None,
+            extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
             model: None,
             fallback_models: Vec::new(),

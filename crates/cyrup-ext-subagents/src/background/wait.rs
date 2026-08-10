@@ -230,6 +230,8 @@ async fn terminal_summary_for(initial_ids: &[String], deps: &WaitDeps) -> (usize
     let mut complete = 0usize;
     let mut failed = 0usize;
     let mut paused = 0usize;
+    // G77: stopped runs are counted and reported in their own bucket, never folded into `failed`.
+    let mut stopped = 0usize;
     for id in initial_ids {
         let paths = super::RunPaths::for_run(
             &deps.async_root,
@@ -249,16 +251,23 @@ async fn terminal_summary_for(initial_ids: &[String], deps: &WaitDeps) -> (usize
             RunState::Complete => complete += 1,
             RunState::Failed => failed += 1,
             RunState::Paused => paused += 1,
+            RunState::Stopped => stopped += 1,
             RunState::Queued | RunState::Running => {}
         }
     }
-    let finished = complete + failed + paused;
+    let finished = complete + failed + paused + stopped;
     let mut parts: Vec<String> = Vec::new();
     if complete > 0 {
         parts.push(format!("{complete} complete"));
     }
     if failed > 0 {
         parts.push(format!("{failed} failed"));
+    }
+    // G77: placed between `failed` and `paused`, matching the fixed bucket order pi renders status
+    // counts in (`result-intercom.ts:47-53 formatStatusCounts`: completed, failed, stopped, paused,
+    // detached).
+    if stopped > 0 {
+        parts.push(format!("{stopped} stopped"));
     }
     if paused > 0 {
         parts.push(format!("{paused} paused"));
@@ -856,5 +865,7 @@ mod tests {
         assert!(!is_active(RunState::Paused));
         assert!(!is_active(RunState::Complete));
         assert!(!is_active(RunState::Failed));
+        // G77: a stopped run is terminal, so it is never "active" — `wait` must not block on one.
+        assert!(!is_active(RunState::Stopped));
     }
 }

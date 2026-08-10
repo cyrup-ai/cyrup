@@ -172,6 +172,10 @@ pub fn apply_overrides(
     // project scope exists and declares one), then fill every model-less agent BEFORE per-agent
     // overrides run so an explicit `agentOverrides.<name>.model` still wins by overwriting it.
     apply_default_model(merged, resolve_default_model(settings).as_deref());
+    // applySubagentDefaults (agents.ts:986-996) runs model -> thinking -> extensions, all three
+    // BEFORE per-agent overrides, and all three fill-only-if-unset.
+    apply_default_thinking(merged, resolve_default_thinking(settings).as_deref());
+    apply_default_extensions(merged, resolve_default_extensions(settings).as_deref());
 
     // applyBuiltinOverrides header (agents.ts:792-798): resolve the bulk-disable / disableThinking
     // scope selection ONCE, up front, exactly as pi does before mapping over the builtin list.
@@ -239,6 +243,73 @@ fn apply_default_model(merged: &mut HashMap<String, AgentDefinition>, default_mo
         if agent.model.is_none() {
             agent.model = Some(cyrup_core::ModelId::from(dm.to_string()));
             agent.model_source = Some(AgentModelSourceInfo::SettingsDefault);
+        }
+    }
+}
+
+/// pi `resolveSubagentDefaultThinking` (`agents.ts:946-953`): the project-scope value wins when the
+/// project scope exists and declares one, else the user-scope value.
+fn resolve_default_thinking(settings: &LayeredOverrideSettings) -> Option<String> {
+    if settings.project_settings_path.is_some()
+        && let Some(dt) = settings.project.default_thinking.as_ref()
+    {
+        return Some(dt.clone());
+    }
+    settings.user.default_thinking.clone()
+}
+
+/// pi `applySubagentDefaultThinking` (`agents.ts:955-964`): fill every agent whose `thinking` is
+/// UNSET from the resolved `defaultThinking`. `Some("off")` is an EXPLICIT off (see
+/// [`AgentDefinition::thinking`]) and therefore counts as set — pi's guard is
+/// `agent.thinking !== undefined`, and its `thinking: false` (cyrup's `Some("off")`) is likewise not
+/// `undefined`, so an agent that explicitly opted out is never re-armed by the default.
+///
+/// Runs BEFORE per-agent overrides so an explicit `agentOverrides.<name>.thinking` still wins, and
+/// before the builtin `disableThinking` clear so `disableThinking: true` still strips it.
+fn apply_default_thinking(
+    merged: &mut HashMap<String, AgentDefinition>,
+    default_thinking: Option<&str>,
+) {
+    let Some(dt) = default_thinking else {
+        return;
+    };
+    for agent in merged.values_mut() {
+        if agent.thinking.is_none() {
+            agent.thinking = Some(dt.to_string());
+        }
+    }
+}
+
+/// pi `resolveSubagentDefaultExtensions` (`agents.ts:966-973`): project-wins-outright, same shape as
+/// [`resolve_default_thinking`].
+fn resolve_default_extensions(settings: &LayeredOverrideSettings) -> Option<Vec<String>> {
+    if settings.project_settings_path.is_some()
+        && let Some(de) = settings.project.default_extensions.as_ref()
+    {
+        return Some(de.clone());
+    }
+    settings.user.default_extensions.clone()
+}
+
+/// pi `applySubagentDefaultExtensions` (`agents.ts:975-984`): fill every agent whose `extensions` is
+/// UNSET (`None` — "all extensions visible") from the resolved `defaultExtensions`, and stamp
+/// [`AgentDefinition::extensions_from_default`] so the value is never mistaken for the agent's own
+/// declaration by `editable_base`/`clone_override_base`.
+///
+/// An agent that declared `extensions:` explicitly — INCLUDING an explicitly-empty list, which is
+/// `Some(vec![])` and means "no extensions" — keeps its own value, matching pi's
+/// `agent.extensions !== undefined` guard.
+fn apply_default_extensions(
+    merged: &mut HashMap<String, AgentDefinition>,
+    default_extensions: Option<&[String]>,
+) {
+    let Some(de) = default_extensions else {
+        return;
+    };
+    for agent in merged.values_mut() {
+        if agent.extensions.is_none() {
+            agent.extensions = Some(de.to_vec());
+            agent.extensions_from_default = true;
         }
     }
 }
@@ -693,8 +764,10 @@ mod tests {
             local_name: name.to_string(),
             package_name: None,
             description: format!("{name} description"),
+            aliases: Vec::new(),
             tools: None,
             extensions: None,
+            extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
             model: None,
             fallback_models: Vec::new(),

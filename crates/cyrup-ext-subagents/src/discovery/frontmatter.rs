@@ -72,6 +72,12 @@ const KNOWN_FIELDS: &[&str] = &[
     "name",
     "package",
     "description",
+    // Both alias spellings entered `KNOWN_FIELDS` with pi's agent-alias feature
+    // (`agent-serializer.ts:9-10` @ v0.43.0). They MUST be here AND emitted by
+    // `management::serialize_agent`: a key that is "known" but never written is silently deleted on
+    // the first management rewrite, because the extra-fields round-trip loop skips known keys.
+    "alias",
+    "aliases",
     "tools",
     "model",
     "fallbackModels",
@@ -361,6 +367,40 @@ pub(crate) fn parse_frontmatter_list(raw: Option<&str>) -> Option<Vec<String>> {
             .map(str::to_string)
             .collect(),
     )
+}
+
+/// Normalize a raw alias list against the agent's own runtime name — a direct port of pi's
+/// `normalizeAgentAliases` (`agents.ts:495-499`):
+///
+/// ```text
+/// [...new Set((rawAliases ?? []).map((alias) => alias.trim()).filter(Boolean))]
+///     .filter((alias) => alias !== agentName)
+/// ```
+///
+/// Order matters and is preserved exactly: **trim → drop empties → de-duplicate (first occurrence
+/// wins, JS `Set` insertion order) → drop the agent's own name**. The self-name filter runs LAST, so
+/// an alias equal to the agent name is removed even if it also appeared twice.
+///
+/// pi returns `undefined` for an empty result; this returns an empty `Vec`, which
+/// [`AgentDefinition::aliases`] documents as the identical state.
+#[must_use]
+pub fn normalize_agent_aliases(raw_aliases: Vec<String>, agent_name: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for alias in raw_aliases {
+        let trimmed = alias.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        if trimmed == agent_name {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
 }
 
 /// Parse a full agent/chain `.md` file's frontmatter block: flat `key: value` lines plus one level
@@ -743,6 +783,16 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         .filter(|v| !v.is_empty())
         .map(|v| v.into_iter().map(PathBuf::from).collect::<Vec<_>>());
 
+    // `aliases:` / `alias:` — pi `agents.ts:1516`:
+    // `normalizeAgentAliases(parseFrontmatterList(frontmatter.aliases ?? frontmatter.alias), runtimeName)`.
+    // The PLURAL key is tried first (`??` short-circuits on the plural being present at all), and the
+    // normalization is measured against the RUNTIME name, not the local one.
+    let aliases = normalize_agent_aliases(
+        parse_frontmatter_list(parsed.get("aliases").or_else(|| parsed.get("alias")))
+            .unwrap_or_default(),
+        &runtime_name,
+    );
+
     // `skill` and `skills` are aliases (source: `frontmatter.skill || frontmatter.skills`) — the
     // singular form is tried first, matching source's `||` short-circuit precedence exactly.
     let skill_raw = parsed.get("skill").or_else(|| parsed.get("skills"));
@@ -880,8 +930,10 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         local_name,
         package_name,
         description,
+        aliases,
         tools,
         extensions,
+        extensions_from_default: false,
         subagent_only_extensions,
         model,
         fallback_models,

@@ -139,6 +139,20 @@ pub enum SubagentError {
     #[error("resume target has no persisted transcript")]
     ResumeNoTranscript,
 
+    /// G77 — a resume was requested against a run whose terminal state is
+    /// [`crate::background::RunState::Stopped`]. pi throws this rather than reviving
+    /// (`runs/background/async-resume.ts:406` @v0.43.0: `if (state === "stopped") throw new
+    /// Error(\`Async run '${runId}' was stopped and cannot be resumed. Start a new run
+    /// instead.\`);`), and the message is reproduced verbatim here because it is what the model
+    /// reads back from a refused `action: "resume"`.
+    ///
+    /// Deliberately NOT folded into [`Self::ResumeNoTranscript`]: a stopped run's children very
+    /// often DO have persisted transcripts, so the no-transcript variant would never fire for
+    /// them and the run would be silently revived — the exact behaviour upstream added this throw
+    /// to prevent.
+    #[error("Async run '{0}' was stopped and cannot be resumed. Start a new run instead.")]
+    ResumeStopped(String),
+
     /// Subprocess spawn or I/O failure.
     #[error("spawn failed: {0}")]
     Spawn(#[from] std::io::Error),

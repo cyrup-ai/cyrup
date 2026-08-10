@@ -212,6 +212,7 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         child_index: None,
         control_config: None,
         on_control_event: None,
+        artifacts_dir: None,
     };
     let plan = build_attempt_spawn_plan(
         &agent,

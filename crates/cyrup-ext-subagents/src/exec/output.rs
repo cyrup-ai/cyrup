@@ -33,6 +33,7 @@
 
 use std::path::Path;
 
+use crate::discovery::types::AgentDefinition;
 use crate::exec::ndjson::SubagentEvent;
 
 // ============================================================================================
@@ -174,6 +175,47 @@ pub(crate) const ACCEPTANCE_REPORT_COMPANION_KEYS: &[&str] = &[
     "manualNotes",
 ];
 
+/// The two fence language tags an acceptance report may carry. G79 widened the PARSER to
+/// `acceptance[-_]report` everywhere (`acceptance.ts:702,774,792` @v0.43.0); this probe has to
+/// recognize the same set or the two disagree about whether a report exists at all.
+pub(crate) const ACCEPTANCE_REPORT_FENCE_LANGS: &[&str] = &["acceptance-report", "acceptance_report"];
+
+/// The snake_case spelling of a camelCase acceptance-report key, derived MECHANICALLY rather than
+/// kept as a second hardcoded list, so this can never drift from
+/// [`ACCEPTANCE_REPORT_COMPANION_KEYS`].
+///
+/// G79 gave every field of `ACCEPTANCE_REPORT_FIELDS` a snake_case alias (`acceptance.ts:486-508`).
+/// Applied to the nine companion keys plus `criteriaSatisfied`, this transformation reproduces
+/// upstream's table entry-for-entry (`criteriaSatisfied`→`criteria_satisfied`,
+/// `testsAddedOrUpdated`→`tests_added_or_updated`, `noStagedFiles`→`no_staged_files`, …).
+fn snake_case_alias(camel: &str) -> String {
+    let mut out = String::with_capacity(camel.len() + 4);
+    for ch in camel.chars() {
+        if ch.is_ascii_uppercase() {
+            out.push('_');
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Does `body` mention the JSON key `camel`, in either the canonical camelCase spelling or the
+/// snake_case alias G79 accepts? A bare substring test on the body text, exactly like the
+/// camelCase-only check it replaces — this widens WHICH spellings count, not how they are matched.
+fn body_mentions_report_key(body: &str, camel: &str) -> bool {
+    text_mentions_report_key(body, camel)
+}
+
+/// [`body_mentions_report_key`], exposed for `exec/acceptance.rs`'s self-report `Claimed` vs.
+/// `Attested` floor, which scans the whole text rather than one fenced block's body. Shared so the
+/// two can never disagree about which spellings count as companion evidence.
+pub(crate) fn text_mentions_report_key(text: &str, camel: &str) -> bool {
+    text.contains(&format!("\"{camel}\""))
+        || text.contains(&format!("\"{}\"", snake_case_alias(camel)))
+}
+
 /// R-SA-029: does `text` "look like" a fenced acceptance-report, per the three independent
 /// detection rules the requirement enumerates (any one matching is sufficient)?
 ///
@@ -190,14 +232,16 @@ pub(crate) const ACCEPTANCE_REPORT_COMPANION_KEYS: &[&str] = &[
 pub fn looks_like_acceptance_report(text: &str) -> bool {
     for block in fenced_blocks(text) {
         let lang = block.lang.to_ascii_lowercase();
-        if lang == "acceptance-report" {
+        // G79: both `acceptance-report` and `acceptance_report` (`acceptance.ts:702`).
+        if ACCEPTANCE_REPORT_FENCE_LANGS.contains(&lang.as_str()) {
             return true;
         }
+        // G79: every key also answers to its snake_case alias (`acceptance.ts:486-508`).
         if matches!(lang.as_str(), "json" | "jsonc" | "json5")
-            && block.body.contains("\"criteriaSatisfied\"")
+            && body_mentions_report_key(block.body, "criteriaSatisfied")
             && ACCEPTANCE_REPORT_COMPANION_KEYS
                 .iter()
-                .any(|key| block.body.contains(&format!("\"{key}\"")))
+                .any(|key| body_mentions_report_key(block.body, key))
         {
             return true;
         }
@@ -949,36 +993,97 @@ pub fn format_saved_output_reference(saved_path: &Path, full_output: &str) -> Sa
 // R-SA-024: argv/system-prompt steering for file-only output mode
 // ============================================================================================
 
-/// R-SA-024 (MUST, file-only half) — build the authoritative output-path override instruction to
-/// inject into the child's **system prompt** (not merely conveyed via argv) when
-/// `output_mode == "file-only"`, so the child's own write-tool behavior is steered at generation
-/// time. Mirrors pi-subagents' own `formatOutputPathInstruction`/`injectOutputPathSystemPrompt`
-/// (`pi-subagents/src/runs/shared/single-output.ts:36-51`) verbatim in wording and structure.
+/// G82 — source: `formatOutputPathInstruction`'s `capabilities` parameter
+/// (`pi-subagents/src/runs/shared/single-output.ts:79-82,85`). Upstream passes the resolved
+/// agent/step config straight in (`injectOutputPathSystemPrompt(systemPrompt, outputPath, agent)`,
+/// `execution.ts:1443`), reading only its `tools`/`mcpDirectTools`; this crate's equivalent view of
+/// exactly those two fields is [`AgentDefinition`], so the capability is expressed as
+/// `Option<&AgentDefinition>` and answered by
+/// [`crate::exec::completion_guard::has_mutation_tool_capability`].
 ///
-/// Returns `None` if no output path is configured (nothing to inject); wiring this into the full
-/// system-prompt assembly pipeline and the rest of R-SA-024's argv contract (`--model`,
-/// tools-allowlist flag) is a later phase's concern (`exec/mod.rs`'s `run_sync` and
-/// `spawn/mod.rs`'s `ChildSpawnSpec` construction, neither implemented yet) — this function is
-/// the narrow, independently testable piece that belongs to this file's output-handoff scope.
+/// `None` means "capabilities unknown", which upstream's `!capabilities ||
+/// hasMutationToolCapability(...)` treats as write-capable — the direct-write instruction.
+pub type OutputInstructionCapabilities<'a> = Option<&'a AgentDefinition>;
+
+/// G82 — source: `formatOutputPathInstruction(outputPath, capabilities)`
+/// (`pi-subagents/src/runs/shared/single-output.ts:84-97`). The shared body of BOTH injection
+/// forms, and the reason this function exists rather than a single hard-coded string: its
+/// `delivery` line has TWO branches.
+///
+/// ```text
+/// const delivery = !capabilities || hasMutationToolCapability(capabilities.tools, capabilities.mcpDirectTools)
+///     ? `Write your findings to exactly this path: ${outputPath}`
+///     : [
+///         "Return the complete artifact in your final response.",
+///         `The runtime will persist it to exactly this path: ${outputPath}`,
+///         "Do not call contact_supervisor merely because no write-capable tool is available.",
+///     ].join("\n");
+/// ```
+///
+/// The second branch is the one this crate was missing: an agent whose entire resolved tool
+/// allowlist is read-only CANNOT write the file, so instructing it to do so produced a run that
+/// either escalated to `contact_supervisor` (which the third line exists to forbid) or failed the
+/// output handoff outright. The runtime persists the artifact for it instead — which
+/// [`resolve_output_handoff`]'s `OrchestratorWrote` branch already does.
+///
+/// The two trailing lines are identical in both branches and are what make the path authoritative.
 #[must_use]
-pub fn build_output_path_system_prompt_instruction(output_path: Option<&Path>) -> Option<String> {
-    let path = output_path?;
-    Some(format!(
-        "Runtime output path override:\nWrite your findings to exactly this path: {}\n\
+pub fn format_output_path_instruction(
+    output_path: &Path,
+    capabilities: OutputInstructionCapabilities<'_>,
+) -> String {
+    let write_capable = capabilities
+        .is_none_or(crate::exec::completion_guard::has_mutation_tool_capability);
+    let delivery = if write_capable {
+        format!("Write your findings to exactly this path: {}", output_path.display())
+    } else {
+        format!(
+            "Return the complete artifact in your final response.\n\
+             The runtime will persist it to exactly this path: {}\n\
+             Do not call contact_supervisor merely because no write-capable tool is available.",
+            output_path.display()
+        )
+    };
+    format!(
+        "{delivery}\n\
          This path is authoritative for this run.\n\
          Ignore any other output filename or output path mentioned elsewhere, including output \
-         destinations in the base agent prompt, system prompt, or task instructions.",
-        path.display()
+         destinations in the base agent prompt, system prompt, or task instructions."
+    )
+}
+
+/// R-SA-024 (MUST, file-only half) — build the authoritative output-path override instruction to
+/// inject into the child's **system prompt** (not merely conveyed via argv), so the child's own
+/// write-tool behavior is steered at generation time. Mirrors pi-subagents' own
+/// `injectOutputPathSystemPrompt`'s instruction body
+/// (`pi-subagents/src/runs/shared/single-output.ts:104-108`).
+///
+/// Returns `None` if no output path is configured (nothing to inject). `capabilities` selects the
+/// delivery branch — see [`format_output_path_instruction`].
+#[must_use]
+pub fn build_output_path_system_prompt_instruction(
+    output_path: Option<&Path>,
+    capabilities: OutputInstructionCapabilities<'_>,
+) -> Option<String> {
+    let path = output_path?;
+    Some(format!(
+        "Runtime output path override:\n{}",
+        format_output_path_instruction(path, capabilities)
     ))
 }
 
 /// R-SA-024 — append [`build_output_path_system_prompt_instruction`]'s instruction to an existing
 /// system prompt body, if any output path is configured; otherwise returns `system_prompt`
 /// unchanged. Mirrors pi-subagents' `injectOutputPathSystemPrompt`
-/// (`pi-subagents/src/runs/shared/single-output.ts:49-52`).
+/// (`pi-subagents/src/runs/shared/single-output.ts:104-108`).
 #[must_use]
-pub fn inject_output_path_system_prompt(system_prompt: &str, output_path: Option<&Path>) -> String {
-    let Some(instruction) = build_output_path_system_prompt_instruction(output_path) else {
+pub fn inject_output_path_system_prompt(
+    system_prompt: &str,
+    output_path: Option<&Path>,
+    capabilities: OutputInstructionCapabilities<'_>,
+) -> String {
+    let Some(instruction) = build_output_path_system_prompt_instruction(output_path, capabilities)
+    else {
         return system_prompt.to_string();
     };
     if system_prompt.is_empty() {
@@ -986,6 +1091,155 @@ pub fn inject_output_path_system_prompt(system_prompt: &str, output_path: Option
     } else {
         format!("{system_prompt}\n\n{instruction}")
     }
+}
+
+/// G82 — source: `injectSingleOutputInstruction(task, outputPath, capabilities)`
+/// (`pi-subagents/src/runs/shared/single-output.ts:99-102`):
+///
+/// ```text
+/// return `${task}\n\n---\n**Output:**\n${formatOutputPathInstruction(outputPath, capabilities)}`;
+/// ```
+///
+/// The TASK-side sibling of [`inject_output_path_system_prompt`]. Its `**Output:**` header is one
+/// of the lines [`crate::exec::task_intent`]'s `stripFrameworkInstructions` port removes before
+/// classification, so an injected output instruction never contributes write-intent signal to the
+/// task it was appended to.
+#[must_use]
+pub fn inject_single_output_instruction(
+    task: &str,
+    output_path: Option<&Path>,
+    capabilities: OutputInstructionCapabilities<'_>,
+) -> String {
+    let Some(path) = output_path else {
+        return task.to_string();
+    };
+    format!(
+        "{task}\n\n---\n**Output:**\n{}",
+        format_output_path_instruction(path, capabilities)
+    )
+}
+
+// ============================================================================================
+// G82: authorship from the CHILD'S OWN successful write
+// (pi `extractChildWrittenOutput`, `single-output.ts:13-52`)
+// ============================================================================================
+
+/// G82 — source: `extractChildWrittenOutput(messages, outputPath, cwd)`
+/// (`pi-subagents/src/runs/shared/single-output.ts:13-52`). Upstream's own doc comment states the
+/// contract verbatim:
+///
+/// > Content the child itself sent to the configured output path, taken from its last `write` tool
+/// > call whose tool result reports success. Unlike reading the path from disk, this cannot be
+/// > polluted by a sibling run writing the same path (#420); requiring the successful tool result
+/// > keeps failed, cancelled, or unanswered write calls from counting as authored output. Returns
+/// > undefined when no such write exists (e.g. bash or edit-based construction), in which case
+/// > callers must not assume file authorship.
+///
+/// This is the authorship signal [`resolve_output_handoff`] deliberately CANNOT provide: that
+/// function is an mtime/size stat heuristic (its own doc says so), so any other process touching
+/// `output_path` between the pre-spawn snapshot and the child's exit makes it report
+/// `ChildWrote` for content the child never authored. The two are complementary and both are used:
+/// the handoff decides what content is DELIVERED, this decides what content is ATTRIBUTED to the
+/// child (and is therefore an admissible acceptance-report source, `acceptance.ts:755-771`).
+///
+/// # Wire-shape delta
+///
+/// Upstream walks a rich `Message[]`: assistant messages' `toolCall` content parts supply the
+/// call id + `arguments`, and `role === "toolResult"` messages with `isError === false` supply the
+/// success set. This crate's transcript is [`SubagentEvent`], where
+/// [`SubagentEvent::ToolExecutionStart`] carries `tool_call_id`/`tool_name`/`args` and
+/// [`SubagentEvent::ToolExecutionEnd`] carries `tool_call_id`/`is_error` — the same two facts,
+/// keyed the same way. One difference is forced by the wire: `is_error` is a non-optional field
+/// with `#[serde(default)]`, so cyrup has no "result present but success unknown" state to
+/// distinguish from `is_error: false`; upstream's `isError === false` (rather than `!isError`)
+/// exists to reject exactly that third state. The two behaviours upstream's strictness actually
+/// buys — a FAILED result does not count, and a call with NO result at all does not count — are
+/// both preserved here.
+///
+/// Path comparison resolves both sides against `cwd` (upstream `path.resolve(cwd ?? ".", ...)`),
+/// and lowercases both on Windows (upstream's `process.platform === "win32"` branch).
+#[must_use]
+pub fn extract_child_written_output(
+    events: &[SubagentEvent],
+    output_path: Option<&Path>,
+    cwd: &Path,
+) -> Option<String> {
+    let target = comparable_path(cwd, output_path?);
+
+    // `for (const message of messages) if (message.role === "toolResult" && message.isError === false)`
+    // — the success set is built in a FIRST full pass, so a result that arrives before its call in
+    // the transcript still counts (upstream does not assume ordering either).
+    let successful_call_ids: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            SubagentEvent::ToolExecutionEnd {
+                tool_call_id,
+                is_error: false,
+                ..
+            } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // `content = args.content` with NO early return: the LAST matching write wins, so a later
+    // successful rewrite of the same path supersedes an earlier draft.
+    let mut content: Option<String> = None;
+    for event in events {
+        let SubagentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } = event
+        else {
+            continue;
+        };
+        if tool_name != "write" || !successful_call_ids.contains(tool_call_id.as_str()) {
+            continue;
+        }
+        // `typeof args.path !== "string" || typeof args.content !== "string"` → skip.
+        let (Some(write_path), Some(write_content)) = (
+            args.get("path").and_then(serde_json::Value::as_str),
+            args.get("content").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        if comparable_path(cwd, Path::new(write_path)) != target {
+            continue;
+        }
+        content = Some(write_content.to_string());
+    }
+    content
+}
+
+/// `path.resolve(cwd ?? ".", p)` plus the Windows case-folding
+/// (`single-output.ts:28-29,45-46`). `Path::join` reproduces `path.resolve`'s "an absolute second
+/// argument replaces the base" rule; the result is normalized only in the ways `path.resolve` is
+/// (it does not touch the filesystem, so a symlink is not resolved on either side).
+fn comparable_path(cwd: &Path, path: &Path) -> std::path::PathBuf {
+    let resolved = normalize_dot_segments(&cwd.join(path));
+    if cfg!(windows) {
+        std::path::PathBuf::from(resolved.to_string_lossy().to_lowercase())
+    } else {
+        resolved
+    }
+}
+
+/// The `.`/`..` collapsing half of `path.resolve` — purely lexical, exactly like Node's, so a
+/// child that wrote `./reports/../reports/out.md` still matches a configured `reports/out.md`.
+fn normalize_dot_segments(path: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 // ============================================================================================
@@ -1177,6 +1431,45 @@ mod tests {
         assert!(!looks_like_acceptance_report("Just a normal answer."));
         assert!(!looks_like_acceptance_report(
             "```rust\nfn main() {}\n```"
+        ));
+    }
+
+    /// G79 widened the acceptance-report PARSER to accept the `acceptance_report` fence tag and a
+    /// snake_case alias for every field (`acceptance.ts:702`, `:486-508` @v0.43.0). This probe is
+    /// what the LIVE lattice gate's self-report floor consults (`acceptance.rs::self_report_floor`),
+    /// so if it keeps the pre-G79 spellings the two disagree: a child emits a report the parser
+    /// accepts in full, the floor scores it `not-required`, and the run is REJECTED for missing an
+    /// attestation it actually produced — the exact failure G79 exists to remove.
+    #[test]
+    fn the_probe_accepts_every_spelling_g79_taught_the_parser() {
+        // The underscore fence tag.
+        assert!(looks_like_acceptance_report(
+            "Done.\n```acceptance_report\n{\"ok\": true}\n```\n"
+        ));
+        // snake_case on BOTH the marker key and the companion key.
+        assert!(looks_like_acceptance_report(
+            "Done.\n```json\n{\"criteria_satisfied\": true, \"changed_files\": [\"a.rs\"]}\n```\n"
+        ));
+        // Mixed spellings across the pair still count.
+        assert!(looks_like_acceptance_report(
+            "Done.\n```json\n{\"criteriaSatisfied\": true, \"tests_added_or_updated\": [\"t.rs\"]}\n```\n"
+        ));
+
+        // The snake_case aliases are derived mechanically; assert they reproduce upstream's
+        // `ACCEPTANCE_REPORT_FIELDS` table entry-for-entry rather than by a second hardcoded list.
+        assert_eq!(snake_case_alias("criteriaSatisfied"), "criteria_satisfied");
+        assert_eq!(
+            snake_case_alias("testsAddedOrUpdated"),
+            "tests_added_or_updated"
+        );
+        assert_eq!(snake_case_alias("noStagedFiles"), "no_staged_files");
+        assert_eq!(snake_case_alias("commandsRun"), "commands_run");
+        assert_eq!(snake_case_alias("manualNotes"), "manual_notes");
+
+        // Widening spellings must not widen the RULE: a marker key with no companion key still
+        // does not count, in either spelling.
+        assert!(!looks_like_acceptance_report(
+            "Done.\n```json\n{\"criteria_satisfied\": true}\n```\n"
         ));
     }
 
@@ -1818,7 +2111,7 @@ mod tests {
     #[test]
     fn builds_output_path_instruction_when_path_present() {
         let path = Path::new("/work/out.md");
-        let instruction = build_output_path_system_prompt_instruction(Some(path))
+        let instruction = build_output_path_system_prompt_instruction(Some(path), None)
             .expect("Some for a configured path");
         assert!(instruction.contains("/work/out.md"));
         assert!(instruction.contains("authoritative"));
@@ -1826,13 +2119,13 @@ mod tests {
 
     #[test]
     fn no_instruction_built_when_no_output_path() {
-        assert!(build_output_path_system_prompt_instruction(None).is_none());
+        assert!(build_output_path_system_prompt_instruction(None, None).is_none());
     }
 
     #[test]
     fn injects_instruction_after_existing_system_prompt() {
         let path = Path::new("/work/out.md");
-        let merged = inject_output_path_system_prompt("You are a helpful agent.", Some(path));
+        let merged = inject_output_path_system_prompt("You are a helpful agent.", Some(path), None);
         assert!(merged.starts_with("You are a helpful agent."));
         assert!(merged.contains("/work/out.md"));
     }
@@ -1840,14 +2133,365 @@ mod tests {
     #[test]
     fn injects_instruction_alone_when_system_prompt_empty() {
         let path = Path::new("/work/out.md");
-        let merged = inject_output_path_system_prompt("", Some(path));
+        let merged = inject_output_path_system_prompt("", Some(path), None);
         assert!(merged.contains("/work/out.md"));
         assert!(!merged.starts_with('\n'));
     }
 
     #[test]
     fn system_prompt_unchanged_when_no_output_path() {
-        let merged = inject_output_path_system_prompt("unchanged", None);
+        let merged = inject_output_path_system_prompt("unchanged", None, None);
         assert_eq!(merged, "unchanged");
+    }
+
+    // ============================================================================================
+    // G82: capability-aware output instruction + child-write authorship.
+    // Cases transcribed from `pi-subagents:v0.43.0:test/unit/single-output.test.ts`.
+    // ============================================================================================
+
+    fn capability_agent(tools: Option<Vec<crate::discovery::types::ToolRef>>) -> AgentDefinition {
+        AgentDefinition {
+            name: "cap".to_string(),
+            local_name: "cap".to_string(),
+            package_name: None,
+            description: "capability probe agent".to_string(),
+            aliases: Vec::new(),
+            tools,
+            extensions: None,
+            extensions_from_default: false,
+            subagent_only_extensions: Vec::new(),
+            model: None,
+            fallback_models: Vec::new(),
+            thinking: None,
+            system_prompt_mode: crate::discovery::types::SystemPromptMode::Replace,
+            inherit_project_context: false,
+            inherit_skills: false,
+            skills: Vec::new(),
+            default_reads: None,
+            default_progress: None,
+            output: None,
+            completion_guard: None,
+            interactive: None,
+            max_subagent_depth: None,
+            default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            memory: None,
+            tool_budget: None,
+            disabled: None,
+            system_prompt_body: String::new(),
+            source: crate::discovery::types::AgentSource::User,
+            file_path: std::path::PathBuf::from("/tmp/agent.md"),
+            present_fields: std::collections::HashSet::new(),
+            extra_fields: std::collections::BTreeMap::new(),
+            override_info: None,
+            model_source: None,
+        }
+    }
+
+    fn builtin(names: &[&str]) -> Option<Vec<crate::discovery::types::ToolRef>> {
+        Some(
+            names
+                .iter()
+                .map(|n| crate::discovery::types::ToolRef::Builtin((*n).to_string()))
+                .collect(),
+        )
+    }
+
+    /// `single-output.test.ts:85-90` — "appends direct-write instructions for mutation-capable
+    /// agents".
+    #[test]
+    fn a_mutation_capable_agent_is_told_to_write_the_file_itself() {
+        let agent = capability_agent(builtin(&["read", "write"]));
+        let output = inject_single_output_instruction(
+            "Analyze this",
+            Some(Path::new("/tmp/report.md")),
+            Some(&agent),
+        );
+        assert!(output.starts_with("Analyze this\n\n---\n**Output:**\n"), "{output:?}");
+        assert!(
+            output.contains("Write your findings to exactly this path: /tmp/report.md"),
+            "{output:?}"
+        );
+        assert!(output.contains("This path is authoritative for this run."), "{output:?}");
+        assert!(
+            output.contains("Ignore any other output filename or output path mentioned elsewhere"),
+            "{output:?}"
+        );
+    }
+
+    /// `single-output.test.ts:92-98` — "tells read-only agents to return the artifact for runtime
+    /// persistence". This is the branch cyrup did not have: before G82 a read-only agent was
+    /// ordered to write a file it has no tool to write.
+    #[test]
+    fn a_read_only_agent_is_told_to_return_the_artifact_for_the_runtime_to_persist() {
+        let agent = capability_agent(builtin(&["read", "grep", "find", "ls"]));
+        let output = inject_single_output_instruction(
+            "Analyze this",
+            Some(Path::new("/tmp/report.md")),
+            Some(&agent),
+        );
+        assert!(
+            output.contains("Return the complete artifact in your final response."),
+            "{output:?}"
+        );
+        assert!(
+            output.contains("The runtime will persist it to exactly this path: /tmp/report.md"),
+            "{output:?}"
+        );
+        assert!(
+            output.contains(
+                "Do not call contact_supervisor merely because no write-capable tool is available."
+            ),
+            "{output:?}"
+        );
+        assert!(
+            !output.contains("Write your findings to exactly this path"),
+            "the direct-write instruction must NOT appear: {output:?}"
+        );
+    }
+
+    /// `single-output.test.ts:110-115` — "uses runtime-persistence instructions in read-only system
+    /// prompts", and its mutation-capable sibling at `:106-112`.
+    #[test]
+    fn the_system_prompt_form_branches_on_capability_too() {
+        let read_only = capability_agent(builtin(&["read"]));
+        let prompt = inject_output_path_system_prompt(
+            "Analyze only",
+            Some(Path::new("/tmp/new.md")),
+            Some(&read_only),
+        );
+        assert!(prompt.starts_with("Analyze only"), "{prompt:?}");
+        assert!(prompt.contains("Runtime output path override:"), "{prompt:?}");
+        assert!(
+            prompt.contains("The runtime will persist it to exactly this path: /tmp/new.md"),
+            "{prompt:?}"
+        );
+        assert!(!prompt.contains("Write your findings to exactly this path"), "{prompt:?}");
+
+        // An agent with no declared allowlist at all is mutation-capable (`tools === undefined`).
+        let unrestricted = capability_agent(None);
+        let prompt = inject_output_path_system_prompt(
+            "Analyze only",
+            Some(Path::new("/tmp/new.md")),
+            Some(&unrestricted),
+        );
+        assert!(
+            prompt.contains("Write your findings to exactly this path: /tmp/new.md"),
+            "{prompt:?}"
+        );
+    }
+
+    /// `single-output.test.ts:117-119` — "leaves prompts unchanged when no output path is active",
+    /// for the task-side form too.
+    #[test]
+    fn no_output_path_means_no_task_instruction() {
+        assert_eq!(
+            inject_single_output_instruction("Base task", None, None),
+            "Base task"
+        );
+    }
+
+    // ---- extractChildWrittenOutput ----
+
+    fn write_call(id: &str, path: &str, content: &str) -> SubagentEvent {
+        SubagentEvent::ToolExecutionStart {
+            tool_call_id: id.into(),
+            tool_name: "write".to_string(),
+            args: serde_json::json!({"path": path, "content": content}),
+        }
+    }
+
+    fn tool_result(id: &str, is_error: bool) -> SubagentEvent {
+        SubagentEvent::ToolExecutionEnd {
+            tool_call_id: id.into(),
+            tool_name: "write".to_string(),
+            result: serde_json::Value::Null,
+            is_error,
+        }
+    }
+
+    fn completed_write(id: &str, path: &str, content: &str) -> Vec<SubagentEvent> {
+        vec![write_call(id, path, content), tool_result(id, false)]
+    }
+
+    /// `single-output.test.ts:191-198` — "returns the last successfully written content for the
+    /// configured path".
+    #[test]
+    fn the_last_successful_write_to_the_configured_path_wins() {
+        let mut events = completed_write("w1", "/tmp/out.md", "draft");
+        events.extend(completed_write("w2", "/tmp/other.md", "unrelated"));
+        events.extend(completed_write("w3", "/tmp/out.md", "final report"));
+        assert_eq!(
+            extract_child_written_output(&events, Some(Path::new("/tmp/out.md")), Path::new("/repo")),
+            Some("final report".to_string())
+        );
+    }
+
+    /// `single-output.test.ts:200-210` — "ignores write calls whose tool result failed".
+    #[test]
+    fn a_failed_write_result_is_not_authorship() {
+        let failed_only = vec![
+            write_call("w1", "/tmp/out.md", "never landed"),
+            tool_result("w1", true),
+        ];
+        assert_eq!(
+            extract_child_written_output(
+                &failed_only,
+                Some(Path::new("/tmp/out.md")),
+                Path::new("/repo")
+            ),
+            None
+        );
+
+        let mut failed_after_success = completed_write("w1", "/tmp/out.md", "landed");
+        failed_after_success.push(write_call("w2", "/tmp/out.md", "never landed"));
+        failed_after_success.push(tool_result("w2", true));
+        assert_eq!(
+            extract_child_written_output(
+                &failed_after_success,
+                Some(Path::new("/tmp/out.md")),
+                Path::new("/repo")
+            ),
+            Some("landed".to_string()),
+            "the later FAILED write must not overwrite the earlier successful one"
+        );
+    }
+
+    /// `single-output.test.ts:212-221` — "ignores write calls with no confirmed successful tool
+    /// result". On cyrup's wire the only representable "unconfirmed" state is the absence of any
+    /// `ToolExecutionEnd` for the call (see `extract_child_written_output`'s wire-shape note).
+    #[test]
+    fn an_unanswered_write_call_is_not_authorship() {
+        let missing_result = vec![write_call("w1", "/tmp/out.md", "unconfirmed")];
+        assert_eq!(
+            extract_child_written_output(
+                &missing_result,
+                Some(Path::new("/tmp/out.md")),
+                Path::new("/repo")
+            ),
+            None
+        );
+    }
+
+    /// `single-output.test.ts:223-227` — "resolves relative write paths against the child cwd".
+    #[test]
+    fn relative_write_paths_resolve_against_the_child_cwd() {
+        let events = completed_write("w1", "reports/out.md", "relative content");
+        assert_eq!(
+            extract_child_written_output(
+                &events,
+                Some(Path::new("/repo/reports/out.md")),
+                Path::new("/repo")
+            ),
+            Some("relative content".to_string())
+        );
+        assert_eq!(
+            extract_child_written_output(
+                &events,
+                Some(Path::new("/elsewhere/reports/out.md")),
+                Path::new("/repo")
+            ),
+            None,
+            "a different absolute target must not match"
+        );
+        // `path.resolve` collapses `.`/`..` lexically on both sides.
+        let dotted = completed_write("w1", "./reports/../reports/out.md", "dotted");
+        assert_eq!(
+            extract_child_written_output(
+                &dotted,
+                Some(Path::new("reports/out.md")),
+                Path::new("/repo")
+            ),
+            Some("dotted".to_string())
+        );
+    }
+
+    /// `single-output.test.ts:235-245` — "ignores non-write tools and missing arguments".
+    #[test]
+    fn non_write_tools_and_missing_arguments_are_ignored() {
+        let events = vec![
+            SubagentEvent::ToolExecutionStart {
+                tool_call_id: "e1".into(),
+                tool_name: "edit".to_string(),
+                args: serde_json::json!({"path": "/tmp/out.md", "oldText": "a", "newText": "b"}),
+            },
+            tool_result("e1", false),
+            SubagentEvent::ToolExecutionStart {
+                tool_call_id: "w1".into(),
+                tool_name: "write".to_string(),
+                args: serde_json::json!({"path": "/tmp/out.md"}),
+            },
+            tool_result("w1", false),
+        ];
+        assert_eq!(
+            extract_child_written_output(&events, Some(Path::new("/tmp/out.md")), Path::new("/repo")),
+            None,
+            "an `edit` call and a `write` call with no `content` are both non-authorship"
+        );
+        assert_eq!(
+            extract_child_written_output(&[], Some(Path::new("/tmp/out.md")), Path::new("/repo")),
+            None
+        );
+        assert_eq!(
+            extract_child_written_output(&completed_write("w1", "/tmp/out.md", "x"), None, Path::new("/repo")),
+            None,
+            "no configured output path means no authorship question to answer"
+        );
+    }
+
+    /// The `part.name !== "write"` half of `single-output.ts:40` on its own. The case above cannot
+    /// prove it: its `edit` call carries no `content` argument, so the args type-check rejects it
+    /// whether or not the tool name is inspected. A tool that IS shaped like `write` — both `path`
+    /// and `content` strings, successful result, matching path — is the only input that isolates
+    /// the name check, and only a `write` call is authorship of the configured output.
+    #[test]
+    fn a_write_shaped_call_from_a_different_tool_is_not_authorship() {
+        for tool in ["edit", "multi_edit", "bash", "create_file", "notebook_edit"] {
+            let events = vec![
+                SubagentEvent::ToolExecutionStart {
+                    tool_call_id: "t1".into(),
+                    tool_name: tool.to_string(),
+                    args: serde_json::json!({"path": "/tmp/out.md", "content": "impostor"}),
+                },
+                tool_result("t1", false),
+            ];
+            assert_eq!(
+                extract_child_written_output(
+                    &events,
+                    Some(Path::new("/tmp/out.md")),
+                    Path::new("/repo")
+                ),
+                None,
+                "`{tool}` is not the `write` tool, so its content is not authored output"
+            );
+        }
+    }
+
+    /// The property `resolve_output_handoff` cannot supply: a SIBLING process writing the same
+    /// path makes the stat heuristic report `ChildWrote`, while authorship — taken from the child's
+    /// own transcript — correctly reports that this child wrote nothing there (#420).
+    #[test]
+    fn authorship_is_immune_to_a_sibling_writing_the_same_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shared.md");
+        let before = snapshot_output_file(Some(&path));
+
+        // Somebody else — not this child — writes the configured path mid-run.
+        std::fs::write(&path, "written by a sibling run").expect("sibling write");
+
+        // The stat heuristic attributes it to the child...
+        assert_eq!(
+            resolve_output_handoff(&path, "this child's receipt", before),
+            OutputHandoff::ChildWrote {
+                content: "written by a sibling run".to_string()
+            }
+        );
+        // ...but the child's own transcript shows it never wrote that path.
+        let events = completed_write("w1", "somewhere/else.md", "this child's real artifact");
+        assert_eq!(
+            extract_child_written_output(&events, Some(&path), dir.path()),
+            None
+        );
     }
 }

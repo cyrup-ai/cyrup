@@ -39,7 +39,8 @@ use super::{RunId, RunMode, RunPaths, RunState, RunStatus, StepState, StepStatus
 // =================================================================================================
 
 /// The lowercase state string pi renders (`AsyncStatus.state`): `queued`/`running`/`paused`/
-/// `complete`/`failed`.
+/// `complete`/`failed`/`stopped` (`async-status.ts:69` @v0.43.0 declares exactly this union, minus
+/// the unported `rejected` checkpoint state).
 pub(crate) fn run_state_label(state: RunState) -> &'static str {
     match state {
         RunState::Queued => "queued",
@@ -47,6 +48,9 @@ pub(crate) fn run_state_label(state: RunState) -> &'static str {
         RunState::Paused => "paused",
         RunState::Complete => "complete",
         RunState::Failed => "failed",
+        // G77: its own word, never `"failed"` — every upstream reader that renders a run's state
+        // for a human prints `"stopped"` verbatim (`run-status.ts:478-479`, `notify.ts:210`).
+        RunState::Stopped => "stopped",
     }
 }
 
@@ -67,6 +71,8 @@ pub(crate) fn step_state_label(state: StepState) -> &'static str {
         StepState::Paused => "paused",
         StepState::Complete => "complete",
         StepState::Failed => "failed",
+        // G77 — pi `step.status = "stopped"` (`subagent-runner.ts:2967`).
+        StepState::Stopped => "stopped",
     }
 }
 
@@ -140,6 +146,12 @@ fn format_steering_summary(steer_count: Option<u64>, last_steer_at: Option<i64>)
     }
 }
 
+/// pi's verbatim resume-guidance line for a STOPPED run (`run-status.ts:37` @v0.43.0). Public so
+/// the `status`-action renderer, the `resume` refusal path and their tests all assert the one
+/// string rather than three drifting copies.
+pub const STOPPED_NOT_RESUMABLE_GUIDANCE: &str =
+    "Resume: unavailable; stopped runs are not resumable. Start a new run instead.";
+
 /// Whether `session_file` points at an on-disk file that currently exists (pi's
 /// `hasExistingSessionFile`, `run-status.ts:32-34`).
 fn session_file_exists(session_file: &Option<PathBuf>) -> bool {
@@ -151,7 +163,17 @@ fn session_file_exists(session_file: &Option<PathBuf>) -> bool {
 /// filter is trivially every step; the branch structure otherwise mirrors pi exactly:
 /// single-child-with-transcript → whole-run `Revive`, else first child with a transcript →
 /// `Revive child` with its index, else the unavailable notice.
-fn format_resume_guidance(run_id: &str, steps: &[StepStatus]) -> String {
+///
+/// G77 — `stopped` short-circuits BEFORE every other branch, exactly as upstream's own first line
+/// does (`run-status.ts:36-37` @v0.43.0: `if (options.stopped) return "Resume: unavailable;
+/// stopped runs are not resumable. Start a new run instead.";`). A stopped run's children may well
+/// have persisted session files, so without this guard the function would happily hand the model a
+/// `Revive:` line for a run [`super::control::resume`] is required to refuse
+/// (`async-resume.ts:406`).
+fn format_resume_guidance(run_id: &str, steps: &[StepStatus], stopped: bool) -> String {
+    if stopped {
+        return STOPPED_NOT_RESUMABLE_GUIDANCE.to_string();
+    }
     let unavailable = "Resume: unavailable; no child session file was persisted.".to_string();
     if run_id.is_empty() || steps.is_empty() {
         return unavailable;
@@ -278,7 +300,15 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
     }
 
     if status.state != RunState::Running {
-        lines.push(format_resume_guidance(status.run_id.as_str(), &status.steps));
+        lines.push(format_resume_guidance(
+            status.run_id.as_str(),
+            &status.steps,
+            // G77 — pi `formatResumeGuidance(…, { stopped: status.state === "stopped" ||
+            // status.stopped === true })` (`run-status.ts:445`). cyrup carries the stop verdict on
+            // `state` alone (no redundant `stopped` boolean on `RunStatus`), so this is the whole
+            // predicate.
+            status.state == RunState::Stopped,
+        ));
     }
     if paths.run_log_md.exists() {
         lines.push(format!("Log: {}", paths.run_log_md.display()));
@@ -485,7 +515,13 @@ fn list_rank(state: RunState) -> u8 {
     match state {
         RunState::Running => 0,
         RunState::Queued => 1,
-        RunState::Paused | RunState::Complete | RunState::Failed => 2,
+        // G77: upstream's `sortRuns` gives `failed`, `stopped` and `paused` the SAME rank 2 and
+        // `complete` rank 3 (`async-status.ts:346-354` @v0.43.0 — `case "stopped": return 2;`
+        // sits between the `failed` and `paused` cases, all three returning 2). This list only ever
+        // holds queued/running rows, so every terminal state collapses to one bucket here; the
+        // `Stopped` arm is spelled out rather than swept into a catch-all so a future state cannot
+        // silently inherit rank 2.
+        RunState::Paused | RunState::Complete | RunState::Failed | RunState::Stopped => 2,
     }
 }
 
@@ -645,6 +681,54 @@ mod tests {
         status.steps[0].telemetry.steer_count = None;
         let quiet = format_status(&status, &paths);
         assert!(!quiet.contains("steering:"), "an unsteered step gets no suffix: {quiet}");
+    }
+
+    /// G77 — the `status` action's rendering of a stopped run: its own state word, and pi's
+    /// verbatim not-resumable guidance INSTEAD of the `Revive:` line the same steps would
+    /// otherwise earn. The step below deliberately carries an existing `session_file`, which is
+    /// precisely the input that would produce a `Revive:` line without the stopped short-circuit.
+    #[test]
+    fn a_stopped_run_renders_its_own_state_word_and_refuses_to_offer_a_revive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(&transcript, b"{}\n").expect("write transcript");
+
+        let id = RunId::from_token("stoprender01".to_string());
+        let paths = RunPaths::for_run(dir.path(), dir.path(), &id);
+        let mut status = RunStatus::queued(id, RunMode::Single, Some(1));
+        status.state = RunState::Stopped;
+        let mut step = StepStatus::pending("scout");
+        step.status = StepState::Stopped;
+        step.session_file = Some(transcript);
+        step.error = Some(control::STOP_MESSAGE.to_string());
+        status.steps = vec![step];
+
+        let report = format_status(&status, &paths);
+        assert!(report.contains("State: stopped"), "{report}");
+        assert!(report.contains("Step 1: scout stopped"), "{report}");
+        assert!(report.contains(STOPPED_NOT_RESUMABLE_GUIDANCE), "{report}");
+        assert!(
+            !report.contains("Revive:"),
+            "a stopped run must never be offered a Revive line even though its step HAS a \
+             transcript (pi `run-status.ts:36-37` short-circuits before the transcript checks): \
+             {report}"
+        );
+    }
+
+    /// G77 — the lowercase wire words every human-facing renderer prints. `stopped` is its own
+    /// word on both enums, never `failed`.
+    #[test]
+    fn stopped_gets_its_own_state_and_step_label() {
+        assert_eq!(run_state_label(RunState::Stopped), "stopped");
+        assert_eq!(step_state_label(StepState::Stopped), "stopped");
+        // The other five are unchanged.
+        assert_eq!(run_state_label(RunState::Failed), "failed");
+        assert_eq!(run_state_label(RunState::Paused), "paused");
+        assert_eq!(step_state_label(StepState::Failed), "failed");
+        // pi `sortRuns` (`async-status.ts:346-354`) ranks stopped with failed/paused at 2.
+        assert_eq!(list_rank(RunState::Stopped), list_rank(RunState::Failed));
+        assert_eq!(list_rank(RunState::Stopped), list_rank(RunState::Paused));
+        assert!(list_rank(RunState::Running) < list_rank(RunState::Stopped));
     }
 
     fn roots() -> (tempfile::TempDir, PathBuf, PathBuf) {

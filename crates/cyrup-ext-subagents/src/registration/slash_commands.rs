@@ -106,6 +106,13 @@ pub enum SlashCommandName {
     /// registered by the SAME `registerSlashCommands` call, three lines above the
     /// `registerPromptWorkflowCommands` hop the two commands above come from.
     SubagentsFleet,
+    /// G77 — `/subagents-stop [run-id]`: terminally stop a current-session async subagent run (pi
+    /// `pi.registerCommand("subagents-stop", …)`, `slash-commands.ts:751-792` @v0.43.0). With an
+    /// explicit id its handler is exactly `runSlashSubagent(pi, ctx, { action: "stop", id })`
+    /// (`:756`); with no id upstream opens a TUI selector over the discovered stop targets and
+    /// then issues the same call for whichever the user picks (`:791`). Also NOT one of R-SA-129's
+    /// twelve, and registered by the same `registerSlashCommands` call.
+    SubagentsStop,
 }
 
 impl SlashCommandName {
@@ -132,6 +139,7 @@ impl SlashCommandName {
             SlashCommandName::PromptWorkflow => "prompt-workflow",
             SlashCommandName::ChainPrompts => "chain-prompts",
             SlashCommandName::SubagentsFleet => "subagents-fleet",
+            SlashCommandName::SubagentsStop => "subagents-stop",
         }
     }
 
@@ -245,6 +253,13 @@ pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
         name: SlashCommandName::SubagentsFleet,
         usage: "Usage: /subagents-fleet",
         description: "Show active subagent fleet status and transcript commands",
+    },
+    // G77: `/subagents-stop` (`slash-commands.ts:751-753` @v0.43.0). `description` is upstream's
+    // verbatim.
+    SlashCommandDescriptor {
+        name: SlashCommandName::SubagentsStop,
+        usage: "Usage: /subagents-stop [run-id]",
+        description: "Stop a current-session async subagent run",
     },
 ];
 
@@ -521,8 +536,11 @@ pub fn validate_inline_acceptance(value: &str, agent: &str) -> Result<(), SlashP
         return Ok(());
     }
     Err(SlashParseError::new(format!(
+        // G78 — `reviewed` is no longer a requestable acceptance level ANYWHERE at pi-subagents
+        // v0.43.0 (`acceptance.ts:54`), so the escape hatch this message points at is the object
+        // form's `review` gate rather than a `reviewed` level that no longer exists.
         "Inline acceptance for step '{agent}' supports auto, attested, or checked. Use the \
-         subagent tool API or a saved .chain.json file for none, verified, or reviewed \
+         subagent tool API or a saved .chain.json file for none, verified, or review-gated \
          acceptance contracts."
     )))
 }
@@ -1777,17 +1795,22 @@ mod tests {
     /// `pi.registerCommand("chain-prompts", …)` (`:303`). G92 adds a THIRD such command,
     /// `pi.registerCommand("subagents-fleet", …)` (`slash-commands.ts:1092-1097` @v0.34.0), which
     /// `registerSlashCommands` registers DIRECTLY, three lines above that
-    /// `registerPromptWorkflowCommands` hop. This table registers all fifteen, so the count is
-    /// fifteen. The twelve are still pinned exactly, as a prefix, below.
+    /// `registerPromptWorkflowCommands` hop. G77 adds a FOURTH, `pi.registerCommand(
+    /// "subagents-stop", …)` (`slash-commands.ts:751-792` @v0.43.0), registered by that same
+    /// `registerSlashCommands` call. This table registers all sixteen, so the count is sixteen.
+    /// The twelve are still pinned exactly, as a prefix, below.
     #[test]
-    fn slash_commands_table_has_the_twelve_plus_the_three_extra_commands() {
-        assert_eq!(SLASH_COMMANDS.len(), R_SA_129_COMMAND_COUNT + 3);
+    fn slash_commands_table_has_the_twelve_plus_the_four_extra_commands() {
+        assert_eq!(SLASH_COMMANDS.len(), R_SA_129_COMMAND_COUNT + 4);
         let tail: Vec<&str> = SLASH_COMMANDS
             .iter()
             .skip(R_SA_129_COMMAND_COUNT)
             .map(|d| d.name.as_str())
             .collect();
-        assert_eq!(tail, ["prompt-workflow", "chain-prompts", "subagents-fleet"]);
+        assert_eq!(
+            tail,
+            ["prompt-workflow", "chain-prompts", "subagents-fleet", "subagents-stop"]
+        );
     }
 
     #[test]

@@ -510,6 +510,19 @@ pub struct SubagentSettings {
     pub overrides: BTreeMap<String, AgentOverrideConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// pi's `subagents.defaultThinking` (`agents.ts:158`) — a crate-wide reasoning-level default
+    /// filled into every agent whose own `thinking` is unset (`applySubagentDefaultThinking`,
+    /// `agents.ts:955-964`). Validated as a NON-EMPTY string and stored trimmed
+    /// (`agents.ts:882-889`); a malformed value MUST abort discovery (R-SA-009).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_thinking: Option<String>,
+    /// pi's `subagents.defaultExtensions` (`agents.ts:159`) — a crate-wide extension allowlist
+    /// filled into every agent whose own `extensions` is unset
+    /// (`applySubagentDefaultExtensions`, `agents.ts:975-984`), which also stamps
+    /// [`AgentDefinition::extensions_from_default`]. Validated as an array of NON-EMPTY strings and
+    /// stored trimmed (`agents.ts:890-897`); a malformed value MUST abort discovery (R-SA-009).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_extensions: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_builtins: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -697,6 +710,20 @@ pub struct AgentDefinition {
     pub local_name: String,
     pub package_name: Option<String>,
     pub description: String,
+    /// Alternate names this agent also answers to (pi `AgentConfig.aliases`, `agents.ts:121`), from
+    /// the `aliases:`/`alias:` frontmatter key. Already normalized by
+    /// [`crate::discovery::frontmatter::normalize_agent_aliases`] (pi `normalizeAgentAliases`,
+    /// `agents.ts:495-499`): trimmed, de-duplicated in first-seen order, empties dropped, and the
+    /// agent's own runtime `name` removed — so an alias never shadows the canonical name.
+    ///
+    /// EMPTY means "no aliases", which is exactly pi's `undefined` (its `normalizeAgentAliases`
+    /// returns `undefined` rather than `[]` for an empty result, and `serializeAgent`'s `joinComma`
+    /// maps `[]` back to `undefined`), so no separate `Option` layer is needed.
+    ///
+    /// Resolution is alias-aware but NAME-FIRST: [`crate::discovery::resolve_agent_name`] matches
+    /// `name`/`local_name` before it ever looks at this list, and a non-unique alias is a hard
+    /// ambiguity error rather than an arbitrary pick (pi `resolveAgentName`, `agents.ts:511-529`).
+    pub aliases: Vec<String>,
     /// `None` = no allowlist restriction (all builtin tools available); `Some(vec![])` = no
     /// tools; `Some(populated)` = exactly this allowlist. Distinct from `extensions` below, which
     /// has an independently-meaningful `None`/empty/populated tri-state (func-SA §4.1).
@@ -704,6 +731,16 @@ pub struct AgentDefinition {
     /// `None` = all extensions visible; `Some(vec![])` = none; `Some(populated)` = allowlist
     /// (func-SA §4.1).
     pub extensions: Option<Vec<String>>,
+    /// True iff [`Self::extensions`] was filled in from `subagents.defaultExtensions` rather than
+    /// declared by the agent itself (pi `AgentConfig.extensionsFromDefault`, `agents.ts:142`, set by
+    /// `applySubagentDefaultExtensions`, `agents.ts:979`).
+    ///
+    /// Load-bearing in exactly two places, both of which must NOT treat a settings-supplied default
+    /// as the agent's own data: `editable_base` (pi `editableAgentConfig`,
+    /// `agent-management.ts:243`) — so a management update never BAKES the settings default into the
+    /// agent's `.md` file — and `clone_override_base` (pi `cloneOverrideBase`, `agents.ts:582`) — so
+    /// an override's restore-baseline does not capture it either.
+    pub extensions_from_default: bool,
     /// Child-only extension paths — visible to a spawned subagent even when not visible to the
     /// orchestrator itself.
     pub subagent_only_extensions: Vec<String>,
@@ -1036,8 +1073,10 @@ mod tests {
             local_name: "reviewer".to_string(),
             package_name: None,
             description: "reviews things".to_string(),
+            aliases: Vec::new(),
             tools,
             extensions: None,
+            extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
             model: None,
             fallback_models: Vec::new(),

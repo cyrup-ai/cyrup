@@ -3,7 +3,7 @@
 //!
 //! `pi-subagents:v0.34.0:src/runs/shared/acceptance.ts:69-125` `inferLevel` returns exactly four
 //! shapes and none of them is `none`: `reviewed` (`:88-96`), `checked` (`:98-105`), `attested` for
-//! a reviewer/scout/context-builder/researcher/analyst agent or read-only task wording
+//! a reviewer/oracle/scout/researcher/analyst agent or read-only task wording
 //! (`:107-116`), and `attested` as the final fallthrough (`:118-124`). `formatAcceptancePrompt`
 //! returns `""` only for `level === "none"` (`:305`), and `execution.ts:1037-1038` appends its
 //! result unconditionally, so essentially every child is told to end with a fenced
@@ -148,6 +148,7 @@ fn run_options(cwd: &Path) -> RunOptions {
         steer_inbox_dir: None,
         control_config: None,
         on_control_event: None,
+        artifacts_dir: None,
         model_scope: None,
     }
 }

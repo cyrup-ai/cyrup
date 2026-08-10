@@ -335,6 +335,9 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
         subagents: cyrup_ext_subagents::discovery::types::SubagentSettings {
             overrides,
             default_model: None,
+            // G101 added these two; a profile declares neither.
+            default_thinking: None,
+            default_extensions: None,
             disable_builtins: None,
             disable_thinking: None,
             // SUBA-003 added this field; a profile declares no model-scope policy of its own.
@@ -359,6 +362,9 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
         subagents: cyrup_ext_subagents::discovery::types::SubagentSettings {
             overrides: bogus_overrides,
             default_model: None,
+            // G101 added these two; a profile declares neither.
+            default_thinking: None,
+            default_extensions: None,
             disable_builtins: None,
             disable_thinking: None,
             // SUBA-003 added this field; a profile declares no model-scope policy of its own.

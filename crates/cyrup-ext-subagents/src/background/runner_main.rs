@@ -662,6 +662,19 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     // for the identical reason — a request written in the race window before the watcher attaches
     // must not be missed.
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // G77 — the THIRD control-inbox verb (`control/stop.json`, pi `StopRequest`): an explicit
+    // user/agent stop, or an ancestor's stop cascaded down. Same mandatory
+    // synchronous-startup-check-then-watch treatment as the other two, for the same reason.
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if control::check_stop_inbox_now(run_paths)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        interrupt_cancel.cancel();
+    }
     if control::check_timeout_inbox_now(run_paths)
         .await
         .ok()
@@ -686,6 +699,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     let control_flags = ControlFlags {
         interrupted: Arc::clone(&interrupted),
         timed_out: Arc::clone(&timed_out),
+        stopped: Arc::clone(&stopped),
     };
     // R-SA-136/146: open the size-capped `events.jsonl` writer for this run, via the SAME shared
     // `BoundedJsonlWriter` primitive `spawn::SpawnedChild`'s per-attempt child-output tee uses
@@ -795,6 +809,23 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             )
             .await;
             (RunState::Failed, results, Some(message))
+        }
+        Ok(LoopOutcome::Stopped { results, message }) => {
+            // G77 — pi `subagent.run.stopped` (`subagent-runner.ts:2977-2982` @v0.43.0), carrying
+            // the stop message so a reader of `events.jsonl` sees WHY the run ended without having
+            // to reconstruct it from the terminal record. `durationMs` follows the same shape the
+            // sibling terminal events use here.
+            append_event(
+                &mut events,
+                "subagent.run.stopped",
+                Some(serde_json::json!({
+                    "runId": run_id_str,
+                    "message": message,
+                    "durationMs": duration_ms,
+                })),
+            )
+            .await;
+            (RunState::Stopped, results, Some(message))
         }
         Err(err) => {
             append_event(
@@ -970,6 +1001,23 @@ enum LoopOutcome {
         /// The message stamped onto the run's terminal error and every step it failed.
         message: String,
     },
+    /// G77 — an explicit stop request (`control/stop.json`, pi `StopRequest`) was observed and
+    /// consumed: pi `stopRunner` (`subagent-runner.ts:2955-2984` @v0.43.0). `results` holds every
+    /// step that DID complete before the stop landed.
+    ///
+    /// Deliberately NOT folded into `Interrupted` or `TimedOut`. Against `Interrupted`: a stop is
+    /// terminal and `resume` MUST refuse it (`async-resume.ts:406`), where a pause is exactly what
+    /// `resume` exists for. Against `TimedOut`: the terminal `state` is `Stopped`, not `Failed`, and
+    /// every downstream reader — the notify status word (`notify.ts:210`), the grouped intercom
+    /// verdict (`result-intercom.ts:84-87`), the `status` action's `State:` line
+    /// (`run-status.ts:478-479`) — prints a different word for it. Collapsing either way loses a
+    /// user-visible distinction upstream maintains at four separate sites.
+    Stopped {
+        results: Vec<SingleResult>,
+        /// The message stamped onto the run's terminal error and every step it stopped — always
+        /// the request's own `reason` when it carried one, else [`control::STOP_MESSAGE`].
+        message: String,
+    },
 }
 
 /// The two control-inbox verbs' pending flags, shared between the watcher task that SETS them and
@@ -983,6 +1031,13 @@ struct ControlFlags {
     interrupted: Arc<std::sync::atomic::AtomicBool>,
     /// A `control/timeout.json` is pending (terminal deadline failure).
     timed_out: Arc<std::sync::atomic::AtomicBool>,
+    /// G77 — a `control/stop.json` is pending (terminal, non-resumable explicit stop). The THIRD
+    /// verb, checked before the other two everywhere the three are drained together, matching pi's
+    /// own inbox order (`control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → then
+    /// `consumeTimeoutRequest` → then `consumeInterruptRequest`) and `stopRunner`'s own
+    /// `if (stopped || timedOut || interrupted || state !== "running") return` mutual exclusion
+    /// (`subagent-runner.ts:2956`).
+    stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // =================================================================================================
@@ -1101,6 +1156,8 @@ async fn run_inner(
 ) -> Result<LoopOutcome, SubagentError> {
     let interrupted = &flags.interrupted;
     let timed_out = &flags.timed_out;
+    // G77 — the stop flag, read at the very top of every loop iteration ahead of the other two.
+    let stopped = &flags.stopped;
     let mut steps = config.steps.clone();
     let mut cursor = 0usize;
     let mut results: Vec<SingleResult> = Vec::new();
@@ -1223,6 +1280,47 @@ async fn run_inner(
     };
 
     loop {
+        // G77 — STOP is checked before BOTH of the others, matching pi's own inbox-drain order
+        // (`control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → `consumeTimeoutRequest` →
+        // `consumeInterruptRequest`) and `stopRunner`'s mutual-exclusion guard
+        // (`subagent-runner.ts:2956`: `if (stopped || timedOut || interrupted || …) return`). The
+        // order is load-bearing when several land together: a stop outranks a timeout outranks an
+        // interrupt, so the terminal record is always the hardest, least-resumable verdict.
+        //
+        // Unlike the interrupt arm below there is no `cursor < steps.len()` moot-signal guard: a
+        // stop that lands after the last step finished still ends the run `Stopped` upstream
+        // (`stopRunner` only checks `statusPayload.state === "running"`, which is still true until
+        // `finish_run` writes the terminal record), and — unlike the interrupt case that guard
+        // exists for — that is not a downgrade to a permanently-wrong non-terminal record: `Stopped`
+        // IS terminal, so nothing is left waiting to be resumed.
+        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(request) = control::consume_stop_request(run_paths).await? {
+                let message = request
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| control::STOP_MESSAGE.to_string());
+                {
+                    let mut guard = lock_status(status);
+                    let s = &mut *guard;
+                    mark_remaining_stopped(s, cursor, steps.len(), &message);
+                    refresh_workflow_graph(s, &steps);
+                    s.touch();
+                }
+                write_shared_status(run_paths, status)
+                    .await
+                    .map_err(SubagentError::Spawn)?;
+                // pi `stopNestedAsyncDescendants()` (`subagent-runner.ts:2984`) — stop the whole
+                // subtree, not just this run, or every background run this one spawned keeps going
+                // detached and unreachable after the user asked for it to stop.
+                cascade_to_descendants(config, events, cascade::CascadeVerb::Stop).await;
+                promote_interrupted_results_to_stopped(&mut results, &message);
+                return Ok(LoopOutcome::Stopped { results, message });
+            }
+            // Same idempotent absorption the other two arms document: a watch notification with
+            // nothing actually pending clears the flag rather than looping.
+            stopped.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
         // Timeout is checked BEFORE interrupt, matching pi's own inbox-drain order
         // (`control-channel.ts:608-609` @v0.34.0: `if (consumeTimeoutRequest(...)) onTimeout();`
         // then `if (consumeInterruptRequest(...)) onInterrupt();`). The order is load-bearing when
@@ -1522,6 +1620,18 @@ async fn run_inner(
             // overwriting the `Paused` marking just applied, since `Paused` is not terminal).
             // Checked against the file rather than the flag so a stale flag can never spin this
             // loop: only this branch's own consumption removes the file.
+            //
+            // G77: the STOP inbox is probed before the timeout inbox, for the identical reason and
+            // in pi's identical order (`control-channel.ts:653-655`). All THREE verbs share the one
+            // cancellation token, so `step_result.interrupted` is equally true for a stop — and
+            // returning `Interrupted` here would end an explicitly-stopped run as a resumable
+            // `Paused`, which is exactly the bug this gap is about. Falling through without
+            // advancing the cursor lets the loop-top stop branch produce the terminal record; it
+            // re-marks this same step `Stopped`, overwriting the `Paused` marking just applied,
+            // because `Paused` is not terminal.
+            if control::check_stop_inbox_now(run_paths).await?.is_some() {
+                continue;
+            }
             if control::check_timeout_inbox_now(run_paths).await?.is_some() {
                 continue;
             }
@@ -1612,6 +1722,85 @@ fn mark_remaining_timed_out(
                 for child in &mut group.children {
                     if !child.status.is_terminal() {
                         child.status = StepState::Failed;
+                        child.error = Some(message.to_string());
+                        child.ended_at.get_or_insert(now);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// G77 — re-label the child that was torn down BY the stop as `stopped` rather than `interrupted`.
+///
+/// cyrup drives a step's live child off one shared [`cyrup_core::CancelToken`] for every control
+/// verb, so a child killed by a stop comes back from `run_sync` carrying `interrupted: true` — the
+/// same shape an actual `interrupt` produces. pi does not have that ambiguity because it hands the
+/// child two separate abort controllers, and it resolves the child's own record against the STOP
+/// signal specifically: `const stoppedAfterAcceptance = finalResult?.stopped === true ||
+/// ctx.stopSignal?.aborted === true;` … `stopped: stoppedAfterAcceptance ? true :
+/// finalResult?.stopped` (`subagent-runner.ts:1642,1722` @v0.43.0). This function is that same
+/// promotion, applied at the one place cyrup knows the stop signal is what fired.
+///
+/// The rest of each promoted field follows `runSubagent`'s own stopped-result shape
+/// (`subagent-runner.ts:909,915,917`): `exitCode: 1`, `error: stopMessage`, and — only when the
+/// child produced no output of its own — `finalOutput: stopMessage`. Children that had ALREADY
+/// completed before the stop landed are untouched, exactly as upstream leaves them (their records
+/// settled while `stopSignal.aborted` was still false).
+fn promote_interrupted_results_to_stopped(results: &mut [SingleResult], message: &str) {
+    for result in results.iter_mut().filter(|r| r.interrupted) {
+        result.interrupted = false;
+        result.stopped = true;
+        result.exit_code = 1;
+        result.error = Some(message.to_string());
+        if result
+            .final_output
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+        {
+            result.final_output = Some(message.to_string());
+        }
+    }
+}
+
+/// G77 — the STOP counterpart of [`mark_remaining_timed_out`]/[`mark_remaining_paused`], ported
+/// from pi `stopRunner`'s own step sweep (`subagent-runner.ts:2964-2973` @v0.43.0):
+///
+/// ```text
+/// for (const step of statusPayload.steps) {
+///     if (step.status !== "running" && step.status !== "pending") continue;
+///     step.status = "stopped";
+///     step.error = stopMessage;
+///     step.exitCode = 1;
+///     step.stopped = true;
+///     …
+/// }
+/// ```
+///
+/// Three differences from the timeout sweep, all upstream's:
+/// * the terminal step status is [`StepState::Stopped`], never `Failed` — a reader must be able to
+///   tell "someone stopped this" from "this crashed";
+/// * upstream sweeps EVERY `running`-or-`pending` step in the payload, not only those from the
+///   cursor onward — which is the same set here, since a step before the cursor is already
+///   terminal and `is_terminal()` skips it either way;
+/// * the message is the fixed [`control::STOP_MESSAGE`], not a computed one.
+fn mark_remaining_stopped(status: &mut RunStatus, from_index: usize, total: usize, message: &str) {
+    let now = super::now_epoch_millis_pub();
+    for index in from_index..total {
+        if let Some(step) = status.steps.get_mut(index)
+            && !step.status.is_terminal()
+        {
+            step.status = StepState::Stopped;
+            step.error = Some(message.to_string());
+            step.ended_at.get_or_insert(now);
+        }
+    }
+    if let Some(groups) = &mut status.parallel_groups {
+        for group in groups {
+            if group.group_step_index >= from_index {
+                for child in &mut group.children {
+                    if !child.status.is_terminal() {
+                        child.status = StepState::Stopped;
                         child.error = Some(message.to_string());
                         child.ended_at.get_or_insert(now);
                     }
@@ -1785,6 +1974,8 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
         // the terminal per-step `SingleResult` instead of being flattened into an anonymous
         // non-zero exit.
         timed_out: result.timed_out,
+        stopped: false,
+        process_signal: None,
         error: result.error.clone(),
         saved_output_path: result.saved_output_path.clone(),
         tool_calls: Vec::new(),
@@ -1821,6 +2012,8 @@ fn imported_root_to_single_result(
         detached: false,
         interrupted: false,
         timed_out: false,
+        stopped: false,
+        process_signal: None,
         error: imported.error.clone(),
         saved_output_path: None,
         tool_calls: Vec::new(),
@@ -2342,6 +2535,17 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // (`subagent-runner.ts:2270-2280` → `async-job-tracker.ts:138-166` @v0.34.0). That
             // replay hop is not ported; the events themselves are not lost.
             on_control_event: None,
+            // G80 — pi `artifactsDir: ctx.artifactsDir` on the background hop's own
+            // `evaluateAcceptance` call (`runs/background/subagent-runner.ts:1638-1639` @v0.43.0),
+            // which is how a step's verify[] results get memoized under
+            // `<artifactsDir>/acceptance/verify/<runId>/`. Gated by the SAME two-term gate every
+            // other artifact write on this hop uses (`ctx.artifactsDir && ctx.artifactConfig
+            // ?.enabled !== false`, `subagent-runner.ts:879`), so `artifacts: false` disarms
+            // memoization along with the quadruple.
+            artifacts_dir: self
+                .artifacts_dir
+                .clone()
+                .filter(|_| self.artifact_config.enabled),
         };
 
         // SUBA-N03 / T6 on the SECOND hop — pi `runs/background/subagent-runner.ts:877-889`
@@ -2536,6 +2740,7 @@ fn spawn_control_watcher(
     let ControlFlags {
         interrupted,
         timed_out,
+        stopped,
     } = flags;
     let handle = tokio::spawn(async move {
         // G90: the steer queue's own `events.jsonl` writer. A second `BoundedJsonlWriter` on the
@@ -2597,6 +2802,18 @@ fn spawn_control_watcher(
             // Timeout is checked first, matching pi's own drain order (`control-channel.ts:608-609`
             // @v0.34.0) and this run loop's own top-of-iteration ordering.
             let mut wake = false;
+            // G77: stop is probed FIRST, matching pi's fixed drain order
+            // (`control-channel.ts:653-655`) — when a stop and a timeout/interrupt land in the same
+            // tick, the run must end `Stopped`, the hardest and least-resumable of the three.
+            if control::check_stop_inbox_now(&run_paths)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                wake = true;
+            }
             if control::check_timeout_inbox_now(&run_paths)
                 .await
                 .ok()
@@ -2881,6 +3098,12 @@ async fn finish_run(
             detached: false,
             interrupted: terminal_state == RunState::Paused,
             timed_out: false,
+            // G77 — pi `runSubagent`'s stopped result carries `stopped: true` and
+            // `exitCode: 1` (`subagent-runner.ts:2359-2365`), which is what
+            // `resolveSubagentResultStatus`/`buildCompletionDetails`/`resultState` all read to
+            // classify the child as stopped rather than merely failed.
+            stopped: terminal_state == RunState::Stopped,
+            process_signal: None,
             error: Some(error.clone()),
             saved_output_path: None,
             tool_calls: Vec::new(),
@@ -3609,6 +3832,8 @@ mod tests {
                 detached: false,
                 interrupted: false,
                 timed_out: false,
+                stopped: false,
+                process_signal: None,
                 error: None,
                 saved_output_path: None,
                 tool_calls: Vec::new(),
@@ -3803,6 +4028,8 @@ mod tests {
                 detached: false,
                 interrupted: false,
                 timed_out: false,
+                stopped: false,
+                process_signal: None,
                 error: None,
                 saved_output_path: None,
                 tool_calls: Vec::new(),

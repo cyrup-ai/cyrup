@@ -522,6 +522,136 @@ pub fn timeout_request_path(run_dir: &Path) -> PathBuf {
     control_inbox_dir(run_dir).join("timeout.json")
 }
 
+// =================================================================================================
+// StopRequest (G77) — the control inbox's FOURTH verb (pi `control-channel.ts:49-53,123-125,
+// 281-290,519-530,593-601` @v0.43.0)
+// =================================================================================================
+
+/// pi's literal stop message (`subagent-runner.ts:1972` @v0.43.0: `const stopMessage = "Subagent
+/// stopped by user.";`), stamped onto the stopped run's `error`, onto every step it stopped, and —
+/// when the child produced no output of its own — onto the child's `finalOutput`
+/// (`subagent-runner.ts:917`/`:1595-1596`).
+pub const STOP_MESSAGE: &str = "Subagent stopped by user.";
+
+/// The on-disk `control/stop.json` request record — pi's `StopRequest`
+/// (`control-channel.ts:49-53` @v0.43.0): `{ type: "stop", ts, source, reason }`, the exact sibling
+/// shape of [`InterruptRequest`]/[`TimeoutRequest`], in the same control inbox under a third file
+/// name.
+///
+/// # Why a THIRD verb rather than reusing `interrupt` or `timeout`
+///
+/// All three are mutually exclusive verdicts upstream, and the difference is observable in the
+/// run's terminal record. `stopRunner`'s own guard is `if (stopped || timedOut || interrupted ||
+/// statusPayload.state !== "running") return;` (`subagent-runner.ts:2956`) and `timeoutRunner`'s is
+/// the mirror image (`:2986`), so at most one of the three ever fires for a run:
+///
+/// | verb | terminal `state` | unfinished steps | resumable? |
+/// |---|---|---|---|
+/// | `interrupt` | `Paused` | `Paused` | yes (`resume`) |
+/// | `timeout` | `Failed` (`timedOut`) | `Failed` | no |
+/// | `stop` | `Stopped` | `Stopped` (`exitCode: 1`, [`STOP_MESSAGE`]) | **no** — `async-resume.ts:406` refuses explicitly |
+///
+/// The inbox drain order is likewise fixed and load-bearing: stop, THEN timeout, THEN interrupt
+/// (`control-channel.ts:653-655`), so when several land together the hardest, least-resumable
+/// verdict wins.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopRequest {
+    /// Always `"stop"` — the discriminant, a plain string field for the same byte-for-byte
+    /// on-disk-shape reason [`InterruptRequest::kind`] is.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Wall-clock creation time (epoch milliseconds).
+    pub ts: i64,
+    /// Who/what requested the stop — pi's own literals are `"stop-action"` for the
+    /// `subagent({action:"stop"})` path (`async-stop-action.ts:44`) and `"ancestor-stop"` for the
+    /// descendant cascade (`subagent-runner.ts:2300`).
+    pub source: String,
+    /// Optional human-readable reason.
+    pub reason: Option<String>,
+}
+
+impl StopRequest {
+    /// Constructs a fresh stop request stamped with the current wall-clock time.
+    #[must_use]
+    pub fn new(source: impl Into<String>, reason: Option<String>) -> Self {
+        Self {
+            kind: "stop".to_string(),
+            ts: now_epoch_millis(),
+            source: source.into(),
+            reason,
+        }
+    }
+}
+
+/// `<run_dir>/control/stop.json` (pi `stopRequestPath`, `control-channel.ts:123-125` @v0.43.0).
+#[must_use]
+pub fn stop_request_path(run_dir: &Path) -> PathBuf {
+    control_inbox_dir(run_dir).join("stop.json")
+}
+
+/// The observable outcome of one [`stop`] call — pi `stopAsyncRun`
+/// (`runs/foreground/async-stop-action.ts:23-64` @v0.43.0) returns an `AgentToolResult` whose
+/// `isError` flag and text encode exactly these three cases; this enum is that trichotomy, with the
+/// user-facing prose left to the caller so the tool-result shaping stays in `extension.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// A [`StopRequest`] file was written into the target's control inbox (pi's `"Stop requested
+    /// for async run {id}."` success result, `async-stop-action.ts:56`).
+    Requested,
+    /// The reconciled status is neither `Running` nor `Queued` — pi's
+    /// `if (!status || (status.state !== "running" && status.state !== "queued"))` guard
+    /// (`async-stop-action.ts:41`), whose message is `"No running or queued async run was found for
+    /// '{id}'."` and whose `isError` is `true`. Note this makes a stop of an already-`Paused` run an
+    /// ERROR upstream, not a silent no-op the way a duplicate `interrupt` is.
+    NotStoppable,
+}
+
+/// Delivers a stop request against the run identified by `run_id_token` (G77; pi `stopAsyncRun`,
+/// `runs/foreground/async-stop-action.ts:23-64` @v0.43.0).
+///
+/// Runs the same R-SA-079 reconciliation gate every other control op runs (upstream's own first act
+/// is `reconcileAsyncRun(target.asyncDir, { kill }).status`, `:39`), then applies upstream's
+/// actionability guard verbatim: only a `Running` or `Queued` run may be stopped. Unlike
+/// [`interrupt`] there is no already-pending short-circuit — upstream writes the request
+/// unconditionally via `writeAtomicJson` (`control-channel.ts:287-288`), which is idempotent by
+/// construction because the request is a single well-known path whose mere existence is the state.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::UnsafePathToken`] if `run_id_token` is unsafe, or an I/O error
+/// (wrapped in [`SubagentError::Spawn`]) if the reconciliation read or the request write fails —
+/// upstream's own `catch` around `deliverStopRequest` (`:58-63`) surfaces the same class of failure
+/// as `"Failed to stop async run {id}: {message}"`.
+pub async fn stop(
+    async_root: &Path,
+    results_dir: &Path,
+    run_id_token: &str,
+    source: impl Into<String>,
+    reason: Option<String>,
+) -> Result<StopOutcome, SubagentError> {
+    let paths = resolve_run_paths(async_root, results_dir, run_id_token)?;
+    let status = match reconcile_before_control_op(&paths).await {
+        Ok(status) => status,
+        // pi's guard is `if (!status || (status.state !== "running" && status.state !== "queued"))`
+        // (`async-stop-action.ts:41`) — an ABSENT record and a non-actionable one collapse onto the
+        // SAME "No running or queued async run was found for '{id}'." refusal. This gate reports an
+        // absent record as a `NotFound` I/O error rather than a `None`, so it is folded back here;
+        // every other error class (a genuine read/permission failure) still propagates.
+        Err(SubagentError::Spawn(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StopOutcome::NotStoppable);
+        }
+        Err(err) => return Err(err),
+    };
+
+    if !matches!(status.state, RunState::Running | RunState::Queued) {
+        return Ok(StopOutcome::NotStoppable);
+    }
+
+    deliver_stop_request(&paths.run_dir, source, reason).await?;
+    Ok(StopOutcome::Requested)
+}
+
 /// Parent side, addressed by run DIRECTORY: atomically write an [`InterruptRequest`] into
 /// `run_dir`'s control inbox and send the same best-effort `SIGUSR2` wake-up [`interrupt`] does
 /// (pi `deliverInterruptRequest`, `control-channel.ts` @v0.34.0).
@@ -567,6 +697,30 @@ pub async fn deliver_timeout_request(
 ) -> Result<PathBuf, SubagentError> {
     let path = timeout_request_path(run_dir);
     write_control_request(&path, &TimeoutRequest::new(source, reason)).await?;
+    Ok(path)
+}
+
+/// Parent side, addressed by run DIRECTORY: atomically write a [`StopRequest`] into `run_dir`'s
+/// control inbox (G77; pi `deliverStopRequest` → `requestAsyncStop`, `control-channel.ts:281-290,
+/// 593-601` @v0.43.0).
+///
+/// Like [`deliver_timeout_request`] and unlike [`deliver_interrupt_request`], this sends **no**
+/// wake-up signal — upstream's `deliverStopRequest` accepts a `pid`/`kill` pair in its input shape
+/// but its whole body is `requestAsyncStop(input.asyncDir, …)` (`control-channel.ts:600`); the file
+/// inbox is the entire channel. The runner's own poll/watch tick picks it up and `stopRunner`
+/// aborts the live children from inside.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the control directory cannot be created or the request
+/// cannot be written.
+pub async fn deliver_stop_request(
+    run_dir: &Path,
+    source: impl Into<String>,
+    reason: Option<String>,
+) -> Result<PathBuf, SubagentError> {
+    let path = stop_request_path(run_dir);
+    write_control_request(&path, &StopRequest::new(source, reason)).await?;
     Ok(path)
 }
 
@@ -834,6 +988,38 @@ pub async fn consume_timeout_request(
     }
 }
 
+/// Non-consuming read of a pending [`StopRequest`] (G77) — [`check_control_inbox_now`]'s and
+/// [`check_timeout_inbox_now`]'s sibling, with the identical "the file's existence IS the state,
+/// reading never deletes" contract.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the file exists but cannot be read or parsed.
+pub async fn check_stop_inbox_now(paths: &RunPaths) -> Result<Option<StopRequest>, SubagentError> {
+    read_control_request(&stop_request_path(&paths.run_dir)).await
+}
+
+/// Idempotent, at-most-once consumption of a pending [`StopRequest`] (G77) — pi
+/// `consumeStopRequest` (`control-channel.ts:519-530` @v0.43.0), and the exact
+/// read-then-unconditionally-delete discipline [`consume_interrupt_request`] documents at length. A
+/// missing file is `Ok(None)`, never an error; losing the delete race against a concurrent consumer
+/// still returns the contents this caller observed (upstream's own comment on that branch reads
+/// "Already removed by a concurrent check — still counts as consumed").
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] for a genuine I/O failure other than "file does not exist".
+pub async fn consume_stop_request(paths: &RunPaths) -> Result<Option<StopRequest>, SubagentError> {
+    let path = stop_request_path(&paths.run_dir);
+    let request = match read_control_request::<StopRequest>(&path).await? {
+        Some(request) => request,
+        None => return Ok(None),
+    };
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) | Err(_) => Ok(Some(request)),
+    }
+}
+
 async fn read_control_request<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<Option<T>, SubagentError> {
@@ -1077,6 +1263,18 @@ pub async fn resume(
 
     if status.state == RunState::Running {
         return resolve_running_selection(&status, requested_step_index);
+    }
+
+    // G77 — pi `async-resume.ts:406` @v0.43.0: `if (state === "stopped") throw new Error(...)`.
+    // Checked AFTER the `Running` branch and BEFORE the terminal-revival branch, exactly where
+    // upstream checks it (its own `resolveResumeTarget` reads the reconciled state, refuses a
+    // stopped one, and only then looks for a transcript). A stopped run's steps routinely still
+    // carry `session_file`s, so without this guard `resolve_terminal_revival` would happily revive
+    // a run the user explicitly killed.
+    if status.state == RunState::Stopped {
+        return Err(SubagentError::ResumeStopped(
+            status.run_id.as_str().to_string(),
+        ));
     }
 
     resolve_terminal_revival(&status, requested_step_index)
@@ -1775,17 +1973,35 @@ pub async fn wait_for_imported_async_root(
 /// boolean per child): a child that exited `0` is `Complete`; a child that exited non-zero is
 /// `Paused` iff the whole run is paused, else `Failed`; absent a child, the run's own
 /// state/`success` decides.
+///
+/// G77 — the two `stopped` branches are upstream's own, in upstream's own order
+/// (`chain-root-attachment.ts:85-93` @v0.43.0):
+/// 1. `if (child?.stopped === true) return "stopped";` — FIRST, ahead of the child's `success`
+///    check, so a stopped child is never re-read as complete-or-failed;
+/// 2. `if (child?.success === false) return result.state === "stopped" ? "stopped" : result.state
+///    === "paused" ? "paused" : "failed";` — the non-zero-exit child inherits the RUN's stop before
+///    it inherits its pause;
+/// 3. the childless fallthrough passes `"stopped"` straight through alongside
+///    `complete`/`failed`/`paused` (`:90`).
 fn imported_state(result: &ResultFile, child: Option<&SingleResult>) -> RunState {
     if let Some(child) = child {
+        if child.stopped {
+            return RunState::Stopped;
+        }
         if child.exit_code == 0 {
             return RunState::Complete;
         }
-        return if result.state == RunState::Paused { RunState::Paused } else { RunState::Failed };
+        return match result.state {
+            RunState::Stopped => RunState::Stopped,
+            RunState::Paused => RunState::Paused,
+            _ => RunState::Failed,
+        };
     }
     match result.state {
         RunState::Complete => RunState::Complete,
         RunState::Failed => RunState::Failed,
         RunState::Paused => RunState::Paused,
+        RunState::Stopped => RunState::Stopped,
         RunState::Queued | RunState::Running => {
             if result.success { RunState::Complete } else { RunState::Failed }
         }
@@ -2035,6 +2251,193 @@ mod tests {
             context: None,
             agent_scope: None,
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // G77 — the `stop` control verb (pi `stopAsyncRun` / `StopRequest` / `consumeStopRequest`)
+    // ---------------------------------------------------------------------------------------
+
+    /// `stop` writes a real `control/stop.json` for a `Running` run, and `consume_stop_request`
+    /// reads-then-deletes it exactly once (pi `consumeStopRequest`, `control-channel.ts:519-530`).
+    #[tokio::test]
+    async fn stop_writes_a_real_stop_request_that_is_consumed_exactly_once() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("stoprun00001");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        write_running_status(&paths, &run_id, RunMode::Single, Some(4242), Vec::new()).await;
+
+        assert_eq!(
+            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None)
+                .await
+                .expect("stop resolves"),
+            StopOutcome::Requested
+        );
+
+        // The file lands at pi's own path, with pi's own discriminant and source.
+        let path = stop_request_path(&paths.run_dir);
+        assert_eq!(path, paths.run_dir.join("control").join("stop.json"));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.expect("stop.json exists"))
+                .expect("valid json");
+        assert_eq!(raw["type"], serde_json::json!("stop"));
+        assert_eq!(raw["source"], serde_json::json!("stop-action"));
+
+        // Non-consuming read leaves it in place…
+        assert!(check_stop_inbox_now(&paths).await.expect("read").is_some());
+        assert!(path.exists());
+        // …consumption removes it and is idempotent thereafter.
+        let consumed = consume_stop_request(&paths).await.expect("consume").expect("was pending");
+        assert_eq!(consumed.kind, "stop");
+        assert!(!path.exists());
+        assert!(consume_stop_request(&paths).await.expect("second consume").is_none());
+    }
+
+    /// pi `stopAsyncRun`'s actionability guard (`async-stop-action.ts:41`): only `running` or
+    /// `queued`. A `Paused` run is refused — NOT silently absorbed the way a duplicate `interrupt`
+    /// is — and nothing is written.
+    #[tokio::test]
+    async fn stop_refuses_a_run_that_is_neither_running_nor_queued() {
+        let (_dir, async_root, results_dir) = temp_roots();
+
+        // Queued IS stoppable.
+        let queued_id = RunId::from_token("stopqueued01");
+        let queued_paths = RunPaths::for_run(&async_root, &results_dir, &queued_id);
+        tokio::fs::create_dir_all(&queued_paths.run_dir).await.expect("mkdir");
+        write_atomic_json(
+            &queued_paths.status,
+            &RunStatus::queued(queued_id.clone(), RunMode::Single, None),
+        )
+        .await
+        .expect("write status");
+        assert_eq!(
+            stop(&async_root, &results_dir, queued_id.as_str(), "stop-action", None)
+                .await
+                .expect("stop resolves"),
+            StopOutcome::Requested
+        );
+
+        // Paused is NOT.
+        let paused_id = RunId::from_token("stoppaused01");
+        let paused_paths = RunPaths::for_run(&async_root, &results_dir, &paused_id);
+        let mut paused = write_running_status(
+            &paused_paths,
+            &paused_id,
+            RunMode::Single,
+            Some(11),
+            Vec::new(),
+        )
+        .await;
+        paused.advance_state(RunState::Paused).expect("Running -> Paused");
+        write_atomic_json(&paused_paths.status, &paused).await.expect("write");
+        assert_eq!(
+            stop(&async_root, &results_dir, paused_id.as_str(), "stop-action", None)
+                .await
+                .expect("stop resolves"),
+            StopOutcome::NotStoppable
+        );
+        assert!(
+            !stop_request_path(&paused_paths.run_dir).exists(),
+            "a refused stop must not leave a request file behind"
+        );
+    }
+
+    /// G77 — pi `async-resume.ts:406` @v0.43.0: a stopped run is NOT resumable, and the refusal is
+    /// its own error with its own verbatim sentence, never the no-transcript one. The run below
+    /// deliberately HAS a persisted transcript, which is exactly the case a
+    /// `ResumeNoTranscript`-only implementation would happily revive.
+    #[tokio::test]
+    async fn resume_refuses_a_stopped_run_even_when_a_transcript_exists() {
+        let (dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("stopresume01");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+
+        let transcript = dir.path().join("session.jsonl");
+        tokio::fs::write(&transcript, b"{}\n").await.expect("write transcript");
+
+        let mut step = super::super::StepStatus::pending("worker");
+        step.status = StepState::Stopped;
+        step.session_file = Some(transcript.clone());
+        let mut status =
+            write_running_status(&paths, &run_id, RunMode::Single, Some(9), vec![step]).await;
+        status.advance_state(RunState::Stopped).expect("Running -> Stopped");
+        write_atomic_json(&paths.status, &status).await.expect("write");
+
+        let err = resume(&async_root, &results_dir, run_id.as_str(), None)
+            .await
+            .expect_err("a stopped run must not be resumable");
+        assert!(
+            matches!(err, SubagentError::ResumeStopped(ref id) if id == run_id.as_str()),
+            "the refusal must be its own variant, not ResumeNoTranscript: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Async run 'stopresume01' was stopped and cannot be resumed. Start a new run instead."
+        );
+    }
+
+    /// G77 — `imported_state` (pi `resultState`, `chain-root-attachment.ts:85-93`): a child's own
+    /// `stopped` flag short-circuits ahead of its exit code, and a failing child inherits the run's
+    /// stop before it inherits a pause.
+    #[test]
+    fn imported_state_propagates_stopped_ahead_of_exit_code_and_pause() {
+        fn result_with(state: RunState, child: crate::exec::SingleResult) -> ResultFile {
+            ResultFile {
+                id: RunId::from_token("importstop01"),
+                run_id: RunId::from_token("importstop01"),
+                agent: "worker".to_string(),
+                mode: RunMode::Single,
+                state,
+                success: false,
+                cwd: PathBuf::from("/tmp"),
+                session_file: None,
+                results: vec![child],
+            }
+        }
+        fn child(exit_code: i32, stopped: bool) -> crate::exec::SingleResult {
+            crate::exec::SingleResult {
+                agent: "worker".to_string(),
+                task: String::new(),
+                exit_code,
+                usage: cyrup_core::Usage::default(),
+                model: None,
+                attempted_models: Vec::new(),
+                model_attempts: Vec::new(),
+                final_output: None,
+                structured_output: None,
+                acceptance: None,
+                detached: false,
+                interrupted: false,
+                timed_out: false,
+                stopped,
+                process_signal: None,
+                error: None,
+                saved_output_path: None,
+                tool_calls: Vec::new(),
+                output_truncated: false,
+                control_events: Vec::new(),
+                progress: None,
+            }
+        }
+
+        // `child.stopped === true` wins even over a clean exit (`:87` precedes `:88`).
+        let r = result_with(RunState::Complete, child(0, true));
+        assert_eq!(imported_state(&r, r.results.first()), RunState::Stopped);
+
+        // A failing child inherits the run's stop (`:89`'s `result.state === "stopped"` arm),
+        // ahead of the pause arm.
+        let r = result_with(RunState::Stopped, child(1, false));
+        assert_eq!(imported_state(&r, r.results.first()), RunState::Stopped);
+
+        // …and with NO child at all, the run's stop passes straight through (`:90`).
+        let mut r = result_with(RunState::Stopped, child(1, false));
+        r.results.clear();
+        assert_eq!(imported_state(&r, None), RunState::Stopped);
+
+        // The pre-G77 relations are untouched.
+        let r = result_with(RunState::Paused, child(1, false));
+        assert_eq!(imported_state(&r, r.results.first()), RunState::Paused);
+        let r = result_with(RunState::Failed, child(1, false));
+        assert_eq!(imported_state(&r, r.results.first()), RunState::Failed);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2757,6 +3160,8 @@ mod tests {
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: error.map(str::to_string),
             saved_output_path: None,
             tool_calls: Vec::new(),

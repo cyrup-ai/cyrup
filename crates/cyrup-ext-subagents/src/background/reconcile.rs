@@ -313,9 +313,22 @@ async fn repair_from_result(
 
     let mut repaired = existing.unwrap_or_else(|| RunStatus::queued(result.run_id.clone(), result.mode, None));
     repaired.pid = repaired.pid.or(None);
-    for step in &mut repaired.steps {
+    for (index, step) in repaired.steps.iter_mut().enumerate() {
         if !step.status.is_terminal() {
-            step.status = if result.success { StepState::Complete } else { StepState::Failed };
+            // G77 — pi `childState(overallState, child)` (`stale-run-reconciler.ts:145-149`): a
+            // child that reports its OWN `success` wins (`true` → complete, `false` → failed),
+            // otherwise the step inherits the run's overall repaired state — which is where
+            // `"stopped"` propagates from (`readResultRepairData`, `:126`: `data.success ?
+            // "complete" : data.state === "stopped" ? "stopped" : …`). Before this, every
+            // non-terminal step of a stopped run was repaired to `Failed`, erasing the stop.
+            let child_stopped = result.results.get(index).is_some_and(|child| child.stopped);
+            step.status = if child_stopped || result.state == RunState::Stopped {
+                StepState::Stopped
+            } else if result.success {
+                StepState::Complete
+            } else {
+                StepState::Failed
+            };
         }
     }
     // Force `state` to the result's own terminal state directly rather than routing through
@@ -491,6 +504,8 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: Some(step.error.clone().unwrap_or_else(|| diagnostic.to_string())),
             saved_output_path: None,
             tool_calls: Vec::new(),
@@ -521,6 +536,8 @@ fn placeholder_result(
         detached: false,
         interrupted: false,
         timed_out: false,
+        stopped: false,
+        process_signal: None,
         error: Some(diagnostic.to_string()),
         saved_output_path: None,
         tool_calls: Vec::new(),
@@ -732,6 +749,68 @@ mod tests {
         )
         .expect("valid JSON");
         assert_eq!(reread.state, RunState::Complete);
+    }
+
+    /// G77 — repair-from-result must carry a STOPPED terminal state onto the still-non-terminal
+    /// steps as [`StepState::Stopped`], not as `Failed`.
+    ///
+    /// Upstream: `readResultRepairData` derives `state = data.success ? "complete" : data.state ===
+    /// "stopped" ? "stopped" : …` (`stale-run-reconciler.ts:126`) and `childState` hands that
+    /// overall state to each repaired step (`:145-149`), which then writes `status: state`
+    /// (`:163`). Before this, every non-terminal step of a stopped run was repaired to `Failed`,
+    /// erasing the stop from the status report an orchestrator reads back.
+    #[tokio::test]
+    async fn a_stopped_result_file_repairs_its_steps_to_stopped_not_failed() {
+        let (_dir, paths) = temp_paths();
+        let run_id = run_id_from_paths(&paths);
+
+        let status = running_status(run_id.clone(), 999_999, epoch_millis(SystemTime::now()));
+        crate::background::atomic::write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
+
+        let result = ResultFile {
+            id: run_id.clone(),
+            run_id: run_id.clone(),
+            agent: "researcher".to_string(),
+            mode: RunMode::Single,
+            state: RunState::Stopped,
+            success: false,
+            cwd: paths.run_dir.clone(),
+            session_file: None,
+            results: Vec::new(),
+        };
+        crate::background::atomic::write_atomic_json(&paths.result, &result)
+            .await
+            .expect("write result");
+
+        let outcome = reconcile(
+            &paths,
+            None,
+            SystemTime::now(),
+            |_| Liveness::Alive,
+            DEFAULT_SPAWN_GRACE,
+            DEFAULT_STALE_AFTER,
+        )
+        .await
+        .expect("reconcile succeeds");
+
+        assert_eq!(outcome.action, ReconcileAction::RepairedFromResult);
+        assert_eq!(outcome.status.state, RunState::Stopped);
+        assert_eq!(
+            outcome.status.steps[0].status,
+            StepState::Stopped,
+            "the in-flight step must be repaired to Stopped, not Failed: {:?}",
+            outcome.status.steps[0]
+        );
+
+        // Persisted, not merely returned.
+        let reread: RunStatus = serde_json::from_slice(
+            &tokio::fs::read(&paths.status).await.expect("status.json exists"),
+        )
+        .expect("valid JSON");
+        assert_eq!(reread.state, RunState::Stopped);
+        assert_eq!(reread.steps[0].status, StepState::Stopped);
     }
 
     #[tokio::test]

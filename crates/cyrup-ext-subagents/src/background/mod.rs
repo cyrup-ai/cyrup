@@ -274,6 +274,26 @@ pub enum RunState {
     /// The run ended in failure — either a step's own failure or a synthesized failure from
     /// stale-dead reconciliation (R-SA-092).
     Failed,
+    /// G77 — pi `stopRunner` (`runs/background/subagent-runner.ts:2955-2984` @v0.43.0): an explicit
+    /// user/agent **stop** request (`control/stop.json`, pi `StopRequest`
+    /// `runs/background/control-channel.ts:49-53`) was consumed. Every then-running-or-pending step
+    /// was marked [`StepState::Stopped`] with `exitCode: 1` and the literal
+    /// [`STOP_MESSAGE`](crate::background::control::STOP_MESSAGE), and the run's terminal record is
+    /// `state: "stopped"` (pi `statusPayload.state = "stopped"`, `subagent-runner.ts:2959`).
+    ///
+    /// **A first-class terminal state, NOT an alias for [`Self::Failed`] or [`Self::Paused`].**
+    /// Upstream distinguishes all three at every reader: `stopRunner`'s own guard is
+    /// `if (stopped || timedOut || interrupted || state !== "running") return`
+    /// (`subagent-runner.ts:2956`), so a stop and a timeout and an interrupt are mutually exclusive
+    /// verdicts; `resolveSubagentResultStatus` ranks `"stopped"` above `"paused"` and above the
+    /// `success`/exit-code fallbacks (`intercom/result-intercom.ts:31-35`);
+    /// `resolveGroupedStatus` gives `"stopped"` its own precedence slot between `"failed"` and
+    /// `"paused"` (`result-intercom.ts:84-87`); `async-resume.ts:406` REFUSES to resume a stopped
+    /// run (`"was stopped and cannot be resumed"`) where a paused one is exactly what `resume`
+    /// exists for; and `notify.ts:210` renders a fourth `status` word for it. Folding `Stopped`
+    /// into `Failed` would silently make a stopped run look resumable-or-not identically to a
+    /// crashed one and would erase the distinct user-visible string at every one of those sites.
+    Stopped,
 }
 
 impl RunState {
@@ -290,15 +310,22 @@ impl RunState {
             RunState::Paused => 2,
             RunState::Complete => 3,
             RunState::Failed => 3,
+            RunState::Stopped => 3,
         }
     }
 
     /// `true` once a run in this state will never again be mutated by the runner that owns it
-    /// (`Complete`/`Failed`). `Paused` is deliberately **not** terminal — R-SA-084 is explicit
-    /// that interrupt is a soft, resumable pause, never a terminal state.
+    /// (`Complete`/`Failed`/`Stopped`). `Paused` is deliberately **not** terminal — R-SA-084 is
+    /// explicit that interrupt is a soft, resumable pause, never a terminal state.
+    ///
+    /// [`RunState::Stopped`] **is** terminal in its own right (G77): pi treats a stopped run as
+    /// finished-and-non-resumable (`async-resume.ts:406` throws rather than reviving it,
+    /// `chain-root-attachment.ts:60`'s `TERMINAL_STATES` set contains `"stopped"`, and
+    /// `stale-run-reconciler.ts:292`'s `isTerminalState` returns true for it) — it is neither a
+    /// pause nor a failure.
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, RunState::Complete | RunState::Failed)
+        matches!(self, RunState::Complete | RunState::Failed | RunState::Stopped)
     }
 
     /// Returns `true` if a transition from `self` to `next` is permitted.
@@ -311,8 +338,14 @@ impl RunState {
     /// - `Paused -> Running | Failed` (resume respawns and steers execution forward again,
     ///   R-SA-086; or a paused run is later reconciled to `Failed` by long-staleness reconciliation,
     ///   R-SA-091, if it is never resumed).
-    /// - `Complete`/`Failed` are terminal: no outgoing transition is permitted, including to
-    ///   themselves — a caller that already observed a terminal state and tries to write the same
+    /// - `Queued -> Stopped` / `Running -> Stopped` (G77): an explicit stop request was consumed.
+    ///   Upstream's `stopRunner` gate is `statusPayload.state !== "running"` returns early
+    ///   (`subagent-runner.ts:2956`), and the parent-side `stopAsyncRun` only accepts a target whose
+    ///   reconciled state is `"running"` or `"queued"` (`async-stop-action.ts:41`) — so those are
+    ///   exactly the two predecessors, and a `Paused` run is deliberately NOT stoppable (upstream
+    ///   returns `"No running or queued async run was found"` for it).
+    /// - `Complete`/`Failed`/`Stopped` are terminal: no outgoing transition is permitted, including
+    ///   to themselves — a caller that already observed a terminal state and tries to write the same
     ///   terminal state again should treat that as a no-op at a layer above this guard, not as a
     ///   fresh "transition".
     #[must_use]
@@ -321,9 +354,11 @@ impl RunState {
             (self, next),
             (RunState::Queued, RunState::Running)
                 | (RunState::Queued, RunState::Failed)
+                | (RunState::Queued, RunState::Stopped)
                 | (RunState::Running, RunState::Paused)
                 | (RunState::Running, RunState::Complete)
                 | (RunState::Running, RunState::Failed)
+                | (RunState::Running, RunState::Stopped)
                 | (RunState::Paused, RunState::Running)
                 | (RunState::Paused, RunState::Failed)
         )
@@ -385,14 +420,22 @@ pub enum StepState {
     Complete,
     /// Finished with a failure (including a synthesized stale-dead failure, R-SA-092).
     Failed,
+    /// G77 — pi `step.status = "stopped"` (`subagent-runner.ts:2967`): this step was still
+    /// `Running` or `Pending` when an explicit stop request landed, so the runner marked it
+    /// `stopped` (with `exitCode: 1` and the stop message as its `error`) rather than `failed` or
+    /// `paused`. Terminal and non-resumable, exactly like [`RunState::Stopped`].
+    Stopped,
 }
 
 impl StepState {
-    /// `true` for `Complete`/`Failed` — mirrors [`RunState::is_terminal`]'s exclusion of `Paused`
-    /// for the identical reason (R-SA-084: pause is soft and resumable, never terminal).
+    /// `true` for `Complete`/`Failed`/`Stopped` — mirrors [`RunState::is_terminal`]'s exclusion of
+    /// `Paused` for the identical reason (R-SA-084: pause is soft and resumable, never terminal),
+    /// and its inclusion of `Stopped` for the reason documented there (pi
+    /// `chain-root-attachment.ts:61`'s `TERMINAL_STEP_STATUSES` set lists `"stopped"` alongside
+    /// `"complete"`/`"completed"`/`"failed"`/`"paused"`).
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, StepState::Complete | StepState::Failed)
+        matches!(self, StepState::Complete | StepState::Failed | StepState::Stopped)
     }
 }
 
@@ -1343,6 +1386,13 @@ pub enum WorkflowNodeStatus {
     Failed,
     /// Interrupted mid-flight (soft pause).
     Paused,
+    /// G77 — pi `WorkflowNodeStatus` includes `"stopped"` (`shared/types.ts:40`), and the detached
+    /// runner's own graph refresh normalizes a `"stopped"` step onto it and rolls it up over its
+    /// children (`subagent-runner.ts:2163-2188`). Distinct from [`Self::Failed`]: upstream's
+    /// `updateNode` tail is `if (node.error && node.status !== "stopped" && node.status !==
+    /// "rejected") node.status = "failed"` — i.e. a stopped node keeps its status even though the
+    /// stop stamped an `error` onto it, precisely so a stop is never re-rendered as a failure.
+    Stopped,
     /// Detached (fire-and-forget) and no longer tracked inline.
     Detached,
 }
@@ -1611,6 +1661,14 @@ fn normalize_workflow_status(status: Option<&str>) -> Option<WorkflowNodeStatus>
         Some("running") => Some(WorkflowNodeStatus::Running),
         Some("failed") => Some(WorkflowNodeStatus::Failed),
         Some("paused") => Some(WorkflowNodeStatus::Paused),
+        // G77: `workflow-graph.ts`'s own `normalizeStatus` has no `"stopped"` case, but the
+        // detached runner's graph refresh — which in cyrup is FUSED into this same builder via
+        // [`build_workflow_graph_from_runner_steps`] rather than living as a second local
+        // normalizer — does (`subagent-runner.ts:2163-2166`: `if (status === "running" || … ||
+        // status === "stopped" || …) return status`). Without this arm a stopped step falls
+        // through to the result-derived/`pending` default and the graph silently reports a stopped
+        // node as pending-or-failed.
+        Some("stopped") => Some(WorkflowNodeStatus::Stopped),
         Some("detached") => Some(WorkflowNodeStatus::Detached),
         Some("pending") => Some(WorkflowNodeStatus::Pending),
         _ => None,
@@ -1665,11 +1723,21 @@ fn push_workflow_phase(phases: &mut Vec<WorkflowPhase>, phase: Option<&str>, nod
 }
 
 /// Summarize a parallel group's child statuses with pi's explicit precedence (pi
-/// `summarizeParallelStatuses`, `workflow-graph.ts:63-71`): running > failed > paused > detached >
-/// all-completed > any-completed(=running) > pending.
+/// `summarizeParallelStatuses`, `workflow-graph.ts:63-71`): running > stopped > failed > paused >
+/// detached > all-completed > any-completed(=running) > pending.
+///
+/// G77 — the `stopped` slot sits immediately after `running`, matching the detached runner's own
+/// child roll-up (`subagent-runner.ts:2181-2186`: `every completed` → `some running` → `some
+/// stopped` → `some rejected` → `some failed` → `some paused`), which is the roll-up this fused
+/// builder serves for a background run. `workflow-graph.ts`'s standalone version predates the
+/// state and has no such branch; adding it here cannot change any other caller's result, because
+/// [`WorkflowNodeStatus::Stopped`] is only ever produced by a stopped step.
 fn summarize_parallel_statuses(statuses: &[WorkflowNodeStatus]) -> WorkflowNodeStatus {
     if statuses.contains(&WorkflowNodeStatus::Running) {
         return WorkflowNodeStatus::Running;
+    }
+    if statuses.contains(&WorkflowNodeStatus::Stopped) {
+        return WorkflowNodeStatus::Stopped;
     }
     if statuses.contains(&WorkflowNodeStatus::Failed) {
         return WorkflowNodeStatus::Failed;
@@ -1993,6 +2061,7 @@ pub fn workflow_graph_from_run(
             StepState::Paused => "paused",
             StepState::Complete => "complete",
             StepState::Failed => "failed",
+            StepState::Stopped => "stopped",
         });
         step_statuses.push(WorkflowStepStatusInput {
             status: status_str.map(str::to_string),
@@ -2428,6 +2497,8 @@ mod tests {
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: None,
             saved_output_path: None,
             tool_calls: Vec::new(),
@@ -2623,6 +2694,107 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("Failed"));
         assert!(message.contains("Queued"));
+    }
+
+    /// G77 — `Stopped` is terminal in its own right, reachable only from `Running`/`Queued`, and a
+    /// dead end thereafter. Every claim is checked against a named upstream site.
+    #[test]
+    fn stopped_is_a_first_class_terminal_run_state_not_an_alias() {
+        // Terminal (pi `chain-root-attachment.ts:60` TERMINAL_STATES, `stale-run-reconciler.ts:292`
+        // isTerminalState) — and distinct from the other two terminal states.
+        assert!(RunState::Stopped.is_terminal());
+        assert_ne!(RunState::Stopped, RunState::Failed);
+        assert_ne!(RunState::Stopped, RunState::Paused);
+        assert_eq!(RunState::Stopped.rank(), RunState::Failed.rank());
+
+        // Reachable from exactly the two states pi's `stopAsyncRun` guard accepts
+        // (`async-stop-action.ts:41`: `state !== "running" && state !== "queued"` is the refusal).
+        assert!(RunState::Running.can_transition_to(RunState::Stopped));
+        assert!(RunState::Queued.can_transition_to(RunState::Stopped));
+        assert!(
+            !RunState::Paused.can_transition_to(RunState::Stopped),
+            "a paused run is not stoppable upstream — `stopAsyncRun` answers `No running or queued \
+             async run was found`"
+        );
+
+        // A dead end: no outgoing transition at all, including to itself.
+        for next in [
+            RunState::Queued,
+            RunState::Running,
+            RunState::Paused,
+            RunState::Complete,
+            RunState::Failed,
+            RunState::Stopped,
+        ] {
+            assert!(
+                !RunState::Stopped.can_transition_to(next),
+                "Stopped is terminal; Stopped -> {next:?} must be rejected"
+            );
+            RunState::Stopped
+                .try_advance(next)
+                .expect_err("every outgoing transition from Stopped is illegal");
+        }
+    }
+
+    /// G77 — the per-step counterpart (pi `subagent-runner.ts:2967` `step.status = "stopped"`;
+    /// `chain-root-attachment.ts:61` TERMINAL_STEP_STATUSES).
+    #[test]
+    fn stopped_is_a_first_class_terminal_step_state_not_an_alias() {
+        assert!(StepState::Stopped.is_terminal());
+        assert_ne!(StepState::Stopped, StepState::Failed);
+        assert_ne!(StepState::Stopped, StepState::Paused);
+        // The pre-existing terminality relations are untouched.
+        assert!(!StepState::Pending.is_terminal());
+        assert!(!StepState::Running.is_terminal());
+        assert!(!StepState::Paused.is_terminal());
+    }
+
+    /// G77 — the wire spelling is `"stopped"` on both enums, which is what a pi-shaped
+    /// `status.json`/result file round-trips through.
+    #[test]
+    fn stopped_serializes_as_the_lowercase_pi_wire_word() {
+        assert_eq!(
+            serde_json::to_value(RunState::Stopped).expect("serialize"),
+            serde_json::json!("stopped")
+        );
+        assert_eq!(
+            serde_json::to_value(StepState::Stopped).expect("serialize"),
+            serde_json::json!("stopped")
+        );
+        assert_eq!(
+            serde_json::from_value::<RunState>(serde_json::json!("stopped")).expect("deserialize"),
+            RunState::Stopped
+        );
+        assert_eq!(
+            serde_json::from_value::<StepState>(serde_json::json!("stopped")).expect("deserialize"),
+            StepState::Stopped
+        );
+    }
+
+    /// G77 — the workflow-graph projection: a stopped step normalizes to
+    /// [`WorkflowNodeStatus::Stopped`] (pi `subagent-runner.ts:2163-2166`) and rolls up over a
+    /// parallel group ahead of `failed`/`paused` (`:2181-2186`).
+    #[test]
+    fn workflow_graph_projects_and_rolls_up_stopped() {
+        assert_eq!(
+            normalize_workflow_status(Some("stopped")),
+            Some(WorkflowNodeStatus::Stopped)
+        );
+        assert_eq!(
+            summarize_parallel_statuses(&[WorkflowNodeStatus::Failed, WorkflowNodeStatus::Stopped]),
+            WorkflowNodeStatus::Stopped,
+            "stopped outranks failed in the runner's own child roll-up"
+        );
+        assert_eq!(
+            summarize_parallel_statuses(&[WorkflowNodeStatus::Running, WorkflowNodeStatus::Stopped]),
+            WorkflowNodeStatus::Running,
+            "…but running still outranks stopped"
+        );
+        // Unchanged without a stopped child.
+        assert_eq!(
+            summarize_parallel_statuses(&[WorkflowNodeStatus::Failed, WorkflowNodeStatus::Paused]),
+            WorkflowNodeStatus::Failed
+        );
     }
 
     #[test]

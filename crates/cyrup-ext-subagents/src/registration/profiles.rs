@@ -298,11 +298,20 @@ impl ProfileKind {
     }
 }
 
-/// The 8 builtin agent names in pi's `buildProfileFile` grouping (profiles.ts:389-396): two
-/// cheap-tier, three medium-tier, three strong-tier — every one of the 8 builtins is assigned.
+/// The builtin agent names in pi's `buildProfileFile` grouping (profiles.ts:402-415 @ v0.43.0): two
+/// cheap-tier, ONE medium-tier, three strong-tier.
+///
+/// SIX entries, not eight, and the medium tier is a single agent. Upstream `83b9872` deleted the
+/// `planner` and `context-builder` roles, which were the other two medium-tier entries, leaving
+/// `researcher` alone there — see [`crate::discovery::management::BUILTIN_AGENT_NAMES`].
+///
+/// The 7th roster name, `advisor`, is deliberately ABSENT: it is an alias of `oracle`
+/// (`agents/oracle.md:3` @ v0.43.0), and a settings override keyed on an alias would never be
+/// applied — `subagents.agentOverrides` is looked up by canonical agent name. pi's
+/// `buildProfileFile` likewise writes no `advisor` entry.
 pub const PROFILE_CHEAP_AGENTS: [&str; 2] = ["scout", "delegate"];
 /// See [`PROFILE_CHEAP_AGENTS`].
-pub const PROFILE_MEDIUM_AGENTS: [&str; 3] = ["planner", "context-builder", "researcher"];
+pub const PROFILE_MEDIUM_AGENTS: [&str; 1] = ["researcher"];
 /// See [`PROFILE_CHEAP_AGENTS`].
 pub const PROFILE_STRONG_AGENTS: [&str; 3] = ["worker", "reviewer", "oracle"];
 
@@ -316,10 +325,10 @@ fn tier_override(model: &str) -> AgentOverrideConfig {
 }
 
 /// Build a subagent profile file from a tier assignment — pi `buildProfileFile`
-/// (profiles.ts:385-400). Writes `subagents.agentOverrides.<agent>.model` for ALL EIGHT builtin
-/// agents: scout/delegate → `cheap`, planner/context-builder/researcher → `medium`,
-/// worker/reviewer/oracle → `strong`. (pi's `buildProfileFile` takes a `kind` argument it does not
-/// read — the tier assignment alone determines the file — so this port takes only the models.)
+/// (profiles.ts:402-415 @ v0.43.0). Writes `subagents.agentOverrides.<agent>.model` for the six
+/// tiered builtins: scout/delegate → `cheap`, researcher → `medium`, worker/reviewer/oracle →
+/// `strong`. (pi's `buildProfileFile` takes a `kind` argument it does not read — the tier assignment
+/// alone determines the file — so this port takes only the models.)
 ///
 /// In addition to the 8-agent tier map, this sets `subagents.defaultModel` to the `medium` tier —
 /// the profile's representative fallback model for any agent that is NOT one of the 8 builtins
@@ -1165,18 +1174,15 @@ mod tests {
         };
         let profile = build_profile_file(&models);
 
-        // Exactly the 8 builtin agents, no more, no fewer.
-        assert_eq!(profile.subagents.overrides.len(), 8);
+        // Exactly the 6 tiered builtins pi's `buildProfileFile` writes @ v0.43.0
+        // (profiles.ts:402-415), no more, no fewer.
+        assert_eq!(profile.subagents.overrides.len(), 6);
 
         // scout/delegate -> cheap
         assert_eq!(override_model(&profile, "scout").as_deref(), Some("prov/cheap-1"));
         assert_eq!(override_model(&profile, "delegate").as_deref(), Some("prov/cheap-1"));
-        // planner/context-builder/researcher -> medium
-        assert_eq!(override_model(&profile, "planner").as_deref(), Some("prov/medium-1"));
-        assert_eq!(
-            override_model(&profile, "context-builder").as_deref(),
-            Some("prov/medium-1")
-        );
+        // researcher -> medium (its two former medium-tier companions, `planner` and
+        // `context-builder`, were deleted upstream in `83b9872`)
         assert_eq!(
             override_model(&profile, "researcher").as_deref(),
             Some("prov/medium-1")
@@ -1185,6 +1191,14 @@ mod tests {
         assert_eq!(override_model(&profile, "worker").as_deref(), Some("prov/strong-1"));
         assert_eq!(override_model(&profile, "reviewer").as_deref(), Some("prov/strong-1"));
         assert_eq!(override_model(&profile, "oracle").as_deref(), Some("prov/strong-1"));
+
+        // The removed roles must carry NO override at all — a profile that still pinned a model on
+        // a role that no longer exists would silently resurrect it in `settings.json`.
+        assert_eq!(override_model(&profile, "planner"), None);
+        assert_eq!(override_model(&profile, "context-builder"), None);
+        // `advisor` is an `oracle` ALIAS, not a distinct override target: `agentOverrides` is keyed
+        // by canonical name, so an `advisor` entry would never be applied to anything.
+        assert_eq!(override_model(&profile, "advisor"), None);
     }
 
     #[test]
@@ -1274,7 +1288,7 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     #[test]
-    fn generate_provider_profiles_writes_quota_and_quality_with_eight_agent_map() {
+    fn generate_provider_profiles_writes_quota_and_quality_with_the_six_agent_map() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let ranked = vec![
             "prov/cheap".to_string(),
@@ -1287,11 +1301,12 @@ mod tests {
         assert!(result.quota_path.ends_with("prov.quota.json"));
         assert!(result.quality_path.ends_with("prov.quality.json"));
 
-        // Both files are real, load back through the read-only loader, and carry all 8 agents.
+        // Both files are real, load back through the read-only loader, and carry all 6 tiered
+        // agents (8 until `83b9872` deleted `planner`/`context-builder` upstream).
         let quota = load_profile(tmp.path(), "prov.quota").expect("load quota");
         let quality = load_profile(tmp.path(), "prov.quality").expect("load quality");
-        assert_eq!(quota.subagents.overrides.len(), 8);
-        assert_eq!(quality.subagents.overrides.len(), 8);
+        assert_eq!(quota.subagents.overrides.len(), 6);
+        assert_eq!(quality.subagents.overrides.len(), 6);
         assert_eq!(
             override_model(&quota, "scout").as_deref(),
             Some(result.quota_models.cheap.as_str())

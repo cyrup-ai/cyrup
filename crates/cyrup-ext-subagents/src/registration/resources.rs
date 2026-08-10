@@ -171,13 +171,13 @@ mod tests {
 
     use super::*;
 
-    /// The 7 prompt-template recipes pi ships (`prompts/*.md`, package.json:52), which this crate
-    /// mirrors under `resources/prompts/`.
-    const EXPECTED_PROMPTS: [&str; 7] = [
+    /// The 5 prompt-template recipes pi ships (`prompts/*.md` @ v0.43.0), which this crate mirrors
+    /// under `resources/prompts/`. `parallel-context-build` and `parallel-handoff-plan` were deleted
+    /// upstream in `83b9872` together with the `planner`/`context-builder` roles they drove — a
+    /// recipe whose every step names a role that no longer exists is dead on arrival.
+    const EXPECTED_PROMPTS: [&str; 5] = [
         "gather-context-and-clarify",
         "parallel-cleanup",
-        "parallel-context-build",
-        "parallel-handoff-plan",
         "parallel-research",
         "parallel-review",
         "review-loop",

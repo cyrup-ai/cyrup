@@ -164,6 +164,10 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         child_index: None,
         control_config: None,
         on_control_event: None,
+        // Added with G80's verify-command memoization. `None` is the pre-G80 behaviour (no
+        // artifacts root configured => no memoization), which is what this bridge fixture wants:
+        // its subject is the intercom child bridge, not the acceptance gate.
+        artifacts_dir: None,
     }
 }
 

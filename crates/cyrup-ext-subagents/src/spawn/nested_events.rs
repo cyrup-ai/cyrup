@@ -376,16 +376,23 @@ fn is_safe_nested_id(value: Option<&Value>) -> bool {
 
 fn sanitize_state(value: Option<&Value>, fallback: &str) -> String {
     match value.and_then(Value::as_str) {
-        Some(s @ ("queued" | "running" | "complete" | "failed" | "paused")) => s.to_string(),
+        // G77: `"stopped"` is in upstream's own allowlist (`nested-events.ts:270-273` @v0.43.0);
+        // without it a stopped descendant's state is silently rewritten to the `fallback`, so the
+        // parent's registry never learns the child was stopped.
+        Some(s @ ("queued" | "running" | "complete" | "failed" | "paused" | "stopped")) => {
+            s.to_string()
+        }
         _ => fallback.to_string(),
     }
 }
 
 fn sanitize_step_status(value: Option<&Value>) -> String {
     match value.and_then(Value::as_str) {
-        Some(s @ ("pending" | "running" | "complete" | "completed" | "failed" | "paused")) => {
-            s.to_string()
-        }
+        // G77: same allowlist widening for a nested STEP status (`nested-events.ts:281-283`).
+        Some(
+            s @ ("pending" | "running" | "complete" | "completed" | "failed" | "paused"
+            | "stopped"),
+        ) => s.to_string(),
         _ => "pending".to_string(),
     }
 }
@@ -983,7 +990,12 @@ fn registry_path(route: &NestedRoute) -> PathBuf {
 }
 
 fn terminal(state: &str) -> bool {
-    matches!(state, "complete" | "failed" | "paused")
+    // G77: `"stopped"` is in upstream's own set (`runs/shared/nested-events.ts:420-422` @v0.43.0:
+    // `state === "complete" || state === "failed" || state === "paused" || state === "stopped"`).
+    // Without it, a later non-terminal event from a stopped descendant would overwrite its terminal
+    // record in the nested-run registry — and the cascade's own `is_live_state` would then keep
+    // re-targeting a run that has already been stopped.
+    matches!(state, "complete" | "failed" | "paused" | "stopped")
 }
 
 /// `{ ...existing, ...incoming }`: incoming's present keys win (via JSON map merge, so absent

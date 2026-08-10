@@ -694,8 +694,11 @@ fn is_valid_package_identifier(name: &str) -> bool {
 // Acceptance validation (acceptance.ts::validateAcceptanceInput)
 // -------------------------------------------------------------------------------------------
 
-const VALID_ACCEPTANCE_LEVELS: &[&str] =
-    &["auto", "none", "attested", "checked", "verified", "reviewed"];
+/// `VALID_LEVELS` (`acceptance.ts:35` @v0.43.0). `"reviewed"` is deliberately absent: v0.43.0
+/// removed it from `AcceptanceLevel` because it is an ACHIEVED status, never a requestable level —
+/// see [`crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE`], which this file's
+/// validator emits for it just as `model::validate_acceptance_input` does.
+const VALID_ACCEPTANCE_LEVELS: &[&str] = &["auto", "none", "attested", "checked", "verified"];
 const VALID_ACCEPTANCE_EVIDENCE: &[&str] = &[
     "changed-files",
     "tests-added",
@@ -725,9 +728,24 @@ fn validate_acceptance_input(input: Option<&Value>, path_label: &str) -> Vec<Str
     if input == &Value::Bool(false) {
         return errors;
     }
+    // `acceptance.ts:180-185` @v0.43.0 — the bare-string form now accepts only `auto`, `attested`
+    // and `checked`; see `model::validate_acceptance_input`, whose messages these mirror verbatim.
     if let Some(level) = input.as_str() {
-        if !VALID_ACCEPTANCE_LEVELS.contains(&level) {
+        if level == "reviewed" {
+            errors.push(format!(
+                "{path_label} {}",
+                crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE
+            ));
+        } else if !VALID_ACCEPTANCE_LEVELS.contains(&level) {
             errors.push(format!("{path_label} has invalid level '{level}'."));
+        } else if level == "none" {
+            errors.push(format!(
+                "{path_label} level \"none\" requires a reason; use {{ level: \"none\", reason: \"...\" }}."
+            ));
+        } else if level == "verified" {
+            errors.push(format!(
+                "{path_label} level \"verified\" requires object form with at least one runtime verify command. Use level \"checked\" or provide a non-empty acceptance.verify array."
+            ));
         }
         return errors;
     }
@@ -743,13 +761,19 @@ fn validate_acceptance_input(input: Option<&Value>, path_label: &str) -> Vec<Str
             errors.push(format!("{path_label}.{key} is not supported."));
         }
     }
-    if let Some(level) = object.get("level") {
+    // `acceptance.ts:195-199` @v0.43.0.
+    if object.get("level").and_then(Value::as_str) == Some("reviewed") {
+        errors.push(format!(
+            "{path_label}.level {}",
+            crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE
+        ));
+    } else if let Some(level) = object.get("level") {
         let valid = level
             .as_str()
             .is_some_and(|s| VALID_ACCEPTANCE_LEVELS.contains(&s));
         if !valid {
             errors.push(format!(
-                "{path_label}.level must be one of auto, none, attested, checked, verified, reviewed."
+                "{path_label}.level must be one of auto, none, attested, checked, verified."
             ));
         }
     }
@@ -820,6 +844,18 @@ fn validate_acceptance_input(input: Option<&Value>, path_label: &str) -> Vec<Str
         &format!("{path_label}.evidence"),
         &mut errors,
     );
+    // `acceptance.ts:248-249` @v0.43.0: an object-form `verified` policy MUST declare at least one
+    // runtime command, or the level means nothing beyond the child's own claim.
+    let verified_without_commands = object.get("level").and_then(Value::as_str) == Some("verified")
+        && !object
+            .get("verify")
+            .and_then(Value::as_array)
+            .is_some_and(|commands| !commands.is_empty());
+    if verified_without_commands {
+        errors.push(format!(
+            "{path_label}.verify must contain at least one runtime command when level is verified. Use level \"checked\" or provide a non-empty acceptance.verify array."
+        ));
+    }
     match object.get("verify") {
         None => {}
         Some(Value::Array(commands)) => {
@@ -881,7 +917,12 @@ fn validate_acceptance_input(input: Option<&Value>, path_label: &str) -> Vec<Str
                 }
             }
         }
-        Some(_) => errors.push(format!("{path_label}.verify must be an array.")),
+        // Upstream's `else if` (`acceptance.ts:250-252`): the generic shape message is suppressed
+        // when the more specific `verified`-needs-commands one already fired.
+        Some(_) if !verified_without_commands => {
+            errors.push(format!("{path_label}.verify must be an array."));
+        }
+        Some(_) => {}
     }
     if let Some(review) = object.get("review")
         && review != &Value::Bool(false)
@@ -1682,6 +1723,57 @@ mod tests {
         let path = write(tmp.path(), "bad-acceptance.chain.json", content);
         let err = parse_chain_json(&path, AgentSource::User).expect_err("acceptance reason required");
         assert!(err.contains("step 1 acceptance.reason is required"), "{err}");
+    }
+
+    /// G78 — the chain-JSON validator is a SECOND copy of `validateAcceptanceInput`, so it has to
+    /// refuse `reviewed` (and reasonless `none` / command-less `verified`) with the same messages
+    /// the tool-param path uses. A chain file is exactly where a stale `"reviewed"` would otherwise
+    /// sit unnoticed until dispatch.
+    #[test]
+    fn json_chain_rejects_levels_that_are_no_longer_requestable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (
+                "{\"agent\":\"worker\",\"acceptance\":\"reviewed\"}",
+                "is an achieved status, not a requestable acceptance level",
+            ),
+            (
+                "{\"agent\":\"worker\",\"acceptance\":{\"level\":\"reviewed\"}}",
+                "step 1 acceptance.level is an achieved status",
+            ),
+            (
+                "{\"agent\":\"worker\",\"acceptance\":\"none\"}",
+                "requires a reason",
+            ),
+            (
+                "{\"agent\":\"worker\",\"acceptance\":\"verified\"}",
+                "requires object form with at least one runtime verify command",
+            ),
+            (
+                "{\"agent\":\"worker\",\"acceptance\":{\"level\":\"verified\"}}",
+                "must contain at least one runtime command when level is verified",
+            ),
+        ];
+        for (step, expected) in cases {
+            let content = format!(
+                "{{\"name\":\"c\",\"description\":\"d\",\"chain\":[{step}]}}"
+            );
+            let path = write(tmp.path(), "levels.chain.json", &content);
+            let err = parse_chain_json(&path, AgentSource::User)
+                .expect_err("the level must be refused at parse time");
+            assert!(err.contains(expected), "for {step}: {err}");
+        }
+        // The still-requestable bare levels keep parsing.
+        for level in ["auto", "attested", "checked"] {
+            let content = format!(
+                "{{\"name\":\"c\",\"description\":\"d\",\"chain\":[{{\"agent\":\"worker\",\"acceptance\":\"{level}\"}}]}}"
+            );
+            let path = write(tmp.path(), "ok.chain.json", &content);
+            assert!(
+                parse_chain_json(&path, AgentSource::User).is_ok(),
+                "`{level}` must remain requestable in a chain file"
+            );
+        }
     }
 
     #[test]

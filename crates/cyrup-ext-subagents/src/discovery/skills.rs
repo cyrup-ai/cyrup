@@ -311,7 +311,7 @@ fn escape_xml_text(value: &str) -> String {
 const DEFAULT_MIN_REFERENCES: i64 = 2;
 const DEFAULT_MAX_RECOMMENDATIONS: i64 = 3;
 const DEFAULT_PREFERRED_AGENT: &str = "reviewer";
-const FALLBACK_AGENT_ORDER: [&str; 3] = ["reviewer", "context-builder", "delegate"];
+const FALLBACK_AGENT_ORDER: [&str; 2] = ["reviewer", "delegate"];
 const MAX_RECOMMENDATION_CAP: i64 = 5;
 
 /// The `proactiveSkillSubagents` extension-config block (pi `ProactiveSkillSubagentsConfig`). Every

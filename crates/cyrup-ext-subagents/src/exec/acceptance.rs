@@ -444,11 +444,12 @@ impl AcceptanceContract {
         });
         Self {
             // `resolve_effective_acceptance` with no explicit input returns `inferred.level`
-            // verbatim, and `infer_level` only ever yields `attested`/`checked`/`reviewed` — the
-            // `Auto`/`None` arms below are unreachable and map to the nearest real level rather
-            // than reintroducing a silent no-op contract.
+            // verbatim, and `infer_level` only ever yields `attested`/`checked` (v0.43.0 removed
+            // the `reviewed` level; its risky branch now returns `checked` plus a required review
+            // gate, `acceptance.ts:114-120`) — the `Auto`/`None`/`Verified` arms below are
+            // unreachable and map to the nearest real level rather than reintroducing a silent
+            // no-op contract.
             required_level: match inferred.level {
-                model::AcceptanceLevel::Reviewed => AcceptanceStatus::Reviewed,
                 model::AcceptanceLevel::Verified => AcceptanceStatus::Verified,
                 model::AcceptanceLevel::Checked => AcceptanceStatus::Checked,
                 model::AcceptanceLevel::Attested
@@ -496,7 +497,7 @@ impl AcceptanceContract {
     /// (`acceptance.ts:286-289`); neither has an input here, because
     /// [`AcceptanceContract::heuristic_default`] classifies on agent name + task text alone. That
     /// still leaves the `reviewed` rung reachable — `inferLevel`'s risky branch also fires on task
-    /// WORDING (`release`/`migration`/`security`/…, `acceptance.ts:86`), which this signature does
+    /// WORDING (`release`/`migration`/`security`/…, `acceptance.ts:109`), which this signature does
     /// see — so what is missing is only the three boolean escalations and the review downgrade,
     /// both tracked separately from this function's own concern, which is strictly the combination
     /// rule.
@@ -563,8 +564,15 @@ impl AcceptanceContract {
             }
             AcceptanceStatus::Checked => model::AcceptanceLevel::Checked,
             AcceptanceStatus::Verified => model::AcceptanceLevel::Verified,
+            // v0.43.0 deleted the `reviewed` LEVEL (`types.ts:639`), so a lattice contract that
+            // requires an independent reviewer has no level of its own to project onto. Upstream
+            // expresses exactly that shape as `level: "checked"` plus `review.required` — which
+            // this contract already carries separately in `review` — so `Reviewed` projects to
+            // `Checked`, NOT to `Verified` (which would additionally demand `verify[]` commands
+            // this contract never declared and reject the run for their absence,
+            // `acceptance.ts:1281-1286`).
             AcceptanceStatus::Reviewed | AcceptanceStatus::Rejected => {
-                model::AcceptanceLevel::Reviewed
+                model::AcceptanceLevel::Checked
             }
         };
         model::ResolvedAcceptanceConfig {
@@ -585,7 +593,10 @@ impl AcceptanceContract {
 /// constructor's doc comment.
 fn clamp_requestable_level(level: AcceptanceStatus) -> AcceptanceStatus {
     match level {
-        AcceptanceStatus::Rejected => AcceptanceStatus::Reviewed,
+        // The highest level a POLICY can request at v0.43.0 is `verified` — `reviewed` is an
+        // achieved status only (`types.ts:639`, `acceptance.ts:54`), reachable from a real
+        // [`ReviewerResult`] via [`AcceptanceContract::with_reviewer_result`] and never by asking.
+        AcceptanceStatus::Rejected => AcceptanceStatus::Verified,
         other => other,
     }
 }
@@ -672,8 +683,10 @@ pub fn lower_acceptance_input(
             "attested" => Some(AcceptanceStatus::Attested),
             "checked" => Some(AcceptanceStatus::Checked),
             "verified" => Some(AcceptanceStatus::Verified),
-            "reviewed" => Some(AcceptanceStatus::Reviewed),
-            // "auto" (and anything `validate_acceptance_input` already let through) infers.
+            // `"reviewed"` is deliberately absent: it is not an `AcceptanceLevel` at v0.43.0 and
+            // `model::validate_acceptance_input` has already rejected it above with
+            // `EXPLICIT_REVIEWED_UNAVAILABLE`, so this arm can never be reached from the wire.
+            // `"auto"` (and anything `validate_acceptance_input` let through) infers.
             _ => None,
         }
     }
@@ -1113,11 +1126,102 @@ pub async fn run_verify_commands(
     commands: &[VerifyCommand],
     default_cwd: &Path,
 ) -> Vec<VerifyCommandResult> {
+    run_verify_commands_memoized(commands, default_cwd, None).await
+}
+
+/// G80 — [`run_verify_commands`] with upstream's per-workspace MEMOIZATION armed
+/// (`runMemoizedVerifyCommand`, `pi-subagents/src/runs/shared/acceptance.ts:1072-1132` @v0.43.0).
+///
+/// This is the live foreground gate's entry point: pi calls `evaluateAcceptance({ …, artifactsDir,
+/// runId })` for a single run (`runs/foreground/execution.ts:1696-1706`) and for every background
+/// step (`runs/background/subagent-runner.ts:1628-1640`), and those are the two call sites whose
+/// verify results are memoized. `memo: None` reproduces the un-memoized behavior exactly — no
+/// artifact is read, none is written, and every command executes — which is both the pre-G80
+/// behavior and what pi's chain group gate does (`chain-execution.ts:1037-1046` passes neither
+/// field).
+///
+/// A memo HIT replays the recorded `exit_code`/`status`/`output_tail`/`spawn_error` without
+/// spawning anything; the cache is keyed on the command's text, its resolved repo-relative cwd, its
+/// declared env key names, a hash of the whole effective environment, its timeout, its
+/// `allow_failure` flag, the repository `HEAD` and a hash of the full working-tree diff
+/// (`acceptance.ts:1091-1101`). Any edit anywhere in the tree therefore invalidates every memo,
+/// which is what makes replaying a `cargo test` result safe.
+///
+/// **[CYRUP-DELTA: mechanism]** this crate has two verify-result shapes (see
+/// [`model::MemoIdentity`]'s `resultShape` note); the artifact records which one it holds so the
+/// two can share pi's single `<artifactsDir>/acceptance/verify/<runId>/` directory without ever
+/// mis-reading each other's payload.
+pub async fn run_verify_commands_memoized(
+    commands: &[VerifyCommand],
+    default_cwd: &Path,
+    memo: Option<model::VerifyMemoContext<'_>>,
+) -> Vec<VerifyCommandResult> {
     let mut results = Vec::with_capacity(commands.len());
     for command in commands {
-        results.push(run_one_verify_command(command, default_cwd).await);
+        results.push(run_memoized_verify_command(command, default_cwd, memo).await);
     }
     results
+}
+
+/// The `resultShape` marker for a memo artifact holding a [`VerifyCommandResult`].
+const MEMO_SHAPE_VERIFY_COMMAND_RESULT: &str = "verify-command-result";
+
+/// [`run_one_verify_command`] behind the memo layer — `runMemoizedVerifyCommand`
+/// (`acceptance.ts:1072-1132`) over this crate's enum-lattice result shape.
+///
+/// Structurally identical to [`model::run_memoized_verify_command`]: no memo context or no git
+/// working tree means fall straight through to a real execution (`acceptance.ts:1085-1087`); a
+/// readable artifact whose `cacheKey` matches is replayed with `id`/`command` re-stamped from the
+/// CURRENT command (`acceptance.ts:1106`); a write failure is swallowed onto the returned result's
+/// diagnostics rather than failing the verification (`acceptance.ts:1127-1130`).
+async fn run_memoized_verify_command(
+    command: &VerifyCommand,
+    default_cwd: &Path,
+    memo: Option<model::VerifyMemoContext<'_>>,
+) -> VerifyCommandResult {
+    let Some(memo) = memo else {
+        return run_one_verify_command(command, default_cwd).await;
+    };
+    let cwd = match command.cwd.as_deref() {
+        Some(declared) => default_cwd.join(declared),
+        None => default_cwd.to_path_buf(),
+    };
+    let Some(workspace_state) = model::read_verify_workspace_state(&cwd).await else {
+        return run_one_verify_command(command, default_cwd).await;
+    };
+    let identity = model::MemoIdentity::derive(
+        command,
+        memo,
+        workspace_state,
+        MEMO_SHAPE_VERIFY_COMMAND_RESULT,
+    );
+
+    if let Some(cached) = identity.read_cached(MEMO_SHAPE_VERIFY_COMMAND_RESULT)
+        && let Ok(result) = serde_json::from_value::<VerifyCommandResult>(cached)
+    {
+        return VerifyCommandResult {
+            id: command.id.clone(),
+            command: command.command.clone(),
+            ..result
+        };
+    }
+
+    let result = run_one_verify_command(command, default_cwd).await;
+    let payload = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+    if let Err(message) =
+        identity.write_cached(command, MEMO_SHAPE_VERIFY_COMMAND_RESULT, &payload)
+    {
+        // Upstream's `artifactError` (`acceptance.ts:1128`) has no field to live on in this shape,
+        // and the verification's own verdict is already settled — a failed memo write can only
+        // cost a future re-run, never a wrong verdict. Traced rather than silently dropped so a
+        // permanently unwritable artifacts dir is diagnosable.
+        tracing::debug!(
+            artifact = %identity.artifact_path.display(),
+            error = %message,
+            "verify-command memo artifact could not be written; result not cached"
+        );
+    }
+    result
 }
 
 /// The single-command core [`run_verify_commands`] loops over, factored out so tests can execute a
@@ -1210,7 +1314,12 @@ async fn run_one_verify_command(
                 // (`acceptance.ts:775`).
                 status: failed_status,
                 output_tail: String::new(),
-                spawn_error: Some(format!("failed to spawn verify command: {err}")),
+                // G80: `redactVerifyEnv(error.message, command.env)` on upstream's own
+                // `child.on("error")` arm (`acceptance.ts:1204`).
+                spawn_error: Some(model::redact_verify_env(
+                    &format!("failed to spawn verify command: {err}"),
+                    command.env.as_ref(),
+                )),
             };
         }
     };
@@ -1304,7 +1413,12 @@ async fn run_one_verify_command(
                 } else {
                     failed_status
                 },
-                output_tail: tail_utf8_lossy(&combined, VERIFY_OUTPUT_TAIL_BYTES),
+                // G80: `trimOutput(redactVerifyEnv(stdout, command.env))`
+                // (`acceptance.ts:1194-1195`) — the captured stream is REDACTED before it is
+                // bounded, so a secret straddling the tail cut cannot leak its prefix. This tail
+                // is the "why did the gate reject" snippet a caller/UI shows, i.e. transcript
+                // material.
+                output_tail: redacted_output_tail(&combined, command.env.as_ref()),
                 spawn_error: None,
             }
         }
@@ -1315,9 +1429,29 @@ async fn run_one_verify_command(
             passed: false,
             status: failed_status,
             output_tail: String::new(),
-            spawn_error: Some(format!("failed to wait on verify command: {err}")),
+            spawn_error: Some(model::redact_verify_env(
+                &format!("failed to wait on verify command: {err}"),
+                command.env.as_ref(),
+            )),
         },
     }
+}
+
+/// G80 — decode a verify command's combined capture, redact every sensitive environment VALUE out
+/// of it ([`model::redact_verify_env`], upstream `acceptance.ts:989-994`), and only then keep the
+/// trailing [`VERIFY_OUTPUT_TAIL_BYTES`].
+///
+/// Order matters and is upstream's: redaction runs on the WHOLE decoded capture
+/// (`trimOutput(redactVerifyEnv(...))`, `acceptance.ts:1194`), never on the already-bounded tail —
+/// otherwise a secret split by the cut would have its surviving half pass through unmasked.
+#[must_use]
+fn redacted_output_tail(
+    combined: &[u8],
+    env: Option<&std::collections::BTreeMap<String, String>>,
+) -> String {
+    let decoded = String::from_utf8_lossy(combined);
+    let redacted = model::redact_verify_env(&decoded, env);
+    tail_utf8_lossy(redacted.as_bytes(), VERIFY_OUTPUT_TAIL_BYTES)
 }
 
 /// Read one of a child's piped streams to EOF on its own task, so neither stream can fill its
@@ -1495,6 +1629,15 @@ pub async fn evaluate_acceptance(
     final_output: Option<&str>,
     completion_guard: CompletionMutationGuardResult,
     verify_cwd: &Path,
+    // G80 — pi's `artifactsDir`/`runId` pair (`acceptance.ts:1226-1227`), threaded down to
+    // `runMemoizedVerifyCommand`. `None` (every caller with no artifacts root configured, and
+    // every test that does not exercise memoization) executes every verify[] command for real.
+    memo: Option<model::VerifyMemoContext<'_>>,
+    // G82 — pi's `fileOutput` (`acceptance.ts:1214-1220`): content the CHILD itself sent to its
+    // configured output file, taken from its own successful `write` tool calls rather than from
+    // disk, so a concurrent writer to the same path cannot be misattributed to it. `None` for a
+    // run with no configured output path, or one whose child never successfully wrote it.
+    file_output: Option<AcceptanceFileOutput<'_>>,
 ) -> AcceptanceLedger {
     if !gate.is_clean() {
         return AcceptanceLedger::not_required();
@@ -1503,8 +1646,14 @@ pub async fn evaluate_acceptance(
         return AcceptanceLedger::not_required();
     }
 
+    // G82 / pi `parseAcceptanceReportSources` (`acceptance.ts:753-771`): the acceptance report may
+    // live in the assistant's own output OR in the artifact the child wrote to its configured
+    // output path, and in `outputMode: "file-only"` the FILE is searched first. Resolved once here
+    // and used by every rung below that reads the report.
+    let report_source = select_acceptance_report_source(final_output, file_output.as_ref());
+
     // Step 2: self-report floor (Claimed / Attested).
-    let mut achieved = self_report_floor(final_output);
+    let mut achieved = self_report_floor(report_source);
 
     // Step 3: Checked — orchestrator-observed structural evidence.
     let mut detail: Vec<String> = Vec::new();
@@ -1524,7 +1673,7 @@ pub async fn evaluate_acceptance(
         // REAL `git status --short`. ANY failed runtime check rejects. Runs alongside — not instead
         // of — the completion-mutation guard above, which is this crate's own extra orchestrator-
         // observed signal (R-SA-034) and has no upstream counterpart on this rung.
-        let failures = declared_structural_failures(contract, final_output, verify_cwd).await;
+        let failures = declared_structural_failures(contract, report_source, verify_cwd).await;
         if !failures.is_empty() {
             detail.extend(failures);
             checked = false;
@@ -1540,7 +1689,8 @@ pub async fn evaluate_acceptance(
         if contract.verify.is_empty() {
             detail.push("verified: no verify[] commands were declared".to_string());
         } else {
-            verify_results = run_verify_commands(&contract.verify, verify_cwd).await;
+            verify_results =
+                run_verify_commands_memoized(&contract.verify, verify_cwd, memo).await;
             // `verifyRuns.some((run) => run.status === "failed" || run.status === "timed-out")`
             // (`acceptance.ts:842` @v0.34.0) — NOT `!every(passed)`, which would also reject a
             // command the author explicitly marked `allowFailure: true`.
@@ -1666,6 +1816,78 @@ async fn declared_structural_failures(
         .collect()
 }
 
+// ============================================================================================
+// G82: the child-authored output file as an acceptance-report source
+// (pi `parseAcceptanceReportSources`, `acceptance.ts:753-771`)
+// ============================================================================================
+
+/// G82 — pi's `fileOutput` input to `evaluateAcceptance` (`acceptance.ts:1214-1220`). Upstream's
+/// own doc on the field:
+///
+/// > Content the child sent to its configured output file (from its own write tool calls, not from
+/// > disk, so a concurrent writer to the same path cannot be misattributed). Searched for the
+/// > acceptance report; searched before the assistant output when `authoritative` (outputMode
+/// > "file-only").
+///
+/// Built by [`crate::exec::output::extract_child_written_output`], never by reading the path.
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptanceFileOutput<'a> {
+    /// The exact bytes the child's own successful `write` call sent to `path`.
+    pub content: &'a str,
+    /// The configured output path, quoted verbatim in the "(in configured output …)" parse-error
+    /// suffix upstream produces (`acceptance.ts:763`).
+    pub path: &'a Path,
+    /// `outputMode === "file-only"` — the file becomes the PRIMARY report source, searched before
+    /// the assistant output.
+    pub authoritative: bool,
+}
+
+/// G82 — source: `parseAcceptanceReportSources(output, fileOutput)` (`acceptance.ts:753-771`).
+///
+/// ```text
+/// const [primary, secondary] = fileOutput?.authoritative ? [fromFile, fromText] : [fromText, fromFile];
+/// const first = primary();
+/// // A malformed report in the primary source is a defect to surface, not a
+/// // miss to paper over with the secondary source; only a genuinely absent
+/// // report falls through.
+/// if (first.report || first.error !== ACCEPTANCE_REPORT_NOT_FOUND) return first;
+/// return secondary();
+/// ```
+///
+/// Ported as a choice of SOURCE TEXT rather than of parse result, because every rung of
+/// [`evaluate_acceptance`] re-reads the report from text ([`self_report_floor`]'s companion-key
+/// probe and [`declared_structural_failures`]'s full parse want the same source). The selection
+/// rule is identical: the primary source wins whenever it yields a report OR any parse error other
+/// than "not found"; only a genuinely absent report falls through to the secondary.
+fn select_acceptance_report_source<'a>(
+    output: Option<&'a str>,
+    file_output: Option<&AcceptanceFileOutput<'a>>,
+) -> Option<&'a str> {
+    /// `ACCEPTANCE_REPORT_NOT_FOUND` (`acceptance.ts:699`) — the one error that is a MISS rather
+    /// than a defect. Reuses the model port's own constant so the two selectors can never drift.
+    use model::ACCEPTANCE_REPORT_NOT_FOUND;
+
+    let from_text = output;
+    let from_file = file_output.map(|f| f.content);
+    let (primary, secondary) = if file_output.is_some_and(|f| f.authoritative) {
+        (from_file, from_text)
+    } else {
+        (from_text, from_file)
+    };
+    let primary_is_decisive = primary.is_some_and(|text| {
+        let parsed = model::parse_acceptance_report(text);
+        parsed.report.is_some() || parsed.error.as_deref() != Some(ACCEPTANCE_REPORT_NOT_FOUND)
+    });
+    if primary_is_decisive {
+        primary
+    } else {
+        // `return secondary()` — and when there is no secondary at all, its result is the same
+        // "not found" the primary already produced, so the primary text is kept for the (identical)
+        // downstream outcome rather than discarding the run's own output.
+        secondary.or(primary)
+    }
+}
+
 /// Step 2's self-report floor: `NotRequired` if no `final_output` or no acceptance-report-shaped
 /// block is present at all; `Claimed` if a block is present but carries no recognizable companion
 /// evidence field; `Attested` if it carries at least one of
@@ -1702,9 +1924,12 @@ fn extract_acceptance_report(text: &str) -> Option<ParsedAcceptanceReport> {
     if !looks_like_acceptance_report(text) {
         return None;
     }
+    // G79 gave every acceptance-report field a snake_case alias (`acceptance.ts:486-508`), so the
+    // companion-evidence probe has to accept both spellings or a child whose report the PARSER
+    // accepts in full is still scored as a bare `Claimed` here.
     let has_companion_evidence = crate::exec::output::ACCEPTANCE_REPORT_COMPANION_KEYS
         .iter()
-        .any(|key| text.contains(&format!("\"{key}\"")));
+        .any(|key| crate::exec::output::text_mentions_report_key(text, key));
     Some(ParsedAcceptanceReport {
         has_companion_evidence,
     })
@@ -1903,9 +2128,55 @@ mod tests {
         );
     }
 
-    /// The read-only AGENT branch of the same tree — `reviewer|scout|context-builder|researcher|
-    /// analyst` (`acceptance.ts:80`) — reached by agent name alone, with no read-only wording in
+    /// The read-only AGENT branch of the same tree — `reviewer|oracle|scout|researcher|analyst`
+    /// (`acceptance.ts:99` @ v0.43.0) — reached by agent name alone, with no read-only wording in
     /// the task.
+    /// CROSS-CUTTING (batch 9): G97 made `advisor` an ALIAS of `oracle`, G99 put `oracle` (and not
+    /// `advisor`) into the read-only-agent alternation (`acceptance.ts:99` @v0.43.0), and G83 put
+    /// `advisor` into `isReviewerStyleAgent` (`task-intent.ts:60`). Three groups, one outcome: the
+    /// acceptance contract a caller gets must not depend on WHICH spelling of the same agent it
+    /// used.
+    ///
+    /// This is load-bearing rather than cosmetic. `advisor` is absent from the alternation, so it
+    /// reaches the same verdict as `oracle` only because two independent mechanisms agree —
+    /// name canonicalization at dispatch, and G83's reviewer-style classifier. If either is
+    /// narrowed, an `advisor` call silently starts running a STRICTER gate than the identical
+    /// `oracle` call, and no other test in the crate compares the two.
+    ///
+    /// `seer` is the control: an unrelated name genuinely does diverge on a write-shaped task, which
+    /// proves this test is comparing something that can differ rather than asserting a constant.
+    #[test]
+    fn an_alias_infers_the_same_acceptance_contract_as_the_agent_it_names() {
+        const TASKS: &[&str] = &[
+            "Investigate the bug",
+            "Implement the fix",
+            "Update the parser and add a test",
+            "Say hello",
+        ];
+
+        for task in TASKS {
+            let via_alias = AcceptanceContract::heuristic_default("advisor", task);
+            let via_name = AcceptanceContract::heuristic_default("oracle", task);
+            assert_eq!(
+                via_alias.required_level, via_name.required_level,
+                "`advisor` is an alias of `oracle`; the inferred contract for {task:?} must not \
+                 depend on which spelling was used"
+            );
+        }
+
+        // Control: the invariance above is a real agreement between two agent names, not an
+        // artifact of every name inferring the same thing.
+        let unrelated =
+            AcceptanceContract::heuristic_default("seer", "Update the parser and add a test");
+        let oracle =
+            AcceptanceContract::heuristic_default("oracle", "Update the parser and add a test");
+        assert_ne!(
+            unrelated.required_level, oracle.required_level,
+            "a write-shaped task must infer a stricter contract for a non-reviewer-style agent, \
+             otherwise this test proves nothing"
+        );
+    }
+
     #[test]
     fn heuristic_default_attests_a_research_agent_on_neutral_task_wording() {
         let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
@@ -1950,9 +2221,12 @@ mod tests {
     }
 
     #[test]
+    /// The clamp target is `Verified`, not `Reviewed`: v0.43.0 removed `reviewed` from
+    /// `AcceptanceLevel` (`types.ts:639`), so the highest level a POLICY can request is `verified`
+    /// and `Reviewed` is reachable only from a real [`ReviewerResult`].
     fn explicit_contract_clamps_a_nonsensical_rejected_requested_level() {
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Rejected, vec![]);
-        assert_eq!(contract.required_level, AcceptanceStatus::Reviewed);
+        assert_eq!(contract.required_level, AcceptanceStatus::Verified);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2014,28 +2288,34 @@ mod tests {
         assert!(!effective.explicit, "an inferred contract never arms R-SA-033");
     }
 
-    /// `explicitAcceptanceCanDisable` (`acceptance.ts:134-136`) requires a non-blank `reason`, and
-    /// a bare `"none"` string carries none (`normalizeAcceptanceInput`, `:127-132`). So upstream
-    /// falls through to `LEVEL_RANK["none"] >= LEVEL_RANK[inferred]`, which is false for every
-    /// real level — the gate stays armed at the inferred level. Pre-fix, cyrup lowered `"none"`
-    /// onto an explicit `NotRequired` contract whose `is_no_op()` disabled the gate entirely.
+    /// `explicitAcceptanceCanDisable` (`acceptance.ts:167-169`) requires a non-blank `reason`, and
+    /// a bare `"none"` string carries none. v0.34.0 accepted the string and fell through to
+    /// `LEVEL_RANK["none"] >= LEVEL_RANK[inferred]`, leaving the gate armed at the inferred level;
+    /// v0.43.0 REFUSES it outright at validation (`acceptance.ts:183`) and says how to write it
+    /// properly. Either way the one thing a reasonless `"none"` must never do is disarm the gate —
+    /// which is exactly what cyrup did before this pair of fixes — so both halves are asserted:
+    /// the string is rejected, and the object form that IS accepted still needs its reason.
     #[test]
     fn a_bare_none_string_cannot_disable_the_gate() {
-        let lowered = lower_acceptance_input(&serde_json::json!("none"))
-            .expect("'none' is a valid level")
-            .expect("a bare level string yields a contract");
-        assert!(
-            !lowered.disables_gate,
-            "a reasonless 'none' fails explicitAcceptanceCanDisable"
+        let err = lower_acceptance_input(&serde_json::json!("none"))
+            .expect_err("a reasonless bare 'none' is rejected at v0.43.0");
+        assert_eq!(
+            err,
+            "acceptance level \"none\" requires a reason; use { level: \"none\", reason: \"...\" }."
         );
 
-        let effective =
-            AcceptanceContract::resolve_effective(Some(lowered), "worker", "Implement the fix");
-        assert_eq!(
-            effective.required_level,
-            AcceptanceStatus::Checked,
-            "the inferred floor survives a reasonless 'none'"
+        // The object form with no reason is likewise refused, so there is no spelling of a
+        // reasonless `none` that reaches the contract at all.
+        let object_err = lower_acceptance_input(&serde_json::json!({"level": "none"}))
+            .expect_err("`{ level: \"none\" }` with no reason is rejected");
+        assert!(
+            object_err.contains("acceptance.reason is required when level is none."),
+            "{object_err}"
         );
+
+        // And a run with no acceptance param at all still gets the inferred gate, unchanged.
+        let effective = AcceptanceContract::resolve_effective(None, "worker", "Implement the fix");
+        assert_eq!(effective.required_level, AcceptanceStatus::Checked);
         assert!(!effective.is_no_op(), "the gate must still be evaluated");
     }
 
@@ -2572,6 +2852,8 @@ mod tests {
             Some("Done.\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```"),
             no_guard_trigger(),
             dir.path(),
+            None,
+            None,
         )
         .await;
 
@@ -2625,6 +2907,8 @@ mod tests {
             Some("I fixed the bug.\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```"),
             no_guard_trigger(),
             dir.path(),
+            None,
+            None,
         )
         .await;
 
@@ -2656,6 +2940,8 @@ mod tests {
             ),
             no_guard_trigger(),
             dir.path(),
+            None,
+            None,
         )
         .await;
 
@@ -2682,6 +2968,8 @@ mod tests {
             ),
             no_guard_trigger(),
             dir.path(),
+            None,
+            None,
         )
         .await;
 
@@ -2698,7 +2986,7 @@ mod tests {
             vec![vc("exit 0"), vc("exit 1"), vc("exit 0")],
         );
         let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path())
+            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
                 .await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
         assert_eq!(ledger.verify_results.len(), 3);
@@ -2716,7 +3004,7 @@ mod tests {
             timed_out: false,
         };
         let ledger =
-            evaluate_acceptance(&contract, dirty_gate, None, no_guard_trigger(), dir.path()).await;
+            evaluate_acceptance(&contract, dirty_gate, None, no_guard_trigger(), dir.path(), None, None).await;
         assert_eq!(ledger.status, AcceptanceStatus::NotRequired);
         assert!(ledger.verify_results.is_empty(), "must not even run verify[] on a non-clean gate");
     }
@@ -2726,7 +3014,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
         let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path())
+            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
                 .await;
         assert_eq!(ledger.status, AcceptanceStatus::Checked);
     }
@@ -2741,7 +3029,7 @@ mod tests {
             triggered: true,
         };
         let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, triggered, dir.path()).await;
+            evaluate_acceptance(&contract, clean_gate(), None, triggered, dir.path(), None, None).await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
     }
 
@@ -2755,7 +3043,7 @@ mod tests {
             });
         assert_eq!(contract.required_level, AcceptanceStatus::Reviewed);
         let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path())
+            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
                 .await;
         assert_eq!(ledger.status, AcceptanceStatus::Reviewed);
     }
@@ -2766,7 +3054,7 @@ mod tests {
         let mut contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
         contract.required_level = AcceptanceStatus::Reviewed; // demand Reviewed but attach no result
         let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path())
+            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
                 .await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
     }
@@ -2780,10 +3068,238 @@ mod tests {
                 detail: Some("needs more work".to_string()),
             });
         let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path())
+            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
                 .await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
         assert!(ledger.detail.expect("detail").contains("needs more work"));
+    }
+
+    /// G79 on the LIVE gate: `run_sync` calls THIS `evaluate_acceptance`, whose `Checked` rung
+    /// parses the child's report through `model::parse_acceptance_report`. A child that answered in
+    /// snake_case, wrote `Done` instead of `satisfied`, sent a lone object where an array belongs
+    /// and a bare string where a `string[]` belongs used to fail every declared criterion and every
+    /// declared evidence kind — a rejected run for a purely cosmetic mismatch. After G79 the same
+    /// answer passes, and the criterion id matches across `c 1` / `C_1` spellings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_gate_accepts_an_aliased_child_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]).with_policy(
+            model::normalize_criteria(
+                &[model::CriterionInput::Gate(model::AcceptanceGate {
+                    id: Some("C 1".to_string()),
+                    must: Some("add a regression test".to_string()),
+                    evidence: None,
+                    severity: None,
+                })],
+                &[],
+            ),
+            vec![
+                model::AcceptanceEvidenceKind::ChangedFiles,
+                model::AcceptanceEvidenceKind::TestsAdded,
+                model::AcceptanceEvidenceKind::CommandsRun,
+                model::AcceptanceEvidenceKind::ManualNotes,
+            ],
+            None,
+            Vec::new(),
+        );
+        let output = r#"done
+```acceptance_report
+{
+  "criteria_satisfied": {"id": "c_1", "status": "Done", "evidence": "added tests/regression.rs"},
+  "changed_files": "src/file.rs",
+  "tests_added_or_updated": ["tests/regression.rs"],
+  "commands_run": {"command": "cargo test", "result": "OK", "summary": "green"},
+  "manual_notes": "nothing else"
+}
+```"#;
+        let ledger = evaluate_acceptance(
+            &contract,
+            clean_gate(),
+            Some(output),
+            no_guard_trigger(),
+            dir.path(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            ledger.status,
+            AcceptanceStatus::Checked,
+            "aliased report must satisfy the gate; detail was {:?}",
+            ledger.detail
+        );
+        assert_eq!(ledger.detail, None);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // G78 — `reviewed` is not a requestable level, on the LIVE wire-lowering path every
+    // execution surface shares (`lower_acceptance_input` -> `model::validate_acceptance_input`).
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn lowering_rejects_reviewed_as_a_requestable_level_in_both_wire_forms() {
+        let bare = lower_acceptance_input(&serde_json::json!("reviewed"))
+            .expect_err("a bare `reviewed` level is rejected at v0.43.0");
+        assert_eq!(
+            bare,
+            format!("acceptance {}", model::EXPLICIT_REVIEWED_UNAVAILABLE)
+        );
+        // The message must point the caller at the replacement mechanism, not merely refuse.
+        assert!(bare.contains("acceptance.review.required"));
+
+        let object = lower_acceptance_input(&serde_json::json!({"level": "reviewed"}))
+            .expect_err("an object-form `reviewed` level is rejected at v0.43.0");
+        assert_eq!(
+            object,
+            format!("acceptance.level {}", model::EXPLICIT_REVIEWED_UNAVAILABLE)
+        );
+    }
+
+    /// The advertise-vs-dispatch invariant: upstream v0.43.0 deliberately KEEPS `"reviewed"` in the
+    /// advertised `AcceptanceOverride` enum (`schemas.ts:83-88`, marked `deprecated`) precisely so
+    /// this preflight message can explain itself. A schema that stopped advertising it would leave
+    /// the model guessing; a dispatch that accepted it would reinstate the deleted level.
+    #[test]
+    fn reviewed_is_still_advertised_so_the_rejection_can_explain_itself() {
+        let rendered = crate::extension::sj_acceptance_override().to_string();
+        assert!(
+            rendered.contains("\"reviewed\""),
+            "the acceptance enum must still advertise `reviewed` so preflight can explain it"
+        );
+        assert!(lower_acceptance_input(&serde_json::json!("reviewed")).is_err());
+    }
+
+    /// The advertise-vs-dispatch invariant, driven over the SCHEMA rather than a hand-written list:
+    /// every string value `sj_acceptance_override` offers the model must be one `lower_acceptance_input`
+    /// actually accepts — with exactly one upstream-sanctioned exception, `"reviewed"`, which is
+    /// advertised in its own `deprecated` branch solely so the refusal can explain itself
+    /// (`schemas.ts:83-88` @v0.43.0).
+    ///
+    /// G78 narrowed the dispatch (bare `"none"` and `"verified"` became hard errors,
+    /// `acceptance.ts:183-184`) without narrowing the schema, so the tool advertised two values it
+    /// would then refuse. Upstream narrowed both together: `schemas.ts:82` is exactly
+    /// `["auto", "attested", "checked"]`.
+    #[test]
+    fn every_advertised_acceptance_level_is_one_the_dispatch_accepts() {
+        let schema = crate::extension::sj_acceptance_override();
+        let branches = schema
+            .get("anyOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("AcceptanceOverride is an anyOf");
+
+        let mut advertised: Vec<String> = Vec::new();
+        for branch in branches {
+            if branch.get("type").and_then(serde_json::Value::as_str) != Some("string") {
+                continue;
+            }
+            let deprecated = branch
+                .get("deprecated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            for value in branch
+                .get("enum")
+                .and_then(serde_json::Value::as_array)
+                .expect("a string branch carries an enum")
+            {
+                let value = value.as_str().expect("enum entries are strings");
+                if deprecated {
+                    // The sanctioned exception: advertised, refused, and the refusal EXPLAINS.
+                    let err = lower_acceptance_input(&serde_json::json!(value)).expect_err(
+                        "a deprecated advertised level must still be refused by the dispatch",
+                    );
+                    assert!(
+                        err.contains(model::EXPLICIT_REVIEWED_UNAVAILABLE),
+                        "the deprecated `{value}` must be refused with the explanatory text, got {err}"
+                    );
+                } else {
+                    advertised.push(value.to_string());
+                }
+            }
+        }
+
+        assert_eq!(
+            advertised,
+            ["auto", "attested", "checked"],
+            "schemas.ts:82 advertises exactly these three requestable levels"
+        );
+        for level in &advertised {
+            assert!(
+                lower_acceptance_input(&serde_json::json!(level)).is_ok(),
+                "`{level}` is advertised to the model, so the dispatch must accept it"
+            );
+        }
+
+        // And the two G78 newly-invalidated values must be gone from the advertised surface
+        // entirely — not merely absent from the requestable branch.
+        let rendered = schema.to_string();
+        for gone in ["\"none\"", "\"verified\""] {
+            assert!(
+                !rendered.contains(gone),
+                "{gone} is rejected by lower_acceptance_input and must not be advertised: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_none_and_verified_level_strings_are_rejected() {
+        // `AcceptanceInput = Exclude<AcceptanceLevel, "none" | "verified"> | …` (`types.ts:684-685`).
+        let none = lower_acceptance_input(&serde_json::json!("none"))
+            .expect_err("a bare `none` carries no reason and is rejected");
+        assert!(none.contains("requires a reason"), "{none}");
+        let verified = lower_acceptance_input(&serde_json::json!("verified"))
+            .expect_err("a bare `verified` declares no runtime command and is rejected");
+        assert!(
+            verified.contains("requires object form with at least one runtime verify command"),
+            "{verified}"
+        );
+        // The three still-requestable bare levels keep working.
+        for level in ["auto", "attested", "checked"] {
+            assert!(
+                lower_acceptance_input(&serde_json::json!(level)).is_ok(),
+                "`{level}` must remain requestable"
+            );
+        }
+    }
+
+    #[test]
+    fn object_form_verified_without_runtime_commands_is_rejected() {
+        let err = lower_acceptance_input(&serde_json::json!({"level": "verified"}))
+            .expect_err("`verified` with no verify[] is rejected");
+        assert!(
+            err.contains("must contain at least one runtime command when level is verified"),
+            "{err}"
+        );
+        let err = lower_acceptance_input(&serde_json::json!({"level": "verified", "verify": []}))
+            .expect_err("`verified` with an EMPTY verify[] is rejected too");
+        assert!(err.contains("at least one runtime command"), "{err}");
+        // A real command is accepted, and the per-command validation still runs alongside.
+        let ok = lower_acceptance_input(&serde_json::json!({
+            "level": "verified",
+            "verify": [{"id": "gate", "command": "true"}],
+        }))
+        .expect("a verified policy with one command is valid")
+        .expect("an explicit contract");
+        assert_eq!(ok.required_level, AcceptanceStatus::Verified);
+        let bad_item = lower_acceptance_input(&serde_json::json!({
+            "level": "verified",
+            "verify": [{"command": "true"}],
+        }))
+        .expect_err("a verify[] entry with no id is still rejected");
+        assert!(bad_item.contains("verify[0].id is required."), "{bad_item}");
+    }
+
+    /// Inference tops out at `Checked` now that `reviewed` is not a level — the escalation lives on
+    /// the contract's `review` gate instead. A risky/write task must therefore still arm a REAL
+    /// gate, not silently drop to a weaker one.
+    #[test]
+    fn heuristic_inference_tops_out_at_checked_with_a_required_review_gate() {
+        let contract = AcceptanceContract::heuristic_default("worker", "Prepare the security release");
+        assert_eq!(contract.required_level, AcceptanceStatus::Checked);
+        assert!(matches!(
+            &contract.review,
+            Some(model::ReviewSetting::Gate(gate)) if gate.required == Some(true)
+                && gate.agent.as_deref() == Some("reviewer")
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2921,6 +3437,82 @@ mod tests {
                 .contains("acceptance criteria were not met")
         );
     }
+
+    // --------------------------------------------------------------------------------------
+    // G82: `parseAcceptanceReportSources` (`acceptance.ts:753-772`), enum-lattice side
+    // --------------------------------------------------------------------------------------
+
+    /// The lattice-side [`select_acceptance_report_source`] has its own copy of upstream's
+    /// primary/secondary rule and — unlike `model::parse_acceptance_report_sources` — had no unit
+    /// test of it. The live `file-only` integration test cannot supply one: in that mode the run's
+    /// `final_output` is absent by the time the gate runs, so the secondary source is `None` and
+    /// BOTH the `authoritative` ordering and the primary-is-decisive rule collapse to the same
+    /// answer no matter which way they are written.
+    #[test]
+    fn the_authoritative_file_is_searched_first_and_a_primary_defect_is_never_papered_over() {
+        let file_report =
+            "artifact\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-file\"}\n```";
+        let text_report =
+            "receipt\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-text\"}\n```";
+        let path = Path::new("out.md");
+
+        // Not authoritative: the assistant output is primary. It has no report, so the file — the
+        // secondary — supplies it.
+        assert_eq!(
+            select_acceptance_report_source(
+                Some("no report here"),
+                Some(&AcceptanceFileOutput {
+                    content: file_report,
+                    path,
+                    authoritative: false,
+                }),
+            ),
+            Some(file_report)
+        );
+
+        // Not authoritative, and BOTH carry a report: the assistant output wins.
+        assert_eq!(
+            select_acceptance_report_source(
+                Some(text_report),
+                Some(&AcceptanceFileOutput {
+                    content: file_report,
+                    path,
+                    authoritative: false,
+                }),
+            ),
+            Some(text_report)
+        );
+
+        // `outputMode: "file-only"` makes the file authoritative: it is searched FIRST and wins
+        // even though the assistant output also carries a report.
+        assert_eq!(
+            select_acceptance_report_source(
+                Some(text_report),
+                Some(&AcceptanceFileOutput {
+                    content: file_report,
+                    path,
+                    authoritative: true,
+                }),
+            ),
+            Some(file_report)
+        );
+
+        // A MALFORMED report in the primary source is a defect to surface, not a miss to paper
+        // over with the secondary — only a genuinely absent report falls through.
+        let malformed = "receipt\n```acceptance-report\n{\"criteriaSatisfied\": [{\"id\": \"c1\"}]}\n```";
+        assert_eq!(
+            select_acceptance_report_source(
+                Some(malformed),
+                Some(&AcceptanceFileOutput {
+                    content: file_report,
+                    path,
+                    authoritative: false,
+                }),
+            ),
+            Some(malformed),
+            "a defective primary must not be replaced by the secondary"
+        );
+    }
 }
 
 // ================================================================================================
@@ -2948,9 +3540,19 @@ pub mod model {
     // Enums (types.ts:248-373)
     // --------------------------------------------------------------------------------------------
 
-    /// `AcceptanceLevel` (types.ts:248) — `auto` is the "infer" sentinel; every other variant is a
-    /// concrete provenance level. Ordering rank is `none < attested < checked < verified < reviewed`
-    /// ([`level_rank`]); `Auto` has no rank.
+    /// `AcceptanceLevel` (`types.ts:639` @v0.43.0:
+    /// `"auto" | "none" | "attested" | "checked" | "verified"`) — `auto` is the "infer" sentinel;
+    /// every other variant is a concrete provenance level. Ordering rank is
+    /// `none < attested < checked < verified` ([`level_rank`]); `Auto` has no rank.
+    ///
+    /// **`reviewed` is NOT a level.** Up to v0.34.0 the union carried a sixth member `"reviewed"`;
+    /// v0.43.0 removed it, because `reviewed` is an ACHIEVED ledger status (something an
+    /// independent reviewer produces) and never a requestable acceptance level. A policy that wants
+    /// independent review declares `acceptance.review.required` instead, and
+    /// `validateAcceptanceInput` now rejects the string `"reviewed"` outright with
+    /// [`EXPLICIT_REVIEWED_UNAVAILABLE`] (`acceptance.ts:54,181,195-196`). The achieved status still
+    /// exists — see [`AcceptanceLedgerStatus::Reviewed`], which is deliberately NOT an
+    /// [`AcceptanceEvidenceStatus`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
     pub enum AcceptanceLevel {
@@ -2959,7 +3561,6 @@ pub mod model {
         Attested,
         Checked,
         Verified,
-        Reviewed,
     }
 
     impl AcceptanceLevel {
@@ -2971,12 +3572,11 @@ pub mod model {
                 AcceptanceLevel::Attested => "attested",
                 AcceptanceLevel::Checked => "checked",
                 AcceptanceLevel::Verified => "verified",
-                AcceptanceLevel::Reviewed => "reviewed",
             }
         }
     }
 
-    /// `LEVEL_RANK` (acceptance.ts:22-28) — `None` for `Auto` (unranked).
+    /// `LEVEL_RANK` (acceptance.ts:28-33 @v0.43.0) — `None` for `Auto` (unranked).
     fn level_rank(level: AcceptanceLevel) -> Option<u8> {
         match level {
             AcceptanceLevel::Auto => Option::None,
@@ -2984,7 +3584,6 @@ pub mod model {
             AcceptanceLevel::Attested => Some(1),
             AcceptanceLevel::Checked => Some(2),
             AcceptanceLevel::Verified => Some(3),
-            AcceptanceLevel::Reviewed => Some(4),
         }
     }
 
@@ -3295,7 +3894,13 @@ pub mod model {
         AllowedFailure,
     }
 
-    /// `AcceptanceVerifyResult` (types.ts:344-353).
+    /// `AcceptanceVerifyResult` (`shared/types.ts:736-758` @v0.43.0).
+    ///
+    /// The trailing seven fields are the memoization EVIDENCE upstream stamps onto every result
+    /// that went through [`run_memoized_verify_command`] (`acceptance.ts:1106,1112,1128-1129`).
+    /// They are all `Option` and all `skip_serializing_if`-omitted, exactly like upstream's `?:`
+    /// members, so a result produced without a memo context serializes byte-for-byte as it did
+    /// before this port.
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct AcceptanceVerifyResult {
@@ -3310,14 +3915,76 @@ pub mod model {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub stderr: Option<String>,
         pub duration_ms: u128,
+        /// `artifactPath` (`types.ts:745`) — where this run's memo artifact was read from/written
+        /// to. Cleared (`delete evidenced.artifactPath`, `acceptance.ts:1129`) when the write
+        /// itself failed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub artifact_path: Option<String>,
+        /// `cacheKey` (`types.ts:746`) — the sha256 over the memo identity (command text, repo-
+        /// relative cwd, declared env key names, full effective-env hash, timeout, `allowFailure`,
+        /// `HEAD`, working-tree diff hash).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cache_key: Option<String>,
+        /// `memoized` (`types.ts:747`) — `Some(true)` when this result was REPLAYED from the memo
+        /// artifact instead of executed, `Some(false)` when it was executed under an active memo
+        /// context, `None` when no memo context applied at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub memoized: Option<bool>,
+        /// `envKeys` (`types.ts:748`) — the sorted key names of the command's OWN declared `env`
+        /// (`Object.keys(command.env ?? {}).sort()`, `acceptance.ts:1088`). Names only; no values,
+        /// so a secret-bearing override never reaches the ledger.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub env_keys: Option<Vec<String>>,
+        /// `envHash` (`types.ts:749`) — sha256 over the whole EFFECTIVE environment
+        /// (`acceptance.ts:1089`), so a changed secret invalidates the memo without the value ever
+        /// being written down.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub env_hash: Option<String>,
+        /// `workspaceState` (`types.ts:750-756`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub workspace_state: Option<VerifyWorkspaceState>,
+        /// `artifactError` (`types.ts:757`) — set when the memo artifact could not be written
+        /// (`acceptance.ts:1128`). Never fails the verification itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub artifact_error: Option<String>,
     }
 
+    /// `VerifyWorkspaceState.kind` (`acceptance.ts:1039`) — the single discriminant upstream
+    /// declares. A workspace that is not a git checkout produces no state at all (and therefore no
+    /// memoization), rather than a second variant.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum VerifyWorkspaceKind {
+        GitTracked,
+    }
+
+    /// `VerifyWorkspaceState` (`acceptance.ts:1038-1044`): the identity of the working tree a
+    /// verify command's result is memoized AGAINST. `head` + `diff_hash` together pin both the
+    /// committed and the uncommitted state, so any edit to the tree invalidates every memo.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VerifyWorkspaceState {
+        pub kind: VerifyWorkspaceKind,
+        pub repo_root: String,
+        pub cwd_relative: String,
+        pub head: String,
+        pub diff_hash: String,
+    }
+
+    /// `AcceptanceReviewResult["status"]` (`types.ts:756` @v0.43.0:
+    /// `"review-required" | "reviewed" | "blockers"`).
+    ///
+    /// v0.34.0 spelled this `"no-blockers" | "blockers" | "needs-parent-decision"`. v0.43.0 renamed
+    /// both non-`blockers` members so the review outcome shares the LEDGER's own vocabulary: a
+    /// reviewer that signed off yields `reviewed` (which is exactly the ledger status the run then
+    /// takes) and an absent/incomplete review yields `review-required` (likewise). See
+    /// [`evaluate_acceptance`]'s review block, `acceptance.ts:1318-1336`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
     pub enum ReviewResultStatus {
-        NoBlockers,
+        ReviewRequired,
+        Reviewed,
         Blockers,
-        NeedsParentDecision,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3343,25 +4010,69 @@ pub mod model {
         pub findings: Vec<ReviewFinding>,
     }
 
-    /// `AcceptanceLedgerStatus` (types.ts:365-373).
+    /// `AcceptanceEvidenceStatus` (`types.ts:770-777` @v0.43.0) — the strictly EVIDENCE-derived
+    /// half of the ledger's status: how far the child's own report plus the orchestrator's own
+    /// structural/verify checks carried this run, with review deliberately excluded.
+    ///
+    /// v0.43.0 split this out of `AcceptanceLedgerStatus` so a run whose evidence genuinely reached
+    /// `verified` still reads as `verified` on `evidenceStatus` even while `status` sits at
+    /// `review-required` waiting for an independent reviewer. Before the split there was one field,
+    /// so "the review has not happened yet" ERASED the evidence level that had already been earned.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
-    pub enum AcceptanceLedgerStatus {
+    pub enum AcceptanceEvidenceStatus {
+        Pending,
         NotRequired,
         Claimed,
         Attested,
         Checked,
         Verified,
-        Reviewed,
-        Accepted,
         Rejected,
     }
 
-    /// `AcceptanceLedger` (types.ts:375-385, subset actually populated by `evaluateAcceptance`).
+    /// `AcceptanceLedgerStatus` (`types.ts:779-783` @v0.43.0) —
+    /// `AcceptanceEvidenceStatus | "review-required" | "reviewed" | "accepted"`. Rust has no union
+    /// type, so the evidence members are restated here and [`AcceptanceEvidenceStatus`] converts
+    /// into this enum via [`From`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum AcceptanceLedgerStatus {
+        Pending,
+        NotRequired,
+        Claimed,
+        Attested,
+        Checked,
+        Verified,
+        Rejected,
+        ReviewRequired,
+        Reviewed,
+        Accepted,
+    }
+
+    impl From<AcceptanceEvidenceStatus> for AcceptanceLedgerStatus {
+        fn from(status: AcceptanceEvidenceStatus) -> Self {
+            match status {
+                AcceptanceEvidenceStatus::Pending => AcceptanceLedgerStatus::Pending,
+                AcceptanceEvidenceStatus::NotRequired => AcceptanceLedgerStatus::NotRequired,
+                AcceptanceEvidenceStatus::Claimed => AcceptanceLedgerStatus::Claimed,
+                AcceptanceEvidenceStatus::Attested => AcceptanceLedgerStatus::Attested,
+                AcceptanceEvidenceStatus::Checked => AcceptanceLedgerStatus::Checked,
+                AcceptanceEvidenceStatus::Verified => AcceptanceLedgerStatus::Verified,
+                AcceptanceEvidenceStatus::Rejected => AcceptanceLedgerStatus::Rejected,
+            }
+        }
+    }
+
+    /// `AcceptanceLedger` (`types.ts:785-800` @v0.43.0, subset actually populated by
+    /// `evaluateAcceptance`).
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct AcceptanceLedger {
         pub status: AcceptanceLedgerStatus,
+        /// `evidenceStatus` (`types.ts:787`) — moves in lockstep with `status` through the
+        /// attestation/checked/verified rungs and is then FROZEN: `evaluateAcceptance`'s review
+        /// block (`acceptance.ts:1318-1336`) rewrites only `status`, never this field.
+        pub evidence_status: AcceptanceEvidenceStatus,
         pub explicit: bool,
         pub inferred_reason: Vec<String>,
         pub criteria: Vec<SerializableGate>,
@@ -3412,7 +4123,7 @@ pub mod model {
             AcceptanceLevel::Checked => {
                 vec![ChangedFiles, TestsAdded, CommandsRun, ResidualRisks, NoStagedFiles]
             }
-            AcceptanceLevel::Verified | AcceptanceLevel::Reviewed => vec![
+            AcceptanceLevel::Verified => vec![
                 ChangedFiles,
                 TestsAdded,
                 CommandsRun,
@@ -3460,36 +4171,63 @@ pub mod model {
         let task = input.task.as_deref().unwrap_or("").to_lowercase();
         let mut reasons: Vec<String> = Vec::new();
 
-        // /\b(?:reviewer|scout|context-builder|researcher|analyst)\b/
+        // `/\b(?:reviewer|oracle|scout|researcher|analyst)\b/` (`acceptance.ts:99` @ v0.43.0).
+        //
+        // Both edits to this alternation are VERSION LAG, not a port bug. At the ported baseline it
+        // read `reviewer|scout|context-builder|researcher|analyst` (`acceptance.ts:80` @ v0.34.0),
+        // which is exactly what this port originally carried — correctly. Upstream `83b9872`
+        // ("fix: remove stale bundled roles") then dropped `context-builder` and added `oracle` in
+        // the SAME edit; `git log -S` over this alternation returns that one commit and no other.
+        // Both halves are applied together here for the same reason they were made together.
         let read_only_agent = any_word_boundary(
             &agent,
-            &["reviewer", "scout", "context-builder", "researcher", "analyst"],
+            &["reviewer", "oracle", "scout", "researcher", "analyst"],
         );
-        // /\b(?:read[- ]only|review[- ]only|do not edit|don't edit|no edits|without edits|inspect|summari[sz]e)\b/
-        let read_only_task = any_word_boundary(
-            &task,
-            &[
-                "read only",
-                "read-only",
-                "review only",
-                "review-only",
-                "do not edit",
-                "don't edit",
-                "no edits",
-                "without edits",
-                "inspect",
-                "summarise",
-                "summarize",
-            ],
+        // G83 — `const intent = classifyTaskMutationIntent(input.acceptanceRole ? "worker" :
+        // input.agentName, input.task ?? "")` (`acceptance.ts:90`). This crate has no
+        // `acceptanceRole` input, which is exactly upstream's `acceptanceRole === undefined`
+        // branch, so the agent name is passed straight through.
+        let intent = crate::exec::task_intent::classify_task_mutation_intent(
+            &input.agent_name,
+            input.task.as_deref().unwrap_or(""),
         );
-        // /\b(?:fix|implement|update|write|edit|modify|migrate|release|security|delete|remove|refactor|commit)\b/ || /\bworker\b/
-        let write_task = any_word_boundary(
-            &task,
-            &[
-                "fix", "implement", "update", "write", "edit", "modify", "migrate", "release",
-                "security", "delete", "remove", "refactor", "commit",
-            ],
-        ) || word_boundary_contains(&agent, "worker");
+        // `const readOnlyTask = intent.kind === "read-only" || (intent.kind === "unknown" &&
+        // /\b(?:read[- ]only|review[- ]only|no edits|without edits|inspect|summari[sz]e)\b/.test(task))`
+        // (`acceptance.ts:91-92`). The keyword probe is a FALLBACK for `unknown` only, and its
+        // `do not edit`/`don't edit` entries moved into the classifier — a bare keyword scan
+        // cannot tell `Do not edit files.` (blanket, read-only) from `Do not edit unrelated files;
+        // implement the fix.` (scoped constraint on an implementation task), and used to call both
+        // read-only.
+        let read_only_task = intent == crate::exec::task_intent::TaskMutationIntent::ReadOnly
+            || (intent == crate::exec::task_intent::TaskMutationIntent::Unknown
+                && any_word_boundary(
+                    &task,
+                    &[
+                        "read only",
+                        "read-only",
+                        "review only",
+                        "review-only",
+                        "no edits",
+                        "without edits",
+                        "inspect",
+                        "summarise",
+                        "summarize",
+                    ],
+                ));
+        // `const taskMayWrite = readOnlyTask ? false : taskMayMutate(input.task ?? "") ||
+        // intent.kind === "implementation" || rolePatchTask` (`acceptance.ts:97`), with
+        // `rolePatchTask === false` because no acceptance role is declared (`:93-96`).
+        let task_may_write = !read_only_task
+            && (crate::exec::task_intent::task_may_mutate(input.task.as_deref().unwrap_or(""))
+                || intent == crate::exec::task_intent::TaskMutationIntent::Implementation);
+        // `const writeTask = taskMayWrite || (input.acceptanceRole === "writer" && !readOnlyTask)
+        // || (input.acceptanceRole === undefined && /\bworker\b/.test(agent) && !readOnlyTask)`
+        // (`acceptance.ts:100-102`).
+        let write_task =
+            task_may_write || (word_boundary_contains(&agent, "worker") && !read_only_task);
+        // `const keywordRiskReadOnly = input.acceptanceRole === undefined ? intent.kind ===
+        // "read-only" : inferredReadOnly` (`acceptance.ts:105`).
+        let keyword_risk_read_only = intent == crate::exec::task_intent::TaskMutationIntent::ReadOnly;
         // /\b(?:release|migration|migrate|security|data[- ]loss|destructive|post-review|fix pass)\b/
         let risky_task = any_word_boundary(
             &task,
@@ -3505,7 +4243,14 @@ pub mod model {
                 "fix pass",
             ],
         );
-        let risky = (input.is_async && write_task) || input.dynamic || input.dynamic_group || risky_task;
+        // `const risky = Boolean(input.async && writeTask) || (Boolean(input.dynamic) &&
+        // !roleResolvesReadOnly) || (Boolean(input.dynamicGroup) && !roleResolvesReadOnly) ||
+        // (!keywordRiskReadOnly && /…/.test(task))` (`acceptance.ts:106-109`);
+        // `roleResolvesReadOnly` is `false` with no acceptance role declared (`:102`).
+        let risky = (input.is_async && write_task)
+            || input.dynamic
+            || input.dynamic_group
+            || (!keyword_risk_read_only && risky_task);
 
         if risky {
             reasons.push(
@@ -3519,8 +4264,12 @@ pub mod model {
             if input.dynamic || input.dynamic_group {
                 reasons.push("dynamic fanout context".to_string());
             }
+            // `acceptance.ts:114-120` @v0.43.0 — the risky branch returns `level: "checked"` plus a
+            // REQUIRED review gate. Up to v0.34.0 it returned `level: "reviewed"`; v0.43.0 deleted
+            // that level entirely (see [`AcceptanceLevel`]), so the "an independent reviewer must
+            // sign this off" half of the escalation now lives ONLY in `review`, never in `level`.
             return InferredLevel {
-                level: AcceptanceLevel::Reviewed,
+                level: AcceptanceLevel::Checked,
                 reasons,
                 criteria: vec![
                     CriterionInput::Text(
@@ -3530,7 +4279,7 @@ pub mod model {
                         "Return evidence sufficient for an independent acceptance review".to_string(),
                     ),
                 ],
-                evidence: required_evidence_for_level(AcceptanceLevel::Reviewed),
+                evidence: required_evidence_for_level(AcceptanceLevel::Checked),
                 review: Some(ReviewSetting::Gate(AcceptanceReviewGate {
                     agent: Some("reviewer".to_string()),
                     focus: Option::None,
@@ -3710,24 +4459,16 @@ pub mod model {
         };
         let criteria = normalize_criteria(&criteria_source, &evidence);
 
-        let mut review = if explicit.review.is_some() {
+        // `acceptance.ts:389` @v0.43.0: `explicit.review !== undefined ? explicit.review :
+        // inferred.review` — and nothing more. v0.34.0 additionally downgraded an inference-
+        // escalated `reviewed` gate to `required: false` (`acceptance.ts:288-290` @v0.34.0); that
+        // rule existed only because inference could escalate the LEVEL to `reviewed`, which
+        // v0.43.0 removed (see [`AcceptanceLevel`]), so the downgrade went with it.
+        let review = if explicit.review.is_some() {
             explicit.review.clone()
         } else {
             inferred.review.clone()
         };
-        // acceptance.ts:288-290: inference escalated the level to `reviewed` (explicit asked for
-        // something lower, and set no review of its own) — downgrade the inferred required review to
-        // optional so it is not an explicit hard blocker.
-        if level == AcceptanceLevel::Reviewed
-            && explicit_level != AcceptanceLevel::Auto
-            && explicit_level != AcceptanceLevel::Reviewed
-            && explicit.review.is_none()
-            && let Some(ReviewSetting::Gate(gate)) = &review {
-                review = Some(ReviewSetting::Gate(AcceptanceReviewGate {
-                    required: Some(false),
-                    ..gate.clone()
-                }));
-            }
 
         ResolvedAcceptanceConfig {
             level,
@@ -4015,31 +4756,308 @@ pub mod model {
         }
     }
 
-    /// `unwrapAcceptanceReport` (acceptance.ts:375-381).
-    fn unwrap_acceptance_report(value: &Value) -> &Value {
-        let Value::Object(map) = value else {
-            return value;
-        };
-        if let Some(inner) = map.get("acceptance") {
-            return inner;
+    // --------------------------------------------------------------------------------------------
+    // G79: report normalization (acceptance.ts:484-628 @v0.43.0)
+    //
+    // v0.34.0 had only `unwrapAcceptanceReport` + `validationPathLabelForWrapper`: two wrapper keys,
+    // no aliases, no coercions, and no errors for anything unexpected. v0.43.0 replaced both with a
+    // single normalization pass that runs INSIDE `validateAcceptanceReport`, so every entry point
+    // (explicit fence, generic JSON fence, `ACCEPTANCE_REPORT:` marker, caller-supplied report)
+    // gets the same treatment.
+    // --------------------------------------------------------------------------------------------
+
+    /// `ACCEPTANCE_REPORT_WRAPPERS` (acceptance.ts:484) — four spellings, up from v0.34.0's two.
+    const ACCEPTANCE_REPORT_WRAPPERS: &[&str] = &[
+        "acceptance",
+        "acceptance-report",
+        "acceptance_report",
+        "acceptanceReport",
+    ];
+
+    /// `ACCEPTANCE_REPORT_FIELDS` (acceptance.ts:486-508) — `(wire key, canonical key)`. Every
+    /// camelCase field also answers to its snake_case spelling, and `notes` is canonical on its own.
+    const ACCEPTANCE_REPORT_FIELDS: &[(&str, &str)] = &[
+        ("criteriaSatisfied", "criteriaSatisfied"),
+        ("criteria_satisfied", "criteriaSatisfied"),
+        ("changedFiles", "changedFiles"),
+        ("changed_files", "changedFiles"),
+        ("testsAddedOrUpdated", "testsAddedOrUpdated"),
+        ("tests_added_or_updated", "testsAddedOrUpdated"),
+        ("commandsRun", "commandsRun"),
+        ("commands_run", "commandsRun"),
+        ("validationOutput", "validationOutput"),
+        ("validation_output", "validationOutput"),
+        ("residualRisks", "residualRisks"),
+        ("residual_risks", "residualRisks"),
+        ("noStagedFiles", "noStagedFiles"),
+        ("no_staged_files", "noStagedFiles"),
+        ("diffSummary", "diffSummary"),
+        ("diff_summary", "diffSummary"),
+        ("reviewFindings", "reviewFindings"),
+        ("review_findings", "reviewFindings"),
+        ("manualNotes", "manualNotes"),
+        ("manual_notes", "manualNotes"),
+        ("notes", "notes"),
+    ];
+
+    /// `CRITERION_REPORT_FIELDS` (acceptance.ts:510).
+    const CRITERION_REPORT_FIELDS: &[&str] = &["id", "status", "evidence"];
+    /// `COMMAND_REPORT_FIELDS` (acceptance.ts:511).
+    const COMMAND_REPORT_FIELDS: &[&str] = &["command", "result", "summary"];
+
+    /// `normalizedToken` (acceptance.ts:513-515):
+    /// `value.trim().toLowerCase().replace(/[\s_]+/g, "-").replace(/-+/g, "-")`.
+    ///
+    /// Both replacements are reproduced literally, in order, because they are not the same as one
+    /// combined `[\s_-]+ -> "-"` pass at the edges: `trim()` has already removed surrounding
+    /// whitespace, so a leading `_` or `-` survives as a leading `-` rather than being dropped.
+    fn normalized_token(value: &str) -> String {
+        let lowered = value.trim().to_lowercase();
+        // `/[\s_]+/g -> "-"`
+        let mut collapsed = String::with_capacity(lowered.len());
+        let mut in_run = false;
+        for ch in lowered.chars() {
+            if ch.is_whitespace() || ch == '_' {
+                if !in_run {
+                    collapsed.push('-');
+                    in_run = true;
+                }
+            } else {
+                in_run = false;
+                collapsed.push(ch);
+            }
         }
-        if let Some(inner) = map.get("acceptance-report") {
-            return inner;
+        // `/-+/g -> "-"`
+        let mut out = String::with_capacity(collapsed.len());
+        let mut prev_dash = false;
+        for ch in collapsed.chars() {
+            if ch == '-' {
+                if !prev_dash {
+                    out.push('-');
+                    prev_dash = true;
+                }
+            } else {
+                prev_dash = false;
+                out.push(ch);
+            }
         }
-        value
+        out
     }
 
-    /// `validationPathLabelForWrapper` (acceptance.ts:429-435).
-    fn validation_path_label_for_wrapper(value: &Value) -> &'static str {
-        let Value::Object(map) = value else {
-            return "";
+    /// `normalizeCriterionStatus` (acceptance.ts:517-524) — the alias table a model actually emits
+    /// (`"Done"`, `"PASSED"`, `"n/a"`-style tokens) folded onto the three canonical statuses. A
+    /// value that matches nothing is returned UNCHANGED so `validateAcceptanceReport` still reports
+    /// it with its original text.
+    fn normalize_criterion_status(value: &Value) -> Value {
+        let Some(text) = value.as_str() else {
+            return value.clone();
         };
-        if map.contains_key("acceptance") {
-            "acceptance"
-        } else if map.contains_key("acceptance-report") {
-            "acceptance-report"
-        } else {
-            ""
+        let token = normalized_token(text);
+        match token.as_str() {
+            "satisfied" | "met" | "complete" | "completed" | "done" | "pass" | "passed"
+            | "success" | "succeeded" => Value::String("satisfied".to_string()),
+            "not-satisfied" | "not-met" | "unmet" | "incomplete" | "fail" | "failed" => {
+                Value::String("not-satisfied".to_string())
+            }
+            "not-applicable" | "n-a" | "na" | "skip" | "skipped" => {
+                Value::String("not-applicable".to_string())
+            }
+            _ => value.clone(),
+        }
+    }
+
+    /// `normalizeCommandResult` (acceptance.ts:526-533).
+    fn normalize_command_result(value: &Value) -> Value {
+        let Some(text) = value.as_str() else {
+            return value.clone();
+        };
+        let token = normalized_token(text);
+        match token.as_str() {
+            "passed" | "pass" | "success" | "successful" | "succeeded" | "ok" => {
+                Value::String("passed".to_string())
+            }
+            "failed" | "fail" | "failure" | "error" => Value::String("failed".to_string()),
+            "not-run" | "not-executed" | "skip" | "skipped" => {
+                Value::String("not-run".to_string())
+            }
+            _ => value.clone(),
+        }
+    }
+
+    /// `normalizeCriterionReport` (acceptance.ts:535-550).
+    fn normalize_criterion_report(value: &Value, path_label: &str, errors: &mut Vec<String>) -> Value {
+        let Value::Object(map) = value else {
+            return value.clone();
+        };
+        let mut out = serde_json::Map::new();
+        for (key, field) in map {
+            if !CRITERION_REPORT_FIELDS.contains(&key.as_str()) {
+                errors.push(format!(
+                    "{path_label}.{key}: unsupported acceptance criterion field"
+                ));
+                continue;
+            }
+            let normalized = match key.as_str() {
+                "id" => match field.as_str() {
+                    Some(text) => Value::String(normalized_token(text)),
+                    Option::None => field.clone(),
+                },
+                "status" => normalize_criterion_status(field),
+                _ => field.clone(),
+            };
+            out.insert(key.clone(), normalized);
+        }
+        Value::Object(out)
+    }
+
+    /// `normalizeCommandReport` (acceptance.ts:552-563).
+    fn normalize_command_report(value: &Value, path_label: &str, errors: &mut Vec<String>) -> Value {
+        let Value::Object(map) = value else {
+            return value.clone();
+        };
+        let mut out = serde_json::Map::new();
+        for (key, field) in map {
+            if !COMMAND_REPORT_FIELDS.contains(&key.as_str()) {
+                errors.push(format!(
+                    "{path_label}.{key}: unsupported acceptance command field"
+                ));
+                continue;
+            }
+            let normalized = if key == "result" {
+                normalize_command_result(field)
+            } else {
+                field.clone()
+            };
+            out.insert(key.clone(), normalized);
+        }
+        Value::Object(out)
+    }
+
+    /// The outcome of [`normalize_acceptance_report_value`].
+    struct NormalizedReportValue {
+        value: Value,
+        path_label: String,
+        errors: Vec<String>,
+    }
+
+    /// `normalizeAcceptanceReportValue` (acceptance.ts:565-628): unwrap an acceptance wrapper key,
+    /// fold every field alias onto its canonical name, and coerce the shapes a model reliably gets
+    /// wrong — a lone object where an array belongs, a bare string where a `string[]` belongs, and
+    /// `"true"`/`"false"` where `noStagedFiles` wants a boolean.
+    ///
+    /// **[CYRUP-DELTA]** `serde_json::Map` is a `BTreeMap` here (the `preserve_order` feature is
+    /// off workspace-wide), so key iteration is alphabetical rather than insertion-ordered. That
+    /// changes only two things against upstream and neither is a behavioural gate: which of several
+    /// simultaneously-present wrapper keys is picked as `wrapperKey` (upstream picks the first
+    /// authored, this picks the alphabetically first — and either way the ambiguity itself is
+    /// reported), and the ORDER of the accumulated error strings.
+    fn normalize_acceptance_report_value(value: &Value, path_label: &str) -> NormalizedReportValue {
+        let mut errors: Vec<String> = Vec::new();
+        let mut report_value = value.clone();
+        let mut report_path = path_label.to_string();
+
+        if let Value::Object(map) = &report_value {
+            let wrapper_keys: Vec<&String> = map
+                .keys()
+                .filter(|key| ACCEPTANCE_REPORT_WRAPPERS.contains(&key.as_str()))
+                .collect();
+            if let Some(wrapper_key) = wrapper_keys.first().map(|key| (*key).clone()) {
+                if wrapper_keys.len() > 1 {
+                    let label = if path_label.is_empty() {
+                        "acceptance-report"
+                    } else {
+                        path_label
+                    };
+                    errors.push(format!(
+                        "{label}: multiple acceptance report wrappers are ambiguous"
+                    ));
+                }
+                for key in map.keys() {
+                    if key != &wrapper_key {
+                        errors.push(format!(
+                            "{}: unsupported alongside acceptance report wrapper '{wrapper_key}'",
+                            path_for(path_label, key)
+                        ));
+                    }
+                }
+                report_path = path_for(path_label, &wrapper_key);
+                report_value = map.get(&wrapper_key).cloned().unwrap_or(Value::Null);
+            }
+        }
+
+        let Value::Object(map) = &report_value else {
+            return NormalizedReportValue {
+                value: report_value,
+                path_label: report_path,
+                errors,
+            };
+        };
+
+        let mut normalized = serde_json::Map::new();
+        for (key, field) in map {
+            let Some((_, canonical)) = ACCEPTANCE_REPORT_FIELDS
+                .iter()
+                .find(|(wire, _)| *wire == key.as_str())
+            else {
+                errors.push(format!(
+                    "{}: unsupported acceptance report field",
+                    path_for(&report_path, key)
+                ));
+                continue;
+            };
+            if normalized.contains_key(*canonical) {
+                errors.push(format!(
+                    "{}: duplicates normalized field '{canonical}'",
+                    path_for(&report_path, key)
+                ));
+                continue;
+            }
+            let field_path = path_for(&report_path, canonical);
+            let normalized_field = match *canonical {
+                "criteriaSatisfied" | "commandsRun" => {
+                    // A lone object is read as a one-element array (`acceptance.ts:598,605`).
+                    let items: Option<Vec<Value>> = match field {
+                        Value::Array(items) => Some(items.clone()),
+                        Value::Object(_) => Some(vec![field.clone()]),
+                        _ => Option::None,
+                    };
+                    match items {
+                        Some(items) => Value::Array(
+                            items
+                                .iter()
+                                .enumerate()
+                                .map(|(index, item)| {
+                                    let item_path = format!("{field_path}[{index}]");
+                                    if *canonical == "criteriaSatisfied" {
+                                        normalize_criterion_report(item, &item_path, &mut errors)
+                                    } else {
+                                        normalize_command_report(item, &item_path, &mut errors)
+                                    }
+                                })
+                                .collect(),
+                        ),
+                        Option::None => field.clone(),
+                    }
+                }
+                "changedFiles" | "testsAddedOrUpdated" | "validationOutput" | "residualRisks"
+                | "reviewFindings" => match field {
+                    Value::String(_) => Value::Array(vec![field.clone()]),
+                    _ => field.clone(),
+                },
+                "noStagedFiles" => match field.as_str().map(|s| s.trim().to_lowercase()) {
+                    Some(token) if token == "true" => Value::Bool(true),
+                    Some(token) if token == "false" => Value::Bool(false),
+                    _ => field.clone(),
+                },
+                _ => field.clone(),
+            };
+            normalized.insert((*canonical).to_string(), normalized_field);
+        }
+
+        NormalizedReportValue {
+            value: Value::Object(normalized),
+            path_label: report_path,
+            errors,
         }
     }
 
@@ -4083,18 +5101,21 @@ pub mod model {
         }
     }
 
-    fn is_string_array(value: Option<&Value>) -> bool {
-        matches!(value, Some(Value::Array(items)) if items.iter().all(Value::is_string))
-    }
-
     fn validate_string_array_field(errors: &mut Vec<String>, value: Option<&Value>, path: &str) {
         let Some(Value::Array(items)) = value else {
             push_type_error(errors, path, "string[]", value);
             return;
         };
         for (index, item) in items.iter().enumerate() {
-            if !item.is_string() {
-                push_type_error(errors, &format!("{path}[{index}]"), "string", Some(item));
+            // `acceptance.ts:827` @v0.43.0 — a blank entry is no longer accepted as evidence
+            // (v0.34.0 only required `typeof item === "string"`).
+            if !item.as_str().is_some_and(|s| !s.trim().is_empty()) {
+                push_type_error(
+                    errors,
+                    &format!("{path}[{index}]"),
+                    "non-empty string",
+                    Some(item),
+                );
             }
         }
     }
@@ -4105,7 +5126,13 @@ pub mod model {
         value: &Value,
         path_label: &str,
     ) -> (Option<AcceptanceReport>, Vec<String>) {
-        let mut errors: Vec<String> = Vec::new();
+        // `acceptance.ts:831-835` @v0.43.0 — normalization runs FIRST and its errors seed the list,
+        // so an unsupported alias or a duplicated field is reported alongside the type errors
+        // rather than silently dropping the whole report.
+        let normalized = normalize_acceptance_report_value(value, path_label);
+        let value = &normalized.value;
+        let path_label = normalized.path_label.as_str();
+        let mut errors: Vec<String> = normalized.errors;
         let Value::Object(map) = value else {
             let label = if path_label.is_empty() {
                 "acceptance-report"
@@ -4120,16 +5147,29 @@ pub mod model {
         if let Some(criteria) = map.get("criteriaSatisfied") {
             let cpath = path_for(path_label, "criteriaSatisfied");
             if let Value::Array(items) = criteria {
+                // `acceptance.ts:845,855-858`: ids are compared AFTER `normalizedToken`, so
+                // `"C 1"` and `"c_1"` are the same criterion and the second one is a duplicate.
+                let mut criterion_ids: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
                 for (index, item) in items.iter().enumerate() {
                     let ipath = format!("{cpath}[{index}]");
                     let Value::Object(obj) = item else {
                         push_type_error(&mut errors, &ipath, "object", Some(item));
                         continue;
                     };
-                    if let Some(id) = obj.get("id")
-                        && !id.is_string() {
+                    match obj.get("id") {
+                        Some(id) if !id.is_string() => {
                             push_type_error(&mut errors, &format!("{ipath}.id"), "string", Some(id));
                         }
+                        Some(Value::String(id))
+                            if !id.is_empty() && !criterion_ids.insert(id.as_str()) =>
+                        {
+                            errors.push(format!(
+                                "{ipath}.id: duplicate normalized criterion id '{id}'"
+                            ));
+                        }
+                        _ => {}
+                    }
                     let status = obj.get("status").and_then(Value::as_str);
                     if !matches!(status, Some("satisfied") | Some("not-satisfied") | Some("not-applicable"))
                     {
@@ -4202,11 +5242,16 @@ pub mod model {
                             obj.get("result"),
                         );
                     }
-                    if !obj.get("summary").is_some_and(Value::is_string) {
+                    // `acceptance.ts:883` @v0.43.0 — non-empty (v0.34.0 accepted `""`).
+                    if !obj
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty())
+                    {
                         push_type_error(
                             &mut errors,
                             &format!("{ipath}.summary"),
-                            "string",
+                            "non-empty string",
                             obj.get("summary"),
                         );
                     }
@@ -4238,12 +5283,13 @@ pub mod model {
                     Some(no_staged),
                 );
             }
+        // `acceptance.ts:890` @v0.43.0 — non-empty (v0.34.0 accepted `""`).
         if let Some(diff) = map.get("diffSummary")
-            && !diff.is_string() {
+            && !diff.as_str().is_some_and(|s| !s.trim().is_empty()) {
                 push_type_error(
                     &mut errors,
                     &path_for(path_label, "diffSummary"),
-                    "string",
+                    "non-empty string",
                     Some(diff),
                 );
             }
@@ -4310,7 +5356,14 @@ pub mod model {
         }
     }
 
-    /// `hasGenericAcceptanceReportSignal` (acceptance.ts:393-407).
+    /// `hasGenericAcceptanceReportSignal` (acceptance.ts:630-644 @v0.43.0) — plain KEY PRESENCE on
+    /// the NORMALIZED value.
+    ///
+    /// v0.34.0 additionally type-checked each companion (`isStringArray(record.changedFiles)`, …),
+    /// which meant a `json`-fenced report whose `changedFiles` was a bare string — a shape v0.43.0's
+    /// normalizer now repairs — read as "not a report at all" and was silently left in the
+    /// delivered output. Presence alone is the signal; the shape is then `validateAcceptanceReport`'s
+    /// business and its errors are surfaced rather than swallowed.
     fn has_generic_acceptance_report_signal(value: &Value) -> bool {
         let Value::Object(map) = value else {
             return false;
@@ -4318,33 +5371,19 @@ pub mod model {
         if !map.contains_key("criteriaSatisfied") {
             return false;
         }
-        is_string_array(map.get("changedFiles"))
-            || is_string_array(map.get("testsAddedOrUpdated"))
-            || is_commands_run_array(map.get("commandsRun"))
-            || is_string_array(map.get("validationOutput"))
-            || is_string_array(map.get("residualRisks"))
-            || map.get("noStagedFiles").is_some_and(Value::is_boolean)
-            || map.get("diffSummary").is_some_and(Value::is_string)
-            || is_string_array(map.get("reviewFindings"))
-            || map.get("manualNotes").is_some_and(Value::is_string)
-    }
-
-    /// `isCommandsRunArray` (acceptance.ts:383-391).
-    fn is_commands_run_array(value: Option<&Value>) -> bool {
-        let Some(Value::Array(items)) = value else {
-            return false;
-        };
-        items.iter().all(|item| {
-            let Value::Object(obj) = item else {
-                return false;
-            };
-            obj.get("command").is_some_and(Value::is_string)
-                && matches!(
-                    obj.get("result").and_then(Value::as_str),
-                    Some("passed") | Some("failed") | Some("not-run")
-                )
-                && obj.get("summary").is_some_and(Value::is_string)
-        })
+        [
+            "changedFiles",
+            "testsAddedOrUpdated",
+            "commandsRun",
+            "validationOutput",
+            "residualRisks",
+            "noStagedFiles",
+            "diffSummary",
+            "reviewFindings",
+            "manualNotes",
+        ]
+        .iter()
+        .any(|key| map.contains_key(*key))
     }
 
     // --------------------------------------------------------------------------------------------
@@ -4358,37 +5397,167 @@ pub mod model {
         pub error: Option<String>,
     }
 
-    /// `parseAcceptanceReportBody` (acceptance.ts:437-441).
+    /// `ACCEPTANCE_REPORT_NOT_FOUND` (acceptance.ts:699) — the ONE error string that means "there
+    /// was simply no report here", as opposed to "there was one and it was broken". The source
+    /// fallback in [`parse_acceptance_report_sources`] switches on exactly this value, so it is a
+    /// named constant rather than a repeated literal.
+    pub const ACCEPTANCE_REPORT_NOT_FOUND: &str = "Structured acceptance report not found.";
+
+    /// The tag alternation `` ```acceptance[-_]report `` (acceptance.ts:702-703) — v0.43.0 accepts
+    /// the underscore spelling everywhere the hyphenated one is accepted.
+    const ACCEPTANCE_REPORT_FENCE_TAGS: &[&str] = &["acceptance-report", "acceptance_report"];
+
+    /// `parseAcceptanceReportBody` (acceptance.ts:666-668).
     fn parse_acceptance_report_body(body: &str) -> Result<(Option<AcceptanceReport>, Vec<String>), String> {
         let parsed = parse_report_json(body)?;
-        let report = unwrap_acceptance_report(&parsed);
-        let label = validation_path_label_for_wrapper(&parsed);
-        Ok(validate_acceptance_report(report, label))
+        Ok(validate_acceptance_report(&parsed, ""))
     }
 
-    /// `parseGenericJsonAcceptanceReportBody` (acceptance.ts:443-449).
-    fn parse_generic_json_acceptance_report_body(body: &str) -> Option<AcceptanceReport> {
-        let parsed = parse_report_json(body).ok()?;
-        let report = unwrap_acceptance_report(&parsed);
-        let (validated, _errors) = validate_acceptance_report(report, "");
-        let report = validated?;
-        // Re-check the generic signal against the ORIGINAL value (pi checks `validation.report`,
-        // which is the same object, minus dropped unknown fields — the signal keys are all known).
-        if has_generic_acceptance_report_signal(report_to_value(&report).as_ref().unwrap_or(&Value::Null)) {
-            Some(report)
-        } else {
-            Option::None
+    /// `parseUnterminatedAcceptanceReportFence` (acceptance.ts:670-683) — recovery for the single
+    /// most common malformed emission: the model opened ```` ```acceptance-report ```` and then ran
+    /// out of turn without ever closing the fence. Everything after the opener is parsed as the
+    /// body. Only attempted when NO closing ``` follows the opener at all, so a well-formed run is
+    /// never re-parsed by this path.
+    ///
+    /// Returns `(report, error)`; `(None, None)` means "this recovery does not apply".
+    fn parse_unterminated_acceptance_report_fence(
+        output: &str,
+    ) -> (Option<AcceptanceReport>, Option<String>) {
+        let Some((body_start, _)) = find_acceptance_report_fence_opener(output) else {
+            return (Option::None, Option::None);
+        };
+        if output.get(body_start..).is_some_and(|rest| rest.contains("```")) {
+            return (Option::None, Option::None);
+        }
+        let body = output.get(body_start..).unwrap_or("").trim();
+        match serde_json::from_str::<Value>(body) {
+            Ok(parsed) => {
+                let (report, errors) = validate_acceptance_report(&parsed, "");
+                match report {
+                    Some(report) => (Some(report), Option::None),
+                    Option::None => (
+                        Option::None,
+                        Some(format!(
+                            "Failed to parse acceptance-report: Invalid acceptance-report: {}",
+                            errors.join("; ")
+                        )),
+                    ),
+                }
+            }
+            Err(err) => (
+                Option::None,
+                Some(format!("Failed to parse acceptance-report: {err}")),
+            ),
         }
     }
 
-    fn report_to_value(report: &AcceptanceReport) -> Option<Value> {
-        serde_json::to_value(report).ok()
+    /// `/```acceptance[-_]report\b/i.test(output)` (acceptance.ts:702) — pure TAG PRESENCE, with a
+    /// `\b` after the tag and NO requirement that a newline follow it.
+    ///
+    /// This is deliberately NOT [`find_acceptance_report_fence_opener`], whose upstream twin
+    /// (`parseUnterminatedAcceptanceReportFence`, acceptance.ts:671) really does anchor on
+    /// `[^\n]*\n` because it needs the offset where the fence BODY starts. `parseAcceptanceReport`
+    /// only needs to know a fence was OPENED. Conflating the two loses exactly the case where a
+    /// model was cut off mid-opener (`"…\n```acceptance-report"` with nothing after it): the run
+    /// then reports [`ACCEPTANCE_REPORT_NOT_FOUND`] instead of the fence defect, and because that
+    /// constant is the one value [`parse_acceptance_report_sources`] and
+    /// [`super::select_acceptance_report_source`] branch on to decide "genuinely absent, fall
+    /// through to the other source", a truncated report in a `file-only` artifact papers itself
+    /// over with the assistant text — the precise failure this source-selection rule exists to
+    /// prevent.
+    fn has_acceptance_report_fence_tag(output: &str) -> bool {
+        let lowered = output.to_ascii_lowercase();
+        let mut from = 0usize;
+        while let Some(rel) = lowered.get(from..).and_then(|s| s.find("```")) {
+            let fence_at = from + rel;
+            let after_fence = fence_at + 3;
+            let rest = lowered.get(after_fence..).unwrap_or("");
+            if let Some(tag) = ACCEPTANCE_REPORT_FENCE_TAGS
+                .iter()
+                .find(|tag| rest.starts_with(**tag))
+            {
+                let after_tag = after_fence + tag.len();
+                // `\b`: the tag must not run straight into another word character.
+                let boundary_ok = lowered
+                    .get(after_tag..)
+                    .and_then(|s| s.chars().next())
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                if boundary_ok {
+                    return true;
+                }
+            }
+            from = after_fence;
+        }
+        false
     }
 
-    /// `parseAcceptanceReport` (acceptance.ts:451-492).
+    /// `/```acceptance[-_]report\b[^\n]*\n/gi.exec(output)` (acceptance.ts:671-673): the byte offset
+    /// just past the opener's newline, plus the offset of the opener itself.
+    fn find_acceptance_report_fence_opener(output: &str) -> Option<(usize, usize)> {
+        let lowered = output.to_ascii_lowercase();
+        let mut from = 0usize;
+        while let Some(rel) = lowered.get(from..).and_then(|s| s.find("```")) {
+            let fence_at = from + rel;
+            let after_fence = fence_at + 3;
+            let rest = lowered.get(after_fence..).unwrap_or("");
+            let tag = ACCEPTANCE_REPORT_FENCE_TAGS
+                .iter()
+                .find(|tag| rest.starts_with(**tag));
+            if let Some(tag) = tag {
+                let after_tag = after_fence + tag.len();
+                // `\b`: the tag must not run straight into another word character.
+                let boundary_ok = lowered
+                    .get(after_tag..)
+                    .and_then(|s| s.chars().next())
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                if boundary_ok
+                    && let Some(nl_rel) = lowered.get(after_tag..).and_then(|s| s.find('\n'))
+                {
+                    return Some((after_tag + nl_rel + 1, fence_at));
+                }
+            }
+            from = after_fence;
+        }
+        Option::None
+    }
+
+    /// `parseGenericJsonAcceptanceReportBody` (acceptance.ts:685-697).
+    ///
+    /// Returns `(report, error)`. v0.34.0 returned only `Option<AcceptanceReport>` and swallowed
+    /// every validation failure, so a `json`-fenced block that was unmistakably a report but had one
+    /// bad field was treated as unrelated prose. v0.43.0 surfaces those errors — but ONLY when the
+    /// value still carries the `criteriaSatisfied` marker, so genuinely unrelated JSON stays quiet.
+    fn parse_generic_json_acceptance_report_body(
+        body: &str,
+    ) -> Result<(Option<AcceptanceReport>, Option<String>), String> {
+        let parsed = parse_report_json(body)?;
+        let normalized = normalize_acceptance_report_value(&parsed, "");
+        let has_criteria_marker = matches!(
+            &normalized.value,
+            Value::Object(map) if map.contains_key("criteriaSatisfied")
+        );
+        if !has_generic_acceptance_report_signal(&normalized.value)
+            && !(has_criteria_marker && !normalized.errors.is_empty())
+        {
+            return Ok((Option::None, Option::None));
+        }
+        let (report, errors) = validate_acceptance_report(&parsed, "");
+        Ok(match report {
+            Some(report) => (Some(report), Option::None),
+            Option::None => (
+                Option::None,
+                Some(format!("Invalid acceptance-report: {}", errors.join("; "))),
+            ),
+        })
+    }
+
+    /// `parseAcceptanceReport` (acceptance.ts:701-751).
     #[must_use]
     pub fn parse_acceptance_report(output: &str) -> ParsedAcceptanceReport {
-        let fenced = fenced_block_bodies(output, &["acceptance-report"]);
+        // acceptance.ts:702 tests TAG PRESENCE only — see [`has_acceptance_report_fence_tag`] for
+        // why this must not be `find_acceptance_report_fence_opener(...).is_some()`.
+        let explicit_fence_present = has_acceptance_report_fence_tag(output);
+        let fenced = fenced_block_bodies(output, ACCEPTANCE_REPORT_FENCE_TAGS);
         let mut parse_errors: Vec<String> = Vec::new();
         for body in &fenced {
             match parse_acceptance_report_body(body) {
@@ -4413,49 +5582,137 @@ pub mod model {
                 )),
             };
         }
+        // `acceptance.ts:715-719`: an OPENED acceptance-report fence that produced no parseable
+        // body never falls through to the generic-JSON or marker paths — it is a defect of THIS
+        // report, so it is either recovered or reported.
+        if explicit_fence_present {
+            let (report, error) = parse_unterminated_acceptance_report_fence(output);
+            if report.is_some() || error.is_some() {
+                return ParsedAcceptanceReport { report, error };
+            }
+            return ParsedAcceptanceReport {
+                report: Option::None,
+                error: Some(
+                    "Failed to parse acceptance-report: Empty or unterminated acceptance-report fence."
+                        .to_string(),
+                ),
+            };
+        }
         for body in fenced_block_bodies(output, &["json", "jsonc", "json5"]) {
-            if let Some(report) = parse_generic_json_acceptance_report_body(&body) {
-                return ParsedAcceptanceReport {
-                    report: Some(report),
-                    error: Option::None,
-                };
+            match parse_generic_json_acceptance_report_body(&body) {
+                Ok((Some(report), _)) => {
+                    return ParsedAcceptanceReport {
+                        report: Some(report),
+                        error: Option::None,
+                    };
+                }
+                Ok((Option::None, Some(error))) => {
+                    return ParsedAcceptanceReport {
+                        report: Option::None,
+                        error: Some(format!("Failed to parse acceptance-report: {error}")),
+                    };
+                }
+                // Unrelated JSON, or malformed JSON that is not report-shaped: ignored, exactly as
+                // upstream's bare `catch {}` does (`acceptance.ts:725-728`).
+                Ok((Option::None, Option::None)) | Err(_) => {}
             }
         }
-        // ACCEPTANCE_REPORT: marker (acceptance.ts:473-490).
-        if let Some(marker_index) = find_acceptance_report_marker(output)
-            && let Some(json_start) = output.get(marker_index..).and_then(|s| s.find('{')).map(|r| marker_index + r)
-                && let Some(json) = extract_balanced_json(output, json_start) {
-                    match serde_json::from_str::<Value>(&json) {
-                        Ok(parsed) => {
-                            let report = unwrap_acceptance_report(&parsed);
-                            let label = validation_path_label_for_wrapper(&parsed);
-                            let (validated, errors) = validate_acceptance_report(report, label);
-                            return match validated {
-                                Some(report) => ParsedAcceptanceReport {
-                                    report: Some(report),
-                                    error: Option::None,
-                                },
-                                Option::None => ParsedAcceptanceReport {
-                                    report: Option::None,
-                                    error: Some(format!(
-                                        "Failed to parse acceptance-report: Invalid acceptance-report: {}",
-                                        errors.join("; ")
-                                    )),
-                                },
-                            };
-                        }
-                        Err(err) => {
-                            return ParsedAcceptanceReport {
-                                report: Option::None,
-                                error: Some(err.to_string()),
-                            };
-                        }
+        // ACCEPTANCE_REPORT: marker (acceptance.ts:730-749). v0.43.0 gives the two "the marker is
+        // there but the object is not" cases their own messages instead of silently falling through
+        // to `ACCEPTANCE_REPORT_NOT_FOUND`.
+        if let Some(marker_index) = find_acceptance_report_marker(output) {
+            let Some(json_start) = output
+                .get(marker_index..)
+                .and_then(|s| s.find('{'))
+                .map(|r| marker_index + r)
+            else {
+                return ParsedAcceptanceReport {
+                    report: Option::None,
+                    error: Some(
+                        "Failed to parse acceptance-report: Expected a JSON object after ACCEPTANCE_REPORT:."
+                            .to_string(),
+                    ),
+                };
+            };
+            let Some(json) = extract_balanced_json(output, json_start) else {
+                return ParsedAcceptanceReport {
+                    report: Option::None,
+                    error: Some(
+                        "Failed to parse acceptance-report: Unterminated JSON object after ACCEPTANCE_REPORT:."
+                            .to_string(),
+                    ),
+                };
+            };
+            return match serde_json::from_str::<Value>(&json) {
+                Ok(parsed) => {
+                    let (validated, errors) = validate_acceptance_report(&parsed, "");
+                    match validated {
+                        Some(report) => ParsedAcceptanceReport {
+                            report: Some(report),
+                            error: Option::None,
+                        },
+                        Option::None => ParsedAcceptanceReport {
+                            report: Option::None,
+                            error: Some(format!(
+                                "Failed to parse acceptance-report: Invalid acceptance-report: {}",
+                                errors.join("; ")
+                            )),
+                        },
                     }
                 }
+                Err(err) => ParsedAcceptanceReport {
+                    report: Option::None,
+                    error: Some(format!("Failed to parse acceptance-report: {err}")),
+                },
+            };
+        }
         ParsedAcceptanceReport {
             report: Option::None,
-            error: Some("Structured acceptance report not found.".to_string()),
+            error: Some(ACCEPTANCE_REPORT_NOT_FOUND.to_string()),
         }
+    }
+
+    /// `parseAcceptanceReportSources` (acceptance.ts:753-772) — search BOTH the assistant output and
+    /// the child's configured output file, in the order `authoritative` dictates.
+    ///
+    /// The load-bearing rule is the fallthrough condition: only a genuinely ABSENT report
+    /// ([`ACCEPTANCE_REPORT_NOT_FOUND`]) in the primary source falls through to the secondary. A
+    /// MALFORMED report in the primary source is a defect to surface, not a miss to paper over.
+    #[must_use]
+    pub fn parse_acceptance_report_sources(
+        output: &str,
+        file_output: Option<&super::AcceptanceFileOutput<'_>>,
+    ) -> ParsedAcceptanceReport {
+        let from_text = || parse_acceptance_report(output);
+        let from_file = || match file_output {
+            Option::None => ParsedAcceptanceReport {
+                report: Option::None,
+                error: Some(ACCEPTANCE_REPORT_NOT_FOUND.to_string()),
+            },
+            Some(file) => {
+                let parsed = parse_acceptance_report(file.content);
+                if parsed.report.is_some()
+                    || parsed.error.as_deref() == Some(ACCEPTANCE_REPORT_NOT_FOUND)
+                {
+                    parsed
+                } else {
+                    ParsedAcceptanceReport {
+                        report: Option::None,
+                        error: Some(format!(
+                            "{} (in configured output {})",
+                            parsed.error.unwrap_or_default(),
+                            file.path.display()
+                        )),
+                    }
+                }
+            }
+        };
+        let authoritative = file_output.is_some_and(|file| file.authoritative);
+        let first = if authoritative { from_file() } else { from_text() };
+        if first.report.is_some() || first.error.as_deref() != Some(ACCEPTANCE_REPORT_NOT_FOUND) {
+            return first;
+        }
+        if authoritative { from_text() } else { from_file() }
     }
 
     /// Case-insensitive `/ACCEPTANCE_REPORT\s*:/i` locator (acceptance.ts:473).
@@ -4480,20 +5737,30 @@ pub mod model {
     /// the DELIVERED output, so a caller sees the human answer, never the machine report JSON.
     #[must_use]
     pub fn strip_acceptance_report(output: &str) -> String {
-        // The trailing-fence variant (`\n?```(tag)\s*\n([\s\S]*?)```\s*`) over all four tags.
-        let tags = ["acceptance-report", "json", "jsonc", "json5"];
+        // The trailing-fence variant (`\n?```(acceptance[-_]report|json|jsonc|json5)\s*\n([\s\S]*?)```\s*`,
+        // acceptance.ts:775) — five tags at v0.43.0, which added the underscore spelling.
+        let tags = [
+            "acceptance-report",
+            "acceptance_report",
+            "json",
+            "jsonc",
+            "json5",
+        ];
         let matches = fenced_matches(output, &tags, true, true);
-        // The LAST match with only whitespace after it is the trailing fence (acceptance.ts:497-502).
+        // The LAST match with only whitespace after it is the trailing fence (acceptance.ts:777-782).
         let trailing = matches.into_iter().rev().find(|m| {
             output
                 .get(m.end..)
                 .is_none_or(|tail| tail.trim().is_empty())
         });
         if let Some(fence) = trailing {
-            if fence.tag == "acceptance-report" {
+            if ACCEPTANCE_REPORT_FENCE_TAGS.contains(&fence.tag.as_str()) {
                 return output.get(..fence.index).unwrap_or("").trim_end().to_string();
             }
-            if parse_generic_json_acceptance_report_body(&fence.body).is_some() {
+            if matches!(
+                parse_generic_json_acceptance_report_body(&fence.body),
+                Ok((Some(_), _))
+            ) {
                 return output.get(..fence.index).unwrap_or("").trim_end().to_string();
             }
         }
@@ -4504,9 +5771,9 @@ pub mod model {
         stripped.trim_end().to_string()
     }
 
-    /// `/\n?```acceptance-report\s*\n[\s\S]*?```\s*$/i` (acceptance.ts:512).
+    /// `/\n?```acceptance[-_]report\s*\n[\s\S]*?```\s*$/i` (acceptance.ts:792).
     fn strip_trailing_acceptance_report_fence(output: &str) -> String {
-        let matches = fenced_matches(output, &["acceptance-report"], true, true);
+        let matches = fenced_matches(output, ACCEPTANCE_REPORT_FENCE_TAGS, true, true);
         if let Some(fence) = matches
             .into_iter()
             .rev()
@@ -4604,19 +5871,27 @@ pub mod model {
         criteria: &[ResolvedAcceptanceGate],
         report: &AcceptanceReport,
     ) -> Vec<AcceptanceRuntimeCheck> {
-        let reported: std::collections::HashMap<&str, &CriterionReport> = report
+        // `acceptance.ts:912-914` @v0.43.0: BOTH sides go through `normalizedToken`, so a declared
+        // `c 1` matches a reported `C_1`. The report side is already normalized by
+        // `normalize_criterion_report`; the DECLARED side is not, so it is normalized here.
+        let reported: std::collections::HashMap<String, &CriterionReport> = report
             .criteria_satisfied
             .as_deref()
             .unwrap_or(&[])
             .iter()
-            .filter_map(|item| item.id.as_deref().map(|id| (id, item)))
+            .filter_map(|item| {
+                item.id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| (normalized_token(id), item))
+            })
             .collect();
         criteria
             .iter()
             .filter(|criterion| criterion.severity != GateSeverity::Recommended)
             .map(|criterion| {
                 let id = format!("criterion:{}", criterion.id);
-                match reported.get(criterion.id.as_str()) {
+                match reported.get(&normalized_token(&criterion.id)) {
                     Option::None => AcceptanceRuntimeCheck {
                         id,
                         status: RuntimeCheckStatus::Failed,
@@ -4930,11 +6205,13 @@ pub mod model {
 
     fn ledger_status_str(status: AcceptanceLedgerStatus) -> &'static str {
         match status {
+            AcceptanceLedgerStatus::Pending => "pending",
             AcceptanceLedgerStatus::NotRequired => "not-required",
             AcceptanceLedgerStatus::Claimed => "claimed",
             AcceptanceLedgerStatus::Attested => "attested",
             AcceptanceLedgerStatus::Checked => "checked",
             AcceptanceLedgerStatus::Verified => "verified",
+            AcceptanceLedgerStatus::ReviewRequired => "review-required",
             AcceptanceLedgerStatus::Reviewed => "reviewed",
             AcceptanceLedgerStatus::Accepted => "accepted",
             AcceptanceLedgerStatus::Rejected => "rejected",
@@ -4942,29 +6219,556 @@ pub mod model {
     }
 
     // --------------------------------------------------------------------------------------------
-    // runVerifyCommand (acceptance.ts:713-767) — REAL subprocess execution
+    // G80: verify-command secret redaction (acceptance.ts:974-994)
+    // --------------------------------------------------------------------------------------------
+
+    /// The alternation inside upstream's `SENSITIVE_ENV_KEY_PATTERN`
+    /// (`acceptance.ts:974` @v0.43.0):
+    ///
+    /// ```text
+    /// /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|COOKIE|SESSION|PRIVATE|API_KEY|ACCESS_KEY)(?:_|$)/i
+    /// ```
+    ///
+    /// Copied VERBATIM and in upstream's order. This list is a security boundary — a verify
+    /// command's captured stdout/stderr goes straight into the acceptance ledger and from there
+    /// into a transcript, so anything this list misses is a credential that leaks. Do not "improve"
+    /// it locally; change it only to track upstream.
+    const SENSITIVE_ENV_KEY_WORDS: [&str; 11] = [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASS",
+        "AUTH",
+        "CREDENTIAL",
+        "COOKIE",
+        "SESSION",
+        "PRIVATE",
+        "API_KEY",
+        "ACCESS_KEY",
+    ];
+
+    /// `SENSITIVE_ENV_KEY_PATTERN.test(key)` (`acceptance.ts:974,985`), re-expressed as a scan so
+    /// the crate needs no regex dependency.
+    ///
+    /// The pattern is unanchored and case-insensitive, so it matches when ANY word in
+    /// [`SENSITIVE_ENV_KEY_WORDS`] occurs at a `_`-or-boundary-delimited position anywhere in the
+    /// key: `GITHUB_TOKEN` and `TOKEN_FILE` and `AWS_SECRET_ACCESS_KEY` all match, while
+    /// `TOKENIZER` and `PASSAGE` do not (`I`/`A` is neither `_` nor end-of-string).
+    ///
+    /// `to_ascii_uppercase` is what makes the `i` flag faithful without changing byte offsets —
+    /// env key names are ASCII, and a non-ASCII byte is left alone and simply never matches.
+    #[must_use]
+    fn is_sensitive_env_key(key: &str) -> bool {
+        let upper = key.to_ascii_uppercase();
+        let bytes = upper.as_bytes();
+        for word in SENSITIVE_ENV_KEY_WORDS {
+            let needle = word.as_bytes();
+            if needle.len() > bytes.len() {
+                continue;
+            }
+            for start in 0..=(bytes.len() - needle.len()) {
+                let end = start + needle.len();
+                if bytes.get(start..end) != Some(needle) {
+                    continue;
+                }
+                // `(?:^|_)` before, `(?:_|$)` after.
+                let left = start == 0 || bytes.get(start - 1) == Some(&b'_');
+                let right = end == bytes.len() || bytes.get(end) == Some(&b'_');
+                if left && right {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// `effectiveVerifyEnv` (`acceptance.ts:976-981`): `{ ...process.env, ...(env ?? {}) }` — the
+    /// command's declared pairs layered OVER the inherited environment, never replacing it.
+    ///
+    /// Upstream's `flatMap` drops any `process.env` entry whose value is not a string; the Rust
+    /// analog is dropping any `vars_os` pair that is not valid UTF-8 (which is also why this reads
+    /// `vars_os` rather than `vars`, whose iterator panics on exactly that input — the no-panic
+    /// policy forbids it).
+    #[must_use]
+    fn effective_verify_env(
+        env: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut merged: std::collections::BTreeMap<String, String> = std::env::vars_os()
+            .filter_map(|(key, value)| {
+                Some((key.into_string().ok()?, value.into_string().ok()?))
+            })
+            .collect();
+        if let Some(declared) = env {
+            for (key, value) in declared {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+        merged
+    }
+
+    /// `verifyRedactionEnv` (`acceptance.ts:983-987`): the effective environment filtered down to
+    /// the entries whose KEY looks sensitive and whose VALUE is at least 4 long — the length floor
+    /// upstream applies so that a short/degenerate value (`"1"`, `"on"`) cannot blanket-redact
+    /// every occurrence of that substring in otherwise-innocent output.
+    ///
+    /// JS `.length` counts UTF-16 units where Rust `.len()` counts bytes; the two agree exactly for
+    /// the ASCII every real credential is made of, and both are monotone in string size, so the
+    /// longest-first ordering below is preserved either way.
+    #[must_use]
+    fn verify_redaction_env(
+        env: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Vec<String> {
+        effective_verify_env(env)
+            .into_iter()
+            .filter(|(key, value)| value.len() >= 4 && is_sensitive_env_key(key))
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    /// `redactVerifyEnv` (`acceptance.ts:989-994`): replace every occurrence of every sensitive
+    /// environment VALUE in `value` with `[REDACTED]`.
+    ///
+    /// The de-duplicated secret list is sorted LONGEST FIRST (upstream
+    /// `.sort((left, right) => right.length - left.length)`), which is load-bearing: when one
+    /// secret is a prefix of another, redacting the short one first would leave the remainder of
+    /// the long one in the output. `str::replace` is a literal replacement, exactly like
+    /// `String.prototype.replaceAll` with a string (not regex) pattern.
+    #[must_use]
+    pub fn redact_verify_env(
+        value: &str,
+        env: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> String {
+        let mut secrets = verify_redaction_env(env);
+        // `[...new Set(...)]` — dedupe. Sorting first makes `dedup` total, and the subsequent
+        // stable length sort then leaves equal-length secrets in a deterministic order.
+        secrets.sort();
+        secrets.dedup();
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        let mut redacted = value.to_string();
+        for secret in secrets {
+            // `.filter(Boolean)` (`acceptance.ts:991`) — an empty secret would otherwise splice
+            // `[REDACTED]` between every character.
+            if secret.is_empty() {
+                continue;
+            }
+            redacted = redacted.replace(&secret, "[REDACTED]");
+        }
+        redacted
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // G80: per-workspace memoization of verify results (acceptance.ts:1032-1132)
+    // --------------------------------------------------------------------------------------------
+
+    /// `hash` (`acceptance.ts:1034-1036`): lowercase hex sha256.
+    #[must_use]
+    fn hash_bytes(value: &[u8]) -> String {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(value);
+        let digest = hasher.finalize();
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The two values upstream requires BOTH of before it will memoize anything at all
+    /// (`if (!workspaceState || !options.artifactsDir || !options.runId)`, `acceptance.ts:1085`):
+    /// the run's artifacts root and the run id that scopes the cache within it.
+    ///
+    /// Passing `None` for the whole context is upstream's "no artifacts configured" case — every
+    /// verify command then executes for real, exactly as it did before memoization existed. That
+    /// is also what pi's chain-execution group gate does: its two `evaluateAcceptance` calls
+    /// (`chain-execution.ts:1037-1046,1233-1242`) pass neither field.
+    #[derive(Debug, Clone, Copy)]
+    pub struct VerifyMemoContext<'a> {
+        /// pi `options.artifactsDir` — the run's artifacts root. Memo artifacts land under
+        /// `<artifacts_dir>/acceptance/verify/<run_id>/<cacheKey>.json` (`acceptance.ts:1102`).
+        pub artifacts_dir: &'a Path,
+        /// pi `options.runId`.
+        pub run_id: &'a str,
+    }
+
+    /// `readVerifyWorkspaceState` (`acceptance.ts:1046-1060`): identify the git working tree
+    /// `cwd` sits in, as `HEAD` plus a hash of the full uncommitted diff.
+    ///
+    /// Returns `None` — which disables memoization for this command entirely — when `cwd` is not
+    /// inside a git checkout, when either `git` invocation fails, or when `HEAD` is empty (an
+    /// unborn branch). A non-git workspace has no cheap identity to key a cache on, so upstream
+    /// declines to guess one.
+    ///
+    /// **[CYRUP-DELTA: mechanism]** upstream uses `spawnSync` and hashes the diff after decoding it
+    /// as UTF-8; this awaits `tokio::process::Command` (blocking the async executor on three git
+    /// invocations is not an option here) and hashes the diff's RAW BYTES, which is strictly more
+    /// faithful for the `--binary` diffs the flag exists to produce — a lossy decode would collapse
+    /// distinct binary blobs onto the same replacement characters and therefore the same key.
+    pub async fn read_verify_workspace_state(cwd: &Path) -> Option<VerifyWorkspaceState> {
+        let repo = tokio::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(cwd)
+            .output()
+            .await
+            .ok()?;
+        if !repo.status.success() {
+            return Option::None;
+        }
+        let repo_root_raw = String::from_utf8(repo.stdout).ok()?;
+        let repo_root_raw = repo_root_raw.trim();
+        if repo_root_raw.is_empty() {
+            return Option::None;
+        }
+        // `fs.realpathSync` (`acceptance.ts:1049`) — both sides are canonicalized so the
+        // `path.relative` below cannot be defeated by a symlinked cwd.
+        let repo_root = std::fs::canonicalize(repo_root_raw).ok()?;
+
+        let head = tokio::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo_root)
+            .output()
+            .await
+            .ok()?;
+        let diff = tokio::process::Command::new("git")
+            .args(["diff", "--binary", "--full-index", "HEAD", "--"])
+            .current_dir(&repo_root)
+            .output()
+            .await
+            .ok()?;
+        if !head.status.success() || !diff.status.success() {
+            return Option::None;
+        }
+        let head_text = String::from_utf8(head.stdout).ok()?;
+        let head_text = head_text.trim();
+        if head_text.is_empty() {
+            return Option::None;
+        }
+
+        // `path.relative(repoRoot, fs.realpathSync(cwd)) || "."` (`acceptance.ts:1056`). `cwd` is
+        // always inside `repoRoot` here — `repoRoot` was derived by running `rev-parse` FROM it —
+        // so a plain prefix strip is exactly `path.relative`, and `""` becomes `"."`.
+        let cwd_real = std::fs::canonicalize(cwd).ok()?;
+        let relative = cwd_real.strip_prefix(&repo_root).ok()?;
+        let cwd_relative = if relative.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            relative.to_string_lossy().into_owned()
+        };
+
+        Some(VerifyWorkspaceState {
+            kind: VerifyWorkspaceKind::GitTracked,
+            repo_root: repo_root.to_string_lossy().into_owned(),
+            cwd_relative,
+            head: head_text.to_string(),
+            diff_hash: hash_bytes(&diff.stdout),
+        })
+    }
+
+    /// The shape marker stamped into a memo artifact's `resultShape` field.
+    ///
+    /// **[CYRUP-DELTA: mechanism]** upstream has exactly ONE verify-result type, so its artifact
+    /// needs no discriminant. This crate carries two — the pi-shaped
+    /// [`AcceptanceVerifyResult`] here and the enum-lattice
+    /// [`super::VerifyCommandResult`] the foreground gate reports — and they share one cache
+    /// directory. The marker makes a cross-shape read a clean MISS (re-run the command) rather
+    /// than relying on the two shapes' required fields happening to be mutually incompatible under
+    /// serde. It is an opaque field of a private artifact; nothing observable depends on it.
+    const MEMO_SHAPE_ACCEPTANCE_VERIFY_RESULT: &str = "acceptance-verify-result";
+
+    /// The everything-but-the-result half of a memo artifact, shared by both result shapes.
+    ///
+    /// Mirrors upstream's written object (`acceptance.ts:1115-1126`) field for field, minus
+    /// `result` (supplied by the caller) plus `resultShape` (see
+    /// [`MEMO_SHAPE_ACCEPTANCE_VERIFY_RESULT`]).
+    pub(crate) struct MemoIdentity {
+        pub(crate) cache_key: String,
+        pub(crate) artifact_path: PathBuf,
+        pub(crate) env_keys: Vec<String>,
+        pub(crate) env_hash: String,
+        pub(crate) timeout_ms: u64,
+        pub(crate) allow_failure: bool,
+        pub(crate) workspace_state: VerifyWorkspaceState,
+    }
+
+    impl MemoIdentity {
+        /// `acceptance.ts:1088-1102`: derive this command's cache key and artifact path against an
+        /// already-read [`VerifyWorkspaceState`].
+        ///
+        /// The key covers everything that can change the command's OUTCOME: its text, the
+        /// repo-relative directory it runs in, the names of the env keys it declares, a hash of the
+        /// entire effective environment, its timeout, its `allowFailure` flag, `HEAD`, and the
+        /// working-tree diff hash. Note `env_keys` records only NAMES (the ledger is
+        /// transcript-visible) while `env_hash` covers every VALUE — that split is upstream's, and
+        /// it is what lets a rotated credential invalidate the memo without ever being written
+        /// down.
+        ///
+        /// **[CYRUP-DELTA: mechanism]** the key is a sha256 over `serde_json`'s rendering of the
+        /// same field set rather than over V8's `JSON.stringify` of it, so the digest VALUE differs
+        /// from pi's. Nothing compares the two: a cache key is only ever matched against another
+        /// key produced by the same build, and upstream re-checks `cached.cacheKey === cacheKey`
+        /// on read for exactly that reason.
+        pub(crate) fn derive(
+            command: &AcceptanceVerifyCommand,
+            memo: VerifyMemoContext<'_>,
+            workspace_state: VerifyWorkspaceState,
+            result_shape: &str,
+        ) -> Self {
+            // `Object.keys(command.env ?? {}).sort()` (`acceptance.ts:1088`) — a `BTreeMap` is
+            // already sorted.
+            let env_keys: Vec<String> = command
+                .env
+                .as_ref()
+                .map(|env| env.keys().cloned().collect())
+                .unwrap_or_default();
+            // `hash(JSON.stringify(<effective env, key-sorted>))` (`acceptance.ts:1089`).
+            let effective = effective_verify_env(command.env.as_ref());
+            let env_hash = hash_bytes(
+                serde_json::to_string(&effective)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            let timeout_ms = command.timeout_ms.unwrap_or(DEFAULT_VERIFY_TIMEOUT_MS);
+            let allow_failure = command.allow_failure == Some(true);
+            let key_material = serde_json::json!({
+                "version": 1,
+                "command": command.command,
+                "cwdRelative": workspace_state.cwd_relative,
+                "envKeys": env_keys,
+                "envHash": env_hash,
+                "timeoutMs": timeout_ms,
+                "allowFailure": allow_failure,
+                "head": workspace_state.head,
+                "diffHash": workspace_state.diff_hash,
+                "resultShape": result_shape,
+            });
+            let cache_key = hash_bytes(
+                serde_json::to_string(&key_material)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            // `path.join(artifactsDir, "acceptance", "verify", runId, `${cacheKey}.json`)`
+            // (`acceptance.ts:1102`).
+            let artifact_path = memo
+                .artifacts_dir
+                .join("acceptance")
+                .join("verify")
+                .join(memo.run_id)
+                .join(format!("{cache_key}.json"));
+            Self {
+                cache_key,
+                artifact_path,
+                env_keys,
+                env_hash,
+                timeout_ms,
+                allow_failure,
+                workspace_state,
+            }
+        }
+
+        /// The `result` payload of a matching memo artifact, or `None` for any miss.
+        ///
+        /// Upstream's read is wrapped in a bare `try {} catch {}` whose comment says it out loud —
+        /// *"A cache miss or unreadable artifact must not prevent host verification"*
+        /// (`acceptance.ts:1108-1110`) — so an absent file, malformed JSON, a stale `cacheKey` or a
+        /// foreign `resultShape` are all just misses.
+        pub(crate) fn read_cached(&self, result_shape: &str) -> Option<serde_json::Value> {
+            let raw = std::fs::read(&self.artifact_path).ok()?;
+            let cached: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+            if cached.get("cacheKey").and_then(serde_json::Value::as_str)
+                != Some(self.cache_key.as_str())
+            {
+                return Option::None;
+            }
+            // An artifact with no marker predates the field; treat it as the pi-shaped default so
+            // this stays a pure addition.
+            let shape = cached
+                .get("resultShape")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(MEMO_SHAPE_ACCEPTANCE_VERIFY_RESULT);
+            if shape != result_shape {
+                return Option::None;
+            }
+            cached.get("result").cloned()
+        }
+
+        /// Write the memo artifact (`acceptance.ts:1113-1126`), returning the error TEXT upstream
+        /// puts on `artifactError` when the write fails.
+        ///
+        /// Best-effort by construction: the command has already run and its real exit code is
+        /// already known, so a failure here can only cost a future re-run, never a wrong verdict.
+        pub(crate) fn write_cached(
+            &self,
+            command: &AcceptanceVerifyCommand,
+            result_shape: &str,
+            result: &serde_json::Value,
+        ) -> Result<(), String> {
+            let payload = serde_json::json!({
+                "version": 1,
+                "cacheKey": self.cache_key,
+                "command": command.command,
+                "cwdRelative": self.workspace_state.cwd_relative,
+                "envKeys": self.env_keys,
+                "envHash": self.env_hash,
+                "timeoutMs": self.timeout_ms,
+                "allowFailure": self.allow_failure,
+                "workspaceState": self.workspace_state,
+                "resultShape": result_shape,
+                "result": result,
+            });
+            let text = serde_json::to_string_pretty(&payload).map_err(|err| err.to_string())?;
+            if let Some(parent) = self.artifact_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+            }
+            std::fs::write(&self.artifact_path, text).map_err(|err| err.to_string())
+        }
+    }
+
+    /// `runMemoizedVerifyCommand` (`acceptance.ts:1072-1132`): replay a verify command's recorded
+    /// result when the workspace has not changed since it was recorded, otherwise run it for real
+    /// and record the outcome.
+    ///
+    /// Falls straight through to [`run_verify_command`] — no artifact read, no artifact write, no
+    /// evidence fields — whenever there is no memo context or the cwd is not a git working tree
+    /// (`acceptance.ts:1085-1087`). The memoized replay carries the recorded `exitCode`, `status`,
+    /// `stdout`, `stderr` and `durationMs` but re-stamps `id`/`command`/`cwd` from the CURRENT
+    /// command (`acceptance.ts:1106`), so a renamed criterion id still reports under its new name.
+    pub async fn run_memoized_verify_command(
+        command: &AcceptanceVerifyCommand,
+        default_cwd: &Path,
+        memo: Option<VerifyMemoContext<'_>>,
+    ) -> AcceptanceVerifyResult {
+        let cwd = resolve_verify_cwd(command, default_cwd);
+        let Some(memo) = memo else {
+            return run_verify_command(command, default_cwd).await;
+        };
+        // `try { workspaceState = readVerifyWorkspaceState(cwd) } catch { undefined }`
+        // (`acceptance.ts:1079-1084`).
+        let Some(workspace_state) = read_verify_workspace_state(&cwd).await else {
+            return run_verify_command(command, default_cwd).await;
+        };
+        let identity = MemoIdentity::derive(
+            command,
+            memo,
+            workspace_state,
+            MEMO_SHAPE_ACCEPTANCE_VERIFY_RESULT,
+        );
+
+        if let Some(cached) = identity.read_cached(MEMO_SHAPE_ACCEPTANCE_VERIFY_RESULT)
+            // `isCachedVerifyResult` (`acceptance.ts:1062-1070`) asserts id/command are strings,
+            // `exitCode` is a number or an explicit null, `status` is one of the four literals and
+            // `durationMs` is a number. Every one of those is a REQUIRED field of
+            // `AcceptanceVerifyResult` (only `cwd` and the evidence fields carry `#[serde(default)]`),
+            // so a successful deserialization IS that predicate.
+            && let Ok(result) = serde_json::from_value::<AcceptanceVerifyResult>(cached)
+        {
+            return AcceptanceVerifyResult {
+                id: command.id.clone(),
+                command: command.command.clone(),
+                cwd: Some(cwd.display().to_string()),
+                artifact_path: Some(identity.artifact_path.display().to_string()),
+                cache_key: Some(identity.cache_key.clone()),
+                memoized: Some(true),
+                env_keys: Some(identity.env_keys.clone()),
+                env_hash: Some(identity.env_hash.clone()),
+                workspace_state: Some(identity.workspace_state.clone()),
+                artifact_error: Option::None,
+                ..result
+            };
+        }
+
+        let result = run_verify_command(command, default_cwd).await;
+        let mut evidenced = AcceptanceVerifyResult {
+            artifact_path: Some(identity.artifact_path.display().to_string()),
+            cache_key: Some(identity.cache_key.clone()),
+            memoized: Some(false),
+            env_keys: Some(identity.env_keys.clone()),
+            env_hash: Some(identity.env_hash.clone()),
+            workspace_state: Some(identity.workspace_state.clone()),
+            artifact_error: Option::None,
+            ..result
+        };
+        let payload = serde_json::to_value(&evidenced).unwrap_or(serde_json::Value::Null);
+        if let Err(message) =
+            identity.write_cached(command, MEMO_SHAPE_ACCEPTANCE_VERIFY_RESULT, &payload)
+        {
+            // `evidenced.artifactError = …; delete evidenced.artifactPath;`
+            // (`acceptance.ts:1128-1129`) — never claim an artifact that is not there.
+            evidenced.artifact_error = Some(message);
+            evidenced.artifact_path = Option::None;
+        }
+        evidenced
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // runVerifyCommand (acceptance.ts:1134-1208) — REAL subprocess execution
     // --------------------------------------------------------------------------------------------
 
     const DEFAULT_VERIFY_TIMEOUT_MS: u64 = 120_000;
 
-    /// `runVerifyCommand` (acceptance.ts:713-767): execute one `verify[]` command as a REAL shell
-    /// subprocess, observing its real exit code — never the child's own claim about it.
+    /// `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd`
+    /// (`acceptance.ts:1078,1137`) — `path.resolve` returns an absolute segment verbatim and joins
+    /// a relative one onto the base, which is what `Path::join` does.
+    #[must_use]
+    fn resolve_verify_cwd(command: &AcceptanceVerifyCommand, default_cwd: &Path) -> PathBuf {
+        match command.cwd.as_deref() {
+            Some(rel) => {
+                let path = Path::new(rel);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    default_cwd.join(path)
+                }
+            }
+            Option::None => default_cwd.to_path_buf(),
+        }
+    }
+
+    impl AcceptanceVerifyResult {
+        /// Everything upstream's `finish(...)` (`acceptance.ts:1150-1163`) resolves, with NO
+        /// memoization evidence attached — the plain shape a command executed outside a memo
+        /// context reports. [`run_memoized_verify_command`] stamps the evidence on afterwards.
+        fn unmemoized(
+            command: &AcceptanceVerifyCommand,
+            cwd: Option<String>,
+            exit_code: Option<i32>,
+            status: VerifyRunStatus,
+            stdout: Option<String>,
+            stderr: Option<String>,
+            duration_ms: u128,
+        ) -> Self {
+            Self {
+                id: command.id.clone(),
+                command: command.command.clone(),
+                cwd,
+                exit_code,
+                status,
+                stdout,
+                stderr,
+                duration_ms,
+                artifact_path: Option::None,
+                cache_key: Option::None,
+                memoized: Option::None,
+                env_keys: Option::None,
+                env_hash: Option::None,
+                workspace_state: Option::None,
+                artifact_error: Option::None,
+            }
+        }
+    }
+
+    /// `runVerifyCommand` (`acceptance.ts:1134-1208`): execute one `verify[]` command as a REAL
+    /// shell subprocess, observing its real exit code — never the child's own claim about it.
+    ///
+    /// **G80 — every captured stream leaves this function REDACTED.** Upstream wraps each of
+    /// `stdout`/`stderr` in `redactVerifyEnv(…, command.env)` before `trimOutput`
+    /// (`acceptance.ts:1173-1174,1194-1195,1203-1204`), and so does this. The output of a verify
+    /// command is attacker-adjacent by construction — it is whatever `cargo test`/`curl`/a build
+    /// script printed, running with the orchestrator's full environment — and it lands verbatim in
+    /// the acceptance ledger, which lands in a transcript. Redacting before trimming (not after) is
+    /// also upstream's order and matters: a secret straddling the 12 000-char truncation point must
+    /// be masked while it is still whole.
     async fn run_verify_command(
         command: &AcceptanceVerifyCommand,
         default_cwd: &Path,
     ) -> AcceptanceVerifyResult {
         let started = Instant::now();
-        let cwd: PathBuf = match command.cwd.as_deref() {
-            Some(rel) => {
-                let p = Path::new(rel);
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    default_cwd.join(p)
-                }
-            }
-            Option::None => default_cwd.to_path_buf(),
-        };
+        let cwd: PathBuf = resolve_verify_cwd(command, default_cwd);
         let mut cmd = shell_command(&command.command);
         cmd.current_dir(&cwd);
         cmd.stdin(std::process::Stdio::null());
@@ -4984,20 +6788,22 @@ pub mod model {
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
-                return AcceptanceVerifyResult {
-                    id: command.id.clone(),
-                    command: command.command.clone(),
-                    cwd: cwd_str,
-                    exit_code: Some(1),
-                    status: if command.allow_failure == Some(true) {
+                // `child.on("error", …)` (`acceptance.ts:1198-1205`) — the error TEXT is redacted
+                // too, because a spawn failure echoes the command line back (`sh: -c: …`) and a
+                // verify command may legitimately carry a credential in its own argv.
+                return AcceptanceVerifyResult::unmemoized(
+                    command,
+                    cwd_str,
+                    Some(1),
+                    if command.allow_failure == Some(true) {
                         VerifyRunStatus::AllowedFailure
                     } else {
                         VerifyRunStatus::Failed
                     },
-                    stdout: Option::None,
-                    stderr: Some(err.to_string()),
-                    duration_ms: started.elapsed().as_millis(),
-                };
+                    Option::None,
+                    Some(redact_verify_env(&err.to_string(), command.env.as_ref())),
+                    started.elapsed().as_millis(),
+                );
             }
         };
 
@@ -5028,16 +6834,15 @@ pub mod model {
             if let Some(task) = stderr_task {
                 task.abort();
             }
-            return AcceptanceVerifyResult {
-                id: command.id.clone(),
-                command: command.command.clone(),
-                cwd: cwd_str,
-                exit_code: Option::None,
-                status: VerifyRunStatus::TimedOut,
-                stdout: Option::None,
-                stderr: Option::None,
-                duration_ms: started.elapsed().as_millis(),
-            };
+            return AcceptanceVerifyResult::unmemoized(
+                command,
+                cwd_str,
+                Option::None,
+                VerifyRunStatus::TimedOut,
+                Option::None,
+                Option::None,
+                started.elapsed().as_millis(),
+            );
         };
 
         // Same bound as the enum-lattice copy: a command that exits while a descendant still holds
@@ -5049,16 +6854,15 @@ pub mod model {
         )
         .await
         else {
-            return AcceptanceVerifyResult {
-                id: command.id.clone(),
-                command: command.command.clone(),
-                cwd: cwd_str,
-                exit_code: Option::None,
-                status: VerifyRunStatus::TimedOut,
-                stdout: Option::None,
-                stderr: Option::None,
-                duration_ms: started.elapsed().as_millis(),
-            };
+            return AcceptanceVerifyResult::unmemoized(
+                command,
+                cwd_str,
+                Option::None,
+                VerifyRunStatus::TimedOut,
+                Option::None,
+                Option::None,
+                started.elapsed().as_millis(),
+            );
         };
 
         match waited {
@@ -5072,32 +6876,45 @@ pub mod model {
                 } else {
                     VerifyRunStatus::Failed
                 };
-                AcceptanceVerifyResult {
-                    id: command.id.clone(),
-                    command: command.command.clone(),
-                    cwd: cwd_str,
+                // `trimOutput(redactVerifyEnv(stdout, command.env))` / same for stderr
+                // (`acceptance.ts:1194-1195`) — redact FIRST, trim second.
+                AcceptanceVerifyResult::unmemoized(
+                    command,
+                    cwd_str,
                     exit_code,
                     status,
-                    stdout: trim_output(&String::from_utf8_lossy(&out_bytes)),
-                    stderr: trim_output(&String::from_utf8_lossy(&err_bytes)),
-                    duration_ms: started.elapsed().as_millis(),
-                }
+                    trim_output_after(&out_bytes, command.env.as_ref()),
+                    trim_output_after(&err_bytes, command.env.as_ref()),
+                    started.elapsed().as_millis(),
+                )
             }
-            Err(err) => AcceptanceVerifyResult {
-                id: command.id.clone(),
-                command: command.command.clone(),
-                cwd: cwd_str,
-                exit_code: Some(1),
-                status: if command.allow_failure == Some(true) {
+            Err(err) => AcceptanceVerifyResult::unmemoized(
+                command,
+                cwd_str,
+                Some(1),
+                if command.allow_failure == Some(true) {
                     VerifyRunStatus::AllowedFailure
                 } else {
                     VerifyRunStatus::Failed
                 },
-                stdout: Option::None,
-                stderr: Some(err.to_string()),
-                duration_ms: started.elapsed().as_millis(),
-            },
+                Option::None,
+                Some(redact_verify_env(&err.to_string(), command.env.as_ref())),
+                started.elapsed().as_millis(),
+            ),
         }
+    }
+
+    /// `trimOutput(redactVerifyEnv(<captured bytes>, env))` (`acceptance.ts:1194-1195`) as one
+    /// step, in upstream's order: the raw capture is decoded, REDACTED whole, and only then
+    /// trimmed/truncated. Doing it the other way round would let the 12 000-char truncation split
+    /// a secret and smuggle its prefix through.
+    #[must_use]
+    fn trim_output_after(
+        captured: &[u8],
+        env: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Option<String> {
+        let decoded = String::from_utf8_lossy(captured);
+        trim_output(&redact_verify_env(&decoded, env))
     }
 
     fn shell_command(command: &str) -> tokio::process::Command {
@@ -5119,13 +6936,22 @@ pub mod model {
     // evaluateAcceptance / acceptanceFailureMessage (acceptance.ts:769-856)
     // --------------------------------------------------------------------------------------------
 
-    /// Input to [`evaluate_acceptance`] (acceptance.ts:769-775).
+    /// Input to [`evaluate_acceptance`] (`acceptance.ts:1210-1228`).
     pub struct EvaluateAcceptanceInput<'a> {
         pub acceptance: &'a ResolvedAcceptanceConfig,
         pub output: &'a str,
         pub cwd: &'a Path,
         pub report: Option<AcceptanceReport>,
+        /// G79 — pi `input.fileOutput` (`acceptance.ts:1214-1220`): the content the child sent to
+        /// its configured output file, searched for the acceptance report alongside `output` by
+        /// [`parse_acceptance_report_sources`].
+        pub file_output: Option<super::AcceptanceFileOutput<'a>>,
         pub review_result: Option<AcceptanceReviewResult>,
+        /// G80 — pi `input.artifactsDir` + `input.runId` (`acceptance.ts:1226-1227`), threaded to
+        /// [`run_memoized_verify_command`] (`acceptance.ts:1289-1293`). `None` disables
+        /// memoization for this evaluation, which is what pi's own chain-execution group gate does
+        /// (`chain-execution.ts:1037-1046,1233-1242` pass neither field).
+        pub memo: Option<VerifyMemoContext<'a>>,
     }
 
     /// `evaluateAcceptance` (acceptance.ts:769-845). Async because `verified` runs REAL `verify[]`
@@ -5133,12 +6959,15 @@ pub mod model {
     #[must_use]
     pub async fn evaluate_acceptance(input: EvaluateAcceptanceInput<'_>) -> AcceptanceLedger {
         let acceptance = input.acceptance;
+        // `acceptance.ts:1230-1233` @v0.43.0: ONE `initialStatus`, written to both fields.
+        let initial_status = if acceptance.level == AcceptanceLevel::None {
+            AcceptanceEvidenceStatus::NotRequired
+        } else {
+            AcceptanceEvidenceStatus::Claimed
+        };
         let mut ledger = AcceptanceLedger {
-            status: if acceptance.level == AcceptanceLevel::None {
-                AcceptanceLedgerStatus::NotRequired
-            } else {
-                AcceptanceLedgerStatus::Claimed
-            },
+            status: initial_status.into(),
+            evidence_status: initial_status,
             explicit: acceptance.explicit,
             inferred_reason: acceptance.inferred_reason.clone(),
             criteria: acceptance.criteria.iter().map(SerializableGate::from_gate).collect(),
@@ -5152,10 +6981,14 @@ pub mod model {
             return ledger;
         }
 
+        // `acceptance.ts:1243-1250` @v0.43.0 — a caller-supplied `report` wins outright; otherwise
+        // BOTH the assistant output and the child's configured output file are searched, in the
+        // order `parse_acceptance_report_sources` picks (G79).
         let report = match input.report {
             Some(report) => Some(report),
             Option::None => {
-                let parsed = parse_acceptance_report(input.output);
+                let parsed =
+                    parse_acceptance_report_sources(input.output, input.file_output.as_ref());
                 if parsed.report.is_none() {
                     ledger.child_report_parse_error = parsed.error.clone();
                     ledger.runtime_checks.push(AcceptanceRuntimeCheck {
@@ -5166,6 +6999,7 @@ pub mod model {
                             .unwrap_or_else(|| "Structured acceptance report missing.".to_string()),
                     });
                     ledger.status = AcceptanceLedgerStatus::Rejected;
+                    ledger.evidence_status = AcceptanceEvidenceStatus::Rejected;
                     return ledger;
                 }
                 parsed.report
@@ -5174,28 +7008,34 @@ pub mod model {
         let Some(report) = report else {
             // Unreachable: the `None` branch above already returned on a missing report.
             ledger.status = AcceptanceLedgerStatus::Rejected;
+            ledger.evidence_status = AcceptanceEvidenceStatus::Rejected;
             return ledger;
         };
         ledger.child_report = Some(report.clone());
         ledger.status = AcceptanceLedgerStatus::Attested;
+        ledger.evidence_status = AcceptanceEvidenceStatus::Attested;
 
         let rank = level_rank(acceptance.level).unwrap_or(0);
         let checked_rank = 2u8;
         let verified_rank = 3u8;
 
+        // `acceptance.ts:1268-1278` @v0.43.0. NOTE the two structural changes v0.43.0 made here:
+        // the rung APPENDS to `runtimeChecks` rather than replacing them, and it no longer returns
+        // early on a failed check — it simply declines to promote, so the `verify[]` rung below
+        // still runs and its results still land on the ledger. The single rejection point is the
+        // combined check further down (`:1308-1312`).
         if rank >= checked_rank {
             let mut checks = check_criteria_satisfied(&acceptance.criteria, &report);
             checks.extend(run_structural_checks(&acceptance.evidence, &report, input.cwd).await);
-            ledger.runtime_checks = checks;
-            if ledger
+            ledger.runtime_checks.extend(checks);
+            if !ledger
                 .runtime_checks
                 .iter()
                 .any(|c| c.status == RuntimeCheckStatus::Failed)
             {
-                ledger.status = AcceptanceLedgerStatus::Rejected;
-                return ledger;
+                ledger.status = AcceptanceLedgerStatus::Checked;
+                ledger.evidence_status = AcceptanceEvidenceStatus::Checked;
             }
-            ledger.status = AcceptanceLedgerStatus::Checked;
         }
 
         if rank >= verified_rank
@@ -5208,55 +7048,87 @@ pub mod model {
                     message: "verified acceptance requires runtime verify commands.".to_string(),
                 });
                 ledger.status = AcceptanceLedgerStatus::Rejected;
+                ledger.evidence_status = AcceptanceEvidenceStatus::Rejected;
                 return ledger;
             }
             let mut runs = Vec::new();
             for command in &acceptance.verify {
-                runs.push(run_verify_command(command, input.cwd).await);
+                // `runMemoizedVerifyCommand(command, input.cwd, { …, artifactsDir, runId })`
+                // (`acceptance.ts:1289-1293`) — memoized when the caller supplied both, a plain
+                // execution otherwise.
+                runs.push(run_memoized_verify_command(command, input.cwd, input.memo).await);
             }
             ledger.verify_runs = runs;
             if ledger.verify_runs.iter().any(|run| {
                 matches!(run.status, VerifyRunStatus::Failed | VerifyRunStatus::TimedOut)
             }) {
                 ledger.status = AcceptanceLedgerStatus::Rejected;
+                ledger.evidence_status = AcceptanceEvidenceStatus::Rejected;
                 return ledger;
             }
-            ledger.status = AcceptanceLedgerStatus::Verified;
+            if !ledger
+                .runtime_checks
+                .iter()
+                .any(|c| c.status == RuntimeCheckStatus::Failed)
+            {
+                ledger.status = AcceptanceLedgerStatus::Verified;
+                ledger.evidence_status = AcceptanceEvidenceStatus::Verified;
+            }
         }
 
-        if acceptance.level == AcceptanceLevel::Reviewed {
-            if let Some(review) = input.review_result {
-                let status = if review.status == ReviewResultStatus::NoBlockers {
-                    AcceptanceLedgerStatus::Reviewed
-                } else {
-                    AcceptanceLedgerStatus::Rejected
-                };
-                ledger.review_result = Some(review);
-                ledger.status = status;
-            } else {
-                let optional_review = matches!(
-                    &acceptance.review,
-                    Some(ReviewSetting::Gate(g)) if g.required == Some(false)
-                );
-                let severity = if acceptance.explicit && !optional_review {
-                    ReviewFindingSeverity::Blocker
-                } else {
-                    ReviewFindingSeverity::NonBlocking
-                };
-                ledger.review_result = Some(AcceptanceReviewResult {
-                    status: ReviewResultStatus::NeedsParentDecision,
-                    findings: vec![ReviewFinding {
-                        severity,
-                        file: Option::None,
-                        issue: "Reviewed acceptance requires an independent reviewer result."
-                            .to_string(),
-                        rationale: "The run cannot be marked reviewed from child evidence alone."
-                            .to_string(),
-                    }],
-                });
-                let review_disabled = matches!(&acceptance.review, Some(ReviewSetting::Disabled(false)));
-                if review_disabled || (acceptance.explicit && !optional_review) {
+        // `acceptance.ts:1308-1312` — the single rejection point for failed structural checks.
+        if ledger
+            .runtime_checks
+            .iter()
+            .any(|c| c.status == RuntimeCheckStatus::Failed)
+        {
+            ledger.status = AcceptanceLedgerStatus::Rejected;
+            ledger.evidence_status = AcceptanceEvidenceStatus::Rejected;
+            return ledger;
+        }
+        // `acceptance.ts:1313-1316` — a run that never got past `claimed` (only reachable when the
+        // caller allowed a missing report) still settles at its declared level.
+        if ledger.status == AcceptanceLedgerStatus::Claimed {
+            let settled = match acceptance.level {
+                AcceptanceLevel::Verified => AcceptanceEvidenceStatus::Verified,
+                AcceptanceLevel::Checked => AcceptanceEvidenceStatus::Checked,
+                AcceptanceLevel::Attested => AcceptanceEvidenceStatus::Attested,
+                AcceptanceLevel::None => AcceptanceEvidenceStatus::NotRequired,
+                // `auto` never survives `resolve_effective_acceptance`.
+                AcceptanceLevel::Auto => AcceptanceEvidenceStatus::Claimed,
+            };
+            ledger.status = settled.into();
+            ledger.evidence_status = settled;
+        }
+
+        // `acceptance.ts:1318-1336` @v0.43.0 — the review gate now hangs off `acceptance.review`,
+        // NOT off a `level === "reviewed"` that no longer exists. Only `status` moves here;
+        // `evidence_status` keeps whatever the evidence actually earned.
+        if let Some(ReviewSetting::Gate(gate)) = &acceptance.review {
+            match input.review_result {
+                Some(review) if review.status == ReviewResultStatus::Reviewed => {
+                    ledger.review_result = Some(review);
+                    ledger.status = AcceptanceLedgerStatus::Reviewed;
+                }
+                Some(review) if review.status == ReviewResultStatus::Blockers => {
+                    ledger.review_result = Some(review);
                     ledger.status = AcceptanceLedgerStatus::Rejected;
+                }
+                supplied => {
+                    if gate.required != Some(false) {
+                        ledger.review_result = Some(supplied.unwrap_or(AcceptanceReviewResult {
+                            status: ReviewResultStatus::ReviewRequired,
+                            findings: vec![ReviewFinding {
+                                severity: ReviewFindingSeverity::NonBlocking,
+                                file: Option::None,
+                                issue: "Independent review has not been supplied.".to_string(),
+                                rationale:
+                                    "The run cannot be marked reviewed from child evidence alone."
+                                        .to_string(),
+                            }],
+                        }));
+                        ledger.status = AcceptanceLedgerStatus::ReviewRequired;
+                    }
                 }
             }
         }
@@ -5289,10 +7161,10 @@ pub mod model {
             };
             return Some(format!("Acceptance verification '{}' {status}.", run.id));
         }
+        // `acceptance.ts:1363-1364` @v0.43.0. v0.34.0 also had a `needs-parent-decision` arm; that
+        // review status no longer exists, and its successor (`review-required`) is not a REJECTED
+        // ledger, so it never reaches this function at all.
         match ledger.review_result.as_ref().map(|r| r.status) {
-            Some(ReviewResultStatus::NeedsParentDecision) => {
-                Some("Acceptance review required but no automatic reviewer result is available.".to_string())
-            }
             Some(ReviewResultStatus::Blockers) => {
                 Some("Acceptance review found blockers.".to_string())
             }
@@ -5304,7 +7176,11 @@ pub mod model {
     // validateAcceptanceInput (acceptance.ts:138-249)
     // --------------------------------------------------------------------------------------------
 
-    const VALID_LEVELS: &[&str] = &["auto", "none", "attested", "checked", "verified", "reviewed"];
+    const VALID_LEVELS: &[&str] = &["auto", "none", "attested", "checked", "verified"];
+    /// `EXPLICIT_REVIEWED_UNAVAILABLE` (`acceptance.ts:54` @v0.43.0) — verbatim, including the
+    /// leading space the two call sites supply by interpolation (`${pathLabel} ${…}` /
+    /// `${pathLabel}.level ${…}`).
+    pub const EXPLICIT_REVIEWED_UNAVAILABLE: &str = "is an achieved status, not a requestable acceptance level. For a read-only reviewer call, omit acceptance. To require independent review of a writer result, use acceptance.review.required and orchestrate the reviewer separately.";
     const ACCEPTANCE_CONFIG_KEYS: &[&str] =
         &["level", "criteria", "evidence", "verify", "review", "stopRules", "reason"];
     const ACCEPTANCE_GATE_KEYS: &[&str] = &["id", "must", "evidence", "severity"];
@@ -5320,9 +7196,24 @@ pub mod model {
         match input {
             Value::Null => return errors,
             Value::Bool(false) => return errors,
+            // `acceptance.ts:180-185` @v0.43.0. Every bare level string except `auto`, `attested`
+            // and `checked` is now an error: `reviewed` is not a level at all, `none` needs a
+            // reason, and `verified` needs runtime commands — which is precisely
+            // `AcceptanceInput = Exclude<AcceptanceLevel, "none" | "verified"> | false |
+            // AcceptanceConfig` (`types.ts:684-685`) restated as messages.
             Value::String(s) => {
-                if !VALID_LEVELS.contains(&s.as_str()) {
+                if s == "reviewed" {
+                    errors.push(format!("{path_label} {EXPLICIT_REVIEWED_UNAVAILABLE}"));
+                } else if !VALID_LEVELS.contains(&s.as_str()) {
                     errors.push(format!("{path_label} has invalid level '{s}'."));
+                } else if s == "none" {
+                    errors.push(format!(
+                        "{path_label} level \"none\" requires a reason; use {{ level: \"none\", reason: \"...\" }}."
+                    ));
+                } else if s == "verified" {
+                    errors.push(format!(
+                        "{path_label} level \"verified\" requires object form with at least one runtime verify command. Use level \"checked\" or provide a non-empty acceptance.verify array."
+                    ));
                 }
                 return errors;
             }
@@ -5342,10 +7233,13 @@ pub mod model {
                 errors.push(format!("{path_label}.{key} is not supported."));
             }
         }
-        if let Some(level) = map.get("level")
+        // `acceptance.ts:195-199` @v0.43.0.
+        if map.get("level").and_then(Value::as_str) == Some("reviewed") {
+            errors.push(format!("{path_label}.level {EXPLICIT_REVIEWED_UNAVAILABLE}"));
+        } else if let Some(level) = map.get("level")
             && !level.as_str().is_some_and(|l| VALID_LEVELS.contains(&l)) {
                 errors.push(format!(
-                    "{path_label}.level must be one of auto, none, attested, checked, verified, reviewed."
+                    "{path_label}.level must be one of auto, none, attested, checked, verified."
                 ));
             }
         if map.get("level").and_then(Value::as_str) == Some("none")
@@ -5376,7 +7270,27 @@ pub mod model {
             Some(_) => errors.push(format!("{path_label}.evidence must be an array.")),
             Option::None => {}
         }
-        validate_verify_input(&mut errors, map.get("verify"), path_label);
+        // `acceptance.ts:248-252` @v0.43.0: an object-form `verified` policy MUST carry at least one
+        // runtime command — the level's whole meaning is "the orchestrator ran something", so a
+        // command-less `verified` could only ever have been satisfied by the child's own claim.
+        let verified_without_commands = map.get("level").and_then(Value::as_str) == Some("verified")
+            && !map
+                .get("verify")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty());
+        if verified_without_commands {
+            errors.push(format!(
+                "{path_label}.verify must contain at least one runtime command when level is verified. Use level \"checked\" or provide a non-empty acceptance.verify array."
+            ));
+        }
+        // Upstream's `else if` suppresses only the generic "must be an array" message; the
+        // per-command checks below it are an unconditional `if (Array.isArray(value.verify))`.
+        validate_verify_input(
+            &mut errors,
+            map.get("verify"),
+            path_label,
+            !verified_without_commands,
+        );
         validate_review_input(&mut errors, map.get("review"), path_label);
         match map.get("stopRules") {
             Some(Value::Array(items)) => {
@@ -5439,7 +7353,15 @@ pub mod model {
         }
     }
 
-    fn validate_verify_input(errors: &mut Vec<String>, verify: Option<&Value>, path_label: &str) {
+    /// `report_shape_errors` is upstream's `else if` guard (`acceptance.ts:250-252`): `false`
+    /// suppresses the generic `.verify must be an array.` message because the caller already
+    /// emitted the more specific `verified`-needs-commands one.
+    fn validate_verify_input(
+        errors: &mut Vec<String>,
+        verify: Option<&Value>,
+        path_label: &str,
+        report_shape_errors: bool,
+    ) {
         match verify {
             Option::None => {}
             Some(Value::Array(items)) => {
@@ -5490,7 +7412,10 @@ pub mod model {
                         }
                 }
             }
-            Some(_) => errors.push(format!("{path_label}.verify must be an array.")),
+            Some(_) if report_shape_errors => {
+                errors.push(format!("{path_label}.verify must be an array."));
+            }
+            Some(_) => {}
         }
     }
 
@@ -5591,26 +7516,44 @@ pub mod model {
                 .level,
                 AcceptanceLevel::Checked
             );
+            // `acceptance.ts:111-121` @v0.43.0 — the risky branch resolves to `checked` (v0.34.0
+            // said `reviewed`, a level that no longer exists) and expresses "an independent
+            // reviewer must sign this off" through the REQUIRED review gate instead. Both halves
+            // are asserted, so a regression that drops the gate cannot hide behind the level.
+            let async_write = resolve(AcceptanceResolveInput {
+                agent_name: "worker".into(),
+                task: Some("Implement the fix".into()),
+                is_async: true,
+                ..Default::default()
+            });
+            assert_eq!(async_write.level, AcceptanceLevel::Checked);
             assert_eq!(
-                resolve(AcceptanceResolveInput {
-                    agent_name: "worker".into(),
-                    task: Some("Implement the fix".into()),
-                    is_async: true,
-                    ..Default::default()
-                })
-                .level,
-                AcceptanceLevel::Reviewed
+                async_write.review,
+                Some(ReviewSetting::Gate(AcceptanceReviewGate {
+                    agent: Some("reviewer".into()),
+                    focus: None,
+                    required: Some(true),
+                }))
             );
             assert_eq!(
-                resolve(AcceptanceResolveInput {
-                    agent_name: "worker".into(),
-                    task: Some("Fix each item".into()),
-                    mode: Some(SubagentRunMode::Chain),
-                    dynamic: true,
-                    ..Default::default()
-                })
-                .level,
-                AcceptanceLevel::Reviewed
+                async_write.evidence,
+                required_evidence_for_level(AcceptanceLevel::Checked)
+            );
+            let dynamic = resolve(AcceptanceResolveInput {
+                agent_name: "worker".into(),
+                task: Some("Fix each item".into()),
+                mode: Some(SubagentRunMode::Chain),
+                dynamic: true,
+                ..Default::default()
+            });
+            assert_eq!(dynamic.level, AcceptanceLevel::Checked);
+            assert_eq!(
+                dynamic.review,
+                Some(ReviewSetting::Gate(AcceptanceReviewGate {
+                    agent: Some("reviewer".into()),
+                    focus: None,
+                    required: Some(true),
+                }))
             );
         }
 
@@ -5754,7 +7697,8 @@ pub mod model {
                 "acceptance-report",
             ));
             assert!(bad_review.report.is_none());
-            assert!(bad_review.error.as_deref().unwrap().contains("reviewFindings[0]: expected string; got object"));
+            // G79 — `validateStringArrayField` now demands a NON-EMPTY string (`acceptance.ts:827`).
+            assert!(bad_review.error.as_deref().unwrap().contains("reviewFindings[0]: expected non-empty string; got object"));
 
             let bad_command = parse_acceptance_report(&report_text(
                 json!({"commandsRun": [{"command": "npm test", "exitCode": 0}]}),
@@ -5762,16 +7706,347 @@ pub mod model {
             ));
             let err = bad_command.error.as_deref().unwrap();
             assert!(err.contains("commandsRun[0].result: expected one of \"passed\", \"failed\", \"not-run\"; got missing"));
-            assert!(err.contains("commandsRun[0].summary: expected string; got missing"));
+            assert!(err.contains("commandsRun[0].summary: expected non-empty string; got missing"));
 
+            // G79 — `"done"` is now a recognized ALIAS of `satisfied` (`acceptance.ts:520`), so the
+            // unrecognized-status assertion uses a token that really is unrecognized. The alias
+            // itself is asserted separately in
+            // `normalizes_status_aliases_field_aliases_and_singleton_shapes`.
             let bad_criteria = parse_acceptance_report(&report_text(
-                json!({"criteriaSatisfied": [{"id": 7, "status": "done", "evidence": ""}]}),
+                json!({"criteriaSatisfied": [{"id": 7, "status": "maybe", "evidence": ""}]}),
                 "acceptance-report",
             ));
             let err = bad_criteria.error.as_deref().unwrap();
             assert!(err.contains("criteriaSatisfied[0].id: expected string; got number 7"));
-            assert!(err.contains("criteriaSatisfied[0].status: expected one of \"satisfied\", \"not-satisfied\", \"not-applicable\"; got \"done\""));
+            assert!(err.contains("criteriaSatisfied[0].status: expected one of \"satisfied\", \"not-satisfied\", \"not-applicable\"; got \"maybe\""));
             assert!(err.contains("criteriaSatisfied[0].evidence: expected non-empty string; got \"\""));
+        }
+
+        // ---- G79: report normalization, recovery and sources (acceptance.ts:484-772) ----
+
+        #[test]
+        fn normalizes_status_aliases_field_aliases_and_singleton_shapes() {
+            // Every one of these shapes was REJECTED before v0.43.0's normalizer: snake_case keys
+            // were "unsupported", a lone object where an array belongs failed the array check, a
+            // bare string where a `string[]` belongs failed `string[]`, `"true"` failed the boolean
+            // check, and `Done`/`OK` failed the status/result enums.
+            let parsed = parse_acceptance_report(
+                r#"done
+```acceptance-report
+{
+  "criteria_satisfied": {"id": "C 1", "status": "Done", "evidence": "did it"},
+  "changed_files": "src/file.rs",
+  "tests_added_or_updated": ["tests/file.rs"],
+  "commands_run": {"command": "cargo test", "result": "OK", "summary": "green"},
+  "validation_output": "all green",
+  "residual_risks": [],
+  "no_staged_files": "true",
+  "manual_notes": "nothing else"
+}
+```"#,
+            );
+            assert_eq!(parsed.error, None);
+            let report = parsed.report.expect("the normalized report parses");
+            let criterion = &report.criteria_satisfied.as_ref().unwrap()[0];
+            assert_eq!(criterion.id.as_deref(), Some("c-1"));
+            assert_eq!(criterion.status, CriterionStatus::Satisfied);
+            assert_eq!(
+                report.changed_files.as_deref(),
+                Some(["src/file.rs".to_string()].as_slice())
+            );
+            assert_eq!(
+                report.validation_output.as_deref(),
+                Some(["all green".to_string()].as_slice())
+            );
+            let command = &report.commands_run.as_ref().unwrap()[0];
+            assert_eq!(command.result, CommandRunResult::Passed);
+            assert_eq!(report.no_staged_files, Some(true));
+            assert_eq!(report.manual_notes.as_deref(), Some("nothing else"));
+        }
+
+        #[test]
+        fn rejects_duplicate_normalized_criterion_ids_and_unsupported_fields() {
+            let parsed = parse_acceptance_report(&report_text(
+                json!({"criteriaSatisfied": [
+                    {"id": "c 1", "status": "satisfied", "evidence": "one"},
+                    {"id": "C_1", "status": "satisfied", "evidence": "two"}
+                ]}),
+                "acceptance-report",
+            ));
+            let err = parsed.error.as_deref().expect("duplicate ids are an error");
+            assert!(
+                err.contains("criteriaSatisfied[1].id: duplicate normalized criterion id 'c-1'"),
+                "{err}"
+            );
+
+            let unsupported = parse_acceptance_report(&report_text(
+                json!({"criteriaSatisfied": [
+                    {"id": "c1", "status": "satisfied", "evidence": "one", "confidence": 0.9}
+                ]}),
+                "acceptance-report",
+            ));
+            let err = unsupported.error.as_deref().expect("unknown fields are an error");
+            assert!(
+                err.contains("criteriaSatisfied[0].confidence: unsupported acceptance criterion field"),
+                "{err}"
+            );
+
+            let stray = parse_acceptance_report(&report_text(
+                json!({"totallyUnknown": 1}),
+                "acceptance-report",
+            ));
+            let err = stray.error.as_deref().expect("unknown report fields are an error");
+            assert!(
+                err.contains("totallyUnknown: unsupported acceptance report field"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn unwraps_every_wrapper_spelling_and_flags_siblings() {
+            for wrapper in ["acceptance", "acceptance-report", "acceptance_report", "acceptanceReport"] {
+                let mut map = serde_json::Map::new();
+                map.insert(wrapper.to_string(), report_value(json!({})));
+                let body = Value::Object(map);
+                let text = format!(
+                    "done\n```acceptance-report\n{}\n```",
+                    serde_json::to_string(&body).unwrap()
+                );
+                let parsed = parse_acceptance_report(&text);
+                assert_eq!(parsed.error, None, "wrapper `{wrapper}` must unwrap");
+                assert!(parsed.report.is_some(), "wrapper `{wrapper}` must unwrap");
+            }
+
+            let sibling = json!({"acceptance": report_value(json!({})), "extra": 1});
+            let parsed = parse_acceptance_report(&format!(
+                "done\n```acceptance-report\n{}\n```",
+                serde_json::to_string(&sibling).unwrap()
+            ));
+            let err = parsed.error.as_deref().expect("a sibling key is an error");
+            assert!(
+                err.contains("extra: unsupported alongside acceptance report wrapper 'acceptance'"),
+                "{err}"
+            );
+
+            let ambiguous = json!({
+                "acceptance": report_value(json!({})),
+                "acceptanceReport": report_value(json!({})),
+            });
+            let parsed = parse_acceptance_report(&format!(
+                "done\n```acceptance-report\n{}\n```",
+                serde_json::to_string(&ambiguous).unwrap()
+            ));
+            let err = parsed.error.as_deref().expect("two wrappers are ambiguous");
+            assert!(
+                err.contains("multiple acceptance report wrappers are ambiguous"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn recovers_an_unterminated_acceptance_report_fence() {
+            let body = serde_json::to_string(&report_value(json!({}))).unwrap();
+            let recovered = parse_acceptance_report(&format!("done\n```acceptance-report\n{body}"));
+            assert_eq!(recovered.error, None);
+            assert!(recovered.report.is_some());
+
+            // The underscore spelling is accepted everywhere the hyphenated one is
+            // (`acceptance.ts:702-703`).
+            let underscored = parse_acceptance_report(&format!("done\n```acceptance_report\n{body}\n```"));
+            assert_eq!(underscored.error, None);
+            assert!(underscored.report.is_some());
+
+            // An opened fence whose body is not JSON is reported as a defect of THIS report and is
+            // never allowed to fall through to the generic-JSON or marker paths.
+            let broken = parse_acceptance_report("done\n```acceptance-report\nnot json at all");
+            assert!(broken.report.is_none());
+            assert!(
+                broken
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("Failed to parse acceptance-report:"),
+                "{:?}",
+                broken.error
+            );
+
+            let empty = parse_acceptance_report("done\n```acceptance-report\n\n```");
+            assert_eq!(
+                empty.error.as_deref(),
+                Some("Failed to parse acceptance-report: Empty or unterminated acceptance-report fence.")
+            );
+        }
+
+        /// A model cut off mid-opener — `"…\n```acceptance-report"` with no newline after the tag —
+        /// must still be reported as a FENCE DEFECT, not as "no report at all".
+        ///
+        /// `acceptance.ts:702`'s guard is `/```acceptance[-_]report\b/i.test(output)`: tag presence,
+        /// with no `[^\n]*\n` anchor. Reusing the offset-finding opener helper (which needs the
+        /// newline, per `acceptance.ts:671`) collapsed this case onto
+        /// [`ACCEPTANCE_REPORT_NOT_FOUND`] — and that constant is the single discriminator both
+        /// [`parse_acceptance_report_sources`] and [`super::select_acceptance_report_source`] use to
+        /// decide a report is genuinely ABSENT and the other source may be consulted. A truncated
+        /// `file-only` artifact would therefore have been silently replaced by the assistant text.
+        #[test]
+        fn a_fence_opener_with_no_trailing_newline_is_a_defect_not_an_absent_report() {
+            for opener in [
+                "done\n```acceptance-report",
+                "done\n```acceptance_report",
+                // Trailing info-string content, still with no newline (`\b` then `[^\n]*`).
+                "done\n```acceptance-report ",
+            ] {
+                let parsed = parse_acceptance_report(opener);
+                assert!(parsed.report.is_none(), "{opener:?} -> {:?}", parsed.report);
+                assert_eq!(
+                    parsed.error.as_deref(),
+                    Some(
+                        "Failed to parse acceptance-report: Empty or unterminated acceptance-report fence."
+                    ),
+                    "{opener:?} must report the fence defect, never {ACCEPTANCE_REPORT_NOT_FOUND:?}"
+                );
+            }
+
+            // `\b` still bites: a tag that runs straight into another word character is NOT an
+            // acceptance-report fence, so this one genuinely IS absent.
+            let unrelated = parse_acceptance_report("done\n```acceptance-reporting");
+            assert_eq!(unrelated.error.as_deref(), Some(ACCEPTANCE_REPORT_NOT_FOUND));
+
+            // And the load-bearing consequence: an absent report falls through to the other
+            // source, but this defect must NOT — it is surfaced verbatim.
+            let file = super::super::AcceptanceFileOutput {
+                content: "",
+                path: std::path::Path::new("out.md"),
+                authoritative: false,
+            };
+            let sources =
+                parse_acceptance_report_sources("done\n```acceptance-report", Some(&file));
+            assert!(sources.report.is_none());
+            assert_eq!(
+                sources.error.as_deref(),
+                Some(
+                    "Failed to parse acceptance-report: Empty or unterminated acceptance-report fence."
+                )
+            );
+        }
+
+        #[test]
+        fn report_shaped_generic_json_surfaces_its_validation_errors() {
+            // v0.34.0 swallowed this: a `json` fence that is unmistakably a report but has one bad
+            // field read as unrelated prose, so the run silently had "no report".
+            let text = format!(
+                "prose\n```json\n{}\n```",
+                serde_json::to_string(&json!({
+                    "criteriaSatisfied": [{"id": "c1", "status": "maybe", "evidence": "x"}],
+                    "changedFiles": ["a.rs"],
+                }))
+                .unwrap()
+            );
+            let parsed = parse_acceptance_report(&text);
+            assert!(parsed.report.is_none());
+            let err = parsed.error.as_deref().expect("a report-shaped json fence reports errors");
+            assert!(err.starts_with("Failed to parse acceptance-report: Invalid acceptance-report:"), "{err}");
+
+            // Genuinely unrelated JSON stays quiet.
+            let unrelated = parse_acceptance_report("prose\n```json\n{\"hello\": \"world\"}\n```");
+            assert_eq!(unrelated.error.as_deref(), Some(ACCEPTANCE_REPORT_NOT_FOUND));
+        }
+
+        #[test]
+        fn marker_path_distinguishes_missing_from_unterminated_objects() {
+            assert_eq!(
+                parse_acceptance_report("ACCEPTANCE_REPORT: nope").error.as_deref(),
+                Some("Failed to parse acceptance-report: Expected a JSON object after ACCEPTANCE_REPORT:.")
+            );
+            assert_eq!(
+                parse_acceptance_report("ACCEPTANCE_REPORT: {\"changedFiles\": [")
+                    .error
+                    .as_deref(),
+                Some("Failed to parse acceptance-report: Unterminated JSON object after ACCEPTANCE_REPORT:.")
+            );
+        }
+
+        #[test]
+        fn report_sources_prefer_the_file_when_authoritative_and_never_paper_over_a_defect() {
+            let good = format!(
+                "done\n```acceptance-report\n{}\n```",
+                serde_json::to_string(&report_value(json!({"diffSummary": "from-file"}))).unwrap()
+            );
+            let path = std::path::Path::new("out.md");
+
+            // Not authoritative: the assistant output is primary, the file is the fallback.
+            let from_file_fallback = parse_acceptance_report_sources(
+                "no report here",
+                Some(&super::super::AcceptanceFileOutput {
+                    content: &good,
+                    path,
+                    authoritative: false,
+                }),
+            );
+            assert_eq!(
+                from_file_fallback
+                    .report
+                    .as_ref()
+                    .and_then(|r| r.diff_summary.as_deref()),
+                Some("from-file")
+            );
+
+            // Authoritative (`outputMode: "file-only"`): the file is searched FIRST and wins even
+            // when the assistant output also carries a report.
+            let assistant = format!(
+                "done\n```acceptance-report\n{}\n```",
+                serde_json::to_string(&report_value(json!({"diffSummary": "from-text"}))).unwrap()
+            );
+            let file_first = parse_acceptance_report_sources(
+                &assistant,
+                Some(&super::super::AcceptanceFileOutput {
+                    content: &good,
+                    path,
+                    authoritative: true,
+                }),
+            );
+            assert_eq!(
+                file_first
+                    .report
+                    .as_ref()
+                    .and_then(|r| r.diff_summary.as_deref()),
+                Some("from-file")
+            );
+
+            // A MALFORMED report in the primary source is surfaced, never papered over with the
+            // secondary (`acceptance.ts:767-771`) — and the file's parse errors carry the path.
+            let malformed = "done\n```acceptance-report\n{\"criteriaSatisfied\": [{\"id\": \"c1\"}]}\n```";
+            let primary_defect = parse_acceptance_report_sources(
+                malformed,
+                Some(&super::super::AcceptanceFileOutput {
+                    content: &good,
+                    path,
+                    authoritative: false,
+                }),
+            );
+            assert!(primary_defect.report.is_none());
+            assert!(
+                primary_defect.error.as_deref().unwrap().contains("Invalid acceptance-report"),
+                "{:?}",
+                primary_defect.error
+            );
+
+            let file_defect = parse_acceptance_report_sources(
+                "no report here",
+                Some(&super::super::AcceptanceFileOutput {
+                    content: malformed,
+                    path,
+                    authoritative: false,
+                }),
+            );
+            assert!(
+                file_defect
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("(in configured output out.md)"),
+                "{:?}",
+                file_defect.error
+            );
         }
 
         // ---- runVerifyCommand (acceptance.ts:713-767) — the SECOND copy of the runner ----
@@ -5857,7 +8132,9 @@ pub mod model {
                 output: &report_text(json!({"testsAddedOrUpdated": []}), "acceptance-report"),
                 cwd: dir.path(),
                 report: None,
+                file_output: None,
                 review_result: None,
+                memo: None,
             })
             .await;
             assert_eq!(ledger.status, AcceptanceLedgerStatus::Rejected);
@@ -5890,7 +8167,9 @@ pub mod model {
                 ),
                 cwd: dir.path(),
                 report: None,
+                file_output: None,
                 review_result: None,
+                memo: None,
             })
             .await;
             assert_eq!(ledger.status, AcceptanceLedgerStatus::Rejected);
@@ -5924,7 +8203,9 @@ pub mod model {
                 output: &report_text(json!({}), "acceptance-report"),
                 cwd: dir.path(),
                 report: None,
+                file_output: None,
                 review_result: None,
+                memo: None,
             })
             .await;
             assert_eq!(pass_ledger.status, AcceptanceLedgerStatus::Verified);
@@ -5952,7 +8233,9 @@ pub mod model {
                 output: &report_text(json!({}), "acceptance-report"),
                 cwd: dir.path(),
                 report: None,
+                file_output: None,
                 review_result: None,
+                memo: None,
             })
             .await;
             assert_eq!(fail_ledger.status, AcceptanceLedgerStatus::Rejected);
@@ -5966,13 +8249,17 @@ pub mod model {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn reviewed_mode_records_reviewer_outcomes() {
+        /// G78 — the review gate hangs off `acceptance.review` (`acceptance.ts:1318-1336`
+        /// @v0.43.0), NOT off a `level === "reviewed"` that no longer exists, and it moves ONLY
+        /// `status`: `evidence_status` keeps the `checked` the child's evidence actually earned in
+        /// all three outcomes. Before the split, "the reviewer has not answered yet" erased that.
+        async fn review_gate_records_reviewer_outcomes_without_disturbing_evidence_status() {
             let dir = temp_dir();
             let acceptance = resolve(AcceptanceResolveInput {
                 agent_name: "worker".into(),
-                task: Some("Implement a risky fix".into()),
+                task: Some("Implement a fix".into()),
                 explicit: cfg(AcceptanceConfig {
-                    level: Some(AcceptanceLevel::Reviewed),
+                    level: Some(AcceptanceLevel::Checked),
                     review: Some(ReviewSetting::Gate(AcceptanceReviewGate {
                         agent: Some("reviewer".into()),
                         focus: None,
@@ -5982,24 +8269,31 @@ pub mod model {
                 }),
                 ..Default::default()
             });
-            let no_blockers = evaluate_acceptance(EvaluateAcceptanceInput {
+            assert_eq!(acceptance.level, AcceptanceLevel::Checked);
+
+            let reviewed = evaluate_acceptance(EvaluateAcceptanceInput {
                 acceptance: &acceptance,
                 output: &report_text(json!({}), "acceptance-report"),
                 cwd: dir.path(),
                 report: None,
+                file_output: None,
                 review_result: Some(AcceptanceReviewResult {
-                    status: ReviewResultStatus::NoBlockers,
+                    status: ReviewResultStatus::Reviewed,
                     findings: vec![],
                 }),
+                memo: None,
             })
             .await;
-            assert_eq!(no_blockers.status, AcceptanceLedgerStatus::Reviewed);
+            assert_eq!(reviewed.status, AcceptanceLedgerStatus::Reviewed);
+            assert_eq!(reviewed.evidence_status, AcceptanceEvidenceStatus::Checked);
+            assert!(acceptance_failure_message(&reviewed).is_none());
 
             let blockers = evaluate_acceptance(EvaluateAcceptanceInput {
                 acceptance: &acceptance,
                 output: &report_text(json!({}), "acceptance-report"),
                 cwd: dir.path(),
                 report: None,
+                file_output: None,
                 review_result: Some(AcceptanceReviewResult {
                     status: ReviewResultStatus::Blockers,
                     findings: vec![ReviewFinding {
@@ -6009,27 +8303,52 @@ pub mod model {
                         rationale: "Acceptance requires test evidence.".into(),
                     }],
                 }),
+                memo: None,
             })
             .await;
             assert_eq!(blockers.status, AcceptanceLedgerStatus::Rejected);
+            assert_eq!(blockers.evidence_status, AcceptanceEvidenceStatus::Checked);
+            assert_eq!(
+                acceptance_failure_message(&blockers).as_deref(),
+                Some("Acceptance review found blockers.")
+            );
 
             let unavailable = evaluate_acceptance(EvaluateAcceptanceInput {
                 acceptance: &acceptance,
                 output: &report_text(json!({}), "acceptance-report"),
                 cwd: dir.path(),
                 report: None,
+                file_output: None,
                 review_result: None,
+                memo: None,
             })
             .await;
-            assert_eq!(unavailable.status, AcceptanceLedgerStatus::Rejected);
+            // `review-required` is NOT `rejected` (`acceptance.ts:1334`): the run is waiting on a
+            // reviewer, so it neither passes nor fails the acceptance gate on its own.
+            assert_eq!(unavailable.status, AcceptanceLedgerStatus::ReviewRequired);
+            assert_eq!(unavailable.evidence_status, AcceptanceEvidenceStatus::Checked);
+            assert!(acceptance_failure_message(&unavailable).is_none());
             assert_eq!(
                 unavailable.review_result.as_ref().map(|r| r.status),
-                Some(ReviewResultStatus::NeedsParentDecision)
+                Some(ReviewResultStatus::ReviewRequired)
+            );
+            assert_eq!(
+                unavailable
+                    .review_result
+                    .as_ref()
+                    .and_then(|r| r.findings.first())
+                    .map(|f| f.issue.as_str()),
+                Some("Independent review has not been supplied.")
             );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn explicit_checked_is_not_an_explicit_reviewed_blocker_when_inference_recommends_review() {
+        /// G78 — a dynamic-fanout run whose inference recommends review. v0.34.0 escalated the
+        /// LEVEL to `reviewed` and then downgraded the gate to `required: false` to avoid turning
+        /// an explicit `checked` into a hard blocker; v0.43.0 has neither step, because the level
+        /// stops at `checked` and the REQUIRED gate parks the run at `review-required` instead of
+        /// rejecting it. `evidence_status` still records the `checked` that was earned.
+        async fn dynamic_fanout_review_gate_parks_at_review_required_not_rejected() {
             let dir = temp_dir();
             let acceptance = resolve(AcceptanceResolveInput {
                 agent_name: "worker".into(),
@@ -6041,10 +8360,10 @@ pub mod model {
                 }),
                 ..Default::default()
             });
-            assert_eq!(acceptance.level, AcceptanceLevel::Reviewed);
+            assert_eq!(acceptance.level, AcceptanceLevel::Checked);
             assert!(matches!(
                 &acceptance.review,
-                Some(ReviewSetting::Gate(g)) if g.required == Some(false)
+                Some(ReviewSetting::Gate(g)) if g.required == Some(true)
             ));
             let ledger = evaluate_acceptance(EvaluateAcceptanceInput {
                 acceptance: &acceptance,
@@ -6057,43 +8376,52 @@ pub mod model {
                 ),
                 cwd: dir.path(),
                 report: None,
+                file_output: None,
                 review_result: None,
+                memo: None,
             })
             .await;
-            assert_eq!(ledger.status, AcceptanceLedgerStatus::Checked);
+            assert_eq!(ledger.status, AcceptanceLedgerStatus::ReviewRequired);
+            assert_eq!(ledger.evidence_status, AcceptanceEvidenceStatus::Checked);
+            assert!(acceptance_failure_message(&ledger).is_none());
             assert_eq!(
                 ledger.review_result.as_ref().map(|r| r.status),
-                Some(ReviewResultStatus::NeedsParentDecision)
+                Some(ReviewResultStatus::ReviewRequired)
             );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        /// G78 — no reviewer result can ever be invented from the child's own evidence. With the
+        /// gate explicitly switched OFF (`review: false`, which is falsy at `acceptance.ts:1318`)
+        /// the review block does not run at all, so the ledger settles at its evidence level with
+        /// NO `reviewResult` — it is never silently promoted to `reviewed`.
         async fn does_not_mark_reviewed_without_an_independent_reviewer_result() {
             let dir = temp_dir();
             let acceptance = resolve(AcceptanceResolveInput {
                 agent_name: "worker".into(),
                 task: Some("Implement a fix".into()),
                 explicit: cfg(AcceptanceConfig {
-                    level: Some(AcceptanceLevel::Reviewed),
+                    level: Some(AcceptanceLevel::Checked),
                     review: Some(ReviewSetting::Disabled(false)),
                     ..Default::default()
                 }),
                 ..Default::default()
             });
-            assert_eq!(acceptance.level, AcceptanceLevel::Reviewed);
+            assert_eq!(acceptance.level, AcceptanceLevel::Checked);
             let ledger = evaluate_acceptance(EvaluateAcceptanceInput {
                 acceptance: &acceptance,
                 output: &report_text(json!({}), "acceptance-report"),
                 cwd: dir.path(),
                 report: None,
+                file_output: None,
                 review_result: None,
+                memo: None,
             })
             .await;
-            assert_eq!(ledger.status, AcceptanceLedgerStatus::Rejected);
-            assert!(acceptance_failure_message(&ledger)
-                .unwrap()
-                .to_lowercase()
-                .contains("review required"));
+            assert_eq!(ledger.status, AcceptanceLedgerStatus::Checked);
+            assert_eq!(ledger.evidence_status, AcceptanceEvidenceStatus::Checked);
+            assert_eq!(ledger.review_result, None);
+            assert!(acceptance_failure_message(&ledger).is_none());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6113,7 +8441,9 @@ pub mod model {
                 output: "",
                 cwd: dir.path(),
                 report: Some(aggregate_acceptance_report(&[], None)),
+                file_output: None,
                 review_result: None,
+                memo: None,
             })
             .await;
             assert_eq!(ledger.status, AcceptanceLedgerStatus::Rejected);

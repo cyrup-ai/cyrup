@@ -153,6 +153,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         steer_inbox_dir: None,
         control_config: None,
         on_control_event: None,
+        artifacts_dir: None,
         // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
         model_scope: None,
     }

@@ -86,8 +86,6 @@ async fn prompt_workflow_list_names_every_bundled_recipe() {
     for recipe in [
         "gather-context-and-clarify",
         "parallel-cleanup",
-        "parallel-context-build",
-        "parallel-handoff-plan",
         "parallel-research",
         "parallel-review",
         "review-loop",
@@ -95,6 +93,15 @@ async fn prompt_workflow_list_names_every_bundled_recipe() {
         assert!(
             output.contains(&format!("- {recipe}: ")),
             "the bundled recipe {recipe:?} must be listed: {output}"
+        );
+    }
+    // `parallel-context-build`/`parallel-handoff-plan` were deleted upstream in `83b9872` together
+    // with the `planner`/`context-builder` roles their every step named. They must NOT be listed —
+    // a recipe that dispatches to an agent that no longer exists is a broken suggestion.
+    for gone in ["parallel-context-build", "parallel-handoff-plan"] {
+        assert!(
+            !output.contains(&format!("- {gone}: ")),
+            "the removed recipe {gone:?} must not be listed: {output}"
         );
     }
 

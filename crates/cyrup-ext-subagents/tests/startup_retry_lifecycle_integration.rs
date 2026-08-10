@@ -178,6 +178,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         steer_inbox_dir: None,
         control_config: None,
         on_control_event: None,
+        artifacts_dir: None,
         model_scope: None,
     }
 }

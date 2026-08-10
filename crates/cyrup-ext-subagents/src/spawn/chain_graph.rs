@@ -1743,7 +1743,16 @@ async fn evaluate_dynamic_group_acceptance(
         output: "",
         cwd: &ctx.cwd,
         report: Some(model::aggregate_acceptance_report(children, Some(notes))),
+        // A completed GROUP has no child-authored output file of its own — upstream's group gate
+        // likewise passes no `fileOutput` (`chain-execution.ts:1034-1055`).
+        file_output: None,
         review_result: None,
+        // G80 — `None` is upstream's own shape here: both of pi's completed-group
+        // `evaluateAcceptance` calls (`chain-execution.ts:1037-1046,1233-1242` @v0.43.0) pass
+        // neither `artifactsDir` nor `runId`, so a GROUP gate's verify[] commands are never
+        // memoized. Only the per-run gates (`execution.ts:1704-1705`,
+        // `subagent-runner.ts:1638-1639`) supply the pair.
+        memo: None,
     })
     .await;
     model::acceptance_failure_message(&ledger)
