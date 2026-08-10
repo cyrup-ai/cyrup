@@ -826,3 +826,97 @@ fn t9_mirror_custom_message_bg_covers_the_sibling_blocks_and_is_optional() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// T9 — `scrollbarThumb`, Pi's seventh (and OPTIONAL) background token.
+//
+// This is a direct mirror of `pi/packages/coding-agent/test/scrollbar-theme.test.ts`, which was RUN
+// against v0.84.1's source to read its expectations. That test constructs no `ScrollView`, enters no
+// alt-screen renderer and reads no `fullscreenScrollbar` setting: it loads a theme JSON and asserts
+// how the token RESOLVES. Resolution is the part cyrup can port today, and it is the part a user
+// notices first — a theme that omits the token must resolve to its own `selectedBg`, not to "no
+// colour", and a theme that sets it must win.
+//
+// ```ts
+// // :31-38
+// delete themeJson.colors.scrollbarThumb;
+// const loadedTheme = loadThemeFromPath(writeTheme(themeJson), "truecolor");
+// expect(loadedTheme.getBgAnsi("scrollbarThumb")).toBe(loadedTheme.getBgAnsi("selectedBg"));
+// // :40-47
+// themeJson.colors.scrollbarThumb = "#123456";
+// expect(loadedTheme.getBgAnsi("scrollbarThumb")).toBe("\x1b[48;2;18;52;86m");  // rgb(18,52,86)
+// ```
+// ---------------------------------------------------------------------------------------------
+
+/// Load the built-in `dark` theme, optionally overriding `colors.scrollbarThumb`, and project it the
+/// way boot does. `None` = the token is absent, which is upstream's "legacy theme" case.
+fn dark_with_scrollbar_thumb(value: Option<&str>) -> UiTheme {
+    let mut theme = cyrup_resources::theme::builtin_themes()
+        .into_iter()
+        .find(|t| t.data.name == "dark")
+        .expect("the built-in `dark` theme");
+    match value {
+        Some(v) => {
+            theme.data.colors.insert("scrollbarThumb".to_string(), v.to_string());
+        }
+        None => {
+            theme.data.colors.remove("scrollbarThumb");
+        }
+    }
+    UiTheme::from_resolved(theme.data.name.clone(), &theme.resolve(), 0)
+}
+
+/// `scrollbarThumb ?? selectedBg` — applied by `withThemeColorFallbacks` (`theme.ts:330`) and again
+/// by the `Theme` constructor (`theme.ts:365`). A theme that omits the token resolves to its OWN
+/// `selectedBg`, never to `None`.
+///
+/// FAILS before the fix: `BackgroundTheme` had no `scrollbar_thumb` field at all, and the raw role
+/// lookup for a token the theme does not define answers `None` — i.e. "terminal default", which is
+/// a different colour from `selectedBg` on every theme.
+#[test]
+fn t9_an_omitted_scrollbar_thumb_falls_back_to_selected_bg() {
+    let theme = dark_with_scrollbar_thumb(None);
+    let bg = theme.backgrounds();
+
+    assert_eq!(
+        bg.scrollbar_thumb, bg.selected,
+        "`scrollbarThumb: bgColors.scrollbarThumb ?? bgColors.selectedBg` (theme.ts:365)"
+    );
+    // …and pin the concrete value, so the assertion cannot be satisfied by both being `None`.
+    assert_eq!(
+        bg.scrollbar_thumb,
+        Some(Color::Rgb(0x3a, 0x3a, 0x4a)),
+        "dark `selectedBg` is `#3a3a4a` (dark.json vars `selectedBg`)"
+    );
+}
+
+/// The other half: an explicitly configured `scrollbarThumb` WINS over the fallback
+/// (`scrollbar-theme.test.ts:40-47`, whose `#123456` is `rgb(18,52,86)`).
+#[test]
+fn t9_an_explicit_scrollbar_thumb_overrides_the_fallback() {
+    let theme = dark_with_scrollbar_thumb(Some("#123456"));
+    let bg = theme.backgrounds();
+
+    assert_eq!(
+        bg.scrollbar_thumb,
+        Some(Color::Rgb(18, 52, 86)),
+        "the theme's own value, not `selectedBg`"
+    );
+    assert_ne!(bg.scrollbar_thumb, bg.selected, "the fallback must not shadow an explicit token");
+}
+
+/// The token is OPTIONAL upstream (`Type.Optional(ColorValueSchema)`, `theme.ts:50`), so a theme
+/// that omits it must still LOAD — it is not one of the 51 required tokens. Guards against
+/// "porting" the token by adding it to the required set, which would reject every pre-existing user
+/// theme, the exact regression upstream's optionality exists to prevent.
+#[test]
+fn t9_scrollbar_thumb_is_optional_and_never_required() {
+    assert!(
+        !cyrup_resources::theme::REQUIRED_COLOR_TOKENS.contains(&"scrollbarThumb"),
+        "`theme.ts:50` declares it Type.Optional; docs/themes.md:144 lists it with `thinkingMax` \
+         as the two optional tokens among 51 required ones"
+    );
+    // A theme with no `scrollbarThumb` still resolves every other background.
+    let bg = dark_with_scrollbar_thumb(None).backgrounds();
+    assert!(bg.selected.is_some() && bg.user_message.is_some() && bg.tool_error.is_some());
+}

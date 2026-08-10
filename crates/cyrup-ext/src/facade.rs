@@ -262,7 +262,8 @@ impl ExtensionHost {
     ) -> Result<(), ExtError> {
         let mut api = InitApi::new();
         ext.init(&mut api).await?;
-        let (subs, tools, commands, tool_renderers, message_renderers) = api.into_parts();
+        let (subs, tools, commands, tool_renderers, message_renderers, entry_renderers) =
+            api.into_parts();
 
         // EXT-003 footgun guard: a native that subscribes to `project_trust` but did NOT override
         // `decides_project_trust` is skipped by the pre-trust bootstrap pass, so its vote arrives
@@ -291,6 +292,11 @@ impl ExtensionHost {
         }
         for custom_type in message_renderers {
             self.registry.register_message_renderer(id.clone(), custom_type)?;
+        }
+        // X15: the custom-ENTRY renderer table (Pi `extension.entryRenderers`, loader.ts:314-318) —
+        // separate from the message table above, exactly as upstream keeps them.
+        for custom_type in entry_renderers {
+            self.registry.register_entry_renderer(id.clone(), custom_type)?;
         }
 
         // Keep the native handle for command-tier slash execution (R-08-016) before it is wrapped
@@ -693,15 +699,35 @@ impl ExtensionHost {
     /// `LiveExtension::render_call` existed, but nothing could get from a tool NAME to the guest
     /// that renders it, so both were dead outside a unit test.
     pub async fn render_tool_call(&self, tool_name: &str, call: &Value) -> Option<Value> {
-        let owner = self.registry.tool_renderer_owner(tool_name).ok().flatten()?;
-        self.render_via(&owner, tool_name, call, true).await
+        self.render_tool_call_outcome(tool_name, call).await.into_option()
+    }
+
+    /// [`Self::render_tool_call`] keeping the FAULT distinct from "no renderer" — see
+    /// [`RenderOutcome`].
+    pub async fn render_tool_call_outcome(&self, tool_name: &str, call: &Value) -> RenderOutcome {
+        let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
+            return RenderOutcome::None;
+        };
+        self.render_via(&owner, tool_name, call, RenderKind::Call).await
     }
 
     /// Render a TOOL RESULT through the tool's registered renderer (Pi `renderResult`,
     /// extensions/types.ts:475-481). See [`Self::render_tool_call`].
     pub async fn render_tool_result(&self, tool_name: &str, result: &Value) -> Option<Value> {
-        let owner = self.registry.tool_renderer_owner(tool_name).ok().flatten()?;
-        self.render_via(&owner, tool_name, result, false).await
+        self.render_tool_result_outcome(tool_name, result).await.into_option()
+    }
+
+    /// [`Self::render_tool_result`] keeping the FAULT distinct from "no renderer" — see
+    /// [`RenderOutcome`].
+    pub async fn render_tool_result_outcome(
+        &self,
+        tool_name: &str,
+        result: &Value,
+    ) -> RenderOutcome {
+        let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
+            return RenderOutcome::None;
+        };
+        self.render_via(&owner, tool_name, result, RenderKind::Result).await
     }
 
     /// Render a CUSTOM MESSAGE through the extension that registered a renderer for `custom_type`
@@ -715,20 +741,89 @@ impl ExtensionHost {
     /// both surfaces route through them; the two are kept apart by their REGISTRY tables
     /// (`tool_renderer_owner` vs `message_renderer_owner`), not by the wire shape.
     pub async fn render_message_call(&self, custom_type: &str, message: &Value) -> Option<Value> {
-        let owner = self.registry.message_renderer_owner(custom_type).ok().flatten()?;
-        self.render_via(&owner, custom_type, message, true).await
+        self.render_message_call_outcome(custom_type, message).await.into_option()
+    }
+
+    /// [`Self::render_message_call`] keeping the FAULT distinct from "no renderer" — see
+    /// [`RenderOutcome`].
+    ///
+    /// The MESSAGE surface's own consumer collapses the two again on purpose
+    /// (`custom-message.ts:82-84` catches and falls through to the default box); the distinction is
+    /// preserved HERE so it survives to the ENTRY surface, which does not
+    /// ([`Self::render_entry`]).
+    pub async fn render_message_call_outcome(
+        &self,
+        custom_type: &str,
+        message: &Value,
+    ) -> RenderOutcome {
+        let Some(owner) = self.registry.message_renderer_owner(custom_type).ok().flatten() else {
+            return RenderOutcome::None;
+        };
+        self.render_via(&owner, custom_type, message, RenderKind::Call).await
     }
 
     /// The result-side companion of [`Self::render_message_call`].
     pub async fn render_message_result(&self, custom_type: &str, message: &Value) -> Option<Value> {
-        let owner = self.registry.message_renderer_owner(custom_type).ok().flatten()?;
-        self.render_via(&owner, custom_type, message, false).await
+        self.render_message_result_outcome(custom_type, message).await.into_option()
     }
 
-    /// Invoke `render-call`/`render-result` on a specific extension, containing faults LOCALLY
-    /// (`warn!` + `None`) the way [`Self::deliver_bus_events`] does. Deliberately NOT routed through
+    /// [`Self::render_message_result`] keeping the FAULT distinct from "no renderer" — see
+    /// [`RenderOutcome`].
+    pub async fn render_message_result_outcome(
+        &self,
+        custom_type: &str,
+        message: &Value,
+    ) -> RenderOutcome {
+        let Some(owner) = self.registry.message_renderer_owner(custom_type).ok().flatten() else {
+            return RenderOutcome::None;
+        };
+        self.render_via(&owner, custom_type, message, RenderKind::Result).await
+    }
+
+    /// Render a custom ENTRY through the extension that registered an ENTRY renderer for
+    /// `custom_type` (Pi `getEntryRenderer(entry.customType)`, `extensions/runner.ts:593-600`,
+    /// resolved by `interactive-mode.ts:3431-3436 addCustomEntryToChat`).
+    ///
+    /// X15 — this is the surface whose FAULT is user-visible, and the reason [`RenderOutcome`]
+    /// exists. Upstream `CustomEntryComponent.rebuild` (`custom-entry.ts:40-52`) has three distinct
+    /// outcomes and they draw three different things:
+    ///
+    /// | upstream                                    | here                     | drawn |
+    /// |---------------------------------------------|--------------------------|-------|
+    /// | `getEntryRenderer(...) === undefined` (:3433) | [`RenderOutcome::None`]  | nothing |
+    /// | renderer returned `undefined` (:54-56 / :3438) | [`RenderOutcome::None`] | nothing |
+    /// | renderer returned a `Component` (:58-60)     | [`RenderOutcome::Rendered`] | `Spacer(1)` + the component |
+    /// | renderer THREW (:47-52)                      | [`RenderOutcome::Failed`] | `Spacer(1)` + a `customMessageBg` box holding `[type] renderer failed: {message}` |
+    ///
+    /// The first two collapse because upstream draws nothing for both; the THIRD must not, and
+    /// before this existed it did — `render_via` reported a faulting renderer as `None` and the
+    /// failure box had no producer anywhere in `crates/`.
+    ///
+    /// CYRUP-DELTA (wire): there is no `render-entry` guest export. cyrup's WIT deliberately keeps
+    /// ONE renderer pair (`render-call`/`render-result`) keyed by an opaque `custom-type` and tells
+    /// the surfaces apart by their REGISTRY table (see [`Self::render_message_call`]); an entry
+    /// therefore travels over `render-call`. Adding a fourth export would break every already-built
+    /// guest component for no behavioural gain. A NATIVE owner has no such constraint and gets its
+    /// own [`crate::NativeExtension::render_entry`] hook.
+    pub async fn render_entry(&self, custom_type: &str, entry: &Value) -> RenderOutcome {
+        let Some(owner) = self.registry.entry_renderer_owner(custom_type).ok().flatten() else {
+            return RenderOutcome::None;
+        };
+        self.render_via(&owner, custom_type, entry, RenderKind::Entry).await
+    }
+
+    /// Invoke the owner's renderer, containing faults LOCALLY (`warn!` + [`RenderOutcome::Failed`])
+    /// the way [`Self::deliver_bus_events`] does. Deliberately NOT routed through
     /// `dispatch_block_mutate`: a renderer is a presentation concern and a faulting one must never
     /// be able to block the tool call it was asked to draw (R-08-036).
+    ///
+    /// X15 — containment used to mean `warn!` + `None`, and `None` is ALSO what "no extension
+    /// registered a renderer for this key" returns, so "the renderer threw" and "there is no
+    /// renderer" were indistinguishable to every caller. Upstream never conflates them: the throw
+    /// is caught at the COMPONENT (`custom-entry.ts:47-52` / `custom-message.ts:82-84`), which
+    /// still knows which of the two it is looking at. The fault now travels as its own variant and
+    /// each surface decides what to draw for it; the `warn!` is unchanged, since a faulting
+    /// renderer is still an extension bug worth logging once per render.
     ///
     /// NATIVE owners are tried first and are available in EVERY build (a native renderer needs no
     /// wasm host); a guest owner resolves against the live instance map only under `wasm-host`.
@@ -737,31 +832,32 @@ impl ExtensionHost {
         owner: &ExtensionId,
         key: &str,
         payload: &Value,
-        is_call: bool,
-    ) -> Option<Value> {
+        kind: RenderKind,
+    ) -> RenderOutcome {
         if let Some(native) = self.native.read().ok().and_then(|g| g.get(owner).cloned()) {
-            // A panicking native renderer must degrade to the default framing, never take the
-            // frame down with it (R-08-036) — the same containment the guest arm gets below.
-            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if is_call {
-                    native.render_call(key, payload)
-                } else {
-                    native.render_result(key, payload)
-                }
+            // A panicking native renderer must degrade gracefully, never take the frame down with
+            // it (R-08-036) — the same containment the guest arm gets below. `catch_unwind` IS the
+            // native analog of upstream's `try`/`catch`, so its `Err` is the `throw` of
+            // `custom-entry.ts:47` and carries the same payload: the panic message.
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
+                RenderKind::Call => native.render_call(key, payload),
+                RenderKind::Result => native.render_result(key, payload),
+                RenderKind::Entry => native.render_entry(key, payload),
             }));
             return match rendered {
-                Ok(v) => v,
+                Ok(v) => RenderOutcome::from_option(v),
                 Err(panic) => {
+                    let message = native_panic_msg(panic);
                     tracing::warn!(
-                        extension = %owner, key = %key,
-                        error = %native_panic_msg(panic),
-                        "native renderer panicked (falling back to the default renderer)"
+                        extension = %owner, key = %key, error = %message,
+                        "native renderer panicked (the surface decides: default framing for a \
+                         message/tool row, a failure box for a custom entry)"
                     );
-                    None
+                    RenderOutcome::Failed(message)
                 }
             };
         }
-        self.render_via_guest(owner, key, payload, is_call).await
+        self.render_via_guest(owner, key, payload, kind).await
     }
 
     #[cfg(feature = "wasm-host")]
@@ -770,37 +866,45 @@ impl ExtensionHost {
         owner: &ExtensionId,
         key: &str,
         payload: &Value,
-        is_call: bool,
-    ) -> Option<Value> {
-        let ext = self.live.read().ok().and_then(|g| g.get(owner).cloned())?;
-        let out = if is_call {
-            ext.render_call(key, payload).await
-        } else {
-            ext.render_result(key, payload).await
+        kind: RenderKind,
+    ) -> RenderOutcome {
+        let Some(ext) = self.live.read().ok().and_then(|g| g.get(owner).cloned()) else {
+            // The owner is recorded but has no live instance (unloaded mid-render, or a native-only
+            // build). Nothing threw — there is simply nothing to call.
+            return RenderOutcome::None;
+        };
+        // CYRUP-DELTA: an ENTRY rides the `render-call` export — see [`Self::render_entry`] for why
+        // the world deliberately has no fourth renderer export.
+        let out = match kind {
+            RenderKind::Call | RenderKind::Entry => ext.render_call(key, payload).await,
+            RenderKind::Result => ext.render_result(key, payload).await,
         };
         match out {
-            Ok(v) => v,
+            Ok(v) => RenderOutcome::from_option(v),
             Err(e) => {
+                let message = e.to_string();
                 tracing::warn!(
-                    extension = %owner, key = %key, error = %e,
-                    "extension renderer fault contained (falling back to the default renderer)"
+                    extension = %owner, key = %key, error = %message,
+                    "extension renderer fault contained (the surface decides: default framing for \
+                     a message/tool row, a failure box for a custom entry)"
                 );
-                None
+                RenderOutcome::Failed(message)
             }
         }
     }
 
     /// Native-only build: no live guest can hold a renderer, so a guest-owned key draws with the
     /// host's own framing. (A NATIVE-owned key is still rendered — see [`Self::render_via`].)
+    /// [`RenderOutcome::None`], not `Failed`: nothing threw, the runtime simply is not there.
     #[cfg(not(feature = "wasm-host"))]
     async fn render_via_guest(
         &self,
         _owner: &ExtensionId,
         _key: &str,
         _payload: &Value,
-        _is_call: bool,
-    ) -> Option<Value> {
-        None
+        _kind: RenderKind,
+    ) -> RenderOutcome {
+        RenderOutcome::None
     }
 
     /// Whether ANY extension registered a renderer for this tool name (Pi
@@ -814,6 +918,13 @@ impl ExtensionHost {
     /// `getMessageRenderer(...) !== undefined`, runner.ts:579-587).
     pub fn has_message_renderer(&self, custom_type: &str) -> bool {
         self.registry.message_renderer_owner(custom_type).ok().flatten().is_some()
+    }
+
+    /// Whether ANY extension registered a custom-ENTRY renderer for `custom_type` (Pi
+    /// `getEntryRenderer(...) !== undefined`, runner.ts:593-600 — the `if (!renderer) return;`
+    /// early-out of `addCustomEntryToChat`, interactive-mode.ts:3432-3435).
+    pub fn has_entry_renderer(&self, custom_type: &str) -> bool {
+        self.registry.entry_renderer_owner(custom_type).ok().flatten().is_some()
     }
 
     pub fn registry(&self) -> &ExtensionRegistry {
@@ -1240,6 +1351,75 @@ impl ExtensionHost {
 
 /// Extract a panic payload message (mirrors `native::panic_msg`, kept local so the facade does not
 /// reach into the native module's private helper).
+/// Which of the three renderer hooks [`ExtensionHost::render_via`] is dispatching.
+///
+/// `Call`/`Result` are the tool + custom-message pair; `Entry` is the custom-ENTRY renderer
+/// (`registerEntryRenderer`). On the GUEST wire `Entry` reuses `render-call` — see
+/// [`ExtensionHost::render_entry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderKind {
+    Call,
+    Result,
+    Entry,
+}
+
+/// What an extension's registered renderer produced — the three outcomes Pi's renderer components
+/// distinguish (`custom-entry.ts:40-60`, `custom-message.ts:60-88`).
+///
+/// X15 — cyrup previously modelled this as `Option<Value>` and so could not tell a renderer that
+/// THREW from one that was never registered: both were `None`, and `cyrup-tui` mapped `None` to
+/// "draw the default framing". That made `crate::` incapable of ever producing Pi's
+/// `[type] renderer failed: …` box, which is the ONLY thing upstream draws for a throw
+/// (`custom-entry.ts:50` is the sole occurrence of that string in `packages/`).
+///
+/// Note the two "nothing came back" cases are deliberately ONE variant: upstream's `!component`
+/// check (`custom-entry.ts:54-56`) treats "no renderer registered" and "the renderer returned
+/// `undefined`" identically on both surfaces, so no consumer needs to tell them apart. Callers that
+/// want the cheap pre-check ask [`ExtensionHost::has_entry_renderer`] /
+/// [`ExtensionHost::has_message_renderer`] instead, exactly as upstream does before constructing a
+/// component.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum RenderOutcome {
+    /// No renderer is registered for this key, or the registered renderer chose to draw nothing
+    /// (`Component | undefined` returning `undefined`). The host draws its own framing.
+    #[default]
+    None,
+    /// The renderer's output — a serialized widget tree, the wire analog of the `pi-tui`
+    /// `Component` an upstream renderer returns.
+    Rendered(Value),
+    /// The renderer FAULTED: a native renderer panicked, or a guest renderer trapped/errored. The
+    /// payload is the message, upstream's
+    /// `error instanceof Error ? error.message : String(error)` (`custom-entry.ts:48`).
+    Failed(String),
+}
+
+impl RenderOutcome {
+    fn from_option(v: Option<Value>) -> Self {
+        match v {
+            Some(v) => Self::Rendered(v),
+            None => Self::None,
+        }
+    }
+
+    /// Collapse back to the pre-X15 shape, which is what the MESSAGE and TOOL surfaces genuinely
+    /// want: `custom-message.ts:82-84` catches a throw and falls through to the default box, i.e.
+    /// upstream itself treats a faulting message renderer as "no rendered component".
+    pub fn into_option(self) -> Option<Value> {
+        match self {
+            Self::Rendered(v) => Some(v),
+            Self::None | Self::Failed(_) => None,
+        }
+    }
+
+    /// The fault message, if this is a [`Self::Failed`].
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Failed(m) => Some(m.as_str()),
+            _ => None,
+        }
+    }
+}
+
 fn native_panic_msg(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()

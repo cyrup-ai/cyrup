@@ -214,12 +214,13 @@ impl HostCtx {
 }
 
 /// The decomposed result of [`InitApi`]: the declared subscriptions, registered tools, registered
-/// `(name, descriptor)` commands, and the tool names / custom types this extension declared a
-/// renderer for (EXT-006).
+/// `(name, descriptor)` commands, and the tool names / custom message types / custom ENTRY types
+/// this extension declared a renderer for (EXT-006, X15).
 pub(crate) type InitParts = (
     Subscriptions,
     Vec<Arc<dyn Tool>>,
     Vec<(String, CommandDescriptor)>,
+    Vec<String>,
     Vec<String>,
     Vec<String>,
 );
@@ -233,6 +234,7 @@ pub struct InitApi {
     commands: Vec<(String, CommandDescriptor)>,
     tool_renderers: Vec<String>,
     message_renderers: Vec<String>,
+    entry_renderers: Vec<String>,
 }
 
 impl InitApi {
@@ -278,12 +280,35 @@ impl InitApi {
         self.tool_renderers.push(tool_name.into());
     }
 
+    /// Declare that this extension renders custom ENTRIES of `custom_type` (Pi
+    /// `api.registerEntryRenderer(customType, renderer)`, extensions/types.ts:1295, implemented at
+    /// `loader.ts:314-318`). The host routes [`crate::ExtensionHost::render_entry`] for that type
+    /// back to [`NativeExtension::render_entry`]. First registration in load order wins, matching
+    /// Pi's `getEntryRenderer` loop (runner.ts:593-600).
+    ///
+    /// X15 — DISTINCT from [`Self::register_message_renderer`]. A custom MESSAGE participates in
+    /// LLM context and is drawn by `CustomMessageComponent`, which SWALLOWS a renderer throw and
+    /// falls through to its default `[type] body` box (`custom-message.ts:82-84`). A custom ENTRY
+    /// is TUI-only durable state (`pi.appendEntry`) drawn by `CustomEntryComponent`, which draws a
+    /// `[type] renderer failed: …` box instead (`custom-entry.ts:47-52`) and draws NOTHING at all
+    /// when no renderer claims the type (`interactive-mode.ts:3432-3435`).
+    pub fn register_entry_renderer(&mut self, custom_type: impl Into<String>) {
+        self.entry_renderers.push(custom_type.into());
+    }
+
     pub fn subscriptions(&self) -> Subscriptions {
         self.subs
     }
 
     pub(crate) fn into_parts(self) -> InitParts {
-        (self.subs, self.tools, self.commands, self.tool_renderers, self.message_renderers)
+        (
+            self.subs,
+            self.tools,
+            self.commands,
+            self.tool_renderers,
+            self.message_renderers,
+            self.entry_renderers,
+        )
     }
 }
 
@@ -388,6 +413,24 @@ pub trait NativeExtension: Send + Sync {
     /// The result-side companion of [`Self::render_call`] (Pi `renderResult`,
     /// extensions/types.ts:475-481).
     fn render_result(&self, _key: &str, _result: &serde_json::Value) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Render a custom ENTRY this extension declared a renderer for via
+    /// [`InitApi::register_entry_renderer`] (Pi `EntryRenderer`, extensions/types.ts:1165-1169).
+    /// `custom_type` is the entry's `customType`; `entry` is the serialized session entry.
+    ///
+    /// `None` — the upstream `Component | undefined` return — means "I chose to draw nothing"; the
+    /// host then draws nothing at all, matching `CustomEntryComponent.hasContent() === false`
+    /// (`interactive-mode.ts:3438-3440`). A PANIC is the `throw` of `custom-entry.ts:47`: the host
+    /// contains it and reports [`crate::RenderOutcome::Failed`], which draws the failure box.
+    ///
+    /// Sync for the same reason as [`Self::render_call`]: it runs on the UI's event path.
+    fn render_entry(
+        &self,
+        _custom_type: &str,
+        _entry: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
         None
     }
 

@@ -101,6 +101,11 @@ fn push_registrations(api: &ExtensionApi) {
     for r in &api.renderers {
         registration::register_message_renderer(&r.custom_type);
     }
+    // The custom-ENTRY table (Pi `registerEntryRenderer`, types.ts:1295) — a distinct host import
+    // because the host keeps a distinct table; rendering still arrives on `render-call`.
+    for r in &api.entry_renderers {
+        registration::register_entry_renderer(&r.custom_type);
+    }
     for command in &api.autocomplete {
         registration::add_autocomplete(command);
     }

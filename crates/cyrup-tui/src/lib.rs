@@ -94,7 +94,7 @@ pub use autocomplete::{
     Completion, CompletionContext,
 };
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
-pub use overlay::{HotkeysOverlay, Overlay, OverlayOutcome};
+pub use overlay::{Overlay, OverlayOutcome};
 pub use panic_hook::{install_panic_hook, restore_terminal_best_effort};
 pub use resume_hint::{
     format_resume_command, quote_if_needed, resume_hint_line, ResumeTarget, APP_NAME,
@@ -169,7 +169,7 @@ pub use status::{
     experimental_features_enabled, experimental_features_enabled_from, format_tokens, StatusLine,
 };
 pub use text_input::TextInputSelector;
-pub use tree_selector::{FilterMode, TreeKind, TreeNode, TreeSelector};
+pub use tree_selector::{FilterMode, TreeEntryRole, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{IndicatorKind, StatusIndicator, SPINNER_FRAMES, SPINNER_INTERVAL};
 pub use startup::{
     build_startup_lines, display_path, extension_diagnostics, resource_diagnostics,

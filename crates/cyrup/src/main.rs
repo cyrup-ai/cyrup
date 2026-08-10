@@ -1660,7 +1660,10 @@ async fn run_interactive(
     // raw projection, interactive-mode.ts:3506-3516).
     let restored = session.raw_context_messages().await;
     if !restored.is_empty() {
-        app.replay_session(&restored);
+        // X11 — WITH the loaded extensions: Pi resolves `getMessageRenderer(message.customType)` on
+        // the replay walk (`interactive-mode.ts:3471`) exactly as it does on the live
+        // `addMessageToChat` path, so a `--resume`d session keeps the extension rendering it had.
+        app.replay_session_with_extensions(&restored, &session.services().ext_host).await;
     }
 
     if !inputs.is_empty() {

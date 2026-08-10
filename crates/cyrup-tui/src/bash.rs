@@ -53,6 +53,15 @@ pub struct BashExecution {
     /// derived from elapsed time exactly as the status band does
     /// ([`crate::status_indicator::StatusIndicator::spinner_at`]).
     started: Instant,
+    /// X13 — Pi `BashExecutionComponent.truncationResult?.truncated` (`bash-execution.ts:27`), set
+    /// by `setComplete`'s third argument from `result.truncated` (`interactive-mode.ts:6310`,
+    /// `:6351`, and the replay at `:3460`). The executor decided the output it handed back was
+    /// clipped; the component itself does not recompute that.
+    truncated: bool,
+    /// X13 — Pi `BashExecutionComponent.fullOutputPath` (`:28`): where the executor spooled the
+    /// UNclipped output. `bash-execution.ts:197` renders the warning only when a path is present,
+    /// because the whole point of the row is telling the user where to find the rest.
+    full_output_path: Option<String>,
 }
 
 impl BashExecution {
@@ -66,6 +75,8 @@ impl BashExecution {
             exit_code: None,
             expanded: false,
             started: Instant::now(),
+            truncated: false,
+            full_output_path: None,
         }
     }
 
@@ -130,7 +141,20 @@ impl BashExecution {
     /// `complete`, not `error`. cyrup tested `exit_code != Some(0)`, which swept `None` into the
     /// error arm and then rendered a bold red `  (exit ?)` row upstream never draws (there is no
     /// `?` fallback anywhere in `bash-execution.ts`; `:192` interpolates the number directly).
-    pub fn set_complete(&mut self, exit_code: Option<i32>, cancelled: bool) {
+    ///
+    /// X13 — upstream's signature has FOUR parameters, not two:
+    /// `setComplete(exitCode, cancelled, truncationResult?, fullOutputPath?)` (`:98-103`), and both
+    /// tail arguments are supplied at every call site (`interactive-mode.ts:6307-6312`,
+    /// `:6348-6353`, `:3460-3465`). cyrup dropped them, so `"Output truncated"` appeared nowhere in
+    /// the crate and a spooled `!` output was silently unreachable. See
+    /// [`Self::render_lines_at`]'s status block for the row they drive.
+    pub fn set_complete(
+        &mut self,
+        exit_code: Option<i32>,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
+    ) {
         self.exit_code = exit_code;
         self.status = if cancelled {
             BashStatus::Cancelled
@@ -139,6 +163,30 @@ impl BashExecution {
         } else {
             BashStatus::Complete
         };
+        self.truncated = truncated;
+        self.full_output_path = full_output_path;
+    }
+
+    /// X13 — `contextTruncation.truncated` (`bash-execution.ts:122-126`): whether the accumulated
+    /// output on its own exceeds the LLM-context limits the component re-applies every frame,
+    /// independent of whatever the executor reported.
+    ///
+    /// `truncateTail`'s own early-out is the whole predicate — `truncate.ts:177`
+    /// `if (totalLines <= maxLines && totalBytes <= maxBytes)` returns `truncated: false` — so the
+    /// boolean needs no tail walk, only the two totals. Byte length is UTF-8 (`Buffer.byteLength`),
+    /// which is `str::len()` here.
+    fn context_truncated(&self) -> bool {
+        /// `truncate.ts:11` `DEFAULT_MAX_LINES`.
+        const MAX_LINES: usize = 2000;
+        /// `truncate.ts:12` `DEFAULT_MAX_BYTES` (50 KB).
+        const MAX_BYTES: usize = 50 * 1024;
+        if self.output_lines.len() > MAX_LINES {
+            return true;
+        }
+        // `\n`-joined, matching `getOutput`/`updateDisplay`'s `this.outputLines.join("\n")`.
+        let bytes: usize = self.output_lines.iter().map(String::len).sum::<usize>()
+            + self.output_lines.len().saturating_sub(1);
+        bytes > MAX_BYTES
     }
 
     /// The styled lines for the current frame (`updateDisplay` render, `bash-execution.ts:119-204`):
@@ -310,12 +358,39 @@ impl BashExecution {
                     }
                     _ => {}
                 }
+                // X13 — the truncation warning, the LAST status part (`bash-execution.ts:195-199`):
+                //
+                // ```ts
+                // const wasTruncated = this.truncationResult?.truncated || contextTruncation.truncated;
+                // if (wasTruncated && this.fullOutputPath) {
+                //     statusParts.push(theme.fg("warning", `Output truncated. Full output: ${this.fullOutputPath}`));
+                // }
+                // ```
+                //
+                // Both conditions matter: a truncated run with no spool path renders NOTHING (there
+                // would be nowhere to send the user), which is why the row is gated on the path and
+                // not just the flag. `contextTruncation` is the component's own
+                // `truncateTail(fullOutput, {maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES})`
+                // (`:122-126`) — the same 2000-line / 50 KB pair `truncate.ts:11-12` defines, applied
+                // to what is on screen — so an executor that reported no truncation still trips the
+                // warning once the block itself overflows those limits.
+                if (self.truncated || self.context_truncated())
+                    && let Some(path) = &self.full_output_path
+                {
+                    // The colour rides on the SPAN, not the `Line`: a spool path is long enough to
+                    // wrap at `width - 2`, and `wrap_line` rebuilds each produced row from its
+                    // cells' styles — a `Line`-level style would survive only the un-wrapped case.
+                    parts.push(Line::from(vec![Span::styled(
+                        format!("Output truncated. Full output: {path}"),
+                        theme.warning_style(),
+                    )]));
+                }
                 if !parts.is_empty() {
                     out.push(Line::default());
                     // One `new Text(`\n${statusParts.join("\n")}`, 1, 0)` for the whole group
                     // (`bash-execution.ts:202`): `wrapTextWithAnsi` splits it back on `\n`
                     // (`utils.ts:839`) and `text.ts:64`/`:70-76` wrap each piece at `width - 2` and
-                    // margin every produced row. `X13`'s truncation-warning part carries a full
+                    // margin every produced row. X13's truncation-warning part carries a full
                     // filesystem path and is the one that actually needs the wrap.
                     for part in parts {
                         out.extend(crate::transcript::text_lines_of(&part, width, 1));
@@ -331,7 +406,7 @@ impl BashExecution {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use ratatui::style::Style;
 
     use super::*;
@@ -352,15 +427,15 @@ mod tests {
     #[test]
     fn complete_classifies_exit_codes() {
         let mut ok = BashExecution::new("true", false);
-        ok.set_complete(Some(0), false);
+        ok.set_complete(Some(0), false, false, None);
         assert_eq!(ok.status(), BashStatus::Complete);
 
         let mut err = BashExecution::new("false", false);
-        err.set_complete(Some(1), false);
+        err.set_complete(Some(1), false, false, None);
         assert_eq!(err.status(), BashStatus::Error);
 
         let mut cancelled = BashExecution::new("sleep 10", false);
-        cancelled.set_complete(None, true);
+        cancelled.set_complete(None, true, false, None);
         assert_eq!(cancelled.status(), BashStatus::Cancelled);
     }
 
@@ -383,7 +458,7 @@ mod tests {
         let theme = UiTheme::dark();
         let mut sig = BashExecution::new("sleep 10", false);
         sig.append_output("partial");
-        sig.set_complete(None, false);
+        sig.set_complete(None, false, false, None);
         assert_eq!(sig.status(), BashStatus::Complete, "a missing exit code is not an error");
         let text: Vec<String> =
             sig.render_lines(40, &theme, None, None).iter().map(plain).collect();
@@ -392,7 +467,7 @@ mod tests {
         // MIRROR: a real non-zero code still classifies as an error and still renders `(exit N)`
         // with the number, inset one column like every other row of the block.
         let mut err = BashExecution::new("false", false);
-        err.set_complete(Some(3), false);
+        err.set_complete(Some(3), false, false, None);
         assert_eq!(err.status(), BashStatus::Error);
         let etext: Vec<String> =
             err.render_lines(40, &theme, None, None).iter().map(plain).collect();
@@ -411,7 +486,7 @@ mod tests {
         let theme = UiTheme::dark();
         let mut b = BashExecution::new("ls", false);
         b.append_output("alpha\nbeta");
-        b.set_complete(Some(7), false);
+        b.set_complete(Some(7), false, false, None);
         let text: Vec<String> =
             b.render_lines(40, &theme, None, Some("Ctrl+O")).iter().map(plain).collect();
         // [spacer, rule, header, blank, out, out, blank, (exit 7), rule]
@@ -433,7 +508,7 @@ mod tests {
         // MIRROR: with NO output there is no output blank — `bash-execution.ts:142` gates the whole
         // output `Text` on `availableLines.length > 0`.
         let mut empty = BashExecution::new("true", false);
-        empty.set_complete(Some(0), false);
+        empty.set_complete(Some(0), false, false, None);
         let etext: Vec<String> =
             empty.render_lines(40, &theme, None, None).iter().map(plain).collect();
         assert_eq!(etext, vec!["".to_string(), "─".repeat(40), " $ true".to_string(), "─".repeat(40)]);
@@ -488,7 +563,7 @@ mod tests {
         for i in 1..=30 {
             b.append_output(&format!("line{i}\n"));
         }
-        b.set_complete(Some(0), false);
+        b.set_complete(Some(0), false, false, None);
 
         let lines = b.render_lines(40, &theme, None, Some("ctrl+o"));
         let hint = lines.iter().find(|l| plain(l).contains("more lines")).unwrap();
@@ -517,7 +592,7 @@ mod tests {
         for i in 1..=30 {
             b.append_output(&format!("line{i}\n"));
         }
-        b.set_complete(Some(0), false);
+        b.set_complete(Some(0), false, false, None);
         let lines = b.render_lines(40, &theme, None, Some("Ctrl+O"));
         let text: Vec<String> = lines.iter().map(plain).collect();
         // 30 output lines + a trailing empty (from the final "\n") → preview keeps the last 20.
@@ -550,7 +625,7 @@ mod tests {
         let long_cmd = "grep --recursive --line-number --binary-files=without-match needle ./src";
         let mut b = BashExecution::new(long_cmd, false);
         b.append_output("a very long line of program output that certainly does not fit in thirty\n");
-        b.set_complete(Some(0), false);
+        b.set_complete(Some(0), false, false, None);
         let lines = b.render_lines(30, &theme, None, None);
         let text: Vec<String> = lines.iter().map(plain).collect();
 
@@ -575,7 +650,7 @@ mod tests {
 
         // MIRROR: a short command still renders as exactly one inset header row.
         let mut short = BashExecution::new("true", false);
-        short.set_complete(Some(0), false);
+        short.set_complete(Some(0), false, false, None);
         let stext: Vec<String> = short.render_lines(40, &theme, None, None).iter().map(plain).collect();
         assert_eq!(stext[2], " $ true", "{stext:?}");
     }
@@ -598,7 +673,7 @@ mod tests {
         for i in 0..40 {
             b.append_output(&format!("line{i}\n"));
         }
-        b.set_complete(Some(0), false);
+        b.set_complete(Some(0), false, false, None);
 
         // `... 21 more lines (ctrl+shift+o to expand)` is 42 cells; a 30-column block gives the
         // status `Text` a `contentWidth` of 28, so upstream breaks it in two — after `lines`, since
@@ -636,7 +711,7 @@ mod tests {
 
         // MIRROR — a status part that FITS is still exactly one inset row, unwrapped.
         let mut short = BashExecution::new("false", false);
-        short.set_complete(Some(1), false);
+        short.set_complete(Some(1), false, false, None);
         let stext: Vec<String> = short.render_lines(40, &theme, None, None).iter().map(plain).collect();
         assert_eq!(
             stext.iter().filter(|r| r.contains("exit 1")).count(),
@@ -667,5 +742,69 @@ mod tests {
         let inc = BashExecution::new("secret", false);
         let inc_lines = inc.render_lines(20, &theme, None, None);
         assert_eq!(inc_lines[2].spans[1].style, header_style);
+    }
+
+    /// **X13 — the truncation warning row (`bash-execution.ts:195-199`).**
+    ///
+    /// ```ts
+    /// const wasTruncated = this.truncationResult?.truncated || contextTruncation.truncated;
+    /// if (wasTruncated && this.fullOutputPath) {
+    ///     statusParts.push(theme.fg("warning", `Output truncated. Full output: ${this.fullOutputPath}`));
+    /// }
+    /// ```
+    #[test]
+    fn x13_truncated_output_names_the_spool_file() {
+        let theme = UiTheme::dark();
+        let mut b = BashExecution::new("gen", false);
+        b.append_output("a\nb\n");
+        b.set_complete(Some(0), false, true, Some("/tmp/pi-bash-1.log".to_string()));
+        let lines = b.render_lines(80, &theme, None, None);
+        let row = lines
+            .iter()
+            .find(|l| plain(l).contains("Output truncated"))
+            .unwrap_or_else(|| panic!("no warning row in {:?}", lines.iter().map(plain).collect::<Vec<_>>()));
+        assert!(plain(row).contains("Output truncated. Full output: /tmp/pi-bash-1.log"));
+        assert_eq!(row.spans[1].style, theme.warning_style(), "`theme.fg(\"warning\", …)`");
+
+        // MIRROR 1: truncated but with NO spool path renders nothing — upstream's `&& this.fullOutputPath`
+        // guard, because there would be nowhere to point the user.
+        let mut no_path = BashExecution::new("gen", false);
+        no_path.append_output("a\nb\n");
+        no_path.set_complete(Some(0), false, true, None);
+        assert!(
+            !no_path.render_lines(80, &theme, None, None).iter().any(|l| plain(l).contains("truncated")),
+            "no path ⇒ no row"
+        );
+
+        // MIRROR 2: a path with NO truncation renders nothing either.
+        let mut untruncated = BashExecution::new("gen", false);
+        untruncated.append_output("a\nb\n");
+        untruncated.set_complete(Some(0), false, false, Some("/tmp/x.log".to_string()));
+        assert!(
+            !untruncated
+                .render_lines(80, &theme, None, None)
+                .iter()
+                .any(|l| plain(l).contains("truncated")),
+            "not truncated ⇒ no row"
+        );
+
+        // MIRROR 3: the component's OWN `contextTruncation` (`:122-126`) trips it even when the
+        // executor reported `truncated: false` — 2001 lines is past `DEFAULT_MAX_LINES`.
+        let mut ctx = BashExecution::new("gen", false);
+        ctx.append_output(&"x\n".repeat(2001));
+        ctx.set_complete(Some(0), false, false, Some("/tmp/x.log".to_string()));
+        assert!(
+            ctx.render_lines(80, &theme, None, None).iter().any(|l| plain(l).contains("Output truncated")),
+            "contextTruncation.truncated is the second leg of `wasTruncated`"
+        );
+
+        // MIRROR 4: the warning is the LAST status part, after `(exit N)` (`:189-199` order).
+        let mut failed = BashExecution::new("gen", false);
+        failed.append_output("a\n");
+        failed.set_complete(Some(2), false, true, Some("/tmp/x.log".to_string()));
+        let rows: Vec<String> = failed.render_lines(80, &theme, None, None).iter().map(plain).collect();
+        let exit = rows.iter().position(|r| r.contains("(exit 2)")).unwrap();
+        let warn = rows.iter().position(|r| r.contains("Output truncated")).unwrap();
+        assert!(exit < warn, "exit code first, truncation warning last: {rows:?}");
     }
 }

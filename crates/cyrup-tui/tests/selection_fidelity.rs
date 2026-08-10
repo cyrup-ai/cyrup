@@ -743,3 +743,401 @@ fn select_list_treats_a_whitespace_only_description_as_absent() {
     // description column follows it.
     assert_eq!(rendered.trim_end(), "→ cmd", "must take the single-column arm: {rendered:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// S26 / S27 — the char-vs-grapheme residual
+//
+// Upstream measures every `SelectList` width with `visibleWidth` and cuts with `truncateToWidth`:
+//
+//   * `select-list.ts:147`  `const prefixWidth = visibleWidth(prefix);`
+//   * `select-list.ts:153`  `const truncatedValueWidth = visibleWidth(truncatedValue);`
+//   * `select-list.ts:181`  `Math.max(widest, visibleWidth(this.getDisplayValue(item)) + PRIMARY_COLUMN_GAP)`
+//   * `select-list.ts:159`  `truncateToWidth(descriptionSingleLine, remainingWidth, "")`
+//   * `select-list.ts:209`/`:211`  `truncateToWidth(displayValue, maxWidth, "")`
+//
+// `visibleWidth` (`tui/src/utils.ts:240-295`) segments with `graphemeSegmenter` and sums
+// `graphemeWidth`; `truncateToWidth` (`utils.ts:1053-1092`, non-ASCII branch `:1100-1110`) walks
+// the same segmenter and only ever keeps a cluster whole. cyrup measured `chars().count()` and cut
+// `chars().take(n)`, which is wrong three separate ways: a wide character measured 1 column, a
+// combining mark measured 1 column instead of 0, and a multi-codepoint cluster could be cut in
+// half.
+
+/// The visible **column** index at which `needle` starts, unlike [`col_of`] which counts chars.
+/// The two disagree for exactly the inputs these tests exercise.
+fn vis_col_of(haystack: &str, needle: &str) -> Option<usize> {
+    let byte = haystack.find(needle)?;
+    Some(ratatui::text::Span::raw(haystack.get(..byte)?).width())
+}
+
+fn vis_width(s: &str) -> usize {
+    ratatui::text::Span::raw(s).width()
+}
+
+/// **S26, CJK.** A label of 20 double-width characters measures **40** columns, so the 32-column
+/// clamp binds (`:184`), the label is cut to `32 - GAP = 30` columns (`:151`) — 15 CJK characters —
+/// and the description starts at `prefixWidth + effectivePrimaryColumnWidth = 2 + 32 = 34`
+/// (`:155`).
+///
+/// FAILS under `chars().count()`: the label measures 20, `clamp(22, 12, 32)` does not bind, the
+/// budget is 20 *chars*, the whole 40-column label survives and the description lands at column 44
+/// — ten columns past where pi puts it, and past the right edge of a narrow frame.
+#[test]
+fn select_list_measures_a_cjk_label_in_columns_not_chars() {
+    let theme = UiTheme::dark();
+    let label: String = "銀".repeat(20); // 20 chars, 40 columns
+    assert_eq!(label.chars().count(), 20);
+    assert_eq!(vis_width(&label), 40);
+
+    let list = SelectList::new(
+        vec![SelectItem::new(label, Some("説明テキスト".to_string()))],
+        ColumnLayout::SLASH,
+    );
+    let rendered = text(&list.lines(120, &theme)[0]);
+
+    let kept = rendered.chars().filter(|c| *c == '銀').count();
+    assert_eq!(kept, 15, "label must be cut to 30 COLUMNS = 15 CJK chars: {rendered:?}");
+    assert_eq!(
+        vis_col_of(&rendered, "説明テキスト"),
+        Some(34),
+        "description must start at prefix(2) + column(32): {rendered:?}"
+    );
+}
+
+/// **S27, ZWJ cluster in a label.** `👨\u{200d}👩\u{200d}👧` is ONE extended grapheme cluster of
+/// FIVE codepoints occupying TWO columns; `truncateToWidth` keeps it whole or drops it
+/// (`utils.ts:1100-1110`).
+///
+/// The single-column arm budget is `width - prefixWidth - 2` (`:169`) = 16 columns at width 20, so
+/// exactly eight of ten families survive.
+///
+/// FAILS under `chars().take(16)`: 16 codepoints is three whole families plus a lone `👨` — the
+/// label is cut mid-cluster, the family dissolves into a stray man emoji, and only 8 of the 16
+/// budgeted columns are used.
+#[test]
+fn select_list_never_splits_a_zwj_cluster_in_a_label() {
+    let theme = UiTheme::dark();
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let label = family.repeat(10);
+    assert_eq!(label.chars().count(), 50, "5 codepoints per family");
+    assert_eq!(vis_width(&label), 20, "2 columns per family");
+
+    // width <= 40 forces the single-column arm (`:149`), budget = 20 - 2 - 2 = 16.
+    let list = SelectList::new(vec![SelectItem::label(label)], ColumnLayout::SLASH);
+    let rendered = text(&list.lines(20, &theme)[0]);
+    let body = rendered.strip_prefix("→ ").expect("selected row prefix");
+
+    assert_eq!(vis_width(body), 16, "budget is width(20) - prefix(2) - 2: {rendered:?}");
+    assert_eq!(
+        body.matches(family).count(),
+        8,
+        "exactly eight whole families fit in 16 columns: {rendered:?}"
+    );
+    assert!(
+        !body.ends_with('\u{200d}') && !body.ends_with('\u{1f468}'),
+        "a cut must never leave a dangling ZWJ or a half-dissolved family: {rendered:?}"
+    );
+}
+
+/// **S27, combining mark in a label.** `e` + U+0301 is one cluster of **1** column and 2
+/// codepoints. The single-column budget at width 20 is 16 columns, so 16 accented `e`s survive.
+///
+/// FAILS under `chars().take(16)`: 16 codepoints is 8 clusters — half the label vanishes — and the
+/// 16th codepoint is a bare `e`, so the accent of the last kept letter is dropped.
+#[test]
+fn select_list_never_splits_a_combining_mark_in_a_label() {
+    let theme = UiTheme::dark();
+    let label = "e\u{301}".repeat(30);
+    assert_eq!(label.chars().count(), 60);
+    assert_eq!(vis_width(&label), 30);
+
+    let list = SelectList::new(vec![SelectItem::label(label)], ColumnLayout::SLASH);
+    let rendered = text(&list.lines(20, &theme)[0]);
+    let body = rendered.strip_prefix("→ ").expect("selected row prefix");
+
+    assert_eq!(vis_width(body), 16, "budget is width(20) - prefix(2) - 2: {rendered:?}");
+    assert_eq!(body.matches("e\u{301}").count(), 16, "16 whole clusters: {rendered:?}");
+    assert!(
+        !body.ends_with('e'),
+        "the last kept letter must keep its accent: {rendered:?}"
+    );
+}
+
+/// **S27, ZWJ cluster in a description.** `:159` cuts the description with the same
+/// `truncateToWidth`. With `SLASH`'s pinned column and an ASCII `cmd` label the description starts
+/// at `2 + 3 + max(1, 12 - 3) = 14`, leaving `45 - 14 - 2 = 29` columns — fourteen whole families
+/// (28 columns), never fourteen and a half.
+///
+/// FAILS under `chars().take(29)`: 29 codepoints is five families plus `👨\u{200d}👩\u{200d}` — a
+/// half-built family trailing a ZWJ, 25 of the 29 columns left blank.
+#[test]
+fn select_list_never_splits_a_zwj_cluster_in_a_description() {
+    let theme = UiTheme::dark();
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let list = SelectList::new(
+        vec![SelectItem::new("cmd", Some(family.repeat(20)))],
+        ColumnLayout::SLASH,
+    );
+    let rendered = text(&list.lines(45, &theme)[0]);
+
+    assert_eq!(vis_col_of(&rendered, family), Some(14), "description column: {rendered:?}");
+    let start = rendered.find(family).expect("description present");
+    let desc = rendered.get(start..).expect("suffix");
+
+    assert_eq!(vis_width(desc), 28, "29-column budget holds 14 two-column families: {rendered:?}");
+    assert_eq!(
+        desc.matches(family).count(),
+        14,
+        "fourteen whole families, not thirteen and a half: {rendered:?}"
+    );
+    assert!(
+        !desc.ends_with('\u{200d}') && !desc.ends_with('\u{1f468}'),
+        "a cut must never leave a dangling ZWJ or a half-dissolved family: {rendered:?}"
+    );
+    assert!(
+        vis_width(&rendered) <= 43,
+        "row must stop 2 columns short of a 45-column frame: {rendered:?}"
+    );
+}
+
+/// **S27, combining mark in a description.** Same 29-column description budget; 29 accented `e`s
+/// are 58 codepoints.
+///
+/// FAILS under `chars().take(29)`: 14 clusters plus a bare `e` — 15 columns where pi draws 29, and
+/// the trailing letter loses its accent.
+#[test]
+fn select_list_never_splits_a_combining_mark_in_a_description() {
+    let theme = UiTheme::dark();
+    let list = SelectList::new(
+        vec![SelectItem::new("cmd", Some("e\u{301}".repeat(40)))],
+        ColumnLayout::SLASH,
+    );
+    let rendered = text(&list.lines(45, &theme)[0]);
+    assert_eq!(vis_col_of(&rendered, "e\u{301}"), Some(14), "description column: {rendered:?}");
+    let start = rendered.find("e\u{301}").expect("description present");
+    let desc = rendered.get(start..).expect("suffix");
+
+    assert_eq!(vis_width(desc), 29, "description budget is 29 columns: {rendered:?}");
+    assert_eq!(desc.matches("e\u{301}").count(), 29, "29 whole clusters: {rendered:?}");
+    assert!(!desc.ends_with('e'), "trailing letter kept its accent: {rendered:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// S24 — the remaining two halves: per-role entry colouring, and the timestamp pad
+//
+// `getEntryDisplayText` (`tree-selector.ts:768-852`) never returns one uniformly-styled string.
+// Verified with `git -C pi show v0.84.1:packages/coding-agent/src/modes/interactive/components/tree-selector.ts`:
+//
+//   :781  result = theme.fg("accent",  "user: ")      + content;
+//   :786  result = theme.fg("success", "assistant: ") + textContent;
+//   :793  result = theme.fg("success", "assistant: ") + theme.fg("muted", "(no content)");
+//   :799  result = theme.fg("muted",   this.formatToolCall(toolCall.name, toolCall.arguments));
+//   :805  result = theme.fg("dim",     `[bash]: ${normalize(bashMsg.command ?? "")}`);
+//   :824  result = theme.fg("borderAccent", `[compaction: ${tokens}k tokens]`);
+//   :828  result = theme.fg("warning", `[branch summary]: `) + normalize(entry.summary);
+//   :831  result = theme.fg("dim", `[model: ${entry.modelId}]`);
+//   :851  return isSelected ? theme.bold(result) : result;
+//
+// `git grep -n borderAccent v0.84.1 -- packages/*/src` finds exactly ONE component render site,
+// `:824` above — so this row is also the whole of T9's `borderAccent`.
+
+/// The foreground of a style — named so the assertions below read as colour comparisons.
+fn fg_of(style: ratatui::style::Style) -> Option<ratatui::style::Color> {
+    style.fg
+}
+
+/// The style of the first span of `row` whose text contains `needle`.
+fn span_style_containing(row: &Line<'_>, needle: &str) -> ratatui::style::Style {
+    row.spans
+        .iter()
+        .find(|s| s.content.contains(needle))
+        .unwrap_or_else(|| panic!("no span containing {needle:?} in {:?}", text(row)))
+        .style
+}
+
+fn roled_nodes() -> Vec<TreeNode> {
+    // The label forms are exactly what `cyrup_session_svc::dag_display` (`session.rs:4935-4995`)
+    // emits for each entry type — it is the producer this classification is keyed to.
+    let user = TreeNode::message("u", 0, "user: port the editor");
+    let assistant = TreeNode::message("a", 0, "assistant: on it");
+    let empty = TreeNode::message("n", 0, "assistant: (no content)");
+    let bash = TreeNode::message("b", 0, "[bash]: cargo check");
+    let mut tool = TreeNode::message("t", 0, "[read]");
+    tool.kind = TreeKind::ToolGroup;
+    let mut compaction = TreeNode::message("c", 0, "compaction");
+    compaction.kind = TreeKind::Compaction;
+    let mut summary = TreeNode::message("s", 0, "branch summary: dropped the retry loop");
+    summary.kind = TreeKind::Compaction;
+    let mut model = TreeNode::message("m", 0, "model → opus");
+    model.kind = TreeKind::ModelChange;
+    vec![user, assistant, empty, bash, tool, compaction, summary, model]
+}
+
+/// **S24(b).** Each entry type carries its own colour, and the role prefix carries a *different*
+/// colour from the content behind it.
+///
+/// FAILS before the fix: every row's label was a single `base_style()` span, so a user row, an
+/// assistant row, a tool result and a compaction summary were pixel-identical in colour.
+#[test]
+fn tree_rows_are_coloured_per_role_like_pi() {
+    let theme = UiTheme::dark();
+    let mut sel = TreeSelector::new(roled_nodes());
+    // Park the cursor on a row not under test so no assertion is confounded by `:851`'s bold.
+    sel.handle(&key(KeyCode::Down), &SelectKeymap::default());
+    let rows = sel.rows(120, &theme);
+
+    // `:781` — `accent` prefix, body text behind it.
+    let user = &rows[0];
+    assert_eq!(
+        fg_of(span_style_containing(user, "user: ")),
+        theme.accent_style().fg,
+        "`user: ` must be the accent role: {:?}",
+        text(user)
+    );
+    assert_eq!(
+        fg_of(span_style_containing(user, "port the editor")),
+        theme.base_style().fg,
+        "the user's own text is body text, not accent: {:?}",
+        text(user)
+    );
+
+    // `:793` — `success` prefix, `muted` placeholder body.
+    let empty = &rows[2];
+    assert_eq!(
+        fg_of(span_style_containing(empty, "assistant: ")),
+        theme.success_style().fg,
+        "`assistant: ` must be the success role: {:?}",
+        text(empty)
+    );
+    assert_eq!(
+        fg_of(span_style_containing(empty, "(no content)")),
+        theme.muted_style().fg,
+        "the empty-assistant placeholder is muted: {:?}",
+        text(empty)
+    );
+
+    // `:805` — the whole bash row is `dim`.
+    assert_eq!(
+        fg_of(span_style_containing(&rows[3], "[bash]: cargo check")),
+        theme.dim_style().fg,
+        "a bash row is dim end to end"
+    );
+    // `:799` — the whole tool row is `muted`.
+    assert_eq!(
+        fg_of(span_style_containing(&rows[4], "[read]")),
+        theme.muted_style().fg,
+        "a tool-result row is muted end to end"
+    );
+    // `:828` — `warning` prefix.
+    assert_eq!(
+        fg_of(span_style_containing(&rows[6], "branch summary: ")),
+        theme.warning_style().fg,
+        "a branch summary's prefix is the warning role"
+    );
+    // `:831` — `dim`.
+    assert_eq!(
+        fg_of(span_style_containing(&rows[7], "model → opus")),
+        theme.dim_style().fg,
+        "a model-change row is dim"
+    );
+
+    // The four must not collapse onto one another.
+    let four = [
+        span_style_containing(&rows[0], "user: ").fg,
+        span_style_containing(&rows[1], "assistant: ").fg,
+        span_style_containing(&rows[4], "[read]").fg,
+        span_style_containing(&rows[5], "compaction").fg,
+    ];
+    for (i, a) in four.iter().enumerate() {
+        for b in four.iter().skip(i + 1) {
+            assert_ne!(a, b, "user / assistant / tool / compaction must differ in colour: {four:?}");
+        }
+    }
+}
+
+/// **T9 — `borderAccent`.** `tree-selector.ts:824` is the token's only component render site in all
+/// of `packages/*/src`. In `dark.json` it resolves through `vars.cyan` `#00d7ff` (`:5`, `:25`),
+/// which is a different colour from `accent` (`vars.accent` `#8abeb7`, `:14`, `:23`) — so a theme
+/// author who sets it can actually see it.
+///
+/// FAILS before the fix: `grep -rn borderAccent crates/cyrup-tui/src` found nothing outside doc
+/// comments, and the compaction row rendered in `base_style()`.
+#[test]
+fn tree_compaction_row_reads_the_border_accent_token() {
+    let theme = UiTheme::dark();
+    let want = *theme.roles.get("borderAccent").expect("dark.json:25 defines borderAccent");
+    let mut sel = TreeSelector::new(roled_nodes());
+    sel.handle(&key(KeyCode::Down), &SelectKeymap::default());
+    let rows = sel.rows(120, &theme);
+    let got = span_style_containing(&rows[5], "compaction").fg;
+    assert_eq!(got, Some(want), "the compaction row must read `borderAccent`");
+    assert_ne!(got, theme.accent_style().fg, "`borderAccent` is not `accent` (#00d7ff vs #8abeb7)");
+    assert_ne!(got, theme.base_style().fg, "the compaction row is not body text");
+}
+
+/// **S24(b), the selection.** `:851` `return isSelected ? theme.bold(result) : result;` — the
+/// selected row is BOLDED, keeping every role colour underneath. `theme.bold` (`theme.ts:384-386`)
+/// emits SGR 1 and nothing else; it does not touch the foreground.
+///
+/// FAILS before the fix: the selected row's label was repainted `accent + BOLD`, erasing the role
+/// colour on exactly the row the user is looking at.
+#[test]
+fn tree_selected_row_is_bolded_not_repainted_accent() {
+    let theme = UiTheme::dark();
+    let sel = TreeSelector::new(roled_nodes()); // row 0 (the `user:` row) is selected
+    let rows = sel.rows(120, &theme);
+    let prefix = span_style_containing(&rows[0], "user: ");
+    let body = span_style_containing(&rows[0], "port the editor");
+
+    assert!(prefix.add_modifier.contains(ratatui::style::Modifier::BOLD), "`:851` bolds the row");
+    assert!(body.add_modifier.contains(ratatui::style::Modifier::BOLD), "`:851` bolds the row");
+    assert_eq!(body.fg, theme.base_style().fg, "the body keeps its own colour under the bold");
+
+    // And an unselected row of the same role is the same colour, minus the bold.
+    let mut moved = TreeSelector::new(roled_nodes());
+    moved.handle(&key(KeyCode::Down), &SelectKeymap::default());
+    let unselected = span_style_containing(&moved.rows(120, &theme)[0], "port the editor");
+    assert_eq!(unselected.fg, body.fg, "selection must not change the colour");
+    assert!(!unselected.add_modifier.contains(ratatui::style::Modifier::BOLD));
+}
+
+/// **S24(a).** The label-timestamp pad is `width - leftWidth - stampWidth - 1`, and `leftWidth` has
+/// to be a COLUMN count. Upstream measures the same quantities with `visibleWidth`
+/// (`tree-selector.ts:747` `const anchorCol = visibleWidth(prefixPart);`, `:754`
+/// `bodyWidth: visibleWidth(body)`).
+///
+/// The row here is unavoidably unicode even before the preview text: the `●` glyph, and the
+/// `☆labeled` star that a labeled row always carries. Add a CJK preview and `chars().count()`
+/// under-measures the row by one column per wide character.
+///
+/// FAILS under `spans.iter().map(|s| s.content.chars().count())`: the pad is computed from 31
+/// columns where the row really occupies 41, so the row renders 10 columns too wide and the
+/// timestamp is pushed off the right edge of an 80-column frame.
+#[test]
+fn tree_label_timestamp_pad_is_measured_in_columns_not_chars() {
+    let theme = UiTheme::dark();
+    let mut labeled = TreeNode::message("e1", 0, "user: 日本語のプレビュー行です");
+    labeled.has_label = true;
+    labeled.time_label = Some("12:04".to_string());
+    let mut sel = TreeSelector::new(vec![labeled]);
+    // `t` = `app.tree.toggleLabelTimestamp` (`tree-selector.ts:1090`); the column is off by default.
+    sel.handle(&key(KeyCode::Char('t')), &SelectKeymap::default());
+
+    let width = 80u16;
+    let row = &sel.rows(width, &theme)[0];
+    let rendered = text(row);
+    assert!(rendered.contains("12:04"), "precondition: the column is on: {rendered:?}");
+
+    assert_eq!(
+        row.width(),
+        usize::from(width),
+        "the padded row must occupy exactly the frame width: {rendered:?} ({} columns)",
+        row.width()
+    );
+    // The stamp is the last thing on the row, so it must end flush against the right edge.
+    let stamp_start = row.width() - 5;
+    assert_eq!(
+        ratatui::text::Span::raw(rendered.trim_end_matches("12:04")).width(),
+        stamp_start,
+        "the timestamp must end flush right: {rendered:?}"
+    );
+}

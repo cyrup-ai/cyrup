@@ -277,6 +277,17 @@ interface registration {
   register-provider:         func(id: string, config-json: string);
   unregister-provider:       func(id: string);
   register-message-renderer: func(custom-type: string);
+  // Pi registerEntryRenderer(customType, renderer), types.ts:1295 / loader.ts:314-318 — the
+  // custom-ENTRY surface, a SEPARATE table from register-message-renderer above (upstream keeps
+  // `messageRenderers` and `entryRenderers` as disjoint maps, types.ts:1703-1704). An entry is
+  // TUI-only durable state appended by `append-entry`; a message participates in LLM context. They
+  // differ in what a FAULTING renderer draws: a message falls through to the default box
+  // (custom-message.ts:82-84), an entry draws `[type] renderer failed: …` (custom-entry.ts:47-52).
+  //
+  // There is deliberately NO `render-entry` export: an entry is rendered over `render-call` above,
+  // keyed by its custom-type, and the two surfaces are told apart by the HOST's registry table.
+  // A fourth export would invalidate every already-built guest component for no behavioural gain.
+  register-entry-renderer:   func(custom-type: string);
   add-autocomplete:          func(command: string);
   // global autocomplete provider stacking (Pi addAutocompleteProvider, types.ts:218): records that
   // the guest contributes one more stacked provider; the host folds them via `autocomplete-suggest`.

@@ -66,7 +66,7 @@ use crate::login_dialog::{
     TuiAuthInteraction,
 };
 use crate::model_selector::{ModelEntry, ModelSelector};
-use crate::overlay::{HotkeyRow, HotkeysOverlay, Overlay, OverlayOutcome};
+use crate::overlay::{Overlay, OverlayOutcome};
 use crate::selector::{
     CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome,
 };
@@ -322,11 +322,15 @@ pub struct AppState {
     /// `insert_before`; never re-rendered inside the inline viewport.
     pub scrollback: Vec<Line<'static>>,
     /// Extension-registered keyboard shortcuts (R-08-017; Pi `registerShortcut`): each parsed
-    /// [`Key`] spec paired with the raw key-id string the host routes on. Sourced from
+    /// [`Key`] spec paired with the [`ShortcutSpec`] the host routes on. Sourced from
     /// `ExtensionHost::shortcut_keys()` at boot and refreshed on session swap; a matching key press
     /// (checked at the global-keymap tier, after built-in bindings) becomes an
     /// [`AppAction::ExtensionShortcut`]. Empty when no extension registered a shortcut.
-    pub extension_shortcuts: Vec<(Key, String)>,
+    ///
+    /// This is also the registry `/hotkeys` reads for its **Extensions** table — upstream's
+    /// `extensionRunner.getShortcuts(...)` (`interactive-mode.ts:6187-6196`) is the same set from
+    /// the same source, so [`App::hotkeys_markdown`] iterates it rather than omitting the section.
+    pub extension_shortcuts: Vec<(Key, ShortcutSpec)>,
     /// The env-sniffed terminal capabilities (feature #7/#8; Pi `getCapabilities`): image protocol +
     /// truecolor + OSC-8-hyperlink forwarding. Boot default is conservative (half-block, no
     /// hyperlinks); the binary refines it via [`App::detect_image_support`]. The `hyperlinks` flag
@@ -515,11 +519,58 @@ impl AppState {
     /// [`Key`] spec (unparseable ids are dropped, never panicking) and retained with its id so a
     /// matching press routes to the owning extension. Called by the binary at boot and after a
     /// session swap, so a `/reload` that changes the registered set takes effect.
-    pub fn set_extension_shortcuts(&mut self, key_ids: impl IntoIterator<Item = String>) {
-        self.extension_shortcuts = key_ids
+    ///
+    /// Accepts either a bare key-id (`ExtensionHost::shortcut_keys()`'s `Vec<String>`) or an
+    /// `(id, description)` pair — see [`ShortcutSpec`] for why both forms exist.
+    pub fn set_extension_shortcuts(&mut self, specs: impl IntoIterator<Item = impl Into<ShortcutSpec>>) {
+        self.extension_shortcuts = specs
             .into_iter()
-            .filter_map(|id| Key::parse(&id).ok().map(|k| (k, id)))
+            .map(Into::into)
+            .filter_map(|spec| Key::parse(&spec.id).ok().map(|k| (k, spec)))
             .collect();
+    }
+}
+
+/// One extension-registered keyboard shortcut as the TUI holds it — the display-side half of
+/// upstream's `ExtensionShortcut` record (`coding-agent/src/core/extensions/types.ts:1547-1552`:
+/// `shortcut: KeyId`, `description?: string`, `handler`, `extensionPath: string`). The handler lives
+/// on the guest side of the WASM boundary and never crosses into the TUI; the id and the label are
+/// what `/hotkeys` and the dispatcher need.
+///
+/// Both `From` impls exist because the two callers differ: the binary installs
+/// `ExtensionHost::shortcut_keys()` (`crates/cyrup/src/main.rs:1634`), a `Vec<String>` of bare ids,
+/// while a host that also carries the registered description installs `(id, description)` pairs.
+/// A bare id therefore keeps working unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutSpec {
+    /// `shortcut: KeyId` (`types.ts:1548`) — the raw id the host routes a fired press back on.
+    pub id: String,
+    /// `description ?? extensionPath` (`interactive-mode.ts:6193`) — the `/hotkeys` Action cell.
+    /// `None` when the registering host supplied neither.
+    pub description: Option<String>,
+}
+
+impl From<String> for ShortcutSpec {
+    fn from(id: String) -> Self {
+        ShortcutSpec { id, description: None }
+    }
+}
+
+impl From<&str> for ShortcutSpec {
+    fn from(id: &str) -> Self {
+        ShortcutSpec { id: id.to_string(), description: None }
+    }
+}
+
+impl From<(String, String)> for ShortcutSpec {
+    fn from((id, description): (String, String)) -> Self {
+        ShortcutSpec { id, description: Some(description) }
+    }
+}
+
+impl From<(String, Option<String>)> for ShortcutSpec {
+    fn from((id, description): (String, Option<String>)) -> Self {
+        ShortcutSpec { id, description }
     }
 }
 
@@ -815,8 +866,11 @@ impl<B: Backend> App<B> {
     /// Install the extension-registered keyboard shortcuts (R-08-017; delegates to
     /// [`AppState::set_extension_shortcuts`]). The binary calls this at boot from
     /// `ExtensionHost::shortcut_keys()`.
-    pub fn set_extension_shortcuts(&mut self, key_ids: impl IntoIterator<Item = String>) {
-        self.state.set_extension_shortcuts(key_ids);
+    pub fn set_extension_shortcuts(
+        &mut self,
+        specs: impl IntoIterator<Item = impl Into<ShortcutSpec>>,
+    ) {
+        self.state.set_extension_shortcuts(specs);
     }
 
     /// Plumb the `autocompleteMaxVisible` setting (Pi, item #6) into the editor's autocomplete popup
@@ -841,6 +895,11 @@ impl<B: Backend> App<B> {
     /// the defaults) — never a panic.
     pub fn load_keybindings_json(&mut self, json: &str) -> Result<(), TuiError> {
         self.state.keymap.merge_json(json)?;
+        // X9 — every `… to expand` hint resolves its key label through the LIVE keymap upstream
+        // (`keyText("app.tools.expand")`, `keybinding-hints.ts:34-36`). The transcript holds no
+        // keymap, so the resolved label is pushed to it whenever bindings change.
+        let expand = self.state.keymap.keys_label(Action::ToolsExpand);
+        self.state.transcript.set_expand_hint(expand);
         self.state.select_keymap.merge_json(json)?;
         self.state.tree_keymap.merge_json(json)?;
         self.state.session_keymap.merge_json(json)?;
@@ -1040,6 +1099,9 @@ impl<B: Backend> App<B> {
     /// `sessionManager.getCwd()` (`interactive-mode.ts:819`). Does NOT write anything on its own;
     /// [`Self::update_terminal_title`] is what recomputes the title.
     pub fn set_title_cwd(&mut self, cwd: PathBuf) {
+        // X7 — the same value Pi hands the tool renderers as `ToolRenderContext.cwd`
+        // (`tool-execution.ts:126`), which `read`'s compact classification resolves against.
+        self.state.transcript.set_cwd(Some(cwd.clone()));
         self.state.title_cwd = cwd;
     }
 
@@ -1167,16 +1229,60 @@ impl<B: Backend> App<B> {
     /// the previous conversation stays visible ABOVE the replayed one. The replay itself needs no
     /// re-render: it starts from an empty transcript and flushes forward normally.
     ///
-    /// **Known gap**: Pi resolves an extension's registered message renderer for a replayed `custom`
-    /// message (`getMessageRenderer(message.customType)`, `:3326`). cyrup's renderer lookup is async
-    /// with a timeout (see `render_with_extensions`), and this walk is synchronous, so a replayed
-    /// custom message draws with the built-in `[type] body` framing. The LIVE path
-    /// ([`AgentSessionEvent::MessageEnd`]) still honors the renderer.
+    /// X11 — this is the NO-EXTENSIONS shorthand. Pi resolves an extension's registered message
+    /// renderer on the replay walk too (`const renderer = this.session.extensionRunner
+    /// .getMessageRenderer(message.customType)`, `interactive-mode.ts:3471`, inside the same
+    /// `case "custom"` the `display` gate at `:3470` guards), exactly as it does on the live
+    /// `addMessageToChat` path. Call [`Self::replay_session_with_extensions`] wherever a host is in
+    /// hand — every production `/resume`, `/fork`, `/import` and `--continue` does — or a resumed
+    /// session silently loses extension rendering that the live session had.
     pub fn replay_session(&mut self, messages: &[cyrup_session_svc::agent_message::AgentMessage]) {
+        self.replay_session_rendered(messages, &std::collections::HashMap::new());
+    }
+
+    /// [`Self::replay_session`], first resolving each displayed `custom` message's registered
+    /// extension renderer (EXT-006; Pi `getMessageRenderer(message.customType)`,
+    /// `interactive-mode.ts:3471`).
+    ///
+    /// The renderer lookup is an async guest call with a timeout while the replay walk is sync, so
+    /// — exactly like [`Self::ingest_event_with_extensions`] on the live path — every renderer runs
+    /// FIRST and its text rides into the walk, keyed by the message's index.
+    pub async fn replay_session_with_extensions(
+        &mut self,
+        messages: &[cyrup_session_svc::agent_message::AgentMessage],
+        ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    ) {
+        use cyrup_session_svc::agent_message::AgentMessage;
+        let mut rendered: std::collections::HashMap<usize, crate::transcript::Rendered> =
+            std::collections::HashMap::new();
+        for (i, message) in messages.iter().enumerate() {
+            // `if (message.display)` (`:3470`) gates the whole arm, lookup included.
+            let AgentMessage::Custom(c) = message else { continue };
+            if !c.display {
+                continue;
+            }
+            let payload = serde_json::to_value(message).unwrap_or(serde_json::Value::Null);
+            if let Some(text) =
+                extension_render_message(ext_host, &c.custom_type, &payload).await
+            {
+                rendered.insert(i, crate::transcript::Rendered::Text(text));
+            }
+        }
+        self.replay_session_rendered(messages, &rendered);
+    }
+
+    /// The replay walk itself. `rendered` maps a message INDEX to the text an extension's registered
+    /// renderer produced for it (X11); an absent entry draws the built-in framing, which is Pi's
+    /// `getMessageRenderer(...) === undefined` outcome.
+    fn replay_session_rendered(
+        &mut self,
+        messages: &[cyrup_session_svc::agent_message::AgentMessage],
+        rendered: &std::collections::HashMap<usize, crate::transcript::Rendered>,
+    ) {
         use cyrup_core::{Content, Message};
         use cyrup_session_svc::agent_message::AgentMessage;
         use serde_json::Value;
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
             match message {
                 AgentMessage::Core(Message::User { content, .. }) => {
                     let text = content_text(content);
@@ -1254,15 +1360,30 @@ impl<B: Backend> App<B> {
                         &b.output,
                         b.exit_code.and_then(|c| i32::try_from(c).ok()),
                         b.cancelled,
+                        // X13 — upstream replays both (`interactive-mode.ts:3460-3465`
+                        // `message.truncated ? {truncated:true} : undefined, message.fullOutputPath`),
+                        // which is what puts the `Output truncated. Full output: …` row back on a
+                        // resumed session's `!` block.
+                        b.truncated,
+                        b.full_output_path.clone(),
                     );
                 }
                 AgentMessage::Custom(c) => {
                     // Pi renders a custom message only when it opted into display
-                    // (`if (message.display)`, interactive-mode.ts:3324).
+                    // (`if (message.display)`, interactive-mode.ts:3470).
                     if c.display {
-                        self.state
-                            .transcript
-                            .push_custom_message(c.custom_type.clone(), custom_message_text(&c.content));
+                        // X11 — `const renderer = this.session.extensionRunner.getMessageRenderer(
+                        // message.customType); new CustomMessageComponent(message, renderer, …)`
+                        // (`:3471-3477`). The replay arm is NOT a thinner variant of the live one:
+                        // it performs the identical lookup, so a resumed session keeps the
+                        // extension rendering the live session had. Absent an entry the built-in
+                        // `[type] body` framing draws — `getMessageRenderer` returning `undefined`.
+                        let rendered = rendered.get(&index).cloned().unwrap_or_default();
+                        self.state.transcript.push_custom_message_rendered(
+                            c.custom_type.clone(),
+                            custom_message_text(&c.content),
+                            rendered,
+                        );
                     }
                 }
                 AgentMessage::BranchSummary(b) => {
@@ -1422,6 +1543,16 @@ impl<B: Backend> App<B> {
         let images = crate::transcript::ImageOpts {
             show: self.state.transcript.show_images(),
             width_cells: self.state.transcript.image_width_cells(),
+            // X9/X7 — the same live `app.tools.expand` label and session cwd the in-viewport render
+            // uses, so a committed block's hints and compact `read` header do not disagree with the
+            // live one they were just scrolled up from.
+            expand_key: self.state.transcript.expand_key(),
+            cwd: self.state.transcript.cwd(),
+            // X14 — the LIVE `this.toolOutputExpanded`. Upstream never freezes an expansion onto a
+            // message: `setToolsExpanded` walks `chatContainer.children` and re-broadcasts to every
+            // expandable child (`interactive-mode.ts:4032-4046`), so a branch/compaction summary
+            // pushed while collapsed still opens when `Ctrl+O` is pressed before it paints.
+            tools_expanded: self.state.transcript.tool_expanded(),
         };
         let lines: Vec<Line<'static>> = committed
             .iter()
@@ -1498,10 +1629,10 @@ impl<B: Backend> App<B> {
                 // the global-keymap tier — after the built-in bindings (so an extension can't shadow
                 // `Ctrl+D`/`Esc`) but before the editor (so the key never leaks in as text). The run
                 // loop dispatches the matched key-id to the session's extension host.
-                if let Some((_, id)) =
+                if let Some((_, spec)) =
                     self.state.extension_shortcuts.iter().find(|(k, _)| k.matches(key))
                 {
-                    return AppAction::ExtensionShortcut(id.clone());
+                    return AppAction::ExtensionShortcut(spec.id.clone());
                 }
                 match self.state.editor.handle_key(key) {
                     EditorOutcome::Submit(text) => self.dispatch_submission(&text),
@@ -1609,8 +1740,16 @@ impl<B: Backend> App<B> {
             "session" => cmd(C::SessionInfo),
             // --- in-crate info blocks ---
             "hotkeys" => {
-                // A floating, dismissable overlay (spec/tui/05 §2), not a scrollback block.
-                self.open_hotkeys_overlay();
+                // `handleHotkeysCommand` (interactive-mode.ts:6197-6203) appends to the TRANSCRIPT —
+                // `chatContainer.addChild(Spacer(1) / DynamicBorder / Text(bold accent title,1,0) /
+                // Spacer(1) / Markdown(body,1,1) / DynamicBorder)`. That is byte-for-byte the same
+                // component stack `/changelog` builds at :6067-6072, i.e. [`Entry::Block`]; there is no
+                // floating overlay anywhere in the command (`git grep showOverlay v0.84.1` finds it
+                // only in `tui.ts` and the extension-UI path at :2719). The help therefore SCROLLS
+                // WITH the conversation and stays in scrollback instead of being a modal that
+                // captures keys and vanishes on Esc.
+                let body = self.hotkeys_markdown();
+                self.state.transcript.push_block("Keyboard Shortcuts", body);
                 AppAction::Redraw
             }
             "changelog" => {
@@ -1688,7 +1827,7 @@ impl<B: Backend> App<B> {
                 // A running `!`/`!!` bash block is cancelled first (the run loop kills the child),
                 // mirroring Pi's `tui.select.cancel` on the bash component.
                 if self.state.transcript.bash_running() {
-                    self.state.transcript.bash_complete(None, true);
+                    self.state.transcript.bash_complete_simple(None, true);
                     self.state.transcript.commit_bash();
                 }
                 // Pi branches on `this.session.isStreaming` FIRST (interactive-mode.ts:2636): an Esc
@@ -1812,77 +1951,144 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Push the hotkeys/help popup onto the overlay stack (`/hotkeys` → `handleHotkeysCommand`,
-    /// interactive-mode.ts:5396-5470). Rows are derived from the **live** keymaps so rebinds reflect.
-    pub fn open_hotkeys_overlay(&mut self) {
-        let rows = self.hotkey_rows();
-        self.state.overlays.push(Box::new(HotkeysOverlay::new("Keyboard Shortcuts", rows)));
-    }
-
     /// Whether a floating overlay is currently open (test/inspection access).
     pub fn overlay_open(&self) -> bool {
         !self.state.overlays.is_empty()
     }
 
-    /// Build the hotkeys popup rows from the live editor + global keymaps (the structured form of
-    /// [`hotkeys_markdown`](Self::hotkeys_markdown); same bindings, rebind-aware).
-    fn hotkey_rows(&self) -> Vec<HotkeyRow> {
+    /// The `/hotkeys` body — Pi `handleHotkeysCommand` (interactive-mode.ts:6090-6205), verbatim: three
+    /// `**Section**` headings each over a `| Key | Action |` GFM table, keys backticked and joined with
+    /// ` / ` where a row names two bindings.
+    ///
+    /// Every cell is `keyDisplayText(id)` = `formatKeys(getKeys(id), { capitalize: true })`
+    /// (`keybinding-hints.ts:29-39`), i.e. **all** keys bound to the id joined with `/` and each chord
+    /// part title-cased — not just the first key, so a rebind that binds two keys shows both. Unbound
+    /// ids render as the empty string exactly as upstream's `keys.length === 0 → ""` does (:30).
+    ///
+    /// `[CYRUP-DELTA]` — three of upstream's `**Other**` rows are omitted because the binding itself is
+    /// unported, not merely unbound: `app.model.select` ("Open model selector"), `app.thinking.toggle`
+    /// ("Toggle thinking block visibility") and `app.message.copy` ("Copy last assistant message") have
+    /// no [`Action`] variant (`core/keybindings.ts:21,23,26` vs `keymap.rs`'s enum). Printing them with
+    /// an empty key cell would advertise a shortcut no key reaches.
+    ///
+    /// The trailing **Extensions** table (`:6186-6197`) IS built. It is gated on
+    /// `if (shortcuts.size > 0)` (`:6189`) — no registered shortcut, no section, never an empty
+    /// table — and each row is
+    /// ``| `${formatKeyText(key, { capitalize: true })}` | ${shortcut.description ?? shortcut.extensionPath} |``
+    /// (`:6193-6197`). cyrup's registry is [`AppState::extension_shortcuts`], the very set the input
+    /// router already matches presses against (`:1501`), fed from `ExtensionHost::shortcut_keys()`
+    /// — so the section is a read of live state, not a fabricated list.
+    ///
+    /// The `newLine` row's `" (Ctrl+Enter on Windows Terminal)"` suffix (:6151) is gated on
+    /// `process.platform === "win32"`; it is emitted here under the same `cfg(windows)` condition.
+    fn hotkeys_markdown(&self) -> String {
         let ek = self.state.editor.keymap_ref();
         let km = &self.state.keymap;
-        let e = |a: EditorAction| ek.key_label(a).unwrap_or_else(|| "—".to_string());
-        let g = |a: Action| km.key_label(a).unwrap_or_else(|| "—".to_string());
-        let entry = |keys: String, desc: &str| HotkeyRow::Entry { keys, desc: desc.to_string() };
-        vec![
-            HotkeyRow::Section("Navigation".to_string()),
-            entry(
-                format!(
-                    "{}/{}/{}/{}",
-                    e(EditorAction::CursorUp),
-                    e(EditorAction::CursorDown),
-                    e(EditorAction::CursorLeft),
-                    e(EditorAction::CursorRight)
-                ),
-                "Move cursor / browse history",
-            ),
-            entry(
-                format!("{}/{}", e(EditorAction::CursorWordLeft), e(EditorAction::CursorWordRight)),
-                "Move by word",
-            ),
-            entry(e(EditorAction::CursorLineStart), "Start of line"),
-            entry(e(EditorAction::CursorLineEnd), "End of line"),
-            entry(e(EditorAction::JumpForward), "Jump forward to character"),
-            entry(e(EditorAction::JumpBackward), "Jump backward to character"),
-            entry(format!("{}/{}", g(Action::PageUp), g(Action::PageDown)), "Scroll by page"),
-            HotkeyRow::Section("Editing".to_string()),
-            entry(e(EditorAction::Submit), "Send message"),
-            entry(e(EditorAction::NewLine), "New line"),
-            entry(e(EditorAction::DeleteWordBackward), "Delete word backwards"),
-            entry(e(EditorAction::DeleteWordForward), "Delete word forwards"),
-            entry(e(EditorAction::DeleteToLineStart), "Delete to start of line"),
-            entry(e(EditorAction::DeleteToLineEnd), "Delete to end of line"),
-            entry(e(EditorAction::Yank), "Paste most-recently-deleted text"),
-            entry(e(EditorAction::YankPop), "Cycle deleted text after pasting"),
-            entry(e(EditorAction::Undo), "Undo"),
-            HotkeyRow::Section("Other".to_string()),
-            entry(e(EditorAction::Tab), "Path completion / accept autocomplete"),
-            entry(g(Action::Interrupt), "Cancel autocomplete / abort streaming"),
-            entry(g(Action::Clear), "Clear editor (first) / exit (second)"),
-            entry(g(Action::Quit), "Quit"),
-            entry(g(Action::Suspend), "Suspend to background"),
-            entry(g(Action::ToolsExpand), "Toggle tool output expansion"),
-            entry(g(Action::ExternalEditor), "Open buffer in external editor"),
-            entry(g(Action::ThinkingCycle), "Cycle thinking level"),
-            entry(
-                format!("{}/{}", g(Action::ModelCycleForward), g(Action::ModelCycleBackward)),
-                "Cycle model forward / backward",
-            ),
-            entry(g(Action::FollowUp), "Queue message as a follow-up"),
-            entry(g(Action::Dequeue), "Restore queued messages to editor"),
-            entry(g(Action::ClipboardPasteImage), "Paste image from clipboard"),
-            entry("/".to_string(), "Slash commands"),
-            entry("!".to_string(), "Run bash command"),
-            entry("!!".to_string(), "Run bash command (excluded from context)"),
-        ]
+        // `keyDisplayText` — every bound key, `/`-joined, each part capitalized.
+        let e = |a: EditorAction| {
+            crate::chrome::format_key_text(&ek.keys_label(a).unwrap_or_default(), true)
+        };
+        let g =
+            |a: Action| crate::chrome::format_key_text(&km.keys_label(a).unwrap_or_default(), true);
+        let win_note = if cfg!(windows) { " (Ctrl+Enter on Windows Terminal)" } else { "" };
+        let mut out = format!(
+            "**Navigation**\n\
+             | Key | Action |\n\
+             |-----|--------|\n\
+             | `{cursor_up}` / `{cursor_down}` / `{cursor_left}` / `{cursor_right}` | Move cursor / browse history |\n\
+             | `{word_left}` / `{word_right}` | Move by word |\n\
+             | `{line_start}` | Start of line |\n\
+             | `{line_end}` | End of line |\n\
+             | `{jump_fwd}` | Jump forward to character |\n\
+             | `{jump_back}` | Jump backward to character |\n\
+             | `{page_up}` / `{page_down}` | Scroll by page |\n\
+             \n\
+             **Editing**\n\
+             | Key | Action |\n\
+             |-----|--------|\n\
+             | `{submit}` | Send message |\n\
+             | `{new_line}` | New line{win_note} |\n\
+             | `{del_word_back}` | Delete word backwards |\n\
+             | `{del_word_fwd}` | Delete word forwards |\n\
+             | `{del_line_start}` | Delete to start of line |\n\
+             | `{del_line_end}` | Delete to end of line |\n\
+             | `{yank}` | Paste the most-recently-deleted text |\n\
+             | `{yank_pop}` | Cycle through the deleted text after pasting |\n\
+             | `{undo}` | Undo |\n\
+             \n\
+             **Other**\n\
+             | Key | Action |\n\
+             |-----|--------|\n\
+             | `{tab}` | Path completion / accept autocomplete |\n\
+             | `{interrupt}` | Cancel autocomplete / abort streaming |\n\
+             | `{clear}` | Clear editor (first) / exit (second) |\n\
+             | `{exit}` | Exit (when editor is empty) |\n\
+             | `{suspend}` | Suspend to background |\n\
+             | `{thinking_cycle}` | Cycle thinking level |\n\
+             | `{model_fwd}` / `{model_back}` | Cycle models |\n\
+             | `{expand_tools}` | Toggle tool output expansion |\n\
+             | `{external_editor}` | Edit message in external editor |\n\
+             | `{follow_up}` | Queue follow-up message |\n\
+             | `{dequeue}` | Restore queued messages |\n\
+             | `{paste_image}` | Paste image or text from clipboard |\n\
+             | `/` | Slash commands |\n\
+             | `!` | Run bash command |\n\
+             | `!!` | Run bash command (excluded from context) |",
+            cursor_up = e(EditorAction::CursorUp),
+            cursor_down = e(EditorAction::CursorDown),
+            cursor_left = e(EditorAction::CursorLeft),
+            cursor_right = e(EditorAction::CursorRight),
+            word_left = e(EditorAction::CursorWordLeft),
+            word_right = e(EditorAction::CursorWordRight),
+            line_start = e(EditorAction::CursorLineStart),
+            line_end = e(EditorAction::CursorLineEnd),
+            jump_fwd = e(EditorAction::JumpForward),
+            jump_back = e(EditorAction::JumpBackward),
+            page_up = g(Action::PageUp),
+            page_down = g(Action::PageDown),
+            submit = e(EditorAction::Submit),
+            new_line = e(EditorAction::NewLine),
+            del_word_back = e(EditorAction::DeleteWordBackward),
+            del_word_fwd = e(EditorAction::DeleteWordForward),
+            del_line_start = e(EditorAction::DeleteToLineStart),
+            del_line_end = e(EditorAction::DeleteToLineEnd),
+            yank = e(EditorAction::Yank),
+            yank_pop = e(EditorAction::YankPop),
+            undo = e(EditorAction::Undo),
+            tab = e(EditorAction::Tab),
+            interrupt = g(Action::Interrupt),
+            clear = g(Action::Clear),
+            exit = g(Action::Quit),
+            suspend = g(Action::Suspend),
+            thinking_cycle = g(Action::ThinkingCycle),
+            model_fwd = g(Action::ModelCycleForward),
+            model_back = g(Action::ModelCycleBackward),
+            expand_tools = g(Action::ToolsExpand),
+            external_editor = g(Action::ExternalEditor),
+            follow_up = g(Action::FollowUp),
+            dequeue = g(Action::Dequeue),
+            paste_image = g(Action::ClipboardPasteImage),
+        );
+        // `if (shortcuts.size > 0) { hotkeys += "\n**Extensions**\n| Key | Action |\n|-----|--------|\n" }`
+        // then one `| \`key\` | description |` row per entry (`interactive-mode.ts:6189-6197`).
+        // The key cell is `formatKeyText(key, { capitalize: true })` over the REGISTERED id, not a
+        // keymap lookup — an extension shortcut is not a rebindable `Keybinding`, so there is
+        // nothing to resolve it against.
+        if !self.state.extension_shortcuts.is_empty() {
+            out.push_str("\n\n**Extensions**\n| Key | Action |\n|-----|--------|");
+            for (_, spec) in &self.state.extension_shortcuts {
+                let key_display = crate::chrome::format_key_text(&spec.id, true);
+                // `shortcut.description ?? shortcut.extensionPath` (`:6192`). cyrup's
+                // `ExtensionHost::shortcut_keys()` currently surfaces neither field — the guest's
+                // `register_shortcut(key, desc)` drops `desc` at `cyrup-ext/src/host/live.rs:98`
+                // and the registry keys on `ExtensionId` — so with nothing registered the raw
+                // key-id stands in. It identifies the shortcut truthfully; a fabricated label
+                // would not.
+                let label = spec.description.as_deref().unwrap_or(spec.id.as_str());
+                out.push_str(&format!("\n| `{key_display}` | {label} |"));
+            }
+        }
+        out
     }
 
     /// Open an editor-swap selector (spec/tui/05 §1.1 `showSelector`): snapshot the editor text, build
@@ -4040,7 +4246,7 @@ impl<B: Backend> App<B> {
     /// yields a `&cyrup_core::AssistantMessage`). `cyrup-provider` is a direct dependency, so the
     /// token-by-token render (gap 1) is live, not deferred.
     pub fn ingest_event(&mut self, ev: &AgentSessionEvent) {
-        self.ingest_event_rendered(ev, None);
+        self.ingest_event_rendered(ev, None, crate::transcript::Rendered::None);
     }
 
     /// [`Self::ingest_event`], first giving the loaded extensions a chance to RENDER the event
@@ -4058,7 +4264,18 @@ impl<B: Backend> App<B> {
         ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ) {
         let rendered = extension_render(ext_host, ev).await;
-        self.ingest_event_rendered(ev, rendered);
+        // X15 — the custom-ENTRY renderer is a SECOND, disjoint lookup (Pi keeps
+        // `messageRenderers` and `entryRenderers` as separate maps, types.ts:1703-1704, and
+        // `addCustomEntryToChat` resolves the entry one at `interactive-mode.ts:3432`). It rides in
+        // the same way and for the same reason: the fold is sync, the guest call is async.
+        let entry = match ev {
+            AgentSessionEvent::EntryAppended { entry } => {
+                let custom_type = custom_entry_type(entry);
+                extension_render_entry(ext_host, &custom_type, entry).await
+            }
+            _ => crate::transcript::Rendered::None,
+        };
+        self.ingest_event_rendered(ev, rendered, entry);
     }
 
     /// The run loop's per-event fold: [`Self::ingest_event_with_extensions`], then the footer's
@@ -4125,7 +4342,15 @@ impl<B: Backend> App<B> {
         self.state.status.set_auto_compact(session.auto_compaction_enabled());
     }
 
-    fn ingest_event_rendered(&mut self, ev: &AgentSessionEvent, rendered: Option<String>) {
+    /// `rendered` is what a custom-MESSAGE / tool-row renderer produced (already collapsed to
+    /// `Option<String>`, since both surfaces swallow a renderer throw upstream). `entry` is the
+    /// three-state custom-ENTRY outcome, which does NOT collapse — see [`extension_render_entry`].
+    fn ingest_event_rendered(
+        &mut self,
+        ev: &AgentSessionEvent,
+        rendered: Option<String>,
+        entry_rendered: crate::transcript::Rendered,
+    ) {
         match ev {
             AgentSessionEvent::AgentStart => {
                 self.state.status.set_streaming(true);
@@ -4171,6 +4396,13 @@ impl<B: Backend> App<B> {
                     // EXT-006: `rendered` is the text the extension that registered a renderer for
                     // this custom type produced; absent one it is `None` and the default
                     // `[kind] body` framing draws (Pi `CustomMessageComponent`).
+                    // `Rendered::None` is "no renderer claimed this type" — Pi's
+                    // `getMessageRenderer(...) === undefined` (`interactive-mode.ts:3326`), which
+                    // draws the default box. A renderer that FAULTED also lands here, matching
+                    // `custom-message.ts:82-84`'s `catch { /* Fall through to default rendering */ }`.
+                    let rendered = rendered
+                        .map(crate::transcript::Rendered::Text)
+                        .unwrap_or(crate::transcript::Rendered::None);
                     self.state.transcript.push_custom_message_rendered(kind, body, rendered);
                 }
             }
@@ -4380,13 +4612,36 @@ impl<B: Backend> App<B> {
             }
             AgentSessionEvent::EntryAppended { entry } => {
                 // A loaded extension appended a custom (non-LLM) entry to the tree (Pi
-                // `entry_appended`, agent-session.ts:140). Surface its type as a status line.
-                let ty = entry
-                    .get("type")
-                    .or_else(|| entry.get("customType"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("custom");
-                self.state.transcript.push_status(format!("entry appended → {ty}"));
+                // `entry_appended`, agent-session.ts:140 → `addCustomEntryToChat(event.entry)`,
+                // interactive-mode.ts:3105/3431-3450).
+                let ty = custom_entry_type(entry);
+                // X15 — `addCustomEntryToChat` is entirely a renderer question:
+                //
+                // ```ts
+                // const renderer = this.session.extensionRunner.getEntryRenderer(entry.customType);
+                // if (!renderer) { return; }                      // :3433-3435 — draws NOTHING
+                // const component = new CustomEntryComponent(entry, renderer);
+                // component.setExpanded(this.toolOutputExpanded);
+                // if (!component.hasContent()) { return; }        // :3438-3440 — also nothing
+                // ```
+                //
+                // …and `CustomEntryComponent` is where a THROW becomes the failure box
+                // (`custom-entry.ts:47-52`) rather than being dropped. `entry_rendered` carries
+                // that three-state answer here.
+                if entry_rendered.has_content() {
+                    self.state.transcript.push_custom_message_rendered(
+                        ty,
+                        String::new(),
+                        entry_rendered,
+                    );
+                } else {
+                    // CYRUP-DELTA: with no renderer claiming the type upstream shows nothing at
+                    // all, which leaves a `/statedemo`-style entry invisible. cyrup keeps its
+                    // pre-existing one-line receipt for that case only — strictly additive over
+                    // "nothing", and it never competes with a renderer, because a renderer that
+                    // produced output (or faulted) took the branch above.
+                    self.state.transcript.push_status(format!("entry appended → {ty}"));
+                }
             }
             // Session lifecycle (runtime replacement, arch-11 §3.4): surface a status line. The TUI
             // re-subscribes to the runtime's new generation on `SessionReplaced` (R-11-021); the
@@ -4669,11 +4924,6 @@ pub async fn extension_render(
     ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ev: &AgentSessionEvent,
 ) -> Option<String> {
-    enum Which {
-        Message(String, serde_json::Value),
-        ToolCall(String, serde_json::Value),
-        ToolResult(String, serde_json::Value),
-    }
     let which = match ev {
         AgentSessionEvent::MessageEnd { .. } => {
             let (kind, _) = custom_message_from_event(ev)?;
@@ -4697,25 +4947,128 @@ pub async fn extension_render(
         }
         _ => return None,
     };
+    // A FAULTING renderer collapses to `None` here on purpose: both of this function's surfaces
+    // swallow the throw upstream — a custom message falls through to its default `[type] body` box
+    // (`custom-message.ts:82-84`, `catch { /* Fall through to default rendering */ }`) and a tool
+    // row keeps its built-in shell. The distinction is preserved by the host
+    // ([`cyrup_ext::RenderOutcome`]) for the ENTRY surface, which does NOT swallow it — see
+    // [`extension_render_entry`].
+    run_renderer(ext_host, which).await.into_text()
+}
+
+/// Ask the loaded extensions to render an appended custom ENTRY (X15; Pi `addCustomEntryToChat`,
+/// `interactive-mode.ts:3431-3436`, resolving `extensionRunner.getEntryRenderer(entry.customType)`
+/// at `runner.ts:593-600`).
+///
+/// This is the ONE surface where the renderer's fault is user-visible, so it is the one that must
+/// NOT collapse the three-state [`cyrup_ext::RenderOutcome`] the way [`extension_render`] does:
+///
+/// * no renderer, or a renderer that drew nothing (`:3433-3435` / `:3438-3440`) →
+///   [`Rendered::None`], and the caller draws NOTHING;
+/// * a rendered component (`custom-entry.ts:58-60`) → [`Rendered::Text`];
+/// * a renderer that THREW (`custom-entry.ts:47-52`) → [`Rendered::Failed`], the failure box.
+///
+/// Same cheap sync pre-check (`if (!renderer) return;`) and the same spawn + bounded wait as
+/// [`extension_render`].
+pub async fn extension_render_entry(
+    ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    custom_type: &str,
+    entry: &serde_json::Value,
+) -> crate::transcript::Rendered {
+    if !ext_host.has_entry_renderer(custom_type) {
+        return crate::transcript::Rendered::None;
+    }
+    run_renderer(ext_host, Which::Entry(custom_type.to_string(), entry.clone())).await
+}
+
+/// The `customType` of a serialized session entry — the key an entry renderer is registered under
+/// (Pi `entry.customType`, `session-manager.ts` `CustomEntry`; read by `addCustomEntryToChat`,
+/// `interactive-mode.ts:3432`).
+///
+/// Both spellings are accepted because the persisted entry carries `customType` while the event
+/// envelope's discriminator is `type`; `"custom"` is the last-resort label for an entry that
+/// carries neither, and no renderer will ever claim it.
+pub(crate) fn custom_entry_type(entry: &serde_json::Value) -> String {
+    entry
+        .get("customType")
+        .or_else(|| entry.get("custom_type"))
+        .or_else(|| entry.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("custom")
+        .to_string()
+}
+
+/// Which registered renderer to invoke, and with what payload.
+enum Which {
+    Message(String, serde_json::Value),
+    ToolCall(String, serde_json::Value),
+    ToolResult(String, serde_json::Value),
+    Entry(String, serde_json::Value),
+}
+
+/// Resolve an extension's registered MESSAGE renderer for `custom_type` and run it against
+/// `payload` (Pi `getMessageRenderer(customType)`, `extensions/runner.ts:579-587`).
+///
+/// X11 — the REPLAY walk needs this without an `AgentSessionEvent` to hand: a `/resume` reads
+/// persisted `AgentMessage`s, not events, and Pi performs the identical lookup there
+/// (`interactive-mode.ts:3471`) as on the live path. Same cheap sync `has_message_renderer`
+/// pre-check and the same spawn + bounded wait as [`extension_render`], so a wedged guest degrades
+/// a replayed block to its built-in framing instead of stalling the resume.
+pub async fn extension_render_message(
+    ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    custom_type: &str,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    if !ext_host.has_message_renderer(custom_type) {
+        return None;
+    }
+    // Same collapse as [`extension_render`]: `custom-message.ts:82-84` swallows the throw.
+    run_renderer(ext_host, Which::Message(custom_type.to_string(), payload.clone()))
+        .await
+        .into_text()
+}
+
+/// Run one renderer on its OWN task under [`EXTENSION_RENDER_TIMEOUT`] — see that constant's doc for
+/// why the call must never be awaited inline on the event path.
+///
+/// X15 — the host now reports three outcomes ([`cyrup_ext::RenderOutcome`]) and this carries all
+/// three back; [`extension_render`]/[`extension_render_message`] are what collapse `Failed` into
+/// the default framing for their surfaces, because upstream does
+/// (`custom-message.ts:82-84` catches and falls through).
+async fn run_renderer(
+    ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    which: Which,
+) -> crate::transcript::Rendered {
+    use crate::transcript::Rendered;
     let host = ext_host.clone();
     let task = tokio::spawn(async move {
         match which {
-            Which::Message(key, payload) => host.render_message_call(&key, &payload).await,
-            Which::ToolCall(key, payload) => host.render_tool_call(&key, &payload).await,
-            Which::ToolResult(key, payload) => host.render_tool_result(&key, &payload).await,
+            Which::Message(key, payload) => host.render_message_call_outcome(&key, &payload).await,
+            Which::ToolCall(key, payload) => host.render_tool_call_outcome(&key, &payload).await,
+            Which::ToolResult(key, payload) => host.render_tool_result_outcome(&key, &payload).await,
+            Which::Entry(key, payload) => host.render_entry(&key, &payload).await,
         }
     });
     let abort = task.abort_handle();
     match tokio::time::timeout(EXTENSION_RENDER_TIMEOUT, task).await {
-        Ok(Ok(v)) => v.map(|v| rendered_text(&v)),
-        // A panicking renderer task degrades to the built-in framing, like a faulting one.
-        Ok(Err(_)) => None,
+        Ok(Ok(cyrup_ext::RenderOutcome::Rendered(v))) => Rendered::Text(rendered_text(&v)),
+        // The renderer FAULTED. `cyrup-ext` already contained the fault (native panic caught,
+        // guest trap mapped) and kept its message; upstream's `catch` binding is the same value.
+        Ok(Ok(cyrup_ext::RenderOutcome::Failed(message))) => Rendered::Failed(message),
+        Ok(Ok(cyrup_ext::RenderOutcome::None)) => Rendered::None,
+        // The renderer TASK itself panicked — outside the host's `catch_unwind`, so no message
+        // survived the unwind. Report it as a fault anyway: something threw, and reporting `None`
+        // here is precisely the conflation X15 is about.
+        Ok(Err(_)) => Rendered::Failed("renderer task panicked".to_string()),
         Err(_) => {
             // Cancel the wedged call rather than detaching it: dropping a `JoinHandle` only
             // detaches, and a renderer that blocks once will block again on the next event, so
             // detached tasks would pile up behind the instance's store lock.
             abort.abort();
-            None
+            // NOT a fault: upstream renderers are synchronous and cannot time out, so there is no
+            // `catch` to model. A wedged renderer degrades to the built-in framing (and, for an
+            // entry, to nothing at all) rather than accusing the extension of throwing.
+            Rendered::None
         }
     }
 }
@@ -5369,11 +5722,46 @@ fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 6] {
             .fold(0u16, |a, h| a.saturating_add(h))
     };
 
+    // L7 — the editor's MINIMUM HEIGHT. Pi docks the two bottom regions with explicit floors
+    // (`interactive-mode.ts:876-883`):
+    //
+    // ```ts
+    // const dock = new TuiLayouts.VStack([
+    //     { component: this.pendingMessagesContainer, shrink: 1, minSize: 0 },
+    //     { component: this.statusContainer,          shrink: 1, minSize: 0 },
+    //     { component: this.widgetContainerAbove,     shrink: 1, minSize: 0 },
+    //     { component: this.editorContainer,          shrink: 1, minSize: 3 },
+    //     { component: this.widgetContainerBelow,     shrink: 1, minSize: 0 },
+    //     { component: this.footerContainer,          shrink: 1, minSize: 1 },
+    // ]);
+    // ```
+    //
+    // and `allocateStackSizes`' shrink pass only ever takes rows from an entry while
+    // `sizes[index] > (entry.minSize ?? 0)` — `capacity = sizes[index] - minSize`
+    // (`tui/src/components/stack.ts:109,124`). So pi's editor never goes below 3 rows. When even
+    // the floors do not fit, `candidates` empties and the pass returns (`:111`) with the stack
+    // OVERFLOWING its box; the children past the box's clip rect are the ones that vanish, and the
+    // editor — laid out before the footer — is not one of them.
+    //
+    // cyrup allocated the footer first and then took `want_slot.min(remaining)` with no floor at
+    // all, so on a viewport of 3-4 rows the editor was squeezed to 1-2 rows: its own top/bottom
+    // rules do not fit, let alone a line of text. Both floors are now reserved up front, editor
+    // first, and only the surplus is handed out — which reproduces pi's answer on a very short
+    // terminal (editor 3, footer 1 at 4 rows; editor 3 and no footer at 3) and is bit-identical to
+    // the old split at every height where the old one was not already squeezing.
+    const EDITOR_MIN_ROWS: u16 = 3;
     let mut remaining = avail;
-    let footer = footer_max.min(remaining).max(1);
-    remaining = remaining.saturating_sub(footer);
-    let slot = want_slot.min(remaining);
-    remaining = remaining.saturating_sub(slot);
+    let slot_floor = want_slot.min(EDITOR_MIN_ROWS).min(remaining);
+    remaining = remaining.saturating_sub(slot_floor);
+    let footer_floor = 1u16.min(remaining);
+    remaining = remaining.saturating_sub(footer_floor);
+    // Surplus, in the old order: the footer fills out to `footer_max`, then the slot to `want_slot`.
+    let footer_extra = footer_max.saturating_sub(footer_floor).min(remaining);
+    let footer = footer_floor.saturating_add(footer_extra);
+    remaining = remaining.saturating_sub(footer_extra);
+    let slot_extra = want_slot.saturating_sub(slot_floor).min(remaining);
+    let slot = slot_floor.saturating_add(slot_extra);
+    remaining = remaining.saturating_sub(slot_extra);
     let popup = want_popup.min(remaining);
     remaining = remaining.saturating_sub(popup);
     let band = if want_status { 2u16.min(remaining) } else { 0 };
@@ -5775,8 +6163,14 @@ impl App<CrosstermBackend<Stdout>> {
         // elsewhere moves; the process cwd is the fallback seeded in `AppState::new`). Refreshed on
         // `session_info_changed` (`ingest_event`) and on every session swap (the `session_swapped`
         // arm below), which is exactly Pi's `:2901` / `:1761` call sites.
+        // X7(b) — through [`Self::set_title_cwd`], NOT a bare `state.title_cwd = …`. That funnel is
+        // what also lands the value on the transcript as Pi's `ToolRenderContext.cwd`
+        // (`tool-execution.ts:126`), which `read`'s compact classification resolves its path against
+        // (`read.ts:336`, `resolveToCwd(rawPath, cwd)`). Assigning the field directly left
+        // `transcript.cwd()` at `None`, so the classification silently fell back to the PROCESS cwd
+        // — which is exactly what the paragraph above says can differ after a `/resume`.
         if let Some(rt) = runtime.as_ref() {
-            self.state.title_cwd = rt.cwd().to_path_buf();
+            self.set_title_cwd(rt.cwd().to_path_buf());
         }
         self.state.status.set_session_name(session.session_name().await);
         if let Some(title) = self.update_terminal_title() {
@@ -5817,11 +6211,12 @@ impl App<CrosstermBackend<Stdout>> {
         // session, and any turn not running a bash call, never ticks.
         let mut elapsed_tick = tokio::time::interval(ELAPSED_TICK_INTERVAL);
         elapsed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // A live `!`/`!!` bash subprocess: its output receiver + a cancel token to kill it (`Esc`).
-        // Kept as run-loop locals (not on `self`) so the `select!` borrow does not collide with the
-        // input-arm `&mut self`.
+        // A live `!`/`!!` bash run: the receiver its deltas + terminal result arrive on. Kept as a
+        // run-loop local (not on `self`) so the `select!` borrow does not collide with the
+        // input-arm `&mut self`. X13 — cancellation is NOT a local token any more: the run goes
+        // through `session.execute_bash*`, which owns the child's token (`_bashAbortController`,
+        // agent-session.ts:2660), so `Esc` is `session.abort_bash()` — Pi's `abortBash()`.
         let mut bash_rx: Option<tokio::sync::mpsc::UnboundedReceiver<BashMsg>> = None;
-        let mut bash_cancel: Option<CancelToken> = None;
         // A fired extension shortcut is spawned onto its own tokio task (see the
         // `AppAction::ExtensionShortcut` arm below for why); this channel carries its status/error
         // line back to the transcript once it settles, mirroring the `bash_rx` pattern above.
@@ -5931,9 +6326,7 @@ impl App<CrosstermBackend<Stdout>> {
                             session.abort();
                             // Also kill a running bash child (the block was already marked cancelled
                             // in `apply_action`); the reader task's terminal `Done` clears `bash_rx`.
-                            if let Some(c) = bash_cancel.take() {
-                                c.cancel();
-                            }
+                            session.abort_bash();
                         }
                         AppAction::InterruptRestoreQueued => {
                             // Pi `onEscape` while streaming (interactive-mode.ts:2636-2637):
@@ -5946,9 +6339,7 @@ impl App<CrosstermBackend<Stdout>> {
                                 steering.into_iter().chain(follow_up).collect();
                             self.restore_queued_to_editor(&queued);
                             session.abort();
-                            if let Some(c) = bash_cancel.take() {
-                                c.cancel();
-                            }
+                            session.abort_bash();
                         }
                         AppAction::AbortBranchSummary => {
                             // Pi `:4793` — cancel the summarization only. The spawned navigation
@@ -5956,14 +6347,11 @@ impl App<CrosstermBackend<Stdout>> {
                             // arm re-shows the tree; the indicator/Escape rebind are torn down there.
                             session.abort_branch_summary();
                         }
-                        AppAction::RunBash { command, .. } => {
-                            // Replace any prior job (its token is dropped → child orphaned-but-exits).
-                            if let Some(c) = bash_cancel.take() {
-                                c.cancel();
-                            }
-                            let (rx, c) = spawn_bash(command);
-                            bash_rx = Some(rx);
-                            bash_cancel = Some(c);
+                        AppAction::RunBash { command, excluded } => {
+                            // Replace any prior job (Pi keeps one `bashComponent`; a second `!` while
+                            // the first still runs supersedes it).
+                            session.abort_bash();
+                            bash_rx = Some(spawn_session_bash(session.clone(), command, excluded));
                         }
                         AppAction::Submit(text) => {
                             // Spawned, not awaited inline (L4 review §2.1 — the SAME deadlock reason
@@ -6074,28 +6462,27 @@ impl App<CrosstermBackend<Stdout>> {
                 Some(msg) = bash_next => {
                     match msg {
                         BashMsg::Chunk(chunk) => self.state.transcript.bash_append(&chunk),
-                        BashMsg::Done(code) => {
-                            // Feed `!` (not `!!`) output back into the session context, then commit
-                            // the block to scrollback (`bash-execution.ts` → BashExecutionMessage).
-                            if let Some(b) = self.state.transcript.bash() {
-                                let excluded = b.excluded();
-                                let command = b.command().to_string();
-                                let output = b.output();
-                                self.state.transcript.bash_complete(code, false);
-                                self.state.transcript.commit_bash();
-                                if !excluded && !output.trim().is_empty() {
-                                    let payload = serde_json::json!({
-                                        "command": command,
-                                        "output": output,
-                                        "exitCode": code,
-                                    });
-                                    let _ = session
-                                        .append_custom_message("bashExecution", payload, false)
-                                        .await;
-                                }
-                            }
+                        BashMsg::Done { exit_code, cancelled, truncated, full_output_path } => {
+                            // X13 — Pi's completion arm verbatim (`interactive-mode.ts:6347-6353`):
+                            //   this.bashComponent.setComplete(
+                            //       result.exitCode, result.cancelled,
+                            //       result.truncated ? {truncated:true, content:result.output} : undefined,
+                            //       result.fullOutputPath);
+                            // All FOUR fields, so `Output truncated. Full output: …`
+                            // (`bash-execution.ts:195-199`) is reachable in a LIVE session and not
+                            // only on replay. Recording into the session is NOT done here: it is
+                            // `executeBash`'s own `recordBashResult` (agent-session.ts:2628-2643),
+                            // which `AgentSession::execute_bash` already performs — with the
+                            // `truncated`/`fullOutputPath` fields intact, which is what puts the
+                            // warning back on the block after a `/resume`.
+                            self.state.transcript.bash_complete(
+                                exit_code,
+                                cancelled,
+                                truncated,
+                                full_output_path,
+                            );
+                            self.state.transcript.commit_bash();
                             bash_rx = None;
-                            bash_cancel = None;
                         }
                     }
                     self.draw_synchronized()?;
@@ -6298,7 +6685,11 @@ impl App<CrosstermBackend<Stdout>> {
                         // reach their own component instead of replaying as user prose.
                         let restored = session.raw_context_messages().await;
                         if !restored.is_empty() {
-                            self.replay_session(&restored);
+                            // X11 — with extensions: the swapped-in session brings its own host,
+                            // and Pi resolves `getMessageRenderer` on the replay walk too
+                            // (`interactive-mode.ts:3471`).
+                            let ext_host = session.services().ext_host.clone();
+                            self.replay_session_with_extensions(&restored, &ext_host).await;
                         }
                         // The swapped-in session owns a fresh extension host; re-source its
                         // registered shortcut key-ids (R-08-017) so a post-swap press still routes.
@@ -6321,76 +6712,84 @@ impl App<CrosstermBackend<Stdout>> {
     }
 }
 
-/// A streamed message from a running `!`/`!!` bash subprocess (`bash-execution.ts` output pump).
+/// A streamed message from a running `!`/`!!` bash execution (`bash-execution.ts` output pump).
 #[derive(Clone, Debug)]
 enum BashMsg {
-    /// A raw stdout/stderr chunk (merged; `appendOutput` strips ANSI + normalizes newlines).
+    /// A sanitized stdout/stderr delta (Pi's `onChunk`, `interactive-mode.ts:6338-6343`).
     Chunk(String),
-    /// The process exited (`setComplete`); carries the exit code (`None` if signalled/unknown).
-    Done(Option<i32>),
+    /// The run finished — the four `setComplete(exitCode, cancelled, truncationResult,
+    /// fullOutputPath)` arguments (`bash-execution.ts:98-103`, fed from `BashResult` at
+    /// `interactive-mode.ts:6348-6353`).
+    Done {
+        exit_code: Option<i32>,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
+    },
 }
 
-/// Spawn `command` via `sh -c` (`bash-execution.ts` / the `!` handler), streaming merged
-/// stdout+stderr chunks over the returned channel and a terminal [`BashMsg::Done`]. The returned
-/// [`CancelToken`] kills the child when cancelled (`Esc` → `tui.select.cancel`). No `unsafe`.
-fn spawn_bash(command: String) -> (tokio::sync::mpsc::UnboundedReceiver<BashMsg>, CancelToken) {
-    use tokio::io::AsyncReadExt;
-    use tokio::process::Command;
+/// Run a `!`/`!!` command through the session's own bash seam — Pi's `handleBashCommand`
+/// (`interactive-mode.ts:6279-6364`), whose executor line is `await this.session.executeBash(command,
+/// (chunk) => this.bashComponent.appendOutput(chunk), { excludeFromContext, operations })`
+/// (`:6336-6345`) — streaming its deltas and terminal [`BashResult`] over the returned channel.
+///
+/// **X13.** This replaced a local `sh -c` pump that reported only an exit code, so
+/// `truncated`/`fullOutputPath` were hard-coded `false, None` at the call to `setComplete` and the
+/// `Output truncated. Full output: …` row (`bash-execution.ts:195-199`) could never appear in a live
+/// session — only on the replay path, which reads the fields back off a persisted
+/// `bashExecution` message. The seam that produces them already existed:
+/// `AgentSession::execute_bash` → `run_bash` → `BashOutputBuffer` (`cyrup-session-svc/src/bash.rs`,
+/// a port of `bash-executor.ts:57-124`), which spills to `cyrup-bash-<id>.log` once the raw stream
+/// passes `DEFAULT_MAX_BYTES` and tail-truncates the preview. Nothing in the TUI reached it.
+///
+/// Routing through the session rather than spawning locally also picks up the rest of Pi's
+/// `executeBash` contract that the local pump silently skipped: the `user_bash` extension event and
+/// its `result` override ([`AgentSession::execute_bash_with_user_event`], Pi's per-front-end
+/// `emitUserBash`, `interactive-mode.ts:6283-6288`), the `shellCommandPrefix`/`shellPath` settings,
+/// the managed `bin` dir on `PATH`, ANSI/binary sanitization of every chunk, the
+/// `bash_execution_update` event fan-out, and `recordBashResult` (`agent-session.ts:2628`) — which
+/// is why the caller no longer appends its own `bashExecution` message.
+///
+/// Cancellation is the session's (`abortBash`, `agent-session.ts:2660`), not a token handed back
+/// here: `execute_bash` installs its own child token and `AgentSession::abort_bash` fires it.
+fn spawn_session_bash(
+    session: Arc<AgentSession>,
+    command: String,
+    excluded: bool,
+) -> tokio::sync::mpsc::UnboundedReceiver<BashMsg> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BashMsg>();
-    let cancel = CancelToken::new();
-    let child_cancel = cancel.clone();
     tokio::spawn(async move {
-        let spawned = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-        let mut child = match spawned {
-            Ok(c) => c,
+        let chunk_tx = tx.clone();
+        // Pi's `(chunk) => { this.bashComponent.appendOutput(chunk); this.ui.requestRender(); }`
+        // (`interactive-mode.ts:6338-6343`) — the redraw is the run loop's, so the sink only posts.
+        let sink: cyrup_session_svc::BashChunkSink = Some(Box::new(move |delta: &str| {
+            let _ = chunk_tx.send(BashMsg::Chunk(delta.to_string()));
+        }));
+        let options =
+            cyrup_session_svc::BashOptions { exclude_from_context: excluded, id: None };
+        let done = match session.execute_bash_with_user_event(&command, options, sink).await {
+            Ok(result) => BashMsg::Done {
+                exit_code: result.exit_code,
+                cancelled: result.cancelled,
+                truncated: result.truncated,
+                full_output_path: result.full_output_path,
+            },
+            // A genuine backend failure (spawn error, missing shell, …). Pi's `catch`
+            // (`interactive-mode.ts:6355-6360`) shows the message and calls
+            // `setComplete(undefined, false)` — no exit code, not cancelled, no truncation report.
             Err(e) => {
-                let _ = tx.send(BashMsg::Chunk(format!("{e}\n")));
-                let _ = tx.send(BashMsg::Done(None));
-                return;
-            }
-        };
-        // Pump stdout + stderr concurrently into the same channel (merged like a terminal).
-        async fn pump<R: tokio::io::AsyncRead + Unpin>(
-            mut r: R,
-            tx: tokio::sync::mpsc::UnboundedSender<BashMsg>,
-        ) {
-            let mut buf = [0u8; 4096];
-            loop {
-                match r.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let chunk = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])).into_owned();
-                        if tx.send(BashMsg::Chunk(chunk)).is_err() {
-                            break;
-                        }
-                    }
+                let _ = tx.send(BashMsg::Chunk(format!("Bash command failed: {e}\n")));
+                BashMsg::Done {
+                    exit_code: None,
+                    cancelled: false,
+                    truncated: false,
+                    full_output_path: None,
                 }
             }
-        }
-        let out_task = child.stdout.take().map(|o| tokio::spawn(pump(o, tx.clone())));
-        let err_task = child.stderr.take().map(|e| tokio::spawn(pump(e, tx.clone())));
-        let status = tokio::select! {
-            _ = child_cancel.cancelled() => {
-                let _ = child.start_kill();
-                child.wait().await.ok()
-            }
-            s = child.wait() => s.ok(),
         };
-        if let Some(t) = out_task {
-            let _ = t.await;
-        }
-        if let Some(t) = err_task {
-            let _ = t.await;
-        }
-        let _ = tx.send(BashMsg::Done(status.and_then(|s| s.code())));
+        let _ = tx.send(done);
     });
-    (rx, cancel)
+    rx
 }
 
 /// Write the OSC 0 window-title sequence — Pi `ProcessTerminal.setTitle`
@@ -6777,5 +7176,132 @@ mod external_editor_tests {
         let file = dir.path().join("buffer.md");
         std::fs::write(&file, "x").unwrap();
         assert_eq!(run_editor_over_file(&editor, &file).as_deref(), Some("line one"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod x13_live_bash_tests {
+    use super::*;
+    use cyrup_provider::faux::FauxProvider;
+    use cyrup_provider::Provider;
+    use cyrup_session_svc::{SessionBuilder, SessionConfig};
+    use ratatui::backend::TestBackend;
+
+    /// ~3000 lines x ~40 bytes ≈ 120 KB — comfortably past `truncate.ts:11-12`'s 2000-line / 50 KB
+    /// pair, so `bash-executor.ts`'s `ensureTempFile` spill and `truncateTail` both fire.
+    const BIG: &str =
+        "for i in $(seq 1 3000); do echo \"line-number-$i-padding-xxxxxxxxxx\"; done";
+
+    async fn session(dir: &std::path::Path) -> Arc<AgentSession> {
+        let cwd = dir.join("project");
+        let agent_dir = dir.join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let mut cfg = SessionConfig::new(cwd, agent_dir);
+        cfg.trust_override = Some(true);
+        Arc::new(SessionBuilder::new(faux, cfg).build().await.unwrap())
+    }
+
+    /// Drive `spawn_session_bash` with EXACTLY the two `select!` arms the run loop uses, so the
+    /// assertion covers the real wiring and not a re-implementation of it.
+    async fn run_block(app: &mut App<TestBackend>, session: Arc<AgentSession>, command: &str) {
+        app.state_mut().transcript.start_bash(command.to_string(), false, None, None);
+        let mut rx = spawn_session_bash(session, command.to_string(), false);
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                BashMsg::Chunk(chunk) => app.state_mut().transcript.bash_append(&chunk),
+                BashMsg::Done { exit_code, cancelled, truncated, full_output_path } => {
+                    app.state_mut().transcript.bash_complete(
+                        exit_code,
+                        cancelled,
+                        truncated,
+                        full_output_path,
+                    );
+                    app.state_mut().transcript.commit_bash();
+                    break;
+                }
+            }
+        }
+        app.draw().unwrap();
+    }
+
+    /// **X13 — a LIVE `!` run names its spool file.**
+    ///
+    /// `bash-execution.ts:195-199`:
+    /// ```ts
+    /// const wasTruncated = this.truncationResult?.truncated || contextTruncation.truncated;
+    /// if (wasTruncated && this.fullOutputPath) {
+    ///     statusParts.push(theme.fg("warning", `Output truncated. Full output: ${this.fullOutputPath}`));
+    /// }
+    /// ```
+    /// `fullOutputPath` is `setComplete`'s FOURTH argument, which `handleBashCommand` passes from
+    /// `result.fullOutputPath` (`interactive-mode.ts:6352`). The old local `sh -c` pump had no
+    /// spool at all and always passed `false, None`, so the row was unreachable outside replay —
+    /// even though `contextTruncation.truncated` was already true here (120 KB / 3000 lines), which
+    /// is exactly why the `&& this.fullOutputPath` leg is what this test turns on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_bash_run_names_its_spool_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session(dir.path()).await;
+        let mut app = App::new(TestBackend::new(120, 24), UiTheme::dark()).unwrap();
+        run_block(&mut app, session, BIG).await;
+
+        let out = app.scrollback_text();
+        let row = out
+            .lines()
+            .find(|l| l.contains("Output truncated. Full output:"))
+            .unwrap_or_else(|| panic!("no truncation row in a 120 KB live run:\n{out}"));
+        let path = row.split("Full output:").nth(1).unwrap().trim().to_string();
+        assert!(path.contains("cyrup-bash-"), "the spool file is the executor's: {path}");
+
+        // The named file really holds the FULL output — the row is not a decorative string.
+        let spooled = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("the spool file must be readable at {path}: {e}"));
+        assert!(spooled.contains("line-number-1-padding"), "nothing dropped from the front");
+        assert!(spooled.contains("line-number-3000-padding"), "nor from the tail");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// MIRROR — a SMALL live run spools nothing, so the row must not appear. Proves the wiring
+    /// forwards the executor's real report rather than hard-coding the other constant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_small_live_bash_run_has_no_truncation_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session(dir.path()).await;
+        let mut app = App::new(TestBackend::new(120, 24), UiTheme::dark()).unwrap();
+        run_block(&mut app, session, "echo hello-small").await;
+
+        let out = app.scrollback_text();
+        assert!(out.contains("hello-small"), "the output rendered:\n{out}");
+        assert!(!out.contains("Output truncated"), "and nothing was spooled:\n{out}");
+    }
+
+    /// The run is recorded through the session's own `recordBashResult` (`agent-session.ts:2628`)
+    /// — WITH the truncation fields, which is what makes the replay arm able to restore the row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_live_run_records_a_bash_execution_message_carrying_the_spool_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session(dir.path()).await;
+        let mut app = App::new(TestBackend::new(120, 24), UiTheme::dark()).unwrap();
+        run_block(&mut app, session.clone(), BIG).await;
+
+        let msgs = session.agent_messages().await;
+        let payload = msgs
+            .iter()
+            .find_map(|m| match m {
+                cyrup_agent::AgentMessage::Custom { kind, payload, .. }
+                    if kind == "bashExecution" =>
+                {
+                    Some(payload.clone())
+                }
+                _ => None,
+            })
+            .expect("`executeBash` records the run itself — the caller must not append its own");
+        assert_eq!(payload["truncated"], true);
+        let path = payload["fullOutputPath"].as_str().expect("the spool path persisted");
+        assert!(path.contains("cyrup-bash-"));
+        let _ = std::fs::remove_file(path);
     }
 }

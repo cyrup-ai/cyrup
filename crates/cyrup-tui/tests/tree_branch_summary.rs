@@ -130,7 +130,7 @@ fn branch_summaries(app: &App<TestBackend>) -> Vec<String> {
         .pending()
         .iter()
         .filter_map(|e| match e {
-            Entry::BranchSummary(s) => Some(s.clone()),
+            Entry::BranchSummary { summary, .. } => Some(summary.clone()),
             _ => None,
         })
         .collect()

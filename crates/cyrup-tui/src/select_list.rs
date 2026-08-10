@@ -5,8 +5,15 @@
 //! autocomplete popup it is appended directly below the editor's bottom rule, and it is the shared
 //! engine behind every selector. Selection is internal state mutated by [`SelectList::select_up`] /
 //! [`SelectList::select_down`] (both **wrap**, `select-list.ts:115-123`) and read at render
-//! (pure `state -> lines`). Width math is char-based here (CJK/emoji visible-width via `unicode-width`
-//! is tracked as a residual — gaps 41/42).
+//! (pure `state -> lines`).
+//!
+//! **Width math is visible-width, never char counts.** Upstream measures with `visibleWidth`
+//! (`select-list.ts:147`, `:153`, `:181` → `tui/src/utils.ts:240-295`, which segments into grapheme
+//! clusters and sums `graphemeWidth`) and cuts with `truncateToWidth` (`:159`, `:209`, `:211` →
+//! `utils.ts:1053`, which walks grapheme clusters and never splits one). cyrup used
+//! `chars().count()` and `chars().take(n)` for both — the char-vs-grapheme defect this crate has
+//! now carried in eight separate measurements. A CJK label measured half its true column count and
+//! a ZWJ family emoji or a combining mark could be cut in half, corrupting the row.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -14,6 +21,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::component::Component;
+use crate::settings_selector::{str_width, truncate_to_width};
 use crate::theme::UiTheme;
 
 /// Default max visible rows (`editor.ts:333-334`), clamped to `[3, 20]`.
@@ -254,11 +262,14 @@ impl SelectList {
     ///
     /// The bounds mirror `getPrimaryColumnBounds` (`:187-197`): ordered and floored at 1, so the
     /// `clamp` below can never be handed an inverted range.
+    ///
+    /// 3. The measurement is `visibleWidth` (`:181`), not a char count: a two-column CJK label
+    ///    measured one column per char, so the description column landed *inside* the label.
     fn primary_column_width(&self) -> usize {
         let widest = self
             .items
             .iter()
-            .map(|i| i.label.chars().count().saturating_add(PRIMARY_COLUMN_GAP))
+            .map(|i| str_width(&i.label).saturating_add(PRIMARY_COLUMN_GAP))
             .max()
             .unwrap_or(0);
         let lo = self.layout.primary_min.min(self.layout.primary_max).max(1);
@@ -304,7 +315,7 @@ impl SelectList {
             let effective = primary_w.min(width.saturating_sub(prefix_w).saturating_sub(4)).max(1);
             let max_primary = effective.saturating_sub(PRIMARY_COLUMN_GAP).max(1);
             let label = truncate(&item.label, max_primary);
-            let label_w = label.chars().count();
+            let label_w = str_width(&label);
             // `spacing = " ".repeat(max(1, effectivePrimaryColumnWidth - truncatedValueWidth))`.
             let spacing = effective.saturating_sub(label_w).max(1);
             let desc_start = prefix_w.saturating_add(label_w).saturating_add(spacing);
@@ -339,14 +350,16 @@ impl SelectList {
     }
 }
 
-/// Hard-cut a string to `max` chars, no ellipsis (`truncateToWidth(text, max, "")`,
-/// `select-list.ts:159`). Char-based; CJK/emoji visible-width is a tracked residual.
+/// Hard-cut a string to `max` **visible columns**, no ellipsis — `truncateToWidth(text, max, "")`
+/// (`select-list.ts:159`, `:209`, `:211`; `tui/src/utils.ts:1053-1092`).
+///
+/// S27: this delegates to the crate's one grapheme-atomic truncator rather than slicing `chars()`.
+/// Upstream's non-ASCII branch iterates `graphemeSegmenter.segment(text)` and only keeps a cluster
+/// whole (`utils.ts:1100-1110`), so `👨‍👩‍👧` is either present or absent, never reduced to its
+/// leading `👨`, and `e` + U+0301 never loses its accent. A char cut did both, and additionally
+/// over-filled the column for any wide character.
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
+    truncate_to_width(s, max, "")
 }
 
 impl Component for SelectList {

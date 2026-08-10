@@ -37,7 +37,10 @@ mod subscriber;
 mod tools;
 
 pub use attribution::merge_provider_attribution_headers;
-pub use bash::{BashOptions, BashResult};
+// `BashChunkSink` is exported alongside them because it is the `on_chunk` parameter type of the
+// public `execute_bash`/`execute_bash_with_user_event`: a front-end that streams a `!`/`!!` run's
+// output (the interactive TUI does) has to name it to build the sink.
+pub use bash::{BashChunkSink, BashOptions, BashResult};
 pub use builder::{
     extension_discovery_roots, ExtensionFlagValue, NoTools, SessionBuilder, SessionConfig,
     SessionTarget,

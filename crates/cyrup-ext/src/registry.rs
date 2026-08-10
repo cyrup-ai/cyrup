@@ -178,6 +178,18 @@ struct RegistryInner {
     /// Populated by [`ExtensionRegistry::register_message_renderer`]; read by
     /// [`crate::ExtensionHost::render_message_call`]/[`crate::ExtensionHost::render_message_result`].
     message_renderer_owner: HashMap<String, ExtensionId>,
+    /// Which extension owns the custom-ENTRY renderer for a custom type (Pi
+    /// `registerEntryRenderer(customType, renderer)`, extensions/types.ts:1295, implemented at
+    /// `loader.ts:314-318`, resolved by `extensions/runner.ts:593-600 getEntryRenderer` — FIRST
+    /// extension in load order wins, exactly like `getMessageRenderer`).
+    ///
+    /// A SEPARATE table from [`Self::message_renderer_owner`] because upstream keeps two disjoint
+    /// maps (`extension.messageRenderers` vs `extension.entryRenderers`, types.ts:1703-1704) and
+    /// their consumers render DIFFERENT things: a custom MESSAGE draws `CustomMessageComponent`
+    /// (which swallows a renderer throw, `custom-message.ts:82-84`), a custom ENTRY draws
+    /// `CustomEntryComponent` (which draws a failure box on a throw, `custom-entry.ts:47-52`). Same
+    /// custom type may legitimately be claimed by different extensions on the two surfaces.
+    entry_renderer_owner: HashMap<String, ExtensionId>,
 }
 
 impl ExtensionRegistry {
@@ -333,6 +345,24 @@ impl ExtensionRegistry {
     /// The extension that renders custom messages of `custom_type` (first-wins), if any.
     pub fn message_renderer_owner(&self, custom_type: &str) -> Result<Option<ExtensionId>, ExtError> {
         Ok(self.lock_read()?.message_renderer_owner.get(custom_type).cloned())
+    }
+
+    /// Record a custom-ENTRY renderer registration (Pi `registerEntryRenderer(customType, …)`,
+    /// types.ts:1295 / loader.ts:314-318). FIRST registration wins, matching Pi's load-order
+    /// `getEntryRenderer` loop (runner.ts:593-600).
+    pub fn register_entry_renderer(
+        &self,
+        owner: ExtensionId,
+        custom_type: impl Into<String>,
+    ) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        g.entry_renderer_owner.entry(custom_type.into()).or_insert(owner);
+        Ok(())
+    }
+
+    /// The extension that renders custom ENTRIES of `custom_type` (first-wins), if any.
+    pub fn entry_renderer_owner(&self, custom_type: &str) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.entry_renderer_owner.get(custom_type).cloned())
     }
 
     /// All registered tool names with Pi's **first-registration-wins** ordering (`getAllRegisteredTools`,

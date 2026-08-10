@@ -242,23 +242,40 @@ fn assembled_completion_popup_open_dismisses_on_esc_not_abort() {
     assert!(!app.editor_mut().autocomplete_open(), "Esc did not close the completion popup");
 }
 
+/// S36 — assembled: `/hotkeys` lands in scrollback with the [`Entry::Block`] envelope pi builds
+/// (interactive-mode.ts:6197-6203). The `─` rules run edge to edge while the title and the markdown
+/// body are inset by ONE column (`Text(…, 1, 0)` / `Markdown(…, 1, 1)`), and the body carries a blank
+/// row on each side of it (`paddingY = 1`, `markdown.ts:352-361`).
 #[test]
-fn assembled_hotkeys_overlay_opens_and_dismisses_on_esc() {
+fn assembled_hotkeys_block_lands_in_scrollback_with_pi_envelope() {
     let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
     app.editor_mut().set_text("/hotkeys");
     app.handle_input(&key(KeyCode::Enter));
-    assert!(app.overlay_open(), "hotkeys overlay did not open");
-    // (#1) The viewport expands to full height so the modal can float over the live region.
+    assert!(!app.overlay_open(), "/hotkeys must not open an overlay");
     app.draw().unwrap();
-    assert_eq!(app.viewport_height(), 30, "overlay should expand the viewport to full height");
-    let screen = buf_text(&app);
-    assert!(screen.contains("Keyboard Shortcuts"), "overlay title missing:\n{screen}");
-    assert!(screen.contains("Send message"), "overlay shortcut list missing:\n{screen}");
-
-    // (#4) Esc dismisses the overlay (Redraw), never leaks to the editor / aborts.
-    let action = app.handle_input(&key(KeyCode::Esc));
-    assert_eq!(action, AppAction::Redraw, "Esc should close the overlay");
-    assert!(!app.overlay_open(), "Esc did not close the overlay");
+    let text = app.scrollback_text();
+    let rows: Vec<&str> = text.lines().collect();
+    let rule = "─".repeat(100);
+    let top = rows
+        .iter()
+        .position(|r| r.trim_end() == rule)
+        .expect("opening DynamicBorder rule");
+    // Spacer(1) above the opening rule.
+    assert!(top >= 1 && rows[top - 1].trim().is_empty(), "Spacer(1) precedes the rule:\n{text}");
+    // Text(bold accent title, paddingX 1) — inset one column, NOT flush left.
+    assert_eq!(rows[top + 1], " Keyboard Shortcuts", "title row:\n{text}");
+    // Spacer(1), then Markdown's own paddingY blank, then the body.
+    assert!(rows[top + 2].trim().is_empty(), "Spacer(1) after the title:\n{text}");
+    assert!(rows[top + 3].trim().is_empty(), "Markdown paddingY blank:\n{text}");
+    assert!(rows[top + 4].starts_with(' '), "body inset by paddingX 1:\n{text}");
+    // The closing rule is preceded by the trailing paddingY blank.
+    let bottom = rows
+        .iter()
+        .rposition(|r| r.trim_end() == rule)
+        .expect("closing DynamicBorder rule");
+    assert!(bottom > top, "two distinct rules:\n{text}");
+    assert!(rows[bottom - 1].trim().is_empty(), "trailing paddingY blank:\n{text}");
+    assert!(text.contains("Send message"), "shortcut list missing:\n{text}");
 }
 
 // -------------------------------------- state 4: long single-paragraph PROSE-WRAP (no void) ----

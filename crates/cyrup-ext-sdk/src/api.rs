@@ -297,6 +297,10 @@ pub struct ExtensionApi {
     /// half of `registerProvider` (sdk gap #1). Invoked across the `provider-*` exports.
     pub(crate) provider_handlers: HashMap<String, ProviderHandlers>,
     pub(crate) renderers: Vec<RegisteredRenderer>,
+    /// Custom-ENTRY renderers (Pi `registerEntryRenderer`, types.ts:1295). A SEPARATE list from
+    /// [`Self::renderers`], mirroring upstream's disjoint `messageRenderers`/`entryRenderers` maps
+    /// (types.ts:1703-1704); on the wire an entry still travels over `render-call`.
+    pub(crate) entry_renderers: Vec<RegisteredRenderer>,
     pub(crate) autocomplete: Vec<String>,
     /// Stacked global autocomplete providers (Pi `addAutocompleteProvider`, sdk gap #2). Folded in
     /// registration order over the host's built-in suggestions by [`Self::autocomplete_suggest`].
@@ -466,6 +470,26 @@ impl ExtensionApi {
         renderer: impl MessageRenderer,
     ) {
         self.renderers.push(RegisteredRenderer {
+            custom_type: custom_type.into(),
+            renderer: Box::new(renderer),
+        });
+    }
+
+    /// Register a custom ENTRY renderer (Pi `pi.registerEntryRenderer(customType, renderer)`,
+    /// types.ts:1295) — the TUI-only surface for entries appended with `append_entry`, which do NOT
+    /// participate in LLM context.
+    ///
+    /// The renderer is invoked through [`MessageRenderer::render_call`], since an entry crosses the
+    /// boundary on the world's `render-call` export (there is no `render-entry`; see the world's
+    /// `register-entry-renderer` comment). A renderer that PANICS here draws upstream's
+    /// `[type] renderer failed: …` box (`custom-entry.ts:47-52`) rather than being silently
+    /// dropped — the one surface where a renderer fault is user-visible.
+    pub fn register_entry_renderer(
+        &mut self,
+        custom_type: impl Into<String>,
+        renderer: impl MessageRenderer,
+    ) {
+        self.entry_renderers.push(RegisteredRenderer {
             custom_type: custom_type.into(),
             renderer: Box::new(renderer),
         });
@@ -732,9 +756,13 @@ impl ExtensionApi {
 
     /// Render a tool call via a registered renderer for `custom_type` (Pi `renderCall`). Returns the
     /// serialized widget tree (`None` = default renderer).
+    /// A custom-ENTRY renderer is searched too, and LAST: the message table is the one the host
+    /// routes tool rows and custom messages through, and it must keep winning a key it already
+    /// claims. An entry-only type falls through to the entry table.
     pub fn render_call(&self, custom_type: &str, call: &Value) -> Option<Value> {
         self.renderers
             .iter()
+            .chain(self.entry_renderers.iter())
             .find(|r| r.custom_type == custom_type)
             .and_then(|r| r.renderer.render_call(call, &Ctx::new()))
     }

@@ -1370,3 +1370,387 @@ fn the_top_level_rewrap_bounds_every_row_when_the_prefix_eats_the_pane() {
     let grid = rows(&render_markdown("| a | b |\n|---|---|\n| 1 | 2 |", 40, &theme));
     assert_eq!(grid[0], "┌───┬───┐", "{grid:?}");
 }
+
+// ── batch 10: markdown internals — M15 (table minimum column width), M7 (inline formatting in
+// table cells) ─────────────────────────────────────────────────────────────────────────────────
+
+/// **M15 — a column is floored at its longest unbroken word, capped at 30.**
+///
+/// `const maxUnbrokenWordWidth = 30` (`markdown.ts:863`) feeds `minWordWidths[i] = Math.max(1,
+/// this.getLongestWordWidth(headerText, maxUnbrokenWordWidth))` (`:871`) and the row pass at
+/// `:877-880`. Those per-column minima ARE `minColumnWidths` (`:884`); the all-1s collapse at `:888`
+/// is the exception, taken only when their sum exceeds `availableForCells` (`:887`). cyrup shrank
+/// straight to a floor of 1 in every over-wide case, so a table one cell too wide shredded a word
+/// that upstream keeps whole.
+///
+/// A user sees this in any assistant message with a table narrower than its natural width — the
+/// `/hotkeys` block below is the same path through a real command.
+#[test]
+fn m15_a_table_column_is_floored_at_its_longest_word_capped_at_thirty() {
+    let theme = UiTheme::dark();
+    // Two columns, border overhead 3*2+1 = 7, so a pane of 37 leaves availableForCells = 30.
+    //
+    // Hand-traced: naturalWidths = [20, 39]; minWordWidths = [20, 1] (`:871`, `:877-880`), whose sum
+    // 21 <= 30, so NO collapse (`:887`). totalNatural 59 + 7 > 37 → the shrink arm (`:920-934`):
+    // totalGrowPotential = (20-20) + (39-1) = 38, extraWidth = 30 - 21 = 9, so column A grows by
+    // floor(0/38 * 9) = 0 and stays at its 20-cell floor while B takes all 9 → [20, 10].
+    let word = "supercalifragilistic"; // exactly 20 cells
+    assert_eq!(word.chars().count(), 20);
+    let filler = "a a a a a a a a a a a a a a a a a a a a"; // 20 tokens, 39 cells
+    let md = format!("| A | B |\n|---|---|\n| {word} | {filler} |");
+    let r = rows(&render_markdown(&md, 37, &theme));
+
+    // The word survives on ONE row. Under the old floor-at-1 arithmetic the columns came out
+    // [11, 19] and it was hard-broken into `supercalifr` / `agilistic`.
+    assert!(
+        r.iter().any(|l| l.contains(word)),
+        "the 20-cell word was broken instead of being floored at its own width:\n{r:?}"
+    );
+    assert_eq!(
+        r.iter().filter(|l| l.contains(word)).count(),
+        1,
+        "the word must occupy exactly one row:\n{r:?}"
+    );
+    // The columns themselves, read off the frame: `┌─` + 20 + `─┬─` + 10 + `─┐` (`:956`).
+    assert_eq!(
+        r.first().map(String::as_str),
+        Some(&*format!("┌{}┬{}┐", "─".repeat(22), "─".repeat(12))),
+        "column widths are not [20, 10]:\n{r:?}"
+    );
+    assert_all_rows_fit(&render_markdown(&md, 37, &theme), 37, "m15 floored table");
+
+    // MIRROR — the floor is CAPPED at 30 (`:863`), and when the capped minima no longer fit,
+    // `:888-908` collapses to all-1s and hands the slack back by weight. A 40-cell word therefore
+    // still breaks: minWordWidths = [30, 1] sums to 31 > 30, so minColumnWidths becomes [1, 1] and
+    // the 28 spare cells go to column A by weight → [29, 1].
+    let long = "abcdefghijklmnopqrstuvwxyzabcdefghijklmn"; // 40 cells
+    assert_eq!(long.chars().count(), 40);
+    let md2 = format!("| A | B |\n|---|---|\n| {long} | {filler} |");
+    let r2 = rows(&render_markdown(&md2, 37, &theme));
+    assert!(
+        !r2.iter().any(|l| l.contains(long)),
+        "a word wider than maxUnbrokenWordWidth must still break:\n{r2:?}"
+    );
+    assert_eq!(
+        r2.first().map(String::as_str),
+        Some(&*format!("┌{}┬{}┐", "─".repeat(31), "─".repeat(3))),
+        "the capped-then-collapsed widths are not [29, 1]:\n{r2:?}"
+    );
+    assert_all_rows_fit(&render_markdown(&md2, 37, &theme), 37, "m15 capped table");
+}
+
+/// **M7 — a table cell is rendered by `renderInlineTokens`, not printed as plain text.**
+///
+/// `markdown.ts:960` and `:983` both call `this.renderInlineTokens(cell.tokens || [], styleContext)`
+/// — the identical call a paragraph makes at `:492` — so `**bold**`, `` `code` ``, `[a](b)` and
+/// `~~del~~` keep their styling inside the grid, and the widths at `:870`/`:876` are
+/// `visibleWidth()` of that styled string.
+///
+/// cyrup pushed the cell's raw text into a `String`, so every inline style was dropped; worse, the
+/// link arm's ` (url)` suffix went through `push_text` into the ROW buffer instead of the cell and
+/// surfaced glued to the table's top border.
+#[test]
+fn m7_inline_formatting_survives_inside_a_table_cell() {
+    let theme = UiTheme::dark();
+    let md = "| Name | Note |\n|------|------|\n| **Ada** | `fn` |";
+    let lines = render_markdown(md, 40, &theme);
+
+    // `theme.bold` — SGR-1 over the cell's own run, adding no foreground (`:673-676`).
+    let bold = find_row(&lines, "Ada")
+        .spans
+        .iter()
+        .find(|s| s.content.contains("Ada"))
+        .expect("the `Ada` cell span");
+    assert!(
+        bold.style.add_modifier.contains(Modifier::BOLD),
+        "`**Ada**` lost its bold inside the cell: {:?}",
+        bold.style
+    );
+
+    // `case "codespan": result += this.theme.code(token.text)` (`:685-687`).
+    let code = find_row(&lines, "fn")
+        .spans
+        .iter()
+        .find(|s| s.content.contains("fn"))
+        .expect("the `fn` cell span");
+    assert_eq!(
+        code.style.fg,
+        theme.md_code_style().fg,
+        "`` `fn` `` lost mdCode inside the cell: {:?}",
+        code.style
+    );
+
+    // …and the body cell around them is NOT bold, so the header/body difference still reads.
+    let plain_header = find_row(&lines, "Name")
+        .spans
+        .iter()
+        .find(|s| s.content.contains("Name"))
+        .expect("header cell");
+    assert!(plain_header.style.add_modifier.contains(Modifier::BOLD), "header band lost bold");
+
+    // MIRROR — the link arm. `token.text !== token.href`, so the incapable-terminal fallback prints
+    // `styledLink + this.theme.linkUrl(" (href)")` (`:697-706`), and BOTH halves belong to the
+    // CELL. Before this batch the suffix was pushed onto the row buffer and came out fused to the
+    // grid's top border.
+    let linked = "| Ref |\n|-----|\n| [doc](https://ex.com) |";
+    let lr = rows(&render_markdown(linked, 40, &theme));
+    assert!(
+        lr.iter().any(|l| l.starts_with('┌')),
+        "the top border was polluted by the link suffix:\n{lr:?}"
+    );
+    assert!(
+        lr.iter().any(|l| l.contains("doc (https://ex.com)")),
+        "the link text and its url suffix must both be inside the cell:\n{lr:?}"
+    );
+    let link_span = find_row(&render_markdown(linked, 40, &theme), "doc")
+        .spans
+        .iter()
+        .find(|s| s.content.contains("doc"))
+        .map(|s| s.style)
+        .expect("link cell span");
+    assert_eq!(link_span.fg, theme.md_link_style().fg, "link text lost mdLink inside the cell");
+}
+
+/// M7 through a real command: `/hotkeys` writes `| \`Ctrl+A\` | Start of line |` rows
+/// (`app.rs:1847` `hotkeys_markdown`, Pi `handleHotkeysCommand`, interactive-mode.ts:6090-6205), so
+/// every key cell is a codespan and upstream renders it through `theme.code`. With cells captured as
+/// plain text the whole `/hotkeys` table came out in body colour.
+#[test]
+fn m7_hotkeys_key_cells_render_as_code_spans() {
+    let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+    app.editor_mut().set_text("/hotkeys");
+    app.handle_input(&cyrup_tui::InputEvent::Key(
+        cyrup_tui::crossterm::event::KeyEvent::new(
+            cyrup_tui::crossterm::event::KeyCode::Enter,
+            cyrup_tui::crossterm::event::KeyModifiers::NONE,
+        ),
+    ));
+    app.draw().unwrap();
+    let theme = UiTheme::dark();
+    let code_fg = theme.md_code_style().fg.expect("mdCode has a foreground");
+    let buf = app.terminal().backend().buffer();
+    let mut code_cells = 0usize;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            if let Some(c) = buf.cell((x, y))
+                && c.fg == code_fg
+                && c.symbol().trim() != ""
+            {
+                code_cells += 1;
+            }
+        }
+    }
+    assert!(
+        code_cells > 0,
+        "no `/hotkeys` key cell rendered in mdCode — table cells are still plain text:\n{}",
+        app.scrollback_text()
+    );
+}
+
+/// **M12 — inline LaTeX is tokenized and typeset, and falls back to its RAW source.**
+///
+/// `markdown.ts:123-144` registers the `latex` inline tokenizer; `:645-652` renders it as
+/// `renderLatex(latexToken.text) ?? latexToken.raw`. Two things were broken before this batch:
+/// nothing typeset math at all, and `\[` / `\]` were eaten by CommonMark's backslash escapes, so
+/// `\[x\]` printed as `[x]` — the delimiters vanished and the reader could not even tell it had
+/// been math.
+#[test]
+fn m12_inline_math_is_typeset_and_falls_back_to_its_raw_source() {
+    let theme = UiTheme::dark();
+
+    let r = rows(&render_markdown("Euler: $e^{i\\pi}+1=0$ indeed.\n", 60, &theme));
+    assert_eq!(
+        r,
+        vec!["Euler: e^(iπ)+1 = 0 indeed.".to_string()],
+        "inline `$…$` was not typeset:\n{r:?}"
+    );
+
+    // `\(…\)` and `\[…\]` are the other two inline openers (`markdown.ts:97-103`).
+    let paren = rows(&render_markdown("a \\(\\alpha\\) b\n", 60, &theme));
+    assert_eq!(paren, vec!["a α b".to_string()], "`\\(…\\)` not tokenized:\n{paren:?}");
+    let bracket = rows(&render_markdown("a \\[\\alpha\\] b\n", 60, &theme));
+    assert_eq!(
+        bracket,
+        vec!["a α b".to_string()],
+        "`\\[…\\]` was consumed as two CommonMark escapes:\n{bracket:?}"
+    );
+
+    // MIRROR — `renderLatex` declines, so the RAW source prints, delimiters and all (`:650`).
+    let raw = rows(&render_markdown("unsupported $x + \\unknown{y}$ here\n", 60, &theme));
+    assert_eq!(
+        raw,
+        vec!["unsupported $x + \\unknown{y}$ here".to_string()],
+        "an unsupported expression must print verbatim, never half-rendered:\n{raw:?}"
+    );
+}
+
+/// **M12 — a block token renders with `{ display: true }`, i.e. stacked.**
+///
+/// `renderLatex(latexToken.text, { display: true }) ?? latexToken.raw.trim()` (`markdown.ts:505-512`),
+/// then `for (const line of rendered.split("\n")) lines.push(...)` (`:511-513`) — one output row per
+/// rendered row, which is what makes a stacked fraction legible.
+#[test]
+fn m12_block_math_stacks_in_display_mode() {
+    let theme = UiTheme::dark();
+    let r = rows(&render_markdown("\\[\n\\frac{x^2+1}{x-1}\n\\]\n", 60, &theme));
+    assert_eq!(
+        r,
+        vec!["x²+1".to_string(), "────".to_string(), "x-1".to_string()],
+        "block math did not stack:\n{r:?}"
+    );
+
+    // `$$…$$` is the other block opener, and a limit operator stacks the same way.
+    let sum = rows(&render_markdown("$$\\sum_{i=0}^n x_i$$\n", 60, &theme));
+    assert_eq!(
+        sum,
+        vec![" n".to_string(), " ∑  xᵢ".to_string(), "i=0".to_string()],
+        "`$$…$$` did not stack its limits:\n{sum:?}"
+    );
+
+    // MIRROR — the SAME expression inline is one row, unstacked (`{ display: false }`).
+    let inline = rows(&render_markdown("x $\\sum_{i=0}^n x_i$ y\n", 60, &theme));
+    assert_eq!(
+        inline,
+        vec!["x ∑ᵢ₌₀ⁿ xᵢ y".to_string()],
+        "inline math must not stack:\n{inline:?}"
+    );
+
+    // A block token nested in a list item keeps the item's indent; the `{0,3}` leading spaces the
+    // tokenizer swallows have to come back or the rows fall out of the item.
+    let in_list = rows(&render_markdown("- item\n\n  $$\\frac{1}{2}$$\n\n- next\n", 60, &theme));
+    assert!(
+        in_list.iter().any(|l| l == "  ─"),
+        "block math lost its list-item indent:\n{in_list:?}"
+    );
+    assert!(in_list.iter().any(|l| l == "- next"), "the next item was swallowed:\n{in_list:?}");
+}
+
+/// **M12 — the tokenizer must not fire inside code, and must not eat currency.**
+///
+/// marked never re-lexes a fenced block's body, and its inline extensions are offered the text at
+/// the backtick (where `tokenizeInlineLatex` declines) before `codespan` swallows the span. The
+/// `$`-specific guards at `markdown.ts:110-118` are what keep `$5` and `` $`x`$ `` out of math.
+#[test]
+fn m12_math_is_not_tokenized_inside_code_or_in_prices() {
+    let theme = UiTheme::dark();
+
+    let fenced = rows(&render_markdown("```\n$\\alpha$\n```\n", 60, &theme));
+    assert!(
+        fenced.iter().any(|l| l.contains("$\\alpha$")),
+        "a fenced block's body was tokenized as math:\n{fenced:?}"
+    );
+    assert!(!fenced.iter().any(|l| l.contains('α')), "math leaked into a code fence:\n{fenced:?}");
+
+    let span = rows(&render_markdown("code `$\\alpha$` span\n", 60, &theme));
+    assert!(
+        span.iter().any(|l| l.contains("$\\alpha$")),
+        "an inline code span was tokenized as math:\n{span:?}"
+    );
+
+    // `/^\d/.test(after)` (`markdown.ts:112`) — `$5 and $10` is a price, not a math span.
+    let price = rows(&render_markdown("It costs $5 and $10 today.\n", 60, &theme));
+    assert_eq!(
+        price,
+        vec!["It costs $5 and $10 today.".to_string()],
+        "a price was eaten as math:\n{price:?}"
+    );
+
+    // `/\s$/.test(inner)` (`markdown.ts:111`) — a trailing space inside the delimiters disqualifies.
+    let spaced = rows(&render_markdown("a $x $ b\n", 60, &theme));
+    assert_eq!(spaced, vec!["a $x $ b".to_string()], "trailing-space guard lost:\n{spaced:?}");
+}
+
+/// M12 through the user action that reaches it: an assistant message containing math, committed to
+/// the transcript, lands typeset in scrollback.
+#[test]
+fn m12_assistant_math_reaches_scrollback_typeset() {
+    let mut app = App::new(TestBackend::new(60, 16), UiTheme::dark()).unwrap();
+    app.transcript_mut()
+        .commit_assistant(Some("The identity $e^{i\\pi}+1=0$ closes it.".to_string()));
+    app.draw().unwrap();
+    let sb = app.scrollback_text();
+    assert!(sb.contains("e^(iπ)+1 = 0"), "assistant math was not typeset:\n{sb}");
+    assert!(!sb.contains("$e^"), "the raw delimiters survived:\n{sb}");
+}
+
+/// **M7 — a STYLED cell that WRAPS keeps its style on every row it wraps onto.**
+///
+/// This is the claim the batch that moved table cells from `String` to `Vec<Span>` actually made —
+/// "so styles survive the break" — and the one thing none of its tests exercised: every M7 case
+/// used a cell short enough that `wrap_cell`'s `visibleLength <= width` early return
+/// (`utils.ts:862-865`) handed the cell back untouched, so the break path never ran.
+///
+/// Upstream a cell is `renderInlineTokens(cell.tokens, styleContext)` (`markdown.ts:960`, `:983`)
+/// fed to `wrapCellText` = `wrapTextWithAnsi` (`:829-831`), whose `breakLongWord`/`AnsiCodeTracker`
+/// machinery exists for exactly this: `tracker.getActiveCodes()` is re-emitted at the head of each
+/// continuation row (`utils.ts:845`, `:1007`) so a bold cell stays bold past the fold.
+#[test]
+fn m7_a_styled_cell_keeps_its_style_across_a_wrap() {
+    let theme = UiTheme::dark();
+    // The Action column cannot hold `alpha beta gamma delta` at width 30, so the cell wraps.
+    let src = "| Key | Action |\n|-----|--------|\n| `x` | **alpha beta gamma delta** |\n";
+    let out = render_markdown(src, 30, &theme);
+    let r = rows(&out);
+    let first = find_row(&out, "alpha");
+    let later = find_row(&out, "delta");
+    assert!(
+        !std::ptr::eq(first, later),
+        "the cell did not wrap — this test proves nothing unless it does:\n{r:?}"
+    );
+    for (label, row) in [("first", first), ("continuation", later)] {
+        let word = if label == "first" { "alpha" } else { "delta" };
+        let span = row
+            .spans
+            .iter()
+            .find(|s| s.content.contains(word))
+            .unwrap_or_else(|| panic!("no span carrying {word:?} on the {label} row: {row:?}"));
+        assert!(
+            span.style.add_modifier.contains(Modifier::BOLD),
+            "the {label} row lost `**…**` across the break — \
+             a plain-`str` cell wrapper cannot carry a style over a fold: {row:?}"
+        );
+    }
+}
+
+/// **M7 (separator styling) — the space between two differently-styled words is NOT the preceding
+/// word's style.**
+///
+/// `wrapSingleLine` never *creates* a separator: `splitIntoTokensWithAnsi` (`utils.ts:775-798`)
+/// emits the whitespace run as its own token and `currentLine += token` (`:923`) appends it
+/// verbatim, with whatever ANSI state the source put around it. `renderInlineTokens` puts the space
+/// after `**alpha**` OUTSIDE the SGR-1/22 pair, so it is ambient. Splitting the cell on `/\s+/` and
+/// re-inserting `" "` with `line.last()`'s style bolded that gap (and collapsed `a  b` to `a b`).
+#[test]
+fn m7_the_gap_between_a_bold_word_and_a_plain_one_is_not_bold() {
+    let theme = UiTheme::dark();
+    // Wide enough that `alpha beta` share a row, narrow enough that the cell still wraps.
+    let src = "| Key | Action |\n|-----|--------|\n| `x` | **alpha** beta gamma delta |\n";
+    let out = render_markdown(src, 30, &theme);
+    let r = rows(&out);
+    let row = find_row(&out, "alpha");
+    assert!(line_text(row).contains("alpha beta"), "need both words on one row:\n{r:?}");
+    let bold: Vec<&str> = row
+        .spans
+        .iter()
+        .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(bold, vec!["alpha"], "the separator was swept into the bold run: {row:?}");
+}
+
+/// **M7 (separator preservation) — a run of whitespace inside a wrapping cell is kept, not
+/// collapsed.** `splitIntoTokensWithAnsi` keeps `"  "` as ONE token and `wrapSingleLine` appends it
+/// unchanged (`utils.ts:923`); only a fold consumes it (`:911-913` "Don't start new line with
+/// whitespace") and only a line end trims it (`:935`).
+#[test]
+fn m7_interior_whitespace_runs_survive_a_wrapping_cell() {
+    let theme = UiTheme::dark();
+    let src = "| Key | Action |\n|-----|--------|\n| `x` | alpha  beta gamma delta |\n";
+    let out = render_markdown(src, 30, &theme);
+    let r = rows(&out);
+    let row = find_row(&out, "alpha");
+    assert!(
+        line_text(row).contains("alpha  beta"),
+        "the double space was re-packed to a single one:\n{r:?}"
+    );
+}

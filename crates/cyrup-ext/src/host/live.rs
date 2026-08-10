@@ -134,6 +134,18 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         guest.add_renderer(custom_type);
     }
 
+    /// X15 — the custom-ENTRY renderer surface (Pi `registerEntryRenderer`, types.ts:1295, stored
+    /// in `extension.entryRenderers` at loader.ts:314-318 and resolved by
+    /// `runner.ts:593-600 getEntryRenderer`). A SEPARATE registry table from the message one above:
+    /// the two draw different things when the renderer throws (`custom-entry.ts:47-52` vs
+    /// `custom-message.ts:82-84`). Rendering itself still travels over the guest's `render-call`
+    /// export — see `ExtensionHost::render_entry` for why the world has no fourth export.
+    async fn register_entry_renderer(&mut self, custom_type: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        let _ = guest.registry.register_entry_renderer(guest.owner.clone(), custom_type.clone());
+        guest.add_renderer(custom_type);
+    }
+
     async fn add_autocomplete(&mut self, command: String) {
         let Ok(guest) = guest_of(self) else { return };
         guest.add_autocomplete(command);

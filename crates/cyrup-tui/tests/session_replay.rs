@@ -254,6 +254,9 @@ fn replay_splits_a_skill_block_submission() {
 #[test]
 fn a_compaction_summary_replays_as_its_own_block_not_a_user_turn() {
     let mut app = app();
+    // X14 — the summary BODY is the expanded form (`interactive-mode.ts:3486`
+    // `setExpanded(this.toolOutputExpanded)`); assert it in the state that produces it.
+    app.transcript_mut().set_tool_expanded(true);
     app.replay_session(&[
         AgentMessage::CompactionSummary(CompactionSummaryMessage {
             summary: "we refactored the parser".to_string(),
@@ -282,6 +285,8 @@ fn a_compaction_summary_replays_as_its_own_block_not_a_user_turn() {
 #[test]
 fn a_branch_summary_replays_as_its_own_block() {
     let mut app = app();
+    // X14 — see the compaction test above (`interactive-mode.ts:3493`).
+    app.transcript_mut().set_tool_expanded(true);
     app.replay_session(&[AgentMessage::BranchSummary(BranchSummaryMessage {
         summary: "tried the async rewrite, abandoned it".to_string(),
         from_id: EntryId::from("entry_1"),
