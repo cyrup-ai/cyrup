@@ -28,8 +28,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use cyrup_config::{AuthStore, ConfigDirs};
-use cyrup_provider::{AuthOverrides, InMemoryCredentialStore, Model};
-use cyrup_sdk::core::ProviderId;
+use cyrup_provider::{
+    AuthOverrides, CredentialStore, CredentialType, InMemoryCredentialStore, Model,
+};
 
 use crate::cli::{Cli, partition_extension_flags};
 use crate::diagnostics::apply_arg_leniency;
@@ -207,21 +208,6 @@ pub fn validate_credential_print_args(cli: &Cli) -> Result<(), CredentialPrintEr
     Ok(())
 }
 
-/// The stored credential kind, the only half of Pi's `CredentialInfo` this path reads
-/// (`{ providerId, type }`, ai/src/auth/types.ts:40-43).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StoredKind {
-    ApiKey,
-    Oauth,
-}
-
-fn stored_kind(cred: &cyrup_config::Credential) -> StoredKind {
-    match cred {
-        cyrup_config::Credential::ApiKey { .. } => StoredKind::ApiKey,
-        cyrup_config::Credential::Oauth { .. } => StoredKind::Oauth,
-    }
-}
-
 /// Lift an `auth.json` credential into the provider-side shape the request path resolves against.
 /// The two types are the same on-disk contract declared in two crates (`cyrup-config` owns the
 /// file, `cyrup-provider` owns the resolution).
@@ -272,23 +258,32 @@ pub async fn resolve_credential_for_print(
     validate_credential_print_args(cli)?;
     let requested_model = cli.model.as_deref().unwrap_or_default();
 
-    // Pi `listCredentials()` — the `{ providerId, type }` view of the stored credential map. The
-    // same read seeds the provider-side store so `get_auth_with` sees what a session would.
+    // Seed the provider-side store from `auth.json` so `get_auth_with` resolves exactly what a
+    // session would. `list_credentials()` is Pi's `listCredentials()` (model-runtime.ts:424 →
+    // runtime-credentials.ts:29): the composed `{ providerId, type }` view, secrets untouched.
     let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));
-    let mut credential_types: BTreeMap<String, StoredKind> = BTreeMap::new();
-    let store = InMemoryCredentialStore::new();
-    for provider_id in auth.list().unwrap_or_default() {
-        let pid = ProviderId::from(provider_id.as_str());
-        if let Ok(Some(cred)) = auth.read(&pid).await {
-            credential_types.insert(provider_id, stored_kind(&cred));
-            store.insert(pid, to_provider_credential(cred));
+    let seed = InMemoryCredentialStore::new();
+    for info in auth.list_credentials().unwrap_or_default() {
+        if let Ok(Some(cred)) = auth.read(&info.provider).await {
+            seed.insert(info.provider.clone(), to_provider_credential(cred));
         }
     }
+    let store = Arc::new(seed) as Arc<dyn CredentialStore>;
+    // `const credentialTypes = new Map((await modelRuntime.listCredentials()).map(...))`
+    // (credential-print.ts:92-94). Read back off the SAME store the request path resolves against,
+    // through `CredentialStore::list()` (ai/src/auth/types.ts:71) — so the kind that decides which
+    // providers this export skips can never disagree with the credential that will be resolved.
+    let credential_types: BTreeMap<String, CredentialType> = store
+        .list()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|info| (info.provider.as_str().to_string(), info.credential_type))
+        .collect();
 
     let (models_json, _load_errors) =
         cyrup_config::load_models_file_reporting(&dirs.agent_dir.join("models.json"));
-    let registry =
-        crate::provider::registry_with_credentials(&models_json, Arc::new(store) as Arc<_>);
+    let registry = crate::provider::registry_with_credentials(&models_json, store);
     let all = registry.get_models(None);
     let has_configured_auth = |m: &Model| {
         cyrup_config::provider_is_configured(&auth, &models_json, &m.provider, None)
@@ -352,10 +347,10 @@ pub async fn resolve_credential_for_print(
         let stored = credential_types.get(model.provider.as_str()).copied();
         // An OAuth-only provider has no API key to print, and an API-key provider has no bearer
         // token — each kind skips the other's providers (:113-114).
-        if kind == CredentialPrintKind::ApiKey && stored == Some(StoredKind::Oauth) {
+        if kind == CredentialPrintKind::ApiKey && stored == Some(CredentialType::Oauth) {
             continue;
         }
-        if kind == CredentialPrintKind::BearerToken && stored != Some(StoredKind::Oauth) {
+        if kind == CredentialPrintKind::BearerToken && stored != Some(CredentialType::Oauth) {
             continue;
         }
         let overrides = AuthOverrides {
@@ -405,12 +400,12 @@ pub async fn resolve_credential_for_print(
             .as_deref()
             .and_then(|p| credential_types.get(p).copied());
         if let Some(provider_id) = provider_id.filter(|_| cli.provider.is_some()) {
-            if kind == CredentialPrintKind::ApiKey && stored == Some(StoredKind::Oauth) {
+            if kind == CredentialPrintKind::ApiKey && stored == Some(CredentialType::Oauth) {
                 return Err(CredentialPrintError::msg(format!(
                     "Provider \"{provider_id}\" is configured with OAuth, not an API key"
                 )));
             }
-            if kind == CredentialPrintKind::BearerToken && stored != Some(StoredKind::Oauth) {
+            if kind == CredentialPrintKind::BearerToken && stored != Some(CredentialType::Oauth) {
                 return Err(CredentialPrintError::msg(format!(
                     "Provider \"{provider_id}\" is not configured with an OAuth bearer token"
                 )));

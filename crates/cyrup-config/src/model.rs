@@ -932,7 +932,7 @@ fn models_are_equal(a: &Model, b: &Model) -> bool {
 }
 
 /// Curated default model id per known provider (Pi `defaultModelPerProvider`,
-/// model-resolver.ts:14-50). Returns `None` for an unknown provider.
+/// model-resolver.ts:14-53 at v0.83.0). Returns `None` for an unknown provider.
 pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
     let id = match provider {
         "amazon-bedrock" => "us.anthropic.claude-opus-4-6-v1",
@@ -966,6 +966,12 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "kimi-coding" => "kimi-for-coding",
         "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.6",
         "cloudflare-ai-gateway" => "workers-ai/@cf/moonshotai/kimi-k2.6",
+        // Alibaba Cloud Model Studio "Token Plan" — two regions, identical catalogs, separate
+        // endpoints and API keys (`ai/scripts/generate-models.ts:1993-2012`). Both name the same
+        // curated default, which is pi's own value at `model-resolver.ts:47-48` and NOT an
+        // extrapolation from the `-cn` sibling: upstream writes `qwen3.7-max` on both keys.
+        "qwen-token-plan" => "qwen3.7-max",
+        "qwen-token-plan-cn" => "qwen3.7-max",
         "xiaomi" => "mimo-v2.5-pro",
         "xiaomi-token-plan-cn" => "mimo-v2.5-pro",
         "xiaomi-token-plan-ams" => "mimo-v2.5-pro",
@@ -1009,6 +1015,12 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "kimi-coding",
     "cloudflare-workers-ai",
     "cloudflare-ai-gateway",
+    // Position is load-bearing: [`first_default_or_first`] returns the FIRST provider in this list
+    // with an available curated-default match, so the order must be pi's `Object.keys` order —
+    // insertion order of `defaultModelPerProvider` (`model-resolver.ts:14-53`), where the two
+    // qwen keys sit between `cloudflare-ai-gateway` and `xiaomi`.
+    "qwen-token-plan",
+    "qwen-token-plan-cn",
     "xiaomi",
     "xiaomi-token-plan-cn",
     "xiaomi-token-plan-ams",
@@ -2285,6 +2297,74 @@ mod tests {
             Some("us.anthropic.claude-opus-4-6-v1")
         );
         assert_eq!(default_model_per_provider("totally-unknown"), None);
+    }
+
+    /// **G16/G42.** The two Qwen Token Plan parents are `KnownProvider`s at v0.83.0
+    /// (`ai/src/types.ts:67-68`) and carry a curated default (`model-resolver.ts:47-48`); cyrup's
+    /// table had neither, so `--provider qwen-token-plan` fell through `default_model_per_provider`
+    /// to `None`.
+    ///
+    /// The user action: a `models.json` that declares a `qwen-token-plan` provider block (R-07-023 —
+    /// the only way to reach these two today, since the built-in registration is still blocked on
+    /// catalog data that has never existed in pi's git history), then
+    /// `cyrup --provider qwen-token-plan --model <an id the block does not list>`. Pi's
+    /// `buildFallbackModel` clones the provider's CURATED default to carry its api/compat/window
+    /// onto the custom id; with no table entry it cloned whichever model happened to be first.
+    #[test]
+    fn qwen_token_plan_custom_id_clones_the_curated_default_not_the_first_model() {
+        // A models.json block listing the plan's models in catalog order — `MiniMax-M2.5` sorts
+        // first and is exactly the wrong base: it is the ONE model of the fifteen that pi's own
+        // `qwen-token-plan-models.test.ts` excludes from the Qwen thinking set.
+        let mut minimax = model("qwen-token-plan", "MiniMax-M2.5", "MiniMax M2.5");
+        minimax.reasoning = false;
+        minimax.context_window = 200_000;
+        let mut curated = model("qwen-token-plan", "qwen3.7-max", "Qwen3.7 Max");
+        curated.context_window = 1_000_000;
+        let available = vec![minimax, curated];
+
+        let built = build_fallback_model("qwen-token-plan", "qwen3.9-max", &available)
+            .expect("a provider with models must yield a fallback");
+        assert_eq!(built.id.as_str(), "qwen3.9-max");
+        assert_eq!(
+            built.context_window, 1_000_000,
+            "the clone base must be the curated qwen3.7-max, not the first-listed MiniMax-M2.5"
+        );
+        assert!(built.reasoning, "…and must therefore inherit the curated model's reasoning flag");
+
+        // Both regions name the SAME default (`model-resolver.ts:47-48`), and both must be known.
+        assert_eq!(default_model_per_provider("qwen-token-plan"), Some("qwen3.7-max"));
+        assert_eq!(default_model_per_provider("qwen-token-plan-cn"), Some("qwen3.7-max"));
+        assert!(
+            KNOWN_PROVIDERS.contains(&"qwen-token-plan")
+                && KNOWN_PROVIDERS.contains(&"qwen-token-plan-cn"),
+            "an entry absent from KNOWN_PROVIDERS is never scanned by first_default_or_first"
+        );
+    }
+
+    /// MIRROR — the scan ORDER. `first_default_or_first` returns the first KNOWN_PROVIDERS entry
+    /// with an available match, so inserting the qwen keys anywhere but pi's `Object.keys` position
+    /// would silently re-rank every other provider's claim on the initial model. Pi places them
+    /// after `cloudflare-ai-gateway` and before `xiaomi` (`model-resolver.ts:45-49`).
+    #[test]
+    fn mirror_qwen_keys_sit_where_pi_puts_them_in_the_scan_order() {
+        let pos = |id: &str| KNOWN_PROVIDERS.iter().position(|p| *p == id);
+        let (gateway, qwen, qwen_cn, xiaomi) = (
+            pos("cloudflare-ai-gateway").unwrap(),
+            pos("qwen-token-plan").unwrap(),
+            pos("qwen-token-plan-cn").unwrap(),
+            pos("xiaomi").unwrap(),
+        );
+        assert_eq!(qwen, gateway + 1);
+        assert_eq!(qwen_cn, qwen + 1);
+        assert_eq!(xiaomi, qwen_cn + 1);
+
+        // And the consequence: with BOTH an xiaomi and a qwen default available, qwen wins.
+        let available = vec![
+            model("xiaomi", "mimo-v2.5-pro", "MiMo"),
+            model("qwen-token-plan", "qwen3.7-max", "Qwen3.7 Max"),
+        ];
+        let chosen = first_default_or_first(&available).unwrap();
+        assert_eq!(chosen.provider.as_str(), "qwen-token-plan");
     }
 
     #[test]

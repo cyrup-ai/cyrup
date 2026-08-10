@@ -47,9 +47,9 @@ pub use api::{
     ApiFactory, ApiImpl, ApiRegistry, EventSink, builtin_registry, channel, register_builtins,
 };
 pub use auth::{
-    ApiKeyAuth, AuthContext, AuthOverrides, AuthResult, Credential, CredentialStore,
-    EnvAuthContext, InMemoryCredentialStore, ModelAuth, ModifyFn, OAuthAuth, ProviderAuth,
-    ProviderEnv, env_key, keyless_local, resolve_provider_auth,
+    ApiKeyAuth, AuthContext, AuthOverrides, AuthResult, Credential, CredentialInfo,
+    CredentialStore, CredentialType, EnvAuthContext, InMemoryCredentialStore, ModelAuth, ModifyFn,
+    OAuthAuth, ProviderAuth, ProviderEnv, env_key, keyless_local, resolve_provider_auth,
 };
 pub use catalog::{builtin_catalog, load_catalog};
 pub use collection::{

@@ -408,6 +408,22 @@ async fn run() -> anyhow::Result<i32> {
         }
     }
 
+    // `--api-key` installs a RUNTIME credential on the same credential store the session's model
+    // runtime reads (Pi `modelRuntime.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey)`,
+    // main.ts:764 → model-runtime.ts:400-418, whose store is `RuntimeCredentials` wrapping
+    // `AuthStorage`). cyrup handed the key only to `select_provider`'s throwaway
+    // `InMemoryCredentialStore`, so the session's `AuthStore` — the one behind `hasConfiguredAuth`,
+    // `getProviderAuthStatus` and `/logout`'s `listCredentials()` — never saw it. Building the store
+    // here (instead of letting `SessionBuilder` default it) is what lets the key be installed on it.
+    //
+    // The default-launch block above cannot have swapped `provider` out from under this: `--api-key`
+    // is rejected earlier unless one of `--model`/`--provider`/`--models` is present, and that block
+    // runs only when all three are absent.
+    let auth_store = Arc::new(AuthStore::at(dirs.agent_dir.join("auth.json")));
+    if let Some(api_key) = cli.api_key.as_deref() {
+        auth_store.set_runtime_api_key(provider.id().clone(), api_key.to_string());
+    }
+
     // Interactive mode drives the **multi-session** `AgentSessionRuntime` (arch-11 §3.4) so the
     // session-swap commands rebuild the active session in place and the TUI re-binds to it. The
     // one-shot/RPC modes keep the single fixed `AgentSession` seam unchanged.
@@ -419,6 +435,7 @@ async fn run() -> anyhow::Result<i32> {
         let session_cwd = config.cwd.clone();
         let mut factory_builder = SessionFactory::new(provider, config)
             .settings_store(settings_store.clone())
+            .auth(auth_store.clone())
             .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
         // SubAgents opt-in gate (default OFF, mirrors the two sibling companions) composed with the T6
         // child-mode gate (Pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`): a plain
@@ -579,6 +596,7 @@ async fn run() -> anyhow::Result<i32> {
             let session_cwd = config.cwd.clone();
             let mut factory_builder = SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
+                .auth(auth_store.clone())
                 .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
             // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/
@@ -670,6 +688,7 @@ async fn run() -> anyhow::Result<i32> {
             let session_cwd = config.cwd.clone();
             let mut factory_builder = SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
+                .auth(auth_store.clone())
                 .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
             // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/

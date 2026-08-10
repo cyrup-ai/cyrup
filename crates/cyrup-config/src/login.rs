@@ -515,22 +515,30 @@ pub fn logout_provider_options(
     options
 }
 
-/// `listCredentials()` → `AuthStorage.list()` (`auth-storage.ts:252-254`): the `(provider, type)`
-/// pairs actually present in `auth.json`, in the store's own order.
+/// `ModelRuntime.listCredentials()` (`model-runtime.ts:424`): the `(provider, type)` pairs the
+/// credential store enumerates, in the store's own order.
+///
+/// Upstream that call is `RuntimeCredentials.list()` (`runtime-credentials.ts:29-36`), i.e.
+/// `AuthStorage.list()` **overlaid with the runtime `--api-key` providers** — so a provider whose
+/// key came from `--api-key` and never touched `auth.json` still appears. cyrup's [`AuthStore`]
+/// fuses both of Pi's layers, and [`AuthStore::list_credentials`] is the composed view; reading
+/// the file tier alone dropped the runtime overlay and hid those providers from `/logout`.
+///
+/// Async only for call-site compatibility — the composed read is synchronous and touches the file
+/// exactly once (it used to be one read to list plus one more per provider).
 pub async fn stored_credentials(store: &AuthStore) -> Result<Vec<(ProviderId, AuthType)>, String> {
-    let ids = store.list().map_err(|e| e.to_string())?;
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        let provider = ProviderId::from(id.as_str());
-        match store.read(&provider).await.map_err(|e| e.to_string())? {
-            Some(Credential::ApiKey { .. }) => out.push((provider, AuthType::ApiKey)),
-            Some(Credential::Oauth { .. }) => out.push((provider, AuthType::Oauth)),
-            // Listed a moment ago and gone now: a concurrent `/logout`. Upstream reads one
-            // in-memory snapshot and cannot observe this; skipping matches the end state.
-            None => {}
-        }
-    }
-    Ok(out)
+    Ok(store
+        .list_credentials()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|info| {
+            let auth_type = match info.credential_type {
+                cyrup_provider::CredentialType::ApiKey => AuthType::ApiKey,
+                cyrup_provider::CredentialType::Oauth => AuthType::Oauth,
+            };
+            (info.provider, auth_type)
+        })
+        .collect())
 }
 
 /// `findLoginProviderOptions` (`interactive-mode.ts:4900-4911`): case-insensitive match of the
@@ -1578,6 +1586,75 @@ mod tests {
         assert_eq!(
             logout_provider_options(&orphan, &providers)[0].name,
             "mystery"
+        );
+    }
+
+    /// `/logout` must list a provider whose key came from `--api-key` and never touched
+    /// `auth.json`. Upstream `getLogoutProviderOptions` reads `listCredentials()`
+    /// (`interactive-mode.ts:4890`) = `RuntimeCredentials.list()`, which overlays the runtime
+    /// api-key providers onto `AuthStorage.list()` (`runtime-credentials.ts:29-36`) — so
+    /// `pi --provider openrouter --model x --api-key sk-runtime` + `/logout` shows OpenRouter.
+    /// cyrup read the FILE tier only, so that row was missing.
+    ///
+    /// User action: `cyrup --provider <p> --model <m> --api-key <k>` (main.rs installs it on the
+    /// session's `AuthStore`, Pi main.ts:764) then the `/logout` slash command / `Logout` selector.
+    #[tokio::test]
+    async fn logout_options_include_a_runtime_api_key_provider() {
+        let (store, _path) = temp_store("logout-runtime");
+        let providers = vec![
+            env_key_provider("openrouter", "OpenRouter"),
+            both_provider("anthropic", "Anthropic", None),
+        ];
+        // Nothing on disk at all — the ONLY credential is the runtime `--api-key`.
+        assert!(stored_credentials(&store).await.unwrap().is_empty());
+
+        store.set_runtime_api_key(ProviderId::from("openrouter"), "sk-runtime".to_string());
+
+        let stored = stored_credentials(&store).await.unwrap();
+        assert_eq!(
+            stored,
+            vec![(ProviderId::from("openrouter"), AuthType::ApiKey)],
+            "the runtime `--api-key` overlay is part of listCredentials() \
+             (runtime-credentials.ts:32-34)"
+        );
+        let rows = logout_provider_options(&stored, &providers);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.name.as_str(), r.auth_type))
+                .collect::<Vec<_>>(),
+            vec![("OpenRouter", AuthType::ApiKey)],
+            "`/logout` must offer the --api-key provider"
+        );
+    }
+
+    /// The overlay REPLACES the stored entry's type, exactly as upstream's `Map.set` does
+    /// (`runtime-credentials.ts:32-34`): a provider holding an OAuth credential on disk that is
+    /// then given `--api-key` enumerates as `api_key`, and is listed exactly once.
+    #[tokio::test]
+    async fn runtime_api_key_overrides_the_stored_credential_type_once() {
+        let (store, _path) = temp_store("logout-runtime-override");
+        let id = ProviderId::from("anthropic");
+        store
+            .modify(&id, |_| async {
+                Ok(Some(Credential::Oauth {
+                    refresh: "r".into(),
+                    access: "a".into(),
+                    expires: 0,
+                    ext: Default::default(),
+                }))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_credentials(&store).await.unwrap(),
+            vec![(id.clone(), AuthType::Oauth)]
+        );
+
+        store.set_runtime_api_key(id.clone(), "sk-runtime".to_string());
+        assert_eq!(
+            stored_credentials(&store).await.unwrap(),
+            vec![(id, AuthType::ApiKey)],
+            "one row, retyped to api_key"
         );
     }
 

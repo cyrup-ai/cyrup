@@ -554,6 +554,50 @@ impl InputEditor {
         }
     }
 
+    /// Move the caret by one **page** of visual lines (`editor.ts:1857` `pageScroll(direction)`;
+    /// `direction` is `-1` for up, `1` for down).
+    ///
+    /// Upstream:
+    ///
+    /// ```text
+    /// const pageSize = Math.max(5, Math.floor(terminalRows * 0.3));
+    /// const target = Math.max(0, Math.min(visualLines.length - 1, current + direction * pageSize));
+    /// this.moveToVisualLine(visualLines, current, target);
+    /// ```
+    ///
+    /// The page size is the SAME `max(5, floor(rows * 0.3))` window the editor renders in
+    /// ([`max_visible_lines`](Self::max_visible_lines)), and the move goes through the shared sticky
+    /// preferred-column machinery, so a page hop keeps the goal column exactly as Up/Down do.
+    ///
+    /// Unlike [`move_up_visual`](Self::move_up_visual) / [`move_down_visual`](Self::move_down_visual)
+    /// there is **no** history recall and no line-start/line-end fall-through at the ends: upstream
+    /// clamps the target index and lets `moveToVisualLine` place the caret (`editor.ts:1863`).
+    pub fn page_scroll(&mut self, direction: i8) {
+        self.last_action = LastAction::None;
+        let page = usize::from(self.max_visible_lines());
+        let map = self.visual_line_map();
+        let cur = self.current_visual_line(&map);
+        let here = map.get(cur).copied().unwrap_or(VisualLine { logical: 0, start: 0, len: 0 });
+        let goal = self.preferred_visual_col.unwrap_or(self.col.saturating_sub(here.start));
+        self.preferred_visual_col = Some(goal);
+        let last = map.len().saturating_sub(1);
+        let target = if direction < 0 { cur.saturating_sub(page) } else { (cur + page).min(last) };
+        if let Some(t) = map.get(target) {
+            self.row = t.logical;
+            self.col = t.start + goal.min(t.len);
+        }
+    }
+
+    /// Whether the buffer occupies more than one **visual** line at the current layout width, i.e.
+    /// whether there is anything inside the editor for a page hop to move through.
+    ///
+    /// The app consults this to decide whether `PageUp`/`PageDown` belongs to the editor (pi's only
+    /// binding for those keys, `keybindings.ts:89-90`) or falls through to cyrup's active-region
+    /// transcript scroll — see [`crate::app::App::handle_input`].
+    pub fn is_multi_visual_line(&self) -> bool {
+        self.visual_line_map().len() > 1
+    }
+
     /// Drop the sticky vertical-motion column (called by every non-vertical motion/edit so the next
     /// Up/Down re-seeds the goal column from the live cursor).
     fn reset_preferred_col(&mut self) {
@@ -1379,7 +1423,9 @@ impl InputEditor {
     fn apply_editor_action(&mut self, action: EditorAction) -> EditorOutcome {
         use EditorAction as E;
         // Any non-vertical action re-seeds the sticky goal column on the next Up/Down (spec/tui/03 §4.2).
-        if !matches!(action, E::CursorUp | E::CursorDown) {
+        // `PageUp`/`PageDown` ARE vertical motion upstream — `pageScroll` shares `moveToVisualLine`
+        // (and therefore `preferredVisualCol`) with `moveCursor` (`editor.ts:1373,1863`).
+        if !matches!(action, E::CursorUp | E::CursorDown | E::PageUp | E::PageDown) {
             self.reset_preferred_col();
         }
         match action {
@@ -1409,6 +1455,17 @@ impl InputEditor {
                 } else {
                     self.move_down_visual();
                 }
+                EditorOutcome::Edited
+            }
+            // `tui.editor.pageUp` / `tui.editor.pageDown` (`editor.ts:855-862`): page the CARET
+            // through the buffer. No history recall on either end (upstream's `pageScroll` never
+            // touches `historyIndex`).
+            E::PageUp => {
+                self.page_scroll(-1);
+                EditorOutcome::Edited
+            }
+            E::PageDown => {
+                self.page_scroll(1);
                 EditorOutcome::Edited
             }
             E::CursorWordLeft => {

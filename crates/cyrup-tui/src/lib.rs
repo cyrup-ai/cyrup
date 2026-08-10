@@ -57,6 +57,7 @@ mod keymap;
 mod login_dialog;
 mod markdown;
 mod model_selector;
+mod native_modifiers;
 mod oauth_selector;
 mod overlay;
 mod panic_hook;
@@ -71,6 +72,7 @@ mod startup_selector;
 mod status;
 mod status_indicator;
 mod stray_reply;
+mod terminal_progress;
 mod terminal_query;
 mod terminal_title;
 mod text_input;
@@ -146,6 +148,12 @@ pub use markdown::{
     render_with_text_color as render_markdown_with_text_color, trim_partial_closing_fence,
 };
 pub use model_selector::{ModelEntry, ModelSelector};
+pub use native_modifiers::{
+    clear_native_modifier_probe, host_platform, is_apple_terminal_session,
+    is_native_modifier_pressed, normalize_native_shift_enter, rescue_native_shift_enter,
+    set_native_modifier_probe, should_detect_native_shift_enter,
+    ModifierKey, ModifierProbe,
+};
 pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE};
 pub use config_selector::{
     ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle, ConfigWriteScope,
@@ -181,6 +189,11 @@ pub use terminal_query::{
     parse_cell_size_report, parse_color_scheme_report, parse_osc11_background_color,
     saw_device_attributes, NoTerminalProbe, StdinTerminalProbe, TerminalProbe, CELL_SIZE_QUERY,
     CELL_SIZE_TIMEOUT, COLOR_SCHEME_QUERY, OSC11_BACKGROUND_QUERY,
+};
+pub use terminal_progress::{
+    progress_is_armed, write_terminal_progress, TerminalProgress,
+    TERMINAL_PROGRESS_ACTIVE_SEQUENCE, TERMINAL_PROGRESS_CLEAR_SEQUENCE,
+    TERMINAL_PROGRESS_KEEPALIVE,
 };
 pub use terminal_title::{session_terminal_title, APP_TITLE};
 pub use theme::{

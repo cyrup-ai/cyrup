@@ -2578,25 +2578,7 @@ impl AgentSession {
                 model.id.as_str()
             )));
         }
-        // Cross-provider select: rebuild + install the owning provider so the agent loop streams
-        // against it (Pi switches model+provider live). A same-provider change is a no-op here.
-        if self.provider.current().id().as_str() != model.provider.as_str() {
-            // A guest-registered provider is already a realized `Provider` in the shared registry
-            // (arch-08 §5.6); install it DIRECTLY so its models stream — the built-in
-            // `ProviderResolver` seam (bin `select_provider`) knows only the Pi registry, not a guest
-            // provider. Falls back to the resolver for a built-in cross-provider swap.
-            if let Some(guest) = self.services.guest_providers.provider(model.provider.as_str()) {
-                self.provider.store(guest);
-            } else {
-                self.provider.resolve_and_store(model.provider.as_str()).map_err(|e| {
-                    SessionServiceError::NoConfiguredAuth(format!(
-                        "{}/{}: {e}",
-                        model.provider.as_str(),
-                        model.id.as_str()
-                    ))
-                })?;
-            }
-        }
+        self.install_owning_provider(&model)?;
         let previous = Self::lock(&self.model).clone();
         self.apply_model_change(&model, &previous, "set", None).await?;
         Ok(ModelRef {
@@ -2604,6 +2586,38 @@ impl AgentSession {
             api: Some(model.api.clone()),
             model: model.id.clone(),
         })
+    }
+
+    /// Cross-provider select: rebuild + install the owning provider so the agent loop streams
+    /// against it (Pi switches model+provider live). A same-provider change is a no-op.
+    ///
+    /// Pi does not need this step: its `ModelRuntime` keeps every provider live and dispatches on
+    /// `model.provider` inside `prepareRequest` (model-runtime.ts:445-470), so `setModel` and
+    /// `cycleModel` alike are a bare `agent.state.model = next` assignment. cyrup installs exactly
+    /// ONE provider at a time, so every path that can land on a model owned by another provider —
+    /// [`Self::set_model_resolved`] **and** both `cycle_model` arms, whose candidate sets span the
+    /// whole auth-filtered registry — has to swap it here or the next turn streams against the
+    /// wrong provider.
+    fn install_owning_provider(&self, model: &Model) -> Result<(), SessionServiceError> {
+        if self.provider.current().id().as_str() == model.provider.as_str() {
+            return Ok(());
+        }
+        // A guest-registered provider is already a realized `Provider` in the shared registry
+        // (arch-08 §5.6); install it DIRECTLY so its models stream — the built-in
+        // `ProviderResolver` seam (bin `select_provider`) knows only the Pi registry, not a guest
+        // provider. Falls back to the resolver for a built-in cross-provider swap.
+        if let Some(guest) = self.services.guest_providers.provider(model.provider.as_str()) {
+            self.provider.store(guest);
+        } else {
+            self.provider.resolve_and_store(model.provider.as_str()).map_err(|e| {
+                SessionServiceError::NoConfiguredAuth(format!(
+                    "{}/{}: {e}",
+                    model.provider.as_str(),
+                    model.id.as_str()
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Whether the model has usable auth (Pi `modelRegistry.hasConfiguredAuth`, agent-session.ts:1449
@@ -3764,9 +3778,10 @@ impl AgentSession {
         *Self::lock(&self.scoped_models) = models;
     }
 
-    /// Cycle to the next/previous model (Pi `cycleModel`, agent-session.ts:1471-1539). Cycles over
-    /// the scoped set when one is configured (filtered to models with configured auth), else the full
-    /// provider catalog. Returns a typed [`ModelCycleResult`] distinguishing the scoped vs available
+    /// Cycle to the next/previous model (Pi `cycleModel`, agent-session.ts:1601-1671). Cycles over
+    /// the scoped set when one is configured (filtered to models with configured auth), else the
+    /// AUTH-FILTERED registry ([`Self::available_model_catalog`]). Returns a typed
+    /// [`ModelCycleResult`] distinguishing the scoped vs available
     /// path + the restored thinking level, or `None` when there is one-or-fewer candidate. Applies
     /// the model + re-clamps/restores the thinking level, persists a `model_change`, and emits
     /// `model_changed` + the `model_select` ext event.
@@ -3783,7 +3798,7 @@ impl AgentSession {
     }
 
     /// Cycle over the scoped set, honoring per-model thinking levels (Pi `_cycleScopedModel`,
-    /// agent-session.ts:1479-1510).
+    /// agent-session.ts:1608-1641).
     async fn cycle_scoped_model(
         &self,
         forward: bool,
@@ -3806,18 +3821,27 @@ impl AgentSession {
         };
         // Explicit scoped thinking level overrides; `None` inherits the current session level.
         let explicit = next.thinking_level;
+        self.install_owning_provider(&next.model)?;
         let new_level = self
             .apply_model_change(&next.model, &current, "cycle", explicit)
             .await?;
         Ok(Some(ModelCycleResult { model: next.model.clone(), thinking_level: new_level, is_scoped: true }))
     }
 
-    /// Cycle over the full provider catalog (Pi `_cycleAvailableModel`, agent-session.ts:1512-1538).
+    /// Cycle over the AUTH-FILTERED registry (Pi `_cycleAvailableModel`, agent-session.ts:1643-1670,
+    /// whose first line is `const availableModels = await this._modelRuntime.getAvailable()`).
+    ///
+    /// `getAvailable()` is `getAll().filter(hasConfiguredAuth)` across EVERY provider
+    /// (model-runtime.ts:315-329 → models.ts:394-409), which is exactly
+    /// [`Self::available_model_catalog`]. cyrup previously cycled `provider.current().models()` —
+    /// the ONE installed provider's own catalog — so a user with `ANTHROPIC_API_KEY` and
+    /// `OPENAI_API_KEY` could never cycle off the provider they launched on, the same SEAM-004 bug
+    /// already fixed for `set_model`/`get_available_models` on the RPC seam.
     async fn cycle_available_model(
         &self,
         forward: bool,
     ) -> Result<Option<ModelCycleResult>, SessionServiceError> {
-        let candidates = self.provider.current().models().to_vec();
+        let candidates = self.available_model_catalog();
         if candidates.len() <= 1 {
             return Ok(None);
         }
@@ -3831,6 +3855,7 @@ impl AgentSession {
         let Some(next) = candidates.get(next_idx).cloned() else {
             return Ok(None);
         };
+        self.install_owning_provider(&next)?;
         let new_level = self.apply_model_change(&next, &current, "cycle", None).await?;
         Ok(Some(ModelCycleResult { model: next, thinking_level: new_level, is_scoped: false }))
     }

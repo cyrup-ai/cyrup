@@ -141,6 +141,14 @@ pub enum EditorAction {
     Tab,
     JumpForward,
     JumpBackward,
+    /// Move the caret UP one page inside the editor buffer — `tui.editor.pageUp`
+    /// (`tui/src/keybindings.ts:89`, handled at `tui/src/components/editor.ts:856` →
+    /// `pageScroll(-1)`, `:1857`). A page is `max(5, floor(terminalRows * 0.3))` **visual** lines,
+    /// the same window [`crate::app::max_visible_editor_lines`] sizes the editor slot from.
+    PageUp,
+    /// Move the caret DOWN one page inside the editor buffer — `tui.editor.pageDown`
+    /// (`tui/src/keybindings.ts:90`; `editor.ts:860` → `pageScroll(1)`).
+    PageDown,
 }
 
 impl EditorAction {
@@ -171,6 +179,8 @@ impl EditorAction {
             "editor.tab" => E::Tab,
             "editor.jumpForward" => E::JumpForward,
             "editor.jumpBackward" => E::JumpBackward,
+            "editor.pageUp" => E::PageUp,
+            "editor.pageDown" => E::PageDown,
             _ => return None,
         })
     }
@@ -277,6 +287,10 @@ impl Key {
                 "end" => code = Some(KeyCode::End),
                 "backspace" => code = Some(KeyCode::Backspace),
                 "delete" | "del" => code = Some(KeyCode::Delete),
+                // Upstream `KeyId` spells these `pageUp`/`pageDown` (`tui/src/keys.ts:122-123`);
+                // `label()` emits the lowercased `pageup`/`pagedown`, so both round-trip.
+                "pageup" | "pgup" => code = Some(KeyCode::PageUp),
+                "pagedown" | "pgdn" => code = Some(KeyCode::PageDown),
                 other => {
                     let mut chars = other.chars();
                     match (chars.next(), chars.next()) {
@@ -937,7 +951,9 @@ pub struct EditorKeymap {
 impl Default for EditorKeymap {
     fn default() -> Self {
         use EditorAction as E;
-        use KeyCode::{Backspace, Char, Delete, Down, End, Enter, Home, Left, Right, Tab, Up};
+        use KeyCode::{
+            Backspace, Char, Delete, Down, End, Enter, Home, Left, PageDown, PageUp, Right, Tab, Up,
+        };
         let ctrl = |c: char| Key { code: Char(c), mods: KeyModifiers::CONTROL };
         let alt = |c: char| Key { code: Char(c), mods: KeyModifiers::ALT };
         let alt_code = |code: KeyCode| Key { code, mods: KeyModifiers::ALT };
@@ -958,9 +974,23 @@ impl Default for EditorKeymap {
                 (ctrl_code(Right), E::CursorWordRight),
                 (alt('f'), E::CursorWordRight),
                 (Key::plain(Home), E::CursorLineStart),
+                // `ctrl+home` / `ctrl+end` joined the line-start/line-end key sets in **v0.84.1**
+                // (`tui/src/keybindings.ts:92-99`: `["home", "ctrl+home", "ctrl+a"]` /
+                // `["end", "ctrl+end", "ctrl+e"]`); at the v0.83.0 baseline the sets were
+                // `["home","ctrl+a"]` / `["end","ctrl+e"]`. Version lag, not a port bug.
+                (ctrl_code(Home), E::CursorLineStart),
                 (ctrl('a'), E::CursorLineStart),
                 (Key::plain(End), E::CursorLineEnd),
+                (ctrl_code(End), E::CursorLineEnd),
                 (ctrl('e'), E::CursorLineEnd),
+                // Page motion (`keybindings.ts:89-90` at v0.83.0 — `pageUp`/`pageDown` are EDITOR
+                // bindings upstream and always have been; pi has no `app.pageUp` at either tag).
+                // `ctrl+pageUp`/`ctrl+pageDown` were added to the same sets in v0.84.1
+                // (`keybindings.ts:108-109`).
+                (Key::plain(PageUp), E::PageUp),
+                (ctrl_code(PageUp), E::PageUp),
+                (Key::plain(PageDown), E::PageDown),
+                (ctrl_code(PageDown), E::PageDown),
                 // Deletion + kill ring (`:79-110`).
                 (Key::plain(Backspace), E::DeleteCharBackward),
                 (Key::plain(Delete), E::DeleteCharForward),

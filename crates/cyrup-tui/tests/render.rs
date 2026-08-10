@@ -151,6 +151,14 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
 
     let mut app = App::new(TestBackend::new(60, 14), UiTheme::dark()).unwrap();
     app.ingest_event(&AgentSessionEvent::AgentStart);
+    // `message_start` opens the assistant message — Pi's `this.streamingComponent =
+    // new AssistantMessageComponent(...)` (`interactive-mode.ts:3130-3139`), and the guard both
+    // `message_update` (`:3146`) and `message_end` (`:3182`) test before they touch it. The agent
+    // emits it on the stream's `Start` frame (`cyrup-agent/src/agent.rs:802-808`) and, failing that,
+    // just before `MessageEnd` (`:848-852`), so it is never absent in production.
+    app.ingest_event(&AgentSessionEvent::MessageStart {
+        message: AgentMessage::Assistant(partial.clone()),
+    });
     for delta in ["The ", "live ", "stream"] {
         app.ingest_event(&AgentSessionEvent::MessageUpdate {
             message: AgentMessage::user_text(""),
@@ -170,13 +178,18 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
         "in-flight stream leaked to scrollback"
     );
 
-    // A terminal `Done` commits the authoritative message and clears the active region.
+    // `message_end` commits the authoritative message and clears the active region — Pi
+    // `updateContent(this.streamingMessage, false)` then `this.streamingComponent = undefined`
+    // (`interactive-mode.ts:3193`, `:3213`). This used to be a `MessageUpdate` carrying
+    // `StreamEvent::terminal(...)`, an event `cyrup-agent` never emits: it `break 'consume`s the
+    // moment the stream yields its terminal (`agent.rs:813-820`), so the terminal reaches the TUI
+    // only as `MessageEnd`. Pinning the synthetic form hid the fact that the real one committed
+    // nothing at all.
     let mut final_msg = partial.clone();
     final_msg.content = vec![Content::text("The live stream is done")];
     final_msg.usage = Usage { total_tokens: 42, ..Usage::default() };
-    app.ingest_event(&AgentSessionEvent::MessageUpdate {
-        message: AgentMessage::user_text(""),
-        assistant_message_event: Box::new(StreamEvent::terminal(final_msg)),
+    app.ingest_event(&AgentSessionEvent::MessageEnd {
+        message: AgentMessage::Assistant(final_msg),
     });
     app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();

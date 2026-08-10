@@ -40,6 +40,16 @@ fn base_config(fx: &Fixture) -> SessionConfig {
     cfg
 }
 
+/// Stands in for the binary's `select_provider` seam: hands back an offline faux provider for any
+/// id, so a cross-provider model change can actually install its owning provider.
+struct AnyFauxResolver;
+
+impl cyrup_session_svc::ProviderResolver for AnyFauxResolver {
+    fn resolve(&self, _provider_id: &str) -> Result<Arc<dyn Provider>, String> {
+        Ok(Arc::new(FauxProvider::new()))
+    }
+}
+
 fn two_model_provider() -> Arc<FauxProvider> {
     let mut reasoning = FauxModelDefinition::new("faux-2");
     reasoning.reasoning = true;
@@ -461,7 +471,17 @@ async fn set_model_resolved_auth_precheck_and_typed_cycle() {
     let provider: Arc<dyn Provider> = faux.clone();
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());
-    let session = SessionBuilder::new(provider.clone(), cfg).build().await.unwrap();
+    // The real host always carries a resolver (`main.rs` hands every factory a
+    // `BuiltinProviderResolver`), and it is load-bearing for the cycle below: `cycle_model`'s
+    // available arm walks `getAvailable()` across EVERY configured provider (Pi
+    // `_modelRuntime.getAvailable()`, agent-session.ts:1644), and this fixture is not hermetic
+    // against the ambient environment — a `TOGETHER_API_KEY` in the shell makes `together`
+    // configured and puts its catalog in the cycle set, which then has to be installable.
+    let session = SessionBuilder::new(provider.clone(), cfg)
+        .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>)
+        .build()
+        .await
+        .unwrap();
 
     // set_model_resolved on an in-catalog model succeeds.
     let faux2 = provider.models().iter().find(|m| m.id.as_str() == "faux-2").unwrap().clone();
@@ -475,17 +495,21 @@ async fn set_model_resolved_auth_precheck_and_typed_cycle() {
     assert!(!session.has_configured_auth(&bogus));
     assert!(session.set_model_resolved(bogus).await.is_err(), "out-of-catalog model rejected");
 
-    // Typed cycle over the full catalog reports is_scoped = false.
-    let r = session.cycle_model(true).await.unwrap().expect("two models cycle");
-    assert!(!r.is_scoped, "no scoped set configured → available path");
-
-    // Scoped set with a per-model thinking level reports is_scoped = true.
+    // Scoped set with a per-model thinking level reports is_scoped = true. Asserted BEFORE the
+    // available arm because that arm now legitimately leaves the session on ANOTHER provider (it
+    // walks every configured provider, Pi `_modelRuntime.getAvailable()`), which would put this
+    // fixture's two scoped models out of the newly installed provider's catalog.
     session.set_scoped_models(vec![
         ScopedModel { model: provider.models()[0].clone(), thinking_level: None },
         ScopedModel { model: faux2.clone(), thinking_level: Some(cyrup_core::ModelThinkingLevel::High) },
     ]);
     let r = session.cycle_model(true).await.unwrap().expect("scoped cycle");
     assert!(r.is_scoped, "scoped set configured → scoped path");
+
+    // Typed cycle over the available (auth-filtered) registry reports is_scoped = false.
+    session.set_scoped_models(Vec::new());
+    let r = session.cycle_model(true).await.unwrap().expect("two models cycle");
+    assert!(!r.is_scoped, "no scoped set configured → available path");
 }
 
 // --------------------------------------------------------------- prompt ordering + expansion ----

@@ -2752,15 +2752,28 @@ pub(crate) fn entry_lines(
             out
         }
         Entry::Tool(run) => {
-            // Committed tools render in their last (expanded-at-commit) form; a diff result always
-            // renders in full. We commit with the at-the-time expand flag captured by the caller —
-            // here we always show the full body so finalized scrollback keeps the complete record.
-            tool_lines(run, true, width, theme, images)
+            // X14 — a committed tool renders at the LIVE `this.toolOutputExpanded`, exactly like a
+            // live one. Upstream has ONE `ToolExecutionComponent` per call and never swaps its
+            // expansion when it scrolls: the component is seeded `setExpanded(this.toolOutputExpanded)`
+            // at every construction site (`interactive-mode.ts:3165`, `:3239`, `:3437`, `:3486`,
+            // `:3602`) and re-broadcast on every toggle (`setToolsExpanded`, `:4032-4046`), with
+            // `toolOutputExpanded` defaulting to **false** (`:442`).
+            //
+            // This used to pass a hardcoded `true`, "so finalized scrollback keeps the complete
+            // record". That is the GREEN-SLAB defect: a collapsed `read`'s `renderResult` returns
+            // `""` upstream (`read.ts:178-180`) and `bash`/`grep`/`ls` cap at 10 rows, so upstream's
+            // committed block is a 3-row header. Forcing `true` dumped the WHOLE file — every line
+            // of it — inside the full-width `toolSuccessBg` box, so one `read` of a 500-line file
+            // painted 500 rows of solid tool tint (Indexed(22), a vivid `#005f00`, once a
+            // 256-colour terminal quantises `#283228`) straight over the conversation.
+            tool_lines(run, images.tools_expanded, width, theme, images)
         }
         Entry::Bash(b) => {
-            // Committed bash blocks render in full (the complete record), like committed tools.
+            // Same rule for the `!`/`!!` block: `BashExecutionComponent` is `isExpandable` and takes
+            // the same broadcast (`setToolsExpanded`, `:4032-4046`), so a committed one renders at
+            // the live flag rather than force-expanded.
             let mut full = b.clone();
-            full.set_expanded(true);
+            full.set_expanded(images.tools_expanded);
             full.render_lines(width, theme, None, None)
         }
         Entry::SkillInvocation { name, content, lead_spacer } => {

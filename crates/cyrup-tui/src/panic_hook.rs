@@ -44,8 +44,21 @@ use ratatui::crossterm::terminal::disable_raw_mode;
 ///
 /// Deliberately does NOT touch the alternate screen: the production app runs an inline viewport and
 /// never enters it (only `startup_selector` does, and it owns its own exit path).
+///
+/// It DOES clear the OSC 9;4 progress indicator, which is not a terminal *mode* like the other
+/// three: it is state the terminal emulator keeps on the app's behalf, and it survives the process
+/// and every `stty sane`/`reset` a user would reach for. See the first statement below.
 pub fn restore_terminal_best_effort() {
     let mut out = io::stdout();
+    // The OSC 9;4 taskbar indicator, first — Pi's `ProcessTerminal.stop()` clears it ahead of every
+    // other teardown step (`tui/src/terminal.ts:407-409`, `if (this.clearProgressInterval())`), and
+    // it is the one piece of state here that OUTLIVES the process: raw mode and bracketed paste die
+    // with the tty settings a `reset` restores, but a progress indicator this process lit stays lit
+    // in the taskbar until something explicitly clears it. Gated on
+    // [`crate::progress_is_armed`] so a session that never armed progress emits nothing.
+    if crate::terminal_progress::progress_is_armed() {
+        crate::terminal_progress::write_terminal_progress(false);
+    }
     let _ = out.execute(PopKeyboardEnhancementFlags);
     let _ = out.execute(DisableBracketedPaste);
     let _ = disable_raw_mode();

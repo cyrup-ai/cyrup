@@ -74,9 +74,17 @@ fn tool_call() -> Content {
 fn scrollback_for(ev: StreamEvent) -> (App<TestBackend>, String) {
     let mut app = new_app();
     let message = ev.terminal_message().cloned().expect("terminal event carries a message");
-    app.ingest_event(&AgentSessionEvent::MessageUpdate {
+    // The production shape. `cyrup-agent` emits `MessageStart` on the stream's `Start` frame
+    // (`agent.rs:802-808`), then `break 'consume`s the moment the stream yields its terminal
+    // (`:813-820`) and re-emits it as `MessageEnd` (`:854`) — a terminal event never rides a
+    // `MessageUpdate`. Pi finalizes in the matching `message_end` arm, guarded on the open
+    // streaming component (`interactive-mode.ts:3180-3213`). This helper used to post the terminal
+    // as a `MessageUpdate` with no `MessageStart` at all, a sequence nothing produces.
+    app.ingest_event(&AgentSessionEvent::MessageStart {
+        message: AgentMessage::Assistant(message.clone()),
+    });
+    app.ingest_event(&AgentSessionEvent::MessageEnd {
         message: AgentMessage::Assistant(message),
-        assistant_message_event: Box::new(ev),
     });
     app.draw().unwrap();
     let out = app.scrollback_text();

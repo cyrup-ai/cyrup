@@ -19,7 +19,10 @@ pub use oauth::{
 };
 pub use resolve::{AuthOverrides, resolve_provider_auth};
 pub use store::{CredentialStore, InMemoryCredentialStore, ModifyFn};
-pub use types::{AuthContext, AuthResult, Credential, EnvAuthContext, ModelAuth, ProviderEnv};
+pub use types::{
+    AuthContext, AuthResult, Credential, CredentialInfo, CredentialType, EnvAuthContext, ModelAuth,
+    ProviderEnv,
+};
 
 /// How a provider authenticates (func-01 §4.1: at least one of `api_key | oauth`).
 #[derive(Clone, Default)]

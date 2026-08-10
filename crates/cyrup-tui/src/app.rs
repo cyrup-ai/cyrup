@@ -356,6 +356,21 @@ pub struct AppState {
     /// `interactive-mode.ts:818-826`). Retained so the value is observable in tests and after a
     /// redraw; the crossterm run loop is what actually writes the OSC 0 sequence.
     pub terminal_title: Option<String>,
+    /// The OSC 9;4 taskbar progress indicator — Pi's `terminal.showTerminalProgress` gate plus the
+    /// armed bit ([`crate::TerminalProgress`], `tui/src/terminal.ts:509-523`). Held here for the
+    /// same reason as [`AppState::terminal_title`] directly above: the session-event fold records
+    /// the transition and the crossterm run loop is what writes the escape sequence.
+    pub terminal_progress: crate::TerminalProgress,
+    /// Pi `this.streamingComponent` (`interactive-mode.ts:435`): the assistant message currently
+    /// streaming, as a plain "is one open?" bit — cyrup's transcript owns the buffers, so only the
+    /// lifetime matters here.
+    ///
+    /// Set on `message_start` for an `assistant` message (`:3129-3141`) and cleared the moment that
+    /// message is finalized (`this.streamingComponent = undefined`, `:3213`). It is the guard Pi's
+    /// `message_end` arm opens with (`if (this.streamingComponent && event.message.role ===
+    /// "assistant")`, `:3182`), and it is what keeps a defensively-handled terminal
+    /// `StreamEvent::Done` inside `message_update` from committing the same message twice.
+    pub streaming_assistant: bool,
     /// The working directory whose basename goes into the automatic terminal title — Pi
     /// `sessionManager.getCwd()` (`interactive-mode.ts:819`). Seeded from the process cwd and
     /// re-pointed at the live session's cwd by [`App::run`] (and on every session swap), since a
@@ -489,6 +504,10 @@ impl AppState {
             pending_ui_reply: None,
             pending_tree_nav: None,
             terminal_title: None,
+            // Off until a session binds and `terminal.showTerminalProgress` is read ([`App::run`]).
+            // Pi has no seed at all — it re-reads the setting at each of its five call sites.
+            terminal_progress: crate::TerminalProgress::default(),
+            streaming_assistant: false,
             // Pi reads `sessionManager.getCwd()` at title time; the process cwd is the same value
             // until a session with a recorded cwd is bound, which re-points it ([`App::run`]).
             title_cwd: std::env::current_dir().unwrap_or_default(),
@@ -851,8 +870,44 @@ impl<B: Backend> App<B> {
     /// See [`crate::drain`] for what the drain protects against (buffered Kitty key-release reports
     /// and the quit keystroke itself leaking to the parent shell once raw mode is off).
     pub fn drain_and_restore(&mut self) -> Result<(), TuiError> {
+        // Pi's `stop()` clears the OSC 9;4 indicator first (`interactive-mode.ts:6041-6043`), before
+        // `ui.stop()` tears the terminal down. Doing it here as well as inside
+        // [`crate::panic_hook::restore_terminal_best_effort`] is Pi's own two-level structure: the
+        // interactive mode clears its indicator, and `ProcessTerminal.stop()` clears whatever is
+        // still armed. Both are idempotent; this one additionally drops the session's own armed bit
+        // so the keepalive cannot re-arm on the way out.
+        self.clear_terminal_progress_on_exit();
         let _ = crate::drain::drain_stdin_before_exit();
         self.restore()
+    }
+
+    /// Write the parked OSC 9;4 transition, if any — the second half of Pi's
+    /// `ui.terminal.setProgress` (`tui/src/terminal.ts:509-523`).
+    pub fn flush_terminal_progress(&mut self) {
+        if let Some(active) = self.state.terminal_progress.take_pending() {
+            crate::write_terminal_progress(active);
+        }
+    }
+
+    /// Re-send the active sequence — Pi's `setInterval(..., TERMINAL_PROGRESS_KEEPALIVE_MS)`
+    /// (`terminal.ts:514-516`). Driven from the run loop's 1 s ticker, gated on
+    /// [`crate::TerminalProgress::keepalive`] so an idle session never writes.
+    ///
+    /// Also the resume path: a Ctrl+Z suspend runs [`Self::restore`], which clears the terminal's
+    /// indicator, and the next tick after `fg` puts it back for a turn that is still running.
+    pub fn tick_terminal_progress_keepalive(&mut self) {
+        if self.state.terminal_progress.keepalive() {
+            crate::write_terminal_progress(true);
+        }
+    }
+
+    /// The exit clear — Pi `stop()` (`interactive-mode.ts:6041-6043`) and `ProcessTerminal.stop()`
+    /// (`terminal.ts:407-409`). Answers from the TERMINAL's armed bit, so an indicator this process
+    /// lit is always taken back down even if the setting was turned off in between.
+    pub fn clear_terminal_progress_on_exit(&mut self) {
+        if self.state.terminal_progress.shutdown() {
+            crate::write_terminal_progress(false);
+        }
     }
 
     /// Immutable state access.
@@ -1618,6 +1673,19 @@ impl<B: Backend> App<B> {
                         let defer_to_editor = match action {
                             Action::Interrupt => self.state.editor.autocomplete_open(),
                             Action::Quit => !self.state.editor.is_empty(),
+                            // `PageUp`/`PageDown` are EDITOR bindings upstream and only editor
+                            // bindings — pi defines no `app.pageUp`/`app.pageDown` at v0.83.0 or
+                            // v0.84.1, and `tui.editor.pageUp` (`tui/src/keybindings.ts:89-90`)
+                            // pages the CARET (`editor.ts:855-862` → `pageScroll`). cyrup resolved
+                            // them globally and always scrolled the transcript, so the key never
+                            // reached a focused multi-line editor at all. Defer to the editor
+                            // whenever the buffer spans more than one visual line — i.e. whenever
+                            // there is something in it to page — and otherwise fall through to
+                            // cyrup's active-region transcript scroll, which has no pi analogue
+                            // (pi pages committed history with the terminal's own scrollback).
+                            Action::PageUp | Action::PageDown => {
+                                self.state.editor.is_multi_visual_line()
+                            }
                             _ => false,
                         };
                         if !defer_to_editor {
@@ -2044,8 +2112,10 @@ impl<B: Backend> App<B> {
             line_end = e(EditorAction::CursorLineEnd),
             jump_fwd = e(EditorAction::JumpForward),
             jump_back = e(EditorAction::JumpBackward),
-            page_up = g(Action::PageUp),
-            page_down = g(Action::PageDown),
+            // Upstream reads these off the EDITOR map — `getEditorKeyDisplay("tui.editor.pageUp")`
+            // (`interactive-mode.ts:5766-5767`, rendered at `:5808`) — not an app binding.
+            page_up = e(EditorAction::PageUp),
+            page_down = e(EditorAction::PageDown),
             submit = e(EditorAction::Submit),
             new_line = e(EditorAction::NewLine),
             del_word_back = e(EditorAction::DeleteWordBackward),
@@ -3971,6 +4041,17 @@ impl<B: Backend> App<B> {
                     self.state.show_images = value == "true";
                     self.state.transcript.set_show_images(self.state.show_images);
                 }
+                // `terminal.showTerminalProgress` is live in Pi by construction — its gate is
+                // `getShowTerminalProgress()` re-read at every call site, so a flip takes effect on
+                // the next transition with no handler doing anything but persisting
+                // (`onShowTerminalProgressChange`, `interactive-mode.ts:4311-4313`). cyrup caches
+                // the gate on `AppState`, so the flip has to be pushed into it here or the row would
+                // not take effect until the next session bind. Turning the row OFF while an
+                // indicator is lit also parks a clear — see the `[CYRUP-DELTA]` on
+                // `TerminalProgress::set_enabled`.
+                if id == "terminal.showTerminalProgress" {
+                    self.state.terminal_progress.set_enabled(value == "true");
+                }
                 if id == "terminal.imageWidthCells"
                     && let Ok(cells) = value.parse::<u16>()
                 {
@@ -4353,16 +4434,30 @@ impl<B: Backend> App<B> {
     ) {
         match ev {
             AgentSessionEvent::AgentStart => {
+                // Pi `case "agent_start"` (`interactive-mode.ts:2865-2867`): the FIRST statement of
+                // the arm, before the retry-handler restore and the working indicator, is
+                // `if (getShowTerminalProgress()) this.ui.terminal.setProgress(true)`. The OSC write
+                // is the run loop's (`flush_terminal_progress`), as for the OSC 0 title.
+                self.state.terminal_progress.set(true);
                 self.state.status.set_streaming(true);
                 self.state.indicator.working();
             }
             AgentSessionEvent::AgentEnd { .. } => {
+                // Pi `case "agent_end"` (`interactive-mode.ts:3057-3059`), again the arm's first
+                // statement: `setProgress(false)`. `agent_end` — not `agent_settled` — is where Pi
+                // clears, so a turn that goes on to auto-retry or run a queued continuation drops
+                // the indicator and the next `agent_start` puts it back.
+                self.state.terminal_progress.set(false);
                 self.state.status.set_streaming(false);
                 self.state.indicator.idle();
                 // Reasoning commits BEFORE the answer text so the scrollback order matches Pi's
                 // content walk (thinking section, then the assistant markdown).
                 self.state.transcript.commit_thinking(None);
                 self.state.transcript.commit_assistant(None);
+                // `if (this.streamingComponent) { … this.streamingComponent = undefined; }`
+                // (`interactive-mode.ts:3271-3275`) — a turn that ended without a `message_end`
+                // (an abort mid-stream) must not leave the slot open for the next turn.
+                self.state.streaming_assistant = false;
                 // Commit the turn's live tool executions into scrollback (`tool-execution.ts` tools
                 // persist through the turn, then scroll up as committed history).
                 self.state.transcript.commit_tools();
@@ -4376,18 +4471,45 @@ impl<B: Backend> App<B> {
             // deliberate no-op, NOT a missing case.
             AgentSessionEvent::AgentSettled => {}
             AgentSessionEvent::TurnStart | AgentSessionEvent::TurnEnd { .. } => {}
-            // A finished message: an extension `Custom` message renders as a distinct labeled block
-            // (`custom-message.ts`, interactive-mode.ts:3083). Core user/assistant text is already
-            // surfaced via the user echo + streaming-delta path, so only `Custom` is folded here (on
-            // `MessageEnd` so it commits once, not twice with `MessageStart`).
-            AgentSessionEvent::MessageStart { .. } => {}
+            // Pi `case "message_start"` (`interactive-mode.ts:3121-3143`): an `assistant` message
+            // opens a fresh `AssistantMessageComponent` and files it in `this.streamingComponent`
+            // (`:3130-3139`). cyrup's transcript already owns the streaming buffers, so the only
+            // thing this arm has to reproduce is the LIFETIME — the bit `message_end` reads to know
+            // an assistant message is open and unfinalized (`:3182`).
+            AgentSessionEvent::MessageStart { .. } => {
+                if message_role_from_event(ev).as_deref() == Some("assistant") {
+                    self.state.streaming_assistant = true;
+                }
+            }
+            // Pi `case "message_end"` (`interactive-mode.ts:3180-3216`). This is where an assistant
+            // message is FINALIZED — `this.streamingComponent.updateContent(this.streamingMessage,
+            // false)` at `:3193`, then `this.streamingComponent = undefined` at `:3213`.
+            //
+            // It is not optional bookkeeping: it is what makes a turn INTERLEAVE. Each finished
+            // assistant text commits here, before the tool calls it requested start; each
+            // `ToolExecutionComponent` is then appended after it (`:3166`/`:3240`) and the next
+            // step's text after those. Committing assistant text only at `agent_end` instead —
+            // which is what cyrup did while this arm was empty — concatenated every step's text
+            // into one block and pushed the whole turn's tools below it, because
+            // `commit_finished_leading_tools` refuses to commit a tool ahead of uncommitted
+            // assistant text (`transcript.rs:865-868`) and so never fired at all.
             AgentSessionEvent::MessageEnd { .. } => {
                 // A tool that reported usage for its own execution spends real tokens, so the
-                // cumulative footer totals must include it (`footer.ts:99-101`). Assistant usage
-                // arrives on the stream `Done` instead, via `add_usage` — this arm is the
-                // `toolResult` branch and, like upstream, must NOT restate the `CH` segment.
+                // cumulative footer totals must include it (`footer.ts:99-101`). This is the
+                // `toolResult` branch and, like upstream, must NOT restate the `CH` segment —
+                // assistant usage goes through `add_usage` in [`Self::finalize_assistant_message`].
                 if let Some(u) = tool_result_usage_from_event(ev) {
                     self.state.status.add_usage_totals(&u);
+                }
+                // `if (event.message.role === "user") break;` (`:3181`) plus the
+                // `this.streamingComponent &&` guard (`:3182`): only an OPEN assistant message
+                // finalizes here. The open bit is cleared by whichever path finalizes first, so a
+                // producer that does deliver a terminal `StreamEvent::Done` inside `message_update`
+                // cannot commit the same text twice.
+                if self.state.streaming_assistant
+                    && let Some(message) = assistant_message_from_event(ev)
+                {
+                    self.finalize_assistant_message(&message);
                 }
                 // The `AgentMessage` type lives in `cyrup-agent` (a dev-dep here, not a direct dep), so
                 // the `Custom` arm is detected via its serde projection (`tag = "role"`,
@@ -4470,6 +4592,11 @@ impl<B: Backend> App<B> {
                 self.state.status.set_queued(steering.len().saturating_add(follow_up.len()));
             }
             AgentSessionEvent::CompactionStart { reason } => {
+                // Pi `case "compaction_start"` (`interactive-mode.ts:3076-3078`): compaction is
+                // also work the user waits on, so it arms the same indicator — including a manual
+                // `/compact` outside any turn, which is the one progress window with no
+                // `agent_start` around it.
+                self.state.terminal_progress.set(true);
                 // Pi's exact status copy (status-indicator.ts:80-82): a MANUAL `/compact` reads
                 // "Compacting context…"; an automatic compaction reads "Auto-compacting…", prefixed
                 // "Context overflow detected, " when the overflow path triggered it (item #9). The
@@ -4491,6 +4618,12 @@ impl<B: Backend> App<B> {
                 self.state.indicator.set(IndicatorKind::Compaction, Some(msg));
             }
             AgentSessionEvent::CompactionEnd { .. } => {
+                // Pi `case "compaction_end"` (`interactive-mode.ts:3090-3092`): clears
+                // unconditionally, even when this was an AUTO-compaction inside a still-streaming
+                // turn. Pi's own `agent_end` then re-clears; the visible effect is a brief gap in
+                // the taskbar pulse, and matching it is why `TerminalProgress::set` does not
+                // deduplicate repeated transitions.
+                self.state.terminal_progress.set(false);
                 // Back to working if the turn is still streaming, else idle.
                 if self.state.status.streaming {
                     self.state.indicator.working();
@@ -4694,37 +4827,56 @@ impl<B: Backend> App<B> {
                     self.state.transcript.push_thinking_delta(delta);
                 }
             }
-            StreamEvent::Done { message, .. } | StreamEvent::Error { error: message, .. } => {
-                // Commit the reasoning FIRST (Pi walks content in order and thinking precedes the
-                // answer), preferring the terminal message's authoritative `thinking` blocks over
-                // whatever streamed — a redacted/summarised block only ever arrives terminally.
-                let thinking = thinking_text(&message.content);
-                if thinking.is_empty() {
-                    self.state.transcript.commit_thinking(None);
-                } else {
-                    self.state.transcript.commit_thinking(Some(thinking));
-                }
-                let text = content_text(&message.content);
-                if text.is_empty() {
-                    // Pure tool-use / empty terminal: keep any streamed partial; `AgentEnd` commits it.
-                    self.state.transcript.commit_assistant(None);
-                } else {
-                    self.state.transcript.commit_assistant(Some(text));
-                }
-                let tokens = message.usage.total_tokens;
-                if tokens > 0 {
-                    self.state.status.set_tokens(tokens);
-                }
-                // Accumulate the turn into the cumulative session footer totals (footer.ts:86-107).
-                self.state.status.add_usage(&message.usage);
-                // A turn that did not finish cleanly gets Pi's error-styled footer notice
-                // (assistant-message.ts:175-201) — otherwise a 5xx, an abort or a max-token
-                // truncation would end the turn with no explanation at all.
-                if let Some(notice) = stop_reason_notice(message) {
-                    self.state.transcript.push_error(notice);
-                }
+            // DEFENSIVE, not the live path. `cyrup-agent` `break 'consume`s the moment the stream
+            // yields its terminal (`agent.rs:813-820`), so a terminal event is never re-emitted as
+            // a `MessageUpdate` and this arm does not fire for a real turn — `MessageEnd` is where
+            // an assistant message finalizes. It stays for any producer (an embedder, a replayed
+            // transport) that does forward the terminal, and clears the open bit so `MessageEnd`
+            // will not then commit the same text a second time. The `streaming_assistant` guard is
+            // Pi's `if (this.streamingComponent && ...)` on `message_update`
+            // (`interactive-mode.ts:3146`).
+            StreamEvent::Done { message, .. } | StreamEvent::Error { error: message, .. }
+                if self.state.streaming_assistant =>
+            {
+                self.finalize_assistant_message(message);
             }
             _ => {}
+        }
+    }
+
+    /// Pi `message_end`'s finalization of an assistant message (`interactive-mode.ts:3183-3214`):
+    /// the authoritative message replaces whatever streamed, and the streaming slot closes.
+    ///
+    /// Commits the reasoning FIRST — Pi walks the message content in order and `thinking` precedes
+    /// the answer (`assistant-message.ts:115-166`) — preferring the final message's blocks over the
+    /// streamed ones, since a redacted/summarised block only ever arrives terminally.
+    fn finalize_assistant_message(&mut self, message: &cyrup_core::AssistantMessage) {
+        // `this.streamingComponent = undefined` (`:3213`).
+        self.state.streaming_assistant = false;
+        let thinking = thinking_text(&message.content);
+        if thinking.is_empty() {
+            self.state.transcript.commit_thinking(None);
+        } else {
+            self.state.transcript.commit_thinking(Some(thinking));
+        }
+        let text = content_text(&message.content);
+        if text.is_empty() {
+            // Pure tool-use / empty terminal: keep any streamed partial; `AgentEnd` commits it.
+            self.state.transcript.commit_assistant(None);
+        } else {
+            self.state.transcript.commit_assistant(Some(text));
+        }
+        let tokens = message.usage.total_tokens;
+        if tokens > 0 {
+            self.state.status.set_tokens(tokens);
+        }
+        // Accumulate the turn into the cumulative session footer totals (footer.ts:86-107).
+        self.state.status.add_usage(&message.usage);
+        // A turn that did not finish cleanly gets Pi's error-styled footer notice
+        // (assistant-message.ts:175-201) — otherwise a 5xx, an abort or a max-token
+        // truncation would end the turn with no explanation at all.
+        if let Some(notice) = stop_reason_notice(message) {
+            self.state.transcript.push_error(notice);
         }
     }
 }
@@ -5226,6 +5378,29 @@ fn tool_result_usage_from_event(ev: &AgentSessionEvent) -> Option<cyrup_core::Us
         return None;
     }
     serde_json::from_value(message.get("usage")?.clone()).ok()
+}
+
+/// The `role` discriminant of the message an event carries (`"user"`/`"assistant"`/`"toolResult"`/
+/// `"custom"`), read through the same serde projection [`custom_message_from_event`] uses and for
+/// the same reason: `AgentMessage` lives in `cyrup-agent`, a dev-dependency here.
+///
+/// This is Pi's `event.message.role` test (`interactive-mode.ts:3122`, `:3181`).
+fn message_role_from_event(ev: &AgentSessionEvent) -> Option<String> {
+    let value = serde_json::to_value(ev).ok()?;
+    Some(value.get("message")?.get("role")?.as_str()?.to_string())
+}
+
+/// The authoritative [`AssistantMessage`](cyrup_core::AssistantMessage) a `message_end` carries, via
+/// the same projection. `AgentMessage::Assistant` is an internally-tagged newtype variant, so the
+/// serialized object is the assistant message's own fields plus `role` — which deserializes
+/// straight back into `AssistantMessage`.
+fn assistant_message_from_event(ev: &AgentSessionEvent) -> Option<cyrup_core::AssistantMessage> {
+    let value = serde_json::to_value(ev).ok()?;
+    let message = value.get("message")?;
+    if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return None;
+    }
+    serde_json::from_value(message.clone()).ok()
 }
 
 fn custom_message_from_event(ev: &AgentSessionEvent) -> Option<(String, String)> {
@@ -5935,6 +6110,13 @@ impl App<CrosstermBackend<Stdout>> {
 
     /// Draw one frame wrapped in synchronized-output markers (CSI 2026, R-10-002 / R-ARCH-TUI-004).
     pub fn draw_synchronized(&mut self) -> Result<(), TuiError> {
+        // The OSC 9;4 write for a progress transition the session-event fold (or a `/settings` flip)
+        // recorded. Pi writes it synchronously inside the event handler
+        // (`interactive-mode.ts:2865-2867` → `terminal.ts:509-523`); cyrup's fold is a pure state
+        // transition, so the write happens here — one call site, ahead of the frame, reached by
+        // EVERY run-loop arm that can have changed the state. Draining makes it once-per-transition
+        // rather than once-per-frame.
+        self.flush_terminal_progress();
         let mut out = io::stdout();
         let _ = out.execute(BeginSynchronizedUpdate);
         let res = self.draw();
@@ -6156,6 +6338,14 @@ impl App<CrosstermBackend<Stdout>> {
         self.state
             .transcript
             .set_image_width_cells(eff.image_width_cells().clamp(1, u16::MAX as i64) as u16);
+        // `terminal.showTerminalProgress` — the gate on the OSC 9;4 taskbar indicator. Pi re-reads
+        // it at each of its five call sites (`interactive-mode.ts:2865`/`:3057`/`:3076`/`:3090`/
+        // `:6041`); cyrup caches it here and re-seeds it on a `/settings` flip and on a session swap,
+        // which is the same liveness. Seeding only — never arms, since Pi arms only from an
+        // `agent_start`/`compaction_start`.
+        self.state.terminal_progress = crate::TerminalProgress::with_enabled(
+            eff.show_terminal_progress(),
+        );
         // The automatic window title (Pi `updateTerminalTitle`, interactive-mode.ts:818-826, called
         // at `:860` right after `init()`): `cyrup - <session name> - <cwd basename>`. Both inputs are
         // read from the LIVE session here — the name Pi reads via `sessionManager.getSessionName()`
@@ -6198,6 +6388,13 @@ impl App<CrosstermBackend<Stdout>> {
         // pays for it — mirrors the spinner's own `if`-gated pattern immediately above.
         let mut dialog_countdown = tokio::time::interval(Duration::from_secs(1));
         dialog_countdown.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The OSC 9;4 keepalive (Pi's `setInterval(..., TERMINAL_PROGRESS_KEEPALIVE_MS)`,
+        // `tui/src/terminal.ts:514-516`): re-send the active sequence once a second for as long as a
+        // turn or a compaction is running, because several terminals expire an indeterminate
+        // progress state that is not refreshed. Same `if`-gated shape as the spinner above, so an
+        // idle session — or any session with the setting off — never writes.
+        let mut progress_keepalive = tokio::time::interval(crate::TERMINAL_PROGRESS_KEEPALIVE);
+        progress_keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The footer's git-branch refresh (Pi watches `.git/HEAD` with `fs.watch` + a 500 ms debounce,
         // `footer-data-provider.ts`). cyrup polls the same 500 ms instead of holding an inotify
         // watch, and the branch is `if`-gated on actually being inside a repo — outside one this arm
@@ -6295,6 +6492,11 @@ impl App<CrosstermBackend<Stdout>> {
                 {
                     self.tick_extension_dialog_countdown();
                     self.draw_synchronized()?;
+                }
+                _ = progress_keepalive.tick(), if self.state.terminal_progress.keepalive() => {
+                    // Pure terminal output, no UI state — Pi's interval writes the escape and
+                    // nothing else, so this arm deliberately does NOT redraw.
+                    self.tick_terminal_progress_keepalive();
                 }
                 _ = elapsed_tick.tick(), if self.state.transcript.has_running_elapsed_tool() => {
                     // Pi's `context.invalidate()` → `ui.requestRender()`: nothing to mutate, the
@@ -6663,6 +6865,11 @@ impl App<CrosstermBackend<Stdout>> {
                         let eff = session.services().settings.effective();
                         self.state.show_images = eff.show_images();
                         self.state.transcript.set_show_images(self.state.show_images);
+                        // Re-read the progress gate for the swapped-in session's settings, for the
+                        // same reason as the image rows beside it. Any indicator the OUTGOING
+                        // session lit is dropped with its state; the swap arrives between turns.
+                        self.state.terminal_progress =
+                            crate::TerminalProgress::with_enabled(eff.show_terminal_progress());
                         self.state.transcript.set_image_width_cells(
                             eff.image_width_cells().clamp(1, u16::MAX as i64) as u16,
                         );
@@ -6856,9 +7063,48 @@ pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
 }
 
 /// Map a crossterm event to our [`InputEvent`] (filtering non-press key kinds).
+///
+/// Key presses first go through [`rescue_native_shift_enter_live`] — upstream's
+/// `ProcessTerminal.forwardInputSequence` normalization (v0.83.0 `tui/src/terminal.ts:305-312`).
+/// On Apple Terminal (and, since v0.84.1, the Windows console) a bare `\r` is all the terminal
+/// sends for BOTH `Enter` and `Shift+Enter`, so the modifier is recovered from the live keyboard
+/// state instead of the byte stream. Everywhere else the event passes through untouched.
 fn map_event(ev: Event) -> Option<InputEvent> {
+    // `TERM_PROGRAM` is read only for the one key that can need it (a bare `Enter`), so no other
+    // keystroke pays for a `getenv`.
+    let term_program = match &ev {
+        Event::Key(k)
+            if k.code == ratatui::crossterm::event::KeyCode::Enter
+                && k.modifiers == ratatui::crossterm::event::KeyModifiers::NONE =>
+        {
+            std::env::var("TERM_PROGRAM").ok()
+        }
+        _ => None,
+    };
+    map_event_on(ev, crate::native_modifiers::host_platform(), term_program.as_deref(), |k| {
+        crate::native_modifiers::is_native_modifier_pressed(k)
+    })
+}
+
+/// [`map_event`] with `process.platform`, `process.env.TERM_PROGRAM` and the native modifier helper
+/// lifted into parameters, so the Apple-Terminal / Windows-console branch of the Shift+Enter rescue
+/// is reachable from a test on any host (the same pattern as
+/// [`crate::image::detect_capabilities_on_platform`]).
+fn map_event_on(
+    ev: Event,
+    platform: &str,
+    term_program: Option<&str>,
+    probe: impl Fn(crate::native_modifiers::ModifierKey) -> bool,
+) -> Option<InputEvent> {
     match ev {
-        Event::Key(k) if !matches!(k.kind, KeyEventKind::Release) => Some(InputEvent::Key(k)),
+        Event::Key(k) if !matches!(k.kind, KeyEventKind::Release) => {
+            Some(InputEvent::Key(crate::native_modifiers::rescue_native_shift_enter(
+                k,
+                platform,
+                term_program,
+                probe,
+            )))
+        }
         Event::Key(_) => None,
         Event::Paste(s) => Some(InputEvent::Paste(s)),
         Event::Resize(w, h) => Some(InputEvent::Resize(w, h)),
@@ -6884,6 +7130,72 @@ fn input_pipeline(raw: Vec<Event>) -> Vec<InputEvent> {
     filter.flush(&mut released);
     out.extend(released.drain(..).filter_map(map_event));
     out
+}
+
+/// The Shift+Enter rescue inside the real reader-thread mapping (G63; `terminal.ts:316-327`).
+///
+/// `map_event_on` is where the input thread actually normalizes a key event, so these drive THAT
+/// with a synthesized `process.platform` / `TERM_PROGRAM` / native helper. The macOS and Windows
+/// probe bodies are unimplemented and unexercised — see `tests/native_shift_enter.rs`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod native_shift_enter_mapping_tests {
+    use super::*;
+    use crate::native_modifiers::ModifierKey;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn enter() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn mapped_key(ev: Option<InputEvent>) -> KeyEvent {
+        match ev {
+            Some(InputEvent::Key(k)) => k,
+            other => panic!("expected a key event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_reader_rewrites_a_bare_enter_on_apple_terminal_when_shift_is_held() {
+        let mapped = map_event_on(enter(), "darwin", Some("Apple_Terminal"), |k| {
+            k == ModifierKey::Shift
+        });
+        assert_eq!(mapped_key(mapped), KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn the_reader_leaves_a_plain_enter_alone_when_shift_is_up() {
+        let mapped = map_event_on(enter(), "darwin", Some("Apple_Terminal"), |_| false);
+        assert_eq!(mapped_key(mapped), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_reader_never_probes_on_a_platform_that_encodes_modifiers() {
+        let mapped =
+            map_event_on(enter(), "linux", None, |_| panic!("the probe must not run on linux"));
+        assert_eq!(mapped_key(mapped), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn non_key_events_are_unaffected() {
+        assert!(matches!(
+            map_event_on(Event::Resize(10, 20), "darwin", Some("Apple_Terminal"), |_| true),
+            Some(InputEvent::Resize(10, 20))
+        ));
+        assert!(
+            map_event_on(
+                Event::Key(KeyEvent {
+                    kind: ratatui::crossterm::event::KeyEventKind::Release,
+                    ..KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                }),
+                "win32",
+                None,
+                |_| true
+            )
+            .is_none(),
+            "releases are still filtered out"
+        );
+    }
 }
 
 #[cfg(test)]

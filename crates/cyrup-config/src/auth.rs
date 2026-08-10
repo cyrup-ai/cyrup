@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use cyrup_core::ProviderId;
+use cyrup_provider::{CredentialInfo, CredentialType};
 use serde_json::{Map, Value};
 
 use crate::env::ConfigDirs;
@@ -153,6 +154,51 @@ impl AuthStore {
     /// `BTreeMap`), which is deterministic; Pi returns `Object.keys` insertion order.
     pub fn list(&self) -> Result<Vec<String>, AuthError> {
         Ok(self.read_file()?.into_keys().collect())
+    }
+
+    /// The COMPOSED credential enumeration `ModelRuntime.listCredentials()` returns
+    /// (model-runtime.ts:424 → `RuntimeCredentials.list()`, runtime-credentials.ts:29-36): the
+    /// `auth.json` entries **overlaid with the runtime `--api-key` providers**, each as
+    /// `{ providerId, type }` and never a secret.
+    ///
+    /// [`Self::list`] is the FILE tier alone (Pi's inner `AuthStorage.list`). This is the outer
+    /// tier: cyrup fuses Pi's `AuthStorage` and its `RuntimeCredentials` decorator into one
+    /// [`AuthStore`], so the decorator's overlay has to be applied here or it is applied nowhere —
+    /// which is what made a `--api-key`-supplied provider invisible to `/logout`, where Pi lists it
+    /// (`getLogoutProviderOptions` → `listCredentials()`, interactive-mode.ts:4890).
+    ///
+    /// Reads the file ONCE (`list()` + a `read()` per provider was N+1 reads of the same file) and
+    /// never resolves a `!command` / `$VAR` api-key value — Pi: "Implementations must not execute
+    /// configured API-key commands while listing" (`ai/src/auth/types.ts:69-70`).
+    pub fn list_credentials(&self) -> Result<Vec<CredentialInfo>, AuthError> {
+        let mut out: Vec<CredentialInfo> = self
+            .read_file()?
+            .into_iter()
+            .map(|(provider, cred)| CredentialInfo {
+                provider: ProviderId::from(provider.as_str()),
+                credential_type: match cred {
+                    Credential::ApiKey { .. } => CredentialType::ApiKey,
+                    Credential::Oauth { .. } => CredentialType::Oauth,
+                },
+            })
+            .collect();
+        // `for (const providerId of this.overrides.keys()) entries.set(providerId, {providerId,
+        // type: "api_key"})` — a runtime key REPLACES the stored entry's type, so `--api-key` on a
+        // provider whose stored credential is OAuth enumerates as `api_key`, exactly as upstream's
+        // `Map.set` overwrite does.
+        if let Ok(runtime) = self.runtime.read() {
+            for provider in runtime.keys() {
+                let id = ProviderId::from(provider.as_str());
+                match out.iter_mut().find(|e| e.provider == id) {
+                    Some(existing) => existing.credential_type = CredentialType::ApiKey,
+                    None => out.push(CredentialInfo {
+                        provider: id,
+                        credential_type: CredentialType::ApiKey,
+                    }),
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Serialized read-modify-write per provider — the ONLY write path. OAuth refresh MUST happen
