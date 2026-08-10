@@ -95,6 +95,40 @@ enum ScriptStep {
     /// stderr-into-error surfacing on a non-zero exit (pi `execution.ts:686`). stderr is not
     /// protocol data (R-SA-046), so this is diagnostic text a real child could equally emit.
     EmitStderr { line: String },
+    /// Write ONE line of `head` + `pad_bytes` `'x'` bytes + `tail` (plus a trailing `\n`) — the
+    /// only way to script a child whose single stdout line exceeds the parent's per-line cap
+    /// (`crate::exec::child_protocol::MAX_CHILD_PENDING_LINE_BYTES`, 16 MiB) without putting 16 MiB
+    /// of literal text in the script file. Written in chunks and flushed once, so the parent reads
+    /// it exactly as it would a real child's oversized record: many partial reads, no newline.
+    EmitPadded {
+        head: String,
+        pad_bytes: usize,
+        tail: String,
+    },
+    /// [`ScriptStep::EmitPadded`]'s STDERR twin: ONE stderr line of `head` + `pad_bytes` `'x'`
+    /// bytes + `tail` (plus a trailing `\n`), written in 64 KiB chunks.
+    ///
+    /// Two distinct parent-side behaviours need a child that writes MORE stderr than fits in the
+    /// OS pipe buffer (~64 KiB on Linux), and neither can be scripted with
+    /// [`ScriptStep::EmitStderr`] without embedding hundreds of kilobytes of literal text in the
+    /// script JSON:
+    ///
+    /// 1. **The pipe-buffer deadlock.** A child blocks in `write(2)` once the pipe is full, so a
+    ///    parent that does not drain stderr CONCURRENTLY with the run waits forever for an exit
+    ///    that can never happen. pi drains on every chunk (`execution.ts:1056-1059`:
+    ///    `proc.stderr.on("data", …)`), so its children never block.
+    /// 2. **The bounded TAIL.** pi retains the LAST `MAX_CHILD_STDERR_BYTES` of stderr
+    ///    (`createBoundedByteTail`, `child-protocol.ts:377-392`, fed raw chunks at
+    ///    `execution.ts:1057`), because a fatal error is at the END of a child's stderr. A
+    ///    distinctive `tail` here is what lets a test assert the tail survived rather than the head.
+    ///
+    /// The bytes are `'x'` (not newline-bearing) so the whole thing really is ONE line, exceeding
+    /// the parent's per-line stderr bound as well as the pipe buffer.
+    EmitStderrPadded {
+        head: String,
+        pad_bytes: usize,
+        tail: String,
+    },
     /// Sleep for `ms` milliseconds before continuing to the next step.
     SleepMs { ms: u64 },
     /// Play the role of a real child's `structured_output` TOOL CALL: write `value` verbatim, as
@@ -287,6 +321,44 @@ async fn main() {
             ScriptStep::EmitStderr { line } => {
                 let _ = writeln!(std::io::stderr(), "{line}");
                 let _ = std::io::stderr().flush();
+            }
+            ScriptStep::EmitPadded {
+                head,
+                pad_bytes,
+                tail,
+            } => {
+                let _ = out.write_all(head.as_bytes());
+                let chunk = vec![b'x'; 64 * 1024];
+                let mut written = 0usize;
+                while written < *pad_bytes {
+                    let take = chunk.len().min(*pad_bytes - written);
+                    let _ = out.write_all(chunk.get(..take).unwrap_or_default());
+                    written += take;
+                }
+                let _ = out.write_all(tail.as_bytes());
+                let _ = out.write_all(b"\n");
+                let _ = out.flush();
+            }
+            ScriptStep::EmitStderrPadded {
+                head,
+                pad_bytes,
+                tail,
+            } => {
+                // Unbuffered, straight at the fd: every `write_all` here is a real `write(2)` the
+                // OS can block, which is exactly the condition being scripted.
+                let stderr = std::io::stderr();
+                let mut err = stderr.lock();
+                let _ = err.write_all(head.as_bytes());
+                let chunk = vec![b'x'; 64 * 1024];
+                let mut written = 0usize;
+                while written < *pad_bytes {
+                    let take = chunk.len().min(*pad_bytes - written);
+                    let _ = err.write_all(chunk.get(..take).unwrap_or_default());
+                    written += take;
+                }
+                let _ = err.write_all(tail.as_bytes());
+                let _ = err.write_all(b"\n");
+                let _ = err.flush();
             }
             ScriptStep::SleepMs { ms } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;

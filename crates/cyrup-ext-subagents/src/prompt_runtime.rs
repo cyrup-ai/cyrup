@@ -26,6 +26,11 @@
 //! blob — validates on call, writes the capture file, and returns `terminate: true` to end the
 //! step. The parent then reads that file back.
 //!
+//! Nesting the schema under `value` moves it one JSON-Pointer level deeper, so
+//! [`create_structured_output_tool_parameters`] also repoints every wrapper-relative `$ref`
+//! (`#/$defs/X` -> `#/properties/value/$defs/X`) before advertising it. Validation still runs
+//! against the RAW schema, whose pointers resolve against the caller's own root.
+//!
 //! # Why a SEPARATE extension rather than a third `RegistrationMode`
 //!
 //! A plain (non-fanout) subagent child attaches no subagents extension at all —
@@ -718,6 +723,156 @@ fn strip_assistant_subagent_tool_calls(message: &AgentMessage) -> Option<AgentMe
     Some(AgentMessage::Assistant(assistant))
 }
 
+/// The JSON Pointer the caller's whole schema is relocated to once nested under the wrapper's
+/// `value` property (pi `createStructuredOutputToolParameters`, `structured-output.ts:65`).
+const STRUCTURED_OUTPUT_VALUE_POINTER: &str = "#/properties/value";
+
+/// Keywords whose value is a MAP of name → subschema (pi `SCHEMA_MAP_KEYWORDS`,
+/// `structured-output.ts:19`).
+const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+];
+
+/// Keywords whose value is a SINGLE subschema (pi `SCHEMA_SINGLE_KEYWORDS`, `:20`).
+const SCHEMA_SINGLE_KEYWORDS: &[&str] = &[
+    "additionalItems",
+    "additionalProperties",
+    "contains",
+    "not",
+    "propertyNames",
+    "if",
+    "then",
+    "else",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "contentSchema",
+];
+
+/// Keywords whose value is an ARRAY of subschemas (pi `SCHEMA_ARRAY_KEYWORDS`, `:21`).
+const SCHEMA_ARRAY_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+
+/// pi `rewriteLocalJsonPointerRefs` (`structured-output.ts:23-60`).
+///
+/// Nesting the caller's `outputSchema` under the tool parameters' `value` property MOVES every
+/// node in it one resource-relative level deeper, which silently invalidates every local JSON
+/// Pointer inside it: a schema that says `{"$defs":{"Node":…},"$ref":"#/$defs/Node"}` becomes a
+/// tool schema whose `#/$defs/Node` resolves against the WRAPPER — where no `$defs` exists. The
+/// model is then handed a schema it cannot satisfy (and a strict validator rejects the whole tool
+/// definition). Rewriting `#` → `#/properties/value` and `#/x` → `#/properties/value/x` restores
+/// every pointer.
+///
+/// `inherits_wrapper_resource` implements pi's `sharesWrapperResource` guard: a subschema that
+/// declares its own `$id` starts a NEW JSON Schema resource, so its `#`-relative pointers resolve
+/// against itself, not the wrapper — neither it nor anything beneath it is rewritten.
+fn rewrite_local_json_pointer_refs(
+    schema: &serde_json::Value,
+    pointer_prefix: &str,
+    inherits_wrapper_resource: bool,
+) -> serde_json::Value {
+    // pi `:24`: booleans, `null`, scalars and arrays pass through untouched.
+    let serde_json::Value::Object(source) = schema else {
+        return schema.clone();
+    };
+    let mut rewritten = source.clone();
+    let shares_wrapper_resource =
+        inherits_wrapper_resource && !source.get("$id").is_some_and(serde_json::Value::is_string);
+
+    if shares_wrapper_resource {
+        for keyword in ["$ref", "$dynamicRef", "$recursiveRef"] {
+            let Some(serde_json::Value::String(reference)) = source.get(keyword) else {
+                continue;
+            };
+            if reference == "#" {
+                rewritten.insert(keyword.to_string(), pointer_prefix.into());
+            } else if let Some(rest) = reference.strip_prefix('#')
+                && rest.starts_with('/')
+            {
+                rewritten.insert(keyword.to_string(), format!("{pointer_prefix}{rest}").into());
+            }
+        }
+    }
+
+    let recurse = |nested: &serde_json::Value| {
+        rewrite_local_json_pointer_refs(nested, pointer_prefix, shares_wrapper_resource)
+    };
+
+    for keyword in SCHEMA_MAP_KEYWORDS {
+        let Some(serde_json::Value::Object(entries)) = source.get(*keyword) else {
+            continue;
+        };
+        let mapped: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(name, nested)| (name.clone(), recurse(nested)))
+            .collect();
+        rewritten.insert((*keyword).to_string(), serde_json::Value::Object(mapped));
+    }
+
+    // `items` is either a tuple (draft-07 array form) or a single subschema (pi `:43-45`).
+    match source.get("items") {
+        Some(serde_json::Value::Array(items)) => {
+            rewritten.insert(
+                "items".to_string(),
+                serde_json::Value::Array(items.iter().map(&recurse).collect()),
+            );
+        }
+        Some(single) => {
+            rewritten.insert("items".to_string(), recurse(single));
+        }
+        None => {}
+    }
+
+    for keyword in SCHEMA_SINGLE_KEYWORDS {
+        if let Some(nested) = source.get(*keyword) {
+            rewritten.insert((*keyword).to_string(), recurse(nested));
+        }
+    }
+
+    for keyword in SCHEMA_ARRAY_KEYWORDS {
+        if let Some(serde_json::Value::Array(items)) = source.get(*keyword) {
+            rewritten.insert(
+                (*keyword).to_string(),
+                serde_json::Value::Array(items.iter().map(&recurse).collect()),
+            );
+        }
+    }
+
+    // Draft-07 `dependencies` is a union: a property-name ARRAY is data, not a schema (pi `:52-58`).
+    if let Some(serde_json::Value::Object(dependencies)) = source.get("dependencies") {
+        let mapped: serde_json::Map<String, serde_json::Value> = dependencies
+            .iter()
+            .map(|(name, nested)| {
+                let value = if nested.is_array() {
+                    nested.clone()
+                } else {
+                    recurse(nested)
+                };
+                (name.clone(), value)
+            })
+            .collect();
+        rewritten.insert("dependencies".to_string(), serde_json::Value::Object(mapped));
+    }
+
+    serde_json::Value::Object(rewritten)
+}
+
+/// pi `createStructuredOutputToolParameters` (`structured-output.ts:62-69`): the caller's schema
+/// nested under `value`, with every wrapper-relative JSON Pointer inside it rewritten.
+#[must_use]
+pub fn create_structured_output_tool_parameters(schema: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "value": rewrite_local_json_pointer_refs(schema, STRUCTURED_OUTPUT_VALUE_POINTER, true),
+        },
+        "required": ["value"],
+        "additionalProperties": false,
+    })
+}
+
 /// The child-side `structured_output` tool (pi `subagent-prompt-runtime.ts:288-313`).
 pub struct StructuredOutputTool {
     /// The caller's declared JSON Schema, used to validate the submitted value.
@@ -725,7 +880,10 @@ pub struct StructuredOutputTool {
     /// `{ type: "object", properties: { value: <schema> }, required: ["value"],
     /// additionalProperties: false }` — pi builds the tool's parameters by NESTING the caller's
     /// schema under `value` rather than exposing it at the top level, so the model is constrained
-    /// by the real schema instead of handed a freeform object.
+    /// by the real schema instead of handed a freeform object. Built via
+    /// [`create_structured_output_tool_parameters`], which also repoints the caller's local
+    /// `$ref`s at their new depth; `schema` above stays the RAW schema, since validation of a
+    /// submitted value resolves pointers against the caller's own root.
     parameters: serde_json::Value,
     /// Where the validated value is written for the parent to read back.
     output_path: PathBuf,
@@ -735,12 +893,7 @@ impl StructuredOutputTool {
     /// Build the tool for `schema`, capturing to `output_path`.
     #[must_use]
     pub fn new(schema: serde_json::Value, output_path: PathBuf) -> Self {
-        let parameters = serde_json::json!({
-            "type": "object",
-            "properties": { "value": schema },
-            "required": ["value"],
-            "additionalProperties": false,
-        });
+        let parameters = create_structured_output_tool_parameters(&schema);
         Self {
             schema,
             parameters,
@@ -1471,6 +1624,237 @@ mod tests {
         assert_eq!(params["properties"]["value"], schema);
         assert_eq!(params["required"], serde_json::json!(["value"]));
         assert_eq!(params["additionalProperties"], serde_json::json!(false));
+    }
+
+    // ---- G81: `$ref` rewrite (pi `rewriteLocalJsonPointerRefs`, structured-output.ts:23-69) ----
+
+    /// A recursive `$defs` schema is the shape that breaks: nesting it under `value` moves every
+    /// definition one level deeper, so `#/$defs/Node` and `#` both stop resolving. Both forms must
+    /// be repointed at the wrapper-relative location.
+    #[test]
+    fn local_json_pointer_refs_are_repointed_under_the_value_wrapper() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "root": { "$ref": "#/$defs/Node" } },
+            "required": ["root"],
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "children": { "type": "array", "items": { "$ref": "#/$defs/Node" } },
+                        "whole": { "$ref": "#" },
+                    },
+                },
+            },
+        });
+        let t = tool(schema, PathBuf::from("/tmp/unused.json"));
+        let value = &t.parameters()["properties"]["value"];
+
+        assert_eq!(
+            value["properties"]["root"]["$ref"],
+            serde_json::json!("#/properties/value/$defs/Node"),
+            "a `#/`-rooted pointer gains the wrapper prefix"
+        );
+        assert_eq!(
+            value["$defs"]["Node"]["properties"]["children"]["items"]["$ref"],
+            serde_json::json!("#/properties/value/$defs/Node"),
+            "the walk descends through `$defs` and single-schema `items`"
+        );
+        assert_eq!(
+            value["$defs"]["Node"]["properties"]["whole"]["$ref"],
+            serde_json::json!("#/properties/value"),
+            "the whole-document pointer `#` becomes the wrapper pointer itself"
+        );
+    }
+
+    /// Every keyword family pi walks (`SCHEMA_ARRAY_KEYWORDS`, `SCHEMA_SINGLE_KEYWORDS`, the
+    /// tuple form of `items`, and the draft-07 `dependencies` union) must be descended into — and
+    /// a `dependencies` ARRAY value is a property-name list, not a schema, so it stays verbatim.
+    #[test]
+    fn every_schema_keyword_family_is_walked() {
+        let schema = serde_json::json!({
+            "anyOf": [{ "$ref": "#/$defs/A" }],
+            "items": [{ "$ref": "#/$defs/A" }, { "$ref": "#" }],
+            "additionalProperties": { "$ref": "#/$defs/A" },
+            "not": { "$ref": "#/$defs/A" },
+            "dependencies": {
+                "names": ["alpha", "beta"],
+                "shape": { "$ref": "#/$defs/A" },
+            },
+            "$defs": { "A": { "type": "string" } },
+        });
+        let t = tool(schema, PathBuf::from("/tmp/unused.json"));
+        let value = &t.parameters()["properties"]["value"];
+
+        let expected = serde_json::json!("#/properties/value/$defs/A");
+        assert_eq!(value["anyOf"][0]["$ref"], expected);
+        assert_eq!(value["items"][0]["$ref"], expected);
+        assert_eq!(value["items"][1]["$ref"], serde_json::json!("#/properties/value"));
+        assert_eq!(value["additionalProperties"]["$ref"], expected);
+        assert_eq!(value["not"]["$ref"], expected);
+        assert_eq!(value["dependencies"]["shape"]["$ref"], expected);
+        assert_eq!(
+            value["dependencies"]["names"],
+            serde_json::json!(["alpha", "beta"]),
+            "a `dependencies` array is a property-name list, never a subschema"
+        );
+    }
+
+    /// ALL THREE pointer-bearing keywords are rewritten, not just `$ref` (pi
+    /// `structured-output.ts:29`: `for (const keyword of ["$ref", "$dynamicRef", "$recursiveRef"])`).
+    ///
+    /// `$dynamicRef` (2020-12) and `$recursiveRef` (2019-09) are the recursive-schema keywords, and
+    /// they carry exactly the same `#`-relative pointers as `$ref` — so nesting the caller's schema
+    /// under `value` invalidates them in exactly the same way. A schema using either one is a
+    /// recursive schema by construction, which is precisely the case that breaks loudest: the
+    /// pointer resolves against the wrapper, finds no `$defs`, and the whole tool definition is
+    /// rejected by a strict validator.
+    ///
+    /// Both `#`-relative FORMS are asserted per keyword — the bare whole-document `#` and the
+    /// `#/`-rooted path — because the two are separate branches of the rewrite.
+    #[test]
+    fn dynamic_and_recursive_refs_are_repointed_exactly_like_plain_refs() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "viaRef":          { "$ref": "#/$defs/Node" },
+                "viaDynamic":      { "$dynamicRef": "#/$defs/Node" },
+                "viaRecursive":    { "$recursiveRef": "#/$defs/Node" },
+                "wholeDynamic":    { "$dynamicRef": "#" },
+                "wholeRecursive":  { "$recursiveRef": "#" },
+            },
+            "$defs": { "Node": { "type": "object", "$dynamicAnchor": "node" } },
+        });
+        let t = tool(schema, PathBuf::from("/tmp/unused.json"));
+        let value = &t.parameters()["properties"]["value"];
+
+        let rooted = serde_json::json!("#/properties/value/$defs/Node");
+        assert_eq!(
+            value["properties"]["viaRef"]["$ref"], rooted,
+            "`$ref` is the keyword already covered — it anchors the comparison"
+        );
+        assert_eq!(
+            value["properties"]["viaDynamic"]["$dynamicRef"], rooted,
+            "`$dynamicRef` carries the same `#/`-rooted pointer and must gain the same prefix"
+        );
+        assert_eq!(
+            value["properties"]["viaRecursive"]["$recursiveRef"], rooted,
+            "`$recursiveRef` likewise"
+        );
+
+        let whole = serde_json::json!("#/properties/value");
+        assert_eq!(
+            value["properties"]["wholeDynamic"]["$dynamicRef"], whole,
+            "the bare whole-document form is a separate branch, and applies to `$dynamicRef` too"
+        );
+        assert_eq!(
+            value["properties"]["wholeRecursive"]["$recursiveRef"], whole,
+            "and to `$recursiveRef`"
+        );
+    }
+
+    /// The `$id` resource guard applies to all three keywords too — a `$dynamicRef` beneath an
+    /// `$id`-bearing subschema resolves against THAT resource, so rewriting it would break a schema
+    /// that was already correct. This is the mirror of the rewrite above: proving `$dynamicRef` is
+    /// rewritten is only half the behaviour if it is rewritten unconditionally.
+    #[test]
+    fn dynamic_and_recursive_refs_under_their_own_id_are_left_alone() {
+        let schema = serde_json::json!({
+            "properties": {
+                "embedded": {
+                    "$id": "https://example.test/inner.json",
+                    "$dynamicRef": "#/$defs/B",
+                    "properties": { "deep": { "$recursiveRef": "#" } },
+                    "$defs": { "B": { "type": "number" } },
+                },
+            },
+        });
+        let t = tool(schema, PathBuf::from("/tmp/unused.json"));
+        let value = &t.parameters()["properties"]["value"];
+
+        assert_eq!(
+            value["properties"]["embedded"]["$dynamicRef"],
+            serde_json::json!("#/$defs/B"),
+            "the `$id`-bearing node keeps its own resource-relative `$dynamicRef`"
+        );
+        assert_eq!(
+            value["properties"]["embedded"]["properties"]["deep"]["$recursiveRef"],
+            serde_json::json!("#"),
+            "and its descendants keep theirs"
+        );
+    }
+
+    /// pi's `sharesWrapperResource` guard: a subschema with its own `$id` is a NEW schema
+    /// resource, so its `#`-relative pointers already resolve against itself — rewriting them
+    /// would break a schema that was correct.
+    #[test]
+    fn a_subschema_with_its_own_id_and_its_descendants_are_left_alone() {
+        let schema = serde_json::json!({
+            "properties": {
+                "outer": { "$ref": "#/$defs/A" },
+                "embedded": {
+                    "$id": "https://example.test/inner.json",
+                    "$ref": "#/$defs/B",
+                    "properties": { "deep": { "$ref": "#/$defs/B" } },
+                    "$defs": { "B": { "type": "number" } },
+                },
+            },
+            "$defs": { "A": { "type": "string" } },
+        });
+        let t = tool(schema, PathBuf::from("/tmp/unused.json"));
+        let value = &t.parameters()["properties"]["value"];
+
+        assert_eq!(
+            value["properties"]["outer"]["$ref"],
+            serde_json::json!("#/properties/value/$defs/A"),
+            "the wrapper resource is still rewritten"
+        );
+        assert_eq!(
+            value["properties"]["embedded"]["$ref"],
+            serde_json::json!("#/$defs/B"),
+            "the `$id`-bearing node keeps its own resource-relative pointer"
+        );
+        assert_eq!(
+            value["properties"]["embedded"]["properties"]["deep"]["$ref"],
+            serde_json::json!("#/$defs/B"),
+            "and so does everything beneath it"
+        );
+    }
+
+    /// The rewrite is for the ADVERTISED parameters only. Validation of a submitted value runs
+    /// against the caller's RAW schema, whose pointers resolve against its own root — so a
+    /// `$ref`-bearing schema still accepts a conforming value and still rejects a bad one.
+    #[tokio::test]
+    async fn validation_still_uses_the_unrewritten_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("output.json");
+        let t = tool(
+            serde_json::json!({
+                "type": "object",
+                "properties": { "node": { "$ref": "#/$defs/Node" } },
+                "required": ["node"],
+                "$defs": {
+                    "Node": {
+                        "type": "object",
+                        "properties": { "label": { "type": "string" } },
+                        "required": ["label"],
+                    },
+                },
+            }),
+            out.clone(),
+        );
+
+        let ok = t
+            .execute(
+                ToolCallId::from("call-ref-ok"),
+                serde_json::json!({ "value": { "node": { "label": "leaf" } } }),
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
+            .await
+            .expect("a value conforming to the `$ref`-ed definition is captured");
+        assert!(ok.terminate);
+        assert!(out.exists(), "the captured value is written for the parent");
     }
 
     #[tokio::test]

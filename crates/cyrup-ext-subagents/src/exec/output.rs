@@ -1395,6 +1395,36 @@ mod tests {
         );
     }
 
+    /// The joint the `TOOL_FAILURE_PREFIX` guard exists for, asserted across the two modules that
+    /// form it: this module MINTS the `<tool> failed …` message that `exec::fallback` then
+    /// classifies. `FATAL_BASH_PATTERNS` above and `RETRYABLE_MODEL_FAILURE_PATTERNS` share
+    /// `"connection refused"` and `"timeout"` verbatim, so without the guard a failed tool whose
+    /// own output mentions either would re-run the child's WHOLE task on the next model.
+    #[test]
+    fn a_re_diagnosed_tool_failure_is_never_classified_as_a_retryable_model_failure() {
+        for (tool, text) in [
+            ("bash", "curl: (7) Failed to connect to api.test: Connection refused"),
+            ("bash", "timeout: sending signal TERM to command, exit 124"),
+            ("mcp.server/write", "quota exceeded, exit code: 3"),
+        ] {
+            let events = vec![tool_result_end(tool, text, true)];
+            let detected = detect_subagent_error(&events).expect("must diagnose a failure");
+            let message = detected.message();
+
+            // Half one: the DETAILS this module put in the message do match the retryable set —
+            // that is what made the misclassification possible in the first place.
+            assert!(
+                crate::exec::fallback::is_retryable_model_failure(Some(text)),
+                "sanity check: the tool's own output text matches a retryable pattern — {text}"
+            );
+            // Half two: the assembled `<tool> failed …` message does NOT.
+            assert!(
+                !crate::exec::fallback::is_retryable_model_failure(Some(&message)),
+                "a failed TOOL must not spend another model attempt — {message}"
+            );
+        }
+    }
+
     #[test]
     fn detect_subagent_error_flags_an_explicit_is_error_tool_result() {
         let events = vec![tool_result_end("read", "EISDIR: illegal operation", true)];

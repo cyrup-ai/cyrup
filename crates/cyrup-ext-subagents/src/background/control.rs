@@ -606,9 +606,26 @@ pub struct SteerRequest {
     pub kind: String,
     /// Unique request id. Also the dedup key and (base64url-encoded) half of the file name, so two
     /// requests written in the same millisecond cannot collide.
+    ///
+    /// For requests this crate MINTS (see [`request_async_steer`]) it is
+    /// `<16-hex monotonic sequence>-<uuid>`, which makes it the TIEBREAK that orders same-millisecond
+    /// guidance — see [`ts`](Self::ts). Ids that arrive from elsewhere are accepted verbatim; the
+    /// only requirements are uniqueness and non-emptiness.
     pub id: String,
     /// Wall-clock creation time (epoch milliseconds). The primary sort key on consumption, so
     /// guidance is delivered in the order the parent produced it.
+    ///
+    /// It is not a SUFFICIENT sort key. A millisecond is an eternity next to two `request_async_steer`
+    /// calls in a loop, so same-`ts` requests are routine rather than exotic, and the tiebreak
+    /// decides what the user actually sees. pi ties on `base64url(randomUUID())`
+    /// (`consumeSteerRequestsFromDir` sorts file names, `control-channel.ts:437`; the name is
+    /// `steerRequestFileName`, `:85-87`) — i.e. two corrections typed in quick succession reach the
+    /// child in RANDOM order, and the second can be overridden by the first. cyrup keeps `ts` as the
+    /// primary key, exactly as upstream, and makes the tiebreak deterministic by minting a
+    /// monotonic sequence into [`id`](Self::id).
+    ///
+    /// [CYRUP-DELTA: ordering only. The key, the file name and the wire shape are pi's; only the
+    /// id's internal FORM changes, which upstream treats as an opaque unique string.]
     pub ts: i64,
     /// The guidance itself, already trimmed and known non-empty.
     pub message: String,
@@ -663,6 +680,27 @@ pub async fn write_steer_request_to_dir(
     Ok(path)
 }
 
+/// Mint the next steer-request id: `<16-hex monotonic sequence>-<uuid>`.
+///
+/// Both halves are load-bearing and neither replaces the other:
+///
+/// - the **sequence** is what makes ordering deterministic. It is the tiebreak
+///   [`consume_steer_requests_from_dir`] falls back on when two requests share a `ts`, which is the
+///   common case rather than the rare one — see [`SteerRequest::ts`]. Zero-padded to 16 hex digits
+///   so a plain lexicographic comparison IS a numeric one (it cannot overflow in practice: at one
+///   steer per nanosecond it would take ~584 years).
+/// - the **uuid** is what keeps ids unique across PROCESSES. The counter is per-process, so two
+///   parents steering the same run would otherwise mint colliding ids and one request would
+///   overwrite the other's file.
+///
+/// `Relaxed` is sufficient: the only requirement is that each caller gets a distinct, increasing
+/// value, which `fetch_add` guarantees on its own — no other memory is being published through it.
+fn next_steer_request_id() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{seq:016x}-{}", uuid::Uuid::new_v4().as_simple())
+}
+
 /// Parent side: pi `requestAsyncSteer` (`control-channel.ts:121-140`) — validate, stamp, and drop
 /// one steering request into `run_dir`'s steer queue.
 ///
@@ -684,7 +722,7 @@ pub async fn request_async_steer(
     // `Option<usize>`, so that guard has no surviving branch here.
     let request = SteerRequest {
         kind: "steer".to_string(),
-        id: uuid::Uuid::new_v4().as_simple().to_string(),
+        id: next_steer_request_id(),
         ts: now_epoch_millis(),
         message: message.to_string(),
         target_index,
@@ -1871,6 +1909,88 @@ mod tests {
     use super::*;
     use crate::spawn::chain_graph::SingleStepSpec;
     use std::sync::Arc;
+
+    // ---- steer queue ordering ----
+
+    /// Steer messages must be delivered in the order the parent produced them, even when several
+    /// are queued inside the same millisecond — which is the NORMAL case for two calls in a loop,
+    /// not an exotic one.
+    ///
+    /// Before the monotonic sequence in [`next_steer_request_id`], same-`ts` requests tied on a
+    /// random UUID, so the consumer's order was a coin flip: a user sending two corrections in
+    /// quick succession could have the second applied before the first. It also made
+    /// `tests/steer_delivery_integration.rs` fail about one run in four, which is the more
+    /// expensive symptom — an intermittently red suite makes every future green meaningless.
+    ///
+    /// Twenty requests in a tight loop makes a random tiebreak essentially impossible to pass
+    /// (20! orderings), so this does not rely on getting unlucky to detect a regression.
+    #[tokio::test]
+    async fn steer_requests_queued_in_the_same_millisecond_are_consumed_in_creation_order() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).expect("mkdir run dir");
+
+        let expected: Vec<String> = (0..20).map(|i| format!("guidance-{i:02}")).collect();
+        for message in &expected {
+            request_async_steer(&run_dir, message, None, Some("steer-action"))
+                .await
+                .expect("queued");
+        }
+
+        let drained = consume_steer_requests(&run_dir).await;
+        let delivered: Vec<String> = drained.into_iter().map(|r| r.message).collect();
+        assert_eq!(
+            delivered, expected,
+            "guidance must be delivered in the order it was produced; a `ts`-only sort leaves \
+             same-millisecond requests in random order"
+        );
+    }
+
+    /// The sequence is only the TIEBREAK — `ts` still dominates, exactly as upstream sorts
+    /// (`consumeSteerRequestsFromDir`, `control-channel.ts:437`, over a `ts`-prefixed file name).
+    /// A request with an older `ts` sorts first even when its id was minted later, which is what
+    /// keeps ordering correct across processes, where the per-process counter means nothing.
+    #[tokio::test]
+    async fn an_older_timestamp_still_wins_over_a_later_minted_sequence() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let run_dir = dir.path().join("run");
+        let queue = steer_requests_dir(&run_dir);
+
+        // Minted in ascending-sequence order, written with DESCENDING timestamps.
+        let first_id = next_steer_request_id();
+        let second_id = next_steer_request_id();
+        assert!(first_id < second_id, "the sequence must be ascending");
+
+        for (id, ts, message) in [
+            (first_id, 2_000_i64, "newer-ts-earlier-seq"),
+            (second_id, 1_000_i64, "older-ts-later-seq"),
+        ] {
+            write_steer_request_to_dir(
+                &queue,
+                &SteerRequest {
+                    kind: "steer".to_string(),
+                    id,
+                    ts,
+                    message: message.to_string(),
+                    target_index: None,
+                    source: None,
+                },
+            )
+            .await
+            .expect("written");
+        }
+
+        let delivered: Vec<String> = consume_steer_requests(&run_dir)
+            .await
+            .into_iter()
+            .map(|r| r.message)
+            .collect();
+        assert_eq!(
+            delivered,
+            vec!["older-ts-later-seq".to_string(), "newer-ts-earlier-seq".to_string()],
+            "`ts` is the primary key; the sequence only breaks ties within one millisecond"
+        );
+    }
 
     fn temp_roots() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().expect("real tempdir");

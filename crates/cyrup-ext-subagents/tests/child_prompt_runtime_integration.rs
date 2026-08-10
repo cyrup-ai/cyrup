@@ -348,3 +348,94 @@ fn the_runtime_the_binary_loads_is_the_one_under_test() {
         Some("subagent-prompt-runtime".to_string())
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// G81: the advertised `structured_output` parameters, through the real host registry
+// -------------------------------------------------------------------------------------------
+
+/// The whole user path for a `$ref`-bearing `outputSchema`, end to end on the CHILD side:
+///
+/// 1. the parent writes the caller's raw schema to a temp file and points the child at it with
+///    `CYRUP_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA` (`exec::structured::create_structured_output_runtime`);
+/// 2. the child builds the prompt runtime from that env (`crates/cyrup/src/main.rs:489`);
+/// 3. the runtime registers `structured_output` with the host;
+/// 4. the host hands the tool's `parameters` to the provider as the model-facing schema.
+///
+/// Step 4 is where an unrewritten `#/$defs/...` becomes unsatisfiable: nesting the caller's schema
+/// under `value` moved every definition a level deeper, so the pointer resolves against the
+/// wrapper, which has no `$defs`. This asserts the registered tool's ADVERTISED parameters, not a
+/// pure function's return value.
+#[tokio::test]
+async fn the_registered_structured_output_tool_advertises_rewritten_local_refs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let schema_path = dir.path().join("schema.json");
+    let output_path = dir.path().join("output.json");
+    std::fs::write(
+        &schema_path,
+        serde_json::json!({
+            "type": "object",
+            "properties": { "root": { "$ref": "#/$defs/Finding" } },
+            "required": ["root"],
+            "$defs": {
+                "Finding": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string" },
+                        "related": { "type": "array", "items": { "$ref": "#/$defs/Finding" } },
+                    },
+                    "required": ["summary"],
+                },
+            },
+        })
+        .to_string(),
+    )
+    .expect("write schema file");
+
+    let schema_env = schema_path.display().to_string();
+    let capture_env = output_path.display().to_string();
+    let ext = prompt_runtime_extension_from(&move |key: &str| match key {
+        k if k == cyrup_ext_subagents::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV => {
+            Some(schema_env.clone())
+        }
+        k if k == cyrup_ext_subagents::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV => {
+            Some(capture_env.clone())
+        }
+        _ => None,
+    })
+    .expect("both structured vars build the runtime");
+
+    let host = ExtensionHost::new(cfg());
+    host.load_native(ext).await.expect("load_native");
+
+    let tool = host
+        .registry()
+        .tool("structured_output")
+        .expect("registry read")
+        .expect("the structured_output tool must be registered with the host");
+    let params = tool.parameters();
+
+    assert_eq!(
+        params["properties"]["value"]["properties"]["root"]["$ref"],
+        serde_json::json!("#/properties/value/$defs/Finding"),
+        "the model-facing schema must point at the definitions' real location"
+    );
+    assert_eq!(
+        params["properties"]["value"]["$defs"]["Finding"]["properties"]["related"]["items"]["$ref"],
+        serde_json::json!("#/properties/value/$defs/Finding"),
+        "including the recursive pointer inside the definition itself"
+    );
+
+    // And the tool still VALIDATES against the caller's own root, so a conforming value is
+    // captured for the parent to read back.
+    let result = tool
+        .execute(
+            ToolCallId::from("call-ref"),
+            serde_json::json!({ "value": { "root": { "summary": "ok" } } }),
+            CancelToken::new(),
+            Box::new(|_| {}),
+        )
+        .await
+        .expect("a conforming value is captured");
+    assert!(result.terminate);
+    assert!(output_path.exists());
+}

@@ -514,6 +514,21 @@ impl LiveProgressFold {
             .unwrap_or(0)
     }
 
+    /// Fold one PARENT-side attempt note (a model-fallback or startup-retry note) into this run's
+    /// `recent_output` ring.
+    ///
+    /// pi seeds each attempt's `progress.recentOutput` from the accumulated `attemptNotes` when the
+    /// attempt is constructed (`runs/foreground/execution.ts:432`) and streams that object live, so
+    /// the note explaining a relaunch is visible for the whole relaunched attempt. This fold is
+    /// driven by the child's NDJSON instead, and a parent-side note never appears there — so the
+    /// executor hands it over directly (see [`crate::exec::LiveEventSink::emit_note`]).
+    ///
+    /// Deliberately touches ONLY `recent_output`: a note is not a turn, a tool call or a token, and
+    /// folding it as one would corrupt every counter on the surface it is meant to explain.
+    pub fn record_attempt_note(&mut self, note: &str) {
+        self.push_output(note);
+    }
+
     /// Append the non-empty lines of `text` to the bounded `recent_output` ring, evicting oldest
     /// first past [`RECENT_OUTPUT_CAP`] (pi `appendRecentOutput`,
     /// `runs/foreground/execution.ts:115-120`).

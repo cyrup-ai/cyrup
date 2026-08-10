@@ -51,6 +51,24 @@ use crate::exec::model_scope::{
 // R-SA-041: the inherit sentinel
 // -------------------------------------------------------------------------------------------
 
+/// pi's `INHERIT_MODEL` sentinel (`runs/shared/model-fallback.ts:22`). A requested model set to
+/// the literal string `"inherit"` — like an empty/whitespace-only one, and like pi's `false` —
+/// means "no model was requested", NOT "run a model literally named `inherit`". It is never a real
+/// model id and must never reach `--model` on a child's argv.
+///
+/// Canonically owned here, next to [`resolve_model_inheritance`] (the launch-path resolver);
+/// `extension.rs`'s `models` report formatter imports it rather than re-declaring the literal.
+pub const INHERIT_MODEL_SENTINEL: &str = "inherit";
+
+/// pi's `const explicit = trimmed && trimmed !== INHERIT_MODEL ? trimmed : undefined`
+/// (`model-fallback.ts:203-204`): the requested model as a REAL model id, or `None` when the
+/// request is absent, blank, or the [`INHERIT_MODEL_SENTINEL`].
+fn real_requested_model(requested: Option<&ModelId>) -> Option<&ModelId> {
+    let requested = requested?;
+    let trimmed = requested.as_str().trim();
+    (!trimmed.is_empty() && trimmed != INHERIT_MODEL_SENTINEL).then_some(requested)
+}
+
 /// Distinguishes "the caller didn't specify a model override" from "explicitly use this model"
 /// (R-SA-041). Deliberately NOT `Option<ModelId>`: an `Option`-shaped API invites a caller to
 /// silently fall through to a global cross-session default model config when no override and no
@@ -189,11 +207,23 @@ pub fn build_model_candidates_scoped(
 /// (`pi-subagents/src/runs/shared/model-fallback.ts:47-59`), where `requestedModel = task.model ??
 /// agentConfig.model` and `parentModel = ctx.model`.
 ///
+/// As of pi v0.43.0 this is the TWO-STAGE `resolveEffectiveSubagentModel`
+/// (`model-fallback.ts:222-245`), not the single-shot `resolveSubagentModelOverride` it wraps.
+/// Stage 1 resolves `explicitModel ?? agentModel`; when that yields nothing *and* an explicit
+/// per-call model was supplied, stage 2 re-resolves the agent's own model alone. The case that
+/// makes the second stage load-bearing: a caller that passes the `"inherit"` sentinel (or a blank
+/// `model`) in a headless session with no live parent model. Stage 1 reduces the request to "the
+/// parent model", finds none, and returns nothing — without stage 2 the agent's own `model:` is
+/// silently shadowed by the caller's non-request and the ladder falls through to the fallback
+/// list (or hard-fails empty).
+///
 /// Precedence, highest first (matching pi's `explicit ?? parentModel` branch, `model-fallback.ts:52-58`):
 ///
 /// 1. `per_call_override` — an explicit per-call (`/run [model=…]`, tool `model`, single-run
-///    `model_override`) or per-step (chain step `model`) override. Returned as
-///    [`ModelOverride::Explicit`] so it is candidate #0.
+///    `model_override`) or per-step (chain step `model`) override, **when it names a real model**.
+///    Returned as [`ModelOverride::Explicit`] so it is candidate #0. A blank or
+///    [`INHERIT_MODEL_SENTINEL`] value is a request to inherit, never a model id: it skips to
+///    branch 3 and then to the stage-2 retry against branch 2.
 /// 2. `persona_model` — the resolved persona's own `model` (frontmatter / settings). Returned as
 ///    [`ModelOverride::Inherit`] so [`build_model_candidates`] places the persona's already-present
 ///    primary model first, exactly as before this seam existed (no behavior change for a persona
@@ -247,29 +277,50 @@ pub fn resolve_model_inheritance(
     available_models: &mut Vec<ModelId>,
     scope: Option<&ModelScopeConfig>,
 ) -> Result<ModelOverride, ModelScopeViolation> {
-    match (per_call_override, persona_model) {
-        (Some(explicit), _) => {
-            if let Some(violation) =
-                check_model_scope(Some(explicit.as_str()), scope, ModelSource::Explicit)
-            {
+    // A blank or `"inherit"` model id is a REQUEST, not a candidate. Purge it from the allowlist
+    // before anything else: `build_model_candidates` re-derives the ladder from
+    // `agent_primary_model`/`agent_fallback_models` independently of this function's return value,
+    // so a persona whose frontmatter says `model: inherit` would otherwise still be filtered *in*
+    // as candidate #0 and spawn a child with `--model inherit`.
+    available_models.retain(|model| real_requested_model(Some(model)).is_some());
+
+    let explicit_present = per_call_override.is_some();
+
+    // --- Stage 1 (pi `resolveEffectiveSubagentModel`, `model-fallback.ts:230-236`) ---
+    //
+    // The request is `explicitModel ?? agentModel` — JS nullish coalescing over PRESENCE, so a
+    // present-but-sentinel per-call `model` does NOT fall through to the persona's model here; it
+    // falls through to the parent session model, which is exactly what "inherit" asks for.
+    let stage1_request = per_call_override.or(persona_model);
+    match real_requested_model(stage1_request) {
+        Some(requested) => {
+            // pi `:212`: the source is the caller's only when the request itself was a real,
+            // explicit model — an explicit request that reduced to the parent model is always
+            // `"inherited"` (handled in the `None` arm below).
+            let source = if explicit_present {
+                ModelSource::Explicit
+            } else {
+                ModelSource::Inherited
+            };
+            if let Some(violation) = check_model_scope(Some(requested.as_str()), scope, source) {
                 // Fail closed: an explicitly requested out-of-scope model refuses the run.
                 if violation.severity == ModelScopeSeverity::Error {
                     return Err(violation);
                 }
                 warn_violation(&violation);
             }
-            Ok(ModelOverride::Explicit(explicit.clone()))
-        }
-        (None, Some(persona)) => {
-            if let Some(violation) =
-                check_model_scope(Some(persona.as_str()), scope, ModelSource::Inherited)
-            {
-                warn_violation(&violation);
+            if explicit_present {
+                return Ok(ModelOverride::Explicit(requested.clone()));
             }
-            Ok(ModelOverride::Inherit)
+            // The request WAS the persona's own model: keep returning `Inherit` so
+            // `build_model_candidates` seats it via `agent_primary_model`, byte-identically to
+            // before this two-stage shape existed.
+            return Ok(ModelOverride::Inherit);
         }
-        (None, None) => match inherited_session_model {
-            Some(inherited) => {
+        None => {
+            // Absent / blank / `"inherit"`: pi resolves to `${parentModel.provider}/${id}`
+            // (`model-fallback.ts:207`), always at `ModelSource::Inherited` (`:212`).
+            if let Some(inherited) = inherited_session_model {
                 if let Some(violation) =
                     check_model_scope(Some(inherited.as_str()), scope, ModelSource::Inherited)
                 {
@@ -278,11 +329,31 @@ pub fn resolve_model_inheritance(
                 if !available_models.contains(inherited) {
                     available_models.push(inherited.clone());
                 }
-                Ok(ModelOverride::Explicit(inherited.clone()))
+                return Ok(ModelOverride::Explicit(inherited.clone()));
             }
-            None => Ok(ModelOverride::Inherit),
-        },
+        }
     }
+
+    // --- Stage 2 (pi `:237-244`) ---
+    //
+    // `if (resolved || explicitModel === undefined) return resolved;` — an explicit request that
+    // resolved to NOTHING (a `"inherit"`/blank `model` with no live parent session) must not
+    // shadow the agent's own configured model. Re-resolve against the persona model alone, at
+    // `"inherited"` source so an out-of-scope agent default warns rather than refusing the run.
+    if explicit_present
+        && let Some(persona) = real_requested_model(persona_model)
+    {
+        if let Some(violation) =
+            check_model_scope(Some(persona.as_str()), scope, ModelSource::Inherited)
+        {
+            warn_violation(&violation);
+        }
+        if !available_models.contains(persona) {
+            available_models.push(persona.clone());
+        }
+        return Ok(ModelOverride::Explicit(persona.clone()));
+    }
+    Ok(ModelOverride::Inherit)
 }
 
 // -------------------------------------------------------------------------------------------
@@ -370,6 +441,9 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::Contains("fetch failed"),
     RetryPattern::Contains("network error"),
     RetryPattern::Contains("socket hang up"),
+    // Added upstream at v0.43.0 (`model-fallback.ts:303`): a stream that ended without a
+    // `finish_reason` is a truncated provider response, not a task failure.
+    RetryPattern::Contains("stream ended without finish_reason"),
     RetryPattern::Contains("upstream"),
     RetryPattern::OptionalWordBetween("time", "d", " out"), // /timed? out/i
     RetryPattern::Contains("timeout"),
@@ -482,6 +556,70 @@ fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
     }
 }
 
+/// pi `TOOL_FAILURE_PREFIX` (`model-fallback.ts:316-323`), hand-rolled for the same reason the
+/// rest of this module is: `^[\w.:@/-]+ failed (?:\(exit \d+\):|with exit code \d+)(?:\s|$)`.
+///
+/// Those two shapes are produced by exactly one thing in this crate — [`crate::exec::output::
+/// DetectedSubagentError::message`], the exit-0 re-diagnosis of a trailing failed tool/bash call
+/// (`output.rs`, pi `execution.ts:776-778`). They describe a TOOL that failed inside the child's
+/// task, never the provider or the model, however network-flavoured the tool's own output reads.
+/// The overlap is not hypothetical: `FATAL_BASH_PATTERNS` (`output.rs`) and
+/// [`RETRYABLE_MODEL_FAILURE_PATTERNS`] literally share `"connection refused"` and `"timeout"`, so
+/// `bash failed (exit 1): curl: (7) Failed to connect ... Connection refused` was classified
+/// retryable and re-ran the child's WHOLE task on the next model in the ladder — which cannot fix
+/// a tool failure and costs a full extra run. Tool names include namespaced forms
+/// (`mcp.server/write`), hence the `.`/`:`/`@`/`/`/`-` members of the leading character class.
+///
+/// Case-insensitive like pi's `/i`; anchored at the start of the trimmed error like pi's `^`.
+fn is_tool_failure_prefix(error: &str) -> bool {
+    let trimmed = error.trim_start();
+    // `[\w.:@/-]+` — all ASCII, so the byte count is a valid char boundary.
+    let name_len = trimmed
+        .bytes()
+        .take_while(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'@' | b'/' | b'-')
+        })
+        .count();
+    if name_len == 0 {
+        return false;
+    }
+    let Some(rest) = trimmed.get(name_len..).and_then(|r| strip_prefix_ci(r, " failed ")) else {
+        return false;
+    };
+    let tail = if let Some(after) = strip_prefix_ci(rest, "(exit ") {
+        // `\(exit \d+\):`
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        match after.get(digits..).and_then(|r| r.strip_prefix("):")) {
+            Some(tail) => tail,
+            None => return false,
+        }
+    } else if let Some(after) = strip_prefix_ci(rest, "with exit code ") {
+        // `with exit code \d+`
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        match after.get(digits..) {
+            Some(tail) => tail,
+            None => return false,
+        }
+    } else {
+        return false;
+    };
+    // `(?:\s|$)`
+    tail.is_empty() || tail.starts_with(char::is_whitespace)
+}
+
+/// ASCII-case-insensitive [`str::strip_prefix`].
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    let rest = s.get(prefix.len()..)?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
+}
+
 /// Classify whether a failed attempt's error text matches a known retryable-failure pattern
 /// (R-SA-039).
 ///
@@ -506,6 +644,10 @@ pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
         return false;
     };
     if error.trim().is_empty() {
+        return false;
+    }
+    // pi `:326`: the tool-failure guard runs FIRST and short-circuits the whole pattern set.
+    if is_tool_failure_prefix(error.trim()) {
         return false;
     }
     let haystack = error.to_lowercase();
@@ -653,6 +795,190 @@ pub struct AttemptSignal {
     /// blocking. **Do not fabricate a synthetic trigger** from output-text heuristics — the trigger
     /// is a real `contact_supervisor` blocking-ask event on the child's own wire.
     pub detached: bool,
+    /// Everything [`is_retryable_subagent_startup_failure`] needs beyond the fields above, to tell
+    /// "the child never started" apart from "the child started and failed". See
+    /// [`StartupEvidence`].
+    pub startup: StartupEvidence,
+}
+
+// -------------------------------------------------------------------------------------------
+// Startup retry: a child that dies before doing ANYTHING is relaunched on the SAME model
+// (a port of pi-subagents' `runs/shared/subagent-startup-retry.ts`, v0.43.0, 104 lines)
+// -------------------------------------------------------------------------------------------
+
+/// Backoff before each relaunch of a child that exited before any model or tool activity
+/// (`subagent-startup-retry.ts:9`, verbatim). Its length also fixes the attempt budget: 3 delays =
+/// up to 4 launches of the same model.
+///
+/// Short and bounded on purpose (upstream's own comment): long enough for a concurrent startup lock
+/// to clear, short enough not to amplify a persistently broken binary into a multi-second stall on
+/// every candidate in the ladder.
+pub const SUBAGENT_STARTUP_RETRY_DELAYS_MS: [u64; 3] = [250, 750, 1500];
+
+/// A genuine startup race fails well before a model request could possibly complete
+/// (`subagent-startup-retry.ts:12`). A zero-activity failure that took LONGER than this is not a
+/// startup failure — something was happening — and is not retried.
+pub const MAX_SUBAGENT_STARTUP_FAILURE_DURATION_MS: u64 = 2000;
+
+/// pi `formatProcessSignalError` (`runs/shared/process-signal.ts:1-3`). Ported here rather than in
+/// a `process_signal` module of its own because this predicate is currently its only consumer —
+/// the rest of `process-signal.ts` (`isUnexplainedProcessSignal`) is a separate, still-unported
+/// gap.
+#[must_use]
+pub fn format_process_signal_error(signal: &str) -> String {
+    format!("Subagent process terminated by signal {signal}.")
+}
+
+/// The per-attempt facts the startup-failure classifier reads that [`AttemptSignal`]'s other fields
+/// do not already carry (`SubagentStartupFailureEvidence`, `subagent-startup-retry.ts:16-32`).
+///
+/// Every field is a REASON NOT TO RETRY. The classifier fails closed: anything that looks like the
+/// child actually did something — a message, a tool call, any usage, a produced output, a protocol
+/// violation, an unexplained signal, a lifecycle interruption — disqualifies the retry. That
+/// asymmetry is the whole point: retrying a child that genuinely ran and failed would double the
+/// cost and hide the failure, while NOT retrying a child that never started masks a transient
+/// launch race behind a permanent-looking error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupEvidence {
+    /// The attempt produced some non-blank final output (`finalOutput`).
+    pub final_output_present: bool,
+    /// How many assistant/tool messages the child emitted (`messages.length`).
+    pub message_count: usize,
+    /// How many tool calls the child started (`progressSummary.toolCount`).
+    pub tool_count: u32,
+    /// The attempt's wall-clock duration. `None` means "unknown", which upstream models as
+    /// `Number.POSITIVE_INFINITY` — never within the startup window, so never retryable.
+    pub duration_ms: Option<u64>,
+    /// The attempt failed with a `protocol_output_limit` (`protocolError`). A child that produced
+    /// 16 MiB of output on one line unquestionably started.
+    pub protocol_error: bool,
+    /// The OS signal that killed the child, if any (`processSignal`). Only `SIGKILL` is tolerated
+    /// (upstream `:60`) — that is what this crate's own escalation ladder ends with, so it does not
+    /// prove the child misbehaved; any OTHER signal is evidence something external acted on it.
+    pub process_signal: Option<String>,
+    /// The completion guard saw a mutation attempt (`observedMutationAttempt`).
+    pub observed_mutation_attempt: bool,
+    /// The run was stopped by an explicit user/agent stop (`stopped`).
+    pub stopped: bool,
+    /// The run hit its turn budget (`turnBudgetExceeded`).
+    pub turn_budget_exceeded: bool,
+    /// [CYRUP-DELTA, load-bearing] The attempt's `error` is cyrup's own bare-non-zero-exit
+    /// PLACEHOLDER (`subagent attempt exited with code N`), not a diagnosed failure.
+    ///
+    /// pi leaves `result.error` `undefined` for a non-zero exit it could not explain, and
+    /// `isRetryableSubagentStartupFailure` keys on exactly that absence (`:52`
+    /// `!evidence.error?.trim()`). cyrup cannot leave it unset — `SingleResult`/`ModelAttempt`
+    /// callers surface `error` directly — so `run_attempt` fills a stable placeholder string.
+    /// Without this flag that placeholder is non-blank error TEXT, the predicate's silence test
+    /// fails for every failed attempt, and the whole startup retry is dead code that can never
+    /// fire. This flag is how cyrup spells pi's `undefined`.
+    pub error_is_placeholder: bool,
+}
+
+/// Classify a failed attempt as an unexplained ZERO-ACTIVITY child startup failure — the only
+/// failure this crate relaunches on the SAME model (`isRetryableSubagentStartupFailure`,
+/// `subagent-startup-retry.ts:48-67`, term for term).
+///
+/// The boundary this draws is the whole feature: get it too loose and a legitimately failing model
+/// is launched four times over; too tight and a concurrent-startup race surfaces as a hard failure
+/// the ladder then burns a fallback model on. So: a non-zero numeric exit code, no error text at
+/// all (or exactly this crate's own SIGKILL text), no output, no messages, no tools, no usage, a
+/// duration inside [`MAX_SUBAGENT_STARTUP_FAILURE_DURATION_MS`], no protocol error, no signal other
+/// than SIGKILL, and none of the lifecycle flags set.
+#[must_use]
+pub fn is_retryable_subagent_startup_failure(signal: &AttemptSignal) -> bool {
+    let evidence = &signal.startup;
+    let sigkill_error = format_process_signal_error("SIGKILL");
+    let error_is_silent = evidence.error_is_placeholder
+        || match signal.error.as_deref() {
+            None => true,
+            Some(error) => error.trim().is_empty() || error == sigkill_error,
+        };
+    signal.exit_code.is_some_and(|code| code != 0)
+        && error_is_silent
+        && !evidence.final_output_present
+        && evidence.message_count == 0
+        && evidence.tool_count == 0
+        && !has_usage(&signal.usage)
+        && evidence
+            .duration_ms
+            .is_some_and(|duration| duration <= MAX_SUBAGENT_STARTUP_FAILURE_DURATION_MS)
+        && !evidence.protocol_error
+        && evidence
+            .process_signal
+            .as_deref()
+            .is_none_or(|signal| signal == "SIGKILL")
+        && !evidence.observed_mutation_attempt
+        && !signal.detached
+        && !signal.timed_out
+        && !evidence.stopped
+        && !evidence.turn_budget_exceeded
+}
+
+/// pi `hasUsage` (`subagent-startup-retry.ts:34-41`): did the attempt account for ANY tokens or
+/// cost? cyrup's [`Usage`] has no `turns` counter (pi carries one on its own aggregate); every other
+/// field maps one to one, and `total_tokens` is checked as well since a provider may report it
+/// without a per-direction split.
+fn has_usage(usage: &Usage) -> bool {
+    usage.input != 0
+        || usage.output != 0
+        || usage.cache_read != 0
+        || usage.cache_write != 0
+        || usage.total_tokens != 0
+        || usage.cost.total != 0.0
+}
+
+/// The note recorded against the failed attempt and injected into the relaunched child's context
+/// (`formatSubagentStartupRetryNote`, `subagent-startup-retry.ts:69-76`, verbatim text).
+#[must_use]
+pub fn format_subagent_startup_retry_note(
+    model: &str,
+    attempt: usize,
+    max_attempts: usize,
+    delay_ms: u64,
+) -> String {
+    format!(
+        "[startup-retry] {model} exited before model or tool activity (attempt \
+         {attempt}/{max_attempts}). Retrying the same model in {delay_ms}ms."
+    )
+}
+
+/// The terminal error once every startup attempt is spent
+/// (`formatSubagentStartupRetryExhaustedError`, `subagent-startup-retry.ts:78-83`, verbatim text).
+#[must_use]
+pub fn format_subagent_startup_retry_exhausted_error(model: &str, attempts: usize) -> String {
+    format!(
+        "Subagent failed to start after {attempts} attempts on {model}; no model, tool, output, \
+         usage, or diagnostic activity was observed. This may be a concurrent Pi startup race. \
+         Retry the run or temporarily lower subagent concurrency."
+    )
+}
+
+/// The outcome of waiting out a startup-retry backoff (`waitForSubagentStartupRetry`,
+/// `subagent-startup-retry.ts:86-104`), split three ways because upstream's caller branches on
+/// WHICH signal aborted the wait (`execution.ts:1583-1600`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupRetryWait {
+    /// The delay elapsed undisturbed — relaunch.
+    Proceed,
+    /// A soft interrupt fired during the backoff: the run is PAUSED, not failed (exit 0, cleared
+    /// error, the paused sentinel output).
+    Interrupted,
+    /// A hard cancel fired during the backoff: the run is abandoned with a cancellation error.
+    Cancelled,
+}
+
+/// How the ladder resolved a startup-retry sequence, handed to
+/// [`AttemptRunner::apply_startup_outcome`] so the runner can stamp its own richer per-attempt
+/// payload (which the ladder cannot see inside).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupOutcome {
+    /// A soft interrupt landed during a backoff (`execution.ts:1584-1592`).
+    Interrupted,
+    /// A hard cancel landed during a backoff (`execution.ts:1593-1599`).
+    Cancelled(String),
+    /// Every startup attempt was spent (`execution.ts:1606-1618`).
+    Exhausted(String),
 }
 
 /// Drives exactly one fresh child-subprocess attempt for `model` (R-SA-039: "launch a fresh child
@@ -693,6 +1019,24 @@ pub trait AttemptRunner {
     /// the correct point in the loop (immediately before each fresh spawn, R-SA-031) without this
     /// module needing to know anything about output-file mechanics.
     fn snapshot_output_file(&mut self) {}
+
+    /// Wait out one startup-retry backoff, aborting early if a lifecycle signal fires
+    /// (`waitForSubagentStartupRetry`, `subagent-startup-retry.ts:86-104`).
+    ///
+    /// The default sleeps and proceeds — correct for a runner with no cancellation channel at all
+    /// (test runners). The production runner overrides it to race the delay against
+    /// `RunOptions.cancel`/`RunOptions.interrupt`, because a backoff that ignores them would hold a
+    /// cancelled run open for up to 1.5s AND then relaunch a child into it.
+    async fn wait_startup_retry(&mut self, delay: std::time::Duration) -> StartupRetryWait {
+        tokio::time::sleep(delay).await;
+        StartupRetryWait::Proceed
+    }
+
+    /// Stamp a startup-retry resolution onto this runner's own per-attempt payload — pi mutates
+    /// `result.finalOutput`/`result.interrupted`/`result.progress` in place at
+    /// `execution.ts:1584-1618`, which the ladder cannot do here because `Attempt` is opaque to it.
+    /// Default no-op.
+    fn apply_startup_outcome(&mut self, _attempt: &mut Self::Attempt, _outcome: &StartupOutcome) {}
 }
 
 /// The full outcome of driving the model-fallback ladder to completion (R-SA-040).
@@ -773,7 +1117,7 @@ pub struct FallbackOutcome<A> {
 /// `model_attempts`, zeroed `aggregate_usage`, and `last_signal`/`last_attempt` both `None` — it
 /// never calls `runner.run_attempt` at all in that case. Treating an empty ladder as a hard
 /// pre-spawn failure (there is no model to even try) is the caller's responsibility.
-pub async fn run_fallback_ladder<R: AttemptRunner>(
+pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
     candidates: &[ModelId],
     runner: &mut R,
 ) -> FallbackOutcome<R::Attempt> {
@@ -784,63 +1128,159 @@ pub async fn run_fallback_ladder<R: AttemptRunner>(
     let mut last_attempt: Option<R::Attempt> = None;
     let mut attempt_note: Option<String> = None;
 
-    for (i, model) in candidates.iter().enumerate() {
-        runner.snapshot_output_file(); // R-SA-031: snapshot immediately before each fresh spawn
-        let (signal, attempt) = runner
-            .run_attempt(model, attempt_note.take().as_deref())
-            .await; // R-SA-039: always a fresh child subprocess per candidate
+    'ladder: for (i, model) in candidates.iter().enumerate() {
+        // pi `for (let startupAttemptIndex = 0; ; startupAttemptIndex++)` (`execution.ts:1518`):
+        // the SAME model may be relaunched, without advancing the ladder, when the child died
+        // before doing anything at all.
+        let mut startup_attempt_index = 0usize;
+        loop {
+            runner.snapshot_output_file(); // R-SA-031: snapshot immediately before each fresh spawn
+            let (mut signal, mut attempt) = runner
+                .run_attempt(model, attempt_note.take().as_deref())
+                .await; // R-SA-039: always a fresh child subprocess per candidate
 
-        attempted_models.push(model.clone());
-        add_usage(&mut aggregate, &signal.usage); // R-SA-040: additive, even for a failed attempt
+            // pi records the candidate ONCE per model (`execution.ts:1536-1539`) — a startup
+            // relaunch is the same rung of the ladder, not a new one.
+            if startup_attempt_index == 0 {
+                attempted_models.push(model.clone());
+            }
+            add_usage(&mut aggregate, &signal.usage); // R-SA-040: additive, even for a failed attempt
 
-        model_attempts.push(ModelAttempt {
-            model: model.clone(),
-            success: signal.success,
-            exit_code: signal.exit_code,
-            error: signal.error.clone(),
-            usage: signal.usage.clone(),
-        });
+            // ...but every LAUNCH gets its own row (`modelAttempts.push` is inside the inner loop),
+            // so a run that relaunched three times shows three rows and the retry notes that
+            // explain them.
+            model_attempts.push(ModelAttempt {
+                model: model.clone(),
+                success: signal.success,
+                exit_code: signal.exit_code,
+                error: signal.error.clone(),
+                usage: signal.usage.clone(),
+            });
 
-        let is_last_candidate = i + 1 == candidates.len();
+            let is_last_candidate = i + 1 == candidates.len();
 
-        // --- R-SA-036: timeout is a distinct branch, checked FIRST, before any retryable-error
-        // --- pattern classification runs at all. ---
-        if signal.timed_out {
+            // --- R-SA-036: timeout is a distinct branch, checked FIRST, before any retryable-error
+            // --- pattern classification runs at all. ---
+            if signal.timed_out {
+                last_signal = Some(signal);
+                last_attempt = Some(attempt);
+                break 'ladder;
+            }
+            // --- R-SA-037: detach is likewise terminal, checked before retry classification. ---
+            if signal.detached {
+                last_signal = Some(signal);
+                last_attempt = Some(attempt);
+                break 'ladder;
+            }
+
+            if signal.success {
+                last_signal = Some(signal);
+                last_attempt = Some(attempt);
+                break 'ladder;
+            }
+
+            // --- Startup retry (pi `execution.ts:1558-1619`), evaluated BEFORE the model-fallback
+            // --- decision and before the last-candidate stop: a child that never started says
+            // --- nothing about the MODEL, so advancing the ladder (or giving up on the last rung)
+            // --- would spend a fallback model on what is usually a concurrent-launch race. ---
+            let startup_failure = is_retryable_subagent_startup_failure(&signal);
+            let retry_delay_ms = SUBAGENT_STARTUP_RETRY_DELAYS_MS
+                .get(startup_attempt_index)
+                .copied();
+            if let (true, Some(delay_ms)) = (startup_failure, retry_delay_ms) {
+                let note = format_subagent_startup_retry_note(
+                    model.as_str(),
+                    startup_attempt_index + 1,
+                    SUBAGENT_STARTUP_RETRY_DELAYS_MS.len() + 1,
+                    delay_ms,
+                );
+                match runner
+                    .wait_startup_retry(std::time::Duration::from_millis(delay_ms))
+                    .await
+                {
+                    StartupRetryWait::Proceed => {}
+                    StartupRetryWait::Interrupted => {
+                        // pi `:1584-1592`: a soft interrupt during the backoff is a PAUSE, not a
+                        // failure — exit 0, cleared error, paused sentinel output.
+                        signal.success = true;
+                        signal.exit_code = Some(0);
+                        signal.error = None;
+                        runner.apply_startup_outcome(&mut attempt, &StartupOutcome::Interrupted);
+                        last_signal = Some(signal);
+                        last_attempt = Some(attempt);
+                        break 'ladder;
+                    }
+                    StartupRetryWait::Cancelled => {
+                        let cancelled =
+                            "Subagent startup retry cancelled before relaunch.".to_string();
+                        signal.error = Some(cancelled.clone());
+                        if let Some(row) = model_attempts.last_mut() {
+                            row.error = Some(cancelled.clone());
+                        }
+                        runner.apply_startup_outcome(
+                            &mut attempt,
+                            &StartupOutcome::Cancelled(cancelled),
+                        );
+                        last_signal = Some(signal);
+                        last_attempt = Some(attempt);
+                        break 'ladder;
+                    }
+                }
+                // pi `:1602-1604`: the note replaces this launch's error on its own row and is
+                // injected into the relaunched child's context.
+                if let Some(row) = model_attempts.last_mut() {
+                    row.error = Some(note.clone());
+                }
+                attempt_note = Some(note);
+                // `signal`/`attempt` are deliberately dropped here rather than parked in
+                // `last_signal`/`last_attempt`: `continue` always runs another attempt for the same
+                // model, which overwrites both before anything can read them (pi's `lastResult` is
+                // likewise overwritten on the next pass). Assigning them would be dead.
+                startup_attempt_index += 1;
+                continue;
+            }
+            if startup_failure {
+                // Every launch spent, still zero activity (pi `:1606-1618`).
+                let exhausted = format_subagent_startup_retry_exhausted_error(
+                    model.as_str(),
+                    startup_attempt_index + 1,
+                );
+                signal.error = Some(exhausted.clone());
+                if let Some(row) = model_attempts.last_mut() {
+                    row.error = Some(exhausted.clone());
+                }
+                runner.apply_startup_outcome(&mut attempt, &StartupOutcome::Exhausted(exhausted));
+                last_signal = Some(signal);
+                last_attempt = Some(attempt);
+                break 'ladder;
+            }
+
+            if is_last_candidate {
+                last_signal = Some(signal);
+                last_attempt = Some(attempt);
+                break 'ladder;
+            }
+
+            // Only reached for a non-timeout, non-detached, non-last-candidate failure: NOW (and
+            // only now) is the retryable-pattern classifier consulted (R-SA-039).
+            if !is_retryable_model_failure(signal.error.as_deref()) {
+                last_signal = Some(signal);
+                last_attempt = Some(attempt);
+                break 'ladder;
+            }
+
+            // Retryable, not the last candidate, not a timeout, not a detach: advance the ladder.
+            if let Some(next_model) = candidates.get(i + 1) {
+                attempt_note = Some(format_attempt_note(
+                    model,
+                    signal.error.as_deref(),
+                    next_model,
+                ));
+            }
             last_signal = Some(signal);
             last_attempt = Some(attempt);
             break;
         }
-        // --- R-SA-037: detach is likewise terminal, checked before retry classification. ---
-        if signal.detached {
-            last_signal = Some(signal);
-            last_attempt = Some(attempt);
-            break;
-        }
-
-        if signal.success || is_last_candidate {
-            last_signal = Some(signal);
-            last_attempt = Some(attempt);
-            break;
-        }
-
-        // Only reached for a non-timeout, non-detached, non-last-candidate failure: NOW (and
-        // only now) is the retryable-pattern classifier consulted (R-SA-039).
-        if !is_retryable_model_failure(signal.error.as_deref()) {
-            last_signal = Some(signal);
-            last_attempt = Some(attempt);
-            break;
-        }
-
-        // Retryable, not the last candidate, not a timeout, not a detach: advance the ladder.
-        if let Some(next_model) = candidates.get(i + 1) {
-            attempt_note = Some(format_attempt_note(
-                model,
-                signal.error.as_deref(),
-                next_model,
-            ));
-        }
-        last_signal = Some(signal);
-        last_attempt = Some(attempt);
     }
 
     FallbackOutcome {
@@ -1440,6 +1880,7 @@ mod tests {
             usage,
             timed_out: false,
             detached: false,
+            startup: StartupEvidence::default(),
         }
     }
 
@@ -1451,6 +1892,7 @@ mod tests {
             usage,
             timed_out: false,
             detached: false,
+            startup: StartupEvidence::default(),
         }
     }
 
@@ -1462,6 +1904,7 @@ mod tests {
             usage,
             timed_out: true,
             detached: false,
+            startup: StartupEvidence::default(),
         }
     }
 
@@ -1473,7 +1916,267 @@ mod tests {
             usage,
             timed_out: false,
             detached: true,
+            startup: StartupEvidence::default(),
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // G88a: the `TOOL_FAILURE_PREFIX` guard (pi `model-fallback.ts:316-326`)
+    // ---------------------------------------------------------------------------------------
+
+    /// The exact strings `exec::output::DetectedSubagentError::message` produces. Their DETAILS
+    /// deliberately carry text that `RETRYABLE_MODEL_FAILURE_PATTERNS` independently matches —
+    /// `FATAL_BASH_PATTERNS` and the retryable set literally share `"connection refused"` and
+    /// `"timeout"` — which is exactly how a failed tool used to be mistaken for a failed model.
+    #[test]
+    fn a_tool_failure_prefix_is_never_a_retryable_model_failure() {
+        for msg in [
+            "bash failed (exit 7): curl: (7) Failed to connect to api.test port 443: Connection refused",
+            "bash failed (exit 124): timeout: sending signal TERM to command",
+            "tool failed with exit code 1",
+            "mcp.server/write failed (exit 2): quota exceeded on the remote store",
+            "edit_file failed with exit code 3 after a network error",
+            "  bash failed (exit 1): fetch failed  ",
+        ] {
+            assert!(
+                !is_retryable_model_failure(Some(msg)),
+                "a tool failure must NOT re-run the whole task on another model: {msg}"
+            );
+        }
+    }
+
+    /// The guard is a PREFIX guard, anchored and shaped. Provider errors that merely contain the
+    /// word "failed", and tool-shaped text that does not actually match pi's regex, stay
+    /// classified by the pattern set alone.
+    #[test]
+    fn the_tool_failure_guard_does_not_swallow_genuine_provider_failures() {
+        for msg in [
+            // No `(exit N):` / `with exit code N` clause at all.
+            "provider request failed: 503 service unavailable",
+            // The clause exists but not at the START of the error.
+            "the model was overloaded and then bash failed (exit 1): boom",
+            // `(exit N)` without the trailing colon pi requires.
+            "bash failed (exit 1) rate limit",
+            // A space inside the tool name breaks the leading character class.
+            "some tool failed with exit code 1 rate limit",
+            // No digits where pi requires `\\d+`.
+            "bash failed (exit N): rate limit",
+        ] {
+            assert!(
+                is_retryable_model_failure(Some(msg)),
+                "expected still-retryable: {msg}"
+            );
+        }
+    }
+
+    /// Added to the retryable set upstream at v0.43.0 (`model-fallback.ts:303`).
+    #[test]
+    fn a_truncated_stream_is_retryable() {
+        assert!(is_retryable_model_failure(Some(
+            "Stream ended without finish_reason"
+        )));
+    }
+
+    /// The LADDER-level proof, not just the classifier's: a first candidate that fails with a
+    /// tool-failure message must stop the ladder outright — no second model, no second full run
+    /// of the child's task.
+    #[tokio::test]
+    async fn a_tool_failure_stops_the_ladder_instead_of_re_running_the_task_on_another_model() {
+        let candidates = vec![model("a"), model("b")];
+        let mut runner = ScriptedRunner::new(vec![
+            (
+                failed_signal(
+                    "bash failed (exit 7): curl: (7) Failed to connect: Connection refused",
+                    usage(10, 0, 0.0),
+                ),
+                "attempt-a",
+            ),
+            (ok_signal(usage(999, 999, 999.0)), "attempt-b"), // must never be reached
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+
+        assert_eq!(outcome.attempted_models, vec![model("a")]);
+        assert_eq!(
+            runner.calls.len(),
+            1,
+            "a failed TOOL must not spend a second model attempt"
+        );
+        assert_eq!(outcome.aggregate_usage.input, 10);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // G88b: two-stage explicit -> inherited resolution
+    // (pi `resolveEffectiveSubagentModel`, `model-fallback.ts:222-245`)
+    // ---------------------------------------------------------------------------------------
+
+    /// The `subagent` tool / `/run model=…` accepts pi's `"inherit"` sentinel. With no live parent
+    /// session model to inherit (headless, SDK embedder, background runner started before a model
+    /// was bound), stage 1 resolves to nothing — and stage 2 must fall back to the AGENT's own
+    /// `model:` rather than letting the caller's non-request shadow it.
+    #[test]
+    fn an_inherit_sentinel_with_no_parent_session_falls_back_to_the_agents_own_model() {
+        let persona = model("anthropic/claude-sonnet-5");
+        let mut available = vec![persona.clone(), ModelId::from(INHERIT_MODEL_SENTINEL)];
+
+        let resolved = resolve_model_inheritance(
+            Some(&ModelId::from(INHERIT_MODEL_SENTINEL)),
+            Some(&persona),
+            None, // no live parent session model
+            &mut available,
+            None,
+        )
+        .expect("no scope configured");
+
+        assert_eq!(resolved, ModelOverride::Explicit(persona.clone()));
+        assert!(
+            !available.contains(&ModelId::from(INHERIT_MODEL_SENTINEL)),
+            "the sentinel is a request, never an allowlisted model"
+        );
+        assert_eq!(
+            build_model_candidates(&resolved, Some(&persona), &[], &available),
+            vec![persona],
+            "the child is spawned with `--model <the agent's model>`, never `--model inherit`"
+        );
+    }
+
+    /// With a live parent session model, the same sentinel resolves to the PARENT model, which
+    /// outranks the agent's own — that is what "inherit" asks for (pi `:207`, stage 1).
+    #[test]
+    fn an_inherit_sentinel_prefers_the_parent_session_model_over_the_agents_own() {
+        let persona = model("anthropic/claude-sonnet-5");
+        let parent = model("together/zai-org/GLM-5.2");
+        let mut available = vec![persona.clone()];
+
+        let resolved = resolve_model_inheritance(
+            Some(&ModelId::from("  inherit  ")),
+            Some(&persona),
+            Some(&parent),
+            &mut available,
+            None,
+        )
+        .expect("no scope configured");
+
+        assert_eq!(resolved, ModelOverride::Explicit(parent.clone()));
+        assert_eq!(
+            build_model_candidates(&resolved, Some(&persona), &[], &available),
+            vec![parent, persona],
+            "the parent model leads; the agent's own model stays as the next rung"
+        );
+    }
+
+    /// A blank `model` is pi's `trimmed &&` falsy case — identical to the sentinel, and identical
+    /// to omitting the parameter.
+    #[test]
+    fn a_blank_per_call_model_is_treated_as_no_request_at_all() {
+        let persona = model("anthropic/claude-sonnet-5");
+        let mut available = vec![persona.clone(), ModelId::from("   ")];
+
+        let resolved = resolve_model_inheritance(
+            Some(&ModelId::from("   ")),
+            Some(&persona),
+            None,
+            &mut available,
+            None,
+        )
+        .expect("no scope configured");
+
+        assert_eq!(resolved, ModelOverride::Explicit(persona.clone()));
+        assert_eq!(
+            build_model_candidates(&resolved, Some(&persona), &[], &available),
+            vec![persona]
+        );
+    }
+
+    /// A PERSONA whose frontmatter says `model: inherit` must not reach the ladder either — the
+    /// ladder is rebuilt from `agent_primary_model` independently of this function's return value,
+    /// so the sentinel has to be purged from the allowlist for the filter to drop it.
+    #[test]
+    fn a_persona_model_of_inherit_never_reaches_the_child_argv() {
+        let sentinel = ModelId::from(INHERIT_MODEL_SENTINEL);
+        let parent = model("together/zai-org/GLM-5.2");
+        let fallback = model("openai/gpt-5.4-mini");
+        let mut available = vec![sentinel.clone(), fallback.clone()];
+
+        let resolved = resolve_model_inheritance(
+            None, // no per-call override
+            Some(&sentinel),
+            Some(&parent),
+            &mut available,
+            None,
+        )
+        .expect("no scope configured");
+
+        assert_eq!(resolved, ModelOverride::Explicit(parent.clone()));
+        let ladder = build_model_candidates(
+            &resolved,
+            Some(&sentinel),
+            std::slice::from_ref(&fallback),
+            &available,
+        );
+        assert_eq!(ladder, vec![parent, fallback]);
+        assert!(
+            !ladder.contains(&sentinel),
+            "`inherit` is not a model id and must never be spawned"
+        );
+    }
+
+    /// Stage 1's source rule (pi `:212`): a request that reduced to "the parent model" is always
+    /// `"inherited"`, so an armed `modelScope` WARNS instead of refusing the run — even though the
+    /// caller did pass a `model` parameter.
+    #[test]
+    fn an_inherit_sentinel_under_an_armed_scope_warns_rather_than_refusing() {
+        let scope = ModelScopeConfig {
+            enforce: Some(true),
+            allow: Some(vec!["anthropic/*".to_string()]),
+        };
+        let parent = model("together/zai-org/GLM-5.2"); // outside the allow list
+        let mut available = Vec::new();
+
+        let resolved = resolve_model_inheritance(
+            Some(&ModelId::from(INHERIT_MODEL_SENTINEL)),
+            None,
+            Some(&parent),
+            &mut available,
+            Some(&scope),
+        )
+        .expect("an inherited model only ever warns");
+        assert_eq!(resolved, ModelOverride::Explicit(parent));
+    }
+
+    /// The pre-existing contract this two-stage shape must not disturb: a REAL explicit model is
+    /// still candidate #0 and is still refused outright when an armed scope excludes it.
+    #[test]
+    fn a_real_explicit_model_is_unchanged_by_the_two_stage_shape() {
+        let explicit = model("openai/gpt-5.4");
+        let persona = model("anthropic/claude-sonnet-5");
+        let mut available = vec![explicit.clone(), persona.clone()];
+        assert_eq!(
+            resolve_model_inheritance(
+                Some(&explicit),
+                Some(&persona),
+                Some(&model("together/x")),
+                &mut available,
+                None,
+            )
+            .expect("no scope configured"),
+            ModelOverride::Explicit(explicit.clone())
+        );
+
+        let scope = ModelScopeConfig {
+            enforce: Some(true),
+            allow: Some(vec!["anthropic/*".to_string()]),
+        };
+        assert!(
+            resolve_model_inheritance(
+                Some(&explicit),
+                Some(&persona),
+                None,
+                &mut available,
+                Some(&scope),
+            )
+            .is_err(),
+            "an out-of-scope EXPLICIT model still fails closed"
+        );
     }
 
     #[tokio::test]
@@ -1753,5 +2456,121 @@ mod tests {
     fn format_attempt_note_falls_back_to_a_generic_phrase_when_error_is_absent() {
         let note = format_attempt_note(&model("a"), None, &model("b"));
         assert!(note.contains("attempt failed"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // is_retryable_subagent_startup_failure (G74) — the boundary, term by term
+    // ---------------------------------------------------------------------------------------
+
+    /// The canonical "the child never started" shape: a bare non-zero exit, cyrup's placeholder
+    /// error, nothing else.
+    fn startup_failure_signal() -> AttemptSignal {
+        AttemptSignal {
+            success: false,
+            exit_code: Some(1),
+            error: Some("subagent attempt exited with code 1".to_string()),
+            usage: Usage::default(),
+            timed_out: false,
+            detached: false,
+            startup: StartupEvidence {
+                duration_ms: Some(40),
+                error_is_placeholder: true,
+                ..StartupEvidence::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_bare_zero_activity_non_zero_exit_is_a_startup_failure() {
+        assert!(is_retryable_subagent_startup_failure(&startup_failure_signal()));
+    }
+
+    /// Every field is a REASON NOT TO RETRY: each of these mutations alone must disqualify it.
+    /// This is the boundary the whole feature turns on — too loose and a legitimately failing model
+    /// is launched four times over.
+    #[test]
+    fn any_single_piece_of_evidence_disqualifies_the_startup_retry() {
+        type Mutate = Box<dyn Fn(&mut AttemptSignal)>;
+        let cases: Vec<(&str, Mutate)> = vec![
+            ("a clean exit", Box::new(|s: &mut AttemptSignal| s.exit_code = Some(0))),
+            ("no exit code at all", Box::new(|s: &mut AttemptSignal| s.exit_code = None)),
+            (
+                "a real diagnostic",
+                Box::new(|s: &mut AttemptSignal| {
+                    s.error = Some("provider returned 500".to_string());
+                    s.startup.error_is_placeholder = false;
+                }),
+            ),
+            ("produced output", Box::new(|s: &mut AttemptSignal| s.startup.final_output_present = true)),
+            ("emitted a message", Box::new(|s: &mut AttemptSignal| s.startup.message_count = 1)),
+            ("ran a tool", Box::new(|s: &mut AttemptSignal| s.startup.tool_count = 1)),
+            (
+                "burned tokens",
+                Box::new(|s: &mut AttemptSignal| s.usage.input = 1),
+            ),
+            (
+                "an unknown duration",
+                Box::new(|s: &mut AttemptSignal| s.startup.duration_ms = None),
+            ),
+            (
+                "a duration past the startup window",
+                Box::new(|s: &mut AttemptSignal| {
+                    s.startup.duration_ms = Some(MAX_SUBAGENT_STARTUP_FAILURE_DURATION_MS + 1);
+                }),
+            ),
+            ("a protocol violation", Box::new(|s: &mut AttemptSignal| s.startup.protocol_error = true)),
+            (
+                "a signal other than SIGKILL",
+                Box::new(|s: &mut AttemptSignal| s.startup.process_signal = Some("SIGSEGV".to_string())),
+            ),
+            (
+                "a mutation attempt",
+                Box::new(|s: &mut AttemptSignal| s.startup.observed_mutation_attempt = true),
+            ),
+            ("a detach", Box::new(|s: &mut AttemptSignal| s.detached = true)),
+            ("a timeout", Box::new(|s: &mut AttemptSignal| s.timed_out = true)),
+            ("an explicit stop", Box::new(|s: &mut AttemptSignal| s.startup.stopped = true)),
+            (
+                "an exhausted turn budget",
+                Box::new(|s: &mut AttemptSignal| s.startup.turn_budget_exceeded = true),
+            ),
+        ];
+        for (label, mutate) in cases {
+            let mut signal = startup_failure_signal();
+            mutate(&mut signal);
+            assert!(
+                !is_retryable_subagent_startup_failure(&signal),
+                "{label} must disqualify the startup retry"
+            );
+        }
+    }
+
+    /// SIGKILL is the ONE tolerated signal (`subagent-startup-retry.ts:52,60`): it is what this
+    /// crate's own escalation ladder ends with, so it is not evidence the child misbehaved. Both
+    /// spellings upstream tolerates — the signal name and the error text it formats to — must pass.
+    #[test]
+    fn sigkill_alone_does_not_disqualify_the_startup_retry() {
+        let mut signal = startup_failure_signal();
+        signal.startup.process_signal = Some("SIGKILL".to_string());
+        signal.startup.error_is_placeholder = false;
+        signal.error = Some(format_process_signal_error("SIGKILL"));
+        assert!(is_retryable_subagent_startup_failure(&signal));
+    }
+
+    /// The retry budget is the delay table plus the first launch — 4 launches, never 3 or 5.
+    #[test]
+    fn the_startup_retry_budget_matches_upstreams_delay_table() {
+        assert_eq!(SUBAGENT_STARTUP_RETRY_DELAYS_MS, [250, 750, 1500]);
+        let note = format_subagent_startup_retry_note(
+            "m1",
+            1,
+            SUBAGENT_STARTUP_RETRY_DELAYS_MS.len() + 1,
+            250,
+        );
+        assert_eq!(
+            note,
+            "[startup-retry] m1 exited before model or tool activity (attempt 1/4). Retrying the \
+             same model in 250ms."
+        );
     }
 }

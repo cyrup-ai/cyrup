@@ -90,7 +90,7 @@ pub struct ChainScanResult {
 pub fn scan_chain_dir(root: &Path, source: AgentSource) -> ChainScanResult {
     let mut by_name: HashMap<String, ChainCandidate> = HashMap::new();
     let mut diagnostics = Vec::new();
-    walk_dir(root, source, &mut by_name, &mut diagnostics);
+    walk_dir(root, root, source, &mut by_name, &mut diagnostics);
 
     let mut chains: Vec<ChainDefinition> = by_name.into_values().map(|c| c.definition).collect();
     // Deterministic output order (by name) independent of `HashMap` iteration order, so repeated
@@ -142,6 +142,7 @@ enum ChainFileFormat {
 /// files are recognized by their double-suffix (`.chain.json`/`.chain.md`) rather than a bare
 /// extension, since a plain `.json`/`.md` file in the same directory is not a chain file.
 fn walk_dir(
+    root: &Path,
     dir: &Path,
     source: AgentSource,
     by_name: &mut HashMap<String, ChainCandidate>,
@@ -164,7 +165,12 @@ fn walk_dir(
             if file_name == SKILLS_DIR_SEGMENT {
                 continue;
             }
-            walk_dir(&path, source, by_name, diagnostics);
+            // pi shares ONE `listFilesRecursive` between the agent walk and the chain walk
+            // (`agents.ts:1485` / `:1653`), so the same prune set applies here.
+            if super::should_prune_discovery_dir(root, &path, file_name) {
+                continue;
+            }
+            walk_dir(root, &path, source, by_name, diagnostics);
             continue;
         }
 

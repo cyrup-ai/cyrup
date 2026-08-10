@@ -538,6 +538,44 @@ fn resolve_layered_subagent_settings(
 // Directory-walk (R-SA-004/005/006/007): User/Project agent-file scanning
 // -------------------------------------------------------------------------------------------
 
+/// Directory basenames a discovery walk never descends into (pi `DISCOVERY_PRUNED_DIR_NAMES`,
+/// `agents.ts:1373`).
+const DISCOVERY_PRUNED_DIR_NAMES: &[&str] = &[".git", "node_modules"];
+
+/// pi `isDiscoveryNestedProjectRoot` (`agents.ts:1375-1377`): a directory that carries a project
+/// config dir (`getProjectConfigDir`, cyrup's [`PROJECT_CONFIG_DIR_SEGMENT`]) or a
+/// [`LEGACY_AGENTS_DIR_SEGMENT`] dir is somebody ELSE's project root.
+fn is_discovery_nested_project_root(dir: &Path) -> bool {
+    dir.join(PROJECT_CONFIG_DIR_SEGMENT).is_dir() || dir.join(LEGACY_AGENTS_DIR_SEGMENT).is_dir()
+}
+
+/// pi `shouldPruneDiscoveryDir` (`agents.ts:1379-1383`) — whether a discovery walk rooted at
+/// `root` must NOT descend into the child directory `dir` (basename `dir_name`).
+///
+/// Three reasons, in pi's order:
+///
+/// 1. the basename is `.git` or `node_modules` — object stores and dependency trees hold no agent
+///    files, and a `node_modules` walk is unbounded work on every discovery pass (a vendored
+///    package that ships its own `*.md` would also be silently discovered as an agent);
+/// 2. the directory contains a `.git` entry — a nested repository or submodule, i.e. a different
+///    project's content that happens to live inside this tree;
+/// 3. the directory is a nested PROJECT ROOT of its own (`.cyrup/` or `.agents/`) and is not the
+///    walk root itself — its agents belong to that project's own discovery, at that project's own
+///    scope, and hoisting them into this walk would let a checked-out sibling repo redefine this
+///    repo's agent names.
+///
+/// Never applied to `root` itself: reason 3 is explicitly gated on `dir != root` (pi's
+/// `path.resolve(dir) !== path.resolve(rootDir)`) so a walk rooted at a project root still scans.
+pub(crate) fn should_prune_discovery_dir(root: &Path, dir: &Path, dir_name: &str) -> bool {
+    if DISCOVERY_PRUNED_DIR_NAMES.contains(&dir_name) {
+        return true;
+    }
+    if dir.join(".git").exists() {
+        return true;
+    }
+    dir != root && is_discovery_nested_project_root(dir)
+}
+
 /// Recursively walk `root` for agent `.md` files, alphabetical-by-filename, depth-first
 /// (R-SA-004), excluding any subtree rooted at a directory segment literally named
 /// [`SKILLS_DIR_SEGMENT`] (R-SA-007). Each file is parsed via
@@ -554,11 +592,16 @@ fn resolve_layered_subagent_settings(
 /// collision winners once handed to `merge::reduce_last_seen_wins`/`reduce_first_seen_wins`).
 pub fn walk_agent_dir(root: &Path, source: AgentSource) -> Vec<AgentDefinition> {
     let mut out = Vec::new();
-    walk_agent_dir_into(root, source, &mut out);
+    walk_agent_dir_into(root, root, source, &mut out);
     out
 }
 
-fn walk_agent_dir_into(dir: &Path, source: AgentSource, out: &mut Vec<AgentDefinition>) {
+fn walk_agent_dir_into(
+    root: &Path,
+    dir: &Path,
+    source: AgentSource,
+    out: &mut Vec<AgentDefinition>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -575,7 +618,12 @@ fn walk_agent_dir_into(dir: &Path, source: AgentSource, out: &mut Vec<AgentDefin
             if file_name == SKILLS_DIR_SEGMENT {
                 continue;
             }
-            walk_agent_dir_into(&path, source, out);
+            // pi `listFilesRecursive` (`agents.ts:1399`): `.git`/`node_modules`, nested
+            // repositories and nested project roots are pruned, not walked.
+            if should_prune_discovery_dir(root, &path, file_name) {
+                continue;
+            }
+            walk_agent_dir_into(root, &path, source, out);
             continue;
         }
 
@@ -1329,6 +1377,131 @@ mod tests {
     fn missing_scan_root_yields_empty_result_not_error() {
         let discovered = walk_agent_dir(Path::new("/does/not/exist/at/all"), AgentSource::User);
         assert!(discovered.is_empty());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // G102: discovery pruning (pi `shouldPruneDiscoveryDir`, agents.ts:1373-1409)
+    // -----------------------------------------------------------------------------------------
+
+    /// Build the tree every real repository actually has: a `.git` object store, a
+    /// `node_modules/` with a vendored package that ships `.md` files, a git SUBMODULE (a plain
+    /// directory containing a `.git` entry), and a checked-out sibling project with its own
+    /// `.cyrup/` and `.agents/` roots. Only `wanted.md` at the top belongs to THIS walk.
+    fn seed_prunable_tree(root: &Path) {
+        write_agent(root, "wanted.md", "wanted", "the only agent this walk owns");
+        write_agent(&root.join(".git"), "gitobj.md", "gitobj", "git internals");
+        write_agent(
+            &root.join("node_modules").join("some-pkg"),
+            "vendored.md",
+            "vendored",
+            "a dependency's own markdown",
+        );
+
+        let submodule = root.join("vendor").join("submodule");
+        write_agent(&submodule, "submodule.md", "submodule", "another repo");
+        std::fs::write(submodule.join(".git"), "gitdir: ../../.git/modules/x\n")
+            .expect("write submodule .git file");
+
+        let sibling = root.join("sibling-project");
+        write_agent(&sibling, "sibling.md", "sibling", "another project's agent");
+        std::fs::create_dir_all(sibling.join(PROJECT_CONFIG_DIR_SEGMENT)).expect("mkdir .cyrup");
+
+        let legacy = root.join("legacy-project");
+        write_agent(&legacy, "legacy.md", "legacy", "a legacy-layout project");
+        std::fs::create_dir_all(legacy.join(LEGACY_AGENTS_DIR_SEGMENT)).expect("mkdir .agents");
+    }
+
+    #[test]
+    fn the_agent_walk_prunes_git_node_modules_submodules_and_nested_project_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_prunable_tree(tmp.path());
+
+        let names: Vec<String> = walk_agent_dir(tmp.path(), AgentSource::Project)
+            .into_iter()
+            .map(|a| a.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["wanted".to_string()],
+            "a discovery walk must not adopt another project's (or a dependency's) agents"
+        );
+    }
+
+    /// The walk root itself is exempt (pi's `path.resolve(dir) !== path.resolve(rootDir)` gate):
+    /// scanning a directory that IS a project root must still find its agents.
+    #[test]
+    fn the_walk_root_is_never_pruned_by_its_own_project_markers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(PROJECT_CONFIG_DIR_SEGMENT)).expect("mkdir");
+        std::fs::create_dir_all(tmp.path().join(LEGACY_AGENTS_DIR_SEGMENT)).expect("mkdir");
+        write_agent(tmp.path(), "own.md", "own", "this project's own agent");
+
+        let names: Vec<String> = walk_agent_dir(tmp.path(), AgentSource::Project)
+            .into_iter()
+            .map(|a| a.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["own".to_string()]);
+
+        // And directly at the predicate, since the walk only ever applies it to CHILD directories:
+        // the `dir != root` clause is what keeps the self-rooted case answering "do not prune".
+        assert!(
+            !should_prune_discovery_dir(tmp.path(), tmp.path(), "whatever-its-basename-is"),
+            "a walk root is exempt from the nested-project-root rule (pi's \
+             `path.resolve(dir) !== path.resolve(rootDir)`)"
+        );
+        let child = tmp.path().join("sibling");
+        std::fs::create_dir_all(child.join(PROJECT_CONFIG_DIR_SEGMENT)).expect("mkdir");
+        assert!(
+            should_prune_discovery_dir(tmp.path(), &child, "sibling"),
+            "the identical markers on a CHILD directory do prune it"
+        );
+    }
+
+    /// The user action end to end: a `/subagents` listing (or any agent lookup) runs
+    /// [`discover_agents`] over the project's agent dirs. Point one at a real repo-shaped tree and
+    /// the vendored/sibling-project agents must not appear in the delegatable set.
+    #[test]
+    fn discover_agents_does_not_list_vendored_or_sibling_project_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_prunable_tree(tmp.path());
+
+        let cfg = AgentDiscoveryConfig {
+            user_agent_dirs: vec![tmp.path().to_path_buf()],
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents(&cfg, None).expect("discovery succeeds");
+        let discovered: Vec<&str> = result.agents.iter().map(|a| a.name.as_str()).collect();
+
+        assert!(discovered.contains(&"wanted"), "{discovered:?}");
+        for stranger in ["vendored", "submodule", "sibling", "legacy", "gitobj"] {
+            assert!(
+                !discovered.contains(&stranger),
+                "`{stranger}` belongs to another tree and must not be delegatable here: \
+                 {discovered:?}"
+            );
+        }
+    }
+
+    /// pi shares ONE `listFilesRecursive` between the agent walk and the chain walk, so the prune
+    /// set must apply identically to chains — an unpruned chain walk would still descend
+    /// `node_modules`.
+    #[test]
+    fn the_chain_walk_prunes_the_same_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let chain = |name: &str| {
+            format!("---\nname: {name}\ndescription: d\n---\n\n## scout\n\nlook around.\n")
+        };
+        std::fs::write(tmp.path().join("wanted.chain.md"), chain("wanted")).expect("write");
+        let vendored = tmp.path().join("node_modules").join("some-pkg");
+        std::fs::create_dir_all(&vendored).expect("mkdir");
+        std::fs::write(vendored.join("vendored.chain.md"), chain("vendored")).expect("write");
+        let sibling = tmp.path().join("sibling-project");
+        std::fs::create_dir_all(sibling.join(PROJECT_CONFIG_DIR_SEGMENT)).expect("mkdir");
+        std::fs::write(sibling.join("sibling.chain.md"), chain("sibling")).expect("write");
+
+        let scanned = chains::scan_chain_dir(tmp.path(), AgentSource::Project);
+        let names: Vec<String> = scanned.chains.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(names, vec!["wanted".to_string()]);
     }
 
     // -----------------------------------------------------------------------------------------

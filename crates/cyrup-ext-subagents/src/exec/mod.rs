@@ -38,6 +38,11 @@
 /// subprocess execution (R-SA-023/030/032/033; DI-SA-5).
 pub mod acceptance;
 
+/// Bounded child-protocol I/O: the 16 MiB stdout line cap and its `protocol_output_limit`
+/// diagnostic, the oversized-aggregate-record projection, the bounded stderr byte tail, and the
+/// drain start/cancel lifecycle projection — a port of pi's `runs/shared/child-protocol.ts`.
+pub mod child_protocol;
+
 /// Implementation-expecting classification and mutating-tool-call scan (R-SA-034).
 pub mod completion_guard;
 
@@ -94,7 +99,8 @@ use crate::exec::acceptance::{
 };
 use crate::exec::completion_guard::evaluate_completion_mutation_guard;
 use crate::exec::fallback::{
-    AttemptRunner, AttemptSignal, ModelAttempt, ModelOverride, run_fallback_ladder,
+    AttemptRunner, AttemptSignal, ModelAttempt, ModelOverride, StartupEvidence, StartupOutcome,
+    StartupRetryWait, run_fallback_ladder,
 };
 use crate::exec::ndjson::SubagentEvent;
 use crate::exec::output::{
@@ -625,7 +631,19 @@ pub struct RunOptions {
 /// vocabulary without this module depending on that caller. Cheap to clone (an `Arc`); a runtime
 /// callback with no serializable content, so it is never persisted with the rest of [`RunOptions`].
 #[derive(Clone)]
-pub struct LiveEventSink(std::sync::Arc<dyn Fn(&str) + Send + Sync>);
+pub struct LiveEventSink {
+    /// The child's raw NDJSON stdout lines.
+    lines: LiveEventCallback,
+    /// PARENT-side attempt notes — see [`LiveEventSink::emit_note`].
+    ///
+    /// `None` for a sink that only cares about child output (the background telemetry forwarder),
+    /// in which case notes are dropped.
+    notes: Option<LiveEventCallback>,
+}
+
+/// One installed live-event callback. Named so [`LiveEventSink`]'s two fields do not each have to
+/// spell the full `Arc<dyn Fn…>` out.
+type LiveEventCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 impl std::fmt::Debug for LiveEventSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -637,12 +655,44 @@ impl LiveEventSink {
     /// Wrap a raw-line callback as a cheaply-cloneable sink.
     #[must_use]
     pub fn new(sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
-        Self(std::sync::Arc::new(sink))
+        Self {
+            lines: std::sync::Arc::new(sink),
+            notes: None,
+        }
+    }
+
+    /// Also route PARENT-side attempt notes to `sink` (additive; a sink without one drops them).
+    #[must_use]
+    pub fn with_note_sink(mut self, sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.notes = Some(std::sync::Arc::new(sink));
+        self
     }
 
     /// Deliver one raw NDJSON stdout line to the installed callback.
     pub fn emit(&self, raw_line: &str) {
-        (self.0)(raw_line);
+        (self.lines)(raw_line);
+    }
+
+    /// Deliver one PARENT-side attempt note (a model-fallback or startup-retry note) to the live
+    /// progress surface.
+    ///
+    /// Notes are the one thing on that surface that does NOT come from the child: pi seeds each
+    /// attempt's progress ring with them at construction (`recentOutput: [...shared.attemptNotes]`,
+    /// `runs/foreground/execution.ts:432`) and streams that same `progress` object through
+    /// `fireUpdate()` for the whole attempt. They are the only explanation the user ever gets for
+    /// why a run was relaunched, and they must arrive DURING the relaunched attempt — a settled
+    /// snapshot cannot carry them, because `compactCompletedProgress` (`shared/utils.ts:414-421`,
+    /// ported at [`crate::tui::events::LiveProgressSnapshot::compact_completed`]) empties
+    /// `recent_output` as one of its two growth terms.
+    ///
+    /// cyrup's live surface folds the child's raw NDJSON rather than sharing pi's one mutable
+    /// `progress` object, so a parent-side note has no child line to ride in on — hence this second,
+    /// explicit channel. [CYRUP-DELTA: transport only; the note text, its timing and the ring it
+    /// lands in are pi's.]
+    pub fn emit_note(&self, note: &str) {
+        if let Some(notes) = &self.notes {
+            notes(note);
+        }
     }
 }
 
@@ -1201,9 +1251,10 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// `buildPiArgs`, `pi-args.ts:83-229`).
 ///
 /// Argv (flags in any order, task prompt last): `--print`, `--mode`, `json`; `--model
-/// <apply_thinking_suffix(model, agent.thinking)>` (T4 thinking-suffix); an optional `--tools
-/// <comma-list>` — the agent's declared builtins plus any resolved direct-MCP tool names — present
-/// only when at least one builtin is declared (pi's `builtinTools.length > 0` gate); the agent's
+/// <apply_thinking_suffix(model, agent.thinking)>` (T4 thinking-suffix); the tool-allowlist flag —
+/// `--tools <comma-list>` (the agent's declared builtins plus any resolved direct-MCP tool names)
+/// when the agent pinned a non-empty allowlist, `--no-tools` when it pinned an EMPTY one, and
+/// nothing at all when it pinned none (pi's `explicitToolAllowlist` gate, `pi-args.ts:547-552`); the agent's
 /// extension threading (`--no-extensions` + `--extension <path>` allowlist when `agent.extensions`
 /// is `Some`, else `--extension <path>` for tool-extension/child-only paths with discovery left
 /// on); `--no-skills` when the agent does not inherit skills; `--system-prompt=<persona body>` /
@@ -1311,11 +1362,33 @@ pub fn build_attempt_spawn_plan(
         .iter()
         .any(|tool| tool == crate::extension::TOOL_NAME);
 
-    // pi: `--tools` is emitted ONLY when at least one builtin is declared; a direct-MCP-only agent
-    // gets no `--tools` at all (`pi-args.ts:117-123`). The resolved direct-MCP tool names — the
-    // whole point of the T4 fix (`mcp:` refs previously flowed to `--tools` literally, an
-    // unresolvable name) — are appended after the builtins.
-    if !builtin_tools.is_empty() {
+    // G103 / pi `pi-args.ts:390-392,547-552` @v0.43.0. `explicitToolAllowlist` is
+    // `input.tools !== undefined || mcpDirectTools.length > 0 || <ceiling>` — i.e. "did anything
+    // pin this child's tool surface at all". cyrup folds pi's `tools` and `mcpDirectTools` into the
+    // one `agent.tools: Option<Vec<ToolRef>>`, so `is_some()` IS that predicate: `None` is an agent
+    // that never wrote a `tools:` key (no restriction, child keeps the ambient set), `Some(_)` —
+    // INCLUDING `Some(vec![])` — is an explicit allowlist.
+    //
+    // Upstream then emits `--tools <list>` when the effective allowlist is non-empty and
+    // **`--no-tools`** when it is empty. Both halves were missing here: the old gate was
+    // `!builtin_tools.is_empty()`, which (a) dropped `--no-tools` entirely, so an agent that asked
+    // for NO tools — `tools:` empty in frontmatter, or a settings override of `"tools": false`,
+    // which `discovery::merge` resolves to `Some(vec![])` — was spawned with the FULL ambient tool
+    // set, the exact inversion of what it asked for; and (b) dropped `--tools` for a
+    // direct-MCP-only agent (upstream's `effectiveToolAllowlist` is `[...declaredBuiltinTools,
+    // ...effectiveMcpTools, ...internalTools]`, so MCP names alone still pin the allowlist).
+    //
+    // Upstream's third allowlist term, `internalTools` (`pi-args.ts:393` — the run's own
+    // `structured_output` grant when the step declared an `outputSchema`), has no counterpart here
+    // and needs none: **[CYRUP-DELTA]** cyrup's `--tools`/`--no-tools` selection
+    // (`cyrup-session-svc/src/builder.rs:255-292`) runs over `registry.visible(...)` alone, and the
+    // extension-contributed tools are merged in AFTERWARDS by `ext_host.active_tools(&base_tools)`
+    // (`builder.rs:1068,1084`). `structured_output` is registered by this crate's own child-side
+    // `prompt_runtime` extension, so it is never a candidate for the allowlist filter and survives
+    // `--no-tools` intact — where in pi it is a first-class tool that the flag WOULD deny, hence
+    // pi's explicit re-grant.
+    let explicit_tool_allowlist = agent.tools.is_some();
+    if explicit_tool_allowlist {
         let mut allowlist = builtin_tools.clone();
         if !mcp_direct_tools.is_empty() {
             allowlist.extend(mcp_direct_tools::resolve_mcp_direct_tool_names(
@@ -1323,23 +1396,26 @@ pub fn build_attempt_spawn_plan(
                 &opts.cwd,
             ));
         }
-        args.push("--tools".to_string());
-        args.push(allowlist.join(","));
+        if allowlist.is_empty() {
+            args.push("--no-tools".to_string());
+        } else {
+            args.push("--tools".to_string());
+            args.push(allowlist.join(","));
+        }
 
         // G106 / pi `pi-args.ts:611-616` @v0.43.0 (`env[REQUIRED_CHILD_TOOLS_ENV] =
         // JSON.stringify(toolPlan.requiredChildTools)`), whose `requiredChildTools` is
         // `explicitToolAllowlist ? [...declaredBuiltinTools, ...effectiveMcpTools, ...internalTools]
-        // : []` (`:401-409`). cyrup's `allowlist` is exactly the first two of those three terms, and
-        // this arm IS the `explicitToolAllowlist` branch (an agent with no `tools:` never reaches
-        // it, and upstream writes `[]` — i.e. nothing — for that case).
-        //
-        // The third term, upstream's `internalTools`, is the intercom bridge's own grant
-        // (`intercom-bridge.ts:169`'s `["intercom", "contact_supervisor"]`). cyrup has no
-        // bridge-tool computation at this seam, so the list carries the agent's DECLARED names
-        // only. That is the honest reading for its one consumer — the child-side `intercom`
-        // fallback registers when the agent asked for a tool called `intercom`, which is a
-        // statement about what the agent declared, not about what the bridge added.
-        required_child_tools = Some(allowlist);
+        // : []` (`:401-409`) — the same terms as `allowlist` above (minus `internalTools`, see the
+        // `[CYRUP-DELTA]` note there), and this arm IS the `explicitToolAllowlist` branch (an agent
+        // with no `tools:` never reaches it, and upstream writes `[]` — i.e. nothing — for that
+        // case). Upstream itself only sets the env when the list is non-empty (`:610`), so a
+        // no-tools child carries no `REQUIRED_CHILD_TOOLS` — which is also what its one consumer
+        // wants: the child-side `intercom` fallback registers when the agent asked for a tool
+        // called `intercom`, and an agent that asked for nothing asked for that too.
+        if !allowlist.is_empty() {
+            required_child_tools = Some(allowlist);
+        }
     }
 
     // Extension threading (pi `pi-args.ts:125-137`): `Some(extensions)` turns discovery off
@@ -1782,6 +1858,15 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         // crate's ladder hands them down one at a time, so each is appended as it arrives.
         if let Some(note) = attempt_note {
             progress.append_recent_output(note);
+            // ...and onto the LIVE surface, which is the only place a user can actually read it:
+            // this attempt's own `progress` is compacted (`recent_output` emptied) before it
+            // becomes `SingleResult::progress`, exactly as pi's `compactCompletedProgress` does.
+            // pi has no second hop here only because its live stream and its settled snapshot are
+            // the same mutable object; cyrup's live surface folds the child's NDJSON, which a
+            // parent-side note never appears on. See [`LiveEventSink::emit_note`].
+            if let Some(sink) = &self.opts.live_events {
+                sink.emit_note(note);
+            }
         }
 
         // pi `runSingleAttempt`'s control locals (`execution.ts:336,344-354`): the attempt's own
@@ -1842,6 +1927,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                         usage: Usage::default(),
                         timed_out: false,
                         detached: false,
+                        startup: StartupEvidence::default(),
                     },
                     AttemptRecord {
                         progress,
@@ -1869,6 +1955,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                         usage: Usage::default(),
                         timed_out: false,
                         detached: false,
+                        startup: StartupEvidence::default(),
                     },
                     AttemptRecord {
                         progress,
@@ -1908,6 +1995,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                     usage: progress.usage.clone(),
                     timed_out: false,
                     detached: outcome.detached,
+                    startup: StartupEvidence::default(),
                 },
                 AttemptRecord {
                     progress,
@@ -1918,10 +2006,10 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             );
         }
 
-        let (raw_exit_code, spawn_error) = match outcome.exit_status {
-            Ok(Some(status)) => (status.code(), None),
-            Ok(None) => (None, None), // terminated via signal escalation (timeout/cancel)
-            Err(err) => (None, Some(err.to_string())),
+        let (raw_exit_code, spawn_error, process_signal) = match &outcome.exit_status {
+            Ok(Some(status)) => (status.code(), None, process_signal_name(status)),
+            Ok(None) => (None, None, None), // terminated via signal escalation (timeout/cancel)
+            Err(err) => (None, Some(err.to_string()), None),
         };
 
         let final_output = extract_final_output(&progress.message_end_events);
@@ -1938,6 +2026,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                     usage: progress.usage.clone(),
                     timed_out: true,
                     detached: outcome.detached,
+                    startup: StartupEvidence::default(),
                 },
                 AttemptRecord {
                     progress,
@@ -1952,7 +2041,16 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
 
         // (a) The trailing, still-uncleared assistant `errorMessage` (pi close-handler
         //     `execution.ts:684` sets `result.error = assistantError`).
-        let mut error = spawn_error;
+        // (a.0) The protocol-output-limit diagnostic outranks everything: pi's `failProtocol` sets
+        //     `result.error` at the moment the cap trips, and the close handler only fills in a
+        //     `closeError` when `result.error` is still unset (`execution.ts:1099`).
+        let mut error = outcome
+            .protocol_error
+            .as_ref()
+            .map(crate::exec::child_protocol::format_protocol_output_limit);
+        if error.is_none() {
+            error = spawn_error;
+        }
         if error.is_none() {
             error = trailing_assistant_error(&progress.all_events);
         }
@@ -1960,8 +2058,13 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         // (b) `forcedDrainAfterFinalSuccess` (pi `execution.ts:685`): a child that emitted a CLEAN
         //     terminal stop but had to be force-drained (held stdout open past the grace window)
         //     is coerced to exit 0, not treated as a forced-kill failure.
-        let forced_drain_after_final_success =
-            outcome.forced_termination && outcome.clean_terminal_stop && error.is_none();
+        //     pi's witness is `(cleanTerminalAssistantStopReceived || agentSettledReceived)`
+        //     (`execution.ts:1080`) — a child that announced `agent_settled` finished on purpose
+        //     just as much as one that emitted a clean terminal assistant stop, and before
+        //     `agent_settled` was parsed at all this crate could only ever see the second half.
+        let forced_drain_after_final_success = outcome.forced_termination
+            && (outcome.clean_terminal_stop || outcome.agent_settled)
+            && error.is_none();
 
         // (b.1) Surface the child's trailing stderr as the error on a non-zero (or signal-death)
         //     exit, when nothing richer was already diagnosed and this is not a clean forced-drain
@@ -2043,7 +2146,11 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         // ladder's record; pi leaves it undefined, but this crate's `ModelAttempt`/`SingleResult`
         // callers surface `error` directly, so a plain "exited with code N" (never matching a
         // retryable pattern) is used rather than a null.
-        if !success && error.is_none() {
+        // ...and the startup-failure classifier has to be told that is what happened, since pi
+        // keys "the child failed with nothing to say" on `error` being UNSET
+        // (`subagent-startup-retry.ts:52`). See `StartupEvidence::error_is_placeholder`.
+        let error_is_placeholder = !success && error.is_none();
+        if error_is_placeholder {
             error = Some(format!("subagent attempt exited with code {exit_code}"));
         }
 
@@ -2058,6 +2165,30 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 // NDJSON showed a blocking `contact_supervisor` ask (surfaced via `spawn_clarify`),
                 // which bypasses acceptance/completion-guard/truncation and stops the ladder.
                 detached: outcome.detached,
+                // Startup-failure evidence (pi `execution.ts:1558-1573`). Every field here is a
+                // reason NOT to relaunch this model; `is_retryable_subagent_startup_failure`
+                // fails closed on any of them.
+                startup: StartupEvidence {
+                    final_output_present: final_output
+                        .as_deref()
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    message_count: progress.message_end_events.len(),
+                    tool_count: progress.tool_count,
+                    duration_ms: Some(progress.duration_ms()),
+                    protocol_error: outcome.protocol_error.is_some(),
+                    process_signal: process_signal.clone(),
+                    observed_mutation_attempt: crate::exec::completion_guard::has_mutation_tool_call(
+                        &progress.all_events,
+                    ),
+                    // cyrup's foreground executor has no `stopped`/`turnBudgetExceeded` analog
+                    // (pi carries both on the BACKGROUND runner's result). Neither can be true of
+                    // a child with zero messages, zero tools and zero usage anyway — both require
+                    // the child to have run turns — so leaving them false cannot widen the
+                    // predicate.
+                    stopped: false,
+                    turn_budget_exceeded: false,
+                    error_is_placeholder,
+                },
             },
             AttemptRecord {
                 progress,
@@ -2066,6 +2197,42 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 control,
             },
         )
+    }
+
+    /// pi `waitForSubagentStartupRetry(delayMs, [options.signal, options.interruptSignal])`
+    /// (`execution.ts:1588`): the backoff is raced against BOTH lifecycle signals, and which one
+    /// fired decides whether the run is paused or abandoned. Already-aborted is checked first
+    /// (upstream `subagent-startup-retry.ts:88`), so a cancelled run never sleeps before giving up.
+    async fn wait_startup_retry(&mut self, delay: Duration) -> StartupRetryWait {
+        if self.opts.interrupt.is_cancelled() {
+            return StartupRetryWait::Interrupted;
+        }
+        if self.opts.cancel.is_cancelled() {
+            return StartupRetryWait::Cancelled;
+        }
+        tokio::select! {
+            biased;
+            () = self.opts.interrupt.cancelled() => StartupRetryWait::Interrupted,
+            () = self.opts.cancel.cancelled() => StartupRetryWait::Cancelled,
+            () = tokio::time::sleep(delay) => StartupRetryWait::Proceed,
+        }
+    }
+
+    /// pi mutates `result.finalOutput`/`result.interrupted` in place at `execution.ts:1584-1618`;
+    /// this crate's ladder cannot reach inside an opaque `Attempt`, so it calls back here instead.
+    fn apply_startup_outcome(&mut self, attempt: &mut Self::Attempt, outcome: &StartupOutcome) {
+        match outcome {
+            StartupOutcome::Interrupted => {
+                attempt.interrupted = true;
+                attempt.final_output = Some(INTERRUPTED_FINAL_OUTPUT.to_string());
+            }
+            StartupOutcome::Cancelled(message) | StartupOutcome::Exhausted(message) => {
+                // pi also sets `result.progress.status/error` here; cyrup's `AgentProgress` carries
+                // neither field (its status/error live on `SingleResult`, which `run_sync` derives
+                // from the ladder's own `AttemptSignal::error` — already set by the ladder).
+                attempt.final_output = Some(message.clone());
+            }
+        }
     }
 
     fn snapshot_output_file(&mut self) {
@@ -2077,6 +2244,35 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         // heuristic, not a per-attempt one — a task's `output_path` does not change between
         // fallback attempts, so re-snapshotting per attempt would not observe anything new).
     }
+}
+
+/// The OS signal that killed a child, named the way pi names it (`proc.on("close", (code,
+/// signal))` hands Node's signal NAME straight through), for
+/// [`crate::exec::fallback::StartupEvidence::process_signal`]. `None` on a normal exit, and `None`
+/// on non-Unix, where no such concept crosses `ExitStatus`.
+#[cfg(unix)]
+fn process_signal_name(status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|signal| match signal {
+        libc_signal::SIGINT => "SIGINT".to_string(),
+        libc_signal::SIGKILL => "SIGKILL".to_string(),
+        libc_signal::SIGTERM => "SIGTERM".to_string(),
+        other => format!("SIG{other}"),
+    })
+}
+
+/// The three signal numbers this crate's own escalation ladder sends (R-SA-059), named locally so
+/// this module needs no `libc` dependency of its own.
+#[cfg(unix)]
+mod libc_signal {
+    pub const SIGINT: i32 = 2;
+    pub const SIGKILL: i32 = 9;
+    pub const SIGTERM: i32 = 15;
+}
+
+#[cfg(not(unix))]
+fn process_signal_name(_status: &std::process::ExitStatus) -> Option<String> {
+    None
 }
 
 /// The runtime facts [`SpawnedChildAttemptRunner::run_attempt`]'s exit-0 re-diagnosis (pi
@@ -2096,6 +2292,17 @@ struct DriveOutcome {
     /// pi's `cleanTerminalAssistantStopReceived` (`execution.ts:580`), the other half of
     /// `forcedDrainAfterFinalSuccess`.
     clean_terminal_stop: bool,
+    /// The child emitted `agent_settled` — pi's `agentSettledReceived` (`execution.ts:843`). The
+    /// SECOND half of pi's `forcedDrainAfterFinalSuccess` witness (`:1080`:
+    /// `(cleanTerminalAssistantStopReceived || agentSettledReceived)`), and the event that arms the
+    /// final-stop grace window for a child whose last assistant message was not a clean terminal
+    /// stop.
+    agent_settled: bool,
+    /// The child blew past the per-line stdout cap and the line was not a projectable aggregate
+    /// (pi `failProtocol`, `execution.ts:1026-1041`). Set only on that path; when set, the child was
+    /// force-terminated through the signal ladder and this diagnostic becomes the attempt's error,
+    /// ahead of every other diagnosis.
+    protocol_error: Option<crate::exec::child_protocol::ProtocolOutputLimit>,
     /// The child's real exit status once confirmed gone, or a genuine `wait()`/read I/O fault.
     exit_status: std::io::Result<Option<std::process::ExitStatus>>,
     /// R-SA-037: the child's NDJSON stream showed a BLOCKING `contact_supervisor` supervisor-clarify
@@ -2226,6 +2433,10 @@ async fn drive_attempt(
     // loop so the post-loop `wait_final_drain()` can report the already-known exit status.
     let mut exit_drain_at: Option<tokio::time::Instant> = None;
     let mut clean_terminal_stop = false;
+    // pi's `agentSettledReceived` (`execution.ts:595,862,1080`): the child announced the WHOLE run
+    // settled. Like `clean_terminal_stop` it is a "the child finished on purpose" witness, so a
+    // forced drain after it is still coerced to success.
+    let mut agent_settled = false;
     // R-SA-037: set once the child's NDJSON shows a blocking `contact_supervisor` ask; the ask is
     // surfaced via `spawn_clarify` exactly once (the guard below), and this flag then rides out to
     // the attempt's `detached` outcome (bypassing acceptance; the ladder does not advance past it).
@@ -2268,6 +2479,8 @@ async fn drive_attempt(
                     clean_terminal_stop,
                     exit_status: outcome.map(|o| Some(o.status)),
                     detached: detached_seen,
+                    agent_settled,
+                    protocol_error: None,
                 };
             }
             () = interrupt.cancelled() => {
@@ -2284,6 +2497,8 @@ async fn drive_attempt(
                     clean_terminal_stop,
                     exit_status: outcome.map(|o| Some(o.status)),
                     detached: detached_seen,
+                    agent_settled,
+                    protocol_error: None,
                 };
             }
             () = deadline_arm => {
@@ -2300,6 +2515,8 @@ async fn drive_attempt(
                     clean_terminal_stop,
                     exit_status: outcome.map(|o| Some(o.status)),
                     detached: detached_seen,
+                    agent_settled,
+                    protocol_error: None,
                 };
             }
             step = child.next_event_or_exit() => {
@@ -2332,15 +2549,44 @@ async fn drive_attempt(
                             // open the grace window on the FIRST terminal assistant stop and track
                             // whether ANY terminal stop was clean (no errorMessage) for
                             // `forcedDrainAfterFinalSuccess`.
-                            if is_terminal_assistant_stop(&event) {
+                            let terminal_stop = is_terminal_assistant_stop(&event);
+                            if terminal_stop {
                                 clean_terminal_stop =
                                     clean_terminal_stop || !message_end_has_error_message(&event);
-                                if final_drain_at.is_none() {
-                                    final_drain_at = Some(
-                                        tokio::time::Instant::now()
-                                            + Duration::from_millis(FINAL_STOP_GRACE_MS),
-                                    );
+                            }
+                            if matches!(event, crate::exec::ndjson::SubagentEvent::AgentSettled) {
+                                agent_settled = true;
+                            }
+                            // pi `applyChildLifecycle(projectChildLifecycle(evt))` — run for EVERY
+                            // event (`execution.ts:844`), plus the terminal-stop form at `:947`.
+                            // The three arms are: `agent_end{willRetry:true}` DISARMS the window
+                            // (the child is about to retry — force-killing it there kills a run
+                            // that is still working); `agent_settled` and a terminal assistant stop
+                            // ARM it; everything else leaves it alone.
+                            let will_retry = matches!(
+                                event,
+                                crate::exec::ndjson::SubagentEvent::AgentEnd {
+                                    will_retry: true,
+                                    ..
                                 }
+                            );
+                            match crate::exec::child_protocol::project_child_lifecycle(
+                                event.kind(),
+                                will_retry,
+                                terminal_stop,
+                            ) {
+                                crate::exec::child_protocol::ChildLifecycleAction::CancelDrain => {
+                                    final_drain_at = None;
+                                }
+                                crate::exec::child_protocol::ChildLifecycleAction::StartDrain => {
+                                    if final_drain_at.is_none() {
+                                        final_drain_at = Some(
+                                            tokio::time::Instant::now()
+                                                + Duration::from_millis(FINAL_STOP_GRACE_MS),
+                                        );
+                                    }
+                                }
+                                crate::exec::child_protocol::ChildLifecycleAction::None => {}
                             }
                             // R-SA-037 detach-trigger arm: a child's blocking `contact_supervisor`
                             // ask (`need_decision`/`interview`) surfaces the ask to the parent's
@@ -2377,6 +2623,29 @@ async fn drive_attempt(
                             );
                             progress.record_event(event);
                         }
+                    }
+                    crate::spawn::ChildStep::ProtocolLimit(limit) => {
+                        // pi `failProtocol` (`execution.ts:1026-1041`): the diagnostic becomes the
+                        // run's error and the child is signalled down (upstream SIGTERM then, 3s
+                        // later, SIGKILL — cyrup routes every forced termination through
+                        // `terminate`'s own SIGINT->SIGTERM->SIGKILL ladder instead of inventing a
+                        // second one). Nothing further can be read: the reader is permanently
+                        // closed, so continuing to poll it would spin on `Eof`.
+                        let outcome = child.terminate(&cancel).await;
+                        return DriveOutcome {
+                            timed_out: false,
+                            interrupted: false,
+                            // NOT a forced *drain*: upstream's `failProtocol` deliberately does not
+                            // set `forcedTerminationSignal`, so the clean-drain coercion to exit 0
+                            // cannot swallow a protocol failure. (It could not anyway — that
+                            // coercion also requires no error, and this sets one.)
+                            forced_termination: false,
+                            clean_terminal_stop,
+                            exit_status: outcome.map(|o| Some(o.status)),
+                            detached: detached_seen,
+                            agent_settled,
+                            protocol_error: Some(limit),
+                        };
                     }
                     crate::spawn::ChildStep::Line(Err(_)) | crate::spawn::ChildStep::Eof => {
                         // Stdout EOF (child exited/closed stdout) or a genuine read fault — either
@@ -2428,6 +2697,8 @@ async fn drive_attempt(
                     clean_terminal_stop,
                     exit_status: outcome.map(|o| Some(o.status)),
                     detached: detached_seen,
+                    agent_settled,
+                    protocol_error: None,
                 };
             }
             () = async {
@@ -2455,6 +2726,8 @@ async fn drive_attempt(
                 clean_terminal_stop,
                 exit_status: Ok(Some(status)),
                 detached: detached_seen,
+                agent_settled,
+                protocol_error: None,
             }
         }
         Ok(None) => {
@@ -2470,6 +2743,8 @@ async fn drive_attempt(
                 clean_terminal_stop,
                 exit_status: outcome.map(|o| Some(o.status)),
                 detached: detached_seen,
+                agent_settled,
+                protocol_error: None,
             }
         }
         Err(err) => DriveOutcome {
@@ -2479,6 +2754,8 @@ async fn drive_attempt(
             clean_terminal_stop,
             exit_status: Err(err),
             detached: detached_seen,
+            agent_settled,
+            protocol_error: None,
         },
     }
 }
@@ -3638,6 +3915,155 @@ mod tests {
         );
         // `replace` must never also append — the two flags are mutually exclusive per mode.
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
+    }
+
+    // ---- G103: an EXPLICITLY empty `tools:` means "no tools" (pi `pi-args.ts:390-392,547-552`) ----
+
+    /// The USER ACTION: an author writes an agent `.md` whose frontmatter says `tools:` with
+    /// nothing after it — "this agent gets NO tools" — and someone delegates to that agent. The
+    /// spawned `cyrup` child must carry `--no-tools`.
+    ///
+    /// Before the fix the whole chain silently inverted the request: `parse_agent_file` folded the
+    /// empty list to `None` ("no restriction"), and the argv builder's `!builtin_tools.is_empty()`
+    /// gate then emitted no flag at all, so the child came up with the FULL ambient tool set —
+    /// read, write, edit and bash included.
+    #[test]
+    fn an_explicitly_empty_tools_list_spawns_the_child_with_no_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A REAL agent file, so discovery and the argv builder are both exercised — the defect
+        // lived in the seam between them and either half alone would have looked correct.
+        let def = crate::discovery::frontmatter::parse_agent_file(
+            "---\nname: scribe\ndescription: Writes prose, touches nothing\ntools:\n---\n\n- You are the SCRIBE persona.\n",
+            crate::discovery::types::AgentSource::User,
+            std::path::Path::new("scribe.md"),
+        )
+        .expect("agent file parses");
+        assert_eq!(
+            def.tools,
+            Some(Vec::new()),
+            "an explicitly-empty `tools:` must survive discovery as an EMPTY allowlist, distinct \
+             from the `None` that an ABSENT `tools:` produces (pi `agents.ts:1610`)"
+        );
+
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let agent = AgentConfig::from_agent_definition(&def, depth);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+
+        assert!(
+            argv.contains(&"--no-tools".to_string()),
+            "a no-tools agent must be spawned with --no-tools; argv was {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--tools"),
+            "--no-tools and --tools are mutually exclusive; argv was {argv:?}"
+        );
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS),
+            "upstream only writes REQUIRED_CHILD_TOOLS for a NON-empty allowlist \
+             (`pi-args.ts:610`); env was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// MIRROR: an agent that OMITS `tools:` entirely is asking to INHERIT the ambient tool set, not
+    /// to be stripped of it. Neither flag may appear — the case the fix must not capture.
+    #[test]
+    fn an_omitted_tools_key_leaves_the_child_tool_set_unrestricted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let def = crate::discovery::frontmatter::parse_agent_file(
+            "---\nname: scribe\ndescription: Writes prose\n---\n\n- You are the SCRIBE persona.\n",
+            crate::discovery::types::AgentSource::User,
+            std::path::Path::new("scribe.md"),
+        )
+        .expect("agent file parses");
+        assert_eq!(
+            def.tools, None,
+            "an ABSENT `tools:` key must stay `None` — pi `agents.ts:1610` carries the field only \
+             when `rawTools !== undefined`"
+        );
+
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let agent = AgentConfig::from_agent_definition(&def, depth);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+
+        assert!(
+            !argv.iter().any(|a| a == "--no-tools" || a == "--tools"),
+            "an agent that pinned no allowlist must get neither flag; argv was {argv:?}"
+        );
+    }
+
+    /// MIRROR: a NON-empty allowlist is unaffected — `--tools <list>` exactly as before, and the
+    /// `REQUIRED_CHILD_TOOLS` env still pinned.
+    #[test]
+    fn a_non_empty_tools_list_still_pins_the_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.tools = Some(vec![
+            ToolRef::Builtin("read".to_string()),
+            ToolRef::Builtin("grep".to_string()),
+        ]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let opts = base_opts(dir.path(), &["m1"]);
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+
+        let idx = argv
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("a declared allowlist must still emit --tools");
+        assert_eq!(argv.get(idx + 1).map(String::as_str), Some("read,grep"));
+        assert!(!argv.iter().any(|a| a == "--no-tools"));
+        assert!(
+            plan.spec
+                .env_overlay
+                .get(crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS)
+                .is_some_and(|v| v.contains("read")),
+            "env was {:?}",
+            plan.spec.env_overlay
+        );
     }
 
     // ---- `memory:` scopes reach the child persona (pi `execution.ts:1058-1061`) ----

@@ -4275,6 +4275,10 @@ async fn drive_foreground_run_sync(
         agent_name.to_string(),
     ))));
     let sink = {
+        // Both closures below need their own handles; take the note sink's copies FIRST, since the
+        // line sink's `move` consumes the ones named after it.
+        let note_fold = std::sync::Arc::clone(&fold);
+        let note_tx = tx.clone();
         let fold = std::sync::Arc::clone(&fold);
         crate::exec::LiveEventSink::new(move |raw: &str| {
             let mut guard = match fold.lock() {
@@ -4290,6 +4294,21 @@ async fn drive_foreground_run_sync(
                 // A closed receiver (the caller already returned) is a benign no-op.
                 let _ = tx.send(payload.into_tool_update(text));
             }
+        })
+        // Parent-side attempt notes (model-fallback / startup-retry) fold into the SAME ring and
+        // fire an update immediately: the note explains a relaunch that is happening right now, so
+        // it is worthless if it waits for the next child event — and it cannot wait for settle,
+        // where `compact_completed` empties `recent_output` outright.
+        .with_note_sink(move |note: &str| {
+            let mut guard = match note_fold.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.record_attempt_note(note);
+            let snapshot = guard.snapshot(LiveProgressStatus::Running);
+            let payload = SubagentUpdatePayload::single_live(resolved_context, snapshot);
+            let text = payload.content_text();
+            let _ = note_tx.send(payload.into_tool_update(text));
         })
     };
     run_options.live_events = Some(sink);
@@ -9297,7 +9316,10 @@ const BUILTIN_AGENT_NAMES: [&str; 8] = [
 /// pi's `INHERIT_MODEL` sentinel (`runs/shared/model-fallback.ts:22`): a persona's `model` set to
 /// the literal string `"inherit"` requests the parent session's model exactly as if `model` were
 /// unset — it is NOT a real model id to resolve against the catalog or print verbatim.
-const INHERIT_MODEL_SENTINEL: &str = "inherit";
+///
+/// Re-exported from its canonical owner, [`crate::exec::fallback`], which is where the LAUNCH path
+/// applies it (this module's use is the `models` report formatter).
+use crate::exec::fallback::INHERIT_MODEL_SENTINEL;
 
 /// pi `splitThinkingSuffix` (`runs/shared/model-fallback.ts:13-19`): split a model string on its
 /// LAST `:`, isolating a trailing thinking-level suffix (`:high`, `:off`, ...) from the base model

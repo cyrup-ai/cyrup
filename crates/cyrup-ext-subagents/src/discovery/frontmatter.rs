@@ -729,10 +729,15 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
 
     let runtime_name = AgentDefinition::qualified_name(&local_name, package_name.as_deref());
 
-    let tools = parse_frontmatter_list(parsed.get("tools"))
-        .map(parse_tool_refs)
-        .unwrap_or_default();
-    let tools = if tools.is_empty() { None } else { Some(tools) };
+    // G103 / pi `agents.ts:1610` @v0.43.0: `...(rawTools !== undefined ? { tools } : {})` — the
+    // `tools` field is carried onto the agent exactly when the frontmatter KEY was present, and its
+    // value is whatever `splitToolList` produced, INCLUDING the empty list. An explicitly-empty
+    // `tools:` therefore means "this agent gets no tools" and stays distinct from an absent
+    // `tools:`, which means "no allowlist restriction" (see [`AgentDefinition::tools`]'s own doc).
+    // Collapsing the two — which this used to do with an `is_empty() -> None` fold — silently
+    // handed a no-tools agent the full builtin set, because [`crate::exec::build_attempt_spawn_plan`]
+    // emits `--no-tools` only for the explicit-but-empty case.
+    let tools = parse_frontmatter_list(parsed.get("tools")).map(parse_tool_refs);
 
     let default_reads = parse_frontmatter_list(parsed.get("defaultReads"))
         .filter(|v| !v.is_empty())
@@ -1396,6 +1401,40 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(populated.extensions, Some(vec!["foo".to_string(), "bar".to_string()]));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // G103: an explicitly-empty `tools:` is NOT the same as an absent one (pi `agents.ts:1610`)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn an_explicitly_empty_tools_key_parses_to_an_empty_allowlist_not_to_none() {
+        // pi: `parseFrontmatterList("")` is `[]`, `splitToolList([])` is `{ tools: [] }`, and
+        // `...(rawTools !== undefined ? { tools } : {})` therefore CARRIES that empty list onto the
+        // agent. `None` means "no allowlist restriction"; `Some(vec![])` means "no tools".
+        for content in [
+            "---\nname: scribe\ndescription: Scribe\ntools:\n---\n\nBody\n",
+            "---\nname: scribe\ndescription: Scribe\ntools: \"\"\n---\n\nBody\n",
+        ] {
+            let def = parse_agent_file(content, AgentSource::Project, Path::new("/s.md"))
+                .expect("parses");
+            assert_eq!(
+                def.tools,
+                Some(Vec::new()),
+                "an explicitly-empty `tools:` must be an EMPTY allowlist, not `None`; input was \
+                 {content:?}"
+            );
+            assert!(def.present_fields.contains("tools"));
+        }
+    }
+
+    #[test]
+    fn an_absent_tools_key_parses_to_none() {
+        // The MIRROR of the case above — the distinction only exists if BOTH sides hold.
+        let content = "---\nname: scribe\ndescription: Scribe\n---\n\nBody\n";
+        let def = parse_agent_file(content, AgentSource::Project, Path::new("/s.md")).expect("parses");
+        assert_eq!(def.tools, None);
+        assert!(!def.present_fields.contains("tools"));
     }
 
     // -----------------------------------------------------------------------------------------

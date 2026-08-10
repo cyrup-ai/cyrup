@@ -597,13 +597,190 @@ pub fn has_mutation_tool_call(events: &[SubagentEvent]) -> bool {
     })
 }
 
-/// Source: `isMutatingBashCommand` (`long-running-guard.ts`). A bash command counts as mutating
-/// if it contains an unquoted file-redirection operator (`>`/`>>` not immediately preceded by `-`
-/// and not immediately followed by `&`/`|`/`;`/`(`/`)`, outside single/double quotes) OR matches
-/// one of the fixed `MUTATING_BASH_PATTERNS`.
+/// Source: `isMutatingBashCommand` (`long-running-guard.ts:138-142` @v0.43.0). A bash command
+/// counts as mutating if it contains an unquoted file-redirection operator (`>`/`>>` not
+/// immediately preceded by `-` and not immediately followed by `&`/`|`/`;`/`(`/`)`, outside
+/// single/double quotes) OR invokes a mutating `git` subcommand ([`has_mutating_git_command`]) OR
+/// matches one of the fixed `MUTATING_BASH_PATTERNS`.
+///
+/// G84: the `has_mutating_git_command` term is the post-v0.34.0 upstream addition
+/// (`long-running-guard.ts:128-141`, absent at the ported baseline). Without it a subagent whose
+/// only write to the repo is `git add`/`git commit`/`git push` registers as having attempted NO
+/// mutation, which (a) makes [`has_mutation_tool_call`] return `false` and fires the completion
+/// guard's "no mutating tool call was observed" failure on a run that really did change the repo,
+/// and (b) leaves a repeatedly-failing `git push` out of the control loop's mutating-failure
+/// accounting ([`crate::exec::control`]'s `needs_attention` escalation), so the run never
+/// escalates.
 #[must_use]
 pub fn is_mutating_bash_command(command: &str) -> bool {
-    has_unquoted_file_redirection(command) || matches_mutating_bash_pattern(command)
+    has_unquoted_file_redirection(command)
+        || has_mutating_git_command(command)
+        || matches_mutating_bash_pattern(command)
+}
+
+/// Source: `unquotedShellText` (`long-running-guard.ts:99-126`) — rewrite `command` so that every
+/// character that was inside single or double quotes becomes a `_` placeholder and the quote
+/// characters themselves are dropped. Segment splitting and the `git` prefix test in
+/// [`has_mutating_git_command`] then only ever see genuinely unquoted shell text, so
+/// `echo "git push"` cannot be mistaken for an actual push.
+///
+/// Ported branch-for-branch, including the backslash asymmetry: outside quotes a `\` and the
+/// character it escapes are both preserved verbatim; inside double quotes both become `_`; inside
+/// single quotes `\` is not an escape at all and simply becomes `_`.
+fn unquoted_shell_text(command: &str) -> String {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut result = String::with_capacity(command.len());
+    for ch in command.chars() {
+        if escaped {
+            result.push(if in_single || in_double { '_' } else { ch });
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            result.push(if in_double { '_' } else { ch });
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        result.push(if in_single || in_double { '_' } else { ch });
+    }
+    result
+}
+
+/// Source: the `unquoted.split(/(?:&&|\|\||[;|()\n])/)` in `hasMutatingGitCommand`
+/// (`long-running-guard.ts:130`). Splits on `&&`, `||`, `;`, `|`, `(`, `)` and `\n` — note a
+/// SINGLE `&` is deliberately not a separator (it is absent from the source's character class),
+/// and `||` falls out of the single-`|` case as two splits around an empty segment, which the
+/// caller's blank-segment skip discards exactly as the source's `if (!trimmed) continue` does.
+///
+/// Every separator is ASCII, and a multi-byte UTF-8 continuation byte is always `>= 0x80`, so
+/// byte-wise scanning can never land mid-character; the `get(..)` slices are still fallible-checked
+/// rather than indexed, per the crate's no-panic policy.
+fn split_shell_segments(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let sep_len = if bytes.get(i) == Some(&b'&') && bytes.get(i + 1) == Some(&b'&') {
+            2
+        } else if matches!(bytes.get(i), Some(&b';' | &b'|' | &b'(' | &b')' | &b'\n')) {
+            1
+        } else {
+            0
+        };
+        if sep_len == 0 {
+            i += 1;
+            continue;
+        }
+        out.push(text.get(start..i).unwrap_or(""));
+        i += sep_len;
+        start = i;
+    }
+    out.push(text.get(start..).unwrap_or(""));
+    out
+}
+
+/// Source: `hasMutatingGitCommand` (`long-running-guard.ts:128-136` @v0.43.0). True when any
+/// unquoted shell segment invokes `git add`, `git commit` or `git push`, allowing the same global
+/// options the source's regex allows in between. Segments that begin with `echo`/`printf` are
+/// skipped, matching the source's `/^(?:echo|printf)\b/` guard.
+fn has_mutating_git_command(command: &str) -> bool {
+    let unquoted = unquoted_shell_text(command);
+    for segment in split_shell_segments(&unquoted) {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // `/^(?:echo|printf)\b/`
+        if starts_with_word(trimmed, "echo") || starts_with_word(trimmed, "printf") {
+            continue;
+        }
+        if segment_invokes_mutating_git(trimmed) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `s` begins with the literal `word` followed by a regex word boundary (end-of-string or a
+/// non-word character) — the `^<word>\b` shape used by the two guards in
+/// [`has_mutating_git_command`].
+fn starts_with_word(s: &str, word: &str) -> bool {
+    s.strip_prefix(word)
+        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
+}
+
+/// One segment against the source's
+/// `^git\s+(?:(?:(?:-C|--git-dir|--work-tree)\s+\S+|(?:--git-dir|--work-tree)=\S+|--paginate)\s+)*(?:add|commit|push)\b`.
+///
+/// The `*` group and the verb alternation are disjoint (every option starts with `-`, no verb
+/// does), so the regex's backtracking is unnecessary here: the loop tests the verb first and
+/// otherwise consumes exactly one option group per iteration, bailing the moment neither matches.
+fn segment_invokes_mutating_git(segment: &str) -> bool {
+    let Some(after_git) = segment.strip_prefix("git") else {
+        return false;
+    };
+    // `git\s+` — at least one whitespace character must follow the literal `git`.
+    let mut cursor = after_git.trim_start_matches(char::is_whitespace);
+    if cursor == after_git {
+        return false;
+    }
+    loop {
+        // `(?:add|commit|push)\b`
+        for verb in ["add", "commit", "push"] {
+            if starts_with_word(cursor, verb) {
+                return true;
+            }
+        }
+        // `(?:--git-dir|--work-tree)=\S+`
+        let after_option = if let Some(tail) = cursor
+            .strip_prefix("--git-dir=")
+            .or_else(|| cursor.strip_prefix("--work-tree="))
+        {
+            let after_value = tail.trim_start_matches(|c: char| !c.is_whitespace());
+            // `\S+` needs at least one non-whitespace character.
+            if after_value == tail {
+                return false;
+            }
+            after_value
+        // `(?:-C|--git-dir|--work-tree)\s+\S+`
+        } else if let Some(tail) = cursor
+            .strip_prefix("--git-dir")
+            .or_else(|| cursor.strip_prefix("--work-tree"))
+            .or_else(|| cursor.strip_prefix("-C"))
+        {
+            let after_ws = tail.trim_start_matches(char::is_whitespace);
+            if after_ws == tail {
+                return false;
+            }
+            let after_value = after_ws.trim_start_matches(|c: char| !c.is_whitespace());
+            if after_value == after_ws {
+                return false;
+            }
+            after_value
+        // `--paginate`
+        } else if let Some(tail) = cursor.strip_prefix("--paginate") {
+            tail
+        } else {
+            return false;
+        };
+        // Each option group in the source's `*` is itself followed by `\s+`.
+        let next = after_option.trim_start_matches(char::is_whitespace);
+        if next == after_option {
+            return false;
+        }
+        cursor = next;
+    }
 }
 
 /// Source: `hasUnquotedFileRedirection` — a hand-rolled quote-aware scanner (already
@@ -949,13 +1126,20 @@ fn find_word_boundary_case_sensitive_lower(haystack: &str, needle_lower: &str) -
 /// agent implicitly has access to every mutating builtin too, so this returns `false` for `None`,
 /// matching the source's own `tools !== undefined` guard (an agent that declared no `tools` field
 /// at all is conservatively treated as NOT read-only-only).
+///
+/// G103: `tools == Some(vec![])` — an EXPLICITLY empty allowlist — returns `true` (the guard is
+/// exempt), because an agent granted no tools at all cannot mutate anything and so can never be
+/// expected to. That is `[].every(...) === true` in the source's
+/// `return !tools.every((tool) => READ_ONLY_BUILTIN_TOOLS.has(tool))`
+/// (`completion-guard.ts:39-43` @v0.43.0). The `tools.length === 0` short-circuit this used to
+/// mirror belongs to the v0.34.0 shape (`toolMutationCapability`, which classed an empty list as
+/// mutation-CAPABLE) and was dropped upstream; keeping it made a no-tools agent fail every
+/// implementation-worded task with the completion guard's "no mutating tool call was observed"
+/// error that it had no possible way to avoid.
 fn declares_only_read_only_tools(agent: &AgentDefinition) -> bool {
     let Some(tools) = &agent.tools else {
         return false;
     };
-    if tools.is_empty() {
-        return false;
-    }
     tools.iter().all(|tool_ref| match tool_ref {
         ToolRef::Builtin(name) => READ_ONLY_BUILTIN_TOOLS.contains(&name.as_str()),
         ToolRef::Mcp(_) | ToolRef::ExtensionPath(_) => false,
@@ -1255,6 +1439,86 @@ mod tests {
         assert!(is_mutating_bash_command("patch -p0 < fix.patch"));
     }
 
+    // ---- G84: `git add`/`commit`/`push` are mutations (`long-running-guard.ts:128-141` @v0.43.0)
+
+    /// The USER ACTION: an agent is told to "fix the failing test and commit it". It edits through
+    /// a heredoc-free path (or the edit itself is already staged) and finishes with `git commit`.
+    /// That agent HAS mutated the repo, so the completion guard must not fail the run for having
+    /// "observed no mutating tool call".
+    ///
+    /// Before the fix `is_mutating_bash_command` had only the redirection and
+    /// `MUTATING_BASH_PATTERNS` terms, and `git commit` matched neither.
+    #[test]
+    fn git_add_commit_and_push_count_as_mutating_bash_commands() {
+        assert!(is_mutating_bash_command("git add -A"));
+        assert!(is_mutating_bash_command("git commit -m 'wip'"));
+        assert!(is_mutating_bash_command("git push origin HEAD"));
+        assert!(is_mutating_bash_command("git push"));
+        // Global options the source's regex explicitly tolerates between `git` and the verb.
+        assert!(is_mutating_bash_command("git -C /repo commit -am x"));
+        assert!(is_mutating_bash_command("git --git-dir=/r/.git add ."));
+        assert!(is_mutating_bash_command("git --work-tree /r --git-dir /r/.git push"));
+        assert!(is_mutating_bash_command("git --paginate add ."));
+        // Not the first command in the line: the source splits on shell separators first.
+        assert!(is_mutating_bash_command("cargo test && git commit -am wip"));
+        assert!(is_mutating_bash_command("cd /repo; git push"));
+        assert!(is_mutating_bash_command("(git add .)"));
+
+        // MIRROR — every near-miss the source's own guards carve out must stay non-mutating, or
+        // the guard would be satisfied by any agent that merely LOOKED at the repo.
+        assert!(!is_mutating_bash_command("git status"));
+        assert!(!is_mutating_bash_command("git log --oneline"));
+        assert!(!is_mutating_bash_command("git diff HEAD"));
+        // `\b` after the verb.
+        assert!(!is_mutating_bash_command("git addendum"));
+        assert!(!is_mutating_bash_command("git pushes"));
+        // `/^(?:echo|printf)\b/` skips the segment outright...
+        assert!(!is_mutating_bash_command("echo git commit"));
+        assert!(!is_mutating_bash_command("printf 'git push'"));
+        // ...and `unquotedShellText` masks quoted spans, so an unrelated command that merely
+        // MENTIONS a push is not one.
+        assert!(!is_mutating_bash_command("rg \"git push\" docs/"));
+        assert!(!is_mutating_bash_command("cargo run -- 'git commit -m x'"));
+        // An unrecognized global option ends the `*` loop without reaching a verb.
+        assert!(!is_mutating_bash_command("git -c user.name=x commit"));
+    }
+
+    /// The consequence, driven through the guard itself: a run whose only repo write was a
+    /// `git commit` must NOT be failed by the completion-mutation guard.
+    #[test]
+    fn a_git_commit_satisfies_the_completion_mutation_guard() {
+        let committer = agent(
+            "worker",
+            Some(vec![ToolRef::Builtin("bash".to_string())]),
+            None,
+        );
+        let events = vec![tool_start(
+            "bash",
+            serde_json::json!({"command": "git commit -am 'fix the failing test'"}),
+        )];
+        assert!(has_mutation_tool_call(&events));
+
+        let result =
+            evaluate_completion_mutation_guard(&committer, "Implement the fix and commit it", &events);
+        assert!(
+            result.expected_mutation,
+            "a bash-capable worker told to implement is expected to mutate"
+        );
+        assert!(
+            result.attempted_mutation,
+            "the `git commit` IS the mutation; without it the guard fails a run that really did \
+             change the repo"
+        );
+        assert!(!result.triggered);
+
+        // MIRROR: the same agent that only ran `git status` still trips the guard.
+        let looker = vec![tool_start("bash", serde_json::json!({"command": "git status"}))];
+        assert!(
+            evaluate_completion_mutation_guard(&committer, "Implement the fix and commit it", &looker)
+                .triggered
+        );
+    }
+
     #[test]
     fn has_mutation_tool_call_reads_bash_command_from_call_args() {
         let events = vec![tool_start(
@@ -1335,10 +1599,16 @@ mod tests {
         let task = "Implement the approved source fix";
 
         assert!(evaluate_completion_mutation_guard(&agent("architect", None, None), task, &[]).triggered);
-        assert!(
-            evaluate_completion_mutation_guard(&agent("architect", Some(vec![]), None), task, &[])
-                .triggered
-        );
+        // G103: an agent granted NO tools cannot mutate anything, so the guard must never fire on
+        // it — `hasMutationToolCapability([]) === false` (`completion-guard.ts:39-43` @v0.43.0),
+        // which short-circuits `expectedMutation` to `false` and with it `triggered`. This
+        // asserted `.triggered` (the v0.34.0 `toolMutationCapability` shape, which classed an
+        // empty list as mutation-capable), i.e. it asserted that a no-tools agent FAILS every
+        // implementation-worded task it is ever given.
+        let empty_allowlist =
+            evaluate_completion_mutation_guard(&agent("architect", Some(vec![]), None), task, &[]);
+        assert!(!empty_allowlist.expected_mutation);
+        assert!(!empty_allowlist.triggered);
         assert!(evaluate_completion_mutation_guard(
             &agent(
                 "architect",
@@ -1442,7 +1712,11 @@ mod tests {
     #[test]
     fn declares_only_read_only_tools_matches_source_semantics() {
         assert!(!declares_only_read_only_tools(&agent("a", None, None)));
-        assert!(!declares_only_read_only_tools(&agent("a", Some(vec![]), None)));
+        // G103 / `completion-guard.ts:39-43` @v0.43.0: an EXPLICITLY empty allowlist has no
+        // mutation capability at all (`[].every(...) === true`), so the guard exempts it. This
+        // asserted `!` while cyrup still mirrored v0.34.0's `tools.length === 0 =>
+        // mutation-capable` short-circuit.
+        assert!(declares_only_read_only_tools(&agent("a", Some(vec![]), None)));
         assert!(declares_only_read_only_tools(&agent(
             "a",
             Some(vec![ToolRef::Builtin("read".to_string())]),

@@ -154,7 +154,15 @@ pub enum SubagentEvent {
         is_error: bool,
     },
     /// A turn (assistant message + its tool calls/results) completed.
+    ///
+    /// `message` carries `#[serde(default)]` because `turn_end` is one of the two AGGREGATE records
+    /// the bounded reader may deliver in reduced form: when a child's `turn_end` line exceeds
+    /// [`crate::exec::child_protocol::MAX_CHILD_PENDING_LINE_BYTES`], the reader replaces it with
+    /// the projected `{"type":"turn_end"}` (`child-protocol.ts:219`). Without the default that
+    /// projected record fails to deserialize and [`parse_line`]'s `.ok()` drops it silently, so the
+    /// recovery path upstream added would deliver nothing.
     TurnEnd {
+        #[serde(default)]
         message: serde_json::Value,
         #[serde(default)]
         tool_results: Vec<serde_json::Value>,
@@ -168,6 +176,17 @@ pub enum SubagentEvent {
         #[serde(default)]
         will_retry: bool,
     },
+    /// The WHOLE run settled — the last event a cyrup child emits before its run-scoped stream
+    /// closes (`cyrup-session-svc/src/subscriber.rs:214-228`; Pi `_emitAgentSettled`,
+    /// `agent-session.ts:599-600`). Distinct from [`SubagentEvent::AgentEnd`], which fires once per
+    /// agent loop and may be followed by an auto-retry.
+    ///
+    /// This variant is not decorative: pi's `projectChildLifecycle`
+    /// (`runs/shared/child-protocol.ts:398`) treats `agent_settled` as a drain START, so without it
+    /// the event degraded to [`SubagentEvent::Unknown`] here and a child that settled without a
+    /// terminal assistant stop (an error/aborted final message, a tool-call-terminated turn) never
+    /// armed the parent's final-stop grace window at all.
+    AgentSettled,
     /// The session-level steering/follow-up queue changed.
     QueueUpdate {
         #[serde(default)]
@@ -242,6 +261,7 @@ impl SubagentEvent {
             SubagentEvent::ToolExecutionEnd { .. } => "tool_execution_end",
             SubagentEvent::TurnEnd { .. } => "turn_end",
             SubagentEvent::AgentEnd { .. } => "agent_end",
+            SubagentEvent::AgentSettled => "agent_settled",
             SubagentEvent::QueueUpdate { .. } => "queue_update",
             SubagentEvent::CompactionStart { .. } => "compaction_start",
             SubagentEvent::CompactionEnd { .. } => "compaction_end",
