@@ -687,12 +687,6 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
         interrupted: Arc::clone(&interrupted),
         timed_out: Arc::clone(&timed_out),
     };
-    let _watcher_task = spawn_control_watcher(
-        run_paths.clone(),
-        control_flags.clone(),
-        interrupt_cancel.clone(),
-    );
-
     // R-SA-136/146: open the size-capped `events.jsonl` writer for this run, via the SAME shared
     // `BoundedJsonlWriter` primitive `spawn::SpawnedChild`'s per-attempt child-output tee uses
     // (`jsonl.rs`'s own module doc names this exact call site as one of its two intended writers).
@@ -715,6 +709,18 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     // telemetry pump mutate (pi's single `statusPayload`, folded from the per-child event handler
     // AND the 1s `activityTimer`, `subagent-runner.ts:1430-1581`).
     let shared_status: SharedStatus = Arc::new(std::sync::Mutex::new(status));
+
+    // R-SA-082's watcher is installed HERE rather than immediately after the two synchronous
+    // startup checks above, because G90's steer routing needs the shared status handle (it accepts
+    // a steer only against a currently-`Running` step and records the acceptance on that step). The
+    // synchronous startup checks stay where they were — they are what closes the pre-watcher race
+    // window, and nothing between them and this line can deliver a control request.
+    let _watcher_task = spawn_control_watcher(
+        run_paths.clone(),
+        control_flags.clone(),
+        interrupt_cancel.clone(),
+        Arc::clone(&shared_status),
+    );
 
     // The live-telemetry channel: each dispatched step's `RunOptions::live_events` sink forwards
     // raw child NDJSON lines here (tagged with the step's flat index); the telemetry task folds
@@ -1169,6 +1175,10 @@ async fn run_inner(
         share: config.share,
         artifacts_dir: config.artifacts_dir.clone(),
         artifact_config: config.artifact_config,
+        // G90 (pi `subagent-runner.ts:2313,2600,2797` @v0.34.0): the async run dir every
+        // dispatched step derives its own `steer-targets/<flatIndex>/` inbox from. This is the
+        // detached hop-2 runner, so it is exactly the process upstream gives `steerInboxDir` to.
+        run_dir: Some(run_paths.run_dir.clone()),
     });
     // SUBA-N03 — pi `subagent-runner.ts:2078-2081`: `const remainingMs = Math.max(0,
     // config.deadlineAt - Date.now())`. The orchestrator stamped an ABSOLUTE epoch deadline into
@@ -1927,6 +1937,19 @@ pub(crate) struct ExecSingleStepExecutor {
     /// `ctx.artifactConfig`). Read together with [`Self::artifacts_dir`]; `enabled: false` disables
     /// the write just as an absent dir does.
     pub(crate) artifact_config: crate::artifacts::ArtifactConfig,
+    /// G90 — this run's async run directory, the root of the steer control inbox
+    /// (`<run_dir>/control/steer-targets/<flatIndex>/`). Each dispatched step derives its OWN
+    /// per-child inbox from it and hands the path to the child in
+    /// [`crate::exec::RunOptions::steer_inbox_dir`], which is pi's
+    /// `steerInboxDir: stepSteerInboxDir(asyncDir, fi)` (`subagent-runner.ts:2313,2600,2797`
+    /// @v0.34.0).
+    ///
+    /// `None` for a FOREGROUND executor, matching upstream exactly: `steerInboxDir` is supplied
+    /// only by the background runner, because the inbox lives inside an async run directory and a
+    /// foreground `/chain`//`/parallel` walk has none. That is also why `control_steer` refuses a
+    /// foreground run outright ([`crate::extension::STEER_FOREGROUND_RUN_REFUSAL`]) rather than
+    /// queueing into a directory nothing would ever read.
+    pub(crate) run_dir: Option<PathBuf>,
 }
 
 impl ExecSingleStepExecutor {
@@ -1999,6 +2022,9 @@ impl ExecSingleStepExecutor {
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
+            // G90: a foreground walk has no async run directory, hence no steer inbox — the same
+            // reason upstream supplies `steerInboxDir` only from the background runner.
+            run_dir: None,
         }
     }
 
@@ -2028,6 +2054,24 @@ impl ExecSingleStepExecutor {
     ) -> Self {
         self.control = control;
         self
+    }
+
+    /// G90: the steer inbox the child at flat index `index` must be handed — pi
+    /// `steerInboxDir: stepSteerInboxDir(asyncDir, fi)` (`subagent-runner.ts:2313,2600,2797`
+    /// @v0.34.0).
+    ///
+    /// Named rather than inlined because the two halves of the runner hop have to agree on it and
+    /// they are written 800 lines apart: `handle_steer_request` routes an accepted request into
+    /// `control::enqueue_step_steer(run_dir, index, …)` (which writes to
+    /// `step_steer_inbox_dir(run_dir, index)`), and this is where the SAME path is handed to the
+    /// child. Deriving it from the run-level `steer_requests_dir`, or from a step index rather
+    /// than the FLAT index, would leave both sides individually plausible and the feature silently
+    /// dead — the failure mode this whole item is about.
+    #[must_use]
+    pub(crate) fn steer_inbox_for(&self, index: usize) -> Option<PathBuf> {
+        self.run_dir
+            .as_deref()
+            .map(|run_dir| control::step_steer_inbox_dir(run_dir, index))
     }
 }
 
@@ -2271,6 +2315,15 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             orchestrator_intercom_target: self.orchestrator_intercom_target.clone(),
             run_id: self.run_id.clone(),
             child_index: Some(self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst)),
+            // G90 (pi `steerInboxDir: stepSteerInboxDir(asyncDir, fi)`,
+            // `subagent-runner.ts:2313,2600,2797` @v0.34.0): THIS step's own per-child steer inbox,
+            // handed to the spawned child so its live steering watcher has a path to attach to. The
+            // index is the same `current_flat_index` `child_index` above uses — the position the
+            // runner's own `deliver_steer_request` routes an accepted request to
+            // (`control::enqueue_step_steer`), so the two halves of the hop address the same
+            // directory by construction. `None` for a foreground executor (no async run dir).
+            steer_inbox_dir: self
+                .steer_inbox_for(self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst)),
             // SUBA-N05: the run's resolved live-control config, threaded from
             // [`RunnerConfig::control`] (background) or [`ExecSingleStepExecutor::with_control`]
             // (foreground chain/parallel) — pi `controlConfig: input.controlConfig` on the
@@ -2478,12 +2531,31 @@ fn spawn_control_watcher(
     run_paths: RunPaths,
     flags: ControlFlags,
     interrupt_cancel: cyrup_core::CancelToken,
+    shared_status: SharedStatus,
 ) -> ControlWatcherHandle {
     let ControlFlags {
         interrupted,
         timed_out,
     } = flags;
     let handle = tokio::spawn(async move {
+        // G90: the steer queue's own `events.jsonl` writer. A second `BoundedJsonlWriter` on the
+        // same file is safe and does NOT double the 50MB budget: `create` opens in append mode and
+        // seeds `bytes_written` from the file's CURRENT length, so each writer's cap is measured
+        // against the file as it actually is, not against its own contribution.
+        let mut events = BoundedJsonlWriter::create(&run_paths.events).await.ok();
+        // pi's in-memory `pendingStepSteers` (`subagent-runner.ts:1332,2071-2075`): a steer that
+        // arrives while its target child is still `pending` is HELD, not dropped, and re-attempted.
+        //
+        // [CYRUP-DELTA] pi flushes the pending queue from an explicit per-step
+        // `flushPendingStepSteers(flatIndex)` hook at each dispatch site; this task instead
+        // re-attempts on the SAME fixed interval pi's own `watchAsyncControlInbox` runs its poll
+        // safety net at (`control-channel.ts:319`). Same guarantee — a held steer lands as soon as
+        // its child starts running — reached through the polling half of R-SA-082 rather than a new
+        // hook threaded through three dispatch sites. It also closes a real gap: cyrup's watcher
+        // previously had NO interval at all, so it depended entirely on `notify` firing.
+        let mut pending: Vec<control::SteerRequest> = Vec::new();
+        let mut ticker = tokio::time::interval(control::CONTROL_INBOX_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (watcher, mut rx) = match control::watch_control_inbox(&run_paths) {
             Ok(pair) => pair,
             Err(_) => {
@@ -2499,7 +2571,23 @@ fn spawn_control_watcher(
         // Keep the watcher alive for the lifetime of this task (dropping it would stop the watch)
         // — held in this local binding rather than discarded.
         let _watcher = watcher;
-        while rx.recv().await.is_some() {
+        loop {
+            // G90 turned this from a bare `rx.recv()` await into a two-arm select: the interval arm
+            // is what retries a HELD steer whose target child was still `pending` last time round,
+            // and is also the poll safety net pi's `watchAsyncControlInbox` has always had.
+            tokio::select! {
+                message = rx.recv() => {
+                    if message.is_none() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {}
+            }
+            // G90: drain the steer queue and route it, BEFORE the interrupt/timeout checks. Order
+            // matters and is pi's: a steer is non-terminal guidance for a child that is expected to
+            // keep running, so it must be handed over before an interrupt landing in the same tick
+            // tears that child down.
+            route_steer_requests(&run_paths, &shared_status, &mut events, &mut pending).await;
             // The control inbox now holds TWO distinct request files (`interrupt.json` and
             // `timeout.json`), so a notification is no longer self-describing: this task must ask
             // WHICH one is pending rather than blindly assuming "interrupt". Blindly setting
@@ -2540,6 +2628,145 @@ fn spawn_control_watcher(
         }
     });
     ControlWatcherHandle { handle }
+}
+
+/// G90 — the runner's steer router, pi `deliverSteerRequest` + the `onSteer` inbox handler
+/// (`subagent-runner.ts:1740-1790,2066-2076` @v0.34.0).
+///
+/// One tick: drain `<run_dir>/control/steer-requests/`, merge whatever was HELD from previous ticks,
+/// and for each request in `ts` order decide per target child whether it can be handed over right
+/// now. An accepted request is copied into that child's own inbox
+/// ([`control::enqueue_step_steer`]), counted on the step and on the run
+/// ([`crate::background::StepTelemetry::steer_count`]), and logged to `events.jsonl` as
+/// `subagent.steer.requested` with pi's exact `acceptedIndexes`/`rejected` payload — so
+/// `subagent({ action: "status", id })` shows the acceptance and `events.jsonl` shows the full
+/// decision, which is what makes `action: "steer"` observable rather than fire-and-forget.
+///
+/// A request whose target is still `pending` is put back on `pending` for the next tick, matching
+/// pi's `pendingStepSteers`. A request that lands while the run is not `Running` at all is held the
+/// same way rather than discarded: pi returns early from `deliverSteerRequest`, and its request has
+/// already been removed from the run-level queue by `consumeSteerRequests`, so holding it here is
+/// strictly closer to pi's INTENT (`pendingStepSteers` exists precisely so early steers survive) —
+/// and the whole queue is dropped with this task when the run ends either way.
+async fn route_steer_requests(
+    run_paths: &RunPaths,
+    shared: &SharedStatus,
+    events: &mut Option<BoundedJsonlWriter>,
+    pending: &mut Vec<control::SteerRequest>,
+) {
+    let mut queue = std::mem::take(pending);
+    queue.extend(control::consume_steer_requests(&run_paths.run_dir).await);
+    if queue.is_empty() {
+        return;
+    }
+    queue.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+
+    let mut status_dirty = false;
+    for request in queue {
+        // Snapshot the decision inputs under the lock, then release it — `enqueue_step_steer` is
+        // `.await`-ing filesystem work and a `std::sync::Mutex` guard must never cross an await.
+        let (run_state, step_states): (RunState, Vec<StepState>) = {
+            let status = lock_status(shared);
+            (status.state, status.steps.iter().map(|s| s.status).collect())
+        };
+        if run_state != RunState::Running {
+            pending.push(request);
+            continue;
+        }
+        let targets: Vec<usize> = match request.target_index {
+            Some(index) => vec![index],
+            None => step_states
+                .iter()
+                .enumerate()
+                .filter(|(_, state)| **state == StepState::Running)
+                .map(|(index, _)| index)
+                .collect(),
+        };
+        // No running child yet and no explicit target: hold rather than reject, so a steer racing
+        // the very first dispatch is not lost (pi's `else pendingStepSteers.push(request)`).
+        if targets.is_empty() {
+            pending.push(request);
+            continue;
+        }
+
+        let mut accepted: Vec<usize> = Vec::new();
+        let mut rejected: Vec<serde_json::Value> = Vec::new();
+        let mut held = false;
+        for index in targets {
+            match step_states.get(index) {
+                None => rejected.push(
+                    serde_json::json!({ "index": index, "reason": "child index out of range" }),
+                ),
+                Some(StepState::Pending) => held = true,
+                Some(StepState::Running) => {
+                    if control::enqueue_step_steer(&run_paths.run_dir, index, &request)
+                        .await
+                        .is_ok()
+                    {
+                        accepted.push(index);
+                    } else {
+                        rejected.push(serde_json::json!({
+                            "index": index,
+                            "reason": "child inbox write failed"
+                        }));
+                    }
+                }
+                Some(other) => rejected.push(serde_json::json!({
+                    "index": index,
+                    "reason": format!("child is {}", super::run_status::step_state_label(*other))
+                })),
+            }
+        }
+        if held && accepted.is_empty() && rejected.is_empty() {
+            pending.push(request);
+            continue;
+        }
+
+        let now = super::now_epoch_millis_pub();
+        if !accepted.is_empty() {
+            let mut status = lock_status(shared);
+            for index in &accepted {
+                if let Some(step) = status.steps.get_mut(*index) {
+                    step.telemetry.steer_count =
+                        Some(step.telemetry.steer_count.unwrap_or(0).saturating_add(1));
+                    step.telemetry.last_steer_at = Some(now);
+                }
+            }
+            let total = u64::try_from(accepted.len()).unwrap_or(0);
+            status.telemetry.steer_count =
+                Some(status.telemetry.steer_count.unwrap_or(0).saturating_add(total));
+            status.telemetry.last_steer_at = Some(now);
+            status.last_update = now;
+            status_dirty = true;
+        }
+
+        let mut payload = serde_json::json!({
+            "runId": run_paths
+                .run_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            "requestId": request.id,
+            "message": request.message,
+            "acceptedIndexes": accepted,
+        });
+        if let Some(map) = payload.as_object_mut() {
+            if let Some(source) = request.source.as_ref() {
+                map.insert("source".to_string(), serde_json::json!(source));
+            }
+            if let Some(target) = request.target_index {
+                map.insert("targetIndex".to_string(), serde_json::json!(target));
+            }
+            if !rejected.is_empty() {
+                map.insert("rejected".to_string(), serde_json::json!(rejected));
+            }
+        }
+        append_event(events, "subagent.steer.requested", Some(payload)).await;
+    }
+
+    if status_dirty {
+        let _ = write_shared_status(run_paths, shared).await;
+    }
 }
 
 /// RAII wrapper aborting the spawned control-inbox watcher task on drop, so a caller ([`run`])
@@ -2745,6 +2972,272 @@ mod tests {
     use crate::background::atomic::write_atomic_json;
     use crate::spawn::chain_graph::SingleStepSpec;
 
+    // ---------------------------------------------------------------------------------------
+    // G90 — the runner's steer router, driven as the FULL LIFECYCLE rather than one rendered
+    // block: parent writes into the run queue -> router decides per child -> per-child inbox +
+    // status counters + `events.jsonl` decision record.
+    // ---------------------------------------------------------------------------------------
+
+    /// A `Running` run with `agents.len()` steps, the ones named in `running` marked `Running` and
+    /// the rest left `Pending`.
+    fn steer_fixture(dir: &Path, agents: &[&str], running: &[usize]) -> (RunPaths, SharedStatus) {
+        let paths = RunPaths::for_run(dir, dir, &RunId::from_token("steerroute01".to_string()));
+        std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
+        let mut status =
+            RunStatus::queued(paths.run_dir.file_name().map(|n| RunId::from_token(n.to_string_lossy().into_owned())).expect("run id"), RunMode::Parallel, Some(std::process::id()));
+        status.state = RunState::Running;
+        status.steps = agents
+            .iter()
+            .enumerate()
+            .map(|(i, agent)| {
+                let mut step = crate::background::StepStatus::pending(*agent);
+                if running.contains(&i) {
+                    step.status = StepState::Running;
+                }
+                step
+            })
+            .collect();
+        (paths, Arc::new(std::sync::Mutex::new(status)))
+    }
+
+    /// G90, the runner's two halves must address the SAME directory.
+    ///
+    /// `route_steer_requests` writes an accepted request into
+    /// `control::step_steer_inbox_dir(run_dir, index)`; `run_single` hands the child
+    /// `steer_inbox_for(index)`. If those two ever diverge — a run-level queue dir on one side, a
+    /// per-child target dir on the other; a step index on one side and a flat index on the other —
+    /// each half stays individually correct and the feature is silently dead again, with no test
+    /// failing. This asserts the agreement directly, at the real write site.
+    #[tokio::test]
+    async fn the_inbox_the_runner_writes_is_the_inbox_the_child_is_handed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b"], &[1]);
+        control::request_async_steer(&paths.run_dir, "look at step two", None, Some("steer-action"))
+            .await
+            .expect("parent write");
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+
+        // The executor built for THIS run, exactly as `run` builds it.
+        let executor = ExecSingleStepExecutor {
+            depth: DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            interrupt_cancel: cyrup_core::CancelToken::new(),
+            current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            telemetry: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
+            resolved_agents: Arc::new(BTreeMap::new()),
+            orchestrator_intercom_target: None,
+            run_id: None,
+            inherited_session_model: None,
+            model_scope: None,
+            control: None,
+            include_progress: None,
+            run_dir: Some(paths.run_dir.clone()),
+        };
+
+        let handed = executor
+            .steer_inbox_for(1)
+            .expect("a background executor must hand its children an inbox");
+        let written: Vec<_> = std::fs::read_dir(&handed)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the runner must have written into the very directory the child is handed \
+                     ({}): {e}",
+                    handed.display()
+                )
+            })
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "the routed request must be sitting in the child's own inbox at {}",
+            handed.display()
+        );
+
+        // A FOREGROUND executor has no run dir and therefore hands no inbox — the same condition
+        // that makes `control_steer` refuse a foreground run outright.
+        let foreground = ExecSingleStepExecutor::foreground(
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            Arc::new(BTreeMap::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(foreground.steer_inbox_for(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn steer_routing_fans_an_untargeted_request_to_every_running_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b", "c"], &[0, 2]);
+        control::request_async_steer(&paths.run_dir, "tighten the scope", None, Some("steer-action"))
+            .await
+            .expect("parent write");
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+
+        // Every RUNNING child got its own copy; the pending one did not.
+        for index in [0usize, 2] {
+            let inbox = control::step_steer_inbox_dir(&paths.run_dir, index);
+            let files: Vec<_> = std::fs::read_dir(&inbox)
+                .unwrap_or_else(|e| panic!("child {index} inbox must exist: {e}"))
+                .filter_map(Result::ok)
+                .collect();
+            assert_eq!(files.len(), 1, "child {index} must receive exactly one steer");
+            let raw = std::fs::read_to_string(files[0].path()).expect("read");
+            let request: control::SteerRequest = serde_json::from_str(&raw).expect("parse");
+            assert_eq!(request.target_index, Some(index), "the copy must be PINNED to its child");
+            assert_eq!(request.message, "tighten the scope");
+        }
+        assert!(
+            !control::step_steer_inbox_dir(&paths.run_dir, 1).exists(),
+            "a pending child must NOT be handed an untargeted steer"
+        );
+
+        // The run-level queue was drained exactly once (delete-before-deliver).
+        assert!(
+            control::consume_steer_requests(&paths.run_dir).await.is_empty(),
+            "the run queue must be empty after routing"
+        );
+        assert!(pending.is_empty(), "nothing was held");
+
+        // Counters landed on the accepted steps AND the run, and were persisted.
+        let status = lock_status(&shared).clone();
+        assert_eq!(status.steps[0].telemetry.steer_count, Some(1));
+        assert_eq!(status.steps[1].telemetry.steer_count, None);
+        assert_eq!(status.steps[2].telemetry.steer_count, Some(1));
+        assert_eq!(status.telemetry.steer_count, Some(2));
+        assert!(status.telemetry.last_steer_at.is_some());
+        let persisted: RunStatus =
+            serde_json::from_slice(&std::fs::read(&paths.status).expect("status.json written"))
+                .expect("parse status.json");
+        assert_eq!(persisted.telemetry.steer_count, Some(2));
+
+        // And the decision is on the event log, with pi's payload keys.
+        drop(events);
+        let log = std::fs::read_to_string(&paths.events).expect("events.jsonl");
+        let line = log
+            .lines()
+            .find(|l| l.contains("subagent.steer.requested"))
+            .expect("the router must log its decision");
+        let event: serde_json::Value = serde_json::from_str(line).expect("parse event");
+        assert_eq!(event["acceptedIndexes"], serde_json::json!([0, 2]));
+        assert_eq!(event["source"], serde_json::json!("steer-action"));
+        assert_eq!(event["message"], serde_json::json!("tighten the scope"));
+        assert!(event.get("rejected").is_none(), "nothing was rejected: {event}");
+    }
+
+    #[tokio::test]
+    async fn a_steer_aimed_at_a_pending_child_is_held_then_delivered_once_it_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b"], &[0]);
+        control::request_async_steer(&paths.run_dir, "wait for me", Some(1), None)
+            .await
+            .expect("parent write");
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+        assert_eq!(pending.len(), 1, "a pending target must be HELD, never dropped");
+        assert!(
+            !control::step_steer_inbox_dir(&paths.run_dir, 1).exists(),
+            "nothing may be delivered while the child is pending"
+        );
+
+        // The child starts; the next tick delivers the held request without the parent resending.
+        lock_status(&shared).steps[1].status = StepState::Running;
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+        assert!(pending.is_empty(), "the held request must be released");
+        let inbox = control::step_steer_inbox_dir(&paths.run_dir, 1);
+        assert_eq!(
+            std::fs::read_dir(&inbox).expect("inbox").count(),
+            1,
+            "the held request must land on the child that just started"
+        );
+        assert_eq!(lock_status(&shared).steps[1].telemetry.steer_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_steer_aimed_at_a_finished_child_is_rejected_with_that_childs_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b"], &[0]);
+        lock_status(&shared).steps[1].status = StepState::Complete;
+        control::request_async_steer(&paths.run_dir, "too late", Some(1), None)
+            .await
+            .expect("parent write");
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+        assert!(pending.is_empty(), "a terminal child is a rejection, not a hold");
+        assert_eq!(lock_status(&shared).telemetry.steer_count, None);
+
+        drop(events);
+        let log = std::fs::read_to_string(&paths.events).expect("events.jsonl");
+        let line = log
+            .lines()
+            .find(|l| l.contains("subagent.steer.requested"))
+            .expect("a rejection is still logged");
+        let event: serde_json::Value = serde_json::from_str(line).expect("parse event");
+        assert_eq!(event["acceptedIndexes"], serde_json::json!([]));
+        assert_eq!(event["rejected"][0]["index"], serde_json::json!(1));
+        assert_eq!(event["rejected"][0]["reason"], serde_json::json!("child is complete"));
+    }
+
+    #[tokio::test]
+    async fn steer_requests_are_routed_in_timestamp_order_not_readdir_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a"], &[0]);
+        // Written newest-first on purpose: the queue file names are zero-padded by `ts`, and the
+        // consumer re-sorts, so delivery order must still be oldest-first.
+        for (ts, message) in [(2_000_i64, "second"), (1_000, "first")] {
+            let request = control::SteerRequest {
+                kind: "steer".to_string(),
+                id: format!("id-{ts}"),
+                ts,
+                message: message.to_string(),
+                target_index: None,
+                source: None,
+            };
+            control::write_steer_request_to_dir(
+                &control::steer_requests_dir(&paths.run_dir),
+                &request,
+            )
+            .await
+            .expect("write");
+        }
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+        drop(events);
+
+        let log = std::fs::read_to_string(&paths.events).expect("events.jsonl");
+        let messages: Vec<String> = log
+            .lines()
+            .filter(|l| l.contains("subagent.steer.requested"))
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|e| e["message"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(messages, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(lock_status(&shared).steps[0].telemetry.steer_count, Some(2));
+    }
+
     fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
             skills: None,
@@ -2801,6 +3294,7 @@ mod tests {
             model_scope: None,
             control: None,
             include_progress: None,
+            run_dir: None,
         };
         let ctx = ChainRunContext {
             cwd: dir.path().to_path_buf(),

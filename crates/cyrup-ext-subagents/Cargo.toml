@@ -59,6 +59,12 @@ jsonschema = { workspace = true }
 # nonce deliberately wants v7's sortable timestamp prefix — both features compose additively.
 uuid = { workspace = true, features = ["v4"] }
 libc = { workspace = true }
+# G90 steer: pi names a steer-request file `<ts>-<base64url(id)>.json`
+# (`control-channel.ts:85-87` @v0.34.0), so the id — an arbitrary caller-supplied string —
+# is base64url-encoded rather than interpolated raw, which is what keeps a path separator
+# out of the file name. Already a `[workspace.dependencies]` entry used by five sibling
+# crates; pure Rust, no C.
+base64 = { workspace = true }
 # SHA-256 for the direct-MCP metadata-cache config-identity hash (`exec/mcp_direct_tools.rs`,
 # pi `computeMcpServerHash`) — the resolver validates a cached server's tool/resource metadata is
 # still current by hashing the resolution-relevant fields of its `mcp.json` definition and

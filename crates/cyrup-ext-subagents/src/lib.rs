@@ -37,6 +37,11 @@ pub mod fork_context;
 /// The shared, size-capped append-only JSONL primitive (R-SA-136/146) used by both
 /// [`spawn::SpawnedChild`]'s child-output tee and [`background::RunPaths::events`]'s async-run
 /// event log. See [`jsonl`] for the full contract.
+/// The NATIVE supervisor channel (`pi-subagents/src/intercom/native-supervisor-channel.ts`): the
+/// broker-free, file-backed child↔supervisor request/reply channel upstream introduced in `3ac0ef5`
+/// ("Make supervisor coordination native") when it deleted the companion-recommendation surface.
+pub mod native_supervisor;
+
 pub mod jsonl;
 pub mod prompt_runtime;
 pub mod registration;

@@ -97,7 +97,31 @@ enum ScriptStep {
     EmitStderr { line: String },
     /// Sleep for `ms` milliseconds before continuing to the next step.
     SleepMs { ms: u64 },
+    /// Play the role of a real child's `structured_output` TOOL CALL: write `value` verbatim, as
+    /// JSON, to the capture path the parent handed this process in
+    /// `CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE` (pi `structured-output.ts:9`'s
+    /// `PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE`; the child-side writer is
+    /// `subagent-prompt-runtime.ts`'s registered `structured_output` tool).
+    ///
+    /// This is the ONLY channel `exec::structured::read_structured_output` consults when the
+    /// parent created a capture runtime — a fenced ` ```json ` block in prose is deliberately NOT
+    /// a substitute (pi's whole point at `structured-output.ts:56-58`: a missing capture file is a
+    /// hard failure even when prose was produced). A fixture test that wants to exercise the
+    /// structured-output path therefore has to make this call, exactly as a real child would.
+    ///
+    /// With the env var absent (no schema was declared for this run) the step is a silent no-op,
+    /// matching a real child, which registers no `structured_output` tool at all in that case.
+    /// A write failure is likewise not fatal here: this binary's whole contract (module doc) is
+    /// that a scripting mistake degrades to observable-but-not-crashing behaviour, and the parent
+    /// then reports its own genuine "missing structured output" failure.
+    WriteStructuredOutput { value: serde_json::Value },
 }
+
+/// The capture-path env var [`ScriptStep::WriteStructuredOutput`] honours — the same constant
+/// `crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV` defines, restated here because this
+/// binary deliberately links nothing from the library (see this module's doc: it is a
+/// self-contained NDJSON emitter with zero session/provider machinery).
+const STRUCTURED_OUTPUT_CAPTURE_ENV: &str = "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE";
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case", default)]
@@ -172,6 +196,21 @@ fn emit_env_echo(names: &[String], out: &mut impl Write) {
         }
     }
     let _ = out.flush();
+}
+
+/// [`ScriptStep::WriteStructuredOutput`]'s worker: write `value` to the parent-provided capture
+/// path. Absent env var => no-op (see the variant's own doc for why both degradations are correct).
+fn write_structured_output_capture(value: &serde_json::Value) {
+    let Some(path) = std::env::var_os(STRUCTURED_OUTPUT_CAPTURE_ENV) else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(value) else {
+        return;
+    };
+    if let Err(err) = std::fs::write(&path, bytes) {
+        // stderr is diagnostic, never protocol data (R-SA-046).
+        eprintln!("cyrup-subagent-fixture: failed to write structured output capture: {err}");
+    }
 }
 
 /// Install best-effort signal-ignoring handlers per the script's `ignore_sigint`/`ignore_sigterm`
@@ -251,6 +290,9 @@ async fn main() {
             }
             ScriptStep::SleepMs { ms } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+            }
+            ScriptStep::WriteStructuredOutput { value } => {
+                write_structured_output_capture(value);
             }
         }
     }

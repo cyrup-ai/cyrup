@@ -123,6 +123,10 @@ fn base_agent_config(model: &str) -> AgentConfig {
         max_output: OutputCap::default(),
         max_subagent_depth: None,
         depth: DepthEnvelope { current_depth: 0, max_depth: 5 },
+        // Added when the agent-definition fields landed (G95 `memory:`, G89 `toolBudget:`); this
+        // fixture declares neither, which is the same as an agent file omitting them.
+        memory: None,
+        tool_budget: None,
     }
 }
 
@@ -130,6 +134,9 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
         // SUBA-003: no `subagents.modelScope` policy in this fixture — enforcement off.
         model_scope: None,
+        // Added with G90's steer inbox. `None` is upstream's foreground shape — only a background
+        // step gets a steer inbox (`subagent-runner.ts` step dirs), so this bridge fixture has none.
+        steer_inbox_dir: None,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,

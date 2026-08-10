@@ -163,6 +163,8 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reviewer".to_string(), reviewer);
@@ -308,6 +310,8 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("worker".to_string(), worker);
@@ -410,6 +414,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        steer_inbox_dir: None,
         control_config: None,
         on_control_event: None,
         // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
@@ -435,6 +440,8 @@ fn depth_echo_agent(model: &str, depth: DepthEnvelope, max_subagent_depth: Optio
         completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth,
+        memory: None,
+        tool_budget: None,
         depth,
     }
 }
@@ -579,6 +586,8 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
             completion_guard: Some(false),
             max_subagent_depth: None,
             default_context: None,
+            memory: None,
+            tool_budget: None,
         },
     );
 
@@ -713,6 +722,8 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reporter".to_string(), reporter);
@@ -843,6 +854,8 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reporter".to_string(), reporter);
@@ -1061,6 +1074,8 @@ fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     }
 }
 

@@ -117,6 +117,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
         completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth: None,
+        memory: None,
+        tool_budget: None,
         depth: DepthEnvelope { current_depth: 0, max_depth: 5 },
     }
 }
@@ -148,6 +150,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        steer_inbox_dir: None,
         control_config: None,
         on_control_event: None,
         // SUBA-003: no `subagents.modelScope` policy configured for this fixture.

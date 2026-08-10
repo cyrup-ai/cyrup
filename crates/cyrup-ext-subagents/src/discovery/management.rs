@@ -494,6 +494,12 @@ fn build_definition(
         interactive: fields.interactive.unwrap_or(None),
         max_subagent_depth: fields.max_subagent_depth.unwrap_or(None),
         default_context: fields.default_context.unwrap_or(None),
+        // Not exposed as an editable management field (pi's `agentCreate`/`agentUpdate` input
+        // schemas have no `memory`/`toolBudget` key either); a created agent declares neither.
+        default_async: None,
+        default_timeout_ms: None,
+        memory: None,
+        tool_budget: None,
         disabled: fields.disabled.unwrap_or(None),
         system_prompt_body: fields.system_prompt_body.clone().unwrap_or_default(),
         source,
@@ -552,6 +558,13 @@ fn merge_fields(
         interactive: fields.interactive.unwrap_or(existing.interactive),
         max_subagent_depth: fields.max_subagent_depth.unwrap_or(existing.max_subagent_depth),
         default_context: fields.default_context.unwrap_or(existing.default_context),
+        // An UPDATE never edits these two (no management field exists for them) but must not
+        // DROP them either — an agent file with a `memory:`/`toolBudget:` block that is renamed
+        // or field-edited keeps both, exactly as pi's preserve-frontmatter update does.
+        default_async: existing.default_async,
+        default_timeout_ms: existing.default_timeout_ms,
+        memory: existing.memory.clone(),
+        tool_budget: existing.tool_budget.clone(),
         disabled: fields.disabled.unwrap_or(existing.disabled),
         system_prompt_body: fields
             .system_prompt_body
@@ -768,6 +781,49 @@ fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&HashSet<Strin
             Some(false) => "false",
         };
         lines.push(format!("completionGuard: {value}"));
+    }
+
+    // async / timeoutMs launch defaults (`agent-serializer.ts:87-88` @ v0.43.0): emitted whenever
+    // set, or as an empty value under preserve. Same silent-deletion trap as `toolBudget` below —
+    // a KNOWN_FIELD the serializer never writes is dropped on the first management rewrite.
+    if def.default_async.is_some() || preserve(&["async"]) {
+        let value = match def.default_async {
+            None => "",
+            Some(true) => "true",
+            Some(false) => "false",
+        };
+        lines.push(format!("async: {value}"));
+    }
+    if def.default_timeout_ms.is_some() || preserve(&["timeoutMs"]) {
+        let value = def
+            .default_timeout_ms
+            .map_or_else(String::new, |ms| ms.to_string());
+        lines.push(format!("timeoutMs: {value}"));
+    }
+
+    // toolBudget (`agent-serializer.ts:91-93` @ v0.34.0): emitted as compact JSON when set, or as
+    // an empty value under preserve. Without this, adding `toolBudget` to `KNOWN_FIELDS` would let
+    // any management update SILENTLY DELETE an author's budget — the extra-fields loop below skips
+    // known keys, so a field that is known but never emitted simply vanishes on rewrite.
+    if def.tool_budget.is_some() || preserve(&["toolBudget"]) {
+        let value = def
+            .tool_budget
+            .as_ref()
+            .and_then(|b| serde_json::to_string(b).ok())
+            .unwrap_or_default();
+        lines.push(format!("toolBudget: {value}"));
+    }
+
+    // memory (`agent-serializer.ts:95-99` @ v0.34.0): a two-line nested block, emitted ONLY when
+    // set (upstream has no `preserve` arm for it).
+    if let Some(memory) = &def.memory {
+        let scope = match memory.scope {
+            crate::discovery::types::MemoryScope::Project => "project",
+            crate::discovery::types::MemoryScope::User => "user",
+        };
+        lines.push("memory:".to_string());
+        lines.push(format!("  scope: {scope}"));
+        lines.push(format!("  path: {}", memory.path));
     }
 
     // Unknown-key round-trip (`agent-serializer.ts:91-104`): re-emit every extra field, skipping any
@@ -1190,7 +1246,6 @@ fn serialize_chain_json(def: &ChainDefinition) -> String {
 //     degrading to `(unavailable)` only with no live session.
 //   - skill warnings (`skillsWarning`) and proactive-skill suggestions in `list` — need the skills
 //     subsystem (C4 / Tier 5), entirely absent today.
-//   - companion suggestions in `list` — deferred-companion (no cyrup companion exists to integrate).
 //   - settings-override un-apply on update (`editableAgentConfig`) — settings overrides are inert
 //     today (C2 / Tier 2), so `override_info` is always `None` and the un-apply ([`editable_base`])
 //     is a no-op; it is still applied forward-compatibly here so the moment C2 lands it is correct.
@@ -2268,8 +2323,11 @@ fn chain_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool 
     scope.is_none() || source == AgentSource::Package || Some(source) == scope
 }
 
-/// pi `handleList` (`agent-management.ts:539-566`). Proactive-skill and companion suggestion blocks
-/// are deferred (skills/companion subsystems absent — see section header).
+/// pi `handleList` (`agent-management.ts:539-566`). The proactive-skill block is deferred (skills
+/// subsystem absent — see section header). There is no companion-suggestion block to port: upstream
+/// deleted `companionSuggestionLines` from `handleList`'s `ManagementContext` and from its rendered
+/// lines in `3ac0ef5` ("Make supervisor coordination native", 2026-07-03), together with the whole
+/// `extension/companion-suggestions.ts` module.
 fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
     let scope = normalize_list_scope(req.agent_scope);
     let d = discover_agents_all(cfg)?;
@@ -3351,6 +3409,10 @@ mod tests {
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            memory: None,
+            tool_budget: None,
             disabled: None,
             system_prompt_body: "You are a reviewer.".to_string(),
             source,
@@ -3849,6 +3911,82 @@ mod tests {
         assert_eq!(outcome.definition.model, Some(ModelId::from("anthropic/claude-sonnet-4")));
         assert_eq!(outcome.definition.thinking, Some("high".to_string()));
         assert_eq!(outcome.definition.system_prompt_body, "You investigate things.");
+    }
+
+    /// A `memory:`/`toolBudget:` agent must survive a serialize -> re-parse round-trip. This is
+    /// the failure mode that adding a key to `KNOWN_FIELDS` creates: the extra-fields loop skips
+    /// known keys, so a known key the serializer never EMITS is silently deleted the first time a
+    /// management update or rename rewrites the file.
+    #[test]
+    fn serialize_agent_round_trips_memory_and_tool_budget() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "reviewer".to_string();
+        def.name = "reviewer".to_string();
+        def.description = "Reviews".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.memory = Some(crate::discovery::types::AgentMemoryConfig {
+            scope: crate::discovery::types::MemoryScope::Project,
+            path: "security-reviewer".to_string(),
+        });
+        def.tool_budget = crate::exec::tool_budget::validate_tool_budget_config(
+            Some(&serde_json::json!({ "hard": 8, "soft": 3, "block": ["read"] })),
+            "toolBudget",
+        )
+        .expect("valid");
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("memory:\n  scope: project\n  path: security-reviewer"),
+            "memory must be emitted as a nested block:\n{serialized}"
+        );
+        assert!(
+            serialized.contains("toolBudget: {"),
+            "toolBudget must be emitted as JSON:\n{serialized}"
+        );
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(reparsed.memory, def.memory, "memory lost on round trip");
+        assert_eq!(
+            reparsed.tool_budget, def.tool_budget,
+            "toolBudget lost on round trip"
+        );
+        assert!(!reparsed.extra_fields.contains_key("memory"));
+        assert!(!reparsed.extra_fields.contains_key("toolBudget"));
+    }
+
+    /// The same silent-deletion trap for the two launch defaults (G98).
+    #[test]
+    fn serialize_agent_round_trips_the_async_and_timeout_launch_defaults() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "slowpoke".to_string();
+        def.name = "slowpoke".to_string();
+        def.description = "Slow".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.default_async = Some(true);
+        def.default_timeout_ms = Some(1234);
+
+        let serialized = serialize_agent(&def, None);
+        assert!(serialized.contains("async: true"), "{serialized}");
+        assert!(serialized.contains("timeoutMs: 1234"), "{serialized}");
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips");
+        assert_eq!(reparsed.default_async, Some(true));
+        assert_eq!(reparsed.default_timeout_ms, Some(1234));
+        assert!(!reparsed.extra_fields.contains_key("async"));
+        assert!(!reparsed.extra_fields.contains_key("timeoutMs"));
+
+        // An explicit `async: false` must survive too (it is not the same as "unset").
+        def.default_async = Some(false);
+        let serialized = serialize_agent(&def, None);
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips");
+        assert_eq!(reparsed.default_async, Some(false));
     }
 
     #[test]

@@ -73,6 +73,11 @@ pub mod structured;
 /// `ToolCallSummary` + `formatToolCall` (`shared/types.ts:225`, `shared/formatters.ts:99`).
 pub mod tool_call_summary;
 
+/// Per-run child tool-call budgets (`toolBudget:` frontmatter and the
+/// `CYRUP_SUBAGENT_TOOL_BUDGET` env hand-off) — a port of pi-subagents'
+/// `runs/shared/tool-budget.ts`. Enforcement lives child-side in [`crate::prompt_runtime`].
+pub mod tool_budget;
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -229,6 +234,15 @@ pub struct AgentConfig {
     /// threaded through so `run_sync` can compute the CHILD's envelope via `next_envelope` before
     /// ever building the spawn env overlay (R-SA-054/055/056).
     pub depth: DepthEnvelope,
+    /// The agent's `memory:` scope (pi `AgentConfig.memory`). Resolved at spawn into the
+    /// persistent-memory block folded onto the child's persona system prompt
+    /// ([`crate::discovery::agent_memory::build_agent_memory_injection`], pi
+    /// `execution.ts:1058-1061`).
+    pub memory: Option<crate::discovery::types::AgentMemoryConfig>,
+    /// The agent's validated `toolBudget:` (pi `AgentConfig.toolBudget`). Encoded into the child's
+    /// [`crate::exec::tool_budget::TOOL_BUDGET_ENV`] at spawn; the child-side runtime
+    /// ([`crate::prompt_runtime`]) is what actually nudges and blocks.
+    pub tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
 }
 
 impl AgentConfig {
@@ -255,6 +269,8 @@ impl AgentConfig {
             max_output: OutputCap::default(),
             max_subagent_depth: agent.max_subagent_depth,
             depth,
+            memory: agent.memory.clone(),
+            tool_budget: agent.tool_budget.clone(),
         }
     }
 }
@@ -343,6 +359,16 @@ pub struct ResolvedAgentPersona {
     /// runner-config hand-off backward compatible.
     #[serde(default)]
     pub default_context: Option<ContextMode>,
+    /// The agent's own `memory:` scope, carried so a chain/parallel/background step folds the SAME
+    /// persistent-memory block onto the child persona the single-run path does.
+    /// `#[serde(default)]` keeps the runner-config hand-off backward compatible.
+    #[serde(default)]
+    pub memory: Option<crate::discovery::types::AgentMemoryConfig>,
+    /// The agent's own validated `toolBudget:`, carried so a chain/parallel/background step hands
+    /// the child the SAME budget the single-run path does. `#[serde(default)]` keeps the
+    /// runner-config hand-off backward compatible.
+    #[serde(default)]
+    pub tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
 }
 
 impl ResolvedAgentPersona {
@@ -369,6 +395,8 @@ impl ResolvedAgentPersona {
             completion_guard: agent.completion_guard,
             max_subagent_depth: agent.max_subagent_depth,
             default_context: agent.default_context,
+            memory: agent.memory.clone(),
+            tool_budget: agent.tool_budget.clone(),
         }
     }
 
@@ -396,6 +424,8 @@ impl ResolvedAgentPersona {
             max_output: OutputCap::default(),
             max_subagent_depth: self.max_subagent_depth,
             depth,
+            memory: self.memory.clone(),
+            tool_budget: self.tool_budget.clone(),
         }
     }
 }
@@ -558,6 +588,21 @@ pub struct RunOptions {
     /// [`crate::spawn::nested_events::CHILD_INDEX_ENV`]. `None` defaults to `0` (a single top-level
     /// run has one child at index 0).
     pub child_index: Option<usize>,
+    /// G90 — this child's OWN steer inbox directory
+    /// (`<run_dir>/control/steer-targets/<flatIndex>/`), handed to the child process as
+    /// [`crate::prompt_runtime::STEER_INBOX_ENV`].
+    ///
+    /// pi `steerInboxDir` (`pi-args.ts:67,251-252` @v0.34.0), supplied by the background runner as
+    /// `stepSteerInboxDir(asyncDir, fi)` (`subagent-runner.ts:2313,2600,2797`). This is the ONLY
+    /// channel a steer request has to a running child: the parent drops a request into the
+    /// run-level queue, the runner routes it into this per-child directory, and the child's own
+    /// [`crate::prompt_runtime::SteeringInbox`] watches THIS path and injects each message into
+    /// its live model turn. Without the env var the child never learns the path exists, and the
+    /// whole verb is a write-only file drop — which is exactly what it was.
+    ///
+    /// `None` on the foreground path (no async run directory exists), matching upstream's own
+    /// `if (input.steerInboxDir)` guard.
+    pub steer_inbox_dir: Option<PathBuf>,
     /// pi `options.controlConfig` (`execution.ts:245`, threaded from `runSinglePath`'s
     /// `resolveControlConfig(deps.config.control, params.control)`, `subagent-executor.ts:1179`
     /// @v0.34.0; the detached async runner reads the same value back out of its one-shot config,
@@ -1237,6 +1282,10 @@ pub fn build_attempt_spawn_plan(
     // reproduce pi's three destinations for one `tools` list (`pi-args.ts:104-141`): builtins (plus
     // resolved MCP names) to `--tools`, extension paths to `--extension`, and the raw MCP selectors
     // to the `MCP_DIRECT_TOOLS` env.
+    // See the `required_child_tools = Some(allowlist)` assignment below for the full rationale;
+    // declared out here because the value has to survive into the env overlay, which is built
+    // further down.
+    let mut required_child_tools: Option<Vec<String>> = None;
     let mut builtin_tools: Vec<String> = Vec::new();
     let mut tool_extension_paths: Vec<String> = Vec::new();
     let mut mcp_direct_tools: Vec<String> = Vec::new();
@@ -1276,6 +1325,21 @@ pub fn build_attempt_spawn_plan(
         }
         args.push("--tools".to_string());
         args.push(allowlist.join(","));
+
+        // G106 / pi `pi-args.ts:611-616` @v0.43.0 (`env[REQUIRED_CHILD_TOOLS_ENV] =
+        // JSON.stringify(toolPlan.requiredChildTools)`), whose `requiredChildTools` is
+        // `explicitToolAllowlist ? [...declaredBuiltinTools, ...effectiveMcpTools, ...internalTools]
+        // : []` (`:401-409`). cyrup's `allowlist` is exactly the first two of those three terms, and
+        // this arm IS the `explicitToolAllowlist` branch (an agent with no `tools:` never reaches
+        // it, and upstream writes `[]` — i.e. nothing — for that case).
+        //
+        // The third term, upstream's `internalTools`, is the intercom bridge's own grant
+        // (`intercom-bridge.ts:169`'s `["intercom", "contact_supervisor"]`). cyrup has no
+        // bridge-tool computation at this seam, so the list carries the agent's DECLARED names
+        // only. That is the honest reading for its one consumer — the child-side `intercom`
+        // fallback registers when the agent asked for a tool called `intercom`, which is a
+        // statement about what the agent declared, not about what the bridge added.
+        required_child_tools = Some(allowlist);
     }
 
     // Extension threading (pi `pi-args.ts:125-137`): `Some(extensions)` turns discovery off
@@ -1317,7 +1381,30 @@ pub fn build_attempt_spawn_plan(
     // SUBA-001 / pi `pi-args.ts:159-165` (v0.34.0): the persona body ships on EVERY spawn; the
     // agent's `systemPromptMode` only chooses which flag carries it. See this function's doc
     // comment for the literal-text-vs-temp-file `[CYRUP-DELTA]` and the empty-body rule.
-    let persona_body = agent.system_prompt_body.trim();
+    //
+    // pi `execution.ts:1058-1061` folds the agent's persistent-memory block onto the SAME
+    // `systemPrompt` string just before it reaches `buildPiArgs`, so a `memory:`-scoped agent
+    // carries its accumulated role notes into every run. Same composition here, on the persona body
+    // that this argv pair is the only channel for. `build_agent_memory_injection` returns "" for an
+    // agent with no scope (the common case), an unresolvable/unsafe path, or a read-only agent with
+    // nothing recorded yet — so the overwhelming majority of spawns are byte-identical to before.
+    let memory_injection =
+        crate::discovery::agent_memory::build_agent_memory_injection(
+            agent.memory.as_ref(),
+            agent.tools.as_ref(),
+            &opts.cwd,
+        );
+    let persona_body_trimmed = agent.system_prompt_body.trim();
+    let persona_owned;
+    let persona_body: &str = if memory_injection.is_empty() {
+        persona_body_trimmed
+    } else if persona_body_trimmed.is_empty() {
+        persona_owned = memory_injection;
+        &persona_owned
+    } else {
+        persona_owned = format!("{persona_body_trimmed}\n\n{memory_injection}");
+        &persona_owned
+    };
     if !persona_body.is_empty() {
         let flag = match agent.system_prompt_mode {
             SystemPromptMode::Replace => SYSTEM_PROMPT_FLAG,
@@ -1444,10 +1531,10 @@ pub fn build_attempt_spawn_plan(
     // nested-events env names, so setting them here also satisfies that sibling overlay. The child's
     // presence label is the SAME `resolve_subagent_intercom_target(run_id, agent, index)` string the
     // parent addresses to steer it (extension.rs `control_resume`), so the two independently-produced
-    // strings match at the broker. `ORCHESTRATOR_SESSION_ID` is deliberately NOT set (pi's own
-    // `pi-args.ts` never sets it — the child resolves the supervisor by the presence NAME in
-    // `ORCHESTRATOR_TARGET`, which the broker resolves by name; a stable-id env is only wired when a
-    // broker-resolvable id exists, which a freshly-connected orchestrator does not have).
+    // strings match at the broker. `ORCHESTRATOR_SESSION_ID` + `SUPERVISOR_CHANNEL_DIR` are written
+    // by the nested block at the end of this arm — the NATIVE supervisor channel upstream added in
+    // `3ac0ef5` (`pi-args.ts:221-231`), which needs the launching session's own id as its request
+    // routing key.
     if let (Some(orch_target), Some(run_id)) = (
         opts.orchestrator_intercom_target.as_deref().filter(|s| !s.is_empty()),
         opts.run_id.as_ref(),
@@ -1469,6 +1556,43 @@ pub fn build_attempt_spawn_plan(
                 child_index,
             ),
         );
+
+        // NATIVE supervisor channel (pi `pi-args.ts:221-231`, added in `3ac0ef5` "Make supervisor
+        // coordination native"). Upstream's condition is `orchestratorIntercomTarget &&
+        // parentSessionId && runId && childAgentName` — the first, third and fourth are the arm
+        // we are already inside, so only the parent session id remains. Both vars are written
+        // TOGETHER with the channel directories created up front (upstream's own two
+        // `fs.mkdirSync(..., { recursive: true })` calls, `:228-229`), because
+        // `read_child_metadata` refuses to activate on a partial set: a child handed a channel dir
+        // it cannot address, or an address with no channel dir, would be neither bridged nor
+        // cleanly un-bridged.
+        //
+        // A failure to create the directories is deliberately NOT fatal here: the file channel is a
+        // fallback for coordination the broker path may already be providing, and a spawn must not
+        // fail because a scratch directory could not be made. The vars are then simply not written,
+        // which is exactly the "no native channel" state.
+        if let Some(parent_session) = opts
+            .parent_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            env_overlay.insert(
+                crate::spawn::intercom_target::ENV_ORCHESTRATOR_SESSION_ID.to_string(),
+                parent_session.to_string(),
+            );
+            let channel_dir = crate::native_supervisor::resolve_supervisor_channel_dir(
+                run_id.as_str(),
+                &agent.name,
+                child_index,
+            );
+            if crate::native_supervisor::ensure_supervisor_channel_dir(&channel_dir).is_ok() {
+                env_overlay.insert(
+                    crate::spawn::intercom_target::ENV_SUPERVISOR_CHANNEL_DIR.to_string(),
+                    channel_dir.display().to_string(),
+                );
+            }
+        }
     }
 
     // SUBA-S01 (pi `pi-args.ts:246-250`): hand the child BOTH paths. pi's child-side runtime gates
@@ -1484,6 +1608,46 @@ pub fn build_attempt_spawn_plan(
         env_overlay.insert(
             crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV.to_string(),
             runtime.output_path.display().to_string(),
+        );
+    }
+
+    // pi `pi-args.ts` ships the resolved tool budget to the child in `PI_SUBAGENT_TOOL_BUDGET`
+    // (`tool-budget.ts:63-65`); the child-side `subagent-prompt-runtime.ts:263` decodes it and
+    // registers the nudge/block hook. Same hand-off here — see
+    // [`crate::prompt_runtime::SubagentPromptRuntime`] for the enforcement half. Absent budget =>
+    // no var, so a child that inherits a STALE budget from the parent's own environment cannot
+    // happen silently: the overlay only ever adds.
+    if let Some(encoded) =
+        crate::exec::tool_budget::encode_tool_budget_env(agent.tool_budget.as_ref())
+    {
+        env_overlay.insert(
+            crate::exec::tool_budget::TOOL_BUDGET_ENV.to_string(),
+            encoded,
+        );
+    }
+
+    if let Some(tools) = required_child_tools {
+        env_overlay.insert(
+            crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS.to_string(),
+            serde_json::Value::Array(tools.into_iter().map(serde_json::Value::String).collect())
+                .to_string(),
+        );
+    }
+
+    // G90 (pi `pi-args.ts:251-252` @v0.34.0: `if (input.steerInboxDir) env[SUBAGENT_STEER_INBOX_ENV]
+    // = input.steerInboxDir`): hand this child the path to its OWN steer inbox. `run_sync` creates
+    // the directory before the spawn so the child's watcher has something to attach to on its very
+    // first tick, exactly as upstream's child-side `start()` does its own `mkdirSync` — see
+    // [`crate::prompt_runtime::SteeringInbox`]. Absent on the foreground path, so a foreground child
+    // is byte-identical to before.
+    if let Some(inbox) = opts
+        .steer_inbox_dir
+        .as_deref()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        env_overlay.insert(
+            crate::prompt_runtime::STEER_INBOX_ENV.to_string(),
+            inbox.display().to_string(),
         );
     }
 
@@ -1866,6 +2030,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 .is_none_or(|text| text.trim().is_empty())
             && structured_output_absent(
                 self.opts.structured_output_schema.as_ref(),
+                self.structured_runtime.as_ref(),
                 &progress.all_events,
             )
         {
@@ -1945,20 +2110,34 @@ struct DriveOutcome {
 /// (cold-start) gate: is the child's structured output ABSENT from its event stream? Returns
 /// `true` when NO structured-output schema was requested at all (pi's `!options.structuredOutput`
 /// leg, where empty prose is unconditionally an empty-output failure), OR when a schema WAS
-/// requested but no structured-output value is present in the transcript
-/// ([`StructuredOutcome::Missing`], pi's `!existsSync(outputPath)`). A present-but-invalid value is
-/// deliberately NOT "absent" here — this is a pure presence test, exactly like pi's `existsSync`;
-/// the value's validity is a separate concern [`run_sync`]'s own R-SA-030 structured-output check
-/// diagnoses afterward (pi `readStructuredOutput`, `execution.ts:791`). Reuses [`structured`]'s own
-/// public [`resolve_structured_output`] rather than reimplementing extraction, so this crate keeps a
-/// single owner of "what counts as a present structured output".
-fn structured_output_absent(schema: Option<&serde_json::Value>, events: &[SubagentEvent]) -> bool {
+/// requested but the child never delivered a value. A present-but-invalid value is deliberately NOT
+/// "absent" here — this is a pure presence test, exactly like pi's `existsSync`; the value's
+/// validity is a separate concern [`run_sync`]'s own R-SA-030 structured-output check diagnoses
+/// afterward (pi `readStructuredOutput`, `execution.ts:1204-1224`).
+///
+/// The presence channel is pi's literally: `!existsSync(options.structuredOutput.outputPath)`
+/// (`execution.ts:1189-1191`) — the CAPTURE FILE the child's `structured_output` tool writes, not
+/// the transcript. Consulting the transcript here instead would fail a perfectly good run: a child
+/// that calls `structured_output` and then stops without prose has `finalText` empty and a written
+/// capture file, which pi passes (`missingStructuredOutput === false`) and a fenced-block scan
+/// would classify `Missing`, flipping the attempt to a retryable "produced no output" failure the
+/// ladder then burns a fallback model on. The transcript scan survives ONLY as the degraded
+/// no-runtime fallback (`run_sync` could not create the capture runtime at all), where there is
+/// genuinely no file to stat — the same split [`run_sync`]'s own read-back makes.
+fn structured_output_absent(
+    schema: Option<&serde_json::Value>,
+    runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
+    events: &[SubagentEvent],
+) -> bool {
     match schema {
         None => true,
-        Some(schema) => matches!(
-            resolve_structured_output(Some(schema), events),
-            StructuredOutcome::Missing
-        ),
+        Some(schema) => match runtime {
+            Some(runtime) => !runtime.output_path.exists(),
+            None => matches!(
+                resolve_structured_output(Some(schema), events),
+                StructuredOutcome::Missing
+            ),
+        },
     }
 }
 
@@ -2587,6 +2766,17 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         };
     }
 
+    // G90: create this child's steer inbox BEFORE the spawn. The child's own watcher does its own
+    // `mkdir` on start (pi `subagent-prompt-runtime.ts:226`), but the RUNNER may route an accepted
+    // steer request into the directory before the child has finished booting, and a request written
+    // into a directory that is then created underneath it would be lost. Creating it here — at the
+    // single point that also hands the path over — makes the directory exist for the whole of the
+    // child's life. A failure is deliberately NOT fatal: steering is an optional live channel, and a
+    // run must not fail to start because a control subdirectory could not be made.
+    if let Some(inbox) = opts.steer_inbox_dir.as_deref() {
+        let _ = std::fs::create_dir_all(inbox);
+    }
+
     // SUBA-S01 (pi `chain-execution.ts:301` / `async-execution.ts:498`): when the step declares an
     // `outputSchema`, create the capture runtime ONCE per run — not per attempt — and write the
     // schema to a private file the child reads. Every fallback attempt shares it, exactly as pi
@@ -3039,6 +3229,10 @@ fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinition {
         interactive: None,
         max_subagent_depth: agent.max_subagent_depth,
         default_context: None,
+        default_async: None,
+        default_timeout_ms: None,
+        memory: None,
+        tool_budget: None,
         disabled: None,
         system_prompt_body: agent.system_prompt_body.clone(),
         source: crate::discovery::types::AgentSource::User,
@@ -3126,6 +3320,8 @@ mod tests {
             completion_guard: Some(false),
             max_output: OutputCap::default(),
             max_subagent_depth: None,
+            memory: None,
+            tool_budget: None,
             depth: DepthEnvelope {
                 current_depth: 0,
                 max_depth: 5,
@@ -3161,6 +3357,7 @@ mod tests {
             orchestrator_intercom_target: None,
             run_id: None,
             child_index: None,
+            steer_inbox_dir: None,
             control_config: None,
             on_control_event: None,
         }
@@ -3443,6 +3640,342 @@ mod tests {
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
     }
 
+    // ---- `memory:` scopes reach the child persona (pi `execution.ts:1058-1061`) ----
+
+    /// The USER ACTION: an agent `.md` declares `memory: { scope: user, path: reviewer }`, the user
+    /// runs that agent, and the child is spawned with its accumulated role notes on the persona
+    /// system prompt. Before this wiring `memory:` was demoted to `extra_fields` and reached
+    /// nothing at all.
+    #[test]
+    fn a_memory_scoped_agent_ships_its_memory_block_on_the_persona_system_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `project` scope resolves under `<nearest project root>/.cyrup/agent-memory`, and the
+        // nearest project root is the first ancestor holding a `.cyrup` directory — so creating one
+        // here anchors the scope on the fixture, with no process-global env to mutate.
+        let project_config = dir.path().join(".cyrup");
+        std::fs::create_dir_all(&project_config).expect("mkdir .cyrup");
+        let memory_dir = project_config
+            .join(crate::discovery::agent_memory::AGENT_MEMORY_DIR_NAME)
+            .join("reviewer");
+        std::fs::create_dir_all(&memory_dir).expect("mkdir");
+        std::fs::write(
+            memory_dir.join(crate::discovery::agent_memory::AGENT_MEMORY_FILE),
+            "2026-01-01: prefer `cargo clippy` over `cargo check` for this repo.\n",
+        )
+        .expect("write MEMORY.md");
+
+        // Parse a REAL agent file so the whole chain (frontmatter -> AgentDefinition ->
+        // AgentConfig -> argv) is exercised, not just the last hop.
+        let def = crate::discovery::frontmatter::parse_agent_file(
+            "---\nname: reviewer\ndescription: Reviews\nmemory:\n  scope: project\n  path: reviewer\n---\n\n- You are the REVIEWER persona.\n",
+            crate::discovery::types::AgentSource::User,
+            std::path::Path::new("reviewer.md"),
+        )
+        .expect("agent file parses");
+        assert_eq!(
+            def.memory,
+            Some(crate::discovery::types::AgentMemoryConfig {
+                scope: crate::discovery::types::MemoryScope::Project,
+                path: "reviewer".to_string(),
+            }),
+            "`memory:` must be a first-class parsed field, not an extra_field"
+        );
+        assert!(
+            !def.extra_fields.contains_key("memory"),
+            "`memory` is a KNOWN_FIELD; it must not also land in extra_fields"
+        );
+
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let agent = AgentConfig::from_agent_definition(&def, depth);
+        let opts = base_opts(dir.path(), &["m1"]);
+
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let delivered = argv
+            .iter()
+            .find(|a| a.starts_with("--system-prompt"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            delivered.contains("- You are the REVIEWER persona."),
+            "the persona body must survive; argv was {argv:?}"
+        );
+        assert!(
+            delivered.contains("# Persistent agent memory"),
+            "the memory block must be folded onto the persona; argv was {argv:?}"
+        );
+        assert!(
+            delivered.contains("prefer `cargo clippy` over `cargo check`"),
+            "the RECORDED notes must reach the child; argv was {argv:?}"
+        );
+    }
+
+    /// An agent with NO `memory:` block must produce a byte-identical spawn plan to before — the
+    /// overwhelming majority of agents.
+    #[test]
+    fn an_agent_without_a_memory_scope_ships_only_its_persona() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_body = "- persona".to_string();
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(argv.contains(&"--system-prompt=- persona".to_string()), "{argv:?}");
+        assert!(!argv.iter().any(|a| a.contains("Persistent agent memory")));
+    }
+
+    // ---- `toolBudget:` reaches the child (pi `tool-budget.ts:63-65`) ----
+
+    /// The USER ACTION: an agent `.md` declares `toolBudget: {"hard": 5, "soft": 2}`, the user runs
+    /// that agent, and the child is spawned with the validated budget in its environment where the
+    /// child-side runtime picks it up. Before this wiring `toolBudget:` was demoted to
+    /// `extra_fields` — the user wrote it, nothing happened, no error.
+    #[test]
+    fn a_tool_budget_agent_ships_its_budget_to_the_child_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let def = crate::discovery::frontmatter::parse_agent_file(
+            "---\nname: scout\ndescription: Scouts\ntoolBudget: {\"hard\": 5, \"soft\": 2}\n---\n\nbody\n",
+            crate::discovery::types::AgentSource::User,
+            std::path::Path::new("scout.md"),
+        )
+        .expect("agent file parses");
+        let budget = def.tool_budget.clone().expect("toolBudget is parsed");
+        assert_eq!(budget.hard, 5);
+        assert_eq!(budget.soft, Some(2));
+        assert!(
+            !def.extra_fields.contains_key("toolBudget"),
+            "`toolBudget` is a KNOWN_FIELD; it must not also land in extra_fields"
+        );
+
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let agent = AgentConfig::from_agent_definition(&def, depth);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let encoded = plan
+            .spec
+            .env_overlay
+            .get(crate::exec::tool_budget::TOOL_BUDGET_ENV)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            crate::exec::tool_budget::decode_tool_budget_env(Some(&encoded)),
+            Ok(Some(budget)),
+            "the child must receive the SAME validated budget; overlay was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// An agent with no `toolBudget:` must set no budget var at all — a child must never inherit a
+    /// stale budget from the parent process's own environment.
+    #[test]
+    fn an_agent_without_a_tool_budget_sets_no_budget_env_var() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::exec::tool_budget::TOOL_BUDGET_ENV)
+        );
+    }
+
+    /// G90, the SPAWN hop: a child handed a steer inbox must receive the path in its environment,
+    /// and the directory must already exist when it starts.
+    ///
+    /// pi `pi-args.ts:251-252` (`if (input.steerInboxDir) env[SUBAGENT_STEER_INBOX_ENV] = ...`).
+    /// Without this hop the parent's whole steer path is a write-only file drop: the requests land
+    /// on disk correctly and no process is ever told where to look.
+    #[test]
+    fn a_steer_inbox_reaches_the_child_as_an_env_var() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let inbox = crate::background::control::step_steer_inbox_dir(&dir.path().join("run-1"), 2);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.steer_inbox_dir = Some(inbox.clone());
+
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(crate::prompt_runtime::STEER_INBOX_ENV)
+                .map(String::as_str),
+            Some(inbox.display().to_string().as_str()),
+            "the child must be told where its steer inbox is; overlay was {:?}",
+            plan.spec.env_overlay
+        );
+
+        // ...and a run with no inbox sets NO variable, so a child can never inherit a stale inbox
+        // from the parent process's own environment.
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &base_opts(dir.path(), &["m1"]),
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::prompt_runtime::STEER_INBOX_ENV)
+        );
+    }
+
+    /// G95 + G89 across the DETACHED-RUNNER seam, which the two tests above do not touch.
+    ///
+    /// A background/chain/parallel step does not reach `AgentConfig::from_agent_definition` at all.
+    /// The orchestrator resolves the persona into a [`ResolvedAgentPersona`], SERIALIZES it into
+    /// the runner config on disk, and the detached runner deserializes it and calls
+    /// [`ResolvedAgentPersona::to_agent_config`] to rebuild the spawn input. Every field that
+    /// hand-off drops is silently lost for every non-foreground run — and because both fields are
+    /// `#[serde(default)] Option`, dropping them produces no error, no warning and no compile
+    /// failure: `memory: None, tool_budget: None` in `to_agent_config` type-checks perfectly and
+    /// leaves the whole rest of the suite green while `/run x --bg` quietly stops honouring the
+    /// agent's `memory:` and `toolBudget:`.
+    ///
+    /// So this drives the REAL hand-off — persona → JSON → persona → `AgentConfig` → argv/env — and
+    /// asserts on the two observable end products, not on the struct fields.
+    #[test]
+    fn the_detached_runner_persona_handoff_preserves_memory_and_tool_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_config = dir.path().join(".cyrup");
+        std::fs::create_dir_all(&project_config).expect("mkdir .cyrup");
+        let memory_dir = project_config
+            .join(crate::discovery::agent_memory::AGENT_MEMORY_DIR_NAME)
+            .join("reviewer");
+        std::fs::create_dir_all(&memory_dir).expect("mkdir");
+        std::fs::write(
+            memory_dir.join(crate::discovery::agent_memory::AGENT_MEMORY_FILE),
+            "2026-01-01: the detached runner must see this too.\n",
+        )
+        .expect("write MEMORY.md");
+
+        let def = crate::discovery::frontmatter::parse_agent_file(
+            "---\nname: reviewer\ndescription: Reviews\nmemory:\n  scope: project\n  path: reviewer\ntoolBudget: {\"hard\": 5, \"soft\": 2}\n---\n\n- You are the REVIEWER persona.\n",
+            crate::discovery::types::AgentSource::User,
+            std::path::Path::new("reviewer.md"),
+        )
+        .expect("agent file parses");
+        let budget = def.tool_budget.clone().expect("toolBudget is parsed");
+
+        // The hand-off, verbatim: resolve → serialize into the runner config → deserialize in the
+        // detached runner process → rebuild the spawn input.
+        let persona = ResolvedAgentPersona::from_agent_definition(&def);
+        let encoded = serde_json::to_string(&persona).expect("persona serializes");
+        let decoded: ResolvedAgentPersona =
+            serde_json::from_str(&encoded).expect("runner config deserializes");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let agent = decoded.to_agent_config(depth);
+
+        let opts = base_opts(dir.path(), &["m1"]);
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+
+        let argv = plan.spec.build_argv();
+        let delivered = argv
+            .iter()
+            .find(|a| a.starts_with("--system-prompt"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            delivered.contains("the detached runner must see this too."),
+            "G95: a background/chain/parallel child must receive the SAME persistent-memory block \
+             a foreground child does; argv was {argv:?}"
+        );
+        assert_eq!(
+            crate::exec::tool_budget::decode_tool_budget_env(
+                plan.spec
+                    .env_overlay
+                    .get(crate::exec::tool_budget::TOOL_BUDGET_ENV)
+                    .map(String::as_str)
+            ),
+            Ok(Some(budget)),
+            "G89: a background/chain/parallel child must receive the SAME validated tool budget; \
+             overlay was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
     /// SUBA-S01 (pi `pi-args.ts:246-250`): a declared `outputSchema` must reach the child as BOTH
     /// structured-output env vars, pointing at the runtime's real schema and capture paths.
     ///
@@ -3645,6 +4178,76 @@ mod tests {
         );
     }
 
+    /// G106 (pi `pi-args.ts:221-231`, `3ac0ef5` "Make supervisor coordination native"): the single
+    /// spawn-plan chokepoint must hand a child BOTH native-supervisor-channel vars and CREATE the
+    /// `requests/`+`replies/` directories.
+    ///
+    /// The user action: `/run reviewer "..."` (or the `subagent` tool) from a live session. Without
+    /// this the spawned child's `read_child_metadata` returns `None`, it registers no native
+    /// `contact_supervisor`, and the file channel is unreachable — which is the pre-fix state.
+    #[test]
+    fn build_attempt_spawn_plan_writes_the_native_supervisor_channel_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]); // name = "worker"
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.orchestrator_intercom_target = Some("subagent-chat-abcd1234".to_string());
+        opts.run_id = Some(crate::background::RunId::from_token("run-NSC"));
+        opts.child_index = Some(2);
+        opts.parent_session_id = Some("session-parent-1".to_string());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        let env = &plan.spec.env_overlay;
+
+        assert_eq!(
+            env.get(crate::spawn::intercom_target::ENV_ORCHESTRATOR_SESSION_ID).map(String::as_str),
+            Some("session-parent-1"),
+            "the native channel keys every request on the launching session's own id"
+        );
+        let channel_dir = env
+            .get(crate::spawn::intercom_target::ENV_SUPERVISOR_CHANNEL_DIR)
+            .map(std::path::PathBuf::from)
+            .expect("the spawn planner must hand the child its channel directory");
+        assert_eq!(
+            channel_dir,
+            crate::native_supervisor::resolve_supervisor_channel_dir("run-NSC", "worker", 2),
+            "the child's channel dir must be the SAME path the parent's poller scans"
+        );
+        assert!(
+            channel_dir.join("requests").is_dir() && channel_dir.join("replies").is_dir(),
+            "both sub-directories are created up front (pi's two mkdirSync calls)"
+        );
+
+        // The child's own gate opens on exactly what the planner wrote — the two halves meet.
+        let metadata = crate::native_supervisor::read_child_metadata_from(&|k| env.get(k).cloned())
+            .expect("the child metadata gate must open on the planner's overlay");
+        assert_eq!(metadata.run_id, "run-NSC");
+        assert_eq!(metadata.agent, "worker");
+        assert_eq!(metadata.child_index, 2);
+        assert_eq!(metadata.orchestrator_session_id, "session-parent-1");
+
+        let _ = std::fs::remove_dir_all(&channel_dir);
+    }
+
+    /// The negative half: no parent session id means no routing key, so NEITHER var is written — a
+    /// half-set overlay would leave the child holding a channel it cannot address.
+    #[test]
+    fn build_attempt_spawn_plan_omits_the_supervisor_channel_env_without_a_parent_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.orchestrator_intercom_target = Some("subagent-chat-abcd1234".to_string());
+        opts.run_id = Some(crate::background::RunId::from_token("run-NSC2"));
+        opts.child_index = Some(0);
+        opts.parent_session_id = None;
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        let env = &plan.spec.env_overlay;
+        assert!(!env.contains_key(crate::spawn::intercom_target::ENV_SUPERVISOR_CHANNEL_DIR));
+        assert!(crate::native_supervisor::read_child_metadata_from(&|k| env.get(k).cloned()).is_none());
+    }
+
     #[test]
     fn build_attempt_spawn_plan_omits_the_child_intercom_bridge_env_without_an_orchestrator_target() {
         // A headless / no-intercom run (no orchestrator target) must leave the child un-bridged — the
@@ -3837,7 +4440,7 @@ mod tests {
 
     /// The consequence of the flag, at the seam that reads it: a child spawned by the production
     /// planner registers NO subagent surface at all (pi `extension/index.ts:177`), instead of the
-    /// full orchestrator surface — its own `subagent` tool, 13 slash commands and background
+    /// full orchestrator surface — its own `subagent` tool, 12 slash commands and background
     /// watcher — that an unmarked child was silently installing.
     #[test]
     fn a_child_spawned_by_the_production_planner_registers_no_subagent_surface() {
@@ -4332,6 +4935,8 @@ mod tests {
             completion_guard: Some(true),
             max_subagent_depth: Some(1),
             default_context: None,
+            memory: None,
+            tool_budget: None,
         };
         let json = serde_json::to_string(&persona).expect("serialize");
         let back: ResolvedAgentPersona = serde_json::from_str(&json).expect("deserialize");
@@ -4357,6 +4962,8 @@ mod tests {
             completion_guard: Some(true),
             max_subagent_depth: Some(1),
             default_context: None,
+            memory: None,
+            tool_budget: None,
         };
         let live_depth = DepthEnvelope {
             current_depth: 1,

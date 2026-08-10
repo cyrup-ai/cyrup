@@ -175,8 +175,13 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         max_output: OutputCap::default(),
         max_subagent_depth: None,
         depth: DepthEnvelope { current_depth: 0, max_depth: 5 },
+        // G95 `memory:` / G89 `toolBudget:` — this fixture declares neither.
+        memory: None,
+        tool_budget: None,
     };
     let opts = RunOptions {
+        // G90's steer inbox: `None` is the foreground shape.
+        steer_inbox_dir: None,
         // SUBA-003: no `subagents.modelScope` policy in this fixture — enforcement off.
         model_scope: None,
         cwd: cwd.to_path_buf(),

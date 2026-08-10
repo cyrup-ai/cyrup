@@ -344,6 +344,22 @@ checker only proves the *impossible* ones (past EOF); a clean run means "no prov
 
 **Batch 6 — pi pre-baseline port bugs.** G39, G3 (`list()` only), G62 (editor page actions then the ctrl aliases), G63 (Apple Terminal path first, win32 second), G66 (OSC 9;4 emitter behind the already-wired setting), G16/G42 parent qwen providers.
 
+> **SEQUENCING CORRECTION (2026-08-10).** The batches below were organised around "pre-baseline
+> debt" vs "version lag". That split is useful for ORDERING WITHIN a target — something broken today
+> outranks something never added — but it is NOT the goal, and letting it organise the plan made
+> reaching latest look like an optional later phase. **The goal is the current state of all four
+> upstreams.**
+>
+> Status by upstream: pi-permission-system is AT v0.8.0 (batch 1); pi-intercom is AT v0.9.2
+> (batch 2); pi is mid-way to v0.84.1 (batches 3-6 done). **pi-subagents is the outlier — nine minor
+> versions behind at ~v0.34.0 against v0.43.0**, with 54 backlog items scattered across batches 7,
+> 8, 9 and 12, and three entirely-new subtrees (`watchdog/` +4,395, `missions/` +1,659,
+> `tui/fleet*` +1,856) parked last behind unrelated pi work.
+>
+> **Batches 7-9 and the subagents half of 12 now run CONTIGUOUSLY as one effort: pi-subagents to
+> v0.43.0.** pi's remaining batches (10-11) follow. Nothing is dropped; the route changes so that
+> "at latest" is reached per-upstream rather than left as a trailing phase.
+
 **Batch 7 — Subagents pre-baseline debt.** G90 `steer`, G91 `schedule*`, G92 `view`/`lines` + `/subagents-fleet`, G95 `memory:`, G89 budgets, G98 agent launch defaults, G96 frontmatter parser, G106 native supervisor channel, G94 companions removal. Note the crate's own advertise-vs-dispatch invariant (`extension.rs:10036-10041`) means every new enum value needs a real dispatch arm in the same change.
 
 **Batch 8 — Subagents run-loop correctness.** G75 bounded NDJSON reader, G76 drain start/cancel (consume the already-parsed `will_retry` at `ndjson.rs:156`), G88 model resolution + `TOOL_FAILURE` prefix guard (live today: cyrup's own formatter emits the guarded prefix at `exec/output.rs:352-359`), G74 startup retry, G81 `$ref` rewrite, G103 empty tools list, G102 discovery pruning, G84 mutation detection, G100 profile merge.

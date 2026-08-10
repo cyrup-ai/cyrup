@@ -64,6 +64,14 @@ pub enum SubagentError {
     #[error("malformed subagents settings: {0}")]
     MalformedSettings(String),
 
+    /// A management/control surface reported a user-facing failure whose text is ALREADY the exact
+    /// upstream message (pi's `isError: true` results carry rendered prose, not an error code) —
+    /// e.g. `view: "fleet"`'s child-safe refusal or `Unknown status view: …`. The `Display` impl is
+    /// therefore the bare message with no added prefix: prefixing it would corrupt a string this
+    /// crate's parity tests pin against pi verbatim.
+    #[error("{0}")]
+    Management(String),
+
     /// An EXPLICITLY requested model (tool-call `model`, `/run [model=…]`, a chain step's `model`)
     /// fell outside the configured `subagents.modelScope` allow list, so the run was REFUSED
     /// before any child process was spawned (SUBA-003; pi `resolveSubagentModelOverride`'s

@@ -78,6 +78,12 @@ pub mod types;
 /// by `discovery/chains.rs` for `.chain.md` files via its low-level `parse_frontmatter_block`.
 pub mod frontmatter;
 
+/// Per-agent persistent memory scopes (`memory:` frontmatter) — a port of pi-subagents'
+/// `agents/agent-memory.ts`: scope parsing, containment-checked directory resolution, capped
+/// `MEMORY.md` reading, and the read-write/read-only system-prompt block folded into the child's
+/// persona at spawn by `exec/mod.rs`.
+pub mod agent_memory;
+
 /// Chain-file discovery: `.chain.json` > `.chain.md` same-name precedence within one directory
 /// scan, cross-scope retention (never merged) across scan scopes (func-SA §5.1 R-SA-015; arch-SA
 /// §6.2.2).

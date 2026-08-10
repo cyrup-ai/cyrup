@@ -776,9 +776,17 @@ fn humanize_duration(d: Duration) -> String {
 // available as a structured, machine-referenceable diagnostic): pi's user-facing doctor is this
 // inventory, not a pass/fail check matrix, so this is what the command output reproduces.
 //
-// The pi Permission-system and Intercom-bridge sections are intentionally omitted — both report on
-// pi companion packages (`pi-permission-system`/`pi-intercom`) that have no cyrup analog today
-// (deferred-companion), so rendering them here would only ever emit "unavailable" placeholders.
+// The pi Permission-system and Intercom-bridge sections are not rendered here yet. NOTE the
+// Intercom-bridge section's rationale changed upstream: since `3ac0ef5` ("Make supervisor
+// coordination native", 2026-07-03) `formatIntercomDiagnostic` no longer probes for an installed
+// `pi-intercom` package at all — it reports `- supervisor channel: available
+// (native:pi-subagents-supervisor-channel)`, which is unconditionally true because the channel is a
+// plain filesystem directory (`crate::native_supervisor`). So this section is unported WORK, not an
+// "unavailable placeholder" — see `native_supervisor::NATIVE_SUPERVISOR_EXTENSION_DIR`.
+//
+// The pi Companion-packages section that used to follow the report body is genuinely gone: the same
+// commit deleted `companionPackageLines` from `DoctorReportInput` and `extension/companion-
+// suggestions.ts` wholesale, so there is nothing left upstream to port.
 // =================================================================================================
 
 /// Everything [`build_doctor_report`] renders, assembled by the caller (normally `extension.rs`'s

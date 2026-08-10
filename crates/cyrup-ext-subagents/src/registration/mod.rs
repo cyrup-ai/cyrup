@@ -1,4 +1,4 @@
-//! Extension registration (native `NativeExtension`, tool + 13 slash commands + doctor
+//! Extension registration (native `NativeExtension`, tool + 12 slash commands + doctor
 //! diagnostics), config-schema layering (`config.json` + `cyrup-config` settings), and durable
 //! persistence (func-SA §5.6; arch-SA §3.8/§4.6/§6.8).
 //!
@@ -56,7 +56,7 @@ pub mod doctor;
 
 pub mod profiles;
 
-/// The 13 slash-command descriptors and their pure argument parsers (R-SA-129):
+/// The 12 slash-command descriptors and their pure argument parsers (R-SA-129):
 /// [`slash_commands::SLASH_COMMANDS`] is the static registration table `extension.rs` iterates at
 /// `init()` time, and `slash_commands::parse_*` functions turn each command's raw trailing
 /// argument string into a strongly-typed parsed-command value, including `/chain`'s inline
@@ -171,13 +171,6 @@ pub struct SubagentExtensionConfig {
     /// constant itself lives in `spawn::worktree::DEFAULT_HOOK_TIMEOUT`, not duplicated here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_setup_hook_timeout_ms: Option<u64>,
-    /// Companion-package recommendation tuning/dismissal state — pi `ExtensionConfig.companionSuggestions?:
-    /// CompanionSuggestionsConfig | false` (types.ts:881). `None` (the field omitted) matches pi's own
-    /// omitted-field default: every package enabled, nothing dismissed. This is the SAME store
-    /// `/subagents-companions hide|show` mutates and `status` reads back (pi
-    /// `companion-suggestions.ts`'s `updateCompanionDismissal`/`isDismissed`), not a side marker file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub companion_suggestions: Option<CompanionSuggestionsSetting>,
     /// The `wait` tool's config gate — pi `ExtensionConfig.waitTool?: WaitToolConfig`
     /// (`extension/index.ts:260` `resolveWaitToolConfig(config.waitTool)`), accepting either a bare
     /// boolean or `{ enabled?: boolean }`. `None` (the field omitted) = enabled, pi's default.
@@ -210,7 +203,6 @@ impl Default for SubagentExtensionConfig {
             worktree_base_dir: None,
             worktree_setup_hook: None,
             worktree_setup_hook_timeout_ms: None,
-            companion_suggestions: None,
             wait_tool: None,
         }
     }
@@ -406,59 +398,6 @@ impl ProactiveSkillSubagents {
             ProactiveSkillSubagents::Config(cfg) => cfg.enabled.unwrap_or(true),
         }
     }
-}
-
-// -------------------------------------------------------------------------------------------
-// Companion-suggestion config (pi `companion-suggestions.ts` + `types.ts:847-862/881`)
-// -------------------------------------------------------------------------------------------
-
-/// Per-package dismissal state — pi `CompanionSuggestionPackageConfig.dismissed`
-/// (types.ts:853-856). `user` dismisses the recommendation for this OS user account entirely;
-/// `workspaces` dismisses it only for the specific workspace keys listed (each the nearest ancestor
-/// `.git` directory, or the resolved cwd when none is found — `extension::companion_workspace_key`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CompanionSuggestionDismissed {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspaces: Option<Vec<String>>,
-}
-
-/// Per-package companion-suggestion config — pi `CompanionSuggestionPackageConfig`
-/// (types.ts:850-857).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CompanionSuggestionPackageConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub surfaces: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dismissed: Option<CompanionSuggestionDismissed>,
-}
-
-/// The companion-suggestions config object — pi `CompanionSuggestionsConfig` (types.ts:859-862).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CompanionSuggestionsConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub packages: Option<HashMap<String, CompanionSuggestionPackageConfig>>,
-}
-
-/// pi `companionSuggestions?: CompanionSuggestionsConfig | false` (types.ts:881): the whole-feature
-/// `false` shortcut disables every companion package regardless of any per-package `enabled`/
-/// `dismissed` state (`companion-suggestions.ts:118`, `packageConfig`). Deserialized untagged so
-/// both a JSON object and a bare `false` parse, matching [`ProactiveSkillSubagents`]'s own shape.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-pub enum CompanionSuggestionsSetting {
-    /// The literal `false` (or `true`) form — `false` disables the whole feature.
-    Toggle(bool),
-    /// The full config-object form.
-    Config(CompanionSuggestionsConfig),
 }
 
 // -------------------------------------------------------------------------------------------

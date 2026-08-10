@@ -586,6 +586,182 @@ async fn write_control_request<T: serde::Serialize + Sync>(
         .map_err(SubagentError::Spawn)
 }
 
+// =================================================================================================
+// steer (G90) — the control inbox's THIRD verb, pi `control-channel.ts:48-55,121-189` @v0.34.0
+// =================================================================================================
+
+/// One parent-to-runner steering request (pi `SteerRequest`, `control-channel.ts:48-55` @v0.34.0).
+///
+/// Unlike [`InterruptRequest`]/[`TimeoutRequest`], steering is a **queue, not a flag**: several
+/// distinct guidance messages can be in flight at once and each must be delivered exactly once, so
+/// a steer request is a uniquely-named file inside a DIRECTORY rather than a single well-known
+/// path whose mere existence is the whole state. That is why [`steer_requests_dir`] exists and
+/// there is no `steer_request_path`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerRequest {
+    /// Always `"steer"` — the discriminant, a plain string field for the same byte-for-byte
+    /// on-disk-shape reason [`InterruptRequest::kind`] is.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Unique request id. Also the dedup key and (base64url-encoded) half of the file name, so two
+    /// requests written in the same millisecond cannot collide.
+    pub id: String,
+    /// Wall-clock creation time (epoch milliseconds). The primary sort key on consumption, so
+    /// guidance is delivered in the order the parent produced it.
+    pub ts: i64,
+    /// The guidance itself, already trimmed and known non-empty.
+    pub message: String,
+    /// The specific child (flat step index) this is aimed at. `None` means "every currently
+    /// running child", which is what the runner fans it out to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_index: Option<usize>,
+    /// Who produced it — `"steer-action"` for the `action: "steer"` tool verb, matching pi's own
+    /// literal (`subagent-executor.ts:620` @v0.34.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// `<run_dir>/control/steer-requests/` — the parent-written queue the runner drains (pi
+/// `steerRequestsDir`, `control-channel.ts:76-78`).
+#[must_use]
+pub fn steer_requests_dir(run_dir: &Path) -> PathBuf {
+    control_inbox_dir(run_dir).join("steer-requests")
+}
+
+/// `<run_dir>/control/steer-targets/<index>/` — the per-child inbox the runner routes an accepted
+/// request into (pi `stepSteerInboxDir`, `control-channel.ts:81-83`). Two directories rather than
+/// one because the two hops have different addressees: the parent does not know which child is
+/// running, and the child must not have to filter a queue that is not its own.
+#[must_use]
+pub fn step_steer_inbox_dir(run_dir: &Path, index: usize) -> PathBuf {
+    control_inbox_dir(run_dir).join("steer-targets").join(index.to_string())
+}
+
+/// pi `steerRequestFileName` (`control-channel.ts:85-87`): `<ts zero-padded to 13>-<base64url(id)>.json`.
+///
+/// The zero-padding is what makes a plain lexicographic directory listing sort by time, which is
+/// exactly what [`consume_steer_requests_from_dir`] relies on before its explicit re-sort — and the
+/// base64url of the id keeps an arbitrary caller-supplied id from ever producing a path separator.
+fn steer_request_file_name(request: &SteerRequest) -> String {
+    use base64::Engine as _;
+    let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(request.id.as_bytes());
+    format!("{:013}-{id}.json", request.ts.max(0))
+}
+
+/// pi `writeSteerRequestToDir` (`control-channel.ts:89-93`).
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the directory cannot be created or the file written.
+pub async fn write_steer_request_to_dir(
+    dir: &Path,
+    request: &SteerRequest,
+) -> Result<PathBuf, SubagentError> {
+    let path = dir.join(steer_request_file_name(request));
+    write_control_request(&path, request).await?;
+    Ok(path)
+}
+
+/// Parent side: pi `requestAsyncSteer` (`control-channel.ts:121-140`) — validate, stamp, and drop
+/// one steering request into `run_dir`'s steer queue.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Management`] for an empty message (pi's `throw new Error("steer message
+/// must not be empty.")`), or [`SubagentError::Spawn`] for an I/O failure.
+pub async fn request_async_steer(
+    run_dir: &Path,
+    message: &str,
+    target_index: Option<usize>,
+    source: Option<&str>,
+) -> Result<PathBuf, SubagentError> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(SubagentError::Management("steer message must not be empty.".to_string()));
+    }
+    // pi additionally rejects a non-integer/negative `targetIndex`; both are unrepresentable in
+    // `Option<usize>`, so that guard has no surviving branch here.
+    let request = SteerRequest {
+        kind: "steer".to_string(),
+        id: uuid::Uuid::new_v4().as_simple().to_string(),
+        ts: now_epoch_millis(),
+        message: message.to_string(),
+        target_index,
+        source: source.map(str::to_string),
+    };
+    write_steer_request_to_dir(&steer_requests_dir(run_dir), &request).await
+}
+
+/// Runner side: pi `enqueueStepSteer` (`control-channel.ts:142-145`) — hand one accepted request to
+/// exactly one child by copying it into that child's own inbox with `target_index` pinned.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the child inbox cannot be created or written.
+pub async fn enqueue_step_steer(
+    run_dir: &Path,
+    index: usize,
+    request: &SteerRequest,
+) -> Result<PathBuf, SubagentError> {
+    let pinned = SteerRequest {
+        kind: "steer".to_string(),
+        target_index: Some(index),
+        ..request.clone()
+    };
+    write_steer_request_to_dir(&step_steer_inbox_dir(run_dir, index), &pinned).await
+}
+
+/// pi `consumeSteerRequestsFromDir` (`control-channel.ts:165-185`): read every `*.json` in `dir` in
+/// name order, DELETE each one before returning it (so a crash mid-delivery loses a request rather
+/// than replaying it), skip anything that fails to parse or validate, and return the survivors
+/// sorted by `(ts, id)`.
+///
+/// A missing directory is an empty list, never an error — the common case is that nobody has ever
+/// steered this run.
+pub async fn consume_steer_requests_from_dir(dir: &Path) -> Vec<SteerRequest> {
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return Vec::new();
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".json") {
+            names.push(name);
+        }
+    }
+    names.sort();
+
+    let mut out: Vec<SteerRequest> = Vec::new();
+    for name in names {
+        let path = dir.join(&name);
+        let parsed = tokio::fs::read(&path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<SteerRequest>(&bytes).ok())
+            .filter(|r| r.kind == "steer" && !r.id.trim().is_empty() && !r.message.trim().is_empty());
+        // Removal is the consumption primitive and happens whether or not the parse succeeded —
+        // a malformed request that stayed on disk would be re-read on every single tick forever.
+        if tokio::fs::remove_file(&path).await.is_err() {
+            // Lost the race to a concurrent consumer: it already owns this request, so this
+            // consumer must NOT also deliver it.
+            continue;
+        }
+        if let Some(mut request) = parsed {
+            request.id = request.id.trim().to_string();
+            request.message = request.message.trim().to_string();
+            out.push(request);
+        }
+    }
+    out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+/// pi `consumeSteerRequests` (`control-channel.ts:187-189`): drain the RUN-level queue.
+pub async fn consume_steer_requests(run_dir: &Path) -> Vec<SteerRequest> {
+    consume_steer_requests_from_dir(&steer_requests_dir(run_dir)).await
+}
+
 /// Non-consuming read of a pending [`TimeoutRequest`] — [`check_control_inbox_now`]'s sibling,
 /// with the identical "the file's existence IS the state, reading never deletes" contract.
 ///

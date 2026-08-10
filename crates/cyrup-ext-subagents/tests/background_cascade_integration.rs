@@ -81,6 +81,8 @@ fn persona(name: &str) -> ResolvedAgentPersona {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     }
 }
 

@@ -109,6 +109,13 @@ pub mod tracker;
 /// `extension.rs`. See [`run_status`] for the full subsystem doc.
 pub mod run_status;
 
+/// The `view: "fleet"` / `view: "transcript"` status surfaces (G92): the Rust port of
+/// pi `runs/background/fleet-view.ts` @v0.34.0 — the read-only in-flight fleet listing behind
+/// `/subagents-fleet`, and the bounded, containment-checked transcript tail behind
+/// `subagent({ action: "status", id, view: "transcript", lines })`. See [`fleet_view`] for the
+/// scope line drawn against upstream's v0.35+ `src/tui/fleet*.ts` subtree, which is NOT this.
+pub mod fleet_view;
+
 /// The `wait` tool's blocking primitive (SUBA-004): block the current turn until outstanding
 /// background runs settle, with a timeout and a cancellation path. Port of pi-subagents'
 /// `runs/background/wait.ts`. See [`wait`] for the full subsystem doc.
@@ -512,6 +519,16 @@ pub struct StepTelemetry {
     /// (pi `step.outputFile`/the run-level `outputFile`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_file: Option<PathBuf>,
+    /// G90: how many steering messages this step has ACCEPTED (pi `step.steerCount`,
+    /// `subagent-runner.ts:1761`). Written by the runner's steer router, read by
+    /// `run_status`'s per-step line — it is the only way a caller can tell that
+    /// `action: "steer"` actually landed on a child rather than merely being queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_count: Option<u64>,
+    /// G90: epoch-millis of this step's most recent accepted steer (pi `step.lastSteerAt`,
+    /// `subagent-runner.ts:1762`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_steer_at: Option<i64>,
 }
 
 /// The run-wide activity roll-ups pi maintains on the top-level `statusPayload`
@@ -545,6 +562,14 @@ pub struct RunTelemetry {
     /// `shared/types.ts:597`) — node ids, phases, group-status precedence, `currentNodeId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_graph: Option<WorkflowGraphSnapshot>,
+    /// G90: total steering messages accepted anywhere in this run (pi `statusPayload.steerCount`,
+    /// `subagent-runner.ts:1766`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_count: Option<u64>,
+    /// G90: epoch-millis of the run's most recent accepted steer (pi `statusPayload.lastSteerAt`,
+    /// `subagent-runner.ts:1767`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_steer_at: Option<i64>,
 }
 
 /// Fold one child NDJSON [`crate::exec::ndjson::SubagentEvent`] into a step's live telemetry — the

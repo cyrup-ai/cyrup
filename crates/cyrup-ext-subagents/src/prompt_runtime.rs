@@ -109,6 +109,248 @@ pub const PROMPT_RUNTIME_EXTENSION_ID: &str = "subagent-prompt-runtime";
 /// [`crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR`] names when it was never called.
 pub const STRUCTURED_OUTPUT_TOOL_NAME: &str = "structured_output";
 
+// =================================================================================================
+// G90 — the CHILD half of `action: "steer"` (pi `registerSteeringInbox`,
+// `runs/shared/subagent-prompt-runtime.ts:193-259` @v0.34.0)
+// =================================================================================================
+
+/// The env var carrying this child's own steer inbox directory — pi `SUBAGENT_STEER_INBOX_ENV`
+/// (`pi-args.ts:32`, value `PI_SUBAGENT_STEER_INBOX`), written by the spawn plan from
+/// [`crate::exec::RunOptions::steer_inbox_dir`].
+///
+/// Declared HERE, on the reader, and aliased by the writer (`exec/mod.rs`), matching the existing
+/// convention this module already sets for `INHERIT_PROJECT_CONTEXT_ENV`/`INHERIT_SKILLS_ENV`: two
+/// independently-spelled copies of a cross-process contract silently drifting apart is exactly the
+/// write-only-flag defect the aliasing exists to prevent — and it is precisely the defect this
+/// whole feature had, in its worse form: the parent wrote steer requests to disk and NO env var
+/// existed at all, so nothing in the crate ever read them in production.
+pub const STEER_INBOX_ENV: &str = "CYRUP_SUBAGENT_STEER_INBOX";
+
+/// How often the child re-checks its inbox. pi `setInterval(flush, 250)`
+/// (`subagent-prompt-runtime.ts:237`).
+///
+/// Upstream ALSO installs an `fs.watch` on the directory (`:232`) and treats the interval as the
+/// portable safety net. cyrup keeps only the interval: this crate's own `notify`-based watcher is
+/// built for run-level status files, the inbox is a directory of tiny files written at human
+/// pace, and 250 ms is already upstream's own worst-case latency bound — a watcher would improve
+/// the best case and add a second, racier code path to the one seam whose failure mode is
+/// "guidance silently never arrives".
+const STEER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// pi `formatSteerMessage` (`subagent-prompt-runtime.ts:161-169` @v0.34.0) — the exact text the
+/// child's model sees. Kept verbatim (including the trailing "do not restart" instruction, which is
+/// what stops a steered child from throwing away the work it has already done).
+#[must_use]
+pub fn format_steer_message(request: &crate::background::control::SteerRequest) -> String {
+    format!(
+        "Mid-run steering from the parent orchestrator:\n\n{}\n\nIncorporate this guidance at the \
+         next safe point. Do not restart the task unless the guidance explicitly asks you to.",
+        request.message
+    )
+}
+
+/// The child-side steering inbox: pi's `registerSteeringInbox` closure state, as a struct.
+///
+/// # Why this exists at all
+///
+/// `action: "steer"` was a DEAD LETTER. The parent validated a request, the detached runner routed
+/// it into `<run_dir>/control/steer-targets/<i>/` — and nothing anywhere read that directory in
+/// production, nor did any env var tell a child it existed. The tool's own success text conceded
+/// as much ("Delivery requires a live Cyrup child session that supports mid-run steering"); there
+/// was no such session, because nothing had been written to make one.
+///
+/// The capability to finish it was never missing. `cyrup_ext::host::HostServices::inject_message`
+/// (`cyrup-ext/src/host/services.rs:311`) is the seam, live-implemented at
+/// `cyrup-session-svc/src/host_services.rs:735` and routed to `AgentSession::send_user_message`,
+/// which — see `session.rs:3671-3677` — STEERS the running turn while streaming and starts a fresh
+/// prompt when idle. That is `pi.sendUserMessage(text, { deliverAs: "steer" })`, exactly. This very
+/// crate already calls it from two other places (`background/watch.rs`'s completion sink and
+/// `native_supervisor.rs`'s channel poller), and `NativeExtension::set_host_services`
+/// (`cyrup-ext/src/native.rs:449`) is how a native extension is handed the backend.
+///
+/// # Lifecycle (pi `:199-258`)
+///
+/// * `session_start` → [`Self::start`]: create the directory, arm the 250 ms poller.
+/// * any of `message_start`/`message_update`/`message_end`/`tool_execution_start`/
+///   `tool_execution_end`/`turn_end` → [`Self::activate`]: start (idempotent), set `can_steer`,
+///   flush now. Upstream's `canSteer` gate is what keeps guidance from being injected into a
+///   session that has not begun a turn yet; cyrup adds the same gate for the same reason, plus one
+///   of its own — [`Self::services`] is late-bound, so a flush before `set_host_services` has
+///   nothing to inject into.
+/// * `session_shutdown` → [`Self::dispose`]: stop the poller. A request still on disk stays on
+///   disk, which is correct: it was never delivered.
+pub struct SteeringInbox {
+    /// `<run_dir>/control/steer-targets/<flatIndex>/` for THIS child.
+    dir: PathBuf,
+    /// The late-bound capability backend (`NativeExtension::set_host_services`). `None` until the
+    /// host binds it, and on a headless/default host it is bound to a backend whose
+    /// `inject_message` denies — both of which degrade to "no steering", never to a panic.
+    services: std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>,
+    state: std::sync::Mutex<SteeringInboxState>,
+}
+
+#[derive(Default)]
+struct SteeringInboxState {
+    /// pi `canSteer` (`:199`): set by the first turn-lifecycle event. Until then the session has no
+    /// live turn to steer.
+    can_steer: bool,
+    /// pi `started` (`:202`): the poller is armed exactly once.
+    started: bool,
+    /// pi `disposed` (`:200`).
+    disposed: bool,
+    /// pi `flushing` (`:201`): re-entrancy guard. `consume_steer_requests_from_dir` DELETES each
+    /// request as it reads it, so two overlapping flushes could not double-deliver — but they
+    /// could interleave two orderings of one queue, and ordering is the one property the
+    /// `(ts, id)` sort exists to guarantee.
+    flushing: bool,
+}
+
+impl SteeringInbox {
+    #[must_use]
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            services: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(SteeringInboxState::default()),
+        }
+    }
+
+    /// The inbox this child watches — exposed for tests and diagnostics.
+    #[must_use]
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    fn bind_services(&self, services: Arc<dyn cyrup_ext::host::HostServices>) {
+        let mut slot = self
+            .services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(services);
+    }
+
+    /// pi `start` (`:223-239`): create the directory, then arm the poller ONCE.
+    ///
+    /// A directory-creation failure returns without arming, exactly as upstream's `try/catch`
+    /// around `mkdirSync` returns without setting `started` — a child that cannot see its inbox
+    /// must not spin a poller against a path that will never exist.
+    fn start(self: &Arc<Self>) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.started || state.disposed {
+                return;
+            }
+            if std::fs::create_dir_all(&self.dir).is_err() {
+                return;
+            }
+            state.started = true;
+        }
+        let inbox = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(STEER_POLL_INTERVAL).await;
+                if inbox
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .disposed
+                {
+                    return;
+                }
+                inbox.flush().await;
+            }
+        });
+    }
+
+    /// pi `activate` (`:240-245`): start, allow steering, flush immediately. Called from every
+    /// turn-lifecycle event so guidance lands at the first safe point rather than up to one poll
+    /// interval later.
+    async fn activate(self: &Arc<Self>) {
+        self.start();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.disposed {
+                return;
+            }
+            state.can_steer = true;
+        }
+        self.flush().await;
+    }
+
+    /// pi `dispose` (`:252-258`).
+    fn dispose(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.disposed = true;
+        state.can_steer = false;
+    }
+
+    /// pi `flush` (`:205-222`): drain the inbox in `(ts, id)` order and inject each request into
+    /// the live session.
+    ///
+    /// On an injection failure, the requests NOT yet delivered — including the one that failed —
+    /// are written back to the inbox and the drain stops (pi `:214-217`). This is what makes the
+    /// hand-off lossless across a transient host error: `consume_steer_requests_from_dir` removes
+    /// each file as it reads it, so without the write-back a single failed inject would silently
+    /// discard the rest of the queue.
+    async fn flush(&self) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.disposed || state.flushing || !state.can_steer {
+                return;
+            }
+            state.flushing = true;
+        }
+
+        let services = self
+            .services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        if let Some(services) = services {
+            let requests =
+                crate::background::control::consume_steer_requests_from_dir(&self.dir).await;
+            for (index, request) in requests.iter().enumerate() {
+                // `custom_type: None` is the load-bearing argument: it routes to
+                // `AgentSession::send_user_message`, i.e. a real USER message the model must
+                // answer, which is what `deliverAs: "steer"` means. A `Some(kind)` would make it a
+                // custom (non-LLM) message the model never sees. `display: true` so the operator
+                // watching the child's transcript sees the guidance arrive; `trigger_turn: true`
+                // so an IDLE child (between turns) actually acts on it instead of parking it.
+                if services
+                    .inject_message(&format_steer_message(request), None, true, true)
+                    .is_err()
+                {
+                    for pending in requests.get(index..).unwrap_or_default() {
+                        let _ = crate::background::control::write_steer_request_to_dir(
+                            &self.dir, pending,
+                        )
+                        .await;
+                    }
+                    break;
+                }
+            }
+        }
+
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flushing = false;
+    }
+}
+
 /// pi's exact tool description (`subagent-prompt-runtime.ts:299`).
 const STRUCTURED_OUTPUT_TOOL_DESCRIPTION: &str =
     "Submit the required final structured output for this subagent step. This terminates the step.";
@@ -604,6 +846,17 @@ pub struct SubagentPromptRuntime {
     id: ExtensionId,
     /// `Some` only when this step declared an `outputSchema` (both structured env vars resolved).
     tool: Option<Arc<StructuredOutputTool>>,
+    /// The NATIVE file-channel `contact_supervisor` — pi's `registerNativeSupervisorClient(pi)`
+    /// (`subagent-prompt-runtime.ts:240`, added in `3ac0ef5`). `Some` only when this child has a
+    /// resolvable supervisor channel AND `cyrup-intercom` will not be supplying its own
+    /// broker-backed `contact_supervisor`
+    /// ([`crate::native_supervisor::native_child_client_should_register`]) — cyrup's stand-in for
+    /// upstream's `!hasTool(pi, "contact_supervisor")` guard, which `InitApi` cannot express.
+    supervisor_tool: Option<Arc<crate::native_supervisor::NativeContactSupervisorTool>>,
+    /// G106's SECOND child tool — the bare-named `intercom` fallback
+    /// (`native-supervisor-channel.ts:305-321`). `Some` only when `contact_supervisor` also
+    /// registers AND this agent's declared tool allowlist asked for `intercom`.
+    intercom_fallback: Option<Arc<crate::native_supervisor::NativeChildIntercomTool>>,
     /// `None` reproduces pi's early return at `subagent-prompt-runtime.ts:333` — when NONE of the
     /// three child flags is defined the prompt is left exactly as assembled. In practice a real
     /// spawn always defines all three (`exec/mod.rs` writes both inherit flags and `child_role_env`
@@ -612,6 +865,36 @@ pub struct SubagentPromptRuntime {
     /// pi's `preserveCurrentFanoutToolHistory` (`:142`) — see
     /// [`strip_parent_only_subagent_messages`].
     preserve_fanout_tool_history: bool,
+    /// pi's `registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV]))`
+    /// (`subagent-prompt-runtime.ts:263`). `Some` only when the parent shipped a budget in
+    /// [`crate::exec::tool_budget::TOOL_BUDGET_ENV`]; `None` means every tool call passes
+    /// untouched and this half of the runtime costs nothing.
+    tool_budget: Option<ToolBudgetGuard>,
+    /// G90 / pi `registerSteeringInbox` (`subagent-prompt-runtime.ts:193-259`). `Some` only when
+    /// the parent handed this child a [`STEER_INBOX_ENV`] path — i.e. only for a background/async
+    /// child, which is the only kind that has an async run directory to steer through.
+    steering: Option<Arc<SteeringInbox>>,
+}
+
+/// The live counter behind a `toolBudget:` — pi's three `registerToolBudget` closure variables
+/// (`toolCount`, `softNudged`, and the budget itself, `subagent-prompt-runtime.ts:171-190`).
+///
+/// `on_event` takes `&self`, so the mutable state lives behind a `Mutex` rather than in a JS
+/// closure. A poisoned lock degrades to "do not block" — a budget is advisory scaffolding and must
+/// never be the thing that kills a child run.
+#[derive(Debug)]
+struct ToolBudgetGuard {
+    budget: crate::discovery::types::ResolvedToolBudget,
+    state: std::sync::Mutex<ToolBudgetCounters>,
+}
+
+#[derive(Debug, Default)]
+struct ToolBudgetCounters {
+    tool_count: u32,
+    soft_nudged: bool,
+    /// The tool call whose RESULT should carry the one-time soft nudge — see
+    /// [`SubagentPromptRuntime::on_event`]'s `[CYRUP-DELTA]` note on nudge delivery.
+    pending_nudge: Option<(cyrup_core::ToolCallId, String)>,
 }
 
 impl SubagentPromptRuntime {
@@ -621,8 +904,12 @@ impl SubagentPromptRuntime {
         Self {
             id: ExtensionId::from(PROMPT_RUNTIME_EXTENSION_ID),
             tool: Some(Arc::new(StructuredOutputTool::new(schema, output_path))),
+            supervisor_tool: None,
+            intercom_fallback: None,
             rewrite: None,
             preserve_fanout_tool_history: false,
+            tool_budget: None,
+            steering: None,
         }
     }
 
@@ -637,9 +924,66 @@ impl SubagentPromptRuntime {
         Self {
             id: ExtensionId::from(PROMPT_RUNTIME_EXTENSION_ID),
             tool,
+            supervisor_tool: None,
+            intercom_fallback: None,
             rewrite,
             preserve_fanout_tool_history,
+            tool_budget: None,
+            steering: None,
         }
+    }
+
+    /// Attach the child-side steering inbox (pi `registerSteeringInbox`,
+    /// `subagent-prompt-runtime.ts:262`). `None` leaves the child with no live steering channel,
+    /// which is every foreground child.
+    #[must_use]
+    pub fn with_steering_inbox(mut self, dir: Option<PathBuf>) -> Self {
+        self.steering = dir.map(|dir| Arc::new(SteeringInbox::new(dir)));
+        self
+    }
+
+    /// The steering inbox this runtime watches, if any — exposed so a test can drive the real
+    /// lifecycle instead of reaching into private state.
+    #[must_use]
+    pub fn steering_inbox(&self) -> Option<&Arc<SteeringInbox>> {
+        self.steering.as_ref()
+    }
+
+    /// Attach the NATIVE file-channel `contact_supervisor` (pi `registerNativeSupervisorClient`,
+    /// `subagent-prompt-runtime.ts:240`).
+    #[must_use]
+    pub fn with_supervisor_tool(
+        mut self,
+        tool: Option<Arc<crate::native_supervisor::NativeContactSupervisorTool>>,
+    ) -> Self {
+        self.supervisor_tool = tool;
+        self
+    }
+
+    /// Attach G106's child-side `intercom` fallback (pi
+    /// `registerNativeSupervisorClient(pi)` with `includeIntercomFallback` left on,
+    /// `subagent-prompt-runtime.ts:275-277`).
+    #[must_use]
+    pub fn with_intercom_fallback(
+        mut self,
+        tool: Option<Arc<crate::native_supervisor::NativeChildIntercomTool>>,
+    ) -> Self {
+        self.intercom_fallback = tool;
+        self
+    }
+
+    /// Attach the parent-supplied tool budget (pi `registerToolBudget`,
+    /// `subagent-prompt-runtime.ts:171-190`). `None` leaves every tool call untouched.
+    #[must_use]
+    pub fn with_tool_budget(
+        mut self,
+        budget: Option<crate::discovery::types::ResolvedToolBudget>,
+    ) -> Self {
+        self.tool_budget = budget.map(|budget| ToolBudgetGuard {
+            budget,
+            state: std::sync::Mutex::new(ToolBudgetCounters::default()),
+        });
+        self
     }
 }
 
@@ -658,6 +1002,20 @@ impl NativeExtension for SubagentPromptRuntime {
         if let Some(tool) = &self.tool {
             api.register_tool(tool.clone());
         }
+        // pi `registerSubagentPromptRuntime` calls `registerNativeSupervisorClient(pi)`
+        // unconditionally (`subagent-prompt-runtime.ts:240`); the decision of whether a tool is
+        // actually produced lives in the resolver below, exactly as upstream's own
+        // `if (!readChildMetadata()) return;` early return does.
+        if let Some(tool) = &self.supervisor_tool {
+            api.register_tool(tool.clone());
+        }
+        // The fallback is registered AFTER `contact_supervisor`, matching upstream's own ordering
+        // (`registerNativeSupervisorFallbackOnce` calls `registerNativeSupervisorClientOnce`
+        // first): the primary tool must exist before a tool whose description tells the model to
+        // "prefer contact_supervisor when available" is offered.
+        if let Some(tool) = &self.intercom_fallback {
+            api.register_tool(tool.clone());
+        }
         // `context` is subscribed unconditionally, exactly as pi registers its handler
         // unconditionally: this extension exists ONLY inside a subagent child, and every subagent
         // child must have the parent's orchestration bookkeeping filtered out of its context.
@@ -665,11 +1023,65 @@ impl NativeExtension for SubagentPromptRuntime {
         if self.rewrite.is_some() {
             kinds.push(EventKind::BeforeAgentStart);
         }
+        // pi `registerToolBudget` subscribes `onRuntimeEvent("tool_call", …)` only when a budget
+        // exists (`:172` returns early otherwise); `Dispatcher::no_subscribers` short-circuits an
+        // event with no declared listener, so an un-budgeted child pays nothing for this.
+        // `tool_result` is cyrup-only, and carries the soft nudge — see `on_event`.
+        if self.tool_budget.is_some() {
+            kinds.push(EventKind::ToolCall);
+            kinds.push(EventKind::ToolResult);
+        }
+        // G90 / pi `registerSteeringInbox`'s own `onRuntimeEvent` set
+        // (`subagent-prompt-runtime.ts:247-252` @v0.34.0): `session_start` arms the poller,
+        // `session_shutdown` disposes it, and the six turn-lifecycle events are the `activate`
+        // triggers that set `canSteer` and flush immediately. Subscribed only when this child
+        // actually has an inbox — `Dispatcher::no_subscribers` short-circuits the rest, so a
+        // foreground child pays nothing for any of it (`message_update` in particular is
+        // HIGH-FREQ).
+        if self.steering.is_some() {
+            kinds.extend_from_slice(&[
+                EventKind::SessionStart,
+                EventKind::SessionShutdown,
+                EventKind::MessageStart,
+                EventKind::MessageUpdate,
+                EventKind::MessageEnd,
+                EventKind::ToolExecStart,
+                EventKind::ToolExecEnd,
+                EventKind::TurnEnd,
+            ]);
+        }
         api.subscribe(&kinds);
         Ok(())
     }
 
+    /// G90: the late-bound capability backend, forwarded to the steering inbox — this is the whole
+    /// mechanism by which a steered message reaches the child's model
+    /// (`HostServices::inject_message` → `AgentSession::send_user_message` → `steer` while
+    /// streaming). Without it the inbox drains into nothing.
+    fn set_host_services(&self, services: Arc<dyn cyrup_ext::host::HostServices>) {
+        if let Some(steering) = &self.steering {
+            steering.bind_services(services);
+        }
+    }
+
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        // G90 / pi `registerSteeringInbox`'s handlers (`subagent-prompt-runtime.ts:247-258`). Run
+        // FIRST and always fall through: every one of these events also has (or may later grow) a
+        // meaning for the other halves of this runtime, and steering is a pure side effect that
+        // must never swallow another handler's `HookOutcome`.
+        if let Some(steering) = &self.steering {
+            match ev {
+                HostEvent::SessionStart { .. } => steering.start(),
+                HostEvent::SessionShutdown { .. } => steering.dispose(),
+                HostEvent::MessageStart { .. }
+                | HostEvent::MessageUpdate { .. }
+                | HostEvent::MessageEnd { .. }
+                | HostEvent::ToolExecStart { .. }
+                | HostEvent::ToolExecEnd { .. }
+                | HostEvent::TurnEnd { .. } => steering.activate().await,
+                _ => {}
+            }
+        }
         match ev {
             // pi `:323-341`.
             HostEvent::BeforeAgentStart { system_prompt, .. } => {
@@ -686,6 +1098,83 @@ impl NativeExtension for SubagentPromptRuntime {
                         inject: None,
                     })
                 }
+            }
+            // pi `registerToolBudget`'s `tool_call` handler (`:175-189`): count the call, fire the
+            // one-time soft nudge, then BLOCK when the hard limit has been passed and this tool is
+            // in the block set.
+            HostEvent::ToolCall { call_id, name, .. } => {
+                let Some(guard) = &self.tool_budget else {
+                    return HookOutcome::Noop;
+                };
+                let Ok(mut state) = guard.state.lock() else {
+                    // A poisoned lock must never be the thing that kills a child run; a budget is
+                    // advisory scaffolding, so degrade to "allow".
+                    return HookOutcome::Noop;
+                };
+                state.tool_count = state.tool_count.saturating_add(1);
+                let tool_count = state.tool_count;
+                if let Some(soft) = guard.budget.soft
+                    && tool_count >= soft
+                    && !state.soft_nudged
+                {
+                    state.soft_nudged = true;
+                    // **[CYRUP-DELTA] — nudge transport only.** pi delivers the soft nudge via
+                    // `pi.sendUserMessage(text, { deliverAs: "steer" })` (`:183`), a channel an
+                    // event-tier `HostCtx` does not expose (`HostCtx` is data-only; there is no
+                    // steer seam inside the loop). The nudge is therefore queued against THIS
+                    // call's id and appended to its tool RESULT below — the same text, reaching
+                    // the model at the same point in the transcript (immediately after the
+                    // triggering call), in-band instead of out-of-band. pi's own comment calls the
+                    // nudge advisory and the block authoritative; the block below is byte-identical
+                    // to pi either way.
+                    state.pending_nudge = Some((
+                        call_id.clone(),
+                        crate::exec::tool_budget::tool_budget_soft_nudge(&guard.budget, tool_count),
+                    ));
+                }
+                if crate::exec::tool_budget::should_block_tool_for_budget(
+                    &guard.budget,
+                    name,
+                    tool_count,
+                ) {
+                    return HookOutcome::Block {
+                        reason: Some(crate::exec::tool_budget::tool_budget_blocked_message(
+                            &guard.budget,
+                            name,
+                            tool_count,
+                        )),
+                    };
+                }
+                HookOutcome::Noop
+            }
+            // The soft-nudge delivery half of the `[CYRUP-DELTA]` above: append the queued nudge to
+            // the result of the call that crossed the threshold, then clear it so it fires once.
+            HostEvent::ToolResult {
+                call_id, content, ..
+            } => {
+                let Some(guard) = &self.tool_budget else {
+                    return HookOutcome::Noop;
+                };
+                let Ok(mut state) = guard.state.lock() else {
+                    return HookOutcome::Noop;
+                };
+                let Some((pending_id, _)) = &state.pending_nudge else {
+                    return HookOutcome::Noop;
+                };
+                if pending_id != call_id {
+                    return HookOutcome::Noop;
+                }
+                let Some((_, nudge)) = state.pending_nudge.take() else {
+                    return HookOutcome::Noop;
+                };
+                let mut content = content.clone();
+                content.push(cyrup_core::Content::Text { text: nudge, text_signature: None });
+                HookOutcome::Mutate(EventPatch::ToolResult {
+                    content: Some(content),
+                    details: None,
+                    is_error: None,
+                    usage: None,
+                })
             }
             // pi `:317-321`.
             HostEvent::Context { messages } => {
@@ -751,14 +1240,205 @@ pub fn prompt_runtime_extension_from(
         structured_output: capture.is_some(),
     });
 
-    if tool.is_none() && rewrite.is_none() {
+    // pi `registerNativeSupervisorClient` (`subagent-prompt-runtime.ts:240` →
+    // `native-supervisor-channel.ts:294-311`): a child with a resolvable supervisor channel gets a
+    // `contact_supervisor` that needs no broker, no socket and no intercom opt-in. See
+    // [`crate::native_supervisor::native_child_client_should_register`] for why the second term
+    // stands in for upstream's `!hasTool(pi, "contact_supervisor")`.
+    let agent_dir = crate::native_supervisor::agent_dir_from(get, std::env::current_dir().ok());
+    let child_metadata = crate::native_supervisor::read_child_metadata_from(get)
+        .filter(|_| {
+            crate::native_supervisor::native_child_client_should_register_from(get, &agent_dir)
+        });
+    let supervisor_tool = child_metadata.clone().map(|metadata| {
+        Arc::new(crate::native_supervisor::NativeContactSupervisorTool::new(metadata))
+    });
+    // G106, upstream's SECOND child registration (`native-supervisor-channel.ts:305-321`), layered
+    // ON TOP of `contact_supervisor` exactly as `registerNativeSupervisorFallbackOnce` layers it
+    // (`subagent-prompt-runtime.ts:271-277`): the same channel under the bare name `intercom`,
+    // registered only when this agent's own declared `tools:` allowlist asked for a tool by that
+    // name (`:513`). A plain child gets `contact_supervisor` alone, as upstream.
+    let intercom_fallback = child_metadata
+        .filter(|_| {
+            crate::native_supervisor::native_child_intercom_fallback_should_register(get, &agent_dir)
+        })
+        .map(|metadata| Arc::new(crate::native_supervisor::NativeChildIntercomTool::new(metadata)));
+
+    // pi `:263`: `registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV]))`.
+    // A malformed payload is dropped rather than propagated: pi lets `decodeToolBudgetEnv` throw out
+    // of module init, which here would take down a child whose budget the parent already validated.
+    // The parent is the only writer of this var, so a malformed value means the environment was
+    // tampered with mid-flight — running unbudgeted beats an unexplained child crash.
+    let tool_budget = match crate::exec::tool_budget::decode_tool_budget_env(
+        get(crate::exec::tool_budget::TOOL_BUDGET_ENV).as_deref(),
+    ) {
+        Ok(budget) => budget,
+        Err(message) => {
+            tracing::warn!("{message} — running this child with no tool budget");
+            None
+        }
+    };
+
+    // G90 / pi `:194-195`: `const steerInbox = process.env[SUBAGENT_STEER_INBOX_ENV]?.trim(); if
+    // (!steerInbox) return;`. A blank value is the same as unset, which is what makes the trim
+    // load-bearing rather than cosmetic — an empty path would otherwise resolve to the process cwd
+    // and a poller would drain unrelated files from it.
+    let steer_inbox = non_empty(STEER_INBOX_ENV).map(PathBuf::from);
+
+    if tool.is_none()
+        && rewrite.is_none()
+        && supervisor_tool.is_none()
+        && intercom_fallback.is_none()
+        && tool_budget.is_none()
+        && steer_inbox.is_none()
+    {
         return None;
     }
-    Some(Arc::new(SubagentPromptRuntime::from_parts(
-        tool,
-        rewrite,
-        fanout_child == Some(true),
-    )) as Arc<dyn NativeExtension>)
+    Some(Arc::new(
+        SubagentPromptRuntime::from_parts(tool, rewrite, fanout_child == Some(true))
+            .with_supervisor_tool(supervisor_tool)
+            .with_intercom_fallback(intercom_fallback)
+            .with_tool_budget(tool_budget)
+            .with_steering_inbox(steer_inbox),
+    ) as Arc<dyn NativeExtension>)
+}
+
+#[cfg(test)]
+mod tool_budget_runtime_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+
+    use super::*;
+    use cyrup_core::ToolCallId;
+    use cyrup_ext::native::ExtMode;
+
+    fn budget(json: &str) -> crate::discovery::types::ResolvedToolBudget {
+        crate::exec::tool_budget::validate_tool_budget_config(
+            Some(&serde_json::from_str(json).expect("valid JSON")),
+            "toolBudget",
+        )
+        .expect("valid budget")
+        .expect("some")
+    }
+
+    fn ctx() -> HostCtx {
+        HostCtx::event(ExtMode::Json, false, PathBuf::from("/tmp"))
+    }
+
+    fn call(n: u32, name: &str) -> HostEvent {
+        HostEvent::ToolCall {
+            call_id: ToolCallId::from(format!("call-{n}")),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn result_of(n: u32, name: &str) -> HostEvent {
+        HostEvent::ToolResult {
+            call_id: ToolCallId::from(format!("call-{n}")),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+            content: vec![cyrup_core::Content::Text {
+                text: "ok".to_string(),
+                text_signature: None,
+            }],
+            details: None,
+            is_error: false,
+            usage: None,
+        }
+    }
+
+    /// The USER ACTION end to end, as a full interleaved SEQUENCE (not one block in isolation): an
+    /// agent declares `toolBudget: {"hard": 2, "soft": 1}`, the parent encodes it into the child's
+    /// env, the child builds its runtime FROM that env, and then the child runs five tool calls.
+    /// Call 1 earns the soft nudge on its result; calls 3+ are hard-blocked.
+    #[tokio::test]
+    async fn a_budget_shipped_in_the_env_nudges_once_then_blocks_every_later_browsing_call() {
+        let encoded = crate::exec::tool_budget::encode_tool_budget_env(Some(&budget(
+            "{\"hard\": 2, \"soft\": 1}",
+        )))
+        .expect("encodes");
+        let ext = prompt_runtime_extension_from(&|key| {
+            if key == crate::exec::tool_budget::TOOL_BUDGET_ENV {
+                Some(encoded.clone())
+            } else {
+                None
+            }
+        })
+        .expect("a budget alone is enough to build the child runtime");
+
+        let ctx = ctx();
+        let mut nudges = Vec::new();
+        let mut blocked = Vec::new();
+        for n in 1..=5u32 {
+            match ext.on_event(&call(n, "read"), &ctx).await {
+                HookOutcome::Block { reason } => blocked.push((n, reason.unwrap_or_default())),
+                HookOutcome::Noop => {}
+                other => panic!("unexpected tool_call outcome at {n}: {other:?}"),
+            }
+            if let HookOutcome::Mutate(EventPatch::ToolResult { content, .. }) =
+                ext.on_event(&result_of(n, "read"), &ctx).await
+                && let Some(content) = content
+                && let Some(cyrup_core::Content::Text { text, .. }) = content.last()
+            {
+                nudges.push((n, text.clone()));
+            }
+        }
+
+        assert_eq!(nudges.len(), 1, "the soft nudge fires exactly once: {nudges:?}");
+        assert_eq!(nudges[0].0, 1, "it rides the result of the call that crossed soft");
+        assert!(
+            nudges[0].1.starts_with("Tool budget soft limit reached after 1 tool call (soft 1, hard 2)."),
+            "nudge text: {}",
+            nudges[0].1
+        );
+        assert_eq!(
+            blocked.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "calls 1 and 2 are within the hard budget; every later one is refused"
+        );
+        assert!(
+            blocked[0]
+                .1
+                .starts_with("Tool budget hard limit reached after 3 tool calls (hard 2). The 'read' tool is blocked"),
+            "block reason: {}",
+            blocked[0].1
+        );
+    }
+
+    /// The default block list is pi's browsing tools only — an over-budget child can still `bash`
+    /// and `write` its way to a finished answer.
+    #[tokio::test]
+    async fn an_over_budget_child_can_still_use_a_non_blocked_tool() {
+        let ext = SubagentPromptRuntime::from_parts(None, None, false)
+            .with_tool_budget(Some(budget("{\"hard\": 1}")));
+        let ctx = ctx();
+        assert!(matches!(
+            ext.on_event(&call(1, "read"), &ctx).await,
+            HookOutcome::Noop
+        ));
+        assert!(matches!(
+            ext.on_event(&call(2, "bash"), &ctx).await,
+            HookOutcome::Noop
+        ));
+        assert!(matches!(
+            ext.on_event(&call(3, "read"), &ctx).await,
+            HookOutcome::Block { .. }
+        ));
+    }
+
+    /// No budget in the env => no `tool_call` subscription and no interference at all.
+    #[tokio::test]
+    async fn a_child_with_no_budget_never_blocks_a_tool() {
+        let ext = SubagentPromptRuntime::from_parts(None, None, false).with_tool_budget(None);
+        let ctx = ctx();
+        for n in 1..=10u32 {
+            assert!(matches!(
+                ext.on_event(&call(n, "read"), &ctx).await,
+                HookOutcome::Noop
+            ));
+        }
+        assert!(prompt_runtime_extension_from(&|_| None).is_none());
+    }
 }
 
 #[cfg(test)]

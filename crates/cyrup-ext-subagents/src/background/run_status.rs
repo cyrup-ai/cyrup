@@ -51,7 +51,7 @@ pub(crate) fn run_state_label(state: RunState) -> &'static str {
 }
 
 /// The lowercase mode string pi renders (`SubagentRunMode`): `single`/`parallel`/`chain`.
-fn run_mode_label(mode: RunMode) -> &'static str {
+pub(crate) fn run_mode_label(mode: RunMode) -> &'static str {
     match mode {
         RunMode::Single => "single",
         RunMode::Parallel => "parallel",
@@ -60,7 +60,7 @@ fn run_mode_label(mode: RunMode) -> &'static str {
 }
 
 /// The lowercase per-step status string pi renders (`AsyncJobStep.status`).
-fn step_state_label(state: StepState) -> &'static str {
+pub(crate) fn step_state_label(state: StepState) -> &'static str {
     match state {
         StepState::Pending => "pending",
         StepState::Running => "running",
@@ -79,7 +79,7 @@ fn step_state_label(state: StepState) -> &'static str {
 /// per-group `formatParallelOutcome` are approximated here by cyrup's own step list: for a parallel
 /// run, the count of terminal steps over the total; for a chain, the logical step cursor over
 /// `chain_step_count`; otherwise the step cursor over the flat step count.
-fn progress_label(status: &RunStatus) -> String {
+pub(crate) fn progress_label(status: &RunStatus) -> String {
     let step_count = status.steps.len().max(1);
     let chain_step_count = status.chain_step_count.unwrap_or(step_count);
     match status.mode {
@@ -122,6 +122,23 @@ fn step_line_label(status: &RunStatus, index: usize) -> String {
 // =================================================================================================
 // Resume guidance (`run-status.ts:36-50`)
 // =================================================================================================
+
+/// G90: pi `formatSteeringSummary` (`run-status.ts:76-81` @v0.34.0) — `"3 steers, last
+/// 2026-08-10T12:00:00.000Z"`, with either half omitted when unknown and `None` when neither is.
+fn format_steering_summary(steer_count: Option<u64>, last_steer_at: Option<i64>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(count) = steer_count {
+        parts.push(format!("{count} steer{}", if count == 1 { "" } else { "s" }));
+    }
+    if let Some(at) = last_steer_at {
+        parts.push(format!("last {}", format_iso8601_millis(at)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
 
 /// Whether `session_file` points at an on-disk file that currently exists (pi's
 /// `hasExistingSessionFile`, `run-status.ts:32-34`).
@@ -234,12 +251,24 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
             .as_ref()
             .map(|error| format!(", error: {error}"))
             .unwrap_or_default();
+        // G90: pi's `steeringSuffix` (`run-status.ts:369,375` @v0.34.0), between the activity text
+        // and the error text. This is what makes an `action: "steer"` VISIBLE: without it the tool
+        // would report "Steering queued" and the status report would look identical whether the
+        // runner accepted the request or dropped it.
+        let steering_text = format_steering_summary(
+            step.telemetry.steer_count,
+            step.telemetry.last_steer_at,
+        );
+        let steering_suffix = steering_text
+            .map(|text| format!(", steering: {text}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "{}: {} {}{}{}",
+            "{}: {} {}{}{}{}",
             step_line_label(status, index),
             step.agent,
             step_state_label(step.status),
             model_text,
+            steering_suffix,
             error_text
         ));
         let step_log = paths.step_output_log(index);
@@ -285,7 +314,7 @@ async fn inspect_paths(paths: &RunPaths) -> Result<Option<String>, SubagentError
 ///
 /// Returns [`SubagentError::UnsafePathToken`] if `selector` fails the R-SA-087 safe-token gate, or
 /// [`SubagentError::AmbiguousRunId`] if a prefix matches more than one run directory.
-async fn resolve_run_id(
+pub(crate) async fn resolve_run_id(
     async_root: &Path,
     results_dir: &Path,
     selector: &str,
@@ -354,6 +383,59 @@ pub async fn inspect_status_by_id(
     };
     let paths = RunPaths::for_run(async_root, results_dir, &run_id);
     inspect_paths(&paths).await
+}
+
+/// G92: the same id resolution + R-SA-079 reconciliation [`inspect_status_by_id`] performs, but
+/// handing back the reconciled [`RunStatus`] and its [`RunPaths`] instead of a rendered report — so
+/// `view: "transcript"` can render a DIFFERENT view over the identical, identically-gated snapshot
+/// rather than re-reading `status.json` behind the reconciliation.
+///
+/// # Errors
+///
+/// Propagates safe-token/ambiguity resolution errors and genuine reconciliation I/O failures.
+pub async fn reconcile_by_id(
+    async_root: &Path,
+    results_dir: &Path,
+    selector: &str,
+) -> Result<Option<(RunStatus, RunPaths)>, SubagentError> {
+    let Some(run_id) = resolve_run_id(async_root, results_dir, selector).await? else {
+        return Ok(None);
+    };
+    reconcile_paths(RunPaths::for_run(async_root, results_dir, &run_id)).await
+}
+
+/// G92: [`reconcile_by_id`]'s `dir`-addressed twin, mirroring [`inspect_status_by_dir`].
+///
+/// # Errors
+///
+/// Returns [`SubagentError::UnsafePathToken`] if `async_dir` has no usable basename, or propagates
+/// a genuine reconciliation I/O failure.
+pub async fn reconcile_by_dir(
+    async_dir: &Path,
+    results_dir: &Path,
+) -> Result<Option<(RunStatus, RunPaths)>, SubagentError> {
+    let run_id = async_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| RunId::from_token(name.to_string()))
+        .ok_or_else(|| {
+            SubagentError::UnsafePathToken(format!(
+                "async dir has no run-id basename: {}",
+                async_dir.display()
+            ))
+        })?;
+    let async_root = async_dir.parent().unwrap_or(async_dir);
+    reconcile_paths(RunPaths::for_run(async_root, results_dir, &run_id)).await
+}
+
+/// [`inspect_paths`]'s snapshot-returning twin: same reconciliation gate, same "neither file
+/// exists" → `Ok(None)` mapping, no rendering.
+async fn reconcile_paths(paths: RunPaths) -> Result<Option<(RunStatus, RunPaths)>, SubagentError> {
+    match reconcile_before_control_op(&paths).await {
+        Ok(status) => Ok(Some((status, paths))),
+        Err(SubagentError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// The `status` action's by-`dir` form (pi `resolveAsyncRunLocation`, `run-status.ts:142`): render
@@ -532,6 +614,38 @@ mod tests {
     use crate::background::atomic::write_atomic_json;
     use crate::background::control::{self, InterruptOutcome, ResumeOutcome};
     use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
+
+    /// G90: the runner's accepted-steer counters must SURFACE in the report a user reads
+    /// (pi `steeringSuffix`, `run-status.ts:369,375` @v0.34.0). Without this the tool would say
+    /// "Steering queued" and the status report would look identical whether the runner accepted
+    /// the request or dropped it on the floor.
+    #[test]
+    fn a_steps_accepted_steers_are_rendered_in_pis_steering_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = RunId::from_token("steersuffix1".to_string());
+        let paths = RunPaths::for_run(dir.path(), dir.path(), &id);
+        let mut status = RunStatus::queued(id, RunMode::Single, Some(1));
+        status.state = RunState::Running;
+        let mut step = StepStatus::pending("scout");
+        step.status = StepState::Running;
+        step.telemetry.steer_count = Some(2);
+        step.telemetry.last_steer_at = Some(1_700_000_000_000);
+        status.steps = vec![step];
+
+        let report = format_status(&status, &paths);
+        assert!(
+            report.contains("Step 1: scout running, steering: 2 steers, last 2023-11-14T22:13:20.000Z"),
+            "{report}"
+        );
+
+        // Singular, and no suffix at all when nothing was ever steered.
+        status.steps[0].telemetry.steer_count = Some(1);
+        status.steps[0].telemetry.last_steer_at = None;
+        assert!(format_status(&status, &paths).contains(", steering: 1 steer"), "singular form");
+        status.steps[0].telemetry.steer_count = None;
+        let quiet = format_status(&status, &paths);
+        assert!(!quiet.contains("steering:"), "an unsteered step gets no suffix: {quiet}");
+    }
 
     fn roots() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().expect("real tempdir");

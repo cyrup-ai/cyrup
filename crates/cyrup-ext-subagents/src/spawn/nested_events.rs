@@ -72,7 +72,15 @@ const MAX_DEPTH: i64 = 3;
 // Directory roots (pi shared/types.ts TEMP_ROOT_DIR / RESULTS_DIR / ASYNC_DIR + NESTED_EVENTS_DIR)
 // =================================================================================================
 
-fn temp_root_dir() -> PathBuf {
+/// The shared scratch root every subagent scratch directory hangs off — pi's `TEMP_ROOT_DIR`
+/// (`shared/types.ts`). `<temp_dir>/cyrup-subagents`, overridable with [`TEMP_ROOT_ENV`].
+///
+/// `pub` because [`crate::native_supervisor`] hangs `supervisor-channels/` off the SAME root
+/// upstream does (`native-supervisor-channel.ts:18` — `path.join(TEMP_ROOT_DIR,
+/// "supervisor-channels")`); a second, independently-derived root would put the child's request
+/// files somewhere the parent's poller never looks.
+#[must_use]
+pub fn temp_root_dir() -> PathBuf {
     std::env::var_os(TEMP_ROOT_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("cyrup-subagents"))

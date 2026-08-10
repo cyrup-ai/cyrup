@@ -1,6 +1,6 @@
 //! Integration test: closing gap R-SA-130 for the 5 registration-surface slash commands —
 //! `/subagents-models`, `/subagents-refresh-provider-models`, `/subagents-generate-profiles`,
-//! `/subagents-check-profile`, `/subagents-companions` — proving each now routes through REAL
+//! `/subagents-check-profile` — proving each now routes through REAL
 //! execution (the built-in model registry in `cyrup_provider::catalog`, and `registration::profiles`'
 //! real on-disk profile read/write primitives) rather than the "recognized, not yet executing"
 //! stub arm `extension.rs::dispatch_slash` used to fall into.
@@ -428,22 +428,24 @@ async fn subagents_check_profile_errors_for_a_nonexistent_profile() {
 }
 
 // =====================================================================================================
-// /subagents-companions
+// /subagents-companions — REMOVED upstream
 // =====================================================================================================
 
-/// pi `buildCompanionCommandStatus`/`buildCompanionDoctorLines` (`companion-suggestions.ts:229-242,
-/// 324-326`): `status` renders the real per-package doctor report — "Companion packages" followed
-/// by an `- <pkg>: active|inactive` line (plus install/benefit/status-source/reason) for BOTH
-/// `pi-intercom` and `pi-prompt-template-model` — never the old fixed "no companion extensions ...
-/// nothing to report" string this test used to assert on.
+/// `/subagents-companions` no longer exists. Upstream deleted `src/extension/companion-suggestions.ts`
+/// (359 lines) plus its `subagents-companions` `pi.registerCommand` block, its
+/// `companionSuggestions` `ExtensionConfig` key and its `CompanionSuggestion*` types wholesale in
+/// `3ac0ef5` ("Make supervisor coordination native", 2026-07-03) — three days BEFORE v0.34.0, the
+/// tag this crate ported from, and it is absent from every tag through v0.43.0. Nothing replaced the
+/// command: the same commit added `intercom/native-supervisor-channel.ts` and
+/// `slash/prompt-workflows.ts`, neither of which registers a companions surface.
+///
+/// The user action: typing `/subagents-companions` (with any argument shape the old parser accepted)
+/// must now be handled the way every other unknown command is — `SlashCommandName::from_str_exact`
+/// returns `None`, so `execute_command` returns an `ExtError`, exactly as it does for a name this
+/// extension never registered. Before the removal all four of these returned real, rendered output.
 #[tokio::test]
-async fn subagents_companions_status_reports_the_per_package_doctor_report() {
+async fn subagents_companions_is_no_longer_a_registered_command() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
-    // `status` now reads `<agent dir>/intercom/config.json` and checks for a `pi-intercom`
-    // extension directory under the agent dir (pi `readPiIntercomConfigStatus`/
-    // `diagnoseIntercomBridge`) — sandbox `CYRUP_HOME` so this never touches the real developer/CI
-    // machine's `~/.cyrup`.
-    let (_home_guard, _home) = CyrupHomeGuard::install();
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
         SubagentExtensionConfig::default(),
@@ -451,97 +453,60 @@ async fn subagents_companions_status_reports_the_per_package_doctor_report() {
     );
     let ctx = command_ctx(work_dir.path());
 
-    let output = ext
-        .execute_command("subagents-companions", "", &ctx)
-        .await
-        .expect("execute_command does not error")
-        .expect("status produces textual output");
-    assert!(!output.contains("recognized by the subagents extension"), "got: {output}");
-    assert!(!output.contains("nothing to report"), "got: {output}");
-    assert!(output.starts_with("Companion packages"), "got: {output}");
-    assert!(output.contains("- pi-intercom: inactive"), "got: {output}");
-    assert!(output.contains("- pi-prompt-template-model: inactive"), "got: {output}");
-}
+    for args in ["", "status", "hide pi-intercom workspace", "show pi-intercom"] {
+        let err = ext
+            .execute_command("subagents-companions", args, &ctx)
+            .await
+            .expect_err("the removed command must not resolve to a handler");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("no handler for command `subagents-companions`"),
+            "`/subagents-companions {args}` must be an unknown command, not a rendered report: {rendered}"
+        );
+    }
 
-/// pi `updateCompanionDismissal`/`isDismissed` (`companion-suggestions.ts:130-133, 290-322`): `hide`
-/// must persist into the extension config's `companionSuggestions.packages[<pkg>].dismissed`
-/// structure `status`'s own dismissed-detection reads back — proving the mutation has genuine,
-/// observable effect on the SAME store, not an unkeyed side-marker file nothing else consults. Then
-/// `show` clears it again, and pi's exact fixed reply text is used for both directions.
-#[tokio::test]
-async fn subagents_companions_hide_then_show_round_trips_through_the_shared_config_store() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let (_home_guard, home) = CyrupHomeGuard::install();
-
-    let work_dir = tempfile::tempdir().expect("real tempdir");
-    let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
-        work_dir.path().to_path_buf(),
-    );
-    let ctx = command_ctx(work_dir.path());
-
-    let hide_output = ext
-        .execute_command("subagents-companions", "hide pi-intercom workspace", &ctx)
-        .await
-        .expect("execute_command does not error")
-        .expect("hide produces textual output");
-    assert_eq!(hide_output, "Hid pi-intercom recommendations for this workspace.");
-
-    // The dismissal lands in the SAME `config.json` `status`'s gating reads back (pi's
-    // `updateConfig`/`isDismissed` share one file) — not an unkeyed marker file nothing reads.
-    let config_path = home.join(".cyrup").join("subagents").join("config.json");
-    let on_disk = tokio::fs::read_to_string(&config_path)
-        .await
-        .expect("hide must write the shared config.json");
-    assert!(on_disk.contains("companionSuggestions"), "got: {on_disk}");
-    assert!(on_disk.contains("workspaces"), "got: {on_disk}");
-
-    let status_after_hide = ext
-        .execute_command("subagents-companions", "status", &ctx)
-        .await
-        .expect("execute_command does not error")
-        .expect("status produces textual output");
+    // And it is gone from the registered descriptor table the command palette is built from, so it
+    // cannot be offered for completion either.
     assert!(
-        status_after_hide.contains("- pi-intercom: inactive recommendation hidden by config"),
-        "a same-process status call must observe the hide immediately: {status_after_hide}"
-    );
-
-    let show_output = ext
-        .execute_command("subagents-companions", "show pi-intercom", &ctx)
-        .await
-        .expect("execute_command does not error")
-        .expect("show produces textual output");
-    assert_eq!(show_output, "Showing pi-intercom recommendations for this workspace again.");
-
-    let status_after_show = ext
-        .execute_command("subagents-companions", "status", &ctx)
-        .await
-        .expect("execute_command does not error")
-        .expect("status produces textual output");
-    assert!(
-        status_after_show.contains("- pi-intercom: inactive")
-            && !status_after_show.contains("hidden by config"),
-        "show must clear the dismissal the earlier hide recorded: {status_after_show}"
+        !cyrup_ext_subagents::registration::slash_commands::SLASH_COMMANDS
+            .iter()
+            .any(|d| d.name.as_str() == "subagents-companions"),
+        "the descriptor table must not advertise a command with no dispatch arm"
     );
 }
 
-#[tokio::test]
-async fn subagents_companions_rejects_an_unrecognized_package_name() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let work_dir = tempfile::tempdir().expect("real tempdir");
-    let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
-        work_dir.path().to_path_buf(),
-    );
-    let ctx = command_ctx(work_dir.path());
+/// The other half of the removal: the `companionSuggestions` CONFIG KEY is gone from
+/// `SubagentExtensionConfig` too. A removal that deletes the command but keeps parsing and
+/// re-emitting the key is half-done — a user's `config.json` would keep round-tripping a setting
+/// nothing reads, and the next `hide`-equivalent write would resurrect it.
+///
+/// Upstream deleted the field from `ExtensionConfig` and the three `CompanionSuggestion*` types from
+/// `src/shared/types.ts` in the SAME commit (`3ac0ef5`, `types.ts:948-965,975`).
+///
+/// The user action: a `~/.cyrup/subagents/config.json` that still carries the legacy block must load
+/// without error (an old config must not brick a session) and must NOT be re-serialized with it.
+#[test]
+fn the_companion_suggestions_config_key_is_neither_parsed_nor_re_emitted() {
+    let legacy = r#"{
+      "asyncByDefault": true,
+      "companionSuggestions": {
+        "enabled": true,
+        "packages": { "pi-intercom": { "dismissed": { "user": true } } }
+      }
+    }"#;
+    let parsed: SubagentExtensionConfig =
+        serde_json::from_str(legacy).expect("a legacy config must still load, not hard-fail");
+    // The rest of the config is untouched by the removal.
+    assert!(parsed.async_by_default);
 
-    let output = ext
-        .execute_command("subagents-companions", "hide not-a-real-package workspace", &ctx)
-        .await
-        .expect("execute_command does not error")
-        .expect("a rendered error message");
+    let re_emitted = serde_json::to_string(&parsed).expect("serializes");
     assert!(
-        output.contains("subagent command failed"),
-        "an unrecognized companion package must be rejected, not silently accepted: {output}"
+        !re_emitted.contains("companionSuggestions"),
+        "the removed key must not survive a load/save round trip: {re_emitted}"
+    );
+    let fresh = serde_json::to_string(&SubagentExtensionConfig::default()).expect("serializes");
+    assert!(
+        !fresh.contains("companionSuggestions"),
+        "a default config must not advertise the removed key: {fresh}"
     );
 }

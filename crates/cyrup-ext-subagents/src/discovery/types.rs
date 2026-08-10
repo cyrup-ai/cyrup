@@ -596,6 +596,90 @@ pub enum AgentModelSourceInfo {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Per-agent persistent memory (`memory:` frontmatter) — pi `agents/agent-memory.ts`
+// ---------------------------------------------------------------------------------------------
+
+/// Which root a `memory:` scope resolves under — a direct port of pi's
+/// `AgentMemoryConfig["scope"]` (`agent-memory.ts:54`), which admits exactly `"project"` and
+/// `"user"` and treats every other value as "no memory config at all".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryScope {
+    /// `<projectConfigDir>/agent-memory/<path>` — resolved against the nearest project root
+    /// (`agent-memory.ts:201-204`). An agent with a project scope and NO discoverable project root
+    /// gets no memory block at all.
+    Project,
+    /// `<agentDir>/agent-memory/<path>` (`agent-memory.ts:199`).
+    User,
+}
+
+/// One agent's `memory:` frontmatter block, parsed (pi `AgentMemoryConfig`). BOTH fields are
+/// required — `parseMemoryFrontmatter` returns `undefined` unless `scope` is one of the two legal
+/// values AND a non-empty `path` is present (`agent-memory.ts:53-58`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentMemoryConfig {
+    pub scope: MemoryScope,
+    /// A RELATIVE path under the scope root. Containment is enforced at resolve time
+    /// (`crate::discovery::agent_memory::resolve_memory_dir`), not here — the parser stores the
+    /// raw declared value so serialization round-trips exactly what the author wrote.
+    pub path: String,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-agent tool budgets (`toolBudget:` frontmatter) — pi `runs/shared/tool-budget.ts`
+// ---------------------------------------------------------------------------------------------
+
+/// Which tools a hard-exhausted budget blocks — pi `ToolBudgetConfig["block"]`
+/// (`shared/types.ts`), normalized by `normalizeToolBudgetBlock` (`tool-budget.ts:8-12`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ToolBudgetBlock {
+    /// The literal `"*"` — block EVERY tool once the hard limit is crossed.
+    All(AllToolsMarker),
+    /// An explicit tool-name list. An omitted `block` normalizes to pi's
+    /// `DEFAULT_TOOL_BUDGET_BLOCK` (`["read", "grep", "find", "ls"]`, `tool-budget.ts:3`).
+    Names(Vec<String>),
+}
+
+/// The `"*"` literal, as a type so [`ToolBudgetBlock`] can serialize back to the exact JSON shape
+/// pi's schema advertises (`{"anyOf": [{"type":"array",…}, {"type":"string","enum":["*"]}]}`,
+/// `schemas.ts:82-87`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllToolsMarker;
+
+impl serde::Serialize for AllToolsMarker {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str("*")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AllToolsMarker {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        if raw == "*" {
+            Ok(AllToolsMarker)
+        } else {
+            Err(serde::de::Error::custom("expected \"*\""))
+        }
+    }
+}
+
+/// A VALIDATED, normalized tool budget — pi `ResolvedToolBudget`. Produced only by
+/// [`crate::exec::tool_budget::validate_tool_budget_config`], never constructed straight from
+/// user input, so every instance satisfies `hard >= 1`, `soft >= 1`, `soft <= hard` and a
+/// non-empty `block`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedToolBudget {
+    /// Tool calls allowed before [`ToolBudgetBlock`] tools start being refused. Integer >= 1.
+    pub hard: u32,
+    /// Optional advisory threshold: at this count the child is nudged once to wrap up. Integer
+    /// >= 1 and <= `hard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft: Option<u32>,
+    pub block: ToolBudgetBlock,
+}
+
+// ---------------------------------------------------------------------------------------------
 // AgentDefinition (R-SA-005..022)
 // ---------------------------------------------------------------------------------------------
 
@@ -665,6 +749,27 @@ pub struct AgentDefinition {
     /// `merge.rs`/`exec/`, not defaulted eagerly here so `present_fields` can still distinguish
     /// "agent declared `defaultContext`" from "agent said nothing").
     pub default_context: Option<ContextMode>,
+    /// pi `AgentConfig.defaultAsync` (`agents.ts:131`), from `async:` frontmatter. An agent-level
+    /// LAUNCH DEFAULT: it applies ONLY when a single-agent call site omits `async` entirely
+    /// (`applySingleAgentLaunchDefaults`, `subagent-executor.ts:1929-1946`). It never overrides an
+    /// explicit call-site value, and never applies to a chain/parallel launch.
+    pub default_async: Option<bool>,
+    /// pi `AgentConfig.defaultTimeoutMs` (`agents.ts:132`), from `timeoutMs:` frontmatter. Same
+    /// launch-default precedence as [`Self::default_async`], with the extra rule that an explicit
+    /// call-site `maxRuntimeMs` (the alias of `timeoutMs`) ALSO suppresses it
+    /// (`subagent-executor.ts:1937`).
+    pub default_timeout_ms: Option<u64>,
+    /// The agent's `memory:` scope (pi `AgentConfig.memory`, `agents.ts` + `agent-memory.ts`).
+    /// `None` means the agent declared none, or declared one that failed validation (pi's
+    /// `parseMemoryFrontmatter` returns `undefined` for both). When set, spawn time resolves it to
+    /// a directory and folds a persistent-memory block into the child's system prompt — see
+    /// [`crate::discovery::agent_memory::build_agent_memory_injection`].
+    pub memory: Option<AgentMemoryConfig>,
+    /// The agent's `toolBudget:` (pi `AgentConfig.toolBudget`, `agents.ts` + `tool-budget.ts`),
+    /// already validated and normalized. `None` means the agent declared none. When set, spawn
+    /// time encodes it into the child's `CYRUP_SUBAGENT_TOOL_BUDGET` env var and the child-side
+    /// runtime enforces it (soft nudge + hard block).
+    pub tool_budget: Option<ResolvedToolBudget>,
     pub disabled: Option<bool>,
     /// The agent's own frontmatter-body prose, prior to any orchestrator-injected scaffolding
     /// (acceptance contract, skill pointers, project context) — combined per `system_prompt_mode`
@@ -948,6 +1053,10 @@ mod tests {
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            memory: None,
+            tool_budget: None,
             disabled: None,
             system_prompt_body: String::new(),
             source: AgentSource::User,
