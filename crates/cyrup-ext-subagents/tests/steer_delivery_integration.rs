@@ -31,7 +31,7 @@
 //! 2. the RUNNER hop — `control::consume_steer_requests` + `control::enqueue_step_steer`, the exact
 //!    pair upstream's `onSteer` handler calls (`subagent-runner.ts:3026-3063`);
 //! 3. the SPAWN hop — `exec::build_attempt_spawn_plan` writing `CYRUP_SUBAGENT_STEER_INBOX` (pi
-//!    `pi-args.ts:251-252`), covered by `exec`'s own unit tests;
+//!    `runs/shared/pi-args.ts:251-252`), covered by `exec`'s own unit tests;
 //! 4. the CHILD hop — `prompt_runtime::prompt_runtime_extension_from` building the runtime from
 //!    that env var, and its real event lifecycle injecting pi's exact `formatSteerMessage` text.
 

@@ -1,17 +1,17 @@
 //! Skills association for subagent runs (T5, C4) — a port of pi-subagents'
-//! `agents/skills.ts:608-682` (`resolveSkills`/`resolveSkillsWithFallback`/`buildSkillInjection`/
+//! `agents/skills.ts:629-714` (`resolveSkills`/`resolveSkillsWithFallback`/`buildSkillInjection`/
 //! `discoverAvailableSkills`) and the whole of `agents/proactive-skills.ts`.
 //!
 //! # What this module owns
 //!
 //! - **Skill resolution** ([`resolve_skills`]/[`resolve_skills_with_fallback`]): map a list of
 //!   skill NAMES to on-disk skills against an execution cwd (with an optional runtime-cwd fallback,
-//!   pi `resolveSkillsWithFallback`, `skills.ts:640-654`), returning the resolved pointers and the
+//!   pi `resolveSkillsWithFallback`, `skills.ts:670-686`), returning the resolved pointers and the
 //!   names that could not be found.
 //! - **Lazy `<available_skills>` injection** ([`build_skill_injection`]): render the resolved skills
 //!   as a POINTER block (name + description + `SKILL.md` location + a "read the file" invocation
 //!   hint) for the child's system prompt — NEVER the full `SKILL.md` body (pi `buildSkillInjection`,
-//!   `skills.ts:656-675`; the "lazy references instead of inlining full skill bodies" contract of
+//!   `skills.ts:688-707`; the "lazy references instead of inlining full skill bodies" contract of
 //!   `skills-fallback.test.ts`).
 //! - **Orchestration-skill exclusion** ([`SUBAGENT_ORCHESTRATION_SKILL`]): the `pi-subagents`
 //!   operational skill is the PARENT orchestration skill and is NEVER child-injectable — it always
@@ -36,8 +36,8 @@
 //! text so a `Replace`-mode persona cannot suppress it), honoring the
 //! agent's own `skills` list and leaving `inherit_skills` (the `--no-skills` child flag) orthogonal:
 //! an `inherit_skills: false` agent still receives its EXPLICITLY-listed skills as pointers, exactly
-//! like pi (`execution.ts:935-952` builds the injection from `options.skills ?? agent.skills`
-//! regardless of the inherit flag, which only governs `pi-args.ts:139` `--no-skills`).
+//! like pi (`execution.ts:1412-1436` builds the injection from `options.skills ?? agent.skills`
+//! regardless of the inherit flag, which only governs `runs/shared/pi-args.ts:139` `--no-skills`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -185,7 +185,7 @@ async fn resolve_skills_in(
 }
 
 /// Resolve against `primary_cwd`, then re-resolve only the still-missing names against
-/// `fallback_cwd` (pi `resolveSkillsWithFallback`, `skills.ts:640-654`). The fallback is skipped
+/// `fallback_cwd` (pi `resolveSkillsWithFallback`, `skills.ts:670-686`). The fallback is skipped
 /// when there is no fallback cwd, when nothing was missing, or when the two cwds are the same
 /// directory (pi's `path.resolve(a) === path.resolve(b)` guard) — the resulting `missing` is exactly
 /// the fallback pass's `missing` (a name still absent from BOTH cwds).
@@ -235,7 +235,7 @@ fn same_directory(a: &Path, b: &Path) -> bool {
 }
 
 /// Every child-injectable skill discoverable from `cwd`, sorted by name and EXCLUDING the
-/// orchestration skill (pi `discoverAvailableSkills`, `skills.ts:710-724`).
+/// orchestration skill (pi `discoverAvailableSkills`, `skills.ts:742-756`).
 pub async fn discover_available_skills(cwd: &Path) -> Vec<AvailableSkill> {
     discover_available_skills_in(cwd, &SkillDiscoveryDirs::from_env()).await
 }
@@ -259,7 +259,7 @@ async fn discover_available_skills_in(cwd: &Path, dirs: &SkillDiscoveryDirs) -> 
 // ================================================================================================
 
 /// Render the resolved skills as the lazy `<available_skills>` POINTER block for a child's system
-/// prompt (pi `buildSkillInjection`, `skills.ts:656-675`). Each entry carries only the skill's
+/// prompt (pi `buildSkillInjection`, `skills.ts:688-707`). Each entry carries only the skill's
 /// name, description, and `SKILL.md` `<location>` plus a "use the read tool to load it" hint — the
 /// full body is deliberately EXCLUDED so it never bloats the system prompt. Returns an empty string
 /// for an empty input (no block emitted).
@@ -295,7 +295,7 @@ pub fn build_skill_injection(skills: &[ResolvedSkill]) -> String {
 }
 
 /// Escape the three XML-significant characters in skill metadata (pi `escapeXmlText`,
-/// `skills.ts:677-682`). `&` MUST be replaced first so an already-escaped entity is not
+/// `skills.ts:709-714`). `&` MUST be replaced first so an already-escaped entity is not
 /// double-escaped.
 fn escape_xml_text(value: &str) -> String {
     value
@@ -334,6 +334,40 @@ pub enum ProactiveSkillSubagentsSetting {
     /// pi's `config === false`.
     Disabled,
     Config(ProactiveSkillSubagentsConfig),
+}
+
+impl ProactiveSkillSubagentsSetting {
+    /// Bridge the EXTENSION-CONFIG shape ([`crate::registration::ProactiveSkillSubagents`], which
+    /// is what `config.json` deserializes into and what pi reads as
+    /// `ctx.config?.proactiveSkillSubagents`, `agent-management.ts:768`) onto this module's own
+    /// recommender input. Two shapes exist because pi's `ExtensionConfig` field is
+    /// `ProactiveSkillSubagentsConfig | false` while this module models the three-state
+    /// `undefined | false | object` as `Option<ProactiveSkillSubagentsSetting>`.
+    ///
+    /// `Toggle(false)` is pi's literal `false` → [`Self::Disabled`]. `Toggle(true)` has no pi
+    /// analogue (pi's type does not admit `true`); cyrup's config parser accepts it, and it means
+    /// "on with defaults", so it maps to an empty config block — which
+    /// [`resolve_proactive_skill_subagents_config`] resolves exactly as it resolves pi's
+    /// `undefined`. The numeric knobs widen from the config type's `u32` to this module's `i64`,
+    /// which is the signedness pi's `positiveInteger` guard (`proactive-skills.ts:32-36`,
+    /// ported as `positive_integer`) is written against.
+    #[must_use]
+    pub fn from_extension_config(setting: &crate::registration::ProactiveSkillSubagents) -> Self {
+        match setting {
+            crate::registration::ProactiveSkillSubagents::Toggle(false) => Self::Disabled,
+            crate::registration::ProactiveSkillSubagents::Toggle(true) => {
+                Self::Config(ProactiveSkillSubagentsConfig::default())
+            }
+            crate::registration::ProactiveSkillSubagents::Config(cfg) => {
+                Self::Config(ProactiveSkillSubagentsConfig {
+                    enabled: cfg.enabled,
+                    min_references: cfg.min_references.map(i64::from),
+                    max_recommendations: cfg.max_recommendations.map(i64::from),
+                    preferred_agent: cfg.preferred_agent.clone(),
+                })
+            }
+        }
+    }
 }
 
 /// The resolved, defaults-applied config (pi `ResolvedProactiveSkillSubagentsConfig`).
@@ -565,30 +599,22 @@ pub fn format_proactive_skill_subagent_recommendations(
 /// invoked; a closure error (discovery failure) degrades to an empty availability list, which yields
 /// no suggestions.
 ///
-/// # UNWIRED — this function has no production caller
+/// # Where it is wired
 ///
 /// Upstream calls it from exactly one place: `handleList` (`agent-management.ts:765-770` @v0.43.0),
 /// which splices its lines between the `Chains:` block and the chain diagnostics
-/// (`agent-management.ts:784`, inside the `handleList` that spans `:753-788`). cyrup's [`crate::discovery::management`] `handle_list` still carries
-/// the "the proactive-skill block is deferred" note from when this module did not exist, so the
-/// whole recommender — this function, [`recommend_proactive_skill_subagents`],
-/// [`format_proactive_skill_subagent_recommendations`], [`proactive_agent_input`],
-/// [`proactive_chain_input`] and [`discover_available_skills`] — is reachable only from tests and
-/// from outside the crate. `{ action: "list" }` therefore never shows a suggestion, and the bundled
-/// `pi-subagents` SKILL.md tells the model to look for one.
+/// (`agent-management.ts:784`, inside the `handleList` that spans `:753-788`). cyrup's
+/// [`crate::discovery::management::handle_list`] now does the same, reading its two inputs off
+/// [`crate::discovery::management::ProactiveSkillsInput`] on the `ManagementRequest`.
 ///
-/// Wiring it needs two things this module cannot reach on its own, both of which cross into
-/// `extension.rs`:
-///
-/// 1. `handle_list` is synchronous and [`discover_available_skills`] is `async`, so either the
-///    management dispatcher becomes `async` or the caller pre-resolves the availability list and
-///    passes it down;
-/// 2. `ManagementRequest` carries no `proactiveSkillSubagents` setting, and omitting it would make
-///    an explicit `proactiveSkillSubagents: false` silently stop disabling anything (pi reads
-///    `ctx.config?.proactiveSkillSubagents` at `agent-management.ts:768`).
-///
-/// Both are pub-signature changes that per-package builds cannot see; do them under
-/// `cargo test --workspace`.
+/// The `discover_available_skills` closure keeps upstream's LAZINESS — it is not invoked at all
+/// when the feature is disabled — but cyrup's [`discover_available_skills`] is `async` where pi's
+/// is sync, and `handle_list` is a synchronous dispatcher. The seam is therefore split: the async
+/// caller (`extension.rs::route_management_action`) resolves the availability list only after
+/// [`resolve_proactive_skill_subagents_config`] says the feature is on, and `handle_list` hands
+/// this function a closure that simply yields that pre-resolved list. Same two observable
+/// properties as upstream — a disabled feature performs no skill scan, and a scan that produced
+/// nothing yields no suggestions.
 pub fn build_proactive_skill_subagent_recommendation_lines<F, E>(
     agents: &[ProactiveAgentInput],
     chains: &[ProactiveChainInput],

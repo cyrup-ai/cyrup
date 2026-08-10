@@ -12,7 +12,7 @@
 //! `SIGKILL` [`TIMEOUT_SIGTERM_GRACE`] later, matching upstream `abortVerification`
 //! (`pi-subagents/src/runs/shared/acceptance.ts:742-758` @v0.34.0) and the kill-on-expiry
 //! semantics of `runWorktreeSetupHook`'s `spawnSync(…, { timeout })`
-//! (`pi-subagents/src/runs/shared/worktree.ts:290-296`). Both entry points share the one
+//! (`pi-subagents/src/runs/shared/worktree.ts:323-329`). Both entry points share the one
 //! group-aware [`send_signal`] target-selection rule below; there is deliberately no second
 //! signalling path in this crate.
 //!
@@ -197,7 +197,7 @@ pub const TIMEOUT_SIGTERM_GRACE: Duration = Duration::from_millis(1000);
 /// `SIGINT -> SIGTERM -> SIGKILL` escalation, but a *timeout* is already the caller's declared
 /// patience running out, so upstream's `abortVerification` skips straight to `SIGTERM` + a 1s hard
 /// `SIGKILL` (`acceptance.ts:742-758`), and `runWorktreeSetupHook`'s `spawnSync(…, { timeout })`
-/// (`worktree.ts:290-296`) likewise kills on expiry rather than escalating gently.
+/// (`worktree.ts:323-329`) likewise kills on expiry rather than escalating gently.
 ///
 /// Callers MUST still own the `Child` when they call this — the bug this function exists to make
 /// unrepresentable is racing `tokio::time::timeout(…, child.wait_with_output())`, whose

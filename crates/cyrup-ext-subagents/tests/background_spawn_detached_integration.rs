@@ -910,7 +910,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
 /// crate's own bookkeeping: with a published parent-session anchor (what
 /// `cyrup-permission-system`'s PARENT-role `SessionStart` installs — pi's
 /// `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`,
-/// `pi-subagents/src/extension/index.ts:599` @v0.34.0), the REAL detached `__subagent-runner` process
+/// `pi-subagents/src/extension/index.ts:716` @v0.43.0), the REAL detached `__subagent-runner` process
 /// spawned by the production entry point [`spawn_detached_runner`] has
 /// `CYRUP_SUBAGENT_PARENT_SESSION` in its own environment — read straight out of
 /// `/proc/<pid>/environ`, i.e. the kernel's copy, not ours.

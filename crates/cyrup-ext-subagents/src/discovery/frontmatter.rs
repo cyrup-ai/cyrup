@@ -909,7 +909,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
     // never errors: an illegal scope or a missing path simply declines the config.
     let memory = crate::discovery::agent_memory::parse_memory_frontmatter(parsed.get("memory"));
     // `disabled` is NOT an honored agent-FILE frontmatter field. pi's `loadAgentsFromDir`
-    // (`agents.ts:1056-1195`) never reads `frontmatter.disabled` into `AgentConfig.disabled`, and
+    // (`agents.ts:1482-1644`) never reads `frontmatter.disabled` into `AgentConfig.disabled`, and
     // `disabled` is absent from `KNOWN_FIELDS` (`agent-serializer.ts:4-26`) — so a `disabled:` line in
     // an agent file is just an unknown extra field (round-tripped verbatim into `extra_fields`), NOT a
     // flag. An agent is disabled ONLY by a settings override (`subagents.disableBuiltins` /

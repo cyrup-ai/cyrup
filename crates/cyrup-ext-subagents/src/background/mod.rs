@@ -59,7 +59,7 @@ pub mod spawn_detached;
 
 /// The process-wide parent-session anchor register (R-SA-P1, PERM-001) — cyrup's `unsafe`-free
 /// stand-in for pi's `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
-/// (`pi-subagents/src/extension/index.ts:599` @v0.34.0, cleared at `:619`), and the source of the one env
+/// (`pi-subagents/src/extension/index.ts:716` @v0.43.0, cleared at `:619`), and the source of the one env
 /// entry [`spawn_detached`] overlays onto the hop-1 `__subagent-runner` process so a BACKGROUND
 /// subagent's forwarded permission ask can still address its root's inbox. See [`parent_anchor`]
 /// for the full why.
@@ -451,7 +451,7 @@ impl StepState {
 // model, plus the pure per-event fold [`apply_child_event_to_step`] the detached runner
 // (`background/runner_main.rs`) drives from the child's real stdout events.
 
-/// pi's `ActivityState` (`shared/types.ts:97`): a run/step that is idle-but-long-running or has
+/// pi's `ActivityState` (`shared/types.ts:156`): a run/step that is idle-but-long-running or has
 /// tripped a needs-attention control heuristic. Absent (`None` on the carrying field) is pi's
 /// "neither" default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1372,7 +1372,7 @@ async fn probe_dir_accessible(dir: &Path) -> bool {
 // plain data — no filesystem, no discovery — so it reproduces `workflow-graph.test.ts` scenario for
 // scenario.
 
-/// A workflow node's lifecycle state (pi `WorkflowNodeStatus`, `shared/types.ts:33`).
+/// A workflow node's lifecycle state (pi `WorkflowNodeStatus`, `shared/types.ts:40`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowNodeStatus {
@@ -1412,7 +1412,7 @@ pub enum WorkflowNodeKind {
 }
 
 /// The run-shape tag on a [`WorkflowGraphSnapshot`] (pi `WorkflowGraphSnapshot.mode`,
-/// `shared/types.ts:61`).
+/// `shared/types.ts:78`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowRunMode {
@@ -1443,7 +1443,7 @@ pub struct WorkflowDynamicMeta {
     pub collect_as: Option<String>,
 }
 
-/// One node of a [`WorkflowGraphSnapshot`] (pi `WorkflowGraphNode`, `shared/types.ts:35-57`).
+/// One node of a [`WorkflowGraphSnapshot`] (pi `WorkflowGraphNode`, `shared/types.ts:42-74`).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowGraphNode {
@@ -1500,7 +1500,7 @@ pub struct WorkflowPhase {
     pub node_ids: Vec<String>,
 }
 
-/// The full workflow-graph snapshot (pi `WorkflowGraphSnapshot`, `shared/types.ts:59-65`).
+/// The full workflow-graph snapshot (pi `WorkflowGraphSnapshot`, `shared/types.ts:76-82`).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowGraphSnapshot {
@@ -1768,7 +1768,7 @@ fn seq_label(step: &WorkflowTaskSpec, step_index: usize) -> String {
 }
 
 /// Sanitize a dynamic item key into a node-id-safe token (pi's
-/// `task.itemKey.replace(/[^a-zA-Z0-9_-]/g, "-")`, `workflow-graph.ts:132`).
+/// `task.itemKey.replace(/[^a-zA-Z0-9_-]/g, "-")`, `workflow-graph.ts:157`).
 fn sanitize_item_key(item_key: &str) -> String {
     item_key
         .chars()
@@ -2316,7 +2316,7 @@ fn now_epoch_millis() -> i64 {
 // =================================================================================================
 //
 // pi appends one line per finished run to `<agentDir>/run-history.jsonl` via `recordRun`
-// (`run-history.ts:21-37`), a best-effort telemetry log a later `/subagents`-style surface reads
+// (`run-history.ts:132-153`), a best-effort telemetry log a later `/subagents`-style surface reads
 // back. This is the Rust port of that write path, driven by the background runner's terminal
 // completion (`background/runner_main.rs::finish_run` records one entry per top-level result).
 
@@ -2350,7 +2350,7 @@ pub fn run_history_path() -> PathBuf {
 }
 
 /// Append one [`RunHistoryEntry`] per `result` to `run-history.jsonl` (pi's `recordRun`,
-/// `run-history.ts:21-37`) — best-effort: a missing directory is created, and every I/O or
+/// `run-history.ts:132-153`) — best-effort: a missing directory is created, and every I/O or
 /// serialization failure is silently swallowed so history recording can never fail a run (pi wraps
 /// the whole thing in a `try {} catch {}` for exactly this reason). `run_started_at` is the run's
 /// epoch-millis start, used to derive each entry's `duration`.

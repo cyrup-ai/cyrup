@@ -319,7 +319,7 @@ pub struct AcceptanceContract {
     pub reviewer_result: Option<ReviewerResult>,
     /// Whether this contract may turn the gate OFF outright, or is merely a FLOOR that the
     /// heuristically-inferred level can still raise (pi `explicitAcceptanceCanDisable`,
-    /// `runs/shared/acceptance.ts:134-136` @v0.34.0: `explicit.level === "none" && typeof
+    /// `runs/shared/acceptance.ts:167-174` @v0.43.0: `explicit.level === "none" && typeof
     /// explicit.reason === "string" && explicit.reason.trim().length > 0`).
     ///
     /// Upstream, only a `level: "none"` that ALSO carries a non-blank `reason` — or the `false`
@@ -338,12 +338,12 @@ pub struct AcceptanceContract {
     /// [`AcceptanceContract::explicit`].
     pub disables_gate: bool,
     /// The resolved acceptance criteria this run is gated on (pi `ResolvedAcceptanceConfig.criteria`,
-    /// `types.ts:302-312` @v0.34.0), already through [`model::normalize_criteria`] so every entry
+    /// `shared/types.ts:302-312` @v0.34.0), already through [`model::normalize_criteria`] so every entry
     /// carries an `id`, a non-blank `must` and a [`model::GateSeverity`].
     ///
     /// [`inject_acceptance_contract`] renders them as pi's `- <id>: <must>` list so the child KNOWS
     /// what it must report, and [`evaluate_acceptance`]'s `Checked` rung enforces them via
-    /// [`model::check_criteria_satisfied`] — pi `evaluateAcceptance`, `acceptance.ts:819-829`. Empty
+    /// [`model::check_criteria_satisfied`] — pi `evaluateAcceptance`, `acceptance.ts:1297-1321`. Empty
     /// means "nothing declared", which is enforcement-neutral: pi's own `formatAcceptancePrompt`
     /// falls back to `- Return the requested result.` and `checkCriteriaSatisfied` over an empty
     /// list yields no checks.
@@ -353,16 +353,16 @@ pub struct AcceptanceContract {
     /// `Required evidence: <kinds>` line and enforced by [`model::run_structural_checks`] —
     /// including the REAL `git status --short` subprocess pi runs for
     /// [`model::AcceptanceEvidenceKind::NoStagedFiles`] (`checkNoStagedFiles`,
-    /// `acceptance.ts:646-655`).
+    /// `acceptance.ts:939-948`).
     pub evidence: Vec<model::AcceptanceEvidenceKind>,
     /// The declared review gate (pi `ResolvedAcceptanceConfig.review`). Rendered into the prompt as
     /// pi's `Review gate: required|optional[ by <agent>]` / `Review focus:` lines, and consulted at
     /// [`evaluate_acceptance`]'s `Reviewed` rung: a gate declaring `required: false` is pi's
-    /// `optionalReview` (`acceptance.ts:833-841`), which does NOT reject a run that reached
+    /// `optionalReview` (`acceptance.ts:1321-1335`), which does NOT reject a run that reached
     /// `Reviewed` with no [`ReviewerResult`] in hand.
     pub review: Option<model::ReviewSetting>,
     /// The declared stop rules (pi `ResolvedAcceptanceConfig.stopRules`). Prompt-only, exactly as
-    /// upstream: `formatAcceptancePrompt` emits them (`acceptance.ts:328-330`) and no upstream
+    /// upstream: `formatAcceptancePrompt` emits them (`acceptance.ts:432-434`) and no upstream
     /// runtime check ever reads them back.
     pub stop_rules: Vec<String>,
 }
@@ -425,7 +425,7 @@ impl AcceptanceContract {
 
     /// Build an explicit, caller-supplied contract that acts only as a **floor**: the
     /// heuristically-inferred level may still raise it, and it can never disable the gate
-    /// (pi `explicitAcceptanceCanDisable` returning `false`, `acceptance.ts:134-136` @v0.34.0).
+    /// (pi `explicitAcceptanceCanDisable` returning `false`, `acceptance.ts:167-174` @v0.43.0).
     ///
     /// This is the shape every wire-lowered policy takes EXCEPT the two upstream treats as a
     /// genuine "off" switch (`acceptance: false`, and `{ level: "none", reason: "…" }` with a
@@ -474,7 +474,7 @@ impl AcceptanceContract {
     ///
     /// **`inferLevel` has no `"none"` branch**, which is the property that matters here: upstream
     /// appends a `## Acceptance Contract` block to essentially every child task
-    /// (`formatAcceptancePrompt` returns `""` only for `level === "none"`, `acceptance.ts:305`, and
+    /// (`formatAcceptancePrompt` returns `""` only for `level === "none"`, `acceptance.ts:408`, and
     /// `execution.ts:1037-1038` appends it unconditionally) and always produces a real ledger.
     /// Before this change this function ran the enum-lattice
     /// [`crate::exec::completion_guard::expects_implementation_mutation`] classifier instead and
@@ -535,7 +535,7 @@ impl AcceptanceContract {
 
     /// Combine an explicit, caller-supplied contract (if any) with the heuristically-inferred one
     /// — R-SA-023's resolution rule, and a direct port of pi `resolveEffectiveAcceptance`'s level
-    /// arithmetic (`runs/shared/acceptance.ts:265-302` @v0.34.0):
+    /// arithmetic (`runs/shared/acceptance.ts:344-401` @v0.43.0):
     ///
     /// ```text
     /// level = explicitAcceptanceCanDisable(explicit) ? "none"
@@ -628,7 +628,7 @@ impl AcceptanceContract {
             }
             AcceptanceStatus::Checked => model::AcceptanceLevel::Checked,
             AcceptanceStatus::Verified => model::AcceptanceLevel::Verified,
-            // v0.43.0 deleted the `reviewed` LEVEL (`types.ts:639`), so a lattice contract that
+            // v0.43.0 deleted the `reviewed` LEVEL (`shared/types.ts:639`), so a lattice contract that
             // requires an independent reviewer has no level of its own to project onto. Upstream
             // expresses exactly that shape as `level: "checked"` plus `review.required` — which
             // this contract already carries separately in `review` — so `Reviewed` projects to
@@ -658,7 +658,7 @@ impl AcceptanceContract {
 fn clamp_requestable_level(level: AcceptanceStatus) -> AcceptanceStatus {
     match level {
         // The highest level a POLICY can request at v0.43.0 is `verified` — `reviewed` is an
-        // achieved status only (`types.ts:639`, `acceptance.ts:54`), reachable from a real
+        // achieved status only (`shared/types.ts:639`, `acceptance.ts:54`), reachable from a real
         // [`ReviewerResult`] via [`AcceptanceContract::with_reviewer_result`] and never by asking.
         AcceptanceStatus::Rejected => AcceptanceStatus::Verified,
         other => other,
@@ -682,7 +682,7 @@ pub struct ReviewerResult {
 // Lowering a raw wire `acceptance` value onto an `AcceptanceContract` (SUBA-041 / SUBA-N04)
 // ============================================================================================
 
-/// Lower a raw wire `acceptance` value (pi `AcceptanceOverride`, `schemas.ts:69-76`) onto this
+/// Lower a raw wire `acceptance` value (pi `AcceptanceOverride`, `schemas.ts:80-93`) onto this
 /// crate's [`AcceptanceContract`], after running pi's own `validateAcceptanceInput`
 /// (`pi-subagents/src/runs/shared/acceptance.ts:164-286` @v0.34.0, applied at
 /// `subagent-executor.ts:1418`) so a malformed policy is refused BEFORE any child spawns, with pi's
@@ -712,7 +712,7 @@ pub struct ReviewerResult {
 /// exactly that drift, so both paths call this one function.
 ///
 /// `criteria`/`evidence`/`review`/`stopRules` are lowered onto the contract too (SUBA-C13), through
-/// the [`model`] port's own `normalizeCriteria` (`acceptance.ts:251-263`), so
+/// the [`model`] port's own `normalizeCriteria` (`acceptance.ts:330-342`), so
 /// [`inject_acceptance_contract`] can TELL the child about them and [`evaluate_acceptance`]'s
 /// `Checked` rung can ENFORCE them. Before SUBA-C13 all four were validated here and then dropped on
 /// the floor: `{ level: "checked", criteria: [{ id: "c1", must: "add a regression test" }],
@@ -732,7 +732,7 @@ pub struct ReviewerResult {
 /// # Errors
 ///
 /// Returns every `validateAcceptanceInput` message, space-joined, exactly as pi renders them
-/// (`subagent-executor.ts:1535-1541`).
+/// (`subagent-executor.ts:1758-1762`).
 pub fn lower_acceptance_input(
     raw: &serde_json::Value,
 ) -> Result<Option<AcceptanceContract>, String> {
@@ -756,7 +756,7 @@ pub fn lower_acceptance_input(
     }
 
     match raw {
-        // pi `acceptance: false` is the `level: "none"` shorthand (`acceptance.ts:127-132`) — and
+        // pi `acceptance: false` is the `level: "none"` shorthand (`acceptance.ts:149-154`) — and
         // the ONE string-ish form that genuinely disables the gate, because
         // `normalizeAcceptanceInput` supplies the reason `"disabled by deprecated false shorthand"`
         // itself, satisfying `explicitAcceptanceCanDisable` (`:134-136`).
@@ -765,7 +765,7 @@ pub fn lower_acceptance_input(
             Vec::new(),
         ))),
         // A bare level string carries no `reason`, so `explicitAcceptanceCanDisable` is false for
-        // it (`acceptance.ts:127-136`): `"none"` here is a FLOOR of `none`, which
+        // it (`acceptance.ts:149-174`): `"none"` here is a FLOOR of `none`, which
         // [`AcceptanceContract::resolve_effective`]'s max then discards in favour of the inferred
         // level — it does not switch the gate off.
         serde_json::Value::String(level) => Ok(level_to_status(level)
@@ -783,7 +783,7 @@ pub fn lower_acceptance_input(
                 })
                 .unwrap_or_default();
             let level = config.get("level").and_then(serde_json::Value::as_str);
-            // `explicitAcceptanceCanDisable` (`acceptance.ts:134-136`): only an object whose
+            // `explicitAcceptanceCanDisable` (`acceptance.ts:167-174`): only an object whose
             // `reason` is a non-blank string may turn the gate off. In practice
             // `validate_acceptance_input` already rejects `{ level: "none" }` with no reason
             // ("acceptance.reason is required when level is none."), so this is belt-and-braces —
@@ -801,7 +801,7 @@ pub fn lower_acceptance_input(
                     policy.apply(AcceptanceContract::explicit_floor(status, verify)),
                 )),
                 // `{ verify: [...] }` with no `level` is pi's `level: "auto"` default
-                // (`acceptance.ts:127-132` normalizes an absent level to `auto`), so the level is
+                // (`acceptance.ts:149-154` normalizes an absent level to `auto`), so the level is
                 // still inferred — but declared `verify[]` commands must not be dropped, so an
                 // object carrying any is lowered as an explicit `verified` contract.
                 None if !verify.is_empty() => Ok(Some(policy.apply(AcceptanceContract::explicit(
@@ -812,7 +812,7 @@ pub fn lower_acceptance_input(
                 // ALSO pi's `auto`: the level is inferred, but `resolveEffectiveAcceptance` still
                 // resolves the declared criteria/evidence/review/stopRules and
                 // `formatAcceptancePrompt`/`evaluateAcceptance` still consume them
-                // (`acceptance.ts:265-302`). Lowering it as a `none` FLOOR reproduces that — the
+                // (`acceptance.ts:344-401`). Lowering it as a `none` FLOOR reproduces that — the
                 // floor is discarded by [`AcceptanceContract::resolve_effective`]'s max in favour of
                 // the inferred level, and the policy rides along. Returning `None` here (as this arm
                 // did before SUBA-C13) threw the whole policy away.
@@ -831,7 +831,7 @@ pub fn lower_acceptance_input(
 }
 
 /// Lower one authored `acceptance.verify[i]` object onto a [`VerifyCommand`], carrying **every**
-/// key upstream's `ACCEPTANCE_VERIFY_KEYS` admits (`acceptance.ts:44` @v0.34.0) —
+/// key upstream's `ACCEPTANCE_VERIFY_KEYS` admits (`acceptance.ts:52` @v0.43.0) —
 /// `id`/`command`/`timeoutMs`/`cwd`/`env`/`allowFailure`. Before SUBA-C12b only `command`
 /// survived, so a user who authored `{ id: "lint", command: "npm run lint", allowFailure: true }`
 /// passed validation and then had `allowFailure` silently dropped, rejecting the run.
@@ -874,7 +874,7 @@ fn lower_verify_command(item: &serde_json::Value, index: usize) -> Option<Verify
 }
 
 /// The `criteria`/`evidence`/`review`/`stopRules` half of an authored `acceptance` object, resolved
-/// exactly as pi's `resolveEffectiveAcceptance` resolves them (`acceptance.ts:282-296` @v0.34.0):
+/// exactly as pi's `resolveEffectiveAcceptance` resolves them (`acceptance.ts:384-395` @v0.43.0):
 /// evidence de-duplicated in declaration order, criteria normalized AGAINST that evidence so a
 /// criterion declaring none inherits the config-level list.
 struct LoweredAcceptancePolicy {
@@ -909,7 +909,7 @@ impl LoweredAcceptancePolicy {
 fn lower_acceptance_policy(
     config: &serde_json::Map<String, serde_json::Value>,
 ) -> LoweredAcceptancePolicy {
-    // `evidence: AcceptanceEvidenceKind[]` (types.ts:285), de-duplicated by
+    // `evidence: AcceptanceEvidenceKind[]` (shared/types.ts:285), de-duplicated by
     // `[...new Set(...)]` (acceptance.ts:283-285).
     let evidence = model::unique_evidence(
         &config
@@ -925,7 +925,7 @@ fn lower_acceptance_policy(
             .unwrap_or_default(),
     );
 
-    // `criteria: Array<string | AcceptanceGate>` (types.ts:284).
+    // `criteria: Array<string | AcceptanceGate>` (shared/types.ts:284).
     let criteria_input: Vec<model::CriterionInput> = config
         .get("criteria")
         .and_then(serde_json::Value::as_array)
@@ -935,7 +935,7 @@ fn lower_acceptance_policy(
     // SECOND argument, i.e. a gate that declares no `evidence` of its own inherits the config's.
     let criteria = model::normalize_criteria(&criteria_input, &evidence);
 
-    // `review: AcceptanceReviewGate | false` (types.ts:288).
+    // `review: AcceptanceReviewGate | false` (shared/types.ts:288).
     let review = match config.get("review") {
         Some(serde_json::Value::Bool(flag)) => Some(model::ReviewSetting::Disabled(*flag)),
         Some(serde_json::Value::Object(gate)) => {
@@ -954,7 +954,7 @@ fn lower_acceptance_policy(
         _ => None,
     };
 
-    // `stopRules: string[]` (types.ts:289).
+    // `stopRules: string[]` (shared/types.ts:289).
     let stop_rules = config
         .get("stopRules")
         .and_then(serde_json::Value::as_array)
@@ -976,7 +976,7 @@ fn lower_acceptance_policy(
 }
 
 /// Lower one authored `acceptance.criteria[i]` — a bare `must` string, or a full `AcceptanceGate`
-/// object (types.ts:261-266). Anything else yields `None` (unreachable past validation).
+/// object (shared/types.ts:261-266). Anything else yields `None` (unreachable past validation).
 fn lower_criterion(item: &serde_json::Value) -> Option<model::CriterionInput> {
     match item {
         serde_json::Value::String(must) => Some(model::CriterionInput::Text(must.clone())),
@@ -1027,7 +1027,7 @@ const ACCEPTANCE_CONTRACT_HEADING: &str = "## Acceptance Contract";
 /// and returns `task` unchanged — there is nothing to instruct the child to report if the
 /// orchestrator itself will never gate on it.
 ///
-/// The injected block IS pi's `formatAcceptancePrompt` output (`acceptance.ts:304-348` @v0.34.0),
+/// The injected block IS pi's `formatAcceptancePrompt` output (`acceptance.ts:403-457` @v0.43.0),
 /// produced by [`model::format_acceptance_prompt`] over a [`model::ResolvedAcceptanceConfig`]
 /// projected from `contract` by [`AcceptanceContract::to_resolved_config`]: the acceptance level,
 /// the `- <id>: <must>` criteria list, the `Required evidence: <kinds>` line, the parent's
@@ -1308,7 +1308,7 @@ impl CleanCompletionGate {
 ///    regardless of anything the child's own report claims. A command that declared
 ///    `allowFailure: true` and merely exited nonzero is [`model::VerifyRunStatus::AllowedFailure`]
 ///    and does NOT cap the level — upstream `evaluateAcceptance` rejects only on
-///    `status === "failed" || status === "timed-out"` (`acceptance.ts:842` @v0.34.0).
+///    `status === "failed" || status === "timed-out"` (`acceptance.ts:1336` @v0.43.0).
 /// 5. If `contract.required_level >= Reviewed`, `contract.reviewer_result` MUST be
 ///    `Some(ReviewerResult { approved: true, .. })` to reach [`AcceptanceStatus::Reviewed`]; a
 ///    `None` reviewer result or an `approved: false` one caps the achieved level below `Reviewed`.
@@ -1378,7 +1378,7 @@ pub async fn evaluate_acceptance(
             );
             checked = false;
         }
-        // pi's own `rank >= checked` rung (`evaluateAcceptance`, `acceptance.ts:819-829`): every
+        // pi's own `rank >= checked` rung (`evaluateAcceptance`, `acceptance.ts:1297-1321`): every
         // declared criterion must appear in the child's report as `satisfied`, every declared
         // evidence kind must be present in it, and `no-staged-files` additionally shells out to a
         // REAL `git status --short`. ANY failed runtime check rejects. Runs alongside — not instead
@@ -1403,7 +1403,7 @@ pub async fn evaluate_acceptance(
             verify_results =
                 run_verify_commands_memoized(&contract.verify, verify_cwd, memo).await;
             // `verifyRuns.some((run) => run.status === "failed" || run.status === "timed-out")`
-            // (`acceptance.ts:842` @v0.34.0) — NOT `!every(passed)`, which would also reject a
+            // (`acceptance.ts:1336` @v0.43.0) — NOT `!every(passed)`, which would also reject a
             // command the author explicitly marked `allowFailure: true`.
             let failed: Vec<&str> = verify_results
                 .iter()
@@ -1448,7 +1448,7 @@ pub async fn evaluate_acceptance(
                         .unwrap_or_default()
                 ));
             }
-            // pi `evaluateAcceptance`'s `optionalReview` branch (`acceptance.ts:833-841`): a
+            // pi `evaluateAcceptance`'s `optionalReview` branch (`acceptance.ts:1321-1335`): a
             // declared `review: { required: false }` gate makes a missing reviewer result a
             // NON-BLOCKING finding rather than a rejection, so the run keeps whatever level it
             // otherwise reached. Any other shape (a required gate, `review: false`, or no `review`
@@ -1504,7 +1504,7 @@ pub async fn evaluate_acceptance(
 }
 
 /// Step 3's declared-policy half: pi's `checkCriteriaSatisfied` + `runStructuralChecks`
-/// (`acceptance.ts:622-669` @v0.34.0, applied on `evaluateAcceptance`'s `rank >= checked` rung at
+/// (`acceptance.ts:911-966` @v0.43.0, applied on `evaluateAcceptance`'s `rank >= checked` rung at
 /// `:819-829`), run against the child's own `acceptance-report` block.
 ///
 /// Returns one message per FAILED [`model::AcceptanceRuntimeCheck`], verbatim, so the ledger detail
@@ -1974,7 +1974,7 @@ mod tests {
 
     #[test]
     /// The clamp target is `Verified`, not `Reviewed`: v0.43.0 removed `reviewed` from
-    /// `AcceptanceLevel` (`types.ts:639`), so the highest level a POLICY can request is `verified`
+    /// `AcceptanceLevel` (`shared/types.ts:639`), so the highest level a POLICY can request is `verified`
     /// and `Reviewed` is reachable only from a real [`ReviewerResult`].
     fn explicit_contract_clamps_a_nonsensical_rejected_requested_level() {
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Rejected, vec![]);
@@ -1983,7 +1983,7 @@ mod tests {
 
     // ---------------------------------------------------------------------------------------
     // resolve_effective: pi `resolveEffectiveAcceptance`'s combination rule
-    // (`runs/shared/acceptance.ts:265-302` @v0.34.0)
+    // (`runs/shared/acceptance.ts:344-401` @v0.43.0)
     // ---------------------------------------------------------------------------------------
 
     /// The MAX at `acceptance.ts:277-281` — an explicit level may only ever RAISE the inferred
@@ -2129,7 +2129,7 @@ mod tests {
 
     /// A contract that genuinely disables the gate (pi's `{ level: "none", reason: … }` /
     /// `false` shorthand, the only shapes `explicitAcceptanceCanDisable` accepts,
-    /// `acceptance.ts:134-136`) still appends nothing. The INFERRED contract no longer reaches
+    /// `acceptance.ts:167-174`) still appends nothing. The INFERRED contract no longer reaches
     /// this state — `inferLevel` has no `none` branch — so the fixture is now an explicit one.
     #[test]
     fn a_gate_disabling_contract_leaves_task_text_unchanged() {
@@ -2142,7 +2142,7 @@ mod tests {
     /// The converse, and the actual regression this pairs with: a research/read-only child DOES
     /// get pi's `## Acceptance Contract` block, naming the criterion it will be judged on and the
     /// evidence its `acceptance-report` must carry (`formatAcceptancePrompt`,
-    /// `acceptance.ts:304-348`, appended at `execution.ts:1037-1038`).
+    /// `acceptance.ts:403-457`, appended at `execution.ts:1037-1038`).
     #[test]
     fn a_research_child_still_receives_the_acceptance_contract_block() {
         let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
@@ -2177,7 +2177,7 @@ mod tests {
     /// asserted through its LIVE consumer [`inject_acceptance_contract`] (the other one is
     /// `spawn::chain_graph`'s dynamic-group gate).
     ///
-    /// v0.43.0 deleted the `reviewed` LEVEL (`types.ts:639`), so a lattice contract carrying a
+    /// v0.43.0 deleted the `reviewed` LEVEL (`shared/types.ts:639`), so a lattice contract carrying a
     /// [`ReviewerResult`] — the only way `required_level` reaches
     /// [`AcceptanceStatus::Reviewed`] — has no level of its own to project onto. Mapping it to
     /// `Verified` instead would tell the child it is being gated on runtime verification and, worse,
@@ -2503,7 +2503,7 @@ mod tests {
 
     // ---------------------------------------------------------------------------------------
     // SUBA-C12b regression: the per-command `verify[]` fields upstream's ACCEPTANCE_VERIFY_KEYS
-    // admits (`acceptance.ts:44` @v0.34.0 — id/command/timeoutMs/cwd/env/allowFailure) must
+    // admits (`acceptance.ts:52` @v0.43.0 — id/command/timeoutMs/cwd/env/allowFailure) must
     // actually REACH execution and the gate. `validate_verify_input` has always accepted and
     // type-checked all six, but the contract carried only the command string, so five of them
     // were validated and then silently discarded: a `cwd` ran in the wrong directory, an `env`
@@ -2552,7 +2552,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_declared_cwd_resolves_against_the_run_level_cwd() {
-        // `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd` (`acceptance.ts:716`).
+        // `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd` (`acceptance.ts:1137`).
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("sub")).expect("subdir");
         std::fs::write(dir.path().join("sub/marker.txt"), "hi").expect("seed file");
@@ -2617,8 +2617,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn allow_failure_maps_a_nonzero_exit_to_allowed_failure_and_does_not_reject() {
         // `status: … passed ? "passed" : command.allowFailure ? "allowed-failure" : "failed"`
-        // (`acceptance.ts:766`) and `evaluateAcceptance`'s reject test, which never names
-        // `allowed-failure` (`acceptance.ts:842`).
+        // (`acceptance.ts:1207`) and `evaluateAcceptance`'s reject test, which never names
+        // `allowed-failure` (`acceptance.ts:1336`).
         let dir = tempfile::tempdir().expect("tempdir");
         let declared = VerifyCommand {
             allow_failure: Some(true),
@@ -2634,7 +2634,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn allow_failure_never_rescues_a_timed_out_command() {
-        // Upstream tests `timedOut` FIRST in the status ternary (`acceptance.ts:766`), so a
+        // Upstream tests `timedOut` FIRST in the status ternary (`acceptance.ts:1207`), so a
         // command that hangs is `"timed-out"` — which `evaluateAcceptance` DOES reject — even when
         // it declared `allowFailure: true`.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3062,7 +3062,7 @@ mod tests {
 
     #[test]
     fn bare_none_and_verified_level_strings_are_rejected() {
-        // `AcceptanceInput = Exclude<AcceptanceLevel, "none" | "verified"> | …` (`types.ts:684-685`).
+        // `AcceptanceInput = Exclude<AcceptanceLevel, "none" | "verified"> | …` (`shared/types.ts:684-685`).
         let none = lower_acceptance_input(&serde_json::json!("none"))
             .expect_err("a bare `none` carries no reason and is rejected");
         assert!(none.contains("requires a reason"), "{none}");
@@ -3501,10 +3501,10 @@ pub mod model {
     use crate::exec::completion_guard::{any_word_boundary, word_boundary_contains};
 
     // --------------------------------------------------------------------------------------------
-    // Enums (types.ts:248-373)
+    // Enums (shared/types.ts:248-373)
     // --------------------------------------------------------------------------------------------
 
-    /// `AcceptanceLevel` (`types.ts:639` @v0.43.0:
+    /// `AcceptanceLevel` (`shared/types.ts:639` @v0.43.0:
     /// `"auto" | "none" | "attested" | "checked" | "verified"`) — `auto` is the "infer" sentinel;
     /// every other variant is a concrete provenance level. Ordering rank is
     /// `none < attested < checked < verified` ([`level_rank`]); `Auto` has no rank.
@@ -3551,7 +3551,7 @@ pub mod model {
         }
     }
 
-    /// `AcceptanceEvidenceKind` (types.ts:250-259).
+    /// `AcceptanceEvidenceKind` (shared/types.ts:250-259).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
     pub enum AcceptanceEvidenceKind {
@@ -3583,7 +3583,7 @@ pub mod model {
         }
 
         /// Parse one authored `evidence[]` entry. `None` for anything not in
-        /// `AcceptanceEvidenceKind` (types.ts:250-259) — [`validate_acceptance_input`] has already
+        /// `AcceptanceEvidenceKind` (shared/types.ts:250-259) — [`validate_acceptance_input`] has already
         /// rejected such an entry with `evidence[i] is not a supported evidence kind.` by the time
         /// [`super::lower_acceptance_input`] calls this, so the `None` arm is a total-function
         /// guard rather than a reachable policy path.
@@ -3604,7 +3604,7 @@ pub mod model {
         }
     }
 
-    /// `"required" | "recommended"` (types.ts:265).
+    /// `"required" | "recommended"` (shared/types.ts:265).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
     pub enum GateSeverity {
@@ -3613,7 +3613,7 @@ pub mod model {
     }
 
     // --------------------------------------------------------------------------------------------
-    // Config-input shapes (types.ts:261-293)
+    // Config-input shapes (shared/types.ts:261-293)
     // --------------------------------------------------------------------------------------------
 
     /// One acceptance criterion as authored: either a bare `must` string or a full [`AcceptanceGate`]
@@ -3624,7 +3624,7 @@ pub mod model {
         Gate(AcceptanceGate),
     }
 
-    /// `AcceptanceGate` (types.ts:261-266).
+    /// `AcceptanceGate` (shared/types.ts:261-266).
     #[derive(Debug, Clone, PartialEq)]
     pub struct AcceptanceGate {
         pub id: Option<String>,
@@ -3633,7 +3633,7 @@ pub mod model {
         pub severity: Option<GateSeverity>,
     }
 
-    /// `AcceptanceVerifyCommand` (types.ts:268-275).
+    /// `AcceptanceVerifyCommand` (shared/types.ts:268-275).
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct AcceptanceVerifyCommand {
@@ -3703,7 +3703,7 @@ pub mod model {
         }
     }
 
-    /// `AcceptanceReviewGate` (types.ts:277-281).
+    /// `AcceptanceReviewGate` (shared/types.ts:277-281).
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct AcceptanceReviewGate {
@@ -3715,7 +3715,7 @@ pub mod model {
         pub required: Option<bool>,
     }
 
-    /// `AcceptanceReviewGate | false` (types.ts:288) — `Disabled` is the `false` shorthand.
+    /// `AcceptanceReviewGate | false` (shared/types.ts:288) — `Disabled` is the `false` shorthand.
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(untagged)]
     pub enum ReviewSetting {
@@ -3723,7 +3723,7 @@ pub mod model {
         Gate(AcceptanceReviewGate),
     }
 
-    /// `AcceptanceConfig` (types.ts:283-291).
+    /// `AcceptanceConfig` (shared/types.ts:283-291).
     #[derive(Debug, Clone, Default, PartialEq)]
     pub struct AcceptanceConfig {
         pub level: Option<AcceptanceLevel>,
@@ -3735,7 +3735,7 @@ pub mod model {
         pub reason: Option<String>,
     }
 
-    /// `AcceptanceInput = AcceptanceLevel | false | AcceptanceConfig` (types.ts:293).
+    /// `AcceptanceInput = AcceptanceLevel | false | AcceptanceConfig` (shared/types.ts:293).
     #[derive(Debug, Clone, PartialEq)]
     pub enum AcceptanceInput {
         Level(AcceptanceLevel),
@@ -3744,10 +3744,10 @@ pub mod model {
     }
 
     // --------------------------------------------------------------------------------------------
-    // Resolved shapes (types.ts:295-312)
+    // Resolved shapes (shared/types.ts:295-312)
     // --------------------------------------------------------------------------------------------
 
-    /// `ResolvedAcceptanceGate` (types.ts:295-300).
+    /// `ResolvedAcceptanceGate` (shared/types.ts:295-300).
     #[derive(Debug, Clone, PartialEq)]
     pub struct ResolvedAcceptanceGate {
         pub id: String,
@@ -3756,7 +3756,7 @@ pub mod model {
         pub severity: GateSeverity,
     }
 
-    /// `ResolvedAcceptanceConfig` (types.ts:302-312).
+    /// `ResolvedAcceptanceConfig` (shared/types.ts:302-312).
     #[derive(Debug, Clone, PartialEq)]
     pub struct ResolvedAcceptanceConfig {
         pub level: AcceptanceLevel,
@@ -3771,7 +3771,7 @@ pub mod model {
     }
 
     // --------------------------------------------------------------------------------------------
-    // Report / runtime-check / ledger shapes (types.ts:314-385)
+    // Report / runtime-check / ledger shapes (shared/types.ts:314-385)
     // --------------------------------------------------------------------------------------------
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3805,7 +3805,7 @@ pub mod model {
         pub summary: String,
     }
 
-    /// `AcceptanceReport` (types.ts:314-334).
+    /// `AcceptanceReport` (shared/types.ts:314-334).
     #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct AcceptanceReport {
@@ -3841,7 +3841,7 @@ pub mod model {
         NotApplicable,
     }
 
-    /// `AcceptanceRuntimeCheck` (types.ts:338-342).
+    /// `AcceptanceRuntimeCheck` (shared/types.ts:338-342).
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     pub struct AcceptanceRuntimeCheck {
         pub id: String,
@@ -3879,35 +3879,35 @@ pub mod model {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub stderr: Option<String>,
         pub duration_ms: u128,
-        /// `artifactPath` (`types.ts:745`) — where this run's memo artifact was read from/written
+        /// `artifactPath` (`shared/types.ts:745`) — where this run's memo artifact was read from/written
         /// to. Cleared (`delete evidenced.artifactPath`, `acceptance.ts:1129`) when the write
         /// itself failed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub artifact_path: Option<String>,
-        /// `cacheKey` (`types.ts:746`) — the sha256 over the memo identity (command text, repo-
+        /// `cacheKey` (`shared/types.ts:746`) — the sha256 over the memo identity (command text, repo-
         /// relative cwd, declared env key names, full effective-env hash, timeout, `allowFailure`,
         /// `HEAD`, working-tree diff hash).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cache_key: Option<String>,
-        /// `memoized` (`types.ts:747`) — `Some(true)` when this result was REPLAYED from the memo
+        /// `memoized` (`shared/types.ts:747`) — `Some(true)` when this result was REPLAYED from the memo
         /// artifact instead of executed, `Some(false)` when it was executed under an active memo
         /// context, `None` when no memo context applied at all.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub memoized: Option<bool>,
-        /// `envKeys` (`types.ts:748`) — the sorted key names of the command's OWN declared `env`
+        /// `envKeys` (`shared/types.ts:748`) — the sorted key names of the command's OWN declared `env`
         /// (`Object.keys(command.env ?? {}).sort()`, `acceptance.ts:1088`). Names only; no values,
         /// so a secret-bearing override never reaches the ledger.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub env_keys: Option<Vec<String>>,
-        /// `envHash` (`types.ts:749`) — sha256 over the whole EFFECTIVE environment
+        /// `envHash` (`shared/types.ts:749`) — sha256 over the whole EFFECTIVE environment
         /// (`acceptance.ts:1089`), so a changed secret invalidates the memo without the value ever
         /// being written down.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub env_hash: Option<String>,
-        /// `workspaceState` (`types.ts:750-756`).
+        /// `workspaceState` (`shared/types.ts:750-756`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub workspace_state: Option<VerifyWorkspaceState>,
-        /// `artifactError` (`types.ts:757`) — set when the memo artifact could not be written
+        /// `artifactError` (`shared/types.ts:757`) — set when the memo artifact could not be written
         /// (`acceptance.ts:1128`). Never fails the verification itself.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub artifact_error: Option<String>,
@@ -3935,7 +3935,7 @@ pub mod model {
         pub diff_hash: String,
     }
 
-    /// `AcceptanceReviewResult["status"]` (`types.ts:761` @v0.43.0:
+    /// `AcceptanceReviewResult["status"]` (`shared/types.ts:761` @v0.43.0:
     /// `"review-required" | "reviewed" | "blockers"`).
     ///
     /// v0.34.0 spelled this `"no-blockers" | "blockers" | "needs-parent-decision"`. v0.43.0 renamed
@@ -3967,14 +3967,14 @@ pub mod model {
         pub rationale: String,
     }
 
-    /// `AcceptanceReviewResult` (types.ts:355-363).
+    /// `AcceptanceReviewResult` (shared/types.ts:355-363).
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     pub struct AcceptanceReviewResult {
         pub status: ReviewResultStatus,
         pub findings: Vec<ReviewFinding>,
     }
 
-    /// `AcceptanceEvidenceStatus` (`types.ts:770-777` @v0.43.0) — the strictly EVIDENCE-derived
+    /// `AcceptanceEvidenceStatus` (`shared/types.ts:770-777` @v0.43.0) — the strictly EVIDENCE-derived
     /// half of the ledger's status: how far the child's own report plus the orchestrator's own
     /// structural/verify checks carried this run, with review deliberately excluded.
     ///
@@ -3994,7 +3994,7 @@ pub mod model {
         Rejected,
     }
 
-    /// `AcceptanceLedgerStatus` (`types.ts:779-783` @v0.43.0) —
+    /// `AcceptanceLedgerStatus` (`shared/types.ts:779-783` @v0.43.0) —
     /// `AcceptanceEvidenceStatus | "review-required" | "reviewed" | "accepted"`. Rust has no union
     /// type, so the evidence members are restated here and [`AcceptanceEvidenceStatus`] converts
     /// into this enum via [`From`].
@@ -4027,13 +4027,13 @@ pub mod model {
         }
     }
 
-    /// `AcceptanceLedger` (`types.ts:785-800` @v0.43.0, subset actually populated by
+    /// `AcceptanceLedger` (`shared/types.ts:785-800` @v0.43.0, subset actually populated by
     /// `evaluateAcceptance`).
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct AcceptanceLedger {
         pub status: AcceptanceLedgerStatus,
-        /// `evidenceStatus` (`types.ts:787`) — moves in lockstep with `status` through the
+        /// `evidenceStatus` (`shared/types.ts:787`) — moves in lockstep with `status` through the
         /// attestation/checked/verified rungs and is then FROZEN: `evaluateAcceptance`'s review
         /// block (`acceptance.ts:1318-1336`) rewrites only `status`, never this field.
         pub evidence_status: AcceptanceEvidenceStatus,
@@ -4098,7 +4098,7 @@ pub mod model {
         }
     }
 
-    /// `SubagentRunMode` (types.ts:146) — carried for parity with pi's `inferLevel` input even
+    /// `SubagentRunMode` (shared/types.ts:231) — carried for parity with pi's `inferLevel` input even
     /// though the current heuristic does not branch on it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SubagentRunMode {
@@ -4305,7 +4305,7 @@ pub mod model {
     // normalizeAcceptanceInput / resolveEffectiveAcceptance (acceptance.ts:127-302)
     // --------------------------------------------------------------------------------------------
 
-    /// `normalizeAcceptanceInput` (acceptance.ts:127-132).
+    /// `normalizeAcceptanceInput` (acceptance.ts:149-154).
     #[must_use]
     pub fn normalize_acceptance_input(input: Option<&AcceptanceInput>) -> AcceptanceConfig {
         match input {
@@ -4326,7 +4326,7 @@ pub mod model {
         }
     }
 
-    /// `explicitAcceptanceCanDisable` (acceptance.ts:134-136).
+    /// `explicitAcceptanceCanDisable` (acceptance.ts:167-174).
     fn explicit_acceptance_can_disable(explicit: &AcceptanceConfig) -> bool {
         explicit.level == Some(AcceptanceLevel::None)
             && explicit
@@ -4335,7 +4335,7 @@ pub mod model {
                 .is_some_and(|reason| !reason.trim().is_empty())
     }
 
-    /// `normalizeCriteria` (acceptance.ts:251-263).
+    /// `normalizeCriteria` (acceptance.ts:330-342).
     ///
     /// Public because [`super::lower_acceptance_input`] resolves an authored `criteria[]` through
     /// this exact function on its way onto [`super::AcceptanceContract::criteria`] — the ONE
@@ -4387,7 +4387,7 @@ pub mod model {
         seen
     }
 
-    /// `resolveEffectiveAcceptance` (acceptance.ts:265-302) — including the explicit-vs-inferred MAX
+    /// `resolveEffectiveAcceptance` (acceptance.ts:344-401) — including the explicit-vs-inferred MAX
     /// escalation and the "inference-escalated-to-reviewed" review-downgrade rule.
     #[must_use]
     pub fn resolve_effective_acceptance(input: &AcceptanceResolveInput) -> ResolvedAcceptanceConfig {
@@ -4448,7 +4448,7 @@ pub mod model {
     }
 
     // --------------------------------------------------------------------------------------------
-    // formatAcceptancePrompt (acceptance.ts:304-348)
+    // formatAcceptancePrompt (acceptance.ts:403-457)
     // --------------------------------------------------------------------------------------------
 
     /// The `acceptance-report` example object, rendered exactly as pi's
@@ -4594,7 +4594,7 @@ pub mod model {
     }
 
     // --------------------------------------------------------------------------------------------
-    // Fenced-block scanning mirroring pi's regexes (acceptance.ts:350-373, 423-427, 494-515)
+    // Fenced-block scanning mirroring pi's regexes (acceptance.ts:459-482, 423-427, 494-515)
     // --------------------------------------------------------------------------------------------
 
     struct FenceMatch {
@@ -4692,7 +4692,7 @@ pub mod model {
             .collect()
     }
 
-    /// `extractBalancedJson` (acceptance.ts:350-373).
+    /// `extractBalancedJson` (acceptance.ts:459-482).
     fn extract_balanced_json(text: &str, start: usize) -> Option<String> {
         let mut depth = 0i64;
         let mut in_string = false;
@@ -4727,7 +4727,7 @@ pub mod model {
         end.and_then(|e| text.get(start..e)).map(str::to_string)
     }
 
-    /// `parseReportJson` (acceptance.ts:409-421).
+    /// `parseReportJson` (acceptance.ts:646-658).
     fn parse_report_json(body: &str) -> Result<Value, String> {
         let trimmed = body.trim();
         match serde_json::from_str::<Value>(trimmed) {
@@ -5108,7 +5108,7 @@ pub mod model {
         }
     }
 
-    /// `validateAcceptanceReport` (acceptance.ts:551-620). Returns `(report, errors)`; a present
+    /// `validateAcceptanceReport` (acceptance.ts:831-909). Returns `(report, errors)`; a present
     /// `report` requires no errors AND at least one recognized report field.
     fn validate_acceptance_report(
         value: &Value,
@@ -5378,7 +5378,7 @@ pub mod model {
     // parseAcceptanceReport / stripAcceptanceReport (acceptance.ts:437-515)
     // --------------------------------------------------------------------------------------------
 
-    /// `parseAcceptanceReport` result (acceptance.ts:451).
+    /// `parseAcceptanceReport` result (acceptance.ts:701).
     #[derive(Debug, Clone, PartialEq, Default)]
     pub struct ParsedAcceptanceReport {
         pub report: Option<AcceptanceReport>,
@@ -5814,7 +5814,7 @@ pub mod model {
     }
 
     // --------------------------------------------------------------------------------------------
-    // Report-driven runtime checks (acceptance.ts:622-669)
+    // Report-driven runtime checks (acceptance.ts:911-966)
     // --------------------------------------------------------------------------------------------
 
     /// `reportEvidencePresent` (acceptance.ts:632-644).
@@ -5849,7 +5849,7 @@ pub mod model {
         }
     }
 
-    /// `checkCriteriaSatisfied` (acceptance.ts:622-630).
+    /// `checkCriteriaSatisfied` (acceptance.ts:911-919).
     ///
     /// Public because the live gate ([`super::evaluate_acceptance`]'s `Checked` rung) runs this
     /// same check over [`super::AcceptanceContract::criteria`] — there is exactly one criteria
@@ -5915,7 +5915,7 @@ pub mod model {
         }
     }
 
-    /// `checkNoStagedFiles` (acceptance.ts:646-655) — REAL `git status --short` subprocess in `cwd`.
+    /// `checkNoStagedFiles` (acceptance.ts:939-948) — REAL `git status --short` subprocess in `cwd`.
     async fn check_no_staged_files(cwd: &Path) -> AcceptanceRuntimeCheck {
         let output = tokio::process::Command::new("git")
             .arg("status")
@@ -5966,7 +5966,7 @@ pub mod model {
         }
     }
 
-    /// `runStructuralChecks` (acceptance.ts:657-669).
+    /// `runStructuralChecks` (acceptance.ts:950-966).
     ///
     /// Takes the evidence list rather than the whole [`ResolvedAcceptanceConfig`] — upstream reads
     /// nothing else off `acceptance` (`for (const kind of acceptance.evidence)` plus the
@@ -6040,7 +6040,7 @@ pub mod model {
         seen
     }
 
-    /// `aggregateAcceptanceReport` (acceptance.ts:681-711).
+    /// `aggregateAcceptanceReport` (acceptance.ts:1000-1030).
     #[must_use]
     pub fn aggregate_acceptance_report(
         results: &[AggregateChild],
@@ -6988,7 +6988,7 @@ pub mod model {
         pub report_optional: bool,
     }
 
-    /// `evaluateAcceptance` (acceptance.ts:769-845). Async because `verified` runs REAL `verify[]`
+    /// `evaluateAcceptance` (acceptance.ts:1210-1355). Async because `verified` runs REAL `verify[]`
     /// subprocesses and `checked`/above may run the REAL `git status` no-staged-files check.
     #[must_use]
     pub async fn evaluate_acceptance(input: EvaluateAcceptanceInput<'_>) -> AcceptanceLedger {
@@ -7206,7 +7206,7 @@ pub mod model {
         ledger
     }
 
-    /// `acceptanceFailureMessage` (acceptance.ts:847-856).
+    /// `acceptanceFailureMessage` (acceptance.ts:1357-1365).
     #[must_use]
     pub fn acceptance_failure_message(ledger: &AcceptanceLedger) -> Option<String> {
         if ledger.status != AcceptanceLedgerStatus::Rejected {
@@ -7321,7 +7321,7 @@ pub mod model {
             // and `checked` is now an error: `reviewed` is not a level at all, `none` needs a
             // reason, and `verified` needs runtime commands — which is precisely
             // `AcceptanceInput = Exclude<AcceptanceLevel, "none" | "verified"> | false |
-            // AcceptanceConfig` (`types.ts:684-685`) restated as messages.
+            // AcceptanceConfig` (`shared/types.ts:684-685`) restated as messages.
             Value::String(s) => {
                 if s == "reviewed" {
                     errors.push(format!("{path_label} {EXPLICIT_REVIEWED_UNAVAILABLE}"));

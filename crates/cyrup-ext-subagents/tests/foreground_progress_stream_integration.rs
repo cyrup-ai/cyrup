@@ -1,7 +1,7 @@
 //! Integration test: closing C19 — a FOREGROUND single run streams live progress through the host
 //! [`cyrup_core::ToolUpdateSink`] as its child's NDJSON stdout arrives, instead of surfacing zero
 //! progress until completion (`extension.rs::run_foreground_streaming` -> the C19 live sink; pi
-//! `runs/foreground/execution.ts:478-499` `onUpdate`/`fireUpdate`).
+//! `runs/foreground/execution.ts:805-826` `onUpdate`/`fireUpdate`).
 //!
 //! No mocking (this crate's standing convention): the run spawns the REAL `cyrup-subagent-fixture`
 //! binary as a genuine OS subprocess via `CYRUP_SUBAGENT_BINARY`, the fixture emits a real scripted

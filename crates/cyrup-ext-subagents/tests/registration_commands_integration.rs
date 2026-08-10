@@ -129,7 +129,7 @@ fn registry_model_count(provider: &str) -> usize {
 
 #[tokio::test]
 async fn subagents_models_command_reports_the_runtime_builtin_model_mapping() {
-    // pi `/subagents-models` (slash-commands.ts:1090-1111 -> `handleModels`) reports the RUNTIME
+    // pi `/subagents-models` (slash-commands.ts:802-823 -> `handleModels`) reports the RUNTIME
     // builtin-agent -> model mapping, NOT a dump of the static provider catalog. This asserts the
     // mapping's header/shape and that it no longer dumps the catalog.
     let _guard = ENV_MUTATION_LOCK.lock().await;
@@ -228,7 +228,7 @@ async fn subagents_refresh_provider_models_writes_a_real_catalog_cache_file() {
     let parsed: serde_json::Value = serde_json::from_str(&contents).expect("valid json");
     assert_eq!(parsed["provider"], serde_json::json!(provider));
     // Every model the registry lists for that provider was probed and written — pi's
-    // `availableModels` for the provider, not a hand-seeded subset (profiles.ts:505).
+    // `availableModels` for the provider, not a hand-seeded subset (profiles.ts:529).
     assert_eq!(
         parsed["modelCount"].as_u64().unwrap_or(0),
         registry_count as u64,
@@ -318,7 +318,7 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
         .as_str()
         .to_string();
 
-    // pi `checkSubagentProfile`'s `entries` (profiles.ts:615-617) walks ONLY
+    // pi `checkSubagentProfile`'s `entries` (profiles.ts:639-641) walks ONLY
     // `subagents.agentOverrides`, never `defaultModel` (this crate's own `render_profile_check_
     // report` doc comment says the same) — so a profile needs a real `overrides.<agent>.model`
     // entry to have anything to check at all; a `defaultModel`-only profile always renders "no
@@ -487,7 +487,7 @@ async fn subagents_companions_is_no_longer_a_registered_command() {
 /// nothing reads, and the next `hide`-equivalent write would resurrect it.
 ///
 /// Upstream deleted the field from `ExtensionConfig` and the three `CompanionSuggestion*` types from
-/// `src/shared/types.ts` in the SAME commit (`3ac0ef5`, `types.ts:948-965,975`).
+/// `src/shared/types.ts` in the SAME commit (`3ac0ef5`, `shared/types.ts:948-965,975`).
 ///
 /// The user action: a `~/.cyrup/subagents/config.json` that still carries the legacy block must load
 /// without error (an old config must not brick a session) and must NOT be re-serialized with it.

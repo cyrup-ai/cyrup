@@ -258,7 +258,7 @@ pub fn describe_profiles(
 // port additionally sets a representative `subagents.defaultModel` (the medium tier) so the
 // profile is a complete policy that also covers non-builtin/custom agents (see
 // [`build_profile_file`]). The tier→model mapping is
-// chosen by `pickTierModels` (profiles.ts:348-359) from the provider's ranked model list. The
+// chosen by `pickTierModels` (profiles.ts:365-376) from the provider's ranked model list. The
 // LIVE-PROBE model *classification/ranking* (`refreshProviderModelCatalog`'s per-model probe +
 // `classifyModel`) is a sanctioned deferral (func-SA §9 item 31) — but the profile FILE SHAPE, the
 // tier-position math, and the per-provider catalog artifact are all pure, faithful, and ported
@@ -266,7 +266,7 @@ pub fn describe_profiles(
 // catalog, the deferred-live-probe stand-in) and this module writes the pi-shaped files.
 
 /// The three model tiers a generated profile assigns across the 8 builtin agents (pi
-/// `pickTierModels` result, profiles.ts:348-359). Each is a model reference string (pi uses a
+/// `pickTierModels` result, profiles.ts:365-376). Each is a model reference string (pi uses a
 /// fully-qualified `provider/id`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TierModels {
@@ -277,7 +277,7 @@ pub struct TierModels {
 
 /// Which of pi's two profile flavors a generation pass produces (`ProfileKind`, profiles.ts:12).
 /// Selects the tier *positions* used to pick cheap/medium/strong models from the provider's ranked
-/// model list (`profilePositions`, profiles.ts:342-346).
+/// model list (`profilePositions`, profiles.ts:359-363).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProfileKind {
     /// Quota-optimized: bias toward the cheaper end of the ranked list (`{0, 1/3, 2/3}`), and drop
@@ -359,7 +359,7 @@ pub fn build_profile_file(models: &TierModels) -> NamedProfile {
 }
 
 /// The cheap/medium/strong sampling positions for `kind` (pi `profilePositions`,
-/// profiles.ts:342-346), each a `0.0..=1.0` fraction into the ranked selection pool.
+/// profiles.ts:359-363), each a `0.0..=1.0` fraction into the ranked selection pool.
 fn profile_positions(kind: ProfileKind) -> (f64, f64, f64) {
     match kind {
         ProfileKind::Quota => (0.0, 1.0 / 3.0, 2.0 / 3.0),
@@ -368,7 +368,7 @@ fn profile_positions(kind: ProfileKind) -> (f64, f64, f64) {
 }
 
 /// Map a `0.0..=1.0` position into a valid index of a `count`-element list (pi `roundIndex`,
-/// profiles.ts:337-340): `count <= 1` collapses to `0`; otherwise `round((count-1) * position)`,
+/// profiles.ts:354-357): `count <= 1` collapses to `0`; otherwise `round((count-1) * position)`,
 /// clamped into `0..=count-1`.
 fn round_index(count: usize, position: f64) -> usize {
     if count <= 1 {
@@ -381,7 +381,7 @@ fn round_index(count: usize, position: f64) -> usize {
 }
 
 /// Pick the cheap/medium/strong models for `kind` from a RANKED model list (pi `pickTierModels`,
-/// profiles.ts:348-359): quality samples the whole list; quota drops the single most-expensive
+/// profiles.ts:365-376): quality samples the whole list; quota drops the single most-expensive
 /// (last) model from the selection pool when more than one exists, then samples that shorter pool.
 ///
 /// `ranked_models` MUST already be in ascending capability/rank order (cheapest/weakest first),
@@ -426,7 +426,7 @@ pub fn pick_tier_models(
 }
 
 /// The `worker`-tier model of a loaded profile, if it sets one (pi `getProfileWorkerModel`,
-/// slash-commands.ts:336-339) — the model `/subagents-load-profile` offers to switch the live
+/// slash-commands.ts:424-427) — the model `/subagents-load-profile` offers to switch the live
 /// session to. `None` when the profile does not override `worker`'s model (or sets it to blank).
 #[must_use]
 pub fn profile_worker_model(profile: &NamedProfile) -> Option<String> {
@@ -470,7 +470,7 @@ pub fn write_named_profile(
 
 /// The result of a `/subagents-generate-profiles` pass: both written profile paths plus the tier
 /// assignments each ended up with (mirrors pi `generateProfilesForProvider`'s return shape,
-/// profiles.ts:584).
+/// profiles.ts:608).
 #[derive(Clone, Debug)]
 pub struct GeneratedProfiles {
     pub quota_path: PathBuf,
@@ -539,9 +539,9 @@ pub fn generate_provider_profiles(
 ///    key-by-key would leave the previous profile's agents pinned to its models forever, and no
 ///    profile switch could ever unpin them.
 ///
-/// An absent settings file is treated as an empty object (pi `readSettingsFile`, profiles.ts:145-148);
+/// An absent settings file is treated as an empty object (pi `readSettingsFile`, profiles.ts:162-165);
 /// a settings file that is not a JSON object aborts with [`SubagentError::MalformedSettings`] (pi
-/// `readJsonObjectFile`, profiles.ts:85-92). Output matches pi `writeJsonFile`: pretty two-space
+/// `readJsonObjectFile`, profiles.ts:89-96). Output matches pi `writeJsonFile`: pretty two-space
 /// indent + trailing newline, with the parent directory created if needed.
 ///
 /// # Errors
@@ -627,14 +627,14 @@ pub fn apply_profile_to_settings_file(
 pub const DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS: u64 = 7;
 
 /// The per-provider catalog directory under `profiles_dir` (pi `getProviderModelsDir`,
-/// profiles.ts:438-440: a `providers/` child of the profiles root).
+/// profiles.ts:453-455: a `providers/` child of the profiles root).
 #[must_use]
 pub fn provider_models_dir(profiles_dir: &Path) -> PathBuf {
     profiles_dir.join("providers")
 }
 
 /// The on-disk path of one provider's model catalog file (pi `getProviderModelsPath`,
-/// profiles.ts:448-450: `<providers>/<provider>.models.json`). Validates `provider` via
+/// profiles.ts:463-465: `<providers>/<provider>.models.json`). Validates `provider` via
 /// [`validate_profile_name`] before constructing the path (R-SA-142).
 ///
 /// # Errors
@@ -687,7 +687,7 @@ pub struct ProviderModelCatalog {
 }
 
 /// Whether `catalog` is older than its `max_age_days` window as of `now_epoch_ms` (pi
-/// `isProviderModelCatalogStale`, profiles.ts:482-487). A catalog written in the future
+/// `isProviderModelCatalogStale`, profiles.ts:506-511). A catalog written in the future
 /// (`refreshed_at_epoch_ms > now_epoch_ms`, e.g. clock skew) is treated as fresh, never stale.
 #[must_use]
 pub fn is_provider_catalog_stale(
@@ -700,7 +700,7 @@ pub fn is_provider_catalog_stale(
 }
 
 /// Read one provider's cached catalog file, if present (pi `readProviderModelCatalog`,
-/// profiles.ts:476-480). `Ok(None)` when the file does not exist (a never-refreshed provider is a
+/// profiles.ts:500-504). `Ok(None)` when the file does not exist (a never-refreshed provider is a
 /// normal state, not an error).
 ///
 /// # Errors

@@ -26,7 +26,7 @@
 pub use crate::spawn::nested_events::{CHILD_INDEX_ENV, RUN_ID_ENV};
 
 /// `CYRUP_SUBAGENT_ORCHESTRATOR_TARGET` (pi `PI_SUBAGENT_ORCHESTRATOR_TARGET`,
-/// `pi-args.ts:15,204-205`): the supervisor's addressable presence target the child's
+/// `runs/shared/pi-args.ts:15,204-205`): the supervisor's addressable presence target the child's
 /// `contact_supervisor` relays to. Read by `cyrup-intercom::identity::ENV_ORCH_TARGET`.
 pub const ENV_ORCHESTRATOR_TARGET: &str = "CYRUP_SUBAGENT_ORCHESTRATOR_TARGET";
 /// `CYRUP_SUBAGENT_ORCHESTRATOR_SESSION_ID` (pi `PI_SUBAGENT_ORCHESTRATOR_SESSION_ID`): the
@@ -35,30 +35,30 @@ pub const ENV_ORCHESTRATOR_TARGET: &str = "CYRUP_SUBAGENT_ORCHESTRATOR_TARGET";
 ///
 /// The spawn site DOES set it, from the launching session's own id: upstream added
 /// `env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV] = input.parentSessionId` in `3ac0ef5` ("Make
-/// supervisor coordination native", `pi-args.ts:221-223`), because the NATIVE supervisor channel
+/// supervisor coordination native", `runs/shared/pi-args.ts:221-223`), because the NATIVE supervisor channel
 /// keys every request on it — `requestMatchesContext` compares it against
 /// `ctx.sessionManager.getSessionId()` so a request only ever surfaces in the session that spawned
 /// the child (`native-supervisor-channel.ts:445-448`). An earlier revision of this doc said the
 /// spawn site leaves it unset; that was true only at pre-`3ac0ef5` upstream.
 pub const ENV_ORCHESTRATOR_SESSION_ID: &str = "CYRUP_SUBAGENT_ORCHESTRATOR_SESSION_ID";
 /// `CYRUP_SUBAGENT_SUPERVISOR_CHANNEL_DIR` (pi `PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR`,
-/// `pi-args.ts:17,80-86,225-231`, added in `3ac0ef5` "Make supervisor coordination native"): the
+/// `runs/shared/pi-args.ts:17,80-86,225-231`, added in `3ac0ef5` "Make supervisor coordination native"): the
 /// per-child directory holding the NATIVE supervisor channel's `requests/`+`replies/` JSON files.
 /// Written by the spawn site alongside [`ENV_ORCHESTRATOR_SESSION_ID`] whenever an orchestrator
 /// target, a parent session id, a run id and a persona name are ALL known — upstream's exact
-/// four-way condition (`pi-args.ts:225`). Read by [`crate::native_supervisor::read_child_metadata`].
+/// four-way condition (`runs/shared/pi-args.ts:225`). Read by [`crate::native_supervisor::read_child_metadata`].
 pub const ENV_SUPERVISOR_CHANNEL_DIR: &str = "CYRUP_SUBAGENT_SUPERVISOR_CHANNEL_DIR";
-/// `CYRUP_SUBAGENT_CHILD_AGENT` (pi `PI_SUBAGENT_CHILD_AGENT`, `pi-args.ts:17,210-211`): the child's
+/// `CYRUP_SUBAGENT_CHILD_AGENT` (pi `PI_SUBAGENT_CHILD_AGENT`, `runs/shared/pi-args.ts:17,210-211`): the child's
 /// own persona name (one of the four vars required for the metadata gate to activate). Read by
 /// `cyrup-intercom::identity::ENV_CHILD_AGENT`.
 pub const ENV_CHILD_AGENT: &str = "CYRUP_SUBAGENT_CHILD_AGENT";
 /// `CYRUP_SUBAGENT_INTERCOM_SESSION_NAME` (pi `PI_SUBAGENT_INTERCOM_SESSION_NAME`,
-/// `pi-args.ts:201-202`): the child's OWN deterministic presence label
+/// `runs/shared/pi-args.ts:201-202`): the child's OWN deterministic presence label
 /// ([`resolve_subagent_intercom_target`]) — the addressable name the parent steers. Read by
 /// `cyrup-intercom::identity::ENV_INTERCOM_SESSION_NAME`.
 pub const ENV_INTERCOM_SESSION_NAME: &str = "CYRUP_SUBAGENT_INTERCOM_SESSION_NAME";
 
-/// pi `sanitizeIntercomTargetPart` (`intercom-bridge.ts:90-92`): lowercase, collapse every run of
+/// pi `sanitizeIntercomTargetPart` (`intercom/intercom-bridge.ts:90-92`): lowercase, collapse every run of
 /// characters outside `[a-z0-9_-]` to a single `-`, strip leading/trailing `-`, and fall back to
 /// `"agent"` when the result is empty.
 #[must_use]
@@ -83,7 +83,7 @@ pub fn sanitize_intercom_target_part(value: &str) -> String {
     }
 }
 
-/// pi `resolveSubagentIntercomTarget` (`intercom-bridge.ts:94-97`): the deterministic broker
+/// pi `resolveSubagentIntercomTarget` (`intercom/intercom-bridge.ts:94-97`): the deterministic broker
 /// presence label a spawned child registers under (and the parent addresses to steer it) —
 /// `subagent-<sanitize(agent)>-<sanitize(run_id)>-<index+1>`.
 #[must_use]
@@ -93,7 +93,7 @@ pub fn resolve_subagent_intercom_target(run_id: &str, agent: &str, index: usize)
 
 /// The index-OPTIONAL form of [`resolve_subagent_intercom_target`], matching upstream's signature
 /// exactly: `resolveSubagentIntercomTarget(runId, agent, index?: number)` renders
-/// `stepSuffix = index !== undefined ? `-${index + 1}` : ""` (`intercom-bridge.ts:94-97`
+/// `stepSuffix = index !== undefined ? `-${index + 1}` : ""` (`intercom/intercom-bridge.ts:94-97`
 /// @v0.34.0), so an index-less caller gets the bare `subagent-<agent>-<run>` label with NO trailing
 /// step number.
 ///
@@ -121,7 +121,7 @@ pub fn resolve_subagent_intercom_target_opt(
     )
 }
 
-/// pi `resolveIntercomSessionTarget` (`intercom-bridge.ts:83-88`): a supervisor's own addressable
+/// pi `resolveIntercomSessionTarget` (`intercom/intercom-bridge.ts:83-88`): a supervisor's own addressable
 /// presence target — the trimmed session name if present, else the unnamed-session alias
 /// `subagent-chat-<id[0:8]>` (with a leading `session-` prefix stripped first). Byte-identical to
 /// [`cyrup_intercom::identity::presence_name`] so the child's `orchestrator_target` (produced here,

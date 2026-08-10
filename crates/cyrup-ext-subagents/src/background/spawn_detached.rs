@@ -46,7 +46,7 @@
 //! and that is still true. The single exception is the R-SA-P1 parent-session ANCHOR
 //! ([`crate::exec::PARENT_SESSION_ENV_VAR`]), which is not runner configuration at all — it is
 //! ambient process identity that pi propagates purely by environment INHERITANCE
-//! (`pi-subagents/src/extension/index.ts:599` @v0.34.0 publishes it into the orchestrator's own
+//! (`pi-subagents/src/extension/index.ts:716` @v0.43.0 publishes it into the orchestrator's own
 //! `process.env`, so every descendant at every hop simply inherits it). cyrup's orchestrator cannot
 //! write its own `process.env` (`#![forbid(unsafe_code)]` + 2024-edition `unsafe std::env::set_var`),
 //! so this module writes that ONE entry explicitly onto the hop-1 child instead, resolved by

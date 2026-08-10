@@ -548,7 +548,7 @@ pub fn format_fleet(
 // `view: "transcript"` (pi `formatAsyncRunTranscript`, fleet-view.ts:340-449)
 // =================================================================================================
 
-/// pi `validateTranscriptIndex` + `selectTranscriptStep` (`fleet-view.ts:340-362`): an explicit
+/// pi `validateTranscriptIndex` + `selectTranscriptStep` (`fleet-view.ts:363-385`): an explicit
 /// index must be in range; otherwise prefer the run's `currentStep` while it is running, then fall
 /// back to the sole step of a one-step run.
 ///
@@ -596,7 +596,7 @@ fn select_transcript_step(
     Ok((selected, hint))
 }
 
-/// pi `stepStateLine` (`fleet-view.ts:364-375`).
+/// pi `stepStateLine` (`fleet-view.ts:387-399`).
 fn step_state_line(status: &RunStatus, index: Option<usize>, now: i64) -> Option<String> {
     let index = index?;
     let step = status.steps.get(index)?;
@@ -621,7 +621,7 @@ fn step_state_line(status: &RunStatus, index: Option<usize>, now: i64) -> Option
     Some(parts.join(" | "))
 }
 
-/// pi `appendKnownArtifacts` (`fleet-view.ts:377-387`).
+/// pi `appendKnownArtifacts` (`fleet-view.ts:401-411`).
 fn append_known_artifacts(lines: &mut Vec<String>, artifacts: &[(&str, String)]) {
     if artifacts.is_empty() {
         return;
@@ -632,7 +632,7 @@ fn append_known_artifacts(lines: &mut Vec<String>, artifacts: &[(&str, String)])
     }
 }
 
-/// pi `appendTranscriptBody` (`fleet-view.ts:389-396`).
+/// pi `appendTranscriptBody` (`fleet-view.ts:413-420`).
 fn append_transcript_body(lines: &mut Vec<String>, source: &str, body: &[String], truncated: bool) {
     lines.push(format!("{source}{}:", if truncated { " (tail truncated)" } else { "" }));
     if body.is_empty() {

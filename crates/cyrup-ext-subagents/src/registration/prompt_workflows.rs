@@ -9,10 +9,10 @@
 //! `resources.rs`'s own `#[cfg(test)]` block. The recipes were vendored, discovered and unit-tested,
 //! and no user could invoke one: nothing registered a command that reads them. Upstream reaches
 //! them through two slash commands registered from `registerSlashCommands`
-//! (`slash/slash-commands.ts:1099-1102` @v0.34.0 calls `registerPromptWorkflowCommands`, which
+//! (`slash/slash-commands.ts:795-800` @v0.43.0 calls `registerPromptWorkflowCommands`, which
 //! registers `prompt-workflow` at `prompt-workflows.ts:269` and `chain-prompts` at `:303`), and
 //! `registerSlashCommands(pi, state)` is itself called from the extension entry point
-//! (`extension/index.ts:529`). So the user action is literally typing `/prompt-workflow list` or
+//! (`extension/index.ts:605`). So the user action is literally typing `/prompt-workflow list` or
 //! `/prompt-workflow parallel-review <task>`.
 //!
 //! Classification: **port-bug**. Both commands and this whole file exist at the ported baseline

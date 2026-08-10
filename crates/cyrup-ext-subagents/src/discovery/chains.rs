@@ -62,7 +62,7 @@ const CHAIN_MD_SUFFIX: &str = ".chain.md";
 const SKILLS_DIR_SEGMENT: &str = "skills";
 
 /// The `maxItems` value pi passes into `validateChainOutputBindings` at chain-parse time
-/// (`chain-serializer.ts:177`, `Number.MAX_SAFE_INTEGER`) — parse-time validation never enforces a
+/// (`chain-serializer.ts:204`, `Number.MAX_SAFE_INTEGER`) — parse-time validation never enforces a
 /// concrete fan-out ceiling; that is a run-time concern. Kept as the JS safe-integer maximum so a
 /// dynamic step's own `maxItems` (if any) is the only ceiling checked here.
 const CHAIN_PARSE_MAX_ITEMS: u64 = 9_007_199_254_740_991;
@@ -960,7 +960,7 @@ pub(crate) fn validate_dynamic_step_shape(
     }
     // `config.maxItems` is always the parse-time `MAX_SAFE_INTEGER`, so it is a valid non-negative
     // integer by construction and the "requires expand.maxItems or config.maxItems" branch (both
-    // undefined) can never fire here — matching `chain-serializer.ts:177`.
+    // undefined) can never fire here — matching `chain-serializer.ts:204`.
     let _ = config_max_items;
 
     match step.get("parallel") {
@@ -1149,9 +1149,9 @@ pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u3
             // `failFast` is a legal dynamic-step key at the ported baseline
             // (`dynamic-fanout.ts:44` `DYNAMIC_STEP_KEYS`, mirrored by this file's own
             // `DYNAMIC_STEP_KEYS`) and upstream forwards it verbatim when it lowers the dynamic
-            // step to a `ParallelStep` (`chain-execution.ts:897-901`: `failFast: step.failFast`),
+            // step to a `ParallelStep` (`chain-execution.ts:1061-1067`: `failFast: step.failFast`),
             // where `runParallelChainTasks` applies pi's `?? false` default
-            // (`chain-execution.ts:231`). Reading it here — exactly as the static-`parallel` arm
+            // (`chain-execution.ts:283`). Reading it here — exactly as the static-`parallel` arm
             // above does — is what keeps the validator's acceptance of the key honest.
             fail_fast: step.fail_fast.unwrap_or(false),
             // C16: carry pi's `expand.{item,key,maxItems,onEmpty}` and `collect.outputSchema`
@@ -1888,8 +1888,8 @@ mod tests {
     /// but this bridge previously read it ONLY on the static-`parallel` arm and dropped it on the
     /// dynamic arm — so an author's `failFast: true` was validated as legal and then silently
     /// ignored. Upstream forwards it verbatim when it lowers the dynamic step to a `ParallelStep`
-    /// (`chain-execution.ts:897-901` @v0.34.0: `failFast: step.failFast`), and applies pi's `??
-    /// false` default only at dispatch (`chain-execution.ts:231`).
+    /// (`chain-execution.ts:1061-1067` @v0.43.0: `failFast: step.failFast`), and applies pi's `??
+    /// false` default only at dispatch (`chain-execution.ts:283`).
     #[test]
     fn chain_step_to_runner_step_carries_fail_fast_onto_a_dynamic_group() {
         let dynamic = |fail_fast: Option<bool>| ChainStepConfig {

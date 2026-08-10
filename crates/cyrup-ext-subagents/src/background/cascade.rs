@@ -203,7 +203,7 @@ pub async fn cascade_to_nested_async_descendants(
                 control::deliver_timeout_request(&dir, verb.source(), None).await
             }
             // G77: like `Timeout`, no wake-up signal — upstream's `deliverStopRequest` body is a
-            // bare `requestAsyncStop(...)` (`control-channel.ts:600`) despite its input shape
+            // bare `requestAsyncStop(...)` (`runs/background/control-channel.ts:600`) despite its input shape
             // accepting a `pid`, so `pid` is deliberately unused on this arm.
             CascadeVerb::Stop => control::deliver_stop_request(&dir, verb.source(), None).await,
         };

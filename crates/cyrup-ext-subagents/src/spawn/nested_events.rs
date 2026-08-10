@@ -767,7 +767,7 @@ pub fn nested_route_env(route: &NestedRoute) -> HashMap<String, String> {
 }
 
 /// The child-ROLE env pair EVERY spawned subagent child carries, and the SINGLE production source
-/// of those two entries — pi `augmentChildEnv` (`pi-args.ts:328-330`), where
+/// of those two entries — pi `augmentChildEnv` (`runs/shared/pi-args.ts:328-330`), where
 /// `env[SUBAGENT_CHILD_ENV] = "1"` and `env[SUBAGENT_FANOUT_CHILD_ENV] = fanoutAuthorized ? "1" : "0"`
 /// are written unconditionally on every spawn, next to each other, in that order.
 ///

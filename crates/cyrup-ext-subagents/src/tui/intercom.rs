@@ -378,11 +378,11 @@ fn resolve_step_result_status(
     }
 }
 
-/// pi `formatSubagentResultReceipt` (`result-intercom.ts:334-377`), ported for the mode label +
+/// pi `formatSubagentResultReceipt` (`result-intercom.ts:376-421`), ported for the mode label +
 /// "Run: …" + "Children: …" + closing-line structure this crate has real data for today. pi's three
 /// conditional sections (`Artifacts:` / `Run intercom targets (may be inactive after completion):` /
 /// `Sessions:`) each only render when at least one delivered child carries an `artifactPath` /
-/// `intercomTarget` / `sessionPath` respectively (`.filter(...)`, `result-intercom.ts:351-373`) — no
+/// `intercomTarget` / `sessionPath` respectively (`.filter(...)`, `result-intercom.ts:395-417`) — no
 /// per-grouped-child artifact path, session path, or intercom target is tracked anywhere in this
 /// crate's pipeline yet, so those three sections correctly evaluate to "no matching children" and are
 /// omitted here exactly as pi's own filters would do given the identical absence of data; the moment
@@ -647,7 +647,7 @@ impl SteerChannel for NoTransportSteerChannel {
 /// receiver never perceptibly stalls the orchestrator's own turn.
 pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_millis(750);
 
-/// pi's `deliverSubagentIntercomMessageEvent` default `timeoutMs` (`result-intercom.ts:283-288`) —
+/// pi's `deliverSubagentIntercomMessageEvent` default `timeoutMs` (`result-intercom.ts:325-330`) —
 /// the SAME 500ms bound applies to EVERY caller of that function, including the live-child follow-up
 /// steer at `subagent-executor.ts:860` ([`SubagentExecutor::control_resume`]'s `SteerRunning` arm).
 /// Distinct from [`DEFAULT_DELIVERY_TIMEOUT`] (750ms), which only bounds the grouped-result
@@ -659,7 +659,7 @@ pub const DEFAULT_STEER_TIMEOUT: Duration = Duration::from_millis(500);
 /// analogue of [`deliver`]'s race, applied to the distinct steer seam. Resolves to `true` only if the
 /// channel confirms `Ok(true)` before `timeout` elapses; any other outcome (`Ok(false)`, `Err`, or the
 /// timeout branch firing first) resolves to `false`, matching pi's `deliverSubagentIntercomMessageEvent`
-/// contract that the caller's turn is never blocked longer than `timeoutMs` (`result-intercom.ts:283-316`).
+/// contract that the caller's turn is never blocked longer than `timeoutMs` (`result-intercom.ts:325-358`).
 pub async fn steer_with_timeout(channel: &dyn SteerChannel, target: String, text: String, timeout: Duration) -> bool {
     let attempt = channel.steer(target, text);
     tokio::select! {
@@ -670,7 +670,7 @@ pub async fn steer_with_timeout(channel: &dyn SteerChannel, target: String, text
 }
 
 /// Convenience wrapper over [`steer_with_timeout`] using [`DEFAULT_STEER_TIMEOUT`] (pi's `timeoutMs
-/// = 500` default, applied uniformly to every caller per `result-intercom.ts:283-288`).
+/// = 500` default, applied uniformly to every caller per `result-intercom.ts:325-330`).
 pub async fn steer_with_default_timeout(channel: &dyn SteerChannel, target: String, text: String) -> bool {
     steer_with_timeout(channel, target, text, DEFAULT_STEER_TIMEOUT).await
 }

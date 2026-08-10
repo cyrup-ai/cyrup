@@ -523,7 +523,7 @@ pub fn timeout_request_path(run_dir: &Path) -> PathBuf {
 }
 
 // =================================================================================================
-// StopRequest (G77) — the control inbox's FOURTH verb (pi `control-channel.ts:49-53,123-125,
+// StopRequest (G77) — the control inbox's FOURTH verb (pi `runs/background/control-channel.ts:49-53,123-125,
 // 281-290,519-530,593-601` @v0.43.0)
 // =================================================================================================
 
@@ -534,7 +534,7 @@ pub fn timeout_request_path(run_dir: &Path) -> PathBuf {
 pub const STOP_MESSAGE: &str = "Subagent stopped by user.";
 
 /// The on-disk `control/stop.json` request record — pi's `StopRequest`
-/// (`control-channel.ts:49-53` @v0.43.0): `{ type: "stop", ts, source, reason }`, the exact sibling
+/// (`runs/background/control-channel.ts:49-53` @v0.43.0): `{ type: "stop", ts, source, reason }`, the exact sibling
 /// shape of [`InterruptRequest`]/[`TimeoutRequest`], in the same control inbox under a third file
 /// name.
 ///
@@ -552,7 +552,7 @@ pub const STOP_MESSAGE: &str = "Subagent stopped by user.";
 /// | `stop` | `Stopped` | `Stopped` (`exitCode: 1`, [`STOP_MESSAGE`]) | **no** — `async-resume.ts:406` refuses explicitly |
 ///
 /// The inbox drain order is likewise fixed and load-bearing: stop, THEN timeout, THEN interrupt
-/// (`control-channel.ts:653-655`), so when several land together the hardest, least-resumable
+/// (`runs/background/control-channel.ts:653-655`), so when several land together the hardest, least-resumable
 /// verdict wins.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -584,7 +584,7 @@ impl StopRequest {
     }
 }
 
-/// `<run_dir>/control/stop.json` (pi `stopRequestPath`, `control-channel.ts:123-125` @v0.43.0).
+/// `<run_dir>/control/stop.json` (pi `stopRequestPath`, `runs/background/control-channel.ts:123-125` @v0.43.0).
 #[must_use]
 pub fn stop_request_path(run_dir: &Path) -> PathBuf {
     control_inbox_dir(run_dir).join("stop.json")
@@ -614,7 +614,7 @@ pub enum StopOutcome {
 /// is `reconcileAsyncRun(target.asyncDir, { kill }).status`, `:39`), then applies upstream's
 /// actionability guard verbatim: only a `Running` or `Queued` run may be stopped. Unlike
 /// [`interrupt`] there is no already-pending short-circuit — upstream writes the request
-/// unconditionally via `writeAtomicJson` (`control-channel.ts:287-288`), which is idempotent by
+/// unconditionally via `writeAtomicJson` (`runs/background/control-channel.ts:287-288`), which is idempotent by
 /// construction because the request is a single well-known path whose mere existence is the state.
 ///
 /// # Errors
@@ -678,7 +678,7 @@ pub async fn deliver_interrupt_request(
 }
 
 /// Parent side, addressed by run DIRECTORY: atomically write a [`TimeoutRequest`] into `run_dir`'s
-/// control inbox (pi `deliverTimeoutRequest`, `control-channel.ts:536-545` @v0.34.0).
+/// control inbox (pi `deliverTimeoutRequest`, `runs/background/control-channel.ts:536-545` @v0.34.0).
 ///
 /// Note the deliberate asymmetry with [`deliver_interrupt_request`], faithful to upstream:
 /// `deliverTimeoutRequest` sends NO wake-up signal. `SIGUSR2` is the interrupt fast-path only; a
@@ -701,12 +701,12 @@ pub async fn deliver_timeout_request(
 }
 
 /// Parent side, addressed by run DIRECTORY: atomically write a [`StopRequest`] into `run_dir`'s
-/// control inbox (G77; pi `deliverStopRequest` → `requestAsyncStop`, `control-channel.ts:281-290,
+/// control inbox (G77; pi `deliverStopRequest` → `requestAsyncStop`, `runs/background/control-channel.ts:281-290,
 /// 593-601` @v0.43.0).
 ///
 /// Like [`deliver_timeout_request`] and unlike [`deliver_interrupt_request`], this sends **no**
 /// wake-up signal — upstream's `deliverStopRequest` accepts a `pid`/`kill` pair in its input shape
-/// but its whole body is `requestAsyncStop(input.asyncDir, …)` (`control-channel.ts:600`); the file
+/// but its whole body is `requestAsyncStop(input.asyncDir, …)` (`runs/background/control-channel.ts:600`); the file
 /// inbox is the entire channel. The runner's own poll/watch tick picks it up and `stopRunner`
 /// aborts the live children from inside.
 ///
@@ -741,10 +741,10 @@ async fn write_control_request<T: serde::Serialize + Sync>(
 }
 
 // =================================================================================================
-// steer (G90) — the control inbox's THIRD verb, pi `control-channel.ts:48-55,121-189` @v0.34.0
+// steer (G90) — the control inbox's THIRD verb, pi `runs/background/control-channel.ts:48-55,121-189` @v0.34.0
 // =================================================================================================
 
-/// One parent-to-runner steering request (pi `SteerRequest`, `control-channel.ts:48-55` @v0.34.0).
+/// One parent-to-runner steering request (pi `SteerRequest`, `runs/background/control-channel.ts:48-55` @v0.34.0).
 ///
 /// Unlike [`InterruptRequest`]/[`TimeoutRequest`], steering is a **queue, not a flag**: several
 /// distinct guidance messages can be in flight at once and each must be delivered exactly once, so
@@ -772,7 +772,7 @@ pub struct SteerRequest {
     /// It is not a SUFFICIENT sort key. A millisecond is an eternity next to two `request_async_steer`
     /// calls in a loop, so same-`ts` requests are routine rather than exotic, and the tiebreak
     /// decides what the user actually sees. pi ties on `base64url(randomUUID())`
-    /// (`consumeSteerRequestsFromDir` sorts file names, `control-channel.ts:437`; the name is
+    /// (`consumeSteerRequestsFromDir` sorts file names, `runs/background/control-channel.ts:437`; the name is
     /// `steerRequestFileName`, `:85-87`) — i.e. two corrections typed in quick succession reach the
     /// child in RANDOM order, and the second can be overridden by the first. cyrup keeps `ts` as the
     /// primary key, exactly as upstream, and makes the tiebreak deterministic by minting a
@@ -794,14 +794,14 @@ pub struct SteerRequest {
 }
 
 /// `<run_dir>/control/steer-requests/` — the parent-written queue the runner drains (pi
-/// `steerRequestsDir`, `control-channel.ts:76-78`).
+/// `steerRequestsDir`, `runs/background/control-channel.ts:76-78`).
 #[must_use]
 pub fn steer_requests_dir(run_dir: &Path) -> PathBuf {
     control_inbox_dir(run_dir).join("steer-requests")
 }
 
 /// `<run_dir>/control/steer-targets/<index>/` — the per-child inbox the runner routes an accepted
-/// request into (pi `stepSteerInboxDir`, `control-channel.ts:81-83`). Two directories rather than
+/// request into (pi `stepSteerInboxDir`, `runs/background/control-channel.ts:81-83`). Two directories rather than
 /// one because the two hops have different addressees: the parent does not know which child is
 /// running, and the child must not have to filter a queue that is not its own.
 #[must_use]
@@ -809,7 +809,7 @@ pub fn step_steer_inbox_dir(run_dir: &Path, index: usize) -> PathBuf {
     control_inbox_dir(run_dir).join("steer-targets").join(index.to_string())
 }
 
-/// pi `steerRequestFileName` (`control-channel.ts:85-87`): `<ts zero-padded to 13>-<base64url(id)>.json`.
+/// pi `steerRequestFileName` (`runs/background/control-channel.ts:85-87`): `<ts zero-padded to 13>-<base64url(id)>.json`.
 ///
 /// The zero-padding is what makes a plain lexicographic directory listing sort by time, which is
 /// exactly what [`consume_steer_requests_from_dir`] relies on before its explicit re-sort — and the
@@ -820,7 +820,7 @@ fn steer_request_file_name(request: &SteerRequest) -> String {
     format!("{:013}-{id}.json", request.ts.max(0))
 }
 
-/// pi `writeSteerRequestToDir` (`control-channel.ts:89-93`).
+/// pi `writeSteerRequestToDir` (`runs/background/control-channel.ts:89-93`).
 ///
 /// # Errors
 ///
@@ -855,7 +855,7 @@ fn next_steer_request_id() -> String {
     format!("{seq:016x}-{}", uuid::Uuid::new_v4().as_simple())
 }
 
-/// Parent side: pi `requestAsyncSteer` (`control-channel.ts:121-140`) — validate, stamp, and drop
+/// Parent side: pi `requestAsyncSteer` (`runs/background/control-channel.ts:121-140`) — validate, stamp, and drop
 /// one steering request into `run_dir`'s steer queue.
 ///
 /// # Errors
@@ -885,7 +885,7 @@ pub async fn request_async_steer(
     write_steer_request_to_dir(&steer_requests_dir(run_dir), &request).await
 }
 
-/// Runner side: pi `enqueueStepSteer` (`control-channel.ts:142-145`) — hand one accepted request to
+/// Runner side: pi `enqueueStepSteer` (`runs/background/control-channel.ts:142-145`) — hand one accepted request to
 /// exactly one child by copying it into that child's own inbox with `target_index` pinned.
 ///
 /// # Errors
@@ -904,7 +904,7 @@ pub async fn enqueue_step_steer(
     write_steer_request_to_dir(&step_steer_inbox_dir(run_dir, index), &pinned).await
 }
 
-/// pi `consumeSteerRequestsFromDir` (`control-channel.ts:165-185`): read every `*.json` in `dir` in
+/// pi `consumeSteerRequestsFromDir` (`runs/background/control-channel.ts:165-185`): read every `*.json` in `dir` in
 /// name order, DELETE each one before returning it (so a crash mid-delivery loses a request rather
 /// than replaying it), skip anything that fails to parse or validate, and return the survivors
 /// sorted by `(ts, id)`.
@@ -949,7 +949,7 @@ pub async fn consume_steer_requests_from_dir(dir: &Path) -> Vec<SteerRequest> {
     out
 }
 
-/// pi `consumeSteerRequests` (`control-channel.ts:187-189`): drain the RUN-level queue.
+/// pi `consumeSteerRequests` (`runs/background/control-channel.ts:187-189`): drain the RUN-level queue.
 pub async fn consume_steer_requests(run_dir: &Path) -> Vec<SteerRequest> {
     consume_steer_requests_from_dir(&steer_requests_dir(run_dir)).await
 }
@@ -967,7 +967,7 @@ pub async fn check_timeout_inbox_now(
 }
 
 /// Idempotent, at-most-once consumption of a pending [`TimeoutRequest`] — pi
-/// `consumeTimeoutRequest` (`control-channel.ts:209` @v0.34.0), and the exact
+/// `consumeTimeoutRequest` (`runs/background/control-channel.ts:209` @v0.34.0), and the exact
 /// read-then-unconditionally-delete discipline [`consume_interrupt_request`] documents at length.
 /// A missing file is `Ok(None)`, never an error; losing the delete race against a concurrent
 /// consumer still returns the contents this caller observed.
@@ -1000,7 +1000,7 @@ pub async fn check_stop_inbox_now(paths: &RunPaths) -> Result<Option<StopRequest
 }
 
 /// Idempotent, at-most-once consumption of a pending [`StopRequest`] (G77) — pi
-/// `consumeStopRequest` (`control-channel.ts:519-530` @v0.43.0), and the exact
+/// `consumeStopRequest` (`runs/background/control-channel.ts:519-530` @v0.43.0), and the exact
 /// read-then-unconditionally-delete discipline [`consume_interrupt_request`] documents at length. A
 /// missing file is `Ok(None)`, never an error; losing the delete race against a concurrent consumer
 /// still returns the contents this caller observed (upstream's own comment on that branch reads
@@ -2163,7 +2163,7 @@ mod tests {
     }
 
     /// The sequence is only the TIEBREAK — `ts` still dominates, exactly as upstream sorts
-    /// (`consumeSteerRequestsFromDir`, `control-channel.ts:437`, over a `ts`-prefixed file name).
+    /// (`consumeSteerRequestsFromDir`, `runs/background/control-channel.ts:437`, over a `ts`-prefixed file name).
     /// A request with an older `ts` sorts first even when its id was minted later, which is what
     /// keeps ordering correct across processes, where the per-process counter means nothing.
     #[tokio::test]
@@ -2258,7 +2258,7 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     /// `stop` writes a real `control/stop.json` for a `Running` run, and `consume_stop_request`
-    /// reads-then-deletes it exactly once (pi `consumeStopRequest`, `control-channel.ts:519-530`).
+    /// reads-then-deletes it exactly once (pi `consumeStopRequest`, `runs/background/control-channel.ts:519-530`).
     #[tokio::test]
     async fn stop_writes_a_real_stop_request_that_is_consumed_exactly_once() {
         let (_dir, async_root, results_dir) = temp_roots();

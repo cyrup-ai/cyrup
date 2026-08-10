@@ -122,7 +122,7 @@ async fn walk(
 
 /// The backlog item's own example: a group gate declaring a criterion the aggregate report can
 /// never carry. `aggregateAcceptanceReport` reports only `criterion-1`, `criterion-2` and one
-/// `child-<n>` per child (`acceptance.ts:681-711`), so a criterion named `c1` is simply "not
+/// `child-<n>` per child (`acceptance.ts:1000-1030`), so a criterion named `c1` is simply "not
 /// reported" and `checkCriteriaSatisfied` fails it — under pi the whole chain fails.
 #[tokio::test]
 async fn a_declared_group_gate_that_cannot_be_satisfied_fails_the_chain() {
@@ -142,7 +142,7 @@ async fn a_declared_group_gate_that_cannot_be_satisfied_fails_the_chain() {
         results[0]
     );
     let error = results[0].error.clone().unwrap_or_default();
-    // pi `acceptanceFailureMessage` (`acceptance.ts:847-856`) prefixes the first failed runtime
+    // pi `acceptanceFailureMessage` (`acceptance.ts:1357-1365`) prefixes the first failed runtime
     // check with `Acceptance rejected: `.
     assert!(
         error.contains("Acceptance rejected: Required criterion 'c1' was not reported."),

@@ -94,14 +94,16 @@ pub enum SlashCommandName {
     /// `/prompt-workflow <name> [args]` — run one `prompts/*.md` recipe (pi
     /// `prompt-workflows.ts:269` @v0.34.0). NOT one of R-SA-129's twelve: it comes from
     /// `registerPromptWorkflowCommands`, which `registerSlashCommands` calls at
-    /// `slash-commands.ts:1099-1102`, so it is a real upstream command on the same surface.
+    /// `slash-commands.ts:795-800`, so it is a real upstream command on the same surface.
     PromptWorkflow,
     /// `/chain-prompts a -> b -- args` — run several recipes as one native subagent chain (pi
     /// `prompt-workflows.ts:303` @v0.34.0).
     ChainPrompts,
     /// `/subagents-fleet` — the read-only in-flight fleet surface (pi
     /// `pi.registerCommand("subagents-fleet", …)`, `slash-commands.ts:1092-1097` @v0.34.0, whose
-    /// handler is exactly `runSlashSubagent(pi, ctx, { action: "status", view: "fleet" })`). Also
+    /// handler is exactly `runSlashSubagent(pi, ctx, { action: "status", view: "fleet" })`; at
+    /// v0.43.0 that command is `:714-717` and its handler is `showFleet(ctx)` instead, which this
+    /// crate does not port yet). Also
     /// NOT one of R-SA-129's twelve, and also a real upstream command on the same surface —
     /// registered by the SAME `registerSlashCommands` call, three lines above the
     /// `registerPromptWorkflowCommands` hop the two commands above come from.
@@ -247,8 +249,10 @@ pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
         usage: "Usage: /chain-prompts prompt-a -> prompt-b -- args",
         description: "Run prompt templates as a native subagent chain: /chain-prompts analyze -> fix -- args",
     },
-    // G92: `/subagents-fleet` (`slash-commands.ts:1092-1097` @v0.34.0). `description` is upstream's
-    // verbatim.
+    // G92: `/subagents-fleet` (`slash-commands.ts:1092-1097` @v0.34.0). `description` is that
+    // baseline's verbatim text. VERSION LAG: at v0.43.0 the command is `slash-commands.ts:714-717`
+    // and its description reads "Open the live subagent fleet inspector" — it moved to the
+    // interactive FleetView (`src/tui/fleet*.ts`), which this crate does not port yet.
     SlashCommandDescriptor {
         name: SlashCommandName::SubagentsFleet,
         usage: "Usage: /subagents-fleet",
@@ -550,7 +554,7 @@ pub fn validate_inline_acceptance(value: &str, agent: &str) -> Result<(), SlashP
 // =================================================================================================
 
 /// Split one agent token into its bare name and inline `[...]` config, if present.
-/// Faithful port of `pi-subagents`' `parseAgentToken` (`slash-commands.ts:92-97`).
+/// Faithful port of `pi-subagents`' `parseAgentToken` (`slash-commands.ts:76-81`).
 #[must_use]
 pub fn parse_agent_token(token: &str) -> (String, InlineStepConfig) {
     let Some(bracket) = token.find('[') else {
@@ -1467,7 +1471,7 @@ pub fn parse_chain_command(raw_args: &str) -> Result<ParsedChainCommand, SlashPa
         .map(|element| match element {
             ParsedChainElement::Group { tasks, config } => {
                 // T1 (count fan-out, `slash-commands.ts:884` `opts.inGroup && config.count` +
-                // `subagent-executor.ts:1359` `expandChainParallelCounts`): an inline group task's
+                // `subagent-executor.ts:2002` `expandChainParallelCounts`): an inline group task's
                 // `[count=N]` repeats that concrete task N times, widening the fan-out — the
                 // parse-time analogue of pi's `expandChainParallelCounts`, applied here where the
                 // group's static width is known. `count` is validated `>= 1` at parse time
@@ -1615,7 +1619,7 @@ pub fn parse_run_chain_command(raw_args: &str) -> Result<ParsedRunChainCommand, 
 
 /// `/subagent-cost` and `/subagents-doctor` take no arguments at all (R-SA-129's per-command
 /// argument-shape contract; source: both handlers ignore `_args` entirely,
-/// `slash-commands.ts:1076-1088`). This parser exists purely so every one of the 12 commands has a
+/// `slash-commands.ts:685-697`). This parser exists purely so every one of the 12 commands has a
 /// uniform `parse_*` entry point `extension.rs` can dispatch through — it always succeeds.
 pub fn parse_no_args_command(_raw_args: &str) {}
 
@@ -1632,7 +1636,7 @@ pub struct ParsedSubagentsModelsCommand {
 
 /// Parse `/subagents-models [builtin-agent-name]` (R-SA-129). Faithful port of the
 /// `pi.registerCommand("subagents-models", ...)` handler's argument-parsing portion
-/// (`slash-commands.ts:1090-1111`), MINUS the `BUILTIN_AGENT_NAMES.includes(agent)` existence
+/// (`slash-commands.ts:802-823`), MINUS the `BUILTIN_AGENT_NAMES.includes(agent)` existence
 /// check (source lines 1105-1108) — deferred to `extension.rs`, which has access to the resolved
 /// builtin-agent-name list this pure parser does not.
 ///
@@ -1661,7 +1665,7 @@ pub fn parse_subagents_models_command(
 // /subagents-profiles — no arguments
 // =================================================================================================
 
-// `/subagents-profiles` takes no arguments (source: `slash-commands.ts:1113-1123`). Shares
+// `/subagents-profiles` takes no arguments (source: `slash-commands.ts:811-821`). Shares
 // `parse_no_args_command`'s always-succeeds shape.
 
 // =================================================================================================
@@ -1671,7 +1675,7 @@ pub fn parse_subagents_models_command(
 
 /// Parse a command whose entire argument contract is exactly one required positional token (no
 /// flags, no `key=value`). Faithful port of `parseSingleRequiredArg`
-/// (`slash-commands.ts:330-334`), shared by `/subagents-load-profile`, `/subagents-generate-
+/// (`slash-commands.ts:418-422`), shared by `/subagents-load-profile`, `/subagents-generate-
 /// profiles`, and `/subagents-check-profile` (source calls this same helper for all three,
 /// `slash-commands.ts:1134`, `1216`, `1259`).
 ///
@@ -1789,11 +1793,11 @@ mod tests {
     const R_SA_129_COMMAND_COUNT: usize = 12;
 
     /// Upstream's `registerSlashCommands` registers R-SA-129's twelve AND — at
-    /// `pi-subagents/src/slash/slash-commands.ts:1099-1102` @v0.34.0 —
+    /// `pi-subagents/src/slash/slash-commands.ts:795-800` @v0.43.0 —
     /// `registerPromptWorkflowCommands({ pi, run })`, which registers two more on the SAME command
     /// surface: `pi.registerCommand("prompt-workflow", …)` (`slash/prompt-workflows.ts:269`) and
     /// `pi.registerCommand("chain-prompts", …)` (`:303`). G92 adds a THIRD such command,
-    /// `pi.registerCommand("subagents-fleet", …)` (`slash-commands.ts:1092-1097` @v0.34.0), which
+    /// `pi.registerCommand("subagents-fleet", …)` (`slash-commands.ts:714-717` @v0.43.0), which
     /// `registerSlashCommands` registers DIRECTLY, three lines above that
     /// `registerPromptWorkflowCommands` hop. G77 adds a FOURTH, `pi.registerCommand(
     /// "subagents-stop", …)` (`slash-commands.ts:751-792` @v0.43.0), registered by that same

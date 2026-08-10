@@ -647,7 +647,7 @@ pub async fn find_latest_session_file_by_mtime(
 }
 
 // =================================================================================================
-// `/subagent-cost` session-transcript walk (pi `buildSubagentCostReport`, slash-commands.ts:289-328)
+// `/subagent-cost` session-transcript walk (pi `buildSubagentCostReport`, slash-commands.ts:377-416)
 //
 // This is the shape `/subagent-cost` actually renders (R-SA-140's user-facing surface), and it is a
 // DIFFERENT computation from the recursive background-artifact accumulator above: pi's cost command
@@ -698,7 +698,7 @@ impl TranscriptUsage {
         }
     }
 
-    /// Additive fold (pi `addUsage`, slash-commands.ts:227-234) — every column summed, never
+    /// Additive fold (pi `addUsage`, slash-commands.ts:315-322) — every column summed, never
     /// last-write-wins.
     fn add(&mut self, other: &TranscriptUsage) {
         self.input += other.input;
@@ -709,7 +709,7 @@ impl TranscriptUsage {
         self.turns += other.turns;
     }
 
-    /// pi `usageHasValue` (slash-commands.ts:236-238): a child result is only listed when at least
+    /// pi `usageHasValue` (slash-commands.ts:324-326): a child result is only listed when at least
     /// one accounting column is non-zero, so a zero-usage tool result never adds an empty "Child N"
     /// line.
     fn has_value(&self) -> bool {
@@ -723,7 +723,7 @@ impl TranscriptUsage {
 }
 
 /// One `{agent, usage, sessionFile?}` child entry parsed out of a subagent `toolResult`'s
-/// `details.results` array (pi `SingleResult` subset the cost walk reads, shared/types.ts:394-408).
+/// `details.results` array (pi `SingleResult` subset the cost walk reads, shared/types.ts:803-892).
 struct TranscriptChild {
     agent: String,
     usage: Usage,
@@ -742,7 +742,7 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// pi `formatCostUsage` (slash-commands.ts:280-287): `"{label}: ↑{in} ↓{out} ${cost}(...extras)"`,
+/// pi `formatCostUsage` (slash-commands.ts:368-375): `"{label}: ↑{in} ↓{out} ${cost}(...extras)"`,
 /// where extras (cache read / cache write / turns) are only appended when non-zero.
 fn format_cost_usage(label: &str, usage: &TranscriptUsage) -> String {
     let mut extras: Vec<String> = Vec::new();
@@ -772,7 +772,7 @@ fn format_cost_usage(label: &str, usage: &TranscriptUsage) -> String {
     )
 }
 
-/// pi `assistantUsageFromMessage` (slash-commands.ts:240-259): the parent's own per-turn usage for a
+/// pi `assistantUsageFromMessage` (slash-commands.ts:328-347): the parent's own per-turn usage for a
 /// `role: "assistant"` message. Returns the message's [`cyrup_core::Usage`] (the cost column reads
 /// its `cost.total`); the caller folds it in with `turns: 1`.
 fn assistant_usage_from_entry(entry: &Entry) -> Option<&Usage> {
@@ -785,7 +785,7 @@ fn assistant_usage_from_entry(entry: &Entry) -> Option<&Usage> {
     }
 }
 
-/// pi `isSubagentDetails` (slash-commands.ts:261-265) + the per-result field reads of
+/// pi `isSubagentDetails` (slash-commands.ts:349-353) + the per-result field reads of
 /// `buildSubagentCostReport`: a details value is subagent details only when it is an object carrying
 /// a string `mode` AND an array `results`. Each result's `agent`/`usage`/`sessionFile` is read
 /// leniently (matching pi's untyped field access), so a malformed individual result degrades to
@@ -822,7 +822,7 @@ fn parse_subagent_details(details: &serde_json::Value) -> Option<Vec<TranscriptC
     Some(children)
 }
 
-/// pi `detailsFromSessionEntry` (slash-commands.ts:267-278): extract subagent `{mode, results}`
+/// pi `detailsFromSessionEntry` (slash-commands.ts:355-366): extract subagent `{mode, results}`
 /// details from a session entry, whether stored directly on a `toolResult` message whose `toolName`
 /// is `subagent` (the tool-invoked path) or nested under `details.result.details` of a
 /// [`SLASH_RESULT_TYPE`] custom message (the slash-invoked path).
@@ -850,7 +850,7 @@ fn details_from_session_entry(entry: &Entry) -> Option<Vec<TranscriptChild>> {
 }
 
 /// Build the `/subagent-cost` report by walking one session-transcript branch (pi
-/// `buildSubagentCostReport`, slash-commands.ts:289-328), root→leaf. Sums the parent's own
+/// `buildSubagentCostReport`, slash-commands.ts:377-416), root→leaf. Sums the parent's own
 /// assistant-message usage and a per-child breakdown of every subagent `toolResult` in the branch,
 /// then renders pi's exact multi-line report (Parent line, per-child lines with their optional
 /// `Session:` reference, a divider, the Children subtotal, and the grand Total).

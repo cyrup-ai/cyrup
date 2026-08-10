@@ -10,7 +10,7 @@
 //! 2. [`is_retryable_model_failure`] — R-SA-039's fixed retryable-failure pattern classifier
 //!    (rate limits, auth errors, 5xx, cold-start, empty response, etc.), a verbatim 1:1 port of
 //!    pi-subagents' `RETRYABLE_MODEL_FAILURE_PATTERNS`/`isRetryableModelFailure`
-//!    (`pi-subagents/src/runs/shared/model-fallback.ts:98-138`).
+//!    (`pi-subagents/src/runs/shared/model-fallback.ts:278-329`).
 //! 3. [`run_fallback_ladder`] — the attempt loop itself (R-SA-035/036/037/039/040), which drives
 //!    a caller-supplied single-attempt runner across the candidate ladder built by (1),
 //!    consulting (2) only after a **distinct, prior** timeout check (R-SA-036's load-bearing
@@ -204,7 +204,7 @@ pub fn build_model_candidates_scoped(
 /// Resolve one subagent attempt's effective [`ModelOverride`], folding in the INHERITED parent
 /// session model — the cyrup analog of pi's `resolveSubagentModelOverride(requestedModel,
 /// parentModel, availableModels, preferredProvider)`
-/// (`pi-subagents/src/runs/shared/model-fallback.ts:47-59`), where `requestedModel = task.model ??
+/// (`pi-subagents/src/runs/shared/model-fallback.ts:196-220`), where `requestedModel = task.model ??
 /// agentConfig.model` and `parentModel = ctx.model`.
 ///
 /// As of pi v0.43.0 this is the TWO-STAGE `resolveEffectiveSubagentModel`
@@ -362,7 +362,7 @@ pub fn resolve_model_inheritance(
 
 /// One retryable-failure pattern (R-SA-039), a dependency-free re-typing of one of pi-subagents'
 /// case-insensitive JS regexes in `RETRYABLE_MODEL_FAILURE_PATTERNS`
-/// (`pi-subagents/src/runs/shared/model-fallback.ts:98-133`).
+/// (`pi-subagents/src/runs/shared/model-fallback.ts:278-314`).
 ///
 /// This crate does not depend on the `regex` crate (workspace dependency budget; mirrors
 /// `cyrup-provider::utils::regexlite`'s own dependency-free approach for the analogous
@@ -414,7 +414,7 @@ enum RetryPattern {
 }
 
 /// The fixed retryable-failure pattern set (R-SA-039), in pi's exact `RETRYABLE_MODEL_FAILURE_PATTERNS`
-/// declaration order (`model-fallback.ts:98-133`).
+/// declaration order (`model-fallback.ts:278-314`).
 const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::OptionalWsBetween("rate", "limit"), // /rate\s*limit/i
     RetryPattern::Contains("too many requests"),
@@ -662,7 +662,7 @@ pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
 /// Format the "prior attempt failed" note appended into the next attempt's initial
 /// `recent_output`/progress context (R-SA-039's "append a note about the prior attempt into the
 /// next attempt's initial `recent_output`/progress context"), mirroring pi's
-/// `formatModelAttemptNote` (`model-fallback.ts:140-145`).
+/// `formatModelAttemptNote` (`model-fallback.ts:331-336`).
 #[must_use]
 pub fn format_attempt_note(
     failed_model: &ModelId,

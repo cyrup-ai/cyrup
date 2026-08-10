@@ -45,7 +45,7 @@
 //! on Windows, via [`std::env::split_paths`]) list of additional read-only agent directories,
 //! scanned as **User** scope (R-SA-003's own text: "scanned as User scope"). They are **prepended
 //! ahead of** the ordinary user agent directories in fixed scan order (pi `discoverAgents`
-//! `[...userAgentsExtra, ...userAgentsOld, ...userAgentsNew]`, agents.ts:1300-1304), so under
+//! `[...userAgentsExtra, ...userAgentsOld, ...userAgentsNew]`, agents.ts:1752-1756), so under
 //! R-SA-002's last-directory-scanned-wins rule the user's *own* agent dirs win over a bundled
 //! extra-dir agent of the same name — extras are the **lowest-precedence** User-tier stream, a
 //! read-only fallback for a same-named agent the user has not defined themselves. (A prior bug
@@ -99,7 +99,7 @@ pub mod management;
 /// Skills association (T5, C4): skill-name resolution against a cwd (reusing `cyrup-resources`
 /// discovery), the lazy `<available_skills>` system-prompt injection, the `pi-subagents`
 /// orchestration-skill exclusion, and proactive skill-subagent suggestions — a port of pi-subagents'
-/// `agents/skills.ts:608-682` + `agents/proactive-skills.ts`. Consumed by `exec/mod.rs`'s prompt
+/// `agents/skills.ts:629-714` + `agents/proactive-skills.ts`. Consumed by `exec/mod.rs`'s prompt
 /// assembly (the injection is composed into the child's task text at spawn).
 pub mod skills;
 
@@ -113,7 +113,7 @@ pub mod merge;
 
 /// The settings-file **writer** side of `subagents.agentOverrides` (pi
 /// `mergeBuiltinAgentOverride`/`removeBuiltinAgentOverride`/`removeBuiltinAgentOverrideFields`,
-/// `agents/agents.ts:1033-1120`) — the read-modify-write half this module's reader-only
+/// `agents/agents.ts:1276-1371`) — the read-modify-write half this module's reader-only
 /// [`load_layered_override_settings`] deliberately does not do. Backs the `disable`/`enable`/`reset`
 /// management actions (SUBA-005).
 pub mod settings_write;
@@ -369,7 +369,7 @@ pub fn project_settings_path(project_root: &Path) -> PathBuf {
 }
 
 /// Project-scope agent read directories for `project_root`, **lowest-precedence first** (pi
-/// `resolveNearestProjectAgentDirs`, agents.ts:1234-1248): the legacy `<root>/.agents` dir first
+/// `resolveNearestProjectAgentDirs`, agents.ts:1683-1697): the legacy `<root>/.agents` dir first
 /// (included only when it already exists on disk), then the preferred `<root>/.cyrup/agents` dir
 /// **last** — always included because it is simultaneously the highest-precedence project read dir
 /// under the tier's last-directory-scanned-wins rule (R-SA-002) AND the create/write target
@@ -388,7 +388,7 @@ pub fn resolve_project_agent_read_dirs(project_root: &Path) -> Vec<PathBuf> {
 }
 
 /// Project-scope chain read directories for `project_root` (pi `resolveNearestProjectChainDirs`,
-/// agents.ts:1250-1259): the single preferred `<root>/.cyrup/chains` dir — a directory SEPARATE
+/// agents.ts:1699-1708): the single preferred `<root>/.cyrup/chains` dir — a directory SEPARATE
 /// from the project agents dir ([`CHAINS_SUBDIR`]).
 #[must_use]
 pub fn resolve_project_chain_read_dirs(project_root: &Path) -> Vec<PathBuf> {
@@ -396,7 +396,7 @@ pub fn resolve_project_chain_read_dirs(project_root: &Path) -> Vec<PathBuf> {
 }
 
 /// User-scope agent read directories rooted at `home`, **lowest-precedence first** (pi
-/// `discoverAgents` `userDirOld`/`userDirNew`, agents.ts:1279-1280,1301-1302): the primary
+/// `discoverAgents` `userDirOld`/`userDirNew`, agents.ts:1728-1729,1301-1302): the primary
 /// `<home>/.cyrup/agents` dir first (always included — the create/write fallback target), then the
 /// legacy `<home>/.agents` "second" user dir **last** (included only when it already exists, so it
 /// wins the last-directory-scanned reduce only once the user actually populates it, matching pi's
@@ -413,7 +413,7 @@ pub fn resolve_user_agent_read_dirs(home: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// User-scope chain read directories rooted at `home` (pi `getUserChainDir`, agents.ts:180): the
+/// User-scope chain read directories rooted at `home` (pi `getUserChainDir`, agents.ts:220): the
 /// single `<home>/.cyrup/chains` dir — again SEPARATE from the user agents dir ([`CHAINS_SUBDIR`]).
 #[must_use]
 pub fn resolve_user_chain_read_dirs(home: &Path) -> Vec<PathBuf> {
@@ -639,7 +639,7 @@ impl AgentDiscoveryConfig {
     /// last-directory-scanned-wins User tier rule lets an ordinary user directory's same-named
     /// agent win over an extra directory's, matching pi-subagents'
     /// `[...userAgentsExtra, ...userAgentsOld, ...userAgentsNew]` placement for
-    /// `PI_SUBAGENT_EXTRA_AGENT_DIRS` (agents.ts:1300-1304). Extras are therefore the
+    /// `PI_SUBAGENT_EXTRA_AGENT_DIRS` (agents.ts:1752-1756). Extras are therefore the
     /// **lowest-precedence** User-tier stream (a read-only fallback), never an override of the
     /// user's own agents. A no-op when the variable is absent or empty.
     #[must_use]
@@ -709,7 +709,7 @@ pub fn parse_subagent_settings(
     validate_default_extensions(value)?;
     let mut settings: SubagentSettings = serde_json::from_value(value.clone())
         .map_err(|e| SubagentError::MalformedSettings(e.to_string()))?;
-    // pi `readSubagentSettings` (`agents.ts:695-702`): `defaultModel` must be a NON-EMPTY string;
+    // pi `readSubagentSettings` (`agents.ts:874-881`): `defaultModel` must be a NON-EMPTY string;
     // an empty/whitespace-only value is malformed and MUST abort (R-SA-009). Stored trimmed so a
     // stray-whitespace value resolves to the same model everywhere it is consulted.
     if let Some(dm) = settings.default_model.as_ref() {
@@ -789,7 +789,7 @@ fn validate_default_extensions(subagents: &serde_json::Value) -> Result<(), Suba
 }
 
 /// Read one on-disk `settings.json` file and extract its typed `subagents` block (pi
-/// `readSubagentSettings`, `agents.ts:672-714`). Mirrors pi's outcome taxonomy:
+/// `readSubagentSettings`, `agents.ts:851-919`). Mirrors pi's outcome taxonomy:
 /// - an **absent** file yields the all-default [`SubagentSettings`] (the common "no customization"
 ///   case — NOT an error);
 /// - a file that cannot be read, does not parse as JSON, or is not a JSON object aborts with
@@ -839,7 +839,7 @@ pub fn read_subagent_settings_file(path: &Path) -> Result<SubagentSettings, Suba
 
 /// Read and layer the user-scope and project-scope `settings.json` `subagents` blocks into one
 /// resolved [`SubagentSettings`] (pi's two `readSubagentSettings(...)` calls plus the
-/// project-over-user resolution `discoverAgents` performs inline, `agents.ts:1282-1286` +
+/// project-over-user resolution `discoverAgents` performs inline, `agents.ts:1731-1735` +
 /// `716-728`). Resolution (R-SA-012/R-SA-133):
 /// - per-agent `agentOverrides.<name>`: the **project** entry wins over a same-named **user** entry
 ///   (only one is ever applied to a given agent name);
@@ -909,7 +909,7 @@ fn resolve_layered_subagent_settings(
         default_extensions: project.default_extensions.or(user.default_extensions),
         disable_builtins: project.disable_builtins.or(user.disable_builtins),
         disable_thinking: project.disable_thinking.or(user.disable_thinking),
-        // pi `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1404`) — the same
+        // pi `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1738`) — the same
         // project-wins-outright rule [`LayeredOverrideSettings::model_scope`] applies.
         model_scope: project.model_scope.or(user.model_scope),
     }
@@ -1227,13 +1227,13 @@ pub struct AgentDiscoveryResult {
     /// discovery of sibling files.
     pub diagnostics: Vec<ChainDiscoveryDiagnostic>,
     /// The effective `subagents.modelScope` policy for this discovery's cwd (pi `discoverAgents`'s
-    /// own returned `modelScope`, `agents.ts:1404/1446`): project scope wins over user, `None` =
+    /// own returned `modelScope`, `agents.ts:1738/1446`): project scope wins over user, `None` =
     /// no policy configured, so model-scope enforcement is off.
     pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
 }
 
 /// The **raw, unmerged** four-tier agent scan — the shape pi's `discoverAgentsAll` hands back as
-/// its separate `d.builtin` / `d.package` / `d.user` / `d.project` arrays (`agents.ts:1325-1422`),
+/// its separate `d.builtin` / `d.package` / `d.user` / `d.project` arrays (`agents.ts:1783-1888`),
 /// BEFORE any cross-tier precedence merge or settings-override application.
 ///
 /// [`discover_agents_all`] deliberately returns the *merged* view (one precedence-winner per name,
@@ -1257,7 +1257,7 @@ fn scan_agent_tiers_scoped(cfg: &AgentDiscoveryConfig, scope: AgentReadScope) ->
     let builtin = scan_builtin_agents(cfg);
     let package = scan_package_agents(cfg);
     // Scope-filtered discovery (R-SA-013; pi `discoverAgents` + `mergeAgentsForScope`,
-    // agents.ts:1300-1320, agent-selection.ts): narrow the User-vs-Project axis **within each
+    // agents.ts:1752-1778, agent-selection.ts): narrow the User-vs-Project axis **within each
     // tier, BEFORE the merge** — never merge-all-then-filter. Zeroing the excluded tier's
     // candidates up front means a Project agent can never dedup-shadow a same-named User agent out
     // of the User-scope view (the bug a post-merge scope filter has: the merge would keep only the
@@ -1340,7 +1340,7 @@ fn run_discovery(
 /// violates it by never caching anything itself.
 pub fn discover_agents_all(cfg: &AgentDiscoveryConfig) -> Result<AgentDiscoveryResult, SubagentError> {
     // Management/introspection is always the full Both-scope view (pi `discoverAgentsAll` loads
-    // every tier unconditionally, agents.ts:1325-1422); scope narrowing is a delegation-only
+    // every tier unconditionally, agents.ts:1783-1888); scope narrowing is a delegation-only
     // concern applied by `discover_agents`.
     let mut result = run_discovery(cfg, AgentReadScope::Both)?;
     result.agents = AgentVisibility::management(&result.agents)
@@ -1392,7 +1392,7 @@ pub fn discover_agents(
 /// applying pi's run-time cross-scope precedence: on a same-name collision the highest-precedence
 /// scope wins, in the order Project > User > Package > Builtin. This mirrors pi's
 /// `discoverSavedChains` (slash-commands.ts:171-177,1040), which feeds `discoverAgentsAll`'s
-/// `[...package, ...user, ...project]` chain array (agents.ts:1409-1413) into a name-keyed `Map`
+/// `[...package, ...user, ...project]` chain array (agents.ts:1875-1879) into a name-keyed `Map`
 /// whose last write wins — so the project-scope chain (emitted last) is the one actually run.
 /// cyrup deliberately RETAINS every scope's same-named chain in [`AgentDiscoveryResult::chains`]
 /// (R-SA-015, never merged across scopes) for management/doctor visibility, so this run-time
@@ -1470,7 +1470,7 @@ mod tests {
     #[test]
     fn with_prepended_user_extras_puts_extras_first_so_primary_user_dirs_win_last() {
         // pi loads PI_SUBAGENT_EXTRA_AGENT_DIRS agents FIRST (lowest precedence), then the user's
-        // own agent dirs (agents.ts:1300-1304), so under the User tier's last-directory-scanned-
+        // own agent dirs (agents.ts:1752-1756), so under the User tier's last-directory-scanned-
         // wins reduce (R-SA-002) the user's own agent wins over a bundled extra-dir agent of the
         // same name. A prior bug appended extras AFTER the user dirs, inverting this.
         let primary = PathBuf::from("/home/user/.cyrup/agents");

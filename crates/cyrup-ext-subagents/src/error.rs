@@ -94,7 +94,7 @@ pub enum SubagentError {
     /// `subagent` tool's own `execute`. Upstream needs no dedicated error for this because every
     /// slash handler funnels back into the SAME `executor.execute` the tool uses
     /// (`slash/slash-commands.ts` `runSlashSubagent` -> `requestSlashRun` -> the bridge wired at
-    /// `extension/index.ts:396-401` -> `executeSubagentCollapsed` -> `executor.execute`), so its one
+    /// `extension/index.ts:512-517` -> `executeSubagentCollapsed` -> `executor.execute`), so its one
     /// reserve covers both surfaces; in this crate the slash surface is a separate entry point and
     /// charges the budget itself.
     ///

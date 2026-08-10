@@ -1,6 +1,6 @@
 //! Integration test (T6): a REAL foreground subagent run leaves the full artifact quadruple on
 //! disk — `<runId>_<agent>_input.md`, `_output.md`, `.jsonl`, `_meta.json` (pi
-//! `runs/foreground/execution.ts:960-1074` + `shared/artifacts.ts:29-39`).
+//! `runs/foreground/execution.ts:960-1074` + `shared/artifacts.ts:186-196`).
 //!
 //! No mocking (this crate's standing convention): the run spawns the REAL `cyrup-subagent-fixture`
 //! binary as a genuine OS subprocess via `CYRUP_SUBAGENT_BINARY` (R-SA-045 tier 1), discovers a REAL
@@ -170,8 +170,8 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
     // the background hop-2 runner all leave it in place; it is the observation channel
     // `tool_parallel_chain_integration`/`companions_wiring_proof` read back). It is NOT swept by the
     // foreground orchestrator: mirroring pi, which never deletes its persisted child NDJSON stream
-    // and only cleans the transient `os.tmpdir()` prompt/task-overflow dir (`pi-args.ts:233-236`
-    // `cleanupTempDir`, `execution.ts:677`) that lives outside the working tree.
+    // and only cleans the transient `os.tmpdir()` prompt/task-overflow dir (`runs/shared/pi-args.ts:233-236`
+    // `cleanupTempDir`, `execution.ts:1109`) that lives outside the working tree.
     let tee = std::fs::read_to_string(
         work_dir
             .path()

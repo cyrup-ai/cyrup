@@ -26,8 +26,13 @@
 //!   every run that has a configured output path, exactly as `subagent-executor.ts:3674` does.
 //! * [`inject_output_path_system_prompt`] — the SYSTEM-PROMPT-side one
 //!   (`injectOutputPathSystemPrompt`, `single-output.ts:104-108`), which upstream applies at
-//!   `execution.ts:1443` and `api/preflight.ts:313`. **This one is ported but NOT yet wired** —
-//!   see its own doc comment for the seam it belongs at and what blocks it.
+//!   `execution.ts:1443` and `api/preflight.ts:313`. This one is LIVE too:
+//!   `exec/mod.rs::build_attempt_spawn_plan` composes it onto the persona body that becomes the
+//!   child's `--system-prompt`/`--append-system-prompt`, at the same point in the composition
+//!   order `execution.ts:1443` occupies.
+//!
+//! The two are complementary, not alternatives — upstream's foreground single run applies both to
+//! the same run, and so does this crate.
 //!
 //! This module has ZERO dependency on `cyrup-agent` — every message/content shape it inspects is
 //! the same opaque `serde_json::Value` [`crate::exec::ndjson::SubagentEvent`] already exposes,
@@ -1080,21 +1085,28 @@ pub fn build_output_path_system_prompt_instruction(
 /// unchanged. Mirrors pi-subagents' `injectOutputPathSystemPrompt`
 /// (`pi-subagents/src/runs/shared/single-output.ts:104-108`).
 ///
-/// # NOT YET WIRED — unported work, stated rather than hidden
+/// # Where it is wired
 ///
-/// Upstream calls this at `runs/foreground/execution.ts:1443` and `api/preflight.ts:313`, in BOTH
-/// cases on the same run that also gets the task-side [`inject_single_output_instruction`]. cyrup
-/// wires only the task-side half (`exec/mod.rs::build_task_text`). This function has NO production
-/// caller.
+/// `exec/mod.rs::build_attempt_spawn_plan` calls this on the persona body it is about to ship as
+/// the child's `--system-prompt=<body>` / `--append-system-prompt=<body>`, immediately after
+/// folding in `build_agent_memory_injection`'s block — which is exactly upstream's own composition
+/// order, where `injectOutputPathSystemPrompt` is the statement following the memory fold
+/// (`execution.ts:1433-1443`). Upstream's other call site, `api/preflight.ts:313`, applies the same
+/// injector to the `effectiveSystemPrompt` of a `SubagentLaunchContract` PROJECTION rather than to
+/// a run; cyrup has no port of that preflight/contract API surface at all (no `LaunchContract`
+/// type exists in this crate), so there is nothing here for that second site to attach to. The two
+/// upstream sites do not disagree — both put the instruction on the system prompt — so the one
+/// cyrup surface that exists carries it.
 ///
-/// The seam it belongs at is `exec/mod.rs::build_attempt_spawn_plan`'s persona composition — the
-/// `persona_body` local that already appends `build_agent_memory_injection`'s block, which is
-/// upstream's own immediate predecessor of the `injectOutputPathSystemPrompt` call at
-/// `execution.ts:1443`. What blocks the wiring is a cyrup-side hazard with no upstream analog:
-/// cyrup emits NO `--system-prompt` flag at all for an empty persona body (pi always emits, because
-/// pi's value is persona PLUS skills, memory and steering and so is never empty), so appending the
-/// override to an empty `Replace`-mode body would start emitting `--system-prompt=<override only>`
-/// and blank the child's assembled system prompt. Wiring it requires deciding that case first.
+/// This does NOT replace the task-side [`inject_single_output_instruction`]: upstream's foreground
+/// single run gets BOTH, the task side from its caller (`subagent-executor.ts:3674`) and this one
+/// from `execution.ts:1443`, and `exec/mod.rs` reproduces that pairing.
+///
+/// Composing the override here also retires the empty-body hazard rather than tripping over it:
+/// the `--system-prompt` flag is emitted when the body is non-empty AFTER this injection, so an
+/// output path makes an otherwise-empty `Replace`-mode persona ship the override (which is what
+/// upstream ships too — `runs/shared/pi-args.ts:570-585` emits for any non-null string), while a run with no
+/// output path and no persona still emits no flag and leaves the child's assembled prompt intact.
 #[must_use]
 pub fn inject_output_path_system_prompt(
     system_prompt: &str,

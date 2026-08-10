@@ -6,7 +6,7 @@
 //!      `runSinglePath`, `subagent-executor.ts:2719-2736`, gated on `!detached && !interrupted`)
 //!      — not parallel-mode alone;
 //!   2. render the delivered receipt via pi's `formatSubagentResultReceipt`
-//!      (`result-intercom.ts:334-377`) — mode label + `"Run: …"` + `"Children: …"` + the exact
+//!      (`result-intercom.ts:376-421`) — mode label + `"Run: …"` + `"Children: …"` + the exact
 //!      closing line — never a bespoke `"N/M succeeded"` string; and
 //!   3. cite the run's OWN real, delivered-payload run id in that receipt — never a second, fresh,
 //!      disconnected id minted only for the message.

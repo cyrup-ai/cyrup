@@ -4,8 +4,8 @@
 //! function for them (`registration::resources::bundled_prompt_files`) whose only caller was that
 //! module's own `#[cfg(test)]` block. Upstream reaches those recipes through two slash commands
 //! registered by `registerPromptWorkflowCommands` (`pi-subagents/src/slash/prompt-workflows.ts:269,
-//! 303` @v0.34.0), itself called from `registerSlashCommands` (`slash/slash-commands.ts:1099-1102`)
-//! which the extension entry point calls at `extension/index.ts:529`.
+//! 303` @v0.34.0), itself called from `registerSlashCommands` (`slash/slash-commands.ts:795-800`)
+//! which the extension entry point calls at `extension/index.ts:605`.
 //!
 //! Every test here drives the REAL user entry point, not the ported functions:
 //! `ExtensionHost::execute_native_command` — the exact call

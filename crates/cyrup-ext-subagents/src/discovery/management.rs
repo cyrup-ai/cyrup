@@ -620,7 +620,7 @@ fn reparse_agent_file(file_path: &Path, source: AgentSource) -> Result<AgentDefi
 //     (e.g. a `permission:` nested-YAML block captured by `frontmatter.rs`) is re-emitted as
 //     `key:` + two-space-indented lines, NOT corrupted into one flat line.
 // Settings-override values are NOT baked into files: the update handler feeds `serialize_agent` the
-// pre-override `editable_base` snapshot (pi `editableAgentConfig`, `agent-management.ts:174-196`),
+// pre-override `editable_base` snapshot (pi `editableAgentConfig`, `agent-management.ts:217-267`),
 // and `disabled` is never emitted at all (it is a settings-only concept — a `disabled:` in an agent
 // file is just an unknown extra field, round-tripped through `extra_fields`).
 // -------------------------------------------------------------------------------------------
@@ -872,7 +872,7 @@ fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&HashSet<Strin
     format!("{}\n\n{}\n", lines.join("\n"), def.system_prompt_body)
 }
 
-/// pi `preservedAgentFrontmatterFields` (`agent-management.ts:207-250`): starting from the field
+/// pi `preservedAgentFrontmatterFields` (`agent-management.ts:278-330`): starting from the field
 /// keys literally present in the agent's on-disk frontmatter (`existing_present`, which for a
 /// discovered agent is exactly [`AgentDefinition::present_fields`]), REMOVE any key this update is
 /// changing (so the changed field is re-serialized from its NEW value, not preserved at its old
@@ -1122,7 +1122,7 @@ pub fn rename_chain(
 
 /// Create a new `.chain.json` under `scope_dir` carrying real authored `steps` and an optional
 /// package identifier — the steps-aware create the management `action: "create"` path needs (pi
-/// `handleCreate`'s chain branch, `agent-management.ts:706-715`). Unlike the bare [`create_chain`]
+/// `handleCreate`'s chain branch, `agent-management.ts:935-952`). Unlike the bare [`create_chain`]
 /// skeleton (which materializes an empty step list), this preserves the caller's parsed
 /// [`ChainStepConfig`] sequence verbatim. The file is named by the RUNTIME name
 /// (`{package}.{local}.chain.json`), matching pi's on-disk convention, and always written as
@@ -1161,7 +1161,7 @@ pub fn create_chain_with_steps(
 /// Update an existing User/Project-scope chain in one step: rewrite `name`/`package`/`description`/
 /// `steps` and rename the on-disk file when the runtime name changes — the steps-preserving update
 /// the management `action: "update"` path needs (pi `handleUpdate`'s chain branch,
-/// `agent-management.ts:802-846`). Unlike the bare [`update_chain`] skeleton (which replaces the
+/// `agent-management.ts:1041-1087`). Unlike the bare [`update_chain`] skeleton (which replaces the
 /// step list with empty placeholders), this writes the caller-supplied `steps` verbatim (the
 /// handler passes the existing steps through when the caller did not re-author them). Fails with
 /// `ReadOnlySource` for a Builtin/Package target (R-SA-014) before any filesystem access, and with
@@ -1219,7 +1219,7 @@ fn write_chain_file(file_path: &Path, definition: &ChainDefinition) -> Result<()
 
 /// Serialize a [`ChainDefinition`] to the pi `.chain.json` shape
 /// [`crate::discovery::chains::parse_chain_json`] reads (`serializeJsonChain`,
-/// `chain-serializer.ts:201-214`): a root object with the pre-qualification `name`
+/// `chain-serializer.ts:228-241`): a root object with the pre-qualification `name`
 /// (`frontmatterNameForConfig` — the chain's `local_name`), `description`, and a `chain` ARRAY of
 /// the raw [`ChainStepConfig`] steps, plus `package` when set and any preserved `extra_fields`.
 fn serialize_chain_json(def: &ChainDefinition) -> String {
@@ -1280,7 +1280,7 @@ fn serialize_chain_json(def: &ChainDefinition) -> String {
 //     is a no-op; it is still applied forward-compatibly here so the moment C2 lands it is correct.
 //
 // One architectural divergence (documented, NOT a management-layer bug): pi's `discoverAgentsAll`
-// returns UNMERGED per-tier arrays (`agents.ts:1325-1422`), so `list`/`get` on a name that a
+// returns UNMERGED per-tier arrays (`agents.ts:1783-1888`), so `list`/`get` on a name that a
 // user/project agent shadows across tiers show BOTH the builtin/package entry AND the shadowing
 // entry. cyrup's `discover_agents_all` returns the R-SA-001 four-tier MERGE (one precedence-winner
 // per name, by deliberate architecture), so `list`/`get` show only the winner. `update`/`delete`
@@ -1324,6 +1324,32 @@ pub struct ManagementRequest<'a> {
     /// backend bound / headless) keeps the genuine no-host degrade. Only the `models` action reads
     /// it; the other handlers ignore it.
     pub current_session_model: Option<&'a str>,
+    /// The proactive skill-subagent inputs [`handle_list`] splices in — pi's
+    /// `ctx.config?.proactiveSkillSubagents` plus its `discoverAvailableSkills: () =>
+    /// discoverAvailableSkills(ctx.cwd)` closure (`agent-management.ts:765-770` @v0.43.0). `None`
+    /// means the caller performed no availability scan, which yields no suggestions — the same
+    /// outcome upstream reaches when its `discoverAvailableSkills` throws
+    /// (`proactive-skills.ts:182-186` catches to `[]`, and an empty availability list matches no
+    /// skill). Only the `list` action reads it.
+    pub proactive_skills: Option<ProactiveSkillsInput<'a>>,
+}
+
+/// The two proactive skill-subagent inputs `handleList` reads off its `ManagementContext`
+/// (`agent-management.ts:765-770` @v0.43.0), carried on [`ManagementRequest`] because cyrup's
+/// management layer takes a request rather than a context object.
+///
+/// **Why the availability list is pre-resolved rather than a closure.** Upstream passes a lazy
+/// `discoverAvailableSkills: () => AvailableSkill[]` so that a disabled feature performs no
+/// filesystem scan. cyrup's [`crate::discovery::skills::discover_available_skills`] is `async`
+/// while [`handle_management_action`] is sync, so the laziness moves one level up: the async caller
+/// checks [`crate::discovery::skills::resolve_proactive_skill_subagents_config`]'s `enabled` first
+/// and only then awaits the scan, filling this field. Both upstream properties survive — no scan
+/// when disabled, and no suggestions when the scan found nothing.
+pub struct ProactiveSkillsInput<'a> {
+    /// pi `ctx.config?.proactiveSkillSubagents`. `None` is pi's `undefined` (defaults-on).
+    pub setting: Option<&'a crate::discovery::skills::ProactiveSkillSubagentsSetting>,
+    /// The already-resolved result of pi's `discoverAvailableSkills(ctx.cwd)` closure.
+    pub available_skills: &'a [crate::discovery::skills::AvailableSkill],
 }
 
 /// The rendered outcome of a management action — pi's `result(text, isError)`
@@ -2478,14 +2504,17 @@ fn chain_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool 
 
 /// pi `handleList` (`agent-management.ts:753-788` @v0.43.0 — thirty-six lines).
 ///
-/// **The proactive-skill block is still MISSING, and the reason this comment used to give is stale.**
-/// It said "skills subsystem absent"; the subsystem exists now — [`crate::discovery::skills`] is a
-/// complete port of `proactive-skills.ts` — but nothing calls it, so `{ action: "list" }` never
-/// emits the `Proactive skill subagent suggestions:` block upstream splices in at
-/// `agent-management.ts:784`. See
-/// [`crate::discovery::skills::build_proactive_skill_subagent_recommendation_lines`]'s own doc for
-/// the two cross-file seams (an async availability scan, and a `proactiveSkillSubagents` setting
-/// that `ManagementRequest` does not carry) that the wire-up needs.
+/// The proactive-skill block is spliced in exactly where upstream splices it: BETWEEN the `Chains:`
+/// block and the chain diagnostics, preceded by one blank line and only when it has lines
+/// (`agent-management.ts:784`'s
+/// `...(proactiveSuggestions.length ? ["", ...proactiveSuggestions] : [])`). Its two inputs — pi's
+/// `ctx.config?.proactiveSkillSubagents` and the result of its `discoverAvailableSkills(ctx.cwd)`
+/// closure — arrive on [`ManagementRequest::proactive_skills`]; see [`ProactiveSkillsInput`] for
+/// why the availability scan is pre-resolved by the async caller rather than run lazily here.
+///
+/// The recommender consults the SAME `agents`/`chains` bindings this function already rendered
+/// (upstream passes its own post-filter `agents` and `chains` locals), so a scope-filtered or
+/// disabled-filtered listing recommends only from what it listed.
 ///
 /// There is no companion-suggestion block to port: upstream
 /// deleted `companionSuggestionLines` from `handleList`'s `ManagementContext` and from its rendered
@@ -2550,6 +2579,33 @@ fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Ma
     } else {
         for c in &chains {
             lines.push(format!("- {} ({}): {}", c.name, source_str(c.source), c.description));
+        }
+    }
+    // pi `agent-management.ts:765-770,784`: the proactive suggestions are computed from the same
+    // filtered `agents`/`chains` this listing rendered, and spliced in after `Chains:` and before
+    // `Chain diagnostics:` — with a leading blank line, and only when non-empty.
+    if let Some(proactive) = &req.proactive_skills {
+        let agent_inputs: Vec<crate::discovery::skills::ProactiveAgentInput> = agents
+            .iter()
+            .map(|a| crate::discovery::skills::proactive_agent_input(a))
+            .collect();
+        let chain_inputs: Vec<crate::discovery::skills::ProactiveChainInput> = chains
+            .iter()
+            .map(|c| crate::discovery::skills::proactive_chain_input(c))
+            .collect();
+        let suggestions =
+            crate::discovery::skills::build_proactive_skill_subagent_recommendation_lines(
+                &agent_inputs,
+                &chain_inputs,
+                proactive.setting,
+                // The availability scan already happened (see `ProactiveSkillsInput`); this closure
+                // is the sync shim that hands its result to the recommender, and — exactly like
+                // upstream's — is never called when the feature is disabled.
+                || Ok::<_, std::convert::Infallible>(proactive.available_skills.to_vec()),
+            );
+        if !suggestions.is_empty() {
+            lines.push(String::new());
+            lines.extend(suggestions);
         }
     }
     if !diagnostics.is_empty() {
@@ -4401,7 +4457,155 @@ mod tests {
             agent_scope: scope,
             config,
             current_session_model: None,
+            proactive_skills: None,
         }
+    }
+
+    // ---- pi `handleList`'s proactive skill-subagent block (`agent-management.ts:765-770,784`) ----
+
+    /// Two user agents that both name the same skill, so the skill clears the default
+    /// `minReferences: 2`. Returns the request-side availability list that makes it recommendable.
+    fn seed_two_agents_sharing_a_skill(cfg: &AgentDiscoveryConfig) -> Vec<crate::discovery::skills::AvailableSkill> {
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "auditor-one.md",
+            "---\nname: auditor-one\ndescription: First auditor\nskills: audit-trail\n---\nBody.\n",
+        );
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "auditor-two.md",
+            "---\nname: auditor-two\ndescription: Second auditor\nskills: audit-trail\n---\nBody.\n",
+        );
+        vec![crate::discovery::skills::AvailableSkill {
+            name: "audit-trail".to_string(),
+            description: Some("Trace every mutation.".to_string()),
+        }]
+    }
+
+    /// The block upstream splices at `agent-management.ts:784` must actually appear in `list`
+    /// output, positioned AFTER the `Chains:` block and BEFORE `Chain diagnostics:`, with the
+    /// blank-line separator upstream's `["", ...proactiveSuggestions]` prepends.
+    #[test]
+    fn list_emits_the_proactive_skill_subagent_block_in_pis_position() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let available = seed_two_agents_sharing_a_skill(&cfg);
+
+        let mut req = mreq(None, None, None, None);
+        req.proactive_skills = Some(ProactiveSkillsInput {
+            setting: None, // pi's `undefined` — defaults on
+            available_skills: &available,
+        });
+        let out = handle_management_action(&cfg, "list", &req).expect("list ok");
+        assert!(!out.is_error, "{}", out.text);
+        let t = out.text;
+
+        assert!(
+            t.contains("Proactive skill subagent suggestions:"),
+            "the block upstream splices at `agent-management.ts:784` is missing:\n{t}"
+        );
+        assert!(
+            t.contains("- audit-trail via reviewer (referenced by 2 configured agents/chains; agent:auditor-one, agent:auditor-two) - Trace every mutation."),
+            "the recommendation line must match `formatProactiveSkillSubagentRecommendations`:\n{t}"
+        );
+        assert!(
+            t.contains("Guardrails: use these for broad tasks"),
+            "the guardrails footer must ship with the block:\n{t}"
+        );
+        let chains_at = t.find("Chains:").unwrap_or(usize::MAX);
+        let block_at = t.find("Proactive skill subagent suggestions:").unwrap_or(usize::MIN);
+        assert!(chains_at < block_at, "the block must follow `Chains:`:\n{t}");
+        assert!(
+            t.contains("\n\nProactive skill subagent suggestions:"),
+            "upstream prepends one blank line to the block:\n{t}"
+        );
+    }
+
+    /// pi reads `ctx.config?.proactiveSkillSubagents`; the literal `false` disables the feature
+    /// entirely (`resolveProactiveSkillSubagentsConfig`, `proactive-skills.ts:38-59`). A setting
+    /// that stopped being threaded through would silently stop disabling anything.
+    #[test]
+    fn list_honours_an_explicit_proactive_skill_subagents_false() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let available = seed_two_agents_sharing_a_skill(&cfg);
+
+        let disabled = crate::discovery::skills::ProactiveSkillSubagentsSetting::Disabled;
+        let mut req = mreq(None, None, None, None);
+        req.proactive_skills = Some(ProactiveSkillsInput {
+            setting: Some(&disabled),
+            available_skills: &available,
+        });
+        let out = handle_management_action(&cfg, "list", &req).expect("list ok");
+        assert!(
+            !out.text.contains("Proactive skill subagent suggestions:"),
+            "an explicit `false` must suppress the block:\n{}",
+            out.text
+        );
+    }
+
+    /// A caller that ran no availability scan (`proactive_skills: None`) emits no block — the same
+    /// outcome upstream reaches when its `discoverAvailableSkills` throws
+    /// (`proactive-skills.ts:182-186` catches to `[]`, which matches no skill).
+    #[test]
+    fn list_emits_no_proactive_block_without_an_availability_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let _available = seed_two_agents_sharing_a_skill(&cfg);
+
+        let out = handle_management_action(&cfg, "list", &mreq(None, None, None, None)).expect("list ok");
+        assert!(
+            !out.text.contains("Proactive skill subagent suggestions:"),
+            "{}",
+            out.text
+        );
+        // ...and an availability scan that found nothing likewise recommends nothing.
+        let empty: Vec<crate::discovery::skills::AvailableSkill> = Vec::new();
+        let mut req = mreq(None, None, None, None);
+        req.proactive_skills = Some(ProactiveSkillsInput {
+            setting: None,
+            available_skills: &empty,
+        });
+        let out = handle_management_action(&cfg, "list", &req).expect("list ok");
+        assert!(
+            !out.text.contains("Proactive skill subagent suggestions:"),
+            "{}",
+            out.text
+        );
+    }
+
+    /// The extension-config shape (`config.json`'s `proactiveSkillSubagents`) must reach the
+    /// recommender's own setting shape without losing the disable — the bridge is what
+    /// `extension.rs::route_management_action` calls.
+    #[test]
+    fn the_extension_config_bridge_preserves_disable_and_the_tuning_knobs() {
+        use crate::discovery::skills::{
+            ProactiveSkillSubagentsSetting, resolve_proactive_skill_subagents_config,
+        };
+        use crate::registration::ProactiveSkillSubagents;
+
+        let off = ProactiveSkillSubagentsSetting::from_extension_config(
+            &ProactiveSkillSubagents::Toggle(false),
+        );
+        assert!(!resolve_proactive_skill_subagents_config(Some(&off)).enabled);
+
+        let on = ProactiveSkillSubagentsSetting::from_extension_config(
+            &ProactiveSkillSubagents::Toggle(true),
+        );
+        assert!(resolve_proactive_skill_subagents_config(Some(&on)).enabled);
+
+        let tuned = ProactiveSkillSubagentsSetting::from_extension_config(
+            &ProactiveSkillSubagents::Config(crate::registration::ProactiveSkillSubagentsConfig {
+                enabled: Some(true),
+                min_references: Some(1),
+                max_recommendations: Some(2),
+                preferred_agent: Some("scout".to_string()),
+            }),
+        );
+        let resolved = resolve_proactive_skill_subagents_config(Some(&tuned));
+        assert_eq!(resolved.min_references, 1);
+        assert_eq!(resolved.max_recommendations, 2);
+        assert_eq!(resolved.preferred_agent, "scout");
     }
 
     #[test]
@@ -4677,6 +4881,7 @@ mod tests {
             agent_scope: None,
             config: None,
             current_session_model: Some(model),
+            proactive_skills: None,
         };
         let out = handle_management_action(&cfg, "models", &req).expect("models ok");
         assert!(!out.is_error, "{}", out.text);

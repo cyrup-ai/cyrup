@@ -6,7 +6,7 @@
 //! pre-check short-circuited on every event and the tool row always drew cyrup's built-in shell.
 //!
 //! Upstream declares both renderers on its `ToolDefinition` (`pi-subagents/src/extension/index.ts:
-//! 465` `renderCall`, `:495` `renderResult` → `tui/render.ts:1406` `renderSubagentResult`,
+//! 465` `renderCall`, `:495` `renderResult` → `tui/render.ts:1678` `renderSubagentResult`,
 //! @v0.34.0), which pi's interactive mode prefers over the built-in
 //! (`pi/packages/coding-agent/src/modes/interactive/components/tool-execution.ts:81-112`).
 //!
@@ -91,7 +91,7 @@ async fn a_child_safe_registration_declares_no_renderer() {
     assert!(!host.has_tool_renderer("subagent"));
 }
 
-/// Every branch of pi's `renderCall` (`extension/index.ts:465-493` @v0.34.0), through the real host
+/// Every branch of pi's `renderCall` (`extension/index.ts:548-568` @v0.43.0), through the real host
 /// call `cyrup-tui` makes on `ToolExecutionStart`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_call_row_renders_every_pi_branch() {
@@ -151,7 +151,7 @@ async fn the_call_row_renders_every_pi_branch() {
 
 /// The result row for a SETTLED single run draws through `render_inline_result` — the header line
 /// (agent + `[fork]` badge) and its stats line — instead of the built-in shell. This is pi's
-/// `d.mode === "single" && d.results.length === 1` compact branch (`tui/render.ts:1428-1430`).
+/// `d.mode === "single" && d.results.length === 1` compact branch (`tui/render.ts:1709-1712`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_settled_single_result_draws_the_compact_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -262,7 +262,7 @@ async fn a_management_result_draws_its_report_text() {
 /// (`crates/cyrup-agent/src/agent.rs:123-142,927`), and renders THAT.
 ///
 /// It is the assertion that would have caught the port bug this item fixed: `runSinglePath`'s
-/// `details` is `{ mode: "single", runId, results: [r], … }` (`subagent-executor.ts:3002-3013`
+/// `details` is `{ mode: "single", runId, results: [r], … }` (`subagent-executor.ts:3811-3823`
 /// @v0.34.0), and cyrup used to emit the bare `SingleResult` at the details ROOT — no `mode`, no
 /// `results` — so `renderSubagentResult`'s only settled branch could never fire.
 #[cfg(feature = "test-fixtures")]

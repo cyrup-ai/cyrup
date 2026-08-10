@@ -1,6 +1,6 @@
 //! Read-modify-**write** of the `subagents.agentOverrides.<name>` block of a `settings.json`
 //! (SUBA-005) — a port of pi-subagents' three settings writers
-//! (`src/agents/agents.ts:1033-1120` at v0.34.0):
+//! (`src/agents/agents.ts:1276-1371` at v0.34.0):
 //!
 //! | pi | here |
 //! |---|---|
@@ -35,7 +35,7 @@ use serde_json::{Map, Value};
 
 use crate::error::SubagentError;
 
-/// pi `readSettingsFileStrict` (`agents.ts:551-572`): an **absent** file reads as the empty object
+/// pi `readSettingsFileStrict` (`agents.ts:701-722`): an **absent** file reads as the empty object
 /// (the common "no settings yet" case, not an error); an unreadable file, a file that does not
 /// parse as JSON, and a file whose top level is not a JSON object each abort with that function's
 /// verbatim message. The messages are shared with `read_subagent_settings_file`'s reader-side
@@ -67,7 +67,7 @@ fn read_settings_file_strict(path: &Path) -> Result<Map<String, Value>, Subagent
     }
 }
 
-/// pi `writeSettingsFile` (`agents.ts:574-577`): `mkdir -p` the parent, then write
+/// pi `writeSettingsFile` (`agents.ts:706-709`): `mkdir -p` the parent, then write
 /// `JSON.stringify(settings, null, 2) + "\n"`. The two-space indent and the trailing newline are
 /// matched exactly so a cyrup-written settings file is diff-clean against a pi-written one.
 fn write_settings_file(path: &Path, settings: &Map<String, Value>) -> Result<(), SubagentError> {
@@ -106,7 +106,7 @@ fn store_overrides(settings: &mut Map<String, Value>, next_overrides: Map<String
     }
 }
 
-/// pi `mergeBuiltinAgentOverride` (`agents.ts:1058-1085`): shallow-merge `fields` into
+/// pi `mergeBuiltinAgentOverride` (`agents.ts:1301-1327`): shallow-merge `fields` into
 /// `subagents.agentOverrides.<name>` in the settings file at `path`, creating every missing level,
 /// and return that path.
 ///
@@ -136,7 +136,7 @@ pub fn merge_builtin_agent_override(
     write_settings_file(path, &settings)
 }
 
-/// pi `removeBuiltinAgentOverride` (`agents.ts:1033-1057`): delete the WHOLE
+/// pi `removeBuiltinAgentOverride` (`agents.ts:1276-1299`): delete the WHOLE
 /// `subagents.agentOverrides.<name>` entry. Returns whether anything was actually removed — the
 /// caller (`reset`) reports "Removed &lt;scope&gt; settings override at &lt;path&gt;" only on `true`,
 /// and pi distinguishes the same way.
@@ -163,7 +163,7 @@ pub fn remove_builtin_agent_override(path: &Path, name: &str) -> Result<bool, Su
     Ok(true)
 }
 
-/// pi `removeBuiltinAgentOverrideFields` (`agents.ts:1086-1120`): delete only the named `fields`
+/// pi `removeBuiltinAgentOverrideFields` (`agents.ts:1329-1371`): delete only the named `fields`
 /// from `subagents.agentOverrides.<name>`, leaving the entry's other fields intact — and delete the
 /// entry entirely if that emptied it. Returns whether any field was actually present and removed;
 /// `false` means nothing was written.

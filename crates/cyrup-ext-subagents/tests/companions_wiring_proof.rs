@@ -441,7 +441,7 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
     );
 
     // R-SA-123: the inline receipt is REDUCED — the heavy per-task output is dropped, replaced by
-    // pi's exact `formatSubagentResultReceipt` wording (result-intercom.ts:334-364): "Delivered
+    // pi's exact `formatSubagentResultReceipt` wording (result-intercom.ts:376-408): "Delivered
     // <mode> subagent results via intercom." + a real "Run: <id>" (never a throwaway) + a child
     // status count line.
     assert!(

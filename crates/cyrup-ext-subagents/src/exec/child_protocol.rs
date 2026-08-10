@@ -315,7 +315,7 @@ enum CompletedValue {
 }
 
 /// The streaming JSON validator behind [`PI_AGGREGATE_EVENT_PROJECTOR`]
-/// (`createPiAggregateProjection`, `child-protocol.ts:30-224`).
+/// (`createPiAggregateProjection`, `child-protocol.ts:266-266`).
 ///
 /// It never materializes the oversized line: it walks it character by character, tracking only the
 /// container stack, the current token, and the two top-level fields the run loop consumes. If the

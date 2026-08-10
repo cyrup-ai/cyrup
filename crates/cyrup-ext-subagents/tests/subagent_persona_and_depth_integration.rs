@@ -1193,7 +1193,7 @@ async fn a_chain_step_with_an_invalid_acceptance_policy_fails_the_step_rather_th
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // A policy that reaches the runner already malformed (the tool boundary refuses these up front,
-    // pi `subagent-executor.ts:1534`; a hand-edited `runner-config.json` does not go through it).
+    // pi `subagent-executor.ts:1757`; a hand-edited `runner-config.json` does not go through it).
     // Fail-closed: the step FAILS with pi's own `validateAcceptanceInput` message rather than
     // silently degrading to "no contract", which would be the very defect SUBA-N04 names.
     let (success, error) =

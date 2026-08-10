@@ -25,7 +25,7 @@
 //!    `success: false` off it unconditionally, so the child reads `failed` despite the clean exit.
 //!
 //! 5. **A stop landing together with a timeout.** The terminal record must be `Stopped`, the
-//!    hardest and least-resumable of the three verbs (`control-channel.ts:653-655`'s drain order
+//!    hardest and least-resumable of the three verbs (`runs/background/control-channel.ts:653-655`'s drain order
 //!    and `subagent-runner.ts:2956`'s mutual-exclusion guard). Both claimed orderings existed in
 //!    the runner with nothing exercising them together.
 //!
@@ -582,7 +582,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 /// G77 — a stop and a timeout landing together must end the run `Stopped`, never `Failed`.
 ///
 /// Upstream fixes this order in two places and cyrup mirrors both: the inbox drain order
-/// (`control-channel.ts:653-655` @v0.43.0 — `consumeStopRequest` → `consumeTimeoutRequest` →
+/// (`runs/background/control-channel.ts:653-655` @v0.43.0 — `consumeStopRequest` → `consumeTimeoutRequest` →
 /// `consumeInterruptRequest`) and `stopRunner`'s mutual-exclusion guard
 /// (`subagent-runner.ts:2956`: `if (stopped || timedOut || interrupted || …) return`). The terminal
 /// record must always be the HARDEST, least-resumable verdict — and a timeout is `Failed`, which

@@ -959,7 +959,7 @@ fn step_elapsed_ms(status: &RunStatus, flat_index: usize) -> i64 {
 }
 
 /// Recompute + embed this run's workflow-graph snapshot (pi's `refreshWorkflowGraph`,
-/// `subagent-runner.ts:1202-1233`) from the current step list + live per-step statuses, so any
+/// `subagent-runner.ts:2180-2381`) from the current step list + live per-step statuses, so any
 /// `status.json` reader always sees a graph consistent with the run's current progress.
 fn refresh_workflow_graph(status: &mut RunStatus, steps: &[RunnerStep]) {
     let graph = super::workflow_graph_from_run(steps, status);
@@ -1033,7 +1033,7 @@ struct ControlFlags {
     timed_out: Arc<std::sync::atomic::AtomicBool>,
     /// G77 — a `control/stop.json` is pending (terminal, non-resumable explicit stop). The THIRD
     /// verb, checked before the other two everywhere the three are drained together, matching pi's
-    /// own inbox order (`control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → then
+    /// own inbox order (`runs/background/control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → then
     /// `consumeTimeoutRequest` → then `consumeInterruptRequest`) and `stopRunner`'s own
     /// `if (stopped || timedOut || interrupted || state !== "running") return` mutual exclusion
     /// (`subagent-runner.ts:2956`).
@@ -1228,7 +1228,7 @@ async fn run_inner(
         include_progress: config.include_progress,
         // SUBA-N03: the run's `share` opt-in and artifact destination/selection, carried from the
         // one-shot config so an async run honours `share`/`artifacts` and leaves the same artifact
-        // quadruple a foreground run does (pi `subagent-runner.ts:879-889,1117-1133` @v0.34.0).
+        // quadruple a foreground run does (pi `subagent-runner.ts:1630-1666,1117-1133` @v0.43.0).
         share: config.share,
         artifacts_dir: config.artifacts_dir.clone(),
         artifact_config: config.artifact_config,
@@ -1281,7 +1281,7 @@ async fn run_inner(
 
     loop {
         // G77 — STOP is checked before BOTH of the others, matching pi's own inbox-drain order
-        // (`control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → `consumeTimeoutRequest` →
+        // (`runs/background/control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → `consumeTimeoutRequest` →
         // `consumeInterruptRequest`) and `stopRunner`'s mutual-exclusion guard
         // (`subagent-runner.ts:2956`: `if (stopped || timedOut || interrupted || …) return`). The
         // order is load-bearing when several land together: a stop outranks a timeout outranks an
@@ -1322,7 +1322,7 @@ async fn run_inner(
         }
 
         // Timeout is checked BEFORE interrupt, matching pi's own inbox-drain order
-        // (`control-channel.ts:608-609` @v0.34.0: `if (consumeTimeoutRequest(...)) onTimeout();`
+        // (`runs/background/control-channel.ts:608-609` @v0.34.0: `if (consumeTimeoutRequest(...)) onTimeout();`
         // then `if (consumeInterruptRequest(...)) onInterrupt();`). The order is load-bearing when
         // both land together — an ancestor that timed out cascades a timeout to this run while a
         // user may simultaneously be interrupting it, and the terminal record must be the harder
@@ -1463,7 +1463,7 @@ async fn run_inner(
         // R-SA-097 root attachment (chain-root-attachment.ts): an `ImportAsyncRoot` step is NOT
         // dispatched by spawning a child — it is synthesized by POLLING another already-launched
         // run's terminal files (mirroring pi's `runSingleStep` short-circuit `if (step.importAsyncRoot)`,
-        // `subagent-runner.ts:688`). Intercept it here, before the `walk_chain` dispatch, so the
+        // `subagent-runner.ts:1153`). Intercept it here, before the `walk_chain` dispatch, so the
         // runner "calls the poll" (`control::wait_for_imported_async_root`) rather than routing it
         // through the `SingleStepExecutor` spawn seam that would (correctly) have no idea how to run
         // it.
@@ -1490,7 +1490,7 @@ async fn run_inner(
                 // are already recorded on ITS own terminal `ResultFile` — `ImportedAsyncRootResult`
                 // deliberately carries only the identity/output fields
                 // `imported_root_to_single_result` reproduces, so there is nothing to re-attribute
-                // here (matching pi's `runSingleStep`, `subagent-runner.ts:695-709`).
+                // here (matching pi's `runSingleStep`, `subagent-runner.ts:1162-1181`).
                 control_events: Vec::new(),
                 // Same reasoning for the per-child detail fields: an imported root's real exit code
                 // is carried on `ImportedAsyncRootResult` and reproduced by
@@ -1622,7 +1622,7 @@ async fn run_inner(
             // loop: only this branch's own consumption removes the file.
             //
             // G77: the STOP inbox is probed before the timeout inbox, for the identical reason and
-            // in pi's identical order (`control-channel.ts:653-655`). All THREE verbs share the one
+            // in pi's identical order (`runs/background/control-channel.ts:653-655`). All THREE verbs share the one
             // cancellation token, so `step_result.interrupted` is equally true for a stop — and
             // returning `Interrupted` here would end an explicitly-stopped run as a resumable
             // `Paused`, which is exactly the bug this gap is about. Falling through without
@@ -1993,7 +1993,7 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
 /// first step. Unlike [`step_result_to_single_result`], the agent/model/attempted-models here come
 /// from the IMPORTED result (the target child's own identity), not the `ImportAsyncRoot` step's
 /// display spec — matching pi's `runSingleStep` returning `imported.agent`/`imported.model`/… rather
-/// than the step's declared values (`subagent-runner.ts:695-709`).
+/// than the step's declared values (`subagent-runner.ts:1162-1181`).
 fn imported_root_to_single_result(
     spec: &crate::spawn::chain_graph::ImportAsyncRootSpec,
     imported: &control::ImportedAsyncRootResult,
@@ -2363,7 +2363,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         // violation directly above makes, and for the same reason: silently running a gate-less
         // child is the defect, not the remedy. The tool boundary
         // (`extension.rs::execute` -> `validate_execution_acceptance`, pi
-        // `subagent-executor.ts:1534`) normally refuses such a policy before any child spawns; this
+        // `subagent-executor.ts:1757`) normally refuses such a policy before any child spawns; this
         // is the last line of defence for a step reaching the runner from a config file that was
         // hand-edited after validation.
         let acceptance = match step.acceptance.as_ref() {
@@ -2417,7 +2417,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         let effective_cwd = step.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
         // File-output handoff wiring (Tier-2): resolve this step's `output` FILE path (relative
         // against the step's effective cwd, absolute used verbatim — pi's `resolveSingleOutputPath`
-        // fallback, `single-output.ts:21-34`) and hand it to `run_sync`, so `exec/output.rs`'s
+        // fallback, `single-output.ts:64-77`) and hand it to `run_sync`, so `exec/output.rs`'s
         // stat-snapshot handoff runs and the saved-output reference message is emitted. Previously
         // hard-`None`, which is exactly why the whole file-output path was dead code.
         let output_path = step.output_path.as_deref().map(|raw| {
@@ -2455,7 +2455,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // from `RunnerConfig::share`; `None` is "omitted", which is NOT enabling.
             share: self.share,
             // SUBA-N03 — this step's own already-resolved session directory (pi's `--session-dir`,
-            // `pi-args.ts:109-111`). Resolved PARENT-side and carried on the step rather than
+            // `runs/shared/pi-args.ts:109-111`). Resolved PARENT-side and carried on the step rather than
             // derived here from a run-level root: see `SingleStepSpec::session_dir`'s
             // [CYRUP-DELTA] note for why an index-derived path would be unsafe at this seam.
             session_dir: step.session_dir.clone(),
@@ -2754,7 +2754,7 @@ fn spawn_control_watcher(
         // [CYRUP-DELTA] pi flushes the pending queue from an explicit per-step
         // `flushPendingStepSteers(flatIndex)` hook at each dispatch site; this task instead
         // re-attempts on the SAME fixed interval pi's own `watchAsyncControlInbox` runs its poll
-        // safety net at (`control-channel.ts:319`). Same guarantee — a held steer lands as soon as
+        // safety net at (`runs/background/control-channel.ts:319`). Same guarantee — a held steer lands as soon as
         // its child starts running — reached through the polling half of R-SA-082 rather than a new
         // hook threaded through three dispatch sites. It also closes a real gap: cyrup's watcher
         // previously had NO interval at all, so it depended entirely on `notify` firing.
@@ -2799,11 +2799,11 @@ fn spawn_control_watcher(
             // `interrupted` on a timeout delivery would tear the live child down under the wrong
             // verdict and end the run `Paused` (resumable) when it must end `Failed`/timed-out.
             //
-            // Timeout is checked first, matching pi's own drain order (`control-channel.ts:608-609`
+            // Timeout is checked first, matching pi's own drain order (`runs/background/control-channel.ts:608-609`
             // @v0.34.0) and this run loop's own top-of-iteration ordering.
             let mut wake = false;
             // G77: stop is probed FIRST, matching pi's fixed drain order
-            // (`control-channel.ts:653-655`) — when a stop and a timeout/interrupt land in the same
+            // (`runs/background/control-channel.ts:653-655`) — when a stop and a timeout/interrupt land in the same
             // tick, the run must end `Stopped`, the hardest and least-resumable of the three.
             if control::check_stop_inbox_now(&run_paths)
                 .await
@@ -4023,7 +4023,7 @@ mod tests {
     /// When a run reaches a terminal state having produced no step results at all, `finish_run`
     /// invents one placeholder [`SingleResult`] so the `ResultFile` is never silently empty. That
     /// placeholder must carry `stopped: true` for a `Stopped` run (pi `runSubagent`'s stopped result
-    /// shape, `subagent-runner.ts:2359-2365`: `stopped: true`, `exitCode: 1`) — it is the ONLY thing
+    /// shape, `subagent-runner.ts:4448-4454`: `stopped: true`, `exitCode: 1`) — it is the ONLY thing
     /// that lets `resolveSubagentResultStatus` classify the child as stopped rather than merely
     /// failed, and therefore the only thing that makes the grouped intercom verdict `stopped`.
     ///
@@ -4275,7 +4275,7 @@ mod tests {
     // ---------------------------------------------------------------------------------------
     // R-SA-097 root attachment: an ImportAsyncRoot step becomes a chain's first step by POLLING
     // another already-completed run — no subprocess spawned, so provable in-module without the
-    // fixture binary (mirrors pi chain-root-attachment.ts / subagent-runner.ts:688).
+    // fixture binary (mirrors pi chain-root-attachment.ts / subagent-runner.ts:1153).
     // ---------------------------------------------------------------------------------------
 
     #[tokio::test]

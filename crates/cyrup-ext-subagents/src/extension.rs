@@ -315,14 +315,14 @@ impl Default for SubagentExecutor {
 }
 
 /// SUBA-041 — the per-call SINGLE-mode override surface pi's `runSinglePath` honors
-/// (`subagent-executor.ts:2788-2791` output/outputMode/skill, `:2962` acceptance, `:2874` share,
+/// (`subagent-executor.ts:3561-3564` output/outputMode/skill, `:2962` acceptance, `:2874` share,
 /// `:3387-3401` artifacts/sessionDir), carried as ONE owned bundle so
 /// [`ForegroundRunRequest`] stays within the field budget and every non-tool caller (the `/run`
 /// slash surface, tests) can keep saying [`Default::default`] for "no overrides at all".
 ///
 /// The values here are the RAW tool params, not resolved paths: pi resolves an `output` string
 /// against `resolveSingleRunOutputBaseDir(deps, artifactsDir, runId)`
-/// (`subagent-executor.ts:2203-2207,2882`), a base directory that only exists once the run id has
+/// (`subagent-executor.ts:2838-2842,2882`), a base directory that only exists once the run id has
 /// been minted and the artifacts dir computed — i.e. inside `run_foreground_impl`, not at the
 /// dispatch site.
 #[derive(Debug, Clone, Default)]
@@ -338,21 +338,21 @@ pub struct SingleRunOverrides {
     /// [`normalize_skill_input`]: `Some(names)` replaces the persona's own `skills:`, `Some(vec![])`
     /// is the explicit `skill: false` "no skills" form, `None` inherits the persona's list.
     pub skills: Option<Vec<String>>,
-    /// pi `params.acceptance` (`AcceptanceOverride`, `schemas.ts:69-76`), already validated and
+    /// pi `params.acceptance` (`AcceptanceOverride`, `schemas.ts:80-93`), already validated and
     /// lowered by [`parse_single_acceptance`]. `None` defers to
     /// [`crate::exec::acceptance::AcceptanceContract::heuristic_default`] (R-SA-023), which is
     /// exactly what pi's `acceptance: "auto"` / omitted means.
     pub acceptance: Option<crate::exec::acceptance::AcceptanceContract>,
     /// pi `params.share` (`subagent-executor.ts:3354` `shareEnabled`).
     pub share: Option<bool>,
-    /// pi `params.sessionDir` (`subagent-executor.ts:3393-3401`), still the RAW string: it is
+    /// pi `params.sessionDir` (`subagent-executor.ts:5044-5052`), still the RAW string: it is
     /// tilde-expanded and `path.resolve`d, then suffixed with pi's own `<runId>/run-0` layout once
     /// the run id exists.
     pub session_dir: Option<String>,
     /// pi `params.artifacts` (`subagent-executor.ts:3387-3390`): `enabled = artifacts !== false`, so
     /// only an explicit `Some(false)` turns the artifact quadruple off.
     pub artifacts: Option<bool>,
-    /// pi `params.control` (`ControlOverrides`, `extension/schemas.ts:201-215,279` @v0.34.0),
+    /// pi `params.control` (`ControlOverrides`, `extension/schemas.ts:242-255,279` @v0.43.0),
     /// already lowered from the wire object by
     /// [`crate::exec::control::parse_control_overrides`]. `None` = the param was omitted, which
     /// defers wholly to the extension-level `subagents.control` block and then to
@@ -365,7 +365,7 @@ pub struct SingleRunOverrides {
     /// documented opt-out. Threaded straight onto [`crate::exec::RunOptions::include_progress`],
     /// where only `Some(true)` populates [`crate::exec::SingleResult::progress`] — pi's own
     /// truthiness gate (`progress: params.includeProgress ? allProgress : undefined`,
-    /// `subagent-executor.ts:3008`).
+    /// `subagent-executor.ts:3819`).
     pub include_progress: Option<bool>,
 }
 
@@ -415,7 +415,7 @@ pub struct BackgroundSingleRequest<'a> {
     pub task: &'a str,
     /// Call-site fork/fresh context; `None` defers to the persona's own `default_context`.
     pub context: Option<ContextMode>,
-    /// Per-call model override; `None` inherits (pi `async-execution.ts:849-855`).
+    /// Per-call model override; `None` inherits (pi `async-execution.ts:1256-1267`).
     pub model_override: Option<ModelId>,
     /// The resolved execution-time agent-discovery scope.
     pub agent_scope: AgentReadScope,
@@ -460,14 +460,14 @@ pub struct BackgroundSingleRequest<'a> {
     ///
     /// Upstream does exactly this on its async SINGLE path: `executeAsyncSingle` receives
     /// `output: effectiveOutput` + `outputBaseDir: resolveSingleRunOutputBaseDir(deps, artifactsDir,
-    /// id)` (`runs/foreground/subagent-executor.ts:2857-2859` @v0.34.0) and resolves the same
+    /// id)` (`runs/foreground/subagent-executor.ts:3633-3636` @v0.43.0) and resolves the same
     /// `normalizeSingleOutputOverride`/`resolveSingleOutputPath` pair at
     /// `runs/background/async-execution.ts:905-907`.
     pub output: Option<serde_json::Value>,
     /// SUBA-N03: pi `params.outputMode` (`extension/schemas.ts:50-53`) — `"inline"` (pi's default)
     /// or `"file-only"`. Lands on
     /// [`crate::spawn::chain_graph::SingleStepSpec::output_mode`]. Upstream:
-    /// `outputMode: effectiveOutputMode` (`subagent-executor.ts:2860`), consumed at
+    /// `outputMode: effectiveOutputMode` (`subagent-executor.ts:3637`), consumed at
     /// `async-execution.ts:908-910` where it also drives `validateFileOnlyOutputMode`.
     pub output_mode: Option<String>,
     /// SUBA-N03: pi `params.skill` (`SkillOverride`, `extension/schemas.ts:33-40`), already
@@ -483,7 +483,7 @@ pub struct BackgroundSingleRequest<'a> {
     /// [`crate::exec::RunOptions::share`]. Upstream: `shareEnabled` →
     /// `spawnRunner({ share: shareEnabled })` (`async-execution.ts:965`).
     pub share: Option<bool>,
-    /// SUBA-N03: pi `params.sessionDir` (`subagent-executor.ts:3393-3401`), still the RAW string.
+    /// SUBA-N03: pi `params.sessionDir` (`subagent-executor.ts:5044-5052`), still the RAW string.
     /// `spawn_background` resolves it through the SAME
     /// [`resolve_single_run_session_root`] the foreground path uses and lands
     /// `<root>/run-0` on [`crate::spawn::chain_graph::SingleStepSpec::session_dir`]. Upstream:
@@ -559,7 +559,7 @@ pub struct BackgroundStepsSpec {
     /// SUBA-N03: the run's identity, MINTED BY THE CALLER rather than by `spawn_background_steps`.
     ///
     /// Hoisted for exactly the reason pi hoists its own (`const id = randomUUID();` at
-    /// `subagent-executor.ts:2834`, used at `:2861` to build `outputBaseDir` and only then handed
+    /// `subagent-executor.ts:3607`, used at `:2861` to build `outputBaseDir` and only then handed
     /// to `executeAsyncSingle(id, …)`): the run-scoped SINGLE-mode output base directory is
     /// `<artifactsDir>/outputs/<runId>`, so a caller that must resolve `params.output` against it
     /// needs the id BEFORE the spawn call, not after.
@@ -684,7 +684,7 @@ impl SubagentExecutor {
     /// EVERY route into execution charges here, so the budget cannot be walked around by picking a
     /// different surface — upstream gets that property structurally (every slash handler funnels
     /// back through `executor.execute`, `slash/slash-commands.ts` `runSlashSubagent` ->
-    /// `requestSlashRun` -> `extension/index.ts:396-401` -> `executeSubagentCollapsed`), this crate
+    /// `requestSlashRun` -> `extension/index.ts:512-517` -> `executeSubagentCollapsed`), this crate
     /// gets it by charging at each independent entry point exactly once:
     ///
     /// * the `subagent` TOOL — [`SubagentTool::execute`], after the dispatch guard and the
@@ -831,7 +831,7 @@ impl SubagentExecutor {
     }
 
     /// The live PARENT session's current model as a `provider/id` [`ModelId`] — pi's `ctx.model`
-    /// (`pi-subagents/src/runs/shared/model-fallback.ts:47-59`), the model an inheriting subagent
+    /// (`pi-subagents/src/runs/shared/model-fallback.ts:196-220`), the model an inheriting subagent
     /// (a persona with no `model:` of its own, run with no per-call override) resolves to. Read off
     /// the bound P-1 [`cyrup_ext::host::HostServices`] backend
     /// ([`cyrup_ext::host::HostServices::current_model`], returned by `LiveHostServices` as
@@ -874,9 +874,9 @@ impl SubagentExecutor {
         Arc::new(crate::tui::notices::LoggingControlNoticeSink)
     }
 
-    /// pi `createForegroundControlNotifier` (`subagent-executor.ts:1222-1229`) +
+    /// pi `createForegroundControlNotifier` (`subagent-executor.ts:1582-1611`) +
     /// `emitControlNotification` (`:505-535`) + the `SUBAGENT_CONTROL_EVENT` listener it feeds
-    /// (`extension/index.ts:549-556` → `handleSubagentControlNotice`), collapsed into the one
+    /// (`extension/index.ts:637-661` → `handleSubagentControlNotice`), collapsed into the one
     /// callback [`crate::exec::RunOptions::on_control_event`] takes, plus the ORDERED hand-off that
     /// callback needs in a multi-threaded runtime (see "Ordering", below). All line numbers are
     /// `@v0.34.0`.
@@ -891,14 +891,14 @@ impl SubagentExecutor {
     ///    (`:512-513`): `intercomBridge.active ? resolveSubagentIntercomTarget(event.runId,
     ///    event.agent, event.index) : undefined`. It is not decoration — it renders the
     ///    "Direct intercom target: …" line of the notice body AND is the leading component of the
-    ///    dedup key (`controlNotificationKey`, `shared/subagent-control.ts:141-144`).
+    ///    dedup key (`controlNotificationKey`, `shared/subagent-control.ts:142-145`).
     /// 3. `shouldNotifyControlEvent` (already applied one layer down —
     ///    [`crate::exec::control::ControlMonitor::emit_control_event`] gates on it before this sink
     ///    is ever called) and then the `notifyChannels.includes("event")` CHANNEL gate (`:521`). A
     ///    config whose channels exclude `event` still raises the event onto
     ///    [`crate::exec::SingleResult::control_events`], it just delivers no transcript notice.
     /// 4. `handleSubagentControlNotice`'s own first line: `active_long_running` is NEVER surfaced
-    ///    as a transcript notice (`control-notices.ts:74`) — it is informational telemetry only.
+    ///    as a transcript notice (`control-notices.ts:50`) — it is informational telemetry only.
     /// 5. Hand the notice to [`crate::tui::notices::ControlNoticeState`], which owns the debounce,
     ///    the at-fire-time actionability re-check and the at-most-once dedup.
     ///
@@ -1042,7 +1042,7 @@ impl SubagentExecutor {
                 return;
             }
             // (4) pi `handleSubagentControlNotice`'s `active_long_running` early return
-            // (`control-notices.ts:74`).
+            // (`control-notices.ts:50`).
             if event.event_type == crate::registration::ControlEventType::ActiveLongRunning {
                 return;
             }
@@ -1483,7 +1483,7 @@ impl SubagentExecutor {
                 task,
                 // pi's slash-command surfaces (`/run`, `/chain`, `/parallel`, `/run-chain`)
                 // explicitly set `agentScope: "both"` on every dispatch they build
-                // (`slash-commands.ts:997,1015,1045,1069`) — this flat entry point has no caller
+                // (`slash-commands.ts:675,1015,1045,1069`) — this flat entry point has no caller
                 // that ever narrows the scope, so `Both` here is not a default guess but pi's own
                 // explicit, always-supplied value for this exact call shape.
                 agent_scope: AgentReadScope::Both,
@@ -1500,7 +1500,7 @@ impl SubagentExecutor {
 
     /// C19 (live foreground progress): the same foreground single run as [`run_foreground`], but
     /// STREAMING live progress through the host [`ToolUpdateSink`] as the child's NDJSON stdout
-    /// arrives — the crate-side of pi's `onUpdate`/`fireUpdate` (`runs/foreground/execution.ts:478-499`).
+    /// arrives — the crate-side of pi's `onUpdate`/`fireUpdate` (`runs/foreground/execution.ts:805-826`).
     /// The tool call still blocks and still returns the same terminal [`SingleResult`]; the
     /// difference is that a still-running child no longer surfaces zero progress until completion.
     /// Each `tool_execution_start`/`tool_execution_end`/assistant `message_end` folds into a
@@ -1585,8 +1585,9 @@ impl SubagentExecutor {
         if let Some(model) = &model_override {
             available_models.push(model.clone());
         }
-        // Session-model inheritance (pi `resolveSubagentModelOverride((params.model) ?? a.model,
-        // ctx.model, …)`, `subagent-executor.ts:1684`): when this run has NEITHER a per-call `model`
+        // Session-model inheritance (pi `resolveEffectiveSubagentModel(params.model, agentConfig.model,
+        // parentModel, …)`, `subagent-executor.ts:3553-3560` @v0.43.0; `parentModel` is `ctx.model`
+        // captured at `:4344-4345`): when this run has NEITHER a per-call `model`
         // override NOR a persona `model:` of its own, inherit the live PARENT session model
         // (`HostServices::current_model`) as the primary candidate — otherwise an inheriting persona
         // has an EMPTY ladder and the run hard-fails with "no candidate model available"
@@ -1610,7 +1611,7 @@ impl SubagentExecutor {
         )
         .map_err(|violation| SubagentError::ModelOutOfScope(violation.message))?;
 
-        // R-SA-035 / pi `resolveAttemptTimeout` (`execution.ts:91-99`): the orchestrator computes
+        // R-SA-035 / pi `resolveAttemptTimeout` (`execution.ts:173-181`): the orchestrator computes
         // the wall-clock `deadline_at` ONCE, here, from the nominal `timeout_ms` budget (pi
         // `deadlineAt ?? now + timeoutMs`), and threads BOTH down — `deadline_at` is what `run_sync`
         // races the child against; `timeout_ms` is what the timed-out message renders.
@@ -1647,13 +1648,13 @@ impl SubagentExecutor {
         };
         let art_dir = crate::artifacts::temp_artifacts_dir(cwd);
 
-        // SUBA-041 / pi `resolveSingleRunOutputBaseDir` (`subagent-executor.ts:2203-2207`): the
+        // SUBA-041 / pi `resolveSingleRunOutputBaseDir` (`subagent-executor.ts:2838-2842`): the
         // configured `singleRunOutputBaseDir` (tilde-expanded, `path.resolve`d) wins, else
         // `<artifactsDir>/outputs/<runId>`. This is the base a RELATIVE `output` resolves against —
         // deliberately NOT the run cwd, so a bare `report.md` never lands in the user's repo.
         let output_base_dir =
             resolve_single_run_output_base_dir(&cfg, &art_dir, &run_id);
-        // pi `runSinglePath` (`subagent-executor.ts:2789-2791,2882`): the persona's own `output:` is
+        // pi `runSinglePath` (`subagent-executor.ts:3562-3564,2882`): the persona's own `output:` is
         // the fallback for an omitted param and the referent of `output: true`; `outputMode` defaults
         // to `inline` from the PARAM alone (pi never consults the persona's own mode here).
         let output_path = resolve_single_output_path(
@@ -1671,7 +1672,7 @@ impl SubagentExecutor {
         let output_mode = parse_tool_output_mode(overrides.output_mode.as_deref())
             .unwrap_or(crate::discovery::types::OutputMode::Inline);
 
-        // SUBA-041 / pi `subagent-executor.ts:3393-3401`: an explicit `sessionDir` is tilde-expanded
+        // SUBA-041 / pi `subagent-executor.ts:5044-5052`: an explicit `sessionDir` is tilde-expanded
         // and `path.resolve`d and becomes the session ROOT verbatim; a configured
         // `default_session_dir` is instead scoped per run (`path.join(base, runId)`); the child's own
         // directory is then `<root>/run-0` (pi's `sessionDirForIndex(0)`).
@@ -1681,7 +1682,7 @@ impl SubagentExecutor {
         // (no parent-session-file plumbing reaches the extension), so with neither an explicit
         // `sessionDir` nor a configured default this stays `None` and
         // [`crate::exec::build_attempt_spawn_plan`] falls to pi's own `--no-session` branch
-        // (`pi-args.ts:105-106`). The isolation outcome is the same one pi's scoped root buys: the
+        // (`runs/shared/pi-args.ts:105-106`). The isolation outcome is the same one pi's scoped root buys: the
         // child never writes into the orchestrator's session store.
         let session_dir =
             resolve_single_run_session_root(&cfg, overrides.session_dir.as_deref(), &run_id)
@@ -1720,7 +1721,7 @@ impl SubagentExecutor {
             skills: overrides.skills,
             runtime_cwd: None,
             // pi `progress: params.includeProgress ? allProgress : undefined`
-            // (`subagent-executor.ts:3008` @v0.34.0). `run_sync` assembles the snapshot; this is
+            // (`subagent-executor.ts:3819` @v0.43.0). `run_sync` assembles the snapshot; this is
             // the only place the caller's flag reaches it on the foreground path.
             include_progress: overrides.include_progress,
             agent_scope: None,
@@ -1746,7 +1747,7 @@ impl SubagentExecutor {
                 run_id: run_id.clone(),
                 step_index: None,
             }),
-            // Intercom child-bridge activation (pi `pi-args.ts:201-214` via
+            // Intercom child-bridge activation (pi `runs/shared/pi-args.ts:201-214` via
             // `data.intercomBridge.orchestratorTarget`): thread THIS orchestrator's own presence
             // target + this run's id + child index 0 so the spawned child registers
             // `contact_supervisor` (addressed here) + a broker presence under
@@ -1815,7 +1816,7 @@ impl SubagentExecutor {
         // T6 artifact quadruple (pi `runs/foreground/execution.ts:960-1074`): record this run's input
         // BEFORE spawning (so it survives a child crash), then its output/metadata/event-stream AFTER
         // the run settles. Written into the scoped-temp artifacts root for `cwd` (the Rust analog of
-        // pi's `tempArtifactsDir = getArtifactsDir(null)`, `extension/index.ts:263`). Best-effort: a
+        // pi's `tempArtifactsDir = getArtifactsDir(null)`, `extension/index.ts:340`). Best-effort: a
         // failed artifact write never alters the `SingleResult` the caller observes. (`run_id`,
         // `art_cfg` and `art_dir` were all resolved above — `art_cfg.enabled` already honors
         // SUBA-041's `artifacts: false`, and `art_dir` doubles as the relative-output base root.)
@@ -1880,7 +1881,7 @@ impl SubagentExecutor {
         // child NDJSON stream — pi only cleans the *transient* per-spawn prompt/task-overflow dir it
         // creates under `os.tmpdir()` (`pi-subagents/src/runs/shared/pi-args.ts:143-158` build it,
         // `:233-236` `cleanupTempDir` removes it, invoked from
-        // `pi-subagents/src/runs/foreground/execution.ts:677`), a dir that lives OUTSIDE the working
+        // `pi-subagents/src/runs/foreground/execution.ts:1109`), a dir that lives OUTSIDE the working
         // tree and never holds the event stream. An earlier revision erroneously `remove_dir_all`'d
         // the whole `.cyrup-subagent-scratch` dir here, which silently discarded that tee the moment a
         // foreground `/run` completed — defeating the tee's own stated purpose and diverging from
@@ -1961,7 +1962,7 @@ impl SubagentExecutor {
         // SUBA-N03 — the run id is minted HERE, not inside `spawn_background_steps`, because the
         // SINGLE-mode output base directory is run-scoped (`<artifactsDir>/outputs/<runId>`) and a
         // relative `output` must resolve against it BEFORE the spawn call. pi hoists it for exactly
-        // this reason: `const id = randomUUID()` (`subagent-executor.ts:2834` @v0.34.0) feeds
+        // this reason: `const id = randomUUID()` (`subagent-executor.ts:3607` @v0.43.0) feeds
         // `resolveSingleRunOutputBaseDir(deps, artifactsDir, id)` at `:2861` and only then reaches
         // `executeAsyncSingle(id, …)`. `RunId::new` is 128 bits of fresh entropy per call and
         // `spawn_background_steps` `mkdir`s the run dir before writing anything into it, so two
@@ -2007,7 +2008,7 @@ impl SubagentExecutor {
         let effective_output_mode = parse_tool_output_mode(output_mode.as_deref())
             .unwrap_or(crate::discovery::types::OutputMode::Inline);
         // pi `validateFileOnlyOutputMode(outputMode, outputPath, \`Async single run (${agent})\`)`
-        // (`async-execution.ts:909-910`, via `single-output.ts:85-90`): `file-only` with no
+        // (`async-execution.ts:909-910`, via `single-output.ts:140-145`): `file-only` with no
         // resolvable output path is refused BEFORE any spawn, and on the async path it is refused
         // HERE — the detached runner's own R-SA-025 `validate_file_only_requires_path` would
         // otherwise only surface it as a hop-2 step failure the caller never sees synchronously.
@@ -2031,7 +2032,7 @@ impl SubagentExecutor {
             agent: agent_name.to_string(),
             task: task.to_string(),
             cwd: None,
-            // pi `executeAsyncSingle` (`async-execution.ts:849-855`): `params.modelOverride ??
+            // pi `executeAsyncSingle` (`async-execution.ts:1256-1267`): `params.modelOverride ??
             // agent.model` reaches the detached runner's step unconditionally — a per-call
             // `model:` override on an async SINGLE run is never dropped just because the run is
             // background rather than foreground.
@@ -2091,7 +2092,7 @@ impl SubagentExecutor {
                 // SUBA-N03: the id this call already resolved paths against.
                 run_id,
                 // SUBA-N03: `timeoutMs`/`maxRuntimeMs` (pi `timeoutMs: data.timeoutMs`,
-                // `subagent-executor.ts:2871`). `spawn_background_steps` stamps the absolute
+                // `subagent-executor.ts:3653`). `spawn_background_steps` stamps the absolute
                 // `deadline_at_ms` from it at spawn time.
                 timeout_ms,
                 // SUBA-N03: `share` (pi `share: shareEnabled`, `async-execution.ts:965`).
@@ -2162,7 +2163,7 @@ impl SubagentExecutor {
 
         // SUBA-N03: the run id is the CALLER'S (`BackgroundStepsSpec::run_id`), never minted here.
         // pi hoists it the same way and for the same reason — `const id = randomUUID()` at
-        // `subagent-executor.ts:2834` feeds `resolveSingleRunOutputBaseDir(deps, artifactsDir, id)`
+        // `subagent-executor.ts:3607` feeds `resolveSingleRunOutputBaseDir(deps, artifactsDir, id)`
         // at `:2861` BEFORE `executeAsyncSingle(id, …)` is called — so a caller that must resolve a
         // run-scoped output path can do so against the very id this run will be keyed by.
         //
@@ -2173,7 +2174,7 @@ impl SubagentExecutor {
         // millisecond the hop-1 spawn and hop-2 startup consumed.
         let deadline_at_ms = timeout_ms.map(|ms| crate::background::now_epoch_ms().saturating_add(ms));
 
-        // pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:585-589,826-830`): a
+        // pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:926-930,826-830`): a
         // background run started from WITHIN an already-nested run (this process inherited a nested
         // route via its own env, set by ITS OWN parent's spawn) reroutes its storage under that same
         // root's `nested-subagent-runs`/`nested` subtree, rather than becoming an indistinguishable
@@ -2303,7 +2304,7 @@ impl SubagentExecutor {
             &run_paths.runner_stderr_log,
         )?;
 
-        // pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:717-750,935-967`): once
+        // pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:1083-1125,935-967`): once
         // hop 1's pid is CONFIRMED (never before — an unconfirmed spawn must not appear in the root's
         // nested registry at all), relay a `subagent.nested.started` event into the inherited route's
         // sink so the grandparent's `project_nested_events` projection can see this run without ever
@@ -2602,7 +2603,7 @@ impl SubagentExecutor {
         include_progress: Option<bool>,
         // pi `params.chainDir` — the caller's explicit chain artifact directory, honoured verbatim
         // when given and otherwise defaulted below: `chainDir: params.chainDir ??
-        // getProjectChainRunsDir(effectiveCwd)` (`subagent-executor.ts:2022` @v0.34.0). That line
+        // getProjectChainRunsDir(effectiveCwd)` (`subagent-executor.ts:2623` @v0.43.0). That line
         // lives in `runChainPath`, so this is CHAIN-mode-only upstream and every other caller here
         // passes `None` — `route_parallel_mode`, the slash surface (which exposes no `chainDir`
         // param at all), and the tests.
@@ -2625,7 +2626,7 @@ impl SubagentExecutor {
             });
         }
 
-        // R-SA-053 (pi `chain-execution.ts:499-510`): validate EVERY chain's output bindings
+        // R-SA-053 (pi `chain-execution.ts:584-596`): validate EVERY chain's output bindings
         // (duplicate `as` names, malformed/unknown `{outputs.x}` references, dynamic-fanout `expand`
         // source) up front, before persona resolution, chain-dir creation, or ANY step is dispatched
         // — a tool `chain[]`/slash `/chain`//`/run-chain` graph gets the SAME upfront check a saved
@@ -2656,7 +2657,7 @@ impl SubagentExecutor {
         // the receipt would otherwise find nothing. See [`GraphRunOutcome::Foreground::run_id`].
         let foreground_run_id = RunId::new();
         // pi `chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd)`
-        // (`subagent-executor.ts:2022` @v0.34.0): an explicit caller value WINS and is used exactly
+        // (`subagent-executor.ts:2623` @v0.43.0): an explicit caller value WINS and is used exactly
         // as given — pi does not rewrite it either, and `chain-execution.ts:283` is what resolves a
         // step's relative `output` against it. The `unwrap_or_else` fallback keeps cyrup's existing
         // per-run subdirectory ([CYRUP-DELTA] vs pi's flat project chain-runs dir), which the block
@@ -2882,7 +2883,7 @@ impl SubagentExecutor {
         .dir()
     }
 
-    /// `/subagent-cost` (R-SA-140; pi `buildSubagentCostReport`, slash-commands.ts:289-328): walk
+    /// `/subagent-cost` (R-SA-140; pi `buildSubagentCostReport`, slash-commands.ts:377-416): walk
     /// this session's TRANSCRIPT (not a background status file) and report the parent's own
     /// assistant-message usage plus a per-child breakdown of every subagent `toolResult` recorded in
     /// the branch — so foreground subagent usage (which never mints a background run) is visible.
@@ -2921,8 +2922,8 @@ impl SubagentExecutor {
         }
     }
 
-    /// `/subagents-models` (pi `handleModels`, agent-management.ts:580-647; slash dispatch
-    /// slash-commands.ts:1090-1111): report the RUNTIME builtin-agent -> model mapping — each
+    /// `/subagents-models` (pi `handleModels`, agent-management.ts:802-869; slash dispatch
+    /// slash-commands.ts:802-823): report the RUNTIME builtin-agent -> model mapping — each
     /// discovered builtin persona's effective model + the provenance of that model — NOT a dump of
     /// the full static provider catalog. `requested_agent` filters to a single builtin (pi's
     /// single-agent form), erroring with the available-builtins list when the name is not a
@@ -2943,9 +2944,9 @@ impl SubagentExecutor {
         // to "(unavailable)" exactly as before this seam existed.
         let current_model = self.inherited_session_model().map(|m| m.as_str().to_string());
         let current_model = current_model.as_deref();
-        // pi `ctx.model?.provider` (agent-management.ts:588) / the `ParentModel` a `model: undefined`
+        // pi `ctx.model?.provider` (agent-management.ts:810) / the `ParentModel` a `model: undefined`
         // (or the `"inherit"` sentinel) resolves to (`resolveSubagentModelOverride`,
-        // model-fallback.ts:47-59): both split off the SAME live `provider/id` string.
+        // model-fallback.ts:196-220): both split off the SAME live `provider/id` string.
         let preferred_provider = current_model
             .and_then(|m| m.split_once('/'))
             .map(|(provider, _)| provider);
@@ -2971,7 +2972,7 @@ impl SubagentExecutor {
             .map(|agent| (agent.name.as_str(), agent))
             .collect();
 
-        // pi `params.agent?.trim()` (agent-management.ts:581): a whitespace-only/empty `agent`
+        // pi `params.agent?.trim()` (agent-management.ts:803): a whitespace-only/empty `agent`
         // string is JS-falsy and treated as "no agent requested" — it falls through to the
         // all-agents view below, it is NOT looked up as a builtin named "".
         let requested_agent = requested_agent.map(str::trim).filter(|s| !s.is_empty());
@@ -3787,7 +3788,7 @@ impl SubagentExecutor {
                 // pi's `deliverSubagentIntercomMessageEvent` bounds EVERY caller (including this
                 // live-child follow-up steer, `subagent-executor.ts:860`) to a 500ms default timeout
                 // race — the caller's own turn is never blocked longer than that waiting on a
-                // delivery ack (`result-intercom.ts:283-316`). Race the raw `SteerChannel::steer`
+                // delivery ack (`result-intercom.ts:325-358`). Race the raw `SteerChannel::steer`
                 // call against that same bound rather than awaiting it unbounded.
                 let delivered = match &child_target {
                     Some(target) => {
@@ -3961,7 +3962,7 @@ impl SubagentExecutor {
         ))
     }
 
-    /// pi `buildRevivedAsyncTask` (`background/async-resume.ts:378-391`): the revival framing wrapped
+    /// pi `buildRevivedAsyncTask` (`background/async-resume.ts:526-539`): the revival framing wrapped
     /// AROUND the orchestrator's raw follow-up, rather than sending the follow-up verbatim as the
     /// revived child's `{task}` — the revived agent otherwise has no way to know it is being resumed
     /// from a stored transcript rather than starting fresh.
@@ -4185,7 +4186,7 @@ impl SubagentExecutor {
         }
     }
 
-    /// G98 / pi `applySingleAgentLaunchDefaults` (`subagent-executor.ts:1585-1602` @v0.35.0):
+    /// G98 / pi `applySingleAgentLaunchDefaults` (`subagent-executor.ts:1930-1947` @v0.43.0):
     /// resolve the named agent's OWN launch defaults so a SINGLE-agent launch can inherit them.
     ///
     /// **Why this lives on the executor rather than in `route_single`.** Upstream calls
@@ -4408,7 +4409,7 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// pi `expandTilde` (`extension/index.ts:86-88`): a leading `~/` expands against the user's home
+/// pi `expandTilde` (`extension/index.ts:233-234`): a leading `~/` expands against the user's home
 /// directory; any other value (including a bare `~` with no trailing slash) passes through
 /// unchanged.
 fn expand_tilde(value: &str) -> PathBuf {
@@ -4493,7 +4494,7 @@ fn write_foreground_output_artifacts(
 
 /// Drive one foreground [`crate::exec::run_sync`], optionally streaming live progress through
 /// `on_update` (C19 — the crate-side of pi's `onUpdate`/`fireUpdate`,
-/// `runs/foreground/execution.ts:478-499`). When `on_update` is `None` this is a plain awaited
+/// `runs/foreground/execution.ts:805-826`). When `on_update` is `None` this is a plain awaited
 /// `run_sync` — the original, silent-until-completion behavior; every non-streaming caller (the
 /// `/run` slash command, tests) is unchanged.
 ///
@@ -4819,7 +4820,10 @@ const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently supports li
      child sessions only; use action='interrupt' or action='resume' for foreground runs.";
 
 /// The fanout-child's restricted tool description — pi's exact 3-line text
-/// (`fanout-child.ts:159-163`, joined with `\n`): tells the model up front which management/control
+/// (`fanout-child.ts:159-163` @v0.34.0, joined with `\n`). VERSION LAG: at v0.43.0 that block is
+/// `fanout-child.ts:177-181` and its third line reads "Mutating management actions (create, update,
+/// delete, eject, disable, enable, reset, grant-spawn-budget) are blocked in this mode." — an eighth
+/// verb, `grant-spawn-budget`, that this constant does not yet carry. It tells the model up front which management/control
 /// actions remain available and which mutation actions are blocked in this mode, rather than only
 /// discovering the block via a runtime [`ToolError`] from [`SubagentTool::route_management_action`].
 /// SUBA-005 updated the blocked list to pi's own seven-name parenthesized form
@@ -4837,7 +4841,7 @@ const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently supports li
 const CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate to subagents from child-safe fanout mode.\nAllowed management/control actions: list, get, status, interrupt, stop, resume, steer, append-step, doctor.\nAgent config mutation actions (create, update, delete, eject, disable, enable, reset) are blocked in this mode.";
 
 /// The `subagent` tool's full discriminated-union parameter surface (R-SA-128, C8) — the Rust parse
-/// target for pi's `SubagentParamsSchema` (`src/extension/schemas.ts:195-265`). Every top-level pi
+/// target for pi's `SubagentParamsSchema` (`src/extension/schemas.ts:257-357`). Every top-level pi
 /// field is represented so the tool can drive SINGLE (`agent`/`task`), PARALLEL (`tasks`/
 /// `concurrency`/`worktree`), CHAIN (`chain`), management (`action` ∈ list/get/models/create/update/
 /// delete), control (`action` ∈ status/interrupt/resume/append-step), and diagnostics (`action:
@@ -4894,7 +4898,7 @@ struct SubagentToolParams {
     acceptance: Option<serde_json::Value>,
 }
 
-/// pi `resolveForegroundTimeout` (`subagent-executor.ts:1327-1341`): `timeoutMs` and `maxRuntimeMs`
+/// pi `resolveForegroundTimeout` (`subagent-executor.ts:1951-1968`): `timeoutMs` and `maxRuntimeMs`
 /// are ALIASES for one foreground timeout budget. Returns the single effective value (or `None` when
 /// neither is supplied), or an `Err` message when a value is non-positive or the two aliases were
 /// both supplied with DIFFERENT values. (A negative/fractional value could never have deserialized
@@ -4932,7 +4936,7 @@ fn resolve_execution_agent_scope(raw: Option<&str>) -> AgentReadScope {
     }
 }
 
-/// pi `formatFailedSingleRunOutput` (`subagent-executor.ts:1041-1052`): the delivered content for a
+/// pi `formatFailedSingleRunOutput` (`subagent-executor.ts:1569-1580`): the delivered content for a
 /// FAILED single run — the error text (`result.error` or `"Failed"`), followed, ONLY when the run
 /// produced distinct output, by an `Output:` block carrying that output. This is what
 /// [`SubagentTool::route_single`] hands to `ToolError` (cyrup's error channel; pi's `isError: true`),
@@ -4981,7 +4985,7 @@ impl SubagentToolParams {
     /// "omitted" case: `Some(Fork)`/`Some(Fresh)` for an explicit value, `None` when the caller left
     /// `context` off entirely. An omitted (`None`) value is what lets each requested agent fall back
     /// to ITS OWN persona `default_context` downstream (pi `resolveAgentDefaultContextPolicy`,
-    /// `subagent-executor.ts:1280-1293`) rather than being forced to `Fresh` — the collapse-to-`Fresh`
+    /// `subagent-executor.ts:1875-1891`) rather than being forced to `Fresh` — the collapse-to-`Fresh`
     /// that the pre-Tier-2 `context_mode` did. Any non-`"fork"` explicit string still resolves to
     /// `Some(Fresh)` (pi treats only the literal `"fork"` as fork).
     fn context_override(&self) -> Option<ContextMode> {
@@ -5049,7 +5053,7 @@ impl SubagentToolParams {
 
 /// One parsed `tasks[]` element (top-level PARALLEL) or `parallel[]` element (a static parallel
 /// group inside a `chain[]` step) — the union of pi's `TaskItem` (`schemas.ts:78-90`) and
-/// `ParallelTaskSchema` (`schemas.ts:93-109`).
+/// `ParallelTaskSchema` (`schemas.ts:133-152`).
 ///
 /// Fields with a [`SingleStepSpec`] home reach the child today: `agent`/`task`/`cwd`/`model`/
 /// `as`(named output)/`outputMode`/`reads`/`acceptance`/`outputSchema`, plus `count` (a fan-out
@@ -5144,7 +5148,7 @@ fn parse_tool_task_items(
     Ok(items)
 }
 
-/// pi `expandTopLevelTaskCounts` (`subagent-executor.ts:1343-1357`): repeat each task `count` times
+/// pi `expandTopLevelTaskCounts` (`subagent-executor.ts:1986-2000`): repeat each task `count` times
 /// (default 1), erroring on `count < 1` with pi's exact message. `count` is stripped from each
 /// expanded clone (it is a width hint, never carried onto the concrete task).
 fn expand_top_level_task_counts(items: Vec<ToolTaskItem>) -> Result<Vec<ToolTaskItem>, String> {
@@ -5163,7 +5167,7 @@ fn expand_top_level_task_counts(items: Vec<ToolTaskItem>) -> Result<Vec<ToolTask
     Ok(out)
 }
 
-/// pi `expandChainParallelCounts` (`subagent-executor.ts:1359-1382`): the same per-task `count`
+/// pi `expandChainParallelCounts` (`subagent-executor.ts:2002-2025`): the same per-task `count`
 /// fan-out applied to a static parallel group inside a `chain[]` step, with pi's exact per-step
 /// error message.
 fn expand_chain_parallel_counts(
@@ -5252,7 +5256,7 @@ fn tool_task_to_spec(item: &ToolTaskItem) -> SingleStepSpec {
     }
 }
 
-/// pi `resolveSingleRunOutputBaseDir` (`runs/foreground/subagent-executor.ts:2203-2207` @v0.34.0):
+/// pi `resolveSingleRunOutputBaseDir` (`runs/foreground/subagent-executor.ts:2838-2842` @v0.43.0):
 /// the base directory a RELATIVE SINGLE-mode `output` path resolves against — the configured
 /// `singleRunOutputBaseDir` (tilde-expanded, `path.resolve`d) when set, else
 /// `<artifactsDir>/outputs/<runId>`.
@@ -5278,7 +5282,7 @@ fn resolve_single_run_output_base_dir(
     }
 }
 
-/// pi's SINGLE-mode session-ROOT resolution (`runs/foreground/subagent-executor.ts:3393-3401`
+/// pi's SINGLE-mode session-ROOT resolution (`runs/foreground/subagent-executor.ts:5044-5052`
 /// @v0.34.0): an explicit `sessionDir` param is tilde-expanded and `path.resolve`d and becomes the
 /// root VERBATIM; a configured `default_session_dir` is instead scoped per run
 /// (`path.join(base, runId)`) so two runs sharing one configured base cannot share a session store.
@@ -5364,14 +5368,14 @@ fn parse_tool_acceptance(raw: Option<&serde_json::Value>) -> Option<serde_json::
 // SUBA-041: the SINGLE-mode override normalizers (`output`/`outputMode`/`skill`/`acceptance`).
 //
 // pi's `runSinglePath` runs each raw tool param through one small shared normalizer before it ever
-// reaches `runSync` (`single-output.ts:11-34`, `skills.ts:684-708`, `acceptance.ts:138-249`); these
+// reaches `runSync` (`single-output.ts:54-77`, `skills.ts:716-740`, `acceptance.ts:176-303`); these
 // are those normalizers, ported 1:1 so the top-level SINGLE surface and the `tasks[]`/`chain[]` item
 // surface agree on what a given value means.
 // -------------------------------------------------------------------------------------------------
 
-/// pi `normalizeSingleOutputOverride` (`runs/shared/single-output.ts:11-19`) composed with
+/// pi `normalizeSingleOutputOverride` (`runs/shared/single-output.ts:54-62`) composed with
 /// `runSinglePath`'s own `rawOutput = params.output !== undefined ? params.output :
-/// agentConfig.output` (`subagent-executor.ts:2789`).
+/// agentConfig.output` (`subagent-executor.ts:3562`).
 ///
 /// Returns the effective output FILE name/path, or `None` for every "no output file" form: an
 /// explicit `false`/`"false"`, an empty string, a non-string/non-boolean value, and — for
@@ -5401,8 +5405,8 @@ fn normalize_single_output_override(
     }
 }
 
-/// pi `resolveSingleOutputPath` (`runs/shared/single-output.ts:21-34`), specialized to the one call
-/// shape `runSinglePath` uses (`subagent-executor.ts:2882`): a `relativeBaseDir` is ALWAYS supplied
+/// pi `resolveSingleOutputPath` (`runs/shared/single-output.ts:64-77`), specialized to the one call
+/// shape `runSinglePath` uses (`subagent-executor.ts:3666`): a `relativeBaseDir` is ALWAYS supplied
 /// there — `resolveSingleRunOutputBaseDir`'s configured `singleRunOutputBaseDir` or
 /// `<artifactsDir>/outputs/<runId>` (`:2203-2207`) — so the runtime-cwd / requested-cwd fallback
 /// rungs of the upstream function are unreachable on this path and are not reproduced. An ABSOLUTE
@@ -5417,9 +5421,9 @@ fn resolve_single_output_path(output: Option<&str>, base_dir: &Path) -> Option<P
     }
 }
 
-/// pi `normalizeSkillInput` (`agents/skills.ts:684-708`): `false` → the explicit "no skills at all"
+/// pi `normalizeSkillInput` (`agents/skills.ts:716-740`): `false` → the explicit "no skills at all"
 /// form (`Some(vec![])`, which `runSinglePath` spells `effectiveSkills = []`,
-/// `subagent-executor.ts:2889-2893`); `true`/absent → `None` (inherit the persona's own `skills:`);
+/// `subagent-executor.ts:3676-3680`); `true`/absent → `None` (inherit the persona's own `skills:`);
 /// an array or a comma-separated string → the trimmed, non-empty, order-preserving de-duplicated
 /// names. A string that opens on `[` is first tried as JSON (models routinely serialize the array
 /// form as a string, and a naive comma-split would embed brackets and quotes into the names).
@@ -5467,7 +5471,7 @@ fn normalize_skill_input(raw: Option<&serde_json::Value>) -> Option<Vec<String>>
 }
 
 // SUBA-041 / SUBA-N04 — the SINGLE-mode `acceptance` param's lowering (pi `AcceptanceOverride`,
-// `schemas.ts:69-76`, applied at `subagent-executor.ts:1418`).
+// `schemas.ts:80-93`, applied at `subagent-executor.ts:1418`).
 //
 // The single implementation lives in `crate::exec::acceptance::lower_acceptance_input` so the
 // chain/parallel/background STEP path (`background/runner_main.rs::ExecSingleStepExecutor::
@@ -5629,7 +5633,7 @@ fn sj_output_mode() -> serde_json::Value {
 /// This crate previously advertised ONE wide enum that also offered `"none"` and `"verified"`.
 /// Both are hard-rejected by [`crate::exec::acceptance::lower_acceptance_input`]
 /// (`acceptance.ts:183-184`: `none` needs a reason, `verified` needs a non-empty `verify[]`), which
-/// is `AcceptanceInput = Exclude<AcceptanceLevel, "none" | "verified">` (`types.ts:684-685`)
+/// is `AcceptanceInput = Exclude<AcceptanceLevel, "none" | "verified">` (`shared/types.ts:684-685`)
 /// restated. Advertising a value the dispatch refuses is precisely the advertise-vs-dispatch
 /// violation this crate forbids, so the enum is narrowed to upstream's three.
 ///
@@ -5676,7 +5680,7 @@ fn sj_task_item() -> serde_json::Value {
     })
 }
 
-/// `ParallelTaskSchema` (`schemas.ts:93-109`): a static parallel task inside a chain step (agent
+/// `ParallelTaskSchema` (`schemas.ts:133-152`): a static parallel task inside a chain step (agent
 /// required, task optional).
 fn sj_parallel_task() -> serde_json::Value {
     serde_json::json!({
@@ -5702,7 +5706,7 @@ fn sj_parallel_task() -> serde_json::Value {
     })
 }
 
-/// `DynamicParallelTemplateSchema` (`schemas.ts:122-136`): the single per-item child template used
+/// `DynamicParallelTemplateSchema` (`schemas.ts:165-182`): the single per-item child template used
 /// with `expand`/`collect` dynamic fanout.
 fn sj_dynamic_parallel_template() -> serde_json::Value {
     serde_json::json!({
@@ -5727,7 +5731,7 @@ fn sj_dynamic_parallel_template() -> serde_json::Value {
     })
 }
 
-/// `DynamicExpandSchema` (`schemas.ts:111-120`): the fanout source pointer + bounds.
+/// `DynamicExpandSchema` (`schemas.ts:154-163`): the fanout source pointer + bounds.
 fn sj_dynamic_expand() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -5751,7 +5755,7 @@ fn sj_dynamic_expand() -> serde_json::Value {
     })
 }
 
-/// `DynamicCollectSchema` (`schemas.ts:138-141`): the fanned-in collected-array output binding.
+/// `DynamicCollectSchema` (`schemas.ts:184-187`): the fanned-in collected-array output binding.
 fn sj_dynamic_collect() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -5764,7 +5768,7 @@ fn sj_dynamic_collect() -> serde_json::Value {
     })
 }
 
-/// `ChainItem` (`schemas.ts:144-178`): one `chain[]` element — sequential `{agent, task?, ...}`,
+/// `ChainItem` (`schemas.ts:190-229`): one `chain[]` element — sequential `{agent, task?, ...}`,
 /// static `{parallel: [...]}`, or dynamic `{expand, parallel: {...}, collect}` fanout (flattened so
 /// chain steps need no object-shape `anyOf`/`oneOf` union at the item level, exactly as pi does).
 fn sj_chain_item() -> serde_json::Value {
@@ -5801,7 +5805,7 @@ fn sj_chain_item() -> serde_json::Value {
     })
 }
 
-/// `ControlOverrides` (`extension/schemas.ts:201-215` @v0.34.0): per-run subagent-control attention
+/// `ControlOverrides` (`extension/schemas.ts:242-255` @v0.43.0): per-run subagent-control attention
 /// thresholds and notification routing.
 ///
 /// SUBA-041 unhooked this fragment from [`subagent_tool_parameters`] because cyrup had the control
@@ -5834,7 +5838,7 @@ fn sj_control_overrides() -> serde_json::Value {
 }
 
 /// The complete LLM-facing JSON Schema for the `subagent` tool (C8) — a faithful port of pi's
-/// exported `SubagentParams` (`schemas.ts:195-265`, after `keepTopLevelParameterDescriptions`
+/// exported `SubagentParams` (`schemas.ts:257-357`, after `keepTopLevelParameterDescriptions`
 /// pruning). Every top-level parameter pi advertises is present with its top-level description; as
 /// of SUBA-N06 there are no withholds left. The nested `tasks[]`/`chain[]`
 /// element shapes carry their full structural detail (types, enums, `minimum`s, `items`, `anyOf`
@@ -5854,7 +5858,7 @@ fn sj_control_overrides() -> serde_json::Value {
 /// reason is gone: [`crate::exec::AgentProgress::snapshot`] projects the winning attempt's fold
 /// into pi's `AgentProgress` wire shape and [`crate::exec::run_sync`] publishes it on
 /// [`crate::exec::SingleResult::progress`] under pi's own truthiness gate
-/// (`progress: params.includeProgress ? allProgress : undefined`, `subagent-executor.ts:3008`
+/// (`progress: params.includeProgress ? allProgress : undefined`, `subagent-executor.ts:3819`
 /// @v0.34.0). It is honoured on the ASYNC path too — the flag rides to the detached hop-2 runner on
 /// [`crate::background::runner_main::RunnerConfig::include_progress`] and lands on every step's
 /// `RunOptions`, so the persisted `ResultFile`'s `SingleResult`s carry their snapshots. That is
@@ -5909,7 +5913,7 @@ fn sj_control_overrides() -> serde_json::Value {
 ///
 /// `acceptance` (SUBA-N04), `control` (SUBA-N05) and `includeProgress` (SUBA-N06) were wired to hop
 /// 2 by their own units. The async path additionally now writes the SAME artifact quadruple the
-/// foreground path does (pi `runs/background/subagent-runner.ts:879-889,1117-1133`), which is what
+/// foreground path does (pi `runs/background/subagent-runner.ts:1630-1666,1117-1133`), which is what
 /// gives `artifacts: false` something real to switch off.
 ///
 /// The former refusal was pinned by a test; that test was RE-SCOPED, not deleted — see
@@ -5918,7 +5922,7 @@ fn sj_control_overrides() -> serde_json::Value {
 /// contract), so this schema-vs-behaviour contract still cannot drift silently in either direction.
 /// Resolve a chain run's artifact directory, pi's
 /// `chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd)`
-/// (`subagent-executor.ts:2022` @v0.34.0).
+/// (`subagent-executor.ts:2623` @v0.43.0).
 ///
 /// An explicit caller value WINS and is used verbatim — pi does not rewrite it either (a step's
 /// relative `output` is what gets joined against it, at `chain-execution.ts:283`), so a relative
@@ -6025,7 +6029,7 @@ fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("control".to_string(), sj_control_overrides());
     // pi's own description (`schemas.ts:286`) is kept VERBATIM, including its stale
     // "Relative paths resolve against cwd" clause: pi's `resolveSingleOutputPath`
-    // (`single-output.ts:21-34`) only falls back to a cwd when no `relativeBaseDir` is supplied, and
+    // (`single-output.ts:64-77`) only falls back to a cwd when no `relativeBaseDir` is supplied, and
     // `runSinglePath` always supplies one (`resolveSingleRunOutputBaseDir`, `:2882`). Both sides
     // therefore resolve a relative `output` against the run's scoped output dir; the sentence is
     // upstream's inaccuracy, reproduced rather than silently corrected (parity over prose).
@@ -6223,7 +6227,8 @@ pub struct SubagentTool {
     executor: Arc<SubagentExecutor>,
     cwd: PathBuf,
     parameters: serde_json::Value,
-    /// The mode-specific tool description (T6, pi `fanout-child.ts:159-163`): the root orchestrator
+    /// The mode-specific tool description (T6, pi `fanout-child.ts:159-163` @v0.34.0; `:177-181` at
+    /// v0.43.0): the root orchestrator
     /// advertises [`SUBAGENT_TOOL_DESCRIPTION`]; a fanout child advertises
     /// [`CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION`] instead, so the model inside a restricted child is
     /// told up front which management actions are blocked rather than only discovering the block via
@@ -6441,7 +6446,7 @@ impl SubagentTool {
         Ok(if changed { Some(next) } else { None })
     }
 
-    /// pi `resolveRequestedCwd` (`subagent-executor.ts:193-195`): an explicit `params.cwd` is
+    /// pi `resolveRequestedCwd` (`subagent-executor.ts:348-350`): an explicit `params.cwd` is
     /// resolved AGAINST this tool's runtime cwd (`path.resolve(runtimeCwd, requestedCwd)` — a
     /// relative `requestedCwd` is joined onto `runtimeCwd`; an absolute one replaces it outright,
     /// which is exactly [`Path::join`]'s own behavior for an absolute argument); an omitted `cwd`
@@ -6461,7 +6466,7 @@ impl SubagentTool {
     /// value is `Fresh` in this tier); `model` is the per-call override.
     ///
     /// SUBA-041 — the per-call override surface pi's `runSinglePath` honors
-    /// (`subagent-executor.ts:2788-2791` output/outputMode/skill, `:2962` acceptance, `:2874` share,
+    /// (`subagent-executor.ts:3561-3564` output/outputMode/skill, `:2962` acceptance, `:2874` share,
     /// `:3387-3401` artifacts/sessionDir, `:1179` control) now reaches [`RunOptions`] through
     /// [`SingleRunOverrides`] instead of being rejected wholesale. `includeProgress` — the one
     /// remaining param with no subsystem behind it — is absent from the tool schema and still
@@ -6506,7 +6511,7 @@ impl SubagentTool {
         // winning attempt's fold into pi's `AgentProgress` wire shape and `run_sync` publishes it
         // on `SingleResult::progress` when — and only when — this flag is `Some(true)`, matching
         // pi's `progress: params.includeProgress ? allProgress : undefined`
-        // (`subagent-executor.ts:3008` @v0.34.0). It is advertised in the tool schema again and
+        // (`subagent-executor.ts:3819` @v0.43.0). It is advertised in the tool schema again and
         // honoured on BOTH the foreground path (`SingleRunOverrides::include_progress` →
         // `RunOptions::include_progress`) and the async one (`BackgroundSingleRequest::
         // include_progress` → `RunnerConfig::include_progress` → every hop-2 step's `RunOptions`).
@@ -6540,7 +6545,7 @@ impl SubagentTool {
             include_progress: p.include_progress,
         };
 
-        // pi's own `validateFileOnlyOutputMode` gate (`single-output.ts:85-90`, applied at
+        // pi's own `validateFileOnlyOutputMode` gate (`single-output.ts:140-145`, applied at
         // `subagent-executor.ts:2883-2886`) fires AFTER the persona is resolved, because a persona's
         // own `output:` can satisfy `outputMode: "file-only"` on its own. cyrup already enforces the
         // identical invariant one layer down at the same point in the sequence — `run_sync`'s
@@ -6569,7 +6574,7 @@ impl SubagentTool {
         // question can actually be asked of this call's params.
         let launch_defaults = SubagentExecutor::single_agent_launch_defaults(cwd, agent);
 
-        // pi `resolveForegroundTimeout` (`subagent-executor.ts:1327-1341`): `timeoutMs`/
+        // pi `resolveForegroundTimeout` (`subagent-executor.ts:1951-1968`): `timeoutMs`/
         // `maxRuntimeMs` are aliases; validate up front (positive, and consistent when both given).
         // The agent-level default is applied only when that resolution produced nothing, which is
         // exactly pi's `params.timeoutMs === undefined && params.maxRuntimeMs === undefined` guard
@@ -6673,7 +6678,7 @@ impl SubagentTool {
                 .await
                 .map_err(|e| ToolError::new(e.to_string()))?;
             // R-SA-074: return immediately after confirmed spawn; instruct against busy-polling.
-            // pi `executeAsyncSingle` (`async-execution.ts:981-984`): the headline is `Async: {agent}
+            // pi `executeAsyncSingle` (`async-execution.ts:1515-1518`): the headline is `Async: {agent}
             // [{id}]`, followed by `formatAsyncStartedMessage`'s fixed guidance, and `details` is
             // `{ mode: "single", runId, results: [], asyncId }` (`asyncId` === `runId` for a SINGLE
             // run, pi's own async-run identity convention).
@@ -6719,13 +6724,13 @@ impl SubagentTool {
         // finalized delivered output (`run_sync` already folded in the timeout preamble and any
         // saved-output reference), i.e. pi's `finalizedOutput.displayOutput`.
         let display_output = result.final_output.clone().unwrap_or_default();
-        // pi `runSinglePath`'s `details` (`subagent-executor.ts:3002-3013` @v0.34.0) is
+        // pi `runSinglePath`'s `details` (`subagent-executor.ts:3811-3823` @v0.43.0) is
         // `compactForegroundDetails({ mode: "single", runId, results: [r], progress, … })` — the
         // `SingleResult` is WRAPPED under `results`, and `mode`/`runId`/`context` sit beside it.
         // This used to be `serde_json::to_value(&result)`: the bare `SingleResult` at the details
         // ROOT, with no `mode`, no `runId` and no `results` array at all. That is a port bug at the
         // ported baseline, and it is what left `renderSubagentResult`'s only settled branch
-        // (`tui/render.ts:1428`, keyed on `d.mode === "single" && d.results.length === 1`)
+        // (`tui/render.ts:1709`, keyed on `d.mode === "single" && d.results.length === 1`)
         // permanently unreachable — a `details` shape no renderer could read.
         //
         // `SubagentUpdatePayload` IS that shape (`{mode, context, progress, results, …}`, its own
@@ -6931,7 +6936,7 @@ impl SubagentTool {
         cwd: &Path,
     ) -> Result<ToolResult, ToolError> {
         // T6 child-safe restriction (pi `fanout-child.ts` `allowMutatingManagementActions: false`,
-        // over `MUTATING_MANAGEMENT_ACTIONS`, `subagent-executor.ts:112`): a fanout child may
+        // over `MUTATING_MANAGEMENT_ACTIONS`, `subagent-executor.ts:151`): a fanout child may
         // inspect/delegate but must not rewrite the parent's agent config on disk — which since
         // SUBA-005 also means it must not eject a builtin into the parent's user scope, nor
         // disable/enable/reset an agent via the parent's `settings.json`.
@@ -6949,12 +6954,47 @@ impl SubagentTool {
         // management layer renders the real inherited model rather than `(unavailable)`. Bound to a
         // local so the borrowed `&str` in `ManagementRequest` outlives the call.
         let current_session_model = self.executor.inherited_session_model().map(|m| m.as_str().to_string());
+
+        // pi `handleList` reads `ctx.config?.proactiveSkillSubagents` and passes a LAZY
+        // `discoverAvailableSkills: () => discoverAvailableSkills(ctx.cwd)` closure
+        // (`agent-management.ts:765-770` @v0.43.0). cyrup's skill scan is `async` and
+        // `handle_management_action` is sync, so the laziness lives here instead: the config is
+        // resolved first and the scan is awaited ONLY when the feature is enabled, which is the
+        // observable behaviour upstream's closure gives (a disabled feature touches no filesystem).
+        // Every other action ignores the field, so the scan is also skipped for them.
+        let proactive_setting = if action == "list" {
+            self.executor
+                .config_snapshot()
+                .await
+                .proactive_skill_subagents
+                .as_ref()
+                .map(crate::discovery::skills::ProactiveSkillSubagentsSetting::from_extension_config)
+        } else {
+            None
+        };
+        let available_skills: Vec<crate::discovery::skills::AvailableSkill> = if action == "list"
+            && crate::discovery::skills::resolve_proactive_skill_subagents_config(
+                proactive_setting.as_ref(),
+            )
+            .enabled
+        {
+            crate::discovery::skills::discover_available_skills(cwd).await
+        } else {
+            Vec::new()
+        };
+
         let req = crate::discovery::management::ManagementRequest {
             agent: p.agent.as_deref(),
             chain_name: p.chain_name.as_deref(),
             agent_scope: p.agent_scope.as_deref(),
             config: p.config.as_ref(),
             current_session_model: current_session_model.as_deref(),
+            proactive_skills: (action == "list").then(|| {
+                crate::discovery::management::ProactiveSkillsInput {
+                    setting: proactive_setting.as_ref(),
+                    available_skills: &available_skills,
+                }
+            }),
         };
         match crate::discovery::management::handle_management_action(&cfg, action, &req) {
             Ok(outcome) if !outcome.is_error => Ok(ToolResult {
@@ -7015,7 +7055,7 @@ impl SubagentTool {
                 self.executor.control_stop(cwd, target, p.dir.as_deref()).await
             }
             "resume" => {
-                // pi `resumeAsyncRun` (`subagent-executor.ts:1145-1152`): a resume may carry an
+                // pi `resumeAsyncRun` (`subagent-executor.ts:1456-1469`): a resume may carry an
                 // attach-chain, whose steps' `acceptance` is validated with pi's own prefix before
                 // anything is enqueued (SUBA-N04 — those policies are now really honoured).
                 let acceptance_errors = validate_execution_acceptance(p);
@@ -7082,7 +7122,7 @@ impl SubagentTool {
     /// [`crate::spawn::parallel::run_bounded`] worker pool over real child processes.
     ///
     /// Faithful pi behaviors reproduced here: per-task `count` fan-out multiplication
-    /// (`expandTopLevelTaskCounts`, `subagent-executor.ts:1343`); duplicate-output-path rejection
+    /// (`expandTopLevelTaskCounts`, `subagent-executor.ts:1986`); duplicate-output-path rejection
     /// BEFORE any spawn (`findDuplicateParallelOutputPath`, `subagent-executor.ts:1978`); and the
     /// `N/M succeeded` result summary (`subagent-executor.ts:2446`).
     async fn route_parallel_mode(
@@ -7140,18 +7180,18 @@ impl SubagentTool {
                 p.control.as_ref().map(crate::exec::control::parse_control_overrides),
                 // SUBA-N06: `includeProgress` is likewise a top-level `SubagentParams` field, so it
                 // applies to PARALLEL/CHAIN exactly as it does to SINGLE — pi gates
-                // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:2679`) and
+                // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:3444`) and
                 // threads it into `executeChain` (`:2012`), both @v0.34.0.
                 p.include_progress,
                 // ...but `chainDir` is NOT such a field: pi resolves it only in `runChainPath`
-                // (`subagent-executor.ts:2022`), never in `runParallelPath`, so a bare PARALLEL run
+                // (`subagent-executor.ts:2623`), never in `runParallelPath`, so a bare PARALLEL run
                 // keeps the default scratch dir even when the caller sent one.
                 None,
             )
             .await
             .map_err(|e| ToolError::new(e.to_string()))?
         {
-            // pi `executeAsyncChain` (`async-execution.ts:775-784`): a bare PARALLEL call is a
+            // pi `executeAsyncChain` (`async-execution.ts:1152-1161`): a bare PARALLEL call is a
             // length-1 chain of one parallel step, so `chainDesc` is just that group's own
             // `[a+b+c]` descriptor; the headline is `Async parallel: {chainDesc} [{id}]`.
             GraphRunOutcome::Background(run_id) => Ok(ToolResult {
@@ -7181,7 +7221,7 @@ impl SubagentTool {
                         // through the intercom `DeliveryChannel`. On a confirmed delivery, the inline
                         // tool payload is REDUCED — the heavy per-task `final_output` block that
                         // `render_parallel_tool_summary` inlines is dropped in favor of pi's own
-                        // `formatSubagentResultReceipt` text (`result-intercom.ts:334-377`) — else the
+                        // `formatSubagentResultReceipt` text (`result-intercom.ts:376-421`) — else the
                         // full inline summary is preserved (never delivered instead-of, always
                         // in-addition-to). Uses the `NoTransportChannel` default (→ NotDelivered, full
                         // inline kept) until `with_channels` wires the real broker channel.
@@ -7199,7 +7239,7 @@ impl SubagentTool {
                         match self.executor.deliver_group_out_of_band(payload.clone()).await {
                             crate::tui::intercom::DeliveryOutcome::Delivered => {
                                 let reduced = crate::tui::intercom::ReducedInlinePayload::from(&payload);
-                                // pi's `formatSubagentResultReceipt` (`result-intercom.ts:334-377`):
+                                // pi's `formatSubagentResultReceipt` (`result-intercom.ts:376-421`):
                                 // mode label + "Run: …" + "Children: {status counts}" + closing line.
                                 let receipt = crate::tui::intercom::format_subagent_result_receipt(
                                     "parallel",
@@ -7255,7 +7295,7 @@ impl SubagentTool {
         let graph = parse_tool_chain_items(raw, cfg.parallel_concurrency())?;
         let context = p.context_override();
         let depth = resolve_effective_depth(cfg.max_subagent_depth).current_depth;
-        // pi `resolveForegroundTimeout` (`subagent-executor.ts:1327-1341`): `timeoutMs`/
+        // pi `resolveForegroundTimeout` (`subagent-executor.ts:1951-1968`): `timeoutMs`/
         // `maxRuntimeMs` are aliases, resolved once up front here exactly as SINGLE mode does.
         let timeout_ms = resolve_foreground_timeout(p).map_err(ToolError::new)?;
         // SUBA-N03: no timeout-vs-async refusal here any more. The one that stood here cited
@@ -7291,18 +7331,18 @@ impl SubagentTool {
                 p.control.as_ref().map(crate::exec::control::parse_control_overrides),
                 // SUBA-N06: `includeProgress` is likewise a top-level `SubagentParams` field, so it
                 // applies to PARALLEL/CHAIN exactly as it does to SINGLE — pi gates
-                // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:2679`) and
+                // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:3444`) and
                 // threads it into `executeChain` (`:2012`), both @v0.34.0.
                 p.include_progress,
                 // pi `chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd)`
-                // (`subagent-executor.ts:2022` @v0.34.0). THE one caller that forwards it: `:2022`
+                // (`subagent-executor.ts:2623` @v0.43.0). THE one caller that forwards it: `:2022`
                 // sits in `runChainPath`, and this is cyrup's CHAIN arm.
                 p.chain_dir.clone().map(PathBuf::from),
             )
             .await
             .map_err(|e| ToolError::new(e.to_string()))?
         {
-            // pi `executeAsyncChain` (`async-execution.ts:775-784`): headline `Async chain: {chainDesc}
+            // pi `executeAsyncChain` (`async-execution.ts:1152-1161`): headline `Async chain: {chainDesc}
             // [{id}]` followed by `formatAsyncStartedMessage`'s fixed guidance; `details` is
             // `{ mode: "chain", runId, results: [], asyncId }`.
             GraphRunOutcome::Background(run_id) => Ok(ToolResult {
@@ -7360,7 +7400,7 @@ impl SubagentTool {
                 {
                     crate::tui::intercom::DeliveryOutcome::Delivered => {
                         let reduced = crate::tui::intercom::ReducedInlinePayload::from(&payload);
-                        // pi's `formatSubagentResultReceipt` (`result-intercom.ts:334-377`).
+                        // pi's `formatSubagentResultReceipt` (`result-intercom.ts:376-421`).
                         let receipt = crate::tui::intercom::format_subagent_result_receipt(
                             "chain",
                             &run_id,
@@ -7459,7 +7499,7 @@ impl Tool for SubagentTool {
             return Err(ToolError::new(duplicate_subagent_call_text()));
         };
 
-        // pi `validateExecutionInput`'s mode-exclusivity gate (`subagent-executor.ts:1124-1143`,
+        // pi `validateExecutionInput`'s mode-exclusivity gate (`subagent-executor.ts:1736-1754`,
         // `hasChain`/`hasTasks`/`hasSingle` computed at `2995-2997`): a mode is selected by a
         // NON-EMPTY `chain`/`tasks` array, not merely by the field being present — an explicit
         // `tasks: []` or `chain: []` MUST fall through to this "provide exactly one mode" error
@@ -7474,7 +7514,7 @@ impl Tool for SubagentTool {
             )));
         }
 
-        // pi `validateExecutionInput`'s acceptance gate (`subagent-executor.ts:1534-1541`), in pi's
+        // pi `validateExecutionInput`'s acceptance gate (`subagent-executor.ts:1757-1762`), in pi's
         // own position: immediately after the mode-exclusivity check and before agent resolution or
         // any spawn. Covers the top-level SINGLE `acceptance` AND every `tasks[]`/`chain[]` item's
         // own — SUBA-N04, since those items' policies now really do reach their children.
@@ -7550,7 +7590,7 @@ impl Tool for SubagentTool {
 }
 
 /// pi `validateExecutionAcceptance` (`runs/shared/acceptance.ts:288-310` @v0.34.0, called from
-/// `validateExecutionInput` at `subagent-executor.ts:1534` immediately after the mode-exclusivity
+/// `validateExecutionInput` at `subagent-executor.ts:1757` immediately after the mode-exclusivity
 /// gate and BEFORE agent resolution): run `validateAcceptanceInput` over EVERY `acceptance` the
 /// dispatch declares — the top-level SINGLE param, each `tasks[i]`, each `chain[i]`, and each
 /// `chain[i].parallel[j]` (array form) or `chain[i].parallel` (dynamic-template object form) — using
@@ -7607,7 +7647,7 @@ fn validate_execution_acceptance(params: &SubagentToolParams) -> Vec<String> {
     errors
 }
 
-/// pi `countRequestedSubagentSpawns` (`runs/foreground/subagent-executor.ts:284-292`): how many
+/// pi `countRequestedSubagentSpawns` (`runs/foreground/subagent-executor.ts:439-447`): how many
 /// subagent spawns ONE accepted execution dispatch will charge against the session budget.
 ///
 /// * PARALLEL (`tasks[]`) → one spawn per task.
@@ -7639,7 +7679,7 @@ fn count_requested_subagent_spawns(
 /// (pi's `chain.reduce(...)`, `subagent-executor.ts:286-291`), kept separate so the dynamic-fanout
 /// worst case and the static `getStepAgents` count stay individually readable.
 fn chain_step_requested_spawns(step: &serde_json::Value, cfg: &SubagentExtensionConfig) -> u32 {
-    // pi `isDynamicParallelStep` (`shared/settings.ts:131-133`), the same predicate
+    // pi `isDynamicParallelStep` (`shared/settings.ts:161-163`), the same predicate
     // `discovery::chains` already ports: `expand` + `collect` + a NON-array `parallel`.
     let is_dynamic = step.get("expand").is_some()
         && step.get("collect").is_some()
@@ -7666,7 +7706,7 @@ fn chain_step_requested_spawns(step: &serde_json::Value, cfg: &SubagentExtension
 ///
 /// pi needs no lowered-form counter because every slash handler funnels back into the very same
 /// `executor.execute` the tool uses (`slash/slash-commands.ts` `runSlashSubagent` ->
-/// `requestSlashRun` -> the bridge wired at `extension/index.ts:396-401` ->
+/// `requestSlashRun` -> the bridge wired at `extension/index.ts:512-517` ->
 /// `executeSubagentCollapsed` -> `executor.execute`), so its single `reserveSubagentSpawns`
 /// (`subagent-executor.ts:266-282`, called at `:3434-3441`) always sees the RAW `SubagentParamsLike`
 /// and counts it with `countRequestedSubagentSpawns` (`:284-292`). This crate's slash surface parses
@@ -7919,8 +7959,8 @@ pub struct SubagentsExtension {
     /// orchestrator; a fanout-authorized child is built with [`RegistrationMode::ChildSafe`].
     mode: RegistrationMode,
     /// The NATIVE supervisor channel (pi `createNativeSupervisorChannel(pi, state)`,
-    /// `extension/index.ts:285`). Constructed for every extension and STARTED at `SessionStart`
-    /// (`extension/index.ts:614`) in [`RegistrationMode::Full`] only — upstream registers its parent
+    /// `extension/index.ts:372`). Constructed for every extension and STARTED at `SessionStart`
+    /// (`extension/index.ts:757`) in [`RegistrationMode::Full`] only — upstream registers its parent
     /// tools inside `start()`, which a `ChildSafe` child never reaches because it does not subscribe
     /// to `session_start` at all.
     supervisor_channel: Arc<crate::native_supervisor::NativeSupervisorChannel>,
@@ -8075,7 +8115,7 @@ impl NativeExtension for SubagentsExtension {
     ///   install in a child.
     ///
     /// A plain (non-fanout) child never reaches `init` at all: the binary's `subagent_extension_for_env`
-    /// gate returns `None`, so no extension is attached (pi `index.ts:243-245` registers nothing).
+    /// gate returns `None`, so no extension is attached (pi `extension/index.ts:243-245` registers nothing).
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
         match self.mode {
             RegistrationMode::ChildSafe => {
@@ -8148,7 +8188,7 @@ impl NativeExtension for SubagentsExtension {
                 )));
 
                 // G106 (pi `createNativeSupervisorChannel`'s `registerParentTools`,
-                // `native-supervisor-channel.ts:606-609`): the PARENT half of the native supervisor
+                // `native-supervisor-channel.ts:642-645`): the PARENT half of the native supervisor
                 // channel. Without it a child that blocks on `contact_supervisor` has nobody to
                 // answer it unless the orchestrator happens to have opted into `cyrup-intercom` AND
                 // holds a live broker presence — which a plain session never does
@@ -8189,7 +8229,7 @@ impl NativeExtension for SubagentsExtension {
 
                 // C20 / EXT-006: this extension draws its OWN `subagent` tool rows. pi declares the
                 // same thing as `renderCall`/`renderResult` members of its `ToolDefinition`
-                // (`extension/index.ts:465,495` @v0.34.0); cyrup's native tools are already-
+                // (`extension/index.ts:548,495` @v0.43.0); cyrup's native tools are already-
                 // executable `Arc<dyn Tool>` values with no descriptor, so the declaration goes
                 // through `InitApi` instead (`cyrup-ext/src/native.rs:277`). Without this the host's
                 // `has_tool_renderer("subagent")` pre-check short-circuits and
@@ -8256,7 +8296,7 @@ impl NativeExtension for SubagentsExtension {
                 // NOT per `session_start`). What DOES belong here, per-session, is pi's OWN
                 // `session_start` handler body (`extension/index.ts:628-642`): the per-session-file
                 // artifact sweep (`cleanupOldArtifacts(getArtifactsDir(sessionFile))`,
-                // `resetSessionState`'s `cleanupSessionArtifacts` at `extension/index.ts:591-600`),
+                // `resetSessionState`'s `cleanupSessionArtifacts` at `extension/index.ts:708-717`),
                 // best-effort — a failure here must never block a session from starting.
                 if let Some(session_file) =
                     self.executor.host_services().and_then(|s| s.session_file())
@@ -8283,7 +8323,7 @@ impl NativeExtension for SubagentsExtension {
                 // with THIS session's id.
                 self.executor.reset_spawn_budget();
 
-                // G106 (pi `extension/index.ts:614` `supervisorChannel.start()`): bind the live
+                // G106 (pi `extension/index.ts:757` `supervisorChannel.start()`): bind the live
                 // capability backend — the channel needs `session_id()` to decide which pending
                 // requests belong to THIS orchestrator, and `inject_message` to surface them — then
                 // start the poll loop. Idempotent across a session rebuild.
@@ -8302,7 +8342,7 @@ impl NativeExtension for SubagentsExtension {
             }
             HostEvent::SessionShutdown { .. } => {
                 // pi `runtimeCleanup`/`session_shutdown` both call `supervisorChannel.dispose()`
-                // (`extension/index.ts:299,644`): stop the poller and drop the pending map, so a
+                // (`extension/index.ts:418,644`): stop the poller and drop the pending map, so a
                 // rebuilt session never re-surfaces the previous session's requests.
                 self.supervisor_channel.dispose();
                 self.executor.teardown_session().await;
@@ -8376,7 +8416,7 @@ impl NativeExtension for SubagentsExtension {
     }
 
     /// Draw the `subagent` tool's CALL row — a 1:1 port of pi's `renderCall`
-    /// (`extension/index.ts:465-493` @v0.34.0), on the raw tool arguments the host hands over
+    /// (`extension/index.ts:548-568` @v0.43.0), on the raw tool arguments the host hands over
     /// (`AgentSessionEvent::ToolExecutionStart.args`).
     ///
     /// Reached by: the model issues a `subagent` tool call → `cyrup-tui`'s `extension_render`
@@ -8388,8 +8428,8 @@ impl NativeExtension for SubagentsExtension {
         Some(serde_json::Value::String(render_subagent_call(call)))
     }
 
-    /// Draw the `subagent` tool's RESULT row — pi's `renderResult` (`extension/index.ts:495-503`),
-    /// which delegates to `renderSubagentResult` (`tui/render.ts:1406`).
+    /// Draw the `subagent` tool's RESULT row — pi's `renderResult` (`extension/index.ts:569-576`),
+    /// which delegates to `renderSubagentResult` (`tui/render.ts:1678`).
     ///
     /// The host hands over the whole `AgentToolResult` (`{content, details, terminate}`,
     /// `cyrup-agent/src/agent.rs:123-142`), which is exactly pi's `renderResult(result, …)`
@@ -8413,7 +8453,7 @@ impl NativeExtension for SubagentsExtension {
     }
 }
 
-/// pi `renderCall` (`extension/index.ts:465-493` @v0.34.0), rendered as plain text: cyrup's
+/// pi `renderCall` (`extension/index.ts:548-568` @v0.43.0), rendered as plain text: cyrup's
 /// renderer contract returns a serialized widget tree the host flattens, and pi's own return here
 /// is a single `Text` node in every branch.
 fn render_subagent_call(args: &serde_json::Value) -> String {
@@ -8479,7 +8519,7 @@ fn effective_parallel_task_count(args: &serde_json::Value) -> u64 {
         .sum()
 }
 
-/// pi `renderSubagentResult` (`tui/render.ts:1406-1430` @v0.34.0), compact tier — see
+/// pi `renderSubagentResult` (`tui/render.ts:1678-1712` @v0.43.0), compact tier — see
 /// [`NativeExtension::render_result`]'s doc for the branch map. Returns a JSON array of line
 /// strings, which the host flattens newline-joined (`cyrup-tui/src/app.rs:4512`).
 fn render_subagent_result(result: &serde_json::Value) -> serde_json::Value {
@@ -8557,7 +8597,7 @@ impl SubagentsExtension {
                 let model = parsed.config.model.clone().map(ModelId::from);
                 // SUBA-002 — charge the per-SESSION spawn budget on the SLASH surface too. Upstream
                 // gets this for free: `/run`'s handler calls `runSlashSubagent` -> `requestSlashRun`
-                // -> the bridge wired at `extension/index.ts:396-401` -> `executeSubagentCollapsed`
+                // -> the bridge wired at `extension/index.ts:512-517` -> `executeSubagentCollapsed`
                 // -> the SAME `executor.execute` the tool uses, whose `reserveSubagentSpawns`
                 // (`subagent-executor.ts:266-282`, called at `:3434-3441`) therefore covers both
                 // surfaces. Here `dispatch_slash` is an independent entry point into
@@ -8587,8 +8627,8 @@ impl SubagentsExtension {
                     .reserve_subagent_spawns(1, run_cfg.max_subagent_spawns_per_session)
                     .map_err(SubagentError::SpawnLimitExceeded)?;
 
-                // G98 / pi `applySingleAgentLaunchDefaults` (`subagent-executor.ts:1585-1602,3608`
-                // @v0.35.0). `/run` is pi's SINGLE shape, and upstream reaches it through the SAME
+                // G98 / pi `applySingleAgentLaunchDefaults` (`subagent-executor.ts:1930-1947`,
+                // applied at `:4927` @v0.43.0). `/run` is pi's SINGLE shape, and upstream reaches it through the SAME
                 // `executor.execute` the tool does, so the agent's own `async:`/`timeoutMs:`
                 // frontmatter defaults apply here identically. cyrup's `/run` is an independent
                 // entry point, so it has to apply them itself — see
@@ -8596,7 +8636,7 @@ impl SubagentsExtension {
                 // shared rather than duplicated.
                 //
                 // Fill-unset-only, and `/run`'s "unset" is precise: the surface parses no
-                // `timeoutMs=`/`maxRuntimeMs=` token at all (`slash-commands.ts:1193-1196`
+                // `timeoutMs=`/`maxRuntimeMs=` token at all (`slash-commands.ts:891-894`
                 // @v0.34.0 forwards only `output`/`outputMode`/`skill`/`model`), so a timeout
                 // default is ALWAYS eligible; `--bg` is the only async signal, and an explicit
                 // `--bg` must beat an agent declaring `async: false`, so the default only decides
@@ -8629,7 +8669,7 @@ impl SubagentsExtension {
                             // directly below, not a background-specific drop — that branch calls
                             // `run_foreground(…)`'s flat legacy signature, which likewise carries
                             // no override bundle. `/run`'s own parser does not yet surface pi's
-                            // `output`/`outputMode`/`skill` tokens (`slash-commands.ts:1193-1196`
+                            // `output`/`outputMode`/`skill` tokens (`slash-commands.ts:891-894`
                             // @v0.34.0) on EITHER path; wiring that surface is a separate unit, and
                             // until it lands both `/run` paths behave identically. `share`/
                             // `sessionDir`/`artifacts`/`timeoutMs` have no `/run` token upstream at
@@ -8664,15 +8704,22 @@ impl SubagentsExtension {
                 }
             }
             // pi's `/subagents-doctor` handler calls `runSlashSubagent(pi, ctx, { action: "doctor"
-            // })` — no `sessionDir` override on the slash-command surface (`slash-commands.ts:1081-
-            // 1087`), so `formatConfiguredSessionDir` falls through to the configured default.
+            // })` — no `sessionDir` override on the slash-command surface
+            // (`slash-commands.ts:694-699` @v0.43.0), so `formatConfiguredSessionDir` falls through
+            // to the configured default.
             SlashCommandName::SubagentsDoctor => Ok(self.executor.run_doctor(cwd, None).await),
-            // G92: pi's `/subagents-fleet` handler is exactly
-            // `runSlashSubagent(pi, ctx, { action: "status", view: "fleet" })`
-            // (`slash-commands.ts:1092-1097` @v0.34.0) — the SAME executor entry point the
+            // G92: pi's `/subagents-fleet` handler was exactly
+            // `runSlashSubagent(pi, ctx, { action: "status", view: "fleet" })` at the ported
+            // baseline (`slash-commands.ts:1092-1097` @v0.34.0) — the SAME executor entry point the
             // `subagent({ action: "status", view: "fleet" })` tool call lands on, so the two
             // surfaces can never render different fleets (R-SA-130). `child_safe` is false: a slash
             // command only exists on the orchestrator surface.
+            //
+            // VERSION LAG (unported, not a bug in this arm): at v0.43.0 upstream rewrote this
+            // command (`slash-commands.ts:714-717`) — the description became "Open the live
+            // subagent fleet inspector" and the handler became `showFleet(ctx)`, the interactive
+            // FleetView. `src/tui/fleet*.ts` is one of the two upstream trees this crate does not
+            // port yet, so cyrup still implements the v0.34.0 status-report shape above.
             SlashCommandName::SubagentsFleet => self
                 .executor
                 .control_status_view(
@@ -8828,7 +8875,7 @@ impl SubagentsExtension {
 
             // -----------------------------------------------------------------------------------
             // /subagents-models — report the RUNTIME builtin-agent -> model mapping (pi
-            // `handleModels`, slash-commands.ts:1090-1111), NOT a dump of the static provider
+            // `handleModels`, slash-commands.ts:802-823), NOT a dump of the static provider
             // catalog: each discovered builtin persona's effective model + provenance, optionally
             // filtered to one builtin.
             // -----------------------------------------------------------------------------------
@@ -9024,7 +9071,7 @@ impl SubagentsExtension {
                     output: None,
                     output_mode: None,
                     // A recipe's `skill:` IS forwarded — unlike `/run`, whose upstream handler
-                    // parses no `skill=` token (`slash-commands.ts:1193-1196`), `workflowParams`
+                    // parses no `skill=` token (`slash-commands.ts:891-894`), `workflowParams`
                     // sets `skill` from the recipe's frontmatter (`prompt-workflows.ts:233`).
                     skills: run.skills.clone(),
                     share: None,
@@ -9147,7 +9194,7 @@ impl SubagentsExtension {
         // SUBA-002 — charge the per-SESSION spawn budget for the chain-shaped SLASH surfaces
         // (`/chain`, `/parallel`, `/run-chain`), which all funnel through this one wrapper. Upstream
         // needs no charge here because those handlers call `runSlashSubagent` -> `requestSlashRun`
-        // -> the bridge at `extension/index.ts:396-401` -> `executeSubagentCollapsed` -> the SAME
+        // -> the bridge at `extension/index.ts:512-517` -> `executeSubagentCollapsed` -> the SAME
         // `executor.execute` the tool uses, so its `reserveSubagentSpawns`
         // (`subagent-executor.ts:266-282`, called at `:3434-3441`) already covers them; this crate
         // reaches `run_or_background_graph` directly from here, so the reserve has to be repeated.
@@ -9250,7 +9297,7 @@ impl SubagentsExtension {
     }
 
     /// A just-refreshed catalog's usable, RANKED, non-dominated `provider/id` full-id list — the
-    /// pure, synchronous half of pi `generateProfilesForProvider`'s pipeline (profiles.ts:591-592:
+    /// pure, synchronous half of pi `generateProfilesForProvider`'s pipeline (profiles.ts:615-616:
     /// `catalog.models.filter(catalogModelIsUsable)` then `filterDominatedModels`, ordered by
     /// `derived.profileRank` ascending since [`write_provider_catalog_file`] already sorted
     /// `catalog.models` that way — profiles.ts:567). Cross-references each catalog entry's
@@ -9387,7 +9434,7 @@ impl SubagentsExtension {
             ));
         }
 
-        // pi `if (availableModels.length === 0) throw new Error(...)` (profiles.ts:506-508) — a
+        // pi `if (availableModels.length === 0) throw new Error(...)` (profiles.ts:530-532) — a
         // command ERROR, not an informational success string.
         let has_models = registry_models().iter().any(|m| m.provider.as_str() == provider);
         if !has_models {
@@ -9414,7 +9461,7 @@ impl SubagentsExtension {
         crate::registration::profiles::validate_profile_name(provider)?;
         // pi's refreshProviderModelCatalog (called internally by generateProfilesForProvider,
         // profiles.ts:586) throws BEFORE any probing when the registry has zero models
-        // (profiles.ts:506-508) — checked here, up front, so this mirrors that ordering exactly.
+        // (profiles.ts:530-532) — checked here, up front, so this mirrors that ordering exactly.
         let has_models = registry_models().iter().any(|m| m.provider.as_str() == provider);
         if !has_models {
             return Err(SubagentError::MalformedSettings(format!(
@@ -9486,7 +9533,7 @@ impl SubagentsExtension {
     ///
     /// pi additionally *offers an interactive confirm* to switch the running session's model to the
     /// worker model, but ONLY when the host exposes `pi.setModel` + `ctx.modelRegistry`
-    /// (slash-commands.ts:1150-1168); when it does not, pi falls straight through to the
+    /// (slash-commands.ts:848-866); when it does not, pi falls straight through to the
     /// `else if (workerModel)` branch and simply reports the worker model (line 1167). A native
     /// `NativeExtension::execute_command` `HostCtx` exposes neither a `set_model` control op nor an
     /// interactive `confirm` today (that live session-model switch is the outer-layer UI tier,
@@ -9557,7 +9604,7 @@ fn first_step_task(graph: &[RunnerStep]) -> String {
         .unwrap_or_default()
 }
 
-/// pi `formatAsyncStartedMessage` (`async-execution.ts:200-208`): the mode-specific `headline`
+/// pi `formatAsyncStartedMessage` (`async-execution.ts:261-267`): the mode-specific `headline`
 /// followed verbatim by the fixed four-line detached-run guidance (blank line, then three
 /// instruction lines), joined with `"\n"` exactly as pi's `.join("\n")` does.
 fn format_async_started_message(headline: &str) -> String {
@@ -9847,7 +9894,7 @@ struct AvailableModelEntry {
     full_id: String,
 }
 
-/// pi's `ctx.modelRegistry.getAvailable()` (`profiles.ts:505`, `agent-management.ts:169`) — the
+/// pi's `ctx.modelRegistry.getAvailable()` (`profiles.ts:529`, `agent-management.ts:169`) — the
 /// model registry every model-facing subagents command consults — bound here to the REAL built-in
 /// provider registry, [`cyrup_provider::catalog::builtin_catalog`], i.e. every model every
 /// registered provider ships.
@@ -9873,7 +9920,7 @@ fn registry_available_models() -> Vec<AvailableModelEntry> {
         .collect()
 }
 
-/// pi `resolveModelCandidate` (`runs/shared/model-fallback.ts:60-76`): resolve a bare or
+/// pi `resolveModelCandidate` (`runs/shared/model-fallback.ts:148-164`): resolve a bare or
 /// fully-qualified model string against the available-model list. A `provider/id` string passes
 /// through unchanged; a bare id resolves to its `fullId` when exactly one available model matches
 /// (or, when multiple providers offer the same bare id, the `preferred_provider`'s match wins); an
@@ -9909,7 +9956,7 @@ fn resolve_model_candidate(
     Some(format!("{}{thinking_suffix}", only.full_id))
 }
 
-/// pi `resolveSubagentModelOverride` (`runs/shared/model-fallback.ts:47-59`): the effective model a
+/// pi `resolveSubagentModelOverride` (`runs/shared/model-fallback.ts:196-220`): the effective model a
 /// discovered builtin persona resolves to. `requested_model` unset, empty, or the `"inherit"`
 /// sentinel all resolve to the live parent session model (`provider/id`) when one is bound, else
 /// `None` (pi's "(unresolved)" case); any other explicit value is resolved via
@@ -9928,7 +9975,7 @@ fn resolve_subagent_model_override(
     }
 }
 
-/// pi `resolveSubagentDefaultModel` (`agents.ts:716-728`): which scope's `subagents.defaultModel`
+/// pi `resolveSubagentDefaultModel` (`agents.ts:921-933`): which scope's `subagents.defaultModel`
 /// wins (project beats user when the project scope exists and declares one). `merge.rs`'s
 /// `apply_default_model` already guarantees that whenever an agent's `model_source` is still
 /// [`AgentModelSourceInfo::SettingsDefault`], `model` equals exactly the value this same
@@ -9946,14 +9993,14 @@ fn resolve_default_model_scope(settings: &LayeredOverrideSettings) -> Option<&'s
 }
 
 /// Provenance of a builtin persona's resolved model (pi `formatModelSource`,
-/// agent-management.ts:565-578). `default_model_scope` is [`resolve_default_model_scope`]'s
+/// agent-management.ts:787-800). `default_model_scope` is [`resolve_default_model_scope`]'s
 /// result for the current discovery run.
 fn format_model_source(
     agent: &AgentDefinition,
     current_session_model: Option<&str>,
     default_model_scope: Option<&str>,
 ) -> String {
-    // pi `agent.override && agent.model !== agent.override.base.model` (agent-management.ts:566-568):
+    // pi `agent.override && agent.model !== agent.override.base.model` (agent-management.ts:788-790):
     // the override branch fires only when the override actually changed the resolved model, not
     // merely because an override happens to be recorded (e.g. it only touched `disabled`/`tools`).
     if let Some(override_info) = &agent.override_info
@@ -9966,7 +10013,7 @@ fn format_model_source(
         return format!("{scope} override");
     }
     // pi `agent.modelSource?.type === "subagents.defaultModel" && agent.model === agent.modelSource.model`
-    // (agent-management.ts:569-571): scope-qualified provenance, gated on the model still matching
+    // (agent-management.ts:791-793): scope-qualified provenance, gated on the model still matching
     // what the default actually supplied (see this function's doc for why the value check is
     // redundant here and the scope alone suffices).
     if agent.model_source == Some(AgentModelSourceInfo::SettingsDefault)
@@ -10026,7 +10073,7 @@ struct ProbeOutcome {
 }
 
 /// Classify a non-zero probe exit's combined stderr/stdout text into a [`ProbeStatus`] (pi
-/// `resolveProbeStatus`, profiles.ts:310-316): `timedOut` short-circuits to `Timeout` regardless
+/// `resolveProbeStatus`, profiles.ts:327-333): `timedOut` short-circuits to `Timeout` regardless
 /// of text; empty text (no output at all) is `Error`; otherwise an auth/billing-shaped message
 /// wins over an unavailable-shaped one (pi checks the auth regex first), and anything else falls
 /// through to `Error`. Case-insensitive substring checks stand in for pi's `/i` regex alternations
@@ -10066,10 +10113,10 @@ fn resolve_probe_status(text: &str, timed_out: bool) -> ProbeStatus {
     ProbeStatus::Error
 }
 
-/// The 45-second probe timeout (pi `probeModel`'s `timeout: 45_000`, profiles.ts:328).
+/// The 45-second probe timeout (pi `probeModel`'s `timeout: 45_000`, profiles.ts:345).
 const PROBE_TIMEOUT_MS: u64 = 45_000;
 
-/// The fixed probe prompt (pi `probeModel`, profiles.ts:326).
+/// The fixed probe prompt (pi `probeModel`, profiles.ts:343).
 const PROBE_PROMPT: &str = "Reply with exactly \"OK\".";
 
 /// Real live-probe subprocess call (pi `probeModel`, profiles.ts:318-335): spawns this crate's own
@@ -10168,7 +10215,7 @@ async fn probe_model_with(
     }
 }
 
-/// pi `extractVersionScore` (profiles.ts:150-154): the max of every `\d+(\.\d+)?` numeric token in
+/// pi `extractVersionScore` (profiles.ts:167-171): the max of every `\d+(\.\d+)?` numeric token in
 /// `id`, or `0.0` if none. Hand-rolled digit-run scan (no `regex` dependency in this crate) —
 /// semantically identical to pi's global regex match + `Math.max`.
 fn extract_version_score(id: &str) -> f64 {
@@ -10201,7 +10248,7 @@ fn extract_version_score(id: &str) -> f64 {
     best.unwrap_or(0.0)
 }
 
-/// pi `modelNameTokens` (profiles.ts:156-163): lowercase, insert a space at every
+/// pi `modelNameTokens` (profiles.ts:173-180): lowercase, insert a space at every
 /// letter-then-digit / digit-then-letter boundary, then split on runs of anything outside
 /// `[a-z0-9.]`, dropping empty tokens. A single left-to-right scan reproduces pi's two sequential
 /// global regex replaces (letter→digit, then digit→letter) exactly for every adjacent-character
@@ -10229,7 +10276,7 @@ fn model_name_tokens(model_name: &str) -> Vec<String> {
         .collect()
 }
 
-/// pi `inferProfileBand` (profiles.ts:165-172): a coarse 0..=4 capability band inferred purely
+/// pi `inferProfileBand` (profiles.ts:182-189): a coarse 0..=4 capability band inferred purely
 /// from name tokens (spark/flash/nano/tiny/instant → 0; mini/haiku/small → 1; opus/max/ultra/pro →
 /// 4; sonnet/turbo/plus → 3; anything else → 2).
 fn infer_profile_band(model_name: &str) -> u8 {
@@ -10251,7 +10298,7 @@ fn infer_profile_band(model_name: &str) -> u8 {
     2
 }
 
-/// pi `combinedCost` (profiles.ts:199-204): the sum of every finite cost field. Since
+/// pi `combinedCost` (profiles.ts:216-221): the sum of every finite cost field. Since
 /// `cyrup_provider::ModelCost`'s fields are required (never `Option`), this always yields
 /// `Some(sum)` for a registry model (pi's `undefined` branch is reachable only when the
 /// registry omits cost metadata entirely, which the embedded-catalog schema never does).
@@ -10261,7 +10308,7 @@ fn combined_cost(cost: &cyrup_provider::ModelCost) -> Option<f64> {
     if filtered.is_empty() { None } else { Some(filtered.iter().sum()) }
 }
 
-/// pi's `NumericStats` (profiles.ts:188-191): the min/max of a value set, used to min-max
+/// pi's `NumericStats` (profiles.ts:205-208): the min/max of a value set, used to min-max
 /// normalize a raw metric into `0.0..=1.0`.
 #[derive(Clone, Copy, Debug)]
 struct NumericStats {
@@ -10269,7 +10316,7 @@ struct NumericStats {
     max: f64,
 }
 
-/// pi `collectStats` (profiles.ts:206-210): `None` when every input is missing/non-finite.
+/// pi `collectStats` (profiles.ts:223-227): `None` when every input is missing/non-finite.
 fn collect_stats(values: &[Option<f64>]) -> Option<NumericStats> {
     let filtered: Vec<f64> = values.iter().filter_map(|v| v.filter(|x| x.is_finite())).collect();
     if filtered.is_empty() {
@@ -10280,7 +10327,7 @@ fn collect_stats(values: &[Option<f64>]) -> Option<NumericStats> {
     Some(NumericStats { min, max })
 }
 
-/// pi `normalize` (profiles.ts:212-216): min-max normalize `value` into `stats`' range; a
+/// pi `normalize` (profiles.ts:229-233): min-max normalize `value` into `stats`' range; a
 /// degenerate (all-equal) range normalizes to `0.5`.
 fn normalize(value: Option<f64>, stats: Option<&NumericStats>) -> Option<f64> {
     let value = value?;
@@ -10291,8 +10338,8 @@ fn normalize(value: Option<f64>, stats: Option<&NumericStats>) -> Option<f64> {
     Some((value - stats.min) / (stats.max - stats.min))
 }
 
-/// pi `ClassificationContext` (profiles.ts:193-197), built once per provider-filtered candidate
-/// set (pi `buildClassificationContext`, profiles.ts:218-224). pi's sibling `cost` stat feeds only
+/// pi `ClassificationContext` (profiles.ts:210-214), built once per provider-filtered candidate
+/// set (pi `buildClassificationContext`, profiles.ts:235-241). pi's sibling `cost` stat feeds only
 /// `costTier`/`latencyTier` (profiles.ts:285-295) — NEITHER of which contributes to `profileRank`
 /// (profiles.ts:298's `qualitySignals` never includes `costNorm`) — so it is not modeled here; see
 /// [`ModelClassification`]'s doc comment for why `profile_rank` is the only field this port keeps.
@@ -10406,7 +10453,7 @@ fn dominates(a: &RankedCandidate, b: &RankedCandidate) -> bool {
         || a.max_tokens > b.max_tokens
 }
 
-/// pi `filterDominatedModels` (profiles.ts:381-383): drop every candidate that some OTHER
+/// pi `filterDominatedModels` (profiles.ts:398-400): drop every candidate that some OTHER
 /// candidate in the set dominates. Identifies "the other candidate" by pointer identity
 /// ([`std::ptr::eq`]) rather than a numeric index, so this never indexes `candidates` directly
 /// (clippy's `indexing_slicing`, denied outside `#[cfg(test)]` by this crate's own lints).
@@ -10422,7 +10469,7 @@ fn filter_dominated(candidates: Vec<RankedCandidate>) -> Vec<RankedCandidate> {
     candidates.into_iter().zip(keep).filter(|(_, k)| *k).map(|(c, _)| c).collect()
 }
 
-/// pi `catalogModelIsUsable` (profiles.ts:402-404): usable iff the probe did NOT come back
+/// pi `catalogModelIsUsable` (profiles.ts:417-419): usable iff the probe did NOT come back
 /// unavailable/auth/timeout/error (`observed.availableInRegistry` is trivially always `true` here,
 /// since every candidate is already drawn from the model registry).
 fn probe_status_is_usable(status: &str) -> bool {
@@ -10431,7 +10478,7 @@ fn probe_status_is_usable(status: &str) -> bool {
 
 /// Render `/subagents-check-profile`'s report (pi `checkSubagentProfile`, profiles.ts:608-637):
 /// for every `overrides.<agent>.model` the profile declares (pi does NOT check `defaultModel` —
-/// `entries` at profiles.ts:615-617 only ever walks `profile.subagents.agentOverrides`), resolve it
+/// `entries` at profiles.ts:639-641 only ever walks `profile.subagents.agentOverrides`), resolve it
 /// against the model registry ([`registry_models`]) and REAL-probe the resolved full id
 /// (or the raw string when unresolved) via [`probe_model`], with a per-probed-id cache so the same
 /// model is never probed twice in one report (pi's `probeCache`, profiles.ts:618-628).
@@ -10439,7 +10486,7 @@ async fn render_profile_check_report(
     name: &str,
     profile: &crate::registration::profiles::NamedProfile,
 ) -> String {
-    // pi's `entries` (profiles.ts:615-617) walks ONLY `agentOverrides`, never `defaultModel`.
+    // pi's `entries` (profiles.ts:639-641) walks ONLY `agentOverrides`, never `defaultModel`.
     let mut refs: Vec<(String, String)> = Vec::new();
     for (agent_name, over) in &profile.subagents.overrides {
         if let crate::discovery::types::OverrideField::Value(model) = &over.model {
@@ -10575,7 +10622,7 @@ mod tests {
         );
     }
 
-    /// Regression (pi `chain-execution.ts:499-510`, dossier "No upfront
+    /// Regression (pi `chain-execution.ts:584-596`, dossier "No upfront
     /// validateChainOutputBindings for tool/slash chains; duplicate `as` silently overwrites"): a
     /// tool `chain[]` call with two steps sharing the SAME `as` name must be rejected up front,
     /// before any step (including its own agent-name resolution) is even attempted. Both step
@@ -10807,8 +10854,8 @@ mod tests {
 
     // ---- SUBA-041: the SINGLE-mode override normalizers ----
 
-    /// pi `normalizeSingleOutputOverride` (`single-output.ts:11-19`) + `runSinglePath`'s persona
-    /// fallback (`subagent-executor.ts:2789`), rule by rule.
+    /// pi `normalizeSingleOutputOverride` (`single-output.ts:54-62`) + `runSinglePath`'s persona
+    /// fallback (`subagent-executor.ts:3562`), rule by rule.
     #[test]
     fn normalize_single_output_override_ports_pis_five_cases() {
         // Omitted param → the persona's own declared output.
@@ -10847,7 +10894,7 @@ mod tests {
         assert_eq!(normalize_single_output_override(Some(&serde_json::json!("")), None), None);
     }
 
-    /// pi `resolveSingleOutputPath` (`single-output.ts:21-34`) as `runSinglePath` calls it: a
+    /// pi `resolveSingleOutputPath` (`single-output.ts:64-77`) as `runSinglePath` calls it: a
     /// RELATIVE output resolves against the run's own scoped base dir, never the run cwd; an
     /// absolute one is used verbatim; the disable sentinels never produce a path.
     #[test]
@@ -10866,7 +10913,7 @@ mod tests {
         assert_eq!(resolve_single_output_path(Some(""), base), None);
     }
 
-    /// pi `normalizeSkillInput` (`agents/skills.ts:684-708`) — including the JSON-encoded-array
+    /// pi `normalizeSkillInput` (`agents/skills.ts:716-740`) — including the JSON-encoded-array
     /// guard models routinely trip, and the `false` → "no skills at all" form.
     #[test]
     fn normalize_skill_input_ports_pis_union() {
@@ -10922,7 +10969,7 @@ mod tests {
         assert_eq!(verified.required_level, AcceptanceStatus::Verified);
         assert_eq!(verified.verify, vec!["cargo test".to_string()]);
 
-        // pi's verbatim validation failures (`acceptance.ts:143,152`).
+        // pi's verbatim validation failures (`acceptance.ts:181,152`).
         assert_eq!(
             parse_single_acceptance(&serde_json::json!("nope")),
             Err("acceptance has invalid level 'nope'.".to_string())
@@ -11017,7 +11064,7 @@ mod tests {
     }
 
     /// C8: the LLM-facing `subagent` tool schema exposes pi's FULL parameter union
-    /// (`schemas.ts:195-265`), not just the pre-C8 5-property single-task shape. Asserts every
+    /// (`schemas.ts:257-357`), not just the pre-C8 5-property single-task shape. Asserts every
     /// top-level pi property name is present, the 11-value management/control `action` enum is
     /// complete and correctly ordered, the `context` fresh/fork enum is present, the `tasks[]`
     /// per-task `output`/`outputMode`/`reads`/`progress` fields exist, and the numeric bounds pi
@@ -11086,7 +11133,7 @@ mod tests {
         );
 
         // SUBA-N05: `control`'s nested shape, pinned against `ControlOverrides`
-        // (`extension/schemas.ts:201-215` @v0.34.0). Every advertised field must be one
+        // (`extension/schemas.ts:242-255` @v0.43.0). Every advertised field must be one
         // `crate::exec::control::parse_control_overrides` actually reads, and both string unions
         // must match `ControlEventType`/`ControlNotificationChannel`'s wire spellings exactly —
         // advertising an enum member the lowering drops is the same defect class as advertising a
@@ -11178,7 +11225,7 @@ mod tests {
         assert_eq!(props["tasks"]["items"]["required"], serde_json::json!(["agent", "task"]));
 
         // chain[] items must be an additionalProperties:false object with the flattened
-        // sequential/parallel/dynamic surface (schemas.ts:144-178).
+        // sequential/parallel/dynamic surface (schemas.ts:190-229).
         let chain_item = &props["chain"]["items"];
         assert_eq!(chain_item["type"], serde_json::json!("object"));
         assert_eq!(chain_item["additionalProperties"], serde_json::json!(false));
@@ -11216,7 +11263,7 @@ mod tests {
             serde_json::json!(["event", "async", "intercom"])
         );
 
-        // The multi-section description (index.ts:461-495) — the substrings pi's own
+        // The multi-section description (extension/index.ts:461-495) — the substrings pi's own
         // tool-description executable spec pins (test/unit/tool-description.test.ts).
         let desc = SUBAGENT_TOOL_DESCRIPTION;
         for needle in [
@@ -11247,7 +11294,7 @@ mod tests {
     }
 
     /// pi `chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd)`
-    /// (`subagent-executor.ts:2022` @v0.34.0), which lives in `runChainPath`.
+    /// (`subagent-executor.ts:2623` @v0.43.0), which lives in `runChainPath`.
     ///
     /// Regression: `chainDir` was advertised with pi's description copied verbatim
     /// (`schemas.ts:263`), deserialized into `SubagentToolParams::chain_dir`, counted by
@@ -11843,7 +11890,7 @@ mod tests {
     }
 
     /// SUBA-002's request-counting rules (pi `countRequestedSubagentSpawns`,
-    /// `subagent-executor.ts:284-292`), observed through the rejection notice's `N requested` field:
+    /// `subagent-executor.ts:439-447`), observed through the rejection notice's `N requested` field:
     /// a CHAIN bills each step, with a dynamic-parallel step billed its worst-case fan-out
     /// (`expand.maxItems`, else `config.chain.dynamicFanout.maxItems`, else 0) and a static parallel
     /// step billed its task count.
@@ -11941,7 +11988,7 @@ mod tests {
 
     /// SUBA-002 regression: the per-SESSION spawn budget covers the SLASH surface, not the
     /// `subagent` tool alone. Upstream gets this structurally — `/run`'s handler goes
-    /// `runSlashSubagent` -> `requestSlashRun` -> the bridge at `extension/index.ts:396-401` ->
+    /// `runSlashSubagent` -> `requestSlashRun` -> the bridge at `extension/index.ts:512-517` ->
     /// `executeSubagentCollapsed` -> the SAME `executor.execute` whose `reserveSubagentSpawns`
     /// (`subagent-executor.ts:266-282`, called at `:3434-3441`) charges the tool — so the cap is
     /// unbypassable there. In this crate `dispatch_slash` is an independent entry into
@@ -12021,7 +12068,7 @@ mod tests {
     /// funnel through [`SubagentsExtension::run_or_background_chain`], which pre-fix reached
     /// `run_or_background_graph` with no spawn charge whatsoever. Each is now billed over the
     /// LOWERED graph by [`count_graph_requested_spawns`], applying pi's per-step rule
-    /// (`countRequestedSubagentSpawns`, `subagent-executor.ts:284-292`) arm for arm — asserted
+    /// (`countRequestedSubagentSpawns`, `subagent-executor.ts:439-447`) arm for arm — asserted
     /// through the `N requested` field of the refusal notice, and for both `background: false` and
     /// `background: true`, since the charge sits ahead of that split.
     #[tokio::test]
@@ -12279,6 +12326,62 @@ mod tests {
         );
     }
 
+    /// END-TO-END for pi `handleList`'s proactive block (`agent-management.ts:765-770,784`): a real
+    /// `{ action: "list" }` tool call, over real on-disk agents and a real on-disk skill, must
+    /// render the `Proactive skill subagent suggestions:` block. This is the seam the recommender
+    /// was missing — the whole `proactive-skills.ts` port existed but nothing called it, so the
+    /// tool description's own line ("If { action: "list" } shows proactive skill subagent
+    /// suggestions, consider a small fresh-context fanout…") pointed at output that never appeared.
+    #[tokio::test]
+    async fn tool_list_renders_the_proactive_skill_subagent_suggestions_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agents_dir = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("mkdir agents");
+        for name in ["auditor-one", "auditor-two"] {
+            std::fs::write(
+                agents_dir.join(format!("{name}.md")),
+                format!("---\nname: {name}\ndescription: An auditor\nskills: audit-trail\n---\nBody.\n"),
+            )
+            .expect("write agent");
+        }
+        let skill_dir = dir.path().join(".cyrup").join("skills").join("audit-trail");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Trace every mutation.\n---\n\nHow to audit.\n",
+        )
+        .expect("write skill");
+
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let out = tool
+            .execute(
+                ToolCallId::from("t"),
+                serde_json::json!({ "action": "list" }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect("list is wired");
+        let text = out
+            .content
+            .iter()
+            .find_map(|c| match c {
+                cyrup_core::Content::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        assert!(
+            text.contains("Proactive skill subagent suggestions:"),
+            "the block must reach the tool's rendered output:\n{text}"
+        );
+        assert!(
+            text.contains("- audit-trail via reviewer (referenced by 2 configured agents/chains; agent:auditor-one, agent:auditor-two) - Trace every mutation."),
+            "the recommendation must name the skill, the carrier agent, its reference count and its \
+             sources, exactly as `formatProactiveSkillSubagentRecommendations` renders them:\n{text}"
+        );
+    }
+
     /// Dispatch discrimination: management/control/parallel/chain modes are each RECOGNIZED and
     /// routed to their own arm rather than mis-parsed as a broken SINGLE call. Management/control
     /// still short-circuit at their P1 stubs; parallel/chain now route to REAL execution, proven
@@ -12388,7 +12491,7 @@ mod tests {
         }
     }
 
-    /// T6 regression (pi `MUTATING_MANAGEMENT_ACTIONS`, `subagent-executor.ts:112`): a fanout child
+    /// T6 regression (pi `MUTATING_MANAGEMENT_ACTIONS`, `subagent-executor.ts:151`): a fanout child
     /// is refused ALL SEVEN mutating management actions — including the four SUBA-005 added — and
     /// the refusal happens BEFORE any discovery or filesystem access, so a child cannot even probe
     /// the parent's config through them. The read-only verbs are unaffected.
@@ -12438,7 +12541,7 @@ mod tests {
 
     /// Build the `ControlEvent` a `needs_attention` raise produces, with an explicit reason so
     /// distinct reasons yield distinct `controlNotificationKey`s (pi
-    /// `shared/subagent-control.ts:141-144` @v0.34.0).
+    /// `shared/subagent-control.ts:142-145` @v0.43.0).
     fn pump_test_event(
         run_id: &RunId,
         index: u32,
@@ -12600,14 +12703,14 @@ mod tests {
     /// SUBA-N05 — the `notifyChannels` gate, which had ZERO runtime consumers before this change.
     ///
     /// pi routes a raised event onto the transcript channel only when
-    /// `controlConfig.notifyChannels.includes("event")` (`subagent-executor.ts:521` @v0.34.0). A
+    /// `controlConfig.notifyChannels.includes("event")` (`subagent-executor.ts:817` @v0.43.0). A
     /// config of `notifyChannels: ["intercom"]` must therefore raise the event (it still lands on
     /// `SingleResult::control_events`) and deliver NO transcript notice. Before this change the
     /// notifier had no channel check at all, so such a config still produced a notice.
     ///
     /// Also pins the two gates that were already correct, so a refactor cannot quietly drop them:
     /// `active_long_running` is never surfaced as a transcript notice
-    /// (`control-notices.ts:74`), and an `["event"]` config does surface `needs_attention`.
+    /// (`control-notices.ts:50`), and an `["event"]` config does surface `needs_attention`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn notify_channels_gates_the_transcript_notice_without_suppressing_the_event() {
         use crate::registration::ControlNotificationChannel;
@@ -12794,7 +12897,7 @@ mod tests {
         );
 
         // A malformed `acceptance` policy is refused up front with pi's own
-        // `validateAcceptanceInput` message (`acceptance.ts:143`), not swallowed.
+        // `validateAcceptanceInput` message (`acceptance.ts:181`), not swallowed.
         let bad_acceptance = tool
             .execute(
                 ToolCallId::from("bad-acceptance"),
@@ -13398,7 +13501,7 @@ mod tests {
     ///
     /// pi runs this check inside `executeAsyncSingle` itself, in the PARENT process, before
     /// `spawnRunner` (`validateFileOnlyOutputMode(outputMode, outputPath, \`Async single run
-    /// (${agent})\`)`, `runs/background/async-execution.ts:909-910` via `single-output.ts:85-90`).
+    /// (${agent})\`)`, `runs/background/async-execution.ts:909-910` via `single-output.ts:140-145`).
     /// The filesystem assertion is the load-bearing half: no run directory may exist afterwards.
     #[tokio::test]
     async fn a_background_single_run_refuses_file_only_output_mode_with_no_path_before_spawning() {
@@ -13484,7 +13587,7 @@ mod tests {
         );
     }
 
-    /// pi `validateExecutionInput`'s mode-exclusivity gate (`subagent-executor.ts:1124-1143`,
+    /// pi `validateExecutionInput`'s mode-exclusivity gate (`subagent-executor.ts:1736-1754`,
     /// `hasChain`/`hasTasks`/`hasSingle` at `2995-2997`): mode is selected by a NON-EMPTY array, not
     /// merely the field's presence — an explicit `tasks: []` or `chain: []` (with no `agent`) must
     /// fall through to "Provide exactly one mode", never silently execute as an empty parallel run
@@ -13569,7 +13672,7 @@ mod tests {
         );
     }
 
-    /// pi `resolveRequestedCwd` (`subagent-executor.ts:193-195,2801-2802`): an explicit `cwd` param
+    /// pi `resolveRequestedCwd` (`subagent-executor.ts:348-350,2801-2802`): an explicit `cwd` param
     /// must be resolved and threaded into the dispatch's own discovery, not silently ignored in
     /// favor of the tool's construction-time cwd. Proven end-to-end with the read-only `get`
     /// management action (no process spawn, so safe to drive to completion): an agent that exists
@@ -13896,7 +13999,7 @@ mod tests {
         );
     }
 
-    /// pi `executeAsyncSingle` (`async-execution.ts:849-855`): `params.modelOverride ?? agent.model`
+    /// pi `executeAsyncSingle` (`async-execution.ts:1256-1267`): `params.modelOverride ?? agent.model`
     /// reaches the detached runner's step for an async SINGLE run regardless of whether that run is
     /// foreground or background. Before this fix, [`SubagentExecutor::spawn_background`] hardcoded
     /// `model: None` into the `SingleStepSpec` it wrote into `runner-config.json`, silently dropping
@@ -14180,7 +14283,7 @@ mod tests {
         );
     }
 
-    /// pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:585-589,650,672-678,717-750`
+    /// pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:926-930,650,672-678,717-750`
     /// / `826-830,895,914-920,935-967`): a background run started from WITHIN an already-nested run
     /// reroutes its storage under the inherited root's `nested-subagent-runs`/`nested` subtree,
     /// instead of the ordinary per-`cwd` shared async/results roots — otherwise it is
@@ -14228,7 +14331,7 @@ mod tests {
         }
     }
 
-    /// pi `formatAsyncStartedMessage` (`async-execution.ts:200-208`): the mode-specific headline
+    /// pi `formatAsyncStartedMessage` (`async-execution.ts:261-267`): the mode-specific headline
     /// followed by the fixed 4-line detached-run guidance, `"\n"`-joined verbatim. Before this fix,
     /// an async-start tool result was the single flat sentence "Background subagent run started:
     /// {run_id}. Use the status/interrupt management actions to check on it later; do not poll in a
@@ -14470,7 +14573,7 @@ mod tests {
 
     // ---------------------------------------------------------------------------------------
     // `/subagent-cost` walks the SESSION TRANSCRIPT (pi `buildSubagentCostReport`,
-    // slash-commands.ts:289-328), not a background status file: this drives the REAL production
+    // slash-commands.ts:377-416), not a background status file: this drives the REAL production
     // command path (`SubagentExecutor::run_cost_report` -> `cost_report_from_sessions_dir`) end to
     // end over a real on-disk session (created + appended via `cyrup_session::SessionManager`,
     // reloaded via `SessionManager::open`), proving the command sums the parent's own assistant
@@ -14642,7 +14745,7 @@ mod tests {
         let executor = SubagentExecutor::new();
         // No host bound (no live session model) and `delegate.md` declares no `model:` of its own,
         // so pi's `resolveSubagentModelOverride` has nothing to resolve to and `handleModels`
-        // renders its exact `"(unresolved)"` placeholder (agent-management.ts:591) — pre-fix this
+        // renders its exact `"(unresolved)"` placeholder (agent-management.ts:813) — pre-fix this
         // crate rendered the bespoke, non-pi "(inherits current session model)" text instead.
         let report = executor.run_models_report(dir.path(), Some("delegate"));
         assert!(
@@ -14661,7 +14764,7 @@ mod tests {
         let settings_dir = dir.path().join(".cyrup").join("agents");
         std::fs::create_dir_all(&settings_dir).expect("mkdir settings dir");
         // A settings override that explicitly requests pi's `"inherit"` sentinel — same request as
-        // leaving `model` unset, per `resolveSubagentModelOverride` (model-fallback.ts:47-59).
+        // leaving `model` unset, per `resolveSubagentModelOverride` (model-fallback.ts:196-220).
         std::fs::write(
             settings_dir.join("settings.json"),
             r#"{"subagents":{"agentOverrides":{"delegate":{"model":"inherit"}}}}"#,
@@ -14697,7 +14800,7 @@ mod tests {
         std::fs::create_dir_all(&settings_dir).expect("mkdir settings dir");
         // This override only ever touches `disabled` — it never applies to `model` — so the
         // resolved model provenance must NOT claim an "override" changed it (pi
-        // `agent.override && agent.model !== agent.override.base.model`, agent-management.ts:566-568).
+        // `agent.override && agent.model !== agent.override.base.model`, agent-management.ts:788-790).
         std::fs::write(
             settings_dir.join("settings.json"),
             r#"{"subagents":{"agentOverrides":{"scout":{"disabled":true}}}}"#,
@@ -14732,7 +14835,7 @@ mod tests {
         let executor = SubagentExecutor::new();
         let report = executor.run_models_report(dir.path(), Some("scout"));
         // pi `agent.modelSource.type === "subagents.defaultModel"` renders `${scope} defaultModel`
-        // (agent-management.ts:569-571); the pre-fix text hardcoded the unscoped "settings
+        // (agent-management.ts:791-793); the pre-fix text hardcoded the unscoped "settings
         // defaultModel" regardless of which settings scope actually supplied the default.
         assert!(
             report.contains("Source: project defaultModel"),
@@ -14747,7 +14850,7 @@ mod tests {
 
     /// PROV-007: `/subagents-models` resolves a BARE model id against the real built-in model
     /// registry (pi `resolveModelCandidate` over `ctx.modelRegistry.getAvailable()`,
-    /// model-fallback.ts:60-76), so a persona configured with a bare id from ANY registered
+    /// model-fallback.ts:148-164), so a persona configured with a bare id from ANY registered
     /// provider renders its `provider/id`. The retired 2-model seed stub could only ever resolve
     /// `claude-sonnet-4-5`/`gpt-4o`; every other bare id fell through pi's "no match" fallback and
     /// rendered verbatim.
@@ -14849,7 +14952,7 @@ mod tests {
         );
     }
 
-    /// pi `expandTilde` (`extension/index.ts:86-88`) composed with `path.resolve`: a leading `~/`
+    /// pi `expandTilde` (`extension/index.ts:233-234`) composed with `path.resolve`: a leading `~/`
     /// expands against the home directory before being resolved to an absolute path.
     #[test]
     fn format_configured_session_dir_expands_a_leading_tilde() {
@@ -15691,7 +15794,7 @@ mod tests {
 
     /// pi's `deliverSubagentIntercomMessageEvent` bounds EVERY caller — including this live-child
     /// follow-up steer (`subagent-executor.ts:860`) — to a 500ms default timeout race
-    /// (`result-intercom.ts:283-316`): the caller's own turn is never blocked longer than that
+    /// (`result-intercom.ts:325-358`): the caller's own turn is never blocked longer than that
     /// waiting on a delivery ack. Proven with a `SteerChannel` whose `steer` never resolves at all
     /// (the real-world shape of "no receiver ever answers"): pre-fix, `control_resume` awaited the
     /// raw `SteerChannel::steer` future directly with no outer race, so this would hang forever;
@@ -15835,7 +15938,7 @@ mod tests {
         );
     }
 
-    /// pi `buildRevivedAsyncTask` (`background/async-resume.ts:378-391`): a revived child's `{task}`
+    /// pi `buildRevivedAsyncTask` (`background/async-resume.ts:526-539`): a revived child's `{task}`
     /// must be the follow-up WRAPPED in the revival framing (source run/agent/session-file context
     /// plus an explicit "you are reviving..." preamble), never the orchestrator's raw follow-up text
     /// verbatim — the revived agent otherwise has no way to know it is resuming from a stored
@@ -16129,7 +16232,7 @@ mod tests {
     /// (a) An OMITTED call-site `context` (`None`) resolves EACH step to its own agent's persona
     /// `default_context` — a `fork`-defaulting agent forks, a `fresh`-defaulting agent stays fresh —
     /// rather than the pre-Tier-2 forced-`Fresh` collapse. Mirrors pi's
-    /// `resolveAgentDefaultContextPolicy` (`subagent-executor.ts:1280-1293`).
+    /// `resolveAgentDefaultContextPolicy` (`subagent-executor.ts:1875-1891`).
     #[tokio::test]
     async fn omitted_call_site_context_falls_back_to_each_agents_persona_default() {
         let (resolver, _root) = persisted_fork_resolver().await;
@@ -16302,7 +16405,7 @@ mod tests {
     // =============================================================================================
     // "profiles" unit divergence fixes: real live-probe classification/ranking (pi
     // `probeModel`/`classifyModel`/`refreshProviderModelCatalog`/`generateProfilesForProvider`,
-    // profiles.ts:250-606) + Ok-vs-Err on empty-provider paths (profiles.ts:506-508/593-595).
+    // profiles.ts:267-630) + Ok-vs-Err on empty-provider paths (profiles.ts:530-532/593-595).
     // =============================================================================================
 
     fn test_model(
@@ -16337,7 +16440,7 @@ mod tests {
         }
     }
 
-    /// pi `resolveProbeStatus` (profiles.ts:310-316): `timedOut` always wins; empty text is
+    /// pi `resolveProbeStatus` (profiles.ts:327-333): `timedOut` always wins; empty text is
     /// `error`; an auth/billing-shaped message wins over an unavailable-shaped one; anything else
     /// is `error`.
     #[test]
@@ -16349,7 +16452,7 @@ mod tests {
         assert_eq!(resolve_probe_status("connection reset by peer", false), ProbeStatus::Error);
     }
 
-    /// pi `extractVersionScore` (profiles.ts:150-154): the max numeric token, decimals included.
+    /// pi `extractVersionScore` (profiles.ts:167-171): the max numeric token, decimals included.
     #[test]
     fn extract_version_score_takes_the_max_numeric_token() {
         assert_eq!(extract_version_score("claude-3-5-sonnet"), 5.0);
@@ -16358,7 +16461,7 @@ mod tests {
         assert_eq!(extract_version_score("no-numbers-here"), 0.0);
     }
 
-    /// pi `modelNameTokens`/`inferProfileBand` (profiles.ts:156-172).
+    /// pi `modelNameTokens`/`inferProfileBand` (profiles.ts:173-189).
     #[test]
     fn infer_profile_band_recognizes_known_name_tokens() {
         assert_eq!(infer_profile_band("Claude Haiku 4.5"), 1);
@@ -16399,7 +16502,7 @@ mod tests {
         assert!(cost_ascending_puts_strong_first, "test fixture must actually invert cost vs capability");
     }
 
-    /// pi `catalogModelIsUsable` (profiles.ts:402-404): only `unavailable`/`auth`/`timeout`/`error`
+    /// pi `catalogModelIsUsable` (profiles.ts:417-419): only `unavailable`/`auth`/`timeout`/`error`
     /// probe outcomes are unusable; `ok` (and any legacy/unknown string) is usable.
     #[test]
     fn probe_status_is_usable_matches_pi_predicate() {
@@ -16410,7 +16513,7 @@ mod tests {
         assert!(!probe_status_is_usable("error"));
     }
 
-    /// pi `dominatesModel`/`filterDominatedModels` (profiles.ts:365-383): a candidate that is
+    /// pi `dominatesModel`/`filterDominatedModels` (profiles.ts:382-400): a candidate that is
     /// cheaper-or-equal, ranked-at-least-as-high, and never worse on reasoning/context/max-tokens —
     /// with at least one strict improvement — dominates and drops the other.
     #[test]
@@ -16447,7 +16550,7 @@ mod tests {
     }
 
     /// pi `refreshProviderModelCatalog` throws `"No models found in the current registry for
-    /// provider '...'."` (profiles.ts:506-508) when the registry has zero models for the provider —
+    /// provider '...'."` (profiles.ts:530-532) when the registry has zero models for the provider —
     /// cyrup used to return `Ok("... nothing to refresh...")` for this exact case instead. The
     /// unknown-provider check runs BEFORE any filesystem write, so this is safe to exercise without
     /// `CYRUP_HOME` sandboxing (no real `~/.cyrup` write happens on this path).
@@ -16472,7 +16575,7 @@ mod tests {
     }
 
     /// pi `generateProfilesForProvider` -> `refreshProviderModelCatalog` throws the identical
-    /// "No models found..." error (profiles.ts:506-508, invoked at profiles.ts:586) BEFORE any
+    /// "No models found..." error (profiles.ts:530-532, invoked at profiles.ts:610) BEFORE any
     /// usable-model filtering — cyrup used to return `Ok("... nothing to generate...")` instead.
     /// Also safe without `CYRUP_HOME` sandboxing: the unknown-provider check is the very first
     /// thing this handler does, before any filesystem write.

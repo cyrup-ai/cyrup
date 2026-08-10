@@ -93,7 +93,7 @@ fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 /// SUBA-041's stated acceptance criterion, verbatim: `{agent, task, output: "report.md",
 /// outputMode: "file-only"}` must COMPLETE, with the output written to a file and only a concise
 /// file reference returned inline — pi's `finalizeSingleOutput` + `formatSavedOutputReference`
-/// (`single-output.ts:73-83`) behavior for `outputMode: "file-only"`.
+/// (`single-output.ts:128-138`) behavior for `outputMode: "file-only"`.
 ///
 /// Against pre-SUBA-041 code this call never spawned anything at all: `route_single` refused it
 /// with `subagent SINGLE mode does not yet support the following param(s): output, outputMode`.
@@ -154,7 +154,7 @@ async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_re
 
     // (1) The file was actually written. `output: "report.md"` is relative, so pi resolves it
     // against the run's own scoped output base dir (`<artifactsDir>/outputs/<runId>`,
-    // `subagent-executor.ts:2203-2207`) — under the isolated CYRUP_HOME, never the user's cwd.
+    // `subagent-executor.ts:2838-2842`) — under the isolated CYRUP_HOME, never the user's cwd.
     let mut files = Vec::new();
     walk(home_dir.path(), &mut files);
     let report = files
@@ -459,7 +459,7 @@ async fn an_agent_async_default_backgrounds_a_call_that_omits_async() {
 //
 // pi calls `applySingleAgentLaunchDefaults` exactly ONCE, at the shared `execute` entry
 // (`subagent-executor.ts:3608` @v0.35.0), and its `/run` handler is `runSlashSubagent` ->
-// `requestSlashRun` -> the bridge at `extension/index.ts:396-401` -> the SAME `executor.execute`
+// `requestSlashRun` -> the bridge at `extension/index.ts:512-517` -> the SAME `executor.execute`
 // the tool uses — so upstream's two surfaces cannot disagree. cyrup's `/run` is an INDEPENDENT
 // entry point (`SubagentsExtension::execute_command`'s `Run` arm), so the defaults have to be
 // applied there too. They were not: the resolution lived inside `SubagentTool::route_single`, and

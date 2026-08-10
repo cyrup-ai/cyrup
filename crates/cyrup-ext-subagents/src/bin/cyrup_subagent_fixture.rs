@@ -139,7 +139,7 @@ enum ScriptStep {
     ///
     /// This is the ONLY channel `exec::structured::read_structured_output` consults when the
     /// parent created a capture runtime — a fenced ` ```json ` block in prose is deliberately NOT
-    /// a substitute (pi's whole point at `structured-output.ts:56-58`: a missing capture file is a
+    /// a substitute (pi's whole point at `structured-output.ts:157-159`: a missing capture file is a
     /// hard failure even when prose was produced). A fixture test that wants to exercise the
     /// structured-output path therefore has to make this call, exactly as a real child would.
     ///

@@ -196,7 +196,7 @@ fn a_research_agent_infers_a_real_contract_rather_than_none() {
 }
 
 /// End to end: a research child that emits ordinary prose and no `acceptance-report` block gets a
-/// REJECTED ledger (pi `evaluateAcceptance`'s missing-attestation branch, `acceptance.ts:808-814`)
+/// REJECTED ledger (pi `evaluateAcceptance`'s missing-attestation branch, `acceptance.ts:1277-1283`)
 /// — not the `not-required` cyrup previously reported — and, because the contract was INFERRED
 /// rather than explicit, the run still exits 0 with no error (pi `execution.ts:1229` gates its
 /// exit-code correction on `result.acceptance.explicit`).

@@ -26,7 +26,9 @@
 //!    `artifacts_dir: art_cfg.enabled.then(|| art_dir.clone())` (so SUBA-041's `artifacts: false`
 //!    disarms memoization with the quadruple), and `background/runner_main.rs`'s
 //!    `self.artifacts_dir.clone().filter(|_| self.artifact_config.enabled)` on the hop-2 runner.
-//!    The last three tests here drive those seams end to end.
+//!    The last five tests here drive those seams end to end — including BOTH terms of the hop-2
+//!    runner's gate, which need three cases between them because `artifacts_dir: None` alone can
+//!    never reach the `.filter(…)` that the `artifact_config.enabled` term lives in.
 //!
 //! No mocking: every verify command below is a REAL `/bin/sh` subprocess, every workspace is a REAL
 //! `git` repository, and the two wiring tests spawn the REAL `cyrup-subagent-fixture` binary as a
@@ -961,5 +963,67 @@ async fn the_background_hop_writes_no_memo_when_the_run_disabled_artifacts() {
         execution_count(&marker),
         2,
         "with no memo context BOTH verify commands really execute"
+    );
+}
+
+/// The SECOND term of the same gate, which the test directly above cannot reach.
+///
+/// `background/runner_main.rs`'s `self.artifacts_dir.clone().filter(|_| self.artifact_config
+/// .enabled)` is a two-term gate, and an `artifacts_dir: None` run short-circuits on the FIRST
+/// term: the `.filter(…)` never runs, so deleting it entirely leaves that test green. Only a run
+/// carrying a REAL `artifacts_dir` alongside `artifact_config.enabled == false` distinguishes the
+/// two, and this is that run — same fixture, same duplicate verify policy, only the config pair
+/// changed.
+///
+/// The pairing is upstream's, at the boundary that BUILDS the runner's ctx rather than at the
+/// runner: `artifactsDir: artifactConfig.enabled ? artifactsDir : undefined`
+/// (`runs/background/async-execution.ts:1037`, and again at `:1454` for the parallel result mode)
+/// — the async runner itself then passes `artifactsDir: ctx.artifactsDir` to `evaluateAcceptance`
+/// unconditionally (`runs/background/subagent-runner.ts:1638-1639` @v0.43.0), because by then a
+/// disabled config has already erased the directory. cyrup carries both fields all the way to
+/// hop 2 in `RunnerConfig`, so it re-applies that same `enabled ? dir : undefined` here; drop it
+/// and `artifacts: false` would silently keep writing memo artifacts under a directory the run was
+/// told not to use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_background_hop_writes_no_memo_when_the_config_is_disabled_despite_a_real_dir() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    init_repo(dir.path());
+    let artifacts_dir = dir.path().join("arts");
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let marker = marker_dir.path().join("runs.log");
+
+    // A REAL directory on the first term — so the run reaches the second one — with the config
+    // that `artifacts: false` produces. `foreground()` (what `runner_config` installs) has every
+    // include flag on, so nothing but `enabled` is holding the write back.
+    let mut config = runner_config(
+        dir.path(),
+        "memohop2run3",
+        Some(artifacts_dir.clone()),
+        single_step("worker", "do the thing", duplicate_verify_policy(&marker)),
+    );
+    config.artifact_config.enabled = false;
+
+    run_hop2(dir.path(), config).await;
+
+    let artifacts = memo_artifacts(&artifacts_dir);
+    assert!(
+        artifacts.is_empty(),
+        "`artifact_config.enabled == false` must disarm verify memoization even though \
+         `artifacts_dir` is a real path; found: {artifacts:?} under {}",
+        artifacts_dir.display()
+    );
+    assert_eq!(
+        execution_count(&marker),
+        2,
+        "with memoization disarmed BOTH verify commands really execute — a count of 1 means the \
+         second was replayed from a memo this run was never allowed to write"
+    );
+    // The quadruple shares the gate, so the disabled run leaves the directory untouched entirely.
+    assert!(
+        !artifacts_dir.exists(),
+        "a disabled artifact config must create nothing under {}",
+        artifacts_dir.display()
     );
 }

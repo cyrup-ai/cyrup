@@ -16,7 +16,7 @@
 //! The budget crosses the process boundary as JSON in [`TOOL_BUDGET_ENV`], exactly as pi ships it
 //! in `PI_SUBAGENT_TOOL_BUDGET` (`tool-budget.ts:63-71`); the child-side enforcement lives in
 //! [`crate::prompt_runtime`], the port of `subagent-prompt-runtime.ts::registerToolBudget`
-//! (`subagent-prompt-runtime.ts:171-190`).
+//! (`subagent-prompt-runtime.ts:306-325`).
 
 use crate::discovery::types::{AllToolsMarker, ResolvedToolBudget, ToolBudgetBlock};
 
@@ -141,7 +141,7 @@ fn as_positive_integer(value: &serde_json::Value) -> Option<u32> {
     Some(n as u32)
 }
 
-/// pi `shouldBlockToolForBudget` (`tool-budget.ts:47-50`): a call is refused only once the count
+/// pi `shouldBlockToolForBudget` (`tool-budget.ts:53-56`): a call is refused only once the count
 /// PASSES `hard` (i.e. `nextToolCount > hard`) and the tool is in the block set.
 #[must_use]
 pub fn should_block_tool_for_budget(
@@ -158,7 +158,7 @@ pub fn should_block_tool_for_budget(
     }
 }
 
-/// pi `toolBudgetSoftNudge` (`tool-budget.ts:52-54`) — verbatim, including the `soft`/`hard`
+/// pi `toolBudgetSoftNudge` (`tool-budget.ts:58-60`) — verbatim, including the `soft`/`hard`
 /// interpolation and the singular/plural "call"/"calls".
 #[must_use]
 pub fn tool_budget_soft_nudge(budget: &ResolvedToolBudget, tool_count: u32) -> String {
@@ -174,7 +174,7 @@ pub fn tool_budget_soft_nudge(budget: &ResolvedToolBudget, tool_count: u32) -> S
     )
 }
 
-/// pi `toolBudgetBlockedMessage` (`tool-budget.ts:56-58`) — verbatim.
+/// pi `toolBudgetBlockedMessage` (`tool-budget.ts:62-64`) — verbatim.
 #[must_use]
 pub fn tool_budget_blocked_message(
     budget: &ResolvedToolBudget,
@@ -188,7 +188,7 @@ pub fn tool_budget_blocked_message(
     )
 }
 
-/// pi `encodeToolBudgetEnv` (`tool-budget.ts:63-65`): the resolved budget as JSON, or `None`.
+/// pi `encodeToolBudgetEnv` (`tool-budget.ts:69-71`): the resolved budget as JSON, or `None`.
 #[must_use]
 pub fn encode_tool_budget_env(budget: Option<&ResolvedToolBudget>) -> Option<String> {
     budget.and_then(|b| serde_json::to_string(b).ok())

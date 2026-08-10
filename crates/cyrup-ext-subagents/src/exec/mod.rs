@@ -80,7 +80,7 @@ pub mod structured;
 pub mod task_intent;
 
 /// `{text, expandedText}` tool-call argument previews (R-SA-043's compaction target) — pi
-/// `ToolCallSummary` + `formatToolCall` (`shared/types.ts:225`, `shared/formatters.ts:99`).
+/// `ToolCallSummary` + `formatToolCall` (`shared/types.ts:601`, `shared/formatters.ts:99`).
 pub mod tool_call_summary;
 
 /// Per-run child tool-call budgets (`toolBudget:` frontmatter and the
@@ -110,7 +110,8 @@ use crate::exec::fallback::{
 use crate::exec::ndjson::SubagentEvent;
 use crate::exec::output::{
     EMPTY_OUTPUT_ERROR, INTERRUPTED_FINAL_OUTPUT, OutputCap, detect_subagent_error,
-    extract_final_output, inject_single_output_instruction, is_terminal_assistant_stop,
+    extract_final_output, inject_output_path_system_prompt, inject_single_output_instruction,
+    is_terminal_assistant_stop,
     message_end_has_error_message, resolve_output_handoff, snapshot_output_file,
     trailing_assistant_error, truncate_output, validate_file_only_requires_path,
 };
@@ -202,7 +203,7 @@ pub struct AgentConfig {
     pub fallback_models: Vec<ModelId>,
     /// The agent's frontmatter reasoning level (func-SA §4.1 `AgentDefinition::thinking`) as pi's
     /// OPEN string, applied to the child's `--model` argument as a `:<value>` suffix at spawn time via
-    /// [`apply_thinking_suffix`] (pi `applyThinkingSuffix`, `pi-args.ts:76-81`) — `None` leaves the
+    /// [`apply_thinking_suffix`] (pi `applyThinkingSuffix`, `runs/shared/pi-args.ts:76-81`) — `None` leaves the
     /// per-attempt model id untouched. Carrying the raw string (rather than a closed on-only enum)
     /// means an explicit `Some("off")` now reaches the child as `:off`, exactly like pi, instead of
     /// being conflated with `None` and dropped.
@@ -212,7 +213,7 @@ pub struct AgentConfig {
     pub tools: Option<Vec<ToolRef>>,
     /// Extension-allowlist tri-state (func-SA §4.1 `AgentDefinition::extensions`): `Some(list)`
     /// emits `--no-extensions` plus an explicit `--extension` for each entry (discovery off, exact
-    /// allowlist); `None` leaves the child's own extension discovery on (pi `pi-args.ts:128-137`).
+    /// allowlist); `None` leaves the child's own extension discovery on (pi `runs/shared/pi-args.ts:128-137`).
     pub extensions: Option<Vec<String>>,
     /// Child-only extension paths always threaded as `--extension`, visible to the spawned child
     /// even when not visible to the orchestrator (pi `subagentOnlyExtensions`).
@@ -220,10 +221,10 @@ pub struct AgentConfig {
     pub output: Option<crate::discovery::types::OutputSpec>,
     /// pi's `PI_SUBAGENT_INHERIT_PROJECT_CONTEXT` env flag: whether the child inherits the parent's
     /// project-context files (`AGENTS.md`/`CLAUDE.md`) — threaded to the child as
-    /// `CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT=1|0` (pi `pi-args.ts:199`).
+    /// `CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT=1|0` (pi `runs/shared/pi-args.ts:199`).
     pub inherit_project_context: bool,
     /// Whether the child inherits skills discovery: when `false`, the child is spawned with
-    /// `--no-skills` and `CYRUP_SUBAGENT_INHERIT_SKILLS=0` (pi `pi-args.ts:139-141,200`).
+    /// `--no-skills` and `CYRUP_SUBAGENT_INHERIT_SKILLS=0` (pi `runs/shared/pi-args.ts:139-141,200`).
     pub inherit_skills: bool,
     /// The agent's own frontmatter `skills` list (func-SA §4.1, R-SA-017). These are the
     /// EXPLICITLY-configured skill names resolved to `<available_skills>` pointers and injected into
@@ -372,7 +373,7 @@ pub struct ResolvedAgentPersona {
     /// Carried on the resolved persona so the orchestrator can, when a call site OMITS `context`,
     /// fall back to each requested agent's OWN default via
     /// [`crate::fork_context::resolve_effective_context`] (pi `resolveAgentDefaultContextPolicy`,
-    /// `subagent-executor.ts:1280-1293`) — matching pi, where the already-resolved `agents` list the
+    /// `subagent-executor.ts:1875-1891`) — matching pi, where the already-resolved `agents` list the
     /// executor consults carries `defaultContext`. `#[serde(default)]` keeps the one-shot
     /// runner-config hand-off backward compatible.
     #[serde(default)]
@@ -482,7 +483,7 @@ pub struct RunOptions {
     /// `None` means no wall-clock timeout at all.
     pub deadline_at: Option<Instant>,
     /// The NOMINAL foreground timeout budget in milliseconds (pi `timeoutMs`/`maxRuntimeMs`, aliases
-    /// resolved by the orchestrator, `subagent-executor.ts:1327-1341`). Distinct from `deadline_at`
+    /// resolved by the orchestrator, `subagent-executor.ts:1951-1968`). Distinct from `deadline_at`
     /// (the actual wall-clock instant the timer fires at): `timeout_ms` is what the timed-out
     /// message renders (`Subagent timed out after {ms}ms.`, pi `formatTimeoutMessage`), while
     /// `deadline_at` is what [`run_sync`] actually races the child against. Normally the orchestrator
@@ -514,7 +515,7 @@ pub struct RunOptions {
     /// [`build_attempt_spawn_plan`]). pi v0.34.0 has no gist upload of its own — the tool schema's
     /// legacy "Upload session to GitHub Gist" wording describes a capability neither side ships.
     pub share: Option<bool>,
-    /// pi `options.sessionDir` (`pi-args.ts:107-111`): the directory the child persists its session
+    /// pi `options.sessionDir` (`runs/shared/pi-args.ts:107-111`): the directory the child persists its session
     /// under, passed through as `--session-dir <dir>` and created up front. Ignored when
     /// [`ForkContext::session_file_path`] resolved a concrete session FILE (pi's `sessionFile` wins
     /// that branch outright).
@@ -590,7 +591,7 @@ pub struct RunOptions {
     /// child's spawn env overlay as [`crate::spawn::intercom_target::ENV_ORCHESTRATOR_TARGET`] so the
     /// spawned child's `IntercomExtension` reads non-`None` child-orchestrator metadata → registers
     /// `contact_supervisor` (addressed at THIS supervisor) + a broker presence under its own
-    /// deterministic label (the child-bridge activation, pi `pi-args.ts:204-205`). `None` (headless /
+    /// deterministic label (the child-bridge activation, pi `runs/shared/pi-args.ts:204-205`). `None` (headless /
     /// no live intercom session, and every no-intercom test) leaves the six child-bridge vars unset,
     /// so the spawned child registers no supervisor bridge — the clean no-intercom path. Gated
     /// together with [`Self::run_id`]: BOTH must be `Some` for the metadata to activate at all, so a
@@ -601,7 +602,7 @@ pub struct RunOptions {
     /// presence label via [`crate::spawn::intercom_target::resolve_subagent_intercom_target`]. Paired
     /// with [`Self::orchestrator_intercom_target`] — both `Some` is the child-bridge activation gate.
     pub run_id: Option<crate::background::RunId>,
-    /// This child's flat index within its run (pi `childIndex`/`ctx.flatIndex`, `pi-args.ts:213-214`)
+    /// This child's flat index within its run (pi `childIndex`/`ctx.flatIndex`, `runs/shared/pi-args.ts:213-214`)
     /// — the `+1`-suffixed step position in its own presence label + the child's
     /// [`crate::spawn::nested_events::CHILD_INDEX_ENV`]. `None` defaults to `0` (a single top-level
     /// run has one child at index 0).
@@ -610,7 +611,7 @@ pub struct RunOptions {
     /// (`<run_dir>/control/steer-targets/<flatIndex>/`), handed to the child process as
     /// [`crate::prompt_runtime::STEER_INBOX_ENV`].
     ///
-    /// pi `steerInboxDir` (`pi-args.ts:67,251-252` @v0.34.0), supplied by the background runner as
+    /// pi `steerInboxDir` (`runs/shared/pi-args.ts:67,251-252` @v0.34.0), supplied by the background runner as
     /// `stepSteerInboxDir(asyncDir, fi)` (`subagent-runner.ts:2313,2600,2797`). This is the ONLY
     /// channel a steer request has to a running child: the parent drops a request into the
     /// run-level queue, the runner routes it into this per-child directory, and the child's own
@@ -854,7 +855,7 @@ pub struct SingleResult {
     /// that shape is O(1) in the child's chattiness. pi bounds neither on this path.
     ///
     /// **[CYRUP-DELTA] on placement.** pi carries the array one level UP, on
-    /// `Details.progress: AgentProgress[]` (`types.ts:908`), assembled as `allProgress` from each
+    /// `Details.progress: AgentProgress[]` (`shared/types.ts:908`), assembled as `allProgress` from each
     /// child's own `result.progress` (`subagent-executor.ts:3060-3062,3380`), and blanks
     /// `SingleResult.progress` in the returned `results` (`compactForegroundResult`,
     /// `utils.ts:404-412`). cyrup's SINGLE-mode tool `details` IS the serialized `SingleResult`
@@ -1192,7 +1193,7 @@ pub struct AttemptSpawnPlan {
 const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Child env flag: whether the subagent inherits the parent's project-context files
-/// (`AGENTS.md`/`CLAUDE.md`) — pi `PI_SUBAGENT_INHERIT_PROJECT_CONTEXT` (`pi-args.ts:199`).
+/// (`AGENTS.md`/`CLAUDE.md`) — pi `PI_SUBAGENT_INHERIT_PROJECT_CONTEXT` (`runs/shared/pi-args.ts:199`).
 ///
 /// Aliased to the READER's declaration ([`crate::prompt_runtime`], which acts on it child-side in
 /// `before_agent_start`) rather than re-spelled here: the two spellings drifting apart would
@@ -1200,10 +1201,10 @@ const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "
 const INHERIT_PROJECT_CONTEXT_ENV: &str = crate::prompt_runtime::INHERIT_PROJECT_CONTEXT_ENV;
 
 /// Child env flag: whether the subagent inherits skills discovery — pi
-/// `PI_SUBAGENT_INHERIT_SKILLS` (`pi-args.ts:200`). Same aliasing rule as above.
+/// `PI_SUBAGENT_INHERIT_SKILLS` (`runs/shared/pi-args.ts:200`). Same aliasing rule as above.
 const INHERIT_SKILLS_ENV: &str = crate::prompt_runtime::INHERIT_SKILLS_ENV;
 
-/// The MCP adapter's direct-tool-allowlist env (pi keeps this un-namespaced, `pi-args.ts:216-220`):
+/// The MCP adapter's direct-tool-allowlist env (pi keeps this un-namespaced, `runs/shared/pi-args.ts:216-220`):
 /// the comma-joined `mcp:` selectors, or [`MCP_DIRECT_TOOLS_NONE_SENTINEL`] when the agent declares
 /// no direct MCP tools at all (so the child's adapter can distinguish "none selected" from "env
 /// unset / inherited").
@@ -1237,15 +1238,15 @@ pub const AGENT_NAME_ENV_VAR: &str = "CYRUP_SUBAGENT_AGENT_NAME";
 /// pi's `__none__` sentinel for [`MCP_DIRECT_TOOLS_ENV`] when no direct MCP tools are declared.
 const MCP_DIRECT_TOOLS_NONE_SENTINEL: &str = "__none__";
 
-/// The child flag carrying a `SystemPromptMode::Replace` persona body (pi `pi-args.ts:165`'s
+/// The child flag carrying a `SystemPromptMode::Replace` persona body (pi `runs/shared/pi-args.ts:165`'s
 /// `"--system-prompt"`; the host side is `cyrup/src/cli.rs`'s `#[arg(long = "system-prompt")]`).
 const SYSTEM_PROMPT_FLAG: &str = "--system-prompt";
 
-/// The child flag carrying a `SystemPromptMode::Append` persona body (pi `pi-args.ts:165`'s
+/// The child flag carrying a `SystemPromptMode::Append` persona body (pi `runs/shared/pi-args.ts:165`'s
 /// `"--append-system-prompt"`; repeatable host-side, joined with `\n`).
 const APPEND_SYSTEM_PROMPT_FLAG: &str = "--append-system-prompt";
 
-/// pi `applyThinkingSuffix` (`pi-args.ts:76-81`): append `:<thinking>` to a model id, unless the
+/// pi `applyThinkingSuffix` (`runs/shared/pi-args.ts:76-81`): append `:<thinking>` to a model id, unless the
 /// model already ends with a recognized `:<level>` suffix (leave it untouched) or either input is
 /// absent (return the model as-is). Operates on strings so the exact pi rule — including the `off`
 /// level a closed on-only enum cannot itself carry — is reproduced verbatim; the agent's own OPEN
@@ -1291,7 +1292,7 @@ pub fn split_known_thinking_suffix(model: &str) -> (&str, &str) {
 }
 
 /// Append `item` to `vec` only if not already present — the order-preserving de-duplication pi
-/// achieves with `[...new Set(...)]` over the extension-path list (`pi-args.ts:130,134`).
+/// achieves with `[...new Set(...)]` over the extension-path list (`runs/shared/pi-args.ts:130,134`).
 fn push_unique(vec: &mut Vec<String>, item: String) {
     if !vec.contains(&item) {
         vec.push(item);
@@ -1299,40 +1300,49 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 }
 
 /// Build the argv + env overlay for one attempt against `model` (R-SA-024/047/048/054; pi
-/// `buildPiArgs`, `pi-args.ts:83-229`).
+/// `buildPiArgs`, `runs/shared/pi-args.ts:83-229`).
 ///
 /// Argv (flags in any order, task prompt last): `--print`, `--mode`, `json`; `--model
 /// <apply_thinking_suffix(model, agent.thinking)>` (T4 thinking-suffix); the tool-allowlist flag —
 /// `--tools <comma-list>` (the agent's declared builtins plus any resolved direct-MCP tool names)
 /// when the agent pinned a non-empty allowlist, `--no-tools` when it pinned an EMPTY one, and
-/// nothing at all when it pinned none (pi's `explicitToolAllowlist` gate, `pi-args.ts:547-552`); the agent's
+/// nothing at all when it pinned none (pi's `explicitToolAllowlist` gate, `runs/shared/pi-args.ts:547-552`); the agent's
 /// extension threading (`--no-extensions` + `--extension <path>` allowlist when `agent.extensions`
 /// is `Some`, else `--extension <path>` for tool-extension/child-only paths with discovery left
 /// on); `--no-skills` when the agent does not inherit skills; `--system-prompt=<persona body>` /
 /// `--append-system-prompt=<persona body>` per `agent.system_prompt_mode` when the body is
 /// non-empty (ONE argv element, `=`-joined — see below); pi's full session branch
-/// (`pi-args.ts:100-112`) — either `--session <path>` when `opts.fork_context` resolved a session
+/// (`runs/shared/pi-args.ts:100-112`) — either `--session <path>` when `opts.fork_context` resolved a session
 /// file path, or else `--no-session` unless [`RunOptions::session_dir`]/[`RunOptions::share`]
 /// enable sessions plus `--session-dir <dir>` for an explicit directory; then the task prompt last
 /// (via [`ChildSpawnSpec::resolve_task_arg`], R-SA-047's `@<tempfile>` overflow rule).
 ///
 /// Env overlay carries the child-ROLE pair
-/// ([`crate::spawn::nested_events::child_role_env`] — pi `pi-args.ts:329-330`), the incremented
+/// ([`crate::spawn::nested_events::child_role_env`] — pi `runs/shared/pi-args.ts:329-330`), the incremented
 /// depth envelope (R-SA-054), the run sentinel, the agent's inherit flags
 /// ([`INHERIT_PROJECT_CONTEXT_ENV`]/[`INHERIT_SKILLS_ENV`]), and the raw direct-MCP selector list
 /// ([`MCP_DIRECT_TOOLS_ENV`], or the `__none__` sentinel).
 ///
 /// The agent's own persona prose (`agent.system_prompt_body`) is delivered here as
 /// `--system-prompt=<body>` (`SystemPromptMode::Replace`) or `--append-system-prompt=<body>`
-/// (`SystemPromptMode::Append`) — pi `pi-args.ts:159-165` (v0.34.0), where the mode picks the flag
+/// (`SystemPromptMode::Append`) — pi `runs/shared/pi-args.ts:159-165` (v0.34.0), where the mode picks the flag
 /// and the body always ships. Nothing child-side re-resolves the persona from
 /// [`AGENT_NAME_ENV_VAR`] (that var is read only by the permission companion), so this argv pair is
 /// the ONLY channel the persona has.
 ///
-/// The authoritative output-path instruction (R-SA-024) and the `<available_skills>` pointer block
-/// remain composed into `task` BEFORE this function is called — see [`build_task_text`] — rather
-/// than being folded into the persona body the way pi's `execution.ts:1054-1062` composes them, so
-/// that a `Replace`-mode persona cannot suppress the orchestrator's own scaffolding.
+/// The `<available_skills>` pointer block remains composed into `task` BEFORE this function is
+/// called — see [`build_task_text`] — rather than being folded into the persona body the way pi's
+/// `execution.ts:1054-1056` composes it, so that a `Replace`-mode persona cannot suppress the
+/// orchestrator's own scaffolding.
+///
+/// The output-path override (R-SA-024) travels on BOTH surfaces, exactly as upstream sends it. The
+/// task-side half (`injectSingleOutputInstruction`, the `**Output:**` header) is composed into
+/// `task` by [`build_task_text`], mirroring `subagent-executor.ts:3674`. The system-prompt half
+/// ([`crate::exec::output::inject_output_path_system_prompt`], the `Runtime output path override:`
+/// header) is composed onto the persona body HERE, mirroring `execution.ts:1443` — the statement
+/// upstream runs immediately after folding the memory block onto the same `systemPrompt` string,
+/// which is the line just below. Both are keyed on the presence of an output PATH alone, never on
+/// [`RunOptions::output_mode`], and both are capability-aware.
 ///
 /// **[CYRUP-DELTA]** pi writes the composed prompt to a `0600` temp file and passes the PATH,
 /// because pi's `resolvePromptInput` (`resource-loader.ts:53-68`) reads `--system-prompt`'s value
@@ -1341,10 +1351,14 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// resolution anywhere), so the body is passed inline; handing over a path here would deliver the
 /// path string itself as the child's system prompt. Inline means the `=`-joined single-argv form is
 /// mandatory, not stylistic — clap refuses a detached value beginning with `-`, and markdown
-/// personas routinely open on a `- bullet` or a `---` rule. An empty/whitespace-only body emits NO flag at
-/// all (pi always emits it, but pi's value is the persona PLUS skills, memory and output-path
-/// steering, so it is never meaningfully empty; emitting `--system-prompt ""` here would blank the
-/// child's assembled prompt instead).
+/// personas routinely open on a `- bullet` or a `---` rule. A body that is still empty AFTER the
+/// memory block and the output-path override have been composed onto it emits NO flag at all (pi
+/// emits unconditionally, `runs/shared/pi-args.ts:570-585`'s `!== undefined && !== null`, so an empty string
+/// still writes a `0600` prompt file and still passes `--system-prompt <path>`; emitting
+/// `--system-prompt=` here would blank the child's assembled prompt instead of leaving it alone).
+/// That delta now covers only the genuinely-empty case: an agent with an output path configured
+/// composes a non-empty override and therefore DOES ship the flag, which is upstream's own
+/// rationale for why its value "is never meaningfully empty".
 ///
 /// # Errors
 ///
@@ -1357,7 +1371,7 @@ pub fn build_attempt_spawn_plan(
     opts: &RunOptions,
     depth: DepthEnvelope,
     temp_dir: &std::path::Path,
-    // SUBA-S01 (pi `pi-args.ts:246-250`): the run's capture runtime, whose two paths become the
+    // SUBA-S01 (pi `runs/shared/pi-args.ts:246-250`): the run's capture runtime, whose two paths become the
     // child's structured-output env overlay. `None` = the step declared no `outputSchema`, and the
     // child then registers no `structured_output` tool at all.
     structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
@@ -1380,7 +1394,7 @@ pub fn build_attempt_spawn_plan(
     // pi `splitToolList` already ran at discovery time, so a `mcp:`-prefixed entry is a
     // `ToolRef::Mcp` holding the bare selector (pi's `mcpDirectTools`) and an extension-path entry a
     // `ToolRef::ExtensionPath` (pi's `toolExtensionPaths`). Re-split those typed refs here to
-    // reproduce pi's three destinations for one `tools` list (`pi-args.ts:104-141`): builtins (plus
+    // reproduce pi's three destinations for one `tools` list (`runs/shared/pi-args.ts:104-141`): builtins (plus
     // resolved MCP names) to `--tools`, extension paths to `--extension`, and the raw MCP selectors
     // to the `MCP_DIRECT_TOOLS` env.
     // See the `required_child_tools = Some(allowlist)` assignment below for the full rationale;
@@ -1400,7 +1414,7 @@ pub fn build_attempt_spawn_plan(
         }
     }
 
-    // pi `pi-args.ts:194`: `const fanoutAuthorized = declaredBuiltinTools.includes("subagent")` —
+    // pi `runs/shared/pi-args.ts:194`: `const fanoutAuthorized = declaredBuiltinTools.includes("subagent")` —
     // a persona is granted NESTED delegation exactly when it declares the `subagent` tool itself.
     // With `tools` unset, pi's `declaredBuiltinTools` is `[]` (`:189-193`, no capability ceiling in
     // this port), so an agent that declares nothing is NOT fanout-authorized. This is the single
@@ -1412,7 +1426,7 @@ pub fn build_attempt_spawn_plan(
         .iter()
         .any(|tool| tool == crate::extension::TOOL_NAME);
 
-    // G103 / pi `pi-args.ts:390-392,547-552` @v0.43.0. `explicitToolAllowlist` is
+    // G103 / pi `runs/shared/pi-args.ts:390-392,547-552` @v0.43.0. `explicitToolAllowlist` is
     // `input.tools !== undefined || mcpDirectTools.length > 0 || <ceiling>` — i.e. "did anything
     // pin this child's tool surface at all". cyrup folds pi's `tools` and `mcpDirectTools` into the
     // one `agent.tools: Option<Vec<ToolRef>>`, so `is_some()` IS that predicate: `None` is an agent
@@ -1428,7 +1442,7 @@ pub fn build_attempt_spawn_plan(
     // direct-MCP-only agent (upstream's `effectiveToolAllowlist` is `[...declaredBuiltinTools,
     // ...effectiveMcpTools, ...internalTools]`, so MCP names alone still pin the allowlist).
     //
-    // Upstream's third allowlist term, `internalTools` (`pi-args.ts:393` — the run's own
+    // Upstream's third allowlist term, `internalTools` (`runs/shared/pi-args.ts:393` — the run's own
     // `structured_output` grant when the step declared an `outputSchema`), has no counterpart here
     // and needs none: **[CYRUP-DELTA]** cyrup's `--tools`/`--no-tools` selection
     // (`cyrup-session-svc/src/builder.rs:255-292`) runs over `registry.visible(...)` alone, and the
@@ -1453,7 +1467,7 @@ pub fn build_attempt_spawn_plan(
             args.push(allowlist.join(","));
         }
 
-        // G106 / pi `pi-args.ts:611-616` @v0.43.0 (`env[REQUIRED_CHILD_TOOLS_ENV] =
+        // G106 / pi `runs/shared/pi-args.ts:611-616` @v0.43.0 (`env[REQUIRED_CHILD_TOOLS_ENV] =
         // JSON.stringify(toolPlan.requiredChildTools)`), whose `requiredChildTools` is
         // `explicitToolAllowlist ? [...declaredBuiltinTools, ...effectiveMcpTools, ...internalTools]
         // : []` (`:401-409`) — the same terms as `allowlist` above (minus `internalTools`, see the
@@ -1468,7 +1482,7 @@ pub fn build_attempt_spawn_plan(
         }
     }
 
-    // Extension threading (pi `pi-args.ts:125-137`): `Some(extensions)` turns discovery off
+    // Extension threading (pi `runs/shared/pi-args.ts:125-137`): `Some(extensions)` turns discovery off
     // (`--no-extensions`) and pins the exact allowlist; `None` leaves discovery on. In both cases
     // the agent's own tool-extension paths and child-only extensions are threaded explicitly,
     // order-preserving and de-duplicated. (This crate does not inject pi's own runtime `.ts`
@@ -1499,12 +1513,12 @@ pub fn build_attempt_spawn_plan(
         args.push(path);
     }
 
-    // pi: a subagent that does not inherit skills is spawned with `--no-skills` (`pi-args.ts:139`).
+    // pi: a subagent that does not inherit skills is spawned with `--no-skills` (`runs/shared/pi-args.ts:139`).
     if !agent.inherit_skills {
         args.push("--no-skills".to_string());
     }
 
-    // SUBA-001 / pi `pi-args.ts:159-165` (v0.34.0): the persona body ships on EVERY spawn; the
+    // SUBA-001 / pi `runs/shared/pi-args.ts:159-165` (v0.34.0): the persona body ships on EVERY spawn; the
     // agent's `systemPromptMode` only chooses which flag carries it. See this function's doc
     // comment for the literal-text-vs-temp-file `[CYRUP-DELTA]` and the empty-body rule.
     //
@@ -1521,16 +1535,40 @@ pub fn build_attempt_spawn_plan(
             &opts.cwd,
         );
     let persona_body_trimmed = agent.system_prompt_body.trim();
-    let persona_owned;
-    let persona_body: &str = if memory_injection.is_empty() {
-        persona_body_trimmed
+    let persona_with_memory: String = if memory_injection.is_empty() {
+        persona_body_trimmed.to_string()
     } else if persona_body_trimmed.is_empty() {
-        persona_owned = memory_injection;
-        &persona_owned
+        memory_injection
     } else {
-        persona_owned = format!("{persona_body_trimmed}\n\n{memory_injection}");
-        &persona_owned
+        format!("{persona_body_trimmed}\n\n{memory_injection}")
     };
+
+    // G82 / R-SA-024 — the SYSTEM-PROMPT half of the output-path override, upstream
+    // `injectOutputPathSystemPrompt(systemPrompt, options.outputPath, agent)`
+    // (`execution.ts:1443`, the statement immediately after the memory/refinement composition this
+    // block mirrors). It is a SECOND surface, not an alternative to the task-side
+    // `injectSingleOutputInstruction` that `build_task_text` applies: upstream's foreground single
+    // run gets BOTH — the task side at `subagent-executor.ts:3674` (its caller) and this one at
+    // `execution.ts:1443` — because the task text steers what the child is asked to produce while
+    // the system prompt steers where its write tools point for the whole session, and a long run
+    // that compacts away the task text keeps the system prompt. `api/preflight.ts:313` applies the
+    // same injector to its own `effectiveSystemPrompt` projection; cyrup has no launch-contract
+    // preflight surface to port that second call site onto, so this is the only one that exists
+    // here.
+    //
+    // Keyed on the PATH alone, never on `opts.output_mode` — same rule as the task side, for the
+    // same reason (`outputMode` is read only by `validateFileOnlyOutputMode` and by delivery-side
+    // `finalizeSingleOutput`). Capability-aware through the same `AgentDefinition` projection the
+    // task side uses, so a read-only agent is told the runtime will persist its final response
+    // rather than being ordered to write a file it has no tool to write
+    // (`single-output.ts:84-91`).
+    let output_capabilities = completion_guard_projection(agent);
+    let persona_owned = inject_output_path_system_prompt(
+        &persona_with_memory,
+        opts.output_path.as_deref(),
+        Some(&output_capabilities),
+    );
+    let persona_body: &str = &persona_owned;
     if !persona_body.is_empty() {
         let flag = match agent.system_prompt_mode {
             SystemPromptMode::Replace => SYSTEM_PROMPT_FLAG,
@@ -1545,7 +1583,7 @@ pub fn build_attempt_spawn_plan(
         args.push(format!("{flag}={persona_body}"));
     }
 
-    // Session threading (pi `buildPiArgs`, `pi-args.ts:100-112`) — the FULL branch, both halves:
+    // Session threading (pi `buildPiArgs`, `runs/shared/pi-args.ts:100-112`) — the FULL branch, both halves:
     //
     // * a resolved fork-context session FILE wins outright: its parent directory is created
     //   (pi's `fs.mkdirSync(path.dirname(sessionFile), { recursive: true })`) and `--session <file>`
@@ -1582,7 +1620,7 @@ pub fn build_attempt_spawn_plan(
     let (task_arg, temp_file) = ChildSpawnSpec::resolve_task_arg(task_text, temp_dir)?;
 
     let mut env_overlay = crate::spawn::depth::to_env_overlay(&depth);
-    // PERM-001 / pi `augmentChildEnv` (`pi-args.ts:329-330`): the child-ROLE pair, written on EVERY
+    // PERM-001 / pi `augmentChildEnv` (`runs/shared/pi-args.ts:329-330`): the child-ROLE pair, written on EVERY
     // spawn. This is the process about to BE a subagent child, so it must say so — see
     // [`crate::spawn::nested_events::child_role_env`] for the three subsystems that read it, chiefly
     // the permission companion's child→parent ask-forwarding (a child whose `ask` fires with this
@@ -1613,7 +1651,7 @@ pub fn build_attempt_spawn_plan(
     if !agent.name.trim().is_empty() {
         env_overlay.insert(AGENT_NAME_ENV_VAR.to_string(), agent.name.clone());
     }
-    // pi `pi-args.ts:199-200`: the child observes the agent's inherit flags as env (`1`/`0`).
+    // pi `runs/shared/pi-args.ts:199-200`: the child observes the agent's inherit flags as env (`1`/`0`).
     env_overlay.insert(
         INHERIT_PROJECT_CONTEXT_ENV.to_string(),
         if agent.inherit_project_context { "1" } else { "0" }.to_string(),
@@ -1622,7 +1660,7 @@ pub fn build_attempt_spawn_plan(
         INHERIT_SKILLS_ENV.to_string(),
         if agent.inherit_skills { "1" } else { "0" }.to_string(),
     );
-    // pi `pi-args.ts:216-220`: the raw `mcp:` selectors (comma-joined) or the `__none__` sentinel.
+    // pi `runs/shared/pi-args.ts:216-220`: the raw `mcp:` selectors (comma-joined) or the `__none__` sentinel.
     env_overlay.insert(
         MCP_DIRECT_TOOLS_ENV.to_string(),
         if mcp_direct_tools.is_empty() {
@@ -1646,7 +1684,7 @@ pub fn build_attempt_spawn_plan(
         env_overlay.insert(PARENT_SESSION_ENV_VAR.to_string(), anchor);
     }
 
-    // Intercom child-bridge activation (pi `pi-args.ts:201-214`, `augmentChildEnv`'s intercom half):
+    // Intercom child-bridge activation (pi `runs/shared/pi-args.ts:201-214`, `augmentChildEnv`'s intercom half):
     // when the launching orchestrator has a resolvable intercom presence target AND this run has an
     // id AND this child has a persona name, write the full child-orchestrator metadata set so the
     // spawned child's `IntercomExtension` reads `read_child_orchestrator_metadata() == Some` →
@@ -1659,7 +1697,7 @@ pub fn build_attempt_spawn_plan(
     // parent addresses to steer it (extension.rs `control_resume`), so the two independently-produced
     // strings match at the broker. `ORCHESTRATOR_SESSION_ID` + `SUPERVISOR_CHANNEL_DIR` are written
     // by the nested block at the end of this arm — the NATIVE supervisor channel upstream added in
-    // `3ac0ef5` (`pi-args.ts:221-231`), which needs the launching session's own id as its request
+    // `3ac0ef5` (`runs/shared/pi-args.ts:221-231`), which needs the launching session's own id as its request
     // routing key.
     if let (Some(orch_target), Some(run_id)) = (
         opts.orchestrator_intercom_target.as_deref().filter(|s| !s.is_empty()),
@@ -1683,7 +1721,7 @@ pub fn build_attempt_spawn_plan(
             ),
         );
 
-        // NATIVE supervisor channel (pi `pi-args.ts:221-231`, added in `3ac0ef5` "Make supervisor
+        // NATIVE supervisor channel (pi `runs/shared/pi-args.ts:221-231`, added in `3ac0ef5` "Make supervisor
         // coordination native"). Upstream's condition is `orchestratorIntercomTarget &&
         // parentSessionId && runId && childAgentName` — the first, third and fourth are the arm
         // we are already inside, so only the parent session id remains. Both vars are written
@@ -1721,7 +1759,7 @@ pub fn build_attempt_spawn_plan(
         }
     }
 
-    // SUBA-S01 (pi `pi-args.ts:246-250`): hand the child BOTH paths. pi's child-side runtime gates
+    // SUBA-S01 (pi `runs/shared/pi-args.ts:246-250`): hand the child BOTH paths. pi's child-side runtime gates
     // on both being present (`subagent-prompt-runtime.ts:281`), and so does cyrup's
     // [`crate::prompt_runtime::prompt_runtime_extension_for_env`] — so these are set together or
     // not at all. Without them the child has no `structured_output` tool, which is precisely the
@@ -1760,7 +1798,7 @@ pub fn build_attempt_spawn_plan(
         );
     }
 
-    // G90 (pi `pi-args.ts:251-252` @v0.34.0: `if (input.steerInboxDir) env[SUBAGENT_STEER_INBOX_ENV]
+    // G90 (pi `runs/shared/pi-args.ts:251-252` @v0.34.0: `if (input.steerInboxDir) env[SUBAGENT_STEER_INBOX_ENV]
     // = input.steerInboxDir`): hand this child the path to its OWN steer inbox. `run_sync` creates
     // the directory before the spawn so the child's watcher has something to attach to on its very
     // first tick, exactly as upstream's child-side `start()` does its own `mkdirSync` — see
@@ -1799,7 +1837,7 @@ pub fn build_attempt_spawn_plan(
 ///
 /// The agent's OWN persona prose is deliberately NOT part of this text. It travels as
 /// `--system-prompt`/`--append-system-prompt` on the child's argv — see
-/// [`build_attempt_spawn_plan`] (SUBA-001, pi `pi-args.ts:159-165`). Previously `Append` mode
+/// [`build_attempt_spawn_plan`] (SUBA-001, pi `runs/shared/pi-args.ts:159-165`). Previously `Append` mode
 /// concatenated the body here and `Replace` mode dropped it on the floor entirely, on the mistaken
 /// premise that the child re-resolved its own persona; nothing child-side does (the
 /// [`AGENT_NAME_ENV_VAR`] anchor is read only by the permission companion), so every
@@ -4149,13 +4187,13 @@ mod tests {
         assert!(plan.spec.build_argv().contains(&"--no-skills".to_string()));
     }
 
-    // ---- SUBA-001: persona system-prompt delivery (pi `pi-args.ts:159-165` @ v0.34.0) ----
+    // ---- SUBA-001: persona system-prompt delivery (pi `runs/shared/pi-args.ts:159-165` @ v0.34.0) ----
 
     #[test]
     fn build_attempt_spawn_plan_delivers_the_persona_body_as_system_prompt_in_replace_mode() {
         // The critical path: 7 of the 8 bundled personas (and every user-authored agent, per
         // `default_system_prompt_mode`) declare `systemPromptMode: replace`. The child MUST be
-        // spawned with `--system-prompt=<persona body>` — pi `pi-args.ts:164-165` picks
+        // spawned with `--system-prompt=<persona body>` — pi `runs/shared/pi-args.ts:164-165` picks
         // `--system-prompt` for `replace` — or the subagent runs as a generic coding agent that
         // received nothing but the task text.
         //
@@ -4189,7 +4227,7 @@ mod tests {
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
     }
 
-    // ---- G103: an EXPLICITLY empty `tools:` means "no tools" (pi `pi-args.ts:390-392,547-552`) ----
+    // ---- G103: an EXPLICITLY empty `tools:` means "no tools" (pi `runs/shared/pi-args.ts:390-392,547-552`) ----
 
     /// The USER ACTION: an author writes an agent `.md` whose frontmatter says `tools:` with
     /// nothing after it — "this agent gets NO tools" — and someone delegates to that agent. The
@@ -4532,7 +4570,7 @@ mod tests {
     /// G90, the SPAWN hop: a child handed a steer inbox must receive the path in its environment,
     /// and the directory must already exist when it starts.
     ///
-    /// pi `pi-args.ts:251-252` (`if (input.steerInboxDir) env[SUBAGENT_STEER_INBOX_ENV] = ...`).
+    /// pi `runs/shared/pi-args.ts:251-252` (`if (input.steerInboxDir) env[SUBAGENT_STEER_INBOX_ENV] = ...`).
     /// Without this hop the parent's whole steer path is a write-only file drop: the requests land
     /// on disk correctly and no process is ever told where to look.
     #[test]
@@ -4674,7 +4712,7 @@ mod tests {
         );
     }
 
-    /// SUBA-S01 (pi `pi-args.ts:246-250`): a declared `outputSchema` must reach the child as BOTH
+    /// SUBA-S01 (pi `runs/shared/pi-args.ts:246-250`): a declared `outputSchema` must reach the child as BOTH
     /// structured-output env vars, pointing at the runtime's real schema and capture paths.
     ///
     /// Before this wiring, `create_structured_output_runtime`, `read_structured_output`,
@@ -4769,7 +4807,7 @@ mod tests {
 
     #[test]
     fn build_attempt_spawn_plan_delivers_the_persona_body_as_append_in_append_mode() {
-        // pi `pi-args.ts:164-165`: the mode picks the FLAG, the body always ships.
+        // pi `runs/shared/pi-args.ts:164-165`: the mode picks the FLAG, the body always ships.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = sample_agent_config("m1", &[]);
         agent.system_prompt_mode = SystemPromptMode::Append;
@@ -4825,6 +4863,276 @@ mod tests {
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
     }
 
+    // ---- G82 / R-SA-024: the SYSTEM-PROMPT half of the output-path override
+    //      (pi `injectOutputPathSystemPrompt`, `execution.ts:1443`) ----
+
+    /// Extract the single `--system-prompt=`/`--append-system-prompt=` argv element's VALUE, or
+    /// `None` when neither flag was emitted. Used by the output-path-override tests below, which
+    /// all care about the flag's payload rather than which of the two flags carried it.
+    fn delivered_system_prompt(argv: &[String]) -> Option<String> {
+        argv.iter().find_map(|a| {
+            a.strip_prefix("--append-system-prompt=")
+                .or_else(|| a.strip_prefix("--system-prompt="))
+                .map(str::to_string)
+        })
+    }
+
+    /// Upstream composes the override onto the SAME `systemPrompt` string the persona and the
+    /// memory block already occupy, as the statement directly after the memory fold
+    /// (`execution.ts:1433-1443`). It is a second surface, not a replacement for the task-side
+    /// `injectSingleOutputInstruction`: the run gets both.
+    #[test]
+    fn build_attempt_spawn_plan_composes_the_output_path_override_onto_the_system_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_mode = SystemPromptMode::Replace;
+        agent.system_prompt_body = "- You are the REVIEWER persona.".to_string();
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        let out = dir.path().join("out.md");
+        opts.output_mode = OutputMode::FileOnly;
+        opts.output_path = Some(out.clone());
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let delivered = delivered_system_prompt(&argv).unwrap_or_default();
+        assert!(
+            !delivered.is_empty(),
+            "a system-prompt flag must be emitted; argv was {argv:?}"
+        );
+
+        assert!(
+            delivered.contains("- You are the REVIEWER persona."),
+            "the persona body must survive the injection: {delivered:?}"
+        );
+        assert!(
+            delivered.contains("Runtime output path override:"),
+            "the system-prompt-side header must be present: {delivered:?}"
+        );
+        assert!(
+            delivered.contains(&format!(
+                "Write your findings to exactly this path: {}",
+                out.display()
+            )),
+            "the override must name the authoritative path: {delivered:?}"
+        );
+        // Order matters: upstream APPENDS the override to the already-composed prompt, so the
+        // persona is what the child reads first and the override is what overrides it.
+        let persona_at = delivered
+            .find("- You are the REVIEWER persona.")
+            .unwrap_or(usize::MAX);
+        let override_at = delivered
+            .find("Runtime output path override:")
+            .unwrap_or(usize::MIN);
+        assert!(
+            persona_at < override_at,
+            "the override must be appended AFTER the persona: {delivered:?}"
+        );
+    }
+
+    /// No configured output path means no override — the persona ships alone, byte-identical to
+    /// what it was before this injection existed (`injectOutputPathSystemPrompt` returns its input
+    /// unchanged for an undefined path, `single-output.ts:105`).
+    #[test]
+    fn build_attempt_spawn_plan_leaves_the_system_prompt_alone_without_an_output_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_mode = SystemPromptMode::Replace;
+        agent.system_prompt_body = "- persona".to_string();
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert_eq!(
+            delivered_system_prompt(&argv).as_deref(),
+            Some("- persona"),
+            "argv was {argv:?}"
+        );
+    }
+
+    /// Same rule as the task side: upstream keys the injection on the PATH alone. `outputMode` is
+    /// read only by `validateFileOnlyOutputMode` and by delivery-side `finalizeSingleOutput`.
+    #[test]
+    fn the_system_prompt_override_is_unconditional_on_output_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_body = "- persona".to_string();
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        for mode in [
+            OutputMode::FileOnly,
+            OutputMode::FileAndInline,
+            OutputMode::Inline,
+        ] {
+            let mut opts = base_opts(dir.path(), &["m1"]);
+            opts.output_mode = mode;
+            opts.output_path = Some(dir.path().join("out.md"));
+            let plan = build_attempt_spawn_plan(
+                &agent,
+                &ModelId::from("m1"),
+                "task",
+                &opts,
+                depth,
+                dir.path(),
+                None,
+            )
+            .expect("plan builds");
+            let delivered = delivered_system_prompt(&plan.spec.build_argv()).unwrap_or_default();
+            assert!(
+                delivered.contains("Runtime output path override:"),
+                "{mode:?} with a configured path must carry the override: {delivered:?}"
+            );
+        }
+    }
+
+    /// The capability branch (`formatOutputPathInstruction`, `single-output.ts:84-91`) must be
+    /// live on this surface too, not only on the task side: a read-only agent is told the runtime
+    /// will persist its final response.
+    #[test]
+    fn the_system_prompt_override_branches_on_the_agents_tool_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.output_path = Some(dir.path().join("out.md"));
+
+        let mut read_only = sample_agent_config("m1", &[]);
+        read_only.system_prompt_body = "- persona".to_string();
+        read_only.tools = Some(vec![
+            crate::discovery::types::ToolRef::Builtin("read".to_string()),
+            crate::discovery::types::ToolRef::Builtin("grep".to_string()),
+        ]);
+        let plan = build_attempt_spawn_plan(
+            &read_only,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let delivered = delivered_system_prompt(&plan.spec.build_argv()).unwrap_or_default();
+        assert!(
+            delivered.contains("Return the complete artifact in your final response."),
+            "{delivered:?}"
+        );
+        assert!(
+            !delivered.contains("Write your findings to exactly this path:"),
+            "a read-only agent must not be ordered to write: {delivered:?}"
+        );
+
+        let mut write_capable = sample_agent_config("m1", &[]);
+        write_capable.system_prompt_body = "- persona".to_string();
+        write_capable.tools = Some(vec![
+            crate::discovery::types::ToolRef::Builtin("read".to_string()),
+            crate::discovery::types::ToolRef::Builtin("write".to_string()),
+        ]);
+        let plan = build_attempt_spawn_plan(
+            &write_capable,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let delivered = delivered_system_prompt(&plan.spec.build_argv()).unwrap_or_default();
+        assert!(
+            delivered.contains("Write your findings to exactly this path:"),
+            "{delivered:?}"
+        );
+        assert!(
+            !delivered.contains("Return the complete artifact in your final response."),
+            "{delivered:?}"
+        );
+    }
+
+    /// An empty persona plus a configured output path composes a NON-empty body, so the flag ships
+    /// — pi emits its system-prompt flag for any non-null string (`runs/shared/pi-args.ts:570-585`), and the
+    /// composed value is exactly the override. The empty-body omission delta survives only for the
+    /// genuinely-empty case, which
+    /// [`build_attempt_spawn_plan_omits_the_system_prompt_flag_for_an_empty_persona_body`] pins.
+    #[test]
+    fn an_empty_persona_with_an_output_path_still_ships_the_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_mode = SystemPromptMode::Append;
+        agent.system_prompt_body = "   \n\t ".to_string();
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.output_path = Some(dir.path().join("out.md"));
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let delivered = delivered_system_prompt(&argv).unwrap_or_default();
+        assert!(
+            delivered.starts_with("Runtime output path override:"),
+            "the override alone must still ship; argv was {argv:?}"
+        );
+    }
+
+    /// Both halves reach the SAME run, as upstream's foreground single run does: the task side
+    /// from `subagent-executor.ts:3674` (cyrup: [`build_task_text`]) and the system-prompt side
+    /// from `execution.ts:1443` (cyrup: [`build_attempt_spawn_plan`]). Wiring one and not the
+    /// other is the gap this pins closed.
+    #[test]
+    fn both_output_path_surfaces_reach_the_same_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_body = "- persona".to_string();
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.output_path = Some(dir.path().join("out.md"));
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let task = build_task_text(&agent, "do the thing", &opts, &contract, "");
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &task, &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let delivered = delivered_system_prompt(&plan.spec.build_argv()).unwrap_or_default();
+
+        assert!(task.contains("\n\n---\n**Output:**\n"), "task side missing: {task:?}");
+        assert!(
+            delivered.contains("Runtime output path override:"),
+            "system-prompt side missing: {delivered:?}"
+        );
+        // The task-side header must NOT leak onto the system prompt, nor vice versa: they are
+        // distinct upstream strings and `stripFrameworkInstructions` only knows the task one.
+        assert!(
+            !delivered.contains("**Output:**"),
+            "the task-side header must not appear on the system prompt: {delivered:?}"
+        );
+        assert!(
+            !task.contains("Runtime output path override:"),
+            "the system-prompt-side header must not appear in the task: {task:?}"
+        );
+    }
+
     #[test]
     fn build_attempt_spawn_plan_includes_tools_flag_only_when_agent_declares_tools() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4876,7 +5184,7 @@ mod tests {
         );
     }
 
-    /// G106 (pi `pi-args.ts:221-231`, `3ac0ef5` "Make supervisor coordination native"): the single
+    /// G106 (pi `runs/shared/pi-args.ts:221-231`, `3ac0ef5` "Make supervisor coordination native"): the single
     /// spawn-plan chokepoint must hand a child BOTH native-supervisor-channel vars and CREATE the
     /// `requests/`+`replies/` directories.
     ///
@@ -4994,13 +5302,13 @@ mod tests {
         let argv = plan.spec.build_argv();
         let idx = argv.iter().position(|a| a == "--session").expect("--session present");
         assert!(argv[idx + 1].contains("parent-branch.jsonl"));
-        // pi's `sessionFile` branch (`pi-args.ts:101-103`) emits ONLY `--session`: never the
+        // pi's `sessionFile` branch (`runs/shared/pi-args.ts:101-103`) emits ONLY `--session`: never the
         // `--no-session`/`--session-dir` pair from the else arm.
         assert!(!argv.contains(&"--no-session".to_string()));
         assert!(!argv.contains(&"--session-dir".to_string()));
     }
 
-    /// SUBA-041 prerequisite (pi `buildPiArgs`, `pi-args.ts:104-112`): with NO fork-context session
+    /// SUBA-041 prerequisite (pi `buildPiArgs`, `runs/shared/pi-args.ts:104-112`): with NO fork-context session
     /// file, no `session_dir` and no `share`, pi's `sessionEnabled` is false and the child is spawned
     /// `--no-session`. Pre-fix this arm emitted nothing at all, so every session-less subagent child
     /// silently persisted a session into the orchestrator's own store.
@@ -5019,7 +5327,7 @@ mod tests {
 
     /// SUBA-041 prerequisite: an explicit `session_dir` both ENABLES sessions (no `--no-session`)
     /// and reaches the child as `--session-dir <dir>`, with the directory created up front — pi's
-    /// `fs.mkdirSync(sessionDir, { recursive: true })` (`pi-args.ts:108-110`).
+    /// `fs.mkdirSync(sessionDir, { recursive: true })` (`runs/shared/pi-args.ts:108-110`).
     #[test]
     fn build_attempt_spawn_plan_emits_session_dir_and_creates_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5095,7 +5403,7 @@ mod tests {
         );
     }
 
-    // ---- PERM-001: the child-ROLE env pair (pi `augmentChildEnv`, `pi-args.ts:329-330`) ----
+    // ---- PERM-001: the child-ROLE env pair (pi `augmentChildEnv`, `runs/shared/pi-args.ts:329-330`) ----
 
     /// The production spawn path MUST mark the child as a child. Without this entry the re-exec'd
     /// process is indistinguishable from a top-level session, so

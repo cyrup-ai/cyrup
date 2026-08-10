@@ -2,7 +2,7 @@
 //!
 //! This module is the Rust port of pi's `runs/background/run-status.ts` `inspectSubagentStatus`
 //! (`run-status.ts:101-273`) and the `async-status.ts` `listAsyncRuns`/`formatAsyncRunList`
-//! no-id "list active runs" shape it delegates to (`async-status.ts:223-338`). It owns the
+//! no-id "list active runs" shape it delegates to (`async-status.ts:366-537`). It owns the
 //! *rendering* half of the `status` action; the *acting* control ops (`interrupt`/`resume`/
 //! `append-step`) live in [`super::control`]. `extension.rs`'s control-action dispatch arms route
 //! into both.
@@ -77,10 +77,10 @@ pub(crate) fn step_state_label(state: StepState) -> &'static str {
 }
 
 // =================================================================================================
-// Progress + step-line labels (`run-status.ts:52-63`, `async-status.ts:289-308`)
+// Progress + step-line labels (`run-status.ts:63-75`, `async-status.ts:486-505`)
 // =================================================================================================
 
-/// The one-line progress label (pi `formatAsyncRunProgressLabel`, `async-status.ts:289-308`),
+/// The one-line progress label (pi `formatAsyncRunProgressLabel`, `async-status.ts:486-505`),
 /// rendered from the fields cyrup's [`RunStatus`] carries. pi's parallel-group normalization and
 /// per-group `formatParallelOutcome` are approximated here by cyrup's own step list: for a parallel
 /// run, the count of terminal steps over the total; for a chain, the logical step cursor over
@@ -108,7 +108,7 @@ pub(crate) fn progress_label(status: &RunStatus) -> String {
     }
 }
 
-/// The per-step line prefix (pi `stepLineLabel`, `run-status.ts:52-63`): `Agent i/N` for a
+/// The per-step line prefix (pi `stepLineLabel`, `run-status.ts:63-75`): `Agent i/N` for a
 /// standalone parallel run, `Step i/N` for a chain, bare `Step i` for a single run. pi's
 /// parallel-group-aware `Step X/Y Agent A/B` nesting inside a chain is flattened here to the
 /// enclosing `Step i/N` (cyrup does not yet carry the per-group step-index projection that nesting
@@ -129,7 +129,7 @@ fn step_line_label(status: &RunStatus, index: usize) -> String {
 // Resume guidance (`run-status.ts:36-50`)
 // =================================================================================================
 
-/// G90: pi `formatSteeringSummary` (`run-status.ts:76-81` @v0.34.0) — `"3 steers, last
+/// G90: pi `formatSteeringSummary` (`run-status.ts:88-93` @v0.43.0) — `"3 steers, last
 /// 2026-08-10T12:00:00.000Z"`, with either half omitted when unknown and `None` when neither is.
 fn format_steering_summary(steer_count: Option<u64>, last_steer_at: Option<i64>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
@@ -153,7 +153,7 @@ pub const STOPPED_NOT_RESUMABLE_GUIDANCE: &str =
     "Resume: unavailable; stopped runs are not resumable. Start a new run instead.";
 
 /// Whether `session_file` points at an on-disk file that currently exists (pi's
-/// `hasExistingSessionFile`, `run-status.ts:32-34`).
+/// `hasExistingSessionFile`, `run-status.ts:37-39`).
 fn session_file_exists(session_file: &Option<PathBuf>) -> bool {
     session_file.as_ref().is_some_and(|path| path.exists())
 }
@@ -273,7 +273,7 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
             .as_ref()
             .map(|error| format!(", error: {error}"))
             .unwrap_or_default();
-        // G90: pi's `steeringSuffix` (`run-status.ts:369,375` @v0.34.0), between the activity text
+        // G90: pi's `steeringSuffix` (`run-status.ts:413,419` @v0.43.0), between the activity text
         // and the error text. This is what makes an `action: "steer"` VISIBLE: without it the tool
         // would report "Steering queued" and the status report would look identical whether the
         // runner accepted the request or dropped it.
@@ -497,7 +497,7 @@ pub async fn inspect_status_by_dir(
 }
 
 // =================================================================================================
-// No-id "list active runs" (`listAsyncRuns`/`formatAsyncRunList`, async-status.ts:223-338)
+// No-id "list active runs" (`listAsyncRuns`/`formatAsyncRunList`, async-status.ts:366-537)
 // =================================================================================================
 
 /// One active-run summary row for the no-id list: its own run directory plus the reconciled status.
@@ -509,7 +509,7 @@ pub struct ActiveRun {
     pub status: RunStatus,
 }
 
-/// State-ordering rank for the active-run list (pi `sortRuns`, `async-status.ts:204-221`, restricted
+/// State-ordering rank for the active-run list (pi `sortRuns`, `async-status.ts:345-364`, restricted
 /// to the queued/running states this list surfaces): running before queued.
 fn list_rank(state: RunState) -> u8 {
     match state {
@@ -526,7 +526,7 @@ fn list_rank(state: RunState) -> u8 {
 }
 
 /// Enumerate every currently-active (queued or running) background run under `async_root` (pi
-/// `listAsyncRuns` with `states: ["queued", "running"]`, `async-status.ts:223-258`): scan the run
+/// `listAsyncRuns` with `states: ["queued", "running"]`, `async-status.ts:366-449`): scan the run
 /// directories, reconcile each (R-SA-079), keep the queued/running ones, and sort running-first
 /// then most-recently-updated first. A missing `async_root` (no runs ever spawned for this cwd) is
 /// an empty list, not an error. A run whose status cannot be reconciled (e.g. a half-written
@@ -582,7 +582,7 @@ pub async fn list_active_runs(
     Ok(runs)
 }
 
-/// Render the active-run list (pi `formatAsyncRunList`, `async-status.ts:318-338`): a
+/// Render the active-run list (pi `formatAsyncRunList`, `async-status.ts:516-537`): a
 /// `No active async runs.` sentinel when empty, otherwise a `Active async runs: N` heading and one
 /// `- id | state | mode | progress[ | K pending appends] | dir` header per run followed by its
 /// `  n. agent | status[ | model]` step lines.
@@ -652,7 +652,7 @@ mod tests {
     use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
     /// G90: the runner's accepted-steer counters must SURFACE in the report a user reads
-    /// (pi `steeringSuffix`, `run-status.ts:369,375` @v0.34.0). Without this the tool would say
+    /// (pi `steeringSuffix`, `run-status.ts:413,419` @v0.43.0). Without this the tool would say
     /// "Steering queued" and the status report would look identical whether the runner accepted
     /// the request or dropped it on the floor.
     #[test]

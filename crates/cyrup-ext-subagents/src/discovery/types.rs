@@ -136,7 +136,7 @@ impl ToolRef {
     }
 
     /// Split one raw `tools`-list string into its typed [`ToolRef`] shape, exactly as
-    /// `frontmatter::parse_tool_refs` and pi's `splitToolList` (`agents.ts:438-452`) do: an
+    /// `frontmatter::parse_tool_refs` and pi's `splitToolList` (`agents.ts:531-545`) do: an
     /// `mcp:`-prefixed entry becomes [`ToolRef::Mcp`] with the `mcp:` PREFIX STRIPPED (so
     /// `"mcp:server.tool"` → `Mcp("server.tool")`, matching pi's `tool.slice(4)`); every other
     /// entry becomes [`ToolRef::Builtin`]. Used by this type's own string-form [`Deserialize`](
@@ -444,31 +444,31 @@ pub struct AgentOverrideConfig {
     pub thinking: OverrideField<String>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub system_prompt_mode: OverrideField<SystemPromptMode>,
-    /// pi `inheritProjectContext?: boolean` (`agents.ts:70`). A plain boolean toggle (no `| false`
+    /// pi `inheritProjectContext?: boolean` (`agents.ts:88`). A plain boolean toggle (no `| false`
     /// clear form): `Value(true)`/`Value(false)` are both real settings.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub inherit_project_context: OverrideField<bool>,
-    /// pi `inheritSkills?: boolean` (`agents.ts:71`).
+    /// pi `inheritSkills?: boolean` (`agents.ts:89`).
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub inherit_skills: OverrideField<bool>,
-    /// pi `defaultContext?: AgentDefaultContext | false` (`agents.ts:72`) — `"fresh"`/`"fork"`
+    /// pi `defaultContext?: AgentDefaultContext | false` (`agents.ts:90`) — `"fresh"`/`"fork"`
     /// deserialize to [`OverrideField::Value`], a JSON `false` to [`OverrideField::ExplicitClear`].
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub default_context: OverrideField<ContextMode>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub disabled: OverrideField<bool>,
-    /// pi `systemPrompt?: string` (`agents.ts:74`). Applied to a BUILTIN agent's body only (pi's
+    /// pi `systemPrompt?: string` (`agents.ts:93`). Applied to a BUILTIN agent's body only (pi's
     /// `applyBuiltinOverride` sets it; `applyCustomAgentOverride` deliberately omits it), replacing
     /// the builtin persona's own frontmatter prose.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub system_prompt: OverrideField<String>,
-    /// pi `skills?: string[] | false` (`agents.ts:75`) — the proactive skill-pointer list, or a
+    /// pi `skills?: string[] | false` (`agents.ts:94`) — the proactive skill-pointer list, or a
     /// JSON `false` to clear it.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub skills: OverrideField<Vec<String>>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub tools: OverrideField<Vec<ToolRef>>,
-    /// pi `subagentOnlyExtensions?: string[] | false` (`agents.ts:77`) — child-only extension
+    /// pi `subagentOnlyExtensions?: string[] | false` (`agents.ts:97`) — child-only extension
     /// paths, or a JSON `false` to clear them.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub subagent_only_extensions: OverrideField<Vec<String>>,
@@ -545,7 +545,7 @@ pub struct SubagentSettings {
 /// precedence at APPLICATION time and record the real winning scope + settings-file path in
 /// [`AgentOverrideInfo`] — exactly as pi's `discoverAgents` holds `userSettings`/`projectSettings`
 /// plus `userSettingsPath`/`projectSettingsPath` and hands all four to
-/// `applyBuiltinOverrides`/`applyCustomAgentOverrides` (`agents.ts:785-943`, `1282-1298`).
+/// `applyBuiltinOverrides`/`applyCustomAgentOverrides` (`agents.ts:1039-1213`, `1282-1298`).
 ///
 /// Pre-flattening the two scopes into a single [`SubagentSettings`] (the pre-Tier-7 shape)
 /// irrecoverably loses *which* scope an applied override came from — which is why the provenance
@@ -578,7 +578,7 @@ pub struct LayeredOverrideSettings {
 
 impl LayeredOverrideSettings {
     /// The effective `subagents.modelScope` policy for this cwd — pi's
-    /// `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1404`): the project
+    /// `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1738`): the project
     /// scope wins outright when present (it is not merged field-by-field with the user scope),
     /// else the user scope applies, else there is no policy and enforcement is off.
     #[must_use]
@@ -886,7 +886,7 @@ pub enum ChainListBinding {
     List(Vec<String>),
 }
 
-/// One parsed chain STEP — a direct port of pi's `ChainStepConfig` (`agents.ts:136-156`). This is
+/// One parsed chain STEP — a direct port of pi's `ChainStepConfig` (`agents.ts:174-195`). This is
 /// the on-disk **authoring** shape a `.chain.md` `## <agent>` section or a `.chain.json` `chain[]`
 /// element deserializes to (func-SA §4.1/§4.2): deliberately permissive and data-only, distinct
 /// from the runtime dispatch form [`crate::spawn::chain_graph::RunnerStep`] (the `SingleStep |
@@ -958,7 +958,7 @@ pub struct ChainStepConfig {
 }
 
 /// One parsed chain (`.chain.md`/`.chain.json`) definition — a port of pi's `ChainConfig`
-/// (`agents.ts:158-167`). `name` is the fully-qualified RUNTIME name (`{package}.{local_name}` when
+/// (`agents.ts:197-206`). `name` is the fully-qualified RUNTIME name (`{package}.{local_name}` when
 /// packaged, else the bare `local_name`, via `buildRuntimeName`, `identity.ts:19-22`); `local_name`
 /// and `package_name` retain the pre-qualification identity so management/serialization can
 /// reconstruct the frontmatter/JSON `name`+`package` split (`frontmatterNameForConfig`). `steps`

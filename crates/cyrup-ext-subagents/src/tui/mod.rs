@@ -217,7 +217,7 @@ pub struct NestedRunSummary {
 /// # Why `notification_key` exists (SUBA-N05)
 ///
 /// Upstream keys its `visibleControlNotices` dedup set on
-/// `controlNotificationKey(event, childIntercomTarget)` (`shared/subagent-control.ts:141-144`
+/// `controlNotificationKey(event, childIntercomTarget)` (`shared/subagent-control.ts:142-145`
 /// @v0.34.0) — `"{childKey}:{type}:{reason}"`, where `childKey` is the child's intercom target when
 /// the bridge is live, else `"{runId}:{index}"` (or bare `runId` for an index-less event). Its
 /// pending-timer map is keyed on `"{runId}:{that}"` (`extension/control-notices.ts:23-26`).

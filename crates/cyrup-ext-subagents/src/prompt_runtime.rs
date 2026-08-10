@@ -12,7 +12,7 @@
 //! What ran instead was [`crate::exec::structured::extract_structured_output_value`], a heuristic
 //! that scans the child's assistant messages for the newest fenced ```json block. That has no pi
 //! counterpart, and it quietly contradicts the very rule `structured.rs` documents: pi's defining
-//! property (`structured-output.ts:56-58`) is that a missing capture file is a HARD failure "EVEN
+//! property (`structured-output.ts:157-159`) is that a missing capture file is a HARD failure "EVEN
 //! WHEN prose was produced". A fenced block IS prose, so cyrup was accepting exactly what pi
 //! rejects — while its own doc comment claimed otherwise.
 //!
@@ -34,11 +34,11 @@
 //! # Why a SEPARATE extension rather than a third `RegistrationMode`
 //!
 //! A plain (non-fanout) subagent child attaches no subagents extension at all —
-//! `subagent_extension_for_env` returns `None` for it, matching pi (`index.ts:243-245` registers
+//! `subagent_extension_for_env` returns `None` for it, matching pi (`extension/index.ts:243-245` registers
 //! nothing). So the `structured_output` tool cannot come from that extension without perturbing a
 //! gate that is deliberately closed.
 //!
-//! pi has the same split and solves it the same way: `pi-args.ts:13` points at
+//! pi has the same split and solves it the same way: `runs/shared/pi-args.ts:13` points at
 //! `subagent-prompt-runtime.ts` as its OWN extension, loaded into the child independently of the
 //! orchestrator surface. This module is that extension.
 //!
@@ -49,7 +49,7 @@
 //!
 //! * **`before_agent_start` → [`rewrite_subagent_prompt`]** (`:97-113,323-341`). The parent writes
 //!   the persona's `inheritProjectContext` / `inheritSkills` decision and the fanout grant into the
-//!   child's env (`pi-args.ts:215-216,181`; cyrup `exec/mod.rs`'s
+//!   child's env (`runs/shared/pi-args.ts:215-216,181`; cyrup `exec/mod.rs`'s
 //!   [`INHERIT_PROJECT_CONTEXT_ENV`]/[`INHERIT_SKILLS_ENV`] + `child_role_env`). NOTHING read them
 //!   child-side, so `inheritProjectContext: false` was a pure no-op: the child re-assembled its own
 //!   system prompt from its own cwd and happily inherited every `AGENTS.md`/`CLAUDE.md` the persona
@@ -116,11 +116,11 @@ pub const STRUCTURED_OUTPUT_TOOL_NAME: &str = "structured_output";
 
 // =================================================================================================
 // G90 — the CHILD half of `action: "steer"` (pi `registerSteeringInbox`,
-// `runs/shared/subagent-prompt-runtime.ts:193-259` @v0.34.0)
+// `runs/shared/subagent-prompt-runtime.ts:328-470` @v0.43.0)
 // =================================================================================================
 
 /// The env var carrying this child's own steer inbox directory — pi `SUBAGENT_STEER_INBOX_ENV`
-/// (`pi-args.ts:32`, value `PI_SUBAGENT_STEER_INBOX`), written by the spawn plan from
+/// (`runs/shared/pi-args.ts:32`, value `PI_SUBAGENT_STEER_INBOX`), written by the spawn plan from
 /// [`crate::exec::RunOptions::steer_inbox_dir`].
 ///
 /// Declared HERE, on the reader, and aliased by the writer (`exec/mod.rs`), matching the existing
@@ -132,7 +132,7 @@ pub const STRUCTURED_OUTPUT_TOOL_NAME: &str = "structured_output";
 pub const STEER_INBOX_ENV: &str = "CYRUP_SUBAGENT_STEER_INBOX";
 
 /// How often the child re-checks its inbox. pi `setInterval(flush, 250)`
-/// (`subagent-prompt-runtime.ts:237`).
+/// (`subagent-prompt-runtime.ts:432`).
 ///
 /// Upstream ALSO installs an `fs.watch` on the directory (`:232`) and treats the interval as the
 /// portable safety net. cyrup keeps only the interval: this crate's own `notify`-based watcher is
@@ -142,7 +142,7 @@ pub const STEER_INBOX_ENV: &str = "CYRUP_SUBAGENT_STEER_INBOX";
 /// "guidance silently never arrives".
 const STEER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// pi `formatSteerMessage` (`subagent-prompt-runtime.ts:161-169` @v0.34.0) — the exact text the
+/// pi `formatSteerMessage` (`subagent-prompt-runtime.ts:271-304` @v0.43.0) — the exact text the
 /// child's model sees. Kept verbatim (including the trailing "do not restart" instruction, which is
 /// what stops a steered child from throwing away the work it has already done).
 #[must_use]
@@ -362,21 +362,21 @@ const STRUCTURED_OUTPUT_TOOL_DESCRIPTION: &str =
 
 /// Child env flag: whether this subagent inherits the parent's project-context files
 /// (`AGENTS.md`/`CLAUDE.md`) — pi `SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV`
-/// (`subagent-prompt-runtime.ts:11`), written parent-side by `exec/mod.rs`.
+/// (`subagent-prompt-runtime.ts:29`), written parent-side by `exec/mod.rs`.
 ///
 /// Declared HERE, next to the only code that reads it, and re-exported by the writer — a
 /// write-only constant with no reader was exactly this item's defect.
 pub const INHERIT_PROJECT_CONTEXT_ENV: &str = "CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT";
 
 /// Child env flag: whether this subagent inherits the parent's skills — pi
-/// `SUBAGENT_INHERIT_SKILLS_ENV` (`subagent-prompt-runtime.ts:12`).
+/// `SUBAGENT_INHERIT_SKILLS_ENV` (`subagent-prompt-runtime.ts:30`).
 ///
-/// The parent ALSO passes `--no-skills` when this is `0` (pi `pi-args.ts:155-157`, cyrup
+/// The parent ALSO passes `--no-skills` when this is `0` (pi `runs/shared/pi-args.ts:155-157`, cyrup
 /// `exec/mod.rs`), which stops the child DISCOVERING skills. This flag is the second half: a forked
 /// child whose prompt already carries an inherited skills section still has to have it removed.
 pub const INHERIT_SKILLS_ENV: &str = "CYRUP_SUBAGENT_INHERIT_SKILLS";
 
-/// pi `CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS` (`subagent-prompt-runtime.ts:21-27`), verbatim.
+/// pi `CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS` (`subagent-prompt-runtime.ts:39-45`), verbatim.
 pub const CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS: &str = concat!(
     "You are a child subagent, not the parent orchestrator.\n",
     "The parent session owns delegation, orchestration, review fanout, and follow-up worker launches.\n",
@@ -385,7 +385,7 @@ pub const CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS: &str = concat!(
     "If you need to edit files, use the available editing tools. Do not print tool-call syntax, patches, or pseudo-tool calls as text.",
 );
 
-/// pi `CHILD_FANOUT_BOUNDARY_INSTRUCTIONS` (`subagent-prompt-runtime.ts:29-36`), verbatim. Used
+/// pi `CHILD_FANOUT_BOUNDARY_INSTRUCTIONS` (`subagent-prompt-runtime.ts:47-54`), verbatim. Used
 /// instead of [`CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS`] for a child the parent DID authorize to fan
 /// out ([`FANOUT_CHILD_ENV`] = `1`), so the grant is not contradicted by its own system prompt.
 pub const CHILD_FANOUT_BOUNDARY_INSTRUCTIONS: &str = concat!(
@@ -397,7 +397,7 @@ pub const CHILD_FANOUT_BOUNDARY_INSTRUCTIONS: &str = concat!(
     "If you need to edit files, use the available editing tools. Do not print tool-call syntax, patches, or pseudo-tool calls as text.",
 );
 
-/// pi `PARENT_ONLY_CUSTOM_MESSAGE_TYPES` (`subagent-prompt-runtime.ts:38-46`), verbatim. Every one
+/// pi `PARENT_ONLY_CUSTOM_MESSAGE_TYPES` (`subagent-prompt-runtime.ts:56-64`), verbatim. Every one
 /// is orchestration bookkeeping the PARENT session produced about its children; a child that reads
 /// them in its own history reads itself as the orchestrator.
 ///
@@ -460,7 +460,7 @@ impl Default for PromptRewriteOptions {
     }
 }
 
-/// pi `readBooleanEnv` (`subagent-prompt-runtime.ts:52-56`): an ABSENT var is `None` (the caller's
+/// pi `readBooleanEnv` (`subagent-prompt-runtime.ts:70-132`): an ABSENT var is `None` (the caller's
 /// default applies); a present var is `false` only for the exact string `"0"`, true otherwise.
 fn read_boolean_env(get: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<bool> {
     get(name).map(|value| value != "0")
@@ -495,13 +495,13 @@ fn strip_delimited_section(prompt: &str, open: &str, close: &str) -> String {
     out
 }
 
-/// pi `stripProjectContext` (`subagent-prompt-runtime.ts:69-74`), on cyrup's delimiters.
+/// pi `stripProjectContext` (`subagent-prompt-runtime.ts:145-150`), on cyrup's delimiters.
 #[must_use]
 pub fn strip_project_context(prompt: &str) -> String {
     strip_delimited_section(prompt, PROJECT_CONTEXT_OPEN, PROJECT_CONTEXT_CLOSE)
 }
 
-/// pi `stripInheritedSkills` (`subagent-prompt-runtime.ts:76-81`), on cyrup's delimiters.
+/// pi `stripInheritedSkills` (`subagent-prompt-runtime.ts:152-157`), on cyrup's delimiters.
 #[must_use]
 pub fn strip_inherited_skills(prompt: &str) -> String {
     strip_delimited_section(prompt, SKILLS_OPEN, SKILLS_CLOSE)
@@ -514,7 +514,7 @@ pub fn strip_inherited_skills(prompt: &str) -> String {
 /// child INHERITED), and they must never drift.
 const SUBAGENT_ORCHESTRATION_SKILL: &str = crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL;
 
-/// pi `stripSubagentOrchestrationSkill` (`subagent-prompt-runtime.ts:83-87`): remove the
+/// pi `stripSubagentOrchestrationSkill` (`subagent-prompt-runtime.ts:159-163`): remove the
 /// `pi-subagents` entry from an inherited `<available_skills>` block, leaving every other skill in
 /// place.
 ///
@@ -586,7 +586,7 @@ fn block_names_orchestration_skill(block: &str) -> bool {
     false
 }
 
-/// pi `stripChildBoundaryInstructions` (`subagent-prompt-runtime.ts:89-95`): remove any boundary
+/// pi `stripChildBoundaryInstructions` (`subagent-prompt-runtime.ts:165-171`): remove any boundary
 /// block already present, then drop the leading blank lines that removal leaves.
 ///
 /// Load-bearing for IDEMPOTENCE, not cosmetics: a child whose persona body was appended to a prompt
@@ -601,7 +601,7 @@ fn strip_child_boundary_instructions(prompt: &str) -> String {
     trim_leading_blank_lines(&rewritten).to_string()
 }
 
-/// pi's `.replace(/^(?:[ \t]*\r?\n)+/, "")` (`subagent-prompt-runtime.ts:94`): drop whole leading
+/// pi's `.replace(/^(?:[ \t]*\r?\n)+/, "")` (`subagent-prompt-runtime.ts:170`): drop whole leading
 /// BLANK lines only. A leading space on a non-blank first line is preserved, exactly as the regex
 /// requires — the alternative (`trim_start`) would silently reflow an indented prompt body.
 fn trim_leading_blank_lines(text: &str) -> &str {
@@ -619,7 +619,7 @@ fn trim_leading_blank_lines(text: &str) -> &str {
     rest
 }
 
-/// pi `rewriteSubagentPrompt` (`subagent-prompt-runtime.ts:97-113`): strip what this child was told
+/// pi `rewriteSubagentPrompt` (`subagent-prompt-runtime.ts:173-189`): strip what this child was told
 /// not to inherit, remove any pre-existing boundary block, then PREFIX the boundary block this run
 /// selects (plus the structured-output instruction when a schema was declared).
 #[must_use]
@@ -656,7 +656,7 @@ fn is_parent_only_custom(message: &AgentMessage) -> bool {
     }
 }
 
-/// pi `stripParentOnlySubagentMessages` (`subagent-prompt-runtime.ts:141-159`): drop the parent's
+/// pi `stripParentOnlySubagentMessages` (`subagent-prompt-runtime.ts:249-269`): drop the parent's
 /// orchestration bookkeeping from the context a CHILD sends to the model.
 ///
 /// Returns `None` when nothing changed, so the caller can leave the in-flight list untouched
@@ -1023,14 +1023,14 @@ pub struct SubagentPromptRuntime {
     /// [`crate::exec::tool_budget::TOOL_BUDGET_ENV`]; `None` means every tool call passes
     /// untouched and this half of the runtime costs nothing.
     tool_budget: Option<ToolBudgetGuard>,
-    /// G90 / pi `registerSteeringInbox` (`subagent-prompt-runtime.ts:193-259`). `Some` only when
+    /// G90 / pi `registerSteeringInbox` (`subagent-prompt-runtime.ts:328-470`). `Some` only when
     /// the parent handed this child a [`STEER_INBOX_ENV`] path — i.e. only for a background/async
     /// child, which is the only kind that has an async run directory to steer through.
     steering: Option<Arc<SteeringInbox>>,
 }
 
 /// The live counter behind a `toolBudget:` — pi's three `registerToolBudget` closure variables
-/// (`toolCount`, `softNudged`, and the budget itself, `subagent-prompt-runtime.ts:171-190`).
+/// (`toolCount`, `softNudged`, and the budget itself, `subagent-prompt-runtime.ts:306-325`).
 ///
 /// `on_event` takes `&self`, so the mutable state lives behind a `Mutex` rather than in a JS
 /// closure. A poisoned lock degrades to "do not block" — a budget is advisory scaffolding and must
@@ -1126,7 +1126,7 @@ impl SubagentPromptRuntime {
     }
 
     /// Attach the parent-supplied tool budget (pi `registerToolBudget`,
-    /// `subagent-prompt-runtime.ts:171-190`). `None` leaves every tool call untouched.
+    /// `subagent-prompt-runtime.ts:306-325`). `None` leaves every tool call untouched.
     #[must_use]
     pub fn with_tool_budget(
         mut self,
@@ -1185,7 +1185,7 @@ impl NativeExtension for SubagentPromptRuntime {
             kinds.push(EventKind::ToolResult);
         }
         // G90 / pi `registerSteeringInbox`'s own `onRuntimeEvent` set
-        // (`subagent-prompt-runtime.ts:247-252` @v0.34.0): `session_start` arms the poller,
+        // (`subagent-prompt-runtime.ts:441-464` @v0.43.0): `session_start` arms the poller,
         // `session_shutdown` disposes it, and the six turn-lifecycle events are the `activate`
         // triggers that set `canSteer` and flush immediately. Subscribed only when this child
         // actually has an inbox — `Dispatcher::no_subscribers` short-circuits the rest, so a
@@ -1218,7 +1218,7 @@ impl NativeExtension for SubagentPromptRuntime {
     }
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        // G90 / pi `registerSteeringInbox`'s handlers (`subagent-prompt-runtime.ts:247-258`). Run
+        // G90 / pi `registerSteeringInbox`'s handlers (`subagent-prompt-runtime.ts:441-469`). Run
         // FIRST and always fall through: every one of these events also has (or may later grow) a
         // meaning for the other halves of this runtime, and steering is a pure side effect that
         // must never swallow another handler's `HookOutcome`.
@@ -1346,7 +1346,7 @@ impl NativeExtension for SubagentPromptRuntime {
 /// a subagent child at all.
 ///
 /// Two independent halves, matching pi — which loads `subagent-prompt-runtime.ts` into EVERY
-/// subagent child (`pi-args.ts:141-143`) and then gates each half on its own vars:
+/// subagent child (`runs/shared/pi-args.ts:141-143`) and then gates each half on its own vars:
 ///
 /// * the `structured_output` tool needs BOTH structured vars (`:281`), plus a schema file that
 ///   reads and parses;

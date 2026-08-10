@@ -4,18 +4,18 @@
 //! # What this ports, and why it has to exist at all
 //!
 //! Upstream `pi-subagents` publishes the launching session's own id into its OWN process
-//! environment at `SessionStart` (`src/extension/index.ts:596-601` @v0.34.0 — the assignment
+//! environment at `SessionStart` (`src/extension/index.ts:713-718` @v0.43.0 — the assignment
 //! `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId` is `:599`, guarded by
 //! `if (!process.env[SUBAGENT_CHILD_ENV])`) and deletes it again at session shutdown (`:619`).
 //! Every subsequent spawn — foreground, background, detached, at any hop — therefore inherits the
-//! anchor for free, because `pi-args.ts:257` @v0.34.0 resolves it as
+//! anchor for free, because `runs/shared/pi-args.ts:257` @v0.34.0 resolves it as
 //! `input.parentSessionId ?? process.env[SUBAGENT_PARENT_SESSION_ENV] ?? ""` and a detached child
 //! inherits the parent's environment block whether or not the spawn site adds an overlay entry.
 //! `pi-permission-system` then reads that anchor (as its own
 //! `SUBAGENT_PARENT_SESSION_ENV_KEY = "PI_AGENT_ROUTER_PARENT_SESSION_ID"`,
 //! `permission-forwarding.ts:9,144` @v0.7.1) to address the parent's ask-forwarding inbox.
 //!
-//! (Those citations previously named `index.ts:555`/`:584`, `pi-args.ts:416` and
+//! (Those citations previously named `extension/index.ts:555`/`:584`, `runs/shared/pi-args.ts:416` and
 //! `permission-forwarding.ts:10,132` — the lines those statements occupy at each upstream's
 //! **HEAD**, not at the versions this workspace ports. `cyrup-ext-subagents` cites
 //! `pi-subagents` v0.34.0 throughout, `cyrup-permission-system` cites `pi-permission-system`
@@ -26,7 +26,7 @@
 //! `std::env::set_var` is `unsafe` as of the 2024 edition. `SubagentExecutor` consequently keeps
 //! the captured root anchor in a private `Mutex` field (`extension.rs`
 //! `capture_parent_session_anchor`/`clear_parent_session_anchor`, themselves a faithful port of
-//! index.ts:599/619) and threads it EXPLICITLY through
+//! extension/index.ts:599/619) and threads it EXPLICITLY through
 //! [`crate::exec::RunOptions::parent_session_id`] on the FOREGROUND path.
 //!
 //! That explicit thread is the only channel that existed, and it stops at the foreground path.
@@ -50,9 +50,9 @@
 //! The register's sole CONSUMER is `cyrup-permission-system` (the anchor exists only so a child's
 //! forwarded ask can address its parent's spool — nothing else in cyrup reads
 //! [`crate::PARENT_SESSION_ENV_VAR`]), and that crate is also the one that publishes here, from
-//! its PARENT-role `SessionStart`/`SessionShutdown` handlers, mirroring pi's index.ts:599/619
+//! its PARENT-role `SessionStart`/`SessionShutdown` handlers, mirroring pi's extension/index.ts:599/619
 //! placement one crate over. Publishing is strictly a PARENT-role act — the exact analog of pi's
-//! own `if (!process.env[SUBAGENT_CHILD_ENV])` guard at `index.ts:596`: a subagent child must never
+//! own `if (!process.env[SUBAGENT_CHILD_ENV])` guard at `extension/index.ts:596`: a subagent child must never
 //! overwrite the anchor with its own id, or a depth-2 grandchild would address its immediate
 //! parent instead of continuing to thread the root's anchor (the direct-parent depth-1 semantics
 //! `exec::PARENT_SESSION_ENV_VAR` documents).
@@ -67,14 +67,14 @@ use std::sync::Mutex;
 use crate::exec::PARENT_SESSION_ENV_VAR;
 
 /// The process-wide anchor slot — pi's `process.env[SUBAGENT_PARENT_SESSION_ENV]` cell
-/// (`pi-subagents/src/extension/index.ts:599`), held as a `Mutex` because this crate forbids the
+/// (`pi-subagents/src/extension/index.ts:716`), held as a `Mutex` because this crate forbids the
 /// `unsafe` `std::env::set_var` a real env write would require. A plain `Mutex` (not a `OnceLock`)
 /// for the same reason `SubagentExecutor::root_parent_session` is one: pi's slot is CLEARABLE at
 /// session shutdown (`:619`'s `delete`), which a write-once cell could not support.
 static ROOT_PARENT_SESSION_ANCHOR: Mutex<Option<String>> = Mutex::new(None);
 
 /// Publish this process's live session id as the parent-session anchor future spawns address
-/// (pi `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`, `extension/index.ts:599`).
+/// (pi `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`, `extension/index.ts:716`).
 ///
 /// A blank id clears the slot rather than storing an empty string, so a headless / unpersisted
 /// session never installs an anchor that would later resolve to a null forwarding target.
@@ -114,7 +114,7 @@ pub fn published_parent_session_anchor() -> Option<String> {
 /// # Why PUBLISHED wins (PERM-001 follow-up)
 ///
 /// pi has exactly ONE cell for this, `process.env[SUBAGENT_PARENT_SESSION_ENV]`, and publishing is
-/// an **assignment** (`index.ts:599`): a session that publishes CLOBBERS whatever the process
+/// an **assignment** (`extension/index.ts:599`): a session that publishes CLOBBERS whatever the process
 /// inherited, and a spawn afterwards can only ever read the published value. cyrup cannot write
 /// its own environment, so it emulates that one cell with TWO — the immutable inherited env plus
 /// [`ROOT_PARENT_SESSION_ANCHOR`] — and the only faithful emulation of an assignment is for the
@@ -124,13 +124,13 @@ pub fn published_parent_session_anchor() -> Option<String> {
 /// `exec::build_attempt_spawn_plan`'s own ladder". It does not match it: that ladder is EXPLICIT
 /// (`opts.parent_session_id`, sourced from `SubagentExecutor::root_parent_session` — i.e. the
 /// captured/published anchor) → INHERITED (`exec/mod.rs`, pi `input.parentSessionId ??
-/// process.env[…]`, `pi-args.ts:257`). Published-first is what makes the two agree, and what makes
+/// process.env[…]`, `runs/shared/pi-args.ts:257`). Published-first is what makes the two agree, and what makes
 /// the foreground and background paths agree with each other.
 ///
 /// "But a nested orchestrator must keep threading the ROOT's anchor, not substitute its own" is
 /// still true, and is still enforced — by the PUBLISHER, exactly where pi enforces it: a subagent
 /// child never publishes. Upstream that is the `if (!process.env[SUBAGENT_CHILD_ENV])` guard at
-/// `index.ts:596`; here it is `PermissionSystemExtension::publish_parent_session_anchor`'s
+/// `extension/index.ts:596`; here it is `PermissionSystemExtension::publish_parent_session_anchor`'s
 /// `install_watcher` gate, which is the SOLE writer of this register (a process carrying any of
 /// `cyrup-permission-system`'s `SUBAGENT_ENV_HINT_KEYS` is built as `new_forwarding_child`, whose
 /// `install_watcher` is `false` — the direct analog of pi's `SUBAGENT_CHILD_ENV` test). The hop-2
@@ -268,7 +268,7 @@ mod tests {
     /// PERM-001 follow-up — the LADDER ORDERING regression, driven through the injectable core so
     /// the INHERITED rung can be supplied without `unsafe { std::env::set_var }`.
     ///
-    /// pi's anchor lives in ONE cell and publishing is an ASSIGNMENT (`index.ts:599`), so a session
+    /// pi's anchor lives in ONE cell and publishing is an ASSIGNMENT (`extension/index.ts:599`), so a session
     /// that publishes clobbers whatever it inherited and every subsequent spawn reads the published
     /// value. This module emulates that cell with two, and until this fix the reader consulted them
     /// INHERITED-first — which inverts the assignment: a stale ancestor id, whether inherited from a

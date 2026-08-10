@@ -628,7 +628,7 @@ async fn parse_and_validate_hook_output(
     Ok(unique)
 }
 
-/// pi `runWorktreeSetupHook` (`pi-subagents/src/runs/shared/worktree.ts:290-296` @v0.34.0): invoke
+/// pi `runWorktreeSetupHook` (`pi-subagents/src/runs/shared/worktree.ts:323-329` @v0.43.0): invoke
 /// the hook (no args) with the worktree as cwd, the input JSON on stdin, bounded by the resolved
 /// timeout, and validate its `syntheticPaths` response.
 ///
@@ -1547,7 +1547,7 @@ mod tests {
     }
 
     /// SUBA-027 regression: a setup hook that blows through its timeout must be KILLED, matching
-    /// upstream `spawnSync(…, { timeout })` (`worktree.ts:290-296`), which kills on expiry.
+    /// upstream `spawnSync(…, { timeout })` (`worktree.ts:323-329`), which kills on expiry.
     /// Before the fix the `Child` lived inside the future `tokio::time::timeout` was racing, so
     /// the elapsed arm dropped the only handle and the hook ran on forever. `exec` in the fixture
     /// is load-bearing: it makes the pid the script publishes the same pid the parent holds, so

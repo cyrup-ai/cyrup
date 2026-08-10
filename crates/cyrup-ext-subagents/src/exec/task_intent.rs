@@ -1759,6 +1759,63 @@ mod tests {
         assert_eq!(strip_patterns("please produce findings only", &[]), "please produce findings only");
     }
 
+    /// The case none of the above can see: TWO INDEPENDENT patterns matching ONE text.
+    ///
+    /// Every case in [`strip_patterns_applies_each_pattern_in_sequence`] is single-pattern by
+    /// construction — each input is chosen so exactly one entry of
+    /// `READ_ONLY_DELIVERABLE_PATTERNS` fires on it. That kills a loop truncated to its first
+    /// ITERATION (patterns 2 and 3 would then never run at all), but it cannot kill a loop that
+    /// `break`s after the first pattern that MATCHES: on every one of those inputs the first
+    /// matching pattern is also the last one that would have done anything, so stopping there and
+    /// running to completion produce byte-identical output.
+    ///
+    /// Upstream's loop has no such exit — `for (const pattern of patterns) { stripped =
+    /// stripped.replace(...) }` (`task-intent.ts:104-109` @v0.43.0) applies EVERY pattern to the
+    /// text the previous one produced, whether or not any of them matched. The two texts below
+    /// each carry phrases for two different entries, so a `break` leaves the later phrase standing.
+    ///
+    /// Expected values are the source regexes' own output, computed by running
+    /// `READ_ONLY_DELIVERABLE_PATTERNS` (`task-intent.ts:61-65`) through `stripPatterns`'
+    /// `replace(/…/gi, " ")` semantics; the multiple spaces are real — each match collapses to a
+    /// single space and the surrounding spaces survive, exactly as upstream leaves them (the
+    /// callers at [`classify_task_mutation_intent`]/[`task_may_mutate`] only ever `test()` the
+    /// result, so whitespace is never normalized).
+    #[test]
+    fn strip_patterns_applies_every_pattern_even_after_one_has_matched() {
+        // Patterns 1 (`produce a report`) and 2 (`issue template`) both fire, on disjoint spans.
+        // A `break` after pattern 1 would leave `issue template` in the text.
+        assert_eq!(
+            strip_patterns(
+                "please produce a report and attach the issue template here",
+                READ_ONLY_DELIVERABLE_PATTERNS
+            ),
+            "please   and attach the   here",
+            "pattern 2 must still run on the text pattern 1 produced"
+        );
+
+        // …and the same for a break placed AFTER a later pattern: here pattern 1 misses entirely
+        // (`attach` is not one of its verbs), pattern 2 fires on `issue template`, and pattern 3
+        // fires on `provide findings only`. A `break` after pattern 2 would leave `findings only`.
+        assert_eq!(
+            strip_patterns(
+                "attach the issue template and provide findings only",
+                READ_ONLY_DELIVERABLE_PATTERNS
+            ),
+            "attach the   and  ",
+            "pattern 3 must still run after pattern 2 has already matched"
+        );
+
+        // All three in one text, which additionally pins that a match by an EARLIER pattern never
+        // suppresses a LATER one anywhere in the group.
+        assert_eq!(
+            strip_patterns(
+                "please produce a report, attach the issue template, and provide findings only",
+                READ_ONLY_DELIVERABLE_PATTERNS
+            ),
+            "please  , attach the  , and  "
+        );
+    }
+
     /// `NO_EDIT_PROHIBITION_PATTERN`'s object stops at `\b(?:but|and|then)\b`
     /// (`task-intent.ts:40`). Upstream's own cases cover `but` and `and` only, so `then` — the
     /// third alternative — needs its own case or the alternation is half-unverified.

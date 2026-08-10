@@ -20,7 +20,7 @@
 //! # Where the notice half lands
 //!
 //! Upstream splits the pipeline in two: `execution.ts` RAISES `ControlEvent`s from the child's
-//! stdout and hands each to `options.onControlEvent`; `subagent-executor.ts:505-535` @v0.34.0
+//! stdout and hands each to `options.onControlEvent`; `subagent-executor.ts:801-831` @v0.43.0
 //! (`emitControlNotification`) then decides which CHANNELS a raised event travels
 //! (`notifyChannels`), and `extension/control-notices.ts` debounces/re-validates/dedups the
 //! resulting transcript notice. This module owns the first half (raise + the two message
@@ -482,7 +482,7 @@ pub fn should_notify_control_event(config: &ResolvedControlConfig, event: &Contr
     config.enabled && config.notify_on.contains(&event.event_type)
 }
 
-/// pi `controlNotificationKey` (`subagent-control.ts:141-144`): the dedup identity of one notice —
+/// pi `controlNotificationKey` (`subagent-control.ts:142-145`): the dedup identity of one notice —
 /// `<child>:<type>:<reason>`, where `<child>` is the child's intercom target when one exists, else
 /// `runId:index` (or the bare `runId` for a single-child run).
 #[must_use]
@@ -747,7 +747,7 @@ impl LongRunningTrigger {
     }
 }
 
-/// pi `nextLongRunningTrigger` (`long-running-guard.ts:117-126`): elapsed-time first, then turns,
+/// pi `nextLongRunningTrigger` (`long-running-guard.ts:162-171`): elapsed-time first, then turns,
 /// then tokens — first match wins.
 #[must_use]
 pub fn next_long_running_trigger(
@@ -837,7 +837,7 @@ fn first_redirect_target(command: &str) -> Option<String> {
     None
 }
 
-/// pi `isMutatingTool` (`long-running-guard.ts:99-110`): `edit`/`write` always; `cursor` when its
+/// pi `isMutatingTool` (`long-running-guard.ts:138-155`): `edit`/`write` always; `cursor` when its
 /// `activityTitle` starts with `Cursor edit`/`Cursor write` (case-insensitively); `bash` when its
 /// command is classified mutating by [`is_mutating_bash_command`]; nothing else.
 #[must_use]
@@ -885,7 +885,7 @@ const MUTATING_FAILURE_HINTS: [&str; 9] = [
     "could not",
 ];
 
-/// pi `didMutatingToolFail` (`long-running-guard.ts:112-115`): a case-insensitive substring test
+/// pi `didMutatingToolFail` (`long-running-guard.ts:157-160`): a case-insensitive substring test
 /// against the failure hints.
 #[must_use]
 pub fn did_mutating_tool_fail(text: &str) -> bool {
@@ -1180,7 +1180,7 @@ impl ControlMonitor {
             .map(|started| (now - started).max(0))
     }
 
-    /// pi `emitNeedsAttention` (`execution.ts:590-615`). Returns `true` when this was a genuine
+    /// pi `emitNeedsAttention` (`execution.ts:955-984`). Returns `true` when this was a genuine
     /// state TRANSITION into `needs_attention` (the source's `previous !== "needs_attention"`).
     pub fn emit_needs_attention(&mut self, now: i64, input: NeedsAttentionInput) -> bool {
         if !self.config.enabled {

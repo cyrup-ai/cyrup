@@ -11,7 +11,7 @@
 //!   folds each progress event ([`LiveProgressFold`]) into a [`LiveProgressSnapshot`], wraps it in a
 //!   [`SubagentUpdatePayload`], and pushes it through the host [`cyrup_core::ToolUpdateSink`]
 //!   (`extension.rs::run_foreground_streaming`). Mirrors pi's `emitUpdateSnapshot`/`fireUpdate`
-//!   (`runs/foreground/execution.ts:478-499`), which fires an `onUpdate({content, details:{mode,
+//!   (`runs/foreground/execution.ts:805-826`), which fires an `onUpdate({content, details:{mode,
 //!   results, progress}})` on every `tool_execution_start`/`tool_execution_end`/`message_end`.
 //!
 //! - **C20/C21 — the render payloads.** [`SubagentUpdatePayload`] is the exact `ToolUpdate.details`
@@ -37,7 +37,7 @@
 //! (`crate::extension`), which the host calls on `AgentSessionEvent::ToolExecutionEnd` for the
 //! `subagent` tool once `init` has declared `register_tool_renderer("subagent")` —
 //! `cyrup-tui/src/app.rs:4276-4296`, pi's `renderResult` seam
-//! (`pi-subagents/src/extension/index.ts:495` @v0.34.0). The lines are converted to plain text
+//! (`pi-subagents/src/extension/index.ts:569` @v0.43.0). The lines are converted to plain text
 //! there (`tui::render::lines_to_plain_text`) because the renderer contract carries a serialized
 //! widget tree across the boundary rather than live `ratatui` values.
 //!
@@ -66,7 +66,7 @@ use crate::tui::render::{render_background_region, render_run_header_line};
 use crate::tui::{RunSource, SubagentProgressSnapshot};
 
 /// Bounded cap on a live progress fold's `recent_output` ring (pi slices `recentOutput` to a recent
-/// window on every append, `runs/foreground/execution.ts:115-120`; the crate's own per-step
+/// window on every append, `runs/foreground/execution.ts:211-216`; the crate's own per-step
 /// telemetry ring uses the same discipline). Oldest lines are evicted first once the cap is hit, so
 /// a long-running child's fold can never grow without bound.
 pub const RECENT_OUTPUT_CAP: usize = 20;
@@ -178,7 +178,7 @@ pub struct RecentToolCall {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveProgressSnapshot {
-    /// This child's flat index within its run (pi `AgentProgress.index`, `types.ts:563`) — `0` for
+    /// This child's flat index within its run (pi `AgentProgress.index`, `shared/types.ts:563`) — `0` for
     /// a SINGLE run, the task position for a PARALLEL fan-out.
     #[serde(default)]
     pub index: u32,
@@ -187,11 +187,11 @@ pub struct LiveProgressSnapshot {
     pub agent: Option<String>,
     /// The run's lifecycle phase from the inline surface's point of view.
     pub status: LiveProgressStatus,
-    /// pi `AgentProgress.activityState` (`types.ts:566`): the live-control attention classification
+    /// pi `AgentProgress.activityState` (`shared/types.ts:566`): the live-control attention classification
     /// this child most recently transitioned to, when one was raised at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_state: Option<ActivityState>,
-    /// The task text this child was launched with (pi `AgentProgress.task`, `types.ts:567`).
+    /// The task text this child was launched with (pi `AgentProgress.task`, `shared/types.ts:567`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub task: String,
     /// The resolved skill names injected into this child's prompt (pi `AgentProgress.skills`).
@@ -211,7 +211,7 @@ pub struct LiveProgressSnapshot {
     pub turn_count: u32,
     /// Cumulative `input + output` tokens observed so far (pi `progress.tokens`).
     pub tokens: u64,
-    /// The resolved launch model for this child (pi `AgentProgress.model`, `types.ts:580`).
+    /// The resolved launch model for this child (pi `AgentProgress.model`, `shared/types.ts:580`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// The resolved thinking level for this child (pi `AgentProgress.thinking`).
@@ -251,7 +251,7 @@ impl LiveProgressSnapshot {
     ///
     /// The status is pi's own terminal classification, in pi's own precedence order
     /// (`renderSingleCompact`'s `resultGlyph`/`resultStatusLine` inputs, and `runSinglePath`'s
-    /// detached/interrupted/exit-code ladder, `subagent-executor.ts:3035-3055`): detached wins,
+    /// detached/interrupted/exit-code ladder, `subagent-executor.ts:3849-3869`): detached wins,
     /// then a zero exit is complete and anything else failed. `recent_tools`/`recent_output` are
     /// left empty exactly as [`Self::compact_completed`] leaves them on a settled snapshot.
     #[must_use]
@@ -421,7 +421,7 @@ impl LiveProgressFold {
     /// Fold one raw NDJSON stdout line into this state. Returns `true` iff the line parsed to a
     /// progress-relevant event (`tool_execution_start`/`tool_execution_end`/assistant
     /// `message_end`) — the exact set pi fires `fireUpdate` on
-    /// (`runs/foreground/execution.ts:535,553,585`), so a caller emits a fresh
+    /// (`runs/foreground/execution.ts:891,553,585`), so a caller emits a fresh
     /// [`SubagentUpdatePayload`] exactly when this returns `true` (never once per raw line).
     /// A non-JSON line, or a JSON event that carries no renderer-facing change, returns `false`.
     pub fn record_line(&mut self, raw: &str) -> bool {
@@ -531,7 +531,7 @@ impl LiveProgressFold {
 
     /// Append the non-empty lines of `text` to the bounded `recent_output` ring, evicting oldest
     /// first past [`RECENT_OUTPUT_CAP`] (pi `appendRecentOutput`,
-    /// `runs/foreground/execution.ts:115-120`).
+    /// `runs/foreground/execution.ts:211-216`).
     fn push_output(&mut self, text: &str) {
         for line in text.lines() {
             let trimmed = line.trim();
@@ -674,7 +674,7 @@ impl SubagentUpdatePayload {
 /// the activity glyph.
 ///
 /// Which entries are rendered mirrors pi's `renderSubagentResult`, whose input is the whole
-/// `Details` object (`tui/render.ts:1406-1430` @v0.34.0) and which reads the SETTLED run out of
+/// `Details` object (`tui/render.ts:1678-1712` @v0.43.0) and which reads the SETTLED run out of
 /// `d.results[…]` — `renderSingleCompact(d, r, …)` takes `r` from `results`, and only reaches for
 /// `r.progress` for the still-running detail lines (`:1275-1298`). So:
 ///
@@ -686,7 +686,7 @@ impl SubagentUpdatePayload {
 ///
 /// Rendering only `progress` — which this function used to do — meant a settled tool result drew
 /// NOTHING at all, because pi's own settle payload carries `results` and gates `progress` on the
-/// caller's `includeProgress` flag (`subagent-executor.ts:3008`).
+/// caller's `includeProgress` flag (`subagent-executor.ts:3819`).
 #[must_use]
 pub fn render_inline_result(payload: &SubagentUpdatePayload, tick: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();

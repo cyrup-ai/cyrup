@@ -118,24 +118,24 @@ pub struct SubagentExtensionConfig {
     /// across every run mode. Default 40 (func-SA §4.7).
     pub max_subagent_spawns_per_session: u32,
     /// Top-level parallel fan-out limits, as a NESTED object matching pi's
-    /// `ExtensionConfig.parallel?: { maxTasks?, concurrency? }` (types.ts:829-832/874) — NOT two
+    /// `ExtensionConfig.parallel?: { maxTasks?, concurrency? }` (shared/types.ts:1715-1718/1771) — NOT two
     /// flat `parallelMaxTasks`/`parallelConcurrency` keys. Read via the [`Self::parallel_max_tasks`]
     /// / [`Self::parallel_concurrency`] accessors, which fall back to pi's defaults (8 / 4) when the
     /// object, or a field within it, is omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel: Option<TopLevelParallelConfig>,
     /// Live-control notice thresholds/channels — pi `ExtensionConfig.control?: ControlConfig`
-    /// (types.ts:101-110/873). Feeds the control-notice state machine (`tui/notices.rs`); a resolved
+    /// (shared/types.ts:160-169/1764). Feeds the control-notice state machine (`tui/notices.rs`); a resolved
     /// view is produced by pi's `resolveControlConfig`. `None` = every threshold defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control: Option<ControlConfig>,
     /// Chain-specific extension config — pi `ExtensionConfig.chain?: { dynamicFanout?: { maxItems? } }`
-    /// (types.ts:834-838/875): the per-run cap on how many items a dynamic fan-out may expand to.
+    /// (shared/types.ts:1720-1724/1772): the per-run cap on how many items a dynamic fan-out may expand to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain: Option<ExtensionChainConfig>,
     /// Proactive skill-subagent suggestion config — pi
     /// `ExtensionConfig.proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false`
-    /// (types.ts:840-845/880): an object of tuning knobs, or the literal `false` to disable the
+    /// (shared/types.ts:840-845/880): an object of tuning knobs, or the literal `false` to disable the
     /// feature entirely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proactive_skill_subagents: Option<ProactiveSkillSubagents>,
@@ -158,7 +158,7 @@ pub struct SubagentExtensionConfig {
     pub worktree_base_dir: Option<PathBuf>,
     /// An optional external setup script invoked once per `worktree: true` group after worktree
     /// creation, before any child process is spawned into it (R-SA-063). Matches pi's
-    /// `ExtensionConfig.worktreeSetupHook?: string` (types.ts:876): a bare **script-path string**
+    /// `ExtensionConfig.worktreeSetupHook?: string` (shared/types.ts:876): a bare **script-path string**
     /// (e.g. `"./scripts/setup-worktree.mjs"`), NOT a `{ command, args }` object — pi resolves it
     /// into a runnable `{ hookPath, timeoutMs }` at spawn time (`subagent-runner.ts:1975`). The
     /// crate-internal runnable shape (`spawn::worktree`'s `WorktreeSetupHookConfig`/[`HookSpec`]) is
@@ -172,7 +172,7 @@ pub struct SubagentExtensionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_setup_hook_timeout_ms: Option<u64>,
     /// The `wait` tool's config gate — pi `ExtensionConfig.waitTool?: WaitToolConfig`
-    /// (`extension/index.ts:260` `resolveWaitToolConfig(config.waitTool)`), accepting either a bare
+    /// (`extension/index.ts:332` `resolveWaitToolConfig(config.waitTool)`), accepting either a bare
     /// boolean or `{ enabled?: boolean }`. `None` (the field omitted) = enabled, pi's default.
     /// [`crate::background::wait::WAIT_TOOL_ENABLED_ENV`] overrides whatever this says.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -270,10 +270,10 @@ pub struct HookSpec {
 }
 
 // -------------------------------------------------------------------------------------------
-// Nested config objects (pi types.ts:829-882) — the shapes pi's ExtensionConfig nests
+// Nested config objects (pi shared/types.ts:829-882) — the shapes pi's ExtensionConfig nests
 // -------------------------------------------------------------------------------------------
 
-/// pi `TopLevelParallelConfig` (types.ts:829-832): the nested `parallel: { maxTasks?, concurrency? }`
+/// pi `TopLevelParallelConfig` (shared/types.ts:829-832): the nested `parallel: { maxTasks?, concurrency? }`
 /// object of [`SubagentExtensionConfig`]. Both fields are optional; an omitted field defers to the
 /// hardcoded pi default via [`SubagentExtensionConfig::parallel_max_tasks`] /
 /// [`SubagentExtensionConfig::parallel_concurrency`].
@@ -286,7 +286,7 @@ pub struct TopLevelParallelConfig {
     pub concurrency: Option<u32>,
 }
 
-/// pi `ExtensionChainConfig` (types.ts:834-838): the nested `chain: { dynamicFanout?: { maxItems? } }`
+/// pi `ExtensionChainConfig` (shared/types.ts:834-838): the nested `chain: { dynamicFanout?: { maxItems? } }`
 /// object of [`SubagentExtensionConfig`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -295,7 +295,7 @@ pub struct ExtensionChainConfig {
     pub dynamic_fanout: Option<DynamicFanoutConfig>,
 }
 
-/// The `chain.dynamicFanout` object (pi types.ts:835-837): the per-run cap on how many items a
+/// The `chain.dynamicFanout` object (pi shared/types.ts:835-837): the per-run cap on how many items a
 /// dynamic fan-out step may expand to.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -304,7 +304,7 @@ pub struct DynamicFanoutConfig {
     pub max_items: Option<u32>,
 }
 
-/// One control-notice event class (pi `ControlEventType`, types.ts:98): the two activity-state
+/// One control-notice event class (pi `ControlEventType`, shared/types.ts:157): the two activity-state
 /// transitions a run may raise a control notice for. Serializes as `active_long_running` /
 /// `needs_attention` (matching pi's string union and [`crate::background::ActivityState`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -314,7 +314,7 @@ pub enum ControlEventType {
     NeedsAttention,
 }
 
-/// One control-notice delivery channel (pi `ControlNotificationChannel`, types.ts:99). Serializes
+/// One control-notice delivery channel (pi `ControlNotificationChannel`, shared/types.ts:158). Serializes
 /// as `event` / `async` / `intercom`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -324,7 +324,7 @@ pub enum ControlNotificationChannel {
     Intercom,
 }
 
-/// pi `ControlConfig` (types.ts:101-110): the live-control notice thresholds/channels nested under
+/// pi `ControlConfig` (shared/types.ts:101-110): the live-control notice thresholds/channels nested under
 /// [`SubagentExtensionConfig::control`]. Every field is optional; pi's `resolveControlConfig`
 /// derives a fully-defaulted `ResolvedControlConfig` from this plus per-call overrides. This crate
 /// carries the raw config shape faithfully so the resolved view (owned by the control-notice
@@ -360,7 +360,7 @@ pub struct ControlConfig {
     pub notify_channels: Option<Vec<ControlNotificationChannel>>,
 }
 
-/// pi `ProactiveSkillSubagentsConfig` (types.ts:840-845): the tuning knobs for proactive
+/// pi `ProactiveSkillSubagentsConfig` (shared/types.ts:840-845): the tuning knobs for proactive
 /// skill-subagent suggestions.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -375,7 +375,7 @@ pub struct ProactiveSkillSubagentsConfig {
     pub preferred_agent: Option<String>,
 }
 
-/// pi `proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false` (types.ts:880): either a
+/// pi `proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false` (shared/types.ts:880): either a
 /// tuning-knob object, or the literal `false` to disable the feature entirely. Deserialized
 /// untagged so both a JSON object and a bare `false` parse.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn subagent_extension_config_parses_pi_control_and_nested_parallel_shapes() {
-        // The exact pi ExtensionConfig shape (types.ts:864-882): nested `parallel {}`, `control {}`
+        // The exact pi ExtensionConfig shape (shared/types.ts:864-882): nested `parallel {}`, `control {}`
         // with all eight keys, `chain.dynamicFanout.maxItems`, `proactiveSkillSubagents` as an
         // object, and `worktreeSetupHook` as a bare script-path string.
         let cfg: SubagentExtensionConfig = serde_json::from_str(

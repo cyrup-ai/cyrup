@@ -470,7 +470,7 @@ fn sample_structured_output_schema() -> serde_json::Value {
     })
 }
 
-/// SUBA-S01 (pi `structured-output.ts:55-68`, `subagent-prompt-runtime.ts`): the child delivers a
+/// SUBA-S01 (pi `structured-output.ts:156-173`, `subagent-prompt-runtime.ts`): the child delivers a
 /// structured-output value by CALLING the `structured_output` tool, which writes it to the private
 /// capture file the parent named in `CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE`. A fenced
 /// ` ```json ` block in prose is explicitly NOT that channel (a missing capture file is a hard
@@ -665,7 +665,7 @@ async fn run_sync_accepts_a_structured_only_child_that_produced_no_prose_at_all(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_missing_structured_output_fails_the_run_even_with_prose() {
-    // pi `readStructuredOutput` (structured-output.ts:55-58, execution.ts:791-805): a declared
+    // pi `readStructuredOutput` (structured-output.ts:156-159, execution.ts:791-805): a declared
     // `outputSchema` with NO captured structured value is a HARD failure EVEN WHEN the child
     // produced prose — prose is never an exemption. The child here emits a non-empty prose answer
     // but NO structured-output value at all.
@@ -775,7 +775,7 @@ async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_doe
 
     // The child EXITS ZERO, but its final activity was a failed `bash` call reporting a non-zero
     // exit code, with NO assistant text recovering from it — pi `detectSubagentError`
-    // (`utils.ts:390-460`) flips this to a failure at the parsed exit code (127). Because
+    // (`utils.ts:481-519`) flips this to a failure at the parsed exit code (127). Because
     // "exit 127" matches NO retryable pattern, the fallback model must never be attempted.
     let script = serde_json::json!({
         "steps": [
@@ -1182,7 +1182,7 @@ async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
 //
 // pi gates its `details.progress` array on the flag and nothing else
 // (`progress: params.includeProgress ? allProgress : undefined`,
-// `runs/foreground/subagent-executor.ts:3008` @v0.34.0 for SINGLE, `:2679` for PARALLEL). cyrup's
+// `runs/foreground/subagent-executor.ts:3819` @v0.43.0 for SINGLE, `:2679` for PARALLEL). cyrup's
 // SINGLE-mode `details` IS the serialized `SingleResult`, so the snapshot lands on
 // `SingleResult::progress` and surfaces at the same JSON path a pi caller reads.
 //

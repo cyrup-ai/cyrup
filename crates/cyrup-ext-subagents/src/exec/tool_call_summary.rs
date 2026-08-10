@@ -1,6 +1,6 @@
 //! `{text, expandedText}` tool-call argument previews (R-SA-043's compaction target), a 1:1 port
 //! of pi-subagents' `ToolCallSummary` + `formatToolCall`/`shortenPath`
-//! (`pi-subagents/src/shared/types.ts:225-228`, `src/shared/formatters.ts:99-133`,
+//! (`pi-subagents/src/shared/types.ts:601-604`, `src/shared/formatters.ts:99-133`,
 //! `src/shared/utils.ts:309-326`).
 //!
 //! A completed run's `tool_calls` is NOT a bare list of tool names — pi surfaces one
@@ -11,7 +11,7 @@
 //! an on-disk `SingleResult` / a rendered result row shows what an LLM caller and a terminal user
 //! see in pi, not merely the tool's name.
 
-/// One tool-call preview (pi `ToolCallSummary`, `types.ts:225-228`): a short `text` and a longer
+/// One tool-call preview (pi `ToolCallSummary`, `shared/types.ts:225-228`): a short `text` and a longer
 /// `expanded_text`, both formatted from the tool name + its requested arguments via
 /// [`format_tool_call`]. `#[serde(rename_all = "camelCase")]` so `expanded_text` round-trips as
 /// `expandedText`, matching pi's on-disk/wire field name exactly.
@@ -25,7 +25,7 @@ pub struct ToolCallSummary {
 impl ToolCallSummary {
     /// Build both previews for `tool_name`/`args` in one shot — the short `text` and the longer
     /// `expanded_text` — exactly as pi's `extractToolCallSummaries` does
-    /// (`utils.ts:319-322`).
+    /// (`utils.ts:359-362`).
     #[must_use]
     pub fn from_call(tool_name: &str, args: &serde_json::Value) -> Self {
         Self {
@@ -43,7 +43,7 @@ impl ToolCallSummary {
 /// - any other tool: `<name> <JSON(args)>` truncated to 40 chars (or 160 when `expanded`).
 ///
 /// `args` is treated as an object; a non-object (or `null`) `args` is handled as an empty object,
-/// mirroring pi's `extractToolCallSummaries` guard (`utils.ts:316-318`) that coerces a
+/// mirroring pi's `extractToolCallSummaries` guard (`utils.ts:356-358`) that coerces a
 /// non-object/array `arguments` to `{}` before formatting.
 #[must_use]
 pub fn format_tool_call(name: &str, args: &serde_json::Value, expanded: bool) -> String {

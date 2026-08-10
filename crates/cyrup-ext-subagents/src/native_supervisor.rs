@@ -50,11 +50,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use cyrup_core::{CancelToken, Content, ExecMode, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 
-/// `NATIVE_INTERCOM_EXTENSION_DIR` (`intercom-bridge.ts:8`) — the constant the doctor report's
+/// `NATIVE_INTERCOM_EXTENSION_DIR` (`intercom/intercom-bridge.ts:8`) — the constant the doctor report's
 /// intercom section renders in place of the old on-disk `pi-intercom` extension-directory probe.
 /// It is not a path: it is a sentinel meaning "the supervisor channel is this process's own
 /// filesystem channel", which is why `diagnoseIntercomBridge` reports
-/// `supervisorChannelAvailable: true` unconditionally (`intercom-bridge.ts:141`).
+/// `supervisorChannelAvailable: true` unconditionally (`intercom/intercom-bridge.ts:141`).
 pub const NATIVE_SUPERVISOR_EXTENSION_DIR: &str = "native:cyrup-subagents-supervisor-channel";
 
 /// `NATIVE_SUPERVISOR_TOOL_NAME` (`native-supervisor-channel.ts:21`): the PARENT-side tool name.
@@ -815,7 +815,7 @@ struct ChannelState {
 /// Reached by: `SubagentsExtension::init` registers [`SubagentSupervisorTool`] over this handle
 /// (Full mode only, matching upstream's `registerParentTools`), and the `SessionStart` handler calls
 /// [`Self::start`], which is where upstream calls `supervisorChannel.start()`
-/// (`extension/index.ts:614`).
+/// (`extension/index.ts:757`).
 pub struct NativeSupervisorChannel {
     state: Mutex<ChannelState>,
     /// The live capability backend messages are injected through, when one is bound.
@@ -1623,7 +1623,7 @@ impl Tool for NativeChildIntercomTool {
 /// The env var carrying this child's REQUIRED tool list — pi `REQUIRED_CHILD_TOOLS_ENV`
 /// (`runs/shared/tool-availability.ts:4`, value `PI_SUBAGENT_REQUIRED_TOOLS`), written by the spawn
 /// plan as a JSON array whenever the agent declared an explicit `tools:` allowlist
-/// (`pi-args.ts:611-616`).
+/// (`runs/shared/pi-args.ts:611-616`).
 ///
 /// Read here for one purpose, upstream's own (`subagent-prompt-runtime.ts:513`): the child-side
 /// `intercom` FALLBACK registers only when the agent's declared tool list actually asks for a tool
