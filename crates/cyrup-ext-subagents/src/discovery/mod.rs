@@ -151,8 +151,9 @@ pub const EXTRA_AGENT_DIRS_ENV_VAR: &str = "CYRUP_SUBAGENT_EXTRA_AGENT_DIRS";
 const AGENT_FILE_EXTENSION: &str = "md";
 
 // -------------------------------------------------------------------------------------------
-// Directory topology (pi findNearestProjectRoot / resolveNearestProject*Dirs, agents.ts:511-522,
-// 1234-1259,1279-1280). Pure, filesystem-probing helpers the caller (`extension.rs::
+// Directory topology (pi `findNearestProjectRoot` `agents.ts:653-655` / `findProjectRootCandidates`
+// `:617-627` / `resolveNearestProjectAgentDirs` `:1683-1697` / `resolveNearestProjectChainDirs`
+// `:1699-1708`, all @v0.43.0). Pure, filesystem-probing helpers the caller (`extension.rs::
 // discovery_config`) uses to populate an `AgentDiscoveryConfig`'s per-scope directory lists.
 // -------------------------------------------------------------------------------------------
 
@@ -162,8 +163,9 @@ const AGENT_FILE_EXTENSION: &str = "md";
 const PROJECT_CONFIG_DIR_SEGMENT: &str = ".cyrup";
 
 /// Legacy top-level agents directory segment (pi's `.agents`), honored BOTH at a project root (a
-/// lower-precedence project agent read dir, agents.ts:1238) AND at the user home (the "second"
-/// user agent dir `os.homedir()/.agents`, agents.ts:1280).
+/// lower-precedence project agent read dir, `agents.ts:1687,1690` @v0.43.0 — pushed AHEAD of the
+/// preferred `<root>/<configDir>/agents`) AND at the user home (the "second" user agent dir
+/// `os.homedir()/.agents`, `agents.ts:1729` for agents and `:1798` for the chain-carrying pass).
 const LEGACY_AGENTS_DIR_SEGMENT: &str = ".agents";
 
 /// Subdirectory under [`PROJECT_CONFIG_DIR_SEGMENT`] holding agent `.md` files.
@@ -171,18 +173,26 @@ const AGENTS_SUBDIR: &str = "agents";
 
 /// Subdirectory under [`PROJECT_CONFIG_DIR_SEGMENT`] holding chain files (`.chain.md`/`.chain.json`)
 /// — a directory SEPARATE from [`AGENTS_SUBDIR`] (pi `getUserChainDir`/`resolveNearestProjectChainDirs`
-/// key each User/Project chain scope on a dedicated `chains/` dir, agents.ts:180,1254, NOT the
-/// shared `agents/` dir; only *package*-tier chains co-locate with a package's agents dir, handled
-/// separately by [`scan_package_chain_scopes`]).
+/// key each User/Project chain scope on a dedicated `chains/` dir, `agents.ts:220-222` and `:1703`
+/// @v0.43.0, NOT the shared `agents/` dir; only *package*-tier chains co-locate with a package's
+/// agents dir, handled separately by [`scan_package_chain_scopes`]).
 const CHAINS_SUBDIR: &str = "chains";
 
 /// Walk `cwd` and every ancestor, returning the nearest directory that qualifies as a project root
 /// — one holding either a [`PROJECT_CONFIG_DIR_SEGMENT`] (`.cyrup`) config directory OR a legacy
-/// [`LEGACY_AGENTS_DIR_SEGMENT`] (`.agents`) directory (a faithful port of pi `findNearestProjectRoot`,
-/// agents.ts:511-522). Returns `None` when no ancestor up to the filesystem root qualifies, so a
-/// caller run outside any project scans no project-scope directories (pi's `readDirs: []`). Always
-/// terminates: the walk stops at the filesystem-root fixpoint where `Path::parent` no longer yields
-/// a distinct ancestor (pi's `path.dirname(dir) === dir` guard).
+/// [`LEGACY_AGENTS_DIR_SEGMENT`] (`.agents`) directory (a faithful port of pi
+/// `findNearestProjectRoot`, `agents.ts:653-655` @v0.43.0 — three lines that are exactly
+/// `findProjectRootCandidates(cwd)[0] ?? null`; the walk itself lives in
+/// [`find_project_root_candidates`], `agents.ts:617-627`). Returns `None` when no ancestor up to the
+/// filesystem root qualifies, so a caller run outside any project scans no project-scope directories
+/// (pi's `readDirs: []`). Always terminates: the walk stops at the filesystem-root fixpoint where
+/// `Path::parent` no longer yields a distinct ancestor (pi's `path.dirname(dir) === dir` guard).
+///
+/// NOT the function this crate's own scope resolution uses — every pi caller of the topology
+/// (`resolveNearestProjectAgentDirs` `:1684`, `resolveNearestProjectChainDirs` `:1700`,
+/// `getProjectAgentSettingsPath` `:679`) goes through [`find_configured_project_root`] instead, so
+/// that `subagents.projectRootResolution` is honored. This is pi's own exported convenience entry
+/// point; [`crate::discovery::agent_memory`]'s `MemoryScope::Project` is its one consumer here.
 #[must_use]
 pub fn find_nearest_project_root(cwd: &Path) -> Option<PathBuf> {
     find_project_root_candidates(cwd).into_iter().next()
@@ -234,7 +244,7 @@ pub fn find_nearest_git_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 /// How a project root is picked out of [`find_project_root_candidates`] — pi's
-/// `ProjectRootResolution` (`agents.ts:152`), declared as `subagents.projectRootResolution` in a
+/// `ProjectRootResolution` (`agents.ts:159`), declared as `subagents.projectRootResolution` in a
 /// candidate root's own `settings.json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectRootResolution {
@@ -411,7 +421,7 @@ pub fn resolve_user_chain_read_dirs(home: &Path) -> Vec<PathBuf> {
 }
 
 // -------------------------------------------------------------------------------------------
-// Alias-aware agent-name resolution (pi `resolveAgentName`, agents.ts:501-529)
+// Alias-aware agent-name resolution (pi `resolveAgentName`, agents.ts:511-529)
 // -------------------------------------------------------------------------------------------
 
 /// The outcome of an alias-aware name lookup — pi's `{ agent?, error? }` triple state
@@ -2334,7 +2344,7 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     // -----------------------------------------------------------------------------------------
-    // G97 — alias-aware name resolution (pi `resolveAgentName`, agents.ts:501-529)
+    // G97 — alias-aware name resolution (pi `resolveAgentName`, agents.ts:511-529)
     // -----------------------------------------------------------------------------------------
 
     fn parsed_agent(source: AgentSource, frontmatter: &str) -> AgentDefinition {
@@ -2731,6 +2741,40 @@ mod tests {
         write_project_settings(&inner, r#"{"projectRootResolution":"git-root"}"#);
 
         assert_eq!(find_configured_project_root(&inner).expect("resolves"), Some(inner));
+    }
+
+    /// The git probe is a PRESENCE test, not a directory test: pi writes
+    /// `fs.existsSync(path.join(currentDir, ".git"))` (`agents.ts:632` @v0.43.0), which is the ONE
+    /// probe in this topology that is not `isDirectory` — `isProjectRootCandidate` (`:614`) uses
+    /// `isDirectory` for both of ITS checks. A linked worktree (`git worktree add`) carries a `.git`
+    /// **file** holding `gitdir: …`, never a directory, so upstream counts it as a git root and
+    /// [`Path::exists`] is the exact analog.
+    ///
+    /// Untested until now, and the difference is invisible: narrowing the probe to `is_dir()` would
+    /// compile, keep every other test in this section green (they all `create_dir_all(".git")`), and
+    /// silently disable `projectRootResolution: "git-root"` for every developer working inside a
+    /// linked worktree — the resolution would quietly fall back to the nearest sub-project.
+    #[test]
+    fn a_linked_worktrees_dot_git_file_counts_as_a_git_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = tmp.path().join("repo");
+        let inner = outer.join("packages").join("app");
+        write_project_settings(&outer, r#"{"projectRootResolution":"git-root"}"#);
+        write_project_settings(&inner, "{}");
+        std::fs::write(outer.join(".git"), "gitdir: /elsewhere/.git/worktrees/app\n")
+            .expect("write the linked worktree's .git FILE");
+        assert!(outer.join(".git").is_file(), "the fixture must be a file, not a directory");
+
+        assert_eq!(
+            find_nearest_git_root(&inner).as_deref(),
+            Some(outer.as_path()),
+            "a `.git` FILE marks the git root exactly as a `.git` directory does"
+        );
+        assert_eq!(
+            find_configured_project_root(&inner).expect("resolves"),
+            Some(outer),
+            "git-root resolution must reach the repo root of a LINKED worktree too"
+        );
     }
 
     #[test]

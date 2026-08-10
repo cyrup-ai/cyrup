@@ -560,9 +560,35 @@ pub fn format_proactive_skill_subagent_recommendations(
 }
 
 /// Build the proactive recommendation transcript lines (pi
-/// `buildProactiveSkillSubagentRecommendationLines`, `proactive-skills.ts:172-191`). When proactive
-/// suggestions are disabled the `discover_available_skills` closure is NOT invoked; a closure error
-/// (discovery failure) degrades to an empty availability list, which yields no suggestions.
+/// `buildProactiveSkillSubagentRecommendationLines`, `proactive-skills.ts:175-194` @v0.43.0 — twenty
+/// lines). When proactive suggestions are disabled the `discover_available_skills` closure is NOT
+/// invoked; a closure error (discovery failure) degrades to an empty availability list, which yields
+/// no suggestions.
+///
+/// # UNWIRED — this function has no production caller
+///
+/// Upstream calls it from exactly one place: `handleList` (`agent-management.ts:765-770` @v0.43.0),
+/// which splices its lines between the `Chains:` block and the chain diagnostics
+/// (`agent-management.ts:784`, inside the `handleList` that spans `:753-788`). cyrup's [`crate::discovery::management`] `handle_list` still carries
+/// the "the proactive-skill block is deferred" note from when this module did not exist, so the
+/// whole recommender — this function, [`recommend_proactive_skill_subagents`],
+/// [`format_proactive_skill_subagent_recommendations`], [`proactive_agent_input`],
+/// [`proactive_chain_input`] and [`discover_available_skills`] — is reachable only from tests and
+/// from outside the crate. `{ action: "list" }` therefore never shows a suggestion, and the bundled
+/// `pi-subagents` SKILL.md tells the model to look for one.
+///
+/// Wiring it needs two things this module cannot reach on its own, both of which cross into
+/// `extension.rs`:
+///
+/// 1. `handle_list` is synchronous and [`discover_available_skills`] is `async`, so either the
+///    management dispatcher becomes `async` or the caller pre-resolves the availability list and
+///    passes it down;
+/// 2. `ManagementRequest` carries no `proactiveSkillSubagents` setting, and omitting it would make
+///    an explicit `proactiveSkillSubagents: false` silently stop disabling anything (pi reads
+///    `ctx.config?.proactiveSkillSubagents` at `agent-management.ts:768`).
+///
+/// Both are pub-signature changes that per-package builds cannot see; do them under
+/// `cargo test --workspace`.
 pub fn build_proactive_skill_subagent_recommendation_lines<F, E>(
     agents: &[ProactiveAgentInput],
     chains: &[ProactiveChainInput],
@@ -938,6 +964,134 @@ mod tests {
             vec!["alpha".to_string(), "beta".to_string()]
         );
         assert!(recommendations.iter().all(|r| r.agent == "delegate"));
+    }
+
+    /// `chooseRecommendationAgent` (`proactive-skills.ts:92-99` @v0.43.0 — eight lines) picks the
+    /// ONE agent every suggestion is attributed to, on a three-rung ladder: the resolved
+    /// `preferredAgent` if it is enabled, else the first enabled name in `FALLBACK_AGENT_ORDER`
+    /// (`:8`, exactly `["reviewer", "delegate"]`), else the first ENABLED agent in input order.
+    ///
+    /// Only the top rung had coverage: `recommends_available_skills_referenced_by_multiple_enabled_configs`
+    /// and the config-bounds test above both hit an enabled preferred agent. Neither the MEMBERSHIP
+    /// of `FALLBACK_AGENT_ORDER` nor its ORDER was observable, so reordering it, emptying it, or
+    /// dropping the `!disabled` filter from any rung would have kept the suite green while silently
+    /// re-attributing every proactive suggestion to a different (possibly disabled) agent.
+    #[test]
+    fn the_recommendation_agent_ladder_walks_preferred_then_fallback_order_then_first_enabled() {
+        // Two agents reference `deslop`, so exactly one recommendation is produced and its `agent`
+        // field is `chooseRecommendationAgent`'s answer.
+        let skills = [available("deslop", None)];
+        let chosen = |agents: &[ProactiveAgentInput], preferred: Option<&str>| -> Option<String> {
+            let setting = preferred.map(|p| {
+                ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
+                    preferred_agent: Some(p.to_string()),
+                    ..Default::default()
+                })
+            });
+            let out = recommend_proactive_skill_subagents(
+                agents,
+                &[],
+                Some(&skills),
+                setting.as_ref(),
+            );
+            out.first().map(|r| r.agent.clone())
+        };
+
+        // Rung 1 — the preferred agent wins even though it is last in input order.
+        assert_eq!(
+            chosen(
+                &[
+                    agent("reviewer", &["deslop"], false),
+                    agent("delegate", &["deslop"], false),
+                    agent("scout", &[], false),
+                ],
+                Some("scout"),
+            )
+            .as_deref(),
+            Some("scout")
+        );
+
+        // Rung 1 is gated on `!disabled`: a DISABLED preferred agent falls through to rung 2.
+        assert_eq!(
+            chosen(
+                &[
+                    agent("delegate", &["deslop"], false),
+                    agent("reviewer", &["deslop"], false),
+                    agent("scout", &[], true),
+                ],
+                Some("scout"),
+            )
+            .as_deref(),
+            Some("reviewer"),
+            "a disabled preferred agent must not be chosen"
+        );
+
+        // Rung 2 — `reviewer` beats `delegate` because FALLBACK_AGENT_ORDER says so, NOT because of
+        // input order: `delegate` is listed FIRST here and still loses.
+        assert_eq!(
+            chosen(
+                &[
+                    agent("delegate", &["deslop"], false),
+                    agent("zeta", &["deslop"], false),
+                    agent("reviewer", &[], false),
+                ],
+                Some("nobody"),
+            )
+            .as_deref(),
+            Some("reviewer"),
+            "FALLBACK_AGENT_ORDER's first entry wins regardless of where it sits in the input"
+        );
+
+        // Rung 2, second entry — with `reviewer` absent, `delegate` is next in the order.
+        assert_eq!(
+            chosen(
+                &[agent("zeta", &["deslop"], false), agent("delegate", &["deslop"], false)],
+                Some("nobody"),
+            )
+            .as_deref(),
+            Some("delegate")
+        );
+
+        // Rung 2 is gated on `!disabled` too: a disabled `reviewer` yields to `delegate`.
+        assert_eq!(
+            chosen(
+                &[
+                    agent("reviewer", &["deslop"], true),
+                    agent("zeta", &["deslop"], false),
+                    agent("delegate", &["deslop"], false),
+                ],
+                Some("nobody"),
+            )
+            .as_deref(),
+            Some("delegate"),
+            "a disabled fallback candidate must be skipped, not chosen"
+        );
+
+        // Rung 3 — neither fallback name exists: the first ENABLED agent wins (`enabled[0]`, the
+        // filtered list's head, not `agents[0]`).
+        assert_eq!(
+            chosen(
+                &[
+                    agent("aardvark", &["deslop"], true),
+                    agent("zeta", &["deslop"], false),
+                    agent("yankee", &["deslop"], false),
+                ],
+                Some("nobody"),
+            )
+            .as_deref(),
+            Some("zeta"),
+            "rung 3 skips disabled agents rather than taking agents[0]"
+        );
+
+        // No enabled agent at all — pi returns `undefined` and `recommendProactiveSkillSubagents`
+        // bails before counting anything (`proactive-skills.ts:117-118`).
+        assert_eq!(
+            chosen(
+                &[agent("zeta", &["deslop"], true), agent("yankee", &["deslop"], true)],
+                Some("nobody"),
+            ),
+            None
+        );
     }
 
     #[test]

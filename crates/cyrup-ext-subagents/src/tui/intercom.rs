@@ -92,14 +92,14 @@ pub struct IntercomPayload {
     /// Total additive token usage across the run (a plain numeric summary — not a capability, not
     /// a route).
     pub total_tokens: u64,
-    /// pi's grouped `SubagentResultIntercomPayload.status` (`result-intercom.ts:82-90
+    /// pi's grouped `SubagentResultIntercomPayload.status` (`result-intercom.ts:83-91
     /// resolveGroupedStatus` @v0.43.0): the **5**-state precedence verdict over
     /// [`Self::child_statuses`] — any-failed wins, else any-**stopped**, else any-paused, else
     /// any-completed, else any-detached, else `Failed` (pi's own explicit default for an empty
     /// child set). A closed enum, not a capability-bearing value, so it is safe to include in this
     /// otherwise-narrow allowlist.
     pub status: SubagentResultStatus,
-    /// pi's grouped `SubagentResultIntercomPayload.summary` (`result-intercom.ts:54-63
+    /// pi's grouped `SubagentResultIntercomPayload.summary` (`result-intercom.ts:57-66
     /// formatStatusCounts` @v0.43.0): "N completed, N failed, N stopped, N paused, N detached"
     /// (only the non-zero buckets, in that fixed render order), or `"0 results"` when
     /// [`Self::child_statuses`] is empty.
@@ -114,13 +114,13 @@ pub struct IntercomPayload {
 }
 
 /// pi `SubagentResultStatus` (`shared/types.ts:229` @v0.43.0 — `"completed" | "failed" | "paused"
-/// | "stopped" | "detached"`, consumed by `result-intercom.ts:20-88`): the **five** terminal states
+/// | "stopped" | "detached"`, consumed by `result-intercom.ts:20-91`): the **five** terminal states
 /// a single grouped child (or a whole grouped run, via [`resolve_grouped_status`]) can resolve to.
 ///
 /// G104 — `Stopped` is its own variant, never an alias for `Failed` or `Paused`. Declaration order
 /// is upstream's own union order because [`count_statuses`] indexes its bucket array with `self as
 /// usize`; the RENDER order in [`format_status_counts`] is deliberately different (upstream's
-/// `formatStatusCounts` prints stopped BEFORE paused, `result-intercom.ts:47-53`) and is spelled
+/// `formatStatusCounts` prints stopped BEFORE paused, `result-intercom.ts:57-66`) and is spelled
 /// out separately there rather than derived from this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,7 +140,7 @@ pub enum SubagentResultStatus {
 /// sixth state is ever added.
 const STATUS_BUCKETS: usize = 5;
 
-/// pi `countStatuses` (`result-intercom.ts:41-52` @v0.43.0): tally `statuses` into the fixed
+/// pi `countStatuses` (`result-intercom.ts:43-55` @v0.43.0): tally `statuses` into the fixed
 /// completed/failed/paused/stopped/detached bucket order (index 0..4, matching
 /// [`SubagentResultStatus`]'s declaration order so `as usize` indexes this array directly).
 fn count_statuses(statuses: &[SubagentResultStatus]) -> [u32; STATUS_BUCKETS] {
@@ -159,7 +159,7 @@ fn count_of(counts: &[u32; STATUS_BUCKETS], status: SubagentResultStatus) -> u32
     counts.get(status as usize).copied().unwrap_or(0)
 }
 
-/// pi `formatStatusCounts` (`result-intercom.ts:54-63` @v0.43.0): "N completed, N failed, N
+/// pi `formatStatusCounts` (`result-intercom.ts:57-66` @v0.43.0): "N completed, N failed, N
 /// stopped, N paused, N detached" (only the non-zero buckets, joined with `", "`, in that fixed
 /// order), or the literal `"0 results"` when `statuses` is empty (pi's own explicit fallback for
 /// `parts.length === 0`).
@@ -191,7 +191,7 @@ pub fn format_status_counts(statuses: &[SubagentResultStatus]) -> String {
     }
 }
 
-/// pi `resolveGroupedStatus` (`result-intercom.ts:82-90` @v0.43.0), ported verbatim: any-failed →
+/// pi `resolveGroupedStatus` (`result-intercom.ts:83-91` @v0.43.0), ported verbatim: any-failed →
 /// `Failed`; else any-**stopped** → `Stopped`; else any-paused → `Paused`; else any-completed →
 /// `Completed`; else any-detached → `Detached`; else (no children at all) → `Failed` (pi's own
 /// explicit default, matched exactly — not `Completed` or any other "optimistic" fallback).
@@ -237,7 +237,7 @@ pub fn is_unexplained_process_signal(
         && !turn_budget_exceeded
 }
 
-/// Every field pi's `resolveSubagentResultStatus` reads (`result-intercom.ts:20-39` @v0.43.0),
+/// Every field pi's `resolveSubagentResultStatus` reads (`result-intercom.ts:20-41` @v0.43.0),
 /// gathered so the port can be a single faithful branch ladder instead of a widening argument list.
 /// `None` on `success`/`state` reproduces upstream's `undefined`, which is what makes the
 /// later branches reachable.
@@ -264,7 +264,7 @@ pub struct ResultStatusInput<'a> {
     pub turn_budget_exceeded: bool,
 }
 
-/// pi `resolveSubagentResultStatus` (`result-intercom.ts:20-39` @v0.43.0), ported branch-for-branch
+/// pi `resolveSubagentResultStatus` (`result-intercom.ts:20-41` @v0.43.0), ported branch-for-branch
 /// in upstream's exact order:
 ///
 /// 1. `detached` → `Detached`
@@ -332,7 +332,7 @@ pub fn resolve_single_result_status(child: &crate::exec::SingleResult) -> Subage
     resolve_subagent_result_status(&ResultStatusInput {
         exit_code: Some(child.exit_code),
         // pi `...(result.acceptance?.status === "rejected" ? { success: false } : {})`
-        // (`subagent-executor.ts:1596`) — the ONLY thing that pins `success` on this path.
+        // (`subagent-executor.ts:1597`) — the ONLY thing that pins `success` on this path.
         success: child
             .acceptance
             .as_ref()
@@ -420,7 +420,7 @@ impl IntercomPayload {
             .map(|r| r.usage.total_tokens)
             .fold(0u64, u64::saturating_add);
         // G104 — every child is resolved through the FULL `resolveSubagentResultStatus` ladder
-        // (`result-intercom.ts:20-39`), including its two `"stopped"` branches. The verdict is read
+        // (`result-intercom.ts:20-41`), including its two `"stopped"` branches. The verdict is read
         // PER CHILD (pi feeds `state: child.state`/`stopped: child.stopped`, not the run's,
         // `run-status.ts:467-475`) — a run that was stopped mid-flight has one stopped child and
         // possibly several already-completed ones, and flattening the run's own state onto all of
@@ -498,6 +498,51 @@ impl IntercomPayload {
                 .iter()
                 .map(|c| c.as_ref().and_then(|r| r.final_output.clone()).unwrap_or_default())
                 .collect(),
+            total_tokens: 0,
+            status,
+            summary,
+            child_statuses,
+        }
+    }
+
+    /// Builds an [`IntercomPayload`] for a FOREGROUND **single** run straight off the child's real
+    /// [`crate::exec::SingleResult`] — the third sanctioned constructor, holding the same
+    /// explicit-allowlist discipline as its two siblings.
+    ///
+    /// G104 — this exists because a single run's child status MUST be resolved by
+    /// [`resolve_single_result_status`] (pi `foregroundResultIntercomStatus`,
+    /// `runs/foreground/subagent-executor.ts:1594-1605` @v0.43.0, which `emitForegroundResultIntercom`
+    /// calls per child at `:1626`), not by [`resolve_step_result_status`]. The two disagree on real
+    /// data, and the disagreement is exactly the bug this constructor closes:
+    ///
+    /// * a child killed by an unexplained process signal (`processSignal` set, non-zero exit)
+    ///   resolves `Stopped` here and `Failed` through a `StepResult` (which has no `process_signal`
+    ///   field at all, so `resolve_step_result_status` can never reach `result-intercom.ts:35`);
+    /// * a child whose acceptance ledger is REJECTED but whose process exited `0` resolves `Failed`
+    ///   here (pi `:1596` pins `success: false`) and `Completed` through a `StepResult` built with
+    ///   `success: exit_code == 0`.
+    ///
+    /// `outputs`/`total_tokens` keep the single-run shapes the grouped foreground constructor
+    /// produces (`final_output` or empty; `0` — upstream's own foreground result-intercom message
+    /// carries no token total either, `formatSubagentResultIntercomMessage` at
+    /// `result-intercom.ts:230` renders run/mode/status/children/outputs and per-child lines and
+    /// nothing else), so the ONLY behaviour this changes is the per-child status resolution, which
+    /// is the point.
+    #[must_use]
+    pub fn from_single_result(
+        run_id: RunId,
+        agent: String,
+        success: bool,
+        result: &crate::exec::SingleResult,
+    ) -> Self {
+        let child_statuses = vec![resolve_single_result_status(result)];
+        let status = resolve_grouped_status(&child_statuses);
+        let summary = format_status_counts(&child_statuses);
+        Self {
+            run_id,
+            agent,
+            success,
+            outputs: vec![result.final_output.clone().unwrap_or_default()],
             total_tokens: 0,
             status,
             summary,
@@ -1028,10 +1073,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
-    // G104 — `stopped` as a first-class result status (pi `result-intercom.ts:20-90` @v0.43.0)
+    // G104 — `stopped` as a first-class result status (pi `result-intercom.ts:20-91` @v0.43.0)
     // ---------------------------------------------------------------------------------------
 
-    /// pi `resolveSubagentResultStatus` (`result-intercom.ts:20-39`) branch-by-branch, in
+    /// pi `resolveSubagentResultStatus` (`result-intercom.ts:20-41`) branch-by-branch, in
     /// upstream's own order. The two assertions that would fail under any "stopped is an alias"
     /// implementation are called out inline.
     #[test]
@@ -1160,7 +1205,7 @@ mod tests {
         assert!(!is_unexplained_process_signal(Some("SIGKILL"), false, false, false, true));
     }
 
-    /// pi `formatStatusCounts` (`result-intercom.ts:54-63`): the RENDER order puts `stopped`
+    /// pi `formatStatusCounts` (`result-intercom.ts:57-66`): the RENDER order puts `stopped`
     /// between `failed` and `paused`, which is NOT the bucket/declaration order — a zip against the
     /// enum order would print it fourth.
     #[test]
@@ -1192,7 +1237,7 @@ mod tests {
         assert_eq!(format_status_counts(&[]), "0 results");
     }
 
-    /// pi `resolveGroupedStatus` (`result-intercom.ts:82-90`): failed > stopped > paused >
+    /// pi `resolveGroupedStatus` (`result-intercom.ts:83-91`): failed > stopped > paused >
     /// completed > detached, with `failed` as the empty-set default.
     #[test]
     fn resolve_grouped_status_gives_stopped_its_own_precedence_slot() {

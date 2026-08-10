@@ -341,7 +341,7 @@ pub struct RunnerConfig {
     /// the directory this run's per-step artifact quadruple is written into.
     ///
     /// `None` means "write no artifacts" — pi's own gate is `if (ctx.artifactsDir &&
-    /// ctx.artifactConfig?.enabled !== false)` (`subagent-runner.ts:879`), i.e. an absent dir is
+    /// ctx.artifactConfig?.enabled !== false)` (`subagent-runner.ts:1192`), i.e. an absent dir is
     /// exactly as disabling as `enabled: false`, which is why the orchestrator sets this to `None`
     /// for `artifacts: false`. `#[serde(default)]` (`None`) is therefore also the pre-SUBA-N03
     /// behaviour: before this field existed the hop-2 runner wrote no artifacts at all.
@@ -1764,7 +1764,7 @@ fn promote_interrupted_results_to_stopped(results: &mut [SingleResult], message:
 }
 
 /// G77 — the STOP counterpart of [`mark_remaining_timed_out`]/[`mark_remaining_paused`], ported
-/// from pi `stopRunner`'s own step sweep (`subagent-runner.ts:2964-2973` @v0.43.0):
+/// from pi `stopRunner`'s own step sweep (`subagent-runner.ts:2965-2974` @v0.43.0):
 ///
 /// ```text
 /// for (const step of statusPayload.steps) {
@@ -2540,7 +2540,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // which is how a step's verify[] results get memoized under
             // `<artifactsDir>/acceptance/verify/<runId>/`. Gated by the SAME two-term gate every
             // other artifact write on this hop uses (`ctx.artifactsDir && ctx.artifactConfig
-            // ?.enabled !== false`, `subagent-runner.ts:879`), so `artifacts: false` disarms
+            // ?.enabled !== false`, `subagent-runner.ts:1192`), so `artifacts: false` disarms
             // memoization along with the quadruple.
             artifacts_dir: self
                 .artifacts_dir
@@ -3092,14 +3092,23 @@ async fn finish_run(
             model: None,
             attempted_models: Vec::new(),
             model_attempts: Vec::new(),
-            final_output: None,
+            // G77 — pi's `stoppedStepResult` fills BOTH halves (`subagent-runner.ts:2358-2365`:
+            // `output: stopMessage, error: stopMessage`), and the sibling live-child path here
+            // ([`promote_interrupted_results_to_stopped`]) already does the same. Without it a
+            // stopped run whose stop landed before any step produced a result delivers an EMPTY
+            // output alongside a populated error, which every output-shaped reader (the notify
+            // completion message, the intercom payload's `outputs`, the status report) renders as
+            // "the run produced nothing" rather than "the run was stopped". Only for `Stopped`:
+            // upstream's other synthesized shapes carry their own messages and cyrup's `finish_run`
+            // has no way to tell a plain `Failed` apart from a timed-out one.
+            final_output: (terminal_state == RunState::Stopped).then(|| error.clone()),
             structured_output: None,
             acceptance: None,
             detached: false,
             interrupted: terminal_state == RunState::Paused,
             timed_out: false,
             // G77 — pi `runSubagent`'s stopped result carries `stopped: true` and
-            // `exitCode: 1` (`subagent-runner.ts:2359-2365`), which is what
+            // `exitCode: 1` (`subagent-runner.ts:2358-2365`), which is what
             // `resolveSubagentResultStatus`/`buildCompletionDetails`/`resultState` all read to
             // classify the child as stopped rather than merely failed.
             stopped: terminal_state == RunState::Stopped,
@@ -3977,6 +3986,289 @@ mod tests {
             Some(session_file),
             "the terminal status.json write must carry the run's own session_file, matching the \
              ResultFile"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // G77 — the `stopped` widenings that had no coverage of their own: `finish_run`'s synthesized
+    // child, `mark_remaining_stopped`'s parallel-GROUP child sweep (the flat step sweep was
+    // covered; the group half never was), `promote_interrupted_results_to_stopped`'s
+    // already-settled-child filter, and the stop message itself. The fourth claimed ordering — a
+    // stop landing together with a timeout must win — needs a real runner and lives in
+    // `tests/run_state_signal_and_stop_parity.rs`.
+    // ---------------------------------------------------------------------------------------
+
+    /// G77 — pi's stop message, pinned VERBATIM.
+    ///
+    /// `"Subagent stopped by user."` is the literal `stopMessage` upstream defines once
+    /// (`runs/background/subagent-runner.ts:1972` @v0.43.0) and then repeats as the `??` default at
+    /// `:779`, `:915`, `:917`, `:952`, `:1151`, `:1596`, `:1636`, `:1658`,
+    /// `runs/shared/external-cli-runner.ts:108` and `runs/background/chain-root-attachment.ts:100,147`.
+    /// It is stamped onto a stopped run's terminal `error`, onto every step the stop swept, and onto
+    /// the child's `finalOutput` when the child produced none of its own — so a drifting copy would
+    /// silently change three separate observable records at once. Nothing pinned the text itself;
+    /// every existing assertion compared it against the constant, which cannot catch a drifted
+    /// constant.
+    #[test]
+    fn the_stop_message_is_pis_verbatim_text() {
+        assert_eq!(
+            control::STOP_MESSAGE,
+            "Subagent stopped by user.",
+            "pi `subagent-runner.ts:1972`'s literal `stopMessage`"
+        );
+    }
+
+    /// G77 widening 1 — `finish_run`'s SYNTHESIZED child.
+    ///
+    /// When a run reaches a terminal state having produced no step results at all, `finish_run`
+    /// invents one placeholder [`SingleResult`] so the `ResultFile` is never silently empty. That
+    /// placeholder must carry `stopped: true` for a `Stopped` run (pi `runSubagent`'s stopped result
+    /// shape, `subagent-runner.ts:2359-2365`: `stopped: true`, `exitCode: 1`) — it is the ONLY thing
+    /// that lets `resolveSubagentResultStatus` classify the child as stopped rather than merely
+    /// failed, and therefore the only thing that makes the grouped intercom verdict `stopped`.
+    ///
+    /// The three sibling terminal states are asserted in the same test so the flag cannot be
+    /// widened into an unconditional `true`.
+    #[tokio::test]
+    async fn finish_runs_synthesized_child_carries_stopped_only_for_a_stopped_run() {
+        for (terminal_state, expect_stopped, expect_interrupted) in [
+            (RunState::Stopped, true, false),
+            (RunState::Paused, false, true),
+            (RunState::Failed, false, false),
+        ] {
+            let dir = tempfile::tempdir().expect("real tempdir");
+            let run_id = RunId::from_token(format!("synth-{terminal_state:?}").to_lowercase());
+            let run_paths = run_paths_in(dir.path(), &run_id);
+            tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+            tokio::fs::create_dir_all(dir.path().join("results"))
+                .await
+                .expect("mkdir results_dir");
+
+            let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(1));
+            status.steps = vec![crate::background::StepStatus::pending("scout")];
+
+            finish_run(
+                &run_paths,
+                status,
+                terminal_state,
+                // Empty: this is exactly the input that makes `finish_run` synthesize a child.
+                Vec::new(),
+                dir.path().to_path_buf(),
+                None,
+                control::STOP_MESSAGE.to_string(),
+            )
+            .await;
+
+            let result: ResultFile = serde_json::from_slice(
+                &tokio::fs::read(&run_paths.result).await.expect("read result"),
+            )
+            .expect("valid JSON");
+            assert_eq!(result.state, terminal_state);
+            assert_eq!(
+                result.results.len(),
+                1,
+                "a terminal run with an error and no step results must still explain itself"
+            );
+            let child = &result.results[0];
+            assert_eq!(child.agent, "scout", "the placeholder inherits the first step's agent");
+            assert_eq!(child.exit_code, 1);
+            assert_eq!(
+                child.error.as_deref(),
+                Some(control::STOP_MESSAGE),
+                "{terminal_state:?}: the terminal error is folded onto the placeholder"
+            );
+            // pi `stoppedStepResult` fills `output: stopMessage` alongside `error: stopMessage`
+            // (`subagent-runner.ts:2358-2365`). Only the stopped shape does — a plain `Failed`
+            // placeholder carries no output, exactly as before.
+            assert_eq!(
+                child.final_output.as_deref(),
+                if expect_stopped { Some(control::STOP_MESSAGE) } else { None },
+                "{terminal_state:?}: {child:?}"
+            );
+            assert_eq!(
+                child.stopped, expect_stopped,
+                "{terminal_state:?}: the synthesized child's `stopped` flag must track the terminal \
+                 state, not be hard-coded either way: {child:?}"
+            );
+            assert_eq!(
+                child.interrupted, expect_interrupted,
+                "{terminal_state:?}: `interrupted` is the PAUSED verdict and must never coincide \
+                 with `stopped`: {child:?}"
+            );
+
+            // The downstream consequence, on the same real record: the grouped intercom verdict.
+            let payload = crate::tui::intercom::IntercomPayload::from_result(&result);
+            let expected = if expect_stopped {
+                crate::tui::intercom::SubagentResultStatus::Stopped
+            } else if expect_interrupted {
+                crate::tui::intercom::SubagentResultStatus::Paused
+            } else {
+                crate::tui::intercom::SubagentResultStatus::Failed
+            };
+            assert_eq!(
+                payload.status, expected,
+                "{terminal_state:?}: the synthesized child's flags are what `resolveGroupedStatus` \
+                 reads: {payload:?}"
+            );
+        }
+    }
+
+    /// G77 widening 2 — `mark_remaining_stopped`'s PARALLEL-GROUP child sweep.
+    ///
+    /// A parallel group's children live on `RunStatus::parallel_groups`, not in the flat `steps`
+    /// list, and upstream's `stopRunner` sweep marks every non-terminal one `"stopped"` with the
+    /// stop message (`subagent-runner.ts:2965-2974`, whose `statusPayload.steps` walk covers the
+    /// normalized parallel children too). The flat half was covered by the mid-flight stop
+    /// integration test; the group half never was — a single-step run has no groups at all.
+    ///
+    /// Three properties, all upstream's: already-terminal children are LEFT ALONE (a child that
+    /// genuinely completed before the stop landed is not relabelled), groups strictly before the
+    /// cursor are untouched, and every swept child gets [`control::STOP_MESSAGE`] plus an end
+    /// timestamp.
+    #[test]
+    fn mark_remaining_stopped_sweeps_parallel_group_children_without_relabelling_finished_ones() {
+        let mut status = RunStatus::queued(
+            RunId::from_token("stopgroups01".to_string()),
+            RunMode::Chain,
+            Some(1),
+        );
+        status.state = RunState::Running;
+        status.steps = vec![
+            crate::background::StepStatus::pending("group-a"),
+            crate::background::StepStatus::pending("group-b"),
+        ];
+        let group = |index: usize, statuses: &[StepState]| crate::background::ParallelGroupStatus {
+            group_step_index: index,
+            children: statuses
+                .iter()
+                .map(|s| {
+                    let mut child = crate::background::StepStatus::pending("kid");
+                    child.status = *s;
+                    child
+                })
+                .collect(),
+        };
+        status.parallel_groups = Some(vec![
+            // Strictly BEFORE the cursor: already settled, must not be touched.
+            group(0, &[StepState::Complete]),
+            // At the cursor: one mid-flight, one never started, one already finished.
+            group(1, &[StepState::Running, StepState::Pending, StepState::Complete]),
+        ]);
+
+        mark_remaining_stopped(&mut status, 1, 2, control::STOP_MESSAGE);
+
+        let groups = status.parallel_groups.as_ref().expect("groups survive the sweep");
+        assert_eq!(
+            groups[0].children[0].status,
+            StepState::Complete,
+            "a group before the cursor is not part of the sweep at all"
+        );
+        assert!(
+            groups[0].children[0].error.is_none(),
+            "and picks up no stop message either"
+        );
+
+        let swept = &groups[1].children;
+        assert_eq!(
+            swept[0].status,
+            StepState::Stopped,
+            "the mid-flight parallel child must be marked Stopped, never Failed and never Paused"
+        );
+        assert_eq!(
+            swept[1].status,
+            StepState::Stopped,
+            "a never-started parallel child is swept too (upstream sweeps `running` OR `pending`)"
+        );
+        assert_eq!(
+            swept[2].status,
+            StepState::Complete,
+            "a child that genuinely finished before the stop landed keeps its own verdict"
+        );
+        assert_eq!(swept[0].error.as_deref(), Some(control::STOP_MESSAGE));
+        assert_eq!(swept[1].error.as_deref(), Some(control::STOP_MESSAGE));
+        assert!(
+            swept[2].error.is_none(),
+            "the finished child is not restamped with a stop message it never earned"
+        );
+        assert!(swept[0].ended_at.is_some(), "a swept child gets an end timestamp");
+        assert!(swept[1].ended_at.is_some(), "a swept child gets an end timestamp");
+
+        // The flat step list is swept by the same call, from the same cursor.
+        assert_eq!(status.steps[0].status, StepState::Pending, "before the cursor");
+        assert_eq!(status.steps[1].status, StepState::Stopped);
+        assert_eq!(status.steps[1].error.as_deref(), Some(control::STOP_MESSAGE));
+    }
+
+    /// G77 widening 3, half one — `promote_interrupted_results_to_stopped` must NOT touch a child
+    /// that had already settled before the stop landed.
+    ///
+    /// pi's own promotion is `stopped: stoppedAfterAcceptance ? true : finalResult?.stopped`
+    /// (`subagent-runner.ts:1642,1722`), applied to the child the stop signal tore down — a child
+    /// whose record settled while `stopSignal.aborted` was still false keeps its own verdict.
+    /// cyrup's witness for "torn down by the stop" is `interrupted` (all three control verbs share
+    /// one cancellation token), so this asserts the filter, not just the rewrite.
+    #[test]
+    fn promoting_stopped_children_leaves_already_settled_ones_alone() {
+        let settled = |agent: &str, interrupted: bool, output: Option<&str>| SingleResult {
+            agent: agent.to_string(),
+            task: String::new(),
+            exit_code: 0,
+            usage: cyrup_core::Usage::default(),
+            model: None,
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: output.map(str::to_string),
+            structured_output: None,
+            acceptance: None,
+            detached: false,
+            interrupted,
+            timed_out: false,
+            stopped: false,
+            process_signal: None,
+            error: None,
+            saved_output_path: None,
+            tool_calls: Vec::new(),
+            output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
+        };
+        let mut results = vec![
+            settled("finished-first", false, Some("I completed before the stop.")),
+            settled("torn-down", true, None),
+            settled("torn-down-with-output", true, Some("partial work")),
+        ];
+
+        promote_interrupted_results_to_stopped(&mut results, control::STOP_MESSAGE);
+
+        assert!(
+            !results[0].stopped && !results[0].interrupted && results[0].exit_code == 0,
+            "a child that settled before the stop keeps its own clean record: {:?}",
+            results[0]
+        );
+        assert_eq!(
+            results[0].final_output.as_deref(),
+            Some("I completed before the stop.")
+        );
+
+        for promoted in &results[1..] {
+            assert!(promoted.stopped, "{promoted:?}");
+            assert!(
+                !promoted.interrupted,
+                "`interrupted` must be CLEARED, or the run reads as resumable: {promoted:?}"
+            );
+            assert_eq!(promoted.exit_code, 1, "pi `subagent-runner.ts:909`");
+            assert_eq!(promoted.error.as_deref(), Some(control::STOP_MESSAGE));
+        }
+        assert_eq!(
+            results[1].final_output.as_deref(),
+            Some(control::STOP_MESSAGE),
+            "a torn-down child with NO output of its own gets the stop message as its output \
+             (pi `subagent-runner.ts:917`)"
+        );
+        assert_eq!(
+            results[2].final_output.as_deref(),
+            Some("partial work"),
+            "a torn-down child that DID produce output keeps it (pi's `!finalOutput.trim()` guard)"
         );
     }
 

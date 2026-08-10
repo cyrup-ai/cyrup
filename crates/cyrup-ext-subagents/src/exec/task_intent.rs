@@ -1722,6 +1722,41 @@ mod tests {
             stripped.contains("only"),
             "pattern 1 must run before pattern 3: {stripped:?}"
         );
+
+        // The case above alone still cannot tell `for (const pattern of patterns)` from a loop
+        // that stops after the first pattern, because pattern 1 is the only one that fires on it.
+        // Each remaining entry therefore gets an input ONLY it matches, so a truncated or skipped
+        // iteration leaves its phrase behind.
+        //
+        // Pattern 2, `/\b(?:issue|bug report)\s+(?:draft|body|template)\b/i` (`task-intent.ts:63`):
+        // `attach` is not one of pattern 1's verbs and there is no `\s+only`, so patterns 1 and 3
+        // both miss.
+        let only_pattern_two = strip_patterns("attach the issue template here", READ_ONLY_DELIVERABLE_PATTERNS);
+        assert!(
+            !only_pattern_two.contains("issue") && !only_pattern_two.contains("template"),
+            "pattern 2 must be applied, not just pattern 1: {only_pattern_two:?}"
+        );
+        assert!(only_pattern_two.contains("attach"), "{only_pattern_two:?}");
+
+        // Pattern 3, `/\b(?:return|provide|produce)\s+(?:text|markdown|answer|findings?|recommendations?)\s+only\b/i`
+        // (`task-intent.ts:64`): `provide` is absent from pattern 1's verb alternation
+        // (`draft|write|compose|prepare|produce`), so only pattern 3 can fire here.
+        let only_pattern_three = strip_patterns("please provide findings only", READ_ONLY_DELIVERABLE_PATTERNS);
+        assert!(
+            !only_pattern_three.contains("findings") && !only_pattern_three.contains("only"),
+            "pattern 3 must be applied, not just pattern 1: {only_pattern_three:?}"
+        );
+
+        // And the feed-forward itself: pattern 3 is applied to the text pattern 1 PRODUCED, never
+        // to the original. A merged single pass (union of the two matches over the original text)
+        // would consume `only` as well, which is precisely what the first case forbids; asserting
+        // the exact string pins that there is no third possibility.
+        assert_eq!(strip_patterns("please produce findings only", READ_ONLY_DELIVERABLE_PATTERNS), "please   only");
+
+        // A pattern that matches nothing must leave the text byte-identical (`continue`, not a
+        // rebuild), and an empty matcher list must be the identity.
+        assert_eq!(strip_patterns("nothing to strip here", READ_ONLY_DELIVERABLE_PATTERNS), "nothing to strip here");
+        assert_eq!(strip_patterns("please produce findings only", &[]), "please produce findings only");
     }
 
     /// `NO_EDIT_PROHIBITION_PATTERN`'s object stops at `\b(?:but|and|then)\b`
@@ -1734,6 +1769,125 @@ mod tests {
             TaskMutationIntent::Implementation
         );
         assert!(task_may_mutate("Do not modify tests then implement the fix"));
+    }
+
+    /// The same rule pinned at the PRIMITIVE, so it cannot be proven only through a classifier
+    /// verdict that several other rules also feed. Each of `but`/`and`/`then` must end the
+    /// captured object at exactly the same place, leaving the follow-on clause in
+    /// `stripped_text` — and a non-coordinating word of the same shape must NOT.
+    #[test]
+    fn each_coordinating_word_ends_the_prohibition_object_at_the_same_place() {
+        for coordinator in ["but", "and", "then"] {
+            let task = format!("do not modify tests {coordinator} implement the fix");
+            let analysis = analyze_no_edit_prohibitions(&task);
+            assert!(analysis.present, "{coordinator}: {task:?}");
+            assert!(!analysis.blanket, "`tests` is a named scope: {coordinator}");
+            assert_eq!(
+                analysis.stripped_text,
+                format!(" {coordinator} implement the fix"),
+                "`{coordinator}` must terminate the object, leaving the follow-on clause"
+            );
+            assert!(at_coordinating_word(&task, task.find(coordinator).expect("present")));
+        }
+        // A word that merely STARTS with a coordinator is not one: `\b(?:but|and|then)\b`.
+        let task = "do not modify tests andrew owns implement the fix";
+        assert_eq!(
+            analyze_no_edit_prohibitions(task).stripped_text,
+            " ",
+            "`andrew` must not terminate the object: the whole clause is swallowed as the object"
+        );
+        assert!(!at_coordinating_word(task, task.find("andrew").expect("present")));
+        // Punctuation is the other terminator, and is independent of the coordinator alternation.
+        assert_eq!(
+            analyze_no_edit_prohibitions("do not modify tests; implement the fix").stripped_text,
+            " ; implement the fix"
+        );
+    }
+
+    /// `RESEARCH_AGENT_PATTERNS` pinned at the primitive: every alternative of
+    /// `investigate|scout|research(?:er)?` (`task-intent.ts:67-71`) must be recognized on its own,
+    /// independently of what `classify_task_mutation_intent` then does with the verdict.
+    #[test]
+    fn every_research_agent_alternative_is_recognized_by_the_primitive() {
+        for agent in [
+            "investigate",
+            "investigate-bot",
+            "scout",
+            "deep-scout",
+            "research",
+            "researcher",
+            "code researcher",
+        ] {
+            assert!(is_research_agent(agent), "{agent:?} must be a research agent");
+        }
+        for agent in [
+            "investigator-bot",
+            "scouting",
+            "researching",
+            "worker",
+            "advisor",
+            "reviewer",
+        ] {
+            assert!(!is_research_agent(agent), "{agent:?} must NOT be a research agent");
+        }
+    }
+
+    /// `REVIEWER_REQUIRED_EDIT_PATTERNS[2]`'s leading `(?:^|[.!?\n]\s*)` alternation, pinned at the
+    /// primitive: the `^` branch fires at offset 0 and NOWHERE else, and the `[.!?\n]\s*` branch is
+    /// still tried at offset 0 when `^` fails.
+    #[test]
+    fn the_sentence_initial_implement_anchor_is_pinned_at_the_primitive() {
+        // `^` branch, offset 0.
+        assert_eq!(
+            m_reviewer_sentence_initial_implement("implement the approved changes", 0),
+            Some("implement the approved".len())
+        );
+        // `^` is not `/m`, so no other offset may use it: the only match in this text is the one
+        // reached through the punctuation branch.
+        let two_sentences = "review the plan. implement the requested changes";
+        assert_eq!(m_reviewer_sentence_initial_implement(two_sentences, 0), None);
+        let dot = two_sentences.find('.').expect("dot");
+        assert!(m_reviewer_sentence_initial_implement(two_sentences, dot).is_some());
+        // Mid-sentence `implement …` is not a mandate: neither branch applies at the verb offset.
+        let mid = "we should implement the approved changes";
+        assert_eq!(
+            m_reviewer_sentence_initial_implement(mid, mid.find("implement").expect("verb")),
+            None
+        );
+        assert!(!any_match(mid, m_reviewer_sentence_initial_implement));
+        // Backtracking into the punctuation branch AT offset 0.
+        for text in [
+            "\nimplement the approved changes",
+            ". implement the approved changes",
+            "! implement the approved changes",
+            "?implement the requested fix",
+        ] {
+            assert!(
+                m_reviewer_sentence_initial_implement(text, 0).is_some(),
+                "the second alternative must be tried at offset 0 too: {text:?}"
+            );
+        }
+        // Every object alternative of `(?:approved|requested|specified|file|code|source|fix(?:es)?|changes?)`.
+        for object in [
+            "approved", "requested", "specified", "file", "code", "source", "fix", "fixes",
+            "change", "changes",
+        ] {
+            let text = format!("implement the {object}");
+            assert!(
+                m_reviewer_sentence_initial_implement(&text, 0).is_some(),
+                "{text:?}"
+            );
+            let bare = format!("implement {object}");
+            assert!(
+                m_reviewer_sentence_initial_implement(&bare, 0).is_some(),
+                "the `(?:the\\s+)?` group is optional: {bare:?}"
+            );
+        }
+        // ...and an object outside the alternation is not a mandate.
+        assert_eq!(
+            m_reviewer_sentence_initial_implement("implement the feature", 0),
+            None
+        );
     }
 
     /// `RESEARCH_AGENT_PATTERNS` is `investigate|scout|research(?:er)?` (`task-intent.ts:67-71`),

@@ -48,7 +48,14 @@ async fn a_secret_inherited_from_the_process_environment_is_redacted_out_of_the_
         std::env::remove_var("G80_INHERITED_API_KEY");
     }
 
-    let tail = &results[0].output_tail;
+    // Upstream keeps the two captured streams separate (`AcceptanceVerifyResult.stdout`/`.stderr`,
+    // `shared/types.ts:741-742`); the retired lattice shape's single `output_tail` was cyrup's.
+    let tail = format!(
+        "{}{}",
+        results[0].stdout.as_deref().unwrap_or_default(),
+        results[0].stderr.as_deref().unwrap_or_default()
+    );
+    let tail = &tail;
     assert!(
         !tail.contains("inherited_secret_value"),
         "an INHERITED credential reached the acceptance ledger verbatim: {tail:?}"

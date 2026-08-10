@@ -167,7 +167,7 @@ pub struct AgentFields {
     pub local_name: Option<String>,
     pub package_name: Option<Option<String>>,
     pub description: Option<String>,
-    /// pi `config.aliases` (`agent-management.ts:386-395` @ v0.43.0). `Some(list)` sets the alias
+    /// pi `config.aliases` (`agent-management.ts:411-421` @ v0.43.0). `Some(list)` sets the alias
     /// list (already normalized against the target's name); `Some(vec![])` is the `false`/`""`
     /// CLEAR; `None` means the update config never mentioned `aliases` and the existing list stands.
     pub aliases: Option<Vec<String>>,
@@ -900,7 +900,7 @@ fn preserved_frontmatter_fields(
     if fields.description.is_some() {
         set.remove("description");
     }
-    // pi `agent-management.ts:266` @ v0.43.0: `if (hasKey(cfg, "aliases")) changed("alias", "aliases")`
+    // pi `agent-management.ts:287` @ v0.43.0: `if (hasKey(cfg, "aliases")) changed("alias", "aliases")`
     // — an update that sets `aliases` un-preserves BOTH spellings so the new value is serialized.
     if fields.aliases.is_some() {
         set.remove("alias");
@@ -1573,7 +1573,7 @@ fn apply_agent_config(
 ) -> Result<(), String> {
     use serde_json::Value;
 
-    // pi `agent-management.ts:386-395` @ v0.43.0 — the FIRST branch of `applyAgentConfig`:
+    // pi `agent-management.ts:411-421` @ v0.43.0 — the FIRST branch of `applyAgentConfig`:
     //
     //   if (cfg.aliases === false || cfg.aliases === "") target.aliases = undefined;
     //   else if (typeof cfg.aliases === "string") { parseCsv(...).filter(a => a !== target.name) }
@@ -1923,7 +1923,7 @@ fn parse_step_list(raw: Option<&serde_json::Value>) -> Result<Vec<ChainStepConfi
 // unknownChainAgents + resolveTarget)
 // -------------------------------------------------------------------------------------------
 
-/// pi `findAgents` (`agent-management.ts:114-127` @ v0.43.0): ALIAS-AWARE lookup over the management
+/// pi `findAgents` (`agent-management.ts:114-126` @ v0.43.0): ALIAS-AWARE lookup over the management
 /// (disabled-inclusive) view, optionally narrowed to one scope, sorted by source label.
 ///
 /// The upstream shape, verbatim:
@@ -1975,7 +1975,7 @@ fn find_agents(d: &AgentDiscoveryResult, name: &str, scope: Option<AgentSource>)
 
 /// The DISTINCT canonical names present in a match set, sorted — pi's
 /// `[...new Set(matches.map(m => m.name))].sort((a, b) => a.localeCompare(b))`
-/// (`agent-management.ts:546-548,793`). More than one entry means the requested name/alias is
+/// (`agent-management.ts:624-626,880-882`). More than one entry means the requested name/alias is
 /// ambiguous and every caller must refuse rather than pick.
 fn distinct_agent_names<'a>(matches: impl IntoIterator<Item = &'a AgentDefinition>) -> Vec<String> {
     matches.into_iter().map(|a| a.name.clone()).collect::<BTreeSet<_>>().into_iter().collect()
@@ -2039,7 +2039,7 @@ fn name_exists_in_scope(
 /// pi `unknownChainAgents` (`agent-management.ts:131-135`): step agents that resolve to no known
 /// agent name, unique and sorted. Dynamic (agent-less) steps are skipped.
 fn unknown_chain_agents(d: &AgentDiscoveryResult, steps: &[ChainStepConfig]) -> Vec<String> {
-    // pi v0.43.0 (`agent-management.ts:169-173`) replaced the `new Set(allAgents(d).map(a => a.name))`
+    // pi v0.43.0 (`agent-management.ts:169-174`) replaced the `new Set(allAgents(d).map(a => a.name))`
     // membership test with `!resolveAgentName(agentName, agents).agent`, so a step that names an
     // ALIAS is known and no longer warns. An ambiguous name yields no `.agent` and is therefore
     // reported as unknown — upstream's behaviour, and defensible: the chain cannot be run either way.
@@ -2060,7 +2060,7 @@ trait MutableTarget: Clone {
     fn source(&self) -> AgentSource;
     fn file_path(&self) -> &Path;
     /// The target's CANONICAL name — pi widened `resolveTarget`'s bound to
-    /// `T extends { name: string; … }` (`agent-management.ts:539`) precisely so it could reject a
+    /// `T extends { name: string; … }` (`agent-management.ts:617`) precisely so it could reject a
     /// match set spanning several distinct names.
     fn target_name(&self) -> &str;
 }
@@ -2120,7 +2120,7 @@ fn resolve_target<T: MutableTarget>(
     available: &[String],
     scope_hint_raw: Option<&str>,
 ) -> Result<T, ManagementOutcome> {
-    // pi `agent-management.ts:545-549` @ v0.43.0, ahead of every other branch: a match set spanning
+    // pi `agent-management.ts:624-627` @ v0.43.0, ahead of every other branch: a match set spanning
     // several DISTINCT canonical names means the requested string was an ambiguous alias (or an
     // ambiguous name), and a mutating action must refuse outright rather than silently mutate one of
     // them. Names are listed sorted, de-duplicated.
@@ -2242,7 +2242,7 @@ fn format_agent_detail(a: &AgentDefinition) -> String {
             lines.push(format!("Package: {pkg}"));
         }
     }
-    // pi `agent-management.ts:594` @ v0.43.0: `if (agent.aliases?.length) lines.push(...)` — between
+    // pi `agent-management.ts:672` @ v0.43.0: `if (agent.aliases?.length) lines.push(...)` — between
     // the package block and the model line.
     if !a.aliases.is_empty() {
         lines.push(format!("Aliases: {}", a.aliases.join(", ")));
@@ -2476,8 +2476,18 @@ fn chain_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool 
     scope.is_none() || source == AgentSource::Package || Some(source) == scope
 }
 
-/// pi `handleList` (`agent-management.ts:539-566`). The proactive-skill block is deferred (skills
-/// subsystem absent — see section header). There is no companion-suggestion block to port: upstream
+/// pi `handleList` (`agent-management.ts:753-788` @v0.43.0 — thirty-six lines).
+///
+/// **The proactive-skill block is still MISSING, and the reason this comment used to give is stale.**
+/// It said "skills subsystem absent"; the subsystem exists now — [`crate::discovery::skills`] is a
+/// complete port of `proactive-skills.ts` — but nothing calls it, so `{ action: "list" }` never
+/// emits the `Proactive skill subagent suggestions:` block upstream splices in at
+/// `agent-management.ts:784`. See
+/// [`crate::discovery::skills::build_proactive_skill_subagent_recommendation_lines`]'s own doc for
+/// the two cross-file seams (an async availability scan, and a `proactiveSkillSubagents` setting
+/// that `ManagementRequest` does not carry) that the wire-up needs.
+///
+/// There is no companion-suggestion block to port: upstream
 /// deleted `companionSuggestionLines` from `handleList`'s `ManagementContext` and from its rendered
 /// lines in `3ac0ef5` ("Make supervisor coordination native", 2026-07-03), together with the whole
 /// `extension/companion-suggestions.ts` module.
@@ -2516,7 +2526,7 @@ fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Ma
                 .default_context
                 .map(|c| format!(", context: {}", context_str(c)))
                 .unwrap_or_default();
-            // pi `agent-management.ts:691` @ v0.43.0 appends `, aliases: <a, b>` after the optional
+            // pi `agent-management.ts:774` @ v0.43.0 appends `, aliases: <a, b>` after the optional
             // context segment and before the `: <description>` separator.
             let aliases = if a.aliases.is_empty() {
                 String::new()
@@ -2563,7 +2573,7 @@ fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Man
     let mut any_found = false;
     if let Some(agent_name) = req.agent {
         let matches = find_agents(&d, agent_name, None);
-        // pi `handleGet` @ v0.43.0 (`agent-management.ts:791-798`) checks AMBIGUITY first: a match
+        // pi `handleGet` @ v0.43.0 (`agent-management.ts:871-885`) checks AMBIGUITY first: a match
         // set spanning several distinct canonical names is refused before the not-found branch.
         let distinct = distinct_agent_names(&matches);
         if distinct.len() > 1 {
@@ -3172,7 +3182,7 @@ fn action_scope(scope: Option<&str>, action: &str) -> Result<AgentSource, Manage
     }
 }
 
-/// pi `resolveEffectiveAgent` (`agent-management.ts:137-152` @ v0.43.0, renamed from
+/// pi `resolveEffectiveAgent` (`agent-management.ts:138-152` @ v0.43.0, renamed from
 /// `pickEffectiveAgent` when it became alias-aware): the single highest-precedence agent answering
 /// to `name` — verbatim, by alias, or (only when neither matched) after [`sanitize_name`].
 ///
@@ -3383,7 +3393,7 @@ fn handle_disable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result
     };
 
     let d = discover_agents_all(cfg)?;
-    // pi `agent-management.ts:1059-1063` @ v0.43.0: the AMBIGUITY outcome is surfaced verbatim and
+    // pi `agent-management.ts:987-988` @ v0.43.0: the AMBIGUITY outcome is surfaced verbatim and
     // short-circuits ahead of the not-found message.
     let effective = match resolve_effective_agent(&d, raw) {
         Err(msg) => return Ok(ManagementOutcome::err(msg)),
@@ -3447,7 +3457,7 @@ fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
     };
 
     let d = discover_agents_all(cfg)?;
-    // pi `agent-management.ts:1059-1063` @ v0.43.0: the AMBIGUITY outcome is surfaced verbatim and
+    // pi `agent-management.ts:987-988` @ v0.43.0: the AMBIGUITY outcome is surfaced verbatim and
     // short-circuits ahead of the not-found message.
     let effective = match resolve_effective_agent(&d, raw) {
         Err(msg) => return Ok(ManagementOutcome::err(msg)),
@@ -4753,7 +4763,7 @@ mod tests {
     }
 
     /// `config.aliases` sets / clears the list, and rejects a wrong-typed value with pi's message
-    /// (`agent-management.ts:386-395`).
+    /// (`agent-management.ts:411-421`).
     #[test]
     fn config_aliases_sets_clears_and_validates() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4784,7 +4794,7 @@ mod tests {
 
         // `false` clears. pi's serializer emits the line only when there IS a value or when the
         // preserve set still carries the key — and `preservedAgentFrontmatterFields` REMOVES both
-        // spellings for an update that set `aliases` (`agent-management.ts:266`) — so a clear drops
+        // spellings for an update that set `aliases` (`agent-management.ts:287`) — so a clear drops
         // the line entirely rather than writing an empty one.
         let clear = serde_json::json!({ "aliases": false });
         handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&clear)))
@@ -4811,7 +4821,7 @@ mod tests {
     }
 
     /// `list` renders `, aliases: …` and `get` renders an `Aliases:` line
-    /// (`agent-management.ts:594,691`); `get` is also reachable BY the alias.
+    /// (`agent-management.ts:672,774`); `get` is also reachable BY the alias.
     #[test]
     fn list_and_get_render_aliases_and_get_resolves_by_alias() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4837,7 +4847,7 @@ mod tests {
     }
 
     /// Two agents claiming the SAME alias make every management path that would have to pick one
-    /// refuse, with pi's `Ambiguous agent alias or name` wording (`agent-management.ts:546-548,793`).
+    /// refuse, with pi's `Ambiguous agent alias or name` wording (`agent-management.ts:624-626,880-882`).
     #[test]
     fn an_ambiguous_alias_is_refused_by_get_update_and_disable() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4880,7 +4890,7 @@ mod tests {
     }
 
     /// `disable`/`enable` reach their target BY alias and write the override under the agent's
-    /// CANONICAL name (`agent-management.ts:1059-1069`).
+    /// CANONICAL name (`agent-management.ts:987-991`).
     #[test]
     fn disable_by_alias_writes_the_override_under_the_canonical_name() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4908,7 +4918,7 @@ mod tests {
     }
 
     /// A chain step that names an ALIAS is a known agent — pi swapped the `Set(names)` membership
-    /// test for `resolveAgentName` in v0.43.0 (`agent-management.ts:169-173`).
+    /// test for `resolveAgentName` in v0.43.0 (`agent-management.ts:169-174`).
     #[test]
     fn a_chain_step_naming_an_alias_does_not_warn_as_unknown() {
         let tmp = tempfile::tempdir().expect("tempdir");

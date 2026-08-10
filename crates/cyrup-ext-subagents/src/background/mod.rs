@@ -1723,7 +1723,7 @@ fn push_workflow_phase(phases: &mut Vec<WorkflowPhase>, phase: Option<&str>, nod
 }
 
 /// Summarize a parallel group's child statuses with pi's explicit precedence (pi
-/// `summarizeParallelStatuses`, `workflow-graph.ts:63-71`): running > stopped > failed > paused >
+/// `summarizeParallelStatuses`, `workflow-graph.ts:65-74`): running > stopped > failed > paused >
 /// detached > all-completed > any-completed(=running) > pending.
 ///
 /// G77 — the `stopped` slot sits immediately after `running`, matching the detached runner's own

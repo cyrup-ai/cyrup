@@ -46,6 +46,18 @@ use cyrup_ext_subagents::exec::completion_guard::CompletionMutationGuardResult;
 // Fixtures
 // ------------------------------------------------------------------------------------------------
 
+/// The combined capture the retired `VerifyCommandResult.output_tail` field held, reassembled
+/// from upstream's separate `stdout`/`stderr` (`AcceptanceVerifyResult`, `shared/types.ts:741-742`)
+/// in the same order the old field concatenated them. The two verify-result shapes have collapsed
+/// onto upstream's single one; this keeps each assertion below at exactly its previous strength.
+fn output_tail(result: &model::AcceptanceVerifyResult) -> String {
+    format!(
+        "{}{}",
+        result.stdout.as_deref().unwrap_or_default(),
+        result.stderr.as_deref().unwrap_or_default()
+    )
+}
+
 fn clean_gate() -> CleanCompletionGate {
     CleanCompletionGate {
         exit_code: 0,
@@ -233,7 +245,7 @@ fn every_occurrence_is_redacted_not_just_the_first() {
 // ------------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_live_lattice_runner_redacts_a_leaked_secret_out_of_the_captured_output() {
+async fn the_live_gate_runner_redacts_a_leaked_secret_out_of_the_captured_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     // A real verify command that echoes its own credential — the exact shape of a `curl -v` or a
     // test harness dumping its environment on failure.
@@ -246,7 +258,7 @@ async fn the_live_lattice_runner_redacts_a_leaked_secret_out_of_the_captured_out
     let results = run_verify_commands_memoized(std::slice::from_ref(&command), dir.path(), None).await;
 
     assert_eq!(results.len(), 1);
-    let tail = &results[0].output_tail;
+    let tail = output_tail(&results[0]);
     assert!(
         !tail.contains("tok_live_9f3a2b7c"),
         "the credential reached the acceptance ledger verbatim: {tail:?}"
@@ -293,32 +305,42 @@ async fn the_live_model_runner_redacts_both_stdout_and_stderr() {
 async fn redaction_runs_before_the_output_is_bounded_so_a_straddling_secret_cannot_leak() {
     // `trimOutput(redactVerifyEnv(stdout, env))` (`acceptance.ts:1194`) — redact the WHOLE capture,
     // then bound it. Bounding first would cut a secret in half and let the surviving half through.
-    // The lattice runner keeps a 4096-byte TAIL, so this prints padding sized to land the secret
-    // exactly across that cut.
+    //
+    // The bound is upstream's own `trimOutput` (`acceptance.ts:968-972` -> first 12 000 chars +
+    // `\n...[truncated]`), so the padding below is sized to land the secret exactly across THAT cut.
+    // It used to be sized for the retired lattice runner's 4096-byte tail instead; that runner is
+    // gone, and a 4158-byte capture is not truncated by `trimOutput` at all, so the old sizing
+    // could no longer exercise the ordering it exists to prove.
     let dir = tempfile::tempdir().expect("tempdir");
     let secret = "AAAABBBBCCCCDDDDEEEEFFFF"; // 24 bytes
-    // Raw output is `50*'x' + secret + 4084*'y'` = 4158 bytes. The 4096-byte tail therefore opens
-    // at byte 62 — 12 bytes INTO the secret — so redacting the already-bounded tail would leave
-    // `DDDDEEEEFFFF` in the ledger. Redacting first collapses the whole secret to `[REDACTED]`
-    // before any cut is made.
+    // Raw output is `11_990*'x' + secret + 100*'y'` = 12 114 chars. The 12 000-char HEAD cut
+    // therefore falls 10 chars INTO the secret, so redacting the already-bounded output would leave
+    // `AAAABBBBCC` sitting in the ledger (a partial no longer matches the env VALUE, so nothing
+    // would mask it). Redacting first collapses the whole secret to `[REDACTED]` before any cut.
     let command = verify_with_env(
         "straddle",
-        "printf 'x%.0s' $(seq 1 50); printf '%s' \"$LEAK_TOKEN\"; printf 'y%.0s' $(seq 1 4084)",
+        "printf 'x%.0s' $(seq 1 11990); printf '%s' \"$LEAK_TOKEN\"; printf 'y%.0s' $(seq 1 100)",
         &[("LEAK_TOKEN", secret)],
     );
 
     let results =
         run_verify_commands_memoized(std::slice::from_ref(&command), dir.path(), None).await;
-    let tail = &results[0].output_tail;
-    let head = &tail[..tail.len().min(80)];
+    let tail = output_tail(&results[0]);
+    let around_cut = &tail[tail.len().saturating_sub(120)..];
 
     assert!(
-        !tail.contains("DDDDEEEEFFFF"),
-        "the tail of a straddling secret survived the cut — redaction ran AFTER bounding: {head:?}"
+        !tail.contains("AAAABBBBCC"),
+        "the head of a straddling secret survived the cut — redaction ran AFTER bounding: \
+         {around_cut:?}"
     );
     assert!(
         tail.contains("[REDACTED]"),
-        "the straddling secret must be masked whole, before bounding: {head:?}"
+        "the straddling secret must be masked whole, before bounding: {around_cut:?}"
+    );
+    assert!(
+        tail.ends_with("...[truncated]"),
+        "the capture must actually have been truncated, or this test proves nothing about \
+         ordering: {around_cut:?}"
     );
 }
 
@@ -343,8 +365,10 @@ async fn a_failed_spawn_message_is_redacted_as_well() {
     let results =
         run_verify_commands_memoized(std::slice::from_ref(&command), dir.path(), None).await;
 
+    // Upstream puts the `child.on("error")` message on `stderr`, not on a field of its own
+    // (`acceptance.ts:1202-1204`); the retired lattice shape's `spawn_error` was cyrup's.
     let spawn_error = results[0]
-        .spawn_error
+        .stderr
         .clone()
         .expect("a command whose cwd does not exist cannot be spawned");
     assert!(
@@ -423,9 +447,19 @@ async fn the_live_gate_replays_a_memoized_verify_result_instead_of_re_running_th
         1,
         "the second evaluation must REPLAY the recorded result, not spawn the command again"
     );
+    // `{ ...cached.result, id, command, cwd, artifactPath, cacheKey, memoized: true, envKeys,
+    // envHash, workspaceState }` (`acceptance.ts:1106`): a replay is the RECORDED result verbatim
+    // except that it announces itself as a replay. The executed one carries `memoized: false`
+    // (`:1112`). Before the two verify-result shapes collapsed onto upstream's one, the live gate's
+    // shape had no `memoized` field at all, so this compared equal by having nothing to compare.
+    assert_eq!(first.verify_results[0].memoized, Some(false), "the first run EXECUTED");
+    assert_eq!(second.verify_results[0].memoized, Some(true), "the second run REPLAYED");
     assert_eq!(
-        second.verify_results, first.verify_results,
-        "a replayed result is the recorded one verbatim (`acceptance.ts:1106`)"
+        model::AcceptanceVerifyResult { memoized: Some(false), ..second.verify_results[0].clone() },
+        first.verify_results[0],
+        "apart from the `memoized` flag a replayed result is the recorded one verbatim, down to \
+         the recorded `duration_ms`, `cache_key`, `env_hash` and `workspace_state` \
+         (`acceptance.ts:1106`)"
     );
 }
 
@@ -858,5 +892,149 @@ async fn read_verify_workspace_state_reports_the_repo_relative_subdirectory() {
     assert!(
         outside_state.is_none() || outside_state.is_some_and(|s| s.repo_root != state.repo_root),
         "a plain temp directory must not resolve to the fixture repository"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// G78 / G80 REACHABILITY — the evidence must arrive on the LIVE gate's ledger, not only on
+// `model::evaluate_acceptance`'s.
+//
+// `model::evaluate_acceptance` has exactly ONE production caller (`spawn::chain_graph`'s
+// dynamic-group gate, which passes `memo: None` and so never memoizes anything). The gate that runs
+// for every ordinary single run is `exec::acceptance::evaluate_acceptance`, called from
+// `exec/mod.rs::run_sync`, and its ledger is what lands in `SingleResult.acceptance`. Until the two
+// verify-result shapes collapsed onto upstream's one, that ledger's entries had nowhere to put any
+// of upstream's memoization evidence and `artifactError` was a `tracing::debug!`. These tests fail
+// if that regresses.
+// ------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_gate_ledger_carries_every_memoization_evidence_field() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    init_repo(repo.path());
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let contract = verified_contract(verify_with_env(
+        "unit",
+        "true",
+        &[("DEPLOY_TOKEN", "tok_live_evidence")],
+    ));
+
+    let ledger = evaluate_acceptance(
+        &contract,
+        clean_gate(),
+        None,
+        guard_did_not_fire(),
+        repo.path(),
+        Some(memo(artifacts.path(), "run-EV")),
+        None,
+    )
+    .await;
+
+    assert_eq!(ledger.status, AcceptanceStatus::Verified);
+    // G78 — `evidenceStatus` (`shared/types.ts:787`), the field v0.43.0 split out of `status`.
+    assert_eq!(
+        ledger.evidence_status,
+        model::AcceptanceEvidenceStatus::Verified
+    );
+
+    assert_eq!(ledger.verify_results.len(), 1);
+    let run = &ledger.verify_results[0];
+    // G80 — all seven, `acceptance.ts:1112`.
+    let artifact_path = run
+        .artifact_path
+        .as_deref()
+        .expect("artifactPath (acceptance.ts:1112)");
+    assert!(
+        Path::new(artifact_path).is_file(),
+        "artifactPath must name an artifact that actually exists: {artifact_path}"
+    );
+    assert!(
+        artifact_path.starts_with(&artifacts.path().join("acceptance/verify/run-EV").display().to_string()),
+        "the artifact lives under <artifactsDir>/acceptance/verify/<runId>/ \
+         (acceptance.ts:1102): {artifact_path}"
+    );
+    let cache_key = run.cache_key.as_deref().expect("cacheKey");
+    assert_eq!(cache_key.len(), 64, "a hex sha256 (acceptance.ts:1034-1036)");
+    assert!(artifact_path.ends_with(&format!("{cache_key}.json")));
+    assert_eq!(run.memoized, Some(false), "this one EXECUTED");
+    assert_eq!(
+        run.env_keys.as_deref(),
+        Some(&["DEPLOY_TOKEN".to_string()][..]),
+        "envKeys is NAMES only (acceptance.ts:1088)"
+    );
+    let env_hash = run.env_hash.as_deref().expect("envHash");
+    assert_eq!(env_hash.len(), 64);
+    let workspace = run.workspace_state.as_ref().expect("workspaceState");
+    assert_eq!(workspace.kind, model::VerifyWorkspaceKind::GitTracked);
+    assert_eq!(workspace.cwd_relative, ".");
+    assert_eq!(workspace.head.len(), 40);
+    assert_eq!(run.artifact_error, None, "the write succeeded");
+
+    // The credential itself never reaches the ledger, only the hash of the environment it is in.
+    let wire = serde_json::to_string(&ledger).expect("the ledger serializes");
+    assert!(
+        !wire.contains("tok_live_evidence"),
+        "a declared credential VALUE must never reach the serialized ledger: {wire}"
+    );
+    // ... and every evidence field survives the wire round trip a session JSONL / intercom result
+    // frame puts it through.
+    for key in [
+        "artifactPath",
+        "cacheKey",
+        "memoized",
+        "envKeys",
+        "envHash",
+        "workspaceState",
+        "evidence_status",
+    ] {
+        assert!(wire.contains(key), "the serialized ledger must carry {key}: {wire}");
+    }
+    let round_tripped: cyrup_ext_subagents::exec::acceptance::AcceptanceLedger =
+        serde_json::from_str(&wire).expect("the ledger round-trips");
+    assert_eq!(round_tripped, ledger);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_gate_ledger_reports_artifact_error_instead_of_swallowing_it() {
+    // `evidenced.artifactError = …; delete evidenced.artifactPath;` (`acceptance.ts:1128-1129`).
+    // The live gate used to have no field for this and downgraded it to a `tracing::debug!`, so an
+    // artifacts directory nobody could write to was invisible in the ledger.
+    let repo = tempfile::tempdir().expect("tempdir");
+    init_repo(repo.path());
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    // A FILE where the artifact tree's directory must go, so `create_dir_all` cannot succeed.
+    std::fs::write(artifacts.path().join("acceptance"), "not a directory").expect("seed blocker");
+
+    let contract = verified_contract(verify("unit", "true"));
+    let ledger = evaluate_acceptance(
+        &contract,
+        clean_gate(),
+        None,
+        guard_did_not_fire(),
+        repo.path(),
+        Some(memo(artifacts.path(), "run-ERR")),
+        None,
+    )
+    .await;
+
+    // The verification's own verdict is unaffected — a failed memo write can only cost a future
+    // re-run, never a wrong answer.
+    assert_eq!(ledger.status, AcceptanceStatus::Verified);
+    let run = &ledger.verify_results[0];
+    assert!(
+        run.artifact_error.is_some(),
+        "an unwritable artifacts dir must surface as artifactError on the ledger: {run:?}"
+    );
+    assert_eq!(
+        run.artifact_path, None,
+        "`delete evidenced.artifactPath` (acceptance.ts:1129) — never claim an artifact that is \
+         not there"
+    );
+    assert_eq!(run.memoized, Some(false));
+    assert!(
+        serde_json::to_string(&ledger)
+            .expect("serializes")
+            .contains("artifactError"),
+        "artifactError must reach the wire, not only a debug log line"
     );
 }

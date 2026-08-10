@@ -1538,7 +1538,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
 
 /// SUBA-N03: `artifacts: false` reaching hop 2 as an absent `artifacts_dir` must leave NO artifact
 /// files behind — pi's own first gate term (`if (ctx.artifactsDir && …)`,
-/// `runs/background/subagent-runner.ts:879`). The complement of the test directly above; without
+/// `runs/background/subagent-runner.ts:1192`). The complement of the test directly above; without
 /// it, that one would still pass if the runner wrote artifacts unconditionally into some default
 /// location.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1896,7 +1896,7 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
     );
     assert!(
         rendered.contains("Resume: unavailable; stopped runs are not resumable. Start a new run instead."),
-        "pi `run-status.ts:37`'s verbatim stopped-resume guidance: {rendered}"
+        "pi `run-status.ts:52`'s verbatim stopped-resume guidance: {rendered}"
     );
     assert!(
         !rendered.contains("Revive:"),

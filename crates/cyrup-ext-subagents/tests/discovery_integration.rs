@@ -808,7 +808,7 @@ fn no_bundled_alias_can_collide_with_a_builtin_name_or_another_alias() {
         }
     }
 
-    // 2. No two agents may claim the same alias — that is `Ambiguous agent alias` (`agents.ts:527`),
+    // 2. No two agents may claim the same alias — that is `Ambiguous agent alias` (`agents.ts:526`),
     //    which fails the run rather than picking a winner.
     let mut claimed: Vec<(&str, &str)> = Vec::new();
     for agent in &agents {

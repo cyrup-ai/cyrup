@@ -496,7 +496,7 @@ pub struct BackgroundSingleRequest<'a> {
     /// `enabled: false` [`crate::artifacts::ArtifactConfig`] — pi's own two-term gate
     /// (`artifactsDir: artifactConfig.enabled ? artifactsDir : undefined`,
     /// `async-execution.ts:964`, read back as `if (ctx.artifactsDir &&
-    /// ctx.artifactConfig?.enabled !== false)`, `subagent-runner.ts:879`).
+    /// ctx.artifactConfig?.enabled !== false)`, `subagent-runner.ts:1192`).
     pub artifacts: Option<bool>,
     /// SUBA-N03: pi `params.timeoutMs`/`params.maxRuntimeMs`, already validated and de-aliased by
     /// [`resolve_foreground_timeout`]. Carried to hop 2 as the nominal
@@ -1280,7 +1280,7 @@ impl SubagentExecutor {
         let result = discover_agents(&cfg, Some(scope))?;
         let model_scope = result.model_scope.clone();
         // pi v0.43.0 routes EVERY execution-path agent lookup through `resolveAgentName`
-        // (`subagent-executor.ts:1513-1516`'s `canonicalizeAgentName`, `preflight.ts:228`), so the
+        // (`subagent-executor.ts:1675-1680`'s `canonicalizeAgentName`, `preflight.ts:228`), so the
         // requested string may be an alias. It is name-first — a real agent named `x` always beats
         // another agent that merely lists `x` as an alias — and a non-unique alias is a HARD error
         // (`Ambiguous agent alias 'x': a, b`), never an arbitrary pick.
@@ -3394,19 +3394,45 @@ impl SubagentExecutor {
     /// * with neither `id` nor `dir`, the exact refusal `"action='stop' requires id or dir."`
     ///   (`:4789`). There is deliberately NO "most recently active run" default here — upstream has
     ///   one for `interrupt` and not for `stop`, because a stop is unrecoverable;
-    /// * a `foreground` run resolves to `"action='stop' supports async runs only. Use
-    ///   action='interrupt' for foreground runs."` (`:4797`);
+    /// * a `nested` run resolves to [`STOP_NESTED_RUN_REFUSAL`] (`:4796`);
+    /// * a `foreground` run resolves to [`STOP_FOREGROUND_RUN_REFUSAL`] (`:4797`);
     /// * with `dir`, the id is `location.resolvedId ?? targetRunId ?? basename(dir)` (`:4782`);
+    /// * an id that names no async run of this session at all reaches
+    ///   [`STOP_NO_STOPPABLE_RUN_REFUSAL`] (`:4812`, upstream's `stopAsyncRun` → `null` fallback);
     /// * the reconciled state must be `running` or `queued`, else the exact refusal text
     ///   `"No running or queued async run was found for '{id}'."` with `isError: true`
     ///   (`async-stop-action.ts:41-47`);
     /// * success is the exact text `"Stop requested for async run {id}."` (`:56`);
     /// * a delivery failure is `"Failed to stop async run {id}: {message}"` (`:60`).
     ///
-    /// Upstream's `workflowControllers` fast path (`:4773-4777`) and its `mode === "workflow"`
-    /// reload-recovery refusal (`:4800-4805`) have no counterpart here: the WorkflowScript runtime
-    /// they address is not part of the ported baseline, so there is no controller registry to
-    /// consult and no `workflow` run mode to observe.
+    /// Upstream's `action === "stop"` block spells SEVEN distinct literals of its own (`:4776`,
+    /// `:4783`, `:4789`, `:4796`, `:4797`, `:4801`, `:4812`) and delegates three more to
+    /// `stopAsyncRun`. This function now reproduces five of the seven plus two of the three:
+    ///
+    /// | upstream string | here |
+    /// |---|---|
+    /// | `action='stop' requires id or dir.` (`:4789`) | yes |
+    /// | `action='stop' supports current-session top-level async runs only.` (`:4796`) | yes |
+    /// | `action='stop' supports async runs only. Use action='interrupt' for foreground runs.` (`:4797`) | yes |
+    /// | `No running or queued async run was found for '{id}'.` (`:4783`, `async-stop-action.ts:41`) | yes |
+    /// | `No stoppable async run found in this session.` (`:4812`) | yes |
+    /// | `Stop requested for async run {id}.` (`async-stop-action.ts:54`) | yes |
+    /// | `Failed to stop async run {id}: {message}` (`async-stop-action.ts:60`) | yes |
+    /// | `Stop requested for async workflow {id}.` (`:4776`) | **unported subsystem** |
+    /// | `Workflow {id} is not controlled by this extension runtime; reload recovery cannot stop it safely.` (`:4801`) | **unported subsystem** |
+    /// | `Async run '{id}' was not found in the active session.` (`async-stop-action.ts:34`) | **unported subsystem** |
+    ///
+    /// The two `Workflow …` strings are the `workflowControllers` fast path and the `mode ===
+    /// "workflow"` reload-recovery refusal. Both are gated on upstream's fourth run mode
+    /// (`SubagentRunMode = "single" | "parallel" | "chain" | "workflow"`, `shared/types.ts:231`) and
+    /// its `state.workflowControllers` registry (`shared/types.ts:1590`); [`crate::background::RunMode`] has
+    /// three variants and this crate has no controller registry, so both branches would be dead code
+    /// today. They enter scope with the WorkflowScript runtime, not before.
+    ///
+    /// `Async run '{id}' was not found in the active session.` is `stopAsyncRun`'s session-scope
+    /// guard (`status?.sessionId !== state.currentSessionId`). [`crate::background::RunStatus`] records no
+    /// session id at all, so there is nothing to compare; it enters scope with per-run session
+    /// attribution in the async store.
     ///
     /// # Errors
     ///
@@ -3423,12 +3449,41 @@ impl SubagentExecutor {
         let async_root = default_async_root(cwd);
         let results_dir = default_results_dir(cwd);
 
-        // pi `:4796-4797`: a live FOREGROUND run is refused with its own sentence pointing at
-        // `interrupt`, never silently treated as a missing async run.
+        // pi `:4795-4797`, in pi's own order: `resolveSubagentRunId` classifies the selector first,
+        // and the `nested` and `foreground` kinds each get their OWN sentence before anything
+        // touches the async store. Both are id-addressed only — upstream's `dir` form returns from
+        // the `params.dir` branch at `:4783` long before this classification runs.
+        let mut resolved_async_id: Option<String> = None;
         if let Some(id) = target
-            && self.is_live_foreground_run(id)
+            && dir.is_none()
         {
-            return Err(STOP_FOREGROUND_RUN_REFUSAL.to_string());
+            // pi `:4796`: the selector named a run nested inside another run's subtree. Real id,
+            // wrong scope — never reported as a missing async run.
+            if self.resolves_to_nested_run(id) {
+                return Err(STOP_NESTED_RUN_REFUSAL.to_string());
+            }
+            // pi `:4797`: a live FOREGROUND run is refused with its own sentence pointing at
+            // `interrupt`, never silently treated as a missing async run.
+            if self.is_live_foreground_run(id) {
+                return Err(STOP_FOREGROUND_RUN_REFUSAL.to_string());
+            }
+            // pi `:4812` via `stopAsyncRun` → `getAsyncStopTarget` → `undefined`
+            // (`async-stop-action.ts:18-20`: no `dir` location and `state.asyncJobs.get(runId)` is
+            // absent). cyrup's on-disk analogue of "not a tracked async job of this session" is
+            // `resolve_run_id` finding no run directory / status / result for the selector.
+            // A safe-token/ambiguity failure surfaces as its own message, matching upstream's
+            // `catch { return { text: error.message } }` around `resolveSubagentRunId` (`:4790-4795`).
+            match run_status::resolve_run_id(&async_root, &results_dir, id)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                // pi `:4806`: `resolved?.kind === "async" ? resolved.id : targetRunId` — the run
+                // that actually gets stopped (and gets named in the confirmation) is the RESOLVED
+                // id, so a unique run-id PREFIX stops the run it names instead of being reported
+                // missing under its own abbreviation.
+                Some(resolved) => resolved_async_id = Some(resolved.as_str().to_string()),
+                None => return Err(STOP_NO_STOPPABLE_RUN_REFUSAL.to_string()),
+            }
         }
 
         // pi `:4782`: `location.resolvedId ?? targetRunId ?? path.basename(location.asyncDir ??
@@ -3446,7 +3501,7 @@ impl SubagentExecutor {
                         .map(str::to_string)
                 })
                 .ok_or_else(|| "action='stop' requires id or dir.".to_string())?,
-            None => target.unwrap_or_default().to_string(),
+            None => resolved_async_id.unwrap_or_else(|| target.unwrap_or_default().to_string()),
         };
 
         match control::stop(&async_root, &results_dir, &run_id, "stop-action", None).await {
@@ -4197,6 +4252,37 @@ impl SubagentExecutor {
         matches.next().is_some() && matches.next().is_none()
     }
 
+    /// G77 — `resolveSubagentRunId(...).kind === "nested"` for the one caller that has to refuse it
+    /// ([`Self::control_stop`], pi `subagent-executor.ts:4791,4796` @v0.43.0, whose nested scope is
+    /// `nestedResolutionScopeForExecutor(deps)`).
+    ///
+    /// This is `findNestedRunMatchesById` (`runs/shared/nested-events.ts:661-675` @v0.43.0) reduced
+    /// to the boolean its one caller needs, and it walks the same three steps upstream does:
+    /// `listNestedRoutes()` → `projectNestedEvents(route)` → search the projected registry, with
+    /// upstream's own `catch { continue; }` on each route. (Upstream flattens via
+    /// `collectScopedNestedRuns`; this uses [`crate::spawn::nested_events::find_nested_run`], pi's
+    /// `findNestedRun`, whose depth-first walk over children, nested children and step children
+    /// reaches at least the same set.)
+    ///
+    /// A selector found in ANY route is a nested run and therefore not a top-level async run of this
+    /// session — exactly the distinction the refusal draws. Fail-open: an unreadable route
+    /// contributes nothing rather than turning a stop into an error, so a corrupt projection can
+    /// only ever cost the caller the more specific sentence, never a spurious refusal of a genuinely
+    /// stoppable run.
+    fn resolves_to_nested_run(&self, selector: &str) -> bool {
+        let Ok(routes) = crate::spawn::nested_events::list_nested_routes() else {
+            return false;
+        };
+        routes.iter().any(|route| {
+            crate::spawn::nested_events::project_nested_events(route)
+                .ok()
+                .is_some_and(|registry| {
+                    crate::spawn::nested_events::find_nested_run(&registry.children, selector)
+                        .is_some()
+                })
+        })
+    }
+
     /// Resolve one nested control request against this executor's live `foreground_controls`
     /// registry — pi's per-request body inside `startNestedControlInboxListener`
     /// (`fanout-child.ts:73-104`). Guard order (exact): target-not-active -> `interrupt` action ->
@@ -4703,6 +4789,31 @@ DIAGNOSTICS:
 /// `resume` on a live foreground run is not the alternative to a *stop*.
 const STOP_FOREGROUND_RUN_REFUSAL: &str =
     "action='stop' supports async runs only. Use action='interrupt' for foreground runs.";
+
+/// G77 — pi's stop-on-a-NESTED-run refusal (`subagent-executor.ts:4796` @v0.43.0), verbatim:
+/// `if (resolved?.kind === "nested") return { … text: "action='stop' supports current-session
+/// top-level async runs only." … }`.
+///
+/// A nested run is one spawned INSIDE another run's subtree (it lives under that root's
+/// `nested-subagent-runs` tree, not in this session's own async root), so it has no entry in the
+/// session's async store and `stopAsyncRun` could never address it. Upstream refuses it with its own
+/// sentence rather than the generic "no stoppable async run" one, because the id the caller gave is
+/// real — it is simply out of this verb's scope.
+const STOP_NESTED_RUN_REFUSAL: &str =
+    "action='stop' supports current-session top-level async runs only.";
+
+/// G77 — pi's terminal fallback for `action: "stop"` (`subagent-executor.ts:4812` @v0.43.0),
+/// verbatim: reached when `stopAsyncRun` returns `null`, which happens iff
+/// `getAsyncStopTarget` found no target at all (`async-stop-action.ts:29-30`) — i.e. no `dir` was
+/// given and the id is not a tracked async job of this session.
+///
+/// Distinct from `"No running or queued async run was found for '{id}'."`, which upstream reserves
+/// for a target that WAS found but whose reconciled state is neither `running` nor `queued`
+/// (`async-stop-action.ts:39-44`). cyrup previously collapsed both onto the second text; the split
+/// is restored here with `run_status::resolve_run_id` — an id that resolves to nothing in this
+/// session's async namespace is upstream's "no target", and an id that resolves but reconciles
+/// non-actionable is upstream's "not running or queued".
+const STOP_NO_STOPPABLE_RUN_REFUSAL: &str = "No stoppable async run found in this session.";
 
 const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently supports live async Cyrup \
      child sessions only; use action='interrupt' or action='resume' for foreground runs.";
@@ -6174,7 +6285,7 @@ impl SubagentTool {
         }
     }
 
-    /// pi `canonicalizeExecutionParams` (`subagent-executor.ts:1513-1571`, driven from `:4029-4031`
+    /// pi `canonicalizeExecutionParams` (`subagent-executor.ts:1682-1734`, driven from `:4923-4925`
     /// right after `deps.discoverAgents(...)` and before `applySingleAgentLaunchDefaults`): rewrite
     /// EVERY agent name this dispatch names — the top-level SINGLE `agent`, each `tasks[i].agent`,
     /// each chain step's `agent`, each static-parallel step's `parallel[j].agent`, and a dynamic
@@ -6212,7 +6323,7 @@ impl SubagentTool {
         let Ok(agents) = SubagentExecutor::discovery_config(cwd)
             // Same scope the mode arms resolve under (pi canonicalizes against the very
             // `discoverAgents(effectiveCwd, scope)` result the executor then uses,
-            // `subagent-executor.ts:4027-4030`), so an alias can never resolve here to an agent the
+            // `subagent-executor.ts:4921-4923`), so an alias can never resolve here to an agent the
             // run itself would not have been allowed to see.
             .and_then(|cfg| {
                 discover_agents(
@@ -6225,7 +6336,7 @@ impl SubagentTool {
             return Ok(None);
         };
 
-        // `canonicalizeAgentName` + the `location` suffix (`subagent-executor.ts:1513-1521`).
+        // `canonicalizeAgentName` + the `location` suffix (`subagent-executor.ts:1683-1690`).
         let resolve = |name: &str, location: Option<String>| -> Result<Option<String>, ToolError> {
             match crate::discovery::resolve_agent_name(name, &agents) {
                 crate::discovery::AgentNameResolution::Found(agent) => {
@@ -6625,9 +6736,10 @@ impl SubagentTool {
         // `progress` follows pi's own gate — `params.includeProgress ? allProgress : undefined`
         // (`:3008`) — so an unasked-for progress array is not smuggled into the model's context.
         let details = {
-            // pi `withForkContext` (`subagent-executor.ts:1596-1608`) stamps `details.context` from
-            // the CALL-SITE `params.context`, and only for `"fork"` — never from the resolved
-            // per-persona default. Mirror that exactly.
+            // pi `resolveExplicitContextPolicy` (`subagent-executor.ts:1893-1900` @v0.43.0) stamps
+            // the context from the CALL-SITE `params.context`, and only for `"fork"` — never from
+            // the resolved per-persona default: `const context = params.context === "fork" ?
+            // "fork" : "fresh";` (`:1894`). Mirror that exactly.
             let details_context = if context == Some(ContextMode::Fork) {
                 ContextMode::Fork
             } else {
@@ -6656,31 +6768,19 @@ impl SubagentTool {
         // surfacing failure — cyrup's analog is `Err(ToolError)` carrying that same receipt text,
         // matching the existing "error surfaced in CONTENT" convention below).
         if !result.detached && !result.interrupted {
-            let step = crate::spawn::chain_graph::StepResult {
-                success: result.exit_code == 0,
-                structured_output: result.structured_output.clone(),
-                final_output: result.final_output.clone(),
-                error: result.error.clone(),
-                interrupted: result.interrupted,
-                // The out-of-band RESULT payload is a delivery of the run's OUTPUT
-                // (`IntercomPayload::from_group_children` reads only success/output/error); control
-                // events travel their own channel — the transcript notice on the foreground path,
-                // and the terminal `ResultFile` on the async one — and are deliberately not
-                // duplicated into the result relay.
-                control_events: Vec::new(),
-                // Likewise the per-child detail fields: `IntercomPayload::from_group_children`
-                // reads only success/output/error, so nothing downstream of this relay observes
-                // them.
-                exit_code: None,
-                timed_out: false,
-                saved_output_path: None,
-                artifact_paths: None,
-            };
-            let payload = crate::tui::intercom::IntercomPayload::from_group_children(
+            // G104 — the SINGLE path resolves its one child through
+            // `foregroundResultIntercomStatus` (`subagent-executor.ts:1594-1605`, applied per child
+            // at `:1626`), i.e. the full `resolveSubagentResultStatus` ladder over the REAL
+            // `SingleResult`. It deliberately does NOT go through the grouped
+            // `StepResult`-projection constructor: a `StepResult` carries no `process_signal`, no
+            // `detached`, no `timed_out` and no acceptance ledger, so projecting through it made the
+            // unexplained-signal → `"stopped"` branch (`result-intercom.ts:35`) unreachable and
+            // reported a rejected-but-exit-0 child as `"completed"`.
+            let payload = crate::tui::intercom::IntercomPayload::from_single_result(
                 run_id.clone(),
                 agent.to_string(),
                 result.exit_code == 0,
-                &[Some(step)],
+                &result,
             );
             if let crate::tui::intercom::DeliveryOutcome::Delivered =
                 self.executor.deliver_group_out_of_band(payload.clone()).await
@@ -7426,7 +7526,7 @@ impl Tool for SubagentTool {
             return Err(ToolError::new(limit_notice));
         }
 
-        // pi `canonicalizeExecutionParams` (`subagent-executor.ts:4029-4031`), in pi's own position:
+        // pi `canonicalizeExecutionParams` (`subagent-executor.ts:4923-4925`), in pi's own position:
         // after the mode is settled and the budget charged, immediately before the mode arm runs. An
         // alias is rewritten to the agent's canonical name HERE so every downstream surface (persona
         // maps, chain bookkeeping, status rows, result summaries) names the real agent; an ambiguous
@@ -12934,7 +13034,7 @@ mod tests {
     /// config — pi's own two-term gate (`artifactsDir: artifactConfig.enabled ? artifactsDir :
     /// undefined`, `runs/background/async-execution.ts:964`, read back by the runner as
     /// `if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false)`,
-    /// `runs/background/subagent-runner.ts:879`).
+    /// `runs/background/subagent-runner.ts:1192`).
     ///
     /// Separate from the sibling above because it asserts the NEGATIVE configuration, and because
     /// the interesting property is that turning artifact FILES off must not move where a relative
@@ -13611,7 +13711,7 @@ mod tests {
         );
     }
 
-    /// pi `canonicalizeExecutionParams` (`subagent-executor.ts:1520-1571`): every agent name in the
+    /// pi `canonicalizeExecutionParams` (`subagent-executor.ts:1682-1734`): every agent name in the
     /// dispatch — SINGLE, each `tasks[]` entry, each chain step, each static-parallel task, and a
     /// dynamic step's template — is rewritten to the CANONICAL name before the mode arm runs, so no
     /// downstream surface ever reports a run under a name no agent file carries.
@@ -13654,7 +13754,7 @@ mod tests {
     }
 
     /// An ambiguous alias inside a fan-out aborts the WHOLE dispatch, with pi's per-site location
-    /// suffix (`subagent-executor.ts:1522-1525`).
+    /// suffix (`subagent-executor.ts:1696,1710,1718,1724`).
     #[tokio::test]
     async fn an_ambiguous_alias_in_a_task_list_aborts_the_dispatch_with_a_location() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -15068,7 +15168,7 @@ mod tests {
 
     /// G77 — the LIVE tool path: `subagent({ action: "stop", id })` must reach
     /// [`SubagentExecutor::control_stop`] and write a REAL `control/stop.json` into the run's
-    /// control inbox (pi `stopAsyncRun` → `deliverStopRequest`, `async-stop-action.ts:44`), with
+    /// control inbox (pi `stopAsyncRun` → `deliverStopRequest`, `async-stop-action.ts:47`), with
     /// pi's verbatim success text.
     ///
     /// This drives `Tool::execute` end to end rather than calling `control_stop` directly, so it
@@ -15092,21 +15192,89 @@ mod tests {
         assert_eq!(raw["source"], serde_json::json!("stop-action"));
     }
 
-    /// G77 — the three refusal shapes, each with pi's verbatim text. None of them is "unknown
+    /// G77 — a unique run-id PREFIX stops the run it names, and the confirmation cites the run's
+    /// full id.
+    ///
+    /// pi hands `stopAsyncRun` `resolved?.kind === "async" ? resolved.id : targetRunId`
+    /// (`subagent-executor.ts:4804-4808` @v0.43.0), and `resolveSubagentRunId`'s prefix pass
+    /// (`run-id-resolver.ts:84-86`) is what makes `resolved.id` the FULL id for an abbreviated
+    /// selector. Without that substitution the abbreviation is carried straight into the async
+    /// store, which knows no such run, and a caller who addressed the run by prefix everywhere else
+    /// (`status`, `interrupt`, `steer` all resolve prefixes) is told their id does not exist.
+    #[tokio::test]
+    async fn a_run_id_prefix_stops_the_run_it_names_and_the_confirmation_uses_the_full_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = seed_running_run(dir.path(), "stopprefix01", &["scout"]);
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+
+        let out = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "stoppre" }))
+            .await
+            .expect("a unique prefix must resolve, not be reported missing");
+        assert_eq!(
+            tool_text(&out),
+            "Stop requested for async run stopprefix01.",
+            "the confirmation names the RESOLVED run, never the abbreviation the caller typed"
+        );
+        assert!(
+            crate::background::control::stop_request_path(&paths.run_dir).exists(),
+            "and the request lands in the resolved run's own control inbox"
+        );
+    }
+
+    /// G77 — the refusal shapes, each with pi's verbatim text. None of them is "unknown
     /// subagent action", and none of them is a panic.
+    ///
+    /// The two not-found texts are DISTINCT upstream and were previously collapsed onto one here:
+    ///
+    /// * an id that names nothing at all never reaches `stopAsyncRun`'s actionability guard —
+    ///   `getAsyncStopTarget` returns `undefined` (`async-stop-action.ts:18-20`), `stopAsyncRun`
+    ///   returns `null`, and the executor falls through to its own terminal
+    ///   `"No stoppable async run found in this session."` (`subagent-executor.ts:4810-4814`);
+    /// * an id that DOES name a run whose reconciled state is neither `running` nor `queued` is the
+    ///   only input that reaches `"No running or queued async run was found for '{id}'."`
+    ///   (`async-stop-action.ts:39-44`).
     #[tokio::test]
     async fn the_stop_action_refusals_use_pis_verbatim_texts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
 
-        // An unknown run (`async-stop-action.ts:44`).
+        // An id naming NOTHING: upstream's `stopAsyncRun` → `null` fallback (`:4812`).
         let err = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "nosuchrun001" }))
             .await
             .expect_err("an unknown run must be refused");
         assert!(
+            err.to_string().contains(STOP_NO_STOPPABLE_RUN_REFUSAL),
+            "an id that resolves to no run at all never reaches `stopAsyncRun`'s running/queued \
+             guard upstream — it is the `null`-target fallback: {err}"
+        );
+
+        // An id naming a run that EXISTS but has already finished: upstream's actionability guard
+        // (`async-stop-action.ts:39-44`). This is the ONLY input that earns the other text.
+        let finished = seed_running_run(dir.path(), "stopfinished1", &["scout"]);
+        {
+            let mut status: crate::background::RunStatus = serde_json::from_slice(
+                &std::fs::read(&finished.status).expect("read seeded status"),
+            )
+            .expect("valid status json");
+            status.state = crate::background::RunState::Complete;
+            status.pid = None;
+            std::fs::write(
+                &finished.status,
+                serde_json::to_vec(&status).expect("serialize status"),
+            )
+            .expect("rewrite status as terminal");
+        }
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "stop", "id": "stopfinished1" }),
+        )
+        .await
+        .expect_err("a finished run is not stoppable");
+        assert!(
             err.to_string()
-                .contains("No running or queued async run was found for 'nosuchrun001'."),
-            "the refusal must be pi's own text, not `unknown subagent action`: {err}"
+                .contains("No running or queued async run was found for 'stopfinished1'."),
+            "a resolvable-but-terminal run must get the actionability text, not the no-target one: \
+             {err}"
         );
 
         // No selector at all (`subagent-executor.ts:4789`). There is deliberately NO

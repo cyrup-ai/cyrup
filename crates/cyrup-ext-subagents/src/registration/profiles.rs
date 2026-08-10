@@ -1155,7 +1155,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // build_profile_file: the 8-agent tier map (pi buildProfileFile, profiles.ts:385-400)
+    // build_profile_file: the 6-agent tier map (pi buildProfileFile, profiles.ts:402-415 @v0.43.0 —
+    // fourteen lines whose `agentOverrides` block names exactly six roles; `83b9872` deleted the
+    // `planner`/`context-builder` entries that made it eight at the ported baseline)
     // -----------------------------------------------------------------------------------------
 
     fn override_model(profile: &NamedProfile, agent: &str) -> Option<String> {
@@ -1166,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn build_profile_file_assigns_all_eight_builtins_to_their_tier() {
+    fn build_profile_file_assigns_all_six_builtins_to_their_tier() {
         let models = TierModels {
             cheap: "prov/cheap-1".to_string(),
             medium: "prov/medium-1".to_string(),

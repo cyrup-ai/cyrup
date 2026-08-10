@@ -264,7 +264,7 @@ async fn terminal_summary_for(initial_ids: &[String], deps: &WaitDeps) -> (usize
         parts.push(format!("{failed} failed"));
     }
     // G77: placed between `failed` and `paused`, matching the fixed bucket order pi renders status
-    // counts in (`result-intercom.ts:47-53 formatStatusCounts`: completed, failed, stopped, paused,
+    // counts in (`result-intercom.ts:57-66 formatStatusCounts`: completed, failed, stopped, paused,
     // detached).
     if stopped > 0 {
         parts.push(format!("{stopped} stopped"));

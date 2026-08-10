@@ -19,12 +19,15 @@
 //!    the delivered output, cutting only at a UTF-8 character boundary and recording the
 //!    truncation fact (never silently dropping bytes without a trace).
 //!
-//! Argv/system-prompt steering for `file-only` mode (R-SA-024's other half — actually building
-//! the child's argv and injecting the output-path override into the system prompt before spawn)
-//! is [`build_output_path_system_prompt_instruction`]'s narrow, testable core; wiring it into the
-//! full `ChildSpawnSpec`/system-prompt assembly is a later phase's concern (`exec/mod.rs`'s
-//! `run_sync` entry point and `spawn/mod.rs`'s `ChildSpawnSpec` construction — neither implemented
-//! yet), per this file's task brief.
+//! Output-path steering (R-SA-024) has TWO injectors upstream, and this module ports both:
+//!
+//! * [`inject_single_output_instruction`] — the TASK-side one (`injectSingleOutputInstruction`,
+//!   `single-output.ts:99-102`). This is the LIVE one: `exec/mod.rs::build_task_text` calls it on
+//!   every run that has a configured output path, exactly as `subagent-executor.ts:3674` does.
+//! * [`inject_output_path_system_prompt`] — the SYSTEM-PROMPT-side one
+//!   (`injectOutputPathSystemPrompt`, `single-output.ts:104-108`), which upstream applies at
+//!   `execution.ts:1443` and `api/preflight.ts:313`. **This one is ported but NOT yet wired** —
+//!   see its own doc comment for the seam it belongs at and what blocks it.
 //!
 //! This module has ZERO dependency on `cyrup-agent` — every message/content shape it inspects is
 //! the same opaque `serde_json::Value` [`crate::exec::ndjson::SubagentEvent`] already exposes,
@@ -1076,6 +1079,22 @@ pub fn build_output_path_system_prompt_instruction(
 /// system prompt body, if any output path is configured; otherwise returns `system_prompt`
 /// unchanged. Mirrors pi-subagents' `injectOutputPathSystemPrompt`
 /// (`pi-subagents/src/runs/shared/single-output.ts:104-108`).
+///
+/// # NOT YET WIRED — unported work, stated rather than hidden
+///
+/// Upstream calls this at `runs/foreground/execution.ts:1443` and `api/preflight.ts:313`, in BOTH
+/// cases on the same run that also gets the task-side [`inject_single_output_instruction`]. cyrup
+/// wires only the task-side half (`exec/mod.rs::build_task_text`). This function has NO production
+/// caller.
+///
+/// The seam it belongs at is `exec/mod.rs::build_attempt_spawn_plan`'s persona composition — the
+/// `persona_body` local that already appends `build_agent_memory_injection`'s block, which is
+/// upstream's own immediate predecessor of the `injectOutputPathSystemPrompt` call at
+/// `execution.ts:1443`. What blocks the wiring is a cyrup-side hazard with no upstream analog:
+/// cyrup emits NO `--system-prompt` flag at all for an empty persona body (pi always emits, because
+/// pi's value is persona PLUS skills, memory and steering and so is never empty), so appending the
+/// override to an empty `Replace`-mode body would start emitting `--system-prompt=<override only>`
+/// and blank the child's assembled system prompt. Wiring it requires deciding that case first.
 #[must_use]
 pub fn inject_output_path_system_prompt(
     system_prompt: &str,
@@ -1100,10 +1119,20 @@ pub fn inject_output_path_system_prompt(
 /// return `${task}\n\n---\n**Output:**\n${formatOutputPathInstruction(outputPath, capabilities)}`;
 /// ```
 ///
-/// The TASK-side sibling of [`inject_output_path_system_prompt`]. Its `**Output:**` header is one
-/// of the lines [`crate::exec::task_intent`]'s `stripFrameworkInstructions` port removes before
-/// classification, so an injected output instruction never contributes write-intent signal to the
-/// task it was appended to.
+/// The TASK-side sibling of [`inject_output_path_system_prompt`], and the LIVE one:
+/// `exec/mod.rs::build_task_text` calls it for every run with a configured output path, mirroring
+/// upstream's single-run site `subagent-executor.ts:3674` (`task = injectSingleOutputInstruction(
+/// task, outputPath, agentConfig)`). Upstream keys it on the PATH alone at all five of its call
+/// sites — `subagent-executor.ts:2979,3674`, `chain-execution.ts:363,1320`,
+/// `async-execution.ts:711,1289` — never on `outputMode`, which is consulted only by
+/// `validateFileOnlyOutputMode` and by delivery-side `finalizeSingleOutput`.
+///
+/// Its `**Output:**` header is one of the lines [`crate::exec::task_intent`]'s
+/// `stripFrameworkInstructions` port removes before classification, so an injected output
+/// instruction never contributes write-intent signal to the task it was appended to. That is the
+/// concrete reason this function, and not the `Runtime output path override:`-prefixed
+/// [`build_output_path_system_prompt_instruction`], is what belongs in the task text: the latter's
+/// header is NOT one of `stripFrameworkInstructions`' alternatives.
 #[must_use]
 pub fn inject_single_output_instruction(
     task: &str,

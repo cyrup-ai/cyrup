@@ -510,13 +510,13 @@ pub struct SubagentSettings {
     pub overrides: BTreeMap<String, AgentOverrideConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
-    /// pi's `subagents.defaultThinking` (`agents.ts:158`) — a crate-wide reasoning-level default
+    /// pi's `subagents.defaultThinking` (`agents.ts:164`) — a crate-wide reasoning-level default
     /// filled into every agent whose own `thinking` is unset (`applySubagentDefaultThinking`,
     /// `agents.ts:955-964`). Validated as a NON-EMPTY string and stored trimmed
     /// (`agents.ts:882-889`); a malformed value MUST abort discovery (R-SA-009).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_thinking: Option<String>,
-    /// pi's `subagents.defaultExtensions` (`agents.ts:159`) — a crate-wide extension allowlist
+    /// pi's `subagents.defaultExtensions` (`agents.ts:165`) — a crate-wide extension allowlist
     /// filled into every agent whose own `extensions` is unset
     /// (`applySubagentDefaultExtensions`, `agents.ts:975-984`), which also stamps
     /// [`AgentDefinition::extensions_from_default`]. Validated as an array of NON-EMPTY strings and

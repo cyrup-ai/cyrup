@@ -564,7 +564,7 @@ pub struct StopRequest {
     /// Wall-clock creation time (epoch milliseconds).
     pub ts: i64,
     /// Who/what requested the stop — pi's own literals are `"stop-action"` for the
-    /// `subagent({action:"stop"})` path (`async-stop-action.ts:44`) and `"ancestor-stop"` for the
+    /// `subagent({action:"stop"})` path (`async-stop-action.ts:47`) and `"ancestor-stop"` for the
     /// descendant cascade (`subagent-runner.ts:2300`).
     pub source: String,
     /// Optional human-readable reason.
@@ -597,7 +597,7 @@ pub fn stop_request_path(run_dir: &Path) -> PathBuf {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopOutcome {
     /// A [`StopRequest`] file was written into the target's control inbox (pi's `"Stop requested
-    /// for async run {id}."` success result, `async-stop-action.ts:56`).
+    /// for async run {id}."` success result, `async-stop-action.ts:53-56`).
     Requested,
     /// The reconciled status is neither `Running` nor `Queued` — pi's
     /// `if (!status || (status.state !== "running" && status.state !== "queued"))` guard

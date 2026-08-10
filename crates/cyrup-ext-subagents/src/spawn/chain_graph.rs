@@ -1753,6 +1753,12 @@ async fn evaluate_dynamic_group_acceptance(
         // memoized. Only the per-run gates (`execution.ts:1704-1705`,
         // `subagent-runner.ts:1638-1639`) supply the pair.
         memo: None,
+        // G78 — `reportOptional: isAgentContractV1(step.agentContract ?? params.agentContract)`
+        // (`chain-execution.ts:1045`). `isAgentContractV1` is `contract?.version === 1`
+        // (`runs/shared/agent-contract.ts:3-5`), and this crate has no agent-contract concept at
+        // all yet (`agent-contract.ts` is unported), so no cyrup step can declare one and the
+        // predicate is `false` for every run.
+        report_optional: false,
     })
     .await;
     model::acceptance_failure_message(&ledger)

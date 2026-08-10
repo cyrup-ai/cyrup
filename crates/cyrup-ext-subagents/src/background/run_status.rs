@@ -146,7 +146,7 @@ fn format_steering_summary(steer_count: Option<u64>, last_steer_at: Option<i64>)
     }
 }
 
-/// pi's verbatim resume-guidance line for a STOPPED run (`run-status.ts:37` @v0.43.0). Public so
+/// pi's verbatim resume-guidance line for a STOPPED run (`run-status.ts:52` @v0.43.0). Public so
 /// the `status`-action renderer, the `resume` refusal path and their tests all assert the one
 /// string rather than three drifting copies.
 pub const STOPPED_NOT_RESUMABLE_GUIDANCE: &str =
@@ -165,7 +165,7 @@ fn session_file_exists(session_file: &Option<PathBuf>) -> bool {
 /// `Revive child` with its index, else the unavailable notice.
 ///
 /// G77 — `stopped` short-circuits BEFORE every other branch, exactly as upstream's own first line
-/// does (`run-status.ts:36-37` @v0.43.0: `if (options.stopped) return "Resume: unavailable;
+/// does (`run-status.ts:51-52` @v0.43.0: `if (options.stopped) return "Resume: unavailable;
 /// stopped runs are not resumable. Start a new run instead.";`). A stopped run's children may well
 /// have persisted session files, so without this guard the function would happily hand the model a
 /// `Revive:` line for a run [`super::control::resume`] is required to refuse
@@ -710,7 +710,7 @@ mod tests {
         assert!(
             !report.contains("Revive:"),
             "a stopped run must never be offered a Revive line even though its step HAS a \
-             transcript (pi `run-status.ts:36-37` short-circuits before the transcript checks): \
+             transcript (pi `run-status.ts:51-52` short-circuits before the transcript checks): \
              {report}"
         );
     }

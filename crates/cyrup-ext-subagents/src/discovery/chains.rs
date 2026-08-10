@@ -694,292 +694,27 @@ fn is_valid_package_identifier(name: &str) -> bool {
 // Acceptance validation (acceptance.ts::validateAcceptanceInput)
 // -------------------------------------------------------------------------------------------
 
-/// `VALID_LEVELS` (`acceptance.ts:35` @v0.43.0). `"reviewed"` is deliberately absent: v0.43.0
-/// removed it from `AcceptanceLevel` because it is an ACHIEVED status, never a requestable level —
-/// see [`crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE`], which this file's
-/// validator emits for it just as `model::validate_acceptance_input` does.
-const VALID_ACCEPTANCE_LEVELS: &[&str] = &["auto", "none", "attested", "checked", "verified"];
-const VALID_ACCEPTANCE_EVIDENCE: &[&str] = &[
-    "changed-files",
-    "tests-added",
-    "commands-run",
-    "validation-output",
-    "residual-risks",
-    "no-staged-files",
-    "diff-summary",
-    "review-findings",
-    "manual-notes",
-];
-const ACCEPTANCE_CONFIG_KEYS: &[&str] =
-    &["level", "criteria", "evidence", "verify", "review", "stopRules", "reason"];
-const ACCEPTANCE_GATE_KEYS: &[&str] = &["id", "must", "evidence", "severity"];
-const ACCEPTANCE_VERIFY_KEYS: &[&str] =
-    &["id", "command", "timeoutMs", "cwd", "env", "allowFailure"];
-const ACCEPTANCE_REVIEW_KEYS: &[&str] = &["agent", "focus", "required"];
-
-/// Faithful port of `acceptance.ts::validateAcceptanceInput`: collects (never throws) a list of
-/// human-readable validation errors for one `AcceptanceInput` value. `input` is the raw field value
-/// (or `None` when the key is absent -> no errors, matching source's `input === undefined`).
+/// `validateAcceptanceInput` (`acceptance.ts:176-303` @v0.43.0), reached through the ONE
+/// implementation this crate has — [`crate::exec::acceptance::model::validate_acceptance_input`].
+///
+/// Upstream has exactly one copy of this validator and every caller imports it: the chain
+/// serializer this module ports does so explicitly
+/// (`import { validateAcceptanceInput } from "../runs/shared/acceptance.ts"`,
+/// `agents/chain-serializer.ts:5`, applied at `:178`/`:189`/`:197`), as do `agents/agents.ts:22`,
+/// `agents/agent-management.ts:36` and `runs/background/async-execution.ts:32`. This file used to
+/// carry a second, private ~260-line transcription of it plus its own `VALID_ACCEPTANCE_*` /
+/// `ACCEPTANCE_*_KEYS` tables, which is how it came to be missing v0.43.0's duplicate-normalized-
+/// criterion-id check and its `ACCEPTANCE_EVIDENCE_HELP`/`ACCEPTANCE_OBJECT_EXAMPLE` guidance
+/// suffixes while the `model` copy was being updated.
+///
+/// The only adaptation is the `undefined` spelling: upstream passes a possibly-`undefined`
+/// property straight in and returns no errors for it (`if (input === undefined) return errors`,
+/// `acceptance.ts:178`), which the `model` signature spells as `Value::Null`.
 fn validate_acceptance_input(input: Option<&Value>, path_label: &str) -> Vec<String> {
-    let mut errors: Vec<String> = Vec::new();
-    let Some(input) = input else {
-        return errors;
-    };
-    if input == &Value::Bool(false) {
-        return errors;
-    }
-    // `acceptance.ts:180-185` @v0.43.0 — the bare-string form now accepts only `auto`, `attested`
-    // and `checked`; see `model::validate_acceptance_input`, whose messages these mirror verbatim.
-    if let Some(level) = input.as_str() {
-        if level == "reviewed" {
-            errors.push(format!(
-                "{path_label} {}",
-                crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE
-            ));
-        } else if !VALID_ACCEPTANCE_LEVELS.contains(&level) {
-            errors.push(format!("{path_label} has invalid level '{level}'."));
-        } else if level == "none" {
-            errors.push(format!(
-                "{path_label} level \"none\" requires a reason; use {{ level: \"none\", reason: \"...\" }}."
-            ));
-        } else if level == "verified" {
-            errors.push(format!(
-                "{path_label} level \"verified\" requires object form with at least one runtime verify command. Use level \"checked\" or provide a non-empty acceptance.verify array."
-            ));
-        }
-        return errors;
-    }
-    let Some(object) = input.as_object() else {
-        errors.push(format!(
-            "{path_label} must be a string level, false, or an object."
-        ));
-        return errors;
-    };
-
-    for key in object.keys() {
-        if !ACCEPTANCE_CONFIG_KEYS.contains(&key.as_str()) {
-            errors.push(format!("{path_label}.{key} is not supported."));
-        }
-    }
-    // `acceptance.ts:195-199` @v0.43.0.
-    if object.get("level").and_then(Value::as_str) == Some("reviewed") {
-        errors.push(format!(
-            "{path_label}.level {}",
-            crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE
-        ));
-    } else if let Some(level) = object.get("level") {
-        let valid = level
-            .as_str()
-            .is_some_and(|s| VALID_ACCEPTANCE_LEVELS.contains(&s));
-        if !valid {
-            errors.push(format!(
-                "{path_label}.level must be one of auto, none, attested, checked, verified."
-            ));
-        }
-    }
-    if object.get("level").and_then(Value::as_str) == Some("none") {
-        let reason_ok = object
-            .get("reason")
-            .and_then(Value::as_str)
-            .is_some_and(|reason| !reason.trim().is_empty());
-        if !reason_ok {
-            errors.push(format!(
-                "{path_label}.reason is required when level is none."
-            ));
-        }
-    }
-    if object.get("reason").is_some_and(|reason| !reason.is_string()) {
-        errors.push(format!("{path_label}.reason must be a string."));
-    }
-    match object.get("criteria") {
-        None => {}
-        Some(Value::Array(criteria)) => {
-            for (index, criterion) in criteria.iter().enumerate() {
-                if criterion.is_string() {
-                    continue;
-                }
-                let criterion_path = format!("{path_label}.criteria[{index}]");
-                let Some(gate) = criterion.as_object() else {
-                    errors.push(format!("{criterion_path} must be a string or an object."));
-                    continue;
-                };
-                for key in gate.keys() {
-                    if !ACCEPTANCE_GATE_KEYS.contains(&key.as_str()) {
-                        errors.push(format!("{criterion_path}.{key} is not supported."));
-                    }
-                }
-                if gate
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|id| id.trim().is_empty())
-                {
-                    errors.push(format!("{criterion_path}.id is required."));
-                }
-                if gate
-                    .get("must")
-                    .and_then(Value::as_str)
-                    .is_none_or(|must| must.trim().is_empty())
-                {
-                    errors.push(format!("{criterion_path}.must is required."));
-                }
-                validate_evidence_array(
-                    gate.get("evidence"),
-                    &format!("{criterion_path}.evidence"),
-                    &mut errors,
-                );
-                if let Some(severity) = gate.get("severity") {
-                    let ok = matches!(severity.as_str(), Some("required") | Some("recommended"));
-                    if !ok {
-                        errors.push(format!(
-                            "{criterion_path}.severity must be required or recommended."
-                        ));
-                    }
-                }
-            }
-        }
-        Some(_) => errors.push(format!("{path_label}.criteria must be an array.")),
-    }
-    validate_evidence_array(
-        object.get("evidence"),
-        &format!("{path_label}.evidence"),
-        &mut errors,
-    );
-    // `acceptance.ts:248-249` @v0.43.0: an object-form `verified` policy MUST declare at least one
-    // runtime command, or the level means nothing beyond the child's own claim.
-    let verified_without_commands = object.get("level").and_then(Value::as_str) == Some("verified")
-        && !object
-            .get("verify")
-            .and_then(Value::as_array)
-            .is_some_and(|commands| !commands.is_empty());
-    if verified_without_commands {
-        errors.push(format!(
-            "{path_label}.verify must contain at least one runtime command when level is verified. Use level \"checked\" or provide a non-empty acceptance.verify array."
-        ));
-    }
-    match object.get("verify") {
-        None => {}
-        Some(Value::Array(commands)) => {
-            for (index, command) in commands.iter().enumerate() {
-                let command_path = format!("{path_label}.verify[{index}]");
-                let Some(cmd) = command.as_object() else {
-                    errors.push(format!("{command_path} must be an object."));
-                    continue;
-                };
-                for key in cmd.keys() {
-                    if !ACCEPTANCE_VERIFY_KEYS.contains(&key.as_str()) {
-                        errors.push(format!("{command_path}.{key} is not supported."));
-                    }
-                }
-                if cmd
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|id| id.trim().is_empty())
-                {
-                    errors.push(format!("{command_path}.id is required."));
-                }
-                if cmd
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_none_or(|c| c.trim().is_empty())
-                {
-                    errors.push(format!("{command_path}.command is required."));
-                }
-                if let Some(timeout) = cmd.get("timeoutMs") {
-                    let ok = timeout.as_u64().is_some_and(|v| v >= 1);
-                    if !ok {
-                        errors.push(format!(
-                            "{command_path}.timeoutMs must be an integer >= 1."
-                        ));
-                    }
-                }
-                if cmd.get("cwd").is_some_and(|cwd| !cwd.is_string()) {
-                    errors.push(format!("{command_path}.cwd must be a string."));
-                }
-                if let Some(env) = cmd.get("env") {
-                    match env.as_object() {
-                        Some(map) => {
-                            for (env_key, env_value) in map {
-                                if !env_value.is_string() {
-                                    errors.push(format!(
-                                        "{command_path}.env.{env_key} must be a string."
-                                    ));
-                                }
-                            }
-                        }
-                        None => errors.push(format!("{command_path}.env must be an object.")),
-                    }
-                }
-                if cmd
-                    .get("allowFailure")
-                    .is_some_and(|value| !value.is_boolean())
-                {
-                    errors.push(format!("{command_path}.allowFailure must be a boolean."));
-                }
-            }
-        }
-        // Upstream's `else if` (`acceptance.ts:250-252`): the generic shape message is suppressed
-        // when the more specific `verified`-needs-commands one already fired.
-        Some(_) if !verified_without_commands => {
-            errors.push(format!("{path_label}.verify must be an array."));
-        }
-        Some(_) => {}
-    }
-    if let Some(review) = object.get("review")
-        && review != &Value::Bool(false)
-    {
-        match review.as_object() {
-            Some(map) => {
-                for key in map.keys() {
-                    if !ACCEPTANCE_REVIEW_KEYS.contains(&key.as_str()) {
-                        errors.push(format!("{path_label}.review.{key} is not supported."));
-                    }
-                }
-                if map.get("agent").is_some_and(|v| !v.is_string()) {
-                    errors.push(format!("{path_label}.review.agent must be a string."));
-                }
-                if map.get("focus").is_some_and(|v| !v.is_string()) {
-                    errors.push(format!("{path_label}.review.focus must be a string."));
-                }
-                if map.get("required").is_some_and(|v| !v.is_boolean()) {
-                    errors.push(format!("{path_label}.review.required must be a boolean."));
-                }
-            }
-            None => errors.push(format!("{path_label}.review must be false or an object.")),
-        }
-    }
-    match object.get("stopRules") {
-        None => {}
-        Some(Value::Array(rules)) => {
-            for (index, item) in rules.iter().enumerate() {
-                if !item.is_string() {
-                    errors.push(format!("{path_label}.stopRules[{index}] must be a string."));
-                }
-            }
-        }
-        Some(_) => errors.push(format!("{path_label}.stopRules must be an array.")),
-    }
-    errors
-}
-
-/// Shared validation for an `evidence` array (top-level and per-criterion), mirroring source's two
-/// identical `Array.isArray(...) ? per-item VALID_EVIDENCE check : "must be an array"` blocks.
-fn validate_evidence_array(value: Option<&Value>, path_label: &str, errors: &mut Vec<String>) {
-    match value {
-        None => {}
-        Some(Value::Array(items)) => {
-            for (index, item) in items.iter().enumerate() {
-                let ok = item
-                    .as_str()
-                    .is_some_and(|kind| VALID_ACCEPTANCE_EVIDENCE.contains(&kind));
-                if !ok {
-                    errors.push(format!(
-                        "{path_label}[{index}] is not a supported evidence kind."
-                    ));
-                }
-            }
-        }
-        Some(_) => errors.push(format!("{path_label} must be an array.")),
-    }
+    crate::exec::acceptance::model::validate_acceptance_input(
+        input.unwrap_or(&Value::Null),
+        path_label,
+    )
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1774,6 +1509,67 @@ mod tests {
                 "`{level}` must remain requestable in a chain file"
             );
         }
+    }
+
+    /// The two NESTED acceptance-validation arms of `parse_chain_json` — a static `parallel[]`
+    /// task's own `acceptance` and a dynamic step's single `parallel` TEMPLATE object's — which the
+    /// step-level test above never reaches.
+    ///
+    /// pi validates all three levels in one pass (`validateExecutionAcceptance`,
+    /// `runs/shared/acceptance.ts:305-328` @v0.43.0: the top-level `acceptance`, every `tasks[i]`
+    /// and every `chain[i]`), so a chain FILE has to be just as thorough — a saved chain is
+    /// authored once and dispatched forever, and an invalid policy buried in a fan-out task or a
+    /// dynamic template would otherwise surface only at spawn time, mid-run.
+    ///
+    /// Both arms are asserted on their own PATH LABEL, because that label is the only thing that
+    /// tells the author which of a dozen tasks is at fault.
+    #[test]
+    fn json_chain_validates_acceptance_on_parallel_tasks_and_on_the_dynamic_template() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // (1) The static-`parallel[]` arm. The SECOND task carries the bad policy, so the index in
+        // the label has to be right, not merely present.
+        let content = "{\"name\":\"c\",\"description\":\"d\",\"chain\":[{\"parallel\":[\
+             {\"agent\":\"a\",\"task\":\"ta\"},\
+             {\"agent\":\"b\",\"task\":\"tb\",\"acceptance\":{\"level\":\"none\"}}]}]}";
+        let path = write(tmp.path(), "parallel-task.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::User)
+            .expect_err("a fan-out task's own acceptance policy is validated too");
+        assert!(
+            err.contains("step 1 parallel task 2 acceptance.reason is required when level is none"),
+            "{err}"
+        );
+
+        // (2) The dynamic-template arm: `parallel` is a single object, not an array.
+        let content = "{\"name\":\"c\",\"description\":\"d\",\"chain\":[\
+             {\"agent\":\"scout\",\"task\":\"Return targets\",\"as\":\"targets\",\"outputSchema\":{\"type\":\"object\"}},\
+             {\"expand\":{\"from\":{\"output\":\"targets\",\"path\":\"/items\"},\"item\":\"target\",\"maxItems\":4},\
+              \"parallel\":{\"agent\":\"reviewer\",\"task\":\"Review {target.path}\",\"acceptance\":\"reviewed\"},\
+              \"collect\":{\"as\":\"reviews\"}}]}";
+        let path = write(tmp.path(), "dynamic-template.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::User)
+            .expect_err("a dynamic template's acceptance policy is validated too");
+        assert!(
+            err.contains("step 2 dynamic template acceptance")
+                && err.contains("is an achieved status, not a requestable acceptance level"),
+            "{err}"
+        );
+
+        // (3) The control: the SAME two shapes with VALID policies parse, so neither arm is simply
+        // rejecting every nested `acceptance` it sees.
+        let content = "{\"name\":\"c\",\"description\":\"d\",\"chain\":[{\"parallel\":[\
+             {\"agent\":\"a\",\"task\":\"ta\",\"acceptance\":\"attested\"},\
+             {\"agent\":\"b\",\"task\":\"tb\",\"acceptance\":{\"level\":\"none\",\"reason\":\"trivial\"}}]}]}";
+        let path = write(tmp.path(), "parallel-ok.chain.json", content);
+        parse_chain_json(&path, AgentSource::User).expect("valid fan-out policies parse");
+
+        let content = "{\"name\":\"c\",\"description\":\"d\",\"chain\":[\
+             {\"agent\":\"scout\",\"task\":\"Return targets\",\"as\":\"targets\",\"outputSchema\":{\"type\":\"object\"}},\
+             {\"expand\":{\"from\":{\"output\":\"targets\",\"path\":\"/items\"},\"item\":\"target\",\"maxItems\":4},\
+              \"parallel\":{\"agent\":\"reviewer\",\"task\":\"Review {target.path}\",\"acceptance\":\"checked\"},\
+              \"collect\":{\"as\":\"reviews\"}}]}";
+        let path = write(tmp.path(), "dynamic-ok.chain.json", content);
+        parse_chain_json(&path, AgentSource::User).expect("a valid dynamic-template policy parses");
     }
 
     #[test]

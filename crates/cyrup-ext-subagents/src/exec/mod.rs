@@ -109,11 +109,10 @@ use crate::exec::fallback::{
 };
 use crate::exec::ndjson::SubagentEvent;
 use crate::exec::output::{
-    EMPTY_OUTPUT_ERROR, INTERRUPTED_FINAL_OUTPUT, OutputCap,
-    build_output_path_system_prompt_instruction, detect_subagent_error, extract_final_output,
-    is_terminal_assistant_stop, message_end_has_error_message, resolve_output_handoff,
-    snapshot_output_file, trailing_assistant_error, truncate_output,
-    validate_file_only_requires_path,
+    EMPTY_OUTPUT_ERROR, INTERRUPTED_FINAL_OUTPUT, OutputCap, detect_subagent_error,
+    extract_final_output, inject_single_output_instruction, is_terminal_assistant_stop,
+    message_end_has_error_message, resolve_output_handoff, snapshot_output_file,
+    trailing_assistant_error, truncate_output, validate_file_only_requires_path,
 };
 use crate::exec::structured::{StructuredOutcome, resolve_structured_output};
 use crate::fork_context::{ContextMode, ForkContext, ForkContextResolver};
@@ -1330,11 +1329,10 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// [`AGENT_NAME_ENV_VAR`] (that var is read only by the permission companion), so this argv pair is
 /// the ONLY channel the persona has.
 ///
-/// System prompt steering for `output_mode == FileOnly` (R-SA-024's system-prompt half) and the
-/// `<available_skills>` pointer block remain composed into `task` BEFORE this function is called —
-/// see [`build_task_text`] — rather than being folded into the persona body the way pi's
-/// `execution.ts:1053-1062` composes them, so that a `Replace`-mode persona cannot suppress the
-/// orchestrator's own scaffolding.
+/// The authoritative output-path instruction (R-SA-024) and the `<available_skills>` pointer block
+/// remain composed into `task` BEFORE this function is called — see [`build_task_text`] — rather
+/// than being folded into the persona body the way pi's `execution.ts:1054-1062` composes them, so
+/// that a `Replace`-mode persona cannot suppress the orchestrator's own scaffolding.
 ///
 /// **[CYRUP-DELTA]** pi writes the composed prompt to a `0600` temp file and passes the PATH,
 /// because pi's `resolvePromptInput` (`resource-loader.ts:53-68`) reads `--system-prompt`'s value
@@ -1797,7 +1795,7 @@ pub fn build_attempt_spawn_plan(
 }
 
 /// Compose the final task text handed to the child: acceptance-contract injection (R-SA-023), then
-/// output-path system-prompt steering (R-SA-024's file-only half), then the skill-pointer block.
+/// the authoritative output-path instruction (R-SA-024), then the skill-pointer block.
 ///
 /// The agent's OWN persona prose is deliberately NOT part of this text. It travels as
 /// `--system-prompt`/`--append-system-prompt` on the child's argv — see
@@ -1817,13 +1815,35 @@ pub fn build_attempt_spawn_plan(
 /// is ORTHOGONAL to `agent.inherit_skills` (the `--no-skills` child flag): an agent that does not
 /// inherit skills still receives its explicitly-listed skills through this block.
 ///
-/// G82: the output-path instruction is CAPABILITY-AWARE. `agent` is projected to the
-/// [`AgentDefinition`] view [`crate::exec::output::format_output_path_instruction`] reads
-/// (`tools`, via `has_mutation_tool_capability`), so an agent whose whole resolved allowlist is
-/// read-only is told to return the artifact in its final response for the runtime to persist —
-/// pi's `formatOutputPathInstruction` read-only branch (`single-output.ts:87-91`) — instead of
-/// being ordered to write a file it has no tool to write. Upstream threads the same agent object
-/// into both injection sites (`execution.ts:1443`, `chain-execution.ts:363`).
+/// G82: the output-path instruction is the TASK-side injector
+/// [`crate::exec::output::inject_single_output_instruction`], upstream
+/// `injectSingleOutputInstruction` (`runs/shared/single-output.ts:99-102`) — the one that emits the
+/// `\n\n---\n**Output:**\n…` header. That header is not decoration: it is the alternative
+/// `stripFrameworkInstructions` (`task-intent.ts:99`, ported at
+/// [`crate::exec::task_intent`]) removes before mutation-intent classification, so the injected
+/// instruction's own `write`/`persist` vocabulary never contributes write-intent signal to the task
+/// it was appended to. The system-prompt-shaped sibling
+/// (`build_output_path_system_prompt_instruction`, whose body opens `Runtime output path
+/// override:`) was wired here instead and is NOT one of those alternatives, so every file-only run
+/// was feeding its own scaffolding back into the classifier.
+///
+/// It is UNCONDITIONAL on [`RunOptions::output_mode`]: upstream keys the injection on the presence
+/// of an output PATH alone at every one of its call sites — `subagent-executor.ts:3674` (the single
+/// run, this function's direct counterpart), `chain-execution.ts:363,1320` and
+/// `async-execution.ts:711,1289` — and `outputMode` is consulted only by
+/// `validateFileOnlyOutputMode` (ported as [`validate_file_only_requires_path`]) and by the
+/// delivery-side `finalizeSingleOutput`. Gating the injection on `OutputMode::FileOnly`, as this
+/// function previously did, silently dropped the authoritative-path instruction from every
+/// `file-and-inline` run that configured an output path — the child was never told where to write.
+///
+/// The instruction is CAPABILITY-AWARE. `agent` is projected to the [`AgentDefinition`] view
+/// [`crate::exec::output::format_output_path_instruction`] reads (`tools`, via
+/// `has_mutation_tool_capability`), so an agent whose whole resolved allowlist is read-only is told
+/// to return the artifact in its final response for the runtime to persist — pi's
+/// `formatOutputPathInstruction` read-only branch (`single-output.ts:84-91`) — instead of being
+/// ordered to write a file it has no tool to write. Upstream threads the same agent object into
+/// every injection site (`execution.ts:1443`, `chain-execution.ts:363`,
+/// `subagent-executor.ts:3674`).
 fn build_task_text(
     agent: &AgentConfig,
     task: &str,
@@ -1832,17 +1852,12 @@ fn build_task_text(
     skill_injection: &str,
 ) -> String {
     let with_acceptance = inject_acceptance_contract(task, contract);
-    let with_output_path = match opts.output_mode {
-        OutputMode::FileOnly => {
-            let path = opts.output_path.as_deref();
-            let capabilities = completion_guard_projection(agent);
-            match build_output_path_system_prompt_instruction(path, Some(&capabilities)) {
-                Some(instruction) => format!("{with_acceptance}\n\n{instruction}"),
-                None => with_acceptance,
-            }
-        }
-        OutputMode::FileAndInline | OutputMode::Inline => with_acceptance,
-    };
+    let capabilities = completion_guard_projection(agent);
+    let with_output_path = inject_single_output_instruction(
+        &with_acceptance,
+        opts.output_path.as_deref(),
+        Some(&capabilities),
+    );
     if skill_injection.is_empty() {
         with_output_path
     } else {
@@ -3964,6 +3979,138 @@ mod tests {
         assert!(text.starts_with("do the thing"));
         assert!(text.contains("Acceptance Contract"));
         assert!(text.contains("out.md"));
+    }
+
+    /// G82 — `build_task_text` must use the TASK-side injector
+    /// (`injectSingleOutputInstruction`, `single-output.ts:99-102`), whose header is
+    /// `\n\n---\n**Output:**\n`, NOT the system-prompt-side `Runtime output path override:` form.
+    /// The header is load-bearing: `**Output:**` is one of `stripFrameworkInstructions`'
+    /// alternatives (`task-intent.ts:99`) and `Runtime output path override:` is not, so the wrong
+    /// header feeds the injected instruction back into mutation-intent classification.
+    #[test]
+    fn build_task_text_uses_the_upstream_task_side_output_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.output_mode = OutputMode::FileOnly;
+        opts.output_path = Some(dir.path().join("out.md"));
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
+
+        let text = build_task_text(&agent, "do the thing", &opts, &contract, "");
+        assert!(
+            text.contains("\n\n---\n**Output:**\n"),
+            "the task-side `**Output:**` header must be present: {text:?}"
+        );
+        assert!(
+            !text.contains("Runtime output path override:"),
+            "the system-prompt-side header must NOT be used in the task text: {text:?}"
+        );
+        // Every line the injector emits is one `strip_framework_instructions` removes, so the
+        // instruction contributes no write-intent signal back to the classifier.
+        assert!(
+            !crate::exec::task_intent::task_may_mutate(&text),
+            "the injected output instruction must be stripped before intent classification: {text:?}"
+        );
+    }
+
+    /// G82 REGRESSION — upstream keys the output instruction on the PATH alone
+    /// (`subagent-executor.ts:3674`, `chain-execution.ts:363,1320`,
+    /// `async-execution.ts:711,1289`); `outputMode` is consulted only by
+    /// `validateFileOnlyOutputMode` and by delivery-side `finalizeSingleOutput`. Gating the
+    /// injection on `OutputMode::FileOnly` left a `file-and-inline` run with a configured output
+    /// path with NO instruction at all — the child was never told where to write.
+    #[test]
+    fn every_output_mode_with_a_configured_path_gets_the_instruction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
+        let path = dir.path().join("out.md");
+
+        for mode in [
+            OutputMode::FileOnly,
+            OutputMode::FileAndInline,
+            OutputMode::Inline,
+        ] {
+            let mut opts = base_opts(dir.path(), &["m1"]);
+            opts.output_mode = mode;
+            opts.output_path = Some(path.clone());
+            let text = build_task_text(&agent, "do the thing", &opts, &contract, "");
+            assert!(
+                text.contains("**Output:**"),
+                "{mode:?} with a configured path must still carry the instruction: {text:?}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "Write your findings to exactly this path: {}",
+                    path.display()
+                )),
+                "{mode:?} must name the authoritative path: {text:?}"
+            );
+        }
+
+        // ...and no configured path means no instruction, in every mode.
+        for mode in [
+            OutputMode::FileOnly,
+            OutputMode::FileAndInline,
+            OutputMode::Inline,
+        ] {
+            let mut opts = base_opts(dir.path(), &["m1"]);
+            opts.output_mode = mode;
+            opts.output_path = None;
+            let text = build_task_text(&agent, "do the thing", &opts, &contract, "");
+            assert!(
+                !text.contains("**Output:**"),
+                "{mode:?} with no path must inject nothing: {text:?}"
+            );
+        }
+    }
+
+    /// G82 — the capability branch of `formatOutputPathInstruction` (`single-output.ts:84-91`)
+    /// must be reachable from the LIVE composition path, not merely from the injector's own unit
+    /// test: an agent whose whole resolved allowlist is read-only is told to return the artifact
+    /// for the runtime to persist, never to write a file it has no tool to write.
+    #[test]
+    fn build_task_text_branches_the_instruction_on_the_agents_real_tool_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        // Deliberately NOT file-only: the capability branch must be live in every mode.
+        opts.output_mode = OutputMode::FileAndInline;
+        opts.output_path = Some(dir.path().join("out.md"));
+
+        let mut read_only = sample_agent_config("m1", &[]);
+        read_only.tools = Some(vec![
+            crate::discovery::types::ToolRef::Builtin("read".to_string()),
+            crate::discovery::types::ToolRef::Builtin("grep".to_string()),
+        ]);
+        let text = build_task_text(&read_only, "do the thing", &opts, &contract, "");
+        assert!(
+            text.contains("Return the complete artifact in your final response."),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("The runtime will persist it to exactly this path:"),
+            "{text:?}"
+        );
+        assert!(
+            !text.contains("Write your findings to exactly this path:"),
+            "a read-only agent must not be ordered to write: {text:?}"
+        );
+
+        let mut write_capable = sample_agent_config("m1", &[]);
+        write_capable.tools = Some(vec![
+            crate::discovery::types::ToolRef::Builtin("read".to_string()),
+            crate::discovery::types::ToolRef::Builtin("write".to_string()),
+        ]);
+        let text = build_task_text(&write_capable, "do the thing", &opts, &contract, "");
+        assert!(
+            text.contains("Write your findings to exactly this path:"),
+            "{text:?}"
+        );
+        assert!(
+            !text.contains("Return the complete artifact in your final response."),
+            "{text:?}"
+        );
     }
 
     #[test]
