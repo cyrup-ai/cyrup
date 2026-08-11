@@ -29,7 +29,8 @@ use cyrup_session_svc::{
 };
 use cyrup_tui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cyrup_tui::{
-    App, AppAction, AppCommand, Entry, IndicatorKind, InputEvent, SelectorKind, TreeNavMsg, UiTheme,
+    Action, App, AppAction, AppCommand, Entry, IndicatorKind, InputEvent, Key, SelectAction,
+    SelectorKind, TreeNavMsg, UiTheme,
 };
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
@@ -129,7 +130,7 @@ fn branch_summaries(app: &App<TestBackend>) -> Vec<String> {
         .pending()
         .iter()
         .filter_map(|e| match e {
-            Entry::BranchSummary(s) => Some(s.clone()),
+            Entry::BranchSummary { summary, .. } => Some(summary.clone()),
             _ => None,
         })
         .collect()
@@ -304,6 +305,47 @@ async fn custom_prompt_choice_opens_the_editor_and_threads_the_instructions() {
         prompts[0].contains("Additional focus: focus-on-the-files"),
         "custom instructions are threaded into the summary prompt, got:\n{}",
         prompts[0]
+    );
+}
+
+/// **U4 + U5 — the instructions editor's hint row is bound to the LIVE tables.**
+///
+/// `ExtensionEditorComponent` composes its hint from four `keyHint(...)` calls, each of which
+/// re-resolves through `keyText` → `getKeybindings().getKeys(...)` on every render
+/// (`extension-editor.ts:83-90`, `keybinding-hints.ts:34-44`), so a rebind is reflected on the
+/// FIRST paint. Two halves of that landed with E9 and neither was exercised:
+///
+/// * **U5** — `interactive-mode.ts:4769`'s dialog is the same component as the `ui.editor` one, so
+///   `open_branch_summary_instructions` must hand it the live tables too. It did not; dropping the
+///   `with_keymaps` call left the suite green and this dialog alone showing stock labels.
+/// * **U4** — `keyText` joins EVERY bound key with `/` (`keybinding-hints.ts:29-36`), and
+///   `tui.input.newLine` ships with two (`tui/src/keybindings.ts:137`,
+///   `defaultKeys: ["shift+enter", "ctrl+j"]`). Reverting the row's `EditorKeymap::keys_label` to
+///   the first-key `key_label` also left the suite green, while the hint silently dropped `ctrl+j`.
+#[tokio::test]
+async fn the_instructions_editor_hint_names_the_users_own_keys() {
+    let fx = fixture();
+    let (session, first, _) = two_turn_session(&fx).await;
+    let mut app = app();
+    let _rx = app.install_tree_nav_channel();
+
+    app.execute_command(confirm_tree(&first), &session, None).await;
+    let cmd = pick(&mut app, PICK_CUSTOM);
+    // Rebind AFTER the prompt is answered and BEFORE the dialog is constructed, so the labels can
+    // only be right if the dialog resolved them itself. (`pick` presses Enter, which is what is
+    // being rebound — doing this earlier would break the prompt, not the assertion.)
+    app.state_mut().select_keymap.set_action(SelectAction::Confirm, vec![Key::ctrl('s')]);
+    app.state_mut().keymap.set_action(Action::ExternalEditor, vec![Key::ctrl('x')]);
+    app.execute_command(cmd, &session, None).await;
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::BranchSummaryInstructions));
+
+    let screen = rendered(&mut app);
+    assert!(screen.contains("ctrl+s submit"), "U5: the rebound confirm key:\n{screen}");
+    assert!(screen.contains("ctrl+x external editor"), "U5: the rebound external key:\n{screen}");
+    assert!(!screen.contains("enter submit"), "U5: the stock label must be gone:\n{screen}");
+    assert!(
+        screen.contains("shift+enter/ctrl+j newline"),
+        "U4: `keyText` joins every key bound to `tui.input.newLine`:\n{screen}"
     );
 }
 

@@ -20,7 +20,7 @@
 //! # Where the notice half lands
 //!
 //! Upstream splits the pipeline in two: `execution.ts` RAISES `ControlEvent`s from the child's
-//! stdout and hands each to `options.onControlEvent`; `subagent-executor.ts:505-535` @v0.34.0
+//! stdout and hands each to `options.onControlEvent`; `subagent-executor.ts:801-831` @v0.43.0
 //! (`emitControlNotification`) then decides which CHANNELS a raised event travels
 //! (`notifyChannels`), and `extension/control-notices.ts` debounces/re-validates/dedups the
 //! resulting transcript notice. This module owns the first half (raise + the two message
@@ -63,7 +63,7 @@ pub const MUTATING_FAILURE_WINDOW_MS: i64 = 5 * 60_000;
 /// to the detached hop-2 runner in `runner-config.json`
 /// ([`crate::background::runner_main::RunnerConfig::control`]) — exactly as upstream does, where
 /// `runSinglePath` computes `resolveControlConfig(deps.config.control, params.control)` and passes
-/// the RESOLVED object into `executeAsyncSingle` (`subagent-executor.ts:2845,2868`), which the
+/// the RESOLVED object into `executeAsyncSingle` (`subagent-executor.ts:2845,2868` @v0.34.0), which the
 /// runner then reads back as `config.controlConfig ?? DEFAULT_CONTROL_CONFIG`
 /// (`subagent-runner.ts:1802`, all @v0.34.0). Resolving parent-side is load-bearing, not stylistic:
 /// the detached runner has no settings access by design, so re-resolving inside it could apply a
@@ -482,7 +482,7 @@ pub fn should_notify_control_event(config: &ResolvedControlConfig, event: &Contr
     config.enabled && config.notify_on.contains(&event.event_type)
 }
 
-/// pi `controlNotificationKey` (`subagent-control.ts:141-144`): the dedup identity of one notice —
+/// pi `controlNotificationKey` (`subagent-control.ts:142-145`): the dedup identity of one notice —
 /// `<child>:<type>:<reason>`, where `<child>` is the child's intercom target when one exists, else
 /// `runId:index` (or the bare `runId` for a single-child run).
 #[must_use]
@@ -747,7 +747,7 @@ impl LongRunningTrigger {
     }
 }
 
-/// pi `nextLongRunningTrigger` (`long-running-guard.ts:117-126`): elapsed-time first, then turns,
+/// pi `nextLongRunningTrigger` (`long-running-guard.ts:162-171`): elapsed-time first, then turns,
 /// then tokens — first match wins.
 #[must_use]
 pub fn next_long_running_trigger(
@@ -837,7 +837,7 @@ fn first_redirect_target(command: &str) -> Option<String> {
     None
 }
 
-/// pi `isMutatingTool` (`long-running-guard.ts:99-110`): `edit`/`write` always; `cursor` when its
+/// pi `isMutatingTool` (`long-running-guard.ts:138-155`): `edit`/`write` always; `cursor` when its
 /// `activityTitle` starts with `Cursor edit`/`Cursor write` (case-insensitively); `bash` when its
 /// command is classified mutating by [`is_mutating_bash_command`]; nothing else.
 #[must_use]
@@ -885,7 +885,7 @@ const MUTATING_FAILURE_HINTS: [&str; 9] = [
     "could not",
 ];
 
-/// pi `didMutatingToolFail` (`long-running-guard.ts:112-115`): a case-insensitive substring test
+/// pi `didMutatingToolFail` (`long-running-guard.ts:157-160`): a case-insensitive substring test
 /// against the failure hints.
 #[must_use]
 pub fn did_mutating_tool_fail(text: &str) -> bool {
@@ -1014,7 +1014,7 @@ impl ControlEventSink {
 
 /// One in-flight mutating tool call, held between its start and its result so the result's text can
 /// be attributed back to the tool/path that produced it (pi `pendingToolResult`,
-/// `execution.ts:586`).
+/// `execution.ts:678`).
 #[derive(Clone, Debug)]
 struct PendingToolResult {
     tool: String,
@@ -1059,7 +1059,7 @@ pub struct ControlMonitor {
 
 impl ControlMonitor {
     /// Build a monitor for one attempt. `started_at` is the attempt's own start (pi `startTime`,
-    /// `execution.ts:336`), from which the long-running elapsed threshold is measured.
+    /// `execution.ts:404-411`), from which the long-running elapsed threshold is measured.
     #[must_use]
     pub fn new(
         config: ResolvedControlConfig,
@@ -1151,7 +1151,7 @@ impl ControlMonitor {
         self.activity_state = None;
     }
 
-    /// pi `emitControlEvent` (`execution.ts:349-355`): notify-gate + at-most-once claim, then
+    /// pi `emitControlEvent` (`execution.ts:417-423`): notify-gate + at-most-once claim, then
     /// record and forward. Returns whether the event actually passed the gate.
     fn emit_control_event(&mut self, event: ControlEvent) -> bool {
         if !should_notify_control_event(&self.config, &event) {
@@ -1180,7 +1180,7 @@ impl ControlMonitor {
             .map(|started| (now - started).max(0))
     }
 
-    /// pi `emitNeedsAttention` (`execution.ts:590-615`). Returns `true` when this was a genuine
+    /// pi `emitNeedsAttention` (`execution.ts:682-707`). Returns `true` when this was a genuine
     /// state TRANSITION into `needs_attention` (the source's `previous !== "needs_attention"`).
     pub fn emit_needs_attention(&mut self, now: i64, input: NeedsAttentionInput) -> bool {
         if !self.config.enabled {
@@ -1216,7 +1216,7 @@ impl ControlMonitor {
         previous != Some(ActivityState::NeedsAttention)
     }
 
-    /// pi `emitActiveLongRunning` (`execution.ts:616-640`): at most once per attempt, and never
+    /// pi `emitActiveLongRunning` (`execution.ts:708-732`): at most once per attempt, and never
     /// while the run is already flagged `needs_attention`.
     pub fn emit_active_long_running(&mut self, now: i64, trigger: LongRunningTrigger) -> bool {
         if !self.config.enabled
@@ -1254,7 +1254,7 @@ impl ControlMonitor {
         true
     }
 
-    /// pi `updateActivityState` (`execution.ts:692-716`): the idle heuristic first, then the
+    /// pi `updateActivityState` (`execution.ts:784-803`): the idle heuristic first, then the
     /// long-running trigger. Returns `true` when a fresh notice was raised (which is what the
     /// source's 1s timer uses to decide whether to also fire a progress update).
     pub fn update_activity_state(&mut self, now: i64) -> bool {
@@ -1430,7 +1430,7 @@ impl ControlMonitor {
     }
 }
 
-/// The optional arguments `emitNeedsAttention` takes (`execution.ts:590`).
+/// The optional arguments `emitNeedsAttention` takes (`execution.ts:682-707`).
 #[derive(Clone, Debug, Default)]
 pub struct NeedsAttentionInput {
     /// Explicit message; the default is derived from the idle age.

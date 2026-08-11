@@ -84,6 +84,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
         completion_guard: Some(false), // isolate this test from R-SA-034's own separate gate
         max_output: OutputCap::default(),
         max_subagent_depth: None,
+        memory: None,
+        tool_budget: None,
         depth: DepthEnvelope {
             current_depth: 0,
             max_depth: 5,
@@ -118,8 +120,10 @@ fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        steer_inbox_dir: None,
         control_config: None,
         on_control_event: None,
+        artifacts_dir: None,
         // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
         model_scope: None,
     }
@@ -466,6 +470,13 @@ fn sample_structured_output_schema() -> serde_json::Value {
     })
 }
 
+/// SUBA-S01 (pi `structured-output.ts:156-173`, `subagent-prompt-runtime.ts`): the child delivers a
+/// structured-output value by CALLING the `structured_output` tool, which writes it to the private
+/// capture file the parent named in `CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE`. A fenced
+/// ` ```json ` block in prose is explicitly NOT that channel (a missing capture file is a hard
+/// failure "even when prose was produced"), so both R-SA-030 tests below script the fixture child
+/// to make that real write — the `write_structured_output` step is the fixture's stand-in for the
+/// tool call, not a shortcut around it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_validates_a_schema_valid_structured_output_and_populates_the_field() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
@@ -474,6 +485,7 @@ async fn run_sync_validates_a_schema_valid_structured_output_and_populates_the_f
     let script = serde_json::json!({
         "steps": [
             {"kind": "emit", "line": r#"{"type":"agent_start"}"#},
+            {"kind": "write_structured_output", "value": {"summary": "all good", "count": 3}},
             {"kind": "emit", "line": message_end_line(
                 "Here is my structured result:\n```json\n{\"summary\": \"all good\", \"count\": 3}\n```",
                 10, 5,
@@ -524,10 +536,12 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
     let dir = tempfile::tempdir().expect("tempdir");
 
     // "count" is a string here, not the schema-required integer — this must fail parent-side
-    // re-validation even though the child exited 0 and produced SOME structured-looking output.
+    // re-validation even though the child exited 0, CALLED `structured_output` (wrote the capture
+    // file) and produced prose.
     let script = serde_json::json!({
         "steps": [
             {"kind": "emit", "line": r#"{"type":"agent_start"}"#},
+            {"kind": "write_structured_output", "value": {"summary": "all good", "count": "three"}},
             {"kind": "emit", "line": message_end_line(
                 "Here is my structured result:\n```json\n{\"summary\": \"all good\", \"count\": \"three\"}\n```",
                 10, 5,
@@ -577,9 +591,81 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
     );
 }
 
+/// pi `execution.ts:1189-1193`: the empty-output (cold-start) gate's structured-presence leg is
+/// literally `!existsSync(options.structuredOutput.outputPath)` — the CAPTURE FILE, not the
+/// transcript.
+///
+/// The USER ACTION this protects: an agent whose whole job is to emit a structured record calls
+/// `structured_output` and then stops WITHOUT any prose (a perfectly ordinary, and for a
+/// schema-declared step arguably the ideal, ending). pi passes that run. A transcript-scanning
+/// presence test classifies it `Missing`, flips the attempt to the retryable "Subagent produced no
+/// output" error, and burns a fallback model on a run that already succeeded — and, because every
+/// fallback attempt ends the same way, fails the whole task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_accepts_a_structured_only_child_that_produced_no_prose_at_all() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // The child calls `structured_output` (writes the capture file) and its ONLY assistant message
+    // is empty — no prose anywhere in the transcript, and in particular no fenced ```json block.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_start"}"#.to_string())},
+            {"kind": "write_structured_output", "value": {"summary": "all good", "count": 3}},
+            {"kind": "emit", "line": empty_message_end_line()},
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_end"}"#.to_string())}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-structured-only.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let mut agent = base_agent_config("primary-model");
+    agent.fallback_models = vec![ModelId::from("fallback-model")];
+    let mut opts = base_run_options(dir.path(), "primary-model");
+    opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
+    opts.structured_output_schema = Some(sample_structured_output_schema());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        cyrup_ext_subagents::exec::run_sync(&agent, "Produce the structured summary", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against a fast, well-behaved fixture child");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_eq!(
+        result.exit_code, 0,
+        "a child that CALLED structured_output has not 'produced no output', prose or not: \
+         {result:?}"
+    );
+    assert!(result.error.is_none(), "got: {:?}", result.error);
+    assert_eq!(
+        result.structured_output,
+        Some(serde_json::json!({"summary": "all good", "count": 3})),
+        "the captured value must still be surfaced, got {result:?}"
+    );
+    assert_eq!(
+        result.attempted_models,
+        vec![ModelId::from("primary-model")],
+        "the ladder must NOT advance — this attempt succeeded, so no fallback model may be burned"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_missing_structured_output_fails_the_run_even_with_prose() {
-    // pi `readStructuredOutput` (structured-output.ts:55-58, execution.ts:791-805): a declared
+    // pi `readStructuredOutput` (structured-output.ts:156-159, execution.ts:791-805): a declared
     // `outputSchema` with NO captured structured value is a HARD failure EVEN WHEN the child
     // produced prose — prose is never an exemption. The child here emits a non-empty prose answer
     // but NO structured-output value at all.
@@ -689,7 +775,7 @@ async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_doe
 
     // The child EXITS ZERO, but its final activity was a failed `bash` call reporting a non-zero
     // exit code, with NO assistant text recovering from it — pi `detectSubagentError`
-    // (`utils.ts:390-460`) flips this to a failure at the parsed exit code (127). Because
+    // (`utils.ts:481-519`) flips this to a failure at the parsed exit code (127). Because
     // "exit 127" matches NO retryable pattern, the fallback model must never be attempted.
     let script = serde_json::json!({
         "steps": [
@@ -960,7 +1046,7 @@ async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is
 // `not-required`), and its delivered output leads with the timeout message. Proven against the
 // REAL signal-escalation ladder (the fixture ignores SIGINT and sleeps far past the deadline, so
 // termination is confirmed only after SIGTERM), never a mock. pi `buildTimedOutAcceptanceLedger`
-// (`execution.ts:101-113,1089-1090`) + timeout preamble (`execution.ts:824-829`).
+// (`execution.ts:101-113` @v0.34.0) + timeout preamble (`execution.ts:824-829`).
 // -------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1096,7 +1182,7 @@ async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
 //
 // pi gates its `details.progress` array on the flag and nothing else
 // (`progress: params.includeProgress ? allProgress : undefined`,
-// `runs/foreground/subagent-executor.ts:3008` @v0.34.0 for SINGLE, `:2679` for PARALLEL). cyrup's
+// `runs/foreground/subagent-executor.ts:3819` @v0.43.0 for SINGLE, `:2679` for PARALLEL). cyrup's
 // SINGLE-mode `details` IS the serialized `SingleResult`, so the snapshot lands on
 // `SingleResult::progress` and surfaces at the same JSON path a pi caller reads.
 //

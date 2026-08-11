@@ -1,5 +1,14 @@
 //! Broker discovery + auto-spawn — a port of `pi-intercom/broker/spawn.ts:179-387`.
 //!
+//! Discovery is **transport-agnostic**: `check_target_connectable` probes whichever
+//! [`crate::transport::target::BrokerConnectTarget`] the platform + environment selects (Unix
+//! socket, Windows named pipe, or the opt-in loopback TCP endpoint), and echoes the endpoint's
+//! `stateId` credential when the target is TCP (`spawn.ts:274,288-291`). `ensure_broker` re-resolves
+//! that target on **every** probe, exactly as pi's argument-less `checkSocketConnectable()` re-calls
+//! `getBrokerConnectTarget()` (`spawn.ts:268-273`) — under TCP the target does not exist until the
+//! broker has published `broker.port.json`, so a once-resolved, cached target could never become
+//! connectable.
+//!
 //! `ensure_broker` ([`spawnBrokerIfNeeded`]) is idempotent: if the broker is already health-
 //! connectable it returns; otherwise it takes an exclusive spawn lock (`O_EXCL`), re-checks, and
 //! **re-execs the broker as a detached OS process** — the configured `broker_command`/`broker_args`
@@ -17,12 +26,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 use crate::error::{IntercomError, Result};
 use crate::paths;
 use crate::transport::framing::{FrameReader, encode_json};
 use crate::transport::protocol::{HealthMessage, PROTOCOL_NAME, PROTOCOL_VERSION, now_ms};
+use crate::transport::stream::BrokerStream;
+use crate::transport::target::{self, BrokerConnectTarget};
 
 /// The hidden subcommand the broker re-exec appends (mirrors `__subagent-runner`).
 pub const INTERCOM_BROKER_SUBCOMMAND: &str = "__intercom-broker";
@@ -43,7 +53,6 @@ const SPAWN_LOCK_MAX_RETRIES: u32 = 5;
 pub async fn ensure_broker(agent_dir: &Path) -> Result<()> {
     let intercom_dir = paths::intercom_dir_path(agent_dir);
     paths::ensure_intercom_runtime_dir(&intercom_dir).map_err(|e| IntercomError::Broker(e.to_string()))?;
-    let socket_path = paths::broker_socket_path(&intercom_dir);
     let pid_path = paths::broker_pid_path(&intercom_dir);
     let lock_path = paths::broker_spawn_lock_path(&intercom_dir);
     // `ensureConnected` passes `config.brokerCommand`/`config.brokerArgs` straight through to
@@ -51,30 +60,29 @@ pub async fn ensure_broker(agent_dir: &Path) -> Result<()> {
     // genuinely changes what gets launched below, instead of being silently ignored.
     let config = crate::config::load_config(&intercom_dir);
 
-    if is_broker_running(&socket_path, &pid_path).await {
+    if is_broker_running_for(agent_dir, &pid_path).await {
         return Ok(());
     }
 
     if !acquire_spawn_lock(&lock_path) {
         // Another process is spawning — just wait for it (spawn.ts:187-190).
-        return wait_for_broker(&socket_path, WAIT_FOR_BROKER_TIMEOUT).await;
+        return wait_for_broker_for(agent_dir, WAIT_FOR_BROKER_TIMEOUT).await;
     }
 
     // Owner path — release the lock on every exit (spawn.ts:238-240).
-    let result = spawn_owner(agent_dir, &socket_path, &pid_path, &config.broker_command, &config.broker_args).await;
+    let result = spawn_owner(agent_dir, &pid_path, &config.broker_command, &config.broker_args).await;
     release_spawn_lock(&lock_path);
     result
 }
 
 async fn spawn_owner(
     agent_dir: &Path,
-    socket_path: &Path,
     pid_path: &Path,
     broker_command: &str,
     broker_args: &[String],
 ) -> Result<()> {
     // Re-check now that we hold the lock (spawn.ts:193-195).
-    if is_broker_running(socket_path, pid_path).await {
+    if is_broker_running_for(agent_dir, pid_path).await {
         return Ok(());
     }
     let mut child = spawn_detached_broker(agent_dir, broker_command, broker_args)?;
@@ -82,7 +90,7 @@ async fn spawn_owner(
     // spawn or dies before startup completes must fail fast with its exit code/signal, not silently
     // wait out the full 5s timeout only to report a generic "timed out".
     let result = tokio::select! {
-        res = wait_for_broker(socket_path, WAIT_FOR_BROKER_TIMEOUT) => res,
+        res = wait_for_broker_for(agent_dir, WAIT_FOR_BROKER_TIMEOUT) => res,
         wait = child.wait() => Err(broker_wait_error(wait)),
     };
     // The child keeps running under its own detached process group regardless of which branch of
@@ -143,6 +151,22 @@ fn spawn_detached_broker(
     {
         command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        // The Windows analog of `getBrokerSpawnOptions`' `detached: true` + `windowsHide: true`
+        // (`spawn.ts:167,171`). pi reaches the same end by writing a `.vbs` launcher and running it
+        // through `wscript.exe` with a hidden window (`getWindowsHiddenLauncherScript` /
+        // `getBrokerLaunchSpec`, `spawn.ts:88-95,130-139`), because Node cannot pass raw creation
+        // flags. cyrup re-execs its own binary directly (see `resolve_broker_command`), so the
+        // launcher script has nothing to launch — the same detach + no-console-window outcome is
+        // requested from the OS directly instead. DETACHED_PROCESS (0x8) is the counterpart of the
+        // `process_group(0)` used on unix above; CREATE_NO_WINDOW (0x0800_0000) is `windowsHide`.
+        // `creation_flags` is `tokio::process::Command`'s own windows-only inherent method (mirroring
+        // `process_group`), so no `std::os::windows::process::CommandExt` import is involved.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
     let child = command.spawn().map_err(|e| IntercomError::Broker(format!("failed to spawn intercom broker: {e}")))?;
     Ok(child)
 }
@@ -171,10 +195,15 @@ fn broker_wait_error(wait_result: std::io::Result<std::process::ExitStatus>) -> 
     }
 }
 
-/// `isBrokerRunning` (`spawn.ts:243-259`): a health-connectable socket, OR a live pid file
-/// (`broker.pid` exists, `kill(pid,0)` succeeds) plus a connectable socket.
+/// `isBrokerRunning` (`spawn.ts:243-259`) against an explicit socket/pipe path.
 pub async fn is_broker_running(socket_path: &Path, pid_path: &Path) -> bool {
-    if check_socket_connectable(socket_path).await {
+    is_broker_running_target(&BrokerConnectTarget::Socket(socket_path.to_path_buf()), pid_path).await
+}
+
+/// `isBrokerRunning` (`spawn.ts:243-259`): a health-connectable target, OR a live pid file
+/// (`broker.pid` exists, `kill(pid,0)` succeeds) plus a connectable target.
+pub async fn is_broker_running_target(target: &BrokerConnectTarget, pid_path: &Path) -> bool {
+    if check_target_connectable(target).await {
         return true;
     }
     let Ok(pid_raw) = std::fs::read_to_string(pid_path) else {
@@ -186,18 +215,43 @@ pub async fn is_broker_running(socket_path: &Path, pid_path: &Path) -> bool {
     if !pid_alive(pid) {
         return false;
     }
-    check_socket_connectable(socket_path).await
+    check_target_connectable(target).await
 }
 
-/// `checkSocketConnectable` (`spawn.ts:267-313`): connect, send a `health` probe, and require a
-/// byte-identical `health_ok` (`{protocol:"pi-intercom",version:1}`) within 1 s.
+/// `isBrokerRunning` with the target **re-resolved** from `agent_dir` + the process env, exactly as
+/// pi's argument-less `checkSocketConnectable()` re-calls `getBrokerConnectTarget()` on every
+/// invocation (`spawn.ts:268-273`). Under the opt-in TCP transport the target does not exist until
+/// the broker has published `broker.port.json`, so it must not be resolved once and cached.
+pub async fn is_broker_running_for(agent_dir: &Path, pid_path: &Path) -> bool {
+    match target::broker_connect_target(agent_dir) {
+        Ok(t) => is_broker_running_target(&t, pid_path).await,
+        // `getBrokerConnectTarget()` throwing (no/short/invalid `broker.port.json`) is caught and
+        // resolves `false` — "not connectable" (`spawn.ts:269-273`).
+        Err(_) => false,
+    }
+}
+
+/// `checkSocketConnectable` (`spawn.ts:267-313`) against an explicit socket/pipe path.
 pub async fn check_socket_connectable(socket_path: &Path) -> bool {
+    check_target_connectable(&BrokerConnectTarget::Socket(socket_path.to_path_buf())).await
+}
+
+/// `checkSocketConnectable` (`spawn.ts:267-313`): connect to `target`, send a `health` probe, and
+/// require a byte-identical `health_ok` (`{protocol:"pi-intercom",version:1}`) within 1 s.
+///
+/// Over a TCP target the probe carries the endpoint's `stateId`
+/// (`spawn.ts:274,288-291`: `...(expectedStateId ? { stateId: expectedStateId } : {})`); without it
+/// the broker rejects the probe with `Invalid intercom TCP endpoint credentials`
+/// (`broker.ts:251-254`) and the connection is not considered healthy. Over a socket/pipe target the
+/// field is **omitted**, not sent as null.
+pub async fn check_target_connectable(target: &BrokerConnectTarget) -> bool {
     let request_id = uuid::Uuid::new_v4().to_string();
+    let state_id = target.state_id().map(str::to_string);
     let probe = async {
-        let mut stream = UnixStream::connect(socket_path).await.ok()?;
+        let mut stream = BrokerStream::connect(target).await.ok()?;
         let frame = encode_json(&HealthMessage::Health {
             request_id: request_id.clone(),
-            state_id: None,
+            state_id,
         })
         .ok()?;
         stream.write_all(&frame).await.ok()?;
@@ -225,14 +279,40 @@ pub async fn check_socket_connectable(socket_path: &Path) -> bool {
     matches!(tokio::time::timeout(HEALTH_TIMEOUT, probe).await, Ok(Some(())))
 }
 
-/// `waitForBroker` (`spawn.ts:378-387`): poll `check_socket_connectable` every 100 ms up to 5 s.
+/// `waitForBroker` (`spawn.ts:378-387`) against an explicit socket/pipe path.
 ///
 /// # Errors
 /// [`IntercomError::Broker`] if the broker did not become connectable within `timeout`.
 pub async fn wait_for_broker(socket_path: &Path, timeout: Duration) -> Result<()> {
+    let target = BrokerConnectTarget::Socket(socket_path.to_path_buf());
+    wait_until(timeout, || check_target_connectable(&target)).await
+}
+
+/// `waitForBroker` (`spawn.ts:378-387`) with the target **re-resolved** every poll from `agent_dir`
+/// plus the process env. See [`is_broker_running_for`] for why caching it would break the TCP
+/// transport: the endpoint file appears only once the broker is listening (`broker.ts:64-81`).
+///
+/// # Errors
+/// [`IntercomError::Broker`] if the broker did not become connectable within `timeout`.
+pub async fn wait_for_broker_for(agent_dir: &Path, timeout: Duration) -> Result<()> {
+    wait_until(timeout, || async {
+        match target::broker_connect_target(agent_dir) {
+            Ok(t) => check_target_connectable(&t).await,
+            Err(_) => false,
+        }
+    })
+    .await
+}
+
+/// The shared 100 ms poll ladder (`spawn.ts:378-387`).
+async fn wait_until<F, Fut>(timeout: Duration, mut probe: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let start = tokio::time::Instant::now();
     while start.elapsed() < timeout {
-        if check_socket_connectable(socket_path).await {
+        if probe().await {
             return Ok(());
         }
         tokio::time::sleep(WAIT_POLL_INTERVAL).await;
@@ -306,8 +386,121 @@ fn pid_alive(pid: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
+    use crate::transport::target::{BrokerTcpEndpoint, INTERCOM_TCP_HOST};
+
+    /// Read length-prefixed frames off `stream` until the first one arrives, answer it with
+    /// `reply`, and hand the probe frame back to the test as raw JSON — a broker stand-in narrow
+    /// enough to assert the exact bytes `checkSocketConnectable` puts on the wire
+    /// (`spawn.ts:286-292`).
+    async fn answer_one_probe<S>(mut stream: S, reply: serde_json::Value) -> serde_json::Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut reader = FrameReader::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0, "the prober closed without sending a health frame");
+            if let Some(payload) = reader.push(&buf[..n]).unwrap().into_iter().next() {
+                let probe: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                let mut reply = reply.clone();
+                if let Some(obj) = reply.as_object_mut() {
+                    obj.insert("requestId".to_string(), probe["requestId"].clone());
+                }
+                stream.write_all(&encode_json(&reply).unwrap()).await.unwrap();
+                return probe;
+            }
+        }
+    }
+
+    fn health_ok_reply() -> serde_json::Value {
+        serde_json::json!({ "type": "health_ok", "protocol": PROTOCOL_NAME, "version": PROTOCOL_VERSION })
+    }
+
+    /// `spawn.ts:274,288-291` — over a TCP target the health probe MUST carry the endpoint's
+    /// `stateId`, or the broker rejects it as `Invalid intercom TCP endpoint credentials`
+    /// (`broker.ts:251-254`) and discovery can never succeed. Runs over a real loopback
+    /// `TcpListener` bound to `127.0.0.1:0` — no network.
+    #[tokio::test]
+    async fn health_probe_over_tcp_carries_the_endpoint_state_id() {
+        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let broker = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            answer_one_probe(stream, health_ok_reply()).await
+        });
+
+        let target = BrokerConnectTarget::Tcp(BrokerTcpEndpoint {
+            host: INTERCOM_TCP_HOST.to_string(),
+            port,
+            state_id: Some("state-1".to_string()),
+        });
+        assert!(check_target_connectable(&target).await, "a valid health_ok means connectable");
+
+        let probe = broker.await.unwrap();
+        assert_eq!(probe["type"], "health");
+        assert_eq!(probe["stateId"], "state-1", "spawn.ts:290 spreads the endpoint stateId");
+        assert!(probe["requestId"].is_string());
+    }
+
+    /// MIRROR (stays green): over a socket target pi spreads `{}` instead
+    /// (`...(expectedStateId ? { stateId } : {})`, `spawn.ts:290`) — the key must be **absent**, not
+    /// null, since the broker compares `clientMessage.stateId === BROKER_STATE_ID`.
+    #[tokio::test]
+    async fn health_probe_over_a_socket_omits_the_state_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("broker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let broker = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            answer_one_probe(stream, health_ok_reply()).await
+        });
+
+        assert!(check_socket_connectable(&socket_path).await);
+        let probe = broker.await.unwrap();
+        assert_eq!(probe["type"], "health");
+        assert!(probe.get("stateId").is_none(), "socket probes carry no credential: {probe}");
+    }
+
+    /// `isBrokerHealthOkMessage` (`spawn.ts:97-106`) — a reply whose `protocol` is not
+    /// `pi-intercom` is not a healthy broker, over TCP just as over a socket.
+    #[tokio::test]
+    async fn tcp_health_probe_rejects_a_foreign_protocol_reply() {
+        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            answer_one_probe(
+                stream,
+                serde_json::json!({ "type": "health_ok", "protocol": "something-else", "version": 1 }),
+            )
+            .await
+        });
+
+        let target = BrokerConnectTarget::Tcp(BrokerTcpEndpoint {
+            host: INTERCOM_TCP_HOST.to_string(),
+            port,
+            state_id: Some("state-1".to_string()),
+        });
+        assert!(!check_target_connectable(&target).await);
+    }
+
+    /// `spawn.ts:268-273` — `getBrokerConnectTarget()` throwing (here: the TCP transport is opted
+    /// in but `broker.port.json` does not exist yet) is caught and resolves `false`, so
+    /// `ensure_broker`'s discovery treats it as "no broker" and proceeds, rather than propagating.
+    #[tokio::test]
+    async fn discovery_treats_an_unresolvable_target_as_not_connectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("broker.pid");
+        // No broker, no socket, no pid file: the socket target simply is not connectable.
+        assert!(!is_broker_running_for(dir.path(), &pid_path).await);
+        assert!(
+            wait_for_broker_for(dir.path(), Duration::from_millis(250)).await.is_err(),
+            "the poll ladder must time out, not hang or panic"
+        );
+    }
 
     #[test]
     fn resolve_broker_command_appends_subcommand() {
@@ -339,13 +532,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let intercom_dir = dir.path().join("intercom");
         std::fs::create_dir_all(&intercom_dir).unwrap();
-        let socket_path = intercom_dir.join("broker.sock");
         let pid_path = intercom_dir.join("broker.pid");
 
         let start = std::time::Instant::now();
         // "false" is a non-default broker_command (per `uses_default_broker_command`), so this also
         // exercises the custom-command path landing on a real, immediately-exiting process.
-        let result = spawn_owner(dir.path(), &socket_path, &pid_path, "false", &[]).await;
+        let result = spawn_owner(dir.path(), &pid_path, "false", &[]).await;
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "a broker that exits immediately must be reported as an error");

@@ -2,6 +2,7 @@
 //! engine (arch-01 §3.7 / func-01 §7).
 
 pub mod helpers;
+pub mod oauth;
 pub mod resolve;
 pub mod store;
 pub mod types;
@@ -11,9 +12,17 @@ use crate::model::Model;
 use std::sync::Arc;
 
 pub use helpers::{env_key, keyless_local};
+pub use oauth::{
+    AuthEvent, AuthInfoLink, AuthInteraction, AuthPrompt, AuthPromptKind, AuthSelectOption,
+    CallbackServer, CallbackServerConfig, OAuthError, Pkce, generate_pkce, oauth_credential,
+    poll_oauth_device_code_flow, register_bundled_oauth_flow_loaders,
+};
 pub use resolve::{AuthOverrides, resolve_provider_auth};
 pub use store::{CredentialStore, InMemoryCredentialStore, ModifyFn};
-pub use types::{AuthContext, AuthResult, Credential, EnvAuthContext, ModelAuth, ProviderEnv};
+pub use types::{
+    AuthContext, AuthResult, Credential, CredentialInfo, CredentialType, EnvAuthContext, ModelAuth,
+    ProviderEnv,
+};
 
 /// How a provider authenticates (func-01 §4.1: at least one of `api_key | oauth`).
 #[derive(Clone, Default)]
@@ -62,9 +71,64 @@ pub trait ApiKeyAuth: Send + Sync {
 }
 
 /// An OAuth strategy. `refresh` runs UNDER the credential-store lock (func-01 R-01-014/067).
+///
+/// Ports `OAuthAuth` (`ai/src/auth/types.ts:189-210`).
 #[async_trait::async_trait]
 pub trait OAuthAuth: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Whether access through this auth method is backed by a provider **subscription** rather
+    /// than metered API billing (`isSubscription`, pi v0.84.1 `ai/src/auth/types.ts:210-211`).
+    ///
+    /// This is NOT "the credential is an OAuth credential". Upstream sets it on exactly five
+    /// flows — Anthropic (Claude Pro/Max) `oauth/anthropic.ts:357`, OpenAI (ChatGPT Plus/Pro)
+    /// `oauth/openai-codex.ts:517`, GitHub Copilot `oauth/github-copilot.ts:402`, Kimi Code
+    /// `oauth/kimi-coding.ts:297` and xAI (Grok/X) `oauth/xai.ts:231` — and deliberately leaves
+    /// it unset on the OAuth flows that still bill per token, i.e. OpenRouter
+    /// (`oauth/openrouter.ts:301-311`) and Radius (`oauth/radius.ts:357-361`). pi's own test
+    /// pins that split: *"identifies only subscription-backed OAuth flows as subscriptions"*,
+    /// `ai/test/oauth-auth.test.ts:30-35`, which asserts `toBe(true)` for the five and
+    /// `not.toBe(true)` for OpenRouter.
+    ///
+    /// Consumers must use this and not `isUsingOAuth`: pi v0.84.0's changelog entry for the TUI
+    /// reads *"Fixed the footer showing `(sub)` for generic OAuth/OpenID sign-ins without a
+    /// known subscription"* (`coding-agent/CHANGELOG.md:155`).
+    ///
+    /// **Shape.** Upstream's field is `isSubscription?: boolean` and every consumer compares
+    /// `=== true` (`coding-agent/src/core/model-runtime.ts:463`), so absent and `false` are
+    /// indistinguishable to a reader; a plain `bool` defaulting to `false` is exactly that
+    /// contract.
+    fn is_subscription(&self) -> bool {
+        false
+    }
+
+    /// Selector label for the subscription login option, e.g. `"Sign in with SuperGrok or X
+    /// Premium"` (`loginLabel`, `ai/src/auth/types.ts:194`). Optional upstream, hence the
+    /// default.
+    fn login_label(&self) -> Option<&str> {
+        None
+    }
+
+    /// Interactive login — the flow that *obtains* a credential (`login`,
+    /// `ai/src/auth/types.ts:196`). Drives the user through the browser/device dance via
+    /// `interaction` and returns the credential to persist
+    /// (`store.modify(provider.id, async () => credential)`).
+    ///
+    /// The default reports [`oauth::OAuthError::LoginUnsupported`]: upstream makes `login`
+    /// mandatory, but a Rust default keeps strategies that only *use* a stored credential (and
+    /// the tests that fake them) compiling unchanged. Every real flow overrides it.
+    ///
+    /// The substrate to implement it lives in [`oauth`]: [`oauth::generate_pkce`],
+    /// [`oauth::CallbackServer`], [`oauth::poll_oauth_device_code_flow`] and
+    /// [`oauth::oauth_credential`].
+    async fn login(
+        &self,
+        _interaction: &dyn oauth::AuthInteraction,
+    ) -> Result<Credential, oauth::OAuthError> {
+        Err(oauth::OAuthError::LoginUnsupported {
+            name: self.name().to_string(),
+        })
+    }
 
     /// Network refresh of an expired credential. A failure surfaces as `AuthError::OAuth` and MUST
     /// NOT fall back to an env key (func-01 R-01-013).

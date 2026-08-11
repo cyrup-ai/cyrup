@@ -423,13 +423,64 @@ pub fn detect_capabilities() -> TerminalCapabilities {
     detect_capabilities_from(|k| std::env::var(k).ok(), probe_tmux_hyperlinks())
 }
 
-/// The pure core of [`detect_capabilities`] (Pi `detectCapabilities`, terminal-image.ts:65-125),
-/// parameterised over an environment lookup + the tmux-hyperlink-forwarding flag so both branches are
-/// deterministically testable. The ordered checks mirror Pi's exactly (multiplexer suppression first,
-/// then the positively-identified terminals, then the conservative default).
+/// The process-wide OSC-8 answer, Pi's module-level `cachedCapabilities` + `getCapabilities()`
+/// (`tui/src/terminal-image.ts:33`, `:138-143`): detect once, then hand the same answer to every
+/// later caller. Renderers consult it through [`hyperlinks_supported`]; the app seeds it from the
+/// capabilities it already detected at startup via [`seed_hyperlink_support`].
+static HYPERLINKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the controlling terminal forwards OSC-8 hyperlinks — Pi `getCapabilities().hyperlinks`,
+/// the gate on `markdown.ts:692`. Detected once and cached for the life of the process, exactly as
+/// upstream caches `detectCapabilities()`.
+///
+/// **This is a pure environment read, unconditionally — it never spawns a subprocess**, which is
+/// what makes it safe to call from a render path. The lazy fallback therefore uses
+/// [`detect_capabilities_from`] with `tmux_forwards_hyperlinks = false` rather than
+/// [`detect_capabilities`], whose `probe_tmux_hyperlinks` shells out to
+/// `tmux display-message -p '#{client_termfeatures}'`. Redrawing a transcript must not fork.
+///
+/// The probe's answer is not lost: [`App::detect_image_support`](crate::App::detect_image_support)
+/// runs the full [`detect_capabilities`] once at startup and seeds this cache via
+/// [`seed_hyperlink_support`], so a real tmux session with forwarding enabled is already recorded
+/// before the first frame. The non-probing fallback only decides for embedders that render without
+/// ever detecting, and for them `false` is upstream's own stated conservative default — "Default to
+/// the legacy `text (url)` behavior unless we have positively identified a hyperlink-capable
+/// terminal above" (`tui/src/terminal-image.ts:130-134`) — which prints the URL rather than risking
+/// a terminal that swallows OSC-8 and shows nothing.
+pub fn hyperlinks_supported() -> bool {
+    *HYPERLINKS.get_or_init(|| detect_capabilities_from(|k| std::env::var(k).ok(), false).hyperlinks)
+}
+
+/// Seed [`hyperlinks_supported`] from capabilities that have already been detected, so startup's
+/// single `detectCapabilities()` serves the renderer too. First writer wins (later calls are no-ops),
+/// matching upstream's write-once `cachedCapabilities`.
+pub fn seed_hyperlink_support(supported: bool) {
+    let _ = HYPERLINKS.set(supported);
+}
+
+/// The pure core of [`detect_capabilities`] for the *host* platform (Pi `detectCapabilities`,
+/// v0.84.1 `tui/src/terminal-image.ts:68-132`), parameterised over an environment lookup + the
+/// tmux-hyperlink-forwarding flag so both branches are deterministically testable.
+///
+/// Pi reads `process.platform` inline; here the platform is `cfg!(windows)`, which is a
+/// compile-time constant and therefore untestable on a non-Windows builder. Use
+/// [`detect_capabilities_on_platform`] to exercise the Windows-console branch anywhere.
 pub fn detect_capabilities_from(
     env: impl Fn(&str) -> Option<String>,
     tmux_forwards_hyperlinks: bool,
+) -> TerminalCapabilities {
+    // Pi `const isWindowsConsole = process.platform === "win32"` (v0.84.1 terminal-image.ts:74).
+    detect_capabilities_on_platform(env, tmux_forwards_hyperlinks, cfg!(windows))
+}
+
+/// [`detect_capabilities_from`] with Pi's `isWindowsConsole` (v0.84.1 `terminal-image.ts:74`) lifted
+/// into a parameter. The ordered checks mirror Pi's exactly: multiplexer suppression first
+/// (`:76-86`), then the positively-identified terminals (`:88-118`), then the bare Windows console
+/// (`:124-129`), then the conservative default (`:131`).
+pub fn detect_capabilities_on_platform(
+    env: impl Fn(&str) -> Option<String>,
+    tmux_forwards_hyperlinks: bool,
+    is_windows_console: bool,
 ) -> TerminalCapabilities {
     let has = |k: &str| env(k).is_some_and(|v| !v.is_empty());
     let lower = |k: &str| env(k).unwrap_or_default().to_ascii_lowercase();
@@ -437,7 +488,10 @@ pub fn detect_capabilities_from(
     let terminal_emulator = lower("TERMINAL_EMULATOR");
     let term = lower("TERM");
     let color_term = lower("COLORTERM");
-    let has_true_color = color_term.contains("truecolor") || color_term.contains("24bit");
+    // Pi `colorTerm === "truecolor" || colorTerm === "24bit"` (v0.84.1 terminal-image.ts:73) — an
+    // EQUALITY, not a substring test. `contains` (what this was) also fired on values that merely
+    // embed the word, e.g. `COLORTERM=not-truecolor`. Port bug, present at v0.83.0 too.
+    let has_true_color = color_term == "truecolor" || color_term == "24bit";
     let identified = |images: Option<ImageProtocol>, hyperlinks: bool| TerminalCapabilities {
         images,
         true_color: true,
@@ -480,6 +534,16 @@ pub fn detect_capabilities_from(
     }
     if terminal_emulator == "jetbrains-jediterm" {
         return identified(None, false);
+    }
+    // Pi terminal-image.ts:124-129 — "Windows Terminal does not always set WT_SESSION, for example
+    // when it hosts a cmd.exe launched directly from Win+R. Modern Windows consoles support
+    // truecolor; keep hyperlinks off unless we positively detected support above." So a bare Windows
+    // console gets truecolor WITHOUT a `COLORTERM` hint, while still falling short of OSC-8.
+    //
+    // Version lag, not a port bug: upstream added this in `fa07e7bd9` ("fix(tui): detect truecolor
+    // for Windows consoles"), after the v0.83.0 baseline this crate was ported against.
+    if is_windows_console {
+        return TerminalCapabilities { images: None, true_color: true, hyperlinks: false };
     }
     // Unknown terminal: conservative — OSC-8 off (an unforwarded hyperlink would vanish from output).
     TerminalCapabilities::conservative(has_true_color)

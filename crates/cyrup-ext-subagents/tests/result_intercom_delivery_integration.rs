@@ -3,10 +3,10 @@
 //! to a confirming [`DeliveryChannel`], must
 //!
 //!   1. attempt out-of-band delivery for the SINGLE-mode foreground path too (pi's
-//!      `runSinglePath`, `subagent-executor.ts:2719-2736`, gated on `!detached && !interrupted`)
+//!      `runSinglePath`, `subagent-executor.ts:3515-3873`, gated on `!detached && !interrupted`)
 //!      — not parallel-mode alone;
 //!   2. render the delivered receipt via pi's `formatSubagentResultReceipt`
-//!      (`result-intercom.ts:334-377`) — mode label + `"Run: …"` + `"Children: …"` + the exact
+//!      (`result-intercom.ts:376-421`) — mode label + `"Run: …"` + `"Children: …"` + the exact
 //!      closing line — never a bespoke `"N/M succeeded"` string; and
 //!   3. cite the run's OWN real, delivered-payload run id in that receipt — never a second, fresh,
 //!      disconnected id minted only for the message.
@@ -179,9 +179,34 @@ async fn single_mode_delivers_out_of_band_and_renders_pis_receipt_with_the_real_
         text.starts_with("Delivered single subagent result via intercom."),
         "must render pi's formatSubagentResultReceipt mode-label line, got: {text:?}"
     );
+    // G104 — the tally reads `1 failed`, and that is upstream's own verdict for this child, not a
+    // regression. pi resolves a SINGLE run's child with `foregroundResultIntercomStatus`
+    // (`subagent-executor.ts:1594-1605` @v0.43.0), whose `:1597` pins `success: false` whenever
+    // `result.acceptance?.status === "rejected"` — unconditionally, not gated on the contract being
+    // explicit. This fixture persona declares no acceptance policy, so the heuristic contract infers
+    // `attested`; the child emits plain prose with no `acceptance-report` fence; the foreground gate
+    // is not `reportOptional` (upstream gates that on `isAgentContractV1(options.agentContract)`,
+    // `execution.ts:1703`, and no agent contract is in play here); so `evaluateAcceptance` rejects
+    // for a missing report (`acceptance.ts:1256-1262`) while leaving the exit code at 0 (the
+    // post-hoc exit-code correction is itself gated on `result.acceptance.explicit`,
+    // `execution.ts:1714`).
+    //
+    // BEFORE this assertion read `Children: 1 completed`. That expectation could only be produced by
+    // the path this change deleted: the payload was built by projecting the real `SingleResult`
+    // through a synthetic `chain_graph::StepResult` whose `success` was literally `exit_code == 0`,
+    // a shape that carries no acceptance ledger and no `process_signal` and therefore could never
+    // reach `result-intercom.ts:32` or `:35` at all.
+    // AFTER: the real `SingleResult` is resolved by the real ladder, so the ledger is visible.
     assert!(
-        text.contains("Children: 1 completed"),
+        text.contains("Children: 1 failed"),
         "must render pi's countStatuses/formatStatusCounts child tally, got: {text:?}"
+    );
+    // Stated directly on the payload as well, so the reason above is asserted rather than merely
+    // commented: the child's REJECTED acceptance ledger is what produced the verdict.
+    assert_eq!(
+        payload.child_statuses,
+        vec![cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Failed],
+        "the per-child status must come from the full ladder over the real SingleResult: {payload:?}"
     );
     assert!(
         text.ends_with("Full grouped output was sent over intercom."),

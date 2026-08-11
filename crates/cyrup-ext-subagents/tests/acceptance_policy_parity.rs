@@ -62,7 +62,7 @@ fn guard_did_not_fire() -> CompletionMutationGuardResult {
 }
 
 // ================================================================================================
-// Injection half — `formatAcceptancePrompt` (acceptance.ts:304-348)
+// Injection half — `formatAcceptancePrompt` (acceptance.ts:403-457)
 // ================================================================================================
 
 #[test]
@@ -74,17 +74,17 @@ fn declared_criteria_evidence_review_and_stop_rules_reach_the_child_prompt() {
     let prompt = inject_acceptance_contract("Fix the bug", &contract);
 
     assert!(prompt.starts_with("Fix the bug"), "task text comes first: {prompt}");
-    // `- ${criterion.id}: ${criterion.must}` (acceptance.ts:313).
+    // `- ${criterion.id}: ${criterion.must}` (acceptance.ts:417).
     assert!(
         prompt.contains("- c1: add a regression test"),
         "the explicit criterion id/must line is missing: {prompt}"
     );
-    // A bare `must` string gets the `criterion-<n>` id from `normalizeCriteria` (acceptance.ts:253).
+    // A bare `must` string gets the `criterion-<n>` id from `normalizeCriteria` (acceptance.ts:332).
     assert!(
         prompt.contains("- criterion-2: keep the public API stable"),
         "the bare-string criterion is missing its normalized id: {prompt}"
     );
-    // `Required evidence: ${acceptance.evidence.join(", ") || "none"}` (acceptance.ts:315).
+    // `Required evidence: ${acceptance.evidence.join(", ") || "none"}` (acceptance.ts:419).
     assert!(
         prompt.contains("Required evidence: tests-added, residual-risks"),
         "the required-evidence line is missing: {prompt}"
@@ -113,7 +113,7 @@ fn declared_criteria_evidence_review_and_stop_rules_reach_the_child_prompt() {
 }
 
 // ================================================================================================
-// Enforcement half — `evaluateAcceptance`'s `rank >= checked` rung (acceptance.ts:819-829)
+// Enforcement half — `evaluateAcceptance`'s `rank >= checked` rung (acceptance.ts:1297-1321)
 // ================================================================================================
 
 /// A child report that claims success but reports NEITHER declared criterion and carries NEITHER
@@ -134,6 +134,8 @@ async fn a_child_report_missing_the_declared_criteria_and_evidence_is_rejected()
         Some(BARE_REPORT),
         guard_did_not_fire(),
         dir.path(),
+        None,
+        None,
     )
     .await;
 
@@ -143,12 +145,12 @@ async fn a_child_report_missing_the_declared_criteria_and_evidence_is_rejected()
         "a report satisfying none of the declared policy must not reach checked: {ledger:?}"
     );
     let detail = ledger.detail.unwrap_or_default();
-    // `checkCriteriaSatisfied`'s verbatim message (acceptance.ts:626).
+    // `checkCriteriaSatisfied`'s verbatim message (acceptance.ts:915).
     assert!(
         detail.contains("Required criterion 'c1' was not reported."),
         "pi's criterion message is missing: {detail}"
     );
-    // `runStructuralChecks`'s verbatim message (acceptance.ts:664).
+    // `runStructuralChecks`'s verbatim message (acceptance.ts:956).
     assert!(
         detail.contains("tests-added evidence missing from child report."),
         "pi's evidence message is missing: {detail}"
@@ -180,6 +182,8 @@ async fn a_child_report_satisfying_the_declared_policy_reaches_checked() {
         Some(report),
         guard_did_not_fire(),
         dir.path(),
+        None,
+        None,
     )
     .await;
 
@@ -209,6 +213,8 @@ async fn a_criterion_reported_as_not_satisfied_is_rejected_with_pis_wording() {
         Some(report),
         guard_did_not_fire(),
         dir.path(),
+        None,
+        None,
     )
     .await;
 
@@ -245,6 +251,8 @@ async fn a_recommended_criterion_is_prompted_but_never_gates() {
         Some("```acceptance-report\n{\"criteriaSatisfied\": []}\n```"),
         guard_did_not_fire(),
         dir.path(),
+        None,
+        None,
     )
     .await;
 
@@ -257,7 +265,7 @@ async fn a_recommended_criterion_is_prompted_but_never_gates() {
 
 /// `no-staged-files` is the one evidence kind backed by an orchestrator-observed fact rather than
 /// the child's own claim: `checkNoStagedFiles` runs a REAL `git status --short` in the run cwd
-/// (acceptance.ts:646-655) and fails when anything is staged, no matter what the child reported.
+/// (acceptance.ts:939-948) and fails when anything is staged, no matter what the child reported.
 #[tokio::test]
 async fn declared_no_staged_files_evidence_runs_a_real_git_status_and_rejects_a_staged_worktree() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -295,6 +303,8 @@ async fn declared_no_staged_files_evidence_runs_a_real_git_status_and_rejects_a_
         Some(report),
         guard_did_not_fire(),
         cwd,
+        None,
+        None,
     )
     .await;
 
@@ -314,7 +324,7 @@ async fn declared_no_staged_files_evidence_runs_a_real_git_status_and_rejects_a_
 }
 
 /// An object with no `level` and no `verify[]` is pi's `level: "auto"`: the level is inferred, but
-/// the declared policy still resolves (`resolveEffectiveAcceptance`, acceptance.ts:265-302). This
+/// the declared policy still resolves (`resolveEffectiveAcceptance`, acceptance.ts:344-401). This
 /// arm used to return `None` and throw the whole policy away.
 #[test]
 fn a_policy_with_no_level_still_lowers_and_carries_its_criteria() {

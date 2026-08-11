@@ -214,12 +214,13 @@ impl HostCtx {
 }
 
 /// The decomposed result of [`InitApi`]: the declared subscriptions, registered tools, registered
-/// `(name, descriptor)` commands, and the tool names / custom types this extension declared a
-/// renderer for (EXT-006).
+/// `(name, descriptor)` commands, and the tool names / custom message types / custom ENTRY types
+/// this extension declared a renderer for (EXT-006, X15).
 pub(crate) type InitParts = (
     Subscriptions,
     Vec<Arc<dyn Tool>>,
     Vec<(String, CommandDescriptor)>,
+    Vec<String>,
     Vec<String>,
     Vec<String>,
 );
@@ -233,6 +234,7 @@ pub struct InitApi {
     commands: Vec<(String, CommandDescriptor)>,
     tool_renderers: Vec<String>,
     message_renderers: Vec<String>,
+    entry_renderers: Vec<String>,
 }
 
 impl InitApi {
@@ -278,12 +280,35 @@ impl InitApi {
         self.tool_renderers.push(tool_name.into());
     }
 
+    /// Declare that this extension renders custom ENTRIES of `custom_type` (Pi
+    /// `api.registerEntryRenderer(customType, renderer)`, extensions/types.ts:1295, implemented at
+    /// `loader.ts:314-318`). The host routes [`crate::ExtensionHost::render_entry`] for that type
+    /// back to [`NativeExtension::render_entry`]. First registration in load order wins, matching
+    /// Pi's `getEntryRenderer` loop (runner.ts:593-600).
+    ///
+    /// X15 — DISTINCT from [`Self::register_message_renderer`]. A custom MESSAGE participates in
+    /// LLM context and is drawn by `CustomMessageComponent`, which SWALLOWS a renderer throw and
+    /// falls through to its default `[type] body` box (`custom-message.ts:82-84`). A custom ENTRY
+    /// is TUI-only durable state (`pi.appendEntry`) drawn by `CustomEntryComponent`, which draws a
+    /// `[type] renderer failed: …` box instead (`custom-entry.ts:47-52`) and draws NOTHING at all
+    /// when no renderer claims the type (`interactive-mode.ts:3432-3435`).
+    pub fn register_entry_renderer(&mut self, custom_type: impl Into<String>) {
+        self.entry_renderers.push(custom_type.into());
+    }
+
     pub fn subscriptions(&self) -> Subscriptions {
         self.subs
     }
 
     pub(crate) fn into_parts(self) -> InitParts {
-        (self.subs, self.tools, self.commands, self.tool_renderers, self.message_renderers)
+        (
+            self.subs,
+            self.tools,
+            self.commands,
+            self.tool_renderers,
+            self.message_renderers,
+            self.entry_renderers,
+        )
     }
 }
 
@@ -335,6 +360,35 @@ pub trait NativeExtension: Send + Sync {
     /// WASM `execute-command` shape so the two paths are interchangeable). The default rejects: a
     /// native built-in that registers a command via [`InitApi::register_command`] MUST override this
     /// to service it. Built-ins that only subscribe to events leave it unimplemented.
+    ///
+    /// # How the return value reaches the user — and the `Ok(None)` convention
+    ///
+    /// **`Ok(Some(text))` is surfaced by the session as an [`crate::NotifyKind::Info`]
+    /// notification** (`cyrup-session-svc/src/session.rs`, the `Ok(Some(_))` arm of
+    /// `try_execute_extension_command`). Trimmed-empty text surfaces nothing. An `Err` surfaces as
+    /// an [`crate::NotifyKind::Error`] notification prefixed `command:<name>: `, mirroring Pi's
+    /// `emitError({ extensionPath: \`command:${commandName}\`, … })`
+    /// (agent-session.ts:1295-1299); either way the command counts as HANDLED and the `/name …`
+    /// text never reaches the model as a prompt (Pi `return true`, :1292 and :1300).
+    ///
+    /// This return channel cannot carry a notification LEVEL — it is a `String`, and everything on
+    /// it arrives as Info. So:
+    ///
+    /// - A handler that just wants to say something returns `Ok(Some(text))` and gets Info. This is
+    ///   the common case and needs no thought.
+    /// - **A handler that needs `Warning` or `Error` calls
+    ///   [`crate::HostServices::notify`] itself with the level it wants, and then returns
+    ///   `Ok(None)`.** Returning both the notification AND the text would put the same message on
+    ///   screen twice, once at the chosen level and once as an Info duplicate.
+    ///
+    /// `Ok(None)` therefore means "nothing further to surface" — either the handler genuinely has
+    /// no output, or it has already surfaced its own at a level this channel cannot express. Both
+    /// are silent here, which is correct in both cases.
+    ///
+    /// Reserve `Err` for the command genuinely FAILING (bad routing, a panic, an unserviceable
+    /// name). A user-facing error the handler expects and wants to phrase itself is better sent as
+    /// a self-issued `Error` notify plus `Ok(None)`, which keeps the wording under the handler's
+    /// control instead of wrapping it in the `command:<name>: ` prefix.
     async fn execute_command(
         &self,
         name: &str,
@@ -359,6 +413,24 @@ pub trait NativeExtension: Send + Sync {
     /// The result-side companion of [`Self::render_call`] (Pi `renderResult`,
     /// extensions/types.ts:475-481).
     fn render_result(&self, _key: &str, _result: &serde_json::Value) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Render a custom ENTRY this extension declared a renderer for via
+    /// [`InitApi::register_entry_renderer`] (Pi `EntryRenderer`, extensions/types.ts:1165-1169).
+    /// `custom_type` is the entry's `customType`; `entry` is the serialized session entry.
+    ///
+    /// `None` — the upstream `Component | undefined` return — means "I chose to draw nothing"; the
+    /// host then draws nothing at all, matching `CustomEntryComponent.hasContent() === false`
+    /// (`interactive-mode.ts:3438-3440`). A PANIC is the `throw` of `custom-entry.ts:47`: the host
+    /// contains it and reports [`crate::RenderOutcome::Failed`], which draws the failure box.
+    ///
+    /// Sync for the same reason as [`Self::render_call`]: it runs on the UI's event path.
+    fn render_entry(
+        &self,
+        _custom_type: &str,
+        _entry: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
         None
     }
 

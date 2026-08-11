@@ -54,6 +54,13 @@ pub enum CascadeVerb {
     /// Terminal deadline failure — `control/timeout.json`, no signal (pi `deliverTimeoutRequest`,
     /// source `"ancestor-timeout"`).
     Timeout,
+    /// G77 — explicit terminal stop: `control/stop.json`, no signal (pi
+    /// `stopNestedAsyncDescendants`, `subagent-runner.ts:2281-2310` @v0.43.0, which calls
+    /// `deliverStopRequest({ asyncDir, pid, source: "ancestor-stop" })` for every `running`/`queued`
+    /// descendant and logs `subagent.nested.stop_failed` per unreachable one). Distinct from
+    /// [`Self::Timeout`] for the same reason the two verbs are distinct at the local level: a
+    /// stopped subtree ends `Stopped` and is not resumable, a timed-out one ends `Failed`.
+    Stop,
 }
 
 impl CascadeVerb {
@@ -63,6 +70,7 @@ impl CascadeVerb {
         match self {
             Self::Interrupt => "ancestor-interrupt",
             Self::Timeout => "ancestor-timeout",
+            Self::Stop => "ancestor-stop",
         }
     }
 
@@ -73,6 +81,7 @@ impl CascadeVerb {
         match self {
             Self::Interrupt => "subagent.nested.interrupt_failed",
             Self::Timeout => "subagent.nested.timeout_failed",
+            Self::Stop => "subagent.nested.stop_failed",
         }
     }
 }
@@ -193,6 +202,10 @@ pub async fn cascade_to_nested_async_descendants(
             CascadeVerb::Timeout => {
                 control::deliver_timeout_request(&dir, verb.source(), None).await
             }
+            // G77: like `Timeout`, no wake-up signal — upstream's `deliverStopRequest` body is a
+            // bare `requestAsyncStop(...)` (`runs/background/control-channel.ts:600`) despite its input shape
+            // accepting a `pid`, so `pid` is deliberately unused on this arm.
+            CascadeVerb::Stop => control::deliver_stop_request(&dir, verb.source(), None).await,
         };
         match delivered {
             Ok(_) => report.delivered.push(run.id.clone()),
@@ -296,7 +309,10 @@ mod tests {
     fn only_running_and_queued_states_are_addressed() {
         assert!(is_live_state("running"));
         assert!(is_live_state("queued"));
-        for dead in ["complete", "failed", "paused", "cancelled", ""] {
+        // G77: `"stopped"` joins the dead set — a stopped descendant is terminal and must not be
+        // re-targeted by a later cascade (pi's own `run.state !== "running" && run.state !==
+        // "queued"` guard, `subagent-runner.ts:2296`).
+        for dead in ["complete", "failed", "paused", "stopped", "cancelled", ""] {
             assert!(!is_live_state(dead), "{dead} must not be addressed");
         }
     }
@@ -305,6 +321,8 @@ mod tests {
     fn verb_sources_and_failure_events_match_pi_literals() {
         assert_eq!(CascadeVerb::Interrupt.source(), "ancestor-interrupt");
         assert_eq!(CascadeVerb::Timeout.source(), "ancestor-timeout");
+        // G77 — pi `stopNestedAsyncDescendants` (`subagent-runner.ts:2281-2311`).
+        assert_eq!(CascadeVerb::Stop.source(), "ancestor-stop");
         assert_eq!(
             CascadeVerb::Interrupt.failure_event_type(),
             "subagent.nested.interrupt_failed"
@@ -312,6 +330,10 @@ mod tests {
         assert_eq!(
             CascadeVerb::Timeout.failure_event_type(),
             "subagent.nested.timeout_failed"
+        );
+        assert_eq!(
+            CascadeVerb::Stop.failure_event_type(),
+            "subagent.nested.stop_failed"
         );
     }
 }

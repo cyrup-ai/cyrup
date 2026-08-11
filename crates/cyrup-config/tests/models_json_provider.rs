@@ -92,7 +92,9 @@ impl ApiImpl for RecordingApi {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         };
         sink.send(StreamEvent::terminal(message)).await;

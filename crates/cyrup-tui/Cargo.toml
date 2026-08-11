@@ -32,6 +32,17 @@ cyrup-ext = { workspace = true }
 # dependency so the streaming-delta variants of `StreamEvent` (`TextDelta { delta, partial }`,
 # stream.rs:306) can be matched in `App::ingest_event` (gap 1 — live token-by-token render).
 cyrup-provider = { workspace = true }
+# Already a transitive dep (via cyrup-session-svc); promoted to a direct dependency so `/login` can
+# run the REAL ported flow: `cyrup_config::login::{login, logout, login_provider_options,
+# resolve_login_command, start_provider_login, resolve_auth_type_selector}` is the config-side half
+# of Pi's `handleLoginCommand` (`interactive-mode.ts:4994-5051`) and `Models.login`
+# (`ai/src/models.ts:431-452`). Points downward: cyrup-config sits below cyrup-session-svc, which
+# already re-exports the `AuthStore` this crate writes through.
+cyrup-config = { workspace = true }
+# The `AuthInteraction` trait (`cyrup_provider::auth::oauth`) is `#[async_trait]`, so implementing it
+# for the TUI (`login_dialog::TuiAuthInteraction`) needs the attribute at the definition site. Was a
+# dev-dependency only (the EXT-006 `NativeExtension` test); promoted for that impl.
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 # `unstable-rendered-line-info` exposes `Paragraph::line_count(width)` — used to measure the WRAPPED
 # display-row height of prose so the content-sized viewport + scrollback flush match what render wraps
@@ -70,6 +81,13 @@ uuid = { workspace = true }
 unicode-segmentation = { workspace = true }
 # JSON keybindings loader (spec/tui/07 §3.9; core/keybindings.ts:14-262) + theme-data hot-reload.
 serde_json = { workspace = true }
+# Already a transitive dep (via cyrup-session-svc) and previously a dev-dep only; promoted to a
+# direct dependency for `edit`'s PRE-EXECUTION diff preview (Pi `computeEditsDiff`,
+# edit-diff.ts:514-547, fired from `renderCall` at edit.ts:377-386). `App::ingest_event_rendered`
+# calls `cyrup_tools::tools::edit_diff::compute_edits_diff` on `ToolExecutionStart` so the diff is
+# rendered before the write lands — the preview MUST share the tool's own matching core, or it
+# would show a diff the tool then contradicts. Points downward: cyrup-tools sits below cyrup-tui.
+cyrup-tools = { workspace = true }
 
 [dev-dependencies]
 cyrup-provider = { workspace = true, features = ["faux"] }
@@ -80,10 +98,6 @@ cyrup-agent = { workspace = true }
 # where the `HostServices` trait for the `/tree` label-append is pulled in) and the
 # extension-dialog-countdown test builds a synthetic `UiRequest` from it.
 tempfile.workspace = true
-# Dev-only: `LiveHostServices::new` takes an `Arc<dyn ProcOps>`, which only `cyrup-tools` supplies —
-# the extension-UI-effect test builds a real `LiveHostServices` so it drives the SAME
-# `emit_ui_effect` drop/deliver seam production does, not a stand-in.
-cyrup-tools = { workspace = true }
-# EXT-006: the renderer-routing test declares a `NativeExtension` (an `#[async_trait]` trait) so it
-# can register a renderer the way a real built-in does.
-async-trait = { workspace = true }
+# `async-trait` was listed here for EXT-006 (the renderer-routing test declares a `NativeExtension`)
+# and for `tests/login_flow.rs`'s stub `OAuthAuth`/`ApiKeyAuth`; it is now a REGULAR dependency
+# above (the `AuthInteraction` impl needs it in `src/`), which covers dev builds too.

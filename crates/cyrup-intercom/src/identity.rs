@@ -8,8 +8,15 @@
 /// `DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "subagent-chat"` (`index.ts:20`).
 pub const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX: &str = "subagent-chat";
 
-/// `CYRUP_INTERCOM_SESSION_ID` (`index.ts:441,606-615`, pi `PI_INTERCOM_SESSION_ID`) — the stable
-/// session id a child adopts across reconnects.
+/// `CYRUP_INTERCOM_SESSION_ID` (`index.ts:441,606-615`, pi `PI_INTERCOM_SESSION_ID`).
+///
+/// Direction matters: upstream **publishes** this (`publishIntercomSessionId`, `index.ts:612-614`,
+/// called from `startSessionRuntime`, `index.ts:946`) so a spawned CHILD inherits it and reads it
+/// back as its SUPERVISOR's id — see [`read_child_orchestrator_metadata_from`]'s fallback below. A
+/// session never re-reads it as its OWN registration id; that is
+/// `ctx.sessionManager.getSessionId()` (cyrup: `HostServices::session_id()`, see
+/// [`crate::connect::connect_once`]). Reading it for self-registration would make a child
+/// re-register under its parent's id and take the parent's broker slot over.
 pub const ENV_INTERCOM_SESSION_ID: &str = "CYRUP_INTERCOM_SESSION_ID";
 /// `CYRUP_INTERCOM_ASK_TIMEOUT_MS` (`config.ts:8`, pi `PI_INTERCOM_ASK_TIMEOUT_MS`).
 pub const ENV_INTERCOM_ASK_TIMEOUT_MS: &str = "CYRUP_INTERCOM_ASK_TIMEOUT_MS";

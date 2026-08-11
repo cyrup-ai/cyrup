@@ -61,7 +61,9 @@ fn assistant(s: &str) -> Message {
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     })
 }
@@ -83,7 +85,9 @@ fn assistant_tool(name: &str, path: &str) -> Message {
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     })
 }
@@ -2343,4 +2347,145 @@ async fn a_settled_summarizer_response_is_still_accepted() {
     .await
     .expect("a settled summarization must succeed");
     assert!(out.text.contains("REAL SUMMARY"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// G21: `fromHook` suppresses file-list inheritance — PIN, not a change.
+//
+// A hook/extension-supplied summary carries `details` of an ARBITRARY, extension-defined shape.
+// Pi therefore refuses to mine it for `readFiles`/`modifiedFiles`, at both inheritance sites:
+//
+//   v0.84.1 coding-agent/src/core/compaction/compaction.ts:51-53
+//       const prevCompaction = entries[prevCompactionIndex] as CompactionEntry;
+//       if (!prevCompaction.fromHook && prevCompaction.details) {
+//           // fromHook field kept for session file compatibility
+//
+//   v0.84.1 coding-agent/src/core/compaction/branch-summarization.ts:202-204
+//       // Only extract from pi-generated summaries (fromHook !== true), not extension-generated ones
+//       if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
+//
+// This is the LIVE fork and it is unchanged from v0.83.0. The harness fork
+// (agent/src/harness/compaction/compaction.ts) DROPPED both guards at v0.84.1 in `44289550a`
+// ("feat(agent): promote durable harness API") — but ONLY because that rewrite deleted the
+// `fromHook` field from `CompactionEntry`/`BranchSummaryEntry`
+// (v0.84.1 agent/src/harness/session/types.ts:44-60, no `fromHook`) AND deleted the compaction hook
+// that produced it (`emitHook`/`hookResult` for compaction is absent from v0.84.1
+// agent/src/harness/agent-harness.ts; cf. v0.83.0 agent-harness.ts:747-755,861,874). Nothing in the
+// v0.84.1 harness can mint a `fromHook: true` entry, so dropping the read-side check there is a
+// no-op, not a semantic reversal.
+//
+// cyrup KEEPS both the field (`entry.rs:91,105`) and a hook that sets it
+// (`compaction/hooks.rs:35,53`; `compaction/mod.rs:295,433,456`), matching the live fork. Removing
+// the guard here would therefore match NEITHER upstream: it would feed extension-shaped `details`
+// into pi's `{readFiles, modifiedFiles}` reader. The guards at `prepare.rs:92` and
+// `branch.rs:178-179` are correct; these tests exist because nothing covered them.
+
+fn compaction_entry_with_details(
+    id: &str,
+    parent: Option<&str>,
+    first_kept: &str,
+    details: serde_json::Value,
+    from_hook: Option<bool>,
+) -> Entry {
+    Entry::known(KnownEntry::Compaction {
+        base: EntryBase {
+            id: EntryId::from(id),
+            parent_id: parent.map(EntryId::from),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        },
+        summary: "PRIOR SUMMARY".to_string(),
+        first_kept_entry_id: Some(EntryId::from(first_kept)),
+        tokens_before: 100,
+        details: Some(details),
+        usage: None,
+        from_hook,
+    })
+}
+
+fn prev_details() -> serde_json::Value {
+    json!({ "readFiles": ["/proj/read-by-hook.rs"], "modifiedFiles": ["/proj/edited-by-hook.rs"] })
+}
+
+/// `prepare_compaction` must NOT inherit a `fromHook: true` compaction's `details`
+/// (v0.84.1 coding-agent/src/core/compaction/compaction.ts:52).
+#[test]
+fn g21_prepare_compaction_ignores_from_hook_prev_details() {
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 5 };
+    let cache = TokenCache::default();
+
+    let build = |from_hook: Option<bool>| {
+        vec![
+            msg_entry("e0", None, user("the first user message in this session")),
+            compaction_entry_with_details("e1", Some("e0"), "e0", prev_details(), from_hook),
+            msg_entry("e2", Some("e1"), user("history that will be summarized away now")),
+            msg_entry("e3", Some("e2"), user("recent tail kept verbatim")),
+        ]
+    };
+
+    // SUPPRESSED: hook-sourced details are not mined.
+    let hooked = build(Some(true));
+    let prep = prepare_compaction(&hooked, &cache, &settings).expect("history to summarize");
+    let (read, modified) = prep.file_ops.compute_lists();
+    assert!(
+        read.is_empty() && modified.is_empty(),
+        "fromHook=true must suppress inheritance, got read={read:?} modified={modified:?}"
+    );
+
+    // MIRROR — the very same details ARE inherited when the entry is pi-generated. Without this the
+    // test above would also pass if inheritance were broken outright.
+    for pi_generated in [None, Some(false)] {
+        let entries = build(pi_generated);
+        let prep = prepare_compaction(&entries, &cache, &settings).expect("history to summarize");
+        let (read, modified) = prep.file_ops.compute_lists();
+        assert_eq!(
+            read,
+            vec!["/proj/read-by-hook.rs".to_string()],
+            "pi-generated details must be inherited (from_hook={pi_generated:?})"
+        );
+        assert_eq!(
+            modified,
+            vec!["/proj/edited-by-hook.rs".to_string()],
+            "pi-generated details must be inherited (from_hook={pi_generated:?})"
+        );
+    }
+}
+
+/// `prepare_branch_entries` must NOT inherit a `fromHook: true` branch summary's `details`
+/// (v0.84.1 coding-agent/src/core/compaction/branch-summarization.ts:204).
+#[test]
+fn g21_prepare_branch_entries_ignores_from_hook_details() {
+    let build = |from_hook: Option<bool>| {
+        vec![Entry::known(KnownEntry::BranchSummary {
+            base: EntryBase {
+                id: EntryId::from("b1"),
+                parent_id: None,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+            from_id: EntryId::from("from"),
+            summary: "abandoned branch summary".to_string(),
+            details: Some(prev_details()),
+            usage: None,
+            from_hook,
+        })]
+    };
+
+    // SUPPRESSED.
+    let prep = branch::prepare_branch_entries(&build(Some(true)), 0);
+    let (read, modified) = prep.file_ops.compute_lists();
+    assert!(
+        read.is_empty() && modified.is_empty(),
+        "fromHook=true branch summary must suppress inheritance, got read={read:?} modified={modified:?}"
+    );
+
+    // MIRROR — pi-generated branch summaries still seed the file lists.
+    for pi_generated in [None, Some(false)] {
+        let prep = branch::prepare_branch_entries(&build(pi_generated), 0);
+        let (read, modified) = prep.file_ops.compute_lists();
+        assert_eq!(read, vec!["/proj/read-by-hook.rs".to_string()], "from_hook={pi_generated:?}");
+        assert_eq!(
+            modified,
+            vec!["/proj/edited-by-hook.rs".to_string()],
+            "from_hook={pi_generated:?}"
+        );
+    }
 }

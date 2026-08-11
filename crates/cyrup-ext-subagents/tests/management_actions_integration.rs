@@ -123,6 +123,7 @@ fn act(base: &Path, action: &str, agent: Option<&str>, scope: Option<&str>) -> O
         agent_scope: scope,
         config: None,
         current_session_model: None,
+        proactive_skills: None,
     };
     let outcome = handle_management_action(&cfg, action, &req).expect("management action runs");
     Outcome { text: outcome.text, is_error: outcome.is_error }

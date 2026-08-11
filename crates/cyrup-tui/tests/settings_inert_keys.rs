@@ -121,13 +121,20 @@ fn open_slash_menu(app: &mut App<TestBackend>) -> String {
     buf_text(app)
 }
 
-/// The line carrying the editor's prompt glyph `›`, as rendered.
-fn prompt_line(app: &App<TestBackend>) -> String {
+/// The editor's text row, located by the buffer content it is showing.
+///
+/// It used to be located by the editor's prompt glyph `›`. E1 removed that glyph — pi's
+/// `Editor.render` (`editor.ts:482-601`) emits only
+/// `${leftPadding}${displayText}${padding}${lineRightPadding}` (`:578`), with no leading glyph
+/// anywhere in the chat editor's construction — so the row is now found by `needle`, which is the
+/// text the caller typed into the buffer. The column arithmetic below is unchanged: `leftPadding`
+/// is `" ".repeat(paddingX)` (`:522`), so the first text column IS `editorPaddingX`.
+fn prompt_line(app: &App<TestBackend>, needle: &str) -> String {
     buf_text(app)
         .lines()
-        .find(|l| l.contains('›'))
+        .find(|l| l.contains(needle))
         .map(str::to_string)
-        .unwrap_or_else(|| panic!("no editor prompt row in the frame:\n{}", buf_text(app)))
+        .unwrap_or_else(|| panic!("no editor text row in the frame:\n{}", buf_text(app)))
 }
 
 // ------------------------------------------------------------------ treeFilterMode --------------
@@ -267,9 +274,9 @@ async fn editor_padding_insets_the_prompt_row_on_the_next_frame() {
     app.editor_mut().set_text("hello");
     app.draw().unwrap();
 
-    let flush = prompt_line(&app);
-    let flush_col = flush.find('›').unwrap();
-    assert_eq!(flush_col, 0, "baseline (padding 0) must render the prompt flush at column 0");
+    let flush = prompt_line(&app, "hello");
+    let flush_col = flush.find("hello").unwrap();
+    assert_eq!(flush_col, 0, "baseline (padding 0) must render the text flush at column 0");
 
     app.execute_command(
         AppCommand::ApplySetting { id: "editorPaddingX".to_string(), value: "3".to_string() },
@@ -279,8 +286,8 @@ async fn editor_padding_insets_the_prompt_row_on_the_next_frame() {
     .await;
     app.draw().unwrap();
 
-    let padded = prompt_line(&app);
-    let padded_col = padded.find('›').unwrap();
+    let padded = prompt_line(&app, "hello");
+    let padded_col = padded.find("hello").unwrap();
     assert_eq!(
         padded_col, 3,
         "`editorPaddingX: 3` must inset the editor text by 3 columns, got column {padded_col} in:\n{padded}"
@@ -307,7 +314,11 @@ async fn persisted_editor_padding_is_honored_by_the_render() {
         .set_padding_x(session.services().settings.effective().editor_padding_x());
     app.editor_mut().set_text("hi");
     app.draw().unwrap();
-    assert_eq!(prompt_line(&app).find('›').unwrap(), 2, "persisted padding must reach the frame");
+    assert_eq!(
+        prompt_line(&app, "hi").find("hi").unwrap(),
+        2,
+        "persisted padding must reach the frame"
+    );
 }
 
 // --------------------------------------------------------------- showHardwareCursor -------------
@@ -366,7 +377,10 @@ async fn hardware_cursor_respects_editor_padding() {
     let fx = fixture();
     let session = session_with(&fx, Settings::new()).await;
     let mut app = app();
-    app.editor_mut().set_text("");
+    // Typed, not empty: an empty buffer puts the caret at `leftPadding + 0`, which cannot
+    // distinguish "the padding is honored" from "the padding is honored AND nothing else is
+    // silently prefixed" — the exact confusion that let the `› ` glyph ride along here.
+    app.editor_mut().set_text("hello");
     app.execute_command(
         AppCommand::ApplySetting { id: "showHardwareCursor".to_string(), value: "true".to_string() },
         &session,
@@ -382,9 +396,11 @@ async fn hardware_cursor_respects_editor_padding() {
     app.draw().unwrap();
 
     let pos = app.terminal().backend().cursor_position();
-    // padding (2) + the `› ` prompt glyph (2 columns) on the first visual row.
+    // padding (2) + the 5 columns of `hello` before the end-of-line caret. E1 removed the two
+    // columns the `› ` glyph used to add here; pi's caret sits at `leftPadding + visibleWidth(text
+    // before it)` and nothing else (`editor.ts:522,546,559`).
     assert_eq!(
-        pos.x, 4,
-        "the hardware cursor must sit past the padding and the prompt glyph, got {pos:?}"
+        pos.x, 7,
+        "the hardware cursor must sit past the padding and the typed text, got {pos:?}"
     );
 }

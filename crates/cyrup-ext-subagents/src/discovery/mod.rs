@@ -45,7 +45,7 @@
 //! on Windows, via [`std::env::split_paths`]) list of additional read-only agent directories,
 //! scanned as **User** scope (R-SA-003's own text: "scanned as User scope"). They are **prepended
 //! ahead of** the ordinary user agent directories in fixed scan order (pi `discoverAgents`
-//! `[...userAgentsExtra, ...userAgentsOld, ...userAgentsNew]`, agents.ts:1300-1304), so under
+//! `[...userAgentsExtra, ...userAgentsOld, ...userAgentsNew]`, agents.ts:1752-1756), so under
 //! R-SA-002's last-directory-scanned-wins rule the user's *own* agent dirs win over a bundled
 //! extra-dir agent of the same name — extras are the **lowest-precedence** User-tier stream, a
 //! read-only fallback for a same-named agent the user has not defined themselves. (A prior bug
@@ -78,6 +78,12 @@ pub mod types;
 /// by `discovery/chains.rs` for `.chain.md` files via its low-level `parse_frontmatter_block`.
 pub mod frontmatter;
 
+/// Per-agent persistent memory scopes (`memory:` frontmatter) — a port of pi-subagents'
+/// `agents/agent-memory.ts`: scope parsing, containment-checked directory resolution, capped
+/// `MEMORY.md` reading, and the read-write/read-only system-prompt block folded into the child's
+/// persona at spawn by `exec/mod.rs`.
+pub mod agent_memory;
+
 /// Chain-file discovery: `.chain.json` > `.chain.md` same-name precedence within one directory
 /// scan, cross-scope retention (never merged) across scan scopes (func-SA §5.1 R-SA-015; arch-SA
 /// §6.2.2).
@@ -93,7 +99,7 @@ pub mod management;
 /// Skills association (T5, C4): skill-name resolution against a cwd (reusing `cyrup-resources`
 /// discovery), the lazy `<available_skills>` system-prompt injection, the `pi-subagents`
 /// orchestration-skill exclusion, and proactive skill-subagent suggestions — a port of pi-subagents'
-/// `agents/skills.ts:608-682` + `agents/proactive-skills.ts`. Consumed by `exec/mod.rs`'s prompt
+/// `agents/skills.ts:629-714` + `agents/proactive-skills.ts`. Consumed by `exec/mod.rs`'s prompt
 /// assembly (the injection is composed into the child's task text at spawn).
 pub mod skills;
 
@@ -107,7 +113,7 @@ pub mod merge;
 
 /// The settings-file **writer** side of `subagents.agentOverrides` (pi
 /// `mergeBuiltinAgentOverride`/`removeBuiltinAgentOverride`/`removeBuiltinAgentOverrideFields`,
-/// `agents/agents.ts:1033-1120`) — the read-modify-write half this module's reader-only
+/// `agents/agents.ts:1276-1371`) — the read-modify-write half this module's reader-only
 /// [`load_layered_override_settings`] deliberately does not do. Backs the `disable`/`enable`/`reset`
 /// management actions (SUBA-005).
 pub mod settings_write;
@@ -145,19 +151,21 @@ pub const EXTRA_AGENT_DIRS_ENV_VAR: &str = "CYRUP_SUBAGENT_EXTRA_AGENT_DIRS";
 const AGENT_FILE_EXTENSION: &str = "md";
 
 // -------------------------------------------------------------------------------------------
-// Directory topology (pi findNearestProjectRoot / resolveNearestProject*Dirs, agents.ts:511-522,
-// 1234-1259,1279-1280). Pure, filesystem-probing helpers the caller (`extension.rs::
+// Directory topology (pi `findNearestProjectRoot` `agents.ts:653-655` / `findProjectRootCandidates`
+// `:617-627` / `resolveNearestProjectAgentDirs` `:1683-1697` / `resolveNearestProjectChainDirs`
+// `:1699-1708`, all @v0.43.0). Pure, filesystem-probing helpers the caller (`extension.rs::
 // discovery_config`) uses to populate an `AgentDiscoveryConfig`'s per-scope directory lists.
 // -------------------------------------------------------------------------------------------
 
 /// Config-directory segment holding cyrup's per-scope agent/chain state (`.cyrup`, cyrup's analog
-/// of pi's `getConfigDirName()` = `.pi`, shared/utils.ts:16,68). A directory containing this
+/// of pi's `getConfigDirName()` = `.pi`, shared/utils.ts:16,91-92 @v0.43.0). A directory containing this
 /// segment marks a project root.
 const PROJECT_CONFIG_DIR_SEGMENT: &str = ".cyrup";
 
 /// Legacy top-level agents directory segment (pi's `.agents`), honored BOTH at a project root (a
-/// lower-precedence project agent read dir, agents.ts:1238) AND at the user home (the "second"
-/// user agent dir `os.homedir()/.agents`, agents.ts:1280).
+/// lower-precedence project agent read dir, `agents.ts:1687,1690` @v0.43.0 — pushed AHEAD of the
+/// preferred `<root>/<configDir>/agents`) AND at the user home (the "second" user agent dir
+/// `os.homedir()/.agents`, `agents.ts:1729` for agents and `:1798` for the chain-carrying pass).
 const LEGACY_AGENTS_DIR_SEGMENT: &str = ".agents";
 
 /// Subdirectory under [`PROJECT_CONFIG_DIR_SEGMENT`] holding agent `.md` files.
@@ -165,25 +173,67 @@ const AGENTS_SUBDIR: &str = "agents";
 
 /// Subdirectory under [`PROJECT_CONFIG_DIR_SEGMENT`] holding chain files (`.chain.md`/`.chain.json`)
 /// — a directory SEPARATE from [`AGENTS_SUBDIR`] (pi `getUserChainDir`/`resolveNearestProjectChainDirs`
-/// key each User/Project chain scope on a dedicated `chains/` dir, agents.ts:180,1254, NOT the
-/// shared `agents/` dir; only *package*-tier chains co-locate with a package's agents dir, handled
-/// separately by [`scan_package_chain_scopes`]).
+/// key each User/Project chain scope on a dedicated `chains/` dir, `agents.ts:1699-1708` and `:1703`
+/// @v0.43.0, NOT the shared `agents/` dir; only *package*-tier chains co-locate with a package's
+/// agents dir, handled separately by [`scan_package_chain_scopes`]).
 const CHAINS_SUBDIR: &str = "chains";
 
 /// Walk `cwd` and every ancestor, returning the nearest directory that qualifies as a project root
 /// — one holding either a [`PROJECT_CONFIG_DIR_SEGMENT`] (`.cyrup`) config directory OR a legacy
-/// [`LEGACY_AGENTS_DIR_SEGMENT`] (`.agents`) directory (a faithful port of pi `findNearestProjectRoot`,
-/// agents.ts:511-522). Returns `None` when no ancestor up to the filesystem root qualifies, so a
-/// caller run outside any project scans no project-scope directories (pi's `readDirs: []`). Always
-/// terminates: the walk stops at the filesystem-root fixpoint where `Path::parent` no longer yields
-/// a distinct ancestor (pi's `path.dirname(dir) === dir` guard).
+/// [`LEGACY_AGENTS_DIR_SEGMENT`] (`.agents`) directory (a faithful port of pi
+/// `findNearestProjectRoot`, `agents.ts:653-655` @v0.43.0 — three lines that are exactly
+/// `findProjectRootCandidates(cwd)[0] ?? null`; the walk itself lives in
+/// [`find_project_root_candidates`], `agents.ts:617-627`). Returns `None` when no ancestor up to the
+/// filesystem root qualifies, so a caller run outside any project scans no project-scope directories
+/// (pi's `readDirs: []`). Always terminates: the walk stops at the filesystem-root fixpoint where
+/// `Path::parent` no longer yields a distinct ancestor (pi's `path.dirname(dir) === dir` guard).
+///
+/// NOT the function this crate's own scope resolution uses — every pi caller of the topology
+/// (`resolveNearestProjectAgentDirs` `:1684`, `resolveNearestProjectChainDirs` `:1700`,
+/// `getProjectAgentSettingsPath` `:679`) goes through [`find_configured_project_root`] instead, so
+/// that `subagents.projectRootResolution` is honored. This is pi's own exported convenience entry
+/// point; [`crate::discovery::agent_memory`]'s `MemoryScope::Project` is its one consumer here.
 #[must_use]
 pub fn find_nearest_project_root(cwd: &Path) -> Option<PathBuf> {
+    find_project_root_candidates(cwd).into_iter().next()
+}
+
+/// True iff `dir` qualifies as a project root — it holds a [`PROJECT_CONFIG_DIR_SEGMENT`] (`.cyrup`)
+/// config directory or a legacy [`LEGACY_AGENTS_DIR_SEGMENT`] (`.agents`) directory (pi
+/// `isProjectRootCandidate`, `agents.ts:613-615`).
+fn is_project_root_candidate(dir: &Path) -> bool {
+    dir.join(PROJECT_CONFIG_DIR_SEGMENT).is_dir() || dir.join(LEGACY_AGENTS_DIR_SEGMENT).is_dir()
+}
+
+/// EVERY ancestor of `cwd` (including `cwd` itself) that qualifies as a project root, **nearest
+/// first** — pi `findProjectRootCandidates` (`agents.ts:617-627`). `find_nearest_project_root` is
+/// this list's head; [`find_configured_project_root`] is this list filtered by the
+/// `subagents.projectRootResolution` setting. Always terminates at the filesystem-root fixpoint
+/// where `Path::parent` no longer yields a distinct ancestor (pi's `path.dirname(dir) === dir`).
+#[must_use]
+pub fn find_project_root_candidates(cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     let mut current = cwd;
     loop {
-        if current.join(PROJECT_CONFIG_DIR_SEGMENT).is_dir()
-            || current.join(LEGACY_AGENTS_DIR_SEGMENT).is_dir()
-        {
+        if is_project_root_candidate(current) {
+            roots.push(current.to_path_buf());
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => return roots,
+        }
+    }
+}
+
+/// The nearest ancestor of `cwd` (including `cwd`) holding a `.git` entry — pi
+/// `findNearestGitRoot` (`agents.ts:629-638`). pi probes with `fs.existsSync`, which is true for a
+/// `.git` **file** as well as a directory, so a linked worktree (whose `.git` is a file) counts;
+/// [`Path::exists`] is the exact analog.
+#[must_use]
+pub fn find_nearest_git_root(cwd: &Path) -> Option<PathBuf> {
+    let mut current = cwd;
+    loop {
+        if current.join(".git").exists() {
             return Some(current.to_path_buf());
         }
         match current.parent() {
@@ -193,8 +243,133 @@ pub fn find_nearest_project_root(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+/// How a project root is picked out of [`find_project_root_candidates`] — pi's
+/// `ProjectRootResolution` (`agents.ts:159`), declared as `subagents.projectRootResolution` in a
+/// candidate root's own `settings.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectRootResolution {
+    /// Stop at the nearest candidate, never walking out to the repository root.
+    Nearest,
+    /// Prefer the candidate that is also the nearest enclosing git root.
+    GitRoot,
+}
+
+/// Read `subagents.projectRootResolution` out of `project_root`'s own settings file — pi
+/// `readProjectRootResolution` (`agents.ts:640-651`).
+///
+/// An absent file, an absent/non-object `subagents` block, or an absent `projectRootResolution` key
+/// all yield `Ok(None)` ("unconfigured"). Any OTHER value is malformed and MUST abort discovery with
+/// a message naming the offending file (pi throws
+/// `Subagent settings in '<path>' have invalid 'projectRootResolution'; expected 'nearest' or 'git-root'.`).
+///
+/// # Errors
+///
+/// [`SubagentError::MalformedSettings`] when the key is present with a value other than `"nearest"`
+/// or `"git-root"`, or when the settings file itself is unreadable/unparseable/not a JSON object
+/// (pi's `readSettingsFileStrict` throws on all three).
+pub fn read_project_root_resolution(
+    project_root: &Path,
+) -> Result<Option<ProjectRootResolution>, SubagentError> {
+    let settings_path = project_settings_path(project_root);
+    let raw = match std::fs::read_to_string(&settings_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Failed to read settings file '{}': {e}",
+                settings_path.display()
+            )));
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        SubagentError::MalformedSettings(format!(
+            "Failed to parse settings file '{}': {e}",
+            settings_path.display()
+        ))
+    })?;
+    if !value.is_object() {
+        return Err(SubagentError::MalformedSettings(format!(
+            "Settings file '{}' must contain a JSON object.",
+            settings_path.display()
+        )));
+    }
+    // pi: `if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return undefined;`
+    let Some(subagents) = value.get("subagents").filter(|v| v.is_object()) else {
+        return Ok(None);
+    };
+    match subagents.get("projectRootResolution") {
+        None => Ok(None),
+        Some(serde_json::Value::String(s)) if s == "nearest" => Ok(Some(ProjectRootResolution::Nearest)),
+        Some(serde_json::Value::String(s)) if s == "git-root" => Ok(Some(ProjectRootResolution::GitRoot)),
+        Some(_) => Err(SubagentError::MalformedSettings(format!(
+            "Subagent settings in '{}' have invalid 'projectRootResolution'; expected 'nearest' or 'git-root'.",
+            settings_path.display()
+        ))),
+    }
+}
+
+/// The project root every scope-resolution in this crate should use — pi
+/// `findConfiguredProjectRoot` (`agents.ts:657-672`), which is what pi's own
+/// `resolveNearestProjectAgentDirs`/`resolveNearestProjectChainDirs`/`getProjectAgentSettingsPath`/
+/// `collectPackageSubagentPaths` all call (`agents.ts:446,1684,1700,679` @v0.43.0) — NOT the bare
+/// [`find_nearest_project_root`].
+///
+/// The rule, verbatim from upstream:
+/// 1. No candidate at all → `None`.
+/// 2. The NEAREST candidate declares `projectRootResolution: "nearest"` → that candidate, full stop
+///    (the git walk never runs).
+/// 3. Otherwise, find the nearest enclosing git root and check whether it is itself one of the
+///    candidates. If it is, AND either the nearest candidate said `"git-root"` OR the git-root
+///    candidate itself says `"git-root"`, the git-root candidate wins.
+/// 4. Otherwise the nearest candidate wins.
+///
+/// Step 3's `||` is why a nested sub-project needs no configuration of its own for a repo-root
+/// `git-root` policy to pull resolution out to the repo root.
+///
+/// # Errors
+///
+/// Propagates [`read_project_root_resolution`]'s [`SubagentError::MalformedSettings`] — a malformed
+/// `projectRootResolution` at either consulted root aborts discovery (R-SA-009), it does not
+/// silently degrade to "nearest".
+pub fn find_configured_project_root(cwd: &Path) -> Result<Option<PathBuf>, SubagentError> {
+    let candidates = find_project_root_candidates(cwd);
+    let Some(nearest_root) = candidates.first() else {
+        return Ok(None);
+    };
+
+    let nearest_mode = read_project_root_resolution(nearest_root)?;
+    if nearest_mode == Some(ProjectRootResolution::Nearest) {
+        return Ok(Some(nearest_root.clone()));
+    }
+
+    // pi compares with `path.resolve(candidate) === path.resolve(gitRoot)`; both sides here are
+    // already absolute ancestor paths produced by the same walk, so plain equality is the analog.
+    let git_project_root = find_nearest_git_root(cwd)
+        .and_then(|git_root| candidates.iter().find(|c| **c == git_root).cloned());
+    if let Some(git_root) = git_project_root
+        && (nearest_mode == Some(ProjectRootResolution::GitRoot)
+            || read_project_root_resolution(&git_root)? == Some(ProjectRootResolution::GitRoot))
+    {
+        return Ok(Some(git_root));
+    }
+
+    Ok(Some(nearest_root.clone()))
+}
+
+/// The `settings.json` path for a project root (pi `path.join(getProjectConfigDir(root), "settings.json")`,
+/// `agents.ts:641,680` @v0.43.0). cyrup keys its per-scope subagent settings under `<root>/.cyrup/agents/`
+/// (the same directory that holds the scope's agent `.md` files), which is the crate's established
+/// layout — see `extension.rs::discovery_config`.
+#[must_use]
+pub fn project_settings_path(project_root: &Path) -> PathBuf {
+    project_root
+        .join(PROJECT_CONFIG_DIR_SEGMENT)
+        .join(AGENTS_SUBDIR)
+        .join("settings.json")
+}
+
 /// Project-scope agent read directories for `project_root`, **lowest-precedence first** (pi
-/// `resolveNearestProjectAgentDirs`, agents.ts:1234-1248): the legacy `<root>/.agents` dir first
+/// `resolveNearestProjectAgentDirs`, agents.ts:1683-1697): the legacy `<root>/.agents` dir first
 /// (included only when it already exists on disk), then the preferred `<root>/.cyrup/agents` dir
 /// **last** — always included because it is simultaneously the highest-precedence project read dir
 /// under the tier's last-directory-scanned-wins rule (R-SA-002) AND the create/write target
@@ -213,7 +388,7 @@ pub fn resolve_project_agent_read_dirs(project_root: &Path) -> Vec<PathBuf> {
 }
 
 /// Project-scope chain read directories for `project_root` (pi `resolveNearestProjectChainDirs`,
-/// agents.ts:1250-1259): the single preferred `<root>/.cyrup/chains` dir — a directory SEPARATE
+/// agents.ts:1699-1708): the single preferred `<root>/.cyrup/chains` dir — a directory SEPARATE
 /// from the project agents dir ([`CHAINS_SUBDIR`]).
 #[must_use]
 pub fn resolve_project_chain_read_dirs(project_root: &Path) -> Vec<PathBuf> {
@@ -221,7 +396,7 @@ pub fn resolve_project_chain_read_dirs(project_root: &Path) -> Vec<PathBuf> {
 }
 
 /// User-scope agent read directories rooted at `home`, **lowest-precedence first** (pi
-/// `discoverAgents` `userDirOld`/`userDirNew`, agents.ts:1279-1280,1301-1302): the primary
+/// `discoverAgents` `userDirOld`/`userDirNew`, agents.ts:1728-1729,1886 @v0.43.0): the primary
 /// `<home>/.cyrup/agents` dir first (always included — the create/write fallback target), then the
 /// legacy `<home>/.agents` "second" user dir **last** (included only when it already exists, so it
 /// wins the last-directory-scanned reduce only once the user actually populates it, matching pi's
@@ -238,11 +413,158 @@ pub fn resolve_user_agent_read_dirs(home: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// User-scope chain read directories rooted at `home` (pi `getUserChainDir`, agents.ts:180): the
+/// User-scope chain read directories rooted at `home` (pi `getUserChainDir`, agents.ts:220): the
 /// single `<home>/.cyrup/chains` dir — again SEPARATE from the user agents dir ([`CHAINS_SUBDIR`]).
 #[must_use]
 pub fn resolve_user_chain_read_dirs(home: &Path) -> Vec<PathBuf> {
     vec![home.join(PROJECT_CONFIG_DIR_SEGMENT).join(CHAINS_SUBDIR)]
+}
+
+// -------------------------------------------------------------------------------------------
+// Alias-aware agent-name resolution (pi `resolveAgentName`, agents.ts:511-529)
+// -------------------------------------------------------------------------------------------
+
+/// The outcome of an alias-aware name lookup — pi's `{ agent?, error? }` triple state
+/// (`agents.ts:511`), which is genuinely three-valued and must not be collapsed into an
+/// `Option`/`Result` pair:
+///
+/// * [`Self::Found`] — exactly one agent (or one canonical name across several tiers) answers.
+/// * [`Self::NotFound`] — nothing answers. Callers turn this into their own "Unknown agent"/
+///   "not found. Available: …" message, whose wording differs per call site.
+/// * [`Self::Ambiguous`] — several DISTINCT canonical names answer. This is a hard error at every
+///   call site; it is never silently resolved by picking one.
+#[derive(Clone, Debug)]
+pub enum AgentNameResolution<'a> {
+    Found(&'a AgentDefinition),
+    NotFound,
+    /// The already-formatted upstream message, e.g.
+    /// `Ambiguous agent alias 'advisor': oracle, seer`.
+    Ambiguous(String),
+}
+
+impl<'a> AgentNameResolution<'a> {
+    /// The matched agent, if any — pi's `resolved.agent`. An [`Self::Ambiguous`] outcome yields
+    /// `None`, exactly like pi's `{ error }` shape, so a caller that only cares "did this name
+    /// resolve" (pi's `Boolean(resolveAgentName(x, [agent]).agent)` membership probe,
+    /// `preflight.ts:194`) reads identically.
+    #[must_use]
+    pub fn agent(&self) -> Option<&'a AgentDefinition> {
+        match self {
+            Self::Found(agent) => Some(*agent),
+            _ => None,
+        }
+    }
+
+    /// The ambiguity message, if this is an [`Self::Ambiguous`] outcome — pi's `resolved.error`.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Self::Ambiguous(msg) => Some(msg),
+            _ => None,
+        }
+    }
+}
+
+/// pi `effectiveAgentMatch` (`agents.ts:501-509`): several matches that all carry the SAME canonical
+/// `name` are not ambiguous at all — they are the same agent seen at several tiers, so the
+/// highest-precedence source wins (`builtin` < `package` < `user` < `project`). Distinct names
+/// return `None`, which is what makes the caller raise the ambiguity error.
+fn effective_agent_match<'a>(matches: &[&'a AgentDefinition]) -> Option<&'a AgentDefinition> {
+    let first = matches.first()?;
+    if matches.iter().any(|a| a.name != first.name) {
+        return None;
+    }
+    // pi sorts DESCENDING by source rank and takes `[0]`; `max_by_key` over a stable iterator keeps
+    // the LAST maximum, and pi's `Array.prototype.sort` is likewise stable, so a descending sort
+    // followed by `[0]` keeps the FIRST element of maximal rank — hence `max_by_key` on a reversed
+    // walk, expressed here as an explicit fold that keeps the first strict maximum.
+    let mut best = *first;
+    for candidate in matches.iter().skip(1) {
+        if source_rank(candidate.source) > source_rank(best.source) {
+            best = candidate;
+        }
+    }
+    Some(best)
+}
+
+/// pi's `sourceRank` map (`agents.ts:504`).
+fn source_rank(source: AgentSource) -> u8 {
+    match source {
+        AgentSource::Builtin => 0,
+        AgentSource::Package => 1,
+        AgentSource::User => 2,
+        AgentSource::Project => 3,
+    }
+}
+
+/// Resolve a requested agent name against a candidate list, honoring aliases — a direct port of pi's
+/// `resolveAgentName` (`agents.ts:511-529`).
+///
+/// The order is **name-first, aliases only as a fallback**, and each stage handles multiplicity the
+/// same way:
+///
+/// 1. Trim the request.
+/// 2. Match `name` OR `local_name` exactly. One hit wins. Several hits collapse via
+///    [`effective_agent_match`] when they are the same canonical agent at different tiers; otherwise
+///    it is `Ambiguous agent name '<request>': <names…>`.
+/// 3. Only if stage 2 matched NOTHING, match against [`AgentDefinition::aliases`]. Same
+///    one/collapse/ambiguous handling, with the message `Ambiguous agent alias '<request>': <names…>`.
+/// 4. Nothing matched → [`AgentNameResolution::NotFound`].
+///
+/// Stage 3 never runs when stage 2 found anything, so a real agent named `x` always beats another
+/// agent that merely lists `x` as an alias — aliases can never shadow a canonical name.
+///
+/// The ambiguity messages list the matches' `name`s **in candidate order** (pi's
+/// `exact.map(a => a.name).join(", ")` over the unsorted filter result), duplicates included, which
+/// is what upstream prints.
+#[must_use]
+pub fn resolve_agent_name<'a>(
+    name: &str,
+    agents: &'a [AgentDefinition],
+) -> AgentNameResolution<'a> {
+    let raw = name.trim();
+
+    let exact: Vec<&AgentDefinition> = agents
+        .iter()
+        .filter(|a| a.name == raw || a.local_name == raw)
+        .collect();
+    if exact.len() == 1
+        && let Some(agent) = exact.first().copied()
+    {
+        return AgentNameResolution::Found(agent);
+    }
+    if exact.len() > 1 {
+        if let Some(agent) = effective_agent_match(&exact) {
+            return AgentNameResolution::Found(agent);
+        }
+        return AgentNameResolution::Ambiguous(format!(
+            "Ambiguous agent name '{name}': {}",
+            join_match_names(&exact)
+        ));
+    }
+
+    let aliased: Vec<&AgentDefinition> =
+        agents.iter().filter(|a| a.aliases.iter().any(|al| al == raw)).collect();
+    if aliased.len() == 1
+        && let Some(agent) = aliased.first().copied()
+    {
+        return AgentNameResolution::Found(agent);
+    }
+    if aliased.len() > 1 {
+        if let Some(agent) = effective_agent_match(&aliased) {
+            return AgentNameResolution::Found(agent);
+        }
+        return AgentNameResolution::Ambiguous(format!(
+            "Ambiguous agent alias '{name}': {}",
+            join_match_names(&aliased)
+        ));
+    }
+
+    AgentNameResolution::NotFound
+}
+
+fn join_match_names(matches: &[&AgentDefinition]) -> String {
+    matches.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 // -------------------------------------------------------------------------------------------
@@ -317,7 +639,7 @@ impl AgentDiscoveryConfig {
     /// last-directory-scanned-wins User tier rule lets an ordinary user directory's same-named
     /// agent win over an extra directory's, matching pi-subagents'
     /// `[...userAgentsExtra, ...userAgentsOld, ...userAgentsNew]` placement for
-    /// `PI_SUBAGENT_EXTRA_AGENT_DIRS` (agents.ts:1300-1304). Extras are therefore the
+    /// `PI_SUBAGENT_EXTRA_AGENT_DIRS` (agents.ts:1752-1756). Extras are therefore the
     /// **lowest-precedence** User-tier stream (a read-only fallback), never an override of the
     /// user's own agents. A no-op when the variable is absent or empty.
     #[must_use]
@@ -378,9 +700,16 @@ pub fn parse_subagent_settings(
     let Some(value) = raw else {
         return Ok(SubagentSettings::default());
     };
+    // pi validates `defaultThinking`/`defaultExtensions` with bespoke, FIELD-NAMING checks against
+    // the raw object (`agents.ts:882-897`), and a wrong TYPE (not merely a wrong value) is one of
+    // the cases it names. That has to happen BEFORE serde touches the object: serde's derived impl
+    // fails the whole struct with `invalid type: integer \`7\`, expected a string`, which names no
+    // field and is useless for finding the offending line in a settings file.
+    validate_default_thinking(value)?;
+    validate_default_extensions(value)?;
     let mut settings: SubagentSettings = serde_json::from_value(value.clone())
         .map_err(|e| SubagentError::MalformedSettings(e.to_string()))?;
-    // pi `readSubagentSettings` (`agents.ts:695-702`): `defaultModel` must be a NON-EMPTY string;
+    // pi `readSubagentSettings` (`agents.ts:874-881`): `defaultModel` must be a NON-EMPTY string;
     // an empty/whitespace-only value is malformed and MUST abort (R-SA-009). Stored trimmed so a
     // stray-whitespace value resolves to the same model everywhere it is consulted.
     if let Some(dm) = settings.default_model.as_ref() {
@@ -394,6 +723,18 @@ pub fn parse_subagent_settings(
             settings.default_model = Some(trimmed.to_string());
         }
     }
+    // Both are stored TRIMMED (pi's `.trim()` in `agents.ts:885,896` @v0.43.0) so a stray-whitespace value
+    // resolves identically everywhere it is consulted.
+    if let Some(dt) = settings.default_thinking.as_ref() {
+        let trimmed = dt.trim();
+        if trimmed.len() != dt.len() {
+            settings.default_thinking = Some(trimmed.to_string());
+        }
+    }
+    if let Some(de) = settings.default_extensions.as_ref() {
+        settings.default_extensions =
+            Some(de.iter().map(|item| item.trim().to_string()).collect());
+    }
     // pi `parseModelScopeConfig(subagentsObject.modelScope, { filePath })` (`agents.ts:731`):
     // `modelScope` is validated by its own parser (not serde's derive), so a malformed block
     // ABORTS discovery per R-SA-009 with a field-naming diagnostic. `SubagentSettings` carries the
@@ -405,8 +746,50 @@ pub fn parse_subagent_settings(
     Ok(settings)
 }
 
+
+/// pi `readSubagentSettings`'s `defaultThinking` gate (`agents.ts:882-889`):
+///
+/// ```text
+/// if ("defaultThinking" in subagentsObject) {
+///   if (typeof ... === "string" && ....trim()) defaultThinking = ....trim();
+///   else throw new Error(`... have invalid 'defaultThinking'; expected a non-empty string.`);
+/// }
+/// ```
+///
+/// The guard is key PRESENCE, so `null`, a number, and `"   "` all throw; only an absent key is
+/// silent.
+fn validate_default_thinking(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(value) = subagents.get("defaultThinking") else {
+        return Ok(());
+    };
+    if value.as_str().is_some_and(|s| !s.trim().is_empty()) {
+        return Ok(());
+    }
+    Err(SubagentError::MalformedSettings(
+        "invalid 'defaultThinking'; expected a non-empty string".to_string(),
+    ))
+}
+
+/// pi `readSubagentSettings`'s `defaultExtensions` gate (`agents.ts:890-897`): the value must be an
+/// ARRAY whose every entry is a non-empty string. An EMPTY array is legal — pi's `.some(...)` guard
+/// passes vacuously — and means "no extensions", which is distinct from an absent key.
+fn validate_default_extensions(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(value) = subagents.get("defaultExtensions") else {
+        return Ok(());
+    };
+    let ok = value.as_array().is_some_and(|items| {
+        items.iter().all(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))
+    });
+    if ok {
+        return Ok(());
+    }
+    Err(SubagentError::MalformedSettings(
+        "invalid 'defaultExtensions'; expected an array of non-empty strings".to_string(),
+    ))
+}
+
 /// Read one on-disk `settings.json` file and extract its typed `subagents` block (pi
-/// `readSubagentSettings`, `agents.ts:672-714`). Mirrors pi's outcome taxonomy:
+/// `readSubagentSettings`, `agents.ts:851-919`). Mirrors pi's outcome taxonomy:
 /// - an **absent** file yields the all-default [`SubagentSettings`] (the common "no customization"
 ///   case — NOT an error);
 /// - a file that cannot be read, does not parse as JSON, or is not a JSON object aborts with
@@ -456,7 +839,7 @@ pub fn read_subagent_settings_file(path: &Path) -> Result<SubagentSettings, Suba
 
 /// Read and layer the user-scope and project-scope `settings.json` `subagents` blocks into one
 /// resolved [`SubagentSettings`] (pi's two `readSubagentSettings(...)` calls plus the
-/// project-over-user resolution `discoverAgents` performs inline, `agents.ts:1282-1286` +
+/// project-over-user resolution `discoverAgents` performs inline, `agents.ts:1731-1735` +
 /// `716-728`). Resolution (R-SA-012/R-SA-133):
 /// - per-agent `agentOverrides.<name>`: the **project** entry wins over a same-named **user** entry
 ///   (only one is ever applied to a given agent name);
@@ -520,9 +903,13 @@ fn resolve_layered_subagent_settings(
     SubagentSettings {
         overrides,
         default_model: project.default_model.or(user.default_model),
+        // pi `resolveSubagentDefaultThinking`/`resolveSubagentDefaultExtensions`
+        // (`agents.ts:946-973`) — project-wins-outright, exactly like `defaultModel`.
+        default_thinking: project.default_thinking.or(user.default_thinking),
+        default_extensions: project.default_extensions.or(user.default_extensions),
         disable_builtins: project.disable_builtins.or(user.disable_builtins),
         disable_thinking: project.disable_thinking.or(user.disable_thinking),
-        // pi `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1404`) — the same
+        // pi `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1738`) — the same
         // project-wins-outright rule [`LayeredOverrideSettings::model_scope`] applies.
         model_scope: project.model_scope.or(user.model_scope),
     }
@@ -531,6 +918,44 @@ fn resolve_layered_subagent_settings(
 // -------------------------------------------------------------------------------------------
 // Directory-walk (R-SA-004/005/006/007): User/Project agent-file scanning
 // -------------------------------------------------------------------------------------------
+
+/// Directory basenames a discovery walk never descends into (pi `DISCOVERY_PRUNED_DIR_NAMES`,
+/// `agents.ts:1373`).
+const DISCOVERY_PRUNED_DIR_NAMES: &[&str] = &[".git", "node_modules"];
+
+/// pi `isDiscoveryNestedProjectRoot` (`agents.ts:1375-1377`): a directory that carries a project
+/// config dir (`getProjectConfigDir`, cyrup's [`PROJECT_CONFIG_DIR_SEGMENT`]) or a
+/// [`LEGACY_AGENTS_DIR_SEGMENT`] dir is somebody ELSE's project root.
+fn is_discovery_nested_project_root(dir: &Path) -> bool {
+    dir.join(PROJECT_CONFIG_DIR_SEGMENT).is_dir() || dir.join(LEGACY_AGENTS_DIR_SEGMENT).is_dir()
+}
+
+/// pi `shouldPruneDiscoveryDir` (`agents.ts:1379-1383`) — whether a discovery walk rooted at
+/// `root` must NOT descend into the child directory `dir` (basename `dir_name`).
+///
+/// Three reasons, in pi's order:
+///
+/// 1. the basename is `.git` or `node_modules` — object stores and dependency trees hold no agent
+///    files, and a `node_modules` walk is unbounded work on every discovery pass (a vendored
+///    package that ships its own `*.md` would also be silently discovered as an agent);
+/// 2. the directory contains a `.git` entry — a nested repository or submodule, i.e. a different
+///    project's content that happens to live inside this tree;
+/// 3. the directory is a nested PROJECT ROOT of its own (`.cyrup/` or `.agents/`) and is not the
+///    walk root itself — its agents belong to that project's own discovery, at that project's own
+///    scope, and hoisting them into this walk would let a checked-out sibling repo redefine this
+///    repo's agent names.
+///
+/// Never applied to `root` itself: reason 3 is explicitly gated on `dir != root` (pi's
+/// `path.resolve(dir) !== path.resolve(rootDir)`) so a walk rooted at a project root still scans.
+pub(crate) fn should_prune_discovery_dir(root: &Path, dir: &Path, dir_name: &str) -> bool {
+    if DISCOVERY_PRUNED_DIR_NAMES.contains(&dir_name) {
+        return true;
+    }
+    if dir.join(".git").exists() {
+        return true;
+    }
+    dir != root && is_discovery_nested_project_root(dir)
+}
 
 /// Recursively walk `root` for agent `.md` files, alphabetical-by-filename, depth-first
 /// (R-SA-004), excluding any subtree rooted at a directory segment literally named
@@ -548,11 +973,16 @@ fn resolve_layered_subagent_settings(
 /// collision winners once handed to `merge::reduce_last_seen_wins`/`reduce_first_seen_wins`).
 pub fn walk_agent_dir(root: &Path, source: AgentSource) -> Vec<AgentDefinition> {
     let mut out = Vec::new();
-    walk_agent_dir_into(root, source, &mut out);
+    walk_agent_dir_into(root, root, source, &mut out);
     out
 }
 
-fn walk_agent_dir_into(dir: &Path, source: AgentSource, out: &mut Vec<AgentDefinition>) {
+fn walk_agent_dir_into(
+    root: &Path,
+    dir: &Path,
+    source: AgentSource,
+    out: &mut Vec<AgentDefinition>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -569,7 +999,12 @@ fn walk_agent_dir_into(dir: &Path, source: AgentSource, out: &mut Vec<AgentDefin
             if file_name == SKILLS_DIR_SEGMENT {
                 continue;
             }
-            walk_agent_dir_into(&path, source, out);
+            // pi `listFilesRecursive` (`agents.ts:1399`): `.git`/`node_modules`, nested
+            // repositories and nested project roots are pruned, not walked.
+            if should_prune_discovery_dir(root, &path, file_name) {
+                continue;
+            }
+            walk_agent_dir_into(root, &path, source, out);
             continue;
         }
 
@@ -792,13 +1227,13 @@ pub struct AgentDiscoveryResult {
     /// discovery of sibling files.
     pub diagnostics: Vec<ChainDiscoveryDiagnostic>,
     /// The effective `subagents.modelScope` policy for this discovery's cwd (pi `discoverAgents`'s
-    /// own returned `modelScope`, `agents.ts:1404/1446`): project scope wins over user, `None` =
+    /// own returned `modelScope`, `agents.ts:1738/1446`): project scope wins over user, `None` =
     /// no policy configured, so model-scope enforcement is off.
     pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
 }
 
 /// The **raw, unmerged** four-tier agent scan — the shape pi's `discoverAgentsAll` hands back as
-/// its separate `d.builtin` / `d.package` / `d.user` / `d.project` arrays (`agents.ts:1325-1422`),
+/// its separate `d.builtin` / `d.package` / `d.user` / `d.project` arrays (`agents.ts:1783-1888`),
 /// BEFORE any cross-tier precedence merge or settings-override application.
 ///
 /// [`discover_agents_all`] deliberately returns the *merged* view (one precedence-winner per name,
@@ -822,7 +1257,7 @@ fn scan_agent_tiers_scoped(cfg: &AgentDiscoveryConfig, scope: AgentReadScope) ->
     let builtin = scan_builtin_agents(cfg);
     let package = scan_package_agents(cfg);
     // Scope-filtered discovery (R-SA-013; pi `discoverAgents` + `mergeAgentsForScope`,
-    // agents.ts:1300-1320, agent-selection.ts): narrow the User-vs-Project axis **within each
+    // agents.ts:1752-1778, agent-selection.ts): narrow the User-vs-Project axis **within each
     // tier, BEFORE the merge** — never merge-all-then-filter. Zeroing the excluded tier's
     // candidates up front means a Project agent can never dedup-shadow a same-named User agent out
     // of the User-scope view (the bug a post-merge scope filter has: the merge would keep only the
@@ -885,7 +1320,7 @@ fn run_discovery(
         agents,
         chains,
         diagnostics,
-        // pi `discoverAgents` returns `{ agents, projectAgentsDir, modelScope }` (`agents.ts:1446`)
+        // pi `discoverAgents` returns `{ agents, projectAgentsDir, modelScope }` (`agents.ts:1727-1781`)
         // — the effective policy travels WITH the discovery result so an execution path that
         // already discovered the agent does not have to re-read settings to learn the scope.
         model_scope: cfg.override_settings.model_scope(),
@@ -905,7 +1340,7 @@ fn run_discovery(
 /// violates it by never caching anything itself.
 pub fn discover_agents_all(cfg: &AgentDiscoveryConfig) -> Result<AgentDiscoveryResult, SubagentError> {
     // Management/introspection is always the full Both-scope view (pi `discoverAgentsAll` loads
-    // every tier unconditionally, agents.ts:1325-1422); scope narrowing is a delegation-only
+    // every tier unconditionally, agents.ts:1783-1888); scope narrowing is a delegation-only
     // concern applied by `discover_agents`.
     let mut result = run_discovery(cfg, AgentReadScope::Both)?;
     result.agents = AgentVisibility::management(&result.agents)
@@ -956,8 +1391,8 @@ pub fn discover_agents(
 /// Resolve one saved chain by exact name (R-SA-008-style equality) across every discovered scope,
 /// applying pi's run-time cross-scope precedence: on a same-name collision the highest-precedence
 /// scope wins, in the order Project > User > Package > Builtin. This mirrors pi's
-/// `discoverSavedChains` (slash-commands.ts:171-177,1040), which feeds `discoverAgentsAll`'s
-/// `[...package, ...user, ...project]` chain array (agents.ts:1409-1413) into a name-keyed `Map`
+/// `discoverSavedChains` (slash-commands.ts:172-177 @v0.34.0), which feeds `discoverAgentsAll`'s
+/// `[...package, ...user, ...project]` chain array (agents.ts:1875-1879) into a name-keyed `Map`
 /// whose last write wins — so the project-scope chain (emitted last) is the one actually run.
 /// cyrup deliberately RETAINS every scope's same-named chain in [`AgentDiscoveryResult::chains`]
 /// (R-SA-015, never merged across scopes) for management/doctor visibility, so this run-time
@@ -1035,7 +1470,7 @@ mod tests {
     #[test]
     fn with_prepended_user_extras_puts_extras_first_so_primary_user_dirs_win_last() {
         // pi loads PI_SUBAGENT_EXTRA_AGENT_DIRS agents FIRST (lowest precedence), then the user's
-        // own agent dirs (agents.ts:1300-1304), so under the User tier's last-directory-scanned-
+        // own agent dirs (agents.ts:1752-1756), so under the User tier's last-directory-scanned-
         // wins reduce (R-SA-002) the user's own agent wins over a bundled extra-dir agent of the
         // same name. A prior bug appended extras AFTER the user dirs, inverting this.
         let primary = PathBuf::from("/home/user/.cyrup/agents");
@@ -1323,6 +1758,131 @@ mod tests {
     fn missing_scan_root_yields_empty_result_not_error() {
         let discovered = walk_agent_dir(Path::new("/does/not/exist/at/all"), AgentSource::User);
         assert!(discovered.is_empty());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // G102: discovery pruning (pi `shouldPruneDiscoveryDir`, agents.ts:1373-1409)
+    // -----------------------------------------------------------------------------------------
+
+    /// Build the tree every real repository actually has: a `.git` object store, a
+    /// `node_modules/` with a vendored package that ships `.md` files, a git SUBMODULE (a plain
+    /// directory containing a `.git` entry), and a checked-out sibling project with its own
+    /// `.cyrup/` and `.agents/` roots. Only `wanted.md` at the top belongs to THIS walk.
+    fn seed_prunable_tree(root: &Path) {
+        write_agent(root, "wanted.md", "wanted", "the only agent this walk owns");
+        write_agent(&root.join(".git"), "gitobj.md", "gitobj", "git internals");
+        write_agent(
+            &root.join("node_modules").join("some-pkg"),
+            "vendored.md",
+            "vendored",
+            "a dependency's own markdown",
+        );
+
+        let submodule = root.join("vendor").join("submodule");
+        write_agent(&submodule, "submodule.md", "submodule", "another repo");
+        std::fs::write(submodule.join(".git"), "gitdir: ../../.git/modules/x\n")
+            .expect("write submodule .git file");
+
+        let sibling = root.join("sibling-project");
+        write_agent(&sibling, "sibling.md", "sibling", "another project's agent");
+        std::fs::create_dir_all(sibling.join(PROJECT_CONFIG_DIR_SEGMENT)).expect("mkdir .cyrup");
+
+        let legacy = root.join("legacy-project");
+        write_agent(&legacy, "legacy.md", "legacy", "a legacy-layout project");
+        std::fs::create_dir_all(legacy.join(LEGACY_AGENTS_DIR_SEGMENT)).expect("mkdir .agents");
+    }
+
+    #[test]
+    fn the_agent_walk_prunes_git_node_modules_submodules_and_nested_project_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_prunable_tree(tmp.path());
+
+        let names: Vec<String> = walk_agent_dir(tmp.path(), AgentSource::Project)
+            .into_iter()
+            .map(|a| a.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["wanted".to_string()],
+            "a discovery walk must not adopt another project's (or a dependency's) agents"
+        );
+    }
+
+    /// The walk root itself is exempt (pi's `path.resolve(dir) !== path.resolve(rootDir)` gate):
+    /// scanning a directory that IS a project root must still find its agents.
+    #[test]
+    fn the_walk_root_is_never_pruned_by_its_own_project_markers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(PROJECT_CONFIG_DIR_SEGMENT)).expect("mkdir");
+        std::fs::create_dir_all(tmp.path().join(LEGACY_AGENTS_DIR_SEGMENT)).expect("mkdir");
+        write_agent(tmp.path(), "own.md", "own", "this project's own agent");
+
+        let names: Vec<String> = walk_agent_dir(tmp.path(), AgentSource::Project)
+            .into_iter()
+            .map(|a| a.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["own".to_string()]);
+
+        // And directly at the predicate, since the walk only ever applies it to CHILD directories:
+        // the `dir != root` clause is what keeps the self-rooted case answering "do not prune".
+        assert!(
+            !should_prune_discovery_dir(tmp.path(), tmp.path(), "whatever-its-basename-is"),
+            "a walk root is exempt from the nested-project-root rule (pi's \
+             `path.resolve(dir) !== path.resolve(rootDir)`)"
+        );
+        let child = tmp.path().join("sibling");
+        std::fs::create_dir_all(child.join(PROJECT_CONFIG_DIR_SEGMENT)).expect("mkdir");
+        assert!(
+            should_prune_discovery_dir(tmp.path(), &child, "sibling"),
+            "the identical markers on a CHILD directory do prune it"
+        );
+    }
+
+    /// The user action end to end: a `/subagents` listing (or any agent lookup) runs
+    /// [`discover_agents`] over the project's agent dirs. Point one at a real repo-shaped tree and
+    /// the vendored/sibling-project agents must not appear in the delegatable set.
+    #[test]
+    fn discover_agents_does_not_list_vendored_or_sibling_project_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_prunable_tree(tmp.path());
+
+        let cfg = AgentDiscoveryConfig {
+            user_agent_dirs: vec![tmp.path().to_path_buf()],
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents(&cfg, None).expect("discovery succeeds");
+        let discovered: Vec<&str> = result.agents.iter().map(|a| a.name.as_str()).collect();
+
+        assert!(discovered.contains(&"wanted"), "{discovered:?}");
+        for stranger in ["vendored", "submodule", "sibling", "legacy", "gitobj"] {
+            assert!(
+                !discovered.contains(&stranger),
+                "`{stranger}` belongs to another tree and must not be delegatable here: \
+                 {discovered:?}"
+            );
+        }
+    }
+
+    /// pi shares ONE `listFilesRecursive` between the agent walk and the chain walk, so the prune
+    /// set must apply identically to chains — an unpruned chain walk would still descend
+    /// `node_modules`.
+    #[test]
+    fn the_chain_walk_prunes_the_same_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let chain = |name: &str| {
+            format!("---\nname: {name}\ndescription: d\n---\n\n## scout\n\nlook around.\n")
+        };
+        std::fs::write(tmp.path().join("wanted.chain.md"), chain("wanted")).expect("write");
+        let vendored = tmp.path().join("node_modules").join("some-pkg");
+        std::fs::create_dir_all(&vendored).expect("mkdir");
+        std::fs::write(vendored.join("vendored.chain.md"), chain("vendored")).expect("write");
+        let sibling = tmp.path().join("sibling-project");
+        std::fs::create_dir_all(sibling.join(PROJECT_CONFIG_DIR_SEGMENT)).expect("mkdir");
+        std::fs::write(sibling.join("sibling.chain.md"), chain("sibling")).expect("write");
+
+        let scanned = chains::scan_chain_dir(tmp.path(), AgentSource::Project);
+        let names: Vec<String> = scanned.chains.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(names, vec!["wanted".to_string()]);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1782,6 +2342,465 @@ mod tests {
     // R-SA-019: discovery is re-scanned per call (no cache) — a second call observes a
     // filesystem change made between calls.
     // -----------------------------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------------------------
+    // G97 — alias-aware name resolution (pi `resolveAgentName`, agents.ts:511-529)
+    // -----------------------------------------------------------------------------------------
+
+    fn parsed_agent(source: AgentSource, frontmatter: &str) -> AgentDefinition {
+        crate::discovery::frontmatter::parse_agent_file(
+            frontmatter,
+            source,
+            Path::new("/tmp/fixture.md"),
+        )
+        .expect("fixture parses")
+    }
+
+    /// `aliases:` is parsed off the agent's own frontmatter, comma- or block-list shaped, with pi's
+    /// `normalizeAgentAliases` normalization applied (`agents.ts:495-499,1516` @v0.43.0).
+    #[test]
+    fn aliases_frontmatter_is_parsed_trimmed_deduped_and_self_filtered() {
+        let agent = parsed_agent(
+            AgentSource::Builtin,
+            "---\nname: worker\ndescription: Implementation agent\naliases: developer, coder, implementer, develop\n---\n\nBody\n",
+        );
+        assert_eq!(agent.aliases, vec!["developer", "coder", "implementer", "develop"]);
+
+        // trim + drop empties + de-duplicate (first occurrence wins) + drop the agent's own name.
+        let messy = parsed_agent(
+            AgentSource::Builtin,
+            "---\nname: oracle\ndescription: d\naliases:   advisor ,, advisor , oracle , seer \n---\n\nBody\n",
+        );
+        assert_eq!(messy.aliases, vec!["advisor", "seer"]);
+
+        // Block-list syntax goes through the same `parseFrontmatterList`.
+        let block = parsed_agent(
+            AgentSource::Builtin,
+            "---\nname: oracle\ndescription: d\naliases:\n  - advisor\n  - seer\n---\n\nBody\n",
+        );
+        assert_eq!(block.aliases, vec!["advisor", "seer"]);
+    }
+
+    /// pi reads `frontmatter.aliases ?? frontmatter.alias` (`agents.ts:1516`) — the PLURAL key wins
+    /// whenever it is present at all, and the singular is the fallback.
+    #[test]
+    fn singular_alias_key_is_the_fallback_and_plural_wins_when_both_are_present() {
+        let singular = parsed_agent(
+            AgentSource::Builtin,
+            "---\nname: oracle\ndescription: d\nalias: advisor\n---\n\nBody\n",
+        );
+        assert_eq!(singular.aliases, vec!["advisor"]);
+
+        let both = parsed_agent(
+            AgentSource::Builtin,
+            "---\nname: oracle\ndescription: d\naliases: advisor\nalias: seer\n---\n\nBody\n",
+        );
+        assert_eq!(both.aliases, vec!["advisor"], "the plural key must win outright");
+    }
+
+    /// An unqualified `aliases:` on a PACKAGED agent is normalized against the RUNTIME name
+    /// (`buildRuntimeName(localName, packageName)`, `agents.ts:1507,1516`), not the local one.
+    #[test]
+    fn aliases_are_normalized_against_the_qualified_runtime_name() {
+        let agent = parsed_agent(
+            AgentSource::Package,
+            "---\nname: oracle\npackage: acme\ndescription: d\naliases: acme.oracle, oracle, advisor\n---\n\nBody\n",
+        );
+        assert_eq!(agent.name, "acme.oracle");
+        // `acme.oracle` == the runtime name and is dropped; the bare `oracle` is NOT the runtime
+        // name here, so it survives as a genuine alias.
+        assert_eq!(agent.aliases, vec!["oracle", "advisor"]);
+    }
+
+    #[test]
+    fn an_alias_resolves_to_its_agent_and_an_exact_name_still_wins() {
+        let agents = vec![
+            parsed_agent(
+                AgentSource::Builtin,
+                "---\nname: oracle\ndescription: d\naliases: advisor\n---\n\nBody\n",
+            ),
+            parsed_agent(AgentSource::Builtin, "---\nname: scout\ndescription: d\n---\n\nBody\n"),
+        ];
+        let resolved = resolve_agent_name("advisor", &agents);
+        assert_eq!(resolved.agent().map(|a| a.name.as_str()), Some("oracle"));
+        // Whitespace around the request is trimmed (`agents.ts:512`).
+        assert_eq!(
+            resolve_agent_name("  advisor  ", &agents).agent().map(|a| a.name.as_str()),
+            Some("oracle")
+        );
+        assert_eq!(
+            resolve_agent_name("scout", &agents).agent().map(|a| a.name.as_str()),
+            Some("scout")
+        );
+        assert!(matches!(resolve_agent_name("nobody", &agents), AgentNameResolution::NotFound));
+    }
+
+    /// Stage 3 only runs when stage 2 matched NOTHING (`agents.ts:513-521`), so a real agent named
+    /// `x` always beats another agent that merely lists `x` as an alias.
+    #[test]
+    fn a_real_name_beats_another_agents_alias_of_the_same_string() {
+        let agents = vec![
+            parsed_agent(
+                AgentSource::Builtin,
+                "---\nname: oracle\ndescription: d\naliases: advisor\n---\n\nBody\n",
+            ),
+            parsed_agent(AgentSource::User, "---\nname: advisor\ndescription: d\n---\n\nBody\n"),
+        ];
+        assert_eq!(
+            resolve_agent_name("advisor", &agents).agent().map(|a| a.name.as_str()),
+            Some("advisor"),
+            "the exact-name stage must short-circuit before the alias stage"
+        );
+    }
+
+    /// pi `effectiveAgentMatch` (`agents.ts:501-509`): several matches carrying the SAME canonical
+    /// name are one agent seen at several tiers, so the highest-precedence source wins rather than
+    /// the call erroring.
+    #[test]
+    fn several_tiers_of_the_same_canonical_name_collapse_by_source_precedence() {
+        let agents = vec![
+            parsed_agent(
+                AgentSource::Builtin,
+                "---\nname: oracle\ndescription: builtin\naliases: advisor\n---\n\nBody\n",
+            ),
+            parsed_agent(
+                AgentSource::Project,
+                "---\nname: oracle\ndescription: project\naliases: advisor\n---\n\nBody\n",
+            ),
+            parsed_agent(
+                AgentSource::User,
+                "---\nname: oracle\ndescription: user\naliases: advisor\n---\n\nBody\n",
+            ),
+        ];
+        assert_eq!(
+            resolve_agent_name("oracle", &agents).agent().map(|a| a.description.as_str()),
+            Some("project"),
+            "project (rank 3) beats user (2) beats builtin (0)"
+        );
+        assert_eq!(
+            resolve_agent_name("advisor", &agents).agent().map(|a| a.description.as_str()),
+            Some("project"),
+            "the same collapse applies on the ALIAS stage"
+        );
+    }
+
+    /// A non-unique ALIAS spanning two distinct canonical names is a hard error naming both — never
+    /// an arbitrary pick (`agents.ts:523-527`).
+    #[test]
+    fn an_alias_claimed_by_two_distinct_agents_is_an_ambiguity_error() {
+        let agents = vec![
+            parsed_agent(
+                AgentSource::Builtin,
+                "---\nname: oracle\ndescription: d\naliases: advisor\n---\n\nBody\n",
+            ),
+            parsed_agent(
+                AgentSource::User,
+                "---\nname: seer\ndescription: d\naliases: advisor\n---\n\nBody\n",
+            ),
+        ];
+        let resolved = resolve_agent_name("advisor", &agents);
+        assert!(resolved.agent().is_none(), "an ambiguous alias must resolve to nothing");
+        assert_eq!(resolved.error(), Some("Ambiguous agent alias 'advisor': oracle, seer"));
+    }
+
+    /// The same rule on the NAME stage, with pi's distinct `Ambiguous agent name` wording
+    /// (`agents.ts:518`): a `localName` collision across two differently-qualified agents.
+    #[test]
+    fn two_distinct_agents_sharing_a_local_name_are_an_ambiguity_error() {
+        let agents = vec![
+            parsed_agent(
+                AgentSource::Package,
+                "---\nname: oracle\npackage: acme\ndescription: d\n---\n\nBody\n",
+            ),
+            parsed_agent(
+                AgentSource::Package,
+                "---\nname: oracle\npackage: other\ndescription: d\n---\n\nBody\n",
+            ),
+        ];
+        let resolved = resolve_agent_name("oracle", &agents);
+        assert!(resolved.agent().is_none());
+        assert_eq!(
+            resolved.error(),
+            Some("Ambiguous agent name 'oracle': acme.oracle, other.oracle")
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // G101 — subagents.defaultThinking / defaultExtensions / projectRootResolution
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn parse_subagent_settings_reads_and_trims_default_thinking_and_default_extensions() {
+        let raw = serde_json::json!({
+            "defaultThinking": "  high  ",
+            "defaultExtensions": ["  ./ext-a.ts ", "ext-b"],
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("valid");
+        assert_eq!(settings.default_thinking.as_deref(), Some("high"));
+        assert_eq!(
+            settings.default_extensions,
+            Some(vec!["./ext-a.ts".to_string(), "ext-b".to_string()])
+        );
+    }
+
+    /// pi `agents.ts:882-897` — both fields MUST abort discovery when malformed (R-SA-009), never
+    /// degrade to "unset".
+    #[test]
+    fn parse_subagent_settings_rejects_malformed_default_thinking_and_default_extensions() {
+        for raw in [
+            serde_json::json!({ "defaultThinking": "   " }),
+            serde_json::json!({ "defaultThinking": 7 }),
+        ] {
+            let err = parse_subagent_settings(Some(&raw)).expect_err("must abort");
+            assert!(
+                matches!(&err, SubagentError::MalformedSettings(m) if m.contains("defaultThinking")),
+                "expected a defaultThinking diagnostic, got: {err}"
+            );
+        }
+        for raw in [
+            serde_json::json!({ "defaultExtensions": ["ok", "  "] }),
+            serde_json::json!({ "defaultExtensions": "not-an-array" }),
+            serde_json::json!({ "defaultExtensions": [1] }),
+        ] {
+            let err = parse_subagent_settings(Some(&raw)).expect_err("must abort");
+            assert!(
+                matches!(&err, SubagentError::MalformedSettings(m) if m.contains("defaultExtensions")),
+                "expected a defaultExtensions diagnostic, got: {err}"
+            );
+        }
+        // An EMPTY array is legal (pi's `.some(...)` guard passes vacuously) and means "no
+        // extensions" — distinct from an absent key.
+        let empty = parse_subagent_settings(Some(&serde_json::json!({ "defaultExtensions": [] })))
+            .expect("an empty defaultExtensions array is valid");
+        assert_eq!(empty.default_extensions, Some(Vec::new()));
+    }
+
+    /// The end-to-end fill, through the real discovery pipeline: an agent that declares neither
+    /// `thinking:` nor `extensions:` inherits both settings defaults; one that declares either keeps
+    /// its own (pi `applySubagentDefaultThinking`/`applySubagentDefaultExtensions`,
+    /// `agents.ts:955-984`).
+    #[test]
+    fn default_thinking_and_default_extensions_fill_only_unset_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("mkdir");
+        std::fs::write(
+            agents_dir.join("bare.md"),
+            "---\nname: bare\ndescription: no thinking, no extensions\n---\n\nBody\n",
+        )
+        .expect("write");
+        std::fs::write(
+            agents_dir.join("opinionated.md"),
+            "---\nname: opinionated\ndescription: d\nthinking: off\nextensions: own-ext\n---\n\nBody\n",
+        )
+        .expect("write");
+
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"subagents":{"defaultThinking":"high","defaultExtensions":["shared-ext"]}}"#,
+        )
+        .expect("write settings");
+
+        let cfg = AgentDiscoveryConfig {
+            user_agent_dirs: vec![agents_dir],
+            override_settings: load_layered_override_settings(&settings_path, None)
+                .expect("settings load"),
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents_all(&cfg).expect("discovery succeeds");
+        let by_name =
+            |n: &str| result.agents.iter().find(|a| a.name == n).expect("agent is discovered");
+
+        let bare = by_name("bare");
+        assert_eq!(bare.thinking.as_deref(), Some("high"));
+        assert_eq!(bare.extensions.as_deref(), Some(["shared-ext".to_string()].as_slice()));
+        assert!(
+            bare.extensions_from_default,
+            "a settings-supplied extension list must be flagged so management never bakes it into \
+             the agent file"
+        );
+
+        let opinionated = by_name("opinionated");
+        assert_eq!(
+            opinionated.thinking.as_deref(),
+            Some("off"),
+            "an EXPLICIT `thinking: off` is set, not unset — the default must not re-arm it"
+        );
+        assert_eq!(opinionated.extensions.as_deref(), Some(["own-ext".to_string()].as_slice()));
+        assert!(!opinionated.extensions_from_default);
+    }
+
+    /// Project scope wins outright over user scope for both defaults (pi
+    /// `resolveSubagentDefaultThinking`/`resolveSubagentDefaultExtensions`, `agents.ts:946-973`).
+    #[test]
+    fn project_scope_default_thinking_and_extensions_beat_the_user_scope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("mkdir");
+        std::fs::write(agents_dir.join("bare.md"), "---\nname: bare\ndescription: d\n---\n\nBody\n")
+            .expect("write");
+
+        let user = tmp.path().join("user-settings.json");
+        let project = tmp.path().join("project-settings.json");
+        std::fs::write(
+            &user,
+            r#"{"subagents":{"defaultThinking":"low","defaultExtensions":["user-ext"]}}"#,
+        )
+        .expect("write");
+        std::fs::write(
+            &project,
+            r#"{"subagents":{"defaultThinking":"high","defaultExtensions":["project-ext"]}}"#,
+        )
+        .expect("write");
+
+        let cfg = AgentDiscoveryConfig {
+            user_agent_dirs: vec![agents_dir],
+            override_settings: load_layered_override_settings(&user, Some(&project))
+                .expect("settings load"),
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents_all(&cfg).expect("discovery succeeds");
+        let bare = result.agents.iter().find(|a| a.name == "bare").expect("bare discovered");
+        assert_eq!(bare.thinking.as_deref(), Some("high"));
+        assert_eq!(bare.extensions.as_deref(), Some(["project-ext".to_string()].as_slice()));
+    }
+
+    // ---- projectRootResolution (pi findConfiguredProjectRoot, agents.ts:640-672) --------------
+
+    /// Build `<root>/.cyrup/agents/settings.json` with the given `subagents` block, marking `root`
+    /// as a project-root candidate in the process.
+    fn write_project_settings(root: &Path, subagents_json: &str) {
+        let dir = root.join(".cyrup").join("agents");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("settings.json"), format!("{{\"subagents\":{subagents_json}}}"))
+            .expect("write settings");
+    }
+
+    #[test]
+    fn find_configured_project_root_defaults_to_the_nearest_candidate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = tmp.path().join("repo");
+        let inner = outer.join("packages").join("app");
+        write_project_settings(&outer, "{}");
+        write_project_settings(&inner, "{}");
+        std::fs::create_dir_all(outer.join(".git")).expect("mkdir .git");
+
+        assert_eq!(
+            find_configured_project_root(&inner).expect("resolves"),
+            Some(inner.clone()),
+            "with no projectRootResolution declared anywhere, the nearest candidate wins"
+        );
+        assert_eq!(find_nearest_project_root(&inner), Some(inner));
+    }
+
+    #[test]
+    fn git_root_resolution_pulls_the_root_out_to_the_repository_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = tmp.path().join("repo");
+        let inner = outer.join("packages").join("app");
+        write_project_settings(&outer, "{}");
+        write_project_settings(&inner, r#"{"projectRootResolution":"git-root"}"#);
+        std::fs::create_dir_all(outer.join(".git")).expect("mkdir .git");
+
+        assert_eq!(
+            find_configured_project_root(&inner).expect("resolves"),
+            Some(outer.clone()),
+            "the NEAREST candidate declaring git-root moves resolution to the git root"
+        );
+
+        // pi's `||` (agents.ts:667): the GIT-ROOT candidate may declare it instead, with the nested
+        // sub-project configuring nothing at all.
+        write_project_settings(&inner, "{}");
+        write_project_settings(&outer, r#"{"projectRootResolution":"git-root"}"#);
+        assert_eq!(find_configured_project_root(&inner).expect("resolves"), Some(outer));
+    }
+
+    #[test]
+    fn nearest_resolution_pins_the_root_and_never_walks_to_the_git_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = tmp.path().join("repo");
+        let inner = outer.join("packages").join("app");
+        // The git root ASKS for git-root resolution; the nearest candidate's explicit `nearest`
+        // short-circuits before that is ever consulted (`agents.ts:662-663`).
+        write_project_settings(&outer, r#"{"projectRootResolution":"git-root"}"#);
+        write_project_settings(&inner, r#"{"projectRootResolution":"nearest"}"#);
+        std::fs::create_dir_all(outer.join(".git")).expect("mkdir .git");
+
+        assert_eq!(find_configured_project_root(&inner).expect("resolves"), Some(inner));
+    }
+
+    #[test]
+    fn a_git_root_that_is_not_itself_a_candidate_does_not_win() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = tmp.path().join("repo");
+        let inner = outer.join("packages").join("app");
+        // `outer` is the git root but holds NO `.cyrup`/`.agents` dir, so it is not in `candidates`
+        // and `candidates.find(...)` yields nothing (`agents.ts:666`).
+        std::fs::create_dir_all(outer.join(".git")).expect("mkdir .git");
+        write_project_settings(&inner, r#"{"projectRootResolution":"git-root"}"#);
+
+        assert_eq!(find_configured_project_root(&inner).expect("resolves"), Some(inner));
+    }
+
+    /// The git probe is a PRESENCE test, not a directory test: pi writes
+    /// `fs.existsSync(path.join(currentDir, ".git"))` (`agents.ts:632` @v0.43.0), which is the ONE
+    /// probe in this topology that is not `isDirectory` — `isProjectRootCandidate` (`:614`) uses
+    /// `isDirectory` for both of ITS checks. A linked worktree (`git worktree add`) carries a `.git`
+    /// **file** holding `gitdir: …`, never a directory, so upstream counts it as a git root and
+    /// [`Path::exists`] is the exact analog.
+    ///
+    /// Untested until now, and the difference is invisible: narrowing the probe to `is_dir()` would
+    /// compile, keep every other test in this section green (they all `create_dir_all(".git")`), and
+    /// silently disable `projectRootResolution: "git-root"` for every developer working inside a
+    /// linked worktree — the resolution would quietly fall back to the nearest sub-project.
+    #[test]
+    fn a_linked_worktrees_dot_git_file_counts_as_a_git_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = tmp.path().join("repo");
+        let inner = outer.join("packages").join("app");
+        write_project_settings(&outer, r#"{"projectRootResolution":"git-root"}"#);
+        write_project_settings(&inner, "{}");
+        std::fs::write(outer.join(".git"), "gitdir: /elsewhere/.git/worktrees/app\n")
+            .expect("write the linked worktree's .git FILE");
+        assert!(outer.join(".git").is_file(), "the fixture must be a file, not a directory");
+
+        assert_eq!(
+            find_nearest_git_root(&inner).as_deref(),
+            Some(outer.as_path()),
+            "a `.git` FILE marks the git root exactly as a `.git` directory does"
+        );
+        assert_eq!(
+            find_configured_project_root(&inner).expect("resolves"),
+            Some(outer),
+            "git-root resolution must reach the repo root of a LINKED worktree too"
+        );
+    }
+
+    #[test]
+    fn a_malformed_project_root_resolution_aborts_rather_than_degrading() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        write_project_settings(&root, r#"{"projectRootResolution":"repo-root"}"#);
+
+        let err = find_configured_project_root(&root).expect_err("must abort");
+        assert!(
+            matches!(&err, SubagentError::MalformedSettings(m)
+                if m.contains("projectRootResolution")
+                    && m.contains("expected 'nearest' or 'git-root'")),
+            "expected pi's own diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn find_configured_project_root_is_none_outside_any_project() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("no-project-here");
+        std::fs::create_dir_all(&bare).expect("mkdir");
+        // The tempdir itself carries no `.cyrup`/`.agents`; walking to `/` finds nothing either
+        // unless the host filesystem root happens to hold one, which no test box does.
+        assert_eq!(find_configured_project_root(&bare).expect("resolves"), None);
+    }
 
     #[test]
     fn discovery_is_re_scanned_per_call_not_cached() {

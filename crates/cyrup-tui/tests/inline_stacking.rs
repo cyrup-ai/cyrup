@@ -437,15 +437,17 @@ fn streaming_turn_grows_and_commits_without_stacking_chrome() {
     let at_peak = replay(&app.terminal().backend().bytes());
     let _ = peak_bytes;
 
-    // (peak) The newest text + the `▌` stream caret are visible, and the editor has NOT stacked.
+    // (peak) The newest text is visible and the editor has NOT stacked.
     assert!(
         rows_containing(&at_peak, "SENTINELZZ") >= 1,
         "newest streaming text missing (should be tail-anchored + visible):\n{}",
         at_peak.join("\n")
     );
+    // X1: pi draws no stream caret (`assistant-message.ts:104-114`); the only caret in the TUI is
+    // the editor's reverse-video cell (`editor.ts:545-564`).
     assert!(
-        at_peak.iter().any(|r| r.contains('▌')),
-        "stream caret `▌` missing at the streaming peak:\n{}",
+        !at_peak.iter().any(|r| r.contains('▌')),
+        "invented stream caret `▌` at the streaming peak:\n{}",
         at_peak.join("\n")
     );
     assert_eq!(

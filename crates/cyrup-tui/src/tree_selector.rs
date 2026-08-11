@@ -12,13 +12,13 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap, TreeAction, TreeKeymap};
-use crate::selector::{search_input_spans, Selector, SelectorOutcome};
+use crate::selector::{Selector, SelectorOutcome};
 use crate::theme::UiTheme;
 
 /// The entry-type glyph key (`tree-selector.ts` switch ~`:638`, render `:691-727`; spec/tui/05 §5.1).
@@ -45,6 +45,174 @@ impl TreeKind {
             TreeKind::ThinkingChange => "◇",
             TreeKind::ToolGroup => "⚙",
             TreeKind::Compaction => "✓",
+        }
+    }
+}
+
+/// The per-role colouring of a `/tree` row's entry text — `getEntryDisplayText`
+/// (`tree-selector.ts:768-852`).
+///
+/// **S24(b).** Upstream never draws the entry text as one span. It switches on `entry.type` and,
+/// for a message, on `msg.role`, and emits a *coloured role prefix* followed by the content:
+///
+/// ```text
+/// :781  result = theme.fg("accent",  "user: ")      + content;
+/// :786  result = theme.fg("success", "assistant: ") + textContent;
+/// :788  result = theme.fg("success", "assistant: ") + theme.fg("muted", "(aborted)");
+/// :791  result = theme.fg("success", "assistant: ") + theme.fg("error",   errMsg);
+/// :793  result = theme.fg("success", "assistant: ") + theme.fg("muted", "(no content)");
+/// :799  result = theme.fg("muted",   this.formatToolCall(...));
+/// :805  result = theme.fg("dim",     `[bash]: ${...}`);
+/// :819  result = theme.fg("customMessageLabel", `[${entry.customType}]: `) + content;
+/// :824  result = theme.fg("borderAccent", `[compaction: ${tokens}k tokens]`);
+/// :828  result = theme.fg("warning", `[branch summary]: `) + summary;
+/// :831/:834/:837/:840/:843  result = theme.fg("dim", …);
+/// :851  return isSelected ? theme.bold(result) : result;
+/// ```
+///
+/// Two consequences cyrup missed. First, a user row, an assistant row, a tool-result row and a
+/// compaction row were **colour-identical** — one `base_style()` span each. Second, `:851` only
+/// *bolds* the selected row; it does not recolour it, where cyrup replaced the whole label with
+/// `accent`, so the selected row lost what little role information the row carried.
+///
+/// ## Why this is classified from the label text
+///
+/// cyrup splits `getEntryDisplayText` across two crates: the **text** half is
+/// `cyrup_session_svc`'s `dag_display` (`session.rs:4935-4995`, whose own doc comment cites
+/// `tree-selector.ts:762-830`), which composes exactly these prefixes — `"user: "`, `"assistant: "`,
+/// `"[bash]: "`, `"branch summary: "`, `"model → "`, `"thinking → "`, `"title: "`, `"custom "`,
+/// `"label "` — and the **style** half is here. `SessionDagNode` carries `kind`
+/// ([`SessionDagKind`](cyrup_session_svc::SessionDagKind)) but no role, and `kind` collapses
+/// user/assistant/bash/custom into one `Message` variant and compaction/branch-summary into one
+/// `Compaction` variant, so the role is recoverable only from the text that `dag_display` wrote.
+/// [`TreeEntryRole::classify`] therefore reads `kind` first and disambiguates on that exact prefix
+/// set. A `role` field on `SessionDagNode` would let the classifier collapse to a `match`; that is
+/// a cyrup-session-svc change, and the classifier is written so it is the only thing that would
+/// need to move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeEntryRole {
+    /// `theme.fg("accent", "user: ") + content` (`:781`).
+    User,
+    /// `theme.fg("success", "assistant: ") + textContent` (`:786`).
+    Assistant,
+    /// `theme.fg("success", "assistant: ") + theme.fg("muted", "(no content)")` (`:788`, `:793`) —
+    /// the placeholder body is `muted`, not body text.
+    AssistantPlaceholder,
+    /// `theme.fg("muted", …)` over the whole row (`:799-801`).
+    ToolResult,
+    /// `theme.fg("dim", "[bash]: …")` over the whole row (`:805`).
+    Bash,
+    /// `theme.fg("customMessageLabel", "[type]: ") + content` (`:819`).
+    CustomMessage,
+    /// `theme.fg("borderAccent", "[compaction: Nk tokens]")` over the whole row (`:824`) — the one
+    /// and only `borderAccent` render site in pi (T9).
+    Compaction,
+    /// `theme.fg("warning", "[branch summary]: ") + summary` (`:828`).
+    BranchSummary,
+    /// `theme.fg("dim", …)` over the whole row — `model_change` (`:831`),
+    /// `thinking_level_change` (`:834`), `custom` (`:837`), `label` (`:840`), `session_info`
+    /// (`:843-845`), and the `[role]` fallback for an unrecognised message role (`:807`).
+    Dim,
+    /// No upstream case matched: `default: result = ""` (`:847-848`) has no colour of its own, and a
+    /// row whose label was built by something other than `dag_display` (a test fixture, an embedder)
+    /// keeps body text.
+    Plain,
+}
+
+impl TreeEntryRole {
+    /// Classify a row from its [`TreeKind`] and its already-composed label — see the type-level
+    /// doc for why the label is load-bearing here.
+    ///
+    /// `kind` decides first wherever it can (`ToolGroup`/`Compaction`/`ModelChange`/
+    /// `ThinkingChange` are unambiguous), and the prefix set disambiguates the rest, in the order
+    /// `dag_display` can emit them: `"[bash]: "` is tested before the generic `[…]` custom-message
+    /// shape because it also matches it.
+    #[must_use]
+    pub fn classify(kind: TreeKind, label: &str) -> TreeEntryRole {
+        match kind {
+            // `:795-801` — a tool result is muted end to end, with no coloured prefix.
+            TreeKind::ToolGroup => TreeEntryRole::ToolResult,
+            // `dag_display` maps BOTH `compaction` (`:822-824`) and `branch_summary` (`:827-828`)
+            // onto `SessionDagKind::Compaction`, and upstream colours them differently — `:828` is
+            // `warning`, not `borderAccent`.
+            TreeKind::Compaction => {
+                if label.starts_with("branch summary: ") {
+                    TreeEntryRole::BranchSummary
+                } else {
+                    TreeEntryRole::Compaction
+                }
+            }
+            // `:830-834` — both are a single `theme.fg("dim", …)`.
+            TreeKind::ModelChange | TreeKind::ThinkingChange => TreeEntryRole::Dim,
+            TreeKind::Message => {
+                if label.starts_with("user: ") {
+                    TreeEntryRole::User
+                } else if let Some(body) = label.strip_prefix("assistant: ") {
+                    // `:787-793`: an assistant row with no text renders its placeholder `muted`.
+                    if body == "(no content)" || body == "(aborted)" {
+                        TreeEntryRole::AssistantPlaceholder
+                    } else {
+                        TreeEntryRole::Assistant
+                    }
+                } else if label.starts_with("[bash]: ") {
+                    TreeEntryRole::Bash
+                } else if label.starts_with("title: ")
+                    || label.starts_with("custom ")
+                    || label.starts_with("label ")
+                {
+                    TreeEntryRole::Dim
+                } else if label.starts_with('[') && label.ends_with(']') {
+                    TreeEntryRole::CustomMessage
+                } else {
+                    TreeEntryRole::Plain
+                }
+            }
+        }
+    }
+
+    /// The row's coloured spans: a `(prefix, prefix-style)` pair plus the remainder in body style,
+    /// or a single whole-row span where upstream colours the whole row.
+    ///
+    /// `:851` `return isSelected ? theme.bold(result) : result;` — the selected row is **bolded**,
+    /// keeping every per-role colour. It is not repainted in `accent`.
+    fn spans(self, label: &str, is_sel: bool, theme: &UiTheme) -> Vec<Span<'static>> {
+        let bold = |s: Style| if is_sel { s.add_modifier(Modifier::BOLD) } else { s };
+        let split = |prefix_len: usize, prefix_style: Style, body_style: Style| {
+            let (prefix, body) = label.split_at(prefix_len.min(label.len()));
+            let mut out = vec![Span::styled(prefix.to_string(), bold(prefix_style))];
+            if !body.is_empty() {
+                out.push(Span::styled(body.to_string(), bold(body_style)));
+            }
+            out
+        };
+        let whole = |style: Style| vec![Span::styled(label.to_string(), bold(style))];
+        match self {
+            TreeEntryRole::User => {
+                split("user: ".len(), theme.accent_style(), theme.base_style())
+            }
+            TreeEntryRole::Assistant => {
+                split("assistant: ".len(), theme.success_style(), theme.base_style())
+            }
+            TreeEntryRole::AssistantPlaceholder => {
+                split("assistant: ".len(), theme.success_style(), theme.muted_style())
+            }
+            TreeEntryRole::ToolResult => whole(theme.muted_style()),
+            TreeEntryRole::Bash => whole(theme.dim_style()),
+            // `:819` is a bare `theme.fg("customMessageLabel", …)`. The bold that
+            // [`UiTheme::custom_message_label_style`] carries belongs to the TRANSCRIPT's label —
+            // `custom-message.ts:92` wraps the text in `\x1b[1m…\x1b[22m` *inside* the colour —
+            // and there is no such wrapper here, so it is removed rather than inherited. (`:851`
+            // adds bold back on the selected row, which is a different thing and applies to every
+            // role alike.)
+            TreeEntryRole::CustomMessage => {
+                whole(theme.custom_message_label_style().remove_modifier(Modifier::BOLD))
+            }
+            TreeEntryRole::Compaction => whole(theme.border_accent_style()),
+            TreeEntryRole::BranchSummary => {
+                split("branch summary: ".len(), theme.warning_style(), theme.base_style())
+            }
+            TreeEntryRole::Dim => whole(theme.dim_style()),
+            TreeEntryRole::Plain => whole(theme.base_style()),
         }
     }
 }
@@ -409,8 +577,12 @@ impl TreeSelector {
     /// the live buffer with a visible caret, and the save/cancel hint — shown in the tree body while a
     /// rename is in progress.
     fn label_edit_lines(&self, edit: &LabelEdit, theme: &UiTheme) -> Vec<Line<'static>> {
+        // S31: `LabelInput.render` splices the `Input`'s own line in behind a literal two-space
+        // `indent` — `lines.push(...this.input.render(availableWidth).map(line => `${indent}${line}`))`
+        // (`tree-selector.ts:1299,1302`) — so the row reads `"  " + "> " + value`. cyrup drew the
+        // indent but dropped `Input.render`'s shared `"> "` prompt (`input.ts:380`) entirely.
         let mut input = vec![Span::raw("  ")];
-        input.extend(search_input_spans(&edit.query, edit.cursor, theme));
+        input.extend(crate::selector::input_line_spans(&edit.query, edit.cursor, theme));
         vec![
             Line::from(Span::styled("  Label (empty to remove):", theme.muted_style())),
             Line::from(input),
@@ -420,13 +592,25 @@ impl TreeSelector {
 
     /// Build the connector prefix for `node` at `nodes` index `idx` (depth-0 has none). Uses the
     /// "is this the last child of its parent" relation derived from the flat pre-order list.
+    ///
+    /// **The fold state lives INSIDE the connector.** Upstream builds the prefix one character at a
+    /// time over `totalChars = displayIndent * 3` (`tree-selector.ts:701-729`); at the node's own
+    /// connector level the three cells are
+    ///
+    /// * `posInLevel === 0` → `flatNode.isLast ? "└" : "├"` (`:719`)
+    /// * `posInLevel === 1` → `isFolded ? "⊞" : foldable ? "⊟" : "─"` (`:721-722`)
+    /// * `posInLevel === 2` → `" "` (`:724`)
+    ///
+    /// so a foldable-and-expanded child renders `├⊟ `, a folded one `├⊞ `, and a leaf `├─ `. The
+    /// whole prefix is then styled `theme.fg("dim", prefix)` (`:746`), which is why the fold cell is
+    /// dim here rather than accent — only the connector-less fallback marker at `:734` is accent.
     fn connector_prefix(&self, idx: usize) -> String {
         let Some(node) = self.nodes.get(idx) else { return String::new() };
         if node.depth == 0 {
             return String::new();
         }
         // For each ancestor level 1..depth, draw `│  ` if that ancestor has a following sibling,
-        // else three spaces; then the node's own `├─ `/`└─ `.
+        // else three spaces; then the node's own `├`/`└` + fold cell + ` `.
         let mut prefix = String::new();
         for level in 1..node.depth {
             if self.ancestor_has_following_sibling(idx, level) {
@@ -435,11 +619,16 @@ impl TreeSelector {
                 prefix.push_str("   ");
             }
         }
-        if self.is_last_child(idx) {
-            prefix.push_str("└─ ");
+        prefix.push(if self.is_last_child(idx) { '└' } else { '├' });
+        // `:722` verbatim — `isFolded` is tested FIRST and independently of `foldable`.
+        prefix.push(if node.folded {
+            '⊞'
+        } else if node.foldable {
+            '⊟'
         } else {
-            prefix.push_str("├─ ");
-        }
+            '─'
+        });
+        prefix.push(' ');
         prefix
     }
 
@@ -487,34 +676,69 @@ impl TreeSelector {
             let Some(node) = self.nodes.get(idx) else { continue };
             let is_sel = row == self.selected;
             let mut spans: Vec<Span<'static>> = Vec::new();
-            // Connector prefix.
+            // Cursor gutter — `tree-selector.ts:689`:
+            //   `const cursor = isSelected ? theme.fg("accent", "› ") : "  ";`
+            // Upstream keeps this as a fixed 2-column gutter (`TREE_GUTTER_WIDTH`, `:49`) that the
+            // horizontal viewport never clips (`:84-89`).
+            spans.push(if is_sel {
+                Span::styled("› ".to_string(), theme.accent_style())
+            } else {
+                Span::raw("  ")
+            });
+            // Connector prefix — this is also where the FOLD STATE is drawn (`:721-722`); see
+            // `connector_prefix`.
             let prefix = self.connector_prefix(idx);
-            if !prefix.is_empty() {
+            let shows_fold_in_connector = !prefix.is_empty();
+            if shows_fold_in_connector {
                 spans.push(Span::styled(prefix, theme.dim_style()));
             }
-            // Fold marker.
-            if node.foldable {
-                let marker = if node.folded { "⊞ " } else { "⊟ " };
-                spans.push(Span::styled(marker, theme.muted_style()));
+            // The connector-less FALLBACK fold marker — `tree-selector.ts:733-734`:
+            //   const showsFoldInConnector = flatNode.showConnector && !flatNode.isVirtualRootChild;
+            //   const foldMarker = isFolded && !showsFoldInConnector ? theme.fg("accent", "⊞ ") : "";
+            //
+            // `!showsFoldInConnector` means "the connector did NOT already show the fold state", so
+            // this branch is reached only by a node that HAS NO CONNECTOR — depth 0 here, a root or
+            // a virtual-root child upstream. It is a fallback, not the general case, and it only
+            // ever emits the FOLDED glyph: an expanded connector-less node draws nothing, because
+            // there is no cell to put `⊟` in.
+            if node.folded && !shows_fold_in_connector {
+                spans.push(Span::styled("⊞ ", theme.accent_style()));
             }
             // Glyph + label.
             let glyph_style = if is_sel { theme.accent_style() } else { theme.base_style() };
             spans.push(Span::styled(format!("{} ", node.kind.glyph()), glyph_style));
-            let label_style = if is_sel {
-                theme.accent_style().add_modifier(Modifier::BOLD)
-            } else {
-                theme.base_style()
-            };
-            spans.push(Span::styled(node.label.clone(), label_style));
+            // S24(b): the entry text is coloured PER ROLE, with a coloured role prefix, and the
+            // selected row is only BOLDED (`:851`), never repainted `accent` — see
+            // [`TreeEntryRole`].
+            spans.extend(
+                TreeEntryRole::classify(node.kind, &node.label).spans(&node.label, is_sel, theme),
+            );
             if node.has_label {
                 spans.push(Span::styled("  ☆labeled".to_string(), theme.warning_style()));
             }
-            // Right-aligned time column + selected marker.
-            let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            // Right-aligned label-timestamp column.
+            //
+            // S37: this used to ALSO render a `◀ selected` marker on the highlighted row, padded
+            // flush right. There is no upstream analog — `git grep '◀' v0.84.1 -- packages/` finds
+            // nothing anywhere in pi, and `renderHorizontalViewport` (`tree-selector.ts:85-91`)
+            // emits `row.gutter + row.body` truncated to `width` with no right-hand padding at all,
+            // so an upstream row is exactly as wide as its content. The marker was a cyrup
+            // invention that (a) added text pi never draws and (b) padded the row out to `width`,
+            // which is what made the `selectedBg` fill below look full-width. It is removed; the
+            // selection is indicated the way upstream indicates it — the `› ` cursor at `:689` plus
+            // the fill at `:750-753`.
+            //
+            // S24(a): the pad is computed from the row's **visible width**, not `chars().count()`.
+            // Upstream measures the same quantity with `visibleWidth` (`tree-selector.ts:747`
+            // `const anchorCol = visibleWidth(prefixPart);`, `:754` `bodyWidth: visibleWidth(body)`),
+            // and everything ahead of this column is unicode: the connector `│├└─⊟⊞`, the glyphs
+            // `●◆◇⚙✓`, the `☆labeled` star, and a message preview that is arbitrary user text. A CJK
+            // preview measured one column per character, so the pad overshot by the number of wide
+            // characters in the row and pushed the timestamp off the right edge. `Span::width` is
+            // the crate's `visibleWidth`; this was the eighth char-count measurement found in it.
+            let left_len: usize = spans.iter().map(Span::width).sum();
             let mut right = String::new();
-            if is_sel {
-                right.push_str("◀ selected");
-            } else if self.show_time
+            if self.show_time
                 // Pi's render condition in full (`tree-selector.ts:741-743`): the column is a
                 // *label* timestamp, so an entry with no label never shows one even when the toggle
                 // is on and a timestamp happens to be attached.
@@ -524,10 +748,24 @@ impl TreeSelector {
                 right.push_str(t);
             }
             if !right.is_empty() {
-                let pad = (width as usize).saturating_sub(left_len + right.chars().count() + 1);
+                let pad =
+                    (width as usize).saturating_sub(left_len + Span::raw(&right).width() + 1);
                 spans.push(Span::raw(" ".repeat(pad + 1)));
                 let style = if is_sel { theme.accent_style() } else { theme.dim_style() };
                 spans.push(Span::styled(right, style));
+            }
+            // S2/SYS-4: the selected row carries the `selectedBg` fill. `tree-selector.ts:750-753`
+            //     if (isSelected) { gutter = theme.bg("selectedBg", gutter); body = theme.bg("selectedBg", body); }
+            // wraps the already-styled gutter and body — the fill is laid OVER the per-span
+            // foregrounds, it does not replace them, and it stops at the end of the body: upstream
+            // does NOT pad the row out to `width` (`:85-91`), so the bar is content-wide, not
+            // full-width. This is one of only two places upstream fills a selection background;
+            // cyrup previously drew it in `SelectList`, where upstream never does, and omitted it
+            // here.
+            if is_sel {
+                for span in &mut spans {
+                    span.style = theme.selected_bg_over(span.style);
+                }
             }
             lines.push(Line::from(spans));
         }

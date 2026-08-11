@@ -86,6 +86,31 @@ pub struct ResolvedCommand {
     pub descriptor: CommandDescriptor,
 }
 
+/// One extension-name collision, in Pi's `detectExtensionConflicts` shape
+/// (`coding-agent/src/core/resource-loader.ts:1059-1094`): `{path, message}`, where `path` is the
+/// extension whose registration LOST (the later one in load order) and `message` names the
+/// extension that already owns the name.
+///
+/// Pi walks the loaded-extension list AFTER loading and emits one record per losing registration;
+/// cyrup detects the same collisions at registration time (registrations stream in through
+/// [`ExtensionRegistry::register_tool`] / [`ExtensionRegistry::register_guest_tool`] /
+/// [`ExtensionRegistry::register_flag`] rather than landing in per-extension maps), which yields the
+/// same set in the same order. `path` is an [`ExtensionId`] because a cyrup native built-in has no
+/// filesystem path — Pi's own inline extensions likewise carry a synthetic `<inline:…>` path.
+///
+/// These records are folded into [`crate::LoadExtensionsResult::errors`] by
+/// [`crate::ExtensionHost::discover_and_load`], exactly as Pi's `addExtensionConflictDiagnostics`
+/// pushes them onto `extensionsResult.errors` (`resource-loader.ts:625-632`) — which `main.ts:735-738`
+/// renders as `Failed to load extension "<path>": <message>` and exits 1 on (`main.ts:843-848`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionConflict {
+    /// The extension whose registration was rejected (Pi's `conflicts[].path`).
+    pub path: ExtensionId,
+    /// Pi's verbatim message: `Tool "<name>" conflicts with <owner>` /
+    /// `Flag "--<name>" conflicts with <owner>`.
+    pub message: String,
+}
+
 /// The registry of everything extensions contribute. `Send + Sync` (interior `RwLock`), shared via
 /// `Arc` across the host (arch-08 §3.1).
 #[derive(Default)]
@@ -103,7 +128,10 @@ pub struct ExtensionRegistry {
 
 #[derive(Default)]
 struct RegistryInner {
-    /// Extension tools keyed by name; last insert wins (override, R-08-012). Insertion order kept.
+    /// Extension tools keyed by name. FIRST registering extension wins (Pi `getAllRegisteredTools` /
+    /// `getToolDefinition`, runner.ts:450-471 — both loop `this.extensions` in load order and take
+    /// the first hit); a re-registration by the SAME extension replaces, matching Pi's per-extension
+    /// `extension.tools.set(tool.name, …)` (loader.ts:245-252). Insertion order kept.
     tool_order: Vec<String>,
     tools: HashMap<String, Arc<dyn Tool>>,
     /// Which extension owns each tool name (for diagnostics / unload).
@@ -115,6 +143,13 @@ struct RegistryInner {
     command_order: Vec<(ExtensionId, String, CommandDescriptor)>,
     shortcuts: HashMap<String, ExtensionId>,
     flags: HashMap<String, Value>,
+    /// Which extension owns each flag name. FIRST registration wins (Pi `getFlags`,
+    /// runner.ts:473-483 — `if (!allFlags.has(name))` over `this.extensions` in load order).
+    flag_owner: HashMap<String, ExtensionId>,
+    /// Name collisions between DIFFERENT extensions, in load order (Pi `detectExtensionConflicts`,
+    /// resource-loader.ts:1059-1094). Accumulated as registrations arrive; read back by
+    /// [`ExtensionRegistry::conflicts`].
+    conflicts: Vec<ExtensionConflict>,
     /// CLI-supplied flag VALUE overrides (Pi `runtime.flagValues` entries set by
     /// `applyExtensionFlagValues`, agent-session-services.ts:102-114). ONE shared map keyed by flag
     /// name (Pi's single `runtime.flagValues`), consulted by `GuestState::get_flag` AHEAD of the
@@ -143,6 +178,18 @@ struct RegistryInner {
     /// Populated by [`ExtensionRegistry::register_message_renderer`]; read by
     /// [`crate::ExtensionHost::render_message_call`]/[`crate::ExtensionHost::render_message_result`].
     message_renderer_owner: HashMap<String, ExtensionId>,
+    /// Which extension owns the custom-ENTRY renderer for a custom type (Pi
+    /// `registerEntryRenderer(customType, renderer)`, extensions/types.ts:1295, implemented at
+    /// `loader.ts:314-318`, resolved by `extensions/runner.ts:593-600 getEntryRenderer` — FIRST
+    /// extension in load order wins, exactly like `getMessageRenderer`).
+    ///
+    /// A SEPARATE table from [`Self::message_renderer_owner`] because upstream keeps two disjoint
+    /// maps (`extension.messageRenderers` vs `extension.entryRenderers`, types.ts:1703-1704) and
+    /// their consumers render DIFFERENT things: a custom MESSAGE draws `CustomMessageComponent`
+    /// (which swallows a renderer throw, `custom-message.ts:82-84`), a custom ENTRY draws
+    /// `CustomEntryComponent` (which draws a failure box on a throw, `custom-entry.ts:47-52`). Same
+    /// custom type may legitimately be claimed by different extensions on the two surfaces.
+    entry_renderer_owner: HashMap<String, ExtensionId>,
 }
 
 impl ExtensionRegistry {
@@ -150,11 +197,31 @@ impl ExtensionRegistry {
         Self::default()
     }
 
-    /// Register (or override) an extension tool. A `PoisonError` degrades to a surfaced error,
-    /// never a panic (R-00-009).
+    /// Register an extension tool. A `PoisonError` degrades to a surfaced error, never a panic
+    /// (R-00-009).
+    ///
+    /// **First registering extension wins.** Pi resolves an extension tool by looping the loaded
+    /// extensions in LOAD ORDER and returning the first hit — `getAllRegisteredTools`
+    /// (`extensions/runner.ts:450-460`, `if (!toolsByName.has(...))`) supplies the executable
+    /// definitions that `agent-session.ts:2463-2487 _refreshToolRegistry` puts in `_toolRegistry`,
+    /// and `getToolDefinition` (`runner.ts:463-471`) resolves by the same rule. So the extension that
+    /// loaded FIRST both appears in the tool list and is the one that RUNS. A later extension
+    /// claiming the same name is rejected here and recorded as an [`ExtensionConflict`] (Pi
+    /// `detectExtensionConflicts`, resource-loader.ts:1059-1094).
+    ///
+    /// A re-registration by the SAME owner still replaces: Pi's per-extension map is a plain
+    /// `extension.tools.set(tool.name, …)` (`extensions/loader.ts:245-252`), so an extension that
+    /// re-registers its own tool (hot-reload, or the descriptor→`WasmTool` materialization pass)
+    /// overwrites its previous entry.
     pub fn register_tool(&self, owner: ExtensionId, tool: Arc<dyn Tool>) -> Result<(), ExtError> {
         let name = tool.name().to_string();
         let mut g = self.lock_write()?;
+        if let Some(existing) = Self::tool_owner_in(&g, &name)
+            && existing != owner
+        {
+            Self::record_conflict(&mut g, owner, format!("Tool \"{name}\" conflicts with {existing}"));
+            return Ok(());
+        }
         if !g.tools.contains_key(&name) {
             g.tool_order.push(name.clone());
         }
@@ -163,6 +230,35 @@ impl ExtensionRegistry {
         drop(g);
         self.mark_tools_dirty();
         Ok(())
+    }
+
+    /// The extension that already owns tool `name`, across BOTH tool tables: the executable
+    /// `Arc<dyn Tool>` map and the not-yet-materialized guest descriptor map. Pi has ONE
+    /// `extension.tools` map per extension holding both kinds, so the first-wins rule must see them
+    /// as one namespace — otherwise a guest descriptor and a native tool of the same name would each
+    /// "win" in their own table.
+    fn tool_owner_in(g: &RegistryInner, name: &str) -> Option<ExtensionId> {
+        g.tool_owner
+            .get(name)
+            .or_else(|| g.guest_tools.get(name).map(|(o, _)| o))
+            .cloned()
+    }
+
+    /// Append a conflict record, de-duplicated. Pi emits one record per losing registration from a
+    /// single post-load sweep; cyrup sees registrations streaming in and a retryable path (the guest
+    /// descriptor re-materializer) can re-offer the same losing registration, so identical records
+    /// collapse to keep the diagnostic list Pi-shaped.
+    fn record_conflict(g: &mut RegistryInner, path: ExtensionId, message: String) {
+        let record = ExtensionConflict { path, message };
+        if !g.conflicts.contains(&record) {
+            g.conflicts.push(record);
+        }
+    }
+
+    /// Every name collision between two DIFFERENT extensions, in load order (Pi
+    /// `detectExtensionConflicts`, resource-loader.ts:1059-1094).
+    pub fn conflicts(&self) -> Result<Vec<ExtensionConflict>, ExtError> {
+        Ok(self.lock_read()?.conflicts.clone())
     }
 
     /// Mark the tool set as changed (Pi's `runtime.refreshTools()` trigger, loader.ts:249-256).
@@ -177,8 +273,11 @@ impl ExtensionRegistry {
         self.tools_dirty.swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
-    /// Register a guest (WASM) tool by descriptor (R-08-012). Last insert wins (override); insertion
-    /// order is preserved for stable active-set surfacing.
+    /// Register a guest (WASM) tool by descriptor (R-08-012). Same precedence rule as
+    /// [`Self::register_tool`] — the FIRST extension to claim a tool name wins (Pi
+    /// `getAllRegisteredTools`/`getToolDefinition`, runner.ts:450-471), a later claimant is rejected
+    /// and recorded as an [`ExtensionConflict`], and the SAME owner re-registering replaces.
+    /// Insertion order is preserved for stable active-set surfacing.
     pub fn register_guest_tool(
         &self,
         owner: ExtensionId,
@@ -187,6 +286,12 @@ impl ExtensionRegistry {
         desc.validate()?;
         let name = desc.name.clone();
         let mut g = self.lock_write()?;
+        if let Some(existing) = Self::tool_owner_in(&g, &name)
+            && existing != owner
+        {
+            Self::record_conflict(&mut g, owner, format!("Tool \"{name}\" conflicts with {existing}"));
+            return Ok(());
+        }
         if !g.guest_tools.contains_key(&name) {
             g.guest_tool_order.push(name.clone());
         }
@@ -242,11 +347,31 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.message_renderer_owner.get(custom_type).cloned())
     }
 
+    /// Record a custom-ENTRY renderer registration (Pi `registerEntryRenderer(customType, …)`,
+    /// types.ts:1295 / loader.ts:314-318). FIRST registration wins, matching Pi's load-order
+    /// `getEntryRenderer` loop (runner.ts:593-600).
+    pub fn register_entry_renderer(
+        &self,
+        owner: ExtensionId,
+        custom_type: impl Into<String>,
+    ) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        g.entry_renderer_owner.entry(custom_type.into()).or_insert(owner);
+        Ok(())
+    }
+
+    /// The extension that renders custom ENTRIES of `custom_type` (first-wins), if any.
+    pub fn entry_renderer_owner(&self, custom_type: &str) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.entry_renderer_owner.get(custom_type).cloned())
+    }
+
     /// All registered tool names with Pi's **first-registration-wins** ordering (`getAllRegisteredTools`,
     /// runner.ts:417; gap-08 #7). `tool_order`/`guest_tool_order` are both first-insert order (a later
     /// override updates the value but keeps the original position), so the union — extension tools
-    /// then guest-only tools, de-duplicated first-wins — is exactly Pi's getter order. (Execution
-    /// still resolves last-wins via the `tools` map; only the *getter* is first-wins.)
+    /// then guest-only tools, de-duplicated first-wins — is exactly Pi's getter order. Execution
+    /// resolves first-wins too ([`Self::register_tool`] rejects a second extension's claim on the
+    /// name), so the getter and the executed tool always agree, as they do in Pi where both read the
+    /// same load-ordered `this.extensions` loop.
     pub fn all_registered_tool_names(&self) -> Result<Vec<String>, ExtError> {
         let g = self.lock_read()?;
         let mut out: Vec<String> = Vec::new();
@@ -447,9 +572,44 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.provider_hub.get(id).cloned())
     }
 
+    /// Register a flag WITHOUT an owning extension — the host/embedder-side setter (and what the
+    /// flag-reconciliation tests drive). Unconditional insert: with no owner there is nothing to
+    /// compare against, so no conflict can be attributed. Extension-supplied flags must go through
+    /// [`Self::register_flag`] so Pi's first-wins rule and its conflict diagnostic apply.
     pub fn set_flag(&self, name: impl Into<String>, spec: Value) -> Result<(), ExtError> {
         let mut g = self.lock_write()?;
         g.flags.insert(name.into(), spec);
+        Ok(())
+    }
+
+    /// Register an extension-owned flag (Pi `pi.registerFlag(name, options)`, loader.ts:274-283).
+    ///
+    /// **First registering extension wins**, mirroring Pi's `getFlags()` which folds every
+    /// extension's `flags` map into one in LOAD ORDER under `if (!allFlags.has(name))`
+    /// (`extensions/runner.ts:473-483`) — so the second extension's spec is never the one the CLI
+    /// reconciles against. The loser is recorded as an [`ExtensionConflict`] carrying Pi's
+    /// `Flag "--<name>" conflicts with <owner>` message (resource-loader.ts:1080-1089). A
+    /// re-registration by the SAME owner replaces (Pi's per-extension `extension.flags.set`).
+    pub fn register_flag(
+        &self,
+        owner: ExtensionId,
+        name: impl Into<String>,
+        spec: Value,
+    ) -> Result<(), ExtError> {
+        let name = name.into();
+        let mut g = self.lock_write()?;
+        if let Some(existing) = g.flag_owner.get(&name).cloned()
+            && existing != owner
+        {
+            Self::record_conflict(
+                &mut g,
+                owner,
+                format!("Flag \"--{name}\" conflicts with {existing}"),
+            );
+            return Ok(());
+        }
+        g.flag_owner.insert(name.clone(), owner);
+        g.flags.insert(name, spec);
         Ok(())
     }
 

@@ -64,7 +64,10 @@ use super::types::{
     ChainListBinding, ChainOutputBinding, ChainStepConfig, OutputSpec, OverrideScope,
     SystemPromptMode, ToolRef,
 };
-use super::{discover_agents_all, AgentDiscoveryConfig, AgentDiscoveryResult};
+use super::{
+    discover_agents_all, resolve_agent_name, AgentDiscoveryConfig, AgentDiscoveryResult,
+    AgentNameResolution,
+};
 
 // -------------------------------------------------------------------------------------------
 // R-SA-013: call-site-dependent `disabled` visibility
@@ -164,6 +167,10 @@ pub struct AgentFields {
     pub local_name: Option<String>,
     pub package_name: Option<Option<String>>,
     pub description: Option<String>,
+    /// pi `config.aliases` (`agent-management.ts:411-421` @ v0.43.0). `Some(list)` sets the alias
+    /// list (already normalized against the target's name); `Some(vec![])` is the `false`/`""`
+    /// CLEAR; `None` means the update config never mentioned `aliases` and the existing list stands.
+    pub aliases: Option<Vec<String>>,
     pub tools: Option<Option<Vec<ToolRef>>>,
     pub extensions: Option<Option<Vec<String>>>,
     pub subagent_only_extensions: Option<Vec<String>>,
@@ -477,8 +484,10 @@ fn build_definition(
         local_name: local_name.to_string(),
         package_name,
         description: description.to_string(),
+        aliases: fields.aliases.clone().unwrap_or_default(),
         tools: fields.tools.clone().unwrap_or(None),
         extensions: fields.extensions.clone().unwrap_or(None),
+        extensions_from_default: false,
         subagent_only_extensions: fields.subagent_only_extensions.clone().unwrap_or_default(),
         model: fields.model.clone().unwrap_or(None),
         fallback_models: fields.fallback_models.clone().unwrap_or_default(),
@@ -494,6 +503,12 @@ fn build_definition(
         interactive: fields.interactive.unwrap_or(None),
         max_subagent_depth: fields.max_subagent_depth.unwrap_or(None),
         default_context: fields.default_context.unwrap_or(None),
+        // Not exposed as an editable management field (pi's `agentCreate`/`agentUpdate` input
+        // schemas have no `memory`/`toolBudget` key either); a created agent declares neither.
+        default_async: None,
+        default_timeout_ms: None,
+        memory: None,
+        tool_budget: None,
         disabled: fields.disabled.unwrap_or(None),
         system_prompt_body: fields.system_prompt_body.clone().unwrap_or_default(),
         source,
@@ -518,11 +533,13 @@ fn merge_fields(
         local_name: local_name.to_string(),
         package_name,
         description: description.to_string(),
+        aliases: fields.aliases.clone().unwrap_or_else(|| existing.aliases.clone()),
         tools: fields.tools.clone().unwrap_or_else(|| existing.tools.clone()),
         extensions: fields
             .extensions
             .clone()
             .unwrap_or_else(|| existing.extensions.clone()),
+        extensions_from_default: existing.extensions_from_default,
         subagent_only_extensions: fields
             .subagent_only_extensions
             .clone()
@@ -552,6 +569,13 @@ fn merge_fields(
         interactive: fields.interactive.unwrap_or(existing.interactive),
         max_subagent_depth: fields.max_subagent_depth.unwrap_or(existing.max_subagent_depth),
         default_context: fields.default_context.unwrap_or(existing.default_context),
+        // An UPDATE never edits these two (no management field exists for them) but must not
+        // DROP them either — an agent file with a `memory:`/`toolBudget:` block that is renamed
+        // or field-edited keeps both, exactly as pi's preserve-frontmatter update does.
+        default_async: existing.default_async,
+        default_timeout_ms: existing.default_timeout_ms,
+        memory: existing.memory.clone(),
+        tool_budget: existing.tool_budget.clone(),
         disabled: fields.disabled.unwrap_or(existing.disabled),
         system_prompt_body: fields
             .system_prompt_body
@@ -596,7 +620,7 @@ fn reparse_agent_file(file_path: &Path, source: AgentSource) -> Result<AgentDefi
 //     (e.g. a `permission:` nested-YAML block captured by `frontmatter.rs`) is re-emitted as
 //     `key:` + two-space-indented lines, NOT corrupted into one flat line.
 // Settings-override values are NOT baked into files: the update handler feeds `serialize_agent` the
-// pre-override `editable_base` snapshot (pi `editableAgentConfig`, `agent-management.ts:174-196`),
+// pre-override `editable_base` snapshot (pi `editableAgentConfig`, `agent-management.ts:217-267`),
 // and `disabled` is never emitted at all (it is a settings-only concept — a `disabled:` in an agent
 // file is just an unknown extra field, round-tripped through `extra_fields`).
 // -------------------------------------------------------------------------------------------
@@ -630,6 +654,18 @@ fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&HashSet<Strin
         lines.push(format!("package: {pkg}"));
     }
     lines.push(format!("description: {}", def.description));
+    // aliases (`agent-serializer.ts:59-60` @ v0.43.0):
+    // `if (aliasesValue || preserve("alias", "aliases")) lines.push(`aliases: ${aliasesValue ?? ""}`)`.
+    // Both spellings are `KNOWN_FIELDS`, so this line is what stops a management rewrite from
+    // silently DELETING an author's `alias:`/`aliases:` (the extra-fields loop skips known keys);
+    // an author who wrote the singular `alias:` gets the plural back, exactly as upstream does.
+    {
+        let aliases_value =
+            if def.aliases.is_empty() { None } else { Some(def.aliases.join(", ")) };
+        if aliases_value.is_some() || preserve(&["alias", "aliases"]) {
+            lines.push(format!("aliases: {}", aliases_value.as_deref().unwrap_or("")));
+        }
+    }
 
     // tools: agent builtin/extension entries plus `mcp:`-prefixed direct tools (pi merges both).
     let tools_value = def.tools.as_ref().and_then(|tools| {
@@ -770,6 +806,49 @@ fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&HashSet<Strin
         lines.push(format!("completionGuard: {value}"));
     }
 
+    // async / timeoutMs launch defaults (`agent-serializer.ts:87-88` @ v0.43.0): emitted whenever
+    // set, or as an empty value under preserve. Same silent-deletion trap as `toolBudget` below —
+    // a KNOWN_FIELD the serializer never writes is dropped on the first management rewrite.
+    if def.default_async.is_some() || preserve(&["async"]) {
+        let value = match def.default_async {
+            None => "",
+            Some(true) => "true",
+            Some(false) => "false",
+        };
+        lines.push(format!("async: {value}"));
+    }
+    if def.default_timeout_ms.is_some() || preserve(&["timeoutMs"]) {
+        let value = def
+            .default_timeout_ms
+            .map_or_else(String::new, |ms| ms.to_string());
+        lines.push(format!("timeoutMs: {value}"));
+    }
+
+    // toolBudget (`agent-serializer.ts:91-93` @ v0.34.0): emitted as compact JSON when set, or as
+    // an empty value under preserve. Without this, adding `toolBudget` to `KNOWN_FIELDS` would let
+    // any management update SILENTLY DELETE an author's budget — the extra-fields loop below skips
+    // known keys, so a field that is known but never emitted simply vanishes on rewrite.
+    if def.tool_budget.is_some() || preserve(&["toolBudget"]) {
+        let value = def
+            .tool_budget
+            .as_ref()
+            .and_then(|b| serde_json::to_string(b).ok())
+            .unwrap_or_default();
+        lines.push(format!("toolBudget: {value}"));
+    }
+
+    // memory (`agent-serializer.ts:95-99` @ v0.34.0): a two-line nested block, emitted ONLY when
+    // set (upstream has no `preserve` arm for it).
+    if let Some(memory) = &def.memory {
+        let scope = match memory.scope {
+            crate::discovery::types::MemoryScope::Project => "project",
+            crate::discovery::types::MemoryScope::User => "user",
+        };
+        lines.push("memory:".to_string());
+        lines.push(format!("  scope: {scope}"));
+        lines.push(format!("  path: {}", memory.path));
+    }
+
     // Unknown-key round-trip (`agent-serializer.ts:91-104`): re-emit every extra field, skipping any
     // key that is actually a KNOWN field (defensive; the parser never puts one here). A block value
     // (embedded newlines) is re-emitted as `key:` + each line indented two spaces so it round-trips
@@ -793,7 +872,7 @@ fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&HashSet<Strin
     format!("{}\n\n{}\n", lines.join("\n"), def.system_prompt_body)
 }
 
-/// pi `preservedAgentFrontmatterFields` (`agent-management.ts:207-250`): starting from the field
+/// pi `preservedAgentFrontmatterFields` (`agent-management.ts:278-330`): starting from the field
 /// keys literally present in the agent's on-disk frontmatter (`existing_present`, which for a
 /// discovered agent is exactly [`AgentDefinition::present_fields`]), REMOVE any key this update is
 /// changing (so the changed field is re-serialized from its NEW value, not preserved at its old
@@ -820,6 +899,12 @@ fn preserved_frontmatter_fields(
     }
     if fields.description.is_some() {
         set.remove("description");
+    }
+    // pi `agent-management.ts:287` @ v0.43.0: `if (hasKey(cfg, "aliases")) changed("alias", "aliases")`
+    // — an update that sets `aliases` un-preserves BOTH spellings so the new value is serialized.
+    if fields.aliases.is_some() {
+        set.remove("alias");
+        set.remove("aliases");
     }
     if fields.system_prompt_body.is_some() {
         set.remove("systemPrompt");
@@ -1037,7 +1122,7 @@ pub fn rename_chain(
 
 /// Create a new `.chain.json` under `scope_dir` carrying real authored `steps` and an optional
 /// package identifier — the steps-aware create the management `action: "create"` path needs (pi
-/// `handleCreate`'s chain branch, `agent-management.ts:706-715`). Unlike the bare [`create_chain`]
+/// `handleCreate`'s chain branch, `agent-management.ts:935-952`). Unlike the bare [`create_chain`]
 /// skeleton (which materializes an empty step list), this preserves the caller's parsed
 /// [`ChainStepConfig`] sequence verbatim. The file is named by the RUNTIME name
 /// (`{package}.{local}.chain.json`), matching pi's on-disk convention, and always written as
@@ -1076,7 +1161,7 @@ pub fn create_chain_with_steps(
 /// Update an existing User/Project-scope chain in one step: rewrite `name`/`package`/`description`/
 /// `steps` and rename the on-disk file when the runtime name changes — the steps-preserving update
 /// the management `action: "update"` path needs (pi `handleUpdate`'s chain branch,
-/// `agent-management.ts:802-846`). Unlike the bare [`update_chain`] skeleton (which replaces the
+/// `agent-management.ts:1041-1087`). Unlike the bare [`update_chain`] skeleton (which replaces the
 /// step list with empty placeholders), this writes the caller-supplied `steps` verbatim (the
 /// handler passes the existing steps through when the caller did not re-author them). Fails with
 /// `ReadOnlySource` for a Builtin/Package target (R-SA-014) before any filesystem access, and with
@@ -1134,7 +1219,7 @@ fn write_chain_file(file_path: &Path, definition: &ChainDefinition) -> Result<()
 
 /// Serialize a [`ChainDefinition`] to the pi `.chain.json` shape
 /// [`crate::discovery::chains::parse_chain_json`] reads (`serializeJsonChain`,
-/// `chain-serializer.ts:201-214`): a root object with the pre-qualification `name`
+/// `chain-serializer.ts:228-241`): a root object with the pre-qualification `name`
 /// (`frontmatterNameForConfig` — the chain's `local_name`), `description`, and a `chain` ARRAY of
 /// the raw [`ChainStepConfig`] steps, plus `package` when set and any preserved `extra_fields`.
 fn serialize_chain_json(def: &ChainDefinition) -> String {
@@ -1174,7 +1259,7 @@ fn serialize_chain_json(def: &ChainDefinition) -> String {
 // Management-action dispatch + renderers — a faithful port of pi's `agent-management.ts`
 // `handleManagementAction`/`handleList`/`handleGet`/`handleModels`/`handleCreate`/`handleUpdate`/
 // `handleDelete` + `formatAgentDetail`/`formatChainDetail`/`formatChainStepDetail`
-// (`agent-management.ts:44-880`). This is the C3 wire-up: the low-level CRUD above finally gains its
+// (`agent-management.ts:1242-1256`). This is the C3 wire-up: the low-level CRUD above finally gains its
 // real production callers, driven by the `subagent` tool's `action` enum
 // (`list`/`get`/`models`/`create`/`update`/`delete`) via `extension.rs::route_management_action`.
 //
@@ -1190,13 +1275,12 @@ fn serialize_chain_json(def: &ChainDefinition) -> String {
 //     degrading to `(unavailable)` only with no live session.
 //   - skill warnings (`skillsWarning`) and proactive-skill suggestions in `list` — need the skills
 //     subsystem (C4 / Tier 5), entirely absent today.
-//   - companion suggestions in `list` — deferred-companion (no cyrup companion exists to integrate).
 //   - settings-override un-apply on update (`editableAgentConfig`) — settings overrides are inert
 //     today (C2 / Tier 2), so `override_info` is always `None` and the un-apply ([`editable_base`])
 //     is a no-op; it is still applied forward-compatibly here so the moment C2 lands it is correct.
 //
 // One architectural divergence (documented, NOT a management-layer bug): pi's `discoverAgentsAll`
-// returns UNMERGED per-tier arrays (`agents.ts:1325-1422`), so `list`/`get` on a name that a
+// returns UNMERGED per-tier arrays (`agents.ts:1783-1888`), so `list`/`get` on a name that a
 // user/project agent shadows across tiers show BOTH the builtin/package entry AND the shadowing
 // entry. cyrup's `discover_agents_all` returns the R-SA-001 four-tier MERGE (one precedence-winner
 // per name, by deliberate architecture), so `list`/`get` show only the winner. `update`/`delete`
@@ -1205,13 +1289,20 @@ fn serialize_chain_json(def: &ChainDefinition) -> String {
 // scope), out of this C3 task. In the common (non-shadowing) case the output is byte-identical.
 // ===============================================================================================
 
-/// pi's `BUILTIN_AGENT_NAMES` (`agents.ts:25-34`) — used by [`handle_models`] to bound the requested
-/// filter and to iterate the builtin model mapping in pi's exact stable order.
-pub const BUILTIN_AGENT_NAMES: [&str; 8] = [
-    "context-builder",
+/// pi's `BUILTIN_AGENT_NAMES` (`agents.ts:38-46` @ v0.43.0) — used by [`handle_models`] to bound the
+/// requested filter and to iterate the builtin model mapping in pi's exact stable order.
+///
+/// SEVEN names, not eight. Upstream `83b9872` ("fix: remove stale bundled roles") deleted the
+/// `planner` and `context-builder` roles outright — their `agents/*.md`, their paired prompt
+/// templates, and every special case keyed on their names — and `bff9722` added `advisor`, which
+/// `34a018f` then demoted from its own `agents/advisor.md` to an ALIAS on `oracle`
+/// (`agents/oracle.md:3` @ v0.43.0 carries `aliases: advisor`). `advisor` therefore stays in this
+/// list — the roster is the set of names the model-report surface enumerates, and pi keeps listing
+/// it — while shipping NO `advisor.md` of its own; the alias is what resolves it.
+pub const BUILTIN_AGENT_NAMES: [&str; 7] = [
+    "advisor",
     "delegate",
     "oracle",
-    "planner",
     "researcher",
     "reviewer",
     "scout",
@@ -1219,7 +1310,7 @@ pub const BUILTIN_AGENT_NAMES: [&str; 8] = [
 ];
 
 /// The management-relevant subset of the `subagent` tool's parsed parameters (pi `ManagementParams`,
-/// `agent-management.ts:36-42`). Borrowed from the caller's already-parsed `SubagentToolParams` so
+/// `agent-management.ts:45-51`). Borrowed from the caller's already-parsed `SubagentToolParams` so
 /// `extension.rs` owns the JSON deserialization and this module owns only the management semantics.
 pub struct ManagementRequest<'a> {
     pub agent: Option<&'a str>,
@@ -1233,10 +1324,36 @@ pub struct ManagementRequest<'a> {
     /// backend bound / headless) keeps the genuine no-host degrade. Only the `models` action reads
     /// it; the other handlers ignore it.
     pub current_session_model: Option<&'a str>,
+    /// The proactive skill-subagent inputs [`handle_list`] splices in — pi's
+    /// `ctx.config?.proactiveSkillSubagents` plus its `discoverAvailableSkills: () =>
+    /// discoverAvailableSkills(ctx.cwd)` closure (`agent-management.ts:765-770` @v0.43.0). `None`
+    /// means the caller performed no availability scan, which yields no suggestions — the same
+    /// outcome upstream reaches when its `discoverAvailableSkills` throws
+    /// (`proactive-skills.ts:182-186` catches to `[]`, and an empty availability list matches no
+    /// skill). Only the `list` action reads it.
+    pub proactive_skills: Option<ProactiveSkillsInput<'a>>,
+}
+
+/// The two proactive skill-subagent inputs `handleList` reads off its `ManagementContext`
+/// (`agent-management.ts:765-770` @v0.43.0), carried on [`ManagementRequest`] because cyrup's
+/// management layer takes a request rather than a context object.
+///
+/// **Why the availability list is pre-resolved rather than a closure.** Upstream passes a lazy
+/// `discoverAvailableSkills: () => AvailableSkill[]` so that a disabled feature performs no
+/// filesystem scan. cyrup's [`crate::discovery::skills::discover_available_skills`] is `async`
+/// while [`handle_management_action`] is sync, so the laziness moves one level up: the async caller
+/// checks [`crate::discovery::skills::resolve_proactive_skill_subagents_config`]'s `enabled` first
+/// and only then awaits the scan, filling this field. Both upstream properties survive — no scan
+/// when disabled, and no suggestions when the scan found nothing.
+pub struct ProactiveSkillsInput<'a> {
+    /// pi `ctx.config?.proactiveSkillSubagents`. `None` is pi's `undefined` (defaults-on).
+    pub setting: Option<&'a crate::discovery::skills::ProactiveSkillSubagentsSetting>,
+    /// The already-resolved result of pi's `discoverAvailableSkills(ctx.cwd)` closure.
+    pub available_skills: &'a [crate::discovery::skills::AvailableSkill],
 }
 
 /// The rendered outcome of a management action — pi's `result(text, isError)`
-/// (`agent-management.ts:44-46`). `is_error` mirrors pi's `AgentToolResult.isError`; the caller maps
+/// (`agent-management.ts:43-44`). `is_error` mirrors pi's `AgentToolResult.isError`; the caller maps
 /// `is_error == true` to a `ToolError` (cyrup surfaces tool failures as `Err`, R-02-024) while still
 /// preserving pi's exact human-facing text verbatim.
 pub struct ManagementOutcome {
@@ -1270,7 +1387,7 @@ pub const MANAGEMENT_ACTIONS: [&str; 10] = [
 pub const MUTATING_MANAGEMENT_ACTIONS: [&str; 7] =
     ["create", "update", "delete", "eject", "disable", "enable", "reset"];
 
-/// pi's `handleManagementAction` (`agent-management.ts:870-880`): dispatch a management `action` to
+/// pi's `handleManagementAction` (`agent-management.ts:1242-1256`): dispatch a management `action` to
 /// its handler. Discovery is re-run per call inside each handler (R-SA-019), never cached across a
 /// create -> get -> update -> delete sequence.
 ///
@@ -1328,7 +1445,7 @@ fn override_scope_str(scope: OverrideScope) -> &'static str {
     }
 }
 
-/// pi `asDisambiguationScope` (`agent-management.ts:70-73`): `"user"`/`"project"` pass through,
+/// pi `asDisambiguationScope` (`agent-management.ts:79-82`): `"user"`/`"project"` pass through,
 /// anything else (incl. absent / `"both"`) is `None`.
 fn disambiguation_scope(scope: Option<&str>) -> Option<AgentSource> {
     match scope {
@@ -1338,7 +1455,7 @@ fn disambiguation_scope(scope: Option<&str>) -> Option<AgentSource> {
     }
 }
 
-/// pi `normalizeListScope` (`agent-management.ts:75-79`): absent -> both; `"user"`/`"project"`/
+/// pi `normalizeListScope` (`agent-management.ts:90-94`): absent -> both; `"user"`/`"project"`/
 /// `"both"` pass through; any other value falls back to both. `None` here means "both".
 fn normalize_list_scope(scope: Option<&str>) -> Option<AgentSource> {
     match scope {
@@ -1348,7 +1465,7 @@ fn normalize_list_scope(scope: Option<&str>) -> Option<AgentSource> {
     }
 }
 
-/// pi `sanitizeName` (`agent-management.ts:81-83`): `lowercase`, `trim`, `\s+`->`-`, strip
+/// pi `sanitizeName` (`agent-management.ts:96-98`): `lowercase`, `trim`, `\s+`->`-`, strip
 /// `[^a-z0-9-]`, `-+`->`-`, trim leading/trailing `-`.
 fn sanitize_name(name: &str) -> String {
     let lowered = name.to_lowercase();
@@ -1374,7 +1491,7 @@ fn sanitize_name(name: &str) -> String {
     collapsed.trim_matches('-').to_string()
 }
 
-/// pi `parseCsv` (`agent-management.ts:48-50`): split on `,`, trim, drop empties, dedup preserving
+/// pi `parseCsv` (`agent-management.ts:57-59`): split on `,`, trim, drop empties, dedup preserving
 /// first occurrence.
 fn parse_csv(value: &str) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -1388,7 +1505,7 @@ fn parse_csv(value: &str) -> Vec<String> {
     out
 }
 
-/// pi `parseTools` (`agent-management.ts:310-320`): split CSV; `mcp:`-prefixed entries become MCP
+/// pi `parseTools` (`agent-management.ts:395-408`): split CSV; `mcp:`-prefixed entries become MCP
 /// direct-tool refs (prefix stripped, verbatim otherwise), the rest builtin refs. cyrup unifies both
 /// into one `Vec<ToolRef>` (MCP entries preserved as [`ToolRef::Mcp`] without the `mcp:` prefix,
 /// matching [`tool_ref_to_frontmatter_entry`]'s inverse).
@@ -1428,7 +1545,7 @@ fn default_inherit_project_context(local_name: &str) -> bool {
 // config-object / package-name parsing (pi configObject / parsePackageName)
 // -------------------------------------------------------------------------------------------
 
-/// pi `configObject` (`agent-management.ts:52-64`): a JSON-string config is `JSON.parse`d (parse
+/// pi `configObject` (`agent-management.ts:61-73`): a JSON-string config is `JSON.parse`d (parse
 /// failure -> `config must be valid JSON: …`); a non-object (or array) yields `Ok(None)`; an object
 /// yields `Ok(Some(map))`.
 fn config_object(
@@ -1471,16 +1588,55 @@ fn parse_package_config(value: Option<&serde_json::Value>) -> Result<Option<Stri
 
 // -------------------------------------------------------------------------------------------
 // applyAgentConfig: parse the caller's `config` object into an `AgentFields` delta (pi
-// applyAgentConfig, agent-management.ts:322-417). Exact pi error strings are reproduced verbatim
+// applyAgentConfig, agent-management.ts:410-615). Exact pi error strings are reproduced verbatim
 // (the tool test-suite pins several, e.g. `config.completionGuard must be a boolean`).
 // -------------------------------------------------------------------------------------------
 
 fn apply_agent_config(
     fields: &mut AgentFields,
     cfg: &serde_json::Map<String, serde_json::Value>,
+    target_name: &str,
 ) -> Result<(), String> {
     use serde_json::Value;
 
+    // pi `agent-management.ts:411-421` @ v0.43.0 — the FIRST branch of `applyAgentConfig`:
+    //
+    //   if (cfg.aliases === false || cfg.aliases === "") target.aliases = undefined;
+    //   else if (typeof cfg.aliases === "string") { parseCsv(...).filter(a => a !== target.name) }
+    //   else if (Array.isArray(...) && every string) { [...new Set(map(trim).filter(Boolean))].filter(a => a !== target.name) }
+    //   else return "config.aliases must be a comma-separated string, string array, or false when provided.";
+    //
+    // `target_name` is the target's name AS IT STANDS WHEN THE CONFIG IS APPLIED, which on a rename
+    // is still the OLD runtime name: upstream calls `applyAgentConfig` at `:1006`, six lines before
+    // `updated.name = buildRuntimeName(newLocalName, newPackageName)` at `:1012`.
+    if let Some(v) = cfg.get("aliases") {
+        if v == &Value::Bool(false) || v.as_str() == Some("") {
+            fields.aliases = Some(Vec::new());
+        } else if let Some(raw) = v.as_str() {
+            fields.aliases =
+                Some(parse_csv(raw).into_iter().filter(|a| a != target_name).collect());
+        } else if let Some(arr) = v.as_array()
+            && arr.iter().all(Value::is_string)
+        {
+            let mut seen = HashSet::new();
+            let mut aliases = Vec::new();
+            for item in arr {
+                let trimmed = item.as_str().unwrap_or_default().trim();
+                if trimmed.is_empty() || trimmed == target_name {
+                    continue;
+                }
+                if seen.insert(trimmed.to_string()) {
+                    aliases.push(trimmed.to_string());
+                }
+            }
+            fields.aliases = Some(aliases);
+        } else {
+            return Err(
+                "config.aliases must be a comma-separated string, string array, or false when provided."
+                    .to_string(),
+            );
+        }
+    }
     if let Some(v) = cfg.get("systemPrompt") {
         if v == &Value::Bool(false) || v.as_str() == Some("") {
             fields.system_prompt_body = Some(String::new());
@@ -1570,7 +1726,7 @@ fn apply_agent_config(
         }
     }
     if let Some(v) = cfg.get("thinking") {
-        // pi `applyAgentConfig` (`agent-management.ts:368-372`): `false`/`""` clears; any other
+        // pi `applyAgentConfig` (`agent-management.ts:507-514`): `false`/`""` clears; any other
         // string sets the OPEN value (trimmed; a whitespace-only value clears). No closed-enum
         // coercion — an arbitrary/`off` value is preserved verbatim.
         if v == &Value::Bool(false) || v.as_str() == Some("") {
@@ -1793,23 +1949,65 @@ fn parse_step_list(raw: Option<&serde_json::Value>) -> Result<Vec<ChainStepConfi
 // unknownChainAgents + resolveTarget)
 // -------------------------------------------------------------------------------------------
 
-/// pi `findAgents` (`agent-management.ts:99-106`): raw-or-sanitized exact-name match over the
-/// management (disabled-inclusive) view, optionally narrowed to one scope, sorted by source label.
+/// pi `findAgents` (`agent-management.ts:114-126` @ v0.43.0): ALIAS-AWARE lookup over the management
+/// (disabled-inclusive) view, optionally narrowed to one scope, sorted by source label.
+///
+/// The upstream shape, verbatim:
+/// 1. Resolve `raw` against the scoped list with [`resolve_agent_name`].
+/// 2. If that neither matched nor was ambiguous, retry with the sanitized name (only when the
+///    sanitized form actually differs). An AMBIGUOUS first attempt is NOT retried — the retry guard
+///    is `!resolved.agent && !resolved.error`.
+/// 3. On a hit, return EVERY definition sharing the resolved CANONICAL name (so a user file
+///    shadowing a builtin still yields both tiers, which is what `resolve_target`'s
+///    both-scopes/read-only messages are built on).
+/// 4. On a miss OR an ambiguity, fall back to the per-candidate membership probe
+///    `resolveAgentName(raw, [agent]).agent` — which, run against a ONE-element list, can never be
+///    ambiguous, so this is exactly "every agent whose own name/localName/aliases answer to `raw`
+///    (or to the sanitized form)". That is what surfaces the several distinct canonical names an
+///    ambiguity error must list.
 fn find_agents(d: &AgentDiscoveryResult, name: &str, scope: Option<AgentSource>) -> Vec<AgentDefinition> {
     let raw = name.trim();
     let sanitized = sanitize_name(raw);
-    let mut matches: Vec<AgentDefinition> = d
+    let scoped: Vec<AgentDefinition> = d
         .agents
         .iter()
         .filter(|a| scope.is_none() || Some(a.source) == scope)
-        .filter(|a| a.name == raw || a.name == sanitized)
         .cloned()
         .collect();
+
+    let mut resolved = resolve_agent_name(raw, &scoped);
+    if matches!(resolved, AgentNameResolution::NotFound) && sanitized != raw {
+        resolved = resolve_agent_name(&sanitized, &scoped);
+    }
+
+    let mut matches: Vec<AgentDefinition> = if let Some(agent) = resolved.agent() {
+        let canonical = agent.name.clone();
+        scoped.iter().filter(|a| a.name == canonical).cloned().collect()
+    } else {
+        scoped
+            .iter()
+            .filter(|a| {
+                let one = std::slice::from_ref(*a);
+                resolve_agent_name(raw, one).agent().is_some()
+                    || (sanitized != raw
+                        && resolve_agent_name(&sanitized, one).agent().is_some())
+            })
+            .cloned()
+            .collect()
+    };
     matches.sort_by(|a, b| source_str(a.source).cmp(source_str(b.source)));
     matches
 }
 
-/// pi `findChains` (`agent-management.ts:108-114`).
+/// The DISTINCT canonical names present in a match set, sorted — pi's
+/// `[...new Set(matches.map(m => m.name))].sort((a, b) => a.localeCompare(b))`
+/// (`agent-management.ts:624-626,880-882` @v0.43.0). More than one entry means the requested name/alias is
+/// ambiguous and every caller must refuse rather than pick.
+fn distinct_agent_names<'a>(matches: impl IntoIterator<Item = &'a AgentDefinition>) -> Vec<String> {
+    matches.into_iter().map(|a| a.name.clone()).collect::<BTreeSet<_>>().into_iter().collect()
+}
+
+/// pi `findChains` (`agent-management.ts:128-134`).
 fn find_chains(d: &AgentDiscoveryResult, name: &str, scope: Option<AgentSource>) -> Vec<ChainDefinition> {
     let raw = name.trim();
     let sanitized = sanitize_name(raw);
@@ -1824,7 +2022,7 @@ fn find_chains(d: &AgentDiscoveryResult, name: &str, scope: Option<AgentSource>)
     matches
 }
 
-/// pi `availableNames(cwd, "agent")` (`agent-management.ts:93-97`): unique, sorted runtime names.
+/// pi `availableNames(cwd, "agent")` (`agent-management.ts:108-112`): unique, sorted runtime names.
 fn available_agent_names(d: &AgentDiscoveryResult) -> Vec<String> {
     d.agents
         .iter()
@@ -1843,7 +2041,7 @@ fn available_chain_names(d: &AgentDiscoveryResult) -> Vec<String> {
         .collect()
 }
 
-/// pi `nameExistsInScope` (`agent-management.ts:116-125`): whether an agent OR chain with this
+/// pi `nameExistsInScope` (`agent-management.ts:154-163`): whether an agent OR chain with this
 /// runtime name already exists in the given writable scope (excluding one path, used on rename).
 fn name_exists_in_scope(
     d: &AgentDiscoveryResult,
@@ -1864,14 +2062,17 @@ fn name_exists_in_scope(
     false
 }
 
-/// pi `unknownChainAgents` (`agent-management.ts:131-135`): step agents that resolve to no known
+/// pi `unknownChainAgents` (`agent-management.ts:169-174`): step agents that resolve to no known
 /// agent name, unique and sorted. Dynamic (agent-less) steps are skipped.
 fn unknown_chain_agents(d: &AgentDiscoveryResult, steps: &[ChainStepConfig]) -> Vec<String> {
-    let known: HashSet<&str> = d.agents.iter().map(|a| a.name.as_str()).collect();
+    // pi v0.43.0 (`agent-management.ts:169-174`) replaced the `new Set(allAgents(d).map(a => a.name))`
+    // membership test with `!resolveAgentName(agentName, agents).agent`, so a step that names an
+    // ALIAS is known and no longer warns. An ambiguous name yields no `.agent` and is therefore
+    // reported as unknown — upstream's behaviour, and defensible: the chain cannot be run either way.
     let mut missing = BTreeSet::new();
     for step in steps {
         if let Some(agent) = &step.agent
-            && !known.contains(agent.as_str())
+            && resolve_agent_name(agent, &d.agents).agent().is_none()
         {
             missing.insert(agent.clone());
         }
@@ -1884,6 +2085,10 @@ fn unknown_chain_agents(d: &AgentDiscoveryResult, steps: &[ChainStepConfig]) -> 
 trait MutableTarget: Clone {
     fn source(&self) -> AgentSource;
     fn file_path(&self) -> &Path;
+    /// The target's CANONICAL name — pi widened `resolveTarget`'s bound to
+    /// `T extends { name: string; … }` (`agent-management.ts:617`) precisely so it could reject a
+    /// match set spanning several distinct names.
+    fn target_name(&self) -> &str;
 }
 
 impl MutableTarget for AgentDefinition {
@@ -1893,6 +2098,9 @@ impl MutableTarget for AgentDefinition {
     fn file_path(&self) -> &Path {
         &self.file_path
     }
+    fn target_name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl MutableTarget for ChainDefinition {
@@ -1901,6 +2109,9 @@ impl MutableTarget for ChainDefinition {
     }
     fn file_path(&self) -> &Path {
         &self.file_path
+    }
+    fn target_name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -1925,7 +2136,7 @@ impl TargetKind {
     }
 }
 
-/// pi `resolveTarget` (`agent-management.ts:419-444`): pick the single writable target for a
+/// pi `resolveTarget` (`agent-management.ts:617-646`): pick the single writable target for a
 /// mutating action, producing pi's exact read-only / not-found / disambiguation messages as an
 /// error [`ManagementOutcome`].
 fn resolve_target<T: MutableTarget>(
@@ -1935,6 +2146,24 @@ fn resolve_target<T: MutableTarget>(
     available: &[String],
     scope_hint_raw: Option<&str>,
 ) -> Result<T, ManagementOutcome> {
+    // pi `agent-management.ts:624-627` @ v0.43.0, ahead of every other branch: a match set spanning
+    // several DISTINCT canonical names means the requested string was an ambiguous alias (or an
+    // ambiguous name), and a mutating action must refuse outright rather than silently mutate one of
+    // them. Names are listed sorted, de-duplicated.
+    let distinct: Vec<String> = matches
+        .iter()
+        .map(|m| m.target_name().to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if distinct.len() > 1 {
+        return Err(ManagementOutcome::err(format!(
+            "Ambiguous {} alias or name '{}': {}",
+            kind.low(),
+            name,
+            distinct.join(", ")
+        )));
+    }
     let mutable: Vec<T> = matches
         .iter()
         .filter(|m| m.source().is_writable())
@@ -2011,7 +2240,7 @@ fn resolve_target<T: MutableTarget>(
 // Renderers (pi formatAgentDetail / formatChainDetail / formatChainStepDetail, 463-537)
 // -------------------------------------------------------------------------------------------
 
-/// pi `formatAgentDetail` (`agent-management.ts:463-489`).
+/// pi `formatAgentDetail` (`agent-management.ts:665-701`).
 fn format_agent_detail(a: &AgentDefinition) -> String {
     let mut tools_out: Vec<String> = Vec::new();
     if let Some(tools) = &a.tools {
@@ -2038,6 +2267,11 @@ fn format_agent_detail(a: &AgentDefinition) -> String {
         if let Some(pkg) = &a.package_name {
             lines.push(format!("Package: {pkg}"));
         }
+    }
+    // pi `agent-management.ts:672` @ v0.43.0: `if (agent.aliases?.length) lines.push(...)` — between
+    // the package block and the model line.
+    if !a.aliases.is_empty() {
+        lines.push(format!("Aliases: {}", a.aliases.join(", ")));
     }
     if let Some(model) = &a.model {
         lines.push(format!("Model: {model}"));
@@ -2135,7 +2369,7 @@ fn format_agent_detail(a: &AgentDefinition) -> String {
     lines.join("\n")
 }
 
-/// pi `formatChainStepDetail` (`agent-management.ts:491-524`).
+/// pi `formatChainStepDetail` (`agent-management.ts:703-738`).
 fn format_chain_step_detail(step: &ChainStepConfig, index: usize) -> Vec<String> {
     let n = index + 1;
     let mut lines: Vec<String> = Vec::new();
@@ -2235,7 +2469,7 @@ fn format_chain_step_detail(step: &ChainStepConfig, index: usize) -> Vec<String>
     lines
 }
 
-/// pi `formatChainDetail` (`agent-management.ts:526-537`).
+/// pi `formatChainDetail` (`agent-management.ts:740-751`).
 fn format_chain_detail(c: &ChainDefinition) -> String {
     let mut lines: Vec<String> = vec![
         format!("Chain: {} ({})", c.name, source_str(c.source)),
@@ -2268,8 +2502,24 @@ fn chain_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool 
     scope.is_none() || source == AgentSource::Package || Some(source) == scope
 }
 
-/// pi `handleList` (`agent-management.ts:539-566`). Proactive-skill and companion suggestion blocks
-/// are deferred (skills/companion subsystems absent — see section header).
+/// pi `handleList` (`agent-management.ts:753-788` @v0.43.0 — thirty-six lines).
+///
+/// The proactive-skill block is spliced in exactly where upstream splices it: BETWEEN the `Chains:`
+/// block and the chain diagnostics, preceded by one blank line and only when it has lines
+/// (`agent-management.ts:784`'s
+/// `...(proactiveSuggestions.length ? ["", ...proactiveSuggestions] : [])`). Its two inputs — pi's
+/// `ctx.config?.proactiveSkillSubagents` and the result of its `discoverAvailableSkills(ctx.cwd)`
+/// closure — arrive on [`ManagementRequest::proactive_skills`]; see [`ProactiveSkillsInput`] for
+/// why the availability scan is pre-resolved by the async caller rather than run lazily here.
+///
+/// The recommender consults the SAME `agents`/`chains` bindings this function already rendered
+/// (upstream passes its own post-filter `agents` and `chains` locals), so a scope-filtered or
+/// disabled-filtered listing recommends only from what it listed.
+///
+/// There is no companion-suggestion block to port: upstream
+/// deleted `companionSuggestionLines` from `handleList`'s `ManagementContext` and from its rendered
+/// lines in `3ac0ef5` ("Make supervisor coordination native", 2026-07-03), together with the whole
+/// `extension/companion-suggestions.ts` module.
 fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
     let scope = normalize_list_scope(req.agent_scope);
     let d = discover_agents_all(cfg)?;
@@ -2305,7 +2555,21 @@ fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Ma
                 .default_context
                 .map(|c| format!(", context: {}", context_str(c)))
                 .unwrap_or_default();
-            lines.push(format!("- {} ({}{}): {}", a.name, source_str(a.source), ctx, a.description));
+            // pi `agent-management.ts:774` @ v0.43.0 appends `, aliases: <a, b>` after the optional
+            // context segment and before the `: <description>` separator.
+            let aliases = if a.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(", aliases: {}", a.aliases.join(", "))
+            };
+            lines.push(format!(
+                "- {} ({}{}{}): {}",
+                a.name,
+                source_str(a.source),
+                ctx,
+                aliases,
+                a.description
+            ));
         }
     }
     lines.push(String::new());
@@ -2315,6 +2579,33 @@ fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Ma
     } else {
         for c in &chains {
             lines.push(format!("- {} ({}): {}", c.name, source_str(c.source), c.description));
+        }
+    }
+    // pi `agent-management.ts:765-770,784` @v0.43.0: the proactive suggestions are computed from the same
+    // filtered `agents`/`chains` this listing rendered, and spliced in after `Chains:` and before
+    // `Chain diagnostics:` — with a leading blank line, and only when non-empty.
+    if let Some(proactive) = &req.proactive_skills {
+        let agent_inputs: Vec<crate::discovery::skills::ProactiveAgentInput> = agents
+            .iter()
+            .map(|a| crate::discovery::skills::proactive_agent_input(a))
+            .collect();
+        let chain_inputs: Vec<crate::discovery::skills::ProactiveChainInput> = chains
+            .iter()
+            .map(|c| crate::discovery::skills::proactive_chain_input(c))
+            .collect();
+        let suggestions =
+            crate::discovery::skills::build_proactive_skill_subagent_recommendation_lines(
+                &agent_inputs,
+                &chain_inputs,
+                proactive.setting,
+                // The availability scan already happened (see `ProactiveSkillsInput`); this closure
+                // is the sync shim that hands its result to the recommender, and — exactly like
+                // upstream's — is never called when the feature is disabled.
+                || Ok::<_, std::convert::Infallible>(proactive.available_skills.to_vec()),
+            );
+        if !suggestions.is_empty() {
+            lines.push(String::new());
+            lines.extend(suggestions);
         }
     }
     if !diagnostics.is_empty() {
@@ -2327,7 +2618,7 @@ fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Ma
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 
-/// pi `handleGet` (`agent-management.ts:649-677`).
+/// pi `handleGet` (`agent-management.ts:871-906`).
 fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
     if req.agent.is_none() && req.chain_name.is_none() {
         return Ok(ManagementOutcome::err("Specify 'agent' or 'chainName' for get."));
@@ -2338,7 +2629,20 @@ fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Man
     let mut any_found = false;
     if let Some(agent_name) = req.agent {
         let matches = find_agents(&d, agent_name, None);
-        if matches.is_empty() {
+        // pi `handleGet` @ v0.43.0 (`agent-management.ts:871-885`) checks AMBIGUITY first: a match
+        // set spanning several distinct canonical names is refused before the not-found branch.
+        let distinct = distinct_agent_names(&matches);
+        if distinct.len() > 1 {
+            let msg = format!(
+                "Ambiguous agent alias or name '{}': {}",
+                agent_name,
+                distinct.join(", ")
+            );
+            if !has_both {
+                return Ok(ManagementOutcome::err(msg));
+            }
+            blocks.push(msg);
+        } else if matches.is_empty() {
             let avail = available_agent_names(&d);
             let msg = format!(
                 "Agent '{}' not found. Available: {}.",
@@ -2379,11 +2683,11 @@ fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Man
     Ok(ManagementOutcome { text: blocks.join("\n\n"), is_error: !any_found })
 }
 
-/// Port of pi `formatModelSource` (`agent-management.ts:568-578`). The live parent session model is
+/// Port of pi `formatModelSource` (`agent-management.ts:790-800`). The live parent session model is
 /// now threaded in as `current_session_model` (from [`ManagementRequest::current_session_model`] /
 /// [`cyrup_ext::host::HostServices::current_model`]), so when the persona declares no `model` but a
 /// live session model is bound this reports "inherits current session model" (pi's own wording,
-/// agent-management.ts:576); otherwise it classifies from discovery-time provenance (`override_info`
+/// agent-management.ts:798); otherwise it classifies from discovery-time provenance (`override_info`
 /// / `model_source`) and the agent's own resolved `model`.
 fn format_model_source(agent: &AgentDefinition, current_session_model: Option<&str>) -> String {
     if let Some(info) = &agent.override_info
@@ -2403,7 +2707,7 @@ fn format_model_source(agent: &AgentDefinition, current_session_model: Option<&s
     "inherit requested, but no current session model is available".to_string()
 }
 
-/// pi `handleModels` (`agent-management.ts:580-647`): the live parent session model is now threaded
+/// pi `handleModels` (`agent-management.ts:802-869`): the live parent session model is now threaded
 /// in via [`ManagementRequest::current_session_model`] (from
 /// [`cyrup_ext::host::HostServices::current_model`]), so `Current session model` renders the real
 /// `provider/id` and an inheriting persona's effective model falls back to it; both degrade to
@@ -2521,7 +2825,7 @@ fn pick_scope_dir(cfg: &AgentDiscoveryConfig, scope: AgentSource, is_chain: bool
     dirs.last().cloned()
 }
 
-/// pi `handleCreate` (`agent-management.ts:679-738`). Model/skills registry warnings are deferred
+/// pi `handleCreate` (`agent-management.ts:908-975`). Model/skills registry warnings are deferred
 /// (see section header); the create + name-collision + shadow-note + unknown-agent warnings are
 /// faithful.
 fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
@@ -2621,7 +2925,9 @@ fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
         system_prompt_body: Some(String::new()),
         ..AgentFields::default()
     };
-    if let Err(e) = apply_agent_config(&mut fields, &cfg_map) {
+    // On CREATE the target's name is the just-built runtime name (pi `agent-management.ts:953-965`
+    // constructs the `AgentConfig` with `name: runtimeName` before calling `applyAgentConfig`).
+    if let Err(e) = apply_agent_config(&mut fields, &cfg_map, &runtime_name) {
         return Ok(ManagementOutcome::err(e));
     }
     let Some(created) = create_agent(&scope_dir, scope, &local_name, &description, &fields)? else {
@@ -2637,18 +2943,29 @@ fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 
-/// The base definition to edit: pi `editableAgentConfig` (`agent-management.ts:174-196`) un-applies a
+/// The base definition to edit: pi `editableAgentConfig` (`agent-management.ts:217-267`) un-applies a
 /// settings override so an update writes the agent's own base values, never the override-applied
 /// ones. Settings overrides are inert today (C2), so `override_info` is always `None` and this is a
 /// clone — kept forward-compatible for the moment C2 lands.
 fn editable_base(target: &AgentDefinition) -> AgentDefinition {
-    match &target.override_info {
+    let mut base = match &target.override_info {
         Some(info) => (*info.base_snapshot).clone(),
         None => target.clone(),
+    };
+    // pi `editableAgentConfig` (`agent-management.ts:243`):
+    // `...(agent.extensionsFromDefault ? {} : agent.extensions !== undefined ? { extensions: [...] } : {})`
+    // — an `extensions` list that came from `subagents.defaultExtensions` is NOT the agent's own
+    // data, so it is dropped here rather than BAKED into the `.md` file by the next update. (cyrup's
+    // `base_snapshot` is a whole-definition clone, unlike pi's field-subset `cloneOverrideBase`, so
+    // this guard also covers pi's `agents.ts:582` exclusion on the override-restore baseline.)
+    if base.extensions_from_default {
+        base.extensions = None;
+        base.extensions_from_default = false;
     }
+    base
 }
 
-/// pi `handleUpdate` (`agent-management.ts:740-847`). Model/fallback/skills registry warnings are
+/// pi `handleUpdate` (`agent-management.ts:977-1088`). Model/fallback/skills registry warnings are
 /// deferred (see section header); rename, package repackaging, unknown-agent warnings, and the
 /// still-referenced-after-rename warning are faithful.
 fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
@@ -2700,7 +3017,7 @@ fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
             }
         }
         let mut fields = AgentFields::default();
-        if let Err(e) = apply_agent_config(&mut fields, &cfg_map) {
+        if let Err(e) = apply_agent_config(&mut fields, &cfg_map, &old_name) {
             return Ok(ManagementOutcome::err(e));
         }
         fields.local_name = Some(new_local.clone());
@@ -2833,7 +3150,7 @@ fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 
-/// pi `handleDelete` (`agent-management.ts:849-868`).
+/// pi `handleDelete` (`agent-management.ts:1090-1109`).
 fn handle_delete(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
     if req.agent.is_none() && req.chain_name.is_none() {
         return Ok(ManagementOutcome::err("Specify 'agent' or 'chainName' for delete."));
@@ -2885,7 +3202,7 @@ fn handle_delete(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
 
 // =================================================================================================
 // SUBA-005: the tier-aware / settings-writing management actions
-// (pi `handleEject`/`handleDisable`/`handleEnable`/`handleReset`, `agent-management.ts:909-1032`)
+// (pi `handleEject`/`handleDisable`/`handleEnable`/`handleReset`, `agent-management.ts:1111-1240`)
 // =================================================================================================
 //
 // These four are the last of pi's ten `ManagementAction`s to be ported. They differ from the six
@@ -2906,7 +3223,7 @@ fn handle_delete(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
 // not actually change, naming the higher-precedence scope that is winning. A settings write that is
 // silently overruled by the other scope is exactly the failure a user cannot debug on their own.
 
-/// pi `actionScope` (`agent-management.ts:79-83`): unlike the CRUD actions' `asDisambiguationScope`
+/// pi `actionScope` (`agent-management.ts:84-88`): unlike the CRUD actions' `asDisambiguationScope`
 /// (where an absent/unrecognized `agentScope` means "both, disambiguate later"), these four actions
 /// each write to exactly ONE scope, so an absent `agentScope` defaults to `user` and anything other
 /// than `user`/`project` is a hard validation error naming the action.
@@ -2921,21 +3238,47 @@ fn action_scope(scope: Option<&str>, action: &str) -> Result<AgentSource, Manage
     }
 }
 
-/// pi `pickEffectiveAgent` (`agent-management.ts:131-137`): the single highest-precedence agent
-/// matching `name` either verbatim or after [`sanitize_name`].
+/// pi `resolveEffectiveAgent` (`agent-management.ts:138-152` @ v0.43.0, renamed from
+/// `pickEffectiveAgent` when it became alias-aware): the single highest-precedence agent answering
+/// to `name` — verbatim, by alias, or (only when neither matched) after [`sanitize_name`].
+///
+/// Three outcomes, matching pi's `{ agent?, error? }`:
+/// * `Ok(Some(agent))` — resolved.
+/// * `Ok(None)` — nothing answers; the caller emits its own "not found. Available: …".
+/// * `Err(message)` — the name/alias is AMBIGUOUS; the caller surfaces the message verbatim. This
+///   outcome did not exist before aliases, and it must not be collapsed into `Ok(None)`: a
+///   "not found" message for a name that matched two agents would be actively misleading.
+///
+/// The sanitized retry is gated on the first attempt being a clean MISS (pi's
+/// `!resolved.agent && !resolved.error`) — an ambiguous raw name is never retried.
 ///
 /// pi reduces over its concatenated per-tier arrays by `AGENT_SOURCE_PRECEDENCE`; cyrup's
-/// `discover_agents_all` has *already* performed that reduction per name (R-SA-001), so the only
-/// residual ambiguity is the raw-vs-sanitized pair matching two DIFFERENT names — resolved here by
-/// the same precedence rule (`precedence_rank`, lower wins) rather than by scan order.
-fn pick_effective_agent(d: &AgentDiscoveryResult, name: &str) -> Option<AgentDefinition> {
+/// `discover_agents_all` has *already* performed that reduction per name (R-SA-001), so the reduce
+/// below normally sees a single element — it is kept so the precedence rule is stated, not implied.
+fn resolve_effective_agent(
+    d: &AgentDiscoveryResult,
+    name: &str,
+) -> Result<Option<AgentDefinition>, String> {
     let raw = name.trim();
-    let sanitized = sanitize_name(raw);
-    d.agents
+    let mut resolved = resolve_agent_name(raw, &d.agents);
+    if matches!(resolved, AgentNameResolution::NotFound) {
+        let sanitized = sanitize_name(raw);
+        if sanitized != raw {
+            resolved = resolve_agent_name(&sanitized, &d.agents);
+        }
+    }
+    if let Some(err) = resolved.error() {
+        return Err(err.to_string());
+    }
+    let Some(agent) = resolved.agent() else {
+        return Ok(None);
+    };
+    let canonical = agent.name.clone();
+    Ok(d.agents
         .iter()
-        .filter(|a| a.name == raw || a.name == sanitized)
+        .filter(|a| a.name == canonical)
         .min_by_key(|a| a.source.precedence_rank())
-        .cloned()
+        .cloned())
 }
 
 /// The bundled (read-only) tiers in pi's own `[...d.package, ...d.builtin]` search order
@@ -2963,7 +3306,7 @@ fn writable_tier(tiers: &super::merge::TieredAgents, scope: AgentSource) -> &[Ag
 }
 
 /// The `settings.json` path these actions write for `scope`, or pi's verbatim refusal when the
-/// project scope does not exist at all (`agent-management.ts:955-957`, mirrored for enable/reset).
+/// project scope does not exist at all (`agent-management.ts:1157`, mirrored for enable/reset at `:1181`/`:1210`).
 ///
 /// `project_settings_path` is `None` **only** when the discovery config was built with no project
 /// root; an existing project root whose `settings.json` has not been created yet is `Some(path)`
@@ -3002,7 +3345,7 @@ fn with_settings_reread(cfg: &AgentDiscoveryConfig) -> Result<AgentDiscoveryConf
     Ok(refreshed)
 }
 
-/// pi `handleEject` (`agent-management.ts:909-943`): copy a read-only builtin/package agent file
+/// pi `handleEject` (`agent-management.ts:1111-1147`): copy a read-only builtin/package agent file
 /// verbatim into a writable scope so it can be customized, refusing rather than clobbering whenever
 /// the destination is already occupied.
 ///
@@ -3087,7 +3430,7 @@ fn handle_eject(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<M
     )))
 }
 
-/// pi `handleDisable` (`agent-management.ts:947-968`): write `{ disabled: true }` into
+/// pi `handleDisable` (`agent-management.ts:1149-1171`): write `{ disabled: true }` into
 /// `subagents.agentOverrides.<name>` at `scope`, then RE-DISCOVER and verify the agent actually
 /// became invisible — reporting an error (naming the winning scope) if a higher-precedence override
 /// overruled the write.
@@ -3106,12 +3449,18 @@ fn handle_disable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result
     };
 
     let d = discover_agents_all(cfg)?;
-    let Some(effective) = pick_effective_agent(&d, raw) else {
-        let avail = available_agent_names(&d);
-        return Ok(ManagementOutcome::err(format!(
-            "Agent '{raw}' not found. Available: {}.",
-            if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
-        )));
+    // pi `agent-management.ts:987-988` @ v0.43.0: the AMBIGUITY outcome is surfaced verbatim and
+    // short-circuits ahead of the not-found message.
+    let effective = match resolve_effective_agent(&d, raw) {
+        Err(msg) => return Ok(ManagementOutcome::err(msg)),
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            let avail = available_agent_names(&d);
+            return Ok(ManagementOutcome::err(format!(
+                "Agent '{raw}' not found. Available: {}.",
+                if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
+            )));
+        }
     };
     let runtime_name = effective.name;
 
@@ -3125,7 +3474,8 @@ fn handle_disable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result
     // `disabled: Some(true)`, which is precisely the signal being checked. The re-read
     // ([`with_settings_reread`]) is what makes this a verification rather than a replay of the
     // pre-write snapshot.
-    let after = pick_effective_agent(&discover_agents_all(&with_settings_reread(cfg)?)?, raw);
+    let after =
+        resolve_effective_agent(&discover_agents_all(&with_settings_reread(cfg)?)?, raw).ok().flatten();
     if after.as_ref().and_then(|a| a.disabled) == Some(true) {
         return Ok(ManagementOutcome::ok(format!(
             "Disabled agent '{runtime_name}' via {} settings override at {}. It is now hidden from \
@@ -3145,7 +3495,7 @@ fn handle_disable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result
     )))
 }
 
-/// pi `handleEnable` (`agent-management.ts:970-996`): remove ONLY the `disabled` field from
+/// pi `handleEnable` (`agent-management.ts:1173-1199`): remove ONLY the `disabled` field from
 /// `subagents.agentOverrides.<name>` at `scope` (an agent's other overrides — its model, tools,
 /// thinking budget — survive being re-enabled), then re-discover and verify.
 fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
@@ -3163,12 +3513,18 @@ fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
     };
 
     let d = discover_agents_all(cfg)?;
-    let Some(effective) = pick_effective_agent(&d, raw) else {
-        let avail = available_agent_names(&d);
-        return Ok(ManagementOutcome::err(format!(
-            "Agent '{raw}' not found. Available: {}.",
-            if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
-        )));
+    // pi `agent-management.ts:987-988` @ v0.43.0: the AMBIGUITY outcome is surfaced verbatim and
+    // short-circuits ahead of the not-found message.
+    let effective = match resolve_effective_agent(&d, raw) {
+        Err(msg) => return Ok(ManagementOutcome::err(msg)),
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            let avail = available_agent_names(&d);
+            return Ok(ManagementOutcome::err(format!(
+                "Agent '{raw}' not found. Available: {}.",
+                if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
+            )));
+        }
     };
     let runtime_name = effective.name;
 
@@ -3178,7 +3534,8 @@ fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
         &["disabled"],
     )?;
     // Re-read from disk before verifying — see [`with_settings_reread`].
-    let after = pick_effective_agent(&discover_agents_all(&with_settings_reread(cfg)?)?, raw);
+    let after =
+        resolve_effective_agent(&discover_agents_all(&with_settings_reread(cfg)?)?, raw).ok().flatten();
 
     if let Some(after) = after.as_ref()
         && after.disabled != Some(true)
@@ -3217,7 +3574,7 @@ fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
     )))
 }
 
-/// pi `handleReset` (`agent-management.ts:998-1032`): undo BOTH halves of a customization at
+/// pi `handleReset` (`agent-management.ts:1201-1240`): undo BOTH halves of a customization at
 /// `scope` — delete the custom `.md` file that shadows a bundled agent, and delete the whole
 /// `subagents.agentOverrides.<name>` entry — returning the agent to its bundled default.
 ///
@@ -3334,8 +3691,10 @@ mod tests {
             local_name: "reviewer".to_string(),
             package_name: None,
             description: "reviews things".to_string(),
+            aliases: Vec::new(),
             tools: None,
             extensions: None,
+            extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
             model: None,
             fallback_models: Vec::new(),
@@ -3351,6 +3710,10 @@ mod tests {
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            memory: None,
+            tool_budget: None,
             disabled: None,
             system_prompt_body: "You are a reviewer.".to_string(),
             source,
@@ -3851,6 +4214,82 @@ mod tests {
         assert_eq!(outcome.definition.system_prompt_body, "You investigate things.");
     }
 
+    /// A `memory:`/`toolBudget:` agent must survive a serialize -> re-parse round-trip. This is
+    /// the failure mode that adding a key to `KNOWN_FIELDS` creates: the extra-fields loop skips
+    /// known keys, so a known key the serializer never EMITS is silently deleted the first time a
+    /// management update or rename rewrites the file.
+    #[test]
+    fn serialize_agent_round_trips_memory_and_tool_budget() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "reviewer".to_string();
+        def.name = "reviewer".to_string();
+        def.description = "Reviews".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.memory = Some(crate::discovery::types::AgentMemoryConfig {
+            scope: crate::discovery::types::MemoryScope::Project,
+            path: "security-reviewer".to_string(),
+        });
+        def.tool_budget = crate::exec::tool_budget::validate_tool_budget_config(
+            Some(&serde_json::json!({ "hard": 8, "soft": 3, "block": ["read"] })),
+            "toolBudget",
+        )
+        .expect("valid");
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("memory:\n  scope: project\n  path: security-reviewer"),
+            "memory must be emitted as a nested block:\n{serialized}"
+        );
+        assert!(
+            serialized.contains("toolBudget: {"),
+            "toolBudget must be emitted as JSON:\n{serialized}"
+        );
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(reparsed.memory, def.memory, "memory lost on round trip");
+        assert_eq!(
+            reparsed.tool_budget, def.tool_budget,
+            "toolBudget lost on round trip"
+        );
+        assert!(!reparsed.extra_fields.contains_key("memory"));
+        assert!(!reparsed.extra_fields.contains_key("toolBudget"));
+    }
+
+    /// The same silent-deletion trap for the two launch defaults (G98).
+    #[test]
+    fn serialize_agent_round_trips_the_async_and_timeout_launch_defaults() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "slowpoke".to_string();
+        def.name = "slowpoke".to_string();
+        def.description = "Slow".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.default_async = Some(true);
+        def.default_timeout_ms = Some(1234);
+
+        let serialized = serialize_agent(&def, None);
+        assert!(serialized.contains("async: true"), "{serialized}");
+        assert!(serialized.contains("timeoutMs: 1234"), "{serialized}");
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips");
+        assert_eq!(reparsed.default_async, Some(true));
+        assert_eq!(reparsed.default_timeout_ms, Some(1234));
+        assert!(!reparsed.extra_fields.contains_key("async"));
+        assert!(!reparsed.extra_fields.contains_key("timeoutMs"));
+
+        // An explicit `async: false` must survive too (it is not the same as "unset").
+        def.default_async = Some(false);
+        let serialized = serialize_agent(&def, None);
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips");
+        assert_eq!(reparsed.default_async, Some(false));
+    }
+
     #[test]
     fn serialize_agent_round_trip_preserves_unknown_keys_including_block_values() {
         // T7 §3: unknown keys survive a serialize -> re-parse round-trip, and a block-valued extra
@@ -4018,7 +4457,343 @@ mod tests {
             agent_scope: scope,
             config,
             current_session_model: None,
+            proactive_skills: None,
         }
+    }
+
+    // ---- pi `handleList`'s proactive skill-subagent block (`agent-management.ts:765-770,784` @v0.43.0) ----
+
+    /// Two user agents that both name the same skill, so the skill clears the default
+    /// `minReferences: 2`. Returns the request-side availability list that makes it recommendable.
+    fn seed_two_agents_sharing_a_skill(cfg: &AgentDiscoveryConfig) -> Vec<crate::discovery::skills::AvailableSkill> {
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "auditor-one.md",
+            "---\nname: auditor-one\ndescription: First auditor\nskills: audit-trail\n---\nBody.\n",
+        );
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "auditor-two.md",
+            "---\nname: auditor-two\ndescription: Second auditor\nskills: audit-trail\n---\nBody.\n",
+        );
+        vec![crate::discovery::skills::AvailableSkill {
+            name: "audit-trail".to_string(),
+            description: Some("Trace every mutation.".to_string()),
+        }]
+    }
+
+    /// The block upstream splices at `agent-management.ts:784` must actually appear in `list`
+    /// output, positioned AFTER the `Chains:` block and BEFORE `Chain diagnostics:`, with the
+    /// blank-line separator upstream's `["", ...proactiveSuggestions]` prepends.
+    #[test]
+    fn list_emits_the_proactive_skill_subagent_block_in_pis_position() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let available = seed_two_agents_sharing_a_skill(&cfg);
+
+        let mut req = mreq(None, None, None, None);
+        req.proactive_skills = Some(ProactiveSkillsInput {
+            setting: None, // pi's `undefined` — defaults on
+            available_skills: &available,
+        });
+        let out = handle_management_action(&cfg, "list", &req).expect("list ok");
+        assert!(!out.is_error, "{}", out.text);
+        let t = out.text;
+
+        assert!(
+            t.contains("Proactive skill subagent suggestions:"),
+            "the block upstream splices at `agent-management.ts:784` is missing:\n{t}"
+        );
+        assert!(
+            t.contains("- audit-trail via reviewer (referenced by 2 configured agents/chains; agent:auditor-one, agent:auditor-two) - Trace every mutation."),
+            "the recommendation line must match `formatProactiveSkillSubagentRecommendations`:\n{t}"
+        );
+        assert!(
+            t.contains("Guardrails: use these for broad tasks"),
+            "the guardrails footer must ship with the block:\n{t}"
+        );
+        let chains_at = t.find("Chains:").unwrap_or(usize::MAX);
+        let block_at = t.find("Proactive skill subagent suggestions:").unwrap_or(usize::MIN);
+        assert!(chains_at < block_at, "the block must follow `Chains:`:\n{t}");
+        assert!(
+            t.contains("\n\nProactive skill subagent suggestions:"),
+            "upstream prepends one blank line to the block:\n{t}"
+        );
+    }
+
+    /// pi reads `ctx.config?.proactiveSkillSubagents`; the literal `false` disables the feature
+    /// entirely (`resolveProactiveSkillSubagentsConfig`, `proactive-skills.ts:38-59`). A setting
+    /// that stopped being threaded through would silently stop disabling anything.
+    #[test]
+    fn list_honours_an_explicit_proactive_skill_subagents_false() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let available = seed_two_agents_sharing_a_skill(&cfg);
+
+        let disabled = crate::discovery::skills::ProactiveSkillSubagentsSetting::Disabled;
+        let mut req = mreq(None, None, None, None);
+        req.proactive_skills = Some(ProactiveSkillsInput {
+            setting: Some(&disabled),
+            available_skills: &available,
+        });
+        let out = handle_management_action(&cfg, "list", &req).expect("list ok");
+        assert!(
+            !out.text.contains("Proactive skill subagent suggestions:"),
+            "an explicit `false` must suppress the block:\n{}",
+            out.text
+        );
+    }
+
+    /// A caller that ran no availability scan (`proactive_skills: None`) emits no block — the same
+    /// outcome upstream reaches when its `discoverAvailableSkills` throws
+    /// (`proactive-skills.ts:182-186` catches to `[]`, which matches no skill).
+    #[test]
+    fn list_emits_no_proactive_block_without_an_availability_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let _available = seed_two_agents_sharing_a_skill(&cfg);
+
+        let out = handle_management_action(&cfg, "list", &mreq(None, None, None, None)).expect("list ok");
+        assert!(
+            !out.text.contains("Proactive skill subagent suggestions:"),
+            "{}",
+            out.text
+        );
+        // ...and an availability scan that found nothing likewise recommends nothing.
+        let empty: Vec<crate::discovery::skills::AvailableSkill> = Vec::new();
+        let mut req = mreq(None, None, None, None);
+        req.proactive_skills = Some(ProactiveSkillsInput {
+            setting: None,
+            available_skills: &empty,
+        });
+        let out = handle_management_action(&cfg, "list", &req).expect("list ok");
+        assert!(
+            !out.text.contains("Proactive skill subagent suggestions:"),
+            "{}",
+            out.text
+        );
+    }
+
+    /// Upstream's splice is `...(proactiveSuggestions.length ? ["", ...proactiveSuggestions] : [])`
+    /// (`agent-management.ts:784` @v0.43.0). The FALSE branch contributes NOTHING — not even the
+    /// separator — so a listing with no suggestions must be byte-identical to one that never asked
+    /// for them. Pinned here because pi's `lines.join("\n")` layout makes a stray `""` a real
+    /// rendering defect: it trails the whole listing with a blank line, or doubles the single blank
+    /// line that introduces `Chain diagnostics:`.
+    #[test]
+    fn list_emits_no_separator_when_the_proactive_block_is_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        // Agents that DO share a skill, so only the empty availability list suppresses the block —
+        // the recommender really runs and really returns nothing.
+        let _available = seed_two_agents_sharing_a_skill(&cfg);
+        let empty: Vec<crate::discovery::skills::AvailableSkill> = Vec::new();
+
+        let mut asked = mreq(None, None, None, None);
+        asked.proactive_skills = Some(ProactiveSkillsInput {
+            setting: None,
+            available_skills: &empty,
+        });
+        let with_scan = handle_management_action(&cfg, "list", &asked).expect("list ok");
+        let without_scan =
+            handle_management_action(&cfg, "list", &mreq(None, None, None, None)).expect("list ok");
+
+        assert_eq!(
+            with_scan.text, without_scan.text,
+            "an empty suggestion list must contribute NO lines at all — upstream's `: []` branch \
+             appends neither the block nor its blank-line separator"
+        );
+        assert!(
+            !with_scan.text.ends_with('\n'),
+            "a spurious separator would trail the listing with a blank line:\n{:?}",
+            with_scan.text
+        );
+
+        // ...and with chain diagnostics present, the ONE blank line that introduces them must stay
+        // one: an unconditional separator would render `\n\n\nChain diagnostics:`.
+        std::fs::create_dir_all(&cfg.user_chain_dirs[0]).expect("mkdir chains");
+        std::fs::write(
+            cfg.user_chain_dirs[0].join("broken.chain.json"),
+            "{ this is not json",
+        )
+        .expect("write broken chain");
+        let with_diags = handle_management_action(&cfg, "list", &asked).expect("list ok");
+        assert!(
+            with_diags.text.contains("\n\nChain diagnostics:"),
+            "the diagnostics block keeps its single leading blank line:\n{}",
+            with_diags.text
+        );
+        assert!(
+            !with_diags.text.contains("\n\n\n"),
+            "an empty proactive block must not double the diagnostics separator:\n{:?}",
+            with_diags.text
+        );
+    }
+
+    /// pi counts a CHAIN's step skills as references exactly like an agent's `skills`
+    /// (`proactive-skills.ts:132-140`: every skill `collectStepSkills` gathers for a chain adds one
+    /// `chain:<name>` source), and the `sources.size >= config.minReferences` filter
+    /// (`proactive-skills.ts:72-90`) then sees agent and chain sources on equal footing. So one agent
+    /// plus one chain naming the same skill is enough to clear the default `minReferences: 2`.
+    ///
+    /// This pins BOTH ends of `handle_list`'s chain wiring: that `chains` reaches the recommender at
+    /// all (upstream passes its own post-filter `chains` local, `agent-management.ts:767`), and that
+    /// `collect_chain_step_skills` recurses into nested `parallel` steps
+    /// (`proactive-skills.ts:77-89`).
+    #[test]
+    fn list_counts_chain_step_skills_toward_min_references() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        // One agent per skill: neither reaches `minReferences: 2` on agents alone.
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "auditor-one.md",
+            "---\nname: auditor-one\ndescription: First auditor\nskills: audit-trail\n---\nBody.\n",
+        );
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "diver.md",
+            "---\nname: diver\ndescription: Deep diver\nskills: deep-dive\n---\nBody.\n",
+        );
+        // One chain supplies the second reference for each: `audit-trail` on a top-level step and
+        // `deep-dive` only inside a nested `parallel` child.
+        std::fs::create_dir_all(&cfg.user_chain_dirs[0]).expect("mkdir chains");
+        std::fs::write(
+            cfg.user_chain_dirs[0].join("audit-run.chain.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "audit-run",
+                "description": "Audit then dive",
+                "chain": [
+                    { "agent": "auditor-one", "task": "audit it", "skills": ["audit-trail"] },
+                    { "parallel": [
+                        { "agent": "diver", "task": "dive in", "skills": ["deep-dive"] }
+                    ] }
+                ]
+            }))
+            .expect("serialize chain"),
+        )
+        .expect("write chain");
+
+        let available = vec![
+            crate::discovery::skills::AvailableSkill {
+                name: "audit-trail".to_string(),
+                description: Some("Trace every mutation.".to_string()),
+            },
+            crate::discovery::skills::AvailableSkill {
+                name: "deep-dive".to_string(),
+                description: None,
+            },
+        ];
+        let mut req = mreq(None, None, None, None);
+        req.proactive_skills = Some(ProactiveSkillsInput {
+            setting: None, // pi's `undefined` — `minReferences` defaults to 2
+            available_skills: &available,
+        });
+        let out = handle_management_action(&cfg, "list", &req).expect("list ok");
+        assert!(!out.is_error, "{}", out.text);
+        let t = out.text;
+
+        assert!(
+            t.contains("- audit-trail via reviewer (referenced by 2 configured agents/chains; agent:auditor-one, chain:audit-run) - Trace every mutation."),
+            "a chain step's `skills` must count as a `chain:<name>` source toward `minReferences`:\n{t}"
+        );
+        assert!(
+            t.contains("- deep-dive via reviewer (referenced by 2 configured agents/chains; agent:diver, chain:audit-run)"),
+            "`collectStepSkills` recurses into nested `parallel` children, so a skill named only \
+             there still contributes its chain source:\n{t}"
+        );
+    }
+
+    /// The extension-config shape (`config.json`'s `proactiveSkillSubagents`) must reach the
+    /// recommender's own setting shape without losing the disable — the bridge is what
+    /// `extension.rs::route_management_action` calls.
+    #[test]
+    fn the_extension_config_bridge_preserves_disable_and_the_tuning_knobs() {
+        use crate::discovery::skills::{
+            ProactiveSkillSubagentsSetting, resolve_proactive_skill_subagents_config,
+        };
+        use crate::registration::ProactiveSkillSubagents;
+
+        let off = ProactiveSkillSubagentsSetting::from_extension_config(
+            &ProactiveSkillSubagents::Toggle(false),
+        );
+        assert!(!resolve_proactive_skill_subagents_config(Some(&off)).enabled);
+
+        let on = ProactiveSkillSubagentsSetting::from_extension_config(
+            &ProactiveSkillSubagents::Toggle(true),
+        );
+        assert!(resolve_proactive_skill_subagents_config(Some(&on)).enabled);
+
+        let tuned = ProactiveSkillSubagentsSetting::from_extension_config(
+            &ProactiveSkillSubagents::Config(crate::registration::ProactiveSkillSubagentsConfig {
+                enabled: Some(true),
+                min_references: Some(1),
+                max_recommendations: Some(2),
+                preferred_agent: Some("scout".to_string()),
+            }),
+        );
+        let resolved = resolve_proactive_skill_subagents_config(Some(&tuned));
+        assert_eq!(resolved.min_references, 1);
+        assert_eq!(resolved.max_recommendations, 2);
+        assert_eq!(resolved.preferred_agent, "scout");
+    }
+
+    /// pi's `positiveInteger` (`proactive-skills.ts:32-36` — five lines) returns `undefined` for
+    /// anything that is not a finite integer `>= 1`, and `resolveProactiveSkillSubagentsConfig`
+    /// (`:50,:53`) then falls through to `DEFAULT_MIN_REFERENCES` / `DEFAULT_MAX_RECOMMENDATIONS`.
+    /// A guard that let `0` through would set `minReferences: 0` (every skill named even once gets
+    /// recommended) and `maxRecommendations: 0` (`Math.min(0, 5)` → `slice(0, 0)` → the block
+    /// silently disappears), so both directions are pinned. The negative cases are reachable only
+    /// through this `i64` shape — the `config.json` bridge narrows to `u32` — which is exactly the
+    /// signedness the port's guard is written against.
+    #[test]
+    fn proactive_config_rejects_non_positive_min_and_max_like_pis_positive_integer() {
+        use crate::discovery::skills::{
+            ProactiveSkillSubagentsConfig, ProactiveSkillSubagentsSetting,
+            resolve_proactive_skill_subagents_config,
+        };
+
+        for (min, max) in [(Some(0), Some(0)), (Some(-1), Some(-7)), (Some(-100), Some(0))] {
+            let setting = ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
+                enabled: None,
+                min_references: min,
+                max_recommendations: max,
+                preferred_agent: None,
+            });
+            let resolved = resolve_proactive_skill_subagents_config(Some(&setting));
+            assert_eq!(
+                resolved.min_references, 2,
+                "minReferences={min:?} is not a positive integer, so pi's DEFAULT_MIN_REFERENCES applies"
+            );
+            assert_eq!(
+                resolved.max_recommendations, 3,
+                "maxRecommendations={max:?} is not a positive integer, so pi's \
+                 DEFAULT_MAX_RECOMMENDATIONS applies"
+            );
+        }
+
+        // `1` is the boundary pi keeps, and the cap still clamps a large one to MAX_RECOMMENDATION_CAP.
+        let boundary = ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
+            enabled: None,
+            min_references: Some(1),
+            max_recommendations: Some(1),
+            preferred_agent: None,
+        });
+        let resolved = resolve_proactive_skill_subagents_config(Some(&boundary));
+        assert_eq!(resolved.min_references, 1);
+        assert_eq!(resolved.max_recommendations, 1);
+
+        let huge = ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
+            enabled: None,
+            min_references: None,
+            max_recommendations: Some(99),
+            preferred_agent: None,
+        });
+        assert_eq!(
+            resolve_proactive_skill_subagents_config(Some(&huge)).max_recommendations,
+            5,
+            "`Math.min(maxRecommendations, MAX_RECOMMENDATION_CAP)`, `proactive-skills.ts:54`"
+        );
     }
 
     #[test]
@@ -4294,6 +5069,7 @@ mod tests {
             agent_scope: None,
             config: None,
             current_session_model: Some(model),
+            proactive_skills: None,
         };
         let out = handle_management_action(&cfg, "models", &req).expect("models ok");
         assert!(!out.is_error, "{}", out.text);
@@ -4316,6 +5092,335 @@ mod tests {
         let out = handle_management_action(&cfg, "models", &mreq(Some("not-a-builtin"), None, None, None)).expect("no discovery error");
         assert!(out.is_error);
         assert!(out.text.contains("Builtin agent 'not-a-builtin' not found"), "{}", out.text);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // G97 — aliases through the real management surface
+    // -----------------------------------------------------------------------------------------
+
+    fn write_agent_md(dir: &Path, file: &str, body: &str) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(dir.join(file), body).expect("write agent file");
+    }
+
+    /// `aliases:` must survive a serialize -> re-parse round-trip — the same silent-deletion trap
+    /// `memory:`/`toolBudget:` had: both spellings are now `KNOWN_FIELDS`, so a key the serializer
+    /// never emits is dropped the first time management rewrites the file.
+    #[test]
+    fn serialize_agent_round_trips_aliases() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "oracle".to_string();
+        def.name = "oracle".to_string();
+        def.aliases = vec!["advisor".to_string(), "seer".to_string()];
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("aliases: advisor, seer"),
+            "aliases must be emitted comma-joined:\n{serialized}"
+        );
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(reparsed.aliases, def.aliases, "aliases lost on round trip");
+        assert!(!reparsed.extra_fields.contains_key("aliases"));
+        assert!(!reparsed.extra_fields.contains_key("alias"));
+
+        // An agent with no aliases emits no line at all on a CREATE (pi's `if (aliasesValue || ...)`).
+        def.aliases.clear();
+        assert!(!serialize_agent(&def, None).contains("aliases:"));
+    }
+
+    /// An UPDATE that does not mention `aliases` must not delete an existing `alias:`/`aliases:`
+    /// line — pi's preserve set covers both spellings (`agent-serializer.ts:60`).
+    #[test]
+    fn an_unrelated_update_preserves_an_existing_alias_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "seer.md",
+            "---\nname: seer\ndescription: Sees\nalias: prophet\n---\n\nBody\n",
+        );
+
+        let config = serde_json::json!({ "description": "Sees further" });
+        let out = handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&config)))
+            .expect("update ok");
+        assert!(!out.is_error, "{}", out.text);
+
+        let written = std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
+        assert!(
+            written.contains("aliases: prophet"),
+            "an update that never mentioned aliases must not drop them:\n{written}"
+        );
+    }
+
+    /// `config.aliases` sets / clears the list, and rejects a wrong-typed value with pi's message
+    /// (`agent-management.ts:411-421`).
+    #[test]
+    fn config_aliases_sets_clears_and_validates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "seer.md",
+            "---\nname: seer\ndescription: Sees\n---\n\nBody\n",
+        );
+
+        // String (CSV) form, with the agent's own name filtered out.
+        let set = serde_json::json!({ "aliases": "prophet, seer , oracle-lite" });
+        let out = handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&set)))
+            .expect("update ok");
+        assert!(!out.is_error, "{}", out.text);
+        let written = std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
+        assert!(
+            written.contains("aliases: prophet, oracle-lite"),
+            "the agent's own name must be filtered out of its aliases:\n{written}"
+        );
+
+        // Array form, de-duplicated.
+        let arr = serde_json::json!({ "aliases": ["prophet", "prophet", " diviner "] });
+        handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&arr)))
+            .expect("update ok");
+        let written = std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
+        assert!(written.contains("aliases: prophet, diviner"), "{written}");
+
+        // `false` clears. pi's serializer emits the line only when there IS a value or when the
+        // preserve set still carries the key — and `preservedAgentFrontmatterFields` REMOVES both
+        // spellings for an update that set `aliases` (`agent-management.ts:287`) — so a clear drops
+        // the line entirely rather than writing an empty one.
+        let clear = serde_json::json!({ "aliases": false });
+        handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&clear)))
+            .expect("update ok");
+        let written = std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
+        assert!(!written.contains("aliases:"), "a cleared alias list writes no line:\n{written}");
+        let reparsed = crate::discovery::frontmatter::parse_agent_file(
+            &written,
+            AgentSource::User,
+            Path::new("/seer.md"),
+        )
+        .expect("reparses");
+        assert!(reparsed.aliases.is_empty());
+
+        // Wrong type -> pi's exact validation message.
+        let bad = serde_json::json!({ "aliases": 7 });
+        let out = handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&bad)))
+            .expect("no discovery error");
+        assert!(out.is_error);
+        assert_eq!(
+            out.text,
+            "config.aliases must be a comma-separated string, string array, or false when provided."
+        );
+    }
+
+    /// `list` renders `, aliases: …` and `get` renders an `Aliases:` line
+    /// (`agent-management.ts:672,774` @v0.43.0); `get` is also reachable BY the alias.
+    #[test]
+    fn list_and_get_render_aliases_and_get_resolves_by_alias() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "seer.md",
+            "---\nname: seer\ndescription: Sees\naliases: prophet, diviner\n---\n\nBody\n",
+        );
+
+        let list = handle_management_action(&cfg, "list", &mreq(None, None, None, None)).expect("list ok");
+        assert!(
+            list.text.contains("- seer (user, aliases: prophet, diviner): Sees"),
+            "{}",
+            list.text
+        );
+
+        let by_alias = handle_management_action(&cfg, "get", &mreq(Some("prophet"), None, None, None))
+            .expect("get ok");
+        assert!(!by_alias.is_error, "{}", by_alias.text);
+        assert!(by_alias.text.contains("Agent: seer (user)"), "{}", by_alias.text);
+        assert!(by_alias.text.contains("Aliases: prophet, diviner"), "{}", by_alias.text);
+    }
+
+    /// Two agents claiming the SAME alias make every management path that would have to pick one
+    /// refuse, with pi's `Ambiguous agent alias or name` wording (`agent-management.ts:624-626,880-882` @v0.43.0).
+    #[test]
+    fn an_ambiguous_alias_is_refused_by_get_update_and_disable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "seer.md",
+            "---\nname: seer\ndescription: Sees\naliases: prophet\n---\n\nBody\n",
+        );
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "augur.md",
+            "---\nname: augur\ndescription: Augurs\naliases: prophet\n---\n\nBody\n",
+        );
+
+        let get = handle_management_action(&cfg, "get", &mreq(Some("prophet"), None, None, None))
+            .expect("no discovery error");
+        assert!(get.is_error);
+        assert_eq!(get.text, "Ambiguous agent alias or name 'prophet': augur, seer");
+
+        let config = serde_json::json!({ "description": "changed" });
+        let update =
+            handle_management_action(&cfg, "update", &mreq(Some("prophet"), None, None, Some(&config)))
+                .expect("no discovery error");
+        assert!(update.is_error);
+        assert_eq!(update.text, "Ambiguous agent alias or name 'prophet': augur, seer");
+
+        // `disable` goes through `resolve_effective_agent`, whose ambiguity message is
+        // `resolveAgentName`'s own (`agents.ts:526`), surfaced verbatim.
+        let disable =
+            handle_management_action(&cfg, "disable", &mreq(Some("prophet"), None, Some("user"), None))
+                .expect("no discovery error");
+        assert!(disable.is_error);
+        assert_eq!(disable.text, "Ambiguous agent alias 'prophet': augur, seer");
+        assert!(
+            !disable.text.contains("not found"),
+            "an ambiguous alias must NEVER be reported as not found: {}",
+            disable.text
+        );
+    }
+
+    /// `disable`/`enable` reach their target BY alias and write the override under the agent's
+    /// CANONICAL name (`agent-management.ts:987-991`).
+    #[test]
+    fn disable_by_alias_writes_the_override_under_the_canonical_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = mgmt_cfg(tmp.path());
+        cfg.override_settings.user_settings_path = tmp.path().join("user/agents/settings.json");
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "seer.md",
+            "---\nname: seer\ndescription: Sees\naliases: prophet\n---\n\nBody\n",
+        );
+
+        let out = handle_management_action(&cfg, "disable", &mreq(Some("prophet"), None, Some("user"), None))
+            .expect("no discovery error");
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("Disabled agent 'seer'"), "{}", out.text);
+
+        let settings = std::fs::read_to_string(&cfg.override_settings.user_settings_path)
+            .expect("settings written");
+        let value: serde_json::Value = serde_json::from_str(&settings).expect("valid json");
+        assert_eq!(
+            value["subagents"]["agentOverrides"]["seer"]["disabled"],
+            serde_json::Value::Bool(true),
+            "the override must be keyed on the canonical name, not the alias: {settings}"
+        );
+    }
+
+    /// A chain step that names an ALIAS is a known agent — pi swapped the `Set(names)` membership
+    /// test for `resolveAgentName` in v0.43.0 (`agent-management.ts:169-174`).
+    #[test]
+    fn a_chain_step_naming_an_alias_does_not_warn_as_unknown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "seer.md",
+            "---\nname: seer\ndescription: Sees\naliases: prophet\n---\n\nBody\n",
+        );
+
+        let config = serde_json::json!({
+            "name": "foresee",
+            "description": "A chain",
+            "scope": "user",
+            "steps": [{ "agent": "prophet", "task": "look ahead" }],
+        });
+        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&config)))
+            .expect("create ok");
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            !out.text.contains("unknown agents"),
+            "an alias-named step must not be reported as unknown: {}",
+            out.text
+        );
+
+        // Control: a step naming nothing at all still warns, so the assertion above is really
+        // measuring alias resolution and not a broken warning path.
+        let ghost = serde_json::json!({
+            "name": "haunted",
+            "description": "A chain",
+            "scope": "user",
+            "steps": [{ "agent": "ghost-agent", "task": "boo" }],
+        });
+        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&ghost)))
+            .expect("create ok");
+        assert!(
+            out.text.contains("Warning: chain steps reference unknown agents: ghost-agent."),
+            "{}",
+            out.text
+        );
+    }
+
+    /// G101: an `extensions` list that came from `subagents.defaultExtensions` is NOT the agent's
+    /// own data. `editable_base` (pi `editableAgentConfig`, `agent-management.ts:243`) must drop it
+    /// so a management update never BAKES the settings default into the `.md` file — where it would
+    /// outlive the setting and stop tracking it.
+    #[test]
+    fn a_settings_defaulted_extension_list_is_never_baked_into_the_agent_file() {
+        let mut agent = sample_agent(AgentSource::User, PathBuf::from("/seer.md"));
+        agent.extensions = Some(vec!["shared-ext".to_string()]);
+        agent.extensions_from_default = true;
+
+        let base = editable_base(&agent);
+        assert_eq!(base.extensions, None, "a defaulted list must not survive into the edit base");
+        assert!(!base.extensions_from_default);
+        assert!(
+            !serialize_agent(&base, None).contains("extensions:"),
+            "the serialized file must carry no extensions line at all"
+        );
+
+        // An agent's OWN declared list is untouched by the same path.
+        let mut own = sample_agent(AgentSource::User, PathBuf::from("/seer.md"));
+        own.extensions = Some(vec!["own-ext".to_string()]);
+        own.extensions_from_default = false;
+        assert_eq!(editable_base(&own).extensions, Some(vec!["own-ext".to_string()]));
+        assert!(serialize_agent(&editable_base(&own), None).contains("extensions: own-ext"));
+    }
+
+    /// G99: the roster is the SEVEN names pi declares at v0.43.0 (`agents.ts:38-46`), and the
+    /// all-agents model report walks EXACTLY that static list.
+    ///
+    /// `advisor` is in the roster but ships no `advisor.md` — upstream `34a018f` demoted it to an
+    /// `oracle` ALIAS — and `handleModels` looks builtins up by EXACT name
+    /// (`agent-management.ts:850`, `builtinByName.get(name)`), never through `resolveAgentName`. So
+    /// `advisor` renders the missing row upstream too, and this pins that the alias is not silently
+    /// promoted into a seventh definition.
+    #[test]
+    fn the_models_report_walks_the_seven_name_roster_including_the_fileless_advisor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let out = handle_management_action(&cfg, "models", &mreq(None, None, None, None))
+            .expect("models ok");
+        assert!(!out.is_error, "{}", out.text);
+
+        assert_eq!(
+            BUILTIN_AGENT_NAMES,
+            ["advisor", "delegate", "oracle", "researcher", "reviewer", "scout", "worker"]
+        );
+        for name in BUILTIN_AGENT_NAMES {
+            assert!(out.text.contains(&format!("\n{name}\n")), "{name} row missing:\n{}", out.text);
+        }
+        for gone in ["planner", "context-builder"] {
+            assert!(
+                !out.text.contains(&format!("\n{gone}\n")),
+                "the removed role {gone} must not be reported:\n{}",
+                out.text
+            );
+        }
+        assert!(
+            out.text.contains("advisor\n  model:\n    (builtin definition not found)\n  source: missing"),
+            "advisor ships no file of its own and must render the missing row:\n{}",
+            out.text
+        );
+        // The six roles that DO ship a file resolve to a real definition.
+        assert!(
+            !out.text.contains("oracle\n  model:\n    (builtin definition not found)"),
+            "{}",
+            out.text
+        );
     }
 
     #[test]

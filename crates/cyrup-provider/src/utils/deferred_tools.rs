@@ -183,7 +183,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 2,
         })
     }

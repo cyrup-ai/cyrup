@@ -114,451 +114,20 @@ pub(crate) fn any_word_boundary(haystack_lower: &str, needles: &[&str]) -> bool 
 }
 
 // -------------------------------------------------------------------------------------------
-// Pattern groups (mirrors the source's REVIEW_ONLY_PATTERNS / REVIEWER_REQUIRED_EDIT_PATTERNS /
-// EXPLICIT_NO_EDIT_PATTERNS / SCOPED_NO_EDIT_CONSTRAINT_PATTERNS / RESEARCH_AGENT_PATTERNS /
-// WORKER_IMPLEMENTATION_PATTERNS / GENERAL_IMPLEMENTATION_PATTERNS verbatim, one function per
-// source array)
+// Task mutation-intent classification (moved to `exec/task_intent.rs`, mirroring upstream's own
+// `task-intent.ts` split)
 // -------------------------------------------------------------------------------------------
 
-/// Source: `REVIEW_ONLY_PATTERNS` — `/\breview only\b/i`, `/\bsuggest fixes only\b/i`,
-/// `/\bonly return findings\b/i`, `/\breturn findings only\b/i`.
-fn matches_review_only(text_lower: &str) -> bool {
-    any_word_boundary(
-        text_lower,
-        &[
-            "review only",
-            "suggest fixes only",
-            "only return findings",
-            "return findings only",
-        ],
-    )
-}
+/// Re-exported from [`crate::exec::task_intent`], exactly as `completion-guard.ts:3,5` imports
+/// `expectsImplementationMutation` from `./task-intent.ts` and re-exports it. The classifier's
+/// pattern lists, their ORDER and the three-valued
+/// [`crate::exec::task_intent::TaskMutationIntent`] live there because acceptance-level inference
+/// (`exec/acceptance.rs`) is its second consumer and needs all three values plus
+/// [`crate::exec::task_intent::task_may_mutate`], which this guard never sees.
+pub use crate::exec::task_intent::expects_implementation_mutation;
 
-/// Source: `REVIEWER_REQUIRED_EDIT_PATTERNS`. Two entries use a `(?:...)` verb alternation
-/// (`must\s+(?:edit|modify|change|fix|patch|apply)` and its `required to`/`always` siblings) —
-/// ported as one boundary check per (prefix, verb) pair rather than a generic alternation engine,
-/// since the verb set is small and fixed.
-fn matches_reviewer_required_edit(text_lower: &str) -> bool {
-    const VERBS: &[&str] = &["edit", "modify", "change", "fix", "patch", "apply"];
-    const PREFIXES: &[&str] = &["must", "required to", "always"];
-    for prefix in PREFIXES {
-        for verb in VERBS {
-            // `\bmust\s+(?:edit|...)\b` — the source pattern allows arbitrary whitespace between
-            // prefix and verb (`\s+`), collapsed here to a single-space phrase test since prose
-            // task text realistically uses single spaces; `word_boundary_contains` still requires
-            // a non-word boundary on each side of the whole phrase.
-            let phrase = format!("{prefix} {verb}");
-            if word_boundary_contains(text_lower, &phrase) {
-                return true;
-            }
-        }
-    }
-    any_word_boundary(
-        text_lower,
-        &[
-            "regardless of findings",
-            "apply the fix directly",
-            "apply fix directly",
-            "apply the fixes directly",
-            "apply fixes directly",
-            "make the code changes",
-            "make code changes",
-        ],
-    )
-}
 
-/// Source: `EXPLICIT_NO_EDIT_PATTERNS` — `/\bdo not edit\b/i`, `/\bdon't edit\b/i`,
-/// `/\bdo not modify\b/i`, `/\bdo not change files\b/i`.
-fn matches_explicit_no_edit(text_lower: &str) -> bool {
-    any_word_boundary(
-        text_lower,
-        &[
-            "do not edit",
-            "don't edit",
-            "do not modify",
-            "do not change files",
-        ],
-    )
-}
-
-/// Source: `SCOPED_NO_EDIT_CONSTRAINT_PATTERNS` — matched (not merely tested) so
-/// [`strip_scoped_no_edit_constraints`] can excise every occurrence, mirroring the source's
-/// `stripped.replace(pattern, " ")` loop. Returns the byte ranges of every non-overlapping match
-/// of any of the five source phrases, in left-to-right order.
-///
-/// Source patterns: `/\bdo not edit files?\s+outside\b/i`, `/\bdo not edit\s+outside\b/i`,
-/// `/\bdo not edit\s+unrelated files?\b/i`, `/\bdo not change\s+unrelated files?\b/i`,
-/// `/\bdo not modify\s+unrelated files?\b/i`.
-fn scoped_no_edit_constraint_ranges(text_lower: &str) -> Vec<(usize, usize)> {
-    // Each entry: the fixed phrase(s) this one source pattern can match, longest-first within a
-    // group so `find_longest_at` below prefers `"do not edit files outside"` over the shorter
-    // `"do not edit file outside"` when both are literally present is moot (they're mutually
-    // exclusive singular/plural forms) — order here only matters for readability.
-    const PHRASES: &[&str] = &[
-        "do not edit files outside",
-        "do not edit file outside",
-        "do not edit outside",
-        "do not edit unrelated files",
-        "do not edit unrelated file",
-        "do not change unrelated files",
-        "do not change unrelated file",
-        "do not modify unrelated files",
-        "do not modify unrelated file",
-    ];
-
-    let mut ranges = Vec::new();
-    for phrase in PHRASES {
-        let mut start = 0usize;
-        while let Some(rel) = text_lower.get(start..).and_then(|s| s.find(phrase)) {
-            let match_start = start + rel;
-            let match_end = match_start + phrase.len();
-            let before_ok = text_lower[..match_start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !is_word_char(c));
-            let after_ok = text_lower[match_end..]
-                .chars()
-                .next()
-                .is_none_or(|c| !is_word_char(c));
-            if before_ok && after_ok {
-                ranges.push((match_start, match_end));
-            }
-            start = match_start + 1;
-            if start > text_lower.len() {
-                break;
-            }
-        }
-    }
-    ranges.sort_unstable();
-    ranges
-}
-
-/// Source: `RESEARCH_AGENT_PATTERNS` — `/\binvestigate\b/i`, `/\bscout\b/i`,
-/// `/\bresearch(?:er)?\b/i` (matches both `research` and `researcher`; the latter is a strict
-/// extension of the former so a single `word_boundary_contains(.., "research")` covers both —
-/// `\bresearch\b` alone would NOT match inside `"researcher"` since `er` is a word character
-/// continuing past the boundary, so `researcher` is tested as its own literal phrase too).
-fn matches_research_agent(agent_lower: &str) -> bool {
-    any_word_boundary(agent_lower, &["investigate", "scout", "research", "researcher"])
-}
-
-/// Source: `WORKER_IMPLEMENTATION_PATTERNS`. The second source entry,
-/// `/\b(?:update|add|remove|replace|create)\b(?!\s+(?:(?:a|an|the)\s+)?(?:report|summary|findings?)(?:\b|$))/i`,
-/// is a verb match with a **negative lookahead** excluding `"<verb> [a/an/the] report|summary|
-/// finding(s)"` — ported as [`matches_verb_not_followed_by_report_like_noun`] rather than folded
-/// into the plain word-boundary helper, since a negative lookahead has no direct
-/// `word_boundary_contains` equivalent.
-fn matches_worker_implementation(task_lower: &str) -> bool {
-    if any_word_boundary(
-        task_lower,
-        &["implement", "fix", "edit", "modify", "patch", "refactor", "delete"],
-    ) {
-        return true;
-    }
-    if matches_verb_not_followed_by_report_like_noun(
-        task_lower,
-        &["update", "add", "remove", "replace", "create"],
-    ) {
-        return true;
-    }
-    any_word_boundary(
-        task_lower,
-        &[
-            "apply the changes",
-            "apply changes",
-            "apply the change",
-            "apply change",
-            "apply the fix",
-            "apply fix",
-            "apply the fixes",
-            "apply fixes",
-            "apply the patch",
-            "apply patch",
-            "make the changes",
-            "make changes",
-            "do those fixes",
-        ],
-    )
-}
-
-/// Source: `GENERAL_IMPLEMENTATION_PATTERNS`. The last entry is a verb-then-required-noun
-/// alternation (`/\b(?:update|add|remove|replace|delete|create)\s+(?:the\s+)?(?:file|files|...)\b/i`)
-/// — ported as [`matches_verb_then_target_noun`] rather than the negative-lookahead style above,
-/// since this one is a POSITIVE required-noun-after-verb pattern, structurally different from
-/// [`matches_verb_not_followed_by_report_like_noun`].
-fn matches_general_implementation(task_lower: &str) -> bool {
-    if any_word_boundary(
-        task_lower,
-        &["implement", "fix", "edit", "modify", "patch", "refactor"],
-    ) {
-        return true;
-    }
-    if any_word_boundary(
-        task_lower,
-        &[
-            "apply the changes",
-            "apply changes",
-            "apply the change",
-            "apply change",
-            "apply the fix",
-            "apply fix",
-            "apply the fixes",
-            "apply fixes",
-            "apply the patch",
-            "apply patch",
-            "make the changes",
-            "make changes",
-            "do those fixes",
-        ],
-    ) {
-        return true;
-    }
-    const VERBS: &[&str] = &["update", "add", "remove", "replace", "delete", "create"];
-    const NOUNS: &[&str] = &[
-        "file",
-        "files",
-        "code",
-        "source",
-        "implementation",
-        "test",
-        "tests",
-        "component",
-        "function",
-        "module",
-        "class",
-        "method",
-        "logic",
-        "import",
-        "imports",
-        "readme",
-        "docs",
-        "doc",
-        "changelog",
-        "package.json",
-        "config",
-        "manifest",
-        "extension",
-        "prompt",
-        "command",
-    ];
-    matches_verb_then_target_noun(task_lower, VERBS, NOUNS)
-}
-
-/// Ports `/\b(?:V1|V2|...)\b(?!\s+(?:(?:a|an|the)\s+)?(?:N1|N2|...)(?:\b|$))/i`: for every
-/// word-boundary occurrence of a verb in `verbs`, the match is REJECTED (does not count) if,
-/// immediately after the verb (skipping exactly one optional `a `/`an `/`the ` article and any
-/// amount of whitespace, matching the source's `\s+(?:(?:a|an|the)\s+)?`), the following text
-/// starts with `"report"`, `"summary"`, `"finding"`, or `"findings"` at a word boundary (or the
-/// string ends there — the source's `(?:\b|$)`). Returns true iff at least one verb occurrence
-/// survives (is NOT followed by one of those report-like nouns).
-fn matches_verb_not_followed_by_report_like_noun(text_lower: &str, verbs: &[&str]) -> bool {
-    const REPORT_LIKE_NOUNS: &[&str] = &["report", "summary", "finding", "findings"];
-    for verb in verbs {
-        let mut start = 0usize;
-        while let Some(rel) = text_lower.get(start..).and_then(|s| s.find(verb)) {
-            let match_start = start + rel;
-            let match_end = match_start + verb.len();
-            let before_ok = text_lower[..match_start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !is_word_char(c));
-            let after_word_ok = text_lower[match_end..]
-                .chars()
-                .next()
-                .is_none_or(|c| !is_word_char(c));
-            start = match_start + 1;
-            if start > text_lower.len() {
-                start = text_lower.len() + 1;
-            }
-            if !before_ok || !after_word_ok {
-                continue;
-            }
-
-            let rest = &text_lower[match_end..];
-            let after_ws = rest.trim_start_matches([' ', '\t']);
-            if rest == after_ws {
-                // Source requires `\s+` (at least one whitespace char) between the verb and the
-                // optional article/noun for the lookahead to even apply; with no whitespace at
-                // all following the verb (end of string, or punctuation immediately after), the
-                // negative lookahead trivially does not exclude this occurrence.
-                return true;
-            }
-            // Strip one optional `a `/`an `/`the ` article, mirroring `(?:(?:a|an|the)\s+)?`.
-            let after_article = strip_optional_article(after_ws);
-            let excluded = REPORT_LIKE_NOUNS.iter().any(|noun| {
-                after_article.strip_prefix(noun).is_some_and(|tail| {
-                    tail.chars().next().is_none_or(|c| !is_word_char(c))
-                })
-            });
-            if !excluded {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Strips at most one leading `"a "`, `"an "`, or `"the "` article token from `text` — the
-/// `(?:(?:a|an|the)\s+)?` half of the source's negative-lookahead pattern.
-fn strip_optional_article(text: &str) -> &str {
-    for article in ["a ", "an ", "the "] {
-        if let Some(rest) = text.strip_prefix(article) {
-            return rest;
-        }
-    }
-    text
-}
-
-/// Ports `/\b(?:V1|...)\s+(?:the\s+)?(?:N1|...)\b/i`: a verb, optional `"the "`, then one of the
-/// required nouns, all at word boundaries.
-fn matches_verb_then_target_noun(text_lower: &str, verbs: &[&str], nouns: &[&str]) -> bool {
-    for verb in verbs {
-        let mut start = 0usize;
-        while let Some(rel) = text_lower.get(start..).and_then(|s| s.find(verb)) {
-            let match_start = start + rel;
-            let match_end = match_start + verb.len();
-            let before_ok = text_lower[..match_start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !is_word_char(c));
-            start = match_start + 1;
-            if start > text_lower.len() {
-                start = text_lower.len() + 1;
-            }
-            if !before_ok {
-                continue;
-            }
-            let rest = &text_lower[match_end..];
-            let after_ws = rest.trim_start_matches([' ', '\t']);
-            if rest == after_ws {
-                // `\s+` is mandatory before the noun clause; no whitespace at all means this verb
-                // occurrence cannot satisfy the rest of the pattern.
-                continue;
-            }
-            let after_the = after_ws.strip_prefix("the ").unwrap_or(after_ws);
-            let matched_noun = nouns.iter().any(|noun| {
-                after_the.strip_prefix(noun).is_some_and(|tail| {
-                    tail.chars().next().is_none_or(|c| !is_word_char(c))
-                })
-            });
-            if matched_noun {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-// -------------------------------------------------------------------------------------------
-// Task-text preprocessing (mirrors `stripFrameworkInstructions` / `stripScopedNoEditConstraints`)
-// -------------------------------------------------------------------------------------------
-
-/// Source: `stripFrameworkInstructions`. Drops any line that is purely orchestrator-injected
-/// scaffolding (`[Write to: ...]`/`[Read from: ...]` framework markers, and the fixed set of
-/// progress/output-path instruction lines the source enumerates) so those lines' own vocabulary
-/// (`write`, `output`, `update progress`, …) never contributes false-positive implementation
-/// signal. Line-oriented, case-insensitive, anchored at line start (`^\s*...`) per the source's
-/// per-line regex tests.
-fn strip_framework_instructions(task: &str) -> String {
-    task.lines()
-        .filter(|line| !is_write_read_marker_line(line))
-        .filter(|line| !is_progress_or_output_instruction_line(line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// `/^\s*\[(?:Write to|Read from):/i`
-fn is_write_read_marker_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let lower = trimmed.to_lowercase();
-    lower.starts_with("[write to:") || lower.starts_with("[read from:")
-}
-
-/// `/^\s*(?:Create and maintain progress at:|Update progress at:|\*\*Output:\*\*|Write your
-/// findings to(?: exactly this path)?:|This path is authoritative for this run\.|Ignore any other
-/// output filename or output path mentioned elsewhere)/i`
-fn is_progress_or_output_instruction_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let lower = trimmed.to_lowercase();
-    lower.starts_with("create and maintain progress at:")
-        || lower.starts_with("update progress at:")
-        || lower.starts_with("**output:**")
-        || lower.starts_with("write your findings to exactly this path:")
-        || lower.starts_with("write your findings to:")
-        || lower.starts_with("this path is authoritative for this run.")
-        || lower.starts_with("ignore any other output filename or output path mentioned elsewhere")
-}
-
-/// Source: `stripScopedNoEditConstraints` — replaces every match of
-/// [`scoped_no_edit_constraint_ranges`] with a single space, mirroring `stripped.replace(pattern,
-/// " ")` applied once per pattern in sequence (the source loop's net effect on non-overlapping
-/// matches, which is the only case this pattern set can ever produce given how specific each
-/// phrase is).
-fn strip_scoped_no_edit_constraints(task_lower_source: &str) -> String {
-    let ranges = scoped_no_edit_constraint_ranges(task_lower_source);
-    if ranges.is_empty() {
-        return task_lower_source.to_string();
-    }
-    let mut result = String::with_capacity(task_lower_source.len());
-    let mut cursor = 0usize;
-    for (start, end) in ranges {
-        if start < cursor {
-            // Overlapping match already covered by a prior replacement; skip.
-            continue;
-        }
-        result.push_str(&task_lower_source[cursor..start]);
-        result.push(' ');
-        cursor = end;
-    }
-    result.push_str(&task_lower_source[cursor..]);
-    result
-}
-
-// -------------------------------------------------------------------------------------------
-// Public classification API (mirrors `expectsImplementationMutation` / `hasMutationToolCall` /
-// `evaluateCompletionMutationGuard`)
-// -------------------------------------------------------------------------------------------
-
-/// Source: `expectsImplementationMutation(agent, task)`. Classifies whether `task`, given the
-/// declared `agent` (persona) name, is expected to require a mutating tool call to be considered
-/// genuinely complete — the "fixed heuristic-pattern classification" R-SA-034 requires.
-///
-/// This function does NOT consult declared tools at all (that short-circuit —
-/// [`declares_only_read_only_tools`] — is applied by [`evaluate_completion_mutation_guard`],
-/// exactly mirroring the source's own separation between `expectsImplementationMutation` as a
-/// pure task/agent-name classifier and the read-only-tools carve-out living one level up in
-/// `evaluateCompletionMutationGuard`).
-#[must_use]
-pub fn expects_implementation_mutation(agent: &str, task: &str) -> bool {
-    let stripped = strip_framework_instructions(task);
-    let stripped_lower = stripped.to_lowercase();
-    let without_scoped_lower = strip_scoped_no_edit_constraints(&stripped_lower);
-
-    if matches_review_only(&without_scoped_lower) {
-        return false;
-    }
-    if matches_explicit_no_edit(&without_scoped_lower) {
-        return false;
-    }
-
-    let agent_lower = agent.to_lowercase();
-    if matches_research_agent(&agent_lower) {
-        return false;
-    }
-    if word_boundary_contains(&agent_lower, "reviewer") {
-        return matches_reviewer_required_edit(&stripped_lower);
-    }
-
-    let worker_intent =
-        agent == "worker" && matches_worker_implementation(&stripped_lower);
-    if worker_intent {
-        return true;
-    }
-
-    matches_general_implementation(&stripped_lower)
-}
-
-/// Source: `hasMutationToolCall(messages)` (`completion-guard.ts:121-135`), re-scoped to this
+/// Source: `hasMutationToolCall(messages)` (`completion-guard.ts:69-84` @v0.43.0), re-scoped to this
 /// crate's dependency-free [`SubagentEvent`] transcript instead of a rich `Message[]` array (this
 /// crate has zero dependency on `cyrup-agent`'s message types, module docs above).
 ///
@@ -597,13 +166,190 @@ pub fn has_mutation_tool_call(events: &[SubagentEvent]) -> bool {
     })
 }
 
-/// Source: `isMutatingBashCommand` (`long-running-guard.ts`). A bash command counts as mutating
-/// if it contains an unquoted file-redirection operator (`>`/`>>` not immediately preceded by `-`
-/// and not immediately followed by `&`/`|`/`;`/`(`/`)`, outside single/double quotes) OR matches
-/// one of the fixed `MUTATING_BASH_PATTERNS`.
+/// Source: `isMutatingBashCommand` (`long-running-guard.ts:138-142` @v0.43.0). A bash command
+/// counts as mutating if it contains an unquoted file-redirection operator (`>`/`>>` not
+/// immediately preceded by `-` and not immediately followed by `&`/`|`/`;`/`(`/`)`, outside
+/// single/double quotes) OR invokes a mutating `git` subcommand ([`has_mutating_git_command`]) OR
+/// matches one of the fixed `MUTATING_BASH_PATTERNS`.
+///
+/// G84: the `has_mutating_git_command` term is the post-v0.34.0 upstream addition
+/// (`long-running-guard.ts:128-141`, absent at the ported baseline). Without it a subagent whose
+/// only write to the repo is `git add`/`git commit`/`git push` registers as having attempted NO
+/// mutation, which (a) makes [`has_mutation_tool_call`] return `false` and fires the completion
+/// guard's "no mutating tool call was observed" failure on a run that really did change the repo,
+/// and (b) leaves a repeatedly-failing `git push` out of the control loop's mutating-failure
+/// accounting ([`crate::exec::control`]'s `needs_attention` escalation), so the run never
+/// escalates.
 #[must_use]
 pub fn is_mutating_bash_command(command: &str) -> bool {
-    has_unquoted_file_redirection(command) || matches_mutating_bash_pattern(command)
+    has_unquoted_file_redirection(command)
+        || has_mutating_git_command(command)
+        || matches_mutating_bash_pattern(command)
+}
+
+/// Source: `unquotedShellText` (`long-running-guard.ts:99-126`) — rewrite `command` so that every
+/// character that was inside single or double quotes becomes a `_` placeholder and the quote
+/// characters themselves are dropped. Segment splitting and the `git` prefix test in
+/// [`has_mutating_git_command`] then only ever see genuinely unquoted shell text, so
+/// `echo "git push"` cannot be mistaken for an actual push.
+///
+/// Ported branch-for-branch, including the backslash asymmetry: outside quotes a `\` and the
+/// character it escapes are both preserved verbatim; inside double quotes both become `_`; inside
+/// single quotes `\` is not an escape at all and simply becomes `_`.
+fn unquoted_shell_text(command: &str) -> String {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut result = String::with_capacity(command.len());
+    for ch in command.chars() {
+        if escaped {
+            result.push(if in_single || in_double { '_' } else { ch });
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            result.push(if in_double { '_' } else { ch });
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        result.push(if in_single || in_double { '_' } else { ch });
+    }
+    result
+}
+
+/// Source: the `unquoted.split(/(?:&&|\|\||[;|()\n])/)` in `hasMutatingGitCommand`
+/// (`long-running-guard.ts:130`). Splits on `&&`, `||`, `;`, `|`, `(`, `)` and `\n` — note a
+/// SINGLE `&` is deliberately not a separator (it is absent from the source's character class),
+/// and `||` falls out of the single-`|` case as two splits around an empty segment, which the
+/// caller's blank-segment skip discards exactly as the source's `if (!trimmed) continue` does.
+///
+/// Every separator is ASCII, and a multi-byte UTF-8 continuation byte is always `>= 0x80`, so
+/// byte-wise scanning can never land mid-character; the `get(..)` slices are still fallible-checked
+/// rather than indexed, per the crate's no-panic policy.
+fn split_shell_segments(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let sep_len = if bytes.get(i) == Some(&b'&') && bytes.get(i + 1) == Some(&b'&') {
+            2
+        } else if matches!(bytes.get(i), Some(&b';' | &b'|' | &b'(' | &b')' | &b'\n')) {
+            1
+        } else {
+            0
+        };
+        if sep_len == 0 {
+            i += 1;
+            continue;
+        }
+        out.push(text.get(start..i).unwrap_or(""));
+        i += sep_len;
+        start = i;
+    }
+    out.push(text.get(start..).unwrap_or(""));
+    out
+}
+
+/// Source: `hasMutatingGitCommand` (`long-running-guard.ts:128-136` @v0.43.0). True when any
+/// unquoted shell segment invokes `git add`, `git commit` or `git push`, allowing the same global
+/// options the source's regex allows in between. Segments that begin with `echo`/`printf` are
+/// skipped, matching the source's `/^(?:echo|printf)\b/` guard.
+fn has_mutating_git_command(command: &str) -> bool {
+    let unquoted = unquoted_shell_text(command);
+    for segment in split_shell_segments(&unquoted) {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // `/^(?:echo|printf)\b/`
+        if starts_with_word(trimmed, "echo") || starts_with_word(trimmed, "printf") {
+            continue;
+        }
+        if segment_invokes_mutating_git(trimmed) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `s` begins with the literal `word` followed by a regex word boundary (end-of-string or a
+/// non-word character) — the `^<word>\b` shape used by the two guards in
+/// [`has_mutating_git_command`].
+fn starts_with_word(s: &str, word: &str) -> bool {
+    s.strip_prefix(word)
+        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
+}
+
+/// One segment against the source's
+/// `^git\s+(?:(?:(?:-C|--git-dir|--work-tree)\s+\S+|(?:--git-dir|--work-tree)=\S+|--paginate)\s+)*(?:add|commit|push)\b`.
+///
+/// The `*` group and the verb alternation are disjoint (every option starts with `-`, no verb
+/// does), so the regex's backtracking is unnecessary here: the loop tests the verb first and
+/// otherwise consumes exactly one option group per iteration, bailing the moment neither matches.
+fn segment_invokes_mutating_git(segment: &str) -> bool {
+    let Some(after_git) = segment.strip_prefix("git") else {
+        return false;
+    };
+    // `git\s+` — at least one whitespace character must follow the literal `git`.
+    let mut cursor = after_git.trim_start_matches(char::is_whitespace);
+    if cursor == after_git {
+        return false;
+    }
+    loop {
+        // `(?:add|commit|push)\b`
+        for verb in ["add", "commit", "push"] {
+            if starts_with_word(cursor, verb) {
+                return true;
+            }
+        }
+        // `(?:--git-dir|--work-tree)=\S+`
+        let after_option = if let Some(tail) = cursor
+            .strip_prefix("--git-dir=")
+            .or_else(|| cursor.strip_prefix("--work-tree="))
+        {
+            let after_value = tail.trim_start_matches(|c: char| !c.is_whitespace());
+            // `\S+` needs at least one non-whitespace character.
+            if after_value == tail {
+                return false;
+            }
+            after_value
+        // `(?:-C|--git-dir|--work-tree)\s+\S+`
+        } else if let Some(tail) = cursor
+            .strip_prefix("--git-dir")
+            .or_else(|| cursor.strip_prefix("--work-tree"))
+            .or_else(|| cursor.strip_prefix("-C"))
+        {
+            let after_ws = tail.trim_start_matches(char::is_whitespace);
+            if after_ws == tail {
+                return false;
+            }
+            let after_value = after_ws.trim_start_matches(|c: char| !c.is_whitespace());
+            if after_value == after_ws {
+                return false;
+            }
+            after_value
+        // `--paginate`
+        } else if let Some(tail) = cursor.strip_prefix("--paginate") {
+            tail
+        } else {
+            return false;
+        };
+        // Each option group in the source's `*` is itself followed by `\s+`.
+        let next = after_option.trim_start_matches(char::is_whitespace);
+        if next == after_option {
+            return false;
+        }
+        cursor = next;
+    }
 }
 
 /// Source: `hasUnquotedFileRedirection` — a hand-rolled quote-aware scanner (already
@@ -949,17 +695,44 @@ fn find_word_boundary_case_sensitive_lower(haystack: &str, needle_lower: &str) -
 /// agent implicitly has access to every mutating builtin too, so this returns `false` for `None`,
 /// matching the source's own `tools !== undefined` guard (an agent that declared no `tools` field
 /// at all is conservatively treated as NOT read-only-only).
+///
+/// G103: `tools == Some(vec![])` — an EXPLICITLY empty allowlist — returns `true` (the guard is
+/// exempt), because an agent granted no tools at all cannot mutate anything and so can never be
+/// expected to. That is `[].every(...) === true` in the source's
+/// `return !tools.every((tool) => READ_ONLY_BUILTIN_TOOLS.has(tool))`
+/// (`completion-guard.ts:39-43` @v0.43.0). The `tools.length === 0` short-circuit this used to
+/// mirror belongs to the v0.34.0 shape (`toolMutationCapability`, which classed an empty list as
+/// mutation-CAPABLE) and was dropped upstream; keeping it made a no-tools agent fail every
+/// implementation-worded task with the completion guard's "no mutating tool call was observed"
+/// error that it had no possible way to avoid.
 fn declares_only_read_only_tools(agent: &AgentDefinition) -> bool {
     let Some(tools) = &agent.tools else {
         return false;
     };
-    if tools.is_empty() {
-        return false;
-    }
     tools.iter().all(|tool_ref| match tool_ref {
         ToolRef::Builtin(name) => READ_ONLY_BUILTIN_TOOLS.contains(&name.as_str()),
         ToolRef::Mcp(_) | ToolRef::ExtensionPath(_) => false,
     })
+}
+
+/// Source: `hasMutationToolCapability(tools, mcpDirectTools)` (`completion-guard.ts:39-43`
+/// @v0.43.0) — the exact logical complement of [`declares_only_read_only_tools`]:
+///
+/// ```text
+/// if ((mcpDirectTools?.length ?? 0) > 0) return true;
+/// if (tools === undefined) return true;
+/// return !tools.every((tool) => READ_ONLY_BUILTIN_TOOLS.has(tool));
+/// ```
+///
+/// Exposed publicly (the negated form is private) because a SECOND upstream consumer needs it
+/// besides `evaluateCompletionMutationGuard`: `formatOutputPathInstruction`
+/// (`single-output.ts:85-91`) branches the output-path instruction on it, telling an agent with no
+/// write-capable tool to return the artifact in its final response for the runtime to persist,
+/// rather than to write the file itself. See
+/// [`crate::exec::output::format_output_path_instruction`].
+#[must_use]
+pub fn has_mutation_tool_capability(agent: &AgentDefinition) -> bool {
+    !declares_only_read_only_tools(agent)
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1052,8 +825,10 @@ mod tests {
             local_name: local_name.to_string(),
             package_name: None,
             description: "test agent".to_string(),
+            aliases: Vec::new(),
             tools,
             extensions: None,
+            extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
             model: None,
             fallback_models: Vec::new(),
@@ -1069,6 +844,10 @@ mod tests {
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            memory: None,
+            tool_budget: None,
             disabled: None,
             system_prompt_body: String::new(),
             source: AgentSource::User,
@@ -1251,6 +1030,86 @@ mod tests {
         assert!(is_mutating_bash_command("patch -p0 < fix.patch"));
     }
 
+    // ---- G84: `git add`/`commit`/`push` are mutations (`long-running-guard.ts:128-141` @v0.43.0)
+
+    /// The USER ACTION: an agent is told to "fix the failing test and commit it". It edits through
+    /// a heredoc-free path (or the edit itself is already staged) and finishes with `git commit`.
+    /// That agent HAS mutated the repo, so the completion guard must not fail the run for having
+    /// "observed no mutating tool call".
+    ///
+    /// Before the fix `is_mutating_bash_command` had only the redirection and
+    /// `MUTATING_BASH_PATTERNS` terms, and `git commit` matched neither.
+    #[test]
+    fn git_add_commit_and_push_count_as_mutating_bash_commands() {
+        assert!(is_mutating_bash_command("git add -A"));
+        assert!(is_mutating_bash_command("git commit -m 'wip'"));
+        assert!(is_mutating_bash_command("git push origin HEAD"));
+        assert!(is_mutating_bash_command("git push"));
+        // Global options the source's regex explicitly tolerates between `git` and the verb.
+        assert!(is_mutating_bash_command("git -C /repo commit -am x"));
+        assert!(is_mutating_bash_command("git --git-dir=/r/.git add ."));
+        assert!(is_mutating_bash_command("git --work-tree /r --git-dir /r/.git push"));
+        assert!(is_mutating_bash_command("git --paginate add ."));
+        // Not the first command in the line: the source splits on shell separators first.
+        assert!(is_mutating_bash_command("cargo test && git commit -am wip"));
+        assert!(is_mutating_bash_command("cd /repo; git push"));
+        assert!(is_mutating_bash_command("(git add .)"));
+
+        // MIRROR — every near-miss the source's own guards carve out must stay non-mutating, or
+        // the guard would be satisfied by any agent that merely LOOKED at the repo.
+        assert!(!is_mutating_bash_command("git status"));
+        assert!(!is_mutating_bash_command("git log --oneline"));
+        assert!(!is_mutating_bash_command("git diff HEAD"));
+        // `\b` after the verb.
+        assert!(!is_mutating_bash_command("git addendum"));
+        assert!(!is_mutating_bash_command("git pushes"));
+        // `/^(?:echo|printf)\b/` skips the segment outright...
+        assert!(!is_mutating_bash_command("echo git commit"));
+        assert!(!is_mutating_bash_command("printf 'git push'"));
+        // ...and `unquotedShellText` masks quoted spans, so an unrelated command that merely
+        // MENTIONS a push is not one.
+        assert!(!is_mutating_bash_command("rg \"git push\" docs/"));
+        assert!(!is_mutating_bash_command("cargo run -- 'git commit -m x'"));
+        // An unrecognized global option ends the `*` loop without reaching a verb.
+        assert!(!is_mutating_bash_command("git -c user.name=x commit"));
+    }
+
+    /// The consequence, driven through the guard itself: a run whose only repo write was a
+    /// `git commit` must NOT be failed by the completion-mutation guard.
+    #[test]
+    fn a_git_commit_satisfies_the_completion_mutation_guard() {
+        let committer = agent(
+            "worker",
+            Some(vec![ToolRef::Builtin("bash".to_string())]),
+            None,
+        );
+        let events = vec![tool_start(
+            "bash",
+            serde_json::json!({"command": "git commit -am 'fix the failing test'"}),
+        )];
+        assert!(has_mutation_tool_call(&events));
+
+        let result =
+            evaluate_completion_mutation_guard(&committer, "Implement the fix and commit it", &events);
+        assert!(
+            result.expected_mutation,
+            "a bash-capable worker told to implement is expected to mutate"
+        );
+        assert!(
+            result.attempted_mutation,
+            "the `git commit` IS the mutation; without it the guard fails a run that really did \
+             change the repo"
+        );
+        assert!(!result.triggered);
+
+        // MIRROR: the same agent that only ran `git status` still trips the guard.
+        let looker = vec![tool_start("bash", serde_json::json!({"command": "git status"}))];
+        assert!(
+            evaluate_completion_mutation_guard(&committer, "Implement the fix and commit it", &looker)
+                .triggered
+        );
+    }
+
     #[test]
     fn has_mutation_tool_call_reads_bash_command_from_call_args() {
         let events = vec![tool_start(
@@ -1331,10 +1190,16 @@ mod tests {
         let task = "Implement the approved source fix";
 
         assert!(evaluate_completion_mutation_guard(&agent("architect", None, None), task, &[]).triggered);
-        assert!(
-            evaluate_completion_mutation_guard(&agent("architect", Some(vec![]), None), task, &[])
-                .triggered
-        );
+        // G103: an agent granted NO tools cannot mutate anything, so the guard must never fire on
+        // it — `hasMutationToolCapability([]) === false` (`completion-guard.ts:39-43` @v0.43.0),
+        // which short-circuits `expectedMutation` to `false` and with it `triggered`. This
+        // asserted `.triggered` (the v0.34.0 `toolMutationCapability` shape, which classed an
+        // empty list as mutation-capable), i.e. it asserted that a no-tools agent FAILS every
+        // implementation-worded task it is ever given.
+        let empty_allowlist =
+            evaluate_completion_mutation_guard(&agent("architect", Some(vec![]), None), task, &[]);
+        assert!(!empty_allowlist.expected_mutation);
+        assert!(!empty_allowlist.triggered);
         assert!(evaluate_completion_mutation_guard(
             &agent(
                 "architect",
@@ -1438,7 +1303,11 @@ mod tests {
     #[test]
     fn declares_only_read_only_tools_matches_source_semantics() {
         assert!(!declares_only_read_only_tools(&agent("a", None, None)));
-        assert!(!declares_only_read_only_tools(&agent("a", Some(vec![]), None)));
+        // G103 / `completion-guard.ts:39-43` @v0.43.0: an EXPLICITLY empty allowlist has no
+        // mutation capability at all (`[].every(...) === true`), so the guard exempts it. This
+        // asserted `!` while cyrup still mirrored v0.34.0's `tools.length === 0 =>
+        // mutation-capable` short-circuit.
+        assert!(declares_only_read_only_tools(&agent("a", Some(vec![]), None)));
         assert!(declares_only_read_only_tools(&agent(
             "a",
             Some(vec![ToolRef::Builtin("read".to_string())]),

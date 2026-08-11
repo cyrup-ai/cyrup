@@ -139,6 +139,59 @@ mod tests {
         }
     }
 
+    /// VERSION LAG (v0.83.0 → v0.84.1): OpenAI cut GPT-5.6 Terra and Luna prices on 2026-07-30 and
+    /// pi added the authoritative table `OPENAI_GPT_56_STANDARD_COSTS`
+    /// (v0.84.1 `ai/scripts/generate-models.ts:387-393`), which the openai literals then consume
+    /// (`:2371`, `:2383` — `cost: withOpenAiLongContextPricing(OPENAI_GPT_56_STANDARD_COSTS[...])`;
+    /// `:2372`/`:2384` are the `contextWindow:` lines one row below).
+    /// The table does not exist at v0.83.0 (`grep OPENAI_GPT_56_STANDARD_COSTS` finds nothing in
+    /// `v0.83.0 ai/scripts/generate-models.ts`); v0.83.0 spelled the same two rows as inline
+    /// literals `{1, 6, 0.1, 1.25}` / `{2.5, 15, 0.25, 3.125}`, which is exactly what cyrup carried.
+    /// Overbilling by 5x (luna) and 1.25x (terra) is invisible without an absolute assertion, which
+    /// is why [`long_context_models_carry_the_272k_pricing_tier`] — a RELATIVE multiplier check —
+    /// stayed green through the whole divergence.
+    #[test]
+    fn gpt_5_6_luna_and_terra_use_the_post_cut_prices() {
+        let models = openai_models();
+        let find = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+                .clone()
+        };
+
+        let luna = find("gpt-5.6-luna");
+        assert_eq!(luna.cost.input, 0.2);
+        assert_eq!(luna.cost.output, 1.2);
+        assert_eq!(luna.cost.cache_read, 0.02);
+        assert_eq!(luna.cost.cache_write, 0.25);
+        let t = &luna.cost.tiers.as_ref().expect("luna tiers")[0];
+        assert_eq!(t.input, 0.4);
+        assert_eq!(t.output, 1.8);
+        assert_eq!(t.cache_read, 0.04);
+        assert_eq!(t.cache_write, 0.5);
+
+        let terra = find("gpt-5.6-terra");
+        assert_eq!(terra.cost.input, 2.0);
+        assert_eq!(terra.cost.output, 12.0);
+        assert_eq!(terra.cost.cache_read, 0.2);
+        assert_eq!(terra.cost.cache_write, 2.5);
+        let t = &terra.cost.tiers.as_ref().expect("terra tiers")[0];
+        assert_eq!(t.input, 4.0);
+        assert_eq!(t.output, 18.0);
+        assert_eq!(t.cache_read, 0.4);
+        assert_eq!(t.cache_write, 5.0);
+
+        // MIRROR: Sol is NOT in `OPENAI_GPT_56_STANDARD_COSTS` — its literal is still the inline
+        // `{5, 30, 0.5, 6.25}` at BOTH tags (v0.84.1 `…:2360`), so it must not move.
+        let sol = find("gpt-5.6-sol");
+        assert_eq!(sol.cost.input, 5.0);
+        assert_eq!(sol.cost.output, 30.0);
+        assert_eq!(sol.cost.cache_read, 0.5);
+        assert_eq!(sol.cost.cache_write, 6.25);
+    }
+
     /// End-to-end: the catalog rate + the pricing function together bill a real long-context
     /// gpt-5.4-pro request at the long-context price.
     #[test]

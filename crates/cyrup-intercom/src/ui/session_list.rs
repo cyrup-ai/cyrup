@@ -42,7 +42,11 @@ pub enum SessionListAction {
     /// The user cancelled (`tui.select.cancel`).
     Cancel,
     /// The user chose a session (`tui.select.confirm`).
-    Select(SessionInfo),
+    ///
+    /// Boxed: [`SessionInfo`] is by far the largest thing this enum carries, and every other
+    /// variant is a unit, so an inline `SessionInfo` would make a `Redraw` cost the same as a
+    /// selection. Same reasoning as [`crate::transport::client::InboundEvent::Message`].
+    Select(Box<SessionInfo>),
 }
 
 /// The session picker overlay (pi `SessionListOverlay`).
@@ -87,7 +91,7 @@ impl SessionListOverlay {
         if keybindings.matches(data, "tui.select.confirm")
             && let Some(session) = self.sessions.get(self.selected_index)
         {
-            return SessionListAction::Select(session.clone());
+            return SessionListAction::Select(Box::new(session.clone()));
         }
         SessionListAction::Ignore
     }
@@ -189,12 +193,16 @@ mod tests {
             name: Some(name.to_string()),
             cwd: "/Users/envvar/.config/ghostty".to_string(),
             model: "bsy-deepseek-v4-pro".to_string(),
-            pid: 1,
-            started_at: 0,
-            last_activity: 0,
+            pid: 1u32.into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
             status: None,
             peer_uid: None,
             trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         }
     }
 
@@ -243,7 +251,7 @@ mod tests {
         overlay.handle_input(&kb, "\x1b[A");
         assert_eq!(overlay.selected().map(|s| s.id.as_str()), Some("bbbb2222"));
         // Enter selects the highlighted session.
-        assert_eq!(overlay.handle_input(&kb, "\r"), SessionListAction::Select(b));
+        assert_eq!(overlay.handle_input(&kb, "\r"), SessionListAction::Select(Box::new(b)));
         // Esc cancels.
         assert_eq!(overlay.handle_input(&kb, "\x1b"), SessionListAction::Cancel);
     }

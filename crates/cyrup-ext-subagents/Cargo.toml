@@ -23,6 +23,14 @@ test-fixtures = []
 [dependencies]
 cyrup-core = { workspace = true }
 cyrup-ext = { workspace = true }
+# `prompt_runtime.rs`'s child-side `context` hook (pi `subagent-prompt-runtime.ts:317-321`) filters
+# the LIVE message list, and that seam is typed: `cyrup_ext::EventPatch::Context` carries a
+# `Vec<cyrup_agent::AgentMessage>`, so the filter cannot be written against an opaque JSON value the
+# way `exec/ndjson.rs` deliberately treats a CHILD's NDJSON stream. This names the type that seam
+# already requires — `cyrup-ext` (a direct dependency above) depends on `cyrup-agent` itself, so no
+# new layering is introduced. NB `cyrup_session::AgentMessage` is a DIFFERENT type (a session-entry
+# message); the extension seam wants the agent-loop one.
+cyrup-agent = { workspace = true }
 cyrup-session = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-resources = { workspace = true }
@@ -51,12 +59,27 @@ jsonschema = { workspace = true }
 # nonce deliberately wants v7's sortable timestamp prefix — both features compose additively.
 uuid = { workspace = true, features = ["v4"] }
 libc = { workspace = true }
+# G90 steer: pi names a steer-request file `<ts>-<base64url(id)>.json`
+# (`control-channel.ts:85-87` @v0.34.0), so the id — an arbitrary caller-supplied string —
+# is base64url-encoded rather than interpolated raw, which is what keeps a path separator
+# out of the file name. Already a `[workspace.dependencies]` entry used by five sibling
+# crates; pure Rust, no C.
+base64 = { workspace = true }
 # SHA-256 for the direct-MCP metadata-cache config-identity hash (`exec/mcp_direct_tools.rs`,
 # pi `computeMcpServerHash`) — the resolver validates a cached server's tool/resource metadata is
 # still current by hashing the resolution-relevant fields of its `mcp.json` definition and
 # comparing against the cache's stamped `configHash`. Same version `cyrup-config` already pins for
 # its own PKCE/auth hashing, so no new workspace-wide version surface is introduced.
 sha2 = "0.11.0"
+# NFKC normalization for the watchdog emission guard's dedup identity
+# (`watchdog/emission-guard.ts:43`'s `value.normalize("NFKC")`): two warnings that differ only by a
+# compatibility form must collide on one identity, or the same finding re-warns every turn. Already a
+# `[workspace.dependencies]` entry (`cyrup-tools` uses it for the same reason); pure Rust, no C.
+unicode-normalization = { workspace = true }
+# WHATWG URL parsing for the mission store's delivery-receipt validation (`missions/store.rs`,
+# pi `new URL(url)` at `pi-subagents/src/missions/store.ts:170-174`). See the justifying comment
+# on the `[workspace.dependencies]` entry.
+url = { workspace = true }
 tracing = "0.1.44"
 # `tui/render.rs`'s pure fold-to-aggregate rendering functions (R-SA-106..113) return
 # `ratatui::text::Line`/`Span` values so a live terminal owner (`cyrup-tui`, out of scope for

@@ -1,4 +1,4 @@
-//! Extension registration (native `NativeExtension`, tool + 13 slash commands + doctor
+//! Extension registration (native `NativeExtension`, tool + 12 slash commands + doctor
 //! diagnostics), config-schema layering (`config.json` + `cyrup-config` settings), and durable
 //! persistence (func-SA §5.6; arch-SA §3.8/§4.6/§6.8).
 //!
@@ -56,7 +56,7 @@ pub mod doctor;
 
 pub mod profiles;
 
-/// The 13 slash-command descriptors and their pure argument parsers (R-SA-129):
+/// The 12 slash-command descriptors and their pure argument parsers (R-SA-129):
 /// [`slash_commands::SLASH_COMMANDS`] is the static registration table `extension.rs` iterates at
 /// `init()` time, and `slash_commands::parse_*` functions turn each command's raw trailing
 /// argument string into a strongly-typed parsed-command value, including `/chain`'s inline
@@ -80,6 +80,13 @@ pub mod cost;
 /// the full subsystem doc, including why the manifest's directory entries are expanded to concrete
 /// files here.
 pub mod resources;
+
+/// Prompt-template workflows (R-SA-132/134): discovery of the `prompts/*.md` recipes across the
+/// package/user/project tiers plus the argument grammar and recipe→run lowering behind the
+/// `/prompt-workflow` and `/chain-prompts` slash commands. A 1:1 port of
+/// `pi-subagents/src/slash/prompt-workflows.ts` @v0.34.0. See [`prompt_workflows`] for the full
+/// subsystem doc, including which fields of a recipe cyrup's dispatch surface can carry today.
+pub mod prompt_workflows;
 
 // -------------------------------------------------------------------------------------------
 // SubagentExtensionConfig (func-SA §4.7; arch-SA §3.8) — tier 3 of R-SA-133
@@ -111,24 +118,24 @@ pub struct SubagentExtensionConfig {
     /// across every run mode. Default 40 (func-SA §4.7).
     pub max_subagent_spawns_per_session: u32,
     /// Top-level parallel fan-out limits, as a NESTED object matching pi's
-    /// `ExtensionConfig.parallel?: { maxTasks?, concurrency? }` (types.ts:829-832/874) — NOT two
+    /// `ExtensionConfig.parallel?: { maxTasks?, concurrency? }` (shared/types.ts:1715-1718/1771) — NOT two
     /// flat `parallelMaxTasks`/`parallelConcurrency` keys. Read via the [`Self::parallel_max_tasks`]
     /// / [`Self::parallel_concurrency`] accessors, which fall back to pi's defaults (8 / 4) when the
     /// object, or a field within it, is omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel: Option<TopLevelParallelConfig>,
     /// Live-control notice thresholds/channels — pi `ExtensionConfig.control?: ControlConfig`
-    /// (types.ts:101-110/873). Feeds the control-notice state machine (`tui/notices.rs`); a resolved
+    /// (shared/types.ts:160-169/1764). Feeds the control-notice state machine (`tui/notices.rs`); a resolved
     /// view is produced by pi's `resolveControlConfig`. `None` = every threshold defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control: Option<ControlConfig>,
     /// Chain-specific extension config — pi `ExtensionConfig.chain?: { dynamicFanout?: { maxItems? } }`
-    /// (types.ts:834-838/875): the per-run cap on how many items a dynamic fan-out may expand to.
+    /// (shared/types.ts:1720-1724/1772): the per-run cap on how many items a dynamic fan-out may expand to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain: Option<ExtensionChainConfig>,
     /// Proactive skill-subagent suggestion config — pi
     /// `ExtensionConfig.proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false`
-    /// (types.ts:840-845/880): an object of tuning knobs, or the literal `false` to disable the
+    /// (shared/types.ts:1726-1731 interface, :1779 field): an object of tuning knobs, or the literal `false` to disable the
     /// feature entirely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proactive_skill_subagents: Option<ProactiveSkillSubagents>,
@@ -151,7 +158,7 @@ pub struct SubagentExtensionConfig {
     pub worktree_base_dir: Option<PathBuf>,
     /// An optional external setup script invoked once per `worktree: true` group after worktree
     /// creation, before any child process is spawned into it (R-SA-063). Matches pi's
-    /// `ExtensionConfig.worktreeSetupHook?: string` (types.ts:876): a bare **script-path string**
+    /// `ExtensionConfig.worktreeSetupHook?: string` (shared/types.ts:876): a bare **script-path string**
     /// (e.g. `"./scripts/setup-worktree.mjs"`), NOT a `{ command, args }` object — pi resolves it
     /// into a runnable `{ hookPath, timeoutMs }` at spawn time (`subagent-runner.ts:1975`). The
     /// crate-internal runnable shape (`spawn::worktree`'s `WorktreeSetupHookConfig`/[`HookSpec`]) is
@@ -164,19 +171,43 @@ pub struct SubagentExtensionConfig {
     /// constant itself lives in `spawn::worktree::DEFAULT_HOOK_TIMEOUT`, not duplicated here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_setup_hook_timeout_ms: Option<u64>,
-    /// Companion-package recommendation tuning/dismissal state — pi `ExtensionConfig.companionSuggestions?:
-    /// CompanionSuggestionsConfig | false` (types.ts:881). `None` (the field omitted) matches pi's own
-    /// omitted-field default: every package enabled, nothing dismissed. This is the SAME store
-    /// `/subagents-companions hide|show` mutates and `status` reads back (pi
-    /// `companion-suggestions.ts`'s `updateCompanionDismissal`/`isDismissed`), not a side marker file.
+    /// pi `ExtensionConfig.fleetView?: boolean` (`shared/types.ts:1750-1751`, its own comment:
+    /// "Show the Claude Code-style navigable fleet. Defaults to true."). Read by upstream as
+    /// `config.fleetView !== false` (`extension/index.ts:333`), so ONLY an explicit `false`
+    /// disables it — which is exactly what a `bool` defaulting to `true` expresses here.
+    /// Consumed by `extension.rs`'s `refresh_fleet_status_widget`, which publishes nothing when it
+    /// is off (upstream's `fleetStatus` is `undefined` in that case, `extension/index.ts:378-383`).
+    pub fleet_view: bool,
+    /// pi `ExtensionConfig.fleetViewPlacement?: FleetViewPlacement` (`shared/types.ts:1752-1753`,
+    /// its own comment: "Place the persistent FleetView above or below the editor. Defaults to
+    /// belowEditor."). Resolved through
+    /// [`crate::tui::fleet_status::resolve_fleet_view_placement`] — upstream's own
+    /// `resolveFleetViewPlacement(config.fleetViewPlacement)` (`extension/index.ts:334`) — which
+    /// accepts ONLY the exact string `"aboveEditor"` and treats everything else as below.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub companion_suggestions: Option<CompanionSuggestionsSetting>,
+    pub fleet_view_placement: Option<String>,
     /// The `wait` tool's config gate — pi `ExtensionConfig.waitTool?: WaitToolConfig`
-    /// (`extension/index.ts:260` `resolveWaitToolConfig(config.waitTool)`), accepting either a bare
+    /// (`extension/index.ts:332` `resolveWaitToolConfig(config.waitTool)`), accepting either a bare
     /// boolean or `{ enabled?: boolean }`. `None` (the field omitted) = enabled, pi's default.
     /// [`crate::background::wait::WAIT_TOOL_ENABLED_ENV`] overrides whatever this says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_tool: Option<crate::background::wait::WaitToolSetting>,
+    /// The durable-mission store config — pi `ExtensionConfig.missions?: MissionStoreConfig`
+    /// (`pi-subagents/src/missions/types.ts:102-108`, validated on every config read by
+    /// `extension/config.ts:25`'s `validateMissionStoreConfig`).
+    ///
+    /// `None` (the field omitted) is the default and means "missions enabled, default directories,
+    /// global pointer index on": every field inside is itself optional and
+    /// [`crate::missions::resolve_mission_store_location`] supplies the defaults. Setting
+    /// `{"enabled": false}` disables only the AUTOMATIC per-launch mission creation — an explicit
+    /// `mission`/`missionId` parameter and the six `mission.*` actions still work
+    /// (`missions/lifecycle.ts:65-66`).
+    ///
+    /// Validated through [`crate::missions::validate_mission_store_config`] by
+    /// [`Self::validate_missions`], which the config loader calls: serde alone would silently
+    /// accept an unknown key inside the block, and upstream refuses one loudly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missions: Option<crate::missions::MissionStoreConfig>,
 }
 
 /// pi's hardcoded default for `parallel.maxTasks` (func-SA §4.7) — the cap applied when the nested
@@ -203,13 +234,31 @@ impl Default for SubagentExtensionConfig {
             worktree_base_dir: None,
             worktree_setup_hook: None,
             worktree_setup_hook_timeout_ms: None,
-            companion_suggestions: None,
+            // pi `config.fleetView !== false` (`extension/index.ts:333`) — on unless explicitly off.
+            fleet_view: true,
+            fleet_view_placement: None,
             wait_tool: None,
+            missions: None,
         }
     }
 }
 
 impl SubagentExtensionConfig {
+    /// pi `validateMissionStoreConfig(config.missions)` (`extension/config.ts:25`) — the
+    /// unknown-key/wrong-type check upstream runs on every config read, applied to the RAW config
+    /// JSON so an unknown key inside the `missions` block is refused rather than silently dropped
+    /// by serde's field matching.
+    ///
+    /// # Errors
+    ///
+    /// The upstream refusal text (`config.missions.<key> is unknown`, `… must be boolean`, `…
+    /// must be a positive integer`).
+    pub fn validate_missions(raw: &serde_json::Value) -> Result<(), String> {
+        crate::missions::validate_mission_store_config(raw.get("missions"), "config.missions")
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// The effective `parallel.maxTasks` (pi `ExtensionConfig.parallel?.maxTasks`), falling back to
     /// [`DEFAULT_PARALLEL_MAX_TASKS`] (8) when the nested `parallel` object — or its `maxTasks`
     /// field — is omitted.
@@ -271,10 +320,10 @@ pub struct HookSpec {
 }
 
 // -------------------------------------------------------------------------------------------
-// Nested config objects (pi types.ts:829-882) — the shapes pi's ExtensionConfig nests
+// Nested config objects (pi shared/types.ts:829-882) — the shapes pi's ExtensionConfig nests
 // -------------------------------------------------------------------------------------------
 
-/// pi `TopLevelParallelConfig` (types.ts:829-832): the nested `parallel: { maxTasks?, concurrency? }`
+/// pi `TopLevelParallelConfig` (shared/types.ts:1715-1718): the nested `parallel: { maxTasks?, concurrency? }`
 /// object of [`SubagentExtensionConfig`]. Both fields are optional; an omitted field defers to the
 /// hardcoded pi default via [`SubagentExtensionConfig::parallel_max_tasks`] /
 /// [`SubagentExtensionConfig::parallel_concurrency`].
@@ -287,7 +336,7 @@ pub struct TopLevelParallelConfig {
     pub concurrency: Option<u32>,
 }
 
-/// pi `ExtensionChainConfig` (types.ts:834-838): the nested `chain: { dynamicFanout?: { maxItems? } }`
+/// pi `ExtensionChainConfig` (shared/types.ts:1720-1724): the nested `chain: { dynamicFanout?: { maxItems? } }`
 /// object of [`SubagentExtensionConfig`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -296,7 +345,7 @@ pub struct ExtensionChainConfig {
     pub dynamic_fanout: Option<DynamicFanoutConfig>,
 }
 
-/// The `chain.dynamicFanout` object (pi types.ts:835-837): the per-run cap on how many items a
+/// The `chain.dynamicFanout` object (pi shared/types.ts:835-837): the per-run cap on how many items a
 /// dynamic fan-out step may expand to.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -305,7 +354,7 @@ pub struct DynamicFanoutConfig {
     pub max_items: Option<u32>,
 }
 
-/// One control-notice event class (pi `ControlEventType`, types.ts:98): the two activity-state
+/// One control-notice event class (pi `ControlEventType`, shared/types.ts:157): the two activity-state
 /// transitions a run may raise a control notice for. Serializes as `active_long_running` /
 /// `needs_attention` (matching pi's string union and [`crate::background::ActivityState`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -315,7 +364,7 @@ pub enum ControlEventType {
     NeedsAttention,
 }
 
-/// One control-notice delivery channel (pi `ControlNotificationChannel`, types.ts:99). Serializes
+/// One control-notice delivery channel (pi `ControlNotificationChannel`, shared/types.ts:158). Serializes
 /// as `event` / `async` / `intercom`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,7 +374,7 @@ pub enum ControlNotificationChannel {
     Intercom,
 }
 
-/// pi `ControlConfig` (types.ts:101-110): the live-control notice thresholds/channels nested under
+/// pi `ControlConfig` (shared/types.ts:160-169): the live-control notice thresholds/channels nested under
 /// [`SubagentExtensionConfig::control`]. Every field is optional; pi's `resolveControlConfig`
 /// derives a fully-defaulted `ResolvedControlConfig` from this plus per-call overrides. This crate
 /// carries the raw config shape faithfully so the resolved view (owned by the control-notice
@@ -361,22 +410,33 @@ pub struct ControlConfig {
     pub notify_channels: Option<Vec<ControlNotificationChannel>>,
 }
 
-/// pi `ProactiveSkillSubagentsConfig` (types.ts:840-845): the tuning knobs for proactive
+/// pi `ProactiveSkillSubagentsConfig` (shared/types.ts:1726-1731): the tuning knobs for proactive
 /// skill-subagent suggestions.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProactiveSkillSubagentsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    // These are `i64`, not `u32`, so that an out-of-range value REACHES the guard instead of
+    // failing deserialization. `positive_integer` (discovery/skills.rs:412) already filters
+    // `>= 1` and is written for `i64`, matching upstream's `positiveInteger`
+    // (proactive-skills.ts:32-36), which returns `undefined` for a non-positive value and lets
+    // the caller fall back to the default while KEEPING the rest of the file.
+    //
+    // With `u32`, serde rejected `-1` before the guard ever ran, and
+    // `load_subagent_extension_config` (crates/cyrup/src/subagent_config.rs) discards the WHOLE
+    // config.json on any deserialization error — so one bad value silently dropped every other
+    // setting in the file (parallel.maxTasks, control.*, chain.dynamicFanout.maxItems,
+    // worktreeSetupHook, maxSubagentDepth, globalConcurrencyLimit).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_references: Option<u32>,
+    pub min_references: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_recommendations: Option<u32>,
+    pub max_recommendations: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_agent: Option<String>,
 }
 
-/// pi `proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false` (types.ts:880): either a
+/// pi `proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false` (shared/types.ts:1779, interface at :1726-1731): either a
 /// tuning-knob object, or the literal `false` to disable the feature entirely. Deserialized
 /// untagged so both a JSON object and a bare `false` parse.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -399,59 +459,6 @@ impl ProactiveSkillSubagents {
             ProactiveSkillSubagents::Config(cfg) => cfg.enabled.unwrap_or(true),
         }
     }
-}
-
-// -------------------------------------------------------------------------------------------
-// Companion-suggestion config (pi `companion-suggestions.ts` + `types.ts:847-862/881`)
-// -------------------------------------------------------------------------------------------
-
-/// Per-package dismissal state — pi `CompanionSuggestionPackageConfig.dismissed`
-/// (types.ts:853-856). `user` dismisses the recommendation for this OS user account entirely;
-/// `workspaces` dismisses it only for the specific workspace keys listed (each the nearest ancestor
-/// `.git` directory, or the resolved cwd when none is found — `extension::companion_workspace_key`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CompanionSuggestionDismissed {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspaces: Option<Vec<String>>,
-}
-
-/// Per-package companion-suggestion config — pi `CompanionSuggestionPackageConfig`
-/// (types.ts:850-857).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CompanionSuggestionPackageConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub surfaces: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dismissed: Option<CompanionSuggestionDismissed>,
-}
-
-/// The companion-suggestions config object — pi `CompanionSuggestionsConfig` (types.ts:859-862).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CompanionSuggestionsConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub packages: Option<HashMap<String, CompanionSuggestionPackageConfig>>,
-}
-
-/// pi `companionSuggestions?: CompanionSuggestionsConfig | false` (types.ts:881): the whole-feature
-/// `false` shortcut disables every companion package regardless of any per-package `enabled`/
-/// `dismissed` state (`companion-suggestions.ts:118`, `packageConfig`). Deserialized untagged so
-/// both a JSON object and a bare `false` parse, matching [`ProactiveSkillSubagents`]'s own shape.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-pub enum CompanionSuggestionsSetting {
-    /// The literal `false` (or `true`) form — `false` disables the whole feature.
-    Toggle(bool),
-    /// The full config-object form.
-    Config(CompanionSuggestionsConfig),
 }
 
 // -------------------------------------------------------------------------------------------
@@ -728,7 +735,7 @@ pub fn resolve_effective_config(
         .or_else(|| settings.default_model.clone());
 
     // Tier 7: pi has NO per-agent `maxSubagentDepth` settings override (`BuiltinAgentOverrideConfig`,
-    // agents.ts:65-79, carries none) — an earlier port invented one and consulted it here. The
+    // agents.ts:82-100, carries none) — an earlier port invented one and consulted it here. The
     // settings tier therefore never supplies a max depth; it resolves from `config.json` (tier 3),
     // agent frontmatter (tier 4), or the hardcoded default (tier 5) instead.
     let settings_max_depth: Option<u32> = None;
@@ -873,7 +880,7 @@ mod tests {
 
     #[test]
     fn subagent_extension_config_parses_pi_control_and_nested_parallel_shapes() {
-        // The exact pi ExtensionConfig shape (types.ts:864-882): nested `parallel {}`, `control {}`
+        // The exact pi ExtensionConfig shape (shared/types.ts:864-882): nested `parallel {}`, `control {}`
         // with all eight keys, `chain.dynamicFanout.maxItems`, `proactiveSkillSubagents` as an
         // object, and `worktreeSetupHook` as a bare script-path string.
         let cfg: SubagentExtensionConfig = serde_json::from_str(
@@ -1012,6 +1019,8 @@ mod tests {
             model_scope: None,
             overrides,
             default_model: Some("claude-sonnet".to_string()),
+            default_thinking: None,
+            default_extensions: None,
             disable_builtins: Some(true),
             disable_thinking: Some(true),
         };

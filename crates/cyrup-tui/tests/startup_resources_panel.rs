@@ -229,3 +229,66 @@ fn a_contained_native_init_failure_renders_under_extension_issues() {
     assert!(out.contains("permission-system"), "the failing extension must be named:\n{out}");
     assert!(out.contains("policy file unreadable"), "{out}");
 }
+
+/// **The L2 defect, surviving in `startup_lines`.**
+///
+/// Every child upstream adds to `loadedResourcesContainer` is a `new Text(…, 0, 0)`
+/// (`interactive-mode.ts:1766`, `:1775`, `:1798`, `:1807`) or an `ExpandableText(…, 0, 0)`
+/// (`:1626-1632`, which `extends Text`), and `Text.render` WRAPS at
+/// `contentWidth = Math.max(1, width - paddingX * 2)` (`text.ts:64`) BEFORE prefixing `leftMargin`
+/// to each produced row (`:70-76`).
+///
+/// `startup_lines` took no `width` at all: it inserted the margin into the LOGICAL row and handed
+/// the result to the outer `Paragraph::wrap`, which reflowed it at the FULL frame width. A single
+/// extension diagnostic carrying an absolute path drew rows of 77 and 73 columns inside a
+/// 40-column frame, with every continuation row flush at column 0 — the precise shape this batch
+/// existed to eliminate, still standing in the one block nobody had converted.
+#[test]
+fn startup_panel_rows_wrap_inside_the_frame() {
+    const W: u16 = 40;
+    let long_path = "/home/somebody/workspace/project/.cyrup/agent/extensions/very-long-name.json";
+    let long_msg = "failed to instantiate: the module exported no `activate` entry point and the \
+                    manifest declared an unknown capability";
+    let report = StartupReport {
+        quiet_startup: true,
+        extension_diagnostics: vec![StartupDiagnostic::plain(
+            DiagnosticSeverity::Error,
+            Some(long_path.into()),
+            long_msg,
+        )],
+        ..Default::default()
+    };
+
+    let mut app = App::new(TestBackend::new(W, 24), UiTheme::dark()).unwrap();
+    app.push_loaded_resources(&report);
+    app.draw().unwrap();
+    let lines = app.scrollback_lines();
+    assert!(!lines.is_empty(), "panel committed nothing");
+
+    for line in lines {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            line.width() <= usize::from(W),
+            "row {:?} is {} cells in a {W}-column frame",
+            text,
+            line.width()
+        );
+    }
+    // The wrap actually happened: the long path and the long message each occupy several rows.
+    assert!(lines.len() > 4, "nothing wrapped: {:?}", app.scrollback_text());
+    assert!(app.scrollback_text().contains("very-long-name.json"), "path lost in the wrap");
+    assert!(app.scrollback_text().contains("capability"), "message tail lost in the wrap");
+
+    // MIRROR — a short panel at a wide frame is untouched, margin and all: `[Skills]` still opens
+    // at column `outputPad` and the indented list rows keep their own two-space inset.
+    let mut wide = App::new(TestBackend::new(120, 24), UiTheme::dark()).unwrap();
+    wide.push_loaded_resources(&loud_report());
+    wide.draw().unwrap();
+    let text = wide.scrollback_text();
+    assert!(text.lines().any(|l| l.trim_start().starts_with("[Skills]")), "{text}");
+    assert!(text.lines().any(|l| l == "   deploy"), "list row lost its own inset:\n{text}");
+    assert!(text.lines().any(|l| l == "   review"), "list row lost its own inset:\n{text}");
+    for line in wide.scrollback_lines() {
+        assert!(line.width() <= 120, "wide frame overflow: {:?}", line.width());
+    }
+}

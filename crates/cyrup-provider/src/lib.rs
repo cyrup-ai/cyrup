@@ -47,9 +47,9 @@ pub use api::{
     ApiFactory, ApiImpl, ApiRegistry, EventSink, builtin_registry, channel, register_builtins,
 };
 pub use auth::{
-    ApiKeyAuth, AuthContext, AuthOverrides, AuthResult, Credential, CredentialStore,
-    EnvAuthContext, InMemoryCredentialStore, ModelAuth, ModifyFn, OAuthAuth, ProviderAuth,
-    ProviderEnv, env_key, keyless_local, resolve_provider_auth,
+    ApiKeyAuth, AuthContext, AuthOverrides, AuthResult, Credential, CredentialInfo,
+    CredentialStore, CredentialType, EnvAuthContext, InMemoryCredentialStore, ModelAuth, ModifyFn,
+    OAuthAuth, ProviderAuth, ProviderEnv, env_key, keyless_local, resolve_provider_auth,
 };
 pub use catalog::{builtin_catalog, load_catalog};
 pub use collection::{
@@ -128,6 +128,7 @@ pub use providers::{
 pub use providers::{
     TOGETHER_BASE_URL, together_models, together_provider, together_provider_with,
 };
+pub use providers::builtin_provider_oauth;
 pub use providers::{openrouter_images_auth, openrouter_images_provider};
 pub use stream::sse::{
     DEFAULT_HTTP_IDLE_TIMEOUT_MS, OnRequest, OnResponse, SseFrame, SseRequest, build_client,
@@ -174,4 +175,8 @@ pub mod known_api {
     pub const GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
     pub const MISTRAL_CONVERSATIONS: &str = "mistral-conversations";
     pub const BEDROCK_CONVERSE_STREAM: &str = "bedrock-converse-stream";
+    /// pi `KnownApi` (`ai/src/types.ts:16-26`). Ported in the unported-work sweep.
+    pub const PI_MESSAGES: &str = "pi-messages";
+    /// pi `KnownApi` (`ai/src/types.ts:16-26`). Ported in the unported-work sweep.
+    pub const OPENAI_CODEX_RESPONSES: &str = "openai-codex-responses";
 }

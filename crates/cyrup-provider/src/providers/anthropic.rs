@@ -4,10 +4,11 @@
 //! `providers/anthropic.ts` + the generated `anthropic.models.ts` catalog.
 //!
 //! Auth: `ANTHROPIC_OAUTH_TOKEN` takes precedence over `ANTHROPIC_API_KEY` (Pi
-//! `envApiKeyAuth("Anthropic API key", ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"])`). The Pi
-//! provider additionally wires an OAuth *login* flow (`lazyOAuth`/`loadAnthropicOAuth`); that login
-//! subsystem is tracked as a separate blocker (it needs a local callback HTTP server + PKCE) — the
-//! resolution path (explicit → stored → env) is fully wired here.
+//! `envApiKeyAuth("Anthropic API key", ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"])`), and the
+//! Pi provider's OAuth *login* clause (`lazyOAuth`/`loadAnthropicOAuth`,
+//! `providers/anthropic.ts:50-54`) is wired too — see
+//! [`super::builtin_oauth::builtin_provider_oauth`]. Both the resolution path (explicit → stored →
+//! env) and the login path are live.
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
@@ -31,9 +32,15 @@ pub fn anthropic_models() -> Vec<Model> {
 }
 
 /// The Anthropic [`ProviderAuth`]: `ANTHROPIC_OAUTH_TOKEN` then `ANTHROPIC_API_KEY` (Pi
-/// `envApiKeyAuth`, env-api-keys.ts:70).
+/// `envApiKeyAuth`, env-api-keys.ts:70), **plus** the Claude Pro/Max OAuth login
+/// (`lazyOAuth({ name: "Anthropic (Claude Pro/Max)", isSubscription: true, load:
+/// loadAnthropicOAuth })`, `providers/anthropic.ts:50-54`) — see
+/// [`super::builtin_oauth::builtin_provider_oauth`].
 pub fn anthropic_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key(["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]))
+    ProviderAuth {
+        api_key: Some(env_key(["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"])),
+        oauth: super::builtin_oauth::builtin_provider_oauth(ANTHROPIC_PROVIDER_ID),
+    }
 }
 
 /// Construct the Anthropic provider over the given credential store + shared api registry. The
@@ -108,9 +115,14 @@ impl AnthropicFleetSpec {
         serde_json::from_str(self.catalog_json).unwrap_or_default()
     }
 
-    /// The provider's [`ProviderAuth`]: an API key from its env var (Pi `envApiKeyAuth`).
+    /// The provider's [`ProviderAuth`]: an API key from its env var (Pi `envApiKeyAuth`), plus the
+    /// `lazyOAuth` clause for the one fleet member that has one — `kimi-coding`
+    /// (`providers/kimi-coding.ts:14-19`). See [`super::builtin_oauth::builtin_provider_oauth`].
     pub fn auth(&self) -> ProviderAuth {
-        ProviderAuth::with_api_key(env_key([self.env_var]))
+        ProviderAuth {
+            api_key: Some(env_key([self.env_var])),
+            oauth: super::builtin_oauth::builtin_provider_oauth(self.id),
+        }
     }
 
     /// Build this provider over an explicit credential store + shared api registry.

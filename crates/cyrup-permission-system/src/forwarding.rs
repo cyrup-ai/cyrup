@@ -569,6 +569,36 @@ pub async fn process_forwarded_requests(
             continue;
         }
 
+        // `request.id` is attacker-controlled: it is read verbatim out of a spool file any child
+        // that can forward a request may write, and it is joined into `responses_dir` below. An id
+        // of `../../../.bashrc` would make THIS process — the parent, which is the trusted one —
+        // write a JSON document outside the spool. `validate_safe_token` rejects `/`, `\` and
+        // `..`, exactly as it already does for the session-id token at `forwarding_location`
+        // (`:187`), and it is what actually stops traversal here.
+        //
+        // `validate_contains_root` is R-SA-087's second clause, but note precisely what it can and
+        // cannot do: it is `resolved.starts_with(root)`, a LEXICAL comparison that does NOT resolve
+        // `..` components — `responses/../../x` "starts with" `responses` as far as it is
+        // concerned. It therefore adds nothing against traversal and must never be mistaken for
+        // the defence. What it does catch is the ABSOLUTE-path shape: `join("/etc/cron.d/x")`
+        // discards the root entirely, and the result fails `starts_with`. Both checks are kept
+        // because they cover different escapes; neither alone is sufficient.
+        //
+        // This runs BEFORE `resolve_forwarded_decision` on purpose. That call surfaces the human
+        // ask dialog, so validating afterwards would still let a hostile request interrupt the
+        // user with a plausible-looking prompt — and the response is written on *either* answer,
+        // so denying it would not prevent the write. A request that cannot be answered safely must
+        // never be shown at all.
+        if validate_safe_token(&request.id).is_err() {
+            let _ = std::fs::remove_file(&request_path);
+            continue;
+        }
+        let response_path = location.responses_dir.join(format!("{}.json", request.id));
+        if validate_contains_root(&location.responses_dir, &response_path).is_err() {
+            let _ = std::fs::remove_file(&request_path);
+            continue;
+        }
+
         let decision = resolve_forwarded_decision(&request, services, config).await;
 
         let response = ForwardedPermissionResponse {
@@ -580,7 +610,6 @@ pub async fn process_forwarded_requests(
             responder_session_id: current.clone(),
             responded_at: now_millis(),
         };
-        let response_path = location.responses_dir.join(format!("{}.json", request.id));
         if write_json_atomic(&response_path, &response).is_err() {
             continue; // pi response-write failure: leave the request for a retry (`:1493-1496`).
         }
@@ -594,7 +623,7 @@ pub async fn process_forwarded_requests(
     }
 }
 
-/// The per-request decision (pi `index.ts:1414-1470`): expired → deny; yolo → approve; else surface
+/// The per-request decision (v0.8.0 pi `index.ts:1170-1230`): expired → deny; yolo → approve; else surface
 /// the SAME `select`/`input` dialog a local ask uses ([`LocalAskChannel`]) UNDER the one host-owned,
 /// session-scoped human-interaction lock (C3), with the configured auto-deny prompt timeout.
 async fn resolve_forwarded_decision(
@@ -604,7 +633,7 @@ async fn resolve_forwarded_decision(
 ) -> PermissionPromptDecision {
     let age_ms = now_millis().saturating_sub(request.created_at);
     if age_ms >= i64::try_from(PERMISSION_FORWARDING_TIMEOUT.as_millis()).unwrap_or(i64::MAX) {
-        // pi expired-on-read (`index.ts:1416-1426`).
+        // pi expired-on-read (v0.8.0 `index.ts:1172-1182`).
         return PermissionPromptDecision {
             approved: false,
             state: PermissionDecisionState::Denied,
@@ -615,7 +644,8 @@ async fn resolve_forwarded_decision(
         };
     }
 
-    // pi `shouldAutoApprovePermissionState("ask", cfg)` (`index.ts:1427-1429`): yolo auto-approves.
+    // pi `shouldAutoApprovePermissionState("ask", extensionConfig)` (v0.8.0 `index.ts:1183-1185`):
+    // yolo auto-approves.
     if config.yolo_mode {
         return PermissionPromptDecision {
             approved: true,
@@ -624,7 +654,7 @@ async fn resolve_forwarded_decision(
         };
     }
 
-    // pi debug notify (`index.ts:1432-1441`).
+    // pi debug notify (v0.8.0 `index.ts:1188-1197`).
     if config.debug {
         let who = if request.requester_agent_name.is_empty() {
             "unknown"
@@ -637,14 +667,23 @@ async fn resolve_forwarded_decision(
         );
     }
 
-    // pi optional auto-deny timeout (`index.ts:1443-1452`): `forwardedPromptTimeoutSeconds` > 0 → the
-    // select auto-rejects after that long; else it waits indefinitely.
-    let positive_timeout_secs = config.forwarded_prompt_timeout_seconds.filter(|s| *s > 0);
-    let timeout = positive_timeout_secs.map(Duration::from_secs);
-    // pi `timeoutDenialReason` (`index.ts:1447-1449`): only set when a positive timeout is configured;
+    // pi optional auto-deny timeout (v0.8.0 `index.ts:1199-1208`): `forwardedPromptTimeoutSeconds`
+    // non-null and > 0 → the select auto-rejects after that long; else it waits indefinitely.
+    let positive_timeout_secs = config.forwarded_prompt_timeout_seconds.filter(|s| *s > 0.0);
+    // pi `timeoutMs = forwardedPromptTimeoutSeconds * 1000` (`index.ts:1201`) — a plain multiply, so a
+    // fractional `45.5` yields 45500 ms, NOT 45000. `try_from_secs_f64` rather than
+    // `Duration::from_secs_f64` because the latter panics on a non-finite/out-of-range input and this
+    // crate denies `clippy::panic`; `normalize` has already excluded NaN/infinity/non-positive, so the
+    // only reachable error is an absurd overflow, which saturates to the longest wait expressible.
+    let timeout = positive_timeout_secs
+        .map(|secs| Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX));
+    // pi `timeoutDenialReason` (v0.8.0 `index.ts:1203-1205`): only set when a positive timeout is
+    // configured;
     // `requestPermissionDecisionFromUi` only reaches the reason-attaching fallback branch when the
     // caller passed a `timeoutDenialReason` at all (`permission-dialog.ts:155-158`), so `None` here
     // reproduces pi's plain (no `denialReason`) result for the "wait indefinitely" case.
+    // `{secs}` is `Display for f64`, which omits a zero fraction — `30` and `45.5`, exactly what JS
+    // interpolates for the same two values (`${30}` / `${45.5}`).
     let timeout_denial_reason = positive_timeout_secs.map(|secs| {
         format!(
             "permission_timeout: forwarded permission prompt was not answered within {secs} seconds."

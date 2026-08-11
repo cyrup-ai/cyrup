@@ -349,10 +349,35 @@ async fn connect_once(
     ensure_broker(&params.agent_dir).await?;
     let socket = broker_socket_path(&intercom_dir_path(&params.agent_dir));
     let registration = build_registration(state, params);
-    // Re-offer our previous identity so a reconnect takes over the same broker session id/name
-    // rather than appearing as a second, stale participant.
-    let session_id = std::env::var(ENV_INTERCOM_SESSION_ID)
-        .ok()
+    // Register under THIS SESSION'S OWN id — pi `await nextClient.connect(buildRegistration(),
+    // currentSessionId)` (`index.ts:833`), where `currentSessionId = ctx.sessionManager
+    // .getSessionId()` (`index.ts:945`). The live `HostServices::session_id()` is cyrup's
+    // `sessionManager.getSessionId()`.
+    //
+    // This used to read `CYRUP_INTERCOM_SESSION_ID` from the process env instead, which has ZERO
+    // writers anywhere in the workspace, so the offered id was always `None` on a first connect and
+    // the broker minted a random UUID (`broker/mod.rs:319-320`, `broker.ts:346-352`). Two
+    // consequences, both user-visible:
+    //   * a session's broker identity was unrelated to its agent session id, so the id column of
+    //     `intercom{list}` / the `/intercom` picker showed a UUID that names nothing else in cyrup
+    //     and NO peer could ever address a session by the session id it actually has;
+    //   * [`build_registration`] derives the presence alias `subagent-chat-<id[0:8]>` from the REAL
+    //     `HostServices::session_id()`, so the alias' 8 hex chars matched no listed id — the alias
+    //     is supposed to BE the readable form of the id it registers under.
+    // Reading the env var was also actively wrong in pi's own terms: pi *publishes*
+    // `PI_INTERCOM_SESSION_ID` (`publishIntercomSessionId`, `index.ts:612-614,946`) for CHILDREN to
+    // inherit and read back as their SUPERVISOR's id (`readChildOrchestratorMetadata`,
+    // `index.ts:86-87`) — it never re-reads it as its own registration id. A child that inherited it
+    // would have re-registered under its parent's id and taken the parent's broker slot over
+    // (`handle_register` identity takeover).
+    //
+    // `last_session_id()` stays as the fallback for a session with no live `HostServices` bound
+    // (headless/degraded): a reconnect then still re-offers the identity the broker previously
+    // assigned rather than appearing as a second, stale participant.
+    let session_id = state
+        .host_services()
+        .and_then(|services| services.session_id())
+        .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty())
         .or_else(|| state.connect.last_session_id());
     let client = Arc::new(IntercomClient::connect(&socket, registration, session_id).await?);
@@ -424,10 +449,11 @@ pub fn build_registration(state: &SharedIntercomState, params: &ConnectParams) -
         name,
         cwd: state.cwd.to_string_lossy().to_string(),
         model: params.model.clone().unwrap_or_else(|| "cyrup".to_string()),
-        pid: std::process::id(),
-        started_at: now_ms(),
-        last_activity: now_ms(),
+        pid: std::process::id().into(),
+        started_at: now_ms().into(),
+        last_activity: now_ms().into(),
         status: state.config.status.clone(),
+        extra: Default::default(),
     }
 }
 

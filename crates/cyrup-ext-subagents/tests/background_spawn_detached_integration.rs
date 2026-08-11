@@ -465,6 +465,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     }
 }
 
@@ -908,7 +910,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
 /// crate's own bookkeeping: with a published parent-session anchor (what
 /// `cyrup-permission-system`'s PARENT-role `SessionStart` installs — pi's
 /// `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`,
-/// `pi-subagents/src/extension/index.ts:599` @v0.34.0), the REAL detached `__subagent-runner` process
+/// `pi-subagents/src/extension/index.ts:716` @v0.43.0), the REAL detached `__subagent-runner` process
 /// spawned by the production entry point [`spawn_detached_runner`] has
 /// `CYRUP_SUBAGENT_PARENT_SESSION` in its own environment — read straight out of
 /// `/proc/<pid>/environ`, i.e. the kernel's copy, not ours.
@@ -981,20 +983,21 @@ async fn detached_runner_process_inherits_the_published_parent_session_anchor() 
     // production overlay itself is unchanged and correct — `.envs(env_overlay)` is handed to
     // `execve`, which is precisely why the value only becomes observable after that `execve`.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut entries: Vec<String> = Vec::new();
-    loop {
+    // The loop YIELDS the entries rather than pre-seeding a `mut` binding: every path that leaves
+    // it either breaks with a value or trips the deadline assert, so an initial empty vec was dead
+    // on arrival (clippy `unused_assignments`).
+    let entries: Vec<String> = loop {
         let exec_done = std::fs::read_link(format!("/proc/{pid}/exe"))
             .map(|target| target != std::env::current_exe().unwrap_or_default())
             .unwrap_or(false);
         if exec_done {
             let environ =
                 std::fs::read(format!("/proc/{pid}/environ")).expect("read child environ");
-            entries = environ
+            break environ
                 .split(|b| *b == 0)
                 .filter(|chunk| !chunk.is_empty())
                 .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
                 .collect();
-            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -1002,7 +1005,7 @@ async fn detached_runner_process_inherits_the_published_parent_session_anchor() 
              this test binary"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    };
 
     kill_pid_for_cleanup(pid);
 

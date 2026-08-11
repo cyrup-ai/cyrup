@@ -285,7 +285,9 @@ fn empty_partial(model: &ModelRef) -> AssistantMessage {
         // (proxy.ts:121-137, specifically `:123`). This is the client side of a Pi-server wire, so
         // the seed is directly observable interop, not an internal detail.
         stop_reason: cyrup_core::StopReason::Pending,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     }
 }

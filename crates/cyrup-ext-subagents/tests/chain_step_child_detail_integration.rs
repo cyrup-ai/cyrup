@@ -5,7 +5,7 @@
 //! (`pi-subagents:v0.34.0:src/runs/foreground/execution.ts:847` — `result.exitCode = exitCode`) and
 //! its `savedOutputPath` (`:963` — `result.savedOutputPath = resolvedOutput.savedPath`), and
 //! `collectDynamicResults` copies both onto every dynamic fan-out collect record
-//! (`src/runs/shared/dynamic-fanout.ts:278,283`). This port's chain walker sees a step only through
+//! (`src/runs/shared/dynamic-fanout.ts:278,283` @v0.34.0). This port's chain walker sees a step only through
 //! the narrow `StepResult` seam, so both values have to survive
 //! `ExecSingleStepExecutor::run_single`'s collapse of a `SingleResult` into a `StepResult` — which
 //! before this change they did not: the exit code was re-derived as
@@ -95,6 +95,8 @@ fn reporter_persona() -> ResolvedAgentPersona {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     }
 }
 

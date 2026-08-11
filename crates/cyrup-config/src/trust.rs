@@ -473,7 +473,9 @@ pub fn select_loaded<T>(resources: &[(ResourceKind, T)], trusted: bool) -> Vec<&
 mod tests {
     use super::*;
 
-    fn tmp() -> PathBuf {
+    /// The returned guard owns the directory's lifetime — it MUST stay bound for the whole
+    /// test (`let dir = tmp();`), never dropped into a temporary (`tmp().join(..)`).
+    fn tmp() -> crate::test_util::TempDir {
         crate::test_util::temp_dir()
     }
 
@@ -492,7 +494,8 @@ mod tests {
         assert_eq!(found.decision, TrustDecision::Trusted);
 
         // None when no ancestor matches.
-        let other = tmp().join("unrelated");
+        let other_root = tmp();
+        let other = other_root.join("unrelated");
         std::fs::create_dir_all(&other).unwrap();
         assert!(store.nearest(&other).unwrap().is_none());
     }
@@ -713,7 +716,8 @@ mod tests {
     fn trust_requiring_resources_detection() {
         // R-07-006
         let home = tmp();
-        let cwd = tmp().join("proj");
+        let cwd_root = tmp();
+        let cwd = cwd_root.join("proj");
         std::fs::create_dir_all(&cwd).unwrap();
         assert!(!has_trust_requiring_resources(&cwd, &home));
         std::fs::create_dir_all(cwd.join(".cyrup")).unwrap();

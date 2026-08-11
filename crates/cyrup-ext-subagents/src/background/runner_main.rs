@@ -186,7 +186,7 @@ pub struct RunnerConfig {
     /// failure, matching pi's `agents.find` miss), never silently downgraded to a placeholder.
     #[serde(default)]
     pub resolved_agents: BTreeMap<String, ResolvedAgentPersona>,
-    /// The chain's overall original task text (pi `originalTask`, `chain-execution.ts:493-497,1048`),
+    /// The chain's overall original task text (pi `originalTask`, `chain-execution.ts:104,536,600` @v0.34.0),
     /// the value every step's `{task}` placeholder resolves to. Resolved ONCE by the orchestrator
     /// (`SubagentExecutor::run_or_background_graph`) from the tool/slash `task` param, else the first
     /// step's first task, and carried here verbatim so the detached hop-2 runner substitutes the SAME
@@ -194,7 +194,7 @@ pub struct RunnerConfig {
     /// config still deserialize — an empty value keeps `{task}` → `""`.
     #[serde(default)]
     pub original_task: String,
-    /// The chain working directory (pi `chainDir`, `chain-execution.ts:1050`) that `{chain_dir}`
+    /// The chain working directory (pi `chainDir`, `chain-execution.ts:654`) that `{chain_dir}`
     /// resolves to. Resolved ONCE by the orchestrator as a dedicated per-run scratch dir under
     /// [`crate::artifacts::chain_runs_dir`] and created before the detached spawn, so the runner
     /// substitutes an already-existing directory. `#[serde(default)]` (`None`) lets an older config
@@ -238,7 +238,7 @@ pub struct RunnerConfig {
     /// lets an older on-disk config still deserialize, leaving enforcement off for that run.
     #[serde(default)]
     pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
-    /// The inherited nested-event route (pi `config.nestedRoute`, `async-execution.ts:672,914`) —
+    /// The inherited nested-event route (pi `config.nestedRoute`, `async-execution.ts:727,989` @v0.34.0) —
     /// resolved ONCE by the orchestrator from its own inherited env
     /// ([`crate::spawn::nested_events::resolve_inherited_nested_route_from_env`]) and carried here
     /// so a background run started from WITHIN an already-nested run relays its own descendants
@@ -248,7 +248,7 @@ pub struct RunnerConfig {
     #[serde(default)]
     pub nested_route: Option<crate::spawn::nested_events::NestedRoute>,
     /// This run's own resolved ancestry address within `nested_route` (pi `config.nestedSelf`,
-    /// `async-execution.ts:673-678,915-920`) — `None` iff `nested_route` is also `None`.
+    /// `async-execution.ts:728-731,990-993` @v0.34.0) — `None` iff `nested_route` is also `None`.
     /// `#[serde(default)]` lets an older on-disk config still deserialize.
     #[serde(default)]
     pub nested_self: Option<crate::spawn::nested_events::NestedParentAddress>,
@@ -261,7 +261,7 @@ pub struct RunnerConfig {
     /// on-disk config still deserialize — `None` keeps the pre-fix "no config cap" behavior.
     #[serde(default)]
     pub dynamic_fanout_max_items: Option<u32>,
-    /// SUBA-N05 — pi `config.controlConfig` (`subagent-runner.ts:153,1802` @v0.34.0): the
+    /// SUBA-N05 — pi `config.controlConfig` (`subagent-runner.ts:117,1328` @v0.34.0): the
     /// FULLY-RESOLVED live-control thresholds/channels this run was authorized with.
     ///
     /// Resolved ONCE, parent-side, by the orchestrator
@@ -269,7 +269,7 @@ pub struct RunnerConfig {
     /// `subagents.control` block plus the call's own `control` override) and carried here verbatim,
     /// exactly as upstream does — `runSinglePath` computes
     /// `resolveControlConfig(deps.config.control, effectiveParams.control)` and passes the RESOLVED
-    /// object into `executeAsyncSingle` (`subagent-executor.ts:2845,2868-2870`), whose runner reads
+    /// object into `executeAsyncSingle` (`subagent-executor.ts:2845,2868-2870` @v0.34.0), whose runner reads
     /// it back as `config.controlConfig ?? DEFAULT_CONTROL_CONFIG`.
     ///
     /// Parent-side resolution is load-bearing rather than stylistic: this process has no settings
@@ -311,7 +311,7 @@ pub struct RunnerConfig {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// SUBA-N03 — pi `config.deadlineAt` (`subagent-runner.ts:126`, fed from
-    /// `async-execution.ts:924,983` `deadlineAt = Date.now() + params.timeoutMs`): the ABSOLUTE
+    /// `async-execution.ts:924,983` @v0.34.0 `deadlineAt = Date.now() + params.timeoutMs`): the ABSOLUTE
     /// wall-clock instant this run must be finished by, as milliseconds since the Unix epoch.
     ///
     /// Absolute epoch-milliseconds rather than a `std::time::Instant` for the reason pi's is a
@@ -341,7 +341,7 @@ pub struct RunnerConfig {
     /// the directory this run's per-step artifact quadruple is written into.
     ///
     /// `None` means "write no artifacts" — pi's own gate is `if (ctx.artifactsDir &&
-    /// ctx.artifactConfig?.enabled !== false)` (`subagent-runner.ts:879`), i.e. an absent dir is
+    /// ctx.artifactConfig?.enabled !== false)` (`subagent-runner.ts:1192`), i.e. an absent dir is
     /// exactly as disabling as `enabled: false`, which is why the orchestrator sets this to `None`
     /// for `artifacts: false`. `#[serde(default)]` (`None`) is therefore also the pre-SUBA-N03
     /// behaviour: before this field existed the hop-2 runner wrote no artifacts at all.
@@ -662,6 +662,19 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     // for the identical reason — a request written in the race window before the watcher attaches
     // must not be missed.
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // G77 — the THIRD control-inbox verb (`control/stop.json`, pi `StopRequest`): an explicit
+    // user/agent stop, or an ancestor's stop cascaded down. Same mandatory
+    // synchronous-startup-check-then-watch treatment as the other two, for the same reason.
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if control::check_stop_inbox_now(run_paths)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        interrupt_cancel.cancel();
+    }
     if control::check_timeout_inbox_now(run_paths)
         .await
         .ok()
@@ -686,13 +699,8 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     let control_flags = ControlFlags {
         interrupted: Arc::clone(&interrupted),
         timed_out: Arc::clone(&timed_out),
+        stopped: Arc::clone(&stopped),
     };
-    let _watcher_task = spawn_control_watcher(
-        run_paths.clone(),
-        control_flags.clone(),
-        interrupt_cancel.clone(),
-    );
-
     // R-SA-136/146: open the size-capped `events.jsonl` writer for this run, via the SAME shared
     // `BoundedJsonlWriter` primitive `spawn::SpawnedChild`'s per-attempt child-output tee uses
     // (`jsonl.rs`'s own module doc names this exact call site as one of its two intended writers).
@@ -713,8 +721,20 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
 
     // Move the initial `Running` status into the shared handle BOTH the step loop and the live-
     // telemetry pump mutate (pi's single `statusPayload`, folded from the per-child event handler
-    // AND the 1s `activityTimer`, `subagent-runner.ts:1430-1581`).
+    // AND the 1s `activityTimer`, `subagent-runner.ts:1962`).
     let shared_status: SharedStatus = Arc::new(std::sync::Mutex::new(status));
+
+    // R-SA-082's watcher is installed HERE rather than immediately after the two synchronous
+    // startup checks above, because G90's steer routing needs the shared status handle (it accepts
+    // a steer only against a currently-`Running` step and records the acceptance on that step). The
+    // synchronous startup checks stay where they were — they are what closes the pre-watcher race
+    // window, and nothing between them and this line can deliver a control request.
+    let _watcher_task = spawn_control_watcher(
+        run_paths.clone(),
+        control_flags.clone(),
+        interrupt_cancel.clone(),
+        Arc::clone(&shared_status),
+    );
 
     // The live-telemetry channel: each dispatched step's `RunOptions::live_events` sink forwards
     // raw child NDJSON lines here (tagged with the step's flat index); the telemetry task folds
@@ -789,6 +809,23 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             )
             .await;
             (RunState::Failed, results, Some(message))
+        }
+        Ok(LoopOutcome::Stopped { results, message }) => {
+            // G77 — pi `subagent.run.stopped` (`subagent-runner.ts:2977-2982` @v0.43.0), carrying
+            // the stop message so a reader of `events.jsonl` sees WHY the run ended without having
+            // to reconstruct it from the terminal record. `durationMs` follows the same shape the
+            // sibling terminal events use here.
+            append_event(
+                &mut events,
+                "subagent.run.stopped",
+                Some(serde_json::json!({
+                    "runId": run_id_str,
+                    "message": message,
+                    "durationMs": duration_ms,
+                })),
+            )
+            .await;
+            (RunState::Stopped, results, Some(message))
         }
         Err(err) => {
             append_event(
@@ -922,7 +959,7 @@ fn step_elapsed_ms(status: &RunStatus, flat_index: usize) -> i64 {
 }
 
 /// Recompute + embed this run's workflow-graph snapshot (pi's `refreshWorkflowGraph`,
-/// `subagent-runner.ts:1202-1233`) from the current step list + live per-step statuses, so any
+/// `subagent-runner.ts:2160-2192`) from the current step list + live per-step statuses, so any
 /// `status.json` reader always sees a graph consistent with the run's current progress.
 fn refresh_workflow_graph(status: &mut RunStatus, steps: &[RunnerStep]) {
     let graph = super::workflow_graph_from_run(steps, status);
@@ -951,7 +988,7 @@ enum LoopOutcome {
     Interrupted { results: Vec<SingleResult> },
     /// A wall-clock deadline expired — either this run's own (`config.deadline_at_ms`, observed as
     /// a step whose child was killed by the deadline) or an ancestor's, delivered as a
-    /// `control/timeout.json` request (pi `timeoutRunner`, `subagent-runner.ts:2029-2062`
+    /// `control/timeout.json` request (pi `timeoutRunner`, `subagent-runner.ts:2987-3025`
     /// @v0.34.0).
     ///
     /// Deliberately NOT folded into `Interrupted`: an interrupt is a resumable pause (`Paused`,
@@ -962,6 +999,23 @@ enum LoopOutcome {
     TimedOut {
         results: Vec<SingleResult>,
         /// The message stamped onto the run's terminal error and every step it failed.
+        message: String,
+    },
+    /// G77 — an explicit stop request (`control/stop.json`, pi `StopRequest`) was observed and
+    /// consumed: pi `stopRunner` (`subagent-runner.ts:2955-2984` @v0.43.0). `results` holds every
+    /// step that DID complete before the stop landed.
+    ///
+    /// Deliberately NOT folded into `Interrupted` or `TimedOut`. Against `Interrupted`: a stop is
+    /// terminal and `resume` MUST refuse it (`async-resume.ts:406`), where a pause is exactly what
+    /// `resume` exists for. Against `TimedOut`: the terminal `state` is `Stopped`, not `Failed`, and
+    /// every downstream reader — the notify status word (`notify.ts:210`), the grouped intercom
+    /// verdict (`result-intercom.ts:84-87`), the `status` action's `State:` line
+    /// (`run-status.ts:478-479`) — prints a different word for it. Collapsing either way loses a
+    /// user-visible distinction upstream maintains at four separate sites.
+    Stopped {
+        results: Vec<SingleResult>,
+        /// The message stamped onto the run's terminal error and every step it stopped — always
+        /// the request's own `reason` when it carried one, else [`control::STOP_MESSAGE`].
         message: String,
     },
 }
@@ -977,6 +1031,13 @@ struct ControlFlags {
     interrupted: Arc<std::sync::atomic::AtomicBool>,
     /// A `control/timeout.json` is pending (terminal deadline failure).
     timed_out: Arc<std::sync::atomic::AtomicBool>,
+    /// G77 — a `control/stop.json` is pending (terminal, non-resumable explicit stop). The THIRD
+    /// verb, checked before the other two everywhere the three are drained together, matching pi's
+    /// own inbox order (`runs/background/control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → then
+    /// `consumeTimeoutRequest` → then `consumeInterruptRequest`) and `stopRunner`'s own
+    /// `if (stopped || timedOut || interrupted || state !== "running") return` mutual exclusion
+    /// (`subagent-runner.ts:2955-2986`).
+    stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // =================================================================================================
@@ -1095,6 +1156,8 @@ async fn run_inner(
 ) -> Result<LoopOutcome, SubagentError> {
     let interrupted = &flags.interrupted;
     let timed_out = &flags.timed_out;
+    // G77 — the stop flag, read at the very top of every loop iteration ahead of the other two.
+    let stopped = &flags.stopped;
     let mut steps = config.steps.clone();
     let mut cursor = 0usize;
     let mut results: Vec<SingleResult> = Vec::new();
@@ -1165,10 +1228,14 @@ async fn run_inner(
         include_progress: config.include_progress,
         // SUBA-N03: the run's `share` opt-in and artifact destination/selection, carried from the
         // one-shot config so an async run honours `share`/`artifacts` and leaves the same artifact
-        // quadruple a foreground run does (pi `subagent-runner.ts:879-889,1117-1133` @v0.34.0).
+        // quadruple a foreground run does (pi `subagent-runner.ts:879-890,1117-1125` @v0.34.0).
         share: config.share,
         artifacts_dir: config.artifacts_dir.clone(),
         artifact_config: config.artifact_config,
+        // G90 (pi `subagent-runner.ts:2313,2600,2797` @v0.34.0): the async run dir every
+        // dispatched step derives its own `steer-targets/<flatIndex>/` inbox from. This is the
+        // detached hop-2 runner, so it is exactly the process upstream gives `steerInboxDir` to.
+        run_dir: Some(run_paths.run_dir.clone()),
     });
     // SUBA-N03 — pi `subagent-runner.ts:2078-2081`: `const remainingMs = Math.max(0,
     // config.deadlineAt - Date.now())`. The orchestrator stamped an ABSOLUTE epoch deadline into
@@ -1182,7 +1249,7 @@ async fn run_inner(
     // `None` unless the caller asked for a timeout — but it was never a reason to DROP an explicit
     // one, and upstream has always honoured `timeoutMs` on the async path (`schemas.ts:265-266`
     // and `tool-description.ts:25,:73` @v0.34.0 both say it applies to "foreground and
-    // async/background runs"; `async-execution.ts:924,982-983` arms the deadline).
+    // async/background runs"; `async-execution.ts:1302-1305` arms the deadline).
     let deadline_at = config.deadline_at_ms.map(|deadline_ms| {
         let remaining_ms = deadline_ms.saturating_sub(crate::background::now_epoch_ms());
         std::time::Instant::now() + std::time::Duration::from_millis(remaining_ms)
@@ -1213,8 +1280,49 @@ async fn run_inner(
     };
 
     loop {
+        // G77 — STOP is checked before BOTH of the others, matching pi's own inbox-drain order
+        // (`runs/background/control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → `consumeTimeoutRequest` →
+        // `consumeInterruptRequest`) and `stopRunner`'s mutual-exclusion guard
+        // (`subagent-runner.ts:2955-2986`: `if (stopped || timedOut || interrupted || …) return`). The
+        // order is load-bearing when several land together: a stop outranks a timeout outranks an
+        // interrupt, so the terminal record is always the hardest, least-resumable verdict.
+        //
+        // Unlike the interrupt arm below there is no `cursor < steps.len()` moot-signal guard: a
+        // stop that lands after the last step finished still ends the run `Stopped` upstream
+        // (`stopRunner` only checks `statusPayload.state === "running"`, which is still true until
+        // `finish_run` writes the terminal record), and — unlike the interrupt case that guard
+        // exists for — that is not a downgrade to a permanently-wrong non-terminal record: `Stopped`
+        // IS terminal, so nothing is left waiting to be resumed.
+        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(request) = control::consume_stop_request(run_paths).await? {
+                let message = request
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| control::STOP_MESSAGE.to_string());
+                {
+                    let mut guard = lock_status(status);
+                    let s = &mut *guard;
+                    mark_remaining_stopped(s, cursor, steps.len(), &message);
+                    refresh_workflow_graph(s, &steps);
+                    s.touch();
+                }
+                write_shared_status(run_paths, status)
+                    .await
+                    .map_err(SubagentError::Spawn)?;
+                // pi `stopNestedAsyncDescendants()` (`subagent-runner.ts:2984`) — stop the whole
+                // subtree, not just this run, or every background run this one spawned keeps going
+                // detached and unreachable after the user asked for it to stop.
+                cascade_to_descendants(config, events, cascade::CascadeVerb::Stop).await;
+                promote_interrupted_results_to_stopped(&mut results, &message);
+                return Ok(LoopOutcome::Stopped { results, message });
+            }
+            // Same idempotent absorption the other two arms document: a watch notification with
+            // nothing actually pending clears the flag rather than looping.
+            stopped.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
         // Timeout is checked BEFORE interrupt, matching pi's own inbox-drain order
-        // (`control-channel.ts:608-609` @v0.34.0: `if (consumeTimeoutRequest(...)) onTimeout();`
+        // (`runs/background/control-channel.ts:654-655` @v0.43.0: `if (consumeTimeoutRequest(...)) onTimeout();`
         // then `if (consumeInterruptRequest(...)) onInterrupt();`). The order is load-bearing when
         // both land together — an ancestor that timed out cascades a timeout to this run while a
         // user may simultaneously be interrupting it, and the terminal record must be the harder
@@ -1355,7 +1463,7 @@ async fn run_inner(
         // R-SA-097 root attachment (chain-root-attachment.ts): an `ImportAsyncRoot` step is NOT
         // dispatched by spawning a child — it is synthesized by POLLING another already-launched
         // run's terminal files (mirroring pi's `runSingleStep` short-circuit `if (step.importAsyncRoot)`,
-        // `subagent-runner.ts:688`). Intercept it here, before the `walk_chain` dispatch, so the
+        // `subagent-runner.ts:1153`). Intercept it here, before the `walk_chain` dispatch, so the
         // runner "calls the poll" (`control::wait_for_imported_async_root`) rather than routing it
         // through the `SingleStepExecutor` spawn seam that would (correctly) have no idea how to run
         // it.
@@ -1382,7 +1490,7 @@ async fn run_inner(
                 // are already recorded on ITS own terminal `ResultFile` — `ImportedAsyncRootResult`
                 // deliberately carries only the identity/output fields
                 // `imported_root_to_single_result` reproduces, so there is nothing to re-attribute
-                // here (matching pi's `runSingleStep`, `subagent-runner.ts:695-709`).
+                // here (matching pi's `runSingleStep`, `subagent-runner.ts:1162-1181`).
                 control_events: Vec::new(),
                 // Same reasoning for the per-child detail fields: an imported root's real exit code
                 // is carried on `ImportedAsyncRootResult` and reproduced by
@@ -1512,6 +1620,18 @@ async fn run_inner(
             // overwriting the `Paused` marking just applied, since `Paused` is not terminal).
             // Checked against the file rather than the flag so a stale flag can never spin this
             // loop: only this branch's own consumption removes the file.
+            //
+            // G77: the STOP inbox is probed before the timeout inbox, for the identical reason and
+            // in pi's identical order (`runs/background/control-channel.ts:653-655`). All THREE verbs share the one
+            // cancellation token, so `step_result.interrupted` is equally true for a stop — and
+            // returning `Interrupted` here would end an explicitly-stopped run as a resumable
+            // `Paused`, which is exactly the bug this gap is about. Falling through without
+            // advancing the cursor lets the loop-top stop branch produce the terminal record; it
+            // re-marks this same step `Stopped`, overwriting the `Paused` marking just applied,
+            // because `Paused` is not terminal.
+            if control::check_stop_inbox_now(run_paths).await?.is_some() {
+                continue;
+            }
             if control::check_timeout_inbox_now(run_paths).await?.is_some() {
                 continue;
             }
@@ -1575,7 +1695,7 @@ fn timeout_message(timeout_ms: Option<u64>, source: &str) -> String {
 }
 
 /// The timeout counterpart of [`mark_remaining_paused`] (pi `timeoutRunner`'s step sweep,
-/// `subagent-runner.ts:2038-2049` @v0.34.0): every step from `from_index` that is not already
+/// `subagent-runner.ts:2029-2067` @v0.34.0): every step from `from_index` that is not already
 /// terminal becomes `Failed` with the timeout `message` and an end timestamp.
 ///
 /// `Failed`, not `Paused`, is the whole point — see [`LoopOutcome::TimedOut`]. A reader must be
@@ -1602,6 +1722,85 @@ fn mark_remaining_timed_out(
                 for child in &mut group.children {
                     if !child.status.is_terminal() {
                         child.status = StepState::Failed;
+                        child.error = Some(message.to_string());
+                        child.ended_at.get_or_insert(now);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// G77 — re-label the child that was torn down BY the stop as `stopped` rather than `interrupted`.
+///
+/// cyrup drives a step's live child off one shared [`cyrup_core::CancelToken`] for every control
+/// verb, so a child killed by a stop comes back from `run_sync` carrying `interrupted: true` — the
+/// same shape an actual `interrupt` produces. pi does not have that ambiguity because it hands the
+/// child two separate abort controllers, and it resolves the child's own record against the STOP
+/// signal specifically: `const stoppedAfterAcceptance = finalResult?.stopped === true ||
+/// ctx.stopSignal?.aborted === true;` … `stopped: stoppedAfterAcceptance ? true :
+/// finalResult?.stopped` (`subagent-runner.ts:1642,1722` @v0.43.0). This function is that same
+/// promotion, applied at the one place cyrup knows the stop signal is what fired.
+///
+/// The rest of each promoted field follows `runSubagent`'s own stopped-result shape
+/// (`subagent-runner.ts:1937-4576` @v0.43.0): `exitCode: 1`, `error: stopMessage`, and — only when the
+/// child produced no output of its own — `finalOutput: stopMessage`. Children that had ALREADY
+/// completed before the stop landed are untouched, exactly as upstream leaves them (their records
+/// settled while `stopSignal.aborted` was still false).
+fn promote_interrupted_results_to_stopped(results: &mut [SingleResult], message: &str) {
+    for result in results.iter_mut().filter(|r| r.interrupted) {
+        result.interrupted = false;
+        result.stopped = true;
+        result.exit_code = 1;
+        result.error = Some(message.to_string());
+        if result
+            .final_output
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+        {
+            result.final_output = Some(message.to_string());
+        }
+    }
+}
+
+/// G77 — the STOP counterpart of [`mark_remaining_timed_out`]/[`mark_remaining_paused`], ported
+/// from pi `stopRunner`'s own step sweep (`subagent-runner.ts:2955-2986` @v0.43.0):
+///
+/// ```text
+/// for (const step of statusPayload.steps) {
+///     if (step.status !== "running" && step.status !== "pending") continue;
+///     step.status = "stopped";
+///     step.error = stopMessage;
+///     step.exitCode = 1;
+///     step.stopped = true;
+///     …
+/// }
+/// ```
+///
+/// Three differences from the timeout sweep, all upstream's:
+/// * the terminal step status is [`StepState::Stopped`], never `Failed` — a reader must be able to
+///   tell "someone stopped this" from "this crashed";
+/// * upstream sweeps EVERY `running`-or-`pending` step in the payload, not only those from the
+///   cursor onward — which is the same set here, since a step before the cursor is already
+///   terminal and `is_terminal()` skips it either way;
+/// * the message is the fixed [`control::STOP_MESSAGE`], not a computed one.
+fn mark_remaining_stopped(status: &mut RunStatus, from_index: usize, total: usize, message: &str) {
+    let now = super::now_epoch_millis_pub();
+    for index in from_index..total {
+        if let Some(step) = status.steps.get_mut(index)
+            && !step.status.is_terminal()
+        {
+            step.status = StepState::Stopped;
+            step.error = Some(message.to_string());
+            step.ended_at.get_or_insert(now);
+        }
+    }
+    if let Some(groups) = &mut status.parallel_groups {
+        for group in groups {
+            if group.group_step_index >= from_index {
+                for child in &mut group.children {
+                    if !child.status.is_terminal() {
+                        child.status = StepState::Stopped;
                         child.error = Some(message.to_string());
                         child.ended_at.get_or_insert(now);
                     }
@@ -1775,6 +1974,8 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
         // the terminal per-step `SingleResult` instead of being flattened into an anonymous
         // non-zero exit.
         timed_out: result.timed_out,
+        stopped: false,
+        process_signal: None,
         error: result.error.clone(),
         saved_output_path: result.saved_output_path.clone(),
         tool_calls: Vec::new(),
@@ -1792,7 +1993,7 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
 /// first step. Unlike [`step_result_to_single_result`], the agent/model/attempted-models here come
 /// from the IMPORTED result (the target child's own identity), not the `ImportAsyncRoot` step's
 /// display spec — matching pi's `runSingleStep` returning `imported.agent`/`imported.model`/… rather
-/// than the step's declared values (`subagent-runner.ts:695-709`).
+/// than the step's declared values (`subagent-runner.ts:1162-1181`).
 fn imported_root_to_single_result(
     spec: &crate::spawn::chain_graph::ImportAsyncRootSpec,
     imported: &control::ImportedAsyncRootResult,
@@ -1811,6 +2012,8 @@ fn imported_root_to_single_result(
         detached: false,
         interrupted: false,
         timed_out: false,
+        stopped: false,
+        process_signal: None,
         error: imported.error.clone(),
         saved_output_path: None,
         tool_calls: Vec::new(),
@@ -1897,7 +2100,7 @@ pub(crate) struct ExecSingleStepExecutor {
     /// quietly replaced by an allowed model. `None` = enforcement off.
     pub(crate) model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
     /// SUBA-N05 — the run's FULLY-RESOLVED live-control config (pi `controlConfig`,
-    /// `subagent-runner.ts:1802` / `chain-execution.ts:388,1064` @v0.34.0), carried from
+    /// `subagent-runner.ts:1953` / `chain-execution.ts:322,491` @v0.34.0), carried from
     /// [`RunnerConfig::control`] (background) or handed by [`Self::with_control`] (foreground
     /// `/chain`, `/parallel`, `/run-chain`). Threaded onto every dispatched step's
     /// [`crate::exec::RunOptions::control_config`], so an explicit `control` override really does
@@ -1914,11 +2117,11 @@ pub(crate) struct ExecSingleStepExecutor {
     /// SUBA-N03 — the run's `share` opt-in (pi `config.share` ← `params.share`), threaded onto
     /// every dispatched step's [`crate::exec::RunOptions::share`]. Its one effect is pi's
     /// `sessionEnabled = Boolean(sessionFile || sessionDir) || share` term
-    /// (`runs/foreground/execution.ts:1027,1039`): `Some(true)` keeps a child's session store on
+    /// (`runs/foreground/execution.ts:1027,1039` @v0.34.0): `Some(true)` keeps a child's session store on
     /// where it would otherwise be spawned `--no-session`. `None`/`Some(false)` is not enabling.
     pub(crate) share: Option<bool>,
     /// SUBA-N03 — where this run's per-step artifact quadruple is written (pi `ctx.artifactsDir`,
-    /// `runs/background/subagent-runner.ts:877-889,1117-1133` @v0.34.0), paired with
+    /// `runs/background/subagent-runner.ts:879-890,1117-1125` @v0.34.0 @v0.34.0), paired with
     /// [`Self::artifact_config`]. `None` disables artifact writing outright, which is exactly pi's
     /// own first gate term (`if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false)`) and
     /// is how an explicit `artifacts: false` reaches this hop.
@@ -1927,6 +2130,19 @@ pub(crate) struct ExecSingleStepExecutor {
     /// `ctx.artifactConfig`). Read together with [`Self::artifacts_dir`]; `enabled: false` disables
     /// the write just as an absent dir does.
     pub(crate) artifact_config: crate::artifacts::ArtifactConfig,
+    /// G90 — this run's async run directory, the root of the steer control inbox
+    /// (`<run_dir>/control/steer-targets/<flatIndex>/`). Each dispatched step derives its OWN
+    /// per-child inbox from it and hands the path to the child in
+    /// [`crate::exec::RunOptions::steer_inbox_dir`], which is pi's
+    /// `steerInboxDir: stepSteerInboxDir(asyncDir, fi)` (`subagent-runner.ts:2313,2600,2797`
+    /// @v0.34.0).
+    ///
+    /// `None` for a FOREGROUND executor, matching upstream exactly: `steerInboxDir` is supplied
+    /// only by the background runner, because the inbox lives inside an async run directory and a
+    /// foreground `/chain`//`/parallel` walk has none. That is also why `control_steer` refuses a
+    /// foreground run outright ([`crate::extension::STEER_FOREGROUND_RUN_REFUSAL`]) rather than
+    /// queueing into a directory nothing would ever read.
+    pub(crate) run_dir: Option<PathBuf>,
 }
 
 impl ExecSingleStepExecutor {
@@ -1999,6 +2215,9 @@ impl ExecSingleStepExecutor {
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
+            // G90: a foreground walk has no async run directory, hence no steer inbox — the same
+            // reason upstream supplies `steerInboxDir` only from the background runner.
+            run_dir: None,
         }
     }
 
@@ -2028,6 +2247,24 @@ impl ExecSingleStepExecutor {
     ) -> Self {
         self.control = control;
         self
+    }
+
+    /// G90: the steer inbox the child at flat index `index` must be handed — pi
+    /// `steerInboxDir: stepSteerInboxDir(asyncDir, fi)` (`subagent-runner.ts:2313,2600,2797`
+    /// @v0.34.0).
+    ///
+    /// Named rather than inlined because the two halves of the runner hop have to agree on it and
+    /// they are written 800 lines apart: `handle_steer_request` routes an accepted request into
+    /// `control::enqueue_step_steer(run_dir, index, …)` (which writes to
+    /// `step_steer_inbox_dir(run_dir, index)`), and this is where the SAME path is handed to the
+    /// child. Deriving it from the run-level `steer_requests_dir`, or from a step index rather
+    /// than the FLAT index, would leave both sides individually plausible and the feature silently
+    /// dead — the failure mode this whole item is about.
+    #[must_use]
+    pub(crate) fn steer_inbox_for(&self, index: usize) -> Option<PathBuf> {
+        self.run_dir
+            .as_deref()
+            .map(|run_dir| control::step_steer_inbox_dir(run_dir, index))
     }
 }
 
@@ -2126,7 +2363,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         // violation directly above makes, and for the same reason: silently running a gate-less
         // child is the defect, not the remedy. The tool boundary
         // (`extension.rs::execute` -> `validate_execution_acceptance`, pi
-        // `subagent-executor.ts:1534`) normally refuses such a policy before any child spawns; this
+        // `subagent-executor.ts:1757`) normally refuses such a policy before any child spawns; this
         // is the last line of defence for a step reaching the runner from a config file that was
         // hand-edited after validation.
         let acceptance = match step.acceptance.as_ref() {
@@ -2142,7 +2379,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             None => None,
         };
 
-        // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:458-466,1583-1609`): clone the
+        // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:1333,2002-2005,2069` @v0.34.0): clone the
         // run-wide SHARED interrupt token so an interrupt landing WHILE this child is running (the
         // control-inbox watcher cancels `self.interrupt_cancel`) actually tears the child down via
         // `run_sync`'s `opts.interrupt` race — not merely gets noticed between steps. Previously a
@@ -2180,7 +2417,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         let effective_cwd = step.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
         // File-output handoff wiring (Tier-2): resolve this step's `output` FILE path (relative
         // against the step's effective cwd, absolute used verbatim — pi's `resolveSingleOutputPath`
-        // fallback, `single-output.ts:21-34`) and hand it to `run_sync`, so `exec/output.rs`'s
+        // fallback, `single-output.ts:64-77`) and hand it to `run_sync`, so `exec/output.rs`'s
         // stat-snapshot handoff runs and the saved-output reference message is emitted. Previously
         // hard-`None`, which is exactly why the whole file-output path was dead code.
         let output_path = step.output_path.as_deref().map(|raw| {
@@ -2194,7 +2431,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         let opts = RunOptions {
             cwd: effective_cwd,
             deadline_at: ctx.deadline_at,
-            // pi `chain-execution.ts:305-306,1118-1119`: every step's `runSync` call carries BOTH
+            // pi `chain-execution.ts:335-336,741-742,1197-1198` @v0.34.0: every step's `runSync` call carries BOTH
             // the chain-wide `deadlineAt` (raced against) and the nominal `timeoutMs` (only used to
             // render the timed-out message) — the same two values for every step, never re-derived
             // per step.
@@ -2214,11 +2451,11 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             cancel: ctx.cancel.clone(),
             interrupt: interrupt_token,
             // SUBA-N03 — pi `share: shareEnabled` (`async-execution.ts:965`) reaching this run's
-            // children as one of the two `sessionEnabled` terms (`execution.ts:1027,1039`). Carried
+            // children as one of the two `sessionEnabled` terms (`execution.ts:1027,1039` @v0.34.0). Carried
             // from `RunnerConfig::share`; `None` is "omitted", which is NOT enabling.
             share: self.share,
             // SUBA-N03 — this step's own already-resolved session directory (pi's `--session-dir`,
-            // `pi-args.ts:109-111`). Resolved PARENT-side and carried on the step rather than
+            // `runs/shared/pi-args.ts:109-111`). Resolved PARENT-side and carried on the step rather than
             // derived here from a run-level root: see `SingleStepSpec::session_dir`'s
             // [CYRUP-DELTA] note for why an index-derived path would be unsafe at this seam.
             session_dir: step.session_dir.clone(),
@@ -2271,10 +2508,19 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             orchestrator_intercom_target: self.orchestrator_intercom_target.clone(),
             run_id: self.run_id.clone(),
             child_index: Some(self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst)),
+            // G90 (pi `steerInboxDir: stepSteerInboxDir(asyncDir, fi)`,
+            // `subagent-runner.ts:2313,2600,2797` @v0.34.0): THIS step's own per-child steer inbox,
+            // handed to the spawned child so its live steering watcher has a path to attach to. The
+            // index is the same `current_flat_index` `child_index` above uses — the position the
+            // runner's own `deliver_steer_request` routes an accepted request to
+            // (`control::enqueue_step_steer`), so the two halves of the hop address the same
+            // directory by construction. `None` for a foreground executor (no async run dir).
+            steer_inbox_dir: self
+                .steer_inbox_for(self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst)),
             // SUBA-N05: the run's resolved live-control config, threaded from
             // [`RunnerConfig::control`] (background) or [`ExecSingleStepExecutor::with_control`]
             // (foreground chain/parallel) — pi `controlConfig: input.controlConfig` on the
-            // per-step `runSync` call (`chain-execution.ts:388,1064,1323` @v0.34.0), and
+            // per-step `runSync` call (`chain-execution.ts:322,491,733` @v0.34.0), and
             // `config.controlConfig ?? DEFAULT_CONTROL_CONFIG` in the async runner
             // (`subagent-runner.ts:1802`). `None` still degrades to `DEFAULT_CONTROL_CONFIG` inside
             // `run_sync`, so an omitted config keeps control tracking ON with stock thresholds
@@ -2289,6 +2535,17 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // (`subagent-runner.ts:2270-2280` → `async-job-tracker.ts:138-166` @v0.34.0). That
             // replay hop is not ported; the events themselves are not lost.
             on_control_event: None,
+            // G80 — pi `artifactsDir: ctx.artifactsDir` on the background hop's own
+            // `evaluateAcceptance` call (`runs/background/subagent-runner.ts:1638-1639` @v0.43.0),
+            // which is how a step's verify[] results get memoized under
+            // `<artifactsDir>/acceptance/verify/<runId>/`. Gated by the SAME two-term gate every
+            // other artifact write on this hop uses (`ctx.artifactsDir && ctx.artifactConfig
+            // ?.enabled !== false`, `subagent-runner.ts:1192`), so `artifacts: false` disarms
+            // memoization along with the quadruple.
+            artifacts_dir: self
+                .artifacts_dir
+                .clone()
+                .filter(|_| self.artifact_config.enabled),
         };
 
         // SUBA-N03 / T6 on the SECOND hop — pi `runs/background/subagent-runner.ts:877-889`
@@ -2478,12 +2735,32 @@ fn spawn_control_watcher(
     run_paths: RunPaths,
     flags: ControlFlags,
     interrupt_cancel: cyrup_core::CancelToken,
+    shared_status: SharedStatus,
 ) -> ControlWatcherHandle {
     let ControlFlags {
         interrupted,
         timed_out,
+        stopped,
     } = flags;
     let handle = tokio::spawn(async move {
+        // G90: the steer queue's own `events.jsonl` writer. A second `BoundedJsonlWriter` on the
+        // same file is safe and does NOT double the 50MB budget: `create` opens in append mode and
+        // seeds `bytes_written` from the file's CURRENT length, so each writer's cap is measured
+        // against the file as it actually is, not against its own contribution.
+        let mut events = BoundedJsonlWriter::create(&run_paths.events).await.ok();
+        // pi's in-memory `pendingStepSteers` (`subagent-runner.ts:1332,2071-2075` @v0.34.0): a steer that
+        // arrives while its target child is still `pending` is HELD, not dropped, and re-attempted.
+        //
+        // [CYRUP-DELTA] pi flushes the pending queue from an explicit per-step
+        // `flushPendingStepSteers(flatIndex)` hook at each dispatch site; this task instead
+        // re-attempts on the SAME fixed interval pi's own `watchAsyncControlInbox` runs its poll
+        // safety net at (`runs/background/control-channel.ts:625-692`). Same guarantee — a held steer lands as soon as
+        // its child starts running — reached through the polling half of R-SA-082 rather than a new
+        // hook threaded through three dispatch sites. It also closes a real gap: cyrup's watcher
+        // previously had NO interval at all, so it depended entirely on `notify` firing.
+        let mut pending: Vec<control::SteerRequest> = Vec::new();
+        let mut ticker = tokio::time::interval(control::CONTROL_INBOX_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (watcher, mut rx) = match control::watch_control_inbox(&run_paths) {
             Ok(pair) => pair,
             Err(_) => {
@@ -2499,16 +2776,44 @@ fn spawn_control_watcher(
         // Keep the watcher alive for the lifetime of this task (dropping it would stop the watch)
         // — held in this local binding rather than discarded.
         let _watcher = watcher;
-        while rx.recv().await.is_some() {
+        loop {
+            // G90 turned this from a bare `rx.recv()` await into a two-arm select: the interval arm
+            // is what retries a HELD steer whose target child was still `pending` last time round,
+            // and is also the poll safety net pi's `watchAsyncControlInbox` has always had.
+            tokio::select! {
+                message = rx.recv() => {
+                    if message.is_none() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {}
+            }
+            // G90: drain the steer queue and route it, BEFORE the interrupt/timeout checks. Order
+            // matters and is pi's: a steer is non-terminal guidance for a child that is expected to
+            // keep running, so it must be handed over before an interrupt landing in the same tick
+            // tears that child down.
+            route_steer_requests(&run_paths, &shared_status, &mut events, &mut pending).await;
             // The control inbox now holds TWO distinct request files (`interrupt.json` and
             // `timeout.json`), so a notification is no longer self-describing: this task must ask
             // WHICH one is pending rather than blindly assuming "interrupt". Blindly setting
             // `interrupted` on a timeout delivery would tear the live child down under the wrong
             // verdict and end the run `Paused` (resumable) when it must end `Failed`/timed-out.
             //
-            // Timeout is checked first, matching pi's own drain order (`control-channel.ts:608-609`
+            // Timeout is checked first, matching pi's own drain order (`runs/background/control-channel.ts:608-609`
             // @v0.34.0) and this run loop's own top-of-iteration ordering.
             let mut wake = false;
+            // G77: stop is probed FIRST, matching pi's fixed drain order
+            // (`runs/background/control-channel.ts:653-655`) — when a stop and a timeout/interrupt land in the same
+            // tick, the run must end `Stopped`, the hardest and least-resumable of the three.
+            if control::check_stop_inbox_now(&run_paths)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+                wake = true;
+            }
             if control::check_timeout_inbox_now(&run_paths)
                 .await
                 .ok()
@@ -2540,6 +2845,145 @@ fn spawn_control_watcher(
         }
     });
     ControlWatcherHandle { handle }
+}
+
+/// G90 — the runner's steer router, pi `deliverSteerRequest` + the `onSteer` inbox handler
+/// (`subagent-runner.ts:1740-1790,2066-2076` @v0.34.0).
+///
+/// One tick: drain `<run_dir>/control/steer-requests/`, merge whatever was HELD from previous ticks,
+/// and for each request in `ts` order decide per target child whether it can be handed over right
+/// now. An accepted request is copied into that child's own inbox
+/// ([`control::enqueue_step_steer`]), counted on the step and on the run
+/// ([`crate::background::StepTelemetry::steer_count`]), and logged to `events.jsonl` as
+/// `subagent.steer.requested` with pi's exact `acceptedIndexes`/`rejected` payload — so
+/// `subagent({ action: "status", id })` shows the acceptance and `events.jsonl` shows the full
+/// decision, which is what makes `action: "steer"` observable rather than fire-and-forget.
+///
+/// A request whose target is still `pending` is put back on `pending` for the next tick, matching
+/// pi's `pendingStepSteers`. A request that lands while the run is not `Running` at all is held the
+/// same way rather than discarded: pi returns early from `deliverSteerRequest`, and its request has
+/// already been removed from the run-level queue by `consumeSteerRequests`, so holding it here is
+/// strictly closer to pi's INTENT (`pendingStepSteers` exists precisely so early steers survive) —
+/// and the whole queue is dropped with this task when the run ends either way.
+async fn route_steer_requests(
+    run_paths: &RunPaths,
+    shared: &SharedStatus,
+    events: &mut Option<BoundedJsonlWriter>,
+    pending: &mut Vec<control::SteerRequest>,
+) {
+    let mut queue = std::mem::take(pending);
+    queue.extend(control::consume_steer_requests(&run_paths.run_dir).await);
+    if queue.is_empty() {
+        return;
+    }
+    queue.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+
+    let mut status_dirty = false;
+    for request in queue {
+        // Snapshot the decision inputs under the lock, then release it — `enqueue_step_steer` is
+        // `.await`-ing filesystem work and a `std::sync::Mutex` guard must never cross an await.
+        let (run_state, step_states): (RunState, Vec<StepState>) = {
+            let status = lock_status(shared);
+            (status.state, status.steps.iter().map(|s| s.status).collect())
+        };
+        if run_state != RunState::Running {
+            pending.push(request);
+            continue;
+        }
+        let targets: Vec<usize> = match request.target_index {
+            Some(index) => vec![index],
+            None => step_states
+                .iter()
+                .enumerate()
+                .filter(|(_, state)| **state == StepState::Running)
+                .map(|(index, _)| index)
+                .collect(),
+        };
+        // No running child yet and no explicit target: hold rather than reject, so a steer racing
+        // the very first dispatch is not lost (pi's `else pendingStepSteers.push(request)`).
+        if targets.is_empty() {
+            pending.push(request);
+            continue;
+        }
+
+        let mut accepted: Vec<usize> = Vec::new();
+        let mut rejected: Vec<serde_json::Value> = Vec::new();
+        let mut held = false;
+        for index in targets {
+            match step_states.get(index) {
+                None => rejected.push(
+                    serde_json::json!({ "index": index, "reason": "child index out of range" }),
+                ),
+                Some(StepState::Pending) => held = true,
+                Some(StepState::Running) => {
+                    if control::enqueue_step_steer(&run_paths.run_dir, index, &request)
+                        .await
+                        .is_ok()
+                    {
+                        accepted.push(index);
+                    } else {
+                        rejected.push(serde_json::json!({
+                            "index": index,
+                            "reason": "child inbox write failed"
+                        }));
+                    }
+                }
+                Some(other) => rejected.push(serde_json::json!({
+                    "index": index,
+                    "reason": format!("child is {}", super::run_status::step_state_label(*other))
+                })),
+            }
+        }
+        if held && accepted.is_empty() && rejected.is_empty() {
+            pending.push(request);
+            continue;
+        }
+
+        let now = super::now_epoch_millis_pub();
+        if !accepted.is_empty() {
+            let mut status = lock_status(shared);
+            for index in &accepted {
+                if let Some(step) = status.steps.get_mut(*index) {
+                    step.telemetry.steer_count =
+                        Some(step.telemetry.steer_count.unwrap_or(0).saturating_add(1));
+                    step.telemetry.last_steer_at = Some(now);
+                }
+            }
+            let total = u64::try_from(accepted.len()).unwrap_or(0);
+            status.telemetry.steer_count =
+                Some(status.telemetry.steer_count.unwrap_or(0).saturating_add(total));
+            status.telemetry.last_steer_at = Some(now);
+            status.last_update = now;
+            status_dirty = true;
+        }
+
+        let mut payload = serde_json::json!({
+            "runId": run_paths
+                .run_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            "requestId": request.id,
+            "message": request.message,
+            "acceptedIndexes": accepted,
+        });
+        if let Some(map) = payload.as_object_mut() {
+            if let Some(source) = request.source.as_ref() {
+                map.insert("source".to_string(), serde_json::json!(source));
+            }
+            if let Some(target) = request.target_index {
+                map.insert("targetIndex".to_string(), serde_json::json!(target));
+            }
+            if !rejected.is_empty() {
+                map.insert("rejected".to_string(), serde_json::json!(rejected));
+            }
+        }
+        append_event(events, "subagent.steer.requested", Some(payload)).await;
+    }
+
+    if status_dirty {
+        let _ = write_shared_status(run_paths, shared).await;
+    }
 }
 
 /// RAII wrapper aborting the spawned control-inbox watcher task on drop, so a caller ([`run`])
@@ -2627,7 +3071,7 @@ async fn finish_run(
     status.state = terminal_state;
     status.last_update = now;
     status.ended_at = Some(now);
-    // pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:1167,2411`): the
+    // pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:3021` @v0.34.0): the
     // terminal `status.json` write carries the SAME `cwd`/`sessionFile` the terminal `ResultFile`
     // below does, so `resume`'s terminal-revival branch (R-SA-085) can read `status.cwd ??
     // result.cwd` (`background/async-resume.ts:323,345,373`) straight off the reconciled status
@@ -2648,12 +3092,27 @@ async fn finish_run(
             model: None,
             attempted_models: Vec::new(),
             model_attempts: Vec::new(),
-            final_output: None,
+            // G77 — pi's `stoppedStepResult` fills BOTH halves (`subagent-runner.ts:2358-2365`:
+            // `output: stopMessage, error: stopMessage`), and the sibling live-child path here
+            // ([`promote_interrupted_results_to_stopped`]) already does the same. Without it a
+            // stopped run whose stop landed before any step produced a result delivers an EMPTY
+            // output alongside a populated error, which every output-shaped reader (the notify
+            // completion message, the intercom payload's `outputs`, the status report) renders as
+            // "the run produced nothing" rather than "the run was stopped". Only for `Stopped`:
+            // upstream's other synthesized shapes carry their own messages and cyrup's `finish_run`
+            // has no way to tell a plain `Failed` apart from a timed-out one.
+            final_output: (terminal_state == RunState::Stopped).then(|| error.clone()),
             structured_output: None,
             acceptance: None,
             detached: false,
             interrupted: terminal_state == RunState::Paused,
             timed_out: false,
+            // G77 — pi `runSubagent`'s stopped result carries `stopped: true` and
+            // `exitCode: 1` (`subagent-runner.ts:2358-2365`), which is what
+            // `resolveSubagentResultStatus`/`buildCompletionDetails`/`resultState` all read to
+            // classify the child as stopped rather than merely failed.
+            stopped: terminal_state == RunState::Stopped,
+            process_signal: None,
             error: Some(error.clone()),
             saved_output_path: None,
             tool_calls: Vec::new(),
@@ -2745,6 +3204,272 @@ mod tests {
     use crate::background::atomic::write_atomic_json;
     use crate::spawn::chain_graph::SingleStepSpec;
 
+    // ---------------------------------------------------------------------------------------
+    // G90 — the runner's steer router, driven as the FULL LIFECYCLE rather than one rendered
+    // block: parent writes into the run queue -> router decides per child -> per-child inbox +
+    // status counters + `events.jsonl` decision record.
+    // ---------------------------------------------------------------------------------------
+
+    /// A `Running` run with `agents.len()` steps, the ones named in `running` marked `Running` and
+    /// the rest left `Pending`.
+    fn steer_fixture(dir: &Path, agents: &[&str], running: &[usize]) -> (RunPaths, SharedStatus) {
+        let paths = RunPaths::for_run(dir, dir, &RunId::from_token("steerroute01".to_string()));
+        std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
+        let mut status =
+            RunStatus::queued(paths.run_dir.file_name().map(|n| RunId::from_token(n.to_string_lossy().into_owned())).expect("run id"), RunMode::Parallel, Some(std::process::id()));
+        status.state = RunState::Running;
+        status.steps = agents
+            .iter()
+            .enumerate()
+            .map(|(i, agent)| {
+                let mut step = crate::background::StepStatus::pending(*agent);
+                if running.contains(&i) {
+                    step.status = StepState::Running;
+                }
+                step
+            })
+            .collect();
+        (paths, Arc::new(std::sync::Mutex::new(status)))
+    }
+
+    /// G90, the runner's two halves must address the SAME directory.
+    ///
+    /// `route_steer_requests` writes an accepted request into
+    /// `control::step_steer_inbox_dir(run_dir, index)`; `run_single` hands the child
+    /// `steer_inbox_for(index)`. If those two ever diverge — a run-level queue dir on one side, a
+    /// per-child target dir on the other; a step index on one side and a flat index on the other —
+    /// each half stays individually correct and the feature is silently dead again, with no test
+    /// failing. This asserts the agreement directly, at the real write site.
+    #[tokio::test]
+    async fn the_inbox_the_runner_writes_is_the_inbox_the_child_is_handed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b"], &[1]);
+        control::request_async_steer(&paths.run_dir, "look at step two", None, Some("steer-action"))
+            .await
+            .expect("parent write");
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+
+        // The executor built for THIS run, exactly as `run` builds it.
+        let executor = ExecSingleStepExecutor {
+            depth: DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            interrupt_cancel: cyrup_core::CancelToken::new(),
+            current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            telemetry: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
+            resolved_agents: Arc::new(BTreeMap::new()),
+            orchestrator_intercom_target: None,
+            run_id: None,
+            inherited_session_model: None,
+            model_scope: None,
+            control: None,
+            include_progress: None,
+            run_dir: Some(paths.run_dir.clone()),
+        };
+
+        let handed = executor
+            .steer_inbox_for(1)
+            .expect("a background executor must hand its children an inbox");
+        let written: Vec<_> = std::fs::read_dir(&handed)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the runner must have written into the very directory the child is handed \
+                     ({}): {e}",
+                    handed.display()
+                )
+            })
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "the routed request must be sitting in the child's own inbox at {}",
+            handed.display()
+        );
+
+        // A FOREGROUND executor has no run dir and therefore hands no inbox — the same condition
+        // that makes `control_steer` refuse a foreground run outright.
+        let foreground = ExecSingleStepExecutor::foreground(
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            Arc::new(BTreeMap::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(foreground.steer_inbox_for(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn steer_routing_fans_an_untargeted_request_to_every_running_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b", "c"], &[0, 2]);
+        control::request_async_steer(&paths.run_dir, "tighten the scope", None, Some("steer-action"))
+            .await
+            .expect("parent write");
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+
+        // Every RUNNING child got its own copy; the pending one did not.
+        for index in [0usize, 2] {
+            let inbox = control::step_steer_inbox_dir(&paths.run_dir, index);
+            let files: Vec<_> = std::fs::read_dir(&inbox)
+                .unwrap_or_else(|e| panic!("child {index} inbox must exist: {e}"))
+                .filter_map(Result::ok)
+                .collect();
+            assert_eq!(files.len(), 1, "child {index} must receive exactly one steer");
+            let raw = std::fs::read_to_string(files[0].path()).expect("read");
+            let request: control::SteerRequest = serde_json::from_str(&raw).expect("parse");
+            assert_eq!(request.target_index, Some(index), "the copy must be PINNED to its child");
+            assert_eq!(request.message, "tighten the scope");
+        }
+        assert!(
+            !control::step_steer_inbox_dir(&paths.run_dir, 1).exists(),
+            "a pending child must NOT be handed an untargeted steer"
+        );
+
+        // The run-level queue was drained exactly once (delete-before-deliver).
+        assert!(
+            control::consume_steer_requests(&paths.run_dir).await.is_empty(),
+            "the run queue must be empty after routing"
+        );
+        assert!(pending.is_empty(), "nothing was held");
+
+        // Counters landed on the accepted steps AND the run, and were persisted.
+        let status = lock_status(&shared).clone();
+        assert_eq!(status.steps[0].telemetry.steer_count, Some(1));
+        assert_eq!(status.steps[1].telemetry.steer_count, None);
+        assert_eq!(status.steps[2].telemetry.steer_count, Some(1));
+        assert_eq!(status.telemetry.steer_count, Some(2));
+        assert!(status.telemetry.last_steer_at.is_some());
+        let persisted: RunStatus =
+            serde_json::from_slice(&std::fs::read(&paths.status).expect("status.json written"))
+                .expect("parse status.json");
+        assert_eq!(persisted.telemetry.steer_count, Some(2));
+
+        // And the decision is on the event log, with pi's payload keys.
+        drop(events);
+        let log = std::fs::read_to_string(&paths.events).expect("events.jsonl");
+        let line = log
+            .lines()
+            .find(|l| l.contains("subagent.steer.requested"))
+            .expect("the router must log its decision");
+        let event: serde_json::Value = serde_json::from_str(line).expect("parse event");
+        assert_eq!(event["acceptedIndexes"], serde_json::json!([0, 2]));
+        assert_eq!(event["source"], serde_json::json!("steer-action"));
+        assert_eq!(event["message"], serde_json::json!("tighten the scope"));
+        assert!(event.get("rejected").is_none(), "nothing was rejected: {event}");
+    }
+
+    #[tokio::test]
+    async fn a_steer_aimed_at_a_pending_child_is_held_then_delivered_once_it_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b"], &[0]);
+        control::request_async_steer(&paths.run_dir, "wait for me", Some(1), None)
+            .await
+            .expect("parent write");
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+        assert_eq!(pending.len(), 1, "a pending target must be HELD, never dropped");
+        assert!(
+            !control::step_steer_inbox_dir(&paths.run_dir, 1).exists(),
+            "nothing may be delivered while the child is pending"
+        );
+
+        // The child starts; the next tick delivers the held request without the parent resending.
+        lock_status(&shared).steps[1].status = StepState::Running;
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+        assert!(pending.is_empty(), "the held request must be released");
+        let inbox = control::step_steer_inbox_dir(&paths.run_dir, 1);
+        assert_eq!(
+            std::fs::read_dir(&inbox).expect("inbox").count(),
+            1,
+            "the held request must land on the child that just started"
+        );
+        assert_eq!(lock_status(&shared).steps[1].telemetry.steer_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_steer_aimed_at_a_finished_child_is_rejected_with_that_childs_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b"], &[0]);
+        lock_status(&shared).steps[1].status = StepState::Complete;
+        control::request_async_steer(&paths.run_dir, "too late", Some(1), None)
+            .await
+            .expect("parent write");
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+        assert!(pending.is_empty(), "a terminal child is a rejection, not a hold");
+        assert_eq!(lock_status(&shared).telemetry.steer_count, None);
+
+        drop(events);
+        let log = std::fs::read_to_string(&paths.events).expect("events.jsonl");
+        let line = log
+            .lines()
+            .find(|l| l.contains("subagent.steer.requested"))
+            .expect("a rejection is still logged");
+        let event: serde_json::Value = serde_json::from_str(line).expect("parse event");
+        assert_eq!(event["acceptedIndexes"], serde_json::json!([]));
+        assert_eq!(event["rejected"][0]["index"], serde_json::json!(1));
+        assert_eq!(event["rejected"][0]["reason"], serde_json::json!("child is complete"));
+    }
+
+    #[tokio::test]
+    async fn steer_requests_are_routed_in_timestamp_order_not_readdir_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a"], &[0]);
+        // Written newest-first on purpose: the queue file names are zero-padded by `ts`, and the
+        // consumer re-sorts, so delivery order must still be oldest-first.
+        for (ts, message) in [(2_000_i64, "second"), (1_000, "first")] {
+            let request = control::SteerRequest {
+                kind: "steer".to_string(),
+                id: format!("id-{ts}"),
+                ts,
+                message: message.to_string(),
+                target_index: None,
+                source: None,
+            };
+            control::write_steer_request_to_dir(
+                &control::steer_requests_dir(&paths.run_dir),
+                &request,
+            )
+            .await
+            .expect("write");
+        }
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+        drop(events);
+
+        let log = std::fs::read_to_string(&paths.events).expect("events.jsonl");
+        let messages: Vec<String> = log
+            .lines()
+            .filter(|l| l.contains("subagent.steer.requested"))
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|e| e["message"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(messages, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(lock_status(&shared).steps[0].telemetry.steer_count, Some(2));
+    }
+
     fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
             skills: None,
@@ -2801,6 +3526,7 @@ mod tests {
             model_scope: None,
             control: None,
             include_progress: None,
+            run_dir: None,
         };
         let ctx = ChainRunContext {
             cwd: dir.path().to_path_buf(),
@@ -3115,6 +3841,8 @@ mod tests {
                 detached: false,
                 interrupted: false,
                 timed_out: false,
+                stopped: false,
+                process_signal: None,
                 error: None,
                 saved_output_path: None,
                 tool_calls: Vec::new(),
@@ -3213,7 +3941,7 @@ mod tests {
         assert!(!result.success);
     }
 
-    /// pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:1167,2411`): the
+    /// pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:3021` @v0.34.0): the
     /// terminal `status.json` write must carry the SAME `cwd`/`sessionFile` the terminal
     /// `ResultFile` does, so `resume`'s terminal-revival branch (R-SA-085,
     /// `background/async-resume.ts:323,345,373`) can read `status.cwd ?? result.cwd` straight off
@@ -3262,9 +3990,292 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
+    // G77 — the `stopped` widenings that had no coverage of their own: `finish_run`'s synthesized
+    // child, `mark_remaining_stopped`'s parallel-GROUP child sweep (the flat step sweep was
+    // covered; the group half never was), `promote_interrupted_results_to_stopped`'s
+    // already-settled-child filter, and the stop message itself. The fourth claimed ordering — a
+    // stop landing together with a timeout must win — needs a real runner and lives in
+    // `tests/run_state_signal_and_stop_parity.rs`.
+    // ---------------------------------------------------------------------------------------
+
+    /// G77 — pi's stop message, pinned VERBATIM.
+    ///
+    /// `"Subagent stopped by user."` is the literal `stopMessage` upstream defines once
+    /// (`runs/background/subagent-runner.ts:1972` @v0.43.0) and then repeats as the `??` default at
+    /// `:779`, `:915`, `:917`, `:952`, `:1151`, `:1596`, `:1636`, `:1658`,
+    /// `runs/shared/external-cli-runner.ts:108` and `runs/background/chain-root-attachment.ts:100,147`.
+    /// It is stamped onto a stopped run's terminal `error`, onto every step the stop swept, and onto
+    /// the child's `finalOutput` when the child produced none of its own — so a drifting copy would
+    /// silently change three separate observable records at once. Nothing pinned the text itself;
+    /// every existing assertion compared it against the constant, which cannot catch a drifted
+    /// constant.
+    #[test]
+    fn the_stop_message_is_pis_verbatim_text() {
+        assert_eq!(
+            control::STOP_MESSAGE,
+            "Subagent stopped by user.",
+            "pi `subagent-runner.ts:1972`'s literal `stopMessage`"
+        );
+    }
+
+    /// G77 widening 1 — `finish_run`'s SYNTHESIZED child.
+    ///
+    /// When a run reaches a terminal state having produced no step results at all, `finish_run`
+    /// invents one placeholder [`SingleResult`] so the `ResultFile` is never silently empty. That
+    /// placeholder must carry `stopped: true` for a `Stopped` run (pi `runSubagent`'s stopped result
+    /// shape, `subagent-runner.ts:4448-4454`: `stopped: true`, `exitCode: 1`) — it is the ONLY thing
+    /// that lets `resolveSubagentResultStatus` classify the child as stopped rather than merely
+    /// failed, and therefore the only thing that makes the grouped intercom verdict `stopped`.
+    ///
+    /// The three sibling terminal states are asserted in the same test so the flag cannot be
+    /// widened into an unconditional `true`.
+    #[tokio::test]
+    async fn finish_runs_synthesized_child_carries_stopped_only_for_a_stopped_run() {
+        for (terminal_state, expect_stopped, expect_interrupted) in [
+            (RunState::Stopped, true, false),
+            (RunState::Paused, false, true),
+            (RunState::Failed, false, false),
+        ] {
+            let dir = tempfile::tempdir().expect("real tempdir");
+            let run_id = RunId::from_token(format!("synth-{terminal_state:?}").to_lowercase());
+            let run_paths = run_paths_in(dir.path(), &run_id);
+            tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+            tokio::fs::create_dir_all(dir.path().join("results"))
+                .await
+                .expect("mkdir results_dir");
+
+            let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(1));
+            status.steps = vec![crate::background::StepStatus::pending("scout")];
+
+            finish_run(
+                &run_paths,
+                status,
+                terminal_state,
+                // Empty: this is exactly the input that makes `finish_run` synthesize a child.
+                Vec::new(),
+                dir.path().to_path_buf(),
+                None,
+                control::STOP_MESSAGE.to_string(),
+            )
+            .await;
+
+            let result: ResultFile = serde_json::from_slice(
+                &tokio::fs::read(&run_paths.result).await.expect("read result"),
+            )
+            .expect("valid JSON");
+            assert_eq!(result.state, terminal_state);
+            assert_eq!(
+                result.results.len(),
+                1,
+                "a terminal run with an error and no step results must still explain itself"
+            );
+            let child = &result.results[0];
+            assert_eq!(child.agent, "scout", "the placeholder inherits the first step's agent");
+            assert_eq!(child.exit_code, 1);
+            assert_eq!(
+                child.error.as_deref(),
+                Some(control::STOP_MESSAGE),
+                "{terminal_state:?}: the terminal error is folded onto the placeholder"
+            );
+            // pi `stoppedStepResult` fills `output: stopMessage` alongside `error: stopMessage`
+            // (`subagent-runner.ts:2358-2365`). Only the stopped shape does — a plain `Failed`
+            // placeholder carries no output, exactly as before.
+            assert_eq!(
+                child.final_output.as_deref(),
+                if expect_stopped { Some(control::STOP_MESSAGE) } else { None },
+                "{terminal_state:?}: {child:?}"
+            );
+            assert_eq!(
+                child.stopped, expect_stopped,
+                "{terminal_state:?}: the synthesized child's `stopped` flag must track the terminal \
+                 state, not be hard-coded either way: {child:?}"
+            );
+            assert_eq!(
+                child.interrupted, expect_interrupted,
+                "{terminal_state:?}: `interrupted` is the PAUSED verdict and must never coincide \
+                 with `stopped`: {child:?}"
+            );
+
+            // The downstream consequence, on the same real record: the grouped intercom verdict.
+            let payload = crate::tui::intercom::IntercomPayload::from_result(&result);
+            let expected = if expect_stopped {
+                crate::tui::intercom::SubagentResultStatus::Stopped
+            } else if expect_interrupted {
+                crate::tui::intercom::SubagentResultStatus::Paused
+            } else {
+                crate::tui::intercom::SubagentResultStatus::Failed
+            };
+            assert_eq!(
+                payload.status, expected,
+                "{terminal_state:?}: the synthesized child's flags are what `resolveGroupedStatus` \
+                 reads: {payload:?}"
+            );
+        }
+    }
+
+    /// G77 widening 2 — `mark_remaining_stopped`'s PARALLEL-GROUP child sweep.
+    ///
+    /// A parallel group's children live on `RunStatus::parallel_groups`, not in the flat `steps`
+    /// list, and upstream's `stopRunner` sweep marks every non-terminal one `"stopped"` with the
+    /// stop message (`subagent-runner.ts:2955-2986`, whose `statusPayload.steps` walk covers the
+    /// normalized parallel children too). The flat half was covered by the mid-flight stop
+    /// integration test; the group half never was — a single-step run has no groups at all.
+    ///
+    /// Three properties, all upstream's: already-terminal children are LEFT ALONE (a child that
+    /// genuinely completed before the stop landed is not relabelled), groups strictly before the
+    /// cursor are untouched, and every swept child gets [`control::STOP_MESSAGE`] plus an end
+    /// timestamp.
+    #[test]
+    fn mark_remaining_stopped_sweeps_parallel_group_children_without_relabelling_finished_ones() {
+        let mut status = RunStatus::queued(
+            RunId::from_token("stopgroups01".to_string()),
+            RunMode::Chain,
+            Some(1),
+        );
+        status.state = RunState::Running;
+        status.steps = vec![
+            crate::background::StepStatus::pending("group-a"),
+            crate::background::StepStatus::pending("group-b"),
+        ];
+        let group = |index: usize, statuses: &[StepState]| crate::background::ParallelGroupStatus {
+            group_step_index: index,
+            children: statuses
+                .iter()
+                .map(|s| {
+                    let mut child = crate::background::StepStatus::pending("kid");
+                    child.status = *s;
+                    child
+                })
+                .collect(),
+        };
+        status.parallel_groups = Some(vec![
+            // Strictly BEFORE the cursor: already settled, must not be touched.
+            group(0, &[StepState::Complete]),
+            // At the cursor: one mid-flight, one never started, one already finished.
+            group(1, &[StepState::Running, StepState::Pending, StepState::Complete]),
+        ]);
+
+        mark_remaining_stopped(&mut status, 1, 2, control::STOP_MESSAGE);
+
+        let groups = status.parallel_groups.as_ref().expect("groups survive the sweep");
+        assert_eq!(
+            groups[0].children[0].status,
+            StepState::Complete,
+            "a group before the cursor is not part of the sweep at all"
+        );
+        assert!(
+            groups[0].children[0].error.is_none(),
+            "and picks up no stop message either"
+        );
+
+        let swept = &groups[1].children;
+        assert_eq!(
+            swept[0].status,
+            StepState::Stopped,
+            "the mid-flight parallel child must be marked Stopped, never Failed and never Paused"
+        );
+        assert_eq!(
+            swept[1].status,
+            StepState::Stopped,
+            "a never-started parallel child is swept too (upstream sweeps `running` OR `pending`)"
+        );
+        assert_eq!(
+            swept[2].status,
+            StepState::Complete,
+            "a child that genuinely finished before the stop landed keeps its own verdict"
+        );
+        assert_eq!(swept[0].error.as_deref(), Some(control::STOP_MESSAGE));
+        assert_eq!(swept[1].error.as_deref(), Some(control::STOP_MESSAGE));
+        assert!(
+            swept[2].error.is_none(),
+            "the finished child is not restamped with a stop message it never earned"
+        );
+        assert!(swept[0].ended_at.is_some(), "a swept child gets an end timestamp");
+        assert!(swept[1].ended_at.is_some(), "a swept child gets an end timestamp");
+
+        // The flat step list is swept by the same call, from the same cursor.
+        assert_eq!(status.steps[0].status, StepState::Pending, "before the cursor");
+        assert_eq!(status.steps[1].status, StepState::Stopped);
+        assert_eq!(status.steps[1].error.as_deref(), Some(control::STOP_MESSAGE));
+    }
+
+    /// G77 widening 3, half one — `promote_interrupted_results_to_stopped` must NOT touch a child
+    /// that had already settled before the stop landed.
+    ///
+    /// pi's own promotion is `stopped: stoppedAfterAcceptance ? true : finalResult?.stopped`
+    /// (`subagent-runner.ts:1642,1722` @v0.43.0), applied to the child the stop signal tore down — a child
+    /// whose record settled while `stopSignal.aborted` was still false keeps its own verdict.
+    /// cyrup's witness for "torn down by the stop" is `interrupted` (all three control verbs share
+    /// one cancellation token), so this asserts the filter, not just the rewrite.
+    #[test]
+    fn promoting_stopped_children_leaves_already_settled_ones_alone() {
+        let settled = |agent: &str, interrupted: bool, output: Option<&str>| SingleResult {
+            agent: agent.to_string(),
+            task: String::new(),
+            exit_code: 0,
+            usage: cyrup_core::Usage::default(),
+            model: None,
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: output.map(str::to_string),
+            structured_output: None,
+            acceptance: None,
+            detached: false,
+            interrupted,
+            timed_out: false,
+            stopped: false,
+            process_signal: None,
+            error: None,
+            saved_output_path: None,
+            tool_calls: Vec::new(),
+            output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
+        };
+        let mut results = vec![
+            settled("finished-first", false, Some("I completed before the stop.")),
+            settled("torn-down", true, None),
+            settled("torn-down-with-output", true, Some("partial work")),
+        ];
+
+        promote_interrupted_results_to_stopped(&mut results, control::STOP_MESSAGE);
+
+        assert!(
+            !results[0].stopped && !results[0].interrupted && results[0].exit_code == 0,
+            "a child that settled before the stop keeps its own clean record: {:?}",
+            results[0]
+        );
+        assert_eq!(
+            results[0].final_output.as_deref(),
+            Some("I completed before the stop.")
+        );
+
+        for promoted in &results[1..] {
+            assert!(promoted.stopped, "{promoted:?}");
+            assert!(
+                !promoted.interrupted,
+                "`interrupted` must be CLEARED, or the run reads as resumable: {promoted:?}"
+            );
+            assert_eq!(promoted.exit_code, 1, "pi `subagent-runner.ts:909`");
+            assert_eq!(promoted.error.as_deref(), Some(control::STOP_MESSAGE));
+        }
+        assert_eq!(
+            results[1].final_output.as_deref(),
+            Some(control::STOP_MESSAGE),
+            "a torn-down child with NO output of its own gets the stop message as its output \
+             (pi `subagent-runner.ts:917`)"
+        );
+        assert_eq!(
+            results[2].final_output.as_deref(),
+            Some("partial work"),
+            "a torn-down child that DID produce output keeps it (pi's `!finalOutput.trim()` guard)"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
     // R-SA-097 root attachment: an ImportAsyncRoot step becomes a chain's first step by POLLING
     // another already-completed run — no subprocess spawned, so provable in-module without the
-    // fixture binary (mirrors pi chain-root-attachment.ts / subagent-runner.ts:688).
+    // fixture binary (mirrors pi chain-root-attachment.ts / subagent-runner.ts:1153).
     // ---------------------------------------------------------------------------------------
 
     #[tokio::test]
@@ -3309,6 +4320,8 @@ mod tests {
                 detached: false,
                 interrupted: false,
                 timed_out: false,
+                stopped: false,
+                process_signal: None,
                 error: None,
                 saved_output_path: None,
                 tool_calls: Vec::new(),

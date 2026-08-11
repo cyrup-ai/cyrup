@@ -81,10 +81,11 @@ fn registration(name: &str) -> SessionRegistration {
         name: Some(name.to_string()),
         cwd: "/tmp/work".to_string(),
         model: "test-model".to_string(),
-        pid: std::process::id(),
-        started_at: now_ms(),
-        last_activity: now_ms(),
+        pid: std::process::id().into(),
+        started_at: now_ms().into(),
+        last_activity: now_ms().into(),
         status: None,
+        extra: Default::default(),
     }
 }
 
@@ -95,7 +96,7 @@ async fn next_message(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(InboundEvent::Message { from, message })) => return (from, message),
+            Ok(Ok(InboundEvent::Message { from, message })) => return (from, *message),
             Ok(Ok(_other)) => continue,
             Ok(Err(e)) => panic!("event channel error: {e}"),
             Err(_) => panic!("timed out waiting for the child's ask over the broker"),
@@ -122,6 +123,10 @@ fn base_agent_config(model: &str) -> AgentConfig {
         max_output: OutputCap::default(),
         max_subagent_depth: None,
         depth: DepthEnvelope { current_depth: 0, max_depth: 5 },
+        // Added when the agent-definition fields landed (G95 `memory:`, G89 `toolBudget:`); this
+        // fixture declares neither, which is the same as an agent file omitting them.
+        memory: None,
+        tool_budget: None,
     }
 }
 
@@ -129,6 +134,9 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
         // SUBA-003: no `subagents.modelScope` policy in this fixture — enforcement off.
         model_scope: None,
+        // Added with G90's steer inbox. `None` is upstream's foreground shape — only a background
+        // step gets a steer inbox (`subagent-runner.ts` step dirs), so this bridge fixture has none.
+        steer_inbox_dir: None,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,
@@ -156,6 +164,10 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         child_index: None,
         control_config: None,
         on_control_event: None,
+        // Added with G80's verify-command memoization. `None` is the pre-G80 behaviour (no
+        // artifacts root configured => no memoization), which is what this bridge fixture wants:
+        // its subject is the intercom child bridge, not the acceptance gate.
+        artifacts_dir: None,
     }
 }
 

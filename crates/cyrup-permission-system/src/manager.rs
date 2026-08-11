@@ -1172,6 +1172,34 @@ mod tests {
         assert_eq!(r.state, PermissionState::Ask);
     }
 
+    // End-to-end proof that pi's frontmatter key drop (`common.ts:111-113`, `:133-135`) is WIRED:
+    // this reaches the parser through the production path
+    // `check_permission` -> `resolve_permissions` (`manager.rs:405`) ->
+    // `load_agent_permissions_from` (`:571`/`:575`), no test-only seam. Pre-fix, `constructor`
+    // parsed as an ordinary key and became a live bash rule that granted `allow`.
+    #[test]
+    fn agent_frontmatter_prototype_pollution_key_is_not_a_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_global(dir.path(), "{}");
+        write(
+            &dir.path().join("agents").join("coder.md"),
+            "---\npermission:\n  bash:\n    constructor: allow\n    echo *: allow\n---\nbody\n",
+        );
+        assert_eq!(
+            m.check_permission("bash", &serde_json::json!({"command":"constructor"}), Some("coder"))
+                .state,
+            PermissionState::Ask,
+            "a `constructor` frontmatter key must be dropped, leaving the default ask"
+        );
+        // MIRROR: the sibling rule on the same map is untouched — the drop is key-scoped, not a
+        // blanket rejection of the frontmatter block.
+        assert_eq!(
+            m.check_permission("bash", &serde_json::json!({"command":"echo hi"}), Some("coder"))
+                .state,
+            PermissionState::Allow
+        );
+    }
+
     #[test]
     fn agent_name_traversal_is_rejected() {
         let dir = tempfile::tempdir().unwrap();

@@ -24,9 +24,15 @@ fn skill_invocation_renders_label_name_and_content() {
     assert!(out.contains("commit"), "skill content body committed:\n{out}");
 }
 
+/// X14 — the full body is the EXPANDED form. `BranchSummaryMessageComponent` is constructed with
+/// `expanded = false` (`branch-summary-message.ts:11`) and `interactive-mode.ts:3493` then calls
+/// `component.setExpanded(this.toolOutputExpanded)`, so the body is on screen only once `Ctrl+O`
+/// has been pressed. Every assertion below is the ORIGINAL one; the only change is that the test
+/// now puts the transcript in the state that actually produces that render.
 #[test]
 fn branch_summary_renders_with_header() {
     let mut app = new_app();
+    app.transcript_mut().set_tool_expanded(true);
     app.transcript_mut().push_branch_summary("Explored an alternative refactor, then reverted.");
     app.draw().unwrap();
     let out = app.scrollback_text();
@@ -35,9 +41,24 @@ fn branch_summary_renders_with_header() {
     assert!(out.contains("alternative refactor"), "branch body committed:\n{out}");
 }
 
+/// X14 — and COLLAPSED (the default) it is `branch-summary-message.ts:46-56`'s single row:
+/// `"Branch summary (" + keyText("app.tools.expand") + " to expand)"`, with the body withheld.
+#[test]
+fn branch_summary_collapses_to_one_expand_hint_row() {
+    let mut app = new_app();
+    app.transcript_mut().push_branch_summary("Explored an alternative refactor, then reverted.");
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+    assert!(out.contains("[branch]"), "the label still shows:\n{out}");
+    assert!(out.contains("Branch summary (ctrl+o to expand)"), "collapsed hint row:\n{out}");
+    assert!(!out.contains("alternative refactor"), "the body is withheld:\n{out}");
+    assert!(!out.contains("Branch Summary"), "and so is the `**Branch Summary**` header:\n{out}");
+}
+
 #[test]
 fn compaction_summary_groups_the_token_count() {
     let mut app = new_app();
+    app.transcript_mut().set_tool_expanded(true);
     app.transcript_mut().push_compaction_summary(123_456, "Condensed the earlier turns.");
     app.draw().unwrap();
     let out = app.scrollback_text();
@@ -45,6 +66,22 @@ fn compaction_summary_groups_the_token_count() {
     // Pi formats the pre-compaction token count with thousands separators.
     assert!(out.contains("123,456"), "token count grouped:\n{out}");
     assert!(out.contains("Condensed"), "compaction body committed:\n{out}");
+}
+
+/// X14 — `compaction-summary-message.ts:48-56`: the collapsed row keeps the grouped token count
+/// (`Compacted from 123,456 tokens (`) and drops the summary.
+#[test]
+fn compaction_summary_collapses_to_one_expand_hint_row() {
+    let mut app = new_app();
+    app.transcript_mut().push_compaction_summary(123_456, "Condensed the earlier turns.");
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+    assert!(out.contains("[compaction]"), "the label still shows:\n{out}");
+    assert!(
+        out.contains("Compacted from 123,456 tokens (ctrl+o to expand)"),
+        "collapsed hint row keeps the grouped count:\n{out}"
+    );
+    assert!(!out.contains("Condensed"), "the body is withheld:\n{out}");
 }
 
 #[test]
@@ -81,12 +118,12 @@ fn custom_message_event_handles_array_content() {
 #[test]
 fn user_message_renders_as_multiline_markdown_box() {
     // The rich user-message variant (`user-message.ts`): the submitted text renders as multi-line
-    // markdown (not a single label line), keeping a `you:` accent label for legibility.
+    // markdown. X1: no `you: ` label — the block is identified by its `userMessageBg` fill (`:40`).
     let mut app = new_app();
     app.transcript_mut().push_user("# Heading\n\nFirst paragraph.\n\nSecond paragraph.");
     app.draw().unwrap();
     let out = app.scrollback_text();
-    assert!(out.contains("you: "), "user accent label committed:\n{out}");
+    assert!(!out.contains("you:"), "invented `you: ` label committed:\n{out}");
     assert!(out.contains("Heading"), "markdown heading rendered:\n{out}");
     // Multi-paragraph markdown means more than one rendered line (vs. the old single label line).
     assert!(out.contains("First paragraph"), "first paragraph rendered:\n{out}");

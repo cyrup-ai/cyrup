@@ -46,7 +46,7 @@
 //! and that is still true. The single exception is the R-SA-P1 parent-session ANCHOR
 //! ([`crate::exec::PARENT_SESSION_ENV_VAR`]), which is not runner configuration at all — it is
 //! ambient process identity that pi propagates purely by environment INHERITANCE
-//! (`pi-subagents/src/extension/index.ts:599` @v0.34.0 publishes it into the orchestrator's own
+//! (`pi-subagents/src/extension/index.ts:716` @v0.43.0 publishes it into the orchestrator's own
 //! `process.env`, so every descendant at every hop simply inherits it). cyrup's orchestrator cannot
 //! write its own `process.env` (`#![forbid(unsafe_code)]` + 2024-edition `unsafe std::env::set_var`),
 //! so this module writes that ONE entry explicitly onto the hop-1 child instead, resolved by
@@ -135,7 +135,7 @@ mod windows_flags {
 ///   signal sent to the orchestrator's own process group (e.g. a terminal-driven `Ctrl-C`
 ///   SIGINT-to-foreground-process-group, which by default targets every process sharing that
 ///   group). This is the identical mechanism [`crate::spawn::SpawnedChild::spawn`] and
-///   `exec::acceptance::run_one_verify_command` already use for their own (non-detached, but
+///   `exec::acceptance::model::run_verify_command` already use for their own (non-detached, but
 ///   still signal-isolated) children — reused here rather than inventing a second convention.
 /// - **Windows**: `creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)` — the nearest
 ///   platform equivalent per R-SA-070's own "or the nearest platform equivalent" clause.

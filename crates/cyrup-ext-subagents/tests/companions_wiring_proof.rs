@@ -117,6 +117,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
         completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth: None,
+        memory: None,
+        tool_budget: None,
         depth: DepthEnvelope { current_depth: 0, max_depth: 5 },
     }
 }
@@ -148,8 +150,10 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        steer_inbox_dir: None,
         control_config: None,
         on_control_event: None,
+        artifacts_dir: None,
         // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
         model_scope: None,
     }
@@ -437,7 +441,7 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
     );
 
     // R-SA-123: the inline receipt is REDUCED — the heavy per-task output is dropped, replaced by
-    // pi's exact `formatSubagentResultReceipt` wording (result-intercom.ts:334-364): "Delivered
+    // pi's exact `formatSubagentResultReceipt` wording (result-intercom.ts:376-408): "Delivered
     // <mode> subagent results via intercom." + a real "Run: <id>" (never a throwaway) + a child
     // status count line.
     assert!(

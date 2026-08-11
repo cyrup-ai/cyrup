@@ -360,6 +360,7 @@ mod tests {
                 name: "patch.diff".to_string(),
                 content: "+1 line".to_string(),
                 language: Some("diff".to_string()),
+                extra: Default::default(),
             }]),
         );
         assert_eq!(text, "Looks good\n\n---\n📎 patch.diff\n~~~diff\n+1 line\n~~~");

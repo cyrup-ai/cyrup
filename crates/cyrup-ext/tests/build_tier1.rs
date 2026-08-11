@@ -19,11 +19,19 @@ fn tier1_cargo_build_emits_a_component_and_caches() {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../cyrup-ext-sdk");
     assert!(crate_dir.join("Cargo.toml").is_file(), "sdk crate dir: {}", crate_dir.display());
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let cache = ArtifactCache::new(std::env::temp_dir().join(format!("cyrup-ext-tier1-{nanos}")));
+    // The cache directory must OUTLIVE both `build_component_in` calls below (the second one is the
+    // cache-hit assertion) but must not outlive the test. A `TempDir` gives exactly that: a unique
+    // directory removed when `_cache_dir` drops at the end of the function.
+    //
+    // This was previously a nanos-suffixed path under `std::env::temp_dir()` with no cleanup, so
+    // every run of this test leaked its ~213 MB wasm build cache. 57 of them accumulated here and
+    // filled a 16 GB `/tmp` tmpfs, at which point `ld` began failing with SIGBUS while linking
+    // unrelated doctests — a green suite turning red for reasons nowhere near the change under test.
+    let cache_dir = tempfile::Builder::new()
+        .prefix("cyrup-ext-tier1-")
+        .tempdir()
+        .expect("a temp dir for the tier-1 artifact cache");
+    let cache = ArtifactCache::new(cache_dir.path().to_path_buf());
 
     // First call: a cache MISS -> a real cargo build -> a validated component.
     let bytes = build_component_in(&crate_dir, &cache).expect("tier-1 build produces a component");

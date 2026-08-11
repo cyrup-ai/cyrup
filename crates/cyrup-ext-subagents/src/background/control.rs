@@ -239,7 +239,7 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         state: result.state,
         pid,
         // Carry the authoritative ResultFile's own `cwd`/`sessionFile` through the repair (pi's
-        // `status.cwd ?? result.cwd` fallback, `background/async-resume.ts:323,345,373`, has
+        // `status.cwd ?? result.cwd` fallback, `background/async-resume.ts:323,345,373` @v0.34.0, has
         // nothing to fall back FROM here otherwise — this is the terminal-repair path where
         // `status.json` itself could not legally advance, so the ResultFile is the only surviving
         // source of truth for either field).
@@ -522,6 +522,136 @@ pub fn timeout_request_path(run_dir: &Path) -> PathBuf {
     control_inbox_dir(run_dir).join("timeout.json")
 }
 
+// =================================================================================================
+// StopRequest (G77) — the control inbox's FOURTH verb (pi `runs/background/control-channel.ts:49-53,123-125,
+// 281-290,519-530,593-601` @v0.43.0)
+// =================================================================================================
+
+/// pi's literal stop message (`subagent-runner.ts:1972` @v0.43.0: `const stopMessage = "Subagent
+/// stopped by user.";`), stamped onto the stopped run's `error`, onto every step it stopped, and —
+/// when the child produced no output of its own — onto the child's `finalOutput`
+/// (`subagent-runner.ts:917`/`:1595-1596`).
+pub const STOP_MESSAGE: &str = "Subagent stopped by user.";
+
+/// The on-disk `control/stop.json` request record — pi's `StopRequest`
+/// (`runs/background/control-channel.ts:49-53` @v0.43.0): `{ type: "stop", ts, source, reason }`, the exact sibling
+/// shape of [`InterruptRequest`]/[`TimeoutRequest`], in the same control inbox under a third file
+/// name.
+///
+/// # Why a THIRD verb rather than reusing `interrupt` or `timeout`
+///
+/// All three are mutually exclusive verdicts upstream, and the difference is observable in the
+/// run's terminal record. `stopRunner`'s own guard is `if (stopped || timedOut || interrupted ||
+/// statusPayload.state !== "running") return;` (`subagent-runner.ts:2955-2986`) and `timeoutRunner`'s is
+/// the mirror image (`:2986`), so at most one of the three ever fires for a run:
+///
+/// | verb | terminal `state` | unfinished steps | resumable? |
+/// |---|---|---|---|
+/// | `interrupt` | `Paused` | `Paused` | yes (`resume`) |
+/// | `timeout` | `Failed` (`timedOut`) | `Failed` | no |
+/// | `stop` | `Stopped` | `Stopped` (`exitCode: 1`, [`STOP_MESSAGE`]) | **no** — `async-resume.ts:406` refuses explicitly |
+///
+/// The inbox drain order is likewise fixed and load-bearing: stop, THEN timeout, THEN interrupt
+/// (`runs/background/control-channel.ts:653-655`), so when several land together the hardest, least-resumable
+/// verdict wins.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopRequest {
+    /// Always `"stop"` — the discriminant, a plain string field for the same byte-for-byte
+    /// on-disk-shape reason [`InterruptRequest::kind`] is.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Wall-clock creation time (epoch milliseconds).
+    pub ts: i64,
+    /// Who/what requested the stop — pi's own literals are `"stop-action"` for the
+    /// `subagent({action:"stop"})` path (`async-stop-action.ts:47`) and `"ancestor-stop"` for the
+    /// descendant cascade (`subagent-runner.ts:2300`).
+    pub source: String,
+    /// Optional human-readable reason.
+    pub reason: Option<String>,
+}
+
+impl StopRequest {
+    /// Constructs a fresh stop request stamped with the current wall-clock time.
+    #[must_use]
+    pub fn new(source: impl Into<String>, reason: Option<String>) -> Self {
+        Self {
+            kind: "stop".to_string(),
+            ts: now_epoch_millis(),
+            source: source.into(),
+            reason,
+        }
+    }
+}
+
+/// `<run_dir>/control/stop.json` (pi `stopRequestPath`, `runs/background/control-channel.ts:123-125` @v0.43.0).
+#[must_use]
+pub fn stop_request_path(run_dir: &Path) -> PathBuf {
+    control_inbox_dir(run_dir).join("stop.json")
+}
+
+/// The observable outcome of one [`stop`] call — pi `stopAsyncRun`
+/// (`runs/foreground/async-stop-action.ts:23-64` @v0.43.0) returns an `AgentToolResult` whose
+/// `isError` flag and text encode exactly these three cases; this enum is that trichotomy, with the
+/// user-facing prose left to the caller so the tool-result shaping stays in `extension.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// A [`StopRequest`] file was written into the target's control inbox (pi's `"Stop requested
+    /// for async run {id}."` success result, `async-stop-action.ts:53-56`).
+    Requested,
+    /// The reconciled status is neither `Running` nor `Queued` — pi's
+    /// `if (!status || (status.state !== "running" && status.state !== "queued"))` guard
+    /// (`async-stop-action.ts:41`), whose message is `"No running or queued async run was found for
+    /// '{id}'."` and whose `isError` is `true`. Note this makes a stop of an already-`Paused` run an
+    /// ERROR upstream, not a silent no-op the way a duplicate `interrupt` is.
+    NotStoppable,
+}
+
+/// Delivers a stop request against the run identified by `run_id_token` (G77; pi `stopAsyncRun`,
+/// `runs/foreground/async-stop-action.ts:23-64` @v0.43.0).
+///
+/// Runs the same R-SA-079 reconciliation gate every other control op runs (upstream's own first act
+/// is `reconcileAsyncRun(target.asyncDir, { kill }).status`, `:39`), then applies upstream's
+/// actionability guard verbatim: only a `Running` or `Queued` run may be stopped. Unlike
+/// [`interrupt`] there is no already-pending short-circuit — upstream writes the request
+/// unconditionally via `writeAtomicJson` (`runs/background/control-channel.ts:287-288`), which is idempotent by
+/// construction because the request is a single well-known path whose mere existence is the state.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::UnsafePathToken`] if `run_id_token` is unsafe, or an I/O error
+/// (wrapped in [`SubagentError::Spawn`]) if the reconciliation read or the request write fails —
+/// upstream's own `catch` around `deliverStopRequest` (`:58-63`) surfaces the same class of failure
+/// as `"Failed to stop async run {id}: {message}"`.
+pub async fn stop(
+    async_root: &Path,
+    results_dir: &Path,
+    run_id_token: &str,
+    source: impl Into<String>,
+    reason: Option<String>,
+) -> Result<StopOutcome, SubagentError> {
+    let paths = resolve_run_paths(async_root, results_dir, run_id_token)?;
+    let status = match reconcile_before_control_op(&paths).await {
+        Ok(status) => status,
+        // pi's guard is `if (!status || (status.state !== "running" && status.state !== "queued"))`
+        // (`async-stop-action.ts:41`) — an ABSENT record and a non-actionable one collapse onto the
+        // SAME "No running or queued async run was found for '{id}'." refusal. This gate reports an
+        // absent record as a `NotFound` I/O error rather than a `None`, so it is folded back here;
+        // every other error class (a genuine read/permission failure) still propagates.
+        Err(SubagentError::Spawn(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StopOutcome::NotStoppable);
+        }
+        Err(err) => return Err(err),
+    };
+
+    if !matches!(status.state, RunState::Running | RunState::Queued) {
+        return Ok(StopOutcome::NotStoppable);
+    }
+
+    deliver_stop_request(&paths.run_dir, source, reason).await?;
+    Ok(StopOutcome::Requested)
+}
+
 /// Parent side, addressed by run DIRECTORY: atomically write an [`InterruptRequest`] into
 /// `run_dir`'s control inbox and send the same best-effort `SIGUSR2` wake-up [`interrupt`] does
 /// (pi `deliverInterruptRequest`, `control-channel.ts` @v0.34.0).
@@ -548,7 +678,7 @@ pub async fn deliver_interrupt_request(
 }
 
 /// Parent side, addressed by run DIRECTORY: atomically write a [`TimeoutRequest`] into `run_dir`'s
-/// control inbox (pi `deliverTimeoutRequest`, `control-channel.ts:536-545` @v0.34.0).
+/// control inbox (pi `deliverTimeoutRequest`, `runs/background/control-channel.ts:582-591` @v0.43.0).
 ///
 /// Note the deliberate asymmetry with [`deliver_interrupt_request`], faithful to upstream:
 /// `deliverTimeoutRequest` sends NO wake-up signal. `SIGUSR2` is the interrupt fast-path only; a
@@ -570,6 +700,30 @@ pub async fn deliver_timeout_request(
     Ok(path)
 }
 
+/// Parent side, addressed by run DIRECTORY: atomically write a [`StopRequest`] into `run_dir`'s
+/// control inbox (G77; pi `deliverStopRequest` → `requestAsyncStop`, `runs/background/control-channel.ts:281-290,
+/// 593-601` @v0.43.0).
+///
+/// Like [`deliver_timeout_request`] and unlike [`deliver_interrupt_request`], this sends **no**
+/// wake-up signal — upstream's `deliverStopRequest` accepts a `pid`/`kill` pair in its input shape
+/// but its whole body is `requestAsyncStop(input.asyncDir, …)` (`runs/background/control-channel.ts:600`); the file
+/// inbox is the entire channel. The runner's own poll/watch tick picks it up and `stopRunner`
+/// aborts the live children from inside.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the control directory cannot be created or the request
+/// cannot be written.
+pub async fn deliver_stop_request(
+    run_dir: &Path,
+    source: impl Into<String>,
+    reason: Option<String>,
+) -> Result<PathBuf, SubagentError> {
+    let path = stop_request_path(run_dir);
+    write_control_request(&path, &StopRequest::new(source, reason)).await?;
+    Ok(path)
+}
+
 /// Shared "mkdir -p the control dir, then atomically write the request" step both dir-addressed
 /// deliver functions perform.
 async fn write_control_request<T: serde::Serialize + Sync>(
@@ -586,6 +740,220 @@ async fn write_control_request<T: serde::Serialize + Sync>(
         .map_err(SubagentError::Spawn)
 }
 
+// =================================================================================================
+// steer (G90) — the control inbox's THIRD verb, pi `runs/background/control-channel.ts:48-55,121-189` @v0.34.0
+// =================================================================================================
+
+/// One parent-to-runner steering request (pi `SteerRequest`, `runs/background/control-channel.ts:48-55` @v0.34.0).
+///
+/// Unlike [`InterruptRequest`]/[`TimeoutRequest`], steering is a **queue, not a flag**: several
+/// distinct guidance messages can be in flight at once and each must be delivered exactly once, so
+/// a steer request is a uniquely-named file inside a DIRECTORY rather than a single well-known
+/// path whose mere existence is the whole state. That is why [`steer_requests_dir`] exists and
+/// there is no `steer_request_path`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerRequest {
+    /// Always `"steer"` — the discriminant, a plain string field for the same byte-for-byte
+    /// on-disk-shape reason [`InterruptRequest::kind`] is.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Unique request id. Also the dedup key and (base64url-encoded) half of the file name, so two
+    /// requests written in the same millisecond cannot collide.
+    ///
+    /// For requests this crate MINTS (see [`request_async_steer`]) it is
+    /// `<16-hex monotonic sequence>-<uuid>`, which makes it the TIEBREAK that orders same-millisecond
+    /// guidance — see [`ts`](Self::ts). Ids that arrive from elsewhere are accepted verbatim; the
+    /// only requirements are uniqueness and non-emptiness.
+    pub id: String,
+    /// Wall-clock creation time (epoch milliseconds). The primary sort key on consumption, so
+    /// guidance is delivered in the order the parent produced it.
+    ///
+    /// It is not a SUFFICIENT sort key. A millisecond is an eternity next to two `request_async_steer`
+    /// calls in a loop, so same-`ts` requests are routine rather than exotic, and the tiebreak
+    /// decides what the user actually sees. pi ties on `base64url(randomUUID())`
+    /// (`consumeSteerRequestsFromDir` sorts file names, `runs/background/control-channel.ts:437`; the name is
+    /// `steerRequestFileName`, `:85-87`) — i.e. two corrections typed in quick succession reach the
+    /// child in RANDOM order, and the second can be overridden by the first. cyrup keeps `ts` as the
+    /// primary key, exactly as upstream, and makes the tiebreak deterministic by minting a
+    /// monotonic sequence into [`id`](Self::id).
+    ///
+    /// [CYRUP-DELTA: ordering only. The key, the file name and the wire shape are pi's; only the
+    /// id's internal FORM changes, which upstream treats as an opaque unique string.]
+    pub ts: i64,
+    /// The guidance itself, already trimmed and known non-empty.
+    pub message: String,
+    /// The specific child (flat step index) this is aimed at. `None` means "every currently
+    /// running child", which is what the runner fans it out to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_index: Option<usize>,
+    /// Who produced it — `"steer-action"` for the `action: "steer"` tool verb, matching pi's own
+    /// literal (`subagent-executor.ts:620` @v0.34.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// `<run_dir>/control/steer-requests/` — the parent-written queue the runner drains (pi
+/// `steerRequestsDir`, `runs/background/control-channel.ts:136-138`).
+#[must_use]
+pub fn steer_requests_dir(run_dir: &Path) -> PathBuf {
+    control_inbox_dir(run_dir).join("steer-requests")
+}
+
+/// `<run_dir>/control/steer-targets/<index>/` — the per-child inbox the runner routes an accepted
+/// request into (pi `stepSteerInboxDir`, `runs/background/control-channel.ts:149-152`). Two directories rather than
+/// one because the two hops have different addressees: the parent does not know which child is
+/// running, and the child must not have to filter a queue that is not its own.
+#[must_use]
+pub fn step_steer_inbox_dir(run_dir: &Path, index: usize) -> PathBuf {
+    control_inbox_dir(run_dir).join("steer-targets").join(index.to_string())
+}
+
+/// pi `steerRequestFileName` (`runs/background/control-channel.ts:181-183`): `<ts zero-padded to 13>-<base64url(id)>.json`.
+///
+/// The zero-padding is what makes a plain lexicographic directory listing sort by time, which is
+/// exactly what [`consume_steer_requests_from_dir`] relies on before its explicit re-sort — and the
+/// base64url of the id keeps an arbitrary caller-supplied id from ever producing a path separator.
+fn steer_request_file_name(request: &SteerRequest) -> String {
+    use base64::Engine as _;
+    let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(request.id.as_bytes());
+    format!("{:013}-{id}.json", request.ts.max(0))
+}
+
+/// pi `writeSteerRequestToDir` (`runs/background/control-channel.ts:209-214`).
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the directory cannot be created or the file written.
+pub async fn write_steer_request_to_dir(
+    dir: &Path,
+    request: &SteerRequest,
+) -> Result<PathBuf, SubagentError> {
+    let path = dir.join(steer_request_file_name(request));
+    write_control_request(&path, request).await?;
+    Ok(path)
+}
+
+/// Mint the next steer-request id: `<16-hex monotonic sequence>-<uuid>`.
+///
+/// Both halves are load-bearing and neither replaces the other:
+///
+/// - the **sequence** is what makes ordering deterministic. It is the tiebreak
+///   [`consume_steer_requests_from_dir`] falls back on when two requests share a `ts`, which is the
+///   common case rather than the rare one — see [`SteerRequest::ts`]. Zero-padded to 16 hex digits
+///   so a plain lexicographic comparison IS a numeric one (it cannot overflow in practice: at one
+///   steer per nanosecond it would take ~584 years).
+/// - the **uuid** is what keeps ids unique across PROCESSES. The counter is per-process, so two
+///   parents steering the same run would otherwise mint colliding ids and one request would
+///   overwrite the other's file.
+///
+/// `Relaxed` is sufficient: the only requirement is that each caller gets a distinct, increasing
+/// value, which `fetch_add` guarantees on its own — no other memory is being published through it.
+fn next_steer_request_id() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{seq:016x}-{}", uuid::Uuid::new_v4().as_simple())
+}
+
+/// Parent side: pi `requestAsyncSteer` (`runs/background/control-channel.ts:304-343`) — validate, stamp, and drop
+/// one steering request into `run_dir`'s steer queue.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Management`] for an empty message (pi's `throw new Error("steer message
+/// must not be empty.")`), or [`SubagentError::Spawn`] for an I/O failure.
+pub async fn request_async_steer(
+    run_dir: &Path,
+    message: &str,
+    target_index: Option<usize>,
+    source: Option<&str>,
+) -> Result<PathBuf, SubagentError> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(SubagentError::Management("steer message must not be empty.".to_string()));
+    }
+    // pi additionally rejects a non-integer/negative `targetIndex`; both are unrepresentable in
+    // `Option<usize>`, so that guard has no surviving branch here.
+    let request = SteerRequest {
+        kind: "steer".to_string(),
+        id: next_steer_request_id(),
+        ts: now_epoch_millis(),
+        message: message.to_string(),
+        target_index,
+        source: source.map(str::to_string),
+    };
+    write_steer_request_to_dir(&steer_requests_dir(run_dir), &request).await
+}
+
+/// Runner side: pi `enqueueStepSteer` (`runs/background/control-channel.ts:345-349`) — hand one accepted request to
+/// exactly one child by copying it into that child's own inbox with `target_index` pinned.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the child inbox cannot be created or written.
+pub async fn enqueue_step_steer(
+    run_dir: &Path,
+    index: usize,
+    request: &SteerRequest,
+) -> Result<PathBuf, SubagentError> {
+    let pinned = SteerRequest {
+        kind: "steer".to_string(),
+        target_index: Some(index),
+        ..request.clone()
+    };
+    write_steer_request_to_dir(&step_steer_inbox_dir(run_dir, index), &pinned).await
+}
+
+/// pi `consumeSteerRequestsFromDir` (`runs/background/control-channel.ts:433-460`): read every `*.json` in `dir` in
+/// name order, DELETE each one before returning it (so a crash mid-delivery loses a request rather
+/// than replaying it), skip anything that fails to parse or validate, and return the survivors
+/// sorted by `(ts, id)`.
+///
+/// A missing directory is an empty list, never an error — the common case is that nobody has ever
+/// steered this run.
+pub async fn consume_steer_requests_from_dir(dir: &Path) -> Vec<SteerRequest> {
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return Vec::new();
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".json") {
+            names.push(name);
+        }
+    }
+    names.sort();
+
+    let mut out: Vec<SteerRequest> = Vec::new();
+    for name in names {
+        let path = dir.join(&name);
+        let parsed = tokio::fs::read(&path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<SteerRequest>(&bytes).ok())
+            .filter(|r| r.kind == "steer" && !r.id.trim().is_empty() && !r.message.trim().is_empty());
+        // Removal is the consumption primitive and happens whether or not the parse succeeded —
+        // a malformed request that stayed on disk would be re-read on every single tick forever.
+        if tokio::fs::remove_file(&path).await.is_err() {
+            // Lost the race to a concurrent consumer: it already owns this request, so this
+            // consumer must NOT also deliver it.
+            continue;
+        }
+        if let Some(mut request) = parsed {
+            request.id = request.id.trim().to_string();
+            request.message = request.message.trim().to_string();
+            out.push(request);
+        }
+    }
+    out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+/// pi `consumeSteerRequests` (`runs/background/control-channel.ts:462-464`): drain the RUN-level queue.
+pub async fn consume_steer_requests(run_dir: &Path) -> Vec<SteerRequest> {
+    consume_steer_requests_from_dir(&steer_requests_dir(run_dir)).await
+}
+
 /// Non-consuming read of a pending [`TimeoutRequest`] — [`check_control_inbox_now`]'s sibling,
 /// with the identical "the file's existence IS the state, reading never deletes" contract.
 ///
@@ -599,7 +967,7 @@ pub async fn check_timeout_inbox_now(
 }
 
 /// Idempotent, at-most-once consumption of a pending [`TimeoutRequest`] — pi
-/// `consumeTimeoutRequest` (`control-channel.ts:209` @v0.34.0), and the exact
+/// `consumeTimeoutRequest` (`runs/background/control-channel.ts:209` @v0.34.0), and the exact
 /// read-then-unconditionally-delete discipline [`consume_interrupt_request`] documents at length.
 /// A missing file is `Ok(None)`, never an error; losing the delete race against a concurrent
 /// consumer still returns the contents this caller observed.
@@ -612,6 +980,38 @@ pub async fn consume_timeout_request(
 ) -> Result<Option<TimeoutRequest>, SubagentError> {
     let path = timeout_request_path(&paths.run_dir);
     let request = match read_control_request::<TimeoutRequest>(&path).await? {
+        Some(request) => request,
+        None => return Ok(None),
+    };
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) | Err(_) => Ok(Some(request)),
+    }
+}
+
+/// Non-consuming read of a pending [`StopRequest`] (G77) — [`check_control_inbox_now`]'s and
+/// [`check_timeout_inbox_now`]'s sibling, with the identical "the file's existence IS the state,
+/// reading never deletes" contract.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the file exists but cannot be read or parsed.
+pub async fn check_stop_inbox_now(paths: &RunPaths) -> Result<Option<StopRequest>, SubagentError> {
+    read_control_request(&stop_request_path(&paths.run_dir)).await
+}
+
+/// Idempotent, at-most-once consumption of a pending [`StopRequest`] (G77) — pi
+/// `consumeStopRequest` (`runs/background/control-channel.ts:519-530` @v0.43.0), and the exact
+/// read-then-unconditionally-delete discipline [`consume_interrupt_request`] documents at length. A
+/// missing file is `Ok(None)`, never an error; losing the delete race against a concurrent consumer
+/// still returns the contents this caller observed (upstream's own comment on that branch reads
+/// "Already removed by a concurrent check — still counts as consumed").
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] for a genuine I/O failure other than "file does not exist".
+pub async fn consume_stop_request(paths: &RunPaths) -> Result<Option<StopRequest>, SubagentError> {
+    let path = stop_request_path(&paths.run_dir);
+    let request = match read_control_request::<StopRequest>(&path).await? {
         Some(request) => request,
         None => return Ok(None),
     };
@@ -863,6 +1263,18 @@ pub async fn resume(
 
     if status.state == RunState::Running {
         return resolve_running_selection(&status, requested_step_index);
+    }
+
+    // G77 — pi `async-resume.ts:406` @v0.43.0: `if (state === "stopped") throw new Error(...)`.
+    // Checked AFTER the `Running` branch and BEFORE the terminal-revival branch, exactly where
+    // upstream checks it (its own `resolveResumeTarget` reads the reconciled state, refuses a
+    // stopped one, and only then looks for a transcript). A stopped run's steps routinely still
+    // carry `session_file`s, so without this guard `resolve_terminal_revival` would happily revive
+    // a run the user explicitly killed.
+    if status.state == RunState::Stopped {
+        return Err(SubagentError::ResumeStopped(
+            status.run_id.as_str().to_string(),
+        ));
     }
 
     resolve_terminal_revival(&status, requested_step_index)
@@ -1561,17 +1973,35 @@ pub async fn wait_for_imported_async_root(
 /// boolean per child): a child that exited `0` is `Complete`; a child that exited non-zero is
 /// `Paused` iff the whole run is paused, else `Failed`; absent a child, the run's own
 /// state/`success` decides.
+///
+/// G77 — the two `stopped` branches are upstream's own, in upstream's own order
+/// (`chain-root-attachment.ts:85-93` @v0.43.0):
+/// 1. `if (child?.stopped === true) return "stopped";` — FIRST, ahead of the child's `success`
+///    check, so a stopped child is never re-read as complete-or-failed;
+/// 2. `if (child?.success === false) return result.state === "stopped" ? "stopped" : result.state
+///    === "paused" ? "paused" : "failed";` — the non-zero-exit child inherits the RUN's stop before
+///    it inherits its pause;
+/// 3. the childless fallthrough passes `"stopped"` straight through alongside
+///    `complete`/`failed`/`paused` (`:90`).
 fn imported_state(result: &ResultFile, child: Option<&SingleResult>) -> RunState {
     if let Some(child) = child {
+        if child.stopped {
+            return RunState::Stopped;
+        }
         if child.exit_code == 0 {
             return RunState::Complete;
         }
-        return if result.state == RunState::Paused { RunState::Paused } else { RunState::Failed };
+        return match result.state {
+            RunState::Stopped => RunState::Stopped,
+            RunState::Paused => RunState::Paused,
+            _ => RunState::Failed,
+        };
     }
     match result.state {
         RunState::Complete => RunState::Complete,
         RunState::Failed => RunState::Failed,
         RunState::Paused => RunState::Paused,
+        RunState::Stopped => RunState::Stopped,
         RunState::Queued | RunState::Running => {
             if result.success { RunState::Complete } else { RunState::Failed }
         }
@@ -1696,6 +2126,88 @@ mod tests {
     use crate::spawn::chain_graph::SingleStepSpec;
     use std::sync::Arc;
 
+    // ---- steer queue ordering ----
+
+    /// Steer messages must be delivered in the order the parent produced them, even when several
+    /// are queued inside the same millisecond — which is the NORMAL case for two calls in a loop,
+    /// not an exotic one.
+    ///
+    /// Before the monotonic sequence in [`next_steer_request_id`], same-`ts` requests tied on a
+    /// random UUID, so the consumer's order was a coin flip: a user sending two corrections in
+    /// quick succession could have the second applied before the first. It also made
+    /// `tests/steer_delivery_integration.rs` fail about one run in four, which is the more
+    /// expensive symptom — an intermittently red suite makes every future green meaningless.
+    ///
+    /// Twenty requests in a tight loop makes a random tiebreak essentially impossible to pass
+    /// (20! orderings), so this does not rely on getting unlucky to detect a regression.
+    #[tokio::test]
+    async fn steer_requests_queued_in_the_same_millisecond_are_consumed_in_creation_order() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).expect("mkdir run dir");
+
+        let expected: Vec<String> = (0..20).map(|i| format!("guidance-{i:02}")).collect();
+        for message in &expected {
+            request_async_steer(&run_dir, message, None, Some("steer-action"))
+                .await
+                .expect("queued");
+        }
+
+        let drained = consume_steer_requests(&run_dir).await;
+        let delivered: Vec<String> = drained.into_iter().map(|r| r.message).collect();
+        assert_eq!(
+            delivered, expected,
+            "guidance must be delivered in the order it was produced; a `ts`-only sort leaves \
+             same-millisecond requests in random order"
+        );
+    }
+
+    /// The sequence is only the TIEBREAK — `ts` still dominates, exactly as upstream sorts
+    /// (`consumeSteerRequestsFromDir`, `runs/background/control-channel.ts:437`, over a `ts`-prefixed file name).
+    /// A request with an older `ts` sorts first even when its id was minted later, which is what
+    /// keeps ordering correct across processes, where the per-process counter means nothing.
+    #[tokio::test]
+    async fn an_older_timestamp_still_wins_over_a_later_minted_sequence() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let run_dir = dir.path().join("run");
+        let queue = steer_requests_dir(&run_dir);
+
+        // Minted in ascending-sequence order, written with DESCENDING timestamps.
+        let first_id = next_steer_request_id();
+        let second_id = next_steer_request_id();
+        assert!(first_id < second_id, "the sequence must be ascending");
+
+        for (id, ts, message) in [
+            (first_id, 2_000_i64, "newer-ts-earlier-seq"),
+            (second_id, 1_000_i64, "older-ts-later-seq"),
+        ] {
+            write_steer_request_to_dir(
+                &queue,
+                &SteerRequest {
+                    kind: "steer".to_string(),
+                    id,
+                    ts,
+                    message: message.to_string(),
+                    target_index: None,
+                    source: None,
+                },
+            )
+            .await
+            .expect("written");
+        }
+
+        let delivered: Vec<String> = consume_steer_requests(&run_dir)
+            .await
+            .into_iter()
+            .map(|r| r.message)
+            .collect();
+        assert_eq!(
+            delivered,
+            vec!["older-ts-later-seq".to_string(), "newer-ts-earlier-seq".to_string()],
+            "`ts` is the primary key; the sequence only breaks ties within one millisecond"
+        );
+    }
+
     fn temp_roots() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().expect("real tempdir");
         let async_root = dir.path().join("async");
@@ -1739,6 +2251,193 @@ mod tests {
             context: None,
             agent_scope: None,
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // G77 — the `stop` control verb (pi `stopAsyncRun` / `StopRequest` / `consumeStopRequest`)
+    // ---------------------------------------------------------------------------------------
+
+    /// `stop` writes a real `control/stop.json` for a `Running` run, and `consume_stop_request`
+    /// reads-then-deletes it exactly once (pi `consumeStopRequest`, `runs/background/control-channel.ts:519-530`).
+    #[tokio::test]
+    async fn stop_writes_a_real_stop_request_that_is_consumed_exactly_once() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("stoprun00001");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        write_running_status(&paths, &run_id, RunMode::Single, Some(4242), Vec::new()).await;
+
+        assert_eq!(
+            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None)
+                .await
+                .expect("stop resolves"),
+            StopOutcome::Requested
+        );
+
+        // The file lands at pi's own path, with pi's own discriminant and source.
+        let path = stop_request_path(&paths.run_dir);
+        assert_eq!(path, paths.run_dir.join("control").join("stop.json"));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.expect("stop.json exists"))
+                .expect("valid json");
+        assert_eq!(raw["type"], serde_json::json!("stop"));
+        assert_eq!(raw["source"], serde_json::json!("stop-action"));
+
+        // Non-consuming read leaves it in place…
+        assert!(check_stop_inbox_now(&paths).await.expect("read").is_some());
+        assert!(path.exists());
+        // …consumption removes it and is idempotent thereafter.
+        let consumed = consume_stop_request(&paths).await.expect("consume").expect("was pending");
+        assert_eq!(consumed.kind, "stop");
+        assert!(!path.exists());
+        assert!(consume_stop_request(&paths).await.expect("second consume").is_none());
+    }
+
+    /// pi `stopAsyncRun`'s actionability guard (`async-stop-action.ts:41`): only `running` or
+    /// `queued`. A `Paused` run is refused — NOT silently absorbed the way a duplicate `interrupt`
+    /// is — and nothing is written.
+    #[tokio::test]
+    async fn stop_refuses_a_run_that_is_neither_running_nor_queued() {
+        let (_dir, async_root, results_dir) = temp_roots();
+
+        // Queued IS stoppable.
+        let queued_id = RunId::from_token("stopqueued01");
+        let queued_paths = RunPaths::for_run(&async_root, &results_dir, &queued_id);
+        tokio::fs::create_dir_all(&queued_paths.run_dir).await.expect("mkdir");
+        write_atomic_json(
+            &queued_paths.status,
+            &RunStatus::queued(queued_id.clone(), RunMode::Single, None),
+        )
+        .await
+        .expect("write status");
+        assert_eq!(
+            stop(&async_root, &results_dir, queued_id.as_str(), "stop-action", None)
+                .await
+                .expect("stop resolves"),
+            StopOutcome::Requested
+        );
+
+        // Paused is NOT.
+        let paused_id = RunId::from_token("stoppaused01");
+        let paused_paths = RunPaths::for_run(&async_root, &results_dir, &paused_id);
+        let mut paused = write_running_status(
+            &paused_paths,
+            &paused_id,
+            RunMode::Single,
+            Some(11),
+            Vec::new(),
+        )
+        .await;
+        paused.advance_state(RunState::Paused).expect("Running -> Paused");
+        write_atomic_json(&paused_paths.status, &paused).await.expect("write");
+        assert_eq!(
+            stop(&async_root, &results_dir, paused_id.as_str(), "stop-action", None)
+                .await
+                .expect("stop resolves"),
+            StopOutcome::NotStoppable
+        );
+        assert!(
+            !stop_request_path(&paused_paths.run_dir).exists(),
+            "a refused stop must not leave a request file behind"
+        );
+    }
+
+    /// G77 — pi `async-resume.ts:406` @v0.43.0: a stopped run is NOT resumable, and the refusal is
+    /// its own error with its own verbatim sentence, never the no-transcript one. The run below
+    /// deliberately HAS a persisted transcript, which is exactly the case a
+    /// `ResumeNoTranscript`-only implementation would happily revive.
+    #[tokio::test]
+    async fn resume_refuses_a_stopped_run_even_when_a_transcript_exists() {
+        let (dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("stopresume01");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+
+        let transcript = dir.path().join("session.jsonl");
+        tokio::fs::write(&transcript, b"{}\n").await.expect("write transcript");
+
+        let mut step = super::super::StepStatus::pending("worker");
+        step.status = StepState::Stopped;
+        step.session_file = Some(transcript.clone());
+        let mut status =
+            write_running_status(&paths, &run_id, RunMode::Single, Some(9), vec![step]).await;
+        status.advance_state(RunState::Stopped).expect("Running -> Stopped");
+        write_atomic_json(&paths.status, &status).await.expect("write");
+
+        let err = resume(&async_root, &results_dir, run_id.as_str(), None)
+            .await
+            .expect_err("a stopped run must not be resumable");
+        assert!(
+            matches!(err, SubagentError::ResumeStopped(ref id) if id == run_id.as_str()),
+            "the refusal must be its own variant, not ResumeNoTranscript: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Async run 'stopresume01' was stopped and cannot be resumed. Start a new run instead."
+        );
+    }
+
+    /// G77 — `imported_state` (pi `resultState`, `chain-root-attachment.ts:85-93`): a child's own
+    /// `stopped` flag short-circuits ahead of its exit code, and a failing child inherits the run's
+    /// stop before it inherits a pause.
+    #[test]
+    fn imported_state_propagates_stopped_ahead_of_exit_code_and_pause() {
+        fn result_with(state: RunState, child: crate::exec::SingleResult) -> ResultFile {
+            ResultFile {
+                id: RunId::from_token("importstop01"),
+                run_id: RunId::from_token("importstop01"),
+                agent: "worker".to_string(),
+                mode: RunMode::Single,
+                state,
+                success: false,
+                cwd: PathBuf::from("/tmp"),
+                session_file: None,
+                results: vec![child],
+            }
+        }
+        fn child(exit_code: i32, stopped: bool) -> crate::exec::SingleResult {
+            crate::exec::SingleResult {
+                agent: "worker".to_string(),
+                task: String::new(),
+                exit_code,
+                usage: cyrup_core::Usage::default(),
+                model: None,
+                attempted_models: Vec::new(),
+                model_attempts: Vec::new(),
+                final_output: None,
+                structured_output: None,
+                acceptance: None,
+                detached: false,
+                interrupted: false,
+                timed_out: false,
+                stopped,
+                process_signal: None,
+                error: None,
+                saved_output_path: None,
+                tool_calls: Vec::new(),
+                output_truncated: false,
+                control_events: Vec::new(),
+                progress: None,
+            }
+        }
+
+        // `child.stopped === true` wins even over a clean exit (`:87` precedes `:88`).
+        let r = result_with(RunState::Complete, child(0, true));
+        assert_eq!(imported_state(&r, r.results.first()), RunState::Stopped);
+
+        // A failing child inherits the run's stop (`:89`'s `result.state === "stopped"` arm),
+        // ahead of the pause arm.
+        let r = result_with(RunState::Stopped, child(1, false));
+        assert_eq!(imported_state(&r, r.results.first()), RunState::Stopped);
+
+        // …and with NO child at all, the run's stop passes straight through (`:90`).
+        let mut r = result_with(RunState::Stopped, child(1, false));
+        r.results.clear();
+        assert_eq!(imported_state(&r, None), RunState::Stopped);
+
+        // The pre-G77 relations are untouched.
+        let r = result_with(RunState::Paused, child(1, false));
+        assert_eq!(imported_state(&r, r.results.first()), RunState::Paused);
+        let r = result_with(RunState::Failed, child(1, false));
+        assert_eq!(imported_state(&r, r.results.first()), RunState::Failed);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2461,6 +3160,8 @@ mod tests {
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: error.map(str::to_string),
             saved_output_path: None,
             tool_calls: Vec::new(),

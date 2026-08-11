@@ -37,11 +37,22 @@ pub mod fork_context;
 /// The shared, size-capped append-only JSONL primitive (R-SA-136/146) used by both
 /// [`spawn::SpawnedChild`]'s child-output tee and [`background::RunPaths::events`]'s async-run
 /// event log. See [`jsonl`] for the full contract.
+/// The NATIVE supervisor channel (`pi-subagents/src/intercom/native-supervisor-channel.ts`): the
+/// broker-free, file-backed child↔supervisor request/reply channel upstream introduced in `3ac0ef5`
+/// ("Make supervisor coordination native") when it deleted the companion-recommendation surface.
+pub mod native_supervisor;
+
 pub mod jsonl;
+/// The durable MISSION subsystem — a 1:1 port of `pi-subagents/src/missions/` (6 files @v0.43.0):
+/// mission records, their store, the launch binding that ties a mission to a real run, the six
+/// `mission.*` tool actions, per-mission workflow state, and the turn-end goal-continuation driver.
+/// See [`missions`] for the full file-by-file correspondence table.
+pub mod missions;
 pub mod prompt_runtime;
 pub mod registration;
 pub mod spawn;
 pub mod tui;
+pub mod watchdog;
 
 // P-5 (cyrup-permission-system-port.md §4 / reconciliation §2): re-export the `background::control`
 // file-channel primitives + the R-SA-P1 parent-session anchor const at the crate root so the
@@ -53,7 +64,7 @@ pub mod tui;
 // `background::spawn_detached`) and permission reads it back in the child.
 //
 // PERM-001 adds the one flow in the other direction: pi's orchestrator publishes the anchor into
-// its OWN `process.env` at `SessionStart` (`pi-subagents/src/extension/index.ts:599` @v0.34.0,
+// its OWN `process.env` at `SessionStart` (`pi-subagents/src/extension/index.ts:716` @v0.43.0,
 // deleted at `:619`) so that even a DETACHED descendant inherits it, and this crate cannot do that
 // (`#![forbid(unsafe_code)]` vs. 2024-edition `unsafe std::env::set_var`). The
 // [`background::parent_anchor`] register stands in for that `process.env` slot, and the anchor's

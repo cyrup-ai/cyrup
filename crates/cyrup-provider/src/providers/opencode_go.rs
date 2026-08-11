@@ -1,4 +1,4 @@
-//! The OpenCode Zen Go provider (arch-01 §5). A **mixed-API** provider whose catalog carries both
+//! The OpenCode Go provider (arch-01 §5). A **mixed-API** provider whose catalog carries both
 //! [`anthropic-messages`](crate::api::anthropic_messages) and
 //! [`openai-completions`](crate::api::openai_completions) models, each routed to its own `ApiImpl`
 //! per request via the shared [`ApiRegistry`]. Mirrors Pi's `providers/opencode-go.ts` + the
@@ -21,7 +21,7 @@ pub const OPENCODE_API_KEY_ENV: &str = "OPENCODE_API_KEY";
 /// The verbatim catalog extracted from Pi's generated `opencode-go.models.ts`.
 const OPENCODE_GO_CATALOG_JSON: &str = include_str!("catalog/opencode-go.json");
 
-/// The full OpenCode Zen Go catalog (1:1 with Pi `OPENCODE_GO_MODELS`). A parse failure yields an
+/// The full OpenCode Go catalog (1:1 with Pi `OPENCODE_GO_MODELS`). A parse failure yields an
 /// empty catalog (surfaced loudly by the count test) rather than a panic (NO-PANIC policy).
 pub fn opencode_go_models() -> Vec<Model> {
     serde_json::from_str(OPENCODE_GO_CATALOG_JSON).unwrap_or_default()
@@ -32,7 +32,7 @@ pub fn opencode_go_auth() -> ProviderAuth {
     ProviderAuth::with_api_key(env_key([OPENCODE_API_KEY_ENV]))
 }
 
-/// Construct the OpenCode Zen Go provider over the given credential store + shared api registry.
+/// Construct the OpenCode Go provider over the given credential store + shared api registry.
 /// The registry MUST provide BOTH the `anthropic-messages` and `openai-completions` impls (use
 /// [`builtin_registry`]).
 pub fn opencode_go_provider_with(
@@ -41,7 +41,11 @@ pub fn opencode_go_provider_with(
 ) -> WireProvider {
     WireProvider::new(
         OPENCODE_GO_PROVIDER_ID,
-        "OpenCode Zen Go",
+        // VERSION LAG (v0.83.0 → v0.84.1): upstream renamed the display name from
+        // "OpenCode Zen Go" to "OpenCode Go" (v0.84.1 `ai/src/providers/opencode-go.ts:11`;
+        // v0.83.0 `…:11` still reads "OpenCode Zen Go"). The provider `id` is unchanged, and
+        // nothing in the workspace keys off the display string.
+        "OpenCode Go",
         opencode_go_models(),
         opencode_go_auth(),
         store,
@@ -118,6 +122,10 @@ mod tests {
     fn provider_identity() {
         let p = opencode_go_provider();
         assert_eq!(p.id().as_str(), "opencode-go");
+        // v0.84.1 `ai/src/providers/opencode-go.ts:11` — renamed from "OpenCode Zen Go"
+        // (v0.83.0 `…:11`). The sibling `opencode` provider is NOT renamed: it is still
+        // `name: "OpenCode Zen"` at v0.84.1 `ai/src/providers/opencode.ts:14`.
+        assert_eq!(p.name(), "OpenCode Go");
         assert!(p.get_model("kimi-k2.6").is_some());
         let vars = crate::env_api_keys::api_key_env_vars("opencode-go").expect("env mapping");
         assert!(vars.contains(&OPENCODE_API_KEY_ENV));

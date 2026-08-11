@@ -26,8 +26,8 @@ pub use event_stream::{
     finalizing_channel, Finalizing, FinalizingSink, FinalizingStream,
 };
 pub use message::{
-    AssistantMessage, Content, Cost, Message, ModelThinkingLevel, StopReason, TextPhase,
-    TextSignatureV1, ThinkingLevel, ToolCall, Usage, UNRESOLVED_API,
+    AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel, StopReason,
+    TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, Usage, UNRESOLVED_API,
 };
 pub use tool::{
     ExecMode, Tool, ToolError, ToolRenderKind, ToolResult, ToolUpdate, ToolUpdateSink,

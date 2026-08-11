@@ -78,13 +78,22 @@ pub mod dynamic_fanout;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_core::CancelToken;
-use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStderr, ChildStdout};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::SubagentError;
+// The per-line output cap lives with the rest of the child-protocol port (pi keeps it in
+// `runs/shared/child-protocol.ts`, which this crate maps onto `exec/`), but it belongs on the READ
+// side of the spawn boundary — this is the only place a child's raw bytes enter the parent.
+use crate::exec::child_protocol::{
+    BoundedByteTail, BoundedLineReader, BoundedLineStream, BoundedRead, MAX_CHILD_STDERR_BYTES,
+    ProtocolOutputLimit, format_protocol_output_limit,
+};
 use crate::jsonl::BoundedJsonlWriter;
 
 /// Threshold (characters) above which the task prompt MUST be written to a temp file and passed
@@ -97,6 +106,17 @@ pub const TASK_ARGV_INLINE_THRESHOLD: usize = 8000;
 /// (flushing buffered writes, closing file descriptors) without masking a genuinely hung child
 /// behind an indefinite wait.
 pub const FINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Bounded wait for the concurrent stderr pump ([`CapturedStderr`]) to observe EOF, applied when a
+/// failed run reads back the child's trailing stderr. By the time it is read the child is dead and
+/// its closed write end EOFs the pipe immediately, so this only exists so a pathological pipe (a
+/// grandchild that inherited the fd and is still holding it open) degrades to "report the tail we
+/// have so far" rather than blocking the run.
+const STDERR_PUMP_JOIN_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Read size for the stderr pump. stderr is diagnostic text, not protocol data (R-SA-046) — this
+/// only has to keep the OS pipe from filling, so a modest buffer is right.
+const STDERR_PUMP_CHUNK_BYTES: usize = 8 * 1024;
 
 /// The env var carrying an override for which binary [`resolve_spawn_command`] re-execs
 /// (R-SA-045 tier 1). Mirrors pi-subagents' `PI_SUBAGENT_PI_BINARY`.
@@ -324,17 +344,30 @@ pub enum ChildStep {
     /// should keep draining under a bounded window rather than stopping here — but it must no
     /// longer wait on an EOF that will never come.
     Exited(std::io::Result<std::process::ExitStatus>),
+    /// The child emitted a single stdout line larger than
+    /// [`crate::exec::child_protocol::MAX_CHILD_PENDING_LINE_BYTES`] with no newline, and it was
+    /// not a projectable aggregate record (pi `failProtocol`, `execution.ts:1026-1041`). The read
+    /// loop is over — nothing further will ever be read from this stdout — and the caller must
+    /// terminate the child and fail the attempt with this diagnostic.
+    ProtocolLimit(ProtocolOutputLimit),
 }
 
 pub struct SpawnedChild {
     child: tokio::process::Child,
-    stdout_lines: Lines<BufReader<ChildStdout>>,
-    /// The child's stderr reader. R-SA-046: stderr is diagnostic, never protocol data — but on a
-    /// non-zero exit its trailing content is surfaced into the run's error (pi `execution.ts:686`),
-    /// so the executor moves it out via [`SpawnedChild::take_stderr`] before consuming the child and
-    /// drains the orphaned reader to EOF afterward (the dead child's closed write end guarantees a
-    /// prompt EOF). `None` once taken.
-    stderr_lines: Option<Lines<BufReader<ChildStderr>>>,
+    /// The child's stdout, read through the BOUNDED line reader (pi `createBoundedLineReader`,
+    /// `child-protocol.ts:244`) rather than `tokio::io::Lines`. The distinction is not cosmetic:
+    /// `Lines` grows one `String` until it sees a `\n`, so a child emitting one enormous line grows
+    /// the PARENT's heap without bound. This reader caps a single line at 16 MiB, recovers the two
+    /// redundant aggregate records (`turn_end`/`agent_end`) that can legitimately exceed it, and
+    /// surfaces anything else as [`ChildStep::ProtocolLimit`].
+    stdout: BoundedLineStream<ChildStdout>,
+    /// The child's stderr, being drained CONCURRENTLY with the run by a background pump task from
+    /// the moment the child is spawned — see [`CapturedStderr`] for why that concurrency is
+    /// load-bearing rather than an optimisation. R-SA-046: stderr is diagnostic, never protocol
+    /// data, but on a non-zero exit its trailing content is surfaced into the run's error (pi
+    /// `execution.ts:686`), so the executor moves the accumulated tail out via
+    /// [`SpawnedChild::take_stderr`] before consuming the child. `None` once taken.
+    stderr: Option<CapturedStderr>,
     /// Raw NDJSON stdout lines, teed unmodified as they are read (R-SA-058), written lazily via
     /// [`SpawnedChild::next_event`] rather than buffered and flushed at exit. Size-capped at
     /// [`crate::jsonl::DEFAULT_JSONL_CAP_BYTES`] per file (R-SA-136/146): once the cap is reached,
@@ -415,8 +448,10 @@ impl SpawnedChild {
         match Self::spawn_wired(&spec, jsonl_path).await {
             Ok((child, stdout, stderr, jsonl_writer)) => Ok(Self {
                 child,
-                stdout_lines: BufReader::new(stdout).lines(),
-                stderr_lines: Some(BufReader::new(stderr).lines()),
+                stdout: BoundedLineStream::stdout(stdout),
+                // Pumped from THIS instant, before anything can await the child — pi attaches its
+                // own `proc.stderr.on("data", …)` handler at the same point (`execution.ts:1056`).
+                stderr: Some(CapturedStderr::pump(stderr)),
                 jsonl_writer,
                 temp_files,
                 exited: false,
@@ -528,10 +563,19 @@ impl SpawnedChild {
     /// silently dropping the line — losing the on-disk audit artifact is treated as a real error,
     /// distinct from a parse failure.
     pub async fn next_event(&mut self) -> Option<Result<NdjsonLine, SubagentError>> {
-        let line = match self.stdout_lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => return None,
-            Err(err) => return Some(Err(SubagentError::Spawn(err))),
+        let line = match self.stdout.next().await {
+            BoundedRead::Line(line) => line,
+            BoundedRead::Eof => return None,
+            // This method cannot express the limit as its own outcome (that is
+            // [`ChildStep::ProtocolLimit`], on the richer `next_event_or_exit`), so it degrades to
+            // the error channel carrying the same formatted diagnostic — never to a silent EOF,
+            // which would report an over-limit child as a clean end of stream.
+            BoundedRead::Limit(limit) => {
+                return Some(Err(SubagentError::Spawn(std::io::Error::other(
+                    format_protocol_output_limit(&limit),
+                ))));
+            }
+            BoundedRead::Err(err) => return Some(Err(SubagentError::Spawn(err))),
         };
 
         if let Err(err) = self.jsonl_writer.write_line(&line).await {
@@ -562,18 +606,18 @@ impl SpawnedChild {
     pub async fn next_event_or_exit(&mut self) -> ChildStep {
         let Self {
             child,
-            stdout_lines,
+            stdout,
             jsonl_writer,
             exited,
             ..
         } = self;
 
         let read = if *exited {
-            stdout_lines.next_line().await
+            stdout.next().await
         } else {
             tokio::select! {
                 biased;
-                line = stdout_lines.next_line() => line,
+                line = stdout.next() => line,
                 status = child.wait() => {
                     *exited = true;
                     return ChildStep::Exited(status);
@@ -582,9 +626,10 @@ impl SpawnedChild {
         };
 
         let line = match read {
-            Ok(Some(line)) => line,
-            Ok(None) => return ChildStep::Eof,
-            Err(err) => return ChildStep::Line(Err(SubagentError::Spawn(err))),
+            BoundedRead::Line(line) => line,
+            BoundedRead::Eof => return ChildStep::Eof,
+            BoundedRead::Limit(limit) => return ChildStep::ProtocolLimit(limit),
+            BoundedRead::Err(err) => return ChildStep::Line(Err(SubagentError::Spawn(err))),
         };
 
         if let Err(err) = jsonl_writer.write_line(&line).await {
@@ -595,18 +640,19 @@ impl SpawnedChild {
         ChildStep::Line(Ok(NdjsonLine { raw: line, parsed }))
     }
 
-    /// Move the child's stderr reader out of this [`SpawnedChild`] so the executor can drain it
-    /// independently of the stdout read loop and — after the child is consumed by
-    /// [`SpawnedChild::terminate`]/[`SpawnedChild::finish`] — read whatever the (now-dead) child
-    /// wrote to stderr, surfacing it into the run's error on a non-zero exit (pi `execution.ts:686`).
+    /// Move the handle on the child's already-running stderr pump out of this [`SpawnedChild`], so
+    /// the executor can read the accumulated tail after the child is consumed by
+    /// [`SpawnedChild::terminate`]/[`SpawnedChild::finish`] and surface it into the run's error on a
+    /// non-zero exit (pi `execution.ts:686`).
     ///
-    /// Returns a [`CapturedStderr`] wrapper (rather than the raw tokio reader type) so the executor
-    /// module never needs to name `Lines<BufReader<ChildStderr>>` itself. Returns an empty capture
-    /// on the second and later calls (the reader is taken exactly once). stderr is not protocol data
-    /// (R-SA-046) — this is purely for the diagnostic-into-error surfacing, never for parsing NDJSON.
+    /// This does NOT start the draining — [`SpawnedChild::spawn`] already did, and it has been
+    /// running ever since. Taking the handle late (or never) is therefore safe: the pipe is being
+    /// consumed either way. Returns an empty capture on the second and later calls. stderr is not
+    /// protocol data (R-SA-046) — this is purely for the diagnostic-into-error surfacing, never for
+    /// parsing NDJSON.
     #[must_use]
     pub fn take_stderr(&mut self) -> CapturedStderr {
-        CapturedStderr(self.stderr_lines.take())
+        self.stderr.take().unwrap_or_else(CapturedStderr::empty)
     }
 
     /// Wait, with a bounded timeout, for a child that has already emitted its final message to
@@ -695,34 +741,145 @@ impl SpawnedChild {
     }
 }
 
-/// The child's stderr reader, moved out of a [`SpawnedChild`] by [`SpawnedChild::take_stderr`]. Its
-/// trailing content is surfaced into a failed run's error (pi `execution.ts:686`: on a non-zero
-/// exit `result.error = stderrBuf.trim()` when no richer error is already set). Kept opaque so the
-/// executor never depends on the concrete `tokio::io::Lines`/`BufReader`/`ChildStderr` types.
-pub struct CapturedStderr(Option<Lines<BufReader<ChildStderr>>>);
+/// A handle on the background task draining one child's stderr, moved out of a [`SpawnedChild`] by
+/// [`SpawnedChild::take_stderr`]. Its trailing content is surfaced into a failed run's error (pi
+/// `execution.ts:686`/`:1095`: on a non-zero exit `closeError = stderr.trim()` when no richer error
+/// is already set).
+///
+/// # Why the drain runs CONCURRENTLY with the run
+///
+/// This is a correctness requirement, not a performance choice. An OS pipe has a fixed buffer
+/// (~64 KiB on Linux); once it is full the writer BLOCKS in `write(2)` until someone reads. A
+/// parent that only reads stderr *after* waiting for the child therefore deadlocks against any
+/// child verbose enough to fill the buffer: the child is blocked writing stderr, the parent is
+/// blocked waiting for the child to exit, and neither can proceed. In this crate that is a frozen
+/// session — the delegating tool call never returns.
+///
+/// pi has no such state because its stderr consumer is an event handler installed at spawn time,
+/// which drains every chunk as it arrives (`execution.ts:1056-1059`):
+///
+/// ```text
+/// proc.stderr.on("data", (chunk: Buffer) => {
+///     stderrTail.push(chunk);
+///     stderrReader.push(chunk);
+/// });
+/// ```
+///
+/// [`CapturedStderr::pump`] is that handler: a task spawned alongside the child that reads until
+/// EOF regardless of whether anyone ever asks for the result.
+///
+/// # Why the tail is fed RAW CHUNKS
+///
+/// Note which of pi's two consumers produces the error text: `stderrTail`, a
+/// `createBoundedByteTail` fed the raw `chunk` (`execution.ts:1057`) with no notion of lines at
+/// all. The line-bounded `stderrReader` beside it (`execution.ts:1047-1052`) exists only to feed
+/// `shared.transcriptWriter?.writeStderrLine` and has no say over the error.
+///
+/// That separation is what makes the bound a TAIL rather than a truncation. A child's fatal error
+/// is the LAST thing it writes, so a capture that stopped at the first over-long line would report
+/// the child's warm-up chatter and drop its cause of death. Feeding the byte tail raw keeps the
+/// last [`MAX_CHILD_STDERR_BYTES`] of *everything*, however the child chose to break it into lines
+/// — or not to.
+///
+/// The per-line reader is ported alongside it, on the same chunks, for the same reason pi keeps
+/// both: it bounds what a single pathological line can cost the diagnostic path. cyrup has no
+/// `ChildTranscriptWriter` port yet, so its lines go to `tracing` at debug level — the same
+/// discard-if-nobody-is-listening shape as pi's own optional-chained `transcriptWriter?.`.
+pub struct CapturedStderr {
+    /// The last [`MAX_CHILD_STDERR_BYTES`] the child has written so far, shared with the pump task
+    /// that is still appending to it. `None` for an [`CapturedStderr::empty`] capture.
+    tail: Option<Arc<AsyncMutex<BoundedByteTail>>>,
+    /// The pump task, awaited (briefly, bounded) by [`CapturedStderr::drain_to_string`] so the read
+    /// sees everything the child wrote rather than racing the last chunk.
+    pump: Option<tokio::task::JoinHandle<()>>,
+}
 
 impl CapturedStderr {
-    /// Read every remaining line of the child's stderr to EOF and return it as one string (lines
-    /// re-joined with a trailing `\n` each, matching how the child wrote them). Intended to be
-    /// called AFTER the child has been consumed (`terminate`/`finish`) and is therefore dead — the
-    /// closed write end guarantees a prompt EOF, so this never blocks on a live child. A per-read
-    /// bounded timeout is applied defensively so a pathological never-EOF pipe cannot hang the run.
-    /// Returns an empty string when the reader was never present (e.g. a second call, or a spawn
-    /// that never captured stderr).
+    /// Start draining `stderr` immediately, into a bounded tail this handle can read back later.
+    ///
+    /// The task owns the reader and runs to EOF on its own; dropping the returned handle does not
+    /// stop it, which is deliberate — the pipe must keep being consumed for as long as the child
+    /// might write to it, whether or not this run ever ends up wanting the text.
+    fn pump(stderr: ChildStderr) -> Self {
+        // BOUNDED (pi `createBoundedByteTail()`, `execution.ts:1025`, read back at `:1077`): only
+        // the LAST `MAX_CHILD_STDERR_BYTES` are retained. This string is surfaced verbatim as a
+        // failed run's error, so an unbounded buffer here would let a chatty child grow the
+        // parent's heap by exactly as much as it wrote — the same hole the stdout cap closes, on
+        // the stream far likelier to be spammed.
+        let tail = Arc::new(AsyncMutex::new(BoundedByteTail::new(MAX_CHILD_STDERR_BYTES)));
+        let pump_tail = Arc::clone(&tail);
+        let pump = tokio::spawn(async move {
+            let mut reader = stderr;
+            // pi's second consumer (`execution.ts:1047-1052`), fed the identical chunks.
+            let mut lines = BoundedLineReader::stderr();
+            let mut buf = vec![0u8; STDERR_PUMP_CHUNK_BYTES];
+            loop {
+                let read = match reader.read(&mut buf).await {
+                    Ok(0) => break,                       // EOF: the child closed its write end
+                    Ok(read) => read,
+                    Err(_) => break, // a broken stderr pipe is diagnostic-only; never fails the run
+                };
+                let chunk = buf.get(..read).unwrap_or_default();
+                pump_tail.lock().await.push(chunk);
+                lines.push(chunk);
+                drain_stderr_lines(&mut lines);
+            }
+            lines.end();
+            drain_stderr_lines(&mut lines);
+        });
+        Self {
+            tail: Some(tail),
+            pump: Some(pump),
+        }
+    }
+
+    /// A capture with no stderr behind it — what [`SpawnedChild::take_stderr`] returns on its
+    /// second and later calls. [`CapturedStderr::drain_to_string`] yields `""`.
+    #[must_use]
+    fn empty() -> Self {
+        Self {
+            tail: None,
+            pump: None,
+        }
+    }
+
+    /// Return the LAST [`MAX_CHILD_STDERR_BYTES`] the child wrote to stderr, as one string.
+    ///
+    /// Intended to be called AFTER the child has been consumed (`terminate`/`finish`) and is
+    /// therefore dead: the closed write end EOFs the pipe, the pump finishes, and this returns
+    /// everything. The join is bounded by [`STDERR_PUMP_JOIN_TIMEOUT`] so a pipe held open by a
+    /// grandchild that inherited the fd degrades to "whatever has arrived so far" instead of
+    /// blocking the run — and even then the pump is left running, so the pipe keeps draining.
+    ///
+    /// Returns an empty string when there was no stderr behind this capture.
     pub async fn drain_to_string(self) -> String {
-        let Some(mut lines) = self.0 else {
+        let Some(tail) = self.tail else {
             return String::new();
         };
-        let mut buf = String::new();
-        // Loops until EOF (`Ok(Ok(None))`), a read error (`Ok(Err(_))`), or the defensive per-read
-        // timeout (`Err(_)`) — any of which fails the `while let` pattern and ends the drain.
-        while let Ok(Ok(Some(line))) =
-            tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await
-        {
-            buf.push_str(&line);
-            buf.push('\n');
+        if let Some(pump) = self.pump {
+            // A join error (the task panicked or was aborted) is not itself a run failure: whatever
+            // the pump had already pushed is still in `tail`, and that is what gets reported.
+            let _ = tokio::time::timeout(STDERR_PUMP_JOIN_TIMEOUT, pump).await;
         }
-        buf
+        tail.lock().await.text()
+    }
+}
+
+/// Forward whatever [`BoundedLineReader::stderr`] has completed to `tracing`, cyrup's stand-in for
+/// pi's `shared.transcriptWriter?.writeStderrLine` (`execution.ts:1050-1051`). Debug level because
+/// this is a child's ordinary diagnostic chatter; the over-long-line diagnostic is a warning
+/// because it means the reader has permanently closed and later lines will not appear here (the
+/// error path is unaffected — it reads the raw byte tail, not this).
+fn drain_stderr_lines(lines: &mut BoundedLineReader) {
+    while let Some(line) = lines.take_line() {
+        tracing::debug!(target: "cyrup_ext_subagents::child_stderr", "{line}");
+    }
+    if let Some(limit) = lines.take_limit() {
+        tracing::warn!(
+            target: "cyrup_ext_subagents::child_stderr",
+            "{}",
+            format_protocol_output_limit(&limit)
+        );
     }
 }
 

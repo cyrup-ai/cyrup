@@ -116,13 +116,20 @@ where
 }
 
 /// The process exit code for a settled one-shot run, from the last assistant message's stop reason
-/// (arch-11 §6.6): `error` ⇒ 1, `aborted` ⇒ 130, otherwise (`stop`/`length`/`toolUse`) ⇒ 0.
+/// (arch-11 §6.6): `error` ⇒ 1, `aborted` ⇒ 130, otherwise (`stop`/`length`/`toolUse`/`deferred`)
+/// ⇒ 0.
 ///
 /// `pending` — the in-flight sentinel — exits **1**, not 0. A transcript whose last assistant
 /// message never settled is a stream that was cut off, and reporting success for it is precisely
 /// the silent-truncation failure PROV-010 / AGENT-014 / DRIFT-012 closed on the decoder side. The
 /// match is exhaustive on purpose: the `_ => 0` it replaces would have swallowed `Pending` (and
 /// will not swallow whatever variant comes next either).
+///
+/// `deferred` exits **0**, and that is Pi's answer, not a guess: Pi's print mode raises `exitCode`
+/// only for `"error"`/`"aborted"` (`v0.84.1 coding-agent/src/modes/print-mode.ts:144-147`) and
+/// everything else falls to the text-printing `else`. It is also the semantically right answer —
+/// Pi puts `deferred` in the `done` (success) extract, not the `error` one
+/// (`v0.84.1 ai/src/types.ts:527-531`): the request WAS accepted, and the caller holds a handle.
 pub async fn exit_code(session: &AgentSession) -> i32 {
     use cyrup_sdk::core::{Message, StopReason};
     for message in session.messages().await.iter().rev() {
@@ -130,7 +137,10 @@ pub async fn exit_code(session: &AgentSession) -> i32 {
             return match assistant.stop_reason {
                 StopReason::Error | StopReason::Pending => 1,
                 StopReason::Aborted => 130,
-                StopReason::Stop | StopReason::Length | StopReason::ToolUse => 0,
+                StopReason::Stop
+                | StopReason::Length
+                | StopReason::ToolUse
+                | StopReason::Deferred => 0,
             };
         }
     }

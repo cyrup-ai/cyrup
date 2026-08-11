@@ -33,7 +33,9 @@ pub fn assistant_msg(text: impl Into<String>) -> Message {
             cost: Cost::default(),
         },
         stop_reason: StopReason::Stop,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     })
 }
@@ -56,7 +58,9 @@ pub fn create_assistant_message(text: impl Into<String>) -> AgentMessage {
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     })
 }

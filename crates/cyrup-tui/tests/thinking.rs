@@ -56,12 +56,27 @@ fn done(content: Vec<Content>) -> StreamEvent {
     StreamEvent::terminal(msg)
 }
 
+/// Post one stream frame the way `cyrup-agent` actually posts it.
+///
+/// A non-terminal frame rides a `MessageUpdate` (`agent.rs:827-831`). A TERMINAL one never does:
+/// the consume loop `break`s on it (`:813-820`) and it reaches the TUI as `MessageEnd` (`:854`),
+/// which is where Pi finalizes the message (`interactive-mode.ts:3180-3213`) — guarded on the
+/// streaming component `message_start` created (`:3130-3139`, `:3182`). This helper used to post
+/// every frame, terminal included, as a bare `MessageUpdate` with no `MessageStart`.
 fn feed(app: &mut App<TestBackend>, ev: StreamEvent) {
-    let message = ev.terminal_message().cloned().unwrap_or_else(blank);
-    app.ingest_event(&AgentSessionEvent::MessageUpdate {
-        message: AgentMessage::Assistant(message),
-        assistant_message_event: Box::new(ev),
+    let terminal = ev.terminal_message().cloned();
+    app.ingest_event(&AgentSessionEvent::MessageStart {
+        message: AgentMessage::Assistant(blank()),
     });
+    match terminal {
+        Some(message) => app.ingest_event(&AgentSessionEvent::MessageEnd {
+            message: AgentMessage::Assistant(message),
+        }),
+        None => app.ingest_event(&AgentSessionEvent::MessageUpdate {
+            message: AgentMessage::Assistant(blank()),
+            assistant_message_event: Box::new(ev),
+        }),
+    }
 }
 
 /// The bottom `viewport_height` rows — the live inline region the app repaints each frame.

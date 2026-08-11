@@ -18,21 +18,18 @@
 //!    scan even reaches a `/`).
 //!
 //!    **This function performs zero filesystem access.** It is a pure string predicate over its
-//!    `&str` argument, called strictly before [`profile_path`]/[`load_profile`]/[`apply_profile`]
-//!    touch the filesystem or the `cyrup-config` settings store at all — the ordering this
+//!    `&str` argument, called strictly before [`profile_path`]/[`load_profile`]/
+//!    [`apply_profile_to_settings_file`] touch the filesystem at all — the ordering this
 //!    module's own path-traversal test proves via a filesystem-access-tracking double (see the
 //!    `tests` module below), not merely by asserting the final `Err` outcome.
 //!
-//! 2. **[`apply_profile`] — the R-SA-141 targeted-key settings merge.** Loading a named profile
-//!    MUST replace only the `subagents` top-level key in `cyrup-config`'s settings store, leaving
-//!    every other top-level key (e.g. a top-level `defaultModel`) untouched. This module does
-//!    **not** reimplement a targeted-merge primitive of its own: `cyrup_config::SettingsManager::
-//!    set_nested(scope, &["subagents"], value)` already performs exactly this operation — a
-//!    scoped read-modify-write that parses the on-disk document, replaces (via
-//!    [`cyrup_config::settings`]'s internal `set_value_at_path`) only the single top-level key
-//!    named by the first (and, here, only) path segment, and re-serializes the whole document —
-//!    so [`apply_profile`] is a thin, well-documented call-through to that existing primitive
-//!    rather than a second, parallel implementation that could drift out of sync with it.
+//! 2. **[`apply_profile_to_settings_file`] — the targeted-key settings merge.** Loading a named
+//!    profile MUST touch only the `subagents` top-level key of the user settings file, leaving
+//!    every other top-level key (e.g. a top-level `defaultModel`) untouched, and within
+//!    `subagents` must MERGE rather than replace. This is a 1:1 port of pi's
+//!    `applySubagentProfile` (`profiles.ts:482-497`) — upstream's only apply path, and cyrup's
+//!    only one too. Its three merge layers, and why the third is an unconditional assignment
+//!    rather than a merge, are documented on the function itself.
 //!
 //! # Deferred to a later phase (explicitly, per this task's own instructions)
 //!
@@ -58,7 +55,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use cyrup_config::{SettingsManager, SettingsScope};
 
 use crate::discovery::types::{AgentOverrideConfig, OverrideField, SubagentSettings};
 use crate::error::SubagentError;
@@ -221,65 +217,20 @@ pub fn load_profile(profiles_dir: &Path, name: &str) -> Result<NamedProfile, Sub
 // R-SA-141: targeted-key settings merge
 // =================================================================================================
 
-/// Apply a named profile's `subagents` payload into `settings`'s `subagents` settings key, at
-/// `scope`, via a **targeted replace of only the `subagents` key** (R-SA-141) — every other
-/// top-level settings key (e.g. a top-level `defaultModel`) is left byte-for-byte untouched.
-///
-/// This is a thin call-through to [`cyrup_config::SettingsManager::set_nested`] with a
-/// single-segment path (`&["subagents"]`): that function's own scoped read-modify-write already
-/// parses the on-disk document, replaces exactly the named top-level key (creating it if absent,
-/// preserving every sibling key already present), and re-serializes the whole document — this is
-/// precisely R-SA-141's "replacing only the `subagents` key's value, leaving all other settings
-/// keys... untouched" contract, with no second, parallel merge implementation needed here.
-///
-/// `name` is still validated via [`validate_profile_name`] first (R-SA-142 applies to the
-/// settings-store key-selection path exactly as it does to the filesystem-lookup path — a
-/// caller-supplied profile *name* is untrusted input regardless of which backing store it
-/// ultimately addresses), even though `set_nested`'s own path segments here are the fixed,
-/// hardcoded literal `"subagents"` and never `name` itself; this guards against a future caller
-/// mistakenly threading an unvalidated `name` into a settings path segment of its own.
-///
-/// # Errors
-///
-/// - [`SubagentError::UnsafePathToken`] if `name` fails the R-SA-142 allowlist.
-/// - [`SubagentError::Config`] if the underlying settings-store write fails (e.g. the target
-///   scope is untrusted-project, or a lock/I/O error occurs).
-pub fn apply_profile(
-    settings: &mut SettingsManager,
-    scope: SettingsScope,
-    name: &str,
-    profile: &NamedProfile,
-) -> Result<(), SubagentError> {
-    validate_profile_name(name)?;
-    let value = serde_json::to_value(&profile.subagents).map_err(|e| {
-        SubagentError::MalformedSettings(format!(
-            "profile {name:?} could not be serialized for settings write: {e}"
-        ))
-    })?;
-    settings.set_nested(scope, &["subagents"], value)?;
-    Ok(())
-}
-
-/// Convenience composition of [`load_profile`] + [`apply_profile`]: read the named profile from
-/// `profiles_dir`, then targeted-merge it into `settings` at `scope` (`/subagents-load-profile`'s
-/// full end-to-end operation, R-SA-140/141/142 together).
-///
-/// # Errors
-///
-/// Propagates every error [`load_profile`]/[`apply_profile`] can return. In particular, an unsafe
-/// `name` is rejected by [`load_profile`]'s own [`profile_path`] call before any filesystem
-/// access is attempted, and (redundantly, defense-in-depth) would be rejected again by
-/// [`apply_profile`]'s own validation if somehow reached with an already-loaded profile.
-pub fn load_and_apply_profile(
-    profiles_dir: &Path,
-    settings: &mut SettingsManager,
-    scope: SettingsScope,
-    name: &str,
-) -> Result<NamedProfile, SubagentError> {
-    let profile = load_profile(profiles_dir, name)?;
-    apply_profile(settings, scope, name, &profile)?;
-    Ok(profile)
-}
+// pi has exactly ONE profile-apply path — `applySubagentProfile` (`profiles.ts:482-497`), which
+// read-modify-writes the user settings FILE and is called from exactly one place
+// (`slash-commands.ts:855`). `apply_profile_to_settings_file` below is that function, and it is
+// what `/subagents-load-profile` drives.
+//
+// A second, `SettingsManager`-store-based pair (`apply_profile` / `load_and_apply_profile`) used to
+// live here. It was removed rather than wired up, for three reasons:
+//   1. it has no upstream counterpart at all — pi does not have a store-based apply;
+//   2. it had no non-test caller anywhere in `crates/`, and duplicated the same three-layer merge;
+//   3. its destination was WRONG. `SettingsManager`'s `Global` scope is
+//      `cyrup_config::Dirs::settings_path()` = `~/.cyrup/agent/settings.json`, whereas this
+//      extension's discovery reads its `subagents.*` layer from `~/.cyrup/agents/settings.json`
+//      (`extension.rs:1217`, matching `extension.rs`'s `user_settings_path`). Wiring it in would
+//      have written a profile to a file this extension never reads.
 
 /// Snapshot every currently-discoverable profile's raw payload, keyed by name (used by a
 /// `/subagents-profiles` listing command to render a table without a second directory walk per
@@ -298,16 +249,16 @@ pub fn describe_profiles(
 }
 
 // =================================================================================================
-// Profile FILE SHAPE (pi `buildProfileFile`, profiles.ts:385-400) + tier selection
+// Profile FILE SHAPE (pi `buildProfileFile`, profiles.ts:402-415) + tier selection
 // =================================================================================================
 //
 // A GENERATED profile (`/subagents-generate-profiles <provider>`) is NOT merely a single
 // `defaultModel`; pi writes a per-agent `subagents.agentOverrides` map assigning EACH of the 8
-// builtin agents to one of three model tiers (`buildProfileFile`, profiles.ts:385-400) — and this
+// builtin agents to one of three model tiers (`buildProfileFile`, profiles.ts:402-415) — and this
 // port additionally sets a representative `subagents.defaultModel` (the medium tier) so the
 // profile is a complete policy that also covers non-builtin/custom agents (see
 // [`build_profile_file`]). The tier→model mapping is
-// chosen by `pickTierModels` (profiles.ts:348-359) from the provider's ranked model list. The
+// chosen by `pickTierModels` (profiles.ts:365-376) from the provider's ranked model list. The
 // LIVE-PROBE model *classification/ranking* (`refreshProviderModelCatalog`'s per-model probe +
 // `classifyModel`) is a sanctioned deferral (func-SA §9 item 31) — but the profile FILE SHAPE, the
 // tier-position math, and the per-provider catalog artifact are all pure, faithful, and ported
@@ -315,7 +266,7 @@ pub fn describe_profiles(
 // catalog, the deferred-live-probe stand-in) and this module writes the pi-shaped files.
 
 /// The three model tiers a generated profile assigns across the 8 builtin agents (pi
-/// `pickTierModels` result, profiles.ts:348-359). Each is a model reference string (pi uses a
+/// `pickTierModels` result, profiles.ts:365-376). Each is a model reference string (pi uses a
 /// fully-qualified `provider/id`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TierModels {
@@ -326,7 +277,7 @@ pub struct TierModels {
 
 /// Which of pi's two profile flavors a generation pass produces (`ProfileKind`, profiles.ts:12).
 /// Selects the tier *positions* used to pick cheap/medium/strong models from the provider's ranked
-/// model list (`profilePositions`, profiles.ts:342-346).
+/// model list (`profilePositions`, profiles.ts:359-363).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProfileKind {
     /// Quota-optimized: bias toward the cheaper end of the ranked list (`{0, 1/3, 2/3}`), and drop
@@ -347,11 +298,20 @@ impl ProfileKind {
     }
 }
 
-/// The 8 builtin agent names in pi's `buildProfileFile` grouping (profiles.ts:389-396): two
-/// cheap-tier, three medium-tier, three strong-tier — every one of the 8 builtins is assigned.
+/// The builtin agent names in pi's `buildProfileFile` grouping (profiles.ts:402-415 @ v0.43.0): two
+/// cheap-tier, ONE medium-tier, three strong-tier.
+///
+/// SIX entries, not eight, and the medium tier is a single agent. Upstream `83b9872` deleted the
+/// `planner` and `context-builder` roles, which were the other two medium-tier entries, leaving
+/// `researcher` alone there — see [`crate::discovery::management::BUILTIN_AGENT_NAMES`].
+///
+/// The 7th roster name, `advisor`, is deliberately ABSENT: it is an alias of `oracle`
+/// (`agents/oracle.md:3` @ v0.43.0), and a settings override keyed on an alias would never be
+/// applied — `subagents.agentOverrides` is looked up by canonical agent name. pi's
+/// `buildProfileFile` likewise writes no `advisor` entry.
 pub const PROFILE_CHEAP_AGENTS: [&str; 2] = ["scout", "delegate"];
 /// See [`PROFILE_CHEAP_AGENTS`].
-pub const PROFILE_MEDIUM_AGENTS: [&str; 3] = ["planner", "context-builder", "researcher"];
+pub const PROFILE_MEDIUM_AGENTS: [&str; 1] = ["researcher"];
 /// See [`PROFILE_CHEAP_AGENTS`].
 pub const PROFILE_STRONG_AGENTS: [&str; 3] = ["worker", "reviewer", "oracle"];
 
@@ -365,10 +325,10 @@ fn tier_override(model: &str) -> AgentOverrideConfig {
 }
 
 /// Build a subagent profile file from a tier assignment — pi `buildProfileFile`
-/// (profiles.ts:385-400). Writes `subagents.agentOverrides.<agent>.model` for ALL EIGHT builtin
-/// agents: scout/delegate → `cheap`, planner/context-builder/researcher → `medium`,
-/// worker/reviewer/oracle → `strong`. (pi's `buildProfileFile` takes a `kind` argument it does not
-/// read — the tier assignment alone determines the file — so this port takes only the models.)
+/// (profiles.ts:402-415 @ v0.43.0). Writes `subagents.agentOverrides.<agent>.model` for the six
+/// tiered builtins: scout/delegate → `cheap`, researcher → `medium`, worker/reviewer/oracle →
+/// `strong`. (pi's `buildProfileFile` takes a `kind` argument it does not read — the tier assignment
+/// alone determines the file — so this port takes only the models.)
 ///
 /// In addition to the 8-agent tier map, this sets `subagents.defaultModel` to the `medium` tier —
 /// the profile's representative fallback model for any agent that is NOT one of the 8 builtins
@@ -399,7 +359,7 @@ pub fn build_profile_file(models: &TierModels) -> NamedProfile {
 }
 
 /// The cheap/medium/strong sampling positions for `kind` (pi `profilePositions`,
-/// profiles.ts:342-346), each a `0.0..=1.0` fraction into the ranked selection pool.
+/// profiles.ts:359-363), each a `0.0..=1.0` fraction into the ranked selection pool.
 fn profile_positions(kind: ProfileKind) -> (f64, f64, f64) {
     match kind {
         ProfileKind::Quota => (0.0, 1.0 / 3.0, 2.0 / 3.0),
@@ -408,7 +368,7 @@ fn profile_positions(kind: ProfileKind) -> (f64, f64, f64) {
 }
 
 /// Map a `0.0..=1.0` position into a valid index of a `count`-element list (pi `roundIndex`,
-/// profiles.ts:337-340): `count <= 1` collapses to `0`; otherwise `round((count-1) * position)`,
+/// profiles.ts:354-357): `count <= 1` collapses to `0`; otherwise `round((count-1) * position)`,
 /// clamped into `0..=count-1`.
 fn round_index(count: usize, position: f64) -> usize {
     if count <= 1 {
@@ -421,7 +381,7 @@ fn round_index(count: usize, position: f64) -> usize {
 }
 
 /// Pick the cheap/medium/strong models for `kind` from a RANKED model list (pi `pickTierModels`,
-/// profiles.ts:348-359): quality samples the whole list; quota drops the single most-expensive
+/// profiles.ts:365-376): quality samples the whole list; quota drops the single most-expensive
 /// (last) model from the selection pool when more than one exists, then samples that shorter pool.
 ///
 /// `ranked_models` MUST already be in ascending capability/rank order (cheapest/weakest first),
@@ -466,7 +426,7 @@ pub fn pick_tier_models(
 }
 
 /// The `worker`-tier model of a loaded profile, if it sets one (pi `getProfileWorkerModel`,
-/// slash-commands.ts:336-339) — the model `/subagents-load-profile` offers to switch the live
+/// slash-commands.ts:424-427) — the model `/subagents-load-profile` offers to switch the live
 /// session to. `None` when the profile does not override `worker`'s model (or sets it to blank).
 #[must_use]
 pub fn profile_worker_model(profile: &NamedProfile) -> Option<String> {
@@ -483,7 +443,7 @@ pub fn profile_worker_model(profile: &NamedProfile) -> Option<String> {
 // =================================================================================================
 
 /// Serialize `profile` and write it to `<profiles_dir>/<name>.json` (pi `writeJsonFile`,
-/// profiles.ts:94-97: pretty-printed, two-space indent, trailing newline). Creates `profiles_dir`
+/// profiles.ts:98-101: pretty-printed, two-space indent, trailing newline). Creates `profiles_dir`
 /// if absent. `name` is validated through [`profile_path`] before any filesystem access.
 ///
 /// # Errors
@@ -510,7 +470,7 @@ pub fn write_named_profile(
 
 /// The result of a `/subagents-generate-profiles` pass: both written profile paths plus the tier
 /// assignments each ended up with (mirrors pi `generateProfilesForProvider`'s return shape,
-/// profiles.ts:584).
+/// profiles.ts:608).
 #[derive(Clone, Debug)]
 pub struct GeneratedProfiles {
     pub quota_path: PathBuf,
@@ -557,16 +517,31 @@ pub fn generate_provider_profiles(
     })
 }
 
-/// Apply a loaded profile by REPLACING ONLY the `subagents` key of an on-disk `settings.json`
-/// file, preserving every other top-level key (pi `applySubagentProfile`, profiles.ts:467-474 →
-/// `writeJsonFile`). This is the file-based counterpart to [`apply_profile`] (which targets a
-/// `cyrup-config` [`SettingsManager`] store): `/subagents-load-profile` writes the SAME user
-/// settings file the extension's discovery reads its `subagents.*` layer back from, so a loaded
-/// profile takes effect on the next discovery pass exactly as pi's does.
+/// Apply a loaded profile by MERGING it into the `subagents` key of an on-disk `settings.json`
+/// file, preserving every other top-level key (pi `applySubagentProfile`, profiles.ts:482-497 →
+/// `writeJsonFile`). This is the ONE apply path, matching pi, which has exactly one:
+/// `/subagents-load-profile` writes the SAME user settings file the extension's discovery reads
+/// its `subagents.*` layer back from (`extension.rs:1217`), so a loaded profile takes effect on
+/// the next discovery pass exactly as pi's does.
 ///
-/// An absent settings file is treated as an empty object (pi `readSettingsFile`, profiles.ts:145-148);
+/// # Merge order (pi `profiles.ts:486-495`, verbatim)
+///
+/// `{ ...existing, ...profile.subagents, agentOverrides: profile.subagents.agentOverrides }` —
+/// three layers, and the order is the whole point:
+///
+/// 1. every `subagents.*` key already on disk survives (`disableBuiltins`, `defaultModel`,
+///    `modelScope`, …). Before v0.43.0 upstream assigned the profile's block wholesale, so
+///    switching profiles silently DELETED settings the profile says nothing about;
+/// 2. a key the profile DOES declare wins over the on-disk value — that is what loading a
+///    profile means;
+/// 3. `agentOverrides` is taken from the profile UNCONDITIONALLY rather than key-merged, because
+///    "a profile owns the complete agent mapping" (pi's own comment): a per-agent map merged
+///    key-by-key would leave the previous profile's agents pinned to its models forever, and no
+///    profile switch could ever unpin them.
+///
+/// An absent settings file is treated as an empty object (pi `readSettingsFile`, profiles.ts:162-165);
 /// a settings file that is not a JSON object aborts with [`SubagentError::MalformedSettings`] (pi
-/// `readJsonObjectFile`, profiles.ts:85-92). Output matches pi `writeJsonFile`: pretty two-space
+/// `readJsonObjectFile`, profiles.ts:89-96). Output matches pi `writeJsonFile`: pretty two-space
 /// indent + trailing newline, with the parent directory created if needed.
 ///
 /// # Errors
@@ -603,7 +578,33 @@ pub fn apply_profile_to_settings_file(
     let subagents_value = serde_json::to_value(&profile.subagents).map_err(|e| {
         SubagentError::MalformedSettings(format!("could not serialize profile subagents: {e}"))
     })?;
-    root.insert("subagents".to_string(), subagents_value);
+
+    // Layer 1: whatever `subagents` block is already on disk (an absent / non-object value is an
+    // empty base, pi's `settings.subagents && typeof … === "object" && !Array.isArray(…) ? … : {}`).
+    let mut merged = match root.get("subagents") {
+        Some(serde_json::Value::Object(existing)) => existing.clone(),
+        _ => serde_json::Map::new(),
+    };
+    // Layer 2: every key the profile declares.
+    if let serde_json::Value::Object(incoming) = &subagents_value {
+        for (key, value) in incoming {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    // Layer 3: the profile owns `agentOverrides` outright. `SubagentSettings` serializes an EMPTY
+    // override map to no key at all (`skip_serializing_if`), so this is not implied by layer 2:
+    // without it, a profile that clears every override would leave the previous profile's
+    // overrides standing, which is precisely the un-switchable state pi's unconditional
+    // assignment prevents.
+    merged.insert(
+        "agentOverrides".to_string(),
+        subagents_value
+            .get("agentOverrides")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+    );
+
+    root.insert("subagents".to_string(), serde_json::Value::Object(merged));
 
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent).map_err(SubagentError::Spawn)?;
@@ -626,14 +627,14 @@ pub fn apply_profile_to_settings_file(
 pub const DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS: u64 = 7;
 
 /// The per-provider catalog directory under `profiles_dir` (pi `getProviderModelsDir`,
-/// profiles.ts:438-440: a `providers/` child of the profiles root).
+/// profiles.ts:453-455: a `providers/` child of the profiles root).
 #[must_use]
 pub fn provider_models_dir(profiles_dir: &Path) -> PathBuf {
     profiles_dir.join("providers")
 }
 
 /// The on-disk path of one provider's model catalog file (pi `getProviderModelsPath`,
-/// profiles.ts:448-450: `<providers>/<provider>.models.json`). Validates `provider` via
+/// profiles.ts:463-465: `<providers>/<provider>.models.json`). Validates `provider` via
 /// [`validate_profile_name`] before constructing the path (R-SA-142).
 ///
 /// # Errors
@@ -686,7 +687,7 @@ pub struct ProviderModelCatalog {
 }
 
 /// Whether `catalog` is older than its `max_age_days` window as of `now_epoch_ms` (pi
-/// `isProviderModelCatalogStale`, profiles.ts:482-487). A catalog written in the future
+/// `isProviderModelCatalogStale`, profiles.ts:506-511). A catalog written in the future
 /// (`refreshed_at_epoch_ms > now_epoch_ms`, e.g. clock skew) is treated as fresh, never stale.
 #[must_use]
 pub fn is_provider_catalog_stale(
@@ -699,7 +700,7 @@ pub fn is_provider_catalog_stale(
 }
 
 /// Read one provider's cached catalog file, if present (pi `readProviderModelCatalog`,
-/// profiles.ts:476-480). `Ok(None)` when the file does not exist (a never-refreshed provider is a
+/// profiles.ts:500-504). `Ok(None)` when the file does not exist (a never-refreshed provider is a
 /// normal state, not an error).
 ///
 /// # Errors
@@ -722,7 +723,7 @@ pub fn read_provider_catalog(
 }
 
 /// Write one provider's catalog file (pi `writeJsonFile` targeting `getProviderModelsPath`,
-/// profiles.ts:575), creating the `providers/` directory if absent. Pretty two-space indent +
+/// profiles.ts:463-465), creating the `providers/` directory if absent. Pretty two-space indent +
 /// trailing newline, matching pi's `writeJsonFile`.
 ///
 /// # Errors
@@ -751,9 +752,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use std::cell::RefCell;
-    use std::sync::Arc;
-
-    use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
 
     use super::*;
 
@@ -1140,131 +1138,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // R-SA-141: targeted-key merge — replaces ONLY `subagents`, leaves siblings untouched
-    // -----------------------------------------------------------------------------------------
-
-    fn manager_with_seed(seed_json: &str) -> SettingsManager {
-        let store = Arc::new(InMemorySettingsStore::new());
-        store.seed(SettingsScope::Global, seed_json);
-        SettingsManager::load(store, Settings::new(), true)
-    }
-
-    #[test]
-    fn apply_profile_replaces_subagents_key_only_leaves_sibling_keys_untouched() {
-        let mut mgr = manager_with_seed(
-            r#"{
-                "defaultModel": "top-level-default",
-                "theme": "dark",
-                "subagents": { "defaultModel": "old-subagents-default" }
-            }"#,
-        );
-
-        let profile = NamedProfile {
-            subagents: SubagentSettings {
-                default_model: Some("new-subagents-default".to_string()),
-                ..Default::default()
-            },
-        };
-
-        apply_profile(&mut mgr, SettingsScope::Global, "quality", &profile)
-            .expect("apply profile");
-
-        // Sibling top-level keys are untouched.
-        assert_eq!(
-            mgr.global().get("defaultModel").and_then(|v| v.as_str()),
-            Some("top-level-default")
-        );
-        assert_eq!(
-            mgr.global().get("theme").and_then(|v| v.as_str()),
-            Some("dark")
-        );
-
-        // The `subagents` key was replaced with the profile's payload.
-        let subagents = mgr
-            .global()
-            .get("subagents")
-            .expect("subagents key present after apply");
-        assert_eq!(
-            subagents.get("defaultModel").and_then(|v| v.as_str()),
-            Some("new-subagents-default")
-        );
-    }
-
-    #[test]
-    fn apply_profile_creates_subagents_key_when_absent() {
-        let mut mgr = manager_with_seed(r#"{ "defaultModel": "top-level-default" }"#);
-
-        let profile = NamedProfile {
-            subagents: SubagentSettings {
-                default_model: Some("fresh-subagents-default".to_string()),
-                ..Default::default()
-            },
-        };
-
-        apply_profile(&mut mgr, SettingsScope::Global, "quality", &profile)
-            .expect("apply profile");
-
-        assert_eq!(
-            mgr.global().get("defaultModel").and_then(|v| v.as_str()),
-            Some("top-level-default"),
-            "pre-existing sibling key must survive creation of a previously-absent subagents key"
-        );
-        let subagents = mgr.global().get("subagents").expect("subagents key created");
-        assert_eq!(
-            subagents.get("defaultModel").and_then(|v| v.as_str()),
-            Some("fresh-subagents-default")
-        );
-    }
-
-    #[test]
-    fn apply_profile_rejects_unsafe_name_before_touching_settings_store() {
-        let mut mgr = manager_with_seed(r#"{ "defaultModel": "top-level-default" }"#);
-        let profile = NamedProfile::default();
-
-        let result = apply_profile(&mut mgr, SettingsScope::Global, "../escape", &profile);
-
-        assert!(matches!(result, Err(SubagentError::UnsafePathToken(_))));
-        // The settings store must be completely unmodified: re-reading the seeded document
-        // shows the original single top-level key and nothing else.
-        assert_eq!(
-            mgr.global().get("defaultModel").and_then(|v| v.as_str()),
-            Some("top-level-default")
-        );
-        assert!(mgr.global().get("subagents").is_none());
-    }
-
-    #[test]
-    fn load_and_apply_profile_end_to_end() {
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        let profile = NamedProfile {
-            subagents: SubagentSettings {
-                default_model: Some("end-to-end-model".to_string()),
-                ..Default::default()
-            },
-        };
-        write_profile(tmp.path(), "e2e", &profile);
-
-        let mut mgr = manager_with_seed(r#"{ "theme": "dark" }"#);
-        let loaded = load_and_apply_profile(tmp.path(), &mut mgr, SettingsScope::Global, "e2e")
-            .expect("load and apply");
-
-        assert_eq!(
-            loaded.subagents.default_model.as_deref(),
-            Some("end-to-end-model")
-        );
-        assert_eq!(
-            mgr.global().get("theme").and_then(|v| v.as_str()),
-            Some("dark"),
-            "sibling key survives"
-        );
-        let subagents = mgr.global().get("subagents").expect("subagents written");
-        assert_eq!(
-            subagents.get("defaultModel").and_then(|v| v.as_str()),
-            Some("end-to-end-model")
-        );
-    }
-
-    // -----------------------------------------------------------------------------------------
     // describe_profiles
     // -----------------------------------------------------------------------------------------
 
@@ -1282,7 +1155,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // build_profile_file: the 8-agent tier map (pi buildProfileFile, profiles.ts:385-400)
+    // build_profile_file: the 6-agent tier map (pi buildProfileFile, profiles.ts:402-415 @v0.43.0 —
+    // fourteen lines whose `agentOverrides` block names exactly six roles; `83b9872` deleted the
+    // `planner`/`context-builder` entries that made it eight at the ported baseline)
     // -----------------------------------------------------------------------------------------
 
     fn override_model(profile: &NamedProfile, agent: &str) -> Option<String> {
@@ -1293,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn build_profile_file_assigns_all_eight_builtins_to_their_tier() {
+    fn build_profile_file_assigns_all_six_builtins_to_their_tier() {
         let models = TierModels {
             cheap: "prov/cheap-1".to_string(),
             medium: "prov/medium-1".to_string(),
@@ -1301,18 +1176,15 @@ mod tests {
         };
         let profile = build_profile_file(&models);
 
-        // Exactly the 8 builtin agents, no more, no fewer.
-        assert_eq!(profile.subagents.overrides.len(), 8);
+        // Exactly the 6 tiered builtins pi's `buildProfileFile` writes @ v0.43.0
+        // (profiles.ts:402-415), no more, no fewer.
+        assert_eq!(profile.subagents.overrides.len(), 6);
 
         // scout/delegate -> cheap
         assert_eq!(override_model(&profile, "scout").as_deref(), Some("prov/cheap-1"));
         assert_eq!(override_model(&profile, "delegate").as_deref(), Some("prov/cheap-1"));
-        // planner/context-builder/researcher -> medium
-        assert_eq!(override_model(&profile, "planner").as_deref(), Some("prov/medium-1"));
-        assert_eq!(
-            override_model(&profile, "context-builder").as_deref(),
-            Some("prov/medium-1")
-        );
+        // researcher -> medium (its two former medium-tier companions, `planner` and
+        // `context-builder`, were deleted upstream in `83b9872`)
         assert_eq!(
             override_model(&profile, "researcher").as_deref(),
             Some("prov/medium-1")
@@ -1321,6 +1193,14 @@ mod tests {
         assert_eq!(override_model(&profile, "worker").as_deref(), Some("prov/strong-1"));
         assert_eq!(override_model(&profile, "reviewer").as_deref(), Some("prov/strong-1"));
         assert_eq!(override_model(&profile, "oracle").as_deref(), Some("prov/strong-1"));
+
+        // The removed roles must carry NO override at all — a profile that still pinned a model on
+        // a role that no longer exists would silently resurrect it in `settings.json`.
+        assert_eq!(override_model(&profile, "planner"), None);
+        assert_eq!(override_model(&profile, "context-builder"), None);
+        // `advisor` is an `oracle` ALIAS, not a distinct override target: `agentOverrides` is keyed
+        // by canonical name, so an `advisor` entry would never be applied to anything.
+        assert_eq!(override_model(&profile, "advisor"), None);
     }
 
     #[test]
@@ -1410,7 +1290,7 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     #[test]
-    fn generate_provider_profiles_writes_quota_and_quality_with_eight_agent_map() {
+    fn generate_provider_profiles_writes_quota_and_quality_with_the_six_agent_map() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let ranked = vec![
             "prov/cheap".to_string(),
@@ -1423,11 +1303,12 @@ mod tests {
         assert!(result.quota_path.ends_with("prov.quota.json"));
         assert!(result.quality_path.ends_with("prov.quality.json"));
 
-        // Both files are real, load back through the read-only loader, and carry all 8 agents.
+        // Both files are real, load back through the read-only loader, and carry all 6 tiered
+        // agents (8 until `83b9872` deleted `planner`/`context-builder` upstream).
         let quota = load_profile(tmp.path(), "prov.quota").expect("load quota");
         let quality = load_profile(tmp.path(), "prov.quality").expect("load quality");
-        assert_eq!(quota.subagents.overrides.len(), 8);
-        assert_eq!(quality.subagents.overrides.len(), 8);
+        assert_eq!(quota.subagents.overrides.len(), 6);
+        assert_eq!(quality.subagents.overrides.len(), 6);
         assert_eq!(
             override_model(&quota, "scout").as_deref(),
             Some(result.quota_models.cheap.as_str())
@@ -1501,6 +1382,226 @@ mod tests {
                 .and_then(|s| s.get("defaultModel"))
                 .and_then(|m| m.as_str()),
             Some("fresh")
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // G100: merge, don't replace (pi applySubagentProfile, profiles.ts:483-495)
+    // -----------------------------------------------------------------------------------------
+
+    /// `/subagents-load-profile` must not be a settings eraser. Unrelated `subagents.*` keys the
+    /// profile says nothing about — the ones a user set once and never thinks about again — have
+    /// to survive a profile switch.
+    #[test]
+    fn loading_a_profile_preserves_unrelated_subagent_settings() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let settings_path = tmp.path().join("agent").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).expect("mkdir");
+        std::fs::write(
+            &settings_path,
+            r#"{
+                "defaultModel": "openai/gpt-5",
+                "subagents": {
+                    "disableBuiltins": true,
+                    "defaultModel": "anthropic/claude-sonnet-5",
+                    "modelScope": { "enforce": true, "allow": ["anthropic/*"] },
+                    "agentOverrides": { "scout": { "model": "old" } }
+                }
+            }"#,
+        )
+        .expect("seed settings");
+
+        let profile = build_profile_file(&TierModels {
+            cheap: "openai-codex/gpt-5.3-codex-spark".to_string(),
+            medium: "openai-codex/gpt-5.4-mini".to_string(),
+            strong: "openai-codex/gpt-5.5".to_string(),
+        });
+        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        let subagents = written.get("subagents").expect("subagents block");
+
+        // Layer 1: keys the profile does not mention survive.
+        assert_eq!(
+            subagents.get("disableBuiltins"),
+            Some(&serde_json::json!(true)),
+            "a profile that says nothing about disableBuiltins must not delete it"
+        );
+        assert_eq!(
+            subagents.get("modelScope"),
+            Some(&serde_json::json!({ "enforce": true, "allow": ["anthropic/*"] })),
+            "nor silently disarm a modelScope policy"
+        );
+        // Layer 3: the profile owns the whole agent mapping — the previous profile's `scout` pin
+        // is replaced, not merged over.
+        assert_eq!(
+            subagents
+                .get("agentOverrides")
+                .and_then(|a| a.get("scout"))
+                .and_then(|s| s.get("model")),
+            Some(&serde_json::json!("openai-codex/gpt-5.3-codex-spark"))
+        );
+        // Sibling top-level keys are still untouched.
+        assert_eq!(written.get("defaultModel"), Some(&serde_json::json!("openai/gpt-5")));
+    }
+
+    /// Layer 2 in isolation: a key the profile DOES declare must WIN over the value already on
+    /// disk (pi `profiles.ts:491`: `...existing` is spread FIRST, `...profile.subagents` second).
+    ///
+    /// This is the layer that makes loading a profile mean anything at all. It is also the one the
+    /// layer-1 test above cannot prove: "the on-disk value survived" and "the profile's value won"
+    /// are opposite outcomes for a CONTESTED key, and a merge with the two spreads in the wrong
+    /// order — or with no layer-2 write at all — still passes every layer-1 and layer-3 assertion.
+    ///
+    /// Both a scalar (`defaultModel`) and a structured value (`modelScope`) are contested here, so
+    /// the assertion also covers the case where the profile's value must REPLACE the on-disk one
+    /// wholesale rather than being merged into it.
+    #[test]
+    fn a_profile_key_overrides_the_value_already_on_disk() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{
+                "subagents": {
+                    "defaultModel": "on-disk/loser",
+                    "modelScope": { "enforce": true, "allow": ["on-disk/*"] },
+                    "disableBuiltins": true
+                }
+            }"#,
+        )
+        .expect("seed settings");
+
+        let profile = NamedProfile {
+            subagents: SubagentSettings {
+                default_model: Some("profile/winner".to_string()),
+                model_scope: Some(crate::exec::model_scope::ModelScopeConfig {
+                    enforce: Some(false),
+                    allow: Some(vec!["profile/*".to_string()]),
+                }),
+                ..Default::default()
+            },
+        };
+        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        let subagents = written.get("subagents").expect("subagents block");
+
+        assert_eq!(
+            subagents.get("defaultModel"),
+            Some(&serde_json::json!("profile/winner")),
+            "a key the profile declares must beat the on-disk value — otherwise loading a profile \
+             changes nothing for any setting the user had already touched"
+        );
+        assert_eq!(
+            subagents
+                .get("modelScope")
+                .and_then(|s| s.get("allow"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1),
+            "the profile's structured value REPLACES the on-disk one; a deep merge would leave \
+             both allowlists in place"
+        );
+        assert_eq!(
+            subagents
+                .get("modelScope")
+                .and_then(|s| s.get("allow"))
+                .and_then(|a| a.get(0)),
+            Some(&serde_json::json!("profile/*")),
+            "and the surviving entry is the profile's, not the on-disk one"
+        );
+        // Layer 1 still holds alongside it — the override is targeted, not a wholesale replace.
+        assert_eq!(
+            subagents.get("disableBuiltins"),
+            Some(&serde_json::json!(true)),
+            "an uncontested key is still untouched"
+        );
+    }
+
+    /// Layer 3 in isolation: an agent the OLD profile pinned and the NEW profile does not mention
+    /// must be unpinned. A key-by-key merge of `agentOverrides` could never do this, which is why
+    /// pi assigns it unconditionally.
+    #[test]
+    fn a_profile_switch_drops_the_previous_profiles_agent_overrides() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{ "subagents": { "agentOverrides": { "retired-agent": { "model": "stale" }, "scout": { "model": "old" } } } }"#,
+        )
+        .expect("seed settings");
+
+        let profile = NamedProfile {
+            subagents: SubagentSettings {
+                overrides: [(
+                    "scout".to_string(),
+                    AgentOverrideConfig {
+                        model: OverrideField::Value("fresh".to_string()),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        };
+        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        let overrides = written
+            .get("subagents")
+            .and_then(|s| s.get("agentOverrides"))
+            .and_then(serde_json::Value::as_object)
+            .expect("agentOverrides object");
+        assert_eq!(
+            overrides.keys().collect::<Vec<_>>(),
+            vec!["scout"],
+            "the previous profile's agents must not outlive it"
+        );
+    }
+
+    /// The layer-3 edge: a profile with an EMPTY agent mapping. `SubagentSettings` serializes an
+    /// empty map to no key at all, so layer 2 contributes nothing here — only the unconditional
+    /// `agentOverrides` assignment (pi's `agentOverrides: profile.subagents.agentOverrides`, which
+    /// for a validated-but-empty profile is `{}`) clears the previous profile's pins.
+    #[test]
+    fn a_profile_with_no_agent_overrides_clears_the_previous_ones() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{ "subagents": { "disableBuiltins": true, "agentOverrides": { "scout": { "model": "old" } } } }"#,
+        )
+        .expect("seed settings");
+
+        let profile = NamedProfile {
+            subagents: SubagentSettings {
+                default_model: Some("openai/gpt-5.5".to_string()),
+                ..Default::default()
+            },
+        };
+        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        let subagents = written.get("subagents").expect("subagents block");
+        assert_eq!(
+            subagents.get("agentOverrides"),
+            Some(&serde_json::json!({})),
+            "an empty agent mapping is still the profile's mapping — it must replace, not vanish"
+        );
+        assert_eq!(
+            subagents.get("disableBuiltins"),
+            Some(&serde_json::json!(true)),
+            "and the unrelated key still survives"
         );
     }
 

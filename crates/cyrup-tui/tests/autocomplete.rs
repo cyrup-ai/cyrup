@@ -3,10 +3,11 @@
 
 use cyrup_tui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cyrup_tui::{
-    fuzzy_filter, fuzzy_match, fuzzy_score, App, ColumnLayout, EditorOutcome, InputEditor,
-    SelectItem, SelectList, UiTheme,
+    fuzzy_filter, fuzzy_match, fuzzy_score, App, Autocomplete, ColumnLayout, CommandRegistry,
+    CommandSource, EditorOutcome, InputEditor, SelectItem, SelectList, SlashCommand, UiTheme,
 };
 use ratatui::backend::TestBackend;
+use std::path::Path;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -279,4 +280,59 @@ fn mention_list_files_walks_the_tree_skipping_vcs() {
     assert!(files.contains(&"src/main.rs".to_string()), "missing nested file: {files:?}");
     assert!(files.contains(&"Cargo.toml".to_string()), "missing root file: {files:?}");
     assert!(!files.iter().any(|f| f.contains(".git")), ".git must be skipped: {files:?}");
+}
+
+// ---- S35: multi-line descriptions in the slash popup ---------------------------------------
+
+/// **S35.** `normalizeToSingleLine` (`select-list.ts:9`) —
+/// `text.replace(/[\r\n]+/g, " ").trim()` — is applied at `:98`, *inside* `SelectList.render`,
+/// before `renderItem` ever sees the description. The slash popup therefore inherits it by
+/// construction: `Autocomplete` builds a real `SelectList` (`autocomplete.rs`
+/// `slash_context`) and `App::draw` renders it through `ac.list.lines(...)`.
+///
+/// This is the property the audit doubted. The test pins it from the popup's own data path so a
+/// future refactor that gives the popup its own row builder fails here.
+#[test]
+fn slash_popup_descriptions_are_collapsed_to_one_line() {
+    let registry = CommandRegistry::with_dynamic([SlashCommand {
+        name: "review".into(),
+        // A prompt-template command whose front-matter description spans lines — the exact shape
+        // that used to inject a raw control character into the popup row.
+        description: "Review the diff\r\n\nfor correctness bugs".into(),
+        argument_hint: None,
+        source: CommandSource::Prompt,
+        has_arg_completion: false,
+    }]);
+    let ac = Autocomplete::compute(&registry, &["/review".to_string()], 0, 7, false, Path::new("."))
+        .expect("slash popup should open");
+    let theme = UiTheme::dark();
+    let lines = ac.list.lines(90, &theme);
+    let row: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(!row.contains('\n'), "no raw newline reaches the row: {row:?}");
+    assert!(!row.contains('\r'), "no raw carriage return reaches the row: {row:?}");
+    // `[\r\n]+` is one regex alternation with a `+`, so the whole run collapses to ONE space.
+    assert!(
+        row.contains("Review the diff for correctness bugs"),
+        "the run of breaks collapses to a single space: {row:?}"
+    );
+}
+
+/// The same normalization applies to `SelectList` directly, and it TRIMS the result — an
+/// all-whitespace description normalizes to `""`, which is falsy in JS, so `:149`'s two-column gate
+/// takes the single-column arm.
+#[test]
+fn select_list_normalizes_and_trims_descriptions() {
+    let list = SelectList::new(
+        vec![
+            SelectItem::new("a", Some("\n  spaced\r\n\r\nout  \n".to_string())),
+            SelectItem::new("b", Some("   \n  ".to_string())),
+        ],
+        ColumnLayout::SLASH,
+    );
+    let theme = UiTheme::dark();
+    let lines = list.lines(90, &theme);
+    let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(first.trim_end().ends_with("spaced out"), "collapsed + trimmed: {first:?}");
+    let second: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(second, "  b", "a whitespace-only description drops the second column: {second:?}");
 }

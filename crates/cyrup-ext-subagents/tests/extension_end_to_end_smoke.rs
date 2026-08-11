@@ -313,7 +313,7 @@ async fn subagent_tool_call_against_an_unknown_agent_fails_before_any_subprocess
 }
 
 /// T3 group C — a FAILED single run surfaces as a tool ERROR whose content carries the failure
-/// text (pi `formatFailedSingleRunOutput` + `isError: true`, `subagent-executor.ts:2752-2757`).
+/// text (pi `formatFailedSingleRunOutput` + `isError: true`, `subagent-executor.ts:1569-1580`).
 /// cyrup's `ToolResult` has no `isError` flag, so the faithful analogue is `Err(ToolError)` — which
 /// the runtime renders as a `tool_execution_end` with `is_error: true` carrying the message. Proven
 /// end to end: the REAL fixture child exits non-zero with detail on its real stderr pipe, and that

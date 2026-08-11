@@ -583,8 +583,8 @@ fn path_buf_import_is_reachable() {
 }
 
 // -------------------------------------------------------------------------------------------
-// R-SA-132/134: the 8 bundled builtin personas (scout, delegate, context-builder, planner,
-// researcher, reviewer, worker, oracle) are real, discoverable resources — not hardcoded Rust
+// R-SA-132/134: the 6 bundled builtin personas (scout, delegate, researcher, reviewer, worker,
+// oracle) are real, discoverable resources — not hardcoded Rust
 // strings — under this crate's own `resources/agents/` directory (the exact path
 // `extension.rs::builtin_agents_dir()` resolves at runtime via `CARGO_MANIFEST_DIR`, mirrored
 // here so this test exercises the SAME on-disk resource root the real extension uses, not a
@@ -593,15 +593,18 @@ fn path_buf_import_is_reachable() {
 // discovery pipeline (R-SA-020), end to end via `discover_agents_all`.
 // -------------------------------------------------------------------------------------------
 
-/// The 8 bundled builtin persona runtime names this crate ships, mirroring `pi-subagents/agents/
-/// {context-builder,delegate,oracle,planner,researcher,reviewer,scout,worker}.md` (func-SA
-/// §5.1 R-SA-132's exact target list). Each `.md` file's frontmatter `name:` is unqualified (no
-/// `package:` field), so per R-SA-008 the runtime name is exactly the local name.
+/// The 6 bundled builtin persona runtime names this crate ships, mirroring `pi-subagents/agents/
+/// {delegate,oracle,researcher,reviewer,scout,worker}.md` @ v0.43.0 (`git ls-tree v0.43.0 agents/`
+/// lists exactly those six). Each `.md` file's frontmatter `name:` is unqualified (no `package:`
+/// field), so per R-SA-008 the runtime name is exactly the local name.
+///
+/// `planner`/`context-builder` were deleted upstream in `83b9872` ("fix: remove stale bundled
+/// roles"). `advisor` is in `BUILTIN_AGENT_NAMES` but ships NO file of its own — upstream `34a018f`
+/// made it an `oracle` ALIAS (`agents/oracle.md:3`), so it is resolved by
+/// `discovery::resolve_agent_name`, not discovered as a seventh persona.
 const BUILTIN_PERSONA_NAMES: &[&str] = &[
-    "context-builder",
     "delegate",
     "oracle",
-    "planner",
     "researcher",
     "reviewer",
     "scout",
@@ -619,7 +622,7 @@ fn bundled_resources_dir() -> PathBuf {
 }
 
 #[test]
-fn all_eight_bundled_builtin_personas_are_discovered_with_builtin_source() {
+fn all_six_bundled_builtin_personas_are_discovered_with_builtin_source() {
     let cfg = AgentDiscoveryConfig {
         builtin_agents_dir: Some(bundled_resources_dir()),
         ..AgentDiscoveryConfig::default()
@@ -653,7 +656,7 @@ fn all_eight_bundled_builtin_personas_are_discovered_with_builtin_source() {
     assert_eq!(
         result.agents.len(),
         BUILTIN_PERSONA_NAMES.len(),
-        "exactly the 8 bundled personas should be discovered from the builtin resource root, \
+        "exactly the 6 bundled personas should be discovered from the builtin resource root, \
          found: {:?}",
         result.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>()
     );
@@ -761,4 +764,169 @@ fn delegate_persona_keeps_its_name_sensitive_defaults_when_loaded_from_the_bundl
         cyrup_ext_subagents::discovery::types::SystemPromptMode::Append
     );
     assert!(delegate.inherit_project_context);
+}
+
+// ============================================================================================
+// CROSS-CUTTING (batch 9): G97 (agent aliases) x G99 (the re-tiered builtin roster)
+// ============================================================================================
+
+/// G97 added aliases and G99 changed the roster underneath them, in the same batch. Both feed the
+/// SAME resolver, and their interaction is invisible to either group's own tests: G97's alias tests
+/// use hand-built `AgentDefinition`s, and G99's roster test walks names without ever resolving one.
+///
+/// The collision this pins is not hypothetical. G99 left `advisor` in `BUILTIN_AGENT_NAMES`
+/// (`agents.ts:38-46` @v0.43.0) while deleting `agents/advisor.md`, because upstream `34a018f`
+/// demoted it to an ALIAS on `oracle` (`agents/oracle.md:3`). So one entry of the roster is
+/// resolvable ONLY through the machinery G97 introduced — if aliases regress, or if a future roster
+/// edit reinstates an `advisor` file, the name either stops resolving or resolves ambiguously, and
+/// nothing else in the suite would notice.
+///
+/// Asserted against the REAL bundled `resources/agents/`, not a fixture, so a stray alias added to
+/// a shipped persona is caught here.
+#[test]
+fn no_bundled_alias_can_collide_with_a_builtin_name_or_another_alias() {
+    use cyrup_ext_subagents::discovery::{AgentNameResolution, resolve_agent_name};
+
+    let cfg = AgentDiscoveryConfig {
+        builtin_agents_dir: Some(bundled_resources_dir()),
+        ..AgentDiscoveryConfig::default()
+    };
+    let agents = discover_agents_all(&cfg)
+        .expect("builtin-only discovery succeeds")
+        .agents;
+
+    // 1. No alias may equal any agent's NAME. Stage 2 of `resolveAgentName` (`agents.ts:513-524`)
+    //    matches names before aliases and never falls through when it hits, so such an alias would
+    //    be permanently dead — silently unreachable rather than an error.
+    for agent in &agents {
+        for alias in &agent.aliases {
+            assert!(
+                !agents.iter().any(|other| other.name == *alias),
+                "alias '{alias}' on '{}' is shadowed forever by the agent actually named '{alias}'",
+                agent.name
+            );
+        }
+    }
+
+    // 2. No two agents may claim the same alias — that is `Ambiguous agent alias` (`agents.ts:526`),
+    //    which fails the run rather than picking a winner.
+    let mut claimed: Vec<(&str, &str)> = Vec::new();
+    for agent in &agents {
+        for alias in &agent.aliases {
+            if let Some((other, _)) = claimed.iter().find(|(a, _)| *a == alias.as_str()) {
+                panic!("alias '{alias}' is claimed by both '{other}' and '{}'", agent.name);
+            }
+            claimed.push((alias.as_str(), agent.name.as_str()));
+        }
+    }
+
+    // 3. EVERY name the roster advertises must resolve to exactly one agent — including `advisor`,
+    //    which ships no file and is reachable only as `oracle`'s alias.
+    for name in cyrup_ext_subagents::discovery::management::BUILTIN_AGENT_NAMES {
+        match resolve_agent_name(name, &agents) {
+            AgentNameResolution::Found(agent) => {
+                if name == "advisor" {
+                    assert_eq!(
+                        agent.name, "oracle",
+                        "`advisor` ships no file of its own; it must resolve through oracle's alias"
+                    );
+                } else {
+                    assert_eq!(agent.name, name, "roster name '{name}' must resolve to itself");
+                }
+            }
+            AgentNameResolution::NotFound => {
+                panic!("roster advertises '{name}' but it resolves to nothing")
+            }
+            AgentNameResolution::Ambiguous(msg) => {
+                panic!("roster name '{name}' is ambiguous: {msg}")
+            }
+        }
+    }
+
+    // 4. The roles G99 removed must not resolve by name OR by any surviving alias — a deleted role
+    //    that is still reachable is exactly the stale-roster state `83b9872` set out to end.
+    for gone in ["planner", "context-builder"] {
+        assert!(
+            matches!(resolve_agent_name(gone, &agents), AgentNameResolution::NotFound),
+            "removed role '{gone}' must not resolve at all"
+        );
+    }
+}
+
+/// The other half of the same seam: a real agent named `x` must beat another agent's alias `x`
+/// (`agents.ts:513-524` — stage 3 never runs when stage 2 matched), and a SECOND claimant of a
+/// shipped alias must produce the ambiguity refusal rather than a silent pick.
+///
+/// Driven against the real bundled roster plus one project-scope agent, because that is how the
+/// collision actually arises: a user adds an agent whose name or alias happens to be one the
+/// shipped personas already use.
+#[test]
+fn a_user_agent_named_after_a_bundled_alias_wins_and_a_second_claimant_is_refused() {
+    use cyrup_ext_subagents::discovery::{AgentNameResolution, resolve_agent_name};
+
+    let cfg = AgentDiscoveryConfig {
+        builtin_agents_dir: Some(bundled_resources_dir()),
+        ..AgentDiscoveryConfig::default()
+    };
+    let mut agents = discover_agents_all(&cfg)
+        .expect("builtin-only discovery succeeds")
+        .agents;
+
+    // Baseline: `advisor` is oracle's alias today.
+    assert_eq!(
+        resolve_agent_name("advisor", &agents)
+            .agent()
+            .expect("advisor resolves")
+            .name,
+        "oracle"
+    );
+
+    // A project agent literally NAMED `advisor` takes the name back — the alias never shadows it.
+    let mut named_advisor = agents
+        .iter()
+        .find(|a| a.name == "scout")
+        .expect("scout is bundled")
+        .clone();
+    named_advisor.name = "advisor".to_string();
+    named_advisor.local_name = "advisor".to_string();
+    named_advisor.aliases = Vec::new();
+    agents.push(named_advisor);
+
+    assert_eq!(
+        resolve_agent_name("advisor", &agents)
+            .agent()
+            .expect("the real `advisor` agent resolves")
+            .name,
+        "advisor",
+        "an agent NAMED advisor must beat oracle's ALIAS advisor"
+    );
+
+    // And a second agent claiming the same alias is refused, not silently won.
+    let mut second_claimant = agents
+        .iter()
+        .find(|a| a.name == "delegate")
+        .expect("delegate is bundled")
+        .clone();
+    second_claimant.name = "seer".to_string();
+    second_claimant.local_name = "seer".to_string();
+    second_claimant.aliases = vec!["sage".to_string()];
+    let mut oracle_also_sage = agents
+        .iter()
+        .find(|a| a.name == "oracle")
+        .expect("oracle is bundled")
+        .clone();
+    oracle_also_sage.aliases = vec!["sage".to_string()];
+    agents.retain(|a| a.name != "oracle");
+    agents.push(oracle_also_sage);
+    agents.push(second_claimant);
+
+    match resolve_agent_name("sage", &agents) {
+        AgentNameResolution::Ambiguous(msg) => {
+            assert!(
+                msg.starts_with("Ambiguous agent alias 'sage'"),
+                "must be the ALIAS ambiguity message, got: {msg}"
+            );
+        }
+        other => panic!("two claimants of alias 'sage' must be refused, got {other:?}"),
+    }
 }

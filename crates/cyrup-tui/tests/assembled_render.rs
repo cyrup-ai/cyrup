@@ -6,15 +6,18 @@
 //! - the inline live region is **content-sized** and pinned at the bottom, not the whole screen
 //!   (audit #1: `app.rs` viewport + `Min(1)→Min(0)`);
 //! - the footer shows the seeded model + data, never a permanent `no-model` (audit #2/#5);
-//! - the editor body row shows the accent prompt glyph `›` + a reverse-video soft cursor every idle
-//!   frame (audit #3);
+//! - the editor body row shows a reverse-video soft cursor every idle frame (audit #3) and carries
+//!   NO prompt glyph — pi's `Editor.render` emits none (E1, `editor.ts:482-601`);
 //! - routing holds — Ctrl+D does not quit a non-empty buffer, Esc dismisses an open popup instead of
 //!   aborting (audit #4);
 //! - the tool-execution surface is the spec block with a state bg tint (audit #6/#7).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use cyrup_tui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cyrup_tui::{App, AppAction, InputEvent, UiTheme};
+use cyrup_tui::{
+    App, AppAction, ConfigKind, ConfigRow, ConfigScope, ConfigSelector, InputEvent, SelectorKind,
+    UiTheme,
+};
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 
@@ -89,8 +92,15 @@ fn assembled_no_model_empty_is_usable_not_a_void_at_100x30() {
     app.draw().unwrap();
 
     // (#1) The live region is content-sized and small — NOT the ~26-blank-row void the audit found.
-    // Empty turn: 1 startup-hint row + 3 editor rows + 2 footer rows = 6 rows, pinned at the bottom.
-    assert_eq!(app.viewport_height(), 6, "live region not content-sized:\n{}", buf_text(&app));
+    // Empty turn: 6 startup-hint rows + 3 editor rows + 2 footer rows = 11 rows, pinned at the
+    // bottom. The hint block is 6 rows at this width because pi frames its startup `ExpandableText`
+    // with a `Spacer(1)` on each side (v0.84.1 `interactive-mode.ts:960-962`) and the collapsed body
+    // is FIVE parts — `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`
+    // (`:952`) — of which cyrup draws the last four: 1 + (1 + 1 + 1 + 1) + 1.
+    //
+    // Longest row is `onboarding` at 91 columns; the block's content width is `width - paddingX * 2`
+    // = 98 (`text.ts:64`), so nothing wraps here. See the sibling test for the widths where it does.
+    assert_eq!(app.viewport_height(), 11, "live region not content-sized:\n{}", buf_text(&app));
     assert!(
         blank_rows(&app) >= 20,
         "the live region ballooned into a void (too few blank scrollback rows):\n{}",
@@ -105,9 +115,15 @@ fn assembled_no_model_empty_is_usable_not_a_void_at_100x30() {
     );
 
     let live = live_text(&app);
-    // (#3) The editor body row shows the accent prompt glyph + a reverse-video soft cursor.
-    assert!(live.contains('›'), "editor prompt glyph `›` missing from live region:\n{live}");
+    // (#3) The editor body row shows a reverse-video soft cursor — the ONLY caret pi's editor
+    // draws (`editor.ts:558,563`). E1: and no prompt glyph. `Editor.render` (`editor.ts:482-601`)
+    // pushes `${leftPadding}${displayText}${padding}${lineRightPadding}` (`:578`) and nothing else;
+    // the chat editor is a bare `new CustomEditor(...)` (`interactive-mode.ts:563-566`) whose class
+    // overrides `handleInput` only (`components/custom-editor.ts`, no `render`). The `›` upstream
+    // does draw is the SELECTED-ROW cursor of the list selectors (`session-selector.ts:476`,
+    // `tree-selector.ts:689`, `user-message-selector.ts:57`) — a different component entirely.
     assert!(live_has_reversed(&app), "editor soft cursor (reverse cell) missing:\n{live}");
+    assert!(!live.contains('\u{203a}'), "E1: pi's editor draws no prompt glyph:\n{live}");
     // The editor's two `─` rules frame the body row.
     assert!(live.contains('─'), "editor rules missing from live region:\n{live}");
     // (#2) With nothing seeded the footer is Pi's literal `no-model` (never blank, never invented).
@@ -118,12 +134,21 @@ fn assembled_no_model_empty_is_usable_not_a_void_at_100x30() {
 
 #[test]
 fn assembled_no_model_empty_is_usable_at_other_sizes() {
-    for (w, h) in [(60u16, 20u16), (120, 40), (80, 24)] {
+    // The expected height is `hint block + 3 editor + 2 footer`, and the hint block GROWS as the
+    // terminal narrows because pi's `Text.render` wraps at `contentWidth = width - paddingX * 2`
+    // (`tui/src/components/text.ts:64-67`) instead of clipping. The three text rows are 79
+    // (`compactInstructions`), 60 (`compactOnboarding`) and 91 (`onboarding`) columns wide, plus
+    // three blanks that never wrap:
+    //
+    //   w=120 → content 118: 1 + 1 + 1 rows + 3 blanks =  6 → 11
+    //   w=80  → content  78: 2 + 1 + 2 rows + 3 blanks =  8 → 13   (79 > 78, 91 > 78)
+    //   w=60  → content  58: 2 + 2 + 2 rows + 3 blanks =  9 → 14   (60 > 58 as well)
+    for (w, h, want) in [(60u16, 20u16, 14u16), (120, 40, 11), (80, 24, 13)] {
         let mut app = App::new(TestBackend::new(w, h), UiTheme::dark()).unwrap();
         app.draw().unwrap();
-        assert_eq!(app.viewport_height(), 6, "live region not content-sized at {w}x{h}");
+        assert_eq!(app.viewport_height(), want, "live region not content-sized at {w}x{h}");
         let live = live_text(&app);
-        assert!(live.contains('›'), "prompt glyph missing at {w}x{h}:\n{live}");
+        assert!(!live.contains('\u{203a}'), "E1: no editor prompt glyph at {w}x{h}:\n{live}");
         assert!(live.contains("no-model"), "footer missing at {w}x{h}:\n{live}");
         assert!(live_has_reversed(&app), "soft cursor missing at {w}x{h}");
     }
@@ -168,11 +193,14 @@ fn assembled_model_and_transcript_renders_footer_model_and_active_turn() {
     // The active streaming turn renders inline in the live region.
     assert!(live.contains("I'll start by reading"), "active turn missing from live region:\n{live}");
     // Committed history is in native scrollback, not the live region (ADR-0001 / audit #1).
-    assert!(app.scrollback_text().contains("you: refactor the auth module"), "user not flushed");
+    // X1: no `you: ` label — `user-message.ts:38-58` renders the body only.
+    assert!(app.scrollback_text().contains("refactor the auth module"), "user not flushed");
+    assert!(!app.scrollback_text().contains("you:"), "invented `you: ` label in scrollback");
     assert!(!live.contains("refactor the auth module"), "committed user leaked into live region:\n{live}");
-    // The editor is still present + usable beneath the active turn.
-    assert!(live.contains('›'), "editor prompt missing with a transcript:\n{live}");
+    // The editor is still present + usable beneath the active turn: its caret is the reverse-video
+    // cell, and (E1) it carries no prompt glyph.
     assert!(live_has_reversed(&app), "editor soft cursor missing with a transcript");
+    assert!(!live.contains('\u{203a}'), "E1: no editor prompt glyph with a transcript:\n{live}");
 }
 
 #[test]
@@ -214,23 +242,40 @@ fn assembled_completion_popup_open_dismisses_on_esc_not_abort() {
     assert!(!app.editor_mut().autocomplete_open(), "Esc did not close the completion popup");
 }
 
+/// S36 — assembled: `/hotkeys` lands in scrollback with the [`Entry::Block`] envelope pi builds
+/// (interactive-mode.ts:6197-6203). The `─` rules run edge to edge while the title and the markdown
+/// body are inset by ONE column (`Text(…, 1, 0)` / `Markdown(…, 1, 1)`), and the body carries a blank
+/// row on each side of it (`paddingY = 1`, `markdown.ts:352-361`).
 #[test]
-fn assembled_hotkeys_overlay_opens_and_dismisses_on_esc() {
+fn assembled_hotkeys_block_lands_in_scrollback_with_pi_envelope() {
     let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
     app.editor_mut().set_text("/hotkeys");
     app.handle_input(&key(KeyCode::Enter));
-    assert!(app.overlay_open(), "hotkeys overlay did not open");
-    // (#1) The viewport expands to full height so the modal can float over the live region.
+    assert!(!app.overlay_open(), "/hotkeys must not open an overlay");
     app.draw().unwrap();
-    assert_eq!(app.viewport_height(), 30, "overlay should expand the viewport to full height");
-    let screen = buf_text(&app);
-    assert!(screen.contains("Keyboard Shortcuts"), "overlay title missing:\n{screen}");
-    assert!(screen.contains("Send message"), "overlay shortcut list missing:\n{screen}");
-
-    // (#4) Esc dismisses the overlay (Redraw), never leaks to the editor / aborts.
-    let action = app.handle_input(&key(KeyCode::Esc));
-    assert_eq!(action, AppAction::Redraw, "Esc should close the overlay");
-    assert!(!app.overlay_open(), "Esc did not close the overlay");
+    let text = app.scrollback_text();
+    let rows: Vec<&str> = text.lines().collect();
+    let rule = "─".repeat(100);
+    let top = rows
+        .iter()
+        .position(|r| r.trim_end() == rule)
+        .expect("opening DynamicBorder rule");
+    // Spacer(1) above the opening rule.
+    assert!(top >= 1 && rows[top - 1].trim().is_empty(), "Spacer(1) precedes the rule:\n{text}");
+    // Text(bold accent title, paddingX 1) — inset one column, NOT flush left.
+    assert_eq!(rows[top + 1], " Keyboard Shortcuts", "title row:\n{text}");
+    // Spacer(1), then Markdown's own paddingY blank, then the body.
+    assert!(rows[top + 2].trim().is_empty(), "Spacer(1) after the title:\n{text}");
+    assert!(rows[top + 3].trim().is_empty(), "Markdown paddingY blank:\n{text}");
+    assert!(rows[top + 4].starts_with(' '), "body inset by paddingX 1:\n{text}");
+    // The closing rule is preceded by the trailing paddingY blank.
+    let bottom = rows
+        .iter()
+        .rposition(|r| r.trim_end() == rule)
+        .expect("closing DynamicBorder rule");
+    assert!(bottom > top, "two distinct rules:\n{text}");
+    assert!(rows[bottom - 1].trim().is_empty(), "trailing paddingY blank:\n{text}");
+    assert!(text.contains("Send message"), "shortcut list missing:\n{text}");
 }
 
 // -------------------------------------- state 4: long single-paragraph PROSE-WRAP (no void) ----
@@ -254,8 +299,10 @@ fn long_single_paragraph() -> String {
     para
 }
 
+/// The name says "no caret" on purpose: this test asserts the ABSENCE of `▌` (X1), so a name
+/// promising caret coverage would read as the opposite of what it checks.
 #[test]
-fn assembled_long_streaming_paragraph_shows_newest_text_and_caret_and_grows() {
+fn assembled_long_streaming_paragraph_shows_newest_text_and_grows_without_a_caret() {
     let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
     app.status_mut().set_model("anthropic/claude-opus-4-8");
     // Stream the whole paragraph as one delta (no hard newlines): one logical `Line`, many wrapped
@@ -278,10 +325,14 @@ fn assembled_long_streaming_paragraph_shows_newest_text_and_caret_and_grows() {
         live.contains("OMEGAEND"),
         "newest text (last sentence) missing from live region — PROSE-WRAP truncation:\n{live}"
     );
-    // (a) The `▌` stream caret trails the newest grapheme and is visible.
-    assert!(live.contains('▌'), "stream caret `▌` missing from live region:\n{live}");
-    // Sanity: the accent label + some earlier text render too (it is the whole paragraph, wrapped).
-    assert!(live.contains("assistant:"), "assistant label missing:\n{live}");
+    // (a) X1: pi draws NO streaming caret — the only caret in the TUI is the editor's reverse-video
+    // cell (`editor.ts:545-564`), and `git grep "▌" v0.84.1 -- packages/` finds one hit, the pupil of
+    // an eye in `examples/extensions/custom-header.ts:22`.
+    assert!(!live.contains('▌'), "invented stream caret `▌` in live region:\n{live}");
+    // X1: and no `assistant: ` label (`assistant-message.ts:104-114` is the Markdown body alone).
+    assert!(!live.contains("assistant:"), "invented assistant label:\n{live}");
+    // Sanity: earlier text renders too (it is the whole paragraph, wrapped).
+    assert!(live.contains("Sentence 1 adds"), "earlier text missing:\n{live}");
 }
 
 #[test]
@@ -343,3 +394,74 @@ fn assembled_backslash_enter_soft_newline_routes_as_edit_not_submit() {
     assert_eq!(action, AppAction::Submit("foo".to_string()), "plain Enter should submit");
 }
 
+
+
+// --------------------------------------------------------- the per-frame terminal height --------
+
+/// **U6.** `App::draw` publishes the SCREEN height to the open selector on every frame, and a
+/// selector that windows its own body must resize with it.
+///
+/// Pi feeds `ui.terminal.rows` into `ConfigSelectorComponent` (`cli/config-selector.ts:47`), which
+/// becomes `this.maxVisible = Math.max(5, (terminalHeight ?? 24) - chrome)`
+/// (`config-selector.ts:264-266`) and slices the body at `:405-409`. `Selector::set_terminal_height`
+/// is cyrup's port of that input, and until now the ONLY caller was the standalone
+/// `startup_selector` loop — so a selector opened inside the running app kept the `?? 24` default
+/// forever, no matter how tall the terminal was.
+///
+/// Assembled on purpose: the whole claim is about `App::draw` making the call, so a direct
+/// `sel.set_terminal_height(60)` would test the thing that already worked.
+#[test]
+fn an_open_selector_is_told_the_terminals_height_on_every_frame() {
+    // 40 resources ⇒ 40 body rows once the terminal allows them. A 24-row default allows only
+    // `24 - 7 = 17`.
+    let rows: Vec<ConfigRow> = (0..40)
+        .map(|i| ConfigRow {
+            scope: ConfigScope::User,
+            kind: ConfigKind::Skills,
+            display_name: format!("res-{i:02}"),
+            pattern: format!("skills/res-{i:02}"),
+            base_dir: "/home/me/.cyrup".to_string(),
+            enabled: true,
+        })
+        .collect();
+
+    let mut app = App::new(TestBackend::new(80, 60), UiTheme::dark()).unwrap();
+    app.open_boxed_selector(SelectorKind::Settings, Box::new(ConfigSelector::new(rows)));
+    app.draw().unwrap();
+
+    let screen = buf_text(&app);
+    let shown = (0..40).filter(|i| screen.contains(&format!("res-{i:02}"))).count();
+    assert_eq!(
+        shown, 40,
+        "U6: on a 60-row terminal the body window is `60 - 7 = 53` rows, so all 40 resources are          on screen; a hardcoded 24 shows 17 of them:\n{screen}"
+    );
+    assert!(screen.contains("res-39"), "the LAST resource, the one a 24-row window drops");
+}
+
+/// MIRROR of U6. The window really is DERIVED from the terminal, in both directions: the same
+/// selector on a 24-row terminal is windowed at `24 - 7 = 17` body rows, so the tail is off-screen.
+/// Without the pairing, "shows all 40" would be satisfied by a selector that windows at nothing.
+#[test]
+fn the_same_selector_is_windowed_on_a_short_terminal() {
+    let rows: Vec<ConfigRow> = (0..40)
+        .map(|i| ConfigRow {
+            scope: ConfigScope::User,
+            kind: ConfigKind::Skills,
+            display_name: format!("res-{i:02}"),
+            pattern: format!("skills/res-{i:02}"),
+            base_dir: "/home/me/.cyrup".to_string(),
+            enabled: true,
+        })
+        .collect();
+
+    let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+    app.open_boxed_selector(SelectorKind::Settings, Box::new(ConfigSelector::new(rows)));
+    app.draw().unwrap();
+
+    let screen = buf_text(&app);
+    assert!(screen.contains("res-00"), "the head of the list is on screen:\n{screen}");
+    assert!(
+        !screen.contains("res-39"),
+        "a 24-row terminal cannot show 40 body rows:\n{screen}"
+    );
+}

@@ -2,7 +2,7 @@
 //!
 //! This module is the Rust port of pi's `runs/background/run-status.ts` `inspectSubagentStatus`
 //! (`run-status.ts:101-273`) and the `async-status.ts` `listAsyncRuns`/`formatAsyncRunList`
-//! no-id "list active runs" shape it delegates to (`async-status.ts:223-338`). It owns the
+//! no-id "list active runs" shape it delegates to (`async-status.ts:366-537`). It owns the
 //! *rendering* half of the `status` action; the *acting* control ops (`interrupt`/`resume`/
 //! `append-step`) live in [`super::control`]. `extension.rs`'s control-action dispatch arms route
 //! into both.
@@ -18,7 +18,7 @@
 //! run identity/state/mode/progress, pending-append count, start/update timestamps, per-step
 //! agent+state(+model+error) lines, the reconciliation-repaired terminal `Result:` reference, the
 //! `Log`/`Events` artifact references, and — for a non-running run — the exact
-//! `formatResumeGuidance` shape (`run-status.ts:36-50`) an LLM reads to revive a child. Nested
+//! `formatResumeGuidance` shape (`run-status.ts:51-66`) an LLM reads to revive a child. Nested
 //! descendants, activity labels, and parallel-group step-index nesting are omitted here (they have
 //! no source fields), documented rather than silently faked.
 //!
@@ -39,7 +39,8 @@ use super::{RunId, RunMode, RunPaths, RunState, RunStatus, StepState, StepStatus
 // =================================================================================================
 
 /// The lowercase state string pi renders (`AsyncStatus.state`): `queued`/`running`/`paused`/
-/// `complete`/`failed`.
+/// `complete`/`failed`/`stopped` (`async-status.ts:69` @v0.43.0 declares exactly this union, minus
+/// the unported `rejected` checkpoint state).
 pub(crate) fn run_state_label(state: RunState) -> &'static str {
     match state {
         RunState::Queued => "queued",
@@ -47,11 +48,14 @@ pub(crate) fn run_state_label(state: RunState) -> &'static str {
         RunState::Paused => "paused",
         RunState::Complete => "complete",
         RunState::Failed => "failed",
+        // G77: its own word, never `"failed"` — every upstream reader that renders a run's state
+        // for a human prints `"stopped"` verbatim (`run-status.ts:478-479`, `notify.ts:210`).
+        RunState::Stopped => "stopped",
     }
 }
 
 /// The lowercase mode string pi renders (`SubagentRunMode`): `single`/`parallel`/`chain`.
-fn run_mode_label(mode: RunMode) -> &'static str {
+pub(crate) fn run_mode_label(mode: RunMode) -> &'static str {
     match mode {
         RunMode::Single => "single",
         RunMode::Parallel => "parallel",
@@ -60,26 +64,28 @@ fn run_mode_label(mode: RunMode) -> &'static str {
 }
 
 /// The lowercase per-step status string pi renders (`AsyncJobStep.status`).
-fn step_state_label(state: StepState) -> &'static str {
+pub(crate) fn step_state_label(state: StepState) -> &'static str {
     match state {
         StepState::Pending => "pending",
         StepState::Running => "running",
         StepState::Paused => "paused",
         StepState::Complete => "complete",
         StepState::Failed => "failed",
+        // G77 — pi `step.status = "stopped"` (`subagent-runner.ts:2967`).
+        StepState::Stopped => "stopped",
     }
 }
 
 // =================================================================================================
-// Progress + step-line labels (`run-status.ts:52-63`, `async-status.ts:289-308`)
+// Progress + step-line labels (`run-status.ts:63-75`, `async-status.ts:486-505`)
 // =================================================================================================
 
-/// The one-line progress label (pi `formatAsyncRunProgressLabel`, `async-status.ts:289-308`),
+/// The one-line progress label (pi `formatAsyncRunProgressLabel`, `async-status.ts:486-505`),
 /// rendered from the fields cyrup's [`RunStatus`] carries. pi's parallel-group normalization and
 /// per-group `formatParallelOutcome` are approximated here by cyrup's own step list: for a parallel
 /// run, the count of terminal steps over the total; for a chain, the logical step cursor over
 /// `chain_step_count`; otherwise the step cursor over the flat step count.
-fn progress_label(status: &RunStatus) -> String {
+pub(crate) fn progress_label(status: &RunStatus) -> String {
     let step_count = status.steps.len().max(1);
     let chain_step_count = status.chain_step_count.unwrap_or(step_count);
     match status.mode {
@@ -102,7 +108,7 @@ fn progress_label(status: &RunStatus) -> String {
     }
 }
 
-/// The per-step line prefix (pi `stepLineLabel`, `run-status.ts:52-63`): `Agent i/N` for a
+/// The per-step line prefix (pi `stepLineLabel`, `run-status.ts:63-75`): `Agent i/N` for a
 /// standalone parallel run, `Step i/N` for a chain, bare `Step i` for a single run. pi's
 /// parallel-group-aware `Step X/Y Agent A/B` nesting inside a chain is flattened here to the
 /// enclosing `Step i/N` (cyrup does not yet carry the per-group step-index projection that nesting
@@ -120,21 +126,54 @@ fn step_line_label(status: &RunStatus, index: usize) -> String {
 }
 
 // =================================================================================================
-// Resume guidance (`run-status.ts:36-50`)
+// Resume guidance (`run-status.ts:51-66`)
 // =================================================================================================
 
+/// G90: pi `formatSteeringSummary` (`run-status.ts:88-93` @v0.43.0) — `"3 steers, last
+/// 2026-08-10T12:00:00.000Z"`, with either half omitted when unknown and `None` when neither is.
+fn format_steering_summary(steer_count: Option<u64>, last_steer_at: Option<i64>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(count) = steer_count {
+        parts.push(format!("{count} steer{}", if count == 1 { "" } else { "s" }));
+    }
+    if let Some(at) = last_steer_at {
+        parts.push(format!("last {}", format_iso8601_millis(at)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+/// pi's verbatim resume-guidance line for a STOPPED run (`run-status.ts:52` @v0.43.0). Public so
+/// the `status`-action renderer, the `resume` refusal path and their tests all assert the one
+/// string rather than three drifting copies.
+pub const STOPPED_NOT_RESUMABLE_GUIDANCE: &str =
+    "Resume: unavailable; stopped runs are not resumable. Start a new run instead.";
+
 /// Whether `session_file` points at an on-disk file that currently exists (pi's
-/// `hasExistingSessionFile`, `run-status.ts:32-34`).
+/// `hasExistingSessionFile`, `run-status.ts:42-44`).
 fn session_file_exists(session_file: &Option<PathBuf>) -> bool {
     session_file.as_ref().is_some_and(|path| path.exists())
 }
 
 /// The `Resume:`/`Revive:` guidance line for a non-running run (pi `formatResumeGuidance`,
-/// `run-status.ts:36-50`). Every cyrup [`StepStatus`] carries a known agent, so the "known child"
+/// `run-status.ts:51-66`). Every cyrup [`StepStatus`] carries a known agent, so the "known child"
 /// filter is trivially every step; the branch structure otherwise mirrors pi exactly:
 /// single-child-with-transcript → whole-run `Revive`, else first child with a transcript →
 /// `Revive child` with its index, else the unavailable notice.
-fn format_resume_guidance(run_id: &str, steps: &[StepStatus]) -> String {
+///
+/// G77 — `stopped` short-circuits BEFORE every other branch, exactly as upstream's own first line
+/// does (`run-status.ts:51-52` @v0.43.0: `if (options.stopped) return "Resume: unavailable;
+/// stopped runs are not resumable. Start a new run instead.";`). A stopped run's children may well
+/// have persisted session files, so without this guard the function would happily hand the model a
+/// `Revive:` line for a run [`super::control::resume`] is required to refuse
+/// (`async-resume.ts:406`).
+fn format_resume_guidance(run_id: &str, steps: &[StepStatus], stopped: bool) -> String {
+    if stopped {
+        return STOPPED_NOT_RESUMABLE_GUIDANCE.to_string();
+    }
     let unavailable = "Resume: unavailable; no child session file was persisted.".to_string();
     if run_id.is_empty() || steps.is_empty() {
         return unavailable;
@@ -169,7 +208,7 @@ fn format_resume_guidance(run_id: &str, steps: &[StepStatus]) -> String {
 /// (`YYYY-MM-DDTHH:MM:SS.mmmZ`), matching pi's `new Date(ms).toISOString()` output shape. Pure
 /// arithmetic (Howard Hinnant's proleptic-Gregorian `civil_from_days`), so it needs no date-time
 /// dependency and cannot panic.
-fn format_iso8601_millis(ms: i64) -> String {
+pub(crate) fn format_iso8601_millis(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
     let days = secs.div_euclid(86_400);
@@ -208,6 +247,16 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("Run: {}", status.run_id));
+    // pi `run-status.ts:373-385` @v0.43.0: the DURABLE MISSION this run is bound to, read back
+    // from the `mission.json` binding its own async dir carries, rendered immediately after
+    // `Run:` and omitted entirely when the run has no mission. An unreadable/invalid binding is a
+    // WARNING appended to the report (`nestedWarning`), never a failure of the status report
+    // itself.
+    match crate::missions::read_mission_binding(&paths.run_dir) {
+        Ok(Some(binding)) => lines.push(format!("Mission: {}", binding.mission_id)),
+        Ok(None) => {}
+        Err(e) => lines.push(format!("Warning: Mission binding unavailable: {e}")),
+    }
     lines.push(format!("State: {}", run_state_label(status.state)));
     lines.push(format!("Mode: {}", run_mode_label(status.mode)));
     lines.push(format!("Progress: {}", progress_label(status)));
@@ -234,12 +283,24 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
             .as_ref()
             .map(|error| format!(", error: {error}"))
             .unwrap_or_default();
+        // G90: pi's `steeringSuffix` (`run-status.ts:413,419` @v0.43.0), between the activity text
+        // and the error text. This is what makes an `action: "steer"` VISIBLE: without it the tool
+        // would report "Steering queued" and the status report would look identical whether the
+        // runner accepted the request or dropped it.
+        let steering_text = format_steering_summary(
+            step.telemetry.steer_count,
+            step.telemetry.last_steer_at,
+        );
+        let steering_suffix = steering_text
+            .map(|text| format!(", steering: {text}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "{}: {} {}{}{}",
+            "{}: {} {}{}{}{}",
             step_line_label(status, index),
             step.agent,
             step_state_label(step.status),
             model_text,
+            steering_suffix,
             error_text
         ));
         let step_log = paths.step_output_log(index);
@@ -249,7 +310,15 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
     }
 
     if status.state != RunState::Running {
-        lines.push(format_resume_guidance(status.run_id.as_str(), &status.steps));
+        lines.push(format_resume_guidance(
+            status.run_id.as_str(),
+            &status.steps,
+            // G77 — pi `formatResumeGuidance(…, { stopped: status.state === "stopped" ||
+            // status.stopped === true })` (`run-status.ts:445`). cyrup carries the stop verdict on
+            // `state` alone (no redundant `stopped` boolean on `RunStatus`), so this is the whole
+            // predicate.
+            status.state == RunState::Stopped,
+        ));
     }
     if paths.run_log_md.exists() {
         lines.push(format!("Log: {}", paths.run_log_md.display()));
@@ -285,7 +354,7 @@ async fn inspect_paths(paths: &RunPaths) -> Result<Option<String>, SubagentError
 ///
 /// Returns [`SubagentError::UnsafePathToken`] if `selector` fails the R-SA-087 safe-token gate, or
 /// [`SubagentError::AmbiguousRunId`] if a prefix matches more than one run directory.
-async fn resolve_run_id(
+pub(crate) async fn resolve_run_id(
     async_root: &Path,
     results_dir: &Path,
     selector: &str,
@@ -356,6 +425,59 @@ pub async fn inspect_status_by_id(
     inspect_paths(&paths).await
 }
 
+/// G92: the same id resolution + R-SA-079 reconciliation [`inspect_status_by_id`] performs, but
+/// handing back the reconciled [`RunStatus`] and its [`RunPaths`] instead of a rendered report — so
+/// `view: "transcript"` can render a DIFFERENT view over the identical, identically-gated snapshot
+/// rather than re-reading `status.json` behind the reconciliation.
+///
+/// # Errors
+///
+/// Propagates safe-token/ambiguity resolution errors and genuine reconciliation I/O failures.
+pub async fn reconcile_by_id(
+    async_root: &Path,
+    results_dir: &Path,
+    selector: &str,
+) -> Result<Option<(RunStatus, RunPaths)>, SubagentError> {
+    let Some(run_id) = resolve_run_id(async_root, results_dir, selector).await? else {
+        return Ok(None);
+    };
+    reconcile_paths(RunPaths::for_run(async_root, results_dir, &run_id)).await
+}
+
+/// G92: [`reconcile_by_id`]'s `dir`-addressed twin, mirroring [`inspect_status_by_dir`].
+///
+/// # Errors
+///
+/// Returns [`SubagentError::UnsafePathToken`] if `async_dir` has no usable basename, or propagates
+/// a genuine reconciliation I/O failure.
+pub async fn reconcile_by_dir(
+    async_dir: &Path,
+    results_dir: &Path,
+) -> Result<Option<(RunStatus, RunPaths)>, SubagentError> {
+    let run_id = async_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| RunId::from_token(name.to_string()))
+        .ok_or_else(|| {
+            SubagentError::UnsafePathToken(format!(
+                "async dir has no run-id basename: {}",
+                async_dir.display()
+            ))
+        })?;
+    let async_root = async_dir.parent().unwrap_or(async_dir);
+    reconcile_paths(RunPaths::for_run(async_root, results_dir, &run_id)).await
+}
+
+/// [`inspect_paths`]'s snapshot-returning twin: same reconciliation gate, same "neither file
+/// exists" → `Ok(None)` mapping, no rendering.
+async fn reconcile_paths(paths: RunPaths) -> Result<Option<(RunStatus, RunPaths)>, SubagentError> {
+    match reconcile_before_control_op(&paths).await {
+        Ok(status) => Ok(Some((status, paths))),
+        Err(SubagentError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The `status` action's by-`dir` form (pi `resolveAsyncRunLocation`, `run-status.ts:142`): render
 /// the run whose async directory is `async_dir` directly, deriving its sibling result file from
 /// `results_dir` and the directory's own basename. Returns `Ok(None)` when neither status nor
@@ -385,7 +507,7 @@ pub async fn inspect_status_by_dir(
 }
 
 // =================================================================================================
-// No-id "list active runs" (`listAsyncRuns`/`formatAsyncRunList`, async-status.ts:223-338)
+// No-id "list active runs" (`listAsyncRuns`/`formatAsyncRunList`, async-status.ts:366-537)
 // =================================================================================================
 
 /// One active-run summary row for the no-id list: its own run directory plus the reconciled status.
@@ -397,18 +519,24 @@ pub struct ActiveRun {
     pub status: RunStatus,
 }
 
-/// State-ordering rank for the active-run list (pi `sortRuns`, `async-status.ts:204-221`, restricted
+/// State-ordering rank for the active-run list (pi `sortRuns`, `async-status.ts:345-364`, restricted
 /// to the queued/running states this list surfaces): running before queued.
 fn list_rank(state: RunState) -> u8 {
     match state {
         RunState::Running => 0,
         RunState::Queued => 1,
-        RunState::Paused | RunState::Complete | RunState::Failed => 2,
+        // G77: upstream's `sortRuns` gives `failed`, `stopped` and `paused` the SAME rank 2 and
+        // `complete` rank 3 (`async-status.ts:346-354` @v0.43.0 — `case "stopped": return 2;`
+        // sits between the `failed` and `paused` cases, all three returning 2). This list only ever
+        // holds queued/running rows, so every terminal state collapses to one bucket here; the
+        // `Stopped` arm is spelled out rather than swept into a catch-all so a future state cannot
+        // silently inherit rank 2.
+        RunState::Paused | RunState::Complete | RunState::Failed | RunState::Stopped => 2,
     }
 }
 
 /// Enumerate every currently-active (queued or running) background run under `async_root` (pi
-/// `listAsyncRuns` with `states: ["queued", "running"]`, `async-status.ts:223-258`): scan the run
+/// `listAsyncRuns` with `states: ["queued", "running"]`, `async-status.ts:366-449`): scan the run
 /// directories, reconcile each (R-SA-079), keep the queued/running ones, and sort running-first
 /// then most-recently-updated first. A missing `async_root` (no runs ever spawned for this cwd) is
 /// an empty list, not an error. A run whose status cannot be reconciled (e.g. a half-written
@@ -464,7 +592,7 @@ pub async fn list_active_runs(
     Ok(runs)
 }
 
-/// Render the active-run list (pi `formatAsyncRunList`, `async-status.ts:318-338`): a
+/// Render the active-run list (pi `formatAsyncRunList`, `async-status.ts:516-537`): a
 /// `No active async runs.` sentinel when empty, otherwise a `Active async runs: N` heading and one
 /// `- id | state | mode | progress[ | K pending appends] | dir` header per run followed by its
 /// `  n. agent | status[ | model]` step lines.
@@ -532,6 +660,86 @@ mod tests {
     use crate::background::atomic::write_atomic_json;
     use crate::background::control::{self, InterruptOutcome, ResumeOutcome};
     use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
+
+    /// G90: the runner's accepted-steer counters must SURFACE in the report a user reads
+    /// (pi `steeringSuffix`, `run-status.ts:413,419` @v0.43.0). Without this the tool would say
+    /// "Steering queued" and the status report would look identical whether the runner accepted
+    /// the request or dropped it on the floor.
+    #[test]
+    fn a_steps_accepted_steers_are_rendered_in_pis_steering_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = RunId::from_token("steersuffix1".to_string());
+        let paths = RunPaths::for_run(dir.path(), dir.path(), &id);
+        let mut status = RunStatus::queued(id, RunMode::Single, Some(1));
+        status.state = RunState::Running;
+        let mut step = StepStatus::pending("scout");
+        step.status = StepState::Running;
+        step.telemetry.steer_count = Some(2);
+        step.telemetry.last_steer_at = Some(1_700_000_000_000);
+        status.steps = vec![step];
+
+        let report = format_status(&status, &paths);
+        assert!(
+            report.contains("Step 1: scout running, steering: 2 steers, last 2023-11-14T22:13:20.000Z"),
+            "{report}"
+        );
+
+        // Singular, and no suffix at all when nothing was ever steered.
+        status.steps[0].telemetry.steer_count = Some(1);
+        status.steps[0].telemetry.last_steer_at = None;
+        assert!(format_status(&status, &paths).contains(", steering: 1 steer"), "singular form");
+        status.steps[0].telemetry.steer_count = None;
+        let quiet = format_status(&status, &paths);
+        assert!(!quiet.contains("steering:"), "an unsteered step gets no suffix: {quiet}");
+    }
+
+    /// G77 — the `status` action's rendering of a stopped run: its own state word, and pi's
+    /// verbatim not-resumable guidance INSTEAD of the `Revive:` line the same steps would
+    /// otherwise earn. The step below deliberately carries an existing `session_file`, which is
+    /// precisely the input that would produce a `Revive:` line without the stopped short-circuit.
+    #[test]
+    fn a_stopped_run_renders_its_own_state_word_and_refuses_to_offer_a_revive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(&transcript, b"{}\n").expect("write transcript");
+
+        let id = RunId::from_token("stoprender01".to_string());
+        let paths = RunPaths::for_run(dir.path(), dir.path(), &id);
+        let mut status = RunStatus::queued(id, RunMode::Single, Some(1));
+        status.state = RunState::Stopped;
+        let mut step = StepStatus::pending("scout");
+        step.status = StepState::Stopped;
+        step.session_file = Some(transcript);
+        step.error = Some(control::STOP_MESSAGE.to_string());
+        status.steps = vec![step];
+
+        let report = format_status(&status, &paths);
+        assert!(report.contains("State: stopped"), "{report}");
+        assert!(report.contains("Step 1: scout stopped"), "{report}");
+        assert!(report.contains(STOPPED_NOT_RESUMABLE_GUIDANCE), "{report}");
+        assert!(
+            !report.contains("Revive:"),
+            "a stopped run must never be offered a Revive line even though its step HAS a \
+             transcript (pi `run-status.ts:51-52` short-circuits before the transcript checks): \
+             {report}"
+        );
+    }
+
+    /// G77 — the lowercase wire words every human-facing renderer prints. `stopped` is its own
+    /// word on both enums, never `failed`.
+    #[test]
+    fn stopped_gets_its_own_state_and_step_label() {
+        assert_eq!(run_state_label(RunState::Stopped), "stopped");
+        assert_eq!(step_state_label(StepState::Stopped), "stopped");
+        // The other five are unchanged.
+        assert_eq!(run_state_label(RunState::Failed), "failed");
+        assert_eq!(run_state_label(RunState::Paused), "paused");
+        assert_eq!(step_state_label(StepState::Failed), "failed");
+        // pi `sortRuns` (`async-status.ts:346-354`) ranks stopped with failed/paused at 2.
+        assert_eq!(list_rank(RunState::Stopped), list_rank(RunState::Failed));
+        assert_eq!(list_rank(RunState::Stopped), list_rank(RunState::Paused));
+        assert!(list_rank(RunState::Running) < list_rank(RunState::Stopped));
+    }
 
     fn roots() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().expect("real tempdir");

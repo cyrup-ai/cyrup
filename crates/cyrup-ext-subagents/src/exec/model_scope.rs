@@ -26,7 +26,7 @@
 //! | site | upstream | source |
 //! |---|---|---|
 //! | [`crate::exec::fallback::resolve_model_inheritance`] | `resolveSubagentModelOverride` (`model-fallback.ts:203-210`) | explicit → error, persona/inherited → warn |
-//! | [`crate::exec::fallback::build_model_candidates_scoped`] | `buildModelCandidates` (`model-fallback.ts:234-236`) | fallback entries after the primary → warn |
+//! | [`crate::exec::fallback::build_model_candidates_scoped`] | `buildModelCandidates` (`model-fallback.ts:253-276`) | fallback entries after the primary → warn |
 //!
 //! Unlike pi — whose async runs resolve their models parent-side in `async-execution.ts:457` — a
 //! cyrup background run resolves each step's model INSIDE the detached hop-2 runner process, which
@@ -189,7 +189,7 @@ pub fn check_model_scope(
 }
 
 /// Emit a warn-severity violation the way pi's `defaultScopeWarn` does
-/// (`model-fallback.ts:167-169`, `console.warn("[pi-subagents] " + message)`). Error-severity
+/// (`model-fallback.ts:175-195`, `console.warn("[pi-subagents] " + message)`). Error-severity
 /// violations are never routed here — they are returned to the caller and refuse the run.
 pub(crate) fn warn_violation(violation: &ModelScopeViolation) {
     if violation.severity == ModelScopeSeverity::Warn {

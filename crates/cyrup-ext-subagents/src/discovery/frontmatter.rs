@@ -4,8 +4,10 @@
 //! `pi-subagents`' own `src/agents/frontmatter.ts::parseFrontmatter` implements** — flat
 //! `key: value` pairs plus **one level** of block-indent values (an empty-valued `key:` line
 //! followed by more-indented continuation lines, common-leading-whitespace-stripped and stored as
-//! a single newline-joined string). It is **not** a general YAML parser: no arrays, no anchors,
-//! no multiline scalar indicators (`|`/`>`), no nested-block-of-blocks. Per arch-SA §6.2.3 / §12
+//! a single newline-joined string), plus **folded block scalars** (`key: >` / `key: >-`, folded per
+//! [`fold_block`]) and **block lists** (`- item` lines, normalized by [`parse_frontmatter_list`]).
+//! It is **not** a general YAML parser: no anchors, no literal-block indicator (`|`), no
+//! nested-block-of-blocks. Per arch-SA §6.2.3 / §12
 //! item 2, a general YAML crate MAY be substituted later only if verified byte-for-byte compatible
 //! against this exact grammar — until then this hand-rolled parser is the source of truth.
 //!
@@ -35,8 +37,9 @@
 //! - `systemPromptMode`/`inheritProjectContext` discovery-time defaults are computed from the
 //!   agent's **local name** (pre-packaging) — `Append`/`true` only when local name is exactly
 //!   `"delegate"`, else `Replace`/`false` (R-SA-018) — applying even when the agent is packaged.
-//! - Comma-separated list fields (`tools`, `defaultReads`, `skill`/`skills`, `fallbackModels`,
-//!   `extensions`, `subagentOnlyExtensions`) split on `,`, trim each entry, drop empties.
+//! - List fields (`tools`, `defaultReads`, `skill`/`skills`, `fallbackModels`, `extensions`,
+//!   `subagentOnlyExtensions`) accept comma-separated OR block-list (`- item`) syntax via
+//!   [`parse_frontmatter_list`]; each entry is trimmed and empties are dropped.
 //! - Boolean-ish fields (`inheritProjectContext`, `inheritSkills`, `defaultProgress`,
 //!   `interactive`) accept literal `"true"`/`"false"` strings only; anything else is treated as
 //!   "not stated" and falls through to that field's own default.
@@ -69,6 +72,12 @@ const KNOWN_FIELDS: &[&str] = &[
     "name",
     "package",
     "description",
+    // Both alias spellings entered `KNOWN_FIELDS` with pi's agent-alias feature
+    // (`agent-serializer.ts:9-10` @ v0.43.0). They MUST be here AND emitted by
+    // `management::serialize_agent`: a key that is "known" but never written is silently deleted on
+    // the first management rewrite, because the extra-fields round-trip loop skips known keys.
+    "alias",
+    "aliases",
     "tools",
     "model",
     "fallbackModels",
@@ -87,6 +96,16 @@ const KNOWN_FIELDS: &[&str] = &[
     "interactive",
     "maxSubagentDepth",
     "completionGuard",
+    // Both present in `KNOWN_FIELDS` at the ported v0.34.0 baseline
+    // (`agent-serializer.ts:4-26` @ v0.34.0). Until they were parsed here, a `toolBudget:` or
+    // `memory:` line in an agent file was demoted to `extra_fields` and did nothing at all.
+    "toolBudget",
+    "memory",
+    // Agent-level LAUNCH DEFAULTS (`agent-serializer.ts:4-40` @ v0.43.0). Parsed into
+    // `default_async`/`default_timeout_ms` and applied by `route_single` only when the call site
+    // omitted the corresponding parameter.
+    "async",
+    "timeoutMs",
 ];
 
 /// True iff `key` is one of the crate's first-class typed frontmatter fields (pi's `KNOWN_FIELDS`,
@@ -180,7 +199,12 @@ fn match_key_value(line: &str) -> Option<(&str, &str)> {
 /// `value.slice(1, -1)` guarded by a matching-pair check. A value that starts with a quote char
 /// but does not end with the *same* quote char (or is too short to contain a matching pair) is
 /// left untouched.
-fn strip_matching_quotes(value: &str) -> &str {
+///
+/// Returns `(was_quoted, value)`. The `was_quoted` flag matters because source gates its
+/// folded-block-scalar detection on it (`frontmatter.ts:121`: `isFolded = !isQuoted && (rawValue
+/// === ">" || rawValue === ">-")`) — a literally quoted `">"` is the one-character STRING `>`, not
+/// a block indicator.
+fn strip_matching_quotes(value: &str) -> (bool, &str) {
     let bytes = value.as_bytes();
     if let (Some(&first), Some(&last)) = (bytes.first(), bytes.last())
         && bytes.len() >= 2
@@ -189,10 +213,10 @@ fn strip_matching_quotes(value: &str) -> &str {
         // Safe: both quote chars are single-byte ASCII, so slicing at these positions never
         // splits a multi-byte UTF-8 sequence. `get(1..value.len() - 1)` avoids any raw indexing.
         if let Some(inner) = value.get(1..value.len() - 1) {
-            return inner;
+            return (true, inner);
         }
     }
-    value
+    (false, value)
 }
 
 /// The position (in `char` count, matching JS `String.prototype.search`'s semantics closely
@@ -205,28 +229,178 @@ fn first_non_whitespace_offset(line: &str) -> usize {
         .unwrap_or_else(|| line.chars().count())
 }
 
+/// The block's common leading-whitespace prefix, mirroring source's
+/// `rawBlock.match(/^[ \t]+(?=\S)/m)` (`frontmatter.ts:102`) EXACTLY: scan the joined block
+/// line-by-line (the `m` flag makes `^` match after every `\n`) and return the leading `[ \t]+` run
+/// of the FIRST line whose run is immediately followed by a NON-WHITESPACE character (the `(?=\S)`
+/// lookahead). Lines that are entirely whitespace — and a leading BLANK line — are skipped rather
+/// than yielding an empty/degenerate prefix.
+///
+/// **This is the indent-anchor fix.** The previous implementation took the prefix from the raw
+/// block's very first characters (`raw_block.chars().take_while(..)`), which silently produced an
+/// EMPTY prefix — hence no dedent at all — whenever the block's first captured line was blank. That
+/// never happened before folded scalars existed (a blank line has `indent == 0`, so it could not be
+/// captured as a continuation), but a folded block DOES capture blank lines
+/// (`frontmatter.ts:91`), so `description: >` followed by a blank line and then indented text used
+/// to keep its full source indentation in the parsed value. Anchoring on the first line that
+/// actually has content reproduces the regex.
+///
+/// Greediness note: `[ \t]+` is greedy and the lookahead cannot be satisfied by backtracking (every
+/// shorter prefix is still followed by ` ` or `\t`, which are not `\S`), so "maximal run, then
+/// require a non-whitespace char" is the regex's exact behaviour.
+fn block_indent_prefix(raw_block: &str) -> String {
+    for line in raw_block.split('\n') {
+        let ws: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        if ws.is_empty() {
+            continue;
+        }
+        // `ws` is built from single-byte ASCII chars, so `ws.len()` is a valid char boundary.
+        match line.get(ws.len()..).and_then(|rest| rest.chars().next()) {
+            Some(c) if !c.is_whitespace() => return ws,
+            _ => continue,
+        }
+    }
+    String::new()
+}
+
 /// Strip the common leading whitespace prefix from a set of raw block-continuation lines, then
-/// join with `\n`. The "prefix" is taken from the **first** captured line's leading whitespace run
-/// (mirrors source's `rawBlock.match(/^([ \t]+)/m)` taking the first line in the joined block that
-/// has any leading whitespace, then stripping that exact prefix from every line via a global
-/// multiline regex replace, and finally trimming one leading `\n` if the strip left one).
+/// join with `\n`. Source strips that prefix from every line via a global multiline regex replace,
+/// then trims one leading `\n` if the strip left one (`frontmatter.ts:104-106`).
 fn dedent_block(raw_lines: &[String]) -> String {
     let raw_block = raw_lines.join("\n");
-    let prefix: String = raw_block
-        .chars()
-        .take_while(|c| *c == ' ' || *c == '\t')
-        .collect();
+    let prefix = block_indent_prefix(&raw_block);
     if prefix.is_empty() {
         return raw_block;
     }
+    // `split('\n')` (not `.lines()`): a trailing empty segment is a real line of the block and must
+    // survive the round-trip. `.lines()` swallows it, which folded blocks (which capture blank
+    // lines) would otherwise notice.
     let stripped: String = raw_block
-        .lines()
+        .split('\n')
         .map(|line| line.strip_prefix(prefix.as_str()).unwrap_or(line))
         .collect::<Vec<_>>()
         .join("\n");
     // Mirror source's final `.replace(/^\n/, "")`: drop exactly one leading newline left over
     // from the strip, if present.
     stripped.strip_prefix('\n').map_or(stripped.clone(), str::to_string)
+}
+
+/// Fold a YAML folded block scalar (`>` / `>-`), a line-for-line port of
+/// `pi-subagents/src/agents/frontmatter.ts::foldBlock` (`frontmatter.ts:12-40`).
+///
+/// Folding rules, exactly as source implements them:
+/// - each line is `trimEnd`ed; a line that is empty after trimming is a BLANK-line separator and is
+///   counted, never emitted directly;
+/// - a line that still has leading whitespace after the block-level dedent is "more indented" and
+///   YAML preserves its line break rather than folding it into a space;
+/// - between two consecutive content lines: a single space if neither is more-indented, else a
+///   newline;
+/// - across `n` blank lines: `n` newlines, plus one extra if either neighbour is more-indented;
+/// - the whole result is finally `trim`ed, so `>` and `>-` behave identically here (source draws no
+///   distinction between them either — both route through this same function).
+fn fold_block(block: &str) -> String {
+    let mut folded = String::new();
+    let mut has_content = false;
+    let mut previous_is_more_indented = false;
+    let mut blank_lines: usize = 0;
+
+    for line in block.split('\n') {
+        let current = line.trim_end();
+        if current.trim().is_empty() {
+            if has_content {
+                blank_lines += 1;
+            }
+            continue;
+        }
+
+        let current_is_more_indented = current.len() > current.trim_start().len();
+        if has_content {
+            if blank_lines > 0 {
+                let extra = usize::from(previous_is_more_indented || current_is_more_indented);
+                for _ in 0..(blank_lines + extra) {
+                    folded.push('\n');
+                }
+            } else if previous_is_more_indented || current_is_more_indented {
+                folded.push('\n');
+            } else {
+                folded.push(' ');
+            }
+        }
+        folded.push_str(current);
+        has_content = true;
+        previous_is_more_indented = current_is_more_indented;
+        blank_lines = 0;
+    }
+
+    folded.trim().to_string()
+}
+
+/// Normalize a simple-scalar frontmatter list from **either** comma-separated **or** YAML
+/// block-list syntax — a direct port of `frontmatter.ts::parseFrontmatterList`
+/// (`frontmatter.ts:46-57`).
+///
+/// Each physical line is trimmed, then the standard `- ` list marker is removed IF present
+/// (source's `/^-\s+(.+)$/` — note the REQUIRED whitespace after the hyphen, which is what keeps an
+/// ordinary hyphen-leading value like `-foo` intact), and the remainder is then split on `,`. Every
+/// resulting entry is trimmed and empties are dropped.
+///
+/// `None` in, `None` out — the caller distinguishes "the key was absent" from "the key was present
+/// but yielded no entries", which several fields depend on (source spreads `...(rawTools !==
+/// undefined ? { tools } : {})`, so an explicitly EMPTY `tools:` means "no tools", not "default
+/// tools").
+pub(crate) fn parse_frontmatter_list(raw: Option<&str>) -> Option<Vec<String>> {
+    let raw = raw?;
+    Some(
+        raw.split('\n')
+            .flat_map(|line| {
+                let value = line.trim();
+                let item = value
+                    .strip_prefix('-')
+                    .filter(|rest| rest.starts_with(char::is_whitespace))
+                    .map(str::trim_start)
+                    .filter(|rest| !rest.is_empty())
+                    .unwrap_or(value);
+                item.split(',').collect::<Vec<_>>()
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Normalize a raw alias list against the agent's own runtime name — a direct port of pi's
+/// `normalizeAgentAliases` (`agents.ts:495-499`):
+///
+/// ```text
+/// [...new Set((rawAliases ?? []).map((alias) => alias.trim()).filter(Boolean))]
+///     .filter((alias) => alias !== agentName)
+/// ```
+///
+/// Order matters and is preserved exactly: **trim → drop empties → de-duplicate (first occurrence
+/// wins, JS `Set` insertion order) → drop the agent's own name**. The self-name filter runs LAST, so
+/// an alias equal to the agent name is removed even if it also appeared twice.
+///
+/// pi returns `undefined` for an empty result; this returns an empty `Vec`, which
+/// [`AgentDefinition::aliases`] documents as the identical state.
+#[must_use]
+pub fn normalize_agent_aliases(raw_aliases: Vec<String>, agent_name: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for alias in raw_aliases {
+        let trimmed = alias.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        if trimmed == agent_name {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
 }
 
 /// Parse a full agent/chain `.md` file's frontmatter block: flat `key: value` lines plus one level
@@ -276,23 +450,39 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
     let mut current_key: Option<String> = None;
     let mut current_block_lines: Vec<String> = Vec::new();
     let mut current_indent: Option<usize> = None;
+    // Whether the pending block was opened by a FOLDED scalar indicator (`>` / `>-`), which changes
+    // both what the block captures (blank lines too) and how it is stored (folded, not verbatim).
+    let mut current_folded = false;
 
     let flush_block = |fields: &mut Vec<(String, String)>,
                         current_key: &mut Option<String>,
                         current_block_lines: &mut Vec<String>,
-                        current_indent: &mut Option<usize>| {
+                        current_indent: &mut Option<usize>,
+                        current_folded: &mut bool| {
         if let Some(key) = current_key.take() {
             let stripped = dedent_block(current_block_lines);
-            fields.push((key, stripped));
+            let value = if *current_folded {
+                fold_block(&stripped)
+            } else {
+                stripped
+            };
+            fields.push((key, value));
         }
         current_block_lines.clear();
         *current_indent = None;
+        *current_folded = false;
     };
 
     for line in frontmatter_block.split('\n') {
         let indent = first_non_whitespace_offset(line);
 
-        if current_key.is_some() && indent > current_indent.unwrap_or(0) {
+        // Source: `indent > (currentIndent ?? 0) || (currentFolded && trimmed === "")`
+        // (`frontmatter.ts:91`). A blank line has `indent == 0` and so is NOT a continuation of an
+        // ordinary block — but a FOLDED block keeps it, because blank lines are a folded scalar's
+        // paragraph separator and `foldBlock` needs to see them.
+        if current_key.is_some()
+            && (indent > current_indent.unwrap_or(0) || (current_folded && line.trim().is_empty()))
+        {
             // Continuation of the current block value.
             current_block_lines.push(line.to_string());
             continue;
@@ -305,6 +495,7 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
             &mut current_key,
             &mut current_block_lines,
             &mut current_indent,
+            &mut current_folded,
         );
 
         // Match against the RAW line (source: `line.match(/^([\w-]+):.../)`, `frontmatter.ts:61`),
@@ -314,13 +505,18 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
             // Non-matching line (comment, blank, indented orphan, malformed): silently ignored.
             continue;
         };
-        let value = strip_matching_quotes(raw_value.trim());
+        let raw_value = raw_value.trim();
+        let (is_quoted, value) = strip_matching_quotes(raw_value);
+        // A bare `>` or `>-` opens a YAML FOLDED block scalar. Source gates this on the value not
+        // being quoted (`frontmatter.ts:121`), so `description: ">"` is still the literal string.
+        let is_folded = !is_quoted && (raw_value == ">" || raw_value == ">-");
 
-        if value.is_empty() {
-            // Empty-valued key: might start a block value; defer storing until we see indent.
+        if value.is_empty() || is_folded {
+            // Empty-valued key or folded indicator: defer storing until we see the block body.
             current_key = Some(key.to_string());
             current_block_lines = Vec::new();
             current_indent = Some(indent);
+            current_folded = is_folded;
         } else {
             fields.push((key.to_string(), value.to_string()));
         }
@@ -333,6 +529,7 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
         &mut current_key,
         &mut current_block_lines,
         &mut current_indent,
+        &mut current_folded,
     );
 
     ParsedFrontmatter { fields, body }
@@ -341,18 +538,6 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
 // ---------------------------------------------------------------------------------------------
 // Layer 2: agent-specific parsing (R-SA-005/006/018; func-SA §4.1)
 // ---------------------------------------------------------------------------------------------
-
-/// Split a comma-separated frontmatter list value into trimmed, non-empty entries — mirrors every
-/// `frontmatter.<field>?.split(",").map((t) => t.trim()).filter(Boolean)` call site in source
-/// (`tools`, `defaultReads`, `skill`/`skills`, `fallbackModels`, `extensions`,
-/// `subagentOnlyExtensions`).
-fn split_comma_list(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
 
 /// `key: value` -> `Option<bool>`, accepting only the literal strings `"true"`/`"false"`;
 /// anything else (including absence) is `None`, matching source's ternary-chain pattern
@@ -482,8 +667,8 @@ fn default_inherit_project_context(local_name: &str) -> bool {
 /// `pi-subagents/src/agents/agents.ts`'s own two-way split (`mcpDirectTools` vs. a single `tools`
 /// bucket covering everything else); any further Builtin-vs-ExtensionPath refinement is a later
 /// resolution step against a known-tools registry, out of scope for this file.
-fn parse_tool_refs(raw: &str) -> Vec<ToolRef> {
-    split_comma_list(raw)
+fn parse_tool_refs(entries: Vec<String>) -> Vec<ToolRef> {
+    entries
         .into_iter()
         .map(|entry| {
             if let Some(mcp_name) = entry.strip_prefix("mcp:") {
@@ -495,7 +680,7 @@ fn parse_tool_refs(raw: &str) -> Vec<ToolRef> {
         .collect()
 }
 
-/// `thinking: <value>` -> `Option<String>`. pi's `AgentConfig.thinking` (`agents.ts:103,171`) is an
+/// `thinking: <value>` -> `Option<String>`. pi's `AgentConfig.thinking` (`agents.ts:64,86,126` @v0.43.0) is an
 /// OPEN string, so this preserves the raw frontmatter value verbatim rather than coercing it into a
 /// closed on-only [`cyrup_core::ThinkingLevel`] enum:
 ///
@@ -584,25 +769,36 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
 
     let runtime_name = AgentDefinition::qualified_name(&local_name, package_name.as_deref());
 
-    let tools = parsed.get("tools").map(parse_tool_refs).unwrap_or_default();
-    let tools = if tools.is_empty() { None } else { Some(tools) };
+    // G103 / pi `agents.ts:1610` @v0.43.0: `...(rawTools !== undefined ? { tools } : {})` — the
+    // `tools` field is carried onto the agent exactly when the frontmatter KEY was present, and its
+    // value is whatever `splitToolList` produced, INCLUDING the empty list. An explicitly-empty
+    // `tools:` therefore means "this agent gets no tools" and stays distinct from an absent
+    // `tools:`, which means "no allowlist restriction" (see [`AgentDefinition::tools`]'s own doc).
+    // Collapsing the two — which this used to do with an `is_empty() -> None` fold — silently
+    // handed a no-tools agent the full builtin set, because [`crate::exec::build_attempt_spawn_plan`]
+    // emits `--no-tools` only for the explicit-but-empty case.
+    let tools = parse_frontmatter_list(parsed.get("tools")).map(parse_tool_refs);
 
-    let default_reads = parsed
-        .get("defaultReads")
-        .map(split_comma_list)
+    let default_reads = parse_frontmatter_list(parsed.get("defaultReads"))
         .filter(|v| !v.is_empty())
         .map(|v| v.into_iter().map(PathBuf::from).collect::<Vec<_>>());
+
+    // `aliases:` / `alias:` — pi `agents.ts:1516`:
+    // `normalizeAgentAliases(parseFrontmatterList(frontmatter.aliases ?? frontmatter.alias), runtimeName)`.
+    // The PLURAL key is tried first (`??` short-circuits on the plural being present at all), and the
+    // normalization is measured against the RUNTIME name, not the local one.
+    let aliases = normalize_agent_aliases(
+        parse_frontmatter_list(parsed.get("aliases").or_else(|| parsed.get("alias")))
+            .unwrap_or_default(),
+        &runtime_name,
+    );
 
     // `skill` and `skills` are aliases (source: `frontmatter.skill || frontmatter.skills`) — the
     // singular form is tried first, matching source's `||` short-circuit precedence exactly.
     let skill_raw = parsed.get("skill").or_else(|| parsed.get("skills"));
-    let skills = skill_raw
-        .map(split_comma_list)
-        .unwrap_or_default();
+    let skills = parse_frontmatter_list(skill_raw).unwrap_or_default();
 
-    let fallback_models: Vec<ModelId> = parsed
-        .get("fallbackModels")
-        .map(split_comma_list)
+    let fallback_models: Vec<ModelId> = parse_frontmatter_list(parsed.get("fallbackModels"))
         .unwrap_or_default()
         .into_iter()
         .map(ModelId::from)
@@ -625,12 +821,10 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
 
     let default_context = parsed.get("defaultContext").and_then(parse_default_context);
 
-    let extensions = parsed.get("extensions").map(split_comma_list);
+    let extensions = parse_frontmatter_list(parsed.get("extensions"));
 
-    let subagent_only_extensions = parsed
-        .get("subagentOnlyExtensions")
-        .map(split_comma_list)
-        .unwrap_or_default();
+    let subagent_only_extensions =
+        parse_frontmatter_list(parsed.get("subagentOnlyExtensions")).unwrap_or_default();
 
     let model = parsed.get("model").map(ModelId::from);
     let thinking = parsed.get("thinking").and_then(parse_thinking_value);
@@ -641,8 +835,81 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         .get("maxSubagentDepth")
         .and_then(parse_max_subagent_depth);
     let completion_guard = parse_bool_field(parsed.get("completionGuard"));
+
+    // `toolBudget:` — pi `agents.ts:1163-1195` @ v0.34.0: a present, non-blank value is
+    // `JSON.parse`d and must be a JSON OBJECT; `tool-budget.ts::validateToolBudgetConfig` then
+    // normalizes it. Until this landed, `toolBudget` was demoted to `extra_fields` and no budget
+    // ever reached a child.
+    //
+    // `[CYRUP-DELTA]` on the FAILURE path only: pi THROWS out of `loadAgentsFromDir`, so one
+    // malformed `toolBudget:` anywhere aborts agent discovery entirely and the user loses every
+    // agent. This function's contract is R-SA-005/006's per-file silent skip (it returns
+    // `Option`, not `Result`), so a malformed budget skips THIS FILE — the same treatment an
+    // invalid `package` gets — and logs the reason at `warn` rather than taking the whole
+    // directory down with it. The valid path is byte-identical to pi.
+    let tool_budget = match parsed.get("toolBudget").filter(|v| !v.trim().is_empty()) {
+        None => None,
+        Some(raw) => {
+            let parsed_json = serde_json::from_str::<serde_json::Value>(raw).map_err(|err| {
+                format!("Agent '{local_name}' has invalid toolBudget frontmatter; expected a JSON object. ({err})")
+            });
+            match parsed_json.and_then(|value| {
+                crate::exec::tool_budget::validate_tool_budget_config(
+                    Some(&value),
+                    &format!("Agent '{local_name}' toolBudget"),
+                )
+            }) {
+                Ok(budget) => budget,
+                Err(message) => {
+                    tracing::warn!(
+                        agent = %local_name,
+                        path = %file_path.display(),
+                        "{message} — skipping this agent file"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
+    // `async:` — pi `agents.ts:1541-1546`: strictly `"true"`/`"false"`; anything else is an ERROR
+    // upstream. Same `[CYRUP-DELTA]` as `toolBudget` above: a per-file skip + warn instead of
+    // aborting the whole directory scan.
+    let default_async = match parsed.get("async") {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(_) => {
+            tracing::warn!(
+                agent = %local_name,
+                path = %file_path.display(),
+                "Agent '{local_name}' has invalid async frontmatter; expected true or false. — skipping this agent file"
+            );
+            return None;
+        }
+    };
+
+    // `timeoutMs:` — pi `agents.ts:1547-1554`: `Number.isInteger(parsed) && parsed > 0`, else error.
+    let default_timeout_ms = match parsed.get("timeoutMs") {
+        None => None,
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Some(ms),
+            _ => {
+                tracing::warn!(
+                    agent = %local_name,
+                    path = %file_path.display(),
+                    "Agent '{local_name}' has invalid timeoutMs frontmatter; expected a positive integer. — skipping this agent file"
+                );
+                return None;
+            }
+        },
+    };
+
+    // `memory:` — pi `agents.ts:1290` @ v0.43.0 / the same call at v0.34.0. `parseMemoryFrontmatter`
+    // never errors: an illegal scope or a missing path simply declines the config.
+    let memory = crate::discovery::agent_memory::parse_memory_frontmatter(parsed.get("memory"));
     // `disabled` is NOT an honored agent-FILE frontmatter field. pi's `loadAgentsFromDir`
-    // (`agents.ts:1056-1195`) never reads `frontmatter.disabled` into `AgentConfig.disabled`, and
+    // (`agents.ts:1482-1644`) never reads `frontmatter.disabled` into `AgentConfig.disabled`, and
     // `disabled` is absent from `KNOWN_FIELDS` (`agent-serializer.ts:4-26`) — so a `disabled:` line in
     // an agent file is just an unknown extra field (round-tripped verbatim into `extra_fields`), NOT a
     // flag. An agent is disabled ONLY by a settings override (`subagents.disableBuiltins` /
@@ -663,8 +930,10 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         local_name,
         package_name,
         description,
+        aliases,
         tools,
         extensions,
+        extensions_from_default: false,
         subagent_only_extensions,
         model,
         fallback_models,
@@ -680,6 +949,10 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         interactive,
         max_subagent_depth,
         default_context,
+        default_async,
+        default_timeout_ms,
+        memory,
+        tool_budget,
         disabled,
         system_prompt_body: parsed.body,
         source,
@@ -1183,6 +1456,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
+    // G103: an explicitly-empty `tools:` is NOT the same as an absent one (pi `agents.ts:1610`)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn an_explicitly_empty_tools_key_parses_to_an_empty_allowlist_not_to_none() {
+        // pi: `parseFrontmatterList("")` is `[]`, `splitToolList([])` is `{ tools: [] }`, and
+        // `...(rawTools !== undefined ? { tools } : {})` therefore CARRIES that empty list onto the
+        // agent. `None` means "no allowlist restriction"; `Some(vec![])` means "no tools".
+        for content in [
+            "---\nname: scribe\ndescription: Scribe\ntools:\n---\n\nBody\n",
+            "---\nname: scribe\ndescription: Scribe\ntools: \"\"\n---\n\nBody\n",
+        ] {
+            let def = parse_agent_file(content, AgentSource::Project, Path::new("/s.md"))
+                .expect("parses");
+            assert_eq!(
+                def.tools,
+                Some(Vec::new()),
+                "an explicitly-empty `tools:` must be an EMPTY allowlist, not `None`; input was \
+                 {content:?}"
+            );
+            assert!(def.present_fields.contains("tools"));
+        }
+    }
+
+    #[test]
+    fn an_absent_tools_key_parses_to_none() {
+        // The MIRROR of the case above — the distinction only exists if BOTH sides hold.
+        let content = "---\nname: scribe\ndescription: Scribe\n---\n\nBody\n";
+        let def = parse_agent_file(content, AgentSource::Project, Path::new("/s.md")).expect("parses");
+        assert_eq!(def.tools, None);
+        assert!(!def.present_fields.contains("tools"));
+    }
+
+    // -----------------------------------------------------------------------------------------
     // present_fields / extra_fields bookkeeping (R-SA-010's fill-unset-only precondition)
     // -----------------------------------------------------------------------------------------
 
@@ -1279,5 +1586,177 @@ mod tests {
         let def = parse_agent_file(DELEGATE_MD, AgentSource::Builtin, Path::new("delegate.md")).expect("parses");
         assert_eq!(def.system_prompt_mode, SystemPromptMode::Append);
         assert!(def.inherit_project_context);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Folded block scalars (`>` / `>-`) — `frontmatter.ts::foldBlock` (v0.43.0 `frontmatter.ts:12-40`).
+    //
+    // Every expected value below was produced by executing a transliteration of that exact
+    // upstream file (Python's `re` reproduces the `^`+MULTILINE and greedy-`[ \t]+`+`(?=\S)`
+    // semantics the TS relies on) against the same fixture strings.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn folded_scalar_folds_lines_into_one_paragraph_instead_of_storing_the_indicator() {
+        // Before folded-scalar support this stored the LITERAL string ">" as the description,
+        // which is what the delegate tool schema and `/agents` then showed the user.
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: >\n  Reviews Rust changes for\n  correctness and style.\ntools: read\n---\n\nBody\n",
+        );
+        assert_eq!(
+            parsed.get("description"),
+            Some("Reviews Rust changes for correctness and style.")
+        );
+        assert_eq!(parsed.get("tools"), Some("read"));
+        assert_eq!(parsed.body, "Body");
+    }
+
+    #[test]
+    fn folded_scalar_strip_chomp_indicator_is_accepted_too() {
+        let parsed =
+            parse_frontmatter_block("---\nname: worker\ndescription: >-\n  one\n  two\n---\n\nBody\n");
+        assert_eq!(parsed.get("description"), Some("one two"));
+    }
+
+    #[test]
+    fn folded_scalar_blank_line_separates_paragraphs() {
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: >\n  para one line a\n  para one line b\n\n  para two\n---\n\nBody\n",
+        );
+        assert_eq!(
+            parsed.get("description"),
+            Some("para one line a para one line b\npara two")
+        );
+    }
+
+    #[test]
+    fn folded_scalar_preserves_line_breaks_around_more_indented_lines() {
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: >\n  normal line\n    more indented\n  back to normal\n---\n\nBody\n",
+        );
+        assert_eq!(
+            parsed.get("description"),
+            Some("normal line\n  more indented\nback to normal")
+        );
+    }
+
+    #[test]
+    fn folded_scalar_with_a_leading_blank_line_still_dedents_the_block() {
+        // The indent-anchor bug: the old prefix logic read the block's FIRST characters, which for
+        // a block starting with a blank line is `\n` — an empty prefix, so nothing was dedented and
+        // every content line then looked "more indented" to the folder, yielding
+        // "first content line\n  second content line" instead of a single folded paragraph.
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: >\n\n  first content line\n  second content line\n---\n\nBody\n",
+        );
+        assert_eq!(
+            parsed.get("description"),
+            Some("first content line second content line")
+        );
+    }
+
+    #[test]
+    fn a_quoted_gt_is_a_literal_string_not_a_folded_block_indicator() {
+        let parsed = parse_frontmatter_block("---\nname: worker\ndescription: \">\"\n---\n\nBody\n");
+        assert_eq!(parsed.get("description"), Some(">"));
+    }
+
+    #[test]
+    fn a_plain_empty_valued_block_is_still_stored_verbatim_not_folded() {
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: Worker\npermission:\n  \"*\": ask\n  bash:\n    \"*\": ask\n---\n\nBody\n",
+        );
+        assert_eq!(parsed.get("permission"), Some("\"*\": ask\nbash:\n  \"*\": ask"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Block lists — `frontmatter.ts::parseFrontmatterList` (v0.43.0 `frontmatter.ts:46-57`).
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn parse_frontmatter_list_accepts_comma_and_block_syntax() {
+        assert_eq!(
+            parse_frontmatter_list(Some("read, grep, find")),
+            Some(vec!["read".into(), "grep".into(), "find".into()])
+        );
+        assert_eq!(
+            parse_frontmatter_list(Some("- read\n- grep")),
+            Some(vec!["read".into(), "grep".into()])
+        );
+        assert_eq!(
+            parse_frontmatter_list(Some("- read\n  - grep")),
+            Some(vec!["read".into(), "grep".into()])
+        );
+        assert_eq!(
+            parse_frontmatter_list(Some("- read, grep\n- find")),
+            Some(vec!["read".into(), "grep".into(), "find".into()])
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_list_leaves_ordinary_hyphenated_values_intact() {
+        // Only the standard `- ` marker (hyphen + whitespace) is a list marker.
+        assert_eq!(
+            parse_frontmatter_list(Some("-foo, bar-baz")),
+            Some(vec!["-foo".into(), "bar-baz".into()])
+        );
+        assert_eq!(parse_frontmatter_list(Some("-")), Some(vec!["-".into()]));
+    }
+
+    #[test]
+    fn parse_frontmatter_list_distinguishes_absent_from_empty() {
+        assert_eq!(parse_frontmatter_list(None), None);
+        assert_eq!(parse_frontmatter_list(Some("")), Some(Vec::new()));
+    }
+
+    #[test]
+    fn agent_file_block_list_tools_become_real_tool_refs() {
+        // The user-visible defect this fixes: a block-list `tools:` used to yield tool names
+        // literally prefixed with "- ", so every tool in the list failed to resolve.
+        let def = parse_agent_file(
+            "---\nname: worker\ndescription: Worker\ntools:\n  - read\n  - grep\n  - mcp:github/search\n---\n\nBody\n",
+            AgentSource::User,
+            Path::new("worker.md"),
+        )
+        .expect("parses");
+        assert_eq!(
+            def.tools,
+            Some(vec![
+                ToolRef::Builtin("read".into()),
+                ToolRef::Builtin("grep".into()),
+                ToolRef::Mcp("github/search".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn agent_file_block_list_skills_and_reads_are_parsed() {
+        let def = parse_agent_file(
+            "---\nname: worker\ndescription: Worker\nskills:\n  - alpha\n  - beta\ndefaultReads:\n  - context.md\n  - plan.md\nfallbackModels:\n  - a/one\n  - b/two\nextensions:\n  - ext-a\n---\n\nBody\n",
+            AgentSource::User,
+            Path::new("worker.md"),
+        )
+        .expect("parses");
+        assert_eq!(def.skills, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            def.default_reads,
+            Some(vec![PathBuf::from("context.md"), PathBuf::from("plan.md")])
+        );
+        assert_eq!(
+            def.fallback_models,
+            vec![ModelId::from("a/one"), ModelId::from("b/two")]
+        );
+        assert_eq!(def.extensions, Some(vec!["ext-a".to_string()]));
+    }
+
+    #[test]
+    fn agent_file_folded_description_reaches_the_agent_definition() {
+        let def = parse_agent_file(
+            "---\nname: worker\ndescription: >\n  Reviews Rust changes for\n  correctness and style.\n---\n\nBody\n",
+            AgentSource::User,
+            Path::new("worker.md"),
+        )
+        .expect("parses");
+        assert_eq!(def.description, "Reviews Rust changes for correctness and style.");
     }
 }

@@ -5,15 +5,15 @@
 //! per-`cwd` artifacts directory: `<runId>_<agent>[_i]_input.md` (the task the child was given),
 //! `<runId>_<agent>[_i]_output.md` (its delivered answer), `<runId>_<agent>[_i].jsonl` (the run's
 //! observable event stream), and `<runId>_<agent>[_i]_meta.json` (usage/model/exit-code metadata) —
-//! matching pi's `getArtifactPaths` (`shared/artifacts.ts:29-39`). The four filenames and the
+//! matching pi's `getArtifactPaths` (`shared/artifacts.ts:186-197`). The four filenames and the
 //! `[^\w.-] -> _` agent-name sanitization are byte-for-byte faithful to pi so an artifact consumer
 //! (a human, a follow-up run, a debugging tool) sees the exact same layout.
 //!
 //! Housekeeping mirrors pi one-for-one: [`cleanup_old_artifacts`] is the 24h-throttled 7-day sweep
-//! (`shared/artifacts.ts:57-86`, a `.last-cleanup` marker gates re-scanning to once per day and
+//! (`shared/artifacts.ts:230-259`, a `.last-cleanup` marker gates re-scanning to once per day and
 //! deletes any artifact older than `max_age_days`), [`cleanup_all_artifact_dirs`] fans that sweep
-//! across the temp + per-session artifact roots (`shared/artifacts.ts:88-112`), and
-//! [`cleanup_old_chain_dirs`] is pi's separate 24h chain-runs sweep (`shared/settings.ts:162-185`).
+//! across the temp + per-session artifact roots (`shared/artifacts.ts:261-285`), and
+//! [`cleanup_old_chain_dirs`] is pi's separate 24h chain-runs sweep (`shared/settings.ts:197-220`).
 //! All housekeeping is best-effort: a file that vanishes or is unreadable mid-scan is skipped, never
 //! fatal to the caller (extension startup must not fail on a stale artifact).
 //!
@@ -46,14 +46,14 @@ const CLEANUP_MARKER_FILE: &str = ".last-cleanup";
 /// chain-runs max age (pi `CHAIN_DIR_MAX_AGE_MS`).
 const ONE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 
-/// The default artifact-cleanup horizon (pi `DEFAULT_ARTIFACT_CONFIG.cleanupDays`, `types.ts:899`).
+/// The default artifact-cleanup horizon (pi `DEFAULT_ARTIFACT_CONFIG.cleanupDays`, `shared/types.ts:1804`).
 pub const DEFAULT_CLEANUP_DAYS: u64 = 7;
 
-/// The four artifact paths for one run/agent/index (pi `ArtifactPaths`, `types.ts:464-469`).
+/// The four artifact paths for one run/agent/index (pi `ArtifactPaths`, `shared/types.ts:1044-1050`).
 ///
 /// `Serialize` (camelCase, matching pi's own field names) because pi carries this bundle onto a
-/// result as `SingleResult.artifactPaths` (`shared/types.ts:488`) and spreads it verbatim into a
-/// dynamic fan-out's collect records (`runs/shared/dynamic-fanout.ts:284`), where a chain author
+/// result as `SingleResult.artifactPaths` (`shared/types.ts:901`) and spreads it verbatim into a
+/// dynamic fan-out's collect records (`runs/shared/dynamic-fanout.ts:286`), where a chain author
 /// reads it through `{outputs.<collect.as>}`. Only serialization is derived: nothing reads one of
 /// these back off the wire, and pi's fifth field (`transcriptPath`) has no analogue in this port.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -70,15 +70,15 @@ pub struct ArtifactPaths {
 }
 
 /// Which of the four artifact files to write + the cleanup horizon (pi `ArtifactConfig`,
-/// `types.ts:471-478`). The [`Default`] impl reproduces pi's `DEFAULT_ARTIFACT_CONFIG`
-/// (`types.ts:893-900`) exactly: input/output/metadata on, **jsonl off**, 7-day cleanup.
+/// `shared/types.ts:1054-1063`). The [`Default`] impl reproduces pi's `DEFAULT_ARTIFACT_CONFIG`
+/// (`shared/types.ts:1796-1805`) exactly: input/output/metadata on, **jsonl off**, 7-day cleanup.
 ///
 /// SUBA-N03: `Serialize`/`Deserialize` (camelCase, matching pi's own `artifactConfig` wire shape)
 /// because the async SINGLE path carries this whole config to the detached hop-2 runner on
 /// [`crate::background::runner_main::RunnerConfig::artifact_config`] — pi's `spawnRunner({ …,
 /// artifactsDir, artifactConfig, … })` (`runs/background/async-execution.ts:966-968` @v0.34.0),
 /// read back by its runner as `ctx.artifactConfig?.enabled !== false`
-/// (`runs/background/subagent-runner.ts:879-889,1117-1133`). Every field is `#[serde(default)]`ed
+/// (`runs/background/subagent-runner.ts:879-890,1117-1125` @v0.34.0). Every field is `#[serde(default)]`ed
 /// through a whole-struct `Default` so an older on-disk config that omits the block still
 /// deserializes to pi's own `DEFAULT_ARTIFACT_CONFIG`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -100,7 +100,7 @@ pub struct ArtifactConfig {
 
 impl Default for ArtifactConfig {
     fn default() -> Self {
-        // pi `DEFAULT_ARTIFACT_CONFIG` (`types.ts:893-900`).
+        // pi `DEFAULT_ARTIFACT_CONFIG` (`shared/types.ts:1796-1805`).
         Self {
             enabled: true,
             include_input: true,
@@ -117,7 +117,7 @@ impl ArtifactConfig {
     /// that the `.jsonl` event stream is enabled, so every foreground run leaves the full artifact
     /// quadruple (`_input.md`/`_output.md`/`.jsonl`/`_meta.json`) rather than only three files. pi
     /// leaves `includeJsonl` off in its GLOBAL default but writes the same `.jsonl` path verbatim
-    /// once a caller enables it (`runs/foreground/execution.ts:976-978`); this crate opts the
+    /// once a caller enables it (`runs/foreground/execution.ts:1468-1470`); this crate opts the
     /// foreground path into it so the run's observable event stream is always captured alongside its
     /// input/output/metadata.
     #[must_use]
@@ -129,26 +129,26 @@ impl ArtifactConfig {
     }
 }
 
-/// `<cwd>/.cyrup-subagents` (pi `getProjectSubagentsDir`, `shared/artifacts.ts:8-10`).
+/// `<cwd>/.cyrup-subagents` (pi `getProjectSubagentsDir`, `shared/artifacts.ts:133-135`).
 #[must_use]
 pub fn project_subagents_dir(cwd: &Path) -> PathBuf {
     cwd.join(PROJECT_ARTIFACT_ROOT)
 }
 
-/// `<cwd>/.cyrup-subagents/artifacts` (pi `getProjectArtifactsDir`, `shared/artifacts.ts:12-14`).
+/// `<cwd>/.cyrup-subagents/artifacts` (pi `getProjectArtifactsDir`, `shared/artifacts.ts:137-139`).
 #[must_use]
 pub fn project_artifacts_dir(cwd: &Path) -> PathBuf {
     project_subagents_dir(cwd).join(ARTIFACTS_SUBDIR)
 }
 
-/// `<cwd>/.cyrup-subagents/chain-runs` (pi `getProjectChainRunsDir`, `shared/artifacts.ts:16-18`).
+/// `<cwd>/.cyrup-subagents/chain-runs` (pi `getProjectChainRunsDir`, `shared/artifacts.ts:141-143`).
 #[must_use]
 pub fn project_chain_runs_dir(cwd: &Path) -> PathBuf {
     project_subagents_dir(cwd).join(CHAIN_RUNS_SUBDIR)
 }
 
 /// The scoped-temp artifacts root for `cwd` — the Rust analog of pi's `TEMP_ARTIFACTS_DIR`
-/// (`types.ts:961`), keyed per-`cwd` under the SAME `<home>/.cyrup/subagents` root the async/results
+/// (`shared/types.ts:1866`), keyed per-`cwd` under the SAME `<home>/.cyrup/subagents` root the async/results
 /// dirs use ([`crate::background::run_artifact_roots`]).
 #[must_use]
 pub fn temp_artifacts_dir(cwd: &Path) -> PathBuf {
@@ -162,7 +162,7 @@ pub fn chain_runs_dir(cwd: &Path) -> PathBuf {
     subagents_home().join(CHAIN_RUNS_SUBDIR).join(cwd_key(cwd))
 }
 
-/// Resolve the artifacts directory for a run (pi `getArtifactsDir`, `shared/artifacts.ts:20-27`):
+/// Resolve the artifacts directory for a run (pi `getArtifactsDir`, `shared/artifacts.ts:160-184`):
 /// a `project_cwd` wins (project-local artifacts dir), else a `session_file`'s sibling
 /// `subagent-artifacts` dir, else the scoped temp root keyed by `temp_cwd`.
 #[must_use]
@@ -183,7 +183,7 @@ pub fn resolve_artifacts_dir(
 }
 
 /// Replace every character outside pi's `[\w.-]` class with `_` (pi `safeAgent`,
-/// `shared/artifacts.ts:31`). `\w` in the pi regex (no `u` flag) is exactly ASCII `[A-Za-z0-9_]`.
+/// `shared/artifacts.ts:188`). `\w` in the pi regex (no `u` flag) is exactly ASCII `[A-Za-z0-9_]`.
 fn safe_agent(agent: &str) -> String {
     agent
         .chars()
@@ -197,7 +197,7 @@ fn safe_agent(agent: &str) -> String {
         .collect()
 }
 
-/// The four artifact paths for one run (pi `getArtifactPaths`, `shared/artifacts.ts:29-39`): base is
+/// The four artifact paths for one run (pi `getArtifactPaths`, `shared/artifacts.ts:186-197`): base is
 /// `<runId>_<safeAgent>[_<index>]`, with a per-fan-out `_<index>` suffix only when `index` is set.
 #[must_use]
 pub fn artifact_paths(dir: &Path, run_id: &str, agent: &str, index: Option<usize>) -> ArtifactPaths {
@@ -212,7 +212,7 @@ pub fn artifact_paths(dir: &Path, run_id: &str, agent: &str, index: Option<usize
 }
 
 /// Create the artifacts dir + every missing parent (pi `ensureArtifactsDir`,
-/// `shared/artifacts.ts:41-43`).
+/// `shared/artifacts.ts:199-201`).
 ///
 /// # Errors
 /// Propagates the underlying `create_dir_all` error.
@@ -220,7 +220,7 @@ pub fn ensure_artifacts_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// Write one artifact file's UTF-8 content (pi `writeArtifact`, `shared/artifacts.ts:45-47`).
+/// Write one artifact file's UTF-8 content (pi `writeArtifact`, `shared/artifacts.ts:203-206`).
 ///
 /// # Errors
 /// Propagates the underlying write error.
@@ -228,7 +228,7 @@ pub fn write_artifact(path: &Path, content: &str) -> io::Result<()> {
     std::fs::write(path, content)
 }
 
-/// Write a pretty-printed JSON metadata file (pi `writeMetadata`, `shared/artifacts.ts:49-51`,
+/// Write a pretty-printed JSON metadata file (pi `writeMetadata`, `shared/artifacts.ts:221-224`,
 /// which uses `JSON.stringify(metadata, null, 2)`).
 ///
 /// # Errors
@@ -240,7 +240,7 @@ pub fn write_metadata(path: &Path, metadata: &serde_json::Value) -> io::Result<(
 }
 
 /// Append one newline-terminated line to the `.jsonl` event stream (pi `appendJsonl`,
-/// `shared/artifacts.ts:53-55`).
+/// `shared/artifacts.ts:226-228`).
 ///
 /// # Errors
 /// Propagates the underlying open/append error.
@@ -263,7 +263,7 @@ fn now_ms() -> u128 {
 }
 
 /// 24h-throttled sweep of artifacts older than `max_age_days` in one directory (pi
-/// `cleanupOldArtifacts`, `shared/artifacts.ts:57-86`).
+/// `cleanupOldArtifacts`, `shared/artifacts.ts:230-259`).
 ///
 /// A `.last-cleanup` marker at the dir root gates re-scanning to at most once per 24h: if the marker
 /// was touched within the last day the sweep returns immediately (this is what makes the sweep cheap
@@ -309,7 +309,7 @@ pub fn cleanup_old_artifacts(dir: &Path, max_age_days: u64) {
 }
 
 /// Sweep every artifact directory this crate writes to (pi `cleanupAllArtifactDirs`,
-/// `shared/artifacts.ts:88-112`): the scoped temp artifacts root for `cwd`, plus each persisted
+/// `shared/artifacts.ts:261-285`): the scoped temp artifacts root for `cwd`, plus each persisted
 /// session's sibling `subagent-artifacts` directory under `<home>/.cyrup/sessions`. Best-effort: an
 /// unreadable sessions root or session dir is skipped rather than failing startup.
 pub fn cleanup_all_artifact_dirs(cwd: &Path, max_age_days: u64) {
@@ -329,7 +329,7 @@ pub fn cleanup_all_artifact_dirs(cwd: &Path, max_age_days: u64) {
 }
 
 /// Remove chain-run scratch directories older than 24h (pi `cleanupOldChainDirs`,
-/// `shared/settings.ts:162-185`). Unlike [`cleanup_old_artifacts`] this is unthrottled and operates
+/// `shared/settings.ts:197-220`). Unlike [`cleanup_old_artifacts`] this is unthrottled and operates
 /// on whole subdirectories (each `<chainRunsDir>/<runId>/`), matching pi. Best-effort: a dir that
 /// cannot be stat'd or removed is skipped.
 pub fn cleanup_old_chain_dirs(cwd: &Path) {
@@ -416,7 +416,7 @@ pub fn write_run_artifacts(
 }
 
 /// Build the `_meta.json` metadata value for one completed run (T6, pi
-/// `runs/foreground/execution.ts:1053-1068` and the identical `metadataPath` write in the async
+/// `persistSingleResultMetadata`, `runs/foreground/execution.ts:128-167` — and the identical `metadataPath` write in the async
 /// runner, `runs/background/subagent-runner.ts:1121-1134` @v0.34.0). Carries the fields this
 /// crate's [`SingleResult`] actually knows: `runId`/`agent`/`task`/`exitCode`/`usage`/`model`/
 /// `attemptedModels`/`modelAttempts`/`toolCount`/`error`/`timestamp`. Pi additionally records

@@ -141,6 +141,14 @@ pub enum EditorAction {
     Tab,
     JumpForward,
     JumpBackward,
+    /// Move the caret UP one page inside the editor buffer — `tui.editor.pageUp`
+    /// (`tui/src/keybindings.ts:89`, handled at `tui/src/components/editor.ts:856` →
+    /// `pageScroll(-1)`, `:1857`). A page is `max(5, floor(terminalRows * 0.3))` **visual** lines,
+    /// the same window [`crate::app::max_visible_editor_lines`] sizes the editor slot from.
+    PageUp,
+    /// Move the caret DOWN one page inside the editor buffer — `tui.editor.pageDown`
+    /// (`tui/src/keybindings.ts:90`; `editor.ts:860` → `pageScroll(1)`).
+    PageDown,
 }
 
 impl EditorAction {
@@ -171,6 +179,8 @@ impl EditorAction {
             "editor.tab" => E::Tab,
             "editor.jumpForward" => E::JumpForward,
             "editor.jumpBackward" => E::JumpBackward,
+            "editor.pageUp" => E::PageUp,
+            "editor.pageDown" => E::PageDown,
             _ => return None,
         })
     }
@@ -277,6 +287,10 @@ impl Key {
                 "end" => code = Some(KeyCode::End),
                 "backspace" => code = Some(KeyCode::Backspace),
                 "delete" | "del" => code = Some(KeyCode::Delete),
+                // Upstream `KeyId` spells these `pageUp`/`pageDown` (`tui/src/keys.ts:122-123`);
+                // `label()` emits the lowercased `pageup`/`pagedown`, so both round-trip.
+                "pageup" | "pgup" => code = Some(KeyCode::PageUp),
+                "pagedown" | "pgdn" => code = Some(KeyCode::PageDown),
                 other => {
                     let mut chars = other.chars();
                     match (chars.next(), chars.next()) {
@@ -335,7 +349,13 @@ impl Key {
             KeyCode::Enter => "enter".to_string(),
             KeyCode::Tab => "tab".to_string(),
             KeyCode::BackTab => "shift+tab".to_string(),
-            KeyCode::Esc => "esc".to_string(),
+            // Upstream's key id is the full word: `"app.interrupt": { defaultKeys: "escape" }`
+            // (v0.84.1 `coding-agent/src/core/keybindings.ts:66`), `"tui.select.cancel": {
+            // defaultKeys: ["escape", "ctrl+c"] }` (`tui/src/keybindings.ts:149-152`), and
+            // `formatKeyText` (`keybinding-hints.ts:17-27`) never abbreviates — it only splits on
+            // `/` and `+` and rewrites `alt`→`option` on darwin. So every hint reads `escape
+            // interrupt`, not `esc interrupt`. [`Key::parse`] accepts both spellings.
+            KeyCode::Esc => "escape".to_string(),
             KeyCode::Up => "up".to_string(),
             KeyCode::Down => "down".to_string(),
             KeyCode::Left => "left".to_string(),
@@ -423,10 +443,32 @@ impl Keymap {
         self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| *k).collect()
     }
 
-    /// The label of the first key bound to `action` (`esc`, `ctrl+c`), or `None` if unbound. Drives
-    /// status-band hints like `(esc to cancel)` from the live keymap (spec/tui/01 §6.1).
+    /// The label of the first key bound to `action` (`escape`, `ctrl+c`), or `None` if unbound.
+    ///
+    /// Prefer [`keys_label`](Self::keys_label) for anything the user READS: upstream's hint helpers
+    /// all funnel through `keyText`, which joins every bound key. This first-key form is for callers
+    /// that genuinely need one key.
     pub fn key_label(&self, action: Action) -> Option<String> {
         self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+    }
+
+    /// **All** keys bound to `action`, joined with `/` — Pi's `keyText`, i.e.
+    /// `formatKeys(getKeybindings().getKeys(keybinding))` = `formatKeyText(keys.join("/"))`
+    /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's
+    /// `keys.length === 0` → `""`).
+    ///
+    /// This is what every `hint(…)` / `keyHint(…)` in the startup block and the status band renders
+    /// (`interactive-mode.ts:936-946`, `status-indicator.ts:47,78,100`), so a rebind that binds two
+    /// keys shows both instead of silently hiding the second. The app-tier twin of
+    /// [`SelectKeymap::keys_label`].
+    pub fn keys_label(&self, action: Action) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
     }
 
     /// Rebind `action` to exactly `keys`, dropping any keys it was previously bound to **and** taking
@@ -492,6 +534,32 @@ impl SelectKeymap {
     /// Resolve the selector action for an event, if any (R-10-018: never compare keys inline).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<SelectAction> {
         self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// The label of the first key bound to `action` (`esc`, `enter`), or `None` if unbound — the
+    /// selector-tier twin of [`Keymap::key_label`]. Drives Pi's `keyHint("tui.select.cancel",
+    /// "to cancel")` dialog hints (`keybinding-hints.ts:12-27`) from the LIVE keymap, so a
+    /// `keybindings.json` rebind of `tui.select.*` changes the hint text too (spec/tui/05 §10; the
+    /// cancel text is never hardcoded).
+    pub fn key_label(&self, action: SelectAction) -> Option<String> {
+        self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+    }
+
+    /// **All** keys bound to `action`, joined with `/` — Pi's `keyText`, which is
+    /// `formatKeys(getKeybindings().getKeys(keybinding))` = `formatKeyText(keys.join("/"))`
+    /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's `keys.length ===
+    /// 0` → `""`).
+    ///
+    /// This is what a `keyHint("tui.select.cancel", …)` renders: with the stock bindings
+    /// (`tui/src/keybindings.ts:149-152`) it is `escape/ctrl+c`, not just the first key.
+    pub fn keys_label(&self, action: SelectAction) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
     }
 
     /// Rebind `action` to exactly `keys`.
@@ -667,6 +735,24 @@ impl ModelsKeymap {
         self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
+    /// **All** keys bound to `action`, joined with `/` — the `app.models.*` twin of
+    /// [`SelectKeymap::keys_label`], i.e. Pi's `keyText("app.models.…")`
+    /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's
+    /// `keys.length === 0` → `""`).
+    ///
+    /// Read **only** by the `/scoped-models` footer hint
+    /// (`scoped-models-selector.ts:197-205`), which is the only place upstream calls `keyText` on
+    /// an `app.models.*` id.
+    pub fn keys_label(&self, action: ModelsAction) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
+    }
+
     /// Rebind `action` to exactly `keys`.
     pub fn set_action(&mut self, action: ModelsAction, keys: Vec<Key>) {
         self.bindings.retain(|(_, a)| *a != action);
@@ -679,6 +765,101 @@ impl ModelsKeymap {
     pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
         for (id, value) in keybindings_object(json)? {
             if let Some(action) = ModelsAction::from_id(&id) {
+                self.set_action(action, parse_key_values(&value)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `/resume` session-picker actions (`session-selector.ts:532-637`; `core/keybindings.ts:91-94,
+/// 135-154` `app.session.*`). These bind only inside the session selector, on top of the shared
+/// `tui.select.*` navigation; resolved via [`SessionKeymap`] (R-10-018).
+///
+/// The header's second hint row names **every one of them** through `keyHint("app.session.…", …)`
+/// (`session-selector.ts:171-179`), so a rebind has to reach the hint text as well as the handler —
+/// which is exactly what a hardcoded `"ctrl+s sort · ctrl+n named · …"` string cannot do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SessionAction {
+    /// Cycle threaded → recent → fuzzy — `app.session.toggleSort` (Ctrl+S).
+    ToggleSort,
+    /// Toggle the all ↔ named filter — `app.session.toggleNamedFilter` (Ctrl+N).
+    ToggleNamedFilter,
+    /// Ask to delete the highlighted session — `app.session.delete` (Ctrl+D).
+    Delete,
+    /// Fold the session path into the metadata column — `app.session.togglePath` (Ctrl+P).
+    TogglePath,
+    /// Rename the highlighted session — `app.session.rename` (Ctrl+R).
+    Rename,
+}
+
+impl SessionAction {
+    /// Resolve an `app.session.*` binding id (`core/keybindings.ts:91-94,135-154`).
+    pub fn from_id(id: &str) -> Option<SessionAction> {
+        match id {
+            "app.session.toggleSort" => Some(SessionAction::ToggleSort),
+            "app.session.toggleNamedFilter" => Some(SessionAction::ToggleNamedFilter),
+            "app.session.delete" => Some(SessionAction::Delete),
+            "app.session.togglePath" => Some(SessionAction::TogglePath),
+            "app.session.rename" => Some(SessionAction::Rename),
+            _ => None,
+        }
+    }
+}
+
+/// The configurable `/resume` binding table. Defaults are upstream's verbatim
+/// (`core/keybindings.ts:91-94` Ctrl+N, `:135-150` Ctrl+P / Ctrl+S / Ctrl+R / Ctrl+D).
+#[derive(Clone, Debug)]
+pub struct SessionKeymap {
+    bindings: Vec<(Key, SessionAction)>,
+}
+
+impl Default for SessionKeymap {
+    fn default() -> Self {
+        use SessionAction as S;
+        SessionKeymap {
+            bindings: vec![
+                (Key::ctrl('s'), S::ToggleSort),
+                (Key::ctrl('n'), S::ToggleNamedFilter),
+                (Key::ctrl('d'), S::Delete),
+                (Key::ctrl('p'), S::TogglePath),
+                (Key::ctrl('r'), S::Rename),
+            ],
+        }
+    }
+}
+
+impl SessionKeymap {
+    /// Resolve the session-picker action for an event, if any (R-10-018).
+    pub fn action_for(&self, ev: &KeyEvent) -> Option<SessionAction> {
+        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// **All** keys bound to `action`, joined with `/` — Pi's `keyText("app.session.…")`
+    /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's
+    /// `keys.length === 0` → `""`).
+    pub fn keys_label(&self, action: SessionAction) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
+    }
+
+    /// Rebind `action` to exactly `keys`.
+    pub fn set_action(&mut self, action: SessionAction, keys: Vec<Key>) {
+        self.bindings.retain(|(_, a)| *a != action);
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document, applying only the `app.session.*` ids.
+    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
+        for (id, value) in keybindings_object(json)? {
+            if let Some(action) = SessionAction::from_id(&id) {
                 self.set_action(action, parse_key_values(&value)?);
             }
         }
@@ -770,7 +951,9 @@ pub struct EditorKeymap {
 impl Default for EditorKeymap {
     fn default() -> Self {
         use EditorAction as E;
-        use KeyCode::{Backspace, Char, Delete, Down, End, Enter, Home, Left, Right, Tab, Up};
+        use KeyCode::{
+            Backspace, Char, Delete, Down, End, Enter, Home, Left, PageDown, PageUp, Right, Tab, Up,
+        };
         let ctrl = |c: char| Key { code: Char(c), mods: KeyModifiers::CONTROL };
         let alt = |c: char| Key { code: Char(c), mods: KeyModifiers::ALT };
         let alt_code = |code: KeyCode| Key { code, mods: KeyModifiers::ALT };
@@ -791,9 +974,23 @@ impl Default for EditorKeymap {
                 (ctrl_code(Right), E::CursorWordRight),
                 (alt('f'), E::CursorWordRight),
                 (Key::plain(Home), E::CursorLineStart),
+                // `ctrl+home` / `ctrl+end` joined the line-start/line-end key sets in **v0.84.1**
+                // (`tui/src/keybindings.ts:92-99`: `["home", "ctrl+home", "ctrl+a"]` /
+                // `["end", "ctrl+end", "ctrl+e"]`); at the v0.83.0 baseline the sets were
+                // `["home","ctrl+a"]` / `["end","ctrl+e"]`. Version lag, not a port bug.
+                (ctrl_code(Home), E::CursorLineStart),
                 (ctrl('a'), E::CursorLineStart),
                 (Key::plain(End), E::CursorLineEnd),
+                (ctrl_code(End), E::CursorLineEnd),
                 (ctrl('e'), E::CursorLineEnd),
+                // Page motion (`keybindings.ts:89-90` at v0.83.0 — `pageUp`/`pageDown` are EDITOR
+                // bindings upstream and always have been; pi has no `app.pageUp` at either tag).
+                // `ctrl+pageUp`/`ctrl+pageDown` were added to the same sets in v0.84.1
+                // (`keybindings.ts:108-109`).
+                (Key::plain(PageUp), E::PageUp),
+                (ctrl_code(PageUp), E::PageUp),
+                (Key::plain(PageDown), E::PageDown),
+                (ctrl_code(PageDown), E::PageDown),
                 // Deletion + kill ring (`:79-110`).
                 (Key::plain(Backspace), E::DeleteCharBackward),
                 (Key::plain(Delete), E::DeleteCharForward),
@@ -845,6 +1042,21 @@ impl EditorKeymap {
     /// the `/hotkeys` table from the live editor keymap (`getEditorKeyDisplay`, interactive-mode.ts).
     pub fn key_label(&self, action: EditorAction) -> Option<String> {
         self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+    }
+
+    /// **All** keys bound to `action`, joined with `/` — Pi's `keyText`
+    /// (`keybinding-hints.ts:29-36`). The editor-tier twin of [`Keymap::keys_label`] /
+    /// [`SelectKeymap::keys_label`]; a hint row that names an editor binding must show every bound
+    /// key, e.g. `tui.input.newLine`'s stock `["shift+enter", "ctrl+j"]`
+    /// (pi `tui/src/keybindings.ts:137`) renders as `shift+enter/ctrl+j`.
+    pub fn keys_label(&self, action: EditorAction) -> Option<String> {
+        let keys: Vec<String> =
+            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.join("/"))
+        }
     }
 
     /// Rebind `action` to exactly `keys`.

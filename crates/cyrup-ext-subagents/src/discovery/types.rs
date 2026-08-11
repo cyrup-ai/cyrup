@@ -136,7 +136,7 @@ impl ToolRef {
     }
 
     /// Split one raw `tools`-list string into its typed [`ToolRef`] shape, exactly as
-    /// `frontmatter::parse_tool_refs` and pi's `splitToolList` (`agents.ts:438-452`) do: an
+    /// `frontmatter::parse_tool_refs` and pi's `splitToolList` (`agents.ts:531-545`) do: an
     /// `mcp:`-prefixed entry becomes [`ToolRef::Mcp`] with the `mcp:` PREFIX STRIPPED (so
     /// `"mcp:server.tool"` → `Mcp("server.tool")`, matching pi's `tool.slice(4)`); every other
     /// entry becomes [`ToolRef::Builtin`]. Used by this type's own string-form [`Deserialize`](
@@ -410,7 +410,7 @@ pub struct AgentOverrideInfo {
 /// Per-field three-state override delta for one agent name, as read from
 /// `subagents.agentOverrides.<name>` in `cyrup-config`'s layered, untyped settings map (func-SA
 /// §4.1). **This is a field-for-field port of pi's `BuiltinAgentOverrideConfig`
-/// (`agents.ts:65-79`)** — every field below is exactly one pi override field, and pi has no
+/// (`agents.ts:82-100`)** — every field below is exactly one pi override field, and pi has no
 /// others:
 ///
 /// - pi's `string | false` / `string[] | false` / `AgentDefaultContext | false` fields
@@ -434,7 +434,7 @@ pub struct AgentOverrideConfig {
     pub model: OverrideField<String>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub fallback_models: OverrideField<Vec<String>>,
-    /// pi's `subagents.overrides.<name>.thinking` (`agents.ts:66,599-602`) is a `string | false`:
+    /// pi's `subagents.overrides.<name>.thinking` (`agents.ts:64,596,1011` @v0.43.0) is a `string | false`:
     /// an OPEN reasoning-level string (`"off"`, `"high"`, or any future/provider-specific value),
     /// or the literal `false` (explicit-clear). Modeled as `OverrideField<String>` — NOT a closed
     /// [`cyrup_core::ThinkingLevel`] enum — so an arbitrary pi thinking value (notably `"off"`, which
@@ -444,31 +444,31 @@ pub struct AgentOverrideConfig {
     pub thinking: OverrideField<String>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub system_prompt_mode: OverrideField<SystemPromptMode>,
-    /// pi `inheritProjectContext?: boolean` (`agents.ts:70`). A plain boolean toggle (no `| false`
+    /// pi `inheritProjectContext?: boolean` (`agents.ts:88`). A plain boolean toggle (no `| false`
     /// clear form): `Value(true)`/`Value(false)` are both real settings.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub inherit_project_context: OverrideField<bool>,
-    /// pi `inheritSkills?: boolean` (`agents.ts:71`).
+    /// pi `inheritSkills?: boolean` (`agents.ts:89`).
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub inherit_skills: OverrideField<bool>,
-    /// pi `defaultContext?: AgentDefaultContext | false` (`agents.ts:72`) — `"fresh"`/`"fork"`
+    /// pi `defaultContext?: AgentDefaultContext | false` (`agents.ts:90`) — `"fresh"`/`"fork"`
     /// deserialize to [`OverrideField::Value`], a JSON `false` to [`OverrideField::ExplicitClear`].
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub default_context: OverrideField<ContextMode>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub disabled: OverrideField<bool>,
-    /// pi `systemPrompt?: string` (`agents.ts:74`). Applied to a BUILTIN agent's body only (pi's
+    /// pi `systemPrompt?: string` (`agents.ts:93`). Applied to a BUILTIN agent's body only (pi's
     /// `applyBuiltinOverride` sets it; `applyCustomAgentOverride` deliberately omits it), replacing
     /// the builtin persona's own frontmatter prose.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub system_prompt: OverrideField<String>,
-    /// pi `skills?: string[] | false` (`agents.ts:75`) — the proactive skill-pointer list, or a
+    /// pi `skills?: string[] | false` (`agents.ts:94`) — the proactive skill-pointer list, or a
     /// JSON `false` to clear it.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub skills: OverrideField<Vec<String>>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub tools: OverrideField<Vec<ToolRef>>,
-    /// pi `subagentOnlyExtensions?: string[] | false` (`agents.ts:77`) — child-only extension
+    /// pi `subagentOnlyExtensions?: string[] | false` (`agents.ts:97`) — child-only extension
     /// paths, or a JSON `false` to clear them.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub subagent_only_extensions: OverrideField<Vec<String>>,
@@ -510,6 +510,19 @@ pub struct SubagentSettings {
     pub overrides: BTreeMap<String, AgentOverrideConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// pi's `subagents.defaultThinking` (`agents.ts:164`) — a crate-wide reasoning-level default
+    /// filled into every agent whose own `thinking` is unset (`applySubagentDefaultThinking`,
+    /// `agents.ts:955-964`). Validated as a NON-EMPTY string and stored trimmed
+    /// (`agents.ts:955-964`); a malformed value MUST abort discovery (R-SA-009).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_thinking: Option<String>,
+    /// pi's `subagents.defaultExtensions` (`agents.ts:165`) — a crate-wide extension allowlist
+    /// filled into every agent whose own `extensions` is unset
+    /// (`applySubagentDefaultExtensions`, `agents.ts:975-984`), which also stamps
+    /// [`AgentDefinition::extensions_from_default`]. Validated as an array of NON-EMPTY strings and
+    /// stored trimmed (`agents.ts:890-897`); a malformed value MUST abort discovery (R-SA-009).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_extensions: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_builtins: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -532,7 +545,7 @@ pub struct SubagentSettings {
 /// precedence at APPLICATION time and record the real winning scope + settings-file path in
 /// [`AgentOverrideInfo`] — exactly as pi's `discoverAgents` holds `userSettings`/`projectSettings`
 /// plus `userSettingsPath`/`projectSettingsPath` and hands all four to
-/// `applyBuiltinOverrides`/`applyCustomAgentOverrides` (`agents.ts:785-943`, `1282-1298`).
+/// `applyBuiltinOverrides`/`applyCustomAgentOverrides` (`agents.ts:1039-1213`, `1282-1298`).
 ///
 /// Pre-flattening the two scopes into a single [`SubagentSettings`] (the pre-Tier-7 shape)
 /// irrecoverably loses *which* scope an applied override came from — which is why the provenance
@@ -565,7 +578,7 @@ pub struct LayeredOverrideSettings {
 
 impl LayeredOverrideSettings {
     /// The effective `subagents.modelScope` policy for this cwd — pi's
-    /// `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1404`): the project
+    /// `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1738`): the project
     /// scope wins outright when present (it is not merged field-by-field with the user scope),
     /// else the user scope applies, else there is no policy and enforcement is off.
     #[must_use]
@@ -596,6 +609,90 @@ pub enum AgentModelSourceInfo {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Per-agent persistent memory (`memory:` frontmatter) — pi `agents/agent-memory.ts`
+// ---------------------------------------------------------------------------------------------
+
+/// Which root a `memory:` scope resolves under — a direct port of pi's
+/// `AgentMemoryConfig["scope"]` (`agent-memory.ts:54`), which admits exactly `"project"` and
+/// `"user"` and treats every other value as "no memory config at all".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryScope {
+    /// `<projectConfigDir>/agent-memory/<path>` — resolved against the nearest project root
+    /// (`agent-memory.ts:201-204`). An agent with a project scope and NO discoverable project root
+    /// gets no memory block at all.
+    Project,
+    /// `<agentDir>/agent-memory/<path>` (`agent-memory.ts:199`).
+    User,
+}
+
+/// One agent's `memory:` frontmatter block, parsed (pi `AgentMemoryConfig`). BOTH fields are
+/// required — `parseMemoryFrontmatter` returns `undefined` unless `scope` is one of the two legal
+/// values AND a non-empty `path` is present (`agent-memory.ts:53-58`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentMemoryConfig {
+    pub scope: MemoryScope,
+    /// A RELATIVE path under the scope root. Containment is enforced at resolve time
+    /// (`crate::discovery::agent_memory::resolve_memory_dir`), not here — the parser stores the
+    /// raw declared value so serialization round-trips exactly what the author wrote.
+    pub path: String,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-agent tool budgets (`toolBudget:` frontmatter) — pi `runs/shared/tool-budget.ts`
+// ---------------------------------------------------------------------------------------------
+
+/// Which tools a hard-exhausted budget blocks — pi `ToolBudgetConfig["block"]`
+/// (`shared/types.ts`), normalized by `normalizeToolBudgetBlock` (`tool-budget.ts:7-11`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ToolBudgetBlock {
+    /// The literal `"*"` — block EVERY tool once the hard limit is crossed.
+    All(AllToolsMarker),
+    /// An explicit tool-name list. An omitted `block` normalizes to pi's
+    /// `DEFAULT_TOOL_BUDGET_BLOCK` (`["read", "grep", "find", "ls"]`, `tool-budget.ts:3`).
+    Names(Vec<String>),
+}
+
+/// The `"*"` literal, as a type so [`ToolBudgetBlock`] can serialize back to the exact JSON shape
+/// pi's schema advertises (`{"anyOf": [{"type":"array",…}, {"type":"string","enum":["*"]}]}`,
+/// `schemas.ts:109-114`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllToolsMarker;
+
+impl serde::Serialize for AllToolsMarker {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str("*")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AllToolsMarker {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        if raw == "*" {
+            Ok(AllToolsMarker)
+        } else {
+            Err(serde::de::Error::custom("expected \"*\""))
+        }
+    }
+}
+
+/// A VALIDATED, normalized tool budget — pi `ResolvedToolBudget`. Produced only by
+/// [`crate::exec::tool_budget::validate_tool_budget_config`], never constructed straight from
+/// user input, so every instance satisfies `hard >= 1`, `soft >= 1`, `soft <= hard` and a
+/// non-empty `block`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedToolBudget {
+    /// Tool calls allowed before [`ToolBudgetBlock`] tools start being refused. Integer >= 1.
+    pub hard: u32,
+    /// Optional advisory threshold: at this count the child is nudged once to wrap up. Integer
+    /// >= 1 and <= `hard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft: Option<u32>,
+    pub block: ToolBudgetBlock,
+}
+
+// ---------------------------------------------------------------------------------------------
 // AgentDefinition (R-SA-005..022)
 // ---------------------------------------------------------------------------------------------
 
@@ -613,6 +710,20 @@ pub struct AgentDefinition {
     pub local_name: String,
     pub package_name: Option<String>,
     pub description: String,
+    /// Alternate names this agent also answers to (pi `AgentConfig.aliases`, `agents.ts:121`), from
+    /// the `aliases:`/`alias:` frontmatter key. Already normalized by
+    /// [`crate::discovery::frontmatter::normalize_agent_aliases`] (pi `normalizeAgentAliases`,
+    /// `agents.ts:495-499`): trimmed, de-duplicated in first-seen order, empties dropped, and the
+    /// agent's own runtime `name` removed — so an alias never shadows the canonical name.
+    ///
+    /// EMPTY means "no aliases", which is exactly pi's `undefined` (its `normalizeAgentAliases`
+    /// returns `undefined` rather than `[]` for an empty result, and `serializeAgent`'s `joinComma`
+    /// maps `[]` back to `undefined`), so no separate `Option` layer is needed.
+    ///
+    /// Resolution is alias-aware but NAME-FIRST: [`crate::discovery::resolve_agent_name`] matches
+    /// `name`/`local_name` before it ever looks at this list, and a non-unique alias is a hard
+    /// ambiguity error rather than an arbitrary pick (pi `resolveAgentName`, `agents.ts:511-529`).
+    pub aliases: Vec<String>,
     /// `None` = no allowlist restriction (all builtin tools available); `Some(vec![])` = no
     /// tools; `Some(populated)` = exactly this allowlist. Distinct from `extensions` below, which
     /// has an independently-meaningful `None`/empty/populated tri-state (func-SA §4.1).
@@ -620,13 +731,23 @@ pub struct AgentDefinition {
     /// `None` = all extensions visible; `Some(vec![])` = none; `Some(populated)` = allowlist
     /// (func-SA §4.1).
     pub extensions: Option<Vec<String>>,
+    /// True iff [`Self::extensions`] was filled in from `subagents.defaultExtensions` rather than
+    /// declared by the agent itself (pi `AgentConfig.extensionsFromDefault`, `agents.ts:142`, set by
+    /// `applySubagentDefaultExtensions`, `agents.ts:979`).
+    ///
+    /// Load-bearing in exactly two places, both of which must NOT treat a settings-supplied default
+    /// as the agent's own data: `editable_base` (pi `editableAgentConfig`,
+    /// `agent-management.ts:243`) — so a management update never BAKES the settings default into the
+    /// agent's `.md` file — and `clone_override_base` (pi `cloneOverrideBase`, `agents.ts:582`) — so
+    /// an override's restore-baseline does not capture it either.
+    pub extensions_from_default: bool,
     /// Child-only extension paths — visible to a spawned subagent even when not visible to the
     /// orchestrator itself.
     pub subagent_only_extensions: Vec<String>,
     pub model: Option<ModelId>,
     pub fallback_models: Vec<ModelId>,
     /// The agent's own frontmatter `thinking` value, held as pi's OPEN reasoning-level string
-    /// (`AgentConfig.thinking?: string`, `agents.ts:103,171`) rather than a closed
+    /// (`AgentConfig.thinking?: string`, `agents.ts:64,86,126` @v0.43.0) rather than a closed
     /// [`cyrup_core::ThinkingLevel`] enum. `None` means the frontmatter said nothing (unset);
     /// `Some("off")` is an EXPLICIT off (distinct from unset — the on-only enum could name neither);
     /// `Some("high")`/etc. are on-levels; any other string (a future or provider-specific level) is
@@ -665,6 +786,27 @@ pub struct AgentDefinition {
     /// `merge.rs`/`exec/`, not defaulted eagerly here so `present_fields` can still distinguish
     /// "agent declared `defaultContext`" from "agent said nothing").
     pub default_context: Option<ContextMode>,
+    /// pi `AgentConfig.defaultAsync` (`agents.ts:131`), from `async:` frontmatter. An agent-level
+    /// LAUNCH DEFAULT: it applies ONLY when a single-agent call site omits `async` entirely
+    /// (`applySingleAgentLaunchDefaults`, `subagent-executor.ts:1929-1946`). It never overrides an
+    /// explicit call-site value, and never applies to a chain/parallel launch.
+    pub default_async: Option<bool>,
+    /// pi `AgentConfig.defaultTimeoutMs` (`agents.ts:132`), from `timeoutMs:` frontmatter. Same
+    /// launch-default precedence as [`Self::default_async`], with the extra rule that an explicit
+    /// call-site `maxRuntimeMs` (the alias of `timeoutMs`) ALSO suppresses it
+    /// (`subagent-executor.ts:1937`).
+    pub default_timeout_ms: Option<u64>,
+    /// The agent's `memory:` scope (pi `AgentConfig.memory`, `agents.ts` + `agent-memory.ts`).
+    /// `None` means the agent declared none, or declared one that failed validation (pi's
+    /// `parseMemoryFrontmatter` returns `undefined` for both). When set, spawn time resolves it to
+    /// a directory and folds a persistent-memory block into the child's system prompt — see
+    /// [`crate::discovery::agent_memory::build_agent_memory_injection`].
+    pub memory: Option<AgentMemoryConfig>,
+    /// The agent's `toolBudget:` (pi `AgentConfig.toolBudget`, `agents.ts` + `tool-budget.ts`),
+    /// already validated and normalized. `None` means the agent declared none. When set, spawn
+    /// time encodes it into the child's `CYRUP_SUBAGENT_TOOL_BUDGET` env var and the child-side
+    /// runtime enforces it (soft nudge + hard block).
+    pub tool_budget: Option<ResolvedToolBudget>,
     pub disabled: Option<bool>,
     /// The agent's own frontmatter-body prose, prior to any orchestrator-injected scaffolding
     /// (acceptance contract, skill pointers, project context) — combined per `system_prompt_mode`
@@ -744,7 +886,7 @@ pub enum ChainListBinding {
     List(Vec<String>),
 }
 
-/// One parsed chain STEP — a direct port of pi's `ChainStepConfig` (`agents.ts:136-156`). This is
+/// One parsed chain STEP — a direct port of pi's `ChainStepConfig` (`agents.ts:174-195`). This is
 /// the on-disk **authoring** shape a `.chain.md` `## <agent>` section or a `.chain.json` `chain[]`
 /// element deserializes to (func-SA §4.1/§4.2): deliberately permissive and data-only, distinct
 /// from the runtime dispatch form [`crate::spawn::chain_graph::RunnerStep`] (the `SingleStep |
@@ -816,7 +958,7 @@ pub struct ChainStepConfig {
 }
 
 /// One parsed chain (`.chain.md`/`.chain.json`) definition — a port of pi's `ChainConfig`
-/// (`agents.ts:158-167`). `name` is the fully-qualified RUNTIME name (`{package}.{local_name}` when
+/// (`agents.ts:197-206`). `name` is the fully-qualified RUNTIME name (`{package}.{local_name}` when
 /// packaged, else the bare `local_name`, via `buildRuntimeName`, `identity.ts:19-22`); `local_name`
 /// and `package_name` retain the pre-qualification identity so management/serialization can
 /// reconstruct the frontmatter/JSON `name`+`package` split (`frontmatterNameForConfig`). `steps`
@@ -931,8 +1073,10 @@ mod tests {
             local_name: "reviewer".to_string(),
             package_name: None,
             description: "reviews things".to_string(),
+            aliases: Vec::new(),
             tools,
             extensions: None,
+            extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
             model: None,
             fallback_models: Vec::new(),
@@ -948,6 +1092,10 @@ mod tests {
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            memory: None,
+            tool_budget: None,
             disabled: None,
             system_prompt_body: String::new(),
             source: AgentSource::User,
@@ -1070,7 +1218,7 @@ mod tests {
 
     #[test]
     fn agent_override_config_deserializes_all_pi_overridable_fields() {
-        // pi `BuiltinAgentOverrideConfig` (agents.ts:65-79): the six fields an earlier port dropped
+        // pi `BuiltinAgentOverrideConfig` (agents.ts:82-100): the six fields an earlier port dropped
         // (`inheritProjectContext`/`inheritSkills`/`defaultContext`/`systemPrompt`/`skills`/
         // `subagentOnlyExtensions`) must now deserialize, with the `| false` fields reading a JSON
         // `false` as an explicit clear and the plain-bool fields reading `false` as a real value.

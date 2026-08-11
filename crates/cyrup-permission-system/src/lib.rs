@@ -38,6 +38,18 @@
 //! built here is reachable from the wired gate, the shaping seam, the forwarding transport, or its
 //! integration tests.
 //!
+//! The extension's one HUMAN-visible registration is the `/permission-system` slash command (pi
+//! `index.ts:1502-1512`), registered from `init` and serviced by
+//! [`cyrup_ext::NativeExtension::execute_command`]. It is the cyrup expression of pi's settings
+//! modal (`config-modal.ts:63-123`) over the same two rows, and it is what makes the v0.8.0 config
+//! WRITE path reachable: [`PermissionSystemExtension::save_extension_config`] (pi
+//! `saveExtensionConfig`, `index.ts:1402-1420`) and [`PermissionSystemExtension::set_yolo_mode`] /
+//! [`PermissionSystemExtension::toggle_yolo_mode`] (pi `setYoloModeFromRuntimeApi`,
+//! `index.ts:1422-1469`) both land in [`ExtensionConfig::save`], whose merge-into-the-existing-
+//! document semantics — non-extension keys preserved, a corrupt file refused rather than clobbered,
+//! a symlinked config written through — were previously unobservable because the crate had no
+//! non-test caller for them at all (`tests/config_command.rs`).
+//!
 //! The AUDIT / DEBUG TRAIL is wired too ([`logging`], pi `logging.ts` + the `writeReviewEntry` call
 //! sites throughout `index.ts`): setting `"debug": true` in the `config.json` this crate itself
 //! materializes arms a JSONL trail at `<agent_dir>/cyrup-permission-system/logs/
@@ -74,6 +86,7 @@ pub mod status;
 pub mod stores;
 pub mod types;
 pub mod wildcard;
+pub mod yolo_api;
 
 pub use ask::{
     AskChannel, AskOutcome, ForwardingAskChannel, LocalAskChannel, NoOpAskChannel,
@@ -83,7 +96,7 @@ pub use error::PermissionError;
 pub use ext_config::ExtensionConfig;
 pub use extension::{
     is_installed, permission_extension_for_env, PermissionSystemExtension, CHILD_ENV_VAR,
-    EXTENSION_ID, INSTALL_ENV_VAR,
+    EXTENSION_ID, INSTALL_ENV_VAR, PERMISSION_SYSTEM_COMMAND,
 };
 pub use forwarding::{
     process_forwarded_requests, resolve_child_wait_timeout, spawn_forwarding_watcher,
@@ -95,3 +108,4 @@ pub use manager::{ManagerPaths, PermissionManager};
 pub use types::{
     CheckSource, PermissionCheckResult, PermissionState,
 };
+pub use yolo_api::{YoloModeControlOptions, YoloModeControlResult, DEFAULT_YOLO_CONTROL_SOURCE};

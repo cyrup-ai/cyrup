@@ -379,8 +379,16 @@ pub async fn generate_summary<S: Summarizer>(
         StopReason::Aborted => Err(CompactionError::Aborted),
         // An unsettled response is NOT a summary. The `_ =>` this replaces would have accepted a
         // `Pending` message's partial text as a finished summary and compacted the transcript
-        // against it — silently losing history to a truncated stream.
-        StopReason::Pending => Err(CompactionError::Summarization(
+        // against it — silently losing history to a truncated stream. `Deferred` is grouped here
+        // for the same reason and NOT with the success arm: a deferred turn is a receipt whose
+        // `content` is `[]` (`v0.84.1 ai/src/providers/faux.ts:293-296`), so accepting it would compact
+        // the transcript against an EMPTY summary. Pi's own compaction only special-cases
+        // `"aborted"`/`"error"` (`v0.84.1 agent/src/harness/compaction/compaction.ts:578,581` and
+        // `:832,835`) and would take the empty text — but it can never reach that state either:
+        // compaction never sets `SimpleStreamOptions.deferred` (`v0.84.1 ai/src/types.ts:307`) and
+        // every real provider throws for deferred (`v0.84.1 ai/src/models.ts:714,728`). Unreachable
+        // on both sides, so this is a strictly safer spelling of the same behaviour.
+        StopReason::Pending | StopReason::Deferred => Err(CompactionError::Summarization(
             resp.error_message.unwrap_or_else(|| PENDING_SUMMARY.to_string()),
         )),
         StopReason::Stop | StopReason::Length | StopReason::ToolUse => {
@@ -422,8 +430,16 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
         StopReason::Aborted => Err(CompactionError::Aborted),
         // An unsettled response is NOT a summary. The `_ =>` this replaces would have accepted a
         // `Pending` message's partial text as a finished summary and compacted the transcript
-        // against it — silently losing history to a truncated stream.
-        StopReason::Pending => Err(CompactionError::Summarization(
+        // against it — silently losing history to a truncated stream. `Deferred` is grouped here
+        // for the same reason and NOT with the success arm: a deferred turn is a receipt whose
+        // `content` is `[]` (`v0.84.1 ai/src/providers/faux.ts:293-296`), so accepting it would compact
+        // the transcript against an EMPTY summary. Pi's own compaction only special-cases
+        // `"aborted"`/`"error"` (`v0.84.1 agent/src/harness/compaction/compaction.ts:578,581` and
+        // `:832,835`) and would take the empty text — but it can never reach that state either:
+        // compaction never sets `SimpleStreamOptions.deferred` (`v0.84.1 ai/src/types.ts:307`) and
+        // every real provider throws for deferred (`v0.84.1 ai/src/models.ts:714,728`). Unreachable
+        // on both sides, so this is a strictly safer spelling of the same behaviour.
+        StopReason::Pending | StopReason::Deferred => Err(CompactionError::Summarization(
             resp.error_message.unwrap_or_else(|| PENDING_SUMMARY.to_string()),
         )),
         StopReason::Stop | StopReason::Length | StopReason::ToolUse => {

@@ -101,7 +101,9 @@ fn empty_assistant(model: &ModelRef) -> AssistantMessage {
         // `Stop` seed made a `message_start` emitted on a pre-first-event abort claim a completed
         // turn. It never reaches `message_end`: every return path stamps a settled reason.
         stop_reason: StopReason::Pending,
+        deferred: None,
         error_message: None,
+        raw_stop_reason: None,
         timestamp: 0,
     }
 }
@@ -1501,6 +1503,13 @@ impl Agent {
     pub async fn set_headers(&self, h: Option<cyrup_provider::HeaderMap>) {
         lock(&self.state).headers = h;
     }
+    /// Replace the preferred transport on the RUNNING agent — pi's `this.session.agent.transport =
+    /// transport` (`interactive-mode.ts:4215`), the second half of the `/settings` "Transport"
+    /// handler (the first half persists the setting). Applies from the next run onward, matching
+    /// pi's read of `this.transport` in `createLoopConfig` (agent.ts:442).
+    pub async fn set_transport(&self, t: Option<cyrup_provider::Transport>) {
+        lock(&self.state).transport = t;
+    }
     pub async fn set_thinking_level(&self, t: ModelThinkingLevel) {
         lock(&self.state).thinking_level = t;
     }
@@ -1678,7 +1687,7 @@ impl Agent {
         // `handleRunFailure(error, signal.aborted)`, agent.ts:490,496-511).
         let fail_cancel = cancel.clone();
 
-        let (system_prompt, model, thinking_level, tools, messages) = {
+        let (system_prompt, model, thinking_level, tools, messages, transport) = {
             let mut st = lock(&self.state);
             st.error_message = None;
             st.is_streaming = true;
@@ -1691,8 +1700,16 @@ impl Agent {
                 st.thinking_level,
                 st.tools.clone(),
                 st.messages.clone(),
+                st.transport,
             )
         };
+        // `transport` is LIVE state, not a build-time constant: pi reads `this.transport` when it
+        // assembles the loop config at RUN START (`createLoopConfig`, agent.ts:442) and the
+        // `/settings` row mutates that field on the running agent (`interactive-mode.ts:4215`).
+        // Overlaying it here — rather than reading it per-turn inside the loop — reproduces pi's
+        // snapshot semantics exactly: a `set_transport` between runs takes effect on the next run
+        // and never re-targets an in-flight one.
+        let gen_config = GenerationConfig { transport, ..self.gen_config.clone() };
 
         let mut rc = RunCtx::new(
             self.state.clone(),
@@ -1707,7 +1724,7 @@ impl Agent {
             system_prompt,
             model,
             thinking_level,
-            self.gen_config.clone(),
+            gen_config,
             tools,
             messages,
             cancel,
@@ -1970,6 +1987,9 @@ impl AgentBuilder {
             error_message: None,
             // Seeded from the builder, then kept LIVE by `set_headers`.
             headers: self.gen_config.headers.clone(),
+            // Same shape for `transport` (pi's public `agent.transport` field, agent.ts:204/228):
+            // seeded from `AgentBuilder::transport`, then kept LIVE by `set_transport`.
+            transport: self.gen_config.transport,
         };
         Agent {
             state: Arc::new(Mutex::new(state)),

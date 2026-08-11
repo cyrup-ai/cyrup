@@ -76,6 +76,11 @@ fn run_loop(
         terminal
             .draw(|frame| {
                 let area = frame.area();
+                // Pi passes `ui.terminal.rows` into `ConfigSelectorComponent`
+                // (`cli/config-selector.ts:47`), which turns it into the body window
+                // (`config-selector.ts:266`). Doing it here rather than at construction keeps the
+                // window correct across a resize; it is a no-op for every other selector.
+                inner.set_terminal_height(area.height);
                 let height = inner.desired_height(area.width).min(area.height).max(1);
                 let slot = Rect { x: area.x, y: area.y, width: area.width, height };
                 inner.render(frame, slot, theme);

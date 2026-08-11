@@ -200,15 +200,42 @@ fn parse_osc_hex_channel(channel: &str) -> Option<u8> {
     u8::try_from(scaled.min(255)).ok()
 }
 
-/// Pi `parseTerminalColorSchemeReport` (`terminal-colors.ts:67-73`) over an exact `CSI ? 997 ; N n`
-/// frame: `2` ⇒ light, `1` ⇒ dark. Any other shape ⇒ `None`.
+/// Pi `parseTerminalColorSchemeReport` (v0.84.1 `tui/src/terminal-colors.ts:67-73`) over a run of
+/// **one or more back-to-back** `CSI ? 997 ; N n` frames: `2` ⇒ light, `1` ⇒ dark.
+///
+/// Pi's pattern is `/^(?:\x1b\[\?997;(1|2)n)+$/` (v0.84.1 `terminal-colors.ts:29`). Two properties
+/// of that regex are load-bearing and are reproduced exactly here:
+///
+/// 1. **The `+` makes a burst legal, and the capture group keeps the LAST iteration** — a terminal
+///    that emits several reports in one write (theme flipped twice, or a duplicate report chasing
+///    the first) settles on the newest, not the stalest. Pi pins this at
+///    `terminal-colors.test.ts:118-119`: `"…;2n…;1n…;1n"` ⇒ dark, `"…;1n…;2n…;2n"` ⇒ light.
+/// 2. **It stays anchored `^…$`** — anything that is not a whole number of well-formed frames
+///    fails the *entire* match, so one malformed or truncated frame poisons the burst rather than
+///    the parser falling back on its healthy neighbours (`terminal-colors.test.ts:120-122`:
+///    `"…;3n"`, `"\x1b[?996n"` and `"x\x1b[?997;1n"` are all `undefined`).
+///
+/// **Version lag, not a port bug.** At v0.83.0 the pattern was the single-frame
+/// `/^\x1b\[\?997;(1|2)n$/`; upstream widened it in `0e633790c` ("fix(tui): handle batched color
+/// scheme reports", #7550). The pre-batch port was faithful to the tag it was written against.
 pub fn parse_color_scheme_report(data: &str) -> Option<TerminalTheme> {
-    let n = data.strip_prefix("\x1b[?997;")?.strip_suffix('n')?;
-    match n {
-        "1" => Some(TerminalTheme::Dark),
-        "2" => Some(TerminalTheme::Light),
-        _ => None,
+    let mut rest = data;
+    let mut last = None;
+    // Pi's `(?:…)+` — consume frames left to right; the capture (here `last`) ends up holding the
+    // final iteration's value.
+    while let Some(after_introducer) = rest.strip_prefix("\x1b[?997;") {
+        // A frame with no terminator is a truncated report: Pi's anchor rejects the whole string.
+        let (n, tail) = after_introducer.split_once('n')?;
+        last = Some(match n {
+            "1" => TerminalTheme::Dark,
+            "2" => TerminalTheme::Light,
+            _ => return None,
+        });
+        rest = tail;
     }
+    // Pi's `$`: leftover bytes (or, with `last == None`, leading bytes) mean no match at all.
+    // An empty `data` also yields `None`, because `+` demands at least one frame.
+    if rest.is_empty() { last } else { None }
 }
 
 /// Locate an OSC 11 reply anywhere inside a raw read (which may also carry the DA1 sentinel reply)
@@ -261,12 +288,33 @@ pub fn find_cell_size_report(buffer: &str) -> Option<(u16, u16)> {
     parse_cell_size_report(rest.get(..=end)?)
 }
 
-/// Locate a `CSI ? 997 ; N n` report anywhere inside a raw read and parse it.
+/// Locate the `CSI ? 997 ; N n` report(s) anywhere inside a raw read and parse them.
+///
+/// Pi can anchor ([`parse_color_scheme_report`]) because its dispatcher hands
+/// `consumeTerminalColorSchemeReport` (v0.84.1 `tui/src/tui.ts:920-931`) a single stdin chunk;
+/// cyrup's probe reads a buffer that also carries the DA1 sentinel reply, so it has to scan. The
+/// two Pi properties that *do* survive the scan are preserved:
+///
+/// * **Last wins.** A batched burst settles on the newest report, matching Pi's `(?:…)+` capture
+///   (v0.84.1 `terminal-colors.ts:29`). Before this, cyrup returned the FIRST report in the buffer
+///   and could settle on a stale scheme.
+/// * **A malformed or truncated `?997;` frame poisons the whole read** rather than being skipped
+///   over in favour of a healthy neighbour — Pi's `^…$` anchor rejects such a string outright.
+///   Only the *non*-`997` bytes (the sentinel) are tolerated, because they must be.
 pub fn find_color_scheme_report(buffer: &str) -> Option<TerminalTheme> {
-    let start = buffer.find("\x1b[?997;")?;
-    let rest = buffer.get(start..)?;
-    let end = rest.find('n')?;
-    parse_color_scheme_report(rest.get(..=end)?)
+    const INTRODUCER: &str = "\x1b[?997;";
+    let mut last = None;
+    let mut search = 0usize;
+    while let Some(rest) = buffer.get(search..) {
+        let Some(offset) = rest.find(INTRODUCER) else { break };
+        let frame_start = search.saturating_add(offset);
+        let Some(frame) = buffer.get(frame_start..) else { break };
+        // No terminator yet ⇒ the report is still arriving; Pi's anchor rejects the burst.
+        let end = frame.find('n')?;
+        last = Some(frame.get(..=end).and_then(parse_color_scheme_report)?);
+        search = frame_start.saturating_add(end).saturating_add(1);
+    }
+    last
 }
 
 /// Whether the buffer already holds a Device-Attributes reply (`CSI … c`) — the ordering sentinel
@@ -474,6 +522,59 @@ mod tests {
         assert_eq!(parse_color_scheme_report("\x1b[?997;2n"), Some(TerminalTheme::Light));
         assert_eq!(parse_color_scheme_report("\x1b[?997;3n"), None);
         assert_eq!(parse_color_scheme_report("\x1b[?996n"), None, "the QUERY is not a report");
+    }
+
+    /// Pi v0.84.1 `tui/test/terminal-colors.test.ts:118-122`, transcribed case for case.
+    #[test]
+    fn a_batched_color_scheme_burst_settles_on_the_last_report() {
+        // `terminal-colors.test.ts:118` — "\x1b[?997;2n\x1b[?997;1n\x1b[?997;1n" ⇒ "dark".
+        assert_eq!(
+            parse_color_scheme_report("\x1b[?997;2n\x1b[?997;1n\x1b[?997;1n"),
+            Some(TerminalTheme::Dark),
+        );
+        // `terminal-colors.test.ts:119` — "\x1b[?997;1n\x1b[?997;2n\x1b[?997;2n" ⇒ "light".
+        assert_eq!(
+            parse_color_scheme_report("\x1b[?997;1n\x1b[?997;2n\x1b[?997;2n"),
+            Some(TerminalTheme::Light),
+        );
+        // Two frames is enough to tell first-wins from last-wins.
+        assert_eq!(
+            parse_color_scheme_report("\x1b[?997;1n\x1b[?997;2n"),
+            Some(TerminalTheme::Light),
+        );
+        // MIRROR: Pi stays anchored, so a burst is all-or-nothing. `terminal-colors.test.ts:120-122`.
+        assert_eq!(
+            parse_color_scheme_report("\x1b[?997;2n\x1b[?997;3n"),
+            None,
+            "one malformed frame poisons the whole burst",
+        );
+        assert_eq!(
+            parse_color_scheme_report("\x1b[?997;2n\x1b[?997;"),
+            None,
+            "a truncated trailing frame poisons the whole burst",
+        );
+        assert_eq!(parse_color_scheme_report("x\x1b[?997;1n"), None, "test.ts:122 — leading junk");
+        assert_eq!(parse_color_scheme_report("\x1b[?997;1nx"), None, "trailing junk");
+        assert_eq!(parse_color_scheme_report(""), None, "`+` demands at least one frame");
+    }
+
+    /// The same burst as it actually reaches cyrup: unsplit, with the DA1 sentinel riding along.
+    #[test]
+    fn a_batched_burst_alongside_the_sentinel_settles_on_the_last_report() {
+        assert_eq!(
+            find_color_scheme_report("\x1b[?997;1n\x1b[?997;2n\x1b[?62;c"),
+            Some(TerminalTheme::Light),
+        );
+        assert_eq!(
+            find_color_scheme_report("\x1b[?997;2n\x1b[?997;1n\x1b[?997;1n\x1b[?62;1;2c"),
+            Some(TerminalTheme::Dark),
+        );
+        // MIRROR: a lone report is unaffected, and a read with no report at all still yields None.
+        assert_eq!(find_color_scheme_report("\x1b[?997;1n\x1b[?62;c"), Some(TerminalTheme::Dark));
+        assert_eq!(find_color_scheme_report("\x1b[?62;1;2c"), None, "DA1 only ⇒ no scheme");
+        assert_eq!(find_color_scheme_report(""), None);
+        // A truncated tail frame is rejected rather than falling back on its healthy neighbour.
+        assert_eq!(find_color_scheme_report("\x1b[?997;1n\x1b[?997;"), None);
     }
 
     #[test]

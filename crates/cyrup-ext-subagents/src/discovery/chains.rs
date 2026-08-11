@@ -62,7 +62,7 @@ const CHAIN_MD_SUFFIX: &str = ".chain.md";
 const SKILLS_DIR_SEGMENT: &str = "skills";
 
 /// The `maxItems` value pi passes into `validateChainOutputBindings` at chain-parse time
-/// (`chain-serializer.ts:177`, `Number.MAX_SAFE_INTEGER`) — parse-time validation never enforces a
+/// (`chain-serializer.ts:204`, `Number.MAX_SAFE_INTEGER`) — parse-time validation never enforces a
 /// concrete fan-out ceiling; that is a run-time concern. Kept as the JS safe-integer maximum so a
 /// dynamic step's own `maxItems` (if any) is the only ceiling checked here.
 const CHAIN_PARSE_MAX_ITEMS: u64 = 9_007_199_254_740_991;
@@ -90,7 +90,7 @@ pub struct ChainScanResult {
 pub fn scan_chain_dir(root: &Path, source: AgentSource) -> ChainScanResult {
     let mut by_name: HashMap<String, ChainCandidate> = HashMap::new();
     let mut diagnostics = Vec::new();
-    walk_dir(root, source, &mut by_name, &mut diagnostics);
+    walk_dir(root, root, source, &mut by_name, &mut diagnostics);
 
     let mut chains: Vec<ChainDefinition> = by_name.into_values().map(|c| c.definition).collect();
     // Deterministic output order (by name) independent of `HashMap` iteration order, so repeated
@@ -142,6 +142,7 @@ enum ChainFileFormat {
 /// files are recognized by their double-suffix (`.chain.json`/`.chain.md`) rather than a bare
 /// extension, since a plain `.json`/`.md` file in the same directory is not a chain file.
 fn walk_dir(
+    root: &Path,
     dir: &Path,
     source: AgentSource,
     by_name: &mut HashMap<String, ChainCandidate>,
@@ -164,7 +165,12 @@ fn walk_dir(
             if file_name == SKILLS_DIR_SEGMENT {
                 continue;
             }
-            walk_dir(&path, source, by_name, diagnostics);
+            // pi shares ONE `listFilesRecursive` between the agent walk and the chain walk
+            // (`agents.ts:1485` / `:1653`), so the same prune set applies here.
+            if super::should_prune_discovery_dir(root, &path, file_name) {
+                continue;
+            }
+            walk_dir(root, &path, source, by_name, diagnostics);
             continue;
         }
 
@@ -688,251 +694,27 @@ fn is_valid_package_identifier(name: &str) -> bool {
 // Acceptance validation (acceptance.ts::validateAcceptanceInput)
 // -------------------------------------------------------------------------------------------
 
-const VALID_ACCEPTANCE_LEVELS: &[&str] =
-    &["auto", "none", "attested", "checked", "verified", "reviewed"];
-const VALID_ACCEPTANCE_EVIDENCE: &[&str] = &[
-    "changed-files",
-    "tests-added",
-    "commands-run",
-    "validation-output",
-    "residual-risks",
-    "no-staged-files",
-    "diff-summary",
-    "review-findings",
-    "manual-notes",
-];
-const ACCEPTANCE_CONFIG_KEYS: &[&str] =
-    &["level", "criteria", "evidence", "verify", "review", "stopRules", "reason"];
-const ACCEPTANCE_GATE_KEYS: &[&str] = &["id", "must", "evidence", "severity"];
-const ACCEPTANCE_VERIFY_KEYS: &[&str] =
-    &["id", "command", "timeoutMs", "cwd", "env", "allowFailure"];
-const ACCEPTANCE_REVIEW_KEYS: &[&str] = &["agent", "focus", "required"];
-
-/// Faithful port of `acceptance.ts::validateAcceptanceInput`: collects (never throws) a list of
-/// human-readable validation errors for one `AcceptanceInput` value. `input` is the raw field value
-/// (or `None` when the key is absent -> no errors, matching source's `input === undefined`).
+/// `validateAcceptanceInput` (`acceptance.ts:176-303` @v0.43.0), reached through the ONE
+/// implementation this crate has — [`crate::exec::acceptance::model::validate_acceptance_input`].
+///
+/// Upstream has exactly one copy of this validator and every caller imports it: the chain
+/// serializer this module ports does so explicitly
+/// (`import { validateAcceptanceInput } from "../runs/shared/acceptance.ts"`,
+/// `agents/chain-serializer.ts:5`, applied at `:178`/`:189`/`:197`), as do `agents/agents.ts:22`,
+/// `agents/agent-management.ts:36` and `runs/background/async-execution.ts:32`. This file used to
+/// carry a second, private ~260-line transcription of it plus its own `VALID_ACCEPTANCE_*` /
+/// `ACCEPTANCE_*_KEYS` tables, which is how it came to be missing v0.43.0's duplicate-normalized-
+/// criterion-id check and its `ACCEPTANCE_EVIDENCE_HELP`/`ACCEPTANCE_OBJECT_EXAMPLE` guidance
+/// suffixes while the `model` copy was being updated.
+///
+/// The only adaptation is the `undefined` spelling: upstream passes a possibly-`undefined`
+/// property straight in and returns no errors for it (`if (input === undefined) return errors`,
+/// `acceptance.ts:178`), which the `model` signature spells as `Value::Null`.
 fn validate_acceptance_input(input: Option<&Value>, path_label: &str) -> Vec<String> {
-    let mut errors: Vec<String> = Vec::new();
-    let Some(input) = input else {
-        return errors;
-    };
-    if input == &Value::Bool(false) {
-        return errors;
-    }
-    if let Some(level) = input.as_str() {
-        if !VALID_ACCEPTANCE_LEVELS.contains(&level) {
-            errors.push(format!("{path_label} has invalid level '{level}'."));
-        }
-        return errors;
-    }
-    let Some(object) = input.as_object() else {
-        errors.push(format!(
-            "{path_label} must be a string level, false, or an object."
-        ));
-        return errors;
-    };
-
-    for key in object.keys() {
-        if !ACCEPTANCE_CONFIG_KEYS.contains(&key.as_str()) {
-            errors.push(format!("{path_label}.{key} is not supported."));
-        }
-    }
-    if let Some(level) = object.get("level") {
-        let valid = level
-            .as_str()
-            .is_some_and(|s| VALID_ACCEPTANCE_LEVELS.contains(&s));
-        if !valid {
-            errors.push(format!(
-                "{path_label}.level must be one of auto, none, attested, checked, verified, reviewed."
-            ));
-        }
-    }
-    if object.get("level").and_then(Value::as_str) == Some("none") {
-        let reason_ok = object
-            .get("reason")
-            .and_then(Value::as_str)
-            .is_some_and(|reason| !reason.trim().is_empty());
-        if !reason_ok {
-            errors.push(format!(
-                "{path_label}.reason is required when level is none."
-            ));
-        }
-    }
-    if object.get("reason").is_some_and(|reason| !reason.is_string()) {
-        errors.push(format!("{path_label}.reason must be a string."));
-    }
-    match object.get("criteria") {
-        None => {}
-        Some(Value::Array(criteria)) => {
-            for (index, criterion) in criteria.iter().enumerate() {
-                if criterion.is_string() {
-                    continue;
-                }
-                let criterion_path = format!("{path_label}.criteria[{index}]");
-                let Some(gate) = criterion.as_object() else {
-                    errors.push(format!("{criterion_path} must be a string or an object."));
-                    continue;
-                };
-                for key in gate.keys() {
-                    if !ACCEPTANCE_GATE_KEYS.contains(&key.as_str()) {
-                        errors.push(format!("{criterion_path}.{key} is not supported."));
-                    }
-                }
-                if gate
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|id| id.trim().is_empty())
-                {
-                    errors.push(format!("{criterion_path}.id is required."));
-                }
-                if gate
-                    .get("must")
-                    .and_then(Value::as_str)
-                    .is_none_or(|must| must.trim().is_empty())
-                {
-                    errors.push(format!("{criterion_path}.must is required."));
-                }
-                validate_evidence_array(
-                    gate.get("evidence"),
-                    &format!("{criterion_path}.evidence"),
-                    &mut errors,
-                );
-                if let Some(severity) = gate.get("severity") {
-                    let ok = matches!(severity.as_str(), Some("required") | Some("recommended"));
-                    if !ok {
-                        errors.push(format!(
-                            "{criterion_path}.severity must be required or recommended."
-                        ));
-                    }
-                }
-            }
-        }
-        Some(_) => errors.push(format!("{path_label}.criteria must be an array.")),
-    }
-    validate_evidence_array(
-        object.get("evidence"),
-        &format!("{path_label}.evidence"),
-        &mut errors,
-    );
-    match object.get("verify") {
-        None => {}
-        Some(Value::Array(commands)) => {
-            for (index, command) in commands.iter().enumerate() {
-                let command_path = format!("{path_label}.verify[{index}]");
-                let Some(cmd) = command.as_object() else {
-                    errors.push(format!("{command_path} must be an object."));
-                    continue;
-                };
-                for key in cmd.keys() {
-                    if !ACCEPTANCE_VERIFY_KEYS.contains(&key.as_str()) {
-                        errors.push(format!("{command_path}.{key} is not supported."));
-                    }
-                }
-                if cmd
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|id| id.trim().is_empty())
-                {
-                    errors.push(format!("{command_path}.id is required."));
-                }
-                if cmd
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_none_or(|c| c.trim().is_empty())
-                {
-                    errors.push(format!("{command_path}.command is required."));
-                }
-                if let Some(timeout) = cmd.get("timeoutMs") {
-                    let ok = timeout.as_u64().is_some_and(|v| v >= 1);
-                    if !ok {
-                        errors.push(format!(
-                            "{command_path}.timeoutMs must be an integer >= 1."
-                        ));
-                    }
-                }
-                if cmd.get("cwd").is_some_and(|cwd| !cwd.is_string()) {
-                    errors.push(format!("{command_path}.cwd must be a string."));
-                }
-                if let Some(env) = cmd.get("env") {
-                    match env.as_object() {
-                        Some(map) => {
-                            for (env_key, env_value) in map {
-                                if !env_value.is_string() {
-                                    errors.push(format!(
-                                        "{command_path}.env.{env_key} must be a string."
-                                    ));
-                                }
-                            }
-                        }
-                        None => errors.push(format!("{command_path}.env must be an object.")),
-                    }
-                }
-                if cmd
-                    .get("allowFailure")
-                    .is_some_and(|value| !value.is_boolean())
-                {
-                    errors.push(format!("{command_path}.allowFailure must be a boolean."));
-                }
-            }
-        }
-        Some(_) => errors.push(format!("{path_label}.verify must be an array.")),
-    }
-    if let Some(review) = object.get("review")
-        && review != &Value::Bool(false)
-    {
-        match review.as_object() {
-            Some(map) => {
-                for key in map.keys() {
-                    if !ACCEPTANCE_REVIEW_KEYS.contains(&key.as_str()) {
-                        errors.push(format!("{path_label}.review.{key} is not supported."));
-                    }
-                }
-                if map.get("agent").is_some_and(|v| !v.is_string()) {
-                    errors.push(format!("{path_label}.review.agent must be a string."));
-                }
-                if map.get("focus").is_some_and(|v| !v.is_string()) {
-                    errors.push(format!("{path_label}.review.focus must be a string."));
-                }
-                if map.get("required").is_some_and(|v| !v.is_boolean()) {
-                    errors.push(format!("{path_label}.review.required must be a boolean."));
-                }
-            }
-            None => errors.push(format!("{path_label}.review must be false or an object.")),
-        }
-    }
-    match object.get("stopRules") {
-        None => {}
-        Some(Value::Array(rules)) => {
-            for (index, item) in rules.iter().enumerate() {
-                if !item.is_string() {
-                    errors.push(format!("{path_label}.stopRules[{index}] must be a string."));
-                }
-            }
-        }
-        Some(_) => errors.push(format!("{path_label}.stopRules must be an array.")),
-    }
-    errors
-}
-
-/// Shared validation for an `evidence` array (top-level and per-criterion), mirroring source's two
-/// identical `Array.isArray(...) ? per-item VALID_EVIDENCE check : "must be an array"` blocks.
-fn validate_evidence_array(value: Option<&Value>, path_label: &str, errors: &mut Vec<String>) {
-    match value {
-        None => {}
-        Some(Value::Array(items)) => {
-            for (index, item) in items.iter().enumerate() {
-                let ok = item
-                    .as_str()
-                    .is_some_and(|kind| VALID_ACCEPTANCE_EVIDENCE.contains(&kind));
-                if !ok {
-                    errors.push(format!(
-                        "{path_label}[{index}] is not a supported evidence kind."
-                    ));
-                }
-            }
-        }
-        Some(_) => errors.push(format!("{path_label} must be an array.")),
-    }
+    crate::exec::acceptance::model::validate_acceptance_input(
+        input.unwrap_or(&Value::Null),
+        path_label,
+    )
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1178,7 +960,7 @@ pub(crate) fn validate_dynamic_step_shape(
     }
     // `config.maxItems` is always the parse-time `MAX_SAFE_INTEGER`, so it is a valid non-negative
     // integer by construction and the "requires expand.maxItems or config.maxItems" branch (both
-    // undefined) can never fire here — matching `chain-serializer.ts:177`.
+    // undefined) can never fire here — matching `chain-serializer.ts:204`.
     let _ = config_max_items;
 
     match step.get("parallel") {
@@ -1367,9 +1149,9 @@ pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u3
             // `failFast` is a legal dynamic-step key at the ported baseline
             // (`dynamic-fanout.ts:44` `DYNAMIC_STEP_KEYS`, mirrored by this file's own
             // `DYNAMIC_STEP_KEYS`) and upstream forwards it verbatim when it lowers the dynamic
-            // step to a `ParallelStep` (`chain-execution.ts:897-901`: `failFast: step.failFast`),
+            // step to a `ParallelStep` (`chain-execution.ts:1061-1067`: `failFast: step.failFast`),
             // where `runParallelChainTasks` applies pi's `?? false` default
-            // (`chain-execution.ts:231`). Reading it here — exactly as the static-`parallel` arm
+            // (`chain-execution.ts:283`). Reading it here — exactly as the static-`parallel` arm
             // above does — is what keeps the validator's acceptance of the key honest.
             fail_fast: step.fail_fast.unwrap_or(false),
             // C16: carry pi's `expand.{item,key,maxItems,onEmpty}` and `collect.outputSchema`
@@ -1676,6 +1458,118 @@ mod tests {
         let path = write(tmp.path(), "bad-acceptance.chain.json", content);
         let err = parse_chain_json(&path, AgentSource::User).expect_err("acceptance reason required");
         assert!(err.contains("step 1 acceptance.reason is required"), "{err}");
+    }
+
+    /// G78 — the chain-JSON validator is a SECOND copy of `validateAcceptanceInput`, so it has to
+    /// refuse `reviewed` (and reasonless `none` / command-less `verified`) with the same messages
+    /// the tool-param path uses. A chain file is exactly where a stale `"reviewed"` would otherwise
+    /// sit unnoticed until dispatch.
+    #[test]
+    fn json_chain_rejects_levels_that_are_no_longer_requestable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (
+                "{\"agent\":\"worker\",\"acceptance\":\"reviewed\"}",
+                "is an achieved status, not a requestable acceptance level",
+            ),
+            (
+                "{\"agent\":\"worker\",\"acceptance\":{\"level\":\"reviewed\"}}",
+                "step 1 acceptance.level is an achieved status",
+            ),
+            (
+                "{\"agent\":\"worker\",\"acceptance\":\"none\"}",
+                "requires a reason",
+            ),
+            (
+                "{\"agent\":\"worker\",\"acceptance\":\"verified\"}",
+                "requires object form with at least one runtime verify command",
+            ),
+            (
+                "{\"agent\":\"worker\",\"acceptance\":{\"level\":\"verified\"}}",
+                "must contain at least one runtime command when level is verified",
+            ),
+        ];
+        for (step, expected) in cases {
+            let content = format!(
+                "{{\"name\":\"c\",\"description\":\"d\",\"chain\":[{step}]}}"
+            );
+            let path = write(tmp.path(), "levels.chain.json", &content);
+            let err = parse_chain_json(&path, AgentSource::User)
+                .expect_err("the level must be refused at parse time");
+            assert!(err.contains(expected), "for {step}: {err}");
+        }
+        // The still-requestable bare levels keep parsing.
+        for level in ["auto", "attested", "checked"] {
+            let content = format!(
+                "{{\"name\":\"c\",\"description\":\"d\",\"chain\":[{{\"agent\":\"worker\",\"acceptance\":\"{level}\"}}]}}"
+            );
+            let path = write(tmp.path(), "ok.chain.json", &content);
+            assert!(
+                parse_chain_json(&path, AgentSource::User).is_ok(),
+                "`{level}` must remain requestable in a chain file"
+            );
+        }
+    }
+
+    /// The two NESTED acceptance-validation arms of `parse_chain_json` — a static `parallel[]`
+    /// task's own `acceptance` and a dynamic step's single `parallel` TEMPLATE object's — which the
+    /// step-level test above never reaches.
+    ///
+    /// pi validates all three levels in one pass (`validateExecutionAcceptance`,
+    /// `runs/shared/acceptance.ts:305-328` @v0.43.0: the top-level `acceptance`, every `tasks[i]`
+    /// and every `chain[i]`), so a chain FILE has to be just as thorough — a saved chain is
+    /// authored once and dispatched forever, and an invalid policy buried in a fan-out task or a
+    /// dynamic template would otherwise surface only at spawn time, mid-run.
+    ///
+    /// Both arms are asserted on their own PATH LABEL, because that label is the only thing that
+    /// tells the author which of a dozen tasks is at fault.
+    #[test]
+    fn json_chain_validates_acceptance_on_parallel_tasks_and_on_the_dynamic_template() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // (1) The static-`parallel[]` arm. The SECOND task carries the bad policy, so the index in
+        // the label has to be right, not merely present.
+        let content = "{\"name\":\"c\",\"description\":\"d\",\"chain\":[{\"parallel\":[\
+             {\"agent\":\"a\",\"task\":\"ta\"},\
+             {\"agent\":\"b\",\"task\":\"tb\",\"acceptance\":{\"level\":\"none\"}}]}]}";
+        let path = write(tmp.path(), "parallel-task.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::User)
+            .expect_err("a fan-out task's own acceptance policy is validated too");
+        assert!(
+            err.contains("step 1 parallel task 2 acceptance.reason is required when level is none"),
+            "{err}"
+        );
+
+        // (2) The dynamic-template arm: `parallel` is a single object, not an array.
+        let content = "{\"name\":\"c\",\"description\":\"d\",\"chain\":[\
+             {\"agent\":\"scout\",\"task\":\"Return targets\",\"as\":\"targets\",\"outputSchema\":{\"type\":\"object\"}},\
+             {\"expand\":{\"from\":{\"output\":\"targets\",\"path\":\"/items\"},\"item\":\"target\",\"maxItems\":4},\
+              \"parallel\":{\"agent\":\"reviewer\",\"task\":\"Review {target.path}\",\"acceptance\":\"reviewed\"},\
+              \"collect\":{\"as\":\"reviews\"}}]}";
+        let path = write(tmp.path(), "dynamic-template.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::User)
+            .expect_err("a dynamic template's acceptance policy is validated too");
+        assert!(
+            err.contains("step 2 dynamic template acceptance")
+                && err.contains("is an achieved status, not a requestable acceptance level"),
+            "{err}"
+        );
+
+        // (3) The control: the SAME two shapes with VALID policies parse, so neither arm is simply
+        // rejecting every nested `acceptance` it sees.
+        let content = "{\"name\":\"c\",\"description\":\"d\",\"chain\":[{\"parallel\":[\
+             {\"agent\":\"a\",\"task\":\"ta\",\"acceptance\":\"attested\"},\
+             {\"agent\":\"b\",\"task\":\"tb\",\"acceptance\":{\"level\":\"none\",\"reason\":\"trivial\"}}]}]}";
+        let path = write(tmp.path(), "parallel-ok.chain.json", content);
+        parse_chain_json(&path, AgentSource::User).expect("valid fan-out policies parse");
+
+        let content = "{\"name\":\"c\",\"description\":\"d\",\"chain\":[\
+             {\"agent\":\"scout\",\"task\":\"Return targets\",\"as\":\"targets\",\"outputSchema\":{\"type\":\"object\"}},\
+             {\"expand\":{\"from\":{\"output\":\"targets\",\"path\":\"/items\"},\"item\":\"target\",\"maxItems\":4},\
+              \"parallel\":{\"agent\":\"reviewer\",\"task\":\"Review {target.path}\",\"acceptance\":\"checked\"},\
+              \"collect\":{\"as\":\"reviews\"}}]}";
+        let path = write(tmp.path(), "dynamic-ok.chain.json", content);
+        parse_chain_json(&path, AgentSource::User).expect("a valid dynamic-template policy parses");
     }
 
     #[test]
@@ -1994,8 +1888,8 @@ mod tests {
     /// but this bridge previously read it ONLY on the static-`parallel` arm and dropped it on the
     /// dynamic arm — so an author's `failFast: true` was validated as legal and then silently
     /// ignored. Upstream forwards it verbatim when it lowers the dynamic step to a `ParallelStep`
-    /// (`chain-execution.ts:897-901` @v0.34.0: `failFast: step.failFast`), and applies pi's `??
-    /// false` default only at dispatch (`chain-execution.ts:231`).
+    /// (`chain-execution.ts:1061-1067` @v0.43.0: `failFast: step.failFast`), and applies pi's `??
+    /// false` default only at dispatch (`chain-execution.ts:283`).
     #[test]
     fn chain_step_to_runner_step_carries_fail_fast_onto_a_dynamic_group() {
         let dynamic = |fail_fast: Option<bool>| ChainStepConfig {
@@ -2031,7 +1925,7 @@ mod tests {
     /// that can declare a `verify[]` command and which this bridge previously discarded outright
     /// (`.and_then(Value::as_str)` kept the bare level string and nothing else). Lowering it to a
     /// contract stays `run_single`'s job, exactly as upstream hands `seqStep.acceptance` to `runSync`
-    /// unmodified (pi `chain-execution.ts:1335` @v0.34.0).
+    /// unmodified (pi `chain-execution.ts:1401` @v0.43.0).
     #[test]
     fn chain_step_to_runner_step_carries_every_acceptance_form_onto_the_step_spec() {
         let policy = serde_json::json!({

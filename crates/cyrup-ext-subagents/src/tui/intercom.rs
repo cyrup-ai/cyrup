@@ -92,15 +92,17 @@ pub struct IntercomPayload {
     /// Total additive token usage across the run (a plain numeric summary — not a capability, not
     /// a route).
     pub total_tokens: u64,
-    /// pi's grouped `SubagentResultIntercomPayload.status` (`result-intercom.ts:56-63
-    /// resolveGroupedStatus`): the 4-state precedence verdict over [`Self::child_statuses`] —
-    /// any-failed wins, else any-paused, else any-completed, else any-detached, else `Failed` (pi's
-    /// own explicit default for an empty child set). A closed enum, not a capability-bearing value,
-    /// so it is safe to include in this otherwise-narrow allowlist.
+    /// pi's grouped `SubagentResultIntercomPayload.status` (`result-intercom.ts:83-91
+    /// resolveGroupedStatus` @v0.43.0): the **5**-state precedence verdict over
+    /// [`Self::child_statuses`] — any-failed wins, else any-**stopped**, else any-paused, else
+    /// any-completed, else any-detached, else `Failed` (pi's own explicit default for an empty
+    /// child set). A closed enum, not a capability-bearing value, so it is safe to include in this
+    /// otherwise-narrow allowlist.
     pub status: SubagentResultStatus,
-    /// pi's grouped `SubagentResultIntercomPayload.summary` (`result-intercom.ts:46-54
-    /// formatStatusCounts`): "N completed, N failed, N paused, N detached" (only the non-zero
-    /// buckets, in that fixed order), or `"0 results"` when [`Self::child_statuses`] is empty.
+    /// pi's grouped `SubagentResultIntercomPayload.summary` (`result-intercom.ts:57-66
+    /// formatStatusCounts` @v0.43.0): "N completed, N failed, N stopped, N paused, N detached"
+    /// (only the non-zero buckets, in that fixed render order), or `"0 results"` when
+    /// [`Self::child_statuses`] is empty.
     pub summary: String,
     /// The per-child [`SubagentResultStatus`], in the same fixed order as [`Self::outputs`] (pi's
     /// `children[].status`, `result-intercom.ts:33-44 countStatuses`'s input) — a second parallel
@@ -111,23 +113,38 @@ pub struct IntercomPayload {
     pub child_statuses: Vec<SubagentResultStatus>,
 }
 
-/// pi `SubagentResultStatus` (`../shared/types.ts`, consumed by `result-intercom.ts:17-63`): the
-/// four terminal states a single grouped child (or a whole grouped run, via
-/// [`resolve_grouped_status`]) can resolve to.
+/// pi `SubagentResultStatus` (`shared/types.ts:229` @v0.43.0 — `"completed" | "failed" | "paused"
+/// | "stopped" | "detached"`, consumed by `result-intercom.ts:20-91`): the **five** terminal states
+/// a single grouped child (or a whole grouped run, via [`resolve_grouped_status`]) can resolve to.
+///
+/// G104 — `Stopped` is its own variant, never an alias for `Failed` or `Paused`. Declaration order
+/// is upstream's own union order because [`count_statuses`] indexes its bucket array with `self as
+/// usize`; the RENDER order in [`format_status_counts`] is deliberately different (upstream's
+/// `formatStatusCounts` prints stopped BEFORE paused, `result-intercom.ts:57-66`) and is spelled
+/// out separately there rather than derived from this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SubagentResultStatus {
     Completed,
     Failed,
     Paused,
+    /// G104 — pi `"stopped"`. Produced by an explicit stop request
+    /// ([`crate::background::RunState::Stopped`] / [`crate::exec::SingleResult::stopped`]) and by
+    /// an UNEXPLAINED process signal (`result-intercom.ts:35`).
+    Stopped,
     Detached,
 }
 
-/// pi `countStatuses` (`result-intercom.ts:33-44`): tally `statuses` into the fixed
-/// completed/failed/paused/detached bucket order (index 0..3, matching [`SubagentResultStatus`]'s
-/// declaration order so `as usize` indexes this array directly).
-fn count_statuses(statuses: &[SubagentResultStatus]) -> [u32; 4] {
-    let mut counts = [0u32; 4];
+/// The number of [`SubagentResultStatus`] buckets [`count_statuses`] tallies into — kept as a named
+/// constant so the array type, the render table and the `as usize` indexing cannot drift apart if a
+/// sixth state is ever added.
+const STATUS_BUCKETS: usize = 5;
+
+/// pi `countStatuses` (`result-intercom.ts:43-55` @v0.43.0): tally `statuses` into the fixed
+/// completed/failed/paused/stopped/detached bucket order (index 0..4, matching
+/// [`SubagentResultStatus`]'s declaration order so `as usize` indexes this array directly).
+fn count_statuses(statuses: &[SubagentResultStatus]) -> [u32; STATUS_BUCKETS] {
+    let mut counts = [0u32; STATUS_BUCKETS];
     for s in statuses {
         if let Some(count) = counts.get_mut(*s as usize) {
             *count += 1;
@@ -136,17 +153,35 @@ fn count_statuses(statuses: &[SubagentResultStatus]) -> [u32; 4] {
     counts
 }
 
-/// pi `formatStatusCounts` (`result-intercom.ts:46-54`): "N completed, N failed, N paused, N
-/// detached" (only the non-zero buckets, joined with `", "`, in that fixed order), or the literal
-/// `"0 results"` when `statuses` is empty (pi's own explicit fallback for `parts.length === 0`).
+/// Read one bucket out of a [`count_statuses`] tally by variant, without indexing arithmetic the
+/// no-panic policy would have to reason about.
+fn count_of(counts: &[u32; STATUS_BUCKETS], status: SubagentResultStatus) -> u32 {
+    counts.get(status as usize).copied().unwrap_or(0)
+}
+
+/// pi `formatStatusCounts` (`result-intercom.ts:57-66` @v0.43.0): "N completed, N failed, N
+/// stopped, N paused, N detached" (only the non-zero buckets, joined with `", "`, in that fixed
+/// order), or the literal `"0 results"` when `statuses` is empty (pi's own explicit fallback for
+/// `parts.length === 0`).
+///
+/// G104 — the render order is NOT the enum's declaration order: upstream's `parts` array lists
+/// `counts.stopped` between `counts.failed` and `counts.paused`, so `stopped` prints third even
+/// though `countStatuses` declares its bucket fourth. Reproduced literally here rather than zipping
+/// against the bucket order, which would print it fourth.
 #[must_use]
 pub fn format_status_counts(statuses: &[SubagentResultStatus]) -> String {
     let counts = count_statuses(statuses);
-    const LABELS: [&str; 4] = ["completed", "failed", "paused", "detached"];
-    let parts: Vec<String> = counts
+    const RENDER_ORDER: [(SubagentResultStatus, &str); STATUS_BUCKETS] = [
+        (SubagentResultStatus::Completed, "completed"),
+        (SubagentResultStatus::Failed, "failed"),
+        (SubagentResultStatus::Stopped, "stopped"),
+        (SubagentResultStatus::Paused, "paused"),
+        (SubagentResultStatus::Detached, "detached"),
+    ];
+    let parts: Vec<String> = RENDER_ORDER
         .iter()
-        .zip(LABELS.iter())
-        .filter(|(n, _)| **n > 0)
+        .map(|(status, label)| (count_of(&counts, *status), label))
+        .filter(|(n, _)| *n > 0)
         .map(|(n, label)| format!("{n} {label}"))
         .collect();
     if parts.is_empty() {
@@ -156,67 +191,198 @@ pub fn format_status_counts(statuses: &[SubagentResultStatus]) -> String {
     }
 }
 
-/// pi `resolveGroupedStatus` (`result-intercom.ts:56-63`), ported verbatim: any-failed → `Failed`;
-/// else any-paused → `Paused`; else any-completed → `Completed`; else any-detached → `Detached`;
-/// else (no children at all) → `Failed` (pi's own explicit default, matched exactly — not
-/// `Completed` or any other "optimistic" fallback).
+/// pi `resolveGroupedStatus` (`result-intercom.ts:83-91` @v0.43.0), ported verbatim: any-failed →
+/// `Failed`; else any-**stopped** → `Stopped`; else any-paused → `Paused`; else any-completed →
+/// `Completed`; else any-detached → `Detached`; else (no children at all) → `Failed` (pi's own
+/// explicit default, matched exactly — not `Completed` or any other "optimistic" fallback).
+///
+/// G104 — the `Stopped` slot sits between `Failed` and `Paused`, which is load-bearing: a grouped
+/// run with one stopped and one paused child reports `stopped`, not `paused`, and a grouped run
+/// with one stopped and one completed child reports `stopped`, not `completed`.
 #[must_use]
 pub fn resolve_grouped_status(statuses: &[SubagentResultStatus]) -> SubagentResultStatus {
     let counts = count_statuses(statuses);
-    if counts[1] > 0 {
-        return SubagentResultStatus::Failed;
-    }
-    if counts[2] > 0 {
-        return SubagentResultStatus::Paused;
-    }
-    if counts[0] > 0 {
-        return SubagentResultStatus::Completed;
-    }
-    if counts[3] > 0 {
-        return SubagentResultStatus::Detached;
+    for candidate in [
+        SubagentResultStatus::Failed,
+        SubagentResultStatus::Stopped,
+        SubagentResultStatus::Paused,
+        SubagentResultStatus::Completed,
+        SubagentResultStatus::Detached,
+    ] {
+        if count_of(&counts, candidate) > 0 {
+            return candidate;
+        }
     }
     SubagentResultStatus::Failed
 }
 
-/// pi `resolveSubagentResultStatus` (`result-intercom.ts:17-31`), specialized to the fields a
-/// background [`crate::exec::SingleResult`]-shaped child actually carries: `detached` takes
-/// precedence, then a soft interrupt (pi's `interrupted || state === "paused"`), then the exit code
-/// (pi's final `exitCode === 0 ? "completed" : "failed"` fallback — this crate's per-child record has
-/// no separate `success`/`state` field to consult first, only `exit_code`, so pi's two middle
-/// branches collapse into this one exit-code check here).
-fn resolve_single_result_status(detached: bool, interrupted: bool, exit_code: i32) -> SubagentResultStatus {
-    if detached {
+/// pi `isUnexplainedProcessSignal` (`runs/shared/process-signal.ts:5-19` @v0.43.0): a process signal
+/// is "unexplained" when one was actually delivered AND none of the four lifecycle verdicts that
+/// would explain it is set. (Upstream's fifth input, `forcedDrainAfterFinalSuccess`, is an
+/// `execution.ts`-local latch never carried onto a `SingleResult`, so it has no field here — its
+/// only call site that passes it is `execution.ts:1082-1088`, not `resolveSubagentResultStatus`,
+/// which passes exactly the four below.)
+#[must_use]
+pub fn is_unexplained_process_signal(
+    process_signal: Option<&str>,
+    interrupted: bool,
+    timed_out: bool,
+    stopped: bool,
+    turn_budget_exceeded: bool,
+) -> bool {
+    process_signal.is_some_and(|s| !s.is_empty())
+        && !interrupted
+        && !timed_out
+        && !stopped
+        && !turn_budget_exceeded
+}
+
+/// Every field pi's `resolveSubagentResultStatus` reads (`result-intercom.ts:20-41` @v0.43.0),
+/// gathered so the port can be a single faithful branch ladder instead of a widening argument list.
+/// `None` on `success`/`state` reproduces upstream's `undefined`, which is what makes the
+/// later branches reachable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResultStatusInput<'a> {
+    /// pi `exitCode?: number`.
+    pub exit_code: Option<i32>,
+    /// pi `success?: boolean`.
+    pub success: Option<bool>,
+    /// pi `state?: string` — the run/step lifecycle word (`"stopped"`, `"paused"`, `"complete"`,
+    /// `"failed"`).
+    pub state: Option<&'a str>,
+    /// pi `interrupted?: boolean`.
+    pub interrupted: bool,
+    /// pi `detached?: boolean`.
+    pub detached: bool,
+    /// pi `processSignal?: string | null`.
+    pub process_signal: Option<&'a str>,
+    /// pi `timedOut?: boolean`.
+    pub timed_out: bool,
+    /// pi `stopped?: boolean`.
+    pub stopped: bool,
+    /// pi `turnBudgetExceeded?: boolean`.
+    pub turn_budget_exceeded: bool,
+}
+
+/// pi `resolveSubagentResultStatus` (`result-intercom.ts:20-41` @v0.43.0), ported branch-for-branch
+/// in upstream's exact order:
+///
+/// 1. `detached` → `Detached`
+/// 2. `stopped || state === "stopped"` → `Stopped`   ← **G104: ahead of `interrupted`**
+/// 3. `interrupted || state === "paused"` → `Paused`
+/// 4. `success === true` → `Completed`
+/// 5. `isUnexplainedProcessSignal(...) && exitCode !== 0` → `Stopped`  ← **G104: a signal death
+///    nobody claimed is a stop, not a failure**
+/// 6. `success === false` → `Failed`
+/// 7. `state === "complete"` → `Completed`
+/// 8. `state === "failed"` → `Failed`
+/// 9. `typeof exitCode === "number"` → `exitCode === 0 ? Completed : Failed`
+/// 10. otherwise → `Failed`
+///
+/// Ordering is behaviour, not style: branch 2 before branch 3 is what stops a run that was both
+/// stopped and interrupted from being reported resumable, and branch 5 before branch 6 is what
+/// keeps an externally-`SIGKILL`ed child out of the `failed` bucket.
+#[must_use]
+pub fn resolve_subagent_result_status(input: &ResultStatusInput<'_>) -> SubagentResultStatus {
+    if input.detached {
         return SubagentResultStatus::Detached;
     }
-    if interrupted {
+    if input.stopped || input.state == Some("stopped") {
+        return SubagentResultStatus::Stopped;
+    }
+    if input.interrupted || input.state == Some("paused") {
         return SubagentResultStatus::Paused;
     }
-    if exit_code == 0 {
-        SubagentResultStatus::Completed
-    } else {
-        SubagentResultStatus::Failed
+    if input.success == Some(true) {
+        return SubagentResultStatus::Completed;
     }
+    if is_unexplained_process_signal(
+        input.process_signal,
+        input.interrupted,
+        input.timed_out,
+        input.stopped,
+        input.turn_budget_exceeded,
+    ) && input.exit_code != Some(0)
+    {
+        return SubagentResultStatus::Stopped;
+    }
+    if input.success == Some(false) {
+        return SubagentResultStatus::Failed;
+    }
+    if input.state == Some("complete") {
+        return SubagentResultStatus::Completed;
+    }
+    if input.state == Some("failed") {
+        return SubagentResultStatus::Failed;
+    }
+    match input.exit_code {
+        Some(0) => SubagentResultStatus::Completed,
+        Some(_) => SubagentResultStatus::Failed,
+        None => SubagentResultStatus::Failed,
+    }
+}
+
+/// [`resolve_subagent_result_status`] applied to a real [`crate::exec::SingleResult`] child — pi
+/// `foregroundResultIntercomStatus` (`runs/foreground/subagent-executor.ts:1594-1605` @v0.43.0),
+/// which passes exactly these fields off the child's own record. `success` is left `None` (pi only
+/// sets it from a REJECTED acceptance ledger, `:1596`), so a child with no acceptance verdict falls
+/// through to the signal/exit-code branches exactly as upstream's does.
+#[must_use]
+pub fn resolve_single_result_status(child: &crate::exec::SingleResult) -> SubagentResultStatus {
+    resolve_subagent_result_status(&ResultStatusInput {
+        exit_code: Some(child.exit_code),
+        // pi `...(result.acceptance?.status === "rejected" ? { success: false } : {})`
+        // (`subagent-executor.ts:1597`) — the ONLY thing that pins `success` on this path.
+        success: child
+            .acceptance
+            .as_ref()
+            .and_then(|ledger| {
+                (ledger.status == crate::exec::acceptance::AcceptanceStatus::Rejected).then_some(false)
+            }),
+        state: None,
+        interrupted: child.interrupted,
+        detached: child.detached,
+        process_signal: child.process_signal.as_deref(),
+        timed_out: child.timed_out,
+        stopped: child.stopped,
+        // cyrup's `SingleResult` carries no `turnBudgetExceeded` (the turn-budget subsystem stops a
+        // child via its own tool-budget path and does not stamp a terminal flag); `false` here can
+        // only WIDEN `isUnexplainedProcessSignal`, never narrow it, and a turn-budget stop is not
+        // signal-killed in this port, so no real case is misclassified.
+        turn_budget_exceeded: false,
+    })
 }
 
 /// The chain-graph-local analogue of [`resolve_single_result_status`] for a foreground grouped
-/// child ([`crate::spawn::chain_graph::StepResult`]): no `detached`/`exitCode` field exists at this
-/// granularity, so this only distinguishes paused (interrupted) / completed / failed. A `None` child
-/// (a skipped/absent step) resolves to pi's ultimate `"failed"` default (no completion status is
+/// child ([`crate::spawn::chain_graph::StepResult`]): no `detached`/`exitCode`/`processSignal` field
+/// exists at this granularity, so this drives [`resolve_subagent_result_status`] with the two
+/// signals it does have plus the run-level `stopped` verdict its caller knows. A `None` child (a
+/// skipped/absent step) resolves to pi's ultimate `"failed"` default (no completion status is
 /// knowable for a step that never ran).
-fn resolve_step_result_status(step: Option<&crate::spawn::chain_graph::StepResult>) -> SubagentResultStatus {
+///
+/// G104 — no `Stopped` branch here, and that is faithful rather than a gap: the stop verb is a
+/// control-inbox request consumed by the DETACHED runner (`subagent-runner.ts:2955-2984`), a
+/// foreground grouped run has no control inbox, and pi's own foreground path never sets
+/// `result.stopped` either (`execution.ts` only reads it). The background grouped path, which CAN
+/// be stopped, goes through [`IntercomPayload::from_result`] instead and does resolve `Stopped`.
+fn resolve_step_result_status(
+    step: Option<&crate::spawn::chain_graph::StepResult>,
+) -> SubagentResultStatus {
     match step {
         None => SubagentResultStatus::Failed,
-        Some(r) if r.interrupted => SubagentResultStatus::Paused,
-        Some(r) if r.success => SubagentResultStatus::Completed,
-        Some(_) => SubagentResultStatus::Failed,
+        Some(r) => resolve_subagent_result_status(&ResultStatusInput {
+            success: Some(r.success),
+            interrupted: r.interrupted,
+            ..ResultStatusInput::default()
+        }),
     }
 }
 
-/// pi `formatSubagentResultReceipt` (`result-intercom.ts:334-377`), ported for the mode label +
+/// pi `formatSubagentResultReceipt` (`result-intercom.ts:376-421`), ported for the mode label +
 /// "Run: …" + "Children: …" + closing-line structure this crate has real data for today. pi's three
 /// conditional sections (`Artifacts:` / `Run intercom targets (may be inactive after completion):` /
 /// `Sessions:`) each only render when at least one delivered child carries an `artifactPath` /
-/// `intercomTarget` / `sessionPath` respectively (`.filter(...)`, `result-intercom.ts:351-373`) — no
+/// `intercomTarget` / `sessionPath` respectively (`.filter(...)`, `result-intercom.ts:395-417`) — no
 /// per-grouped-child artifact path, session path, or intercom target is tracked anywhere in this
 /// crate's pipeline yet, so those three sections correctly evaluate to "no matching children" and are
 /// omitted here exactly as pi's own filters would do given the identical absence of data; the moment
@@ -253,10 +419,38 @@ impl IntercomPayload {
             .iter()
             .map(|r| r.usage.total_tokens)
             .fold(0u64, u64::saturating_add);
+        // G104 — every child is resolved through the FULL `resolveSubagentResultStatus` ladder
+        // (`result-intercom.ts:20-41`), including its two `"stopped"` branches. The verdict is read
+        // PER CHILD (pi feeds `state: child.state`/`stopped: child.stopped`, not the run's,
+        // `run-status.ts:467-475`) — a run that was stopped mid-flight has one stopped child and
+        // possibly several already-completed ones, and flattening the run's own state onto all of
+        // them would wrongly re-label work that had genuinely finished. The per-child `stopped`
+        // flag is set by `runner_main`'s stop arm, mirroring pi's `stoppedAfterAcceptance =
+        // finalResult?.stopped === true || ctx.stopSignal?.aborted === true`
+        // (`subagent-runner.ts:1642,1722` @v0.43.0).
         let child_statuses: Vec<SubagentResultStatus> = result
             .results
             .iter()
-            .map(|r| resolve_single_result_status(r.detached, r.interrupted, r.exit_code))
+            .map(|r| {
+                let mut input = ResultStatusInput {
+                    exit_code: Some(r.exit_code),
+                    success: None,
+                    state: None,
+                    interrupted: r.interrupted,
+                    detached: r.detached,
+                    process_signal: r.process_signal.as_deref(),
+                    timed_out: r.timed_out,
+                    stopped: r.stopped,
+                    turn_budget_exceeded: false,
+                };
+                if r.acceptance
+                    .as_ref()
+                    .is_some_and(|l| l.status == crate::exec::acceptance::AcceptanceStatus::Rejected)
+                {
+                    input.success = Some(false);
+                }
+                resolve_subagent_result_status(&input)
+            })
             .collect();
         let status = resolve_grouped_status(&child_statuses);
         let summary = format_status_counts(&child_statuses);
@@ -304,6 +498,51 @@ impl IntercomPayload {
                 .iter()
                 .map(|c| c.as_ref().and_then(|r| r.final_output.clone()).unwrap_or_default())
                 .collect(),
+            total_tokens: 0,
+            status,
+            summary,
+            child_statuses,
+        }
+    }
+
+    /// Builds an [`IntercomPayload`] for a FOREGROUND **single** run straight off the child's real
+    /// [`crate::exec::SingleResult`] — the third sanctioned constructor, holding the same
+    /// explicit-allowlist discipline as its two siblings.
+    ///
+    /// G104 — this exists because a single run's child status MUST be resolved by
+    /// [`resolve_single_result_status`] (pi `foregroundResultIntercomStatus`,
+    /// `runs/foreground/subagent-executor.ts:1594-1605` @v0.43.0, which `emitForegroundResultIntercom`
+    /// calls per child at `:1626`), not by [`resolve_step_result_status`]. The two disagree on real
+    /// data, and the disagreement is exactly the bug this constructor closes:
+    ///
+    /// * a child killed by an unexplained process signal (`processSignal` set, non-zero exit)
+    ///   resolves `Stopped` here and `Failed` through a `StepResult` (which has no `process_signal`
+    ///   field at all, so `resolve_step_result_status` can never reach `result-intercom.ts:35`);
+    /// * a child whose acceptance ledger is REJECTED but whose process exited `0` resolves `Failed`
+    ///   here (pi `:1596` pins `success: false`) and `Completed` through a `StepResult` built with
+    ///   `success: exit_code == 0`.
+    ///
+    /// `outputs`/`total_tokens` keep the single-run shapes the grouped foreground constructor
+    /// produces (`final_output` or empty; `0` — upstream's own foreground result-intercom message
+    /// carries no token total either, `formatSubagentResultIntercomMessage` at
+    /// `result-intercom.ts:230` renders run/mode/status/children/outputs and per-child lines and
+    /// nothing else), so the ONLY behaviour this changes is the per-child status resolution, which
+    /// is the point.
+    #[must_use]
+    pub fn from_single_result(
+        run_id: RunId,
+        agent: String,
+        success: bool,
+        result: &crate::exec::SingleResult,
+    ) -> Self {
+        let child_statuses = vec![resolve_single_result_status(result)];
+        let status = resolve_grouped_status(&child_statuses);
+        let summary = format_status_counts(&child_statuses);
+        Self {
+            run_id,
+            agent,
+            success,
+            outputs: vec![result.final_output.clone().unwrap_or_default()],
             total_tokens: 0,
             status,
             summary,
@@ -408,7 +647,7 @@ impl SteerChannel for NoTransportSteerChannel {
 /// receiver never perceptibly stalls the orchestrator's own turn.
 pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_millis(750);
 
-/// pi's `deliverSubagentIntercomMessageEvent` default `timeoutMs` (`result-intercom.ts:283-288`) —
+/// pi's `deliverSubagentIntercomMessageEvent` default `timeoutMs` (`result-intercom.ts:325-330`) —
 /// the SAME 500ms bound applies to EVERY caller of that function, including the live-child follow-up
 /// steer at `subagent-executor.ts:860` ([`SubagentExecutor::control_resume`]'s `SteerRunning` arm).
 /// Distinct from [`DEFAULT_DELIVERY_TIMEOUT`] (750ms), which only bounds the grouped-result
@@ -420,7 +659,7 @@ pub const DEFAULT_STEER_TIMEOUT: Duration = Duration::from_millis(500);
 /// analogue of [`deliver`]'s race, applied to the distinct steer seam. Resolves to `true` only if the
 /// channel confirms `Ok(true)` before `timeout` elapses; any other outcome (`Ok(false)`, `Err`, or the
 /// timeout branch firing first) resolves to `false`, matching pi's `deliverSubagentIntercomMessageEvent`
-/// contract that the caller's turn is never blocked longer than `timeoutMs` (`result-intercom.ts:283-316`).
+/// contract that the caller's turn is never blocked longer than `timeoutMs` (`result-intercom.ts:325-358`).
 pub async fn steer_with_timeout(channel: &dyn SteerChannel, target: String, text: String, timeout: Duration) -> bool {
     let attempt = channel.steer(target, text);
     tokio::select! {
@@ -431,7 +670,7 @@ pub async fn steer_with_timeout(channel: &dyn SteerChannel, target: String, text
 }
 
 /// Convenience wrapper over [`steer_with_timeout`] using [`DEFAULT_STEER_TIMEOUT`] (pi's `timeoutMs
-/// = 500` default, applied uniformly to every caller per `result-intercom.ts:283-288`).
+/// = 500` default, applied uniformly to every caller per `result-intercom.ts:325-330`).
 pub async fn steer_with_default_timeout(channel: &dyn SteerChannel, target: String, text: String) -> bool {
     steer_with_timeout(channel, target, text, DEFAULT_STEER_TIMEOUT).await
 }
@@ -822,6 +1061,8 @@ mod tests {
             detached: false,
             interrupted: false,
             timed_out: false,
+            stopped: false,
+            process_signal: None,
             error: None,
             saved_output_path: None,
             tool_calls: Vec::new(),
@@ -829,6 +1070,246 @@ mod tests {
             control_events: Vec::new(),
             progress: None,
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // G104 — `stopped` as a first-class result status (pi `result-intercom.ts:20-91` @v0.43.0)
+    // ---------------------------------------------------------------------------------------
+
+    /// pi `resolveSubagentResultStatus` (`result-intercom.ts:20-41`) branch-by-branch, in
+    /// upstream's own order. The two assertions that would fail under any "stopped is an alias"
+    /// implementation are called out inline.
+    #[test]
+    fn resolve_subagent_result_status_reproduces_pis_branch_order() {
+        let base = ResultStatusInput::default();
+
+        // 1. detached wins over everything, including an explicit stop.
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput {
+                detached: true,
+                stopped: true,
+                ..base.clone()
+            }),
+            SubagentResultStatus::Detached
+        );
+
+        // 2. `stopped` OR `state === "stopped"` — and it wins over `interrupted`, which is the
+        //    branch that stops a stopped run from being reported as a resumable pause.
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput { stopped: true, ..base.clone() }),
+            SubagentResultStatus::Stopped
+        );
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput {
+                state: Some("stopped"),
+                ..base.clone()
+            }),
+            SubagentResultStatus::Stopped
+        );
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput {
+                stopped: true,
+                interrupted: true,
+                ..base.clone()
+            }),
+            SubagentResultStatus::Stopped,
+            "stopped MUST outrank interrupted (`result-intercom.ts:32` precedes `:33`)"
+        );
+
+        // 3. interrupted / state==="paused".
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput { interrupted: true, ..base.clone() }),
+            SubagentResultStatus::Paused
+        );
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput { state: Some("paused"), ..base.clone() }),
+            SubagentResultStatus::Paused
+        );
+
+        // 4. success === true.
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput {
+                success: Some(true),
+                exit_code: Some(3),
+                ..base.clone()
+            }),
+            SubagentResultStatus::Completed
+        );
+
+        // 5. an UNEXPLAINED signal with a non-zero exit is `stopped`, NOT `failed`
+        //    (`result-intercom.ts:35`) — the branch that keeps an externally-SIGKILLed child out of
+        //    the failure bucket.
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput {
+                exit_code: Some(137),
+                process_signal: Some("SIGKILL"),
+                ..base.clone()
+            }),
+            SubagentResultStatus::Stopped
+        );
+        // …but an EXPLAINED one is not: a timeout, an interrupt, or a stop all disqualify it.
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput {
+                exit_code: Some(137),
+                process_signal: Some("SIGKILL"),
+                timed_out: true,
+                success: Some(false),
+                ..base.clone()
+            }),
+            SubagentResultStatus::Failed
+        );
+        // …and neither is a signal death that still exited 0 (`&& input.exitCode !== 0`).
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput {
+                exit_code: Some(0),
+                process_signal: Some("SIGTERM"),
+                ..base.clone()
+            }),
+            SubagentResultStatus::Completed
+        );
+
+        // 6-10. the success/state/exit-code tail, including pi's ultimate `"failed"` default.
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput { success: Some(false), ..base.clone() }),
+            SubagentResultStatus::Failed
+        );
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput { state: Some("complete"), ..base.clone() }),
+            SubagentResultStatus::Completed
+        );
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput { state: Some("failed"), ..base.clone() }),
+            SubagentResultStatus::Failed
+        );
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput { exit_code: Some(0), ..base.clone() }),
+            SubagentResultStatus::Completed
+        );
+        assert_eq!(
+            resolve_subagent_result_status(&ResultStatusInput { exit_code: Some(1), ..base.clone() }),
+            SubagentResultStatus::Failed
+        );
+        assert_eq!(resolve_subagent_result_status(&base), SubagentResultStatus::Failed);
+    }
+
+    /// pi `isUnexplainedProcessSignal` (`runs/shared/process-signal.ts:5-19`): all four
+    /// explanations disqualify, and an absent/empty signal is never "unexplained".
+    #[test]
+    fn is_unexplained_process_signal_matches_pis_four_disqualifiers() {
+        assert!(is_unexplained_process_signal(Some("SIGKILL"), false, false, false, false));
+        assert!(!is_unexplained_process_signal(None, false, false, false, false));
+        assert!(!is_unexplained_process_signal(Some(""), false, false, false, false));
+        assert!(!is_unexplained_process_signal(Some("SIGKILL"), true, false, false, false));
+        assert!(!is_unexplained_process_signal(Some("SIGKILL"), false, true, false, false));
+        assert!(!is_unexplained_process_signal(Some("SIGKILL"), false, false, true, false));
+        assert!(!is_unexplained_process_signal(Some("SIGKILL"), false, false, false, true));
+    }
+
+    /// pi `formatStatusCounts` (`result-intercom.ts:57-66`): the RENDER order puts `stopped`
+    /// between `failed` and `paused`, which is NOT the bucket/declaration order — a zip against the
+    /// enum order would print it fourth.
+    #[test]
+    fn format_status_counts_renders_stopped_between_failed_and_paused() {
+        let all = [
+            SubagentResultStatus::Detached,
+            SubagentResultStatus::Paused,
+            SubagentResultStatus::Stopped,
+            SubagentResultStatus::Failed,
+            SubagentResultStatus::Completed,
+        ];
+        assert_eq!(
+            format_status_counts(&all),
+            "1 completed, 1 failed, 1 stopped, 1 paused, 1 detached"
+        );
+        assert_eq!(
+            format_status_counts(&[SubagentResultStatus::Stopped, SubagentResultStatus::Stopped]),
+            "2 stopped"
+        );
+        // Unchanged for a stop-free tally (the pre-G104 render order is preserved exactly).
+        assert_eq!(
+            format_status_counts(&[
+                SubagentResultStatus::Completed,
+                SubagentResultStatus::Paused,
+                SubagentResultStatus::Detached
+            ]),
+            "1 completed, 1 paused, 1 detached"
+        );
+        assert_eq!(format_status_counts(&[]), "0 results");
+    }
+
+    /// pi `resolveGroupedStatus` (`result-intercom.ts:83-91`): failed > stopped > paused >
+    /// completed > detached, with `failed` as the empty-set default.
+    #[test]
+    fn resolve_grouped_status_gives_stopped_its_own_precedence_slot() {
+        use SubagentResultStatus::{Completed, Detached, Failed, Paused, Stopped};
+        assert_eq!(resolve_grouped_status(&[Failed, Stopped]), Failed, "failed still outranks stopped");
+        assert_eq!(resolve_grouped_status(&[Stopped, Paused]), Stopped, "stopped outranks paused");
+        assert_eq!(resolve_grouped_status(&[Stopped, Completed]), Stopped, "stopped outranks completed");
+        assert_eq!(resolve_grouped_status(&[Stopped, Detached]), Stopped);
+        assert_eq!(resolve_grouped_status(&[Stopped]), Stopped);
+        // The pre-G104 relations are untouched.
+        assert_eq!(resolve_grouped_status(&[Paused, Completed]), Paused);
+        assert_eq!(resolve_grouped_status(&[Completed, Detached]), Completed);
+        assert_eq!(resolve_grouped_status(&[]), Failed);
+    }
+
+    /// The LIVE projection path: `IntercomPayload::from_result` must read each child's own
+    /// `stopped` flag (never the run's overall state flattened onto every child) and roll the
+    /// group up to `Stopped`.
+    #[test]
+    fn from_result_reports_a_stopped_child_without_relabelling_the_completed_ones() {
+        let mut stopped_child = sample_single_result("worker", "");
+        stopped_child.stopped = true;
+        stopped_child.exit_code = 1;
+        let done_child = sample_single_result("scout", "found it");
+
+        let result = crate::background::ResultFile {
+            id: RunId::from_token("stoppedrun00001"),
+            run_id: RunId::from_token("stoppedrun00001"),
+            agent: "scout".to_string(),
+            mode: crate::background::RunMode::Chain,
+            state: crate::background::RunState::Stopped,
+            success: false,
+            cwd: PathBuf::from("/tmp"),
+            session_file: None,
+            results: vec![done_child, stopped_child],
+        };
+
+        let payload = IntercomPayload::from_result(&result);
+        assert_eq!(
+            payload.child_statuses,
+            vec![SubagentResultStatus::Completed, SubagentResultStatus::Stopped],
+            "the child that finished BEFORE the stop stays `completed` — pi resolves per child, \
+             never by flattening the run's own state onto all of them"
+        );
+        assert_eq!(payload.status, SubagentResultStatus::Stopped);
+        assert_eq!(payload.summary, "1 completed, 1 stopped");
+        assert_eq!(
+            format_subagent_result_receipt("chain", &payload.run_id, &payload.child_statuses),
+            "Delivered chain subagent results via intercom.\nRun: stoppedrun00001\nChildren: 1 completed, 1 stopped\nFull grouped output was sent over intercom."
+        );
+    }
+
+    /// The other LIVE projection path: a child killed by an unexplained signal resolves to
+    /// `stopped` straight off its real `SingleResult`, through the same
+    /// `foregroundResultIntercomStatus` shape pi uses (`subagent-executor.ts:1594-1605`).
+    #[test]
+    fn resolve_single_result_status_reads_stopped_and_the_unexplained_signal_off_a_real_child() {
+        let mut child = sample_single_result("worker", "partial");
+        child.exit_code = 137;
+        child.process_signal = Some("SIGKILL".to_string());
+        assert_eq!(resolve_single_result_status(&child), SubagentResultStatus::Stopped);
+
+        child.timed_out = true;
+        assert_eq!(
+            resolve_single_result_status(&child),
+            SubagentResultStatus::Failed,
+            "an EXPLAINED signal death is not a stop"
+        );
+
+        let mut stopped = sample_single_result("worker", "");
+        stopped.stopped = true;
+        assert_eq!(resolve_single_result_status(&stopped), SubagentResultStatus::Stopped);
     }
 
     // ---------------------------------------------------------------------------------------

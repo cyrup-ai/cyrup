@@ -1,6 +1,7 @@
-//! FULLY-WIRED PROOF that the `debug` key an operator sets in `config.json` actually produces the
-//! audit / debug JSONL trail pi writes (`logging.ts` + the `writeReviewEntry` call sites throughout
-//! `index.ts`) — driven through the registered `before_tool_call` gate
+//! FULLY-WIRED PROOF that the audit / debug JSONL trail pi writes (`logging.ts` + the
+//! `writeReviewEntry` call sites throughout `index.ts`) actually reaches disk — the
+//! security-`review` stream unconditionally, the `debug` stream only when an operator sets
+//! `"debug": true` in `config.json` — driven through the registered `before_tool_call` gate
 //! (`NativeExtension::on_event(ToolCall)`), the SAME entry point the dispatcher drives at runtime,
 //! not by calling the logger directly.
 //!
@@ -16,7 +17,9 @@
 //!   `resolution: confirmation_unavailable` when no human is reachable.
 //! - `index.ts:2243-2255` — the skill-read `policy_denied` entry, whose `source` is `skill_read`.
 //! - `logging.ts:71-77` — the record shape `{timestamp, extension, stream, event, ...details}`.
-//! - `logging.ts:89,97` — BOTH streams gated on `config.debug`.
+//! - v0.8.0 `logging.ts:90-93` — ONLY the `debug` stream is gated on `config.debug`; `review`
+//!   (`:98-100`) is a bare `writeLine`. v0.7.1 gated both (`:97-100`), which is the gap tests
+//!   (2)/(2b) pin.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::path::{Path, PathBuf};
@@ -131,11 +134,17 @@ async fn policy_denied_tool_call_writes_a_review_entry_when_debug_is_on() {
 }
 
 // ================================================================================================
-// (2) The SAME denied call under the DEFAULT `"debug": false` writes nothing at all.
+// (2) The SAME denied call under the DEFAULT `"debug": false` STILL writes the review entry.
+//
+// v0.7.1 `logging.ts:97-100` early-returned out of `review` unless `config.debug`; v0.8.0
+// `logging.ts:98-100` deletes those lines, so the security-review stream is unconditional. Since
+// `"debug": false` is what `default_config_content()` materializes, gating the trail on it meant
+// every decision entry was a no-op for every operator who had not first turned on diagnostics —
+// i.e. the audit trail was off precisely when it was needed.
 // ================================================================================================
 
 #[tokio::test]
-async fn debug_off_writes_no_trail_for_the_same_denied_call() {
+async fn debug_off_still_writes_the_review_trail_for_a_denied_call() {
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, false, &["bash"]).await;
@@ -144,11 +153,74 @@ async fn debug_off_writes_no_trail_for_the_same_denied_call() {
         ext.on_event(&tool_call("bash", json!({ "command": "rm -rf /" })), &ctx(agent_dir)).await;
     assert!(matches!(outcome, HookOutcome::Block { .. }), "the deny rule must still block");
 
+    let entries = trail(agent_dir);
     assert!(
-        !trail_path(agent_dir).exists(),
-        "pi gates BOTH streams on `config.debug` (`logging.ts:89,97`) — a disabled logger must not \
-         even create the file"
+        !entries.is_empty(),
+        "v0.8.0 `logging.ts:98-100` — the review stream is NOT gated on `debug`; expected a trail \
+         at {:?}",
+        trail_path(agent_dir)
     );
+    let blocked = find_event(&entries, "permission_request.blocked")
+        .expect("a policy-denied tool call must be audited regardless of `debug`");
+    assert_eq!(blocked["stream"], json!("review"));
+    assert_eq!(blocked["resolution"], json!("policy_denied"));
+    assert_eq!(blocked["command"], json!("rm -rf /"));
+}
+
+// ================================================================================================
+// (2b) MIRROR — un-gating `review` must not un-gate `debug`. `config.debug` keeps its upstream
+// meaning (v0.8.0 `logging.ts:90-93`), so the diagnostic stream stays opt-in. `session_start` is
+// what reaches `refresh_config_and_manager` → the `config.loaded` debug entry (`extension.rs:393`),
+// so the same run that proves the review line lands also proves the debug line does not.
+// ================================================================================================
+
+#[tokio::test]
+async fn debug_off_keeps_the_diagnostic_stream_silent_while_the_review_stream_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, false, &["bash"]).await;
+
+    let _ = ext
+        .on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx(agent_dir))
+        .await;
+    let _ = ext.on_event(&tool_call("bash", json!({ "command": "rm -rf /" })), &ctx(agent_dir)).await;
+
+    let entries = trail(agent_dir);
+    assert!(
+        find_event(&entries, "permission_request.blocked").is_some(),
+        "the review stream must be live under `\"debug\": false`"
+    );
+    assert!(
+        find_event(&entries, "config.loaded").is_none(),
+        "`config.loaded` is a DEBUG-stream entry (`extension.rs:393`) and must stay gated on \
+         `config.debug`: {entries:?}"
+    );
+    assert!(
+        entries.iter().all(|e| e["stream"] == json!("review")),
+        "no `debug`-stream line may appear under `\"debug\": false`: {entries:?}"
+    );
+}
+
+// ================================================================================================
+// (2c) MIRROR — with `"debug": true` BOTH streams write, so the un-gating did not delete the flag.
+// ================================================================================================
+
+#[tokio::test]
+async fn debug_on_writes_both_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, true, &["bash"]).await;
+
+    let _ = ext
+        .on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx(agent_dir))
+        .await;
+    let _ = ext.on_event(&tool_call("bash", json!({ "command": "rm -rf /" })), &ctx(agent_dir)).await;
+
+    let entries = trail(agent_dir);
+    let loaded = find_event(&entries, "config.loaded")
+        .expect("`\"debug\": true` must still produce the diagnostic stream");
+    assert_eq!(loaded["stream"], json!("debug"));
+    assert!(find_event(&entries, "permission_request.blocked").is_some());
 }
 
 // ================================================================================================

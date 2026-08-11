@@ -12,6 +12,14 @@
 //! This module is the **pure** row-builder half (no session, no I/O) so it is unit-testable in
 //! isolation; `app::execute_command` gathers the raw inputs (stored ids, catalog provider ids, per-
 //! provider auth state) from the live `AgentSession` and calls [`provider_rows`].
+//!
+//! [`login_selector_rows`] is the newer, option-shaped builder the live `/login` and `/logout`
+//! pickers use: it takes the resolved `AuthSelectorProvider[]`
+//! (`cyrup_config::login::{login_provider_options, logout_provider_options}`) rather than raw
+//! `(id, state)` pairs, so a provider offering BOTH a subscription and an API-key login gets the two
+//! rows upstream gives it. [`provider_rows`] remains for the id-only shape.
+
+use cyrup_config::login::{AuthType, LoginProviderOption};
 
 /// The three auth states the oauth-selector status line distinguishes (Pi `getStatusText`,
 /// `oauth-selector.ts:151-159`). Kept independent of the `cyrup-config` `AuthStatus` type so the row
@@ -106,6 +114,155 @@ pub fn provider_rows(entries: Vec<(String, AuthState)>) -> Vec<(String, String, 
         .collect();
     rows.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then(a.0.cmp(&b.0)));
     rows
+}
+
+/// `formatAuthSelectorProviderType` (`oauth-selector.ts:22-24`).
+pub fn format_auth_selector_provider_type(auth_type: AuthType) -> &'static str {
+    match auth_type {
+        AuthType::Oauth => "subscription",
+        AuthType::ApiKey => "API key",
+    }
+}
+
+/// `/^[A-Z][A-Z0-9_]*(?:, [A-Z][A-Z0-9_]*)*$/` (`oauth-selector.ts:176`) — "does this source read
+/// like a list of environment-variable names?", which is what makes the row say `✓ env: OPENAI_API_KEY`
+/// instead of echoing the bare source. Hand-rolled rather than pulling in a regex crate for one
+/// pattern (`cyrup/Cargo.toml:174-180` — prefer no new dependency where a small pure function does).
+fn looks_like_env_var_list(source: &str) -> bool {
+    !source.is_empty()
+        && source.split(", ").all(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) if first.is_ascii_uppercase() => {
+                    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                }
+                _ => false,
+            }
+        })
+}
+
+/// The theme colour one run of the status indicator is painted in.
+///
+/// **S21.** `formatStatusIndicator` (`oauth-selector.ts:164-181`) does not return one uniformly
+/// coloured string: `" ✓ configured"` is `theme.fg("success", …)` (`:175`), the mismatch case is
+/// `theme.fg("muted", " • ") + theme.fg("warning", label)` (`:168`) — **two** runs — and
+/// `" • unconfigured"` is `theme.fg("muted", …)` (`:165`). cyrup folded the whole thing into a
+/// `SelectItem.description`, which `select_list.rs` paints uniformly `muted` (or, on the highlighted
+/// row, uniformly `accent`), so a configured provider read grey instead of green and a credential
+/// mismatch lost its warning entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusTone {
+    /// `theme.fg("muted", …)`.
+    Muted,
+    /// `theme.fg("warning", …)`.
+    Warning,
+    /// `theme.fg("success", …)`.
+    Success,
+}
+
+/// `formatStatusIndicator(provider)` as the **styled runs** upstream actually emits
+/// (`oauth-selector.ts:164-181`), each keeping its own colour — see [`StatusTone`].
+///
+/// The text is verbatim upstream's, **leading space included**: the indicator is concatenated
+/// straight onto the provider name at `:138`/`:141` (`prefix + text + authTypeLabel +
+/// statusIndicator`), so the single space in `" ✓ configured"` is the entire gap between the name
+/// and its status. [`format_status_indicator`] keeps returning the space-less form, because that one
+/// feeds a padded description column rather than this concatenation.
+pub fn status_indicator_runs(option: &LoginProviderOption) -> Vec<(StatusTone, String)> {
+    // `if (!provider.status) return theme.fg("muted", " • unconfigured")` (`:165`).
+    let Some(status) = option.status.as_ref() else {
+        return vec![(StatusTone::Muted, " • unconfigured".to_string())];
+    };
+    // `:166-169` — a stored credential of the OTHER kind: muted bullet, warning label.
+    if status.auth_type != option.auth_type {
+        let label = match status.auth_type {
+            AuthType::Oauth => "subscription configured",
+            AuthType::ApiKey => "API key configured",
+        };
+        return vec![
+            (StatusTone::Muted, " • ".to_string()),
+            (StatusTone::Warning, label.to_string()),
+        ];
+    }
+    // `:170-176`.
+    let source = match status.source.as_deref() {
+        None | Some("") | Some("OAuth") | Some("stored credential") => {
+            return vec![(StatusTone::Success, " ✓ configured".to_string())];
+        }
+        Some(source) => source,
+    };
+    if looks_like_env_var_list(source) {
+        vec![(StatusTone::Success, format!(" ✓ env: {source}"))]
+    } else {
+        vec![(StatusTone::Success, format!(" ✓ {source}"))]
+    }
+}
+
+/// `formatStatusIndicator(provider)` (`oauth-selector.ts:164-181`) — the row's trailing status,
+/// verbatim including the mismatch case (a provider whose STORED credential is of the other kind
+/// shows `• subscription configured` / `• API key configured`, not `✓ configured`).
+pub fn format_status_indicator(option: &LoginProviderOption) -> String {
+    // `if (!provider.status) return " • unconfigured"` (`:165`).
+    let Some(status) = option.status.as_ref() else {
+        return "• unconfigured".to_string();
+    };
+    // `if (provider.status.type !== provider.authType)` (`:166-169`).
+    if status.auth_type != option.auth_type {
+        let label = match status.auth_type {
+            AuthType::Oauth => "subscription configured",
+            AuthType::ApiKey => "API key configured",
+        };
+        return format!("• {label}");
+    }
+    // `if (!source || source === "OAuth" || source === "stored credential")` (`:170-176`).
+    let source = match status.source.as_deref() {
+        None | Some("") | Some("OAuth") | Some("stored credential") => {
+            return "✓ configured".to_string();
+        }
+        Some(source) => source,
+    };
+    if looks_like_env_var_list(source) {
+        format!("✓ env: {source}")
+    } else {
+        format!("✓ {source}")
+    }
+}
+
+/// The `OAuthSelectorComponent` rows for a resolved `AuthSelectorProvider[]`
+/// (`oauth-selector.ts:124-145`), as `(value, label, description)`.
+///
+/// * **value** is the row's INDEX into `options`. Pi calls back with `(providerId, authType)` and
+///   re-finds the option (`interactive-mode.ts:5106-5111`); cyrup's selector carries a single
+///   string, and the index is the only key that survives one provider contributing two rows.
+/// * **label** is `` `${name}${authTypeLabel}` ``, where the ` [subscription]` / ` [API key]` suffix
+///   appears only when the list MIXES both kinds (`showAuthTypeLabels`, `oauth-selector.ts:61`).
+/// * **description** is [`format_status_indicator`].
+///
+/// `options` is already sorted by display name by `login_provider_options`/`logout_provider_options`
+/// (Node `localeCompare`, via `feruca`), so this preserves their order.
+pub fn login_selector_rows(
+    options: &[LoginProviderOption],
+) -> Vec<(String, String, Option<String>)> {
+    // `new Set(providers.map(p => p.authType)).size > 1` (`oauth-selector.ts:61`).
+    let show_auth_type_labels = options
+        .iter()
+        .any(|o| o.auth_type != options.first().map_or(o.auth_type, |f| f.auth_type));
+    options
+        .iter()
+        .enumerate()
+        .map(|(i, option)| {
+            let label = if show_auth_type_labels {
+                format!(
+                    "{} [{}]",
+                    option.name,
+                    format_auth_selector_provider_type(option.auth_type)
+                )
+            } else {
+                option.name.clone()
+            };
+            (i.to_string(), label, Some(format_status_indicator(option)))
+        })
+        .collect()
 }
 
 #[cfg(test)]

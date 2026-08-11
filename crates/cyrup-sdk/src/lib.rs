@@ -93,9 +93,13 @@ pub use cyrup_session_svc::{
 
 // ---- run-mode helpers (arch-11 §2.3; Pi `runPrintMode`/`runRpcMode` SDK exports) so an embedder
 // can drive print / json / rpc over the seam (or the runtime host, for rpc) themselves. ----
+// `to_json_event`/`JsonAgentSessionEvent` are the json/rpc stdout wire projection (Pi
+// `toJsonEvent`, `coding-agent/src/modes/json-event.ts`), exported for the same reason Pi exports
+// it — `modes/index.ts:6` and `index.ts:337` — so an embedder writing its own event lane emits the
+// same delta-only `message_update` the built-in modes do rather than re-deriving the projection.
 pub use cyrup_modes::{
-    run_json, run_print, run_rpc, ModesError, PrintOptions, QueueModeArg, RpcOut, RpcResponse,
-    SessionCommand,
+    run_json, run_print, run_rpc, to_json_event, JsonAgentSessionEvent, ModesError, PrintOptions,
+    QueueModeArg, RpcOut, RpcResponse, SessionCommand,
 };
 
 /// The single streaming primitive (arch-00 §3.1): every event feed is an `EventStream<T>`.

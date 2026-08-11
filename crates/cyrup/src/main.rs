@@ -97,6 +97,15 @@ async fn run() -> anyhow::Result<i32> {
         }
     }
 
+    // `cyrup auth print-api-key|print-bearer-token` pre-dispatch (Pi
+    // `if (await runCredentialPrintCommand(args)) return;`, main.ts:557-559 — immediately after the
+    // config/package block and BEFORE `parseArgs`). Without it `auth` is not a known verb, so the
+    // tokens survive arg leniency as bare positionals and become a chat PROMPT: no credential, no
+    // error, an agent session started and tokens burned on an auth subcommand.
+    if let Some(code) = cyrup::credential_print::dispatch(&argv).await {
+        return Ok(code);
+    }
+
     // Pi-faithful arg leniency (args.ts:80-82,131-139,202-203) BEFORE clap: a bad `--mode` is
     // silently dropped, a bad `--thinking` warns + drops, and an unknown single-dash option becomes a
     // Pi `Unknown option` error (exit 1) rather than a clap usage error (exit 2).
@@ -399,6 +408,22 @@ async fn run() -> anyhow::Result<i32> {
         }
     }
 
+    // `--api-key` installs a RUNTIME credential on the same credential store the session's model
+    // runtime reads (Pi `modelRuntime.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey)`,
+    // main.ts:764 → model-runtime.ts:400-418, whose store is `RuntimeCredentials` wrapping
+    // `AuthStorage`). cyrup handed the key only to `select_provider`'s throwaway
+    // `InMemoryCredentialStore`, so the session's `AuthStore` — the one behind `hasConfiguredAuth`,
+    // `getProviderAuthStatus` and `/logout`'s `listCredentials()` — never saw it. Building the store
+    // here (instead of letting `SessionBuilder` default it) is what lets the key be installed on it.
+    //
+    // The default-launch block above cannot have swapped `provider` out from under this: `--api-key`
+    // is rejected earlier unless one of `--model`/`--provider`/`--models` is present, and that block
+    // runs only when all three are absent.
+    let auth_store = Arc::new(AuthStore::at(dirs.agent_dir.join("auth.json")));
+    if let Some(api_key) = cli.api_key.as_deref() {
+        auth_store.set_runtime_api_key(provider.id().clone(), api_key.to_string());
+    }
+
     // Interactive mode drives the **multi-session** `AgentSessionRuntime` (arch-11 §3.4) so the
     // session-swap commands rebuild the active session in place and the TUI re-binds to it. The
     // one-shot/RPC modes keep the single fixed `AgentSession` seam unchanged.
@@ -410,6 +435,7 @@ async fn run() -> anyhow::Result<i32> {
         let session_cwd = config.cwd.clone();
         let mut factory_builder = SessionFactory::new(provider, config)
             .settings_store(settings_store.clone())
+            .auth(auth_store.clone())
             .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
         // SubAgents opt-in gate (default OFF, mirrors the two sibling companions) composed with the T6
         // child-mode gate (Pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`): a plain
@@ -470,7 +496,9 @@ async fn run() -> anyhow::Result<i32> {
         // via the SAME `.with_native_extension(...)` seam. `permission_extension_for_env` selects the
         // role by the `CYRUP_SUBAGENT_CHILD` signal — a subagent child loads the gate with the
         // child→parent ask-FORWARDING channel, this (root) session loads it with the in-session dialog
-        // + the forwarding watcher — and returns `None` only when the gate is not installed (DI-5).
+        // + the forwarding watcher — and returns `None` when the gate is not installed (DI-5) OR
+        // when an installed gate is switched off by `"enabled": false` in its `config.json`
+        // (v0.8.0 `index.ts:1473-1477`, the master switch that early-returns before registration).
         if let Some(ext) = cyrup_permission_system::permission_extension_for_env(
             dirs.agent_dir.clone(),
             session_cwd,
@@ -517,8 +545,30 @@ async fn run() -> anyhow::Result<i32> {
         // positional is downsampled to 2000px or inlined at full resolution.
         let auto_resize_images = session.services().settings.effective().image_auto_resize();
         let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images).await?;
-        let interactive =
-            run_interactive(runtime.clone(), session.clone(), inputs, cli.verbose, cancel).await;
+        // The startup package-update check (Pi `interactive-mode.ts:850-856`): DETACHED, gated on
+        // `NetworkPolicy::allow_update_check()` (`--offline` / `CYRUP_OFFLINE` /
+        // `CYRUP_SKIP_VERSION_CHECK`), and delivered to the run loop over a channel so nothing here
+        // is awaited before the first frame. `None` when the gate declines — see
+        // `cyrup::update_check` for why only the PACKAGE half of Pi's pair is ported.
+        let update_policy = cyrup_config::policy::NetworkPolicy::resolve(
+            session.services().settings.effective(),
+            &env,
+            &overrides,
+        );
+        let package_updates = cyrup::update_check::spawn_package_update_check(
+            dirs.package_dir.clone(),
+            Some(dirs.cwd.clone()),
+            update_policy,
+        );
+        let interactive = run_interactive(
+            runtime.clone(),
+            session.clone(),
+            inputs,
+            cli.verbose,
+            cancel,
+            package_updates,
+        )
+        .await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path
         // (agent-session-runtime.ts:397-404), emitting `session_shutdown{reason:"quit"}` so
         // extensions can flush/deregister. Runs even when the TUI loop errored out.
@@ -546,6 +596,7 @@ async fn run() -> anyhow::Result<i32> {
             let session_cwd = config.cwd.clone();
             let mut factory_builder = SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
+                .auth(auth_store.clone())
                 .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
             // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/
@@ -637,6 +688,7 @@ async fn run() -> anyhow::Result<i32> {
             let session_cwd = config.cwd.clone();
             let mut factory_builder = SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
+                .auth(auth_store.clone())
                 .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
             // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/
@@ -1526,6 +1578,9 @@ async fn run_interactive(
     // (`cli.rs:818` has always advertised exactly that; TUI-006 makes it true).
     verbose: bool,
     cancel: CancelToken,
+    // The detached startup package-update check's answer channel (Pi `interactive-mode.ts:850-856`);
+    // `None` when the network policy declined. Handed straight to the run loop.
+    package_updates: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<String>>>,
 ) -> anyhow::Result<()> {
     // Boot the render theme from `settings.theme` + the terminal background/color-depth (feature #4:
     // the `ThemeController`), instead of the hardwired dark boot the audit flagged (theme.rs #4). An
@@ -1559,6 +1614,9 @@ async fn run_interactive(
     }
     app.detect_image_support();
     seed_footer(&mut app, &runtime, &session).await;
+    // Pi shows the package-update notification whenever the detached check settles, which is why the
+    // channel — not the answer — is what reaches the loop (`interactive-mode.ts:850-856`).
+    app.set_package_update_channel(package_updates);
 
     // Configurable keybindings (feature #2; Pi `KeybindingsManager.create`, keybindings.ts:348-352):
     // load the user's `~/.cyrup/keybindings.json` and merge it into every live keymap (global/editor/
@@ -1621,7 +1679,10 @@ async fn run_interactive(
     // raw projection, interactive-mode.ts:3506-3516).
     let restored = session.raw_context_messages().await;
     if !restored.is_empty() {
-        app.replay_session(&restored);
+        // X11 — WITH the loaded extensions: Pi resolves `getMessageRenderer(message.customType)` on
+        // the replay walk (`interactive-mode.ts:3471`) exactly as it does on the live
+        // `addMessageToChat` path, so a `--resume`d session keeps the extension rendering it had.
+        app.replay_session_with_extensions(&restored, &session.services().ext_host).await;
     }
 
     if !inputs.is_empty() {
@@ -1713,6 +1774,14 @@ async fn seed_footer<B: cyrup_tui::RebuildBackend>(
 
     // Location line (`cwd (branch) • name`, footer.ts:116-130).
     status.set_cwd(home_relative(runtime.cwd()));
+    // …and the `(branch)` half of it, which Pi reads from its `FooterDataProvider`
+    // (`footer.ts:117` → `footer-data-provider.ts` `getGitBranch()`). This is the sole production
+    // caller: before it existed `StatusLine::set_branch` had only test callers, so the segment could
+    // never appear in a real session. Constructed from the RUNTIME's cwd, the same value Pi passes
+    // (`new FooterDataProvider(sessionManager.getCwd())`), not the process cwd — a `--resume` of a
+    // session recorded elsewhere must show THAT tree's branch.
+    let cwd = runtime.cwd().to_path_buf();
+    app.set_footer_git_cwd(&cwd);
 
     // Thinking level → footer suffix + editor rule color (spec/tui/03 §3.3, footer.ts:186-188).
     let level = thinking_level_str(session.thinking_level().await);
@@ -1907,14 +1976,25 @@ mod tests {
         let catalog = cyrup::provider::all_available_models(&cyrup_config::ModelFile::default());
 
         // Path-segment awareness: a 1-segment pattern (`anthropic*`, no `**`) can NEVER match the
-        // 2-segment `anthropic/<id>` under minimatch, and `anthropic*` also does not match any bare
-        // `id` (none begin "anthropic"). Pi → 0 matches. The old crude matcher wrongly matched EVERY
-        // anthropic model (its single segment anchored via plain substring across the `/`).
+        // 2-segment `anthropic/<id>` form under minimatch. The old crude matcher wrongly matched
+        // EVERY anthropic model (its single segment anchored via plain substring across the `/`).
+        //
+        // It CAN match a bare id that genuinely begins "anthropic", and since `amazon-bedrock` was
+        // ported that is no longer a hypothetical: Bedrock ids are dotted, e.g.
+        // `anthropic.claude-opus-4-7`. So the assertion is no longer "zero matches" — it is that
+        // every match is a BARE dotted id and none is the provider-qualified `anthropic/…` form.
+        // Asserting emptiness here would have quietly re-encoded "amazon-bedrock is not ported".
         let scoped = resolve_scoped_models(&catalog, &["anthropic*".to_string()]);
         assert!(
-            scoped.is_empty(),
-            "`anthropic*` must scope 0 models (path-segment-aware, like Pi), got {}",
-            scoped.len()
+            scoped.iter().all(|m| !m.model.id.as_str().contains('/')),
+            "`anthropic*` is one segment, so it must never match the 2-segment `anthropic/<id>` \
+             form; got {:?}",
+            scoped.iter().map(|m| m.model.id.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            scoped.iter().all(|m| m.model.id.as_str().starts_with("anthropic")),
+            "every match must actually begin with the literal pattern prefix; got {:?}",
+            scoped.iter().map(|m| m.model.id.as_str()).collect::<Vec<_>>()
         );
 
         // Character classes (`[68]`) are real minimatch syntax the crude matcher could not express

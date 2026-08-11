@@ -21,7 +21,18 @@ use cyrup_session_svc::AgentSessionEvent;
 use cyrup_tui::{App, UiTheme};
 use ratatui::backend::TestBackend;
 
-const LENGTH_NOTICE: &str = "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.";
+/// Pi v0.84.1 `coding-agent/src/modes/interactive/components/assistant-message.ts:180`, verbatim.
+///
+/// Changed from the v0.83.0 wording ("Error: Model stopped because it reached the maximum output
+/// token limit. The response may be incomplete.", v0.83.0 `assistant-message.ts:153-161`) by
+/// upstream `32850ef7c`: a `length` stop may now be a context overflow that pi compacts and
+/// retries, so the notice no longer asserts the max-output-token cause. Upstream's own test moved
+/// with it (`coding-agent/test/assistant-message.test.ts:63,73` — "renders length stops with
+/// neutral truncation wording", expecting exactly this string).
+const LENGTH_NOTICE: &str = "Response was truncated before completion.";
+
+/// The v0.83.0 wording, asserted ABSENT so a silent regression to it is caught.
+const OLD_LENGTH_NOTICE: &str = "maximum output token limit";
 
 fn new_app() -> App<TestBackend> {
     App::new(TestBackend::new(120, 24), UiTheme::dark()).unwrap()
@@ -63,9 +74,17 @@ fn tool_call() -> Content {
 fn scrollback_for(ev: StreamEvent) -> (App<TestBackend>, String) {
     let mut app = new_app();
     let message = ev.terminal_message().cloned().expect("terminal event carries a message");
-    app.ingest_event(&AgentSessionEvent::MessageUpdate {
+    // The production shape. `cyrup-agent` emits `MessageStart` on the stream's `Start` frame
+    // (`agent.rs:802-808`), then `break 'consume`s the moment the stream yields its terminal
+    // (`:813-820`) and re-emits it as `MessageEnd` (`:854`) — a terminal event never rides a
+    // `MessageUpdate`. Pi finalizes in the matching `message_end` arm, guarded on the open
+    // streaming component (`interactive-mode.ts:3180-3213`). This helper used to post the terminal
+    // as a `MessageUpdate` with no `MessageStart` at all, a sequence nothing produces.
+    app.ingest_event(&AgentSessionEvent::MessageStart {
+        message: AgentMessage::Assistant(message.clone()),
+    });
+    app.ingest_event(&AgentSessionEvent::MessageEnd {
         message: AgentMessage::Assistant(message),
-        assistant_message_event: Box::new(ev),
     });
     app.draw().unwrap();
     let out = app.scrollback_text();
@@ -130,8 +149,13 @@ fn aborted_stop_reason_without_a_message_says_operation_aborted() {
 fn length_stop_reason_surfaces_the_truncation_notice() {
     let (app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Length, None, vec![text("a truncated answer")])));
     assert!(out.contains("a truncated answer"), "truncated body committed:\n{out}");
-    assert!(out.contains(LENGTH_NOTICE), "max-output-token notice:\n{out}");
+    assert!(out.contains(LENGTH_NOTICE), "neutral truncation notice:\n{out}");
     assert!(styled_error(&app, LENGTH_NOTICE), "notice uses the error role:\n{out}");
+    // The wording is neutral about the CAUSE (`32850ef7c`) — it must not claim a token limit.
+    assert!(!out.contains(OLD_LENGTH_NOTICE), "v0.83.0 wording must be gone:\n{out}");
+    // MIRROR: `assistant-message.ts:180` passes the bare sentence to `theme.fg("error", …)`; only
+    // the `error` arm (`:193`) builds an `Error: `-prefixed string. A length stop is not prefixed.
+    assert!(!out.contains("Error: Response was truncated"), "length notice is not prefixed:\n{out}");
 }
 
 #[test]

@@ -23,6 +23,7 @@ pub mod env;
 pub mod env_keys;
 pub mod error;
 pub mod lock;
+pub mod login;
 pub mod model;
 pub mod models_store;
 pub mod policy;

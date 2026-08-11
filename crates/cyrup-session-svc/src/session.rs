@@ -958,7 +958,50 @@ impl AgentSession {
         match self.services.ext_host.execute_native_command(name, args, &cancel).await {
             // A native extension owned + serviced the command (Pi short-circuits regardless of the
             // handler's own Ok/Err — the command was "handled").
-            Ok(Some(_)) => {
+            Ok(Some(payload)) => {
+                // SURFACE THE HANDLER'S OUTPUT. This arm used to bind the payload to `_`.
+                //
+                // Pi's handler signature is `Promise<void>` and it talks to the user through
+                // `ctx.ui.*` (`agent-session.ts:1278-1301` — the return value genuinely is
+                // discarded there). cyrup's `NativeExtension::execute_command` instead returns
+                // `Result<Option<String>>`, a cyrup-original channel, and its built-ins populate it:
+                // `cyrup-ext-subagents` alone answers all 15 of its slash commands this way and
+                // contains ZERO `notify` calls. Discarding the payload therefore made every one of
+                // those commands silent — `/prompt-workflow list` ran, spawned, and printed nothing;
+                // `/permission-system yoloMode on` wrote the config and said nothing. The seam was
+                // advertised and unread, which is the same defect class as a mechanism wired to no
+                // caller.
+                //
+                // Routing it to `notify` reproduces pi's OBSERVABLE behaviour (the user sees the
+                // command's response) using the one UI channel that is already live end-to-end:
+                // `LiveHostServices::notify` -> `UiEffect::Notify` -> the TUI's `showExtensionNotify`.
+                // An empty payload stays silent, so a handler that deliberately says nothing still
+                // says nothing.
+                // The bind is the HANDLER's own `Result` — `execute_native_command` returns
+                // `Result<Option<Result<Option<String>, ExtError>>, _>`: outer = routing, `Option` =
+                // did a native extension own the name, inner = what the handler itself returned.
+                match &payload {
+                    Ok(Some(text)) if !text.trim().is_empty() => {
+                        cyrup_ext::HostServices::notify(
+                            &*self.services.host_services,
+                            text,
+                            cyrup_ext::NotifyKind::Info,
+                        );
+                    }
+                    // A handler that deliberately returns nothing stays silent.
+                    Ok(_) => {}
+                    // Pi surfaces a THROWN handler through `emitError` with
+                    // `extensionPath: command:<name>` (`agent-session.ts:1294-1299`) and still
+                    // reports the command handled. Same here: show it, do not fall through to
+                    // treating `/name` as a prompt.
+                    Err(e) => {
+                        cyrup_ext::HostServices::notify(
+                            &*self.services.host_services,
+                            &format!("command:{name}: {e}"),
+                            cyrup_ext::NotifyKind::Error,
+                        );
+                    }
+                }
                 // SEAM-003: drain the control ops the native handler queued. This route used to
                 // `return true` with NO drain at all, so a native built-in's `control(...)` sat in
                 // the queue until some later WASM command happened to run. Pi keeps native + wasm
@@ -2014,9 +2057,9 @@ impl AgentSession {
             cyrup_core::StopReason::Aborted => {
                 Err(cyrup_session::compaction::CompactionError::Aborted)
             }
-            // An unsettled response is NOT a summary — same guard as
-            // `cyrup_session::compaction::{summarize,branch}`.
-            cyrup_core::StopReason::Pending => {
+            // An unsettled response is NOT a summary — same guard, and the same `Deferred`
+            // rationale, as `cyrup_session::compaction::{summarize,branch}`.
+            cyrup_core::StopReason::Pending | cyrup_core::StopReason::Deferred => {
                 Err(cyrup_session::compaction::CompactionError::Summarization(
                     resp.error_message.unwrap_or_else(|| {
                         cyrup_session::compaction::PENDING_SUMMARY.to_string()
@@ -2335,6 +2378,35 @@ impl AgentSession {
     /// let `session_shutdown` be announced — and `session_cancel` fired — while the aborted turn
     /// was still writing its tool results.
     pub async fn dispose(&self, reason: &str) {
+        self.dispose_with(reason, None).await;
+    }
+
+    /// [`Self::dispose`] with the host's `before_session_invalidate` hook (Pi
+    /// `beforeSessionInvalidate`, agent-session-runtime.ts:76/:129-131).
+    ///
+    /// Pi's `teardownCurrent` is `await this.session.abort(); await emitSessionShutdownEvent(…);
+    /// this.beforeSessionInvalidate?.(); this.session.dispose();` (agent-session-runtime.ts:167-177)
+    /// and its `dispose()` repeats the last three lines (:398-404). So the hook's contract is
+    /// positional: it runs **after** every `session_shutdown` handler has finished and **before**
+    /// anything invalidates the session. Because cyrup collapses pi's `teardownCurrent` +
+    /// `AgentSession.dispose` into this one method, the call site is here — after
+    /// `dispatch_notify(SessionShutdown)` and before `session_cancel.cancel()`, which is cyrup's
+    /// analog of pi's `_extensionRunner.invalidate("This extension ctx is stale after session
+    /// replacement or reload…")` (agent-session.ts:848, inside `dispose()` at :837-853).
+    ///
+    /// The hook is deliberately **synchronous** (`Fn()`, pi's `() => void`): it exists so a host can
+    /// detach extension-provided UI without yielding to the executor, i.e. without a window in which
+    /// a component still rendered from the outgoing session's now-stale extension context can be
+    /// driven. Awaiting inside it would reopen exactly that window, so there is nothing to await.
+    ///
+    /// [`Self::dispose`] passes `None`; the only producer of a `Some` is
+    /// [`crate::runtime::AgentSessionRuntime`], which reads whatever the host registered via
+    /// `set_before_session_invalidate`.
+    pub async fn dispose_with(
+        &self,
+        reason: &str,
+        before_invalidate: Option<crate::runtime::BeforeSessionInvalidate>,
+    ) {
         self.abort_and_settle().await;
         self.fanout_emit(AgentSessionEvent::SessionShutdown { reason: reason.to_string() }).await;
         // Notify extensions, then release the long-lived token.
@@ -2344,6 +2416,11 @@ impl AgentSession {
             .dispatcher()
             .dispatch_notify(&HostEvent::SessionShutdown { reason: reason.to_string() }, &cancel)
             .await;
+        // Pi `this.beforeSessionInvalidate?.()` (agent-session-runtime.ts:176 and :403): the last
+        // point at which this session — and the extension context bound to it — is still live.
+        if let Some(hook) = before_invalidate {
+            hook();
+        }
         self.session_cancel.cancel();
     }
 
@@ -2501,25 +2578,7 @@ impl AgentSession {
                 model.id.as_str()
             )));
         }
-        // Cross-provider select: rebuild + install the owning provider so the agent loop streams
-        // against it (Pi switches model+provider live). A same-provider change is a no-op here.
-        if self.provider.current().id().as_str() != model.provider.as_str() {
-            // A guest-registered provider is already a realized `Provider` in the shared registry
-            // (arch-08 §5.6); install it DIRECTLY so its models stream — the built-in
-            // `ProviderResolver` seam (bin `select_provider`) knows only the Pi registry, not a guest
-            // provider. Falls back to the resolver for a built-in cross-provider swap.
-            if let Some(guest) = self.services.guest_providers.provider(model.provider.as_str()) {
-                self.provider.store(guest);
-            } else {
-                self.provider.resolve_and_store(model.provider.as_str()).map_err(|e| {
-                    SessionServiceError::NoConfiguredAuth(format!(
-                        "{}/{}: {e}",
-                        model.provider.as_str(),
-                        model.id.as_str()
-                    ))
-                })?;
-            }
-        }
+        self.install_owning_provider(&model)?;
         let previous = Self::lock(&self.model).clone();
         self.apply_model_change(&model, &previous, "set", None).await?;
         Ok(ModelRef {
@@ -2527,6 +2586,38 @@ impl AgentSession {
             api: Some(model.api.clone()),
             model: model.id.clone(),
         })
+    }
+
+    /// Cross-provider select: rebuild + install the owning provider so the agent loop streams
+    /// against it (Pi switches model+provider live). A same-provider change is a no-op.
+    ///
+    /// Pi does not need this step: its `ModelRuntime` keeps every provider live and dispatches on
+    /// `model.provider` inside `prepareRequest` (model-runtime.ts:445-470), so `setModel` and
+    /// `cycleModel` alike are a bare `agent.state.model = next` assignment. cyrup installs exactly
+    /// ONE provider at a time, so every path that can land on a model owned by another provider —
+    /// [`Self::set_model_resolved`] **and** both `cycle_model` arms, whose candidate sets span the
+    /// whole auth-filtered registry — has to swap it here or the next turn streams against the
+    /// wrong provider.
+    fn install_owning_provider(&self, model: &Model) -> Result<(), SessionServiceError> {
+        if self.provider.current().id().as_str() == model.provider.as_str() {
+            return Ok(());
+        }
+        // A guest-registered provider is already a realized `Provider` in the shared registry
+        // (arch-08 §5.6); install it DIRECTLY so its models stream — the built-in
+        // `ProviderResolver` seam (bin `select_provider`) knows only the Pi registry, not a guest
+        // provider. Falls back to the resolver for a built-in cross-provider swap.
+        if let Some(guest) = self.services.guest_providers.provider(model.provider.as_str()) {
+            self.provider.store(guest);
+        } else {
+            self.provider.resolve_and_store(model.provider.as_str()).map_err(|e| {
+                SessionServiceError::NoConfiguredAuth(format!(
+                    "{}/{}: {e}",
+                    model.provider.as_str(),
+                    model.id.as_str()
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Whether the model has usable auth (Pi `modelRegistry.hasConfiguredAuth`, agent-session.ts:1449
@@ -3030,6 +3121,28 @@ impl AgentSession {
         Ok(effective)
     }
 
+    /// Apply a `transport` settings value to the RUNNING agent — the second half of pi's
+    /// `/settings` "Transport" handler:
+    ///
+    /// ```ts
+    /// onTransportChange: (transport) => {
+    ///     this.settingsManager.setTransport(transport);
+    ///     this.session.agent.transport = transport;   // interactive-mode.ts:4215
+    /// },
+    /// ```
+    ///
+    /// cyrup did only the persist half, so cycling the row wrote JSON that nothing re-read until the
+    /// next process start. `s` is the persisted `TransportSetting` string (`"auto" | "sse" |
+    /// "websocket" | "websocket-cached"`); an unrecognized value falls back to `auto`, matching
+    /// `getTransport()`'s `?? "auto"` (settings-manager.ts:751). Returns the transport actually
+    /// applied. Takes effect from the NEXT run, exactly as pi's `createLoopConfig` read does
+    /// (agent.ts:442).
+    pub async fn set_transport(&self, s: &str) -> cyrup_provider::Transport {
+        let t = crate::builder::parse_transport(s);
+        self.agent.set_transport(Some(t)).await;
+        t
+    }
+
     /// Cycle to the next thinking level (Pi `cycleThinkingLevel`, agent-session.ts:1551). Returns
     /// `None` when the model does not support thinking.
     pub async fn cycle_thinking_level(&self) -> Result<Option<ModelThinkingLevel>, SessionServiceError> {
@@ -3378,7 +3491,12 @@ impl AgentSession {
     /// (`{tokens, contextWindow, percent}`, extensions/types.ts:288-294). `None` when no model /
     /// no known context window — Pi's `getContextUsage` returns `undefined` there
     /// (agent-session.ts:3165-3170).
-    async fn stats_context_usage(&self) -> Option<crate::state::StatsContextUsage> {
+    ///
+    /// Public because it is a 1:1 port of `AgentSession.getContextUsage()`, which upstream's footer
+    /// calls directly on every render (`footer.ts:108`) to build its `{pct}%/{window}` segment. The
+    /// TUI needs exactly this three-state answer — including the `percent: null` case — which the
+    /// coarser [`Self::context_usage`] (always a number) cannot express.
+    pub async fn stats_context_usage(&self) -> Option<crate::state::StatsContextUsage> {
         let usage = self.context_usage().await;
         if usage.context_window == 0 {
             return None;
@@ -3660,9 +3778,10 @@ impl AgentSession {
         *Self::lock(&self.scoped_models) = models;
     }
 
-    /// Cycle to the next/previous model (Pi `cycleModel`, agent-session.ts:1471-1539). Cycles over
-    /// the scoped set when one is configured (filtered to models with configured auth), else the full
-    /// provider catalog. Returns a typed [`ModelCycleResult`] distinguishing the scoped vs available
+    /// Cycle to the next/previous model (Pi `cycleModel`, agent-session.ts:1601-1671). Cycles over
+    /// the scoped set when one is configured (filtered to models with configured auth), else the
+    /// AUTH-FILTERED registry ([`Self::available_model_catalog`]). Returns a typed
+    /// [`ModelCycleResult`] distinguishing the scoped vs available
     /// path + the restored thinking level, or `None` when there is one-or-fewer candidate. Applies
     /// the model + re-clamps/restores the thinking level, persists a `model_change`, and emits
     /// `model_changed` + the `model_select` ext event.
@@ -3679,7 +3798,7 @@ impl AgentSession {
     }
 
     /// Cycle over the scoped set, honoring per-model thinking levels (Pi `_cycleScopedModel`,
-    /// agent-session.ts:1479-1510).
+    /// agent-session.ts:1608-1641).
     async fn cycle_scoped_model(
         &self,
         forward: bool,
@@ -3702,18 +3821,27 @@ impl AgentSession {
         };
         // Explicit scoped thinking level overrides; `None` inherits the current session level.
         let explicit = next.thinking_level;
+        self.install_owning_provider(&next.model)?;
         let new_level = self
             .apply_model_change(&next.model, &current, "cycle", explicit)
             .await?;
         Ok(Some(ModelCycleResult { model: next.model.clone(), thinking_level: new_level, is_scoped: true }))
     }
 
-    /// Cycle over the full provider catalog (Pi `_cycleAvailableModel`, agent-session.ts:1512-1538).
+    /// Cycle over the AUTH-FILTERED registry (Pi `_cycleAvailableModel`, agent-session.ts:1643-1670,
+    /// whose first line is `const availableModels = await this._modelRuntime.getAvailable()`).
+    ///
+    /// `getAvailable()` is `getAll().filter(hasConfiguredAuth)` across EVERY provider
+    /// (model-runtime.ts:315-329 → models.ts:394-409), which is exactly
+    /// [`Self::available_model_catalog`]. cyrup previously cycled `provider.current().models()` —
+    /// the ONE installed provider's own catalog — so a user with `ANTHROPIC_API_KEY` and
+    /// `OPENAI_API_KEY` could never cycle off the provider they launched on, the same SEAM-004 bug
+    /// already fixed for `set_model`/`get_available_models` on the RPC seam.
     async fn cycle_available_model(
         &self,
         forward: bool,
     ) -> Result<Option<ModelCycleResult>, SessionServiceError> {
-        let candidates = self.provider.current().models().to_vec();
+        let candidates = self.available_model_catalog();
         if candidates.len() <= 1 {
             return Ok(None);
         }
@@ -3727,6 +3855,7 @@ impl AgentSession {
         let Some(next) = candidates.get(next_idx).cloned() else {
             return Ok(None);
         };
+        self.install_owning_provider(&next)?;
         let new_level = self.apply_model_change(&next, &current, "cycle", None).await?;
         Ok(Some(ModelCycleResult { model: next, thinking_level: new_level, is_scoped: false }))
     }

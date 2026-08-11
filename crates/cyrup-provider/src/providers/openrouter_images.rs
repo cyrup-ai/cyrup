@@ -10,9 +10,16 @@ use crate::images::{
     create_images_provider, openrouter, openrouter_image_models,
 };
 
-/// The OpenRouter image provider's [`ProviderAuth`]: `OPENROUTER_API_KEY` (Pi `envApiKeyAuth`).
+/// The OpenRouter image provider's [`ProviderAuth`]: `OPENROUTER_API_KEY` (Pi `envApiKeyAuth`)
+/// plus the OpenRouter OAuth login (`lazyOAuth({ name: "OpenRouter OAuth", loginLabel: "Sign in
+/// with OpenRouter", load: loadOpenRouterOAuth })`, `providers/openrouter-images.ts:13-17`) — no
+/// `isSubscription`, because OpenRouter bills per token. See
+/// [`super::builtin_oauth::builtin_provider_oauth`].
 pub fn openrouter_images_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key(["OPENROUTER_API_KEY"]))
+    ProviderAuth {
+        api_key: Some(env_key(["OPENROUTER_API_KEY"])),
+        oauth: super::builtin_oauth::builtin_provider_oauth(OPENROUTER_PROVIDER_ID),
+    }
 }
 
 /// Construct the OpenRouter image provider (Pi `openrouterImagesProvider`, openrouter-images.ts:6).

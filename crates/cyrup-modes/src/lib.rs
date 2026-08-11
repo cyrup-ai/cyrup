@@ -18,10 +18,12 @@
 
 mod error;
 mod json;
+mod json_event;
 mod print;
 mod rpc;
 
 pub use error::ModesError;
 pub use json::run_json;
+pub use json_event::{to_json_event, JsonAgentSessionEvent};
 pub use print::{run_print, PrintOptions};
 pub use rpc::{run_rpc, QueueModeArg, RpcOut, RpcResponse, SessionCommand};

@@ -9,11 +9,15 @@
 use cyrup_resources::theme::{builtin_themes, ColorSpec, ResolvedTheme, ThemeData};
 use ratatui::style::{Color, Modifier, Style};
 
-/// The terminal color-depth the [`UiTheme`] projects its RGB roles into (Pi `ColorMode`,
-/// `theme.ts:162` + the capability probe `theme.ts:588`). Pi carries only `truecolor`/`256color`;
-/// cyrup extends the enum with `Ansi16` and `None` for depth-limited/monochrome terminals so the
-/// projection is total. The mode is chosen once at boot from the terminal capabilities (`COLORTERM`)
-/// and re-applied whenever the theme changes (`ThemeController`).
+/// The terminal color-depth the [`UiTheme`] projects its RGB roles into (Pi `ColorMode`, v0.84.1
+/// `coding-agent/src/modes/interactive/theme/theme.ts:167` + the capability gate at `:611`).
+///
+/// Pi carries only `truecolor`/`256color`. `Ansi16` and `None` are cyrup-only *explicit* modes,
+/// reachable through [`UiTheme::with_color_mode`] for depth-limited/monochrome output so the
+/// projection is total — but [`ColorMode::detect`] never selects them (T3, TUI-FIDELITY §2): a
+/// detected terminal always lands on `TrueColor` or `Ansi256`, matching Pi. The mode is chosen once
+/// at boot from the terminal capabilities and re-applied whenever the theme changes
+/// (`ThemeController`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ColorMode {
     /// 24-bit direct color — RGB roles pass through as `Color::Rgb` (Pi `"truecolor"`).
@@ -29,24 +33,37 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
-    /// Pick the color mode from the environment the way Pi's capability probe does (`getCapabilities`,
-    /// `theme.ts:588`): a `COLORTERM` of `truecolor`/`24bit` ⇒ [`ColorMode::TrueColor`]; a `TERM`
-    /// mentioning `256color` ⇒ [`ColorMode::Ansi256`]; a dumb/no-color terminal ⇒ [`ColorMode::None`];
-    /// otherwise the safe [`ColorMode::Ansi256`] default (matching Pi's `256color` fallback).
+    /// Pick the color mode from the environment exactly the way Pi does:
+    /// `const colorMode = mode ?? (getCapabilities().trueColor ? "truecolor" : "256color")`
+    /// (v0.84.1 `coding-agent/src/modes/interactive/theme/theme.ts:611`).
+    ///
+    /// T2/T3 (TUI-FIDELITY §2): this used to read `COLORTERM`/`TERM` directly and had two bugs.
+    /// (a) `COLORTERM` is only Pi's *fallback* hint for an unidentified terminal
+    /// (`tui/src/terminal-image.ts:73`); the gate is the terminal-program table at `:76-131`, so
+    /// iTerm2 / Windows Terminal / VS Code / Alacritty / JetBrains — none of which set `COLORTERM`
+    /// — were being quantised through [`rgb_to_256`], collapsing the three tool background tints
+    /// into near-identical cube cells. (b) Pi has **no** monochrome mode at all —
+    /// `type ColorMode = "truecolor" | "256color"` (`theme.ts:167`) — so `TERM=dumb` or an unset
+    /// `TERM` must still get the full 256-colour UI, not [`ColorMode::None`].
+    ///
+    /// The terminal table is already ported once, in [`crate::image::detect_capabilities_from`];
+    /// this delegates to it rather than growing a second copy. The tmux OSC-8 probe cannot change
+    /// `true_color`, so `false` is passed for it and the `tmux display-message` subprocess is
+    /// skipped.
     pub fn detect() -> ColorMode {
-        let colorterm = std::env::var("COLORTERM").unwrap_or_default().to_ascii_lowercase();
-        if colorterm.contains("truecolor") || colorterm.contains("24bit") {
-            return ColorMode::TrueColor;
+        ColorMode::detect_from(|k| std::env::var(k).ok())
+    }
+
+    /// The pure core of [`ColorMode::detect`], parameterised over an environment lookup so both
+    /// arms are deterministically testable (same shape as `detect_capabilities_from`).
+    pub fn detect_from(env: impl Fn(&str) -> Option<String>) -> ColorMode {
+        if crate::image::detect_capabilities_from(env, false).true_color {
+            ColorMode::TrueColor
+        } else {
+            // Pi `createTheme` falls back to `"256color"` when truecolor is unavailable
+            // (v0.84.1 theme.ts:611). There is no lower rung upstream.
+            ColorMode::Ansi256
         }
-        let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
-        if term == "dumb" || term.is_empty() {
-            return ColorMode::None;
-        }
-        if term.contains("256color") {
-            return ColorMode::Ansi256;
-        }
-        // Pi's `createTheme` falls back to `256color` when truecolor is unavailable (`theme.ts:588`).
-        ColorMode::Ansi256
     }
 
     /// Project one `ratatui::Color` into this mode. Only `Color::Rgb` is transformed (named/indexed
@@ -72,6 +89,19 @@ impl ColorMode {
             None => None,
         }
     }
+}
+
+/// The three states Pi's `getEditHeaderBg` distinguishes for an `edit` block's fill
+/// (`core/tools/edit.ts:239-253`) — the `EditCallRenderComponent.preview` union collapsed to what
+/// the background actually keys on. See [`UiTheme::edit_bg_style`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditHeaderPreview {
+    /// `computeEditsDiff` produced a diff (`preview` is `{diff, firstChangedLine}`) → `toolSuccessBg`.
+    Computed,
+    /// The preview failed (`preview` is `{error}`) → `toolErrorBg`.
+    Failed,
+    /// No preview yet (`preview === undefined`) → `settledError ? toolErrorBg : toolPendingBg`.
+    Absent,
 }
 
 /// The render-facing theme. Cheap to clone (a handful of optional colors + a name).
@@ -284,18 +314,30 @@ impl UiTheme {
         Style::default().fg(self.accent.unwrap_or(Color::Cyan))
     }
 
-    /// Error style (failed tools, error notifications).
+    /// Error style (failed tools, error notifications) — Pi `error` (dark.json:41), **colour only**.
+    ///
+    /// T4 (TUI-FIDELITY §2): this used to bake in `Modifier::BOLD`. Pi's `Theme.fg()`
+    /// (v0.84.1 `coding-agent/src/modes/interactive/theme/theme.ts:372-376`) emits a bare SGR
+    /// foreground and resets only `\x1b[39m`; `bold()` is a *separate* combinator (`:384-386`).
+    /// `git grep -c 'bold(theme.fg("error"' v0.84.1 -- packages` matches nothing — no upstream
+    /// error string is bold — so the modifier is dropped here rather than at each of the 13
+    /// render sites.
     pub fn error_style(&self) -> Style {
-        Style::default().fg(self.error.unwrap_or(Color::Red)).add_modifier(Modifier::BOLD)
+        Style::default().fg(self.error.unwrap_or(Color::Red))
     }
 
-    /// Dimmed style for secondary/tool chrome.
+    /// Secondary/hint chrome — Pi's **`dim` token**, colour only (`dark.json:31 "dim": "dimGray"`
+    /// = `#666666`; `light.json:30` = `#767676`).
+    ///
+    /// T1 (TUI-FIDELITY §2): this used to resolve the `text` role and add `Modifier::DIM`, which is
+    /// wrong twice over. Pi renders every hint through `theme.fg("dim", …)` (e.g.
+    /// `theme.ts:1312`/`:1314` in `getSettingsListTheme`), and `fg()` (`theme.ts:372-376`) emits a
+    /// plain foreground escape with **no SGR attribute** — so cyrup was painting body-bright text
+    /// plus SGR 2, which terminals that ignore SGR 2 (Terminal.app, much of tmux, Windows consoles)
+    /// render at full brightness, and which in the *light* theme came out near-black `#1f2328`
+    /// where Pi draws grey.
     pub fn dim_style(&self) -> Style {
-        let mut s = Style::default().add_modifier(Modifier::DIM);
-        if let Some(fg) = self.foreground {
-            s = s.fg(fg);
-        }
-        s
+        self.role_style("dim", "#666666", "#767676")
     }
 
     /// Style for the user's own messages (bold accent label).
@@ -309,17 +351,50 @@ impl UiTheme {
     }
 
     /// Muted style (descriptions, scroll indicators, hints, footer body) — Pi `muted` (theme.ts:543).
-    /// Falls back to a dimmed foreground when the theme omits the role.
+    ///
+    /// The `muted` token is `gray` `#808080` (`dark.json:30`+`:11`) / `mediumGray` `#6c6c6c`
+    /// (`light.json:29`+`:11`); it is a *different* token from `dim`, so a theme that omits it falls
+    /// back to its own palette's grey rather than to [`Self::dim_style`]'s `dimGray`.
     pub fn muted_style(&self) -> Style {
         match self.muted {
             Some(c) => Style::default().fg(c),
-            None => self.dim_style(),
+            None => self.role_style("muted", "#808080", "#6c6c6c"),
         }
     }
 
     /// Border/rule style for the editor + selector `DynamicBorder` rules — Pi `border` (theme.ts:537).
     pub fn border_style(&self) -> Style {
         Style::default().fg(self.border.or(self.muted).unwrap_or(Color::DarkGray))
+    }
+
+    /// The `borderAccent` role — Pi's "highlighted border" token (`docs/themes.md:158`).
+    ///
+    /// T9: `git grep borderAccent v0.84.1 -- packages/*/src` finds exactly **one** component render
+    /// site outside the HTML-export stylesheet and the theme plumbing itself —
+    /// `tree-selector.ts:824`, the `/tree` compaction row:
+    ///
+    /// ```text
+    /// case "compaction": {
+    ///     const tokens = Math.round(entry.tokensBefore / 1000);
+    ///     result = theme.fg("borderAccent", `[compaction: ${tokens}k tokens]`);
+    /// ```
+    ///
+    /// So this is not a border colour in practice; it is the colour of that one row, and until
+    /// [`crate::TreeSelector`] coloured its rows per role (S24) the token had no read site at all
+    /// even though a custom theme is *required* to define it (`theme-schema.json:41`).
+    ///
+    /// It is a distinct colour from `accent` in both built-ins — `cyan` `#00d7ff` vs `accent`
+    /// `#8abeb7` (`dark.json:5,14,23,25`), `teal` vs `#5a8080` (`light.json:24`) — so the fallback
+    /// chain goes to `border` before `accent` rather than collapsing onto the accent role.
+    pub fn border_accent_style(&self) -> Style {
+        let fg = self
+            .roles
+            .get("borderAccent")
+            .copied()
+            .or(self.border)
+            .or(self.accent)
+            .unwrap_or(Color::Cyan);
+        Style::default().fg(fg)
     }
 
     /// Success style (current/active `✓` markers, succeeded states) — Pi `success` (theme.ts:540).
@@ -337,23 +412,48 @@ impl UiTheme {
         Style::default().fg(self.bash_mode.or(self.success).unwrap_or(Color::Green))
     }
 
-    /// The editor's top/bottom rule style for a reasoning `level` — Pi `thinking{Off..Xhigh}`
-    /// (`interactive-mode.ts:3533-3541`, spec/tui/03 §3.3): an escalating per-level color that is the
-    /// editor's primary always-visible mode signal. Falls back to the `border` role for unknown levels.
+    /// The editor's top/bottom rule style for a reasoning `level` — Pi `thinking{Off..Max}`
+    /// (`Theme.getThinkingBorderColor`, v0.84.1
+    /// `coding-agent/src/modes/interactive/theme/theme.ts:420-440`): an escalating per-level color
+    /// that is the editor's primary always-visible mode signal.
+    ///
+    /// An unrecognized level resolves to `thinkingOff`, matching Pi's `default:` arm
+    /// (`theme.ts:437-438` — `return (str) => this.fg("thinkingOff", str)`). This used to fall back
+    /// to the `border` role, a token Pi never reaches from here.
     pub fn thinking_border_style(&self, level: &str) -> Style {
         let thinking = self.thinking();
         let color = match level {
-            "off" => thinking.off,
             "minimal" => thinking.minimal,
             "low" => thinking.low,
             "medium" => thinking.medium,
             "high" => thinking.high,
             "xhigh" => thinking.xhigh,
             "max" => thinking.max,
-            // An unrecognized level keeps the neutral border color.
-            _ => return self.border_style(),
+            // `"off"` and Pi's `default:` arm share `thinkingOff` (theme.ts:423-424, :437-438).
+            _ => thinking.off,
         };
         Style::default().fg(color)
+    }
+
+    /// The **editor's own** top/bottom rule when no reasoning level owns it — Pi `borderMuted`.
+    ///
+    /// T9 (TUI-FIDELITY §2): Pi's shared `Editor` initialises `this.borderColor` from
+    /// `getEditorTheme().borderColor`, which is `(text) => theme.fg("borderMuted", text)` (v0.84.1
+    /// `theme.ts:1301-1304`, consumed at `tui/src/components/editor.ts:348,494`). Only the *chat*
+    /// editor is then reassigned per thinking level / bash mode
+    /// (`interactive-mode.ts:3990-3993`); an `ExtensionEditorComponent`, built as
+    /// `new Editor(tui, getEditorTheme(), options)` (`components/extension-editor.ts:70`), never is,
+    /// so its rule stays `borderMuted` (`dark.json:26` = `darkGray`, `light.json:25` = `lightGray`).
+    /// Falls back to the `border` role, then `muted`.
+    pub fn border_muted_style(&self) -> Style {
+        let fg = self
+            .roles
+            .get("borderMuted")
+            .copied()
+            .or(self.border)
+            .or(self.muted)
+            .unwrap_or(Color::DarkGray);
+        Style::default().fg(fg)
     }
 
     // --- structured sub-themes (feature #3) -----------------------------------------------------
@@ -369,13 +469,18 @@ impl UiTheme {
     /// message/tool/selected background is a named `Option<Color>` field (`None` ⇒ terminal default).
     pub fn backgrounds(&self) -> BackgroundTheme {
         let g = |k: &str| self.roles.get(k).copied();
+        let selected = g("selectedBg");
         BackgroundTheme {
-            selected: g("selectedBg"),
+            selected,
             user_message: g("userMessageBg"),
             custom_message: g("customMessageBg"),
             tool_pending: g("toolPendingBg"),
             tool_success: g("toolSuccessBg"),
             tool_error: g("toolErrorBg"),
+            // `scrollbarThumb: bgColors.scrollbarThumb ?? bgColors.selectedBg` (`theme.ts:365`,
+            // and again at `:330`). The fallback is to this theme's OWN resolved `selectedBg`,
+            // never a hardcoded colour — exactly as `thinkingMax` falls back to `thinkingXhigh`.
+            scrollbar_thumb: g("scrollbarThumb").or(selected),
         }
     }
 
@@ -383,14 +488,19 @@ impl UiTheme {
     /// 3533-3541): the escalating per-reasoning-level editor rule color, one typed field per level,
     /// each resolved from the live theme with the spec/tui/03 §3.3 dark-hex fallback so it is total.
     pub fn thinking(&self) -> ThinkingTheme {
-        let level = |key: &str, default_hex: &str| self.role_color(key, default_hex);
-        let xhigh = level("thinkingXhigh", "#d183e8");
+        // Fallback pairs, `dark.json:73-78` / `light.json:72-77`. `thinkingOff` used to default to
+        // `#666666` (`dimGray`); the token is `darkGray` `#505050` dark / `lightGray` `#b0b0b0`
+        // light — the same drifted-fallback defect as the markdown roles in [`Self::role_style`].
+        let level = |key: &str, dark_hex: &str, light_hex: &str| {
+            self.role_color_themed(key, dark_hex, light_hex)
+        };
+        let xhigh = level("thinkingXhigh", "#d183e8", "#8b008b");
         ThinkingTheme {
-            off: level("thinkingOff", "#666666"),
-            minimal: level("thinkingMinimal", "#6e6e6e"),
-            low: level("thinkingLow", "#5f87af"),
-            medium: level("thinkingMedium", "#81a2be"),
-            high: level("thinkingHigh", "#b294bb"),
+            off: level("thinkingOff", "#505050", "#b0b0b0"),
+            minimal: level("thinkingMinimal", "#6e6e6e", "#767676"),
+            low: level("thinkingLow", "#5f87af", "#547da7"),
+            medium: level("thinkingMedium", "#81a2be", "#5a8080"),
+            high: level("thinkingHigh", "#b294bb", "#875f87"),
             xhigh,
             // Pi made `thinkingMax` an OPTIONAL theme token with an explicit
             // `colors.thinkingMax ?? colors.thinkingXhigh` fallback (theme.ts:93,329,358) so
@@ -418,6 +528,9 @@ impl UiTheme {
             "toolPendingBg" => bg.tool_pending,
             "toolSuccessBg" => bg.tool_success,
             "toolErrorBg" => bg.tool_error,
+            // Routed through the struct so `theme.bg("scrollbarThumb", …)` (`interactive-mode.ts:
+            // 874`) gets the `?? selectedBg` fallback rather than the raw map miss.
+            "scrollbarThumb" => bg.scrollbar_thumb,
             _ => self.roles.get(key).copied(),
         }
     }
@@ -431,29 +544,96 @@ impl UiTheme {
         }
     }
 
-    /// Selected-row fill in selectors (`selectedBg`, select-list.ts:160-162).
-    pub fn selected_bg_style(&self) -> Style {
-        self.with_bg(self.accent_style(), "selectedBg")
+    /// Selected-row fill (`selectedBg`) laid over an arbitrary foreground style.
+    ///
+    /// SYS-4 (TUI-FIDELITY §5): upstream paints a selection background in exactly **two**
+    /// components — `tree-selector.ts:750-753` (`gutter` and `body`) and `session-selector.ts:506-508`
+    /// (the whole row) — and in neither case does it replace the row's foreground colours. It never
+    /// fills in `SelectList` at all (`git grep selectedBg v0.84.1 -- packages/tui` is empty).
+    /// Callers therefore build their spans first and lay the fill over each one, rather than
+    /// swapping in a single style.
+    /// S39: the old `selected_bg_style()` — `selectedBg` over the accent foreground, as a single
+    /// ready-made style — is gone. After SYS-4 moved the fill out of `SelectList` it had **zero**
+    /// callers under `src/`; being `pub`, nothing would have flagged it. Both remaining fill sites
+    /// (`tree_selector.rs`, `session_selector.rs`) need the layering form above, because upstream
+    /// wraps already-styled text (`theme.bg("selectedBg", body)`) rather than replacing its style.
+    /// Callers that only want the colour ask for `selected_bg_over(Style::default()).bg`.
+    pub fn selected_bg_over(&self, style: Style) -> Style {
+        self.with_bg(style, "selectedBg")
     }
 
-    /// User-message block fill (`userMessageBg`, user-message rendering).
+    /// User-message block: `userMessageBg` fill **and** `userMessageText` foreground.
+    ///
+    /// T8/T9 (TUI-FIDELITY §2): Pi's `UserMessage.rebuild()` wraps the markdown in
+    /// `new Box(…, (content) => theme.bg("userMessageBg", content))` and passes
+    /// `{ color: (content) => theme.fg("userMessageText", content) }` (v0.84.1
+    /// `coding-agent/src/modes/interactive/components/user-message.ts:40-49`). This used to take its
+    /// foreground from `base_style()` (the `text` role), so `userMessageText` — a token a custom
+    /// theme is *required* to define — had no effect on screen. `text` is the fallback only when the
+    /// theme omits the role.
     pub fn user_message_bg_style(&self) -> Style {
-        self.with_bg(self.base_style(), "userMessageBg")
+        let fg = self.roles.get("userMessageText").copied().or(self.foreground);
+        let base = match fg {
+            Some(c) => Style::default().fg(c),
+            None => Style::default(),
+        };
+        self.with_bg(base, "userMessageBg")
     }
 
-    /// Custom/notice block fill (`customMessageBg`).
+    /// Custom/notice block: `customMessageBg` fill **and** `customMessageText` foreground.
+    ///
+    /// T9: Pi renders the body as `new Markdown(text, …, { color: (text) => theme.fg(
+    /// "customMessageText", text) })` (v0.84.1 `components/custom-message.ts:107-111`). This used to
+    /// use [`Self::dim_style`], which is a different token entirely.
     pub fn custom_message_bg_style(&self) -> Style {
-        self.with_bg(self.dim_style(), "customMessageBg")
+        self.with_bg(self.custom_message_text_style(), "customMessageBg")
     }
 
-    /// Tool-call title (the `read`/`edit`/`$`/`grep …` headers) — Pi `toolTitle` (= `text`, the base
-    /// foreground) rendered bold (`theme.fg("toolTitle", theme.bold(...))`, dark.json:44).
-    pub fn tool_title_style(&self) -> Style {
-        let mut s = Style::default().add_modifier(Modifier::BOLD);
-        if let Some(fg) = self.foreground {
-            s = s.fg(fg);
+    /// `customMessageText` as a bare FOREGROUND, with no `customMessageBg` fill — Pi's
+    /// `theme.fg("customMessageText", …)` on its own.
+    ///
+    /// X7 needs this: `formatCompactReadCall` paints the skill label
+    /// `theme.fg("customMessageText", classification.label)` (`core/tools/read.ts:154`) inside the
+    /// TOOL block, which already has its own `toolPendingBg`/`toolSuccessBg` tint.
+    /// [`Self::custom_message_bg_style`] would patch the purple custom-message fill over that one
+    /// row.
+    pub fn custom_message_text_style(&self) -> Style {
+        match self.roles.get("customMessageText").copied() {
+            Some(c) => Style::default().fg(c),
+            None => self.dim_style(),
         }
-        s
+    }
+
+    /// The `[customType]` label above a custom/notice block — `customMessageLabel`, bold.
+    ///
+    /// T9: Pi `theme.fg("customMessageLabel", "\x1b[1m[" + customType + "]\x1b[22m")` (v0.84.1
+    /// `components/custom-message.ts:92`) — the `\x1b[1m…\x1b[22m` pair is SGR bold, applied inside
+    /// the colour. Falls back to the accent role when the theme omits the token.
+    pub fn custom_message_label_style(&self) -> Style {
+        let fg = self
+            .roles
+            .get("customMessageLabel")
+            .copied()
+            .or(self.accent)
+            .unwrap_or(Color::Cyan);
+        Style::default().fg(fg).add_modifier(Modifier::BOLD)
+    }
+
+    /// Tool-call title (the `read`/`edit`/`$`/`grep …` headers) — Pi `toolTitle`, bold.
+    ///
+    /// T8: Pi is `theme.fg("toolTitle", theme.bold("read"))` (v0.84.1
+    /// `coding-agent/src/core/tools/read.ts:81`, and identically `bash.ts:236`, `edit.ts:207`,
+    /// `find.ts:80`, `grep.ts:84`, `ls.ts:60`, `write.ts:146`,
+    /// `components/tool-execution.ts:136,366`). This used to read `self.foreground` — the `text`
+    /// role — and never consult `roles["toolTitle"]`. The two built-ins alias them
+    /// (`dark.json:45`/`light.json:44` both say `"toolTitle": "text"`) so nothing changes there, but
+    /// a custom theme setting `toolTitle` was silently ignored on all ten tool headers.
+    pub fn tool_title_style(&self) -> Style {
+        let s = Style::default().add_modifier(Modifier::BOLD);
+        match self.roles.get("toolTitle").copied().or(self.foreground) {
+            Some(fg) => s.fg(fg),
+            None => s,
+        }
     }
 
     /// Tool output body — Pi `toolOutput` (= `gray`/`mediumGray`, dark.json:45). Prefers an explicit
@@ -479,6 +659,43 @@ impl UiTheme {
         self.with_bg(base, key)
     }
 
+    /// X8 — the `edit` block's fill, which is **not** `done`/`is_error` keyed. Pi gives `edit` its own
+    /// `getEditHeaderBg(preview, settledError)` (v0.84.1 `core/tools/edit.ts:239-253`), applied at
+    /// `:262`:
+    ///
+    /// ```ts
+    /// if (preview) {
+    ///     if ("error" in preview) return (text) => theme.bg("toolErrorBg", text);
+    ///     return (text) => theme.bg("toolSuccessBg", text);
+    /// }
+    /// if (settledError) return (text) => theme.bg("toolErrorBg", text);
+    /// return (text) => theme.bg("toolPendingBg", text);
+    /// ```
+    ///
+    /// The PREVIEW is tested first and `done` is never consulted: a diff that `computeEditsDiff`
+    /// produced from the streamed arguments alone puts the block on the SUCCESS tint while the call
+    /// is still pending (through the whole permission prompt), and a preview that failed puts it on
+    /// the ERROR tint before anything is written. [`Self::tool_bg_style`] keys only on
+    /// `done`/`is_error`, so both of those rendered neutral `toolPendingBg`.
+    ///
+    /// The settled case still lands on the right tint: `renderResult` re-runs `setEditPreview` from
+    /// `details.diff` (`edit.ts:400-411`) before the component is rebuilt, so a successful write
+    /// arrives here as [`EditHeaderPreview::Computed`].
+    pub fn edit_bg_style(
+        &self,
+        base: Style,
+        preview: EditHeaderPreview,
+        settled_error: bool,
+    ) -> Style {
+        let key = match preview {
+            EditHeaderPreview::Failed => "toolErrorBg",
+            EditHeaderPreview::Computed => "toolSuccessBg",
+            EditHeaderPreview::Absent if settled_error => "toolErrorBg",
+            EditHeaderPreview::Absent => "toolPendingBg",
+        };
+        self.with_bg(base, key)
+    }
+
     // --- rich-rendering roles (spec/tui/06 §11) -------------------------------------------------
 
     /// Resolve a Pi color-token role by name (`syntaxKeyword`, `mdHeading`, …), falling back to the
@@ -496,14 +713,67 @@ impl UiTheme {
         }
     }
 
-    /// `fg`-only style for a role with a hex default (spec/tui/06 §3.2 dark hexes).
-    fn role_style(&self, key: &str, default_hex: &str) -> Style {
-        Style::default().fg(self.role_color(key, default_hex))
+    /// Whether this palette is a **light** one, i.e. one that draws dark glyphs on a light ground.
+    ///
+    /// Only consulted to pick between the dark and light members of a hex fallback pair
+    /// ([`Self::palette_hex`]); a theme that actually defines the role never reaches it. The name is
+    /// authoritative for the two built-ins — `builtin_or_static` stamps `"dark"`/`"light"` and
+    /// `from_resolved` copies `dark.json`/`light.json`'s own `"name"` field — and a custom theme
+    /// falls back to the luma of its `text` role, because a light theme is exactly the one whose
+    /// body text is dark. After [`Self::with_color_mode`] has quantized `foreground` to a
+    /// `Color::Indexed` the luma test no longer applies and a non-built-in name resolves as dark;
+    /// that only affects roles a custom theme left undefined, which Pi forbids outright
+    /// (`REQUIRED_COLOR_TOKENS`).
+    fn is_light_palette(&self) -> bool {
+        if self.name.eq_ignore_ascii_case("light") {
+            return true;
+        }
+        if self.name.eq_ignore_ascii_case("dark") {
+            return false;
+        }
+        match self.foreground {
+            // ITU-R BT.601 luma, in integer thousandths to keep the no-panic/no-float-cast profile.
+            Some(Color::Rgb(r, g, b)) => {
+                299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) < 128_000
+            }
+            _ => false,
+        }
+    }
+
+    /// Pick the member of a `(dark, light)` hex-fallback pair that matches this palette.
+    fn palette_hex<'a>(&self, dark_hex: &'a str, light_hex: &'a str) -> &'a str {
+        if self.is_light_palette() { light_hex } else { dark_hex }
+    }
+
+    /// [`Self::role_color`] with a **theme-aware** hex fallback pair.
+    fn role_color_themed(&self, key: &str, dark_hex: &str, light_hex: &str) -> Color {
+        self.role_color(key, self.palette_hex(dark_hex, light_hex))
+    }
+
+    /// `fg`-only style for a role with a `(dark, light)` hex fallback pair.
+    ///
+    /// The hexes are a last-resort value for the synthetic fallback theme (the one
+    /// `builtin_or_static` synthesizes when the resource layer cannot supply a palette at all); any
+    /// real theme resolves the role through [`Self::role_color`]. Five of these defaults had drifted
+    /// away from BOTH Pi's `dark.json` and cyrup's own built-in dark palette — `mdCodeBlockBorder`,
+    /// `mdQuote`, `mdQuoteBorder` and `mdHr` are `gray` `#808080` (`dark.json:53,54,55,56`;
+    /// `cyrup-resources/src/theme.rs:568,569,570,571`) and `mdLinkUrl` is `dimGray` `#666666`
+    /// (`dark.json:50`) — so the degraded theme drew a *different* palette from the normal one.
+    /// Found while fixing T7; same accessor, same class of defect.
+    ///
+    /// Aligning them to `dark.json` alone then broke the *light* half: `builtin_or_static`
+    /// synthesizes both [`Self::dark`] and [`Self::light`] with an empty `roles` map, so a
+    /// resource-less light theme fell through to the same hexes and drew dark-theme greys. Every
+    /// fallback is therefore a pair — `light.json`'s value is `mediumGray` `#6c6c6c` (`:11`, used by
+    /// `mdCodeBlockBorder` `:52` / `mdQuote` `:53` / `mdQuoteBorder` `:54` / `mdHr` `:55`) and
+    /// `dimGray` `#767676` (`:12`, used by `dim` `:30` / `mdLinkUrl` `:49`).
+    fn role_style(&self, key: &str, dark_hex: &str, light_hex: &str) -> Style {
+        Style::default().fg(self.role_color_themed(key, dark_hex, light_hex))
     }
 
     /// Markdown heading — `mdHeading`, bold (`markdown.ts:336-362`).
     pub fn md_heading_style(&self) -> Style {
-        self.role_style("mdHeading", "#f0c674").add_modifier(Modifier::BOLD)
+        self.role_style("mdHeading", "#f0c674", "#9a7326").add_modifier(Modifier::BOLD)
     }
     /// Inline code span — `mdCode` (= accent), no backticks (`markdown.ts:512-516`).
     pub fn md_code_style(&self) -> Style {
@@ -511,11 +781,11 @@ impl UiTheme {
     }
     /// Flat (unknown-language) fenced-code body — `mdCodeBlock` (`markdown.ts:378-398`).
     pub fn md_code_block_style(&self) -> Style {
-        self.role_style("mdCodeBlock", "#b5bd68")
+        self.role_style("mdCodeBlock", "#b5bd68", "#588458")
     }
     /// Fence border lines (```` ``` ````) — `mdCodeBlockBorder` (`markdown.ts:380,393`).
     pub fn md_code_block_border_style(&self) -> Style {
-        self.role_style("mdCodeBlockBorder", "#666666")
+        self.role_style("mdCodeBlockBorder", "#808080", "#6c6c6c")
     }
     /// Assistant **reasoning** (thinking) body — `thinkingText`, italic (Pi
     /// `assistant-message.ts:145-165` renders each run of `thinking` blocks as one Markdown section
@@ -527,93 +797,184 @@ impl UiTheme {
     /// NOTE this is a different thing from [`ThinkingTheme`], which is the per-reasoning-**level**
     /// editor-border palette (`thinkingOff`…`thinkingXhigh`).
     pub fn thinking_text_style(&self) -> Style {
-        self.role_style("thinkingText", "#808080").add_modifier(Modifier::ITALIC)
+        self.role_style("thinkingText", "#808080", "#6c6c6c").add_modifier(Modifier::ITALIC)
     }
     /// Blockquote body — `mdQuote`, italic (`markdown.ts:414-461`).
     pub fn md_quote_style(&self) -> Style {
-        self.role_style("mdQuote", "#969896").add_modifier(Modifier::ITALIC)
+        self.role_style("mdQuote", "#808080", "#6c6c6c").add_modifier(Modifier::ITALIC)
     }
     /// Blockquote `│ ` border — `mdQuoteBorder` (`markdown.ts:414-461`).
     pub fn md_quote_border_style(&self) -> Style {
-        self.role_style("mdQuoteBorder", "#666666")
+        self.role_style("mdQuoteBorder", "#808080", "#6c6c6c")
     }
     /// Horizontal rule — `mdHr` (`markdown.ts:463-468`).
     pub fn md_hr_style(&self) -> Style {
-        self.role_style("mdHr", "#666666")
+        self.role_style("mdHr", "#808080", "#6c6c6c")
     }
-    /// List bullet marker — `mdListBullet` (= accent) (`markdown.ts:604-654`).
+    /// List bullet marker — `mdListBullet` (`markdown.ts:604-654`).
+    ///
+    /// The `= accent` alias holds in the DARK palette only (`dark.json:57` `"mdListBullet":
+    /// "accent"`); `light.json:56` maps it to `green` `#588458`, which is *not* the light accent
+    /// (`teal` `#5a8080`). So the accent chain is the dark palette's rule and a resource-less light
+    /// theme takes the light hex instead.
     pub fn md_list_bullet_style(&self) -> Style {
-        Style::default()
-            .fg(self.roles.get("mdListBullet").copied().or(self.accent).unwrap_or(Color::Cyan))
+        match self.roles.get("mdListBullet").copied() {
+            Some(c) => Style::default().fg(c),
+            None if self.is_light_palette() => self.role_style("mdListBullet", "#588458", "#588458"),
+            None => Style::default().fg(self.accent.unwrap_or(Color::Cyan)),
+        }
     }
     /// Link text — `mdLink`, underlined (`markdown.ts:537-556`).
     pub fn md_link_style(&self) -> Style {
-        self.role_style("mdLink", "#81a2be").add_modifier(Modifier::UNDERLINED)
+        self.role_style("mdLink", "#81a2be", "#547da7").add_modifier(Modifier::UNDERLINED)
     }
-    /// Trailing `(url)` — `mdLinkUrl`, dim (`markdown.ts:548-556`).
+    /// Trailing ` (url)` after a markdown link — `mdLinkUrl`, **colour only**.
+    ///
+    /// T7 (TUI-FIDELITY §2): this used to add `Modifier::DIM`. Pi emits
+    /// `styledLink + this.theme.linkUrl(" (" + token.href + ")")` (v0.84.1
+    /// `tui/src/components/markdown.ts:705`) where `linkUrl` is
+    /// `(text) => theme.fg("mdLinkUrl", text)` (`theme.ts:1256`) — `fg()` alone, no SGR attribute.
+    /// The link *text* really is underlined (`markdown.ts:691`
+    /// `this.theme.link(this.theme.underline(linkText))`), which is why
+    /// [`Self::md_link_style`] keeps `UNDERLINED`; the URL suffix is not.
     pub fn md_link_url_style(&self) -> Style {
-        self.role_style("mdLinkUrl", "#5f819d").add_modifier(Modifier::DIM)
+        self.role_style("mdLinkUrl", "#666666", "#767676")
     }
 
     /// Diff added (`+`) line — `toolDiffAdded`, green (`diff.ts` `theme.fg("toolDiffAdded")`).
     pub fn tool_diff_added_style(&self) -> Style {
-        Style::default().fg(self.role_color("toolDiffAdded", "#b5bd68"))
+        Style::default().fg(self.role_color_themed("toolDiffAdded", "#b5bd68", "#588458"))
     }
     /// Diff removed (`-`) line — `toolDiffRemoved`, red.
     pub fn tool_diff_removed_style(&self) -> Style {
-        Style::default().fg(self.role_color("toolDiffRemoved", "#cc6666"))
+        Style::default().fg(self.role_color_themed("toolDiffRemoved", "#cc6666", "#aa5555"))
     }
     /// Diff context (unchanged) line — `toolDiffContext`, gray.
     pub fn tool_diff_context_style(&self) -> Style {
-        Style::default().fg(self.role_color("toolDiffContext", "#808080"))
+        Style::default().fg(self.role_color_themed("toolDiffContext", "#808080", "#6c6c6c"))
     }
     /// Intra-line changed-token emphasis — reversed video (`theme.inverse`, `diff.ts:renderIntraLineDiff`).
     pub fn inverse_style(&self) -> Style {
         Style::default().add_modifier(Modifier::REVERSED)
     }
 
-    /// Resolve a `syntect` scope (top-of-stack) to a syntax-highlight style by the prefix table in
-    /// spec/tui/06 §3.2 (`theme.ts:1083-1113`). Unknown scopes return `None` so the caller renders the
-    /// run flat in `mdCodeBlock` (auto-detect-off parity, §3.1).
+    /// The style for a scope that names a whole *annotation* / *preprocessor* construct, which Pi's
+    /// highlighter emits as a single `meta` span (T6, TUI-FIDELITY §2).
+    ///
+    /// Pi maps cli-highlight's `meta` class to `muted` — `meta: (s) => t.fg("muted", s)`, v0.84.1
+    /// `coding-agent/src/modes/interactive/theme/theme.ts:1128` — and highlight.js applies that one
+    /// class to the *entire* Rust attribute / Python decorator / C preprocessor line.
+    ///
+    /// syntect's vocabulary is structural, not lexical: it nests finer scopes *inside* a
+    /// `meta.annotation` / `meta.preprocessor` context (`#[derive(Debug)]` comes back as
+    /// `meta.annotation.rust` wrapping `punctuation.definition.annotation.rust` and
+    /// `variable.annotation.rust`), so the deepest-first walk in `markdown::scope_style` would only
+    /// ever recolour the punctuation. This is checked *before* that walk so the container wins,
+    /// reproducing Pi's one-span-one-colour result.
+    ///
+    /// It is deliberately NOT a blanket `meta` prefix. syntect also emits `meta.function.*`,
+    /// `meta.block.*`, `meta.group.*` and `meta.qualified-name.*` around ordinary code — a bare
+    /// `starts_with("meta")` would grey out most of a Rust or Python block, which is the opposite of
+    /// Pi's output. The behaviour is ported; the scope string it keys off cannot be.
+    ///
+    /// The container does **not** swallow a nested string/comment literal — see
+    /// [`Self::syntax_meta_nested_style`].
+    pub fn syntax_meta_container_style(&self, scope: &str) -> Option<Style> {
+        if scope.starts_with("meta.annotation") || scope.starts_with("meta.preprocessor") {
+            Some(self.muted_style())
+        } else {
+            None
+        }
+    }
+
+    /// The style for a scope nested *inside* a [`Self::syntax_meta_container_style`] construct that
+    /// keeps its **own** colour instead of being greyed with the rest of the annotation.
+    ///
+    /// highlight.js does not emit one flat `meta` span: its `meta` modes declare sub-modes, and
+    /// cli-highlight wraps each sub-mode in its own class, so the inner class is what
+    /// `buildCliHighlightTheme` resolves. Both constructs named in the audit contain a *string*
+    /// sub-mode — a Rust attribute's `#[cfg(feature = "wasm-host")]` literal and a C
+    /// `#include <stdio.h>`'s bracketed header — so Pi paints those `syntaxString`
+    /// (`theme.ts:1125`) while the surrounding `#[cfg(`…`)]` / `#include` stays `muted`
+    /// (`theme.ts:1128`). Returning the container style for the whole construct over-greyed them.
+    ///
+    /// Restricted to `string` and `comment` on purpose. The wider "any nested scope with its own
+    /// mapping escapes" rule would undo T6 entirely, because syntect scopes an annotation's own
+    /// glyphs as `punctuation.definition.annotation.*` / `variable.annotation.*` /
+    /// `keyword.control.import.*` — all three of which the prefix table maps — leaving nothing
+    /// muted. Numbers are deliberately excluded because upstream is grammar-dependent there
+    /// (highlight.js's Python decorator mode contains a number sub-mode, its C preprocessor mode
+    /// does not, so `#define N 42`'s `42` is plain `meta`), and greying them matches the two
+    /// constructs the audit names.
+    pub fn syntax_meta_nested_style(&self, scope: &str) -> Option<Style> {
+        if scope.starts_with("string") || scope.starts_with("comment") {
+            self.syntax_style_for_scope(scope)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a `syntect` scope to a syntax-highlight style, the prefix table mirroring Pi's
+    /// `buildCliHighlightTheme` (v0.84.1 `theme.ts:1119-1145`). Unknown scopes return `None`, and the
+    /// caller then emits the run **unstyled** — Pi pushes cli-highlight's output verbatim
+    /// (`tui/src/components/markdown.ts:526` `lines.push(`${indent}${hlLine}`)`), so a token the
+    /// highlighter did not classify carries no escape and sits at the terminal default.
+    ///
+    /// Three classes are **attribute-only, with no foreground at all**: `buildCliHighlightTheme`
+    /// builds them from the bare `chalk` combinators — `emphasis: (s) => t.italic(s)` (`:1140`),
+    /// `strong: (s) => t.bold(s)` (`:1141`), `link: (s) => t.underline(s)` (`:1142`), where
+    /// `italic`/`bold`/`underline` are `chalk.italic`/`chalk.bold`/`chalk.underline`
+    /// (`theme.ts:384-394`) and never call `fg()`. `markup.italic`/`markup.bold` used to return an
+    /// explicit `text` foreground alongside the attribute, which *overrides* whatever colour the
+    /// surrounding run had — the same defect class as unclassified spans defaulting to
+    /// `mdCodeBlock`. `markup.underline` (syntect's scope for a markdown link target,
+    /// `markup.underline.link.markdown`) was not mapped at all and is Pi's `link` class.
     pub fn syntax_style_for_scope(&self, scope: &str) -> Option<Style> {
-        // Most-specific prefixes first; the first match wins.
-        let (role, default_hex, modifier) = if scope.starts_with("comment") {
-            ("syntaxComment", "#6A9955", None)
+        // Most-specific prefixes first; the first match wins. `role` is `None` for the classes Pi
+        // styles with an SGR attribute and no colour.
+        let (role, modifier) = if scope.starts_with("comment") {
+            (Some(("syntaxComment", "#6A9955", "#008000")), None)
         } else if scope.starts_with("string") {
-            ("syntaxString", "#CE9178", None)
+            (Some(("syntaxString", "#CE9178", "#A31515")), None)
         } else if scope.starts_with("constant.numeric") {
-            ("syntaxNumber", "#B5CEA8", None)
+            (Some(("syntaxNumber", "#B5CEA8", "#098658")), None)
         } else if scope.starts_with("entity.name.function") || scope.starts_with("support.function") {
-            ("syntaxFunction", "#DCDCAA", None)
+            (Some(("syntaxFunction", "#DCDCAA", "#795E26")), None)
         } else if scope.starts_with("entity.name.type")
             || scope.starts_with("support.type")
             || scope.starts_with("support.class")
             || scope.starts_with("entity.name.class")
         {
-            ("syntaxType", "#4EC9B0", None)
+            (Some(("syntaxType", "#4EC9B0", "#267F99")), None)
         } else if scope.starts_with("keyword.operator") {
-            ("syntaxOperator", "#D4D4D4", None)
+            (Some(("syntaxOperator", "#D4D4D4", "#000000")), None)
         } else if scope.starts_with("keyword") || scope.starts_with("storage") {
-            ("syntaxKeyword", "#569CD6", None)
-        } else if scope.starts_with("variable")
-            || scope.starts_with("entity.other.attribute-name")
-            || scope.starts_with("meta.attribute")
+            (Some(("syntaxKeyword", "#569CD6", "#0000FF")), None)
+        } else if scope.starts_with("variable") || scope.starts_with("entity.other.attribute-name")
         {
-            ("syntaxVariable", "#9CDCFE", None)
+            (Some(("syntaxVariable", "#9CDCFE", "#001080")), None)
         } else if scope.starts_with("punctuation") {
-            ("syntaxPunctuation", "#D4D4D4", None)
+            (Some(("syntaxPunctuation", "#D4D4D4", "#000000")), None)
         } else if scope.starts_with("markup.inserted") {
-            ("toolDiffAdded", "#b5bd68", None)
+            (Some(("toolDiffAdded", "#b5bd68", "#588458")), None)
         } else if scope.starts_with("markup.deleted") {
-            ("toolDiffRemoved", "#cc6666", None)
+            (Some(("toolDiffRemoved", "#cc6666", "#aa5555")), None)
         } else if scope.starts_with("markup.italic") {
-            ("text", "#d4d4d4", Some(Modifier::ITALIC))
+            // `emphasis: (s) => t.italic(s)` — `theme.ts:1140`. Attribute only, no `fg()`.
+            (None, Some(Modifier::ITALIC))
         } else if scope.starts_with("markup.bold") {
-            ("text", "#d4d4d4", Some(Modifier::BOLD))
+            // `strong: (s) => t.bold(s)` — `theme.ts:1141`.
+            (None, Some(Modifier::BOLD))
+        } else if scope.starts_with("markup.underline") {
+            // `link: (s) => t.underline(s)` — `theme.ts:1142`.
+            (None, Some(Modifier::UNDERLINED))
         } else {
             return None;
         };
-        let mut s = self.role_style(role, default_hex);
+        let mut s = match role {
+            Some((key, dark_hex, light_hex)) => self.role_style(key, dark_hex, light_hex),
+            None => Style::default(),
+        };
         if let Some(m) = modifier {
             s = s.add_modifier(m);
         }
@@ -624,6 +985,36 @@ impl UiTheme {
 /// The structured per-role **background** sub-theme (feature #3; Pi background tokens, theme.ts:48-55).
 /// Every message/tool/selected background is a named field, so the whole background surface is
 /// addressable at once instead of via ad-hoc flat-map string lookups. `None` ⇒ terminal default.
+///
+// T9 — `scrollbarThumb` is Pi's SEVENTH background token (`theme/theme.ts:50`), and unlike the
+// other six it is `Type.Optional`, with an explicit `?? selectedBg` fallback applied twice: in
+// `withThemeColorFallbacks` (`:330`) and again in the `Theme` constructor (`:365`).
+//
+// It was long recorded here as blocked on an unported DRAW surface. That reasoning confused the
+// token with its painter. Its only *painting* consumer is indeed
+// `scrollbarStyle: (text) => theme.bg("scrollbarThumb", text)` (`interactive-mode.ts:874`) on the
+// `ScrollView` that exists solely as `fullscreenLayoutRoot`'s first child — but the token has a
+// second, independent consumer in the THEME LOADER itself, and upstream tests exactly that with no
+// ScrollView, no alt-screen renderer and no settings in sight:
+//
+// ```ts
+// // test/scrollbar-theme.test.ts:31-38
+// delete themeJson.colors.scrollbarThumb;
+// const loadedTheme = loadThemeFromPath(writeTheme(themeJson), "truecolor");
+// expect(loadedTheme.getBgAnsi("scrollbarThumb")).toBe(loadedTheme.getBgAnsi("selectedBg"));
+// ```
+//
+// That resolution behaviour is portable today and is ported below — it is the exact idiom
+// [`UiTheme::thinking`] already uses for `thinkingMax ?? thinkingXhigh`, the OTHER optional token,
+// declared on the adjacent line of the same upstream function (`theme.ts:329`/`:330`).
+//
+// What remains unported is the PAINTER, and only the painter: a fullscreen/alt-screen renderer with
+// a `ScrollView` (`pi/packages/tui/src/components/scroll-view.ts`) and the `fullscreenScrollbar`
+// setting that gates it (`settings-manager.ts:136,1138-1146`). cyrup's interactive layout is one
+// ratatui `Viewport::Inline` committing history to native scrollback, so nothing draws a thumb yet.
+// When that lands it reads this field; until then the field still has to RESOLVE correctly, because
+// a user theme that sets `scrollbarThumb` and one that omits it must agree, and a theme that omits
+// it must not resolve to "no colour".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackgroundTheme {
     /// Selected-row fill in selectors (`selectedBg`).
@@ -638,6 +1029,11 @@ pub struct BackgroundTheme {
     pub tool_success: Option<Color>,
     /// Tool block fill on error (`toolErrorBg`).
     pub tool_error: Option<Color>,
+    /// Fullscreen scrollbar thumb fill (`scrollbarThumb`, `theme.ts:50`). OPTIONAL upstream, with
+    /// `scrollbarThumb ?? selectedBg` applied by the loader (`:330`) and again by the `Theme`
+    /// constructor (`:365`), so a theme that omits it resolves to its own `selectedBg` — NEVER to
+    /// `None`. Same shape as `thinkingMax ?? thinkingXhigh` in [`ThinkingTheme`].
+    pub scrollbar_thumb: Option<Color>,
 }
 
 /// The structured **thinking-border** sub-theme (feature #3; Pi `thinking{Off..Xhigh}`,
@@ -1175,6 +1571,71 @@ fn ansi256_to_rgb(index: u8) -> (u8, u8, u8) {
     }
 }
 
+/// Port of `getLanguageFromPath` (v0.84.1 `modes/interactive/theme/theme.ts:1184-1250`) — the
+/// extension→language table the `read` and `write` tool bodies syntax-highlight through
+/// (`core/tools/read.ts:184`, `write.ts:151`).
+///
+/// Verbatim, including the shape: the extension is the LAST `.`-separated segment lower-cased
+/// (`filePath.split(".").pop()?.toLowerCase()`), so a path with no dot at all still yields the whole
+/// basename as "the extension" and simply misses the table, and a dotfile like `.gitignore` looks up
+/// `gitignore`. `undefined` (here `None`) is "no language" — the caller then renders the body flat
+/// in `toolOutput` rather than falling back to any auto-detection, which Pi does not do.
+///
+/// The values are Pi's own language NAMES, fed to `highlightCode`; cyrup feeds them to syntect's
+/// `find_syntax_by_token`, which resolves the same words (`rust`, `typescript`, `bash`, …) and
+/// returns `None` for the handful syntect's default set does not ship (`fish`, `hcl`, `protobuf`),
+/// leaving those flat — the same end state as Pi's `try`/`catch` fallback in `highlightCode`.
+pub(crate) fn language_from_path(file_path: &str) -> Option<&'static str> {
+    let ext = file_path.rsplit('.').next()?.to_ascii_lowercase();
+    let lang = match ext.as_str() {
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "py" => "python",
+        "rb" => "ruby",
+        "rs" => "rust",
+        "go" => "go",
+        "java" => "java",
+        "kt" => "kotlin",
+        "swift" => "swift",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
+        "cs" => "csharp",
+        "php" => "php",
+        "sh" | "bash" | "zsh" => "bash",
+        "fish" => "fish",
+        "ps1" => "powershell",
+        "sql" => "sql",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "scss" => "scss",
+        "sass" => "sass",
+        "less" => "less",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "xml" => "xml",
+        "md" | "markdown" => "markdown",
+        "dockerfile" => "dockerfile",
+        "makefile" => "makefile",
+        "cmake" => "cmake",
+        "lua" => "lua",
+        "perl" => "perl",
+        "r" => "r",
+        "scala" => "scala",
+        "clj" => "clojure",
+        "ex" | "exs" => "elixir",
+        "erl" => "erlang",
+        "hs" => "haskell",
+        "ml" => "ocaml",
+        "vim" => "vim",
+        "graphql" => "graphql",
+        "proto" => "protobuf",
+        "tf" | "hcl" => "hcl",
+        _ => return None,
+    };
+    Some(lang)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1216,11 +1677,16 @@ mod tests {
             legacy.thinking_border_style("max"),
             legacy.thinking_border_style("xhigh")
         );
-        // A genuinely unknown level still falls through to the neutral border.
+        // A genuinely unknown level resolves to `thinkingOff`, which is Pi's `default:` arm in
+        // `Theme.getThinkingBorderColor` (v0.84.1
+        // `coding-agent/src/modes/interactive/theme/theme.ts:437-438` —
+        // `default: return (str) => this.fg("thinkingOff", str)`). It used to fall through to the
+        // `border` role, a token Pi never reaches from here.
         assert_eq!(
             legacy.thinking_border_style("ultra"),
-            legacy.border_style()
+            legacy.thinking_border_style("off")
         );
+        assert_ne!(legacy.thinking_border_style("ultra"), legacy.border_style());
     }
 
     #[test]

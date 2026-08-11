@@ -135,14 +135,20 @@ async fn the_exposure_flag_suppresses_the_injection() {
     assert!(out.contains("[][][][][]"), "got: {out}");
 }
 
-/// The prompt guideline is gated by the same flag, and defaults ON (bash.ts:322,329-331).
+/// The prompt guideline is gated by the same flag, and defaults ON (v0.84.1
+/// `coding-agent/src/core/tools/bash.ts:327,334`).
+///
+/// The sentence itself is pinned to v0.84.1 `bash.ts:47`, which softened the v0.83.0 imperative
+/// `"Inspect PI_* ..."` (v0.83.0 `bash.ts:330`) to `"You can inspect PI_* ..."`. `PI_*` reads
+/// `CYRUP_*` here because those are the names `execute` actually publishes to the child, and the
+/// `PI_*` five are unconditionally scrubbed (`config::session_env_scrub_keys`).
 #[test]
 fn the_prompt_guideline_tracks_the_exposure_flag() {
     let cwd = std::env::temp_dir();
     let on = BashTool::new(proc(), ShellConfig::detect(), cwd.clone(), BashOpts::default());
     assert_eq!(
         on.prompt_guidelines(),
-        &["Inspect CYRUP_* environment variables for current model and session details."],
+        &["You can inspect CYRUP_* environment variables for current model and session details."],
     );
 
     let off = BashTool::new(
@@ -152,4 +158,39 @@ fn the_prompt_guideline_tracks_the_exposure_flag() {
         BashOpts { expose_session_environment: false, ..BashOpts::default() },
     );
     assert!(off.prompt_guidelines().is_empty());
+}
+
+/// G41: the guideline is a SYSTEM-PROMPT string, so its exact phrasing is model-facing behaviour.
+///
+/// v0.84.0 softened pi's bare imperative into a statement of availability; v0.84.1 keeps it at
+/// `coding-agent/src/core/tools/bash.ts:47`:
+///
+/// ```text
+/// guidelines: ["You can inspect PI_* environment variables for current model and session details."],
+/// ```
+///
+/// v0.83.0 `bash.ts:330` had `"Inspect PI_* environment variables for current model and session
+/// details."`. This test pins the softened form and explicitly rejects a silent regression to the
+/// v0.83.0 imperative — an assertion on the whole string alone would also pass if someone
+/// re-hardened only the prefix, so both directions are checked.
+#[test]
+fn the_guideline_uses_pi_v0_84_1_softened_phrasing() {
+    let on =
+        BashTool::new(proc(), ShellConfig::detect(), std::env::temp_dir(), BashOpts::default());
+    let guideline = *on.prompt_guidelines().first().expect("guideline present by default");
+
+    assert!(
+        guideline.starts_with("You can inspect "),
+        "v0.84.1 bash.ts:47 softened the imperative to a statement of availability; got: {guideline}"
+    );
+    assert_ne!(
+        guideline, "Inspect CYRUP_* environment variables for current model and session details.",
+        "this is the v0.83.0 bash.ts:330 wording — unported"
+    );
+    // The tail after the softening prefix is byte-identical to pi's, modulo the vendor prefix on
+    // the variable family (cyrup publishes CYRUP_*; the PI_* five are scrubbed).
+    assert_eq!(
+        guideline.trim_start_matches("You can "),
+        "inspect CYRUP_* environment variables for current model and session details."
+    );
 }

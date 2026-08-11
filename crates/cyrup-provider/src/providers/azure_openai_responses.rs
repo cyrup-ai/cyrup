@@ -104,6 +104,64 @@ mod tests {
         assert!(models.iter().any(|m| m.thinking_level_map.is_some()));
     }
 
+    /// VERSION LAG (v0.83.0 → v0.84.1): the Azure catalog is a DERIVED clone of the `openai` rows
+    /// (v0.84.1 `ai/scripts/generate-models.ts:2711-2726`) taken AFTER the temporary-override loop
+    /// at `:2273`, so the 2026-07-30 GPT-5.6 price cut (`OPENAI_GPT_56_STANDARD_COSTS`,
+    /// `:387-393` — absent at v0.83.0) propagates here. The clone copies the four scalar rates and
+    /// DROPS `tiers` (`:2718-2723` lists exactly input/output/cacheRead/cacheWrite), which is why
+    /// the tier assertions live in the `openai` provider test and not this one.
+    #[test]
+    fn the_gpt_5_6_clone_carries_the_post_cut_prices_and_no_tiers() {
+        let models = azure_openai_responses_models();
+        let find = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+                .clone()
+        };
+
+        let luna = find("gpt-5.6-luna");
+        assert_eq!(
+            (
+                luna.cost.input,
+                luna.cost.output,
+                luna.cost.cache_read,
+                luna.cost.cache_write
+            ),
+            (0.2, 1.2, 0.02, 0.25)
+        );
+        assert!(luna.cost.tiers.is_none(), "the Azure clone drops tiers");
+
+        let terra = find("gpt-5.6-terra");
+        assert_eq!(
+            (
+                terra.cost.input,
+                terra.cost.output,
+                terra.cost.cache_read,
+                terra.cost.cache_write
+            ),
+            (2.0, 12.0, 0.2, 2.5)
+        );
+        assert!(terra.cost.tiers.is_none());
+
+        // MIRROR: Sol is absent from the price table, so its clone is unchanged, and the Azure
+        // context-window override still applies to all three (`…:2704-2710`).
+        let sol = find("gpt-5.6-sol");
+        assert_eq!(
+            (
+                sol.cost.input,
+                sol.cost.output,
+                sol.cost.cache_read,
+                sol.cost.cache_write
+            ),
+            (5.0, 30.0, 0.5, 6.25)
+        );
+        for id in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+            assert_eq!(find(id).context_window, 1_050_000, "{id}");
+        }
+    }
+
     #[test]
     fn env_mapping_present() {
         let vars =

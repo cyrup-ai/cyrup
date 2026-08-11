@@ -1,12 +1,18 @@
-//! The 13 slash-command descriptors and their argument parsers (func-SA §5.6 R-SA-129; arch-SA
+//! The 12 slash-command descriptors and their argument parsers (func-SA §5.6 R-SA-129; arch-SA
 //! §2.2/§6.8).
 //!
 //! # Scope of this file
 //!
-//! This file defines, for all 13 commands listed by R-SA-129 (`/run`, `/chain`, `/parallel`,
+//! This file defines, for all 12 commands listed by R-SA-129 (`/run`, `/chain`, `/parallel`,
 //! `/run-chain`, `/subagent-cost`, `/subagents-doctor`, `/subagents-models`,
 //! `/subagents-profiles`, `/subagents-load-profile`, `/subagents-refresh-provider-models`,
-//! `/subagents-generate-profiles`, `/subagents-check-profile`, `/subagents-companions`):
+//! `/subagents-generate-profiles`, `/subagents-check-profile`):
+//!
+//! `/subagents-companions` was the thirteenth until upstream DELETED
+//! `src/extension/companion-suggestions.ts` wholesale in `3ac0ef5` ("Make supervisor coordination
+//! native", 2026-07-03) — the same commit that added `intercom/native-supervisor-channel.ts`. The
+//! command, its `companionSuggestions` config key and its two recognized package names are gone
+//! from every upstream tag from v0.34.0 onward; nothing replaced the command.
 //!
 //! - a [`SlashCommandName`] enum plus a [`SLASH_COMMANDS`] table of static descriptors
 //!   (name/usage/description) suitable for driving `InitApi::register_command` registration,
@@ -50,10 +56,6 @@
 //!   later sibling modules per arch-SA §2.2's module layout; this file defines only their
 //!   descriptor entries and trivial argument parsing (an optional single positional token, or
 //!   none), never their diagnostic/report-building logic.
-//! - **`/subagents-companions`'s dismissal-state mutation** — same story: this file parses
-//!   `status | hide <package> <workspace|user> | show <package>` into a typed
-//!   [`CompanionsCommand`], but persisting a dismissal to `config.json` is a `registration/mod.rs`
-//!   / `extension.rs` concern this file has no config-store handle to perform.
 //! - **The single shared dispatch path itself** (R-SA-130: "every slash command handler MUST
 //!   route through the same internal execution function the `subagent` tool uses") — that is a
 //!   property of `extension.rs`'s `dispatch_slash`/`SubagentExecutor::execute_from_command`
@@ -72,7 +74,7 @@ use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec};
 // SlashCommandName / SLASH_COMMANDS descriptor table (R-SA-129)
 // =================================================================================================
 
-/// The 13 slash commands R-SA-129 mandates, as a closed enum (never a bare `&str` — every
+/// The 12 slash commands R-SA-129 mandates, as a closed enum (never a bare `&str` — every
 /// dispatch call site gets exhaustiveness checking against this list rather than risking a
 /// stringly-typed typo silently falling through to "unknown command").
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -89,7 +91,30 @@ pub enum SlashCommandName {
     SubagentsRefreshProviderModels,
     SubagentsGenerateProfiles,
     SubagentsCheckProfile,
-    SubagentsCompanions,
+    /// `/prompt-workflow <name> [args]` — run one `prompts/*.md` recipe (pi
+    /// `prompt-workflows.ts:269` @v0.34.0). NOT one of R-SA-129's twelve: it comes from
+    /// `registerPromptWorkflowCommands`, which `registerSlashCommands` calls at
+    /// `slash-commands.ts:795-800`, so it is a real upstream command on the same surface.
+    PromptWorkflow,
+    /// `/chain-prompts a -> b -- args` — run several recipes as one native subagent chain (pi
+    /// `prompt-workflows.ts:303` @v0.34.0).
+    ChainPrompts,
+    /// `/subagents-fleet` — the live fleet inspector (pi
+    /// `pi.registerCommand("subagents-fleet", …)`, `slash-commands.ts:714-717` @v0.43.0, whose
+    /// handler is exactly `showFleet(ctx)`; at the v0.34.0 baseline the same command was
+    /// `:1092-1097` with the read-only `runSlashSubagent(pi, ctx, { action: "status", view:
+    /// "fleet" })` handler, which is now `showFleet`'s own `!ctx.hasUI` fallback). Also
+    /// NOT one of R-SA-129's twelve, and also a real upstream command on the same surface —
+    /// registered by the SAME `registerSlashCommands` call, three lines above the
+    /// `registerPromptWorkflowCommands` hop the two commands above come from.
+    SubagentsFleet,
+    /// G77 — `/subagents-stop [run-id]`: terminally stop a current-session async subagent run (pi
+    /// `pi.registerCommand("subagents-stop", …)`, `slash-commands.ts:751-792` @v0.43.0). With an
+    /// explicit id its handler is exactly `runSlashSubagent(pi, ctx, { action: "stop", id })`
+    /// (`:756`); with no id upstream opens a TUI selector over the discovered stop targets and
+    /// then issues the same call for whichever the user picks (`:791`). Also NOT one of R-SA-129's
+    /// twelve, and registered by the same `registerSlashCommands` call.
+    SubagentsStop,
 }
 
 impl SlashCommandName {
@@ -113,7 +138,10 @@ impl SlashCommandName {
             }
             SlashCommandName::SubagentsGenerateProfiles => "subagents-generate-profiles",
             SlashCommandName::SubagentsCheckProfile => "subagents-check-profile",
-            SlashCommandName::SubagentsCompanions => "subagents-companions",
+            SlashCommandName::PromptWorkflow => "prompt-workflow",
+            SlashCommandName::ChainPrompts => "chain-prompts",
+            SlashCommandName::SubagentsFleet => "subagents-fleet",
+            SlashCommandName::SubagentsStop => "subagents-stop",
         }
     }
 
@@ -141,11 +169,11 @@ pub struct SlashCommandDescriptor {
     pub description: &'static str,
 }
 
-/// All 13 commands R-SA-129 mandates, in the order that requirement lists them. `extension.rs`
+/// All 12 commands R-SA-129 mandates, in the order that requirement lists them. `extension.rs`
 /// (Phase 9) is expected to iterate this table once at `init()` time and call
 /// `InitApi::register_command` once per entry (arch-SA §3.2's `for cmd in
 /// registration::SLASH_COMMANDS { api.register_command(...) }` sketch) — this table is the single
-/// source of truth for "which 13 commands exist," so an omission here is a compile-visible gap
+/// source of truth for "which 12 commands exist," so an omission here is a compile-visible gap
 /// rather than a silently-missing registration.
 pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
     SlashCommandDescriptor {
@@ -208,10 +236,33 @@ pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
         usage: "Usage: /subagents-check-profile <name>",
         description: "Check whether a saved profile still points to usable models",
     },
+    // The two prompt-template commands `registerPromptWorkflowCommands` adds on top of R-SA-129's
+    // twelve (`prompt-workflows.ts:269-270,303-304` @v0.34.0). `description` is upstream's
+    // verbatim, with pi's package name rebranded — it is what the command palette shows.
     SlashCommandDescriptor {
-        name: SlashCommandName::SubagentsCompanions,
-        usage: "Usage: /subagents-companions status | hide <package> <workspace|user> | show <package>",
-        description: "Manage companion-extension recommendation visibility",
+        name: SlashCommandName::PromptWorkflow,
+        usage: "Usage: /prompt-workflow <name> [args] [--fork|--fresh] [--worktree] [--bg] [--subagent <agent>]",
+        description: "Run a prompt template through native subagents: /prompt-workflow <name> [args]",
+    },
+    SlashCommandDescriptor {
+        name: SlashCommandName::ChainPrompts,
+        usage: "Usage: /chain-prompts prompt-a -> prompt-b -- args",
+        description: "Run prompt templates as a native subagent chain: /chain-prompts analyze -> fix -- args",
+    },
+    // G92: `/subagents-fleet` (`slash-commands.ts:714-717` @v0.43.0). `description` is upstream's
+    // verbatim text at that tag; its handler is `showFleet(ctx)`, ported by
+    // `extension.rs::show_fleet` over `crate::tui::fleet`.
+    SlashCommandDescriptor {
+        name: SlashCommandName::SubagentsFleet,
+        usage: "Usage: /subagents-fleet",
+        description: "Open the live subagent fleet inspector",
+    },
+    // G77: `/subagents-stop` (`slash-commands.ts:751-753` @v0.43.0). `description` is upstream's
+    // verbatim.
+    SlashCommandDescriptor {
+        name: SlashCommandName::SubagentsStop,
+        usage: "Usage: /subagents-stop [run-id]",
+        description: "Stop a current-session async subagent run",
     },
 ];
 
@@ -488,8 +539,11 @@ pub fn validate_inline_acceptance(value: &str, agent: &str) -> Result<(), SlashP
         return Ok(());
     }
     Err(SlashParseError::new(format!(
+        // G78 — `reviewed` is no longer a requestable acceptance level ANYWHERE at pi-subagents
+        // v0.43.0 (`acceptance.ts:54`), so the escape hatch this message points at is the object
+        // form's `review` gate rather than a `reviewed` level that no longer exists.
         "Inline acceptance for step '{agent}' supports auto, attested, or checked. Use the \
-         subagent tool API or a saved .chain.json file for none, verified, or reviewed \
+         subagent tool API or a saved .chain.json file for none, verified, or review-gated \
          acceptance contracts."
     )))
 }
@@ -499,7 +553,7 @@ pub fn validate_inline_acceptance(value: &str, agent: &str) -> Result<(), SlashP
 // =================================================================================================
 
 /// Split one agent token into its bare name and inline `[...]` config, if present.
-/// Faithful port of `pi-subagents`' `parseAgentToken` (`slash-commands.ts:92-97`).
+/// Faithful port of `pi-subagents`' `parseAgentToken` (`slash-commands.ts:76-81`).
 #[must_use]
 pub fn parse_agent_token(token: &str) -> (String, InlineStepConfig) {
     let Some(bracket) = token.find('[') else {
@@ -1169,7 +1223,7 @@ pub struct ParsedRunCommand {
 }
 
 /// Parse `/run <agent>[key=value,...] [task] [--bg] [--fork]` (R-SA-129). Faithful port of the
-/// `pi.registerCommand("run", ...)` handler body (`slash-commands.ts:978-1006`), argument-parsing
+/// `pi.registerCommand("run", ...)` handler body (`slash-commands.ts:980-1008` @v0.34.0), argument-parsing
 /// portion only (agent-existence validation and actual dispatch are later-phase concerns per this
 /// file's module header).
 ///
@@ -1337,9 +1391,9 @@ pub struct ParsedChainCommand {
 
 /// Parse `/chain agent1 "task1" -> agent2 "task2"` (or the inline-parallel-group variant `/chain
 /// agent1 "task1" -> (agent2 "task2" | agent3 "task3") -> agent4`) into a [`ParsedChainCommand`]
-/// (R-SA-129). Faithful port of `buildChainExpressionSteps` (`slash-commands.ts:890-972`) composed
+/// (R-SA-129). Faithful port of `buildChainExpressionSteps` (`slash-commands.ts:892-974` @v0.34.0) composed
 /// with the `pi.registerCommand("chain", ...)` handler's flag extraction
-/// (`slash-commands.ts:1008-1020`).
+/// (`slash-commands.ts:1010-1022` @v0.34.0).
 ///
 /// # Errors
 ///
@@ -1416,7 +1470,7 @@ pub fn parse_chain_command(raw_args: &str) -> Result<ParsedChainCommand, SlashPa
         .map(|element| match element {
             ParsedChainElement::Group { tasks, config } => {
                 // T1 (count fan-out, `slash-commands.ts:884` `opts.inGroup && config.count` +
-                // `subagent-executor.ts:1359` `expandChainParallelCounts`): an inline group task's
+                // `subagent-executor.ts:2002` `expandChainParallelCounts`): an inline group task's
                 // `[count=N]` repeats that concrete task N times, widening the fan-out — the
                 // parse-time analogue of pi's `expandChainParallelCounts`, applied here where the
                 // group's static width is known. `count` is validated `>= 1` at parse time
@@ -1462,7 +1516,7 @@ pub struct ParsedParallelCommand {
 /// `(a | b)` inline-group syntax — it IS already an implicit single-level parallel group over
 /// however many steps `parse_agent_args` returns; nesting a further group inside it has no
 /// well-formed meaning and pi-subagents' own `/parallel` handler
-/// (`slash-commands.ts:1052-1074`) never calls `buildChainExpressionSteps`/`hasGroupSyntax` at
+/// (`slash-commands.ts:1054-1076` @v0.34.0) never calls `buildChainExpressionSteps`/`hasGroupSyntax` at
 /// all, confirming this is not an oversight.
 ///
 /// # Errors
@@ -1483,7 +1537,7 @@ pub fn parse_parallel_command(raw_args: &str) -> Result<ParsedParallelCommand, S
                 task,
                 cwd: step.config.cwd.as_ref().map(PathBuf::from),
                 // T1: `/parallel`'s per-step `[model=…]` override reaches the child (pi
-                // `slash-commands.ts:1065` `config.model ? {model} : {}`), previously dropped.
+                // `slash-commands.ts:1067` @v0.34.0 `config.model ? {model} : {}`), previously dropped.
                 model: step.config.model.clone().map(ModelId::from),
                 tools: None,
                 extensions: None,
@@ -1530,7 +1584,7 @@ pub struct ParsedRunChainCommand {
 
 /// Parse `/run-chain <chainName> -- <task> [--bg] [--fork]` (R-SA-129). Faithful port of the
 /// `pi.registerCommand("run-chain", ...)` handler's argument-parsing portion
-/// (`slash-commands.ts:1022-1050`).
+/// (`slash-commands.ts:1024-1052` @v0.34.0).
 ///
 /// # Errors
 ///
@@ -1564,7 +1618,7 @@ pub fn parse_run_chain_command(raw_args: &str) -> Result<ParsedRunChainCommand, 
 
 /// `/subagent-cost` and `/subagents-doctor` take no arguments at all (R-SA-129's per-command
 /// argument-shape contract; source: both handlers ignore `_args` entirely,
-/// `slash-commands.ts:1076-1088`). This parser exists purely so every one of the 13 commands has a
+/// `slash-commands.ts:685-697`). This parser exists purely so every one of the 12 commands has a
 /// uniform `parse_*` entry point `extension.rs` can dispatch through — it always succeeds.
 pub fn parse_no_args_command(_raw_args: &str) {}
 
@@ -1581,7 +1635,7 @@ pub struct ParsedSubagentsModelsCommand {
 
 /// Parse `/subagents-models [builtin-agent-name]` (R-SA-129). Faithful port of the
 /// `pi.registerCommand("subagents-models", ...)` handler's argument-parsing portion
-/// (`slash-commands.ts:1090-1111`), MINUS the `BUILTIN_AGENT_NAMES.includes(agent)` existence
+/// (`slash-commands.ts:802-823`), MINUS the `BUILTIN_AGENT_NAMES.includes(agent)` existence
 /// check (source lines 1105-1108) — deferred to `extension.rs`, which has access to the resolved
 /// builtin-agent-name list this pure parser does not.
 ///
@@ -1610,7 +1664,7 @@ pub fn parse_subagents_models_command(
 // /subagents-profiles — no arguments
 // =================================================================================================
 
-// `/subagents-profiles` takes no arguments (source: `slash-commands.ts:1113-1123`). Shares
+// `/subagents-profiles` takes no arguments (source: `slash-commands.ts:811-821`). Shares
 // `parse_no_args_command`'s always-succeeds shape.
 
 // =================================================================================================
@@ -1620,9 +1674,9 @@ pub fn parse_subagents_models_command(
 
 /// Parse a command whose entire argument contract is exactly one required positional token (no
 /// flags, no `key=value`). Faithful port of `parseSingleRequiredArg`
-/// (`slash-commands.ts:330-334`), shared by `/subagents-load-profile`, `/subagents-generate-
+/// (`slash-commands.ts:419-423`), shared by `/subagents-load-profile`, `/subagents-generate-
 /// profiles`, and `/subagents-check-profile` (source calls this same helper for all three,
-/// `slash-commands.ts:1134`, `1216`, `1259`).
+/// `slash-commands.ts:846`, `928`, `971`).
 ///
 /// # Errors
 ///
@@ -1681,7 +1735,7 @@ pub struct ParsedRefreshProviderModelsCommand {
 
 /// Parse `/subagents-refresh-provider-models <provider> [--force]` (R-SA-129). Faithful port of
 /// the `pi.registerCommand("subagents-refresh-provider-models", ...)` handler's argument-parsing
-/// portion (`slash-commands.ts:1178-1210`): a trailing `--force` OR bare `force` token (either
+/// portion (`slash-commands.ts:890-922`): a trailing `--force` OR bare `force` token (either
 /// form, source's regex accepts both) is stripped before applying
 /// [`parse_single_required_arg`] to what remains.
 ///
@@ -1702,7 +1756,7 @@ pub fn parse_subagents_refresh_provider_models_command(
 }
 
 /// Strip a trailing `--force` or bare `force` token (source: `/(?:^|\s)--force$/` /
-/// `/(?:^|\s)force$/`, `slash-commands.ts:1183-1184`). Returns the cleaned remainder plus whether
+/// `/(?:^|\s)force$/`, `slash-commands.ts:895-896`). Returns the cleaned remainder plus whether
 /// a force flag was present.
 fn strip_trailing_force_flag(input: &str) -> (String, bool) {
     for suffix in ["--force", "force"] {
@@ -1717,95 +1771,6 @@ fn strip_trailing_force_flag(input: &str) -> (String, bool) {
     (input.to_string(), false)
 }
 
-// =================================================================================================
-// /subagents-companions — status | hide <package> <workspace|user> | show <package>
-// =================================================================================================
-
-/// The two companion package names pi-subagents' `/subagents-companions` recognizes (source:
-/// `COMPANION_PACKAGES`, referenced by `parseCompanionPackage`,
-/// `companion-suggestions.ts:282-284`). Kept as a fixed, closed set here (rather than an arbitrary
-/// string) so an unknown package name is a parse-time rejection, matching source's own "Unknown
-/// companion package" error.
-pub const COMPANION_PACKAGES: &[&str] = &["pi-intercom", "pi-prompt-template-model"];
-
-/// One parsed `/subagents-companions` invocation (R-SA-129). Faithful port of
-/// `handleCompanionCommand`'s argument-parsing shape (`companion-suggestions.ts:328-351`) — the
-/// actual status-report rendering / dismissal-state mutation this type feeds into is a
-/// `registration/mod.rs`/`extension.rs` concern with a config-store handle this pure parser does
-/// not have.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CompanionsCommand {
-    /// `/subagents-companions` (bare) or `/subagents-companions status`.
-    Status,
-    /// `/subagents-companions hide <package> <workspace|user>`.
-    Hide {
-        package: String,
-        scope: CompanionsScope,
-    },
-    /// `/subagents-companions show <package>`.
-    Show { package: String },
-}
-
-/// `workspace` vs. `user` dismissal scope for [`CompanionsCommand::Hide`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompanionsScope {
-    Workspace,
-    User,
-}
-
-/// Parse `/subagents-companions status | hide <package> <workspace|user> | show <package>`
-/// (R-SA-129). Faithful port of `handleCompanionCommand`'s argument-parsing portion
-/// (`companion-suggestions.ts:328-351`), returning a typed [`CompanionsCommand`] in place of
-/// source's `{ text, updatedConfig?, error? }` shape (this file has no config store to mutate;
-/// `extension.rs` performs the actual dismissal update from the parsed command this function
-/// returns).
-///
-/// # Errors
-///
-/// Returns [`SlashParseError`] if: the first token is present but neither `hide` nor `show`; the
-/// named package is not one of [`COMPANION_PACKAGES`]; or (`hide` only) the scope token is
-/// present but is neither `workspace` nor `user`.
-pub fn parse_subagents_companions_command(
-    raw_args: &str,
-) -> Result<CompanionsCommand, SlashParseError> {
-    let parts: Vec<&str> = raw_args.split_whitespace().collect();
-    let verb = parts.first().copied();
-    if verb.is_none() || verb == Some("status") {
-        return Ok(CompanionsCommand::Status);
-    }
-    if verb != Some("hide") && verb != Some("show") {
-        return Err(SlashParseError::new(
-            "Usage: /subagents-companions status | hide <pi-intercom|pi-prompt-template-model> \
-             <workspace|user> | show <pi-intercom|pi-prompt-template-model>",
-        ));
-    }
-    let package = parts.get(1).copied();
-    let Some(package) = package.filter(|p| COMPANION_PACKAGES.contains(p)) else {
-        return Err(SlashParseError::new(
-            "Unknown companion package. Use pi-intercom or pi-prompt-template-model.",
-        ));
-    };
-    if verb == Some("show") {
-        return Ok(CompanionsCommand::Show {
-            package: package.to_string(),
-        });
-    }
-    let scope = match parts.get(2).copied() {
-        Some("workspace") => CompanionsScope::Workspace,
-        Some("user") => CompanionsScope::User,
-        _ => {
-            return Err(SlashParseError::new(
-                "Usage: /subagents-companions hide <pi-intercom|pi-prompt-template-model> \
-                 <workspace|user>",
-            ));
-        }
-    };
-    Ok(CompanionsCommand::Hide {
-        package: package.to_string(),
-        scope,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1818,12 +1783,37 @@ mod tests {
     use super::*;
 
     // ---------------------------------------------------------------------------------------
-    // SLASH_COMMANDS table completeness (R-SA-129: exactly 13 commands)
+    // SLASH_COMMANDS table completeness (R-SA-129's 12, plus the 2 prompt-template commands
+    // and /subagents-fleet)
     // ---------------------------------------------------------------------------------------
 
+    /// R-SA-129's twelve, which occupy the table's leading positions and are asserted verbatim by
+    /// [`slash_commands_table_matches_r_sa_129s_exact_list`].
+    const R_SA_129_COMMAND_COUNT: usize = 12;
+
+    /// Upstream's `registerSlashCommands` registers R-SA-129's twelve AND — at
+    /// `pi-subagents/src/slash/slash-commands.ts:795-800` @v0.43.0 —
+    /// `registerPromptWorkflowCommands({ pi, run })`, which registers two more on the SAME command
+    /// surface: `pi.registerCommand("prompt-workflow", …)` (`slash/prompt-workflows.ts:269`) and
+    /// `pi.registerCommand("chain-prompts", …)` (`:303`). G92 adds a THIRD such command,
+    /// `pi.registerCommand("subagents-fleet", …)` (`slash-commands.ts:714-717` @v0.43.0), which
+    /// `registerSlashCommands` registers DIRECTLY, three lines above that
+    /// `registerPromptWorkflowCommands` hop. G77 adds a FOURTH, `pi.registerCommand(
+    /// "subagents-stop", …)` (`slash-commands.ts:751-792` @v0.43.0), registered by that same
+    /// `registerSlashCommands` call. This table registers all sixteen, so the count is sixteen.
+    /// The twelve are still pinned exactly, as a prefix, below.
     #[test]
-    fn slash_commands_table_has_exactly_13_entries() {
-        assert_eq!(SLASH_COMMANDS.len(), 13);
+    fn slash_commands_table_has_the_twelve_plus_the_four_extra_commands() {
+        assert_eq!(SLASH_COMMANDS.len(), R_SA_129_COMMAND_COUNT + 4);
+        let tail: Vec<&str> = SLASH_COMMANDS
+            .iter()
+            .skip(R_SA_129_COMMAND_COUNT)
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(
+            tail,
+            ["prompt-workflow", "chain-prompts", "subagents-fleet", "subagents-stop"]
+        );
     }
 
     #[test]
@@ -1850,9 +1840,12 @@ mod tests {
             "subagents-refresh-provider-models",
             "subagents-generate-profiles",
             "subagents-check-profile",
-            "subagents-companions",
         ];
-        let actual: Vec<&str> = SLASH_COMMANDS.iter().map(|d| d.name.as_str()).collect();
+        let actual: Vec<&str> = SLASH_COMMANDS
+            .iter()
+            .take(R_SA_129_COMMAND_COUNT)
+            .map(|d| d.name.as_str())
+            .collect();
         assert_eq!(actual, expected);
     }
 
@@ -2674,87 +2667,4 @@ mod tests {
         assert!(err.message.starts_with("Usage:"));
     }
 
-    // ---------------------------------------------------------------------------------------
-    // parse_subagents_companions_command
-    // ---------------------------------------------------------------------------------------
-
-    #[test]
-    fn parse_companions_bare_is_status() {
-        assert_eq!(
-            parse_subagents_companions_command("").expect("ok"),
-            CompanionsCommand::Status
-        );
-    }
-
-    #[test]
-    fn parse_companions_explicit_status() {
-        assert_eq!(
-            parse_subagents_companions_command("status").expect("ok"),
-            CompanionsCommand::Status
-        );
-    }
-
-    #[test]
-    fn parse_companions_hide_workspace() {
-        let parsed =
-            parse_subagents_companions_command("hide pi-intercom workspace").expect("ok");
-        assert_eq!(
-            parsed,
-            CompanionsCommand::Hide {
-                package: "pi-intercom".to_string(),
-                scope: CompanionsScope::Workspace,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_companions_hide_user() {
-        let parsed =
-            parse_subagents_companions_command("hide pi-prompt-template-model user").expect("ok");
-        assert_eq!(
-            parsed,
-            CompanionsCommand::Hide {
-                package: "pi-prompt-template-model".to_string(),
-                scope: CompanionsScope::User,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_companions_show() {
-        let parsed = parse_subagents_companions_command("show pi-intercom").expect("ok");
-        assert_eq!(
-            parsed,
-            CompanionsCommand::Show {
-                package: "pi-intercom".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_companions_unknown_verb_errors() {
-        let err = parse_subagents_companions_command("frobnicate pi-intercom")
-            .expect_err("not hide/show/status");
-        assert!(err.message.starts_with("Usage:"));
-    }
-
-    #[test]
-    fn parse_companions_unknown_package_errors() {
-        let err =
-            parse_subagents_companions_command("hide unknown-package workspace").expect_err("bad pkg");
-        assert!(err.message.contains("Unknown companion package"));
-    }
-
-    #[test]
-    fn parse_companions_hide_missing_scope_errors() {
-        let err = parse_subagents_companions_command("hide pi-intercom").expect_err("no scope");
-        assert!(err.message.starts_with("Usage:"));
-    }
-
-    #[test]
-    fn parse_companions_hide_invalid_scope_errors() {
-        let err = parse_subagents_companions_command("hide pi-intercom galaxy")
-            .expect_err("bad scope token");
-        assert!(err.message.starts_with("Usage:"));
-    }
 }

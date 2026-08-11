@@ -79,6 +79,11 @@ pub struct ModelCompat {
     pub supports_reasoning_effort: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_usage_in_streaming: Option<bool>,
+    /// Pi `supportsFinishReason` (v0.84.1 `ai/src/types.ts:547-548`, default `true`): whether
+    /// streamed responses include `finish_reason`. When `false`, pi INFERS `stop` vs `toolUse` at
+    /// end of stream instead of treating the missing reason as a truncated turn.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_finish_reason: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_tokens_field: Option<MaxTokensField>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -207,6 +212,8 @@ pub struct ResolvedCompat {
     pub supports_developer_role: bool,
     pub supports_reasoning_effort: bool,
     pub supports_usage_in_streaming: bool,
+    /// Pi `supportsFinishReason` (v0.84.1 `ai/src/api/openai-completions.ts:1499`, detected `true`).
+    pub supports_finish_reason: bool,
     pub max_tokens_field: MaxTokensField,
     pub requires_tool_result_name: bool,
     pub requires_assistant_after_tool_result: bool,
@@ -352,6 +359,7 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
             && !is_nvidia
             && !is_ant_ling,
         supports_usage_in_streaming: true,
+        supports_finish_reason: true,
         max_tokens_field: if use_max_tokens {
             MaxTokensField::MaxTokens
         } else {
@@ -396,6 +404,9 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
         supports_usage_in_streaming: c
             .supports_usage_in_streaming
             .unwrap_or(detected.supports_usage_in_streaming),
+        supports_finish_reason: c
+            .supports_finish_reason
+            .unwrap_or(detected.supports_finish_reason),
         max_tokens_field: c.max_tokens_field.unwrap_or(detected.max_tokens_field),
         requires_tool_result_name: c
             .requires_tool_result_name

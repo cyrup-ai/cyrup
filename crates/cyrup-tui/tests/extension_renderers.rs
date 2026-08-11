@@ -392,3 +392,328 @@ async fn an_unknown_widget_tag_is_still_visible() {
     let sb = app.scrollback_text();
     assert!(sb.contains("MISTYPED-NODE"), "the unrecognized node is visible, not dropped:\n{sb}");
 }
+
+// ============================================================ X11 — the REPLAY arm ============
+
+/// **X11 — a RESUMED session keeps its extension rendering.**
+///
+/// Pi's replay walk performs the SAME lookup as the live path, inside the same `display` gate:
+///
+/// ```ts
+/// case "custom": {
+///     if (message.display) {
+///         const renderer = this.session.extensionRunner.getMessageRenderer(message.customType);
+///         const component = new CustomMessageComponent(message, renderer, …);
+/// ```
+/// (`modes/interactive/interactive-mode.ts:3469-3477`).
+///
+/// cyrup's replay arm called `push_custom_message`, which hard-codes `Rendered::None`, so every
+/// `/resume`, `/fork`, `/import` and `--continue` silently downgraded extension-rendered blocks to
+/// the built-in `[type] body` framing — a session looked different after a resume than before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_custom_message_still_reaches_its_registered_renderer() {
+    use cyrup_session_svc::agent_message::{AgentMessage as SessionMessage, CustomRoleMessage};
+
+    let host = host_with_renderer().await;
+    let mut app = app();
+
+    app.replay_session_with_extensions(
+        &[SessionMessage::Custom(CustomRoleMessage {
+            custom_type: "demo".to_string(),
+            content: json!("plain fallback body"),
+            display: true,
+            details: None,
+            timestamp: 0,
+        })],
+        &host,
+    )
+    .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        sb.contains("EXTCALL[demo] payload-bytes="),
+        "the replayed message went through `getMessageRenderer` (`:3471`):\n{sb}"
+    );
+    assert!(
+        !sb.contains("plain fallback body"),
+        "the default `[label] body` framing did NOT also draw:\n{sb}"
+    );
+}
+
+/// MIRROR 1 — a replayed custom type NO extension claimed still draws the built-in framing
+/// (`getMessageRenderer` → `undefined` ⇒ `CustomMessageComponent`'s default box).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_unclaimed_custom_type_keeps_the_default_framing() {
+    use cyrup_session_svc::agent_message::{AgentMessage as SessionMessage, CustomRoleMessage};
+
+    let host = host_with_renderer().await;
+    let mut app = app();
+
+    app.replay_session_with_extensions(
+        &[SessionMessage::Custom(CustomRoleMessage {
+            custom_type: "nobody-renders-this".to_string(),
+            content: json!("plain fallback body"),
+            display: true,
+            details: None,
+            timestamp: 0,
+        })],
+        &host,
+    )
+    .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(sb.contains("plain fallback body"), "the default body drew:\n{sb}");
+    assert!(!sb.contains("EXTCALL"), "no renderer was consulted for an unclaimed type:\n{sb}");
+}
+
+/// MIRROR 2 — `display: false` is still the outer gate (`:3470`): the renderer is not consulted and
+/// nothing at all is drawn, so the fix did not move the lookup outside its `if`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_undisplayed_custom_message_renders_nothing() {
+    use cyrup_session_svc::agent_message::{AgentMessage as SessionMessage, CustomRoleMessage};
+
+    let host = host_with_renderer().await;
+    let mut app = app();
+
+    app.replay_session_with_extensions(
+        &[SessionMessage::Custom(CustomRoleMessage {
+            custom_type: "demo".to_string(),
+            content: json!("plain fallback body"),
+            display: false,
+            details: None,
+            timestamp: 0,
+        })],
+        &host,
+    )
+    .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(!sb.contains("EXTCALL"), "no renderer ran for a non-display message:\n{sb}");
+    assert!(!sb.contains("plain fallback body"), "and no default box either:\n{sb}");
+}
+
+/// MIRROR 3 — the renderer sees the message at the position it occupies in the replay, so a walk
+/// carrying several custom messages does not cross their rendered texts. The two payloads differ in
+/// size, and the renderer reports the byte count it was handed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_replayed_custom_message_gets_its_own_renderer_output() {
+    use cyrup_session_svc::agent_message::{AgentMessage as SessionMessage, CustomRoleMessage};
+
+    let host = host_with_renderer().await;
+    let mut app = app();
+
+    let msg = |content: Value| {
+        SessionMessage::Custom(CustomRoleMessage {
+            custom_type: "demo".to_string(),
+            content,
+            display: true,
+            details: None,
+            timestamp: 0,
+        })
+    };
+    app.replay_session_with_extensions(
+        &[msg(json!("s")), msg(json!("a much longer payload than the first one"))],
+        &host,
+    )
+    .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    let sizes: Vec<usize> = sb
+        .lines()
+        .filter_map(|l| l.split("payload-bytes=").nth(1))
+        .filter_map(|n| n.trim().parse::<usize>().ok())
+        .collect();
+    assert_eq!(sizes.len(), 2, "both messages rendered:\n{sb}");
+    assert!(sizes[0] < sizes[1], "each got ITS OWN payload, in order: {sizes:?}\n{sb}");
+}
+
+// =============================================================================================
+// X15 — the custom-ENTRY surface. Upstream's `addCustomEntryToChat`
+// (`interactive-mode.ts:3431-3450`) is the ONLY constructor of `CustomEntryComponent`, and
+// `CustomEntryComponent.rebuild` (`custom-entry.ts:40-60`) is the ONLY place in `pi/packages` that
+// draws `renderer failed` (`:50`). Its three outcomes draw three different things, and cyrup
+// collapsed two of them: `render_via` reported a faulting renderer as `None`, which is also "no
+// renderer registered", so `Rendered::Failed` had no producer anywhere in `crates/`.
+// =============================================================================================
+
+/// Registers ENTRY renderers only: `card` draws, `boom` panics (upstream's `throw`).
+struct EntryRendererExt;
+
+#[async_trait::async_trait]
+impl NativeExtension for EntryRendererExt {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("entry-demo")
+    }
+
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.register_entry_renderer("card");
+        api.register_entry_renderer("boom");
+        Ok(())
+    }
+
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+
+    fn render_entry(&self, custom_type: &str, entry: &Value) -> Option<Value> {
+        match custom_type {
+            "card" => {
+                Some(Value::String(format!("ENTRYCARD payload-bytes={}", weigh(entry))))
+            }
+            "boom" => panic!("entry renderer exploded"),
+            _ => None,
+        }
+    }
+}
+
+async fn host_with_entry_renderer() -> Arc<ExtensionHost> {
+    let host = Arc::new(ExtensionHost::new(HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: std::path::PathBuf::from("."),
+    }));
+    host.load_native(Arc::new(EntryRendererExt)).await.unwrap();
+    host
+}
+
+/// The persisted shape `LiveHostServices::append_entry` puts on the wire: the serde tag is
+/// `"custom"` and the renderer key lives in `customType` (`cyrup-session`'s `KnownEntry::Custom`,
+/// `#[serde(tag = "type", rename_all_fields = "camelCase")]`). Upstream reads exactly this field
+/// (`getEntryRenderer(entry.customType)`, `interactive-mode.ts:3432`).
+fn entry_event(custom_type: &str) -> AgentSessionEvent {
+    AgentSessionEvent::EntryAppended {
+        entry: json!({
+            "type": "custom",
+            "id": "e1",
+            "parentId": Value::Null,
+            "timestamp": "1970-01-01T00:00:00.000Z",
+            "customType": custom_type,
+            "data": { "k": "v" },
+        }),
+    }
+}
+
+/// THE REGRESSION, end to end. A panicking ENTRY renderer draws Pi's failure box
+/// (`custom-entry.ts:47-52`): `[${customType}] renderer failed: ${message}`. Before X15 the fault
+/// arrived as `None` and this drew the plain "entry appended" receipt instead — indistinguishable
+/// from an entry nobody renders.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_entry_renderer_draws_the_failure_box() {
+    let host = host_with_entry_renderer().await;
+    let mut app = app();
+
+    app.ingest_event_with_extensions(&entry_event("boom"), &host).await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        sb.contains("[boom] renderer failed: entry renderer exploded"),
+        "`custom-entry.ts:50` verbatim — label, the words `renderer failed`, and the throw's own \
+         message:\n{sb}"
+    );
+    assert!(
+        !sb.contains("entry appended"),
+        "the failure box REPLACES the receipt; a faulting renderer must not read as an \
+         unrendered entry:\n{sb}"
+    );
+}
+
+/// The success arm, so the failure box cannot be satisfied by drawing a box for everything:
+/// a renderer that returns a component draws its output (`custom-entry.ts:58-60`) and no failure
+/// text at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_working_entry_renderer_draws_its_own_output_and_no_failure_box() {
+    let host = host_with_entry_renderer().await;
+    let mut app = app();
+
+    app.ingest_event_with_extensions(&entry_event("card"), &host).await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(sb.contains("ENTRYCARD payload-bytes="), "the extension's own output drew:\n{sb}");
+    assert!(!sb.contains("renderer failed"), "a working renderer draws no failure box:\n{sb}");
+    assert!(!sb.contains("entry appended"), "and no receipt either:\n{sb}");
+}
+
+/// The OTHER half of the regression: an entry type NO extension claims must NOT draw the failure
+/// box. Upstream draws nothing at all for it (`if (!renderer) { return; }`,
+/// `interactive-mode.ts:3433-3435`); cyrup keeps its one-line receipt (a documented delta), and the
+/// point of the assertion is that "absent" and "faulted" produce DIFFERENT output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_entry_type_never_draws_the_failure_box() {
+    let host = host_with_entry_renderer().await;
+    let mut app = app();
+
+    app.ingest_event_with_extensions(&entry_event("nobody-renders-this"), &host).await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        !sb.contains("renderer failed"),
+        "no renderer ran, so nothing threw — this is `RenderOutcome::None`, not `Failed`:\n{sb}"
+    );
+    assert!(
+        sb.contains("entry appended → nobody-renders-this"),
+        "the receipt names the entry's `customType`, not the serde tag `custom`:\n{sb}"
+    );
+}
+
+/// An extension that registered a MESSAGE renderer for a type must not have it invoked for an
+/// ENTRY of the same type (upstream keeps `messageRenderers`/`entryRenderers` disjoint,
+/// `types.ts:1703-1704`), and the message surface keeps its own upstream behaviour: a custom
+/// MESSAGE whose renderer throws falls through to the default box
+/// (`custom-message.ts:82-84`) rather than drawing a failure box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_faulting_message_renderer_still_falls_through_to_the_default_box() {
+    struct ThrowingMessageExt;
+
+    #[async_trait::async_trait]
+    impl NativeExtension for ThrowingMessageExt {
+        fn id(&self) -> ExtensionId {
+            ExtensionId::from("throwing-message")
+        }
+        async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+            api.register_message_renderer("demo");
+            Ok(())
+        }
+        async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+            HookOutcome::Noop
+        }
+        fn render_call(&self, _key: &str, _call: &Value) -> Option<Value> {
+            panic!("message renderer exploded")
+        }
+    }
+
+    let host = Arc::new(ExtensionHost::new(HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: std::path::PathBuf::from("."),
+    }));
+    host.load_native(Arc::new(ThrowingMessageExt)).await.unwrap();
+
+    let mut app = app();
+    let ev = AgentSessionEvent::MessageEnd {
+        message: AgentMessage::Custom {
+            kind: "demo".into(),
+            payload: json!("plain fallback body"),
+            timestamp: None,
+        },
+    };
+    app.ingest_event_with_extensions(&ev, &host).await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        sb.contains("plain fallback body"),
+        "`custom-message.ts:82-84` falls through to default rendering — the default box drew:\n{sb}"
+    );
+    assert!(
+        !sb.contains("renderer failed"),
+        "the failure box belongs to the ENTRY surface ONLY; drawing it here would be a \
+         divergence from `custom-message.ts:82-84`:\n{sb}"
+    );
+}

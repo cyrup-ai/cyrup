@@ -86,10 +86,15 @@ fn models_keymap_merges_app_models_ids_only() {
 #[test]
 fn key_label_round_trips_through_parse() {
     assert_eq!(Key::parse("ctrl+c").unwrap().label(), "ctrl+c");
-    assert_eq!(Key::parse("esc").unwrap().label(), "esc");
+    // Both spellings PARSE, but the label is the one upstream uses in its binding table and prints
+    // verbatim in every hint: `"app.interrupt": { defaultKeys: "escape" }` (v0.84.1
+    // `coding-agent/src/core/keybindings.ts:66`), `"tui.select.cancel": { defaultKeys: ["escape",
+    // "ctrl+c"] }` (`tui/src/keybindings.ts:149-152`).
+    assert_eq!(Key::parse("esc").unwrap().label(), "escape");
+    assert_eq!(Key::parse("escape").unwrap().label(), "escape");
     assert_eq!(Key::parse("shift+tab").unwrap().label(), "shift+tab");
-    // The default interrupt key surfaces as the `esc` cancel hint (spec/tui/01 §6.1).
-    assert_eq!(Keymap::default().key_label(Action::Interrupt).as_deref(), Some("esc"));
+    // The default interrupt key surfaces as the `escape` cancel hint (spec/tui/01 §6.1).
+    assert_eq!(Keymap::default().key_label(Action::Interrupt).as_deref(), Some("escape"));
 }
 
 #[test]

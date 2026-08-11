@@ -121,12 +121,6 @@
   "provider": "groq",
   "baseUrl": "https://api.groq.com/openai/v1",
   "reasoning": true,
-  "thinkingLevelMap": {
-   "minimal": null,
-   "low": null,
-   "medium": null,
-   "high": "default"
-  },
   "input": [
    "text"
   ],

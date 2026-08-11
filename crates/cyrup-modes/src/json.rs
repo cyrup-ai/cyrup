@@ -2,7 +2,23 @@
 //!
 //! Runs the same one-shot processing as PRINT mode, but instead of the final text it serializes
 //! every [`AgentSessionEvent`] as one JSON object per line to the caller-supplied sink — the stable
-//! machine-readable event stream external tools parse. One schema serves json and rpc.
+//! machine-readable event stream external tools parse. One schema serves json and rpc: both write
+//! the [`crate::JsonAgentSessionEvent`] projection, never the raw event (Pi `toJsonEvent`,
+//! json-event.ts:28; applied at print-mode.ts:110 for json mode and rpc-mode.ts:356 for rpc).
+//!
+//! # Backpressure
+//!
+//! Pi pairs the v0.84.1 projection with `waitForRawStdoutBackpressure` (print-mode.ts:11,113-118),
+//! subscribed on the AGENT. That exists because Pi's `writeRawStdout` is fire-and-forget — it chains
+//! onto a promise tail and does not await it (`output-guard.ts:85-93`), so a slow stdout would
+//! otherwise buffer without bound; `waitForRawStdoutBackpressure` (`:95-103`) drains that tail.
+//!
+//! cyrup needs no analog and one is deliberately NOT added: the loop below writes through a blocking
+//! [`std::io::Write`] and flushes each line, so the write itself is the await, and the event stream
+//! feeding it is the seam's awaited bounded-1024 fan-out (`cyrup-session-svc/src/subscriber.rs:23`,
+//! `:63-73` — "awaited (backpressure → slows the agent, never drops)"). A stalled consumer therefore
+//! already stalls the agent, which is exactly the invariant Pi's agent subscription restores. Adding
+//! a drain here would be a no-op over an already-drained sink.
 
 use std::io::Write;
 
@@ -57,7 +73,10 @@ pub async fn run_json<W: Write>(
         let session = runtime.session().await;
         let mut stream = session.prompt(input).await?;
         while let Some(ev) = stream.next().await {
-            let line = serde_json::to_string(&ev)?;
+            // Pi print-mode.ts:110 — `writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`)`.
+            // The projection (never the raw event) is what goes on the wire; see
+            // [`crate::to_json_event`] for what it drops and why.
+            let line = serde_json::to_string(&crate::to_json_event(&ev))?;
             writeln!(out, "{line}")?;
             out.flush()?;
         }

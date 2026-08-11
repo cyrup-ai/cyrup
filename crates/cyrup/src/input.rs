@@ -550,7 +550,29 @@ pub fn compose_inputs(
     }
 }
 
+/// The value Pi's `readPipedStdin` resolves with: `data.trim() || undefined` (main.ts:80).
+///
+/// **The trim is load-bearing, not cosmetic.** [`compose_inputs`] joins its parts with `""` because
+/// Pi's `buildInitialMessage` does (initial-message.ts:40) — and Pi can use an empty separator
+/// precisely because the stdin half arrived already trimmed. cyrup used to test `buf.trim()` for
+/// emptiness but return the UNTRIMMED `buf`, so `echo context | cyrup "summarise this"` sent
+/// `"context\nsummarise this"` where Pi sends `"contextsummarise this"` — a divergence in the
+/// literal prompt bytes handed to the model, with leading whitespace surviving at the front too.
+///
+/// Split out of [`read_piped_stdin`] so the byte-level contract is testable without a real pipe;
+/// the read itself contributes nothing but the string.
+fn normalize_piped_stdin(buf: &str) -> Option<String> {
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Read piped stdin to a string when stdin is not a TTY (R-11-006); `None` when interactive or empty.
+/// The text is trimmed before it reaches the prompt (Pi `data.trim() || undefined`, main.ts:80) —
+/// see [`normalize_piped_stdin`].
 async fn read_piped_stdin() -> anyhow::Result<Option<String>> {
     if std::io::stdin().is_terminal() {
         return Ok(None);
@@ -560,11 +582,7 @@ async fn read_piped_stdin() -> anyhow::Result<Option<String>> {
         .read_to_string(&mut buf)
         .await
         .context("reading piped stdin")?;
-    if buf.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(buf))
-    }
+    Ok(normalize_piped_stdin(&buf))
 }
 
 /// Build the prompt inputs from the CLI: split positionals, process `@file` text + images, merge

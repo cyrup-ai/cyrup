@@ -231,12 +231,16 @@ mod tests {
             name: Some("subagent-chat-019ecaf6".to_string()),
             cwd: "/Users/envvar/.config/ghostty".to_string(),
             model: "bsy-deepseek-v4-pro".to_string(),
-            pid: 1,
-            started_at: 0,
-            last_activity: 0,
+            pid: 1u32.into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
             status: None,
             peer_uid: None,
             trusted_local: None,
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         }
     }
 
@@ -335,10 +339,11 @@ mod tests {
             name: None,
             cwd: cwd.to_string(),
             model: "test-model".to_string(),
-            pid: std::process::id(),
-            started_at: 0,
-            last_activity: 0,
+            pid: std::process::id().into(),
+            started_at: 0u64.into(),
+            last_activity: 0u64.into(),
             status: None,
+            extra: Default::default(),
         }
     }
 

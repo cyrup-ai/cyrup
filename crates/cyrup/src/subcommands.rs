@@ -23,7 +23,7 @@ use cyrup_resources::{
 use cyrup_sdk::core::{CancelToken, PackageId};
 use cyrup_tui::{
     run_startup_selector, ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle,
-    SelectKeymap, UiTheme,
+    ConfigWriteScope, ProjectOverrideState, SelectKeymap, UiTheme,
 };
 
 /// The recognized subcommand verbs (Pi: `install`/`remove`/`update`/`list` + `uninstall` alias +
@@ -353,7 +353,16 @@ pub async fn dispatch(
         let trusted = trust_override(argv)
             .or(cli_trust_override)
             .unwrap_or_else(|| saved_trusted(dirs));
-        return Ok(Some(run_config(dirs, trusted).await?));
+        // `-l` / `--local` opens the editor in PROJECT write scope (Pi `handleConfigCommand`,
+        // package-manager-cli.ts:622-624,670) — the flag is the whole user-facing route to
+        // `ConfigWriteScope::Project`, and upstream refuses it in an untrusted folder
+        // (`:650-654`).
+        let local = config_local_flag(argv);
+        if local && !trusted {
+            eprintln!("Project is not trusted. Use --approve to modify local resource config.");
+            return Ok(Some(1));
+        }
+        return Ok(Some(run_config(dirs, trusted, local).await?));
     }
 
     let Some(opts) = parse_package_command(argv) else {
@@ -578,7 +587,7 @@ async fn run_update(
 /// Package-tier resource toggling (Pi `togglePackageResource`) is out of this bin's crate scope — it
 /// needs the installed-package → live-session wiring (`DiscoveryConfig.installed`, gap-07 §1) and
 /// `PackageManager::set_enabled`, both in `cyrup-resources`/`cyrup-session-svc`.
-async fn run_config(dirs: &ConfigDirs, trusted: bool) -> Result<i32> {
+async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32> {
     let settings = SettingsManager::load(crate::file_settings_store(dirs), Settings::new(), trusted);
     let rows = resolve_config_rows(dirs, &settings, trusted).await?;
 
@@ -595,9 +604,44 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool) -> Result<i32> {
         arrays.insert((ConfigScope::Project, kind), settings_array(settings.project(), kind));
     }
 
+    // `globalResolvedPaths` (`package-manager-cli.ts:655-660`): the SAME resolve run against a
+    // settings manager with `projectTrusted: false`, i.e. the set a project would inherit. Its keys
+    // are `inheritedEnabledByKey` (`config-selector.ts:262`), the second arm of
+    // `isInheritedGlobalItem` (`:781-783`). Skipped when the project is untrusted, because then the
+    // two resolves are the same object upstream (`:661-663`).
+    let inherited_keys: Vec<String> = if trusted {
+        let global_settings =
+            SettingsManager::load(crate::file_settings_store(dirs), Settings::new(), false);
+        resolve_config_rows(dirs, &global_settings, false)
+            .await?
+            .iter()
+            .map(ConfigSelector::resource_key)
+            .collect()
+    } else {
+        rows.iter().map(ConfigSelector::resource_key).collect()
+    };
+
     let theme = UiTheme::default();
     let keymap = SelectKeymap::default();
+    // `getProjectOverrideState` for a top-level resource (`config-selector.ts:741-746`):
+    // `getOverrideStateFromEntries(projectSettings[resourceType], patterns, false)` — scan the
+    // PROJECT array for an entry naming this resource and read its marker, `!`/`-` ⇒ unload, else
+    // load; no entry ⇒ inherit (`:759-772`).
+    let override_states = config_override_states(&rows, &arrays);
+
     let mut selector = ConfigSelector::new(rows);
+    // `writeScope: local ? "project" : "global"` and
+    // `projectModeAvailable: settingsManager.isProjectTrusted()` (`package-manager-cli.ts:670-671`).
+    // `projectModeAvailable` is what arms `Tab` and shows the `tab switch mode` hint
+    // (`config-selector.ts:205,920-925`).
+    if local {
+        selector.set_write_scope(ConfigWriteScope::Project);
+    }
+    selector.set_project_mode_available(trusted);
+    selector.set_inherited_global_keys(inherited_keys);
+    for (i, state) in override_states.into_iter().enumerate() {
+        selector.set_override_state(i, state);
+    }
     let mut persist_err: Option<String> = None;
     run_startup_selector(&theme, &keymap, &mut selector, |payload| {
         let Some(toggle) = ConfigToggle::from_payload(payload) else {
@@ -638,6 +682,43 @@ fn settings_array(layer: &Settings, kind: ConfigKind) -> Vec<String> {
         ConfigKind::Prompts => layer.prompt_template_paths(),
         ConfigKind::Themes => layer.theme_paths(),
     }
+}
+
+/// `-l` / `--local`, the flag that opens `cyrup config` in PROJECT write scope (Pi
+/// `handleConfigCommand`, package-manager-cli.ts:622-624 → `writeScope: local ? "project" :
+/// "global"` at `:670`). The ONLY user-facing route to [`ConfigWriteScope::Project`].
+fn config_local_flag(argv: &[String]) -> bool {
+    argv.iter().any(|a| a == "-l" || a == "--local")
+}
+
+/// `getProjectOverrideState` for a top-level resource (Pi config-selector.ts:741-746 →
+/// `getOverrideStateFromEntries`, `:759-772`): scan the **project** settings array for the
+/// resource's `resourceType` and find the entries naming this resource; a `!`/`-` marker is an
+/// unload, anything else a load, and no entry at all is inherit. Upstream's loop assigns rather
+/// than breaks (`:766-770`), so the LAST matching entry wins.
+///
+/// `emptyArrayIsUnload` is upstream's `false` here — that arm is the package tier (`:755`), which
+/// this editor does not manage.
+fn config_override_states(
+    rows: &[ConfigRow],
+    arrays: &HashMap<(ConfigScope, ConfigKind), Vec<String>>,
+) -> Vec<ProjectOverrideState> {
+    rows.iter()
+        .map(|row| {
+            arrays
+                .get(&(ConfigScope::Project, row.kind))
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .filter(|e| strip_override_marker(e) == row.pattern)
+                .map(|e| match e.as_bytes().first() {
+                    Some(b'!' | b'-') => ProjectOverrideState::Unload,
+                    _ => ProjectOverrideState::Load,
+                })
+                .next_back()
+                .unwrap_or(ProjectOverrideState::Inherit)
+        })
+        .collect()
 }
 
 /// Strip one leading `!`/`+`/`-` override marker (Pi's `p.slice(1)` for a marked pattern,
@@ -959,6 +1040,83 @@ mod tests {
         assert!(render_command_help(PackageCommand::Install).contains("Install a package"));
         assert!(render_command_help(PackageCommand::Update).contains("--extension <source>"));
         assert!(usage(PackageCommand::Install).contains("install <source>"));
+    }
+
+    #[test]
+    fn config_local_flag_is_the_only_route_to_project_write_scope() {
+        // Pi `handleConfigCommand` (package-manager-cli.ts:622-624): both spellings, and nothing
+        // else. `cyrup config` alone stays in global scope, which is upstream's default (`:670`).
+        assert!(config_local_flag(&v(&["config", "--local"])));
+        assert!(config_local_flag(&v(&["config", "-l"])));
+        assert!(!config_local_flag(&v(&["config"])));
+        assert!(!config_local_flag(&v(&["config", "--approve"])));
+    }
+
+    /// `getProjectOverrideState` → `getOverrideStateFromEntries` (config-selector.ts:741-772): the
+    /// `+`/`-` entries already in the PROJECT settings array are what the `[+]`/`[-]` checkboxes
+    /// and the `  project load` / `  project unload` suffixes report. Before this wiring the
+    /// selector's override vector was all-`Inherit` in the product, so project scope drew
+    /// identically to global no matter what the settings file said.
+    #[test]
+    fn config_override_states_read_the_project_settings_arrays() {
+        let row = |kind: ConfigKind, pattern: &str| ConfigRow {
+            scope: ConfigScope::Project,
+            kind,
+            display_name: pattern.to_string(),
+            pattern: pattern.to_string(),
+            base_dir: "/repo/.cyrup/".to_string(),
+            enabled: true,
+        };
+        let rows = vec![
+            row(ConfigKind::Skills, "skills/a/SKILL.md"),
+            row(ConfigKind::Skills, "skills/b/SKILL.md"),
+            row(ConfigKind::Skills, "skills/c/SKILL.md"),
+            row(ConfigKind::Prompts, "prompts/p.md"),
+        ];
+        let mut arrays: HashMap<(ConfigScope, ConfigKind), Vec<String>> = HashMap::new();
+        arrays.insert(
+            (ConfigScope::Project, ConfigKind::Skills),
+            vec![
+                "+skills/a/SKILL.md".to_string(),
+                "-skills/b/SKILL.md".to_string(),
+                // `!` is the third marker `strip_override_marker` accepts (`:838-840`).
+                "!skills/c/SKILL.md".to_string(),
+            ],
+        );
+        // The GLOBAL array must not leak into the project override state (`:743` reads
+        // `getProjectSettings()`).
+        arrays.insert(
+            (ConfigScope::User, ConfigKind::Prompts),
+            vec!["+prompts/p.md".to_string()],
+        );
+        assert_eq!(
+            config_override_states(&rows, &arrays),
+            vec![
+                ProjectOverrideState::Load,
+                ProjectOverrideState::Unload,
+                ProjectOverrideState::Unload,
+                ProjectOverrideState::Inherit,
+            ]
+        );
+    }
+
+    #[test]
+    fn config_override_states_take_the_last_matching_entry() {
+        // `:765-770` assigns instead of breaking, so a later entry supersedes an earlier one.
+        let rows = vec![ConfigRow {
+            scope: ConfigScope::Project,
+            kind: ConfigKind::Skills,
+            display_name: "a".to_string(),
+            pattern: "skills/a/SKILL.md".to_string(),
+            base_dir: "/repo/.cyrup/".to_string(),
+            enabled: true,
+        }];
+        let mut arrays: HashMap<(ConfigScope, ConfigKind), Vec<String>> = HashMap::new();
+        arrays.insert(
+            (ConfigScope::Project, ConfigKind::Skills),
+            vec!["-skills/a/SKILL.md".to_string(), "+skills/a/SKILL.md".to_string()],
+        );
+        assert_eq!(config_override_states(&rows, &arrays), vec![ProjectOverrideState::Load]);
     }
 
     #[test]

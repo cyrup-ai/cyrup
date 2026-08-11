@@ -7,23 +7,31 @@
 //! `permission-manager.ts:670-681`) falls back to the `ask` policy with a warning; this module only
 //! surfaces the error string.
 
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::ordered::OrderedValue;
 
-/// Parse a JSONC document into a `Value` (pi `parseJsoncConfig`). Comments and one trailing comma
-/// per array/object are stripped first; the remainder must be valid JSON. Order is NOT preserved —
-/// use [`parse_ordered`] for policy files whose pattern-key order is load-bearing.
-pub fn parse(input: &str) -> Result<Value, String> {
+/// Parse a JSONC document into any `Deserialize` target. Comments and one trailing comma per
+/// array/object are stripped first; the remainder must be valid JSON. The concrete-type wrappers
+/// below ([`parse`], [`parse_ordered`]) exist for the two long-standing call sites; the save path
+/// (`ext_config::ExtensionConfig::save`) deserializes its own lossless order-preserving document
+/// type through this.
+pub fn parse_into<T: DeserializeOwned>(input: &str) -> Result<T, String> {
     let cleaned = strip_comments_and_trailing_commas(input);
     serde_json::from_str(&cleaned).map_err(|e| e.to_string())
+}
+
+/// Parse a JSONC document into a `Value` (pi `parseJsoncConfig`). Order is NOT preserved — use
+/// [`parse_ordered`] for policy files whose pattern-key order is load-bearing.
+pub fn parse(input: &str) -> Result<Value, String> {
+    parse_into(input)
 }
 
 /// Parse a JSONC document into an order-preserving [`OrderedValue`] (the policy-file path: pattern
 /// key order within a category drives last-match-wins).
 pub fn parse_ordered(input: &str) -> Result<OrderedValue, String> {
-    let cleaned = strip_comments_and_trailing_commas(input);
-    serde_json::from_str(&cleaned).map_err(|e| e.to_string())
+    parse_into(input)
 }
 
 /// Parse a JSONC document exactly like pi's `parseJsoncConfig(input, filePath, subject)`
@@ -38,7 +46,7 @@ pub fn parse_ordered(input: &str) -> Result<OrderedValue, String> {
 /// of bare [`parse`]/[`parse_ordered`] wherever the caller can surface the error to a user, so the
 /// warning text mirrors pi's.
 pub fn parse_config(input: &str, file_path: &str, subject: &str) -> Result<Value, String> {
-    parse(input).map_err(|err| format_parse_error(subject, file_path, &err))
+    parse_config_into(input, file_path, subject)
 }
 
 /// Order-preserving counterpart of [`parse_config`]; see its docs for the error-format contract.
@@ -47,7 +55,16 @@ pub fn parse_ordered_config(
     file_path: &str,
     subject: &str,
 ) -> Result<OrderedValue, String> {
-    parse_ordered(input).map_err(|err| format_parse_error(subject, file_path, &err))
+    parse_config_into(input, file_path, subject)
+}
+
+/// Generic counterpart of [`parse_config`]: same pi-shaped error wrapper, any `Deserialize` target.
+pub fn parse_config_into<T: DeserializeOwned>(
+    input: &str,
+    file_path: &str,
+    subject: &str,
+) -> Result<T, String> {
+    parse_into(input).map_err(|err| format_parse_error(subject, file_path, &err))
 }
 
 /// Format a parse failure exactly like pi's `Failed to parse ${subject} at '${filePath}' (...)`

@@ -107,7 +107,6 @@ async fn ext_with_counting_channel(
     let prompts = Arc::new(AtomicUsize::new(0));
     let ext = PermissionSystemExtension::from_parts(
         paths,
-        agent_dir.join("cyrup-permission-system-approvals.json"),
         ExtensionConfig::default(),
         Arc::new(CountingOnceChannel { prompts: Arc::clone(&prompts) }),
     );

@@ -14,6 +14,7 @@
 
 pub mod ratelimit;
 pub mod routing;
+pub mod runtime_claim;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -29,8 +30,8 @@ use crate::config;
 use crate::paths;
 use crate::transport::framing::{FrameReader, encode_json};
 use crate::transport::protocol::{
-    BrokerMessage, HealthMessage, Message, PROTOCOL_NAME, PROTOCOL_VERSION, SessionInfo,
-    SessionRegistration, now_ms,
+    BrokerMessage, ExtensionCapability, HealthMessage, Message, MessageReceipt, PROTOCOL_NAME,
+    PROTOCOL_VERSION, SessionInfo, SessionRegistration, now_ms,
 };
 use ratelimit::TokenBucket;
 use routing::{AskEdge, find_session_ids};
@@ -47,6 +48,120 @@ const PRESENCE_HEARTBEAT_MS: u64 = 1000;
 const SHUTDOWN_DELAY_MS: u64 = 5000;
 /// Reader read-buffer size (implementation detail; framing reassembles across chunk boundaries).
 const READ_BUF: usize = 16 * 1024;
+/// `MAX_EXTENSIONS_PER_SESSION = 32` (`v0.9.2 broker/broker.ts:35`).
+const MAX_EXTENSIONS_PER_SESSION: usize = 32;
+
+/// pi's `extensions` field guard, shared verbatim by `case "register"`
+/// (`v0.9.2 broker/broker.ts:446-456`) and `case "extension_capabilities_update"`
+/// (`v0.9.2 broker/broker.ts:559-567`): the value must be an ARRAY of at most
+/// [`MAX_EXTENSIONS_PER_SESSION`] entries, each passing `validateExtensionCapability`
+/// (`v0.9.2 broker/broker.ts:1159-1168`). Anything else `throw`s, i.e. destroys the socket.
+///
+/// The per-entry decode into [`ExtensionCapability`] reproduces upstream's
+/// `typeof c.namespace !== "string" || typeof c.ownerEligible !== "boolean"` check *and* its
+/// rejection of an array-shaped entry (`[]["namespace"]` is `undefined`), the latter because that
+/// struct is `[MAP-ONLY]` — see `crate::transport::protocol`.
+fn extensions_field_is_valid(extensions: &serde_json::Value) -> bool {
+    let Some(items) = extensions.as_array() else {
+        return false;
+    };
+    if items.len() > MAX_EXTENSIONS_PER_SESSION {
+        return false;
+    }
+    items.iter().all(|item| {
+        serde_json::from_value::<ExtensionCapability>(item.clone())
+            .is_ok_and(|cap| namespace_is_valid(&cap.namespace))
+    })
+}
+
+/// `validateNamespace` (`v0.9.2 broker/broker.ts:1170-1182`): `^[a-z0-9][a-z0-9._/-]{0,63}$`, with
+/// the length bound checked first.
+///
+/// [CYRUP-DELTA] pi's `ns.length` counts UTF-16 code units and this counts `char`s; the two can
+/// disagree only for non-ASCII input, which the character test rejects on both sides anyway, so the
+/// accepted set is identical.
+fn namespace_is_valid(ns: &str) -> bool {
+    if ns.is_empty() || ns.chars().count() > 64 {
+        return false;
+    }
+    let mut chars = ns.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '/' | '-'))
+}
+
+/// `String(msg.namespace || "")` — the expression pi echoes into the two `extension_state_result`
+/// frames it emits *before* `namespace` has been type-checked
+/// (`v0.9.2 broker/broker.ts:1371` and `:1382`). Those are the only two places in the protocol
+/// where an arbitrary untyped JSON value is coerced to a string, so the JS coercion is reproduced
+/// here rather than approximated: the field is echoed back to a peer that may be matching on it.
+///
+/// `||` short-circuits on every JS falsy value, so `undefined`/`null`/`false`/`0`/`""` all yield
+/// `""`; anything else goes through `ToString`.
+///
+/// [CYRUP-DELTA] Number formatting agrees with JS for every integral value under `1e21` and for
+/// the shortest-round-trip decimals both runtimes emit, but not for JS's exponent notation
+/// (`String(1e21)` is `"1e+21"` upstream and `1e21` here). JSON cannot carry `NaN`/`Infinity` at
+/// all, so those cases are unreachable rather than divergent.
+fn js_string_or_empty(v: Option<&serde_json::Value>) -> String {
+    match v {
+        None => String::new(),
+        Some(v) if js_is_falsy(v) => String::new(),
+        Some(v) => js_to_string(v),
+    }
+}
+
+/// JS falsiness for the JSON value subset (`undefined` is the `None` arm of the caller).
+fn js_is_falsy(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(b) => !b,
+        serde_json::Value::Number(n) => n.as_f64() == Some(0.0),
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => false,
+    }
+}
+
+/// JS `ToString` for the JSON value subset. Arrays go through `Array.prototype.join(",")`, which
+/// renders `null` elements as the empty string and recurses into nested arrays; every plain object
+/// stringifies to `"[object Object]"`.
+fn js_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => js_number_to_string(n),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|it| match it {
+                serde_json::Value::Null => String::new(),
+                other => js_to_string(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        serde_json::Value::Object(_) => "[object Object]".to_string(),
+    }
+}
+
+/// JS `Number::toString`. `1.0` is the integer `1` upstream, so an integral `f64` is printed
+/// without its fractional part; everything else falls back to serde's shortest round-trip form,
+/// which matches JS across the ordinary decimal range.
+fn js_number_to_string(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() {
+        return i.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return u.to_string();
+    }
+    match n.as_f64() {
+        Some(f) if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e21 => format!("{f:.0}"),
+        _ => n.to_string(),
+    }
+}
 
 /// One registered session + a handle to write to its socket (`broker.ts:32-36`).
 struct ConnectedSession {
@@ -292,8 +407,203 @@ impl BrokerState {
             "send" => self.handle_send(conn_id, self_tx, value, session_id, now),
             "cancel_ask" => self.handle_cancel_ask(conn_id, value, session_id),
             "presence" => self.handle_presence(conn_id, value, session_id, now),
+            "message_receipt" => Self::handle_message_receipt(value),
+            "cancel_message" => Self::handle_cancel_message(self_tx, value),
+            // Extension-bus frames (`v0.9.2 broker/broker.ts:551-585,961-969`). cyrup does not
+            // implement the bus, so it never advertises `EXTENSION_BUS_FEATURE` on `registered` —
+            // which is exactly what stops a conforming pi client from sending these
+            // (`supportsFeature` gate, `v0.9.2 broker/client.ts:648,817-819`). A NON-conforming
+            // peer can still send them over a socket every process on the box can reach, so each
+            // handler ports pi's own validation prefix and pi's own miss branch. The bus EFFECTS
+            // stay unported; nothing below needs them.
+            "extension_publish" => self.handle_extension_publish(conn_id, self_tx, session_id),
+            "extension_state_commit" => {
+                self.handle_extension_state_commit(conn_id, self_tx, value, session_id)
+            }
+            "extension_capabilities_update" => {
+                self.handle_extension_capabilities_update(conn_id, value, session_id)
+            }
+            // Genuinely unknown tags stay fatal — that is pi's own behaviour
+            // (`default: throw new Error(\`Unknown client message type\`)`,
+            // `v0.9.2 broker/broker.ts:971-972`, routed to `socket.destroy(error)` by
+            // `framing.ts:44-51` + `broker.ts:321-323`). Forward compatibility upstream comes from
+            // additive FIELDS and feature negotiation, never from accepting unknown tags.
             _ => FrameResult::protocol_error(),
         }
+    }
+
+    /// `case "message_receipt"` (`v0.9.2 broker/broker.ts:801-820`).
+    ///
+    /// pi validates the receipt with `isMessageReceipt()` — a bad one THROWS, i.e. destroys the
+    /// connection — then looks the message up in `messageReceiptRoutes` and forwards the receipt to
+    /// the original sender only if the route says this session was the receiver.
+    ///
+    /// cyrup has no `messageReceiptRoutes` table yet (it is populated at
+    /// `v0.9.2 broker/broker.ts:698`, alongside the message-lifecycle work this crate has not
+    /// ported), so every lookup misses and pi's own `route === undefined` branch applies: validate,
+    /// then fall through the `if` and `break` without writing anything. Shape validation is kept
+    /// because dropping it would make cyrup LOOSER than pi on a frame arriving over a socket other
+    /// sessions can reach.
+    fn handle_message_receipt(value: &serde_json::Value) -> FrameResult {
+        let Some(receipt) = value.get("receipt") else {
+            return FrameResult::protocol_error();
+        };
+        if serde_json::from_value::<MessageReceipt>(receipt.clone()).is_err() {
+            // `throw new Error("Invalid message_receipt message")` (`v0.9.2 broker/broker.ts:807`).
+            return FrameResult::protocol_error();
+        }
+        FrameResult::cont()
+    }
+
+    /// `case "extension_capabilities_update"` (`v0.9.2 broker/broker.ts:551-585`).
+    ///
+    /// cyrup does not implement the extension bus, so pi's *effects* — `session.extensions = …`,
+    /// `recomputeNamespaceOwners()`, and the `extension_owner`/`extension_state` replies
+    /// (`v0.9.2 broker/broker.ts:568-585`) — stay unported and the frame is ignored, exactly like
+    /// `extension_publish`/`extension_state_commit` above.
+    ///
+    /// pi's **validation prefix** (`v0.9.2 broker/broker.ts:559-567`) is ported, though, because it
+    /// runs before any of that and every one of its failures is a `throw` → `socket.destroy`
+    /// (`framing.ts:44-51`). Without it cyrup accepts an `extensions` payload pi kills the
+    /// connection over — including the array-shaped `[["ns", true]]`, which serde would otherwise
+    /// fill into [`ExtensionCapability`] positionally — on a socket every process on the box can
+    /// reach. Ignoring a *well-formed* frame is a survivability choice; ignoring a malformed one is
+    /// an input-validation hole.
+    ///
+    /// The "before register" throw at `:552-554` is covered by the shared pre-registration guard in
+    /// [`Self::handle_frame`]. The "session not found" throw at `:555-558` is ported below: pi's
+    /// `session.socket !== socket` is [`Self::session_owns_connection`] here, and it IS reachable —
+    /// an identity takeover (`handle_register`'s `close.notify_one()`) reassigns the id to the new
+    /// connection before the superseded reader task observes the notify, so a frame already in the
+    /// old socket's buffer arrives with a stale `conn_id`. Upstream destroys that connection; so
+    /// does this.
+    fn handle_extension_capabilities_update(
+        &self,
+        conn_id: u64,
+        value: &serde_json::Value,
+        session_id: &Option<String>,
+    ) -> FrameResult {
+        let Some(current_id) = session_id.as_deref() else {
+            return FrameResult::protocol_error();
+        };
+        // `throw new Error("Extension capability session not found")`
+        // (`v0.9.2 broker/broker.ts:556-558`) — fatal, unlike the two handlers below, which answer.
+        if !self.session_owns_connection(current_id, conn_id) {
+            return FrameResult::protocol_error();
+        }
+        // `!Array.isArray(undefined)` is true, so a missing field throws upstream too
+        // (`v0.9.2 broker/broker.ts:559-562`).
+        let extensions = value.get("extensions").unwrap_or(&serde_json::Value::Null);
+        if !extensions_field_is_valid(extensions) {
+            return FrameResult::protocol_error();
+        }
+        tracing::debug!(
+            "intercom broker: extension_capabilities_update ignored (bus not implemented)"
+        );
+        FrameResult::cont()
+    }
+
+    /// pi's `session.socket !== socket` guard (`v0.9.2 broker/broker.ts:556,1272,1368`), expressed
+    /// against cyrup's connection ids: the session must exist AND still be owned by the connection
+    /// the frame arrived on.
+    fn session_owns_connection(&self, session_id: &str, conn_id: u64) -> bool {
+        self.sessions.get(session_id).map(|s| s.conn_id) == Some(conn_id)
+    }
+
+    /// `case "extension_publish"` (`v0.9.2 broker/broker.ts:961-964`) → `handleExtensionPublish`
+    /// (`v0.9.2 broker/broker.ts:1262-1356`).
+    ///
+    /// cyrup does not implement the extension bus, which means it never records
+    /// `session.extensions` — pi's `case "extension_capabilities_update"` assignment at
+    /// `v0.9.2 broker/broker.ts:568` is exactly the effect this crate leaves unported. So
+    /// `!session.extensions?.length` (`:1277`) is **unconditionally true** here and pi's own
+    /// not-advertised miss branch is the whole handler: `error`
+    /// `"Session has not advertised extension capability"` (`:1278`). Everything past `:1281` —
+    /// the namespace / audience / payload-size checks and the fan-out — is unreachable while the
+    /// bus is unported, so porting it would be dead code guessing at state that cannot exist.
+    ///
+    /// Answering matters for the same reason it did for `cancel_message`: pi's client resolves an
+    /// extension publish only on a broker frame, so a silent drop strands the caller. Ignoring the
+    /// frame outright was also LOOSER than upstream, on a socket every process on the box can open.
+    fn handle_extension_publish(
+        &self,
+        conn_id: u64,
+        self_tx: &UnboundedSender<Vec<u8>>,
+        session_id: &Option<String>,
+    ) -> FrameResult {
+        let Some(current_id) = session_id.as_deref() else {
+            return FrameResult::protocol_error();
+        };
+        // `!session || session.socket !== socket` → `error: "Session not found"`, and NOT fatal
+        // (`v0.9.2 broker/broker.ts:1271-1275`).
+        let error = if self.session_owns_connection(current_id, conn_id) {
+            "Session has not advertised extension capability"
+        } else {
+            "Session not found"
+        };
+        send_msg(self_tx, &BrokerMessage::Error { error: error.to_string() });
+        FrameResult::cont()
+    }
+
+    /// `case "extension_state_commit"` (`v0.9.2 broker/broker.ts:966-969`) →
+    /// `handleExtensionStateCommit` (`v0.9.2 broker/broker.ts:1358-1495`).
+    ///
+    /// Same shape as [`Self::handle_extension_publish`], with pi's different refusal frame: every
+    /// exit from this handler writes an `extension_state_result`, so the two miss branches at
+    /// `v0.9.2 broker/broker.ts:1367-1388` are `committed: false`, `revision: 0` and a reason —
+    /// `"Session not found"` (`:1374`) or `"Session has not advertised extension capability"`
+    /// (`:1385`). With the bus unported the second is unconditional, exactly as above.
+    ///
+    /// Both branches echo `String(msg.namespace || "")` (`:1371`, `:1382`) — the raw, not-yet-
+    /// type-checked value — so [`js_string_or_empty`] reproduces that coercion rather than
+    /// requiring a string.
+    ///
+    /// A commit is a promise upstream; dropping it silently hangs the committer forever, which is
+    /// the same defect the `cancel_message` port already fixed.
+    fn handle_extension_state_commit(
+        &self,
+        conn_id: u64,
+        self_tx: &UnboundedSender<Vec<u8>>,
+        value: &serde_json::Value,
+        session_id: &Option<String>,
+    ) -> FrameResult {
+        let Some(current_id) = session_id.as_deref() else {
+            return FrameResult::protocol_error();
+        };
+        let reason = if self.session_owns_connection(current_id, conn_id) {
+            "Session has not advertised extension capability"
+        } else {
+            "Session not found"
+        };
+        send_msg(self_tx, &BrokerMessage::ExtensionStateResult {
+            namespace: js_string_or_empty(value.get("namespace")),
+            committed: false,
+            revision: 0,
+            reason: Some(reason.to_string()),
+        });
+        FrameResult::cont()
+    }
+
+    /// `case "cancel_message"` (`v0.9.2 broker/broker.ts:822-869`).
+    ///
+    /// A non-string `messageId` throws upstream (`:825-827`) and is fatal here for the same reason.
+    /// Past that, pi searches its mailbox and then `messageReceiptRoutes`; cyrup has neither table,
+    /// so both misses land on pi's `route?.from !== currentId` branch — `delivery_failed` with
+    /// pi's exact reason (`v0.9.2 broker/broker.ts:842-848`). Answering matters: pi's
+    /// `cancelMessage()` returns a promise settled only by `delivered`/`delivery_failed`
+    /// (`v0.9.2 broker/client.ts:738`), so a silent drop would hang the caller instead.
+    fn handle_cancel_message(
+        self_tx: &UnboundedSender<Vec<u8>>,
+        value: &serde_json::Value,
+    ) -> FrameResult {
+        let Some(message_id) = value.get("messageId").and_then(|v| v.as_str()) else {
+            return FrameResult::protocol_error();
+        };
+        send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+            message_id: message_id.to_string(),
+            reason: "Message cannot be cancelled by this session".to_string(),
+        });
+        FrameResult::cont()
     }
 
     fn handle_register(
@@ -323,6 +633,18 @@ impl BrokerState {
                 _ => return FrameResult::protocol_error(),
             },
         };
+        // `case "register"`'s extensions guard (`v0.9.2 broker/broker.ts:446-456`), in pi's own
+        // position — after the `sessionId` check, before `pruneDisconnectedSessions()`. Absent is
+        // legal (`extensions !== undefined`); present-but-invalid throws, i.e. `socket.destroy`.
+        // `SessionRegistration` does not model `extensions` (cyrup never advertises the bus), so the
+        // raw value comes out of its `#[serde(flatten)]` capture — the same place pi's
+        // `session.extensions` comes from, since pi does not model it on `SessionInfo` either
+        // (`v0.9.2 broker/broker.ts:472-490` puts it on `ConnectedSession`, not on `info`).
+        if let Some(extensions) = registration.extra.get("extensions")
+            && !extensions_field_is_valid(extensions)
+        {
+            return FrameResult::protocol_error();
+        }
 
         let previous_conn = self.sessions.get(&id).map(|s| s.conn_id);
         if previous_conn.is_none() && self.sessions.len() >= MAX_SESSIONS {
@@ -356,6 +678,10 @@ impl BrokerState {
             peer_uid: None,
             // trustedLocal = unix && !win — broker-owned, never from the payload (broker.ts:374).
             trusted_local: Some(cfg!(unix)),
+            context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            extra: Default::default(),
         };
         self.insert_session(id.clone(), ConnectedSession {
             conn_id,
@@ -366,7 +692,7 @@ impl BrokerState {
         // A register cancels any pending auto-shutdown (broker.ts:378-381).
         self.shutdown_gen = self.shutdown_gen.wrapping_add(1);
 
-        send_msg(self_tx, &BrokerMessage::Registered { session_id: id.clone() });
+        send_msg(self_tx, &BrokerMessage::Registered { session_id: id.clone(), features: None });
         self.broadcast(&BrokerMessage::SessionJoined { session: info }, Some(&id));
         FrameResult::cont()
     }
@@ -525,8 +851,17 @@ impl BrokerState {
         }
 
         // Deliver to the target, then (on a reply) delete the satisfied edge, then ack the sender.
+        //
+        // The delivered envelope is pi's `deliveredMessage` (`v0.9.2 broker/broker.ts:672-676`):
+        // the sender's message **spread verbatim**, with the two broker-owned timestamps stamped
+        // on top. `Message`'s `#[serde(flatten)] extra` is what makes the "verbatim" half true in
+        // Rust; without the stamps pi's latency instrumentation reads `undefined` on every
+        // cyrup-brokered hop.
+        let mut delivered = message.clone();
+        delivered.broker_received_at = Some(now.into());
+        delivered.broker_delivered_at = Some(now_ms().into());
         if let Some(target) = self.sessions.get(&target_id) {
-            send_msg(&target.tx, &BrokerMessage::Message { from: from_info, message: message.clone() });
+            send_msg(&target.tx, &BrokerMessage::Message { from: from_info, message: delivered });
         }
         if let Some(rt) = &message.reply_to {
             self.ask_edges.remove(rt);
@@ -565,10 +900,27 @@ impl BrokerState {
         let Some(current_id) = session_id.clone() else {
             return FrameResult::protocol_error();
         };
-        // Validate field types first (a wrong type is fatal — broker.ts:524,533,542).
+        // Validate field types first (a wrong type is fatal — `v0.9.2 broker/broker.ts:892-894`,
+        // `:901-903`, `:910-912`). `value.get` yields `Some(Value::Null)` for an explicit `null`,
+        // which is not a string, so `null` is fatal here exactly as `typeof null === "object"`
+        // makes it upstream.
         for key in ["name", "status", "model"] {
             if let Some(v) = value.get(key)
                 && !v.is_string()
+            {
+                return FrameResult::protocol_error();
+            }
+        }
+        // The context-usage trio obeys a DIFFERENT rule from the string trio above, and from
+        // `isSessionInfo`'s (`v0.9.2 broker/client.ts:182-186`, where `null` is fatal). Here an
+        // explicit `null` is a legal CLEAR — the value is genuinely unknown right after a
+        // compaction, and carrying the stale-high one forward would be a lie — so only a value that
+        // is neither `null` nor a number is fatal (`v0.9.2 broker/broker.ts:921-950`, the
+        // `else if (typeof … !== "number") throw` arm at `:924`, `:934`, `:944`).
+        for key in ["contextPct", "contextTokens", "contextWindow"] {
+            if let Some(v) = value.get(key)
+                && !v.is_null()
+                && !v.is_number()
             {
                 return FrameResult::protocol_error();
             }
@@ -595,7 +947,12 @@ impl BrokerState {
             session.info.model = model.to_string();
             changed = true;
         }
-        session.info.last_activity = now;
+        // `v0.9.2 broker/broker.ts:921-950`, one arm per field. Kept as three explicit calls (not a
+        // loop) because Rust cannot index a struct by name; the helper carries the whole tri-state.
+        changed |= apply_presence_context(&mut session.info.context_pct, value.get("contextPct"));
+        changed |= apply_presence_context(&mut session.info.context_tokens, value.get("contextTokens"));
+        changed |= apply_presence_context(&mut session.info.context_window, value.get("contextWindow"));
+        session.info.last_activity = now.into();
         let should_broadcast =
             changed || now.saturating_sub(session.last_presence_broadcast_at) >= PRESENCE_HEARTBEAT_MS;
         if should_broadcast {
@@ -604,6 +961,43 @@ impl BrokerState {
             self.broadcast(&BrokerMessage::PresenceUpdate { session: info }, Some(&current_id));
         }
         FrameResult::cont()
+    }
+}
+
+/// Apply one `presence` context-usage field to the session's stored [`SessionInfo`], returning
+/// whether it changed (`v0.9.2 broker/broker.ts:921-930` for `contextPct`, `:931-940` for
+/// `contextTokens`, `:941-950` for `contextWindow` — three copies of one 10-line shape).
+///
+/// The tri-state is upstream's, verbatim, and it is NOT the rule the same three fields obey inside
+/// `isSessionInfo` (`v0.9.2 broker/client.ts:182-186`), where `null` is a rejection:
+///
+/// * key absent (`undefined`) — leave the field untouched, no change.
+/// * key present and `null` — **CLEAR** the field (`delete session.info[key]`,
+///   `v0.9.2 broker/broker.ts:923`), and count that as a change only if it was set. pi's guard is
+///   `if (session.info.contextPct !== undefined)`, so clearing an already-absent field is a no-op
+///   and must NOT trigger a `presence_update` broadcast.
+/// * key present and a number — set it, counting a change only if it differs (`:926-929`).
+///
+/// Anything else is unreachable: `handle_presence` has already returned
+/// [`FrameResult::protocol_error`] for it, matching pi's `throw` at `:924`/`:934`/`:944`. The arm
+/// is written as a no-op rather than a `panic!`/`unreachable!` so a future refactor that drops the
+/// pre-validation degrades to "ignored" instead of taking the whole broker down.
+fn apply_presence_context(
+    slot: &mut Option<serde_json::Number>,
+    incoming: Option<&serde_json::Value>,
+) -> bool {
+    match incoming {
+        None => false,
+        Some(serde_json::Value::Null) => slot.take().is_some(),
+        Some(serde_json::Value::Number(n)) => {
+            if slot.as_ref() == Some(n) {
+                false
+            } else {
+                *slot = Some(n.clone());
+                true
+            }
+        }
+        Some(_) => false,
     }
 }
 
@@ -670,7 +1064,9 @@ fn process_frame_payload(
         });
         return PayloadOutcome { keep_going: false, rearm_registration: false };
     }
-    let value: serde_json::Value = match serde_json::from_slice(payload) {
+    // JS-lenient: an overflowing numeric literal must not kill the whole frame — see
+    // `framing::from_frame_slice`.
+    let value: serde_json::Value = match crate::transport::framing::from_frame_slice(payload) {
         Ok(v) => v,
         Err(e) => {
             // `reportMessage`'s `JSON.parse` catch (`framing.ts:29-37`): a descriptive diagnostic,
@@ -831,7 +1227,18 @@ pub async fn run() -> std::io::Result<()> {
     let socket_path = paths::broker_socket_path(&intercom_dir);
     let pid_path = paths::broker_pid_path(&intercom_dir);
 
-    // Unlink a stale socket left by a crashed broker (broker.ts:143-148).
+    // Claim the runtime BEFORE touching anything in it (`assertNoLiveBroker(PID_PATH)`,
+    // `v0.9.2 broker/broker.ts:231`, sitting between `ensureIntercomRuntimeDir` at `:230` and the
+    // stale-socket unlink at `:233-238`). A second broker must DECLINE while an incumbent is alive
+    // rather than unlink its socket and bind its own: the incumbent keeps every connection it has
+    // already accepted (the unlinked inode outlives its name) but is unreachable to new clients, so
+    // the theft silently partitions the session graph instead of failing. Only a *live* pid refuses
+    // — a stale `broker.pid` left by a SIGKILLed broker is still reclaimable, or a crash would wedge
+    // intercom until a human deleted the file. See `broker::runtime_claim`.
+    runtime_claim::assert_no_live_broker(&pid_path)?;
+
+    // Unlink a stale socket left by a crashed broker (`v0.9.2 broker/broker.ts:233-238`;
+    // `v0.7.0 broker/broker.ts:143-148`).
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
     let _ = paths::restrict_intercom_runtime_file(&socket_path);
@@ -878,6 +1285,37 @@ mod tests {
 
     fn make_state() -> BrokerState {
         BrokerState::new(30_000, Arc::new(Notify::new()))
+    }
+
+    /// `String(msg.namespace || "")`, the coercion pi applies to the raw `namespace` before it has
+    /// been type-checked (`v0.9.2 broker/broker.ts:1371,1382`). Every case below is what node
+    /// prints for the same expression.
+    #[test]
+    fn js_string_or_empty_matches_the_js_coercion() {
+        // `||` short-circuits on every falsy value.
+        assert_eq!(js_string_or_empty(None), "");
+        assert_eq!(js_string_or_empty(Some(&json!(null))), "");
+        assert_eq!(js_string_or_empty(Some(&json!(false))), "");
+        assert_eq!(js_string_or_empty(Some(&json!(0))), "");
+        assert_eq!(js_string_or_empty(Some(&json!(0.0))), "");
+        assert_eq!(js_string_or_empty(Some(&json!(""))), "");
+        // Truthy values go through `ToString`.
+        assert_eq!(js_string_or_empty(Some(&json!("ns"))), "ns");
+        assert_eq!(js_string_or_empty(Some(&json!(42))), "42");
+        assert_eq!(js_string_or_empty(Some(&json!(-7))), "-7");
+        assert_eq!(js_string_or_empty(Some(&json!(42.5))), "42.5");
+        // `1.0` is the integer `1` in JS; serde would otherwise print "1.0".
+        assert_eq!(js_string_or_empty(Some(&json!(1.0_f64))), "1");
+        assert_eq!(js_string_or_empty(Some(&json!(true))), "true");
+        assert_eq!(js_string_or_empty(Some(&json!({"a": 1}))), "[object Object]");
+        // `Array.prototype.join(",")`: null elements render empty and nesting flattens.
+        assert_eq!(js_string_or_empty(Some(&json!([1, 2]))), "1,2");
+        assert_eq!(js_string_or_empty(Some(&json!([null]))), "");
+        assert_eq!(js_string_or_empty(Some(&json!([[1, 2], 3]))), "1,2,3");
+        assert_eq!(js_string_or_empty(Some(&json!([{}]))), "[object Object]");
+        // A non-empty array is truthy even when it joins to "" — `String([null] || "")` is `""`
+        // via `join`, not via the `||`, and both paths agree here.
+        assert_eq!(js_string_or_empty(Some(&json!([]))), "");
     }
 
     fn make_tx() -> UnboundedSender<Vec<u8>> {
@@ -1029,5 +1467,93 @@ mod tests {
             Some("s1"),
             "the preserved register frame must actually be dispatched to handle_frame, not discarded"
         );
+    }
+}
+
+#[cfg(test)]
+mod presence_context_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+    use serde_json::json;
+
+    /// R4 — the `presence` tri-state, arm by arm (`v0.9.2 broker/broker.ts:921-950`). The
+    /// no-op-clear arm (`:923`'s `if (session.info.contextPct !== undefined)`) is asserted here
+    /// rather than over the socket because `PRESENCE_HEARTBEAT_MS` is 1 s, so "no broadcast" is not
+    /// a claim a live probe can make without racing the heartbeat.
+    #[test]
+    fn apply_presence_context_matches_pis_tristate() {
+        // undefined — untouched, no change.
+        let mut slot = Some(serde_json::Number::from(42));
+        assert!(!apply_presence_context(&mut slot, None));
+        assert_eq!(slot, Some(serde_json::Number::from(42)));
+
+        // null on a SET field — cleared, and that IS a change (`v0.9.2 broker/broker.ts:923`).
+        assert!(apply_presence_context(&mut slot, Some(&json!(null))));
+        assert_eq!(slot, None);
+
+        // null on an ALREADY-ABSENT field — still cleared, but NOT a change, so it must not
+        // trigger a `presence_update` broadcast.
+        assert!(!apply_presence_context(&mut slot, Some(&json!(null))));
+        assert_eq!(slot, None);
+
+        // a number on an absent field — set, and a change.
+        assert!(apply_presence_context(&mut slot, Some(&json!(7))));
+        assert_eq!(slot, Some(serde_json::Number::from(7)));
+
+        // the SAME number again — set, but not a change (`v0.9.2 broker/broker.ts:926`).
+        assert!(!apply_presence_context(&mut slot, Some(&json!(7))));
+
+        // a different number — a change.
+        assert!(apply_presence_context(&mut slot, Some(&json!(8))));
+        assert_eq!(slot, Some(serde_json::Number::from(8)));
+
+        // a fractional number is a `number` upstream too, so it is accepted, not coerced.
+        assert!(apply_presence_context(&mut slot, Some(&json!(8.5))));
+        assert_eq!(slot, Some(serde_json::Number::from_f64(8.5).unwrap()));
+    }
+
+    /// The whole handler, driven through `handle_frame`: a wrong-typed context field destroys the
+    /// connection (`v0.9.2 broker/broker.ts:924,934,944`) while `null` and a number do not
+    /// (`:922-923,926-929`) — the two halves that must not be collapsed into one rule.
+    #[test]
+    fn handle_presence_rejects_non_number_context_but_accepts_null_and_numbers() {
+        fn drive(patch: serde_json::Value) -> FrameOutcome {
+            let mut state = BrokerState::new(30_000, Arc::new(Notify::new()));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut sid = None;
+            state.handle_frame(
+                1,
+                &tx,
+                &json!({
+                    "type": "register", "sessionId": "s1",
+                    "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+                }),
+                &mut sid,
+                1_000,
+            );
+            let mut frame = json!({ "type": "presence" });
+            if let (Some(dst), Some(src)) = (frame.as_object_mut(), patch.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+            state.handle_frame(1, &tx, &frame, &mut sid, 2_000).outcome
+        }
+
+        for key in ["contextPct", "contextTokens", "contextWindow"] {
+            for bad in [json!("42"), json!({}), json!([]), json!(true)] {
+                assert!(
+                    matches!(drive(json!({ key: bad })), FrameOutcome::ProtocolError),
+                    "`presence.{key} = {bad}` must destroy the connection"
+                );
+            }
+            // POSITIVE CONTROL: null (clear) and a number (set) are both legal here.
+            for good in [json!(null), json!(0), json!(42), json!(99.5)] {
+                assert!(
+                    matches!(drive(json!({ key: good })), FrameOutcome::Continue),
+                    "`presence.{key} = {good}` must be served, not disconnected"
+                );
+            }
+        }
     }
 }

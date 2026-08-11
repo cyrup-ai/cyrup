@@ -46,6 +46,51 @@ impl Credential {
             Credential::Oauth { .. } => None,
         }
     }
+
+    /// The serde tag as a value — Pi's `Credential["type"]` (ai/src/auth/types.ts:42).
+    pub fn credential_type(&self) -> CredentialType {
+        match self {
+            Credential::ApiKey { .. } => CredentialType::ApiKey,
+            Credential::Oauth { .. } => CredentialType::Oauth,
+        }
+    }
+}
+
+/// Pi `Credential["type"]` (`ai/src/auth/types.ts:36-42`) as a standalone value, so
+/// [`CredentialInfo`] can name the KIND of a stored credential without carrying its secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialType {
+    ApiKey,
+    Oauth,
+}
+
+impl CredentialType {
+    /// The wire spelling — the same string the `type` tag serializes to.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CredentialType::ApiKey => "api_key",
+            CredentialType::Oauth => "oauth",
+        }
+    }
+}
+
+impl std::fmt::Display for CredentialType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Pi `CredentialInfo` (`ai/src/auth/types.ts:40-43`): "non-secret credential metadata for
+/// account/status enumeration" — the `{ providerId, type }` pair [`super::CredentialStore::list`]
+/// yields. Deliberately carries NO key/token material, which is what lets a status or logout
+/// surface enumerate credentials without ever touching a secret.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CredentialInfo {
+    #[serde(rename = "providerId")]
+    pub provider: cyrup_core::ProviderId,
+    #[serde(rename = "type")]
+    pub credential_type: CredentialType,
 }
 
 /// The resolved request auth an `ApiImpl` needs: key, header overlay, and an optional base-url

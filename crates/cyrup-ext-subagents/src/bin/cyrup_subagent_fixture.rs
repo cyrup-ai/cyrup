@@ -95,9 +95,67 @@ enum ScriptStep {
     /// stderr-into-error surfacing on a non-zero exit (pi `execution.ts:686`). stderr is not
     /// protocol data (R-SA-046), so this is diagnostic text a real child could equally emit.
     EmitStderr { line: String },
+    /// Write ONE line of `head` + `pad_bytes` `'x'` bytes + `tail` (plus a trailing `\n`) — the
+    /// only way to script a child whose single stdout line exceeds the parent's per-line cap
+    /// (`crate::exec::child_protocol::MAX_CHILD_PENDING_LINE_BYTES`, 16 MiB) without putting 16 MiB
+    /// of literal text in the script file. Written in chunks and flushed once, so the parent reads
+    /// it exactly as it would a real child's oversized record: many partial reads, no newline.
+    EmitPadded {
+        head: String,
+        pad_bytes: usize,
+        tail: String,
+    },
+    /// [`ScriptStep::EmitPadded`]'s STDERR twin: ONE stderr line of `head` + `pad_bytes` `'x'`
+    /// bytes + `tail` (plus a trailing `\n`), written in 64 KiB chunks.
+    ///
+    /// Two distinct parent-side behaviours need a child that writes MORE stderr than fits in the
+    /// OS pipe buffer (~64 KiB on Linux), and neither can be scripted with
+    /// [`ScriptStep::EmitStderr`] without embedding hundreds of kilobytes of literal text in the
+    /// script JSON:
+    ///
+    /// 1. **The pipe-buffer deadlock.** A child blocks in `write(2)` once the pipe is full, so a
+    ///    parent that does not drain stderr CONCURRENTLY with the run waits forever for an exit
+    ///    that can never happen. pi drains on every chunk (`execution.ts:1056-1059`:
+    ///    `proc.stderr.on("data", …)`), so its children never block.
+    /// 2. **The bounded TAIL.** pi retains the LAST `MAX_CHILD_STDERR_BYTES` of stderr
+    ///    (`createBoundedByteTail`, `child-protocol.ts:377-392`, fed raw chunks at
+    ///    `execution.ts:1057`), because a fatal error is at the END of a child's stderr. A
+    ///    distinctive `tail` here is what lets a test assert the tail survived rather than the head.
+    ///
+    /// The bytes are `'x'` (not newline-bearing) so the whole thing really is ONE line, exceeding
+    /// the parent's per-line stderr bound as well as the pipe buffer.
+    EmitStderrPadded {
+        head: String,
+        pad_bytes: usize,
+        tail: String,
+    },
     /// Sleep for `ms` milliseconds before continuing to the next step.
     SleepMs { ms: u64 },
+    /// Play the role of a real child's `structured_output` TOOL CALL: write `value` verbatim, as
+    /// JSON, to the capture path the parent handed this process in
+    /// `CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE` (pi `structured-output.ts:9`'s
+    /// `PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE`; the child-side writer is
+    /// `subagent-prompt-runtime.ts`'s registered `structured_output` tool).
+    ///
+    /// This is the ONLY channel `exec::structured::read_structured_output` consults when the
+    /// parent created a capture runtime — a fenced ` ```json ` block in prose is deliberately NOT
+    /// a substitute (pi's whole point at `structured-output.ts:157-159`: a missing capture file is a
+    /// hard failure even when prose was produced). A fixture test that wants to exercise the
+    /// structured-output path therefore has to make this call, exactly as a real child would.
+    ///
+    /// With the env var absent (no schema was declared for this run) the step is a silent no-op,
+    /// matching a real child, which registers no `structured_output` tool at all in that case.
+    /// A write failure is likewise not fatal here: this binary's whole contract (module doc) is
+    /// that a scripting mistake degrades to observable-but-not-crashing behaviour, and the parent
+    /// then reports its own genuine "missing structured output" failure.
+    WriteStructuredOutput { value: serde_json::Value },
 }
+
+/// The capture-path env var [`ScriptStep::WriteStructuredOutput`] honours — the same constant
+/// `crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV` defines, restated here because this
+/// binary deliberately links nothing from the library (see this module's doc: it is a
+/// self-contained NDJSON emitter with zero session/provider machinery).
+const STRUCTURED_OUTPUT_CAPTURE_ENV: &str = "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE";
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case", default)]
@@ -172,6 +230,21 @@ fn emit_env_echo(names: &[String], out: &mut impl Write) {
         }
     }
     let _ = out.flush();
+}
+
+/// [`ScriptStep::WriteStructuredOutput`]'s worker: write `value` to the parent-provided capture
+/// path. Absent env var => no-op (see the variant's own doc for why both degradations are correct).
+fn write_structured_output_capture(value: &serde_json::Value) {
+    let Some(path) = std::env::var_os(STRUCTURED_OUTPUT_CAPTURE_ENV) else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(value) else {
+        return;
+    };
+    if let Err(err) = std::fs::write(&path, bytes) {
+        // stderr is diagnostic, never protocol data (R-SA-046).
+        eprintln!("cyrup-subagent-fixture: failed to write structured output capture: {err}");
+    }
 }
 
 /// Install best-effort signal-ignoring handlers per the script's `ignore_sigint`/`ignore_sigterm`
@@ -249,8 +322,49 @@ async fn main() {
                 let _ = writeln!(std::io::stderr(), "{line}");
                 let _ = std::io::stderr().flush();
             }
+            ScriptStep::EmitPadded {
+                head,
+                pad_bytes,
+                tail,
+            } => {
+                let _ = out.write_all(head.as_bytes());
+                let chunk = vec![b'x'; 64 * 1024];
+                let mut written = 0usize;
+                while written < *pad_bytes {
+                    let take = chunk.len().min(*pad_bytes - written);
+                    let _ = out.write_all(chunk.get(..take).unwrap_or_default());
+                    written += take;
+                }
+                let _ = out.write_all(tail.as_bytes());
+                let _ = out.write_all(b"\n");
+                let _ = out.flush();
+            }
+            ScriptStep::EmitStderrPadded {
+                head,
+                pad_bytes,
+                tail,
+            } => {
+                // Unbuffered, straight at the fd: every `write_all` here is a real `write(2)` the
+                // OS can block, which is exactly the condition being scripted.
+                let stderr = std::io::stderr();
+                let mut err = stderr.lock();
+                let _ = err.write_all(head.as_bytes());
+                let chunk = vec![b'x'; 64 * 1024];
+                let mut written = 0usize;
+                while written < *pad_bytes {
+                    let take = chunk.len().min(*pad_bytes - written);
+                    let _ = err.write_all(chunk.get(..take).unwrap_or_default());
+                    written += take;
+                }
+                let _ = err.write_all(tail.as_bytes());
+                let _ = err.write_all(b"\n");
+                let _ = err.flush();
+            }
             ScriptStep::SleepMs { ms } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+            }
+            ScriptStep::WriteStructuredOutput { value } => {
+                write_structured_output_capture(value);
             }
         }
     }

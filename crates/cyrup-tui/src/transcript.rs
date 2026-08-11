@@ -23,6 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::bash::BashExecution;
 use crate::component::Component;
@@ -37,7 +38,13 @@ use crate::theme::UiTheme;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     /// A user submission.
-    User(String),
+    ///
+    /// `lead_spacer` freezes `interactive-mode.ts:3500`'s
+    /// `if (this.chatContainer.children.length > 0)` at push time: the `Spacer(1)` that separates a
+    /// user turn from what precedes it is **not** emitted for the very first child of a fresh
+    /// session's chat. The trailing user message of a skill block (`:3513-3521`) is a different call
+    /// site with no such gate and always carries it.
+    User { text: String, lead_spacer: bool },
     /// A finalized assistant message.
     Assistant(String),
     /// A finalized run of assistant **thinking**/reasoning blocks (`assistant-message.ts:115-166`).
@@ -75,7 +82,12 @@ pub enum Entry {
     Bash(BashExecution),
     /// A skill-invocation message (`skill-invocation-message.ts`): a bold `[skill]` label + the skill
     /// name, with the skill block content rendered as markdown below.
-    SkillInvocation { name: String, content: String },
+    ///
+    /// `lead_spacer` carries the same `interactive-mode.ts:3500` gate as [`Self::User`] — the skill
+    /// component is added at `:3506`, inside that `if (textContent)` / `children.length > 0` block,
+    /// so it is the component the gated spacer actually precedes when a submission opens with a
+    /// `<skill>` block.
+    SkillInvocation { name: String, content: String, lead_spacer: bool },
     /// A custom (extension) message (`custom-message.ts`): a bracketed type `label` + a markdown
     /// `body`, styled distinctly from a plain user message.
     ///
@@ -83,12 +95,21 @@ pub enum Entry {
     /// custom type (EXT-006); when present it REPLACES the label+markdown framing, because the
     /// renderer already owns the presentation (Pi hands the resolved renderer to
     /// `CustomMessageComponent` instead of the default, interactive-mode.ts:3324-3336).
-    Custom { label: String, body: String, rendered: Option<String> },
+    Custom { label: String, body: String, rendered: Rendered },
     /// A branch-summary message (`branch-summary-message.ts`): a bold `[branch]` label + the
     /// `**Branch Summary**` markdown body produced when navigating away from a branch.
-    BranchSummary(String),
+    ///
+    /// X14 — the collapsed/expanded choice is NOT stored on the entry. Upstream's
+    /// `BranchSummaryMessageComponent` keeps a live `expanded` field that BOTH
+    /// `interactive-mode.ts:3493`'s seeding `component.setExpanded(this.toolOutputExpanded)` and
+    /// `setToolsExpanded`'s re-broadcast to every `chatContainer` child (`:4032-4046`) write, so a
+    /// later `Ctrl+O` reveals the body of a summary that was pushed while collapsed. Freezing the
+    /// flag at push time made the expanded body unreachable; the render arm reads
+    /// [`ImageOpts::tools_expanded`] — the LIVE flag — instead.
+    BranchSummary { summary: String },
     /// A compaction-summary message (`compaction-summary-message.ts`): a bold `[compaction]` label
     /// noting the pre-compaction token count + the `**Compacted from N tokens**` summary markdown.
+    /// Its expansion is `interactive-mode.ts:3486`'s, read live — see [`Self::BranchSummary`].
     CompactionSummary { tokens_before: u64, summary: String },
     /// The startup loaded-resources / diagnostics panel (`showLoadedResources`,
     /// interactive-mode.ts:1480-1690) — the `[Context]`/`[Skills]`/`[Prompts]`/`[Extensions]`/
@@ -96,6 +117,60 @@ pub enum Entry {
     /// `[Theme conflicts]` blocks. Pre-formatted by [`crate::startup::build_startup_lines`] because
     /// the expand/collapse choice cannot be revisited once committed (see that module's docs).
     LoadedResources(Vec<crate::startup::StartupLine>),
+}
+
+/// What an extension's registered renderer produced for an [`Entry::Custom`] (EXT-006, X15).
+///
+/// Upstream has TWO renderer components over custom types and they agree on three outcomes but not
+/// on what to DRAW for them:
+///
+/// | outcome | `CustomMessageComponent` (`custom-message.ts:60-88`) | `CustomEntryComponent` (`custom-entry.ts:40-60`) |
+/// |---|---|---|
+/// | returned a component | the component, verbatim (`:76-80`) | `Spacer(1)` + the component (`:58-60`) |
+/// | returned nothing / none registered | the default `[type] body` box (`:87-111`) | nothing at all (`:54-56`, `interactive-mode.ts:3433-3435`) |
+/// | THREW | caught, falls through to the default box (`:82-84`) | `Spacer(1)` + a `customMessageBg` box holding `[type] renderer failed: {message}` (`:47-52`) |
+///
+/// So the throw is user-visible on exactly one surface. cyrup modelled the whole thing as
+/// `Option<String>` and could not tell "the renderer threw" from "there is no renderer", which is
+/// why [`Rendered::Failed`] had no producer; [`cyrup_ext::RenderOutcome`] now keeps them apart from
+/// `ExtensionHost::render_via` outward, and [`crate::app::extension_render_entry`] is what turns a
+/// fault into this variant. The message/tool surfaces still collapse `Failed` into
+/// [`Rendered::None`] — that IS their upstream behaviour.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum Rendered {
+    /// No renderer is registered for this custom type, or the registered one drew nothing. A custom
+    /// MESSAGE draws the default `[label]` + markdown box; a custom ENTRY is not pushed at all.
+    #[default]
+    None,
+    /// The renderer's output, already flattened to display text. Emitted verbatim.
+    Text(String),
+    /// The renderer threw; the payload is `error.message`. Draws Pi's failure box
+    /// (`components/custom-entry.ts:47-52`).
+    ///
+    /// Produced by [`crate::app::extension_render_entry`] from a
+    /// [`cyrup_ext::RenderOutcome::Failed`] — a native renderer that panicked (contained by
+    /// `catch_unwind`) or a guest renderer that trapped.
+    Failed(String),
+}
+
+impl Rendered {
+    /// Collapse to the pre-X15 `Option<String>` shape — what the custom-MESSAGE and TOOL-row
+    /// surfaces want, since `custom-message.ts:82-84` catches a throw and falls through to the
+    /// default box. The ENTRY surface must NOT use this.
+    pub fn into_text(self) -> Option<String> {
+        match self {
+            Self::Text(t) => Some(t),
+            Self::None | Self::Failed(_) => None,
+        }
+    }
+
+    /// Whether anything at all should be drawn for a custom ENTRY carrying this outcome
+    /// (`CustomEntryComponent.hasContent()`, `custom-entry.ts:24-26`, checked at
+    /// `interactive-mode.ts:3438-3440`). A failure box counts as content — upstream assigns it to
+    /// `customComponent` (`:51`) before the check.
+    pub fn has_content(&self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 /// One tool execution, shown live in the viewport while it runs (`tool-execution.ts` pending box) and
@@ -143,6 +218,18 @@ pub struct ToolRun {
     /// The RESULT text an extension's registered renderer produced (Pi `renderResult`,
     /// extensions/types.ts:475-481). See [`ToolRun::rendered_call`].
     pub rendered_result: Option<String>,
+    /// `edit`'s **pre-execution** diff preview — Pi `EditCallRenderComponent.preview`
+    /// (edit.ts:145-153), set by `setEditPreview` (`:263-280`) from the `computeEditsDiff` its
+    /// `renderCall` fires the moment the streamed arguments are complete (`:377-386`).
+    ///
+    /// It is what puts the diff on screen while the call is still PENDING — through the permission
+    /// prompt (cyrup emits `ToolExecutionStart` before `prepare`, i.e. before the `before_tool_call`
+    /// gate, `cyrup-agent/src/agent.rs:1181/1334`) and before anything is written. `Ok` is the diff
+    /// text, `Err` the `EditDiffError.error` message; `None` is "no preview" (a non-`edit` tool, a
+    /// replayed history entry, or a file too large to preview synchronously).
+    ///
+    /// Populated only through [`TranscriptView::set_edit_preview`].
+    pub preview: Option<Result<String, String>>,
     /// The `image` content blocks of the result, decoded once when the run finishes
     /// (`tool-execution.ts:331-350` filters `content` for `type === "image"` on every display
     /// update). Decoding here rather than per frame keeps a screenshot-sized PNG off the redraw path.
@@ -177,6 +264,11 @@ pub struct ResultImage {
 pub struct TranscriptView {
     /// Committed entries awaiting a flush to native scrollback (drained, not re-rendered).
     pending: Vec<Entry>,
+    /// Whether anything has already been drained into native scrollback. Together with the live
+    /// buffers this answers `this.chatContainer.children.length > 0` (`interactive-mode.ts:3500`) —
+    /// see [`TranscriptView::chat_has_children`]. `pending` alone cannot: it is emptied on every
+    /// flush, so a session with a full screen of history would look like a fresh one.
+    chat_flushed: bool,
     /// The assistant turn currently streaming, if any (the only entry the viewport renders).
     streaming: Option<String>,
     /// The assistant **reasoning** currently streaming (`StreamEvent::ThinkingDelta`), if any. Held
@@ -209,6 +301,14 @@ pub struct TranscriptView {
     /// from the keymap so rebinds reflect. `None` falls back to the Pi defaults.
     bash_cancel_hint: Option<String>,
     bash_expand_hint: Option<String>,
+    /// X9 — the live `app.tools.expand` label for the TOOL/summary hints (`keyText`,
+    /// `keybinding-hints.ts:34-36`). Distinct from [`Self::bash_expand_hint`], which is scoped to a
+    /// single `!`/`!!` block's lifetime; this one outlives any one block. `None` = [`EXPAND_KEY`].
+    expand_hint: Option<String>,
+    /// X7 — Pi `ToolRenderContext.cwd` (`tool-execution.ts:126`): the SESSION's working directory,
+    /// which `read`'s compact classification resolves relative paths against (`read.ts:336`).
+    /// `None` falls back to the process cwd.
+    cwd: Option<std::path::PathBuf>,
     /// How many visual lines the user has paged **up** from the tail of the active region
     /// (`PageUp`/`PageDown`, spec/tui/07). `0` keeps the newest text pinned to the bottom (the
     /// default auto-scroll); paging up reveals earlier streamed/tool/bash output before it commits to
@@ -312,10 +412,28 @@ impl TranscriptView {
     }
 
     /// Mark the live bash block finished (`setComplete`). No-op if none is live.
-    pub fn bash_complete(&mut self, exit_code: Option<i32>, cancelled: bool) {
+    ///
+    /// X13 — `truncated`/`full_output_path` are `setComplete`'s third and fourth arguments
+    /// (`bash-execution.ts:98-103`), fed upstream from `result.truncated` / `result.fullOutputPath`
+    /// (`interactive-mode.ts:6307-6312`). They drive the `Output truncated. Full output: …` status
+    /// row. See [`Self::bash_complete_simple`] for the `!` path, which has no spool of its own.
+    pub fn bash_complete(
+        &mut self,
+        exit_code: Option<i32>,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
+    ) {
         if let Some(b) = self.bash.as_mut() {
-            b.set_complete(exit_code, cancelled);
+            b.set_complete(exit_code, cancelled, truncated, full_output_path);
         }
+    }
+
+    /// [`Self::bash_complete`] with no truncation report — Pi's `catch` arm
+    /// (`interactive-mode.ts:6357` `setComplete(undefined, false)`), and the shape the interactive
+    /// `!` runner uses while it has no spool file to point at.
+    pub fn bash_complete_simple(&mut self, exit_code: Option<i32>, cancelled: bool) {
+        self.bash_complete(exit_code, cancelled, false, None);
     }
 
     /// Whether a bash block is live (running or finished-but-uncommitted).
@@ -357,8 +475,15 @@ impl TranscriptView {
     /// so a resumed session shows the user's own `!` commands as bash blocks instead of the
     /// ``Ran `cmd` ``  prose `convertToLlm` renders them to for the model.
     ///
-    /// Pi's `setComplete` also takes `truncated`/`fullOutputPath`; [`BashExecution`] does not model
-    /// truncation, so those are not replayed (the same gap the live `!` path already has).
+    /// X13 — the persisted `bashExecution` message carries `truncated` and `fullOutputPath`, and
+    /// upstream replays BOTH: `component.setComplete(message.exitCode, message.cancelled,
+    /// message.truncated ? {truncated:true} : undefined, message.fullOutputPath)`
+    /// (`interactive-mode.ts:3460-3465`). cyrup dropped them, so a resumed session lost the pointer
+    /// to where the full output was spooled.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "upstream's own arity: `new BashExecutionComponent(command, ui, excludeFromContext)`                   + `appendOutput(output)` + `setComplete(exitCode, cancelled, truncationResult,                   fullOutputPath)` (interactive-mode.ts:3454-3465), collapsed into one replay call"
+    )]
     pub fn push_bash_execution(
         &mut self,
         command: impl Into<String>,
@@ -366,12 +491,14 @@ impl TranscriptView {
         output: &str,
         exit_code: Option<i32>,
         cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
     ) {
         let mut b = BashExecution::new(command, excluded);
         if !output.is_empty() {
             b.append_output(output);
         }
-        b.set_complete(exit_code, cancelled);
+        b.set_complete(exit_code, cancelled, truncated, full_output_path);
         self.pending.push(Entry::Bash(b));
     }
 
@@ -379,7 +506,24 @@ impl TranscriptView {
     /// entries into native scrollback exactly once (R-ARCH-TUI-003), so they are not shown again in
     /// the inline viewport.
     pub fn drain_committed(&mut self) -> Vec<Entry> {
+        self.chat_flushed |= !self.pending.is_empty();
         std::mem::take(&mut self.pending)
+    }
+
+    /// `this.chatContainer.children.length > 0` (`interactive-mode.ts:3500`).
+    ///
+    /// cyrup's analogue of the chat container is the whole entry stream: everything ever committed —
+    /// still in `pending` or already flushed by [`drain_committed`](Self::drain_committed) — plus the
+    /// live components the viewport owns while a turn runs. Upstream keeps those live components
+    /// (`AssistantMessageComponent`, each `ToolExecutionComponent`, the `!` bash block) in
+    /// `chatContainer` too, so they count.
+    fn chat_has_children(&self) -> bool {
+        self.chat_flushed
+            || !self.pending.is_empty()
+            || self.streaming.is_some()
+            || self.thinking.is_some()
+            || !self.active_tools.is_empty()
+            || self.bash.is_some()
     }
 
     /// Append a user message. When `text` is a `<skill …>` block (a `/skill:name` expansion), it is
@@ -387,16 +531,26 @@ impl TranscriptView {
     /// as Pi renders the `user` role (`parseSkillBlock` → `SkillInvocationMessageComponent` +
     /// `UserMessageComponent`, interactive-mode.ts:3112-3132). Plain text falls through to a single
     /// user entry.
+    ///
+    /// The leading `Spacer(1)` is gated on `this.chatContainer.children.length > 0` (`:3500`), so
+    /// the first message of a fresh session gets none; the answer is frozen into the entry because
+    /// the render happens later, after `drain_committed` has already emptied `pending`. The user
+    /// message that trails a skill block is added at `:3513-3521` with its own **unconditional**
+    /// spacer, so it always carries one.
     pub fn push_user(&mut self, text: impl Into<String>) {
         let text = text.into();
+        let lead_spacer = self.chat_has_children();
         if let Some(block) = parse_skill_block(&text) {
-            self.pending
-                .push(Entry::SkillInvocation { name: block.name, content: block.content });
+            self.pending.push(Entry::SkillInvocation {
+                name: block.name,
+                content: block.content,
+                lead_spacer,
+            });
             if let Some(user_message) = block.user_message {
-                self.pending.push(Entry::User(user_message));
+                self.pending.push(Entry::User { text: user_message, lead_spacer: true });
             }
         } else {
-            self.pending.push(Entry::User(text));
+            self.pending.push(Entry::User { text, lead_spacer });
         }
         // A fresh prompt jumps the active region back to the tail (spec/tui/07 auto-scroll).
         self.scroll_offset = 0;
@@ -428,11 +582,17 @@ impl TranscriptView {
 
     /// Finalize the assistant turn. If `text` is given it replaces the streaming buffer (e.g. the
     /// authoritative terminal message); otherwise the accumulated streaming buffer is committed.
+    ///
+    /// L3 — the gate is **whitespace-only**, not empty. Pi renders a text block at all only when
+    /// `content.text.trim()` is truthy (`assistant-message.ts:107`) and counts it toward
+    /// `hasVisibleContent` by the same trimmed test (`:96-98`), so a message of nothing but spaces
+    /// produces no `Markdown` child and no leading `Spacer(1)`. Testing `!t.is_empty()` let `"   "`
+    /// through and gave it a blank upstream never emits.
     pub fn commit_assistant(&mut self, text: Option<String>) {
         let final_text = text.or_else(|| self.streaming.take());
         self.streaming = None;
         if let Some(t) = final_text
-            && !t.is_empty()
+            && !t.trim().is_empty()
         {
             self.pending.push(Entry::Assistant(t));
         }
@@ -525,6 +685,7 @@ impl TranscriptView {
             duration_ms: None,
             rendered_call: rendered,
             rendered_result: None,
+            preview: None,
             images: Vec::new(),
         });
     }
@@ -544,6 +705,44 @@ impl TranscriptView {
             && partial.is_some()
         {
             run.result = partial;
+        }
+    }
+
+    /// Whether any live tool run is currently drawing a ticking `Elapsed …` figure, i.e. whether the
+    /// frame goes stale on its own and must be repainted on a timer.
+    ///
+    /// This is Pi's `setInterval(() => context.invalidate(), 1000)` condition, verbatim: bash's
+    /// `renderResult` arms that interval exactly when `state.startedAt !== undefined &&
+    /// options.isPartial` and clears it on the final result (bash.ts:471-479). The `result.is_some()`
+    /// term is upstream's `if (this.result)` gate on `renderResult` running at all
+    /// (tool-execution.ts:281) — bash's initial empty update satisfies it immediately (bash.ts:384).
+    ///
+    /// Gates [`crate::App::run`]'s elapsed tick, so an idle session — or one running any tool but
+    /// `bash` — never pays for a redraw.
+    pub fn has_running_elapsed_tool(&self) -> bool {
+        self.active_tools
+            .iter()
+            .any(|r| !r.done && r.name == "bash" && r.started_at.is_some() && r.result.is_some())
+    }
+
+    /// Attach `edit`'s pre-execution diff preview to a still-running call — Pi `setEditPreview`
+    /// (edit.ts:263-280), the sink its `renderCall`'s `computeEditsDiff(...).then(...)` writes into
+    /// (`:378-386`).
+    ///
+    /// `preview` is `Ok(diff)` or `Err(message)` (Pi's `EditDiffResult | EditDiffError`). Routed by
+    /// `toolCallId` like every other per-run update ([`Self::push_tool_update`]); `None` falls back
+    /// to the latest still-running tool. A run that has already finished is skipped — Pi drops a
+    /// late preview by comparing `previewArgsKey` against the request key (`:381`), and once the
+    /// result is in it is the result diff that renders (`formatEditResult`, `:220-226`).
+    pub fn set_edit_preview(&mut self, call_id: Option<&str>, preview: Result<String, String>) {
+        let run = match call_id {
+            Some(id) => {
+                self.active_tools.iter_mut().find(|r| !r.done && r.call_id.as_deref() == Some(id))
+            }
+            None => self.active_tools.iter_mut().rev().find(|r| !r.done),
+        };
+        if let Some(run) = run {
+            run.preview = Some(preview);
         }
     }
 
@@ -594,6 +793,7 @@ impl TranscriptView {
                 duration_ms: None,
                 rendered_call: None,
                 rendered_result: rendered,
+                preview: None,
                 images,
             });
         }
@@ -698,6 +898,16 @@ impl TranscriptView {
         changed
     }
 
+    /// The live tool-output expansion (Pi `this.toolOutputExpanded`, `interactive-mode.ts:442`).
+    ///
+    /// X14 — read by the shell when it builds the [`ImageOpts`] it flushes committed entries with,
+    /// so a branch/compaction summary honours the flag in force when it is PAINTED rather than the
+    /// one that happened to be set when it was pushed (`setToolsExpanded`'s re-broadcast to every
+    /// `chatContainer` child, `:4032-4046`).
+    pub fn tool_expanded(&self) -> bool {
+        self.tool_expanded
+    }
+
     /// Record a status / notification line.
     pub fn push_status(&mut self, text: impl Into<String>) {
         self.pending.push(Entry::Status(text.into()));
@@ -730,10 +940,49 @@ impl TranscriptView {
         self.pending.push(Entry::Block { title: title.into(), markdown: markdown.into() });
     }
 
+    /// The startup "packages are out of date" notice — Pi `showPackageUpdateNotification`
+    /// (`interactive-mode.ts:3920-3936`), pushed when the detached package-update check settles with
+    /// a non-empty list (`:850-856`).
+    ///
+    /// Upstream's block is a `DynamicBorder`, a bold title, the instruction, `Packages:` and one
+    /// `- name` line per package, then a closing border — structurally [`Entry::Block`], which is the
+    /// same border/title/body sandwich (interactive-mode.ts:5502-5507). `[CYRUP-DELTA]`: upstream
+    /// tints THIS block's border and title `warning` where the generic block is `accent`; cyrup
+    /// reuses the generic block rather than forking the entry type for a colour.
+    ///
+    /// The action names cyrup's own command, `cyrup update --extensions` (`subcommands.rs`), which is
+    /// upstream's `${APP_NAME} update --extensions` after the rebrand. A no-op on an empty list, so
+    /// the caller never has to guard.
+    pub fn push_package_updates(&mut self, packages: &[String]) {
+        if packages.is_empty() {
+            return;
+        }
+        let list = packages
+            .iter()
+            .map(|p| format!("- {p}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.push_block(
+            "Package Updates Available",
+            format!(
+                "Package updates are available. Run {} update --extensions\nPackages:\n{list}",
+                crate::resume_hint::APP_NAME
+            ),
+        );
+    }
+
     /// Push a skill-invocation message (`skill-invocation-message.ts`): a `[skill]` label + the skill
     /// name header, with the skill block content rendered as markdown.
+    ///
+    /// Upstream only ever builds this component inside `case "user"` (`interactive-mode.ts:3506`),
+    /// so it takes the same `:3500` leading-spacer gate [`push_user`](Self::push_user) applies.
     pub fn push_skill_invocation(&mut self, name: impl Into<String>, content: impl Into<String>) {
-        self.pending.push(Entry::SkillInvocation { name: name.into(), content: content.into() });
+        let lead_spacer = self.chat_has_children();
+        self.pending.push(Entry::SkillInvocation {
+            name: name.into(),
+            content: content.into(),
+            lead_spacer,
+        });
     }
 
     /// Push a custom (extension) message (`custom-message.ts`): a bracketed type `label` + a markdown
@@ -742,7 +991,7 @@ impl TranscriptView {
         self.pending.push(Entry::Custom {
             label: label.into(),
             body: body.into(),
-            rendered: None,
+            rendered: Rendered::None,
         });
     }
 
@@ -750,13 +999,14 @@ impl TranscriptView {
     /// produced for this custom type (EXT-006; Pi resolves the renderer at
     /// `interactive-mode.ts:3326` — `extensionRunner.getMessageRenderer(message.customType)` — and
     /// hands it to `CustomMessageComponent` INSTEAD of the default framing). When `rendered` is
-    /// `Some`, the extension's lines are emitted verbatim: no `[label]` bracket, no markdown
-    /// re-wrap, because the renderer already decided how the block looks.
+    /// [`Rendered::Text`], the extension's lines are emitted verbatim: no `[label]` bracket, no
+    /// markdown re-wrap, because the renderer already decided how the block looks;
+    /// [`Rendered::Failed`] draws Pi's renderer-failure box (X15).
     pub fn push_custom_message_rendered(
         &mut self,
         label: impl Into<String>,
         body: impl Into<String>,
-        rendered: Option<String>,
+        rendered: Rendered,
     ) {
         self.pending.push(Entry::Custom {
             label: label.into(),
@@ -767,15 +1017,46 @@ impl TranscriptView {
 
     /// Push a branch-summary message (`branch-summary-message.ts`): the `**Branch Summary**` body
     /// produced when navigating away from / abandoning a branch.
+    ///
+    /// X14 — the collapsed/expanded choice is `component.setExpanded(this.toolOutputExpanded)`
+    /// (`interactive-mode.ts:3493`) and is re-broadcast to every child on every toggle
+    /// (`setToolsExpanded`, `:4032-4046`), so it is resolved at RENDER time from
+    /// [`ImageOpts::tools_expanded`], never captured here.
     pub fn push_branch_summary(&mut self, summary: impl Into<String>) {
-        self.pending.push(Entry::BranchSummary(summary.into()));
+        self.pending.push(Entry::BranchSummary { summary: summary.into() });
     }
 
     /// Push a compaction-summary message (`compaction-summary-message.ts`): the pre-compaction token
     /// count + the `**Compacted from N tokens**` summary body.
     pub fn push_compaction_summary(&mut self, tokens_before: u64, summary: impl Into<String>) {
-        self.pending
-            .push(Entry::CompactionSummary { tokens_before, summary: summary.into() });
+        // X14 — `interactive-mode.ts:3486`'s `setExpanded(this.toolOutputExpanded)`; like the branch
+        // summary above, resolved at render time from the LIVE flag.
+        self.pending.push(Entry::CompactionSummary { tokens_before, summary: summary.into() });
+    }
+
+    /// Set the live `app.tools.expand` key label every `… to expand` hint resolves through — Pi's
+    /// `keyText("app.tools.expand")` (`keybinding-hints.ts:34-36`), which reads the keymap on every
+    /// render. cyrup's transcript holds no keymap, so the app pushes the resolved label here
+    /// whenever bindings change (X9). `None` restores cyrup's default binding label.
+    pub fn set_expand_hint(&mut self, label: Option<String>) {
+        self.expand_hint = label;
+    }
+
+    /// The label [`Self::set_expand_hint`] stored, or [`EXPAND_KEY`].
+    pub fn expand_key(&self) -> &str {
+        self.expand_hint.as_deref().unwrap_or(EXPAND_KEY)
+    }
+
+    /// Point the tool renderers at the SESSION's working directory — Pi `ToolRenderContext.cwd`
+    /// (`tool-execution.ts:126`), which `read`'s compact classification resolves its path against
+    /// (`read.ts:336`). `None` falls back to the process cwd.
+    pub fn set_cwd(&mut self, cwd: Option<std::path::PathBuf>) {
+        self.cwd = cwd;
+    }
+
+    /// The cwd [`Self::set_cwd`] stored.
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
     }
 
     /// Build the styled lines the inline viewport renders: **only** the active streaming partial,
@@ -783,8 +1064,10 @@ impl TranscriptView {
     /// [`drain_committed`](Self::drain_committed)).
     ///
     /// Pi renders the in-flight assistant message **inline** with no surrounding box/title
-    /// (`assistant-message.ts:84-93`); a dim soft cursor `▌` trails the last grapheme while the turn
-    /// streams (spec/tui/01 §3) — the hardware cursor stays on the editor. The buffer is run through
+    /// (`assistant-message.ts:84-93`) and with **no** streaming caret — the only caret in the TUI is
+    /// the editor's reverse-video cell (`editor.ts:545-564`), and `git grep "▌" v0.84.1 --
+    /// packages/` finds a single hit, the pupil of an eye in
+    /// `examples/extensions/custom-header.ts:22` (X1). The buffer is run through
     /// [`trim_partial_closing_fence`](crate::markdown::trim_partial_closing_fence) so a streaming code
     /// fence does not flicker open/closed (`markdown.ts:25-48`).
     /// The number of visual lines the active turn occupies at `width` — the message region's content
@@ -794,7 +1077,7 @@ impl TranscriptView {
         // Measure WRAPPED display rows, not logical lines: `markdown::render` emits ONE un-wrapped
         // `Line` per prose paragraph (width is only consumed for tables/hr/code), so counting
         // `lines().len()` under-counts a long streaming paragraph and the region is sized too short —
-        // clipping the newest text + the `▌` caret. `wrapped_height` measures with the SAME word-wrap
+        // clipping the newest text. `wrapped_height` measures with the SAME word-wrap
         // `render` applies (`Paragraph::line_count`), so the active turn grows + stays tail-anchored
         // (spec/tui/01 §3 overflow; the doc at [`TranscriptView::render`]).
         wrapped_height(&self.lines(width, theme), width)
@@ -805,30 +1088,60 @@ impl TranscriptView {
         // The live reasoning block renders ABOVE the answer text, the order Pi's content walk
         // produces for a reasoning model (thinking blocks precede the text blocks of the turn) —
         // `assistant-message.ts:115-166`.
-        if let Some(thinking) = &self.thinking {
-            let mut td = thinking_lines(thinking, self.hide_thinking, theme);
+        // L3 — `assistant-message.ts:100-102`'s single `Spacer(1)`, emitted once for the whole
+        // message when `hasVisibleContent`. The live view is the same component mid-stream, so the
+        // blank belongs to whichever of the two blocks comes first.
+        //
+        // `hasVisibleContent` (`:96-98`) is
+        // `content.some(c => (c.type === "text" && c.text.trim()) || (c.type === "thinking" &&
+        // c.thinking.trim()))` — a **trimmed** test on both legs, and `:107` gates the text block's
+        // `Markdown` child on the same `content.text.trim()`. So an assistant turn that has streamed
+        // nothing but whitespace is not visible content: no blank, and no body either.
+        let thinking_visible = self.thinking.as_ref().is_some_and(|t| !t.trim().is_empty());
+        let stream_visible = self.streaming.as_ref().is_some_and(|s| !s.trim().is_empty());
+        if thinking_visible || stream_visible {
+            lines.push(Line::default());
+        }
+        // `:129-131` — `if (thinkingBlocks.length === 0) { continue; }` runs BEFORE the
+        // `hideThinkingBlock` branch, and `:122-125` only collects blocks whose `.trim()` is
+        // non-empty. So a reasoning run of nothing but whitespace renders nothing at all, not even
+        // the `Thinking...` label. `commit_thinking` already applies that test; the live leg did
+        // not, so a stray whitespace `ThinkingDelta` put a label (and its blank) on screen.
+        if let Some(thinking) = self.thinking.as_ref().filter(|_| thinking_visible) {
+            let mut td = thinking_lines(
+                thinking,
+                self.hide_thinking,
+                width.saturating_sub(self.output_pad * 2),
+                theme,
+            );
             if !td.is_empty() {
                 pad_lines(&mut td, self.output_pad);
                 lines.extend(td);
                 // Pi's `hasVisibleContentAfter` spacer (`:134-137`): a blank only when more visible
-                // assistant content follows.
-                if self.streaming.is_some() {
+                // assistant content follows — and "visible" is the same trimmed test (`:137`).
+                if stream_visible {
                     lines.push(Line::default());
                 }
             }
         }
-        if let Some(partial) = &self.streaming {
+        if let Some(partial) = self.streaming.as_ref().filter(|_| stream_visible) {
+            // X1 — no role label and no `▌` caret. `assistant-message.ts:104-114` adds exactly one
+            // child per text block, `new Markdown(content.text.trim(), this.outputPad, 0, …)`; the
+            // only caret in the whole TUI is the editor's reverse-video cell (`editor.ts:545-564`).
+            // `git grep "▌" v0.84.1 -- packages/` finds one hit, and it is the pupil of an eye in
+            // `examples/extensions/custom-header.ts:22`.
+            //
+            // M9 — the width follows from that: `markdown.ts:284` `contentWidth = width -
+            // paddingX * 2`, i.e. `width - outputPad * 2`, where the old `width - (11 + outputPad)`
+            // was budgeting for the deleted `"assistant: "`.
             let body = crate::markdown::trim_partial_closing_fence(partial);
-            let mut md =
-                crate::markdown::render(&body, width.saturating_sub(11 + self.output_pad).max(1), theme);
+            let mut md = crate::markdown::render(
+                &body,
+                width.saturating_sub(self.output_pad * 2).max(1),
+                theme,
+            );
             if md.is_empty() {
                 md.push(Line::default());
-            }
-            if let Some(first) = md.first_mut() {
-                first.spans.insert(0, Span::styled("assistant: ", theme.accent_style()));
-            }
-            if let Some(last) = md.last_mut() {
-                last.spans.push(Span::styled("▌", theme.dim_style()));
             }
             pad_lines(&mut md, self.output_pad);
             lines.extend(md);
@@ -841,7 +1154,13 @@ impl TranscriptView {
                 self.tool_expanded,
                 width,
                 theme,
-                ImageOpts { show: self.show_images, width_cells: self.image_width_cells },
+                ImageOpts {
+                    show: self.show_images,
+                    width_cells: self.image_width_cells,
+                    expand_key: self.expand_key(),
+                    cwd: self.cwd.as_deref(),
+                    tools_expanded: self.tool_expanded,
+                },
             ));
         }
         // The live `!`/`!!` bash block renders last (`bash-execution.ts` sits in the message region).
@@ -859,9 +1178,13 @@ impl TranscriptView {
 
 /// Pi's default read/write byte + line truncation limits (`truncate.ts:11-12`).
 const DEFAULT_MAX_BYTES: u64 = 50 * 1024;
-/// The `app.tools.expand` key label used in every `… to expand` hint. Pi renders the live keybinding
-/// (`keyHint`); cyrup's transcript has no keymap handle, so it uses the immutable default (Ctrl+O), the
-/// same literal the existing bash/tool hints use.
+/// The **fallback** `app.tools.expand` label, used only when the caller supplied no live one —
+/// cyrup's own default binding (`keymap.rs:378`, `Key::ctrl('o')`).
+///
+/// X9: this used to be the label itself, hard-coded at every hint site, so a user who rebound
+/// `app.tools.expand` still read `ctrl+o` on screen. Pi resolves the binding at render time
+/// (`keyText(keybinding)` → `getKeybindings().getKeys(...)`, `keybinding-hints.ts:34-36`); the live
+/// label now rides in on [`ImageOpts::expand_key`].
 const EXPAND_KEY: &str = "ctrl+o";
 
 /// Pi's `terminal.imageWidthCells` default (settings-manager.ts:1060-1066) — the cell width an
@@ -880,12 +1203,24 @@ pub const HIDDEN_THINKING_LABEL: &str = "Thinking...";
 /// Render one run of assistant reasoning (`assistant-message.ts:139-165`): the static
 /// [`HIDDEN_THINKING_LABEL`] when `hidden`, otherwise the coalesced thinking body.
 ///
-/// Both forms are painted with the `thinkingText` role in italic
-/// ([`UiTheme::thinking_text_style`]). Pi renders the body through `Markdown` with a `{color, italic}`
-/// override, i.e. every span is forced to the one colour regardless of markdown structure; cyrup
-/// therefore emits the body as plain styled lines rather than re-styling a markdown tree, which is
-/// visually equivalent and keeps the thinking block free of syntax-highlight colours.
-fn thinking_lines(text: &str, hidden: bool, theme: &UiTheme) -> Vec<Line<'static>> {
+/// X5. The hidden form is a plain `new Text(theme.italic(theme.fg("thinkingText", label)),
+/// outputPad, 0)` (`:141-143`) — one styled line. The **body** is a real
+/// `new Markdown(thinkingBlocks.join("\n\n"), this.outputPad, 0, this.markdownTheme,
+/// { color: (text) => theme.fg("thinkingText", text), italic: true }, …)` (`:146-164`).
+///
+/// The `{ color, italic }` pair reaches only `applyDefaultStyle` (`markdown.ts:377-404`), which
+/// `renderToken` hands to the `paragraph`/`text` arms alone: a `heading` builds its own style
+/// context (`:470-480`) and a fenced `code` block never consults one (`:520-539`). So `## Plan`
+/// keeps `mdHeading` and a fence keeps its border + syntax colours — a thinking block is markdown,
+/// not a flat grey wall. The doc comment that used to sit here claimed upstream "forces every span
+/// to the one colour regardless of markdown structure"; that claim was false, and it was the
+/// justification for splitting the body on `\n` and never calling the markdown renderer.
+fn thinking_lines(
+    text: &str,
+    hidden: bool,
+    width: usize,
+    theme: &UiTheme,
+) -> Vec<Line<'static>> {
     let style = theme.thinking_text_style();
     if hidden {
         return vec![Line::styled(HIDDEN_THINKING_LABEL.to_string(), style)];
@@ -894,7 +1229,7 @@ fn thinking_lines(text: &str, hidden: bool, theme: &UiTheme) -> Vec<Line<'static
     if body.is_empty() {
         return Vec::new();
     }
-    body.split('\n').map(|l| Line::styled(l.to_string(), style)).collect()
+    crate::markdown::render_with_default_style(body, width.max(1), theme, style.fg, true)
 }
 
 /// Render one tool execution into styled lines by dispatching on the tool name to its Pi-specific
@@ -922,13 +1257,13 @@ pub(crate) fn tool_lines(
         render_extension(run, expanded, theme, &mut block);
     } else {
         match run.name.as_str() {
-            "read" => render_read(run, expanded, theme, &mut block),
-            "write" => render_write(run, expanded, theme, &mut block),
+            "read" => render_read(run, expanded, theme, images, &mut block),
+            "write" => render_write(run, expanded, theme, images.expand_key, &mut block),
             "edit" => render_edit(run, theme, &mut block),
-            "bash" => render_bash(run, expanded, theme, &mut block),
-            "grep" => render_grep(run, expanded, theme, &mut block),
-            "find" => render_find(run, expanded, theme, &mut block),
-            "ls" => render_ls(run, expanded, theme, &mut block),
+            "bash" => render_bash(run, expanded, theme, images.expand_key, &mut block),
+            "grep" => render_grep(run, expanded, theme, images.expand_key, &mut block),
+            "find" => render_find(run, expanded, theme, images.expand_key, &mut block),
+            "ls" => render_ls(run, expanded, theme, images.expand_key, &mut block),
             _ => render_generic(run, theme, &mut block),
         }
     }
@@ -942,7 +1277,17 @@ pub(crate) fn tool_lines(
         push_image_fallbacks(run, theme, &mut block);
     }
     // The block is state-tinted (bg-only); a leading untinted blank stands in for the component Spacer.
-    let bg = theme.tool_bg_style(Style::default(), run.done, run.is_error);
+    //
+    // X8 — `edit` is the one tool whose tint is NOT the shared `done`/`is_error` one. Pi gives it
+    // `getEditHeaderBg(component.preview, component.settledError)` (`edit.ts:239-253`, applied at
+    // `:262`), which tests the PREVIEW first and never looks at `done`: a preview diff computed from
+    // the streamed arguments greens the block while the call is still pending, and a preview that
+    // failed reds it.
+    let bg = if run.name == "edit" && run.rendered_call.is_none() && run.rendered_result.is_none() {
+        theme.edit_bg_style(Style::default(), edit_header_preview(run), run.is_error)
+    } else {
+        theme.tool_bg_style(Style::default(), run.done, run.is_error)
+    };
     let mut out = vec![Line::default()];
     out.extend(finalize_block(block, width, bg));
     if inline {
@@ -951,17 +1296,42 @@ pub(crate) fn tool_lines(
     out
 }
 
-/// How a tool result's `image` blocks should render: `show` is `terminal.showImages`, `width_cells`
-/// is `terminal.imageWidthCells` (Pi's `maxWidthCells`).
+/// The per-frame render inputs a tool block needs that are not on the [`ToolRun`] itself — Pi's
+/// `ToolRenderContext` (`extensions/types.ts`, built at `tool-execution.ts:116-135`), narrowed to
+/// the three fields cyrup's built-ins actually read.
+///
+/// `show`/`width_cells` are `terminal.showImages` / `terminal.imageWidthCells` (Pi's
+/// `maxWidthCells`). `expand_key` and `cwd` are `context.expanded`'s companions: the live
+/// `app.tools.expand` label every `… to expand` hint resolves through (`keyText`,
+/// `keybinding-hints.ts:34-36`) and `context.cwd`, which `read`'s compact classification resolves
+/// its path against (`read.ts:336`, `resolveToCwd(rawPath, cwd)`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ImageOpts {
+pub(crate) struct ImageOpts<'a> {
     pub show: bool,
     pub width_cells: u16,
+    /// The live `app.tools.expand` label; [`EXPAND_KEY`] when the caller has no keymap in hand.
+    pub expand_key: &'a str,
+    /// Pi `ToolRenderContext.cwd` — the SESSION's working directory, not necessarily the process's.
+    /// `None` falls back to the process cwd.
+    pub cwd: Option<&'a std::path::Path>,
+    /// X14 — the LIVE `this.toolOutputExpanded` (`interactive-mode.ts:442`), the flag `Ctrl+O` /
+    /// `setToolsExpanded` drive. Upstream never stores an expansion on a message: it seeds each
+    /// component from this field at construction (`:3486`, `:3493`) and re-broadcasts to every
+    /// `chatContainer` child on each toggle (`:4032-4046`), so the value in force at PAINT time is
+    /// what renders. The branch/compaction summary arms of [`entry_lines`] read it here for exactly
+    /// that reason. Defaults to `false`, Pi's own initial value.
+    pub tools_expanded: bool,
 }
 
-impl Default for ImageOpts {
+impl Default for ImageOpts<'_> {
     fn default() -> Self {
-        ImageOpts { show: true, width_cells: DEFAULT_IMAGE_WIDTH_CELLS }
+        ImageOpts {
+            show: true,
+            width_cells: DEFAULT_IMAGE_WIDTH_CELLS,
+            expand_key: EXPAND_KEY,
+            cwd: None,
+            tools_expanded: false,
+        }
     }
 }
 
@@ -1038,55 +1408,350 @@ fn decode_result_images(result: &Value) -> Vec<ResultImage> {
         .collect()
 }
 
-/// Apply the shared tool-block chrome to each already-fg-styled line: a 1-column left inset (Pi's
-/// `Box(1, 1)` padding, tool-execution.ts:68) + a right-pad to `width` so the state tint fills the full
-/// content width (`applyBackgroundToLine`, markdown.ts:216), then patch the state background on.
-fn finalize_block(mut lines: Vec<Line<'static>>, width: usize, bg: Style) -> Vec<Line<'static>> {
-    for line in &mut lines {
-        line.spans.insert(0, Span::raw(" "));
-        let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-        if len < width {
-            line.spans.push(Span::raw(" ".repeat(width - len)));
-        }
-        line.style = line.style.patch(bg);
+/// Visible width of one **grapheme cluster** in terminal columns, via ratatui's
+/// unicode-width-backed `Span::width` (Pi's `graphemeWidth`, `utils.ts:174-235`).
+///
+/// Deliberately the same measure [`apply_bg`] reaches through [`Line::width`]: L6's defect was that
+/// the wrap point and the background pad disagreed, so the fix is only a fix if both halves count
+/// the same way. `Span::width` sums `unicode_width` per `char`, so summing it per grapheme over a
+/// span is identical to calling it once on the whole span — the two can never drift.
+fn grapheme_cols(g: &str) -> usize {
+    Span::raw(g).width()
+}
+
+/// Whether a grapheme cluster is whitespace (`token.trim() === ""`, `utils.ts:876`).
+pub(crate) fn is_ws_grapheme(g: &str) -> bool {
+    g.chars().all(char::is_whitespace)
+}
+
+/// Greedy word-wrap one styled line into `width`-column rows, preserving each span's style.
+///
+/// Port of `wrapSingleLine` (`tui/src/utils.ts:857-936`), which `Text`/`Markdown` run before a
+/// `Box` re-pads them and which is therefore what makes `box.ts:85`'s `child.render(contentWidth)`
+/// actually produce `contentWidth`-wide rows. Upstream's `AnsiCodeTracker` plumbing
+/// (`:868`, `:914`, `:917`) is deliberately absent: a terminal line break clears the active SGR
+/// state, so upstream must re-emit it at the head of every produced row, whereas ratatui carries
+/// style per `Span` and the styles travel with the characters.
+///
+/// Semantics kept verbatim: an over-wide single token is hard-broken (`breakLongWord`, `:879-899`),
+/// a wrap never starts a row with whitespace (`:912-915`), and every produced row is right-trimmed
+/// (`:935`).
+///
+/// **The unit is the grapheme cluster, never the `char`.** Both of upstream's loops run over
+/// `graphemeSegmenter.segment(...)`: `splitIntoTokensWithAnsi` builds its tokens grapheme by
+/// grapheme (`utils.ts:775-798`) and `breakLongWord` segments the over-wide token the same way
+/// before measuring it (`:979-980`, `:994-1012`). Wrapping per `char` instead tears a ZWJ emoji
+/// sequence or a combining mark away from its base — a correctness bug, not a spacing one — and it
+/// also measures differently from [`apply_bg`], which is exactly the disagreement L6 is about.
+///
+/// `pub(crate)` because [`crate::markdown`] is upstream's THIRD consumer of the same primitive —
+/// `wrapTextWithAnsi` is called from `text.ts:67`, `box.ts` (transitively, through its child) AND
+/// `markdown.ts:322`/`:594`/`:788`. There is exactly one wrapper here for the same reason there is
+/// exactly one upstream; do not grow a fourth.
+pub(crate) fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    if line.width() <= width {
+        return vec![line.clone()];
     }
-    lines
+    // Flatten to (grapheme, style) cells so a word may straddle a span boundary. Upstream segments
+    // per non-ANSI run, i.e. per style run, which is exactly per `Span` here (`utils.ts:770-798`).
+    let mut cells: Vec<(&str, Style)> = Vec::new();
+    for span in &line.spans {
+        let st = span.style;
+        cells.extend(span.content.graphemes(true).map(|g| (g, st)));
+    }
+    // Tokenize into alternating whitespace / non-whitespace runs (`splitIntoTokensWithAnsi`).
+    let mut tokens: Vec<Vec<(&str, Style)>> = Vec::new();
+    for cell in cells {
+        let ws = is_ws_grapheme(cell.0);
+        match tokens.last_mut() {
+            Some(tok) if tok.first().is_some_and(|f| is_ws_grapheme(f.0) == ws) => tok.push(cell),
+            _ => tokens.push(vec![cell]),
+        }
+    }
+
+    let mut rows: Vec<Vec<(&str, Style)>> = Vec::new();
+    let mut cur: Vec<(&str, Style)> = Vec::new();
+    let mut cur_w = 0usize;
+    for tok in tokens {
+        let tok_w: usize = tok.iter().map(|(g, _)| grapheme_cols(g)).sum();
+        let is_ws = tok.first().is_some_and(|(g, _)| is_ws_grapheme(g));
+        if tok_w > width && !is_ws {
+            if !cur.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            // `breakLongWord` (`:954-1015`) walks the token one GRAPHEME at a time, so a cluster is
+            // never split across the break.
+            for cell in tok {
+                let w = grapheme_cols(cell.0);
+                if cur_w + w > width && !cur.is_empty() {
+                    rows.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                cur_w += w;
+                cur.push(cell);
+            }
+            continue;
+        }
+        if cur_w + tok_w > width && cur_w > 0 {
+            rows.push(std::mem::take(&mut cur));
+            cur_w = 0;
+            if is_ws {
+                continue;
+            }
+        }
+        cur_w += tok_w;
+        cur.extend(tok);
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+
+    rows.into_iter()
+        .map(|mut row| {
+            while row.last().is_some_and(|(g, _)| is_ws_grapheme(g)) {
+                row.pop();
+            }
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (g, st) in row {
+                match spans.last_mut() {
+                    Some(last) if last.style == st => last.content.to_mut().push_str(g),
+                    _ => spans.push(Span::styled(g.to_string(), st)),
+                }
+            }
+            let mut out = Line::from(spans);
+            out.style = line.style;
+            out
+        })
+        .collect()
+}
+
+/// Port of `Box.render` (`tui/src/components/box.ts:74-136`), the shell every tinted transcript
+/// block is built from.
+///
+/// Upstream renders its children at `contentWidth = max(1, width - paddingX * 2)` (`:79`), prefixes
+/// `leftPad` to every produced row (`:80`, `:87`), then emits `paddingY` background-filled blank
+/// rows, the content, and `paddingY` more blank rows (`:106-119`). `applyBg` (`:127-136`) pads each
+/// row to the full `width` and paints the background across it. An empty child set renders nothing
+/// at all (`:75-77`, `:91-93`) — no stray tinted blanks.
+///
+/// Callers that pass a non-zero `paddingY` upstream, i.e. every one of them: `tool-execution.ts:68`
+/// `new Box(1, 1, toolPendingBg)` (and its `:69` `new Text("", 1, 1, …)` fallback), `edit.ts:158`
+/// `new Box(1, 1, …)` (the self-shelled edit block), `user-message.ts:40`
+/// `new Box(this.outputPad, 1, userMessageBg)`, `custom-message.ts:36`, `custom-entry.ts:49` and the
+/// three `extends Box` message components — `skill-invocation-message.ts:17`,
+/// `branch-summary-message.ts:16`, `compaction-summary-message.ts:16` — each `super(1, 1,
+/// customMessageBg)`. `git grep "new Box(" v0.84.1 -- packages/` finds no other production site and
+/// no caller passing `paddingY = 0`.
+fn box_lines(
+    children: Vec<Line<'static>>,
+    width: usize,
+    padding_x: usize,
+    padding_y: usize,
+    bg: Style,
+) -> Vec<Line<'static>> {
+    if children.is_empty() {
+        return Vec::new();
+    }
+    let content_width = width.saturating_sub(padding_x * 2).max(1);
+    let left = " ".repeat(padding_x);
+    let mut content: Vec<Line<'static>> = Vec::new();
+    for child in &children {
+        for mut row in wrap_line(child, content_width) {
+            if padding_x > 0 {
+                row.spans.insert(0, Span::raw(left.clone()));
+            }
+            content.push(row);
+        }
+    }
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(content.len() + padding_y * 2);
+    for _ in 0..padding_y {
+        out.push(apply_bg(Line::default(), width, bg));
+    }
+    for row in content {
+        out.push(apply_bg(row, width, bg));
+    }
+    for _ in 0..padding_y {
+        out.push(apply_bg(Line::default(), width, bg));
+    }
+    out
+}
+
+/// `Box.applyBg` (`box.ts:127-136`): right-pad to `width` and paint the background over the whole
+/// row.
+///
+/// The pad is measured with `Line::width()` — ratatui's unicode-width sum, the analogue of
+/// upstream's `visibleWidth(line)` (`:128`). It used to be `chars().count()`, which **under**-counts
+/// every CJK ideograph, emoji and box-drawing glyph, so the row was over-padded past the frame and
+/// spilled into a spurious extra tinted row.
+fn apply_bg(mut line: Line<'static>, width: usize, bg: Style) -> Line<'static> {
+    let vis = line.width();
+    if vis < width {
+        line.spans.push(Span::raw(" ".repeat(width - vis)));
+    }
+    line.style = line.style.patch(bg);
+    line
+}
+
+/// Port of `Text.render` (`tui/src/components/text.ts:60-87`) for one already-styled **[`Line`]**,
+/// at `paddingY = 0` — the multi-span form, so a row built from several differently-styled pieces
+/// (a `keyHint` pair's dim key + muted description, say) keeps every colour across the wrap.
+///
+/// Upstream has only this form: a `Text` is constructed from ONE string that already carries its
+/// ANSI runs (`theme.fg("dim", …) + theme.fg("muted", …)`), and `wrapTextWithAnsi` carries those
+/// runs through the wrap (`utils.ts:770-798`). [`wrap_line`] is that primitive; this adds `:64`'s
+/// `contentWidth` and `:70-76`'s left margin. See [`text_lines`] for the single-style convenience
+/// wrapper over it.
+pub(crate) fn text_lines_of(
+    src: &Line<'static>,
+    width: usize,
+    padding_x: usize,
+) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(padding_x * 2).max(1);
+    let left = " ".repeat(padding_x);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for mut row in wrap_line(src, content_width) {
+        if padding_x > 0 {
+            row.spans.insert(0, Span::raw(left.clone()));
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// Port of `Text.render` (`tui/src/components/text.ts:60-87`) for one already-styled string, at
+/// `paddingY = 0`.
+///
+/// Upstream wraps at `contentWidth = max(1, width - paddingX * 2)` (`:64`) and then emits
+/// `leftMargin + line + rightMargin` per produced row (`:70-76`). The right margin and the pad to
+/// `width` (`:83-85`) are only observable through a background, and a bare `Text` has none, so they
+/// are not materialised here — a trailing run of blanks is invisible in a ratatui cell grid and
+/// would only defeat the right-trim [`wrap_line`] performs.
+fn text_lines(text: &str, width: usize, padding_x: usize, style: Style) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    // `wrapTextWithAnsi` splits on newlines first (`utils.ts:839`) and wraps each piece.
+    for logical in text.split('\n') {
+        // The style rides on the SPAN, not the `Line` — upstream's colour is baked into the string
+        // the `Text` was constructed with (`theme.fg("dim", message)`), inside the margins, so it
+        // survives being nested in a `Box` that later paints `Line::style` with a background.
+        out.extend(text_lines_of(&Line::from(Span::styled(logical.to_string(), style)), width, padding_x));
+    }
+    out
+}
+
+/// The tool block's shell: `new Box(1, 1, <state bg>)` (tool-execution.ts:68).
+fn finalize_block(lines: Vec<Line<'static>>, width: usize, bg: Style) -> Vec<Line<'static>> {
+    box_lines(lines, width, 1, 1, bg)
 }
 
 // --- per-tool renderers ------------------------------------------------------------------------
 //
 // Each pushes fg-styled logical lines into `out`; `tool_lines` adds the leading spacer + state tint.
 
-/// `read` — header `read <path>:<range>` + (only when expanded/error) the file body (`read.ts:74-201`).
-fn render_read(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
-    let mut spans = vec![Span::styled("read ", theme.tool_title_style())];
-    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
-    if let Some(range) = read_line_range(&run.args) {
-        spans.push(Span::styled(range, theme.warning_style()));
+/// Port of `replaceTabs` (`core/tools/render-utils.ts:31-33`): `text.replace(/\t/g, "   ")`.
+///
+/// X6 — every `read`/`write` body row goes through this upstream, on BOTH sides of the
+/// `lang ? … : …` ternary (`read.ts:185,190`, `write.ts:153,160`). cyrup pushed the raw string, so a
+/// tab expanded at the terminal's own 8-column stops and the block's alignment drifted from Pi's
+/// fixed three spaces. Exactly three spaces, not a tab-stop-aware expansion — upstream's regex is
+/// positional-context-free.
+fn replace_tabs(text: &str) -> String {
+    text.replace('\t', "   ")
+}
+
+/// X6 — one already-`replaceTabs`'d body row, syntax-highlighted when the path resolved to a
+/// language and flat `toolOutput` otherwise.
+///
+/// This is the whole of `read.ts:190`'s ternary
+/// `lang ? replaceTabs(line) : theme.fg("toolOutput", replaceTabs(line))` — note the `lang` arm
+/// carries NO `toolOutput` colour, because the highlighter already coloured it. Pi highlights the
+/// joined body once (`highlightCode(replaceTabs(output), lang)`, `:185`) and splits it back into
+/// lines; cyrup's [`crate::markdown::highlight_code_lines`] returns the same per-line vector, so the
+/// rows are indexed rather than re-highlighted one at a time (syntect is stateful — highlighting a
+/// line in isolation loses an open string/comment run).
+fn body_line(
+    raw: &str,
+    highlighted: Option<&Vec<Line<'static>>>,
+    idx: usize,
+    theme: &UiTheme,
+) -> Line<'static> {
+    match highlighted.and_then(|h| h.get(idx)) {
+        Some(l) => l.clone(),
+        None => Line::styled(replace_tabs(raw), theme.tool_output_style()),
     }
-    out.push(Line::from(spans));
+}
+
+/// `read` — header `read <path>:<range>` + (only when expanded/error) the file body (`read.ts:74-201`).
+fn render_read(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    opts: ImageOpts<'_>,
+    out: &mut Vec<Line<'static>>,
+) {
+    // X7 — `renderCall` picks between two headers (`read.ts:334-343`):
+    // `const classification = !context.expanded ? getCompactReadClassification(args, context.cwd) : undefined;`
+    // so the compact `[skill] name` / `read resource <label>` form is COLLAPSED-only; expanding a
+    // skill read falls back to the plain `read <path>` header plus the body.
+    let classification =
+        if expanded { None } else { compact_read_classification(&run.args, opts.cwd) };
+    match classification {
+        Some(c) => out.push(compact_read_call(&c, &run.args, opts.expand_key, theme)),
+        None => {
+            let mut spans = vec![Span::styled("read ", theme.tool_title_style())];
+            spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
+            if let Some(range) = read_line_range(&run.args) {
+                spans.push(Span::styled(range, theme.warning_style()));
+            }
+            out.push(Line::from(spans));
+        }
+    }
     // `formatReadResult`: nothing below the header when collapsed & not an error (read.ts:173-175).
     let Some(result) = &run.result else { return };
     if !expanded && !run.is_error {
         return;
     }
     let output = result_text(result);
+    // `const lang = !isError && rawPath ? getLanguageFromPath(rawPath) : undefined` (`read.ts:184`).
+    let raw_path = match str_arg(&run.args, &["file_path", "path"]) {
+        StrArg::Value(p) => p,
+        _ => String::new(),
+    };
+    let lang = if run.is_error || raw_path.is_empty() {
+        None
+    } else {
+        crate::theme::language_from_path(&raw_path)
+    };
+    // `highlightCode(replaceTabs(output), lang)` — the tabs are replaced BEFORE the highlighter runs
+    // on this side of the ternary (`read.ts:185`), so a leading tab is three highlighted spaces.
+    let highlighted =
+        lang.and_then(|l| crate::markdown::highlight_code_lines(&replace_tabs(&output), l, theme));
     let all = trim_trailing_empty(output.split('\n').collect());
     let total = all.len();
     let shown = if expanded { total } else { total.min(10) };
     out.push(Line::default());
-    for l in all.iter().take(shown) {
-        out.push(Line::styled((*l).to_string(), theme.tool_output_style()));
+    for (i, l) in all.iter().take(shown).enumerate() {
+        out.push(body_line(l, highlighted.as_ref(), i, theme));
     }
     let remaining = total.saturating_sub(shown);
     if remaining > 0 {
-        out.push(more_lines_hint(remaining, None, theme));
+        out.push(more_lines_hint(remaining, None, opts.expand_key, theme));
     }
     push_read_truncation(result, theme, out);
 }
 
 /// `write` — header `write <path>` + a content preview from the call args (`write.ts:131-179`).
-fn render_write(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+fn render_write(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    expand_key: &str,
+    out: &mut Vec<Line<'static>>,
+) {
     let mut spans = vec![Span::styled("write ", theme.tool_title_style())];
     spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
     out.push(Line::from(spans));
@@ -1101,16 +1766,31 @@ fn render_write(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Li
         StrArg::Missing => {}
         StrArg::Value(content) => {
             let display = content.replace('\r', "");
+            // X6 — `const lang = rawPath ? getLanguageFromPath(rawPath) : undefined` (`write.ts:151`).
+            // Unlike `read` there is no `isError` leg: the preview comes from the ARGUMENTS, so it is
+            // highlighted whether or not the write went on to fail.
+            let raw_path = match str_arg(&run.args, &["file_path", "path"]) {
+                StrArg::Value(p) => p,
+                _ => String::new(),
+            };
+            let lang = if raw_path.is_empty() {
+                None
+            } else {
+                crate::theme::language_from_path(&raw_path)
+            };
+            let highlighted = lang.and_then(|l| {
+                crate::markdown::highlight_code_lines(&replace_tabs(&display), l, theme)
+            });
             let all = trim_trailing_empty(display.split('\n').collect());
             let total = all.len();
             let shown = if expanded { total } else { total.min(10) };
             out.push(Line::default());
-            for l in all.iter().take(shown) {
-                out.push(Line::styled((*l).to_string(), theme.tool_output_style()));
+            for (i, l) in all.iter().take(shown).enumerate() {
+                out.push(body_line(l, highlighted.as_ref(), i, theme));
             }
             let remaining = total.saturating_sub(shown);
             if remaining > 0 {
-                out.push(more_lines_hint(remaining, Some(total), theme));
+                out.push(more_lines_hint(remaining, Some(total), expand_key, theme));
             }
         }
     }
@@ -1120,31 +1800,109 @@ fn render_write(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Li
     }
 }
 
-/// `edit` — header `edit <path>` + the result self-diff (`edit.ts:200-227/363-431`, rendered via
+/// `edit` — header `edit <path>` + the diff (`edit.ts:200-227/244-262/363-431`, rendered via
 /// [`crate::diff::render_diff`], the port of `diff.ts`).
+///
+/// Two sources feed that diff, in Pi's order:
+///
+/// 1. the **pre-execution preview** ([`ToolRun::preview`], Pi `buildEditCallComponent`
+///    edit.ts:244-262): a `Spacer(1)` then the diff `computeEditsDiff` produced from the arguments
+///    alone, or the failure message in the error colour. This is on screen while the call is still
+///    PENDING — including for the whole time a permission prompt is up — and before anything is
+///    written.
+/// 2. the settled result's `details.diff`, which **replaces** the preview rather than being appended
+///    below it. That is Pi's own ordering, and it is easy to misread: `renderResult` calls
+///    `setEditPreview(callComponent, { diff: result.details.diff, … })` (edit.ts:196-204) BEFORE
+///    handing `callComponent.preview` to `formatEditResult`, so by the time `formatEditResult` tests
+///    `resultDiff !== previewDiff` (`:220-223`) the two are the same object and the result body
+///    renders nothing. The diff is therefore drawn exactly once, by the call component, and it is
+///    the authoritative post-write one.
+///
+/// The same de-duplication applies to failures: an error result whose text merely restates the
+/// preview error is dropped (`:212-218`), while a preview that succeeded stays on screen next to an
+/// error the tool itself hit.
+/// X8 — which of Pi's three `getEditHeaderBg` preview states this run is in
+/// (`core/tools/edit.ts:239-253`).
+///
+/// `EditCallRenderComponent.preview` is a single slot that BOTH the pre-execution `computeEditsDiff`
+/// (`renderCall`, `:385`) and the settled result (`renderResult`'s `setEditPreview` from
+/// `details.diff`, `:400-411`) write, the result overwriting the preview. So the result diff is
+/// tested first here, exactly as `renderResult` runs before `buildEditCallComponent` rebuilds the
+/// component. The two are read with the same accessors [`render_edit`] uses, so the tint can never
+/// disagree with the body drawn inside it.
+fn edit_header_preview(run: &ToolRun) -> crate::theme::EditHeaderPreview {
+    use crate::theme::EditHeaderPreview as P;
+    let result_diff = run
+        .result
+        .as_ref()
+        .filter(|_| !run.is_error)
+        .and_then(|r| r.get("details"))
+        .and_then(|d| d.get("diff"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if result_diff.is_some() {
+        return P::Computed;
+    }
+    match &run.preview {
+        Some(Ok(d)) if !d.is_empty() => P::Computed,
+        Some(Err(e)) if !e.trim().is_empty() => P::Failed,
+        _ => P::Absent,
+    }
+}
+
 fn render_edit(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     let mut spans = vec![Span::styled("edit ", theme.tool_title_style())];
     spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
     out.push(Line::from(spans));
-    let Some(result) = &run.result else { return };
-    if run.is_error {
-        push_error_body(result, theme, out);
-        return;
-    }
-    if let Some(diff) = result
-        .get("details")
+
+    let preview_diff = match &run.preview {
+        Some(Ok(d)) if !d.is_empty() => Some(d.as_str()),
+        _ => None,
+    };
+    let preview_error = match &run.preview {
+        Some(Err(e)) if !e.trim().is_empty() => Some(e.as_str()),
+        _ => None,
+    };
+    // The settled diff supersedes the preview (`setEditPreview` from `renderResult`, edit.ts:196-204).
+    let result_diff = run
+        .result
+        .as_ref()
+        .filter(|_| !run.is_error)
+        .and_then(|r| r.get("details"))
         .and_then(|d| d.get("diff"))
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
+        .filter(|s| !s.is_empty());
+
+    if let Some(diff) = result_diff.or(preview_diff) {
         out.push(Line::default());
         out.extend(crate::diff::render_diff(diff, theme));
+    } else if let Some(err) = preview_error {
+        out.push(Line::default());
+        for l in err.split('\n') {
+            out.push(Line::styled(l.to_string(), theme.error_style()));
+        }
+    }
+
+    if run.is_error
+        && let Some(result) = &run.result
+    {
+        // `if (!errorText || errorText === previewError) return undefined` (edit.ts:215-217).
+        if preview_error.is_some_and(|e| result_text(result).trim() == e.trim()) {
+            return;
+        }
+        push_error_body(result, theme, out);
     }
 }
 
 /// `bash` — header `$ <command> (timeout Ns)` + the output tail (collapsed = last 5 visual lines) +
 /// truncation notices + a `Took {d}s` footer (`bash.ts:201-289/430-464`).
-fn render_bash(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+fn render_bash(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    expand_key: &str,
+    out: &mut Vec<Line<'static>>,
+) {
     // Header: `$ command`, bold, + a muted ` (timeout Ns)` suffix (`formatBashCall`).
     let title = theme.tool_title_style();
     let mut spans = Vec::new();
@@ -1181,10 +1939,19 @@ fn render_bash(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Lin
                 let shown = total.min(5);
                 let skipped = total - shown;
                 if skipped > 0 {
-                    out.push(Line::styled(
-                        format!("... ({skipped} earlier lines, {EXPAND_KEY} to expand)"),
-                        theme.muted_style(),
-                    ));
+                    // X9 — same three-run shape as [`more_lines_hint`], with `bash.ts:281-284`'s own
+                    // wording:
+                    // `fg("muted", `... (${skipped} earlier lines,`) + ` ${keyHint("app.tools.expand", "to expand")}` + fg("muted", ")")`.
+                    let mut spans = vec![
+                        Span::styled(
+                            format!("... ({skipped} earlier lines,"),
+                            theme.muted_style(),
+                        ),
+                        Span::raw(" "),
+                    ];
+                    spans.extend(key_hint_spans(expand_key, "to expand", theme));
+                    spans.push(Span::styled(")".to_string(), theme.muted_style()));
+                    out.push(Line::from(spans));
                 }
                 for l in all.iter().skip(skipped) {
                     out.push(Line::styled((*l).to_string(), theme.tool_output_style()));
@@ -1192,9 +1959,30 @@ fn render_bash(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Lin
             }
         }
         push_bash_warnings(result, theme, out);
-        if let Some(ms) = run.duration_ms {
+        // The duration footer (bash.ts:309-313). Upstream is literally
+        // `const label = options.isPartial ? "Elapsed" : "Took"` with
+        // `formatDuration((endedAt ?? Date.now()) - startedAt)`, so a RUNNING command shows a live
+        // `Elapsed 12.3s` that only becomes `Took 12.4s` when the call settles — the tool's
+        // `renderResult` arms a 1 s `setInterval(() => context.invalidate())` (`:471-473`) precisely
+        // to make it tick. It is gated on `startedAt`, which `renderCall` stamps the moment
+        // execution begins (`:460-463`), NOT on the result being final; `run.result` is already
+        // `Some` from the first frame because bash emits an initial empty update before it spawns
+        // (bash.ts:384-385, ported at `cyrup-tools/src/tools/bash.rs:170`), which is what makes
+        // upstream's `if (this.result)` renderResult gate (tool-execution.ts:281) pass too.
+        //
+        // Before this, cyrup keyed the line on `duration_ms`, which is written only on settle
+        // (`push_tool_end_rendered`), so a long-running command rendered NO duration at all — the
+        // one number that tells a user a 10-minute build is still alive.
+        if let Some(started) = run.started_at {
+            let (label, ms) = match run.duration_ms {
+                Some(ms) => ("Took", ms),
+                None => ("Elapsed", started.elapsed().as_millis() as u64),
+            };
+            // X10 — `bash.ts:317` is `new Text(`\n${theme.fg("muted", …)}`, 0, 0)`: the same
+            // leading-`\n` blank row as the warnings block above.
+            out.push(Line::default());
             out.push(Line::styled(
-                format!("Took {}", format_duration(ms)),
+                format!("{label} {}", format_duration(ms)),
                 theme.muted_style(),
             ));
         }
@@ -1203,7 +1991,13 @@ fn render_bash(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Lin
 
 /// `grep` — header `grep /<pattern>/ in <path> (glob) limit N` + matching lines (head-15) + a
 /// `[Truncated: …]` notice (`grep.ts:68-121/370-379`).
-fn render_grep(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+fn render_grep(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    expand_key: &str,
+    out: &mut Vec<Line<'static>>,
+) {
     let title = theme.tool_title_style();
     let outp = theme.tool_output_style();
     let mut spans = vec![Span::styled("grep ".to_string(), title)];
@@ -1221,13 +2015,19 @@ fn render_grep(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Lin
         spans.push(Span::styled(format!(" limit {limit}"), outp));
     }
     out.push(Line::from(spans));
-    push_list_output(run, expanded, 15, theme, out);
+    push_list_output(run, expanded, 15, theme, expand_key, out);
     push_grep_warnings(run.result.as_ref(), theme, out);
 }
 
 /// `find` — header `find <pattern> in <path> (limit N)` + matching paths (head-20) + a `[Truncated: …]`
 /// notice (`find.ts:59-107/359-368`).
-fn render_find(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+fn render_find(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    expand_key: &str,
+    out: &mut Vec<Line<'static>>,
+) {
     let title = theme.tool_title_style();
     let outp = theme.tool_output_style();
     let mut spans = vec![Span::styled("find ".to_string(), title)];
@@ -1242,20 +2042,26 @@ fn render_find(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Lin
         spans.push(Span::styled(format!(" (limit {limit})"), outp));
     }
     out.push(Line::from(spans));
-    push_list_output(run, expanded, 20, theme, out);
+    push_list_output(run, expanded, 20, theme, expand_key, out);
     push_find_warnings(run.result.as_ref(), theme, out);
 }
 
 /// `ls` — header `ls <path> (limit N)` + entries (head-20) + a `[Truncated: …]` notice
 /// (`ls.ts:52-93/210-219`).
-fn render_ls(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+fn render_ls(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    expand_key: &str,
+    out: &mut Vec<Line<'static>>,
+) {
     let mut spans = vec![Span::styled("ls ".to_string(), theme.tool_title_style())];
     spans.push(tool_path_span(&run.args, &["path"], Some("."), theme));
     if let Some(limit) = run.args.get("limit").and_then(Value::as_i64) {
         spans.push(Span::styled(format!(" (limit {limit})"), theme.tool_output_style()));
     }
     out.push(Line::from(spans));
-    push_list_output(run, expanded, 20, theme, out);
+    push_list_output(run, expanded, 20, theme, expand_key, out);
     push_ls_warnings(run.result.as_ref(), theme, out);
 }
 
@@ -1375,13 +2181,164 @@ fn read_line_range(args: &Value) -> Option<String> {
     })
 }
 
-/// A `... (N more lines[, M total], ctrl+o to expand)` hint (read/write/grep/find/ls collapsed tail).
-fn more_lines_hint(remaining: usize, total: Option<usize>, theme: &UiTheme) -> Line<'static> {
-    let text = match total {
-        Some(t) => format!("... ({remaining} more lines, {t} total, {EXPAND_KEY} to expand)"),
-        None => format!("... ({remaining} more lines, {EXPAND_KEY} to expand)"),
+/// Port of `keyHint(keybinding, description)` (`keybinding-hints.ts:42-44`):
+///
+/// ```ts
+/// return theme.fg("dim", keyText(keybinding)) + theme.fg("muted", ` ${description}`);
+/// ```
+///
+/// TWO runs, not one — the key label alone is `dim` and the words after it are `muted`, and the
+/// separating space belongs to the muted run. `bash.rs`'s X16 hint already renders exactly this
+/// shape; X9 is the same primitive extracted so the transcript's hints stop disagreeing with it.
+fn key_hint_spans(key: &str, description: &str, theme: &UiTheme) -> [Span<'static>; 2] {
+    [
+        Span::styled(key.to_string(), theme.dim_style()),
+        Span::styled(format!(" {description}"), theme.muted_style()),
+    ]
+}
+
+/// A `... (N more lines[, M total], <key> to expand)` hint (read/write/grep/find/ls collapsed tail).
+///
+/// X9 — upstream is one interpolation with THREE colour runs
+/// (`read.ts:192` = `grep.ts:111` = `find.ts:108` = `ls.ts:85`, and `write.ts:162` with the extra
+/// `N total,`):
+///
+/// ```ts
+/// theme.fg("muted", `\n... (${remaining} more lines,`) + " " + keyHint("app.tools.expand", "to expand") + theme.fg("muted", ")")
+/// ```
+///
+/// so the key label is `dim` against `muted` words — and the space between the count and the key is
+/// OUTSIDE both `fg()` calls, i.e. unstyled. cyrup painted the whole sentence one flat `muted` and
+/// spelled the key as the compile-time literal `ctrl+o`, so a rebound `app.tools.expand` still
+/// printed `ctrl+o`; `key` is now the live `keyText` label.
+fn more_lines_hint(
+    remaining: usize,
+    total: Option<usize>,
+    key: &str,
+    theme: &UiTheme,
+) -> Line<'static> {
+    let lead = match total {
+        Some(t) => format!("... ({remaining} more lines, {t} total,"),
+        None => format!("... ({remaining} more lines,"),
     };
-    Line::styled(text, theme.muted_style())
+    let mut spans = vec![Span::styled(lead, theme.muted_style()), Span::raw(" ")];
+    spans.extend(key_hint_spans(key, "to expand", theme));
+    spans.push(Span::styled(")".to_string(), theme.muted_style()));
+    Line::from(spans)
+}
+
+/// The file names `getCompactReadClassification` treats as a "resource" read
+/// (`core/tools/read.ts:42` `COMPACT_RESOURCE_FILE_NAMES`). Verbatim, including the two `.MD`
+/// spellings — the set is matched case-SENSITIVELY upstream (`Set.has(basename(absolutePath))`), so
+/// `agents.md` is deliberately not in it.
+const COMPACT_RESOURCE_FILE_NAMES: [&str; 5] =
+    ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+
+/// One `CompactReadClassification` (`read.ts:37-40`) — `kind` is `"docs" | "resource" | "skill"`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompactRead {
+    kind: &'static str,
+    label: String,
+}
+
+/// Port of `getCompactReadClassification` (`core/tools/read.ts:122-143`). **X7 = `G30b`** in
+/// `PARITY-GAPS.md` §2.5 — the same unported function; porting it here closes both, and neither
+/// backlog should re-land it.
+///
+/// ```ts
+/// const absolutePath = resolveToCwd(rawPath, cwd);
+/// const fileName = basename(absolutePath);
+/// if (fileName === "SKILL.md") return { kind: "skill", label: basename(dirname(absolutePath)) || fileName };
+/// const docsClassification = getPiDocsClassification(absolutePath);
+/// if (docsClassification) return docsClassification;
+/// if (COMPACT_RESOURCE_FILE_NAMES.has(fileName)) return { kind: "resource", label: formatPathRelativeToCwdOrAbsolute(absolutePath, cwd) };
+/// return undefined;
+/// ```
+///
+/// The `docs` arm is the one piece that cannot be ported here, and the missing seam is specific:
+/// `getPiDocsClassification` (`:103-120`) resolves the read path against `dirname(getReadmePath())`
+/// — the directory of the SHIPPED package's `README.md` (`coding-agent/src/config.ts`) — to label
+/// `README.md`/`docs/…`/`examples/…` inside pi's own install. `getReadmePath` has no counterpart
+/// anywhere in `crates/` (`grep -rn "readme_path\|getReadmePath" crates --include=*.rs` is empty),
+/// and a Rust binary ships no such tree, so there is no path to compare against. `skill` and
+/// `resource` are complete; `docs` needs a packaged-docs locator to exist first.
+fn compact_read_classification(
+    args: &Value,
+    cwd: Option<&std::path::Path>,
+) -> Option<CompactRead> {
+    let raw_path = match str_arg(args, &["file_path", "path"]) {
+        StrArg::Value(p) => p,
+        // `if (!rawPath) return undefined` (`:127`) — covers both the empty and the non-string case,
+        // since `str()` yields `""`/`null` and both are falsy.
+        _ => return None,
+    };
+    // `resolveToCwd(rawPath, cwd)` — an absolute path is kept, a relative one is joined to the
+    // session cwd. `Path::join` has exactly that semantic for an absolute right-hand side.
+    let base = match cwd {
+        Some(c) => c.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    let absolute = base.join(&raw_path);
+    let file_name = absolute.file_name()?.to_string_lossy().into_owned();
+    if file_name == "SKILL.md" {
+        // `basename(dirname(absolutePath)) || fileName` — the containing directory names the skill,
+        // and a `SKILL.md` at the filesystem root falls back to the file name itself.
+        let label = absolute
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(file_name);
+        return Some(CompactRead { kind: "skill", label });
+    }
+    if COMPACT_RESOURCE_FILE_NAMES.contains(&file_name.as_str()) {
+        // `formatPathRelativeToCwdOrAbsolute(absolutePath, cwd)`: the cwd-relative form when the file
+        // is under it, else the absolute path.
+        let label = absolute
+            .strip_prefix(&base)
+            .map(|r| r.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| absolute.to_string_lossy().into_owned());
+        return Some(CompactRead { kind: "resource", label });
+    }
+    None
+}
+
+/// Port of `formatCompactReadCall` (`core/tools/read.ts:145-167`).
+///
+/// ```ts
+/// const expandHint = theme.fg("dim", ` (${keyText("app.tools.expand")} to expand)`);
+/// if (classification.kind === "skill")
+///     return theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) +
+///            theme.fg("customMessageText", classification.label) + formatReadLineRange(args, theme) + expandHint;
+/// return theme.fg("toolTitle", theme.bold(`read ${classification.kind}`)) + " " +
+///        theme.fg("accent", classification.label) + formatReadLineRange(args, theme) + expandHint;
+/// ```
+///
+/// Note the expand hint here is **not** `keyHint`: it is one whole `dim` run including the words and
+/// the parentheses (`:150`), unlike [`more_lines_hint`]'s dim-key/muted-words split. That asymmetry
+/// is upstream's, and copying `keyHint`'s two-tone shape onto it would be the wrong fix.
+fn compact_read_call(
+    c: &CompactRead,
+    args: &Value,
+    expand_key: &str,
+    theme: &UiTheme,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if c.kind == "skill" {
+        // The `\x1b[1m…\x1b[22m` pair inside the interpolation is bold-on/bold-off around the
+        // bracket label only; `custom_message_label_style` already carries BOLD.
+        spans.push(Span::styled("[skill] ".to_string(), theme.custom_message_label_style()));
+        spans.push(Span::styled(c.label.clone(), theme.custom_message_text_style()));
+    } else {
+        spans.push(Span::styled(format!("read {}", c.kind), theme.tool_title_style()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(c.label.clone(), theme.accent_style()));
+    }
+    if let Some(range) = read_line_range(args) {
+        spans.push(Span::styled(range, theme.warning_style()));
+    }
+    spans.push(Span::styled(format!(" ({expand_key} to expand)"), theme.dim_style()));
+    Line::from(spans)
 }
 
 /// Shared head-N list body for grep/find/ls (`\n` + first N output lines + a `… more` hint).
@@ -1390,6 +2347,7 @@ fn push_list_output(
     expanded: bool,
     head: usize,
     theme: &UiTheme,
+    expand_key: &str,
     out: &mut Vec<Line<'static>>,
 ) {
     let Some(result) = &run.result else { return };
@@ -1407,7 +2365,7 @@ fn push_list_output(
     }
     let remaining = total.saturating_sub(shown);
     if remaining > 0 {
-        out.push(more_lines_hint(remaining, None, theme));
+        out.push(more_lines_hint(remaining, None, expand_key, theme));
     }
 }
 
@@ -1423,23 +2381,29 @@ fn push_error_body(result: &Value, theme: &UiTheme, out: &mut Vec<Line<'static>>
     }
 }
 
-/// Extract the tool result's display text (`getTextOutput`, render-utils.ts:39-64): join the `text`
+/// Extract the tool result's display text (`getTextOutput`, render-utils.ts:39-63): join the `text`
 /// blocks of `{content:[…]}`, else a `text`/`output`/`stdout`/`message` string field, else a bare
-/// string/array. Carriage returns are stripped.
+/// string/array.
+///
+/// Every branch goes through [`crate::ansi::sanitize_display_text`] — the full
+/// `sanitizeBinaryOutput(stripAnsi(text)).replace(/\r/g, "")` of `render-utils.ts:48`, not just the
+/// `\r` drop. Only `bash` output arrives pre-sanitized (at capture, `cyrup-session-svc/src/bash.rs`
+/// `sanitize_chunk`); `read`/`ls`/`find`/`grep` and every extension tool reach here raw, and the
+/// transform is idempotent so the pre-sanitized path is unaffected.
 ///
 /// `image` blocks are NOT represented here — they are rendered by [`tool_lines`], either as an
 /// inline half-block raster or as Pi's `[Image: …]` stand-in ([`push_image_fallbacks`]) — so this is
 /// the `showImages`-on half of Pi's `getTextOutput`, whose image-indicator half lives there.
 fn result_text(result: &Value) -> String {
     match result {
-        Value::String(s) => s.replace('\r', ""),
+        Value::String(s) => crate::ansi::sanitize_display_text(s),
         Value::Object(o) => {
             if let Some(content) = o.get("content") {
                 return content_blocks_text(content);
             }
             for k in ["text", "output", "stdout", "message"] {
                 if let Some(Value::String(s)) = o.get(k) {
-                    return s.replace('\r', "");
+                    return crate::ansi::sanitize_display_text(s);
                 }
             }
             String::new()
@@ -1461,16 +2425,16 @@ fn content_blocks_text(content: &Value) -> String {
                     if matches!(ty, Some("text") | None)
                         && let Some(Value::String(t)) = obj.get("text")
                     {
-                        parts.push(t.replace('\r', ""));
+                        parts.push(crate::ansi::sanitize_display_text(t));
                         continue;
                     }
                 } else if let Some(s) = it.as_str() {
-                    parts.push(s.replace('\r', ""));
+                    parts.push(crate::ansi::sanitize_display_text(s));
                 }
             }
             parts.join("\n")
         }
-        Value::String(s) => s.replace('\r', ""),
+        Value::String(s) => crate::ansi::sanitize_display_text(s),
         _ => String::new(),
     }
 }
@@ -1563,6 +2527,10 @@ fn push_bash_warnings(result: &Value, theme: &UiTheme, out: &mut Vec<Line<'stati
             warns.push(format!("Truncated: {} lines shown ({} limit)", tnum(t, "outputLines"), format_size(max_bytes)));
         }
     }
+    // X10 — `bash.ts:311` is `new Text(`\n${theme.fg("warning", …)}`, 0, 0)`; the leading `\n` makes
+    // `wrapTextWithAnsi` emit an empty first row (`utils.ts:839` splits on it), so the warning row
+    // is always preceded by a blank.
+    out.push(Line::default());
     out.push(Line::styled(format!("[{}]", warns.join(". ")), theme.warning_style()));
 }
 
@@ -1657,11 +2625,26 @@ pub(crate) fn wrapped_height(lines: &[Line<'static>], width: usize) -> usize {
 /// Render a single committed [`Entry`] into its styled scrollback line(s) at content `width`
 /// (R-ARCH-TUI-003). Used by the shell to feed drained entries into `Terminal::insert_before`.
 ///
-/// Assistant bodies render as **markdown** (spec/tui/06 §2) — multiple lines — with an `assistant: `
-/// accent label prefixed onto the first line so the conversation stays grep-legible. User/tool/status
-/// entries stay one line each.
-/// Left-indent every line by `pad` columns — the horizontal half of Pi's `outputPad` message padding
-/// (`Markdown(content, outputPad, 0)` / `Box(outputPad, 1)`). A no-op at `pad == 0` (flush-left).
+/// Assistant and user bodies render as **markdown** (spec/tui/06 §2) — multiple lines, no role
+/// label: `assistant-message.ts:104-114` adds one `Markdown` child per text block and
+/// `user-message.ts:38-58` one `Box`-wrapped `Markdown`, and neither contains a prefix (X1).
+/// Prefix `leftMargin` to every ALREADY-WRAPPED row — the second half of `markdown.ts:334-340`
+/// (`const lineWithMargins = leftMargin + line + rightMargin`), where `leftMargin =
+/// " ".repeat(this.paddingX)` (`:329`) and `paddingX` is the caller's `outputPad`
+/// (`assistant-message.ts:111` `new Markdown(text, this.outputPad, 0, …)`).
+///
+/// **Order matters and this is the back half of it.** Upstream wraps at `contentWidth` FIRST
+/// (`:322`) and margins SECOND (`:340`); [`crate::markdown::render`] now does that wrap internally
+/// (its `width` argument IS `contentWidth` — every call site passes `width - outputPad * 2`), so
+/// every row handed here already fits and the indent lands on rows 1..N as well as on row 0. It
+/// used to be inserted into the single unwrapped logical line and reflowed afterwards by the outer
+/// `Paragraph::wrap` at FULL frame width, which is what put row 0 at column 1 and rows 1..N at
+/// column 0 (L2) with no right gutter (M10).
+///
+/// `rightMargin` (`:330`) and the pad-to-`width` (`:346-348`) are not materialised, for the reason
+/// [`text_lines`] gives: without a background they are an invisible trailing run of blanks in a
+/// ratatui cell grid, and the gutter they buy comes from the narrower wrap instead. A no-op at
+/// `pad == 0` (flush-left).
 fn pad_lines(lines: &mut [Line<'static>], pad: usize) {
     if pad == 0 {
         return;
@@ -1677,142 +2660,430 @@ pub(crate) fn entry_lines(
     theme: &UiTheme,
     width: usize,
     output_pad: usize,
-    images: ImageOpts,
+    images: ImageOpts<'_>,
 ) -> Vec<Line<'static>> {
     match entry {
-        Entry::User(text) => {
-            // The rich user-message render (`user-message.ts`): the submitted text is rendered as
-            // multi-line **markdown** (Pi `UserMessageComponent` wraps a `Markdown` in a
-            // `userMessageBg` box), with a `you:` accent label prefixed onto the first line so the
-            // conversation stays grep-legible — mirroring the assistant arm. (Pi's `userMessageBg`
-            // box background and the OSC-133 shell-zone markers wrapping the block are terminal
-            // shell-integration escapes that the ratatui cell grid / `insert_before` scrollback model
-            // cannot carry; the markdown body + user accent is the in-crate fidelity.)
-            let mut md =
-                crate::markdown::render(text, width.saturating_sub(5 + output_pad).max(1), theme);
-            if md.is_empty() {
-                md.push(Line::default());
+        Entry::User { text, lead_spacer } => {
+            // `UserMessageComponent` (`user-message.ts:38-58`) is exactly one child: a
+            // `new Box(this.outputPad, 1, (c) => theme.bg("userMessageBg", c))` wrapping
+            // `new Markdown(text, 0, 0, …, { color: userMessageText })`. The body is the block's
+            // only content — there is **no** role label anywhere in the component (X1), and the
+            // `userMessageBg` fill plus the `Box`'s `paddingY = 1` tinted blank above and below are
+            // what identify a user turn (L1). The OSC-133 shell-zone markers at `:66-67` are
+            // terminal shell-integration escapes the ratatui cell grid cannot carry.
+            //
+            // Content width is the `Box`'s `contentWidth = width - outputPad * 2` (`box.ts:79`),
+            // which the inner `Markdown(…, 0, 0)` then passes through unchanged (`markdown.ts:284`
+            // with `paddingX = 0`) — not `width - 5` (M9: that 5 was the width of the deleted
+            // `"you: "` label).
+            let role = theme.user_message_bg_style();
+            let md = crate::markdown::render_with_text_color(
+                text,
+                width.saturating_sub(output_pad * 2).max(1),
+                theme,
+                role.fg,
+            );
+            // `applyBackgroundToLine` paints the BACKGROUND only (`box.ts:132-134`).
+            let fill = match role.bg {
+                Some(bg) => Style::default().bg(bg),
+                None => Style::default(),
+            };
+            let mut out = box_lines(md, width, output_pad, 1, fill);
+            // `chatContainer.addChild(new Spacer(1))` before the component — but `:3500` GATES it on
+            // `this.chatContainer.children.length > 0`, so the very first thing in a fresh session's
+            // chat gets no leading blank (`lead_spacer`, frozen at push time by
+            // [`TranscriptView::chat_has_children`]). `:3514`, the user message that trails a skill
+            // block, is UNgated and always passes `true`.
+            //
+            // The blank is also skipped when the component itself rendered nothing: `box_lines`
+            // returns `[]` for an empty child set (`box.ts:75-77`/`:91-93`), and upstream never
+            // reaches either the spacer or the component in that case because `:3499`'s
+            // `if (textContent)` has already skipped the whole `case "user"`.
+            if *lead_spacer && !out.is_empty() {
+                out.insert(0, Line::default());
             }
-            if let Some(first) = md.first_mut() {
-                first.spans.insert(0, Span::styled("you: ", theme.user_style()));
-            }
-            // The `outputPad` horizontal padding (Pi `Box(outputPad, 1)`, user-message.ts:31).
-            pad_lines(&mut md, output_pad);
-            // Project the `userMessageBg` role onto the block (audit #6: the bg roles were dead; the
-            // "ratatui can't carry bg" claim was wrong — `insert_before` writes cell bg fine). No-op
-            // when the theme omits the role (terminal default shows through).
-            let user_bg = theme.user_message_bg_style();
-            for line in &mut md {
-                line.style = line.style.patch(user_bg);
-            }
-            md
+            out
         }
         Entry::Assistant(text) => {
-            let mut md =
-                crate::markdown::render(text, width.saturating_sub(11 + output_pad).max(1), theme);
+            // L3 — `assistant-message.ts:107` renders a text block only when `content.text.trim()`
+            // is truthy, and `:96-98` counts it toward `hasVisibleContent` by the same trimmed test.
+            // A whitespace-only message is therefore neither body nor blank.
+            if text.trim().is_empty() {
+                return Vec::new();
+            }
+            // `assistant-message.ts:104-114`: the body is `new Markdown(content.text.trim(),
+            // this.outputPad, 0, …)` and nothing else — no role label (X1). `contentWidth =
+            // width - outputPad * 2` (`markdown.ts:284`), not `width - 11` (M9: the 11 was
+            // `"assistant: "`).
+            let mut md = crate::markdown::render(
+                text,
+                width.saturating_sub(output_pad * 2).max(1),
+                theme,
+            );
             if md.is_empty() {
                 md.push(Line::default());
             }
-            if let Some(first) = md.first_mut() {
-                first.spans.insert(0, Span::styled("assistant: ", theme.accent_style()));
-            }
-            // The `outputPad` horizontal padding (Pi `Markdown(content, outputPad, 0)`,
-            // assistant-message.ts:103).
+            // The `outputPad` horizontal padding (Pi `Markdown(content, outputPad, 0)`).
             pad_lines(&mut md, output_pad);
+            // L3 — `assistant-message.ts:100-102`:
+            // `if (hasVisibleContent) { this.contentContainer.addChild(new Spacer(1)); }`.
+            // Gated above by the same trimmed predicate `hasVisibleContent` uses (`:96-98`), so the
+            // blank cannot outlive its content. [`TranscriptView::commit_assistant`] refuses to
+            // commit a whitespace-only turn for the same reason; the check is repeated here because
+            // `Entry::Assistant` is public and reachable without going through it.
+            md.insert(0, Line::default());
             md
         }
         Entry::Thinking { text, hidden } => {
             // The reasoning section (`assistant-message.ts:139-165`), padded like every other
             // assistant-side block. `hidden` was frozen at commit time (see [`Entry::Thinking`]).
-            let mut out = thinking_lines(text, *hidden, theme);
+            let mut out = thinking_lines(text, *hidden, width.saturating_sub(output_pad * 2), theme);
+            if out.is_empty() {
+                return out;
+            }
             pad_lines(&mut out, output_pad);
+            // The same single `Spacer(1)` as the assistant arm (`:100-102`). Upstream renders one
+            // component per assistant message, so the spacer lands on whichever visible block comes
+            // first; the reasoning run always precedes the answer text in the content walk, and the
+            // blank BETWEEN them is upstream's `hasVisibleContentAfter` spacer (`:166-168`). Two
+            // cyrup entries each carrying one leading blank therefore reproduce upstream's
+            // `[blank] thinking [blank] text` exactly.
+            out.insert(0, Line::default());
             out
         }
         Entry::Tool(run) => {
-            // Committed tools render in their last (expanded-at-commit) form; a diff result always
-            // renders in full. We commit with the at-the-time expand flag captured by the caller —
-            // here we always show the full body so finalized scrollback keeps the complete record.
-            tool_lines(run, true, width, theme, images)
+            // X14 — a committed tool renders at the LIVE `this.toolOutputExpanded`, exactly like a
+            // live one. Upstream has ONE `ToolExecutionComponent` per call and never swaps its
+            // expansion when it scrolls: the component is seeded `setExpanded(this.toolOutputExpanded)`
+            // at every construction site (`interactive-mode.ts:3165`, `:3239`, `:3437`, `:3486`,
+            // `:3602`) and re-broadcast on every toggle (`setToolsExpanded`, `:4032-4046`), with
+            // `toolOutputExpanded` defaulting to **false** (`:442`).
+            //
+            // This used to pass a hardcoded `true`, "so finalized scrollback keeps the complete
+            // record". That is the GREEN-SLAB defect: a collapsed `read`'s `renderResult` returns
+            // `""` upstream (`read.ts:178-180`) and `bash`/`grep`/`ls` cap at 10 rows, so upstream's
+            // committed block is a 3-row header. Forcing `true` dumped the WHOLE file — every line
+            // of it — inside the full-width `toolSuccessBg` box, so one `read` of a 500-line file
+            // painted 500 rows of solid tool tint (Indexed(22), a vivid `#005f00`, once a
+            // 256-colour terminal quantises `#283228`) straight over the conversation.
+            tool_lines(run, images.tools_expanded, width, theme, images)
         }
         Entry::Bash(b) => {
-            // Committed bash blocks render in full (the complete record), like committed tools.
+            // Same rule for the `!`/`!!` block: `BashExecutionComponent` is `isExpandable` and takes
+            // the same broadcast (`setToolsExpanded`, `:4032-4046`), so a committed one renders at
+            // the live flag rather than force-expanded.
             let mut full = b.clone();
-            full.set_expanded(true);
+            full.set_expanded(images.tools_expanded);
             full.render_lines(width, theme, None, None)
         }
-        Entry::SkillInvocation { name, content } => {
+        Entry::SkillInvocation { name, content, lead_spacer } => {
             // `[skill]` label + bold name header, full content as markdown (the committed/expanded
-            // form — `skill-invocation-message.ts` expanded branch).
-            labeled_message_lines("skill", &format!("**{name}**"), content, theme, width)
+            // form — `skill-invocation-message.ts` expanded branch). The leading spacer is the gated
+            // `interactive-mode.ts:3500` one (see [`Entry::SkillInvocation`]).
+            labeled_message_lines(
+                "skill",
+                &format!("**{name}**"),
+                content,
+                false,
+                *lead_spacer,
+                theme,
+                width,
+            )
         }
         Entry::Custom { label, body, rendered } => match rendered {
+            // X15 — the renderer THREW. Pi does not silently drop the entry: `CustomEntryComponent`
+            // catches and draws a failure box in its place (`components/custom-entry.ts:47-52`):
+            //
+            // ```ts
+            // } catch (error) {
+            //     const message = error instanceof Error ? error.message : String(error);
+            //     const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+            //     box.addChild(new Text(theme.fg("error", `[${this.entry.customType}] renderer failed: ${message}`), 0, 0));
+            //     component = box;
+            // }
+            // ```
+            //
+            // — a `customMessageBg` box holding ONE `error`-coloured line, and then `:59-60`'s
+            // `Spacer(1)` + the box, the same leading blank the success arm gets.
+            Rendered::Failed(message) => {
+                let block = theme.custom_message_bg_style();
+                let fill = match block.bg {
+                    Some(bg) => Style::default().bg(bg),
+                    None => Style::default(),
+                };
+                let text = format!("[{label}] renderer failed: {message}");
+                // `new Text(…, 0, 0)` inside a `Box(1, 1)`: paddingX 0, so the row wraps at the
+                // box's own content width (`box.ts:79`) with no further margin.
+                let children = text_lines(&text, width.saturating_sub(2).max(1), 0, theme.error_style());
+                let mut out = box_lines(children, width, 1, 1, fill);
+                if !out.is_empty() {
+                    out.insert(0, Line::default());
+                }
+                out
+            }
             // EXT-006: an extension registered a renderer for this custom type, so ITS output is
             // the block (Pi hands the resolved renderer to `CustomMessageComponent` in place of the
             // default framing, interactive-mode.ts:3324-3336). Emitted verbatim — the renderer
             // already owns the presentation, so no `[label]` bracket is added.
-            Some(text) => text
-                .split('\n')
-                .map(|l| Line::styled(l.to_string(), theme.dim_style()))
-                .collect(),
+            Rendered::Text(text) => {
+                // `CustomMessageComponent` adds its `Spacer(1)` in the CONSTRUCTOR
+                // (`custom-message.ts:33`), before `rebuild()` chooses between the custom renderer
+                // (`:79`) and the default box (`:88`), so both arms carry the leading blank.
+                let mut out = vec![Line::default()];
+                // X11 — `custom-message.ts:76-81` is `this.customComponent = component;
+                // this.addChild(component); return;`: the component is added AS-IS and the host
+                // applies no colour of its own. cyrup re-styled every row `dim`, which overrode
+                // whatever the extension had chosen — the one thing `renderShell: "self"`/a custom
+                // renderer exists to prevent. Rows go out unstyled so the terminal default (and any
+                // styling the renderer expressed) survives.
+                out.extend(text.split('\n').map(|l| Line::raw(l.to_string())));
+                out
+            }
             // A bracketed extension-type label + the markdown body (`custom-message.ts`).
-            None => labeled_message_lines(label, "", body, theme, width),
+            // `custom-message.ts:33`'s constructor `Spacer(1)` — unconditional.
+            Rendered::None => labeled_message_lines(label, "", body, true, true, theme, width),
         },
-        Entry::BranchSummary(summary) => {
-            labeled_message_lines("branch", "**Branch Summary**", summary, theme, width)
+        Entry::BranchSummary { summary } => {
+            // X14 — `BranchSummaryMessageComponent` is a `Box(1, 1, customMessageBg)` whose body
+            // depends on `expanded`, which `interactive-mode.ts:3493` seeds from
+            // `this.toolOutputExpanded` and `setToolsExpanded` re-broadcasts on every toggle
+            // (`:4032-4046` walks `chatContainer.children` calling `setExpanded`), so the LIVE flag
+            // is read here (`branch-summary-message.ts:11,22-25,32-56`). COLLAPSED it is one
+            // row, not the whole summary:
+            //
+            // ```ts
+            // theme.fg("customMessageText", "Branch summary (") +
+            //     theme.fg("dim", keyText("app.tools.expand")) +
+            //     theme.fg("customMessageText", " to expand)")
+            // ```
+            //
+            // Note the two-tone split is `customMessageText`/`dim`, NOT `keyHint`'s `muted`/`dim`.
+            // `interactive-mode.ts:3491` is UNgated — the branch summary always gets its blank.
+            if images.tools_expanded {
+                labeled_message_lines(
+                    "branch",
+                    "**Branch Summary**",
+                    summary,
+                    true,
+                    true,
+                    theme,
+                    width,
+                )
+            } else {
+                collapsed_summary_lines("branch", "Branch summary (", images.expand_key, theme, width)
+            }
         }
         Entry::CompactionSummary { tokens_before, summary } => {
+            // X14 — the same collapsed form (and the same LIVE `toolOutputExpanded` read), with the
+            // token count in the lead (`compaction-summary-message.ts:48-56`):
+            // `fg("customMessageText", `Compacted from ${tokenStr} tokens (`) + fg("dim", keyText(…)) + fg("customMessageText", " to expand)")`.
+            if !images.tools_expanded {
+                let lead =
+                    format!("Compacted from {} tokens (", group_thousands(*tokens_before));
+                return collapsed_summary_lines(
+                    "compaction",
+                    &lead,
+                    images.expand_key,
+                    theme,
+                    width,
+                );
+            }
             let header = format!("**Compacted from {} tokens**", group_thousands(*tokens_before));
-            labeled_message_lines("compaction", &header, summary, theme, width)
+            // `interactive-mode.ts:3484` is UNgated too.
+            labeled_message_lines("compaction", &header, summary, true, true, theme, width)
         }
-        Entry::Status(text) => vec![Line::styled(format!("• {text}"), theme.dim_style())],
+        Entry::Status(text) => {
+            // X18 — `showStatus` (`interactive-mode.ts:3411-3429`) is two chat children and nothing
+            // more:
+            //
+            // ```ts
+            // const spacer = new Spacer(1);
+            // const text = new Text(theme.fg("dim", message), 1, 0);
+            // this.chatContainer.addChild(spacer);
+            // this.chatContainer.addChild(text);
+            // ```
+            //
+            // so a status row is a leading blank plus a `dim` `Text` at **paddingX 1** — the same
+            // one-column inset every other chat child sits at (`text.ts:64`, `:70-76`). There is no
+            // bullet: `git grep "•" v0.84.1 -- packages/coding-agent/src/modes/interactive` finds no
+            // status glyph, and `showStatus` interpolates nothing before `message`. The `• ` prefix
+            // and the flush-left placement were both cyrup inventions.
+            //
+            // The spacer is UNgated here — unlike `:3500`, `:3424` has no
+            // `chatContainer.children.length` test.
+            let mut out = vec![Line::default()];
+            out.extend(text_lines(text, width, 1, theme.dim_style()));
+            out
+        }
         Entry::Warning(text) => {
             // Pi `showWarning` (`interactive-mode.ts:3956-3960`): `Spacer(1)` then
             // `Text(theme.fg("warning", …), 1, 0)` — the `Error` shape in the warning colour.
-            let mut out = vec![Line::styled(text.clone(), theme.warning_style())];
-            pad_lines(&mut out, output_pad);
-            out.insert(0, Line::default());
+            let mut out = vec![Line::default()];
+            out.extend(text_lines(text, width, output_pad, theme.warning_style()));
             out
         }
         Entry::Error(text) => {
             // Pi: `Spacer(1)` then `Text(theme.fg("error", text), outputPad, 0)`
-            // (assistant-message.ts:178-188). One logical line — the scrollback flush wraps it at
-            // the content width via `wrapped_height`/`Paragraph::wrap`, exactly like a long prose
-            // paragraph.
-            let mut out = vec![Line::styled(text.clone(), theme.error_style())];
-            pad_lines(&mut out, output_pad);
-            out.insert(0, Line::default());
+            // (assistant-message.ts:180, :189, :193). A `Text` WRAPS at
+            // `contentWidth = width - paddingX * 2` (`text.ts:64`) and margins each produced row
+            // (`:70-76`) — it does not hand one long logical line to an outer reflow. cyrup did the
+            // latter, so a long error printed row 0 at column `outputPad` and every continuation row
+            // at column 0, the same L2 defect the markdown body had.
+            let mut out = vec![Line::default()];
+            out.extend(text_lines(text, width, output_pad, theme.error_style()));
             out
         }
         Entry::Block { title, markdown } => {
-            let rule = "─".repeat(width.max(1));
+            // Both upstream instances of this stack are identical — `/changelog`
+            // (interactive-mode.ts:6067-6072) and `/hotkeys` (:6197-6203); `git grep -n
+            // "new DynamicBorder()" v0.84.1 -- .../interactive-mode.ts` finds exactly six sites and
+            // four of them are those two pairs. Each is:
+            //
+            //   Spacer(1) / DynamicBorder() / Text(bold(accent(title)), 1, 0) / Spacer(1) /
+            //   Markdown(body, 1, 1, theme) / DynamicBorder()
+            //
+            // The last two constructor arguments are `(paddingX, paddingY)` — **not**
+            // `(paddingX, leftMargin)`: `markdown.ts:250-260` binds the third parameter to
+            // `this.paddingY`, and the left margin is derived from paddingX alone
+            // (`markdown.ts:329` `leftMargin = " ".repeat(this.paddingX)`). So the body is inset by
+            // ONE column on both sides (content width `width - 2`, `markdown.ts:284`) and carries one
+            // blank row above AND below it (`markdown.ts:352-361`), and the title is inset by one
+            // column too (`Text`'s own `paddingX`, `text.ts:60-87`). Only the two `─` rules run
+            // edge to edge.
+            let w = width.max(1);
+            let rule = "─".repeat(w);
             let bold = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);
             let mut out: Vec<Line<'static>> = vec![
                 Line::default(),
                 Line::styled(rule.clone(), theme.border_style()),
-                Line::styled(title.clone(), bold),
-                Line::default(),
             ];
-            out.extend(crate::markdown::render(markdown, width.max(1), theme));
+            out.extend(text_lines_of(&Line::styled(title.clone(), bold), w, 1));
+            out.push(Line::default());
+            // `markdown.ts:288-296` returns EARLY on blank text, before the paddingY block, so an
+            // empty body contributes no rows at all — not two blanks.
+            if !markdown.trim().is_empty() {
+                let mut md = crate::markdown::render(markdown, w.saturating_sub(2).max(1), theme);
+                pad_lines(&mut md, 1);
+                out.push(Line::default());
+                out.extend(md);
+                out.push(Line::default());
+            }
             out.push(Line::styled(rule, theme.border_style()));
             out
         }
-        Entry::LoadedResources(lines) => crate::startup::startup_lines(lines, theme, output_pad),
+        Entry::LoadedResources(lines) => {
+            crate::startup::startup_lines(lines, theme, width.max(1), output_pad)
+        }
     }
 }
 
-/// Render a labeled extension/system message (`skill`/`custom`/`branch`/`compaction` variants,
-/// `{skill-invocation,custom,branch-summary,compaction-summary}-message.ts`): a bold-accent
-/// `[label]` line, then the optional bold `header` + the `body` rendered as markdown. The committed
-/// scrollback form is the *expanded* render (the complete record), like committed tools.
+/// Render a labeled extension/system message (`skill`/`custom`/`branch`/`compaction` variants),
+/// then the optional bold `header` + the `body` rendered as markdown. The committed scrollback form
+/// is the *expanded* render (the complete record), like committed tools.
+///
+/// T9 (TUI-FIDELITY §2): the `[label]` bracket is Pi's `customMessageLabel` token, not `accent`.
+/// All four upstream components build it identically — `theme.fg("customMessageLabel",
+/// "\x1b[1m[<name>]\x1b[22m")` — at v0.84.1
+/// `coding-agent/src/modes/interactive/components/skill-invocation-message.ts:38`,
+/// `custom-message.ts:92`, `branch-summary-message.ts:35` and `compaction-summary-message.ts:36`.
+/// The `\x1b[1m…\x1b[22m` pair is SGR bold, so the bold stays; only the colour role changes
+/// (`dark.json:41` `#9575cd`, `light.json:40` `#7e57c2` — purple, where cyrup was painting the teal
+/// accent).
+///
+/// T9 continued — `customMessageBg` + `customMessageText`. All four upstream components are (or
+/// wrap) a `Box` whose fill is `theme.bg("customMessageBg", …)` and hand their body to
+/// `new Markdown(…, { color: (text) => theme.fg("customMessageText", text) })`:
+/// `custom-message.ts:36,107-111`, `skill-invocation-message.ts:17,42-44`,
+/// `branch-summary-message.ts:16,42-44`, `compaction-summary-message.ts:16,43-45`. Both tokens were
+/// dead on screen — [`UiTheme::custom_message_bg_style`] had zero callers — so the block drew no
+/// fill and the body took the plain `text` role. The fill goes on `Line::style` (the same mechanism
+/// the `userMessageBg` block uses) and the body colour goes through
+/// [`crate::markdown::render_with_text_color`], because a span-level `fg` set by the markdown
+/// renderer would otherwise mask a line-level one.
+///
+/// X2 — the block shell. All four components are (or extend) `new Box(1, 1, (t) =>
+/// theme.bg("customMessageBg", t))`, so the body sits in a **1-column inset** and the box emits a
+/// tinted blank row above and below it (`box.ts:79-88`, `:106-119`). Both were missing: the label
+/// started at column 0 and the purple band was exactly as tall as its content.
+///
+/// X2 — the `Spacer(1)` after the label. `custom-message.ts:94`, `branch-summary-message.ts:37` and
+/// `compaction-summary-message.ts:38` each `addChild(new Spacer(1))` immediately after the label
+/// `Text`; `skill-invocation-message.ts` does **not** (`:36-45` is label then `Markdown`, `:47-53`
+/// is one collapsed line). Hence `spacer_after_label` rather than an unconditional blank — the row
+/// is a property of three of the four components, not of the shared shell.
+///
+/// `lead_spacer` is the `chatContainer.addChild(new Spacer(1))` that precedes the component. It is
+/// **not** uniform across the call sites, so each one passes its own answer:
+/// `interactive-mode.ts:3484` (compaction) and `:3491` (branch) are unconditional, whereas `:3500`
+/// — which covers the skill component, since `:3506` sits inside it — is gated on
+/// `this.chatContainer.children.length > 0`. A custom message supplies its own in the constructor
+/// (`custom-message.ts:33`), also unconditional.
+/// X14 — the COLLAPSED branch/compaction summary: the same `Box(1, 1, customMessageBg)` +
+/// `[label]` + `Spacer(1)` shell [`labeled_message_lines`] builds, but with one `Text` row in place
+/// of the markdown body (`branch-summary-message.ts:46-56`, `compaction-summary-message.ts:47-56`).
+///
+/// ```ts
+/// this.addChild(new Text(
+///     theme.fg("customMessageText", "Branch summary (") +
+///         theme.fg("dim", keyText("app.tools.expand")) +
+///         theme.fg("customMessageText", " to expand)"),
+///     0, 0));
+/// ```
+///
+/// Three runs, and the outer two are `customMessageText` — NOT `muted`. This is not `keyHint`; the
+/// two components spell the pair out by hand and only the key label shares `dim` with it. `lead`
+/// carries the trailing `(` so the compaction variant can interpolate its token count
+/// (`Compacted from 12,345 tokens (`).
+fn collapsed_summary_lines(
+    label: &str,
+    lead: &str,
+    expand_key: &str,
+    theme: &UiTheme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let block = theme.custom_message_bg_style();
+    let text = theme.custom_message_text_style();
+    let content_width = width.saturating_sub(2).max(1);
+    let row = Line::from(vec![
+        Span::styled(lead.to_string(), text),
+        Span::styled(expand_key.to_string(), theme.dim_style()),
+        Span::styled(" to expand)".to_string(), text),
+    ]);
+    let mut children =
+        vec![Line::styled(format!("[{label}]"), theme.custom_message_label_style())];
+    children.push(Line::default());
+    // `new Text(…, 0, 0)` — paddingX 0 inside the `Box`, so the row wraps at the box's own content
+    // width with no extra margin.
+    children.extend(text_lines_of(&row, content_width, 0));
+    let fill = match block.bg {
+        Some(bg) => Style::default().bg(bg),
+        None => Style::default(),
+    };
+    let mut out = box_lines(children, width, 1, 1, fill);
+    // `interactive-mode.ts:3484`/`:3491` — the leading `Spacer(1)` is unconditional for both.
+    if !out.is_empty() {
+        out.insert(0, Line::default());
+    }
+    out
+}
+
 fn labeled_message_lines(
     label: &str,
     header: &str,
     body: &str,
+    spacer_after_label: bool,
+    lead_spacer: bool,
     theme: &UiTheme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let bold = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);
-    let mut out = vec![Line::styled(format!("[{label}]"), bold)];
+    let block = theme.custom_message_bg_style();
+    // `Box(1, 1)` renders its children at `contentWidth = width - 2` (`box.ts:79`).
+    let content_width = width.saturating_sub(2).max(1);
+    let mut children =
+        vec![Line::styled(format!("[{label}]"), theme.custom_message_label_style())];
+    if spacer_after_label {
+        children.push(Line::default());
+    }
     let md_src = if header.is_empty() {
         body.to_string()
     } else if body.is_empty() {
@@ -1821,7 +3092,26 @@ fn labeled_message_lines(
         format!("{header}\n\n{body}")
     };
     if !md_src.is_empty() {
-        out.extend(crate::markdown::render(&md_src, width.max(1), theme));
+        children.extend(crate::markdown::render_with_text_color(
+            &md_src,
+            content_width,
+            theme,
+            block.fg,
+        ));
+    }
+    // The `customMessageBg` fill covers the whole box — padding rows and label row included.
+    // A theme that omits the token leaves `bg` `None` and the terminal default shows through.
+    // `applyBackgroundToLine` paints the BACKGROUND only (`box.ts:132-134`); the foreground comes
+    // from the content, which already carries `customMessageText` via `render_with_text_color`.
+    let fill = match block.bg {
+        Some(bg) => Style::default().bg(bg),
+        None => Style::default(),
+    };
+    let mut out = box_lines(children, width, 1, 1, fill);
+    // The leading `Spacer(1)` — see `lead_spacer` above. Skipped when the `Box` produced no rows at
+    // all (`box.ts:75-77`/`:91-93`), so a contentless block cannot leave an orphan blank behind.
+    if lead_spacer && !out.is_empty() {
+        out.insert(0, Line::default());
     }
     out
 }
@@ -1947,6 +3237,12 @@ mod output_pad_tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// A user entry whose `interactive-mode.ts:3500` gate is already decided — this module is about
+    /// the pad, not about where the leading `Spacer(1)` comes from.
+    fn user(text: &str, lead_spacer: bool) -> Entry {
+        Entry::User { text: text.to_string(), lead_spacer }
+    }
+
     /// F12: a fresh transcript defaults to Pi's `outputPad = 1` and `set_output_pad` drives it.
     #[test]
     fn output_pad_defaults_to_one_and_is_settable() {
@@ -1956,51 +3252,152 @@ mod output_pad_tests {
         assert_eq!(view.output_pad(), 0);
     }
 
-    /// `outputPad` left-indents user/assistant committed lines; `0` renders flush-left, `1` prepends a
-    /// single leading column ahead of the `you:`/`assistant:` accent label.
+    /// `outputPad` left-indents the message BODY; `0` renders flush-left, `1` prepends a single
+    /// leading column.
+    ///
+    /// X1 — there is no `you: ` / `assistant: ` label to indent past. `user-message.ts:38-58` adds
+    /// exactly one child (a `Box` wrapping a `Markdown`) and `assistant-message.ts:104-114` adds one
+    /// `Markdown` per text block; neither component contains a role prefix.
+    ///
+    /// L1/L3 — the user block's first two rows are the leading `Spacer(1)`
+    /// (`interactive-mode.ts:3501`) and the `Box`'s top `paddingY` row (`box.ts:107-109`); the
+    /// assistant block's first row is `assistant-message.ts:100-102`'s `Spacer(1)`.
     #[test]
     fn output_pad_left_indents_committed_messages() {
         let theme = UiTheme::dark();
-        // pad = 1 → a leading space before the label.
-        let u1 = entry_lines(&Entry::User("hello".into()), &theme, 80, 1, ImageOpts::default());
-        assert!(line_text(&u1[0]).starts_with(" you: "), "pad=1 user: {:?}", line_text(&u1[0]));
+        // pad = 1 → the body starts one column in.
+        let u1 = entry_lines(&user("hello", true), &theme, 80, 1, ImageOpts::default());
+        assert_eq!(line_text(&u1[0]), "", "user leading Spacer(1): {:?}", line_text(&u1[0]));
+        assert_eq!(line_text(&u1[1]).trim(), "", "user top paddingY row: {:?}", line_text(&u1[1]));
+        assert!(line_text(&u1[2]).starts_with(" hello"), "pad=1 user: {:?}", line_text(&u1[2]));
         let a1 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 1, ImageOpts::default());
-        assert!(
-            line_text(&a1[0]).starts_with(" assistant: "),
-            "pad=1 assistant: {:?}",
-            line_text(&a1[0])
-        );
+        assert_eq!(line_text(&a1[0]), "", "assistant leading Spacer(1)");
+        assert_eq!(line_text(&a1[1]), " hi", "pad=1 assistant: {:?}", line_text(&a1[1]));
         // pad = 0 → flush-left (no leading space).
-        let u0 = entry_lines(&Entry::User("hello".into()), &theme, 80, 0, ImageOpts::default());
-        assert!(line_text(&u0[0]).starts_with("you: "), "pad=0 user: {:?}", line_text(&u0[0]));
+        let u0 = entry_lines(&user("hello", true), &theme, 80, 0, ImageOpts::default());
+        assert!(line_text(&u0[2]).starts_with("hello"), "pad=0 user: {:?}", line_text(&u0[2]));
         let a0 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 0, ImageOpts::default());
-        assert!(
-            line_text(&a0[0]).starts_with("assistant: "),
-            "pad=0 assistant: {:?}",
-            line_text(&a0[0])
-        );
+        assert_eq!(line_text(&a0[1]), "hi", "pad=0 assistant: {:?}", line_text(&a0[1]));
+
+        // MIRROR (X1): no role label at any pad, in either arm.
+        for pad in [0usize, 1] {
+            for e in [user("hello", true), Entry::Assistant("hi".into())] {
+                let joined: String = entry_lines(&e, &theme, 80, pad, ImageOpts::default())
+                    .iter()
+                    .map(line_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(!joined.contains("you:"), "pad={pad}: {joined:?}");
+                assert!(!joined.contains("assistant:"), "pad={pad}: {joined:?}");
+            }
+        }
     }
 
     /// The live streaming partial honors the pad too (Pi keeps the outputPad on the in-flight
     /// `AssistantMessageComponent`). Rendering the active region with pad=1 vs pad=0 shifts the line.
+    ///
+    /// Row 0 is L3's `Spacer(1)` (`assistant-message.ts:100-102`), which the live view emits for the
+    /// same reason the committed arm does — it is one component either side of the commit.
     #[test]
     fn output_pad_indents_the_live_streaming_partial() {
         let theme = UiTheme::dark();
         let mut view = TranscriptView::new();
         view.push_assistant_delta("streaming answer");
         let padded = view.lines(80, &theme);
-        assert!(
-            line_text(&padded[0]).starts_with(" assistant: "),
-            "pad=1 live: {:?}",
-            line_text(&padded[0])
-        );
+        assert_eq!(line_text(&padded[0]), "", "leading Spacer(1) missing");
+        assert_eq!(line_text(&padded[1]), " streaming answer", "pad=1 live");
         view.set_output_pad(0);
         let flush = view.lines(80, &theme);
-        assert!(
-            line_text(&flush[0]).starts_with("assistant: "),
-            "pad=0 live: {:?}",
-            line_text(&flush[0])
-        );
+        assert_eq!(line_text(&flush[1]), "streaming answer", "pad=0 live");
+
+        // MIRROR (X1): no `assistant: ` label and no `▌` caret in the live region either.
+        // `git grep "▌" v0.84.1 -- packages/` finds only `examples/extensions/custom-header.ts:22`.
+        let joined: String = flush.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(!joined.contains("assistant:"), "live label: {joined:?}");
+        assert!(!joined.contains('\u{258c}'), "live caret: {joined:?}");
+    }
+
+    /// A sentence long enough to wrap several times at any of the widths this module tests.
+    const LONG: &str = "The quick brown fox jumps over the lazy dog and then keeps running for \
+                        quite a long while indeed before it finally stops.";
+
+    /// **L2 + M10** — EVERY row of a multi-row message carries the `outputPad` margin, and no row
+    /// reaches the last column.
+    ///
+    /// `markdown.ts:316-326` wraps at `contentWidth = width - paddingX * 2` (`:284`) and only then
+    /// does `:334-340` emit `leftMargin + line + rightMargin` for **each** produced row. cyrup used
+    /// to insert the margin into the single unwrapped logical line and let the outer
+    /// `Paragraph::wrap` reflow it at full frame width, so row 0 started at column 1 and rows 1..N
+    /// at column 0 — a ragged left edge on nearly every turn — with nothing holding a right gutter.
+    #[test]
+    fn l2_every_wrapped_row_of_a_message_carries_the_margin_and_a_right_gutter() {
+        let theme = UiTheme::dark();
+        for width in [20usize, 40, 80] {
+            let rows = entry_lines(&Entry::Assistant(LONG.into()), &theme, width, 1, ImageOpts::default());
+            // Row 0 is `assistant-message.ts:100-102`'s `Spacer(1)`; the body follows.
+            let body = &rows[1..];
+            assert!(body.len() > 1, "width={width}: expected a wrapped body, got {body:?}");
+            for row in body {
+                let t = line_text(row);
+                assert!(t.starts_with(' '), "width={width}: row lost its leftMargin: {t:?}");
+                assert!(!t.starts_with("  "), "width={width}: over-indented row: {t:?}");
+                // `contentWidth = width - paddingX*2` plus one column of `leftMargin` — the last
+                // column stays empty, which is the `rightMargin` (`markdown.ts:330`/`:340`).
+                assert!(row.width() < width, "width={width}: no right gutter: {t:?} ({})", row.width());
+            }
+            // MIRROR: at `outputPad = 0` there is no margin, and the wrap uses the full width.
+            let flush = entry_lines(&Entry::Assistant(LONG.into()), &theme, width, 0, ImageOpts::default());
+            for row in &flush[1..] {
+                assert!(row.width() <= width, "pad=0 width={width}: {:?}", line_text(row));
+            }
+            assert!(!line_text(&flush[1]).starts_with(' '), "pad=0 must be flush-left");
+        }
+
+        // MIRROR: a short message still occupies exactly one body row, and an empty turn none.
+        let short = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 1, ImageOpts::default());
+        assert_eq!(short.len(), 2, "spacer + one row: {short:?}");
+        assert!(entry_lines(&Entry::Assistant("   ".into()), &theme, 80, 1, ImageOpts::default())
+            .is_empty());
+    }
+
+    /// The same for the LIVE streaming partial (`transcript.rs:1000`'s call site) — the row a user
+    /// watches for the whole turn.
+    #[test]
+    fn l2_live_streaming_partial_wraps_inside_its_own_padding() {
+        let theme = UiTheme::dark();
+        let mut view = TranscriptView::new();
+        view.push_assistant_delta(LONG);
+        let rows = view.lines(40, &theme);
+        assert!(rows.len() > 2, "expected a wrapped live body: {rows:?}");
+        for row in &rows[1..] {
+            let t = line_text(row);
+            assert!(t.starts_with(' '), "live row lost its leftMargin: {t:?}");
+            assert!(row.width() <= 39, "live row has no right gutter: {t:?}");
+        }
+    }
+
+    /// **Edit 6** — a long `Entry::Error` / `Entry::Warning` is a `Text`, and a `Text` WRAPS at
+    /// `contentWidth = width - paddingX * 2` (`text.ts:64`) before prefixing `leftMargin` to each
+    /// produced row (`:70-76`).
+    ///
+    /// `assistant-message.ts:180`/`:189`/`:193` construct them as `new Text(theme.fg("error", …),
+    /// this.outputPad, 0)`; `interactive-mode.ts:3956-3960` does the same in the warning colour.
+    /// cyrup pushed ONE unwrapped logical line and `pad_lines`'d it, i.e. the L2 defect again.
+    #[test]
+    fn error_and_warning_rows_wrap_inside_the_output_pad() {
+        let theme = UiTheme::dark();
+        for entry in [Entry::Error(LONG.into()), Entry::Warning(LONG.into())] {
+            let rows = entry_lines(&entry, &theme, 40, 1, ImageOpts::default());
+            assert_eq!(line_text(&rows[0]), "", "leading Spacer(1)");
+            assert!(rows.len() > 2, "expected a wrapped body: {rows:?}");
+            for row in &rows[1..] {
+                let t = line_text(row);
+                assert!(t.starts_with(' '), "row lost its leftMargin: {t:?}");
+                assert!(row.width() <= 39, "row has no right gutter: {t:?}");
+            }
+            // The colour rides on the span, inside the margins (`theme.fg("error", text)`).
+            assert!(rows[1].spans.iter().any(|s| s.style.fg.is_some()), "colour lost: {rows:?}");
+        }
     }
 }
 
@@ -2046,7 +3443,7 @@ mod skill_tests {
         );
         let entries = view.pending();
         assert!(matches!(entries.first(), Some(Entry::SkillInvocation { name, .. }) if name == "deploy"));
-        assert!(matches!(entries.get(1), Some(Entry::User(t)) if t == "run it"));
+        assert!(matches!(entries.get(1), Some(Entry::User { text, .. }) if text == "run it"));
     }
 
     #[test]
@@ -2055,7 +3452,7 @@ mod skill_tests {
         view.push_user("hello world");
         let entries = view.pending();
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries.first(), Some(Entry::User(t)) if t == "hello world"));
+        assert!(matches!(entries.first(), Some(Entry::User { text, .. }) if text == "hello world"));
     }
 }
 
@@ -2148,5 +3545,1219 @@ mod progressive_commit_tests {
             "assistant text commits before the tool row"
         );
         assert_eq!(tool_names(view.pending()), vec!["read"], "the tool commits after the stream");
+    }
+}
+
+
+/// Batch 5 — transcript vertical rhythm (TUI-FIDELITY L1, L3, L5, L6, X1, X2, X5, X10).
+///
+/// Every assertion here is anchored to a quoted pi v0.84.1 line; each test is paired with a MIRROR
+/// assertion covering the shape that must NOT change.
+#[cfg(test)]
+mod vertical_rhythm_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use ratatui::style::{Color, Modifier};
+
+    use super::*;
+
+    fn txt(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+    fn texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines.iter().map(txt).collect()
+    }
+
+    fn committed_tool(result: Value) -> Entry {
+        let mut view = TranscriptView::new();
+        view.push_tool_start("bash", serde_json::json!({ "command": "cat wide.txt" }));
+        view.push_tool_end("bash", false, Some(result));
+        view.commit_tools();
+        view.drain_committed().into_iter().next().unwrap()
+    }
+
+    /// L1 — `box.ts:106-119`: `for (i < paddingY) result.push(this.applyBg("", width))` before the
+    /// content and again after it, with every caller passing `paddingY = 1`
+    /// (`tool-execution.ts:68`). Both rows are `applyBg`-filled, so they carry the state tint across
+    /// the whole width — they are the block's visible top and bottom edge.
+    ///
+    /// L5 — `box.ts:79-88`: the child renders at `contentWidth = width - paddingX * 2` and is then
+    /// shifted right by `leftPad`, leaving a one-column tinted gutter on BOTH sides.
+    #[test]
+    fn tool_block_has_tinted_padding_rows_and_a_gutter_on_both_sides() {
+        let theme = UiTheme::dark();
+        let entry = committed_tool(serde_json::json!({
+            "content": [{ "type": "text", "text": "abc" }],
+        }));
+        let lines = entry_lines(&entry, &theme, 30, 1, ImageOpts::default());
+        let tint = theme.tool_bg_style(Style::default(), true, false).bg;
+        assert!(tint.is_some(), "the dark theme defines a tool tint");
+
+        // Row 0 is the component's own untinted `Spacer(1)` (`tool-execution.ts:63`).
+        assert_eq!(txt(&lines[0]), "", "leading Spacer(1)");
+        assert_eq!(lines[0].style.bg, None, "the Spacer is OUTSIDE the Box, so it is untinted");
+        // Rows 1 and N-1 are the Box's paddingY rows: blank, full width, tinted.
+        let last = lines.len() - 1;
+        for i in [1usize, last] {
+            assert_eq!(txt(&lines[i]).trim(), "", "row {i} is blank: {:?}", txt(&lines[i]));
+            assert_eq!(lines[i].width(), 30, "row {i} fills the width");
+            assert_eq!(lines[i].style.bg, tint, "row {i} carries the tint");
+        }
+        // Content rows sit at column 1 and are padded to the full width, so the last column is a
+        // tinted blank — the right gutter.
+        let header = &lines[2];
+        assert!(txt(header).starts_with(" $ "), "1-column inset: {:?}", txt(header));
+        assert_eq!(header.width(), 30, "content row fills the width");
+
+        // MIRROR: an EMPTY block renders nothing at all — `box.ts:75-77` / `:91-93` return `[]`
+        // before any padding row is pushed, so a contentless Box never leaves two stray tinted rows.
+        assert!(box_lines(Vec::new(), 30, 1, 1, Style::default().bg(Color::Red)).is_empty());
+    }
+
+    /// L5, the load-bearing half — `box.ts:85` renders the child at `contentWidth`, so a line longer
+    /// than the frame is broken at `width - paddingX * 2` and the last column of every row stays a
+    /// tinted blank. Sizing the child at the full `width` instead (what cyrup did) lets output run
+    /// flush into column N-1 with no gutter on the right.
+    #[test]
+    fn tool_block_content_is_sized_to_width_minus_both_paddings() {
+        let theme = UiTheme::dark();
+        // A single unbroken 25-column token: it is hard-broken at `contentWidth`, so the break
+        // point is exactly what `contentWidth` is. At `width - 2` the first row's ink is 1 + 18 = 19
+        // and column 19 stays a tinted blank; sized at the full `width` it would be 1 + 20 = 21 and
+        // overflow the frame entirely.
+        let long = "abcdefghijklmnopqrstuvwxy 0123456789";
+        let entry = committed_tool(serde_json::json!({
+            "content": [{ "type": "text", "text": long }],
+        }));
+        let lines = entry_lines(&entry, &theme, 20, 1, ImageOpts::default());
+        let body: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|l| {
+                let t = txt(l);
+                t.contains("abcdefghijklmnopqr") || t.contains("stuvwxy")
+            })
+            .collect();
+        assert!(body.len() > 1, "the long line must wrap inside the Box: {:?}", texts(&lines));
+        for row in &body {
+            assert_eq!(row.width(), 20, "every row still fills the frame");
+            // The INK — everything before the right pad — must stop at or before column
+            // `paddingX + contentWidth` = 19, leaving column 19 (0-indexed) as the tinted gutter.
+            let ink = Line::raw(txt(row).trim_end().to_string()).width();
+            assert!(ink <= 19, "row ran into the right gutter ({ink} cols): {:?}", txt(row));
+            assert!(txt(row).starts_with(' '), "row lost its left inset: {:?}", txt(row));
+        }
+
+        // MIRROR: a SHORT line is not broken and is not indented twice.
+        let short = committed_tool(serde_json::json!({
+            "content": [{ "type": "text", "text": "zz" }],
+        }));
+        let sl = entry_lines(&short, &theme, 20, 1, ImageOpts::default());
+        assert_eq!(sl.iter().filter(|l| txt(l).contains("zz")).count(), 1);
+    }
+
+    /// L6 — `box.ts:127-131` measures with `visibleWidth(line)`, which counts terminal COLUMNS. The
+    /// old `chars().count()` under-counts every wide glyph, so the pad was too long and the tinted
+    /// row overflowed the frame into a spurious extra row.
+    #[test]
+    fn tool_block_background_is_measured_in_columns_not_chars() {
+        let theme = UiTheme::dark();
+        // Eight CJK ideographs: 8 chars, 16 columns.
+        let wide = committed_tool(serde_json::json!({
+            "content": [{ "type": "text", "text": "日本語のテキスト" }],
+        }));
+        let lines = entry_lines(&wide, &theme, 30, 1, ImageOpts::default());
+        for (i, line) in lines.iter().enumerate() {
+            assert!(line.width() <= 30, "row {i} overflows the frame: {} cols", line.width());
+        }
+        let body = lines.iter().find(|l| txt(l).contains('日')).unwrap();
+        assert_eq!(body.width(), 30, "the wide row is padded to exactly the width, not past it");
+
+        // MIRROR: the same number of NARROW characters still lands on exactly the width — the fix is
+        // a change of measure, not a change of target.
+        let narrow = committed_tool(serde_json::json!({
+            "content": [{ "type": "text", "text": "abcdefgh" }],
+        }));
+        let nlines = entry_lines(&narrow, &theme, 30, 1, ImageOpts::default());
+        let nbody = nlines.iter().find(|l| txt(l).contains("abcdefgh")).unwrap();
+        assert_eq!(nbody.width(), 30);
+    }
+
+    /// L3 — `assistant-message.ts:100-102`. The blank is gated on `hasVisibleContent` (`:96-98`),
+    /// which is exactly the condition `commit_assistant` / `commit_thinking` already gate the entry
+    /// on, so an empty turn emits neither entry nor blank.
+    #[test]
+    fn assistant_and_thinking_each_lead_with_the_spacer() {
+        let theme = UiTheme::dark();
+        let a = entry_lines(&Entry::Assistant("hi".into()), &theme, 40, 1, ImageOpts::default());
+        assert_eq!(txt(&a[0]), "", "assistant leading Spacer(1)");
+        assert_eq!(txt(&a[1]), " hi");
+
+        let t = Entry::Thinking { text: "musing".into(), hidden: true };
+        let tl = entry_lines(&t, &theme, 40, 1, ImageOpts::default());
+        assert_eq!(txt(&tl[0]), "", "thinking leading Spacer(1)");
+        assert_eq!(txt(&tl[1]), format!(" {HIDDEN_THINKING_LABEL}"));
+
+        // A thinking run followed by the answer reproduces upstream's
+        // `[Spacer] thinking [Spacer] text` (`:100-102` + `:166-168`).
+        let seq: Vec<String> = tl.iter().chain(a.iter()).map(txt).collect();
+        assert_eq!(seq, vec!["", " Thinking...", "", " hi"]);
+
+        // MIRROR: an empty turn commits no entry, so no orphan blank can reach scrollback.
+        let mut view = TranscriptView::new();
+        view.commit_assistant(Some(String::new()));
+        view.commit_thinking(Some("   ".into()));
+        assert!(view.pending().is_empty(), "empty content must not commit");
+    }
+
+    /// X2 — `custom-message.ts:94`, `branch-summary-message.ts:37` and
+    /// `compaction-summary-message.ts:38` each `addChild(new Spacer(1))` right after the label
+    /// `Text`. `skill-invocation-message.ts` does NOT: `:36-45` is label then `Markdown`, with no
+    /// spacer between them. The label itself is `theme.fg("customMessageLabel", "\x1b[1m[…]\x1b[22m")`
+    /// inside a `Box(1, 1, customMessageBg)`, so it is inset one column and banded.
+    #[test]
+    fn label_blocks_space_after_the_label_except_skill() {
+        let theme = UiTheme::dark();
+        let branch = entry_lines(
+            // `tools_expanded: true` — this test is about the EXPANDED body's spacer
+            // (`branch-summary-message.ts:37` then `:39-45`); X14's collapsed arm is covered by
+            // `x14_collapsed_branch_summary_is_one_hint_row`.
+            &Entry::BranchSummary { summary: "we merged".into() },
+            &theme,
+            40,
+            1,
+            ImageOpts { tools_expanded: true, ..ImageOpts::default() },
+        );
+        let b = texts(&branch);
+        assert_eq!(b[0], "", "leading Spacer(1) (interactive-mode.ts:3491)");
+        assert_eq!(b[1].trim(), "", "Box top paddingY");
+        assert_eq!(b[2].trim_end(), " [branch]", "label, inset 1");
+        assert_eq!(b[3].trim(), "", "Spacer(1) after the label (branch-summary-message.ts:37)");
+        assert_eq!(b[b.len() - 1].trim(), "", "Box bottom paddingY");
+
+        // MIRROR: `[skill]` has NO spacer after its label — the body follows immediately.
+        let skill = entry_lines(
+            &Entry::SkillInvocation {
+                name: "deploy".into(),
+                content: "run it".into(),
+                lead_spacer: true,
+            },
+            &theme,
+            40,
+            1,
+            ImageOpts::default(),
+        );
+        let s = texts(&skill);
+        assert_eq!(s[2].trim_end(), " [skill]", "label, inset 1");
+        assert_eq!(s[3].trim_end(), " deploy", "the body starts on the very next row");
+
+        // Every row of either block carries the `customMessageBg` band, padding rows included.
+        let band = theme.custom_message_bg_style().bg;
+        assert!(band.is_some());
+        for (i, line) in branch.iter().enumerate().skip(1) {
+            assert_eq!(line.style.bg, band, "branch row {i} is unbanded");
+            assert_eq!(line.width(), 40, "branch row {i} does not fill the width");
+        }
+    }
+
+    /// X5 — `assistant-message.ts:146-164` renders the reasoning body through a real `Markdown`
+    /// with `{ color: thinkingText, italic: true }`. Because that pair only reaches
+    /// `applyDefaultStyle` (`markdown.ts:377-404`), a heading keeps `mdHeading` (`:470-480`) instead
+    /// of being flattened into the thinking colour.
+    #[test]
+    fn thinking_body_is_markdown_not_flat_text() {
+        let theme = UiTheme::dark();
+        let e = Entry::Thinking { text: "## Plan\n\nthen do it".into(), hidden: false };
+        let lines = entry_lines(&e, &theme, 40, 0, ImageOpts::default());
+        let heading = lines.iter().find(|l| txt(l).contains("Plan")).unwrap();
+        // The literal `## ` is consumed by the renderer (level < 3 prints no prefix).
+        assert_eq!(txt(heading), "Plan", "markdown was not parsed: {:?}", txt(heading));
+        let hs = heading.spans[0].style;
+        assert_eq!(hs.fg, theme.md_heading_style().fg, "heading kept its own colour");
+
+        let prose = lines.iter().find(|l| txt(l).contains("then do it")).unwrap();
+        let ps = prose.spans[0].style;
+        assert_eq!(ps.fg, theme.thinking_text_style().fg, "prose takes the thinkingText colour");
+        assert!(ps.add_modifier.contains(Modifier::ITALIC), "prose takes `italic: true`");
+
+        // MIRROR: the HIDDEN form is still one plain `Text` line (`:141-143`), not markdown.
+        let hidden = Entry::Thinking { text: "## Plan".into(), hidden: true };
+        let hl = entry_lines(&hidden, &theme, 40, 0, ImageOpts::default());
+        assert_eq!(texts(&hl), vec!["".to_string(), HIDDEN_THINKING_LABEL.to_string()]);
+    }
+
+    /// X10 — `bash.ts:311` and `:317` both build their row as `new Text(`\n${…}`, 0, 0)`. The
+    /// leading `\n` makes `wrapTextWithAnsi` (`utils.ts:839`) emit an empty first row, so the
+    /// truncation warning and the `Took Ns` footer are each preceded by a blank.
+    #[test]
+    fn bash_tool_warnings_and_duration_each_get_a_leading_blank() {
+        let theme = UiTheme::dark();
+        let entry = committed_tool(serde_json::json!({
+            "content": [{ "type": "text", "text": "out" }],
+            "details": { "fullOutputPath": "/tmp/full.txt" },
+        }));
+        let lines = entry_lines(&entry, &theme, 40, 1, ImageOpts::default());
+        let rows = texts(&lines);
+        let warn = rows.iter().position(|r| r.contains("Full output")).unwrap();
+        assert_eq!(rows[warn - 1].trim(), "", "blank before the warning row");
+        let took = rows.iter().position(|r| r.contains("Took ")).unwrap();
+        assert_eq!(rows[took - 1].trim(), "", "blank before the duration row");
+
+        // MIRROR: the blanks belong to the warning/duration rows, not to the output — a result with
+        // neither still ends on the Box's single bottom padding row.
+        let plain = committed_tool(serde_json::json!({
+            "content": [{ "type": "text", "text": "out" }],
+        }));
+        let pl = texts(&entry_lines(&plain, &theme, 40, 1, ImageOpts::default()));
+        assert!(!pl.iter().any(|r| r.contains("Full output")));
+        assert_eq!(pl[pl.len() - 1].trim(), "");
+        assert_ne!(pl[pl.len() - 2].trim(), "", "no doubled trailing blank");
+    }
+}
+
+/// Batch 6 — the adversarial-review follow-ups on the batch-5 rhythm work.
+///
+/// Same rules as [`vertical_rhythm_tests`]: every assertion is anchored to a quoted pi v0.84.1 line
+/// and paired with a MIRROR covering the shape that must NOT change.
+#[cfg(test)]
+mod rhythm_followup_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    fn txt(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+    fn texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines.iter().map(txt).collect()
+    }
+    /// The grapheme clusters of a rendered row set, whitespace dropped — whitespace is exactly what
+    /// wrapping is allowed to remove (`utils.ts:906`, `:935`), and nothing else is.
+    fn clusters(rows: &[Line<'static>]) -> Vec<String> {
+        rows.iter()
+            .flat_map(|r| {
+                txt(r).graphemes(true).map(str::to_string).collect::<Vec<_>>()
+            })
+            .filter(|g| !g.trim().is_empty())
+            .collect()
+    }
+
+    /// L6, the half the batch left undone — `wrap_line` must measure and break on GRAPHEME CLUSTERS.
+    ///
+    /// Upstream never sees a `char`: `splitIntoTokensWithAnsi` builds its tokens from
+    /// `graphemeSegmenter.segment(...)` (`tui/src/utils.ts:775-798`) and `breakLongWord` re-segments
+    /// the over-wide token the same way before measuring each piece (`:977-980`, `:994-1012`).
+    /// Breaking per `char` severs a ZWJ emoji sequence from its joiner and a combining mark from its
+    /// base, which is a correctness bug rather than a spacing one — and it measures differently from
+    /// [`apply_bg`], which is the very disagreement L6 is about.
+    #[test]
+    fn wrap_line_breaks_on_graphemes_not_chars() {
+        // ONE unbroken token (no spaces) so it takes the `breakLongWord` path, mixing a ZWJ family
+        // emoji, a combining-mark sequence and wide CJK.
+        let src = "AAAA\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}BBe\u{301}\u{65e5}\u{672c}\u{8a9e}";
+        let rows = wrap_line(&Line::raw(src.to_string()), 8);
+        assert!(rows.len() > 1, "the token must hard-break at width 8: {:?}", texts(&rows));
+        for (i, r) in rows.iter().enumerate() {
+            assert!(r.width() <= 8, "row {i} overflows: {} cols {:?}", r.width(), txt(r));
+        }
+        // No cluster was split: re-segmenting the produced rows yields the source's clusters, in
+        // order. A per-`char` break emits `"\u{1f468}"` then a bare `"\u{200d}"`, which does not.
+        let want: Vec<String> =
+            src.graphemes(true).filter(|g| !g.trim().is_empty()).map(str::to_string).collect();
+        assert_eq!(clusters(&rows), want, "a grapheme cluster was torn: {:?}", texts(&rows));
+        assert!(
+            rows.iter().any(|r| txt(r).contains('\u{1f468}')
+                && txt(r).contains('\u{1f466}')),
+            "the ZWJ family landed on one row whole: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            !rows.iter().any(|r| txt(r).starts_with('\u{200d}') || txt(r).starts_with('\u{301}')),
+            "a row began with an orphaned joiner/combining mark: {:?}",
+            texts(&rows)
+        );
+
+        // A long unbroken run of WIDE characters: 26 CJK ideographs, 52 columns, at width 10.
+        let cjk = "\u{8a9e}".repeat(26);
+        let wide = wrap_line(&Line::raw(cjk.clone()), 10);
+        for (i, r) in wide.iter().enumerate() {
+            assert!(r.width() <= 10, "wide row {i} overflows: {} cols", r.width());
+        }
+        assert_eq!(clusters(&wide).len(), 26, "characters were lost or duplicated");
+
+        // MIRROR: the token-width SUM leg is grapheme-measured too, so a space-separated wide string
+        // wraps on its spaces and every row still fits.
+        let words = "\u{65e5}\u{672c}\u{8a9e} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466} abc \u{65e5}\u{672c}\u{8a9e}";
+        let ws = wrap_line(&Line::raw(words.to_string()), 9);
+        for (i, r) in ws.iter().enumerate() {
+            assert!(r.width() <= 9, "row {i} overflows: {} cols {:?}", r.width(), txt(r));
+        }
+        assert_eq!(
+            clusters(&ws),
+            words
+                .graphemes(true)
+                .filter(|g| !g.trim().is_empty())
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        );
+
+        // MIRROR: the fast path is untouched — a line that already fits comes back byte-identical.
+        let fits = Line::raw("short".to_string());
+        assert_eq!(texts(&wrap_line(&fits, 20)), vec!["short".to_string()]);
+    }
+
+    /// L3 — the gate is `hasVisibleContent` (`assistant-message.ts:96-98`):
+    ///
+    /// ```ts
+    /// const hasVisibleContent = message.content.some(
+    ///   (c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
+    /// );
+    /// if (hasVisibleContent) { this.contentContainer.addChild(new Spacer(1)); }
+    /// ```
+    ///
+    /// Both legs are **trimmed**, and `:107` gates the text block's `Markdown` child on the same
+    /// `content.text.trim()`. A turn of nothing but spaces therefore gets neither a body nor a
+    /// blank. `commit_assistant` tested `!t.is_empty()`, which let `"   "` through.
+    #[test]
+    fn whitespace_only_assistant_turn_is_not_visible_content() {
+        let theme = UiTheme::dark();
+
+        // Committed leg: a whitespace-only turn never becomes an entry.
+        let mut view = TranscriptView::new();
+        view.commit_assistant(Some("   \n\t ".to_string()));
+        assert!(view.pending().is_empty(), "whitespace-only turn committed: {:?}", view.pending());
+
+        // …and the render arm refuses it independently, because `Entry::Assistant` is public.
+        assert!(entry_lines(&Entry::Assistant("  ".into()), &theme, 40, 1, ImageOpts::default())
+            .is_empty());
+
+        // Streaming leg: the live region shows nothing at all until real text arrives.
+        let mut live = TranscriptView::new();
+        live.push_assistant_delta("  ");
+        assert!(live.lines(40, &theme).is_empty(), "{:?}", texts(&live.lines(40, &theme)));
+
+        // MIRROR: real content still gets exactly one leading blank, on both legs.
+        let mut ok = TranscriptView::new();
+        ok.commit_assistant(Some("hi".to_string()));
+        let committed = entry_lines(&ok.pending()[0], &theme, 40, 1, ImageOpts::default());
+        assert_eq!(texts(&committed), vec!["".to_string(), " hi".to_string()]);
+        live.push_assistant_delta("hi");
+        assert_eq!(texts(&live.lines(40, &theme)), vec!["".to_string(), " hi".to_string()]);
+    }
+
+    /// The `hasVisibleContent` fix must not disarm the reasoning leg: a whitespace-only THINKING
+    /// buffer is invisible for the same reason (`:97`'s `c.thinking.trim()`), but a real one still
+    /// carries the blank, and the `hasVisibleContentAfter` blank between the two (`:135-137`,
+    /// `:166-168`) is likewise gated on the trimmed answer text.
+    #[test]
+    fn live_thinking_and_answer_spacers_use_the_trimmed_predicate() {
+        let theme = UiTheme::dark();
+        let mut view = TranscriptView::new();
+        view.set_hide_thinking_block(true);
+
+        view.push_thinking_delta("  ");
+        assert!(view.lines(40, &theme).is_empty(), "whitespace-only reasoning is not visible");
+
+        view.push_thinking_delta("musing");
+        assert_eq!(
+            texts(&view.lines(40, &theme)),
+            vec!["".to_string(), format!(" {HIDDEN_THINKING_LABEL}")],
+            "one leading blank, no trailing one — nothing visible follows"
+        );
+
+        // A whitespace-only answer must NOT open the `hasVisibleContentAfter` gap.
+        view.push_assistant_delta("   ");
+        assert_eq!(
+            texts(&view.lines(40, &theme)),
+            vec!["".to_string(), format!(" {HIDDEN_THINKING_LABEL}")]
+        );
+
+        // MIRROR: a real answer does. (The buffer is now `"   done"`; `Markdown` drops the leading
+        // whitespace, so the row is the `outputPad` column plus the text.)
+        view.push_assistant_delta("done");
+        assert_eq!(
+            texts(&view.lines(40, &theme)),
+            vec![
+                "".to_string(),
+                format!(" {HIDDEN_THINKING_LABEL}"),
+                "".to_string(),
+                " done".to_string(),
+            ]
+        );
+    }
+
+    /// The leading `Spacer(1)` may not outlive the component it introduces. `box.ts:75-77` and
+    /// `:91-93` both `return []` for an empty child set, and upstream never reaches the spacer in
+    /// that case either — `interactive-mode.ts:3499`'s `if (textContent)` skips the whole
+    /// `case "user"`, spacer included. Prepending it unconditionally left a bare blank row.
+    #[test]
+    fn a_component_that_renders_nothing_gets_no_leading_spacer() {
+        let theme = UiTheme::dark();
+        let empty = Entry::User { text: String::new(), lead_spacer: true };
+        assert!(
+            entry_lines(&empty, &theme, 40, 1, ImageOpts::default()).is_empty(),
+            "orphan blank ahead of an empty user box"
+        );
+        // The same for the labeled shell, exercised through `box_lines` directly.
+        assert!(box_lines(Vec::new(), 40, 1, 1, Style::default()).is_empty());
+
+        // MIRROR: real text still gets the blank, the tinted paddingY row and the inset body.
+        let real = Entry::User { text: "hello".into(), lead_spacer: true };
+        let rows = entry_lines(&real, &theme, 40, 1, ImageOpts::default());
+        assert_eq!(txt(&rows[0]), "", "leading Spacer(1)");
+        assert_eq!(rows[0].width(), 0, "the Spacer is outside the Box, so it is not filled");
+        assert_eq!(rows[1].width(), 40, "the Box's top paddingY row IS filled");
+        assert!(txt(&rows[2]).starts_with(" hello"));
+    }
+
+    /// X18 — `showStatus` (`interactive-mode.ts:3411-3429`) puts a status line in the chat container
+    /// like any other child:
+    ///
+    /// ```ts
+    /// const spacer = new Spacer(1);
+    /// const text = new Text(theme.fg("dim", message), 1, 0);
+    /// this.chatContainer.addChild(spacer);
+    /// this.chatContainer.addChild(text);
+    /// ```
+    ///
+    /// So: a leading blank, then a `dim` `Text` at **paddingX 1** — `Text.render` emits
+    /// `leftMargin + line + rightMargin` (`text.ts:70-76`) and wraps at `width - paddingX * 2`
+    /// (`:64`). No bullet is interpolated anywhere; the `• ` prefix and the flush-left placement
+    /// were cyrup inventions.
+    #[test]
+    fn status_row_is_a_spacer_plus_a_one_column_inset_dim_text() {
+        let theme = UiTheme::dark();
+        let rows = entry_lines(&Entry::Status("Model: opus".into()), &theme, 40, 1, ImageOpts::default());
+        assert_eq!(texts(&rows), vec!["".to_string(), " Model: opus".to_string()]);
+        assert!(!txt(&rows[1]).contains('\u{2022}'), "invented bullet: {:?}", txt(&rows[1]));
+        assert_eq!(rows[1].spans[1].style, theme.dim_style(), "`theme.fg(\"dim\", message)`");
+
+        // The inset does not depend on `outputPad` — `new Text(…, 1, 0)` hard-codes paddingX 1.
+        let flush = entry_lines(&Entry::Status("Model: opus".into()), &theme, 40, 0, ImageOpts::default());
+        assert_eq!(texts(&flush), vec!["".to_string(), " Model: opus".to_string()]);
+
+        // MIRROR: a long status wraps at `contentWidth = width - 2` and every row keeps the inset.
+        let long = entry_lines(
+            &Entry::Status("aaaa bbbb cccc dddd eeee ffff gggg".into()),
+            &theme,
+            16,
+            1,
+            ImageOpts::default(),
+        );
+        assert!(long.len() > 2, "a long status must wrap: {:?}", texts(&long));
+        for row in long.iter().skip(1) {
+            assert!(txt(row).starts_with(' '), "row lost its inset: {:?}", txt(row));
+            assert!(row.width() <= 16, "row overflows: {:?}", txt(row));
+        }
+    }
+
+    /// The first child of a fresh session's chat gets NO leading blank:
+    /// `interactive-mode.ts:3500` is `if (this.chatContainer.children.length > 0) { …
+    /// addChild(new Spacer(1)) }`. The neighbouring call sites are deliberately different — `:3484`
+    /// (compaction), `:3491` (branch) and `:3514` (the user message trailing a skill block) are all
+    /// UNgated — so the gate is per call site, not a global rule.
+    #[test]
+    fn the_first_chat_child_gets_no_leading_spacer() {
+        let theme = UiTheme::dark();
+        let mut view = TranscriptView::new();
+        view.push_user("first");
+        let first = view.drain_committed();
+        assert!(matches!(first[0], Entry::User { lead_spacer: false, .. }), "{:?}", first[0]);
+        let rows = entry_lines(&first[0], &theme, 40, 1, ImageOpts::default());
+        assert_eq!(rows[0].width(), 40, "row 0 is the Box's tinted paddingY row, not a Spacer");
+        assert!(txt(&rows[1]).starts_with(" first"), "{:?}", texts(&rows));
+
+        // MIRROR: the SECOND message gets one — and it still does after the first was flushed to
+        // native scrollback, which is why the answer cannot be read off `pending` at render time.
+        view.push_user("second");
+        let second = view.drain_committed();
+        assert!(matches!(second[0], Entry::User { lead_spacer: true, .. }), "{:?}", second[0]);
+        let srows = entry_lines(&second[0], &theme, 40, 1, ImageOpts::default());
+        assert_eq!(txt(&srows[0]), "");
+        assert_eq!(srows[0].width(), 0, "the Spacer is untinted and unpadded");
+
+        // A live streaming turn is a chat child too (`AssistantMessageComponent` is in
+        // `chatContainer`), so a user message that follows one is never "first".
+        let mut streamed = TranscriptView::new();
+        streamed.push_assistant_delta("hi");
+        streamed.push_user("after a stream");
+        assert!(matches!(streamed.pending()[0], Entry::User { lead_spacer: true, .. }));
+
+        // `:3500` covers the SKILL component too (`:3506` sits inside it), while the user message
+        // that trails the skill block (`:3513-3521`) has its own unconditional spacer.
+        let mut skill = TranscriptView::new();
+        skill.push_user("<skill name=\"deploy\" location=\"a\">\nrun it\n</skill>\n\nand then?");
+        let entries = skill.drain_committed();
+        assert!(
+            matches!(entries[0], Entry::SkillInvocation { lead_spacer: false, .. }),
+            "{:?}",
+            entries[0]
+        );
+        assert!(matches!(entries[1], Entry::User { lead_spacer: true, .. }), "{:?}", entries[1]);
+        assert_eq!(
+            txt(&entry_lines(&entries[1], &theme, 40, 1, ImageOpts::default())[0]),
+            ""
+        );
+
+        // MIRROR: the ungated call sites are unaffected — a branch summary opening a fresh session
+        // still leads with its blank (`:3491`).
+        let branch =
+            entry_lines(
+                &Entry::BranchSummary { summary: "merged".into() },
+                &theme,
+                40,
+                1,
+                ImageOpts { tools_expanded: true, ..ImageOpts::default() },
+            );
+        assert_eq!(txt(&branch[0]), "");
+        assert_eq!(branch[0].width(), 0, "`:3491`'s Spacer is outside the Box");
+    }
+
+    /// **`Entry::Block` — the body is rendered at `width - 2`, not at `width`.**
+    ///
+    /// The stack is `Markdown(body, 1, 1, theme)` (`interactive-mode.ts:6201`, and the identical
+    /// `/changelog` site at `:6071`), and `Markdown.render` opens with
+    /// `const contentWidth = Math.max(1, width - this.paddingX * 2)` (`markdown.ts:284`) — paddingX
+    /// is 1, so the body wraps at two columns narrower than the rule above it and is then inset by
+    /// `leftMargin = " ".repeat(this.paddingX)` (`:328`). Rendering the body at the full `width` put
+    /// a row of body text one column wider than the block it sits in, and the inset then pushed it
+    /// past the right edge.
+    #[test]
+    fn block_body_wraps_at_width_minus_two() {
+        let theme = UiTheme::dark();
+        // 19 columns of body inside a 20-column block: fits at `width`, must NOT fit at `width - 2`.
+        let body = "aaaaaaaaa bbbbbbbbb";
+        assert_eq!(Line::raw(body).width(), 19);
+        let rows = entry_lines(
+            &Entry::Block { title: "T".into(), markdown: body.into() },
+            &theme,
+            20,
+            1,
+            ImageOpts::default(),
+        );
+        let text: Vec<String> = texts(&rows);
+        assert!(
+            text.iter().any(|r| r.trim() == "aaaaaaaaa") && text.iter().any(|r| r.trim() == "bbbbbbbbb"),
+            "the body did not wrap at `width - 2` — it was rendered at the full width: {text:?}"
+        );
+        for row in &rows {
+            assert!(row.width() <= 20, "a row overflowed the block: {:?}", txt(row));
+        }
+        // `leftMargin` — every body row carries the one-column inset (`markdown.ts:328-340`).
+        for row in rows.iter().filter(|r| txt(r).contains('a') || txt(r).contains('b')) {
+            assert!(txt(row).starts_with(' '), "body row lost `leftMargin`: {:?}", txt(row));
+        }
+
+        // MIRROR — the two `─` rules are the one thing that DOES run edge to edge (`DynamicBorder`
+        // is a chat child with no padding at all), so the block is 20 wide even though its body is 18.
+        assert_eq!(txt(&rows[1]), "─".repeat(20), "the opening rule is full width");
+        assert_eq!(
+            txt(rows.last().unwrap()),
+            "─".repeat(20),
+            "the closing rule is full width"
+        );
+    }
+
+    /// **`Entry::Block` — an EMPTY body contributes no rows, not two blank ones.**
+    ///
+    /// `Markdown.render` returns `[]` on blank text at `markdown.ts:288-296`:
+    ///
+    /// ```ts
+    /// if (!text || text.trim() === "") {
+    ///     const result: string[] = [];
+    ///     …
+    ///     return result;
+    /// }
+    /// ```
+    ///
+    /// That early return is BEFORE the `paddingY` block at `:352-361`, so the component's own
+    /// blank rows above and below the body never materialize. Emitting them anyway left a
+    /// bodyless block (a `/changelog` with no entries is the live case) four rows tall with a
+    /// hollow gap the upstream never draws.
+    #[test]
+    fn block_with_an_empty_body_emits_no_padding_rows() {
+        let theme = UiTheme::dark();
+        let rule = "─".repeat(24);
+        let empty = entry_lines(
+            &Entry::Block { title: "What's New".into(), markdown: String::new() },
+            &theme,
+            24,
+            1,
+            ImageOpts::default(),
+        );
+        assert_eq!(
+            texts(&empty),
+            vec!["".to_string(), rule.clone(), " What's New".to_string(), String::new(), rule.clone()],
+            "an empty body must add nothing between the title's trailing blank and the closing rule"
+        );
+
+        // Whitespace-only is the same case — the guard is `text.trim() === ""`, not `!text`.
+        let blank = entry_lines(
+            &Entry::Block { title: "What's New".into(), markdown: "  \n\n \t".into() },
+            &theme,
+            24,
+            1,
+            ImageOpts::default(),
+        );
+        assert_eq!(texts(&blank), texts(&empty), "a whitespace-only body is a blank body");
+
+        // MIRROR — a real body DOES bring the `paddingY` pair with it (`:352-361`), so the two
+        // shapes differ by exactly the body plus its two blanks.
+        let full = entry_lines(
+            &Entry::Block { title: "What's New".into(), markdown: "hello".into() },
+            &theme,
+            24,
+            1,
+            ImageOpts::default(),
+        );
+        assert_eq!(full.len(), empty.len() + 3, "body + one blank above + one below: {:?}", texts(&full));
+        assert_eq!(txt(&full[4]), "", "paddingY row above the body");
+        assert_eq!(txt(&full[5]).trim(), "hello");
+        assert_eq!(txt(&full[6]), "", "paddingY row below the body");
+    }
+}
+
+/// Batch-11 group X — the eight transcript items scheduled by every plan and delivered by none:
+/// X6 (`read`/`write` syntax highlighting + `replaceTabs`), X7 (compact `read` classification, =
+/// `G30b`), X8 (`edit` preview-state tint), X9 (dim-key/muted-word expand hints resolved from the
+/// live keymap), X11 (extension-rendered custom message keeps its own colour), X14 (collapsed
+/// branch/compaction summaries), X15 (renderer-failure box).
+#[cfg(test)]
+mod x_group_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+    use serde_json::json;
+
+    use super::*;
+
+    fn txt(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+    fn texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines.iter().map(txt).collect()
+    }
+    fn joined(lines: &[Line<'static>]) -> String {
+        texts(lines).join("\n")
+    }
+    /// The one rendered row whose text contains `needle`.
+    fn row<'a>(lines: &'a [Line<'static>], needle: &str) -> &'a Line<'static> {
+        lines
+            .iter()
+            .find(|l| txt(l).contains(needle))
+            .unwrap_or_else(|| panic!("no row containing {needle:?} in:\n{}", joined(lines)))
+    }
+    fn text_result(text: &str, details: Value) -> Value {
+        json!({ "content": [{ "type": "text", "text": text }], "details": details })
+    }
+    /// One settled tool run, rendered through the real [`tool_lines`] dispatch.
+    fn run_lines(
+        name: &str,
+        args: Value,
+        result: Option<Value>,
+        expanded: bool,
+        opts: ImageOpts<'_>,
+    ) -> Vec<Line<'static>> {
+        let theme = UiTheme::dark();
+        let mut view = TranscriptView::new();
+        view.push_tool_start(name, args);
+        if let Some(r) = result {
+            view.push_tool_end(name, false, Some(r));
+        }
+        let run = view.active_tools()[0].clone();
+        let mut out = Vec::new();
+        out.extend(tool_lines(&run, expanded, 100, &theme, opts));
+        out
+    }
+
+    // --- X6 -------------------------------------------------------------------------------------
+
+    /// **X6 — an expanded `read` of a source file is SYNTAX HIGHLIGHTED, not one flat grey wall.**
+    ///
+    /// `read.ts:184-190`:
+    /// ```ts
+    /// const lang = !isError && rawPath ? getLanguageFromPath(rawPath) : undefined;
+    /// const renderedLines = lang ? highlightCode(replaceTabs(output), lang) : output.split("\n");
+    /// …displayLines.map((line) => (lang ? replaceTabs(line) : theme.fg("toolOutput", replaceTabs(line))))
+    /// ```
+    /// so with a language in hand the body carries the highlighter's colours and NOT `toolOutput`.
+    #[test]
+    fn x6_expanded_read_of_a_rust_file_is_highlighted() {
+        let theme = UiTheme::dark();
+        let lines = run_lines(
+            "read",
+            json!({ "path": "src/main.rs" }),
+            Some(text_result("// a comment\nfn main() {}", json!(null))),
+            true,
+            ImageOpts::default(),
+        );
+        let comment = row(&lines, "a comment");
+        let comment_span = comment
+            .spans
+            .iter()
+            .find(|s| s.content.contains("comment"))
+            .expect("the comment text is on the row");
+        assert_ne!(
+            comment_span.style,
+            theme.tool_output_style(),
+            "a highlighted row is NOT painted `toolOutput`:\n{}",
+            joined(&lines)
+        );
+        assert_eq!(
+            comment_span.style,
+            theme.syntax_style_for_scope("comment.line").unwrap(),
+            "`// a comment` takes the syntaxComment role"
+        );
+        // The `fn` keyword on the next row proves the highlighter ran over the whole body, not just
+        // the first line.
+        let decl = row(&lines, "fn main");
+        assert!(
+            decl.spans.iter().any(|s| s.style == theme.syntax_style_for_scope("keyword").unwrap()),
+            "`fn` takes the syntaxKeyword role:\n{}",
+            joined(&lines)
+        );
+
+        // MIRROR: a path whose extension `getLanguageFromPath` does not know has `lang === undefined`,
+        // so every row stays flat `theme.fg("toolOutput", …)` — the `: ` arm of the same ternary.
+        let flat = run_lines(
+            "read",
+            json!({ "path": "notes.unknownext" }),
+            Some(text_result("// a comment\nfn main() {}", json!(null))),
+            true,
+            ImageOpts::default(),
+        );
+        // The flat arm is one `Line::styled(replaceTabs(line), toolOutput)` — the colour rides on
+        // the row, not on per-token spans, because there are no tokens.
+        assert_eq!(
+            row(&flat, "a comment").style.fg,
+            theme.tool_output_style().fg,
+            "unknown extension ⇒ flat toolOutput:\n{}",
+            joined(&flat)
+        );
+    }
+
+    /// **X6 — tabs become exactly three spaces (`replaceTabs`, `render-utils.ts:31-33`).**
+    #[test]
+    fn x6_tabs_are_replaced_with_three_spaces() {
+        let lines = run_lines(
+            "read",
+            json!({ "path": "notes.unknownext" }),
+            Some(text_result("a\tb", json!(null))),
+            true,
+            ImageOpts::default(),
+        );
+        assert!(
+            joined(&lines).contains("a   b"),
+            "tab ⇒ three spaces:\n{}",
+            joined(&lines)
+        );
+        assert!(!joined(&lines).contains('\t'), "no raw tab survives");
+
+        // MIRROR: `write`'s content preview runs through the same `replaceTabs` (`write.ts:160`).
+        let w = run_lines(
+            "write",
+            json!({ "path": "notes.unknownext", "content": "a\tb" }),
+            None,
+            false,
+            ImageOpts::default(),
+        );
+        assert!(joined(&w).contains("a   b"), "write preview too:\n{}", joined(&w));
+    }
+
+    // --- X7 -------------------------------------------------------------------------------------
+
+    /// **X7 (= `G30b`) — a collapsed `read` of a `SKILL.md` is `[skill] <dir> (key to expand)`.**
+    ///
+    /// `read.ts:336` picks `formatCompactReadCall` only when NOT expanded, and `:130-133` labels a
+    /// `SKILL.md` with `basename(dirname(absolutePath))`.
+    #[test]
+    fn x7_collapsed_read_of_a_skill_md_uses_the_compact_header() {
+        let theme = UiTheme::dark();
+        let cwd = std::path::Path::new("/home/u/.cyrup");
+        let opts = ImageOpts { cwd: Some(cwd), ..ImageOpts::default() };
+        let lines = run_lines("read", json!({ "path": "skills/commit-helper/SKILL.md" }), None, false, opts);
+        let header = row(&lines, "[skill]");
+        assert_eq!(
+            txt(header).trim_end(),
+            " [skill] commit-helper (ctrl+o to expand)",
+            "compact skill header (the leading space is the Box's paddingX)"
+        );
+        assert_eq!(
+            header.spans[1].style,
+            theme.custom_message_label_style(),
+            "`theme.fg(\"customMessageLabel\", …)` on the bracket (read.ts:153)"
+        );
+        assert_eq!(
+            header.spans[2].style,
+            theme.custom_message_text_style(),
+            "`theme.fg(\"customMessageText\", label)` (read.ts:154)"
+        );
+        assert!(!joined(&lines).contains("SKILL.md"), "the raw path is gone:\n{}", joined(&lines));
+
+        // MIRROR 1: EXPANDING the same read falls back to the plain `read <path>` header —
+        // `!context.expanded ? getCompactReadClassification(...) : undefined` (read.ts:336).
+        let expanded = run_lines("read", json!({ "path": "skills/commit-helper/SKILL.md" }), None, true, opts);
+        assert!(
+            joined(&expanded).contains("read skills/commit-helper/SKILL.md"),
+            "expanded ⇒ plain header:\n{}",
+            joined(&expanded)
+        );
+        assert!(!joined(&expanded).contains("[skill]"));
+
+        // MIRROR 2: an ordinary source file classifies as nothing and keeps the plain header.
+        let plain = run_lines("read", json!({ "path": "src/main.rs" }), None, false, opts);
+        assert!(joined(&plain).contains("read src/main.rs"), "{}", joined(&plain));
+        assert!(!joined(&plain).contains("to expand"), "no compact hint on a plain read");
+    }
+
+    /// **X7 — `AGENTS.md`/`CLAUDE.md` classify as `resource`, labelled relative to the cwd.**
+    ///
+    /// `read.ts:42` `COMPACT_RESOURCE_FILE_NAMES` + `:138-140`, rendered by `:160-165` as
+    /// `fg("toolTitle", bold("read resource")) + " " + fg("accent", label)`.
+    #[test]
+    fn x7_agents_md_is_a_compact_resource_read() {
+        let theme = UiTheme::dark();
+        let cwd = std::path::Path::new("/w/project");
+        let opts = ImageOpts { cwd: Some(cwd), ..ImageOpts::default() };
+        let lines = run_lines("read", json!({ "path": "docs/AGENTS.md" }), None, false, opts);
+        let header = row(&lines, "read resource");
+        assert_eq!(txt(header).trim_end(), " read resource docs/AGENTS.md (ctrl+o to expand)");
+        assert_eq!(header.spans[1].style, theme.tool_title_style());
+        assert_eq!(header.spans[3].style, theme.accent_style(), "`fg(\"accent\", label)`");
+
+        // MIRROR: the set is matched case-sensitively on the BASENAME, so `agents.md` is not in it.
+        let lower = run_lines("read", json!({ "path": "docs/agents.md" }), None, false, opts);
+        assert!(!joined(&lower).contains("read resource"), "{}", joined(&lower));
+        assert!(joined(&lower).contains("read docs/agents.md"), "{}", joined(&lower));
+    }
+
+    // --- X8 -------------------------------------------------------------------------------------
+
+    /// **X8 — a PENDING `edit` with a computed preview is tinted `toolSuccessBg`, not `toolPendingBg`.**
+    ///
+    /// `getEditHeaderBg` (`edit.ts:239-253`) tests the preview FIRST and never looks at `done`.
+    #[test]
+    fn x8_edit_tint_follows_the_preview_not_done() {
+        let theme = UiTheme::dark();
+        let mut view = TranscriptView::new();
+        view.push_tool_start_rendered(
+            "edit".to_string(),
+            Some("call-1".to_string()),
+            json!({ "path": "a.rs" }),
+            None,
+        );
+        view.set_edit_preview(Some("call-1"), Ok("@@\n-old\n+new".to_string()));
+        let run = view.active_tools()[0].clone();
+        assert!(!run.done, "still pending — a permission prompt is up");
+        let lines = tool_lines(&run, false, 60, &theme, ImageOpts::default());
+        let success = theme.tool_bg_style(Style::default(), true, false);
+        let pending = theme.tool_bg_style(Style::default(), false, false);
+        assert_ne!(success, pending, "the dark theme distinguishes the two tints");
+        assert_eq!(
+            lines[1].style, success,
+            "a computed preview greens the pending block (edit.ts:244-248)"
+        );
+
+        // MIRROR 1: a preview that FAILED reds the same pending block (`"error" in preview`).
+        let mut v2 = TranscriptView::new();
+        v2.push_tool_start_rendered(
+            "edit".to_string(),
+            Some("c".to_string()),
+            json!({ "path": "a.rs" }),
+            None,
+        );
+        v2.set_edit_preview(Some("c"), Err("no match for oldText".to_string()));
+        let r2 = v2.active_tools()[0].clone();
+        assert_eq!(
+            tool_lines(&r2, false, 60, &theme, ImageOpts::default())[1].style,
+            theme.tool_bg_style(Style::default(), false, true),
+            "a failed preview reds it (edit.ts:245-246)"
+        );
+
+        // MIRROR 2: no preview at all still means `toolPendingBg` — the fix must not green
+        // everything (`edit.ts:253`).
+        let mut v3 = TranscriptView::new();
+        v3.push_tool_start("edit", json!({ "path": "a.rs" }));
+        let r3 = v3.active_tools()[0].clone();
+        assert_eq!(tool_lines(&r3, false, 60, &theme, ImageOpts::default())[1].style, pending);
+
+        // MIRROR 3: every OTHER tool keeps the `done`/`is_error` keying — `getEditHeaderBg` is
+        // `edit`-only, and a pending `read` must stay neutral.
+        let r4 = run_lines("read", json!({ "path": "a.rs" }), None, false, ImageOpts::default());
+        assert_eq!(r4[1].style, pending, "pending read is untouched by X8");
+    }
+
+    // --- X9 -------------------------------------------------------------------------------------
+
+    /// **X9 — the `… to expand` hint is dim-key + muted-words, and the key is the LIVE binding.**
+    ///
+    /// `read.ts:192` + `keybinding-hints.ts:42-43`.
+    #[test]
+    fn x9_more_lines_hint_splits_dim_key_from_muted_words() {
+        let theme = UiTheme::dark();
+        let body: String =
+            (0..30).map(|i| format!("line {i}\n")).collect::<String>().trim_end().to_string();
+        // A collapsed `read` renders no body at all (`read.ts:178-180`), so the hint is exercised
+        // through `grep`, whose head-15 collapse uses the very same `more_lines_hint` (`grep.ts:111`
+        // is byte-identical to `read.ts:192`).
+        let g = run_lines(
+            "grep",
+            json!({ "pattern": "x" }),
+            Some(text_result(&body, json!(null))),
+            false,
+            ImageOpts::default(),
+        );
+        let hint = row(&g, "more lines");
+        let spans: Vec<(&str, Style)> =
+            hint.spans.iter().map(|s| (s.content.as_ref(), s.style)).collect();
+        // [0] is the Box's paddingX margin.
+        assert_eq!(spans[1].0, "... (15 more lines,");
+        assert_eq!(spans[1].1, theme.muted_style());
+        assert_eq!(spans[3].0, "ctrl+o", "the key label is its own span");
+        assert_eq!(spans[3].1, theme.dim_style(), "`theme.fg(\"dim\", keyText(...))`");
+        assert_eq!(spans[4].0, " to expand");
+        assert_eq!(spans[4].1, theme.muted_style(), "the description run is `muted`");
+        assert_ne!(theme.dim_style(), theme.muted_style(), "the two roles differ in this theme");
+
+        // MIRROR 1: a REBOUND `app.tools.expand` reaches the hint — the whole point of `keyText`.
+        let rebound = run_lines(
+            "grep",
+            json!({ "pattern": "x" }),
+            Some(text_result(&body, json!(null))),
+            false,
+            ImageOpts { expand_key: "ctrl+e/f4", ..ImageOpts::default() },
+        );
+        let h2 = row(&rebound, "more lines");
+        assert_eq!(h2.spans[3].content.as_ref(), "ctrl+e/f4");
+        assert!(!txt(h2).contains("ctrl+o"), "the literal is gone: {:?}", txt(h2));
+
+        // MIRROR 2: the same two-tone shape on the bash tool's `… earlier lines` hint
+        // (`bash.ts:281-284`), which had the identical defect.
+        let b = run_lines(
+            "bash",
+            json!({ "command": "ls" }),
+            Some(text_result(&body, json!(null))),
+            false,
+            ImageOpts { expand_key: "ctrl+e", ..ImageOpts::default() },
+        );
+        let hb = row(&b, "earlier lines");
+        assert_eq!(hb.spans[1].content.as_ref(), "... (25 earlier lines,");
+        assert_eq!(hb.spans[1].style, theme.muted_style());
+        assert_eq!(hb.spans[3].content.as_ref(), "ctrl+e", "resolved, not the `ctrl+o` literal");
+        assert_eq!(hb.spans[3].style, theme.dim_style());
+        assert_eq!(hb.spans[4].content.as_ref(), " to expand");
+        assert_eq!(hb.spans[4].style, theme.muted_style());
+    }
+
+    // --- X11 ------------------------------------------------------------------------------------
+
+    /// **X11 — an extension-rendered custom message keeps its own colour; the host adds none.**
+    ///
+    /// `custom-message.ts:76-81` is `this.addChild(component); return;` — the component goes in
+    /// as-is. cyrup restyled every row `dim`.
+    #[test]
+    fn x11_extension_rendered_message_is_not_forced_dim() {
+        let theme = UiTheme::dark();
+        let entry = Entry::Custom {
+            label: "demo".to_string(),
+            body: "ignored".to_string(),
+            rendered: Rendered::Text("Hello from the extension".to_string()),
+        };
+        let lines = entry_lines(&entry, &theme, 60, 1, ImageOpts::default());
+        let r = row(&lines, "Hello from the extension");
+        // The old code was `Line::styled(l, theme.dim_style())`, which parks the colour on the ROW,
+        // so both the row style and every span style have to be checked — asserting only on
+        // `spans[0]` would pass against the defect.
+        assert_ne!(r.style, theme.dim_style(), "the host must not repaint the renderer's output");
+        assert_eq!(r.style, Style::default(), "added as-is ⇒ no row-level host styling");
+        assert!(
+            r.spans.iter().all(|s| s.style == Style::default()),
+            "…and none on the spans either: {:?}",
+            r.spans.iter().map(|s| s.style).collect::<Vec<_>>()
+        );
+
+        // MIRROR: the DEFAULT (no renderer) framing is unchanged — still the `[demo]` box whose body
+        // is `customMessageText` (`custom-message.ts:92,107-111`).
+        let default_entry = Entry::Custom {
+            label: "demo".to_string(),
+            body: "body text".to_string(),
+            rendered: Rendered::None,
+        };
+        let d = entry_lines(&default_entry, &theme, 60, 1, ImageOpts::default());
+        assert!(joined(&d).contains("[demo]"), "{}", joined(&d));
+        assert!(joined(&d).contains("body text"), "{}", joined(&d));
+    }
+
+    // --- X15 ------------------------------------------------------------------------------------
+
+    /// **X15 — a THROWING renderer draws Pi's failure box, not nothing.**
+    ///
+    /// `custom-entry.ts:47-52`: a `Box(1, 1, customMessageBg)` holding
+    /// `theme.fg("error", "[type] renderer failed: <message>")`, then `:59-60`'s `Spacer(1)`.
+    #[test]
+    fn x15_a_throwing_renderer_draws_the_failure_box() {
+        let theme = UiTheme::dark();
+        let entry = Entry::Custom {
+            label: "demo".to_string(),
+            body: "unused".to_string(),
+            rendered: Rendered::Failed("boom".to_string()),
+        };
+        let lines = entry_lines(&entry, &theme, 60, 1, ImageOpts::default());
+        assert!(!lines.is_empty(), "the entry must not vanish");
+        assert_eq!(txt(&lines[0]), "", "`custom-entry.ts:59`'s Spacer(1)");
+        let r = row(&lines, "renderer failed");
+        assert_eq!(txt(r).trim_end(), " [demo] renderer failed: boom");
+        assert_eq!(r.spans[1].style.fg, theme.error_style().fg, "`theme.fg(\"error\", …)`");
+        assert_eq!(
+            r.style.bg,
+            theme.custom_message_bg_style().bg,
+            "inside a `Box(1, 1, customMessageBg)`"
+        );
+        assert!(!joined(&lines).contains("unused"), "the default body is not also drawn");
+    }
+
+    // --- X14 ------------------------------------------------------------------------------------
+
+    /// **X14 — a collapsed branch summary is ONE row, and the expand key is the live one.**
+    ///
+    /// `branch-summary-message.ts:46-56`.
+    #[test]
+    fn x14_collapsed_branch_summary_is_one_hint_row() {
+        let theme = UiTheme::dark();
+        let entry =
+            Entry::BranchSummary { summary: "tried the async rewrite, abandoned it".to_string() };
+        let lines = entry_lines(&entry, &theme, 60, 1, ImageOpts::default());
+        assert!(joined(&lines).contains("[branch]"), "{}", joined(&lines));
+        let hint = row(&lines, "Branch summary");
+        assert_eq!(txt(hint).trim_end(), " Branch summary (ctrl+o to expand)");
+        assert_eq!(
+            hint.spans[1].style,
+            theme.custom_message_text_style(),
+            "`fg(\"customMessageText\", \"Branch summary (\")` — NOT muted (`:49`)"
+        );
+        assert_eq!(hint.spans[2].style, theme.dim_style(), "`fg(\"dim\", keyText(...))` (`:50`)");
+        assert!(
+            !joined(&lines).contains("async rewrite"),
+            "the body is withheld:\n{}",
+            joined(&lines)
+        );
+
+        // MIRROR 1: the live keymap label reaches it.
+        let rebound = entry_lines(
+            &entry,
+            &theme,
+            60,
+            1,
+            ImageOpts { expand_key: "f2", ..ImageOpts::default() },
+        );
+        assert!(joined(&rebound).contains("Branch summary (f2 to expand)"), "{}", joined(&rebound));
+
+        // MIRROR 2: expanded still renders the full markdown body + `**Branch Summary**` header.
+        let open = entry_lines(
+            &Entry::BranchSummary { summary: "tried the async rewrite, abandoned it".to_string() },
+            &theme,
+            60,
+            1,
+            ImageOpts { tools_expanded: true, ..ImageOpts::default() },
+        );
+        assert!(joined(&open).contains("async rewrite"), "{}", joined(&open));
+        assert!(joined(&open).contains("Branch Summary"), "{}", joined(&open));
+
+        // MIRROR 3: the compaction variant keeps its grouped token count in the collapsed lead
+        // (`compaction-summary-message.ts:50`).
+        let comp = entry_lines(
+            &Entry::CompactionSummary {
+                tokens_before: 123_456,
+                summary: "condensed".to_string(),
+            },
+            &theme,
+            60,
+            1,
+            ImageOpts::default(),
+        );
+        assert!(
+            joined(&comp).contains("Compacted from 123,456 tokens (ctrl+o to expand)"),
+            "{}",
+            joined(&comp)
+        );
+        assert!(!joined(&comp).contains("condensed"));
+    }
+
+    /// **X14 — the collapse state is Pi's LIVE `toolOutputExpanded`, read at RENDER time.**
+    ///
+    /// `setToolsExpanded` does not merely store the flag; it walks `chatContainer.children` and
+    /// calls `setExpanded(expanded)` on every expandable child (`interactive-mode.ts:4032-4046`),
+    /// and `BranchSummaryMessageComponent.setExpanded` re-runs `updateDisplay()`
+    /// (`branch-summary-message.ts:22-25`). So a summary pushed while collapsed — the default,
+    /// `interactive-mode.ts:442` `private toolOutputExpanded = false` — MUST open when the flag is
+    /// toggled afterwards.
+    ///
+    /// This replaces `x14_push_freezes_the_live_tools_expanded_flag`, which asserted
+    /// `Entry::BranchSummary { expanded: false, .. }` after a `set_tool_expanded(true)` and so
+    /// pinned the defect: with the flag frozen at push there was NO ordering in which the body
+    /// could ever be rendered.
+    #[test]
+    fn x14_toggling_tools_expanded_reveals_an_already_pushed_summary_body() {
+        let theme = UiTheme::dark();
+        let mut view = TranscriptView::new();
+        view.push_branch_summary("we merged the spike");
+        view.push_compaction_summary(1234, "condensed history");
+
+        // Collapsed (Pi's initial `toolOutputExpanded = false`): one hint row each, no body.
+        let entries = view.drain_committed();
+        let render = |view: &TranscriptView, entries: &[Entry]| -> String {
+            entries
+                .iter()
+                .flat_map(|e| {
+                    entry_lines(
+                        e,
+                        &theme,
+                        60,
+                        1,
+                        ImageOpts { tools_expanded: view.tool_expanded(), ..ImageOpts::default() },
+                    )
+                })
+                .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let collapsed = render(&view, &entries);
+        assert!(collapsed.contains("Branch summary (ctrl+o to expand)"), "{collapsed}");
+        assert!(collapsed.contains("Compacted from 1,234 tokens (ctrl+o to expand)"), "{collapsed}");
+        assert!(!collapsed.contains("we merged the spike"), "{collapsed}");
+        assert!(!collapsed.contains("condensed history"), "{collapsed}");
+
+        // `Ctrl+O` AFTER the push. The SAME entries must now paint their bodies.
+        assert!(view.set_tool_expanded(true), "the flag actually changed");
+        let expanded = render(&view, &entries);
+        assert!(
+            expanded.contains("we merged the spike"),
+            "the branch body is reachable after the toggle:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("condensed history"),
+            "the compaction body is reachable after the toggle:\n{expanded}"
+        );
+        assert!(!expanded.contains("to expand"), "and the collapsed hints are gone:\n{expanded}");
+
+        // MIRROR: toggling back re-collapses the same entries — the flag is read, not latched.
+        assert!(view.set_tool_expanded(false));
+        let recollapsed = render(&view, &entries);
+        assert!(!recollapsed.contains("we merged the spike"), "{recollapsed}");
+        assert!(recollapsed.contains("Branch summary (ctrl+o to expand)"), "{recollapsed}");
+    }
+
+    /// **X7 — `language_from_path` is the `getLanguageFromPath` table verbatim
+    /// (`theme.ts:1184-1250`).**
+    #[test]
+    fn x6_language_from_path_matches_pis_table() {
+        use crate::theme::language_from_path as lang;
+        assert_eq!(lang("a.rs"), Some("rust"));
+        assert_eq!(lang("a.TSX"), Some("typescript"), "the extension is lower-cased");
+        assert_eq!(lang("a.zsh"), Some("bash"));
+        assert_eq!(lang("a.hpp"), Some("cpp"));
+        assert_eq!(lang("a.yml"), Some("yaml"));
+        assert_eq!(lang("nodots"), None, "`split(\".\").pop()` yields the whole name ⇒ no match");
+        assert_eq!(lang("a.nope"), None);
     }
 }

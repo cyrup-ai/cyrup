@@ -110,3 +110,41 @@ fn extension_confirm_dialog_short_title_still_uses_a_single_row() {
     let text = buf_text(&app);
     assert!(text.contains("Proceed?"), "the short title still renders:\n{text}");
 }
+
+/// E6, at the CONSTRUCTION SITE. `TextInputSelector`'s hint row is built from its own `keymap`
+/// field, and `App` is the only thing that knows the user's live `tui.select.*` table — so a
+/// builder that is never called leaves the very first paint of a `ui.input` dialog naming stock
+/// `enter`/`escape`. That first paint is the whole point of the row.
+///
+/// Upstream has no such window: `keyHint` re-resolves through `keyText` →
+/// `getKeybindings().getKeys(...)` on every render (`keybinding-hints.ts:34-44`) against the one
+/// live `KeybindingsManager`. Here the dialog is opened straight after
+/// `load_keybindings_json`, drawn once, and never fed a key.
+#[test]
+fn extension_input_dialog_hint_row_uses_the_apps_live_keybindings_on_the_first_paint() {
+    let mut app = App::new(TestBackend::new(60, 24), UiTheme::dark()).unwrap();
+    app.load_keybindings_json(
+        r#"{ "tui.select.confirm": ["ctrl+j"], "tui.select.cancel": ["ctrl+q"] }"#,
+    )
+    .unwrap();
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let req = UiRequest {
+        kind: UiKind::Input,
+        prompt: "Name?".to_string(),
+        options: serde_json::Value::Null,
+        message: String::new(),
+        placeholder: None,
+        opts: DialogOptions { timeout_ms: None, signal_id: None },
+        reply: tx,
+    };
+    app.open_extension_dialog(req);
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionInput));
+    app.draw().unwrap();
+    let text = buf_text(&app);
+    assert!(text.contains("ctrl+j"), "submit names the user's own key:\n{text}");
+    assert!(text.contains("ctrl+q"), "and so does cancel:\n{text}");
+    assert!(
+        !text.contains("enter submit") && !text.contains("esc  cancel"),
+        "the stock defaults must not be what the first frame shows:\n{text}"
+    );
+}

@@ -1152,6 +1152,7 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -1174,6 +1175,8 @@ name = "cyrup-ext-subagents"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64",
+ "cyrup-agent",
  "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
@@ -1430,6 +1433,7 @@ dependencies = [
  "async-trait",
  "base64",
  "cyrup-agent",
+ "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
  "cyrup-provider",

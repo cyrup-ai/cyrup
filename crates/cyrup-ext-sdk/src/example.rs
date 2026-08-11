@@ -50,6 +50,30 @@ impl MessageRenderer for DemoToolRenderer {
     }
 }
 
+/// A custom-ENTRY renderer (Pi `registerEntryRenderer`, extensions/types.ts:1295). Entries are
+/// TUI-only durable state appended with `append_entry`; they never enter LLM context. An entry
+/// crosses the boundary on `render-call`, so the renderer only implements that half.
+struct DemoEntryRenderer;
+impl MessageRenderer for DemoEntryRenderer {
+    fn render_call(&self, entry: &Value, _ctx: &crate::Ctx) -> Option<Value> {
+        Some(crate::widget::text(format!("guest-rendered entry card: {entry}")))
+    }
+}
+
+/// An entry renderer that deliberately FAULTS, so the guest half of X15's failure box has something
+/// to prove itself against. Upstream's analog is a renderer that `throw`s
+/// (`custom-entry.ts:47-52`); a guest panic lowers to a wasm trap, which the host contains as
+/// `RenderOutcome::Failed` instead of the silent `None` it used to report.
+///
+/// `unreachable!` rather than `panic!`: the workspace denies `clippy::panic`, and the trap is
+/// identical either way.
+struct FaultingEntryRenderer;
+impl MessageRenderer for FaultingEntryRenderer {
+    fn render_call(&self, _entry: &Value, _ctx: &crate::Ctx) -> Option<Value> {
+        unreachable!("demo_boom: this entry renderer always faults (X15 fixture)")
+    }
+}
+
 /// Build the demo extension's [`ExtensionApi`]. Pure ergonomic-layer code — also unit-testable on
 /// the host target.
 pub fn build() -> ExtensionApi {
@@ -686,6 +710,12 @@ pub fn build() -> ExtensionApi {
     // Keyed by the TOOL NAME — that is how the host routes a tool row back to the guest that draws
     // it (Pi `getCallRenderer`/`getResultRenderer`, tool-execution.ts:81-112).
     api.register_message_renderer("demo_echo", DemoToolRenderer);
+    // X15 — the custom-ENTRY surface (Pi `registerEntryRenderer(customType, renderer)`,
+    // types.ts:1295). `demo_card` draws; `demo_boom` deliberately FAULTS, which is the only way to
+    // exercise the guest half of the failure box (`custom-entry.ts:47-52`) end to end. A guest
+    // panic is a wasm trap, which the host reports as `RenderOutcome::Failed`.
+    api.register_entry_renderer("demo_card", DemoEntryRenderer);
+    api.register_entry_renderer("demo_boom", FaultingEntryRenderer);
 
     // A custom provider with OAuth + a custom `streamSimple` (Pi `registerProvider({oauth, streamSimple})`,
     // the `custom-provider-*` examples). The `login` flow drives the host `oauth` callbacks; the

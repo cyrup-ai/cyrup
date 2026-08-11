@@ -54,7 +54,7 @@ pub use event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, 
 pub use extension::{ExtKind, Extension};
 pub use facade::{
     BeforeAgentStartReduction, CompactionReduction, ExtensionFlagOverride, ExtensionHost,
-    HostConfig, InputReduction, TreeReduction, UserBashReduction,
+    HostConfig, InputReduction, RenderOutcome, TreeReduction, UserBashReduction,
 };
 pub use build::build_component;
 pub use hooks::ExtHooks;
@@ -72,7 +72,8 @@ pub use provider::{
     ProviderModelConfig, ProviderRegistration,
 };
 pub use registry::{
-    CommandDescriptor, ExecModeWire, ExtensionRegistry, ResolvedCommand, ToolDescriptor,
+    CommandDescriptor, ExecModeWire, ExtensionConflict, ExtensionRegistry, ResolvedCommand,
+    ToolDescriptor,
 };
 pub use subscriber::ExtSubscriber;
 pub use wrapper::{wrap_registered_tool, ActiveToolNames, RegisteredTool};

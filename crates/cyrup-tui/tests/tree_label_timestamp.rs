@@ -48,10 +48,11 @@ fn tree_app(nodes: Vec<TreeNode>) -> App<TestBackend> {
     app
 }
 
-/// Three rows, and the ORDER matters: the highlighted row (always the first, and never moved by
-/// these tests) owns the right-hand column for its `◀ selected` marker, so both rows under test sit
-/// below it. Row 1 is labeled and carries a label timestamp; row 2 carries the same kind of
-/// timestamp but no label. Pi decorates row 1 only, and only once the toggle is on.
+/// Three rows. Row 0 is the highlighted anchor and is never moved by these tests; row 1 is labeled
+/// and carries a label timestamp; row 2 carries the same kind of timestamp but no label. Pi
+/// decorates row 1 only, and only once the toggle is on. (The highlighted row used to claim the
+/// right-hand column for a cyrup-only `◀ selected` marker; that marker has no upstream analog and
+/// was removed — see S37.)
 fn labeled_and_unlabeled() -> Vec<TreeNode> {
     let anchor = TreeNode::message("e0", 0, "user: port the editor");
 
@@ -149,8 +150,7 @@ fn an_unlabeled_row_never_shows_a_label_timestamp() {
         "precondition: the toggle is ON:\n{screen}"
     );
     // The labeled sibling proves the toggle really is painting the column — so the absence below is
-    // the label gate, not a column that failed to render at all. Neither row is the highlighted one,
-    // whose `◀ selected` marker owns the same cells.
+    // the label gate, not a column that failed to render at all.
     assert!(
         screen.contains("12:04"),
         "precondition: the column IS being painted for a labeled row:\n{screen}"

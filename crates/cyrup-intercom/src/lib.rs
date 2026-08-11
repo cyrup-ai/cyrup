@@ -18,6 +18,7 @@ pub mod config;
 pub mod connect;
 pub mod error;
 pub mod extension;
+pub mod format_context;
 pub mod identity;
 pub mod inbound;
 pub mod paths;

@@ -1,22 +1,22 @@
 //! Skills association for subagent runs (T5, C4) — a port of pi-subagents'
-//! `agents/skills.ts:608-682` (`resolveSkills`/`resolveSkillsWithFallback`/`buildSkillInjection`/
+//! `agents/skills.ts:629-714` (`resolveSkills`/`resolveSkillsWithFallback`/`buildSkillInjection`/
 //! `discoverAvailableSkills`) and the whole of `agents/proactive-skills.ts`.
 //!
 //! # What this module owns
 //!
 //! - **Skill resolution** ([`resolve_skills`]/[`resolve_skills_with_fallback`]): map a list of
 //!   skill NAMES to on-disk skills against an execution cwd (with an optional runtime-cwd fallback,
-//!   pi `resolveSkillsWithFallback`, `skills.ts:640-654`), returning the resolved pointers and the
+//!   pi `resolveSkillsWithFallback`, `skills.ts:670-686`), returning the resolved pointers and the
 //!   names that could not be found.
 //! - **Lazy `<available_skills>` injection** ([`build_skill_injection`]): render the resolved skills
 //!   as a POINTER block (name + description + `SKILL.md` location + a "read the file" invocation
 //!   hint) for the child's system prompt — NEVER the full `SKILL.md` body (pi `buildSkillInjection`,
-//!   `skills.ts:656-675`; the "lazy references instead of inlining full skill bodies" contract of
+//!   `skills.ts:688-707`; the "lazy references instead of inlining full skill bodies" contract of
 //!   `skills-fallback.test.ts`).
 //! - **Orchestration-skill exclusion** ([`SUBAGENT_ORCHESTRATION_SKILL`]): the `pi-subagents`
 //!   operational skill is the PARENT orchestration skill and is NEVER child-injectable — it always
 //!   resolves to `missing` and never appears in the available-skills listing (pi's
-//!   `SUBAGENT_ORCHESTRATION_SKILL` rule, `skills.ts:54,618,717`).
+//!   `SUBAGENT_ORCHESTRATION_SKILL` rule, `skills.ts:613-638` @v0.34.0).
 //! - **Proactive skill-subagent suggestions** ([`recommend_proactive_skill_subagents`] et al.): a
 //!   1:1 port of `proactive-skills.ts` — from the configured agents/chains, suggest skills that are
 //!   referenced by at least `min_references` enabled configs and are actually available.
@@ -32,12 +32,12 @@
 //!
 //! The child skill injection itself is wired in [`crate::exec`] (`build_task_text` composes
 //! the [`build_skill_injection`] block into the task text handed to the spawned child — pi folds it
-//! into the persona system prompt instead, `execution.ts:1054-1056`, but cyrup keeps it in the task
+//! into the persona system prompt instead, `execution.ts:1433-1436`, but cyrup keeps it in the task
 //! text so a `Replace`-mode persona cannot suppress it), honoring the
 //! agent's own `skills` list and leaving `inherit_skills` (the `--no-skills` child flag) orthogonal:
 //! an `inherit_skills: false` agent still receives its EXPLICITLY-listed skills as pointers, exactly
-//! like pi (`execution.ts:935-952` builds the injection from `options.skills ?? agent.skills`
-//! regardless of the inherit flag, which only governs `pi-args.ts:139` `--no-skills`).
+//! like pi (`execution.ts:1412-1436` builds the injection from `options.skills ?? agent.skills`
+//! regardless of the inherit flag, which only governs `runs/shared/pi-args.ts:139` `--no-skills`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -185,7 +185,7 @@ async fn resolve_skills_in(
 }
 
 /// Resolve against `primary_cwd`, then re-resolve only the still-missing names against
-/// `fallback_cwd` (pi `resolveSkillsWithFallback`, `skills.ts:640-654`). The fallback is skipped
+/// `fallback_cwd` (pi `resolveSkillsWithFallback`, `skills.ts:670-686`). The fallback is skipped
 /// when there is no fallback cwd, when nothing was missing, or when the two cwds are the same
 /// directory (pi's `path.resolve(a) === path.resolve(b)` guard) — the resulting `missing` is exactly
 /// the fallback pass's `missing` (a name still absent from BOTH cwds).
@@ -235,7 +235,7 @@ fn same_directory(a: &Path, b: &Path) -> bool {
 }
 
 /// Every child-injectable skill discoverable from `cwd`, sorted by name and EXCLUDING the
-/// orchestration skill (pi `discoverAvailableSkills`, `skills.ts:710-724`).
+/// orchestration skill (pi `discoverAvailableSkills`, `skills.ts:742-756`).
 pub async fn discover_available_skills(cwd: &Path) -> Vec<AvailableSkill> {
     discover_available_skills_in(cwd, &SkillDiscoveryDirs::from_env()).await
 }
@@ -259,7 +259,7 @@ async fn discover_available_skills_in(cwd: &Path, dirs: &SkillDiscoveryDirs) -> 
 // ================================================================================================
 
 /// Render the resolved skills as the lazy `<available_skills>` POINTER block for a child's system
-/// prompt (pi `buildSkillInjection`, `skills.ts:656-675`). Each entry carries only the skill's
+/// prompt (pi `buildSkillInjection`, `skills.ts:688-707`). Each entry carries only the skill's
 /// name, description, and `SKILL.md` `<location>` plus a "use the read tool to load it" hint — the
 /// full body is deliberately EXCLUDED so it never bloats the system prompt. Returns an empty string
 /// for an empty input (no block emitted).
@@ -295,7 +295,7 @@ pub fn build_skill_injection(skills: &[ResolvedSkill]) -> String {
 }
 
 /// Escape the three XML-significant characters in skill metadata (pi `escapeXmlText`,
-/// `skills.ts:677-682`). `&` MUST be replaced first so an already-escaped entity is not
+/// `skills.ts:709-714`). `&` MUST be replaced first so an already-escaped entity is not
 /// double-escaped.
 fn escape_xml_text(value: &str) -> String {
     value
@@ -311,7 +311,7 @@ fn escape_xml_text(value: &str) -> String {
 const DEFAULT_MIN_REFERENCES: i64 = 2;
 const DEFAULT_MAX_RECOMMENDATIONS: i64 = 3;
 const DEFAULT_PREFERRED_AGENT: &str = "reviewer";
-const FALLBACK_AGENT_ORDER: [&str; 3] = ["reviewer", "context-builder", "delegate"];
+const FALLBACK_AGENT_ORDER: [&str; 2] = ["reviewer", "delegate"];
 const MAX_RECOMMENDATION_CAP: i64 = 5;
 
 /// The `proactiveSkillSubagents` extension-config block (pi `ProactiveSkillSubagentsConfig`). Every
@@ -334,6 +334,40 @@ pub enum ProactiveSkillSubagentsSetting {
     /// pi's `config === false`.
     Disabled,
     Config(ProactiveSkillSubagentsConfig),
+}
+
+impl ProactiveSkillSubagentsSetting {
+    /// Bridge the EXTENSION-CONFIG shape ([`crate::registration::ProactiveSkillSubagents`], which
+    /// is what `config.json` deserializes into and what pi reads as
+    /// `ctx.config?.proactiveSkillSubagents`, `agent-management.ts:768`) onto this module's own
+    /// recommender input. Two shapes exist because pi's `ExtensionConfig` field is
+    /// `ProactiveSkillSubagentsConfig | false` while this module models the three-state
+    /// `undefined | false | object` as `Option<ProactiveSkillSubagentsSetting>`.
+    ///
+    /// `Toggle(false)` is pi's literal `false` → [`Self::Disabled`]. `Toggle(true)` has no pi
+    /// analogue (pi's type does not admit `true`); cyrup's config parser accepts it, and it means
+    /// "on with defaults", so it maps to an empty config block — which
+    /// [`resolve_proactive_skill_subagents_config`] resolves exactly as it resolves pi's
+    /// `undefined`. The numeric knobs widen from the config type's `u32` to this module's `i64`,
+    /// which is the signedness pi's `positiveInteger` guard (`proactive-skills.ts:32-36`,
+    /// ported as `positive_integer`) is written against.
+    #[must_use]
+    pub fn from_extension_config(setting: &crate::registration::ProactiveSkillSubagents) -> Self {
+        match setting {
+            crate::registration::ProactiveSkillSubagents::Toggle(false) => Self::Disabled,
+            crate::registration::ProactiveSkillSubagents::Toggle(true) => {
+                Self::Config(ProactiveSkillSubagentsConfig::default())
+            }
+            crate::registration::ProactiveSkillSubagents::Config(cfg) => {
+                Self::Config(ProactiveSkillSubagentsConfig {
+                    enabled: cfg.enabled,
+                    min_references: cfg.min_references,
+                    max_recommendations: cfg.max_recommendations,
+                    preferred_agent: cfg.preferred_agent.clone(),
+                })
+            }
+        }
+    }
 }
 
 /// The resolved, defaults-applied config (pi `ResolvedProactiveSkillSubagentsConfig`).
@@ -560,9 +594,27 @@ pub fn format_proactive_skill_subagent_recommendations(
 }
 
 /// Build the proactive recommendation transcript lines (pi
-/// `buildProactiveSkillSubagentRecommendationLines`, `proactive-skills.ts:172-191`). When proactive
-/// suggestions are disabled the `discover_available_skills` closure is NOT invoked; a closure error
-/// (discovery failure) degrades to an empty availability list, which yields no suggestions.
+/// `buildProactiveSkillSubagentRecommendationLines`, `proactive-skills.ts:175-194` @v0.43.0 — twenty
+/// lines). When proactive suggestions are disabled the `discover_available_skills` closure is NOT
+/// invoked; a closure error (discovery failure) degrades to an empty availability list, which yields
+/// no suggestions.
+///
+/// # Where it is wired
+///
+/// Upstream calls it from exactly one place: `handleList` (`agent-management.ts:765-770` @v0.43.0),
+/// which splices its lines between the `Chains:` block and the chain diagnostics
+/// (`agent-management.ts:784`, inside the `handleList` that spans `:753-788`). cyrup's
+/// [`crate::discovery::management::handle_list`] now does the same, reading its two inputs off
+/// [`crate::discovery::management::ProactiveSkillsInput`] on the `ManagementRequest`.
+///
+/// The `discover_available_skills` closure keeps upstream's LAZINESS — it is not invoked at all
+/// when the feature is disabled — but cyrup's [`discover_available_skills`] is `async` where pi's
+/// is sync, and `handle_list` is a synchronous dispatcher. The seam is therefore split: the async
+/// caller (`extension.rs::route_management_action`) resolves the availability list only after
+/// [`resolve_proactive_skill_subagents_config`] says the feature is on, and `handle_list` hands
+/// this function a closure that simply yields that pre-resolved list. Same two observable
+/// properties as upstream — a disabled feature performs no skill scan, and a scan that produced
+/// nothing yields no suggestions.
 pub fn build_proactive_skill_subagent_recommendation_lines<F, E>(
     agents: &[ProactiveAgentInput],
     chains: &[ProactiveChainInput],
@@ -938,6 +990,134 @@ mod tests {
             vec!["alpha".to_string(), "beta".to_string()]
         );
         assert!(recommendations.iter().all(|r| r.agent == "delegate"));
+    }
+
+    /// `chooseRecommendationAgent` (`proactive-skills.ts:92-99` @v0.43.0 — eight lines) picks the
+    /// ONE agent every suggestion is attributed to, on a three-rung ladder: the resolved
+    /// `preferredAgent` if it is enabled, else the first enabled name in `FALLBACK_AGENT_ORDER`
+    /// (`:8`, exactly `["reviewer", "delegate"]`), else the first ENABLED agent in input order.
+    ///
+    /// Only the top rung had coverage: `recommends_available_skills_referenced_by_multiple_enabled_configs`
+    /// and the config-bounds test above both hit an enabled preferred agent. Neither the MEMBERSHIP
+    /// of `FALLBACK_AGENT_ORDER` nor its ORDER was observable, so reordering it, emptying it, or
+    /// dropping the `!disabled` filter from any rung would have kept the suite green while silently
+    /// re-attributing every proactive suggestion to a different (possibly disabled) agent.
+    #[test]
+    fn the_recommendation_agent_ladder_walks_preferred_then_fallback_order_then_first_enabled() {
+        // Two agents reference `deslop`, so exactly one recommendation is produced and its `agent`
+        // field is `chooseRecommendationAgent`'s answer.
+        let skills = [available("deslop", None)];
+        let chosen = |agents: &[ProactiveAgentInput], preferred: Option<&str>| -> Option<String> {
+            let setting = preferred.map(|p| {
+                ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
+                    preferred_agent: Some(p.to_string()),
+                    ..Default::default()
+                })
+            });
+            let out = recommend_proactive_skill_subagents(
+                agents,
+                &[],
+                Some(&skills),
+                setting.as_ref(),
+            );
+            out.first().map(|r| r.agent.clone())
+        };
+
+        // Rung 1 — the preferred agent wins even though it is last in input order.
+        assert_eq!(
+            chosen(
+                &[
+                    agent("reviewer", &["deslop"], false),
+                    agent("delegate", &["deslop"], false),
+                    agent("scout", &[], false),
+                ],
+                Some("scout"),
+            )
+            .as_deref(),
+            Some("scout")
+        );
+
+        // Rung 1 is gated on `!disabled`: a DISABLED preferred agent falls through to rung 2.
+        assert_eq!(
+            chosen(
+                &[
+                    agent("delegate", &["deslop"], false),
+                    agent("reviewer", &["deslop"], false),
+                    agent("scout", &[], true),
+                ],
+                Some("scout"),
+            )
+            .as_deref(),
+            Some("reviewer"),
+            "a disabled preferred agent must not be chosen"
+        );
+
+        // Rung 2 — `reviewer` beats `delegate` because FALLBACK_AGENT_ORDER says so, NOT because of
+        // input order: `delegate` is listed FIRST here and still loses.
+        assert_eq!(
+            chosen(
+                &[
+                    agent("delegate", &["deslop"], false),
+                    agent("zeta", &["deslop"], false),
+                    agent("reviewer", &[], false),
+                ],
+                Some("nobody"),
+            )
+            .as_deref(),
+            Some("reviewer"),
+            "FALLBACK_AGENT_ORDER's first entry wins regardless of where it sits in the input"
+        );
+
+        // Rung 2, second entry — with `reviewer` absent, `delegate` is next in the order.
+        assert_eq!(
+            chosen(
+                &[agent("zeta", &["deslop"], false), agent("delegate", &["deslop"], false)],
+                Some("nobody"),
+            )
+            .as_deref(),
+            Some("delegate")
+        );
+
+        // Rung 2 is gated on `!disabled` too: a disabled `reviewer` yields to `delegate`.
+        assert_eq!(
+            chosen(
+                &[
+                    agent("reviewer", &["deslop"], true),
+                    agent("zeta", &["deslop"], false),
+                    agent("delegate", &["deslop"], false),
+                ],
+                Some("nobody"),
+            )
+            .as_deref(),
+            Some("delegate"),
+            "a disabled fallback candidate must be skipped, not chosen"
+        );
+
+        // Rung 3 — neither fallback name exists: the first ENABLED agent wins (`enabled[0]`, the
+        // filtered list's head, not `agents[0]`).
+        assert_eq!(
+            chosen(
+                &[
+                    agent("aardvark", &["deslop"], true),
+                    agent("zeta", &["deslop"], false),
+                    agent("yankee", &["deslop"], false),
+                ],
+                Some("nobody"),
+            )
+            .as_deref(),
+            Some("zeta"),
+            "rung 3 skips disabled agents rather than taking agents[0]"
+        );
+
+        // No enabled agent at all — pi returns `undefined` and `recommendProactiveSkillSubagents`
+        // bails before counting anything (`proactive-skills.ts:117-118`).
+        assert_eq!(
+            chosen(
+                &[agent("zeta", &["deslop"], true), agent("yankee", &["deslop"], true)],
+                Some("nobody"),
+            ),
+            None
+        );
     }
 
     #[test]

@@ -163,6 +163,8 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reviewer".to_string(), reviewer);
@@ -260,7 +262,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
 }
 
 // =============================================================================================
-// A (pi `originalTask`, `chain-execution.ts:493-497`): a chain step's `{task}` placeholder resolves
+// A (pi `originalTask`, `chain-execution.ts:632-652`): a chain step's `{task}` placeholder resolves
 // to the run-wide `original_task` the orchestrator serialized into `RunnerConfig` — threaded through
 // the runner's `ChainRunContext` into `resolve_step_task`'s `{task}` substitution, so the child is
 // dispatched with the SUBSTITUTED task text, not the literal `{task}`. Proven end-to-end by reading
@@ -308,6 +310,8 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("worker".to_string(), worker);
@@ -410,8 +414,10 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        steer_inbox_dir: None,
         control_config: None,
         on_control_event: None,
+        artifacts_dir: None,
         // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
         model_scope: None,
     }
@@ -435,6 +441,8 @@ fn depth_echo_agent(model: &str, depth: DepthEnvelope, max_subagent_depth: Optio
         completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth,
+        memory: None,
+        tool_budget: None,
         depth,
     }
 }
@@ -579,6 +587,8 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
             completion_guard: Some(false),
             max_subagent_depth: None,
             default_context: None,
+            memory: None,
+            tool_budget: None,
         },
     );
 
@@ -713,6 +723,8 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reporter".to_string(), reporter);
@@ -843,6 +855,8 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reporter".to_string(), reporter);
@@ -1061,6 +1075,8 @@ fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     }
 }
 
@@ -1177,7 +1193,7 @@ async fn a_chain_step_with_an_invalid_acceptance_policy_fails_the_step_rather_th
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // A policy that reaches the runner already malformed (the tool boundary refuses these up front,
-    // pi `subagent-executor.ts:1534`; a hand-edited `runner-config.json` does not go through it).
+    // pi `subagent-executor.ts:1757`; a hand-edited `runner-config.json` does not go through it).
     // Fail-closed: the step FAILS with pi's own `validateAcceptanceInput` message rather than
     // silently degrading to "no contract", which would be the very defect SUBA-N04 names.
     let (success, error) =

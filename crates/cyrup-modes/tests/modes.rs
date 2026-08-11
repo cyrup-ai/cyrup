@@ -49,11 +49,23 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 }
 
 /// Build the multi-session runtime host the RPC adapter drives (Pi `rpc-mode.ts` `runtimeHost`).
+///
+/// Carries a [`AnyFauxResolver`] because the real host always carries one: `main.rs` hands every
+/// `SessionFactory` a `BuiltinProviderResolver`. Any model command whose target model belongs to a
+/// provider other than the installed one (`set_model` across providers, and `cycle_model` since it
+/// walks `getAvailable()` across every configured provider) has to install that provider, and a
+/// resolver-less host can only fail there — which says nothing about the RPC contract under test.
+/// It matters here because these fixtures are NOT hermetic against the ambient environment: a
+/// `TOGETHER_API_KEY` in the developer's shell makes `together` a configured provider and puts its
+/// whole catalog in the available set, exactly as it would for a real user.
 async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> Arc<AgentSessionRuntime> {
     let provider: Arc<dyn Provider> = faux;
     let cfg = base_config(fx);
     let target = cfg.target.clone();
-    let factory = Arc::new(SessionFactory::new(provider, cfg));
+    let factory = Arc::new(
+        SessionFactory::new(provider, cfg)
+            .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>),
+    );
     AgentSessionRuntime::create(factory, target).await.expect("build runtime")
 }
 
@@ -1440,6 +1452,66 @@ async fn rpc_model_commands_span_the_full_auth_filtered_registry() {
             || state["data"]["model"].as_object().map(|o| o.len()).unwrap_or(0) > 2,
         "get_state.model must be the FULL catalog record, not the degraded {{provider,id}} stub: {state}"
     );
+}
+
+// ----------------------------------------------------------------------------------------------
+// G39 — the SEAM-004 hole `cycle_model` was left in. Pi's `_cycleAvailableModel` opens with
+// `const availableModels = await this._modelRuntime.getAvailable()` (agent-session.ts:1644 at
+// v0.83.0) — `getAll().filter(hasConfiguredAuth)` across EVERY provider (model-runtime.ts:315-329).
+// cyrup cycled `provider.current().models()`, the ONE installed provider's own catalog, so the
+// `cycle_model` RPC verb (rpc.rs:1116, the `{"type":"cycle_model"}` request a `cyrup --mode rpc`
+// client sends) could never leave the provider the session launched on even when a second provider
+// was fully credentialed — while `get_available_models` and `set_model`, fixed by SEAM-004, could.
+// ----------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rpc_cycle_model_spans_the_full_auth_filtered_registry() {
+    let fx = fixture();
+    // The same second configured provider SEAM-004 uses: a stored `auth.json` credential makes
+    // `has_configured_auth` true for anthropic's whole catalog. The active provider stays faux.
+    std::fs::write(
+        fx.agent_dir.join("auth.json"),
+        r#"{"anthropic":{"type":"api_key","key":"sk-test"}}"#,
+    )
+    .expect("write auth.json");
+
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let cfg = base_config(&fx);
+    let target = cfg.target.clone();
+    let factory = Arc::new(
+        SessionFactory::new(provider, cfg)
+            .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>),
+    );
+    let runtime = AgentSessionRuntime::create(factory, target).await.expect("build runtime");
+
+    let reader = Cursor::new(
+        concat!(r#"{"type":"cycle_model","id":"c"}"#, "\n", r#"{"type":"get_state","id":"s"}"#, "\n")
+            .as_bytes()
+            .to_vec(),
+    );
+    let mut out: Vec<u8> = Vec::new();
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    let lines = parse_lines(&out);
+
+    let cycled = lines.iter().find(|l| l["command"] == "cycle_model").expect("cycle_model response");
+    assert_eq!(cycled["success"], true, "cycle_model response: {cycled}");
+    assert!(
+        !cycled["data"].is_null(),
+        "one faux model + a CREDENTIALED anthropic catalog is >1 candidate, so Pi's \
+         `availableModels.length <= 1` early return must NOT fire (agent-session.ts:1645); \
+         cycling the active provider's own catalog alone is what makes this null: {cycled}"
+    );
+    assert_eq!(
+        cycled["data"]["model"]["provider"], "anthropic",
+        "cycle_model must step onto the OTHER configured provider (Pi \
+         `_modelRuntime.getAvailable()`, agent-session.ts:1644): {cycled}"
+    );
+    assert_eq!(cycled["data"]["isScoped"], false, "no scoped set → the available arm: {cycled}");
+
+    // ...and the switch is real: the session's live model — what the next turn streams with —
+    // reports the new provider, which also proves the owning provider was installed.
+    let state = lines.iter().find(|l| l["command"] == "get_state").expect("get_state response");
+    assert_eq!(state["data"]["model"]["provider"], "anthropic", "get_state after cycle: {state}");
 }
 
 // ----------------------------------------------------------------------------------------------

@@ -158,7 +158,8 @@ pub struct SingleStepSpec {
     /// the two terms of pi's `sessionEnabled = Boolean(sessionFile || sessionDir) || share`
     /// (`runs/foreground/execution.ts:1039`) and is `mkdir -p`'d before the child spawns.
     ///
-    /// **[CYRUP-DELTA], deliberate.** pi carries a single run-level `config.sessionDir` and derives
+    /// **[CYRUP-DELTA] — UNPORTED, not accepted.** pi carries a single run-level
+    /// `config.sessionDir` and derives
     /// each child's directory at the DISPATCH site — verbatim for a sequential step
     /// (`subagent-runner.ts:2793`), `<root>/parallel-<taskIdx>` for a parallel member (`:2587-2596`),
     /// `<root>/dynamic-<step>-<item>` for a dynamic one (`:2309`). cyrup's `run_single` is the ONE
@@ -240,16 +241,16 @@ pub struct DynamicGroupSpec {
     /// [`ParallelGroupSpec::fail_fast`] — a dynamic fan-out is NOT exempt from R-SA-066.
     ///
     /// Upstream lowers a dynamic step to a plain parallel step and forwards the flag verbatim
-    /// (`chain-execution.ts:897-901`: `const dynamicParallelStep: ParallelStep = { parallel:
+    /// (`chain-execution.ts:1061-1067`: `const dynamicParallelStep: ParallelStep = { parallel:
     /// materialized.parallel, concurrency: step.concurrency, failFast: step.failFast }`), and the
     /// shared `runParallelChainTasks` then honours it identically for both shapes
-    /// (`chain-execution.ts:231`, `:391`). `failFast` is a legal dynamic-step key at the ported
+    /// (`chain-execution.ts:283`, `:391`). `failFast` is a legal dynamic-step key at the ported
     /// baseline (`dynamic-fanout.ts:44` `DYNAMIC_STEP_KEYS`), so accepting it in the validator
     /// (`discovery/chains.rs` `DYNAMIC_STEP_KEYS`) without honouring it here would silently drop
     /// an author's declared intent.
     ///
     /// `#[serde(default)]`: a dynamic step that omits `failFast` is pi's `?? false`
-    /// (`chain-execution.ts:231`), and older serialized graphs predate the field entirely.
+    /// (`chain-execution.ts:283`), and older serialized graphs predate the field entirely.
     #[serde(default)]
     pub fail_fast: bool,
     /// The template variable name each `{item}`/`{item.path}` reference binds to (pi
@@ -428,7 +429,7 @@ pub struct ChainOutputEntry {
 ///
 /// It also carries the rolling [`Self::previous`] output text that a step's `{previous}` placeholder
 /// (and, absent an explicit `{previous}`, `build_chain_instructions`'s "Previous step output" suffix)
-/// resolves to (pi's `prev` local, `chain-execution.ts:608/1049/1219`). Threading `previous` through
+/// resolves to (pi's `prev` local, `chain-execution.ts:750/1049/1219`). Threading `previous` through
 /// the registry — rather than a walker-local — is what lets the background hop-2 runner (which drives
 /// the identical chain one `walk_chain(one_step)` call at a time over a single shared registry,
 /// `background/runner_main.rs:855`) get the same step-to-step `{previous}` piping the foreground
@@ -460,7 +461,7 @@ impl OutputRegistry {
     /// runtime accumulator).
     ///
     /// Registers a **structured** output: the entry's [`ChainOutputEntry::text`] becomes the value's
-    /// compact JSON encoding (pi's `compactStructuredText` = `JSON.stringify`, `chain-outputs.ts:96`)
+    /// compact JSON encoding (pi's `compactStructuredText` = `JSON.stringify`, `chain-outputs.ts:98-100`)
     /// so a `{outputs.name}` reference substitutes that JSON text, while [`ChainOutputEntry::structured`]
     /// retains the raw value for a later `DynamicGroup.expand` pointer to walk.
     pub fn register(&mut self, name: impl Into<String>, value: Value) {
@@ -490,7 +491,7 @@ impl OutputRegistry {
     }
 
     /// The rolling previous-step output text a `{previous}` placeholder resolves to (pi's `prev`,
-    /// `chain-execution.ts:1049`). Empty before the first step (and after any step that produced no
+    /// `chain-execution.ts:750`). Empty before the first step (and after any step that produced no
     /// text output).
     #[must_use]
     pub fn previous(&self) -> &str {
@@ -673,7 +674,7 @@ fn is_safe_output_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// pi's `compactStructuredText` (`chain-outputs.ts:96-97`): the compact JSON encoding
+/// pi's `compactStructuredText` (`chain-outputs.ts:98-100`): the compact JSON encoding
 /// (`JSON.stringify`) of a structured output, used as the `{outputs.name}` substitution text for a
 /// structured step. `serde_json::to_string` emits the same separator-free compact form; a value
 /// that fails to serialize (not reachable for a `serde_json::Value`, which always serializes) falls
@@ -684,11 +685,11 @@ fn compact_structured_text(value: &Value) -> String {
 
 // -------------------------------------------------------------------------------------------
 // Template substitution (C10/C11): {outputs.name}/{task}/{previous}/{chain_dir} + chain
-// instructions prefix/suffix (chain-execution.ts:1039-1052, settings.ts:312-357)
+// instructions prefix/suffix (chain-execution.ts:1039-1052, shared/settings.ts:312-357)
 // -------------------------------------------------------------------------------------------
 
 /// Resolve a chain-relative file path against `chain_dir` the way pi's `resolveChainPath`
-/// (`settings.ts:299-300`) does: an absolute path is used verbatim; a relative path is joined onto
+/// (`shared/settings.ts:335-342`) does: an absolute path is used verbatim; a relative path is joined onto
 /// `chain_dir`. Rendered lossily to a `String` for embedding in the child's prompt text.
 fn resolve_chain_path(file: &Path, chain_dir: &Path) -> String {
     if file.is_absolute() {
@@ -699,7 +700,7 @@ fn resolve_chain_path(file: &Path, chain_dir: &Path) -> String {
 }
 
 /// Build the prefix/suffix a chain step's task is wrapped with, a faithful port of pi's
-/// `buildChainInstructions` (`settings.ts:312-357`):
+/// `buildChainInstructions` (`shared/settings.ts:312-357`):
 ///
 /// - Each declared `reads` file becomes a leading `[Read from: <resolved paths>]` line (prepended so
 ///   it overrides any hardcoded filename in the task text).
@@ -820,7 +821,7 @@ fn register_single_output(registry: &mut OutputRegistry, name: Option<&str>, res
 
 // -------------------------------------------------------------------------------------------
 // Upfront output-binding validation (R-SA-053, pi `chain-outputs.ts::validateChainOutputBindings`,
-// called once at the very top of `executeChain`, `chain-execution.ts:499-510`, BEFORE any step is
+// called once at the very top of `executeChain`, `chain-execution.ts:584-596`, BEFORE any step is
 // dispatched)
 // -------------------------------------------------------------------------------------------
 
@@ -902,7 +903,7 @@ fn dynamic_expand_source_output(expand: &str) -> &str {
 }
 
 /// Faithful port of `chain-outputs.ts::validateChainOutputBindings` (pi's empty-context call from
-/// `chain-execution.ts:499-510`, run ONCE at the very top of `executeChain` before any step is
+/// `chain-execution.ts:584-596`, run ONCE at the very top of `executeChain` before any step is
 /// dispatched), operating directly over the already-typed [`RunnerStep`] graph — the structural
 /// analogue of [`crate::discovery::chains`]'s identically-named raw-JSON port that saved-chain-file
 /// parsing already applies. Checks, in chain order:
@@ -1034,7 +1035,7 @@ pub struct StepResult {
     pub interrupted: bool,
     /// SUBA-N05 — the live-control events this step's child raised
     /// ([`crate::exec::SingleResult::control_events`], pi `result.controlEvents`,
-    /// `runs/foreground/execution.ts:1260` @v0.34.0).
+    /// `runs/foreground/execution.ts:1314` @v0.43.0).
     ///
     /// Carried here for the same reason `structured_output` is: something one layer OUT needs it
     /// and there is no other channel. The detached hop-2 runner collapses every step into a
@@ -1122,13 +1123,13 @@ impl StepResult {
 }
 
 /// The exit code pi stamps on a fan-out item that a `failFast` trip prevented from ever being
-/// dispatched (`chain-execution.ts:242`: `exitCode: -1`). Deliberately outside the `0`/`1` range
+/// dispatched (`chain-execution.ts:283`: `exitCode: -1`). Deliberately outside the `0`/`1` range
 /// [`collapse_fan_out`] maps real child outcomes to, so a consumer of the dynamic collect array
 /// can tell "never ran" apart from "ran and failed".
 const FAIL_FAST_SKIPPED_EXIT_CODE: i64 = -1;
 
 /// The verbatim `error` text pi attaches to that same synthetic skipped result
-/// (`chain-execution.ts:245`: `error: "Skipped due to fail-fast"`). Kept byte-identical because it
+/// (`chain-execution.ts:329`: `error: "Skipped due to fail-fast"`). Kept byte-identical because it
 /// surfaces to chain authors through `{outputs.<collect.as>}`.
 const FAIL_FAST_SKIPPED_ERROR: &str = "Skipped due to fail-fast";
 
@@ -1152,7 +1153,7 @@ pub struct GroupStepResult {
     ///
     /// Carried because pi distinguishes the two: its fail-fast skips materialize as a synthetic
     /// `SingleResult` with `exitCode: -1` / `error: "Skipped due to fail-fast"`
-    /// (`chain-execution.ts:238-246`) that flows on into the dynamic collect array
+    /// (`chain-execution.ts:321-330`) that flows on into the dynamic collect array
     /// (`collectDynamicResults`, `chain-execution.ts:976`), while a cancellation skip has no
     /// upstream analog at all.
     pub fail_fast_skipped: Vec<bool>,
@@ -1196,12 +1197,12 @@ pub struct ChainRunContext {
     /// [`ParallelGroupSpec`] with `worktree: true`. `None` is fine for any chain with no
     /// worktree-isolated group.
     pub worktree_base_dir: Option<PathBuf>,
-    /// The chain's overall original task text (pi `originalTask`, `chain-execution.ts:1048`), the
+    /// The chain's overall original task text (pi `originalTask`, `chain-execution.ts:632-652`), the
     /// value every step's `{task}` placeholder resolves to. Empty when the run carries no distinct
     /// top-level task (the substitution then yields the empty string, matching pi when `params.task`
     /// is empty).
     pub original_task: String,
-    /// The chain working directory (pi `chainDir`, `chain-execution.ts:1050`) that `{chain_dir}`
+    /// The chain working directory (pi `chainDir`, `chain-execution.ts:654`) that `{chain_dir}`
     /// resolves to and that [`build_chain_instructions`]'s `[Read from: …]`/`[Write to: …]` prefix
     /// paths are resolved against. `None` falls back to [`Self::cwd`] (a chain with no dedicated
     /// scratch directory writes/reads relative to its own cwd).
@@ -1504,7 +1505,7 @@ pub async fn walk_chain(
 
                     // A dynamic fan-out honours `failFast` exactly as a static one does: pi lowers
                     // the dynamic step to a plain `ParallelStep` carrying `failFast: step.failFast`
-                    // (`chain-execution.ts:897-901`) and dispatches it through the very same
+                    // (`chain-execution.ts:1061-1067`) and dispatches it through the very same
                     // `runParallelChainTasks` (`:231` `?? false`, `:391` trip-on-nonzero-exit) that
                     // a static parallel step uses. Passing a hardcoded `false` here would leave the
                     // validator-accepted `failFast` key (`dynamic-fanout.ts:44`) silently inert and
@@ -1525,7 +1526,7 @@ pub async fn walk_chain(
                     // pi's `?? null` shape is preserved for a never-dispatched slot.
                     //
                     // A child that fail-fast SKIPPED is not a hole in the array: pi returns a
-                    // synthetic `SingleResult` for it (`chain-execution.ts:238-246` — `task:
+                    // synthetic `SingleResult` for it (`chain-execution.ts:321-330` — `task:
                     // "(skipped)"`, `exitCode: -1`, `error: "Skipped due to fail-fast"`, empty
                     // messages) and that record flows on into `collectDynamicResults` (`:976`), so
                     // the registered `{outputs.<collect.as>}` array carries an explicit `-1`
@@ -1685,7 +1686,7 @@ pub async fn walk_chain(
 /// the group has settled, against the aggregate report folded out of every child's outcome.
 ///
 /// Returns `Some(message)` — pi's own `acceptanceFailureMessage` text
-/// (`runs/shared/acceptance.ts:847-856` @v0.34.0) — when the gate REJECTS, in which case the caller
+/// (`runs/shared/acceptance.ts:1357-1365` @v0.43.0) — when the gate REJECTS, in which case the caller
 /// fails the step and, through C9's stop-on-failure, the whole chain. `None` means "no declared
 /// gate, or it passed".
 ///
@@ -1703,7 +1704,7 @@ pub async fn walk_chain(
 ///
 /// **[CYRUP-DELTA]** upstream runs the completed-group gate UNCONDITIONALLY, because
 /// `resolveEffectiveAcceptance` with `explicit: undefined` still INFERS a level from the agent
-/// name/task with `dynamicGroup: true` (`acceptance.ts:265-302`). This crate's live inference is the
+/// name/task with `dynamicGroup: true` (`acceptance.ts:344-401`). This crate's live inference is the
 /// enum-lattice [`crate::exec::acceptance::AcceptanceContract::heuristic_default`], which has no
 /// `dynamicGroup` input and never infers group-shaped criteria, so an UNdeclared gate stays a no-op
 /// here. A DECLARED gate — the case that was silently discarded — behaves exactly as upstream.
@@ -1742,7 +1743,22 @@ async fn evaluate_dynamic_group_acceptance(
         output: "",
         cwd: &ctx.cwd,
         report: Some(model::aggregate_acceptance_report(children, Some(notes))),
+        // A completed GROUP has no child-authored output file of its own — upstream's group gate
+        // likewise passes no `fileOutput` (`chain-execution.ts:1034-1055`).
+        file_output: None,
         review_result: None,
+        // G80 — `None` is upstream's own shape here: both of pi's completed-group
+        // `evaluateAcceptance` calls (`chain-execution.ts:1037-1046,1233-1242` @v0.43.0) pass
+        // neither `artifactsDir` nor `runId`, so a GROUP gate's verify[] commands are never
+        // memoized. Only the per-run gates (`execution.ts:1704-1705`,
+        // `subagent-runner.ts:1638-1639`) supply the pair.
+        memo: None,
+        // G78 — `reportOptional: isAgentContractV1(step.agentContract ?? params.agentContract)`
+        // (`chain-execution.ts:1045`). `isAgentContractV1` is `contract?.version === 1`
+        // (`runs/shared/agent-contract.ts:3-5`), and this crate has no agent-contract concept at
+        // all yet (`agent-contract.ts` is unported), so no cyrup step can declare one and the
+        // predicate is `false` for every run.
+        report_optional: false,
     })
     .await;
     model::acceptance_failure_message(&ledger)
@@ -3207,7 +3223,7 @@ mod tests {
     /// was spawned — and paid for — after the first failure.
     ///
     /// Upstream lowers the dynamic step to a `ParallelStep` carrying `failFast: step.failFast`
-    /// (`chain-execution.ts:897-901` @v0.34.0) and runs it through the same
+    /// (`chain-execution.ts:1061-1067` @v0.43.0) and runs it through the same
     /// `runParallelChainTasks` a static parallel step uses, which trips on the first non-zero exit
     /// (`chain-execution.ts:391`) and returns a synthetic result for every not-yet-started sibling
     /// (`:238-246`: `exitCode: -1`, `error: "Skipped due to fail-fast"`). Those synthetic entries

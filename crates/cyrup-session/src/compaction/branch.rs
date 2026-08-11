@@ -174,6 +174,18 @@ pub struct BranchPreparation {
 pub fn prepare_branch_entries(entries: &[Entry], budget: u32) -> BranchPreparation {
     let mut file_ops = FileOps::default();
     // First pass: cumulative file tracking from pi-generated (`!fromHook`) branch summaries only.
+    //
+    // Pi (LIVE fork, UNCHANGED v0.83.0 → v0.84.1):
+    //   `// Only extract from pi-generated summaries (fromHook !== true), not extension-generated ones`
+    //   `if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {`
+    //   (`v0.84.1 coding-agent/src/core/compaction/branch-summarization.ts:202-204`).
+    //
+    // The harness fork dropped this guard at v0.84.1 (`44289550a`,
+    // `v0.84.1 agent/src/harness/compaction/branch-summarization.ts:137`) only because that rewrite
+    // deleted `fromHook` from `BranchSummaryEntry`
+    // (`v0.84.1 agent/src/harness/session/types.ts:53-60`) — see the matching note at
+    // `prepare.rs`. cyrup keeps the field (`entry.rs:105`), so it keeps the guard.
+    // Pinned by `tests/compaction.rs::g21_prepare_branch_entries_ignores_from_hook_details`.
     for e in entries {
         if let Entry::Known(KnownEntry::BranchSummary { details: Some(d), from_hook, .. }) = e
             && !from_hook.unwrap_or(false) {
@@ -256,8 +268,9 @@ pub async fn generate_branch_summary<S: Summarizer>(
             Err(CompactionError::Summarization(resp.error_message.unwrap_or_default()))
         }
         cyrup_core::StopReason::Aborted => Err(CompactionError::Aborted),
-        // An unsettled response is NOT a summary — see the same guard in `summarize.rs`.
-        cyrup_core::StopReason::Pending => Err(CompactionError::Summarization(
+        // An unsettled response is NOT a summary — see the same guard, and the `Deferred`
+        // rationale, in `summarize.rs`.
+        cyrup_core::StopReason::Pending | cyrup_core::StopReason::Deferred => Err(CompactionError::Summarization(
             resp.error_message
                 .unwrap_or_else(|| crate::compaction::summarize::PENDING_SUMMARY.to_string()),
         )),

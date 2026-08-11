@@ -127,7 +127,7 @@ fn first_parseable_json_fence(text: &str) -> Option<serde_json::Value> {
 /// combining every violation (bounded to a small number so one hugely-nested schema cannot produce
 /// an unbounded error string), each prefixed with its JSON-Pointer-style instance path — mirroring
 /// pi-subagents' own `validateStructuredOutputValue`
-/// (`pi-subagents/src/runs/shared/structured-output.ts:38-53`) in spirit: "root" for the top-level
+/// (`pi-subagents/src/runs/shared/structured-output.ts:138-154`) in spirit: "root" for the top-level
 /// instance, `a.b.c`-style dotted paths for nested violations, multiple violations joined with
 /// `"; "`.
 ///
@@ -239,7 +239,7 @@ pub fn resolve_structured_output(
 // pi's authoritative structured-output mechanism is NOT event-scraping: a schema-declared step
 // creates a private capture file, injects an instruction, and the child completes by CALLING the
 // `structured_output` tool, which writes its value to that file. `readStructuredOutput` then reads
-// it back — and its defining property (structured-output.ts:56-58) is that a MISSING capture file
+// it back — and its defining property (structured-output.ts:157-159) is that a MISSING capture file
 // (the child never called the tool) is a HARD failure EVEN WHEN the child produced prose. The
 // child-side tool registration + env capture is a child-process concern
 // (`subagent-prompt-runtime.ts`, outer-layer, out of this crate's scope); this module owns the
@@ -257,7 +257,7 @@ pub const STRUCTURED_OUTPUT_SCHEMA_ENV: &str = "CYRUP_SUBAGENT_STRUCTURED_OUTPUT
 pub const STRUCTURED_OUTPUT_CAPTURE_ENV: &str = "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE";
 
 /// The exact hard-failure message a declared `outputSchema` with no captured `structured_output`
-/// call produces (pi `readStructuredOutput`, `structured-output.ts:57`) — surfaced EVEN WHEN the
+/// call produces (pi `readStructuredOutput`, `structured-output.ts:158`) — surfaced EVEN WHEN the
 /// child produced prose. pi runs its structured-output check on every clean exit
 /// (`execution.ts:791`) and fails on a missing capture file unconditionally; prose is never an
 /// exemption. This is the observable divergence C12's structured-output note calls out.
@@ -285,7 +285,7 @@ pub struct StructuredOutputRuntime {
     pub output_path: std::path::PathBuf,
 }
 
-/// pi `createStructuredOutputRuntime` (`structured-output.ts:27-36`): create a private temp dir
+/// pi `createStructuredOutputRuntime` (`structured-output.ts:127-136`): create a private temp dir
 /// under `base_dir`, write the schema to `schema.json`, and define the `output.json` capture path
 /// the child's `structured_output` tool will write to. Uses std-only directory creation (this crate
 /// has no non-test `tempfile` dependency) with a pid+counter+timestamp-unique name.
@@ -330,7 +330,7 @@ fn next_runtime_counter() -> u64 {
     seed ^ COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// pi `readStructuredOutput` (`structured-output.ts:55-68`): read the child's captured structured
+/// pi `readStructuredOutput` (`structured-output.ts:156-173`): read the child's captured structured
 /// output. A MISSING capture file (the child never called `structured_output`) is a hard failure —
 /// EVEN WHEN prose was produced — with [`STRUCTURED_OUTPUT_MISSING_ERROR`]. A present-but-unparseable
 /// or schema-invalid value is also a hard failure.
@@ -353,7 +353,7 @@ pub fn read_structured_output(
     Ok(value)
 }
 
-/// pi `cleanupStructuredOutputRuntime` (`structured-output.ts:70-77`): best-effort removal of the
+/// pi `cleanupStructuredOutputRuntime` (`structured-output.ts:175-182`): best-effort removal of the
 /// runtime's private temp dir.
 pub fn cleanup_structured_output_runtime(runtime: &StructuredOutputRuntime) {
     if let Some(dir) = runtime.schema_path.parent() {
@@ -609,7 +609,7 @@ mod tests {
         );
     }
 
-    // ---- file-based structured_output tool contract (pi structured-output.ts:55-68) ----
+    // ---- file-based structured_output tool contract (pi structured-output.ts:156-173) ----
 
     fn sample_schema() -> serde_json::Value {
         serde_json::json!({

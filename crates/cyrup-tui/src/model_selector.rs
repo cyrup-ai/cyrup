@@ -16,9 +16,10 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::fuzzy;
-use crate::keymap::{SelectAction, SelectKeymap};
+use crate::keymap::{EditorAction, EditorKeymap, SelectAction, SelectKeymap};
 use crate::selector::{Selector, SelectorOutcome};
 use crate::theme::UiTheme;
+use crate::transcript::text_lines_of;
 
 /// One catalog model offered by `/model`.
 #[derive(Clone, Debug)]
@@ -69,6 +70,24 @@ pub struct ModelSelector {
     /// Highlighted index into the *filtered* list.
     selected: usize,
     max_visible: usize,
+    /// `errorMessage` (`model-selector.ts:58`): a catalog-refresh failure. When set it **replaces**
+    /// the `No matching models` / `Model Name:` block and every one of its `\n`-separated lines is
+    /// drawn in `error` (`:299-304`).
+    error_message: Option<String>,
+    /// `refreshStatusMessage` + `refreshStatusSuccess` (`model-selector.ts:59-60`): the
+    /// `Spacer(1)` + `  {message}` row drawn below the list, `success` when the refresh landed and
+    /// `muted` while it is in flight (`:312-317`).
+    ///
+    /// **Empty by default, unlike upstream.** pi seeds `"Refreshing model catalogs…"` in the field
+    /// initializer because its constructor kicks off `refreshModels()` (`:136`); cyrup is handed an
+    /// already-resolved catalog by `App::open_model_selector`, so seeding the same string would
+    /// pin a "Refreshing…" row that nothing ever clears. Drivers that do refresh in the background
+    /// call [`Self::set_refresh_status`] / [`Self::set_error_message`], which reproduce upstream's
+    /// rows exactly.
+    refresh_status: Option<(String, bool)>,
+    /// The label of the key bound to `tui.input.tab` (cyrup's `editor.tab`), for the scope hint row
+    /// — Pi `keyHint("tui.input.tab", "scope")` reads the LIVE keymap (`:228-230`), never a glyph.
+    scope_key: String,
 }
 
 impl ModelSelector {
@@ -91,6 +110,11 @@ impl ModelSelector {
             cursor: 0,
             selected: 0,
             max_visible: 10,
+            error_message: None,
+            refresh_status: None,
+            scope_key: EditorKeymap::default()
+                .keys_label(EditorAction::Tab)
+                .unwrap_or_else(|| "tab".to_string()),
         };
         // Preselect the current model within the initial (scope-filtered) view.
         sel.selected = sel.filtered().iter().position(|m| m.current).unwrap_or(0);
@@ -175,12 +199,54 @@ impl ModelSelector {
         }
     }
 
-    /// The scope header line (`Scope: all | scoped`, Pi `getScopeText`, `:197-201`), or, when no
-    /// providers/scoped models exist, the `warning` hint (Pi `:97-98`).
+    /// Adopt the live editor keymap so the scope hint names the user's `tui.input.tab` binding
+    /// rather than a hardcoded glyph (Pi `keyHint("tui.input.tab", "scope")`, `:228-230`).
+    pub fn set_editor_keymap(&mut self, keymap: &EditorKeymap) {
+        if let Some(label) = keymap.keys_label(EditorAction::Tab) {
+            self.scope_key = label;
+        }
+    }
+
+    /// Set the catalog-refresh status row (Pi `refreshStatusMessage`/`refreshStatusSuccess`,
+    /// `:172-184`): `success` colours it `success`, otherwise `muted`. An empty message clears it,
+    /// exactly like upstream's `refreshStatusMessage = ""` (`:172`, `:191`).
+    ///
+    /// **BLOCKED, not unfinished.** Upstream's producer is `refreshModels()`
+    /// (`model-selector.ts:162-200`), which the constructor fires at `:136` — so the user action
+    /// that should reach this is *opening `/model`*. cyrup cannot run it from here: the driver of
+    /// that refresh is `ModelRuntime.refresh`, and `AgentSession` exposes no analogue —
+    /// `available_model_catalog()` is a snapshot, `AgentSessionServices`
+    /// (`cyrup-session-svc/src/services.rs:84-152`) publishes `catalog_overlay` but not the live
+    /// `cyrup_provider::Collection` that owns `Collection::refresh` (`collection.rs:317`), and the
+    /// one refresh cyrup does run (`cyrup::provider::spawn_model_catalog_refresh`,
+    /// `crates/cyrup/src/provider.rs:132`) is a detached bin-level task with no channel back into
+    /// `App`. Unblocking it is a `cyrup-session-svc` API addition plus a `ModelRefreshMsg` channel
+    /// alongside `install_login_channel` (`app.rs:2045`) — both outside this crate's edit scope.
+    pub fn set_refresh_status(&mut self, message: impl Into<String>, success: bool) {
+        let message = message.into();
+        self.refresh_status = if message.is_empty() { None } else { Some((message, success)) };
+    }
+
+    /// Set (or clear) the catalog-refresh error (Pi `errorMessage`, `:174-194`). Every
+    /// `\n`-separated line renders in `error` and the whole block replaces the `Model Name:` /
+    /// `No matching models` row (`:299-311`).
+    ///
+    /// **BLOCKED** on the same missing seam as [`Self::set_refresh_status`] — every one of
+    /// upstream's four assignments to `errorMessage` (`:174`, `:176`, `:178`, `:180`) is a branch
+    /// on a `modelRuntime.refresh()` result.
+    pub fn set_error_message(&mut self, message: Option<String>) {
+        self.error_message = message.filter(|m| !m.is_empty());
+    }
+
+    /// The scope header line (`Scope: all | scoped`, Pi `getScopeText`, `:222-226`), or, when no
+    /// providers/scoped models exist, the `warning` hint (Pi `:102-103`).
+    ///
+    /// Both are `new Text(…, 0, 0)` — `paddingX = 0` (`:97`, `:103`), so neither carries a leading
+    /// space; they start at column 0, flush with the `  `-prefixed list rows below (S32).
     fn scope_line(&self, theme: &UiTheme) -> Line<'static> {
         if !self.has_scoped {
             return Line::from(Span::styled(
-                " Only showing models from configured providers. Use /login to add providers.",
+                "Only showing models from configured providers. Use /login to add providers.",
                 theme.warning_style(),
             ));
         }
@@ -189,22 +255,59 @@ impl ModelSelector {
             Scope::Scoped => (theme.muted_style(), theme.accent_style()),
         };
         Line::from(vec![
-            Span::styled(" Scope: ", theme.muted_style()),
+            Span::styled("Scope: ", theme.muted_style()),
             Span::styled("all", all_style),
             Span::styled(" | ", theme.muted_style()),
             Span::styled("scoped", scoped_style),
-            Span::styled("      ⇥ scope (all/scoped)", theme.muted_style()),
         ])
     }
 
-    /// The windowed list body (Pi `updateList`, `:229-283`): `→ ` cursor + `id` + `[provider]` badge +
-    /// `✓` on the active model, a `(i/N)` scroll indicator, and the `Model Name:` footer.
-    fn body_lines(&self, filtered: &[&ModelEntry], theme: &UiTheme) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        if filtered.is_empty() {
-            lines.push(Line::from(Span::styled("  No matching models", theme.muted_style())));
-            return lines;
+    /// The scope hint row (Pi `getScopeHintText`, `:228-230`), added as its **own** `Text` child
+    /// (`:99-100`) directly under the scope line — and **only** when scoped models exist, since the
+    /// `else` branch at `:101-104` adds the warning `Text` alone (S30).
+    ///
+    /// `keyHint(binding, description)` is `dim(keyText(binding)) + muted(" " + description)`
+    /// (`keybinding-hints.ts:42-44`), and `getScopeHintText` appends a second `muted` run — so the
+    /// row is two-tone: the key dim, `scope (all/scoped)` muted.
+    fn scope_hint_line(&self, theme: &UiTheme) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(self.scope_key.clone(), theme.dim_style()),
+            Span::styled(" scope", theme.muted_style()),
+            Span::styled(" (all/scoped)", theme.muted_style()),
+        ])
+    }
+
+    /// The whole scope block: the scope line plus its own hint `Text` when scoped models exist
+    /// (`:96-100`), else the lone warning row (`:101-104`).
+    ///
+    /// Routed through [`text_lines_of`] — the `Text.render` port — because these are `Text`
+    /// children like any other and upstream wraps them at the dialog width (`text.ts:60-87`). The
+    /// warning string is 75 columns and so wraps on any terminal narrower than that; it used to be
+    /// truncated instead.
+    fn scope_block_lines(&self, width: usize, theme: &UiTheme) -> Vec<Line<'static>> {
+        let mut out = text_lines_of(&self.scope_line(theme), width, 0);
+        if self.has_scoped {
+            out.extend(text_lines_of(&self.scope_hint_line(theme), width, 0));
         }
+        out
+    }
+
+    /// The windowed list body (Pi `updateList`, `:257-318`): `→ ` cursor + `id` + `[provider]` badge +
+    /// `✓` on the active model, a `(i/N)` scroll indicator, then — in upstream's exact order — the
+    /// **error block** *or* `No matching models` *or* the `Model Name:` footer, and finally the
+    /// refresh-status row.
+    ///
+    /// Note the three-way `if/else if/else` at `:299-311`: an `errorMessage` **replaces** both the
+    /// empty-list message and the `Model Name:` block. The refresh-status row at `:312-317` is
+    /// independent of all three and is emitted even when the filtered list is empty — which is why
+    /// this no longer early-returns on an empty list the way it used to.
+    fn body_lines(
+        &self,
+        filtered: &[&ModelEntry],
+        width: usize,
+        theme: &UiTheme,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
         let len = filtered.len();
         let start = self
             .selected
@@ -233,13 +336,37 @@ impl ModelSelector {
                 theme.muted_style(),
             )));
         }
-        // `Model Name:` footer for the highlighted model (Pi `:280-283`).
-        if let Some(sel) = filtered.get(self.selected) {
+        // Error block / `No matching models` / `Model Name:` footer — Pi's three-way branch
+        // (`:299-311`). The error block wins over both of the others.
+        if let Some(err) = &self.error_message {
+            // `errorMessage.split("\n")` → one `Text` per line, each `theme.fg("error", line)`
+            // (`:301-304`). Each `Text` then wraps at the dialog width like any other.
+            for logical in err.split('\n') {
+                lines.extend(text_lines_of(
+                    &Line::from(Span::styled(logical.to_string(), theme.error_style())),
+                    width,
+                    0,
+                ));
+            }
+        } else if len == 0 {
+            lines.push(Line::from(Span::styled("  No matching models", theme.muted_style())));
+        } else if let Some(sel) = filtered.get(self.selected) {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("  Model Name: {}", sel.name),
                 theme.muted_style(),
             )));
+        }
+        // Refresh-status row (`:312-317`): `Spacer(1)` then `  {message}`, `success` when the
+        // refresh landed, `muted` while it is in flight. Independent of the branch above.
+        if let Some((message, success)) = &self.refresh_status {
+            lines.push(Line::from(""));
+            let style = if *success { theme.success_style() } else { theme.muted_style() };
+            lines.extend(text_lines_of(
+                &Line::from(Span::styled(format!("  {message}"), style)),
+                width,
+                0,
+            ));
         }
         lines
     }
@@ -295,30 +422,41 @@ pub fn find_exact_model_reference_match<'a>(
 }
 
 impl Selector for ModelSelector {
-    fn desired_height(&self, _width: u16) -> u16 {
+    fn desired_height(&self, width: u16) -> u16 {
         let filtered = self.filtered();
-        let body = self.body_lines(&filtered, &UiTheme::default()).len() as u16;
-        // top rule + scope + blank + search + blank + body + bottom rule.
-        body.saturating_add(6)
+        let body = self.body_lines(&filtered, usize::from(width), &UiTheme::default()).len() as u16;
+        // top rule + blank + scope block + blank + search + blank + body + blank + bottom rule
+        // (L4/SYS-3 — see `render`). The scope block is TWO rows when scoped models exist (the
+        // scope line plus its own hint `Text`, `model-selector.ts:96-100`) and one otherwise.
+        let scope = self.scope_block_lines(usize::from(width), &UiTheme::default()).len() as u16;
+        body.saturating_add(7).saturating_add(scope)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let filtered = self.filtered();
-        // Top rule → scope header → blank → search box → blank, then the windowed body + bottom rule.
-        let mut lines: Vec<Line<'static>> = vec![
-            border_rule_line(area.width, theme),
-            self.scope_line(theme),
-            Line::from(""),
-            {
-                // Search box with a visible block cursor (feature #9 "selector IME cursor").
-                let mut spans = vec![Span::styled(" ▏", theme.accent_style())];
-                spans.extend(crate::selector::search_input_spans(&self.query, self.cursor, theme));
-                spans.push(Span::styled("▏", theme.accent_style()));
-                Line::from(spans)
-            },
-            Line::from(""),
-        ];
-        lines.extend(self.body_lines(&filtered, theme));
+        // L4/SYS-3. `ModelSelectorComponent`'s child list (`model-selector.ts:92-129`):
+        //   `DynamicBorder`(:92) · `Spacer`(:93) · scope/hint `Text`(:96-104) · `Spacer`(:105) ·
+        //   search `Input`(:118) · `Spacer`(:120) · listContainer(:124) · `Spacer`(:126) ·
+        //   `DynamicBorder`(:129).
+        // **Four** spacers. cyrup already drew `:105` and `:120`; `:93` and `:126` are added here.
+        // Unconditional, because upstream's `Spacer` children are — a `Paragraph` draws
+        // `lines[0..area.height]` and drops the TRAILING rows, so a short slot shows a strict
+        // PREFIX of this vector, matching pi's layout engine (see `crate::selector::stack_rows`).
+        let mut lines: Vec<Line<'static>> = vec![border_rule_line(area.width, theme)];
+        lines.push(Line::from(""));
+        // The scope hint is its OWN `Text` child (`:99-100`) and exists only on the scoped branch.
+        lines.extend(self.scope_block_lines(usize::from(area.width), theme));
+        lines.push(Line::from(""));
+        // Search box with a visible block cursor (feature #9 "selector IME cursor").
+        //
+        // S31: the prompt is `Input.render`'s shared, unstyled `"> "` at column 0 (`input.ts:380`),
+        // because `model-selector.ts:118` adds `this.searchInput` to the container as a bare child.
+        // cyrup drew accent `" ▏"…"▏"` bars around the value — one column in, coloured, and U+258F
+        // occurs nowhere in pi's TUI sources.
+        lines.push(Line::from(crate::selector::input_line_spans(&self.query, self.cursor, theme)));
+        lines.push(Line::from(""));
+        lines.extend(self.body_lines(&filtered, usize::from(area.width), theme));
+        lines.push(Line::from(""));
         lines.push(border_rule_line(area.width, theme));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
     }
@@ -542,5 +680,161 @@ mod tests {
         let text: String =
             term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("gpt"), "seeded search term shown in the box: {text}");
+    }
+    // ---- S32 / S30 / S23: the scope block and the refresh-status + error rows ---------------------
+
+    /// Render at the selector's own natural height and return the rows, trailing-trimmed, together
+    /// with the buffer so a test can also probe per-cell colour.
+    fn draw(
+        sel: &mut ModelSelector,
+        w: u16,
+        theme: &UiTheme,
+    ) -> (Vec<String>, ratatui::buffer::Buffer) {
+        let h = sel.desired_height(w);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| sel.render(f, f.area(), theme)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = (0..buf.area.height)
+            .map(|y| {
+                let mut line = String::new();
+                for x in 0..buf.area.width {
+                    if let Some(c) = buf.cell((x, y)) {
+                        line.push_str(c.symbol());
+                    }
+                }
+                line.trim_end().to_string()
+            })
+            .collect();
+        (rows, buf)
+    }
+
+    fn fg_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> Option<ratatui::style::Color> {
+        buf.cell((x, y)).map(|c| c.style().fg).unwrap_or(None)
+    }
+
+    /// **S32.** Both `Text` children of the scope block are `new Text(…, 0, 0)` — `paddingX = 0`
+    /// (`model-selector.ts:97`, `:103`) — and `getScopeText` starts with the literal `"Scope: "`
+    /// (`:225`), no leading space. cyrup indented both one column, out of line with the `  `-prefixed
+    /// rows below.
+    ///
+    /// **S30.** `getScopeHintText` is its **own** `Text` child added at `:99-100`, not a tail
+    /// appended to the scope line, and it is two-tone: `keyHint` is
+    /// `dim(keyText(binding)) + muted(" " + description)` (`keybinding-hints.ts:42-44`) with a second
+    /// muted run for ` (all/scoped)` (`:229`). The key comes from the LIVE `tui.input.tab` binding —
+    /// cyrup hardcoded a `⇥` glyph that appears in no upstream string.
+    #[test]
+    fn scope_row_is_flush_and_its_hint_is_a_separate_two_tone_row() {
+        let mut sel = ModelSelector::new(catalog());
+        let theme = UiTheme::dark();
+        let (rows, buf) = draw(&mut sel, 72, &theme);
+        assert_eq!(rows[2], "Scope: all | scoped", "no leading space (S32): {rows:?}");
+        assert_eq!(rows[3], "tab scope (all/scoped)", "its own row (S30): {rows:?}");
+        assert_eq!(rows[4], "", "Spacer(1) (`:105`) follows the whole scope block: {rows:?}");
+        assert!(!rows[2].contains('⇥'), "the hardcoded glyph is gone: {rows:?}");
+        // Two-tone: the key `dim`, the description `muted` (they are different tokens — `#666666`
+        // vs `#808080` — so this cannot pass by accident).
+        assert_ne!(theme.dim_style().fg, theme.muted_style().fg);
+        assert_eq!(fg_at(&buf, 0, 3), theme.dim_style().fg, "`tab` is dim");
+        assert_eq!(fg_at(&buf, 4, 3), theme.muted_style().fg, "`scope …` is muted");
+    }
+
+    /// The hint row belongs to the SCOPED branch only: `model-selector.ts:101-104`'s `else` adds the
+    /// warning `Text` and nothing else, so a catalog with no scoped models must show one row here,
+    /// still flush at column 0 (S32).
+    #[test]
+    fn unscoped_catalog_shows_only_the_flush_warning_row() {
+        let mut sel = ModelSelector::new(unscoped());
+        let theme = UiTheme::dark();
+        let (rows, _) = draw(&mut sel, 90, &theme);
+        assert_eq!(
+            rows[2], "Only showing models from configured providers. Use /login to add providers.",
+            "no leading space (S32): {rows:?}"
+        );
+        assert_eq!(rows[3], "", "no scope-hint row on this branch (S30): {rows:?}");
+        assert!(rows.iter().all(|r| !r.contains("all/scoped")), "{rows:?}");
+    }
+
+    /// **S23.** `model-selector.ts:312-317` appends `Spacer(1)` + `  ${refreshStatusMessage}`,
+    /// coloured `success` when the refresh landed and `muted` while it is in flight. cyrup emitted
+    /// neither, so `/model` was silent about catalog refreshes.
+    #[test]
+    fn refresh_status_row_is_muted_in_flight_and_success_when_done() {
+        let mut sel = ModelSelector::new(catalog());
+        let theme = UiTheme::dark();
+        let (before, _) = draw(&mut sel, 72, &theme);
+        assert!(before.iter().all(|r| !r.contains("Refreshing")), "{before:?}");
+
+        sel.set_refresh_status("Refreshing model catalogs…", false);
+        let (rows, buf) = draw(&mut sel, 72, &theme);
+        let n = rows.len();
+        assert_eq!(rows[n - 3], "  Refreshing model catalogs…", "{rows:?}");
+        assert_eq!(rows[n - 4], "", "Spacer(1) above it (`:313`): {rows:?}");
+        assert_eq!(fg_at(&buf, 2, (n - 3) as u16), theme.muted_style().fg, "in flight ⇒ muted");
+
+        sel.set_refresh_status("Model catalogs refreshed.", true);
+        let (rows, buf) = draw(&mut sel, 72, &theme);
+        let n = rows.len();
+        assert_eq!(rows[n - 3], "  Model catalogs refreshed.", "{rows:?}");
+        assert_eq!(fg_at(&buf, 2, (n - 3) as u16), theme.success_style().fg, "done ⇒ success");
+
+        sel.set_refresh_status("", false);
+        let (rows, _) = draw(&mut sel, 72, &theme);
+        assert!(rows.iter().all(|r| !r.contains("catalogs")), "empty clears the row: {rows:?}");
+    }
+
+    /// **S23.** `:299-311` is a three-way branch: an `errorMessage` REPLACES both `No matching
+    /// models` and the `Model Name:` block, and every one of its `\n`-separated lines is drawn in
+    /// `error`.
+    #[test]
+    fn error_message_replaces_the_model_name_row_and_is_error_coloured() {
+        let mut sel = ModelSelector::new(catalog());
+        let theme = UiTheme::dark();
+        let (before, _) = draw(&mut sel, 72, &theme);
+        assert!(before.iter().any(|r| r.starts_with("  Model Name:")), "{before:?}");
+
+        sel.set_error_message(Some(
+            "Could not refresh openai; showing cached models.\nRetry with /model.".to_string(),
+        ));
+        let (rows, buf) = draw(&mut sel, 72, &theme);
+        assert!(
+            rows.iter().all(|r| !r.contains("Model Name:")),
+            "the error block replaces it: {rows:?}"
+        );
+        let first =
+            rows.iter().position(|r| r.starts_with("Could not refresh openai")).unwrap_or(usize::MAX);
+        assert!(first != usize::MAX, "error line 1 missing: {rows:?}");
+        assert_eq!(rows[first + 1], "Retry with /model.", "one row per \\n (`:301-304`): {rows:?}");
+        assert_eq!(fg_at(&buf, 0, first as u16), theme.error_style().fg);
+        assert_eq!(fg_at(&buf, 0, (first + 1) as u16), theme.error_style().fg);
+    }
+
+    /// **S23.** The refresh-status row is emitted from `updateList`'s tail (`:312`), OUTSIDE the
+    /// three-way branch above it — so it still shows when the filtered list is empty. cyrup's
+    /// `body_lines` used to early-return on an empty list, which would have swallowed it.
+    #[test]
+    fn refresh_status_survives_an_empty_filtered_list() {
+        let mut sel = ModelSelector::new(catalog());
+        sel.set_search("zzzqqq".to_string());
+        sel.set_refresh_status("Refreshing model catalogs…", false);
+        let theme = UiTheme::dark();
+        let (rows, _) = draw(&mut sel, 72, &theme);
+        assert_eq!(sel.visible_len(), 0, "the query matches nothing");
+        assert!(rows.iter().any(|r| r == "  No matching models"), "{rows:?}");
+        assert!(rows.iter().any(|r| r == "  Refreshing model catalogs…"), "{rows:?}");
+    }
+
+    /// MIRROR for the per-component discipline. The `/scoped-models` footer
+    /// (`scoped-models-selector.ts:197-208`) and its `(unsaved)` / `N/M enabled` run belong to
+    /// `ScopedModelsSelectorComponent` alone; `ModelSelectorComponent` has no footer hint at all —
+    /// its children stop at the list `Container` and a `Spacer` (`model-selector.ts:124-129`). If a
+    /// later change pushes that footer into shared code, this fails.
+    #[test]
+    fn model_selector_has_no_scoped_models_footer() {
+        let mut sel = ModelSelector::new(catalog());
+        let theme = UiTheme::dark();
+        let (rows, _) = draw(&mut sel, 72, &theme);
+        for needle in ["toggle", "(unsaved)", "enabled", "provider ·", "Model Configuration"] {
+            assert!(rows.iter().all(|r| !r.contains(needle)), "{needle:?} leaked into /model: {rows:?}");
+        }
     }
 }

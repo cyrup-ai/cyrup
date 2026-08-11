@@ -138,7 +138,7 @@ pub struct FanOutResult<R, E> {
     ///
     /// [`Self::fail_fast_skipped_count`] answers "how many", this answers "which ones, and why" —
     /// the distinction matters to the chain driver because pi synthesizes a *fail-fast-specific*
-    /// placeholder result for the un-run siblings (`chain-execution.ts:238-246`: `task:
+    /// placeholder result for the un-run siblings (`chain-execution.ts:321-330`: `task:
     /// "(skipped)"`, `exitCode: -1`, `error: "Skipped due to fail-fast"`) and has no analog for a
     /// cancellation skip, which is a cyrup-side concept.
     pub skip_reasons: Vec<Option<SkipReason>>,

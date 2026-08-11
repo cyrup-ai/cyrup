@@ -73,6 +73,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
+        memory: None,
+        tool_budget: None,
     }
 }
 
@@ -1172,7 +1174,7 @@ async fn status_json_carries_live_current_tool_during_a_run() {
     );
 }
 
-/// T4 mid-flight interrupt (`subagent-runner.ts:458-466,1583-1609`): interrupting a SINGLE-step run
+/// T4 mid-flight interrupt (`subagent-runner.ts:1333,2002-2005,2069` @v0.34.0): interrupting a SINGLE-step run
 /// must actually reach and tear down the in-flight child — not be a no-op that only takes effect
 /// BETWEEN steps (a single-step run has no next step). Drives the REAL `run()` against the REAL
 /// fixture subprocess: the fixture sleeps 6000ms, and this test drops a control-inbox interrupt
@@ -1526,7 +1528,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
         "…pointing at THIS step's resolved directory: {tee}"
     );
     // `share: true` is one of the two `sessionEnabled` terms, and a session-enabled child must NOT
-    // be spawned `--no-session` (pi `execution.ts:1027,1039`).
+    // be spawned `--no-session` (pi `execution.ts:1027,1039` @v0.34.0).
     assert!(
         !tee.contains("--no-session"),
         "a run with `share: true` / an explicit sessionDir must not spawn the child \
@@ -1536,7 +1538,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
 
 /// SUBA-N03: `artifacts: false` reaching hop 2 as an absent `artifacts_dir` must leave NO artifact
 /// files behind — pi's own first gate term (`if (ctx.artifactsDir && …)`,
-/// `runs/background/subagent-runner.ts:879`). The complement of the test directly above; without
+/// `runs/background/subagent-runner.ts:1192`). The complement of the test directly above; without
 /// it, that one would still pass if the runner wrote artifacts unconditionally into some default
 /// location.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1649,5 +1651,255 @@ async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_
         rendered.contains("timed out") || rendered.contains("timeout"),
         "the failure must be reported as a TIMEOUT (pi's `Subagent timed out after {{n}}ms.`), \
          not some other error: {rendered}"
+    );
+}
+
+// =================================================================================================
+// G77 — `stopped` as a first-class terminal state, driven through the REAL detached-runner loop
+// =================================================================================================
+
+/// G77, the live path: a `control/stop.json` delivered mid-flight must tear the child down and end
+/// the run in the terminal [`RunState::Stopped`] state — **not** `Paused` (what an `interrupt`
+/// produces) and **not** `Failed` (what a `timeout` produces).
+///
+/// Upstream: pi `stopRunner` (`runs/background/subagent-runner.ts:2955-2984` @v0.43.0) sets
+/// `statusPayload.state = "stopped"`, `statusPayload.error = stopMessage`, marks every
+/// `running`-or-`pending` step `"stopped"` with `error = stopMessage`, appends
+/// `subagent.run.stopped` to `events.jsonl`, aborts the live children and stops the nested async
+/// descendants. Every one of those observable effects is asserted below against the REAL files
+/// `run()` itself wrote, with a REAL `cyrup-subagent-fixture` OS subprocess as the child.
+///
+/// The paired `interrupt` test directly above this one (`interrupting_a_single_step_run_actually_
+/// signals_the_mid_flight_child`) is deliberately the same shape with the same 6 s child script, so
+/// the ONLY independent variable between the two is which control file was written — which is
+/// exactly the distinction G77 exists to make observable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "sleep_ms", "ms": 6000},
+            {"kind": "emit", "line": message_end_line("SHOULD-NOT-REACH")},
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script.json", &script);
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation (see module doc).
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
+    }
+
+    let async_root = dir.path().join("async");
+    let results_dir = dir.path().join("results");
+    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    let run_id = RunId::from_token("midstop001");
+    let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+
+    let config = RunnerConfig {
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
+        run_id: run_id.clone(),
+        mode: RunMode::Single,
+        steps: vec![RunnerStep::SingleStep(single_step("only", "sleep a long time"))],
+        cwd: dir.path().to_path_buf(),
+        session_file: None,
+        global_concurrency_limit: 20,
+        worktree_base_dir: None,
+        max_subagent_depth: 2,
+        async_root: async_root.clone(),
+        results_dir: results_dir.clone(),
+        resolved_agents: all_personas(),
+        original_task: String::new(),
+        chain_dir: None,
+        orchestrator_intercom_target: None,
+        inherited_session_model: None,
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
+    let cfg_path = run_paths.run_dir.join("runner-config.json");
+    write_atomic_json(&cfg_path, &config).await.expect("write config");
+
+    // Deliver the stop ~400ms into the child's 6s sleep — squarely mid-flight, through the REAL
+    // parent-side `deliver_stop_request` primitive (never a hand-rolled file write), so this test
+    // covers the writer as well as the runner's reader.
+    let stop_dir = run_paths.run_dir.clone();
+    let stop_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        cyrup_ext_subagents::background::control::deliver_stop_request(
+            &stop_dir,
+            "stop-action",
+            None,
+        )
+        .await
+        .expect("write stop request");
+    });
+
+    let started = std::time::Instant::now();
+    let outcome = run(&cfg_path, &run_paths).await;
+    let elapsed = started.elapsed();
+    stop_task.await.expect("stop task completes");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
+    }
+    outcome.expect("run() itself never returns Err");
+
+    assert!(
+        elapsed < Duration::from_millis(4000),
+        "the run must finish FAR sooner than the child's 6s sleep — proving the mid-flight child was \
+         actually torn down by the stop, not waited out: elapsed={elapsed:?}"
+    );
+
+    let status: RunStatus = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.status).await.expect("status.json exists"),
+    )
+    .expect("parse status.json");
+    let result_file: ResultFile = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.result).await.expect("ResultFile exists"),
+    )
+    .expect("parse ResultFile");
+
+    assert_eq!(
+        status.state,
+        RunState::Stopped,
+        "a stopped run must end `Stopped` — NOT `Paused` (interrupt) and NOT `Failed` (timeout): {status:?}"
+    );
+    assert_eq!(result_file.state, RunState::Stopped);
+    assert!(
+        RunState::Stopped.is_terminal(),
+        "`Stopped` must be terminal in its own right (pi `chain-root-attachment.ts:60` TERMINAL_STATES)"
+    );
+    assert!(!result_file.success);
+
+    // pi `subagent-runner.ts:2966-2973`: every running-or-pending step becomes `"stopped"` with the
+    // stop message, never `"failed"` and never `"paused"`.
+    assert_eq!(status.steps.len(), 1);
+    assert_eq!(
+        status.steps[0].status,
+        cyrup_ext_subagents::background::StepState::Stopped,
+        "the mid-flight step must be marked Stopped: {:?}",
+        status.steps[0]
+    );
+    assert_eq!(
+        status.steps[0].error.as_deref(),
+        Some(cyrup_ext_subagents::background::control::STOP_MESSAGE),
+        "the stopped step carries pi's literal stop message"
+    );
+
+    // pi `subagent-runner.ts:1642,1722` @v0.43.0 — the child's own record is promoted to `stopped`, and
+    // `:909`/`:915`/`:917` give it exitCode 1, the stop message as `error`, and the stop message as
+    // `finalOutput` when it produced none of its own.
+    assert_eq!(result_file.results.len(), 1);
+    let child = &result_file.results[0];
+    assert!(child.stopped, "the torn-down child's SingleResult must carry stopped=true: {child:?}");
+    assert!(
+        !child.interrupted,
+        "a stop is NOT an interrupt — `interrupted` must be cleared so the run does not read as resumable: {child:?}"
+    );
+    assert_eq!(child.exit_code, 1);
+    assert_eq!(
+        child.error.as_deref(),
+        Some(cyrup_ext_subagents::background::control::STOP_MESSAGE)
+    );
+    assert_ne!(
+        child.final_output.as_deref(),
+        Some("SHOULD-NOT-REACH"),
+        "the child's post-sleep emit must never have run — it was torn down mid-sleep"
+    );
+
+    // pi `subagent-runner.ts:2977-2982`: the terminal event is `subagent.run.stopped`, not
+    // `subagent.run.paused` and not `subagent.run.completed`.
+    let events = tokio::fs::read_to_string(&run_paths.events)
+        .await
+        .expect("events.jsonl exists");
+    let types: Vec<String> = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+        .collect();
+    assert!(
+        types.iter().any(|t| t == "subagent.run.stopped"),
+        "events.jsonl must carry `subagent.run.stopped`: {types:?}"
+    );
+    assert!(
+        !types.iter().any(|t| t == "subagent.run.paused" || t == "subagent.run.completed"),
+        "a stopped run must NOT also report itself paused or completed: {types:?}"
+    );
+
+    // The stop request is consumed exactly once (pi `consumeStopRequest`'s
+    // read-then-unconditionally-delete discipline).
+    assert!(
+        !cyrup_ext_subagents::background::control::stop_request_path(&run_paths.run_dir).exists(),
+        "the consumed stop request file must be gone"
+    );
+
+    // G77's downstream contract, asserted on the SAME real record rather than a hand-built one:
+    // the grouped intercom payload reports `stopped`, the notify header word is `stopped`, and
+    // `resume` refuses the run outright.
+    let payload = cyrup_ext_subagents::tui::intercom::IntercomPayload::from_result(&result_file);
+    assert_eq!(
+        payload.status,
+        cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Stopped,
+        "pi `resolveGroupedStatus` must report the whole grouped run as stopped: {payload:?}"
+    );
+    assert_eq!(payload.summary, "1 stopped");
+
+    let notify = cyrup_ext_subagents::background::watch::format_completion_message(&result_file);
+    assert!(
+        notify.content.contains("Background task stopped:"),
+        "pi `notify.ts:210`'s fourth status word must be rendered: {}",
+        notify.content
+    );
+
+    let resume_err = cyrup_ext_subagents::background::control::resume(
+        &async_root,
+        &results_dir,
+        run_id.as_str(),
+        None,
+    )
+    .await
+    .expect_err("resume must refuse a stopped run");
+    assert_eq!(
+        resume_err.to_string(),
+        format!("Async run '{}' was stopped and cannot be resumed. Start a new run instead.", run_id.as_str()),
+        "pi `async-resume.ts:406`'s verbatim refusal"
+    );
+
+    // …and the `status` action renders the stopped run's own state word plus pi's
+    // not-resumable guidance rather than a `Revive:` line.
+    let rendered = cyrup_ext_subagents::background::run_status::inspect_status_by_id(
+        &async_root,
+        &results_dir,
+        run_id.as_str(),
+    )
+    .await
+    .expect("status renders")
+    .expect("status is present");
+    assert!(
+        rendered.contains("State: stopped"),
+        "the status report must print `stopped`, not `failed`: {rendered}"
+    );
+    assert!(
+        rendered.contains("Resume: unavailable; stopped runs are not resumable. Start a new run instead."),
+        "pi `run-status.ts:52`'s verbatim stopped-resume guidance: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Revive:"),
+        "a stopped run must never be offered a Revive line: {rendered}"
     );
 }

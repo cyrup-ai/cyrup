@@ -71,8 +71,11 @@ fn committed_entries_move_to_scrollback_and_only_active_turn_renders() {
 
     // (a) Committed user + assistant text reached the scrollback accumulator (what insert_before got).
     let sb = app.scrollback_text();
-    assert!(sb.contains("you: hello world"), "scrollback missing user line:\n{sb}");
-    assert!(sb.contains("assistant: hi there"), "scrollback missing assistant line:\n{sb}");
+    // X1: no `you: ` / `assistant: ` labels — `user-message.ts:38-58` and
+    // `assistant-message.ts:104-114` render the body alone.
+    assert!(sb.contains("hello world"), "scrollback missing user line:\n{sb}");
+    assert!(sb.contains("hi there"), "scrollback missing assistant line:\n{sb}");
+    assert!(!sb.contains("you:") && !sb.contains("assistant:"), "invented role label:\n{sb}");
 
     // (b) The live region no longer contains the committed text (it scrolled into native scrollback
     //     above the inline band, audit #1), but DOES show the active streaming turn + editor + footer.
@@ -148,6 +151,14 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
 
     let mut app = App::new(TestBackend::new(60, 14), UiTheme::dark()).unwrap();
     app.ingest_event(&AgentSessionEvent::AgentStart);
+    // `message_start` opens the assistant message — Pi's `this.streamingComponent =
+    // new AssistantMessageComponent(...)` (`interactive-mode.ts:3130-3139`), and the guard both
+    // `message_update` (`:3146`) and `message_end` (`:3182`) test before they touch it. The agent
+    // emits it on the stream's `Start` frame (`cyrup-agent/src/agent.rs:802-808`) and, failing that,
+    // just before `MessageEnd` (`:848-852`), so it is never absent in production.
+    app.ingest_event(&AgentSessionEvent::MessageStart {
+        message: AgentMessage::Assistant(partial.clone()),
+    });
     for delta in ["The ", "live ", "stream"] {
         app.ingest_event(&AgentSessionEvent::MessageUpdate {
             message: AgentMessage::user_text(""),
@@ -167,19 +178,31 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
         "in-flight stream leaked to scrollback"
     );
 
-    // A terminal `Done` commits the authoritative message and clears the active region.
+    // `message_end` commits the authoritative message and clears the active region — Pi
+    // `updateContent(this.streamingMessage, false)` then `this.streamingComponent = undefined`
+    // (`interactive-mode.ts:3193`, `:3213`). This used to be a `MessageUpdate` carrying
+    // `StreamEvent::terminal(...)`, an event `cyrup-agent` never emits: it `break 'consume`s the
+    // moment the stream yields its terminal (`agent.rs:813-820`), so the terminal reaches the TUI
+    // only as `MessageEnd`. Pinning the synthetic form hid the fact that the real one committed
+    // nothing at all.
     let mut final_msg = partial.clone();
     final_msg.content = vec![Content::text("The live stream is done")];
     final_msg.usage = Usage { total_tokens: 42, ..Usage::default() };
-    app.ingest_event(&AgentSessionEvent::MessageUpdate {
-        message: AgentMessage::user_text(""),
-        assistant_message_event: Box::new(StreamEvent::terminal(final_msg)),
+    app.ingest_event(&AgentSessionEvent::MessageEnd {
+        message: AgentMessage::Assistant(final_msg),
     });
     app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();
     assert!(
-        app.scrollback_text().contains("assistant: The live stream is done"),
+        app.scrollback_text().contains("The live stream is done"),
         "terminal message not committed to scrollback:\n{}",
+        app.scrollback_text()
+    );
+    // X1: dropping `assistant: ` from the needle above only proves the BODY is there — the negative
+    // is what proves the label is gone. `assistant-message.ts:104-114` is the `Markdown` child alone.
+    assert!(
+        !app.scrollback_text().contains("assistant:"),
+        "invented assistant label in scrollback:\n{}",
         app.scrollback_text()
     );
 }
@@ -200,7 +223,12 @@ fn ingest_events_drive_status_and_transcript() {
 
     let text = buf_text(&app);
     assert!(text.contains("openai/gpt"), "model not reflected:\n{text}");
-    assert!(text.contains("3 queued"), "queue depth not reflected:\n{text}");
+    // The queue depth is TRACKED but must NOT reach the footer: `statsParts` (v0.84.1
+    // `footer.ts:129-164`) is exactly `↑ ↓ R W CH% $cost`, the context segment and `xp` — there is no
+    // queue segment upstream under any name. The extra segment pushed the right-aligned model name
+    // over at narrow widths. pi surfaces queued messages in the transcript instead.
+    assert_eq!(app.state().status.queued, 3, "queue depth not tracked");
+    assert!(!text.contains("queued"), "pi's footer has no queue segment:\n{text}");
     // The model-change notification is a committed entry: it lives in scrollback, not the live region.
     let sb = app.scrollback_text();
     assert!(sb.contains("model → openai/gpt"), "model change not logged to scrollback:\n{sb}");
@@ -220,10 +248,17 @@ fn ingest_events_drive_status_and_transcript() {
 
 #[test]
 fn theme_colors_reach_rendered_cells() {
-    // Dark theme accent (Pi `accent` token = #8abeb7) styles the active streaming label; assert it
-    // lands on real viewport cells (an in-flight turn stays in the viewport, unlike committed entries).
+    // The accent-styled live-region surface is the status band's spinner glyph
+    // (`status_indicator.rs:216-218`, Pi `status-indicator.ts:55-64` → `loader.ts`), which is
+    // `accent` for every kind except `Retry`. Driving the indicator (rather than a streaming turn)
+    // is deliberate: the comment this test used to carry claimed the accent came from "the active
+    // streaming label", but that label was DELETED as X1 (`user-message.ts:38-58` renders the body
+    // only) and the assertion has been surviving since on the editor's `› ` prompt glyph — a cyrup
+    // invention pi's `editor.ts:482-601` never emits, removed here as E1. An assertion whose only
+    // live subject is the thing under removal proves nothing about themes.
     let accent = Color::Rgb(0x8a, 0xbe, 0xb7);
     let mut app = App::new(TestBackend::new(40, 12), UiTheme::dark()).unwrap();
+    app.state_mut().indicator.working();
     app.transcript_mut().push_assistant_delta("colored");
     app.draw().unwrap();
     assert!(has_fg(&app, accent), "dark accent color did not reach any cell");
@@ -231,6 +266,7 @@ fn theme_colors_reach_rendered_cells() {
     // A different theme yields a different accent on the cells (Pi light `accent` = teal #5a8080).
     let light_accent = Color::Rgb(0x5a, 0x80, 0x80);
     let mut light = App::new(TestBackend::new(40, 12), UiTheme::light()).unwrap();
+    light.state_mut().indicator.working();
     light.transcript_mut().push_assistant_delta("colored");
     light.draw().unwrap();
     assert!(has_fg(&light, light_accent), "light accent color did not reach any cell");
@@ -251,15 +287,24 @@ fn finalized_turn_via_events_flows_to_scrollback_and_clears_viewport() {
     let mid = live_region_text(&app);
     assert!(mid.contains("answer"), "active streaming turn missing from live region mid-turn:\n{mid}");
     assert!(!mid.contains("question?"), "committed user leaked into live region:\n{mid}");
-    assert!(app.scrollback_text().contains("you: question?"), "user not flushed to scrollback");
+    assert!(app.scrollback_text().contains("question?"), "user not flushed to scrollback");
+    // X1: the needle lost its `you: ` prefix, so assert the prefix is actually absent rather than
+    // just unasserted (`user-message.ts:38-58` has no role label).
+    assert!(
+        !app.scrollback_text().contains("you:"),
+        "invented `you: ` label in scrollback:\n{}",
+        app.scrollback_text()
+    );
 
     // AgentEnd finalizes the streaming assistant turn.
     app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
-    assert!(sb.contains("you: question?"), "user missing from scrollback:\n{sb}");
-    assert!(sb.contains("assistant: answer"), "finalized assistant missing from scrollback:\n{sb}");
+    assert!(sb.contains("question?"), "user missing from scrollback:\n{sb}");
+    assert!(sb.contains("answer"), "finalized assistant missing from scrollback:\n{sb}");
+    assert!(!sb.contains("you:"), "invented `you: ` label in scrollback:\n{sb}");
+    assert!(!sb.contains("assistant:"), "invented assistant label in scrollback:\n{sb}");
 
     let view = live_region_text(&app);
     assert!(!view.contains("answer"), "finalized assistant still in live region:\n{view}");
@@ -277,8 +322,14 @@ fn committed_entries_flush_exactly_once() {
     app.draw().unwrap();
     app.draw().unwrap();
 
-    let occurrences = app.scrollback_text().matches("you: only once").count();
+    let occurrences = app.scrollback_text().matches("only once").count();
     assert_eq!(occurrences, 1, "committed entry flushed more than once");
+    // X1: the needle used to be `you: only once`; keep the label assertion alive as a negative.
+    assert!(
+        !app.scrollback_text().contains("you:"),
+        "invented `you: ` label in scrollback:\n{}",
+        app.scrollback_text()
+    );
     assert!(app.state().transcript.pending().is_empty(), "pending buffer not drained");
 }
 

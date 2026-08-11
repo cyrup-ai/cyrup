@@ -49,9 +49,20 @@ fn data_bound_commands_route_to_open_selector() {
         submit(&mut app, "/resume"),
         AppAction::Command(AppCommand::OpenSelector(SelectorKind::Session))
     );
+    // `/login [provider]` threads its argument the same way `/model` does (`handleLoginCommand`,
+    // interactive-mode.ts:2810): the run loop resolves it against the live registry + credential
+    // store, because a match may start the login outright with no picker at all.
     assert_eq!(
         submit(&mut app, "/login"),
-        AppAction::Command(AppCommand::OpenSelector(SelectorKind::Login))
+        AppAction::Command(AppCommand::LoginCommand(None))
+    );
+    assert_eq!(
+        submit(&mut app, "/login anthropic"),
+        AppAction::Command(AppCommand::LoginCommand(Some("anthropic".to_string())))
+    );
+    assert_eq!(
+        submit(&mut app, "/logout"),
+        AppAction::Command(AppCommand::OpenSelector(SelectorKind::Logout))
     );
 }
 
@@ -82,20 +93,46 @@ fn quit_command_quits() {
     assert_eq!(submit(&mut app, "/quit"), AppAction::Quit);
 }
 
+/// MIRROR of the `/hotkeys` envelope fix. `/changelog` (interactive-mode.ts:6067-6072) builds the
+/// byte-identical component stack to `/hotkeys` (:6197-6203) — same `Spacer/DynamicBorder/Text(…,1,0)/
+/// Spacer/Markdown(…,1,1)/DynamicBorder` — so the same `Entry::Block` correction must show up here:
+/// the title inset one column, the body inset one column with a `paddingY` blank on each side.
 #[test]
-fn hotkeys_command_opens_a_floating_overlay() {
+fn changelog_block_mirrors_the_hotkeys_envelope() {
+    let mut app = new_app();
+    assert_eq!(submit(&mut app, "/changelog"), AppAction::Redraw);
+    app.draw().unwrap();
+    let text = app.scrollback_text();
+    let rows: Vec<&str> = text.lines().collect();
+    let rule = "─".repeat(80);
+    let top = rows.iter().position(|r| r.trim_end() == rule).expect("opening rule");
+    assert_eq!(rows[top + 1], " What's New", "title inset by Text's paddingX 1:\n{text}");
+    assert!(rows[top + 2].trim().is_empty(), "Spacer(1) after the title:\n{text}");
+    assert!(rows[top + 3].trim().is_empty(), "Markdown paddingY blank:\n{text}");
+    assert_eq!(
+        rows[top + 4], " No changelog entries found.",
+        "body inset by Markdown's paddingX 1:\n{text}"
+    );
+    assert!(rows[top + 5].trim().is_empty(), "trailing paddingY blank:\n{text}");
+    assert_eq!(rows[top + 6].trim_end(), rule, "closing rule:\n{text}");
+}
+
+#[test]
+fn hotkeys_command_pushes_a_scrollback_block_and_no_overlay() {
     let mut app = new_app();
     assert!(!app.overlay_open());
     assert_eq!(submit(&mut app, "/hotkeys"), AppAction::Redraw);
-    // The hotkeys help is now a dismissable floating overlay (spec/tui/05 §2), not a scrollback block.
-    assert!(app.overlay_open(), "/hotkeys opens the overlay z-stack");
+    // `handleHotkeysCommand` (interactive-mode.ts:6197-6203) calls `chatContainer.addChild(...)` six
+    // times and never touches `ui.showOverlay`; the help is scrollback, exactly like `/changelog`
+    // (:6067-6072). This assertion previously demanded the opposite.
+    assert!(!app.overlay_open(), "/hotkeys must not open the overlay z-stack");
     assert!(
-        !app.state()
+        app.state()
             .transcript
             .pending()
             .iter()
-            .any(|e| matches!(e, Entry::Block { .. })),
-        "no scrollback block is pushed",
+            .any(|e| matches!(e, Entry::Block { title, .. } if title == "Keyboard Shortcuts")),
+        "a `Keyboard Shortcuts` scrollback block is pushed",
     );
 }
 

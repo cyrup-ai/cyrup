@@ -140,8 +140,8 @@ pub fn discover_and_merge(
 
 /// Apply the `subagents.*` settings layer to an already-merged agent map, in place (arch-SA
 /// §6.2.1; a direct port of pi's `applySubagentDefaultModel` + `applyBuiltinOverrides` +
-/// `applyCustomAgentOverrides`, `agents.ts:730-943`, driven from `discoverAgents`,
-/// `agents.ts:1282-1322`).
+/// `applyCustomAgentOverrides`, `agents.ts:935-1213`, driven from `discoverAgents`,
+/// `agents.ts:1731-1780`).
 ///
 /// **Tier 7 — real two-scope threading.** [`LayeredOverrideSettings`] carries the user- and
 /// project-scope settings UNFLATTENED (each with its own `settings.json` path), so this function
@@ -154,13 +154,13 @@ pub fn discover_and_merge(
 /// read, running them here over the already-merged winner (dispatched by `agent.source`) is
 /// observably identical — and the surviving winner is the only agent whose provenance is visible:
 ///
-/// - `applySubagentDefaultModel` (`agents.ts:730-739`): fill every model-less agent from the
+/// - `applySubagentDefaultModel` (`agents.ts:935-944`): fill every model-less agent from the
 ///   resolved (project-over-user) `defaultModel`.
-/// - `applyBuiltinOverrides` (`agents.ts:785-838`): for each [`AgentSource::Builtin`] agent, in
+/// - `applyBuiltinOverrides` (`agents.ts:1039-1092`): for each [`AgentSource::Builtin`] agent, in
 ///   pi's exact branch order — project override ▷ project bulk-disable ▷ user override ▷ user
 ///   bulk-disable ▷ none — then the `disableThinking` clear (BUILTINS ONLY, skipped when the
 ///   winning-scope override already set `thinking`).
-/// - `applyCustomAgentOverrides` (`agents.ts:923-943`): for each [`AgentSource::User`]/
+/// - `applyCustomAgentOverrides` (`agents.ts:1193-1213`): for each [`AgentSource::User`]/
 ///   [`AgentSource::Project`] agent, project override ▷ user override (fill-unset-only; the applied
 ///   `scope` is the SETTINGS scope, never the agent's own source). `systemPrompt` and
 ///   `disableBuiltins`/`disableThinking` are BUILTIN-only — custom agents never see them.
@@ -172,6 +172,10 @@ pub fn apply_overrides(
     // project scope exists and declares one), then fill every model-less agent BEFORE per-agent
     // overrides run so an explicit `agentOverrides.<name>.model` still wins by overwriting it.
     apply_default_model(merged, resolve_default_model(settings).as_deref());
+    // applySubagentDefaults (agents.ts:986-996) runs model -> thinking -> extensions, all three
+    // BEFORE per-agent overrides, and all three fill-only-if-unset.
+    apply_default_thinking(merged, resolve_default_thinking(settings).as_deref());
+    apply_default_extensions(merged, resolve_default_extensions(settings).as_deref());
 
     // applyBuiltinOverrides header (agents.ts:792-798): resolve the bulk-disable / disableThinking
     // scope selection ONCE, up front, exactly as pi does before mapping over the builtin list.
@@ -214,7 +218,7 @@ pub fn apply_overrides(
     Ok(())
 }
 
-/// pi `resolveSubagentDefaultModel` (`agents.ts:716-728`): the project-scope `defaultModel` wins
+/// pi `resolveSubagentDefaultModel` (`agents.ts:921-933`): the project-scope `defaultModel` wins
 /// when the project scope exists and declares one, else the user-scope value (or `None`).
 fn resolve_default_model(settings: &LayeredOverrideSettings) -> Option<String> {
     if settings.project_settings_path.is_some()
@@ -225,7 +229,7 @@ fn resolve_default_model(settings: &LayeredOverrideSettings) -> Option<String> {
     settings.user.default_model.clone()
 }
 
-/// pi `applySubagentDefaultModel` (`agents.ts:730-739`): fill every agent that has no resolved
+/// pi `applySubagentDefaultModel` (`agents.ts:935-944`): fill every agent that has no resolved
 /// `model` from the (already project-over-user resolved) `defaultModel`, stamping
 /// [`AgentModelSourceInfo::SettingsDefault`] provenance so management/`/subagents-doctor` surfaces
 /// can report *why* the model resolved that way. Runs before per-agent overrides so an explicit
@@ -243,7 +247,74 @@ fn apply_default_model(merged: &mut HashMap<String, AgentDefinition>, default_mo
     }
 }
 
-/// pi `applyBuiltinOverrides`' per-agent body (`agents.ts:805-836`) for ONE builtin agent: pick the
+/// pi `resolveSubagentDefaultThinking` (`agents.ts:946-953`): the project-scope value wins when the
+/// project scope exists and declares one, else the user-scope value.
+fn resolve_default_thinking(settings: &LayeredOverrideSettings) -> Option<String> {
+    if settings.project_settings_path.is_some()
+        && let Some(dt) = settings.project.default_thinking.as_ref()
+    {
+        return Some(dt.clone());
+    }
+    settings.user.default_thinking.clone()
+}
+
+/// pi `applySubagentDefaultThinking` (`agents.ts:955-964`): fill every agent whose `thinking` is
+/// UNSET from the resolved `defaultThinking`. `Some("off")` is an EXPLICIT off (see
+/// [`AgentDefinition::thinking`]) and therefore counts as set — pi's guard is
+/// `agent.thinking !== undefined`, and its `thinking: false` (cyrup's `Some("off")`) is likewise not
+/// `undefined`, so an agent that explicitly opted out is never re-armed by the default.
+///
+/// Runs BEFORE per-agent overrides so an explicit `agentOverrides.<name>.thinking` still wins, and
+/// before the builtin `disableThinking` clear so `disableThinking: true` still strips it.
+fn apply_default_thinking(
+    merged: &mut HashMap<String, AgentDefinition>,
+    default_thinking: Option<&str>,
+) {
+    let Some(dt) = default_thinking else {
+        return;
+    };
+    for agent in merged.values_mut() {
+        if agent.thinking.is_none() {
+            agent.thinking = Some(dt.to_string());
+        }
+    }
+}
+
+/// pi `resolveSubagentDefaultExtensions` (`agents.ts:966-973`): project-wins-outright, same shape as
+/// [`resolve_default_thinking`].
+fn resolve_default_extensions(settings: &LayeredOverrideSettings) -> Option<Vec<String>> {
+    if settings.project_settings_path.is_some()
+        && let Some(de) = settings.project.default_extensions.as_ref()
+    {
+        return Some(de.clone());
+    }
+    settings.user.default_extensions.clone()
+}
+
+/// pi `applySubagentDefaultExtensions` (`agents.ts:975-984`): fill every agent whose `extensions` is
+/// UNSET (`None` — "all extensions visible") from the resolved `defaultExtensions`, and stamp
+/// [`AgentDefinition::extensions_from_default`] so the value is never mistaken for the agent's own
+/// declaration by `editable_base`/`clone_override_base`.
+///
+/// An agent that declared `extensions:` explicitly — INCLUDING an explicitly-empty list, which is
+/// `Some(vec![])` and means "no extensions" — keeps its own value, matching pi's
+/// `agent.extensions !== undefined` guard.
+fn apply_default_extensions(
+    merged: &mut HashMap<String, AgentDefinition>,
+    default_extensions: Option<&[String]>,
+) {
+    let Some(de) = default_extensions else {
+        return;
+    };
+    for agent in merged.values_mut() {
+        if agent.extensions.is_none() {
+            agent.extensions = Some(de.to_vec());
+            agent.extensions_from_default = true;
+        }
+    }
+}
+
+/// pi `applyBuiltinOverrides`' per-agent body (`agents.ts:1059-1090`) for ONE builtin agent: pick the
 /// single winning override / bulk-disable in pi's exact branch order (project override ▷ project
 /// bulk-disable ▷ user override ▷ user bulk-disable ▷ none), apply it with the true settings scope +
 /// path, then run the `disableThinking` clear unless the winning-scope override explicitly set
@@ -296,7 +367,7 @@ fn apply_builtin_agent(
 }
 
 /// The `{ disabled: true }` override delta pi's bulk-disable arms pass to `applyBuiltinOverride`
-/// (`agents.ts:816/831`).
+/// (`agents.ts:1070/831`).
 fn disable_delta() -> AgentOverrideConfig {
     AgentOverrideConfig {
         disabled: OverrideField::Value(true),
@@ -304,7 +375,7 @@ fn disable_delta() -> AgentOverrideConfig {
     }
 }
 
-/// pi `applyBuiltinOverride` (`agents.ts:741-774`): full-replace every field the delta states
+/// pi `applyBuiltinOverride` (`agents.ts:998-1031`): full-replace every field the delta states
 /// (`Value` sets, `ExplicitClear` resets to the field's absent value, `Unset` is left alone), and
 /// record [`AgentOverrideInfo`] provenance with `base` = the agent snapshot BEFORE this override.
 /// pi's callers only ever pass a non-empty delta — a parsed override entry with no fields is dropped
@@ -360,7 +431,7 @@ fn apply_builtin_override(
         Some(*v)
     });
     apply_field_full_replace(&mut agent.disabled, &delta.disabled, None, |v| Some(*v));
-    // pi `systemPrompt` (agents.ts:761): replace the BUILTIN persona's own body prose.
+    // pi `systemPrompt` (agents.ts:1018): replace the BUILTIN persona's own body prose.
     apply_field_full_replace(
         &mut agent.system_prompt_body,
         &delta.system_prompt,
@@ -393,7 +464,7 @@ fn apply_builtin_override(
     });
 }
 
-/// pi `clearBuiltinThinking` (`agents.ts:776-783`): a no-op when the agent has no `thinking`;
+/// pi `clearBuiltinThinking` (`agents.ts:1033-1037`): a no-op when the agent has no `thinking`;
 /// otherwise drop `thinking` and record disable-thinking provenance ONLY if the agent has no
 /// override recorded yet (a per-agent override already applied in this pass keeps its own
 /// provenance/base). The snapshot is captured BEFORE the clear.
@@ -441,7 +512,7 @@ fn apply_field_full_replace<T, F>(
     }
 }
 
-/// pi `applyCustomAgentOverrides`' per-agent body (`agents.ts:930-942`): project override wins over
+/// pi `applyCustomAgentOverrides`' per-agent body (`agents.ts:1200-1212`): project override wins over
 /// user override; only ONE is ever applied, with the SETTINGS scope/path (never the agent's own
 /// source). The project branch is gated on the project scope actually existing.
 fn apply_custom_agent(agent: &mut AgentDefinition, settings: &LayeredOverrideSettings) {
@@ -460,7 +531,7 @@ fn apply_custom_agent(agent: &mut AgentDefinition, settings: &LayeredOverrideSet
     }
 }
 
-/// pi `applyCustomAgentOverride` (`agents.ts:845-921`): fill-unset-only — a field is applied only
+/// pi `applyCustomAgentOverride` (`agents.ts:1099-1191`): fill-unset-only — a field is applied only
 /// when its frontmatter key was absent from the agent's own on-disk frontmatter (an explicitly
 /// present field blocks the override for that field unconditionally, regardless of the delta's own
 /// value). `systemPrompt` is deliberately NOT a custom-agent override (pi omits it here — it only
@@ -693,8 +764,10 @@ mod tests {
             local_name: name.to_string(),
             package_name: None,
             description: format!("{name} description"),
+            aliases: Vec::new(),
             tools: None,
             extensions: None,
+            extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
             model: None,
             fallback_models: Vec::new(),
@@ -710,6 +783,10 @@ mod tests {
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            memory: None,
+            tool_budget: None,
             disabled: None,
             system_prompt_body: format!("{name} body"),
             source,
@@ -1012,7 +1089,7 @@ mod tests {
 
     #[test]
     fn system_prompt_override_replaces_a_builtin_body() {
-        // pi `applyBuiltinOverride` (agents.ts:761): a `systemPrompt` override replaces the builtin
+        // pi `applyBuiltinOverride` (agents.ts:1018): a `systemPrompt` override replaces the builtin
         // persona's own body prose. This is one of the six fields an earlier port dropped.
         let mut merged = HashMap::new();
         let mut a = agent("reviewer", AgentSource::Builtin, "/builtin/reviewer.md");

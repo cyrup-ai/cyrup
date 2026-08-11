@@ -214,6 +214,10 @@ pub enum ApiStreamOptions {
     OpenAiResponses(crate::api::openai_responses::OpenAiResponsesOptions),
     /// Options for the `azure-openai-responses` wire protocol.
     AzureOpenAiResponses(crate::api::azure_openai_responses::AzureOpenAiResponsesOptions),
+    /// Options for the `openai-codex-responses` wire protocol.
+    OpenAiCodexResponses(crate::api::openai_codex_responses::OpenAiCodexResponsesOptions),
+    /// Options for the `bedrock-converse-stream` wire protocol.
+    Bedrock(crate::api::bedrock_converse_stream::BedrockOptions),
     /// Options for the `google-generative-ai` wire protocol.
     Google(crate::api::google_generative_ai::GoogleOptions),
     /// Options for the `mistral-conversations` wire protocol.
@@ -245,6 +249,24 @@ impl ApiStreamOptions {
     ) -> Option<&crate::api::azure_openai_responses::AzureOpenAiResponsesOptions> {
         match self {
             ApiStreamOptions::AzureOpenAiResponses(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The `openai-codex-responses` options, if this is that variant.
+    pub fn openai_codex_responses(
+        &self,
+    ) -> Option<&crate::api::openai_codex_responses::OpenAiCodexResponsesOptions> {
+        match self {
+            ApiStreamOptions::OpenAiCodexResponses(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The `bedrock-converse-stream` options, if this is that variant.
+    pub fn bedrock(&self) -> Option<&crate::api::bedrock_converse_stream::BedrockOptions> {
+        match self {
+            ApiStreamOptions::Bedrock(o) => Some(o),
             _ => None,
         }
     }
@@ -310,16 +332,21 @@ impl StreamOptions {
 pub const PENDING_AT_TERMINAL: &str = "stream ended without a stop reason";
 
 /// Terminal-`done` reason. Pi narrows the `done` event's `reason` to
-/// `Extract<StopReason, "stop" | "length" | "toolUse">` (Pi types.ts:464), so cyrup mirrors that
-/// with a dedicated enum rather than the full [`StopReason`] (arch-01 §3.3). `rename_all="camelCase"`
-/// makes the wire bytes byte-1:1 with the matching [`StopReason`] values: `"stop"`, `"length"`,
-/// `"toolUse"`.
+/// `Extract<StopReason, "stop" | "length" | "toolUse" | "deferred">`
+/// (`v0.84.1 ai/src/types.ts:527-531`; the same union without `"deferred"` at
+/// `v0.83.0 ai/src/types.ts:464`), so cyrup mirrors that with a dedicated enum rather than the full
+/// [`StopReason`] (arch-01 §3.3). `rename_all="camelCase"` makes the wire bytes byte-1:1 with the
+/// matching [`StopReason`] values: `"stop"`, `"length"`, `"toolUse"`, `"deferred"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DoneReason {
     Stop,
     Length,
     ToolUse,
+    /// The provider returned a durable handle instead of a completed turn. A **success** terminal
+    /// in Pi's union — see [`cyrup_core::StopReason::Deferred`]. No cyrup wire api produces it
+    /// today; it exists so the narrowing stays total against Pi's.
+    Deferred,
 }
 
 /// Terminal-`error` reason. Pi narrows the `error` event's `reason` to
@@ -339,6 +366,7 @@ impl From<DoneReason> for StopReason {
             DoneReason::Stop => StopReason::Stop,
             DoneReason::Length => StopReason::Length,
             DoneReason::ToolUse => StopReason::ToolUse,
+            DoneReason::Deferred => StopReason::Deferred,
         }
     }
 }
@@ -363,6 +391,9 @@ impl TryFrom<StopReason> for DoneReason {
             StopReason::Stop => Ok(DoneReason::Stop),
             StopReason::Length => Ok(DoneReason::Length),
             StopReason::ToolUse => Ok(DoneReason::ToolUse),
+            // `deferred` is in Pi's `done` extract (`v0.84.1 ai/src/types.ts:529`), NOT its `error`
+            // one — a deferred turn is an accepted request, not a failure.
+            StopReason::Deferred => Ok(DoneReason::Deferred),
             StopReason::Error => Err(ErrorReason::Error),
             StopReason::Aborted => Err(ErrorReason::Aborted),
             // `pending` is Pi's in-flight sentinel and is NOT in its `done` extract (types.ts:464).
@@ -652,7 +683,9 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
             timestamp: 0,
         }
     }

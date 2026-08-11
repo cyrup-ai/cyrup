@@ -104,7 +104,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         let Ok(guest) = guest_of(self) else { return };
         let spec: Value = serde_json::from_str(&spec_json).unwrap_or(Value::Null);
         guest.set_flag(name.clone(), spec.clone());
-        let _ = guest.registry.set_flag(name, spec);
+        // Owner-attributed so Pi's first-wins flag rule (`getFlags`, runner.ts:473-483) and its
+        // `Flag "--x" conflicts with <owner>` diagnostic apply to a guest's `registerFlag`.
+        let _ = guest.registry.register_flag(guest.owner.clone(), name, spec);
     }
 
     async fn get_flag(&mut self, name: String) -> Option<String> {
@@ -129,6 +131,18 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         // guest (Pi `getMessageRenderer`, runner.ts:579-587) — the per-guest `GuestState` vec below
         // is host-side bookkeeping only and no consumer can reach it by custom type (EXT-006).
         let _ = guest.registry.register_message_renderer(guest.owner.clone(), custom_type.clone());
+        guest.add_renderer(custom_type);
+    }
+
+    /// X15 — the custom-ENTRY renderer surface (Pi `registerEntryRenderer`, types.ts:1295, stored
+    /// in `extension.entryRenderers` at loader.ts:314-318 and resolved by
+    /// `runner.ts:593-600 getEntryRenderer`). A SEPARATE registry table from the message one above:
+    /// the two draw different things when the renderer throws (`custom-entry.ts:47-52` vs
+    /// `custom-message.ts:82-84`). Rendering itself still travels over the guest's `render-call`
+    /// export — see `ExtensionHost::render_entry` for why the world has no fourth export.
+    async fn register_entry_renderer(&mut self, custom_type: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        let _ = guest.registry.register_entry_renderer(guest.owner.clone(), custom_type.clone());
         guest.add_renderer(custom_type);
     }
 

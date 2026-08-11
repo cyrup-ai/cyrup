@@ -185,19 +185,23 @@ pub fn format_saved_trust(saved: &Option<TrustEntry>) -> String {
     }
 }
 
+/// The option matching the persisted decision, if any (Pi `isSavedOption`,
+/// `trust-selector.ts:92-98`): its trust flag AND its saved path both equal the nearest saved
+/// decision's. This is what drives the ` ✓` saved-decision marker (S20); it is deliberately
+/// `Option`, because upstream distinguishes "no option matches" from "option 0 matches".
+pub fn trust_saved_index(options: &[TrustOption], saved: &Option<TrustEntry>) -> Option<usize> {
+    options.iter().position(|o| {
+        saved.as_ref().is_some_and(|s| {
+            s.decision.is_trusted() == o.trusted && o.saved_path.as_deref() == Some(s.path.as_path())
+        })
+    })
+}
+
 /// The preselected option index for the trust prompt (Pi `app.rs::OpenSelector(Trust)` selection
 /// logic): the option whose trust + saved path matches the nearest saved decision, else the first
-/// option (`Trust`).
+/// option (`Trust`) — Pi's `Math.max(0, findIndex(isSavedOption))`, `trust-selector.ts:45-48`.
 pub fn trust_selected_index(options: &[TrustOption], saved: &Option<TrustEntry>) -> usize {
-    options
-        .iter()
-        .position(|o| {
-            saved.as_ref().is_some_and(|s| {
-                s.decision.is_trusted() == o.trusted
-                    && o.saved_path.as_deref() == Some(s.path.as_path())
-            })
-        })
-        .unwrap_or(0)
+    trust_saved_index(options, saved).unwrap_or(0)
 }
 
 /// What the project-trust prompt resolved to.
@@ -249,7 +253,9 @@ pub fn run_trust_prompt(
         false,
         labels,
         selected,
-    );
+    )
+    // S20: the ` ✓` on the option the trust store already holds (`trust-selector.ts:109-110`).
+    .with_saved_index(trust_saved_index(options, saved));
     let keymap = SelectKeymap::default();
     let outcome = run_startup_selector(theme, &keymap, &mut selector, |_| {})?;
     match interpret_trust(&outcome, options) {
