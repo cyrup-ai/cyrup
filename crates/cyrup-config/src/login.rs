@@ -1280,25 +1280,21 @@ mod tests {
 
     // --------------------------------------------------------------- login/out
 
-    fn temp_store(name: &str) -> (AuthStore, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "cyrup-login-{}-{}",
-            name,
-            std::process::id() as u64 * 1_000_000
-                + std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos() as u64)
-                    .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        (AuthStore::at(path.clone()), path)
+    /// The returned `TempDir` guard owns the directory's lifetime — callers MUST bind it
+    /// (`let (store, _path, _dir) = temp_store("x");`) or the tree is deleted before use.
+    fn temp_store(name: &str) -> (AuthStore, std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("cyrup-login-{name}-"))
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("auth.json");
+        (AuthStore::at(path.clone()), path, dir)
     }
 
     /// `Models.login` for OAuth: run the flow, then write what it returned (`models.ts:437-438`).
     #[tokio::test]
     async fn oauth_login_persists_the_flow_credential() {
-        let (store, _path) = temp_store("oauth");
+        let (store, _path, _dir) = temp_store("oauth");
         let providers = vec![both_provider("anthropic", "Anthropic", None)];
         let interaction = ScriptedInteraction::new(vec![Ok("code".to_string())]);
 
@@ -1324,7 +1320,7 @@ mod tests {
     /// (`ai/src/auth/helpers.ts:12-13`).
     #[tokio::test]
     async fn api_key_login_prompts_for_a_secret_and_persists_it() {
-        let (store, _path) = temp_store("apikey");
+        let (store, _path, _dir) = temp_store("apikey");
         let providers = vec![env_key_provider("openrouter", "OpenRouter")];
         let interaction = ScriptedInteraction::new(vec![Ok("sk-or-v1-abc".to_string())]);
 
@@ -1392,7 +1388,7 @@ mod tests {
     /// `throw new ModelsError("provider", \`Unknown provider: ${providerId}\`)` (`models.ts:433`).
     #[tokio::test]
     async fn unknown_provider_message_and_code() {
-        let (store, _path) = temp_store("unknown");
+        let (store, _path, _dir) = temp_store("unknown");
         let interaction = ScriptedInteraction::new(vec![Ok("x".to_string())]);
         let error = login(
             &store,
@@ -1411,7 +1407,7 @@ mod tests {
     /// name, and the wire spelling of the type.
     #[tokio::test]
     async fn unsupported_method_message_and_code() {
-        let (store, _path) = temp_store("unsupported");
+        let (store, _path, _dir) = temp_store("unsupported");
         let providers = vec![env_key_provider("openrouter", "OpenRouter")];
         let interaction = ScriptedInteraction::new(Vec::new());
 
@@ -1449,7 +1445,7 @@ mod tests {
     /// (`models.ts:437` runs before `:438`; `interactive-mode.ts:5319` compares the message).
     #[tokio::test]
     async fn cancelled_login_writes_nothing_and_keeps_the_message() {
-        let (store, path) = temp_store("cancel");
+        let (store, path, _dir) = temp_store("cancel");
         let providers = vec![env_key_provider("openrouter", "OpenRouter")];
         let interaction = ScriptedInteraction::new(vec![Err(OAuthError::Cancelled)]);
 
@@ -1473,7 +1469,7 @@ mod tests {
     /// `Models.logout` deletes the stored credential (`models.ts:447-451`).
     #[tokio::test]
     async fn logout_removes_the_stored_credential() {
-        let (store, _path) = temp_store("logout");
+        let (store, _path, _dir) = temp_store("logout");
         let providers = vec![env_key_provider("openrouter", "OpenRouter")];
         let interaction = ScriptedInteraction::new(vec![Ok("sk".to_string())]);
         let id = ProviderId::from("openrouter");
@@ -1538,7 +1534,7 @@ mod tests {
     /// `"stored credential"` (`interactive-mode.ts:4890-4897`).
     #[tokio::test]
     async fn logout_options_come_from_the_store_only() {
-        let (store, _path) = temp_store("logout-rows");
+        let (store, _path, _dir) = temp_store("logout-rows");
         let providers = vec![
             env_key_provider("openrouter", "OpenRouter"),
             both_provider("anthropic", "Anthropic", None),
@@ -1600,7 +1596,7 @@ mod tests {
     /// session's `AuthStore`, Pi main.ts:764) then the `/logout` slash command / `Logout` selector.
     #[tokio::test]
     async fn logout_options_include_a_runtime_api_key_provider() {
-        let (store, _path) = temp_store("logout-runtime");
+        let (store, _path, _dir) = temp_store("logout-runtime");
         let providers = vec![
             env_key_provider("openrouter", "OpenRouter"),
             both_provider("anthropic", "Anthropic", None),
@@ -1632,7 +1628,7 @@ mod tests {
     /// then given `--api-key` enumerates as `api_key`, and is listed exactly once.
     #[tokio::test]
     async fn runtime_api_key_overrides_the_stored_credential_type_once() {
-        let (store, _path) = temp_store("logout-runtime-override");
+        let (store, _path, _dir) = temp_store("logout-runtime-override");
         let id = ProviderId::from("anthropic");
         store
             .modify(&id, |_| async {
@@ -1662,7 +1658,7 @@ mod tests {
     /// (`model-runtime.ts:429-436`).
     #[tokio::test]
     async fn provider_auth_status_covers_runtime_stored_and_nothing() {
-        let (store, _path) = temp_store("status");
+        let (store, _path, _dir) = temp_store("status");
         let id = ProviderId::from("openrouter");
 
         assert_eq!(

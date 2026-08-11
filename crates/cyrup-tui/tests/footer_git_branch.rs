@@ -13,21 +13,31 @@
 //! the live-refresh path (`App::poll_footer_git_branch`) the run loop's poll tick drives.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use cyrup_tui::{App, UiTheme};
 use ratatui::backend::TestBackend;
 
+/// A temp dir that deletes itself when dropped, derefing to [`Path`] so it is still used
+/// directly as one. The guard MUST stay bound for the whole test.
+struct Scratch(tempfile::TempDir);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
 /// A private scratch dir; `name` keeps concurrent tests in this file off each other's files.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "cyrup-footer-branch-{name}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(name: &str) -> Scratch {
+    Scratch(
+        tempfile::Builder::new()
+            .prefix(&format!("cyrup-footer-branch-{name}-"))
+            .tempdir()
+            .unwrap(),
+    )
 }
 
 /// A `.git` directory holding `head` — enough for the footer, which READS HEAD rather than shelling

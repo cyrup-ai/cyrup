@@ -507,16 +507,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn store() -> (AuthStore, PathBuf) {
+    /// The returned `TempDir` guard owns the directory's lifetime — callers MUST bind it
+    /// (`let (s, _p, _dir) = store();`) or the tree is deleted before the test runs.
+    fn store() -> (AuthStore, PathBuf, crate::test_util::TempDir) {
         let dir = crate::test_util::temp_dir();
         let path = dir.join("agent").join("auth.json");
-        (AuthStore::at(path.clone()), path)
+        (AuthStore::at(path.clone()), path, dir)
     }
 
     #[tokio::test]
     async fn stored_over_env_then_delete_falls_back() {
         // A-07-5: stored credential used over env; delete → env.
-        let (s, _p) = store();
+        let (s, _p, _dir) = store();
         let provider = ProviderId::from("anthropic");
         s.modify(&provider, |_| async {
             Ok(Some(Credential::api_key("stored-key")))
@@ -592,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_refresh_failure_preserves_credential() {
         // R-07-017: a failure in `f` does not write; the stored credential is preserved.
-        let (s, _p) = store();
+        let (s, _p, _dir) = store();
         let provider = ProviderId::from("claude");
         let original = Credential::Oauth {
             refresh: "r".into(),
@@ -654,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_providers_proceed() {
-        let (s, _p) = store();
+        let (s, _p, _dir) = store();
         let a = ProviderId::from("a");
         let b = ProviderId::from("b");
         s.modify(&a, |_| async { Ok(Some(Credential::api_key("ka"))) })
@@ -678,7 +680,7 @@ mod tests {
     async fn owner_only_permissions() {
         // A-07-9 / R-07-014
         use std::os::unix::fs::PermissionsExt;
-        let (s, path) = store();
+        let (s, path, _dir) = store();
         let provider = ProviderId::from("x");
         s.modify(&provider, |_| async { Ok(Some(Credential::api_key("k"))) })
             .await
@@ -701,7 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_api_key_resolves_template_and_runtime_and_env() {
-        let (s, _p) = store();
+        let (s, _p, _dir) = store();
         let provider = ProviderId::from("acme-test-provider");
         // stored value is a `$VAR` template resolved via the credential's scoped env map.
         s.modify(&provider, |_| async {
@@ -746,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_api_key_oauth_expiry() {
-        let (s, _p) = store();
+        let (s, _p, _dir) = store();
         let provider = ProviderId::from("oauth-prov");
         // valid (future) access token is returned.
         let future = unix_millis() + 600_000;
@@ -783,7 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_status_sources() {
-        let (s, _p) = store();
+        let (s, _p, _dir) = store();
         let openai = ProviderId::from("openai");
         // environment source with label.
         let env: HashMap<String, String> =
@@ -805,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn get_provider_env_returns_scoped_env_for_api_key_only() {
         // Pi AuthStorage.getProviderEnv (auth-storage.ts:305-308).
-        let (s, _p) = store();
+        let (s, _p, _dir) = store();
         let prov = ProviderId::from("acme");
         // api_key with env → Some(copy).
         s.modify(&prov, |_| async {
@@ -850,7 +852,7 @@ mod tests {
     #[tokio::test]
     async fn list_enumerates_providers_with_credentials() {
         // Pi AuthStorage.list (auth-storage.ts:329-331).
-        let (s, _p) = store();
+        let (s, _p, _dir) = store();
         assert!(s.list().unwrap().is_empty());
         s.modify(&ProviderId::from("openai"), |_| async {
             Ok(Some(Credential::api_key("a")))

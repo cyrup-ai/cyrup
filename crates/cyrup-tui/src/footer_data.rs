@@ -234,15 +234,29 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
 
-    fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "cyrup-footer-git-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A temp dir that deletes itself when dropped, derefing to [`Path`] so it is still used
+    /// directly as one (`root.join("x")`, `&root` where `&Path` is wanted).
+    ///
+    /// The guard MUST stay bound for the whole test (`let root = tmp("x");`); dropping it into
+    /// a temporary (`tmp("x").join(..)`) deletes the tree before the test uses it.
+    struct TempRoot(tempfile::TempDir);
+
+    impl std::ops::Deref for TempRoot {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    /// A fresh scratch root; `name` keeps the dirs of concurrent tests distinguishable.
+    fn tmp(name: &str) -> TempRoot {
+        TempRoot(
+            tempfile::Builder::new()
+                .prefix(&format!("cyrup-footer-git-{name}-"))
+                .tempdir()
+                .unwrap(),
+        )
     }
 
     /// Build a plain `.git` directory holding `head` as its HEAD content.
@@ -256,7 +270,7 @@ mod tests {
         let root = tmp("plain");
         plain_repo(&root, "ref: refs/heads/david/cyrup\n");
         let paths = find_git_paths(&root).unwrap();
-        assert_eq!(paths.repo_dir, root);
+        assert_eq!(paths.repo_dir, *root);
         assert_eq!(paths.common_git_dir, root.join(".git"));
         assert_eq!(resolve_branch(&paths).as_deref(), Some("david/cyrup"));
     }

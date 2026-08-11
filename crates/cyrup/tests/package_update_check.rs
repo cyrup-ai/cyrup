@@ -48,16 +48,27 @@ fn git(cwd: &Path, args: &[&str]) {
     );
 }
 
-/// A scratch root, wiped on entry so a crashed previous run cannot poison this one.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "cyrup-pkg-update-{name}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A temp dir that deletes itself when dropped, derefing to [`Path`] so it is still used
+/// directly as one. The guard MUST stay bound for the whole test.
+struct Scratch(tempfile::TempDir);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+/// A scratch root, unique per call, so a crashed previous run cannot poison this one and
+/// nothing is left under `/tmp` afterwards.
+fn scratch(name: &str) -> Scratch {
+    Scratch(
+        tempfile::Builder::new()
+            .prefix(&format!("cyrup-pkg-update-{name}-"))
+            .tempdir()
+            .unwrap(),
+    )
 }
 
 /// An `origin` repo with one commit, plus a clone of it. Returns `(origin, clone)`.

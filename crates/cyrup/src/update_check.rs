@@ -332,9 +332,12 @@ mod tests {
     /// hand-deleted package out of the notification.
     #[tokio::test]
     async fn a_non_repo_install_dir_reports_no_update() {
-        let dir = std::env::temp_dir().join(format!("cyrup-upd-notrepo-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(!git_has_available_update(&dir).await);
+        // `TempDir` (not a hand-rolled `temp_dir().join(..)`) so the directory is removed when
+        // the guard drops instead of accumulating one per run under `/tmp`.
+        let dir = tempfile::Builder::new()
+            .prefix("cyrup-upd-notrepo-")
+            .tempdir()
+            .unwrap();
+        assert!(!git_has_available_update(dir.path()).await);
     }
 }
