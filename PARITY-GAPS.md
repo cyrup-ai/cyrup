@@ -411,6 +411,10 @@ Two in-tree justifications were examined and do **not** close their items: `crat
 
 Found during batch 9's verification passes. None is started; all are evidenced.
 
+**G148 — FIXED in `ad4492e`.** *(Recorded as open in `5d2bc0b`, fixed 16 minutes later. Kept for
+the record because the blast radius turned out to be larger than this entry describes: see the
+correction at the end.)*
+
 **G148 — a negative `minReferences` in `config.json` fails deserialization instead of falling back.**
 `crates/cyrup-ext-subagents/src/registration/mod.rs:367-376` types
 `ProactiveSkillSubagentsConfig`'s `minReferences`/`maxRecommendations` as `Option<u32>`, so
@@ -420,6 +424,16 @@ config fails to load. Upstream tolerates it: `positiveInteger`
 (`pi-subagents` v0.43.0 `src/agents/proactive-skills.ts:32-36`) returns undefined for `value < 1`
 and `resolveProactiveSkillSubagentsConfig` falls through to `DEFAULT_MIN_REFERENCES`. A config pi
 accepts breaks cyrup. Fix is `Option<i64>` plus the same `>= 1` filter the resolver already applies.
+
+*Correction, from the revert proof in `ad4492e`:* the consequence is not that the extension config
+"fails to load" and the proactive knobs are ignored. `load_subagent_extension_config`
+(`crates/cyrup/src/subagent_config.rs`) discards the **entire document** on any serde error and
+returns `SubagentExtensionConfig::default()` with only an `eprintln`. So one bad knob silently reset
+`maxSubagentDepth`, `globalConcurrencyLimit`, `parallel.maxTasks`, every `control.*` key,
+`chain.dynamicFanout.maxItems` and `worktreeSetupHook` to defaults. Reverting the fix makes the new
+test fail `left: 2, right: 5` — the configured `maxSubagentDepth` coming back as the default. This
+is the shape that would have been chased for a long time as a depth bug rather than a config-parse
+bug, and the `eprintln` is the only evidence a user would ever see.
 
 **G149 — widening the snapshot `action` enum survives mutation (untested, code correct).**
 No test feeds a snapshot whose `action` is neither `refine` nor `rollback`, though upstream throws
