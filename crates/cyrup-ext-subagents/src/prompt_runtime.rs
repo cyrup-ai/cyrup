@@ -1027,6 +1027,18 @@ pub struct SubagentPromptRuntime {
     /// the parent handed this child a [`STEER_INBOX_ENV`] path — i.e. only for a background/async
     /// child, which is the only kind that has an async run directory to steer through.
     steering: Option<Arc<SteeringInbox>>,
+    /// pi `registerChildWatchdog(pi)` (`subagent-prompt-runtime.ts:477`). `Some` only when the
+    /// parent armed this child through
+    /// [`crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV`] — the common case is `None`,
+    /// since a child watchdog is off unless the orchestrator's own `subagents.watchdog.children`
+    /// block turned it on. Owns its own [`crate::watchdog::runtime::MainWatchdogRuntime`], distinct
+    /// from the orchestrator's ([`crate::extension::SubagentsExtension::watchdog`]).
+    watchdog: Option<Arc<crate::watchdog::register_child::ChildWatchdog>>,
+    /// The late-bound capability backend the child watchdog's warning sink reads. `set_host_services`
+    /// runs before `init`, but the watchdog is built before BOTH (it has to be, to decide the
+    /// subscription set), so the sink resolves through this slot at delivery time. Shared with the
+    /// closure handed to [`crate::watchdog::register_child::register_child_watchdog`].
+    watchdog_services: Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
 }
 
 /// The live counter behind a `toolBudget:` — pi's three `registerToolBudget` closure variables
@@ -1063,6 +1075,8 @@ impl SubagentPromptRuntime {
             preserve_fanout_tool_history: false,
             tool_budget: None,
             steering: None,
+            watchdog: None,
+            watchdog_services: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1083,6 +1097,8 @@ impl SubagentPromptRuntime {
             preserve_fanout_tool_history,
             tool_budget: None,
             steering: None,
+            watchdog: None,
+            watchdog_services: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1123,6 +1139,26 @@ impl SubagentPromptRuntime {
     ) -> Self {
         self.intercom_fallback = tool;
         self
+    }
+
+    /// Attach the CHILD watchdog (pi `registerChildWatchdog(pi)`,
+    /// `subagent-prompt-runtime.ts:477`). `None` — the common case — leaves the child unwatched.
+    #[must_use]
+    pub fn with_watchdog(
+        mut self,
+        watchdog: Option<Arc<crate::watchdog::register_child::ChildWatchdog>>,
+        services: Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
+    ) -> Self {
+        self.watchdog = watchdog;
+        self.watchdog_services = services;
+        self
+    }
+
+    /// The child watchdog this runtime drives, if any — exposed so a test can drive the real
+    /// lifecycle instead of reaching into private state.
+    #[must_use]
+    pub fn watchdog(&self) -> Option<&Arc<crate::watchdog::register_child::ChildWatchdog>> {
+        self.watchdog.as_ref()
     }
 
     /// Attach the parent-supplied tool budget (pi `registerToolBudget`,
@@ -1203,6 +1239,19 @@ impl NativeExtension for SubagentPromptRuntime {
                 EventKind::TurnEnd,
             ]);
         }
+        // pi `registerChildWatchdog`'s own five `onRuntimeEvent` registrations
+        // (`watchdog/register-child.ts:89-115`). Subscribed only when the parent armed this child,
+        // so an unwatched child pays nothing — `before_agent_start` is already in the set when a
+        // prompt rewrite exists, and `EventKind` de-duplicates through the subscription bitset.
+        if self.watchdog.is_some() {
+            kinds.extend_from_slice(&[
+                EventKind::SessionStart,
+                EventKind::BeforeAgentStart,
+                EventKind::TurnEnd,
+                EventKind::AgentEnd,
+                EventKind::SessionShutdown,
+            ]);
+        }
         api.subscribe(&kinds);
         Ok(())
     }
@@ -1213,8 +1262,14 @@ impl NativeExtension for SubagentPromptRuntime {
     /// streaming). Without it the inbox drains into nothing.
     fn set_host_services(&self, services: Arc<dyn cyrup_ext::host::HostServices>) {
         if let Some(steering) = &self.steering {
-            steering.bind_services(services);
+            steering.bind_services(Arc::clone(&services));
         }
+        // The child watchdog's warning sink resolves through this slot — without it a displayed
+        // child warning has nowhere to go (pi's sink is `pi.sendMessage`, always available).
+        *self
+            .watchdog_services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(services);
     }
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
@@ -1232,6 +1287,30 @@ impl NativeExtension for SubagentPromptRuntime {
                 | HostEvent::ToolExecStart { .. }
                 | HostEvent::ToolExecEnd { .. }
                 | HostEvent::TurnEnd { .. } => steering.activate().await,
+                _ => {}
+            }
+        }
+        // pi `registerChildWatchdog`'s handlers (`watchdog/register-child.ts:89-115`). Like the
+        // steering block above they run FIRST and always fall through: the watchdog observes, it
+        // never blocks or mutates, so it must not swallow another handler's `HookOutcome`.
+        if let Some(watchdog) = &self.watchdog {
+            match ev {
+                HostEvent::SessionStart { .. } => watchdog.handle_session_start(&_ctx.cwd),
+                HostEvent::BeforeAgentStart { prompt, system_prompt, .. } => watchdog
+                    .handle_before_agent_start(
+                        &serde_json::json!({ "prompt": prompt, "systemPrompt": system_prompt }),
+                        &_ctx.cwd,
+                    ),
+                HostEvent::TurnEnd { message, tool_results, .. } => watchdog.handle_turn_end(
+                    &serde_json::json!({
+                        "type": "turn_end",
+                        "message": message,
+                        "toolResults": tool_results,
+                    }),
+                    &_ctx.cwd,
+                ),
+                HostEvent::AgentEnd { .. } => watchdog.handle_agent_end(&_ctx.cwd).await,
+                HostEvent::SessionShutdown { .. } => watchdog.handle_session_shutdown(),
                 _ => {}
             }
         }
@@ -1438,12 +1517,33 @@ pub fn prompt_runtime_extension_from(
     // and a poller would drain unrelated files from it.
     let steer_inbox = non_empty(STEER_INBOX_ENV).map(PathBuf::from);
 
+    // pi `registerChildWatchdog(pi)` (`subagent-prompt-runtime.ts:477`), which reads
+    // `process.env[CHILD_WATCHDOG_CONFIG_ENV]` itself. `None` for every child the orchestrator did
+    // not arm, which is the default.
+    let watchdog_services: Arc<
+        std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>,
+    > = Arc::new(std::sync::Mutex::new(None));
+    let sink_services = Arc::clone(&watchdog_services);
+    let watchdog = crate::watchdog::register_child::register_child_watchdog(
+        get(crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV).as_deref(),
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        Arc::new(move || {
+            sink_services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }),
+        None,
+        crate::watchdog::register_child::stdout_status_sink(),
+    );
+
     if tool.is_none()
         && rewrite.is_none()
         && supervisor_tool.is_none()
         && intercom_fallback.is_none()
         && tool_budget.is_none()
         && steer_inbox.is_none()
+        && watchdog.is_none()
     {
         return None;
     }
@@ -1452,7 +1552,8 @@ pub fn prompt_runtime_extension_from(
             .with_supervisor_tool(supervisor_tool)
             .with_intercom_fallback(intercom_fallback)
             .with_tool_budget(tool_budget)
-            .with_steering_inbox(steer_inbox),
+            .with_steering_inbox(steer_inbox)
+            .with_watchdog(watchdog, watchdog_services),
     ) as Arc<dyn NativeExtension>)
 }
 

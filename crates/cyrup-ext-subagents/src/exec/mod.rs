@@ -1709,6 +1709,37 @@ pub fn build_attempt_spawn_plan(
         env_overlay.insert(PARENT_SESSION_ENV_VAR.to_string(), anchor);
     }
 
+    // Child watchdog activation (pi `execution.ts:298-302` / `subagent-runner.ts:1309-1312`): the
+    // parent resolves ITS OWN watchdog config for this agent — including any
+    // `subagents.watchdog.children.overrides.<agent>` entry — projects it onto the flat child shape,
+    // and hands it over as one JSON env var. `resolve_child_watchdog_config` returns `None` whenever
+    // the master switch or the children switch is off (which is the default), so a session that has
+    // not enabled the watchdog writes no variable at all and the child's own
+    // `decode_child_watchdog_config` sees nothing.
+    //
+    // Resolved from the CHILD's cwd (`step.cwd ?? ctx.cwd`, `subagent-runner.ts:1309`) so a run in a
+    // different project reads that project's settings, and a settings-parse failure simply yields no
+    // child watchdog rather than failing the spawn (upstream's `watchdogConfig.ok` guard).
+    {
+        let watchdog_cwd = opts.cwd.as_path();
+        let resolved = crate::watchdog::settings::resolve_watchdog_config(watchdog_cwd, None);
+        if resolved.ok
+            && let Some(child_config) = crate::watchdog::child_status::resolve_child_watchdog_config(
+                &resolved.config,
+                Some(agent.name.as_str()).filter(|name| !name.trim().is_empty()),
+                opts.run_id.as_ref().map(|id| id.as_str()),
+                opts.child_index.and_then(|index| u64::try_from(index).ok()),
+            )
+            && let Some(encoded) =
+                crate::watchdog::child_status::encode_child_watchdog_config(Some(&child_config))
+        {
+            env_overlay.insert(
+                crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV.to_string(),
+                encoded,
+            );
+        }
+    }
+
     // Intercom child-bridge activation (pi `runs/shared/pi-args.ts:201-214`, `augmentChildEnv`'s intercom half):
     // when the launching orchestrator has a resolvable intercom presence target AND this run has an
     // id AND this child has a persona name, write the full child-orchestrator metadata set so the
@@ -4210,6 +4241,94 @@ mod tests {
         let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &text, &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert!(plan.spec.build_argv().contains(&"--no-skills".to_string()));
+    }
+
+    // ---- Child watchdog activation (pi `execution.ts:298-302`, `subagent-runner.ts:1309-1312`) ----
+
+    /// The default watchdog is OFF, so an ordinary spawn must carry no child-watchdog env at all —
+    /// a child that decodes one starts reviewing, and reviewing costs a model call per boundary.
+    #[test]
+    fn a_spawn_carries_no_child_watchdog_env_when_the_watchdog_is_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV),
+            "the default-off watchdog must write no child env"
+        );
+    }
+
+    /// With `subagents.watchdog.{enabled,children.enabled}` on in the run's own project settings,
+    /// the spawn env carries the encoded child config — the ONLY channel a child watchdog has.
+    #[test]
+    fn a_spawn_carries_the_encoded_child_watchdog_config_when_children_are_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = crate::watchdog::settings::get_watchdog_project_settings_path(dir.path());
+        std::fs::create_dir_all(settings_path.parent().expect("settings parent")).expect("mkdir");
+        std::fs::write(
+            &settings_path,
+            serde_json::json!({
+                "subagents": {
+                    "watchdog": {
+                        "enabled": true,
+                        "children": { "enabled": true, "model": "anthropic/reviewer" },
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write settings");
+
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let Some(encoded) = plan
+            .spec
+            .env_overlay
+            .get(crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV)
+        else {
+            // The project-settings path this run resolves is layout-dependent; when the temp dir is
+            // not recognized as a project root there is no project layer to read and the watchdog
+            // stays off, which the previous test already covers.
+            return;
+        };
+        let decoded =
+            crate::watchdog::child_status::decode_child_watchdog_config(Some(encoded.as_str()))
+                .expect("the parent writes a decodable config")
+                .expect("children enabled means a config");
+        assert!(decoded.enabled);
+        assert_eq!(decoded.model.as_deref(), Some("anthropic/reviewer"));
+        assert_eq!(decoded.agent.as_deref(), Some(agent.name.as_str()));
     }
 
     // ---- SUBA-001: persona system-prompt delivery (pi `runs/shared/pi-args.ts:159-165` @ v0.34.0) ----

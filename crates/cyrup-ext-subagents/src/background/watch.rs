@@ -783,9 +783,39 @@ pub fn install_completion_watcher(
     results_dir: PathBuf,
     sink: Arc<dyn CompletionSink>,
 ) -> Result<CompletionWatcherHandle, SubagentError> {
+    install_completion_watcher_with_observer(results_dir, sink, None)
+}
+
+/// A side-observer of every scanned completion, invoked BEFORE the notification is delivered and
+/// regardless of whether delivery succeeds.
+///
+/// This is the seam pi's event bus provides for free: upstream's `SUBAGENT_ASYNC_COMPLETE_EVENT`
+/// has THREE independent subscribers (`extension/index.ts:648-659`) — `handleComplete` (the
+/// notification), `scheduledRunManager.handleAsyncCompletion`, and
+/// `syncMissionFromAsyncCompletion` — and a `CompletionSink` alone can only model the first.
+/// [`crate::missions::sync_mission_from_async_completion`] is the third one, and it must run
+/// whether or not the notification lands (a mission reconciliation is not conditional on a
+/// message reaching the transcript).
+#[async_trait::async_trait]
+pub trait CompletionObserver: Send + Sync {
+    /// Observe one scanned, not-yet-delivered completion. Must not fail the pipeline: any error
+    /// belongs inside the implementation.
+    async fn observe(&self, notification: &CompletionNotification);
+}
+
+/// [`install_completion_watcher`] with an additional [`CompletionObserver`].
+///
+/// # Errors
+///
+/// As [`install_completion_watcher`].
+pub fn install_completion_watcher_with_observer(
+    results_dir: PathBuf,
+    sink: Arc<dyn CompletionSink>,
+    observer: Option<Arc<dyn CompletionObserver>>,
+) -> Result<CompletionWatcherHandle, SubagentError> {
     let watcher = ResultsWatcher::new(results_dir);
     let (poll_watcher, rx) = watcher.install()?;
-    let task = tokio::spawn(drive_completion_watcher(watcher, rx, sink));
+    let task = tokio::spawn(drive_completion_watcher(watcher, rx, sink, observer));
     Ok(CompletionWatcherHandle { _poll_watcher: poll_watcher, task })
 }
 
@@ -797,10 +827,11 @@ async fn drive_completion_watcher(
     watcher: ResultsWatcher,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     sink: Arc<dyn CompletionSink>,
+    observer: Option<Arc<dyn CompletionObserver>>,
 ) {
-    deliver_pending_completions(&watcher, &sink).await;
+    deliver_pending_completions(&watcher, &sink, observer.as_ref()).await;
     while rx.recv().await.is_some() {
-        deliver_pending_completions(&watcher, &sink).await;
+        deliver_pending_completions(&watcher, &sink, observer.as_ref()).await;
     }
 }
 
@@ -808,11 +839,22 @@ async fn drive_completion_watcher(
 /// notify → delete-last sequence; the parse/dedup half is [`ResultsWatcher::scan`]'s, the
 /// notify/delete half is here). A delivery the sink reports as failed is recorded as a
 /// processing failure so the SAME result is retried on the next scan rather than lost (R-SA-102).
-async fn deliver_pending_completions(watcher: &ResultsWatcher, sink: &Arc<dyn CompletionSink>) {
+async fn deliver_pending_completions(
+    watcher: &ResultsWatcher,
+    sink: &Arc<dyn CompletionSink>,
+    observer: Option<&Arc<dyn CompletionObserver>>,
+) {
     let Ok(found) = watcher.scan().await else {
         return;
     };
     for notification in found {
+        // Ordered BEFORE delivery, matching pi's listener registration order
+        // (`extension/index.ts:648-659`: `handleComplete` then the mission sync) only in the sense
+        // that both run for the same completion — the sync must not be skipped when delivery
+        // fails, so it cannot be folded into the `if sink.deliver(...)` arm below.
+        if let Some(observer) = observer {
+            observer.observe(&notification).await;
+        }
         let message = format_completion_message(&notification.result);
         if sink.deliver(message).await {
             let _ = watcher.delete_after_notify(&notification).await;

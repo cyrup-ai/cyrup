@@ -208,7 +208,7 @@ fn format_resume_guidance(run_id: &str, steps: &[StepStatus], stopped: bool) -> 
 /// (`YYYY-MM-DDTHH:MM:SS.mmmZ`), matching pi's `new Date(ms).toISOString()` output shape. Pure
 /// arithmetic (Howard Hinnant's proleptic-Gregorian `civil_from_days`), so it needs no date-time
 /// dependency and cannot panic.
-fn format_iso8601_millis(ms: i64) -> String {
+pub(crate) fn format_iso8601_millis(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
     let days = secs.div_euclid(86_400);
@@ -247,6 +247,16 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("Run: {}", status.run_id));
+    // pi `run-status.ts:373-385` @v0.43.0: the DURABLE MISSION this run is bound to, read back
+    // from the `mission.json` binding its own async dir carries, rendered immediately after
+    // `Run:` and omitted entirely when the run has no mission. An unreadable/invalid binding is a
+    // WARNING appended to the report (`nestedWarning`), never a failure of the status report
+    // itself.
+    match crate::missions::read_mission_binding(&paths.run_dir) {
+        Ok(Some(binding)) => lines.push(format!("Mission: {}", binding.mission_id)),
+        Ok(None) => {}
+        Err(e) => lines.push(format!("Warning: Mission binding unavailable: {e}")),
+    }
     lines.push(format!("State: {}", run_state_label(status.state)));
     lines.push(format!("Mode: {}", run_mode_label(status.mode)));
     lines.push(format!("Progress: {}", progress_label(status)));

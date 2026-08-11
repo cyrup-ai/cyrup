@@ -171,12 +171,43 @@ pub struct SubagentExtensionConfig {
     /// constant itself lives in `spawn::worktree::DEFAULT_HOOK_TIMEOUT`, not duplicated here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_setup_hook_timeout_ms: Option<u64>,
+    /// pi `ExtensionConfig.fleetView?: boolean` (`shared/types.ts:1750-1751`, its own comment:
+    /// "Show the Claude Code-style navigable fleet. Defaults to true."). Read by upstream as
+    /// `config.fleetView !== false` (`extension/index.ts:333`), so ONLY an explicit `false`
+    /// disables it — which is exactly what a `bool` defaulting to `true` expresses here.
+    /// Consumed by `extension.rs`'s `refresh_fleet_status_widget`, which publishes nothing when it
+    /// is off (upstream's `fleetStatus` is `undefined` in that case, `extension/index.ts:378-383`).
+    pub fleet_view: bool,
+    /// pi `ExtensionConfig.fleetViewPlacement?: FleetViewPlacement` (`shared/types.ts:1752-1753`,
+    /// its own comment: "Place the persistent FleetView above or below the editor. Defaults to
+    /// belowEditor."). Resolved through
+    /// [`crate::tui::fleet_status::resolve_fleet_view_placement`] — upstream's own
+    /// `resolveFleetViewPlacement(config.fleetViewPlacement)` (`extension/index.ts:334`) — which
+    /// accepts ONLY the exact string `"aboveEditor"` and treats everything else as below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fleet_view_placement: Option<String>,
     /// The `wait` tool's config gate — pi `ExtensionConfig.waitTool?: WaitToolConfig`
     /// (`extension/index.ts:332` `resolveWaitToolConfig(config.waitTool)`), accepting either a bare
     /// boolean or `{ enabled?: boolean }`. `None` (the field omitted) = enabled, pi's default.
     /// [`crate::background::wait::WAIT_TOOL_ENABLED_ENV`] overrides whatever this says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_tool: Option<crate::background::wait::WaitToolSetting>,
+    /// The durable-mission store config — pi `ExtensionConfig.missions?: MissionStoreConfig`
+    /// (`pi-subagents/src/missions/types.ts:102-108`, validated on every config read by
+    /// `extension/config.ts:25`'s `validateMissionStoreConfig`).
+    ///
+    /// `None` (the field omitted) is the default and means "missions enabled, default directories,
+    /// global pointer index on": every field inside is itself optional and
+    /// [`crate::missions::resolve_mission_store_location`] supplies the defaults. Setting
+    /// `{"enabled": false}` disables only the AUTOMATIC per-launch mission creation — an explicit
+    /// `mission`/`missionId` parameter and the six `mission.*` actions still work
+    /// (`missions/lifecycle.ts:65-66`).
+    ///
+    /// Validated through [`crate::missions::validate_mission_store_config`] by
+    /// [`Self::validate_missions`], which the config loader calls: serde alone would silently
+    /// accept an unknown key inside the block, and upstream refuses one loudly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missions: Option<crate::missions::MissionStoreConfig>,
 }
 
 /// pi's hardcoded default for `parallel.maxTasks` (func-SA §4.7) — the cap applied when the nested
@@ -203,12 +234,31 @@ impl Default for SubagentExtensionConfig {
             worktree_base_dir: None,
             worktree_setup_hook: None,
             worktree_setup_hook_timeout_ms: None,
+            // pi `config.fleetView !== false` (`extension/index.ts:333`) — on unless explicitly off.
+            fleet_view: true,
+            fleet_view_placement: None,
             wait_tool: None,
+            missions: None,
         }
     }
 }
 
 impl SubagentExtensionConfig {
+    /// pi `validateMissionStoreConfig(config.missions)` (`extension/config.ts:25`) — the
+    /// unknown-key/wrong-type check upstream runs on every config read, applied to the RAW config
+    /// JSON so an unknown key inside the `missions` block is refused rather than silently dropped
+    /// by serde's field matching.
+    ///
+    /// # Errors
+    ///
+    /// The upstream refusal text (`config.missions.<key> is unknown`, `… must be boolean`, `…
+    /// must be a positive integer`).
+    pub fn validate_missions(raw: &serde_json::Value) -> Result<(), String> {
+        crate::missions::validate_mission_store_config(raw.get("missions"), "config.missions")
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// The effective `parallel.maxTasks` (pi `ExtensionConfig.parallel?.maxTasks`), falling back to
     /// [`DEFAULT_PARALLEL_MAX_TASKS`] (8) when the nested `parallel` object — or its `maxTasks`
     /// field — is omitted.

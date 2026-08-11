@@ -355,8 +355,11 @@ impl ControlNoticeState {
         sink: Arc<S>,
     ) {
         match ev.source {
-            // R-SA-117: async notices are delivered immediately, no debounce.
-            RunSource::Async => {
+            // R-SA-117: async notices are delivered immediately, no debounce. A GOAL notice takes
+            // the same immediate path (pi `handleSubagentControlNotice` early-returns ONLY for
+            // `"foreground"`, `extension/control-notices.ts:49`); it differs from an async notice
+            // in `trigger_turn`, which `deliver` decides.
+            RunSource::Async | RunSource::Goal => {
                 let mut guard = state.lock().await;
                 guard.deliver(ev, sink.as_ref());
             }
@@ -448,7 +451,10 @@ impl ControlNoticeState {
         }
         // R-SA-118: a delivered async notice may trigger a new orchestrator turn; a delivered
         // foreground notice never does, since the orchestrator is already mid-turn when it fires.
-        let trigger_turn = ev.source != RunSource::Foreground;
+        // A GOAL notice does not either — pi's `{ triggerTurn: details.source === "async" }`
+        // (`extension/control-notices.ts:39`) is an equality test on `"async"`, not a negation of
+        // `"foreground"`, and the difference only becomes observable once a third source exists.
+        let trigger_turn = ev.source == RunSource::Async;
         sink.emit_control_notice(ev, trigger_turn);
     }
 }

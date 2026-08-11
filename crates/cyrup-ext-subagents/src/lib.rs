@@ -43,10 +43,16 @@ pub mod fork_context;
 pub mod native_supervisor;
 
 pub mod jsonl;
+/// The durable MISSION subsystem — a 1:1 port of `pi-subagents/src/missions/` (6 files @v0.43.0):
+/// mission records, their store, the launch binding that ties a mission to a real run, the six
+/// `mission.*` tool actions, per-mission workflow state, and the turn-end goal-continuation driver.
+/// See [`missions`] for the full file-by-file correspondence table.
+pub mod missions;
 pub mod prompt_runtime;
 pub mod registration;
 pub mod spawn;
 pub mod tui;
+pub mod watchdog;
 
 // P-5 (cyrup-permission-system-port.md §4 / reconciliation §2): re-export the `background::control`
 // file-channel primitives + the R-SA-P1 parent-session anchor const at the crate root so the

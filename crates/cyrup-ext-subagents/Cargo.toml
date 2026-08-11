@@ -71,6 +71,15 @@ base64 = { workspace = true }
 # comparing against the cache's stamped `configHash`. Same version `cyrup-config` already pins for
 # its own PKCE/auth hashing, so no new workspace-wide version surface is introduced.
 sha2 = "0.11.0"
+# NFKC normalization for the watchdog emission guard's dedup identity
+# (`watchdog/emission-guard.ts:43`'s `value.normalize("NFKC")`): two warnings that differ only by a
+# compatibility form must collide on one identity, or the same finding re-warns every turn. Already a
+# `[workspace.dependencies]` entry (`cyrup-tools` uses it for the same reason); pure Rust, no C.
+unicode-normalization = { workspace = true }
+# WHATWG URL parsing for the mission store's delivery-receipt validation (`missions/store.rs`,
+# pi `new URL(url)` at `pi-subagents/src/missions/store.ts:170-174`). See the justifying comment
+# on the `[workspace.dependencies]` entry.
+url = { workspace = true }
 tracing = "0.1.44"
 # `tui/render.rs`'s pure fold-to-aggregate rendering functions (R-SA-106..113) return
 # `ratatui::text::Line`/`Span` values so a live terminal owner (`cyrup-tui`, out of scope for

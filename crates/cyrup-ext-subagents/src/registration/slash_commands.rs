@@ -99,11 +99,11 @@ pub enum SlashCommandName {
     /// `/chain-prompts a -> b -- args` — run several recipes as one native subagent chain (pi
     /// `prompt-workflows.ts:303` @v0.34.0).
     ChainPrompts,
-    /// `/subagents-fleet` — the read-only in-flight fleet surface (pi
-    /// `pi.registerCommand("subagents-fleet", …)`, `slash-commands.ts:1092-1097` @v0.34.0, whose
-    /// handler is exactly `runSlashSubagent(pi, ctx, { action: "status", view: "fleet" })`; at
-    /// v0.43.0 that command is `:714-717` and its handler is `showFleet(ctx)` instead, which this
-    /// crate does not port yet). Also
+    /// `/subagents-fleet` — the live fleet inspector (pi
+    /// `pi.registerCommand("subagents-fleet", …)`, `slash-commands.ts:714-717` @v0.43.0, whose
+    /// handler is exactly `showFleet(ctx)`; at the v0.34.0 baseline the same command was
+    /// `:1092-1097` with the read-only `runSlashSubagent(pi, ctx, { action: "status", view:
+    /// "fleet" })` handler, which is now `showFleet`'s own `!ctx.hasUI` fallback). Also
     /// NOT one of R-SA-129's twelve, and also a real upstream command on the same surface —
     /// registered by the SAME `registerSlashCommands` call, three lines above the
     /// `registerPromptWorkflowCommands` hop the two commands above come from.
@@ -249,14 +249,13 @@ pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
         usage: "Usage: /chain-prompts prompt-a -> prompt-b -- args",
         description: "Run prompt templates as a native subagent chain: /chain-prompts analyze -> fix -- args",
     },
-    // G92: `/subagents-fleet` (`slash-commands.ts:1092-1097` @v0.34.0). `description` is that
-    // baseline's verbatim text. VERSION LAG: at v0.43.0 the command is `slash-commands.ts:714-717`
-    // and its description reads "Open the live subagent fleet inspector" — it moved to the
-    // interactive FleetView (`src/tui/fleet*.ts`), which this crate does not port yet.
+    // G92: `/subagents-fleet` (`slash-commands.ts:714-717` @v0.43.0). `description` is upstream's
+    // verbatim text at that tag; its handler is `showFleet(ctx)`, ported by
+    // `extension.rs::show_fleet` over `crate::tui::fleet`.
     SlashCommandDescriptor {
         name: SlashCommandName::SubagentsFleet,
         usage: "Usage: /subagents-fleet",
-        description: "Show active subagent fleet status and transcript commands",
+        description: "Open the live subagent fleet inspector",
     },
     // G77: `/subagents-stop` (`slash-commands.ts:751-753` @v0.43.0). `description` is upstream's
     // verbatim.

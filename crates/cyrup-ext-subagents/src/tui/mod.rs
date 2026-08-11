@@ -66,6 +66,31 @@ pub mod events;
 /// (R-SA-114-118/121/122; arch-SA §6.7). See that module's own docs for the full design.
 pub mod notices;
 
+/// Width/style primitives shared by the three FleetView modules — cyrup's ratatui-shaped stand-in
+/// for the `@earendil-works/pi-tui` helpers (`theme.fg`, `visibleWidth`, `truncateToWidth`,
+/// `wrapTextWithAnsi`) `src/tui/fleet*.ts` import. See that module's own doc for the transport
+/// difference and why the ANSI-parsing half of those helpers has no counterpart here.
+pub mod fleet_theme;
+
+/// The FleetView transcript pane — Rust port of pi-subagents `src/tui/fleet-transcript.ts`
+/// (`@v0.43.0`): the containment-checked, sanitizing, bounded transcript reader and the
+/// event-list renderer behind the inspector's detail pane.
+pub mod fleet_transcript;
+
+/// The FleetView-relevant projection of pi-subagents' `SubagentState` (`src/shared/types.ts`
+/// `@v0.43.0`) — the shapes `fleet.ts`/`fleet-status.ts` read.
+pub mod fleet_state;
+
+/// The always-on fleet status widget — Rust port of pi-subagents `src/tui/fleet-status.ts`
+/// (`@v0.43.0`): the collapsed one-line summary, the expandable roster, and the state machine
+/// whose `Enter` opens the inspector.
+pub mod fleet_status;
+
+/// The live subagent fleet inspector — Rust port of pi-subagents `src/tui/fleet.ts`
+/// (`@v0.43.0`): the roster/detail two-pane overlay `/subagents-fleet` opens, its steer/stop/
+/// inspect controls, and `showFleet`'s own open/already-open/no-UI control flow.
+pub mod fleet;
+
 // =================================================================================================
 // RunSource (func-SA §4.6's `SubagentRunHandle.source`; shared by every type below)
 // =================================================================================================
@@ -90,6 +115,16 @@ pub enum RunSource {
     Foreground,
     /// This run is a detached background job, tracked and polled out-of-band (§5.4 func-SA).
     Async,
+    /// Not a run at all: a turn-end GOAL-MISSION continuation notice
+    /// ([`crate::missions::goal_driver`]). pi's own third `source` value
+    /// (`SubagentControlMessageDetails.source: "foreground" | "async" | "goal"`,
+    /// `pi-subagents/src/extension/control-notices.ts:11`), and it behaves like neither of the
+    /// other two: it is delivered IMMEDIATELY (there is no live run whose state a debounce could
+    /// re-validate against — `handleSubagentControlNotice` only early-returns for
+    /// `"foreground"`), but it does NOT trigger a turn (`{ triggerTurn: details.source ===
+    /// "async" }`, `control-notices.ts:39`), because the orchestrator is being told what to do
+    /// NEXT, not handed a completed result to react to.
+    Goal,
 }
 
 // =================================================================================================

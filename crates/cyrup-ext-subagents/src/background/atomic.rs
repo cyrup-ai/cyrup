@@ -99,6 +99,74 @@ pub async fn write_atomic_json<T: serde::Serialize + Sync>(
     }
 }
 
+/// The SYNCHRONOUS, owner-only (`0600`) sibling of [`write_atomic_json`] — pi
+/// `writePrivateAtomicJson` (`pi-subagents/src/shared/atomic-json.ts:62`, i.e.
+/// `createAtomicJsonWriter({ mode: 0o600 })`), the writer the whole `missions/` subtree persists
+/// through.
+///
+/// Three differences from [`write_atomic_json`], each mandated by the upstream writer this ports:
+///
+/// 1. **It creates the parent directory** (`fsImpl.mkdirSync(path.dirname(filePath), { recursive:
+///    true })`, `atomic-json.ts:44-46`). [`write_atomic_json`]'s callers all pre-create their run
+///    directories; a mission record's directory may not exist yet on the first write.
+/// 2. **It chmods the file to `0600`** before the rename, so the private mode is in effect the
+///    instant the file becomes visible at `path` rather than a moment later.
+/// 3. **It is blocking**, because `missions/` is a synchronous subsystem end to end (see that
+///    module's own docs). Every call is a small local-filesystem write on the orchestrator's own
+///    machine.
+///
+/// The temp-filename derivation and the bounded rename backoff are the SAME
+/// [`unique_temp_path`]/[`MAX_RENAME_ATTEMPTS`]/[`backoff_delay`] this module already owns — this
+/// is a second entry point onto one implementation, not a second implementation (per this module's
+/// "one shared primitive, not two" contract).
+///
+/// # Errors
+///
+/// Returns an `io::Error` if serialization fails, if the parent directory cannot be created, if
+/// the temp file cannot be written, or if the rename does not succeed within the retry budget. On
+/// any error path the temp file is best-effort removed.
+pub fn write_private_atomic_json_blocking<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = unique_temp_path(path)?;
+
+    if let Err(write_err) = std::fs::write(&tmp, &bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(write_err);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(mode_err) =
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(mode_err);
+        }
+    }
+
+    let mut attempt = 0u32;
+    loop {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                attempt += 1;
+                if attempt >= MAX_RENAME_ATTEMPTS {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(err);
+                }
+                std::thread::sleep(backoff_delay(attempt));
+            }
+        }
+    }
+}
+
 /// Renames `tmp` to `dest`, retrying a bounded number of times with exponential backoff if the
 /// underlying `rename` call fails transiently (file-lock/handle contention). Returns the last
 /// error if every attempt fails.
