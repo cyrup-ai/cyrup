@@ -405,3 +405,63 @@ Two in-tree justifications were examined and do **not** close their items: `crat
 6. **What does `CompiledWildcard` do with `regex: None`?** G132's never-match arm can be either `$^` or `None`, depending on how the `Option<Regex>` consumers treat absence. Check the consumers of `crates/cyrup-permission-system/src/wildcard.rs:32-66` before choosing.
 7. **Is cyrup's blank-first-line dedent divergence reachable?** cyrup takes the prefix from `raw_block`'s first characters (`crates/cyrup-ext-subagents/src/discovery/frontmatter.rs:210-230`) where v0.34.0 already used `/^([ \t]+)/m`, but a blank line may flush the block in both parsers, in which case the difference is unobservable. Determine before sizing G96.
 8. **How should catalogs be kept current?** `packages/ai/src/providers/data/*.json` does not exist at v0.84.1 — the `.models.ts` files are generated, so `scripts/generate-models.ts` is the only oracle for the pricing and compat corrections. Decide whether `crates/cyrup-provider/src/providers/catalog/` gets a regeneration pipeline or stays hand-maintained. Affects G13 and every future catalog drift.
+---
+
+## Post-batch-9 open items (recorded 2026-08-11, HEAD `ce0bf8c`)
+
+Found during batch 9's verification passes. None is started; all are evidenced.
+
+**G148 — a negative `minReferences` in `config.json` fails deserialization instead of falling back.**
+`crates/cyrup-ext-subagents/src/registration/mod.rs:367-376` types
+`ProactiveSkillSubagentsConfig`'s `minReferences`/`maxRecommendations` as `Option<u32>`, so
+`{"proactiveSkillSubagents": {"minReferences": -1}}` fails serde outright — the untagged
+`ProactiveSkillSubagents` enum cannot fall back to `Toggle(bool)` either, so the whole extension
+config fails to load. Upstream tolerates it: `positiveInteger`
+(`pi-subagents` v0.43.0 `src/agents/proactive-skills.ts:32-36`) returns undefined for `value < 1`
+and `resolveProactiveSkillSubagentsConfig` falls through to `DEFAULT_MIN_REFERENCES`. A config pi
+accepts breaks cyrup. Fix is `Option<i64>` plus the same `>= 1` filter the resolver already applies.
+
+**G149 — widening the snapshot `action` enum survives mutation (untested, code correct).**
+No test feeds a snapshot whose `action` is neither `refine` nor `rollback`, though upstream throws
+`${label} snapshot ${index} is invalid.` Related: the test named
+`extract_fence_skips_an_unterminated_opener_…` provably cannot verify the half its name claims.
+
+**G150 — three uniform-shift citation defects, and the check that cannot see them.**
+`src/background/fleet_view.rs` carries a uniform **−1 shift across ~19 citations**
+(`transcriptLineLimit` really at 54 cited 53; `pathWithin` 76/75; `readTextTail` 93/92;
+`formatActivityFacts` 208/207; `contentText` 158/157; …). `src/spawn/dynamic_fanout.rs` has the same
+pattern (`assertNoUnresolvedItemReferences` at 155, cited 154). `src/discovery/management.rs:1381`
+cites `subagent-executor.ts:112` for `MUTATING_MANAGEMENT_ACTIONS` untagged, so it reads as v0.43.0
+where `:112` is `type AsyncStatus,` — correct only at v0.34.0, needs `@v0.34.0`.
+
+**The important half of G150 is the check, not the citations.** A *range* check structurally cannot
+detect a uniform shift: the shifted citation still resolves in-range while naming the wrong line.
+That is why a pass reporting "3204 citations checked, 0 out-of-range" left these standing. What
+catches them is a **content** check asserting the cited line actually contains the named symbol, and
+that the range sits inside that symbol's block. Build the check; the three fixes fall out of it.
+
+**Test hermeticity — a class with two known members, both now fixed, and no guard against a third.**
+The signature is not "touches env"; it is **"asserts an absence it never established."**
+`cyrup-session-svc/tests/model_registry.rs` asserted a provider was *unconfigured* while a real
+`ANTHROPIC_API_KEY` in the shell made it configured; `cyrup-config`'s
+`env_keys::tests::find_and_get_from_scoped_env_map` asserted a lookup returned *nothing* while
+`provider_env_value` falls back to the process env exactly as pi does
+(`ai/src/utils/provider-env.ts:44-52` — cyrup was faithful, the test was wrong). The second passes an
+explicit env map, so it *reads* hermetic and a grep for the class misses it.
+
+Two constraints for anyone fixing the next one:
+- **Scrubbing is unavailable in 15 of 18 crates.** `std::env::remove_var` is unsafe in Rust 2024 and
+  `#![forbid(unsafe_code)]` is crate-level, overriding any `allow` in a test module. Only
+  `cyrup-permission-system`, `cyrup-tools` and `cyrup-ext-sdk` can scrub.
+- **Prefer asserting the fallback agreement** (an empty scoped map returns what the ambient
+  environment says) over asserting absence. Reading env is safe, needs no `unsafe`, and is hermetic
+  in any shell.
+- Where scrubbing *is* used, serialize it: `std::env` is process-global while cargo runs a binary's
+  tests multi-threaded, so an unsynchronized scrub makes neighbouring tests flaky in a way that
+  looks like ordinary nondeterminism.
+
+**There is still no enforced guard.** CLAUDE.md's "tests must never hit real provider APIs" remains
+convention plus the faux provider. pi converts it to a guarantee by running its suite under `env -i`
+with an explicit allowlist (`pi/test.sh`); cyrup has no such wrapper, and this workspace's shell
+carries a live `ANTHROPIC_API_KEY`. A test that behaves differently when a real key is present is one
+line from a test that uses it. Consider an `env -i` wrapper before the next suite run.
