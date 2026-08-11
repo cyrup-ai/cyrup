@@ -172,10 +172,23 @@ mod tests {
             get_env_api_key("openai", Some(&env)).as_deref(),
             Some("sk-openai")
         );
-        // unset
+        // An empty scoped map does NOT mean "unset": `provider_env_value` falls back to the
+        // process environment, faithfully to Pi's `getProviderEnvValue`, which is
+        // `env?.[name] || process.env[name] || …` (`ai/src/utils/provider-env.ts:44-52`).
+        // Asserting `None` here asserted a property of the shell the suite happened to run in —
+        // it passed only while nothing set `OPENAI_API_KEY`, and failed the moment something did.
+        // Assert the fallback agreement instead, which is hermetic and pins the ported contract.
+        //
+        // This crate is `#![forbid(unsafe_code)]` and `std::env::remove_var` is unsafe in Rust
+        // 2024, so the test cannot scrub the ambient value — reading it is safe and sufficient.
         let empty = env_of(&[]);
-        assert_eq!(find_env_keys("openai", Some(&empty)), None);
-        assert_eq!(get_env_api_key("openai", Some(&empty)), None);
+        let ambient = std::env::var("OPENAI_API_KEY").ok().filter(|v| !v.is_empty());
+        assert_eq!(
+            find_env_keys("openai", Some(&empty)),
+            ambient.as_ref().map(|_| vec!["OPENAI_API_KEY".to_string()]),
+            "an empty scoped map must defer to the process env, not report unset"
+        );
+        assert_eq!(get_env_api_key("openai", Some(&empty)), ambient);
     }
 
     #[test]
