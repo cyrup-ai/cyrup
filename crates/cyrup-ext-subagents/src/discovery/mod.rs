@@ -158,7 +158,7 @@ const AGENT_FILE_EXTENSION: &str = "md";
 // -------------------------------------------------------------------------------------------
 
 /// Config-directory segment holding cyrup's per-scope agent/chain state (`.cyrup`, cyrup's analog
-/// of pi's `getConfigDirName()` = `.pi`, shared/utils.ts:16,68). A directory containing this
+/// of pi's `getConfigDirName()` = `.pi`, shared/utils.ts:16,91-92 @v0.43.0). A directory containing this
 /// segment marks a project root.
 const PROJECT_CONFIG_DIR_SEGMENT: &str = ".cyrup";
 
@@ -173,7 +173,7 @@ const AGENTS_SUBDIR: &str = "agents";
 
 /// Subdirectory under [`PROJECT_CONFIG_DIR_SEGMENT`] holding chain files (`.chain.md`/`.chain.json`)
 /// — a directory SEPARATE from [`AGENTS_SUBDIR`] (pi `getUserChainDir`/`resolveNearestProjectChainDirs`
-/// key each User/Project chain scope on a dedicated `chains/` dir, `agents.ts:220-222` and `:1703`
+/// key each User/Project chain scope on a dedicated `chains/` dir, `agents.ts:1699-1708` and `:1703`
 /// @v0.43.0, NOT the shared `agents/` dir; only *package*-tier chains co-locate with a package's
 /// agents dir, handled separately by [`scan_package_chain_scopes`]).
 const CHAINS_SUBDIR: &str = "chains";
@@ -311,7 +311,7 @@ pub fn read_project_root_resolution(
 /// The project root every scope-resolution in this crate should use — pi
 /// `findConfiguredProjectRoot` (`agents.ts:657-672`), which is what pi's own
 /// `resolveNearestProjectAgentDirs`/`resolveNearestProjectChainDirs`/`getProjectAgentSettingsPath`/
-/// `collectPackageSubagentPaths` all call (`agents.ts:446,1684,1700,679`) — NOT the bare
+/// `collectPackageSubagentPaths` all call (`agents.ts:446,1684,1700,679` @v0.43.0) — NOT the bare
 /// [`find_nearest_project_root`].
 ///
 /// The rule, verbatim from upstream:
@@ -357,7 +357,7 @@ pub fn find_configured_project_root(cwd: &Path) -> Result<Option<PathBuf>, Subag
 }
 
 /// The `settings.json` path for a project root (pi `path.join(getProjectConfigDir(root), "settings.json")`,
-/// `agents.ts:641,680`). cyrup keys its per-scope subagent settings under `<root>/.cyrup/agents/`
+/// `agents.ts:641,680` @v0.43.0). cyrup keys its per-scope subagent settings under `<root>/.cyrup/agents/`
 /// (the same directory that holds the scope's agent `.md` files), which is the crate's established
 /// layout — see `extension.rs::discovery_config`.
 #[must_use]
@@ -396,7 +396,7 @@ pub fn resolve_project_chain_read_dirs(project_root: &Path) -> Vec<PathBuf> {
 }
 
 /// User-scope agent read directories rooted at `home`, **lowest-precedence first** (pi
-/// `discoverAgents` `userDirOld`/`userDirNew`, agents.ts:1728-1729,1301-1302): the primary
+/// `discoverAgents` `userDirOld`/`userDirNew`, agents.ts:1728-1729,1886 @v0.43.0): the primary
 /// `<home>/.cyrup/agents` dir first (always included — the create/write fallback target), then the
 /// legacy `<home>/.agents` "second" user dir **last** (included only when it already exists, so it
 /// wins the last-directory-scanned reduce only once the user actually populates it, matching pi's
@@ -723,7 +723,7 @@ pub fn parse_subagent_settings(
             settings.default_model = Some(trimmed.to_string());
         }
     }
-    // Both are stored TRIMMED (pi's `.trim()` in `agents.ts:885,896`) so a stray-whitespace value
+    // Both are stored TRIMMED (pi's `.trim()` in `agents.ts:885,896` @v0.43.0) so a stray-whitespace value
     // resolves identically everywhere it is consulted.
     if let Some(dt) = settings.default_thinking.as_ref() {
         let trimmed = dt.trim();
@@ -1320,7 +1320,7 @@ fn run_discovery(
         agents,
         chains,
         diagnostics,
-        // pi `discoverAgents` returns `{ agents, projectAgentsDir, modelScope }` (`agents.ts:1446`)
+        // pi `discoverAgents` returns `{ agents, projectAgentsDir, modelScope }` (`agents.ts:1727-1781`)
         // — the effective policy travels WITH the discovery result so an execution path that
         // already discovered the agent does not have to re-read settings to learn the scope.
         model_scope: cfg.override_settings.model_scope(),
@@ -1391,7 +1391,7 @@ pub fn discover_agents(
 /// Resolve one saved chain by exact name (R-SA-008-style equality) across every discovered scope,
 /// applying pi's run-time cross-scope precedence: on a same-name collision the highest-precedence
 /// scope wins, in the order Project > User > Package > Builtin. This mirrors pi's
-/// `discoverSavedChains` (slash-commands.ts:171-177,1040), which feeds `discoverAgentsAll`'s
+/// `discoverSavedChains` (slash-commands.ts:172-177 @v0.34.0), which feeds `discoverAgentsAll`'s
 /// `[...package, ...user, ...project]` chain array (agents.ts:1875-1879) into a name-keyed `Map`
 /// whose last write wins — so the project-scope chain (emitted last) is the one actually run.
 /// cyrup deliberately RETAINS every scope's same-named chain in [`AgentDiscoveryResult::chains`]
@@ -2357,7 +2357,7 @@ mod tests {
     }
 
     /// `aliases:` is parsed off the agent's own frontmatter, comma- or block-list shaped, with pi's
-    /// `normalizeAgentAliases` normalization applied (`agents.ts:495-499,1516`).
+    /// `normalizeAgentAliases` normalization applied (`agents.ts:495-499,1516` @v0.43.0).
     #[test]
     fn aliases_frontmatter_is_parsed_trimmed_deduped_and_self_filtered() {
         let agent = parsed_agent(

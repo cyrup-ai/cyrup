@@ -262,7 +262,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
 }
 
 // =============================================================================================
-// A (pi `originalTask`, `chain-execution.ts:493-497`): a chain step's `{task}` placeholder resolves
+// A (pi `originalTask`, `chain-execution.ts:632-652`): a chain step's `{task}` placeholder resolves
 // to the run-wide `original_task` the orchestrator serialized into `RunnerConfig` — threaded through
 // the runner's `ChainRunContext` into `resolve_step_task`'s `{task}` substitution, so the child is
 // dispatched with the SUBSTITUTED task text, not the literal `{task}`. Proven end-to-end by reading

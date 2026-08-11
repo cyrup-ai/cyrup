@@ -16,7 +16,7 @@
 //! - **Orchestration-skill exclusion** ([`SUBAGENT_ORCHESTRATION_SKILL`]): the `pi-subagents`
 //!   operational skill is the PARENT orchestration skill and is NEVER child-injectable — it always
 //!   resolves to `missing` and never appears in the available-skills listing (pi's
-//!   `SUBAGENT_ORCHESTRATION_SKILL` rule, `skills.ts:54,618,717`).
+//!   `SUBAGENT_ORCHESTRATION_SKILL` rule, `skills.ts:613-638` @v0.34.0).
 //! - **Proactive skill-subagent suggestions** ([`recommend_proactive_skill_subagents`] et al.): a
 //!   1:1 port of `proactive-skills.ts` — from the configured agents/chains, suggest skills that are
 //!   referenced by at least `min_references` enabled configs and are actually available.

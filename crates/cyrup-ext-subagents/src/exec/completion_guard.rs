@@ -127,7 +127,7 @@ pub(crate) fn any_word_boundary(haystack_lower: &str, needles: &[&str]) -> bool 
 pub use crate::exec::task_intent::expects_implementation_mutation;
 
 
-/// Source: `hasMutationToolCall(messages)` (`completion-guard.ts:121-135`), re-scoped to this
+/// Source: `hasMutationToolCall(messages)` (`completion-guard.ts:69-84` @v0.43.0), re-scoped to this
 /// crate's dependency-free [`SubagentEvent`] transcript instead of a rich `Message[]` array (this
 /// crate has zero dependency on `cyrup-agent`'s message types, module docs above).
 ///

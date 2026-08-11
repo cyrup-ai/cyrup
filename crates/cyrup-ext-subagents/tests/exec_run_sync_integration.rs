@@ -1046,7 +1046,7 @@ async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is
 // `not-required`), and its delivered output leads with the timeout message. Proven against the
 // REAL signal-escalation ladder (the fixture ignores SIGINT and sleeps far past the deadline, so
 // termination is confirmed only after SIGTERM), never a mock. pi `buildTimedOutAcceptanceLedger`
-// (`execution.ts:101-113,1089-1090`) + timeout preamble (`execution.ts:824-829`).
+// (`execution.ts:101-113` @v0.34.0) + timeout preamble (`execution.ts:824-829`).
 // -------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

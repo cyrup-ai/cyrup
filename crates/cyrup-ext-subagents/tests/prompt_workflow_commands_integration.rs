@@ -245,7 +245,7 @@ async fn a_recipe_runs_through_a_real_child_process() {
 
 /// `/chain-prompts a -> b -- args` runs BOTH recipes as one native chain through the same
 /// `run_or_background_chain` walker `/chain` uses (pi hands the lowered `chain` array to the one
-/// executor, `prompt-workflows.ts:319-324`).
+/// executor, `prompt-workflows.ts:319-324` @v0.34.0).
 #[cfg(feature = "test-fixtures")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chain_prompts_runs_every_recipe_as_one_native_chain() {

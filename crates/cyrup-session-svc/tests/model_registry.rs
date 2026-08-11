@@ -15,6 +15,59 @@ use cyrup_provider::{CreateModelsOptions, Provider};
 use cyrup_session_svc::{ProviderResolver, SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
+/// Provider env keys that `cyrup-config`'s `env_keys` resolves to a CONFIGURED provider. A real
+/// `ANTHROPIC_API_KEY` in the developer's environment makes `anthropic` genuinely configured, so a
+/// test asserting it is filtered out as UNCONFIGURED is asserting a property of the ambient shell,
+/// not of the code. Pi avoids this class wholesale by running its suite under `env -i` with an
+/// explicit allowlist (`pi/test.sh`); cyrup has no such wrapper, so a test that depends on a
+/// provider being unconfigured has to establish that itself.
+const SCRUBBED_PROVIDER_ENV_KEYS: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+
+/// Serializes the env mutation below. `std::env` is process-global while `cargo test` runs a
+/// binary's tests on multiple threads, so an unsynchronized scrub would race any sibling test.
+static ENV_SCRUB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Removes [`SCRUBBED_PROVIDER_ENV_KEYS`] for as long as the guard lives, then restores exactly
+/// what was there — including restoring nothing when the var was absent, which is the common case
+/// in CI and the case the previous version of this test silently depended on.
+struct ScrubbedProviderEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl ScrubbedProviderEnv {
+    fn acquire() -> Self {
+        let guard = ENV_SCRUB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = SCRUBBED_PROVIDER_ENV_KEYS
+            .iter()
+            .map(|key| {
+                let previous = std::env::var(key).ok();
+                // SAFETY: Rust 2024 requires unsafe for env mutation because it is not
+                // thread-safe. ENV_SCRUB_LOCK serializes every mutation in this binary, and the
+                // value is restored in Drop.
+                unsafe { std::env::remove_var(key) };
+                (*key, previous)
+            })
+            .collect();
+        Self {
+            _guard: guard,
+            saved,
+        }
+    }
+}
+
+impl Drop for ScrubbedProviderEnv {
+    fn drop(&mut self) {
+        for (key, previous) in &self.saved {
+            match previous {
+                // SAFETY: as in acquire — still holding ENV_SCRUB_LOCK.
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
 struct Fixture {
     _tmp: TempDir,
     cwd: PathBuf,
@@ -66,6 +119,9 @@ impl ProviderResolver for RegistryResolver {
 /// provider stays selectable; unconfigured providers (openai/anthropic) are filtered out.
 #[tokio::test]
 async fn selector_lists_configured_non_faux_provider_and_hides_unconfigured() {
+    // The openai/anthropic assertions below are only meaningful if those providers are genuinely
+    // unconfigured. Establish that rather than inheriting it from the shell.
+    let _env = ScrubbedProviderEnv::acquire();
     let fx = fixture();
     let provider: Arc<dyn Provider> = two_model_faux();
     let auth = Arc::new(AuthStore::at(fx.agent_dir.join("auth.json")));

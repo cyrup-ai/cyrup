@@ -35,7 +35,7 @@ use serde_json::{Map, Value};
 
 use crate::error::SubagentError;
 
-/// pi `readSettingsFileStrict` (`agents.ts:701-722`): an **absent** file reads as the empty object
+/// pi `readSettingsFileStrict` (`agents.ts:683-704`): an **absent** file reads as the empty object
 /// (the common "no settings yet" case, not an error); an unreadable file, a file that does not
 /// parse as JSON, and a file whose top level is not a JSON object each abort with that function's
 /// verbatim message. The messages are shared with `read_subagent_settings_file`'s reader-side

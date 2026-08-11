@@ -38,6 +38,11 @@
 /// subprocess execution (R-SA-023/030/032/033; DI-SA-5).
 pub mod acceptance;
 
+/// Project-local per-agent refinement overlays (`<cwd>/.cyrup-subagents/refinements/<agent>.md`) —
+/// the READ half of pi-subagents' `agents/agent-refinements.ts`, applied to the child's system
+/// prompt between the memory block and the output-path override (`execution.ts:1442`).
+pub mod agent_refinements;
+
 /// Bounded child-protocol I/O: the 16 MiB stdout line cap and its `protocol_output_limit`
 /// diagnostic, the oversized-aggregate-record projection, the bounded stderr byte tail, and the
 /// drain start/cancel lifecycle projection — a port of pi's `runs/shared/child-protocol.ts`.
@@ -127,8 +132,8 @@ use crate::spawn::{ChildSpawnSpec, SpawnCommand, SpawnedChild};
 pub const RECENT_OUTPUT_CAP: usize = 50;
 
 /// How many trailing lines of ONE chunk of child text enter [`AgentProgress::recent_output`] —
-/// pi's `.split("\n").slice(-10)` at both append sites (`runs/foreground/execution.ts:850,869`
-/// @HEAD; `:794,813` @v0.34.0). A single enormous assistant turn therefore contributes at most ten
+/// pi's `.split("\n").slice(-10)` at both append sites (`runs/foreground/execution.ts:651,670`
+/// @v0.34.0). A single enormous assistant turn therefore contributes at most ten
 /// lines to the ring, before [`RECENT_OUTPUT_CAP`] even applies.
 pub const RECENT_OUTPUT_TAIL_LINES: usize = 10;
 
@@ -144,7 +149,7 @@ pub const RECENT_OUTPUT_TAIL_LINES: usize = 10;
 ///
 /// **[CYRUP-DELTA] ×2.**
 /// 1. pi applies the bound only when SNAPSHOTTING for the streamed wire (`snapshotProgress`,
-///    `execution.ts:171-178`), leaving the live array's lines unbounded in length. This fold
+///    `execution.ts:230-237`), leaving the live array's lines unbounded in length. This fold
 ///    truncates at append time instead — the identical bounded lines on every snapshot, with an
 ///    in-memory ring that is O(1) in line width too. That closes the one growth term a
 ///    settled-but-`running` snapshot (pi's interrupt-paused shape, which `compactCompletedProgress`
@@ -179,7 +184,7 @@ fn bound_output_line(line: &str) -> String {
 }
 
 /// The exact message a timed-out run leads its delivered output with, and the text of the timeout
-/// error — a 1:1 port of pi's `formatTimeoutMessage` (`execution.ts:87-89`). `ms` is the NOMINAL
+/// error — a 1:1 port of pi's `formatTimeoutMessage` (`execution.ts:169-171`). `ms` is the NOMINAL
 /// timeout budget ([`RunOptions::timeout_ms`], pi `options.timeoutMs ?? 0`), not the elapsed time.
 #[must_use]
 pub fn format_timeout_message(ms: u64) -> String {
@@ -203,7 +208,7 @@ pub struct AgentConfig {
     pub fallback_models: Vec<ModelId>,
     /// The agent's frontmatter reasoning level (func-SA §4.1 `AgentDefinition::thinking`) as pi's
     /// OPEN string, applied to the child's `--model` argument as a `:<value>` suffix at spawn time via
-    /// [`apply_thinking_suffix`] (pi `applyThinkingSuffix`, `runs/shared/pi-args.ts:76-81`) — `None` leaves the
+    /// [`apply_thinking_suffix`] (pi `applyThinkingSuffix`, `runs/shared/pi-args.ts:186-200`) — `None` leaves the
     /// per-attempt model id untouched. Carrying the raw string (rather than a closed on-only enum)
     /// means an explicit `Some("off")` now reaches the child as `:off`, exactly like pi, instead of
     /// being conflated with `None` and dropped.
@@ -221,10 +226,10 @@ pub struct AgentConfig {
     pub output: Option<crate::discovery::types::OutputSpec>,
     /// pi's `PI_SUBAGENT_INHERIT_PROJECT_CONTEXT` env flag: whether the child inherits the parent's
     /// project-context files (`AGENTS.md`/`CLAUDE.md`) — threaded to the child as
-    /// `CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT=1|0` (pi `runs/shared/pi-args.ts:199`).
+    /// `CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT=1|0` (pi `runs/shared/pi-args.ts:215` @v0.34.0).
     pub inherit_project_context: bool,
     /// Whether the child inherits skills discovery: when `false`, the child is spawned with
-    /// `--no-skills` and `CYRUP_SUBAGENT_INHERIT_SKILLS=0` (pi `runs/shared/pi-args.ts:139-141,200`).
+    /// `--no-skills` and `CYRUP_SUBAGENT_INHERIT_SKILLS=0` (pi `runs/shared/pi-args.ts:156,216` @v0.34.0).
     pub inherit_skills: bool,
     /// The agent's own frontmatter `skills` list (func-SA §4.1, R-SA-017). These are the
     /// EXPLICITLY-configured skill names resolved to `<available_skills>` pointers and injected into
@@ -357,7 +362,7 @@ pub struct ResolvedAgentPersona {
     /// The agent's own frontmatter `skills` list, carried so a chain/parallel/background step
     /// injects the SAME `<available_skills>` pointer block the single-run path does — resolved and
     /// injected at the shared `run_sync` chokepoint via [`AgentConfig::skills`] (pi resolves each
-    /// child's skills from the already-resolved agent config, `async-execution.ts:404-409,818-822`).
+    /// child's skills from the already-resolved agent config, `async-execution.ts:429,876` @v0.34.0).
     /// `#[serde(default)]` keeps the runner-config hand-off backward compatible.
     #[serde(default)]
     pub skills: Vec<String>,
@@ -509,7 +514,7 @@ pub struct RunOptions {
     /// `timed_out`.
     pub interrupt: CancelToken,
     /// pi `options.share` (`execution.ts:1027`, the tool's SINGLE-mode `share` param). Its ONE
-    /// effect at this port's baseline is pi's `sessionEnabled` term (`execution.ts:1039`): a
+    /// effect at this port's baseline is pi's `sessionEnabled` term (`execution.ts:1412`): a
     /// `Some(true)` keeps the child's session store ON even without an explicit
     /// [`Self::session_dir`], so `--no-session` is not emitted (see
     /// [`build_attempt_spawn_plan`]). pi v0.34.0 has no gist upload of its own — the tool schema's
@@ -563,7 +568,7 @@ pub struct RunOptions {
     pub fork_context: ForkContext,
     /// A live raw-NDJSON-line sink the background hop-2 runner installs to observe this child's
     /// stdout as it streams (pi's `updateStepFromChildEvent` child-event pump,
-    /// `subagent-runner.ts:1430-1517`), so it can fold `currentTool`/`recentTools`/token telemetry
+    /// `subagent-runner.ts:2706-2861`), so it can fold `currentTool`/`recentTools`/token telemetry
     /// into `status.json` on the fly. `None` (the default) for the foreground single-run path and
     /// for tests, which have no live status file to update.
     pub live_events: Option<LiveEventSink>,
@@ -602,7 +607,7 @@ pub struct RunOptions {
     /// presence label via [`crate::spawn::intercom_target::resolve_subagent_intercom_target`]. Paired
     /// with [`Self::orchestrator_intercom_target`] — both `Some` is the child-bridge activation gate.
     pub run_id: Option<crate::background::RunId>,
-    /// This child's flat index within its run (pi `childIndex`/`ctx.flatIndex`, `runs/shared/pi-args.ts:213-214`)
+    /// This child's flat index within its run (pi `childIndex`/`ctx.flatIndex`, `runs/shared/pi-args.ts:738-740`)
     /// — the `+1`-suffixed step position in its own presence label + the child's
     /// [`crate::spawn::nested_events::CHILD_INDEX_ENV`]. `None` defaults to `0` (a single top-level
     /// run has one child at index 0).
@@ -612,7 +617,7 @@ pub struct RunOptions {
     /// [`crate::prompt_runtime::STEER_INBOX_ENV`].
     ///
     /// pi `steerInboxDir` (`runs/shared/pi-args.ts:67,251-252` @v0.34.0), supplied by the background runner as
-    /// `stepSteerInboxDir(asyncDir, fi)` (`subagent-runner.ts:2313,2600,2797`). This is the ONLY
+    /// `stepSteerInboxDir(asyncDir, fi)` (`subagent-runner.ts:2313,2600,2797` @v0.34.0). This is the ONLY
     /// channel a steer request has to a running child: the parent drops a request into the
     /// run-level queue, the runner routes it into this per-child directory, and the child's own
     /// [`crate::prompt_runtime::SteeringInbox`] watches THIS path and injects each message into
@@ -623,7 +628,7 @@ pub struct RunOptions {
     /// `if (input.steerInboxDir)` guard.
     pub steer_inbox_dir: Option<PathBuf>,
     /// pi `options.controlConfig` (`execution.ts:245`, threaded from `runSinglePath`'s
-    /// `resolveControlConfig(deps.config.control, params.control)`, `subagent-executor.ts:1179`
+    /// `resolveControlConfig(deps.config.control, effectiveParams.control)`, `subagent-executor.ts:3385`
     /// @v0.34.0; the detached async runner reads the same value back out of its one-shot config,
     /// `subagent-runner.ts:1802`):
     /// the fully-resolved live-control thresholds/channels this run's attention pipeline runs
@@ -705,7 +710,7 @@ impl LiveEventSink {
     /// `runs/foreground/execution.ts:432`) and streams that same `progress` object through
     /// `fireUpdate()` for the whole attempt. They are the only explanation the user ever gets for
     /// why a run was relaunched, and they must arrive DURING the relaunched attempt — a settled
-    /// snapshot cannot carry them, because `compactCompletedProgress` (`shared/utils.ts:414-421`,
+    /// snapshot cannot carry them, because `compactCompletedProgress` (`shared/utils.ts:330-347`,
     /// ported at [`crate::tui::events::LiveProgressSnapshot::compact_completed`]) empties
     /// `recent_output` as one of its two growth terms.
     ///
@@ -770,7 +775,7 @@ pub struct SingleResult {
     pub interrupted: bool,
     pub timed_out: bool,
     /// G77/G104 — pi `SingleResult.stopped` (`shared/types.ts:879`, set by `runSubagent` at
-    /// `subagent-runner.ts:903`/`:921`/`:952`): this child was terminated by an explicit
+    /// `subagent-runner.ts:2957`/`:2960`/`:2970`): this child was terminated by an explicit
     /// user/agent **stop** request, not by an interrupt, a deadline, or its own exit.
     ///
     /// A distinct flag from [`Self::interrupted`] and [`Self::timed_out`] because upstream reads
@@ -856,7 +861,7 @@ pub struct SingleResult {
     ///
     /// **[CYRUP-DELTA] on placement.** pi carries the array one level UP, on
     /// `Details.progress: AgentProgress[]` (`shared/types.ts:908`), assembled as `allProgress` from each
-    /// child's own `result.progress` (`subagent-executor.ts:3060-3062,3380`), and blanks
+    /// child's own `result.progress` (`subagent-executor.ts:3424,3444,3793,3819` @v0.43.0), and blanks
     /// `SingleResult.progress` in the returned `results` (`compactForegroundResult`,
     /// `utils.ts:404-412`). cyrup's SINGLE-mode tool `details` IS the serialized `SingleResult`
     /// (`extension.rs::route_single`) rather than a `Details` wrapper, so the snapshot lands on the
@@ -928,7 +933,7 @@ pub struct AgentProgress {
     /// [`crate::tui::events::LiveProgressFold`]'s own ring.
     pub recent_tools: VecDeque<crate::tui::events::RecentToolCall>,
     /// When this attempt's clock started, for `durationMs` (pi's `startTime` local, captured before
-    /// the child spawns and read back at `execution.ts:1177`). `None` in a `Default`-constructed
+    /// the child spawns and read back at `execution.ts:744`). `None` in a `Default`-constructed
     /// fold, which reports a zero duration.
     pub started_at: Option<std::time::Instant>,
 }
@@ -973,7 +978,7 @@ impl AgentProgress {
                 self.message_end_events.push(event.clone());
             }
             SubagentEvent::ToolExecutionEnd { result, .. } => {
-                // pi `execution.ts:664,670` @v0.34.0.
+                // pi `execution.ts:663-664,670` @v0.34.0.
                 let result_text = crate::tui::events::extract_event_text(result);
                 self.append_recent_output(&result_text);
                 // pi pushes onto `recentTools` ONLY when a `currentTool` was in flight
@@ -1026,7 +1031,7 @@ impl AgentProgress {
     }
 
     /// Append one chunk of child output text to the bounded `recent_output` ring (R-SA-028) — a
-    /// 1:1 port of pi's `appendRecentOutput` (`runs/foreground/execution.ts:112-120`) fused with
+    /// 1:1 port of pi's `appendRecentOutput` (`runs/foreground/execution.ts:211-217`) fused with
     /// the `.split("\n").slice(-10)` every call site applies to its argument (`:850,869`).
     ///
     /// Exactly pi's three rules, in pi's order: keep only the last
@@ -1193,7 +1198,7 @@ pub struct AttemptSpawnPlan {
 const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Child env flag: whether the subagent inherits the parent's project-context files
-/// (`AGENTS.md`/`CLAUDE.md`) — pi `PI_SUBAGENT_INHERIT_PROJECT_CONTEXT` (`runs/shared/pi-args.ts:199`).
+/// (`AGENTS.md`/`CLAUDE.md`) — pi `PI_SUBAGENT_INHERIT_PROJECT_CONTEXT` (`runs/shared/pi-args.ts:215` @v0.34.0).
 ///
 /// Aliased to the READER's declaration ([`crate::prompt_runtime`], which acts on it child-side in
 /// `before_agent_start`) rather than re-spelled here: the two spellings drifting apart would
@@ -1222,7 +1227,7 @@ const MCP_DIRECT_TOOLS_ENV: &str = "MCP_DIRECT_TOOLS";
 pub const PARENT_SESSION_ENV_VAR: &str = "CYRUP_SUBAGENT_PARENT_SESSION";
 
 /// The resolved persona/agent NAME the child runs as (port doc §4, permission input (1) — pi
-/// `resolveAgentName`, `index.ts:2033-2047`). cyrup spawns a subagent as a SEPARATE process that IS
+/// `resolveAgentName`, `pi-permission-system/src/index.ts:2033-2047` @v0.7.1). cyrup spawns a subagent as a SEPARATE process that IS
 /// its persona for the whole lifetime, so — unlike pi's in-process `active_agent` session entry /
 /// `<active_agent>` prompt tag — the name is captured ONCE at the spawn site and threaded to the
 /// child as this env var (the exact equivalent for cyrup's process-per-subagent model). The child's
@@ -1246,7 +1251,7 @@ const SYSTEM_PROMPT_FLAG: &str = "--system-prompt";
 /// `"--append-system-prompt"`; repeatable host-side, joined with `\n`).
 const APPEND_SYSTEM_PROMPT_FLAG: &str = "--append-system-prompt";
 
-/// pi `applyThinkingSuffix` (`runs/shared/pi-args.ts:76-81`): append `:<thinking>` to a model id, unless the
+/// pi `applyThinkingSuffix` (`runs/shared/pi-args.ts:186-200`): append `:<thinking>` to a model id, unless the
 /// model already ends with a recognized `:<level>` suffix (leave it untouched) or either input is
 /// absent (return the model as-is). Operates on strings so the exact pi rule — including the `off`
 /// level a closed on-only enum cannot itself carry — is reproduced verbatim; the agent's own OPEN
@@ -1292,7 +1297,7 @@ pub fn split_known_thinking_suffix(model: &str) -> (&str, &str) {
 }
 
 /// Append `item` to `vec` only if not already present — the order-preserving de-duplication pi
-/// achieves with `[...new Set(...)]` over the extension-path list (`runs/shared/pi-args.ts:130,134`).
+/// achieves with `[...new Set(...)]` over the extension-path list (`runs/shared/pi-args.ts:146,150` @v0.34.0).
 fn push_unique(vec: &mut Vec<String>, item: String) {
     if !vec.contains(&item) {
         vec.push(item);
@@ -1300,13 +1305,13 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 }
 
 /// Build the argv + env overlay for one attempt against `model` (R-SA-024/047/048/054; pi
-/// `buildPiArgs`, `runs/shared/pi-args.ts:83-229`).
+/// `buildPiArgs`, `runs/shared/pi-args.ts:514-787`).
 ///
 /// Argv (flags in any order, task prompt last): `--print`, `--mode`, `json`; `--model
 /// <apply_thinking_suffix(model, agent.thinking)>` (T4 thinking-suffix); the tool-allowlist flag —
 /// `--tools <comma-list>` (the agent's declared builtins plus any resolved direct-MCP tool names)
 /// when the agent pinned a non-empty allowlist, `--no-tools` when it pinned an EMPTY one, and
-/// nothing at all when it pinned none (pi's `explicitToolAllowlist` gate, `runs/shared/pi-args.ts:547-552`); the agent's
+/// nothing at all when it pinned none (pi's `explicitToolAllowlist` gate, `runs/shared/pi-args.ts:389-393,549-555`); the agent's
 /// extension threading (`--no-extensions` + `--extension <path>` allowlist when `agent.extensions`
 /// is `Some`, else `--extension <path>` for tool-extension/child-only paths with discovery left
 /// on); `--no-skills` when the agent does not inherit skills; `--system-prompt=<persona body>` /
@@ -1339,10 +1344,13 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// task-side half (`injectSingleOutputInstruction`, the `**Output:**` header) is composed into
 /// `task` by [`build_task_text`], mirroring `subagent-executor.ts:3674`. The system-prompt half
 /// ([`crate::exec::output::inject_output_path_system_prompt`], the `Runtime output path override:`
-/// header) is composed onto the persona body HERE, mirroring `execution.ts:1443` — the statement
-/// upstream runs immediately after folding the memory block onto the same `systemPrompt` string,
-/// which is the line just below. Both are keyed on the presence of an output PATH alone, never on
-/// [`RunOptions::output_mode`], and both are capability-aware.
+/// header) is composed onto the persona body HERE, mirroring `execution.ts:1443` — the LAST of the
+/// three folds upstream applies to `systemPrompt` in a row. All three are reproduced below in
+/// upstream's order: the agent-memory block (`execution.ts:1438-1441`), then the project-local
+/// refinement overlay ([`crate::exec::agent_refinements::append_agent_refinement_overlay`],
+/// `execution.ts:1442`), then the output-path override. Both output-path surfaces are keyed on the
+/// presence of an output PATH alone, never on [`RunOptions::output_mode`], and both are
+/// capability-aware.
 ///
 /// **[CYRUP-DELTA]** pi writes the composed prompt to a `0600` temp file and passes the PATH,
 /// because pi's `resolvePromptInput` (`resource-loader.ts:53-68`) reads `--system-prompt`'s value
@@ -1352,7 +1360,8 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// path string itself as the child's system prompt. Inline means the `=`-joined single-argv form is
 /// mandatory, not stylistic — clap refuses a detached value beginning with `-`, and markdown
 /// personas routinely open on a `- bullet` or a `---` rule. A body that is still empty AFTER the
-/// memory block and the output-path override have been composed onto it emits NO flag at all (pi
+/// memory block, the refinement overlay and the output-path override have been composed onto it
+/// emits NO flag at all (pi
 /// emits unconditionally, `runs/shared/pi-args.ts:570-585`'s `!== undefined && !== null`, so an empty string
 /// still writes a `0600` prompt file and still passes `--system-prompt <path>`; emitting
 /// `--system-prompt=` here would blank the child's assembled prompt instead of leaving it alone).
@@ -1426,7 +1435,7 @@ pub fn build_attempt_spawn_plan(
         .iter()
         .any(|tool| tool == crate::extension::TOOL_NAME);
 
-    // G103 / pi `runs/shared/pi-args.ts:390-392,547-552` @v0.43.0. `explicitToolAllowlist` is
+    // G103 / pi `runs/shared/pi-args.ts:389-393,549-555` @v0.43.0. `explicitToolAllowlist` is
     // `input.tools !== undefined || mcpDirectTools.length > 0 || <ceiling>` — i.e. "did anything
     // pin this child's tool surface at all". cyrup folds pi's `tools` and `mcpDirectTools` into the
     // one `agent.tools: Option<Vec<ToolRef>>`, so `is_some()` IS that predicate: `None` is an agent
@@ -1543,6 +1552,22 @@ pub fn build_attempt_spawn_plan(
         format!("{persona_body_trimmed}\n\n{memory_injection}")
     };
 
+    // pi `systemPrompt = appendAgentRefinementOverlay(systemPrompt, { cwd: skillCwd, agentName })`
+    // (`execution.ts:1442`) — the statement BETWEEN the memory fold above and the output-path
+    // override below, so the composition order is persona -> skills -> memory -> refinement ->
+    // output-path. Upstream's `skillCwd` is `options.cwd ?? runtimeCwd`, which is the same
+    // `opts.cwd` the memory block above resolves against.
+    //
+    // A project that has never run `refine` has no `.cyrup-subagents/refinements/` directory at
+    // all, and the overlay is then a byte-for-byte no-op — as is a malformed or whitespace-only
+    // overlay file, since `append_agent_refinement_overlay` is infallible and returns its input
+    // unchanged on every failure (pi's blanket `catch { return systemPrompt; }`).
+    let persona_with_refinement = crate::exec::agent_refinements::append_agent_refinement_overlay(
+        &persona_with_memory,
+        &opts.cwd,
+        &agent.name,
+    );
+
     // G82 / R-SA-024 — the SYSTEM-PROMPT half of the output-path override, upstream
     // `injectOutputPathSystemPrompt(systemPrompt, options.outputPath, agent)`
     // (`execution.ts:1443`, the statement immediately after the memory/refinement composition this
@@ -1564,7 +1589,7 @@ pub fn build_attempt_spawn_plan(
     // (`single-output.ts:84-91`).
     let output_capabilities = completion_guard_projection(agent);
     let persona_owned = inject_output_path_system_prompt(
-        &persona_with_memory,
+        &persona_with_refinement,
         opts.output_path.as_deref(),
         Some(&output_capabilities),
     );
@@ -1583,7 +1608,7 @@ pub fn build_attempt_spawn_plan(
         args.push(format!("{flag}={persona_body}"));
     }
 
-    // Session threading (pi `buildPiArgs`, `runs/shared/pi-args.ts:100-112`) — the FULL branch, both halves:
+    // Session threading (pi `buildPiArgs`, `runs/shared/pi-args.ts:517-528`) — the FULL branch, both halves:
     //
     // * a resolved fork-context session FILE wins outright: its parent directory is created
     //   (pi's `fs.mkdirSync(path.dirname(sessionFile), { recursive: true })`) and `--session <file>`
@@ -1592,7 +1617,7 @@ pub fn build_attempt_spawn_plan(
     //   an explicit `--session-dir <dir>` (directory likewise created up front) points the child's
     //   session store at the caller's directory.
     //
-    // `session_enabled` is pi's `execution.ts:1039` `Boolean(sessionFile || sessionDir) || share`:
+    // `session_enabled` is pi's `execution.ts:1412` `Boolean(sessionFile || sessionDir) || share`:
     // an explicit `sessionDir` OR `share: true` keeps sessions on; neither means the child must not
     // persist a session at all. Pre-SUBA-041 only the `--session` half existed, so
     // [`RunOptions::share`]/[`RunOptions::session_dir`] were inert fields no argv ever read and every
@@ -1644,7 +1669,7 @@ pub fn build_attempt_spawn_plan(
     // Model-inherit sentinel (R-SA-041) never leaks a global default into the child's own
     // resolution beyond what `--model` above already pins explicitly for this attempt.
     env_overlay.insert("CYRUP_SUBAGENT_RUN".to_string(), "1".to_string());
-    // Permission input (1) (port doc §4 / pi `resolveAgentName`, `index.ts:2033-2047`): thread the
+    // Permission input (1) (port doc §4 / pi `resolveAgentName`, `pi-permission-system/src/index.ts:2033-2047` @v0.7.1): thread the
     // resolved persona name to the child as [`AGENT_NAME_ENV_VAR`] so its permission companion's
     // `agent` + `projectAgent` policy layers enforce for the named persona. Only a non-empty name is
     // written (an unnamed persona → var absent → child resolves `None`, matching pi's top-level `""`).
@@ -1776,7 +1801,7 @@ pub fn build_attempt_spawn_plan(
     }
 
     // pi `pi-args.ts` ships the resolved tool budget to the child in `PI_SUBAGENT_TOOL_BUDGET`
-    // (`tool-budget.ts:63-65`); the child-side `subagent-prompt-runtime.ts:263` decodes it and
+    // (`tool-budget.ts:70-72`); the child-side `subagent-prompt-runtime.ts:263` decodes it and
     // registers the nudge/block hook. Same hand-off here — see
     // [`crate::prompt_runtime::SubagentPromptRuntime`] for the enforcement half. Absent budget =>
     // no var, so a child that inherits a STALE budget from the parent's own environment cannot
@@ -1867,8 +1892,8 @@ pub fn build_attempt_spawn_plan(
 ///
 /// It is UNCONDITIONAL on [`RunOptions::output_mode`]: upstream keys the injection on the presence
 /// of an output PATH alone at every one of its call sites — `subagent-executor.ts:3674` (the single
-/// run, this function's direct counterpart), `chain-execution.ts:363,1320` and
-/// `async-execution.ts:711,1289` — and `outputMode` is consulted only by
+/// run, this function's direct counterpart), `chain-execution.ts:363,1320` @v0.43.0 and
+/// `async-execution.ts:711,1289` @v0.43.0 — and `outputMode` is consulted only by
 /// `validateFileOnlyOutputMode` (ported as [`validate_file_only_requires_path`]) and by the
 /// delivery-side `finalizeSingleOutput`. Gating the injection on `OutputMode::FileOnly`, as this
 /// function previously did, silently dropped the authoritative-path instruction from every
@@ -1946,9 +1971,9 @@ struct AttemptRecord {
     interrupted: bool,
     /// This attempt's live-control state machine, carried out of the ladder so `run_sync` can (a)
     /// raise the post-settlement completion-guard notice against the WINNING attempt's own dedup
-    /// set — pi's `emitControlEvent` at `execution.ts:1234` is a local of the same
+    /// set — pi's `emitControlEvent` at `execution.ts:417-423` is a local of the same
     /// `runSingleAttempt` scope — and (b) fold its raised events onto
-    /// [`SingleResult::control_events`] (pi `result.controlEvents = allControlEvents`, `:1260`).
+    /// [`SingleResult::control_events`] (pi `result.controlEvents = allControlEvents`, `:1314`).
     control: crate::exec::control::ControlMonitor,
 }
 
@@ -1984,7 +2009,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             }
         }
 
-        // pi `runSingleAttempt`'s control locals (`execution.ts:336,344-354`): the attempt's own
+        // pi `runSingleAttempt`'s control locals (`execution.ts:245-246` @v0.34.0): the attempt's own
         // start instant, its resolved control config (`options.controlConfig ?? DEFAULT_CONTROL_CONFIG`)
         // and its per-attempt dedup/record state. Built here — before the spawn plan — so every
         // early-return path below still hands a (trivially empty) monitor back to `run_sync`
@@ -2170,7 +2195,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             error = trailing_assistant_error(&progress.all_events);
         }
 
-        // (b) `forcedDrainAfterFinalSuccess` (pi `execution.ts:685`): a child that emitted a CLEAN
+        // (b) `forcedDrainAfterFinalSuccess` (pi `execution.ts:1080`): a child that emitted a CLEAN
         //     terminal stop but had to be force-drained (held stdout open past the grace window)
         //     is coerced to exit 0, not treated as a forced-kill failure.
         //     pi's witness is `(cleanTerminalAssistantStopReceived || agentSettledReceived)`
@@ -2401,10 +2426,10 @@ struct DriveOutcome {
     /// The child emitted a terminal assistant stop but held its stdout open past the final-stop
     /// grace window (or closed stdout yet lingered past `FINAL_DRAIN_TIMEOUT`), so it had to be
     /// force-drained via the real signal ladder — pi's `forcedTerminationSignal`
-    /// (`execution.ts:336,356-362`).
+    /// (`execution.ts:356-362` @v0.34.0).
     forced_termination: bool,
     /// At least one terminal assistant stop observed on this attempt carried no `errorMessage` —
-    /// pi's `cleanTerminalAssistantStopReceived` (`execution.ts:580`), the other half of
+    /// pi's `cleanTerminalAssistantStopReceived` (`execution.ts:557`), the other half of
     /// `forcedDrainAfterFinalSuccess`.
     clean_terminal_stop: bool,
     /// The child emitted `agent_settled` — pi's `agentSettledReceived` (`execution.ts:843`). The
@@ -2428,7 +2453,7 @@ struct DriveOutcome {
     detached: bool,
 }
 
-/// pi's `missingStructuredOutput` analog (`execution.ts:783-785`) for the empty-output
+/// pi's `missingStructuredOutput` analog (`execution.ts:1189-1191`) for the empty-output
 /// (cold-start) gate: is the child's structured output ABSENT from its event stream? Returns
 /// `true` when NO structured-output schema was requested at all (pi's `!options.structuredOutput`
 /// leg, where empty prose is unconditionally an empty-output failure), OR when a schema WAS
@@ -2548,7 +2573,7 @@ async fn drive_attempt(
     // loop so the post-loop `wait_final_drain()` can report the already-known exit status.
     let mut exit_drain_at: Option<tokio::time::Instant> = None;
     let mut clean_terminal_stop = false;
-    // pi's `agentSettledReceived` (`execution.ts:595,862,1080`): the child announced the WHOLE run
+    // pi's `agentSettledReceived` (`execution.ts:595,862,1080` @v0.43.0): the child announced the WHOLE run
     // settled. Like `clean_terminal_stop` it is a "the child finished on purpose" witness, so a
     // forced drain after it is still coerced to success.
     let mut agent_settled = false;
@@ -2660,7 +2685,7 @@ async fn drive_attempt(
                         // exact same wire bytes (`exec/ndjson.rs`'s own module doc), not a
                         // layering of one on top of the other.
                         if let Some(event) = crate::exec::ndjson::parse_line(&line.raw) {
-                            // Final-stop grace-drain (pi `startFinalDrain`, execution.ts:350-367):
+                            // Final-stop grace-drain (pi `startFinalDrain`, execution.ts:584-605):
                             // open the grace window on the FIRST terminal assistant stop and track
                             // whether ANY terminal stop was clean (no errorMessage) for
                             // `forcedDrainAfterFinalSuccess`.
@@ -3264,7 +3289,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // R-SA-031: file-only/output-path handoff, once, against the aggregate captured output. Tracks
     // the concrete saved path (`Some` only when the file was actually written — by the child, or by
     // the orchestrator persisting its own captured output), which the saved-output reference message
-    // below (pi `finalizeSingleOutput`, `single-output.ts:156-180`) is gated on. pi resolves the
+    // below (pi `finalizeSingleOutput`, `single-output.ts:211-235`) is gated on. pi resolves the
     // handoff only for a clean run (`finalResult?.exitCode === 0`, `subagent-runner.ts:872`), so this
     // is gated on the same clean-completion condition rather than run unconditionally.
     let mut saved_output_path: Option<PathBuf> = None;
@@ -3324,7 +3349,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     .is_clean()
     {
         // SUBA-S01: with a capture runtime, read the FILE the child's `structured_output` tool
-        // wrote (pi `readStructuredOutput`, `structured-output.ts:55-68`) rather than scanning the
+        // wrote (pi `readStructuredOutput`, `structured-output.ts:156-173`) rather than scanning the
         // transcript. The event scan is a cyrup-original heuristic that accepts the newest fenced
         // ```json block — i.e. prose — which is exactly what the "EVEN WHEN prose was produced"
         // rule below says must NOT satisfy a declared schema. It stays as the fallback for the one
@@ -3348,7 +3373,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             StructuredOutcome::NotRequested => None,
             StructuredOutcome::Valid(value) => Some(value),
             StructuredOutcome::Missing => {
-                // pi `readStructuredOutput` (structured-output.ts:55-58, execution.ts:791-805): a
+                // pi `readStructuredOutput` (structured-output.ts:156-173, execution.ts:1212-1216): a
                 // declared `outputSchema` with no captured `structured_output` value is a HARD
                 // failure — EVEN WHEN the child produced prose. pi runs its structured-output check
                 // on every clean exit and fails on the missing value unconditionally; prose is never
@@ -3518,7 +3543,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         }
     };
 
-    // Saved-output reference (pi `finalizeSingleOutput`, `single-output.ts:156-180`): once a clean
+    // Saved-output reference (pi `finalizeSingleOutput`, `single-output.ts:211-235`): once a clean
     // run wrote its `output` file, the delivered output either gains a trailing
     // `Output saved to: <path> (<size>, <n> lines). Read this file if needed.` line (inline /
     // file-and-inline modes) or is REPLACED entirely by that reference message (file-only mode) — so
@@ -3598,14 +3623,14 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             activity_state: control.activity_state(),
             error: error.clone(),
         });
-        // pi `compactForegroundDetails` → `compactCompletedProgress` (`shared/utils.ts:414-421`):
+        // pi `compactForegroundDetails` → `compactCompletedProgress` (`shared/utils.ts:330-347`):
         // a SETTLED snapshot keeps eleven fields and empties the two growth terms.
         Some(snapshot.compact_completed())
     } else {
         None
     };
 
-    // SUBA-S01 (pi `cleanupStructuredOutputRuntime`, `structured-output.ts:70-77`): remove the
+    // SUBA-S01 (pi `cleanupStructuredOutputRuntime`, `structured-output.ts:175-182`): remove the
     // runtime's private temp dir once the value has been read back. Best-effort and deliberately
     // unconditional — the schema file is written 0600 because it can carry whatever the caller's
     // schema describes, and leaving one behind per run would accumulate under the scratch dir.
@@ -4052,8 +4077,8 @@ mod tests {
     }
 
     /// G82 REGRESSION — upstream keys the output instruction on the PATH alone
-    /// (`subagent-executor.ts:3674`, `chain-execution.ts:363,1320`,
-    /// `async-execution.ts:711,1289`); `outputMode` is consulted only by
+    /// (`subagent-executor.ts:3674`, `chain-execution.ts:363,1320` @v0.43.0,
+    /// `async-execution.ts:711,1289` @v0.43.0); `outputMode` is consulted only by
     /// `validateFileOnlyOutputMode` and by delivery-side `finalizeSingleOutput`. Gating the
     /// injection on `OutputMode::FileOnly` left a `file-and-inline` run with a configured output
     /// path with NO instruction at all — the child was never told where to write.
@@ -4227,7 +4252,121 @@ mod tests {
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
     }
 
-    // ---- G103: an EXPLICITLY empty `tools:` means "no tools" (pi `runs/shared/pi-args.ts:390-392,547-552`) ----
+    /// pi `execution.ts:1433-1443` composes FOUR things onto `systemPrompt`, in this order:
+    /// skills, the agent-memory block, the project-local refinement overlay, the output-path
+    /// override. This drives the real `build_attempt_spawn_plan` with a memory block, an overlay
+    /// file and an output path all present at once and asserts the delivered `--system-prompt`
+    /// carries them in exactly that order.
+    ///
+    /// The refinement overlay was the hole: `appendAgentRefinementOverlay` (`execution.ts:1442`)
+    /// was entirely unported, so the composition ran memory -> output-path and an authored overlay
+    /// reached no child at all. Order is not cosmetic — the output-path override closes the prompt
+    /// with the runtime's own instruction, and an overlay appended AFTER it would be the last thing
+    /// the child reads, inverting the precedence upstream gives them.
+    #[test]
+    fn the_refinement_overlay_lands_between_the_memory_block_and_the_output_path_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_mode = SystemPromptMode::Replace;
+        agent.system_prompt_body = "You are the WORKER persona.".to_string();
+        // A write-capable agent with a project memory scope, so the memory block is non-empty.
+        // The scope needs a discoverable project root, which is a `.cyrup/` directory.
+        std::fs::create_dir_all(dir.path().join(".cyrup")).expect("mkdir .cyrup");
+        agent.tools = Some(vec![ToolRef::Builtin("write".to_string())]);
+        agent.memory = Some(crate::discovery::types::AgentMemoryConfig {
+            scope: crate::discovery::types::MemoryScope::Project,
+            path: "worker-notes".to_string(),
+        });
+
+        // The overlay file the port now reads, at pi's own path.
+        let overlay_path =
+            crate::exec::agent_refinements::get_agent_refinement_path(dir.path(), &agent.name)
+                .expect("legal agent name");
+        std::fs::create_dir_all(overlay_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &overlay_path,
+            "<!-- pi-subagents-refinement:v1\n{\"agent\":\"worker\",\"revision\":1,\
+             \"updatedAt\":\"2026-08-01T00:00:00.000Z\",\"base\":{\"source\":\"project\",\
+             \"filePath\":\"a.md\",\"systemPromptSha256\":\"s\"},\"evidence\":{}}\n-->\n\n\
+             ```pi-subagents-refinement-current\n- Prefer smaller diffs.\n```\n",
+        )
+        .expect("write overlay");
+
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.output_path = Some(dir.path().join("out.md"));
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let delivered = argv
+            .iter()
+            .find_map(|a| a.strip_prefix("--system-prompt="))
+            .expect("replace mode ships the persona on --system-prompt");
+
+        let persona_at = delivered
+            .find("You are the WORKER persona.")
+            .expect("the persona body opens the prompt");
+        let memory_at = delivered
+            .find("# Persistent agent memory")
+            .expect("the agent-memory block is composed in");
+        let overlay_at = delivered
+            .find("<pi-subagents-refinement agent=\"worker\"")
+            .expect("the refinement overlay must reach the child's system prompt");
+        let output_at = delivered
+            .find("Runtime output path override:")
+            .expect("the output-path override is composed in");
+
+        assert!(
+            persona_at < memory_at && memory_at < overlay_at && overlay_at < output_at,
+            "pi's order is persona -> memory -> refinement -> output-path; got \
+             persona@{persona_at} memory@{memory_at} refinement@{overlay_at} \
+             output@{output_at} in:\n{delivered}"
+        );
+        assert!(
+            delivered.contains("- Prefer smaller diffs.")
+                && delivered.contains("</pi-subagents-refinement>"),
+            "the overlay's guidance and closing tag must both ship: {delivered}"
+        );
+
+        // Remove the overlay and the SAME call composes memory straight onto the output-path
+        // override — proving the assertion above is driven by the file, not by something else in
+        // the prompt that happens to contain the tag.
+        std::fs::remove_file(&overlay_path).expect("remove overlay");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let without = plan.spec.build_argv();
+        let without = without
+            .iter()
+            .find_map(|a| a.strip_prefix("--system-prompt="))
+            .expect("replace mode ships the persona on --system-prompt");
+        assert!(
+            !without.contains("pi-subagents-refinement"),
+            "no overlay file means no overlay block: {without}"
+        );
+        assert!(without.contains("Runtime output path override:"), "{without}");
+    }
+
+    // ---- G103: an EXPLICITLY empty `tools:` means "no tools" (pi `runs/shared/pi-args.ts:389-393,549-555`) ----
 
     /// The USER ACTION: an author writes an agent `.md` whose frontmatter says `tools:` with
     /// nothing after it — "this agent gets NO tools" — and someone delegates to that agent. The
@@ -4485,7 +4624,7 @@ mod tests {
         assert!(!argv.iter().any(|a| a.contains("Persistent agent memory")));
     }
 
-    // ---- `toolBudget:` reaches the child (pi `tool-budget.ts:63-65`) ----
+    // ---- `toolBudget:` reaches the child (pi `tool-budget.ts:70-72`) ----
 
     /// The USER ACTION: an agent `.md` declares `toolBudget: {"hard": 5, "soft": 2}`, the user runs
     /// that agent, and the child is spawned with the validated budget in its environment where the
@@ -5308,7 +5447,7 @@ mod tests {
         assert!(!argv.contains(&"--session-dir".to_string()));
     }
 
-    /// SUBA-041 prerequisite (pi `buildPiArgs`, `runs/shared/pi-args.ts:104-112`): with NO fork-context session
+    /// SUBA-041 prerequisite (pi `buildPiArgs`, `runs/shared/pi-args.ts:517-528`): with NO fork-context session
     /// file, no `session_dir` and no `share`, pi's `sessionEnabled` is false and the child is spawned
     /// `--no-session`. Pre-fix this arm emitted nothing at all, so every session-less subagent child
     /// silently persisted a session into the orchestrator's own store.
@@ -5327,7 +5466,7 @@ mod tests {
 
     /// SUBA-041 prerequisite: an explicit `session_dir` both ENABLES sessions (no `--no-session`)
     /// and reaches the child as `--session-dir <dir>`, with the directory created up front — pi's
-    /// `fs.mkdirSync(sessionDir, { recursive: true })` (`runs/shared/pi-args.ts:108-110`).
+    /// `fs.mkdirSync(sessionDir, { recursive: true })` (`runs/shared/pi-args.ts:524-526`).
     #[test]
     fn build_attempt_spawn_plan_emits_session_dir_and_creates_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5352,7 +5491,7 @@ mod tests {
     }
 
     /// SUBA-041 prerequisite: `share: true` alone is pi's other `sessionEnabled` term
-    /// (`execution.ts:1039`) — it suppresses `--no-session` without naming a directory.
+    /// (`execution.ts:1412`) — it suppresses `--no-session` without naming a directory.
     #[test]
     fn build_attempt_spawn_plan_share_alone_enables_sessions_without_a_session_dir() {
         let dir = tempfile::tempdir().expect("tempdir");

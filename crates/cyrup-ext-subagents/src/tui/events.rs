@@ -20,7 +20,7 @@
 //!   the **inline subagent-result surface** (C20). [`AsyncJobSnapshot`]/[`AsyncJobsPayload`] is the
 //!   wire shape for the **persistent async-jobs widget** (C21) — one row per tracked background run,
 //!   populated crate-side from a polled `status.json` via [`AsyncJobSnapshot::from_run_status`].
-//!   Both mirror pi's `Details`/`renderSubagentResult` input (`tui/render.ts:1267-1301,940-1265`).
+//!   Both mirror pi's `Details`/`renderSubagentResult` input (`tui/render.ts:1678-2029`).
 //!
 //! # The pure render primitives already exist — the remaining outer-layer step is `cyrup-tui`-side
 //!
@@ -75,7 +75,7 @@ pub const RECENT_OUTPUT_CAP: usize = 20;
 /// (`pi-subagents/src/shared/utils.ts:435`, applied by `boundStreamedRecentTools` at `:444-447`).
 ///
 /// **[CYRUP-DELTA]** pi lets the LIVE `progress.recentTools` array grow without bound and slices it
-/// to the last 32 entries only when a snapshot is taken (`snapshotProgress`, `execution.ts:175`).
+/// to the last 32 entries only when a snapshot is taken (`snapshotProgress`, `execution.ts:230-237`).
 /// This fold evicts at push time instead, which yields the identical 32-entry tail on every
 /// snapshot while making a long, tool-heavy child's in-memory fold O(1) rather than O(tool calls).
 /// The distinction is invisible on the wire: no consumer reads past the tail pi already slices to,
@@ -88,7 +88,7 @@ pub const RECENT_TOOLS_CAP: usize = 32;
 // =================================================================================================
 
 /// The lifecycle phase a [`LiveProgressSnapshot`] represents — a 1:1 port of pi's
-/// `AgentProgress["status"]` union (`pi-subagents/src/shared/types.ts:565`,
+/// `AgentProgress["status"]` union (`pi-subagents/src/shared/types.ts:578` @v0.43.0,
 /// `"pending" | "running" | "completed" | "failed" | "detached"`), including its exact wire
 /// spellings. (The richer `Paused`/`Queued` BACKGROUND lifecycle lives on [`RunState`], which
 /// [`AsyncJobSnapshot`] carries for the C21 widget; this enum is the FOREGROUND child's own.)
@@ -143,7 +143,7 @@ impl LiveProgressStatus {
 }
 
 /// One entry of [`LiveProgressSnapshot::recent_tools`] — a 1:1 port of pi's
-/// `AgentProgress["recentTools"][number]` (`pi-subagents/src/shared/types.ts:574`,
+/// `AgentProgress["recentTools"][number]` (`pi-subagents/src/shared/types.ts:587` @v0.43.0,
 /// `{ tool: string; args: string; endMs: number }`), pushed once per `tool_execution_end`
 /// (`runs/foreground/execution.ts:803-810`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,7 +160,7 @@ pub struct RecentToolCall {
 }
 
 /// One run's progress snapshot — a port of pi's `AgentProgress` (`shared/types.ts:562-587`) as
-/// produced by `snapshotProgress` (`runs/foreground/execution.ts:171-178`) for a LIVE update and
+/// produced by `snapshotProgress` (`runs/foreground/execution.ts:230-237`) for a LIVE update and
 /// by `compactCompletedProgress` (`shared/utils.ts:329-345`) for a SETTLED one.
 ///
 /// Two consumers, one shape (exactly as upstream):
@@ -169,7 +169,7 @@ pub struct RecentToolCall {
 ///   [`cyrup_core::ToolUpdate`] `details` channel to `cyrup-tui`; and
 /// - a settled run's [`crate::exec::SingleResult::progress`], populated only when the caller asked
 ///   for it via `includeProgress` (pi `progress: params.includeProgress ? allProgress : undefined`,
-///   `runs/foreground/subagent-executor.ts:3071,3406`), and always passed through
+///   `runs/foreground/subagent-executor.ts:3444,3819` @v0.43.0), and always passed through
 ///   [`Self::compact_completed`] first.
 ///
 /// Every field beyond the original renderer-facing six is `#[serde(default)]` and skipped when
@@ -347,7 +347,7 @@ impl LiveProgressSnapshot {
 
 /// The in-memory accumulator the foreground `subagent` tool folds a child's raw NDJSON stdout lines
 /// into as they stream (C19) — the crate-side half of pi's `processLine` progress fold
-/// (`runs/foreground/execution.ts:501-586`). Cheap and allocation-light; a
+/// (`runs/foreground/execution.ts:830-1023`). Cheap and allocation-light; a
 /// [`LiveProgressSnapshot`] is taken off it whenever a progress-relevant event fires.
 ///
 /// Deliberately narrower than [`crate::exec::AgentProgress`] (which additionally retains full event
@@ -379,7 +379,7 @@ pub struct LiveProgressFold {
     input_tokens: u64,
     output_tokens: u64,
     recent_output: VecDeque<String>,
-    /// When this fold started, for `durationMs` (pi's `startTime` local, `execution.ts:1177`).
+    /// When this fold started, for `durationMs` (pi's `startTime` local, `execution.ts:404-411`).
     /// `None` in a `Default`-constructed fold, which reports a zero duration.
     started_at: Option<std::time::Instant>,
 }
@@ -397,7 +397,7 @@ impl LiveProgressFold {
     }
 
     /// Seed the launch-time descriptive fields pi writes into `progress` at construction
-    /// (`runs/foreground/execution.ts:357-373`) and never mutates thereafter: this child's flat
+    /// (`runs/foreground/execution.ts:425-442`) and never mutates thereafter: this child's flat
     /// `index`, its `task` text, its resolved `skills`, and its resolved `model`/`thinking`.
     /// Chained onto [`Self::new`] by callers that know them; callers that do not (the raw
     /// NDJSON-only folds in tests) simply leave them at their empty defaults.
@@ -421,7 +421,7 @@ impl LiveProgressFold {
     /// Fold one raw NDJSON stdout line into this state. Returns `true` iff the line parsed to a
     /// progress-relevant event (`tool_execution_start`/`tool_execution_end`/assistant
     /// `message_end`) — the exact set pi fires `fireUpdate` on
-    /// (`runs/foreground/execution.ts:891,553,585`), so a caller emits a fresh
+    /// (`runs/foreground/execution.ts:562,608,626,660,693,718` @v0.34.0), so a caller emits a fresh
     /// [`SubagentUpdatePayload`] exactly when this returns `true` (never once per raw line).
     /// A non-JSON line, or a JSON event that carries no renderer-facing change, returns `false`.
     pub fn record_line(&mut self, raw: &str) -> bool {
@@ -475,7 +475,7 @@ impl LiveProgressFold {
     }
 
     /// Take a [`LiveProgressSnapshot`] of the current fold at the given lifecycle `status` (pi
-    /// `snapshotProgress`, `runs/foreground/execution.ts:171-178`). The returned snapshot is the
+    /// `snapshotProgress`, `runs/foreground/execution.ts:230-237`). The returned snapshot is the
     /// FULL, still-running shape; a caller publishing a SETTLED run's progress must additionally
     /// run it through [`LiveProgressSnapshot::compact_completed`], exactly as pi's
     /// `compactForegroundDetails` does (`shared/utils.ts:414-421`).
@@ -553,7 +553,7 @@ impl LiveProgressFold {
 /// `pub(crate)` because [`crate::exec::AgentProgress::append_recent_output`] folds the SAME
 /// extraction into its own `recent_output` ring — pi runs one `extractTextFromContent` over both
 /// the assistant `message_end` content and the `tool_execution_end` result before appending
-/// (`runs/foreground/execution.ts:850,869`), so a second private copy here would be two
+/// (`runs/foreground/execution.ts:651,670` @v0.34.0), so a second private copy here would be two
 /// implementations of one upstream function drifting apart.
 pub(crate) fn extract_event_text(value: &serde_json::Value) -> String {
     match value {
@@ -612,7 +612,7 @@ pub struct SubagentUpdatePayload {
 
 impl SubagentUpdatePayload {
     /// A SINGLE-mode live update carrying one still-running progress snapshot and no settled result
-    /// (pi `createPlaceholderResult`'s `status: "running"` shape, `slash/slash-live-state.ts:50`).
+    /// (pi `createPlaceholderResult`'s `status: "running"` shape, `slash/slash-live-state.ts:51-76`).
     #[must_use]
     pub fn single_live(context: ContextMode, progress: LiveProgressSnapshot) -> Self {
         Self {
@@ -628,7 +628,7 @@ impl SubagentUpdatePayload {
 
     /// A SINGLE-mode terminal update carrying both the settled [`SingleResult`] and a final
     /// progress snapshot (pi's `emitUpdateSnapshot` at run settle,
-    /// `runs/foreground/execution.ts:483-491`).
+    /// `runs/foreground/execution.ts:806-820`).
     #[must_use]
     pub fn single_final(
         context: ContextMode,
@@ -648,7 +648,7 @@ impl SubagentUpdatePayload {
 
     /// The `content` text for the enclosing [`cyrup_core::ToolUpdate`]: the most recent output line
     /// while running, else `"(running…)"` (pi `fireUpdate`'s `output || "(running...)"`,
-    /// `runs/foreground/execution.ts:498`).
+    /// `runs/foreground/execution.ts:822-827`).
     #[must_use]
     pub fn content_text(&self) -> String {
         self.progress
@@ -772,7 +772,7 @@ pub struct AsyncJobSnapshot {
 impl AsyncJobSnapshot {
     /// Build one async-jobs row from a polled [`RunStatus`] (the crate-side of the C21 feed): reads
     /// the run's top-level activity roll-ups (`current_tool`/`tool_count`/`turn_count`/`total_tokens`,
-    /// pi `syncTopLevelCurrentTool`, `subagent-runner.ts:1444-1514`) and step position. `agent` and
+    /// pi `syncTopLevelCurrentTool`, `subagent-runner.ts:2453-2460`) and step position. `agent` and
     /// `context` are supplied by the caller (the tracker knows the run's originating persona and
     /// resolved context, which `status.json` itself does not always carry).
     #[must_use]

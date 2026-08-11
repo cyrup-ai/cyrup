@@ -266,7 +266,7 @@ impl JobTracker {
     /// Starts tracking `run_id` the way [`JobTracker::track`] does, except the per-run
     /// `events.jsonl` byte cursor is seeded at `events_cursor` rather than `0`. Used exclusively by
     /// [`crate::extension::SubagentsExtension::resume_tracking`] (pi `restoreActiveJobs`'s
-    /// `restoredControlEventCursor`, `async-job-tracker.ts:48-55,93`) to re-track a run discovered
+    /// `restoredControlEventCursor`, `async-job-tracker.ts:48-55,99` @v0.34.0) to re-track a run discovered
     /// from a prior process's `AsyncRoot` without re-tailing control events that process already
     /// consumed. `spawn_confirmed_at` is always `None` for a restored job — this tracker has no
     /// record of when hop-1 confirmed the spawn for a run it only learned about after the fact,

@@ -1925,7 +1925,7 @@ mod tests {
     /// that can declare a `verify[]` command and which this bridge previously discarded outright
     /// (`.and_then(Value::as_str)` kept the bare level string and nothing else). Lowering it to a
     /// contract stays `run_single`'s job, exactly as upstream hands `seqStep.acceptance` to `runSync`
-    /// unmodified (pi `chain-execution.ts:1335` @v0.34.0).
+    /// unmodified (pi `chain-execution.ts:1401` @v0.43.0).
     #[test]
     fn chain_step_to_runner_step_carries_every_acceptance_form_onto_the_step_spec() {
         let policy = serde_json::json!({

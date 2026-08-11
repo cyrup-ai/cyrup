@@ -220,7 +220,7 @@ pub struct NestedRunSummary {
 /// `controlNotificationKey(event, childIntercomTarget)` (`shared/subagent-control.ts:142-145`
 /// @v0.34.0) — `"{childKey}:{type}:{reason}"`, where `childKey` is the child's intercom target when
 /// the bridge is live, else `"{runId}:{index}"` (or bare `runId` for an index-less event). Its
-/// pending-timer map is keyed on `"{runId}:{that}"` (`extension/control-notices.ts:23-26`).
+/// pending-timer map is keyed on `"{runId}:{that}"` (`extension/control-notices.ts:23-26` @v0.34.0).
 ///
 /// Before SUBA-N05 this struct was only `(run_id, kind)`, which is STRICTLY coarser on two axes
 /// upstream distinguishes: the `reason` (an `idle` attention notice and a later

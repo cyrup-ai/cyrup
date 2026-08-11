@@ -1224,7 +1224,7 @@ pub struct ParsedRunCommand {
 }
 
 /// Parse `/run <agent>[key=value,...] [task] [--bg] [--fork]` (R-SA-129). Faithful port of the
-/// `pi.registerCommand("run", ...)` handler body (`slash-commands.ts:978-1006`), argument-parsing
+/// `pi.registerCommand("run", ...)` handler body (`slash-commands.ts:980-1008` @v0.34.0), argument-parsing
 /// portion only (agent-existence validation and actual dispatch are later-phase concerns per this
 /// file's module header).
 ///
@@ -1392,9 +1392,9 @@ pub struct ParsedChainCommand {
 
 /// Parse `/chain agent1 "task1" -> agent2 "task2"` (or the inline-parallel-group variant `/chain
 /// agent1 "task1" -> (agent2 "task2" | agent3 "task3") -> agent4`) into a [`ParsedChainCommand`]
-/// (R-SA-129). Faithful port of `buildChainExpressionSteps` (`slash-commands.ts:890-972`) composed
+/// (R-SA-129). Faithful port of `buildChainExpressionSteps` (`slash-commands.ts:892-974` @v0.34.0) composed
 /// with the `pi.registerCommand("chain", ...)` handler's flag extraction
-/// (`slash-commands.ts:1008-1020`).
+/// (`slash-commands.ts:1010-1022` @v0.34.0).
 ///
 /// # Errors
 ///
@@ -1517,7 +1517,7 @@ pub struct ParsedParallelCommand {
 /// `(a | b)` inline-group syntax — it IS already an implicit single-level parallel group over
 /// however many steps `parse_agent_args` returns; nesting a further group inside it has no
 /// well-formed meaning and pi-subagents' own `/parallel` handler
-/// (`slash-commands.ts:1052-1074`) never calls `buildChainExpressionSteps`/`hasGroupSyntax` at
+/// (`slash-commands.ts:1054-1076` @v0.34.0) never calls `buildChainExpressionSteps`/`hasGroupSyntax` at
 /// all, confirming this is not an oversight.
 ///
 /// # Errors
@@ -1538,7 +1538,7 @@ pub fn parse_parallel_command(raw_args: &str) -> Result<ParsedParallelCommand, S
                 task,
                 cwd: step.config.cwd.as_ref().map(PathBuf::from),
                 // T1: `/parallel`'s per-step `[model=…]` override reaches the child (pi
-                // `slash-commands.ts:1065` `config.model ? {model} : {}`), previously dropped.
+                // `slash-commands.ts:1067` @v0.34.0 `config.model ? {model} : {}`), previously dropped.
                 model: step.config.model.clone().map(ModelId::from),
                 tools: None,
                 extensions: None,
@@ -1585,7 +1585,7 @@ pub struct ParsedRunChainCommand {
 
 /// Parse `/run-chain <chainName> -- <task> [--bg] [--fork]` (R-SA-129). Faithful port of the
 /// `pi.registerCommand("run-chain", ...)` handler's argument-parsing portion
-/// (`slash-commands.ts:1022-1050`).
+/// (`slash-commands.ts:1024-1052` @v0.34.0).
 ///
 /// # Errors
 ///
@@ -1675,9 +1675,9 @@ pub fn parse_subagents_models_command(
 
 /// Parse a command whose entire argument contract is exactly one required positional token (no
 /// flags, no `key=value`). Faithful port of `parseSingleRequiredArg`
-/// (`slash-commands.ts:418-422`), shared by `/subagents-load-profile`, `/subagents-generate-
+/// (`slash-commands.ts:419-423`), shared by `/subagents-load-profile`, `/subagents-generate-
 /// profiles`, and `/subagents-check-profile` (source calls this same helper for all three,
-/// `slash-commands.ts:1134`, `1216`, `1259`).
+/// `slash-commands.ts:846`, `928`, `971`).
 ///
 /// # Errors
 ///
@@ -1736,7 +1736,7 @@ pub struct ParsedRefreshProviderModelsCommand {
 
 /// Parse `/subagents-refresh-provider-models <provider> [--force]` (R-SA-129). Faithful port of
 /// the `pi.registerCommand("subagents-refresh-provider-models", ...)` handler's argument-parsing
-/// portion (`slash-commands.ts:1178-1210`): a trailing `--force` OR bare `force` token (either
+/// portion (`slash-commands.ts:890-922`): a trailing `--force` OR bare `force` token (either
 /// form, source's regex accepts both) is stripped before applying
 /// [`parse_single_required_arg`] to what remains.
 ///
@@ -1757,7 +1757,7 @@ pub fn parse_subagents_refresh_provider_models_command(
 }
 
 /// Strip a trailing `--force` or bare `force` token (source: `/(?:^|\s)--force$/` /
-/// `/(?:^|\s)force$/`, `slash-commands.ts:1183-1184`). Returns the cleaned remainder plus whether
+/// `/(?:^|\s)force$/`, `slash-commands.ts:895-896`). Returns the cleaned remainder plus whether
 /// a force flag was present.
 fn strip_trailing_force_flag(input: &str) -> (String, bool) {
     for suffix in ["--force", "force"] {

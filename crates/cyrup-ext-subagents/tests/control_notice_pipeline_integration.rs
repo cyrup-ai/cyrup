@@ -10,7 +10,7 @@
 //! - `runs/foreground/subagent-executor.ts:801-831` — `emitControlNotification`: the
 //!   `childIntercomTarget` resolution, the `noticeText` render, and the
 //!   `notifyChannels.includes("event")` gate.
-//! - `extension/control-notices.ts:38-56` — `deliverControlNotice` →
+//! - `extension/control-notices.ts:23-42` — `deliverControlNotice` →
 //!   `pi.sendMessage({ customType: SUBAGENT_CONTROL_MESSAGE_TYPE, ... }, { triggerTurn })`.
 //!
 //! No mocking of the wired code (this crate's standing convention). Every run below:
@@ -270,7 +270,7 @@ async fn run_single_with_control_and_debounce(
 
 /// The raised control events off a SETTLED single-run `details`.
 ///
-/// pi's `Details` puts them on `results[i].controlEvents` (`shared/types.ts:480`, populated by
+/// pi's `Details` puts them on `results[i].controlEvents` (`shared/types.ts:950-1042`, populated by
 /// `snapshotResult` at `runs/foreground/execution.ts:256` from `result.controlEvents` set at
 /// `:975`), NOT at the details root: `runSinglePath`'s own details object
 /// (`subagent-executor.ts:3811-3823` @v0.43.0) has no `controlEvents` key at all. The root
@@ -462,7 +462,7 @@ async fn notify_on_without_needs_attention_suppresses_the_raise_itself() {
 ///
 /// A foreground notice is held for a debounce window and re-validated against LIVE state when the
 /// timer fires (R-SA-116 / pi `handleSubagentControlNotice`'s `setTimeout` +
-/// `isForegroundNoticeStillActionable`, `control-notices.ts:66-90`). When a run settles, pi calls
+/// `isForegroundNoticeStillActionable`, `control-notices.ts:67-92` @v0.34.0). When a run settles, pi calls
 /// `clearPendingForegroundControlNotices(deps.state, runId)` and then deletes its
 /// `foregroundControls` entry (`subagent-executor.ts:3579-3581` @v0.34.0) — so a timer that has not
 /// yet fired is CANCELLED, and one that fires later would fail `if (!control) return false` anyway.

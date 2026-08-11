@@ -160,7 +160,7 @@ impl ControlNoticeSink for LoggingControlNoticeSink {
 }
 
 /// The REAL transcript-injecting sink: pi's `pi.sendMessage({customType, content, display}, {
-/// triggerTurn})` (`extension/control-notices.ts:47-56`), routed through the P-1
+/// triggerTurn})` (`extension/control-notices.ts:33-41`), routed through the P-1
 /// [`cyrup_ext::host::HostServices::inject_message`] backend — the identical hand-off
 /// [`crate::background::watch::HostServicesCompletionSink`] already uses for background-completion
 /// notifications.
@@ -282,7 +282,7 @@ impl ControlNoticeState {
     /// immediately followed by `deps.state.foregroundControls.delete(runId)`
     /// (`subagent-executor.ts:3579-3581` @v0.34.0; the timer map is keyed
     /// `"{runId}:{controlNotificationKey}"` precisely so it can be filtered by run id,
-    /// `control-notices.ts:23-35`). The abort is not merely hygiene: without it a timer for a
+    /// `control-notices.ts:23-36` @v0.34.0). The abort is not merely hygiene: without it a timer for a
     /// finished run stays armed for the rest of its window holding an `Arc` to the state and the
     /// sink, and — if anything ever re-registers that run id — would fire against the NEW
     /// registration's live view. Dropping the live entry alone already makes such a timer

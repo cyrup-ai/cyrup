@@ -50,7 +50,7 @@ use crate::exec::ndjson::SubagentEvent;
 
 /// A fenced-code-block scan match: the language tag (lowercased) and the fenced body, used by
 /// [`looks_like_acceptance_report`] to test each fenced block in a text part independently of the
-/// others (pi-subagents' own `getFinalOutput`, `pi-subagents/src/shared/utils.ts:244-267`, is the
+/// others (pi-subagents' own `getFinalOutput`, `pi-subagents/src/shared/utils.ts:280-307`, is the
 /// direct source of truth this function ports verbatim — see that function's doc references
 /// below for the exact three detection rules).
 ///
@@ -164,7 +164,7 @@ impl<'a> Iterator for LineSpans<'a> {
 /// The acceptance-report-shaped JSON keys R-SA-029 names explicitly: a fenced `json`/`jsonc`/
 /// `json5` block counts as acceptance-report-shaped only if it contains `"criteriaSatisfied"`
 /// AND at least one of these companion keys — mirroring pi-subagents' own
-/// `getFinalOutput` regex pair verbatim (`pi-subagents/src/shared/utils.ts:257-261`), not a
+/// `getFinalOutput` regex pair verbatim (`pi-subagents/src/shared/utils.ts:280-307`), not a
 /// looser or stricter reinterpretation.
 ///
 /// `pub(crate)` (not private) so `exec/acceptance.rs`'s self-report `Claimed` vs. `Attested`
@@ -363,7 +363,7 @@ pub fn extract_final_output(events: &[SubagentEvent]) -> Option<String> {
 
 // ============================================================================================
 // Exit-0 re-diagnosis: detectSubagentError + trailing assistant errorMessage + empty-output
-// classification (pi `detectSubagentError` `utils.ts:390-460`; the assistantError state machine +
+// classification (pi `detectSubagentError` `utils.ts:481-523`; the assistantError state machine +
 // empty-output check in `execution.ts:556-790`). Tier T3, group A.
 //
 // pi re-diagnoses a child that EXITED ZERO for latent failures its process exit code alone did not
@@ -381,12 +381,12 @@ pub fn extract_final_output(events: &[SubagentEvent]) -> Option<String> {
 pub const EMPTY_OUTPUT_ERROR: &str =
     "Subagent produced no output (possible model cold-start or empty response).";
 
-/// The paused-success sentinel pi delivers for a soft-interrupted run (`execution.ts:731,752`) —
+/// The paused-success sentinel pi delivers for a soft-interrupted run (`execution.ts:848-852` @v0.34.0) —
 /// exit 0, cleared error, this text as the final output.
 pub const INTERRUPTED_FINAL_OUTPUT: &str = "Interrupted. Waiting for explicit next action.";
 
 /// A re-diagnosed subagent failure discovered by [`detect_subagent_error`] on an otherwise
-/// exit-zero run — a faithful port of pi's `ErrorInfo` (`utils.ts:390-460`).
+/// exit-zero run — a faithful port of pi's `ErrorInfo` (`utils.ts:481-523`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedSubagentError {
     /// The exit code to attribute to the run — either parsed out of the failing tool/bash output
@@ -553,7 +553,7 @@ struct DiagToolResult {
     text: Option<String>,
 }
 
-/// Port of pi's `detectSubagentError` (`utils.ts:390-460`): re-diagnose a run for a trailing
+/// Port of pi's `detectSubagentError` (`utils.ts:481-523`): re-diagnose a run for a trailing
 /// tool/provider failure that has *no subsequent assistant text recovering from it*.
 ///
 /// The reverse scan starts strictly *after* the last assistant message that carried real text — a
@@ -657,7 +657,7 @@ pub fn detect_subagent_error(events: &[SubagentEvent]) -> Option<DetectedSubagen
     None
 }
 
-/// Port of pi's live `assistantError` state machine (`execution.ts:571,578-582`): the trailing,
+/// Port of pi's live `assistantError` state machine (`execution.ts:476,940,945` @v0.43.0): the trailing,
 /// still-uncleared assistant `errorMessage`, if any.
 ///
 /// Each assistant `message_end` with a non-empty `errorMessage` sets the trailing error; a
@@ -724,7 +724,7 @@ pub fn is_terminal_assistant_stop(event: &SubagentEvent) -> bool {
 /// Whether a `message_end` event carries a non-empty assistant `errorMessage` — pi's truthy
 /// `evt.message.errorMessage` test (`execution.ts:580`), i.e. an empty string counts as "no error".
 /// Used by the final-stop grace-drain to decide whether a forced-drained terminal stop was *clean*
-/// (`forcedDrainAfterFinalSuccess`, `execution.ts:685`).
+/// (`forcedDrainAfterFinalSuccess`, `execution.ts:1080-1097`).
 #[must_use]
 pub fn message_end_has_error_message(event: &SubagentEvent) -> bool {
     let SubagentEvent::MessageEnd { message } = event else {
@@ -762,7 +762,7 @@ impl OutputFileSnapshot {
 /// configured at all. Advisory only — a stat failure for any reason other than "the path does not
 /// exist yet" (e.g. a permissions error) still degrades to a non-existent snapshot rather than
 /// propagating an error here, matching pi-subagents' own `captureSingleOutputSnapshot`
-/// (`pi-subagents/src/runs/shared/single-output.ts:92-100`): the snapshot's only job is to be
+/// (`pi-subagents/src/runs/shared/single-output.ts:147-156`): the snapshot's only job is to be
 /// compared against post-exit state by [`resolve_output_handoff`], which itself surfaces any
 /// genuine read/write failure directly rather than through this snapshot step. Returns `None` if
 /// no output path is configured at all (nothing to snapshot).
@@ -906,14 +906,14 @@ fn persist_orchestrator_output(
 }
 
 // ============================================================================================
-// Saved-output reference message (pi `formatSavedOutputReference`, single-output.ts:73-83)
+// Saved-output reference message (pi `formatSavedOutputReference`, single-output.ts:128-138)
 // ============================================================================================
 
 /// The "output saved to a file" reference pi surfaces to the caller once a step/run with an
 /// `output` file path finishes cleanly — the `bytes`/`lines` are measured over the FULL (untruncated)
 /// persisted content, and `message` is the exact human-readable line appended to (or, in
 /// `outputMode: "file-only"`, substituted for) the delivered output. Faithful port of pi-subagents'
-/// `SavedOutputReference` (`single-output.ts:73-83`).
+/// `SavedOutputReference` (`single-output.ts:128-138`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedOutputReference {
     /// The absolute on-disk path the output was saved to.
@@ -927,7 +927,7 @@ pub struct SavedOutputReference {
     pub message: String,
 }
 
-/// pi `formatByteSize` (`single-output.ts:61-71`): `"<n> B"` under 1024, else a 1-decimal
+/// pi `formatByteSize` (`single-output.ts:116-126`): `"<n> B"` under 1024, else a 1-decimal
 /// `KB`/`MB`/`GB`/`TB` value WITH a space before the unit — deliberately distinct from
 /// [`format_bytes`]'s no-space `"12.3KB"` truncation-marker form (pi keeps two different byte
 /// formatters for these two surfaces; this one is the saved-output-reference form).
@@ -945,7 +945,7 @@ fn format_byte_size(bytes: usize) -> String {
     format!("{value:.1} {}", units.get(unit_index).copied().unwrap_or("TB"))
 }
 
-/// pi single-output `countLines` (`single-output.ts:55-59`): count `\r\n`/`\r`/`\n` separators, plus
+/// pi single-output `countLines` (`single-output.ts:110-114`): count `\r\n`/`\r`/`\n` separators, plus
 /// one more unless the text ends in a `\r`/`\n`; empty text is 0 lines. Deliberately NOT
 /// [`count_lines`] (the truncation-marker line count, which counts `split('\n')` segments and so
 /// differs for trailing-newline text) — this matches the exact counter pi uses for the saved-output
@@ -974,7 +974,7 @@ fn count_reference_lines(text: &str) -> usize {
     separators + usize::from(!ends_with_newline)
 }
 
-/// pi `formatSavedOutputReference` (`single-output.ts:73-83`): build the [`SavedOutputReference`]
+/// pi `formatSavedOutputReference` (`single-output.ts:128-138`): build the [`SavedOutputReference`]
 /// for `saved_path` measured over `full_output`. `saved_path` is expected to already be absolute
 /// (the caller resolves a relative `output` against the run/chain cwd before spawning — pi's own
 /// `resolveSingleOutputPath`); it is used verbatim as the reported/message path so the message names
@@ -1135,8 +1135,8 @@ pub fn inject_output_path_system_prompt(
 /// `exec/mod.rs::build_task_text` calls it for every run with a configured output path, mirroring
 /// upstream's single-run site `subagent-executor.ts:3674` (`task = injectSingleOutputInstruction(
 /// task, outputPath, agentConfig)`). Upstream keys it on the PATH alone at all five of its call
-/// sites — `subagent-executor.ts:2979,3674`, `chain-execution.ts:363,1320`,
-/// `async-execution.ts:711,1289` — never on `outputMode`, which is consulted only by
+/// sites — `subagent-executor.ts:2979,3674` @v0.43.0, `chain-execution.ts:363,1320` @v0.43.0,
+/// `async-execution.ts:711,1289` @v0.43.0 — never on `outputMode`, which is consulted only by
 /// `validateFileOnlyOutputMode` and by delivery-side `finalizeSingleOutput`.
 ///
 /// Its `**Output:**` header is one of the lines [`crate::exec::task_intent`]'s
@@ -1288,7 +1288,7 @@ fn normalize_dot_segments(path: &Path) -> std::path::PathBuf {
 // ============================================================================================
 
 /// The byte/line cap applied to a delivered final output (R-SA-042). Default parity with
-/// pi-subagents (`DEFAULT_MAX_OUTPUT`, `pi-subagents/src/shared/types.ts:888-891`): 200KB / 5000
+/// pi-subagents (`DEFAULT_MAX_OUTPUT`, `pi-subagents/src/shared/types.ts:1791-1794` @v0.43.0): 200KB / 5000
 /// lines. An agent's own `AgentConfig::max_output` (arch-SA §3.4) may override either field
 /// independently; that layering/resolution is a later phase's concern (`exec/mod.rs`) — this type
 /// is the narrow value this module's [`truncate_output`] actually consumes.
@@ -1327,7 +1327,7 @@ pub struct TruncationResult {
 }
 
 /// Format a byte count as a short human-readable size (`"12.3KB"`), matching pi-subagents'
-/// `formatBytes` (`pi-subagents/src/shared/types.ts:1068-1072`) closely enough for the truncation
+/// `formatBytes` (`pi-subagents/src/shared/types.ts:1981-1985` @v0.43.0) closely enough for the truncation
 /// marker text to read the same way; not a general-purpose formatter used elsewhere.
 fn format_bytes(bytes: usize) -> String {
     if bytes < 1024 {
@@ -1360,7 +1360,7 @@ fn utf8_safe_prefix(s: &str, max_bytes: usize) -> &str {
 ///
 /// Line-cap is applied first (keep only the first `cap.lines` lines), then the byte-cap is applied
 /// to whatever remains — mirroring pi-subagents' own `truncateOutput`
-/// (`pi-subagents/src/shared/types.ts:1075-1108`) ordering exactly: a huge single first line still
+/// (`pi-subagents/src/shared/types.ts:1987-2029` @v0.43.0) ordering exactly: a huge single first line still
 /// gets byte-truncated even though it is only "1 line", and a many-short-lines output that already
 /// fits under the byte cap after line-truncation is not further cut. If neither cap is exceeded,
 /// `output` is returned unchanged and `truncated` is `false`.
@@ -1425,7 +1425,7 @@ pub fn truncate_output(
 }
 
 /// Count lines the same way pi-subagents' `countLines` does
-/// (`pi-subagents/src/runs/shared/single-output.ts:56-60`): the number of newline separators, plus
+/// (`pi-subagents/src/runs/shared/single-output.ts:110-114`): the number of newline separators, plus
 /// one more unless the text ends in a newline — i.e. "how many lines would `output.split('\n')`
 /// produce", which for an empty string is `0` (a genuine empty document has zero lines, not one).
 fn count_lines(text: &str) -> usize {

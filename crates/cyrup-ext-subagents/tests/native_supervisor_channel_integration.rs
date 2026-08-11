@@ -636,7 +636,7 @@ async fn the_supervisor_tool_is_registered_and_dispatches_on_a_real_session() {
 
 /// The other half of the same gate: a fanout child must NOT get `subagent_supervisor`. Upstream
 /// registers the parent tools from `createNativeSupervisorChannel(...).start()`, which only the
-/// orchestrator extension reaches (`extension/index.ts:373,757`); `fanout-child.ts` registers one
+/// orchestrator extension reaches (`extension/index.ts:373,757` @v0.43.0); `fanout-child.ts` registers one
 /// tool and starts no channel. A child that could answer supervisor requests would be answering its
 /// PARENT's, which is exactly the confusion the channel's session scoping exists to prevent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -700,7 +700,7 @@ async fn a_fanout_child_registers_no_supervisor_tool() {
 // Upstream registers TWO tools per side from one builder each: `subagent_supervisor` + an
 // `intercom` alias on the parent (`native-supervisor-channel.ts:636-637`), and
 // `contact_supervisor` + an `intercom` fallback on the child (`:294-321`, layered by
-// `subagent-prompt-runtime.ts:271-277,513`). cyrup had one per side, so the bare name `intercom` —
+// `subagent-prompt-runtime.ts:271-277,324` @v0.34.0). cyrup had one per side, so the bare name `intercom` —
 // the name pi-intercom uses, the name the child bridge instruction names, and the name every
 // pre-native-channel prompt reaches for — resolved to nothing on exactly the orchestrator the
 // native channel exists for.

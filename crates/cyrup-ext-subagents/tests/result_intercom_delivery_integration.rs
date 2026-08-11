@@ -3,7 +3,7 @@
 //! to a confirming [`DeliveryChannel`], must
 //!
 //!   1. attempt out-of-band delivery for the SINGLE-mode foreground path too (pi's
-//!      `runSinglePath`, `subagent-executor.ts:2719-2736`, gated on `!detached && !interrupted`)
+//!      `runSinglePath`, `subagent-executor.ts:3515-3873`, gated on `!detached && !interrupted`)
 //!      — not parallel-mode alone;
 //!   2. render the delivered receipt via pi's `formatSubagentResultReceipt`
 //!      (`result-intercom.ts:376-421`) — mode label + `"Run: …"` + `"Children: …"` + the exact

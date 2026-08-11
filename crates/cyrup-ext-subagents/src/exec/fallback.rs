@@ -155,7 +155,7 @@ pub fn build_model_candidates(
 
 /// [`build_model_candidates`] plus `subagents.modelScope` enforcement over the ladder's
 /// **non-primary** entries — pi `buildModelCandidates`'s `if (index > 0 && options?.scope?.enforce)`
-/// arm (`model-fallback.ts:229-237`).
+/// arm (`model-fallback.ts:253-276`).
 ///
 /// Only entries AFTER the first raw candidate are checked here, and only ever at `warn` severity,
 /// because upstream splits the work exactly that way: candidate #0 is the already-resolved primary

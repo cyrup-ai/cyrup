@@ -249,12 +249,12 @@ pub fn describe_profiles(
 }
 
 // =================================================================================================
-// Profile FILE SHAPE (pi `buildProfileFile`, profiles.ts:385-400) + tier selection
+// Profile FILE SHAPE (pi `buildProfileFile`, profiles.ts:402-415) + tier selection
 // =================================================================================================
 //
 // A GENERATED profile (`/subagents-generate-profiles <provider>`) is NOT merely a single
 // `defaultModel`; pi writes a per-agent `subagents.agentOverrides` map assigning EACH of the 8
-// builtin agents to one of three model tiers (`buildProfileFile`, profiles.ts:385-400) — and this
+// builtin agents to one of three model tiers (`buildProfileFile`, profiles.ts:402-415) — and this
 // port additionally sets a representative `subagents.defaultModel` (the medium tier) so the
 // profile is a complete policy that also covers non-builtin/custom agents (see
 // [`build_profile_file`]). The tier→model mapping is
@@ -443,7 +443,7 @@ pub fn profile_worker_model(profile: &NamedProfile) -> Option<String> {
 // =================================================================================================
 
 /// Serialize `profile` and write it to `<profiles_dir>/<name>.json` (pi `writeJsonFile`,
-/// profiles.ts:94-97: pretty-printed, two-space indent, trailing newline). Creates `profiles_dir`
+/// profiles.ts:98-101: pretty-printed, two-space indent, trailing newline). Creates `profiles_dir`
 /// if absent. `name` is validated through [`profile_path`] before any filesystem access.
 ///
 /// # Errors
@@ -723,7 +723,7 @@ pub fn read_provider_catalog(
 }
 
 /// Write one provider's catalog file (pi `writeJsonFile` targeting `getProviderModelsPath`,
-/// profiles.ts:575), creating the `providers/` directory if absent. Pretty two-space indent +
+/// profiles.ts:463-465), creating the `providers/` directory if absent. Pretty two-space indent +
 /// trailing newline, matching pi's `writeJsonFile`.
 ///
 /// # Errors

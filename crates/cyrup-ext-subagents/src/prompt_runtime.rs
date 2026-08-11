@@ -49,7 +49,7 @@
 //!
 //! * **`before_agent_start` → [`rewrite_subagent_prompt`]** (`:97-113,323-341`). The parent writes
 //!   the persona's `inheritProjectContext` / `inheritSkills` decision and the fanout grant into the
-//!   child's env (`runs/shared/pi-args.ts:215-216,181`; cyrup `exec/mod.rs`'s
+//!   child's env (`runs/shared/pi-args.ts:215-216,181` @v0.34.0; cyrup `exec/mod.rs`'s
 //!   [`INHERIT_PROJECT_CONTEXT_ENV`]/[`INHERIT_SKILLS_ENV`] + `child_role_env`). NOTHING read them
 //!   child-side, so `inheritProjectContext: false` was a pure no-op: the child re-assembled its own
 //!   system prompt from its own cwd and happily inherited every `AGENTS.md`/`CLAUDE.md` the persona
@@ -418,7 +418,7 @@ const PARENT_ONLY_CUSTOM_MESSAGE_TYPES: &[&str] = &[
 
 /// The orchestration tool a child must not read itself as having called
 /// (`crate::extension::TOOL_NAME`; pi keys the same filters on the literal `"subagent"`,
-/// `subagent-prompt-runtime.ts:124,129`).
+/// `subagent-prompt-runtime.ts:124,129` @v0.34.0).
 const SUBAGENT_TOOL_NAME: &str = "subagent";
 
 /// Opening delimiter of cyrup's project-context section (`cyrup-session/src/prompt/builder.rs`'s
@@ -433,7 +433,7 @@ const SKILLS_OPEN: &str = "Available skills (open the SKILL.md with the read too
 const SKILLS_CLOSE: &str = "</available_skills>";
 
 /// What [`rewrite_subagent_prompt`] was told about this child (pi's three `readBooleanEnv` results
-/// plus the structured-output presence check, `subagent-prompt-runtime.ts:111,330-338`).
+/// plus the structured-output presence check, `subagent-prompt-runtime.ts:111,330-338` @v0.34.0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PromptRewriteOptions {
     /// `false` strips the inherited project-context section (pi `inheritProjectContext ?? true`).
@@ -1087,7 +1087,7 @@ impl SubagentPromptRuntime {
     }
 
     /// Attach the child-side steering inbox (pi `registerSteeringInbox`,
-    /// `subagent-prompt-runtime.ts:262`). `None` leaves the child with no live steering channel,
+    /// `subagent-prompt-runtime.ts:328-585`). `None` leaves the child with no live steering channel,
     /// which is every foreground child.
     #[must_use]
     pub fn with_steering_inbox(mut self, dir: Option<PathBuf>) -> Self {
@@ -1408,7 +1408,7 @@ pub fn prompt_runtime_extension_from(
     });
     // G106, upstream's SECOND child registration (`native-supervisor-channel.ts:305-321`), layered
     // ON TOP of `contact_supervisor` exactly as `registerNativeSupervisorFallbackOnce` layers it
-    // (`subagent-prompt-runtime.ts:271-277`): the same channel under the bare name `intercom`,
+    // (`subagent-prompt-runtime.ts:501-506`): the same channel under the bare name `intercom`,
     // registered only when this agent's own declared `tools:` allowlist asked for a tool by that
     // name (`:513`). A plain child gets `contact_supervisor` alone, as upstream.
     let intercom_fallback = child_metadata

@@ -410,7 +410,7 @@ pub struct AgentOverrideInfo {
 /// Per-field three-state override delta for one agent name, as read from
 /// `subagents.agentOverrides.<name>` in `cyrup-config`'s layered, untyped settings map (func-SA
 /// §4.1). **This is a field-for-field port of pi's `BuiltinAgentOverrideConfig`
-/// (`agents.ts:65-79`)** — every field below is exactly one pi override field, and pi has no
+/// (`agents.ts:82-100`)** — every field below is exactly one pi override field, and pi has no
 /// others:
 ///
 /// - pi's `string | false` / `string[] | false` / `AgentDefaultContext | false` fields
@@ -434,7 +434,7 @@ pub struct AgentOverrideConfig {
     pub model: OverrideField<String>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub fallback_models: OverrideField<Vec<String>>,
-    /// pi's `subagents.overrides.<name>.thinking` (`agents.ts:66,599-602`) is a `string | false`:
+    /// pi's `subagents.overrides.<name>.thinking` (`agents.ts:64,596,1011` @v0.43.0) is a `string | false`:
     /// an OPEN reasoning-level string (`"off"`, `"high"`, or any future/provider-specific value),
     /// or the literal `false` (explicit-clear). Modeled as `OverrideField<String>` — NOT a closed
     /// [`cyrup_core::ThinkingLevel`] enum — so an arbitrary pi thinking value (notably `"off"`, which
@@ -513,7 +513,7 @@ pub struct SubagentSettings {
     /// pi's `subagents.defaultThinking` (`agents.ts:164`) — a crate-wide reasoning-level default
     /// filled into every agent whose own `thinking` is unset (`applySubagentDefaultThinking`,
     /// `agents.ts:955-964`). Validated as a NON-EMPTY string and stored trimmed
-    /// (`agents.ts:882-889`); a malformed value MUST abort discovery (R-SA-009).
+    /// (`agents.ts:955-964`); a malformed value MUST abort discovery (R-SA-009).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_thinking: Option<String>,
     /// pi's `subagents.defaultExtensions` (`agents.ts:165`) — a crate-wide extension allowlist
@@ -643,7 +643,7 @@ pub struct AgentMemoryConfig {
 // ---------------------------------------------------------------------------------------------
 
 /// Which tools a hard-exhausted budget blocks — pi `ToolBudgetConfig["block"]`
-/// (`shared/types.ts`), normalized by `normalizeToolBudgetBlock` (`tool-budget.ts:8-12`).
+/// (`shared/types.ts`), normalized by `normalizeToolBudgetBlock` (`tool-budget.ts:7-11`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum ToolBudgetBlock {
@@ -656,7 +656,7 @@ pub enum ToolBudgetBlock {
 
 /// The `"*"` literal, as a type so [`ToolBudgetBlock`] can serialize back to the exact JSON shape
 /// pi's schema advertises (`{"anyOf": [{"type":"array",…}, {"type":"string","enum":["*"]}]}`,
-/// `schemas.ts:82-87`).
+/// `schemas.ts:109-114`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllToolsMarker;
 
@@ -747,7 +747,7 @@ pub struct AgentDefinition {
     pub model: Option<ModelId>,
     pub fallback_models: Vec<ModelId>,
     /// The agent's own frontmatter `thinking` value, held as pi's OPEN reasoning-level string
-    /// (`AgentConfig.thinking?: string`, `agents.ts:103,171`) rather than a closed
+    /// (`AgentConfig.thinking?: string`, `agents.ts:64,86,126` @v0.43.0) rather than a closed
     /// [`cyrup_core::ThinkingLevel`] enum. `None` means the frontmatter said nothing (unset);
     /// `Some("off")` is an EXPLICIT off (distinct from unset — the on-only enum could name neither);
     /// `Some("high")`/etc. are on-levels; any other string (a future or provider-specific level) is
@@ -1218,7 +1218,7 @@ mod tests {
 
     #[test]
     fn agent_override_config_deserializes_all_pi_overridable_fields() {
-        // pi `BuiltinAgentOverrideConfig` (agents.ts:65-79): the six fields an earlier port dropped
+        // pi `BuiltinAgentOverrideConfig` (agents.ts:82-100): the six fields an earlier port dropped
         // (`inheritProjectContext`/`inheritSkills`/`defaultContext`/`systemPrompt`/`skills`/
         // `subagentOnlyExtensions`) must now deserialize, with the `| false` fields reading a JSON
         // `false` as an explicit clear and the plain-bool fields reading `false` as a real value.

@@ -821,7 +821,7 @@ pub struct DoctorReportInput<'a> {
     pub chain_runs_dir: PathBuf,
     /// The full re-scan-per-call discovery result (pi `discoverAgentsAll(cwd)`), from which the
     /// `Discovery` block derives per-source agent/chain counts and the skills inventory. `Err(msg)`
-    /// (pi `lineFromCheck("agents/chains", ...)`, doctor.ts:64-70,131-153: a discovery throw — e.g.
+    /// (pi `lineFromCheck("agents/chains", ...)`, doctor.ts:65-71,131-153 @v0.43.0: a discovery throw — e.g.
     /// R-SA-009's malformed-settings abort — renders `- agents/chains: failed — <msg>` instead of a
     /// fabricated zero-count success.
     pub discovered: Result<&'a AgentDiscoveryResult, &'a str>,
@@ -889,7 +889,7 @@ fn format_existing_directory(label: &str, dir_path: &Path) -> String {
 ///
 /// A discovery failure (`Err`) renders pi's `lineFromCheck` failure shape instead — `- agents/chains:
 /// failed — <err>` and `- skills: failed — <err>` — never the fabricated `total 0` success a silent
-/// `unwrap_or_default()` would otherwise produce (doctor.ts:64-70,131-153). Since this crate derives
+/// `unwrap_or_default()` would otherwise produce (doctor.ts:65-71,131-153 @v0.43.0). Since this crate derives
 /// its skills line from the SAME discovery pass (no separate `discoverAvailableSkills` call exists
 /// yet), a discovery error necessarily fails both lines, not just the agents/chains one.
 fn format_discovery(discovered: Result<&AgentDiscoveryResult, &str>) -> Vec<String> {
@@ -1761,7 +1761,7 @@ mod tests {
     /// Regression for the divergence where a discovery `Err` (e.g. R-SA-009's malformed-settings
     /// abort) was silently mapped to `AgentDiscoveryResult::default()`, rendering a healthy-looking
     /// `- agents: total 0 (builtin 0, package 0, user 0, project 0)` with no failure indication —
-    /// exactly what pi's `lineFromCheck` wrapping prevents (doctor.ts:64-70,131-153: a discovery
+    /// exactly what pi's `lineFromCheck` wrapping prevents (doctor.ts:65-71,131-153 @v0.43.0: a discovery
     /// throw renders `- agents/chains: failed — <err>` instead). This test fails against the
     /// pre-fix behavior, which fed `Ok(&discovered)`/`.unwrap_or_default()` unconditionally and
     /// could never produce a "failed" Discovery line at all.

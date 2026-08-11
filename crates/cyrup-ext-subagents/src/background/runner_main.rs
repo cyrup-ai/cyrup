@@ -186,7 +186,7 @@ pub struct RunnerConfig {
     /// failure, matching pi's `agents.find` miss), never silently downgraded to a placeholder.
     #[serde(default)]
     pub resolved_agents: BTreeMap<String, ResolvedAgentPersona>,
-    /// The chain's overall original task text (pi `originalTask`, `chain-execution.ts:493-497,1048`),
+    /// The chain's overall original task text (pi `originalTask`, `chain-execution.ts:104,536,600` @v0.34.0),
     /// the value every step's `{task}` placeholder resolves to. Resolved ONCE by the orchestrator
     /// (`SubagentExecutor::run_or_background_graph`) from the tool/slash `task` param, else the first
     /// step's first task, and carried here verbatim so the detached hop-2 runner substitutes the SAME
@@ -194,7 +194,7 @@ pub struct RunnerConfig {
     /// config still deserialize — an empty value keeps `{task}` → `""`.
     #[serde(default)]
     pub original_task: String,
-    /// The chain working directory (pi `chainDir`, `chain-execution.ts:1050`) that `{chain_dir}`
+    /// The chain working directory (pi `chainDir`, `chain-execution.ts:654`) that `{chain_dir}`
     /// resolves to. Resolved ONCE by the orchestrator as a dedicated per-run scratch dir under
     /// [`crate::artifacts::chain_runs_dir`] and created before the detached spawn, so the runner
     /// substitutes an already-existing directory. `#[serde(default)]` (`None`) lets an older config
@@ -238,7 +238,7 @@ pub struct RunnerConfig {
     /// lets an older on-disk config still deserialize, leaving enforcement off for that run.
     #[serde(default)]
     pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
-    /// The inherited nested-event route (pi `config.nestedRoute`, `async-execution.ts:672,914`) —
+    /// The inherited nested-event route (pi `config.nestedRoute`, `async-execution.ts:727,989` @v0.34.0) —
     /// resolved ONCE by the orchestrator from its own inherited env
     /// ([`crate::spawn::nested_events::resolve_inherited_nested_route_from_env`]) and carried here
     /// so a background run started from WITHIN an already-nested run relays its own descendants
@@ -248,7 +248,7 @@ pub struct RunnerConfig {
     #[serde(default)]
     pub nested_route: Option<crate::spawn::nested_events::NestedRoute>,
     /// This run's own resolved ancestry address within `nested_route` (pi `config.nestedSelf`,
-    /// `async-execution.ts:673-678,915-920`) — `None` iff `nested_route` is also `None`.
+    /// `async-execution.ts:728-731,990-993` @v0.34.0) — `None` iff `nested_route` is also `None`.
     /// `#[serde(default)]` lets an older on-disk config still deserialize.
     #[serde(default)]
     pub nested_self: Option<crate::spawn::nested_events::NestedParentAddress>,
@@ -261,7 +261,7 @@ pub struct RunnerConfig {
     /// on-disk config still deserialize — `None` keeps the pre-fix "no config cap" behavior.
     #[serde(default)]
     pub dynamic_fanout_max_items: Option<u32>,
-    /// SUBA-N05 — pi `config.controlConfig` (`subagent-runner.ts:153,1802` @v0.34.0): the
+    /// SUBA-N05 — pi `config.controlConfig` (`subagent-runner.ts:117,1328` @v0.34.0): the
     /// FULLY-RESOLVED live-control thresholds/channels this run was authorized with.
     ///
     /// Resolved ONCE, parent-side, by the orchestrator
@@ -269,7 +269,7 @@ pub struct RunnerConfig {
     /// `subagents.control` block plus the call's own `control` override) and carried here verbatim,
     /// exactly as upstream does — `runSinglePath` computes
     /// `resolveControlConfig(deps.config.control, effectiveParams.control)` and passes the RESOLVED
-    /// object into `executeAsyncSingle` (`subagent-executor.ts:2845,2868-2870`), whose runner reads
+    /// object into `executeAsyncSingle` (`subagent-executor.ts:2845,2868-2870` @v0.34.0), whose runner reads
     /// it back as `config.controlConfig ?? DEFAULT_CONTROL_CONFIG`.
     ///
     /// Parent-side resolution is load-bearing rather than stylistic: this process has no settings
@@ -311,7 +311,7 @@ pub struct RunnerConfig {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// SUBA-N03 — pi `config.deadlineAt` (`subagent-runner.ts:126`, fed from
-    /// `async-execution.ts:924,983` `deadlineAt = Date.now() + params.timeoutMs`): the ABSOLUTE
+    /// `async-execution.ts:924,983` @v0.34.0 `deadlineAt = Date.now() + params.timeoutMs`): the ABSOLUTE
     /// wall-clock instant this run must be finished by, as milliseconds since the Unix epoch.
     ///
     /// Absolute epoch-milliseconds rather than a `std::time::Instant` for the reason pi's is a
@@ -721,7 +721,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
 
     // Move the initial `Running` status into the shared handle BOTH the step loop and the live-
     // telemetry pump mutate (pi's single `statusPayload`, folded from the per-child event handler
-    // AND the 1s `activityTimer`, `subagent-runner.ts:1430-1581`).
+    // AND the 1s `activityTimer`, `subagent-runner.ts:1962`).
     let shared_status: SharedStatus = Arc::new(std::sync::Mutex::new(status));
 
     // R-SA-082's watcher is installed HERE rather than immediately after the two synchronous
@@ -959,7 +959,7 @@ fn step_elapsed_ms(status: &RunStatus, flat_index: usize) -> i64 {
 }
 
 /// Recompute + embed this run's workflow-graph snapshot (pi's `refreshWorkflowGraph`,
-/// `subagent-runner.ts:2180-2381`) from the current step list + live per-step statuses, so any
+/// `subagent-runner.ts:2160-2192`) from the current step list + live per-step statuses, so any
 /// `status.json` reader always sees a graph consistent with the run's current progress.
 fn refresh_workflow_graph(status: &mut RunStatus, steps: &[RunnerStep]) {
     let graph = super::workflow_graph_from_run(steps, status);
@@ -988,7 +988,7 @@ enum LoopOutcome {
     Interrupted { results: Vec<SingleResult> },
     /// A wall-clock deadline expired — either this run's own (`config.deadline_at_ms`, observed as
     /// a step whose child was killed by the deadline) or an ancestor's, delivered as a
-    /// `control/timeout.json` request (pi `timeoutRunner`, `subagent-runner.ts:2029-2062`
+    /// `control/timeout.json` request (pi `timeoutRunner`, `subagent-runner.ts:2987-3025`
     /// @v0.34.0).
     ///
     /// Deliberately NOT folded into `Interrupted`: an interrupt is a resumable pause (`Paused`,
@@ -1036,7 +1036,7 @@ struct ControlFlags {
     /// own inbox order (`runs/background/control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → then
     /// `consumeTimeoutRequest` → then `consumeInterruptRequest`) and `stopRunner`'s own
     /// `if (stopped || timedOut || interrupted || state !== "running") return` mutual exclusion
-    /// (`subagent-runner.ts:2956`).
+    /// (`subagent-runner.ts:2955-2986`).
     stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1228,7 +1228,7 @@ async fn run_inner(
         include_progress: config.include_progress,
         // SUBA-N03: the run's `share` opt-in and artifact destination/selection, carried from the
         // one-shot config so an async run honours `share`/`artifacts` and leaves the same artifact
-        // quadruple a foreground run does (pi `subagent-runner.ts:1630-1666,1117-1133` @v0.43.0).
+        // quadruple a foreground run does (pi `subagent-runner.ts:879-890,1117-1125` @v0.34.0).
         share: config.share,
         artifacts_dir: config.artifacts_dir.clone(),
         artifact_config: config.artifact_config,
@@ -1249,7 +1249,7 @@ async fn run_inner(
     // `None` unless the caller asked for a timeout — but it was never a reason to DROP an explicit
     // one, and upstream has always honoured `timeoutMs` on the async path (`schemas.ts:265-266`
     // and `tool-description.ts:25,:73` @v0.34.0 both say it applies to "foreground and
-    // async/background runs"; `async-execution.ts:924,982-983` arms the deadline).
+    // async/background runs"; `async-execution.ts:1302-1305` arms the deadline).
     let deadline_at = config.deadline_at_ms.map(|deadline_ms| {
         let remaining_ms = deadline_ms.saturating_sub(crate::background::now_epoch_ms());
         std::time::Instant::now() + std::time::Duration::from_millis(remaining_ms)
@@ -1283,7 +1283,7 @@ async fn run_inner(
         // G77 — STOP is checked before BOTH of the others, matching pi's own inbox-drain order
         // (`runs/background/control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → `consumeTimeoutRequest` →
         // `consumeInterruptRequest`) and `stopRunner`'s mutual-exclusion guard
-        // (`subagent-runner.ts:2956`: `if (stopped || timedOut || interrupted || …) return`). The
+        // (`subagent-runner.ts:2955-2986`: `if (stopped || timedOut || interrupted || …) return`). The
         // order is load-bearing when several land together: a stop outranks a timeout outranks an
         // interrupt, so the terminal record is always the hardest, least-resumable verdict.
         //
@@ -1322,7 +1322,7 @@ async fn run_inner(
         }
 
         // Timeout is checked BEFORE interrupt, matching pi's own inbox-drain order
-        // (`runs/background/control-channel.ts:608-609` @v0.34.0: `if (consumeTimeoutRequest(...)) onTimeout();`
+        // (`runs/background/control-channel.ts:654-655` @v0.43.0: `if (consumeTimeoutRequest(...)) onTimeout();`
         // then `if (consumeInterruptRequest(...)) onInterrupt();`). The order is load-bearing when
         // both land together — an ancestor that timed out cascades a timeout to this run while a
         // user may simultaneously be interrupting it, and the terminal record must be the harder
@@ -1695,7 +1695,7 @@ fn timeout_message(timeout_ms: Option<u64>, source: &str) -> String {
 }
 
 /// The timeout counterpart of [`mark_remaining_paused`] (pi `timeoutRunner`'s step sweep,
-/// `subagent-runner.ts:2038-2049` @v0.34.0): every step from `from_index` that is not already
+/// `subagent-runner.ts:2029-2067` @v0.34.0): every step from `from_index` that is not already
 /// terminal becomes `Failed` with the timeout `message` and an end timestamp.
 ///
 /// `Failed`, not `Paused`, is the whole point — see [`LoopOutcome::TimedOut`]. A reader must be
@@ -1743,7 +1743,7 @@ fn mark_remaining_timed_out(
 /// promotion, applied at the one place cyrup knows the stop signal is what fired.
 ///
 /// The rest of each promoted field follows `runSubagent`'s own stopped-result shape
-/// (`subagent-runner.ts:909,915,917`): `exitCode: 1`, `error: stopMessage`, and — only when the
+/// (`subagent-runner.ts:1937-4576` @v0.43.0): `exitCode: 1`, `error: stopMessage`, and — only when the
 /// child produced no output of its own — `finalOutput: stopMessage`. Children that had ALREADY
 /// completed before the stop landed are untouched, exactly as upstream leaves them (their records
 /// settled while `stopSignal.aborted` was still false).
@@ -1764,7 +1764,7 @@ fn promote_interrupted_results_to_stopped(results: &mut [SingleResult], message:
 }
 
 /// G77 — the STOP counterpart of [`mark_remaining_timed_out`]/[`mark_remaining_paused`], ported
-/// from pi `stopRunner`'s own step sweep (`subagent-runner.ts:2965-2974` @v0.43.0):
+/// from pi `stopRunner`'s own step sweep (`subagent-runner.ts:2955-2986` @v0.43.0):
 ///
 /// ```text
 /// for (const step of statusPayload.steps) {
@@ -2100,7 +2100,7 @@ pub(crate) struct ExecSingleStepExecutor {
     /// quietly replaced by an allowed model. `None` = enforcement off.
     pub(crate) model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
     /// SUBA-N05 — the run's FULLY-RESOLVED live-control config (pi `controlConfig`,
-    /// `subagent-runner.ts:1802` / `chain-execution.ts:388,1064` @v0.34.0), carried from
+    /// `subagent-runner.ts:1953` / `chain-execution.ts:322,491` @v0.34.0), carried from
     /// [`RunnerConfig::control`] (background) or handed by [`Self::with_control`] (foreground
     /// `/chain`, `/parallel`, `/run-chain`). Threaded onto every dispatched step's
     /// [`crate::exec::RunOptions::control_config`], so an explicit `control` override really does
@@ -2117,11 +2117,11 @@ pub(crate) struct ExecSingleStepExecutor {
     /// SUBA-N03 — the run's `share` opt-in (pi `config.share` ← `params.share`), threaded onto
     /// every dispatched step's [`crate::exec::RunOptions::share`]. Its one effect is pi's
     /// `sessionEnabled = Boolean(sessionFile || sessionDir) || share` term
-    /// (`runs/foreground/execution.ts:1027,1039`): `Some(true)` keeps a child's session store on
+    /// (`runs/foreground/execution.ts:1027,1039` @v0.34.0): `Some(true)` keeps a child's session store on
     /// where it would otherwise be spawned `--no-session`. `None`/`Some(false)` is not enabling.
     pub(crate) share: Option<bool>,
     /// SUBA-N03 — where this run's per-step artifact quadruple is written (pi `ctx.artifactsDir`,
-    /// `runs/background/subagent-runner.ts:877-889,1117-1133` @v0.34.0), paired with
+    /// `runs/background/subagent-runner.ts:879-890,1117-1125` @v0.34.0 @v0.34.0), paired with
     /// [`Self::artifact_config`]. `None` disables artifact writing outright, which is exactly pi's
     /// own first gate term (`if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false)`) and
     /// is how an explicit `artifacts: false` reaches this hop.
@@ -2379,7 +2379,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             None => None,
         };
 
-        // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:458-466,1583-1609`): clone the
+        // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:1333,2002-2005,2069` @v0.34.0): clone the
         // run-wide SHARED interrupt token so an interrupt landing WHILE this child is running (the
         // control-inbox watcher cancels `self.interrupt_cancel`) actually tears the child down via
         // `run_sync`'s `opts.interrupt` race — not merely gets noticed between steps. Previously a
@@ -2431,7 +2431,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         let opts = RunOptions {
             cwd: effective_cwd,
             deadline_at: ctx.deadline_at,
-            // pi `chain-execution.ts:305-306,1118-1119`: every step's `runSync` call carries BOTH
+            // pi `chain-execution.ts:335-336,741-742,1197-1198` @v0.34.0: every step's `runSync` call carries BOTH
             // the chain-wide `deadlineAt` (raced against) and the nominal `timeoutMs` (only used to
             // render the timed-out message) — the same two values for every step, never re-derived
             // per step.
@@ -2451,7 +2451,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             cancel: ctx.cancel.clone(),
             interrupt: interrupt_token,
             // SUBA-N03 — pi `share: shareEnabled` (`async-execution.ts:965`) reaching this run's
-            // children as one of the two `sessionEnabled` terms (`execution.ts:1027,1039`). Carried
+            // children as one of the two `sessionEnabled` terms (`execution.ts:1027,1039` @v0.34.0). Carried
             // from `RunnerConfig::share`; `None` is "omitted", which is NOT enabling.
             share: self.share,
             // SUBA-N03 — this step's own already-resolved session directory (pi's `--session-dir`,
@@ -2520,7 +2520,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // SUBA-N05: the run's resolved live-control config, threaded from
             // [`RunnerConfig::control`] (background) or [`ExecSingleStepExecutor::with_control`]
             // (foreground chain/parallel) — pi `controlConfig: input.controlConfig` on the
-            // per-step `runSync` call (`chain-execution.ts:388,1064,1323` @v0.34.0), and
+            // per-step `runSync` call (`chain-execution.ts:322,491,733` @v0.34.0), and
             // `config.controlConfig ?? DEFAULT_CONTROL_CONFIG` in the async runner
             // (`subagent-runner.ts:1802`). `None` still degrades to `DEFAULT_CONTROL_CONFIG` inside
             // `run_sync`, so an omitted config keeps control tracking ON with stock thresholds
@@ -2748,13 +2748,13 @@ fn spawn_control_watcher(
         // seeds `bytes_written` from the file's CURRENT length, so each writer's cap is measured
         // against the file as it actually is, not against its own contribution.
         let mut events = BoundedJsonlWriter::create(&run_paths.events).await.ok();
-        // pi's in-memory `pendingStepSteers` (`subagent-runner.ts:1332,2071-2075`): a steer that
+        // pi's in-memory `pendingStepSteers` (`subagent-runner.ts:1332,2071-2075` @v0.34.0): a steer that
         // arrives while its target child is still `pending` is HELD, not dropped, and re-attempted.
         //
         // [CYRUP-DELTA] pi flushes the pending queue from an explicit per-step
         // `flushPendingStepSteers(flatIndex)` hook at each dispatch site; this task instead
         // re-attempts on the SAME fixed interval pi's own `watchAsyncControlInbox` runs its poll
-        // safety net at (`runs/background/control-channel.ts:319`). Same guarantee — a held steer lands as soon as
+        // safety net at (`runs/background/control-channel.ts:625-692`). Same guarantee — a held steer lands as soon as
         // its child starts running — reached through the polling half of R-SA-082 rather than a new
         // hook threaded through three dispatch sites. It also closes a real gap: cyrup's watcher
         // previously had NO interval at all, so it depended entirely on `notify` firing.
@@ -3071,7 +3071,7 @@ async fn finish_run(
     status.state = terminal_state;
     status.last_update = now;
     status.ended_at = Some(now);
-    // pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:1167,2411`): the
+    // pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:3021` @v0.34.0): the
     // terminal `status.json` write carries the SAME `cwd`/`sessionFile` the terminal `ResultFile`
     // below does, so `resume`'s terminal-revival branch (R-SA-085) can read `status.cwd ??
     // result.cwd` (`background/async-resume.ts:323,345,373`) straight off the reconciled status
@@ -3941,7 +3941,7 @@ mod tests {
         assert!(!result.success);
     }
 
-    /// pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:1167,2411`): the
+    /// pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:3021` @v0.34.0): the
     /// terminal `status.json` write must carry the SAME `cwd`/`sessionFile` the terminal
     /// `ResultFile` does, so `resume`'s terminal-revival branch (R-SA-085,
     /// `background/async-resume.ts:323,345,373`) can read `status.cwd ?? result.cwd` straight off
@@ -4117,7 +4117,7 @@ mod tests {
     ///
     /// A parallel group's children live on `RunStatus::parallel_groups`, not in the flat `steps`
     /// list, and upstream's `stopRunner` sweep marks every non-terminal one `"stopped"` with the
-    /// stop message (`subagent-runner.ts:2965-2974`, whose `statusPayload.steps` walk covers the
+    /// stop message (`subagent-runner.ts:2955-2986`, whose `statusPayload.steps` walk covers the
     /// normalized parallel children too). The flat half was covered by the mid-flight stop
     /// integration test; the group half never was — a single-step run has no groups at all.
     ///
@@ -4203,7 +4203,7 @@ mod tests {
     /// that had already settled before the stop landed.
     ///
     /// pi's own promotion is `stopped: stoppedAfterAcceptance ? true : finalResult?.stopped`
-    /// (`subagent-runner.ts:1642,1722`), applied to the child the stop signal tore down — a child
+    /// (`subagent-runner.ts:1642,1722` @v0.43.0), applied to the child the stop signal tore down — a child
     /// whose record settled while `stopSignal.aborted` was still false keeps its own verdict.
     /// cyrup's witness for "torn down by the stop" is `interrupted` (all three control verbs share
     /// one cancellation token), so this asserts the filter, not just the rewrite.

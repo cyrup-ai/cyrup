@@ -390,7 +390,7 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
         .await
         .expect("execute_command does not error")
         .expect("check produces textual output");
-    // pi's real rendering (slash-commands.ts:1267-1274): "<agent> -> <model> — registry
+    // pi's real rendering (slash-commands.ts:984 @v0.43.0): "<agent> -> <model> — registry
     // ok|missing; probe <status>(...)" — never the literal "OK"/"UNKNOWN" this test used to
     // assert on (pi's own real output never emits those uppercase tokens anywhere).
     assert!(ok_output.contains(&known_model), "got: {ok_output}");
@@ -487,7 +487,7 @@ async fn subagents_companions_is_no_longer_a_registered_command() {
 /// nothing reads, and the next `hide`-equivalent write would resurrect it.
 ///
 /// Upstream deleted the field from `ExtensionConfig` and the three `CompanionSuggestion*` types from
-/// `src/shared/types.ts` in the SAME commit (`3ac0ef5`, `shared/types.ts:948-965,975`).
+/// `src/shared/types.ts` in the SAME commit (`3ac0ef5`, `shared/types.ts:1743-1789`).
 ///
 /// The user action: a `~/.cyrup/subagents/config.json` that still carries the legacy block must load
 /// without error (an old config must not brick a session) and must NOT be re-serialized with it.

@@ -584,7 +584,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 /// Upstream fixes this order in two places and cyrup mirrors both: the inbox drain order
 /// (`runs/background/control-channel.ts:653-655` @v0.43.0 — `consumeStopRequest` → `consumeTimeoutRequest` →
 /// `consumeInterruptRequest`) and `stopRunner`'s mutual-exclusion guard
-/// (`subagent-runner.ts:2956`: `if (stopped || timedOut || interrupted || …) return`). The terminal
+/// (`subagent-runner.ts:2955-2986`: `if (stopped || timedOut || interrupted || …) return`). The terminal
 /// record must always be the HARDEST, least-resumable verdict — and a timeout is `Failed`, which
 /// would lose the fact that a human explicitly stopped this run.
 ///

@@ -321,7 +321,7 @@ mod tests {
     fn verb_sources_and_failure_events_match_pi_literals() {
         assert_eq!(CascadeVerb::Interrupt.source(), "ancestor-interrupt");
         assert_eq!(CascadeVerb::Timeout.source(), "ancestor-timeout");
-        // G77 — pi `stopNestedAsyncDescendants` (`subagent-runner.ts:2300`).
+        // G77 — pi `stopNestedAsyncDescendants` (`subagent-runner.ts:2281-2311`).
         assert_eq!(CascadeVerb::Stop.source(), "ancestor-stop");
         assert_eq!(
             CascadeVerb::Interrupt.failure_event_type(),

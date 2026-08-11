@@ -1,6 +1,6 @@
 //! `{text, expandedText}` tool-call argument previews (R-SA-043's compaction target), a 1:1 port
 //! of pi-subagents' `ToolCallSummary` + `formatToolCall`/`shortenPath`
-//! (`pi-subagents/src/shared/types.ts:601-604`, `src/shared/formatters.ts:99-133`,
+//! (`pi-subagents/src/shared/types.ts:603-606` @v0.43.0, `src/shared/formatters.ts:99-133`,
 //! `src/shared/utils.ts:309-326`).
 //!
 //! A completed run's `tool_calls` is NOT a bare list of tool names — pi surfaces one
@@ -11,7 +11,7 @@
 //! an on-disk `SingleResult` / a rendered result row shows what an LLM caller and a terminal user
 //! see in pi, not merely the tool's name.
 
-/// One tool-call preview (pi `ToolCallSummary`, `shared/types.ts:225-228`): a short `text` and a longer
+/// One tool-call preview (pi `ToolCallSummary`, `shared/types.ts:603-606`): a short `text` and a longer
 /// `expanded_text`, both formatted from the tool name + its requested arguments via
 /// [`format_tool_call`]. `#[serde(rename_all = "camelCase")]` so `expanded_text` round-trips as
 /// `expandedText`, matching pi's on-disk/wire field name exactly.
@@ -77,7 +77,7 @@ pub fn format_tool_call(name: &str, args: &serde_json::Value, expanded: bool) ->
 
 /// pi `extractToolArgsPreview` (`pi-subagents/src/shared/utils.ts:521-573`): the SHORT argument
 /// preview pi stores on `AgentProgress.currentToolArgs` and then copies verbatim onto each
-/// `recentTools[].args` entry (`runs/foreground/execution.ts:794,807`). Distinct from
+/// `recentTools[].args` entry (`runs/foreground/execution.ts:886,899` @v0.43.0). Distinct from
 /// [`format_tool_call`], which renders `<tool> <args>` for a transcript row; this renders the
 /// arguments ALONE for a live activity line.
 ///
@@ -120,7 +120,7 @@ pub fn extract_tool_args_preview(args: &serde_json::Value) -> String {
         Some(format!("{first}{suffix}"))
     }
 
-    // pi `truncatePreview` (`utils.ts:522-523`): `slice(0, maxLength - 3) + "..."`, i.e. the
+    // pi `truncatePreview` (`utils.ts:525-526`): `slice(0, maxLength - 3) + "..."`, i.e. the
     // ellipsis is INSIDE the budget (unlike `truncate_with_ellipsis`, which appends past it).
     fn truncate_preview(value: &str, max_length: usize) -> String {
         if value.chars().count() <= max_length {
@@ -177,7 +177,7 @@ pub fn extract_tool_args_preview(args: &serde_json::Value) -> String {
         return truncate_preview(prompt, 60);
     }
 
-    // pi `previewKeys` (`utils.ts:555`), in pi's own order. Note pi's guard here is
+    // pi `previewKeys` (`utils.ts:559`), in pi's own order. Note pi's guard here is
     // `args[key] && typeof args[key] === "string"` — non-EMPTY, but NOT trim-checked, so a
     // whitespace-only value wins this rung where it would have lost the named rungs above.
     for key in ["command", "path", "file_path", "pattern", "query", "url", "task", "describe", "search"]

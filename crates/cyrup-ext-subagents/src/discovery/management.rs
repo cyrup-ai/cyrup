@@ -1259,7 +1259,7 @@ fn serialize_chain_json(def: &ChainDefinition) -> String {
 // Management-action dispatch + renderers — a faithful port of pi's `agent-management.ts`
 // `handleManagementAction`/`handleList`/`handleGet`/`handleModels`/`handleCreate`/`handleUpdate`/
 // `handleDelete` + `formatAgentDetail`/`formatChainDetail`/`formatChainStepDetail`
-// (`agent-management.ts:44-880`). This is the C3 wire-up: the low-level CRUD above finally gains its
+// (`agent-management.ts:1242-1256`). This is the C3 wire-up: the low-level CRUD above finally gains its
 // real production callers, driven by the `subagent` tool's `action` enum
 // (`list`/`get`/`models`/`create`/`update`/`delete`) via `extension.rs::route_management_action`.
 //
@@ -1310,7 +1310,7 @@ pub const BUILTIN_AGENT_NAMES: [&str; 7] = [
 ];
 
 /// The management-relevant subset of the `subagent` tool's parsed parameters (pi `ManagementParams`,
-/// `agent-management.ts:36-42`). Borrowed from the caller's already-parsed `SubagentToolParams` so
+/// `agent-management.ts:45-51`). Borrowed from the caller's already-parsed `SubagentToolParams` so
 /// `extension.rs` owns the JSON deserialization and this module owns only the management semantics.
 pub struct ManagementRequest<'a> {
     pub agent: Option<&'a str>,
@@ -1353,7 +1353,7 @@ pub struct ProactiveSkillsInput<'a> {
 }
 
 /// The rendered outcome of a management action — pi's `result(text, isError)`
-/// (`agent-management.ts:44-46`). `is_error` mirrors pi's `AgentToolResult.isError`; the caller maps
+/// (`agent-management.ts:43-44`). `is_error` mirrors pi's `AgentToolResult.isError`; the caller maps
 /// `is_error == true` to a `ToolError` (cyrup surfaces tool failures as `Err`, R-02-024) while still
 /// preserving pi's exact human-facing text verbatim.
 pub struct ManagementOutcome {
@@ -1387,7 +1387,7 @@ pub const MANAGEMENT_ACTIONS: [&str; 10] = [
 pub const MUTATING_MANAGEMENT_ACTIONS: [&str; 7] =
     ["create", "update", "delete", "eject", "disable", "enable", "reset"];
 
-/// pi's `handleManagementAction` (`agent-management.ts:870-880`): dispatch a management `action` to
+/// pi's `handleManagementAction` (`agent-management.ts:1242-1256`): dispatch a management `action` to
 /// its handler. Discovery is re-run per call inside each handler (R-SA-019), never cached across a
 /// create -> get -> update -> delete sequence.
 ///
@@ -1445,7 +1445,7 @@ fn override_scope_str(scope: OverrideScope) -> &'static str {
     }
 }
 
-/// pi `asDisambiguationScope` (`agent-management.ts:70-73`): `"user"`/`"project"` pass through,
+/// pi `asDisambiguationScope` (`agent-management.ts:79-82`): `"user"`/`"project"` pass through,
 /// anything else (incl. absent / `"both"`) is `None`.
 fn disambiguation_scope(scope: Option<&str>) -> Option<AgentSource> {
     match scope {
@@ -1455,7 +1455,7 @@ fn disambiguation_scope(scope: Option<&str>) -> Option<AgentSource> {
     }
 }
 
-/// pi `normalizeListScope` (`agent-management.ts:75-79`): absent -> both; `"user"`/`"project"`/
+/// pi `normalizeListScope` (`agent-management.ts:90-94`): absent -> both; `"user"`/`"project"`/
 /// `"both"` pass through; any other value falls back to both. `None` here means "both".
 fn normalize_list_scope(scope: Option<&str>) -> Option<AgentSource> {
     match scope {
@@ -1465,7 +1465,7 @@ fn normalize_list_scope(scope: Option<&str>) -> Option<AgentSource> {
     }
 }
 
-/// pi `sanitizeName` (`agent-management.ts:81-83`): `lowercase`, `trim`, `\s+`->`-`, strip
+/// pi `sanitizeName` (`agent-management.ts:96-98`): `lowercase`, `trim`, `\s+`->`-`, strip
 /// `[^a-z0-9-]`, `-+`->`-`, trim leading/trailing `-`.
 fn sanitize_name(name: &str) -> String {
     let lowered = name.to_lowercase();
@@ -1491,7 +1491,7 @@ fn sanitize_name(name: &str) -> String {
     collapsed.trim_matches('-').to_string()
 }
 
-/// pi `parseCsv` (`agent-management.ts:48-50`): split on `,`, trim, drop empties, dedup preserving
+/// pi `parseCsv` (`agent-management.ts:57-59`): split on `,`, trim, drop empties, dedup preserving
 /// first occurrence.
 fn parse_csv(value: &str) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -1505,7 +1505,7 @@ fn parse_csv(value: &str) -> Vec<String> {
     out
 }
 
-/// pi `parseTools` (`agent-management.ts:310-320`): split CSV; `mcp:`-prefixed entries become MCP
+/// pi `parseTools` (`agent-management.ts:395-408`): split CSV; `mcp:`-prefixed entries become MCP
 /// direct-tool refs (prefix stripped, verbatim otherwise), the rest builtin refs. cyrup unifies both
 /// into one `Vec<ToolRef>` (MCP entries preserved as [`ToolRef::Mcp`] without the `mcp:` prefix,
 /// matching [`tool_ref_to_frontmatter_entry`]'s inverse).
@@ -1545,7 +1545,7 @@ fn default_inherit_project_context(local_name: &str) -> bool {
 // config-object / package-name parsing (pi configObject / parsePackageName)
 // -------------------------------------------------------------------------------------------
 
-/// pi `configObject` (`agent-management.ts:52-64`): a JSON-string config is `JSON.parse`d (parse
+/// pi `configObject` (`agent-management.ts:61-73`): a JSON-string config is `JSON.parse`d (parse
 /// failure -> `config must be valid JSON: …`); a non-object (or array) yields `Ok(None)`; an object
 /// yields `Ok(Some(map))`.
 fn config_object(
@@ -1588,7 +1588,7 @@ fn parse_package_config(value: Option<&serde_json::Value>) -> Result<Option<Stri
 
 // -------------------------------------------------------------------------------------------
 // applyAgentConfig: parse the caller's `config` object into an `AgentFields` delta (pi
-// applyAgentConfig, agent-management.ts:322-417). Exact pi error strings are reproduced verbatim
+// applyAgentConfig, agent-management.ts:410-615). Exact pi error strings are reproduced verbatim
 // (the tool test-suite pins several, e.g. `config.completionGuard must be a boolean`).
 // -------------------------------------------------------------------------------------------
 
@@ -1726,7 +1726,7 @@ fn apply_agent_config(
         }
     }
     if let Some(v) = cfg.get("thinking") {
-        // pi `applyAgentConfig` (`agent-management.ts:368-372`): `false`/`""` clears; any other
+        // pi `applyAgentConfig` (`agent-management.ts:507-514`): `false`/`""` clears; any other
         // string sets the OPEN value (trimmed; a whitespace-only value clears). No closed-enum
         // coercion — an arbitrary/`off` value is preserved verbatim.
         if v == &Value::Bool(false) || v.as_str() == Some("") {
@@ -2001,13 +2001,13 @@ fn find_agents(d: &AgentDiscoveryResult, name: &str, scope: Option<AgentSource>)
 
 /// The DISTINCT canonical names present in a match set, sorted — pi's
 /// `[...new Set(matches.map(m => m.name))].sort((a, b) => a.localeCompare(b))`
-/// (`agent-management.ts:624-626,880-882`). More than one entry means the requested name/alias is
+/// (`agent-management.ts:624-626,880-882` @v0.43.0). More than one entry means the requested name/alias is
 /// ambiguous and every caller must refuse rather than pick.
 fn distinct_agent_names<'a>(matches: impl IntoIterator<Item = &'a AgentDefinition>) -> Vec<String> {
     matches.into_iter().map(|a| a.name.clone()).collect::<BTreeSet<_>>().into_iter().collect()
 }
 
-/// pi `findChains` (`agent-management.ts:108-114`).
+/// pi `findChains` (`agent-management.ts:128-134`).
 fn find_chains(d: &AgentDiscoveryResult, name: &str, scope: Option<AgentSource>) -> Vec<ChainDefinition> {
     let raw = name.trim();
     let sanitized = sanitize_name(raw);
@@ -2022,7 +2022,7 @@ fn find_chains(d: &AgentDiscoveryResult, name: &str, scope: Option<AgentSource>)
     matches
 }
 
-/// pi `availableNames(cwd, "agent")` (`agent-management.ts:93-97`): unique, sorted runtime names.
+/// pi `availableNames(cwd, "agent")` (`agent-management.ts:108-112`): unique, sorted runtime names.
 fn available_agent_names(d: &AgentDiscoveryResult) -> Vec<String> {
     d.agents
         .iter()
@@ -2041,7 +2041,7 @@ fn available_chain_names(d: &AgentDiscoveryResult) -> Vec<String> {
         .collect()
 }
 
-/// pi `nameExistsInScope` (`agent-management.ts:116-125`): whether an agent OR chain with this
+/// pi `nameExistsInScope` (`agent-management.ts:154-163`): whether an agent OR chain with this
 /// runtime name already exists in the given writable scope (excluding one path, used on rename).
 fn name_exists_in_scope(
     d: &AgentDiscoveryResult,
@@ -2062,7 +2062,7 @@ fn name_exists_in_scope(
     false
 }
 
-/// pi `unknownChainAgents` (`agent-management.ts:131-135`): step agents that resolve to no known
+/// pi `unknownChainAgents` (`agent-management.ts:169-174`): step agents that resolve to no known
 /// agent name, unique and sorted. Dynamic (agent-less) steps are skipped.
 fn unknown_chain_agents(d: &AgentDiscoveryResult, steps: &[ChainStepConfig]) -> Vec<String> {
     // pi v0.43.0 (`agent-management.ts:169-174`) replaced the `new Set(allAgents(d).map(a => a.name))`
@@ -2136,7 +2136,7 @@ impl TargetKind {
     }
 }
 
-/// pi `resolveTarget` (`agent-management.ts:419-444`): pick the single writable target for a
+/// pi `resolveTarget` (`agent-management.ts:617-646`): pick the single writable target for a
 /// mutating action, producing pi's exact read-only / not-found / disambiguation messages as an
 /// error [`ManagementOutcome`].
 fn resolve_target<T: MutableTarget>(
@@ -2240,7 +2240,7 @@ fn resolve_target<T: MutableTarget>(
 // Renderers (pi formatAgentDetail / formatChainDetail / formatChainStepDetail, 463-537)
 // -------------------------------------------------------------------------------------------
 
-/// pi `formatAgentDetail` (`agent-management.ts:463-489`).
+/// pi `formatAgentDetail` (`agent-management.ts:665-701`).
 fn format_agent_detail(a: &AgentDefinition) -> String {
     let mut tools_out: Vec<String> = Vec::new();
     if let Some(tools) = &a.tools {
@@ -2369,7 +2369,7 @@ fn format_agent_detail(a: &AgentDefinition) -> String {
     lines.join("\n")
 }
 
-/// pi `formatChainStepDetail` (`agent-management.ts:491-524`).
+/// pi `formatChainStepDetail` (`agent-management.ts:703-738`).
 fn format_chain_step_detail(step: &ChainStepConfig, index: usize) -> Vec<String> {
     let n = index + 1;
     let mut lines: Vec<String> = Vec::new();
@@ -2469,7 +2469,7 @@ fn format_chain_step_detail(step: &ChainStepConfig, index: usize) -> Vec<String>
     lines
 }
 
-/// pi `formatChainDetail` (`agent-management.ts:526-537`).
+/// pi `formatChainDetail` (`agent-management.ts:740-751`).
 fn format_chain_detail(c: &ChainDefinition) -> String {
     let mut lines: Vec<String> = vec![
         format!("Chain: {} ({})", c.name, source_str(c.source)),
@@ -2581,7 +2581,7 @@ fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Ma
             lines.push(format!("- {} ({}): {}", c.name, source_str(c.source), c.description));
         }
     }
-    // pi `agent-management.ts:765-770,784`: the proactive suggestions are computed from the same
+    // pi `agent-management.ts:765-770,784` @v0.43.0: the proactive suggestions are computed from the same
     // filtered `agents`/`chains` this listing rendered, and spliced in after `Chains:` and before
     // `Chain diagnostics:` — with a leading blank line, and only when non-empty.
     if let Some(proactive) = &req.proactive_skills {
@@ -2618,7 +2618,7 @@ fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Ma
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 
-/// pi `handleGet` (`agent-management.ts:649-677`).
+/// pi `handleGet` (`agent-management.ts:871-906`).
 fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
     if req.agent.is_none() && req.chain_name.is_none() {
         return Ok(ManagementOutcome::err("Specify 'agent' or 'chainName' for get."));
@@ -2683,11 +2683,11 @@ fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Man
     Ok(ManagementOutcome { text: blocks.join("\n\n"), is_error: !any_found })
 }
 
-/// Port of pi `formatModelSource` (`agent-management.ts:568-578`). The live parent session model is
+/// Port of pi `formatModelSource` (`agent-management.ts:790-800`). The live parent session model is
 /// now threaded in as `current_session_model` (from [`ManagementRequest::current_session_model`] /
 /// [`cyrup_ext::host::HostServices::current_model`]), so when the persona declares no `model` but a
 /// live session model is bound this reports "inherits current session model" (pi's own wording,
-/// agent-management.ts:576); otherwise it classifies from discovery-time provenance (`override_info`
+/// agent-management.ts:798); otherwise it classifies from discovery-time provenance (`override_info`
 /// / `model_source`) and the agent's own resolved `model`.
 fn format_model_source(agent: &AgentDefinition, current_session_model: Option<&str>) -> String {
     if let Some(info) = &agent.override_info
@@ -2707,7 +2707,7 @@ fn format_model_source(agent: &AgentDefinition, current_session_model: Option<&s
     "inherit requested, but no current session model is available".to_string()
 }
 
-/// pi `handleModels` (`agent-management.ts:580-647`): the live parent session model is now threaded
+/// pi `handleModels` (`agent-management.ts:802-869`): the live parent session model is now threaded
 /// in via [`ManagementRequest::current_session_model`] (from
 /// [`cyrup_ext::host::HostServices::current_model`]), so `Current session model` renders the real
 /// `provider/id` and an inheriting persona's effective model falls back to it; both degrade to
@@ -2825,7 +2825,7 @@ fn pick_scope_dir(cfg: &AgentDiscoveryConfig, scope: AgentSource, is_chain: bool
     dirs.last().cloned()
 }
 
-/// pi `handleCreate` (`agent-management.ts:679-738`). Model/skills registry warnings are deferred
+/// pi `handleCreate` (`agent-management.ts:908-975`). Model/skills registry warnings are deferred
 /// (see section header); the create + name-collision + shadow-note + unknown-agent warnings are
 /// faithful.
 fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
@@ -2943,7 +2943,7 @@ fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 
-/// The base definition to edit: pi `editableAgentConfig` (`agent-management.ts:174-196`) un-applies a
+/// The base definition to edit: pi `editableAgentConfig` (`agent-management.ts:217-267`) un-applies a
 /// settings override so an update writes the agent's own base values, never the override-applied
 /// ones. Settings overrides are inert today (C2), so `override_info` is always `None` and this is a
 /// clone — kept forward-compatible for the moment C2 lands.
@@ -2965,7 +2965,7 @@ fn editable_base(target: &AgentDefinition) -> AgentDefinition {
     base
 }
 
-/// pi `handleUpdate` (`agent-management.ts:740-847`). Model/fallback/skills registry warnings are
+/// pi `handleUpdate` (`agent-management.ts:977-1088`). Model/fallback/skills registry warnings are
 /// deferred (see section header); rename, package repackaging, unknown-agent warnings, and the
 /// still-referenced-after-rename warning are faithful.
 fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
@@ -3150,7 +3150,7 @@ fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 
-/// pi `handleDelete` (`agent-management.ts:849-868`).
+/// pi `handleDelete` (`agent-management.ts:1090-1109`).
 fn handle_delete(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
     if req.agent.is_none() && req.chain_name.is_none() {
         return Ok(ManagementOutcome::err("Specify 'agent' or 'chainName' for delete."));
@@ -3202,7 +3202,7 @@ fn handle_delete(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
 
 // =================================================================================================
 // SUBA-005: the tier-aware / settings-writing management actions
-// (pi `handleEject`/`handleDisable`/`handleEnable`/`handleReset`, `agent-management.ts:909-1032`)
+// (pi `handleEject`/`handleDisable`/`handleEnable`/`handleReset`, `agent-management.ts:1111-1240`)
 // =================================================================================================
 //
 // These four are the last of pi's ten `ManagementAction`s to be ported. They differ from the six
@@ -3223,7 +3223,7 @@ fn handle_delete(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
 // not actually change, naming the higher-precedence scope that is winning. A settings write that is
 // silently overruled by the other scope is exactly the failure a user cannot debug on their own.
 
-/// pi `actionScope` (`agent-management.ts:79-83`): unlike the CRUD actions' `asDisambiguationScope`
+/// pi `actionScope` (`agent-management.ts:84-88`): unlike the CRUD actions' `asDisambiguationScope`
 /// (where an absent/unrecognized `agentScope` means "both, disambiguate later"), these four actions
 /// each write to exactly ONE scope, so an absent `agentScope` defaults to `user` and anything other
 /// than `user`/`project` is a hard validation error naming the action.
@@ -3306,7 +3306,7 @@ fn writable_tier(tiers: &super::merge::TieredAgents, scope: AgentSource) -> &[Ag
 }
 
 /// The `settings.json` path these actions write for `scope`, or pi's verbatim refusal when the
-/// project scope does not exist at all (`agent-management.ts:955-957`, mirrored for enable/reset).
+/// project scope does not exist at all (`agent-management.ts:1157`, mirrored for enable/reset at `:1181`/`:1210`).
 ///
 /// `project_settings_path` is `None` **only** when the discovery config was built with no project
 /// root; an existing project root whose `settings.json` has not been created yet is `Some(path)`
@@ -3345,7 +3345,7 @@ fn with_settings_reread(cfg: &AgentDiscoveryConfig) -> Result<AgentDiscoveryConf
     Ok(refreshed)
 }
 
-/// pi `handleEject` (`agent-management.ts:909-943`): copy a read-only builtin/package agent file
+/// pi `handleEject` (`agent-management.ts:1111-1147`): copy a read-only builtin/package agent file
 /// verbatim into a writable scope so it can be customized, refusing rather than clobbering whenever
 /// the destination is already occupied.
 ///
@@ -3430,7 +3430,7 @@ fn handle_eject(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<M
     )))
 }
 
-/// pi `handleDisable` (`agent-management.ts:947-968`): write `{ disabled: true }` into
+/// pi `handleDisable` (`agent-management.ts:1149-1171`): write `{ disabled: true }` into
 /// `subagents.agentOverrides.<name>` at `scope`, then RE-DISCOVER and verify the agent actually
 /// became invisible — reporting an error (naming the winning scope) if a higher-precedence override
 /// overruled the write.
@@ -3495,7 +3495,7 @@ fn handle_disable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result
     )))
 }
 
-/// pi `handleEnable` (`agent-management.ts:970-996`): remove ONLY the `disabled` field from
+/// pi `handleEnable` (`agent-management.ts:1173-1199`): remove ONLY the `disabled` field from
 /// `subagents.agentOverrides.<name>` at `scope` (an agent's other overrides — its model, tools,
 /// thinking budget — survive being re-enabled), then re-discover and verify.
 fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
@@ -3574,7 +3574,7 @@ fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
     )))
 }
 
-/// pi `handleReset` (`agent-management.ts:998-1032`): undo BOTH halves of a customization at
+/// pi `handleReset` (`agent-management.ts:1201-1240`): undo BOTH halves of a customization at
 /// `scope` — delete the custom `.md` file that shadows a bundled agent, and delete the whole
 /// `subagents.agentOverrides.<name>` entry — returning the agent to its bundled default.
 ///
@@ -4461,7 +4461,7 @@ mod tests {
         }
     }
 
-    // ---- pi `handleList`'s proactive skill-subagent block (`agent-management.ts:765-770,784`) ----
+    // ---- pi `handleList`'s proactive skill-subagent block (`agent-management.ts:765-770,784` @v0.43.0) ----
 
     /// Two user agents that both name the same skill, so the skill clears the default
     /// `minReferences: 2`. Returns the request-side availability list that makes it recommendable.
@@ -4574,6 +4574,136 @@ mod tests {
         );
     }
 
+    /// Upstream's splice is `...(proactiveSuggestions.length ? ["", ...proactiveSuggestions] : [])`
+    /// (`agent-management.ts:784` @v0.43.0). The FALSE branch contributes NOTHING — not even the
+    /// separator — so a listing with no suggestions must be byte-identical to one that never asked
+    /// for them. Pinned here because pi's `lines.join("\n")` layout makes a stray `""` a real
+    /// rendering defect: it trails the whole listing with a blank line, or doubles the single blank
+    /// line that introduces `Chain diagnostics:`.
+    #[test]
+    fn list_emits_no_separator_when_the_proactive_block_is_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        // Agents that DO share a skill, so only the empty availability list suppresses the block —
+        // the recommender really runs and really returns nothing.
+        let _available = seed_two_agents_sharing_a_skill(&cfg);
+        let empty: Vec<crate::discovery::skills::AvailableSkill> = Vec::new();
+
+        let mut asked = mreq(None, None, None, None);
+        asked.proactive_skills = Some(ProactiveSkillsInput {
+            setting: None,
+            available_skills: &empty,
+        });
+        let with_scan = handle_management_action(&cfg, "list", &asked).expect("list ok");
+        let without_scan =
+            handle_management_action(&cfg, "list", &mreq(None, None, None, None)).expect("list ok");
+
+        assert_eq!(
+            with_scan.text, without_scan.text,
+            "an empty suggestion list must contribute NO lines at all — upstream's `: []` branch \
+             appends neither the block nor its blank-line separator"
+        );
+        assert!(
+            !with_scan.text.ends_with('\n'),
+            "a spurious separator would trail the listing with a blank line:\n{:?}",
+            with_scan.text
+        );
+
+        // ...and with chain diagnostics present, the ONE blank line that introduces them must stay
+        // one: an unconditional separator would render `\n\n\nChain diagnostics:`.
+        std::fs::create_dir_all(&cfg.user_chain_dirs[0]).expect("mkdir chains");
+        std::fs::write(
+            cfg.user_chain_dirs[0].join("broken.chain.json"),
+            "{ this is not json",
+        )
+        .expect("write broken chain");
+        let with_diags = handle_management_action(&cfg, "list", &asked).expect("list ok");
+        assert!(
+            with_diags.text.contains("\n\nChain diagnostics:"),
+            "the diagnostics block keeps its single leading blank line:\n{}",
+            with_diags.text
+        );
+        assert!(
+            !with_diags.text.contains("\n\n\n"),
+            "an empty proactive block must not double the diagnostics separator:\n{:?}",
+            with_diags.text
+        );
+    }
+
+    /// pi counts a CHAIN's step skills as references exactly like an agent's `skills`
+    /// (`proactive-skills.ts:132-140`: every skill `collectStepSkills` gathers for a chain adds one
+    /// `chain:<name>` source), and the `sources.size >= config.minReferences` filter
+    /// (`proactive-skills.ts:72-90`) then sees agent and chain sources on equal footing. So one agent
+    /// plus one chain naming the same skill is enough to clear the default `minReferences: 2`.
+    ///
+    /// This pins BOTH ends of `handle_list`'s chain wiring: that `chains` reaches the recommender at
+    /// all (upstream passes its own post-filter `chains` local, `agent-management.ts:767`), and that
+    /// `collect_chain_step_skills` recurses into nested `parallel` steps
+    /// (`proactive-skills.ts:77-89`).
+    #[test]
+    fn list_counts_chain_step_skills_toward_min_references() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        // One agent per skill: neither reaches `minReferences: 2` on agents alone.
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "auditor-one.md",
+            "---\nname: auditor-one\ndescription: First auditor\nskills: audit-trail\n---\nBody.\n",
+        );
+        write_agent_md(
+            &cfg.user_agent_dirs[0],
+            "diver.md",
+            "---\nname: diver\ndescription: Deep diver\nskills: deep-dive\n---\nBody.\n",
+        );
+        // One chain supplies the second reference for each: `audit-trail` on a top-level step and
+        // `deep-dive` only inside a nested `parallel` child.
+        std::fs::create_dir_all(&cfg.user_chain_dirs[0]).expect("mkdir chains");
+        std::fs::write(
+            cfg.user_chain_dirs[0].join("audit-run.chain.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "audit-run",
+                "description": "Audit then dive",
+                "chain": [
+                    { "agent": "auditor-one", "task": "audit it", "skills": ["audit-trail"] },
+                    { "parallel": [
+                        { "agent": "diver", "task": "dive in", "skills": ["deep-dive"] }
+                    ] }
+                ]
+            }))
+            .expect("serialize chain"),
+        )
+        .expect("write chain");
+
+        let available = vec![
+            crate::discovery::skills::AvailableSkill {
+                name: "audit-trail".to_string(),
+                description: Some("Trace every mutation.".to_string()),
+            },
+            crate::discovery::skills::AvailableSkill {
+                name: "deep-dive".to_string(),
+                description: None,
+            },
+        ];
+        let mut req = mreq(None, None, None, None);
+        req.proactive_skills = Some(ProactiveSkillsInput {
+            setting: None, // pi's `undefined` — `minReferences` defaults to 2
+            available_skills: &available,
+        });
+        let out = handle_management_action(&cfg, "list", &req).expect("list ok");
+        assert!(!out.is_error, "{}", out.text);
+        let t = out.text;
+
+        assert!(
+            t.contains("- audit-trail via reviewer (referenced by 2 configured agents/chains; agent:auditor-one, chain:audit-run) - Trace every mutation."),
+            "a chain step's `skills` must count as a `chain:<name>` source toward `minReferences`:\n{t}"
+        );
+        assert!(
+            t.contains("- deep-dive via reviewer (referenced by 2 configured agents/chains; agent:diver, chain:audit-run)"),
+            "`collectStepSkills` recurses into nested `parallel` children, so a skill named only \
+             there still contributes its chain source:\n{t}"
+        );
+    }
+
     /// The extension-config shape (`config.json`'s `proactiveSkillSubagents`) must reach the
     /// recommender's own setting shape without losing the disable — the bridge is what
     /// `extension.rs::route_management_action` calls.
@@ -4606,6 +4736,64 @@ mod tests {
         assert_eq!(resolved.min_references, 1);
         assert_eq!(resolved.max_recommendations, 2);
         assert_eq!(resolved.preferred_agent, "scout");
+    }
+
+    /// pi's `positiveInteger` (`proactive-skills.ts:32-36` — five lines) returns `undefined` for
+    /// anything that is not a finite integer `>= 1`, and `resolveProactiveSkillSubagentsConfig`
+    /// (`:50,:53`) then falls through to `DEFAULT_MIN_REFERENCES` / `DEFAULT_MAX_RECOMMENDATIONS`.
+    /// A guard that let `0` through would set `minReferences: 0` (every skill named even once gets
+    /// recommended) and `maxRecommendations: 0` (`Math.min(0, 5)` → `slice(0, 0)` → the block
+    /// silently disappears), so both directions are pinned. The negative cases are reachable only
+    /// through this `i64` shape — the `config.json` bridge narrows to `u32` — which is exactly the
+    /// signedness the port's guard is written against.
+    #[test]
+    fn proactive_config_rejects_non_positive_min_and_max_like_pis_positive_integer() {
+        use crate::discovery::skills::{
+            ProactiveSkillSubagentsConfig, ProactiveSkillSubagentsSetting,
+            resolve_proactive_skill_subagents_config,
+        };
+
+        for (min, max) in [(Some(0), Some(0)), (Some(-1), Some(-7)), (Some(-100), Some(0))] {
+            let setting = ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
+                enabled: None,
+                min_references: min,
+                max_recommendations: max,
+                preferred_agent: None,
+            });
+            let resolved = resolve_proactive_skill_subagents_config(Some(&setting));
+            assert_eq!(
+                resolved.min_references, 2,
+                "minReferences={min:?} is not a positive integer, so pi's DEFAULT_MIN_REFERENCES applies"
+            );
+            assert_eq!(
+                resolved.max_recommendations, 3,
+                "maxRecommendations={max:?} is not a positive integer, so pi's \
+                 DEFAULT_MAX_RECOMMENDATIONS applies"
+            );
+        }
+
+        // `1` is the boundary pi keeps, and the cap still clamps a large one to MAX_RECOMMENDATION_CAP.
+        let boundary = ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
+            enabled: None,
+            min_references: Some(1),
+            max_recommendations: Some(1),
+            preferred_agent: None,
+        });
+        let resolved = resolve_proactive_skill_subagents_config(Some(&boundary));
+        assert_eq!(resolved.min_references, 1);
+        assert_eq!(resolved.max_recommendations, 1);
+
+        let huge = ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
+            enabled: None,
+            min_references: None,
+            max_recommendations: Some(99),
+            preferred_agent: None,
+        });
+        assert_eq!(
+            resolve_proactive_skill_subagents_config(Some(&huge)).max_recommendations,
+            5,
+            "`Math.min(maxRecommendations, MAX_RECOMMENDATION_CAP)`, `proactive-skills.ts:54`"
+        );
     }
 
     #[test]
@@ -5026,7 +5214,7 @@ mod tests {
     }
 
     /// `list` renders `, aliases: …` and `get` renders an `Aliases:` line
-    /// (`agent-management.ts:672,774`); `get` is also reachable BY the alias.
+    /// (`agent-management.ts:672,774` @v0.43.0); `get` is also reachable BY the alias.
     #[test]
     fn list_and_get_render_aliases_and_get_resolves_by_alias() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -5052,7 +5240,7 @@ mod tests {
     }
 
     /// Two agents claiming the SAME alias make every management path that would have to pick one
-    /// refuse, with pi's `Ambiguous agent alias or name` wording (`agent-management.ts:624-626,880-882`).
+    /// refuse, with pi's `Ambiguous agent alias or name` wording (`agent-management.ts:624-626,880-882` @v0.43.0).
     #[test]
     fn an_ambiguous_alias_is_refused_by_get_update_and_disable() {
         let tmp = tempfile::tempdir().expect("tempdir");

@@ -429,7 +429,7 @@ pub struct ChainOutputEntry {
 ///
 /// It also carries the rolling [`Self::previous`] output text that a step's `{previous}` placeholder
 /// (and, absent an explicit `{previous}`, `build_chain_instructions`'s "Previous step output" suffix)
-/// resolves to (pi's `prev` local, `chain-execution.ts:608/1049/1219`). Threading `previous` through
+/// resolves to (pi's `prev` local, `chain-execution.ts:750/1049/1219`). Threading `previous` through
 /// the registry — rather than a walker-local — is what lets the background hop-2 runner (which drives
 /// the identical chain one `walk_chain(one_step)` call at a time over a single shared registry,
 /// `background/runner_main.rs:855`) get the same step-to-step `{previous}` piping the foreground
@@ -461,7 +461,7 @@ impl OutputRegistry {
     /// runtime accumulator).
     ///
     /// Registers a **structured** output: the entry's [`ChainOutputEntry::text`] becomes the value's
-    /// compact JSON encoding (pi's `compactStructuredText` = `JSON.stringify`, `chain-outputs.ts:96`)
+    /// compact JSON encoding (pi's `compactStructuredText` = `JSON.stringify`, `chain-outputs.ts:98-100`)
     /// so a `{outputs.name}` reference substitutes that JSON text, while [`ChainOutputEntry::structured`]
     /// retains the raw value for a later `DynamicGroup.expand` pointer to walk.
     pub fn register(&mut self, name: impl Into<String>, value: Value) {
@@ -491,7 +491,7 @@ impl OutputRegistry {
     }
 
     /// The rolling previous-step output text a `{previous}` placeholder resolves to (pi's `prev`,
-    /// `chain-execution.ts:1049`). Empty before the first step (and after any step that produced no
+    /// `chain-execution.ts:750`). Empty before the first step (and after any step that produced no
     /// text output).
     #[must_use]
     pub fn previous(&self) -> &str {
@@ -674,7 +674,7 @@ fn is_safe_output_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// pi's `compactStructuredText` (`chain-outputs.ts:96-97`): the compact JSON encoding
+/// pi's `compactStructuredText` (`chain-outputs.ts:98-100`): the compact JSON encoding
 /// (`JSON.stringify`) of a structured output, used as the `{outputs.name}` substitution text for a
 /// structured step. `serde_json::to_string` emits the same separator-free compact form; a value
 /// that fails to serialize (not reachable for a `serde_json::Value`, which always serializes) falls
@@ -689,7 +689,7 @@ fn compact_structured_text(value: &Value) -> String {
 // -------------------------------------------------------------------------------------------
 
 /// Resolve a chain-relative file path against `chain_dir` the way pi's `resolveChainPath`
-/// (`shared/settings.ts:299-300`) does: an absolute path is used verbatim; a relative path is joined onto
+/// (`shared/settings.ts:335-342`) does: an absolute path is used verbatim; a relative path is joined onto
 /// `chain_dir`. Rendered lossily to a `String` for embedding in the child's prompt text.
 fn resolve_chain_path(file: &Path, chain_dir: &Path) -> String {
     if file.is_absolute() {
@@ -1035,7 +1035,7 @@ pub struct StepResult {
     pub interrupted: bool,
     /// SUBA-N05 — the live-control events this step's child raised
     /// ([`crate::exec::SingleResult::control_events`], pi `result.controlEvents`,
-    /// `runs/foreground/execution.ts:1260` @v0.34.0).
+    /// `runs/foreground/execution.ts:1314` @v0.43.0).
     ///
     /// Carried here for the same reason `structured_output` is: something one layer OUT needs it
     /// and there is no other channel. The detached hop-2 runner collapses every step into a
@@ -1123,7 +1123,7 @@ impl StepResult {
 }
 
 /// The exit code pi stamps on a fan-out item that a `failFast` trip prevented from ever being
-/// dispatched (`chain-execution.ts:326`: `exitCode: -1`). Deliberately outside the `0`/`1` range
+/// dispatched (`chain-execution.ts:283`: `exitCode: -1`). Deliberately outside the `0`/`1` range
 /// [`collapse_fan_out`] maps real child outcomes to, so a consumer of the dynamic collect array
 /// can tell "never ran" apart from "ran and failed".
 const FAIL_FAST_SKIPPED_EXIT_CODE: i64 = -1;
@@ -1197,12 +1197,12 @@ pub struct ChainRunContext {
     /// [`ParallelGroupSpec`] with `worktree: true`. `None` is fine for any chain with no
     /// worktree-isolated group.
     pub worktree_base_dir: Option<PathBuf>,
-    /// The chain's overall original task text (pi `originalTask`, `chain-execution.ts:1048`), the
+    /// The chain's overall original task text (pi `originalTask`, `chain-execution.ts:632-652`), the
     /// value every step's `{task}` placeholder resolves to. Empty when the run carries no distinct
     /// top-level task (the substitution then yields the empty string, matching pi when `params.task`
     /// is empty).
     pub original_task: String,
-    /// The chain working directory (pi `chainDir`, `chain-execution.ts:1050`) that `{chain_dir}`
+    /// The chain working directory (pi `chainDir`, `chain-execution.ts:654`) that `{chain_dir}`
     /// resolves to and that [`build_chain_instructions`]'s `[Read from: …]`/`[Write to: …]` prefix
     /// paths are resolved against. `None` falls back to [`Self::cwd`] (a chain with no dedicated
     /// scratch directory writes/reads relative to its own cwd).

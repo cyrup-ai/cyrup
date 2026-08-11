@@ -1174,7 +1174,7 @@ async fn status_json_carries_live_current_tool_during_a_run() {
     );
 }
 
-/// T4 mid-flight interrupt (`subagent-runner.ts:458-466,1583-1609`): interrupting a SINGLE-step run
+/// T4 mid-flight interrupt (`subagent-runner.ts:1333,2002-2005,2069` @v0.34.0): interrupting a SINGLE-step run
 /// must actually reach and tear down the in-flight child — not be a no-op that only takes effect
 /// BETWEEN steps (a single-step run has no next step). Drives the REAL `run()` against the REAL
 /// fixture subprocess: the fixture sleeps 6000ms, and this test drops a control-inbox interrupt
@@ -1528,7 +1528,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
         "…pointing at THIS step's resolved directory: {tee}"
     );
     // `share: true` is one of the two `sessionEnabled` terms, and a session-enabled child must NOT
-    // be spawned `--no-session` (pi `execution.ts:1027,1039`).
+    // be spawned `--no-session` (pi `execution.ts:1027,1039` @v0.34.0).
     assert!(
         !tee.contains("--no-session"),
         "a run with `share: true` / an explicit sessionDir must not spawn the child \
@@ -1801,7 +1801,7 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         "the stopped step carries pi's literal stop message"
     );
 
-    // pi `subagent-runner.ts:1642,1722` — the child's own record is promoted to `stopped`, and
+    // pi `subagent-runner.ts:1642,1722` @v0.43.0 — the child's own record is promoted to `stopped`, and
     // `:909`/`:915`/`:917` give it exitCode 1, the stop message as `error`, and the stop message as
     // `finalOutput` when it produced none of its own.
     assert_eq!(result_file.results.len(), 1);

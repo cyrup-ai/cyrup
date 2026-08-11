@@ -55,26 +55,26 @@ use cyrup_core::CancelToken;
 use super::run_status::{list_active_runs, ActiveRun};
 use super::{ActivityState, RunState};
 
-/// States that mean a run is still in flight (pi `ACTIVE_STATES`, `wait.ts:56`). Matches exactly
+/// States that mean a run is still in flight (pi `ACTIVE_STATES`, `runs/background/wait.ts:55` @v0.34.0). Matches exactly
 /// what [`list_active_runs`] already returns.
 const fn is_active(state: RunState) -> bool {
     matches!(state, RunState::Queued | RunState::Running)
 }
 
-/// pi `DEFAULT_TIMEOUT_MS` (`wait.ts:58`) — 30 minutes.
+/// pi `DEFAULT_TIMEOUT_MS` (`runs/background/wait.ts:57` @v0.34.0) — 30 minutes.
 pub const DEFAULT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
-/// pi `MIN_POLL_INTERVAL_MS` (`wait.ts:59`) — the floor a caller-supplied interval is clamped to.
+/// pi `MIN_POLL_INTERVAL_MS` (`runs/background/wait.ts:58` @v0.34.0) — the floor a caller-supplied interval is clamped to.
 pub const MIN_POLL_INTERVAL_MS: u64 = 250;
-/// pi `DEFAULT_POLL_INTERVAL_MS` (`wait.ts:60`).
+/// pi `DEFAULT_POLL_INTERVAL_MS` (`runs/background/wait.ts:59` @v0.34.0).
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 
-/// pi `WAIT_TOOL_ENABLED_ENV` (`wait.ts:62`), renamed into cyrup's `CYRUP_SUBAGENT_*` family.
+/// pi `WAIT_TOOL_ENABLED_ENV` (`runs/background/wait.ts:61` @v0.34.0), renamed into cyrup's `CYRUP_SUBAGENT_*` family.
 pub const WAIT_TOOL_ENABLED_ENV: &str = "CYRUP_SUBAGENT_WAIT_TOOL_ENABLED";
 
 const WAIT_TOOL_TRUE_VALUES: [&str; 5] = ["1", "true", "yes", "on", "enabled"];
 const WAIT_TOOL_FALSE_VALUES: [&str; 5] = ["0", "false", "no", "off", "disabled"];
 
-/// pi `parseWaitToolEnabledEnv` (`wait.ts:67-74`): a set vocabulary, and anything else is a hard
+/// pi `parseWaitToolEnabledEnv` (`runs/background/wait.ts:70-77` @v0.34.0): a set vocabulary, and anything else is a hard
 /// configuration error rather than a silently-ignored value.
 ///
 /// # Errors
@@ -98,7 +98,7 @@ pub fn parse_wait_tool_enabled_env(value: Option<&str>) -> Result<Option<bool>, 
 }
 
 /// pi's `config.waitTool`, which accepts either a bare boolean or `{ enabled?: boolean }`
-/// (`configWaitToolEnabled`, `wait.ts:76-85`).
+/// (`configWaitToolEnabled`, `runs/background/wait.ts:78-88` @v0.34.0).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum WaitToolSetting {
@@ -123,7 +123,7 @@ impl WaitToolSetting {
     }
 }
 
-/// pi `resolveWaitToolConfig` (`wait.ts:97-101`): env wins over `config.waitTool`, and the tool is
+/// pi `resolveWaitToolConfig` (`runs/background/wait.ts:90-94` @v0.34.0): env wins over `config.waitTool`, and the tool is
 /// enabled when neither says otherwise.
 ///
 /// # Errors
@@ -138,7 +138,7 @@ pub fn resolve_wait_tool_enabled(
         .unwrap_or(true))
 }
 
-/// The `wait` tool's parameter object (pi `WaitParams`, `wait.ts:104-116`).
+/// The `wait` tool's parameter object (pi `WaitParams`, `runs/background/wait.ts:96-108` @v0.34.0).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WaitParams {
@@ -198,7 +198,7 @@ pub fn format_duration(ms: u64) -> String {
     format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1000)
 }
 
-/// A run flagged as needing the orchestrator's attention (pi `needsAttention`, `wait.ts:200-202`).
+/// A run flagged as needing the orchestrator's attention (pi `needsAttention`, `runs/background/wait.ts:203-205` @v0.34.0).
 fn needs_attention(run: &ActiveRun) -> bool {
     run.status.telemetry.activity_state == Some(ActivityState::NeedsAttention)
 }
@@ -207,7 +207,7 @@ fn run_id_of(run: &ActiveRun) -> &str {
     run.status.run_id.as_str()
 }
 
-/// pi `matchesId` (`wait.ts:196-198`): exact id, or id prefix.
+/// pi `matchesId` (`runs/background/wait.ts:198-200` @v0.34.0): exact id, or id prefix.
 fn matches_id(run: &ActiveRun, id: &str) -> bool {
     run_id_of(run) == id || run_id_of(run).starts_with(id)
 }
@@ -287,7 +287,7 @@ fn join_ids_with_state(runs: &[ActiveRun]) -> String {
 }
 
 /// Block until the targeted background runs finish, the timeout elapses, or the turn is aborted —
-/// pi `waitForSubagents` (`wait.ts:243-394`).
+/// pi `waitForSubagents` (`runs/background/wait.ts:264-394` @v0.34.0).
 ///
 /// Returns `Ok(text)` for a resolved wait and `Err(text)` for the three non-resolutions (a listing
 /// failure, an ambiguous id prefix, a timeout, an abort), matching how every other control action

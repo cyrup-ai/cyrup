@@ -18,7 +18,7 @@
 //! run identity/state/mode/progress, pending-append count, start/update timestamps, per-step
 //! agent+state(+model+error) lines, the reconciliation-repaired terminal `Result:` reference, the
 //! `Log`/`Events` artifact references, and — for a non-running run — the exact
-//! `formatResumeGuidance` shape (`run-status.ts:36-50`) an LLM reads to revive a child. Nested
+//! `formatResumeGuidance` shape (`run-status.ts:51-66`) an LLM reads to revive a child. Nested
 //! descendants, activity labels, and parallel-group step-index nesting are omitted here (they have
 //! no source fields), documented rather than silently faked.
 //!
@@ -126,7 +126,7 @@ fn step_line_label(status: &RunStatus, index: usize) -> String {
 }
 
 // =================================================================================================
-// Resume guidance (`run-status.ts:36-50`)
+// Resume guidance (`run-status.ts:51-66`)
 // =================================================================================================
 
 /// G90: pi `formatSteeringSummary` (`run-status.ts:88-93` @v0.43.0) — `"3 steers, last
@@ -153,13 +153,13 @@ pub const STOPPED_NOT_RESUMABLE_GUIDANCE: &str =
     "Resume: unavailable; stopped runs are not resumable. Start a new run instead.";
 
 /// Whether `session_file` points at an on-disk file that currently exists (pi's
-/// `hasExistingSessionFile`, `run-status.ts:37-39`).
+/// `hasExistingSessionFile`, `run-status.ts:42-44`).
 fn session_file_exists(session_file: &Option<PathBuf>) -> bool {
     session_file.as_ref().is_some_and(|path| path.exists())
 }
 
 /// The `Resume:`/`Revive:` guidance line for a non-running run (pi `formatResumeGuidance`,
-/// `run-status.ts:36-50`). Every cyrup [`StepStatus`] carries a known agent, so the "known child"
+/// `run-status.ts:51-66`). Every cyrup [`StepStatus`] carries a known agent, so the "known child"
 /// filter is trivially every step; the branch structure otherwise mirrors pi exactly:
 /// single-child-with-transcript → whole-run `Revive`, else first child with a transcript →
 /// `Revive child` with its index, else the unavailable notice.

@@ -680,7 +680,7 @@ fn parse_tool_refs(entries: Vec<String>) -> Vec<ToolRef> {
         .collect()
 }
 
-/// `thinking: <value>` -> `Option<String>`. pi's `AgentConfig.thinking` (`agents.ts:103,171`) is an
+/// `thinking: <value>` -> `Option<String>`. pi's `AgentConfig.thinking` (`agents.ts:64,86,126` @v0.43.0) is an
 /// OPEN string, so this preserves the raw frontmatter value verbatim rather than coercing it into a
 /// closed on-only [`cyrup_core::ThinkingLevel`] enum:
 ///

@@ -284,7 +284,7 @@ pub enum RunState {
     /// **A first-class terminal state, NOT an alias for [`Self::Failed`] or [`Self::Paused`].**
     /// Upstream distinguishes all three at every reader: `stopRunner`'s own guard is
     /// `if (stopped || timedOut || interrupted || state !== "running") return`
-    /// (`subagent-runner.ts:2956`), so a stop and a timeout and an interrupt are mutually exclusive
+    /// (`subagent-runner.ts:2955-2986`), so a stop and a timeout and an interrupt are mutually exclusive
     /// verdicts; `resolveSubagentResultStatus` ranks `"stopped"` above `"paused"` and above the
     /// `success`/exit-code fallbacks (`intercom/result-intercom.ts:31-35`);
     /// `resolveGroupedStatus` gives `"stopped"` its own precedence slot between `"failed"` and
@@ -340,7 +340,7 @@ impl RunState {
     ///   R-SA-091, if it is never resumed).
     /// - `Queued -> Stopped` / `Running -> Stopped` (G77): an explicit stop request was consumed.
     ///   Upstream's `stopRunner` gate is `statusPayload.state !== "running"` returns early
-    ///   (`subagent-runner.ts:2956`), and the parent-side `stopAsyncRun` only accepts a target whose
+    ///   (`subagent-runner.ts:2955-2986`), and the parent-side `stopAsyncRun` only accepts a target whose
     ///   reconciled state is `"running"` or `"queued"` (`async-stop-action.ts:41`) — so those are
     ///   exactly the two predecessors, and a `Paused` run is deliberately NOT stoppable (upstream
     ///   returns `"No running or queued async run was found"` for it).
@@ -444,7 +444,7 @@ impl StepState {
 // =================================================================================================
 //
 // pi's detached runner folds each child NDJSON event into the run's `status.json` on a live cadence
-// (`updateStepFromChildEvent`, `subagent-runner.ts:1430-1517`) so a reader watching the file sees
+// (`updateStepFromChildEvent`, `subagent-runner.ts:2706-2861`) so a reader watching the file sees
 // `currentTool`/`recentTools`/`recentOutput`/`turnCount`/`toolCount`/`tokens`/`activityState`/
 // `lastActivityAt` per step, plus the top-level roll-ups those feed (`syncTopLevelCurrentTool`,
 // `statusPayload.toolCount`/`turnCount`/`totalTokens`). This section is the Rust port of that data
@@ -506,10 +506,10 @@ pub struct RecentTool {
 
 /// Bounded cap on a step's `recent_tools`/`recent_output` rings so a long-running step's telemetry
 /// can never grow `status.json` without limit (pi slices to a recent window per append,
-/// `subagent-runner.ts:1460,1496`).
+/// `subagent-runner.ts:1878,1914` @v0.34.0).
 const RECENT_RING_CAP: usize = 20;
 
-/// The live per-step activity telemetry pi folds from child events (`subagent-runner.ts:1430-1517`),
+/// The live per-step activity telemetry pi folds from child events (`subagent-runner.ts:2706-2861`),
 /// carried on [`StepStatus`] via `#[serde(flatten)]` so these fields serialize at the SAME top level
 /// of each `status.json` step object pi writes them at (`currentTool`, `recentTools`, … are direct
 /// members of the step object, not a nested sub-object — `shared/types.ts:598-632`). Every field is
@@ -575,7 +575,7 @@ pub struct StepTelemetry {
 }
 
 /// The run-wide activity roll-ups pi maintains on the top-level `statusPayload`
-/// (`subagent-runner.ts:1444-1514`, `shared/types.ts:576-638`), carried on [`RunStatus`] via
+/// (`subagent-runner.ts:2085-2120`, `shared/types.ts:576-638`), carried on [`RunStatus`] via
 /// `#[serde(flatten)]` so they serialize at the SAME top level of `status.json` pi writes them at
 /// (`status.currentTool`, `status.toolCount`, …). Same `#[serde(default)]` + skip-if-empty
 /// backward-compatibility discipline as [`StepTelemetry`].
@@ -616,7 +616,7 @@ pub struct RunTelemetry {
 }
 
 /// Fold one child NDJSON [`crate::exec::ndjson::SubagentEvent`] into a step's live telemetry — the
-/// Rust port of pi's `updateStepFromChildEvent` (`subagent-runner.ts:1430-1517`), scoped to the
+/// Rust port of pi's `updateStepFromChildEvent` (`subagent-runner.ts:2706-2861`), scoped to the
 /// per-step [`StepTelemetry`] fields (the top-level roll-ups are the caller's job via
 /// [`RunStatus::sync_top_level_telemetry`], mirroring pi's `syncTopLevelCurrentTool` living outside
 /// the per-event fold). `now` is the caller's single epoch-millis reading for this event so every
@@ -674,7 +674,7 @@ pub fn apply_child_event_to_step(
 }
 
 /// Push `item` onto a bounded recent-ring, dropping the oldest entry once [`RECENT_RING_CAP`] is
-/// exceeded (pi keeps only a recent window, `subagent-runner.ts:1460,1496`).
+/// exceeded (pi keeps only a recent window, `subagent-runner.ts:1878,1914` @v0.34.0).
 fn push_bounded<T>(ring: &mut Vec<T>, item: T) {
     ring.push(item);
     if ring.len() > RECENT_RING_CAP {
@@ -784,7 +784,7 @@ pub struct StepStatus {
     /// state.
     pub ended_at: Option<i64>,
     /// Live activity telemetry folded from this step's child events (pi
-    /// `subagent-runner.ts:1430-1517`) — flattened so its members serialize at the same top level
+    /// `subagent-runner.ts:2706-2861`) — flattened so its members serialize at the same top level
     /// of the `status.json` step object pi writes them at (`shared/types.ts:598-632`).
     #[serde(flatten, default)]
     pub telemetry: StepTelemetry,
@@ -858,7 +858,7 @@ pub struct RunStatus {
     /// terminal-revival branch (R-SA-085, `Self::revive_from_transcript`) reads this back so a
     /// revived child spawns in the SAME directory the original run did, rather than whatever cwd
     /// happens to be current at resume time (pi `target.cwd ?? requestCwd`,
-    /// `background/async-resume.ts:323,345,373` + `subagent-executor.ts:890`). `None` only for a
+    /// `background/async-resume.ts:323,345,373` @v0.34.0 + `subagent-executor.ts:890`). `None` only for a
     /// synthesized/repaired status that never had a chance to observe the real value (mirrors
     /// `pid`'s own `None` carve-out immediately above).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -893,7 +893,7 @@ pub struct RunStatus {
     /// Per-parallel-group child status, for any `ParallelGroup`/`DynamicGroup` steps.
     pub parallel_groups: Option<Vec<ParallelGroupStatus>>,
     /// Run-wide live activity roll-ups + the workflow-graph snapshot (pi's top-level
-    /// `statusPayload` telemetry, `subagent-runner.ts:1444-1514`) — flattened so its members
+    /// `statusPayload` telemetry, `subagent-runner.ts:2085-2120`) — flattened so its members
     /// serialize at the same top level of `status.json` pi writes them at.
     #[serde(flatten, default)]
     pub telemetry: RunTelemetry,
@@ -927,7 +927,7 @@ impl RunStatus {
     /// Roll the per-step telemetry of the step at `flat_index` up into the top-level
     /// [`RunStatus::telemetry`] fields, mirroring pi's `syncTopLevelCurrentTool` +
     /// `statusPayload.toolCount`/`turnCount`/`totalTokens`/`lastActivityAt` maintenance
-    /// (`subagent-runner.ts:1444-1514`). Recomputes `current_tool` from whichever step is currently
+    /// (`subagent-runner.ts:2085-2120`). Recomputes `current_tool` from whichever step is currently
     /// running (a step with a live `current_tool`), sums `tool_count`/`total_tokens` across every
     /// step, and takes the max `turn_count` — so the roll-up is always internally consistent with
     /// the per-step fields rather than a separately drifting counter.
@@ -1175,8 +1175,8 @@ impl RunPaths {
 // `results_dir`); the runner then rebuilds its `RunPaths` from those exact absolute roots rather
 // than re-deriving them from the config-file path's own directory structure. Mirrors pi, where the
 // orchestrator computes `resultPath`/`asyncDir` and passes them verbatim in the runner config
-// (`async-execution.ts:650,895`) and the runner reads them straight back
-// (`subagent-runner.ts:1077,1085`) — never re-deriving `RESULTS_DIR`.
+// (`async-execution.ts:701,966` @v0.34.0) and the runner reads them straight back
+// (`subagent-runner.ts:1316` @v0.34.0) — never re-deriving `RESULTS_DIR`.
 
 /// Path segment, under the per-user subagents home, holding one directory per background run (each
 /// run's `status.json`, `events.jsonl`, control inbox, logs — everything EXCEPT the terminal
@@ -1195,7 +1195,7 @@ const RESULTS_SUBDIR: &str = "results";
 /// Two callers need the SAME reading, on opposite sides of a process boundary, which is why this
 /// lives here rather than privately in either of them: `extension.rs` stamps
 /// `RunnerConfig::deadline_at_ms` with it when a background run carries a `timeoutMs`
-/// (pi `deadlineAt = Date.now() + params.timeoutMs`, `runs/background/async-execution.ts:924`
+/// (pi `deadlineAt = Date.now() + params.timeoutMs`, `runs/background/async-execution.ts:1302-1305`
 /// @v0.34.0), and `runner_main::run` subtracts it back out in the detached hop-2 process
 /// (pi `Math.max(0, config.deadlineAt - Date.now())`, `runs/background/subagent-runner.ts:2079`).
 /// It also stamps per-provider catalog freshness

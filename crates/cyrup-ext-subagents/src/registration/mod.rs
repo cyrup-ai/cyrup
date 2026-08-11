@@ -273,7 +273,7 @@ pub struct HookSpec {
 // Nested config objects (pi shared/types.ts:829-882) — the shapes pi's ExtensionConfig nests
 // -------------------------------------------------------------------------------------------
 
-/// pi `TopLevelParallelConfig` (shared/types.ts:829-832): the nested `parallel: { maxTasks?, concurrency? }`
+/// pi `TopLevelParallelConfig` (shared/types.ts:1715-1718): the nested `parallel: { maxTasks?, concurrency? }`
 /// object of [`SubagentExtensionConfig`]. Both fields are optional; an omitted field defers to the
 /// hardcoded pi default via [`SubagentExtensionConfig::parallel_max_tasks`] /
 /// [`SubagentExtensionConfig::parallel_concurrency`].
@@ -286,7 +286,7 @@ pub struct TopLevelParallelConfig {
     pub concurrency: Option<u32>,
 }
 
-/// pi `ExtensionChainConfig` (shared/types.ts:834-838): the nested `chain: { dynamicFanout?: { maxItems? } }`
+/// pi `ExtensionChainConfig` (shared/types.ts:1720-1724): the nested `chain: { dynamicFanout?: { maxItems? } }`
 /// object of [`SubagentExtensionConfig`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -324,7 +324,7 @@ pub enum ControlNotificationChannel {
     Intercom,
 }
 
-/// pi `ControlConfig` (shared/types.ts:101-110): the live-control notice thresholds/channels nested under
+/// pi `ControlConfig` (shared/types.ts:160-169): the live-control notice thresholds/channels nested under
 /// [`SubagentExtensionConfig::control`]. Every field is optional; pi's `resolveControlConfig`
 /// derives a fully-defaulted `ResolvedControlConfig` from this plus per-call overrides. This crate
 /// carries the raw config shape faithfully so the resolved view (owned by the control-notice
@@ -360,7 +360,7 @@ pub struct ControlConfig {
     pub notify_channels: Option<Vec<ControlNotificationChannel>>,
 }
 
-/// pi `ProactiveSkillSubagentsConfig` (shared/types.ts:840-845): the tuning knobs for proactive
+/// pi `ProactiveSkillSubagentsConfig` (shared/types.ts:1726-1731): the tuning knobs for proactive
 /// skill-subagent suggestions.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -674,7 +674,7 @@ pub fn resolve_effective_config(
         .or_else(|| settings.default_model.clone());
 
     // Tier 7: pi has NO per-agent `maxSubagentDepth` settings override (`BuiltinAgentOverrideConfig`,
-    // agents.ts:65-79, carries none) — an earlier port invented one and consulted it here. The
+    // agents.ts:82-100, carries none) — an earlier port invented one and consulted it here. The
     // settings tier therefore never supplies a max depth; it resolves from `config.json` (tier 3),
     // agent frontmatter (tier 4), or the hardcoded default (tier 5) instead.
     let settings_max_depth: Option<u32> = None;

@@ -102,7 +102,7 @@ fn message_end_line(text: &str) -> String {
 }
 
 /// A `message_end` carrying an assistant-side `errorMessage` — pi's `assistantError`, the thing the
-/// close handler would otherwise promote into `result.error` (`execution.ts:1082`).
+/// close handler would otherwise promote into `result.error` (`execution.ts:476`).
 fn message_end_with_error(text: &str, error: &str) -> String {
     serde_json::json!({
         "type": "message_end",
@@ -393,7 +393,7 @@ async fn with_no_signal_the_backoff_ladder_runs_to_exhaustion_and_reports_it_as_
 /// same live `progress` object through `fireUpdate()` for the whole attempt. So the note is the
 /// user's only explanation of why their run was silently relaunched, and it must arrive WHILE the
 /// relaunch is happening: a settled snapshot cannot carry it, because `compactCompletedProgress`
-/// (`shared/utils.ts:414-421`) empties `recentOutput` as one of its two growth terms.
+/// (`shared/utils.ts:330-347`) empties `recentOutput` as one of its two growth terms.
 ///
 /// The existing tests read only `ModelAttempt::error` — the FIRST write — so the second was
 /// unguarded. It was in fact worse than untested: cyrup's live surface folds the child's raw NDJSON,
@@ -516,8 +516,8 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
 
 /// A protocol-output-limit diagnostic OUTRANKS a trailing assistant error.
 ///
-/// pi's `failProtocol` assigns `result.error` at the instant the cap trips (`execution.ts:1030`),
-/// and the close handler only ever fills in what is still unset (`execution.ts:1099`:
+/// pi's `failProtocol` assigns `result.error` at the instant the cap trips (`execution.ts:1026-1041`),
+/// and the close handler only ever fills in what is still unset (`execution.ts:1026-1041`:
 /// `if (!result.error && closeError) result.error = closeError`) — where `closeError` is
 /// `result.error ?? toolDiagnosticError ?? assistantError` (`:1080`). So when a child both blows the
 /// cap AND leaves a trailing assistant `errorMessage`, the protocol diagnostic is what survives.
@@ -592,7 +592,7 @@ async fn a_trailing_assistant_error_is_reported_when_nothing_outranks_it() {
 /// word and then refuses to exit is force-drained rather than waited out.
 ///
 /// pi `projectChildLifecycle` (`child-protocol.ts:400`) returns `"start-drain"` for
-/// `terminalAssistantStop`, applied at `execution.ts:947`. That arm is a PRE-EXISTING, load-bearing
+/// `terminalAssistantStop`, applied at `execution.ts:920`. That arm is a PRE-EXISTING, load-bearing
 /// behaviour — it is the only thing standing between "the assistant finished" and a session that
 /// hangs on a child holding stdout open — and re-plumbing it through the projection table left it
 /// with no subprocess-level coverage: deleting the arm reddened exactly one pure-function table

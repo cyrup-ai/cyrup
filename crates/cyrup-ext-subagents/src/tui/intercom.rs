@@ -427,7 +427,7 @@ impl IntercomPayload {
         // them would wrongly re-label work that had genuinely finished. The per-child `stopped`
         // flag is set by `runner_main`'s stop arm, mirroring pi's `stoppedAfterAcceptance =
         // finalResult?.stopped === true || ctx.stopSignal?.aborted === true`
-        // (`subagent-runner.ts:1642,1722`).
+        // (`subagent-runner.ts:1642,1722` @v0.43.0).
         let child_statuses: Vec<SubagentResultStatus> = result
             .results
             .iter()
