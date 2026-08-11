@@ -217,23 +217,26 @@ pub fn get_agent_refinement_path(cwd: &Path, agent_name: &str) -> Result<PathBuf
 /// pi `extractFence` (`agent-refinements.ts:171-175`): the body of the first
 /// ```` \n```<fence>\n … \n``` ```` block, or `None`.
 ///
-/// The lazy `([\s\S]*?)` plus regex backtracking means a fence OPENER with no closer is not fatal —
-/// the engine retries from the next opener — so the search loops rather than committing to the
-/// first opener. An empty body yields `Some("")`, not `None`: upstream's `match?.[1] ?? null`
+/// Upstream's regex uses a lazy `([\s\S]*?)`, which LOOKS like it retries from a later opener when
+/// one has no closer. It cannot: the opener pattern itself begins with the closer's own `\n``` `, so
+/// "no closer after this opener" implies "no further opener either". Both sides therefore commit to
+/// the first opener, and a second opener simply terminates the first one's body.
+/// An empty body yields `Some("")`, not `None`: upstream's `match?.[1] ?? null`
 /// coalesces only `null`/`undefined`, never `""`, and that distinction is load-bearing for the
 /// snapshots fence (see [`parse_refinement_file`]).
 fn extract_fence<'a>(markdown: &'a str, fence: &str) -> Option<&'a str> {
+    // Straight-line, and deliberately NOT a retry loop. An earlier version searched on from
+    // `rel + 1` when a fence had no closer, which reads like backtracking but can never run: the
+    // opener itself starts with "\n```", so if `body.find("\n```")` is None there is no later
+    // opener to find either, and the next iteration's `find(&opener)` is None by construction.
+    // Conversely, when a second opener DOES exist, the first `find("\n```")` matches its leading
+    // backticks and returns on the first pass. Upstream's regex (`agent-refinements.ts`) has the
+    // same reachability, so this is a dead-branch removal, not a behaviour change.
     let opener = format!("\n```{fence}\n");
-    let mut search_from = 0usize;
-    while let Some(rel) = markdown.get(search_from..)?.find(&opener) {
-        let body_start = search_from + rel + opener.len();
-        let body = markdown.get(body_start..)?;
-        if let Some(end) = body.find("\n```") {
-            return body.get(..end);
-        }
-        search_from = search_from + rel + 1;
-    }
-    None
+    let rel = markdown.find(&opener)?;
+    let body = markdown.get(rel + opener.len()..)?;
+    let end = body.find("\n```")?;
+    body.get(..end)
 }
 
 /// pi `parseRefinementFile` (`agent-refinements.ts:177-237`).
@@ -609,12 +612,20 @@ mod tests {
         assert!(parse_refinement_file(&refinement_file("r", "- x", &bad), "f").is_err());
     }
 
-    /// `extractFence` backtracks past an unterminated opener rather than giving up (the lazy
-    /// `([\s\S]*?)` in pi's regex), and an empty body is `Some("")`, never `None`.
+    /// An unterminated opener yields `None`, an empty body yields `Some("")` (never `None`), a
+    /// fence at byte 0 is not matched, and a SECOND opener terminates the first one's body rather
+    /// than being backtracked to. The old name promised backtracking that neither cyrup nor pi
+    /// performs, and no assertion here exercised two openers at all.
     #[test]
-    fn extract_fence_skips_an_unterminated_opener_and_distinguishes_empty_from_absent() {
+    fn extract_fence_handles_unterminated_empty_absent_and_a_second_opener() {
         let doc = format!("head\n```{CURRENT_FENCE}\nunterminated");
         assert_eq!(extract_fence(&doc, CURRENT_FENCE), None);
+        // The case the old name CLAIMED to cover but no assertion exercised: two openers. There is
+        // no backtracking — the first opener's body search matches the second opener's leading
+        // "\n```", so the body between them is returned. Pinning it means the straight-line
+        // rewrite cannot silently change what a malformed two-fence file yields.
+        let doc = format!("head\n```{CURRENT_FENCE}\nfirst\n```{CURRENT_FENCE}\nsecond\n```\n");
+        assert_eq!(extract_fence(&doc, CURRENT_FENCE), Some("first"));
         let doc = format!("head\n```{CURRENT_FENCE}\n\n```\n");
         assert_eq!(extract_fence(&doc, CURRENT_FENCE), Some(""));
         // The opener must be preceded by a newline (pi's regex begins `\n` + backticks), so a fence

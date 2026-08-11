@@ -15241,7 +15241,11 @@ mod tests {
         assert_eq!(
             executor.remembered_parent_model(),
             None,
-            "…but nothing was remembered under a null session id"
+            // Deliberately narrow: this shows only that with no live model and no session id,
+            // nothing is SURFACED. It does not establish that nothing was STORED — the memory is
+            // keyed on a session id that is None here, so a stored value would be unreachable
+            // either way and this assertion could not tell the two apart.
+            "with no live model and a null session id, no model is surfaced"
         );
     }
 

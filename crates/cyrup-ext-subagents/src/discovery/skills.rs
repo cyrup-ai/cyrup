@@ -32,7 +32,7 @@
 //!
 //! The child skill injection itself is wired in [`crate::exec`] (`build_task_text` composes
 //! the [`build_skill_injection`] block into the task text handed to the spawned child — pi folds it
-//! into the persona system prompt instead, `execution.ts:1054-1056`, but cyrup keeps it in the task
+//! into the persona system prompt instead, `execution.ts:1433-1436`, but cyrup keeps it in the task
 //! text so a `Replace`-mode persona cannot suppress it), honoring the
 //! agent's own `skills` list and leaving `inherit_skills` (the `--no-skills` child flag) orthogonal:
 //! an `inherit_skills: false` agent still receives its EXPLICITLY-listed skills as pointers, exactly
@@ -361,8 +361,8 @@ impl ProactiveSkillSubagentsSetting {
             crate::registration::ProactiveSkillSubagents::Config(cfg) => {
                 Self::Config(ProactiveSkillSubagentsConfig {
                     enabled: cfg.enabled,
-                    min_references: cfg.min_references.map(i64::from),
-                    max_recommendations: cfg.max_recommendations.map(i64::from),
+                    min_references: cfg.min_references,
+                    max_recommendations: cfg.max_recommendations,
                     preferred_agent: cfg.preferred_agent.clone(),
                 })
             }

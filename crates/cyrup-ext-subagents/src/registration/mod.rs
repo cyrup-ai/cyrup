@@ -135,7 +135,7 @@ pub struct SubagentExtensionConfig {
     pub chain: Option<ExtensionChainConfig>,
     /// Proactive skill-subagent suggestion config — pi
     /// `ExtensionConfig.proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false`
-    /// (shared/types.ts:840-845/880): an object of tuning knobs, or the literal `false` to disable the
+    /// (shared/types.ts:1726-1731 interface, :1779 field): an object of tuning knobs, or the literal `false` to disable the
     /// feature entirely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proactive_skill_subagents: Option<ProactiveSkillSubagents>,
@@ -367,15 +367,26 @@ pub struct ControlConfig {
 pub struct ProactiveSkillSubagentsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    // These are `i64`, not `u32`, so that an out-of-range value REACHES the guard instead of
+    // failing deserialization. `positive_integer` (discovery/skills.rs:412) already filters
+    // `>= 1` and is written for `i64`, matching upstream's `positiveInteger`
+    // (proactive-skills.ts:32-36), which returns `undefined` for a non-positive value and lets
+    // the caller fall back to the default while KEEPING the rest of the file.
+    //
+    // With `u32`, serde rejected `-1` before the guard ever ran, and
+    // `load_subagent_extension_config` (crates/cyrup/src/subagent_config.rs) discards the WHOLE
+    // config.json on any deserialization error — so one bad value silently dropped every other
+    // setting in the file (parallel.maxTasks, control.*, chain.dynamicFanout.maxItems,
+    // worktreeSetupHook, maxSubagentDepth, globalConcurrencyLimit).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_references: Option<u32>,
+    pub min_references: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_recommendations: Option<u32>,
+    pub max_recommendations: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_agent: Option<String>,
 }
 
-/// pi `proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false` (shared/types.ts:880): either a
+/// pi `proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false` (shared/types.ts:1779, interface at :1726-1731): either a
 /// tuning-knob object, or the literal `false` to disable the feature entirely. Deserialized
 /// untagged so both a JSON object and a bare `false` parse.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
