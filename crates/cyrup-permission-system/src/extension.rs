@@ -725,7 +725,7 @@ impl PermissionSystemExtension {
     /// [`Self::toggle_yolo_mode`] and [`Self::yolo_mode`] are therefore correctly ported and
     /// currently UNREACHABLE — `cyrup-ext` has no extension-provided-API registry for one extension
     /// to call another's methods, which is the actual missing piece. Tracked as G133b in
-    /// `PARITY-GAPS.md`; see [`crate::yolo_api`].
+    /// `docs/gap-analysis/PARITY-GAPS.md`; see [`crate::yolo_api`].
     ///
     /// Returns `Some(text)` for output the session surfaces as an **Info** notification, and `None`
     /// when this handler has ALREADY notified at its own level — the convention documented on

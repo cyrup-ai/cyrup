@@ -161,7 +161,7 @@ impl PermissionSystemLogger {
     /// no logger reference at all — so the `forwarded_permission.*` entries an operator wants when
     /// a child's ask times out or auto-approves are still absent, gate or no gate. Un-gating makes
     /// the 6 sites we do have reachable; it does not by itself produce v0.8.0's audit trail.
-    /// Tracked as G131b in `PARITY-GAPS.md`.
+    /// Tracked as G131b in `docs/gap-analysis/PARITY-GAPS.md`.
     ///
     /// `debug` — the diagnostic/lifecycle stream — is deliberately still gated; the `debug` flag
     /// keeps its upstream meaning and this is not a rename of it.
