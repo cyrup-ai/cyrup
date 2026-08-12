@@ -29,6 +29,24 @@ use cyrup_ext_subagents::extension::{RegistrationMode, SubagentsExtension};
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use serde_json::{json, Value};
 
+/// Missions are ON by default, and a task-bearing dispatch auto-creates one
+/// (`missions/lifecycle.rs::prepare_mission_launch`). Its cross-project POINTER INDEX defaults to
+/// `agent_dir()/missions/index` — the developer's real `~/.cyrup/agent/missions/index`, beside
+/// `settings.json`, `models-store.json` and `sessions/` — so a tempdir cwd alone does not isolate
+/// it. `config.missions.globalIndexDir` is the production lever that does, and it is the lever
+/// upstream's own fixtures use (`pi-subagents` `test/unit/mission-lifecycle.test.ts:18`).
+fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
+    SubagentExtensionConfig {
+        missions: Some(cyrup_ext_subagents::missions::MissionStoreConfig {
+            global_index_dir: Some(
+                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 async fn host_at(cwd: &Path) -> Arc<ExtensionHost> {
     let host = Arc::new(ExtensionHost::new(HostConfig {
         mode: ExtMode::Tui,
@@ -36,7 +54,7 @@ async fn host_at(cwd: &Path) -> Arc<ExtensionHost> {
         cwd: cwd.to_path_buf(),
     }));
     host.load_native(Arc::new(SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        scoped_config(cwd),
         cwd.to_path_buf(),
     )))
     .await
@@ -82,7 +100,7 @@ async fn a_child_safe_registration_declares_no_renderer() {
         cwd: dir.path().to_path_buf(),
     }));
     host.load_native(Arc::new(SubagentsExtension::with_mode(
-        SubagentExtensionConfig::default(),
+        scoped_config(dir.path()),
         dir.path().to_path_buf(),
         RegistrationMode::ChildSafe,
     )))
@@ -309,7 +327,7 @@ async fn a_real_tool_result_renders_through_the_settled_branch() {
     }
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        scoped_config(dir.path()),
         dir.path().to_path_buf(),
     );
     let tool_result = ext

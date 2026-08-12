@@ -66,7 +66,7 @@ use crate::login_dialog::{
     TuiAuthInteraction,
 };
 use crate::model_selector::{ModelEntry, ModelSelector};
-use crate::overlay::{Overlay, OverlayOutcome};
+use crate::overlay::{ExtensionOverlay, Overlay, OverlayOutcome};
 use crate::selector::{
     CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome,
 };
@@ -3093,6 +3093,27 @@ impl<B: Backend> App<B> {
     ) {
         services.set_ui_sink(ui);
         services.set_ui_effect_sink(effects);
+    }
+
+    /// Bind the INTERACTIVE-OVERLAY seam — Pi's `ctx.ui.custom(factory, { overlay: true, … })`
+    /// (`interactive-mode.ts:2719`, the only `showOverlay` consumer upstream has).
+    ///
+    /// Separate from [`Self::install_ui_sinks`] because only THIS mode can service it. A `UiSink`
+    /// dialog is one question and one answer, which RPC can carry over its
+    /// `extension_ui_request`/`extension_ui_response` pair; an overlay is a component the renderer
+    /// must DRIVE — paint it, feed it every keystroke, repaint on its own cadence — which needs a
+    /// terminal. So `cyrup-modes`' `run_rpc` deliberately installs nothing here, leaving
+    /// `LiveHostServices::open_overlay` to answer `false` so the extension falls back to its own
+    /// non-interactive rendering (Pi's `!ctx.hasUI` branch) instead of blocking on a modal nobody
+    /// can close.
+    ///
+    /// Must be re-run against every swapped-in session, for exactly the reason
+    /// [`Self::install_ui_sinks`] must.
+    pub fn install_overlay_sink(
+        services: &cyrup_session_svc::LiveHostServices,
+        overlays: cyrup_session_svc::OverlaySink,
+    ) {
+        services.set_overlay_sink(overlays);
     }
 
     /// Bind the THIRD extension seam of a session — the contained-fault listener Pi's interactive
@@ -6284,11 +6305,26 @@ impl App<CrosstermBackend<Stdout>> {
         // `ui_tx` is: a replacement session brings a fresh `ExtensionHost`.
         let (ext_error_tx, mut ext_error_rx) =
             tokio::sync::mpsc::unbounded_channel::<cyrup_ext::ExtensionError>();
+        // The FOURTH extension seam: an interactive modal an extension owns the state of and this
+        // loop owns the terminal for (Pi `ctx.ui.custom(factory, { overlay: true, … })`,
+        // `interactive-mode.ts:2719`). `LiveHostServices::open_overlay` blocks the extension's OWN
+        // (always spawned) task on a one-shot while this loop pushes the component onto the
+        // `state.overlays` z-stack, routes every keystroke to it through the existing
+        // `handle_overlay_key` chain, and ticks it at its own cadence. Dropping the overlay — a
+        // `Close` outcome, a session swap, a quit — fires the one-shot and releases that task.
+        // Re-installed on session swap below, for the same reason `ui_tx` is.
+        let (overlay_tx, mut overlay_rx) =
+            tokio::sync::mpsc::unbounded_channel::<cyrup_session_svc::OverlayRequest>();
         Self::install_ui_sinks(
             &session.services().host_services,
             ui_tx.clone(),
             ui_effect_tx.clone(),
         );
+        Self::install_overlay_sink(&session.services().host_services, overlay_tx.clone());
+        // The open overlay's self-refresh timer, armed from its own `refresh_ms` when it arrives and
+        // dropped when the stack empties. `None` means "no ticking overlay is open", which the
+        // `select!` arm below expresses as a `pending()` future rather than a spinning interval.
+        let mut overlay_tick: Option<tokio::time::Interval> = None;
         Self::install_error_listener(&session.services().ext_host, ext_error_tx.clone());
         // The `/` menu's dynamic half (pi `interactive-mode.ts:1240-1300`). `slash_command_catalog()`
         // already merges registered extension commands, prompt templates and skills — it was just
@@ -6453,6 +6489,18 @@ impl App<CrosstermBackend<Stdout>> {
             let theme_changed = async {
                 match theme_rx.as_mut() {
                     Some(rx) => rx.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            };
+            // The open overlay's own cadence (Pi arms it inside the component's constructor —
+            // `pi-subagents/src/tui/fleet.ts:516-521` `setInterval(… , options.refreshMs ?? 750)`).
+            // No ticking overlay ⇒ a future that never resolves, so the arm costs nothing when the
+            // z-stack is empty or the open modal is static.
+            let overlay_ticked = async {
+                match overlay_tick.as_mut() {
+                    Some(t) => {
+                        t.tick().await;
+                    }
                     None => std::future::pending().await,
                 }
             };
@@ -6689,6 +6737,43 @@ impl App<CrosstermBackend<Stdout>> {
                     }
                     self.draw_synchronized()?;
                 }
+                () = overlay_ticked, if !self.state.overlays.is_empty() => {
+                    // Pi's `setInterval(() => { this.invalidate(); this.tui.requestRender(); })`
+                    // (`fleet.ts:516-520`): let the component re-collect, and repaint only when it
+                    // says the frame actually changed — the same "no-op edge costs no draw" rule the
+                    // git-branch poll arm above follows.
+                    let mut changed = false;
+                    for overlay in self.state.overlays.iter_mut() {
+                        changed |= overlay.tick();
+                    }
+                    if changed {
+                        self.draw_synchronized()?;
+                    }
+                }
+                Some(req) = overlay_rx.recv() => {
+                    // An extension handed over an interactive modal (Pi `ctx.ui.custom(factory,
+                    // { overlay: true, … })`). Its calling task is BLOCKED on the one-shot inside
+                    // `req.done` until the `ExtensionOverlay` we build here is dropped, which
+                    // happens on `Close` (`handle_overlay_key` pops it), on a session swap
+                    // (`rebind_session` clears the stack) or on quit.
+                    let cyrup_session_svc::OverlayRequest { overlay, done } = req;
+                    let adapter = ExtensionOverlay::new(overlay, done);
+                    // Arm the shared tick at THIS overlay's cadence before pushing, so the very
+                    // first refresh lands one interval from now rather than immediately.
+                    let refresh_ms = Overlay::refresh_ms(&adapter);
+                    overlay_tick = (refresh_ms > 0).then(|| {
+                        let period = std::time::Duration::from_millis(refresh_ms);
+                        // `interval_at`, not `interval`: the latter's first tick resolves
+                        // IMMEDIATELY, which would re-collect and repaint the frame we are about to
+                        // draw below for no reason.
+                        let mut interval =
+                            tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        interval
+                    });
+                    self.state.overlays.push(Box::new(adapter));
+                    self.draw_synchronized()?;
+                }
                 Some(req) = ui_rx.recv() => {
                     // A loaded guest opened a `ui.*` dialog (L4 review §2.1). EVERY kind, including
                     // `editor` (L4 review §3 — an INLINE dialog is now the default, matching Pi's
@@ -6831,6 +6916,10 @@ impl App<CrosstermBackend<Stdout>> {
                             &session.services().host_services,
                             ui_tx.clone(),
                             ui_effect_tx.clone(),
+                        );
+                        Self::install_overlay_sink(
+                            &session.services().host_services,
+                            overlay_tx.clone(),
                         );
                         // ...and the fault listener, whose `ExtensionHost` is likewise brand new on
                         // the swapped-in session (Pi re-binds `onError` from `rebindSession`, and

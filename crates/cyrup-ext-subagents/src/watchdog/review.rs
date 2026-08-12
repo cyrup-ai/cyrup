@@ -539,6 +539,25 @@ pub struct WatchdogReviewTurn<'a> {
     pub cancel: CancelToken,
 }
 
+/// The slice of the LIVE session a review reads at call time: `ctx.model` and
+/// `pi.getThinkingLevel()` (`review.ts:250-253`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchdogSessionContext {
+    /// `ctx.model` — the session's current model, absent when none is bound.
+    pub model: Option<WatchdogModelInfo>,
+    /// `options.getThinkingLevel?.()` — the session's reasoning level.
+    pub thinking_level: Option<String>,
+}
+
+/// `createMainWatchdogReview(provider, { getThinkingLevel })` (`review.ts:248-253`), where
+/// `provider` is upstream's `() => currentContext` closure: BOTH roles pass a getter, never a
+/// snapshot, because the extension context does not exist when the review is constructed and
+/// changes across `session_start`/`session_before_switch`.
+///
+/// `None` is upstream's absent context, which throws at `:257`.
+pub type WatchdogSessionContextFn =
+    Arc<dyn Fn() -> Option<WatchdogSessionContext> + Send + Sync>;
+
 /// `createMainWatchdogReview` (`review.ts:248-302`) — the [`WatchdogReview`] the main session binds.
 pub struct MainWatchdogReview {
     registry: Arc<dyn super::model_selection::WatchdogModelRegistry>,
@@ -547,6 +566,7 @@ pub struct MainWatchdogReview {
     cwd: std::path::PathBuf,
     current_model: Option<WatchdogModelInfo>,
     current_thinking_level: Option<String>,
+    session: Option<WatchdogSessionContextFn>,
 }
 
 impl std::fmt::Debug for MainWatchdogReview {
@@ -555,6 +575,7 @@ impl std::fmt::Debug for MainWatchdogReview {
             .field("cwd", &self.cwd)
             .field("current_model", &self.current_model)
             .field("current_thinking_level", &self.current_thinking_level)
+            .field("session_bound", &self.session.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -575,20 +596,38 @@ impl MainWatchdogReview {
             cwd,
             current_model: None,
             current_thinking_level: None,
+            session: None,
         }
     }
 
-    /// `ctx.model` (`review.ts:250`).
+    /// `ctx.model` (`review.ts:250`), as a FIXED value — the test/embedder form. Production binds
+    /// [`Self::with_session_context`] instead, because the live model can change under a review
+    /// that outlives one session.
     #[must_use]
     pub fn with_current_model(mut self, model: Option<WatchdogModelInfo>) -> Self {
         self.current_model = model;
         self
     }
 
-    /// `options.getThinkingLevel?.()` (`review.ts:253`).
+    /// `options.getThinkingLevel?.()` (`review.ts:253`), as a FIXED value. See
+    /// [`Self::with_current_model`].
     #[must_use]
     pub fn with_current_thinking_level(mut self, level: Option<String>) -> Self {
         self.current_thinking_level = level;
+        self
+    }
+
+    /// Bind upstream's `() => currentContext` provider (`review.ts:250-253`) — the live session
+    /// model and reasoning level, resolved at REVIEW time.
+    ///
+    /// Without it `config.main.model` is the only model a review can ever resolve, so the
+    /// DEFAULT config (which sets no model, `settings.ts:72-96`) reaches
+    /// [`resolve_watchdog_review_model`]'s no-session-model arm and every boundary fails with
+    /// "the current Pi session model is unavailable". That is the whole inherited-model path, and
+    /// it is the path every unconfigured session takes.
+    #[must_use]
+    pub fn with_session_context(mut self, session: WatchdogSessionContextFn) -> Self {
+        self.session = Some(session);
         self
     }
 }
@@ -599,6 +638,30 @@ impl WatchdogReview for MainWatchdogReview {
         &self,
         request: WatchdogReviewRequest,
     ) -> Result<Option<WatchdogReviewResult>, String> {
+        // `const ctx = resolveContext(provider); if (!ctx) throw …` (`:255`): the LIVE session,
+        // resolved now rather than captured at construction. A bound provider that answers `None`
+        // is upstream's missing extension context and fails the review loudly; an UNbound provider
+        // is the embedder/test form, which falls back to whatever fixed values were set.
+        let session = match &self.session {
+            Some(provider) => match provider() {
+                Some(session) => Some(session),
+                None => {
+                    return Err(
+                        "Main watchdog review cannot run without an active Pi extension context."
+                            .to_string(),
+                    );
+                }
+            },
+            None => None,
+        };
+        let current_model = session
+            .as_ref()
+            .and_then(|session| session.model.clone())
+            .or_else(|| self.current_model.clone());
+        let current_thinking_level = session
+            .as_ref()
+            .and_then(|session| session.thinking_level.clone())
+            .or_else(|| self.current_thinking_level.clone());
         // `if (ctx.signal?.aborted || request.signal?.aborted) return { stopReason: "aborted" }`
         // (`:256`) — checked before the model is even resolved.
         if request.cancel.is_cancelled() {
@@ -609,13 +672,13 @@ impl WatchdogReview for MainWatchdogReview {
         }
         let ctx = WatchdogModelContext {
             registry: self.registry.as_ref(),
-            current_model: self.current_model.clone(),
+            current_model,
         };
         let selection = resolve_watchdog_review_model(
             &ctx,
             &request.config,
             self.auth_resolver.as_ref(),
-            self.current_thinking_level.as_deref(),
+            current_thinking_level.as_deref(),
         )?;
         // Re-checked AFTER resolution (`:259`): resolution can await auth, and the boundary may have
         // been superseded meanwhile.
@@ -958,5 +1021,109 @@ mod tests {
             .unwrap();
         assert_eq!(result.stop_reason, Some(ReviewStopReason::Stop));
         assert!(result.warnings.is_empty(), "warnings stream through the emitter");
+    }
+
+    fn default_request() -> WatchdogReviewRequest {
+        WatchdogReviewRequest {
+            delta: "d".into(),
+            epoch: 1,
+            has_scope: false,
+            review_id: 1,
+            // `DEFAULT_WATCHDOG_CONFIG` sets no `main.model` (`settings.ts:72-96`), so this is the
+            // config EVERY unconfigured session reviews under, and it can only resolve through the
+            // live session model.
+            config: default_watchdog_config(),
+            emit_warning: WatchdogWarningEmitter::inert(),
+            cancel: CancelToken::new(),
+        }
+    }
+
+    /// The defect this seam closes: with no session provider AND no fixed model, the default
+    /// config resolves nothing at all — which is what a production runtime built with
+    /// `BuiltinWatchdogModelRegistry::new(None)` and no live model did at every boundary.
+    #[tokio::test]
+    async fn the_default_config_with_no_session_model_at_all_fails_the_review() {
+        let review = MainWatchdogReview::new(
+            Arc::new(registry()),
+            Arc::new(AmbientReviewAuth),
+            Arc::new(NoTurnReviewAgent),
+            std::path::PathBuf::from("/repo"),
+        );
+        let error = review.review(default_request()).await.unwrap_err();
+        assert!(
+            error.contains("the current Pi session model is unavailable"),
+            "{error}"
+        );
+    }
+
+    /// The live provider is consulted at REVIEW time, not at construction: the same review object
+    /// resolves whatever the session is currently on.
+    #[tokio::test]
+    async fn a_bound_session_provider_supplies_the_model_the_default_config_inherits() {
+        let model: Arc<std::sync::Mutex<Option<WatchdogModelInfo>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let provider_model = Arc::clone(&model);
+        let review = MainWatchdogReview::new(
+            Arc::new(registry()),
+            Arc::new(AmbientReviewAuth),
+            Arc::new(NoTurnReviewAgent),
+            std::path::PathBuf::from("/repo"),
+        )
+        .with_session_context(Arc::new(move || {
+            Some(WatchdogSessionContext {
+                model: provider_model.lock().unwrap().clone(),
+                thinking_level: Some("high".to_string()),
+            })
+        }));
+
+        // Session start has not bound a model yet: the review still fails loudly rather than
+        // reviewing nothing.
+        assert!(
+            review
+                .review(default_request())
+                .await
+                .unwrap_err()
+                .contains("the current Pi session model is unavailable")
+        );
+
+        // The session picks a model; the SAME review object now resolves it.
+        *model.lock().unwrap() = Some(WatchdogModelInfo::new("anthropic", "claude-opus-4-8"));
+        let result = review.review(default_request()).await.unwrap().unwrap();
+        assert_eq!(result.stop_reason, Some(ReviewStopReason::Stop));
+    }
+
+    /// A bound provider that answers `None` is upstream's missing `ExtensionContext`
+    /// (`review.ts:257`) — an error, not a silent clean review.
+    #[tokio::test]
+    async fn a_provider_with_no_live_context_reports_upstreams_error() {
+        let review = MainWatchdogReview::new(
+            Arc::new(registry()),
+            Arc::new(AmbientReviewAuth),
+            Arc::new(NoTurnReviewAgent),
+            std::path::PathBuf::from("/repo"),
+        )
+        .with_current_model(Some(WatchdogModelInfo::new("anthropic", "claude-opus-4-8")))
+        .with_session_context(Arc::new(|| None));
+        assert_eq!(
+            review.review(default_request()).await.unwrap_err(),
+            "Main watchdog review cannot run without an active Pi extension context."
+        );
+    }
+
+    /// The session's reasoning level travels with the model on the INHERITED arm
+    /// (`review.ts:153` — `allowContextThinking: true`).
+    #[tokio::test]
+    async fn the_session_thinking_level_reaches_the_inherited_review_model() {
+        let registry = registry();
+        let ctx = WatchdogModelContext::new(&registry)
+            .with_current_model(Some(WatchdogModelInfo::new("anthropic", "claude-opus-4-8")));
+        let selection = resolve_watchdog_review_model(
+            &ctx,
+            &default_watchdog_config(),
+            &AmbientReviewAuth,
+            Some("xhigh"),
+        )
+        .unwrap();
+        assert_eq!(selection.thinking_level, "xhigh");
     }
 }

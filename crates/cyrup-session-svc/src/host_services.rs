@@ -18,7 +18,7 @@ use cyrup_ext::caps::http::HttpCaps;
 use cyrup_ext::caps::proc::ProcCaps;
 use cyrup_ext::host::{
     ControlOp, DialogOptions, ExecOutput, HostServices, HttpRequest, HttpResponse,
-    HttpStreamResponse, HumanInteractionLock, NotifyKind, ProcSpawnSpec,
+    HttpStreamResponse, HumanInteractionLock, InteractiveOverlay, NotifyKind, ProcSpawnSpec,
 };
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
@@ -112,6 +112,26 @@ pub struct UiRequest {
 /// [`LiveHostServices::set_ui_sink`]; absent (`None`) in headless (print/json), where the ui methods
 /// fall back to the deny defaults (== Pi `noOpUIContext`, runner.ts:230-261).
 pub type UiSink = UnboundedSender<UiRequest>;
+
+/// A live interactive modal an extension handed to the host, plus the one-shot the renderer fulfils
+/// once the user closes it.
+///
+/// The SECOND request/reply shape on this seam (the first is [`UiRequest`]), and the difference is
+/// duration, not direction: a `UiRequest` is answered by one keystroke sequence and yields a value,
+/// while an `OverlayRequest` transfers OWNERSHIP of a component the renderer then drives — paint,
+/// keystroke, paint, … — for as long as the user keeps it open. The reply carries no value because
+/// pi's own `ctx.ui.custom<undefined>(…)` carries none either (`pi-subagents/src/tui/fleet.ts:869`):
+/// the overlay talks to the user directly, so there is nothing left to return when it closes.
+pub struct OverlayRequest {
+    /// The extension-owned component (see [`cyrup_ext::InteractiveOverlay`]).
+    pub overlay: Box<dyn InteractiveOverlay>,
+    /// Fulfilled when the modal is torn down, releasing the blocked extension task.
+    pub done: tokio::sync::oneshot::Sender<()>,
+}
+
+/// The interactive-overlay renderer channel — see [`OverlayRequest`]. Installed by the interactive
+/// TUI only ([`LiveHostServices::set_overlay_sink`]).
+pub type OverlaySink = UnboundedSender<OverlayRequest>;
 
 /// A fire-and-forget `ui.*` effect a loaded extension pushed via `notify`/`set-status`/`set-widget`/
 /// `set-header`/`set-footer`/`set-title`/`set-editor-text`/`paste-editor-text`/`set-tools-expanded`
@@ -271,6 +291,15 @@ pub struct LiveHostServices {
     /// no reply is awaited, unlike [`Self::ui_sink`]. `None` in headless (print/json): the overrides
     /// then silently drop (== Pi `noOpUIContext`, runner.ts:230-261).
     ui_effect_sink: Mutex<Option<UiEffectSink>>,
+    /// The active mode's INTERACTIVE-OVERLAY renderer, attached post-build via
+    /// [`Self::set_overlay_sink`]. An extension's `open_overlay` reaches the SYNC [`HostServices`]
+    /// method, which forwards an [`OverlayRequest`] here and BLOCKS on the one-shot reply until the
+    /// user closes the modal — the request/reply shape of [`Self::ui_sink`], with a whole
+    /// interactive session in the middle instead of a single answer. `None` in headless
+    /// (print/json) and in RPC, whose wire protocol has no way to stream keystrokes back into a
+    /// host-side component; `open_overlay` then returns `false` WITHOUT blocking and the caller
+    /// takes its own non-interactive fallback (pi's `!ctx.hasUI` branch).
+    overlay_sink: Mutex<Option<OverlaySink>>,
     /// Receiver half of the command-tier control channel (see [`Self::wire_control_channel`]). A
     /// guest's `control` capability call reaches the SYNC [`HostServices::control`] method (the
     /// guest is wasm-suspended and cannot await), which forwards the [`ControlOp`] here; the session
@@ -348,6 +377,7 @@ impl LiveHostServices {
             control: Mutex::new(None),
             ui_sink: Mutex::new(None),
             ui_effect_sink: Mutex::new(None),
+            overlay_sink: Mutex::new(None),
             control_rx: Mutex::new(None),
             manager: Mutex::new(None),
             pending_events: Mutex::new(Vec::new()),
@@ -420,6 +450,14 @@ impl LiveHostServices {
     /// Only interactive/rpc call this; headless (print/json) leaves it `None`.
     pub fn set_ui_effect_sink(&self, sink: UiEffectSink) {
         *Self::lock(&self.ui_effect_sink) = Some(sink);
+    }
+
+    /// Attach the mode's interactive-overlay renderer (see [`OverlaySink`]/[`Self::overlay_sink`]).
+    /// ONLY the interactive TUI calls this: it is the one mode that owns a terminal it can route
+    /// live keystrokes from. Everything else leaves it `None`, which is what makes
+    /// [`HostServices::open_overlay`] answer `false` immediately instead of blocking forever.
+    pub fn set_overlay_sink(&self, sink: OverlaySink) {
+        *Self::lock(&self.overlay_sink) = Some(sink);
     }
 
     /// Send one fire-and-forget effect to the attached drain, if any (no-op — matching Pi's
@@ -633,6 +671,34 @@ impl HostServices for LiveHostServices {
             Some(UiReply::Text(t)) => t,
             _ => None,
         }
+    }
+
+    fn open_overlay(&self, overlay: Box<dyn InteractiveOverlay>) -> bool {
+        // No renderer attached (headless print/json, RPC, or a bare embedder): report "not taken"
+        // WITHOUT blocking, so the caller falls back to its own non-interactive surface. This is
+        // pi's `if (!ctx.hasUI)` branch, expressed as a return value rather than a capability probe.
+        let Some(sink) = Self::lock(&self.overlay_sink).clone() else { return false };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        if sink.send(OverlayRequest { overlay, done: done_tx }).is_err() {
+            // The renderer's run loop is gone — degrade exactly as `ui_roundtrip` does.
+            return false;
+        }
+        // Block this task (NOT the run loop's — every caller of a native command handler is a
+        // SPAWNED task, `app.rs`'s `AppAction::Submit`/`ExtensionShortcut` arms) until the renderer
+        // tears the modal down. `block_in_place` frees the worker thread meanwhile, the same
+        // pattern [`Self::ui_roundtrip`] and the `exec` grant use; both interactive entry points run
+        // on the multi-threaded runtime this requires.
+        //
+        // Deliberately NO timeout: an overlay is a modal the human is looking at, and pi's
+        // `await ctx.ui.custom(...)` has no timer either. A dropped sender (renderer gone, session
+        // swapped, app quit) resolves `done_rx` as `Err`, which is still a resolution — the block
+        // cannot outlive the renderer.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let _ = done_rx.await;
+            });
+        });
+        true
     }
 
     // --- fire-and-forget ui effects (see [`UiEffect`]'s doc for the Pi citation per variant) ---

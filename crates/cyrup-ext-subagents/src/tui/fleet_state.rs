@@ -99,6 +99,70 @@ pub struct NestedRunView {
     pub parent_step_index: Option<usize>,
 }
 
+impl NestedStepView {
+    /// Project one on-disk [`crate::background::StepStatus`] onto the nested-tree row shape
+    /// `fleet-status.ts:100-123` renders.
+    #[must_use]
+    pub fn from_step(step: &crate::background::StepStatus) -> Self {
+        Self {
+            agent: step.agent.clone(),
+            status: step_status_label(step.status).to_string(),
+            model: step.model.as_ref().map(|m| m.as_str().to_string()),
+            thinking: step.telemetry.thinking.clone(),
+            started_at: step.started_at,
+            current_tool: step.telemetry.current_tool.clone(),
+            current_path: step.telemetry.current_path.clone(),
+            activity_state: step.telemetry.activity_state,
+            last_activity_at: step.telemetry.last_activity_at,
+        }
+    }
+}
+
+impl NestedRunView {
+    /// Project one nested run's own on-disk [`RunStatus`] onto pi's `NestedRunSummary` shape
+    /// (`statusToSummary`'s nested half, `runs/background/async-status.ts:291`).
+    ///
+    /// ONE level deep, deliberately: pi's own nested summary carries its `steps` but not its
+    /// grandchildren's, and reading further would be the recursive reconcile
+    /// [`crate::background::fleet_view`] declines to do. `parent_step_index` is the owner step this
+    /// run hangs off, which is what `fleet-status.ts:161-163` attaches the row to.
+    #[must_use]
+    pub fn from_run_status(
+        id: impl Into<String>,
+        status: &RunStatus,
+        parent_step_index: Option<usize>,
+    ) -> Self {
+        // pi's nested row prefers a single `agent` and falls back to the `agents` list (`:76-78`);
+        // a one-step run has the former, a multi-step run the latter.
+        let agents: Vec<String> = status.steps.iter().map(|s| s.agent.clone()).collect();
+        let single = (agents.len() == 1).then(|| agents.first().cloned()).flatten();
+        // The run's telemetry rolls up from whichever step is live (`RunStatus::sync_top_level_
+        // telemetry`), so the model/thinking shown is that step's.
+        let live = status
+            .current_step
+            .and_then(|i| status.steps.get(i))
+            .or_else(|| status.steps.first());
+        Self {
+            id: id.into(),
+            agent: single,
+            agents: if agents.len() == 1 { Vec::new() } else { agents },
+            mode: Some(status.mode),
+            state: crate::background::run_status::run_state_label(status.state).to_string(),
+            model: live.and_then(|s| s.model.as_ref().map(|m| m.as_str().to_string())),
+            thinking: live.and_then(|s| s.telemetry.thinking.clone()),
+            started_at: Some(status.started_at),
+            last_update: Some(status.last_update),
+            current_tool: status.telemetry.current_tool.clone(),
+            // `RunTelemetry` carries no run-level `current_path` (only the per-step telemetry
+            // does), so it comes from the same live step the model does.
+            current_path: live.and_then(|s| s.telemetry.current_path.clone()),
+            activity_state: status.telemetry.activity_state,
+            steps: status.steps.iter().map(NestedStepView::from_step).collect(),
+            parent_step_index,
+        }
+    }
+}
+
 // =================================================================================================
 // Live foreground runs (pi `ForegroundRunControl` / `ForegroundChildControl`)
 // =================================================================================================

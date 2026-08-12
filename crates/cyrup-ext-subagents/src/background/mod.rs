@@ -840,6 +840,18 @@ pub struct ParallelGroupStatus {
 pub struct RunStatus {
     /// This run's identity.
     pub run_id: RunId,
+    /// The ORCHESTRATOR session that launched this run (pi `AsyncStatus.sessionId`,
+    /// `shared/types.ts:1249`, written by the runner from `config.sessionId` at
+    /// `subagent-runner.ts:2088`).
+    ///
+    /// Recorded so a LATER session reading the same async root can tell whose runs these are: pi's
+    /// `listAsyncRuns` drops every on-disk run whose `sessionId` differs from the caller's
+    /// (`async-status.ts:432`), which is what keeps `/subagents-fleet` and the active-run listings
+    /// scoped to the current session instead of showing every run the project ever launched.
+    /// `None` for a run launched with no resolvable parent-session anchor (a headless or
+    /// unpersisted orchestrator), and for a status synthesized by reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Which shape of run this is.
     pub mode: RunMode,
     /// Current overall lifecycle state (monotone-forward, see [`RunState`]).
@@ -907,6 +919,9 @@ impl RunStatus {
         let now = now_epoch_millis();
         Self {
             run_id,
+            // The launching session is the runner's to record (it is the only process that knows
+            // the anchor); a status built here carries none until it does.
+            session_id: None,
             mode,
             state: RunState::Queued,
             pid,

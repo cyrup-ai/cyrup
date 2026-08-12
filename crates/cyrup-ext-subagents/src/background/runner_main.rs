@@ -549,6 +549,13 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
 
     // R-SA-075: initial status.json (state=Running, pid=own pid), written BEFORE any step work.
     let mut status = RunStatus::queued(config.run_id.clone(), config.mode, Some(std::process::id()));
+    // pi `...(config.sessionId ? { sessionId: config.sessionId } : {})` (`subagent-runner.ts:2088`):
+    // stamp the ORCHESTRATOR session onto the run's own `status.json`, so a later reader can scope
+    // the async root to one session (`async-status.ts:432`). cyrup's `RunnerConfig` carries no
+    // session id, but the hop-1 spawn already writes the anchor into this process's environment
+    // (`parent_anchor::detached_runner_env_overlay`), which is the same value pi's `ctx
+    // .currentSessionId` is (`async-execution.ts:1042`).
+    status.session_id = crate::background::parent_anchor::resolve_parent_session_anchor();
     status.chain_step_count = Some(config.steps.len());
     status.steps = config
         .steps

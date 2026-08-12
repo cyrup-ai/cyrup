@@ -61,8 +61,8 @@ pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;
 pub use cyrup_ext::NotifyKind;
 pub use host_services::{
-    ControlSink, InjectMessage, InjectSink, LiveHostServices, UiEffect, UiEffectSink, UiKind,
-    UiReply, UiRequest, UiSink,
+    ControlSink, InjectMessage, InjectSink, LiveHostServices, OverlayRequest, OverlaySink, UiEffect,
+    UiEffectSink, UiKind, UiReply, UiRequest, UiSink,
 };
 pub use provider_swap::{ProviderResolver, ProviderSwap};
 pub use runtime::{

@@ -11,7 +11,14 @@
 //! `on_event`, `execute_command`, `render_call` — on the real
 //! [`cyrup_ext_subagents::extension::SubagentsExtension`] and
 //! [`cyrup_ext_subagents::prompt_runtime::SubagentPromptRuntime`], and asserts the watchdog state
-//! machine moved. Nothing here calls a watchdog method directly.
+//! machine moved. **Nothing here calls a watchdog lifecycle method directly** — every `turn_end`,
+//! `agent_end` and `session_*` arrives as a real [`cyrup_ext::HostEvent`] through `on_event`, so
+//! the shaping the two roles do between the host event and `handle_turn_end` is under test rather
+//! than bypassed. (It was bypassed once: the test claiming `turn_end` reached the child built a
+//! `HostEvent::TurnEnd`, discarded it with `let _ =`, and hand-wrote the JSON — which is precisely
+//! how the role-less tool-result shaping stayed green.)
+//!
+//! Constructing a watchdog, and reading its snapshot, are not lifecycle calls and do happen here.
 
 #![allow(
     clippy::unwrap_used,
@@ -30,6 +37,9 @@ use cyrup_ext_subagents::watchdog::child_status::{
     ChildWatchdogPhase, ChildWatchdogStatusEvent, CHILD_WATCHDOG_STATUS_EVENT,
 };
 use cyrup_ext_subagents::watchdog::register_child::{register_child_watchdog, ChildWatchdog};
+use cyrup_ext_subagents::watchdog::runtime::{
+    WatchdogReview, WatchdogReviewRequest, WatchdogReviewResult,
+};
 use cyrup_ext_subagents::watchdog::types::SUBAGENT_WATCHDOG_WARNING_TYPE;
 
 fn ctx(cwd: &std::path::Path) -> HostCtx {
@@ -356,13 +366,20 @@ fn child_config_json() -> String {
 fn armed_child(
     cwd: &std::path::Path,
 ) -> (Arc<ChildWatchdog>, Arc<Mutex<Vec<ChildWatchdogStatusEvent>>>) {
+    armed_child_with_review(cwd, None)
+}
+
+fn armed_child_with_review(
+    cwd: &std::path::Path,
+    review: Option<Arc<dyn WatchdogReview>>,
+) -> (Arc<ChildWatchdog>, Arc<Mutex<Vec<ChildWatchdogStatusEvent>>>) {
     let events: Arc<Mutex<Vec<ChildWatchdogStatusEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = Arc::clone(&events);
     let watchdog = register_child_watchdog(
         Some(&child_config_json()),
         cwd,
         Arc::new(|| None),
-        None,
+        review,
         Arc::new(move |event: &ChildWatchdogStatusEvent| {
             sink_events
                 .lock()
@@ -372,6 +389,49 @@ fn armed_child(
     )
     .expect("the child is armed");
     (watchdog, events)
+}
+
+/// A [`WatchdogReview`] that records the delta it was handed. It is bound through
+/// `register_child_watchdog`'s real `review` parameter — the same parameter production now fills
+/// with `MainWatchdogReview` — so the delta it sees is the delta the model would see.
+#[derive(Default)]
+struct RecordingReview {
+    deltas: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl WatchdogReview for RecordingReview {
+    async fn review(
+        &self,
+        request: WatchdogReviewRequest,
+    ) -> Result<Option<WatchdogReviewResult>, String> {
+        self.deltas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.delta);
+        Ok(Some(WatchdogReviewResult::default()))
+    }
+}
+
+/// The PRODUCTION child, built from the env exactly as `registerSubagentPromptRuntime` builds it,
+/// gets the REAL review — `createMainWatchdogReview(…)` (`register-child.ts:77`), not the inert
+/// default. A runtime whose review is `None` reports `not wired` and reviews nothing at any
+/// boundary, which is what an armed child silently did.
+#[test]
+fn the_env_built_child_watchdog_has_a_review_wired() {
+    let config = child_config_json();
+    let runtime = cyrup_ext_subagents::prompt_runtime::prompt_runtime_from_env(&|key| {
+        (key == cyrup_ext_subagents::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV)
+            .then(|| config.clone())
+    })
+    .expect("a watchdog config alone arms the child runtime");
+    let watchdog = runtime.watchdog().expect("the child watchdog is installed");
+    let snapshot = watchdog.runtime().get_snapshot(None);
+    assert!(
+        snapshot.review_connected,
+        "the child's review must be wired, not the inert default"
+    );
+    assert_eq!(snapshot.review_description, "child model review");
 }
 
 #[tokio::test]
@@ -494,30 +554,132 @@ async fn a_child_watchdog_buffers_the_turn_delta_it_is_handed() {
     );
 
     // A real assistant turn DOES buffer — this is the arm that proves `turn_end` reaches the
-    // runtime rather than being dropped on the way.
-    let assistant = HostEvent::TurnEnd {
-        turn_index: 1,
-        message: cyrup_agent::AgentMessage::Custom {
-            kind: "unused".to_string(),
-            payload: serde_json::Value::Null,
-            timestamp: Some(0),
-        },
-        tool_results: Vec::new(),
-    };
-    let _ = assistant;
-    watchdog.handle_turn_end(
-        &serde_json::json!({
-            "type": "turn_end",
-            "message": { "role": "assistant", "content": [{ "type": "text", "text": "did work" }] },
-            "toolResults": [],
-        }),
-        root.path(),
-    );
+    // runtime rather than being dropped on the way. It goes through `on_event`, like everything
+    // else in this file: the shaping the extension does between `HostEvent::TurnEnd` and
+    // `handle_turn_end` is exactly what a hand-written JSON literal would skip testing.
+    runtime
+        .on_event(&assistant_turn_end("did work", Vec::new()), &cwd)
+        .await;
     assert_eq!(
         watchdog.runtime().get_snapshot(None).buffered_deltas,
         1,
         "the child's runtime is live and buffering"
     );
+
+}
+
+/// The delta the review actually receives, driven entirely through the extension event path.
+///
+/// Two things the `turn_end` shaping defect broke, both keyed on the SAME missing `role`:
+///
+/// 1. `messagesFromEvent` expands a `turn_end` into `[message, ...toolResults]`
+///    (`turn-delta.ts:106-108`) and `formatWatchdogReviewMessage` dispatches on `role` ALONE
+///    (`:126-146`), so role-less results rendered no section — the reviewer saw the assistant's
+///    claim and never the tool output that would contradict it.
+/// 2. `messageIndicatesRepoEdit` (`change-signature.ts:208-216`) ALSO requires
+///    `role === "toolResult"`. It is the git-free fallback that decides a boundary has anything to
+///    review at all (`runtime.ts:1604`), so without the role a child — which binds no repo change
+///    source — took `handleAgentEnd`'s "changes only and nothing changed" early return
+///    (`runtime.ts:987`) and ran NO review, ever. That is what this test's `edit` result proves.
+#[tokio::test]
+async fn the_delta_the_child_review_receives_carries_this_turns_tool_results() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let review = Arc::new(RecordingReview::default());
+    let (watchdog, _events) =
+        armed_child_with_review(root.path(), Some(Arc::clone(&review) as Arc<dyn WatchdogReview>));
+    let runtime = cyrup_ext_subagents::prompt_runtime::SubagentPromptRuntime::from_parts(
+        None, None, false,
+    )
+    .with_watchdog(
+        Some(Arc::clone(&watchdog)),
+        Arc::new(std::sync::Mutex::new(None)),
+    );
+    let cwd = ctx(root.path());
+
+    runtime
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "test".to_string(),
+            },
+            &cwd,
+        )
+        .await;
+    runtime
+        .on_event(
+            &assistant_turn_end(
+                "I read the file and it is fine",
+                vec![
+                    tool_result("edit", "applied 1 hunk", false),
+                    tool_result("bash", "cargo: command not found", true),
+                ],
+            ),
+            &cwd,
+        )
+        .await;
+    runtime
+        .on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &cwd)
+        .await;
+
+    let deltas = review
+        .deltas
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(deltas.len(), 1, "the boundary ran exactly one review");
+    let delta = deltas.first().expect("one delta");
+    assert!(
+        delta.contains("Assistant:\nI read the file and it is fine"),
+        "{delta}"
+    );
+    assert!(
+        delta.contains("Tool result: edit\nResult:\napplied 1 hunk"),
+        "the successful tool result reached the review: {delta}"
+    );
+    assert!(
+        delta.contains("Tool result: bash\nError: tool reported an error"),
+        "the FAILED tool result reached the review: {delta}"
+    );
+}
+
+/// A `turn_end` the host really emits: an assistant message plus this turn's tool results.
+fn assistant_turn_end(
+    text: &str,
+    tool_results: Vec<cyrup_agent::ToolResultMessage>,
+) -> HostEvent {
+    let mut message = cyrup_core::AssistantMessage::errored(
+        cyrup_core::ProviderId::from("faux"),
+        "m",
+        Some(cyrup_core::ApiId::from("faux")),
+        cyrup_core::StopReason::Stop,
+        "",
+    );
+    message.error_message = None;
+    if !text.is_empty() {
+        message.content = vec![cyrup_core::Content::Text {
+            text: text.to_string(),
+            text_signature: None,
+        }];
+    }
+    HostEvent::TurnEnd {
+        turn_index: 1,
+        message: cyrup_agent::AgentMessage::Assistant(message),
+        tool_results,
+    }
+}
+
+fn tool_result(name: &str, text: &str, is_error: bool) -> cyrup_agent::ToolResultMessage {
+    cyrup_agent::ToolResultMessage {
+        tool_call_id: cyrup_core::ToolCallId::from("call-1"),
+        tool_name: name.to_string(),
+        content: vec![cyrup_core::Content::Text {
+            text: text.to_string(),
+            text_signature: None,
+        }],
+        details: None,
+        usage: None,
+        added_tool_names: Vec::new(),
+        is_error,
+        timestamp: 0,
+    }
 }
 
 #[tokio::test]

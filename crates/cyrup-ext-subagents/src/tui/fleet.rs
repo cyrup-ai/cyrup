@@ -457,13 +457,28 @@ pub fn collect_fleet_snapshot(state: &FleetState, options: &FleetViewOptions) ->
     FleetSnapshot { items, error: state.scan_error.clone() }
 }
 
-/// pi's `listAsyncRuns(options.asyncDirRoot, { …, entryLimit: MAX_FLEET_HISTORY_CANDIDATES,
-/// reconcile: false })` (`fleet.ts:194-199`) — the on-disk history half of the roster.
+/// pi's `listAsyncRuns(options.asyncDirRoot, { ...(state.currentSessionId ? { sessionId:
+/// state.currentSessionId } : {}), entryLimit: MAX_FLEET_HISTORY_CANDIDATES, reconcile: false })`
+/// (`fleet.ts:194-199`) — the on-disk history half of the roster.
 ///
-/// `reconcile: false` is upstream's own choice and is load-bearing: the inspector reads what is on
-/// disk right now and never mutates it, so opening the inspector can never repair, fail or
-/// re-terminalise a run. A directory whose `status.json` is missing or unreadable is skipped, not
-/// fatal (pi's `if (!status) continue`).
+/// Three of upstream's options are load-bearing here:
+///
+/// * **`sessionId`** — `listAsyncRuns` drops every on-disk run whose recorded `status.sessionId`
+///   differs from the caller's (`async-status.ts:432`:
+///   `if (options.sessionId && status.sessionId !== options.sessionId) continue;`). Note the exact
+///   shape: with a current session, a run carrying NO recorded session is dropped too
+///   (`undefined !== "abc"`), which is STRICTER than
+///   [`belongs_to_current_session`]'s in-memory rule; with no current session the filter is off
+///   entirely and everything on disk belongs. Without it, opening the inspector in one session
+///   lists every run every other session in the same project ever launched.
+/// * **`reconcile: false`** — the inspector reads what is on disk right now and never mutates it,
+///   so opening the inspector can never repair, fail or re-terminalise a run. A directory whose
+///   `status.json` is missing or unreadable is skipped, not fatal (pi's `if (!status) continue`).
+/// * **`entryLimit`** — upstream sorts the candidate directories by their `status.json` mtime,
+///   NEWEST FIRST, and keeps the first `entryLimit` (`async-status.ts:388-405`). It is not "the
+///   first 100 the directory happened to list": on a project with more than
+///   [`MAX_FLEET_HISTORY_CANDIDATES`] runs, readdir order would silently pin the roster to an
+///   arbitrary — very possibly the oldest — subset.
 ///
 /// # Errors
 ///
@@ -474,16 +489,17 @@ pub async fn collect_fleet_history(
     results_dir: &Path,
     current_session_id: Option<&str>,
 ) -> Result<Vec<AsyncRunView>, String> {
-    let mut runs: Vec<AsyncRunView> = Vec::new();
     let mut entries = match tokio::fs::read_dir(async_root).await {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(runs),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.to_string()),
     };
+    // pi's `entryLimit` pass (`async-status.ts:388-405`): collect every candidate with its
+    // `status.json` mtime FIRST, sort newest-first, and only then take the limit. A directory whose
+    // status file is missing is dropped here rather than counted against the budget, exactly as
+    // upstream's `isNotFoundError ⇒ undefined` filter does.
+    let mut candidates: Vec<(i128, RunPaths)> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if runs.len() >= MAX_FLEET_HISTORY_CANDIDATES {
-            break;
-        }
         let Ok(file_type) = entry.file_type().await else { continue };
         if !file_type.is_dir() {
             continue;
@@ -491,15 +507,35 @@ pub async fn collect_fleet_history(
         let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
         let run_id = crate::background::RunId::from_token(name);
         let paths = RunPaths::for_run(async_root, results_dir, &run_id);
+        let Ok(meta) = tokio::fs::metadata(&paths.status).await else { continue };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| i128::try_from(d.as_millis()).unwrap_or(i128::MAX));
+        candidates.push((mtime, paths));
+    }
+    candidates.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    candidates.truncate(MAX_FLEET_HISTORY_CANDIDATES);
+
+    let mut runs: Vec<AsyncRunView> = Vec::new();
+    for (_, paths) in candidates {
         let Ok(bytes) = tokio::fs::read(&paths.status).await else { continue };
         let Ok(status) = serde_json::from_slice::<RunStatus>(&bytes) else { continue };
+        // pi `async-status.ts:432` — `if (options.sessionId && status.sessionId !==
+        // options.sessionId) continue;`. The comparison is against the sessionId recorded ON THE
+        // RUN ([`crate::background::RunStatus::session_id`], stamped by the detached runner from
+        // the parent-session anchor), and an absent one loses to any present filter.
+        if let Some(current) = current_session_id
+            && status.session_id.as_deref() != Some(current)
+        {
+            continue;
+        }
+        let session_id = status.session_id.clone();
         runs.push(AsyncRunView {
             paths,
             status,
-            // A history run carries no in-memory session tag; pi's `listAsyncRuns` filters on the
-            // sessionId recorded on the run itself, which cyrup's `status.json` does not carry, so
-            // the filter degrades to "belongs" exactly as pi's own `null` session does.
-            session_id: current_session_id.map(str::to_string),
+            session_id,
             description: None,
             context: None,
             nested_children: Vec::new(),
@@ -2418,6 +2454,147 @@ mod tests {
 
     fn component() -> SubagentFleetComponent {
         SubagentFleetComponent::new(busy_state(), FleetViewOptions::default(), None, true, false)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Painted-cell style assertions — the half `lines_text` cannot see
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_five_status_glyphs_paint_five_distinct_roles() {
+        for (state, glyph, role) in [
+            ("running", "●", Role::Accent),
+            ("queued", "◦", Role::Muted),
+            ("complete", "✓", Role::Success),
+            ("paused", "■", Role::Warning),
+            ("boom", "✗", Role::Error),
+        ] {
+            let span = status_glyph(state);
+            assert_eq!(span.content.as_ref(), glyph, "{state} glyph");
+            let line = Line::from(vec![span]);
+            assert!(
+                th::paints_as(th::painted_style(std::slice::from_ref(&line), 4, glyph), role),
+                "{state} must paint as {role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_frame_chrome_paints_its_upstream_roles() {
+        let mut c = component();
+        let frame = c.render(100, 10_000);
+        assert!(
+            th::paints_as(th::painted_style(&frame, 100, "╭"), Role::Border),
+            "the box corner is border-coloured"
+        );
+        assert!(
+            th::paints_as(th::painted_style(&frame, 100, "· live controls"), Role::Dim),
+            "the title suffix is dim"
+        );
+        assert!(
+            th::paints_as(th::painted_style(&frame, 100, "↑↓/jk agent"), Role::Dim),
+            "the footer is dim"
+        );
+        // The title itself is bold and UNCOLOURED — a colour here would be a repaint.
+        let title = th::painted_style(&frame, 100, "Subagent fleet inspector");
+        assert!(title.add_modifier.contains(Modifier::BOLD), "the title is bold");
+        assert_eq!(title.fg, Some(ratatui::style::Color::Reset), "the title takes no colour");
+    }
+
+    #[test]
+    fn the_selected_roster_row_paints_its_marker_accent_and_its_agent_bold() {
+        let mut c = component();
+        let frame = c.render(100, 10_000);
+        assert!(
+            th::paints_as(th::painted_style(&frame, 100, "›"), Role::Accent),
+            "the selection marker is accent"
+        );
+        // `coder` is painted TWICE: once in the frame header's selected-status readout (unstyled,
+        // `fleet.ts:811`) and once as the roster row's agent (bold while selected, `fleet.ts:722`).
+        // Same characters, different cells — invisible to a flattened-text assertion.
+        assert!(
+            !th::painted_style_nth(&frame, 100, "coder", 0)
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "the header readout is not bold"
+        );
+        assert!(
+            th::painted_style_nth(&frame, 100, "coder", 1)
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "the SELECTED roster row's agent is bold"
+        );
+
+        // Move the selection off it: the very same roster cell must lose its bold. The header now
+        // reads the newly selected row, so the roster occurrence is the only `coder` left.
+        c.handle_input(FleetKey::Down);
+        let frame = c.render(100, 10_000);
+        assert_eq!(th::painted_style_nth_of(&frame, 100, "coder", 1), None);
+        assert!(
+            !th::painted_style_nth(&frame, 100, "coder", 0)
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "an unselected roster row's agent must not be bold"
+        );
+        // …and the newly selected row's agent gained it.
+        assert!(
+            th::painted_style_nth(&frame, 100, "a · bg", 0)
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "the newly selected roster row's agent is bold"
+        );
+    }
+
+    #[test]
+    fn the_empty_roster_notice_paints_dim() {
+        let mut c = SubagentFleetComponent::new(
+            FleetState::default(),
+            FleetViewOptions::default(),
+            None,
+            false,
+            false,
+        );
+        let frame = c.render(100, 10_000);
+        assert!(th::paints_as(th::painted_style(&frame, 100, "No tracked children"), Role::Dim));
+        assert!(th::paints_as(th::painted_style(&frame, 100, "no children"), Role::Dim));
+    }
+
+    #[test]
+    fn the_steer_prompt_and_the_stop_confirmation_paint_different_colours() {
+        let mut c = component();
+        c.handle_input(FleetKey::Down);
+        c.handle_input(FleetKey::Char('s'));
+        let frame = c.render(100, 10_000);
+        assert!(
+            th::paints_as(th::painted_style(&frame, 100, "Steer message"), Role::Accent),
+            "the steer prompt is accent"
+        );
+        assert!(
+            th::paints_as(th::painted_style(&frame, 100, "Enter sends"), Role::Dim),
+            "its hint is dim"
+        );
+
+        let mut c = component();
+        c.handle_input(FleetKey::Down);
+        c.handle_input(FleetKey::Char('D'));
+        let frame = c.render(100, 10_000);
+        assert!(
+            th::paints_as(th::painted_style(&frame, 100, "Confirm stop"), Role::Warning),
+            "the stop confirmation is WARNING, not accent — same pane, different colour"
+        );
+    }
+
+    #[test]
+    fn an_action_notice_paints_success_or_error_by_outcome() {
+        let mut c = component();
+        c.finish_action(FleetActionResult::ok("steered"));
+        let frame = c.render(100, 10_000);
+        assert!(th::paints_as(th::painted_style(&frame, 100, "steered"), Role::Success));
+
+        let mut c = component();
+        c.finish_action(FleetActionResult::error("nope"));
+        let frame = c.render(100, 10_000);
+        assert!(th::paints_as(th::painted_style(&frame, 100, "nope"), Role::Error));
     }
 
     #[test]

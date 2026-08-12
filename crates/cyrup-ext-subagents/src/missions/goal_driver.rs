@@ -179,35 +179,174 @@ fn refresh_goal_mission(
     )
 }
 
+/// One node of a mission `state.json`, decoded in **file order**.
+///
+/// # Why this exists instead of [`serde_json::Value`]
+///
+/// `readyActionFromValue`'s last resort is `for (const [key, child] of Object.entries(input))`
+/// (`goal-driver.ts:81`), and `Object.entries` on a `JSON.parse` result yields keys in INSERTION
+/// order — the order they appear in the file. A [`serde_json::Map`] is a [`std::collections::BTreeMap`]
+/// unless the `preserve_order` feature is on (it is not, anywhere in this workspace: `serde_json`
+/// has no `indexmap` dependency in `Cargo.lock`), so iterating one walks keys ALPHABETICALLY.
+///
+/// That silently reordered the search: a `state.json` of
+/// `{"zeta": {"nextAction": "Z"}, "alpha": {"nextAction": "A"}}` answered `"A"` here and `"Z"`
+/// upstream. The precedence this function's own doc claims to pin — explicit keys, then the
+/// `status: "ready"` fallback, then descent — is only half the contract; WHICH sibling is
+/// descended into first is the other half, and it was wrong.
+///
+/// This enum is decoded straight from the file by a `visit_map` that appends entries as they
+/// arrive, so descent order is the file's. Duplicate keys follow `JSON.parse` + `Object.entries`
+/// exactly: the LAST value wins, at the FIRST occurrence's position.
+///
+/// Only the shapes `readyActionFromValue` inspects are retained — strings, arrays and objects.
+/// Every other scalar collapses into [`StateNode::Other`], because upstream's `!value ||
+/// typeof value !== "object"` guard returns `undefined` for all of them without looking further.
+#[derive(Debug, PartialEq)]
+enum StateNode {
+    /// `null`, a boolean or a number — never inspected, only skipped.
+    Other,
+    /// A JSON string (upstream reads these off `nextReadyAction`/`status`/`task`/…).
+    Str(String),
+    /// A JSON array, in order.
+    Array(Vec<StateNode>),
+    /// A JSON object's entries, in FILE order.
+    Object(Vec<(String, StateNode)>),
+}
+
+impl StateNode {
+    /// `input[key]` — the entry for `key`, or `None` when this node is not an object.
+    fn get(&self, key: &str) -> Option<&Self> {
+        match self {
+            Self::Object(entries) => {
+                entries.iter().find(|(k, _)| k == key).map(|(_, value)| value)
+            }
+            _ => None,
+        }
+    }
+
+    /// `typeof input[key] === "string" ? input[key] : undefined`.
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(text) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StateNode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Accepts any JSON value; keeps object entries in arrival (file) order.
+        struct NodeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for NodeVisitor {
+            type Value = StateNode;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StateNode::Other)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(StateNode::Other)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(StateNode::Other)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(StateNode::Other)
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(StateNode::Other)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(StateNode::Str(value.to_string()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(StateNode::Str(value))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StateNode::Other)
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(StateNode::Array(items))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut entries: Vec<(String, StateNode)> = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, StateNode>()? {
+                    // `JSON.parse` keeps the LAST duplicate's value, and `Object.entries` reports
+                    // that key once, at its FIRST position.
+                    match entries.iter_mut().find(|(existing, _)| *existing == key) {
+                        Some(slot) => slot.1 = value,
+                        None => entries.push((key, value)),
+                    }
+                }
+                Ok(StateNode::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(NodeVisitor)
+    }
+}
+
 /// pi `readyActionFromValue` (`goal-driver.ts:62-86`) — the bounded search of `state.json` for a
 /// declared next action.
 ///
 /// Note the ORDER within an object: the two explicit keys first, then the `status: "ready"`
 /// fallback (which yields a positional description when the node names no action of its own), and
-/// only then a recursive descent into the node's own values.
-fn ready_action_from_value(value: &Value, path_label: &str, depth: usize) -> Option<String> {
+/// only then a recursive descent into the node's own values — **in file order**, which is what
+/// [`StateNode`] exists to preserve.
+fn ready_action_from_value(value: &StateNode, path_label: &str, depth: usize) -> Option<String> {
     if depth > MAX_STATE_SEARCH_DEPTH {
         return None;
     }
     match value {
-        Value::Array(items) => items.iter().enumerate().find_map(|(index, item)| {
+        StateNode::Array(items) => items.iter().enumerate().find_map(|(index, item)| {
             ready_action_from_value(item, &format!("{path_label}[{index}]"), depth + 1)
         }),
-        Value::Object(input) => {
+        StateNode::Object(entries) => {
             for key in ["nextReadyAction", "nextAction"] {
-                if let Some(found) = input
+                if let Some(found) = value
                     .get(key)
-                    .and_then(Value::as_str)
+                    .and_then(StateNode::as_str)
                     .filter(|s| !s.trim().is_empty())
                 {
                     return Some(bounded(found));
                 }
             }
-            if input.get("status").and_then(Value::as_str) == Some("ready") {
+            if value.get("status").and_then(StateNode::as_str) == Some("ready") {
                 for key in ["action", "task", "title", "summary"] {
-                    if let Some(found) = input
+                    if let Some(found) = value
                         .get(key)
-                        .and_then(Value::as_str)
+                        .and_then(StateNode::as_str)
                         .filter(|s| !s.trim().is_empty())
                     {
                         return Some(bounded(found));
@@ -215,12 +354,12 @@ fn ready_action_from_value(value: &Value, path_label: &str, depth: usize) -> Opt
                 }
                 return Some(format!("Continue ready mission state at {path_label}"));
             }
-            input.iter().find_map(|(key, child)| {
+            entries.iter().find_map(|(key, child)| {
                 ready_action_from_value(child, &format!("{path_label}.{key}"), depth + 1)
             })
         }
         // pi's guard is `!value || typeof value !== "object"`, so every scalar returns undefined.
-        _ => None,
+        StateNode::Other | StateNode::Str(_) => None,
     }
 }
 
@@ -235,7 +374,7 @@ fn mission_state_action(
         // Upstream lets a malformed state file throw out of the whole scan; same here.
         let raw = std::fs::read_to_string(&state_path)
             .map_err(|err| super::MissionError::io(&state_path, err))?;
-        let value: Value = serde_json::from_str(&raw)
+        let value: StateNode = serde_json::from_str(&raw)
             .map_err(|err| super::MissionError::invalid(err.to_string()))?;
         if let Some(action) = ready_action_from_value(&value, "state", 0) {
             return Ok(Some(action));
@@ -748,18 +887,23 @@ mod tests {
         );
     }
 
+    /// Parse a `state.json` body the way [`mission_state_action`] does — from TEXT, so the
+    /// declaration order in the literal is the order under test.
+    fn state(json: &str) -> StateNode {
+        serde_json::from_str(json).unwrap()
+    }
+
     #[test]
     fn an_explicit_next_ready_action_key_wins_over_a_ready_node() {
-        let value = serde_json::json!({
-            "nested": {"status": "ready", "task": "fallback"},
-            "nextReadyAction": "explicit",
-        });
+        let value = state(
+            r#"{"nested": {"status": "ready", "task": "fallback"}, "nextReadyAction": "explicit"}"#,
+        );
         assert_eq!(ready_action_from_value(&value, "state", 0).as_deref(), Some("explicit"));
     }
 
     #[test]
     fn a_ready_node_with_no_named_action_reports_its_path() {
-        let value = serde_json::json!({"a": {"b": {"status": "ready"}}});
+        let value = state(r#"{"a": {"b": {"status": "ready"}}}"#);
         assert_eq!(
             ready_action_from_value(&value, "state", 0).as_deref(),
             Some("Continue ready mission state at state.a.b")
@@ -769,11 +913,58 @@ mod tests {
     #[test]
     fn the_state_search_is_depth_bounded() {
         // 10 levels of nesting: the `status: "ready"` marker sits below the depth-8 bound.
-        let mut value = serde_json::json!({"status": "ready", "task": "too deep"});
+        let mut text = r#"{"status": "ready", "task": "too deep"}"#.to_string();
         for _ in 0..10 {
-            value = serde_json::json!({ "next": value });
+            text = format!(r#"{{"next": {text}}}"#);
         }
-        assert_eq!(ready_action_from_value(&value, "state", 0), None);
+        assert_eq!(ready_action_from_value(&state(&text), "state", 0), None);
+    }
+
+    /// `Object.entries` (`goal-driver.ts:81`) walks INSERTION order. `zeta` is declared first, so
+    /// `zeta`'s action is the answer — even though `alpha` sorts first.
+    ///
+    /// This is the case a `serde_json::Map` (a `BTreeMap` without `preserve_order`) got wrong:
+    /// it descended alphabetically and returned `"from alpha"`.
+    #[test]
+    fn the_descent_follows_file_order_not_alphabetical_order() {
+        let value =
+            state(r#"{"zeta": {"nextAction": "from zeta"}, "alpha": {"nextAction": "from alpha"}}"#);
+        assert_eq!(ready_action_from_value(&value, "state", 0).as_deref(), Some("from zeta"));
+
+        // …and the mirror image: swapping only the DECLARATION order swaps only the answer.
+        let swapped =
+            state(r#"{"alpha": {"nextAction": "from alpha"}, "zeta": {"nextAction": "from zeta"}}"#);
+        assert_eq!(ready_action_from_value(&swapped, "state", 0).as_deref(), Some("from alpha"));
+    }
+
+    /// The reported PATH label follows the same order, so a positional description names the node
+    /// upstream would have named.
+    #[test]
+    fn the_reported_path_label_follows_file_order() {
+        let value = state(r#"{"zulu": {"status": "ready"}, "alfa": {"status": "ready"}}"#);
+        assert_eq!(
+            ready_action_from_value(&value, "state", 0).as_deref(),
+            Some("Continue ready mission state at state.zulu")
+        );
+    }
+
+    /// `JSON.parse` keeps the LAST duplicate's value and `Object.entries` reports the key once, at
+    /// its FIRST position — so `dup` still leads the descent and carries `"second"`.
+    #[test]
+    fn a_duplicate_key_keeps_the_last_value_at_the_first_position() {
+        let value = state(
+            r#"{"dup": {"nextAction": "first"}, "later": {"nextAction": "later"}, "dup": {"nextAction": "second"}}"#,
+        );
+        assert_eq!(ready_action_from_value(&value, "state", 0).as_deref(), Some("second"));
+    }
+
+    /// Scalars are skipped without being descended into, and an array is searched in index order.
+    #[test]
+    fn arrays_are_searched_in_index_order_and_scalars_are_skipped() {
+        let value = state(
+            r#"{"n": 1, "b": true, "nul": null, "s": "plain", "items": [{"k": 1}, {"nextAction": "second item"}]}"#,
+        );
+        assert_eq!(ready_action_from_value(&value, "state", 0).as_deref(), Some("second item"));
     }
 
     #[test]
