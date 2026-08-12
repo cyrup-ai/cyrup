@@ -461,6 +461,18 @@ pub fn decode_child_watchdog_config(
 
 /// `isChildWatchdogStatusEvent` (`child-status.ts:168-181`) — the parent's NDJSON filter.
 ///
+/// **No non-test caller yet, and the missing caller is not in this module.** Upstream consumes this
+/// predicate, [`child_watchdog_is_active`] and [`accept_child_watchdog_event`] together, in the two
+/// places that read a child's stdout: `runs/foreground/execution.ts:846-864` and
+/// `runs/background/subagent-runner.ts:626-645` (again at `:2711`). Both fold the event into a
+/// `childWatchdogState`, then use `childWatchdogIsActive` to arm a WATCHDOG TAIL timer that holds
+/// the run open while the child is still reviewing (`execution.ts:584-587`,
+/// `subagent-runner.ts:831`) instead of letting the final-drain timer terminate it. cyrup's
+/// counterparts are `crate::exec` and `crate::background`, and neither reads a child watchdog
+/// status event today, so an armed child that is mid-review can still be drained out from under
+/// itself. That is unported wiring in those modules; the three predicates here are faithful ports
+/// of `child-status.ts:167-205` and are what it will call.
+///
 /// Every one of upstream's seven predicates is reproduced: the `type` discriminator, an integral
 /// non-negative `seq`, a finite numeric `ts`, a boolean `followUpPending`, and a `phase` that is a
 /// string in [`ChildWatchdogPhase::ALL`].

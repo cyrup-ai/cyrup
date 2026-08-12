@@ -277,8 +277,8 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
 
 /// C7 regression (root-cause T0.4): the detached runner must write its terminal `ResultFile` into
 /// the SAME results dir the ORCHESTRATOR derived and created — never a re-derived, divergent one.
-/// Before the fix, the orchestrator's results dir was `<subagents_home>/results/<cwd_key>` while the
-/// runner re-derived `<subagents_home>/async/results` from the config-file path's own structure, so
+/// Before the fix, the orchestrator's results dir was `<temp_root_dir>/results/<cwd_key>` while the
+/// runner re-derived `<temp_root_dir>/async/results` from the config-file path's own structure, so
 /// every real background run's result write targeted a directory that never existed and the run
 /// appeared to hang forever.
 ///
@@ -358,7 +358,7 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         .expect("write runner config");
 
     // Deliberately hand run() a PROVISIONAL RunPaths whose result path points at the OLD, buggy,
-    // never-created location (`<subagents_home>/async/results/...`) — exactly what the pre-fix
+    // never-created location (`<temp_root_dir>/async/results/...`) — exactly what the pre-fix
     // derivation computed. The C7 fix means run() ignores this for its terminal writes and honors
     // the config's absolute roots instead.
     let buggy_results_dir = roots

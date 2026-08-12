@@ -700,7 +700,13 @@ impl SubagentFleetStatus {
         &self.entries
     }
 
-    /// pi `widgetRegistered` — whether a widget payload is currently published.
+    /// pi `widgetRegistered` (`fleet-status.ts:247`) — whether a widget payload is currently
+    /// published.
+    ///
+    /// Upstream's field is `private`; this accessor exists because [`Self::refresh`] already
+    /// applies every `widgetRegistered` guard internally (`:308,319,328`) and returns a single
+    /// "republish or clear" bool, so the flag is otherwise unobservable and its state machine
+    /// untestable. Assertion surface by design, not pending wiring.
     #[must_use]
     pub fn is_widget_registered(&self) -> bool {
         self.widget_registered

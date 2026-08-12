@@ -3192,10 +3192,17 @@ async fn finish_run(
     }
 
     // Best-effort run-history recording (pi's `recordRun`, `run-history.ts`): one line per
-    // top-level result appended to `<subagents_home>/run-history.jsonl`. Placed AFTER the
+    // top-level result appended to `<agent_dir>/run-history.jsonl` (pi `getHistoryPath()`,
+    // `runs/shared/run-history.ts:23-25` @v0.43.0 — the DURABLE agent dir, deliberately not the
+    // disposable `temp_root_dir` scratch tree). Placed AFTER the
     // authoritative status/ResultFile writes (and inside the double-invocation guard above, so a
     // no-op re-invocation never double-records) — a history-write failure never affects the run.
-    super::record_run_history(status.started_at, &result_file.results).await;
+    //
+    // The run's OWN async root (`run_dir`'s parent) is handed over rather than re-derived, so a run
+    // whose roots were redirected records its history with them instead of in the real user's agent
+    // dir — see [`super::run_history_path_for`].
+    let async_root = run_paths.run_dir.parent().unwrap_or(&run_paths.run_dir);
+    super::record_run_history(async_root, status.started_at, &result_file.results).await;
 }
 
 #[cfg(test)]

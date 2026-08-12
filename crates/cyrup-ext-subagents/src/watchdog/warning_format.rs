@@ -81,9 +81,16 @@ impl WatchdogWarningDetailsPatch {
     }
 
     /// Chain `identity` onto the patch (`runtime.ts:505,519`).
+    ///
+    /// Takes an `Option` because upstream's is one: both call sites write
+    /// `identity: decision.identity` into the extras LITERAL, and
+    /// `EmissionDecision.identity` is `string | undefined` — a warning the guard accepted without
+    /// an identity leaves the key `undefined` rather than omitting it. A non-optional setter forced
+    /// both callers to build the patch and then assign the field, which is why this had no caller
+    /// at all while `with_displayed_at` right beside it did.
     #[must_use]
-    pub fn with_identity(mut self, identity: impl Into<String>) -> Self {
-        self.identity = Some(identity.into());
+    pub fn with_identity(mut self, identity: Option<impl Into<String>>) -> Self {
+        self.identity = identity.map(Into::into);
         self
     }
 
@@ -133,6 +140,12 @@ pub fn normalize_watchdog_warning_details(
 /// structural subtyping (`emission-guard.ts`'s `evaluate(warning)` is handed a details value at
 /// `runtime.ts:653`, and `createWatchdogWarningMessage(details, …)` at `register-main.ts:371`
 /// passes one as its `warning` argument).
+///
+/// No production caller: every cyrup site that has a details value calls the details-typed
+/// [`create_watchdog_warning_message_from_details`] / [`format_watchdog_warning_content_from_details`]
+/// directly rather than narrowing first. It is kept because it is the only expression of the
+/// conversion upstream performs implicitly, and because it is what pins the warning-typed and
+/// details-typed entry points to each other in this module's tests.
 #[must_use]
 pub fn details_as_warning(details: &WatchdogWarningDetails) -> WatchdogWarning {
     WatchdogWarning {
@@ -230,6 +243,11 @@ pub fn format_watchdog_warning_content_from_details(details: &WatchdogWarningDet
 
 /// `formatWatchdogWarningContent(warning)` (`warning-format.ts:33-60`) — normalizes first
 /// (`:34`), exactly as upstream does, then renders.
+///
+/// This is the port of the EXPORTED upstream name; production takes
+/// [`format_watchdog_warning_content_from_details`] instead, because upstream's only call
+/// (`:69`) passes an already-normalized details value that TypeScript accepts structurally. The
+/// two are pinned together by test.
 #[must_use]
 pub fn format_watchdog_warning_content(warning: &WatchdogWarning) -> String {
     let details =
@@ -238,6 +256,12 @@ pub fn format_watchdog_warning_content(warning: &WatchdogWarning) -> String {
 }
 
 /// `createWatchdogWarningMessage(warning, { display, details })` (`warning-format.ts:62-73`).
+///
+/// The port of the EXPORTED upstream signature. All three upstream call sites
+/// (`register-main.ts:371,387`, `register-child.ts:82`) pass a DETAILS value in the `warning`
+/// position, so cyrup's production paths call
+/// [`create_watchdog_warning_message_from_details`] and this form has no caller; a test pins the
+/// two to the same output so they cannot drift.
 #[must_use]
 pub fn create_watchdog_warning_message(
     warning: &WatchdogWarning,
@@ -324,7 +348,7 @@ mod tests {
                 WatchdogWarningState::Displayed,
                 WatchdogWarningSource::Main,
             )
-            .with_identity("id-1")
+            .with_identity(Some("id-1"))
             .with_displayed_at("1970-01-01T00:00:00.000Z"),
         );
         assert_eq!(details.identity.as_deref(), Some("id-1"));
@@ -390,6 +414,61 @@ mod tests {
             message.content,
             format_watchdog_warning_content_from_details(&details)
         );
+    }
+
+    /// Upstream has ONE `createWatchdogWarningMessage` (`:62-73`) and all three of its call sites
+    /// pass a details value as the `warning` argument AND as `options.details`
+    /// (`register-main.ts:371,387`, `register-child.ts:82`) — TypeScript's structural subtyping
+    /// makes that one call. Rust needs two entry points, so this pins them together: feeding the
+    /// same details through [`details_as_warning`] into the warning-typed
+    /// [`create_watchdog_warning_message`] must produce exactly what the details-typed form
+    /// production uses produces. Without this the two can silently drift, and only the
+    /// details-typed one has a caller to notice.
+    #[test]
+    fn both_message_entry_points_agree_on_upstreams_single_call_shape() {
+        let details = normalize_watchdog_warning_details(
+            &warning(),
+            &WatchdogWarningDetailsPatch::new(
+                WatchdogWarningState::Displayed,
+                WatchdogWarningSource::Child,
+            )
+            .with_identity(Some("id-9"))
+            .with_displayed_at("1970-01-01T00:00:00.000Z"),
+        );
+
+        // `createWatchdogWarningMessage(details, { display: true, details })` — the details ride
+        // BOTH argument positions, exactly as upstream's single call does.
+        let via_warning = create_watchdog_warning_message(
+            &details_as_warning(&details),
+            true,
+            &WatchdogWarningDetailsPatch {
+                category: Some(details.category),
+                source: Some(details.source),
+                confidence: details.confidence,
+                agent: details.agent.clone(),
+                run_id: details.run_id.clone(),
+                stale: details.stale,
+                auto_follow_attempt: details.auto_follow_attempt,
+                state: details.state,
+                identity: details.identity.clone(),
+                displayed_at: details.displayed_at.clone(),
+                error: details.error.clone(),
+                stalemate_repeats: details.stalemate_repeats,
+            },
+        );
+        let via_details = create_watchdog_warning_message_from_details(&details, true);
+
+        assert_eq!(via_warning.custom_type, via_details.custom_type);
+        assert_eq!(via_warning.display, via_details.display);
+        assert_eq!(via_warning.content, via_details.content);
+        assert_eq!(via_warning.details, via_details.details);
+        // …and `:69`'s `content: formatWatchdogWarningContent(details)` is the same body either way.
+        assert_eq!(
+            format_watchdog_warning_content(&details_as_warning(&details)),
+            format_watchdog_warning_content_from_details(&details),
+            "the two content formatters must not drift"
+        );
+        assert!(via_details.content.contains("<subagent_watchdog"));
     }
 
     #[test]

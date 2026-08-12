@@ -758,6 +758,12 @@ impl MainWatchdogRuntime {
     }
 
     /// `clearSessionOverride(cwd)` (`runtime.ts:242-248`).
+    ///
+    /// No caller — and none upstream either. `register-main.ts` clears the enabled flag through
+    /// `setSessionEnabled(false)` (`:289-290`) and the model through
+    /// [`Self::clear_session_model`] (`:304`); nothing calls the method that clears BOTH at once.
+    /// It is kept because it is part of the ported `MainWatchdogRuntime` method surface (upstream
+    /// declares it public on the class), not because a cyrup caller is pending.
     pub fn clear_session_override(&self, cwd: &Path) -> WatchdogRuntimeSnapshot {
         {
             let mut inner = self.lock();
@@ -1418,12 +1424,14 @@ impl MainWatchdogRuntime {
             if !decision.accepted() {
                 return false;
             }
-            let mut patch = WatchdogWarningDetailsPatch::new(
+            // `normalizeWatchdogWarningDetails(warning, { state, source, identity, displayedAt })`
+            // (`runtime.ts:516-521`) — one extras literal, built in one expression.
+            let patch = WatchdogWarningDetailsPatch::new(
                 WatchdogWarningState::Displayed,
                 warning.source.unwrap_or(WatchdogWarningSource::Main),
             )
+            .with_identity(decision.identity())
             .with_displayed_at(super::now_iso8601());
-            patch.identity = decision.identity().map(str::to_string);
             let details = normalize_watchdog_warning_details(warning, &patch);
             inner.last_warning = Some(details.clone());
             inner.displayed_warning_sequence += 1;
@@ -1790,11 +1798,13 @@ impl RuntimeInner {
         if !decision.accepted() {
             return false;
         }
-        let mut patch = WatchdogWarningDetailsPatch::new(
+        // `normalizeWatchdogWarningDetails(warning, { state, source, identity })`
+        // (`runtime.ts:502-506`).
+        let patch = WatchdogWarningDetailsPatch::new(
             WatchdogWarningState::Candidate,
             warning.source.unwrap_or(WatchdogWarningSource::Main),
-        );
-        patch.identity = decision.identity().map(str::to_string);
+        )
+        .with_identity(decision.identity());
         let details = normalize_watchdog_warning_details(warning, &patch);
         self.last_warning = Some(details.clone());
         self.active_review_warning = Some(details);
@@ -2781,6 +2791,37 @@ mod tests {
         runtime.set_session_model(Some(Some("a/b".into())), None, &cwd());
         assert!(runtime.get_snapshot(None).session_model_override.is_some());
         runtime.clear_session_model(&cwd());
+        assert!(runtime.get_snapshot(None).session_model_override.is_none());
+    }
+
+    /// `clearSessionOverride(cwd)` (`runtime.ts:242-248`) clears BOTH session slots at once, where
+    /// `setSessionEnabled(false)` (`:236-241`'s sibling) and [`MainWatchdogRuntime::clear_session_model`]
+    /// each clear one. Nothing calls it upstream either (see its doc), so this test is the only
+    /// thing standing between the ported method and silent rot.
+    #[tokio::test]
+    async fn clearing_the_session_override_drops_both_slots_where_the_narrow_clears_drop_one() {
+        let sinks = Sinks::default();
+        let runtime = MainWatchdogRuntime::new(options_with(enabled_config(), &sinks));
+        runtime.set_session_enabled(false, &cwd());
+        runtime.set_session_model(Some(Some("a/b".into())), None, &cwd());
+        assert_eq!(runtime.get_snapshot(None).session_override, Some(false));
+        assert!(runtime.get_snapshot(None).session_model_override.is_some());
+
+        // The NARROW clear leaves the enabled override standing …
+        runtime.clear_session_model(&cwd());
+        assert_eq!(
+            runtime.get_snapshot(None).session_override,
+            Some(false),
+            "clear_session_model must not touch the enabled override"
+        );
+
+        // … and the wide one drops it too.
+        runtime.set_session_model(Some(Some("a/b".into())), None, &cwd());
+        let snapshot = runtime.clear_session_override(&cwd());
+        assert_eq!(snapshot.session_override, None);
+        assert!(snapshot.session_model_override.is_none());
+        // The returned snapshot is the live one, not a stale copy (`:247`'s `getSnapshot()`).
+        assert_eq!(runtime.get_snapshot(None).session_override, None);
         assert!(runtime.get_snapshot(None).session_model_override.is_none());
     }
 

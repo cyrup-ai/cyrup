@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cyrup_core::ModelId;
 
-use crate::background::{cwd_key, subagents_home};
+use crate::background::{agent_dir, cwd_key, temp_root_dir};
 use crate::exec::SingleResult;
 
 /// Project-local artifact root (pi `PROJECT_ARTIFACT_ROOT = ".pi-subagents"`, rebranded).
@@ -147,19 +147,22 @@ pub fn project_chain_runs_dir(cwd: &Path) -> PathBuf {
     project_subagents_dir(cwd).join(CHAIN_RUNS_SUBDIR)
 }
 
-/// The scoped-temp artifacts root for `cwd` — the Rust analog of pi's `TEMP_ARTIFACTS_DIR`
-/// (`shared/types.ts:1866`), keyed per-`cwd` under the SAME `<home>/.cyrup/subagents` root the async/results
+/// pi `TEMP_ARTIFACTS_DIR = path.join(TEMP_ROOT_DIR, "artifacts")` (`shared/types.ts:1866`
+/// @v0.43.0), keyed per-`cwd` under the SAME [`crate::background::temp_root_dir`] the async/results
 /// dirs use ([`crate::background::run_artifact_roots`]).
+///
+/// [CYRUP-DELTA] the `<cwd_key>` level is cyrup's; upstream's is flat. See
+/// [`crate::background::cwd_key`] for why.
 #[must_use]
 pub fn temp_artifacts_dir(cwd: &Path) -> PathBuf {
-    subagents_home().join(ARTIFACTS_SUBDIR).join(cwd_key(cwd))
+    temp_root_dir().join(ARTIFACTS_SUBDIR).join(cwd_key(cwd))
 }
 
-/// The scoped-temp chain-runs root for `cwd` — the Rust analog of pi's `CHAIN_RUNS_DIR`, keyed
-/// per-`cwd` alongside [`temp_artifacts_dir`].
+/// pi `CHAIN_RUNS_DIR = path.join(TEMP_ROOT_DIR, "chain-runs")` (`shared/types.ts:1865` @v0.43.0),
+/// keyed per-`cwd` alongside [`temp_artifacts_dir`].
 #[must_use]
 pub fn chain_runs_dir(cwd: &Path) -> PathBuf {
-    subagents_home().join(CHAIN_RUNS_SUBDIR).join(cwd_key(cwd))
+    temp_root_dir().join(CHAIN_RUNS_SUBDIR).join(cwd_key(cwd))
 }
 
 /// Resolve the artifacts directory for a run (pi `getArtifactsDir`, `shared/artifacts.ts:160-184`):
@@ -315,10 +318,11 @@ pub fn cleanup_old_artifacts(dir: &Path, max_age_days: u64) {
 pub fn cleanup_all_artifact_dirs(cwd: &Path, max_age_days: u64) {
     cleanup_old_artifacts(&temp_artifacts_dir(cwd), max_age_days);
 
-    let sessions_base = subagents_home()
-        .parent()
-        .map(|home| home.join("sessions"))
-        .unwrap_or_else(|| subagents_home().join("sessions"));
+    // pi `const sessionsBase = path.join(getAgentDir(), "sessions")`
+    // (`shared/artifacts.ts:264` @v0.43.0). This previously read `temp_root_dir().parent()/sessions`,
+    // which resolved to `<home>/.cyrup/sessions` — a directory cyrup never writes; the real one is
+    // `<agent_dir>/sessions`, so the per-session sweep below swept nothing at all.
+    let sessions_base = agent_dir().join("sessions");
     let Ok(entries) = std::fs::read_dir(&sessions_base) else {
         return;
     };

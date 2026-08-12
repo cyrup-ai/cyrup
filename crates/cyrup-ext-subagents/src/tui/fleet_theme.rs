@@ -386,8 +386,15 @@ fn tokenize(line: &Line<'static>) -> Vec<(String, ratatui::style::Style, bool)> 
     tokens
 }
 
-/// The plain-text projection of a rendered [`Line`] — what a caller with no terminal (a slash
-/// command's textual output, a test assertion) reads instead of painting spans.
+/// The plain-text projection of a rendered [`Line`] — what a caller with no terminal reads instead
+/// of painting spans.
+///
+/// Assertion surface: no production caller (the textual fleet view is
+/// `SubagentExecutor::control_status_view`, which builds its own strings and never renders
+/// [`Line`]s). **A test that asserts only through this function or [`lines_text`] asserts no
+/// colour at all** — that is how a repaint regression once shipped under a green suite. Pair it
+/// with the `painted_style*` probes below or a direct `Style`/[`Role`] assertion whenever the thing under test
+/// carries one.
 #[must_use]
 pub fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|span| span.content.as_ref()).collect()

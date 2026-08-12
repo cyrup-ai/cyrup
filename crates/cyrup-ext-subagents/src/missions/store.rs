@@ -578,7 +578,10 @@ fn expand_configured_path(value: &str, project_root: &Path) -> PathBuf {
 /// `os.homedir()`, following this crate's `CYRUP_HOME` → `HOME` → tempdir convention
 /// (`extension.rs::dirs_home:4719`, `exec/mcp_direct_tools.rs:831`,
 /// `registration/prompt_workflows.rs:105`, `watchdog/settings.rs:743`,
-/// `background/mod.rs::subagents_home:1224` — five resolvers, all identical).
+/// `background/mod.rs::home_dir` — six resolvers, all identical).
+///
+/// NOT identical, and the one remaining exception: `discovery/agent_memory.rs::agent_dir` reads
+/// bare `HOME` and so still escapes the sandbox, exactly as this function used to.
 ///
 /// This function used to read bare `HOME`, which made it the ONE home resolver in the crate that
 /// ignored `CYRUP_HOME`. `CYRUP_HOME` is the crate's sandbox lever: nineteen integration tests set

@@ -3126,7 +3126,7 @@ impl SubagentExecutor {
             current_session_file: session_file,
             current_session_id: session_id,
             session_error,
-            temp_root_dir: crate::background::subagents_home(),
+            temp_root_dir: crate::background::temp_root_dir(),
             async_runs_dir: roots.async_root,
             results_dir: roots.results_dir,
             chain_runs_dir: crate::artifacts::chain_runs_dir(cwd),
@@ -13340,6 +13340,10 @@ mod tests {
         let ext = SubagentsExtension::with_config_and_cwd(
             SubagentExtensionConfig {
                 max_subagent_spawns_per_session: 2,
+                // Every dispatch below carries a `task`, so each auto-creates a mission and writes
+                // a pointer into the GLOBAL index — `agent_dir()/missions/index`, i.e. the real
+                // `~/.cyrup/agent`, unless scoped. See [`scoped_missions`].
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -13413,6 +13417,11 @@ mod tests {
                         max_items: Some(7),
                     }),
                 }),
+                // The chains below carry tasks. They are refused by the spawn reservation, which
+                // sits AHEAD of the mission binding, so no mission is created today — but that
+                // ordering is the only thing standing between this test and a
+                // `~/.cyrup/agent/missions/index` pointer. See [`scoped_missions`].
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -13513,6 +13522,9 @@ mod tests {
         let ext = SubagentsExtension::with_config_and_cwd(
             SubagentExtensionConfig {
                 max_subagent_spawns_per_session: 1,
+                // The task-bearing dispatches below auto-create missions; scope their pointer
+                // index into this tempdir ([`scoped_missions`]) so none lands in `~/.cyrup/agent`.
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -13712,6 +13724,10 @@ mod tests {
             SubagentExtensionConfig {
                 max_subagent_spawns_per_session: 1,
                 max_subagent_depth: 0,
+                // Task-bearing dispatch, refused by the depth gate that sits AHEAD of the mission
+                // binding — scoped anyway, for the same reason as
+                // `chain_spawn_count_bills_dynamic_fanout_worst_case_and_parallel_width`.
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -13794,6 +13810,9 @@ mod tests {
         let ext = SubagentsExtension::with_config_and_cwd(
             SubagentExtensionConfig {
                 max_subagent_spawns_per_session: 3,
+                // The chain below carries tasks, so it auto-creates a mission; scope its pointer
+                // index into this tempdir ([`scoped_missions`]) instead of `~/.cyrup/agent`.
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -16960,6 +16979,18 @@ mod tests {
     /// developer's real `~/.cyrup/agent` (faithful to pi `missions/store.ts:265`). A test that
     /// creates a mission, directly or through the tool, MUST scope it into its own tempdir; the
     /// only production lever for that is `config.missions.globalIndexDir`.
+    ///
+    /// There are TWO ways a test reaches that launch path, and both need scoping:
+    ///
+    /// * a bare [`SubagentTool`] over its own executor — use [`scoped_tool`], which arms this
+    ///   config on the executor's live config for you;
+    /// * a [`SubagentsExtension`] built from a [`SubagentExtensionConfig`] literal, whose
+    ///   `subagent_tool()` inherits that config verbatim — set `missions: Some(scoped_missions(…))`
+    ///   in the literal. This second route is NOT covered by [`scoped_tool`] and is what leaked
+    ///   `~/.cyrup/agent/missions/index` pointers titled `"a"`/`"c"` from the three spawn-budget /
+    ///   chain-billing tests: their dispatches carry a `task`, and a task-bearing dispatch
+    ///   auto-creates a mission (`missions/lifecycle.rs::prepare_mission_launch`) whether or not
+    ///   the test mentions missions at all.
     fn scoped_missions(root: &Path) -> crate::missions::MissionStoreConfig {
         crate::missions::MissionStoreConfig {
             global_index_dir: Some(

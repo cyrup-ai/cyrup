@@ -1512,6 +1512,90 @@ mod tests {
         assert_eq!(model.as_deref(), Some("opus"));
     }
 
+    /// The test above hand-writes the artifact's JSON, which can silently drift from the writer.
+    /// This one drives the REAL producer chain end to end —
+    /// [`crate::exec::ToolCallSummary::from_call`] -> [`crate::exec::SingleResult`] ->
+    /// [`crate::artifacts::run_artifact_jsonl_lines`] -> the bytes this pane reads -> rendered
+    /// [`Line`]s — so a change to either side that breaks the pane fails HERE rather than shipping
+    /// an empty inspector.
+    #[test]
+    fn the_writers_own_output_renders_as_conversation_and_tool_rows() {
+        let result = crate::exec::SingleResult {
+            agent: "reviewer".to_string(),
+            task: "task".to_string(),
+            exit_code: 0,
+            usage: Default::default(),
+            model: Some(cyrup_core::ModelId::from("claude-opus-4-8")),
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: Some("The change is safe.".to_string()),
+            structured_output: None,
+            acceptance: None,
+            detached: false,
+            interrupted: false,
+            timed_out: false,
+            stopped: false,
+            process_signal: None,
+            error: None,
+            saved_output_path: None,
+            tool_calls: vec![
+                crate::exec::ToolCallSummary::from_call(
+                    "bash",
+                    &serde_json::json!({ "command": "cargo test -p cyrup-ext-subagents" }),
+                ),
+                crate::exec::ToolCallSummary::from_call(
+                    "read",
+                    &serde_json::json!({ "file_path": "src/lib.rs" }),
+                ),
+            ],
+            output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
+        };
+
+        // Exactly the bytes `extension.rs:4926` / `background/runner_main.rs:2612` write.
+        let lines = crate::artifacts::run_artifact_jsonl_lines(&result);
+        let parsed = parse_transcript_lines(&lines, false);
+        assert!(
+            !parsed.events.is_empty(),
+            "the writer's own output must not parse to nothing — that is the empty-pane bug"
+        );
+
+        let tools: Vec<&FleetToolEvent> = parsed
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                FleetTranscriptEvent::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2, "one row per call the writer recorded");
+        assert_eq!(tools[0].name, "bash");
+        assert_eq!(tools[0].args.as_deref(), Some("cargo test -p cyrup-ext-subagents"));
+        assert_eq!(tools[0].status, ToolStatus::Complete);
+        assert_eq!(tools[1].name, "read");
+        assert_eq!(tools[1].args.as_deref(), Some("src/lib.rs"));
+
+        let (text, model) = parsed
+            .events
+            .iter()
+            .find_map(|e| match e {
+                FleetTranscriptEvent::Assistant { text, model, .. } => Some((text, model)),
+                _ => None,
+            })
+            .expect("the run's final output IS the conversation this artifact preserves");
+        assert_eq!(text, "The change is safe.");
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+
+        // …and it reaches the painted pane, with the real text in real spans.
+        let transcript = transcript_with(parsed.events.clone());
+        let rendered = render_fleet_transcript(&transcript, 60, false);
+        let flat = th::lines_text(&rendered);
+        assert!(flat.contains("The change is safe."), "the assistant turn is painted");
+        assert!(flat.contains("cargo test -p cyrup-ext-subagents"), "the bash args are painted");
+        assert!(flat.contains("src/lib.rs"), "the read args are painted");
+    }
+
     #[test]
     fn a_failed_run_records_its_error_as_a_notice() {
         let lines = vec![

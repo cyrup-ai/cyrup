@@ -43,7 +43,7 @@ use serde_json::Value;
 
 use super::child_status::{
     decode_child_watchdog_config, ChildWatchdogConfig, ChildWatchdogPhase, ChildWatchdogStatusEvent,
-    CHILD_WATCHDOG_CONFIG_ENV, CHILD_WATCHDOG_STATUS_EVENT,
+    CHILD_WATCHDOG_STATUS_EVENT,
 };
 use super::runtime::{MainWatchdogRuntime, MainWatchdogRuntimeOptions, WatchdogReview};
 use super::settings::default_watchdog_config;
@@ -297,16 +297,17 @@ pub fn register_child_watchdog(
     }))
 }
 
-/// `registerChildWatchdog(pi)` reading `process.env[CHILD_WATCHDOG_CONFIG_ENV]` (`:56`), with the
-/// production stdout status sink.
-#[must_use]
-pub fn register_child_watchdog_from_env(
-    cwd: &Path,
-    services: super::register_main::WatchdogServicesFn,
-) -> Option<Arc<ChildWatchdog>> {
-    let raw = std::env::var(CHILD_WATCHDOG_CONFIG_ENV).ok();
-    register_child_watchdog(raw.as_deref(), cwd, services, None, stdout_status_sink())
-}
+// A `register_child_watchdog_from_env(cwd, services)` convenience wrapper lived here and was
+// deleted: it had no caller anywhere, and wiring one would have been a regression rather than a
+// fix. It read the env itself and then passed `review: None`, which lands the child on
+// `InertWatchdogReview` — a runtime that resolves no model, calls nothing and reports every
+// boundary clean. Upstream has no review-less entry point: `registerChildWatchdog(pi, rawConfig =
+// process.env[CHILD_WATCHDOG_CONFIG_ENV])` (`register-child.ts:56`) unconditionally builds
+// `review: createMainWatchdogReview(() => currentContext, …)` at `:77`, so an armed child is always
+// watched by a real review. cyrup's single equivalent entry point is
+// [`register_child_watchdog`] as called from `crate::prompt_runtime` (`prompt_runtime.rs:1701`),
+// which reads the same env var at `:1687-1688`, builds the review at `:1698-1700`, and passes
+// [`stdout_status_sink`] — the port of `:77` and `:50`, in one place.
 
 /// `Date.now()`.
 fn now_ms() -> i64 {

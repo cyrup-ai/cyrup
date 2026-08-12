@@ -6,23 +6,26 @@
 //! the turn delta, and report the stop reason.
 //!
 //! The part that carries the safety property is the tool policy, and it is enforced twice
-//! (`review.ts:271-276`): the tool LIST is filtered to [`WATCHDOG_ALLOWED_TOOL_NAMES`] before the
-//! agent is built, AND `beforeToolCall` re-checks every call against the same set at execution time.
+//! (`review.ts:271-274` + `:285-287`): the tool LIST the agent is GIVEN is filtered to
+//! [`WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES`] before the agent is built, AND `beforeToolCall`
+//! re-checks every call against the wider [`WATCHDOG_ALLOWED_TOOL_NAMES`] permit set at execution
+//! time.
 //! One filter would be enough for the tools the review was given; the second exists because a model
 //! can name a tool the harness supplies from elsewhere. The reviewer must never edit, never run a
 //! shell, never spawn an agent.
 //!
-//! The second load-bearing rule is that **freeform assistant text is ignored** (`:213`): a warning
-//! exists only if `watchdog_warn` was called. That is what lets `finalStopReason` (`:236-246`) be
+//! The second load-bearing rule is that **freeform assistant text is ignored** (`:214`): a warning
+//! exists only if `watchdog_warn` was called. That is what lets `finalStopReason` (`:233-243`) be
 //! the sole quality signal — a review that rambled instead of calling the tool is a CLEAN review,
 //! not a partially-parsed one.
 //!
-//! Model resolution ([`resolve_watchdog_review_model`], `:126-160`) has two arms with deliberately
+//! Model resolution ([`resolve_watchdog_review_model`], `:123-160`) has two arms with deliberately
 //! different thinking rules. With an explicitly CONFIGURED model, context thinking is NOT consulted
 //! (`allowContextThinking: false`, `:136`) — an explicit reviewer gets `off` unless its own config
 //! or its `:suffix` says otherwise, because inheriting the session's reasoning budget would make the
 //! reviewer's cost track the session's by accident. With the INHERITED session model, context
-//! thinking IS consulted (`:153`), because there the reviewer genuinely is the session's model.
+//! thinking IS consulted (`allowContextThinking: true`, `:154`), because there the reviewer
+//! genuinely is the session's model.
 //!
 //! [CYRUP-DELTA] upstream constructs a `pi-agent-core` `Agent` in-process and awaits
 //! `agent.prompt(...)`. This crate's charter (`lib.rs`) is that a SUBAGENT run is always a real OS
@@ -41,8 +44,7 @@ use cyrup_core::CancelToken;
 use serde_json::{Value, json};
 
 use super::model_selection::{
-    THINKING_LEVELS, WatchdogModelContext, WatchdogModelInfo, normalize_model_segment,
-    resolve_model_candidate,
+    THINKING_LEVELS, WatchdogModelContext, WatchdogModelInfo, resolve_model_candidate,
 };
 use super::runtime::{
     ReviewStopReason, WatchdogReview, WatchdogReviewRequest, WatchdogReviewResult,
@@ -58,8 +60,24 @@ use crate::exec::split_known_thinking_suffix;
 /// that writes, executes or delegates.
 pub const WATCHDOG_ALLOWED_TOOL_NAMES: [&str; 5] = ["read", "grep", "find", "ls", "watchdog_warn"];
 
-/// The name of the one tool a review may use to report anything (`review.ts:174`).
+/// The name of the one tool a review may use to report anything (`review.ts:182`).
 pub const WATCHDOG_WARN_TOOL_NAME: &str = "watchdog_warn";
+
+/// `label: "Watchdog warning"` (`review.ts:183`) — the human-facing name a harness shows for the
+/// tool, distinct from the wire [`WATCHDOG_WARN_TOOL_NAME`] the model calls.
+pub const WATCHDOG_WARN_TOOL_LABEL: &str = "Watchdog warning";
+
+/// The tools the review agent is actually GIVEN (`review.ts:271-274`):
+/// `createReadOnlyTools(ctx.cwd).filter(t => WATCHDOG_ALLOWED_TOOL_NAMES.has(t.name) && t.name !==
+/// "watchdog_warn")`.
+///
+/// This is NOT [`WATCHDOG_ALLOWED_TOOL_NAMES`], and the difference is load-bearing. That constant is
+/// the PERMIT list `beforeToolCall` re-checks at execution time (`:285`), and it contains
+/// `watchdog_warn` because the review must be allowed to call it. This one is the EXPOSE list, and
+/// upstream subtracts `watchdog_warn` from it precisely so a harness-supplied tool of that name
+/// cannot shadow [`WatchdogWarnTool`] — the only `watchdog_warn` on the agent is the one built at
+/// `:273`, whose `execute` reaches the runtime's emitter.
+pub const WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES: [&str; 4] = ["read", "grep", "find", "ls"];
 
 /// `WatchdogReviewAuth` (`review.ts:41-45`) — the credential overlay a review's stream calls carry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -241,7 +259,7 @@ fn resolve_review_auth(
     })
 }
 
-/// `resolveWatchdogReviewModel` (`review.ts:122-160`).
+/// `resolveWatchdogReviewModel` (`review.ts:123-160`).
 ///
 /// # Errors
 ///
@@ -325,7 +343,7 @@ pub fn watchdog_warn_parameters_schema() -> Value {
     })
 }
 
-/// The `watchdog_warn` tool's own description (`review.ts:176-180`), joined with spaces.
+/// The `watchdog_warn` tool's own description (`review.ts:184-188`), joined with spaces.
 #[must_use]
 pub fn watchdog_warn_tool_description() -> String {
     [
@@ -391,7 +409,7 @@ pub fn to_watchdog_warning(params: &Value) -> Result<WatchdogWarning, String> {
     })
 }
 
-/// The tool-result text a `watchdog_warn` call gets back (`review.ts:186-192`) — which tells the
+/// The tool-result text a `watchdog_warn` call gets back (`review.ts:197-199`) — which tells the
 /// model whether the runtime actually took the warning, so a rejected one is not simply re-sent.
 #[must_use]
 pub fn watchdog_warn_result_text(accepted: bool) -> &'static str {
@@ -403,7 +421,92 @@ pub fn watchdog_warn_result_text(accepted: bool) -> &'static str {
     }
 }
 
-/// `buildWatchdogSystemPrompt` (`review.ts:196-210`) — the reviewer's whole instruction set, lines
+/// What one `watchdog_warn` call returns (`review.ts:194-202`): the text the model reads, and the
+/// `details: { accepted }` the harness records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchdogWarnToolResult {
+    /// `details: { accepted }` (`review.ts:201`) — whether the runtime's emission guard took it.
+    pub accepted: bool,
+    /// `content: [{ type: "text", text }]` (`review.ts:195-200`).
+    pub text: &'static str,
+}
+
+/// `createWatchdogWarnTool(request)` (`review.ts:180-205`) — the complete descriptor of the ONE
+/// tool a review may use to report anything, and the only path from a model call to the runtime's
+/// emitter.
+///
+/// It exists as a value rather than as loose helpers because upstream builds the whole tool
+/// eagerly at `:273` and hands it to the `Agent` alongside the read-only tools. Every field
+/// upstream sets is here: [`Self::name`] (`:182`), [`Self::label`] (`:183`),
+/// [`Self::description`] (`:184-188`), [`Self::parameters`] (`:189`), [`Self::SEQUENTIAL`]
+/// (`executionMode`, `:190`) and [`Self::execute`] (`:191-203`). Before this type the seam carried
+/// only the parameter schema, so a bound [`WatchdogReviewAgent`] had no way to learn the tool's
+/// name, its label, or the description — which is PROMPT TEXT the model reads to decide when to
+/// warn at all — and had to re-derive the `params -> warning -> emit -> result text` pipeline from
+/// the trait's prose instead of calling it.
+pub struct WatchdogWarnTool<'a> {
+    emit_warning: &'a WatchdogWarningEmitter,
+}
+
+impl<'a> WatchdogWarnTool<'a> {
+    /// `executionMode: "sequential"` (`review.ts:190`) — two `watchdog_warn` calls in one assistant
+    /// message must reach the emission guard in order, because the guard's budget and dedup state
+    /// is what decides the second one.
+    pub const SEQUENTIAL: bool = true;
+
+    /// Bind the tool to the runtime emitter `request.emitWarning` (`review.ts:193`).
+    #[must_use]
+    pub fn new(emit_warning: &'a WatchdogWarningEmitter) -> Self {
+        Self { emit_warning }
+    }
+
+    /// `name: "watchdog_warn"` (`review.ts:182`).
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        WATCHDOG_WARN_TOOL_NAME
+    }
+
+    /// `label: "Watchdog warning"` (`review.ts:183`).
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        WATCHDOG_WARN_TOOL_LABEL
+    }
+
+    /// `description` (`review.ts:184-188`).
+    #[must_use]
+    pub fn description(&self) -> String {
+        watchdog_warn_tool_description()
+    }
+
+    /// `parameters: WatchdogWarnParams` (`review.ts:189`).
+    #[must_use]
+    pub fn parameters(&self) -> Value {
+        watchdog_warn_parameters_schema()
+    }
+
+    /// `execute(_toolCallId, params)` (`review.ts:191-203`) — validate, offer to the runtime, and
+    /// report back whether it was taken.
+    ///
+    /// # Errors
+    ///
+    /// [`to_watchdog_warning`]'s per-field message. Upstream's `nonEmptyString` THROWS
+    /// (`:163-164`), which the harness turns into a tool error the model sees; a bound agent must
+    /// surface this `Err` the same way rather than swallowing it, or a malformed warning becomes
+    /// silence instead of a correction the model can act on.
+    pub fn execute(&self, params: &Value) -> Result<WatchdogWarnToolResult, String> {
+        let warning = to_watchdog_warning(params)?;
+        let accepted = self.emit_warning.emit(&warning);
+        Ok(WatchdogWarnToolResult { accepted, text: watchdog_warn_result_text(accepted) })
+    }
+}
+
+impl std::fmt::Debug for WatchdogWarnTool<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchdogWarnTool").field("name", &self.name()).finish()
+    }
+}
+
+/// `buildWatchdogSystemPrompt` (`review.ts:207-220`) — the reviewer's whole instruction set, lines
 /// in upstream's order, with the scope line included only when the delta carries a scope block.
 #[must_use]
 pub fn build_watchdog_system_prompt(cwd: &str, has_scope: bool) -> String {
@@ -444,7 +547,7 @@ pub fn build_watchdog_system_prompt(cwd: &str, has_scope: bool) -> String {
     lines.join("\n")
 }
 
-/// `buildReviewPrompt` (`review.ts:212-221`) — blocks joined by a BLANK line, the delta wrapped in
+/// `buildReviewPrompt` (`review.ts:222-231`) — blocks joined by a BLANK line, the delta wrapped in
 /// `<turn_delta>` so the model can tell instructions from reviewed content.
 #[must_use]
 pub fn build_review_prompt(
@@ -469,7 +572,7 @@ pub fn build_review_prompt(
     .join("\n\n")
 }
 
-/// `beforeToolCall` (`review.ts:281-283`) — the execution-time half of the two-layer tool policy.
+/// `beforeToolCall` (`review.ts:285-287`) — the execution-time half of the two-layer tool policy.
 #[must_use]
 pub fn watchdog_tool_call_block_reason(tool_name: &str) -> Option<String> {
     if WATCHDOG_ALLOWED_TOOL_NAMES.contains(&tool_name) {
@@ -480,7 +583,7 @@ pub fn watchdog_tool_call_block_reason(tool_name: &str) -> Option<String> {
     ))
 }
 
-/// `finalStopReason` (`review.ts:223-233`): scan the message list BACKWARDS for the last assistant
+/// `finalStopReason` (`review.ts:233-243`): scan the message list BACKWARDS for the last assistant
 /// message and report its stop reason, mapping anything that is not `error`/`aborted`/`length` — and
 /// the no-assistant-message case — to `stop`.
 #[must_use]
@@ -502,14 +605,20 @@ pub fn final_stop_reason(messages: &[Value]) -> ReviewStopReason {
     ReviewStopReason::Stop
 }
 
-/// The single turn `review.ts:270-295` runs: a read-only agent, the watchdog system prompt, the
+/// The single turn `review.ts:271-295` runs: a read-only agent, the watchdog system prompt, the
 /// review prompt, and the `watchdog_warn` tool wired to the runtime's emitter.
 ///
 /// See the module doc for why this is a seam rather than an inline `Agent` construction. An
-/// implementation MUST honour three things, all of which upstream's does: call `emit` for each
-/// `watchdog_warn` call (feeding the tool result back from
-/// [`watchdog_warn_result_text`]), refuse any tool
-/// [`watchdog_tool_call_block_reason`] names, and abort when `cancel` fires.
+/// implementation MUST honour three things, all of which upstream's does, and all three are now
+/// CODE on [`WatchdogReviewTurn`] rather than prose to re-derive:
+///
+/// 1. expose [`WatchdogReviewTurn::read_only_tools`] plus [`WatchdogReviewTurn::warn_tool`] as the
+///    agent's tool list (`:271-274`), and route every `watchdog_warn` call through
+///    [`WatchdogWarnTool::execute`] (`:191-203`) — which emits AND produces the model-visible
+///    result text;
+/// 2. refuse any tool [`WatchdogReviewTurn::block_reason`] names, at execution time, even one the
+///    harness supplied from outside the tool list (`beforeToolCall`, `:285-287`);
+/// 3. abort when `cancel` fires (`:290-292`).
 #[async_trait]
 pub trait WatchdogReviewAgent: Send + Sync {
     /// Run the review turn and report the message list it produced (for
@@ -525,18 +634,45 @@ pub trait WatchdogReviewAgent: Send + Sync {
 pub struct WatchdogReviewTurn<'a> {
     /// The resolved review model and its credential overlay.
     pub selection: &'a WatchdogReviewModelSelection,
-    /// `buildWatchdogSystemPrompt`'s output.
+    /// `buildWatchdogSystemPrompt`'s output (`review.ts:207-220`).
     pub system_prompt: String,
-    /// `buildReviewPrompt`'s output.
+    /// `buildReviewPrompt`'s output (`review.ts:222-231`).
     pub prompt: String,
-    /// The tool names the agent may expose, already filtered.
+    /// [`WATCHDOG_ALLOWED_TOOL_NAMES`] (`review.ts:20`) — the PERMIT list, which INCLUDES
+    /// `watchdog_warn`. This is what `beforeToolCall` re-checks (`:285`), not what the agent is
+    /// given; use [`Self::read_only_tools`] for that. See [`Self::block_reason`].
     pub allowed_tools: &'a [&'a str],
-    /// The `watchdog_warn` schema.
-    pub warn_tool_schema: Value,
-    /// Where an accepted `watchdog_warn` call goes.
+    /// [`WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES`] (`review.ts:271-274`) — the tools the agent is
+    /// actually GIVEN: the permit list minus `watchdog_warn`, which arrives as [`Self::warn_tool`]
+    /// instead so nothing can shadow it.
+    pub read_only_tools: &'a [&'a str],
+    /// `createWatchdogWarnTool(request)` (`review.ts:273`) — name, label, description, parameters
+    /// and the executing body, already bound to this request's emitter.
+    pub warn_tool: WatchdogWarnTool<'a>,
+    /// `toolExecution: "sequential"` (`review.ts:288`) — the Agent-wide setting, distinct from the
+    /// warn tool's own [`WatchdogWarnTool::SEQUENTIAL`] (`:190`). A review's read tools must not
+    /// interleave, so a warning's evidence names a file state the reviewer actually observed.
+    pub tool_execution_sequential: bool,
+    /// Where an accepted `watchdog_warn` call goes. [`Self::warn_tool`] is already bound to it;
+    /// this is the same emitter, exposed for an agent that tees or wraps.
     pub emit_warning: &'a WatchdogWarningEmitter,
     /// Cancellation.
     pub cancel: CancelToken,
+}
+
+impl WatchdogReviewTurn<'_> {
+    /// `beforeToolCall` (`review.ts:285-287`) — the execution-time half of the two-layer tool
+    /// policy. `None` permits the call; `Some(reason)` is upstream's
+    /// `{ block: true, reason }`, which the harness reports to the model as the tool's result.
+    ///
+    /// This exists on the turn, not only as the free
+    /// [`watchdog_tool_call_block_reason`], because it is the layer an implementation is most
+    /// likely to skip: filtering the tool LIST looks sufficient right up until the harness supplies
+    /// a tool of its own.
+    #[must_use]
+    pub fn block_reason(&self, tool_name: &str) -> Option<String> {
+        watchdog_tool_call_block_reason(tool_name)
+    }
 }
 
 /// The slice of the LIVE session a review reads at call time: `ctx.model` and
@@ -609,8 +745,16 @@ impl MainWatchdogReview {
         self
     }
 
-    /// `options.getThinkingLevel?.()` (`review.ts:253`), as a FIXED value. See
+    /// `options.getThinkingLevel?.()` (`review.ts:255`), as a FIXED value. See
     /// [`Self::with_current_model`].
+    ///
+    /// No production caller, and none is coming: upstream reads the LIVE session
+    /// (`options.getThinkingLevel?.()` calls `pi.getThinkingLevel()`), which is
+    /// [`Self::with_session_context`], and both cyrup production paths bind that instead
+    /// (`register_main.rs:176`, `prompt_runtime.rs:1764`). This and [`Self::with_current_model`]
+    /// are the pair that fills the same two slots for an embedder with NO live session provider —
+    /// `review()` reads them via `.or_else()` after the provider — so deleting one and keeping the
+    /// other would leave a half-usable fallback.
     #[must_use]
     pub fn with_current_thinking_level(mut self, level: Option<String>) -> Self {
         self.current_thinking_level = level;
@@ -700,7 +844,12 @@ impl WatchdogReview for MainWatchdogReview {
                 system_prompt,
                 prompt,
                 allowed_tools: &WATCHDOG_ALLOWED_TOOL_NAMES,
-                warn_tool_schema: watchdog_warn_parameters_schema(),
+                read_only_tools: &WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES,
+                // `createWatchdogWarnTool(request)` (`:273`) — built eagerly, exactly where
+                // upstream builds it, so `name`/`label`/`description`/`parameters` reach a bound
+                // agent instead of being re-derived by it.
+                warn_tool: WatchdogWarnTool::new(&request.emit_warning),
+                tool_execution_sequential: true,
                 emit_warning: &request.emit_warning,
                 cancel: request.cancel.clone(),
             })
@@ -728,17 +877,33 @@ impl WatchdogReviewAgent for NoTurnReviewAgent {
     }
 }
 
-/// `currentProviderFamily`-style helper reused by callers that want to log which vendor reviewed.
-#[must_use]
-pub fn review_provider_family(selection: &WatchdogReviewModelSelection) -> String {
-    normalize_model_segment(&selection.model.provider)
-}
+// A `review_provider_family(selection) -> String` helper lived here and was deleted. It had no
+// caller, and its doc named it a "`currentProviderFamily`-style helper" — but `currentProviderFamily`
+// is `model-selection.ts:109-114`, it takes the CONTEXT (`ctx.model`), not a resolved review
+// selection, and it answers the three-valued `"openai" | "anthropic" | undefined` that
+// `strongFamilyOrder` branches on at `:120-122`. cyrup already ports that function faithfully, as
+// the private `current_provider_family` in `model_selection.rs:604`, called at `:632`. This one
+// returned a bare normalized provider string, branched on nothing, and existed in no upstream file.
+
+// ## What in this module still has no production caller, and why
+//
+// [`WatchdogWarnTool::execute`], [`WatchdogReviewTurn::block_reason`] and
+// [`WatchdogWarnTool::SEQUENTIAL`] are the SEAM's own contract: they run when a bound
+// [`WatchdogReviewAgent`] runs a model turn, which is upstream's `agent.prompt(...)` (`:295`). The
+// only implementation in this workspace is [`NoTurnReviewAgent`], bound in BOTH production paths
+// (`register_main.rs:168`, `prompt_runtime.rs:1761`), so no model turn happens anywhere and
+// therefore no tool call does either. Everything the turn CARRIES is now built on the production
+// path (`MainWatchdogReview::review` constructs the descriptor, both tool lists and the sequential
+// flag on every review), so what is missing is one thing and it is nameable: a
+// `WatchdogReviewAgent` that actually runs the turn. Until then this module resolves and validates
+// a review model on every boundary and then reports a clean review — which is why the runtime's
+// `review_description` says "real model review" while no warning is ever emitted.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::watchdog::model_selection::WatchdogModelRegistry;
+    use crate::watchdog::model_selection::{normalize_model_segment, WatchdogModelRegistry};
     use crate::watchdog::settings::default_watchdog_config;
 
     struct FakeRegistry(Vec<WatchdogModelInfo>);
@@ -957,7 +1122,7 @@ mod tests {
             "Review id: 7; epoch: 3; review model: anthropic/claude-opus-4-8; thinking: high."
         ));
         assert!(prompt.contains("<turn_delta>\n\nthe delta\n\n</turn_delta>"));
-        assert_eq!(review_provider_family(&selection), "anthropic");
+        assert_eq!(normalize_model_segment(&selection.model.provider), "anthropic");
     }
 
     #[test]
@@ -968,6 +1133,171 @@ mod tests {
         let schema = watchdog_warn_parameters_schema();
         assert_eq!(schema["additionalProperties"], json!(false));
         assert_eq!(schema["required"].as_array().unwrap().len(), 4);
+    }
+
+    /// `:271-274` subtracts `watchdog_warn` from the tools the agent is GIVEN, while `:285` keeps
+    /// it in the set `beforeToolCall` permits. Two different lists; asserting one against the other
+    /// is what keeps them from drifting into one.
+    #[test]
+    fn the_expose_list_is_the_permit_list_minus_the_warn_tool() {
+        let mut expected: Vec<&str> = WATCHDOG_ALLOWED_TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| *name != WATCHDOG_WARN_TOOL_NAME)
+            .collect();
+        expected.sort_unstable();
+        let mut actual: Vec<&str> = WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES.to_vec();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        // The permit list still contains it — the review must be allowed to CALL what it is not
+        // handed a duplicate of.
+        assert!(WATCHDOG_ALLOWED_TOOL_NAMES.contains(&WATCHDOG_WARN_TOOL_NAME));
+        assert!(!WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES.contains(&WATCHDOG_WARN_TOOL_NAME));
+        assert_eq!(watchdog_tool_call_block_reason(WATCHDOG_WARN_TOOL_NAME), None);
+    }
+
+    /// Every field `createWatchdogWarnTool` sets (`:182-190`) must survive to a bound agent — the
+    /// description in particular is prompt text the model reads to decide whether to warn at all.
+    #[test]
+    fn the_warn_tool_descriptor_carries_every_upstream_field() {
+        let emitter = WatchdogWarningEmitter::inert();
+        let tool = WatchdogWarnTool::new(&emitter);
+        assert_eq!(tool.name(), "watchdog_warn");
+        assert_eq!(tool.label(), "Watchdog warning");
+        assert_eq!(tool.description(), watchdog_warn_tool_description());
+        assert!(tool.description().contains("Do not use for nits"));
+        assert_eq!(tool.parameters(), watchdog_warn_parameters_schema());
+    }
+
+    /// `execute` (`:191-203`) is the whole pipeline: validate, emit, and report which of the two
+    /// result texts applies. A REJECTED warning must still be a successful tool call carrying the
+    /// "was ignored" text — not an error — or the model re-sends it.
+    #[test]
+    fn the_warn_tool_executes_the_full_emit_pipeline() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<WatchdogWarning>::new()));
+        let sink = Arc::clone(&seen);
+        let emitter = WatchdogWarningEmitter::from_fn(Arc::new(move |warning| {
+            sink.lock().unwrap().push(warning.clone());
+            warning.severity == WatchdogSeverity::Blocker
+        }));
+        let tool = WatchdogWarnTool::new(&emitter);
+
+        let taken = tool
+            .execute(&json!({
+                "severity": "blocker",
+                "summary": "s",
+                "evidence": "e",
+                "recommendedAction": "r",
+            }))
+            .unwrap();
+        assert!(taken.accepted);
+        assert_eq!(taken.text, "Watchdog warning recorded.");
+
+        let refused = tool
+            .execute(&json!({
+                "severity": "concern",
+                "summary": "s2",
+                "evidence": "e2",
+                "recommendedAction": "r2",
+            }))
+            .unwrap();
+        assert!(!refused.accepted);
+        assert!(refused.text.contains("stale, duplicate, or over budget"));
+
+        // Both reached the emitter, with `toWatchdogWarning`'s defaults applied (`:170-172`).
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].source, Some(WatchdogWarningSource::Main));
+        assert_eq!(seen[0].confidence, Some(WatchdogConfidence::Medium));
+        assert_eq!(seen[0].category, Some(WatchdogCategory::Other));
+
+        // A malformed call is an Err and must NOT reach the emitter.
+        assert!(tool.execute(&json!({ "severity": "blocker", "summary": "  " })).is_err());
+        assert_eq!(seen.len(), 2);
+    }
+
+    /// The turn a REAL review hands its agent must carry the descriptor and both lists — this is
+    /// the production construction site (`MainWatchdogReview::review`), reached through the seam.
+    #[tokio::test]
+    async fn the_production_turn_carries_the_warn_tool_and_both_tool_lists() {
+        /// Everything the turn hands a bound agent, in the shape a test can compare.
+        struct SeenTurn {
+            warn_tool_name: String,
+            warn_tool_description: String,
+            read_only_tools: Vec<String>,
+            allowed_tools: Vec<String>,
+            sequential: bool,
+        }
+
+        struct Capturing(Arc<std::sync::Mutex<Option<SeenTurn>>>);
+
+        #[async_trait]
+        impl WatchdogReviewAgent for Capturing {
+            async fn run(&self, turn: WatchdogReviewTurn<'_>) -> Result<Vec<Value>, String> {
+                // A bound agent can now build upstream's tool list from the turn alone.
+                let result = turn
+                    .warn_tool
+                    .execute(&json!({
+                        "severity": "concern",
+                        "summary": "s",
+                        "evidence": "e",
+                        "recommendedAction": "r",
+                    }))
+                    .unwrap();
+                assert!(result.accepted, "the emitter this turn was built with accepts");
+                *self.0.lock().unwrap() = Some(SeenTurn {
+                    warn_tool_name: turn.warn_tool.name().to_string(),
+                    warn_tool_description: turn.warn_tool.description(),
+                    read_only_tools: turn.read_only_tools.iter().map(|t| (*t).to_string()).collect(),
+                    allowed_tools: turn.allowed_tools.iter().map(|t| (*t).to_string()).collect(),
+                    sequential: turn.tool_execution_sequential,
+                });
+                // `beforeToolCall` is reachable from the turn, not only as a free function.
+                assert_eq!(turn.block_reason("read"), None);
+                assert!(turn.block_reason("bash").unwrap().contains("read-only"));
+                Ok(Vec::new())
+            }
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let review = MainWatchdogReview::new(
+            Arc::new(registry()),
+            Arc::new(AmbientReviewAuth),
+            Arc::new(Capturing(Arc::clone(&captured))),
+            std::path::PathBuf::from("/repo"),
+        )
+        .with_current_model(Some(WatchdogModelInfo::new("anthropic", "claude-opus-4-8")));
+
+        let emitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&emitted);
+        review
+            .review(WatchdogReviewRequest {
+                delta: "d".into(),
+                config: default_watchdog_config(),
+                review_id: 1,
+                epoch: 1,
+                has_scope: false,
+                emit_warning: WatchdogWarningEmitter::from_fn(Arc::new(move |_| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    true
+                })),
+                cancel: CancelToken::new(),
+            })
+            .await
+            .unwrap();
+
+        // The tool the agent ran was bound to THIS request's emitter (`:193`).
+        assert_eq!(emitted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let guard = captured.lock().unwrap();
+        let seen = guard.as_ref().expect("the agent ran");
+        assert_eq!(seen.warn_tool_name, "watchdog_warn");
+        assert!(seen.warn_tool_description.starts_with("Emit one actionable"));
+        assert_eq!(seen.read_only_tools, vec!["read", "grep", "find", "ls"]);
+        assert_eq!(seen.allowed_tools, vec!["read", "grep", "find", "ls", "watchdog_warn"]);
+        // `toolExecution: "sequential"` (`:288`), and the warn tool's own `executionMode`
+        // (`:190`) — the turn must carry the SAME answer the descriptor's constant gives.
+        assert_eq!(seen.sequential, WatchdogWarnTool::SEQUENTIAL);
+        assert!(seen.sequential, "a review's tools must not interleave");
     }
 
     #[tokio::test]
@@ -1090,6 +1420,62 @@ mod tests {
         *model.lock().unwrap() = Some(WatchdogModelInfo::new("anthropic", "claude-opus-4-8"));
         let result = review.review(default_request()).await.unwrap().unwrap();
         assert_eq!(result.stop_reason, Some(ReviewStopReason::Stop));
+    }
+
+    /// The FIXED-value fallback pair ([`MainWatchdogReview::with_current_model`] /
+    /// [`MainWatchdogReview::with_current_thinking_level`]) is what an embedder with no live
+    /// session provider gets. Both production paths bind `with_session_context` instead, so this
+    /// is the only place the `.or_else()` fallback in `review()` is exercised — and it must lose to
+    /// a provider that answers, exactly as upstream's live `ctx` beats the fixed value.
+    #[tokio::test]
+    async fn the_fixed_fallback_pair_applies_only_when_no_session_provider_answers() {
+        /// Records the selection the turn was actually built with.
+        struct Capture(Arc<std::sync::Mutex<Option<WatchdogReviewModelSelection>>>);
+
+        #[async_trait]
+        impl WatchdogReviewAgent for Capture {
+            async fn run(&self, turn: WatchdogReviewTurn<'_>) -> Result<Vec<Value>, String> {
+                *self.0.lock().unwrap() = Some(turn.selection.clone());
+                Ok(Vec::new())
+            }
+        }
+
+        // No provider at all: the fixed values ARE the session, and the fixed thinking level
+        // reaches the inherited review model (`allowContextThinking: true`, `:154`).
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let unbound = MainWatchdogReview::new(
+            Arc::new(registry()),
+            Arc::new(AmbientReviewAuth),
+            Arc::new(Capture(Arc::clone(&seen))),
+            std::path::PathBuf::from("/repo"),
+        )
+        .with_current_model(Some(WatchdogModelInfo::new("anthropic", "claude-opus-4-8")))
+        .with_current_thinking_level(Some("high".to_string()));
+        unbound.review(default_request()).await.unwrap();
+        let selection = seen.lock().unwrap().clone().expect("the turn ran");
+        assert_eq!(selection.model.id, "claude-opus-4-8");
+        assert_eq!(selection.thinking_level, "high", "the fixed level was consulted");
+
+        // A provider that ANSWERS wins over both fixed values.
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let bound = MainWatchdogReview::new(
+            Arc::new(registry()),
+            Arc::new(AmbientReviewAuth),
+            Arc::new(Capture(Arc::clone(&seen))),
+            std::path::PathBuf::from("/repo"),
+        )
+        .with_current_model(Some(WatchdogModelInfo::new("anthropic", "claude-opus-4-8")))
+        .with_current_thinking_level(Some("high".to_string()))
+        .with_session_context(Arc::new(|| {
+            Some(WatchdogSessionContext {
+                model: Some(WatchdogModelInfo::new("anthropic", "claude-sonnet-4-5")),
+                thinking_level: Some("low".to_string()),
+            })
+        }));
+        bound.review(default_request()).await.unwrap();
+        let selection = seen.lock().unwrap().clone().expect("the turn ran");
+        assert_eq!(selection.model.id, "claude-sonnet-4-5", "the live session beat the fixed model");
+        assert_eq!(selection.thinking_level, "low", "and the fixed thinking level too");
     }
 
     /// A bound provider that answers `None` is upstream's missing `ExtensionContext`
