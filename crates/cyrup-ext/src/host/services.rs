@@ -202,8 +202,27 @@ pub trait HostServices: Send + Sync {
         None
     }
     /// A custom overlay component; returns an optional serialized result (Pi `custom()`).
+    ///
+    /// One-shot and NON-interactive: the spec goes out, an optional result comes back, and nothing
+    /// in between routes a keystroke. For a component the host must actually DRIVE — pi's
+    /// `ctx.ui.custom(factory, { overlay: true, … })` (`interactive-mode.ts:2719`, the only
+    /// `showOverlay` consumer upstream has) — use [`Self::open_overlay`].
     fn custom(&self, _spec: &Value) -> Option<String> {
         None
+    }
+
+    /// Hand a live, focus-capturing modal to the host's terminal owner and BLOCK until the user
+    /// closes it — the interactive half of pi's `ctx.ui.custom(factory, { overlay: true, … })`.
+    ///
+    /// Returns `true` when a host actually took the overlay and ran it to completion, `false` when
+    /// there is no interactive surface to run it on (headless print/json, or a default host). A
+    /// `false` return is the caller's cue to fall back to whatever non-interactive rendering it has
+    /// — exactly pi's own `if (!ctx.hasUI)` branch, and NOT an error.
+    ///
+    /// Denied by default: the default host owns no terminal, so it accepts no overlay. See
+    /// [`crate::host::overlay`] for the contract the boxed value must satisfy.
+    fn open_overlay(&self, _overlay: Box<dyn crate::host::overlay::InteractiveOverlay>) -> bool {
+        false
     }
     /// Current editor buffer text (Pi `getEditorText`).
     fn editor_text(&self) -> String {

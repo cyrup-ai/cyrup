@@ -73,6 +73,55 @@ pub const WATCHDOG_COMMAND_DESCRIPTION: &str = "Show or toggle the default-off s
 pub type WatchdogServicesFn =
     Arc<dyn Fn() -> Option<Arc<dyn cyrup_ext::host::HostServices>> + Send + Sync>;
 
+/// The config layout the watchdog's model registry reads `auth.json` from — the process's own,
+/// resolved exactly as the binary resolves it (`cyrup_config::ConfigDirs::resolve`).
+///
+/// `None` when resolution genuinely fails (no home directory, an unreadable cwd). `ConfigDirs` has
+/// no infallible constructor, and inventing one here would put a synthetic auth path in front of
+/// the recommendation; the callers instead treat `None` as "no authenticated models", which is the
+/// same answer the registry would give for an empty `auth.json` and keeps every other line of the
+/// status report printing.
+///
+/// Passing `None` to [`super::model_selection::BuiltinWatchdogModelRegistry::new`] is NOT the same
+/// thing and is never correct in production: it makes `hasConfiguredAuth` answer `false` for every
+/// model in the catalog, which turns `resolveConfiguredModel`'s authentication check
+/// (`review.ts:107-109`) into an unconditional failure.
+#[must_use]
+pub fn watchdog_config_dirs() -> Option<cyrup_config::ConfigDirs> {
+    let env = cyrup_config::EnvVars::from_process();
+    cyrup_config::ConfigDirs::resolve(&cyrup_config::CliConfigOverrides::default(), &env).ok()
+}
+
+/// `ctx.model` as `model-selection.ts` reads it: a `provider/id` string split back into the pair.
+#[must_use]
+pub fn watchdog_model_info(model: &str) -> Option<WatchdogModelInfo> {
+    let (provider, id) = model.split_once('/')?;
+    if provider.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some(WatchdogModelInfo::new(provider, id))
+}
+
+/// The live-session slice a review reads (`review.ts:250-253`): `ctx.model` — enriched from the
+/// catalog when the registry knows it, so the review sees the model's `api`/`reasoning`/thinking
+/// map rather than a bare `provider/id` pair — and `pi.getThinkingLevel()`.
+///
+/// `None` (no bound capability backend) is upstream's absent `ExtensionContext`.
+fn session_context(
+    services: &WatchdogServicesFn,
+    registry: &Arc<dyn WatchdogModelRegistry>,
+) -> Option<super::review::WatchdogSessionContext> {
+    let services = services()?;
+    let model = services.current_model().as_deref().and_then(|model| {
+        let info = watchdog_model_info(model)?;
+        Some(registry.find(&info.provider, &info.id).unwrap_or(info))
+    });
+    Some(super::review::WatchdogSessionContext {
+        model,
+        thinking_level: services.thinking_level(),
+    })
+}
+
 /// `RegisterMainWatchdogOptions` (`register-main.ts:18-21`).
 #[derive(Clone, Default)]
 pub struct RegisterMainWatchdogOptions {
@@ -103,13 +152,31 @@ pub fn register_main_watchdog(
     // model on every boundary (so a misconfigured `subagents.watchdog.main.model` fails loudly
     // rather than silently reviewing nothing) and runs its turn through whichever
     // [`super::review::WatchdogReviewAgent`] is bound.
-    let review: Arc<dyn WatchdogReview> = options.review.unwrap_or_else(|| {
-        Arc::new(super::review::MainWatchdogReview::new(
-            Arc::new(super::model_selection::BuiltinWatchdogModelRegistry::new(None)),
-            Arc::new(super::review::AmbientReviewAuth),
-            Arc::new(super::review::NoTurnReviewAgent),
-            cwd.to_path_buf(),
-        ))
+    let review_services = Arc::clone(&services);
+    let review: Arc<dyn WatchdogReview> = options.review.unwrap_or_else(move || {
+        // The registry MUST see the process's real `auth.json` — see [`watchdog_config_dirs`] for
+        // why `BuiltinWatchdogModelRegistry::new(None)` cannot resolve any configured model.
+        let registry: Arc<dyn WatchdogModelRegistry> = Arc::new(
+            super::model_selection::BuiltinWatchdogModelRegistry::new(
+                watchdog_config_dirs().as_ref(),
+            ),
+        );
+        let session_registry = Arc::clone(&registry);
+        Arc::new(
+            super::review::MainWatchdogReview::new(
+                registry,
+                Arc::new(super::review::AmbientReviewAuth),
+                Arc::new(super::review::NoTurnReviewAgent),
+                cwd.to_path_buf(),
+            )
+            // `createMainWatchdogReview(() => currentContext, { getThinkingLevel: () =>
+            // pi.getThinkingLevel() })` (`register-main.ts:383`): the live session model and
+            // reasoning level, read at review time through the same late-bound capability slot the
+            // warning sinks use.
+            .with_session_context(Arc::new(move || {
+                session_context(&review_services, &session_registry)
+            })),
+        )
     });
     let display_services = Arc::clone(&services);
     let user_message_services = Arc::clone(&services);

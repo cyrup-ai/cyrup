@@ -1629,8 +1629,17 @@ mod tests {
         // The inner `sh` publishes its own pid via an atomic rename (so the file is never read
         // half-written) and then `exec`s, keeping that same pid — the readiness-marker idiom
         // `spawn::signal`'s own tests use, rather than a fixed sleep that CPU contention outruns.
+        // The trailing `; :` is load-bearing. `sh_command` runs this through `/bin/sh -c <script>`,
+        // and a `-c` script that is a SINGLE simple command triggers the shell's exec-through
+        // optimization: the outer shell REPLACES itself with the inner `sh`, which then `exec`s
+        // `sleep`, collapsing all three into ONE pid — so the fixture created no descendant at all
+        // and the `assert_ne!` below failed with left == right. A second command in the list defeats
+        // that optimization, forcing the outer shell to stay resident and genuinely fork the inner
+        // one. Deliberately NOT `… & wait`: that would make the descendant an ASYNCHRONOUS child,
+        // which POSIX gives SIG_IGN for SIGINT/SIGQUIT — exactly the confound the comment above
+        // warns against. `; :` keeps the descendant synchronous.
         let script = format!(
-            "sh -c 'echo $$ > \"{path}.tmp\"; mv \"{path}.tmp\" \"{path}\"; exec sleep 300'",
+            "sh -c 'echo $$ > \"{path}.tmp\"; mv \"{path}.tmp\" \"{path}\"; exec sleep 300' ; :",
             path = pid_path.display()
         );
         let spec = ChildSpawnSpec {

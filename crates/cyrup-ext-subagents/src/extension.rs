@@ -252,6 +252,24 @@ struct ForegroundControlEntry {
     /// [`SubagentExecutor::foreground_control_notifier`] on every raised control event (pi
     /// `applyControlEventToRememberedForegroundRun`, `subagent-executor.ts:549-570` @v0.43.0).
     current_activity_state: Option<crate::background::ActivityState>,
+    /// pi `ForegroundRunControl.mode` (`shared/types.ts:1506`) — the agent label the fleet roster
+    /// falls back to when no `currentAgent` is known (`fleet.ts:166`) and the `Mode:` line of the
+    /// detail pane (`fleet.ts:248`). Fixed for a run's lifetime.
+    mode: crate::background::RunMode,
+    /// pi `ForegroundRunControl.description` (`shared/types.ts:1509`) — the caller's task, rendered
+    /// as the roster row's identity and the detail pane's `Task` line (`fleet.ts:170,434-437`).
+    description: Option<String>,
+    /// pi `ForegroundRunControl.currentTool` (`fleet.ts:252`) — the tool in flight, refreshed from
+    /// every raised control event alongside [`Self::current_activity_state`].
+    current_tool: Option<String>,
+    /// pi `ForegroundRunControl.currentPath` (`fleet.ts:252`).
+    current_path: Option<String>,
+    /// pi `ForegroundRunControl.turnCount` (`fleet.ts:253`).
+    turn_count: Option<u64>,
+    /// pi `ForegroundRunControl.toolCount` (`fleet.ts:254`).
+    tool_count: Option<u64>,
+    /// pi `ForegroundRunControl.tokens` (`fleet.ts:255`).
+    tokens: Option<u64>,
     /// pi `ForegroundRunControl.startedAt` (`shared/types.ts:1507`) — epoch millis at registration.
     /// Added for the FleetView port: `fleet-status.ts:174` renders the elapsed time from it and
     /// `fleet.ts:251` renders it as the run's ISO `Started:` line, both of which would otherwise
@@ -1138,6 +1156,28 @@ impl SubagentExecutor {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(entry) = controls.get_mut(run_id.as_str()) {
                     entry.current_activity_state = Some(event.to);
+                    // The SAME write also refreshes the run's live telemetry: pi's control record
+                    // carries `currentTool`/`currentPath`/`turnCount`/`toolCount`/`tokens`
+                    // (`shared/types.ts:1510-1523`) and the fleet roster renders all five
+                    // (`fleet.ts:252-255,399-404`). Every one of them already rides on the control
+                    // event; leaving them unread is what made the live rows show a name and nothing
+                    // else. `None` on an event never clobbers a value a previous event supplied —
+                    // a control event reports what it observed, not a full snapshot.
+                    if event.current_tool.is_some() {
+                        entry.current_tool = event.current_tool.clone();
+                    }
+                    if event.current_path.is_some() {
+                        entry.current_path = event.current_path.clone();
+                    }
+                    if let Some(turns) = event.turns {
+                        entry.turn_count = Some(turns);
+                    }
+                    if let Some(tools) = event.tool_count {
+                        entry.tool_count = Some(u64::from(tools));
+                    }
+                    if let Some(tokens) = event.tokens {
+                        entry.tokens = Some(tokens);
+                    }
                     // pi `control.updatedAt = Date.now()` alongside the activity write
                     // (`subagent-executor.ts:549-570` @v0.43.0) — the FleetView's newest-first sort
                     // key (`fleet.ts:142`).
@@ -1993,6 +2033,17 @@ impl SubagentExecutor {
                     current_agent: Some(agent.name.clone()),
                     current_index: Some(0),
                     current_activity_state: None,
+                    // This entry point is pi's `runSinglePath`; its run shape is `single`.
+                    mode: crate::background::RunMode::Single,
+                    // pi `description: task` (`runs/foreground/execution.ts`'s control registration)
+                    // — the caller's own task text, which is what the roster row identifies the run
+                    // by (`fleet.ts:723`) and the detail pane prints as `Task` (`fleet.ts:434-437`).
+                    description: Some(task.to_string()).filter(|t| !t.trim().is_empty()),
+                    current_tool: None,
+                    current_path: None,
+                    turn_count: None,
+                    tool_count: None,
+                    tokens: None,
                     started_at: crate::background::now_epoch_millis_pub(),
                     updated_at: crate::background::now_epoch_millis_pub(),
                 },
@@ -3075,7 +3126,7 @@ impl SubagentExecutor {
             current_session_file: session_file,
             current_session_id: session_id,
             session_error,
-            temp_root_dir: crate::background::subagents_home(),
+            temp_root_dir: crate::background::temp_root_dir(),
             async_runs_dir: roots.async_root,
             results_dir: roots.results_dir,
             chain_runs_dir: crate::artifacts::chain_runs_dir(cwd),
@@ -3430,15 +3481,27 @@ impl SubagentExecutor {
     /// the inspector passes `true` (it lists finished runs too), the always-on status widget passes
     /// `false` (it only ever shows active work, `fleet-status.ts:182`).
     ///
-    /// Three fields are populated as empty, each for a stated reason rather than an omission:
+    /// Everything the live registries and the on-disk status records actually know is threaded
+    /// through, including three things that used to be dropped on the floor:
+    ///
+    /// * **`session_id`** now comes from each run's OWN recorded
+    ///   [`crate::background::RunStatus::session_id`], not from stamping the current session onto
+    ///   every job. Stamping made `belongs_to_current_session` (`fleet.ts:63-65`) a tautology — no
+    ///   job could ever fail it — so a run inherited from a previous session in the same process
+    ///   showed up as this session's.
+    /// * **`nested_children`** are resolved one level from
+    ///   [`crate::background::StepStatus::nested_run_ids`] by reading each nested run's own
+    ///   `status.json` ([`crate::tui::fleet_state::NestedRunView::from_run_status`]). Reading is
+    ///   not reconciling: nothing is repaired, killed or re-terminalised, so this is not the
+    ///   recursive reconcile `background/fleet_view.rs` declines (its delta 2). Without them
+    ///   `fleet-status.ts`'s whole nested tree rendered as absent.
+    /// * **`ForegroundControlView::current_tool`/`current_path`/`activity_state`/`mode`** are read
+    ///   off the live control entry rather than left at their `Default`.
+    ///
+    /// One field is still populated empty, for a stated reason:
     /// * `foreground_runs` — cyrup keeps no settled-foreground registry (pi's
     ///   `state.foregroundRuns`); its foreground control entry is removed the moment the run
     ///   settles, which is the same registry `background::fleet_view` documents as delta 4.
-    /// * `ForegroundControlView`'s telemetry — see [`crate::tui::fleet_state`]'s module doc for why
-    ///   the ported model keeps the fields cyrup's `ForegroundControlEntry` does not yet carry.
-    /// * `nested_children` — [`crate::background::StepStatus::nested_run_ids`] holds ids, not
-    ///   reconciled summaries; rendering them would mean the recursive reconcile
-    ///   `background/fleet_view.rs` deliberately does not do (its delta 2).
     pub async fn fleet_state(
         &self,
         cwd: &Path,
@@ -3464,6 +3527,13 @@ impl SubagentExecutor {
                     current_agent: entry.current_agent.clone(),
                     current_index: entry.current_index,
                     activity_state: entry.current_activity_state,
+                    current_tool: entry.current_tool.clone(),
+                    current_path: entry.current_path.clone(),
+                    turn_count: entry.turn_count,
+                    tool_count: entry.tool_count,
+                    tokens: entry.tokens,
+                    mode: entry.mode,
+                    description: entry.description.clone(),
                     started_at: entry.started_at,
                     updated_at: entry.updated_at,
                     cwd: Some(cwd.to_path_buf()),
@@ -3472,21 +3542,22 @@ impl SubagentExecutor {
                 .collect()
         };
 
-        let tracked_jobs: Vec<AsyncRunView> = self
-            .tracker
-            .snapshot()
-            .into_iter()
-            .filter_map(|job| {
-                job.last_status.map(|status| AsyncRunView {
-                    paths: job.paths,
-                    status,
-                    session_id: current_session_id.clone(),
-                    description: None,
-                    context: None,
-                    nested_children: Vec::new(),
-                })
-            })
-            .collect();
+        let mut tracked_jobs: Vec<AsyncRunView> = Vec::new();
+        for job in self.tracker.snapshot() {
+            let Some(status) = job.last_status else { continue };
+            // pi `nestedChildren` (`fleet-status.ts:193,212`), resolved from the ids each step
+            // records. One level, read-only — see this method's doc.
+            let nested_children = read_nested_children(&job.paths, &status).await;
+            tracked_jobs.push(AsyncRunView {
+                // The run's OWN recorded session, so `belongs_to_current_session` is a real test.
+                session_id: status.session_id.clone(),
+                paths: job.paths,
+                status,
+                description: None,
+                context: None,
+                nested_children,
+            });
+        }
 
         let mut state = FleetState {
             base_cwd: cwd.to_path_buf(),
@@ -4685,6 +4756,59 @@ fn default_async_root(cwd: &Path) -> PathBuf {
 
 fn default_results_dir(cwd: &Path) -> PathBuf {
     crate::background::run_artifact_roots(cwd).results_dir
+}
+
+/// The directory a just-spawned background run owns — the SAME arithmetic
+/// [`SubagentExecutor::spawn_background`] used to create it
+/// ([`resolve_background_storage_roots`] + [`RunPaths::for_run`]), re-derived at the tool's own
+/// call site so an async launch can report it as `details.asyncDir`.
+///
+/// pi carries `asyncDir` on EVERY async launch's `details`:
+/// `{ mode, runId, results: [], asyncId: id, asyncDir, … }`
+/// (`runs/background/async-execution.ts:1191` for the chain/parallel path and `:1563` for the
+/// single path @v0.43.0). cyrup emitted `asyncId` but not `asyncDir`, and that one missing key is
+/// what silently disabled the whole background half of the mission subsystem:
+///
+/// * `attachMissionToLaunchResult` writes the `mission.json` binding into the async dir only
+///   `if (input.result.details.asyncDir)` (`missions/lifecycle.ts:212-213`), so no tool-launched
+///   background run ever got one — and without it `syncMissionFromAsyncCompletion`'s
+///   `readMissionBinding(event.asyncDir)` (`:290`) returns `undefined` and every completed
+///   background run's mission stayed unreconciled;
+/// * `runStatusForResult` returns `"active"` for a run with an `asyncDir` (`:98`); without one the
+///   `results: []` payload fell through to `"completed"`, so a background mission was marked DONE
+///   the instant it was launched;
+/// * `artifactsForResult`'s `status.json` + `events.jsonl` pair (`:129-134`) is gated on the same
+///   key, so a background run recorded no artifacts at all.
+///
+/// Pure path arithmetic over `cwd` plus this process's own env, evaluated in the same process that
+/// just spawned the run, so it resolves to the identical directory (including the nested-route
+/// subtree when this process inherited one). `None` only when the roots cannot be resolved at all,
+/// in which case the key is omitted rather than guessed at.
+fn async_dir_for_run(cwd: &Path, run_id: &RunId) -> Option<PathBuf> {
+    let inherited = crate::spawn::nested_events::resolve_inherited_nested_route_from_env(|key| {
+        std::env::var(key).ok()
+    });
+    let (async_root, results_dir) =
+        resolve_background_storage_roots(cwd, inherited.as_ref()).ok()?;
+    Some(RunPaths::for_run(&async_root, &results_dir, run_id).run_dir)
+}
+
+/// pi's `details` for a confirmed async launch — `{ mode, runId, results: [], asyncId, asyncDir }`
+/// (`runs/background/async-execution.ts:1191` and `:1563` @v0.43.0), shared by all three async
+/// arms so the `asyncDir` key can never again be present on one and missing on another.
+fn async_launch_details(mode: &str, run_id: &RunId, cwd: &Path) -> serde_json::Value {
+    let mut details = serde_json::Map::new();
+    details.insert("mode".to_string(), serde_json::Value::String(mode.to_string()));
+    details.insert("runId".to_string(), serde_json::Value::String(run_id.as_str().to_string()));
+    details.insert("results".to_string(), serde_json::Value::Array(Vec::new()));
+    details.insert("asyncId".to_string(), serde_json::Value::String(run_id.as_str().to_string()));
+    if let Some(dir) = async_dir_for_run(cwd, run_id) {
+        details.insert(
+            "asyncDir".to_string(),
+            serde_json::Value::String(dir.to_string_lossy().into_owned()),
+        );
+    }
+    serde_json::Value::Object(details)
 }
 
 /// The `(async_root, results_dir)` pair a background run's storage should use (pi
@@ -7208,18 +7332,14 @@ impl SubagentTool {
             // R-SA-074: return immediately after confirmed spawn; instruct against busy-polling.
             // pi `executeAsyncSingle` (`async-execution.ts:1515-1518`): the headline is `Async: {agent}
             // [{id}]`, followed by `formatAsyncStartedMessage`'s fixed guidance, and `details` is
-            // `{ mode: "single", runId, results: [], asyncId }` (`asyncId` === `runId` for a SINGLE
-            // run, pi's own async-run identity convention).
+            // `{ mode: "single", runId, results: [], asyncId, asyncDir }` (`async-execution.ts:1563`;
+            // `asyncId` === `runId` for a SINGLE run, pi's own async-run identity convention).
+            // `asyncDir` is what binds this run to its mission — see [`async_dir_for_run`].
             return Ok(ToolResult {
                 content: vec![cyrup_core::Content::text(format_async_started_message(&format!(
                     "Async: {agent} [{run_id}]"
                 )))],
-                details: Some(serde_json::json!({
-                    "mode": "single",
-                    "runId": run_id.as_str(),
-                    "results": [],
-                    "asyncId": run_id.as_str(),
-                })),
+                details: Some(async_launch_details("single", &run_id, cwd)),
                 terminate: false,
                 ..Default::default()
             });
@@ -7832,12 +7952,8 @@ impl SubagentTool {
                     "Async parallel: [{}] [{run_id}]",
                     agents.join("+")
                 )))],
-                details: Some(serde_json::json!({
-                    "mode": "parallel",
-                    "runId": run_id.as_str(),
-                    "results": [],
-                    "asyncId": run_id.as_str(),
-                })),
+                // `asyncDir` per `async-execution.ts:1191` — see [`async_dir_for_run`].
+                details: Some(async_launch_details("parallel", &run_id, cwd)),
                 terminate: false,
                 ..Default::default()
             }),
@@ -7982,12 +8098,8 @@ impl SubagentTool {
                 content: vec![cyrup_core::Content::text(format_async_started_message(&format!(
                     "Async chain: {chain_desc} [{run_id}]"
                 )))],
-                details: Some(serde_json::json!({
-                    "mode": "chain",
-                    "runId": run_id.as_str(),
-                    "results": [],
-                    "asyncId": run_id.as_str(),
-                })),
+                // `asyncDir` per `async-execution.ts:1191` — see [`async_dir_for_run`].
+                details: Some(async_launch_details("chain", &run_id, cwd)),
                 terminate: false,
                 ..Default::default()
             }),
@@ -8228,20 +8340,13 @@ impl Tool for SubagentTool {
         // so mission bookkeeping can never take down a run that would otherwise have succeeded.
         let explicit_mission = parsed.mission_id.is_some() || parsed.mission.is_some();
         let mission_config = cfg.missions.clone();
-        let mut mission_warning: Option<String> = None;
-        let mission_binding = match crate::missions::prepare_mission_launch(
+        let (mission_binding, mission_warning) = prepare_mission_binding_for_dispatch(
             &parsed.mission_launch_params(),
             &effective_cwd,
             mission_config.as_ref(),
             self.executor.host_services().and_then(|s| s.session_id()).as_deref(),
-        ) {
-            Ok(binding) => binding,
-            Err(e) if explicit_mission => return Err(ToolError::new(e.to_string())),
-            Err(e) => {
-                mission_warning = Some(format!("Mission tracking unavailable: {e}"));
-                None
-            }
-        };
+            explicit_mission,
+        )?;
 
         let outcome = if has_tasks {
             self.route_parallel_mode(parsed, &effective_cwd, cancel).await
@@ -8297,6 +8402,43 @@ impl crate::background::watch::CompletionObserver for MissionSyncCompletionObser
         // bookkeeping is never allowed to disturb the completion pipeline.
         if let Err(e) = crate::missions::sync_mission_from_async_completion(&event) {
             tracing::warn!("Failed to update mission from async completion: {e}");
+        }
+    }
+}
+
+/// pi's pre-launch mission resolution (`subagent-executor.ts:5101-5111` @v0.43.0) — the LAUNCH half
+/// of the binding pair whose settle half is [`attach_mission_to_tool_outcome`].
+///
+/// Returns `(binding, warning)`. Upstream's error discipline, verbatim:
+///
+/// * an EXPLICIT `mission`/`missionId` makes a failure fatal to the whole call (`:5109` returns
+///   `toExecutionErrorResult`, cyrup's equivalent being `Err(ToolError)`) — the caller asked for
+///   mission tracking and did not get it;
+/// * an AUTOMATIC binding degrades to a non-fatal `Mission tracking unavailable: <e>` warning
+///   (`:5110`) that [`attach_mission_to_tool_outcome`] later stamps onto `details.missionWarning`,
+///   so bookkeeping can never take down a run that would otherwise have succeeded.
+///
+/// Split out of `execute_dispatch` so the degradation is reachable from a test without driving a
+/// real subagent subprocess; `execute_dispatch` is its only production caller.
+///
+/// # Errors
+///
+/// [`ToolError`] carrying the mission error's own message, and only when `explicit_mission`.
+fn prepare_mission_binding_for_dispatch(
+    params: &crate::missions::MissionLaunchParams,
+    cwd: &Path,
+    config: Option<&crate::missions::MissionStoreConfig>,
+    owner_session_id: Option<&str>,
+    explicit_mission: bool,
+) -> Result<(Option<crate::missions::MissionLaunchBinding>, Option<String>), ToolError> {
+    match crate::missions::prepare_mission_launch(params, cwd, config, owner_session_id) {
+        Ok(binding) => Ok((binding, None)),
+        Err(e) if explicit_mission => Err(ToolError::new(e.to_string())),
+        Err(e) => {
+            // Never silent — an auto-created mission that could not be written is invisible to the
+            // model beyond one `details` key, so the operator gets the reason in the log.
+            tracing::warn!(error = %e, "mission tracking unavailable; continuing without a binding");
+            Ok((None, Some(format!("Mission tracking unavailable: {e}"))))
         }
     }
 }
@@ -8365,23 +8507,32 @@ fn attach_mission_to_tool_outcome(
         },
         Err(e) => {
             let warning = format!("Mission tracking unavailable after launch: {e}");
+            // Never silent: the run itself succeeded and only its bookkeeping did not, which is a
+            // condition an operator has to be able to see in the log even when the model is told
+            // about it in prose.
+            tracing::warn!(error = %e, "mission bookkeeping failed after launch");
             match outcome {
                 Err(err) => Err(err),
-                // pi `:5122-5130`: an EXPLICIT mission turns a post-launch bookkeeping failure
-                // into an error result carrying the warning appended to the content; an automatic
-                // one only records the warning on `details`.
-                Ok(result) if explicit_mission => Err(ToolError::new(format!(
-                    "{}\n{warning}",
-                    result
-                        .content
-                        .iter()
-                        .filter_map(|part| match part {
-                            cyrup_core::Content::Text { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ))),
+                // pi `:5119-5127`: BOTH arms are `{ ...result, … }` — the settled run's content and
+                // `details` survive a post-launch bookkeeping failure in either case. The EXPLICIT
+                // arm additionally makes the warning MODEL-VISIBLE by appending it as a new text
+                // part (`content: [...result.content, { type: "text", text: warning }]`) and sets
+                // `isError: true`; the automatic arm records it on `details` only.
+                //
+                // [CYRUP-DELTA] `cyrup_core::ToolResult` has no `isError` field — this crate's
+                // error-result channel is `Err(ToolError)`, and `ToolError` is a bare `String`.
+                // Returning one here is what this arm used to do, and it DISCARDED THE ENTIRE RUN:
+                // `details` (the `runId`, every settled `results[]` entry, the artifact paths, the
+                // mission stamp) and every non-text content part of a subagent run that had ALREADY
+                // FINISHED were thrown away to signal a bookkeeping failure upstream treats as
+                // non-destructive — `attachMissionToLaunchResult` throwing means the mission store
+                // could not be written, not that the work was lost. The result is kept and the
+                // warning is carried in both of the places upstream carries it; the one thing that
+                // cannot cross is the `isError` bit, whose only cyrup encoding costs the payload.
+                Ok(mut result) if explicit_mission => {
+                    result.content.push(cyrup_core::Content::text(warning.clone()));
+                    Ok(with_warning(result, &warning))
+                }
                 Ok(result) => Ok(with_warning(result, &warning)),
             }
         }
@@ -9352,11 +9503,10 @@ impl NativeExtension for SubagentsExtension {
             // message, toolResults}` object `formatWatchdogTurnDelta`/`eventIndicatesRepoEdit`
             // duck-type against — the same JSON pi's own handler receives.
             HostEvent::TurnEnd { message, tool_results, .. } => {
-                let event = serde_json::json!({
-                    "type": "turn_end",
-                    "message": message,
-                    "toolResults": tool_results,
-                });
+                let event = crate::watchdog::turn_delta::watchdog_turn_end_event(
+                    message,
+                    tool_results,
+                );
                 self.watchdog.handle_turn_end(&event, &ctx.cwd);
             }
             // pi `register-main.ts:423-426` — the mid-run cadence trigger.
@@ -9501,29 +9651,7 @@ impl NativeExtension for SubagentsExtension {
     }
 }
 
-/// The config layout the watchdog's model registry reads `auth.json` from — the process's own,
-/// resolved exactly as the binary resolves it (`cyrup_config::ConfigDirs::resolve`).
-///
-/// `None` when resolution genuinely fails (no home directory, an unreadable cwd). `ConfigDirs` has
-/// no infallible constructor, and inventing one here would put a synthetic auth path in front of the
-/// recommendation; the callers instead treat `None` as "no authenticated models", which is the same
-/// answer the registry would give for an empty `auth.json` and keeps every other line of the status
-/// report printing.
-fn watchdog_config_dirs() -> Option<cyrup_config::ConfigDirs> {
-    let env = cyrup_config::EnvVars::from_process();
-    cyrup_config::ConfigDirs::resolve(&cyrup_config::CliConfigOverrides::default(), &env).ok()
-}
-
-/// `ctx.model` as `model-selection.ts` reads it: a `provider/id` string split back into the pair.
-fn watchdog_model_info(
-    model: &str,
-) -> Option<crate::watchdog::model_selection::WatchdogModelInfo> {
-    let (provider, id) = model.split_once('/')?;
-    if provider.is_empty() || id.is_empty() {
-        return None;
-    }
-    Some(crate::watchdog::model_selection::WatchdogModelInfo::new(provider, id))
-}
+use crate::watchdog::register_main::{watchdog_config_dirs, watchdog_model_info};
 
 /// pi `renderCall` (`extension/index.ts:548-568` @v0.43.0), rendered as plain text: cyrup's
 /// renderer contract returns a serialized widget tree the host flattens, and pi's own return here
@@ -9636,6 +9764,42 @@ fn render_subagent_result(result: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Array(lines.into_iter().map(serde_json::Value::String).collect())
 }
 
+/// Resolve one background run's nested descendants ONE level, by reading each nested run's own
+/// `status.json` — pi's `nestedChildren` on an `AsyncRunSummary` (`runs/background/
+/// async-status.ts:291`, rendered by `tui/fleet-status.ts:193,212`).
+///
+/// [`crate::background::StepStatus::nested_run_ids`] deliberately stores bare ids rather than
+/// embedded snapshots (see its own doc), so a reader that wants the nested run's state has to go
+/// to disk; [`crate::background::RunPaths::nested`] is the documented way to get there. This READS
+/// only — no reconcile, no repair, no kill — which is the same read-only discipline
+/// [`crate::tui::fleet::collect_fleet_history`] applies for pi's `reconcile: false`, and is why
+/// this is not the recursive reconciliation `background/fleet_view.rs` declines.
+///
+/// A nested id whose `status.json` is missing or unparseable is skipped, never fatal.
+async fn read_nested_children(
+    paths: &crate::background::RunPaths,
+    status: &crate::background::RunStatus,
+) -> Vec<crate::tui::fleet_state::NestedRunView> {
+    let mut out = Vec::new();
+    for (step_index, step) in status.steps.iter().enumerate() {
+        for nested_id in &step.nested_run_ids {
+            let nested_paths = paths.nested(nested_id);
+            let Ok(bytes) = tokio::fs::read(&nested_paths.status).await else { continue };
+            let Ok(nested) =
+                serde_json::from_slice::<crate::background::RunStatus>(&bytes)
+            else {
+                continue;
+            };
+            out.push(crate::tui::fleet_state::NestedRunView::from_run_status(
+                nested_id.as_str(),
+                &nested,
+                Some(step_index),
+            ));
+        }
+    }
+    out
+}
+
 impl SubagentsExtension {
     /// The single shared dispatch body [`NativeExtension::execute_command`] calls into
     /// (R-SA-130). Parses `args` via the real, already-built parsers in
@@ -9655,19 +9819,20 @@ impl SubagentsExtension {
     ///    DIRS.results })` (`:645`), which clears the status widget (`tui/fleet.ts:846`), raises
     ///    `state.fleetInspectorOpen` (`:844-845`), and restores both in its `finally` (`:876-878`).
     ///
-    /// \[CYRUP-DELTA] Upstream's third outcome AWAITS an interactive overlay
-    /// (`ctx.ui.custom(factory, { overlay: true, … })`, `tui/fleet.ts:869-875`). cyrup's extension
-    /// host has no interactive-overlay seam — [`cyrup_ext::HostServices::custom`] takes a
-    /// serialized spec and returns an optional serialized result
-    /// (`cyrup-ext/src/host/services.rs:205`), with no input subscription and no re-render
-    /// channel — and this crate must not depend on `cyrup-tui` (arch-SA §1.1/§6.1). So the
-    /// inspector is constructed and its frame is rendered ONCE, and that frame is what the command
-    /// returns. Every state transition above the input boundary is ported and exercised
-    /// ([`crate::tui::fleet::SubagentFleetComponent::handle_input`]); what is missing is a host
-    /// channel to feed it keystrokes, not the behaviour behind them.
+    /// Upstream's third outcome AWAITS an interactive overlay
+    /// (`ctx.ui.custom(factory, { overlay: true, … })`, `tui/fleet.ts:869-875`), and cyrup's
+    /// counterpart is [`cyrup_ext::HostServices::open_overlay`]: the constructed component is
+    /// wrapped in a [`crate::tui::fleet_overlay::FleetOverlay`] and handed to the host, which
+    /// paints it, routes every keystroke into
+    /// [`crate::tui::fleet::SubagentFleetComponent::handle_input`], ticks it at
+    /// [`crate::tui::fleet::REFRESH_MS`], and blocks this call until the user closes it — pi's own
+    /// `await ctx.ui.custom(...)`. The width and the terminal height both come from the host frame
+    /// on every paint, so nothing here guesses at a terminal size.
     ///
-    /// The 100-column render width is a fallback for the same reason: `HostCtx` reports no terminal
-    /// size (upstream's overlay is `width: "95%", minWidth: 60`, `tui/fleet.ts:873`).
+    /// `open_overlay` answering `false` is not an error: it means the attached mode owns no
+    /// terminal to drive a modal on (RPC, an embedder, a session with no UI sink). That is exactly
+    /// pi's `!ctx.hasUI` situation, so the command falls back to the SAME text fleet view outcome 1
+    /// renders rather than reporting a failure.
     ///
     /// `showFleet`'s first statement, `state.lastUiContext = ctx` (`:634`), has no counterpart:
     /// upstream stashes the live `ExtensionContext` so a LATER, context-less caller can still reach
@@ -9714,12 +9879,13 @@ impl SubagentsExtension {
             FleetOpenOutcome::AlreadyOpen => {
                 Ok("Subagent fleet inspector is already open.".to_string())
             }
-            FleetOpenOutcome::Opened { mut component, clear_widget_key } => {
+            FleetOpenOutcome::Opened { component, clear_widget_key } => {
                 self.fleet_open.store(true, Ordering::Release);
                 self.fleet_inspector_open.store(true, Ordering::Release);
                 // pi `ctx.ui.setWidget(FLEET_STATUS_WIDGET_KEY, undefined)` (`tui/fleet.ts:846`):
                 // the status widget must be gone before the overlay paints.
-                if let Some(services) = self.executor.host_services() {
+                let services = self.executor.host_services();
+                if let Some(services) = services.as_ref() {
                     services.set_widget(&serde_json::json!({
                         "key": clear_widget_key,
                         "content": serde_json::Value::Null,
@@ -9728,9 +9894,19 @@ impl SubagentsExtension {
                 if let Ok(mut widget) = self.fleet_status.lock() {
                     widget.set_inspector_open(true);
                 }
-                let frame = crate::tui::fleet_theme::lines_text(
-                    &component.render(100, crate::background::now_epoch_millis_pub()),
+
+                let overlay = crate::tui::fleet_overlay::FleetOverlay::new(
+                    *component,
+                    Arc::clone(&self.executor),
+                    cwd.to_path_buf(),
+                    FleetViewOptions::default().refresh_ms,
+                    tokio::runtime::Handle::current(),
                 );
+                // BLOCKS until the human closes the modal — pi's `await ctx.ui.custom(...)`.
+                let driven = services
+                    .as_ref()
+                    .is_some_and(|services| services.open_overlay(Box::new(overlay)));
+
                 // pi's `finally` (`slash-commands.ts:646-647` + `tui/fleet.ts:876-878`): both
                 // latches are restored however the overlay ended.
                 if let Ok(mut widget) = self.fleet_status.lock() {
@@ -9738,7 +9914,28 @@ impl SubagentsExtension {
                 }
                 self.fleet_inspector_open.store(false, Ordering::Release);
                 self.fleet_open.store(false, Ordering::Release);
-                Ok(frame)
+
+                if driven {
+                    // The overlay said everything it had to say on screen; pi's
+                    // `ctx.ui.custom<undefined>` likewise resolves with no value, and a non-empty
+                    // return here would surface as a redundant notification
+                    // (`cyrup-session-svc/src/session.rs`'s `try_execute_extension_command`).
+                    return Ok(String::new());
+                }
+                // No terminal to drive it on — pi's `!ctx.hasUI` outcome, one level later.
+                self.executor
+                    .control_status_view(
+                        cwd,
+                        None,
+                        None,
+                        false,
+                        StatusViewSelector {
+                            view: Some("fleet"),
+                            ..StatusViewSelector::default()
+                        },
+                    )
+                    .await
+                    .map_err(SubagentError::Management)
             }
         }
     }
@@ -11835,7 +12032,7 @@ mod tests {
     #[tokio::test]
     async fn chain_tool_call_rejects_duplicate_as_names_before_any_agent_resolution() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let err = tool
             .execute(
@@ -11869,7 +12066,7 @@ mod tests {
     #[tokio::test]
     async fn chain_tool_call_rejects_an_unknown_outputs_reference_before_any_agent_resolution() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let err = tool
             .execute(
@@ -12898,6 +13095,13 @@ mod tests {
                     current_agent: Some("reviewer".to_string()),
                     current_index: Some(0),
                     current_activity_state: None,
+                    mode: crate::background::RunMode::Single,
+                    description: None,
+                    current_tool: None,
+                    current_path: None,
+                    turn_count: None,
+                    tool_count: None,
+                    tokens: None,
                     started_at: crate::background::now_epoch_millis_pub(),
                     updated_at: crate::background::now_epoch_millis_pub(),
                 },
@@ -12966,6 +13170,13 @@ mod tests {
                     current_agent: Some("reviewer".to_string()),
                     current_index: Some(0),
                     current_activity_state: None,
+                    mode: crate::background::RunMode::Single,
+                    description: None,
+                    current_tool: None,
+                    current_path: None,
+                    turn_count: None,
+                    tool_count: None,
+                    tokens: None,
                     started_at: crate::background::now_epoch_millis_pub(),
                     updated_at: crate::background::now_epoch_millis_pub(),
                 },
@@ -13129,6 +13340,10 @@ mod tests {
         let ext = SubagentsExtension::with_config_and_cwd(
             SubagentExtensionConfig {
                 max_subagent_spawns_per_session: 2,
+                // Every dispatch below carries a `task`, so each auto-creates a mission and writes
+                // a pointer into the GLOBAL index — `agent_dir()/missions/index`, i.e. the real
+                // `~/.cyrup/agent`, unless scoped. See [`scoped_missions`].
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -13202,6 +13417,11 @@ mod tests {
                         max_items: Some(7),
                     }),
                 }),
+                // The chains below carry tasks. They are refused by the spawn reservation, which
+                // sits AHEAD of the mission binding, so no mission is created today — but that
+                // ordering is the only thing standing between this test and a
+                // `~/.cyrup/agent/missions/index` pointer. See [`scoped_missions`].
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -13302,6 +13522,9 @@ mod tests {
         let ext = SubagentsExtension::with_config_and_cwd(
             SubagentExtensionConfig {
                 max_subagent_spawns_per_session: 1,
+                // The task-bearing dispatches below auto-create missions; scope their pointer
+                // index into this tempdir ([`scoped_missions`]) so none lands in `~/.cyrup/agent`.
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -13501,6 +13724,10 @@ mod tests {
             SubagentExtensionConfig {
                 max_subagent_spawns_per_session: 1,
                 max_subagent_depth: 0,
+                // Task-bearing dispatch, refused by the depth gate that sits AHEAD of the mission
+                // binding — scoped anyway, for the same reason as
+                // `chain_spawn_count_bills_dynamic_fanout_worst_case_and_parallel_width`.
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -13583,6 +13810,9 @@ mod tests {
         let ext = SubagentsExtension::with_config_and_cwd(
             SubagentExtensionConfig {
                 max_subagent_spawns_per_session: 3,
+                // The chain below carries tasks, so it auto-creates a mission; scope its pointer
+                // index into this tempdir ([`scoped_missions`]) instead of `~/.cyrup/agent`.
+                missions: Some(scoped_missions(dir.path())),
                 ..SubagentExtensionConfig::default()
             },
             dir.path().to_path_buf(),
@@ -13649,7 +13879,7 @@ mod tests {
         )
         .expect("write skill");
 
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
         let out = tool
             .execute(
                 ToolCallId::from("t"),
@@ -13835,7 +14065,7 @@ mod tests {
     #[tokio::test]
     async fn tool_execute_routes_each_mode_to_its_dispatch_arm() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         async fn dispatch(tool: &SubagentTool, params: serde_json::Value) -> Result<ToolResult, ToolError> {
             tool.execute(
@@ -13916,7 +14146,7 @@ mod tests {
     #[tokio::test]
     async fn tool_execute_routes_the_four_suba_005_actions_to_their_real_handlers() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         for verb in ["eject", "disable", "enable", "reset"] {
             let err = tool
@@ -14255,7 +14485,7 @@ mod tests {
     #[tokio::test]
     async fn single_mode_accepts_every_wired_override_and_never_silently_drops_an_unwired_one() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         // Every SINGLE-mode override this dispatcher wires: each must reach agent resolution.
         let accepted = [
@@ -14393,7 +14623,7 @@ mod tests {
     #[tokio::test]
     async fn a_background_single_run_no_longer_refuses_the_formerly_foreground_only_overrides() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         // The exact six the removed gate named, plus the timeout pair its sibling guard named, plus
         // `acceptance`/`control`/`includeProgress` (freed by SUBA-N04/N05/N06) so all nine
@@ -14995,7 +15225,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_tool_rejects_a_second_concurrent_dispatch_while_one_is_in_flight() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let _held = tool
             .dispatch_guard
@@ -15040,7 +15270,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_tool_rejects_empty_tasks_and_chain_arrays_as_no_mode_selected() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         async fn dispatch(tool: &SubagentTool, params: serde_json::Value) -> Result<ToolResult, ToolError> {
             tool.execute(
@@ -15076,7 +15306,7 @@ mod tests {
     #[tokio::test]
     async fn control_status_action_uses_run_id_when_id_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
         let err = tool
             .execute(
                 ToolCallId::from("t"),
@@ -15134,7 +15364,7 @@ mod tests {
         )
         .expect("write dirB agent fixture");
 
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir_a.path().to_path_buf());
+        let tool = scoped_tool(dir_a.path()).await;
 
         async fn dispatch(tool: &SubagentTool, params: serde_json::Value) -> Result<ToolResult, ToolError> {
             tool.execute(
@@ -15266,7 +15496,7 @@ mod tests {
     #[tokio::test]
     async fn execution_params_are_canonicalized_across_every_shape() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let params = SubagentToolParams {
             agent: Some("advisor".to_string()),
@@ -15319,7 +15549,7 @@ mod tests {
         )
         .expect("write");
 
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
         let params = SubagentToolParams {
             tasks: Some(vec![
                 serde_json::json!({ "agent": "scout", "task": "a" }),
@@ -16745,6 +16975,48 @@ mod tests {
         paths
     }
 
+    /// The GLOBAL mission pointer index defaults to `agent_dir()/missions/index` — the
+    /// developer's real `~/.cyrup/agent` (faithful to pi `missions/store.ts:265`). A test that
+    /// creates a mission, directly or through the tool, MUST scope it into its own tempdir; the
+    /// only production lever for that is `config.missions.globalIndexDir`.
+    ///
+    /// There are TWO ways a test reaches that launch path, and both need scoping:
+    ///
+    /// * a bare [`SubagentTool`] over its own executor — use [`scoped_tool`], which arms this
+    ///   config on the executor's live config for you;
+    /// * a [`SubagentsExtension`] built from a [`SubagentExtensionConfig`] literal, whose
+    ///   `subagent_tool()` inherits that config verbatim — set `missions: Some(scoped_missions(…))`
+    ///   in the literal. This second route is NOT covered by [`scoped_tool`] and is what leaked
+    ///   `~/.cyrup/agent/missions/index` pointers titled `"a"`/`"c"` from the three spawn-budget /
+    ///   chain-billing tests: their dispatches carry a `task`, and a task-bearing dispatch
+    ///   auto-creates a mission (`missions/lifecycle.rs::prepare_mission_launch`) whether or not
+    ///   the test mentions missions at all.
+    fn scoped_missions(root: &Path) -> crate::missions::MissionStoreConfig {
+        crate::missions::MissionStoreConfig {
+            global_index_dir: Some(
+                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// Install [`scoped_missions`] on the executor's live config, which is what the `subagent`
+    /// tool's launch path reads (`extension.rs`'s `cfg.missions`).
+    async fn arm_scoped_missions(executor: &SubagentExecutor, root: &Path) {
+        executor.config.lock().await.missions = Some(scoped_missions(root));
+    }
+
+    /// A [`SubagentTool`] over a fresh executor whose mission pointer index is scoped into `dir`
+    /// ([`scoped_missions`]). Missions are ON by default, so ANY dispatch carrying a `task`
+    /// auto-creates one (`missions/lifecycle.rs::prepare_mission_launch`) and writes a pointer to
+    /// `agent_dir()/missions/index` — the developer's real `~/.cyrup/agent`. This is therefore the
+    /// constructor every dispatch test must use, not `SubagentTool::new` directly.
+    async fn scoped_tool(dir: &Path) -> SubagentTool {
+        let executor = Arc::new(SubagentExecutor::new());
+        arm_scoped_missions(&executor, dir).await;
+        SubagentTool::new(executor, dir.to_path_buf())
+    }
+
     async fn dispatch_tool(
         tool: &SubagentTool,
         params: serde_json::Value,
@@ -16786,7 +17058,9 @@ mod tests {
     #[tokio::test]
     async fn mission_actions_are_dispatched_from_a_real_tool_call() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let executor = Arc::new(SubagentExecutor::new());
+        arm_scoped_missions(&executor, dir.path()).await;
+        let tool = SubagentTool::new(executor, dir.path().to_path_buf());
 
         let created = dispatch_tool(
             &tool,
@@ -16875,7 +17149,7 @@ mod tests {
     #[tokio::test]
     async fn a_mission_action_validation_failure_is_a_tool_error_with_upstreams_text() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
         let err = dispatch_tool(
             &tool,
             serde_json::json!({ "action": "mission.create", "mission": { "nope": 1 } }),
@@ -16931,7 +17205,9 @@ mod tests {
     #[tokio::test]
     async fn an_execution_call_with_an_explicit_mission_binds_before_the_run_and_settles_after() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let executor = Arc::new(SubagentExecutor::new());
+        arm_scoped_missions(&executor, dir.path()).await;
+        let tool = SubagentTool::new(executor, dir.path().to_path_buf());
         let err = dispatch_tool(
             &tool,
             serde_json::json!({
@@ -16946,7 +17222,11 @@ mod tests {
 
         // The mission was created up front (so the run is attributable even though it failed) and
         // then marked failed by the settle half, with the failure text as its summary.
-        let location = crate::missions::resolve_mission_store_location(dir.path(), None, None);
+        let location = crate::missions::resolve_mission_store_location(
+            dir.path(),
+            Some(&scoped_missions(dir.path())),
+            None,
+        );
         let listed = crate::missions::list_missions(&location);
         assert_eq!(listed.records.len(), 1, "{:?}", listed.records);
         let record = &listed.records[0];
@@ -16961,7 +17241,9 @@ mod tests {
     #[tokio::test]
     async fn mission_false_suppresses_the_automatic_launch_binding() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let executor = Arc::new(SubagentExecutor::new());
+        arm_scoped_missions(&executor, dir.path()).await;
+        let tool = SubagentTool::new(executor, dir.path().to_path_buf());
         let _ = dispatch_tool(
             &tool,
             serde_json::json!({
@@ -16971,7 +17253,11 @@ mod tests {
             }),
         )
         .await;
-        let location = crate::missions::resolve_mission_store_location(dir.path(), None, None);
+        let location = crate::missions::resolve_mission_store_location(
+            dir.path(),
+            Some(&scoped_missions(dir.path())),
+            None,
+        );
         assert!(crate::missions::list_missions(&location).records.is_empty());
     }
 
@@ -16980,7 +17266,7 @@ mod tests {
     #[tokio::test]
     async fn an_explicit_missing_mission_id_fails_the_call_before_the_run() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
         let err = dispatch_tool(
             &tool,
             serde_json::json!({
@@ -16998,7 +17284,7 @@ mod tests {
     #[tokio::test]
     async fn mission_id_and_mission_together_are_refused_at_the_tool_boundary() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
         let err = dispatch_tool(
             &tool,
             serde_json::json!({
@@ -17034,11 +17320,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sink = Arc::new(Recording::default());
         let executor = Arc::new(SubagentExecutor::with_control_notice_sink(sink.clone()));
+        arm_scoped_missions(&executor, dir.path()).await;
         let services: Arc<dyn cyrup_ext::host::HostServices> =
             Arc::new(FixedSessionIdHost { id: Some("goal-session".to_string()), file: None });
         executor.set_host_services(services);
 
-        let location = crate::missions::resolve_mission_store_location(dir.path(), None, None);
+        let location = crate::missions::resolve_mission_store_location(
+            dir.path(),
+            Some(&scoped_missions(dir.path())),
+            None,
+        );
         let record = crate::missions::create_mission(
             &location,
             &crate::missions::MissionCreateInput {
@@ -17093,10 +17384,15 @@ mod tests {
     async fn the_goal_scan_ignores_non_goal_and_foreign_session_missions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = Arc::new(SubagentExecutor::new());
+        arm_scoped_missions(&executor, dir.path()).await;
         let services: Arc<dyn cyrup_ext::host::HostServices> =
             Arc::new(FixedSessionIdHost { id: Some("mine".to_string()), file: None });
         executor.set_host_services(services);
-        let location = crate::missions::resolve_mission_store_location(dir.path(), None, None);
+        let location = crate::missions::resolve_mission_store_location(
+            dir.path(),
+            Some(&scoped_missions(dir.path())),
+            None,
+        );
         crate::missions::create_mission(
             &location,
             &crate::missions::MissionCreateInput {
@@ -17136,14 +17432,18 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let async_root = dir.path().join("async");
-        let location = crate::missions::resolve_mission_store_location(dir.path(), None, None);
+        let location = crate::missions::resolve_mission_store_location(
+            dir.path(),
+            Some(&scoped_missions(dir.path())),
+            None,
+        );
         let binding = crate::missions::prepare_mission_launch(
             &crate::missions::MissionLaunchParams {
                 task: Some("run it in the background".to_string()),
                 ..Default::default()
             },
             dir.path(),
-            None,
+            Some(&scoped_missions(dir.path())),
             Some("sess"),
         )
         .expect("prepare")
@@ -17200,6 +17500,330 @@ mod tests {
         assert!(reconciled.runs[0].completed_at.is_some());
     }
 
+    // ---------------------------------------------------------------------------------------
+    // The two "Mission tracking unavailable" degradation paths (pi `subagent-executor.ts`
+    // `:5101-5111` pre-launch and `:5115-5128` post-launch). Both were entirely uncovered.
+    // ---------------------------------------------------------------------------------------
+
+    /// A [`crate::missions::MissionStoreConfig`] whose global index lands INSIDE `root`, so no test
+    /// here ever writes to the real agent dir under `$HOME`.
+    fn scoped_mission_config(root: &Path) -> crate::missions::MissionStoreConfig {
+        crate::missions::MissionStoreConfig {
+            global_index_dir: Some(
+                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// A mission store whose `missions` directory path is occupied by a FILE, so every write into
+    /// it fails — the cheapest real (not mocked) way to make the store refuse.
+    fn wedged_mission_root(root: &Path) -> crate::missions::MissionStoreConfig {
+        let mission_dir = root.join("wedged").join("missions");
+        std::fs::create_dir_all(mission_dir.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&mission_dir, b"not a directory").expect("write");
+        crate::missions::MissionStoreConfig {
+            directory: Some(mission_dir.to_string_lossy().into_owned()),
+            ..scoped_mission_config(root)
+        }
+    }
+
+    /// pi `:5110`. An AUTOMATIC binding (no `mission`/`missionId` in the call) whose store cannot
+    /// be written degrades to a warning and a `None` binding — the run still goes ahead.
+    #[test]
+    fn a_pre_launch_mission_failure_degrades_to_a_warning_when_the_mission_is_automatic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = wedged_mission_root(dir.path());
+        let params = crate::missions::MissionLaunchParams {
+            task: Some("do the thing".to_string()),
+            ..Default::default()
+        };
+        let (binding, warning) = prepare_mission_binding_for_dispatch(
+            &params,
+            dir.path(),
+            Some(&config),
+            Some("sess"),
+            false,
+        )
+        .expect("an automatic mission never fails the call");
+        assert!(binding.is_none(), "no binding survives a store that cannot be written");
+        let warning = warning.expect("the degradation must record why");
+        assert!(
+            warning.starts_with("Mission tracking unavailable: "),
+            "pi's own prefix, verbatim: {warning}"
+        );
+
+        // …and the warning really reaches the model-facing result, as `details.missionWarning`.
+        let result = attach_mission_to_tool_outcome(
+            Ok(ToolResult {
+                content: vec![cyrup_core::Content::text("child said hi")],
+                details: Some(serde_json::json!({"mode": "single", "runId": "r1"})),
+                ..Default::default()
+            }),
+            binding.as_ref(),
+            Some(warning.clone()),
+            false,
+        )
+        .expect("an automatic mission never turns a good run into an error");
+        let details = result.details.expect("details survive");
+        assert_eq!(details.get("missionWarning").and_then(|v| v.as_str()), Some(warning.as_str()));
+        assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("r1"));
+    }
+
+    /// pi `:5109`. An EXPLICIT `mission`/`missionId` makes the same failure fatal to the call.
+    #[test]
+    fn a_pre_launch_mission_failure_is_fatal_when_the_mission_is_explicit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = wedged_mission_root(dir.path());
+        let params = crate::missions::MissionLaunchParams {
+            task: Some("do the thing".to_string()),
+            mission: Some(serde_json::json!({"title": "Explicit"})),
+            ..Default::default()
+        };
+        let err = prepare_mission_binding_for_dispatch(
+            &params,
+            dir.path(),
+            Some(&config),
+            Some("sess"),
+            true,
+        )
+        .expect_err("an explicit mission that cannot be tracked fails the call");
+        assert!(
+            !err.to_string().is_empty(),
+            "the store's own message is what surfaces, not a generic one"
+        );
+        // Upstream's `toExecutionErrorResult(…, error, …)` carries the RAW error, without the
+        // `Mission tracking unavailable:` prefix that belongs to the degradation arm alone.
+        assert!(!err.to_string().starts_with("Mission tracking unavailable"), "{err}");
+    }
+
+    /// A binding whose record is destroyed between launch and settle, so
+    /// `attach_mission_to_launch_result` really fails — the post-launch degradation's only trigger.
+    fn binding_with_a_corrupt_record(
+        root: &Path,
+    ) -> (crate::missions::MissionLaunchBinding, crate::missions::MissionStoreConfig) {
+        let config = scoped_mission_config(root);
+        let binding = crate::missions::prepare_mission_launch(
+            &crate::missions::MissionLaunchParams {
+                task: Some("settle me".to_string()),
+                ..Default::default()
+            },
+            root,
+            Some(&config),
+            Some("sess"),
+        )
+        .expect("prepare")
+        .expect("a task-bearing launch binds a mission");
+        let record =
+            crate::missions::mission_record_path(&binding.location, &binding.mission_id)
+                .expect("record path");
+        std::fs::write(&record, b"{ this is not json").expect("corrupt the record");
+        (binding, config)
+    }
+
+    /// pi `:5127`. An AUTOMATIC mission whose POST-launch bookkeeping fails keeps the whole result
+    /// and records the warning on `details`.
+    #[test]
+    fn a_post_launch_mission_failure_keeps_the_result_when_the_mission_is_automatic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (binding, _config) = binding_with_a_corrupt_record(dir.path());
+        let result = attach_mission_to_tool_outcome(
+            Ok(ToolResult {
+                content: vec![cyrup_core::Content::text("the child's answer")],
+                details: Some(serde_json::json!({"mode": "single", "runId": "r9", "results": []})),
+                terminate: true,
+                ..Default::default()
+            }),
+            Some(&binding),
+            None,
+            false,
+        )
+        .expect("bookkeeping failure must not fail the run");
+        assert_eq!(result.content.len(), 1, "no warning part on the automatic arm");
+        let details = result.details.expect("details survive");
+        assert!(
+            details
+                .get("missionWarning")
+                .and_then(|v| v.as_str())
+                .is_some_and(|w| w.starts_with("Mission tracking unavailable after launch: ")),
+            "{details}"
+        );
+        assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("r9"));
+        assert!(result.terminate, "every other ToolResult field survives too");
+    }
+
+    /// pi `:5119-5126`. An EXPLICIT mission's post-launch failure appends the warning as a NEW text
+    /// part — and, the actual defect this pins, KEEPS the settled run.
+    ///
+    /// Pre-fix this arm returned `Err(ToolError::new(<joined text parts>))`, which discarded
+    /// `details` (run id, `results[]`, artifact paths), every non-text content part, and every
+    /// other `ToolResult` field of a subagent run that had already finished — for a mission-store
+    /// write failure upstream treats as non-destructive (`{ ...result, isError: true }`).
+    #[test]
+    fn a_post_launch_mission_failure_keeps_the_result_when_the_mission_is_explicit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (binding, _config) = binding_with_a_corrupt_record(dir.path());
+        let image = cyrup_core::Content::Image {
+            data: "AAAA".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        let result = attach_mission_to_tool_outcome(
+            Ok(ToolResult {
+                content: vec![cyrup_core::Content::text("the child's answer"), image.clone()],
+                details: Some(serde_json::json!({
+                    "mode": "single", "runId": "r9",
+                    "results": [{"agent": "scout", "exitCode": 0}],
+                })),
+                terminate: true,
+                ..Default::default()
+            }),
+            Some(&binding),
+            None,
+            true,
+        )
+        .expect("a finished run is never discarded to signal a bookkeeping failure");
+
+        // The warning is model-visible, appended AFTER the run's own content (upstream's
+        // `content: [...result.content, { type: "text", text: warning }]`).
+        assert_eq!(result.content.len(), 3);
+        assert_eq!(result.content[1], image, "a non-text part is carried through untouched");
+        let warning = match &result.content[2] {
+            cyrup_core::Content::Text { text, .. } => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(warning.starts_with("Mission tracking unavailable after launch: "), "{warning}");
+
+        // …and none of the run is lost.
+        let details = result.details.expect("details survive");
+        assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("r9"));
+        assert_eq!(
+            details.get("results").and_then(|v| v.as_array()).map(Vec::len),
+            Some(1),
+            "the settled per-child results survive: {details}"
+        );
+        assert_eq!(details.get("missionWarning").and_then(|v| v.as_str()), Some(warning.as_str()));
+        assert!(result.terminate);
+    }
+
+    /// A confirmed async launch reports the run directory the spawn actually created, so the
+    /// mission binding chain has something to bind to (`async-execution.ts:1191,1563`).
+    #[test]
+    fn an_async_launch_reports_the_run_directory_it_spawned_into() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_id = crate::background::RunId::from_token("bgrun000042");
+        let details = async_launch_details("single", &run_id, dir.path());
+        assert_eq!(details.get("mode").and_then(|v| v.as_str()), Some("single"));
+        assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("bgrun000042"));
+        assert_eq!(details.get("asyncId").and_then(|v| v.as_str()), Some("bgrun000042"));
+        assert_eq!(details.get("results").and_then(|v| v.as_array()).map(Vec::len), Some(0));
+
+        // Absent a nested route in this process's env, the dir is the ordinary per-cwd C7 slot —
+        // exactly what `spawn_background`'s `RunPaths::for_run` created.
+        if crate::spawn::nested_events::resolve_inherited_nested_route_from_env(|key| {
+            std::env::var(key).ok()
+        })
+        .is_none()
+        {
+            let expected = RunPaths::for_run(
+                &default_async_root(dir.path()),
+                &default_results_dir(dir.path()),
+                &run_id,
+            )
+            .run_dir;
+            assert_eq!(
+                details.get("asyncDir").and_then(|v| v.as_str()),
+                Some(expected.to_string_lossy().as_ref())
+            );
+        }
+    }
+
+    /// The chain that one missing key severed, end to end: an async launch's `details` must carry
+    /// the run ACTIVE (not completed), write the `mission.json` binding into the async dir, and
+    /// record the run's `status.json`/`events.jsonl` artifacts.
+    ///
+    /// Pre-fix `details` carried `asyncId` but no `asyncDir`, so `runStatusForResult`
+    /// (`missions/lifecycle.ts:98`) fell through `results: []` to `"completed"` — a background
+    /// mission was marked DONE at launch — no binding file was written, and
+    /// `MissionSyncCompletionObserver` could never find one to reconcile against.
+    #[test]
+    fn an_async_launch_binds_its_mission_marks_it_active_and_records_its_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = scoped_mission_config(dir.path());
+        let binding = crate::missions::prepare_mission_launch(
+            &crate::missions::MissionLaunchParams {
+                task: Some("run it in the background".to_string()),
+                ..Default::default()
+            },
+            dir.path(),
+            Some(&config),
+            Some("sess"),
+        )
+        .expect("prepare")
+        .expect("a task-bearing launch binds a mission");
+
+        let run_id = crate::background::RunId::from_token("bgrun000043");
+        let details = async_launch_details("single", &run_id, dir.path());
+        let async_dir = PathBuf::from(
+            details.get("asyncDir").and_then(|v| v.as_str()).expect("asyncDir is reported"),
+        );
+        // The spawn creates this directory; the binding file lands in it.
+        std::fs::create_dir_all(&async_dir).expect("mkdir");
+
+        crate::missions::attach_mission_to_launch_result(
+            &binding,
+            crate::missions::LaunchOutcome {
+                content: vec![cyrup_core::Content::text("started")],
+                details: Some(details),
+                is_error: false,
+            },
+        )
+        .expect("attach");
+
+        let record =
+            crate::missions::read_mission(&binding.location, &binding.mission_id).expect("read");
+        assert_eq!(record.status, crate::missions::MissionStatus::Active);
+        assert_eq!(record.runs.len(), 1);
+        assert_eq!(
+            record.runs[0].status.as_deref(),
+            Some("active"),
+            "an async launch is ACTIVE, not completed"
+        );
+        assert_eq!(record.runs[0].async_dir.as_deref(), Some(async_dir.to_string_lossy().as_ref()));
+        assert!(record.runs[0].completed_at.is_none());
+
+        let artifacts: Vec<&str> = record.artifacts.iter().map(|a| a.path.as_str()).collect();
+        assert!(
+            artifacts.contains(&async_dir.join("status.json").to_string_lossy().as_ref()),
+            "{artifacts:?}"
+        );
+        assert!(
+            artifacts.contains(&async_dir.join("events.jsonl").to_string_lossy().as_ref()),
+            "{artifacts:?}"
+        );
+
+        // The binding file the completion observer later reads back.
+        let read_back = crate::missions::read_mission_binding(&async_dir)
+            .expect("binding parses")
+            .expect("a binding file was written into the async dir");
+        assert_eq!(read_back.mission_id, binding.mission_id);
+    }
+
+    /// The same post-launch failure on an outcome that was ALREADY an error stays an error, with no
+    /// warning smuggled onto a channel that cannot carry it.
+    #[test]
+    fn a_post_launch_mission_failure_leaves_an_error_outcome_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (binding, _config) = binding_with_a_corrupt_record(dir.path());
+        let err = attach_mission_to_tool_outcome(
+            Err(ToolError::new("the child failed")),
+            Some(&binding),
+            None,
+            true,
+        )
+        .expect_err("an error outcome stays an error");
+        assert_eq!(err.to_string(), "the child failed");
+    }
+
     /// G92, the whole `view: "fleet"` surface driven from a real tool call. Pre-fix the schema
     /// carried no `view` property at all and `SubagentToolParams` had no field to deserialize it
     /// into, so this exact call rendered the ordinary `Active async runs:` list — which is what the
@@ -17208,7 +17832,7 @@ mod tests {
     async fn status_view_fleet_renders_the_fleet_surface_not_the_plain_active_run_list() {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_running_run(dir.path(), "fleetrun0001", &["scout"]);
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let out = dispatch_tool(&tool, serde_json::json!({ "action": "status", "view": "fleet" }))
             .await
@@ -17261,7 +17885,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = seed_running_run(dir.path(), "tailrun00001", &["scout"]);
         std::fs::write(paths.step_output_log(0), "alpha\nbeta\ngamma\n").expect("write output log");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let out = dispatch_tool(
             &tool,
@@ -17295,7 +17919,7 @@ mod tests {
     async fn the_stop_action_dispatches_and_writes_a_real_stop_request() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = seed_running_run(dir.path(), "stoptool0001", &["scout"]);
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let out = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "stoptool0001" }))
             .await
@@ -17323,7 +17947,7 @@ mod tests {
     async fn a_run_id_prefix_stops_the_run_it_names_and_the_confirmation_uses_the_full_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = seed_running_run(dir.path(), "stopprefix01", &["scout"]);
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let out = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "stoppre" }))
             .await
@@ -17354,7 +17978,7 @@ mod tests {
     #[tokio::test]
     async fn the_stop_action_refusals_use_pis_verbatim_texts() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         // An id naming NOTHING: upstream's `stopAsyncRun` → `null` fallback (`:4812`).
         let err = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "nosuchrun001" }))
@@ -17424,6 +18048,13 @@ mod tests {
                     current_agent: Some("scout".to_string()),
                     current_index: Some(0),
                     current_activity_state: None,
+                    mode: crate::background::RunMode::Single,
+                    description: None,
+                    current_tool: None,
+                    current_path: None,
+                    turn_count: None,
+                    tool_count: None,
+                    tokens: None,
                     started_at: crate::background::now_epoch_millis_pub(),
                     updated_at: crate::background::now_epoch_millis_pub(),
                 },
@@ -17629,7 +18260,7 @@ mod tests {
     async fn an_unknown_status_view_is_rejected_with_pis_message() {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_running_run(dir.path(), "typorun00001", &["scout"]);
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
         let err = dispatch_tool(
             &tool,
             serde_json::json!({ "action": "status", "id": "typorun00001", "view": "flee" }),
@@ -17649,7 +18280,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = seed_running_run(dir.path(), "lonerun00001", &["scout"]);
         std::fs::write(paths.step_output_log(0), "only line\n").expect("write output log");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let text = tool_text(
             &dispatch_tool(&tool, serde_json::json!({ "action": "status", "view": "transcript" }))
@@ -17677,7 +18308,7 @@ mod tests {
     async fn steer_action_writes_a_control_inbox_request_for_a_running_run() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = seed_running_run(dir.path(), "steerrun0001", &["scout"]);
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let text = tool_text(
             &dispatch_tool(
@@ -17733,7 +18364,7 @@ mod tests {
     async fn steer_action_enforces_pis_four_refusals() {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_running_run(dir.path(), "guardrun0001", &["scout", "auditor"]);
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let blank = dispatch_tool(
             &tool,
@@ -17807,6 +18438,13 @@ mod tests {
                     current_agent: Some("scout".to_string()),
                     current_index: Some(0),
                     current_activity_state: None,
+                    mode: crate::background::RunMode::Single,
+                    description: None,
+                    current_tool: None,
+                    current_path: None,
+                    turn_count: None,
+                    tool_count: None,
+                    tokens: None,
                     started_at: crate::background::now_epoch_millis_pub(),
                     updated_at: crate::background::now_epoch_millis_pub(),
                 },
@@ -18215,7 +18853,7 @@ mod tests {
     #[tokio::test]
     async fn a_control_action_refuses_a_malformed_acceptance_with_pis_own_prefix() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let tool = scoped_tool(dir.path()).await;
 
         let appended = tool
             .execute(

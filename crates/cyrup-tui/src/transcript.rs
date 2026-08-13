@@ -2242,7 +2242,7 @@ struct CompactRead {
 }
 
 /// Port of `getCompactReadClassification` (`core/tools/read.ts:122-143`). **X7 = `G30b`** in
-/// `PARITY-GAPS.md` §2.5 — the same unported function; porting it here closes both, and neither
+/// `docs/gap-analysis/PARITY-GAPS.md` §2.5 — the same unported function; porting it here closes both, and neither
 /// backlog should re-land it.
 ///
 /// ```ts

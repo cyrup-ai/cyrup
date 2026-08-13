@@ -575,10 +575,28 @@ fn expand_configured_path(value: &str, project_root: &Path) -> PathBuf {
     }
 }
 
-/// `os.homedir()`, degrading to the temp dir when `$HOME` is unset — the same fallback
-/// [`crate::discovery`]'s own `agent_dir()` uses, so the two never disagree.
+/// `os.homedir()`, following this crate's `CYRUP_HOME` → `HOME` → tempdir convention
+/// (`extension.rs::dirs_home:4719`, `exec/mcp_direct_tools.rs:831`,
+/// `registration/prompt_workflows.rs:105`, `watchdog/settings.rs:743`,
+/// `background/mod.rs::home_dir` — six resolvers, all identical).
+///
+/// NOT identical, and the one remaining exception: `discovery/agent_memory.rs::agent_dir` reads
+/// bare `HOME` and so still escapes the sandbox, exactly as this function used to.
+///
+/// This function used to read bare `HOME`, which made it the ONE home resolver in the crate that
+/// ignored `CYRUP_HOME`. `CYRUP_HOME` is the crate's sandbox lever: nineteen integration tests set
+/// it to a `TempDir` precisely so no run-artifact lands in the developer's real home. Every one of
+/// those tests still wrote its mission pointer index into the live `~/.cyrup/agent/missions/index`
+/// — beside `settings.json`, `models-store.json` and `sessions/` — because
+/// [`resolve_mission_store_location`]'s `global_index_dir` default reaches this function and this
+/// function alone did not honour the sandbox. Production behaviour is unchanged: with `CYRUP_HOME`
+/// unset (its only state outside tests) the first branch is `None` and `HOME` answers exactly as
+/// before.
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+    std::env::var_os("CYRUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// pi `getAgentDir()` (`shared/utils.ts:95-100`), reached from `resolveMissionStoreLocation`'s
@@ -660,6 +678,22 @@ pub fn validate_mission_store_config(
 ///
 /// [CYRUP-DELTA] the default record directory is `<projectRoot>/.cyrup-subagents/missions`
 /// (upstream: `.pi-subagents/missions`), via [`crate::artifacts::project_subagents_dir`].
+///
+/// # The `global_index_dir` default is REAL user config — never take it in a test
+///
+/// With no `config.globalIndexDir` and no `agent_dir_override`, the pointer index lands in
+/// [`agent_dir`]`/missions/index` — `~/.cyrup/agent/missions/index` — the same directory that
+/// holds `settings.json`, `models-store.json` and `sessions/`. That is faithful to upstream's
+/// `path.join(input.agentDir ?? getAgentDir(), "missions", "index")` (`store.ts:265`) and must
+/// stay; the pointer index is deliberately cross-project, so it cannot live under a project root.
+///
+/// A test therefore has to scope it, and upstream's own fixtures show both ways of doing it:
+/// `test/unit/mission-goal-driver.test.ts:15` passes `agentDir: path.join(root, "agent")` (this
+/// function's `agent_dir_override`), while `test/unit/mission-lifecycle.test.ts:18`'s
+/// `projectFixture()` returns `missionConfig: { globalIndexDir: path.join(root, "global-index") }`
+/// and threads it through every `prepareMissionLaunch` — because
+/// [`super::lifecycle::prepare_mission_launch`] has no override parameter to pass.
+/// A tempdir `project_root` alone does NOT isolate this path.
 #[must_use]
 pub fn resolve_mission_store_location(
     project_root: &Path,

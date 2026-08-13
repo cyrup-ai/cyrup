@@ -57,6 +57,20 @@ fn run(args: &[&str]) -> (Run, TempDir) {
         .env_remove("OPENAI_API_KEY")
         .env_remove("HTTP_PROXY")
         .env_remove("HTTPS_PROXY")
+        // ...and never inherit an ambient BUILT-IN OPT-IN either. `CYRUP_INTERCOM=1` alone
+        // satisfies `is_installed()` (`cyrup-intercom/src/extension.rs:630-631`, env var name at
+        // `:87`) even though this tempdir agent dir holds no `intercom/config.json`, so the child
+        // attaches intercom and detaches a real `__intercom-broker`. That broker never self-exits —
+        // `schedule_shutdown_check` is armed only by a REGISTERED session's disconnect (1:1 with
+        // pi-intercom `broker/broker.ts:221`/`:429`), and a one-shot run exits before its connect
+        // task registers — so it outlives cargo. Measured on a developer box that exports all three
+        // vars: the four binary-seam targets in this crate left 13 immortal brokers per run, 0
+        // under `env -u CYRUP_INTERCOM`. A hermetic run's extension set must come from the fixture,
+        // not the developer's shell; `auth_credential_print.rs` takes the stronger `env_clear` +
+        // allowlist form of the same rule.
+        .env_remove("CYRUP_INTERCOM")
+        .env_remove("CYRUP_SUBAGENTS")
+        .env_remove("CYRUP_PERMISSION_SYSTEM")
         .args([
             "--offline",
             "--no-session",

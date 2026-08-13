@@ -410,7 +410,7 @@ The `large` rows of §6: LaTeX, the transformer chain, mermaid, `/hotkeys` (S36)
 
 Expanding every range in §7 and diffing it against the tables leaves **36 findings assigned to no
 batch**, four of them high severity. Following §7 literally would have completed ten batches and
-silently left those undone — the identical failure `PARITY-GAPS.md` §6 had, where three items sat in
+silently left those undone — the identical failure `docs/gap-analysis/PARITY-GAPS.md` §6 had, where three items sat in
 the tables and in no batch. Every one is now assigned below. Re-run the arithmetic (every ID in the
 tables must appear in §7 or §7a) after any edit to either section.
 
@@ -418,7 +418,7 @@ tables must appear in §7 or §7a) after any edit to either section.
 |---|---|---|
 | **1 — colour accessors** | **T9** (six dead theme tokens) | same file, same pass; tokens defined but never read are the sibling defect to tokens read through the wrong accessor |
 | **2 — footer / status band** | **C14** (`{n} queued`, cyrup-only), **C15** (`• xp` marker) | both are footer segments; C14 is an element pi does not draw at all |
-| **5 — transcript rhythm** | **X5** (reasoning/thinking body, HIGH), **X6** (read/write syntax highlighting), **X7** (read header classification — this is `G30b` from PARITY-GAPS §2.5, the same unported `getCompactReadClassification`), **X8**, **X9**, **X11**, **X12**, **X13**, **X14**, **X15** | all transcript-block rendering; X7 must be cross-referenced with G30b so the two backlogs do not double-count or half-port it |
+| **5 — transcript rhythm** | **X5** (reasoning/thinking body, HIGH), **X6** (read/write syntax highlighting), **X7** (read header classification — this is `G30b` from `docs/gap-analysis/PARITY-GAPS.md` §2.5, the same unported `getCompactReadClassification`), **X8**, **X9**, **X11**, **X12**, **X13**, **X14**, **X15** | all transcript-block rendering; X7 must be cross-referenced with G30b so the two backlogs do not double-count or half-port it |
 | **7 — editor and input** | **E14** (autocomplete indent), **E15** (editor slot measured at a different width than it renders at) | E15 is a measurement/render mismatch, the same class as the SYS-2 wrap bug — check them together |
 | **9 — per-selector completeness** | **S6** (scoped-models enable marker, HIGH), **S7** (scoped-models title/badge, HIGH), **S9** (`/resume` metadata column, HIGH), **S11**, **S12**, **S13**, **S14**, **S15** (`/resume` colours, header, rules, path toggle, scroll row), **S21** (`/login` status colours), **S22** (`/fork`), **S28**, **S30**, **S31**, **S32**, **S33**, **S34**, **S35** | §7 listed only S5/S8/S16/S19/S23/S29 for this batch; these are the rest of the same per-dialog sweep. `/resume` alone accounts for six |
 | **10 — missing subsystems** | **M7** (inline formatting in table cells), **M15** (table minimum column width) | §7 named LaTeX and the transformer chain but not the table work, which is the same `large` class |

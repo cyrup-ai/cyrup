@@ -1,0 +1,1050 @@
+# 08 — cyrup-session-svc + cyrup-modes + bin + sdk
+
+This area covers the single integration seam (`cyrup/crates/cyrup-session-svc/`), the non-interactive
+front-ends (`cyrup/crates/cyrup-modes/` — print, json, rpc), the binary (`cyrup/crates/cyrup/`) and
+the embedder SDK (`cyrup/crates/cyrup-sdk/`), measured against
+`pi/packages/coding-agent/src/core/agent-session*.ts`, `.../modes/{rpc,print-mode,json-event}`,
+`.../main.ts`, `.../cli/` and `.../utils/shell.ts`.
+
+> **Re-audited 2026-08-12, cyrup HEAD `04c1ba2`** (tree `a9000b1`, docs-only on top of the last code
+> commit `04c1ba2`; branch `david/cyrup`, working tree clean). Upstream re-read at the **named tags**
+> with `git show <tag>:<path>` — never from a working tree: `pi` **v0.83.0** (the ported baseline)
+> for every parity item, and `pi` **v0.84.1** (latest) for every version-lag item and for the
+> re-verification of the RPC/print/signal hosts. `pi-subagents` v0.47.1, `pi-permission-system`
+> v0.8.0 and `pi-intercom` v0.10.1 have no surface in this area and were not consulted.
+>
+> **What changed in this pass.** The whole `4935cc8` (Move 18/18b) closure batch was attacked rather
+> than accepted and **held on nine of ten**: SEAM-001/002/009/021/022/023/024/026/031 are genuinely
+> closed at HEAD, with both sides re-read. **SEAM-006's closure is refuted and the item is reopened**
+> at a corrected severity — the runtime-host half really did land, but pi's `rebindSession` binds
+> three keys (`mode`, `commandContextActions`, `onError`) and cyrup's `bind_extensions()` still takes
+> no arguments, so an extension fault under `cyrup -p` / `--mode json` is still swallowed.
+> **6 items closed this pass**: SEAM-018, SEAM-032, SEAM-S01, SEAM-S02, SEAM-S04, SEAM-S05.
+> **1 item reopened**: SEAM-006 (`high` → `medium`, residual only).
+> **1 item marked misdescribed and superseded**: SEAM-019 — its upstream premise (`--ui-mode`/`--alt`)
+> is false at *both* tags; the real flag is `--tui-mode`, new at v0.84.1, re-filed as SEAM-051.
+> **14 items newly filed**: SEAM-047…SEAM-058 from the auditor, plus SEAM-059 and SEAM-060 recovered
+> by the refuter from surface the audit walked past. **1 new high** (SEAM-047: the first
+> SIGTERM/SIGHUP neither tears down nor exits, so `cyrup --mode rpc` cannot be stopped by a
+> supervisor).
+>
+> ---
+>
+> **REPAIR PASS, same day (2026-08-12), applying the completeness critique and the `cli/` subtree
+> sweep.** No ID was renumbered, merged or deleted.
+> - **`SEAM-051` medium → `high`.** Verified end to end: `grep -rn "tui_mode\|tui-mode" crates
+>   --include='*.rs'` returns **nothing**, `--tui-mode` is absent from `KNOWN_LONG_FLAGS`
+>   (`cli.rs:757-799`), so `partition_extension_flags` (`cli.rs:701-753`) captures it, nothing
+>   registers it, `collect_diagnostics` rates it `error`, and all three modes exit 1
+>   (`main.rs:514-517`, `:662-666`, `:770-774` — each re-read). **The DEFAULT value of a v0.84.1 flag
+>   makes the binary refuse to start**, with a message claiming the option is unknown. Rated `high`
+>   rather than `critical`: it is a deterministic, loud, first-second refusal with a printed
+>   diagnostic and a one-token workaround, not a silent or unrecoverable failure — but it is a launch
+>   failure for every pi-migrant command line and wrapper script, at effort S, and it was ranked below
+>   188 mediums.
+> - **`SEAM-020` low → `medium`**, and its body rewritten. The `cli/` sweep found the concrete defect
+>   the item's ordering framing had abstracted away: `--list-models` prints the whole compiled catalog
+>   because `all_available_models` (`provider.rs:237-240`) is pi's `getModels()`, not `getAvailable()`.
+> - **`SEAM-058` is now a `tracker`**, excluded from the item count — its own Fix says "track, do not
+>   build", and upstream has not wired the tree into `main()` either.
+> - **10 items newly filed, `SEAM-061` … `SEAM-070`**, all from the `pi/packages/coding-agent/src/cli/`
+>   startup-path sweep (`file-processor.ts`, `initial-message.ts`, `list-models.ts`,
+>   `session-picker.ts`, `config-selector.ts`, `startup-ui.ts` at both tags, plus every symbol they
+>   consume) — the ~1 000 lines of shipped Rust under `crates/cyrup/src/startup_ui.rs` +
+>   `main.rs:1040-1270` that the previous edition's flag-name diff never opened. **5 new highs**, all
+>   on the pre-launch surface a user meets before the TUI exists.
+> - **Bookkeeping (critique finding 17a): `SEAM-035` … `SEAM-046` do not exist and never did.** The
+>   gap is a **numbering artifact, not a deletion** — the 2026-08-12 pass began its new items at
+>   `SEAM-047` rather than at `SEAM-035`. Confirmed against the committed edition
+>   (`git show a9000b1:docs/gap-analysis/08-cyrup-session-svc-and-modes.md`), whose highest id is
+>   `SEAM-034` plus the `-SNN` series; the ids are absent from every other file and from
+>   `PARITY-GAPS.md` too. Caveat, stated because it cannot be closed here: `docs/gap-analysis/` has
+>   exactly one commit in cyrup's history, so this check cannot see an id dropped before the directory
+>   came under source control. `SEAM-061` onward continue from the real high-water mark.
+>
+> **Open set after the repair pass: 40 items — 0 critical, 7 high, 19 medium, 14 low — plus 1 tracker
+> (`SEAM-058`) excluded from that count.**
+>
+> **Structural fix applied to this file.** The previous edition split the open set across two tables
+> (`## Open items` and `## Surface-sweep findings`), which is exactly how the high-severity
+> `SEAM-S01` escaped a full audit pass on 2026-08-07 — see structural defect A in
+> `00-residual-ledger.md`. There is now **one** open-items table. The `-SNN` ids are retained
+> unchanged; only their provenance is now a column note rather than a separate section.
+>
+> Static analysis only: nothing was built, run or tested, and no Rust or TypeScript source was
+> modified.
+
+## Status since prior analyses
+
+| ID | Status | Note |
+|---|---|---|
+| SEAM-001 | **closed** | Verified at HEAD: `cyrup-sdk/src/client.rs:241-256` — `build_session` ends in `session.agent_session().bind_extensions().await`; `session.rs:2516-2518` `bind_extensions` → `emit_session_start("startup", None)`, latched at `:2526`. Upstream pi v0.83.0 `agent-session.ts:389`. The SDK residual the item was kept open on is gone. |
+| SEAM-002 | **closed** | `handle.rs:101-102` `close(self)` → `dispose("quit")`; `session.rs:2405-2432` `dispose_with` = `abort_and_settle()` (`:2410`) → facade `SessionShutdown` → `dispatch_notify(HostEvent::SessionShutdown)` → `before_invalidate` → `session_cancel.cancel()`. Upstream `agent-session-runtime.ts:167-178`, `:398-405`. Both residuals closed. |
+| SEAM-003 | **closed** | `runtime.rs:428-430` re-installs `self.actions` onto every replacement before announcement; sink minted once in `create_unannounced` (`:310-312`). Upstream `rpc-mode.ts:322-344`. |
+| SEAM-004 | **closed** | `rpc.rs:1096-1100`, `:1135-1136`, `:1415-1419` all read `available_model_catalog()`; zero bare `model_catalog()`. v0.84.1 moved pi to the synchronous `getAvailableSnapshot()` (`rpc-mode.ts:469`/`:487`), which cyrup's already-synchronous accessor (`session.rs:2726`) matches. |
+| SEAM-005 | **closed** | `rpc.rs:823-825` clears `in_flight` only on `AgentSettled`; `:832`/`:837-839` set the shutdown checkpoint on the same terminal. Upstream v0.84.1 `rpc-mode.ts:355-359`. |
+| SEAM-006 | **reopened — partially closed** | Closure **refuted**. The runtime-host half landed (`print.rs:58-68`, `json.rs:47-51` take `&AgentSessionRuntime`; `main.rs:761` builds via `create_unannounced`). The `onError` sink and the `mode` label did not — see the item, now `medium`. |
+| SEAM-007 | **closed** | `session.rs:1386-1389` `compact` returns `Result<CompactionResult, SessionServiceError>`; refusals surface as RPC errors at `rpc.rs:1174-1183`. Upstream `agent-session.ts:1800-1807`, `rpc-mode.ts:530`. |
+| SEAM-008 | partially closed | Signal set and exit codes landed (`signals.rs:39-69`, `:26-32` → 130/143/129). They are used only on the **second** delivery (`:98-99`). Item stays open at `medium` on the bookkeeping residual; the "host never returns" consequence is SEAM-047's. |
+| SEAM-009 | **closed** | `runtime.rs:539` hoists `fork_anchor_live` above the `match` at `:547`; the in-memory arm (`:574-579`) branches the live manager. `fork_anchor` (`session.rs:5128-5143`) raises `InvalidForkEntry` for a missing entry and a non-user-message `Before` anchor. Upstream `agent-session-runtime.ts:274-287`, `:335-340`. |
+| SEAM-010 | **closed** | `cli.rs:47-57` `ThinkingArg::Max`; `diagnostics.rs:52-53` seven levels; pre-clap leniency at `:110-124`. Upstream `args.ts:57`, `:130-139`. |
+| SEAM-011 | still open | Unchanged; root cause still both WIT copies at `world.wit:326`. Every OTHER `extension_ui_request` member re-diffed against `rpc-types.ts:238-273` and matches. |
+| SEAM-012 | still open | Unchanged; emit sites still lossy at `runtime.rs:461` and `:525`. Batch with SEAM-025 (one WIT bump, both copies). |
+| SEAM-013 | **closed** | `rpc.rs:844-849` samples `shutdown_requested()` every iteration; both pi checkpoints present (`:837-839`, `:754`/`:776`). Upstream v0.84.1 `rpc-mode.ts:357-358`, `:787`. |
+| SEAM-014 | still open | Whole `handle` switch (`rpc.rs:1020-1381`) read: no `GetAvailableThinkingLevels` arm; `grep available_thinking_levels crates/cyrup-modes` is empty. |
+| SEAM-015 | still open | Third argument still a literal `None` at `rpc.rs:1232`; omission recorded only in the source comment at `:1226-1227`. |
+| SEAM-016 | still open | Unchanged, and the refuter folded in a second divergence in the same function: `StopReason::Pending => 1` (`run.rs:138`) where pi leaves the initialised `exitCode = 0`. |
+| SEAM-017 | still open | Zero `RpcClient`/`rpc_client` hits workspace-wide. At v0.84.1 the client's listener type became `JsonAgentSessionEvent`. |
+| SEAM-018 | **closed** | `crates/cyrup/src/credential_print.rs` (618 lines) implements both print verbs, dispatched pre-parse from `main.rs:105-107`. Against the ported baseline (pi v0.83.0 `cli/credential-print.ts`, 152 lines) this is complete. The v0.84.1 `auth check` extension is a separate item, SEAM-050. |
+| SEAM-019 | **misdescribed — superseded by SEAM-051** | The item's upstream premise is false at BOTH tags: `git grep -nE 'uiMode\|"--alt"' v0.83.0 -- packages/coding-agent/src` is EMPTY, and so is the same grep at v0.84.1 but for `TuiMode` imports. pi has never had `--ui-mode` or `--alt`. Do not work this ID as written. |
+| SEAM-020 | still open | `main.rs:140-143` and `:283-285` both run far above the runtime constructions at `:509`/`:652`/`:761`. |
+| SEAM-021 | **closed** | `rpc.rs:1003-1007` `latch_if_running` sets `in_flight` only `if !session.is_idle()`; `Steer` (`:1039`) and `FollowUp` (`:1049`) call it inside `Ok(_)` only. EOF exit at `:851` is reachable. Was **critical**. |
+| SEAM-022 | **closed** | `rpc.rs:680` `watch_generation()`, `:738-743` settle-before-service, `:778-785` dedicated `gen_rx.changed()` arm, `rebind_session` at `:505-518`. The name-based predicate and its false comment are gone. Producer bumps at `runtime.rs:439`. Was **critical**. |
+| SEAM-023 | **closed** | `session.rs:1348-1351` `abort()` = `abort_retry(); agent.abort();`. The `waitForIdle` tail is carried by `abort_and_settle` (SEAM-024). |
+| SEAM-024 | **closed** | `session.rs:1369-1372` `abort_and_settle` = `abort()` + bounded `timeout(ABORT_SETTLE_TIMEOUT, wait_for_idle())`. All three pi-mandated consumers converted (`dispose_with` `:2410`, `compact` `:1396`, RPC `abort` `rpc.rs:1062` on the concurrent path). Sync `abort()` retained for `signals.rs:94`. |
+| SEAM-025 | partially closed | The FACADE event now carries `previous_session_file` (`session.rs:2525-2534`, supplied at `runtime.rs:446`). The EXTENSION event still drops it (`session.rs:2537-2540`, `event.rs:307-308`, both `world.wit:234-235`), and `dispose`/`dispose_with` still take no target. Stays open at `medium`. |
+| SEAM-026 | **closed** | `client.rs:253-254` binds; `handle.rs:85-102` `close(self)` → `dispose("quit")`. The surviving residual of both SEAM-001 and SEAM-002 is gone. |
+| SEAM-027 | partially closed | The SEAM-006 half landed (`json.rs:67` binds/announces once before the loop, `:73` re-reads the active session). The per-run subscription is unchanged (`json.rs:70-83`), so the between-prompt event gap is still open. |
+| SEAM-028 | still open | `modes.rs:1014-1019` still asserts the collapsed `setWidget` shape as correct. |
+| SEAM-029 | still open — **corrected** | The doc contradiction is real (`cli.rs:45-46` vs `diagnostics.rs:110-124`). The auditor's second claim is **false**: `cli.rs`'s `args.ts:57,130` / `args.ts:135` citations are ACCURATE at v0.83.0. Only `diagnostics.rs:51`'s `args.ts:59` is off by two. |
+| SEAM-030 | still open | All three instances survive at `modes.rs:1277`/`:1289-1293`, `:1088`, `:1139`/`:1154-1158`. |
+| SEAM-031 | **closed** | `state.rs:36-54` is pi's `SessionStats` field-for-field with the nested `tokens`/`contextUsage` objects; `from_entries` (`:93-120+`) walks ENTRIES and folds `Compaction`/`BranchSummary` usage back in at `:106-110`, so the post-compaction drop is gone. |
+| SEAM-032 | **closed** | `modes.rs:745` asserts `totalMessages` and `:757-758` asserts the ABSENCE of `messageCount` under `get_session_stats`. `messageCount` legitimately survives in `get_state` only (`rpc.rs:1435` vs `rpc-types.ts:106`). |
+| SEAM-033 | partially closed | Closed for print/json (`create_unannounced` at `runtime.rs:292-314`, used at `main.rs:761`, announced from the mode entry points). Still open for RPC and interactive, which both call `AgentSessionRuntime::create` (`main.rs:652`, `:509`). |
+| SEAM-034 | still open | `state.rs:193-203` still has no `usage` and a non-optional `estimated_tokens_after`. |
+| SEAM-S01 | **closed** | `builder.rs:946-967` → `apply_extension_flag_values` → `startup_diagnostics.flags`; `runtime.rs:113-119` rates each `error`; `report_runtime_diagnostics` (`main.rs:1846-1862`) exits 1 in every mode (`:514-517`, `:662-666`, `:770-774`). Single-dash half live at `diagnostics.rs:140-148`. Was **high**. |
+| SEAM-S02 | **closed** | `signals.rs:92-99` awaits a SECOND `wait_for_signal()` then `std::process::exit(repeat.exit_code())`; `wait_for_signal` builds fresh streams per call so a repeat is observable. Codes pinned at `signals.rs:111-116`. |
+| SEAM-S03 | still open | `grep -rn 'kill_tracked\|track_detached\|DETACHED_PIDS\|tracked_pids' crates/` returns ZERO. Detached children ARE created (`cyrup-tools/src/ops/local.rs:272` `setsid`, `:334` `killpg`) with no process-global registry. |
+| SEAM-S04 | **closed** | `runtime.rs:36` `BeforeSessionInvalidate = Arc<dyn Fn() + Send + Sync>` (synchronous, matching pi's `() => void`), field `:239`, setter `:364-365`, fired at `session.rs:2427-2429` — after `dispatch_notify(SessionShutdown)`, before `session_cancel.cancel()` (`:2431`). |
+| SEAM-S05 | **closed** | `rpc.rs:575-606` splits `rpc_driver` from `write_pump` (`:618-629`) and races them; every driver emission is a non-awaited `let _ = out.send(...)`. Upstream `output-guard.ts:85-103`. |
+| SEAM-047 | **new** | First SIGTERM/SIGHUP neither tears down nor exits — `--mode rpc` runs forever. **high**. |
+| SEAM-048 | **new** | `get_commands` enumerates the last-wins command `HashMap`; pi's `name:N` disambiguation tier is dead code. `medium` (mechanism corrected by the refuter). |
+| SEAM-049 | **new** | Forking before the first message drops pi's `parentSession` link. |
+| SEAM-050 | **new** | `cyrup auth check` unrecognized; the whole v0.84.1 auth-command surface unported. |
+| SEAM-051 | **new** — **raised to `high`** in the repair pass | `--tui-mode <regular\|fullscreen>` rejected with exit 1 instead of parsed. Supersedes SEAM-019. The default value refuses to launch the binary. |
+| SEAM-052 | **new** | `--version` prints `cyrup <version>` and pre-empts the parse-error diagnostics pi reports first. |
+| SEAM-053 | **new** | Optional RPC wire fields emitted as explicit `null` where pi omits the key (second instance corrected by the refuter). |
+| SEAM-054 | **new** | A blank stdin line is dropped instead of producing pi's `parse` error response. |
+| SEAM-055 | **new** | Extension slash commands advertised with a synthesized empty-path `sourceInfo`. |
+| SEAM-056 | **new** | pi's "session has not been saved yet" fork/clone guard is absent. |
+| SEAM-057 | **new** | `--json`, `--rpc`, `--output-format` are cyrup-invented flags occupying the extension-flag namespace. |
+| SEAM-058 | **new** — reclassified **`tracker`** in the repair pass | pi's experimental `server`/`client` command tree + harness have no counterpart (track, do not build). Excluded from the item count. |
+| SEAM-059 | **new** | The signal watcher holds the startup session `Arc`, so after any replacement it aborts a disposed session. Recovered by the refuter. |
+| SEAM-060 | **new** | `get_tree` drops pi's `labelTimestamp` from every node. Recovered by the refuter. |
+| SEAM-061 | **new** (repair pass) | `--resume` picker merges current-folder AND all-projects sessions into one list, labels it "Current Folder", and advertises a dead `tab scope` toggle. **high**. |
+| SEAM-062 | **new** (repair pass) | Pre-launch `--resume` picker offers rename, shows the new name, and discards it. **high**. |
+| SEAM-063 | **new** (repair pass) | Session delete permanently unlinks; pi tries the `trash` CLI first. The `io::Result` is discarded, so a failed delete still reports success. **high**. |
+| SEAM-064 | **new** (repair pass) | Pre-launch trust prompt omits both "(this session only)" options, so every trust answer is persisted. **high**. |
+| SEAM-065 | **new** (repair pass) | Trust resolved pre-launch, inverting pi's tier order — an extension `project_trust` verdict is skipped entirely. **high**. |
+| SEAM-066 | **new** (repair pass) | Every pre-launch TUI surface hardwires the dark palette. |
+| SEAM-067 | **new** (repair pass) | Pre-launch selectors never load `keybindings.json`; hint rows print the wrong keys. |
+| SEAM-068 | **new** (repair pass) | `--list-models <search>` uses a lossy hand-rolled filter while a faithful port of `fuzzyFilter` sits unused. |
+| SEAM-069 | **new** (repair pass) | Trust prompt's saved-decision line never says "inherited from". |
+| SEAM-070 | **new** (repair pass) | `process.title` role suffix unported — rpc/subagent/broker children are indistinguishable in `ps`. |
+| SEAM-071 | **new** (suite-verification pass) | `--no-extensions` nulls only the WASM/disk discovery roots; the three native built-ins load anyway (`builder.rs:775`, no `no_extensions` anywhere in `crates/cyrup/src/main.rs`). |
+| SEAM-072 | **new**, **closed** (fixed) · high | `build_inputs` read process stdin instead of taking Pi's `stdinContent` argument; any inherited open pipe hung the target forever. Read moved to `main.rs`, matching `main.ts:819-832`. |
+| SEAM-073 | **new** (suite-verification pass) | 14 temp dirs leaked per `-p cyrup-session-svc` run; `FileLock` never removes its lock file and a models-store access lands after `TempDir` teardown. |
+
+## Open items
+
+This is the **complete** open set for area 08 — one table, deliberately. The `-SNN` ids came from the
+2026-08-03 surface-driven sweep and are otherwise ordinary items; four of the five have now closed.
+`SEAM-058` is **not** in this table: it proposes no work and is listed under `## Trackers` below.
+
+**`SEAM-035` … `SEAM-046` are absent by construction, not by deletion** — a numbering artifact of the
+2026-08-12 pass starting its new ids at `SEAM-047`. See the repair-pass note in the header block for
+the check that establishes it. Do not "recover" them.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| SEAM-051 | high | upstream-drift | S | `--tui-mode` rejected with exit 1 — the DEFAULT value makes the binary refuse to start |
+| SEAM-047 | high | parity-bug | M | First SIGTERM/SIGHUP neither tears down nor exits 143/129 — `--mode rpc` never returns |
+| SEAM-065 | high | parity-bug | M | Trust resolved pre-launch, inverting pi's tier order — the extension `project_trust` hook is skipped |
+| SEAM-064 | high | parity-bug | S | Pre-launch trust prompt omits both "(this session only)" options — every answer is persisted |
+| SEAM-063 | high | parity-bug | M | Session delete permanently unlinks where pi routes through `trash`; the failure is swallowed |
+| SEAM-061 | high | parity-bug | M | `--resume` picker lists every project's sessions under "Current Folder" with a dead `tab scope` toggle |
+| SEAM-062 | high | parity-bug | S | Pre-launch rename is accepted, echoed on screen, and silently discarded |
+| SEAM-006 | medium | not-ported | S | print/json `bind_extensions` passes no `onError` sink and no mode label |
+| SEAM-008 | medium | not-ported | S | Signal identity and 143/129 are computed but used only on the second delivery |
+| SEAM-011 | medium | parity-bug | M | setWidget goes on the wire with a cyrup-invented `{widget}` blob |
+| SEAM-012 | medium | not-ported | M | `session_before_switch` carries no reason, `session_before_fork` no position |
+| SEAM-014 | medium | not-ported | S | RPC verb `get_available_thinking_levels` not implemented |
+| SEAM-015 | medium | not-ported | M | RPC bash ignores the `operations` backend override |
+| SEAM-016 | medium | parity-bug | S | print-mode exit code derived by reverse-scanning the transcript |
+| SEAM-025 | medium | not-ported | M | Extension `session_start`/`session_shutdown` drop pi's session-file fields |
+| SEAM-027 | medium | parity-bug | M | `--mode json` subscribes per-run, dropping between-prompt events |
+| SEAM-033 | medium | parity-bug | M | RPC/interactive `session_start` still precedes `--name` and `--models` |
+| SEAM-048 | medium | parity-bug | S | `get_commands` enumerates a last-wins map; pi's `name:N` disambiguation is dead code |
+| SEAM-049 | medium | parity-bug | S | Fork before the first message drops pi's `parentSession` link |
+| SEAM-050 | medium | upstream-drift | M | `cyrup auth check` and the v0.84.1 auth-command surface unported |
+| SEAM-059 | medium | parity-bug | S | Signal watcher holds the startup session `Arc` and aborts a disposed session after any replacement |
+| SEAM-S03 | medium | not-ported | M | No detached-child registry: `setsid`-detached bash children survive teardown |
+| SEAM-020 | medium | parity-bug | M | `--list-models` prints the whole compiled catalog, not the auth-configured one; `--help` omits extension flags |
+| SEAM-066 | medium | parity-bug | M | Every pre-launch TUI surface hardwires the dark palette, ignoring `settings.theme` |
+| SEAM-067 | medium | not-ported | S | Pre-launch selectors never load `keybindings.json`, and their hint rows name the wrong keys |
+| SEAM-068 | medium | parity-bug | S | `--list-models <search>` uses a lossy hand-rolled fuzzy filter; the faithful port sits unused |
+| SEAM-071 | medium | parity-bug | S | `--no-extensions` does not gate the native built-ins (permission-system, subagents, intercom) |
+| SEAM-072 | high | parity-bug | S | `build_inputs` owned fd 0 instead of taking `stdinContent` — indefinite hang on an inherited pipe — **fixed this pass** |
+| SEAM-073 | low | cyrup-original | S | 14 temp dirs leaked per session-svc run; `FileLock` never deletes its lock file |
+| SEAM-017 | low | not-ported | M | No `RpcClient` counterpart |
+| SEAM-028 | low | test-defect | S | `modes.rs` setWidget case pins SEAM-011's invented wire field |
+| SEAM-029 | low | stale-port | S | `ThinkingArg` doc comment claims the leniency path is unreachable |
+| SEAM-030 | low | test-defect | S | RPC tests assert wall-clock/scheduling outcomes they cannot control |
+| SEAM-034 | low | parity-bug | S | `CompactionResult` drops pi's `usage` field |
+| SEAM-052 | low | parity-bug | S | `--version` prints a program name and pre-empts the diagnostics gate |
+| SEAM-053 | low | parity-bug | S | Optional RPC fields emitted as explicit `null` where pi omits the key |
+| SEAM-054 | low | parity-bug | S | Blank stdin line dropped instead of answered with pi's `parse` error |
+| SEAM-055 | low | parity-bug | S | Extension commands advertised with an empty-path `sourceInfo` |
+| SEAM-056 | low | not-ported | S | pi's "session has not been saved yet" fork/clone guard absent |
+| SEAM-057 | low | cyrup-original | S | `--json`/`--rpc`/`--output-format` occupy the extension-flag namespace |
+| SEAM-060 | low | parity-bug | S | `get_tree` drops pi's `labelTimestamp` |
+| SEAM-069 | low | parity-bug | S | Trust prompt's saved-decision line never distinguishes an inherited ancestor decision |
+| SEAM-070 | low | not-ported | S | `process.title` role suffix unported — rpc and subagent children are indistinguishable in `ps` |
+
+**43 items — 0 critical, 8 high, 20 medium, 15 low.** (SEAM-071, SEAM-072 and SEAM-073 were added by
+the later suite-verification pass, SEAM-072 closed on arrival; the 40/7/19/14 counts below predate
+them.) Per structural defect A in
+`00-residual-ledger.md`, treat the count as a floor — and see this file's own *Not audited* paragraph,
+which names the inner RPC payload shapes as the largest unswept surface remaining.
+
+## Trackers (excluded from the item count)
+
+Keeps its ID and its body; proposes no schedulable work today.
+
+| ID | Kind | Note |
+|---|---|---|
+| SEAM-058 | tracking | pi's experimental `server`/`client` command tree, `create-harness.ts` and `remote-session.ts`. Its own Fix is "track, do not build, until upstream wires it into `main()`", and the reachability re-check confirms upstream has not: at v0.84.1 `git grep -n experimentalCli` matches only the file itself and its test. The **action** it owes is a re-diff at the next upstream tag (its Verify line), not an implementation. Escalate it back into the counted set the moment `main()` references `experimentalCli`. |
+
+## SEAM-047 — First SIGTERM/SIGHUP neither tears down nor exits 143/129; `--mode rpc` keeps running forever and never emits session_shutdown
+
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13, exit codes as evidence.** A live `cyrup --mode rpc` (stdin held open on a
+> fifo) absorbs the first SIGTERM **and** the first SIGHUP completely — still running 15 s later,
+> requiring SIGKILL. A **second** SIGTERM exits **143**, which is precisely this item's claim that
+> `ShutdownSignal::exit_code` is consulted only on the second delivery. stdout was byte-empty across
+> every run, so no `session_shutdown` (nor anything else) is emitted on the way out under either
+> delivery. Nothing in the item needed correcting.
+
+**cyrup** — `cyrup/crates/cyrup/src/signals.rs:88-101` — `spawn_abort_on_signal`'s first-signal body is exactly `session.abort(); cancel.cancel();` (`:94-95`). The exit codes it does compute (`ShutdownSignal::exit_code`, `:26-32` → 130/143/129) are used ONLY on the second delivery at `:98-99`. The `CancelToken` it fires is created at `cyrup/crates/cyrup/src/main.rs:367` and is observed by the INTERACTIVE arm only (passed into the run loop at `main.rs:568`); the RPC arm hands a clone to the watcher at `main.rs:670` and the print/json arm at `main.rs:781`, and neither `run_rpc` (`cyrup/crates/cyrup-modes/src/rpc.rs:575-579`) nor `run_print`/`run_json` (`print.rs:58-68`, `json.rs:47-51`) takes a cancel token at all. `rpc_driver`'s `select!` (`rpc.rs:717-842`) has no cancellation arm: its only exits are the extension-driven `shutdown_requested` checkpoint (`:845-849`) and `!reader_open && !in_flight && dispatches.is_empty()` (`:851`), neither reachable from a signal. So `runtime.dispose()` at `cyrup/crates/cyrup/src/run.rs:113` never runs and no `session_shutdown` is dispatched. In print/json the send loop (`print.rs:83-96`) simply proceeds to the NEXT `--follow-up` message after the abort and the process exits with the transcript-derived 0/1/130 from `run.rs:133-148`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:366-380` — `registerSignalHandlers` installs SIGTERM (plus SIGHUP off Windows) handlers whose body is `killTrackedDetachedChildren(); void shutdown(signal === "SIGHUP" ? 129 : 143, signal);`; `shutdown` (`:724-741`) unsubscribes, `await runtimeHost.dispose()` (`:734` — which emits `session_shutdown{reason:"quit"}`, `agent-session-runtime.ts:398-405`), pauses stdin, conditionally flushes, then `process.exit(exitCode)` (`:740`). `pi/packages/coding-agent/src/modes/print-mode.ts:50-68` is the same shape: `killTrackedDetachedChildren(); void disposeRuntime().finally(() => process.exit(signal === "SIGHUP" ? 129 : 143));`. Both read at v0.84.1.
+
+**Impact** — A supervisor, CI runner, container stop or `timeout(1)` cannot stop `cyrup --mode rpc`: the first SIGTERM is absorbed and the process lingers holding the session file and any child processes until it is signalled a second time or SIGKILLed. No `session_shutdown` reaches extensions on that path, so intercom deregistration, permission-store teardown and subagent background-run cleanup never run. In print/json a SIGTERM mid-turn silently promotes to "run the next follow-up", and the exit code reports the transcript, so a killed run is indistinguishable from a clean one.
+
+**Fix** — Give `run_rpc`/`run_print`/`run_json` the shutdown signal. Change `spawn_abort_on_signal` (`signals.rs:88`) to publish the `ShutdownSignal` through a `watch`/`oneshot` alongside firing `cancel`; add a `cancel.cancelled()` select arm to `rpc_driver`'s loop (`rpc.rs:717-842`) that sets `reader_open = false` so the existing drain-and-break at `:851` runs, and a between-message check in `run_print`/`run_json`'s send loops; have `run_print_dispatch`/`run_json_dispatch`/`run_rpc_dispatch` (`run.rs:22`, `:50`, `:101`) return 143/129 when a signal was the cause, after `runtime.dispose()`. Pairs naturally with SEAM-S03 (drain the detached-child registry in the same handler, synchronously, as pi does) and with SEAM-059 (the handler must reach the CURRENT session, not the startup one).
+
+**Verify** — Integration test spawning `cyrup --mode rpc`, sending SIGTERM, asserting the process exits 143 within a bounded wait and that a `session_shutdown` line was written to stdout first; repeat with SIGHUP asserting 129. Second test: `cyrup -p 'a' --follow-up 'b'`, SIGTERM during the first turn, assert `'b'` was never submitted and the exit code is 143.
+
+## SEAM-065 — Trust is resolved pre-launch, inverting pi's tier order, so an extension `project_trust` verdict is skipped entirely
+
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** confirmed (both sides re-read in the repair pass)
+
+**cyrup** — `cyrup/crates/cyrup/src/main.rs:325-329` calls `resolve_startup_ui` **before** any runtime is built (the builder runs at `:509`/`:652`/`:761`). Inside it, `main.rs:1142-1162` resolves trust from the store plus the default policy only, runs `run_trust_prompt`, and on any chosen option sets `config.trust_override = Some(trusted)` (`:1159`). That override then short-circuits the extension pass in the builder: `cyrup/crates/cyrup-session-svc/src/builder.rs:495-499` is `let ext_trust = if cfg.trust_override.is_none() && has_resources { pre_trust_extension_verdict(...).await } else { None };` — read verbatim at HEAD. So whenever the user answers the prompt, `pre_trust_extension_verdict` never runs and `decide_trust_with_extension` (`:512-522`) is handed `None`. The extension hook only gets a say when the user **cancels** the prompt.
+
+**upstream** — `pi/packages/coding-agent/src/core/project-trust.ts:46-95` @v0.83.0 (identical at v0.84.1), read in full this pass — `resolveProjectTrusted` orders the tiers explicitly: `trustOverride` (`:47`), no-trust-requiring-resources (`:50`), then **`emitProjectTrustEvent(extensionsResult, …)` at `:54-70`**, whose `if (result) { … return trusted; }` returns before anything else and persists when `result.remember === true`. Only if no extension answered does it read the store (`:72-75`), then the default policy (`:77-84`), then `hasUI` (`:86-88`), and only last `selectProjectTrustOption` → `ctx.ui.select` (`:90-94`). pi reaches the prompt from *inside* `createAgentSessionServices`' `resolveProjectTrust` callback (`main.ts:687-706`), i.e. after `extensionsResult` exists — which is what makes the extension-first order possible.
+
+**Impact** — An extension implementing `on-project-trust` (declared in `crates/cyrup-ext-sdk/wit/world.wit:237`) is defeated on the interactive path: cyrup asks the human first and the human's answer wins, suppressing the hook. A policy extension that would have returned `trusted: no` for a folder cannot stop the user selecting "Trust"; one that would have auto-approved a known-good folder still forces a prompt; and the `remember` half never fires. This is the pre-trust extension seam the builder was written for, dead on the path that matters. Reachability caveat, stated because it bounds the severity: no extension in-tree implements the hook today, so the bypass is latent rather than live — it becomes live the first time anyone ships a trust-policy extension, and the failure is silent when it does.
+
+**Fix** — Do not resolve trust pre-launch. Delete the trust block from `resolve_startup_ui` (`main.rs:1142-1162`) and give `SessionServiceBuilder` a prompt callback (`with_trust_prompt(impl Fn(&[TrustOption], &Option<TrustEntry>) -> Option<usize>)`) that `builder.rs` invokes only when `decide_trust_with_extension` yields `TrustOutcome::NeedsPrompt` — i.e. after `pre_trust_extension_verdict`. The bin supplies `run_trust_prompt` as that callback. This also retires the builder's `saved: None` (`builder.rs:516`) and the "no trust store is wired" warning at `:506-510`, because the bin's `TrustStore` then reaches the same site. **Lands with SEAM-064**, which changes the option set the same callback renders.
+
+**Verify** — `cargo test -p cyrup-session-svc` with a native extension returning `{trusted:false, remember:true}`: assert the prompt callback is NEVER invoked and the store receives the entry. Then a live run in a folder with `.cyrup/` resources plus such an extension — cyrup must start untrusted with no prompt on screen. Per the standing rule, the live run is required, not optional: this is a TTY surface.
+
+## SEAM-064 — The pre-launch trust prompt omits both "(this session only)" options, so every trust answer is written to `trust.json` permanently
+
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed (both sides re-read in the repair pass) · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 on a real pty.** The startup prompt renders exactly **three** rows — Trust
+> / Trust parent folder (`<parent>`) / Do not trust — with no session-only variant of either answer.
+> The consequence was measured too, not inferred: pressing Enter on "Trust" writes
+> `<agent_dir>/trust.json` containing `{"<cwd>": true}`, while cancelling with ESC leaves no
+> `trust.json` at all. Cancel is therefore the only non-persisting exit, and it does not grant trust.
+> Nothing in the item needed correcting.
+
+**cyrup** — `cyrup/crates/cyrup/src/main.rs:1155` — `let options = cyrup_config::trust::trust_options(&dirs.cwd, false);`, fed straight into `cyrup::run_trust_prompt(&theme, &dirs.cwd, &options, &saved, &trust_store)` at `:1157`. The second parameter is `include_session_only` (`cyrup/crates/cyrup-config/src/trust.rs:336`), and it is exactly what gates both ephemeral rows: `"Trust (this session only)"` with `updates: Vec::new()` (`:356-363`) and `"Do not trust (this session only)"` (`:370-377`) — verified verbatim. With `false` the prompt renders three rows (Trust / Trust parent folder / Do not trust), every one of which carries a non-empty `updates`, which `run_trust_prompt` persists unconditionally via `trust_store.set_many(&option.updates)` (`cyrup/crates/cyrup/src/startup_ui.rs:266-268`). The unit tests at `startup_ui.rs:505` and `:519` pin the wrong arity. `false` is passed at **every** call site in the workspace (`main.rs:1155`, `cyrup-session-svc/src/session.rs:3255`), so the two options are unreachable code.
+
+**upstream** — `pi/packages/coding-agent/src/core/project-trust.ts:32` @v0.83.0 (identical at v0.84.1), read this pass: the pre-launch path is `selectProjectTrustOption`, and it calls `getProjectTrustOptions(cwd, { includeSessionOnly: true })`. `core/trust-manager.ts:82-84` and `:91-93` then append `{ label: "Trust (this session only)", trusted: true, updates: [] }` and its negative twin — options with an empty `updates`, which `saveProjectTrustPromptResult` skips writing (`project-trust.ts:40-44`, `if (result.updates.length > 0)`). The contrast that makes this precise: pi's **in-app** `TrustSelectorComponent` calls `getProjectTrustOptions(options.cwd)` with no flag (`modes/interactive/components/trust-selector.ts:44`), so cyrup's `session.rs:3255` passing `false` is **correct** — only the pre-launch site is wrong.
+
+**Impact** — A user who wants to run once in an untrusted folder without recording a verdict has no way to say so. Every answer at the startup trust prompt writes a permanent entry to `<agent_dir>/trust.json` that silently governs all future runs in that folder — including "Do not trust", which then locks the folder out with no prompt offered to reverse it. This is a security prompt whose two least-committal choices were dropped, on the one surface where a user is most likely to be answering about someone else's repository.
+
+**Fix** — Change `main.rs:1155` to `trust_options(&dirs.cwd, true)`. Update the two tests at `startup_ui.rs:504-537` to build with `true` and assert the five-option order (Trust, Trust parent, Trust session-only, Do not trust, Do not trust session-only) and that `interpret_trust` on a session-only index yields `Chosen` with an **empty** `updates`, so `set_many` writes nothing. Leave `session.rs:3255` at `false` — it matches pi's in-app selector. One line of production change; the test update is the work.
+
+**Verify** — `cargo test -p cyrup startup_ui`, then a live run: in a folder with a `.cyrup/` resource and no saved decision, launch `cyrup`, confirm the prompt lists five rows, pick "Trust (this session only)", and confirm `<agent_dir>/trust.json` is unchanged while the session runs trusted.
+
+## SEAM-063 — Session delete permanently unlinks the JSONL where pi routes through the `trash` CLI first, and the failure is swallowed
+
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Both halves reproduced 2026-08-13 on a real pty.** With an executable stub `trash` first on
+> `PATH`, cyrup **never invokes it** (no log line) and unlinks the JSONL permanently. With the
+> sessions directory `chmod 555` so `remove_file` must fail, the row still vanishes from the list, no
+> error is shown or printed, and **the file survives** — a failed delete is visually identical to a
+> successful one.
+>
+> **One correction to the Impact below.** The item says cyrup "additionally reports success
+> unconditionally". That is accurate for the **in-app** `/resume` path (`app.rs:4025` prints "deleted
+> session"), but the **pre-launch** `--resume` picker measured here prints *nothing at all* on
+> delete — no "Session deleted", no "moved to trash", no failure text; the only feedback is the row
+> disappearing. On that surface the defect is a **missing status line as well as** a swallowed error,
+> so the Fix must give `startup_ui.rs`'s `on_apply` a status channel for pi's
+> `result.method === "trash" ? "Session moved to trash" : "Session deleted"` (`session-selector.ts:846`)
+> and `"Failed to delete: …"` (`:849`) to render into. The upstream half was re-read at v0.84.1 this
+> pass and matches the item verbatim.
+
+**cyrup** — Two sites, same defect. Pre-launch picker: `cyrup/crates/cyrup/src/startup_ui.rs:133-137` — `if let Some(SessionSelectorOutcome::Delete(path)) = … { let _ = std::fs::remove_file(&path); }`, verbatim at HEAD. Permanent, and the `let _` discards the `io::Result`, so a failed delete produces no message while the row has already vanished from the list (`cyrup-tui/src/session_selector.rs:780`). In-app `/resume`: `cyrup/crates/cyrup-tui/src/app.rs:4021-4028` → `session.delete_session_file(path)` → `cyrup/crates/cyrup-session-svc/src/session.rs:3343-3347`, also a bare `std::fs::remove_file`, and `app.rs:4025` prints "deleted session" whether or not the file went. `rg -ni 'trash' crates` returns **zero** hits workspace-wide — re-run in this pass and confirmed empty.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/session-selector.ts:645-680` @v0.83.0 (identical at v0.84.1), read in full this pass — `deleteSessionFile` runs `spawnSync("trash", trashArgs)` **first**, with a `["--", path]` guard for leading-dash paths (`:649`); treats `status === 0` **or** the file having disappeared as success with `method: "trash"` (`:666-668`); only then falls back to `await unlink(sessionPath)` with `method: "unlink"` (`:672-674`); and on failure returns `{ok:false, error}` carrying both the unlink message and a `trash: …` hint (`:675-679`). The caller reports which happened — `result.method === "trash" ? "Session moved to trash" : "Session deleted"` (`:846`), or `"Failed to delete: …"` (`:849`). This path is live in the **pre-launch** picker too: `onDeleteSession` is assigned unconditionally in the constructor (`:832`), unlike `onRenameSession`.
+
+**Impact** — For every user who has `trash` installed (macOS `brew install trash`, Linux `trash-cli`), pi's session delete is recoverable from the OS trash and cyrup's is irreversible. One confirmed keypress in the `--resume` picker or in-app `/resume` destroys a whole conversation JSONL with no undo, on a surface whose sibling operation (rename, SEAM-062) is a no-op — so the destructive action is the one that works. cyrup additionally reports success unconditionally, so a delete that failed on a read-only volume looks identical to one that succeeded.
+
+**Fix** — *(Scope note added 2026-08-13 from the live run: the pre-launch picker has **no status line
+at all**, so this fix must add one, not merely correct one.)* Add a `delete_session_file(path) -> Result<DeleteMethod, String>` helper — `std::process::Command::new("trash")` with pi's `--` guard, success on exit-0 **or** `!path.exists()`, else `std::fs::remove_file` — and call it from **both** `crates/cyrup/src/startup_ui.rs:133-137` and `crates/cyrup-session-svc/src/session.rs:3343-3347`. Propagate the method into the status message so `app.rs:4025` can say "Session moved to trash" vs "Session deleted", and stop discarding the error at `startup_ui.rs:136`.
+
+**Verify** — Unit-test the helper with a stub `trash` on `PATH`: success → `Trash`; exit-1 with the file still present → falls back to unlink; unlink failure → `Err`. Then a live run — with `trash` installed, delete a session from `cyrup --resume`, confirm the status line says "moved to trash" and the file is in the OS trash, not gone.
+
+## SEAM-061 — The `--resume` picker merges current-folder and all-projects sessions into one list, labels it "Current Folder", and advertises a `tab scope` toggle that does nothing
+
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 on a real pty, every clause.** Two project dirs; from `projA` the picker
+> headed "Resume Session (Current Folder)" lists `projB`'s session alongside `projA`'s with the cwd
+> column off. Tab is **completely inert** — not merely unbound but producing *no redraw at all* (the
+> raw pty log shows the redraw emitting only `ESC[39m ESC[49m ESC[59m ESC[0m ESC[?25l` and no cell
+> changes) — while the hint row prints `tab scope` and the empty state prints "No sessions in current
+> folder. Press Tab to view all." Selecting the foreign row **resumes `projB`'s session with the
+> footer cwd still `projA`** and no warning, so the item's impact claim is now measured rather than
+> inferred.
+>
+> **One screen element the paragraphs below omit, added because it makes the misreport worse and is
+> the first thing to fix:** the header also renders a scope **radio** — `◉ Current Folder | ○ All` —
+> to the right of the title. The UI does not merely *name* the wrong scope in prose, it draws a
+> two-state control showing "Current Folder" selected, beside a `tab scope` hint, over a list that is
+> already both scopes merged.
+
+
+
+**cyrup** — `cyrup/crates/cyrup/src/main.rs:1259-1268` — `gather_session_infos` runs `list_in_dir(cwd-layout)` and then appends every row from `list_global_sessions(dirs)` (`:1244-1252`, the cross-project `list_all(SessionsRoot)`), de-duplicated by path, into **one** `Vec<SessionInfo>`; read verbatim at HEAD, including the doc comment that names both of pi's loaders as its source. `main.rs:1096` hands that single vector to `cyrup::run_resume_picker(&theme, &sessions, None)`, which builds `SessionSelector::new(rows)` (`cyrup/crates/cyrup/src/startup_ui.rs:126-127`). `SessionSelector` defaults to `scope: SessionScope::Current` (`cyrup/crates/cyrup-tui/src/session_selector.rs:204`), so the header renders `"Resume Session (Current Folder)"` (`:561-563`) over a list containing every project's sessions, with the cwd column off (`show_path: false`, `:199`; the cwd renders only `if self.show_path`, `:456`). There is no `SessionAction::ToggleScope` in the keymap at all (`:825-837` is ToggleSort/ToggleNamedFilter/TogglePath/Delete/Rename), so Tab falls through `handle` (`:770-843`) inert — while the hint row unconditionally prints `"tab scope"` (`:674`) and the empty state prints `"No sessions in current folder. Press Tab to view all."` (`:426`). The crate concedes it at `:49-52`: the Tab toggle "needs an all-sessions loader, which the cyrup chrome does not hand the selector yet". `SessionListProgress` exists and is unused by the bin (`cyrup-session/src/listing.rs:40-41,57`; `main.rs:1261` passes `None`).
+
+**upstream** — `pi/packages/coding-agent/src/cli/session-picker.ts:15-19` @v0.83.0 (byte-identical at v0.84.1), read in full this pass — `selectSession(currentSessionsLoader, allSessionsLoader, settingsManager)` takes **two** loaders, each `(onProgress?: SessionListProgress) => Promise<SessionInfo[]>` (`:12`), and passes both to `SessionSelectorComponent` (`:26-28`). `main.ts:419-421` supplies `SessionManager.list(cwd, sessionDir, onProgress)` and `SessionManager.listAll(sessionDir, onProgress)`. The component starts at `scope: "current"` (`modes/interactive/components/session-selector.ts:704`), loads only the current set on construction (`:859`), and Tab calls `onToggleScope` (`:551-556`) → `toggleScope()`, which lazily loads the all-set. `showCwd` is strictly `this.scope === "all"` (`:844`), and the title switches to `"Resume Session (All)"` (`:131`).
+
+**Impact** — On any machine with more than one cyrup project, `cyrup --resume` shows a picker headed "Current Folder" that actually lists every session on disk, with no cwd column to tell them apart and rows labelled only by their first message. Picking a foreign row resumes another project's session (`main.rs:1124` sets `SessionTarget::Resume(path)` with no cwd guard) — the user has no on-screen way to notice, and the one control the UI tells them to use is dead. The screen actively misreports its own contents, which is worse than either half alone. Secondary: every `--resume` pays a full cross-project scan synchronously before the terminal is even entered, with no progress feedback, where pi scans one directory and streams progress.
+
+**Fix** — Give `run_resume_picker` both listings instead of a merged one: change the signature to `run_resume_picker(theme, current: &[SessionInfo], all: &dyn Fn() -> Vec<SessionInfo>, current_id)`, keep `gather_session_infos`' local half for the initial rows and defer `list_global_sessions` to the toggle. Add `SessionAction::ToggleScope` to the session keymap (bound to Tab, matching `tui.input.tab`), handle it in `SessionSelector::handle` by calling `set_scope` + `set_rows` and flipping `show_path` to `scope == All` (pi's `showCwd`), and make the `"tab scope"` hint conditional on the toggle actually being armed. **Added 2026-08-13 from the live run:** `ctrl+p path (off)` exists today as a *manual* cwd-column toggle, whereas pi derives `showCwd` **strictly** from `scope === "all"` (`session-selector.ts:844`) — so `show_path` must be made to *follow the scope*, not merely be armable alongside it, and the header's `◉ Current Folder | ○ All` radio must be driven by the same state. Thread `SessionListProgress` into the initial load so the header can render pi's `loaded/total`. **Handoff:** the `SessionSelector` half is area 07's file; the loader/plumbing half is this area's. Land them together — either half alone leaves the screen lying.
+
+**Verify** — `cargo test -p cyrup-tui session_selector` for the scope/`show_path` unit assertions, then a **live run**: create sessions in two project dirs, `cd` into the first, run `cyrup --resume` in a real terminal, confirm only the first project's sessions appear under "Resume Session (Current Folder)", press Tab and confirm the header flips to "Resume Session (All)", the other project's sessions appear, and the cwd column turns on. TestBackend alone does not close this.
+
+## SEAM-062 — The pre-launch `--resume` picker offers rename, shows the new name on screen, and silently discards it
+
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 on a real pty, exactly as filed.** The picker advertises `ctrl+r rename`,
+> enters rename mode with its own hint row ("enter to save · escape/ctrl+c to cancel"), accepts the
+> typed text, and on Enter repaints the row's label as `NEWNAME` — complete positive feedback. The
+> session JSONL is untouched (`grep -c NEWNAME` = 0, no `session_info` line appended) and a relaunch
+> of the same picker shows the original label. Upstream re-read at v0.84.1: `cli/session-picker.ts:48`
+> constructs the component with `{ showRenameHint: false, keybindings }` and passes no
+> `renameSession` callback, so pi's pre-launch picker cannot enter rename mode at all. Nothing in the
+> item needed correcting.
+
+**cyrup** — `cyrup/crates/cyrup-tui/src/session_selector.rs:214` — `show_rename_hint: true` is the constructor default (verified verbatim, with an in-tree comment citing pi's `showRenameHint ?? canRename`), and `cyrup/crates/cyrup/src/startup_ui.rs:126-127` never calls `set_show_rename_hint(false)`, so the pre-launch picker prints the `rename` hint (`session_selector.rs:689-692`). `SessionAction::Rename` is ungated (`:833-837`) and enters rename mode for the selected row. On Enter the row is mutated in place — `row.name = Some(name)`, `row.label = name` (`:798-801`) — and a `SelectorOutcome::Apply(rename_payload)` is returned (`:802`). `run_resume_picker`'s `on_apply` closure (`startup_ui.rs:129-138`) matches **only** `SessionSelectorOutcome::Delete`; the rename payload falls through and is dropped, which the doc comment at `:131-133` states outright ("Rename is deferred to the in-app `/resume` (no header-rewrite seam pre-launch)"). Nothing is written to the JSONL.
+
+**upstream** — `pi/packages/coding-agent/src/cli/session-picker.ts:48` @v0.83.0 (byte-identical at v0.84.1), read in full this pass — `selectSession` constructs `SessionSelectorComponent` with `{ showRenameHint: false, keybindings }` and **no** `renameSession` callback. In the component, `this.canRename = !!renameSession` (`modes/interactive/components/session-selector.ts:771`) is therefore false, `setShowRenameHint` hides the hint (`:772`), and the handler bails before entering rename mode (`:807-808`). pi's pre-launch picker cannot enter rename mode at all.
+
+**Impact** — A user renaming a session from `cyrup --resume` gets complete positive feedback — the hint invites it, the input accepts it, the row's label changes to what they typed — and the rename is never persisted. Relaunch and the name is gone. Same class as the already-filed TUI-027 (typed text accepted and thrown away), on a surface nobody had read. It also sits beside SEAM-063, where the *destructive* sibling operation on the same screen does work, so the picker's one reversible action is the broken one.
+
+**Fix** — Stop-the-bleeding is two lines: call `selector.set_show_rename_hint(false)` in `run_resume_picker` and gate `SessionAction::Rename` on a new `SessionSelector::set_rename_enabled(bool)` (default true for the in-app `/resume`, false pre-launch), matching pi's `canRename`. Preferred full fix: handle `SessionSelectorOutcome::Rename` in `run_resume_picker`'s `on_apply` by opening the target with `cyrup_session::SessionManager::open(path)` and appending the `session_info` name — the exact sequence `cyrup-session-svc/src/session.rs:3355-3365 rename_session_file` already performs — so the pre-launch rename works like pi's in-app one. Either is acceptable; leaving the current shape is not.
+
+**Verify** — Live run in a real terminal: `cyrup --resume`, press the rename key on a row, type a name, Enter, quit with Esc, then `cyrup --resume` again — either the hint and the mode must be absent (parity fix) or the name must survive the relaunch (full fix). A unit test asserting `handle` returns `Ignored` for the rename chord when rename is disabled pins the first half.
+
+## SEAM-006 — print/json bind_extensions passes no onError sink and no mode label
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
+
+> **Reopened this pass.** The `4935cc8` closure covered the host half only. The refuter re-read both
+> sides and confirmed the residual, and re-rated the item from `high` to `medium`: control ops now
+> work under print/json, so what remains is the error sink and the mode label, not the whole host.
+
+**cyrup** — Closed half, verified at HEAD: `cyrup/crates/cyrup-modes/src/print.rs:58-68` and `json.rs:47-51` take `runtime: &AgentSessionRuntime`, and the send loops re-read `runtime.session().await` per message (`print.rs:86`, `json.rs:73`); the bin arm builds `AgentSessionRuntime::create_unannounced` at `cyrup/crates/cyrup/src/main.rs:761` and passes the runtime through at `:791-794` → `run.rs:22-26`, `:50-54`. **Residual**: `AgentSession::bind_extensions()` (`cyrup/crates/cyrup-session-svc/src/session.rs:2516`) takes no arguments — there is no place to hand it a mode label or an error callback — and `add_error_listener` has only two call sites workspace-wide, both RPC (`cyrup/crates/cyrup-modes/src/rpc.rs:670` and inside `rebind_session` at `:516`).
+
+**upstream** — `rebindSession` passes THREE keys to `bindExtensions`: `mode: mode === "json" ? "json" : "print"`, `commandContextActions`, and `onError` (which does `console.error("Extension error (path): err")`). **Offsets differ between tags and the ported baseline governs**, so both are given, each read at its own tag rather than shifted: **v0.83.0** `pi/packages/coding-agent/src/modes/print-mode.ts:71-101` — `rebindSession` at `:71`, `bindExtensions` `:73-101`, `mode` `:74`, `commandContextActions` `:75-97`, `onError` `:98-100`. **v0.84.1** `:74-119` — `mode` `:77`, `commandContextActions` `:78-100`, `onError` `:101-103`. The code is the same; only the line numbers moved.
+
+**Impact** — An extension that faults under `cyrup -p` or `cyrup --mode json` is contained and NEVER surfaced: nothing is written to stderr and nothing reaches the json event stream, so a broken extension looks like a silently degraded run. Separately, the extension context's mode label is unset, so an extension that branches on `ctx.mode` (to suppress interactive UI, for example) cannot tell print from json from interactive. `main.rs:678-794` is what a spawned subagent child re-execs into, so subagent runs inherit both.
+
+**Fix** — Give `bind_extensions` the parameters pi's `bindExtensions` takes: add a `BindOptions { mode: &str, on_error: Option<ErrorListener> }`-shaped argument at `session.rs:2516`, thread the mode label into the extension context alongside the existing `commandContextActions` equivalent (`RuntimeActions`, already installed at `runtime.rs:428-430`), and have `run_print`/`run_json` install an error listener that writes pi's `Extension error (path): err` line to stderr before calling it. Keep the no-argument form as a thin default so the RPC and interactive call sites need no change.
+
+**Verify** — A native extension whose `session_start` handler panics/returns `Err` under `cyrup --mode print`: assert the `Extension error (…)` line reaches stderr. A second extension that reports `ctx.mode`: assert it observes `"print"` under `-p` and `"json"` under `--mode json`.
+
+## SEAM-008 — Signal identity and 143/129 are computed but used only on the second delivery
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
+
+> **Corrected this pass.** The auditor raised this to `high`. The refuter kept it at `medium`
+> because the "an RPC host that never returns" consequence is SEAM-047's and double-booking it
+> distorts the plan. SEAM-008's remaining scope is the signal-identity/exit-code bookkeeping;
+> SEAM-047 owns the teardown-and-exit path that consumes it.
+
+**cyrup** — Closed half: `cyrup/crates/cyrup/src/signals.rs:39-69` `wait_for_signal` now selects on `tokio::signal::ctrl_c()`, `SignalKind::terminate()` and `SignalKind::hangup()`, and `ShutdownSignal::exit_code` (`:26-32`) returns 130/143/129. **Residual**: those codes are consumed only by the repeat-delivery arm at `signals.rs:98-99`. The first delivery (`:94-95`) is `session.abort(); cancel.cancel();` and discards the identity entirely — nothing downstream can tell SIGINT from SIGTERM from SIGHUP, and the process exit code still comes from the transcript-derived `exit_code` at `cyrup/crates/cyrup/src/run.rs:133-148` (0/1/130 only).
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:366-380` and `print-mode.ts:50-68` (v0.84.1) both compute `signal === "SIGHUP" ? 129 : 143` on the FIRST delivery and hand it to the teardown path, which exits with it.
+
+**Impact** — A SIGTERM'd or hung-up cyrup reports the transcript's 0/1/130 rather than 143/129, so supervisors and CI cannot distinguish a killed run from a clean one on the first signal — only on a second one, which most supervisors never send before SIGKILL.
+
+**Fix** — Publish the `ShutdownSignal` from the first delivery: change `spawn_abort_on_signal` (`signals.rs:88-101`) to send it on a `watch`/`oneshot` before `cancel.cancel()`, and have the dispatchers in `run.rs:22`/`:50`/`:101` prefer that code over the transcript-derived one. This is the data half of SEAM-047's plumbing; land them together.
+
+**Verify** — Unit test that `wait_for_signal` reports the right `ShutdownSignal` variant per signal (already partly covered at `signals.rs:111-116`), plus SEAM-047's end-to-end exit-code assertions.
+
+## SEAM-011 — setWidget goes on the RPC wire with a cyrup-invented {widget} blob
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup-modes/src/rpc.rs:423-428` emits `{"type":"extension_ui_request","id":…,"method":"setWidget","widget": widget}`. Root cause is the WIT, unchanged in BOTH copies: `cyrup/crates/cyrup-ext/wit/world.wit:326` and `cyrup/crates/cyrup-ext-sdk/wit/world.wit:326` are `set-widget: func(widget-json: string);`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-types.ts:264-271` pins `method:"setWidget"; widgetKey: string; widgetLines: string[] | undefined; widgetPlacement?: "aboveEditor"|"belowEditor"`. The whole `RpcExtensionUIRequest` union (`:238-273`) was re-read this pass: no member carries a `widget` key.
+
+**Impact** — An RPC client written to pi's contract cannot render extension widgets at all: no `widgetKey` to key on, no `widgetLines` to draw, no placement. This remains the LAST divergent member of the union — `notify`, `setStatus` (with the omit-when-`None` `statusText` at `rpc.rs:404-416`), `setTitle` and `set_editor_text` all match field-for-field, and the three TUI-only effects correctly return `None`.
+
+**Fix** — Widen `set-widget` in both WIT copies to `func(key: string, lines: option<list<string>>, placement: option<string>)`, thread the three fields through `cyrup-ext`'s effect type, and emit pi's field names at `rpc.rs:423-428`. This is a guest ABI break, same class as `f777e44`'s.
+
+**Verify** — Invert `cyrup/crates/cyrup-modes/tests/modes.rs:1014-1019` (SEAM-028) to assert `widgetKey`/`widgetLines`/`widgetPlacement` and that no `widget` key is present.
+
+## SEAM-012 — session_before_switch carries no reason, session_before_fork no position
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup-ext/src/event.rs:332-333` declares `SessionBeforeSwitch { target_id: String }` / `SessionBeforeFork { entry_id: String }`; both WIT copies match at `wit/world.wit:240-241`. Emit sites are still lossy: `cyrup/crates/cyrup-session-svc/src/runtime.rs:461` passes `SessionBeforeSwitch { target_id: String::new() }` on the `new_session` path (empty sentinel, no reason), and `runtime.rs:525` passes only `entry_id` while the `position` parameter (`runtime.rs:521`) never reaches the event.
+
+**upstream** — `pi/packages/coding-agent/src/core/agent-session-runtime.ts:133-148` (`reason: "new"|"resume"`, `targetSessionFile`) and `:150-161` (`entryId` plus the spread options, i.e. `position`); type declarations at `core/extensions/types.ts:577-589`.
+
+**Impact** — A gate extension cannot distinguish "new session" from "resume" (both arrive with an empty target) and cannot tell a fork *before* an entry from a fork *at* it, so a policy permitting one and denying the other is unwritable.
+
+**Fix** — Widen both hooks in both WIT copies and in `event.rs:332-333`, populate `reason`/`target_session_file` at `runtime.rs:461` and `position` at `runtime.rs:525`. Batch with SEAM-025 — all four session hooks are one WIT bump.
+
+**Verify** — Recording native extension asserting `reason == "new"` on `--new`, `"resume"` on resume, and `position` matching the requested `ForkPosition`.
+
+## SEAM-014 — RPC verb get_available_thinking_levels not implemented
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — The `SessionCommand` enum (`cyrup/crates/cyrup-modes/src/rpc.rs:84-212`) holds 31 real verbs plus `#[serde(other)] Unknown` (`:210-211`); the whole `handle` switch (`rpc.rs:1020-1381`) was read this pass and has no `GetAvailableThinkingLevels` arm. `grep -rn available_thinking_levels crates/cyrup-modes` returns nothing. The backing method is live and unused by RPC: `cyrup/crates/cyrup-session-svc/src/session.rs:3076`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-types.ts:39` declares the command; handler at `modes/rpc/rpc-mode.ts:507-510`; response shape `{levels}` at `rpc-types.ts:158-164`.
+
+**Impact** — A client cannot enumerate which thinking levels the active model supports, so it must hard-code the list or offer levels the model will reject.
+
+**Fix** — Add the variant to `rpc.rs:84-212` and a handler returning `{"levels": session.available_thinking_levels()}`.
+
+**Verify** — Extend `modes.rs`'s command-surface test to assert the verb succeeds and `data.levels` is a non-empty array; re-run the verb-set diff against `rpc-types.ts:20-72` and expect it empty but for `unknown`.
+
+## SEAM-015 — RPC bash ignores the operations backend override
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup-modes/src/rpc.rs:1228-1234` calls `session.execute_bash_with_user_event(&command, BashOptions { exclude_from_context, id: bash_id }, None)`. The third argument is still a literal `None` at `:1232`, and the omission is recorded only in the source comment at `:1226-1227`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:558-578`: `emitUserBash` at `:559-564`, short-circuit on `eventResult?.result` at `:566-571`, else `session.executeBash(..., { excludeFromContext, id, operations: eventResult?.operations })` with `operations` at `:576`.
+
+**Impact** — An extension cannot supply a remote-exec or sandbox backend for a single RPC bash call, so sandboxing extensions are inert on the RPC path while working elsewhere.
+
+**Fix** — Add an optional per-call backend to `BashOptions` (an `Option<Arc<dyn BashOps>>`-shaped seam), populate it from the `user_bash` event result inside `execute_bash_with_user_event`, and pass it through at `rpc.rs:1232`. This is the seam `289c089`'s commit message deferred.
+
+**Verify** — Native extension returning `operations` from `user_bash`; assert the RPC bash result came from the injected backend, not the local shell.
+
+## SEAM-016 — print-mode exit code derived by reverse-scanning the transcript
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup/src/run.rs:133-148` — `exit_code` iterates `session.messages().await.iter().rev()` (`:135`) and returns on the FIRST `Message::Assistant`, while `cyrup/crates/cyrup-modes/src/print.rs:102-103` reads `transcript.last()` once. The two therefore disagree whenever the final message is not an assistant, which is reachable because `flush_pending_bash_messages` appends `Custom` bash messages after the assistant. Two mapping divergences in the same function: `StopReason::Aborted => 130` (`run.rs:139`) where pi uses 1, and — added this pass by the refuter — `StopReason::Pending => 1` (`run.rs:138`) where pi leaves the initialised `exitCode = 0`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/print-mode.ts:140-155` (v0.84.1) reads `state.messages[state.messages.length - 1]` ONCE (`:141`) for both output and exit code; `exitCode = 1` at `:147` covers error AND aborted; the `else` branch leaves the `exitCode = 0` initialised at `:35`.
+
+**Impact** — `cyrup --mode print` can exit non-zero while printing nothing, or exit zero on a run whose visible output came from a stale assistant message. Scripts keying on the exit code misclassify runs that end with a bash message, and an aborted or still-pending run reports a code pi never emits.
+
+**Fix** — Compute the last message once in `run.rs:133-148` (or have `print.rs` return the decision), matching `print-mode.ts:140-155`, and align the three `StopReason` arms with pi: error and aborted → 1, everything else → 0. The `Aborted ⇒ 130` mapping cites arch-11 §6.6 at `run.rs:132`; that spec is not in this workspace, so raise it before changing rather than assuming.
+
+**Verify** — `grep -rn exit_code crates/cyrup/tests/*.rs` returns nothing today; add a case whose last message is a `Custom` bash message and assert exit 0 with no output, plus cases pinning aborted → 1 and pending → 0.
+
+## SEAM-025 — Extension session_start/session_shutdown drop pi's session-file fields
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — Progress: the FACADE event now carries the field — `cyrup/crates/cyrup-session-svc/src/session.rs:2525` `emit_session_start(&self, reason, previous_session_file)` builds `AgentSessionEvent::SessionStart { reason, previous_session_file }` at `:2530-2534`, and every replacement path supplies it (`runtime.rs:446`). **Residual**: the EXTENSION event drops it — `session.rs:2537-2540` dispatches `HostEvent::SessionStart { reason: reason.to_string() }` only; `cyrup/crates/cyrup-ext/src/event.rs:307-308` is still `SessionStart { reason: String }` / `SessionShutdown { reason: String }`; both WIT copies are still `on-session-start: func(reason: string)` / `on-session-shutdown: func(reason: string)` at `wit/world.wit:234-235`; and `dispose`/`dispose_with` (`session.rs:2380`, `:2405`) still take no target parameter.
+
+**upstream** — `pi/packages/coding-agent/src/core/extensions/types.ts:562-568` (`previousSessionFile?`) and `:616-621` (`targetSessionFile?`), populated at `agent-session-runtime.ts:171-174`, `:305`, `:328`, `:347`.
+
+**Impact** — An extension observing a session replacement cannot tell WHICH session it came from or is going to, so transcript-linking, audit trails and intercom identity handoff across a switch/fork are impossible — even though the host now has the value in hand.
+
+**Fix** — Widen both hooks in both WIT copies and `event.rs:307-308`, pass `previous_session_file` through the dispatch at `session.rs:2537-2540`, and add a target parameter to `dispose`/`dispose_with` (`session.rs:2380`, `:2405`) populated from the replacement caller. Batch with SEAM-012.
+
+**Verify** — Recording extension asserting `previousSessionFile` on a switch-induced `session_start` and `targetSessionFile` on the paired `session_shutdown`.
+
+## SEAM-027 — --mode json subscribes per-run, dropping between-prompt events
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup-modes/src/json.rs:70-83` — the loop does `let session = runtime.session().await; let mut stream = session.prompt(input).await?;` per message and drains only that stream. `AgentSession::prompt` subscribes RUN-scoped (`cyrup/crates/cyrup-session-svc/src/subscriber.rs`, `subscribe_run`, cleared by `end_run`), so gaps between prompts are unobserved. The persistent `AgentSession::subscribe` is used only by `rpc.rs:644`. Partial progress: `run_json` now writes the header once (`json.rs:54-60`) and binds/announces once before the loop (`:67`), so the SEAM-006 host half is done — the event gap is not.
+
+**upstream** — `pi/packages/coding-agent/src/modes/print-mode.ts:106-118` (v0.84.1) installs ONE session-wide `session.subscribe(...)` inside `rebindSession()`, which runs at `:129` before the initial prompt at `:132` and is held across the message loop at `:135-137`; torn down only in `disposeRuntime()`.
+
+**Impact** — With `--follow-up`, any event emitted between runs (extension UI, `session_info_changed`, `model_changed`, background compaction progress) is silently dropped from the json stream, so a consumer sees an incomplete event log.
+
+**Fix** — Install one `session.subscribe()` before the first prompt in `json.rs:67` and drain the persistent stream, terminating each message on `agent_settled`. Must re-subscribe on session replacement, so model it on `rebind_session` (`rpc.rs:505-518`) rather than subscribing once and holding.
+
+**Verify** — A json-mode test with two `--follow-up` prompts and an extension emitting between them; assert the emitted event appears in the stream.
+
+## SEAM-033 — RPC and interactive session_start still precedes --name and --models
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — Closed for print/json: `cyrup/crates/cyrup-session-svc/src/runtime.rs:292-314` `create_unannounced` is pi's `createAgentSessionRuntime` verbatim (it never binds); the bin uses it at `cyrup/crates/cyrup/src/main.rs:761` with `apply_post_build` at `:776`, and the announcement lives in the mode entry points (`print.rs:78`, `json.rs:67`). **Still open for RPC and interactive**: `main.rs:652` and `main.rs:509` both call `AgentSessionRuntime::create`, whose body (`runtime.rs:259-266`) is `create_unannounced(...)` then `this.session().await.bind_extensions().await` — so `session_start` fires BEFORE `apply_post_build` at `main.rs:668` (rpc) and `:519` (interactive), which is where `--name` and `--models` are applied (`apply_post_build`, `main.rs:816-862`).
+
+**upstream** — `pi/packages/coding-agent/src/main.ts:650` (`appendSessionInfo(name)`) and `:742-750` (`scopedModels`) both precede `createAgentSessionRuntime` at `:793-798`, and pi's `createAgentSessionRuntime` (`agent-session-runtime.ts:414-432`) never emits `session_start` — the HOST does, from `rpc-mode.ts:319` / `print-mode.ts:76` / `interactive-mode.ts`.
+
+**Impact** — Under `--mode rpc` or interactive, an extension's `session_start` handler observes a session with no display name (`get-session-name` returns `none`) and, when `--models` scoping applies to a fresh session, the pre-scope model and thinking level. An audit or intercom extension registering under the session name registers the empty name; a gate keying policy on the active model keys on the wrong one. The follow-on `session_info_changed`/`model_changed` events go to a fanout the RPC loop has not yet joined, so nothing on the wire corrects it.
+
+**Fix** — Have the RPC and interactive arms take the same path print/json already does: call `create_unannounced` at `main.rs:652` and `:509`, run `apply_post_build` in the resulting window, and let the host announce afterwards via the idempotent `session.bind_extensions()` (latched at `session.rs:2526`). Delete `AgentSessionRuntime::create`'s announcing tail (`runtime.rs:259-266`) once no caller wants it, so the two shapes cannot drift apart again.
+
+**Verify** — A recording native extension whose `SessionStart` handler captures `session_name()` and the active `ModelRef`; drive `cyrup --mode rpc --name X --models <pattern>` and assert the handler saw `X` and the scoped model. Today it sees `None` and the unscoped model.
+
+## SEAM-048 — RPC get_commands enumerates the last-wins command HashMap; pi's name:N disambiguation tier is dead code
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+> **Corrected this pass.** The auditor filed this as "the catalog and the dispatcher use two
+> different functions". The refuter checked and the mechanism is worse and simpler: `grep -rn
+> resolved_command_owner crates/` returns ONLY its definition and three assertions in
+> `crates/cyrup-ext/tests/aggregation.rs:236-238` — no production caller. Live dispatch uses the bare
+> last-wins `command_owner` (`facade.rs:328`, `facade.rs:1220`, `session.rs:1036`, `session.rs:1274`).
+> So a `name:2` spelling would not be accepted by the dispatcher either; pi's whole disambiguation
+> tier (`registry.rs:462-512`) is dead code outside tests. The fix must wire it into both sides.
+
+**cyrup** — `cyrup/crates/cyrup-modes/src/rpc.rs:1369-1373` (`GetCommands` → `session.slash_command_catalog()`) → `cyrup/crates/cyrup-session-svc/src/session.rs:2275-2295`, whose extension section iterates `self.services.ext_host.registry().command_descriptions()`. That method (`cyrup/crates/cyrup-ext/src/registry.rs:662-669`) reads `RegistryInner::commands`, a `HashMap<String,(ExtensionId,CommandDescriptor)>` (`registry.rs:139`) that `register_command` populates with `g.commands.insert(name.clone(), …)` (`:452`) — LAST WINS, and iteration order is nondeterministic. The faithful port of pi's disambiguation exists three functions above and has no production caller: `resolved_commands()` (`registry.rs:462-500`) walks the duplicate-preserving `command_order` vec (`:141-142`, pushed at `:453`) and assigns `name:1`/`name:2` with the `takenInvocationNames` bump loop. `command_names()` (`registry.rs:655-658`) carries the identical defect.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:680-687` builds each `RpcSlashCommand` from `command.invocationName`, sourced from `getRegisteredCommands()` → `resolveRegisteredCommands()` (`core/extensions/runner.ts:598-641`), which counts duplicates, assigns `${command.name}:${occurrence}` when `count > 1`, bumps on collision, and returns commands in EXTENSION LOAD ORDER (`for (const ext of this.extensions) for (const command of ext.commands.values())`, `runner.ts:602-607`). `getCommand(name)` matches on `invocationName` (`runner.ts:648`).
+
+**Impact** — When two loaded extensions register the same command name, the second one's command is unreachable and invisible: the RPC client is told the command exists once under its bare name, invoking it reaches whichever extension registered last, and no `name:2` spelling is either advertised or accepted. Independently, the `get_commands` list order shuffles between runs, so a client rendering a command palette shows a different order each launch and payload diffs are noise. `command_descriptions()` also backs the TUI command list, so the defect is not RPC-only.
+
+**Fix** — Make `resolved_commands()` the single source of truth on both sides. Change `command_descriptions()` (`registry.rs:662-669`) and `command_names()` (`:655-658`) to delegate to it and return `(invocation_name, descriptor)` in `command_order` order, and switch the four dispatch sites (`facade.rs:328`, `facade.rs:1220`, `session.rs:1036`, `session.rs:1274`) from `command_owner` to `resolved_command_owner` so the advertised name is the accepted name.
+
+**Verify** — Register two native extensions that each declare a command named `check`; drive `{"type":"get_commands"}` and assert the response contains BOTH `check:1` and `check:2` in load order, and that `{"type":"prompt","message":"/check:2"}` reaches the second extension. Add a determinism assertion that two consecutive `get_commands` calls return identical arrays.
+
+## SEAM-049 — Forking before the first message drops pi's parentSession link on both persistence paths
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup-session-svc/src/runtime.rs:581` — the no-anchor arm of `fork` is `(None, _) => self.factory.build(SessionTarget::New, None).await?.into_shared()`. `SessionFactory::build` (`cyrup/crates/cyrup-session-svc/src/factory.rs:99-105`) is defined as `self.build_with_parent(target, cwd, None)`, and `build_with_parent` (`factory.rs:110-118`) is the ONLY path that sets `cfg.parent_session` (`:118`). The runtime already holds the outgoing file — it bound it into `previous` at `runtime.rs:529` for the `session_start` event at `:584` — and it already uses `build_with_parent` correctly on the `new_session` path (`runtime.rs:466-470`). The fork path has the value in hand and discards it.
+
+**upstream** — `pi/packages/coding-agent/src/core/agent-session-runtime.ts:296-299` — the persisted no-leaf branch is `const sessionManager = SessionManager.create(this.cwd, sessionDir); sessionManager.newSession({ parentSession: currentSessionFile });`. The in-memory no-leaf branch does the same at `:336-337`. Both record the parent before `teardownCurrent`.
+
+**Impact** — `/fork` (or the RPC `fork` verb, or `clone`) anchored before the first message produces a session whose header has no `parentSession`, so the session tree loses the edge back to the session it was forked from. Anything walking parentage — session listing/ancestry, `--fork` resumption chains, transcript-linking in audit extensions — sees an orphan where pi shows a child. Silent: the fork succeeds and reports `cancelled:false`.
+
+**Fix** — In `runtime.rs:581` replace `self.factory.build(SessionTarget::New, None)` with `self.factory.build_with_parent(SessionTarget::New, None, previous.clone())`, using the `previous` already bound at `runtime.rs:529`. `build_with_parent` is `pub(crate)` and `runtime.rs` is in the same crate, so no visibility change is needed.
+
+**Verify** — Runtime test: create a persisted session, prompt once, fork at the FIRST user entry (whose parent is `None`, so `fork_anchor` returns `(None, _)`), then read the new session file's header and assert `parentSession` equals the original session file path. Repeat with an in-memory session.
+
+## SEAM-050 — cyrup auth check is unrecognized, and the whole v0.84.1 auth-command surface is unported
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup/src/credential_print.rs:148-158` — the verb table is exactly `Some("print-api-key") => ApiKey`, `Some("print-bearer-token") => BearerToken`, and anything else raises `Unknown auth command "{}". Use "cyrup auth print-api-key" or "cyrup auth print-bearer-token".`, with `dispatch` returning `Some(1)` at `:439-442`. So `cyrup auth check --provider openai` prints that error and exits 1. The help text at `:105-112` advertises only the two print verbs and requires `--model`.
+
+**upstream** — `pi/packages/coding-agent/src/cli/auth-command.ts` is a NEW file at v0.84.1 (`git ls-tree v0.83.0 -- packages/coding-agent/src/cli/` lists neither it nor `auth-check.ts`): `AuthCommandKind = "check" | "api_key" | "bearer_token"` (`:4`), per-kind usage strings (`:17-21`), `--json`/`--credentials`/`--no-refresh` accepted only by `check` (`:82-88`), `Unknown option --X for "auth print-api-key".` (`:100-103`), and `Credential printing requires --provider <provider> or --model <model>` (`:113-115`) — reached for the PRINT kinds too, since v0.84.1 `credential-print.ts:24` calls `validateAuthCommandArgs(args, kind)`. v0.83.0 `credential-print.ts:67-68` required `--model`. New file `cli/auth-check.ts` supplies `checkProviderAuth`/`getProviderCredential`/`createAuthCheckModelRuntime`. Driver rewritten at `main.ts:139-215` (`runAuthCommand`) and moved EARLIER in `main` (`main.ts:578`, ahead of the package/config blocks, where v0.83.0 had it at `:557` after them); exit codes `ready ? 0 : not_ready ? 1 : 2` at `main.ts:208`.
+
+**Impact** — An external tool following the current pi contract (`pi auth check --provider anthropic --json`, branching on exit 0/1/2) gets `Error: Unknown auth command "check"` and exit 1 from cyrup — indistinguishable from `not_ready`. `cyrup auth print-api-key --provider openai` (no `--model`) is rejected where pi v0.84.1 accepts it. An unknown option passed to an auth subcommand produces cyrup's generic handling rather than pi's `Unknown option --X for "auth print-api-key".` plus the usage hint.
+
+**Fix** — Port `cli/auth-command.ts` and `cli/auth-check.ts` into `credential_print.rs` (or a sibling `auth_command.rs`): add a `Check` kind to `CredentialPrintKind` (`credential_print.rs:41-46`), the three check-only flags, provider-or-model validation replacing the `--model`-required check, the `Unknown option --X for "<name>"` rejection, and the 0/1/2 exit mapping in `dispatch` (`:431-443`). Relax the `--model` requirement for the two print verbs at the same time. Cross-references PARITY-GAPS VL-P14.
+
+**Verify** — `cyrup auth check --provider <configured>` prints `ready` and exits 0; with no credential prints `not_ready` and exits 1; with a corrupt store exits 2. `--json` emits the object shape; `--credentials` adds the `credentials` key. `cyrup auth print-api-key --provider openai` (no `--model`) resolves. `cyrup auth check --bogus` prints `Unknown option --bogus for "auth check".`
+
+## SEAM-051 — --tui-mode <regular|fullscreen> is rejected with exit 1 instead of parsed, so the flag's DEFAULT value refuses to launch the binary
+
+**Kind** upstream-drift · **Severity** **high** *(raised from medium in the repair pass)* · **Effort** S · **Confidence** confirmed — every link re-read at HEAD · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 in the shipped binary.** `cyrup --offline --no-session --no-extensions
+> --tui-mode regular -p hi` prints `Error: Unknown option: --tui-mode` and exits 1; the control run
+> without the flag reaches the provider. Reproduced with the value present, absent, bogus and in `=`
+> form, with extensions enabled and disabled, and in print / `--mode json` / `--mode rpc`. `--help`
+> exits 0 and the flag is absent from the shipped help text.
+>
+> **Two mechanism details in the paragraphs below were corrected against that measurement.** (1) The
+> emitted text is `Unknown option:` — **singular**; the plural `Unknown option(s):` form is used only
+> when more than one flag is unmatched (`crates/cyrup-ext/tests/extension_flag_diagnostics.rs:42,99`).
+> (2) The failure does **not** require the extension subsystem: the reconciliation diagnostic runs
+> identically under `--no-extensions`, so do not read the extension-flag partitioning paragraph as a
+> reachability qualifier. The verdict is unchanged.
+
+> Supersedes **SEAM-019**, whose upstream premise (`--ui-mode` / `--alt`) does not exist at any pi
+> tag. Work this item; do not work SEAM-019 as written.
+>
+> **Why high.** This is not a missing feature, it is a launch failure: `cyrup --tui-mode regular` —
+> the flag's own default, the value that asks for the renderer cyrup already has — exits 1 before any
+> session is built, with a message claiming the option is unknown. Anyone carrying a pi v0.84.1
+> command line, a wrapper script, a shell alias or a CI invocation cannot start cyrup at all until
+> they find and delete a flag that upstream documents as valid. Rated `high` rather than `critical`
+> because the failure is deterministic, immediate, printed, and one token from working — it destroys
+> nothing and hides nothing. It was previously ranked below 188 mediums at effort S.
+
+**cyrup** — `grep -rn 'tui_mode\|tui-mode' crates/` returns zero hits outside `cyrup-tui` doc comments. The flag is therefore absent from `KNOWN_LONG_FLAGS` (`cyrup/crates/cyrup/src/cli.rs:757-799`), so `partition_extension_flags` (`cli.rs:701-753`) captures `--tui-mode fullscreen` as an extension flag at `:731-738` (the value does not start with `-`/`@`); nothing registers it, so `apply_extension_flag_values` (`cyrup/crates/cyrup-session-svc/src/builder.rs:946-967`) records `Unknown option: --tui-mode` (singular — the plural form is reserved for two or more unmatched flags; **corrected against the 2026-08-13 measurement**), `collect_diagnostics` (`runtime.rs:113-119`) rates it `error`, and `report_runtime_diagnostics` (`main.rs:1846-1862`) exits 1 in every mode. The reported message is also misleading: the flag is not unknown to pi, it is unported.
+
+**upstream** — `pi/packages/coding-agent/src/cli/args.ts:180-193` (v0.84.1; absent at v0.83.0) — a dedicated `--tui-mode` arm accepting `regular`/`fullscreen`, with `"--tui-mode requires regular or fullscreen"` when the value is missing or starts with `-` (`:186`) and `Invalid TUI mode "X". Valid values: regular, fullscreen` otherwise (`:189-191`); typed `tuiMode?: TuiMode` at `args.ts:49`, listed in the help at `:291`, threaded at `main.ts:935` into `InteractiveMode`, consumed at `modes/interactive/interactive-mode.ts:345` and `:530` with the settings fallback `settingsManager.getTuiMode()`.
+
+**Impact** — `cyrup --tui-mode regular` — the DEFAULT value, harmless even without an alt-screen renderer — aborts the run with exit 1 and a message claiming the option is unknown. A user or script carrying pi v0.84.1 flags cannot launch cyrup at all until the flag is removed.
+
+**Fix** — Add `--tui-mode` to `KNOWN_LONG_FLAGS` and `KNOWN_VALUE_LONG_FLAGS` (`cli.rs:757-799`, `:803+`), add a `TuiMode { Regular, Fullscreen }` value-enum field to `Cli`, and add pi's two error diagnostics to `apply_arg_leniency` (`diagnostics.rs:90-152`) so an invalid value is an ERROR-severity diagnostic rather than a swallowed extension flag. Add the help line to `render_help` (`cli.rs:828-930`). Accepting `regular` as a no-op and rejecting `fullscreen` with an explicit "not supported in this build" message is a legitimate interim; silently exiting 1 on `regular` is not. The rendering half is the alt-screen work (PARITY-GAPS VL-P19, area 07).
+
+**Verify** — `cyrup --tui-mode regular` starts normally; `cyrup --tui-mode bogus` prints `Invalid TUI mode "bogus". Valid values: regular, fullscreen` and exits 1; `cyrup --tui-mode` (no value) prints `--tui-mode requires regular or fullscreen`.
+
+## SEAM-059 — The signal watcher holds the startup session Arc, so after any replacement it aborts a disposed session
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+> Recovered by the refuter from surface the audit pass walked past.
+
+**cyrup** — `cyrup/crates/cyrup/src/signals.rs:88-101` — `spawn_abort_on_signal(session: Arc<AgentSession>, cancel: CancelToken)` moves that one `Arc` into a task that lives for the whole run and calls `session.abort()` on it (`:94`). Every call site binds the session ONCE, before the mode entry point: `main.rs:533` (interactive, from `runtime.session().await` at `:518`), `main.rs:670` (rpc, from `:667`) and `main.rs:781` (print/json, from `:775`). But `AgentSessionRuntime::install_inner` REPLACES the active session on every switch path — it disposes the outgoing one (`runtime.rs:420` `current.dispose_with(...)`) and installs a brand-new `Arc<AgentSession>` at `runtime.rs:433-438`. So after an RPC `new_session`/`switch_session`/`fork`/`clone` (`rpc.rs:1073-1303`), or an extension's `ctx.newSession()`/`ctx.fork()`/`ctx.reload()` in ANY mode, the watcher's `Arc` points at a session whose run is already settled and whose `session_cancel` is already fired. The RPC loop itself gets this right — it rebinds off `runtime.watch_generation()` (`rpc.rs:680`, `:778-785`, `rebind_session` at `:505-518`) — so the signal watcher is the one holder that never rebinds.
+
+**upstream** — pi never binds a session into its handlers. `pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:373-375` calls `shutdown(...)`, whose body dereferences `runtimeHost` (`await runtimeHost.dispose()` at `:734`); `print-mode.ts:57-61` calls `disposeRuntime()`, likewise `await runtimeHost.dispose()` (`:47`). `AgentSessionRuntime.dispose()` (`agent-session-runtime.ts:398-405`) always resolves `this.session`, i.e. the CURRENT one.
+
+**Impact** — Ctrl-C or SIGINT after any session replacement does not stop the run that is actually executing: the abort lands on a disposed session and the live turn continues to completion, burning tokens and emitting output the user asked to stop. Combined with SEAM-047 (no teardown on the first signal at all in rpc/print/json) the first signal is a complete no-op on those paths.
+
+**Fix** — Give `spawn_abort_on_signal` the `Arc<AgentSessionRuntime>` instead of the session and do `runtime.session().await.abort()` inside the handler, matching pi's always-current dereference. Update the three call sites (`main.rs:533`, `:670`, `:781`). Lands with SEAM-047, which rewrites the same function.
+
+**Verify** — Runtime test: build a runtime, install the watcher, replace the session via `new_session`, start a long turn on the replacement, deliver the signal and assert the REPLACEMENT session went to aborted/idle (today the disposed one is aborted and the live one keeps running).
+
+## SEAM-S03 — No detached-child registry: setsid-detached bash children survive teardown
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `grep -rn 'kill_tracked\|track_detached\|DETACHED_PIDS\|tracked_pids' crates/` returns ZERO hits at HEAD. Detached children ARE created: `cyrup/crates/cyrup-tools/src/ops/local.rs:272` calls `libc::setsid()` in a `pre_exec` (documented at `:19` as the `killpg` path) and `:334` is the per-call `libc::killpg`. Nothing registers those pids process-globally, and neither `cyrup/crates/cyrup/src/signals.rs` (117 lines, no pid handling) nor any teardown path drains such a registry.
+
+**upstream** — `pi/packages/coding-agent/src/utils/shell.ts:180-195` (v0.84.1) — a process-global `trackedDetachedChildPids: Set<number>` with `trackDetachedChildPid` / `untrackDetachedChildPid` / `killTrackedDetachedChildren()`. Registered at `core/tools/bash.ts:108` right after the detached spawn and untracked in the `finally`. Drained SYNCHRONOUSLY inside the signal handler, before any async teardown, in all three hosts: `rpc-mode.ts:374`, `print-mode.ts:58`, `interactive-mode.ts`.
+
+**Impact** — A `setsid`-detached bash child (a dev server, a watcher, a long build) outlives cyrup on every exit path except the per-run cancel race that happens to catch it. Killing cyrup leaves orphaned process groups holding ports and file locks; a CI job that stops cyrup does not stop what cyrup started.
+
+**Fix** — Add a process-global registry beside `cyrup-tools/src/ops/local.rs` (an `OnceLock<Mutex<HashSet<i32>>>`), register the pid right after the `pre_exec` spawn at `local.rs:272` and remove it in the same `finally`-equivalent that already runs `killpg` at `:334`; drain it synchronously from the first-signal path in `signals.rs:88-101` before any async teardown, and again from `dispose`. Lands with SEAM-047, which is where the synchronous drain point comes into existence.
+
+**Verify** — Spawn a `setsid` child from a bash tool call that outlives the turn, SIGTERM cyrup, and assert the child's process group is gone within the exit path rather than reparented to init.
+
+## SEAM-066 — Every pre-launch TUI surface hardwires the dark palette, ignoring `settings.theme`, custom theme packages, terminal detection, `showHardwareCursor` and `clearOnShrink`
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — Four pre-launch surfaces, one hardwired palette: `cyrup/crates/cyrup/src/main.rs:1044` (missing-session-cwd prompt), `main.rs:1089` (resume picker **and** trust prompt — one `let theme = UiTheme::default();` serves both) and `cyrup/crates/cyrup/src/subcommands.rs:624` (`cyrup config`), where `UiTheme::default()` is literally `UiTheme::dark()` (`cyrup/crates/cyrup-tui/src/theme.rs:144-148`). No settings read, no `COLORFGBG`, no OSC-11 probe, no registered custom themes. The machinery exists and is used 500 lines away on the in-app path: `main.rs:1589-1605` builds `ThemeController::boot_from_env(theme_setting)` from `settings.effective().theme_setting()` and then `sync_with_terminal(&StdinTerminalProbe, 100ms, &colorfgbg)` — exactly pi's two-phase resolution. The pre-launch surfaces simply do not call it.
+
+**upstream** — `pi/packages/coding-agent/src/cli/startup-ui.ts:77-85` @v0.83.0 — `createStartupTui` does four settings-derived things before mounting anything: `setRegisteredThemes(await loadStartupThemes(settingsManager))` (`:78`), `initTheme(resolveThemeSetting(settingsManager.getThemeSetting(), detectTerminalBackgroundFromEnv().theme) ?? terminalTheme)` (`:79-80`), `new TUI(new ProcessTerminal(), settingsManager.getShowHardwareCursor(), getAgentDir())` (`:82`) and `ui.setClearOnShrink(settingsManager.getClearOnShrink())` (`:83`). `startStartupTui` (`:87-90`) then fires `applyDetectedStartupTheme` (`:92-100`), which for an unset/`auto` setting queries the terminal with a 100 ms bound and re-themes live. `cli/config-selector.ts:22` does the same for `pi config`. At v0.84.1 only the class name changes (`TuiMainScreen`, `startup-ui.ts:82` / `config-selector.ts:25`) — that half is mechanism-N/A per ADR-0001, but the settings-derived **arguments** are not.
+
+**Impact** — A user with `"theme": "light"` in settings.json — or any custom theme from a package — gets a dark-palette resume picker, trust prompt, missing-cwd prompt and `cyrup config` screen, very likely on a light terminal, and then a correctly-themed app one keystroke later. `showHardwareCursor` and `clearOnShrink` are ignored on these surfaces too.
+
+**Fix** — Add `fn startup_theme(dirs: &ConfigDirs) -> UiTheme` to `crates/cyrup/src/startup_ui.rs`: load settings with `SettingsManager::load(file_settings_store(dirs), Settings::new(), false)` (pi's `projectTrusted: false` startup manager, `startup-ui.ts:65-67`), build `ThemeController::boot_from_env(settings.effective().theme_setting().as_deref())` and return `controller.theme()`. Call it at `main.rs:1044`, `main.rs:1089` and `subcommands.rs:624` in place of `UiTheme::default()`. Registered custom themes need `run_startup_selector` to accept the resolved theme set the way `loadStartupThemes` does — if the resource resolve is too heavy for the pre-launch path, file that half against this same item rather than silently dropping it.
+
+**Verify** — Set `"theme": "light"` in `<agent_dir>/settings.json` and **live-run** `cyrup --resume` and `cyrup config` in a real terminal: both must render the light palette, matching what `cyrup` itself renders after boot. A TestBackend unit test cannot show this.
+
+## SEAM-067 — Pre-launch selectors never load the user's `keybindings.json`, and their hint rows name the wrong keys
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup/src/startup_ui.rs:128`, `:259`, `:333` and `cyrup/crates/cyrup/src/subcommands.rs:625` all use `SelectKeymap::default()`, and `run_resume_picker` builds `SessionSelector::new(rows)` without `with_keymaps` (`startup_ui.rs:127`), so the session-specific chords (delete / sort / named-filter / path / rename) also fall back to defaults — the selector's own comment at `session_selector.rs:771-774` notes it "adopt[s] whatever `tui.select.*` table actually routed this key", which pre-launch is always the default table. The user's file is read exactly once, on the in-app path only: `main.rs:1624-1629` reads `<agent_dir>/keybindings.json` and calls `app.load_keybindings_json`, which fans out to `select_keymap`/`session_keymap`/`tree_keymap`/`models_keymap`/editor via `merge_json` (`cyrup-tui/src/app.rs:951-964`).
+
+**upstream** — `pi/packages/coding-agent/src/cli/startup-ui.ts:81` @v0.83.0 (identical at v0.84.1) — `createStartupTui` calls `setKeybindings(KeybindingsManager.create())`, installing the user's `<agentDir>/keybindings.json` globally for every startup selector. `cli/session-picker.ts:22-23` does it a second time and threads the same manager into the component (`{ showRenameHint: false, keybindings }`, `:48`), and the component resolves every chord through it — `kb.matches(keyData, "tui.select.confirm")`, `"tui.select.cancel"`, `"app.session.delete"`, `"app.session.rename"`, `"app.session.toggleSort"`, `"app.session.togglePath"` (`modes/interactive/components/session-selector.ts:532-582`).
+
+**Impact** — A user who rebound `tui.select.confirm`/`tui.select.cancel` or the `app.session.*` chords finds their bindings work inside cyrup but not in the `--resume` picker, the trust prompt, the missing-cwd prompt or `cyrup config` — and, worse, the on-screen hint rows print the **default** labels (`session_selector.rs:681-692` resolves labels from the same unmerged table), so the screen actively misreports which key does what. Compounded by SEAM-061, whose dead `tab scope` hint is on the same row.
+
+**Fix** — Hoist the load: add `fn startup_keymaps(dirs: &ConfigDirs) -> (SelectKeymap, SessionKeymap)` reading `<agent_dir>/keybindings.json` and applying `merge_json` to both (the same merge `app.rs:951-964` performs), logging and continuing on a malformed document. Use it at `startup_ui.rs:128`/`:259`/`:333` and `subcommands.rs:625`, and pass the session keymap through `SessionSelector::with_keymaps` in `run_resume_picker`. **Cross-area note:** area 05's repair pass owns pi's `migrateKeybindingsConfigFile`, which rewrites legacy ids in that same file — this loader must run *after* whatever alias table that item lands, or a legacy `keybindings.json` will still read as empty here.
+
+**Verify** — Write `{"tui.select.cancel": ["ctrl+q"]}` to `<agent_dir>/keybindings.json` and **live-run** `cyrup --resume`: ctrl+q must dismiss the picker and the hint row must name ctrl+q, not Esc.
+
+## SEAM-068 — `--list-models <search>` uses a lossy hand-rolled fuzzy filter while a faithful port of pi's `fuzzyFilter` sits unused in cyrup-tui
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup/src/main.rs:1364-1373` — `fn fuzzy_match(haystack, search)` splits the query with `search.split_whitespace()` and requires each token to be an ASCII-lowercased subsequence; no scoring, no swap fallback. It is called at `main.rs:1392-1395` over `format!("{} {}", m.provider, m.id)`. Meanwhile `cyrup/crates/cyrup-tui/src/fuzzy.rs:139-171` is a complete, documented port of pi's `fuzzyFilter` — `query.split(|c: char| c.is_whitespace() || c == '/')` at `:140`, the alphanumeric-swap retry at `:129-131`, Unicode `char::to_lowercase` at `:122-123`, the score-ascending stable sort at `:170` — and the `cyrup` bin already depends on `cyrup-tui`.
+
+**upstream** — `pi/packages/coding-agent/src/cli/list-models.ts:45` @v0.83.0 (`:49` at v0.84.1) — `filteredModels = fuzzyFilter(models, searchPattern, (m) => \`${m.provider} ${m.id}\`)`. `packages/tui/src/fuzzy.ts:104-107` (identical at both tags) splits the query on `/[\s/]+/` — whitespace **and slash** — and `:120-128` requires every token to match; `fuzzyMatch` at `:75-92` adds the alphanumeric-swap retry (`"o4"` retried as `"4o"` at a +5 penalty).
+
+**Impact** — `cyrup --list-models anthropic/sonnet` prints `No models matching "anthropic/sonnet"` while `pi --list-models anthropic/sonnet` lists the Anthropic Sonnet models, because cyrup treats the whole string as one token and the haystack `"anthropic claude-sonnet-4-5"` contains no `/`. `provider/model` is the form cyrup's own `--model` flag documents (`cli.rs:905`), so it is the first thing a user types. The swap retry is lost too (`--list-models o4` finds `gpt-4o` in pi, nothing in cyrup).
+
+**Fix** — Delete `main.rs:1362-1373` and call the existing port: `cyrup_tui::fuzzy::filter(&models, search, |m| key)` over the `"{provider} {id}"` key, keeping `main.rs:1405-1410`'s provider-then-id sort afterwards — pi re-sorts too (`list-models.ts:54-58`), so the score order is discarded on both sides and the behaviours coincide exactly. **Land with SEAM-020**, which changes the input set to the same function.
+
+**Verify** — `cargo test -p cyrup` asserting the filter over `["anthropic claude-sonnet-4-5", "openai gpt-4o"]` returns the Anthropic row for `"anthropic/sonnet"` and the OpenAI row for `"o4"`. Then `cyrup --list-models anthropic/sonnet` must print rows.
+
+## SEAM-017 — No RpcClient counterpart
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** high
+
+**cyrup** — `grep -rni 'rpcclient\|rpc_client' crates/` returns ZERO hits workspace-wide at HEAD. `cyrup/crates/cyrup-modes/src/` contains `error.rs`, `json.rs`, `json_event.rs`, `lib.rs`, `print.rs`, `rpc.rs` — no client module.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-client.ts` exports `RpcClient`, re-exported from `modes/index.ts:7`; at v0.84.1 its listener type became `JsonAgentSessionEvent` (`rpc-client.ts:50`).
+
+**Impact** — Embedders and cyrup's own tests must hand-roll NDJSON framing and request correlation (`cyrup/crates/cyrup-modes/tests/modes.rs`, `read_json_line`), which is exactly how wire-shape divergences like SEAM-011 and SEAM-053 go unnoticed.
+
+**Fix** — Add `cyrup-modes/src/rpc_client.rs` porting `rpc-client.ts`: spawn/attach, id-correlated request/response, event stream typed on the `json_event.rs` projection. Retrofit `modes.rs` onto it.
+
+**Verify** — `modes.rs` tests drive the client instead of raw lines and still pass.
+
+## SEAM-020 — `--list-models` prints the entire compiled catalog instead of the auth-configured one, and `--help` omits extension flags
+
+**Kind** parity-bug · **Severity** **medium** *(raised from low in the repair pass)* · **Effort** M · **Confidence** high
+
+> **Rewritten in the repair pass.** The item was filed as an *ordering* observation ("both handlers
+> run before the session exists") and rated low on that framing. The `cli/` sweep found the concrete
+> defect the ordering was hiding, and it is not about ordering at all: `--list-models` calls the wrong
+> function. The `--help` half is unchanged and is the smaller of the two.
+
+**cyrup** — Two halves.
+- **The list is unfiltered.** `cyrup/crates/cyrup/src/main.rs:283-284` — `return list_models(&cyrup::provider::all_available_models(&models_json), search);`. Despite the name, `all_available_models` applies **no auth filter**: `cyrup/crates/cyrup/src/provider.rs:237-240` is `composed_registry(...).0.get_models(None)`, i.e. pi's `getModels()`, not `getAvailable()`. The empty-list branch that would print pi's guidance (`main.rs:1380-1384` → `format_no_models_available_message()`) is therefore unreachable in practice. cyrup already has the predicate one function down: `default_launch_model` takes `has_configured_auth: &dyn Fn(&Model) -> bool` and its doc comment at `provider.rs:255-256` explicitly cites "Pi step 4, `getAvailable()` filtered to `hasConfiguredAuth`".
+- **The help is unfiltered too.** `main.rs:140-143` — `if cli.help { print!("{}", render_help(&[])); return Ok(0); }` with an EMPTY extension-flag slice. Both run long before `AgentSessionRuntime::create`/`create_unannounced` at `main.rs:509` (interactive), `:652` (rpc) and `:761` (print/json).
+
+**upstream** — `pi/packages/coding-agent/src/cli/list-models.ts:35` @v0.83.0 — `const models = [...(await modelRuntime.getAvailable())];` (at v0.84.1, `:39`, `getAvailable(undefined, { signal })`). `packages/ai/src/models.ts:394-405` @v0.83.0 (v0.84.1 `:522-538`) implements it as: read each provider's credential, `checkProviderAuth`, then `checks.flatMap(({provider, credential, auth}) => { if (!auth) return []; return provider.filterModels?.(models, credential) ?? models; })` — providers without complete auth contribute nothing, and configured providers can narrow further by credential. The interface comment is unambiguous (`models.ts:152-153`): "Return models whose providers have complete auth configuration." `list-models.ts:37-40` prints `formatNoModelsAvailableMessage()` when that set is empty. For the help half, `main.ts:804-810` flat-maps `resourceLoader.getExtensions()` flags into `printHelp` and `:812-816` lists models off the live `modelRuntime`, both strictly AFTER `createAgentSessionRuntime` at `:793-798`.
+
+**Impact** — `cyrup --list-models` on a fresh install prints hundreds of rows for providers the user has no credential for, where `pi --list-models` prints the "no models available" guidance that tells them how to log in. With one provider configured, pi shows that provider's models and cyrup shows everyone's — so the listing is not a usable answer to "what can I run?", and every `--model` picked from it that belongs to an unconfigured provider fails at launch. Secondary: `cyrup --help` never lists extension-contributed flags.
+
+**Fix** — Build the `has_configured_auth` closure `default_launch_model` already consumes (stored credential in `auth.json`, a known provider env var, or a runtime `--api-key`) and add `available_models(&models_json, &has_configured_auth)` beside `all_available_models` in `provider.rs:237`; call it at `main.rs:284`. The empty branch at `main.rs:1380-1384` then becomes reachable and correct. Separately, feed `render_help` the extension flag set from the resource loader, which does require the ordering move the item originally described. **Land with SEAM-068**, which replaces the search filter in the same function, and note the v0.84.1 `AbortSignal.timeout` on `getAvailable` is PARITY-GAPS VL-P6 (area 01), not this item.
+
+**Verify** — Unit-test `available_models` with a stub auth predicate (zero configured → empty; one configured → only its models). Then run `cyrup --list-models` in a shell with every provider env var unset and no `auth.json`: it must print the no-models-available guidance, not a table. For the help half, a native extension declaring a CLI flag must appear in `cyrup --help`.
+
+## SEAM-028 — modes.rs setWidget case pins SEAM-011's invented wire field
+
+**Kind** test-defect · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup-modes/tests/modes.rs:1014-1019`: the comment at `:1014-1015` concedes that cyrup's WIT collapsed pi's 3-arg `setWidget(key, content, options)` into one opaque JSON payload, and the test then asserts the collapse as CORRECT — `assert_eq!(req["method"], "setWidget")` (`:1018`) and `assert_eq!(req["widget"], serde_json::json!({"widget":"text","text":"hi"}))` (`:1019`). Producer under test: `cyrup/crates/cyrup-modes/src/rpc.rs:423-428`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-types.ts:264-271` pins `widgetKey`/`widgetLines`/`widgetPlacement`; no `widget` field exists in pi's union.
+
+**Impact** — The suite certifies the divergence, so fixing SEAM-011 turns a green test red and invites a revert. The adjacent `setStatus` case IS a correct parity assertion (it checks `statusText` is omitted), which makes the wrong one easy to overlook.
+
+**Fix** — Mark it `#[ignore = "SEAM-011: cyrup collapses setWidget into one blob"]` with the pi-shaped assertion written beneath, or invert it as part of SEAM-011.
+
+**Verify** — After SEAM-011 the test asserts pi's three fields and no `widget` key.
+
+## SEAM-029 — ThinkingArg doc comment claims the leniency path is unreachable
+
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** high
+
+> **Corrected this pass.** The auditor also claimed `cli.rs`'s pi citations were off by two. The
+> refuter checked at the tag: v0.83.0 `args.ts:57` IS `VALID_THINKING_LEVELS`, `:130` IS the
+> `--thinking` arm and `:135` IS the warning push — `cli.rs`'s citations are ACCURATE. Only
+> `diagnostics.rs:51`'s `args.ts:59` (which is `isValidThinkingLevel`) is off by two. Fix the item
+> text before working it: the defect is the contradiction, not the line numbers in `cli.rs`.
+
+**cyrup** — `cyrup/crates/cyrup/src/cli.rs:45-46`, verbatim at HEAD: "`--thinking <level>` (args.ts:57,130). Clap validates membership; the warning-on-invalid path Pi takes (args.ts:135) is unreachable here because clap rejects an unknown value with a usage error." Contradicted by `cyrup/crates/cyrup/src/diagnostics.rs:110-124`, which inspects the `--thinking` value BEFORE clap sees it (called from `main.rs:112`), keeps it when in `VALID_THINKING_LEVELS` (`diagnostics.rs:52-53`, seven entries including `max`) and otherwise drops both tokens with `Invalid thinking level "{value}". Valid values: {joined}`.
+
+**upstream** — `pi/packages/coding-agent/src/cli/args.ts:57` (`VALID_THINKING_LEVELS`), `:130-139` (the `--thinking` arm with the warn-and-continue push at `:135`), and `:59` (`isValidThinkingLevel`).
+
+**Impact** — Doc-only, but this comment is exactly what mis-set a previous edition of this document: a reader concludes the leniency path does not exist and files a false gap.
+
+**Fix** — Rewrite `cli.rs:45-46` to say the leniency pass lives in `diagnostics.rs:110-124` and runs pre-clap, keeping its `args.ts:57,130,135` citations as-is; correct `diagnostics.rs:51`'s `args.ts:59` to `args.ts:57` (or retarget the comment at `isValidThinkingLevel`, which really is `:59`).
+
+**Verify** — Read-through; the two files agree with each other and with the tag.
+
+## SEAM-030 — RPC tests assert wall-clock/scheduling outcomes they cannot control
+
+**Kind** test-defect · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — Three instances, all surviving at HEAD. (a) `cyrup/crates/cyrup-modes/tests/modes.rs:1277` records `std::time::Instant::now()`, `:1279` takes `elapsed`, and `:1289-1293` asserts `elapsed < Duration::from_secs(3)` "proving the command loop is serialized (G1)" — five lines above the deterministic `bash["data"]["cancelled"] == true` at `:1296-1298`, which proves the same thing without a clock. (c) `modes.rs:1139` takes `tokio::time::Instant::now()` and `:1154-1158` asserts `started.elapsed() < Duration::from_secs(2)` on top of an already-deterministic `timeout(5s)` + `assert!(!resolved)` at `:1149-1153` — pure wall-clock margin with no semantic content, the most flake-prone. (b) `modes.rs:1088` is a fixed `tokio::time::sleep(Duration::from_millis(50))` before a negative assertion; **a smell, not a defect**, because `extension_ui_effect_json` returns `None` for `SetHeader`/`SetFooter`/`SetToolsExpanded`, so no `extension_ui_request` can ever be written regardless of sleep length.
+
+**upstream** — No counterpart: these test cyrup-original concurrency structure. pi's `void handleInputLine(line)` (`pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:806-807`, v0.84.1) has no equivalent.
+
+**Impact** — Under CI load or a debug build, (a) and (c) fail for reasons unrelated to the behaviour under test, training contributors to re-run rather than investigate — which is how a suite silently stops being trustworthy.
+
+**Fix** — Delete (a)'s and (c)'s duration assertions; the deterministic assertions beside them already prove the property. Replace (b)'s sleep with a positive synchronisation point.
+
+**Verify** — Tests still pass with the timing assertions removed and stay green under `--test-threads=1` on a loaded machine.
+
+## SEAM-034 — CompactionResult drops pi's usage field
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup-session-svc/src/state.rs:193-203`: `CompactionResult { summary, first_kept_entry_id, tokens_before, estimated_tokens_after, details }` — no `usage` field, and `estimated_tokens_after` is non-optional at `:200`. Serialized straight onto the wire by the RPC `compact` handler (`cyrup/crates/cyrup-modes/src/rpc.rs:1177-1181`). The data exists one layer down: `cyrup/crates/cyrup-session/src/entry.rs` carries `usage: Option<Usage>` on the compaction entry, which `SessionStats::from_entries` (`state.rs:106-110`) now reads — so the stats tier has the number and the compaction response does not.
+
+**upstream** — `pi/packages/coding-agent/src/core/compaction/compaction.ts:88-97`: `interface CompactionResult<T = unknown> { summary; firstKeptEntryId; tokensBefore; estimatedTokensAfter?; usage?: Usage; details?: T }`, with `usage` documented at `:93` as "Usage from the LLM call(s) that generated this summary"; on a split turn pi records the SUM via `combineUsage`. Wire contract `modes/rpc/rpc-types.ts:171`.
+
+**Impact** — An RPC client cannot see what the compaction itself cost, so a cost-tracking front-end under-reports every compaction even though the session totals (SEAM-031, now closed) include it.
+
+**Fix** — Add `#[serde(default, skip_serializing_if = "Option::is_none")] pub usage: Option<Usage>` to `state.rs:193-203` (elided when absent so existing goldens stay byte-identical) and populate it at the construction sites from the value already written to the compaction entry. While there, make `estimated_tokens_after` an `Option<u64>` to match `estimatedTokensAfter?`.
+
+**Verify** — Compact a faux-provider session over RPC and assert the `compact` response `data.usage` matches the persisted compaction entry's `usage`; re-run the JSONL round-trip test to confirm byte-identity when `usage` is absent.
+
+## SEAM-052 — --version prints `cyrup <version>` and pre-empts the parse-error diagnostics pi reports first
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high (the ordering half is airtight; the rendered string rests on clap's documented behaviour, not on observed output)
+
+**cyrup** — `cyrup/crates/cyrup/src/cli.rs:79-90` — the `Cli` derive sets `name = "cyrup"`, `version`, `disable_version_flag = true` (`:83`), and the field carries `#[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]` (`:89`). clap's `ArgAction::Version` renders `{display_name} {version}` and exits from inside the parse, which happens at `cyrup/crates/cyrup/src/main.rs:119` (`Cli::parse_from(&clap_argv)`) — i.e. BEFORE `report_diagnostics(&parse_diagnostics)` at `main.rs:130` and its error exit-1 at `:131-136`. No site in `crates/cyrup` prints a bare version string. The `--help` path is correctly ordered by contrast: `if cli.help` is at `main.rs:140`, after the diagnostics gate.
+
+**upstream** — `pi/packages/coding-agent/src/main.ts:562-570` reports every parse diagnostic and `process.exit(1)` on any error-severity one, and only THEN `:573-576` does `if (parsed.version) { console.log(VERSION); process.exit(0); }` — a bare semver, no program name.
+
+**Impact** — Two script-visible differences. (1) `cyrup --version` emits `cyrup 0.1.0` where `pi --version` emits `0.84.1`, so a version-compare in a wrapper script has to strip a prefix pi never emits. (2) `cyrup -x --version` exits 0 printing the version, while `pi -x --version` prints `Error: Unknown option: -x` and exits 1 — a mistyped flag beside `--version` is silently accepted.
+
+**Fix** — Drop `action = clap::ArgAction::Version` from `cli.rs:89` (make `version` a plain `bool` like `help`), then handle it explicitly in `main.rs` immediately after the diagnostics gate at `:136` and before the `--help` block at `:140`: `if cli.version { println!("{}", env!("CARGO_PKG_VERSION")); return Ok(0); }`. Keep `disable_version_flag = true`.
+
+**Verify** — `cyrup --version` prints exactly the semver with no program name; `cyrup -v` matches; `cyrup -x --version` prints `Error: Unknown option: -x` and exits 1. Update the existing `version_short_is_v_not_verbose` test at `cli.rs:1094`, which currently asserts the clap Version action fires during parse.
+
+## SEAM-053 — Optional RPC wire fields are emitted as explicit null where pi omits the key entirely
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+> **Corrected this pass.** The auditor's second instance is wrong: the `fork` verb passes
+> `ForkPosition::Before` (`rpc.rs:1277`) and `fork_anchor` (`session.rs:5138-5141`) returns
+> `Some(text)` on every successful `Before` fork; the `position:"at"` verb is `clone`, which emits no
+> `text` key at all (`rpc.rs:1299`), matching pi `rpc-mode.ts:625`. The `"text": null` case arises
+> only on the veto/cancelled path (`runtime.rs:527`). The `get_state` instance below is the real one.
+
+**cyrup** — `cyrup/crates/cyrup-modes/src/rpc.rs:1424-1437` — `state_view` builds the `get_state` payload with `json!` and unconditionally includes `"sessionFile": session.session_file().await.map(...)` (`:1431`) and `"sessionName": session.session_name().await` (`:1433`); a `None` serializes as JSON `null`, not an absent key. Contrast the code that DOES get this right: `SessionStats::session_file`/`context_usage` carry `#[serde(default, skip_serializing_if = "Option::is_none")]` (`cyrup/crates/cyrup-session-svc/src/state.rs:39`, `:52`), and the `setStatus` effect inserts `statusText` only when present (`rpc.rs:414-416`) — so the wire is inconsistent with itself.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-types.ts:102-104` types `RpcSessionState.sessionFile?: string`, `sessionName?: string` and `model?`, populated from an object literal at `rpc-mode.ts:446-459` — `JSON.stringify` drops an `undefined` property, so pi's line for an unnamed ephemeral session contains neither key.
+
+**Impact** — A client written against pi's `RpcSessionState` and using `"sessionName" in state` or `state.sessionName === undefined` — the natural TypeScript idioms for an optional property — takes the wrong branch against cyrup, which always supplies the key with a `null` value. Same for `sessionFile` on an ephemeral (`--no-session`) run. Byte-level golden comparisons against a pi transcript also fail.
+
+**Fix** — Build `state_view` (`rpc.rs:1410-1437`) from a `serde_json::Map` and insert `sessionFile`/`sessionName`/`model` only when `Some`, or define a `#[derive(Serialize)]` struct with `skip_serializing_if = "Option::is_none"` on the optional members and serialize that. Audit the remaining `json!` payloads in `handle` for the same shape while there, including the `fork` veto path at `rpc.rs:1276-1281`.
+
+**Verify** — An RPC test that runs `get_state` on a `--no-session` unnamed session and asserts `resp["data"].get("sessionFile").is_none()` and `.get("sessionName").is_none()`.
+
+## SEAM-054 — A blank stdin line is silently dropped instead of producing pi's parse error response
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup-modes/src/rpc.rs:1452-1476` — `read_lines` strips the LF and any trailing CR, then `if buf.is_empty() { continue; }` (`:1465-1467`) drops the record before it is ever forwarded to the command loop; the function doc at `:1449-1451` states the filtering. No response is written, so a client that sent a line receives nothing at all for it.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/jsonl.ts:25-41` (v0.84.1) — `emitLine` is invoked for EVERY newline-delimited slice including an empty one, with no emptiness filter (`:38`). It lands in `handleInputLine` (`rpc-mode.ts:748-762`), where `JSON.parse("")` throws and pi writes `error(undefined, "parse", \`Failed to parse command: ${…}\`)` on stdout (`:752-758`).
+
+**Impact** — A client using a bare newline as a keepalive, or one that accidentally emits a trailing blank line, gets a reply from pi and silence from cyrup. Any correlation-by-count logic (n lines in, n responses out) desynchronizes, and a client waiting on a response for a line it believes it sent hangs. cyrup already produces pi's exact `parse` error for every other malformed line (`rpc.rs:939-950`), so this is one input class out of step with the rest of the surface.
+
+**Fix** — Delete the `if buf.is_empty() { continue; }` guard at `rpc.rs:1465-1467` and update the doc at `:1449-1451`; `dispatch`'s existing `serde_json::from_str` failure arm (`rpc.rs:939-950`) then produces `{"type":"response","command":"parse","success":false,"error":"Failed to parse command: …"}` with no id, exactly as pi does. `is_inline_command` (`rpc.rs:881-890`) already treats an unparseable line as non-inline, so the empty line routes down the concurrent path with no other change.
+
+**Verify** — An RPC test writing `"\n"` followed by a valid `get_state` line and asserting TWO responses come back, the first with `command == "parse"` and `success == false`.
+
+## SEAM-055 — Extension slash commands are advertised over RPC with a synthesized empty-path sourceInfo
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup-session-svc/src/session.rs:2283-2293` — the extension branch of `slash_command_catalog` emits a hard-coded `"sourceInfo": {"path": "", "source": "extension", "scope": "temporary", "origin": "top-level"}` for every registered command. The doc immediately above (`:2277-2280`) claims the synthetic info is "anchored at the extension id", which the literal empty `path` contradicts. The prompt-template and skill branches DO carry real provenance (`t.origin.source_info_json(&t.path)` at `:2302`, `s.origin.source_info_json(&s.skill_md)` at `:2311`), so only the extension branch is blank. The owning `ExtensionId` is available at the source and discarded: `RegistryInner::commands` stores it (`cyrup/crates/cyrup-ext/src/registry.rs:139`, written at `:452`) and `command_descriptions()` (`:662-669`) maps it away.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:681-686` passes `sourceInfo: command.sourceInfo` straight through from the `ResolvedCommand`; the type is required, not optional (`RpcSlashCommand.sourceInfo: SourceInfo`, `rpc-types.ts:79-88`), and `SourceInfo.path` is a non-optional `string` (`core/source-info.ts:6-12`) that `createSyntheticSourceInfo` (`:24-40`) takes as its first positional argument precisely so a synthetic entry still names something.
+
+**Impact** — An RPC client rendering a command palette grouped or filtered by source path — the reason `sourceInfo` is on the wire at all — cannot tell which extension contributed which command; every extension command reports the same empty path. A client keying a trust or enable/disable UI off `sourceInfo.path` collapses all extension commands into one bucket.
+
+**Fix** — Have `command_descriptions()` (`registry.rs:662-669`) return the owning `ExtensionId` it already holds — or switch the caller to `resolved_commands()` (`registry.rs:462`), which carries `owner` on every `ResolvedCommand` — and populate `"path"` at `session.rs:2288` from the extension's resolved path/id. Lands naturally with SEAM-048, which touches the same two functions.
+
+**Verify** — Register a native extension with a known path that declares one command; assert the `get_commands` response entry has `sourceInfo.path` equal to that extension's path rather than `""`.
+
+## SEAM-056 — pi's "session has not been saved yet" fork/clone guard is absent
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** high (which error text cyrup actually surfaces was not observed — only that pi's sentence has zero occurrences in `crates/`)
+
+**cyrup** — `grep -rn 'has not been saved yet\|Wait for the first assistant' crates/` returns ZERO hits workspace-wide. The persisted fork arm is `cyrup/crates/cyrup-session-svc/src/runtime.rs:547-558`: it goes straight to `let mut mgr = SessionManager::open(&file)?;` (`:549`) with no existence pre-check, so a persisted session whose file has not been written yet (cyrup defers the first write until an assistant message exists — see the `create_branched_session` note at `runtime.rs:560-573`) surfaces whatever `SessionManager::open` returns rather than an actionable message. The RPC verbs relay it verbatim: `fork` at `cyrup/crates/cyrup-modes/src/rpc.rs:1283` and `clone` at `:1301`.
+
+**upstream** — `pi/packages/coding-agent/src/core/agent-session-runtime.ts:312-316` — inside the persisted, has-target-leaf branch, `if (!existsSync(currentSessionFile)) { throw new Error("This session has not been saved yet. Wait for the first assistant response before cloning or forking it."); }`, sitting immediately above the `SessionManager.open` at `:317`.
+
+**Impact** — `/fork` or `/clone` on a brand-new session before its first assistant response is a normal user mistake. pi tells the user exactly what to do; cyrup surfaces a filesystem error string that names an internal path and gives no remedy. Over RPC the same string is what a client shows.
+
+**Fix** — Add the existence check ahead of `runtime.rs:549`, returning a dedicated `SessionServiceError` variant whose `Display` is pi's sentence verbatim. Place it inside the `(Some(leaf), Some(file))` arm only, matching pi's placement inside the has-target-leaf branch.
+
+**Verify** — Runtime test: build a persisted session, do not prompt, call `clone`; assert the error message is pi's exact sentence rather than an IO error. Same over RPC via the `clone` verb's `error` field.
+
+## SEAM-057 — --json, --rpc and --output-format are cyrup-invented flags occupying the extension-flag namespace
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup/src/cli.rs:103-111` declares `--output-format <text|json>`, `--json` and `--rpc`, all three documented in-tree as back-compat aliases; they are honoured in `resolve_app_mode` (`cli.rs:571-585`: `cli.rpc ||` at `:572`, `cli.json ||` at `:575`, `cli.output_format ==` at `:575` and `:578`). All three are listed in `KNOWN_LONG_FLAGS` (`cli.rs:762-764`) and `--output-format` also in `KNOWN_VALUE_LONG_FLAGS` (`:806`), so `partition_extension_flags` (`cli.rs:708-721`) consumes them before the extension-flag capture. None appears in `render_help`'s Options block (`cli.rs:828-930`), so they are undiscoverable.
+
+**upstream** — `git grep -nE '"--output-format"\|"--json"\|"--rpc"' v0.84.1 -- packages/coding-agent/src` returns only `auth-command.ts:82-84` (an auth SUBCOMMAND flag) and three npm/ripgrep argv strings; pi's `parseArgs` has no such arm at either tag. Each would therefore fall through to the unknown-long-flag arm at `cli/args.ts:188-201`, be recorded in `unknownFlags`, and — with no extension registering it — produce `Unknown option(s): --json` from `core/agent-session-services.ts:119-124` followed by `process.exit(1)` at `main.ts:844-848`.
+
+**Impact** — Two divergences on a normal path. An extension that legitimately registers a `--json` or `--rpc` flag can never receive it under cyrup: the binary consumes the flag before the extension-flag capture runs and silently changes the output mode instead. And `cyrup --json` succeeds where `pi --json` is a hard exit-1 error, so a script relying on pi rejecting a removed or typo'd flag gets a silently different output format from cyrup.
+
+**Fix** — Decide and record: either delete the three aliases from `Cli` (`cli.rs:103-111`), `resolve_app_mode` (`:571-585`) and `KNOWN_LONG_FLAGS`/`KNOWN_VALUE_LONG_FLAGS` (`:762-764`, `:806`) so the extension-flag namespace matches pi's, or keep them and document them in `render_help` plus state the divergence in-tree. The reserved-namespace half is the behavioural one and should be closed regardless.
+
+**Verify** — Register a native extension declaring a boolean flag named `json`; run `cyrup --json` and assert the extension observes the flag (or, if the aliases are removed, that `cyrup --json` with no such extension exits 1 with `Unknown option(s): --json`).
+
+## SEAM-058 — pi's experimental server/client command tree, create-harness.ts and remote-session.ts have no counterpart
+
+**`tracker`** — not counted in this area's 40 open items. **Kind** tracking *(was upstream-drift)* · **Severity** n/a *(was low)* · **Effort** n/a until triggered · **Confidence** high
+
+> **Reclassified in the 2026-08-12 repair pass.** The item proposes no work by its own Fix line
+> ("Track, do not build, until upstream wires it into `main()`"), and its Impact line says "Today:
+> none user-visible, because upstream has not wired the tree into `main()` either". A backlog row
+> that instructs the reader not to build it is bookkeeping, not backlog. It keeps its ID and body; the
+> recurring action it owes is the re-diff in its Verify line, which the next version-lag sweep runs.
+> **Escalate it back into the counted set the moment `main()` references `experimentalCli`.**
+
+**cyrup** — `cyrup/crates/cyrup/src/subcommands.rs` declares only `PackageCommand` and `UpdateTargetSel`; there is no `server`/`client` verb, no `--listen`/`--connect` option, and no `TransportAddress` type anywhere in `crates/`. `grep -rn 'unix://' crates/` finds nothing resembling pi's transport-address grammar. There is no `cyrup-protocol` or `cyrup-client` crate among the 18 crates.
+
+**upstream** — `packages/coding-agent/src/cli/experimental/` is NEW after v0.83.0 (first added 2026-08-02, `1ee411a28`): `cli.ts:7` composes `piCommand.command(serverCommand).command(clientCommand)`; `commands/server.ts:25-44` declares `--listen` plus `--auth-token`/`--auth-token-file`; `commands/client.ts` declares `--connect`; `command.ts` is a 205-line option/subcommand combinator; `transport-address.ts` parses `unix://…`. `packages/coding-agent/src/server/create-harness.ts` is NEW (2026-08-06, `6fb2d766a`). `packages/coding-agent/src/client/remote-session.ts` imports `@earendil-works/pi-client` and `@earendil-works/pi-protocol`, both packages entirely absent at v0.83.0 (`git ls-tree -r --name-only v0.83.0 -- packages/protocol packages/client` is empty). **Reachability re-checked**: at v0.84.1 `git grep -n experimentalCli v0.84.1 -- packages/` returns only `cli/experimental/cli.ts:7` and `test/experimental-cli-command.test.ts`, and `git grep -n 'create-harness\|createHarness' v0.84.1 -- packages/coding-agent/src` returns nothing — none of it is reachable from `main()` yet.
+
+**Impact** — Today: none user-visible, because upstream has not wired the tree into `main()` either — which is exactly why this is `low` and not `medium`. It is recorded so the surface is tracked before it becomes reachable: once pi routes `pi server --listen unix://…` from `main`, cyrup will be missing an entire CLI verb, its transport-address grammar, its auth-token options and the framed wire behind them. The wire-format half is already tracked as PARITY-GAPS VL-P23; this entry is the CLI/harness half VL-P23 does not cover.
+
+**Fix** — Track, do not build, until upstream wires it into `main()`. When it does: the CLI half is a `subcommands.rs` verb plus a `TransportAddress` parser, the harness half maps onto the existing `SessionFactory`/`AgentSessionRuntime` seam, and the wire half needs the `cyrup-protocol`/`cyrup-client` crates VL-P23 describes — which must NOT be conflated with `crates/cyrup-intercom`'s line/JSON framing.
+
+**Verify** — Re-diff `packages/coding-agent/src/{cli/experimental,server,client}` at the next upstream tag and check whether `main()` references `experimentalCli`; escalate the severity when it does.
+
+## SEAM-060 — get_tree drops pi's labelTimestamp from every node
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+> Recovered by the refuter. This sits squarely in the inner-payload class the audit's own blind-spot
+> list declared unaudited (`tree_json()` nodes vs `SessionTreeNode`), so nothing in the item-driven
+> pass would have caught it.
+
+**cyrup** — `cyrup/crates/cyrup-session-svc/src/session.rs:2330-2347` — `tree_json`'s inner `node_to_json` inserts only `entry`, `children` and (when present) `label`; the omission is stated as deliberate in the doc immediately above at `:2327-2329` ("The optional Pi `labelTimestamp` is omitted"). It reaches the wire verbatim at `cyrup/crates/cyrup-modes/src/rpc.rs:1330-1338` (`get_tree` → `{tree, leafId}`). Per the no-accepted-divergence rule an in-tree comment declaring a field "omitted" is work, not a blessing; the underlying `cyrup_session::manager::TreeNode` needs the field before `tree_json` can carry it.
+
+**upstream** — `pi/packages/coding-agent/src/core/session-manager.ts:159-166` — `interface SessionTreeNode { entry; children; label?: string; labelTimestamp?: string }`, genuinely populated rather than vestigial: `labelTimestampsById` is maintained at `:865`, `:970` and `:1247-1250` and read into the node at `:1318`. The wire contract names the type directly (`modes/rpc/rpc-types.ts:202-208`, `data: { tree: SessionTreeNode[]; leafId: string | null }`).
+
+**Impact** — An RPC client cannot tell when a branch label was set, so it cannot sort or age branch labels, cannot show "renamed 2 days ago", and cannot detect a label that predates the entries beneath it. A client written to pi's `SessionTreeNode` reads `undefined` for a field pi always supplies on labelled nodes.
+
+**Fix** — Add `label_timestamp: Option<String>` to `cyrup_session::manager::TreeNode` alongside the existing `label`, populate it wherever the label itself is populated, and emit it from `node_to_json` (`session.rs:2330-2347`) with an omit-when-`None` insert (matching the `label` treatment); delete the "omitted" note at `:2327-2329`.
+
+**Verify** — Label a branch over RPC, then `get_tree`, and assert the labelled node carries a `labelTimestamp` whose value matches the label operation's timestamp, and that unlabelled nodes carry neither key.
+
+## SEAM-069 — The trust prompt's saved-decision line never says "inherited from", so an ancestor-folder decision is indistinguishable from one made for this folder
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup/src/startup_ui.rs:174-186` — `format_saved_trust` renders `format!("{label} ({})", entry.path.display())` for every saved entry, with no comparison against the current folder's trust path. The entry it is handed comes from `trust_store.nearest(&dirs.cwd)` (`main.rs:1144`), which by construction may resolve to an **ancestor** directory.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/trust-selector.ts:21-30` @v0.83.0 (identical at v0.84.1) — `formatDecision(trustPath, decision)` returns `"none"` for null, and otherwise branches: `if (trustPath !== undefined && decision.path !== trustPath) return \`${label} (inherited from ${decision.path})\`;` before falling through to `${label} (${decision.path})`. The caller passes `this.trustOptions[0]?.savedPath` — the current folder's normalized trust path — as `trustPath` (`:61`).
+
+**Impact** — The "Saved decision:" line reads `trusted (/home/u/work)` whether that decision was made for the current folder or inherited from a parent two levels up. A user cannot tell which folder they are actually changing, on a prompt whose whole job is to make that explicit.
+
+**Fix** — Give `format_saved_trust` the current folder's trust path (`options.first().and_then(|o| o.saved_path.as_deref())`, matching pi's `trustOptions[0].savedPath`) and emit `"{label} (inherited from {path})"` when it differs from `entry.path`. Update the `format_saved_trust_matches_pi` test at `startup_ui.rs:488-501` with the inherited case. Lands with SEAM-064, which rewrites the same option vector.
+
+**Verify** — `cargo test -p cyrup format_saved_trust`, then a live run: save a trust decision for a parent directory, `cd` into a child with `.cyrup/` resources, launch `cyrup`, and confirm the header reads "inherited from &lt;parent&gt;".
+
+## SEAM-070 — `process.title` is never set, so the rpc-mode, subagent-runner and intercom-broker children are indistinguishable from an interactive session in `ps`
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `cyrup/crates/cyrup/src/main.rs:53-57` explicitly declines pi's whole process-identity block: "`process.title` has no std API, and `std::env::set_var` is `unsafe` under edition 2024 … gated as a hard-language limit". Nothing anywhere sets a process name (`rg 'proctitle|prctl|set_process_title|setprogname' crates/` = 0); `cyrup-tui/src/terminal_title.rs` sets the *terminal's* OSC title, a different surface. The two hidden re-exec subcommands (`cyrup/crates/cyrup/src/subagent_runner_cmd.rs:33`, `intercom_broker_cmd.rs:15`) re-exec `current_exe()` and therefore inherit the bare `cyrup` name.
+
+**upstream** — `pi/packages/coding-agent/src/bun/cli.ts:5` @v0.83.0 `process.title = APP_NAME;` (and `src/cli.ts:12`, so it is not Bun-only), while `packages/coding-agent/src/rpc-entry.ts:6` sets a **different** value: `process.title = \`${APP_NAME}-rpc\`;`. Documented behaviour since `packages/coding-agent/CHANGELOG.md:3249`. All three files byte-identical at v0.84.1.
+
+**Impact** — The base title is already satisfied for cyrup by accident: a Rust binary's argv[0] is `cyrup`, whereas Node's is `node`, which is why pi needs the assignment at all. What is genuinely lost is the **role suffix** — pi advertises an RPC-mode process as `pi-rpc`, so an operator can `pkill pi-rpc`, spot a stuck RPC child in `ps`, or distinguish it in Activity Monitor without touching a user's interactive session. In cyrup an rpc-mode process, a `__subagent-runner` child and an `__intercom-broker` child all appear as plain `cyrup`, so recovering from a hung background process means killing by PID after reading `ps -f` command lines. Compounds SEAM-047, whose symptom is exactly a background process that will not stop.
+
+**Fix** — Set the per-process name (not the environment) after mode resolution in `crates/cyrup/src/main.rs::run`, via `prctl(PR_SET_NAME)` on Linux and the macOS equivalent — a two-platform `cfg` block or a small crate such as `proctitle`. Use `cyrup` for interactive, `cyrup-rpc` when `--mode rpc` is resolved (mirroring `rpc-entry.ts:6`), and distinct names in `subagent_runner_cmd::dispatch` and `intercom_broker_cmd::dispatch`. **Correct the comment at `main.rs:53-57` in the same change**: its `unsafe`-free rationale covers only the `std::env::set_var` half, and process naming is a syscall on the current process rather than a mutation of the shared environment, so it does not carry that hazard — leaving the comment as written is how this stayed unfiled. The `PI_CODING_AGENT` env half of the same block is already owned by TOOL-031 / PARITY-GAPS PB-5 (area 04); do not re-file it here.
+
+**Verify** — Launch `cyrup --mode rpc`, then `ps -o comm= -p <pid>` returns `cyrup-rpc`; launch an interactive session and it returns `cyrup`. Both return `cyrup` today.
+
+## SEAM-071 — `--no-extensions` gates only the WASM/disk discovery roots, so the three native built-ins load anyway and `-ne` cannot produce pi's bare session
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-session-svc/src/builder.rs:775` is `for ext in self.native_extensions { … host.load_native_with_services(ext, …) … }` — unconditional; `cfg.no_extensions` is never consulted on that path. The only place the flag acts is `extension_discovery_roots` (`:1677-1690`), which nulls `project_cwd` and `agent_dir` and so suppresses **disk** extensions only. The natives are pushed at `crates/cyrup/src/main.rs:481/:490/:493/:506` (and again at the `:630`/`:724` session-build sites) from `subagent_extension_for_env`, `prompt_runtime_extension_for_env`, `intercom_extension_for_env` and `permission_extension_for_env`; `rg 'no_extensions' crates/cyrup/src/main.rs` returns **nothing**, so none of the four gates sees the flag. A user with `CYRUP_INTERCOM=1` running `cyrup --no-extensions -p hi` therefore still attaches intercom and still spawns a broker.
+
+**upstream** — `pi` v0.83.0 `packages/coding-agent/src/core/resource-loader.ts:451-452`: `const extensionPaths = this.noExtensions ? cliEnabledExtensions : this.mergePaths(cliEnabledExtensions, enabledExtensions);` — under `--no-extensions` the set collapses to the explicitly-passed `-e` paths and nothing else. pi-subagents, pi-intercom and pi-permission-system are ordinary *discovered* extensions upstream, not built-ins, so upstream's `-ne` run has none of the three. That is precisely the guarantee `-ne` exists to give.
+
+**Impact** — `--no-extensions` is the escape hatch a user reaches for when an extension is suspected of breaking a session, and the bisect it is supposed to enable does not work: the three highest-surface extensions in the product — the permission gate, the subagent orchestrator and intercom — are exactly the ones it cannot switch off. Concretely it also means `-ne` cannot be used to get a broker-free one-shot run, which is what forced the four `crates/cyrup/tests/*.rs` fixtures to scrub `CYRUP_INTERCOM`/`CYRUP_SUBAGENTS`/`CYRUP_PERMISSION_SYSTEM` from the child environment instead (ICOM-051, area 11 — that item closes the *test* hole and explicitly does not close this one). Security-adjacent in one direction only: `-ne` currently *keeps* the permission gate on, so this is not a fail-open, but a user who believes `-ne` produced a bare session is wrong about what is loaded.
+
+**Fix** — Consult `cfg.no_extensions` where the natives are selected, not where they are loaded. Either (a) gate the four `*_extension_for_env` calls in `crates/cyrup/src/main.rs` on the resolved `--no-extensions` flag at all three session-build sites, or (b) skip the `self.native_extensions` loop in `builder.rs:775` when `cfg.no_extensions` is set. Prefer (a): the flag is a CLI concern and (b) would also silently drop the subagent-child attachments that are not user-installed extensions at all. **Decide and document the subagent-child carve-out either way** — a `__subagent-runner` child attaches intercom unconditionally so `contact_supervisor` exists (`crates/cyrup-intercom/src/extension.rs:637-640`), and pi's child gets `subagent-prompt-runtime.ts` through `pi-args.ts:13` rather than through discovery, so those two must survive `-ne` to keep parity.
+
+**Verify** — `CYRUP_INTERCOM=1 cyrup --no-extensions --offline --no-session -p hi`, then `ps -axo pid,command | grep -cE '[/]cyrup __intercom-broker'` returns 0 and the session's tool list contains no `intercom`; the same run without `-ne` still attaches it. Plus a `-p cyrup` fixture asserting that under `-ne` the startup extension set is empty even with all three opt-in vars exported.
+
+## SEAM-072 — `build_inputs` read the process's own stdin instead of taking Pi's `stdinContent` argument, so any test that drives prompt assembly hangs forever on an inherited pipe
+
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed · **Status** fixed this pass
+
+**cyrup** — `crates/cyrup/src/input.rs:597-614` (pre-fix) ended with `let piped = read_piped_stdin().await?;` *inside* `build_inputs`, and `read_piped_stdin` (`:576-586`) guards only on `std::io::stdin().is_terminal()` before `tokio::io::stdin().read_to_string(&mut buf).await`. A pipe is not a terminal, so on any non-TTY stdin the call blocks until **EOF** — not until any bounded event. `build_inputs` is `pub` and is the documented "exact fn `main.rs` calls" that two integration targets drive directly (`crates/cyrup/tests/image_auto_resize_file_args.rs:50`, `crates/cyrup/tests/image_bytecap.rs:62`), so those targets inherited whatever descriptor the test runner had on fd 0.
+
+**upstream** — pi v0.83.0 `packages/coding-agent/src/main.ts:819-826` reads stdin in `main` itself — `let stdinContent; if (appMode !== "rpc") { stdinContent = await readPipedStdin(); … }` — and `:828-832` *passes* it in: `prepareInitialMessage(parsed, settingsManager.getImageAutoResize(), stdinContent)`. `stdinContent?: string` is `prepareInitialMessage`'s third parameter (`:169-172`) and flows on to `buildInitialMessage({ parsed, stdinContent })` (`:178`). The descriptor-owning step and the prompt-assembly step are separate functions upstream; cyrup had fused them. cyrup's own doc comment at `input.rs:591-593` already quoted the three-argument upstream call while implementing a two-argument one.
+
+**Impact** — Measured, not theorised. `cargo test -p cyrup --test image_auto_resize_file_args` with stdin at `/dev/null`: **2 passed in 4.77 s**. The identical command with an open pipe on stdin (`sleep 300 | cargo test …`): **both tests still "running for over 60 seconds"**, sampled to `Runtime::block_on` → `Context::park` → `kevent`, and never terminating. It hung the second full-workspace verification run at target 8 of ~338 for 11 minutes until killed. Because `cargo test` has no per-test timeout, the failure mode is a **silent indefinite stall that names nothing** — strictly worse than a red, and the reason a `cargo test --workspace` gate could not be trusted: whether the suite finished at all depended on the CI runner's fd 0. This is very likely the same root cause as the previously-unexplained `one_shot_parity::an_unmatched_models_pattern_warns_on_stderr` "running for over 60 seconds" report, since the whole workspace run shares one inherited descriptor.
+
+**Fix** — *applied.* Restored pi's split: `read_piped_stdin` is now `pub` and is called by `crates/cyrup/src/main.rs` at both prompt-building sites (the interactive arm and the Print/Json arm — RPC still never reads it, matching `main.ts:820`'s `appMode !== "rpc"` guard), and `build_inputs(cli, cwd, auto_resize, piped: Option<String>)` takes the content as its fourth argument, mirroring `prepareInitialMessage`'s `stdinContent`. Nothing about the runtime behaviour of the binary changes — the same read happens at the same point in the same order — only the ownership of fd 0 moves out of the reusable function.
+
+**Verify** — done. `sleep 200 | cargo test -p cyrup --test image_auto_resize_file_args --test image_bytecap` → 2 passed / 1 passed, 4.88 s and 5.51 s, i.e. the previously-fatal condition is now inert. Whole package under the same open pipe: `cargo test -p cyrup` → 17 targets, all `ok`, 221 tests, no stall — including `piped_stdin_trim.rs`, which drives the real binary through a real pipe and therefore proves the production stdin path is unchanged. Audit of the remaining process-global stdin readers: `cyrup-tui/src/drain.rs:154` and `terminal_query.rs:386` both gate on `is_tty() && is_raw_mode_enabled()` and `main.rs:674` is RPC-only, so `input.rs` was the sole unguarded blocking reader.
+
+## SEAM-073 — Every `-p cyrup-session-svc` run leaves 14 temp directories behind, because `FileLock` never deletes its lock file and something touches the models store after the fixture's `TempDir` teardown starts
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed (the leak and its contents are measured; the exact late writer is inferred)
+
+**cyrup** — `crates/cyrup-config/src/lock.rs`: `FileLock::acquire` opens the lock path with `.create(true)` (`:25-34`) and `impl Drop` calls `FileExt::unlock` only (`:42-46`) — the file itself is never removed. Both `FileModelsStore::read` and `::write` take that lock (`crates/cyrup-config/src/models_store.rs:91` and `:100`), so *reading* the store is enough to create `<agent_dir>/models-store.json.lock`. Measured: `cargo test -p cyrup-session-svc` leaves exactly **14** `$TMPDIR/.tmpXXXXXX` directories per run, and every one of them has identical contents — an empty `project/` and `agent/models-store.json.lock`, nothing else. `TempDir::drop`'s `remove_dir_all` swallows its error, so a store access landing after the directory scan begins leaves the whole tree behind silently. `cargo test -p cyrup-tui --lib`, whose fixtures build sessions the same way, leaks **0**, which is what makes this specific to whatever session-svc keeps running past the fixture's drop rather than to the fixture shape.
+
+**upstream** — no counterpart: pi has no lock file beside `models-store.json` (`packages/coding-agent/src/core/models-store.ts` writes it directly), so both the stale-lock artefact and this leak are cyrup-original.
+
+**Impact** — Small but monotone: 14 directories per session-svc run and 15 per full-workspace run (the extra one is a `cyrup-bash-*.log` spool), each ~3 inodes, forever, in a directory macOS only sweeps on reboot. Three consecutive full-workspace runs measured +15, +15, +15. The user-facing residue is the never-deleted `~/.cyrup/models-store.json.lock`, which is cosmetic. What makes it worth an ID is the mechanism rather than the bytes: it is direct evidence that some session-svc task still runs after the session and its whole agent directory are gone, which is the same class of lifetime bug as SEAM-S03.
+
+**Fix** — Two independent halves. (a) Give `FileLock::drop` a best-effort `std::fs::remove_file(&self.path)` after the unlock, or hold the lock on `models-store.json` itself rather than a sidecar. (b) Find and join (or cancel) whatever performs a models-store access after `AgentSession` drop — instrument `FileLock::acquire` with a `tracing::trace!` carrying a backtrace and re-run `-p cyrup-session-svc` to name it; that half is the real defect and (a) only hides it.
+
+**Verify** — `ls $TMPDIR | wc -l` before and after `cargo test -p cyrup-session-svc` differs by 0. Today it differs by 14.
+
+## Coverage
+
+**Read first-hand at cyrup HEAD `04c1ba2`** (tree `a9000b1`, clean). cyrup: `cyrup-modes/src/{rpc.rs — all 1535 lines, across the wire types, the ui-request/effect shapers, `run_rpc`/`rpc_driver`/`write_pump`, `dispatch`, the whole `handle` switch, `state_view`, `read_lines`; print.rs; json.rs; json_event.rs}`; `cyrup-modes/tests/modes.rs` (the `get_session_stats`, setWidget/setStatus, dialog-timeout and `abort_bash` cases); `cyrup/src/{main.rs (arg pipeline `:100-370`, interactive arm `:470-590`, rpc arm `:593-676`, print/json arm `:678-800`, `apply_post_build` `:816-862`, `report_runtime_diagnostics` `:1846-1862`), run.rs (all 188 lines), cli.rs (`:20-260`, `:571-607`, `:690-815`, `:828-930`), diagnostics.rs (all 263 lines), signals.rs (all 117 lines), output_guard.rs, credential_print.rs (`:1-180`, `:431-536`), subcommands.rs}`; `cyrup-session-svc/src/{session.rs (abort/abort_and_settle `:1330-1400`, dispose/dispose_with `:2370-2436`, fork/branch helpers `:2438-2500`, bind_extensions/emit_session_start `:2510-2545`, slash_command_catalog/entries_json/tree_json `:2275-2347`, fork_anchor `:5128-5143`), runtime.rs (`:95-140`, `:200-330`, `:385-465`, `:448-612`), state.rs (all 220 lines), factory.rs `:92-130`, builder.rs `:946-967`}`; `cyrup-sdk/src/{client.rs, handle.rs, lib.rs}`; `cyrup-ext/src/{event.rs, registry.rs `:440-520`, `:640-680`}`; `cyrup-ext/src/facade.rs` command-dispatch sites; `cyrup-tools/src/ops/local.rs` (`setsid`/`killpg`); both `wit/world.wit` copies.
+
+**Added by the repair pass, cyrup side:** `cyrup/src/startup_ui.rs` (all of it — `run_resume_picker` `:121-140`, the trust prompt `:238-274`, `format_saved_trust` `:174-186`, `run_missing_cwd_prompt` `:281-336`, and the tests at `:488-537`), `cyrup/src/main.rs` (`:1040-1170` the startup-UI orchestration, `:1240-1270` the session listings, `:1342-1460` the `--list-models` renderer and filter, `:53-57` the process-identity comment), `cyrup/src/startup.rs`, `cyrup/src/input.rs`, `cyrup/src/provider.rs:230-260`, `cyrup/src/subcommands.rs:590-675`, `cyrup-tui/src/session_selector.rs` (constructor defaults, `handle` `:770-843`, the header/hint rows `:420-470`, `:550-700`), `cyrup-tui/src/startup_selector.rs`, `cyrup-tui/src/theme.rs:144-148`, `cyrup-tui/src/fuzzy.rs:119-175`, `cyrup-config/src/trust.rs:330-390`, `cyrup-session-svc/src/builder.rs:483-524`, `cyrup-session-svc/src/session.rs:3335-3370`, `cyrup-tui/src/app.rs:4021-4028`.
+
+**Upstream read at the NAMED TAG** with `git show <tag>:<path>`, never from a working tree. **v0.83.0** (the ported baseline): `cli/args.ts` (all 400 lines), `cli/credential-print.ts`, `main.ts` (`:100-215`, `:470-620`, `:780-910`), `core/agent-session-runtime.ts` (all 440 lines), `core/agent-session-services.ts` (`:80-200`), `core/source-info.ts`, `core/session-manager.ts` (`:150-170`, `:860-980`, `:1240-1330`), `core/extensions/runner.ts` (`:595-650`), `core/extensions/types.ts`, `core/compaction/compaction.ts`, `modes/rpc/rpc-mode.ts` (the whole command switch `:385-715` plus `shutdown`/`handleInputLine` `:717-810`), `modes/rpc/rpc-types.ts` (all 289 lines). **v0.84.1** (latest): `modes/print-mode.ts`, `modes/rpc/rpc-mode.ts` (`:1-120`, `:280-420`, `:700-810`), `modes/json-event.ts`, `modes/rpc/jsonl.ts`, `core/output-guard.ts`, `utils/shell.ts`, `cli/args.ts` diff, `cli/auth-command.ts`, `cli/experimental/{cli.ts,command.ts,commands/server.ts}`, `server/create-harness.ts`, `main.ts` diff.
+
+**Version-lag sweep method.** `git diff --stat v0.83.0..v0.84.1` scoped to `packages/{server,protocol,client}` and `packages/coding-agent/src/{cli.ts,cli/,main.ts,rpc-entry.ts,server/,modes/}` (81 + 39 files), then `--diff-filter=A` plus `git ls-tree v0.83.0` on each new path to separate "new at v0.84.1" from "existed and changed". Findings: `modes/json-event.ts` is new at v0.84.1 and is **already ported** (`cyrup-modes/src/json_event.rs`, wired at `json.rs:79` and `rpc.rs:300`) — PARITY-GAPS line 392 still lists "JSON/RPC message_update delta projection" as deferred and is **stale on that point**. `rpc-mode.ts`'s other v0.84.1 change is `getAvailable()` → `getAvailableSnapshot()`, which cyrup's already-synchronous `available_model_catalog()` matches (SEAM-004 re-verified against it). `print-mode.ts`'s is `waitForRawStdoutBackpressure` on the agent, which `cyrup-modes/src/json.rs:9-21` argues away with a specific, checkable reason (the seam's bounded-1024 awaited fanout). The residue is SEAM-050 / SEAM-051 / SEAM-058.
+
+**Repair-pass sweep (2026-08-12): the `pi/packages/coding-agent/src/cli/` startup path.** The previous
+edition's CLI coverage named `args.ts`, `credential-print.ts`, `auth-command.ts` and `experimental/`
+only, and its sweep was a flag-NAME diff by its own admission — so six shipped `cli/` files and the
+~1 000 lines of Rust that answer them had been audited by nobody. This pass read
+`file-processor.ts`, `initial-message.ts`, `list-models.ts`, `session-picker.ts`,
+`config-selector.ts` and `startup-ui.ts` **at both v0.83.0 and v0.84.1**, plus every symbol they
+consume (`session-selector.ts`, `core/project-trust.ts`, `core/trust-manager.ts`,
+`packages/tui/src/fuzzy.ts`, `packages/ai/src/models.ts`), and walked each into cyrup by ripgrep over
+`crates/`. Inter-tag drift in the six: `list-models.ts` gains a third `signal?: AbortSignal` param
+(+4 lines, shifting `:29+`); `config-selector.ts:25` and `startup-ui.ts:82` swap `new TUI(...)` for
+`new TuiMainScreen(...)`; the other three are byte-identical, as are the four consumed files — so
+every line number cited in `SEAM-061` … `SEAM-070` holds at either tag. Result: **10 items, 5 of them
+high**, all on the pre-launch surface. The shape is consistent enough to be worth naming: these
+screens were built as a thin shell around `cyrup-tui` selectors, and every settings-derived *input*
+to that shell (theme, keybindings, which loader, which option set) was dropped on the way in, while
+the drawing was ported faithfully. The ADR-0001 substrate carve-out covers `new TUI(...)`; it does
+not cover the arguments.
+
+**Confirmed covered by the same sweep, so nobody re-derives it.** `file-processor.ts` → `crates/cyrup/src/input.rs` is good (file-not-found bail, empty-file skip, the 4.5 MB base64 cap, the 80/85/70/55/40 quality ladder, and `autoResizeImages` genuinely threaded from settings at `input.rs:597`, not hardcoded). `buildInitialMessage` → `input.rs:528-551` `compose_inputs` is exact: pi's part order (stdin, fileText, messages[0]), the EMPTY `parts.concat()` separator (`initial-message.ts:40`), follow-ups as `messages[1..]`, images only when non-empty, and the load-bearing `data.trim() || undefined` on piped stdin (`main.ts:80` → `input.rs:564-571`). `formatTokenCount` and the whole `--list-models` table renderer match field for field (`main.rs:1342-1360`, `:1437-1453`). `shouldRunFirstTimeSetup`/`isOfficialDistribution` → `startup.rs:30-117`, all four gate conditions in pi's order. `showStartupSelector`'s missing-session-cwd use → `startup_ui.rs:281-336` + `main.rs:1043-1058`, including pi's `if (!selectedCwd) process.exit(0)`. `ConfigSelectorOptions` → `subcommands.rs:590-675`, including the `globalResolvedPaths` inherited-keys second resolve. `showFirstTimeSetup` is implemented and callerless — already PARITY-GAPS UW-2 / OQ-6, deliberately not re-filed. `session-picker.ts`'s third callback `onExit` (`:43-46`) is **dead upstream** — declared at `session-selector.ts:301`, assigned at `:800-802`, called nowhere — so cyrup collapsing Confirm/Cancel into `ResumeChoice` loses nothing; do not file it.
+
+**Surface sweep method and results.** (1) Mechanical 32-vs-32 RPC verb-set diff from `rpc-types.ts:20-72` against the `SessionCommand` variants at `rpc.rs:84-212` — one difference, `get_available_thinking_levels` (SEAM-014, re-derived rather than taken on trust). (2) Every response payload in `rpc-types.ts:110-231` compared field-by-field against its `handle` arm — produced SEAM-053 and confirmed the `get_state` field set. (3) Every `RpcExtensionUIRequest` union member (`rpc-types.ts:238-273`) against `extension_ui_request_json` (`rpc.rs:319-373`) and `extension_ui_effect_json` (`:394-449`) — only `setWidget` diverges, so SEAM-011 is the single survivor. (4) Full CLI flag-set diff of `args.ts:63-210` against `Cli` + `KNOWN_LONG_FLAGS` — pi has one flag cyrup lacks (SEAM-051), cyrup has three pi lacks (SEAM-057). (5) Framing surface: `jsonl.ts` vs `read_lines`/`write_out` — produced SEAM-054; the trailing-unterminated-line-at-EOF and CRLF cases match exactly. (6) Signal surface: pi's per-host `registerSignalHandlers` vs `signals.rs` plus a full `CancelToken` consumer trace — produced SEAM-047 and, on re-check, SEAM-059. (7) `AgentSessionRuntime` method surface against `runtime.rs` — produced SEAM-049 and SEAM-056. (8) `SessionTreeNode` vs `tree_json` — produced SEAM-060.
+
+**Severity re-derivation and mechanism carve-outs (repair pass).** Two ratings changed and are argued
+in their item bodies (`SEAM-051` → high, `SEAM-020` → medium). Two further candidates were examined
+under `README.md:106-107` and **stay where they are**, recorded so the next pass does not re-open
+them: `SEAM-047` stays `high` (an unstoppable `--mode rpc` host is a hang and a resource leak, not
+data loss or a bypass — though it becomes the worst item in the file the moment anyone runs cyrup
+under a supervisor), and `SEAM-059` stays `medium` (Ctrl-C after a session replacement fails to stop
+the live turn, which wastes tokens and ignores an explicit user instruction, but destroys nothing).
+Neither is a `critical` by the definition; both are ranked above every other medium in practice by
+their coupling to `SEAM-047`. Separately, the mechanism carve-outs that the `cli/` sweep declined to
+extend are recorded with the sweep above: `new TUI(...)` / `TuiMainScreen` widget-tree plumbing,
+`clearStartupTui`'s 25 ms settle (unnecessary because cyrup enters and leaves the alternate screen,
+`startup_selector.rs:44,62`), the `new Promise` + double-resolve latch idiom, and `loadStartupThemes`'
+`packageManager.resolve(async () => "skip")` install-prompt suppression are all genuinely
+mechanism-N/A — the settings-derived arguments they carry are not, and are filed as `SEAM-066`.
+
+**Rejected with reason, so no future pass re-derives them.** *SEAM-019 as written* — `--ui-mode`/`--alt` do not exist at v0.83.0 or v0.84.1 (`git grep -nE 'uiMode|"--alt"' v0.83.0 -- packages/coding-agent/src` is empty); the ID is retained as misdescribed and superseded by SEAM-051, not deleted. *SEAM-048's "two different functions" mechanism* — `resolved_command_owner` has **no production caller** (`grep -rn resolved_command_owner crates/` returns its definition plus three assertions in `cyrup-ext/tests/aggregation.rs:236-238`); live dispatch uses the last-wins `command_owner` at `facade.rs:328`, `facade.rs:1220`, `session.rs:1036` and `session.rs:1274`, so the item is written against the real mechanism. *SEAM-053's `fork` instance* — the `fork` verb passes `ForkPosition::Before` and always yields `Some(text)` on success; `clone` (the `position:"at"` verb) emits no `text` key at all, matching pi `rpc-mode.ts:625`. *SEAM-029's "cyrup cites pi wrongly" half* — `cli.rs`'s `args.ts:57,130,135` citations are accurate at the tag; only `diagnostics.rs:51` is off by two. *SEAM-008 raised to high* — the severity belongs to SEAM-047; double-booking one open half across two items distorts the plan. *`AgentSessionRuntime::dispose` awaiting `abort_and_settle`* where pi's `dispose()` does not abort at all — cyrup is strictly safer and this is the documented SEAM-024 fix, not a gap.
+
+**Checked and deliberately NOT filed**, so nobody redoes it. `--export` (`Exported to: {path}`, `main.rs:1330`, positional output path from `cli.positionals.first()`) matches `main.ts:578-590`. `resolve_app_mode` (`cli.rs:571-585`) matches `resolveAppMode` (`main.ts:109-120`) including both TTY tests, and `should_take_over_stdout` (`cli.rs:690-692`) matches `isPlainRuntimeMetadataCommand` (`main.ts:126-128`). `PI_STARTUP_BENCHMARK only supports interactive mode` is present at `main.rs:588-590` (pi `main.ts:857-861`). The RPC-only background catalog refresh is present and correctly mode-gated at `main.rs:349-364` (pi `main.ts:863-866`). The non-interactive no-models guard is present at `main.rs:656`/`:764` → `no_models_available()` (`main.rs:1893`). `--min-expiry` unit parsing matches `credential-print.ts:50-61`. `get_entries`' `since` filter and `Entry not found:` message, `get_tree`'s `{tree,leafId}` envelope, `export_html`'s `{path}`, `cycle_model`'s `{model,thinkingLevel,isScoped}|null` and `cycle_thinking_level`'s `{level}|null` all match their `rpc-types.ts` lines. `read_lines`' CRLF and trailing-partial-line handling matches `jsonl.ts` exactly.
+
+**Blind spots and things taken on trust.** Static only — nothing was built, run or tested. (a) SEAM-047's "`--mode rpc` never returns after SIGTERM" is traced end-to-end through the code (no cancel consumer, no signal-reachable loop exit) but not reproduced; the reasoning depends on the standard tokio behaviour that a `ReceiverStream` whose senders are still held pends forever, which is taken on trust. (b) SEAM-052's `cyrup <version>` rendering rests on clap's documented `ArgAction::Version` output, not on observed output — the ORDERING half is airtight from `main.rs:119` vs `:130` and does not depend on it. (c) SEAM-056's severity assumes a persisted-but-unwritten session yields an IO error from `SessionManager::open`; only the absence of pi's actionable message in `crates/` was verified, not the text cyrup actually produces.
+
+**Still blind after the repair pass.** The pre-launch surface is now read on the *bin* side, but three
+things next to it are not. (a) `cyrup-tui/src/session_selector.rs` was read for the members
+`SEAM-061`/`SEAM-062` turn on — the scope/`show_path`/rename paths, the header and hint rows, and
+`handle` — and **not** line by line against `modes/interactive/components/session-selector.ts` (1 000+
+lines upstream); the sort modes, the named-filter, the threaded/flat rendering and the delete
+confirmation are unaudited on both sides, and this pass found two defects in the parts it did open,
+so the prior for more is high. (b) `run_startup_selector` (`cyrup-tui/src/startup_selector.rs`) and
+the `Selector` it mounts were read for their theme/keymap inputs only. (c) `cyrup config`
+(`subcommands.rs:590-675`) was checked against `ConfigSelectorOptions` but its interactive body was
+not driven. All three are TTY surfaces, so per the standing rule nothing here closes without a live
+run regardless of how the tests read.
+
+**Not audited — a divergence in any of these would not have been caught here.** The INNER element shapes on the RPC wire remain largely unread on both sides: `entries_json()` elements vs pi's `SessionEntry`, `BashResult`, the `Model` serialization that `set_model`/`get_available_models`/`get_state` all embed, and `AgentMessage` in `get_messages`. These are the largest payloads on the wire and the previous edition flagged them as unaudited too; this pass closed only the `tree_json` corner of the class (SEAM-060), which immediately produced a finding — expect more in the rest of it. The `AgentSessionEvent` union against pi's event union (the bulk of the RPC stdout stream) belongs to areas 03/06 and was not re-derived; only the `message_update` projection was verified. `packages/server`'s v0.83.0→v0.84.1 rewrite (81 files, +8588/−1985 — a complete replacement of `cli.ts`/ipc/`supervisor.ts` by a unix-transport session server) was enumerated but not read; PARITY-GAPS asserts the package is outside the port's dependency closure and that was not independently re-verified against v0.84.1's `package.json`. `pi/packages/protocol` and `pi/packages/client` were listed but not read — VL-P23 owns them.
+
+**Method limits.** *(Partly superseded by the repair pass: the `cli/` startup path is no longer a
+name-only diff — six files were read end to end at both tags. What follows still holds for
+`args.ts`'s per-flag semantics, which the repair pass did not touch.)* The CLI sweep compared flag NAMES and their leniency treatment exhaustively; it did not compare per-flag SEMANTICS end to end (e.g. whether `--print`'s next-token capture at `args.ts:140-146` is reproduced by clap's positional handling, or whether `--name` with no following value produces pi's `--name requires a value` at `args.ts:102` rather than a clap exit-2 usage error — `--name` is in `VALUE_LONG_FLAGS` at `diagnostics.rs:76` and falls through when it is the last token, but the resulting message was not traced). The RPC handler sweep read every arm of `handle`, but the blocking/concurrent dispatch classification (`is_inline_command`, `rpc.rs:881-890`) was checked for `prompt`/`steer`/`follow_up` only. The workspace has **no `CLAUDE.md`** — the file this README and PARITY-GAPS repeatedly cite for the deliberate-divergence list and the out-of-scope pi package list does not exist here — so "is this package in scope?" could only be answered from PARITY-GAPS' own assertion, which is why SEAM-058 is filed as tracking rather than work.
+
+**Handoffs (repair pass additions).** To **area 07** (TUI): `SEAM-061`'s and `SEAM-062`'s selector
+halves live in `crates/cyrup-tui/src/session_selector.rs` — the missing `SessionAction::ToggleScope`
+arm, the `show_path`/`scope` coupling, and a `set_rename_enabled` gate; the loader and `on_apply`
+halves are this area's, and neither item closes on one half alone. `SEAM-063`'s in-app `/resume` call
+site is `cyrup-tui/src/app.rs:4021-4028`, sharing the helper with the pre-launch site. To **area 05**:
+`SEAM-067` must land *after* whatever keybinding-name alias table that area's repair pass produces
+for pi's `migrateKeybindingsConfigFile`, or a legacy `keybindings.json` will still read as empty in
+the pre-launch selectors; and `SEAM-066`'s theme resolution reads the same startup `SettingsManager`
+area 05 owns. To **area 01**: `SEAM-020`'s auth predicate is a provider-tier concern
+(`provider.rs:237-256`), and the v0.84.1 `AbortSignal.timeout` on `getAvailable` remains PARITY-GAPS
+VL-P6 there, not here. To **area 04**: `SEAM-070` is the process-*name* half only — the
+`PI_CODING_AGENT` env half of the same `main.rs:53-57` block is TOOL-031 / PB-5.
+
+**Handoffs.** To **area 06** (`cyrup-ext`): SEAM-048's and SEAM-055's fixes both land in `cyrup-ext/src/registry.rs:655-669`, `command_names()` carries the identical last-wins defect for whatever else consumes it, and the four `command_owner` dispatch sites named in SEAM-048 are that area's call. To **area 07** (TUI): SEAM-051's rendering half is the alt-screen work (PARITY-GAPS VL-P19); only the arg-parsing half is filed here. To **area 05**: `--tui-mode`'s settings tier (`tuiMode` in `settings-manager.ts:135`/`:1128-1134`) is a settings key not audited here. To **area 01**: the v0.84.1 15-second `AbortSignal.timeout` threaded through `ModelRuntime.create`, `resolveModelScope`, `listModels` and `modelRuntime.refresh` (`main.ts:738`/`:792`/`:864`/`:915`) is PARITY-GAPS VL-P6, a provider-tier concern — only that cyrup's call sites pass no deadline was confirmed here.
+
+**Citation hygiene.** Every cyrup line number in this edition was re-resolved by grep/read at HEAD in this pass, not carried over from the previous edition — several had moved by 100+ lines (`abort()` 1242→1348, `dispose` 2165→2380, `emit_session_start` 2206→2525, the setWidget emitter 395→423, `state_view` 1226→1410, the WIT `set-widget` 307→326). Where the auditor and the refuter disagreed on a line by one or two, the refuter's number is the one written.

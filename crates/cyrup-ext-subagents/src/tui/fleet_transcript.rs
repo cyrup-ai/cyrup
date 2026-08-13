@@ -49,16 +49,19 @@
 //!    surface in this crate's dependency closure, so `read` output renders unhighlighted. pi's own
 //!    `language === undefined` branch (`:465`, `output.split("\n")`) is exactly that, so this is a
 //!    branch pi itself takes for an unknown extension rather than a shape it never produces.
-//! 3. **Record schema: pi's `recordType` PLUS cyrup's own NDJSON tags.** pi's transcript file is
-//!    written by its own transcript writer as `{"recordType":"message"|"tool_start"|"tool_end"|
-//!    "stderr"|"truncated", …}`. cyrup's per-child `.jsonl` artifact
-//!    ([`crate::artifacts::ArtifactPaths::jsonl_path`]) is the child's raw NDJSON event stream
-//!    (`{"type":"message_end"|"tool_execution_start"|…}`, [`crate::exec::ndjson::SubagentEvent`]) —
-//!    pi's fifth `ArtifactPaths` field `transcriptPath` has no cyrup analogue, as
-//!    `artifacts.rs:58` already records. [`parse_transcript_lines`] therefore recognises BOTH: pi's
-//!    `recordType` vocabulary verbatim and first, then cyrup's `type` vocabulary mapped onto the
-//!    identical event semantics. Without the second half this whole module would be correctly
-//!    ported and permanently empty against the only transcript file cyrup actually writes.
+//! 3. **Record schema: pi's `recordType` PLUS a rewrite of cyrup's own records.** pi's transcript
+//!    file is written by its own transcript writer as `{"recordType":"message"|"tool_start"|
+//!    "tool_end"|"stderr"|"truncated", …}`, and pi's fifth `ArtifactPaths` field `transcriptPath`
+//!    has no cyrup analogue (`artifacts.rs:58`). [`parse_transcript_lines`] therefore recognises
+//!    pi's vocabulary verbatim and first, and otherwise runs [`rewrite_cyrup_record`], which maps
+//!    the two record shapes cyrup really writes onto pi's — TAG AND FIELDS. That second clause is
+//!    the whole point: a tag rename alone left this module correctly ported and permanently EMPTY,
+//!    because cyrup's message body is a `content` array where pi's is a flat string, its tool
+//!    output rides inside `tool_execution_end.result` where pi's is a separate `toolResult`
+//!    message, its tool arguments are an object where pi's are preview strings — and the file
+//!    [`super::fleet::transcript_target`] actually points at is written by
+//!    [`crate::artifacts::run_artifact_jsonl_lines`], whose `tool_call`/`result` tags the rename
+//!    did not mention at all. See [`rewrite_cyrup_record`] for the per-shape mapping.
 
 use std::path::{Path, PathBuf};
 
@@ -680,11 +683,18 @@ pub fn parse_transcript_lines(lines: &[String], conversation_started: bool) -> P
             continue;
         };
 
-        // [CYRUP-DELTA, module doc item 3] Normalise cyrup's own NDJSON `type` tag onto pi's
-        // `recordType` vocabulary before dispatch; a record carrying pi's own `recordType` is
-        // untouched.
-        let record_type = string_value(record.get("recordType"))
-            .or_else(|| cyrup_record_type(record).map(str::to_string));
+        // [CYRUP-DELTA, module doc item 3] Rewrite a cyrup-shaped record into pi's own record
+        // vocabulary — FIELDS as well as tag — before dispatch. One cyrup record can carry what pi
+        // spreads over several (a settled `result` holds both the assistant output and the run's
+        // error; a `tool_execution_end` holds both the completion and the tool's output), so the
+        // rewrite yields a LIST. A record carrying pi's own `recordType` passes through untouched.
+        let rewritten: Vec<serde_json::Map<String, Value>> =
+            if record.contains_key("recordType") { Vec::new() } else { rewrite_cyrup_record(record) };
+        let dispatch: Vec<&serde_json::Map<String, Value>> =
+            if rewritten.is_empty() { vec![record] } else { rewritten.iter().collect() };
+
+        for record in dispatch {
+        let record_type = string_value(record.get("recordType"));
         let timestamp = number_value(record.get("ts"));
 
         match record_type.as_deref() {
@@ -761,6 +771,7 @@ pub fn parse_transcript_lines(lines: &[String], conversation_started: bool) -> P
             }
             _ => {}
         }
+        }
     }
 
     // pi `:378-380` — `delete event.resultSeen` before returning.
@@ -829,20 +840,211 @@ fn apply_tool_result(
     }
 }
 
-/// \[CYRUP-DELTA, module doc item 3] Map one of cyrup's own NDJSON event tags
-/// ([`crate::exec::ndjson::SubagentEvent`]'s `type` discriminant, as written into a child's
-/// `.jsonl` artifact) onto pi's `recordType` vocabulary, so [`parse_transcript_lines`] folds the
-/// transcript file cyrup ACTUALLY writes with the identical semantics.
+/// \[CYRUP-DELTA, module doc item 3] Rewrite one cyrup-shaped transcript record into pi's own
+/// record vocabulary — **field names included** — so [`parse_transcript_lines`] folds the files
+/// cyrup ACTUALLY writes with pi's own semantics.
 ///
-/// Only the tags that carry transcript-visible content are mapped; `agent_start`, `turn_start`,
-/// `turn_end`, `message_start` and `message_update` deliberately map to nothing, mirroring pi's
-/// own `if (recordType !== "message") continue` fall-through for records it does not display.
-fn cyrup_record_type(record: &serde_json::Map<String, Value>) -> Option<&'static str> {
-    match record.get("type")?.as_str()? {
-        "message_end" => Some("message"),
-        "tool_execution_start" => Some("tool_start"),
-        "tool_execution_end" => Some("tool_end"),
+/// # Why this is a rewrite and not a tag rename
+///
+/// An earlier version of this mapped three `type` tags onto pi's `recordType` names and stopped
+/// there. That produced an empty pane against every real file, because the FIELDS underneath the
+/// tags do not line up:
+///
+/// * pi's `message` record carries a flat `text` string; cyrup's `message_end` carries a whole
+///   `AgentMessage` whose body is a `content` ARRAY of typed blocks
+///   (`cyrup_core::Content::{Text,Thinking,ToolCall,Image}`). `string_value(message.content)` on an
+///   array is `None`, so no assistant or supervisor turn ever rendered.
+/// * pi's tool output arrives as a separate `role: "toolResult"` message; cyrup's
+///   `tool_execution_end` carries the result INLINE in its `result` field, which the old map never
+///   read — so every tool row rendered with a status glyph and no output.
+/// * pi's `tool_start` reads `argsPreview`/`argsPayload` strings; cyrup emits an `args` OBJECT, so
+///   every collapsed tool row rendered bare.
+///
+/// # The two vocabularies
+///
+/// Both are handled, because two different files reach [`read_fleet_transcript`]:
+///
+/// 1. **The settled-run artifact** ([`crate::artifacts::run_artifact_jsonl_lines`]) — the file
+///    [`super::fleet::transcript_target`] points at for a foreground child. Its records are
+///    `{"type":"tool_call","text":…,"expandedText":…}` per call plus one
+///    `{"type":"result","agent":…,"exitCode":…,"model":…,"output":…,"error":…}`. Neither tag was
+///    recognised at all before, which is why a settled child's pane was blank.
+/// 2. **The raw child NDJSON stream** ([`crate::exec::ndjson::SubagentEvent`]) — what a live
+///    attempt's `.jsonl` holds.
+///
+/// Records that carry no transcript-visible content (`agent_start`, `turn_start`, `turn_end`,
+/// `message_start`, `message_update`, and every lifecycle tag) rewrite to nothing, mirroring pi's
+/// own fall-through for records it does not display.
+fn rewrite_cyrup_record(
+    record: &serde_json::Map<String, Value>,
+) -> Vec<serde_json::Map<String, Value>> {
+    let Some(tag) = record.get("type").and_then(Value::as_str) else { return Vec::new() };
+    match tag {
+        // --- vocabulary 1: the settled-run artifact ------------------------------------------
+        "tool_call" => {
+            let text = string_value(record.get("text")).unwrap_or_default();
+            let expanded = string_value(record.get("expandedText"));
+            let (name, args) = split_formatted_tool_call(&text);
+            // A settled artifact records the call, never a failure — `SingleResult::tool_calls`
+            // has no error channel — so the pair is `tool_start` + a clean `tool_end`, which is
+            // pi's own COMPLETE status (`fleet-transcript.ts:307`). Rendering it as `running`
+            // instead would mark every settled child's tools as still in flight.
+            let mut start = serde_json::Map::new();
+            start.insert("recordType".into(), Value::String("tool_start".into()));
+            start.insert("toolName".into(), Value::String(name.clone()));
+            if !args.is_empty() {
+                start.insert("argsPreview".into(), Value::String(args));
+            }
+            if let Some(expanded) = expanded {
+                start.insert("argsPayload".into(), Value::String(expanded));
+            }
+            let mut end = serde_json::Map::new();
+            end.insert("recordType".into(), Value::String("tool_end".into()));
+            end.insert("toolName".into(), Value::String(name));
+            vec![start, end]
+        }
+        "result" => {
+            let mut out = Vec::new();
+            // The run's final assistant output IS the conversation this artifact preserves.
+            if let Some(output) = string_value(record.get("output")) {
+                let mut message = serde_json::Map::new();
+                message.insert("recordType".into(), Value::String("message".into()));
+                message.insert("role".into(), Value::String("assistant".into()));
+                message.insert("text".into(), Value::String(output));
+                if let Some(model) = string_value(record.get("model")) {
+                    message.insert("model".into(), Value::String(model));
+                }
+                out.push(message);
+            }
+            // pi renders a run failure through its `stderr` record, the same red notice
+            // (`fleet-transcript.ts:322-329`).
+            if let Some(error) = string_value(record.get("error")) {
+                let mut notice = serde_json::Map::new();
+                notice.insert("recordType".into(), Value::String("stderr".into()));
+                notice.insert("text".into(), Value::String(error));
+                out.push(notice);
+            }
+            out
+        }
+        // --- vocabulary 2: the raw child NDJSON stream ---------------------------------------
+        "message_end" => {
+            let Some(message) = object_value(record.get("message")) else { return Vec::new() };
+            let Some(role) = message.get("role").and_then(Value::as_str) else { return Vec::new() };
+            let timestamp = number_value(message.get("timestamp"));
+            let mut out = serde_json::Map::new();
+            out.insert("recordType".into(), Value::String("message".into()));
+            out.insert("role".into(), Value::String(role.to_string()));
+            if let Some(ts) = timestamp {
+                out.insert("ts".into(), Value::from(ts));
+            }
+            // `content` is an array of typed blocks on EVERY role; flatten it to the flat `text`
+            // pi's own record carries.
+            if let Some(text) = content_text(message.get("content")) {
+                out.insert("text".into(), Value::String(text));
+            }
+            if role == "toolResult" {
+                for key in ["toolCallId", "toolName"] {
+                    if let Some(v) = string_value(message.get(key)) {
+                        out.insert(key.into(), Value::String(v));
+                    }
+                }
+                if message.get("isError") == Some(&Value::Bool(true)) {
+                    out.insert("isError".into(), Value::Bool(true));
+                }
+            }
+            if role == "assistant" && let Some(model) = string_value(message.get("model")) {
+                out.insert("model".into(), Value::String(model));
+            }
+            vec![out]
+        }
+        "tool_execution_start" => {
+            let mut out = serde_json::Map::new();
+            out.insert("recordType".into(), Value::String("tool_start".into()));
+            for key in ["toolCallId", "toolName"] {
+                if let Some(v) = string_value(record.get(key)) {
+                    out.insert(key.into(), Value::String(v));
+                }
+            }
+            if let Some(args) = record.get("args").filter(|v| v.is_object()) {
+                let preview = crate::exec::tool_call_summary::extract_tool_args_preview(args);
+                if !preview.trim().is_empty() {
+                    out.insert("argsPreview".into(), Value::String(preview));
+                }
+                if let Ok(payload) = serde_json::to_string(args) {
+                    out.insert("argsPayload".into(), Value::String(payload));
+                }
+            }
+            vec![out]
+        }
+        "tool_execution_end" => {
+            // A `toolResult` message rather than a bare `tool_end`: it sets the SAME status
+            // (`fleet-transcript.ts:349`) and additionally attaches the output, which a `tool_end`
+            // record has no field for. The tool's own `result.content` is where cyrup puts what pi
+            // puts in the separate message.
+            let mut out = serde_json::Map::new();
+            out.insert("recordType".into(), Value::String("message".into()));
+            out.insert("role".into(), Value::String("toolResult".into()));
+            for key in ["toolCallId", "toolName"] {
+                if let Some(v) = string_value(record.get(key)) {
+                    out.insert(key.into(), Value::String(v));
+                }
+            }
+            let result = record.get("result");
+            let is_error = record.get("isError") == Some(&Value::Bool(true))
+                || result.and_then(|r| r.get("isError")) == Some(&Value::Bool(true));
+            if is_error {
+                out.insert("isError".into(), Value::Bool(true));
+            }
+            let text = content_text(result.and_then(|r| r.get("content")))
+                .or_else(|| content_text(result));
+            if let Some(text) = text {
+                out.insert("text".into(), Value::String(text));
+            }
+            vec![out]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The displayable text of a `content` value: a bare string, or the concatenation of the `text`
+/// members of an array of typed blocks (`cyrup_core::Content`, `{"type":"text","text":…}`).
+///
+/// Non-text blocks contribute nothing — a `thinking` block is not part of the visible transcript
+/// (pi's transcript writer records assistant TEXT), a `toolCall` block is already rendered as its
+/// own tool row, and an `image` block has no textual form.
+fn content_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(s) => (!s.trim().is_empty()).then(|| s.clone()),
+        Value::Array(blocks) => {
+            let joined = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            (!joined.trim().is_empty()).then_some(joined)
+        }
         _ => None,
+    }
+}
+
+/// Split one [`crate::exec::tool_call_summary::format_tool_call`] preview back into its tool name
+/// and its argument text.
+///
+/// That formatter emits exactly three shapes: `"$ <command>"` for `bash`, `"<name> <path>"` for
+/// `read`/`write`/`edit`, and `"<name> <json>"` for everything else. The `$` prefix is `bash`'s own
+/// marker, so it identifies the tool without the record having to carry a name — which the settled
+/// artifact does not ([`crate::exec::tool_call_summary::ToolCallSummary`] is two preview strings and
+/// nothing else).
+fn split_formatted_tool_call(text: &str) -> (String, String) {
+    let trimmed = text.trim();
+    if let Some(command) = trimmed.strip_prefix("$ ") {
+        return ("bash".to_string(), command.trim().to_string());
+    }
+    match trimmed.split_once(char::is_whitespace) {
+        Some((name, args)) if !name.is_empty() => (name.to_string(), args.trim().to_string()),
+        _ if trimmed.is_empty() => ("tool".to_string(), String::new()),
+        _ => (trimmed.to_string(), String::new()),
     }
 }
 
@@ -1270,6 +1472,356 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
+    // The cyrup record rewrite (module doc item 3) — against the files cyrup ACTUALLY writes
+    // -----------------------------------------------------------------------------------------
+
+    /// The artifact [`super::super::fleet::transcript_target`] points at for a foreground child is
+    /// written by `artifacts::run_artifact_jsonl_lines`, whose vocabulary is `tool_call`/`result`.
+    /// Before the rewrite, neither tag was recognised at all and this pane was EMPTY.
+    #[test]
+    fn the_settled_run_artifact_yields_conversation_and_tool_rows() {
+        let lines: Vec<String> = vec![
+            r#"{"type":"tool_call","text":"$ ls -la","expandedText":"$ ls -la /very/long/path"}"#.into(),
+            r#"{"type":"tool_call","text":"read src/main.rs","expandedText":"read src/main.rs"}"#.into(),
+            r#"{"type":"result","agent":"reviewer","exitCode":0,"model":"opus","output":"All good.","error":null}"#.into(),
+        ];
+        let parsed = parse_transcript_lines(&lines, false);
+        assert!(!parsed.events.is_empty(), "the real artifact must not parse to nothing");
+
+        let tools: Vec<&FleetToolEvent> = parsed
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                FleetTranscriptEvent::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2, "one row per recorded call");
+        assert_eq!(tools[0].name, "bash", "the `$ ` prefix identifies bash");
+        assert_eq!(tools[0].args.as_deref(), Some("ls -la"));
+        assert_eq!(tools[0].status, ToolStatus::Complete, "a settled run's tools are not running");
+        assert_eq!(tools[1].name, "read");
+        assert_eq!(tools[1].args.as_deref(), Some("src/main.rs"));
+
+        let assistant = parsed.events.iter().find_map(|e| match e {
+            FleetTranscriptEvent::Assistant { text, model, .. } => Some((text, model)),
+            _ => None,
+        });
+        let (text, model) = assistant.expect("the run's final output IS the conversation");
+        assert_eq!(text, "All good.");
+        assert_eq!(model.as_deref(), Some("opus"));
+    }
+
+    /// The test above hand-writes the artifact's JSON, which can silently drift from the writer.
+    /// This one drives the REAL producer chain end to end —
+    /// [`crate::exec::ToolCallSummary::from_call`] -> [`crate::exec::SingleResult`] ->
+    /// [`crate::artifacts::run_artifact_jsonl_lines`] -> the bytes this pane reads -> rendered
+    /// [`Line`]s — so a change to either side that breaks the pane fails HERE rather than shipping
+    /// an empty inspector.
+    #[test]
+    fn the_writers_own_output_renders_as_conversation_and_tool_rows() {
+        let result = crate::exec::SingleResult {
+            agent: "reviewer".to_string(),
+            task: "task".to_string(),
+            exit_code: 0,
+            usage: Default::default(),
+            model: Some(cyrup_core::ModelId::from("claude-opus-4-8")),
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: Some("The change is safe.".to_string()),
+            structured_output: None,
+            acceptance: None,
+            detached: false,
+            interrupted: false,
+            timed_out: false,
+            stopped: false,
+            process_signal: None,
+            error: None,
+            saved_output_path: None,
+            tool_calls: vec![
+                crate::exec::ToolCallSummary::from_call(
+                    "bash",
+                    &serde_json::json!({ "command": "cargo test -p cyrup-ext-subagents" }),
+                ),
+                crate::exec::ToolCallSummary::from_call(
+                    "read",
+                    &serde_json::json!({ "file_path": "src/lib.rs" }),
+                ),
+            ],
+            output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
+        };
+
+        // Exactly the bytes `extension.rs:4926` / `background/runner_main.rs:2612` write.
+        let lines = crate::artifacts::run_artifact_jsonl_lines(&result);
+        let parsed = parse_transcript_lines(&lines, false);
+        assert!(
+            !parsed.events.is_empty(),
+            "the writer's own output must not parse to nothing — that is the empty-pane bug"
+        );
+
+        let tools: Vec<&FleetToolEvent> = parsed
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                FleetTranscriptEvent::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2, "one row per call the writer recorded");
+        assert_eq!(tools[0].name, "bash");
+        assert_eq!(tools[0].args.as_deref(), Some("cargo test -p cyrup-ext-subagents"));
+        assert_eq!(tools[0].status, ToolStatus::Complete);
+        assert_eq!(tools[1].name, "read");
+        assert_eq!(tools[1].args.as_deref(), Some("src/lib.rs"));
+
+        let (text, model) = parsed
+            .events
+            .iter()
+            .find_map(|e| match e {
+                FleetTranscriptEvent::Assistant { text, model, .. } => Some((text, model)),
+                _ => None,
+            })
+            .expect("the run's final output IS the conversation this artifact preserves");
+        assert_eq!(text, "The change is safe.");
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+
+        // …and it reaches the painted pane, with the real text in real spans.
+        let transcript = transcript_with(parsed.events.clone());
+        let rendered = render_fleet_transcript(&transcript, 60, false);
+        let flat = th::lines_text(&rendered);
+        assert!(flat.contains("The change is safe."), "the assistant turn is painted");
+        assert!(flat.contains("cargo test -p cyrup-ext-subagents"), "the bash args are painted");
+        assert!(flat.contains("src/lib.rs"), "the read args are painted");
+    }
+
+    #[test]
+    fn a_failed_run_records_its_error_as_a_notice() {
+        let lines = vec![
+            r#"{"type":"result","agent":"a","exitCode":1,"output":null,"error":"boom"}"#.to_string(),
+        ];
+        let parsed = parse_transcript_lines(&lines, false);
+        let notice = parsed.events.iter().find_map(|e| match e {
+            FleetTranscriptEvent::Notice { text, tone, .. } => Some((text.clone(), *tone)),
+            _ => None,
+        });
+        assert_eq!(notice, Some(("boom".to_string(), NoticeTone::Error)));
+    }
+
+    /// The raw child NDJSON stream. Its message body is a `content` ARRAY, which is exactly what a
+    /// tag-only rename could not read.
+    #[test]
+    fn a_content_array_message_becomes_a_rendered_turn() {
+        let lines = vec![
+            r#"{"type":"message_end","message":{"role":"assistant","model":"sonnet","timestamp":42,"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"hello there"}]}}"#.to_string(),
+            r#"{"type":"message_end","message":{"role":"user","timestamp":43,"content":[{"type":"text","text":"do it"}]}}"#.to_string(),
+        ];
+        let parsed = parse_transcript_lines(&lines, false);
+        let assistant = parsed.events.iter().find_map(|e| match e {
+            FleetTranscriptEvent::Assistant { text, model, timestamp } => {
+                Some((text.clone(), model.clone(), *timestamp))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            assistant,
+            Some(("hello there".to_string(), Some("sonnet".to_string()), Some(42))),
+            "the text block must be lifted out of the content array; thinking must not"
+        );
+        let user = parsed.events.iter().find_map(|e| match e {
+            FleetTranscriptEvent::User { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(user, Some("do it".to_string()), "a supervisor turn after an assistant one");
+    }
+
+    #[test]
+    fn a_tool_execution_pair_carries_its_arguments_and_its_output() {
+        let lines = vec![
+            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"echo hi"}}"#.to_string(),
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","isError":false,"result":{"content":[{"type":"text","text":"hi"}]}}"#.to_string(),
+        ];
+        let parsed = parse_transcript_lines(&lines, false);
+        let tool = parsed.events.iter().find_map(|e| match e {
+            FleetTranscriptEvent::Tool(t) => Some(t),
+            _ => None,
+        });
+        let tool = tool.expect("one tool row");
+        assert_eq!(tool.name, "bash");
+        assert_eq!(tool.status, ToolStatus::Complete);
+        assert_eq!(tool.args.as_deref(), Some("echo hi"), "args object must become a preview");
+        assert!(tool.args_payload.is_some(), "the full args object must survive for `x` expansion");
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("hi"),
+            "the tool's output rides inside `result.content` and must reach the row"
+        );
+    }
+
+    #[test]
+    fn a_failed_tool_execution_end_paints_as_an_error() {
+        let lines = vec![
+            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"read","args":{"path":"/nope"}}"#.to_string(),
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"read","isError":true,"result":{"content":[{"type":"text","text":"ENOENT"}]}}"#.to_string(),
+        ];
+        let parsed = parse_transcript_lines(&lines, false);
+        let tool = parsed.events.iter().find_map(|e| match e {
+            FleetTranscriptEvent::Tool(t) => Some(t),
+            _ => None,
+        });
+        let tool = tool.expect("one tool row");
+        assert_eq!(tool.status, ToolStatus::Error);
+        assert_eq!(tool.error.as_deref(), Some("ENOENT"));
+    }
+
+    #[test]
+    fn pis_own_record_type_vocabulary_still_wins_untouched() {
+        // A record carrying BOTH must be read as pi's — the rewrite is the fallback, not an override.
+        let lines = vec![
+            r#"{"recordType":"message","type":"tool_call","role":"assistant","text":"pi wins"}"#.to_string(),
+        ];
+        let parsed = parse_transcript_lines(&lines, false);
+        assert!(matches!(
+            parsed.events.first(),
+            Some(FleetTranscriptEvent::Assistant { text, .. }) if text == "pi wins"
+        ));
+    }
+
+    #[test]
+    fn lifecycle_only_records_rewrite_to_nothing() {
+        for tag in ["agent_start", "turn_start", "turn_end", "message_start", "message_update", "agent_settled"] {
+            let lines = vec![format!(r#"{{"type":"{tag}"}}"#)];
+            let parsed = parse_transcript_lines(&lines, false);
+            assert!(parsed.events.is_empty(), "{tag} must render nothing");
+            assert_eq!(parsed.malformed, 0, "{tag} is well-formed, just not displayable");
+        }
+    }
+
+    #[test]
+    fn a_formatted_tool_preview_splits_back_into_name_and_args() {
+        assert_eq!(split_formatted_tool_call("$ git status"), ("bash".into(), "git status".into()));
+        assert_eq!(split_formatted_tool_call("edit a/b.rs"), ("edit".into(), "a/b.rs".into()));
+        assert_eq!(
+            split_formatted_tool_call("grep {\"pattern\":\"x\"}"),
+            ("grep".into(), "{\"pattern\":\"x\"}".into())
+        );
+        assert_eq!(split_formatted_tool_call("bare"), ("bare".into(), String::new()));
+        assert_eq!(split_formatted_tool_call("   "), ("tool".into(), String::new()));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Painted-cell style assertions — the half `lines_text` cannot see
+    // -----------------------------------------------------------------------------------------
+
+    fn transcript_of(events: Vec<FleetTranscriptEvent>) -> FleetTranscript {
+        FleetTranscript {
+            path: PathBuf::from("/tmp/t.jsonl"),
+            events,
+            truncated: false,
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn the_assistant_and_supervisor_markers_paint_different_colours() {
+        let transcript = transcript_of(vec![
+            FleetTranscriptEvent::Assistant {
+                text: "answer".into(),
+                model: Some("opus".into()),
+                timestamp: None,
+            },
+            FleetTranscriptEvent::User { text: "ask".into(), timestamp: None },
+        ]);
+        let lines = render_fleet_transcript(&transcript, 60, false);
+        assert!(
+            th::paints_as(th::painted_style(&lines, 60, "◆"), Role::Accent),
+            "the assistant marker is accent"
+        );
+        assert!(
+            th::paints_as(th::painted_style(&lines, 60, "◇"), Role::Warning),
+            "the supervisor marker is warning — same shape family, different colour"
+        );
+        assert!(
+            th::paints_as(th::painted_style(&lines, 60, "│"), Role::BorderMuted),
+            "the rail is border-muted"
+        );
+        assert!(
+            th::paints_as(th::painted_style(&lines, 60, "· opus"), Role::Dim),
+            "the model suffix is dim"
+        );
+    }
+
+    #[test]
+    fn the_three_tool_status_glyphs_paint_three_distinct_colours() {
+        for (status, glyph, role) in [
+            (ToolStatus::Running, "●", Role::Warning),
+            (ToolStatus::Complete, "✓", Role::Success),
+            (ToolStatus::Error, "✗", Role::Error),
+        ] {
+            let transcript = transcript_of(vec![FleetTranscriptEvent::Tool(FleetToolEvent {
+                name: "bash".into(),
+                status,
+                args: Some("echo".into()),
+                ..FleetToolEvent::default()
+            })]);
+            let lines = render_fleet_transcript(&transcript, 60, false);
+            let painted = th::painted_style(&lines, 60, glyph);
+            assert!(th::paints_as(painted, role), "{glyph} must paint as {role:?}");
+        }
+    }
+
+    #[test]
+    fn a_tool_row_paints_its_name_title_coloured_and_its_args_dim() {
+        let transcript = transcript_of(vec![FleetTranscriptEvent::Tool(FleetToolEvent {
+            name: "grep".into(),
+            status: ToolStatus::Complete,
+            args: Some("needle".into()),
+            ..FleetToolEvent::default()
+        })]);
+        let lines = render_fleet_transcript(&transcript, 60, false);
+        assert!(th::paints_as(th::painted_style(&lines, 60, "grep"), Role::ToolTitle));
+        assert!(th::paints_as(th::painted_style(&lines, 60, "needle"), Role::Dim));
+        assert!(th::paints_as(th::painted_style(&lines, 60, "├─"), Role::BorderMuted));
+    }
+
+    #[test]
+    fn each_notice_tone_paints_its_own_colour() {
+        for (tone, role, text) in [
+            (NoticeTone::Error, Role::Error, "bad"),
+            (NoticeTone::Warning, Role::Warning, "careful"),
+            (NoticeTone::Muted, Role::Dim, "quiet"),
+        ] {
+            let transcript = transcript_of(vec![FleetTranscriptEvent::Notice {
+                text: text.into(),
+                tone,
+                timestamp: None,
+            }]);
+            let lines = render_fleet_transcript(&transcript, 40, false);
+            assert!(
+                th::paints_as(th::painted_style(&lines, 40, text), role),
+                "{tone:?} must paint as {role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transcript_warning_paints_warning_and_the_truncation_hint_paints_dim() {
+        let transcript = FleetTranscript {
+            path: PathBuf::from("/tmp/t.jsonl"),
+            events: vec![FleetTranscriptEvent::User { text: "hi".into(), timestamp: None }],
+            truncated: true,
+            warning: Some("clipped".into()),
+        };
+        let lines = render_fleet_transcript(&transcript, 60, false);
+        assert!(th::paints_as(th::painted_style(&lines, 60, "clipped"), Role::Warning));
+        assert!(th::paints_as(
+            th::painted_style(&lines, 60, "↑ Earlier activity omitted"),
+            Role::Dim
+        ));
+    }
+
+    // -----------------------------------------------------------------------------------------
     // Sanitization (pi :12-92)
     // -----------------------------------------------------------------------------------------
 
@@ -1491,14 +2043,22 @@ mod tests {
     #[test]
     fn cyrup_ndjson_tags_map_onto_the_same_event_semantics() {
         // [CYRUP-DELTA] module doc item 3.
+        //
+        // FIXTURE CORRECTED: this test used to feed records with `role`/`text`/`ts` at the TOP
+        // level of a `message_end` and an `argsPreview` STRING on a `tool_execution_start`. Cyrup
+        // emits neither — `SubagentEvent::MessageEnd` wraps a whole `AgentMessage` (whose body is a
+        // `content` array) and `ToolExecutionStart` carries an `args` OBJECT
+        // (`exec/ndjson.rs:113-155`). The old fixture therefore proved the mapping against a file
+        // that does not exist, which is how the pane could pass this test and still render nothing.
+        // The assertions below are unchanged and extended; only the input is now real.
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_transcript(
             dir.path(),
             "t.jsonl",
             &[
-                r#"{"type":"message_end","role":"assistant","text":"from cyrup","ts":10}"#,
-                r#"{"type":"tool_execution_start","toolName":"bash","toolCallId":"c9","argsPreview":"pwd","ts":20}"#,
-                r#"{"type":"tool_execution_end","toolCallId":"c9","isError":true,"ts":30}"#,
+                r#"{"type":"message_end","message":{"role":"assistant","model":"opus","timestamp":10,"content":[{"type":"text","text":"from cyrup"}]}}"#,
+                r#"{"type":"tool_execution_start","toolName":"bash","toolCallId":"c9","args":{"command":"pwd"}}"#,
+                r#"{"type":"tool_execution_end","toolCallId":"c9","toolName":"bash","isError":true,"result":{"content":[{"type":"text","text":"permission denied"}]}}"#,
             ],
         );
         let transcript = read_fleet_transcript(
@@ -1512,10 +2072,20 @@ mod tests {
             transcript.events.iter().map(FleetTranscriptEvent::kind).collect::<Vec<_>>(),
             vec!["assistant", "tool"]
         );
+        let FleetTranscriptEvent::Assistant { text, model, timestamp } = &transcript.events[0]
+        else {
+            panic!("expected assistant event");
+        };
+        assert_eq!(text, "from cyrup");
+        assert_eq!(model.as_deref(), Some("opus"));
+        assert_eq!(*timestamp, Some(10));
         let FleetTranscriptEvent::Tool(tool) = &transcript.events[1] else {
             panic!("expected tool event");
         };
         assert_eq!(tool.status, ToolStatus::Error);
+        assert_eq!(tool.name, "bash");
+        assert_eq!(tool.args.as_deref(), Some("pwd"));
+        assert_eq!(tool.error.as_deref(), Some("permission denied"));
     }
 
     #[test]

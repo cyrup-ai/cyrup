@@ -158,7 +158,7 @@ impl FrameReader {
 /// socket. A hostile sender can thus disconnect an arbitrary third session. cyrup's guard sees the
 /// `null` here and answers `delivery_failed` to the SENDER instead, which is fail-closed and
 /// harms nobody else. That is a deliberate refusal to reproduce an upstream amplification bug, and
-/// it is recorded in `PARITY-GAPS.md` (G136c) rather than left as an undocumented difference.
+/// it is recorded in `docs/gap-analysis/PARITY-GAPS.md` (G136c) rather than left as an undocumented difference.
 ///
 /// The slow path runs only after a real `number out of range` error, so well-formed traffic pays
 /// nothing.

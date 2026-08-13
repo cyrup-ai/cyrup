@@ -33,6 +33,24 @@ static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
 const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
+/// Missions are ON by default, and a task-bearing dispatch auto-creates one
+/// (`missions/lifecycle.rs::prepare_mission_launch`). Its cross-project POINTER INDEX defaults to
+/// `agent_dir()/missions/index` — the developer's real `~/.cyrup/agent/missions/index`, beside
+/// `settings.json`, `models-store.json` and `sessions/` — so a tempdir cwd alone does not isolate
+/// it. `config.missions.globalIndexDir` is the production lever that does, and it is the lever
+/// upstream's own fixtures use (`pi-subagents` `test/unit/mission-lifecycle.test.ts:18`).
+fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
+    SubagentExtensionConfig {
+        missions: Some(cyrup_ext_subagents::missions::MissionStoreConfig {
+            global_index_dir: Some(
+                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn fixture_binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_cyrup-subagent-fixture"))
 }
@@ -172,7 +190,7 @@ async fn tool_parallel_tasks_run_n_real_children_with_per_task_outputs() {
     let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        scoped_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
 
@@ -226,7 +244,7 @@ async fn tool_parallel_count_multiplies_fan_out_into_that_many_real_children() {
     let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        scoped_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
 
@@ -274,7 +292,7 @@ async fn tool_parallel_rejects_duplicate_output_paths_before_any_spawn() {
     let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        scoped_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
 
@@ -320,7 +338,7 @@ async fn tool_chain_static_parallel_group_count_expands_fan_out() {
     let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        scoped_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
 
@@ -362,7 +380,7 @@ async fn slash_run_inline_model_override_reaches_the_child() {
     let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        scoped_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -403,7 +421,7 @@ async fn slash_chain_inline_group_count_multiplies_fan_out() {
     let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        scoped_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -447,7 +465,7 @@ async fn tool_chain_step_model_override_reaches_the_child() {
     let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        scoped_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
 

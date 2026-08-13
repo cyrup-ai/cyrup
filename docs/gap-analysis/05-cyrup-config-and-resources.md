@@ -1,0 +1,773 @@
+# 05 — cyrup-config + cyrup-resources
+
+Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolution, config values, login) and `cyrup/crates/cyrup-resources` (packages, discovery, skills/prompts/themes), plus the launch-path glue in `cyrup/crates/cyrup/src/main.rs`, `migrations.rs`, `cli.rs` and `cyrup-session-svc/src/builder.rs` that consumes them. Measured against `pi/packages/coding-agent/src/core/{settings-manager,model-resolver,model-runtime,models-store,model-config,auth-storage,trust-manager,project-trust,package-manager,provider-composer,resource-loader,prompt-templates,skills,slash-commands,keybindings,resolve-config-value}.ts`, `src/{config,migrations,main}.ts`, `src/utils/paths.ts` and `modes/interactive/theme/theme.ts` — read at the explicit tags **v0.83.0** (the ported baseline) and **v0.84.1** (upstream latest) rather than a floating HEAD.
+
+> **Re-audited 2026-08-12, cyrup HEAD `04c1ba2`** (working tree clean; `a9000b1` is docs-only), against
+> **pi v0.83.0** for parity and **pi v0.84.1** for version lag. **16 items left the open set**
+> (15 closed outright — CFG-002, CFG-010, CFG-011, CFG-022, CFG-024, CFG-029, CFG-031, CFG-032,
+> CFG-033, CFG-034, CFG-S01, CFG-S02, CFG-S03, CFG-S04, plus CFG-001 re-confirmed closed — and
+> **CFG-012 superseded**, because pi *adopted cyrup's* recursive merge at v0.84.1). **13 newly filed**
+> (CFG-035 … CFG-047), **0 reopened**. Three severities were corrected DOWN against the auditor by the
+> refuter: CFG-028 medium→low, CFG-030 medium→low, and CFG-034 closed with its **kind corrected to
+> `upstream-drift`** (its v0.83.0 upstream cite was false — `scrollbarThumb` is a v0.84.1 addition
+> cyrup had already anticipated). CFG-021 was **misdescribed twice** and is corrected in place: the
+> key is `tuiMode`, not `uiMode`, and both it and `fullscreenScrollbar` are v0.84.1 additions, so the
+> kind moves from `not-ported` to `upstream-drift`. CFG-004's cyrup cite was wrong and is repointed.
+> Open set now **38 items: 0 critical, 1 high, 19 medium, 18 low** — the single high is CFG-035, and
+> it is new. Read-only pass: nothing was compiled or executed.
+>
+> **Version-lag basis.** All `upstream-drift` items in this file were measured with
+> `git diff v0.83.0..v0.84.1` scoped to this area's paths (nine files moved, 650+/201−). pi HEAD is
+> `581d75a89` = **v0.84.1-117-g581d75a89**, so 117 commits past the diffed tag are unanalysed — see
+> blind spot 5 in `## Coverage` for the one concrete item that window is known to hold.
+>
+> ### Repair pass 2026-08-12 (post-critique)
+>
+> Applied after the completeness critique of the twelve finished area files. The critique's finding 11
+> observed that `packages/coding-agent/src/migrations.ts` appears in the whole gap-analysis directory
+> exactly once — as an incidental `{mode: 0o600}` citation in this file — and that pi's `runMigrations`
+> makes more calls than cyrup's does. A dedicated **migrations + keybindings surface sweep** was then
+> run over `pi/packages/coding-agent/src/migrations.ts` and `src/core/keybindings.ts` (both
+> byte-identical at v0.83.0 and v0.84.1: `git diff v0.83.0 v0.84.1 --` on both paths is empty) against
+> `crates/cyrup/src/migrations.rs` and its read-time consumers. Its findings are absorbed here as
+> **CFG-048 … CFG-051** (+2 medium, +2 low; 34 → 38 open). No item was renumbered, merged or deleted.
+>
+> The sweep's pairing table, reproduced because it is the evidence for CFG-048: pi's `runMigrations`
+> (`migrations.ts:305-315`) makes five top-level calls, the fifth fanning out into two more — six
+> migration behaviours. cyrup's `run_migrations` (`migrations.rs:26-33`, re-read at HEAD in this pass)
+> makes **four**: `migrate_auth_to_auth_json` (`:27`), `migrate_sessions_from_agent_root` (`:28`),
+> `migrate_tools_to_bin` (`:29`), `migrate_extension_system` (`:30`) — with commands→prompts and the
+> deprecated-dir scan nested inside the fourth. The missing one is `migrateKeybindingsConfigFile()`
+> (`migrations.ts:312`). **cyrup runs no migration pi does not**: `rg 'fn migrate|migrate_' crates
+> --include='*.rs'` resolves only to `crates/cyrup/src/migrations.rs`, `crates/cyrup-config/src/
+> settings.rs` (a faithful port of `migrateSettings`) and its `lib.rs:62` re-export.
+
+## Status since the c8bd2ab baseline
+
+| ID | Status | Note |
+|---|---|---|
+| CFG-001 | **closed** | Re-confirmed at HEAD. `ensure_scope_writable` (`settings.rs:1329-1337`) latches per scope, is called first by `set` (`:1349`) and `set_nested` (`:1404`), and both re-check inside `with_lock`, returning `SettingsWriteRefused` on mid-write corruption (`:1367-1377`, `:1414-1418`). pi `settings-manager.ts` `save()` early-returns on `globalSettingsLoadError` @v0.83.0. Residual hole is CFG-030 (now low). |
+| CFG-002 | **closed** | `pub oauth: Option<ModelsJsonOauth>` at `model.rs:1481-1487`, enum `Radius` only at `:1453-1458` matching pi's `Type.Literal("radius")` (`model-config.ts:194` @v0.83.0); oauth-without-baseUrl rejected at `:1843-1848` with pi's exact string; `config.oauth.is_none()` added to the empty-block guard (~`:1859`); the `oauth === "radius"` baseUrl special-case honoured (~`:1876-1880`). Launch-predicate half closed separately as CFG-022. |
+| CFG-003 | still open | `discovery.rs:325-340` still carries the `[CYRUP-DELTA]` "no network install during session assembly"; git/oci resolve only through `installed_dir`. |
+| CFG-004 | **superseded** (by CFG-025) | Residual is entirely CFG-025, still open. **Cite corrected:** the extension push is `add_local_entries` at `discovery.rs:1373-1379`, NOT `:1242-1246` (that is the SKILL.md walk). Id kept, never reused. |
+| CFG-005 | partially closed | `login.rs` (1721 lines, new) ports login/logout/env-key login/status/selectors; refresh at `cyrup-provider/src/auth/resolve.rs:146-239`. Residual: the two **multi-prompt** api-key logins (cloudflare, google-vertex). Maintainer-deprioritised — filed, not scheduled. Remains open below at medium. |
+| CFG-006 | partially closed | `retry.provider.*` now threaded (`builder.rs:1223-1234`). `websocketConnectTimeoutMs` still inert. Remains open below at medium. |
+| CFG-007 | still open | `AuthStore` re-reads `auth.json` per query; errors coerce to "not configured". Upstream cites corrected to the ported tag. |
+| CFG-008 | still open | Model-scope resolution drops every diagnostic. |
+| CFG-009 | still open | `npm:` source reports "unsupported source (OCI deferred)". |
+| CFG-010 | **closed** | `autoload: Option<bool>` on `PackageSource::Detailed` (`settings.rs:99-103`, accessor `:132-137`) → `PackageFilter` (`builder.rs:1756-1758`) → `retain_by_package_filter` delta branch (`discovery.rs:261-283`), `subtract_delta_shadow` (`:296-322`) and the dedupe delta (`builder.rs:1779-1783`). Verified BELOW the entry condition this time: `apply_autoload_disabled_patterns` (`manifest.rs:401-454`) reproduces pi's `+`/`-`, bare/`!` glob and last-write-wins Map semantics arm for arm, and `delta_shadow` is live (assigned at `discovery.rs:680-696`). |
+| CFG-011 | **closed** | `resolve.rs:145-147` is now `now_millis().saturating_add(minimum_validity_ms) >= expires` with `now_millis` at `:239-245`; regression tests at `:661-664`, `:683`, `:699`, `:775`. Units agree with pi's `Date.now() + expires_in * 1000 - 5*60*1000` (`ai/src/auth/oauth/anthropic.ts:225`/`:338` @v0.83.0). |
+| CFG-012 | **superseded** | **Upstream moved to cyrup's behaviour.** pi v0.84.1 `settings-manager.ts:139-160` replaces the single-level spread with `deepMergeObjects` + `isMergeableObject` (arrays and null excluded), which is behaviourally identical to cyrup's `deep_merge` (`settings.rs:475-491`). Do NOT "fix" cyrup toward the retired v0.83.0 shape — that would be a regression. |
+| CFG-013 | still open | `TrustStore::nearest` reads without the file lock. |
+| CFG-014 | still open | `showCacheMissNotices` absent — one of only three Settings keys with zero occurrences in `settings.rs` on the 47-key sweep. |
+| CFG-015 | still open | Four unconsumed accessors, **plus a fifth key folded in this pass**: `collapseChangelog`, whose only consumer is the `/settings` display row. |
+| CFG-016 | still open | `${0:-default}` emitted literally. |
+| CFG-017 | still open | `${@:-default}` / `${ARGUMENTS:-default}` unsupported. |
+| CFG-018 | still open | Glob scope no longer short-circuits on an exact reference. |
+| CFG-019 | partially closed | The two `qwen-token-plan` arms landed at pi's insertion position (`model.rs:973-974`, `KNOWN_PROVIDERS` `:1022-1023`). Still open: the stale `xai` id and the missing `radius` arm. New v0.84.1 entries are CFG-041, not this item. |
+| CFG-020 | still open | No `ModelRuntime` type at HEAD (`grep -rn 'struct ModelRuntime' crates/` is empty); registry recomposed per call. Upstream target GREW at v0.84.1 (+356 lines). |
+| CFG-021 | **misdescribed → corrected in place** | The key is `tuiMode`, not `uiMode` (`uiMode` exists nowhere in pi). Both `tuiMode` and `fullscreenScrollbar` are **v0.84.1 additions**, so kind moves `not-ported` → `upstream-drift`. Still zero occurrences in cyrup. Remains open below at low. |
+| CFG-022 | **closed** | ONE shared predicate: `provider_is_configured(auth, models_json, provider, env)` at `model.rs:1796-1804`, called from `main.rs:388-392` and `session.rs:2659-2666`. Step-4 regression test at `crates/cyrup/tests/models_json_resolution.rs:120-160`. |
+| CFG-023 | still open | **Not** closed by CFG-022's landing: `find_initial_model` step 3 (`model.rs:1341-1354`) still returns the saved default unconditionally. |
+| CFG-024 | **closed** | `models_json_provider_is_configured` (`model.rs:1817-1832`) now tests `is_command_config_value(raw) \|\| is_config_value_configured(raw, env)` and returns false for an oauth-only block. Purity preserved — no resolution on the status path (`:1806-1815`). |
+| CFG-025 | still open | No `~` / `file://` expansion on settings paths or local package sources. Absorbs CFG-004's residual; CFG-031 closed by expanding only its own site, so the shared util is still owed here. |
+| CFG-026 | still open | Settings packages deduped by raw source string; the in-code note at `builder.rs:1772-1774` names this item. |
+| CFG-027 | still open | Bare-extension-directory local package contributes nothing. |
+| CFG-028 | still open, **severity corrected medium → low** | Evidence accurate, rating was not: pi's `execSync` blocks its ONE event loop, cyrup's blocking call occupies one worker of N. cyrup is strictly *less* blocking than upstream — a robustness note, not a parity gap. |
+| CFG-029 | **closed** | The always-true closure is gone: `models_json_resolution.rs:91-98` builds the real `provider_is_configured` predicate over a temp `AuthStore`, with a step-4 case (`:120-160`) and a negative case (`:165-179`). |
+| CFG-030 | still open, **severity corrected medium → low** | Both sides mangle a non-object top level; pi merely preserves array elements as meaningless indexed keys. Trigger is pathological and load behaviour is identical. |
+| CFG-031 | **closed** | `settings.rs:732-734` is `self.merged.get_str("shellPath").map(|s| expand_tilde(&s))` with provenance at `:724-731` and tests at `:1595-1616`, `:1625-1635`. |
+| CFG-032 | **closed** | `migrations.rs:106` now calls `cyrup_config::lock::write_atomic(&auth_path, …, true)`; `write_atomic(secret=true)` sets `.mode(0o600)` and `set_permissions(0o600)` before rename (`lock.rs:93-112`). Matches pi's `{ mode: 0o600 }` (`migrations.ts:67-70` @v0.83.0). |
+| CFG-033 | **closed** | `cyrup-test-support/src/auth.rs:70-75` is `now_millis()`; decision sites `:132`/`:147`; fixtures re-expressed in ms (`:195`, `:233`, `:276`) with a dedicated millisecond test at `:239-256`. |
+| CFG-034 | **closed**, **kind corrected → `upstream-drift`** | cyrup side real: `theme.rs:1036` `pub scrollbar_thumb: Option<Color>`, `g("scrollbarThumb").or(selected)` at `:483`, tests at `theme_fidelity.rs:831-880`. **The item's v0.83.0 upstream cite was FALSE** — `git grep scrollbarThumb v0.83.0 -- packages` returns nothing; those are v0.84.1 line numbers. cyrup anticipated a v0.84.1 addition. |
+| CFG-035 | **new — open (high)** | `.cyrup/SYSTEM.md` / `APPEND_SYSTEM.md` never discovered; the trust gate prompts about files cyrup never reads. |
+| CFG-036 | **new — open (medium)** | `--session-dir` and the three `CYRUP_*_DIR` env vars are not tilde-expanded. |
+| CFG-037 | **new — open (medium)** | Project-scope git package install writes no `.gitignore` into the user's repo. |
+| CFG-038 | **new — open (medium)** | One bad key spec discards the whole `keybindings.json` — after partially applying it. |
+| CFG-039 | **new — open (medium)** | models.json `samplingParams` silently dropped (v0.84.1 addition). |
+| CFG-040 | **new — open (low)** | `markdown.mermaid` key and its getter/setter absent (v0.84.1 addition). |
+| CFG-041 | **new — open (low)** | `defaultModelPerProvider` missing v0.84.1's `baseten` and `qwen-token-plan-individual`. |
+| CFG-042 | **new — open (low)** | `FileModelsStore` does not normalize its path, cache by revision, or accept cancellation. |
+| CFG-043 | **new — open (low)** | Invalid `models.json` reports a serde parse error instead of pi's per-field schema report. |
+| CFG-044 | **new — open (low)** | Three `auth-storage.ts` provenance cites resolve to nothing upstream; `get_auth_status` is dead code. |
+| CFG-045 | **new — open (medium)** | `doubleEscapeAction` is inert and cyrup's Escape handler drops two of pi's four branches. |
+| CFG-046 | **new — open (medium)** | models.json string fields are not length-validated, so `"baseUrl": ""` composes where pi rejects the file. |
+| CFG-047 | **new — open (low)** | Three built-in slash-command metadata divergences (`/model`, `/login` argument hints, `/reload` description). |
+| CFG-048 | **new (repair pass) — open (medium)** | pi's sixth startup migration, `migrateKeybindingsConfigFile`, is not ported at write time **or** read time, so all 59 legacy keybinding names are silently inert. |
+| CFG-049 | **new (repair pass) — open (medium)** | Extension-system deprecation warnings are printed and immediately buried; pi blocks startup on a keypress so they cannot be missed. |
+| CFG-050 | **new (repair pass) — open (low)** | `migrate_tools_to_bin` relocates the managed `fd`/`rg` binaries with no completion notice, so the move looks like a disappearance. |
+| CFG-051 | **new (repair pass) — open (low)** | The migrated-credentials notice goes to stderr microseconds before the first TUI frame instead of into the transcript, and its provenance cite names unrelated upstream code. |
+| CFG-S01 | **closed** | `resolve_prompt_input` ported (`cli.rs:7-9`), applied to `--system-prompt` (`:456-460`) and each `--append-system-prompt` (`:368-380`, `:461-463`), with three named tests (`:1693-1740`). Matches pi's path-vs-literal-by-existence + warn-and-fall-back (`resource-loader.ts:53-68` @v0.83.0). |
+| CFG-S02 | **closed** | `image_auto_resize()` (`settings.rs:787-792`) with live consumers (`builder.rs:681`, `main.rs:546`/`:780`) and end-to-end proof at `cyrup-session-svc/tests/read_image_auto_resize.rs:150-170`. |
+| CFG-S03 | **closed** | Byte-identical conflict messages at `cyrup-ext/src/registry.rs:222` and `:591-607`, first-registration-wins precedence, tests at `cyrup-ext/tests/extension_name_conflicts.rs:16-17`, `:208`. Matches `detectExtensionConflicts` (`resource-loader.ts:1059-1093` @v0.83.0). |
+| CFG-S04 | **closed** for its four named keys | `enable_skill_commands` → `commands.rs:311`/`:324`; `tree_filter_mode` → `app.rs:3550`, `tree_selector.rs:255`; `editor_padding_x` → `editor.rs:238`; `show_hardware_cursor` → `editor.rs:179`. Wiring proofs at `cyrup-tui/tests/settings_inert_keys.rs`. A FIFTH key of the same class escaped the sweep and is now CFG-045; `collapseChangelog` is folded into CFG-015. |
+
+## Open items
+
+> **⚠ COUNT THIS TABLE ONLY — but do not assume the `-S` ids are gone.** All four surface-sweep items
+> (`CFG-S01`…`CFG-S04`) closed this pass, so the second table under `## Surface-sweep findings` is now
+> historical; its ids are retained there and in the status table so the closures can be re-audited.
+> The 2026-08-07 undercount that structural defect A in `00-residual-ledger.md` describes came from
+> reading one table and ignoring the other — check both headings before quoting a count.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| CFG-035 | high | not-ported | M | `.cyrup/SYSTEM.md` and `APPEND_SYSTEM.md` are never discovered — the trust-gated project system-prompt override is inert |
+| CFG-023 | medium | parity-bug | S | `find_initial_model` step 3 accepts a saved default whose provider has no configured auth |
+| CFG-025 | medium | parity-bug | S | Settings-declared paths and local package sources do not expand `~` or `file://` |
+| CFG-026 | medium | parity-bug | S | Settings packages deduped by raw source string, not resolved identity |
+| CFG-036 | medium | not-ported | S | `--session-dir` and the `CYRUP_*_DIR` env vars are not tilde-expanded |
+| CFG-037 | medium | not-ported | S | A project-scope git package install writes no `.gitignore`, so the clone lands in the user's working tree |
+| CFG-038 | medium | parity-bug | S | One unparseable key spec discards the whole `keybindings.json` — and applies it partially first |
+| CFG-045 | medium | not-ported | S | `doubleEscapeAction` is inert — the Escape handler has no double-escape and no bash-mode-exit branch |
+| CFG-046 | medium | parity-bug | S | models.json string fields are not length-validated, so `"baseUrl": ""` rewrites every model to an empty endpoint |
+| CFG-048 | medium | not-ported | S | pi's sixth startup migration (`migrateKeybindingsConfigFile`, 59 legacy names) is not ported at write time or read time |
+| CFG-049 | medium | not-ported | S | Deprecation warnings are printed and immediately painted over — pi blocks startup on a keypress |
+| CFG-018 | medium | parity-bug | S | Glob scope patterns no longer short-circuit on an exact model reference |
+| CFG-019 | medium | upstream-drift | S | `defaultModelPerProvider` still stale — `xai` id retired, `radius` arm missing |
+| CFG-007 | medium | parity-bug | M | `AuthStore` re-reads auth.json per query and coerces errors to "not configured" |
+| CFG-008 | medium | not-ported | M | Model-scope resolution drops every diagnostic |
+| CFG-006 | medium | not-ported | M | `websocketConnectTimeoutMs` never reaches the HTTP/stream layer |
+| CFG-039 | medium | upstream-drift | M | models.json `samplingParams` on model definitions and modelOverrides is silently dropped |
+| CFG-020 | medium | not-ported | L | No `ModelRuntime` type and no availability snapshot |
+| CFG-003 | medium | not-ported | L | Settings `packages` are resolved but never auto-installed |
+| CFG-005 | medium | not-ported | L | Two multi-prompt api-key login flows unported (`ApiKeyAuth` has no `login` member) |
+| CFG-009 | low | parity-bug | S | An `npm:` package source fails with the misleading message "unsupported source (OCI deferred)" |
+| CFG-013 | low | parity-bug | S | `TrustStore::nearest` reads trust.json without the file lock |
+| CFG-016 | low | parity-bug | S | `${0:-default}` emitted literally instead of substituting |
+| CFG-017 | low | parity-bug | S | `${@:-default}` / `${ARGUMENTS:-default}` prompt-template forms unsupported |
+| CFG-028 | low | cyrup-original | S | Config-value `!command` resolution blocks a tokio worker for up to 10 s |
+| CFG-030 | low | parity-bug | S | Non-object top-level `settings.json` degraded to `{}` with no load error |
+| CFG-040 | low | upstream-drift | S | `markdown.mermaid` settings key and its getter/setter are absent |
+| CFG-041 | low | upstream-drift | S | `default_model_per_provider` missing v0.84.1's `baseten` and `qwen-token-plan-individual` |
+| CFG-043 | low | parity-bug | S | An invalid `models.json` reports a serde parse error instead of pi's per-field schema report |
+| CFG-044 | low | cyrup-original | S | Three `auth-storage.ts` provenance cites resolve to nothing upstream, and `get_auth_status` is dead |
+| CFG-047 | low | parity-bug | S | Three built-in slash-command metadata divergences (`/model`, `/login`, `/reload`) |
+| CFG-050 | low | parity-bug | S | `migrate_tools_to_bin` moves the managed `fd`/`rg` binaries with no completion notice |
+| CFG-051 | low | parity-bug | S | The migrated-credentials notice is written to stderr pre-TUI instead of into the transcript, on a wrong cite |
+| CFG-014 | low | not-ported | M | `showCacheMissNotices` and prompt-cache-miss tracking absent |
+| CFG-015 | low | not-ported | M | Five unconsumed settings accessors, incl. `lastChangelogVersion` and `collapseChangelog` |
+| CFG-027 | low | not-ported | M | A local package that is a bare extension directory contributes nothing |
+| CFG-042 | low | upstream-drift | M | `FileModelsStore` does not normalize its path, cache by file revision, or accept cancellation |
+| CFG-021 | low | upstream-drift | L | `tuiMode` / `fullscreenScrollbar` not modelled |
+
+## CFG-035 — `.cyrup/SYSTEM.md` and `APPEND_SYSTEM.md` are never discovered — the trust-gated project system-prompt override is inert
+
+**Kind** not-ported · **Severity** high · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `grep -rn 'SYSTEM\.md' crates/` returns FIVE hits and not one reads a file: `cyrup/crates/cyrup-session/src/prompt/overrides.rs:12-16` (a doc comment describing the intended precedence), `cyrup/crates/cyrup-config/src/trust.rs:194` and `:203-204` (the two filenames as trust-gate MARKERS inside `has_trust_requiring_resources`'s `CYRUP_MARKERS` list), and `cyrup/crates/cyrup-session/src/prompt/tests.rs:116`. The only producers of the two override fields are the CLI flags: `cyrup/crates/cyrup-session-svc/src/builder.rs:1051` `custom_prompt: cfg.system_prompt.clone().map(Arc::from)` and `:1055` `append_system_prompt: …`, fed from `cyrup/crates/cyrup/src/cli.rs:456-463`. No code path joins `cwd/.cyrup` or `agent_dir` with either filename; `grep -rn 'system_prompt|SystemPrompt' crates/cyrup-resources/src/` returns nothing at all. The existing test at `prompt/tests.rs:116-138` injects `append_system_prompt` directly, so it proves the JOIN and not the DISCOVERY.
+
+**upstream** — `pi/packages/coding-agent/src/core/resource-loader.ts:1022-1034` @v0.83.0 `discoverSystemPromptFile()`: `join(this.cwd, CONFIG_DIR_NAME, "SYSTEM.md")` when `settingsManager.isProjectTrusted()` (`:1023-1026`), else `join(this.agentDir, "SYSTEM.md")` (`:1028-1031`); `:1036-1048` `discoverAppendSystemPromptFile()` is the identical pair for `APPEND_SYSTEM.md`. Consumed in `reload()` at `:525` (`this.systemPromptSource ?? this.discoverSystemPromptFile()`) and `:533-535` (the discovered append file becomes the sole `appendSources` entry). Unchanged at v0.84.1. The trust list cyrup DID port is `trust-manager.ts:29-37` @v0.83.0, whose `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES` includes both filenames — cyrup ported the gate and not the thing it gates.
+
+**Impact** — a project shipping `.cyrup/SYSTEM.md` gets the DEFAULT system prompt: every project-specific instruction, house style and safety framing the repo intended is absent from the model's context, with no diagnostic anywhere. Same for `~/.cyrup/agent/SYSTEM.md` (the user's global override) and both `APPEND_SYSTEM.md` tiers. Silent wrong output on a normal path, made worse by the half-port: `has_trust_requiring_resources` PROMPTS the user to trust the project *because* `.cyrup/SYSTEM.md` exists, then loads nothing from it — the user answers a security question about a file cyrup will never read.
+
+**Fix** — add a discovery step in `cyrup-session-svc/src/builder.rs` beside the existing wiring (~`:1045-1060`), mirroring `resource-loader.ts:1022-1048`: `custom_prompt` = `cfg.system_prompt` (CLI) else `<cwd>/.cyrup/SYSTEM.md` when `settings.project_trusted()` else `<agent_dir>/SYSTEM.md`; `append_system_prompt` = `cfg.append_system_prompt` (CLI, which REPLACES per pi's `this.appendSystemPromptSource ?? …`) else the single discovered `APPEND_SYSTEM.md` under the same trust rule. Route the discovered path through the same `resolve_prompt_input` shape used at `cli.rs:456`. **While fixing:** `cyrup-session/src/prompt/overrides.rs:15-16` documents ACCUMULATION of global + project `APPEND_SYSTEM.md`; pi picks exactly ONE — correct the doc to match upstream in the same change.
+
+**Verify** — integration test in `cyrup-session-svc/tests`: (a) trusted project with a sentinel `.cyrup/SYSTEM.md` → the built system prompt equals that sentinel and does NOT contain the default tool guidance; (b) same tree UNtrusted → default prompt, project file ignored; (c) `<agent_dir>/SYSTEM.md` present, no project file → global sentinel used; (d) `.cyrup/APPEND_SYSTEM.md` present → its text appended, and with `--append-system-prompt X` also given, ONLY `X` is appended. All four fail at HEAD.
+
+## CFG-023 — `find_initial_model` step 3 accepts a saved default whose provider has no configured auth
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-config/src/model.rs:1341-1354`: step 3 is `// 3. Saved default from settings.` then `if let (Some(dp), Some(dm)) = (default_provider, default_model_id) && let Some(found) = all.iter().find(…)` returning `found.clone()` unconditionally. `has_configured_auth` is a parameter at `:1301` and is used by step 1 (`:1307`) but never by step 3. **CFG-022's landing did not close this** — the shared predicate now exists and step 3 still does not call it.
+
+**upstream** — `pi/packages/coding-agent/src/core/model-resolver.ts:621` @v0.83.0 `// 3. Try saved default from settings if auth is configured.`, `:623` `if (found && modelRuntime.hasConfiguredAuth(found.provider))`, falling through to step 4 at `:632` on a failed check.
+
+**Impact** — a user who removes a provider's credentials keeps launching into that provider's model and gets an auth error per turn instead of falling back to a working model.
+
+**Fix** — add the `has_configured_auth(found)` guard to the step-3 condition at `model.rs:1341-1354`, calling the same `provider_is_configured` predicate CFG-022 landed (`model.rs:1796-1804`) so models.json-only providers are not newly rejected.
+
+**Verify** — unit test in `model.rs`: a saved default naming a provider the predicate rejects yields step 4's result, not the saved one. Fails at HEAD.
+
+## CFG-025 — Settings-declared paths and local package sources do not expand `~` or `file://`
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-resources/src/package/manifest.rs:358-366` is still `let trimmed = entry.trim(); let p = PathBuf::from(trimmed); plain.push(if p.is_absolute() { p } else { base.join(trimmed) })` — `~/team-skills` becomes `<base>/~/team-skills`. Same shape at `cyrup/crates/cyrup-resources/src/discovery.rs:371-380` for a settings-declared local PACKAGE path, which then trips the misleading `run `cyrup install …`` diagnostic at `:401-413`. This is also CFG-004's residual: settings-declared extension paths reach the same join via `add_local_entries` (`discovery.rs:1373-1379`). `expand_tilde` (`cyrup/crates/cyrup-config/src/settings.rs:1036-1051`) still has exactly TWO callers — `session_dir` (`:603`) and `shell_path` (`:733`, added by CFG-031's fix) — and still handles only `~` and `~/`: no `file://`, no win32 `~\`.
+
+**upstream** — `pi/packages/coding-agent/src/utils/paths.ts:57-78` @v0.83.0 `normalizePath` (tilde `:65-71` including win32 `~\`, `file://` `:73-76`), applied by `resolvePathFromBase` at `package-manager.ts:2069-2071`.
+
+**Impact** — `"skills": ["~/team-skills"]` silently loads nothing; `"packages": ["~/pack"]` produces a diagnostic naming the wrong cause ("not installed — run cyrup install"). CFG-031 closed by tilde-expanding its own getter, so the shared util is still owed here and CFG-036 now wants it too.
+
+**Fix** — promote `expand_tilde` into a shared `cyrup-config` path util handling `~`, `~/`, `~\` and `file://`; apply it at `manifest.rs:360` BEFORE the `is_absolute` test and at `discovery.rs:372`, taking the home dir from `DiscoveryConfig` rather than the ambient env, mirroring pi's `options.homeDir`. Land as one changeset with CFG-036, which needs the identical util on the env/CLI dir tiers.
+
+**Verify** — test in `cyrup-resources/tests/resources.rs` with a `DiscoveryConfig` home override: `"skills": ["~/team-skills"]` loads the skill; `"packages": ["file:///abs/pack"]` resolves. Both fail at HEAD. The existing regression at `cyrup-session-svc/tests/settings_resolve.rs:173-192` uses the RELATIVE path `"extra"`, so nothing in the suite exercises `~` today.
+
+## CFG-026 — Settings packages deduped by raw source string, not resolved identity
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-session-svc/src/builder.rs:1746` `let source = entry.source().trim().to_string();` and the dedupe key at `:1775` `out.iter().position(|p| p.source == built.source)`. The in-code note at `:1772-1774` states it explicitly: `[CYRUP-DELTA] the identity is the trimmed source STRING … Tracked separately as CFG-026`. The two scopes genuinely resolve to different bases (`cyrup/crates/cyrup-resources/src/discovery.rs:376-380` vs the `base` computed at `:355-358`).
+
+**upstream** — `pi/packages/coding-agent/src/core/package-manager.ts:1676-1695` @v0.83.0 `getPackageIdentity` returns `npm:<name>`, normalized `git:<host>/<path>`, or `local:${resolvePathFromBase(parsed.path, baseDir)}` — a SCOPE-RESOLVED absolute path — and `dedupePackages` (`:1697`) keys on that.
+
+**Impact** — `"packages": ["./pack"]` declared in both scopes means two different directories to pi (both loaded); cyrup drops the global one and its resources never appear.
+
+**Fix** — compute the identity in `builder.rs:1746` as pi does: resolve local paths against the scope base before using them as the dedupe key, normalize git specs. The delta branch of the same dedupe (`builder.rs:1779-1783`) already landed with CFG-010 and must keep working.
+
+**Verify** — test in `cyrup-session-svc/tests/settings_resolve.rs`: `"./pack"` in both global and project settings, each pointing at a distinct on-disk tree with distinct skills → both skills present. Fails at HEAD.
+
+## CFG-036 — `--session-dir` and the `CYRUP_AGENT_DIR` / `CYRUP_SESSION_DIR` / `CYRUP_PACKAGE_DIR` env vars are not tilde-expanded
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-config/src/env.rs:66-70`: `let path = |keys: &[&str]| first_env(keys).map(PathBuf::from);` feeding `agent_dir`, `session_dir` and `package_dir` (with their `PI_*` aliases) raw — no expansion. `ConfigDirs::resolve` (`:139-181`) consumes both the env values and `cli.agent_dir` / `cli.session_dir` / `cli.package_dir` verbatim at `:145-163`, with only `.unwrap_or_else` defaults. The CLI flag is equally raw: `cyrup/crates/cyrup/src/cli.rs:206-207` `#[arg(long = "session-dir")] pub session_dir: Option<PathBuf>`, threaded through `cli.rs:430-431`. The crate already owns `expand_tilde` (`cyrup-config/src/settings.rs:1036-1051`) and wires it only to `session_dir` READ FROM SETTINGS (`:603`) and `shell_path` (`:733`) — never to the flag or env tiers, which take precedence over the settings tier.
+
+**upstream** — `pi/packages/coding-agent/src/config.ts:515-521` @v0.83.0 `getAgentDir()`: `const envDir = process.env[ENV_AGENT_DIR]; if (envDir) { return expandTildePath(envDir); }`, where `expandTildePath` is `normalizePath` (`:498-500` → `utils/paths.ts:57-78`). `config.ts:367-372` `getPackageDir()` does the same with `PI_PACKAGE_DIR`. `main.ts:625-628` @v0.83.0 resolves the session dir as `(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ?? (envSessionDir ? expandTildePath(envSessionDir) : undefined) ?? startupSettingsManager.getSessionDir()` — pi normalizes ALL THREE tiers; cyrup normalizes only the lowest.
+
+**Impact** — `cyrup --session-dir ~/sessions` (quoted, or set from a config file or CI variable where the shell does not expand) writes sessions into a directory literally named `~` under the cwd, and a later `--resume` from a different cwd cannot find them: the user's transcripts appear lost. `CYRUP_AGENT_DIR=~/alt-agent` silently starts a fresh, empty agent dir at `./~/alt-agent` — no credentials, no settings, no trust decisions, no sessions — and the first-run path re-prompts for everything. Silent, and the symptom points nowhere near the cause. The exact spellings come from pi's documented behaviour, so a migrating user hits it immediately.
+
+**Fix** — move `expand_tilde` into the shared `cyrup-config` path util CFG-025 also wants (handling `file://` and win32 `~\`), then apply it inside the `path` closure at `env.rs:66-70` and to the three CLI overrides in `ConfigDirs::resolve` (`env.rs:145-163`) — one call site each, mirroring pi's `normalizePath` on every tier.
+
+**Verify** — unit tests in `cyrup-config/src/env.rs` beside `settings_session_dir_overrides_the_default_and_is_explicit` (`:296-310`), with HOME overridden: `EnvVars { agent_dir: Some("~/alt".into()), .. }` resolves to `<home>/alt`; `CliConfigOverrides { session_dir: Some("~/sessions".into()), .. }` resolves to `<home>/sessions`; `file:///abs/dir` resolves to `/abs/dir`. All fail at HEAD.
+
+## CFG-037 — A project-scope git package install writes no `.gitignore`, so the clone lands in the user's working tree
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `grep -rn gitignore crates/cyrup-resources/src crates/cyrup/src` returns only the SKILL-WALK ignore READER (`cyrup/crates/cyrup-resources/src/discovery.rs:1299` `for filename in [".gitignore", ".ignore", ".fdignore"]`, applied `:1344-1352`) — nothing ever WRITES a `.gitignore`. `PackageInstaller::install` (`cyrup/crates/cyrup-resources/src/package/install.rs:36-101`) resolves the target with `self.store.package_dir(scope, &id)` (`:69-73`) and goes straight into `spawn_blocking(git_clone(...))` (`:77-80`); there is no install-root preparation step. The project-scope root is `<project_root>/.cyrup/packages` (`cyrup/crates/cyrup-resources/src/package/store.rs:26-33`) — inside the user's repository. `grep -rn 'cloud_sync|xattr|setfattr' crates/` is likewise empty.
+
+**upstream** — `pi/packages/coding-agent/src/core/package-manager.ts:1829-1834` @v0.83.0 (`installGit`) opens with `const gitRoot = this.getGitInstallRoot(scope); if (gitRoot) { this.ensureGitIgnore(gitRoot); }` before the clone. `ensureGitIgnore` is `:1952-1960` — `if (!existsSync(ignorePath)) { writeFileSync(ignorePath, "*\n!.gitignore\n", "utf-8"); }`. The same pair guards the npm root at `:1943-1944` alongside `markPathIgnoredByCloudSync` (`utils/paths.ts:124-139`). Unchanged at v0.84.1 (`:1815-1818`, `:1988-1996`).
+
+**Impact** — `cyrup install github:org/pack` at project scope drops an entire cloned repository (including its own `.git`) into `<repo>/.cyrup/packages/…` with nothing telling git to ignore it. The next `git status` shows hundreds of untracked files, `git add -A` commits a vendored third-party tree into the user's history, and the nested `.git` turns it into a broken embedded repo. pi's users never see this because the install root self-ignores. It is a one-line write cyrup dropped.
+
+**Fix** — add an `ensure_git_ignore(root)` helper in `cyrup-resources/src/package/install.rs`, called from `install` (`:36`) immediately before the `PackageSource::Git` clone at `:69-80`, against `self.store.packages_root(scope)` (`store.rs:26-33`): create the root if absent and, when `<root>/.gitignore` does not exist, write exactly `*\n!.gitignore\n`. Optionally port `markPathIgnoredByCloudSync` for the same root; the npm half of pi's call site is moot while the npm channel is dropped (CFG-009).
+
+**Verify** — test in `cyrup-resources/tests/resources.rs`: install from a local bare git remote at `InstallScope::Project` into a tempdir project root, then assert `<root>/.cyrup/packages/.gitignore` exists with byte content `*\n!.gitignore\n`, and that a pre-existing `.gitignore` there is left untouched. Fails at HEAD.
+
+## CFG-038 — One unparseable key spec discards the whole `keybindings.json` — and applies it partially first
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-tui/src/keymap.rs:13-28` `parse_key_values` returns `Err(TuiError::Keybindings(..))` for any value that is not a string or array-of-strings, and propagates `Key::parse(s)?` for an unrecognised key spec. `Keymap::merge_json` (`:487-493`) does `self.set_action(action, parse_key_values(&value)?)` inside the entry loop, so the FIRST bad entry aborts *after* earlier entries have already been applied via `set_action`. `App::load_keybindings_json` (`cyrup/crates/cyrup-tui/src/app.rs:951-962`) then chains six merges with `?` — `keymap` (`:952`), `select_keymap` (`:956`), `tree_keymap` (`:957`), `session_keymap` (`:958`), `models_keymap` (`:959`), `editor` (`:960`) — so an error in the first returns before the other five ever run. The bin's handler at `cyrup/crates/cyrup/src/main.rs:1624-1629` prints `warning: ignoring {path}: {e}` and continues — which is false, the file was half-applied.
+
+**upstream** — pi never parses key strings at load. `pi/packages/coding-agent/src/core/keybindings.ts:350-355` @v0.83.0 `loadFromFile` → `loadRawConfig` (`:328-336`, `catch { return undefined; }` — the only whole-document failure) → `toKeybindingsConfig` (`:275-288`), which SKIPS any entry whose value is neither a string nor a string[] and keeps every other entry. `pi/packages/tui/src/keybindings.ts:243-256` @v0.83.0 `rebuild()` only does `if (!(keybinding in this.definitions)) continue;` and stores the raw `KeyId` strings — an unresolvable spec simply never matches at dispatch and costs nothing else.
+
+**Impact** — a user with a dozen rebinds and one typo (`"app.tools.expand": "ctrl+"`, or a value accidentally written as a number) loses EVERY editor, selector, tree, session and model-picker rebind while keeping whichever app-level bindings happened to parse before the bad one — a half-configured keymap with a warning claiming the file was ignored. In pi the same file loses exactly the one broken entry. **Refuter's caveat:** cyrup iterates a `serde_json::Map` (BTreeMap, alphabetical), so the amount that applies is decided by *key order*, not document order — it still reads as flaky rather than as a config error.
+
+**Fix** — in `cyrup-tui/src/keymap.rs` make every `merge_json` skip-and-continue instead of propagating: `if let Ok(keys) = parse_key_values(&value) { self.set_action(action, keys) }`, collecting per-entry failures — matching `toKeybindingsConfig`'s drop semantics. Keep the whole-document error only for the `keybindings_object` case (`:32-40`, malformed JSON / non-object top level), which is pi's `loadRawConfig` `undefined` path. Return the dropped-entry list from `App::load_keybindings_json` so `main.rs:1624-1629` can name the offending ids instead of claiming the file was ignored.
+
+**Verify** — test in `cyrup-tui/tests/keybindings.rs` beside `malformed_keybindings_json_errors_cleanly` (`:101`): a document with a valid `"tui.select.confirm"` rebind, a valid `"app.tools.expand"` rebind and one bogus `"app.interrupt": "ctrl+"` must apply BOTH valid rebinds to their respective keymaps. Fails at HEAD regardless of key order.
+
+## CFG-045 — `doubleEscapeAction` is inert — the Escape handler has no double-escape and no bash-mode-exit branch
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — same inert-key class as CFG-S04, which the sweep passed because this key *does* have a consumer outside `cyrup-config` — one that only DISPLAYS it. `grep -rn '\bdouble_escape_action\b' crates/ --include='*.rs'` outside `settings.rs` returns exactly ONE line: `cyrup/crates/cyrup-tui/src/app.rs:5721`, the `SettingRow::choice("doubleEscapeAction", "Double-escape action", eff.double_escape_action(), choices(&["fork","tree","none"]))` row. `grep -rn 'double_esc|DoubleEsc|doubleEscape' crates/cyrup-tui/src crates/cyrup/src` finds no handler, no `last_escape_time`, no 500 ms window. cyrup's `Action::Interrupt` arm (`app.rs:1886-1913`) implements only three branches — branch-summary abort, bash-running abort, streaming/idle teardown — then falls out.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2570-2596` @v0.83.0, `this.defaultEditor.onEscape`, is a FOUR-branch chain: `isStreaming` → restore-queued + abort; `isBashRunning` → abortBash; `isBashMode` → `this.editor.setText(""); this.isBashMode = false; this.updateEditorBorderColor();`; else empty editor → `const action = this.settingsManager.getDoubleEscapeAction(); if (action !== "none") { if (now - this.lastEscapeTime < 500) { action === "tree" ? this.showTreeSelector() : this.showUserMessageSelector(); this.lastEscapeTime = 0; } else { this.lastEscapeTime = now; } }`. cyrup ports branches 1–2 and drops 3–4.
+
+**Impact** — the `/settings` row lets a user pick `fork` / `tree` / `none` and nothing whatsoever changes, and Esc-Esc on an empty editor never opens `/tree` (pi's default) or `/fork`. Both destinations exist in cyrup as slash commands (`cyrup/crates/cyrup-tui/src/commands.rs:60-63`), so the reachable-feature loss is the shortcut — but the setting is fully dead and pi's documented default behaviour is absent. The dropped bash-mode-exit branch is a second, separate loss: Escape does not leave bash mode.
+
+**Fix** — extend the `Action::Interrupt` arm at `app.rs:1886-1913` with pi's remaining two branches: a bash-mode exit (clear editor text, clear the bash flag, restore the border colour) and, on an empty editor, a `last_escape_time` field with a 500 ms window dispatching to the tree selector or the user-message (fork) selector per `eff.double_escape_action()`, with `"none"` disabling it. Land beside CFG-S04's wiring work.
+
+**Verify** — test in `cyrup-tui/tests` that sends two Esc events within 500 ms on an empty editor and asserts the tree selector opens; a second with `doubleEscapeAction = "none"` asserting it does not; a third asserting Esc in bash mode clears the editor and leaves bash mode. All fail at HEAD.
+
+## CFG-046 — models.json string fields are not length-validated, so `"baseUrl": ""` rewrites every model to an empty endpoint
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-config/src/model.rs:1465-1477` declares `pub base_url: Option<String>`, `name`, `api_key`, `api` with no length or emptiness check anywhere. `apply_models_json` step 1 (`:1874-1880`) is `if let Some(base_url) = &config.base_url && config.oauth.is_none() { m.base_url = base_url.clone(); }` — `Some("")` is `Some`, so EVERY built-in model of that provider gets `base_url = ""`. `model_from_json` (`:1931-1938`) has the same hole: `definition.base_url.clone().or_else(|| provider_config.base_url.clone()).or_else(…).ok_or_else(…)` treats `Some("")` as present, so pi's `"baseUrl" is required when defining custom models.` never fires. `load_models_file_reporting` (`:1700-1717`) reports no error. The numeric fields are the mirror image: `Option<u64>` makes `-1` a whole-file serde failure where pi rejects only that provider, and cyrup checks only `== Some(0)` at `:1939`/`:1945`.
+
+**upstream** — `pi/packages/coding-agent/src/core/model-config.ts` @v0.83.0 types `name`, `baseUrl`, `apiKey` and `api` on `ProviderConfigSchema` as `Type.Optional(Type.String({ minLength: 1 }))`, so `{"providers":{"x":{"baseUrl":""}}}` fails `validateModelsConfig.Check(parsed)` and `ModelConfig.load` returns an EMPTY provider map plus `Invalid models.json schema:` — the agent starts on built-ins with a loud diagnostic. Belt-and-braces, `modelFromJson` also has `if (!baseUrl) throw …` and `""` is falsy in JS. `contextWindow` / `maxTokens` are `Type.Number()` with a `<= 0` runtime check in `modelFromJson` that rejects only the offending provider.
+
+**Impact** — a `models.json` pi refuses outright is accepted and composed by cyrup: every request for that provider goes to an empty URL while the file is reported as valid. This is a different lens from CFG-043 (which is about the error *message* for a wrong-typed field) — here the file is not diagnosed at all.
+
+**Fix** — validate the four string fields as non-empty after trimming, in `apply_models_json` / `model_from_json` (`model.rs:1465-1477`, `:1874-1880`, `:1931-1945`), and widen the numeric guard from `== Some(0)` to "not strictly positive". Land with CFG-043's per-provider deserialization so one bad provider block is rejected while the rest load, matching pi.
+
+**Verify** — table test in `model.rs`: `{"providers":{"x":{"baseUrl":""}}}` produces a schema diagnostic and composes NO provider override (built-in base URLs intact); a custom model with `"baseUrl": ""` yields pi's `"baseUrl" is required when defining custom models.`; `"contextWindow": -1` rejects only that provider. All fail at HEAD.
+
+## CFG-048 — pi's sixth startup migration, `migrateKeybindingsConfigFile`, is not ported at write time or read time
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup/src/migrations.rs:26-36` `run_migrations` makes exactly four calls — `migrate_auth_to_auth_json` (`:27`), `migrate_sessions_from_agent_root` (`:28`), `migrate_tools_to_bin` (`:29`), `migrate_extension_system` (`:30`). Re-read at HEAD in this pass; there is no keybindings step. The only justification is the in-source comment at `migrations.rs:9-10` — "The keybindings-config migration is intentionally NOT ported here: cyrup's keybindings store (`cyrup-tui`) has no legacy on-disk shape to migrate from" — which is the self-certifying kind `docs/gap-analysis/README.md:208-212` says must not be treated as a decision of record, and which is **factually wrong about the read path as well**. The read path is `crates/cyrup/src/main.rs:1622-1629` (reads `<agent_dir>/keybindings.json`) → `crates/cyrup-tui/src/app.rs:951-963` `load_keybindings_json` → six `merge_json` calls; `crates/cyrup-tui/src/keymap.rs:487-493` is `for (id, value) in keybindings_object(json)? { if let Some(action) = Action::from_id(&id) { … } }`, so an unrecognised id is dropped with **no diagnostic**. `grep -n migrat crates/cyrup-tui/src/{keymap,app,editor}.rs` returns zero; no alias table exists anywhere in the crate.
+
+**upstream** — `pi/packages/coding-agent/src/migrations.ts:312` @v0.83.0 — `migrateKeybindingsConfigFile();`, the fourth of five calls in `runMigrations` (`:305-315`). Body at `:157-174`: read `<agentDir>/keybindings.json`, call `migrateKeybindingsConfig`, and if `migrated` write it back as `${JSON.stringify(config, null, 2)}\n`. `pi/packages/coding-agent/src/core/keybindings.ts:209-269` holds `KEYBINDING_NAME_MIGRATIONS` — **59** legacy→modern entries (the critique's "~30" undercounts): 21 → `tui.editor.*` (`cursorUp` → `tui.editor.cursorUp`, `:210`), 4 → `tui.input.*`, 6 → `tui.select.*`, 28 → `app.*` (`interrupt` → `app.interrupt` `:241`, `deleteSessionNoninvasive` → `app.session.deleteNoninvasive` `:268`). `migrateKeybindingsConfig` (`:289-309`) also **drops** a legacy key when its modern twin is already present (`:301-304`) and reorders through `orderKeybindingsConfig` (`:311-327`). It is applied a **second** time on every read at `keybindings.ts:366` inside `loadFromFile` (`:363-367`), which both `KeybindingsManager.create` (`:348-352`) and `reload()` (`:354-357`) go through. Both files are byte-identical at v0.83.0 and v0.84.1, so this is a baseline miss, not drift.
+
+**Impact** — a user carrying a pre-rename `keybindings.json` — the pi-migrant population this port exists to serve — gets a file that pi repairs on first launch and honours forever, and that cyrup ignores entry by entry in silence: `main.rs:1626-1629` prints only on a hard parse error, so a fully legacy file produces no output at all and stock defaults. Cross-checking the 59 targets against what cyrup's maps actually resolve, **27 of 59** (the six `tui.select.*` plus 21 of the 28 `app.*`) would work today if the table alone were ported; the other 32 are inert for the separate reasons already filed as **TUI-028** (the 21 `tui.editor.*` + 4 `tui.input.*` land in a namespace cyrup spells `editor.*`) and **TUI-008** (7 unbound `app.*` ids). So this recovers real user-visible behaviour on its own **and** is a hard prerequisite for TUI-028 being safe to land.
+
+**Fix** — port `migrateKeybindingsConfigFile` as `migrate_keybindings_config_file(&dirs.agent_dir)` in `crates/cyrup/src/migrations.rs`, called from `run_migrations` between `migrate_tools_to_bin` and `migrate_extension_system` (pi's position, `:311`→`:312`→`:313`). Port `KEYBINDING_NAME_MIGRATIONS` as a 59-entry const table plus `migrate_keybindings_config(&mut Map) -> bool` reproducing pi's three behaviours: rename, drop-legacy-when-modern-present (`keybindings.ts:301-304`), and `orderKeybindingsConfig` ordering (`:311-327`) against cyrup's own id list; write back only when `migrated`, with pi's trailing newline. **Map the 21 `tui.editor.*` / 4 `tui.input.*` targets to cyrup's CURRENT `editor.*` spelling so the migration is correct at HEAD, and add `editor.* → tui.editor.*` rows when TUI-028 renames the namespace** — otherwise TUI-028 silently breaks every `editor.*` config users have written against shipped cyrup. Also apply the table at read time in `keymap.rs`'s `keybindings_object` (`:32-40`) so the alias works before the migration has ever run and after a hand-edit, matching pi's double application. **Delete the false claim at `migrations.rs:9-10`.** While in the area, correct TUI-028's upstream cites in `07-cyrup-tui.md`: it says `keybindings.ts:208-270` and `migrateKeybindingsConfig (:294-311)`; the true offsets are `:209-269` and `:289-309`, identical at both tags.
+
+**Verify** — new test in `migrations.rs`'s test module: write `{"cursorUp":"ctrl+p","interrupt":"ctrl+q","app.clear":"ctrl+k"}` to `<agent_dir>/keybindings.json`, run `run_migrations`, assert the file reads `editor.cursorUp` / `app.interrupt` / `app.clear` in cyrup's declaration order with a trailing newline, and that a second run is a no-op. Collision case: `{"interrupt":"ctrl+q","app.interrupt":"ctrl+e"}` must keep only `app.interrupt: ctrl+e`. Plus a read-time test in `crates/cyrup-tui/tests/keybindings.rs`: `App::load_keybindings_json(r#"{"interrupt":"ctrl+q"}"#)` binds `Action::Interrupt` to ctrl+q without the file ever being migrated on disk. **Ships with TUI-051** (`/reload` is pi's second application site for this table) and must not land after TUI-028.
+
+## CFG-049 — Extension-system deprecation warnings are printed and immediately buried; pi blocks startup on a keypress
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup/src/migrations.rs:263-277` `format_deprecation_warnings` builds pi's text (per-warning `Warning: …` lines, the `Move your extensions to the extensions/ directory.` line, both URLs) but its own doc comment concedes it is "minus the keypress wait (handled by the interactive front-end)". **The front-end does not handle it:** `crates/cyrup/src/main.rs:529-533` is `let warnings = migrations::format_deprecation_warnings(&deprecation_warnings); if !warnings.is_empty() { eprint!("{warnings}"); }` and execution continues straight into TUI init. `grep -rn 'Press any key' crates` returns **zero hits workspace-wide**, so neither the pause nor pi's `Press any key to continue...` line exists anywhere.
+
+**upstream** — `pi/packages/coding-agent/src/migrations.ts:277-296` @v0.83.0 `showDeprecationWarnings` — after the warnings, the guide URL and the docs URL it prints `chalk.dim('\nPress any key to continue...')` (`:286`) and then blocks: `await new Promise<void>(resolve => { process.stdin.setRawMode?.(true); process.stdin.resume(); process.stdin.once('data', () => { … resolve(); }); })` (`:288-295`). Awaited from `main.ts:838-840` — `if (appMode === 'interactive' && deprecationWarnings.length > 0) await showDeprecationWarnings(deprecationWarnings);` — i.e. startup is deliberately gated on acknowledgement, **before** the interactive UI takes the terminal.
+
+**Impact** — these warnings are the only signal a user gets that a legacy `hooks/` directory or a custom `tools/` directory has stopped working, meaning every extension in them is now silently doing nothing. In pi the user cannot proceed without seeing it. In cyrup it is one of several stderr lines emitted microseconds before the first TUI frame paints over the same region; on a busy startup (settings diagnostics, migrated-credential notice, model-fallback line) it is realistically never read, and the user concludes their extensions broke for no reason.
+
+**Fix** — port the gate literally. After `eprint!("{warnings}")` at `main.rs:529-533`, print pi's `Press any key to continue...` line and block on a single key read before TUI init, in interactive mode only (pi's `appMode === 'interactive'` guard at `main.ts:838`; cyrup's call site is already inside the interactive branch). Use the raw-mode read cyrup already owns rather than an `App` dependency, so it stays on the pre-TUI path exactly as upstream. **While editing this function, settle the rebrand question on `MIGRATION_GUIDE_URL` / `EXTENSIONS_DOC_URL` (`migrations.rs:270-272`)**, which currently send cyrup users to `github.com/earendil-works/pi-mono`.
+
+**Verify** — integration test in `crates/cyrup/tests/` driving the binary with a temp `agent_dir` containing a `hooks/` dir and a scripted stdin: assert the process does not reach TUI init until a byte is written to stdin, and that `Press any key to continue...` appears on stderr. Plus a **live terminal run** with `~/.cyrup/hooks/` present, confirming the notice is readable and the session waits — this one is pre-TUI output, and a captured-stderr assertion cannot show that the first frame does not paint over it.
+
+## CFG-018 — Glob scope patterns no longer short-circuit on an exact model reference
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — the glob branch of `ModelResolver::resolve_scope` (`cyrup/crates/cyrup-config/src/model.rs:258-275`) strips an optional `:level` suffix (`:261-268`) then goes straight to the `glob_match` filter over `self.available` (`:269-274`) — no `match_reference` / exact attempt first.
+
+**upstream** — `pi/packages/coding-agent/src/core/model-resolver.ts:297` @v0.83.0 calls `findExactModelReferenceMatch(globPattern, availableModels)` INSIDE the glob branch, before the minimatch filter (declared `:79`; also used on the non-glob path at `:128`).
+
+**Impact** — a scope pattern that is an exact model reference but happens to contain a glob metacharacter (`[`, `?`) resolves through the filter instead of matching directly, so it silently resolves to nothing or to the wrong set.
+
+**Fix** — insert a `match_reference` attempt at `model.rs:269`, returning early on a hit.
+
+**Verify** — unit test in `model.rs`: a pattern that is an exact model reference containing a metacharacter resolves to exactly that model. Fails at HEAD.
+
+## CFG-019 — `defaultModelPerProvider` still stale — `xai` id retired, `radius` arm missing
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — partially fixed since the last pass: the two qwen arms landed at `cyrup/crates/cyrup-config/src/model.rs:973-974` (`qwen-token-plan` / `qwen-token-plan-cn` → `qwen3.7-max`) with matching `KNOWN_PROVIDERS` entries at `:1022-1023` in pi's insertion position. **Still wrong:** `model.rs:951` is `"xai" => "grok-4.20-0309-reasoning"`, and there is NO `radius` arm anywhere in `default_model_per_provider` (`:936-982`) or `KNOWN_PROVIDERS` (`:985-1031`). cyrup's map is 37 entries; pi's is 38 at v0.83.0.
+
+**upstream** — `pi/packages/coding-agent/src/core/model-resolver.ts:28` @v0.83.0 (`:35` @v0.84.1) `xai: "grok-4.5"`; `:20` @v0.83.0 (`:27` @v0.84.1) `radius: "auto"`. Both unchanged across the two tags, so this is inherited debt rather than new drift — the v0.84.1 *additions* are CFG-041.
+
+**Impact** — on identical catalogs, a user with only xAI configured and no saved `defaultModel` launches a different model in cyrup than in pi. `cyrup/crates/cyrup-provider/src/providers/catalog/xai.json` carries BOTH ids, so the old "the catalog doesn't have grok-4.5 anyway" mitigation is void.
+
+**Fix** — correct the `xai` arm at `model.rs:951` to `grok-4.5` and add the `radius` arm plus its `KNOWN_PROVIDERS` entry at pi's position. Do it in one changeset with CFG-041's two v0.84.1 additions, since map ORDER is load-bearing for `first_default_or_first` (`:1034-…`).
+
+**Verify** — table test asserting cyrup's map equals pi v0.84.1's 40 entries key-for-key AND in order. `grep -rn grok-4.20-0309-reasoning crates/ --include='*.rs'` returns only `model.rs:951` itself, so nothing pins the stale id today and the fix is unguarded in both directions.
+
+## CFG-007 — `AuthStore` re-reads auth.json per query and coerces errors to "not configured"
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-config/src/auth.rs:120-126` `read_file` does `read_to_string` + `parse_auth` on every call; there is no cache field on `AuthStore`. `has_auth` (`:261-271`) is `matches!(self.read_file(), Ok(map) if …)` at `:265`, so any `Err` reads as not-configured, and `get_auth_status` (`:273-306`) uses the same idiom at `:278`. No cached `AuthFile`, no `reload()`. The RwLock covers only the runtime `--api-key` tier.
+
+**upstream** — `pi/packages/coding-agent/src/core/auth-storage.ts:172-178` @v0.83.0 (the constructor calls `reload()` once, `:177`), `:204-215` (`reload()` ending in `catch { /* Preserve the last valid in-memory snapshot. */ }`), `:217-222` (`read()` answers from the cached `this.data`). **Cite correction:** the item's original upstream lines (`:188-204` / `:236-247` / `:260-273`) were taken from pi HEAD, not the ported tag — `auth-storage.ts` is 271 lines at v0.83.0.
+
+**Impact** — a transient read error, or a mid-write window, makes every configured provider read as unauthenticated; pi keeps the last good snapshot. Plus one syscall per auth query on hot TUI paths.
+
+**Fix** — add a cached `AuthFile` + revision behind the existing RwLock, an explicit `reload()` that preserves the prior snapshot on error, and route `has_auth` / `get_api_key` through it. Note CFG-044 proposes deleting `get_auth_status` outright — sequence the two so this item does not cache a function that is about to be removed.
+
+**Verify** — test: populate `auth.json`, query once, make it unreadable, query again → still configured. Fails at HEAD.
+
+## CFG-008 — Model-scope resolution drops every diagnostic
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `ModelResolver::resolve_scope` (`cyrup/crates/cyrup-config/src/model.rs:236-282`) returns a bare `Vec<ScopedModel>`: the glob branch (`:258-275`) falls through silently when the filter matches nothing, and the non-glob branch (`:276-281`) keeps only `parsed.model` and DISCARDS `parsed.warning`. No `ModelScopeDiagnostic` type exists; `grep -rn 'No models match' crates/` is empty.
+
+**upstream** — `pi/packages/coding-agent/src/core/model-resolver.ts:261` @v0.83.0 declares `ModelScopeDiagnostic` (codes `no-match` / `invalid-thinking-level`), `:270` returns `diagnostics` on the result, `No models match pattern "…"` is pushed at `:316` (glob) and `:340` (reference), and `Invalid thinking level "…" in pattern` is minted at `:243`.
+
+**Impact** — a typo'd `--models 'anthorpic/*'` resolves to nothing with no explanation, as does an invalid thinking-level suffix.
+
+**Fix** — introduce `ModelScopeDiagnostic` plus a result struct in `model.rs`, accumulate in both branches (`:258-275`, `:276-281`), and surface at the CLI/session call sites.
+
+**Verify** — unit test: `anthorpic/*` yields one diagnostic with pi's exact text; `anthropic/x:bogus` yields the invalid-level warning. Both fail at HEAD.
+
+## CFG-006 — `websocketConnectTimeoutMs` never reaches the HTTP/stream layer
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — the `retry.provider.*` half CLOSED: `cyrup/crates/cyrup-session-svc/src/builder.rs:1223-1234` reads `eff.provider_retry_settings()` and threads `timeout_ms` / `max_retries` / `max_retry_delay_ms` onto the agent builder, citing pi `sdk.ts:303-317`. The websocket half is still inert: `grep -rn websocket_connect_timeout_ms crates/ --include='*.rs'` returns exactly three lines — the accessor `cyrup/crates/cyrup-config/src/settings.rs:705`, the field declaration `cyrup/crates/cyrup-provider/src/stream.rs:179`, and the copy-forward `cyrup/crates/cyrup-provider/src/utils/simple_options.rs:84`. Nothing assigns it.
+
+**upstream** — `pi/packages/coding-agent/src/core/settings-manager.ts:131` @v0.83.0 declares the key (`websocketConnectTimeoutMs?: number`, still present at v0.84.1), consumed through `getWebSocketConnectTimeoutMs` in `sdk.ts`.
+
+**Impact** — a user tuning the websocket connect timeout in settings gets no effect at all; the provider layer always uses its built-in default.
+
+**Fix** — thread `websocket_connect_timeout_ms()` from `builder.rs` (beside the retry block at `:1223-1234`) into `cyrup-provider`'s stream options at the existing field site (`stream.rs:179`).
+
+**Verify** — test asserting the constructed provider options carry the settings value. **Note the residual test debt from the closed half:** the retry assignment is verified structurally only — nothing proves `max_retry_delay_ms` reaches the retry loop (blind spot 6).
+
+## CFG-039 — models.json `samplingParams` on model definitions and modelOverrides is silently dropped
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `grep -rn 'sampling_params|samplingParams' crates/ --include='*.rs'` returns ZERO at HEAD. `ModelDefinition` (`cyrup/crates/cyrup-config/src/model.rs:1542-1565`) carries id/name/api/base_url/reasoning/thinking_level_map/input/cost/context_window/max_tokens/headers/compat and no sampling field; `ModelOverride` (`:1572-1591`) likewise. Both derive `Deserialize` WITHOUT `deny_unknown_fields`, so a declared `samplingParams` block deserializes successfully and is discarded — no error, no warning, no diagnostic through `load_models_file_reporting` (`:1700-1717`).
+
+**upstream** — `pi/packages/coding-agent/src/core/model-config.ts:167` @v0.84.1 adds `samplingParams: Type.Optional(Type.Record(Type.String(), Type.Unknown()))` to `ModelDefinitionSchema` and `:188` the same to `ModelOverrideSchema` (neither exists at v0.83.0). Consumed in `provider-composer.ts` @v0.84.1: `modelFromJson` sets `samplingParams: definition.samplingParams` (`:162`), and `applyModelOverride` MERGES rather than replaces — `samplingParams: override.samplingParams ? { ...model.samplingParams, ...override.samplingParams } : model.samplingParams` (`:123-125`). It reaches the wire via `ai/src/api/simple-options.ts:27-33` and `openai-completions.ts:885-886`.
+
+**Impact** — a user who pins `top_p`, `top_k` or `repetition_penalty` on a custom or overridden model gets the provider's defaults instead, with the file reported as valid. Silent wrong request parameters on exactly the models people hand-tune. This is the models.json half of a two-part gap: `PARITY-GAPS` already records the provider-layer half (`StreamOptions` / `Model` carry no sampling field). Neither half is useful alone — schedule them together.
+
+**Fix** — add `sampling_params: Option<serde_json::Map<String, Value>>` to `ModelDefinition` (`model.rs:1542-1565`) and `ModelOverride` (`:1572-1591`); in `apply_models_json` (`:1838-…`) set it from the definition when building a custom model and MERGE it key-wise on the override path rather than replacing. Then carry it onto `cyrup_provider::Model` and into the request builders (the PARITY-GAPS provider-layer item).
+
+**Verify** — table test in `model.rs`: a provider block declaring `"models": [{"id":"m","samplingParams":{"top_p":0.5}}]` composes a model carrying `top_p = 0.5`; a `modelOverrides` entry adding `{"top_k": 40}` yields BOTH keys (merge, not replace). Both fail at HEAD.
+
+## CFG-020 — No `ModelRuntime` type and no availability snapshot
+
+**Kind** not-ported · **Severity** medium · **Effort** L · **Confidence** confirmed
+
+**cyrup** — `grep -rn 'struct ModelRuntime' crates/ --include='*.rs'` returns ZERO — no such type at HEAD. `full_model_registry()` (`cyrup/crates/cyrup-session-svc/src/session.rs:2680-2720`) recomposes base + guest + built-ins + models.json on EVERY call; `available_model_catalog` (`:2727`) calls it once and then filters, and `provider_has_configured_auth` (`:2659-2666`) re-reads through `provider_is_configured` each time. There is no snapshot and no invalidation queue. `cyrup_provider::auth::ApiKeyAuth` (`cyrup/crates/cyrup-provider/src/auth/mod.rs`) still exposes only `name` + `resolve` — pi's status-query half (`check`) has no counterpart.
+
+**upstream** — `pi/packages/coding-agent/src/core/model-runtime.ts` @v0.83.0 holds a `snapshot` with `configuredProviders` (`:372-374`) rebuilt on invalidation (`queueAvailabilityRefresh`, `:270-289`). **The target grew substantially at v0.84.1** (+356 lines): per-provider `refreshProviderAvailability`, `getAvailableSnapshot()`, `enqueueCredentialOperation`, `CredentialSynchronizationError`.
+
+**Impact** — repeated per-call recomposition of the whole registry; more importantly, the absence of a single snapshot is what let the two `has_configured_auth` implementations drift in the first place (CFG-022, CFG-024 — both now closed by a shared *function*, which is the cheap half of the fix, not the snapshot).
+
+**Fix** — introduce a `ModelRuntime` in `cyrup-config` owning the composed registry plus a `configured_providers` set, invalidated on settings/auth/models.json change; add a `check` method to `ApiKeyAuth`; have `session.rs:2680-2720` and `main.rs` both read from it. CFG-042's revision-checked `FileModelsStore` cache is the mechanism this snapshot would sit on.
+
+**Verify** — assert the registry is composed once per invalidation rather than once per query, and that `main.rs` and `AgentSession` return identical `configured_providers` for a models.json-only provider. **Whoever schedules this must read `model-runtime.ts` at v0.84.1, not v0.83.0** — the port target is materially larger than this item was originally written against, and `CredentialSynchronizationError` / `enqueueCredentialOperation` are area-01 PARITY-GAPS items that interlock with it.
+
+## CFG-003 — Settings `packages` are resolved but never auto-installed
+
+**Kind** not-ported · **Severity** medium · **Effort** L · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-resources/src/discovery.rs:325-340` still carries the `[CYRUP-DELTA]` doc "cyrup performs no network install during session assembly". `resolve_configured_package` (`:341-419`) resolves git/oci ONLY through an already-materialized `cyrup install` tree via `installed_dir` (`:384-399`); anything else becomes the loud diagnostic at `:403-413`. The read/filter/discover half landed and is fine.
+
+**upstream** — `pi/packages/coding-agent/src/core/package-manager.ts:1240-1283` @v0.83.0 `resolvePackageSources` defines `installMissing` (`:1244-1251`) and calls it for both the npm branch and the git branch.
+
+**Impact** — a fresh clone whose `.cyrup/settings.json` lists `github:org/pack` gets zero resources from it and a diagnostic telling the user to run `cyrup install` manually.
+
+**Fix** — implement the git/oci fetch path behind `resolve_configured_package` (`discovery.rs:384-399`), reusing what `cyrup install` already does, gated on an explicit opt-in setting since this is a network operation at session start. Land CFG-037 first or alongside — auto-install at project scope is exactly the path that would drop an un-ignored clone into the user's repo.
+
+**Verify** — integration test with a local bare git remote declared in settings: the first session materializes the tree and loads its skills.
+
+## CFG-005 — Two multi-prompt api-key login flows unported (`ApiKeyAuth` has no `login` member)
+
+**Kind** not-ported · **Severity** medium · **Effort** L · **Confidence** confirmed
+
+**cyrup** — most of this item CLOSED: `cyrup/crates/cyrup-config/src/login.rs` (1721 lines, new since `1806375`) ports `login` (`:760`), `logout` (`:818`), `env_api_key_login` (`:343`), `provider_auth_status` (`:360`) and the selector/option builders (`:422`, `:491`, `:547`, `:589`, `:641`, `:686`); OAuth refresh lives at `cyrup/crates/cyrup-provider/src/auth/resolve.rs:146-239`. The RESIDUAL is stated in-tree at `login.rs:33-42`: the two MULTI-PROMPT api-key logins are unported because `cyrup_provider::auth::ApiKeyAuth` (`cyrup/crates/cyrup-provider/src/auth/mod.rs:60-71`) exposes only `name` + `resolve` — there is no `login` member for a flow that needs more than one field.
+
+**upstream** — `pi/packages/ai/src/providers/cloudflare-auth.ts:48-53` @v0.83.0 (`cloudflareWorkersAIAuth()` prompts for key THEN account id) and `pi/packages/ai/src/providers/google-vertex.ts:15-45` @v0.83.0 (`vertexAuth` prompts select → key / project / location). Both are `login` members on pi's `ApiKeyAuth` shape.
+
+**Impact** — Cloudflare Workers AI and Google Vertex cannot be configured interactively; a user must hand-edit `auth.json` or set env vars, with no in-product path.
+
+**Fix** — add an optional `login` member to the `ApiKeyAuth` trait (`cyrup-provider/src/auth/mod.rs:60-71`) carrying a multi-field prompt description, and implement it for the two providers. Interlocks with `PROV-029` (area 01), which records the Copilot/Codex flows as unreachable for a related reason.
+
+**Verify** — a scripted login for each provider writes the full multi-field credential and a subsequent `resolve` returns a usable key. **Maintainer has DEPRIORITISED this item: keep filed, do not schedule.**
+
+## CFG-009 — An `npm:` package source fails with the misleading message "unsupported source (OCI deferred)"
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `PackageSource::parse` returns `Err(ResourceError::Unsupported)` for an `npm:` prefix at `cyrup/crates/cyrup-resources/src/package/source.rs:78-81` (the documented R-09-021 drop is at `:70-71`), whose Display is `#[error("unsupported source (OCI deferred)")]` at `cyrup/crates/cyrup-resources/src/error.rs:40-41`. Settings entries route through the same parse (`cyrup/crates/cyrup-resources/src/discovery.rs:360-369`), so it appears on a normal session start.
+
+**upstream** — `pi/packages/coding-agent/src/core/package-manager.ts:1419-1445` @v0.83.0 (`parseSource`'s npm branch), consumed by `resolvePackageSources` at `:1257-1268`.
+
+**Impact** — a user declaring an npm package is told the problem is OCI. The npm channel drop itself is a documented decision; only the message is wrong.
+
+**Fix** — split `ResourceError::Unsupported` into `UnsupportedNpm` / `UnsupportedOci` in `error.rs:40-41` with accurate text. Dangling consequence: `EffectiveSettings::npm_command()` (`cyrup-config/src/settings.rs:742`) has zero consumers for the same root cause (CFG-015).
+
+**Verify** — assert the message text for an `npm:` source. The existing test at `cyrup-resources/tests/resources.rs:1987-1991` asserts the VARIANT, not the text, so it neither pins nor guards the message.
+
+## CFG-013 — `TrustStore::nearest` reads trust.json without the file lock
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `nearest()` at `cyrup/crates/cyrup-config/src/trust.rs:140-141` calls `self.read_map()` with no `crate::lock::FileLock::acquire`, while `set_many` (`:160`) acquires it at `:163` before its own `read_map()` at `:164`.
+
+**upstream** — `pi/packages/coding-agent/src/core/trust-manager.ts:219-222` @v0.83.0 wraps `getEntry`'s read in `withTrustFileLock` (defined `:168`); `get()` at `:216` routes through `getEntry`.
+
+**Impact** — negligible on POSIX, since the writer uses rename-based `write_atomic`. A consistency-posture divergence that matters if the writer ever stops being atomic or a non-POSIX target appears.
+
+**Fix** — acquire the lock around `read_map()` at `trust.rs:141`.
+
+**Verify** — code review; no behavioural test is meaningful on POSIX.
+
+## CFG-016 — `${0:-default}` emitted literally instead of substituting
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `match_brace_form` at `cyrup/crates/cyrup-resources/src/prompt.rs:236`; line `:248` is still `let idx = num.parse::<usize>().ok()?.checked_sub(1)?;` — for `num == "0"`, `checked_sub(1)` is None and the `?` aborts the WHOLE form, so `substitute_args` falls to the unrecognized-`${…}` path and emits the token verbatim.
+
+**upstream** — `pi/packages/coding-agent/src/core/prompt-templates.ts:74` @v0.83.0 — the regex alternative `\$\{(\d+|ARGUMENTS|@):-([^}]*)\}` matches, and the handler at `:78` indexes `args[0-1] = args[-1] = undefined`, which is falsy, so `:79` returns the default.
+
+**Impact** — a prompt template using `${0:-default}` renders the literal `${0:-default}` into the model's context instead of the default text.
+
+**Fix** — one line at `prompt.rs:248`: treat index 0 as "no such arg" and take the default branch instead of aborting the form.
+
+**Verify** — unit test in `prompt.rs`: `${0:-fallback}` with no args renders `fallback`. No test pins the current behaviour, so the fix is unguarded in both directions.
+
+## CFG-017 — `${@:-default}` / `${ARGUMENTS:-default}` prompt-template forms unsupported
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — the `:-` guard at `cyrup/crates/cyrup-resources/src/prompt.rs:244-246` still requires `num.bytes().all(|b| b.is_ascii_digit())`, so inner `@:-x` / `ARGUMENTS:-x` fails it; the `@:` arm at `:257-263` then rejects `-x` at `:262` and returns None, and the token falls out to the literal-`$` path. `match_brace_form`'s signature (`:236`) still takes only `args`, never `all_args`.
+
+**upstream** — `pi/packages/coding-agent/src/core/prompt-templates.ts:74` @v0.83.0 accepts `(\d+|ARGUMENTS|@)` and resolves `@` / `ARGUMENTS` to `allArgs` at `:78`.
+
+**Impact** — `${@:-default}` and `${ARGUMENTS:-default}` render literally into the prompt.
+
+**Fix** — extend the guard at `prompt.rs:246` and thread `all_args` into `match_brace_form` (`:236`). The `${@:N}` / `${@:N:L}` slice family at `:256-310` is CORRECT and unaffected — re-verified this pass against `prompt-templates.ts:74-96`.
+
+**Verify** — unit tests for `${@:-fallback}` and `${ARGUMENTS:-fallback}`, with and without args.
+
+## CFG-028 — Config-value `!command` resolution blocks a tokio worker for up to 10 s
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+> **Severity corrected medium → low by the refuter.** The evidence is accurate, the rating was not: pi's
+> `execSync` blocks its ONE event loop for the same 10 s, while cyrup runs
+> `#[tokio::main(flavor = "multi_thread")]` (`crates/cyrup/src/main.rs:40`) and blocks one worker of N.
+> cyrup is strictly *less* blocking than upstream, so there is no behavioural divergence to close —
+> this is a robustness note kept on the list, not a parity gap.
+
+**cyrup** — `cyrup/crates/cyrup-config/src/config_value.rs:306-355` `run_with_timeout` is fully synchronous: `Instant::now()` (`:330`), `Duration::from_millis(10_000)` (`:331`), elapsed check (`:345`), `std::thread::sleep(Duration::from_millis(10))` (`:349`). `grep -rn spawn_blocking crates/cyrup-config/src/` returns nothing, and it is reached from two async fns: `AuthStore::get_api_key` (`cyrup-config/src/auth.rs`) and `ConfiguredApiKeyAuth::resolve` (`cyrup-config/src/provider_compose.rs:206-212`).
+
+**upstream** — `pi/packages/coding-agent/src/core/resolve-config-value.ts:186-196` @v0.83.0 uses `execSync(command, { timeout: 10000 })` inside its async resolve.
+
+**Impact** — a slow `!command` credential helper occupies one tokio worker thread for up to 10 s, degrading unrelated concurrent work. No user-visible parity difference.
+
+**Fix** — add an async entry point in `config_value.rs` wrapping the blocking body in `tokio::task::spawn_blocking`, called from `auth.rs` and `provider_compose.rs:206-212`. Do NOT change the 10 s ceiling — that is pi's number.
+
+**Verify** — test that a 1 s `!sleep 1` credential resolve does not delay a concurrently-spawned task by more than a few milliseconds.
+
+## CFG-030 — Non-object top-level `settings.json` degraded to `{}` with no load error
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+> **Severity corrected medium → low by the refuter.** Both sides mangle the document; the only delta is
+> that pi preserves array elements as meaningless indexed keys (`{0:1,1:2,2:3}`) while cyrup drops them.
+> Neither preserves anything the user intended, load behaviour is identical (all defaults), and the
+> trigger — a `settings.json` whose top level is an array / string / number / null — is pathological.
+
+**cyrup** — `Settings::parse` at `cyrup/crates/cyrup-config/src/settings.rs:186-200` deserializes into `serde_json::Value` (`:191`) then `match value { Value::Object(mut obj) => …, _ => Ok(Self::default()) }` (`:192-199`), commented "// A non-object top-level is treated as empty (degraded), never a panic." at `:198`. So `[1,2,3]` parses Ok, produces no `ScopedError`, never reaches `record_load_error`, leaves `ensure_scope_writable` (`:1329-1337`) satisfied, and the next `/config` write takes the `Some(Ok(default))` branch at `:1360` and rewrites the file from an empty document.
+
+**upstream** — `pi/packages/coding-agent/src/core/settings-manager.ts:389` @v0.83.0 does a bare `JSON.parse` then `migrateSettings`, and `persistScopedSettings` (`:585-593`) spreads the parsed document (`{ ...currentFileSettings }`), preserving array elements as indexed keys.
+
+**Impact** — a `settings.json` that is valid JSON but not an object is silently emptied on the next write, with no diagnostic and no write refusal. CFG-001's protections all apply to malformed TEXT and none to this case.
+
+**Fix** — one line: make `Settings::parse` return `Err` for a non-object top level at `settings.rs:198`; the latch, the diagnostic and all write refusals then apply unchanged.
+
+**Verify** — add a `[1,2,3]` case to CFG-001's byte-equality suite (which today seeds only malformed text): a `/config` write must be refused and the file byte-identical afterwards. Fails at HEAD.
+
+## CFG-040 — `markdown.mermaid` settings key and its getter/setter are absent
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `grep -rni 'mermaid' crates/cyrup-config/src` returns ZERO. `EffectiveSettings`' only markdown accessor is `code_block_indent()` (`cyrup/crates/cyrup-config/src/settings.rs:840-844`, reading `["markdown","codeBlockIndent"]`); no sibling reads `markdown.mermaid` and there is no setter for it. The only `mermaid` mentions in the workspace are two comment lines in `cyrup/crates/cyrup-tui/src/markdown.rs:964-965` quoting upstream's fence predicate.
+
+**upstream** — `pi/packages/coding-agent/src/core/settings-manager.ts:57` @v0.84.1 declares `export type MermaidRenderingMode = "off" | "final" | "streaming"` and `:61` adds `mermaid?: MermaidRenderingMode; // default: "streaming"` to `MarkdownSettings` (absent at v0.83.0). Getter `getMermaidRenderingMode()` at `:1251-1254` (validated, defaulting to `"streaming"`), setter at `:1257-1262` writing through `markModified("markdown", "mermaid")`.
+
+**Impact** — a user cannot turn mermaid rendering off or restrict it to final output; the key is inert and `/settings` has no row for it. Masked today because cyrup renders no mermaid at all (PARITY-GAPS records the renderer half) — the moment that lands, the off-switch is missing and there is no way back to a plain code fence.
+
+**Fix** — add `MermaidRenderingMode` plus `mermaid_rendering_mode()` beside `code_block_indent()` (`settings.rs:840-844`), validating against the three-member list with `"streaming"` as the fallback exactly as `settings-manager.ts:1251-1254` does, and a `set_mermaid_rendering_mode` using `set_nested(&["markdown","mermaid"], …)` so sibling markdown keys survive. Land with the renderer work.
+
+**Verify** — unit test beside the `code_block_indent` assertion (`settings.rs:1878`): `{"markdown":{"mermaid":"off"}}` → `Off`; an unknown value and an absent key both → `Streaming`; a `set_mermaid_rendering_mode` round-trip preserves a sibling `markdown.codeBlockIndent`.
+
+## CFG-041 — `default_model_per_provider` is missing v0.84.1's `baseten` and `qwen-token-plan-individual`
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-config/src/model.rs:936-982` `default_model_per_provider` has 37 arms and neither `baseten` nor `qwen-token-plan-individual`; `KNOWN_PROVIDERS` (`:985-1031`) matches it arm-for-arm and likewise has neither. `grep -rni 'baseten|qwen-token-plan-individual' crates/ --include='*.rs'` returns ZERO. Because `first_default_or_first` (`:1034-…`) scans `KNOWN_PROVIDERS` in order, a provider absent from the list can never contribute a curated default at launch step 4.
+
+**upstream** — `pi/packages/coding-agent/src/core/model-resolver.ts:48` @v0.84.1 adds `baseten: "zai-org/GLM-5.2"` and `:56` adds `"qwen-token-plan-individual": "qwen3.8-max"` (neither present at v0.83.0; the map is 38 entries there and 40 at v0.84.1). The map's `Object.keys` order is the launch scan order at `:683-692` @v0.84.1.
+
+**Impact** — a user whose only credential is a Baseten or Qwen-Individual key launches on no curated default: step 4 falls through the whole known-provider scan and takes `availableModels[0]`, a different model from pi's on identical inputs. Small blast radius today (PARITY-GAPS records that neither provider is registered at all), but the map is the launch contract and will be wrong the moment they are.
+
+**Fix** — add both arms to `default_model_per_provider` and the matching ids to `KNOWN_PROVIDERS` at pi's insertion positions — `baseten` between `together` and `opencode`, `qwen-token-plan-individual` immediately after `qwen-token-plan-cn` — since position is load-bearing. One changeset with CFG-019's `xai`/`radius` corrections.
+
+**Verify** — extend CFG-019's proposed table test to assert cyrup's map equals pi v0.84.1's 40 entries key-for-key AND in the same order, so the next upstream addition fails loudly. No test pins the current 37 entries.
+
+## CFG-043 — An invalid `models.json` reports a serde parse error instead of pi's per-field schema report
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-config/src/model.rs:1700-1717` `load_models_file_reporting` has exactly two messages — `Failed to parse models.json: {e}\n\nFile: {path}` for `ConfigError::Serde` (`:1704-1710`) and `Failed to load models.json: {e}\n\nFile: {path}` otherwise (`:1711-1716`). `load_models_file` (`:1680-1690`) is a single `serde_json::from_str::<ModelFile>` at `:1689`, so a wrong-typed field (e.g. `"contextWindow": "big"`) surfaces as serde's `invalid type: string "big", expected u64 at line N column M` under the PARSE heading, first error only. `grep -n 'Invalid models.json' crates/` returns nothing.
+
+**upstream** — `pi/packages/coding-agent/src/core/model-config.ts` @v0.83.0 keeps three DISTINCT messages: `Failed to load models.json: …` for the read error (`:253-256`), `Failed to parse models.json: …` for the JSON syntax error (`:265-270`), and `Invalid models.json schema:\n{errors}\n\nFile: {path}` for a schema failure (`:272-279`), where `errors` is EVERY validation error rendered as `  - ${formatValidationPath(error)}: ${error.message}` (`:274-277`) with the dotted instance path from `formatValidationPath` (`:217-228`). Unchanged at v0.84.1.
+
+**Impact** — a user with a typo'd field type is told the file failed to PARSE — which points at JSON syntax, not at the field — and is shown only the first offender, by byte offset rather than key path. pi names every bad field as `providers.mycorp.models.0.contextWindow: Expected number`, so the fix is one read; cyrup's message sends the user hunting for a missing comma that does not exist.
+
+**Fix** — split the error in `model.rs`: keep `Failed to parse models.json` for a `serde_json::from_str::<Value>` step, then deserialize the `Value` into `ModelFile` with `serde_path_to_error` (or hand-walk the providers map, deserializing each block independently) and render `Invalid models.json schema:\n` followed by one `  - <dotted.path>: <message>` line per failure. Per-provider deserialization also lets one bad block be rejected while the rest load — the shape `ModelFile::compose` already uses (`:1727-1740`) — and is what CFG-046 needs.
+
+**Verify** — test beside the existing `Failed to parse models.json` assertion (`model.rs:2840`): `{"providers":{"mycorp":{"models":[{"id":"m","contextWindow":"big"}]}}}` must produce a message starting `Invalid models.json schema:` and containing `providers.mycorp.models.0.contextWindow`. Fails at HEAD.
+
+## CFG-044 — Three `auth-storage.ts` provenance cites resolve to nothing upstream, and `get_auth_status` is dead
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — three provenance comments name upstream symbols that do not exist at the ported tag: `cyrup/crates/cyrup-config/src/auth.rs:258-260` ("Pi `AuthStorage.hasAuth`, auth-storage.ts:344-349"), `:271-272` ("Pi `getAuthStatus`, auth-storage.ts:354-369"), `:133-134` ("Pi `AuthStorage.getProviderEnv`, auth-storage.ts:305-308"). `auth-storage.ts` is **271 lines at v0.83.0**, so all three ranges are past end-of-file. `get_auth_status` (`:273-306`) additionally has ZERO production callers: `grep -rn get_auth_status crates/ --include='*.rs'` returns the definition, two `#[cfg(test)]` assertions (`:793`, `:801`) and two doc mentions (`cyrup-config/src/login.rs:356-359`, `cyrup-tui/src/auth_select.rs:42`). The live status function is `cyrup_config::login::provider_auth_status` (`login.rs:360-395`), whose own doc already records that `AuthStore::get_auth_status` "reports `configured: false` for the runtime and environment tiers" and cites "a function that no longer exists at this tag".
+
+**upstream** — `git grep -n 'hasAuth\b' v0.83.0 -- packages` returns NOTHING (only a test helper `hasAuthForProvider` at pi HEAD); `git grep -n getAuthStatus v0.83.0 -- packages` returns only prose in `packages/agent/docs/models.md:874` recording that `AuthStorage` was deleted and its `getAuthStatus` moved to a ModelRegistry facade; `getProviderEnv` returns nothing. The real equivalents at v0.83.0 are `model-runtime.ts:372-374` (`hasConfiguredAuth`) and `model-runtime.ts:428-437` (`getProviderAuthStatus`) — exactly what `login.rs:22` already cites.
+
+**Impact** — CLAUDE.md makes these comments the provenance record, and three assert an upstream that never existed at the ported tag. A maintainer "restoring parity" against them will re-derive the wrong semantics — specifically `get_auth_status`'s `configured: false` for the runtime and environment tiers, the OPPOSITE of `getProviderAuthStatus`'s `{ configured: true, source: "runtime" | "environment" }` — and a dead function with a plausible-looking cite is exactly what a later reader wires up by mistake. Same class as the `subagent-executor.ts:3022` false precedent already recorded in the residual ledger's Corrections.
+
+**Fix** — repoint the three comments at real code: `has_auth` (`:258-260`) → `ModelRuntime.hasConfiguredAuth`, `model-runtime.ts:372-374` @v0.83.0 (noting the models.json tier lives in `provider_is_configured`); `provider_env` (`:133-134`) → the `resolution.env` construction in `model-runtime.ts` `prepareRequest`; then DELETE `AuthStore::get_auth_status` (`:273-306`) with its two tests, since `login::provider_auth_status` is the ported function and the only one with a caller. Update the dangling doc at `cyrup-tui/src/auth_select.rs:39-42` in the same change. Sequence against CFG-007, which otherwise caches a function slated for deletion.
+
+**Verify** — after the change, `grep -rn 'auth-storage.ts:' crates/` must not name `hasAuth`, `getAuthStatus` or `getProviderEnv`, and `grep -rn get_auth_status crates/` must return nothing. Cross-check each surviving cite by opening the named line at `git show v0.83.0:<path>`.
+
+## CFG-047 — Three built-in slash-command metadata divergences (`/model`, `/login`, `/reload`)
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-tui/src/commands.rs:49-72`. Comparing entry by entry against pi's `BUILTIN_SLASH_COMMANDS`, the 22 names and their order match exactly and 19 of 22 descriptions are byte-identical. Three do not: (a) `/model` is `arg_cmd("model", …, "<model>")` where pi's hint is `"<provider/model>"`; (b) `/login` is `cmd("login", "Configure provider authentication", None)` — the hint is dropped entirely, even though `resolve_login_command` (`cyrup/crates/cyrup-config/src/login.rs:589`) does accept a provider argument; (c) `/reload`'s description is "Reload keybindings, extensions, skills, prompts, and themes".
+
+**upstream** — `pi/packages/coding-agent/src/core/slash-commands.ts:19-42` @v0.83.0: `/model` carries `argumentHint: "<provider/model>"`; `/login` is `{ name: "login", description: "Configure provider authentication", argumentHint: "<provider>" }`; `/reload`'s description is "Reload keybindings, extensions, skills, prompts, themes, **and context files**".
+
+**Impact** — autocomplete never tells the user that `/model anthropic/claude-x` and `/login anthropic` are accepted, so a documented affordance is invisible. **Worth a second look while fixing (c):** if cyrup's shortened `/reload` string is HONEST, then `/reload` also fails to re-read `AGENTS.md` / `CLAUDE.md` context files — a behaviour gap rather than a string gap, belonging to whoever owns the reload path (area 03/07). Determine which before editing the string.
+
+**Fix** — correct the two argument hints at `commands.rs:49-72`. For `/reload`, first check whether the reload path re-reads context files; restore pi's full description if it does, or file the missing reload step against the owning area if it does not.
+
+**Verify** — a table test asserting cyrup's 22 built-in commands equal pi's name-for-name including `argumentHint` and `description`, so the next upstream string change fails loudly. Nothing pins these strings today.
+
+## CFG-050 — `migrate_tools_to_bin` moves the managed `fd`/`rg` binaries with no completion notice
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup/src/migrations.rs:177-199` `migrate_tools_to_bin` reproduces pi's loop faithfully — the four managed names `fd`/`rg`/`fd.exe`/`rg.exe`, `bin/` created on demand, rename when the destination is free, delete the stale source when the destination already exists — but tracks no `moved_any` flag and **emits nothing**. Contrast the sibling migration in the same file: `migrate_commands_to_prompts` (`:212-234`) does route its success line through `crate::output_guard::emit_stray_line("Migrated {label} commands/ → prompts/")` at `:220`, so the omission is inconsistent within cyrup rather than a deliberate house style.
+
+**upstream** — `pi/packages/coding-agent/src/migrations.ts:185` `let movedAny = false;`, set true on each successful `renameSync` (`:203`), and `:213-215` — `if (movedAny) { console.log(chalk.green('Migrated managed binaries tools/ → bin/')); }`. Identical at v0.84.1.
+
+**Impact** — a user who has been pointing scripts, settings or a `PATH` entry at `~/.cyrup/agent/tools/rg` finds the binaries gone after an upgrade with nothing in the output saying where they went. pi tells them. Low because the tools themselves keep working through cyrup's own resolver — the cost is a confusing silent filesystem change, not broken function.
+
+**Fix** — add a `moved_any` bool to `migrate_tools_to_bin` (`migrations.rs:177-199`), set it on each successful `std::fs::rename`, and after the loop emit `crate::output_guard::emit_stray_line("Migrated managed binaries tools/ → bin/")` when true — the same guard `migrate_commands_to_prompts` already uses at `:220`, so the line is rerouted to stderr under PRINT/JSON/RPC and cannot corrupt a machine-readable stdout.
+
+**Verify** — extend the `migrates_commands_dir_and_warns_on_legacy_dirs` neighbourhood in `migrations.rs`'s test module: create `<agent_dir>/tools/rg`, run `run_migrations`, assert the file is now at `<agent_dir>/bin/rg` and the notice was emitted (via the `output_guard` seam or a returned flag). A second run must emit nothing.
+
+## CFG-051 — The migrated-credentials notice is written to stderr pre-TUI instead of into the transcript, on a cite that points at unrelated upstream code
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup/src/main.rs:520-527`: the comment reads "Migrated-credential notice (Pi `InteractiveMode` startup warning, interactive-mode.ts:797)" and the code is `if !migration.migrated_auth_providers.is_empty() { eprintln!("Warning: Migrated credentials to auth.json: {}", migration.migrated_auth_providers.join(", ")); }` — a raw stderr write on the pre-TUI path, immediately followed by the deprecation-warning block (`:529-533`, CFG-049) and TUI init.
+
+**upstream** — pi does not print this before the UI. `pi/packages/coding-agent/src/main.ts:607` threads `migratedAuthProviders` into the interactive mode's options (`migratedProviders?: string[]`, `interactive-mode.ts:308`), and `interactive-mode.ts:872-875` @v0.83.0 renders it **inside** the running UI: `const { migratedProviders, … } = this.options; if (migratedProviders && migratedProviders.length > 0) { this.showWarning(\`Migrated credentials to auth.json: ${migratedProviders.join(', ')}\`); }` — a styled warning entry in the transcript, scrollable for the whole session. **The in-tree cite is simply wrong:** `interactive-mode.ts:797` at v0.83.0 is `await this.rebindCurrentSession();`, unrelated to credentials, and v0.84.1 does not carry it either. Same class as the three false `auth-storage.ts` cites already filed as CFG-044.
+
+**Impact** — the one notice telling a user their OAuth tokens and API keys were relocated out of `oauth.json`/`settings.json` into `auth.json` — a change that silently invalidates any tooling or backup pointing at the old files — is emitted exactly where the first TUI frame overwrites it, instead of into the transcript where pi keeps it. Low because the migration itself is correct and idempotent and the credentials keep working; the cost is a one-shot notice about a filesystem change that the user very likely never sees.
+
+**Fix** — thread `migration.migrated_auth_providers` into the TUI the way pi threads `migratedProviders` (`main.ts:607` → `interactive-mode.ts:308` → `:872-875`) and render it through the transcript's warning path after the first frame, rather than `eprintln!` at `main.rs:522-527`. Keep the stderr form for non-interactive modes only. Correct the cite in the comment from `interactive-mode.ts:797` to `interactive-mode.ts:872-875` @v0.83.0 — and note the ordering interaction with CFG-049: once the deprecation gate blocks on a keypress, this line becomes readable by accident, which is not the same as being ported.
+
+**Verify** — app test in `crates/cyrup-tui/tests/`: seed a legacy `oauth.json`, boot, and assert the **rendered transcript** contains `Warning: Migrated credentials to auth.json: anthropic` after the first draw — not merely that stderr received it. Confirm in a live terminal run that the line is still visible and scrollable after the UI has painted.
+
+## CFG-014 — `showCacheMissNotices` and prompt-cache-miss tracking absent
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `grep -rn 'showCacheMissNotices|show_cache_miss' crates/ --include='*.rs'` returns ZERO at HEAD; not among `EffectiveSettings`' accessors (`cyrup/crates/cyrup-config/src/settings.rs:509-1000`). A full 47-key sweep of pi's v0.84.1 Settings interface found this as one of only THREE keys with zero occurrences in `settings.rs` — the other two are `tuiMode` / `fullscreenScrollbar` (CFG-021).
+
+**upstream** — `pi/packages/coding-agent/src/core/settings-manager.ts:96` @v0.83.0 declares the key (default false), getter `:850-852`, setter `:872-875`.
+
+**Impact** — no way to surface prompt-cache misses; a user debugging cache behaviour has no signal.
+
+**Fix** — add the accessor and setter in `settings.rs`, detect the miss off the usage block in `cyrup-provider`, and add the `/config` row.
+
+**Verify** — a faux-provider run with a cache-miss usage block emits the notice when the setting is on and nothing when off.
+
+## CFG-015 — Five unconsumed settings accessors, incl. `lastChangelogVersion` and `collapseChangelog`
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed
+
+**cyrup** — four accessors have zero consumers anywhere outside `cyrup/crates/cyrup-config/src`: `code_block_indent` (`settings.rs:840-844`), `last_changelog_version` (`:994-996`), `npm_command` (`:742`), `warnings().anthropic_extra_usage` (`:884-890`, field `:52`). **A fifth key is folded in this pass** — `collapse_changelog`, whose only consumer outside `settings.rs` is the display row `cyrup/crates/cyrup-tui/src/app.rs:5667` (`SettingRow::toggle("collapseChangelog", "Collapse changelog", eff.collapse_changelog())`), i.e. a `/settings` row over a value nothing reads. This item is also `PARITY-GAPS` PB-6's home: `/changelog` is still hardcoded in `cyrup-tui/src/app.rs` and `grep -rn 'parse_changelog|CHANGELOG' crates/ --include='*.rs'` finds no parser anywhere.
+
+**upstream** — `pi/packages/coding-agent/src/core/settings-manager.ts` @v0.83.0: `:55` `codeBlockIndent`, `:59` `anthropicExtraUsage`, `:84` `lastChangelogVersion` (getter `:660-662`, setter `:664-667`), `:99` `collapseChangelog` ("Show condensed changelog after update (use /changelog for full)"), `:102` `npmCommand`.
+
+**Impact** — five documented settings do nothing when set; two of them (`lastChangelogVersion`, `collapseChangelog`) are the whole state model for a changelog feature cyrup does not have.
+
+**Fix** — wire `code_block_indent` into `cyrup-tui`'s markdown renderer and `anthropicExtraUsage` into the Anthropic provider's warning path. Land `lastChangelogVersion` + `collapseChangelog` together with the changelog parser (PB-6) so all of that feature's state closes at once rather than in halves. `npm_command()` stays blocked behind the unported npm channel (CFG-009) — a consequence, not an independent gap.
+
+**Verify** — one assertion per key at its consumption site; for the changelog pair, a test that a version bump renders the condensed form when `collapseChangelog` is true and the full form when false.
+
+## CFG-027 — A local package that is a bare extension directory contributes nothing
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-resources/src/discovery.rs:813-916`: after `resolve_manifest(&dir)` (`:815`) every resource comes from the manifest lists, and the extension loop at `:887-916` pushes only `manifest.extensions` entries — nothing ever pushes `dir` itself onto `ext_paths`. `resolve_configured_package` additionally hard-errors on a non-directory at `:401-413`.
+
+**upstream** — `pi/packages/coding-agent/src/core/package-manager.ts:1316-1344` @v0.83.0 `resolveLocalExtensionSource`: a missing path is a silent skip (`if (!existsSync(resolved)) return;`, not an error); a FILE entry goes straight to `accumulator.extensions`; a DIRECTORY whose `collectPackageResources` returns false falls back to `this.addResource(accumulator.extensions, resolved, metadata, true)`.
+
+**Impact** — `"packages": ["./my-ext"]` where `./my-ext` is a bare extension with no manifest loads nothing. Narrow: `--extension`/`-e` and the settings `extensions` array both cover the need.
+
+**Fix** — in `discovery.rs:813-916`, when `resolve_manifest` yields nothing, push `dir` onto `ext_paths`; relax the non-directory error at `:401-413` to accept a file entry as an extension and a missing path as a silent skip.
+
+**Verify** — test: a settings-declared local package that is a manifest-less extension directory registers as an extension.
+
+## CFG-042 — `FileModelsStore` does not normalize its path, cache by file revision, or accept cancellation
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `cyrup/crates/cyrup-config/src/models_store.rs:49-51` `FileModelsStore::new(path: impl Into<PathBuf>)` stores the path raw — no tilde / `file://` normalization. `read` (`:89-97`) takes the cross-process lock and calls `read_all` (`:67-72`), which does a full `read_to_string` + `serde_json::from_str` on EVERY call; there is no revision field, no shared read state, no cached snapshot. The trait methods (`:89-116`) take no options argument, so an in-flight read cannot be cancelled. Secondary: `read_all`/`write_all` use `BTreeMap` (`:67`, `:74`), so the file is rewritten with keys SORTED where pi preserves insertion order.
+
+**upstream** — `pi/packages/coding-agent/src/core/models-store.ts` @v0.84.1: the constructor normalizes (`this.path = normalizePath(path)`, `:53`) and adopts a process-wide `sharedModelsFileReadState` (`:23`, `:55-58`); `readLatest` (`:81-108`) short-circuits on `getFileRevision(this.path) === readState.revision` (`:86-87`) and otherwise coalesces concurrent readers onto one in-flight reload; `read`/`write`/`delete` all take `ModelsStoreOperationOptions` and call `options?.signal?.throwIfAborted()` (`:120-122`, `:127-137`, `:139-149`). None of this exists at v0.83.0, where `read` was a bare `storage.withLock(...)`. `InMemoryCodingAgentModelsStore.read`/`write` also gained `structuredClone`.
+
+**Impact** — every catalog-overlay lookup re-reads and re-parses `models-store.json` under a cross-process lock instead of answering from a revision-checked snapshot, paying a syscall + a JSON parse each time and serializing against any concurrent `cyrup update --models`. `FileModelsStore::new("~/alt/models-store.json")` silently targets a literal `~` directory. A hung read cannot be aborted. Low today (cyrup builds the overlay once at session start) — it matters as the mechanism CFG-020's snapshot would need.
+
+**Fix** — give `FileModelsStore` a `RwLock<{ data, revision }>` alongside `path`, normalize the path in `new` (`:49-51`) through the shared util CFG-025/CFG-036 introduce, add a `file_revision(&self)` from mtime+size, and have `read` (`:89`) answer from the cached map when the revision is unchanged, refreshing under the existing `FileLock` otherwise; update the cache in `write`/`delete` (`:99-116`) from the map they already computed. Add a `CancelToken` parameter to the `ModelsStore` trait (`cyrup-provider/src/models_store.rs`) to carry pi's `signal`. If byte-interop with pi matters, swap `BTreeMap` for an insertion-ordered map.
+
+**Verify** — test beside `round_trips_through_the_file_and_survives_a_restart` (`models_store.rs:139`): after one `read`, make the file unreadable and assert a second `read` still returns the cached entry; then rewrite the file and assert the next `read` observes it. Plus a path test: `FileModelsStore::new("~/x/models-store.json")` with HOME overridden resolves under the home dir. Both fail at HEAD.
+
+## CFG-021 — `tuiMode` / `fullscreenScrollbar` not modelled
+
+**Kind** upstream-drift · **Severity** low · **Effort** L · **Confidence** confirmed
+
+> **Misdescribed twice, corrected in place (id retained).** (1) The key name `uiMode` does not exist
+> anywhere in pi — the real key is `tuiMode`. (2) BOTH keys are **v0.84.1 additions**
+> (`git show v0.83.0:…/settings-manager.ts` has neither), so the kind moves from `not-ported` to
+> `upstream-drift`. The finding itself survives: cyrup models neither key.
+
+**cyrup** — `grep -rni 'uiMode|tuiMode|fullscreenScrollbar|fullscreen_scrollbar' crates/ --include='*.rs'` returns ZERO at HEAD. Confirmed by the independent 47-key sweep of pi's v0.84.1 Settings interface against `cyrup/crates/cyrup-config/src/settings.rs`: these two and `showCacheMissNotices` (CFG-014) are the only keys with a zero count.
+
+**upstream** — `pi/packages/coding-agent/src/core/settings-manager.ts:135` @v0.84.1 declares `tuiMode?: TuiMode` (getter `:1128-1133`, setter `:1135-1140`) and the sibling `fullscreenScrollbar?: ScrollViewScrollbar`.
+
+**Impact** — none today; deferred with the fullscreen TUI mode itself. Interlocks with `PARITY-GAPS` VL-P19 (the alt-screen renderer) and with CFG-040, which also waits on renderer work. The companion theme token `scrollbarThumb` already landed (CFG-034, closed).
+
+**Fix** — land with the fullscreen viewport work: add both accessors and setters in `settings.rs` and the `/settings` rows, then consume them in the alt-screen renderer.
+
+**Verify** — settings round-trip test once the mode exists, plus a `/settings` row assertion.
+
+## Coverage
+
+**Read first-hand at cyrup HEAD `04c1ba2`** (tree clean at `a9000b1`, docs-only): `crates/cyrup-config/src/{settings,auth,trust,model,models_store,provider_compose,config_value,env,lib}.rs` (`models_store.rs` and `env.rs` in full), plus `login.rs`'s module doc, full public-fn index and the `provider_auth_status` / `login_provider_options` bodies; `crates/cyrup-resources/src/{discovery,skill,prompt,error}.rs` (discovery's settings / package / project / skill-scan regions) and `src/package/{manifest,source,install,store}.rs`; `crates/cyrup/src/{main,migrations,cli}.rs` (launch predicate, migrations call, keybindings load, dir flags, prompt-input region); `crates/cyrup-session-svc/src/{builder,session}.rs` (packages / retry / prompt regions; auth predicate + `full_model_registry`); `crates/cyrup-test-support/src/auth.rs`; `crates/cyrup-tui/src/{keymap,auth_select,commands,app,theme}.rs` (keymap's `merge_json` + `parse_key_values`; app's keybindings, login-selector and `/settings` regions); tests `crates/cyrup/tests/models_json_resolution.rs`, `crates/cyrup-session-svc/tests/read_image_auto_resize.rs`, `crates/cyrup-tui/tests/settings_inert_keys.rs`, `crates/cyrup-ext/tests/extension_name_conflicts.rs`.
+
+**Read first-hand upstream, at explicit tags** (`git show v0.83.0:<path>` / `git show v0.84.1:<path>`, never the floating HEAD unless stated): `coding-agent/src/core/{settings-manager,model-resolver,model-runtime,models-store,model-config,model-registry,provider-composer,resource-loader,package-manager,pi-manifest,project-trust,trust-manager,source-info,experimental,defaults,resolve-config-value,prompt-templates,skills,slash-commands,keybindings,auth-storage}.ts`, `coding-agent/src/{config,migrations,main,package-manager-cli}.ts`, `coding-agent/src/utils/paths.ts`, `coding-agent/src/modes/interactive/{interactive-mode.ts,components/oauth-selector.ts}`, `packages/tui/src/keybindings.ts`, `packages/ai/src/auth/oauth/anthropic.ts`, `packages/ai/src/providers/{cloudflare-auth,google-vertex}.ts`.
+
+**Version-lag sweep** run as `git diff v0.83.0..v0.84.1` scoped to every area-05 path: nine files moved, 650+/201−. Everything it produced is either filed (CFG-039 `samplingParams`, CFG-040 `markdown.mermaid`, CFG-041 `defaultModelPerProvider`, CFG-042 models-store) or folded into a re-audit (CFG-012 superseded; CFG-021 corrected; CFG-034's kind corrected). Drift deliberately NOT filed here because another item or area owns it: `AGENTS.override.md` (`resource-loader.ts:71`) is already ported at `crates/cyrup-session/src/prompt/context_files.rs:81` (area 03); `chatTemplateArgs` + the `baseten` `thinkingFormat` literal (`model-config.ts:87`, `:98`) are the defect PARITY-GAPS already records against `crates/cyrup-provider/src/api/compat.rs`; `CredentialSynchronizationError` / `enqueueCredentialOperation` / deferred responses / `AuthOperationOptions` cancellation are area-01 PARITY-GAPS items interlocking with CFG-020; the git-update `.pi-update-incomplete` marker and `repairMissingGitDependencies` (`package-manager.ts:1854-1902`) are npm/node_modules machinery downstream of the dropped npm channel (CFG-009).
+
+**Surface-driven sweep method** (the counter to structural blind spot 1). Walked pi's Settings interface key by key — `settings-manager.ts:88-140` @v0.84.1, 47 keys — against `grep -n 'merged.get' crates/cyrup-config/src/settings.rs` and then against consumers OUTSIDE `cyrup-config`; that re-confirmed CFG-014 / CFG-015 open and CFG-S04 closed, and it is what caught `collapseChangelog` (folded into CFG-015) and `doubleEscapeAction` (CFG-045) — the latter had a consumer, but only a `/settings` display row, which is the shape the previous sweep's "has a consumer" test let through. **Record that refinement: a `/settings` row is not a consumer.** Then walked every exported symbol of `resource-loader.ts`, `package-manager.ts`, `trust-manager.ts`, `project-trust.ts`, `skills.ts`, `prompt-templates.ts`, `resolve-config-value.ts`, `keybindings.ts`, `config.ts`, `source-info.ts`, `experimental.ts`, `defaults.ts`, `slash-commands.ts` and `pi-manifest.ts` asking "what in `crates/` consumes this?". That produced CFG-035 (`discoverSystemPromptFile` had no cyrup counterpart at all), CFG-036 (`expandTildePath` on the env/CLI dir tiers), CFG-037 (`ensureGitIgnore`), CFG-038 (`toKeybindingsConfig`'s drop-one semantics), CFG-044 (three cites resolving to nothing upstream) and CFG-047 (`BUILTIN_SLASH_COMMANDS` metadata).
+
+**Migrations + keybindings surface sweep (repair pass 2026-08-12).** Added because the critique found that `pi/packages/coding-agent/src/migrations.ts` was named exactly once in the entire fifteen-file directory, as an incidental `{mode: 0o600}` citation in this file. Axis: **enumerate every call `runMigrations` makes and pair each with its cyrup counterpart, then follow the result to its consumer.** Both upstream files are byte-identical at v0.83.0 and v0.84.1 (`git diff v0.83.0 v0.84.1 -- packages/coding-agent/src/migrations.ts packages/coding-agent/src/core/keybindings.ts` → empty), so every line number below holds at either tag. Six upstream behaviours, six pairings:
+
+| # | pi @v0.83.0 | cyrup @`04c1ba2` | verdict |
+|---|---|---|---|
+| 1 | `migrateAuthToAuthJson()` `:309` | `migrate_auth_to_auth_json` `migrations.rs:27`/`:39` | ported (CFG-032 closed) |
+| 2 | `migrateSessionsFromAgentRoot()` `:310` | `migrate_sessions_from_agent_root` `:28`/`:114` | ported; one edge divergence → area 03 |
+| 3 | `migrateToolsToBin()` `:311` | `migrate_tools_to_bin` `:29`/`:177` | ported **minus its completion notice** → **CFG-050** |
+| 4 | `migrateKeybindingsConfigFile()` `:312` | **nothing** | **not ported** → **CFG-048** |
+| 5 | `migrateExtensionSystem(cwd)` `:313` | `migrate_extension_system` `:30`/`:201` | ported |
+| 5a | `migrateCommandsToPrompts` `:137-155` | `migrate_commands_to_prompts` `:212` | ported, notice included |
+| 5b | `checkDeprecatedExtensionDirs` `:222-255` | `check_deprecated_extension_dirs` `:236` | ported |
+| — | `showDeprecationWarnings` `:277-296` | `format_deprecation_warnings` `:263` | text ported, **keypress gate dropped** → **CFG-049** |
+
+Verified faithful arm-for-arm and **deliberately not filed**: (1)'s skip-if-`auth.json`-exists, the `oauth.json` → `{type:"oauth",…}` wrap, the `oauth.json.migrated` rename, the `settings.json.apiKeys` lift skipping oauth-claimed providers, and the 0600 write; (2)'s non-recursive `*.jsonl` scan, the first-line `{type:"session", cwd}` gate, skip-if-target-exists and the swallow-everything rename; (3)'s four managed names and stale-source delete; (5a)'s Global/Project double run and both message strings routed through `output_guard::emit_stray_line`; (5b)'s always-warn `hooks/` rule and the `tools/`-holds-a-non-managed-entry rule with its leading-dot and case handling; and `settings.rs:362-421` `migrate_settings` against `settings-manager.ts:381-440` (queueMode→steeringMode, websockets→transport, the legacy `skills` **object** with arrays correctly excluded, `retry.maxDelayMs`→`retry.provider.maxRetryDelayMs`, applied in-memory on every parse and never written back — matching pi).
+
+**Rejected with reason — do not re-derive.** Nothing filed by the auditor was refuted outright this pass, but four re-audits were **corrected against the auditor** and those corrections are the record: CFG-028's medium rating was rejected (pi's `execSync` blocks its single event loop for the same 10 s; cyrup blocks one worker of N and is therefore *less* blocking than upstream — robustness note, not a parity gap); CFG-030's medium was rejected (both sides mangle a non-object top level; pi's "preservation" is meaningless indexed keys, and load behaviour is identical); CFG-034's `not-ported` kind and its v0.83.0 upstream cite were rejected (`git grep scrollbarThumb v0.83.0 -- packages` is empty — the cited lines are v0.84.1's, so cyrup anticipated an addition rather than closing a parity gap); CFG-004's cyrup cite `discovery.rs:1242-1246` was rejected (that is the SKILL.md walk; the extension push is `add_local_entries` at `:1373-1379`). One `missedByAuditor` entry was deliberately NOT given its own id: `collapseChangelog` is folded into CFG-015 so the whole changelog feature — `lastChangelogVersion`, `collapseChangelog`, the parser, `/changelog` — closes in one changeset instead of four.
+
+**Checked and deliberately not filed — verified faithful.** `trust.rs`'s `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES` list, the ancestor `.agents/skills` walk with its `$HOME` exclusion, the 4–6 option `trust_options`, `read_map`'s hard errors on a non-object `trust.json` and on a non-bool value, and the `decide_trust_with_extension` hook ordering (`trust.rs:196-424` vs `trust-manager.ts:29-244` + `project-trust.ts:46-95`); `migrate_settings`' four legacy shapes (`settings.rs:357-420` vs `settings-manager.ts:389-448`); `set`/`set_nested`'s locked read-modify-write with nested-sibling preservation (`settings.rs:1349-1420` vs `persistScopedSettings` `:586-616`); the whole of `config_value.rs` (parse / template / command / cache / shell-selection) against `resolve-config-value.ts`; skill frontmatter validation and the ignore-aware SKILL.md walk (`skill.rs:15-95` + `discovery.rs:1191-1280` vs `skills.ts:91-270`); the `${@:N}` / `${@:N:L}` slice family and `$0` (`prompt.rs:256-310` vs `prompt-templates.ts:74-96`); theme dir precedence; `status_indicator_runs` (`auth_select.rs:171-199`), a faithful 4-state port of `formatStatusIndicator` (`oauth-selector.ts:164-181`) — the 3-state `AuthState` / `provider_rows` beside it is legacy scaffolding, not the render path, so nothing was filed against it. `InMemoryCredentialStore::modify`'s `Ok(None)` early return was chased against pi's `post?.type !== "oauth"` guard and matches.
+
+**Handoffs (repair pass).**
+
+- **`encode_cwd` belongs to area 03, and a duplicate copy lives here.** The sweep found that `crates/cyrup/src/migrations.rs:160-173` and `crates/cyrup-session/src/layout.rs:97-105` both do `trim_start_matches(['/', '\\'])`, stripping **all** leading separators, while pi's `migrations.ts:112` and `session-manager.ts:479` both use `/^[/\\]/` with no `g` flag — exactly **one**. For `\\server\share\proj` pi yields `---srv-share-proj--` and cyrup yields `--srv-share-proj--`. Both cyrup copies agree with each other, so no cyrup-written session is lost by cyrup; the costs are cross-tool session-tree interop under UNC/double-slash cwds, and a doc comment at `layout.rs:95` claiming "Pi-compatible encoding: strip a leading separator" that is untrue. **No CFG id is filed for it**: the defect is one behaviour with two copies, `layout.rs` is the primary and belongs to area 03, and filing a second id here would double-count. The fix must delete the `migrations.rs` copy in favour of `cyrup_session::encode_cwd` — the duplication is what let two drift-free copies both be wrong — and area 03's item should say so.
+- **CFG-048 ships with TUI-051 and must precede TUI-028.** `/reload` is pi's second application site for the keybinding name migration (`keybindings.ts:366` via `loadFromFile`, driven from `interactive-mode.ts:5386`), so the config half and the reload half are one behaviour split across two areas. And TUI-028's namespace rename will break every `editor.*` config users have written against shipped cyrup unless CFG-048's table lands first with the `editor.* → tui.editor.*` rows added in the same change.
+- **CFG-049 and CFG-051 are both launch-glue ordering in `crates/cyrup/src/main.rs:520-533`** — one blocks, one relocates into the transcript. They touch adjacent lines and should land together.
+
+**Handoffs.** PARITY-GAPS PB-6 (`lastChangelogVersion` / `/changelog`) is folded into CFG-015 rather than duplicated. CFG-005 is confirmed partially closed and left UNSCHEDULED per the maintainer's deprioritisation; its Copilot/Codex half belongs to PROV-029 (area 01). CFG-039 is half of a two-part gap whose other half is PARITY-GAPS' provider-layer `samplingParams` item (area 01). CFG-047's `/reload` clause may be a behaviour gap owned by the reload path (area 03/07), not a string fix.
+
+**Blind spots for the next pass.**
+
+1. **Static only; nothing compiled or run.** No closure here is observed-passing — every `closed` verdict is a two-sided code read. CFG-035's claim that no code path reads `SYSTEM.md` rests on an exhaustive `grep -rn 'SYSTEM\.md' crates/` returning five hits that are all comments, markers or test inputs, plus a `format!("{…}.md"` sweep for a dynamically-constructed filename. None was found, but absence cannot be proved by grep.
+2. **`login.rs` was NOT audited for correctness.** 1721 lines landed since the last pass; the module doc, the public-fn index and two bodies were read. The remaining ~1200 lines — `login`, `logout`, `resolve_login_command`, `start_provider_login`, `resolve_auth_type_selector`, `ProviderCredentialSink` — were not read against upstream. This is exactly the shape that produced PROV-027/028/029. The same caveat applies to the code that closed CFG-002, CFG-010, CFG-011, CFG-022 and CFG-024: the specific defect each item named is verified gone, not that the new code is correct in the large. **`crates/cyrup-config/src/login.rs` is the single highest-value unread surface in this area.**
+3. **Five in-scope files were only grepped, not read end to end:** `crates/cyrup-resources/src/{theme.rs (828 lines), scope.rs, key.rs}`, `crates/cyrup-config/src/{policy.rs, env_keys.rs}`, and `crates/cyrup-resources/src/package/git_url.rs` (985 lines). `git_url.rs` carries the `hasUnsafeGitInstallPart` security validator, confirmed referenced from `source.rs:75-77` but never compared line-by-line against pi's `parseGitUrl` (`coding-agent/src/utils/git.ts`). A validator gap there would be a security finding this pass could not have seen.
+4. **Upstream `package-manager.ts` is ~2500 lines and roughly a third was read.** Read: `resolve`, `resolvePackageSources`, `collectPackageResources`, `dedupePackages`/`getPackageIdentity`, `installGit`/`updateGit`/`ensureGitRef`, `ensureGitIgnore`/`ensureNpmProject`, `checkForAvailableUpdates`, the install-path resolvers, and — new this pass, closing the previous pass's blind spot 4 — `applyAutoloadDisabledPatterns` against cyrup's `manifest.rs:401-454`. Still NOT read: `applyPatterns`, `collectAutoThemeEntries`, `collectAncestorAgentsSkillDirs`, `resolveExtensionSources`, `getTemporaryDir`, and the whole progress-callback surface.
+5. **The version-lag window stops at v0.84.1.** pi HEAD is `581d75a89` = v0.84.1-117-g581d75a89, so 117 commits over these paths are unanalysed. One concrete item was hit and deliberately NOT filed for that reason: `getExperimentalToolSampling()` in `core/experimental.ts`, which makes `PI_EXPERIMENTAL=1` request `{type:"json_schema", strict:"prefer"}` constrained sampling on the four built-in tools (`read.ts:222`, `bash.ts:337`, `edit.ts:311`, `write.ts:200` at pi HEAD). It is absent at BOTH v0.83.0 and v0.84.1 — `git show v0.84.1:…/experimental.ts` is three lines — so it is post-tag drift outside the swept window. cyrup has no `constrained_sampling` anywhere (only a note at `crates/cyrup-provider/src/api/bedrock_converse_stream.rs:44`). **File it when the window moves.**
+6. **Two closures are verified structurally, not end to end.** CFG-006's retry settings are confirmed assigned onto the agent builder (`builder.rs:1223-1234`) but not confirmed to reach the retry loop — `max_retry_delay_ms` in particular. CFG-022's shared predicate is verified identical at both call sites, but it was not confirmed that a models.json-only provider actually STREAMS (the same caveat the previous pass recorded).
+7. **Area boundaries not crossed:** `remote_catalog.rs` / `spawn_model_catalog_refresh` (area 01); the alt-screen / TUI-mode renderer that CFG-021 and CFG-040 both wait on (area 07); pi's keybinding CONFLICT detector (`KeybindingConflict`, `packages/tui/src/keybindings.ts:235-256`), which has no cyrup counterpart but lives in the TUI substrate rather than `core/keybindings.ts` — worth a look from area 07 alongside CFG-038.
+8. **The `spec/` tree behind the `R-07-*` / `R-09-*` ids is still absent** from this workspace, so those ids were used only as a grep index; no requirement text was quoted or checked.
+9. **NEW (repair pass) — the launch-glue path in `crates/cyrup/src/main.rs` has never had its own sweep.** CFG-049 and CFG-051 were both found by following one upstream function (`showDeprecationWarnings`) to its cyrup call site and noticing what happened *around* it. `main.rs` is the place where migration results, settings diagnostics, model-fallback notices, the first-run gate and the trust prompt all compete for the same few pre-TUI stderr lines, and pi routes several of them into the running UI instead. Nobody has enumerated pi's `main.ts:600-860` startup block against `main.rs`'s statement by statement. Two of two items found there in a partial look is a high enough base rate to run it properly.
+10. **NEW (repair pass) — in-source "intentionally NOT ported" comments were never enumerated as a class.** `migrations.rs:9-10` was one, and it was wrong on both halves of its claim. `grep -rn 'NOT ported\|not ported\|intentionally\|CYRUP-DELTA' crates/cyrup-config crates/cyrup-resources crates/cyrup` would produce the full list, and README:208-212 says none of them is a decision of record. Each is either a gap or a documented mechanism difference, and this file currently adjudicates them only where an item happened to land on one.
+
+---
+
+## Surface-sweep findings (2026-08-03, HEAD `9219dcd`) — ALL FOUR CLOSED 2026-08-12
+
+Found by a **surface-driven** sweep that walked pi asking what has NO cyrup counterpart at all, rather
+than checking a list of known items. That inversion exists because the item-driven method missed pi's
+stray-OSC-reply swallow (`pi/packages/tui/src/tui.ts:788-794`) — a real, user-reported bug — and by
+construction cannot see behaviour nobody wrote an item for. IDs use an `-SNN` suffix to mark their
+provenance.
+
+**All four closed at HEAD `04c1ba2`.** The section and its ids are retained so each closure can be
+re-audited; the evidence is in the status table above. One follow-on: CFG-S04's sweep tested "does this
+key have a consumer outside `cyrup-config`?", which passes for a key whose only consumer is a
+`/settings` display row — `doubleEscapeAction` escaped exactly that way and is now **CFG-045**, and
+`collapseChangelog` the same way and is folded into **CFG-015**.
+
+| ID | Severity | Kind | Effort | Status | Title |
+|---|---|---|---|---|---|
+| CFG-S01 | high | not-ported | S | **closed** | `--system-prompt` / `--append-system-prompt` never read file contents — a path becomes the literal system prompt |
+| CFG-S02 | medium | not-ported | S | **closed** | `images.autoResize: false` is inert — the read tool always downsamples to 2000px |
+| CFG-S03 | medium | not-ported | M | **closed** | Extension tool-name and flag-name conflicts are never detected, and precedence on collision is inverted |
+| CFG-S04 | low | not-ported | M | **closed** | Four more settings keys inert beyond CFG-015's list — `enableSkillCommands`, `treeFilterMode`, `editorPaddingX`, `showHardwareCursor` |

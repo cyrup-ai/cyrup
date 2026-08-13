@@ -645,9 +645,21 @@ pub fn attach_mission_to_launch_result(
         .filter(|(_, part)| content_text(part).is_some())
         .map(|(index, _)| index)
         .next_back();
-    let has_structured_output = detail_results(&outcome)
-        .iter()
-        .any(|child| child.get("structuredOutputPath").is_some_and(|v| !v.is_null()));
+    // [CYRUP-DELTA] upstream keys this guard on `child.structuredOutputPath !== undefined`
+    // (`lifecycle.ts:233`), the FILE its structured-output runtime persisted the child's value to
+    // (`shared/types.ts:914`, written beside `structuredOutput` at `:912`). cyrup's own
+    // [`crate::exec::SingleResult`] carries the VALUE and nothing else — `structured_output:
+    // Option<serde_json::Value>` (`exec/mod.rs:759`), serialized as `structuredOutput`; there is no
+    // `structuredOutputPath` field anywhere in this crate. Reading only upstream's key therefore
+    // made this guard permanently `false` on every result cyrup itself produces, and the
+    // `Mission: <id> (<status>)` announcement was appended to structured-output runs that upstream
+    // deliberately leaves untouched. Both keys are accepted: the value key is the one cyrup's
+    // producer writes, the path key keeps an upstream-shaped `details` working unchanged.
+    let has_structured_output = detail_results(&outcome).iter().any(|child| {
+        ["structuredOutputPath", "structuredOutput"]
+            .iter()
+            .any(|key| child.get(key).is_some_and(|value| !value.is_null()))
+    });
     let text_is_json = last_text_index
         .and_then(|index| outcome.content.get(index))
         .and_then(content_text)
@@ -976,8 +988,23 @@ mod tests {
         }
     }
 
+    /// The GLOBAL pointer index defaults to `agent_dir()/missions/index` — i.e. the developer's
+    /// real `~/.cyrup/agent` (`store.rs::resolve_mission_store_location`, faithful to pi
+    /// `store.ts:265`). [`prepare_mission_launch`] takes no agent-dir override (upstream's
+    /// `prepareMissionLaunch` does not pass one either, `lifecycle.ts:68`), so a test scopes the
+    /// index the only way production can: through `config.missions.globalIndexDir`. Every test in
+    /// this module MUST launch through a config carrying it, or it writes into live user config.
+    fn scoped(root: &Path) -> MissionStoreConfig {
+        MissionStoreConfig {
+            global_index_dir: Some(
+                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+            ),
+            ..Default::default()
+        }
+    }
+
     fn prepared(root: &Path, params: MissionLaunchParams) -> Option<MissionLaunchBinding> {
-        prepare_mission_launch(&params, root, None, Some("sess-1")).unwrap()
+        prepare_mission_launch(&params, root, Some(&scoped(root)), Some("sess-1")).unwrap()
     }
 
     #[test]
@@ -1013,9 +1040,13 @@ mod tests {
             },
         )
         .is_none());
-        assert!(list_missions(&resolve_mission_store_location(tmp.path(), None, None))
-            .records
-            .is_empty());
+        assert!(list_missions(&resolve_mission_store_location(
+            tmp.path(),
+            Some(&scoped(tmp.path())),
+            None
+        ))
+        .records
+        .is_empty());
     }
 
     #[test]
@@ -1027,7 +1058,7 @@ mod tests {
     #[test]
     fn missions_disabled_suppresses_the_automatic_create_but_not_an_explicit_one() {
         let tmp = tempfile::tempdir().unwrap();
-        let disabled = MissionStoreConfig { enabled: Some(false), ..Default::default() };
+        let disabled = MissionStoreConfig { enabled: Some(false), ..scoped(tmp.path()) };
         let params = MissionLaunchParams { task: Some("do it".to_string()), ..Default::default() };
         assert!(
             prepare_mission_launch(&params, tmp.path(), Some(&disabled), None).unwrap().is_none()
@@ -1054,7 +1085,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
-            None,
+            Some(&scoped(tmp.path())),
             None,
         )
         .unwrap_err();
@@ -1084,7 +1115,7 @@ mod tests {
         let missing = prepare_mission_launch(
             &MissionLaunchParams { mission_id: Some("nope".to_string()), ..Default::default() },
             tmp.path(),
-            None,
+            Some(&scoped(tmp.path())),
             None,
         )
         .unwrap_err();
@@ -1253,6 +1284,61 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(text, "plain text");
+    }
+
+    /// The same suppression, keyed on the field cyrup's OWN producer writes:
+    /// [`crate::exec::SingleResult::structured_output`] serializes as `structuredOutput` and there
+    /// is no `structuredOutputPath` anywhere in this crate, so reading only upstream's key left the
+    /// guard permanently false and appended `Mission: …` to every structured-output run.
+    #[test]
+    fn the_announcement_is_suppressed_by_the_structured_output_value_cyrup_actually_emits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binding = prepared(
+            tmp.path(),
+            MissionLaunchParams { task: Some("build".to_string()), ..Default::default() },
+        )
+        .unwrap();
+        let structured = attach_mission_to_launch_result(
+            &binding,
+            outcome(
+                serde_json::json!({
+                    "mode": "single", "runId": "run-struct-value",
+                    "results": [{
+                        "agent": "a", "exitCode": 0, "usage": {"input": 0, "output": 0},
+                        "structuredOutput": {"ok": true},
+                    }],
+                }),
+                "plain text",
+            ),
+        )
+        .unwrap();
+        let text = match &structured.content[0] {
+            cyrup_core::Content::Text { text, .. } => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(text, "plain text");
+
+        // …and an ABSENT structured output (cyrup serializes `None` as an explicit `null`, since
+        // `SingleResult::structured_output` carries no `skip_serializing_if`) must NOT suppress it.
+        let plain = attach_mission_to_launch_result(
+            &binding,
+            outcome(
+                serde_json::json!({
+                    "mode": "single", "runId": "run-plain",
+                    "results": [{
+                        "agent": "a", "exitCode": 0, "usage": {"input": 0, "output": 0},
+                        "structuredOutput": serde_json::Value::Null,
+                    }],
+                }),
+                "plain text",
+            ),
+        )
+        .unwrap();
+        let text = match &plain.content[0] {
+            cyrup_core::Content::Text { text, .. } => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(text.starts_with("plain text\nMission: "), "{text}");
     }
 
     #[test]

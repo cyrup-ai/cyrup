@@ -45,8 +45,108 @@ impl HostServices for RecordingWidgetServices {
         self.widgets.lock().expect("widget lock").push(widget.clone());
     }
     fn session_id(&self) -> Option<String> {
-        Some("fleet-session".to_string())
+        Some(TEST_SESSION_ID.to_string())
     }
+}
+
+/// The one session id every host backend in this file reports, and the one the on-disk fixtures
+/// below stamp onto their `status.json` — because `listAsyncRuns`' session filter
+/// (`async-status.ts:432`) compares exactly those two.
+const TEST_SESSION_ID: &str = "fleet-session";
+
+/// A `HostServices` backend that DRIVES an interactive overlay the way `cyrup-tui`'s run loop does:
+/// paints a frame, feeds a scripted key sequence, paints again, and tears the modal down.
+///
+/// This is the seam `showFleet`'s third outcome depends on (pi `ctx.ui.custom(factory,
+/// { overlay: true, … })`, `tui/fleet.ts:869-875`). Asserting on the frames it captures proves the
+/// component is genuinely hosted — rendered AND driven — rather than constructed and dropped.
+#[derive(Default)]
+struct OverlayHostServices {
+    widgets: Mutex<Vec<serde_json::Value>>,
+    /// Keys fed to the overlay between the first and last captured frame.
+    script: Mutex<Vec<cyrup_ext::OverlayKey>>,
+    /// Every frame painted, flattened to text, in paint order.
+    frames: Mutex<Vec<String>>,
+    /// Every outcome the overlay returned for a scripted key, in order.
+    outcomes: Mutex<Vec<cyrup_ext::OverlayOutcome>>,
+    /// The rows/columns the host reports on each paint.
+    width: usize,
+    rows: usize,
+}
+
+impl OverlayHostServices {
+    fn new(width: usize, rows: usize, script: Vec<cyrup_ext::OverlayKey>) -> Self {
+        Self {
+            widgets: Mutex::new(Vec::new()),
+            script: Mutex::new(script),
+            frames: Mutex::new(Vec::new()),
+            outcomes: Mutex::new(Vec::new()),
+            width,
+            rows,
+        }
+    }
+
+    fn frames(&self) -> Vec<String> {
+        self.frames.lock().expect("frames lock").clone()
+    }
+
+    fn first_frame(&self) -> String {
+        self.frames().first().cloned().unwrap_or_default()
+    }
+
+    fn outcomes(&self) -> Vec<cyrup_ext::OverlayOutcome> {
+        self.outcomes.lock().expect("outcomes lock").clone()
+    }
+}
+
+fn flatten(lines: &[cyrup_ext::OverlayLine]) -> String {
+    lines.iter().map(cyrup_ext::OverlayLine::plain_text).collect::<Vec<_>>().join("\n")
+}
+
+impl HostServices for OverlayHostServices {
+    fn set_widget(&self, widget: &serde_json::Value) {
+        self.widgets.lock().expect("widget lock").push(widget.clone());
+    }
+    fn session_id(&self) -> Option<String> {
+        Some(TEST_SESSION_ID.to_string())
+    }
+    fn open_overlay(&self, mut overlay: Box<dyn cyrup_ext::InteractiveOverlay>) -> bool {
+        let first = overlay.render(self.width, self.rows);
+        self.frames.lock().expect("frames lock").push(flatten(&first));
+        let script = std::mem::take(&mut *self.script.lock().expect("script lock"));
+        for key in script {
+            let outcome = overlay.handle_key(key);
+            self.outcomes.lock().expect("outcomes lock").push(outcome);
+            let frame = overlay.render(self.width, self.rows);
+            self.frames.lock().expect("frames lock").push(flatten(&frame));
+        }
+        true
+    }
+}
+
+/// Write the exact `status.json` record the detached hop-2 runner writes, stamped with
+/// `session_id` — the field `collect_fleet_history`'s session filter reads.
+fn write_status_json(
+    async_root: &std::path::Path,
+    run_token: &str,
+    agent: &str,
+    session_id: Option<&str>,
+) {
+    let run_dir = async_root.join(run_token);
+    std::fs::create_dir_all(&run_dir).expect("run dir");
+    let mut status = cyrup_ext_subagents::background::RunStatus::queued(
+        cyrup_ext_subagents::background::RunId::from_token(run_token.to_string()),
+        cyrup_ext_subagents::background::RunMode::Single,
+        None,
+    );
+    status.state = cyrup_ext_subagents::background::RunState::Running;
+    status.session_id = session_id.map(str::to_string);
+    status.steps = vec![cyrup_ext_subagents::background::StepStatus::pending(agent.to_string())];
+    std::fs::write(
+        run_dir.join("status.json"),
+        serde_json::to_vec(&status).expect("serialize status"),
+    )
+    .expect("write status.json");
 }
 
 fn extension(cwd: &std::path::Path) -> SubagentsExtension {
@@ -112,6 +212,8 @@ async fn subagents_fleet_with_a_ui_renders_the_interactive_inspector_frame() {
     let (_env, _home) = hermetic_home().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let ext = extension(dir.path());
+    let host = std::sync::Arc::new(OverlayHostServices::new(100, 32, Vec::new()));
+    ext.executor().set_host_services(host.clone());
     let ctx = HostCtx::command(ExtMode::Tui, true, dir.path().to_path_buf());
 
     let out = ext
@@ -120,16 +222,91 @@ async fn subagents_fleet_with_a_ui_renders_the_interactive_inspector_frame() {
         .expect("command dispatched")
         .expect("command produced output");
 
+    // pi's `ctx.ui.custom<undefined>` resolves with no value; the modal already said everything on
+    // screen, so the command itself returns nothing to surface as a notification.
+    assert_eq!(out, "", "a hosted overlay must not ALSO return text, got:\n{out}");
+
     // The frame, its title, its empty-roster state and its footer — all from
-    // `SubagentFleetComponent::render` (pi `tui/fleet.ts:788-830`).
-    assert!(out.contains("Subagent fleet inspector"), "got:\n{out}");
-    assert!(out.contains("· live controls"), "got:\n{out}");
-    assert!(out.contains("No tracked children"), "got:\n{out}");
+    // `SubagentFleetComponent::render` (pi `tui/fleet.ts:788-830`), now painted BY THE HOST.
+    let frame = host.first_frame();
+    assert!(frame.contains("Subagent fleet inspector"), "got:\n{frame}");
+    assert!(frame.contains("· live controls"), "got:\n{frame}");
+    assert!(frame.contains("No tracked children"), "got:\n{frame}");
     assert!(
-        out.contains("↑↓/jk agent · H Herdr · s steer · D stop"),
-        "got:\n{out}"
+        frame.contains("↑↓/jk agent · H Herdr · s steer · D stop"),
+        "got:\n{frame}"
     );
-    assert!(out.contains('╭') && out.contains('╰'), "got:\n{out}");
+    assert!(frame.contains('╭') && frame.contains('╰'), "got:\n{frame}");
+}
+
+/// The half that did not exist before the overlay seam: the component is DRIVEN, not just painted.
+/// `set_terminal_rows` is what sizes the body, and it had no production caller at all — so the
+/// inspector rendered at its `32`-row default no matter how tall the terminal was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hosted_inspector_sizes_its_body_from_the_hosts_reported_rows() {
+    let (_env, _home) = hermetic_home().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cwd = dir.path();
+    let roots = cyrup_ext_subagents::background::run_artifact_roots(cwd);
+    write_status_json(&roots.async_root, "fleetrun001", "historian", Some(TEST_SESSION_ID));
+
+    let mut heights = Vec::new();
+    for rows in [24usize, 60usize] {
+        let ext = extension(cwd);
+        let host = std::sync::Arc::new(OverlayHostServices::new(100, rows, Vec::new()));
+        ext.executor().set_host_services(host.clone());
+        let ctx = HostCtx::command(ExtMode::Tui, true, cwd.to_path_buf());
+        ext.execute_command("subagents-fleet", "", &ctx)
+            .await
+            .expect("command dispatched");
+        heights.push(host.first_frame().lines().count());
+    }
+    // pi `bodyHeight = max(2, floor(rows * 0.85) - 6)` + 6 chrome rows (`fleet.ts:792`), i.e. the
+    // whole frame is `floor(rows * 0.85)` tall.
+    assert_eq!(heights, vec![24 * 85 / 100, 60 * 85 / 100], "frames: {heights:?}");
+}
+
+/// Keystrokes reach `handle_input` through the host, and `Esc` closes — the whole interactive half
+/// that used to have no caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keystrokes_move_the_selection_and_escape_closes_the_hosted_inspector() {
+    let (_env, _home) = hermetic_home().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cwd = dir.path();
+    let roots = cyrup_ext_subagents::background::run_artifact_roots(cwd);
+    write_status_json(&roots.async_root, "fleetrun001", "historian", Some(TEST_SESSION_ID));
+    write_status_json(&roots.async_root, "fleetrun002", "archivist", Some(TEST_SESSION_ID));
+
+    use cyrup_ext::{OverlayKey, OverlayKeyCode, OverlayOutcome};
+    let ext = extension(cwd);
+    let host = std::sync::Arc::new(OverlayHostServices::new(
+        100,
+        32,
+        vec![
+            OverlayKey::plain(OverlayKeyCode::Down),
+            OverlayKey::plain(OverlayKeyCode::Char('x')),
+            OverlayKey::plain(OverlayKeyCode::Escape),
+        ],
+    ));
+    ext.executor().set_host_services(host.clone());
+    let ctx = HostCtx::command(ExtMode::Tui, true, cwd.to_path_buf());
+    ext.execute_command("subagents-fleet", "", &ctx)
+        .await
+        .expect("command dispatched");
+
+    assert_eq!(
+        host.outcomes(),
+        vec![OverlayOutcome::Redraw, OverlayOutcome::Redraw, OverlayOutcome::Close],
+        "Down and x redraw; Esc closes (pi `fleet.ts:660-663,666-667,708-712`)"
+    );
+    let frames = host.frames();
+    assert_eq!(frames.len(), 4, "one frame before the script and one after each key");
+    // Both runs are on the roster, and the selection cursor moved from the first to the second.
+    assert!(frames[0].contains("historian"), "got:\n{}", frames[0]);
+    assert!(frames[0].contains("archivist"), "got:\n{}", frames[0]);
+    assert!(frames[0].contains("1/2"), "the position readout starts at 1/2:\n{}", frames[0]);
+    assert!(frames[1].contains("2/2"), "Down must move the selection:\n{}", frames[1]);
+    assert_ne!(frames[0], frames[1], "a moved selection must change the painted frame");
 }
 
 /// The command's registered description must be v0.43.0's, since its handler is now v0.43.0's.
@@ -192,33 +369,21 @@ async fn a_real_status_json_under_the_async_root_becomes_a_roster_row() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cwd = dir.path();
 
-    // Write the exact record the detached hop-2 runner writes: `<async_root>/<run-id>/status.json`.
+    // Write the exact record the detached hop-2 runner writes: `<async_root>/<run-id>/status.json`,
+    // stamped with THIS session — pi's `listAsyncRuns({ sessionId })` filter (`async-status.ts:432`)
+    // compares that field against the caller's session and drops everything else.
     let roots = cyrup_ext_subagents::background::run_artifact_roots(cwd);
-    let run_dir = roots.async_root.join("fleetrun001");
-    std::fs::create_dir_all(&run_dir).expect("run dir");
-    let mut status = cyrup_ext_subagents::background::RunStatus::queued(
-        cyrup_ext_subagents::background::RunId::from_token("fleetrun001".to_string()),
-        cyrup_ext_subagents::background::RunMode::Single,
-        None,
-    );
-    status.state = cyrup_ext_subagents::background::RunState::Running;
-    status.steps = vec![cyrup_ext_subagents::background::StepStatus::pending(
-        "historian".to_string(),
-    )];
-    std::fs::write(
-        run_dir.join("status.json"),
-        serde_json::to_vec(&status).expect("serialize status"),
-    )
-    .expect("write status.json");
+    write_status_json(&roots.async_root, "fleetrun001", "historian", Some(TEST_SESSION_ID));
 
     let ext = extension(cwd);
+    let host = std::sync::Arc::new(OverlayHostServices::new(100, 32, Vec::new()));
+    ext.executor().set_host_services(host.clone());
     let ctx = HostCtx::command(ExtMode::Tui, true, cwd.to_path_buf());
-    let out = ext
-        .execute_command("subagents-fleet", "", &ctx)
+    ext.execute_command("subagents-fleet", "", &ctx)
         .await
-        .expect("command dispatched")
-        .expect("command produced output");
+        .expect("command dispatched");
 
+    let out = host.first_frame();
     assert!(out.contains("historian"), "the roster must list the on-disk run, got:\n{out}");
     assert!(!out.contains("No tracked children"), "got:\n{out}");
     assert!(out.contains("1/1"), "got:\n{out}");
@@ -232,6 +397,43 @@ async fn a_real_status_json_under_the_async_root_becomes_a_roster_row() {
         .expect("command dispatched")
         .expect("command produced output");
     assert!(text.contains("fleetrun001"), "got:\n{text}");
+}
+
+/// pi `listAsyncRuns`' session filter (`async-status.ts:432`), end to end against real files:
+/// `if (options.sessionId && status.sessionId !== options.sessionId) continue;`.
+///
+/// Note the exact shape — a run with NO recorded session is dropped too, because
+/// `undefined !== "fleet-session"`. Without this filter, opening the inspector listed every run
+/// every session in the project had ever launched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_history_scan_keeps_only_this_sessions_runs() {
+    let (_env, _home) = hermetic_home().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cwd = dir.path();
+    let roots = cyrup_ext_subagents::background::run_artifact_roots(cwd);
+    write_status_json(&roots.async_root, "runmine0001", "mine", Some(TEST_SESSION_ID));
+    write_status_json(&roots.async_root, "runtheirs01", "theirs", Some("another-session"));
+    write_status_json(&roots.async_root, "runnosess01", "untagged", None);
+
+    let ext = extension(cwd);
+    let host = std::sync::Arc::new(OverlayHostServices::new(100, 32, Vec::new()));
+    ext.executor().set_host_services(host.clone());
+    let ctx = HostCtx::command(ExtMode::Tui, true, cwd.to_path_buf());
+    ext.execute_command("subagents-fleet", "", &ctx)
+        .await
+        .expect("command dispatched");
+
+    let out = host.first_frame();
+    assert!(out.contains("mine"), "this session's run must be listed, got:\n{out}");
+    assert!(
+        !out.contains("theirs"),
+        "another session's run must be dropped, got:\n{out}"
+    );
+    assert!(
+        !out.contains("untagged"),
+        "an untagged run loses to a present filter (undefined !== id), got:\n{out}"
+    );
+    assert!(out.contains("1/1"), "exactly one roster row survives, got:\n{out}");
 }
 
 // =================================================================================================

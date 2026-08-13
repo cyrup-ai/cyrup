@@ -253,6 +253,17 @@ fn resolve_config_path_with(
 /// same real backpressure the Node stream's `highWaterMark` provides.
 const MAX_PIPE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
+/// One `read()` worth of pipe bytes — [`spawn_pump`]'s stack chunk.
+///
+/// Named (rather than an inline `[0u8; 8192]`) because it is part of the buffer's real contract:
+/// [`PipeBufState::wait_for_room`] parks while `len >= MAX_PIPE_BUFFER_BYTES` and unparks at
+/// `len == MAX_PIPE_BUFFER_BYTES - 1`, after which the pump may append a whole further chunk. The
+/// true, intended bound is therefore `MAX_PIPE_BUFFER_BYTES + PIPE_CHUNK_BYTES - 1`, not the cap
+/// exactly — the guarantee is *bounded*, never *byte-exact* (see `MAX_PIPE_BUFFER_BYTES`'s own
+/// "FINITE, not a specific number"). Whether a sampler observes the plateau at the cap or one chunk
+/// above it is pure scheduling. EXT-N01.
+const PIPE_CHUNK_BYTES: usize = 8192;
+
 /// A byte buffer a background pump task appends to and a `read-*` call drains from the front,
 /// capped at [`MAX_PIPE_BUFFER_BYTES`]. `space_freed` wakes a pump task parked at the cap the
 /// instant `drain` removes bytes (Tokio `Notify` stores one permit, so a `drain` that races ahead
@@ -823,7 +834,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut chunk = [0u8; 8192];
+        let mut chunk = [0u8; PIPE_CHUNK_BYTES];
         loop {
             // Backpressure: park here (never reading the OS pipe) once the buffer is at the cap.
             // This is what makes the cap a REAL bound rather than a drop-newest/drop-oldest hack —
@@ -1339,13 +1350,23 @@ mod tests {
             entry.stdout_buf.data.lock().expect("stdout buffer lock").len()
         };
 
+        // EXT-N01: the bound is the cap PLUS one chunk, because that is the pump's actual
+        // invariant — `wait_for_room` unparks at `len == MAX_PIPE_BUFFER_BYTES - 1` and the pump
+        // then appends a whole `PIPE_CHUNK_BYTES` read before checking again. Sampling exactly at
+        // the cap vs. one chunk above it is decided by the scheduler, so the old `<= cap` assertion
+        // was a coin flip: observed green in one full-workspace run and red in the next at 16781628
+        // bytes, an overshoot of 4412 — well inside one chunk and therefore NOT unbounded growth.
+        // Detection power is unaffected: an unbounded buffer fed by `yes` for 500 ms is hundreds of
+        // megabytes, not cap + 8 KiB.
+        let bound = MAX_PIPE_BUFFER_BYTES + PIPE_CHUNK_BYTES;
+
         // `yes` writes continuously; give the pump time to hit (and, correctly, stay pinned at)
         // the cap — an unbounded buffer would already be well past MAX_PIPE_BUFFER_BYTES here.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let first = buffered_len(&caps);
         assert!(
-            first <= MAX_PIPE_BUFFER_BYTES,
-            "buffered stdout ({first} bytes) exceeded the cap ({MAX_PIPE_BUFFER_BYTES}) — unbounded growth"
+            first <= bound,
+            "buffered stdout ({first} bytes) exceeded the cap + one chunk ({bound}) — unbounded growth"
         );
 
         // Wait again with STILL no read — a genuinely unbounded buffer would have grown further; a
@@ -1353,9 +1374,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let second = buffered_len(&caps);
         assert!(
-            second <= MAX_PIPE_BUFFER_BYTES,
+            second <= bound,
             "buffered stdout grew past the cap on a second check ({second} bytes) — the pump did \
              not actually stop reading at the cap"
+        );
+        // And it is genuinely PLATEAUED, not merely under a generous ceiling: 500 ms of `yes` moves
+        // far more than one chunk, so an uncapped pump could not possibly land within one chunk of
+        // where it already was. This is the assertion that survives the widened bound.
+        assert!(
+            second.abs_diff(first) <= PIPE_CHUNK_BYTES,
+            "buffered stdout moved by more than one chunk between the two samples \
+             ({first} -> {second}) — the pump is not parked at the cap"
         );
 
         // Drain a big chunk and confirm the pump resumes filling the buffer again shortly after —

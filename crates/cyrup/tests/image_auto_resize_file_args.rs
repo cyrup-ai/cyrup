@@ -47,7 +47,13 @@ async fn inputs_for(fx: &Fx, auto_resize: bool) -> Inputs {
         positionals: vec!["@shot.png".to_string(), "what is this".to_string()],
         ..Cli::default()
     };
-    build_inputs(&cli, fx.dir.path(), auto_resize).await.unwrap()
+    // `None` is Pi's `stdinContent` argument (main.ts:831). Passing it explicitly is what makes
+    // this target hermetic: `build_inputs` used to read the process's own stdin, so under
+    // `cargo test` it inherited the runner's descriptor and hung forever whenever that was a pipe
+    // nobody closed (SEAM-072). The read is now `main.rs`'s, exactly as it is Pi's `main`'s.
+    build_inputs(&cli, fx.dir.path(), auto_resize, None)
+        .await
+        .unwrap()
 }
 
 fn only_image(inputs: &Inputs) -> &str {

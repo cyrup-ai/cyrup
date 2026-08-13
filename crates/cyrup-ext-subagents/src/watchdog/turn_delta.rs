@@ -420,6 +420,45 @@ pub fn format_watchdog_review_message(message: &Value) -> Option<String> {
     }
 }
 
+/// The `{type:"turn_end", message, toolResults}` object the two watchdog roles hand
+/// [`super::runtime::MainWatchdogRuntime::handle_turn_end`] — the same JSON pi's own `turn_end`
+/// handlers receive (`register-main.ts:419-422`, `register-child.ts:98-101`).
+///
+/// **The `role` on each tool result is load-bearing.** `messagesFromEvent` expands a `turn_end`
+/// into `[message, ...toolResults]` (`turn-delta.ts:106-108`) and hands each entry straight to
+/// [`format_watchdog_review_message`], which dispatches on `role` ALONE and returns `undefined` for
+/// anything else (`:146`). pi's `ToolResultMessage` declares `role: "toolResult"` as its first
+/// field (`pi/packages/ai/src/types.ts:437-438`), so upstream's results land in the
+/// `"toolResult" | "tool"` arm. cyrup's [`cyrup_agent::ToolResultMessage`] is the *payload* struct —
+/// the discriminant lives on the [`cyrup_agent::AgentMessage::ToolResult`] wrapper (`event.rs:56-73`)
+/// and a bare struct serializes without it — so serializing the `Vec<ToolResultMessage>` directly
+/// produced role-less objects that `format_watchdog_review_message` silently dropped. Every tool
+/// result of every turn was therefore invisible to the review: the model saw the assistant text and
+/// never the diffs, errors or outputs the warnings are supposed to be evidence from.
+///
+/// `message` needs no such fixup — [`cyrup_agent::AgentMessage`] self-tags (`event.rs:32-74`).
+#[must_use]
+pub fn watchdog_turn_end_event(
+    message: &cyrup_agent::AgentMessage,
+    tool_results: &[cyrup_agent::ToolResultMessage],
+) -> Value {
+    let tool_results: Vec<Value> = tool_results
+        .iter()
+        .map(|result| {
+            let mut value = serde_json::to_value(result).unwrap_or(Value::Null);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("role".to_string(), Value::String("toolResult".to_string()));
+            }
+            value
+        })
+        .collect();
+    serde_json::json!({
+        "type": "turn_end",
+        "message": message,
+        "toolResults": tool_results,
+    })
+}
+
 /// The section separator (`turn-delta.ts:160`), also the runtime's own delta separator.
 pub const WATCHDOG_DELTA_SECTION_SEPARATOR: &str = "\n\n---\n\n";
 
@@ -528,6 +567,82 @@ mod tests {
                 "Tool result: grep\nResult:\ntwo",
             ]
             .join(WATCHDOG_DELTA_SECTION_SEPARATOR)
+        );
+    }
+
+    /// The wiring shape, end to end: a REAL [`cyrup_agent::ToolResultMessage`] (the type both
+    /// `HostEvent::TurnEnd` arms carry) must survive `messagesFromEvent` -> the `role` dispatch and
+    /// render its `Tool result:` section. Serialized bare it carries no `role` and is discarded.
+    #[test]
+    fn a_real_host_tool_result_reaches_the_delta_only_because_the_event_stamps_its_role() {
+        let result = cyrup_agent::ToolResultMessage {
+            tool_call_id: cyrup_core::ToolCallId::from("call-1"),
+            tool_name: "read".to_string(),
+            content: vec![cyrup_core::Content::Text {
+                text: "file body".to_string(),
+                text_signature: None,
+            }],
+            details: None,
+            usage: None,
+            added_tool_names: Vec::new(),
+            is_error: false,
+            timestamp: 0,
+        };
+        let message = cyrup_agent::AgentMessage::Custom {
+            kind: "probe".to_string(),
+            payload: json!({}),
+            timestamp: Some(0),
+        };
+
+        // The defect, stated as an assertion: the bare struct has no `role` at all.
+        let bare = serde_json::to_value(&result).expect("serializes");
+        assert!(bare.get("role").is_none());
+        assert_eq!(
+            format_watchdog_review_message(&bare),
+            None,
+            "a role-less tool result is silently dropped by the review dispatch"
+        );
+
+        let event = watchdog_turn_end_event(&message, std::slice::from_ref(&result));
+        assert_eq!(event["toolResults"][0]["role"], json!("toolResult"));
+        assert_eq!(event["toolResults"][0]["toolName"], json!("read"));
+        let delta = format_watchdog_turn_delta(&WatchdogTurnDeltaInput {
+            events: std::slice::from_ref(&event),
+            ..Default::default()
+        });
+        assert_eq!(delta, "Tool result: read\nResult:\nfile body");
+    }
+
+    /// An ERRORED tool result is the one the watchdog most needs to see, and it too only renders
+    /// because the event stamps the role.
+    #[test]
+    fn a_failed_host_tool_result_renders_its_error_section_through_the_event_shape() {
+        let result = cyrup_agent::ToolResultMessage {
+            tool_call_id: cyrup_core::ToolCallId::from("call-2"),
+            tool_name: "bash".to_string(),
+            content: vec![cyrup_core::Content::Text {
+                text: "command not found".to_string(),
+                text_signature: None,
+            }],
+            details: None,
+            usage: None,
+            added_tool_names: Vec::new(),
+            is_error: true,
+            timestamp: 0,
+        };
+        let message = cyrup_agent::AgentMessage::Custom {
+            kind: "probe".to_string(),
+            payload: json!({}),
+            timestamp: Some(0),
+        };
+        let event = watchdog_turn_end_event(&message, std::slice::from_ref(&result));
+        let delta = format_watchdog_turn_delta(&WatchdogTurnDeltaInput {
+            events: std::slice::from_ref(&event),
+            ..Default::default()
+        });
+        assert_eq!(
+            delta,
+            "Tool result: bash\nError: tool reported an error\nOutput:\ncommand not found"
         );
     }
 

@@ -700,7 +700,13 @@ impl SubagentFleetStatus {
         &self.entries
     }
 
-    /// pi `widgetRegistered` — whether a widget payload is currently published.
+    /// pi `widgetRegistered` (`fleet-status.ts:247`) — whether a widget payload is currently
+    /// published.
+    ///
+    /// Upstream's field is `private`; this accessor exists because [`Self::refresh`] already
+    /// applies every `widgetRegistered` guard internally (`:308,319,328`) and returns a single
+    /// "republish or clear" bool, so the flag is otherwise unobservable and its state machine
+    /// untestable. Assertion surface by design, not pending wiring.
     #[must_use]
     pub fn is_widget_registered(&self) -> bool {
         self.widget_registered
@@ -1581,6 +1587,71 @@ mod tests {
         assert!(text.contains("> main"), "{text}");
         assert!(text.contains("coder · running"), "{text}");
         assert!(text.contains("10s"), "{text}");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Painted-cell style assertions — the half `lines_text` cannot see
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_five_nested_status_glyphs_paint_five_distinct_roles() {
+        // Note the DEFAULT arm is the warning square, unlike `fleet.rs`'s error cross — identical
+        // call shape, different colour, and only a painted assertion can tell them apart.
+        for (state, glyph, role) in [
+            ("running", "●", Role::Accent),
+            ("queued", "◦", Role::Muted),
+            ("completed", "✓", Role::Success),
+            ("failed", "✗", Role::Error),
+            ("detached", "■", Role::Warning),
+        ] {
+            let line = Line::from(vec![nested_status_glyph(state)]);
+            assert!(
+                th::paints_as(th::painted_style(std::slice::from_ref(&line), 4, glyph), role),
+                "{state} must paint as {role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_collapsed_row_paints_its_count_muted_and_its_hint_dim() {
+        let busy = FleetState {
+            foreground_controls: vec![control("a", "coder", 0), control("b", "tester", 0)],
+            ..FleetState::default()
+        };
+        let widget = armed_widget(&busy);
+        let lines = widget.render(80, 10_000);
+        assert!(th::paints_as(th::painted_style(&lines, 80, "2 active agents"), Role::Muted));
+        assert!(th::paints_as(th::painted_style(&lines, 80, "↓/← to inspect"), Role::Dim));
+    }
+
+    #[test]
+    fn the_expanded_roster_paints_its_selection_bullet_accent_and_its_agent_muted() {
+        let busy = FleetState {
+            foreground_controls: vec![control("a", "coder", 0)],
+            ..FleetState::default()
+        };
+        let mut widget = armed_widget(&busy);
+        widget.handle_key(&FleetStatusKey::press(FleetStatusKeyCode::Down), true, "");
+        let lines = widget.render(100, 10_000);
+        assert!(
+            th::paints_as(th::painted_style(&lines, 100, ">"), Role::Accent),
+            "the selection bullet is accent"
+        );
+        assert!(
+            th::paints_as(th::painted_style(&lines, 100, "coder"), Role::Muted),
+            "an agent name is muted"
+        );
+        assert!(
+            th::paints_as(
+                th::painted_style(&lines, 100, "↑↓/jk select · enter inspect · esc back"),
+                Role::Dim
+            ),
+            "the key hint is dim"
+        );
+        // The state suffix rides an UNSTYLED span (`fleet-status.ts:452`), not the agent's muted
+        // one — a distinction no text assertion can make.
+        let state = th::painted_style(&lines, 100, "running");
+        assert_eq!(state.fg, Some(ratatui::style::Color::Reset));
     }
 
     #[test]

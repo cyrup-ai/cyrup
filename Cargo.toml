@@ -152,6 +152,13 @@ reqwest              = { version = "0.13.4", default-features = false, features 
 eventsource-stream   = { version = "0.2.3" }
 bytes                = { version = "1" }
 base64               = { version = "0.22" }
+# `cyrup-ext-subagents`'s mission store validates a delivery receipt's URL by CONSTRUCTING one —
+# pi does `new URL(url)` and treats a throw as "not an absolute URL"
+# (`pi-subagents/src/missions/store.ts:170-174`, `actions.ts:161-165`). `url` implements the same
+# WHATWG URL Standard `new URL()` does, so the accept/reject boundary matches exactly instead of
+# being approximated by a hand-rolled scheme scan. Pure Rust, no C, and already resolved in
+# `Cargo.lock` as a transitive dependency of `reqwest`, so this adds no new resolution surface.
+url                  = { version = "2.5" }
 
 # arch-00 §7.1 ratified — first used by cyrup-ext (arch-08 §3.2 draft): the real consumer's
 # `fetch()` (same `streamableHttp.js` citation as `reqwest` above) preserves the WIRE

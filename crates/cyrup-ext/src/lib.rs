@@ -82,8 +82,9 @@ pub use wrapper::{wrap_registered_tool, ActiveToolNames, RegisteredTool};
 pub use host::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
     GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
-    HumanInteractionLock, InstancePool, LiveExtension, NotifyKind, OAuthEvent, ProcSpawnSpec,
-    RecordingServices, SharedBus, StoreLimits, UiChrome, WasmExtension, WasmTool,
+    HumanInteractionLock, InstancePool, InteractiveOverlay, LiveExtension, NotifyKind, OAuthEvent,
+    OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome, OverlaySpan,
+    ProcSpawnSpec, RecordingServices, SharedBus, StoreLimits, UiChrome, WasmExtension, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

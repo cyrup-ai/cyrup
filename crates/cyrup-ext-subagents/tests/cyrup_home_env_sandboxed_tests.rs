@@ -173,8 +173,8 @@ impl cyrup_ext::host::HostServices for FixedSessionHost {
 /// the job as tracked and the anchor would still resolve to the old session's id).
 #[tokio::test]
 async fn teardown_session_stops_the_tracker_and_clears_the_parent_session_anchor() {
-    // `install_completion_watcher` resolves its results dir under `dirs_home()`/
-    // `subagents_home()` — sandbox `CYRUP_HOME` (see `ENV_MUTATION_LOCK`'s own doc).
+    // `install_completion_watcher` resolves its results dir under `background::temp_root_dir()`,
+    // whose CYRUP_HOME branch exists precisely as this sandbox seam (see `ENV_MUTATION_LOCK`).
     let _guard = ENV_MUTATION_LOCK.lock().await;
     let home = tempfile::tempdir().expect("home tempdir");
     // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.

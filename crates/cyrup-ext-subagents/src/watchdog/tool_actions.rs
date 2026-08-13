@@ -49,8 +49,14 @@ pub const WATCHDOG_TOOL_ACTIONS: [&str; 4] = [
     "watchdog.recommend-model",
 ];
 
-/// `WATCHDOG_THINKING_VALUES` (`tool-actions.ts:155`) — `inherit` plus every thinking level; the
-/// enum the tool schema advertises for `params.thinking`.
+/// `WATCHDOG_THINKING_VALUES` (`tool-actions.ts:155`) — `inherit` plus every thinking level.
+///
+/// No caller, and deliberately so: upstream exports it at `:155` and nothing imports it, because
+/// the `subagent` tool's `thinking` parameter is NOT declared as an enum. `extension/schemas.ts:288`
+/// declares `anyOf: [{ type: "string" }, { type: "boolean", enum: [false] }]` with the level names
+/// only in its `description` — so wiring this constant into the schema would DIVERGE from upstream
+/// rather than complete it. It is the ported vocabulary, kept for a caller that wants to validate
+/// against it.
 pub const WATCHDOG_THINKING_VALUES: [&str; 8] = [
     "inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max",
 ];

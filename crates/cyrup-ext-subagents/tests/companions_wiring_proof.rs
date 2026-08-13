@@ -46,6 +46,24 @@ use cyrup_ext_subagents::tui::intercom::{
     NoTransportSteerChannel, SteerChannel,
 };
 
+/// Missions are ON by default, and a task-bearing dispatch auto-creates one
+/// (`missions/lifecycle.rs::prepare_mission_launch`). Its cross-project POINTER INDEX defaults to
+/// `agent_dir()/missions/index` — the developer's real `~/.cyrup/agent/missions/index`, beside
+/// `settings.json`, `models-store.json` and `sessions/` — so a tempdir cwd alone does not isolate
+/// it. `config.missions.globalIndexDir` is the production lever that does, and it is the lever
+/// upstream's own fixtures use (`pi-subagents` `test/unit/mission-lifecycle.test.ts:18`).
+fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
+    SubagentExtensionConfig {
+        missions: Some(cyrup_ext_subagents::missions::MissionStoreConfig {
+            global_index_dir: Some(
+                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Serializes every test mutating `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT` (global).
 static ENV_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
@@ -398,7 +416,7 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
     // the no-transport default, which never fires in this out-of-band-delivery scenario.
     let steer: Arc<dyn SteerChannel> = Arc::new(NoTransportSteerChannel);
     let ext = SubagentsExtension::with_channels(
-        SubagentExtensionConfig::default(),
+        scoped_config(work_dir.path()),
         work_dir.path().to_path_buf(),
         delivery,
         clarify,

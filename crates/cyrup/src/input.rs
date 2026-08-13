@@ -573,7 +573,16 @@ fn normalize_piped_stdin(buf: &str) -> Option<String> {
 /// Read piped stdin to a string when stdin is not a TTY (R-11-006); `None` when interactive or empty.
 /// The text is trimmed before it reaches the prompt (Pi `data.trim() || undefined`, main.ts:80) —
 /// see [`normalize_piped_stdin`].
-async fn read_piped_stdin() -> anyhow::Result<Option<String>> {
+///
+/// **Public, and called from `main.rs` rather than from [`build_inputs`], because that is Pi's own
+/// shape**: `main.ts:819-826` reads `stdinContent = await readPipedStdin()` in `main` (skipping it
+/// entirely for RPC mode, which owns stdin for JSON-RPC) and `:828-832` then *passes* the string
+/// into `prepareInitialMessage(parsed, autoResize, stdinContent)`. Folding the read inside
+/// `build_inputs` made the whole prompt-assembly path depend on a process-global descriptor: under
+/// `cargo test` a test binary inherits whatever stdin the runner has, and if that is a pipe nobody
+/// closes, `read_to_string` never returns and the test target hangs forever instead of failing.
+/// See area-08 `SEAM-072`.
+pub async fn read_piped_stdin() -> anyhow::Result<Option<String>> {
     if std::io::stdin().is_terminal() {
         return Ok(None);
     }
@@ -594,7 +603,17 @@ async fn read_piped_stdin() -> anyhow::Result<Option<String>> {
 /// defaulted option precisely because it used to be missing: `@screenshot.png` always downsampled to
 /// 2000px and injected a `[Image: original …, displayed at …]` note no matter what the settings
 /// panel's "Auto-resize images" toggle said.
-pub async fn build_inputs(cli: &Cli, cwd: &Path, auto_resize: bool) -> anyhow::Result<Inputs> {
+///
+/// `piped` is the already-read piped-stdin content — Pi's third `prepareInitialMessage` argument
+/// (`stdinContent`, main.ts:831), produced by [`read_piped_stdin`] at the call site. It is a
+/// parameter and not an internal read for the same reason it is one upstream: this function is the
+/// prompt-assembly step, not the descriptor-owning step.
+pub async fn build_inputs(
+    cli: &Cli,
+    cwd: &Path,
+    auto_resize: bool,
+    piped: Option<String>,
+) -> anyhow::Result<Inputs> {
     let (files, messages) = split_positionals(&cli.positionals);
     let processed = process_file_args(&files, cwd, auto_resize).await?;
     let file_text = if processed.text.is_empty() {
@@ -602,7 +621,6 @@ pub async fn build_inputs(cli: &Cli, cwd: &Path, auto_resize: bool) -> anyhow::R
     } else {
         Some(processed.text)
     };
-    let piped = read_piped_stdin().await?;
     Ok(compose_inputs(
         file_text,
         processed.images,

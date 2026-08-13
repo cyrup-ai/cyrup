@@ -235,6 +235,11 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
     let now = now_epoch_millis();
     RunStatus {
         run_id: result.run_id.clone(),
+        // A repaired status has no surviving record of the launching session — the `ResultFile`
+        // does not carry one — and an absent id is the honest answer, not a guess. A session-scoped
+        // reader (`fleet::collect_fleet_history`) will then treat this repaired run as belonging to
+        // no session, exactly as pi's `status.sessionId === undefined` does.
+        session_id: None,
         mode: result.mode,
         state: result.state,
         pid,

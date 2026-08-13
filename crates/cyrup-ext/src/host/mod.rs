@@ -12,6 +12,7 @@ pub mod epoch;
 pub mod instance;
 pub mod limits;
 pub mod live;
+pub mod overlay;
 pub mod services;
 pub mod store_state;
 pub mod testkit;
@@ -21,6 +22,10 @@ pub use epoch::EpochDriver;
 pub use instance::{InstancePool, WasmExtension};
 pub use limits::StoreLimits;
 pub use live::{LiveExtension, WasmTool};
+pub use overlay::{
+    InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome,
+    OverlaySpan,
+};
 pub use services::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState,
     HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,

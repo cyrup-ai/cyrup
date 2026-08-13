@@ -877,6 +877,11 @@ fn parse_source_file(file_path: &Path) -> Result<Value, String> {
 /// `resolveWatchdogConfigStrict(cwd, { session })` (`settings.ts:471-482`) — the throwing variant,
 /// used where a caller wants the failure rather than a silent fallback.
 ///
+/// No caller — and none upstream either: `settings.ts` exports it at `:471` and no file in
+/// `pi-subagents@v0.43.0` imports it. Every live path takes the non-throwing
+/// [`resolve_watchdog_config`] and reads its `errors` list instead. Kept as ported public surface,
+/// not as pending wiring.
+///
 /// # Errors
 /// The first layer's parse failure, verbatim.
 pub fn resolve_watchdog_config_strict(
@@ -1505,6 +1510,53 @@ mod tests {
             _root: root,
             project,
         }
+    }
+
+    /// The whole reason [`resolve_watchdog_config_strict`] exists (`settings.ts:471-482`): where
+    /// [`resolve_watchdog_config`] RECORDS a layer failure and falls back to pristine defaults
+    /// (`:537-568`), the strict variant propagates the first one verbatim. Both are driven here
+    /// against the same broken project layer, so the divergence is pinned rather than assumed.
+    #[test]
+    fn the_strict_variant_propagates_the_layer_failure_the_lenient_one_records() {
+        let fx = fixture();
+        std::fs::write(
+            fx.project.join(".cyrup").join("settings.json"),
+            r#"{"subagents":{"watchdog":{"main":{"enabled":"yes"}}}}"#,
+        )
+        .expect("write project settings");
+
+        let error = resolve_watchdog_config_strict(&fx.project, None)
+            .expect_err("a malformed layer must throw, not fall back");
+        assert!(!error.is_empty());
+
+        let lenient = resolve_watchdog_config(&fx.project, None);
+        assert!(!lenient.ok, "the same layer fails for the lenient variant too");
+        assert!(!lenient.errors.is_empty());
+        // Same failure, one propagated and one recorded.
+        assert!(
+            lenient.errors.iter().any(|e| e.message == error),
+            "strict error {error:?} must be one the lenient variant recorded: {:?}",
+            lenient.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        // …and the lenient one still hands back a usable config; the strict one hands back none.
+        assert_eq!(lenient.config, default_watchdog_config());
+    }
+
+    /// A CLEAN project layer must resolve identically through both variants — the strict form is
+    /// not a different resolver, only a different failure mode.
+    #[test]
+    fn the_strict_variant_agrees_with_the_lenient_one_on_a_clean_layer() {
+        let fx = fixture();
+        std::fs::write(
+            fx.project.join(".cyrup").join("settings.json"),
+            r#"{"subagents":{"watchdog":{"main":{"enabled":true}}}}"#,
+        )
+        .expect("write project settings");
+        let strict = resolve_watchdog_config_strict(&fx.project, None).expect("clean layer");
+        let lenient = resolve_watchdog_config(&fx.project, None);
+        assert!(lenient.ok);
+        assert_eq!(strict, lenient.config);
+        assert!(strict.main.enabled, "the project layer's value survived");
     }
 
     #[test]

@@ -25,13 +25,42 @@
 //! decision that is never written is indistinguishable from one that never happened, so the audit
 //! append is the first and last thing this function does.
 //!
-//! ## The two helpers ported inline
+//! ## Where it is wired
 //!
-//! `permissionArgsPreview` and `appendPermissionAudit` come from `runs/shared/permissions.ts`, a
-//! file with no cyrup port in this batch (or anywhere else in the crate — the string
-//! `permissionArgsPreview` appears nowhere). Rather than leave the arbiter unable to redact or
-//! audit, both are ported here, verbatim from `permissions.ts:63-93`, with a note so a later
-//! `permissions.ts` batch collapses them into the shared module rather than adding a second copy.
+//! Upstream has exactly one caller: `registerPermissionGate` (`subagent-prompt-runtime.ts:281-305`,
+//! installed at `:475`) subscribes `tool_call` in the CHILD process, resolves the tool against the
+//! policy the parent shipped in `PERMISSION_POLICY_ENV`, and calls `requestWatchdogPermission` for
+//! every tool whose rule is `ask`. cyrup's port is
+//! [`crate::prompt_runtime::PermissionGate`], reached from
+//! [`crate::prompt_runtime::SubagentPromptRuntime::on_event`]'s `ToolCall` arm.
+//!
+//! **This is not `cyrup-permission-system`'s gate, and "cyrup already has permissions" was never a
+//! reason to leave this module uncalled.** The two are different policies answering different
+//! questions in different processes, and both are upstream-real (pi CORE ships no permission
+//! system at all, so neither one can be attributed to `pi/`):
+//!
+//! * `cyrup-permission-system` ports the third-party `pi-permission-system` extension. Its rules
+//!   come from `cyrup-permissions.jsonc`, its `ask` tier means *ask a human*, and inside a subagent
+//!   child it installs the `ForwardingAskChannel` that writes the question into the PARENT's
+//!   `<agentDir>/sessions/permission-forwarding/` spool so the parent's operator answers it
+//!   (`crate::spawn::nested_events`'s `child_role_env` doc, consumer #3).
+//! * THIS gate ports `pi-subagents`' own policy. Its rules come from the agent definition and the
+//!   extension config, travel to the child in `PERMISSION_POLICY_ENV`, and its `ask` tier means
+//!   *ask a model* — precisely because a subagent child has no human to reach. It also refuses to
+//!   gate `bash` (left to pi-guard) and the four internal coordination tools, which the other
+//!   system does gate.
+//!
+//! A child can be under both at once; they compose the way two `tool_call` handlers compose, and
+//! either one blocking is a block.
+//!
+//! ## The `permissions.ts` helpers ported inline
+//!
+//! `permissionArgsPreview`, `appendPermissionAudit` and — since the gate needs them — the policy
+//! decode/decision half of `runs/shared/permissions.ts` live here, that file having no other cyrup
+//! port. The parent-side half (`validatePermissionConfig`, `resolvePermissionRules`,
+//! `encodePermissionRules`, and `pi-args.ts:713-758`'s env writes) is still unported, so a policy
+//! reaches a child today only if something outside this crate sets
+//! [`PERMISSION_POLICY_ENV`]; that is the remaining work, and it lives in `exec/`, not here.
 //!
 //! [CYRUP-DELTA] the model turn is the [`WatchdogPermissionAgent`] seam, for the same reason
 //! [`super::review::WatchdogReviewAgent`] is — see that module's doc. Everything upstream does
@@ -88,37 +117,138 @@ fn is_secret_key(key: &str) -> bool {
         .any(|fragment| folded.contains(&fragment.replace(['-', '_'], "")))
 }
 
-/// `SECRET_VALUE` (`permissions.ts:15`): a `Bearer <token>`, or a known key prefix followed by at
-/// least eight token characters.
-fn redact_secret_values(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    'outer: while !rest.is_empty() {
-        for prefix in ["Bearer ", "bearer ", "sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "xoxp-",
-            "xoxa-", "xoxr-", "xoxs-"]
-        {
-            if let Some(after) = rest.strip_prefix(prefix) {
-                let token_len = after
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                    .count();
-                let min = if prefix.starts_with("Bearer") || prefix.starts_with("bearer") {
-                    1
-                } else {
-                    8
-                };
-                if token_len >= min {
-                    out.push_str("[redacted]");
-                    rest = after.get(token_len..).unwrap_or("");
-                    continue 'outer;
-                }
-            }
-        }
-        let Some(ch) = rest.chars().next() else { break };
-        out.push(ch);
-        rest = rest.get(ch.len_utf8()..).unwrap_or("");
+/// The literal prefixes of `SECRET_VALUE`'s second alternation (`permissions.ts:15`):
+/// `(?:sk|ghp|github_pat|xox[baprs])`, with the character class expanded. The `[-_A-Za-z0-9]{8,}`
+/// run that must follow is NOT part of the prefix — upstream counts those eight characters from
+/// immediately after `sk`/`ghp`/…, separator included.
+const SECRET_VALUE_PREFIXES: [&str; 8] = [
+    "sk",
+    "ghp",
+    "github_pat",
+    "xoxb",
+    "xoxa",
+    "xoxp",
+    "xoxr",
+    "xoxs",
+];
+
+/// The minimum `[-_A-Za-z0-9]{8,}` run length (`permissions.ts:15`).
+const SECRET_VALUE_MIN_TOKEN: usize = 8;
+
+/// `\w` — the character class both `\b` assertions are defined against. JS `\b` is ASCII-only
+/// regardless of the `u` flag, so every byte of a multi-byte UTF-8 sequence is a NON-word byte
+/// here, exactly as every non-ASCII code point is in JS.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// `[-_A-Za-z0-9]` (`permissions.ts:15`).
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+/// `\b` at byte offset `at`: exactly one side is a word character.
+fn at_word_boundary(bytes: &[u8], at: usize) -> bool {
+    let before = at
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index))
+        .is_some_and(|byte| is_word_byte(*byte));
+    let after = bytes.get(at).is_some_and(|byte| is_word_byte(*byte));
+    before != after
+}
+
+/// `Bearer\s+\S+` anchored at `start`, case-insensitively, with the trailing `\b` satisfied by
+/// backtracking the greedy `\S+` — the same backtrack the regex engine performs, which is why
+/// `Bearer abc.` redacts `Bearer abc` and leaves the `.`.
+///
+/// The backtrack can never stop mid-UTF-8: a boundary needs a word byte on one side, and neither a
+/// lead byte nor a continuation byte is one.
+fn match_bearer(bytes: &[u8], start: usize) -> Option<usize> {
+    let head = bytes.get(start..start.checked_add("bearer".len())?)?;
+    if !head.eq_ignore_ascii_case(b"bearer") {
+        return None;
     }
-    out
+    let after_keyword = start.checked_add("bearer".len())?;
+    let spaces = bytes
+        .get(after_keyword..)?
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    if spaces == 0 {
+        return None;
+    }
+    let token_start = after_keyword.checked_add(spaces)?;
+    let mut length = bytes
+        .get(token_start..)?
+        .iter()
+        .take_while(|byte| !byte.is_ascii_whitespace())
+        .count();
+    while length >= 1 && !at_word_boundary(bytes, token_start.checked_add(length)?) {
+        length -= 1;
+    }
+    (length >= 1).then(|| token_start.saturating_add(length))
+}
+
+/// `(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,}\b` anchored at `start`, case-insensitively.
+fn match_prefixed_token(bytes: &[u8], start: usize) -> Option<usize> {
+    for prefix in SECRET_VALUE_PREFIXES {
+        let Some(end_of_prefix) = start.checked_add(prefix.len()) else {
+            continue;
+        };
+        let Some(head) = bytes.get(start..end_of_prefix) else {
+            continue;
+        };
+        if !head.eq_ignore_ascii_case(prefix.as_bytes()) {
+            continue;
+        }
+        let Some(tail) = bytes.get(end_of_prefix..) else {
+            continue;
+        };
+        let mut length = tail.iter().take_while(|byte| is_token_byte(**byte)).count();
+        while length >= SECRET_VALUE_MIN_TOKEN
+            && !at_word_boundary(bytes, end_of_prefix.saturating_add(length))
+        {
+            length -= 1;
+        }
+        if length >= SECRET_VALUE_MIN_TOKEN {
+            return Some(end_of_prefix.saturating_add(length));
+        }
+    }
+    None
+}
+
+/// `value.replace(SECRET_VALUE, "[redacted]")` (`permissions.ts:15,70`), where
+/// `SECRET_VALUE = /\b(?:Bearer\s+\S+|(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,})\b/gi`.
+///
+/// **The `i` flag is a security property, not a formatting nicety.** The previous port matched a
+/// fixed list of literally-spelled prefixes (`"Bearer "`, `"sk-"`, `"ghp_"`, …), so a real
+/// credential written `BEARER <token>`, `SK-…` or `GHP_…` — and every `sk`/`ghp`/`xox` token with
+/// no separator, which the `-`/`_` in those literals also required — passed through unredacted
+/// into the arbiter's prompt AND into the on-disk audit log. This walks the string the way the
+/// regex does: at every `\b`, try the `Bearer` alternation and then the prefixed-token
+/// alternation, both ASCII-case-insensitively.
+fn redact_secret_values(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if at_word_boundary(bytes, index)
+            && let Some(end) =
+                match_bearer(bytes, index).or_else(|| match_prefixed_token(bytes, index))
+            && end > index
+        {
+            out.extend_from_slice(b"[redacted]");
+            index = end;
+            continue;
+        }
+        if let Some(byte) = bytes.get(index) {
+            out.push(*byte);
+        }
+        index = index.saturating_add(1);
+    }
+    // Lossless by construction: every byte is either copied verbatim or replaced with a whole
+    // ASCII marker, and no match can end inside a multi-byte sequence (see [`match_bearer`]).
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `redact` (`permissions.ts:63-73`).
@@ -216,6 +346,138 @@ pub fn append_permission_audit(file_path: Option<&Path>, record: &Value) {
         use std::io::Write;
         let _ = writeln!(file, "{line}");
     }
+}
+
+// =================================================================================================
+// The policy the arbiter answers FOR (`runs/shared/permissions.ts:4-61`)
+// =================================================================================================
+
+/// `PERMISSION_POLICY_ENV` (`permissions.ts:8`), under cyrup's `CYRUP_SUBAGENT_*` spelling — the
+/// same rename every other member of that family carries (`CYRUP_SUBAGENT_TOOL_BUDGET`,
+/// `CYRUP_SUBAGENT_STEER_INBOX`, …).
+pub const PERMISSION_POLICY_ENV: &str = "CYRUP_SUBAGENT_PERMISSION_POLICY";
+
+/// `PERMISSION_AUDIT_PATH_ENV` (`permissions.ts:9`).
+pub const PERMISSION_AUDIT_PATH_ENV: &str = "CYRUP_SUBAGENT_PERMISSION_AUDIT_PATH";
+
+/// `INTERNAL_TOOLS` (`permissions.ts:10`) — the child's own coordination surface, which a policy
+/// may not gate at all: gating it would let a rule strand a child that cannot report back.
+const INTERNAL_TOOLS: [&str; 4] = [
+    "contact_supervisor",
+    "intercom",
+    "subagent_wait",
+    "structured_output",
+];
+
+/// `PermissionDecision` (`permissions.ts:4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionRuleDecision {
+    /// Run the tool.
+    Allow,
+    /// Ask the arbiter ([`request_watchdog_permission`]).
+    Ask,
+    /// Refuse the tool outright.
+    Deny,
+}
+
+impl PermissionRuleDecision {
+    /// The wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// `DECISIONS.has(decision)` (`permissions.ts:11`).
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "allow" => Some(Self::Allow),
+            "ask" => Some(Self::Ask),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// `PermissionRules` (`permissions.ts:5`) — tool name to decision.
+pub type PermissionRules = std::collections::BTreeMap<String, PermissionRuleDecision>;
+
+/// `validatePermissionRules(value, label)` (`permissions.ts:17-29`).
+///
+/// # Errors
+///
+/// Upstream's five throws, verbatim: a non-object policy, an empty tool name, `bash` (left to
+/// pi-guard), a reserved internal tool, and an unrecognized decision.
+pub fn validate_permission_rules(
+    value: Option<&Value>,
+    label: &str,
+) -> Result<Option<PermissionRules>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Err(format!(
+            "{label} must be an object mapping tool names to allow, ask, or deny."
+        ));
+    };
+    let mut result = PermissionRules::new();
+    for (tool, decision) in object {
+        if tool.trim().is_empty() {
+            return Err(format!("{label} contains an empty tool name."));
+        }
+        if tool == "bash" {
+            return Err(format!(
+                "{label}.bash is unsupported; pi-subagents leaves bash policy to pi-guard."
+            ));
+        }
+        if INTERNAL_TOOLS.contains(&tool.as_str()) {
+            return Err(format!(
+                "{label}.{tool} is reserved for child coordination and cannot be gated."
+            ));
+        }
+        let Some(decision) = decision.as_str().and_then(PermissionRuleDecision::parse) else {
+            return Err(format!("{label}.{tool} must be allow, ask, or deny."));
+        };
+        result.insert(tool.clone(), decision);
+    }
+    Ok((!result.is_empty()).then_some(result))
+}
+
+/// `decodePermissionRules(encoded)` (`permissions.ts:58-61`) — the child's side of the policy: a
+/// blank value is the same as unset.
+///
+/// # Errors
+///
+/// Malformed JSON, or anything [`validate_permission_rules`] rejects.
+pub fn decode_permission_rules(encoded: Option<&str>) -> Result<Option<PermissionRules>, String> {
+    let Some(encoded) = encoded.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(encoded)
+        .map_err(|error| format!("{PERMISSION_POLICY_ENV} is not valid JSON: {error}"))?;
+    validate_permission_rules(Some(&value), PERMISSION_POLICY_ENV)
+}
+
+/// `permissionDecision(rules, toolName)` (`permissions.ts:46-49`).
+///
+/// `bash` and the internal coordination tools are ALWAYS allowed here regardless of the rules —
+/// [`validate_permission_rules`] already refuses to record a rule for any of them, so this is the
+/// second of two enforcement points, not a redundant one: the rules can also arrive from a
+/// parent running a different version.
+#[must_use]
+pub fn permission_decision(
+    rules: Option<&PermissionRules>,
+    tool_name: &str,
+) -> PermissionRuleDecision {
+    if tool_name == "bash" || INTERNAL_TOOLS.contains(&tool_name) {
+        return PermissionRuleDecision::Allow;
+    }
+    rules
+        .and_then(|rules| rules.get(tool_name).copied())
+        .unwrap_or(PermissionRuleDecision::Allow)
 }
 
 /// `WatchdogPermissionResult` (`permission-arbiter.ts:17-21`).
@@ -569,6 +831,72 @@ mod tests {
         assert!(preview.contains("\"safe\":\"kept\""));
     }
 
+    /// `SECRET_VALUE` ends `/gi` (`permissions.ts:15`). Dropping the `i` under-redacts REAL
+    /// credentials — a `Bearer` header is routinely spelled with any casing, and the token prefixes
+    /// are matched case-insensitively upstream — and the un-redacted value went into the arbiter's
+    /// prompt and into the on-disk audit log.
+    #[test]
+    fn secret_values_are_matched_case_insensitively_like_the_upstream_regex() {
+        for value in [
+            "Bearer abcdef",
+            "bearer abcdef",
+            "BEARER abcdef",
+            "BeArEr abcdef",
+        ] {
+            assert_eq!(
+                redact_secret_values(value),
+                "[redacted]",
+                "case-insensitive Bearer: {value}"
+            );
+        }
+        for value in [
+            "sk-abcdefgh",
+            "SK-ABCDEFGH",
+            "Sk_AbCdEfGh",
+            "ghp-abcdefgh",
+            "GHP_ABCDEFGH",
+            "github_pat_abcdefgh",
+            "GITHUB_PAT_ABCDEFGH",
+            "xoxb-abcdefgh",
+            "XOXP-ABCDEFGH",
+            "xoxs_abcdefgh",
+        ] {
+            assert_eq!(
+                redact_secret_values(value),
+                "[redacted]",
+                "case-insensitive prefix: {value}"
+            );
+        }
+    }
+
+    /// The regex's structure, not just its case folding: the `{8,}` run is counted from
+    /// immediately after the literal prefix (separator included), both `\b` assertions hold, and
+    /// `/g` replaces every occurrence.
+    #[test]
+    fn the_secret_value_scan_matches_the_regexs_boundaries_and_length_rule() {
+        // Eight token characters counted from after `sk` — the separator is one of them.
+        assert_eq!(redact_secret_values("sk-abcdefg"), "[redacted]");
+        assert_eq!(redact_secret_values("sk-abcdef"), "sk-abcdef");
+        // No separator at all still matches upstream (`sk` + 8 token chars).
+        assert_eq!(redact_secret_values("skABCDEFGH"), "[redacted]");
+        // Leading `\b`: a prefix glued to a preceding word character is not a match.
+        assert_eq!(redact_secret_values("xsk-abcdefgh"), "xsk-abcdefgh");
+        // Trailing `\b` backtracks off a non-word tail.
+        assert_eq!(redact_secret_values("sk-abcdefgh."), "[redacted].");
+        assert_eq!(redact_secret_values("Bearer abc."), "[redacted].");
+        // `Bearer` needs at least one space and one non-space token.
+        assert_eq!(redact_secret_values("Bearerabc"), "Bearerabc");
+        assert_eq!(redact_secret_values("Bearer "), "Bearer ");
+        // `/g` — every occurrence, and surrounding text is preserved verbatim.
+        assert_eq!(
+            redact_secret_values("a sk-abcdefgh b GHP_ABCDEFGH c"),
+            "a [redacted] b [redacted] c"
+        );
+        // Non-ASCII survives intact.
+        assert_eq!(redact_secret_values("héllo sk-abcdefgh ✓"), "héllo [redacted] ✓");
+        assert_eq!(redact_secret_values("Bearer café"), "[redacted]é");
+    }
+
     #[test]
     fn redaction_truncates_depth_arrays_and_long_strings() {
         let deep = json!({ "a": { "b": { "c": { "d": 1 } } } });
@@ -752,6 +1080,69 @@ mod tests {
         )
         .await;
         assert_eq!(std::fs::read_to_string(&audit).unwrap().lines().count(), 2);
+    }
+
+    // ---- the policy the gate reads (`permissions.ts:17-61`) -------------------------------------
+
+    #[test]
+    fn a_policy_decodes_to_its_rules_and_a_blank_value_is_the_same_as_unset() {
+        let rules = decode_permission_rules(Some("{\"write\":\"deny\",\"fetch\":\"ask\"}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rules.get("write"), Some(&PermissionRuleDecision::Deny));
+        assert_eq!(rules.get("fetch"), Some(&PermissionRuleDecision::Ask));
+        assert!(decode_permission_rules(None).unwrap().is_none());
+        assert!(decode_permission_rules(Some("   ")).unwrap().is_none());
+        // An all-`allow` policy is the same as no policy (`permissions.ts:28`).
+        assert!(
+            decode_permission_rules(Some("{}")).unwrap().is_none(),
+            "an empty rule set installs no gate"
+        );
+    }
+
+    #[test]
+    fn the_five_upstream_validation_errors_all_fire() {
+        let cases = [
+            ("[]", "must be an object mapping tool names to allow, ask, or deny."),
+            ("{\"  \":\"deny\"}", "contains an empty tool name."),
+            (
+                "{\"bash\":\"deny\"}",
+                "bash is unsupported; pi-subagents leaves bash policy to pi-guard.",
+            ),
+            (
+                "{\"contact_supervisor\":\"deny\"}",
+                "reserved for child coordination and cannot be gated.",
+            ),
+            ("{\"write\":\"maybe\"}", "must be allow, ask, or deny."),
+        ];
+        for (raw, fragment) in cases {
+            let error = decode_permission_rules(Some(raw)).unwrap_err();
+            assert!(error.contains(fragment), "{raw} -> {error}");
+        }
+        assert!(
+            decode_permission_rules(Some("not json")).unwrap_err().contains("not valid JSON"),
+        );
+    }
+
+    #[test]
+    fn bash_and_the_internal_tools_are_allowed_even_when_a_rule_says_otherwise() {
+        // A rule set that validation would refuse, built directly — a parent on another version
+        // could still ship it, which is why the decision function checks again.
+        let mut rules = PermissionRules::new();
+        for tool in ["bash", "contact_supervisor", "intercom", "subagent_wait", "structured_output"]
+        {
+            rules.insert(tool.to_string(), PermissionRuleDecision::Deny);
+            assert_eq!(
+                permission_decision(Some(&rules), tool),
+                PermissionRuleDecision::Allow,
+                "{tool}"
+            );
+        }
+        // An unlisted tool defaults to allow; a listed one gets its rule.
+        rules.insert("write".to_string(), PermissionRuleDecision::Ask);
+        assert_eq!(permission_decision(Some(&rules), "write"), PermissionRuleDecision::Ask);
+        assert_eq!(permission_decision(Some(&rules), "read"), PermissionRuleDecision::Allow);
+        assert_eq!(permission_decision(None, "write"), PermissionRuleDecision::Allow);
     }
 
     #[test]

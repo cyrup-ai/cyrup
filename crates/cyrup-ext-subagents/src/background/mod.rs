@@ -840,6 +840,18 @@ pub struct ParallelGroupStatus {
 pub struct RunStatus {
     /// This run's identity.
     pub run_id: RunId,
+    /// The ORCHESTRATOR session that launched this run (pi `AsyncStatus.sessionId`,
+    /// `shared/types.ts:1249`, written by the runner from `config.sessionId` at
+    /// `subagent-runner.ts:2088`).
+    ///
+    /// Recorded so a LATER session reading the same async root can tell whose runs these are: pi's
+    /// `listAsyncRuns` drops every on-disk run whose `sessionId` differs from the caller's
+    /// (`async-status.ts:432`), which is what keeps `/subagents-fleet` and the active-run listings
+    /// scoped to the current session instead of showing every run the project ever launched.
+    /// `None` for a run launched with no resolvable parent-session anchor (a headless or
+    /// unpersisted orchestrator), and for a status synthesized by reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Which shape of run this is.
     pub mode: RunMode,
     /// Current overall lifecycle state (monotone-forward, see [`RunState`]).
@@ -907,6 +919,9 @@ impl RunStatus {
         let now = now_epoch_millis();
         Self {
             run_id,
+            // The launching session is the runner's to record (it is the only process that knows
+            // the anchor); a status built here carries none until it does.
+            session_id: None,
             mode,
             state: RunState::Queued,
             pid,
@@ -1178,16 +1193,19 @@ impl RunPaths {
 // (`async-execution.ts:701,966` @v0.34.0) and the runner reads them straight back
 // (`subagent-runner.ts:1316` @v0.34.0) — never re-deriving `RESULTS_DIR`.
 
-/// Path segment, under the per-user subagents home, holding one directory per background run (each
+/// Path segment, under [`temp_root_dir`], holding one directory per background run (each
 /// run's `status.json`, `events.jsonl`, control inbox, logs — everything EXCEPT the terminal
-/// [`ResultFile`]). Mirrors pi's `ASYNC_DIR` leaf (`shared/types.ts:959`).
+/// [`ResultFile`]). pi's `ASYNC_DIR` leaf is `"async-subagent-runs"`
+/// (`shared/types.ts:1863` @v0.43.0); cyrup shortens it because the `<cwd_key>` level below it
+/// already disambiguates, and `results_dir_for_async_root` pins the two leaves against each other.
 const ASYNC_SUBDIR: &str = "async";
 
-/// Path segment, under the per-user subagents home, holding the terminal [`ResultFile`] for every
+/// Path segment, under [`temp_root_dir`], holding the terminal [`ResultFile`] for every
 /// run (a flat `<run_id>.json` per finished run). A DELIBERATE SIBLING of [`ASYNC_SUBDIR`], never a
 /// child of it — "presence in this dir is the authoritative done signal" (R-SA-077) only works if
 /// the results dir can be watched independently of the still-being-written run dir. Mirrors pi's
-/// `RESULTS_DIR` leaf (`shared/types.ts:958`).
+/// `RESULTS_DIR` leaf, `"async-subagent-results"` (`shared/types.ts:1862` @v0.43.0), shortened
+/// for the same reason as [`ASYNC_SUBDIR`].
 const RESULTS_SUBDIR: &str = "results";
 
 /// The current wall-clock time as whole milliseconds since the Unix epoch, saturating to `u64`.
@@ -1212,27 +1230,173 @@ pub(crate) fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The per-user root every subagent run-artifact directory hangs off: `<home>/.cyrup/subagents`,
-/// where `<home>` resolves from `CYRUP_HOME`, then `HOME`, then the OS temp dir. This is the
-/// single, shared resolution the orchestrator's own `default_async_root`/`default_results_dir`
-/// (`extension.rs`) now delegate to, so the two roots can never again drift apart the way C7
-/// documents.
+/// One segment of a temp-scope id, with every character outside `[A-Za-z0-9._-]` collapsed to a
+/// single `-` and leading/trailing `-` stripped; an empty result becomes `"unknown"`.
+///
+/// 1:1 with pi's `sanitizeTempScopeSegment` (`shared/types.ts:1807-1812` @v0.43.0):
+/// `value.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown"`. The `+`
+/// on the character class is why a RUN of illegal characters collapses to ONE `-` rather than one
+/// per character.
+fn sanitize_temp_scope_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut pending_dash = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            if pending_dash {
+                out.push('-');
+                pending_dash = false;
+            }
+            out.push(ch);
+        } else {
+            // Collapse a run of illegal characters to a single `-`, emitted lazily so a trailing
+            // run never lands (matching the `replace(/-+$/g, "")` that follows upstream).
+            pending_dash = !out.is_empty();
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The per-user scope segment that keeps two users' subagent scratch trees from colliding inside a
+/// world-writable OS temp dir.
+///
+/// 1:1 with pi's `resolveTempScopeId` (`shared/types.ts:1814-1857` @v0.43.0), in its own precedence
+/// order: the real uid (`uid-<n>`) first, then the first non-empty of `USERNAME`/`USER`/`LOGNAME`
+/// (`user-<name>`), then the OS user info (`user-<name>`), then `USERPROFILE`/`HOME`
+/// (`home-<path>`), then the OS home dir (`home-<path>`), and finally the literal `"shared"`.
+///
+/// [CYRUP-DELTA] cyrup stops at the uid branch on Unix and at the env branches elsewhere: pi's
+/// `os.userInfo()` step exists because Node's `process.getuid` is undefined on Windows, and the
+/// stdlib exposes no portable `userInfo` equivalent. Every branch upstream can actually reach on a
+/// platform cyrup supports is present, so the resolved value is identical.
+fn resolve_temp_scope_id() -> &'static str {
+    /// The scope id cannot change within a process (the uid cannot), and [`temp_root_dir`] is on
+    /// the path of every run-root derivation — without this each one re-read `/proc/self/status`.
+    /// Matches upstream's own once-per-process evaluation: pi's `TEMP_ROOT_DIR` is a module-level
+    /// `const`, so `resolveTempScopeId()` runs exactly once per process there too.
+    static SCOPE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCOPE_ID.get_or_init(resolve_temp_scope_id_uncached)
+}
+
+fn resolve_temp_scope_id_uncached() -> String {
+    // pi `if (typeof getuid === "function") return `uid-${getuid()}`` — `process.getuid` is defined
+    // on every Unix, so upstream never reaches a later branch there. Read from procfs because this
+    // crate is `#![forbid(unsafe_code)]` and cannot call `libc::getuid`.
+    if let Some(uid) = real_uid() {
+        return format!("uid-{uid}");
+    }
+    // pi's second branch: the first non-empty of USERNAME/USER/LOGNAME, in that order.
+    for key in ["USERNAME", "USER", "LOGNAME"] {
+        if let Some(value) = std::env::var_os(key).filter(|v| !v.is_empty()) {
+            return format!("user-{}", sanitize_temp_scope_segment(&value.to_string_lossy()));
+        }
+    }
+    // pi's fourth branch (`os.userInfo()`, its third, has no safe stdlib equivalent):
+    // `env.USERPROFILE ?? env.HOME`.
+    for key in ["USERPROFILE", "HOME"] {
+        if let Some(value) = std::env::var_os(key).filter(|v| !v.is_empty()) {
+            return format!("home-{}", sanitize_temp_scope_segment(&value.to_string_lossy()));
+        }
+    }
+    // pi's last resort, verbatim.
+    "shared".to_string()
+}
+
+/// The calling process's REAL uid (not the effective one), or `None` where it cannot be read
+/// without `unsafe`.
+///
+/// `/proc/self/status`'s `Uid:` line is `Uid:\t<real>\t<effective>\t<saved>\t<fs>`; field 1 is the
+/// real uid, which is what `process.getuid()` returns. Returns `None` on a platform with no procfs
+/// (macOS, the BSDs, Windows), where [`resolve_temp_scope_id`] falls through to pi's own next
+/// branch rather than inventing a constant that would collide across users.
+fn real_uid() -> Option<String> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("Uid:"))?;
+    let real = line.split_whitespace().nth(1)?;
+    if real.bytes().all(|b| b.is_ascii_digit()) {
+        Some(real.to_string())
+    } else {
+        None
+    }
+}
+
+/// The per-user root every subagent run-artifact directory hangs off:
+/// `<os-temp-dir>/cyrup-subagents-<scope>`.
+///
+/// # This is a scratch root in the OS temp dir, NOT the user's home
+///
+/// pi puts all four of its run-scratch roots under `os.tmpdir()`:
+///
+/// ```text
+/// TEMP_ROOT_DIR      = path.join(os.tmpdir(), `pi-subagents-${resolveTempScopeId()}`)
+/// RESULTS_DIR        = path.join(TEMP_ROOT_DIR, "async-subagent-results")
+/// ASYNC_DIR          = path.join(TEMP_ROOT_DIR, "async-subagent-runs")
+/// CHAIN_RUNS_DIR     = path.join(TEMP_ROOT_DIR, "chain-runs")
+/// TEMP_ARTIFACTS_DIR = path.join(TEMP_ROOT_DIR, "artifacts")
+/// ```
+///
+/// (`shared/types.ts:1862-1866` @v0.43.0; byte-identical at the ported baseline —
+/// `shared/types.ts:1097-1101` @v0.33.0 and `:1104-1108` @v0.34.0.)
+///
+/// This port previously resolved `<CYRUP_HOME|HOME>/.cyrup/subagents` instead, which is where the
+/// 59,321-file / 551 MB pile in a developer's real `~/.cyrup/subagents` came from: run scratch that
+/// upstream treats as reboot-disposable was being written into permanent user config, per-`cwd`
+/// keyed, with nothing ever sweeping it. The two doc citations that justified the old layout were
+/// both wrong — `shared/types.ts:958` and `:959` are fields of a run-input interface, not the
+/// `RESULTS_DIR`/`ASYNC_DIR` constants.
+///
+/// `std::env::temp_dir()` is the exact analog of Node's `os.tmpdir()`: both read `TMPDIR` and both
+/// fall back to `/tmp`. That is also the ONLY sandbox seam either side has — pi's `DIRS` are
+/// module-level constants, so upstream scopes tests by passing explicit `asyncDirRoot`/`resultsDir`
+/// options (`async-job-tracker.ts:57`, `async-resume.ts:385`, `fleet-view.ts:326` @v0.43.0) rather
+/// than by moving this root.
+///
+/// # `CYRUP_HOME` is the sandbox seam, and only that
+///
+/// When `CYRUP_HOME` is set the whole tree relocates to `<CYRUP_HOME>/.cyrup/subagents`. That var
+/// is cyrup-original — pi has no `PI_HOME` — so there is no upstream behaviour to diverge from, and
+/// its meaning here is the same as in the crate's five other resolvers: "the root every cyrup path
+/// resolves against". No production code path in this workspace sets it (`grep -rn CYRUP_HOME
+/// crates/*/src` finds only resolvers and docs), so with it unset — its only state outside tests —
+/// this function is pi's `TEMP_ROOT_DIR` exactly.
+///
+/// It earns its place because it is the ONE knob the crate's 19 already-`CYRUP_HOME`-sandboxed
+/// integration tests set: honouring it here is what keeps their `TempDir` isolation covering the
+/// run-scratch tree instead of letting them pile into the shared real temp root. Upstream's own
+/// equivalent is passing explicit `asyncDirRoot`/`resultsDir` options (`async-job-tracker.ts:57`,
+/// `async-resume.ts:385`, `fleet-view.ts:326` @v0.43.0) — pi's `DIRS` are module-level constants
+/// that cannot be re-scoped by env at all.
 ///
 /// `pub(crate)` so the artifacts/chain-runs housekeeping ([`crate::artifacts`]) can scope its own
-/// per-`cwd` roots under the SAME `<home>/.cyrup/subagents` tree the async/results roots use, rather
-/// than re-deriving (and risking drift from) this one resolution.
-pub(crate) fn subagents_home() -> PathBuf {
-    let base = std::env::var_os("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(".cyrup").join("subagents")
+/// per-`cwd` roots under the SAME temp root the async/results roots use, rather than re-deriving
+/// (and risking drift from) this one resolution.
+pub(crate) fn temp_root_dir() -> PathBuf {
+    temp_root_dir_from(&|key| std::env::var(key).ok(), std::env::temp_dir())
+}
+
+/// The pure core of [`temp_root_dir`], with the two ambient inputs — the environment and the OS
+/// temp dir — passed in, so both branches are provable without mutating process-global state.
+/// Follows the crate's existing `native_supervisor::agent_dir_from` convention.
+fn temp_root_dir_from(env: &dyn Fn(&str) -> Option<String>, os_temp_dir: PathBuf) -> PathBuf {
+    if let Some(sandbox) = env("CYRUP_HOME").filter(|v| !v.trim().is_empty()) {
+        return PathBuf::from(sandbox).join(".cyrup").join("subagents");
+    }
+    os_temp_dir.join(format!("cyrup-subagents-{}", resolve_temp_scope_id()))
 }
 
 /// A filesystem-safe key derived from `cwd`, so distinct projects' async/result roots never collide
-/// under the shared per-user `~/.cyrup/subagents` tree.
+/// under the shared per-user [`temp_root_dir`] tree.
 ///
-/// `pub(crate)` for the same reason as [`subagents_home`]: [`crate::artifacts`] keys its
+/// [CYRUP-DELTA] pi's `ASYNC_DIR`/`RESULTS_DIR` are FLAT — every project's runs share one directory
+/// (`shared/types.ts:1863-1864` @v0.43.0), and a run is disambiguated only by its run id. cyrup
+/// interposes this `cwd` key so `resume_tracking`'s `read_dir` over the async root cannot re-adopt
+/// a run belonging to a different checkout.
+///
+/// `pub(crate)` for the same reason as [`temp_root_dir`]: [`crate::artifacts`] keys its
 /// artifacts/chain-runs roots by the identical `cwd_key` so a project's artifacts sit beside its
 /// async/results dirs under one per-`cwd` scope.
 pub(crate) fn cwd_key(cwd: &Path) -> String {
@@ -1249,9 +1413,9 @@ pub(crate) fn cwd_key(cwd: &Path) -> String {
 /// same project scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunArtifactRoots {
-    /// `<home>/.cyrup/subagents/async/<cwd_key>` — passed as `RunPaths::for_run`'s `async_root`.
+    /// `<temp_root_dir>/async/<cwd_key>` — passed as `RunPaths::for_run`'s `async_root`.
     pub async_root: PathBuf,
-    /// `<home>/.cyrup/subagents/results/<cwd_key>` — passed as `RunPaths::for_run`'s `results_dir`.
+    /// `<temp_root_dir>/results/<cwd_key>` — passed as `RunPaths::for_run`'s `results_dir`.
     pub results_dir: PathBuf,
 }
 
@@ -1262,7 +1426,7 @@ pub struct RunArtifactRoots {
 /// [`ensure_accessible_dir`]'s job).
 #[must_use]
 pub fn run_artifact_roots(cwd: &Path) -> RunArtifactRoots {
-    let home = subagents_home();
+    let home = temp_root_dir();
     let key = cwd_key(cwd);
     RunArtifactRoots {
         async_root: home.join(ASYNC_SUBDIR).join(&key),
@@ -1272,7 +1436,7 @@ pub fn run_artifact_roots(cwd: &Path) -> RunArtifactRoots {
 
 /// Reconstruct the SIBLING results-dir for an `async_root` produced by [`run_artifact_roots`],
 /// purely structurally (no `cwd`/env re-read). Given the standard layout
-/// `<home>/.cyrup/subagents/async/<cwd_key>`, returns `<home>/.cyrup/subagents/results/<cwd_key>` —
+/// `<temp_root_dir>/async/<cwd_key>`, returns `<temp_root_dir>/results/<cwd_key>` —
 /// i.e. it swaps the [`ASYNC_SUBDIR`] path segment for [`RESULTS_SUBDIR`] while PRESERVING the
 /// `<cwd_key>` leaf, which is exactly what C7's pre-fix `async_root.parent()/results` derivation got
 /// wrong (it dropped the `<cwd_key>` and nested `results` UNDER `async` instead of beside it).
@@ -2342,11 +2506,79 @@ pub struct RunHistoryEntry {
     pub exit: Option<i32>,
 }
 
-/// The path pi writes run history to (`getAgentDir()/run-history.jsonl`), mapped onto cyrup's
-/// per-user subagents home: `<home>/.cyrup/subagents/run-history.jsonl`.
+/// `getHistoryPath()` (`runs/shared/run-history.ts:23-25` @v0.43.0):
+/// `path.join(getAgentDir(), "run-history.jsonl")`.
+///
+/// Run history is DELIBERATELY not under [`temp_root_dir`]: it is the one thing this module writes
+/// that is meant to outlive a reboot (it is what `--force`/staleness checks and the cost report
+/// read back), so it belongs in the agent dir with the rest of the user's durable state. The
+/// previous `<home>/.cyrup/subagents/run-history.jsonl` was neither — it sat in the run-scratch
+/// tree that this module now correctly treats as disposable.
 #[must_use]
 pub fn run_history_path() -> PathBuf {
-    subagents_home().join("run-history.jsonl")
+    agent_dir().join("run-history.jsonl")
+}
+
+/// The run-history file for a run whose per-run directories hang off `async_root`.
+///
+/// For every run that actually lives in this user's canonical scratch root ([`temp_root_dir`]) —
+/// which is every production run, since `resolve_background_storage_roots` derives its roots from
+/// [`run_artifact_roots`] or from an inherited nested route that is itself under that root — this
+/// is exactly pi's unconditional [`run_history_path`].
+///
+/// [CYRUP-DELTA] a run whose roots were REDIRECTED somewhere else records its history beside those
+/// roots instead of in the real user's agent dir. This is the same principle C7 established for the
+/// results dir: **the runner honours the absolute roots it was handed and never re-derives a path
+/// the orchestrator did not choose.** History was the one write still ignoring that, and the cost
+/// was measurable — a full workspace gate put 136 lines of synthetic test history (`researcher` /
+/// `"do the thing"` / `scout`) into a developer's real `~/.cyrup/agent/run-history.jsonl`, because
+/// in-process `run()` callers hand it a `TempDir` for every path EXCEPT this one.
+#[must_use]
+pub fn run_history_path_for(async_root: &Path) -> PathBuf {
+    if async_root.starts_with(temp_root_dir()) {
+        return run_history_path();
+    }
+    async_root
+        .parent()
+        .unwrap_or(async_root)
+        .join("run-history.jsonl")
+}
+
+/// The user home dir, following this crate's `CYRUP_HOME` → `HOME` → tempdir convention
+/// (`extension.rs::dirs_home`, `exec/mcp_direct_tools.rs:831-836`,
+/// `registration/prompt_workflows.rs:105-110`, `watchdog/settings.rs:743-748`,
+/// `missions/store.rs:592-597` — the same resolver, and none of them may disagree).
+///
+/// Honouring `CYRUP_HOME` FIRST is what makes [`run_history_path`] sandboxable: a test that points
+/// `CYRUP_HOME` at a `TempDir` moves the history file with it. `missions/store.rs` was the one copy
+/// that omitted this check, and that omission alone leaked mission pointers into a real `~/.cyrup`
+/// through 19 correctly-sandboxed tests.
+fn home_dir() -> PathBuf {
+    std::env::var_os("CYRUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// pi `getAgentDir()` (`shared/utils.ts:95-100` @v0.43.0): `$CYRUP_AGENT_DIR`/`$PI_CODING_AGENT_DIR`
+/// with `~` expansion, else `<home>/.cyrup/agent`. Byte-identical to the crate's four other copies
+/// of this same upstream function.
+pub(crate) fn agent_dir() -> PathBuf {
+    let home = home_dir();
+    let configured = std::env::var("CYRUP_AGENT_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("PI_CODING_AGENT_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+        });
+    match configured {
+        Some(v) if v == "~" => home,
+        Some(v) if v.starts_with("~/") => home.join(v.get(2..).unwrap_or("")),
+        Some(v) => PathBuf::from(v),
+        None => home.join(".cyrup").join("agent"),
+    }
 }
 
 /// Append one [`RunHistoryEntry`] per `result` to `run-history.jsonl` (pi's `recordRun`,
@@ -2354,8 +2586,8 @@ pub fn run_history_path() -> PathBuf {
 /// serialization failure is silently swallowed so history recording can never fail a run (pi wraps
 /// the whole thing in a `try {} catch {}` for exactly this reason). `run_started_at` is the run's
 /// epoch-millis start, used to derive each entry's `duration`.
-pub async fn record_run_history(run_started_at: i64, results: &[SingleResult]) {
-    record_run_history_at(&run_history_path(), run_started_at, results).await;
+pub async fn record_run_history(async_root: &Path, run_started_at: i64, results: &[SingleResult]) {
+    record_run_history_at(&run_history_path_for(async_root), run_started_at, results).await;
 }
 
 /// The path-explicit core of [`record_run_history`], so tests can target a private temp path
@@ -3157,6 +3389,167 @@ mod tests {
             a.async_root.parent().and_then(Path::parent),
             b.async_root.parent().and_then(Path::parent),
             "the subagents-home prefix is shared across cwds"
+        );
+    }
+
+    /// pi `TEMP_ROOT_DIR = path.join(os.tmpdir(), `pi-subagents-${resolveTempScopeId()}`)`
+    /// (`shared/types.ts:1862` @v0.43.0, and byte-identical at the ported baseline
+    /// `shared/types.ts:1104` @v0.34.0). Every run-scratch root hangs off the OS TEMP dir.
+    ///
+    /// This port used to resolve `<CYRUP_HOME|HOME>/.cyrup/subagents` instead, and that single
+    /// wrong base is what accumulated 59,321 files / 551 MB of synthetic-run residue
+    /// (`fleetrun0001`, 21,076 `cwd`-keyed dirs) inside a real developer's `~/.cyrup`. The test
+    /// asserts the property that made that possible is gone: the root is under the temp dir, and
+    /// nothing this module derives is under the home dir.
+    #[test]
+    fn temp_root_dir_lives_under_the_os_temp_dir_and_never_under_home() {
+        // Production shape: CYRUP_HOME unset -> `<os-temp>/cyrup-subagents-<scope>`, pi's
+        // `TEMP_ROOT_DIR`. Proven through the pure core so a stray ambient CYRUP_HOME (this crate's
+        // integration tests set one) can never make the assertion vacuous.
+        let os_temp = PathBuf::from("/os-temp");
+        let root = temp_root_dir_from(&|_| None, os_temp.clone());
+        assert!(
+            root.starts_with(&os_temp),
+            "the subagent scratch root must hang off the OS temp dir (pi TEMP_ROOT_DIR), got {root:?}"
+        );
+        let leaf = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("the temp root always has a leaf");
+        assert!(
+            leaf.starts_with("cyrup-subagents-"),
+            "the leaf mirrors pi's `pi-subagents-<scope>` under cyrup's rebrand, got {leaf:?}"
+        );
+        assert!(
+            leaf.len() > "cyrup-subagents-".len(),
+            "the per-user scope segment must be non-empty so two users never share a scratch root"
+        );
+
+        // THE REGRESSION: with no CYRUP_HOME sandbox, nothing this module derives may land under
+        // the real user's `~/.cyrup` — that is where the 59,321-file pile came from.
+        assert!(
+            !root.to_string_lossy().contains(".cyrup"),
+            "production run scratch must never be written into the user's config dir, got {root:?}"
+        );
+        if std::env::var_os("CYRUP_HOME").is_none()
+            && let Some(home) = std::env::var_os("HOME")
+        {
+            let dot_cyrup = PathBuf::from(home).join(".cyrup");
+            let derived = run_artifact_roots(Path::new("/some/project"));
+            for path in [&derived.async_root, &derived.results_dir] {
+                assert!(
+                    !path.starts_with(&dot_cyrup),
+                    "with no CYRUP_HOME sandbox, run scratch must never resolve into the real \
+                     user config dir, got {path:?}"
+                );
+            }
+        }
+
+        // Sandbox shape: CYRUP_HOME wins outright and relocates the whole tree.
+        let sandbox = temp_root_dir_from(
+            &|k| (k == "CYRUP_HOME").then(|| "/sandbox".to_string()),
+            os_temp,
+        );
+        assert_eq!(sandbox, PathBuf::from("/sandbox/.cyrup/subagents"));
+    }
+
+    /// `sanitizeTempScopeSegment` (`shared/types.ts:1807-1812` @v0.43.0):
+    /// `.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown"`.
+    ///
+    /// The `+` quantifier is the load-bearing detail — a RUN of illegal characters collapses to one
+    /// `-`, not one per character — and so is the `|| "unknown"` fallback, without which an
+    /// all-illegal username would produce a bare `cyrup-subagents-` shared by every such user.
+    #[test]
+    fn sanitize_temp_scope_segment_matches_pis_regex_pipeline() {
+        assert_eq!(sanitize_temp_scope_segment("alice"), "alice");
+        assert_eq!(sanitize_temp_scope_segment("  alice  "), "alice");
+        // A run of illegal chars collapses to a SINGLE dash (the `+` quantifier).
+        assert_eq!(sanitize_temp_scope_segment("a///b"), "a-b");
+        assert_eq!(sanitize_temp_scope_segment("a/b"), "a-b");
+        // `. _ -` survive; everything else does not.
+        assert_eq!(sanitize_temp_scope_segment("a.b_c-d"), "a.b_c-d");
+        assert_eq!(
+            sanitize_temp_scope_segment("/home/d o/m"),
+            "home-d-o-m",
+            "leading and trailing dashes are stripped after collapsing"
+        );
+        // Empty after sanitising -> the literal "unknown", never an empty segment.
+        assert_eq!(sanitize_temp_scope_segment("///"), "unknown");
+        assert_eq!(sanitize_temp_scope_segment(""), "unknown");
+        assert_eq!(sanitize_temp_scope_segment("   "), "unknown");
+    }
+
+    /// `resolveTempScopeId` (`shared/types.ts:1814-1857` @v0.43.0) prefers `uid-<n>` wherever
+    /// `process.getuid` exists, which is every Unix. The scope must be stable within a process (two
+    /// calls that disagreed would split a session's runs across two roots) and must never be empty.
+    #[test]
+    fn resolve_temp_scope_id_is_stable_and_non_empty() {
+        let first = resolve_temp_scope_id();
+        assert_eq!(first, resolve_temp_scope_id(), "the scope id must be stable");
+        assert!(!first.is_empty());
+        assert!(
+            !first.contains(std::path::MAIN_SEPARATOR),
+            "the scope id is ONE path segment; a separator would silently deepen the tree: {first}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            first.starts_with("uid-"),
+            "on Linux pi's first branch (`uid-${{getuid()}}`) always wins, got {first}"
+        );
+    }
+
+    /// `getHistoryPath()` (`runs/shared/run-history.ts:23-25` @v0.43.0):
+    /// `path.join(getAgentDir(), "run-history.jsonl")` — the DURABLE agent dir, not the disposable
+    /// temp root. This port had it under `<home>/.cyrup/subagents/`, i.e. inside the run-scratch
+    /// tree, where a temp sweep would have silently discarded the user's run history.
+    #[test]
+    fn run_history_path_is_the_agent_dir_not_the_scratch_root() {
+        let path = run_history_path();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("run-history.jsonl")
+        );
+        assert_eq!(path.parent(), Some(agent_dir().as_path()));
+        assert!(
+            !path.starts_with(temp_root_dir()),
+            "durable run history must not live inside the disposable scratch root: {path:?}"
+        );
+    }
+
+    /// [`run_history_path_for`]: a run in the canonical scratch root records to the agent dir (pi's
+    /// unconditional `getHistoryPath()`); a run whose roots were REDIRECTED records beside those
+    /// roots instead.
+    ///
+    /// The second half is the regression: in-process `run()` callers hand the runner a `TempDir`
+    /// for every path except this one, so re-deriving it wrote 136 lines of synthetic test history
+    /// (`researcher`, `"do the thing"`, `scout`) into a real `~/.cyrup/agent/run-history.jsonl` on
+    /// one full workspace gate.
+    #[test]
+    fn run_history_path_for_follows_a_redirected_run_and_never_the_real_agent_dir() {
+        // Canonical root -> pi's unconditional agent-dir path, unchanged.
+        let canonical = run_artifact_roots(Path::new("/some/project")).async_root;
+        assert_eq!(
+            run_history_path_for(&canonical),
+            run_history_path(),
+            "a run under the canonical scratch root keeps pi's `getAgentDir()/run-history.jsonl`"
+        );
+
+        // Redirected root (what every in-process `run()` test hands over) -> beside those roots.
+        let redirected = Path::new("/some/tempdir/async");
+        assert_eq!(
+            run_history_path_for(redirected),
+            PathBuf::from("/some/tempdir/run-history.jsonl")
+        );
+        assert_ne!(
+            run_history_path_for(redirected),
+            run_history_path(),
+            "a redirected run must NEVER append to the real user's durable run history"
+        );
+
+        // A root with no parent degrades to the root itself rather than panicking.
+        assert_eq!(
+            run_history_path_for(Path::new("/")),
+            PathBuf::from("/run-history.jsonl")
         );
     }
 

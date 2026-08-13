@@ -187,8 +187,13 @@ pub fn render_watchdog_warning(
     out
 }
 
-/// The plain text of a rendered warning, line by line — the assertion surface this crate's sibling
-/// [`crate::tui::render::lines_to_plain_text`] provides for the same reason.
+/// The plain text of a rendered warning, line by line.
+///
+/// Assertion surface only — it has no production caller and no upstream counterpart (`render.ts`
+/// returns styled strings and nothing re-flattens them). It is the sibling of
+/// [`crate::tui::render::lines_to_plain_text`]. Note that a test asserting ONLY through this
+/// function asserts no colour: [`render_watchdog_warning`] carries the severity styling, so a
+/// plain-text assertion cannot catch a repaint regression on its own.
 #[must_use]
 pub fn render_watchdog_warning_plain(
     warning: &WatchdogWarningDetails,

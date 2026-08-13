@@ -91,6 +91,12 @@ pub mod fleet_status;
 /// inspect controls, and `showFleet`'s own open/already-open/no-UI control flow.
 pub mod fleet;
 
+/// The host adapter that makes [`fleet`]'s component LIVE: pi's
+/// `ctx.ui.custom(factory, { overlay: true, … })` (`fleet.ts:869-875`) expressed over cyrup's
+/// [`cyrup_ext::InteractiveOverlay`] seam — keystrokes in, painted lines out, the 750 ms refresh
+/// tick, and async control-op dispatch.
+pub mod fleet_overlay;
+
 // =================================================================================================
 // RunSource (func-SA §4.6's `SubagentRunHandle.source`; shared by every type below)
 // =================================================================================================

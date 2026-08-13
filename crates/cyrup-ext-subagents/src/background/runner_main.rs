@@ -549,6 +549,13 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
 
     // R-SA-075: initial status.json (state=Running, pid=own pid), written BEFORE any step work.
     let mut status = RunStatus::queued(config.run_id.clone(), config.mode, Some(std::process::id()));
+    // pi `...(config.sessionId ? { sessionId: config.sessionId } : {})` (`subagent-runner.ts:2088`):
+    // stamp the ORCHESTRATOR session onto the run's own `status.json`, so a later reader can scope
+    // the async root to one session (`async-status.ts:432`). cyrup's `RunnerConfig` carries no
+    // session id, but the hop-1 spawn already writes the anchor into this process's environment
+    // (`parent_anchor::detached_runner_env_overlay`), which is the same value pi's `ctx
+    // .currentSessionId` is (`async-execution.ts:1042`).
+    status.session_id = crate::background::parent_anchor::resolve_parent_session_anchor();
     status.chain_step_count = Some(config.steps.len());
     status.steps = config
         .steps
@@ -3185,10 +3192,17 @@ async fn finish_run(
     }
 
     // Best-effort run-history recording (pi's `recordRun`, `run-history.ts`): one line per
-    // top-level result appended to `<subagents_home>/run-history.jsonl`. Placed AFTER the
+    // top-level result appended to `<agent_dir>/run-history.jsonl` (pi `getHistoryPath()`,
+    // `runs/shared/run-history.ts:23-25` @v0.43.0 — the DURABLE agent dir, deliberately not the
+    // disposable `temp_root_dir` scratch tree). Placed AFTER the
     // authoritative status/ResultFile writes (and inside the double-invocation guard above, so a
     // no-op re-invocation never double-records) — a history-write failure never affects the run.
-    super::record_run_history(status.started_at, &result_file.results).await;
+    //
+    // The run's OWN async root (`run_dir`'s parent) is handed over rather than re-derived, so a run
+    // whose roots were redirected records its history with them instead of in the real user's agent
+    // dir — see [`super::run_history_path_for`].
+    let async_root = run_paths.run_dir.parent().unwrap_or(&run_paths.run_dir);
+    super::record_run_history(async_root, status.started_at, &result_file.results).await;
 }
 
 #[cfg(test)]

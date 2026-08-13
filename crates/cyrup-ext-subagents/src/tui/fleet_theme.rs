@@ -33,6 +33,7 @@
 //! surface out of reach here), chosen to match the palette `tui/render.rs` already established for
 //! this crate's other renderable output.
 
+use cyrup_ext::{OverlayColor, OverlayLine, OverlaySpan};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -385,8 +386,15 @@ fn tokenize(line: &Line<'static>) -> Vec<(String, ratatui::style::Style, bool)> 
     tokens
 }
 
-/// The plain-text projection of a rendered [`Line`] — what a caller with no terminal (a slash
-/// command's textual output, a test assertion) reads instead of painting spans.
+/// The plain-text projection of a rendered [`Line`] — what a caller with no terminal reads instead
+/// of painting spans.
+///
+/// Assertion surface: no production caller (the textual fleet view is
+/// `SubagentExecutor::control_status_view`, which builds its own strings and never renders
+/// [`Line`]s). **A test that asserts only through this function or [`lines_text`] asserts no
+/// colour at all** — that is how a repaint regression once shipped under a green suite. Pair it
+/// with the `painted_style*` probes below or a direct `Style`/[`Role`] assertion whenever the thing under test
+/// carries one.
 #[must_use]
 pub fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|span| span.content.as_ref()).collect()
@@ -398,6 +406,198 @@ pub fn lines_text(lines: &[Line<'_>]) -> String {
     lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
 }
 
+// =================================================================================================
+// The host-overlay projection (`cyrup_ext::OverlayLine`)
+// =================================================================================================
+
+/// A rendered [`Line`] as the backend-free [`OverlayLine`] the extension-overlay seam carries
+/// ([`cyrup_ext::InteractiveOverlay::render`]).
+///
+/// This is the ONLY lossy-looking step between a fleet frame and a painted terminal cell, and it is
+/// not in fact lossy: every [`Role`] resolves to a [`Color`] plus modifiers, and both cross intact
+/// (`cyrup-tui/src/overlay.rs`'s `to_ratatui_span` is the exact inverse). Style is carried
+/// STRUCTURALLY here rather than flattened to text — which is the whole difference between this and
+/// [`lines_text`], the projection a caller with no terminal uses.
+#[must_use]
+pub fn to_overlay_line(line: &Line<'_>) -> OverlayLine {
+    OverlayLine::new(line.spans.iter().map(to_overlay_span).collect())
+}
+
+/// [`to_overlay_line`] over a whole rendered frame.
+#[must_use]
+pub fn to_overlay_lines(lines: &[Line<'_>]) -> Vec<OverlayLine> {
+    lines.iter().map(to_overlay_line).collect()
+}
+
+/// One rendered [`Span`] as an [`OverlaySpan`], colour and modifiers intact.
+#[must_use]
+pub fn to_overlay_span(span: &Span<'_>) -> OverlaySpan {
+    let m = span.style.add_modifier;
+    OverlaySpan {
+        text: span.content.to_string(),
+        fg: span.style.fg.and_then(to_overlay_color),
+        bg: span.style.bg.and_then(to_overlay_color),
+        bold: m.contains(Modifier::BOLD),
+        dim: m.contains(Modifier::DIM),
+        italic: m.contains(Modifier::ITALIC),
+        underlined: m.contains(Modifier::UNDERLINED),
+        reversed: m.contains(Modifier::REVERSED),
+    }
+}
+
+/// A ratatui [`Color`] as an [`OverlayColor`]. `Color::Reset` maps to `None` — the seam spells "no
+/// colour" as an absent field, so there is exactly one representation of the terminal default.
+#[must_use]
+pub fn to_overlay_color(color: Color) -> Option<OverlayColor> {
+    Some(match color {
+        Color::Reset => return None,
+        Color::Black => OverlayColor::Black,
+        Color::Red => OverlayColor::Red,
+        Color::Green => OverlayColor::Green,
+        Color::Yellow => OverlayColor::Yellow,
+        Color::Blue => OverlayColor::Blue,
+        Color::Magenta => OverlayColor::Magenta,
+        Color::Cyan => OverlayColor::Cyan,
+        Color::Gray => OverlayColor::Gray,
+        Color::DarkGray => OverlayColor::DarkGray,
+        Color::LightRed => OverlayColor::LightRed,
+        Color::LightGreen => OverlayColor::LightGreen,
+        Color::LightYellow => OverlayColor::LightYellow,
+        Color::LightBlue => OverlayColor::LightBlue,
+        Color::LightMagenta => OverlayColor::LightMagenta,
+        Color::LightCyan => OverlayColor::LightCyan,
+        Color::White => OverlayColor::White,
+        Color::Indexed(i) => OverlayColor::Indexed(i),
+        Color::Rgb(r, g, b) => OverlayColor::Rgb(r, g, b),
+    })
+}
+
+// =================================================================================================
+// Painted-cell probes (test support for every FleetView module)
+// =================================================================================================
+
+/// The style of the first cell of the first run of `text` inside a PAINTED grid of `lines`.
+///
+/// Every FleetView module's assertions used to flatten `Vec<Line>` to a string with [`lines_text`]
+/// and match characters. That is blind to the half of this module's job that matters: the same
+/// characters carry different [`Role`]s in different branches, and a mis-coloured frame passes a
+/// text assertion unchanged. (It already shipped one visible bug that way.) These probes paint the
+/// frame into a real `ratatui` backend and read the resulting CELLS, so an assertion can name the
+/// colour a run of text is actually drawn in.
+///
+/// Returns `None` when `text` does not appear in the painted grid at all.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn painted_style_of(
+    lines: &[Line<'static>],
+    width: u16,
+    text: &str,
+) -> Option<ratatui::style::Style> {
+    painted_style_nth_of(lines, width, text, 0)
+}
+
+/// [`painted_style_of`] for the `nth` (0-based) occurrence of `text` in the painted grid, scanned
+/// row by row and left to right.
+///
+/// Needed because a frame legitimately paints the SAME text more than once in different roles —
+/// the fleet inspector prints the selected agent's name in both its header (unstyled) and its
+/// roster row (bold when selected), so an assertion about one of them has to say which.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn painted_style_nth_of(
+    lines: &[Line<'static>],
+    width: u16,
+    text: &str,
+    nth: usize,
+) -> Option<ratatui::style::Style> {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{Paragraph, Widget as _};
+
+    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).max(1);
+    let mut term = cyrup_test_support::tui::TestTerminal::new(width, height);
+    let owned: Vec<Line<'static>> = lines.to_vec();
+    term.draw(move |frame: &mut ratatui::Frame| {
+        let area = Rect::new(0, 0, width, height);
+        Paragraph::new(owned.clone()).render(area, frame.buffer_mut());
+    });
+    let buffer = term.buffer();
+    let mut seen = 0usize;
+    for (row, painted) in cyrup_test_support::tui::buffer_lines(buffer).iter().enumerate() {
+        let mut from = 0usize;
+        while let Some(offset) = painted.get(from..).and_then(|rest| rest.find(text)) {
+            let byte_col = from + offset;
+            if seen == nth {
+                // `find` gives a BYTE offset; cells are indexed by column, so count characters.
+                let col = painted.get(..byte_col).map_or(0, |prefix| prefix.chars().count());
+                let x = u16::try_from(col).unwrap_or(u16::MAX);
+                let y = u16::try_from(row).unwrap_or(u16::MAX);
+                let cell = buffer.cell((x, y))?;
+                return Some(
+                    ratatui::style::Style::default()
+                        .fg(cell.fg)
+                        .bg(cell.bg)
+                        .add_modifier(cell.modifier),
+                );
+            }
+            seen = seen.saturating_add(1);
+            from = byte_col.saturating_add(text.len().max(1));
+        }
+    }
+    None
+}
+
+/// [`painted_style_of`], panicking with the painted grid when `text` is absent — the form an
+/// assertion wants.
+///
+/// `clippy::panic` is allowed per-item rather than by the `mod tests` block's `#![allow]`, because
+/// these probes are `#[cfg(test)]` helpers that live at MODULE level (every FleetView module's test
+/// block reaches them through `super::fleet_theme`), so the block-level opt-out does not cover
+/// them. Panicking IS the contract: a probe that cannot find its anchor must fail the assertion
+/// loudly with the painted grid attached, not return a misleading default.
+#[cfg(test)]
+#[allow(clippy::panic)]
+#[must_use]
+pub(crate) fn painted_style(
+    lines: &[Line<'static>],
+    width: u16,
+    text: &str,
+) -> ratatui::style::Style {
+    painted_style_nth(lines, width, text, 0)
+}
+
+/// [`painted_style_nth_of`], panicking with the painted grid when there is no `nth` occurrence.
+/// See [`painted_style`] for why the lint opt-out is per-item.
+#[cfg(test)]
+#[allow(clippy::panic)]
+#[must_use]
+pub(crate) fn painted_style_nth(
+    lines: &[Line<'static>],
+    width: u16,
+    text: &str,
+    nth: usize,
+) -> ratatui::style::Style {
+    match painted_style_nth_of(lines, width, text, nth) {
+        Some(style) => style,
+        None => panic!(
+            "occurrence {nth} of {text:?} never painted into the grid:\n{}",
+            lines_text(lines)
+        ),
+    }
+}
+
+/// Whether a painted cell's foreground is the one [`Role`] resolves to.
+///
+/// Compares the FOREGROUND and the modifiers a role sets, not the whole `Style`: a painted cell
+/// always reports a concrete background (`Color::Reset` for an unset one) that an unpainted
+/// [`Style`] leaves as `None`, so a whole-struct comparison could never match.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn paints_as(painted: ratatui::style::Style, role: Role) -> bool {
+    let expected = style(role);
+    painted.fg == expected.fg.or(Some(Color::Reset))
+        && painted.add_modifier.contains(expected.add_modifier)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -407,6 +607,103 @@ pub fn lines_text(lines: &[Line<'_>]) -> String {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_painted_probe_reads_the_colour_a_role_actually_draws() {
+        let line = Line::from(vec![raw("head "), fg(Role::Error, "boom")]);
+        let painted = painted_style(std::slice::from_ref(&line), 20, "boom");
+        assert_eq!(painted.fg, Some(Color::Red));
+        assert!(paints_as(painted, Role::Error));
+        // …and it can tell that apart from a role with the same characters but another colour.
+        assert!(!paints_as(painted, Role::Success));
+    }
+
+    #[test]
+    fn the_painted_probe_reports_modifiers_too() {
+        let line = Line::from(vec![fg_bold(Role::Accent, "sel")]);
+        let painted = painted_style(std::slice::from_ref(&line), 10, "sel");
+        assert!(painted.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(painted.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn the_painted_probe_finds_text_on_a_later_row() {
+        let lines = vec![
+            Line::from(vec![raw("first")]),
+            Line::from(vec![raw("  "), fg(Role::Warning, "second")]),
+        ];
+        assert_eq!(painted_style(&lines, 20, "second").fg, Some(Color::Yellow));
+        assert_eq!(painted_style_of(&lines, 20, "absent"), None);
+    }
+
+    #[test]
+    fn every_role_survives_the_overlay_projection_round_trip() {
+        for role in [
+            Role::Accent,
+            Role::Muted,
+            Role::Dim,
+            Role::Success,
+            Role::Warning,
+            Role::Error,
+            Role::Border,
+            Role::BorderMuted,
+            Role::ToolTitle,
+            Role::ToolOutput,
+        ] {
+            let line = Line::from(vec![fg(role, "x")]);
+            let projected = to_overlay_line(&line);
+            let span = &projected.spans[0];
+            let expected = style(role);
+            assert_eq!(
+                span.fg.map(to_ratatui_color_for_test),
+                expected.fg,
+                "{role:?} lost its colour crossing the overlay seam"
+            );
+            assert_eq!(
+                span.bold,
+                expected.add_modifier.contains(Modifier::BOLD),
+                "{role:?} lost bold"
+            );
+            assert_eq!(
+                span.dim,
+                expected.add_modifier.contains(Modifier::DIM),
+                "{role:?} lost dim"
+            );
+        }
+    }
+
+    /// The inverse of [`to_overlay_color`], as `cyrup-tui`'s `to_ratatui_color` implements it — kept
+    /// here so this crate can assert the round trip without depending on `cyrup-tui`.
+    fn to_ratatui_color_for_test(color: OverlayColor) -> Color {
+        match color {
+            OverlayColor::Black => Color::Black,
+            OverlayColor::Red => Color::Red,
+            OverlayColor::Green => Color::Green,
+            OverlayColor::Yellow => Color::Yellow,
+            OverlayColor::Blue => Color::Blue,
+            OverlayColor::Magenta => Color::Magenta,
+            OverlayColor::Cyan => Color::Cyan,
+            OverlayColor::Gray => Color::Gray,
+            OverlayColor::DarkGray => Color::DarkGray,
+            OverlayColor::LightRed => Color::LightRed,
+            OverlayColor::LightGreen => Color::LightGreen,
+            OverlayColor::LightYellow => Color::LightYellow,
+            OverlayColor::LightBlue => Color::LightBlue,
+            OverlayColor::LightMagenta => Color::LightMagenta,
+            OverlayColor::LightCyan => Color::LightCyan,
+            OverlayColor::White => Color::White,
+            OverlayColor::Indexed(i) => Color::Indexed(i),
+            OverlayColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        }
+    }
+
+    #[test]
+    fn an_unstyled_span_projects_to_no_colour_at_all() {
+        let projected = to_overlay_line(&Line::from(vec![raw("plain")]));
+        assert_eq!(projected.spans[0].fg, None);
+        assert_eq!(projected.spans[0].bg, None);
+        assert!(!projected.spans[0].bold);
+    }
 
     #[test]
     fn line_width_sums_span_widths() {

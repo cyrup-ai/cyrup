@@ -1,0 +1,1020 @@
+# 06 — cyrup-ext (the extension host)
+
+This area covers the extension host itself: the event catalog and dispatch reduction (`cyrup-ext/src/{event,dispatch,facade,registry}.rs`), the WIT world and its wasmtime runtime (`cyrup-ext/wit/world.wit`, `cyrup-ext/src/host/`), the native built-in extension path (`cyrup-ext/src/native.rs`), the guest SDK (`cyrup-ext-sdk/`), and the `cyrup-session-svc` and `cyrup-tui` wiring that is the only production consumer of any of it. It is measured against `pi/packages/coding-agent/src/core/extensions/` at the ported baseline **pi v0.83.0** — `types.ts`, `runner.ts`, `loader.ts` — with post-baseline drift measured against **pi v0.84.1**. The standing caveat is that cyrup's WASM Component Model host is a deliberate *mechanism* divergence from pi's jiti/TypeScript loader; the *semantics* of the event, registration and context surfaces are fully in scope.
+
+> **Re-audited 2026-08-12, cyrup HEAD `a9000b1`** (branch `david/cyrup`, working tree clean; last **code** commit `04c1ba2`), upstream **pi v0.83.0** (ported baseline) with the version-lag sweep run against **v0.84.1**.
+>
+> **6 items closed this pass** — EXT-008, EXT-012, EXT-S01, EXT-S02, **EXT-S03**, EXT-S06. That includes both of the area's audited highs (EXT-S01, EXT-S02), so **06 now has no open high inherited from a prior pass**; `00-residual-ledger.md:60`/`:161`/`:256` still list EXT-S02 as open on the strength of `commands.rs:31` typing `SlashCommand::name` as `&'static str`, which is stale — it is `Cow<'static, str>` at `commands.rs:36`.
+>
+> **1 closure reopened in part** — EXT-005. Its closure was conditioned on two `CYRUP-DELTA` provenance notes being written into `crates/cyrup-ext/src/lib.rs`; `grep -n 'CYRUP-DELTA\|scopedModels\|ctx.signal' crates/cyrup-ext/src/lib.rs` returns zero at HEAD and both gaps are still live. Residual filed as **EXT-045**. Four further items are now **partially closed** with named residuals: EXT-006, EXT-028, EXT-033, EXT-S04, EXT-S05.
+>
+> **21 items newly filed** — EXT-037…EXT-057. Four are post-baseline **upstream drift** measured on `v0.83.0..v0.84.1` (EXT-049 `ToolCallEventResult.terminate`, EXT-050 the guarded `api.events` wrapper, EXT-051 `refreshToken(signal)`/`isSubscription`, EXT-052 the `streamSimple` `onPayload`/`onResponse` contract); the evidence re-scoping for EXT-019 and EXT-022 came from the same sweep and is folded into those items rather than filed twice. **One is the area's only open critical** — EXT-054, `ExtensionManifest.capabilities` is parsed and never read by any code path, so cyrup's own documented per-extension WASM sandbox grant model is entirely inert. It was found by walking the crate's own security claims rather than pi's surface, which is exactly the blind spot a pi-anchored item-driven sweep cannot cover.
+>
+> Open now: **1 critical · 0 high · 28 medium · 21 low** (50 items). Treat that as a floor, not a total — see `## Coverage`.
+>
+> ### Repair pass 2026-08-12 (post-critique)
+>
+> Applied after the completeness critique of the twelve finished area files. Three changes, no new
+> items and no renumbering:
+>
+> 1. **EXT-054 raised `high` → `critical`** (critique finding 3). README:106-107 defines `critical` as
+>    "data loss, silent wrong output, **a permission bypass**, or a crash on a normal path", with no
+>    reachability qualifier. The prior rating held it at high on the argument that zero WASM guests
+>    ship today. Re-verified at HEAD before raising: `load_discovered` (`facade.rs:1166-1184`) calls
+>    `self.load_wasm(id.clone(), &bytes, services)` and `load_wasm` (`facade.rs:1063-1070`) takes
+>    `(id, bytes, services)` — the manifest is provably not in the signature, so the declared grant
+>    cannot be applied. That is a permission bypass on the definition as written. The zero-guest
+>    reachability argument is retained **inside the item** as blast-radius context for the planner; it
+>    is not a reason to file the item below its class.
+> 2. **Status rows added for EXT-037…EXT-057** (critique finding 17b). The collapsed
+>    `EXT-037 … EXT-057 | new this pass` row hid twenty-one items from the status table that the
+>    README declares must cover "every item from every prior pass". Each now has its own row.
+> 3. **The sweep axis this pass actually used is now recorded in `## Coverage`**, and the sweep it did
+>    **not** run is recorded as an explicit blind spot (critique finding 12). Area 06's new items came
+>    from walking cyrup's own security and capability claims; that is a legitimate axis, but it was
+>    written up as a happy accident rather than a method, and no enumeration of
+>    `core/extensions/`'s exported surface was performed.
+
+## Status of every item from prior analyses
+
+| ID | Status | Note |
+|---|---|---|
+| EXT-001 | **closed** | Re-derived at HEAD. `EventKind::fails_closed` is `matches!(self, EventKind::ToolCall)` (`event.rs:155-157`); the `Err(e)` arm of `dispatch_block_mutate` reports then returns `Blocked{reason:"Extension failed, blocking execution: …"}` only when `kind.fails_closed()`, else `continue` (`dispatch.rs:248-257`). Upstream asymmetry re-read verbatim: `emitToolCall` has no try/catch while `emitUserBash`/`emitContext` immediately below it both wrap the handler and call `emitError` (`runner.ts` @v0.83.0). Do **not** weaken `fails_closed` to fix EXT-029. |
+| EXT-002 | **closed** | Both `from_agent` fns return `None` for `MessageEnd` (`event.rs:175`, `:437`); sole production emit `cyrup-session-svc/src/subscriber.rs:156`, guarded by a `no_subscribers` check at `:151-154`; same-role guard is the `discriminant` comparison in `emit_message_end` (`facade.rs:571-581`). upstream `MessageEndEventResult.message` "must keep the original message role", `types.ts:1091-1094` @v0.83.0. |
+| EXT-003 | **still open** (medium) | Both halves survive at HEAD. `saved: None` still passed literally (`builder.rs:516`); `remember` branch still a bare `tracing::warn!` (`:501-511`); `pre_trust_extension_verdict` still opens `ExtensionHost::with_wasm(host_config).ok()?` (`:1648`) *before* the native vote loop (`:1652`). |
+| EXT-004 | **closed** | Chain re-walked: `mark/take_tools_dirty` (`registry.rs:266-274`) → `refresh_tools` (`facade.rs:403-408`) → `materialize_guest_tools` (`:413-435`), called by `load_wasm` (`:1102`) and `active_tools` (`:384`). upstream: `registerTool` ends with `runtime.refreshTools()` on every registration (`loader.ts:245-252`). The EXT-030 residual lives inside the same function (`facade.rs:431-433`). |
+| EXT-005 | **partially closed — reopened in part** | WIT half closed and improved: `ctx-state` now carries `get-mode`/`has-ui` (`world.wit:528,531`) beside is-idle/has-pending-messages/is-project-trusted/get-system-prompt (`:533-539`); `control.abort`/`shutdown` ungated (`:568,:572`). But the two `CYRUP-DELTA` notes the closure required were never written, and both gaps are real — `scopedModels` (`types.ts:326`) and `signal` (`:334`) have no WIT counterpart. Residual → **EXT-045**. |
+| EXT-006 | **partially closed — still open** (medium) | Replay half for **custom messages** closed: `replay_session_with_extensions` (`cyrup-tui/src/app.rs:1305-1327`), two production callers (`cyrup/src/main.rs:1685`, `app.rs:6988`). Three residuals remain: display options + theme on `render-call`, the one-shot render at ingest, and replayed **tool** rows → filed separately as **EXT-041**. |
+| EXT-007 | **still open** (medium) | Unchanged. Prompt built at `builder.rs:1062`; `ext_host.active_tools(&base_tools)` still six lines later at `:1068`; `prompt_guidelines: Vec::new()` at `:1054`; `impl Tool for WasmTool` (`host/live.rs:1386-1420`) still has no `prompt_guidelines` override. |
+| EXT-008 | **closed** | `register_tool` rejects a foreign owner and records an `ExtensionConflict` (`registry.rs:217-224`) before the insert; `register_guest_tool` likewise (`:288-295`); `tool_owner_in` (`:238-245`) unifies the executable and descriptor tables. The `tool_renderer_owner.remove` at `:303` is now reachable only for the same owner. upstream first-wins on both sides (`runner.ts:450-471`). Conflict-diagnostic surfacing for **shortcuts** is a separate gap → EXT-039. |
+| EXT-009 | **still open** (medium) | Unchanged. 31 variants ending `AgentSettled = 30` with `COUNT: u8 = 31` (`event.rs:53,:58`); `grep -rn before_provider_headers crates/` returns only the `world.wit` header lines that now *admit* the omission. |
+| EXT-010 | **closed** | `AgentSettled = 30` (`event.rs:53`), `on-agent-settled: func();` (`world.wit:218`), dispatch precedes the session fan-out (`subscriber.rs:226` then `:228`), run-tail synthesis (`session.rs:751-757`). `diff` of the two `world.wit` copies is empty. upstream subscribed at `types.ts:1217`. |
+| EXT-011 | **still open** (medium) | **Corrected**: the auditor implied nothing exists. cyrup already *emits* `AgentSessionEvent::SessionInfoChanged` (asserted at `cyrup-session-svc/tests/round8_postrun.rs:240-257`); the gap is purely extension-host routing, so effort drops M → S. |
+| EXT-012 | **closed** | `register-entry-renderer` (`world.wit:290`), host import (`host/live.rs:137-142`), first-wins `entry_renderer_owner` table (`registry.rs:192`, `:353-361`, `:364-366`), `render_entry` + three-state `RenderOutcome` (`facade.rs:808-813`, `:1381-1394`), native `InitApi::register_entry_renderer` (`native.rs:295-297`), TUI consumer (`app.rs:4376`), test `tests/entry_renderer.rs`. upstream `registerEntryRenderer` `types.ts:1279` @v0.83.0 (the auditor's `:1291` is the v0.84.1 line). Replay of custom **entries** is still unwired → EXT-041. |
+| EXT-013 | **still open** (medium) | Unchanged. `command_completions` (`facade.rs:1207-1214`) has one caller, `tests/discover_load.rs:100`; `argument_completions` (`host/live.rs:1178-1195`) one non-SDK caller, `tests/wasm_component.rs:169`. Now sharper: since EXT-S02 closed, the TUI *does* list extension commands but hardcodes `has_arg_completion: false` (`cyrup-tui/src/commands.rs:348`). |
+| EXT-014 | **still open** (medium) | Unchanged, and understated: `ToolExecutionUpdateEvent` carries `args` as well as `toolName` (`types.ts:769-775`), so cyrup drops **two** fields there, not one. |
+| EXT-015 | **still open** (medium) | Unchanged; all four upstream refs re-counted exact at v0.83.0 (`types.ts:562`, `:578`, `:585`, `:616`). cyrup also drops `reason` from `session_before_switch`. |
+| EXT-016 | **still open** (low) | Unchanged. `ResourcesDiscover` still payload-less (`event.rs:309`); `grep -n cwd crates/cyrup-ext/wit/world.wit` still returns only the `on-user-bash` param and `proc.spawn`. Degrades to nice-to-have once EXT-044 lands. |
+| EXT-017 | **still open** (medium) | Unchanged in code, **worse in consequence**: since EXT-S02 closed, `command_descriptions`' unordered `HashMap` walk (`registry.rs:662-669`) feeds `slash_command_catalog` (`session.rs:2277,:2281`) which feeds the interactive `/` menu (`app.rs:4103,:6340,:6937`). `resolved_commands`/`resolved_command_owner` remain production-dead. |
+| EXT-018 | **still open** (medium) | Unchanged. `bus` still `#[cfg(feature = "wasm-host")]` (`facade.rs:137-138`); `grep -c bus crates/cyrup-ext/src/native.rs` = 0. upstream ref corrected to `loader.ts:389` @v0.83.0 (it becomes a guarded wrapper at v0.84.1 → EXT-050). |
+| EXT-019 | **still open** (low) | Still zero hits at HEAD. **Re-scoped to v0.84.1**: upstream now has `MarkdownTransformContext {messageType, isStreaming, availableWidth}`, `registerMarkdownTransformer`, `markdownTransformer?` on `Extension`, and `ExtensionRunner.getMarkdownTransformers()`. Port the v0.84.1 shape, not the v0.83.0 one. |
+| EXT-020 | **closed** | `usage` on `HostEvent::ToolResult` (`event.rs:271-274`), `on-tool-result(…, usage-json: option<string>)` (`world.wit:180`), `EventPatch::ToolResult` (`contract.rs:36-41`). EXT-028's live-coverage residual also closed by `tests/wasm_tool_result_usage.rs` (117 lines). |
+| EXT-021 | **still open** (medium) | Unchanged; all eight upstream cites re-verified line-exactly at v0.83.0. A **ninth** partial found: `setWorkingMessage(message?)` (`types.ts:151`) is only half-covered by `working-start(label)`. `setWidget`'s dropped key/placement is filed separately as **EXT-047**. |
+| EXT-022 | **still open** (low) | Unchanged in cyrup. **Contract changed upstream**: `refreshModels?` moved `types.ts:1448` @v0.83.0 → `:1469` @v0.84.1 and its doc now says `Use context.publish({ persist: entry })` where it said `context.store`. Re-scope the fix. |
+| EXT-023 | **still open** (medium) | Unchanged. The string `prepare` does not occur in `world.wit` at all; `tool-descriptor` has 8 fields; `WasmTool` has no override so the identity default at `cyrup-core/src/tool.rs:134` stands; the SDK still accepts `prepare_arguments` (`descriptor.rs:47-49`) and `lower_tool_descriptor` copies 8 of 10 fields. |
+| EXT-024 | **still open** (medium) | Unchanged. **Evidence correction**: the auditor's `grep 'constrained_sampling'` = 0 is false — `cyrup-provider/src/api/bedrock_converse_stream.rs:44` matches, but the hit is a comment reading "cyrup's `ToolDef` has no such field", which confirms rather than refutes. `ToolRenderKind` still has zero consumers. |
+| EXT-025 | **still open** (low) | Unchanged; per-symbol greps re-run. Drift confirmed on both sides — the live production input path is the inline `AgentSession::emit_input_event` (`session.rs:907`, called from `:872`), and the live `emit_user_bash_event` (`session.rs:4590-4614`) threads `exclude_from_context` and the **session** cwd while the facade copy hardcodes `false` and the **process** cwd (`facade.rs:617-627`). |
+| EXT-026 | **still open** (low) | Unchanged; the never-compiled `not(wasm-host)` arms have multiplied (`facade.rs:441-443`, `:899-908`, `:1261-1264`). Static only — no `cargo check --no-default-features` was run this pass either. |
+| EXT-027 | **still open** (low) | Unchanged; no bundled-extension tier exists. upstream kept moving (`llama/index.ts` +11, `llama/provider.ts` +28 over `v0.83.0..v0.84.1`). |
+| EXT-028 | **partially closed — still open** (low) | All four filed halves are genuinely closed: `HOST_WORLD = "cyrup:ext@0.4"` with the restated "added, removed, or **re-signed**" rule and a bump history naming `f777e44` (`manifest.rs:41-69`); `package cyrup:ext@0.4.0;` in both byte-identical copies (`world.wit:18`); two tie tests (`tests/wit_world_sync.rs:71-89`, `:96-129`); a compile-time `ABI_FINGERPRINT` folded into `cache_key` (`build.rs`, `build/abi.rs`, `build/mod.rs:31-33,:60-66`, pinned at `wit_world_sync.rs:135-160`). **Residual**: the file's own version marker rotted through two bumps — see the item below. |
+| EXT-029 | **still open** (medium) | Unchanged, and **worse in practice**: since EXT-S03 closed, the spurious `onError` is now rendered into the interactive transcript as `Extension "<id>" error: cancelled` (`app.rs:3161-3165`, drained at `:6807`). |
+| EXT-030 | **still open** (medium) | Unchanged; re-arm at `facade.rs:419-424`, wholesale clear at `:431-433`, `take_tools_dirty` a `swap(false, AcqRel)` (`registry.rs:272-274`), and `load_wasm` calls the materializer directly (`facade.rs:1102`) so the clear runs on every load. |
+| EXT-031 | **still open** (medium) | Unchanged. `prepare_next_turn` still sets only `update.tools` (`cyrup-session-svc/src/hooks.rs:179`) with the divergence rationale at `:158-160`. A documented divergence is still a gap — there is no accepted-divergence category. |
+| EXT-032 | **still open** (low) | Unchanged; the uncontrollable bound survives verbatim at `tests/native_dispatch.rs:877` and is strictly redundant with the deterministic outcome assertion at `:878-884`. |
+| EXT-033 | **partially closed — still open** (medium) | FILE half closed: `discover` branches on `is_component_file` first (`loader.rs:124-130`, `:155-157`, `push_file` `:193-221`), new coverage `tests/loader_direct_file.rs`. DIAGNOSTIC half open: a path that exists but is neither dir nor `.wasm`, and a nonexistent path, both fall into `scan_dir`'s silent `let Ok(rd) = read_dir(dir) else { return };` (`loader.rs:169`). |
+| EXT-034 | **still open** (medium) | Unchanged; `deliver_bus_events` still has exactly two production call sites, both command-tier (`facade.rs:1201`, `:1255`). A newly-found second defect in the same function (silent drop at the round bound, and a faulting listener that never reaches the `onError` channel) is filed as **EXT-057**. |
+| EXT-035 | **still open** (medium) | Unchanged in kind, **worse in ratio**: `InitApi` gained exactly one surface (`register_entry_renderer`, `native.rs:295-297`) while `interface registration` now offers **eleven** verbs plus `subscribe`, so a native reaches 5 of 11. `run_shortcut` still resolves owners out of `self.live` only and is still cfg-gated. |
+| EXT-036 | **still open** (low) | **Corrected**: the auditor declared the `world.wit` half closed; it is not. Four stale sites survive, two of them inside the header the count test *does* guard. Rewritten below. |
+| EXT-S01 | **closed** | The native load loop contains each failure per-extension — `if let Err(e) = host.load_native_with_services(...)` collects an `ExtensionLoadDiagnostic{path: id, error, fatal: true}` and continues (`builder.rs:775-786`), with the rationale at `:761-774` correctly noting the bin still exits 1, so a fail-closed permission gate does **not** become a fail-open session. `release_id` (`facade.rs:1345-1349`, called `:251-253`) stops a failed native poisoning `loaded_ids()`. upstream `loader.ts:414-440`, `:481-500`. |
+| EXT-S02 | **closed** | `SlashCommand::name` is `Cow<'static, str>` (`cyrup-tui/src/commands.rs:36`); `dynamic_commands_from_catalog_gated` (`:308-350`) maps catalog rows to `CommandSource::{Extension,Prompt,Skill}` honouring `enableSkillCommands`; `CommandRegistry::with_dynamic` (`:167-178`) merges behind the builtins; installed at `app.rs:4103`, `:6340`, `:6937`. upstream `interactive-mode.ts:601-628`, skill gate `:610`. Three behaviours inside this seam remain open separately: EXT-017, EXT-013, EXT-053. |
+| EXT-S03 | **closed** | `App::install_error_listener` (`app.rs:3140-3149`) forwards contained `ExtensionError`s onto an unbounded channel, drained at `:6807` into `show_extension_error` (`:3161-3165`), installed at boot (`:6328`) and re-installed on session swap (`:6927`). upstream copy is byte-identical (`interactive-mode.ts:2545-2546`, bound at `:1701`). Documented residual: cyrup's `ExtensionError` has no `stack`, so pi's dimmed stack line is absent (stated at `app.rs:3155-3158`). |
+| EXT-S04 | **partially closed — still open** (low) | `customInstructions` ported end to end (`world.wit:558`, `host/live.rs:829`, SDK `ctx.rs:1087-1090`, consumer `session.rs:2862`); this is why `HOST_WORLD` moved 0.3→0.4. The callback substitution is incomplete — see the item below. |
+| EXT-S05 | **partially closed** | `mode` + `hasUI` closed (`world.wit:528,531`, `ext-mode` enum `:25`, copied from the same `HostConfig` the native path uses at `facade.rs:1081`, coverage `tests/guest_host_mode.rs`). The third member of the same upstream sentence — `cwd` (`types.ts:315`) — is still absent; residual → **EXT-044**. |
+| EXT-S06 | **closed** | `scan_dir` handles the direct-file rule (`loader.rs:172-180`), entries sorted for determinism (`:171`), `push_file` de-dupes on the canonicalized **artifact** path (`:199-201`), and `is_component_file` uses `is_file()` which follows symlinks, matching pi's `entry.isFile() || entry.isSymbolicLink()` (stated at `loader.rs:152-154`). upstream `discoverExtensionsInDir` rule 1. |
+| EXT-037 | **new this pass** — open (low) | `ext-tools.get-commands` returns bare extension command names only. Severity lowered medium → low against the auditor: guest-only introspection API, zero shipping guests. EXT-017 is the same defect on the user-visible path and carries the medium. |
+| EXT-038 | **new this pass** — open (medium) | `ext-tools.get-all-tools` returns only extension tools and drops `promptGuidelines` + `sourceInfo`. The `promptGuidelines` half is blocked on the same `Tool::prompt_guidelines` signature change as EXT-007. |
+| EXT-039 | **new this pass** — open (medium) | Extension shortcuts bypass the reserved-keybinding refusal, emit no conflict diagnostics, and lose to built-ins. Precedence half is inferred, not read — see `## Coverage` §Inferred. Read side is TUI-N05 in area 07. |
+| EXT-040 | **new this pass** — open (low) | `register-shortcut`'s description is discarded, so `/hotkeys` shows a raw key-id. |
+| EXT-041 | **new this pass** — open (medium) | Replayed tool calls and results lose their extension renderer. Split out of EXT-006's third residual so the custom-message replay closure is not re-opened. |
+| EXT-042 | **new this pass** — open (low) | `model_select` buries `previousModel`/`source` in the blob; `thinking_level_select` drops `previousLevel`. |
+| EXT-043 | **new this pass** — open (medium) | The `project_trust` event carries no `cwd`, so the deciding extension cannot key its verdict. Pairs with EXT-003's `remember` persistence. |
+| EXT-044 | **new this pass** — open (medium) | `ctx.cwd` is unreachable from a WASM guest. The cheap partial that covers the cwd half of EXT-016 and EXT-043 at once, with no `HOST_WORLD` bump. |
+| EXT-045 | **new this pass** — open (low) | `ctx.scopedModels` and `ctx.signal` are unreachable, and EXT-005's two required `CYRUP-DELTA` notes were never written. This is EXT-005's reopened residual. |
+| EXT-046 | **new this pass** — open (low) | `session.set-label` cannot clear a label. |
+| EXT-047 | **new this pass** — open (medium) | `ui.set-widget` drops pi's widget key and placement. Read side is TUI-014 (area 07); the RPC split is area 08. |
+| EXT-048 | **new this pass** — open (low) | The dialog timeout key is `timeoutMs`; pi's field is `timeout`, and the in-tree citations for it are wrong. |
+| EXT-049 | **new this pass** — open (medium) | `ToolCallEventResult.terminate` is unrepresentable. Post-baseline drift, measured on `v0.83.0..v0.84.1`. |
+| EXT-050 | **new this pass** — open (low) | `pi.events` gained stale-context guarding and tracked unsubscribe; cyrup's bus has neither. Post-baseline drift. One function with EXT-018, EXT-034 and EXT-057. |
+| EXT-051 | **new this pass** — open (low) | Extension provider OAuth drifted: `refreshToken` gained a signal, `oauth` gained `isSubscription`. Auditor's "grep returns nothing" evidence was **corrected** — the transport exists; the typed field and a consumer do not. |
+| EXT-052 | **new this pass** — open (medium) | An extension-supplied `streamSimple` provider fires neither `before_provider_request` nor `after_provider_response`. Post-baseline drift; the reduction reuses area 01's existing path. |
+| EXT-053 | **new this pass** — open (low) | An extension command shadowing a built-in is dropped from autocomplete with no diagnostic. Surfaced by EXT-S02's closure. |
+| EXT-054 | **new this pass** — open (**critical**, raised from high in the repair pass) | `ExtensionManifest.capabilities` is parsed and never read by any code path — the declared per-extension WASM sandbox grant model is entirely inert. Re-verified at HEAD: `load_wasm` (`facade.rs:1063-1070`) never receives the manifest `load_discovered` (`:1166-1184`) holds. Permission bypass per README:106-107. |
+| EXT-055 | **new this pass** — open (medium) | `FsCaps::with_fs_root` has zero callers, so `ext-fs` is permanently denied for every guest. Fail-closed, and the mirror of EXT-054 — same root cause, opposite failure direction. Fix in the same change. |
+| EXT-056 | **new this pass** — open (low) | `register_tool_renderer` is last-wins while every sibling registration table is first-wins. |
+| EXT-057 | **new this pass** — open (low) | `deliver_bus_events` silently drops queued events at the round bound, and a faulting listener never reaches the `onError` channel. Found inside EXT-034's function. |
+
+## Open items
+
+> Both the original items and the `-S` surface-sweep items are now in **one** table. The
+> 2026-08-03 split (which is how `SEAM-S01` escaped a full pass) is gone; do not re-split it.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| EXT-054 | **critical** | cyrup-original | M | `ExtensionManifest.capabilities` is never read — the declared per-extension WASM sandbox grant model is entirely inert — **observed 2026-08-13** |
+| EXT-058 | medium | cyrup-original | S | Guest WASM `http-client` is not gated by `--offline` — a guest reaches the network on a host launched offline — **new, observed 2026-08-13** |
+| EXT-003 | medium | not-ported | M | Project-trust store is unwired at the extension seam |
+| EXT-006 | medium | parity-bug | L | Renderers run without display options or theme, and only once |
+| EXT-007 | medium | parity-bug | M | The first system prompt is built from built-ins only; guest promptGuidelines are dropped |
+| EXT-009 | medium | not-ported | M | before_provider_headers event is missing entirely |
+| EXT-011 | medium | not-ported | S | session_info_changed is emitted internally but never crosses the extension boundary |
+| EXT-013 | medium | parity-bug | M | Slash-command argument completions and autocomplete providers are dead |
+| EXT-014 | medium | parity-bug | M | tool_execution_update / tool_execution_end drop toolName (and args) |
+| EXT-015 | medium | parity-bug | M | Session-lifecycle events lose their discriminating fields at the extension boundary |
+| EXT-017 | medium | parity-bug | S | Command listing is non-deterministic, drops name:N, and a colliding command is unexecutable |
+| EXT-018 | medium | parity-bug | M | The inter-extension event bus is wasm-only — natives have no pi.events |
+| EXT-021 | medium | not-ported | L | ctx.ui capabilities with no WIT representation (at least eight) |
+| EXT-023 | medium | parity-bug | M | prepareArguments is unreachable for WASM guest tools, and the SDK drops the field silently |
+| EXT-024 | medium | parity-bug | M | renderShell/constrainedSampling unexpressible, and render_kind has zero consumers |
+| EXT-029 | medium | parity-bug | S | An abort landing during a gated tool-call dispatch reports as an extension failure |
+| EXT-030 | medium | parity-bug | S | materialize_guest_tools unconditionally clears the tools-dirty flag, swallowing its own re-arm |
+| EXT-031 | medium | parity-bug | L | Turn-boundary refresh propagates tools but not the rebuilt system prompt |
+| EXT-033 | medium | parity-bug | S | A configured extension path that is unloadable or nonexistent produces no diagnostic |
+| EXT-034 | medium | parity-bug | M | Bus events emitted from an event handler are never delivered |
+| EXT-035 | medium | parity-bug | M | NativeExtension can register only 5 of the 11 WIT registration surfaces |
+| EXT-038 | medium | parity-bug | S | ext-tools.get-all-tools returns only extension tools and drops promptGuidelines and sourceInfo |
+| EXT-039 | medium | not-ported | M | Extension shortcuts bypass the reserved-keybinding refusal, emit no conflict diagnostics, and lose to built-ins |
+| EXT-041 | medium | parity-bug | M | Replayed tool calls and results lose their extension renderer |
+| EXT-043 | medium | parity-bug | S | The project_trust event carries no cwd |
+| EXT-044 | medium | not-ported | S | ctx.cwd is unreachable from a WASM guest |
+| EXT-047 | medium | parity-bug | M | ui.set-widget drops pi's widget key and placement |
+| EXT-049 | medium | upstream-drift | S | ToolCallEventResult.terminate is unrepresentable |
+| EXT-052 | medium | not-ported | M | An extension-supplied streamSimple provider fires neither before_provider_request nor after_provider_response |
+| EXT-055 | medium | cyrup-original | S | FsCaps::with_fs_root has zero callers, so ext-fs is permanently denied for every guest |
+| EXT-016 | low | parity-bug | S | resources_discover carries neither cwd nor reason |
+| EXT-019 | low | not-ported | M | registerMarkdownTransformer has no counterpart (re-scoped to v0.84.1) |
+| EXT-022 | low | not-ported | M | ProviderConfig.refreshModels is not represented (re-scoped to the publish/persist contract) |
+| EXT-025 | low | cyrup-original | S | reload() and four emit_* facade methods are dead code that has drifted |
+| EXT-026 | low | cyrup-original | M | A wasmtime-free cyrup-session-svc build cannot be produced |
+| EXT-027 | low | not-ported | L | pi's bundled llama.cpp router extension has no counterpart |
+| EXT-028 | low | stale-port | S | Both world.wit copies still declare `cyrup:ext@0.3.0` on line 1 while the package line is 0.4.0 |
+| EXT-032 | low | test-defect | S | p3_no_human_wait_is_still_budget_contained asserts an uncontrollable wall-clock bound |
+| EXT-036 | low | stale-port | S | The event-catalog provenance comments are stale in four places and contradict each other |
+| EXT-037 | low | parity-bug | S | ext-tools.get-commands returns bare extension command names only |
+| EXT-040 | low | parity-bug | S | register-shortcut's description is discarded, so /hotkeys shows a raw key-id |
+| EXT-042 | low | parity-bug | S | model_select buries previousModel/source, and thinking_level_select drops previousLevel |
+| EXT-045 | low | not-ported | S | ctx.scopedModels and ctx.signal are unreachable, and EXT-005's CYRUP-DELTA notes were never written |
+| EXT-046 | low | parity-bug | S | session.set-label cannot clear a label |
+| EXT-048 | low | parity-bug | S | The dialog timeout key is `timeoutMs`; pi's field is `timeout`, and the in-tree citations are wrong |
+| EXT-050 | low | upstream-drift | M | pi.events gained stale-context guarding and tracked unsubscribe; cyrup's bus has neither |
+| EXT-051 | low | upstream-drift | S | Extension provider OAuth drifted: refreshToken gained a signal, oauth gained isSubscription |
+| EXT-053 | low | parity-bug | S | An extension command shadowing a built-in is dropped from autocomplete with no diagnostic |
+| EXT-056 | low | parity-bug | S | register_tool_renderer is last-wins while every sibling table is first-wins |
+| EXT-057 | low | parity-bug | S | deliver_bus_events silently drops queued events at the round bound, and listener faults never surface |
+| EXT-N01 | high | test-defect | S | The proc-cap buffer test asserted a byte-exact cap the pump never held — scheduling-dependent red — **fixed this pass** |
+| EXT-S04 | low | not-ported | M | ctx.compact's onError path has no observable counterpart |
+
+## EXT-054 — `ExtensionManifest.capabilities` is never read by any code path — the declared per-extension WASM sandbox grant model is entirely inert
+
+**Kind** cyrup-original · **Severity** critical · **Effort** M · **Confidence** **confirmed — the mis-grant reproduced end to end with a real WASM guest** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13, and the result is stronger than this item claims.** `wasm32-wasip2` was
+> already installed; `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` finished in **0.10 s** and
+> produced a 4.1 MB component. A guest whose `extension.json` declared
+> `{"fs": [], "exec": false, "net": false, "ui": false}` — every bit off, the strictest declaration
+> the schema can express — was loaded via `-e <dir>` and got the **full host surface**:
+>
+> * `/execdemo` ran `echo hi` as a real host process and printed `exec stdout: hi`.
+> * `/httpdemo https://api.together.xyz/v1/models` opened a real TLS connection and returned a live
+>   `401 Missing API key` from Together's server.
+> * Both results were surfaced through `ctx.ui().notify()`, so the `ui` bit is inert too.
+>
+> The consumer-side grep was re-run at HEAD and is unchanged: producers only, no consumer.
+>
+> **Two corrections to the Impact below.** (1) *"Blast radius today: zero WASM guests ship … so
+> nothing is currently mis-granted"* **overstates the safety margin**. The SDK's own reference guest
+> (`crates/cyrup-ext-sdk/src/example.rs`) is a complete, loadable component that ships `/execdemo`
+> and `/httpdemo` as ready-made proofs, the target builds it in under a second, and `-e <dir>` loads
+> it pre-trusted — the mis-grant is reproducible **today, with no third-party code**. Read that
+> sentence as "no third-party guest ships, but the in-tree SDK example is a loadable guest that
+> demonstrates the mis-grant end to end." (2) **`--offline` does not gate the guest `http-client`
+> import either** — the `net` bypass above was measured with `--offline` set on the host, so neither
+> the manifest grant nor the offline flag stands between an installed guest and the network. Filed
+> separately as **EXT-058**; the Verify block should add the offline case.
+
+> **Raised `high` → `critical` in the 2026-08-12 repair pass.** README:106-107 defines `critical` as
+> "data loss, silent wrong output, **a permission bypass**, or a crash on a normal path" and attaches
+> no reachability qualifier. The signature evidence was re-verified at HEAD before raising:
+> `load_discovered` (`facade.rs:1166-1184`) has the manifest in hand and calls
+> `self.load_wasm(id.clone(), &bytes, services)`; `load_wasm`'s signature (`facade.rs:1063-1070`) is
+> `(id, bytes, services)` — the manifest provably cannot reach instantiation. The zero-shipping-guest
+> argument that previously held this at high is real and is retained below as **blast radius**, but
+> blast radius today is not the class of the defect: the grant model is the control a reviewer reads
+> to decide an extension is safe to install, and it is inert.
+
+**cyrup** — `grep -rn capabilities crates/cyrup-ext/src --include='*.rs'` at HEAD returns only *producers* and prose: the struct field (`crates/cyrup-ext/src/manifest.rs:20`), the `Capabilities { fs: Vec<String>, exec: bool, net: bool, ui: bool }` definition (`:23-35`), two `capabilities: Default::default()` synthesis sites in the loader (`crates/cyrup-ext/src/loader.rs:213`, `:259`), and doc comments. **There is no consumer anywhere.** `ExtensionHost::load_discovered` (`crates/cyrup-ext/src/facade.rs:1166-1182`) reads `disc.manifest.check_world(HOST_WORLD)?` and `disc.is_trusted(project_trusted)` and then calls `self.load_wasm(id.clone(), &bytes, services)`; `load_wasm` (`facade.rs:1063-1103`) takes only `(id, bytes, services)` and never sees the manifest, so the capability declaration is dropped on the floor at the one place it could be applied. `capabilities.{exec,net,ui}` therefore narrow nothing: a guest whose `extension.json` declares `{"exec": false, "net": false, "ui": false}` still reaches `exec.run`, `http-client`, `proc` and every `ui.*` import, gated solely by the coarse load-time trust check `origin.is_pre_trust() || project_trusted` (`crates/cyrup-ext/src/loader.rs:56-59`). This contradicts the crate's own documented control in three places: `manifest.rs:2` ("Declares the capabilities a guest requests (granted subject to trust, arch-07/12)"), `crates/cyrup-ext/src/host/store_state.rs:1-3` and `:20-22` ("capability-scoped — NO ambient fs/net unless granted, R-ARCH-EXT-011" / "only explicitly preopened dirs (granted via the manifest, arch-12) are visible"), and ADR-0002.
+
+**upstream** — none, and that is the point: pi has no capability model at all (every TypeScript extension runs with the whole process's authority, `pi/packages/coding-agent/src/core/extensions/loader.ts` @v0.83.0). This is a divergence from **cyrup's own** security design rather than a pi parity gap, which is precisely why a pi-anchored, item-driven sweep cannot see it (README structural blind spot 1).
+
+**Impact** — the sandbox cyrup advertises does not exist. Every loaded WASM guest gets the full host surface regardless of what it declared, and the declaration is the thing a reviewer would read to decide whether an extension is safe to install. The trust gate that *is* enforced is all-or-nothing and directory-scoped, so "trusted enough to run" silently means "trusted with process execution, network and the filesystem". **Blast radius today (corrected 2026-08-13 from a live run):** no *third-party* guest ships, **but the in-tree SDK example is itself a loadable guest that demonstrates the mis-grant end to end** — `crates/cyrup-ext-sdk/src/example.rs` ships `/execdemo` and `/httpdemo`, `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` produces the component in 0.10 s, and `-e <dir>` loads it pre-trusted. Measured: an all-false manifest still reached a real host process and a real TLS round trip. `wasm-host` is default-on and `load_discovered` is a live path, so the first installed guest is mis-granted on arrival and the mis-grant is invisible because the manifest says otherwise. Schedule it **before** the first third-party component, not after. **`--offline` is not a second line of defence** — the `net` bypass reproduces with `--offline` set on the host (**EXT-058**).
+
+**Fix** — thread the manifest into instantiation: change `load_wasm` (`facade.rs:1063-1103`) to take `&ExtensionManifest` (or a resolved `Capabilities`) and have `load_discovered` (`facade.rs:1166-1182`) pass `disc.manifest`. In `GuestState` construction (`crates/cyrup-ext/src/host/services.rs:1181` region) seed `ProcCaps`/`HttpCaps`/`FsCaps` from the grant rather than from `Default`, and make the `exec`/`net`/`ui` host imports in `crates/cyrup-ext/src/host/live.rs` return a typed denial when the corresponding bit is false. The `fs` grant strings (`manifest.rs:26-28`, e.g. `"read:."`, `"write:.cyrup/todo"`) need a parser and must feed `FsCaps::with_fs_root` — which is EXT-055 and should be done in the same change. Deny-by-default: an absent `capabilities` block grants nothing, and the loader's two `Default::default()` synthesis sites (`loader.rs:213`, `:259`) must therefore stay the empty grant, not a permissive one.
+
+**Verify** — load two fixture components in one process, one declaring `{"exec": true}` and one declaring `{"exec": false}`; assert the first's `exec.run` succeeds and the second's returns a capability-denied error rather than running. Repeat for `net` against `http-client` and for a `fs` grant that permits one directory and refuses its sibling. **Added 2026-08-13:** include the `--offline` case — a guest declaring `{"net": false}` on a host launched `--offline` must not reach the network, which today it does (**EXT-058**). The regression fixture already exists: build `cyrup-ext-sdk` for `wasm32-wasip2` and load it with `-e`. Add to `crates/cyrup-ext/tests/wasm_component.rs` and a new `tests/manifest_capabilities.rs`.
+
+## EXT-003 — Project-trust store is unwired at the extension seam
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — the vote is live (`pre_trust_extension_verdict`, `crates/cyrup-session-svc/src/builder.rs:1640-1671`) and its verdict is fed to `decide_trust_with_extension`, but the store is absent: `builder.rs:516` still passes `saved: None` literally, and the `remember` branch at `:501-511` is still a bare `tracing::warn!` whose own text admits "no trust store is wired into the session builder". Second half unchanged: `pre_trust_extension_verdict` opens with `let host = ExtensionHost::with_wasm(host_config).ok()?;` at `:1648`, *before* the native vote loop at `:1652`, so a wasm-runtime construction failure returns `None` and discards every native vote.
+
+**upstream** — `pi/packages/coding-agent/src/core/project-trust.ts:63-65` persists (`options.trustStore.set(options.cwd, trusted)` guarded by `result.remember === true`) and `:71-74` reads back (`const decision = options.trustStore.get(options.cwd); if (decision !== null) return decision;`) @v0.83.0.
+
+**Impact** — a directory the user already trusted re-prompts on every launch; "remember" is accepted and discarded. Fail-closed (a re-prompt, not a bypass), which is why this is medium. The `with_wasm` ordering compounds it: on a machine where the wasm runtime cannot be constructed, the native trust deciders silently do not vote.
+
+**Fix** — persist `remember` at `builder.rs:501-511` and read the store back, passing the hit as `saved:` at `:516`. Change `builder.rs:1648` to fall back to `ExtensionHost::new(host_config)` when `with_wasm` fails. Pair with EXT-043, which gives the deciding extension the cwd it is voting on — without that, "remember" has no well-defined key from the extension's point of view.
+
+**Verify** — trust a directory with remember set, restart, assert no prompt and that `decide_trust_with_extension` receives `saved: Some(true)`. Force `with_wasm` to fail and assert native votes still aggregate.
+
+## EXT-006 — Renderers run without display options or theme, and only once
+
+**Kind** parity-bug · **Severity** medium · **Effort** L · **Confidence** high
+
+**cyrup** — the replay half for custom messages is now closed (`replay_session_with_extensions`, `crates/cyrup-tui/src/app.rs:1305-1327`, two production callers). Two residuals remain. (1) **Signature**: `render-call: func(custom-type: string, call-json: string) -> option<string>` (`crates/cyrup-ext/wit/world.wit:169`) carries neither display options nor a theme, and `render-result` matches. (2) **One-shot**: the render is computed once at ingest — `let rendered = extension_render(ext_host, ev).await;` at `app.rs:4368`, fed to `ingest_event_rendered` at `:4380` — so the text is baked and an expand/collapse or a theme change never re-invokes the renderer. The third residual, replayed **tool** rows, is filed separately as EXT-041.
+
+**upstream** — `MessageRenderer = (message, options, theme) => Component | undefined` at `pi/packages/coding-agent/src/core/extensions/types.ts:1146`, with `EntryRenderOptions {expanded}` at `:1142` @v0.83.0; pi re-invokes the renderer from the draw path, so options and theme are live inputs rather than ingest-time constants.
+
+**Impact** — an extension renderer cannot respond to expand/collapse or to the active theme. Toggling either leaves the extension's output frozen in the state it was first drawn in, while every built-in row around it updates.
+
+**Fix** — widen `render-call`/`render-result` in **both** `world.wit` copies to carry display options + theme (an export re-signing ⇒ bump `HOST_WORLD`, batch with the C5 ABI move); move the render out of ingest into the draw path, or cache it keyed by `(entry_id, expanded, theme)` and invalidate on either.
+
+**Verify** — toggle expansion and then the theme on a rendered entry and assert the renderer is re-invoked with the new options each time.
+
+## EXT-007 — The first system prompt is built from built-ins only; guest promptGuidelines are dropped
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `crates/cyrup-session-svc/src/builder.rs:1045-1048` derives `selected_tools`/`tool_contributions` from `base_tools`; the prompt is built at `:1062` (`SystemPromptBuilder::new().build(&prompt_inputs)`); `ext_host.active_tools(&base_tools)` still runs six lines later at `:1068`. `builder.rs:1054` passes `prompt_guidelines: Vec::new()` outright. Root cause for the guidelines half is unchanged: `fn prompt_guidelines(&self) -> &[&str]` at `crates/cyrup-core/src/tool.rs:120` cannot be implemented against a descriptor owning `Vec<String>`, and `impl Tool for WasmTool` (`crates/cyrup-ext/src/host/live.rs:1386-1420`) overrides name/parameters/execution_mode/description/`prompt_snippet` (`:1406-1408`)/execute and nothing else, so the empty trait default stands.
+
+**upstream** — pi builds `_toolPromptGuidelines` from the **merged** definition registry (built-ins + MCP + extension tools) inside `_refreshToolRegistry`, `pi/packages/coding-agent/src/core/agent-session.ts:2497-2504` @v0.83.0.
+
+**Impact** — extension tools are callable but undescribed in the system prompt of the session's first turn, and a guest's `promptGuidelines` never reach the model at all. Compounds EXT-031, which loses the same content for the rest of any run a tool joins mid-flight.
+
+**Fix** — move `ext_host.active_tools(&base_tools)` above `builder.rs:1045` and derive `selected_tools`/`tool_contributions` from the merged set. Widen `Tool::prompt_guidelines` (`cyrup-core/src/tool.rs:120`) to an owned or `Cow` slice and implement the override on `WasmTool` (`host/live.rs:1386-1420`). EXT-038's `promptGuidelines` half is blocked on the same signature change — do both together.
+
+**Verify** — an init-registered guest tool with a snippet and guidelines: assert both appear in the first assembled system prompt.
+
+## EXT-009 — before_provider_headers event is missing entirely
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `crates/cyrup-ext/src/event.rs:13-53` lists 31 `EventKind` variants ending at `AgentSettled = 30`, with `COUNT: u8 = 31` at `:59`; the provider pair is `BeforeProviderRequest`/`AfterProviderResponse` and nothing else. `grep -rn 'before_provider_headers\|before-provider-headers' crates/` returns only the two `world.wit` header lines that now *admit* the omission (`crates/cyrup-ext/wit/world.wit:9-10`, both copies).
+
+**upstream** — `BeforeProviderHeadersEvent` at `pi/packages/coding-agent/src/core/extensions/types.ts:686-689` @v0.83.0, subscribed at `:1212`, reduced by `emitBeforeProviderHeaders` at `runner.ts:1045`; the doc at `:681-685` specifies that a `null` value **deletes** that header.
+
+**Impact** — extensions cannot add, override or delete provider request headers. Any auth-shim, proxy-tagging or telemetry extension that works under pi is impossible under cyrup. Compounds EXT-052: neither the header hook nor the payload hook covers extension-supplied providers.
+
+**Fix** — add `EventKind::BeforeProviderHeaders = 31` (bump `COUNT` at `event.rs:59`, add the `from_u8`/`name()` arms), a guest export in `interface events` in both `world.wit` copies with `option<string>` values so `none` means delete, an `EventPatch::Headers` in `contract.rs`, SDK hooks, and a dispatch point in provider request assembly (area 01 code). Export addition ⇒ bump `HOST_WORLD`.
+
+**Verify** — a guest that adds one header and nulls another; assert the outbound request carries the addition and lacks the deletion.
+
+## EXT-011 — session_info_changed is emitted internally but never crosses the extension boundary
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — there is no `SessionInfoChanged` among the 31 `EventKind` variants (`crates/cyrup-ext/src/event.rs:13-53`), and the WIT session block (`crates/cyrup-ext/wit/world.wit:234-237`) has only `on-session-start`/`on-session-shutdown`/`on-resources-discover`/`on-project-trust`. **Correction carried from the refutation pass**: the signal itself already exists and fires — `AgentSessionEvent::SessionInfoChanged { name }` is produced by `set_session_name` and asserted at `crates/cyrup-session-svc/tests/round8_postrun.rs:240-257`. The gap is purely extension-host *routing*, not a missing event source, so the fix is a `HostEvent` variant plus a WIT export plus one dispatch call beside the existing fan-out — effort S, not M.
+
+**upstream** — `SessionInfoChangedEvent { type, name: string | undefined }` at `pi/packages/coding-agent/src/core/extensions/types.ts:571-575` @v0.83.0, subscribed at `:1193`.
+
+**Impact** — extensions cannot react to a session being renamed or its metadata changing; a status-line or external-sync extension goes stale while the session layer below it already knows.
+
+**Fix** — add the kind (bump `COUNT`/`from_u8`/`name()`), an `on-session-info-changed: func(name: option<string>)` export in both `world.wit` copies, an SDK hook, and dispatch it beside the existing `AgentSessionEvent::SessionInfoChanged` emit in `crates/cyrup-session-svc/src/session.rs`. Export addition ⇒ bump `HOST_WORLD`; batch with the other ABI items.
+
+**Verify** — rename a session; assert a subscribed guest receives the event with the new name, and that the existing `round8_postrun.rs:240-257` assertion still holds.
+
+## EXT-013 — Slash-command argument completions and autocomplete providers are dead
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `ExtensionHost::command_completions` (`crates/cyrup-ext/src/facade.rs:1207-1214`) has exactly one caller workspace-wide, `crates/cyrup-ext/tests/discover_load.rs:100`. `LiveExtension::argument_completions` (`crates/cyrup-ext/src/host/live.rs:1178-1195`) has one non-SDK caller, `crates/cyrup-ext/tests/wasm_component.rs:169`. Nothing under `crates/cyrup-tui/` calls either. Since EXT-S02 closed, the TUI *does* surface extension commands — and hardcodes `has_arg_completion: false` for every dynamic command at `crates/cyrup-tui/src/commands.rs:348`, so the popup never asks.
+
+**upstream** — pi threads the live callback straight through: `getArgumentCompletions: cmd.getArgumentCompletions,` at `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:607` @v0.83.0, in the same object literal as `name: cmd.invocationName` at `:605`; declared on `RegisteredCommand` at `extensions/types.ts:1166`.
+
+**Impact** — an extension can declare argument completions that never appear. The registration API succeeds and the feature is inert; the author's only symptom is that `<tab>` does nothing after their command name.
+
+**Fix** — carry the real flag into `dynamic_commands_from_catalog_gated` (`commands.rs:308-350`) instead of `false`, and call `command_completions` from the TUI completion path for the argument position, folding `argument_completions` results in load order. Reuse the off-thread pattern already used by `extension_render` (`crates/cyrup-tui/src/app.rs`): sync pre-check, spawn, timeout, `abort()`. Route resolution through `resolved_command_owner` (`registry.rs:506-512`) so `deploy:2` is reachable — that is EXT-017's edit, and this item should land immediately after it.
+
+**Verify** — type `/deploy <tab>` with a guest declaring argument completions; assert its items appear, and that a registered autocomplete provider contributes to plain-text completion.
+
+## EXT-014 — tool_execution_update / tool_execution_end drop toolName (and args)
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `crates/cyrup-ext/src/event.rs:304-305`: `ToolExecUpdate { call_id, chunk }` and `ToolExecEnd { call_id, result, is_error }`. `HostEvent::from_agent` discards the rest with `..` at `event.rs:445` and `:451`, while `ToolExecStart` immediately above at `:438-444` destructures and keeps `tool_name` and `args` — the loss is visible in three adjacent arms. WIT signatures match the loss at `crates/cyrup-ext/wit/world.wit:230-231`.
+
+**upstream** — `ToolExecutionUpdateEvent { type, toolCallId, toolName, args, partialResult }` at `pi/packages/coding-agent/src/core/extensions/types.ts:769-775` and `ToolExecutionEndEvent { type, toolCallId, toolName, result, isError }` at `:778-784` @v0.83.0. Note the update event carries **`args`** as well, so cyrup drops two fields there, not one.
+
+**Impact** — an extension observing tool execution must maintain its own `callId → toolName` map from `tool_execution_start`, and cannot filter by tool at all if it missed the start (late registration, reload, or a run that began before it subscribed).
+
+**Fix** — add `tool_name` to both variants and `args` to `ToolExecUpdate` (`event.rs:304-305`), stop discarding at `event.rs:445`/`:451`, widen the two WIT exports in both copies. Export re-signing ⇒ bump `HOST_WORLD`; batch with the other ABI items.
+
+**Verify** — a guest subscribed only to `tool_execution_end` asserts a non-empty `tool_name`; a guest subscribed only to `tool_execution_update` asserts non-empty `args`.
+
+## EXT-015 — Session-lifecycle events lose their discriminating fields at the extension boundary
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `SessionStart { reason }` / `SessionShutdown { reason }` (`crates/cyrup-ext/src/event.rs:307-308`) and `SessionBeforeSwitch { target_id }` / `SessionBeforeFork { entry_id }` (`:332-333`); WIT at `crates/cyrup-ext/wit/world.wit:234-235` and `:240-241`. The fields exist one layer down — `AgentSessionEvent::SessionStart` carries `previous_session_file` and is fanned out intact before the extension dispatch drops it.
+
+**upstream** @v0.83.0, all four re-counted exact — `SessionStartEvent` (`reason` **and** `previousSessionFile?`) at `types.ts:562`; `SessionBeforeSwitchEvent` (`reason: "new"|"resume"` **and** `targetSessionFile?`) at `:578`; `SessionBeforeForkEvent` (`entryId` **and** `position: "before"|"at"`) at `:585`; `SessionShutdownEvent` (`reason`, `targetSessionFile?`) at `:616`.
+
+**Impact** — an extension cannot tell a fresh session from a resume, cannot find the previous session file, and cannot tell a fork *before* an entry from a fork *at* it. Session-lifecycle extensions are limited to a coarse "something happened". Note cyrup drops `reason` from `session_before_switch` specifically, which is the field that distinguishes the two cases it most needs.
+
+**Fix** — widen the four `HostEvent` variants and their WIT exports in both copies; pass `previous_session_file` from the existing `emit_session_start` fan-out in `crates/cyrup-session-svc/src/session.rs`; add pi's `reason` alongside `target_id` in `crates/cyrup-session-svc/src/runtime.rs` (the new-session case is papered over with `target_id: String::new()`). Export re-signing ⇒ bump `HOST_WORLD`.
+
+**Verify** — resume a session and assert the guest sees the previous session file and `reason == "resume"`; fork before and at an entry and assert the two are distinguishable.
+
+## EXT-017 — Command listing is non-deterministic, drops name:N, and a colliding command is unexecutable
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `commands: HashMap<String, (ExtensionId, CommandDescriptor)>` at `crates/cyrup-ext/src/registry.rs:139`, and `command_descriptions` (`:662-669`) iterates `.commands.iter()` directly — random order, one entry per name, bare `name`. The correct implementations exist and are **production-dead**: `resolved_commands` (`:462-501`) and `resolved_command_owner` (`:506-512`) are reached only from `crates/cyrup-ext/tests/aggregation.rs:227-238` and `crates/cyrup-ext-subagents/tests/watchdog_wiring.rs:90`. Execution is still raw-name: `live_for_command` → `command_owner` (`facade.rs:1217-1227`, `registry.rs:650-652`), a last-wins map lookup. **Consequence escalated this pass**: since EXT-S02 closed, `command_descriptions` feeds `slash_command_catalog` (`crates/cyrup-session-svc/src/session.rs:2281`, emitting the bare `name` at `:2277`) which feeds the interactive `/` autocomplete (`crates/cyrup-tui/src/app.rs:4103`, `:6340`, `:6937`), so the nondeterministic ordering is now directly user-visible.
+
+**upstream** — `resolveRegisteredCommands` assigns `name:N` in load order with a `takenInvocationNames` bump loop (`pi/packages/coding-agent/src/core/extensions/runner.ts:598-631`), and `name: cmd.invocationName` is what reaches autocomplete (`modes/interactive/interactive-mode.ts:605`) @v0.83.0.
+
+**Impact** — the slash-command palette reorders between runs, and when two extensions register `deploy` only one is listed and the **last** registrant executes; the other is silently unreachable. The reordering claim is derived from Rust's per-process randomly-seeded `HashMap` hasher rather than from an observed reorder — see `## Coverage`.
+
+**Fix** — swap `session.rs:2277` to emit `r.invocation_name` from `resolved_commands()`, and change `live_for_command` (`facade.rs:1217-1227`) to consult `resolved_command_owner` so `deploy:2` dispatches to its own owner. `tests/aggregation.rs:227-238` already proves the correct behaviour — it is simply unreachable from production. EXT-013 and EXT-053 both depend on this edit.
+
+**Verify** — two extensions registering `deploy`: assert stable load-order listing showing `deploy:1`/`deploy:2` and that invoking each reaches its own owner.
+
+## EXT-018 — The inter-extension event bus is wasm-only — natives have no pi.events
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `bus: Arc<crate::host::SharedBus>` is `#[cfg(feature = "wasm-host")]` at `crates/cyrup-ext/src/facade.rs:137-138` (constructed `:171-172`); `deliver_bus_events` is cfg-gated and resolves subscribers only out of `self.live` (`facade.rs:1014`), the wasm instance map. `grep -c bus crates/cyrup-ext/src/native.rs` is zero, and `InitApi` (`native.rs:230-238`) has six fields — subs, tools, commands, tool_renderers, message_renderers, entry_renderers — none a bus. All three cyrup-shipped extensions (permission-system, intercom, subagents) are `NativeExtension`s, so the documented coordination channel reaches nothing that ships.
+
+**upstream** — pi attaches the one shared bus to every extension regardless of kind: `events: eventBus,` on the returned `ExtensionAPI` at `pi/packages/coding-agent/src/core/extensions/loader.ts:389` @v0.83.0 (it becomes a guarded wrapper at v0.84.1 — see EXT-050), bus impl at `core/event-bus.ts:12-32`.
+
+**Impact** — the permission system, intercom and subagents extensions cannot signal each other through the channel built for exactly that. Any cross-extension coordination has to be re-invented out of band.
+
+**Fix** — move `bus` out of the cfg gate, give `NativeExtension` an `on_bus_event` entry point mirroring the renderer-registration path, and extend `deliver_bus_events` to fan out to `self.native` as well as `self.live`. Fold with EXT-034 (the drain placement), EXT-050 (unsubscribe + lifecycle teardown) and EXT-057 (the round-bound drop) — all four touch the same function and should land as one change.
+
+**Verify** — a native emitting on `demo:bus` and a second native subscribed to it; assert delivery in a build with **and** without `wasm-host`.
+
+## EXT-021 — ctx.ui capabilities with no WIT representation (at least eight)
+
+**Kind** not-ported · **Severity** medium · **Effort** L · **Confidence** high on the WIT surface; medium on completeness (see caveat)
+
+**cyrup** — `interface ui` (`crates/cyrup-ext/wit/world.wit:302-348`) was enumerated function by function at HEAD: 22 functions — notify, set-status, abort-signal, confirm, input, select, editor, set-widget, set-header, set-footer, set-title, custom, get/set/paste-editor-text, theme-get/list/set, working-start/stop, get/set-tools-expanded. It still collapses pi's working-indicator controls into `working-start(label)`/`working-stop()` (`:343-344`) and still returns bare theme **names** from `theme-list` (`:340`).
+
+**upstream** — absent from the WIT, all eight verified line-exactly at v0.83.0: `onTerminalInput` (`types.ts:145`), `setWorkingVisible` (`:154`), `setWorkingIndicator` (`:164`), `setHiddenThinkingLabel` (`:167`), `setEditorComponent` (`:260`), `getEditorComponent` (`:263`), `getAllThemes(): {name, path}[]` (`:269`), `getTheme(name)` (`:272`). A **ninth** is partially covered: `setWorkingMessage(message?)` (`:151`) is not the same thing as `working-start(label)`. A tenth — `setWidget`'s dropped key and placement — is filed separately as **EXT-047**.
+
+**Impact** — extensions cannot observe raw terminal input, cannot replace or read the editor component, cannot control working-indicator visibility independently of the label, and cannot enumerate themes with their paths or inspect a theme without switching to it.
+
+**Fix** — the cheap half is all *imports* and needs no `HOST_WORLD` bump (`manifest.rs:51-54`): add `set-hidden-thinking-label`, `set-working-indicator`, `set-working-visible`, `set-working-message`, `theme-get-by-name`, and widen `theme-list` (`world.wit:340`) to a `{name, path}` record. The expensive half (`onTerminalInput`, `setEditorComponent`/`getEditorComponent`) needs guest exports and a component-safe renderable-editor representation; if genuinely out of scope, write the `CYRUP-DELTA` into `crates/cyrup-ext/src/lib.rs` naming the pi lines and the reason — the omission EXT-045 exists to punish.
+
+**Verify** — a guest calling each new import and asserting the observable TUI effect; for any delta, assert the `lib.rs` note exists so it is not re-found as a gap.
+
+*Caveat*: the WIT surface was verified exhaustively and the eight pi declarations line-exactly, but `crates/cyrup-ext/src/host/services.rs` (~1944 lines) has still not been audited method by method, so a `ctx.ui` capability could be implemented host-side while missing from the WIT.
+
+## EXT-023 — prepareArguments is unreachable for WASM guest tools, and the SDK drops the field silently
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — the host mechanism exists and works for natives (`Tool::prepare_arguments`, `crates/cyrup-core/src/tool.rs:134`, invoked before validation in `crates/cyrup-agent/src/agent.rs`). The WASM boundary cannot express it: `grep -n prepare crates/cyrup-ext/wit/world.wit` returns **nothing** at HEAD — the string does not occur in the world at all; the WIT `tool-descriptor` (`world.wit:39-48`) has 8 fields and no prepare flag, `ToolDescriptor` (`crates/cyrup-ext/src/registry.rs:16-30`) likewise, and `impl Tool for WasmTool` (`crates/cyrup-ext/src/host/live.rs:1386-1420`) has no override so the identity default stands. The SDK accepts and discards it: `pub prepare_arguments: bool` at `crates/cyrup-ext-sdk/src/descriptor.rs:47-49`, documented as "the host coerces args before validation when set", and `lower_tool_descriptor` (`crates/cyrup-ext-sdk/src/guest.rs:55-69`) copies 8 of 10 fields. Struct-literal construction of a different type means no compile error and no warning.
+
+**upstream** — `prepareArguments?: (args: unknown) => Static<TParams>;` on `ToolDefinition` at `pi/packages/coding-agent/src/core/extensions/types.ts:468` @v0.83.0, run before `validateToolArguments` in `packages/agent/src/agent-loop.ts`.
+
+**Impact** — a guest tool that needs argument coercion (the most common reason a tool call fails validation) sets a documented SDK field that does nothing, with no diagnostic anywhere.
+
+**Fix** — add `prepare-arguments: bool` to the WIT `tool-descriptor` and a `prepare-arguments: func(args-json: string) -> option<string>` guest export in both copies; carry the flag on `registry.rs:16-30`; implement `Tool::prepare_arguments` on `WasmTool`. Copy the field in `lower_tool_descriptor` (`guest.rs:55-69`) and add a compile-time exhaustiveness guard there so future fields cannot be dropped silently — the same guard closes EXT-024's half. Export addition ⇒ bump `HOST_WORLD`.
+
+**Verify** — a guest tool declaring `prepare_arguments` that coerces a string to a number; assert the call validates and executes.
+
+## EXT-024 — renderShell/constrainedSampling unexpressible, and render_kind has zero consumers
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `grep -n render-shell crates/cyrup-ext/wit/world.wit` is empty and the `tool-descriptor` record carries no such field, while cyrup-core models it host-side as `ToolRenderKind` (`crates/cyrup-core/src/tool.rs:67`) / `Tool::render_kind` (`:127-128`). Every occurrence workspace-wide is a definition, default, re-export, passthrough or unit test (`cyrup-core/src/tool.rs:67,127-128,198`; `cyrup-core/src/lib.rs:33`; `cyrup-ext/src/wrapper.rs:24,110-111,287`) — **zero consumers** in `cyrup-tui` or `cyrup-agent`, so even a native tool declaring `SelfRendered` is ignored by the TUI. The SDK drops its half too: `render_shell: RenderShell` at `crates/cyrup-ext-sdk/src/descriptor.rs:43-45`, never copied by `lower_tool_descriptor` (`guest.rs:55-69`). *Evidence correction*: the auditor reported `grep -rn constrained_sampling crates/` as empty; it is not — `crates/cyrup-provider/src/api/bedrock_converse_stream.rs:44` matches, but the hit is a comment reading "cyrup's `ToolDef` has no such field", which confirms the gap rather than refuting it.
+
+**upstream** — `constrainedSampling?: false | ConstrainedSamplingConfig;` at `pi/packages/coding-agent/src/core/extensions/types.ts:463` and `renderShell?: "default" | "self";` at `:465` @v0.83.0.
+
+**Impact** — a self-rendering tool still draws the default row chrome; the model's structured-output constraint hook does not exist at any layer.
+
+**Fix** — three pieces for `renderShell`: the WIT/`registry.rs` field, the copy in `lower_tool_descriptor`, and — the part that matters most — a TUI consumer of `render_kind` in the tool-row draw path, now feasible since renderers are live end to end. `constrainedSampling` needs provider-side request assembly (area 01).
+
+**Verify** — a native tool declaring `SelfRendered`: assert the TUI omits the default shell.
+
+## EXT-029 — An abort landing during a gated tool-call dispatch reports as an extension failure
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — the pre-check is at `crates/cyrup-agent/src/agent.rs:967-968` and the re-check at `:999-1000`, so every not-yet-dispatched call in a batch reports correctly. The defect is the race window: the token handed to the hook is a **child** of the run's — `self.hooks.before_tool_call(ctx, self.cancel.child()).await` at `agent.rs:984` — so a run abort cancels it mid-flight and the dispatch returns `Err(ExtError::Cancelled)`. That error is not excluded by the `Err(e)` arm of `dispatch_block_mutate` (`crates/cyrup-ext/src/dispatch.rs:249-257`), which reports it to every `onError` listener and, because `tool_call` is fail-closed, synthesizes `Blocked{reason: Some("Extension failed, blocking execution: cancelled")}`. **Worse since EXT-S03 closed**: that spurious `onError` is now rendered into the interactive transcript as `Extension "<id>" error: cancelled` (`crates/cyrup-tui/src/app.rs:3161-3165`, drained at `:6807`).
+
+**upstream** — pi has no path by which an abort becomes an extension fault: `emitToolCall` (`pi/packages/coding-agent/src/core/extensions/runner.ts:927-948` @v0.83.0) takes no signal and has no cancellation race, and the abort path returns `createErrorToolResult("Operation aborted")` before the block branch (`packages/agent/src/agent-loop.ts:629-635` @v0.84.1).
+
+**Impact** — pressing Esc during a tool call writes a transcript entry blaming a healthy extension **and** now shows a spurious `[Extension issues]`-style error line. Reachable whenever an extension subscribes to `tool_call` — the normal state once `cyrup-permissions.jsonc` exists.
+
+**Fix** — in `dispatch_block_mutate` (`dispatch.rs:249-257`), special-case `ExtError::Cancelled`: do not `report` it and do not synthesize a block reason — return `Blocked { reason: None }` so the agent's own "Operation aborted" text wins; or short-circuit to `Proceed` in `crates/cyrup-ext/src/hooks.rs` when the run token is already cancelled. **Do not weaken `fails_closed`** — that reopens EXT-001.
+
+**Verify** — abort mid-`before_tool_call` with a subscribed extension; assert the result text is "Operation aborted", that no `onError` fired and no transcript error line appeared, and that `tests/ext_fail_closed.rs` still passes unchanged.
+
+## EXT-030 — materialize_guest_tools unconditionally clears the tools-dirty flag, swallowing its own re-arm
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — the not-yet-live branch deliberately re-arms at `crates/cyrup-ext/src/facade.rs:419-424` (`self.registry.mark_tools_dirty(); continue;`), but the tail at `:431-433` is `if changed { self.registry.take_tools_dirty(); }`, and `take_tools_dirty` is a wholesale `swap(false, AcqRel)` (`crates/cyrup-ext/src/registry.rs:272-274`) that clears that re-arm along with any mark raised meanwhile. Trigger: at least one tool materialized (`changed == true`) **and** another was skipped or arrived concurrently. `refresh_tools` short-circuits on the same flag (`facade.rs:404-406`), and `load_wasm` calls `materialize_guest_tools` directly (`facade.rs:1102`), so the clearing happens on every extension load.
+
+**upstream** — pi has no dirty flag: `registerTool` ends with `runtime.refreshTools()` on every registration (`pi/packages/coding-agent/src/core/extensions/loader.ts:245-252`) and `_refreshToolRegistry` rebuilds the whole registry each time (`core/agent-session.ts:2452-2546`) @v0.83.0, so no signal can be lost.
+
+**Impact** — a tool registered concurrently with a materialization pass, or one whose owner was not yet live, is dropped permanently for the session. Nondeterministic and load-order dependent.
+
+**Fix** — drop the `take_tools_dirty()` at `facade.rs:431-433` and instead stop the materializer's own re-registrations from raising the flag — a `register_tool_quiet` on `ExtensionRegistry`, or a `mark_dirty: bool` parameter on `register_tool` (`registry.rs:217-229`). `refresh_tools` already takes the flag once at entry (`facade.rs:404`), which is the correct scoping.
+
+**Verify** — two guests where one registers a tool while the other's descriptors materialize; assert both tools appear after a single `refresh_tools`, and that a descriptor whose owner is not yet live is retried on the next refresh.
+
+## EXT-031 — Turn-boundary refresh propagates tools but not the rebuilt system prompt
+
+**Kind** parity-bug · **Severity** medium · **Effort** L · **Confidence** high
+
+**cyrup** — `PolicyHooks::prepare_next_turn` sets only the tool array — `update.tools = Some(session.next_turn_tools().await);` at `crates/cyrup-session-svc/src/hooks.rs:179` — and `TurnUpdate.system_prompt` remains an unset slot. The divergence is stated in the doc block immediately above at `:158-160` ("Pi also re-pushes `context.systemPrompt` here. cyrup does not"). The stated reason is real: cyrup has one prompt slot into which `assemble_run_messages` already wrote a `before_agent_start` handler's sanitized prompt, and overwriting it mid-run would undo the permission companion's tool-exposure shaping. Under this project's rules a documented divergence is still work — there is no accepted-divergence category.
+
+**upstream** — pi keeps the override and the base in separate slots: `_installAgentNextTurnRefresh` returns `{...previousContext, systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt, tools: …}` at `pi/packages/coding-agent/src/core/agent-session.ts:519-540` @v0.83.0.
+
+**Impact** — a tool registered mid-run becomes callable but undescribed for the remainder of that run. Compounds EXT-007: between them an extension tool's snippet is missing from the first prompt of a session and from the rest of any run it joins mid-flight.
+
+**Fix** — split the prompt into `base_system_prompt` and `system_prompt_override` as pi does, then have `next_turn_tools` return `(tools, resolved_prompt)` and `prepare_next_turn` (`hooks.rs:179`) populate `TurnUpdate.system_prompt`. Until the split lands, keep **both** existing guards — removing either without the split silently undoes permission-system prompt sanitization.
+
+**Verify** — register a tool mid-run and assert its snippet appears in the next turn's prompt while a `before_agent_start` sanitization applied earlier in the same run survives. The tool-array half is already covered by `crates/cyrup-agent/tests/turn_tool_refresh.rs`.
+
+## EXT-033 — A configured extension path that is unloadable or nonexistent produces no diagnostic
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — the FILE half of the original item is **closed**: `discover` now branches on `is_component_file(p)` first and calls `push_file` (`crates/cyrup-ext/src/loader.rs:124-130`), with `is_component_file` at `:155-157` and `push_file` synthesizing the minimal manifest at `:193-221`; new coverage at `crates/cyrup-ext/tests/loader_direct_file.rs`. The DIAGNOSTIC half survives: a configured path that exists but is neither an extension dir nor a `.wasm`, **and a nonexistent path**, both fall through to `scan_dir`, whose first statement is still `let Ok(rd) = std::fs::read_dir(dir) else { return };` (`loader.rs:169`) — a silent return. `discover_and_load` (`facade.rs:1138-1149`) only pushes to `errors` from `load_discovered`, so such a path yields neither `loaded` nor `errors`.
+
+**upstream** — pi guards on `fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()` and falls through to `addPaths([resolved])` for anything else (`pi/packages/coding-agent/src/core/extensions/loader.ts:704-717` @v0.83.0), which then surfaces the failure as a per-path `LoadExtensionsResult.errors` entry.
+
+**Impact** — a typo'd `-e` path is indistinguishable from a correct one: no load, no diagnostic, empty `errors`. The author's only symptom is that their extension's tools and commands are absent. This is also the documented escape hatch under `--no-extensions`, so it is the path a user is most likely to reach for.
+
+**Fix** — give `discover` a `(Vec<DiscoveredExtension>, Vec<LoadError>)` return, or pre-validate `roots.configured` in `facade::discover_and_load` (`facade.rs:1138-1149`), so a path that resolves to nothing produces exactly one `LoadExtensionsResult.errors` entry naming it. Surface it through the same `startup_diagnostics.extensions` channel `builder.rs:775-786` already uses (EXT-S01's mechanism).
+
+**Verify** — point `DiscoveryRoots.configured` at (a) a nonexistent path and (b) an existing non-extension file; assert each produces exactly one `errors` entry naming the path, and that the already-closed `.wasm` case still loads. Extend `crates/cyrup-ext/tests/loader_direct_file.rs`.
+
+## EXT-034 — Bus events emitted from an event handler are never delivered
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `ExtensionHost::deliver_bus_events` (`crates/cyrup-ext/src/facade.rs:1003-1028`) has exactly **two** production call sites, both at the tail of a command-tier call: `facade.rs:1201` (`run_command`) and `:1255` (`run_shortcut`); the only other hits workspace-wide are doc links and `crates/cyrup-ext/tests/wasm_bus_flag.rs:82`. Nothing drains after `dispatch_notify` / `dispatch_block_mutate` / `dispatch_collect_handled` / `dispatch_first_handled` (`crates/cyrup-ext/src/dispatch.rs`), after `LiveExtension::invoke_event`, or anywhere in `cyrup-session-svc` — including the live inline `emit_user_bash_event` (`crates/cyrup-session-svc/src/session.rs:4608-4612`), which dispatches and returns with no drain. The deferral itself is deliberate and correct (wasm single-instance reentrancy forbids re-entering the emitting guest inside its own `bus.emit` import); the defect is that the drain was wired only into the command tier.
+
+**upstream** — `createEventBus()` returns `emit: (channel, data) => { emitter.emit(channel, data); }` over a node `EventEmitter` (`pi/packages/coding-agent/src/core/event-bus.ts:12-32` @v0.83.0), so every listener runs synchronously at the emit call. There is no queue, no drain point, and no entry point from which an emit can go undelivered.
+
+**Impact** — `pi.events` silently works from a slash-command handler and silently does not work from an event handler, which is where cross-extension coordination actually happens (a permission decision, a tool result, a session start). The author sees `bus.emit` succeed with no error. Combined with EXT-018, the bus is usable today only for guest→guest signalling initiated by a slash command.
+
+**Fix** — drain at every seam that can have re-entered a guest. The cheapest correct placement is inside `Dispatcher`'s public entry points, after the subscriber loop completes, which is outside every guest store guard; that requires the dispatcher to hold an `Arc<SharedBus>`. Land together with EXT-018 (so natives get the same drain), EXT-050 (lifecycle teardown) and EXT-057 (the round-bound drop).
+
+**Verify** — two guests from the fixture component, B subscribed to `demo:bus`. Drive an **event** (not a command) into A whose handler emits, and assert B's `bus-deliver` ran before the dispatch call returned, with no manual `deliver_bus_events`. Add beside the two existing shapes in `tests/wasm_bus_flag.rs`.
+
+## EXT-035 — NativeExtension can register only 5 of the 11 WIT registration surfaces
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `InitApi` (`crates/cyrup-ext/src/native.rs:230-238`) gained exactly one surface since this item was filed — `register_entry_renderer` (`:295-297`) — so its six fields are subs/tools/commands/tool_renderers/message_renderers/entry_renderers, and `InitParts` (`:219-226`) is the matching 6-tuple. Meanwhile `interface registration` (`crates/cyrup-ext/wit/world.wit:270-297`) now offers **eleven** registration verbs plus `subscribe`: `register-tool` `:272`, `register-command` `:273`, `register-shortcut` `:274`, `register-flag` `:275`, `get-flag` `:276`, `register-provider` `:277`, `unregister-provider` `:278`, `register-message-renderer` `:279`, `register-entry-renderer` `:290`, `add-autocomplete` `:291`, `add-autocomplete-provider` `:294`. A native reaches 5 of 11 — the ratio got **worse**, not better. The asymmetry is load-bearing even given a back door: `run_shortcut` (`facade.rs:1241-1252`) is still cfg-gated and resolves owners out of `self.live` only, so a registry entry owned by a native could never fire.
+
+**upstream** — pi has one extension kind and one API object: `loader.ts:274-410` @v0.83.0 builds a single `ExtensionAPI` carrying registerTool/registerCommand/registerShortcut/registerFlag/getFlag/registerProvider/unregisterProvider/registerMessageRenderer/registerEntryRenderer/addAutocompleteProvider/events and hands it to every extension it loads. There is no upstream notion of an extension that can register tools but not shortcuts, flags or providers.
+
+**Impact** — with zero WASM guests shipping, six of the eleven documented registration capabilities are unreachable by every extension that actually exists. A first-party extension cannot bind a keyboard shortcut, cannot declare a CLI flag (so it cannot be configured the way pi extensions are), and cannot contribute a provider — which is how `CYRUP_*` env-var sprawl grows.
+
+**Fix** — add `register_shortcut(key, desc)`, `register_flag(name, spec)`, `register_provider(id, config)`, `unregister_provider` and the two autocomplete verbs to `InitApi` (`native.rs:230-297`), extend `InitParts` and the `load_native` fold to push each into the existing registry methods. Then make `run_shortcut` (`facade.rs:1241-1252`) try `self.native` before `self.live` and drop its `wasm-host` cfg gate. Do the shortcut half together with EXT-039 (reserved-key refusal) and EXT-040 (the dropped description), which rewrite the same registrar.
+
+**Verify** — a native registering a shortcut, a flag and a provider in `init`: assert `shortcut_keys()` lists the key, that `run_shortcut` reaches the native's handler, that a CLI flag value round-trips through a native `get_flag`, and that `registry().provider_ids()` contains the id. Add to `crates/cyrup-ext/tests/native_dispatch.rs`.
+
+## EXT-038 — ext-tools.get-all-tools returns only extension tools and drops promptGuidelines and sourceInfo
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `crates/cyrup-ext/src/host/live.rs:746-750` serializes `guest.registry.tool_info()`. That function (`crates/cyrup-ext/src/registry.rs:389-420`) walks only `tool_order` and `guest_tool_order` — the two **extension** tables — and emits `{name, source: "extension"|"guest", description, parameters}`. Built-in tools (read/write/edit/bash/grep/find/ls) are absent entirely, and `promptGuidelines` and `sourceInfo` are not emitted at all. The sibling `get_active_tools` immediately above (`live.rs:732-745`) does it correctly, preferring the live session's real set via `guest.services.active_tools()`, and `set_active_tools` (`:751-759`) also routes to the live backend.
+
+**upstream** — `getAllTools()` maps `this._toolDefinitions` — the merged registry including built-ins, MCP and extension tools — to `{name, description, parameters, promptGuidelines, sourceInfo}` at `pi/packages/coding-agent/src/core/agent-session.ts:906-914` @v0.83.0; the type is `ToolInfo` at `extensions/types.ts:1552`, and the API doc at `:1323` reads "Get all configured tools with parameter schema, prompt guidelines, and source metadata."
+
+**Impact** — this is the introspection API a plan-mode or tool-restriction extension uses to decide what to pass to `setActiveTools`. Under cyrup it reports that the session has only extension tools, so such an extension computes a restriction set that silently omits every built-in; `set_active_tools` then applies it and the agent loses read/write/edit/bash. The read is wrong and the write is honoured, which is what makes this functional rather than cosmetic.
+
+**Fix** — add an `all_tools() -> Option<Vec<Value>>` accessor to `HostServices` (`crates/cyrup-ext/src/host/services.rs`) mirroring `active_tools`, implemented in `LiveHostServices` (`crates/cyrup-session-svc/src/host_services.rs`) off the dynamic tool registry so it covers built-ins + custom + extension tools; have `get_all_tools` (`host/live.rs:746`) prefer it and keep `registry.tool_info()` as the no-session fallback. Add `promptGuidelines` and a `sourceInfo` object to both producers. The guidelines half is blocked on the same `Tool::prompt_guidelines(&self) -> &[&str]` signature EXT-007 must widen — do them together.
+
+**Verify** — with a session carrying built-ins plus one extension tool, assert a guest's `get_all_tools()` contains the built-in names and that a tool declaring prompt guidelines reports them. Extend `crates/cyrup-ext/tests/wasm_component.rs`.
+
+## EXT-039 — Extension shortcuts bypass the reserved-keybinding refusal, emit no conflict diagnostics, and lose to built-ins
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high on the refusal and diagnostics halves; medium on the precedence half (see caveat)
+
+**cyrup** — registration has no gate at all: `ExtensionRegistry::register_shortcut` (`crates/cyrup-ext/src/registry.rs:515-523`) is a bare `g.shortcuts.insert(key.into(), owner)` — no lowercase normalization, no comparison against the keymap, no diagnostic, and two extensions claiming the same key silently collapse to whichever registered last. `ExtensionHost::shortcut_keys()` (`crates/cyrup-ext/src/facade.rs:1233-1235`) hands the raw keys to the TUI, which parses and stores them (`set_extension_shortcuts`, `crates/cyrup-tui/src/app.rs:544-550`). Dispatch consults the **built-in** action table first (`return self.apply_action(action)` at `app.rs:1691`) and extension shortcuts only afterwards (`:1697-1703`), with an in-tree comment stating that as the intent. There is no counterpart to `getShortcutDiagnostics` anywhere in `crates/`.
+
+**upstream** — `getShortcuts(resolvedKeybindings)` at `pi/packages/coding-agent/src/core/extensions/runner.ts:492-534` @v0.83.0 lowercases every key and, against the built-in keymap from `buildBuiltinKeybindings` (`:92-111`), (a) **skips** the extension shortcut with a warning when the colliding built-in is reserved (`restrictOverride === true`), (b) warns but **lets the extension win** when it is not reserved, then `extensionShortcuts.set(normalizedKey, shortcut)`, and (c) warns on extension-vs-extension collisions. The reserved list is `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` (`runner.ts:70-89`: app.interrupt, app.clear, app.exit, app.suspend, app.model.\*, tui.input.submit, tui.select.confirm/cancel, …). `getShortcutDiagnostics()` (`:538-540`) is folded into the `[Extension issues]` startup panel at `modes/interactive/interactive-mode.ts:1612-1618`.
+
+**Impact** — two opposite failures from one missing layer. An extension binding a **non-reserved** built-in key works upstream and is silently dead in cyrup. An extension binding a **reserved** key (Ctrl+C, Enter) is refused with a visible warning upstream; in cyrup it is accepted into the registry, listed by `/hotkeys` as if live, and never fires — an advertised-but-dead binding with no diagnostic. Two extensions claiming the same key silently collapse.
+
+**Fix** — give `register_shortcut` (`registry.rs:515`) the upstream shape: lowercase the key, take the resolved keybinding config, port `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` and `buildBuiltinKeybindings`, reject a reserved collision recording an `ExtensionConflict` (the mechanism exists at `registry.rs:251-256` and already flows into `LoadExtensionsResult.errors` via `facade.rs:1158-1162`), and warn-but-accept a non-reserved one. Then invert the TUI precedence at `crates/cyrup-tui/src/app.rs:1691-1703`, which is safe once the reserved list is enforced at registration. Surface the warnings through the same `startup_diagnostics.extensions` channel `builder.rs:775-786` uses. Land with EXT-035 and EXT-040, which rewrite the same registrar.
+
+**Verify** — register three shortcuts: one on a reserved key (assert refused, one diagnostic, absent from `shortcut_keys()`), one on a non-reserved built-in key (assert it fires instead of the built-in, one warning), and two extensions on the same key (one diagnostic naming both).
+
+*Caveat*: the precedence-**inversion** half is inferred from the reserved-list design and pi's "Using ${shortcut.extensionPath}" warning text, not read off pi's editor dispatch site. The reserved-refusal and missing-diagnostics halves are read directly and are not in doubt.
+
+## EXT-041 — Replayed tool calls and results lose their extension renderer
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `replay_session_with_extensions` (`crates/cyrup-tui/src/app.rs:1305-1327`) resolves a renderer **only** for custom messages: `let AgentMessage::Custom(c) = message else { continue };` at `:1315`. The tool arms of the walk it delegates to pass no rendered payload at all — `push_tool_start_rendered(…, None)` at `app.rs:1370-1375` and `push_tool_end_rendered(…, None)` at `:1398-1405`. The plumbing exists and is used on the live path (`extension_render` routes tool calls and results through `ExtensionHost::render_tool_call`/`render_tool_result`, `crates/cyrup-ext/src/facade.rs:701-731`); the replay walk simply never asks. Both production callers hit it (`crates/cyrup/src/main.rs:1685`, `app.rs:6988`).
+
+**upstream** — `populateHistory`'s assistant arm constructs a `ToolExecutionComponent` for **every** replayed `toolCall` and passes `this.getRegisteredToolDefinition(content.name)` as its definition (`pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3374-3389` @v0.83.0); that definition carries `renderCall`/`renderResult`, which the component prefers over the built-in framing. The custom-message arm cyrup did port is the sibling of this one, not a superset.
+
+**Impact** — a resumed session draws every extension-rendered tool row with the built-in framing while the live session drew the extension's output — exactly the asymmetry EXT-006's replay half was closed to remove, surviving on the tool surface. It bites the shipped population directly: `cyrup-ext-subagents` registers `render_call`/`render_result` for its subagent tool (`crates/cyrup-ext-subagents/src/extension.rs:9616`, `:9646`), so `/resume` on a session containing subagent runs loses their rendering.
+
+**Fix** — extend `replay_session_with_extensions` (`app.rs:1305`) to build a second index keyed by tool-call id: for each replayed tool call whose name satisfies `ext_host.has_tool_renderer(name)` (`facade.rs:913-915`) call `extension_render` for the call, and the result side for each tool result; hand both maps into the `None` slots at `app.rs:1374` and `:1404`. The async-first-then-sync-walk pattern the custom-message half already uses applies unchanged, including the `EXTENSION_RENDER_TIMEOUT` race. Do the same for replayed custom **entries** via `has_entry_renderer`/`render_entry` (`facade.rs:926-928`, `:808`), which EXT-012's closure left unwired on this path.
+
+**Verify** — run a session producing a tool call for a tool with a registered renderer, resume it, and assert the transcript shows the extension's rendered rows rather than the default shell — the assertion `crates/cyrup-tui/tests/extension_renderers.rs:420-520` already makes for custom messages, extended to the tool and entry surfaces.
+
+## EXT-043 — The project_trust event carries no cwd
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `HostEvent::ProjectTrust` is a payload-less unit variant (`crates/cyrup-ext/src/event.rs:310`, kind mapping `:398`) and the WIT export is `on-project-trust: func() -> hook-outcome;` (`crates/cyrup-ext/wit/world.wit:237`). It is dispatched with no payload by `aggregate_project_trust` (`crates/cyrup-ext/src/facade.rs:466-478`), reached from `pre_trust_extension_verdict` (`crates/cyrup-session-svc/src/builder.rs:1640-1671`) — which demonstrably **has** the value in hand, `let host_config = HostConfig { mode, has_ui, cwd: cwd.to_path_buf() };` at `:1646`, four lines before the dispatch — and never passes it. There is no cwd accessor anywhere in the WIT to fall back on (EXT-044).
+
+**upstream** — `ProjectTrustEvent { type: "project_trust"; cwd: string; }` at `pi/packages/coding-agent/src/core/extensions/types.ts:519-522` and `ProjectTrustContext { cwd; mode; hasUI; ui }` at `:531-536` @v0.83.0. The whole decision is per-directory: the store is keyed by cwd (`options.trustStore.set(options.cwd, trusted)`, `core/project-trust.ts:63-65`).
+
+**Impact** — an extension implementing a trust policy — the documented use of this hook, and the one security-relevant hook in the catalog — cannot key its verdict on the directory. Any allowlist-based policy either trusts everything or nothing, and cannot honour `remember` meaningfully because it does not know what it is remembering. This is the seam whose result decides whether project-local extensions are loaded at all (`discover_and_load(&roots, project_trusted, …)`, `facade.rs:1132-1137`).
+
+**Fix** — change the variant to `ProjectTrust { cwd: String }` (`event.rs:310`), the export to `on-project-trust: func(cwd: string) -> hook-outcome;` in both `world.wit` copies (`:237`), the marshaller in `crates/cyrup-ext/src/host/live.rs`, and pass `self.config.cwd` from `aggregate_project_trust` (`facade.rs:466-478`) — the facade already holds it at `HostConfig.cwd` (`facade.rs:106`). Export re-signing ⇒ bump `HOST_WORLD`. EXT-044 is the complementary import-only change that serves every other handler and needs no bump. Pair with EXT-003, which is the store this verdict should key.
+
+**Verify** — load two projects in one process with a native that decides trust; assert its handler receives each project's own cwd and that a per-directory allowlist yields different verdicts. Extend the trust assertions in `crates/cyrup-ext/tests/aggregation.rs`.
+
+## EXT-044 — ctx.cwd is unreachable from a WASM guest
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `grep -n cwd crates/cyrup-ext/wit/world.wit` at HEAD returns exactly three hits, **none of them an accessor**: a comment at `:194`, the `on-user-bash` event parameter at `:198`, and the `proc.spawn` argument at `:395`. `interface ctx-state` (`world.wit:523-540`) offers get-mode / has-ui / is-idle / has-pending-messages / is-project-trusted / get-system-prompt and nothing path-shaped, even though its own header comment claims to mirror pi's base `ExtensionContext`. The host holds the value on every path (`HostConfig.cwd`, `crates/cyrup-ext/src/facade.rs:106`, threaded into `HostCtx::event`/`::command` for natives at `:307`/`:337`); only the WIT verb and the copy into `GuestState` are missing. The native tier **does** expose it (`ctx.cwd`, read e.g. at `crates/cyrup-ext-subagents/src/extension.rs:9500`), which is why the gap is invisible from the shipped population.
+
+**upstream** — `cwd: string` sits on the **base** `ExtensionContext` at `pi/packages/coding-agent/src/core/extensions/types.ts:315` @v0.83.0 (same block as `mode` `:311` and `hasUI` `:313`), so it is available to every handler and every tool execute, not just command handlers; interactive mode supplies `cwd: this.sessionManager.getCwd()`.
+
+**Impact** — a guest cannot resolve any relative path: it cannot tell which project it is running in, cannot scope a cache, cannot interpret a path in a tool argument, and cannot compose a path for its `ext-fs` or `exec` capability without guessing. That is a divergence between cyrup's own two extension tiers as well as against pi. It is also the cheapest fix for two other items — EXT-016 and EXT-043 both degrade to nice-to-have once a guest can simply ask.
+
+**Fix** — add `get-cwd: func() -> string;` to `interface ctx-state` (`world.wit:523-540`) in **both** copies — an **import**, so per `crates/cyrup-ext/src/manifest.rs:51-54` it is additive and needs no `HOST_WORLD` bump — implement it on `HostState` beside the other ctx-state getters in `crates/cyrup-ext/src/host/live.rs`, sourcing `GuestState`'s copy of `HostConfig.cwd` (extend `with_host_mode`, `facade.rs:1077-1081`, which today copies only mode and has-ui), and expose it as `Ctx::cwd()` in `crates/cyrup-ext-sdk/src/ctx.rs` beside `mode()`/`has_ui()`.
+
+**Verify** — a guest asserting `ctx.cwd()` equals the session cwd from an event handler, a tool `execute`, and a command handler alike. Add to `crates/cyrup-ext/tests/guest_host_mode.rs`, which already drives the mode/has-ui pair the same way.
+
+## EXT-047 — ui.set-widget drops pi's widget key and placement
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `set-widget: func(widget-json: string);` (`crates/cyrup-ext/wit/world.wit:326`) — one opaque payload where pi takes three arguments. The host forwards it verbatim (`crates/cyrup-ext/src/host/live.rs:245-250`) into `UiEffect::SetWidget { widget: Value }` (`crates/cyrup-session-svc/src/host_services.rs:154`), whose own doc at `:148-153` **admits** the collapse and says there is "no cyrup-side convention to re-derive them from". The TUI then stores the whole blob in one slot (`AppState::extension_widget`, assigned at `crates/cyrup-tui/src/app.rs:3228`). A de-facto convention already exists and is unenforced: the shipped subagents extension hand-rolls `{"key": FLEET_STATUS_WIDGET_KEY, "content": null}` to mean *clear* (`crates/cyrup-ext-subagents/src/extension.rs:9489-9492`, `:9979-9982`, the latter commented "pi `ctx.ui.setWidget(FLEET_STATUS_WIDGET_KEY, undefined)`") — and that clear still leaves `extension_widget = Some({key, content: null})`, not `None`.
+
+**upstream** — `setWidget(key: string, content: string[] | undefined, options?: ExtensionWidgetOptions)` at `pi/packages/coding-agent/src/core/extensions/types.ts:170-175` @v0.83.0 (plus a component-factory overload), with `ExtensionWidgetOptions {placement?}` at `:107-110` and `WidgetPlacement = "aboveEditor" | "belowEditor"` at `:104`. The key is what makes it a **map**: one widget per key, `undefined` content removes that key's widget, placement decides which chrome slot it lands in.
+
+**Impact** — three concrete losses. (1) Two extensions that both set a widget silently clobber each other. (2) A widget cannot be removed — the shipped subagents extension already tries and the slot stays occupied with a null-content payload. (3) `belowEditor` placement is unexpressible. The read side is area 07's territory (TUI-S01 / TUI-014); the WIT signature is what makes the host structurally unable to do the right thing.
+
+**Fix** — re-sign the import as `set-widget: func(key: string, content-json: option<string>, opts-json: string);` in both `world.wit` copies — an import re-signing, so bump `HOST_WORLD` and batch with the other ABI items. Change `HostServices::set_widget` (`crates/cyrup-ext/src/host/services.rs:260`) and `UiEffect::SetWidget` (`crates/cyrup-session-svc/src/host_services.rs:154`) to `{key, content: Option<Value>, placement}`, and turn `AppState::extension_widget` into a keyed map whose `None` content removes the entry. Update the two shipped call sites in `crates/cyrup-ext-subagents/src/extension.rs` to the typed form they are already emulating by hand.
+
+**Verify** — two extensions each setting a widget under its own key: assert both are retained; then have one clear its key and assert only the other survives. Assert a `belowEditor` widget is distinguishable from an `aboveEditor` one at the host boundary.
+
+## EXT-049 — ToolCallEventResult.terminate is unrepresentable
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `HookOutcome::Block { reason: Option<String> }` (`crates/cyrup-ext/src/contract.rs:12-21`) has no terminate channel, and neither does the WIT `hook-outcome` arm `block(option<string>)` (`crates/cyrup-ext/wit/world.wit:30-35`). A block therefore reaches the agent as a plain error result: `dispatch_block_mutate` returns `Reduced::Blocked{reason}` (`crates/cyrup-ext/src/dispatch.rs:249-262`), which the agent turns into `immediate_error` (`crates/cyrup-agent/src/agent.rs:1008-1030`), hardcoding `terminate: false` at `:1030`. The batch machinery it would feed already exists and works — `has_more_tools = !batch.terminate;` at `agent.rs:534`, with the `every()`-equivalent at `:1306` — so only the seam is missing.
+
+**upstream** — `ToolCallEventResult` gained `terminate?: boolean` at `pi/packages/coding-agent/src/core/extensions/types.ts:1072-1079` @v0.84.1 (**absent at v0.83.0**, so this landed after the ported baseline), documented "Hint that the agent should stop after the current tool batch when this call is blocked. Early termination only happens when every finalized tool result in the batch sets this to true." Consumed at `packages/agent/src/agent-loop.ts:636-646` and folded by `shouldTerminateToolBatch` at `:583` into `hasMoreToolCalls = !executedToolBatch.terminate` at `:216`.
+
+**Impact** — a permission gate that denies a call hard — the motivating case, and cyrup's `tool_call` subscriber **is** the permission system — cannot end the run. Upstream, a gate that blocks every call in a batch with `terminate` stops the loop; under cyrup the model gets the error results back and keeps retrying against a gate that will deny every one, burning turns and tokens. It is also silently unavailable: an author writes `terminate: true` and nothing reads it.
+
+**Fix** — add `terminate: bool` to `HookOutcome::Block` (`contract.rs:16`) and turn the WIT `block(option<string>)` arm into a `block-result` record `{reason: option<string>, terminate: bool}` (`world.wit:30-35`, both copies); carry it through `Reduced::Blocked` (`dispatch.rs:249-262`) and the `Hooks` adapter (`crates/cyrup-ext/src/hooks.rs`); set it on the finalized result where `immediate_error` is built for the **block** path only (`agent.rs:1008-1030`) so the existing every()-rule at `:1306` picks it up. `hook-outcome` re-signing touches every export ⇒ bump `HOST_WORLD`. Add the field to the native `HookOutcome` too, so the permission system can use it without a WASM boundary.
+
+**Verify** — an extension blocking **every** call in a two-call batch with terminate: assert the agent loop ends after the batch. Assert that blocking only one of two does **not** terminate (upstream's `every()` rule). Add beside the fail-closed assertions in `crates/cyrup-ext/tests/ext_fail_closed.rs`.
+
+## EXT-052 — An extension-supplied streamSimple provider fires neither before_provider_request nor after_provider_response
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
+
+**cyrup** — `grep -rn 'onPayload\|on_payload\|onResponse\|on_response' crates/cyrup-ext-sdk/src crates/cyrup-ext/src` returns nothing but Undici `onResponseStart` comments in `caps/http.rs`. A guest's custom stream is driven by `provider-stream-simple: func(id, stream-id, model-json, context-json, options-json) -> result<_, string>` (`crates/cyrup-ext/wit/world.wit:105`), invoked at `crates/cyrup-ext/src/host/live.rs:1296-1320`, which stringifies `options` (`:1306`) and hands it over as an opaque blob; the only callback back is `provider-stream.emit-event` (`world.wit:506`), which carries assistant-message stream events and nothing about the request payload or the HTTP response. So a guest provider has no way to invoke the two hooks, and cyrup's own `emit_before_provider_request` (`crates/cyrup-ext/src/facade.rs:592-606`) and the `AfterProviderResponse` dispatch are never reached on that route.
+
+**upstream** — pi made this a hard contract in the `ProviderConfig.streamSimple` doc at `pi/packages/coding-agent/src/core/extensions/types.ts:1452-1457` @v0.84.1: "Implementations must invoke `options.onPayload` before sending the provider request and use any returned replacement payload. They must invoke `options.onResponse` after receiving the response and before consuming its body, matching built-in providers." The callbacks are declared on `StreamOptions` in `packages/ai/src/types.ts`, and they are how `before_provider_request` (`extensions/types.ts:676-679`) and `after_provider_response` (`:692-696`) reach requests a provider actually issues.
+
+**Impact** — every request an extension-registered provider makes is invisible to every other extension. A proxy-tagging, auditing, redaction or cost-accounting extension that works against built-in providers silently stops working the moment the user switches to an extension-supplied one, with no diagnostic — a silent behaviour change keyed on model choice. It also means `before_provider_request`'s payload **replacement** (the one mutating provider seam cyrup does have) cannot be applied on that route, so a redaction extension leaks. Compounds EXT-009: neither the header hook nor the payload hook covers extension providers.
+
+**Fix** — add two host imports on `interface provider-stream` (`world.wit:505-507`), both additive so no `HOST_WORLD` bump: `on-payload: func(stream-id: string, payload-json: string) -> option<string>;` returning a replacement, and `on-response: func(stream-id: string, status: u16, headers-json: string);`. Implement them on `HostState` beside `emit_event` in `crates/cyrup-ext/src/host/live.rs`, routing the first through `ExtensionHost::emit_before_provider_request` (`facade.rs:592`) and the second through an `AfterProviderResponse` dispatch — the same two reductions the built-in provider path already uses. Expose them from `crates/cyrup-ext-sdk/src/provider.rs` and document the must-invoke contract there verbatim from `types.ts:1452-1457`.
+
+**Verify** — a guest provider whose `stream_simple` calls `on_payload` and `on_response`; with a second extension subscribed to `before_provider_request` and `after_provider_response`, assert the second sees both and that a payload replacement returned by `on_payload` is what the guest provider actually sends.
+
+## EXT-055 — FsCaps::with_fs_root has zero callers, so ext-fs is permanently denied for every guest
+
+**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** high
+
+**cyrup** — `GuestState.fs` is initialized `fs: FsCaps::default()` (`crates/cyrup-ext/src/host/services.rs:1181`), and `FsCaps { root: Option<PathBuf> }` documents `None => all fs access denied` (`:958-962`); `FsCaps::resolve` opens with `let root = self.root.as_ref().ok_or("filesystem capability not granted")?;` (`:967-969`). The only mutator — `self.fs = FsCaps { root: Some(root) };` (`services.rs:1211`) — has **zero callers** workspace-wide; the only grep hit is its own definition. Therefore `ext-fs.read-file` and `ext-fs.write-file` (`crates/cyrup-ext/wit/world.wit:462-466`, host impls `crates/cyrup-ext/src/host/live.rs:625-635`, both of which call `guest.fs.resolve(&path)?` first) return `Err("filesystem capability not granted")` for every extension ever loaded.
+
+**upstream** — none; pi has no capability model. Like EXT-054 this is a cyrup-original invariant that does not hold, and shares its root cause: the manifest's `fs: ["read:.", "write:.cyrup/todo"]` grant syntax (`crates/cyrup-ext/src/manifest.rs:26-28`) has no code that could ever honour it.
+
+**Impact** — fail-closed, so not a security hole, but `interface ext-fs` is exported in the world's import list and documented as a real capability that can never succeed. A guest author gets an opaque runtime error string with no diagnostic pointing at the missing wiring, and no configuration that would fix it.
+
+**Fix** — parse the manifest `fs` grants and call `with_fs_root` (or a multi-root successor) during `load_wasm`, which is exactly the thread EXT-054 opens; until the grant parser exists, at minimum seed the root from `HostConfig.cwd` for pre-trusted origins so the interface is reachable, and make the denial error name the manifest key that would grant it. Do not ship `ext-fs` as an unreachable export.
+
+**Verify** — a guest with a manifest granting `read:.` reads a file under the session cwd and is refused a read outside it; a guest with no `fs` grant is refused both, with an error naming the manifest key.
+
+## EXT-016 — resources_discover carries neither cwd nor reason
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `HostEvent::ResourcesDiscover` is a payload-less unit variant (`crates/cyrup-ext/src/event.rs:309`, kind mapping `:397`); WIT `on-resources-discover: func() -> hook-outcome;` (`crates/cyrup-ext/wit/world.wit:236`), dispatched from `aggregate_resources` (`crates/cyrup-ext/src/facade.rs:482-487`). There is no cwd accessor anywhere in the WIT to fall back on (EXT-044).
+
+**upstream** — `ResourcesDiscoverEvent { type, cwd, reason: "startup" | "reload" }` at `pi/packages/coding-agent/src/core/extensions/types.ts:544-548` @v0.83.0.
+
+**Impact** — a resource-contributing extension cannot tell which directory it is discovering for, nor distinguish startup from a `/reload`, so it cannot cache or scope its contribution. Low rather than medium because the handler returns paths rather than making a security decision — unlike EXT-043, which is the same shape on the trust hook.
+
+**Fix** — add `cwd: String` and `reason: String` to the variant, pass them from the discovery call site and the reload path, widen `world.wit:236` in both copies. Export re-signing ⇒ bump `HOST_WORLD`. EXT-044 (`ctx-state.get-cwd`) is the cheaper partial that needs no bump and covers the cwd half for every handler at once.
+
+**Verify** — a guest asserting a non-empty cwd and `reason == "startup"` at launch, and `"reload"` after `/reload`.
+
+## EXT-019 — registerMarkdownTransformer has no counterpart
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** high
+
+**cyrup** — `grep -rni 'markdown_transformer\|markdowntransform\|transform-markdown' crates/` returns zero hits at HEAD, and nothing in `crates/cyrup-ext/wit/world.wit`.
+
+**upstream** — **re-scoped this pass**: at v0.83.0 this was a bare `MarkdownTransformer` type; the `v0.83.0..v0.84.1` diff adds `MarkdownTransformContext { messageType, isStreaming, availableWidth }` at `pi/packages/coding-agent/src/core/extensions/types.ts:1147-1153`, `registerMarkdownTransformer` on `ExtensionAPI` at `:1292` (impl `loader.ts:309-312`), `markdownTransformer?` on `Extension` at `:1703`, and `ExtensionRunner.getMarkdownTransformers()` at `runner.ts:589-591`.
+
+**Impact** — extensions cannot post-process transcript Markdown (link rewriting, redaction, custom syntax). Post-baseline upstream addition — expected lag, not a regression.
+
+**Fix** — port the **v0.84.1** shape, not the v0.83.0 one: a registration import in `world.wit`'s `interface registration`, an owner list in `registry.rs` preserving load order, a `transform_markdown` fold on the facade that passes the three context fields, and a call site in the TUI markdown render path. Guest export ⇒ bump `HOST_WORLD`.
+
+**Verify** — two guests transforming the same message; assert both applied in load order and that `is_streaming` differs between a streaming and a settled render.
+
+## EXT-022 — ProviderConfig.refreshModels is not represented
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** high
+
+**cyrup** — `ProviderConfig` (`crates/cyrup-ext/src/provider.rs:17-42`) has no refresh hook — `has_stream_simple` at `:41` is the last field; the WIT provider block (`crates/cyrup-ext/wit/world.wit:101-105`) has login / refresh-token / get-api-key / modify-models / stream-simple and no `provider-refresh-models`.
+
+**upstream** — `refreshModels?(context: RefreshModelsContext)` at `pi/packages/coding-agent/src/core/extensions/types.ts:1448` @v0.83.0, moved to `:1469` @v0.84.1 — and **the contract changed since this item was filed**: the doc now reads `Use context.publish({ persist: entry })` where v0.83.0 said `context.store`.
+
+**Impact** — an extension provider's model list is fixed at registration; a provider that gains models at runtime cannot refresh them.
+
+**Fix** — add a `provider-refresh-models` guest export in both `world.wit` copies plus a marker on `ProviderConfig`, shaped to the **publish/persist** contract rather than the old store one, and reuse the collapse-concurrent-calls machinery at `crates/cyrup-provider/src/utils/refresh.rs`. Guest export ⇒ bump `HOST_WORLD`.
+
+**Verify** — a guest provider whose `refresh_models` publishes a changed list; assert the model picker reflects it, that a `persist` entry survives a restart, and that concurrent refreshes collapse.
+
+## EXT-025 — reload() and four emit_* facade methods are dead code that has drifted
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — per-symbol greps at HEAD: `emit_before_agent_start` (`crates/cyrup-ext/src/facade.rs:495`) — callers are `tests/wasm_dispatch.rs:68,86` and `crates/cyrup-ext-subagents/tests/child_prompt_runtime_integration.rs:121`, all tests; `emit_input` (`:532`) — `wasm_dispatch.rs` only; `emit_user_bash` (`:612`) — `wasm_dispatch.rs` only; `command_completions` (`:1207`) — `tests/discover_load.rs:100` only; `ExtensionHost::reload` (`:1271`) — `discover_load.rs:118` only. `emit_message_end` (`:562`) is the live exception (`crates/cyrup-session-svc/src/subscriber.rs:156`). The drift is confirmed on both sides: the live production input path is the **separate inline copy** `AgentSession::emit_input_event` (`crates/cyrup-session-svc/src/session.rs:907`, called from `:872`), and the live `emit_user_bash_event` (`session.rs:4590-4614`) threads `exclude_from_context` (`:4599`) and the **session** cwd (`:4600`) while the facade copy hardcodes `exclude_from_context: false` and the **process** cwd (`facade.rs:617-627`).
+
+**upstream** — one emitter per event on `ExtensionRunner` and no parallel unused copy (`pi/packages/coding-agent/src/core/extensions/runner.ts:950-977` for `emitUserBash`) @v0.83.0.
+
+**Impact** — two implementations of the same seam, one exercised only by tests and already behind in signature. A contributor editing the facade copy changes nothing in production; one editing only the inline copy leaves the tests asserting stale behaviour. `reload()` being dead is also what makes EXT-050's only teardown path unreachable.
+
+**Fix** — either delete the four dead `emit_*` methods and `reload()` and repoint the tests at the live paths, or make the live paths call the facade so there is one implementation — the latter is what `emit_message_end` already demonstrates. Prefer the latter; EXT-034 and EXT-050 both need a single seam to hook.
+
+**Verify** — grep confirms each `emit_*` has at least one production caller or no definition; `tests/wasm_dispatch.rs` and `tests/discover_load.rs` exercise the live paths.
+
+## EXT-026 — A wasmtime-free cyrup-session-svc build cannot be produced
+
+**Kind** cyrup-original · **Severity** low · **Effort** M · **Confidence** medium (static analysis only — no compile was run this pass either)
+
+**cyrup** — `mod host_services;` is still unconditional at `crates/cyrup-session-svc/src/lib.rs:29`, and `crates/cyrup-session-svc/src/host_services.rs:17-19` still imports `cyrup_ext::caps::http::HttpCaps`, `cyrup_ext::caps::proc::ProcCaps` and `cyrup_ext::host::{…}` with no cfg guard. `Cargo.toml:73` declares `cyrup-ext = { path = "crates/cyrup-ext", version = "0.0.0" }` with no `default-features = false`, while `crates/cyrup-session-svc/Cargo.toml:33` inherits it `{ workspace = true }` and declares its own forwarding feature at `:23`, so cyrup-ext's `default = ["wasm-host"]` stays on regardless. The never-compiled `not(wasm-host)` arms have **multiplied** since this item was filed: `facade.rs:441-443` (`materialize_guest_tools`), `:899-908` (`render_via_guest`), `:1261-1264` (`run_shortcut`).
+
+**upstream** — no analog; pi has no compile-time feature tiers. This is a cyrup-original invariant (`wasm-host` is documented as an opt-*out* slimming switch) that does not hold.
+
+**Impact** — the advertised slim build is unbuildable, and the `not(wasm-host)` code paths accumulate without ever being type-checked, so they will not work when the gate is finally fixed.
+
+**Fix** — gate `mod host_services;` and its `cyrup_ext::caps`/`cyrup_ext::host` imports on `wasm-host`; declare `cyrup-ext` in the workspace with `default-features = false` and re-enable `wasm-host` from the crates that want it; then compile the `not(wasm-host)` arms at least once and add them to CI.
+
+**Verify** — `cargo check -p cyrup-session-svc --no-default-features` succeeds and the resulting dependency graph contains no `wasmtime`.
+
+## EXT-027 — pi's bundled llama.cpp router extension has no counterpart
+
+**Kind** not-ported · **Severity** low · **Effort** L · **Confidence** high
+
+**cyrup** — `grep -rli llama crates/` returns only incidental hits in `cyrup-provider`/`cyrup-config` (`auth/helpers.rs`, `utils/overflow.rs`, `providers/together.rs`, `api/openai_completions.rs`, `tests/catalog_data.rs`, `cyrup-config/src/login.rs`). There is no bundled-extension tier in cyrup at all.
+
+**upstream** — `pi/packages/coding-agent/src/extensions/` holds `index.ts` plus `llama/{client,huggingface,index,provider,ui}.ts` at v0.83.0, and it kept moving — `git diff --stat v0.83.0..v0.84.1 -- packages/coding-agent/src/extensions/` shows `llama/index.ts` +11 and `llama/provider.ts` +28.
+
+**Impact** — no local llama.cpp routing out of the box. Lowest value in this area.
+
+**Fix** — only worth doing if a bundled-extension tier is wanted; it would be the first. Needs a shipped-with-binary extension registration path alongside `NativeExtension`.
+
+**Verify** — n/a until the tier exists. *Carried forward on prior evidence*: the llama source itself has still not been read on either pass.
+
+## EXT-028 — Both world.wit copies still declare `cyrup:ext@0.3.0` on line 1 while the package line is 0.4.0
+
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — the four halves this item was filed for are **closed** (see the status table). What survives is the item's own subject applied to itself: `crates/cyrup-ext/wit/world.wit:1` and `crates/cyrup-ext-sdk/wit/world.wit:1` both read `// cyrup:ext@0.3.0 — the versioned WIT world (arch-08 §4.1).` while line 18 of the same file reads `package cyrup:ext@0.4.0;` and `crates/cyrup-ext/src/manifest.rs:69` reads `HOST_WORLD = "cyrup:ext@0.4"`. `manifest.rs:14` likewise still says "WIT world compatibility, e.g. `cyrup:ext@0.3`". The tie test `host_world_matches_the_wit_package_version_in_both_copies` (`crates/cyrup-ext/tests/wit_world_sync.rs:71-89`) parses only the `package` line, so nothing guards the header marker — and since the file also went 0.2→0.3, that marker has now rotted through **two** bumps.
+
+**upstream** — no analog; pi has no compiled ABI. The invariant being violated is cyrup's own, stated at `manifest.rs:41-54`.
+
+**Impact** — doc-only, but on the one file whose versioning discipline is this item's entire subject. A reader checking "which world does this file declare?" gets 0.3.0 from line 1 and 0.4.0 from line 18, and the guard that exists cannot see the disagreement. Exactly the rot class EXT-028 was filed against.
+
+**Fix** — correct line 1 in **both** copies and `manifest.rs:14`, then extend `wit_world_sync.rs:71-89` to parse the header comment as well as the `package` line and assert all three agree with `HOST_WORLD`. Any version string in the file that the test does not read will rot again.
+
+**Verify** — `grep -n '0\.3' crates/cyrup-ext/wit/world.wit crates/cyrup-ext-sdk/wit/world.wit crates/cyrup-ext/src/manifest.rs` returns nothing but the intentional bump-history lines, and the extended test fails if either copy's header is edited alone.
+
+## EXT-032 — p3_no_human_wait_is_still_budget_contained asserts an uncontrollable wall-clock bound
+
+**Kind** test-defect · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `assert!(elapsed < Duration::from_millis(300), "budget-contained near 80ms, took {elapsed:?}");` at `crates/cyrup-ext/tests/native_dispatch.rs:877`, on a `Dispatcher::with_budget(Duration::from_millis(80))` (`:863`) against a 400ms sleep (`:858`) — 220ms of scheduling headroom under a full parallel `cargo test`. It is strictly redundant with the deterministic outcome assertion at `:878-884`, which already rejects the not-budget-fired case by requiring the reason to contain "Extension failed, blocking execution". The timing assertion can therefore only fail spuriously.
+
+**upstream** — no analog; a cyrup test-suite defect of the class the project keeps finding.
+
+**Impact** — a flaky failure under load that blames the dispatcher budget, eroding trust in the suite. It proves nothing the surrounding assertions do not already prove deterministically.
+
+**Fix** — delete the assertion at `native_dispatch.rs:877`. If a timing bound is wanted for documentation, use the defensive 2s form already used at `:710`.
+
+**Verify** — the test still **fails** if `fails_closed` or the budget watchdog is reverted, and passes under `cargo test -- --test-threads=1` and under a loaded parallel run alike.
+
+## EXT-036 — The event-catalog provenance comments are stale in four places and contradict each other
+
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — **corrected this pass**: the prior audit declared the `world.wit` half closed. It is not; four stale sites survive, two of them inside the header the count test *does* guard. (1) `crates/cyrup-ext/src/event.rs:57-58` still reads "1:1 with Pi's 31-event catalog (extensions/types.ts:1133-1171 + `agent_settled` at :1225)" — the 1:1 claim is false and the range is wrong; `event.rs:100` repeats the same range. (2) `crates/cyrup-ext/wit/world.wit:89`, inside `interface events`, still reads "All 30 Pi events (extensions/types.ts:1133-1171) are represented here" — contradicting the file's own header 81 lines above, in **both** copies. (3) The header itself (`world.wit:8-11`) cites "extensions/types.ts:1198-1239, 33 overloads": the real overload block is `types.ts:1190-1231` @v0.83.0 and `:1203-1244` @v0.84.1, so the cited range corresponds to **no version**. (4) The version marker on line 1 is EXT-028's residual, tracked there. `the_header_event_count_matches_the_declared_event_exports` (`crates/cyrup-ext/tests/wit_world_sync.rs:96-129`) ties the *number* and nothing else, which is why a fabricated citation passed straight through an audit that quoted it as evidence.
+
+**upstream** — the `on(event: "…")` overload block is `pi/packages/coding-agent/src/core/extensions/types.ts:1190-1231` @v0.83.0, 33 overloads (re-derived by hand this pass and confirmed). Enumerating them against `EventKind::name()` (`event.rs:104-134`) leaves exactly `before_provider_headers` (EXT-009) and `session_info_changed` (EXT-011) — no third gap and no cyrup-invented event.
+
+**Impact** — these comments are the primary provenance marker a reader consults to decide whether the event catalog is complete, and they assert a completeness that does not hold, in places that disagree with each other on the number and cite a range that matches no upstream version. Under this project's rules an in-tree pi citation *is* the guarantee that a port matches upstream; a fabricated range is worth as much as no range.
+
+**Fix** — rewrite `event.rs:57-58` and `:100` to state the real position (31 of pi's 33, `extensions/types.ts:1190-1231` at the ported tag), naming the two outstanding events and cross-referencing EXT-009 / EXT-011; fix `world.wit:89` and the header range at `:8-11` in **both** copies. Then extend `wit_world_sync.rs:96-129` to validate the cited **range** against the tag as well as the count — otherwise the next citation rots the same way.
+
+**Verify** — grep the crate for `1133-1171`, `1198-1239` and `30-event`; confirm no occurrences remain in either `world.wit` copy or in `event.rs`, and that the stated missing-event list matches a diff of pi's `on`-event names against `EventKind::name()`.
+
+## EXT-037 — ext-tools.get-commands returns bare extension command names only
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `crates/cyrup-ext/src/host/live.rs:760-766` builds `guest.registry.command_names()` (`crates/cyrup-ext/src/registry.rs:656-658`, a `HashMap::keys()` walk) and maps each to `json!({"name": n})`. A guest therefore gets: extension commands only, **raw** names (never `name:N`), no `description`, no `source`, no `sourceInfo`, and a nondeterministic order. cyrup already builds the correct shape elsewhere — `AgentSession::slash_command_catalog` (`crates/cyrup-session-svc/src/session.rs:2275-2310`) emits `{name, description, source, sourceInfo}` for extension commands, prompt templates **and** skills — but `ext-tools.get-commands` (`crates/cyrup-ext/wit/world.wit:516`) does not route through it and `GuestServices` exposes no accessor for it.
+
+**upstream** — `getCommands()` returns `[...extensionCommands, ...templates, ...skills]`, where extension commands map to `{name: command.invocationName, description, source: "extension", sourceInfo}` (`pi/packages/coding-agent/src/core/agent-session.ts:2332-2354` @v0.83.0); the type is `SlashCommandInfo` at `core/slash-commands.ts:6-11`, declared on the API at `extensions/types.ts:1329`.
+
+**Impact** — a guest calling `pi.getCommands()` cannot render a command palette, cannot show descriptions, cannot see prompt templates or skills at all, and cannot invoke a colliding second `deploy` because it is handed the raw name. Rated **low**, not medium: this is pure information loss on a guest-only introspection API, no WASM guest ships, and cyrup's natives use a different path entirely. EXT-017 is the same defect on a path a user sees today, which is where the medium sits.
+
+**Fix** — add a `commands()` accessor to `HostServices` (`crates/cyrup-ext/src/host/services.rs`, beside `active_tools`) returning the `slash_command_catalog()` rows; implement it in `LiveHostServices` (`crates/cyrup-session-svc/src/host_services.rs`) by delegating to `AgentSession::slash_command_catalog`; have `get_commands` (`host/live.rs:760`) prefer the live backend and fall back to `registry.resolved_commands()` (`registry.rs:462`) emitting `{name: r.invocation_name, description, source: "extension"}` when no session is attached. This is the live-source-with-registry-fallback pattern `get_active_tools` already uses at `host/live.rs:736-743`.
+
+**Verify** — register two extension commands both named `deploy`, one prompt template and one skill; assert a guest's `get_commands()` returns four rows in load order with `deploy:1`/`deploy:2`, non-empty descriptions, and `source` values covering extension/prompt/skill. Add to `crates/cyrup-ext/tests/aggregation.rs` beside the existing `resolved_commands` assertions at `:227-238`.
+
+## EXT-040 — register-shortcut's description is discarded, so /hotkeys shows a raw key-id
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `async fn register_shortcut(&mut self, key: String, _desc: String)` at `crates/cyrup-ext/src/host/live.rs:98-101` explicitly discards the description and calls `guest.registry.register_shortcut(guest.owner.clone(), key)`; the registry method (`crates/cyrup-ext/src/registry.rs:515-523`) takes only `(owner, key)` and `shortcuts` is `HashMap<String, ExtensionId>` (`registry.rs:144`), so there is nowhere to put it. `ExtensionHost::shortcut_keys()` returns bare ids (`facade.rs:1233-1235`) and the `/hotkeys` table falls back to printing the key id as its own label — `let label = spec.description.as_deref().unwrap_or(spec.id.as_str());` at `crates/cyrup-tui/src/app.rs:2158`, whose surrounding comment (`:2151-2157`) names this exact drop at `live.rs:98`. The WIT already carries the field: `register-shortcut: func(key: string, desc: string);` (`crates/cyrup-ext/wit/world.wit:274`).
+
+**upstream** — `ExtensionShortcut { shortcut: KeyId; description?: string; handler; extensionPath: string }` at `pi/packages/coding-agent/src/core/extensions/types.ts:1524-1529` @v0.83.0, registered via `registerShortcut(shortcut, {description?, handler})` at `:1250`. The `/hotkeys` Extensions table renders `const description = shortcut.description ?? shortcut.extensionPath;` at `modes/interactive/interactive-mode.ts:5856`.
+
+**Impact** — `/hotkeys` lists extension bindings as `ctrl+alt+f | ctrl+alt+f` instead of `Ctrl+Alt+F | Show the subagent fleet`. The value crosses the WIT boundary and is thrown away one line inside the host, and there is no fallback to the extension id either, which pi has.
+
+**Fix** — widen `shortcuts` to `HashMap<String, (ExtensionId, Option<String>)>` (`registry.rs:144`), thread `desc` through `register_shortcut` (`registry.rs:515`) and the host import (`host/live.rs:98`), and add `shortcut_specs() -> Vec<(String, Option<String>)>` on the facade beside `shortcut_keys()` (`facade.rs:1233`). The TUI already accepts the richer form — `ShortcutSpec`'s `From<(String, Option<String>)>` impl at `crates/cyrup-tui/src/app.rs:2189-2193` exists for precisely this — so the only other edit is `crates/cyrup/src/main.rs:1653`. Fall back to the extension **id**, not the key, when `desc` is empty. Land with EXT-039 and EXT-035, which rewrite the same registrar.
+
+**Verify** — a guest registering `ctrl+t` with description "Toggle X": assert `/hotkeys` renders `Toggle X` in the Action cell. Extend `crates/cyrup-tui/tests/extension_shortcut.rs`.
+
+## EXT-042 — model_select buries previousModel/source, and thinking_level_select drops previousLevel
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `HostEvent::ModelSelect { model: Value }` (`crates/cyrup-ext/src/event.rs:329`) and `ThinkingLevelSelect { level: String }` (`:330`); WIT `on-model-select: func(model-json: string);` and `on-thinking-level-select: func(level: string);` (`crates/cyrup-ext/wit/world.wit:206-207`). The producer nests two of pi's three top-level model fields **inside** `model`: `crates/cyrup-session-svc/src/session.rs:2757-2761` builds `{"provider", "id", "previousModel": {…}, "source": source}` and passes the whole object as the `model` payload at `:2766`. `previousLevel` has no producer at all — `session.rs:3119` dispatches `ThinkingLevelSelect { level: level_str }` and nothing else, even though the previous level is in scope a few lines earlier at the no-op guard, which makes the fix trivial. The SDK's decoded types confirm neither is reachable (`crates/cyrup-ext-sdk/src/events.rs:115-117`, `:121-123`).
+
+**upstream** — `ModelSelectEvent { type, model, previousModel, source }` at `pi/packages/coding-agent/src/core/extensions/types.ts:793-798` and `ThinkingLevelSelectEvent { type, level, previousLevel }` at `:801-805` @v0.83.0 — three and three sibling fields respectively.
+
+**Impact** — a pi extension ported to cyrup reads `event.previousModel` / `event.source` and gets `undefined`; they exist one level down inside `event.model`, which is also where `provider`/`id` live, so `model` is not a `Model` shape either. `previousLevel` cannot be recovered at all, so a handler that wants to react only to an *increase* in thinking level must keep its own shadow copy and will be wrong on the first event of a session.
+
+**Fix** — widen both variants (`event.rs:329-330`) to `ModelSelect { model, previous_model: Option<Value>, source: String }` and `ThinkingLevelSelect { level, previous_level: Option<String> }`, widen the two WIT exports in both copies, un-nest at `session.rs:2757-2766`, and capture the pre-change level before it is overwritten so it can be passed at `:3119`. Add the fields to the SDK event structs (`events.rs:115`, `:121`). Export re-signing ⇒ bump `HOST_WORLD`; batch with the other ABI items.
+
+**Verify** — switch model twice and thinking level twice; assert a subscribed guest sees `previous_model`/`source` as top-level fields and a `previous_level` that differs from `level` on the second change.
+
+## EXT-045 — ctx.scopedModels and ctx.signal are unreachable, and EXT-005's CYRUP-DELTA notes were never written
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `grep -n 'CYRUP-DELTA\|scopedModels\|scoped_models\|ctx.signal' crates/cyrup-ext/src/lib.rs` returns **zero** at HEAD: the two provenance notes EXT-005's closure explicitly required ("Two CYRUP-DELTAs should be recorded in `cyrup-ext/src/lib.rs`") do not exist. Both gaps are still live. `scopedModels`: `interface models` (`crates/cyrup-ext/wit/world.wit:362-372`) has list-models / current / set-model / context-usage / thinking-level / set-thinking-level and no scoped accessor, while the host-side value exists and is maintained (`AgentSession::scoped_models`, `crates/cyrup-session-svc/src/session.rs:3771-3773`). `signal`: the only cancellation a guest can observe is per-call — `host-tool.is-cancelled: func(call-id: string) -> bool` (`world.wit:486`) — so a non-tool handler cannot ask whether a run is in flight or be woken when it aborts.
+
+**upstream** — `scopedModels: readonly ScopedModel[]` at `pi/packages/coding-agent/src/core/extensions/types.ts:326` ("Same set the `/scoped-models` command shows") and `signal: AbortSignal | undefined` at `:334` ("The current abort signal, or undefined when the agent is not streaming") @v0.83.0 — both on the **base** `ExtensionContext`, supplied on every context pi builds.
+
+**Impact** — small on its own: a guest cannot offer a model picker restricted to the session's scoped set, and cannot cooperatively bail out of long non-tool work when the run aborts. The larger cost is the missing note — EXT-005 was closed on the promise that these would be written into the source, and they were not, so the next reader of `crates/cyrup-ext/src/lib.rs` sees a `ctx-state` block claiming to mirror pi's `ExtensionContext` with nothing marking what it omits. That is exactly the mechanism (README structural blind spot 1) by which a gap becomes invisible.
+
+**Fix** — two import-only WIT additions, no `HOST_WORLD` bump (`manifest.rs:51-54`): `scoped-models: func() -> string;` on `interface models` (`world.wit:362`) fed by `AgentSession::scoped_models` through a new `HostServices` accessor, and `is-run-cancelled: func() -> bool;` on `interface ctx-state` (`world.wit:523`) fed by the session cancel token — the run-scoped analog of the existing per-call `host-tool.is-cancelled`. If `signal` is genuinely deferred, **write the CYRUP-DELTA this time**, naming `types.ts:334` and the reason (a live `AbortSignal` is not expressible as a component value).
+
+**Verify** — a guest asserting `models.scoped_models()` matches `/scoped-models`, and that a long-running non-tool handler observes `is-run-cancelled()` flipping after an abort. Grep `lib.rs` and assert a delta note exists for anything left unported.
+
+## EXT-046 — session.set-label cannot clear a label
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `set-label: func(entry-id: string, label: string);` (`crates/cyrup-ext/wit/world.wit:359`), with no `option<>`. The host import is `async fn set_label(&mut self, entry_id: String, label: String)` (`crates/cyrup-ext/src/host/live.rs:355-361`), forwarding to `HostServices::set_label(&self, entry_id: &str, label: &str)` (`crates/cyrup-ext/src/host/services.rs:478`), whose live impl always sets: `mgr.append_label(&EntryId::from(entry_id), Some(label))` at `crates/cyrup-session-svc/src/host_services.rs:1071`. The clearing primitive already exists one layer down — `append_label` takes `Option<&str>` — so only the two signatures block it.
+
+**upstream** — `setLabel(entryId: string, label: string | undefined): void;` at `pi/packages/coding-agent/src/core/extensions/types.ts:1314` @v0.83.0, documented "Set or clear a label on an entry. Labels are user-defined markers for bookmarking/navigation."
+
+**Impact** — an extension that labels entries (bookmarking or review markers, the documented use) can never remove one. An empty string does not clear it either — it writes an empty label — so the entry keeps a marker the user cannot get rid of through the extension that created it.
+
+**Fix** — change the WIT to `set-label: func(entry-id: string, label: option<string>);` in both copies (`:359`), widen the host import (`host/live.rs:355`) and the `HostServices::set_label` signature to `Option<&str>`, and pass it straight through to `append_label`, which already accepts it. Mirror in the SDK's `Ctx::set_label`. This is an **import re-signing**, which per `manifest.rs:51-54` **does** require a `HOST_WORLD` bump (a 0.4 guest imports the old two-string shape) — batch with the other ABI items.
+
+**Verify** — a guest setting then clearing a label on an entry; assert the tree shows the label and then no label. Extend `crates/cyrup-ext/tests/wasm_component.rs`.
+
+## EXT-048 — The dialog timeout key is `timeoutMs`; pi's field is `timeout`, and the in-tree citations are wrong
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — cyrup reads `timeoutMs`: `DialogOptions.timeout_ms` with serde camelCase (`crates/cyrup-ext-sdk/src/ctx.rs:472`, builder `:495-497`, lowered `:507`), consumed as `opts.timeout_ms` at `crates/cyrup-session-svc/src/host_services.rs:515`. The provenance comments assert this **is** pi's shape and are wrong twice over: `crates/cyrup-ext/wit/world.wit:312-313` (both copies) says "`opts-json` is the Pi `ExtensionUIDialogOptions` bag (types.ts:89): `{timeoutMs, signal}`", and `crates/cyrup-session-svc/src/host_services.rs:104` repeats it — and `types.ts:89` at v0.83.0 is a blank line before the UI Context banner.
+
+**upstream** — `export interface ExtensionUIDialogOptions { signal?: AbortSignal; timeout?: number; }` at `pi/packages/coding-agent/src/core/extensions/types.ts:95-100` @v0.83.0, with `timeout?: number` on `:100`, documented "Timeout in milliseconds. Dialog auto-dismisses with live countdown display." `git grep -n timeoutMs v0.83.0 -- packages/coding-agent/src` returns only unrelated startup-ui / http-dispatcher / package-manager hits, so there is no wire variant using `timeoutMs` either.
+
+**Impact** — small today because cyrup's own SDK is the only producer, so both halves agree. It becomes real the moment anything else writes the bag — a hand-written guest, a `custom()` overlay spec, or an RPC-side dialog forwarder — because `{timeout: 5000}` is silently ignored and the dialog gets the fallback ceiling instead of the author's bound, with no error. The immediate harm is the false provenance: two comments cite a pi line for a field name that does not exist there, and this project treats in-tree pi citations as the guarantee that a port matches upstream.
+
+**Fix** — accept both keys behind `crates/cyrup-session-svc/src/host_services.rs:515` (serde `alias = "timeout"` on `DialogOptions::timeout_ms`, `crates/cyrup-ext-sdk/src/ctx.rs:472`, with `timeout` as the canonical name), and correct the two citations at `world.wit:312-313` (both copies) and `host_services.rs:104` to name pi's real field (`{timeout, signal}`, `types.ts:95-100`) plus a one-line note that `timeoutMs` is accepted for back-compat. Comment-only in `world.wit`, so no `HOST_WORLD` bump.
+
+**Verify** — deserialize `{"timeout": 5000}` and `{"timeoutMs": 5000}` into `DialogOptions` and assert both yield 5000; grep the crate for `timeoutMs` cited as a pi field name and confirm none remain.
+
+## EXT-050 — pi.events gained stale-context guarding and tracked unsubscribe; cyrup's bus has neither
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** high
+
+**cyrup** — the WIT bus is emit + subscribe only, with no unsubscribe and no handle: `emit: func(topic: string, payload-json: string);` and `subscribe: func(topic: string);` (`crates/cyrup-ext/wit/world.wit:475-477`). `SharedBus` (`crates/cyrup-ext/src/host/services.rs`, `emit` at `:985-989`) keeps a subscriber table and a pending queue with a single blunt reset — `self.bus.clear()` inside `ExtensionHost::reload` (`crates/cyrup-ext/src/facade.rs:1288`) — which is all-or-nothing and, because `reload` is production-dead (EXT-025; sole caller `crates/cyrup-ext/tests/discover_load.rs:118`), never runs in production. There is no per-extension staleness concept anywhere in `crates/cyrup-ext/src/`.
+
+**upstream** — `events` stopped being the bare bus at v0.84.1 and became a guarded wrapper: `events: { emit(channel, data) { runtime.assertActive(); eventBus.emit(channel, data); }, on(channel, handler) { runtime.assertActive(); return runtime.trackEventBusSubscription(eventBus.on(channel, handler)); } }` (`pi/packages/coding-agent/src/core/extensions/loader.ts:413-421`). The runtime side added `eventBusUnsubscribers` (`:179`) and `trackEventBusSubscription` (`:215-225`), and `invalidate()` now runs every tracked unsubscribe and clears the set (`:206-214`); the interface field is at `extensions/types.ts:1610`.
+
+**Impact** — two behaviours cyrup cannot express. (1) A guest cannot stop listening on a topic — `bus.subscribe` is permanent for the instance's life, so an extension that listens only while a mode is active keeps receiving and must filter by hand. (2) A subscription registered by an extension whose context went stale (session replacement or reload) is not torn down and its emit is not refused; upstream now throws on both. Low today because the bus is wasm-only and cyrup ships zero WASM guests (EXT-018), but this is the shape the rest gets built on — fixing EXT-018/EXT-034 without it bakes in a leak.
+
+**Fix** — add `unsubscribe: func(topic: string);` to `interface bus` (`world.wit:468-478`, both copies) — an additive **import**, no `HOST_WORLD` bump — backed by a removal on `SharedBus`. Then tie teardown to instance lifetime: drop an extension's subscriptions when its `LiveExtension` leaves `ExtensionHost::live` (it enters at `facade.rs:1094-1096`) rather than relying on the whole-bus `clear()`, and refuse an emit/subscribe from an extension no longer in the live map — cyrup's structural analog of `assertActive`. Do this in the same change as EXT-018's un-cfg-gating so natives get the same lifecycle.
+
+**Verify** — a guest that subscribes, unsubscribes, and asserts it stops receiving; and a guest whose instance is dropped mid-session, asserting its `bus-deliver` is no longer invoked and a later emit from it is refused rather than queued. Extend `crates/cyrup-ext/tests/wasm_bus_flag.rs`.
+
+## EXT-051 — Extension provider OAuth drifted: refreshToken gained a signal, oauth gained isSubscription
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — the export takes no cancellation argument: `provider-refresh-token: func(id: string, credentials-json: string) -> result<string, string>;` (`crates/cyrup-ext/wit/world.wit:102`), invoked from the provider block of `crates/cyrup-ext/src/host/live.rs`. For the second half, **the auditor's grep was wrong and the item is narrower than filed**: cyrup already has the concept — `fn is_subscription(&self) -> bool` on the auth trait (`crates/cyrup-provider/src/auth/mod.rs:101`, overridden in `anthropic.rs:662`, `github_copilot.rs:813`, `kimi_coding.rs:704`, `openai_codex.rs:1030`, `xai.rs:631`, all citing pi v0.84.1) — and `ProviderConfig.oauth` is `Option<Value>`, an opaque JSON blob (`crates/cyrup-ext/src/provider.rs:38-40`), so a guest's `isSubscription` key **already crosses the seam untyped**. What is missing is the typed field and a consumer, not the transport.
+
+**upstream** — both changes are visible in `git diff v0.83.0..v0.84.1 -- .../extensions/types.ts`: `refreshToken(credentials: OAuthCredentials, signal: AbortSignal)` at `types.ts:1481` (one-argument at v0.83.0), and a new `isSubscription?: boolean` on the `oauth` block at `:1475` documented "Whether access through this auth method is backed by a provider subscription."
+
+**Impact** — a guest provider's token refresh cannot be cancelled, so a refresh against a hung auth endpoint runs to whatever the epoch budget allows rather than aborting with the run; the failure mode is a wedged login-adjacent path during shutdown. `isSubscription` reaches the host as an untyped key that nothing reads, so an extension-supplied subscription provider is presented like a metered API-key one.
+
+**Fix** — for the signal, prefer cyrup's existing poll idiom over re-signing: leave the export alone and let the guest poll the new `ctx-state.is-run-cancelled` import proposed in EXT-045 (additive import, no bump). For the metadata, add a typed `is_subscription: bool` to the `oauth` block of `ProviderConfig` (`crates/cyrup-ext/src/provider.rs:17-42`) and thread it into the auth surface that already models the concept in `crates/cyrup-provider/src/auth/`.
+
+**Verify** — a guest provider whose refresh blocks: assert an aborted run stops it rather than waiting out the epoch budget. Assert an extension provider declaring `isSubscription` is described as subscription-backed in the auth listing, the same way the built-in providers are.
+
+## EXT-053 — An extension command shadowing a built-in is dropped from autocomplete with no diagnostic
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `CommandRegistry::with_dynamic` (`crates/cyrup-tui/src/commands.rs:166-178`) builds a `HashSet` of the builtin names and pushes a dynamic command only `if !existing.contains(cmd.name.as_ref())`. The drop is silent: nothing is recorded, nothing reaches `startup_diagnostics.extensions` (the channel `crates/cyrup-session-svc/src/builder.rs:775-786` and `facade.rs:1158-1162` use for load and conflict diagnostics), and there is no second chance at a suffixed name because `slash_command_catalog` emits the bare `name` (`crates/cyrup-session-svc/src/session.rs:2277`) — EXT-017. The comment at `commands.rs:169-171` justifies the drop by citing pi's suffixing rule, but cyrup implements neither the suffix nor the warning.
+
+**upstream** — `getBuiltInCommandConflictDiagnostics` (`pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:529-543` @v0.83.0) walks `getRegisteredCommands()`, filters those whose `name` is a built-in, and emits one warning each: `Extension command '/x' conflicts with built-in interactive command. Skipping in autocomplete.` when `invocationName === name`, or `… Available as '/x:2'.` when it was suffixed; those diagnostics are pushed into the `[Extension issues]` startup panel at `:1610`. The autocomplete filter itself (`:603`) is the same drop — but never without the message.
+
+**Impact** — an author who names a command `/model` or `/settings` sees it vanish from the `/` menu with no explanation and, unlike upstream, has no `/model:2` fallback to reach it. The `[Extension issues]` panel cyrup already renders for load faults stays empty for the one conflict class a user is most likely to create.
+
+**Fix** — have `with_dynamic` (`commands.rs:166-178`) return the dropped names alongside the registry and surface them through the same panel the load diagnostics use, with pi's two message forms verbatim. Once EXT-017 lands and the catalog emits `invocation_name`, a shadowed command naturally becomes reachable as `/x:2` and the second message form becomes accurate rather than aspirational — schedule this immediately after EXT-017 and reuse its edit.
+
+**Verify** — register an extension command named `settings`; assert it is absent from `/` autocomplete **and** that exactly one `[Extension issues]` warning naming it is shown. After EXT-017, assert it is reachable as `/settings:2` and that the message says so. Extend `crates/cyrup-tui/tests/commands.rs`.
+
+## EXT-056 — register_tool_renderer is last-wins while every sibling table is first-wins
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `ExtensionRegistry::register_tool_renderer` (`crates/cyrup-ext/src/registry.rs:318-324`) is a bare `self.lock_write()?.tool_renderer_owner.insert(tool_name.into(), owner)`, with a doc at `:310-317` stating that the **last** registration wins. Every neighbour disagrees: `register_message_renderer` (`:335-342`) and `register_entry_renderer` (`:353-361`) both use `.entry(…).or_insert(owner)` — first-wins, citing pi's load-order resolution — and `register_tool` (`:217-224`) now rejects a foreign owner outright since EXT-008 closed. Reached in production from `InitApi`'s `tool_renderers` list via `facade.rs:265-299`.
+
+**upstream** — pi has no separate tool-renderer table at all: `renderCall`/`renderResult` ride on the tool's own `ToolDefinition` (`pi/packages/coding-agent/src/core/extensions/types.ts:472-481` region) and are resolved by `getToolDefinition`, which returns the **first** extension whose `ext.tools` map has the name (`runner.ts:463-471` @v0.83.0). Whoever wins the tool wins its renderer.
+
+**Impact** — under cyrup a later extension calling `register_tool_renderer("bash")` re-points rendering to an extension that lost — or never made — the tool registration, so the tool executes as one extension's and draws as another's. The doc's own justification ("matching `register_guest_tool`'s descriptor path") no longer holds, because that path now early-returns on a foreign owner before it touches `tool_renderer_owner`.
+
+**Fix** — make `register_tool_renderer` (`registry.rs:318-324`) first-wins with `.entry(…).or_insert(owner)` like its two siblings, and record an `ExtensionConflict` (`registry.rs:251-256`) when a second owner claims the same tool name so the drop is diagnosable. Update the doc at `:310-317`, whose stated rationale is now stale.
+
+**Verify** — two extensions registering a renderer for the same tool name: assert the first-loaded one renders and that exactly one conflict diagnostic names both. Add beside the renderer assertions in `crates/cyrup-ext/tests/entry_renderer.rs`.
+
+## EXT-057 — deliver_bus_events silently drops queued events at the round bound, and listener faults never surface
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+
+**cyrup** — `crates/cyrup-ext/src/facade.rs:1003-1027`: `const MAX_ROUNDS: usize = 64; for _ in 0..MAX_ROUNDS { let batch = self.bus.take_pending(); if batch.is_empty() { return; } … }`. When the bound is reached the loop simply falls out with events still sitting in `SharedBus.pending` — no diagnostic, no error, no record that anything was dropped, so a chatty (not even pathological) A→B→A topic pattern loses messages silently. Second half: a contained `bus_deliver` fault is only `tracing::warn!(extension, topic, error, "inter-extension bus delivery contained (skipped)")` (`facade.rs:1017-1024`) — it never goes through `add_error_listener`'s channel, so it cannot reach `App::show_extension_error` / the `[Extension issues]` surface that EXT-S03 wired.
+
+**upstream** — `createEventBus()` (`pi/packages/coding-agent/src/core/event-bus.ts` @v0.83.0) is a node `EventEmitter` whose `emit` runs every listener synchronously: no queue, no round bound, nothing can be dropped. Its `on` wrapper does surface handler faults — `catch (err) { console.error(\`Event handler error (${channel}):\`, err); }`.
+
+**Impact** — low today because no WASM guest ships, but this is the shape EXT-018, EXT-034 and EXT-050 will build on: an extension author whose bus messages vanish past round 64 gets no signal at all, and an extension whose bus listener throws is invisible in the front end that EXT-S03 exists to make faults visible in.
+
+**Fix** — when `MAX_ROUNDS` is exhausted with a non-empty queue, emit an `ExtensionError` through the same `add_error_listener` channel naming the topic and the round bound, and drop the remainder explicitly rather than by falling out of a loop. Route the contained `bus_deliver` fault at `facade.rs:1017-1024` through that channel too, keeping the `tracing::warn!`. Land with EXT-034, which is the same function.
+
+**Verify** — drive a two-guest ping-pong past 64 rounds and assert exactly one error reaches the listener naming the bound; make a subscriber's `bus-deliver` trap and assert the fault appears in the TUI transcript the way a handler fault does.
+
+## EXT-N01 — `unread_stdout_from_a_bursty_child_is_bounded_not_unbounded` asserted a byte-exact cap the pump was never designed to hold
+
+**Kind** test-defect · **Severity** high · **Effort** S · **Confidence** confirmed · **Status** fixed this pass
+
+**cyrup** — `crates/cyrup-ext/src/caps/proc.rs` asserted `first <= MAX_PIPE_BUFFER_BYTES` and `second <= MAX_PIPE_BUFFER_BYTES` against the live buffer of a `yes` child. The pump's real invariant is one chunk looser: `PipeBufState::wait_for_room` returns as soon as `len < MAX_PIPE_BUFFER_BYTES` (`:283`), and `spawn_pump` then appends a full 8 KiB `read()` before re-checking (`:834-840`). The buffer can therefore legitimately sit anywhere in `[cap, cap + 8191]`, and which value a 500 ms sampler sees is pure scheduling. Observed both ways in consecutive full-workspace runs on an otherwise unchanged tree: green in one, and in the next `buffered stdout (16781628 bytes) exceeded the cap (16777216)` — an overshoot of **4412 bytes**, i.e. a partial chunk, which is the bounded behaviour the test exists to prove rather than the unbounded growth it reported.
+
+**upstream** — none, and that is the classification. `ProcCaps` is a cyrup-original host capability for WASM guests; pi has no WASM host and no counterpart to `MAX_PIPE_BUFFER_BYTES`. The constant's own doc at `proc.rs:63` states the intent outright — "the point is FINITE, not a specific number" — so a byte-exact assertion pins a property the design never claimed. Per the repo rule this is case (b): the test asserted something it cannot control (the scheduler's interleaving of `wait_for_room` and `read`), not a divergence from upstream.
+
+**Impact** — a scheduling-dependent red in `-p cyrup-ext --lib`, one of the two defects that made `cargo test --workspace` non-deterministic across back-to-back runs. Left alone it would have trained readers to re-run the gate until it went green, which is how a real regression gets waved through.
+
+**Fix** — *applied.* Named the pump's chunk size as `PIPE_CHUNK_BYTES` (`const PIPE_CHUNK_BYTES: usize = 8192;`, used by `spawn_pump` in place of the inline literal) so the bound is derived from the code rather than a magic number, and asserted `<= MAX_PIPE_BUFFER_BYTES + PIPE_CHUNK_BYTES`. **Strengthened, not merely relaxed:** a third assertion now requires `second.abs_diff(first) <= PIPE_CHUNK_BYTES` — 500 ms of `yes` moves far more than one chunk, so a pump that was not genuinely parked cannot land within one chunk of where it already was. The plateau claim is now checked directly instead of being inferred from an absolute ceiling. No behaviour changed: the only production edit is the literal `8192` becoming a named const of the same value.
+
+**Verify** — done. 6/6 consecutive green in isolation (3.45-3.46 s each) and green in the full-workspace run. Mutation-checked so the widened bound is not vacuous: short-circuiting `wait_for_room`'s guard to `if true || …` (removing backpressure entirely) fails the test at **56004586 bytes** against the new `16785408` bound. Mutation reverted.
+
+## EXT-S04 — ctx.compact's onError path has no observable counterpart
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** high
+
+**cyrup** — `customInstructions` is now ported end to end: `compact: func(opts-json: string) -> result<_, string>` (`crates/cyrup-ext/wit/world.wit:558`), host import at `crates/cyrup-ext/src/host/live.rs:829` (`ControlOp::Compact { custom_instructions }`), SDK `compact_with(&CompactOptions)` at `crates/cyrup-ext-sdk/src/ctx.rs:1087-1090`, consumer at `crates/cyrup-session-svc/src/session.rs:2862`. This is why `HOST_WORLD` moved 0.3→0.4 (`crates/cyrup-ext/src/manifest.rs:63-68`). The callbacks remain unported with an explicit rationale at `world.wit:554-557` — subscribe to `session_compact` instead — but that substitution is **incomplete**: `session_compact` fires only when a compaction produces an entry, so a compaction that *threw* has no observable counterpart at all.
+
+**upstream** — `compact: (options) => { void (async () => { try { const result = await this.session.compact(options?.customInstructions); options?.onComplete?.(result); } catch (error) { … options?.onError?.(err); } })(); }` at `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:1819-1829` @v0.83.0. The `onError` branch fires on a compaction that threw — which produces no compaction entry and therefore no `session_compact` event.
+
+**Impact** — an extension that asks for a compaction cannot learn that it failed, so it cannot sequence work after it, retry, or tell the user. It can observe success and cannot observe failure, which is the worse half of the pair to be missing.
+
+**Fix** — either give `control.compact` a richer return that distinguishes "vetoed" and "errored" from "produced no entry", or add a `session_compact_failed` event to the catalog beside `session_compact` and dispatch it from the error path in `crates/cyrup-session-svc/src/session.rs`. The return-value route is import-only (no bump); the event route is an export addition (bump). Prefer the return value — the caller already awaits a `result<_, string>` and only the error text is being thrown away.
+
+**Verify** — a guest calling `compact_with` against a session where compaction fails; assert the guest observes the failure rather than waiting forever for a `session_compact` that never arrives.
+
+## EXT-058 — Guest WASM `http-client` is not gated by `--offline`
+
+**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** **confirmed — reproduced with a real WASM guest on an `--offline` host** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Filed 2026-08-13 from the `EXT-054` repro run.** Adjacent to `EXT-054` but **not covered by it**:
+> `EXT-054` is about the manifest grant being inert, this is about the *second* control — the host's
+> own offline flag — also not applying. They are separately fixable and the combination is the point.
+
+**cyrup** — `grep -rn "offline" crates/cyrup-ext/src` at HEAD returns **nothing**: the extension host has no notion of the offline flag at all, so the guest `http-client` import in `crates/cyrup-ext/src/host/live.rs` cannot consult it. `--offline` is documented in the shipped help as "Disable startup network operations", so this may be within the letter of the flag — which is exactly why it is worth stating rather than assuming.
+
+**upstream** — none. pi has no WASM guest model and no capability surface to gate, so there is no parity question here; this is a coherence question about **cyrup's own** two controls.
+
+**Impact** — Measured: the host was launched with `--offline` **and** `--model faux/faux-1`, loading a guest whose manifest declared `{"net": false}`, and the guest still performed a live outbound HTTPS request:
+
+```
+ /httpdemo https://api.together.xyz/v1/models
+ http status: 401 body: Missing API key        <-- a response from Together's real servers
+```
+
+Taken with `EXT-054`, **neither of cyrup's two controls stands between an installed guest and the internet**: not the per-extension capability grant, and not the process-wide offline flag. An operator who runs `--offline` on an air-gapped or policy-restricted host, having also written a deny-everything manifest, gets neither guarantee. Rated medium rather than high only because it requires an installed guest, which today means the in-tree SDK example — the same reachability `EXT-054` records.
+
+**Fix** — Decide what `--offline` means for guests and implement it, rather than leaving it undefined. If it is process-wide (the reading an operator will assume), thread the flag into the extension host's service construction and have the `http-client` import return a typed offline error when it is set. If it is genuinely startup-only, say so in the flag's help text — "Disable startup network operations (does not restrict extensions)" — so the guarantee is not over-read. Land the enforcement route with `EXT-054`, which is threading the manifest through the same seam.
+
+**Verify** — Load a guest with `{"net": true}` on a host launched `--offline` and assert its `http-client` call returns an offline error rather than reaching the network; the same guest on a host without `--offline` must succeed. The fixture already exists: `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` and `-e <dir>`, then `/httpdemo`.
+
+## Coverage
+
+### Read first-hand at cyrup HEAD `a9000b1` (tree clean; last code commit `04c1ba2`)
+
+`crates/cyrup-ext/src/{event,registry,facade,loader,manifest,dispatch,contract,native}.rs` in full or across every region the chains required; `crates/cyrup-ext/src/host/live.rs` targeted (the `register_*` imports `:88-142`, ext-tools `:731-766`, control `:779-840`, `set_label` `:355`, ui `:245-250`, `WasmTool` `:1386-1420`, `provider_stream_simple` `:1296-1320`, `get_flag` `:1301-1337`); `crates/cyrup-ext/src/build/mod.rs:1-80`; **both copies of `wit/world.wit` in full, interface by interface, and `diff`ed byte-for-byte (identical)**; `crates/cyrup-ext/tests/wit_world_sync.rs:1-160` and `native_dispatch.rs:848-885`; `crates/cyrup-ext-sdk/src/{descriptor,guest,ctx,events,widget}.rs` targeted. Consumer seams followed where a chain demanded it: `crates/cyrup-session-svc/src/{builder,session,hooks,subscriber,host_services,lib}.rs`, `crates/cyrup-agent/src/agent.rs`, `crates/cyrup-core/src/tool.rs`, `crates/cyrup-tui/src/{app,commands}.rs`, plus `Cargo.toml` at the workspace root and in `cyrup-session-svc`.
+
+### Read first-hand upstream at the ported tag pi v0.83.0
+
+Extracted with `git show v0.83.0:<path>`, so the line numbers in this file are the tag's, not `main`'s. `packages/coding-agent/src/core/extensions/types.ts` in full — the `ExtensionUIContext` block `:95-282`, base `ExtensionContext` `:305-347`, `ToolDefinition` `:449-498`, every event interface `:519-806`, `RegisteredCommand`/`ResolvedCommand` `:1162-1172`, the 33 `on(event:"…")` overloads `:1190-1231`, the `ExtensionAPI` surface `:1236-1410`, `ExtensionShortcut` `:1524-1529`, `ToolInfo` `:1552`. Also `extensions/runner.ts` (reserved keybindings + `buildBuiltinKeybindings` `:70-111`, `getShortcuts` `:492-540`, `resolveRegisteredCommands` `:598-655`, the `emit*` reducers), `extensions/loader.ts`, `core/agent-session.ts` (`getAllTools` `:906-914`, `getCommands` `:2332-2354`, `_refreshToolRegistry`), `core/slash-commands.ts:4-11`, `core/event-bus.ts` **in full**, `core/project-trust.ts`, `modes/interactive/interactive-mode.ts` (conflict diagnostics `:529-543`, autocomplete `:598-628`, diagnostics panel `:1605-1618`, compact handler `:1819-1829`, shortcut install `:1833-1846`, `showExtensionError` `:2545`, `populateHistory` `:3244-3412`, `/hotkeys` `:5856`), and `packages/agent/src/agent-loop.ts:580-660` @v0.84.1.
+
+### Version-lag sweep
+
+`git diff --stat v0.83.0..v0.84.1 -- packages/coding-agent/src/core/extensions/ packages/coding-agent/src/extensions/ packages/coding-agent/src/core/sdk.ts` = 6 files, +110/−38 (`sdk.ts` unchanged). Every hunk of the `types.ts` / `index.ts` / `runner.ts` / `loader.ts` diff was read line by line. It produced four drift items — EXT-049, EXT-050, EXT-051, EXT-052 — plus evidence re-scoping folded into EXT-019 (`MarkdownTransformContext` + `getMarkdownTransformers`) and EXT-022 (`context.publish({persist})` replacing `context.store`) rather than filed twice. The `llama/` diff was counted but not read (blind spot 6).
+
+### Surface-driven sweep — the axis actually used, stated as a method
+
+Recorded in the repair pass because the critique was right that this file never used the term and
+never said where its new items came from. This area ran **two** enumerations and **not** the one
+README blind spot 1 prescribes.
+
+**Axis A — the event catalog, upstream-anchored and exhaustive.** pi's 33 `on(event:"…")` overloads
+were enumerated against cyrup's 31 `EventKind` variants and the 31 WIT `on-*` exports, machine-checked
+by `tests/wit_world_sync.rs:96-129`. The name diff is exactly two (EXT-009, EXT-011). The **payload**
+diff was then done by hand event by event, and that is where the yield was: EXT-014, EXT-015, EXT-016,
+EXT-042, EXT-043.
+
+**Axis B — cyrup's own claims, inverted.** Rather than asking "what does pi export that cyrup lacks",
+this pass walked the **invariants cyrup asserts about itself** — every doc comment, module header and
+ADR reference in `crates/cyrup-ext` that promises a control — and asked "what code enforces this?".
+`manifest.rs:2`, `host/store_state.rs:1-3` and `:20-22`, and the `world.wit:384-386`/`:416-418`
+comments each promise a capability grant; `grep -rn capabilities crates/cyrup-ext/src` returns only
+producers. That produced **EXT-054** and **EXT-055**, the two highest-consequence items in the area,
+and neither is visible from pi at all — pi has no capability model, so a pi-anchored sweep is
+structurally blind to this whole class. **This axis generalises**: any cyrup-original invariant
+(fail-closed gates, first-wins tables, ABI fingerprints, deny-by-default defaults) is a claim with a
+testable consumer, and the sweep is "grep the claim, then grep for a reader".
+
+**The sweep that was NOT run** — see blind spot 8.
+
+### Event catalog enumerated exhaustively
+
+pi = **33** `on(event:"…")` overloads (`types.ts:1190-1231` @v0.83.0; `:1203-1244` @v0.84.1). cyrup `EventKind` = **31** (`event.rs:13-53`, names `:104-134`). WIT `interface events` = **31** `on-*` exports, matching `EventKind` 1:1 and machine-checked against the header claim (`tests/wit_world_sync.rs:96-129`). The set difference is exactly two — `before_provider_headers` (EXT-009) and `session_info_changed` (EXT-011); no third gap and no cyrup-invented event. **But name parity is not payload parity**, and the payload diff is where this pass found work: `project_trust` loses `cwd` (EXT-043), `model_select` nests `previousModel`/`source` and `thinking_level_select` loses `previousLevel` (EXT-042), `resources_discover` loses `cwd`+`reason` (EXT-016), the four session-lifecycle events lose their discriminating fields (EXT-015), and `tool_execution_update`/`_end` lose `toolName` (and `args`, EXT-014). `session_tree` was checked and is **fine** — all four upstream fields ride inside the blob (`session.rs:1970-1975`).
+
+### Inferred rather than read
+
+- **EXT-017 / EXT-037 non-determinism.** Both rest on `HashMap` iteration order being observably unstable between runs. Rust's default hasher is randomly seeded per process, so this is sound in principle, but no reorder was observed — the claim is derived from `command_descriptions` iterating `.commands.iter()` (`registry.rs:662`) and that value reaching `crates/cyrup-tui/src/app.rs:4103` unsorted.
+- **EXT-039's precedence inversion.** pi's `getShortcuts` (which populates the map, refusing reserved keys) and `setupExtensionShortcuts` (which installs `onExtensionShortcut`) were both read, as was cyrup's ordering at `app.rs:1691-1703`. pi's **editor** was not read, so "upstream lets a non-reserved extension binding win" is inferred from the reserved-list design and the warning text, not from the dispatch site. The refusal and diagnostics halves are read directly.
+- **EXT-026.** Asserted from `mod host_services;` being unconditional and the workspace `cyrup-ext` dependency lacking `default-features = false`; the exact `default-features` text was not confirmed and `cargo check --no-default-features` was not run.
+
+### Rejected, corrected, or folded — do not re-derive these
+
+- **Nothing was refuted outright this pass.** Every auditor finding survived, but six were **corrected** and the corrections are load-bearing:
+  - **EXT-037 severity lowered medium → low.** It is real (`get_commands` returns bare names), but it is information loss on a guest-only introspection API with zero WASM guests shipping. EXT-017 is the same defect on a user-visible path and carries the medium. Do not re-rate EXT-037 upward without a shipping guest.
+  - **EXT-011 mechanism corrected.** cyrup already *emits* `AgentSessionEvent::SessionInfoChanged` (`cyrup-session-svc/tests/round8_postrun.rs:240-257`); only the extension-host routing is missing, so effort is S, not M. Do not re-file this as "the event does not exist".
+  - **EXT-051 half corrected.** The auditor's `grep -rn 'is_subscription\|isSubscription' crates/` = nothing is **false** — the concept exists across `crates/cyrup-provider/src/auth/` — and `ProviderConfig.oauth` is an opaque `Value`, so the key already crosses the seam. What is missing is the typed field and a consumer, not the transport.
+  - **EXT-024 evidence corrected.** `grep constrained_sampling crates/` is **not** empty: `cyrup-provider/src/api/bedrock_converse_stream.rs:44` matches, and the hit is a comment confirming the gap.
+  - **EXT-028 and EXT-036 both had their closures partially refused.** EXT-028's four filed halves are genuinely closed but its own version marker rotted; EXT-036's `world.wit` half was declared closed on evidence that itself contains a fabricated citation range.
+- **Two of the six blind-spot findings were folded into existing items rather than given new IDs**, to avoid double-filing: the stale `// cyrup:ext@0.3.0` marker on line 1 of both `world.wit` copies is **EXT-028's residual** (it is that item's own subject), and the header citation `types.ts:1198-1239` matching no upstream version is **EXT-036 site (3)**.
+- **Ledger cross-check.** `00-residual-ledger.md:60` justifies listing EXT-S02 open by citing `commands.rs:31` typing `SlashCommand::name` as `&'static str`. That is stale — it is `Cow<'static, str>` at `commands.rs:36` and the catalog is wired into the TUI at three sites. The ledger's "1 open (EXT-S02)" row at `:256` and suggested-order item 4 at `:161` should both be struck. The ledger's structural defect D also applied to this file: the self-contradicting `~~EXT-028~~ **CLOSED** | Open |` status row is gone, replaced by an explicit `partially closed` row.
+
+### Handoffs to other areas
+
+- **Area 07 (TUI).** The *read* side of EXT-047's keyed widget map is TUI-S01 / TUI-014 territory; only the WIT/`HostServices` half is filed here. EXT-041's fix edits `crates/cyrup-tui/src/app.rs` but the defect is the extension-render seam, so it stays in 06. EXT-039's precedence inversion also lands in `app.rs:1691-1703`.
+- **Area 08 (seam/modes).** pi's RPC `setWidget` splits into `widgetKey`/`widgetLines`/`widgetPlacement`, which EXT-047 unblocks but does not cover.
+- **Area 01 (provider).** EXT-052's `on_payload` reduction reuses cyrup's existing `before_provider_request` path, and EXT-009's header hook needs a dispatch point in provider request assembly — both area 01 code.
+
+### Blind spots for the next pass
+
+1. **Static only, and the hardest half of this area is dynamic.** Nothing was compiled or run. Three `not(wasm-host)` arms (`facade.rs:441-443`, `:899-908`, `:1261-1264`) have almost certainly never been type-checked, and that cannot be proven from reading.
+2. **Zero WASM guests ship, so the guest half of every finding is unexercised.** `crates/cyrup-ext-sdk/src/example.rs` is the only component author in the tree. Every finding whose impact reads "a guest cannot X" (EXT-037/038/044/045/046/050/052) is read off the WIT and the host imports; none was observed failing against a real component. Severity for guest-only items is a judgement about the seam's shape, not an observed report — which is why none is rated above medium.
+3. **`crates/cyrup-ext/src/host/services.rs` (1944 lines) has still never been audited method by method** — only `SharedBus`, `GuestState`'s flag/command/renderer/autocomplete tables, the `HostServices` trait defaults, `set_label` and `set_widget`. EXT-021's caveat stands: a `ctx.ui` capability could be implemented host-side while missing from the WIT and this pass would not have seen it.
+4. **The capability sandbox is still only half-audited.** EXT-054 and EXT-055 came out of asking what *reads* `Capabilities`, and the answer was "nothing". What was **not** done is reading `crates/cyrup-ext/src/caps/{http,fs,proc}.rs` and verifying the `is_trusted = origin.is_pre_trust() || project_trusted` gate the `world.wit` comments at `:384-386` and `:416-418` promise. A trust-gate hole there would be a **critical** that this pass could not see. **This is the highest-value target for the next pass in area 06.**
+5. **The Tier-1 build path is unverified end to end.** EXT-028's four halves closed on directly-read evidence, but `build.rs`'s `CYRUP_EXT_ABI_FINGERPRINT` was never observed changing after a `world.wit` edit — the test at `wit_world_sync.rs:135-160` recomputes the hash rather than proving cache invalidation. `build/toolchain.rs` was not read.
+6. **Upstream coverage is scoped to the extension paths.** `pi/packages/coding-agent/src/extensions/llama/` (~5 files) was diffstat-counted but not read, so EXT-027 is carried forward on old evidence; `wrapper.ts` was not re-read; pi-subagents / pi-permission-system / pi-intercom were out of scope, so extension-surface changes **they** depend on (the intercom `EXTENSION_BUS_FEATURE` work `PARITY-GAPS.md` records) were not cross-checked against the bus findings here — relevant to EXT-018, EXT-034, EXT-050 and EXT-057, which are all one function.
+7. **Payload parity was enumerated for events but not for the other surfaces.** The 33-vs-31 event diff is exhaustive and machine-checked, and the per-event payload diff was done by hand. No equivalent field-by-field sweep was run over `interface ui`, `interface session`, `interface models` or `interface ctx-state` — EXT-046, EXT-047 and EXT-048 were each found incidentally while chasing something else, which strongly suggests more of the same class remains.
+8. **NEW (repair pass) — the export-enumeration sweep README blind spot 1 prescribes was never run for this area, and its absence is the most likely source of missed items.** Axis A above enumerates one upstream surface (the event catalog) exhaustively and Axis B enumerates cyrup's own claims. Neither is the prescribed sweep: *walk every exported symbol of `pi/packages/coding-agent/src/core/extensions/{types,runner,loader,index}.ts` at v0.83.0 and ask, symbol by symbol, what in `crates/` consumes it.* `types.ts` alone is ~1550 lines and its `ExtensionAPI` (`:1236-1410`), `ExtensionUIContext` (`:95-282`) and `ToolDefinition` (`:449-498`) blocks were read as blocks and mined for known items rather than enumerated member by member with a consumer trace — which is exactly how EXT-046/047/048 came to be found "incidentally". `runner.ts`'s non-`emit*` exports and the whole of `loader.ts`'s export list were never enumerated at all. **Next pass: run it, symbol by symbol, and record the count of symbols traced.** Expect the same shape of yield the `packages/tui/src` sweep produced for area 07 (nine items, two critical, off six files nobody had read).
+9. **NEW (repair pass) — the capability sandbox remains the highest-value target and is now the area's only critical.** Blind spot 4 already named `crates/cyrup-ext/src/caps/{http,fs,proc}.rs` as unread. EXT-054's promotion to critical raises the stakes: the item proves the *grant* is inert, but nobody has verified the `is_trusted = origin.is_pre_trust() || project_trusted` gate that is currently the only thing standing in front of the full host surface. A hole there would be a second critical, and it is one file-read away.
+

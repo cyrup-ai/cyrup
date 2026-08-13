@@ -86,7 +86,7 @@
 //!    genuinely inherits it. Stripping it is exactly what stops a delegated worker from reading its
 //!    own prompt as a licence to orchestrate.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -1039,6 +1039,87 @@ pub struct SubagentPromptRuntime {
     /// subscription set), so the sink resolves through this slot at delivery time. Shared with the
     /// closure handed to [`crate::watchdog::register_child::register_child_watchdog`].
     watchdog_services: Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
+    /// pi `registerPermissionGate(pi)` (`subagent-prompt-runtime.ts:281-305,475`). `Some` only when
+    /// the parent shipped a policy in
+    /// [`crate::watchdog::permission_arbiter::PERMISSION_POLICY_ENV`] — upstream returns early on a
+    /// missing policy (`:286`) and subscribes nothing.
+    permission_gate: Option<PermissionGate>,
+}
+
+/// pi `registerPermissionGate`'s closure state (`subagent-prompt-runtime.ts:281-305`): the decoded
+/// policy, the audit path, the raw child-watchdog config the arbiter re-decodes for its model
+/// selection, and the arbiter seam itself.
+pub struct PermissionGate {
+    policy: PermissionPolicy,
+    raw_watchdog_config: Option<String>,
+    audit_path: Option<PathBuf>,
+    arbiter: Arc<dyn crate::watchdog::permission_arbiter::WatchdogPermissionAgent>,
+}
+
+impl std::fmt::Debug for PermissionGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PermissionGate")
+            .field("policy", &self.policy)
+            .field("audit_path", &self.audit_path)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`PERMISSION_POLICY_ENV`](crate::watchdog::permission_arbiter::PERMISSION_POLICY_ENV)
+/// decoded to.
+///
+/// [CYRUP-DELTA] `Invalid` has no upstream shape: `decodePermissionRules` THROWS out of
+/// `registerPermissionGate` and out of module init (`subagent-prompt-runtime.ts:285`), which kills
+/// the child outright. That is fail-closed, and it must stay fail-closed here — treating an
+/// undecodable policy as "no policy" would silently ungate every tool the parent meant to gate.
+/// Blocking every tool call with the decode error is the same direction and strictly less severe
+/// than killing the process, and it tells the operator what is wrong in the block reason.
+#[derive(Debug, Clone)]
+enum PermissionPolicy {
+    Rules(crate::watchdog::permission_arbiter::PermissionRules),
+    Invalid(String),
+}
+
+impl PermissionGate {
+    /// pi's `tool_call` handler body (`subagent-prompt-runtime.ts:288-304`) — `Some(reason)` blocks
+    /// the call, `None` lets it through.
+    async fn evaluate(&self, tool_name: &str, input: &serde_json::Value) -> Option<String> {
+        use crate::watchdog::permission_arbiter::{
+            PermissionRuleDecision, WatchdogPermissionRequest, permission_decision,
+            request_watchdog_permission,
+        };
+        let rules = match &self.policy {
+            PermissionPolicy::Rules(rules) => rules,
+            PermissionPolicy::Invalid(message) => {
+                return Some(format!(
+                    "Blocked by pi-subagents permission rule: the permission policy is invalid: \
+                     {message}"
+                ));
+            }
+        };
+        match permission_decision(Some(rules), tool_name) {
+            PermissionRuleDecision::Allow => None,
+            PermissionRuleDecision::Deny => Some(format!(
+                "Blocked by pi-subagents permission rule: '{tool_name}' is denied."
+            )),
+            PermissionRuleDecision::Ask => {
+                let result = request_watchdog_permission(
+                    &WatchdogPermissionRequest {
+                        tool_name: tool_name.to_string(),
+                        args: input.clone(),
+                        raw_watchdog_config: self.raw_watchdog_config.clone(),
+                        audit_path: self.audit_path.clone(),
+                        cancel: None,
+                    },
+                    self.arbiter.as_ref(),
+                )
+                .await;
+                (!result.approved).then(|| {
+                    format!("Blocked by pi-subagents permission rule: {}", result.reason)
+                })
+            }
+        }
+    }
 }
 
 /// The live counter behind a `toolBudget:` — pi's three `registerToolBudget` closure variables
@@ -1077,6 +1158,7 @@ impl SubagentPromptRuntime {
             steering: None,
             watchdog: None,
             watchdog_services: Arc::new(std::sync::Mutex::new(None)),
+            permission_gate: None,
         }
     }
 
@@ -1099,6 +1181,7 @@ impl SubagentPromptRuntime {
             steering: None,
             watchdog: None,
             watchdog_services: Arc::new(std::sync::Mutex::new(None)),
+            permission_gate: None,
         }
     }
 
@@ -1161,6 +1244,64 @@ impl SubagentPromptRuntime {
         self.watchdog.as_ref()
     }
 
+    /// Attach the child-side permission gate (pi `registerPermissionGate`,
+    /// `subagent-prompt-runtime.ts:281-305`, called at `:475`).
+    ///
+    /// `raw_watchdog_config` is [`crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV`]'s raw
+    /// value, forwarded verbatim because the arbiter re-decodes it for its own model selection
+    /// (`permission-arbiter.ts:63,86`) — an `ask` in a child whose watchdog is off has no reviewer
+    /// and therefore denies.
+    #[must_use]
+    pub fn with_permission_gate(
+        mut self,
+        encoded_policy: Option<&str>,
+        raw_watchdog_config: Option<String>,
+        audit_path: Option<PathBuf>,
+        arbiter: Arc<dyn crate::watchdog::permission_arbiter::WatchdogPermissionAgent>,
+    ) -> Self {
+        // pi `:285-286`: `const rules = decodePermissionRules(...); if (!rules) return;` — no
+        // policy means no handler at all.
+        self.permission_gate =
+            match crate::watchdog::permission_arbiter::decode_permission_rules(encoded_policy) {
+                Ok(None) => None,
+                Ok(Some(rules)) => Some(PermissionGate {
+                    policy: PermissionPolicy::Rules(rules),
+                    raw_watchdog_config,
+                    audit_path,
+                    arbiter,
+                }),
+                Err(message) => Some(PermissionGate {
+                    policy: PermissionPolicy::Invalid(message),
+                    raw_watchdog_config,
+                    audit_path,
+                    arbiter,
+                }),
+            };
+        self
+    }
+
+    /// The permission gate this runtime enforces, if any — exposed so a test drives the real
+    /// dispatch rather than reaching into private state.
+    #[must_use]
+    pub fn permission_gate(&self) -> Option<&PermissionGate> {
+        self.permission_gate.as_ref()
+    }
+
+    /// Whether every half of this runtime is unarmed, i.e. registering it would install nothing.
+    /// [`prompt_runtime_extension_from`] returns `None` in that case, which is upstream's "not
+    /// actually a subagent child" state.
+    #[must_use]
+    pub fn is_inert(&self) -> bool {
+        self.tool.is_none()
+            && self.rewrite.is_none()
+            && self.supervisor_tool.is_none()
+            && self.intercom_fallback.is_none()
+            && self.tool_budget.is_none()
+            && self.steering.is_none()
+            && self.watchdog.is_none()
+            && self.permission_gate.is_none()
+    }
+
     /// Attach the parent-supplied tool budget (pi `registerToolBudget`,
     /// `subagent-prompt-runtime.ts:306-325`). `None` leaves every tool call untouched.
     #[must_use]
@@ -1219,6 +1360,12 @@ impl NativeExtension for SubagentPromptRuntime {
         if self.tool_budget.is_some() {
             kinds.push(EventKind::ToolCall);
             kinds.push(EventKind::ToolResult);
+        }
+        // pi `registerPermissionGate` subscribes `onRuntimeEvent("tool_call", …)` only when a
+        // policy decoded (`:285-287`). `EventKind` de-duplicates through the subscription bitset,
+        // so a child with both a budget and a policy declares `tool_call` once.
+        if self.permission_gate.is_some() {
+            kinds.push(EventKind::ToolCall);
         }
         // G90 / pi `registerSteeringInbox`'s own `onRuntimeEvent` set
         // (`subagent-prompt-runtime.ts:441-464` @v0.43.0): `session_start` arms the poller,
@@ -1302,17 +1449,24 @@ impl NativeExtension for SubagentPromptRuntime {
                         &_ctx.cwd,
                     ),
                 HostEvent::TurnEnd { message, tool_results, .. } => watchdog.handle_turn_end(
-                    &serde_json::json!({
-                        "type": "turn_end",
-                        "message": message,
-                        "toolResults": tool_results,
-                    }),
+                    &crate::watchdog::turn_delta::watchdog_turn_end_event(message, tool_results),
                     &_ctx.cwd,
                 ),
                 HostEvent::AgentEnd { .. } => watchdog.handle_agent_end(&_ctx.cwd).await,
                 HostEvent::SessionShutdown { .. } => watchdog.handle_session_shutdown(),
                 _ => {}
             }
+        }
+        // pi `registerPermissionGate`'s `tool_call` handler (`subagent-prompt-runtime.ts:288-304`).
+        // It runs BEFORE the tool-budget handler below because upstream registers the two in that
+        // order (`:475-476`) and pi's runner walks handlers in registration order
+        // (`coding-agent/src/core/extensions/runner.ts:805-811`) — so a call the policy refuses is
+        // never counted against the budget.
+        if let Some(gate) = &self.permission_gate
+            && let HostEvent::ToolCall { name, input, .. } = ev
+            && let Some(reason) = gate.evaluate(name, input).await
+        {
+            return HookOutcome::Block { reason: Some(reason) };
         }
         match ev {
             // pi `:323-341`.
@@ -1446,6 +1600,15 @@ pub fn prompt_runtime_extension_for_env() -> Option<Arc<dyn NativeExtension>> {
 pub fn prompt_runtime_extension_from(
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Arc<dyn NativeExtension>> {
+    prompt_runtime_from_env(get).map(|runtime| Arc::new(runtime) as Arc<dyn NativeExtension>)
+}
+
+/// [`prompt_runtime_extension_from`] before the trait object is erased — the same decision, typed,
+/// so a caller (and a test) can inspect which halves actually armed.
+#[must_use]
+pub fn prompt_runtime_from_env(
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Option<SubagentPromptRuntime> {
     let non_empty = |key: &str| get(key).filter(|value| !value.trim().is_empty());
 
     let capture = non_empty(STRUCTURED_OUTPUT_CAPTURE_ENV);
@@ -1520,41 +1683,99 @@ pub fn prompt_runtime_extension_from(
     // pi `registerChildWatchdog(pi)` (`subagent-prompt-runtime.ts:477`), which reads
     // `process.env[CHILD_WATCHDOG_CONFIG_ENV]` itself. `None` for every child the orchestrator did
     // not arm, which is the default.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let raw_watchdog_config =
+        non_empty(crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV);
     let watchdog_services: Arc<
         std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>,
     > = Arc::new(std::sync::Mutex::new(None));
     let sink_services = Arc::clone(&watchdog_services);
+    // `review: createMainWatchdogReview(() => currentContext, { getThinkingLevel: () =>
+    // pi.getThinkingLevel() })` (`register-child.ts:77`). Passing `None` here left the child on
+    // `InertWatchdogReview` — a runtime that resolves no model, calls nothing and reports every
+    // boundary clean, so an armed child was watched in name only. The review is built only when
+    // the child is actually armed, since constructing it opens the process's `auth.json`.
+    let child_review = raw_watchdog_config
+        .as_ref()
+        .map(|_| child_watchdog_review(&cwd, &watchdog_services));
     let watchdog = crate::watchdog::register_child::register_child_watchdog(
-        get(crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV).as_deref(),
-        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        raw_watchdog_config.as_deref(),
+        &cwd,
         Arc::new(move || {
             sink_services
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
         }),
-        None,
+        child_review,
         crate::watchdog::register_child::stdout_status_sink(),
     );
 
-    if tool.is_none()
-        && rewrite.is_none()
-        && supervisor_tool.is_none()
-        && intercom_fallback.is_none()
-        && tool_budget.is_none()
-        && steer_inbox.is_none()
-        && watchdog.is_none()
-    {
+    // pi `registerPermissionGate(pi)` (`subagent-prompt-runtime.ts:475`), which reads
+    // `process.env[PERMISSION_POLICY_ENV]` itself (`:285`).
+    let permission_policy =
+        non_empty(crate::watchdog::permission_arbiter::PERMISSION_POLICY_ENV);
+    let permission_audit_path =
+        non_empty(crate::watchdog::permission_arbiter::PERMISSION_AUDIT_PATH_ENV).map(PathBuf::from);
+
+    let runtime = SubagentPromptRuntime::from_parts(tool, rewrite, fanout_child == Some(true))
+        .with_supervisor_tool(supervisor_tool)
+        .with_intercom_fallback(intercom_fallback)
+        .with_tool_budget(tool_budget)
+        .with_steering_inbox(steer_inbox)
+        .with_permission_gate(
+            permission_policy.as_deref(),
+            raw_watchdog_config,
+            permission_audit_path,
+            // `createWatchdogPermissionArbiter()` with no `streamFn` override
+            // (`permission-arbiter.ts:145`). cyrup binds no in-process model turn here for the
+            // same reason [`crate::watchdog::review::NoTurnReviewAgent`] exists, and the result is
+            // the fail-closed one: an `ask` denies as `malformed` rather than approving silently.
+            Arc::new(crate::watchdog::permission_arbiter::NoDecisionPermissionAgent),
+        )
+        .with_watchdog(watchdog, watchdog_services);
+
+    if runtime.is_inert() {
         return None;
     }
-    Some(Arc::new(
-        SubagentPromptRuntime::from_parts(tool, rewrite, fanout_child == Some(true))
-            .with_supervisor_tool(supervisor_tool)
-            .with_intercom_fallback(intercom_fallback)
-            .with_tool_budget(tool_budget)
-            .with_steering_inbox(steer_inbox)
-            .with_watchdog(watchdog, watchdog_services),
-    ) as Arc<dyn NativeExtension>)
+    Some(runtime)
+}
+
+/// `createMainWatchdogReview(() => currentContext, { getThinkingLevel: () => pi.getThinkingLevel()
+/// })` for the CHILD role (`register-child.ts:77`) — the same review the orchestrator binds, over
+/// the same late-bound capability slot the child's warning sink already resolves through.
+fn child_watchdog_review(
+    cwd: &Path,
+    services: &Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
+) -> Arc<dyn crate::watchdog::runtime::WatchdogReview> {
+    let registry: Arc<dyn crate::watchdog::model_selection::WatchdogModelRegistry> =
+        Arc::new(crate::watchdog::model_selection::BuiltinWatchdogModelRegistry::new(
+            crate::watchdog::register_main::watchdog_config_dirs().as_ref(),
+        ));
+    let session_registry = Arc::clone(&registry);
+    let session_services = Arc::clone(services);
+    Arc::new(
+        crate::watchdog::review::MainWatchdogReview::new(
+            registry,
+            Arc::new(crate::watchdog::review::AmbientReviewAuth),
+            Arc::new(crate::watchdog::review::NoTurnReviewAgent),
+            cwd.to_path_buf(),
+        )
+        .with_session_context(Arc::new(move || {
+            let services = session_services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()?;
+            let model = services.current_model().as_deref().and_then(|model| {
+                let info = crate::watchdog::register_main::watchdog_model_info(model)?;
+                Some(session_registry.find(&info.provider, &info.id).unwrap_or(info))
+            });
+            Some(crate::watchdog::review::WatchdogSessionContext {
+                model,
+                thinking_level: services.thinking_level(),
+            })
+        })),
+    )
 }
 
 #[cfg(test)]
@@ -1692,6 +1913,162 @@ mod tool_budget_runtime_tests {
             ));
         }
         assert!(prompt_runtime_extension_from(&|_| None).is_none());
+    }
+}
+
+/// pi `registerPermissionGate` (`subagent-prompt-runtime.ts:281-305`, installed at `:475`) driven
+/// through the REAL extension surface: the env resolver builds it, `init` subscribes `tool_call`,
+/// and `on_event` decides.
+#[cfg(test)]
+mod permission_gate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+
+    use super::*;
+    use crate::watchdog::permission_arbiter::{
+        PERMISSION_AUDIT_PATH_ENV, PERMISSION_POLICY_ENV,
+    };
+    use cyrup_core::ToolCallId;
+    use cyrup_ext::native::ExtMode;
+
+    fn ctx() -> HostCtx {
+        HostCtx::event(ExtMode::Json, false, PathBuf::from("/tmp"))
+    }
+
+    fn call(name: &str) -> HostEvent {
+        HostEvent::ToolCall {
+            call_id: ToolCallId::from("call-1"),
+            name: name.to_string(),
+            input: serde_json::json!({ "path": "a.rs", "apiKey": "SK-ABCDEFGHIJ" }),
+        }
+    }
+
+    fn env_extension(policy: &str, audit: Option<&str>) -> Arc<dyn NativeExtension> {
+        let policy = policy.to_string();
+        let audit = audit.map(str::to_string);
+        prompt_runtime_extension_from(&move |key| match key {
+            PERMISSION_POLICY_ENV => Some(policy.clone()),
+            PERMISSION_AUDIT_PATH_ENV => audit.clone(),
+            _ => None,
+        })
+        .expect("a policy alone arms the child runtime")
+    }
+
+    /// The USER ACTION end to end: a parent ships `{"write":"deny","read":"allow"}` in the child's
+    /// env, and the child refuses `write` while `read` passes — through `on_event`, not through a
+    /// direct call to the gate.
+    #[tokio::test]
+    async fn a_policy_in_the_env_blocks_the_denied_tool_and_passes_the_allowed_one() {
+        let ext = env_extension("{\"write\":\"deny\",\"read\":\"allow\"}", None);
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.expect("init");
+        assert!(
+            api.subscriptions().contains(EventKind::ToolCall),
+            "the gate must subscribe tool_call or it is never consulted"
+        );
+
+        let ctx = ctx();
+        let HookOutcome::Block { reason } = ext.on_event(&call("write"), &ctx).await else {
+            panic!("a denied tool must be blocked");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("Blocked by pi-subagents permission rule: 'write' is denied.")
+        );
+        assert!(matches!(
+            ext.on_event(&call("read"), &ctx).await,
+            HookOutcome::Noop
+        ));
+    }
+
+    /// The `ask` tier with no model turn bound: [`NoDecisionPermissionAgent`] reaches no decision,
+    /// which the arbiter reports as `malformed` and the gate turns into a BLOCK. Fail-closed is the
+    /// whole point — a child has no human to ask.
+    #[tokio::test]
+    async fn an_ask_tier_tool_fails_closed_and_writes_both_audit_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = dir.path().join("permission-audit.jsonl");
+        let ext = env_extension(
+            "{\"write\":\"ask\"}",
+            Some(&audit.display().to_string()),
+        );
+        let HookOutcome::Block { reason } = ext.on_event(&call("write"), &ctx()).await else {
+            panic!("an unanswerable ask must fail closed");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "Blocked by pi-subagents permission rule: Watchdog permission arbiter is \
+                 unavailable because the child watchdog is disabled."
+            )
+        );
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&audit)
+            .expect("the audit file was written")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], serde_json::json!("permission.request"));
+        assert_eq!(lines[1]["approved"], serde_json::json!(false));
+        // The audited preview is redacted — and `SK-ABCDEFGHIJ` only redacts because the regex is
+        // case-insensitive.
+        let preview = lines[0]["preview"].as_str().expect("preview");
+        assert!(preview.contains("[redacted]"), "{preview}");
+        assert!(!preview.contains("ABCDEFGHIJ"), "{preview}");
+    }
+
+    /// `permissionDecision` (`permissions.ts:46-49`): `bash` and the four internal coordination
+    /// tools are allowed no matter what the rules say, so a parent cannot strand a child.
+    #[tokio::test]
+    async fn bash_and_the_internal_coordination_tools_are_never_gated() {
+        // The rules a parent could still ship for them (validation refuses to record these, but a
+        // parent on another version could).
+        let ext = env_extension(
+            "{\"write\":\"deny\",\"read\":\"deny\"}",
+            None,
+        );
+        let ctx = ctx();
+        for name in [
+            "bash",
+            "contact_supervisor",
+            "intercom",
+            "subagent_wait",
+            "structured_output",
+        ] {
+            assert!(
+                matches!(ext.on_event(&call(name), &ctx).await, HookOutcome::Noop),
+                "{name} must never be gated"
+            );
+        }
+    }
+
+    /// [CYRUP-DELTA] an undecodable policy blocks everything rather than degrading to "no policy".
+    #[tokio::test]
+    async fn an_invalid_policy_blocks_every_gated_tool_instead_of_failing_open() {
+        let ext = env_extension("{\"write\":\"maybe\"}", None);
+        let HookOutcome::Block { reason } = ext.on_event(&call("write"), &ctx()).await else {
+            panic!("an invalid policy must not fail open");
+        };
+        let reason = reason.expect("a reason");
+        assert!(reason.contains("the permission policy is invalid"), "{reason}");
+        assert!(reason.contains("must be allow, ask, or deny"), "{reason}");
+    }
+
+    /// No policy in the env => no gate, no `tool_call` subscription, and — with nothing else set —
+    /// no extension at all, exactly as `registerPermissionGate`'s early return (`:286`).
+    #[tokio::test]
+    async fn a_child_with_no_policy_installs_no_gate() {
+        assert!(prompt_runtime_extension_from(&|_| None).is_none());
+        let runtime = SubagentPromptRuntime::from_parts(None, None, false).with_permission_gate(
+            None,
+            None,
+            None,
+            Arc::new(crate::watchdog::permission_arbiter::NoDecisionPermissionAgent),
+        );
+        assert!(runtime.permission_gate().is_none());
+        assert!(runtime.is_inert());
+        let mut api = InitApi::new();
+        runtime.init(&mut api).await.expect("init");
+        assert!(!api.subscriptions().contains(EventKind::ToolCall));
     }
 }
 
