@@ -16,8 +16,19 @@ the evidence.
 > actually does. Closed items keep their IDs in each area file's status table so a closure can be
 > re-audited later.
 >
-> **Open set: 448 work items — 6 critical, 22 high, 197 medium, 223 low**, plus **9 `tracker` rows**
-> that keep their IDs but propose no schedulable work and are excluded from the count.
+> **Open set: 458 work items — 5 critical, 29 high**, plus **9 `tracker` rows** that keep their IDs
+> but propose no schedulable work and are excluded from the count. *(Was 448 / 6 / 22 at the
+> 2026-08-12 re-baseline; the delta is the 2026-08-13 repro pass — see below.)*
+>
+> **Amended 2026-08-13 by [`REPRO-LOG.md`](REPRO-LOG.md), the first pass that ran the binary.**
+> Seventeen items were driven through a real pty or headless: **16 CONFIRMED, 1 REFUTED, 0 BLOCKED**
+> — but only **3 of 17 survived unchanged**. Ten items were corrected in place and carry an
+> `observed 2026-08-13` marker; ten new items were filed from behaviour the binary was *seen* doing.
+> Severity movements: `AGENT-020` **critical → low** (its Impact was refuted — measured 5/5, no
+> message lost), `TUI-016` and `TUI-045` **medium → high**, and four new highs in area 07.
+> **The medium/low split is not re-derived here** — that arithmetic predates this pass and two
+> passes have filed items since; recount from the tables before planning against those two numbers.
+> The critical and high figures are current.
 >
 > **The severity scale is now applied rather than narrated.** The previous edition's headline was "0
 > critical" while six items met the definition below on their own text. Four were raised
@@ -41,20 +52,21 @@ the evidence.
 | [`../PARITY-PLAN.md`](../PARITY-PLAN.md) | **the execution plan derived from this directory — 30 batches, the next three moves, deferrals and open questions** | — | — | — |
 | [`../adr/README.md`](../adr/README.md) | **decisions of record — where the nine open questions of `PARITY-PLAN.md` §7 were settled (eleven ADRs), plus the ledger changes those decisions imply** | — | — | — |
 | [`PARITY-GAPS.md`](PARITY-GAPS.md) | **the same 448 items grouped by gap class — read first** | — | — | — |
+| [`REPRO-LOG.md`](REPRO-LOG.md) | **the first execution of this binary — 17 items driven through a real pty or headless, 16 confirmed / 1 refuted / 0 blocked, plus the real suite numbers (6387, not the inherited 3932) and 9 new items filed from what the binary was seen doing.** Every row carries a transcript. **Read this before trusting a severity: only 3 of 17 items survived a live run unchanged.** | — | — | — |
 | [`00-residual-ledger.md`](00-residual-ledger.md) | ranked cross-cutting view | — | — | — |
-| [`01-cyrup-core-and-provider.md`](01-cyrup-core-and-provider.md) | wire APIs, providers, auth, streaming, catalogs, cost | 40 | 0 | 6 |
-| [`02-cyrup-agent.md`](02-cyrup-agent.md) | the turn loop, tool dispatch, hooks, abort | 26 | 1 | 1 |
+| [`01-cyrup-core-and-provider.md`](01-cyrup-core-and-provider.md) | wire APIs, providers, auth, streaming, catalogs, cost | 41 | 0 | 7 |
+| [`02-cyrup-agent.md`](02-cyrup-agent.md) | the turn loop, tool dispatch, hooks, abort | 26 | 0 | 1 |
 | [`03-cyrup-session.md`](03-cyrup-session.md) | JSONL session tree, compaction, system prompt | 29 | 0 | 1 |
 | [`04-cyrup-tools.md`](04-cyrup-tools.md) | the built-in tool set | 29 | 0 | 1 |
 | [`05-cyrup-config-and-resources.md`](05-cyrup-config-and-resources.md) | settings, model resolution, trust, skills, packages | 38 | 0 | 1 |
-| [`06-cyrup-ext.md`](06-cyrup-ext.md) | extension host, WIT world, event catalog | 50 | 1 | 0 |
-| [`07-cyrup-tui.md`](07-cyrup-tui.md) | terminal UI application layer | 56 | 3 | 1 |
+| [`06-cyrup-ext.md`](06-cyrup-ext.md) | extension host, WIT world, event catalog | 51 | 1 | 0 |
+| [`07-cyrup-tui.md`](07-cyrup-tui.md) | terminal UI application layer | 62 | 3 | 7 |
 | [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes | 40 | 0 | 7 |
 | [`09-cyrup-ext-subagents.md`](09-cyrup-ext-subagents.md) | subagent delegation | 45 | 0 | 2 |
-| [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate | 21 | 1 | 1 |
-| [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker | 44 | 0 | 0 |
+| [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate | 22 | 1 | 1 |
+| [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker | 45 | 0 | 0 |
 | [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline | 30 | 0 | 1 |
-| | **total** | **448** | **6** | **22** |
+| | **total** | **458** | **5** | **29** |
 
 Counts are the `## Open items` table of each file. **Every file now carries exactly one such table**
 — area 03's second table was the last one and was folded in during the repair pass — so a single
@@ -258,12 +270,36 @@ anybody until the repair pass: `packages/tui/src`'s input pipeline, `packages/co
 
 ## Caveats
 
-- This is a **static** analysis. Nothing here was built, run, tested or reproduced. Items are
-  evidenced by reading both sources, not by observing behavior. Every `Verify` line is a design, not
-  an observation.
+- This is a **static** analysis **except for the seventeen items marked `observed 2026-08-13`**
+  ([`REPRO-LOG.md`](REPRO-LOG.md)). For everything else: nothing was built, run, tested or
+  reproduced; items are evidenced by reading both sources, not by observing behavior, and every
+  `Verify` line is a design rather than an observation.
+  **The repro pass measured what that costs, and the number is not reassuring.** 16 of 17 items were
+  confirmed to exist — reading finds real defects — but only **3 of 17** survived a live run
+  unchanged. The recurring failure is that an item recovers *what the code does* and not *what the
+  user sees*: `TUI-016` was filed as an absent surface and is an affirmative wrong one; `SESS-040`
+  assumed a spinner that never renders; `SEAM-063` assumed a success message that is never printed.
+  In each case the verdict was right and the picture of the screen was wrong — **and the picture is
+  what a fix gets written against.** Treat any unobserved item's *mechanism* as a hypothesis even
+  when its *existence* is well evidenced.
+- **A severity raise must cite an observation, or say plainly that it does not.** Two of the four
+  `high → critical` raises made on 2026-08-12 were made on *predicted* consequences: `AGENT-020`'s
+  "data loss on the normal path" was refuted by measurement (5/5 attempts, no message lost) and the
+  item is now `low`, and `EXT-054`'s reassuring blast-radius note ("zero WASM guests ship") was wrong
+  — the in-tree SDK guest reproduces the mis-grant in under a second. The raise procedure applied the
+  severity definition to an item's own Impact prose; where that prose was a prediction, the procedure
+  faithfully promoted a prediction into a rating.
 - **For TUI work this is not a formality.** ratatui `TestBackend` unit tests pass while the assembled
   application has layout and empty-state bugs. No `TUI-*` item — nor `SESS-040`, nor the pre-launch
   surfaces in `SEAM-061`…`SEAM-067` — is done until it has been **run in a real terminal**.
+  **Vindicated 2026-08-13.** `TUI-055` (no indicator renders for the entire 10–20 s of a compaction)
+  is invisible to every static read: the source at `app.rs:4615-4639` sets the indicator and looks
+  correct. Only running it shows the band never reaches the screen. `TUI-N13` is the mirror image —
+  a deterministic macOS-only test failure that four passes missed because the first measurement was
+  piped through `tail`. **Validate your instrument as a first-class step:** that pass produced three
+  instrument errors (`tail` hiding a red, `pgrep -f` matching its own pattern and inventing 22
+  orphaned processes, and `tmux display-message '#{cursor_x}'` reporting a stale hardware cursor
+  while cyrup paints its caret as an SGR-7 cell).
 - Severity and effort are judgements, not measurements. Treat any suggested ordering as a starting
   proposal.
 - **There is no `CLAUDE.md` in this workspace**, and no `spec/` tree or ADR documents. Earlier

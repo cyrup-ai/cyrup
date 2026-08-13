@@ -141,6 +141,9 @@ the embedder SDK (`cyrup/crates/cyrup-sdk/`), measured against
 | SEAM-068 | **new** (repair pass) | `--list-models <search>` uses a lossy hand-rolled filter while a faithful port of `fuzzyFilter` sits unused. |
 | SEAM-069 | **new** (repair pass) | Trust prompt's saved-decision line never says "inherited from". |
 | SEAM-070 | **new** (repair pass) | `process.title` role suffix unported — rpc/subagent/broker children are indistinguishable in `ps`. |
+| SEAM-071 | **new** (suite-verification pass) | `--no-extensions` nulls only the WASM/disk discovery roots; the three native built-ins load anyway (`builder.rs:775`, no `no_extensions` anywhere in `crates/cyrup/src/main.rs`). |
+| SEAM-072 | **new**, **closed** (fixed) · high | `build_inputs` read process stdin instead of taking Pi's `stdinContent` argument; any inherited open pipe hung the target forever. Read moved to `main.rs`, matching `main.ts:819-832`. |
+| SEAM-073 | **new** (suite-verification pass) | 14 temp dirs leaked per `-p cyrup-session-svc` run; `FileLock` never removes its lock file and a models-store access lands after `TempDir` teardown. |
 
 ## Open items
 
@@ -180,6 +183,9 @@ the check that establishes it. Do not "recover" them.
 | SEAM-066 | medium | parity-bug | M | Every pre-launch TUI surface hardwires the dark palette, ignoring `settings.theme` |
 | SEAM-067 | medium | not-ported | S | Pre-launch selectors never load `keybindings.json`, and their hint rows name the wrong keys |
 | SEAM-068 | medium | parity-bug | S | `--list-models <search>` uses a lossy hand-rolled fuzzy filter; the faithful port sits unused |
+| SEAM-071 | medium | parity-bug | S | `--no-extensions` does not gate the native built-ins (permission-system, subagents, intercom) |
+| SEAM-072 | high | parity-bug | S | `build_inputs` owned fd 0 instead of taking `stdinContent` — indefinite hang on an inherited pipe — **fixed this pass** |
+| SEAM-073 | low | cyrup-original | S | 14 temp dirs leaked per session-svc run; `FileLock` never deletes its lock file |
 | SEAM-017 | low | not-ported | M | No `RpcClient` counterpart |
 | SEAM-028 | low | test-defect | S | `modes.rs` setWidget case pins SEAM-011's invented wire field |
 | SEAM-029 | low | stale-port | S | `ThinkingArg` doc comment claims the leniency path is unreachable |
@@ -195,7 +201,9 @@ the check that establishes it. Do not "recover" them.
 | SEAM-069 | low | parity-bug | S | Trust prompt's saved-decision line never distinguishes an inherited ancestor decision |
 | SEAM-070 | low | not-ported | S | `process.title` role suffix unported — rpc and subagent children are indistinguishable in `ps` |
 
-**40 items — 0 critical, 7 high, 19 medium, 14 low.** Per structural defect A in
+**43 items — 0 critical, 8 high, 20 medium, 15 low.** (SEAM-071, SEAM-072 and SEAM-073 were added by
+the later suite-verification pass, SEAM-072 closed on arrival; the 40/7/19/14 counts below predate
+them.) Per structural defect A in
 `00-residual-ledger.md`, treat the count as a floor — and see this file's own *Not audited* paragraph,
 which names the inner RPC payload shapes as the largest unswept surface remaining.
 
@@ -209,7 +217,14 @@ Keeps its ID and its body; proposes no schedulable work today.
 
 ## SEAM-047 — First SIGTERM/SIGHUP neither tears down nor exits 143/129; `--mode rpc` keeps running forever and never emits session_shutdown
 
-**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** high (traced end-to-end on both sides; not reproduced — no execution this pass)
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13, exit codes as evidence.** A live `cyrup --mode rpc` (stdin held open on a
+> fifo) absorbs the first SIGTERM **and** the first SIGHUP completely — still running 15 s later,
+> requiring SIGKILL. A **second** SIGTERM exits **143**, which is precisely this item's claim that
+> `ShutdownSignal::exit_code` is consulted only on the second delivery. stdout was byte-empty across
+> every run, so no `session_shutdown` (nor anything else) is emitted on the way out under either
+> delivery. Nothing in the item needed correcting.
 
 **cyrup** — `cyrup/crates/cyrup/src/signals.rs:88-101` — `spawn_abort_on_signal`'s first-signal body is exactly `session.abort(); cancel.cancel();` (`:94-95`). The exit codes it does compute (`ShutdownSignal::exit_code`, `:26-32` → 130/143/129) are used ONLY on the second delivery at `:98-99`. The `CancelToken` it fires is created at `cyrup/crates/cyrup/src/main.rs:367` and is observed by the INTERACTIVE arm only (passed into the run loop at `main.rs:568`); the RPC arm hands a clone to the watcher at `main.rs:670` and the print/json arm at `main.rs:781`, and neither `run_rpc` (`cyrup/crates/cyrup-modes/src/rpc.rs:575-579`) nor `run_print`/`run_json` (`print.rs:58-68`, `json.rs:47-51`) takes a cancel token at all. `rpc_driver`'s `select!` (`rpc.rs:717-842`) has no cancellation arm: its only exits are the extension-driven `shutdown_requested` checkpoint (`:845-849`) and `!reader_open && !in_flight && dispatches.is_empty()` (`:851`), neither reachable from a signal. So `runtime.dispose()` at `cyrup/crates/cyrup/src/run.rs:113` never runs and no `session_shutdown` is dispatched. In print/json the send loop (`print.rs:83-96`) simply proceeds to the NEXT `--follow-up` message after the abort and the process exits with the transcript-derived 0/1/130 from `run.rs:133-148`.
 
@@ -237,7 +252,14 @@ Keeps its ID and its body; proposes no schedulable work today.
 
 ## SEAM-064 — The pre-launch trust prompt omits both "(this session only)" options, so every trust answer is written to `trust.json` permanently
 
-**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed (both sides re-read in the repair pass)
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed (both sides re-read in the repair pass) · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 on a real pty.** The startup prompt renders exactly **three** rows — Trust
+> / Trust parent folder (`<parent>`) / Do not trust — with no session-only variant of either answer.
+> The consequence was measured too, not inferred: pressing Enter on "Trust" writes
+> `<agent_dir>/trust.json` containing `{"<cwd>": true}`, while cancelling with ESC leaves no
+> `trust.json` at all. Cancel is therefore the only non-persisting exit, and it does not grant trust.
+> Nothing in the item needed correcting.
 
 **cyrup** — `cyrup/crates/cyrup/src/main.rs:1155` — `let options = cyrup_config::trust::trust_options(&dirs.cwd, false);`, fed straight into `cyrup::run_trust_prompt(&theme, &dirs.cwd, &options, &saved, &trust_store)` at `:1157`. The second parameter is `include_session_only` (`cyrup/crates/cyrup-config/src/trust.rs:336`), and it is exactly what gates both ephemeral rows: `"Trust (this session only)"` with `updates: Vec::new()` (`:356-363`) and `"Do not trust (this session only)"` (`:370-377`) — verified verbatim. With `false` the prompt renders three rows (Trust / Trust parent folder / Do not trust), every one of which carries a non-empty `updates`, which `run_trust_prompt` persists unconditionally via `trust_store.set_many(&option.updates)` (`cyrup/crates/cyrup/src/startup_ui.rs:266-268`). The unit tests at `startup_ui.rs:505` and `:519` pin the wrong arity. `false` is passed at **every** call site in the workspace (`main.rs:1155`, `cyrup-session-svc/src/session.rs:3255`), so the two options are unreachable code.
 
@@ -251,7 +273,23 @@ Keeps its ID and its body; proposes no schedulable work today.
 
 ## SEAM-063 — Session delete permanently unlinks the JSONL where pi routes through the `trash` CLI first, and the failure is swallowed
 
-**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** confirmed (both sides re-read in the repair pass)
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Both halves reproduced 2026-08-13 on a real pty.** With an executable stub `trash` first on
+> `PATH`, cyrup **never invokes it** (no log line) and unlinks the JSONL permanently. With the
+> sessions directory `chmod 555` so `remove_file` must fail, the row still vanishes from the list, no
+> error is shown or printed, and **the file survives** — a failed delete is visually identical to a
+> successful one.
+>
+> **One correction to the Impact below.** The item says cyrup "additionally reports success
+> unconditionally". That is accurate for the **in-app** `/resume` path (`app.rs:4025` prints "deleted
+> session"), but the **pre-launch** `--resume` picker measured here prints *nothing at all* on
+> delete — no "Session deleted", no "moved to trash", no failure text; the only feedback is the row
+> disappearing. On that surface the defect is a **missing status line as well as** a swallowed error,
+> so the Fix must give `startup_ui.rs`'s `on_apply` a status channel for pi's
+> `result.method === "trash" ? "Session moved to trash" : "Session deleted"` (`session-selector.ts:846`)
+> and `"Failed to delete: …"` (`:849`) to render into. The upstream half was re-read at v0.84.1 this
+> pass and matches the item verbatim.
 
 **cyrup** — Two sites, same defect. Pre-launch picker: `cyrup/crates/cyrup/src/startup_ui.rs:133-137` — `if let Some(SessionSelectorOutcome::Delete(path)) = … { let _ = std::fs::remove_file(&path); }`, verbatim at HEAD. Permanent, and the `let _` discards the `io::Result`, so a failed delete produces no message while the row has already vanished from the list (`cyrup-tui/src/session_selector.rs:780`). In-app `/resume`: `cyrup/crates/cyrup-tui/src/app.rs:4021-4028` → `session.delete_session_file(path)` → `cyrup/crates/cyrup-session-svc/src/session.rs:3343-3347`, also a bare `std::fs::remove_file`, and `app.rs:4025` prints "deleted session" whether or not the file went. `rg -ni 'trash' crates` returns **zero** hits workspace-wide — re-run in this pass and confirmed empty.
 
@@ -259,13 +297,31 @@ Keeps its ID and its body; proposes no schedulable work today.
 
 **Impact** — For every user who has `trash` installed (macOS `brew install trash`, Linux `trash-cli`), pi's session delete is recoverable from the OS trash and cyrup's is irreversible. One confirmed keypress in the `--resume` picker or in-app `/resume` destroys a whole conversation JSONL with no undo, on a surface whose sibling operation (rename, SEAM-062) is a no-op — so the destructive action is the one that works. cyrup additionally reports success unconditionally, so a delete that failed on a read-only volume looks identical to one that succeeded.
 
-**Fix** — Add a `delete_session_file(path) -> Result<DeleteMethod, String>` helper — `std::process::Command::new("trash")` with pi's `--` guard, success on exit-0 **or** `!path.exists()`, else `std::fs::remove_file` — and call it from **both** `crates/cyrup/src/startup_ui.rs:133-137` and `crates/cyrup-session-svc/src/session.rs:3343-3347`. Propagate the method into the status message so `app.rs:4025` can say "Session moved to trash" vs "Session deleted", and stop discarding the error at `startup_ui.rs:136`.
+**Fix** — *(Scope note added 2026-08-13 from the live run: the pre-launch picker has **no status line
+at all**, so this fix must add one, not merely correct one.)* Add a `delete_session_file(path) -> Result<DeleteMethod, String>` helper — `std::process::Command::new("trash")` with pi's `--` guard, success on exit-0 **or** `!path.exists()`, else `std::fs::remove_file` — and call it from **both** `crates/cyrup/src/startup_ui.rs:133-137` and `crates/cyrup-session-svc/src/session.rs:3343-3347`. Propagate the method into the status message so `app.rs:4025` can say "Session moved to trash" vs "Session deleted", and stop discarding the error at `startup_ui.rs:136`.
 
 **Verify** — Unit-test the helper with a stub `trash` on `PATH`: success → `Trash`; exit-1 with the file still present → falls back to unlink; unlink failure → `Err`. Then a live run — with `trash` installed, delete a session from `cyrup --resume`, confirm the status line says "moved to trash" and the file is in the OS trash, not gone.
 
 ## SEAM-061 — The `--resume` picker merges current-folder and all-projects sessions into one list, labels it "Current Folder", and advertises a `tab scope` toggle that does nothing
 
-**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** confirmed (both sides re-read in the repair pass)
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 on a real pty, every clause.** Two project dirs; from `projA` the picker
+> headed "Resume Session (Current Folder)" lists `projB`'s session alongside `projA`'s with the cwd
+> column off. Tab is **completely inert** — not merely unbound but producing *no redraw at all* (the
+> raw pty log shows the redraw emitting only `ESC[39m ESC[49m ESC[59m ESC[0m ESC[?25l` and no cell
+> changes) — while the hint row prints `tab scope` and the empty state prints "No sessions in current
+> folder. Press Tab to view all." Selecting the foreign row **resumes `projB`'s session with the
+> footer cwd still `projA`** and no warning, so the item's impact claim is now measured rather than
+> inferred.
+>
+> **One screen element the paragraphs below omit, added because it makes the misreport worse and is
+> the first thing to fix:** the header also renders a scope **radio** — `◉ Current Folder | ○ All` —
+> to the right of the title. The UI does not merely *name* the wrong scope in prose, it draws a
+> two-state control showing "Current Folder" selected, beside a `tab scope` hint, over a list that is
+> already both scopes merged.
+
+
 
 **cyrup** — `cyrup/crates/cyrup/src/main.rs:1259-1268` — `gather_session_infos` runs `list_in_dir(cwd-layout)` and then appends every row from `list_global_sessions(dirs)` (`:1244-1252`, the cross-project `list_all(SessionsRoot)`), de-duplicated by path, into **one** `Vec<SessionInfo>`; read verbatim at HEAD, including the doc comment that names both of pi's loaders as its source. `main.rs:1096` hands that single vector to `cyrup::run_resume_picker(&theme, &sessions, None)`, which builds `SessionSelector::new(rows)` (`cyrup/crates/cyrup/src/startup_ui.rs:126-127`). `SessionSelector` defaults to `scope: SessionScope::Current` (`cyrup/crates/cyrup-tui/src/session_selector.rs:204`), so the header renders `"Resume Session (Current Folder)"` (`:561-563`) over a list containing every project's sessions, with the cwd column off (`show_path: false`, `:199`; the cwd renders only `if self.show_path`, `:456`). There is no `SessionAction::ToggleScope` in the keymap at all (`:825-837` is ToggleSort/ToggleNamedFilter/TogglePath/Delete/Rename), so Tab falls through `handle` (`:770-843`) inert — while the hint row unconditionally prints `"tab scope"` (`:674`) and the empty state prints `"No sessions in current folder. Press Tab to view all."` (`:426`). The crate concedes it at `:49-52`: the Tab toggle "needs an all-sessions loader, which the cyrup chrome does not hand the selector yet". `SessionListProgress` exists and is unused by the bin (`cyrup-session/src/listing.rs:40-41,57`; `main.rs:1261` passes `None`).
 
@@ -273,13 +329,22 @@ Keeps its ID and its body; proposes no schedulable work today.
 
 **Impact** — On any machine with more than one cyrup project, `cyrup --resume` shows a picker headed "Current Folder" that actually lists every session on disk, with no cwd column to tell them apart and rows labelled only by their first message. Picking a foreign row resumes another project's session (`main.rs:1124` sets `SessionTarget::Resume(path)` with no cwd guard) — the user has no on-screen way to notice, and the one control the UI tells them to use is dead. The screen actively misreports its own contents, which is worse than either half alone. Secondary: every `--resume` pays a full cross-project scan synchronously before the terminal is even entered, with no progress feedback, where pi scans one directory and streams progress.
 
-**Fix** — Give `run_resume_picker` both listings instead of a merged one: change the signature to `run_resume_picker(theme, current: &[SessionInfo], all: &dyn Fn() -> Vec<SessionInfo>, current_id)`, keep `gather_session_infos`' local half for the initial rows and defer `list_global_sessions` to the toggle. Add `SessionAction::ToggleScope` to the session keymap (bound to Tab, matching `tui.input.tab`), handle it in `SessionSelector::handle` by calling `set_scope` + `set_rows` and flipping `show_path` to `scope == All` (pi's `showCwd`), and make the `"tab scope"` hint conditional on the toggle actually being armed. Thread `SessionListProgress` into the initial load so the header can render pi's `loaded/total`. **Handoff:** the `SessionSelector` half is area 07's file; the loader/plumbing half is this area's. Land them together — either half alone leaves the screen lying.
+**Fix** — Give `run_resume_picker` both listings instead of a merged one: change the signature to `run_resume_picker(theme, current: &[SessionInfo], all: &dyn Fn() -> Vec<SessionInfo>, current_id)`, keep `gather_session_infos`' local half for the initial rows and defer `list_global_sessions` to the toggle. Add `SessionAction::ToggleScope` to the session keymap (bound to Tab, matching `tui.input.tab`), handle it in `SessionSelector::handle` by calling `set_scope` + `set_rows` and flipping `show_path` to `scope == All` (pi's `showCwd`), and make the `"tab scope"` hint conditional on the toggle actually being armed. **Added 2026-08-13 from the live run:** `ctrl+p path (off)` exists today as a *manual* cwd-column toggle, whereas pi derives `showCwd` **strictly** from `scope === "all"` (`session-selector.ts:844`) — so `show_path` must be made to *follow the scope*, not merely be armable alongside it, and the header's `◉ Current Folder | ○ All` radio must be driven by the same state. Thread `SessionListProgress` into the initial load so the header can render pi's `loaded/total`. **Handoff:** the `SessionSelector` half is area 07's file; the loader/plumbing half is this area's. Land them together — either half alone leaves the screen lying.
 
 **Verify** — `cargo test -p cyrup-tui session_selector` for the scope/`show_path` unit assertions, then a **live run**: create sessions in two project dirs, `cd` into the first, run `cyrup --resume` in a real terminal, confirm only the first project's sessions appear under "Resume Session (Current Folder)", press Tab and confirm the header flips to "Resume Session (All)", the other project's sessions appear, and the cwd column turns on. TestBackend alone does not close this.
 
 ## SEAM-062 — The pre-launch `--resume` picker offers rename, shows the new name on screen, and silently discards it
 
-**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed (both sides re-read in the repair pass)
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 on a real pty, exactly as filed.** The picker advertises `ctrl+r rename`,
+> enters rename mode with its own hint row ("enter to save · escape/ctrl+c to cancel"), accepts the
+> typed text, and on Enter repaints the row's label as `NEWNAME` — complete positive feedback. The
+> session JSONL is untouched (`grep -c NEWNAME` = 0, no `session_info` line appended) and a relaunch
+> of the same picker shows the original label. Upstream re-read at v0.84.1: `cli/session-picker.ts:48`
+> constructs the component with `{ showRenameHint: false, keybindings }` and passes no
+> `renameSession` callback, so pi's pre-launch picker cannot enter rename mode at all. Nothing in the
+> item needed correcting.
 
 **cyrup** — `cyrup/crates/cyrup-tui/src/session_selector.rs:214` — `show_rename_hint: true` is the constructor default (verified verbatim, with an in-tree comment citing pi's `showRenameHint ?? canRename`), and `cyrup/crates/cyrup/src/startup_ui.rs:126-127` never calls `set_show_rename_hint(false)`, so the pre-launch picker prints the `rename` hint (`session_selector.rs:689-692`). `SessionAction::Rename` is ungated (`:833-837`) and enters rename mode for the selected row. On Enter the row is mutated in place — `row.name = Some(name)`, `row.label = name` (`:798-801`) — and a `SelectorOutcome::Apply(rename_payload)` is returned (`:802`). `run_resume_picker`'s `on_apply` closure (`startup_ui.rs:129-138`) matches **only** `SessionSelectorOutcome::Delete`; the rename payload falls through and is dropped, which the doc comment at `:131-133` states outright ("Rename is deferred to the in-app `/resume` (no header-rewrite seam pre-launch)"). Nothing is written to the JSONL.
 
@@ -492,7 +557,20 @@ Keeps its ID and its body; proposes no schedulable work today.
 
 ## SEAM-051 — --tui-mode <regular|fullscreen> is rejected with exit 1 instead of parsed, so the flag's DEFAULT value refuses to launch the binary
 
-**Kind** upstream-drift · **Severity** **high** *(raised from medium in the repair pass)* · **Effort** S · **Confidence** confirmed — every link re-read at HEAD
+**Kind** upstream-drift · **Severity** **high** *(raised from medium in the repair pass)* · **Effort** S · **Confidence** confirmed — every link re-read at HEAD · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 in the shipped binary.** `cyrup --offline --no-session --no-extensions
+> --tui-mode regular -p hi` prints `Error: Unknown option: --tui-mode` and exits 1; the control run
+> without the flag reaches the provider. Reproduced with the value present, absent, bogus and in `=`
+> form, with extensions enabled and disabled, and in print / `--mode json` / `--mode rpc`. `--help`
+> exits 0 and the flag is absent from the shipped help text.
+>
+> **Two mechanism details in the paragraphs below were corrected against that measurement.** (1) The
+> emitted text is `Unknown option:` — **singular**; the plural `Unknown option(s):` form is used only
+> when more than one flag is unmatched (`crates/cyrup-ext/tests/extension_flag_diagnostics.rs:42,99`).
+> (2) The failure does **not** require the extension subsystem: the reconciliation diagnostic runs
+> identically under `--no-extensions`, so do not read the extension-flag partitioning paragraph as a
+> reachability qualifier. The verdict is unchanged.
 
 > Supersedes **SEAM-019**, whose upstream premise (`--ui-mode` / `--alt`) does not exist at any pi
 > tag. Work this item; do not work SEAM-019 as written.
@@ -505,7 +583,7 @@ Keeps its ID and its body; proposes no schedulable work today.
 > because the failure is deterministic, immediate, printed, and one token from working — it destroys
 > nothing and hides nothing. It was previously ranked below 188 mediums at effort S.
 
-**cyrup** — `grep -rn 'tui_mode\|tui-mode' crates/` returns zero hits outside `cyrup-tui` doc comments. The flag is therefore absent from `KNOWN_LONG_FLAGS` (`cyrup/crates/cyrup/src/cli.rs:757-799`), so `partition_extension_flags` (`cli.rs:701-753`) captures `--tui-mode fullscreen` as an extension flag at `:731-738` (the value does not start with `-`/`@`); nothing registers it, so `apply_extension_flag_values` (`cyrup/crates/cyrup-session-svc/src/builder.rs:946-967`) records `Unknown option(s): --tui-mode`, `collect_diagnostics` (`runtime.rs:113-119`) rates it `error`, and `report_runtime_diagnostics` (`main.rs:1846-1862`) exits 1 in every mode. The reported message is also misleading: the flag is not unknown to pi, it is unported.
+**cyrup** — `grep -rn 'tui_mode\|tui-mode' crates/` returns zero hits outside `cyrup-tui` doc comments. The flag is therefore absent from `KNOWN_LONG_FLAGS` (`cyrup/crates/cyrup/src/cli.rs:757-799`), so `partition_extension_flags` (`cli.rs:701-753`) captures `--tui-mode fullscreen` as an extension flag at `:731-738` (the value does not start with `-`/`@`); nothing registers it, so `apply_extension_flag_values` (`cyrup/crates/cyrup-session-svc/src/builder.rs:946-967`) records `Unknown option: --tui-mode` (singular — the plural form is reserved for two or more unmatched flags; **corrected against the 2026-08-13 measurement**), `collect_diagnostics` (`runtime.rs:113-119`) rates it `error`, and `report_runtime_diagnostics` (`main.rs:1846-1862`) exits 1 in every mode. The reported message is also misleading: the flag is not unknown to pi, it is unported.
 
 **upstream** — `pi/packages/coding-agent/src/cli/args.ts:180-193` (v0.84.1; absent at v0.83.0) — a dedicated `--tui-mode` arm accepting `regular`/`fullscreen`, with `"--tui-mode requires regular or fullscreen"` when the value is missing or starts with `-` (`:186`) and `Invalid TUI mode "X". Valid values: regular, fullscreen` otherwise (`:189-191`); typed `tuiMode?: TuiMode` at `args.ts:49`, listed in the help at `:291`, threaded at `main.ts:935` into `InteractiveMode`, consumed at `modes/interactive/interactive-mode.ts:345` and `:530` with the settings fallback `settingsManager.getTuiMode()`.
 
@@ -840,6 +918,48 @@ Keeps its ID and its body; proposes no schedulable work today.
 **Fix** — Set the per-process name (not the environment) after mode resolution in `crates/cyrup/src/main.rs::run`, via `prctl(PR_SET_NAME)` on Linux and the macOS equivalent — a two-platform `cfg` block or a small crate such as `proctitle`. Use `cyrup` for interactive, `cyrup-rpc` when `--mode rpc` is resolved (mirroring `rpc-entry.ts:6`), and distinct names in `subagent_runner_cmd::dispatch` and `intercom_broker_cmd::dispatch`. **Correct the comment at `main.rs:53-57` in the same change**: its `unsafe`-free rationale covers only the `std::env::set_var` half, and process naming is a syscall on the current process rather than a mutation of the shared environment, so it does not carry that hazard — leaving the comment as written is how this stayed unfiled. The `PI_CODING_AGENT` env half of the same block is already owned by TOOL-031 / PARITY-GAPS PB-5 (area 04); do not re-file it here.
 
 **Verify** — Launch `cyrup --mode rpc`, then `ps -o comm= -p <pid>` returns `cyrup-rpc`; launch an interactive session and it returns `cyrup`. Both return `cyrup` today.
+
+## SEAM-071 — `--no-extensions` gates only the WASM/disk discovery roots, so the three native built-ins load anyway and `-ne` cannot produce pi's bare session
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-session-svc/src/builder.rs:775` is `for ext in self.native_extensions { … host.load_native_with_services(ext, …) … }` — unconditional; `cfg.no_extensions` is never consulted on that path. The only place the flag acts is `extension_discovery_roots` (`:1677-1690`), which nulls `project_cwd` and `agent_dir` and so suppresses **disk** extensions only. The natives are pushed at `crates/cyrup/src/main.rs:481/:490/:493/:506` (and again at the `:630`/`:724` session-build sites) from `subagent_extension_for_env`, `prompt_runtime_extension_for_env`, `intercom_extension_for_env` and `permission_extension_for_env`; `rg 'no_extensions' crates/cyrup/src/main.rs` returns **nothing**, so none of the four gates sees the flag. A user with `CYRUP_INTERCOM=1` running `cyrup --no-extensions -p hi` therefore still attaches intercom and still spawns a broker.
+
+**upstream** — `pi` v0.83.0 `packages/coding-agent/src/core/resource-loader.ts:451-452`: `const extensionPaths = this.noExtensions ? cliEnabledExtensions : this.mergePaths(cliEnabledExtensions, enabledExtensions);` — under `--no-extensions` the set collapses to the explicitly-passed `-e` paths and nothing else. pi-subagents, pi-intercom and pi-permission-system are ordinary *discovered* extensions upstream, not built-ins, so upstream's `-ne` run has none of the three. That is precisely the guarantee `-ne` exists to give.
+
+**Impact** — `--no-extensions` is the escape hatch a user reaches for when an extension is suspected of breaking a session, and the bisect it is supposed to enable does not work: the three highest-surface extensions in the product — the permission gate, the subagent orchestrator and intercom — are exactly the ones it cannot switch off. Concretely it also means `-ne` cannot be used to get a broker-free one-shot run, which is what forced the four `crates/cyrup/tests/*.rs` fixtures to scrub `CYRUP_INTERCOM`/`CYRUP_SUBAGENTS`/`CYRUP_PERMISSION_SYSTEM` from the child environment instead (ICOM-051, area 11 — that item closes the *test* hole and explicitly does not close this one). Security-adjacent in one direction only: `-ne` currently *keeps* the permission gate on, so this is not a fail-open, but a user who believes `-ne` produced a bare session is wrong about what is loaded.
+
+**Fix** — Consult `cfg.no_extensions` where the natives are selected, not where they are loaded. Either (a) gate the four `*_extension_for_env` calls in `crates/cyrup/src/main.rs` on the resolved `--no-extensions` flag at all three session-build sites, or (b) skip the `self.native_extensions` loop in `builder.rs:775` when `cfg.no_extensions` is set. Prefer (a): the flag is a CLI concern and (b) would also silently drop the subagent-child attachments that are not user-installed extensions at all. **Decide and document the subagent-child carve-out either way** — a `__subagent-runner` child attaches intercom unconditionally so `contact_supervisor` exists (`crates/cyrup-intercom/src/extension.rs:637-640`), and pi's child gets `subagent-prompt-runtime.ts` through `pi-args.ts:13` rather than through discovery, so those two must survive `-ne` to keep parity.
+
+**Verify** — `CYRUP_INTERCOM=1 cyrup --no-extensions --offline --no-session -p hi`, then `ps -axo pid,command | grep -cE '[/]cyrup __intercom-broker'` returns 0 and the session's tool list contains no `intercom`; the same run without `-ne` still attaches it. Plus a `-p cyrup` fixture asserting that under `-ne` the startup extension set is empty even with all three opt-in vars exported.
+
+## SEAM-072 — `build_inputs` read the process's own stdin instead of taking Pi's `stdinContent` argument, so any test that drives prompt assembly hangs forever on an inherited pipe
+
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed · **Status** fixed this pass
+
+**cyrup** — `crates/cyrup/src/input.rs:597-614` (pre-fix) ended with `let piped = read_piped_stdin().await?;` *inside* `build_inputs`, and `read_piped_stdin` (`:576-586`) guards only on `std::io::stdin().is_terminal()` before `tokio::io::stdin().read_to_string(&mut buf).await`. A pipe is not a terminal, so on any non-TTY stdin the call blocks until **EOF** — not until any bounded event. `build_inputs` is `pub` and is the documented "exact fn `main.rs` calls" that two integration targets drive directly (`crates/cyrup/tests/image_auto_resize_file_args.rs:50`, `crates/cyrup/tests/image_bytecap.rs:62`), so those targets inherited whatever descriptor the test runner had on fd 0.
+
+**upstream** — pi v0.83.0 `packages/coding-agent/src/main.ts:819-826` reads stdin in `main` itself — `let stdinContent; if (appMode !== "rpc") { stdinContent = await readPipedStdin(); … }` — and `:828-832` *passes* it in: `prepareInitialMessage(parsed, settingsManager.getImageAutoResize(), stdinContent)`. `stdinContent?: string` is `prepareInitialMessage`'s third parameter (`:169-172`) and flows on to `buildInitialMessage({ parsed, stdinContent })` (`:178`). The descriptor-owning step and the prompt-assembly step are separate functions upstream; cyrup had fused them. cyrup's own doc comment at `input.rs:591-593` already quoted the three-argument upstream call while implementing a two-argument one.
+
+**Impact** — Measured, not theorised. `cargo test -p cyrup --test image_auto_resize_file_args` with stdin at `/dev/null`: **2 passed in 4.77 s**. The identical command with an open pipe on stdin (`sleep 300 | cargo test …`): **both tests still "running for over 60 seconds"**, sampled to `Runtime::block_on` → `Context::park` → `kevent`, and never terminating. It hung the second full-workspace verification run at target 8 of ~338 for 11 minutes until killed. Because `cargo test` has no per-test timeout, the failure mode is a **silent indefinite stall that names nothing** — strictly worse than a red, and the reason a `cargo test --workspace` gate could not be trusted: whether the suite finished at all depended on the CI runner's fd 0. This is very likely the same root cause as the previously-unexplained `one_shot_parity::an_unmatched_models_pattern_warns_on_stderr` "running for over 60 seconds" report, since the whole workspace run shares one inherited descriptor.
+
+**Fix** — *applied.* Restored pi's split: `read_piped_stdin` is now `pub` and is called by `crates/cyrup/src/main.rs` at both prompt-building sites (the interactive arm and the Print/Json arm — RPC still never reads it, matching `main.ts:820`'s `appMode !== "rpc"` guard), and `build_inputs(cli, cwd, auto_resize, piped: Option<String>)` takes the content as its fourth argument, mirroring `prepareInitialMessage`'s `stdinContent`. Nothing about the runtime behaviour of the binary changes — the same read happens at the same point in the same order — only the ownership of fd 0 moves out of the reusable function.
+
+**Verify** — done. `sleep 200 | cargo test -p cyrup --test image_auto_resize_file_args --test image_bytecap` → 2 passed / 1 passed, 4.88 s and 5.51 s, i.e. the previously-fatal condition is now inert. Whole package under the same open pipe: `cargo test -p cyrup` → 17 targets, all `ok`, 221 tests, no stall — including `piped_stdin_trim.rs`, which drives the real binary through a real pipe and therefore proves the production stdin path is unchanged. Audit of the remaining process-global stdin readers: `cyrup-tui/src/drain.rs:154` and `terminal_query.rs:386` both gate on `is_tty() && is_raw_mode_enabled()` and `main.rs:674` is RPC-only, so `input.rs` was the sole unguarded blocking reader.
+
+## SEAM-073 — Every `-p cyrup-session-svc` run leaves 14 temp directories behind, because `FileLock` never deletes its lock file and something touches the models store after the fixture's `TempDir` teardown starts
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed (the leak and its contents are measured; the exact late writer is inferred)
+
+**cyrup** — `crates/cyrup-config/src/lock.rs`: `FileLock::acquire` opens the lock path with `.create(true)` (`:25-34`) and `impl Drop` calls `FileExt::unlock` only (`:42-46`) — the file itself is never removed. Both `FileModelsStore::read` and `::write` take that lock (`crates/cyrup-config/src/models_store.rs:91` and `:100`), so *reading* the store is enough to create `<agent_dir>/models-store.json.lock`. Measured: `cargo test -p cyrup-session-svc` leaves exactly **14** `$TMPDIR/.tmpXXXXXX` directories per run, and every one of them has identical contents — an empty `project/` and `agent/models-store.json.lock`, nothing else. `TempDir::drop`'s `remove_dir_all` swallows its error, so a store access landing after the directory scan begins leaves the whole tree behind silently. `cargo test -p cyrup-tui --lib`, whose fixtures build sessions the same way, leaks **0**, which is what makes this specific to whatever session-svc keeps running past the fixture's drop rather than to the fixture shape.
+
+**upstream** — no counterpart: pi has no lock file beside `models-store.json` (`packages/coding-agent/src/core/models-store.ts` writes it directly), so both the stale-lock artefact and this leak are cyrup-original.
+
+**Impact** — Small but monotone: 14 directories per session-svc run and 15 per full-workspace run (the extra one is a `cyrup-bash-*.log` spool), each ~3 inodes, forever, in a directory macOS only sweeps on reboot. Three consecutive full-workspace runs measured +15, +15, +15. The user-facing residue is the never-deleted `~/.cyrup/models-store.json.lock`, which is cosmetic. What makes it worth an ID is the mechanism rather than the bytes: it is direct evidence that some session-svc task still runs after the session and its whole agent directory are gone, which is the same class of lifetime bug as SEAM-S03.
+
+**Fix** — Two independent halves. (a) Give `FileLock::drop` a best-effort `std::fs::remove_file(&self.path)` after the unlock, or hold the lock on `models-store.json` itself rather than a sidecar. (b) Find and join (or cancel) whatever performs a models-store access after `AgentSession` drop — instrument `FileLock::acquire` with a `tracing::trace!` carrying a backtrace and re-run `-p cyrup-session-svc` to name it; that half is the real defect and (a) only hides it.
+
+**Verify** — `ls $TMPDIR | wc -l` before and after `cargo test -p cyrup-session-svc` differs by 0. Today it differs by 14.
 
 ## Coverage
 

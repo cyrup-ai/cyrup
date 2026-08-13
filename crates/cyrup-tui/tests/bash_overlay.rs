@@ -305,8 +305,14 @@ fn hotkeys_global_key_cells_resolve_from_the_live_keymap() {
     );
     // `formatKeys` joins EVERY bound key with `/` (`keybinding-hints.ts:33-36`), same as the editor
     // half's `Shift+Enter/Ctrl+J`.
+    //
+    // `formatKeyPart` (`keybinding-hints.ts:12-15` @v0.83.0) rewrites `alt`→`option` only when
+    // `process.platform === "darwin"`, so the expected cell is host-dependent — the same reason
+    // `tests/chrome.rs:36-43` branches. Spelled out rather than sourced from
+    // `cyrup_tui::format_key_text`, which would assert the renderer against itself.
+    let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
     assert!(
-        body.contains("| `Ctrl+X/Alt+E` | Edit message in external editor |"),
+        body.contains(&format!("| `Ctrl+X/{alt}+E` | Edit message in external editor |")),
         "a two-key global binding must list both:\n{body}"
     );
     // MIRROR — an untouched global row is unchanged, so the rebind moved one cell and not the table.
@@ -363,9 +369,11 @@ fn hotkeys_lists_extension_registered_shortcuts() {
         body.contains("\n**Extensions**\n| Key | Action |\n|-----|--------|\n"),
         "the section header/table head is verbatim upstream's:\n{body}"
     );
-    // `formatKeyText(key, { capitalize: true })` — every chord part title-cased.
+    // `formatKeyText(key, { capitalize: true })` — every chord part title-cased, and `alt`→`option`
+    // on darwin only (`formatKeyPart`, `keybinding-hints.ts:12-15` @v0.83.0).
     assert!(body.contains("| `Ctrl+J` | Jump to definition |"), "{body}");
-    assert!(body.contains("| `Alt+Shift+K` | Kill the ring |"), "{body}");
+    let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
+    assert!(body.contains(&format!("| `{alt}+Shift+K` | Kill the ring |")), "{body}");
     // The section is LAST — it is appended after the `**Other**` table (`:6188`).
     let other = body.find("**Other**").expect("Other section");
     let ext = body.find("**Extensions**").expect("Extensions section");

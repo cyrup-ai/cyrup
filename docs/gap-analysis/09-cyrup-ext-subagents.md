@@ -136,6 +136,9 @@ clone-HEAD line numbers and file existence both mislead here).
 | SUBA-064 | **new this pass** | medium · The whole `authorityPolicy` subsystem unported; the `stop`/`steer` gate it drives is live-reachable. From sweep 4 (denial paths). |
 | SUBA-065 | **new this pass** | low · `unknownSubagentActionMessage` did-you-mean recovery and its destructive-action gate unported. From sweep 4. |
 | SUBA-066 | **new this pass** | low · `/subagents-guide` slash command unported; outside both VL-S11 and SUBA-055. From sweep 4. |
+| SUBA-067 | **new — FIXED** | high · descendant-termination fixture exec-collapsed to one pid, so the test never exercised group-kill. Found by RUNNING the suite. |
+| SUBA-068 | **new — FIXED** | high · setup-hook timeout fixture raced macOS's ~200 ms first-exec verification with a 200 ms budget. Found by RUNNING the suite. |
+| SUBA-069 | **new — OPEN** | high · the whole setup-hook test family is wall-clock-budgeted and goes red under machine load; `-p cyrup-ext-subagents` is not a reliable gate. |
 
 Closed this pass: **22**. Partially closed: **4** (SUBA-007, SUBA-013, SUBA-024, SUBA-026).
 Newly filed: **24**. Refuted and recorded: **1**.
@@ -189,6 +192,9 @@ Newly filed: **24**. Refuted and recorded: **1**.
 | SUBA-063 | low | not-ported | M | Zero-tool-budget authorisation and the runtime-extension acknowledgement path unported |
 | SUBA-065 | low | upstream-drift | S | `unknownSubagentActionMessage` — did-you-mean recovery and its destructive-action gate — unported |
 | SUBA-066 | low | upstream-drift | S | `/subagents-guide` slash command unported (outside both VL-S11 and SUBA-055) |
+| SUBA-067 | high | test-defect | S | Descendant-termination fixture exec-collapses to one pid; test never exercised group-kill (FIXED) |
+| SUBA-068 | high | test-defect | S | Setup-hook timeout fixture races macOS ~200 ms first-exec verification with a 200 ms budget (FIXED) |
+| SUBA-069 | high | test-defect | M | Setup-hook test family is wall-clock-budgeted; 3 siblings go red under machine load (OPEN) |
 
 **45 items — 0 critical, 2 high, 23 medium, 20 low.** Per structural defect A in
 `00-residual-ledger.md`, treat the count as a floor.
@@ -639,6 +645,41 @@ other items own. A planner should not pick one up; the next audit pass maintains
 **Impact** — The user-facing half of the guide feature has no owner: PARITY-GAPS VL-S11 names exactly three missing commands (`/subagents`, `/subagents-refine`, `/subagents-detach`) and **SUBA-055** scopes itself to the `guide` *action* plus the packaged docs. A user who reads pi's docs and types `/subagents-guide` gets an unknown command. Low severity, but this is precisely the kind of item that silently survives a "guide is filed" checkmark on the next pass.
 **Fix** — Add the `SubagentsGuide` variant and descriptor to `registration/slash_commands.rs:127-146`, routing to the same `read_subagent_guide` **SUBA-055** introduces. Land the two together; this is the last mile of that item, not an independent subsystem.
 **Verify** — `/subagents-guide` must render the overview topic, and `/subagents-guide tool-reference` the tool-reference topic, identical to the corresponding `{action:"guide"}` output.
+
+---
+
+## SUBA-067 — The descendant-termination fixture exec-collapsed to a single process, so the test never exercised group-kill
+
+**Kind** test-defect · **Severity** high · **Effort** S · **Confidence** confirmed · **Status** FIXED
+**cyrup** — `spawn/mod.rs:1633-1636` built `sh -c 'echo $$ > …; mv …; exec sleep 300'` and handed it to `sh_command()` (`mod.rs:1098-1110`), which runs `/bin/sh -c <script>`. A `-c` script that is a SINGLE simple command triggers the shell's exec-through optimization: the outer shell replaces itself with the inner `sh`, which then `exec`s `sleep` — one pid, never a tree. Measured directly: `ps -o pid,ppid,pgid,command` on the direct child showed that pid IS `sleep`, and the `assert_ne!` at `mod.rs:1653` reported `left: 22802 / right: 22802`.
+**upstream** — Not an upstream-behaviour question: the fixture never constructed the scenario the test names, so the assertion could not have been evaluated either way.
+**Impact** — The test is the ONLY coverage of the claim that the escalation ladder reaches a child's descendants, and it was testing nothing: it died in its own precondition before `terminate()` ran. The production mechanism it targets is in fact correct, and was verified independently — `Command::process_group(0)` (`mod.rs:515`) plus the leader-only negation in `send_signal` (`signal.rs:353-364`, `getpgid(pid)==pid` → target `-pgid`); with a fixture that really forks, one `kill(-pgid, SIGTERM)` killed both child and grandchild. A permanently-red test that also covers nothing is the worst of both.
+**Fix** — LANDED. Appended a trailing `; :` so the outer shell is no longer running a single simple command and must stay resident to fork the inner one. Verified on this machine: outer `/bin/sh` 22900, descendant 22902, distinct. Deliberately NOT `… & wait`, which would make the descendant ASYNCHRONOUS and therefore `SIG_IGN` for SIGINT under POSIX — exactly the confound the test's own comment warns against.
+**Verify** — `cargo test -p cyrup-ext-subagents --lib spawn::tests::terminate_reaches_the_childs_own_descendants_not_just_the_direct_child` green, and the `assert_ne!` still fires if the `; :` is removed.
+
+---
+
+## SUBA-068 — The worktree setup-hook timeout fixture raced macOS first-exec verification latency with a 200 ms budget
+
+**Kind** test-defect · **Severity** high · **Effort** S · **Confidence** confirmed · **Status** FIXED
+**cyrup** — `spawn/worktree.rs:1632` failed inside the `wait_for_published_pid` PRECONDITION helper ("the hook never published its pid … within 5s"), not on the kill assertion; the `timed out` assertion above it passed, so the kill path had already run. Root cause is ambient: macOS pays a one-off verification cost on the first `exec` of a freshly written executable whose exact content it has not seen. Measured here with a standalone harness — unique script content: 242.38 / 197.67 / 206.91 / 207.63 / 203.26 / 206.77 ms to first write (6/6 runs); identical content reused: ~130 ms. `tempfile::tempdir()` randomizes the path, and the path is embedded in the script body, so the content is unique on EVERY run and the cost recurs every run. Against `timeout_ms: 200` (`worktree.rs:1576`) the SIGTERM always landed before `echo $$ > pid` could execute.
+**upstream** — Production is already exact parity and was NOT touched: pi's `runWorktreeSetupHook` is `spawnSync(hook.hookPath, [], { …, timeout: hook.timeoutMs, shell: false })` (`pi-subagents v0.47.1 src/runs/shared/worktree.ts:328-334`), and Node's `spawnSync` timeout kills the direct pid with the default `SIGTERM`. The 1000 ms SIGTERM→SIGKILL grace in `signal.rs:190` is pi's own number from `acceptance.ts:1164-1177` (`child.kill("SIGTERM")` then `setTimeout(() => child.kill("SIGKILL"), 1000)`), read at the tag.
+**Impact** — The test could not pass on this machine regardless of implementation correctness, because it asserted a property of process-startup latency that it does not control.
+**Fix** — LANDED, in two parts, because raising the budget alone was NOT enough: at `timeout_ms: 3_000` the test still failed under the full suite's parallel load. The dominant term is removed instead of guessed around — the fixture now `exec`s the SAME hook file once with `$WARMUP` set (a new first-line short-circuit that exits before the pid is published), paying macOS's verification cost before the clock starts, and keeps a 3000 ms budget to absorb ordinary scheduling jitter. The assertion's meaning is unchanged: the hook still `exec sleep 300`, so it still blows its budget and the timeout arm still fires.
+**Verify** — `cargo test -p cyrup-ext-subagents --lib` = **2218 passed / 0 failed**, run twice with all 24 cores saturated by spinners (load average 25-32); `spawn::worktree::tests::` alone 20/20, 3× under the same load.
+
+---
+
+## SUBA-069 — The whole worktree setup-hook test family is wall-clock-budgeted, and goes red under machine load
+
+**Kind** test-defect · **Severity** high · **Effort** M · **Confidence** confirmed · **Status** OPEN
+**cyrup** — Three further tests in the family — `runs_a_repo_relative_setup_hook_and_records_synthetic_paths` (`worktree.rs:1544`), `rejects_tracked_synthetic_paths_from_hook_output` (`:1691`), `excludes_hook_created_synthetic_files_from_captured_patch` (`:1717`) — all fail with `WorktreeSetup("worktree setup hook timed out after 5000ms")` when the machine is loaded, and all pass in isolation. These use the production DEFAULT 5000 ms hook timeout rather than a fixture constant, so unlike SUBA-068 they cannot simply be re-budgeted.
+**Measured** — Controlled A/B on this box, varying ONLY `worktree.rs` and holding everything else constant. With two other agents running cargo concurrently (load ≈8-10): 4 failed / 2214 passed — the three above plus SUBA-068's — reproduced twice. At load ≈3-5: HEAD `worktree.rs` → 1 failed / 2217 passed (SUBA-068 only, the three siblings green); fixed `worktree.rs` → 2218 passed / 0 failed. So the three sibling failures are load-induced and are NOT caused by the SUBA-068 fix.
+**Note on the load that matters** — Synthetic CPU pressure does not reproduce it: with all 24 cores saturated by spinners (load 25-32) the full `--lib` was 2218/2218 green, twice. The failures appear under CONCURRENT CARGO — compilation's I/O and memory pressure, which delays `fork`/`exec` far more than pure CPU contention does. Any reproduction attempt must use a competing build, not a busy-loop.
+**upstream** — pi's default is the same 5000 ms (`worktree.ts` `DEFAULT_SETUP_HOOK_TIMEOUT_MS`, applied through `spawnSync(…, { timeout })` at `:328-334` @v0.47.1), so the CONSTANT is parity-correct and must not be raised in production to make tests pass. The defect is that the tests exercise it with real `/bin/sh` scripts under `cargo test`'s full parallelism (2218 tests), where a freshly-written script's first `exec` alone costs ~200 ms (SUBA-068) and scheduling latency adds the rest.
+**Impact** — "`cargo test -p cyrup-ext-subagents` is green" is not a reliable gate today: the result depends on what else the machine is doing. An intermittent red is more corrosive than a consistent one, because it trains readers to re-run rather than investigate — and it is what let SUBA-067 and SUBA-068 sit unexamined behind a quoted, never-executed "3932 passed" figure.
+**Fix** — Do NOT raise the production default. Options, in preference order: (a) inject the timeout in these three fixtures the way SUBA-068's does, so the budget is a test constant rather than the shipped default; (b) give the hook fixtures stable content at a stable path so macOS's first-exec verification is paid once per suite, not once per test; (c) serialize this module (a shared mutex, as `native_supervisor_channel_integration.rs` already does with `ENV_LOCK`) so hook tests do not compete with 2200 siblings. Re-measure under deliberate load after any of them.
+**Verify** — `cargo test -p cyrup-ext-subagents --lib spawn::worktree::tests::` green while the box is held at load ≥8 (e.g. a concurrent `cargo build` of the workspace), repeated 3×.
 
 ---
 

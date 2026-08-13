@@ -130,6 +130,7 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
+| PROV-052 | **high** | parity-bug | S | The shipped binary's default model is the in-process **faux TEST provider** — a bare `cyrup -p hi` fails with the internal string `No more faux responses queued` — **new, observed 2026-08-13** |
 | PROV-030 | high | not-ported | L | `google-vertex` is registered with 10 models and no wire API — every request dies with `NoApiImpl` |
 | PROV-027 | high | parity-bug | S | Copilot's Claude models send `x-api-key`; pi sends `Authorization: Bearer` |
 | PROV-029 | high | parity-bug | S | Copilot + Codex login flows written but unreachable; flow registry has no production caller |
@@ -949,6 +950,47 @@ The **inbound** direction has no counterpart at all, and it is where the damage 
 **Fix** — In `crates/cyrup-provider/src/api/openai_codex_responses.rs`, wrap **only** the connect/header phase (`open_sse(...)`) in `tokio::time::timeout(Duration::from_millis(n))` when `opts.timeout_ms` is `Some(n)` with `n > 0`. On elapse, first check the `CancelToken` (pi's `!options?.signal?.aborted` guard) and, if not cancelled, emit `format!("Codex SSE response headers timed out after {n}ms")` as the terminal error. Leave the client's `read_timeout` in place for the body phase — that is the correct analogue of pi's global undici `bodyTimeout`/`headersTimeout` (`core/http-dispatcher.ts:87-88` @v0.83.0). Porting `combineAbortSignals` itself is **not** required: its only upstream consumer at either tag is this call site, and `CancelToken` + `tokio::time::timeout` covers it — record that as the mechanism difference rather than filing a second item.
 
 **Verify** — Loopback server that accepts the connection and never writes a byte; drive `openai_codex_responses` with `timeout_ms = Some(200)` and assert the terminal error text is exactly `Codex SSE response headers timed out after 200ms`. Then cancel the `CancelToken` before the deadline and assert the terminal is the aborted one, not the timeout message. Red today on both.
+
+## PROV-052 — The shipped binary's default model is the in-process faux TEST provider, so a bare `cyrup -p hi` fails with the internal string "No more faux responses queued"
+
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** **confirmed — reproduced in the shipped binary; both sides read** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Filed 2026-08-13 from a live run.** `rg 'faux' docs/gap-analysis/*.md` shows every existing
+> mention treats faux as a *test* provider; **no item covers it being the shipped default.** This is
+> a clean instance of README structural blind spot 1 — nobody wrote an item for "what happens when
+> you just run the binary", so no pass could see it.
+
+**cyrup** — `crates/cyrup/src/provider.rs:356` — `select_provider`'s match is `None | Some("faux") => Ok(Arc::new(FauxProvider::new()))`, so **an absent provider *and* an absent model prefix route to the in-process test double**. The doc comment at `:345-347` states this as intended ("No explicit provider/prefix, or an explicit `faux` ⇒ the in-process `FauxProvider`"), and `:421-424` extends it: a `--model` whose prefix is not a known provider also maps to faux, with the comment "a non-provider prefix maps to faux (ledgered) — no warn". Meanwhile `crates/cyrup/src/cli.rs:871` prints `--provider <name>    Provider name (default: google)` in the shipped help — **the documented default and the actual default disagree.**
+
+**upstream** — `pi/packages/coding-agent/src/cli/args.ts:239` @v0.83.0 prints the identical help line, `--provider <name>    Provider name (default: google)`. pi has **no faux provider on any production path**: `packages/ai/src/providers/faux.ts` is the test double and is not reachable from model resolution. An out-of-box `pi -p hi` with no credential therefore cannot produce this failure — it resolves google and reports a missing credential.
+
+**Impact** — Reproduced with a scratch `HOME` and agent dir, no credentials, **no `--offline`**, no `--model`/`--provider`:
+
+```
+$ cyrup --no-session --no-extensions -p hi </dev/null
+EXIT=1
+stdout: (empty)
+stderr: No more faux responses queued
+```
+
+Contrast, same fixture, provider named explicitly — the correct, actionable error:
+
+```
+$ cyrup ... --provider google -p hi        -> provider 'google' is not configured (no credential or env key)
+$ cyrup ... --model openai/gpt-4o -p hi    -> provider 'openai' is not configured (no credential or env key)
+```
+
+And interactively on a first run with no credentials, the footer **advertises the test double as the live model**:
+
+```
+39| 0.0%/128k (auto) • xp                                          faux/faux-1
+```
+
+So the out-of-box experience for a new user with no API key is a **test-harness internal string and exit 1**, where pi gives credential guidance — and the interactive session presents itself as connected to a model named `faux/faux-1`. This is the first thing anyone who installs the binary sees.
+
+**Fix** — Make the default resolve to the documented provider: change `provider.rs:356` so `None` falls through to the registry lookup for `google` (pi's documented default) and only an **explicit** `Some("faux")` reaches `FauxProvider`. Re-examine `:421-424` in the same change — a `--model` with an unrecognised prefix should report the unknown provider, as it does for a recognised-but-unconfigured one, rather than silently becoming a test double; that arm's "(ledgered) — no warn" comment should cite this item or be deleted. Audit the test suite for fixtures that rely on the implicit default and make them pass `--provider faux` explicitly, so the test double stays reachable on purpose.
+
+**Verify** — `cyrup -p hi` with no credentials, no flags and a scratch `HOME` must print a credential/`/login` message naming `google` and must **not** print `No more faux responses queued`. Interactive: the footer on a first run must not read `faux/faux-1`. `cyrup --provider faux -p hi` must still reach the faux provider, and the existing faux-backed tests must stay green once they name it.
 
 ## Coverage
 

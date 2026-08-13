@@ -64,7 +64,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-013 | still-open | `autocomplete.rs:168` `PATH_DELIMS` and `:202` `before.rfind(PATH_DELIMS)` unchanged; no unclosed-quote scan in that file. **New for the fix:** cyrup already owns an unclosed-quote scanner at `crates/cyrup-tui/src/session_search.rs:149, :179, :183` (`had_unclosed_quote`) — an in-repo precedent the original item did not know about. |
 | TUI-014 | still-open | The host sink is now installed, so `UiEffect::SetWidget` *reaches* the TUI and is dropped into a field with no reader: `app.rs:3228`, declared `:390`, cleared `:1211`, only other references are two test assertions. |
 | TUI-015 | still-open | The run loop's event arm still ends in `self.draw_synchronized()?;` (`app.rs:6849-6875`); `rg 'MIN_RENDER\|needs_render\|request_render' crates/cyrup-tui/src` → zero. pi has `MIN_RENDER_INTERVAL_MS = 16` at `packages/tui/src/tui.ts:343`. |
-| TUI-016 | still-open — **regressed** | `QueueUpdate` still discards the texts (`app.rs:4612-4614`) **and** the fidelity work deleted the footer segment that displayed the count: `grep -n 'queued' crates/cyrup-tui/src/status.rs` now returns only the doc lines and the setter at `:149-150`, no render site. The queue is now entirely invisible. |
+| TUI-016 | still-open — **regressed**, and **misdescribed until 2026-08-13** | `QueueUpdate` still discards the texts (`app.rs:4612-4614`) **and** the fidelity work deleted the footer segment that displayed the count: `grep -n 'queued' crates/cyrup-tui/src/status.rs` now returns only the doc lines and the setter at `:149-150`, no render site. **Corrected by live measurement:** the queue is not "entirely invisible" — `dispatch_submission` (`app.rs:1750`) echoes each queued message into the CHAT TRANSCRIPT as an ordinary user bubble, so the user is told it was *delivered*. Retitled and raised medium → high; see also the new **TUI-052**. |
 | TUI-017 | still-open | `image.rs:102-106` still installs `Halfblocks` when `caps.images == None`; `:152-171` takes the placeholder branch only on `!show_images`/zero area/encode error; `:242-247` still emits the invented `🖼 {label} ({w}×{h})`; `app.rs:6085-6096` passes `area.width` with no cap. |
 | TUI-018 | **partially-closed** — open | pi's `compactOnboarding` and the standing `onboarding` line now exist (`chrome.rs:98-114`). The **logo/version** line and the whole expanded body are still absent — `chrome.rs:127-130` states outright that cyrup does not draw the logo part, so the app name and version appear nowhere in the UI. |
 | TUI-019 | still-open | Absent in cyrup, and the upstream side grew by an order of magnitude in the drift window (`tui-alt-screen.ts` +1047, `tui-main-screen.ts` +586, `scroll-view.ts`, `layout.ts`, `stack.ts`, the eight `tui.altScreen.*` ids at `packages/tui/src/keybindings.ts:43-50`, and the `tui-mode`/`fullscreen-scrollbar` settings rows at `settings-selector.ts:633-643`). Severity stays low as a deliberate ADR-0001 divergence; effort is now L+. |
@@ -84,6 +84,10 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-N07 | still-open | The swap arm calls `rebind_session()` then `replay_session_with_extensions` (`app.rs:6988`) and appends below the previous session's flushed scrollback; no clear, no boundary rule. |
 | TUI-N08 | still-open | `crates/cyrup-tui/tests/image.rs:56` asserts the glyph is absent on the inline path and `:67-70` asserts `🖼`, the label and `64×48` are present — pinning the invented format while `image_fallback_text` (`image.rs:353-367`) produces pi's real one. |
 | TUI-N09 | still-open | `tests/extension_dialog_countdown.rs:85` still sleeps 1,100 ms and `:88` asserts the literal `"Proceed? (2s)"`; `tick_extension_dialog_countdown()` at `:86` still takes no argument, so no injectable instant exists. |
+| TUI-N10 | **closed** (fixed this pass) | Both `bash_overlay` hotkeys tests now bind `alt` per `cfg!(target_os = "macos")` and interpolate it, matching `keybinding-hints.ts:12-15`. Target 12/12 green on macOS; mutation-checked against `chrome.rs:41-47`. |
+| TUI-N11 | **closed** (fixed this pass) | The M7 link mirror arm renders through `render_markdown_with_hyperlinks(…, false)` and gained a capable-branch mirror. `--test markdown` 48/48 under ghostty, vscode, iTerm.app and a scrubbed env; previously only the last passed. |
+| TUI-N12 | still-open | `image.rs:430/:457-459` is a write-once `OnceLock` carrying only `hyperlinks`; `rg 'set_capabilities\|reset_capabilities' crates/` → zero. The sole both-branches seam is `markdown.rs:142`'s per-call parameter. |
+| TUI-N13 | **closed** (fixed this pass) | `app.rs:7652-7657` read the spool path from one wrapped visual line; on macOS's 48-char `temp_dir()` the row is exactly 120 columns and the path wraps, so the parse yielded `""`. Now flattened before parsing. `-p cyrup-tui --lib` 285/285 (was 284/1); mutation-checked against `bash.rs:384`. |
 | TUI-S01 | **closed (as framed)** — see TUI-014 + TUI-033 | The item's own Overlap note said "the correct framing is the missing sink, not seven separate items". The sink now exists: `app.rs:3090-3096` `install_ui_sinks` calls `services.set_ui_effect_sink(effects)`, re-run on every session swap (`:6915-6919`). Six mutators are live — Notify `:3195`, SetStatus `:3205`, SetEditorText/paste `:3210`, SetToolsExpanded `:3217` (which *does* push the `Tool output: …` status), SetTitle `:3225` + the OSC-0 write at `:7098-7102`. The residue is exactly three variants, and holding S01 open as well would book them a third time: widgets are **TUI-014**, header/footer are **TUI-033**. Carried at low purely as a pointer. |
 | TUI-S02 | **OVERTURNED** `closed` → partially-closed | `panic_hook.rs` landed (`:82-89` `install_panic_hook` chains `restore_terminal_best_effort()` before the previous hook; installed at `app.rs:6112` before `enable_raw_mode`), closing pi's `uncaughtCrash` half. The item's *second* named mechanism did not: pi `interactive-mode.ts:212-220` `DEAD_TERMINAL_ERROR_CODES`/`isDeadTerminalError` → `emergencyTerminalExit()` (`:3816-3823`) has no cyrup counterpart. See the item. |
 | TUI-S03 | **closed** | `crates/cyrup-tui/src/footer_data.rs` (358 lines) ports `resolveGitBranchSync`: `HEAD_REF_PREFIX = "ref: refs/heads/"` at `:38`, worktree + reftable handling documented at `:14-26`, `POLL_INTERVAL = 500ms` at `:35` matching pi's debounce. Wired live — `app.rs:399` field, `:521` init, `:986` `FooterGitBranch::discover(cwd)`, `:988`/`:1013` `set_branch`, `:6438` the poll interval in the run loop, production populator at `crates/cyrup/src/main.rs:1779`. Test `crates/cyrup-tui/tests/footer_git_branch.rs`. |
@@ -113,7 +117,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-042 | **new (repair pass)** — open (**critical**) | The undo snapshot omits the paste registry. `Snapshot { lines, row, col }` (`editor.rs:71-78`) has no `pastes`; `backspace()`/`delete()` erase `pastes[id]` on paths that already pushed a snapshot; `undo()` (`:748-756`) restores only `lines`/`row`. The marker text reappears on screen while `expanded_text()` can no longer resolve it, so Enter sends the 20-character marker instead of the paste. Silent data loss with a UI asserting the opposite. |
 | TUI-043 | **new (repair pass)** — open (**critical**) | Word motion and Ctrl+W are not paste-marker atomic. `word_left_target`/`word_right_target` (`editor.rs:1074-1128`) classify by `is_word_char` alone and never consult `marker_covering` (`:697-712`), which has exactly two callers. One Ctrl+W after a large paste deletes the single `]`, orphaning the marker and unreachably losing the pasted content. |
 | TUI-044 | **new (repair pass)** — open (medium) | `undo()` discards the snapshot's cursor column — `Snapshot::col` is written at `:718` and never read (`rg 'snap\.col'` → nothing); `preferred_visual_col` is not reset either. Ships with TUI-042 so `Snapshot` is corrected once. |
-| TUI-045 | **new (repair pass)** — open (medium) | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — crossterm emits a spurious `Escape` plus the tail as typed text. `stray_reply.rs` documents observing this exact split and rescues only OSC 11. Escape is not inert: it aborts the turn. |
+| TUI-045 | **new (repair pass)** — open, **raised to high 2026-08-13** | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — crossterm emits a spurious `Escape` plus the tail as typed text. `stray_reply.rs` documents observing this exact split and rescues only OSC 11. Escape is not inert: it aborts the turn. **Reproduced live, idle and mid-stream — a 60 ms gap between two writes on a LOCAL pty is enough; the "exposure is over SSH/mosh/tmux" hedge was too conservative.** |
 | TUI-046 | **new (repair pass)** — open (medium) | cyrup pushes Kitty flag 1; pi pushes 7 — and neither stdin-buffer guard flag 7 requires exists, so the obvious one-token "fix" would double every composed character and leak CSI-u text on WezTerm. Filed as one change with the two guards for exactly that reason. Also corrects `drain.rs:11-16`'s unfounded release-report premise. |
 | TUI-047 | **new (repair pass)** — open (low) | A late or unsolicited DCS/APC frame is shredded into ~20 typed characters; `stray_reply.rs` recognises only OSC 11. Reachability is narrow (tmux passthrough), blast radius is not. |
 | TUI-048 | **new (repair pass)** — open (low) | Word navigation classifies by ASCII-style character class instead of Unicode word segmentation, so CJK/Thai word motion jumps whole runs. Internally inconsistent too — the same file already uses grapheme segmentation for wrapping. |
@@ -134,6 +138,12 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-043 | **critical** | parity-bug | S | Word motion and Ctrl+W are not paste-marker atomic — one Ctrl+W after a large paste orphans the marker and drops the paste |
 | TUI-027 | **critical** | not-ported | M | `/tree` has no text search, its four action keys are the characters pi types *into* that search, and the resulting label edit is persisted to the session JSONL |
 | TUI-031 | **high** | not-ported | M | A prompt typed during compaction is sent immediately instead of queued |
+| TUI-045 | **high** | not-ported | M | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — a spurious `Escape` aborts the turn and the tail is typed as text — **observed 2026-08-13, raised from medium** |
+| TUI-016 | **high** | parity-bug | M | A queued message is echoed into the transcript as if delivered, and has no queue surface at all — **observed 2026-08-13, retitled and raised from medium** |
+| TUI-052 | **high** | parity-bug | S | A queued message dequeued by Escape stays in the transcript forever as a phantom user message that was never sent — **new, observed 2026-08-13** |
+| TUI-053 | **high** | parity-bug | S | `Ctrl+-` (`editor.undo`) is unreachable from any terminal without the kitty keyboard protocol — pi maps the legacy `0x1F` byte, cyrup does not — **new, observed 2026-08-13** |
+| TUI-054 | **high** | parity-bug | S | A failed or aborted compaction is announced to the user as "compaction complete" — `CompactionEnd`'s `aborted`/`error_message` are destructured away — **new, observed 2026-08-13** |
+| TUI-055 | **high** | parity-bug | M | No status indicator renders for the entire duration of a compaction — the screen is blank for 10–20 s — **new, observed 2026-08-13** |
 | TUI-004 | medium | upstream-drift | M | No live colour-scheme sync; `/reload` does not re-apply themes |
 | TUI-005 | medium | not-ported | S | Escape branches: bash-mode clear missing; bash child killed while streaming |
 | TUI-006 | medium | not-ported | M | `[Extension issues]` renders 2 of pi's 4 diagnostic sources |
@@ -142,7 +152,6 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-012 | medium | not-ported | M | No argument autocomplete for `/model <prefix>` or `/login <prefix>` |
 | TUI-014 | medium | not-ported | M | Extension widgets (`ui.setWidget`) now reach the TUI and are stored where nothing renders them |
 | TUI-015 | medium | cyrup-original | M | No render coalescing — one draw per streaming event, no frame budget |
-| TUI-016 | medium | parity-bug | M | Queued messages are now entirely invisible — texts discarded, footer count deleted |
 | TUI-017 | medium | parity-bug | S | Attachment image strip: rasterizes without a protocol, invented placeholder, no 60-cell cap |
 | TUI-028 | medium | parity-bug | S | Editor/input keybinding ids use an `editor.*` namespace upstream abandoned — 24 ids inert |
 | TUI-029 | medium | not-ported | M | Extension autocomplete providers are never consulted by the interactive editor |
@@ -152,7 +161,6 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-034 | medium | upstream-drift | L | No markdown-transformer hook — extension transformers and pi's Mermaid renderer both absent |
 | TUI-037 | medium | not-ported | S | `/reload` never persists an implicitly-granted project trust |
 | TUI-044 | medium | parity-bug | S | `undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read |
-| TUI-045 | medium | not-ported | M | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — a spurious `Escape` aborts the turn and the tail is typed as text |
 | TUI-046 | medium | parity-bug | M | cyrup pushes Kitty keyboard flag 1, pi pushes 7 — and neither guard flag 7 requires exists, so raising it alone would duplicate characters and leak CSI-u text |
 | TUI-051 | medium | parity-bug | S | `/reload` never re-reads `keybindings.json`, while the command's help text and its in-source comment both claim it does |
 | TUI-019 | medium | upstream-drift | L | No alt-screen UI mode, mouse, scrollbars, prompt navigation — **re-rated from low; the ADR-0001 justification does not hold** |
@@ -184,18 +192,39 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-N07 | low | parity-bug | L | Mid-session `/resume` cannot erase the previous session's scrollback |
 | TUI-N08 | low | test-defect | S | `tests/image.rs` pins the invented `🖼` placeholder and the rasterize-anyway fallback |
 | TUI-N09 | low | test-defect | S | `extension_dialog_countdown` asserts an exact countdown it cannot control |
+| TUI-N10 | low | test-defect | S | `bash_overlay`'s two hotkeys tests hard-code the non-macOS `alt` spelling — **fixed this pass** |
+| TUI-N11 | medium | test-defect | S | `m7_inline_formatting_survives_inside_a_table_cell` asserts a property of the ambient `TERM_PROGRAM` — **fixed this pass** |
+| TUI-N12 | low | not-ported | S | No `setCapabilities` / `resetCapabilitiesCache` seam; only markdown can drive both OSC-8 branches |
+| TUI-N13 | high | test-defect | S | `a_live_bash_run_names_its_spool_file` parses one wrapped line, so it is red wherever `TMPDIR` is long — **fixed this pass** |
 | TUI-S02 | low | not-ported | S | No dead-terminal (EIO/EPIPE/ENOTCONN) emergency exit path (panic-hook half closed) |
 | TUI-S10 | low | not-ported | S | Shift+Ctrl+D global debug chord absent — `/debug` reachable only by typing into the editor |
+| TUI-056 | low | parity-bug | S | The context-usage meter resets to `0.0%` after an aborted turn while the conversation is still in the transcript — **new, observed 2026-08-13** |
+| TUI-057 | low | port-divergence | M | Slash-command palette submission is inconsistent — sometimes one Enter, sometimes two, sometimes a trailing space suppresses it — **new, observed 2026-08-13, low confidence** |
 
 ## TUI-042 — The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message
 
-**Kind** parity-bug · **Severity** critical · **Effort** S · **Confidence** confirmed (both sides re-read at HEAD / v0.83.0 in the repair pass)
+**Kind** parity-bug · **Severity** critical · **Effort** S · **Confidence** **confirmed — reproduced in a live terminal, with the model's input read out of the session JSONL** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 end to end, under tmux, via a real bracketed paste** (`tmux paste-buffer -p`,
+> which emits `ESC[200~ … ESC[201~`). 719 bytes / 40 lines → `[paste #1 +40 lines]`; one Backspace
+> deletes the marker atomically; `Ctrl+-` (sent as the kitty CSI-u form `ESC[45;5u` — see **TUI-053**,
+> the legacy byte does not reach `E::Undo`) puts the marker text back on screen; Enter submits the
+> **20-character literal string** `[paste #1 +40 lines]`, read out of the session JSONL rather than
+> off the screen. The **control** run in the same session — same paste, no edit, straight to Enter —
+> submits all 719 characters, so the loss is caused by the undo and not by the paste path. The
+> quieter variant reproduced too: paste → undo → paste re-issues `#4` where pi restores
+> `pasteCounter` and reissues `#3`.
+>
+> **One measured correction to the Impact below.** `[paste #1 2000 chars]` is **21** characters, not
+> 20 (measured live: pasted 2000 chars, captured the marker, `len=21`). The figure 20 is correct only
+> for the `+N lines` form (`[paste #1 +40 lines]`, measured `len=20`). Mechanism, call sites and both
+> variants reproduce verbatim.
 
 **cyrup** — `crates/cyrup-tui/src/editor.rs:71-78` defines `struct Snapshot { lines: Vec<Vec<char>>, row: usize, col: usize }` — **no paste registry**. `snapshot()` (`:716-719`) clones only those three fields; `undo()` (`:748-756`) restores `lines` and `row` and nothing else. The registry it fails to snapshot is `pastes: BTreeMap<u32, String>` (`:149`) with `paste_counter: u32` (`:151`), and both are *mutated destructively* on the very paths that push an undo snapshot: `backspace()` at `:814` and `delete()` at `:852` each call `self.pastes.remove(&id)` **after** the `E::DeleteCharBackward` / `E::DeleteCharForward` arms (`:1487-1500`) have already pushed the snapshot. Expansion is gated on the registry: `marker_at` (`:663-694`) ends with `let content = self.pastes.get(&id)?;`, so once the entry is gone the marker text is **no longer a marker**, and `expanded_text` (`:639-659`) — the function `E::Submit` calls at `:1570-1571` to build what the agent actually receives — emits it verbatim.
 
 **upstream** — `pi/packages/tui/src/components/editor.ts:216-220` @v0.83.0 (identical at v0.84.1, same line numbers): `interface EditorSnapshot { state: EditorState; pastes: Map<number, string>; pasteCounter: number }`, commented "Undo snapshot: editor text state plus the paste registry." `:2012-2014` `pushUndoSnapshot()` pushes `{ state, pastes, pasteCounter }` (v0.84.1 `:2024`); `:2016-2030` `undo()` does `Object.assign(this.state, snapshot.state); this.pastes = snapshot.pastes; this.pasteCounter = snapshot.pasteCounter;` (v0.84.1 `:2028`). The deep copy that makes it work is `packages/tui/src/undo-stack.ts:11-13` — `push(state) { this.stack.push(structuredClone(state)) }` — `structuredClone` deep-clones a `Map`, so each snapshot owns its own registry.
 
-**Impact** — paste 2,000 characters (or >10 lines) into the prompt; the buffer shows `[paste #1 2000 chars]` and `pastes[1]` holds the text. Backspace once — the marker is atomic for backspace (`editor.rs:801-816`), so it vanishes and `pastes[1]` is erased. Press Ctrl+- to undo: **the marker text reappears on screen**, so the user sees their paste restored. Press Enter. `expanded_text()` cannot resolve id 1 any more, so the model receives the 20-character literal string `[paste #1 2000 chars]` instead of the 2,000 characters. Silent data loss with a UI that actively asserts the opposite, on the most ordinary editing sequence there is. pi restores the registry and sends the full text. A second, quieter variant: paste → undo (no delete) leaves an orphan `pastes` entry and never rolls back `paste_counter`, so ids drift from pi's and the map grows for the life of the session.
+**Impact** — paste 2,000 characters (or >10 lines) into the prompt; the buffer shows `[paste #1 2000 chars]` and `pastes[1]` holds the text. Backspace once — the marker is atomic for backspace (`editor.rs:801-816`), so it vanishes and `pastes[1]` is erased. Press Ctrl+- to undo: **the marker text reappears on screen**, so the user sees their paste restored. Press Enter. `expanded_text()` cannot resolve id 1 any more, so the model receives the 21-character literal string `[paste #1 2000 chars]` instead of the 2,000 characters (**length corrected 2026-08-13 from a live measurement**; the `+N lines` form measures 20). Silent data loss with a UI that actively asserts the opposite, on the most ordinary editing sequence there is. pi restores the registry and sends the full text. A second, quieter variant: paste → undo (no delete) leaves an orphan `pastes` entry and never rolls back `paste_counter`, so ids drift from pi's and the map grows for the life of the session.
 
 **Fix** — add `pastes: BTreeMap<u32, String>` and `paste_counter: u32` to `Snapshot` (`editor.rs:71-78`); have `snapshot()` (`:716-719`) clone both and `undo()` (`:748-756`) restore both alongside `lines`/`row`. That is the whole fix — every call site already goes through `snapshot()` / `push_undo_for*`. While there, make `history_draft` (`:93`, `:1199`, `:1218`) carry them too, since it reuses `Snapshot` and browsing history away from a draft containing a marker has the identical failure. **Ships with TUI-044** so `Snapshot` is corrected once. Note cyrup's 500-entry stack bound (`:728-730`, `:742-744`) is a cyrup-original — pi's `UndoStack` is unbounded (`undo-stack.ts:7-28`); keep the bound but state it as a delta rather than leaving it undocumented.
 
@@ -203,7 +232,20 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 
 ## TUI-043 — Word motion and Ctrl+W are not paste-marker atomic — one Ctrl+W after a large paste orphans the marker and drops the pasted content
 
-**Kind** parity-bug · **Severity** critical · **Effort** S · **Confidence** confirmed (both sides re-read at HEAD / v0.83.0 in the repair pass)
+**Kind** parity-bug · **Severity** critical · **Effort** S · **Confidence** **confirmed — reproduced in a live terminal, with the model's input read out of the session JSONL** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 verbatim, both halves.** One `Ctrl+W` at the end of a freshly-inserted
+> `[paste #1 +40 lines]` (719 bytes of payload) deletes **exactly the single `]`**, leaving the
+> 19-character `[paste #1 +40 lines`, and Enter sends that 19-character string to the model instead
+> of the paste — read out of the session JSONL, not inferred. The mirror claim reproduced too:
+> `Alt+Left` from the marker's end parks the caret between `lines` and `]`, and the next printable
+> key writes into the marker, producing `[paste #2 +40 linesX]`.
+>
+> **One correction, to the Verify line below.** It asks to assert that `E::CursorWordBackward` from
+> the marker's end "lands on the marker's **start** column, not one char short". Measured, cyrup
+> lands **19 columns short, not one**: from col 20 the class run consumes only the `]` and stops at
+> col 19. Read that clause as "lands at col 19 — it consumes only the closing `]` — instead of pi's
+> col 0". The cyrup/upstream analysis and the Fix are otherwise exactly right.
 
 **cyrup** — `crates/cyrup-tui/src/editor.rs:1074-1100` `word_left_target()` and `:1102-1128` `word_right_target()` classify purely by `is_word_char` (`:1637-1639`, `c.is_alphanumeric() || c == '_'`) and **never consult `marker_covering()`** — which exists at `:697-712` and is called from exactly two places, `backspace()` `:801-816` and `delete()` `:840-855`. `delete_word_backward()` `:874-884` and `delete_word_forward()` `:886-892` route straight through those two targets, and Ctrl+W / Alt+Backspace are bound to `E::DeleteWordBackward` at `keymap.rs:1002-1003`. Traced concretely on `[paste #1 +42 lines]` with the cursor at the end (col 20): the whitespace skip does not fire (`line[19] == ']'`), `want_word = is_word_char(']') = false`, and the class run consumes only `]` before hitting the word char `s` — so `take_range` (`:921-946`, itself marker-unaware) deletes exactly **one** character and leaves `[paste #1 +42 lines`. `marker_at` (`:663-694`) requires a closing `]`, so the text is no longer a marker and `expanded_text` (`:639-659`) emits it verbatim.
 
@@ -213,11 +255,28 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 
 **Fix** — in `word_left_target()` (`editor.rs:1074-1100`): after the whitespace skip, call `self.marker_covering(i)` and, when it returns `Some((s, _, _))` with `i > s`, return `(self.row, s)` immediately — the port of `findWordBackward`'s `isAtomic` branch (`word-navigation.ts:44-46`). Mirror it in `word_right_target()` (`:1102-1128`) returning `(self.row, e)` for `i < e` (`word-navigation.ts:97-99`). Then make `delete_word_backward()` / `delete_word_forward()` (`:874-892`) drop the registry entry for any marker fully inside the deleted range, as `backspace()` already does at `:814` — otherwise the atomic delete leaves an orphan `pastes` entry. **Land with TUI-042 and TUI-049**: all three are the paste-marker invariant, and fixing the deletion without tightening `marker_at` leaves the partially-chewed-marker case open.
 
-**Verify** — `crates/cyrup-tui/tests/editor.rs`: paste 1,500 chars, assert `text() == "[paste #1 1500 chars]"`; send `E::DeleteWordBackward`; assert `text().is_empty()` and `pastes` no longer contains id 1 (today: `text() == "[paste #1 1500 chars"` and the content is orphaned). Same for `E::DeleteWordForward` with the cursor at col 0, and assert `E::CursorWordBackward` from the marker's end lands on the marker's **start** column, not one char short.
+**Verify** — `crates/cyrup-tui/tests/editor.rs`: paste 1,500 chars, assert `text() == "[paste #1 1500 chars]"`; send `E::DeleteWordBackward`; assert `text().is_empty()` and `pastes` no longer contains id 1 (today: `text() == "[paste #1 1500 chars"` and the content is orphaned). Same for `E::DeleteWordForward` with the cursor at col 0, and assert `E::CursorWordBackward` from the marker's end lands on the marker's **start** column — measured 2026-08-13, cyrup lands at **col 19** (it consumes only the closing `]`) where pi lands at col 0, so the assertion must name col 0 rather than "one char short".
 
 ## TUI-027 — `/tree` has no text search, and its four action keys are the characters pi types into that search
 
-**Kind** not-ported · **Severity** critical · **Effort** M · **Confidence** confirmed
+**Kind** not-ported · **Severity** critical · **Effort** M · **Confidence** **confirmed — the persistence half reproduced in a live terminal and read back out of the session JSONL** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13 by typing the ordinary word `text` into `/tree`, one key at a time.** `t`
+> toggled the timestamp column, `e` opened the inline label editor, and `x`+`t` were swallowed as
+> label text. Enter appended a durable line to the session JSONL. The filter counter stayed at
+> `(4/4)` for **every** keystroke, so there is no search state of any kind, and the hint row rendered
+> exactly `z/x branch   e label   t label time`.
+>
+> **The measured artefact, recorded here so nobody re-derives it.** The persisted record is a
+> top-level entry:
+>
+> ```json
+> {"type":"label","id":"01dfd155","parentId":"471ccb39",
+>  "timestamp":"2026-08-13T12:48:26.225394Z","targetId":"eeb2d0cf","label":"xt"}
+> ```
+>
+> `targetId` is the entry under the cursor at the moment `e` was pressed — on a fresh session that is
+> the `model_change` entry, i.e. **not even a message**. Nothing else in the item needed correcting.
 
 > **Raised `high` → `critical` in the 2026-08-12 repair pass**, on the persistence half rather than
 > the keybinding half. The mutation was re-verified end to end at HEAD: `handle_label_edit`'s confirm
@@ -308,9 +367,9 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 
 **Impact** A user's `keybindings.json` carrying any of these ids silently does nothing, and the documented default chords are dead keys.
 
-**Fix** Extend `Action` and `Action::from_id` (`keymap.rs:96-114`) with the seven ids and route them. `app.thinking.toggle` is mechanical — `TranscriptView::set_hide_thinking_block` exists and the settings row already persists `hideThinkingBlock`. `app.model.select` has its destination built with no key routed to it. The `app.pageUp`/`app.pageDown` spelling half of the original item moved to **TUI-028**, which owns the whole namespace question.
+**Fix** Extend `Action` and `Action::from_id` (`keymap.rs:96-114`) with the seven ids and route them. `app.thinking.toggle` is mechanical — `TranscriptView::set_hide_thinking_block` exists and the settings row already persists `hideThinkingBlock`. `app.model.select` has its destination built with no key routed to it. The `app.pageUp`/`app.pageDown` spelling half of the original item moved to **TUI-028**, which owns the whole namespace question. **And the display half**: add the three `**Other**` rows the `[CYRUP-DELTA]` at `app.rs:2036-2040` withholds — `| ${selectModel} | Open model selector |`, `| ${toggleThinking} | Toggle thinking block visibility |`, `| ${copyMessage} | Copy last assistant message |` (pi v0.83.0 `interactive-mode.ts:5834-5839`, inside `handleHotkeysCommand`) — to the template at `app.rs:2086-2104`, deleting that `[CYRUP-DELTA]` note. The delta is legitimate only while the bindings are unported; closing this item without it leaves `/hotkeys` permanently three rows short of upstream with nothing tracking it.
 
-**Verify** Keymap unit tests round-tripping each id, plus app tests asserting Ctrl+T flips `hide_thinking` and Ctrl+L opens the model selector.
+**Verify** Keymap unit tests round-tripping each id, plus app tests asserting Ctrl+T flips `hide_thinking` and Ctrl+L opens the model selector. `/hotkeys` lists **Open model selector**, **Toggle thinking block visibility** and **Copy last assistant message** in the `**Other**` table, with real key cells rather than empty ones.
 
 ## TUI-009 — Double-Escape → tree/fork never implemented although `doubleEscapeAction` ships in `/settings`
 
@@ -368,19 +427,50 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 
 **Verify** Bench/counter test: N streaming deltas within one interval produce one draw; an image-bearing turn rasterizes once, not per delta.
 
-## TUI-016 — Queued messages are now entirely invisible — texts discarded, footer count deleted
+## TUI-016 — A queued message is echoed into the transcript as if delivered, and has no queue surface at all
 
-**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** confirmed
+> **Retitled and restated 2026-08-13 against a live measurement.** This item was filed as
+> *"Queued messages are now entirely invisible — texts discarded, footer count deleted"*. The
+> absence half is confirmed exactly; the headline is **wrong in the direction that matters**, and a
+> fix written to the old text would have made the bug worse. See the `Observed` block.
 
-**cyrup** — **Regressed since this item was filed.** `crates/cyrup-tui/src/app.rs:4612-4614` `QueueUpdate` still calls only `status.set_queued(steering.len() + follow_up.len())`, discarding the texts — and the fidelity work then deleted the footer segment that displayed the count (TUI-FIDELITY C14): `grep -n 'queued' crates/cyrup-tui/src/status.rs` now returns only the doc lines `:76`, `:80-81` and the setter at `:149-150`, with **no render site anywhere**. The count is dead state and the queue has no surface at all.
+**Kind** parity-bug · **Severity** **high** *(raised from medium 2026-08-13: the observable is an affirmative wrong signal, not an absence)* · **Effort** M · **Confidence** **confirmed — reproduced in a live terminal against a streaming turn** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Observed 2026-08-13, tmux, against a genuine streaming turn.** (Harness note, because it was the
+> hard part: the faux provider cannot stream from the binary — unscripted ⇒ `No more faux responses
+> queued` immediately — so the turn was produced from a **local** fake `openai-completions` endpoint
+> declared in the scratch agent dir's `models.json`, 60 SSE deltas one per second, bound to
+> `127.0.0.1` only. No network.)
+>
+> **Confirmed:** across the entire 200-line scrollback there is **no** `{n} queued` footer segment,
+> **no** pending-messages region above the editor, **no** `Steering:` / `Follow-up:` labelling and
+> **no** dequeue hint. A `grep -in "queue\|steer\|follow"` over the whole scrollback returned only
+> the two literal payloads that were typed.
+>
+> **Corrected:** cyrup does not leave the queue invisible — it **optimistically renders each queued
+> message into the CHAT TRANSCRIPT as an ordinary user bubble** (`dispatch_submission`,
+> `app.rs:1750`, calls `transcript.push_user(prompt.clone())` unconditionally before returning
+> `AppAction::Submit`, whether or not the session then queues it). The user sees text that looks
+> *delivered* while it is still sitting in a queue. Both messages were genuinely held — the first
+> stream ran to completion at `tok59` before `QUEUEDMSGONE` was dispatched as a fresh turn.
+>
+> **Corrected:** "texts discarded" is true only of the **TUI's** copy. The session layer keeps them,
+> proved by Escape restoring the still-queued second message verbatim into the editor.
+>
+> **Consequence for the Fix (load-bearing):** the transcript echo must be **removed at the same time**
+> the pending-messages rows are added. Otherwise pi's `Steering: …` row and cyrup's phantom bubble
+> both render and the message appears **twice**. See also **TUI-052**, the un-retracted echo, which
+> survives this item's fix and `TUI-005`'s unless the echo site itself is removed.
+
+**cyrup** — **Regressed since this item was filed.** `crates/cyrup-tui/src/app.rs:4612-4614` `QueueUpdate` still calls only `status.set_queued(steering.len() + follow_up.len())`, discarding the texts — and the fidelity work then deleted the footer segment that displayed the count (TUI-FIDELITY C14): `grep -n 'queued' crates/cyrup-tui/src/status.rs` now returns only the doc lines `:76`, `:80-81` and the setter at `:149-150`, with **no render site anywhere**. The count is dead state and the queue has no surface of its own. The transcript echo that stands in its place is `app.rs:1750`.
 
 **upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:4190-4207` `updatePendingMessagesDisplay` renders per-message `Steering: {text}` / `Follow-up: {text}` `TruncatedText` rows above the editor plus the `↳ {key} to edit all queued messages` hint, fed from `getAllQueuedMessages` (`:4192`), which folds `compactionQueuedMessages` (`:4162-4166`).
 
-**Impact** The user cannot see *that* anything is queued, let alone what, cannot tell steering from follow-up, and is never told the queue can be edited — which matters because TUI-005's Escape restore is the action that hint advertises. This is the concrete instance of the two-document drift called out in the header block: a fidelity fix removed the only surface a gap item depended on, and nothing replaced it.
+**Impact** The user is told the opposite of the truth. The queued text appears in the transcript as a delivered user message, while no surface anywhere says it is queued: no count, no `Steering:`/`Follow-up:` distinction, and no notice that the queue can be edited — which matters because TUI-005's Escape restore is the action that hint advertises. A user who queues a message during a long turn and then walks away has no way to learn it was never sent; the screen already told them it was. This is also the concrete instance of the two-document drift called out in the header block: a fidelity fix removed the only surface a gap item depended on, and an optimistic echo — not nothing — took its place.
 
-**Fix** Carry the message texts on `QueueUpdate` into `AppState`, render truncated per-message rows in the live region above the editor, and append the hint line resolved from the keymap. Fold TUI-031's compaction queue in through the same `getAllQueuedMessages` shape.
+**Fix** Two halves, and **they must land together**. (1) *Remove* the optimistic echo: `dispatch_submission` (`app.rs:1750`) must not `push_user` a submission the session will queue — push it when the turn actually starts, as pi's streaming branch does (`interactive-mode.ts:2826-2833` clears the editor and calls `updatePendingMessagesDisplay()`; it never writes the text into the chat container). (2) Carry the message texts on `QueueUpdate` into `AppState`, render truncated per-message rows in the live region above the editor, and append the hint line resolved from the keymap. Fold TUI-031's compaction queue in through the same `getAllQueuedMessages` shape. Landing (2) without (1) renders every queued message **twice**.
 
-**Verify** App test: two steering + one follow-up produce three labelled rows in the right order plus the hint line; the rows clear when the queue drains.
+**Verify** App test: two steering + one follow-up produce three labelled rows in the right order plus the hint line; the rows clear when the queue drains; and — the acceptance criterion added 2026-08-13 — **the transcript contains no user bubble for a message that is still queued**, at any point. Then a live terminal run against a streaming turn, per the standing rule: queue two messages mid-stream and confirm they appear only in the pending region until they are actually dispatched.
 
 ## TUI-017 — Attachment image strip: rasterizes without a protocol, invented placeholder, no 60-cell cap
 
@@ -498,7 +588,22 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 
 ## TUI-044 — `undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read
 
-**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** **confirmed — reproduced in a live terminal by two independent readouts** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13, running the item's own scenario, twice from a clean editor.** `hello`,
+> caret 5, `Ctrl+Y` yanks `world` (snapshot pushed at col 5); eight `Left`s to caret 2; undo. The
+> buffer is correctly restored to `hello`, but the caret is at **column 2** — the live pre-undo
+> column, clamped — not at the snapshot's column 5. Two readouts agree: the reverse-video caret cell
+> in the rendered frame sits on index 2 (`he[SGR7]l[SGR0]lo`), and the next keystroke lands there,
+> producing `heZllo` where pi produces `helloZ`. That is the wrong-edit path the item describes, not
+> a cosmetic one.
+>
+> **No correction — the item is exactly right, including the concrete example.** One note for
+> whoever writes the regression test, because it will otherwise mislead:
+> **`tmux display-message -p '#{cursor_x}'` is not a valid instrument here.** cyrup hides the
+> hardware cursor and paints its own caret as a reverse-video cell, so the pane's hardware cursor is
+> stale write-position (measured: 6 on an empty editor, 4 with the caret at logical col 2, 10
+> immediately after this undo). Read the SGR-7 cell out of `tmux capture-pane -e` instead.
 
 **cyrup** — `crates/cyrup-tui/src/editor.rs:748-756`:
 
@@ -525,7 +630,26 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 
 ## TUI-045 — An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled
 
-**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed (crossterm's source read directly, not assumed)
+**Kind** not-ported · **Severity** **high** *(raised from medium 2026-08-13: the mid-stream case aborts a live run and the trigger is a 60 ms gap on a LOCAL pty, not a slow transport)* · **Effort** M · **Confidence** **confirmed — reproduced in a live terminal, both idle and mid-stream** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13, deterministically, first attempt, in both states.** Separate
+> `tmux send-keys -H` calls with a sleep between them force separate `write(2)`s on the pty, i.e.
+> separate `read(2)`s in crossterm — the exact "split at the ESC byte" form.
+>
+> * **control** (`1b 5b 41` in one write, at idle) → history recall; `Up` works.
+> * **split at idle** (`1b`, 60 ms, `5b 41`) → swallowed Escape plus the literal characters `[A`
+>   inserted into the prompt.
+> * **split mid-stream** → `Operation aborted` — the streaming turn is killed at token 267 of 300 —
+>   plus `[A` in the prompt.
+>
+> The item's own Verify ("hold an arrow key while a turn streams, and confirm no Escape-abort and no
+> `[A` text") fails on **both** halves.
+>
+> **Correction to the reachability hedge below, which is too conservative.** It reads "on a local PTY
+> a keypress is normally one write and one read, so the exposure is over SSH/mosh/tmux where the
+> transport fragments". No SSH, mosh or throttled pipe was needed: **a 60 ms inter-write gap on a
+> *local* pty is sufficient.** Any input source that does not deliver a sequence in a single write is
+> exposed — not only slow transports. The crossterm analysis and the Fix hold unchanged.
 
 **cyrup** — `crates/cyrup-tui/src/app.rs:7125-7152` is the whole input pipeline: `event::poll(wait)` → `event::read()` → `StrayReplyFilter::push` → `map_event`. There is **no sequence-reassembly stage of cyrup's own**; the only buffering is crossterm's. crossterm 0.29.0 reassembles a split CSI correctly (`src/event/source/unix/tty.rs:247-268` pushes one byte at a time and keeps `self.buffer` on `Ok(None)`) — **except for a lone ESC**: `src/event/sys/unix/parse.rs:34-41` is `if buffer.len() == 1 { if input_available { Ok(None) } else { Ok(Some(Esc)) } }`, and `input_available` is `read_count == TTY_BUFFER_SIZE` (`tty.rs:149-154`, `TTY_BUFFER_SIZE = 1_024` at `:40`). So any read that does not fill 1,024 bytes and ends on `0x1B` emits `Esc` and clears the buffer; the sequence's tail arrives in the next read and is decoded as literal characters (`\x1b` `[` `A` → `Esc`, `Char('[')`, `Char('A')`). `stray_reply.rs:29-32` documents that cyrup **already observes this exact split form in the wild** ("When the reply is split across `read(2)` calls exactly at the `ESC` byte the opener instead arrives as `Key(Esc)` then `Key(']')`"), but its state machine only rescues an OSC 11 frame — every other sequence class falls through.
 
@@ -1007,6 +1131,64 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 
 **Verify** With (b): `tick_extension_dialog_countdown_at(open + 1_100ms)` renders `(2s)` and `+ 2_100ms` renders `(1s)`, with no `thread::sleep` and no dependence on wall time.
 
+## TUI-N10 — `bash_overlay`'s two hotkeys tests hard-code the non-macOS `alt` spelling, so they are red on every darwin host
+
+**Kind** test-defect · **Severity** low · **Effort** S · **Confidence** confirmed · **Status** fixed this pass
+
+**cyrup** — `crates/cyrup-tui/tests/bash_overlay.rs:309` asserted ``| `Ctrl+X/Alt+E` | Edit message in external editor |`` and `:368` asserted ``| `Alt+Shift+K` | Kill the ring |``. On macOS the renderer emits `Ctrl+X/Option+E` and `Option+Shift+K`, because `crates/cyrup-tui/src/chrome.rs:41-47` `format_key_part` rewrites `alt`→`option` under `cfg!(target_os = "macos")` — reached from `app.rs:2057`/`:2060` (the `keyDisplayText` closures) and `app.rs:2150` (the Extensions rows). Measured before the fix: `cargo test -p cyrup-tui --test bash_overlay` → 10 passed / 2 failed in 0.01 s. Every other assertion in both tests was already satisfied by the actual output — the rebind half (`Ctrl+T`, no surviving `Ctrl+O`, the `/`-joined pair, the untouched `Ctrl+D` mirror) and the whole Extensions section including ordering and the `AppAction::ExtensionShortcut` dispatch.
+
+**upstream** — pi v0.83.0 `packages/coding-agent/src/modes/interactive/components/keybinding-hints.ts:12-15`: `const displayPart = process.platform === "darwin" && part.toLowerCase() === "alt" ? "option" : part;`, on the path `formatKeyText` (`:17-27`) → `formatKeys` (`:29-32`) → `keyDisplayText` (`:38-40`), used by `interactive-mode.ts:5743-5752` and directly at `:5856` for the Extensions table. pi on macOS prints exactly what cyrup prints; the tests pinned pi's Linux/Windows spelling.
+
+**Impact** Two permanently-red tests on the platform this workspace develops on, pinning a spelling upstream does not produce there, while the behaviour they exist to guard — global cells resolving from the live keymap, and the Extensions table — is in fact correct. A red that is not a defect is how a suite starts being ignored; the direct sibling of TUI-N09.
+
+**Not** a symptom of the ADR-0011 / CFG-048 keybindings-name migration. Both tests use the modern ids (`app.tools.expand`, `app.editor.external`) and both resolved correctly; `KEYBINDING_NAME_MIGRATIONS` plays no part in `/hotkeys` rendering, and TUI-028's `editor.*` namespace question is untouched. Batch 8 inherits nothing from this item.
+
+**Fix** — *applied.* Bound `let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };` in each test and interpolated it into the expected cell, mirroring the in-repo precedent `crates/cyrup-tui/tests/chrome.rs:36-43` `format_key_text_rewrites_alt_to_option_on_macos`. Deliberately **not** sourced from `cyrup_tui::format_key_text`, which would let a broken formatter satisfy its own assertion.
+
+**Verify** — done. `cargo test -p cyrup-tui --test bash_overlay` → 12 passed / 0 failed on macOS. Mutation-checked: disabling `chrome.rs:41-47`'s darwin arm returns the target to 10 passed / 2 failed, so the assertions are not vacuous.
+
+## TUI-N11 — `m7_inline_formatting_survives_inside_a_table_cell` asserted a property of the developer's `TERM_PROGRAM`
+
+**Kind** test-defect · **Severity** medium · **Effort** S · **Confidence** confirmed · **Status** fixed this pass
+
+**cyrup** — `crates/cyrup-tui/tests/markdown.rs:1496` and `:1505` rendered the link mirror arm through `render_markdown`, which resolves the OSC-8 gate from `crate::image::hyperlinks_supported()` (`crates/cyrup-tui/src/image.rs:450-452`) — a write-once `OnceLock` sniff of the ambient environment. `:1501` then demanded the row contain `doc (https://ex.com)`, a string that by design cannot exist when the terminal is hyperlink-capable (`src/markdown.rs:1105` gates the suffix on `!self.hyperlinks`). Measured: with `TERM_PROGRAM=ghostty` + `GHOSTTY_RESOURCES_DIR` set (`image.rs:516` → `hyperlinks: true`) the target was 47 passed / 1 failed; with those five vars unset, 48 passed / 0 failed; forcing `TERM_PROGRAM=vscode` reproduced the identical panic. The red therefore fired on ghostty, kitty, iTerm2, WezTerm, Warp, vscode, alacritty, Windows Terminal and forwarding tmux, and hid only on an unidentified terminal — which is why it had been recorded as an unexplained failure.
+
+**upstream** — pi never has this exposure: `packages/tui/test/markdown.test.ts` @v0.83.0 imports `{ resetCapabilitiesCache, setCapabilities }` at `:6` and pins the branch at eight sites (`:470, :1263, :1276, :1289, :1301, :1313, :1334, :1348`). `:469` states the reason inside its own table block, verbatim: "Pin to no-hyperlinks so width checks work on plain text without OSC 8 sequences" — the same family of width/border-sensitive table assertion as the cyrup test that failed. The renderer itself is a faithful port: `packages/tui/src/components/markdown.ts:537-557`, where the ` (url)` suffix exists only in the `else` of `if (getCapabilities().hyperlinks)`.
+
+**Impact** A red on nearly every real terminal, blamed on the renderer rather than the harness. Neither TUI-FIDELITY M7 nor M14 had regressed — both fixes are intact and their dedicated assertions were green throughout. Belongs to the test-hermeticity class opened by 5d2bc0b / ce0bf8c ("stop asserting a property of the ambient shell"). cyrup's own file states the convention at `tests/markdown.rs:132-134` and honours it at twelve other call sites; this one arm was the sole exception.
+
+**Fix** — *applied.* Routed the mirror arm through `render_markdown_with_hyperlinks(linked, 40, &theme, false)` — the explicit-capability entry point the crate exports for exactly this purpose (`src/markdown.rs:142`, "Exists so tests can drive both branches without touching the global cache") — hoisting the previously-duplicated render into one binding reused by both halves. **Strengthened rather than merely pinned**: appended a capable-branch mirror asserting that on the OSC-8 path the cell holds `doc`, the top border is unpolluted, and the URL is *not* printed inline (`markdown.ts:540-543`). The production gate at `src/markdown.rs:1105` was left untouched.
+
+**Verify** — done. Green under all four terminal identities, where previously only the last passed: ambient `TERM_PROGRAM=ghostty` 48/48; `TERM_PROGRAM=vscode` 48/48; `TERM_PROGRAM=iTerm.app` 48/48; fully scrubbed 48/48. Mutation-checked: dropping the `!self.hyperlinks` gate fails 3 tests including `m7` — and now fails it under the *scrubbed* environment too, which the pre-fix arm could not detect.
+
+## TUI-N12 — No counterpart to pi's `setCapabilities` / `resetCapabilitiesCache`: only the markdown renderer has a both-branches test seam
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — the only counterpart is `seed_hyperlink_support` (`crates/cyrup-tui/src/image.rs:457-459`), a first-writer-wins `OnceLock::set` (`:430`) that (a) cannot be overwritten or reset once read and (b) carries only the `hyperlinks` field, not `images` / `true_color`. Because there is no way to pin the global, a test wanting the non-ambient branch must use a per-call override, and that override exists for exactly one consumer — `render_with_hyperlink_support` (`src/markdown.rs:142`). Any other present or future consumer of `hyperlinks_supported()` has no seam at all and can only be tested against whatever terminal the developer happens to be running, which is precisely the failure mode TUI-N11 records.
+
+**upstream** — pi @v0.83.0 exports two capability-cache mutators alongside the getter: `resetCapabilitiesCache()` (`packages/tui/src/terminal-image.ts:137-139`) and `setCapabilities(caps)` (`:142-144`), the latter doc-commented "Override the cached capabilities. Useful in tests to exercise both code paths". Both are pure state mutation and draw nothing, so ADR-0001 rule 2 puts them in scope with no substrate defence.
+
+**Impact** The hermeticity hole that produced TUI-N11 is structural, not incidental: it is closed for markdown only, by a per-call parameter. Secondary and latent, flagged rather than claimed: `App::detect_image_support` (`app.rs:1107`) seeds the lock at boot, and if any earlier caller latches it first that seed is silently discarded for the process — including a real tmux session whose `client_termfeatures` probe positively confirmed forwarding, which would then print pi-suppressed ` (url)` noise on every link for the rest of the session. Both `main.rs` call sites (`:1501`, `:1615`) currently run before the event loop, so this is an ordering hazard rather than an observed bug.
+
+**Fix** Port both mutators over a capability struct carrying all three fields, replacing the `OnceLock` with a resettable cache; keep `render_with_hyperlink_support` as the per-call override.
+
+**Verify** A test that calls `set_capabilities(hyperlinks: true)`, renders through the *ambient* entry point, asserts the OSC-8 shape, then `reset_capabilities_cache()` and re-asserts the fallback — with no dependence on `TERM_PROGRAM`.
+
+## TUI-N13 — `a_live_bash_run_names_its_spool_file` read the spool path from a single rendered line, so it was red on every host whose `TMPDIR` is long (i.e. every macOS host)
+
+**Kind** test-defect · **Severity** high · **Effort** S · **Confidence** confirmed · **Status** fixed this pass
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:7652-7657` (pre-fix) did `out.lines().find(|l| l.contains("Output truncated. Full output:"))` and then `row.split("Full output:").nth(1).unwrap().trim()`. The status block is rendered word-wrapped at the `TestBackend::new(120, 24)` width set at `:7649`, and the spool path comes from `std::env::temp_dir()` (`crates/cyrup-session-svc/src/bash.rs:258`, `cyrup-bash-{suffix}.log`). On macOS `temp_dir()` is `/var/folders/<2>/<30>/T/` (48 chars), so the rendered row ` Output truncated. Full output: /var/folders/d9/6l395nfj7cz0mgc37c_1dxjr0000gn/T/cyrup-bash-180e4-18cb58e67518da38-0.log` is 120 columns and the path wraps onto the **next** visual line. The `find` therefore matched a line ending at `Full output:`, `nth(1)` yielded the empty string, and the assertion at `:7658` failed with an empty path. Reproduced 5/5 in isolation and once in the full-workspace run — deterministic on this host, not flaky. On Linux with `TMPDIR` unset the same path is `/tmp/cyrup-bash-….log` (~43 chars) and the row fits, which is why the test was ever green.
+
+**upstream** — the wrap is faithful, not a defect. pi @v0.83.0 `packages/coding-agent/src/modes/interactive/components/bash-execution.ts:195-199` pushes `Output truncated. Full output: ${this.fullOutputPath}` into `statusParts`, and `:201` emits the whole block as `this.contentContainer.addChild(new Text(`\n${statusParts.join("\n")}`, 1, 0))` — a `Text` node with padding-left 1 that word-wraps to the terminal width exactly as cyrup's does. pi's own bash tests never parse a rendered line for the path. So the renderer matches upstream and only the fixture was wrong.
+
+**Impact** A permanently-red unit test in `cyrup-tui --lib` on the platform this workspace develops on, invisible to every prior pass because the first suite measurement piped `cargo test` through `tail` and kept only the last 120 lines. It sat inside the same 285-test target as the rest of `app.rs`, so `-p cyrup-tui --lib` could never be green here — the direct sibling of TUI-N10 (macOS-only red) and TUI-N11 (ambient-environment assertion), and the third instance of the same class in one pass.
+
+**Fix** — *applied.* Flatten the wrap before parsing: `let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");` then `flat.split_once("Output truncated. Full output: ")` and take the first whitespace-delimited token. Width- and `TMPDIR`-independent, and the assertion is unchanged — the RENDERED scrollback must still name the executor's own `cyrup-bash-` spool file, and the test still opens that file and requires `line-number-1-padding` and `line-number-3000-padding` to both be present. Neither the renderer (`crates/cyrup-tui/src/bash.rs:384`) nor `transcript.rs` was touched.
+
+**Verify** — done. `-p cyrup-tui --lib` 285 passed / 0 failed (was 284/1); the x13 family 3/3. Mutation-checked so the fix is not vacuous: rewriting `bash.rs:384` to emit `MUTANT-` in place of `cyrup-bash-` turns the test red again with the full mutated path in the message (`…/T/MUTANT-18234-….log`), proving the new parse both reads the path across the wrap and still discriminates on it. Mutation reverted; `git status` clean for `bash.rs` and `transcript.rs`.
+
 ## TUI-S02 — No dead-terminal (EIO/EPIPE/ENOTCONN) emergency exit path
 
 **Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
@@ -1036,6 +1218,165 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 **Fix** Add a pre-dispatch chord check in the key path (`app.rs:1660`), ahead of the focused-component dispatch, matching shift+ctrl+d to the existing `/debug` handler at `app.rs:1827`. Structurally outside TUI-008/TUI-028, which cover configurable ids; pi hardcodes this one.
 
 **Verify** App test: with a selector focused, shift+ctrl+d emits the debug dump and the selector keeps its selection; with the editor focused, the same.
+
+## TUI-052 — A queued message dequeued by Escape stays in the transcript forever as a phantom user message that was never sent
+
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** **confirmed — observed in a live terminal, cross-checked against the session JSONL** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Filed 2026-08-13 from the `TUI-016` repro run.** Not covered by `TUI-016` (which is about the
+> *missing queue surface*) nor by `TUI-005` (which is about the Escape *restore*), and it **survives
+> both of their fixes** unless the echo site itself is removed.
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:1750` — `dispatch_submission`'s `Dispatch::Prompt` arm calls `self.state.transcript.push_user(prompt.clone())` **unconditionally**, before returning `AppAction::Submit(prompt)`, with no knowledge of whether the session will run the prompt or queue it. There is no compensating retraction anywhere: `rg 'remove_user\|retract\|pop_user' crates/cyrup-tui/src/transcript*` finds nothing, and the `QueueUpdate` handler (`app.rs:4612-4614`) touches only `status.set_queued`. So when `TUI-005`'s Escape path restores a still-queued message to the editor, the transcript keeps the bubble that was pushed when it was typed.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2826-2833` @v0.83.0 — the streaming branch clears the editor and calls `updatePendingMessagesDisplay()`; it **never** writes the text into the chat container. The text lives only in `pendingMessagesContainer`, which `restoreQueuedMessagesToEditor` (`:3993-4005`) clears via `updatePendingMessagesDisplay()` at the moment the text moves back to the editor. pi cannot reach this state.
+
+**Impact** — Measured live: two messages queued during a streaming turn were both echoed into the transcript. Escape then interrupted the second turn and correctly restored the still-queued `QUEUEDMSGTWO` into the **editor** — while its transcript echo was never retracted, so the same text was on screen twice, once as a delivered user turn and once as unsent editor content:
+
+```
+47: count slowly
+51: QUEUEDMSGONE
+55: QUEUEDMSGTWO        <-- still shown in the transcript as a DELIVERED user message
+72: Operation aborted
+74: QUEUEDMSGTWO        <-- and simultaneously sitting UNSENT in the editor
+```
+
+The session JSONL proves it was never sent — the only user messages recorded are `count slowly` and `QUEUEDMSGONE`. **The transcript permanently disagrees with the session**: it shows a turn the model never saw. A user scrolling back sees a question they believe was asked and answered.
+
+**Fix** — Do not push a submission into the transcript until the turn it belongs to actually starts. Move the `push_user` out of `dispatch_submission` (`app.rs:1750`) and onto the event that begins the run, so a queued message is rendered by the pending-messages region (**TUI-016**) and by nothing else. **Land with TUI-016** — that item's Fix adds the pending rows, and adding them without removing this echo renders every queued message twice.
+
+**Verify** — App test: submit during a streaming turn, assert the transcript gains **no** user entry while the message is queued, then interrupt and assert the transcript still has no entry for it and the editor holds it. Then a live terminal run against a streaming turn: queue a message, press Escape, and confirm the text appears **once**, in the editor only.
+
+## TUI-053 — `Ctrl+-` (`editor.undo`) is unreachable from any terminal that does not implement the kitty keyboard protocol
+
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** **confirmed — measured live, and pi's legacy mapping read at the tag** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:1010` binds `(ctrl('-'), E::Undo)` and nothing else; `:176` maps the id `"editor.undo"` to `E::Undo`. Matching `Char('-') + CONTROL` requires a CSI-u report. On a legacy terminal `Ctrl+-` arrives as the single byte `0x1F`, and crossterm 0.29.0 decodes the whole `0x1C..=0x1F` range arithmetically — `src/event/sys/unix/parse.rs:110-113`, `c @ b'\x1C'..=b'\x1F' => KeyCode::Char((c - 0x1C + b'4') as char) + CONTROL` — so `0x1F` becomes **`Char('7') + CONTROL`** and can never match `Char('-') + CONTROL`. There is no fallback binding and no diagnostic. Note the keymap already carries an explicit `(Kitty-gated)` comment for the char-jump keys directly below this line: the gating hazard was understood there and not applied to undo.
+
+**upstream** — `pi/packages/tui/src/keys.ts:1277` @v0.83.0, read this pass: **`if (data === "\x1f") return "ctrl+-";`**, with `:1281` `if (data === "\x1b\x1f") return "ctrl+alt+-";`. pi's default binding is the same single `ctrl+-` (`packages/tui/src/keybindings.ts:117`), but pi decodes the **legacy control byte explicitly**, so undo works on every terminal. This is a genuine parity gap, not merely a robustness one: the mechanism pi ports specifically to make `ctrl+-` reachable was not ported.
+
+**Impact** — On Terminal.app, iTerm2's default profile, gnome-terminal, plain xterm and anything else without the kitty protocol, **undo simply does not exist** — no error, no hint, nothing happens. Measured live under tmux with extended-keys on: `send-keys C--` did nothing to the editor, while the raw kitty CSI-u form `ESC[45;5u` fired the undo:
+
+```
+$ tmux send-keys "abc"                         -> editor: abc
+$ tmux send-keys "C--"                         -> editor: abc      (nothing happened)
+$ tmux send-keys -H 1b 5b 34 35 3b 35 75       -> editor: (empty)  (undo fired)
+```
+
+This also raises the cost of **TUI-042** and **TUI-044**, both of which are *about* undo restoring state correctly: on most terminals their user-visible surface is unreachable, so a fix to either is untestable by hand without a kitty-protocol terminal.
+
+**Fix** — Add the legacy alias. In `keymap.rs` bind `E::Undo` to `Char('7') + CONTROL` alongside `ctrl('-')` (the byte crossterm actually delivers), or — cleaner, and the right home if **TUI-045**'s pre-parser lands — normalise `0x1F` to `ctrl+-` at the input boundary, which is the literal shape of pi's `keys.ts:1277`. Prefer the pre-parser form so the mapping lives in one place with `\x1b\x1f` → `ctrl+alt+-`. Audit the rest of the `0x1C..=0x1F` range for the same class while there.
+
+**Verify** — Unit: feed the input pipeline the single byte `0x1F` and assert `E::Undo` is produced. Then a live terminal run **on a non-kitty terminal** (Terminal.app or plain xterm): type text, press `Ctrl+-`, confirm the edit is undone. A tmux run with `extended-keys on` does not close this — it is the configuration in which the bug is invisible.
+
+## TUI-054 — A failed or aborted compaction is announced to the user as "compaction complete"
+
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** **confirmed — observed three times in live scrollback, and the discarded fields read at HEAD** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:4641` destructures the event as `AgentSessionEvent::CompactionEnd { .. }` — **discarding every field** — and the arm ends at `:4654` with an unconditional `self.state.transcript.push_status("compaction complete");`. The fields thrown away are exactly the ones that decide what to say: `crates/cyrup-session-svc/src/event.rs:173-181` declares `CompactionEnd { reason, result, aborted, will_retry, error_message }`, and the crate's own doc comment at `:170-172` describes `error_message` as carrying "an `error_message` on the failure paths".
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3089-3100` @v0.83.0, read this pass: `case "compaction_end"` restores the escape handler, clears the indicator, and then branches — `if (event.aborted) { if (event.reason === "manual") { this.showError("Compaction cancelled"); …` — i.e. pi reports cancellation and failure distinctly and never claims success for either.
+
+**Impact** — Observed three times in live scrollback, each an error immediately followed by a success claim:
+
+```
+1069: compact error: Nothing to compact (session too small)
+1073: compaction complete
+
+ 346: compact error: compaction: summarization failed: http 400: {
+ 348:   "error": {
+ 351:     "type": "invalid_request_error",
+ 359: compaction complete
+```
+
+In the second case the summarization provider call failed outright and **no compaction entry was written to the session file** — yet the last line the user sees is "compaction complete". Anyone who scrolls past the error blob, or whose error blob has scrolled off, is told the context was compacted when it was not, and will then reason about their remaining context window from a false premise. Compounded by **TUI-055**: with no indicator during the compaction, this status line is the *only* feedback the whole operation produces.
+
+**Fix** — Destructure the event: `CompactionEnd { reason, aborted, error_message, .. }`, and branch as pi does — `error_message` ⇒ render the failure, `aborted && reason == Manual` ⇒ "Compaction cancelled", else "compaction complete". Lands naturally with **SESS-040** (which makes `aborted` reachable at all) and **TUI-055**.
+
+**Verify** — App test: drive the event loop with `CompactionEnd { aborted: true, reason: Manual, .. }` and assert the transcript says "Compaction cancelled" and **not** "compaction complete"; repeat with `error_message: Some(…)` and assert the message is rendered. A live run where compaction is refused ("Nothing to compact") must not print a success line.
+
+## TUI-055 — No status indicator renders for the entire duration of a compaction — the screen is blank for 10–20 s
+
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** **confirmed — sampled every 200 ms across a full compaction in a live terminal** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Filed 2026-08-13 from the `SESS-040` repro run**, which it corrects: `SESS-040` assumes the
+> opposite ("the indicator keeps spinning"). No item describes the non-render.
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:4615-4639` handles `CompactionStart` by calling `self.state.indicator.set(IndicatorKind::Compaction, Some(msg))` with `msg = "Compacting context..."`, and `app.rs:6044` appends `(${keyText("app.interrupt")} to cancel)`. **None of it reaches the screen.** The source is real and correct-looking; what is missing is whatever makes that indicator state render during a compaction, which is why no amount of source reading found this — it is a defect of the assembled application, visible only when run.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3076-3078` @v0.83.0 — `case "compaction_start"` calls `this.showStatusIndicator(new CompactionStatusIndicator(…))`, and pi's indicator is on screen for the whole operation.
+
+**Impact** — A manual `/compact` measured at 10.5 s, sampled every 200 ms for the first 4 s and every 1 s thereafter, with **no keys sent** during the window:
+
+```
+[t=0.2s] complete=0 ind=          [t=5s]  complete=0 ind=
+[t=0.4s] complete=0 ind=          [t=8s]  complete=0 ind=
+   ...                            [t=10s] complete=0 ind=
+[t=4.0s] complete=0 ind=          [t=11s] complete=1 ind=
+
+# ind = `tmux capture-pane -p | sed -n '/cancel\|Compact/p'` — EMPTY at every sample.
+```
+
+A full pane dump at t=3 s of a second compaction likewise contained no spinner and no indicator text; the transcript region was literally blank lines. So for ten to twenty seconds the shipped TUI gives the user **no spinner, no progress, no key hint and no indication anything is happening** — during an operation that is billing a provider call and rewriting the session. The natural user response is to assume a hang and kill the process, which is exactly when the session file is being mutated.
+
+**Fix** — Establish why `IndicatorKind::Compaction` does not reach the frame (the most likely cause is the indicator being gated on the streaming state, which a manual `/compact` outside a turn does not set — start there), and make the band render for the duration with pi's text and the cancel hint. **Schedule with SESS-040**: that item wires Escape, and Escape wired to an invisible band is still an invisible band; this item makes the band visible, and a visible band advertising a dead key is `SESS-040`'s original complaint. Neither alone is shippable.
+
+**Verify** — App test asserting the rendered frame contains `Compacting context...` for every frame between `CompactionStart` and `CompactionEnd`. Then, per the standing rule, a **live terminal run**: issue `/compact`, sample the pane at 200 ms intervals, and assert the indicator text is present in every sample until the completion line.
+
+## TUI-056 — The context-usage meter resets to `0.0%` after an aborted turn while the conversation is still in the transcript
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** medium — observed live; the cyrup-side cause was not isolated · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Scope note, because half of the original observation was struck.** The same session also showed
+> the meter rendering a literal `?` after a successful compaction. That is **not** a defect: it is a
+> faithful port of pi's `contextPercent === "?"` branch (`footer.ts:151-152`), implemented at
+> `crates/cyrup-tui/src/status.rs:377` and documented at `:364-365` as the intended rendering "when
+> a compaction has left it unknown". Only the aborted-turn behaviour below is filed. Do not re-file
+> the `?`.
+
+**cyrup** — `crates/cyrup-tui/src/status.rs:366-377` `context_text()` renders `{pct}%/{window}` from `set_context_usage`. After an aborted turn the segment was observed at `0.0%/131k` — window known, percent computed as **zero** — which is a different state from the `?` branch (`percent: None`) and is therefore not covered by it. The producing side was not isolated; the item is filed on the observation.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/footer.ts:148-153` @v0.83.0 renders the same segment from `getContextUsage()`. pi's abort path does not reset the usage accounting; the transcript is unchanged by an abort, so the occupancy is unchanged.
+
+**Impact** — Measured on the same session, one abort apart:
+
+```
+before abort: ↑26k ↓1.6k R31k CH94.3% $0.005 4.5%/131k (auto)
+after  abort: ↑26k ↓1.6k R31k          $0.005 0.0%/131k (auto)
+```
+
+The conversation is still in the transcript and still in the session file, but the meter reads "the context is empty". A user watching the meter to decide when to compact is given a number that says they have just been handed a fresh window. Low severity because it is a display value with no downstream consumer, and because it self-corrects on the next turn.
+
+**Fix** — Trace the `set_context_usage` call on the abort path (start from the `Interrupt` arm at `app.rs:6585-6593` and the `AgentEnd`/abort event handling) and stop it re-seeding the meter from a zero or absent usage snapshot; the transcript is unchanged by an abort, so the last known usage should stand. Note the cache-hit segment (`CH94.3%`) also disappears at the same moment, which suggests one shared reset rather than two.
+
+**Verify** — App test: drive a turn, abort it, and assert the context segment retains its pre-abort percentage and the `CH` segment is unchanged. Live run to confirm, since this was only ever seen assembled.
+
+## TUI-057 — Slash-command palette submission is inconsistent: sometimes one Enter runs the command, sometimes two, sometimes a trailing space suppresses it
+
+**Kind** port-divergence · **Severity** low · **Effort** M · **Confidence** **low — observed live but driven through tmux, so an instrument race cannot be excluded** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Filed at low confidence, deliberately, with its caveat intact.** This is a lead, not a
+> characterised defect. It is filed rather than dropped because it was seen repeatedly across one
+> session and because the alternative explanation is itself a defect — see Impact.
+
+**cyrup** — Not isolated. The behaviour spans the palette's completion-acceptance path and the editor's `E::Submit` arm; no single call site was identified, and no static claim is made here.
+
+**upstream** — Not re-read for this item; pi's palette submission semantics were not established this pass. **This must be settled before the item is worked**, or the fix risks pinning cyrup-original behaviour.
+
+**Impact** — Across roughly eight `/compact` invocations driven identically via `tmux send-keys`, submission behaviour varied: sometimes a single Enter after typing `/compact` ran the command; sometimes the first Enter only accepted the completion and a second was needed; and in one case `"/compact "` (with a trailing space) followed by Enter left the text sitting in the editor with the command unrun:
+
+```
+────────────────────────────────────────────────────────
+/compact
+────────────────────────────────────────────────────────
+↑15k ↓2.6k R8.9k CH87.6% $0.004 4.3%/131k (auto)
+```
+
+— captured *after* Enter had been sent. **The caveat is load-bearing and is not a reason to dismiss the item:** driven through tmux, a race between the palette's async population and the Enter keypress cannot be excluded — but a human types at comparable speed, so **that race would itself be the defect**, not an artefact of the harness.
+
+**Fix** — First reproduce deterministically: drive the palette from a test harness rather than a terminal, with the completion source stubbed to resolve on a controllable schedule, and establish whether Enter-before-population is the trigger. Then read pi's palette submission path and port its ordering. Do not change behaviour before both steps.
+
+**Verify** — Once characterised: a test that submits `/compact` with the completion source resolving after the keypress and asserts the command runs exactly once; plus the trailing-space case. Then a live run issuing the same command ten times and asserting ten executions.
 
 ## Coverage
 

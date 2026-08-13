@@ -84,6 +84,51 @@ impl Drop for TempRootGuard {
     }
 }
 
+/// Save / set-or-remove / restore one env var for the duration of a test.
+///
+/// Exists because this file's harness-driven test is the only one here that drives the parent
+/// `intercom`-alias gate through the REAL `std::env::var` closure (`src/extension.rs:9286`) rather
+/// than an injected `get`. Any var that gate reads must therefore be pinned to the value the test
+/// claims, not inherited from whatever the developer or CI runner happens to export.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var(key).ok();
+        // SAFETY: every test in this file holds `ENV_LOCK` for the whole of its critical section, so
+        // no other thread in this process observes a torn env.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        // SAFETY: see `set`.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `set`. Restores the PRIOR value rather than blindly removing, so a developer
+        // env that legitimately sets these is left exactly as it was found.
+        unsafe {
+            match &self.previous {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 /// A live-capability backend stand-in exposing exactly the two seams the channel uses:
 /// `session_id()` (which requests belong to THIS orchestrator) and `inject_message` (the transcript
 /// hand-off). Records every injection so the test can assert the parent actually saw the request.
@@ -553,10 +598,20 @@ async fn the_supervisor_tool_is_registered_and_dispatches_on_a_real_session() {
     let (_root_guard, _root) = TempRootGuard::install();
     let home = tempfile::tempdir().expect("home tempdir");
     let work_dir = tempfile::tempdir().expect("work tempdir");
-    // SAFETY: scoped, `ENV_LOCK`-serialized — matching every sibling test in this file.
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
+    // Pin EVERY env var the alias gate reads, because this test asserts on a precondition it must
+    // therefore actually control (see the `FauxResponse::tool_call("intercom", …)` comment below).
+    // `intercom_supervisor_channel_available` (`src/native_supervisor.rs:1692-1712`) is
+    // `env_opt_in || config exists`, and its `env_opt_in` term reads `CYRUP_INTERCOM` — the
+    // documented product opt-in, exported on developer machines and CI runners alike. Left
+    // unscrubbed it made the gate true, the alias unregistered, and this test fail with
+    // `Tool 'intercom' not found` on any box that sets it. `CYRUP_CODING_AGENT_DIR` is scrubbed
+    // too because `agent_dir_from` (`src/native_supervisor.rs:1772-1784`) reads it BEFORE
+    // `CYRUP_HOME`, so an ambient value would silently defeat the tempdir isolation below.
+    // The guards must be installed BEFORE the extension is constructed: `SubagentsExtension::init`
+    // is what reads the env.
+    let _intercom = EnvVarGuard::remove("CYRUP_INTERCOM");
+    let _agent_dir = EnvVarGuard::remove("CYRUP_CODING_AGENT_DIR");
+    let _home = EnvVarGuard::set("CYRUP_HOME", home.path());
 
     let extension = Arc::new(SubagentsExtension::with_config_and_cwd(
         SubagentExtensionConfig::default(),
@@ -583,11 +638,9 @@ async fn the_supervisor_tool_is_registered_and_dispatches_on_a_real_session() {
 
     let events = harness.run("check the supervisor channel").await;
 
-    // SAFETY: scoped cleanup under the same lock-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
-
+    // Teardown is `EnvVarGuard::drop`, which RESTORES the prior value. The manual
+    // `remove_var("CYRUP_HOME")` that used to sit here was unbalanced: it deleted the var outright
+    // rather than putting back what the process started with.
     let events = events.expect("the turn completes without a transport/session-level error");
 
     let starts: Vec<&str> = events

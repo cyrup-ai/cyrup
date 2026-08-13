@@ -110,7 +110,8 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| EXT-054 | **critical** | cyrup-original | M | `ExtensionManifest.capabilities` is never read — the declared per-extension WASM sandbox grant model is entirely inert |
+| EXT-054 | **critical** | cyrup-original | M | `ExtensionManifest.capabilities` is never read — the declared per-extension WASM sandbox grant model is entirely inert — **observed 2026-08-13** |
+| EXT-058 | medium | cyrup-original | S | Guest WASM `http-client` is not gated by `--offline` — a guest reaches the network on a host launched offline — **new, observed 2026-08-13** |
 | EXT-003 | medium | not-ported | M | Project-trust store is unwired at the extension seam |
 | EXT-006 | medium | parity-bug | L | Renderers run without display options or theme, and only once |
 | EXT-007 | medium | parity-bug | M | The first system prompt is built from built-ins only; guest promptGuidelines are dropped |
@@ -159,11 +160,36 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 | EXT-053 | low | parity-bug | S | An extension command shadowing a built-in is dropped from autocomplete with no diagnostic |
 | EXT-056 | low | parity-bug | S | register_tool_renderer is last-wins while every sibling table is first-wins |
 | EXT-057 | low | parity-bug | S | deliver_bus_events silently drops queued events at the round bound, and listener faults never surface |
+| EXT-N01 | high | test-defect | S | The proc-cap buffer test asserted a byte-exact cap the pump never held — scheduling-dependent red — **fixed this pass** |
 | EXT-S04 | low | not-ported | M | ctx.compact's onError path has no observable counterpart |
 
 ## EXT-054 — `ExtensionManifest.capabilities` is never read by any code path — the declared per-extension WASM sandbox grant model is entirely inert
 
-**Kind** cyrup-original · **Severity** critical · **Effort** M · **Confidence** high (grep-complete on the consumer side; static only)
+**Kind** cyrup-original · **Severity** critical · **Effort** M · **Confidence** **confirmed — the mis-grant reproduced end to end with a real WASM guest** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13, and the result is stronger than this item claims.** `wasm32-wasip2` was
+> already installed; `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` finished in **0.10 s** and
+> produced a 4.1 MB component. A guest whose `extension.json` declared
+> `{"fs": [], "exec": false, "net": false, "ui": false}` — every bit off, the strictest declaration
+> the schema can express — was loaded via `-e <dir>` and got the **full host surface**:
+>
+> * `/execdemo` ran `echo hi` as a real host process and printed `exec stdout: hi`.
+> * `/httpdemo https://api.together.xyz/v1/models` opened a real TLS connection and returned a live
+>   `401 Missing API key` from Together's server.
+> * Both results were surfaced through `ctx.ui().notify()`, so the `ui` bit is inert too.
+>
+> The consumer-side grep was re-run at HEAD and is unchanged: producers only, no consumer.
+>
+> **Two corrections to the Impact below.** (1) *"Blast radius today: zero WASM guests ship … so
+> nothing is currently mis-granted"* **overstates the safety margin**. The SDK's own reference guest
+> (`crates/cyrup-ext-sdk/src/example.rs`) is a complete, loadable component that ships `/execdemo`
+> and `/httpdemo` as ready-made proofs, the target builds it in under a second, and `-e <dir>` loads
+> it pre-trusted — the mis-grant is reproducible **today, with no third-party code**. Read that
+> sentence as "no third-party guest ships, but the in-tree SDK example is a loadable guest that
+> demonstrates the mis-grant end to end." (2) **`--offline` does not gate the guest `http-client`
+> import either** — the `net` bypass above was measured with `--offline` set on the host, so neither
+> the manifest grant nor the offline flag stands between an installed guest and the network. Filed
+> separately as **EXT-058**; the Verify block should add the offline case.
 
 > **Raised `high` → `critical` in the 2026-08-12 repair pass.** README:106-107 defines `critical` as
 > "data loss, silent wrong output, **a permission bypass**, or a crash on a normal path" and attaches
@@ -179,11 +205,11 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 
 **upstream** — none, and that is the point: pi has no capability model at all (every TypeScript extension runs with the whole process's authority, `pi/packages/coding-agent/src/core/extensions/loader.ts` @v0.83.0). This is a divergence from **cyrup's own** security design rather than a pi parity gap, which is precisely why a pi-anchored, item-driven sweep cannot see it (README structural blind spot 1).
 
-**Impact** — the sandbox cyrup advertises does not exist. Every loaded WASM guest gets the full host surface regardless of what it declared, and the declaration is the thing a reviewer would read to decide whether an extension is safe to install. The trust gate that *is* enforced is all-or-nothing and directory-scoped, so "trusted enough to run" silently means "trusted with process execution, network and the filesystem". **Blast radius today:** zero WASM guests ship (`crates/cyrup-ext-sdk/src/example.rs` is the only component author in the tree), so nothing is currently mis-granted — but `wasm-host` is default-on and `load_discovered` is a live path, so the first installed guest is mis-granted on arrival, and the mis-grant is invisible because the manifest says otherwise. Schedule it **before** the first third-party component, not after.
+**Impact** — the sandbox cyrup advertises does not exist. Every loaded WASM guest gets the full host surface regardless of what it declared, and the declaration is the thing a reviewer would read to decide whether an extension is safe to install. The trust gate that *is* enforced is all-or-nothing and directory-scoped, so "trusted enough to run" silently means "trusted with process execution, network and the filesystem". **Blast radius today (corrected 2026-08-13 from a live run):** no *third-party* guest ships, **but the in-tree SDK example is itself a loadable guest that demonstrates the mis-grant end to end** — `crates/cyrup-ext-sdk/src/example.rs` ships `/execdemo` and `/httpdemo`, `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` produces the component in 0.10 s, and `-e <dir>` loads it pre-trusted. Measured: an all-false manifest still reached a real host process and a real TLS round trip. `wasm-host` is default-on and `load_discovered` is a live path, so the first installed guest is mis-granted on arrival and the mis-grant is invisible because the manifest says otherwise. Schedule it **before** the first third-party component, not after. **`--offline` is not a second line of defence** — the `net` bypass reproduces with `--offline` set on the host (**EXT-058**).
 
 **Fix** — thread the manifest into instantiation: change `load_wasm` (`facade.rs:1063-1103`) to take `&ExtensionManifest` (or a resolved `Capabilities`) and have `load_discovered` (`facade.rs:1166-1182`) pass `disc.manifest`. In `GuestState` construction (`crates/cyrup-ext/src/host/services.rs:1181` region) seed `ProcCaps`/`HttpCaps`/`FsCaps` from the grant rather than from `Default`, and make the `exec`/`net`/`ui` host imports in `crates/cyrup-ext/src/host/live.rs` return a typed denial when the corresponding bit is false. The `fs` grant strings (`manifest.rs:26-28`, e.g. `"read:."`, `"write:.cyrup/todo"`) need a parser and must feed `FsCaps::with_fs_root` — which is EXT-055 and should be done in the same change. Deny-by-default: an absent `capabilities` block grants nothing, and the loader's two `Default::default()` synthesis sites (`loader.rs:213`, `:259`) must therefore stay the empty grant, not a permissive one.
 
-**Verify** — load two fixture components in one process, one declaring `{"exec": true}` and one declaring `{"exec": false}`; assert the first's `exec.run` succeeds and the second's returns a capability-denied error rather than running. Repeat for `net` against `http-client` and for a `fs` grant that permits one directory and refuses its sibling. Add to `crates/cyrup-ext/tests/wasm_component.rs` and a new `tests/manifest_capabilities.rs`.
+**Verify** — load two fixture components in one process, one declaring `{"exec": true}` and one declaring `{"exec": false}`; assert the first's `exec.run` succeeds and the second's returns a capability-denied error rather than running. Repeat for `net` against `http-client` and for a `fs` grant that permits one directory and refuses its sibling. **Added 2026-08-13:** include the `--offline` case — a guest declaring `{"net": false}` on a host launched `--offline` must not reach the network, which today it does (**EXT-058**). The regression fixture already exists: build `cyrup-ext-sdk` for `wasm32-wasip2` and load it with `-e`. Add to `crates/cyrup-ext/tests/wasm_component.rs` and a new `tests/manifest_capabilities.rs`.
 
 ## EXT-003 — Project-trust store is unwired at the extension seam
 
@@ -861,6 +887,20 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 
 **Verify** — drive a two-guest ping-pong past 64 rounds and assert exactly one error reaches the listener naming the bound; make a subscriber's `bus-deliver` trap and assert the fault appears in the TUI transcript the way a handler fault does.
 
+## EXT-N01 — `unread_stdout_from_a_bursty_child_is_bounded_not_unbounded` asserted a byte-exact cap the pump was never designed to hold
+
+**Kind** test-defect · **Severity** high · **Effort** S · **Confidence** confirmed · **Status** fixed this pass
+
+**cyrup** — `crates/cyrup-ext/src/caps/proc.rs` asserted `first <= MAX_PIPE_BUFFER_BYTES` and `second <= MAX_PIPE_BUFFER_BYTES` against the live buffer of a `yes` child. The pump's real invariant is one chunk looser: `PipeBufState::wait_for_room` returns as soon as `len < MAX_PIPE_BUFFER_BYTES` (`:283`), and `spawn_pump` then appends a full 8 KiB `read()` before re-checking (`:834-840`). The buffer can therefore legitimately sit anywhere in `[cap, cap + 8191]`, and which value a 500 ms sampler sees is pure scheduling. Observed both ways in consecutive full-workspace runs on an otherwise unchanged tree: green in one, and in the next `buffered stdout (16781628 bytes) exceeded the cap (16777216)` — an overshoot of **4412 bytes**, i.e. a partial chunk, which is the bounded behaviour the test exists to prove rather than the unbounded growth it reported.
+
+**upstream** — none, and that is the classification. `ProcCaps` is a cyrup-original host capability for WASM guests; pi has no WASM host and no counterpart to `MAX_PIPE_BUFFER_BYTES`. The constant's own doc at `proc.rs:63` states the intent outright — "the point is FINITE, not a specific number" — so a byte-exact assertion pins a property the design never claimed. Per the repo rule this is case (b): the test asserted something it cannot control (the scheduler's interleaving of `wait_for_room` and `read`), not a divergence from upstream.
+
+**Impact** — a scheduling-dependent red in `-p cyrup-ext --lib`, one of the two defects that made `cargo test --workspace` non-deterministic across back-to-back runs. Left alone it would have trained readers to re-run the gate until it went green, which is how a real regression gets waved through.
+
+**Fix** — *applied.* Named the pump's chunk size as `PIPE_CHUNK_BYTES` (`const PIPE_CHUNK_BYTES: usize = 8192;`, used by `spawn_pump` in place of the inline literal) so the bound is derived from the code rather than a magic number, and asserted `<= MAX_PIPE_BUFFER_BYTES + PIPE_CHUNK_BYTES`. **Strengthened, not merely relaxed:** a third assertion now requires `second.abs_diff(first) <= PIPE_CHUNK_BYTES` — 500 ms of `yes` moves far more than one chunk, so a pump that was not genuinely parked cannot land within one chunk of where it already was. The plateau claim is now checked directly instead of being inferred from an absolute ceiling. No behaviour changed: the only production edit is the literal `8192` becoming a named const of the same value.
+
+**Verify** — done. 6/6 consecutive green in isolation (3.45-3.46 s each) and green in the full-workspace run. Mutation-checked so the widened bound is not vacuous: short-circuiting `wait_for_room`'s guard to `if true || …` (removing backpressure entirely) fails the test at **56004586 bytes** against the new `16785408` bound. Mutation reverted.
+
 ## EXT-S04 — ctx.compact's onError path has no observable counterpart
 
 **Kind** not-ported · **Severity** low · **Effort** M · **Confidence** high
@@ -874,6 +914,31 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 **Fix** — either give `control.compact` a richer return that distinguishes "vetoed" and "errored" from "produced no entry", or add a `session_compact_failed` event to the catalog beside `session_compact` and dispatch it from the error path in `crates/cyrup-session-svc/src/session.rs`. The return-value route is import-only (no bump); the event route is an export addition (bump). Prefer the return value — the caller already awaits a `result<_, string>` and only the error text is being thrown away.
 
 **Verify** — a guest calling `compact_with` against a session where compaction fails; assert the guest observes the failure rather than waiting forever for a `session_compact` that never arrives.
+
+## EXT-058 — Guest WASM `http-client` is not gated by `--offline`
+
+**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** **confirmed — reproduced with a real WASM guest on an `--offline` host** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Filed 2026-08-13 from the `EXT-054` repro run.** Adjacent to `EXT-054` but **not covered by it**:
+> `EXT-054` is about the manifest grant being inert, this is about the *second* control — the host's
+> own offline flag — also not applying. They are separately fixable and the combination is the point.
+
+**cyrup** — `grep -rn "offline" crates/cyrup-ext/src` at HEAD returns **nothing**: the extension host has no notion of the offline flag at all, so the guest `http-client` import in `crates/cyrup-ext/src/host/live.rs` cannot consult it. `--offline` is documented in the shipped help as "Disable startup network operations", so this may be within the letter of the flag — which is exactly why it is worth stating rather than assuming.
+
+**upstream** — none. pi has no WASM guest model and no capability surface to gate, so there is no parity question here; this is a coherence question about **cyrup's own** two controls.
+
+**Impact** — Measured: the host was launched with `--offline` **and** `--model faux/faux-1`, loading a guest whose manifest declared `{"net": false}`, and the guest still performed a live outbound HTTPS request:
+
+```
+ /httpdemo https://api.together.xyz/v1/models
+ http status: 401 body: Missing API key        <-- a response from Together's real servers
+```
+
+Taken with `EXT-054`, **neither of cyrup's two controls stands between an installed guest and the internet**: not the per-extension capability grant, and not the process-wide offline flag. An operator who runs `--offline` on an air-gapped or policy-restricted host, having also written a deny-everything manifest, gets neither guarantee. Rated medium rather than high only because it requires an installed guest, which today means the in-tree SDK example — the same reachability `EXT-054` records.
+
+**Fix** — Decide what `--offline` means for guests and implement it, rather than leaving it undefined. If it is process-wide (the reading an operator will assume), thread the flag into the extension host's service construction and have the `http-client` import return a typed offline error when it is set. If it is genuinely startup-only, say so in the flag's help text — "Disable startup network operations (does not restrict extensions)" — so the guarantee is not over-read. Land the enforcement route with `EXT-054`, which is threading the manifest through the same seam.
+
+**Verify** — Load a guest with `{"net": true}` on a host launched `--offline` and assert its `http-client` call returns an offline error rather than reaching the network; the same guest on a host without `--offline` must succeed. The fixture already exists: `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` and `-e <dir>`, then `/httpdemo`.
 
 ## Coverage
 

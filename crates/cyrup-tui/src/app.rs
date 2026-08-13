@@ -7650,11 +7650,25 @@ mod x13_live_bash_tests {
         run_block(&mut app, session, BIG).await;
 
         let out = app.scrollback_text();
-        let row = out
-            .lines()
-            .find(|l| l.contains("Output truncated. Full output:"))
-            .unwrap_or_else(|| panic!("no truncation row in a 120 KB live run:\n{out}"));
-        let path = row.split("Full output:").nth(1).unwrap().trim().to_string();
+        // TUI-N13: pi emits the whole status block as `new Text(`\n${statusParts.join("\n")}`, 1, 0)`
+        // (`bash-execution.ts:201` @v0.83.0) — padding-left 1, WORD-WRAPPED to the terminal width —
+        // and cyrup renders it the same way, so a status part longer than the width legitimately
+        // occupies two visual lines in BOTH. The spool path comes from `std::env::temp_dir()`
+        // (`cyrup-session-svc/src/bash.rs:258`), which on macOS is `/var/folders/<2>/<30>/T/`: at
+        // that length ` Output truncated. Full output: <path>` is exactly 120 columns and the path
+        // wraps onto the next line, while on Linux (`TMPDIR` unset -> `/tmp`) it does not. Reading a
+        // single `.lines()` entry therefore asserted the length of the ambient TMPDIR rather than the
+        // wiring under test. Flatten the wrap first; the assertion itself is unchanged and still
+        // requires the RENDERED scrollback to name the executor's own spool file.
+        let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        let path = flat
+            .split_once("Output truncated. Full output: ")
+            .unwrap_or_else(|| panic!("no truncation row in a 120 KB live run:\n{out}"))
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap_or_else(|| panic!("the truncation row named no file:\n{out}"))
+            .to_string();
         assert!(path.contains("cyrup-bash-"), "the spool file is the executor's: {path}");
 
         // The named file really holds the FULL output — the row is not a decorative string.

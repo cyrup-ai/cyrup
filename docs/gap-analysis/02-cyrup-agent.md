@@ -81,7 +81,7 @@ turns AGENT-029 from latent into live.
 | AGENT-S02 | still-open | low. `subscribe` still returns `()` (`agent.rs:1485-1487`) and `on_event` takes no token. Rationale corrected: v0.84.1 **deleted** `_reconnectToAgent` and the compact-time disconnect, so the surviving upstream consumers are disposal (`agent-session.ts:395`, `:829-831`) and the rpc-mode backpressure listener (`modes/rpc/rpc-mode.ts:355-361`, `:732-733`). |
 | AGENT-S03 | still-open | low. `GenerationConfig` still has no `metadata` field; `StreamOptions` is closed with `..Default::default()` at `agent.rs:744`. |
 | AGENT-S04 | **partially-closed** *(this pass)* | Agent-side wiring is complete: `StateInner.transport` (`state.rs:86-95`), `Agent::set_transport` (`agent.rs:1510-1512`), run-start snapshot overlay (`agent.rs:1703`, `:1712`) matching `agent.ts:454`, reaching `StreamOptions.transport` at `agent.rs:734`, TUI row wired at `crates/cyrup-tui/src/app.rs:4114` → `session.rs:3140-3142`. Still dead downstream — nothing in `crates/cyrup-provider` reads it — which is **an area-01 provider gap, not an agent gap**; handed off. Not counted again in the open-severity tally. |
-| AGENT-020 | **new** | **critical** *(raised from high in the 2026-08-12 repair pass)*. `continue_run` drains the steering/follow-up queue before the run-active check, destroying a user-typed message. |
+| AGENT-020 | **new** | **low** *(raised to critical 2026-08-12, then LOWERED critical → low on 2026-08-13 when the raise's justification was refuted by measurement)*. `continue_run` drains the steering/follow-up queue before the run-active check. The code path is real and unchanged at HEAD, but the loss it predicts does not occur on the path the TUI uses: typing during a live stream queued and delivered the message 5/5 times, including four attempts timed at the settle boundary. Latent race, not data loss. |
 | AGENT-021 | **new** | medium. `loop_fn::build_run_ctx` hardcodes `headers: None` — a regression introduced by AGENT-S01's own fix. |
 | AGENT-022 | **new** | medium. `BeforeToolCallResult.terminate` (v0.84.1 drift) unrepresentable. |
 | AGENT-023 | **new** | low *(corrected from medium)*. `Agent::reset()` under a live run; upstream now throws. |
@@ -109,7 +109,7 @@ turns AGENT-029 from latent into live.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| AGENT-020 | **critical** | parity-bug | S | `continue_run` drains the steering/follow-up queue before the run-active check |
+| AGENT-020 | low | parity-bug | S | `continue_run` drains the steering/follow-up queue before the run-active check — **REFUTED as filed 2026-08-13: the predicted loss does not occur on the normal path (5/5 delivered); critical → low** |
 | AGENT-030 | high | parity-bug | M | `AgentSession::prompt` gates on the agent's per-run flag, so a prompt in the post-run gap starts a second run |
 | AGENT-009 | medium | parity-bug | M | Error tool results diverge in `details` and in `tool_execution_end.result` shape |
 | AGENT-016 | medium | cyrup-original | S | Panicking tool in a parallel batch vanishes (unwind builds only) |
@@ -141,14 +141,37 @@ turns AGENT-029 from latent into live.
 
 ## AGENT-020 — `continue_run` drains the steering/follow-up queue before the run-active check
 
-**Kind** parity-bug · **Severity** critical · **Effort** S · **Confidence** confirmed
+**Kind** parity-bug · **Severity** **low** *(lowered from critical 2026-08-13 — see below)* · **Effort** S · **Confidence** **code path confirmed at HEAD; the filed Impact REFUTED by measurement** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
 
-> **Severity raised high → critical, 2026-08-12 repair pass.** `README.md:106-107` defines
-> `critical` as data loss, silent wrong output, a permission bypass, or a crash on a normal path.
-> This item's own Impact is "a user-typed steering message is silently destroyed" — data loss, on
-> the normal path of typing while a turn is in flight. It had been filed at `high` while its text
-> asserted the critical condition; the definition is applied here rather than amended. It remains
-> the highest-value item in this area and must ship with **AGENT-030**.
+> **REFUTED as stated, 2026-08-13, in a live terminal. Severity critical → low.**
+>
+> The cyrup-side code citation below is **accurate and unchanged at HEAD**: `continue_run` really
+> does `drain()` before `start_run` claims the latch, and the drained `Vec<AgentMessage>` really
+> would be dropped on `Err(RunActive)`. What does **not** happen is this item's Impact — the
+> "unconditional silent destruction of a user-typed steering message" on "the normal path of typing
+> while a turn is in flight", which was the sole justification for the `high → critical` raise.
+>
+> Measured under tmux against a real streaming Together turn: typing during an active stream and
+> pressing Enter clears the editor, echoes the message into the transcript, lets the stream run to
+> completion, and **then delivers it** — the model answered the canary (`"We need to obey stop.
+> ACK."` / `"ACK"`). **Five for five**, across one deliberate mid-stream submission and four
+> submissions timed 3.0 / 4.0 / 4.5 / 5.0 s into a ~10 s turn, deliberately aimed at the settle
+> boundary. **No canary was lost.** The steering path the TUI actually uses queues and re-drives;
+> `continue_run` is not entered while the latch is held on that path, so the drain-before-latch
+> window is never opened by typing.
+>
+> **Restated Impact.** The drained `Vec<AgentMessage>` is dropped if `start_run` returns
+> `Err(RunActive)`. That window is reachable only through the sub-millisecond `is_streaming`-cleared /
+> oneshot-unresolved race described in **AGENT-030**, and was not observed. This is a **latent race**,
+> not an unconditional loss.
+>
+> **Keep the Fix** — pushing the drained messages back on the error path is cheap and correct, and it
+> is the right shape regardless of reachability. What does not survive is the severity and the claim
+> that this is the highest-value item in the area.
+>
+> **Method note, recorded because it generalises.** The `README.md:106-107` "data loss on a normal
+> path" criterion was applied to a *predicted* consequence that the binary does not exhibit. A
+> severity raise must cite an observation or say plainly that it does not.
 
 **cyrup** — `crates/cyrup-agent/src/agent.rs:1635-1657`: `continue_run` reads `state.messages` and,
 when the last message is an assistant, calls `let steering = lock(&self.steering).drain();` at
@@ -176,11 +199,18 @@ queues intact and the message is still delivered at the next drain point (`agent
 is empty — but the **line numbers are not**, and the previous revision of this item asserted that
 they were. Corrected in the 2026-08-12 repair pass (completeness critique finding 9).
 
-**Impact** — A user-typed steering message is silently destroyed: the UI accepts it, the queue
-empties, and it never reaches the model or the transcript — no error, no log line, no retry. The
-second branch loses a follow-up message the same way. Because the loss happens inside the post-run
-driver loop, it is invisible to the caller; `drive_run` just `break`s at `session.rs:722` and the run
-ends looking normal.
+**Impact** — *(Rewritten 2026-08-13 after the live measurement REFUTED the previous text; see the
+block above.)* The drained `Vec<AgentMessage>` is dropped if `start_run` returns `Err(RunActive)`,
+and because that happens inside the post-run driver loop it is invisible to the caller: `drive_run`
+just `break`s at `session.rs:722` and the run ends looking normal. **Measured 2026-08-13 in the live
+TUI: typing during an active stream does NOT reach this window** — the message is queued, echoed into
+the transcript, and delivered when the run settles (5/5 attempts, including four timed at the settle
+boundary). The loss is reachable only through the sub-millisecond `is_streaming`-cleared /
+oneshot-unresolved window described in **AGENT-030**, and was not observed. The second branch would
+lose a follow-up message the same way, and by the same narrow route.
+
+*Previous text, retained so the correction is auditable:* "A user-typed steering message is silently
+destroyed: the UI accepts it, the queue empties, and it never reaches the model or the transcript."
 
 **Fix** — Hoist the busy check to the top of `Agent::continue_run` (`agent.rs:1635`) to mirror pi's
 ordering: `if self.is_running() { return Err(AgentError::RunActive); }` before any `drain()`. That

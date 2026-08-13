@@ -174,17 +174,38 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 
 ## SESS-040 — Compaction cannot be cancelled from the shipped binary: the Escape rebind was never ported, `AbortCompaction` has zero callers, and the indicator advertises "(esc to cancel)"
 
-**Kind** not-ported · **Severity** high · **Effort** M · **Confidence** high (both sides read; three independent greps)
+**Kind** not-ported · **Severity** high · **Effort** M · **Confidence** **confirmed on the central claim; the user-visible half REFUTED and rewritten** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Observed 2026-08-13 in a live terminal. Central claim confirmed; mechanism half wrong.**
+>
+> **Confirmed:** Escape pressed 3 s into an 18 s compaction cancelled nothing. The provider call ran
+> to completion, `compaction complete` appeared, and a `compaction` entry with a full summary was
+> appended to the session file at `13:08:22`. Billing continued. `AbortCompaction` still has exactly
+> two lines in the tree (the variant and its handler) and no production dispatch site.
+>
+> **Refuted:** this item predicts that "the user presses Escape, **the indicator keeps spinning**"
+> and that the band renders `(esc to cancel)`. **Neither happens.** Across a 10.5 s compaction
+> sampled every 200 ms for the first 4 s and every 1 s thereafter, with no keys sent, the pane never
+> contained the strings `Compact`, `cancel` or `Working` — **no indicator is drawn at all**, and the
+> transcript region was literally blank. So the affordance this item calls "a cancel key that does
+> nothing" is in practice **"no affordance and no progress feedback at all, for ten to twenty seconds
+> of blank screen"** — a worse user-facing outcome than filed, and it was hiding a second defect.
+>
+> **Cross-reference, load-bearing for scheduling: TUI-055** (the indicator never renders). The
+> in-tree citations at `app.rs:4615-4639` and `app.rs:6044` are accurate **as source** but describe a
+> band that never reaches the screen. **`SESS-040`'s Fix landing alone still leaves the user with an
+> unlabelled blank screen**, so the two must be scheduled together. See also **TUI-054**: the end of
+> a compaction is announced as `compaction complete` even when it was aborted or failed.
 
 **cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:4615-4639` handles `AgentSessionEvent::CompactionStart` by setting `IndicatorKind::Compaction` and nothing else — there is no `defaultEditor.onEscape` equivalent installed — while the comment at `:4624` states "The ` (<key> to cancel)` suffix is appended by the band from the live keymap", and the band at `app.rs:6044` duly renders `(${keyText("app.interrupt")} to cancel)`. `Action::Interrupt` (`app.rs:1886-1913`) checks `branch_summary_in_flight`, then bash, then streaming; its `AppAction::Interrupt` arm (`app.rs:6585-6593`) calls only `session.abort()` + `session.abort_bash()`. `rg -n AbortCompaction crates/` returns exactly two lines — the enum variant at `command.rs:32` and its handler at `command.rs:116-118` — i.e. **no caller anywhere**; `rg -n abort_compaction crates/` finds no production caller of `AgentSession::abort_compaction` (`cyrup-session-svc/src/session.rs:1677-1681`) either, only two tests.
 
 **upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3074-3085` (v0.83.0): `case "compaction_start": … this.autoCompactionEscapeHandler = this.defaultEditor.onEscape; this.defaultEditor.onEscape = () => { this.session.abortCompaction(); }; this.showStatusIndicator(new CompactionStatusIndicator(…))`, restored in `case "compaction_end"` at `:3088-3095`. The rebind is installed on **every** compaction_start, manual and auto alike.
 
-**Impact** — During `/compact` or an auto-compaction, cyrup shows a cancel key that does nothing. The user presses Escape, the indicator keeps spinning, the provider call runs to completion and bills, and `append_compaction` mutates the session file regardless. This is SESS-023's exact shape one event handler away — a whole user-facing affordance dead in the shipped binary — which is why it carries the same severity. It is also the reason SESS-041 and SESS-042 were invisible: with no caller, neither downstream defect could ever fire.
+**Impact** — *(Rewritten 2026-08-13 from a live measurement; the previous text is preserved at the end of this paragraph.)* During `/compact` or an auto-compaction, **cyrup shows nothing at all**: for the full ~10–18 s the status band is empty — no spinner, no "Compacting context...", and therefore no `(esc to cancel)` suffix either. Escape is inert, the provider call runs to completion and bills, and `append_compaction` mutates the session file regardless. The user is given neither a way to cancel nor any indication that anything is happening. *Previous text, retained so the correction is auditable: "cyrup shows a cancel key that does nothing. The user presses Escape, the indicator keeps spinning, the provider call runs to completion and bills."* This is SESS-023's exact shape one event handler away — a whole user-facing affordance dead in the shipped binary — which is why it carries the same severity. It is also the reason SESS-041 and SESS-042 were invisible: with no caller, neither downstream defect could ever fire.
 
 **Fix** — In `app.rs:4615-4639`, on `CompactionStart` save and replace the default-editor Escape handler with one dispatching `AppAction::AbortCompaction`, and restore it in the `CompactionEnd` arm; route that action to `AgentSession::abort_compaction()` via `command.rs:116-118`. Alternatively extend `Action::Interrupt` (`app.rs:1886-1913`) with a compaction branch ahead of the streaming branch, mirroring the existing `branch_summary_in_flight` check. Land with SESS-041, or the auto case still will not cancel.
 
-**Verify** — Drive the TUI event loop through a `CompactionStart`, deliver Escape, and assert `abort_compaction` was invoked and no compaction entry was appended; assert `rg -n AbortCompaction crates/` shows a production dispatch site.
+**Verify** — Drive the TUI event loop through a `CompactionStart`, deliver Escape, and assert `abort_compaction` was invoked and no compaction entry was appended; assert `rg -n AbortCompaction crates/` shows a production dispatch site. **Added 2026-08-13:** additionally assert that the status band **actually renders** `Compacting context... (esc to cancel)` for the duration of the compaction — today it renders nothing, so an `abort_compaction`-only assertion would pass while the user still sees a blank screen (**TUI-055**). Per the standing rule this needs a live terminal run, not TestBackend alone.
 
 ## SESS-007 — A session file whose first physical line is blank fails to open
 

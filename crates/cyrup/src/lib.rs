@@ -44,7 +44,7 @@ pub use diagnostics::{
     Diagnostic, DiagnosticLevel, EXTENSION_LOAD_FAILURE_HINT, apply_arg_leniency,
     format_no_models_available_message, get_provider_login_help,
 };
-pub use input::{Inputs, build_inputs, compose_inputs, split_positionals};
+pub use input::{Inputs, build_inputs, compose_inputs, read_piped_stdin, split_positionals};
 pub use output_guard::{
     emit_stray, emit_stray_line, is_stdout_taken_over, restore_stdout, take_over_stdout,
 };

@@ -1561,19 +1561,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let hook_path = dir.path().join("hang.sh");
+        // `$WARMUP` short-circuits before the pid is published — see the warm-up exec below.
         std::fs::write(
             &hook_path,
             format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 300\n",
+                "#!/bin/sh\n[ -n \"$WARMUP\" ] && exit 0\necho $$ > '{}'\nexec sleep 300\n",
                 pid_file.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        // Pay macOS's first-exec cost BEFORE the clock starts, so the timed run does not race it.
+        //
+        // macOS charges a one-off verification cost on the first `exec` of a freshly written
+        // executable whose exact content it has not seen, and `tempfile::tempdir()` randomizes the
+        // path that this script embeds in its own body — so the content is unique on EVERY run and
+        // the cost is paid on EVERY run. Measured here: 197-242ms to reach line 2 for unique
+        // content (6/6 runs) versus ~0.15-0.23ms once the identical content has been seen. That is
+        // why the original `timeout_ms: 200` could never pass — the SIGTERM landed before
+        // `echo $$ > pid` ran, so the test failed in its own precondition helper rather than on its
+        // actual claim — and why simply raising the budget was not enough either: at 3000ms it
+        // still lost under the full suite's parallel load.
+        //
+        // Warming the cache with the SAME file removes the dominant term instead of guessing a
+        // number, leaving only ordinary scheduling jitter for the budget to absorb.
+        let _ = std::process::Command::new(&hook_path)
+            .env("WARMUP", "1")
+            .status();
+
+        // The assertion's meaning is unchanged by the budget: the hook still `exec sleep 300`, so
+        // it still blows whatever budget it is given and the timeout arm still fires. The budget
+        // only has to be long enough for the hook to publish the pid that proves WHICH process was
+        // signalled.
         let hook = ResolvedWorktreeSetupHook {
             hook_path,
-            timeout_ms: 200,
+            timeout_ms: 3_000,
         };
         let input = WorktreeSetupHookInput {
             version: 1,

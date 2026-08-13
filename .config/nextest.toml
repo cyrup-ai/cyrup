@@ -1,0 +1,27 @@
+# cargo-nextest configuration — the workspace's DEADLOCK TRIPWIRE.
+#
+# Why this file exists at all: `cargo test` has no per-test timeout. A test that blocks forever
+# stops the batch forever and reports nothing, which is exactly what the suite did on 2026-08-12 —
+# a detached `__intercom-broker` grandchild inherited a harness pipe FD above 2 and never exited, so
+# `Command::output()`/`wait_with_output()` (which read to EOF, NOT to child exit) blocked in
+# `crates/cyrup/tests/piped_stdin_trim.rs` until the broker was killed by hand. A gate that can hang
+# indefinitely is not a gate. Under `cargo nextest run` the settings below turn any future deadlock
+# of that shape into a REPORTED FAILURE with a named test, instead of a silent stall.
+#
+# This is a tripwire, not a fix, and it hides nothing: a terminated test is a red, and the two
+# defects behind that particular hang are being closed at their source (the hermetic child env in
+# `crates/cyrup/tests/*.rs`, and FD inheritance in `cyrup-intercom`'s detached broker spawn).
+#
+# Scope note: nextest does NOT run doctests. If the gate ever moves here it must be BOTH
+# `cargo nextest run --workspace` and `cargo test --workspace --doc`; `cargo test --workspace`
+# alone remains the gate until someone validates a full-workspace nextest run.
+
+[profile.default]
+# Report a test as SLOW after 60s (the slowest target in the workspace today finishes in ~7s), and
+# kill it after 3 such periods — 180s — failing the run rather than hanging it. Deliberately far
+# above any legitimate test's runtime so this can only fire on a genuine stall.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Never silently absorb a crash/kill: a test that leaves no result must not be retried into green.
+# (Retries stay off on purpose — an intermittent red is a defect to diagnose, not to re-roll.)
+retries = 0

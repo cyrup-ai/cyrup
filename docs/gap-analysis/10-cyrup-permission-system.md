@@ -88,7 +88,8 @@ Closed this pass: **10**. Reopened: **0**. Newly filed: **7**.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| PERM-009 | **critical** | parity-bug | S | `should_expose_tool` keeps `bash` advertised despite a tool-level deny — **and the allow-listed command executes** |
+| PERM-009 | **critical** | parity-bug | S | `should_expose_tool` keeps `bash` advertised despite a tool-level deny — **and the allow-listed command executes** — **observed 2026-08-13, reproduced in the shipped binary** |
+| PERM-032 | low | *unclassified — lead* | M | A permission-**denied** tool result breaks the next provider request on `together/openai/gpt-oss-20b` (3/3), while two other models handle it fine — **new, observed 2026-08-13, low confidence** |
 | PERM-023 | high | cyrup-original | S | Install probe ignores agent-scoped `permission:` frontmatter the manager enforces — the gate never attaches |
 | PERM-007 | medium | not-ported | M | `/permission-system` renders text where upstream opens a live settings overlay |
 | PERM-008 | medium | not-ported | M | The forwarding path writes no audit entries — 8 review + 3 debug sites unported |
@@ -112,7 +113,25 @@ Closed this pass: **10**. Reopened: **0**. Newly filed: **7**.
 
 ## PERM-009 — `should_expose_tool` keeps `bash` advertised despite a tool-level deny, and the allow-listed command then executes
 
-**Kind** parity-bug · **Severity** **critical** *(raised from medium in the repair pass)* · **Effort** S · **Confidence** confirmed — both sides re-read at both upstream tags
+**Kind** parity-bug · **Severity** **critical** *(raised from medium in the repair pass)* · **Effort** S · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Reproduced 2026-08-13. This is a live, end-to-end permission bypass in the shipped binary, not a
+> code-shape concern.** Scratch `HOME`, a fresh git repo, and a canary file
+> (`PERM009_CANARY_9f3a.txt`) created seconds before the run so no model could hallucinate it.
+>
+> * **Control** — `{"tools": {"bash": "deny"}}` alone: the bash tool is not advertised, the model
+>   says outright "We cannot run shell commands", and **nothing executes**.
+> * **Bypass** — the same file plus a single narrower rule, `"bash": {"git status": "allow"}`: the
+>   model is handed the bash tool and runs the command **for real**. The returned output contains
+>   `PERM009_CANARY_9f3a.txt` and `No commits yet` — genuine `git(1)` output from that specific repo.
+> * **Scope** — a command *not* on the allow list (`whoami`) is still refused, so the bypass grants
+>   exactly the allow-listed command: precisely the mechanism predicted below.
+>
+> Model: Together `openai/gpt-oss-20b`. The item's own Verify ("assert `bash` is absent from the
+> exposed tool set **and** that a `git status` call is not executed") **fails on both halves today**.
+> No factual correction was needed anywhere in the item; the Impact's "`git status` **executes**" is
+> now a first-hand observation rather than a prediction. `critical` is correct and, if anything,
+> understated.
 
 > **Why critical.** `README.md:106-107` defines `critical` as data loss, silent wrong output, **a
 > permission bypass**, or a crash on a normal path. This is a permission bypass on a configured
@@ -420,6 +439,42 @@ Neither tag has a bash branch. So cyrup's branch is an **in-baseline parity bug,
 **Fix** — Thread the live `has_ui` state into the watcher task the same way PERM-005 threaded `SharedExtensionConfig` (`forwarding.rs:732`) — a shared flag updated by the event arms — and open `process_forwarded_requests` (`forwarding.rs:528-545`) with an early return when it is false, mirroring `index.ts:1113-1116`. Requests then remain on disk for the child's own bound to expire, which is pi's behaviour.
 
 **Verify** — Start a watcher with `has_ui: true`, spool a child request, flip `has_ui` to false without dispatching any hook, and assert that after several poll intervals no response artifact exists and the request is still on disk; flip it back and assert the request is then serviced.
+
+## PERM-032 — A permission-denied tool result breaks the next provider request on `together/openai/gpt-oss-20b`
+
+**Kind** *unclassified — lead* · **Severity** low · **Effort** M · **Confidence** **low — reproduced 3/3 against one model, but not isolated to cyrup; may be a provider-side format issue** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Filed as a lead, at low confidence, deliberately.** It is filed rather than dropped because the
+> controls below rule out the obvious innocent explanations, and because the failure is on the
+> permission system's own `Block` path — but the kind is left **unclassified** because the decisive
+> experiment (dumping the serialized request body on the block path and comparing it to the
+> tool-error path) was not run. **Do not schedule work from this item until that experiment is
+> run.**
+
+**cyrup** — Suspected but **not confirmed**: the `HookOutcome::Block` path at `crates/cyrup-permission-system/src/extension.rs:1546-1549` and the agent's block handler downstream of it, i.e. the shape of the message cyrup synthesises to represent a denied tool call. No citation is offered as evidence here; the item rests on the behavioural controls below.
+
+**upstream** — Not read for this item. pi's denial-result message shape must be compared against cyrup's as the first step of the investigation.
+
+**Impact** — Reproducible **3/3** on `--provider together --model openai/gpt-oss-20b`: whenever the permission gate **blocks** a tool call, the follow-up request fails with
+
+```
+http 400: {"error":{"message":"Input validation error","type":"invalid_request_error"}}
+```
+
+Three controls, all on the same fixture, isolate it as far as it was taken:
+
+| variation | result |
+|---|---|
+| same model, same config, same prompt, command **allowed** | turn completes normally |
+| same model, ordinary tool **error** (read of a nonexistent file) | completes normally — *"The read attempt failed – the file /nonexistent/zzz.txt does not exist…"* |
+| same **denied** call on `openai/gpt-oss-120b` | handled fine — *"I'm unable to run that command due to policy restrictions."* |
+| same **denied** call on `Qwen/Qwen3.5-9B` | handled fine |
+
+So the denial-result message shape is accepted by two models and rejected by a third, and it is the *denial* specifically — not tool failure in general — that triggers it. That is suggestive of a serialization defect on the block path rather than a pure provider quirk, but it is equally consistent with a Together-side gpt-oss-20b harmony-format constraint. User-visible effect where it bites: a denied tool call ends the turn with a raw HTTP 400 instead of the model explaining the refusal.
+
+**Fix** — **Investigate before fixing.** (1) Capture the serialized request body for the turn following a block, and diff it against the body following an ordinary tool error on the same model. (2) Read pi's denial-result construction at v0.83.0 and compare field for field. (3) If cyrup's shape diverges, this becomes a `parity-bug` and the fix is to match pi; if it does not, close the item as a provider constraint and record the negative result so nobody re-derives it.
+
+**Verify** — Once classified: a test asserting the request body cyrup emits after a `HookOutcome::Block` matches pi's shape field for field, plus a live run on `together/openai/gpt-oss-20b` where a denied `bash` call is answered by the model rather than by an HTTP 400.
 
 ## Coverage
 

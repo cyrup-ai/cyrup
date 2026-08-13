@@ -88,13 +88,15 @@ This area covers `crates/cyrup-intercom` — the Unix-socket supervisor↔subage
 | ICOM-048 | **new**, open · medium | Injected content omits v0.9.2's `_deliveryMetadata_` line, so the model never sees the inbound message id. |
 | ICOM-049 | **new**, open · low | Inbound delivery and flush carry no runtime-generation / liveness guard. |
 | ICOM-050 | **new**, open · low | `intercom_received` audit entry drops `messageId` and `attachments` and re-timestamps. |
+| ICOM-051 | **new**, **closed** (fixed) · high | Ambient `CYRUP_INTERCOM` satisfied `is_installed()` in four hermetic binary-seam fixtures; 13 immortal brokers per `-p cyrup` run, now 0. Carries the refutation of the proposed `CLOEXEC` code defect. |
 
-Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICOM-027…ICOM-050). Reopened: **0**.
+Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICOM-027…ICOM-050). Reopened: **0**. Filed by the later suite-verification pass: **1** (ICOM-051, closed on arrival).
 
 ## Open items
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
+| ICOM-052 | low | cyrup-original | S | The broker socket path has no `SUN_LEN` guard, so a long agent-dir path degrades intercom permanently with only a WARN that names neither cause nor path — **new, observed 2026-08-13** |
 | ICOM-004 | medium | not-ported | S | `skills/pi-intercom/SKILL.md` not ported |
 | ICOM-006 | medium | not-ported | M | No name poll; presence name fixed at registration |
 | ICOM-008 | medium | parity-bug | S | `ask` silently drops `replyTo` |
@@ -773,6 +775,61 @@ This is a **baseline** gap at the crate's own targeted tag (v0.9.2), not v0.9.3+
 **Fix** — At `tools/intercom.rs:189-196` add `"messageId": reply_message.id`, add `"attachments"` inside the `message` object, and use the reply message's own timestamp instead of `now_ms()`.
 
 **Verify** — Integration test: A asks B, B replies with an attachment; assert A's `intercom_received` entry carries the reply's message id, its attachment list, and the sender's timestamp rather than the receipt time.
+
+---
+
+## ICOM-051 — An ambient `CYRUP_INTERCOM` opted every hermetic binary-seam test into intercom, leaving an immortal broker per test process
+
+**Kind** test-defect · **Severity** high · **Effort** S · **Confidence** confirmed · **Status** fixed this pass
+
+**cyrup** — `is_installed()` (`crates/cyrup-intercom/src/extension.rs:630-631`) is `env_truthy(INSTALL_ENV_VAR) || config_path(intercom_dir).exists()`, with the var named at `:87` (`CYRUP_INTERCOM`). The four `crates/cyrup/tests/*.rs` fixtures that exercise the real binary — `one_shot_parity.rs`, `piped_stdin_trim.rs`, `unknown_flag_exit.rs`, `extension_load_failure_exit.rs` — scrubbed provider keys and proxies from the child environment and declared themselves hermetic, but did not scrub the three built-in opt-ins. On any machine that exports `CYRUP_INTERCOM=1` (this one does) every child therefore attached intercom and spawned a broker, and a broker that no session ever registered with never reaches `schedule_shutdown_check` (`broker/mod.rs:1005-1027`) and so never exits. Measured A/B on the four targets with the ambient vars still exported: **13 surviving `cyrup __intercom-broker` processes** with the fixtures at HEAD, **0** with the scrub. Two full `cargo test --workspace --no-fail-fast` runs after the fix ended with 0.
+
+**upstream** — the broker's immortality is correct parity and must NOT be "fixed" with a startup idle-exit: `pi-intercom` v0.10.1 `broker/broker.ts:221`/`:429` reach `scheduleShutdownCheck()` only from a *registered* session's teardown, exactly as `broker/mod.rs:1005-1027` does. What pi does not have is the ambient attachment: `pi` v0.83.0 `packages/coding-agent/src/core/resource-loader.ts:451-452` (`const extensionPaths = this.noExtensions ? cliEnabledExtensions : this.mergePaths(...)`) means an upstream `--no-extensions` run loads only explicit `-e` paths, and pi-intercom is an ordinary discovered extension — so the equivalent pi run has no intercom and no broker at all.
+
+**Impact** — This was the mechanism behind two of the three symptoms the suite showed: the orphaned-broker count after a full run, and the `one_shot_parity` stall (`wait_with_output()`/`output()` read to EOF, not to child exit, so any surviving grandchild in the pipe group can hold the harness open indefinitely — a target that finishes 4/4 in 4.19 s alone was reported "running for over 60 seconds" in the full run). It also silently widened the extension set of `extension_load_failure_exit.rs`, whose entire contract is that the set is the one it *plants*.
+
+**Fix** — *applied.* `.env_remove("CYRUP_INTERCOM") / ("CYRUP_SUBAGENTS") / ("CYRUP_PERMISSION_SYSTEM")` in the shared child-command builder of each of the four fixtures, beside the existing key/proxy scrub. No assertion was touched. In-repo precedent for the stronger form is `crates/cyrup/tests/auth_credential_print.rs`, which already uses `env_clear` + an allowlist.
+
+**Verify** — done. All 16 tests across the four targets green; `ps -axo pid,command | grep -cE '[/]cyrup __intercom-broker'` returns 0 immediately after and 12 s later (past the 5 s shutdown window). **Measurement note, because it corrupted the original figure:** `pgrep -f '__intercom-broker'` matches *its own* pattern inside other shells' command lines and over-counts — the "22 orphaned brokers" in the original report is not trustworthy. Use `ps -axo pid,command | grep -cE '[/]cyrup __intercom-broker'`.
+
+**Investigated and refuted — do not re-file as a code defect.** A prior diagnosis proposed that `spawn_detached_broker` (`crates/cyrup-intercom/src/transport/spawn.rs:137-172`) leaks non-`CLOEXEC` descriptors into the broker, and prescribed a `pre_exec` FD sweep. That is wrong on three independent counts: (a) the function already sets `Stdio::null()` on 0/1/2 (`:147-149`), so it cannot hold a harness pipe through stdio; (b) Rust std on macOS spawns via `posix_spawn` and marks its own pipes `FD_CLOEXEC`, and a controlled experiment — 40 detached children spawned while 8 threads hammered `Command::output()` — found **0** inherited stray PIPE fds (the earlier apparent confirmation used a descriptor created raw with `libc::pipe`, proving only that a deliberately-non-`CLOEXEC` fd is inherited); (c) the crate is `#![forbid(unsafe_code)]` (`crates/cyrup-intercom/src/lib.rs:14`), a deliberate policy the prescribed patch does not compile against. Anyone reopening this needs a fresh reproduction *and* sign-off to relax that policy. The product-side residue is not here at all — it is `SEAM-071` (area 08): `--no-extensions` does not gate native built-ins.
+
+---
+
+## ICOM-052 — The broker socket path has no `SUN_LEN` guard, so a long agent-dir path silently and permanently degrades intercom
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** **confirmed — reproduced first-hand, and pi's spawn read at v0.9.2** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **Read the upstream note before rating this.** pi has the **same shape** — `broker/spawn.ts` also
+> spawns with `stdio: "ignore"` and `broker/paths.ts:65-74` builds the socket path with no length
+> check — so this is **not** a parity bug and must not be filed as one. It is a robustness gap cyrup
+> shares with upstream, filed because it was *measured here* and because the diagnostic half is
+> cheap and entirely cyrup's to fix.
+
+**cyrup** — `crates/cyrup-intercom/src/paths.rs:81-85` `broker_socket_path` is `intercom_dir.join("broker.sock")` with **no length validation**, and `crates/cyrup-intercom/src/broker/mod.rs:1243` binds it with `UnixListener::bind(&socket_path)?`. On macOS `sockaddr_un.sun_path` is 104 bytes, so a sufficiently deep `HOME`/`CYRUP_AGENT_DIR` makes the bind fail. The parent cannot see why: `crates/cyrup-intercom/src/transport/spawn.rs:147-149` sets `Stdio::null()` on all three descriptors, so the child's error text is discarded, and `:189-194` synthesises the parent-visible message from the exit status alone.
+
+**upstream** — `pi-intercom` v0.9.2, read this pass: `broker/spawn.ts:168`/`:175` spawn with `stdio: "ignore"`, and `:229`/`:232` reject with `Intercom broker exited before startup with signal/code …` — the identical shape, including the identical loss of the child's reason. `broker/paths.ts:65-74` `getBrokerSocketPath` has no length guard either. Cyrup's port is faithful; both fail the same way.
+
+**Impact** — Every cyrup invocation in a scratch `HOME` during this exercise logged:
+
+```
+WARN cyrup_intercom::extension: intercom: startup connect failed; scheduling reconnect
+  error=intercom broker error: intercom broker exited before startup with code 1
+```
+
+Running the broker subcommand directly gives the real reason, which the parent **never** surfaces:
+
+```
+$ HOME=<long path> CYRUP_AGENT_DIR=<long path>/.cyrup ./target/debug/cyrup __intercom-broker
+__intercom-broker: path must be shorter than SUN_LEN
+EXIT=1
+```
+
+With a short `HOME` the broker starts and stays up, so this is path-length dependent rather than universal. But the failure is **permanent for the session** and the only user-visible trace is a WARN whose text names neither the cause nor the path — so anyone with a deep home or project path silently loses intercom, and subagent messaging with it, having been told only that something exited with code 1. Note the diagnostic gap is broader than this one cause: **every** broker startup failure is reported as "code 1", so a config error, a permissions error and this are indistinguishable.
+
+**Fix** — Two independent halves; the second is worth doing regardless of the first. **(a)** Guard the path: in `broker_socket_path` (`paths.rs:81-85`), check the byte length against the platform's `sun_path` limit (104 on macOS, 108 on Linux) and fall back to a short hashed path under `std::env::temp_dir()` when it would overflow, as other Unix daemons do. **(b)** Surface the reason: capture the child's stderr on the startup path (`spawn.rs:147-149` currently nulls it) — pipe it, read it with a bounded timeout, and fold the text into the `IntercomError::Broker` message at `:189-194`, so *any* broker startup failure names itself. (b) is a strict improvement over upstream and is where the value is; take (a) only if the fallback path is acceptable to the design.
+
+**Verify** — Construct an agent dir whose `intercom/broker.sock` exceeds 104 bytes and assert the broker either binds successfully via the fallback (fix a) or that the parent's error message contains `SUN_LEN` and the offending path (fix b). Then assert the short-path case is unchanged and the broker still shuts down cleanly, per the harness check recorded above.
 
 ---
 
