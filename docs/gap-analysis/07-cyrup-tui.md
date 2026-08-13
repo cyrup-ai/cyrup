@@ -1,351 +1,679 @@
 # 07 — cyrup-tui
 
-This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, editor, footer, selectors, themes, images, keymap, autocomplete, startup panel) plus the TUI wiring in `cyrup/crates/cyrup/src/main.rs`. It is measured against `pi/packages/tui/` (rendering primitives) and `pi/packages/coding-agent/src/modes/interactive/` (components and `interactive-mode.ts`) at pi v0.83.0. Headline finding: commit `d2c5509` (TUI-002..007) landed a large amount of real, correctly-ported behavior — thinking rendering, session replay, terminal theme probes, Escape queue restore, the startup panel and tool-result images — but every one of those six items shipped with residue, one of them (TUI-006) with residue large enough that its previous `closed` verdict is **overturned**, and the tool-result-image work is missing the capability gate its own commit message claims. Re-baselined against HEAD `1806375` on 2026-08-03 by reading both sides of every claim; no cargo, no npm.
+This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, editor, footer, selectors, themes, images, keymap, autocomplete, startup panel, terminal negotiation) plus the TUI wiring in `cyrup/crates/cyrup/src/main.rs`. It is measured against `pi/packages/tui/` (rendering primitives and terminal control) and `pi/packages/coding-agent/src/modes/interactive/` (components and `interactive-mode.ts`).
 
-## Status since the c8bd2ab baseline
+> **Re-audited 2026-08-12, cyrup HEAD `04c1ba2` (last code commit; working tree clean at `a9000b1`, docs-only), against pi `v0.84.1`.**
+>
+> The version-lag items in this file were measured against pi **`v0.84.1`**, with pi **`v0.83.0`** — the tag cyrup was ported from — read directly wherever a finding had to be classified `not-ported` (absent at the baseline too) versus `upstream-drift` (landed in the `v0.83.0..v0.84.1` window: 627 files, +52291/−17556). Every `closed` verdict below was reached by reading the Rust at HEAD **and** the TypeScript at the tag; no closure rests on a commit message.
+>
+> **This pass: 13 items closed · 2 auditor closures overturned · 1 closure re-framed · 15 items newly filed · then a repair pass adding 10 more · 56 items now open (3 critical, 1 high, 26 medium, 26 low).**
+>
+> ### Repair pass 2026-08-12 (post-critique)
+>
+> Applied after the completeness critique of the twelve finished area files. Four changes; no item was
+> renumbered, merged or deleted.
+>
+> 1. **TUI-027 raised `high` → `critical`** (critique finding 3). Re-verified both ends at HEAD before
+>    raising: the `/tree` inline label editor's confirm arm returns
+>    `SelectorOutcome::Apply(format!("{entry_id}{FIELD_SEP}{label}"))` (`tree_selector.rs:540-546`),
+>    and the chrome persists that payload through the **live** session path —
+>    `app.rs:3767` `session.services().host_services.set_label(&entry_id, &label)` →
+>    `manager.append_label`, the same path a loaded extension's `setLabel` uses (`app.rs:3763-3767`).
+>    So the characters a pi user types expecting a text search are written into the session JSONL as
+>    that entry's label. That is corruption of persisted user data, which README:106-107 classes as
+>    critical without qualification.
+> 2. **TUI-019 re-rated `low` → `medium`, and its ADR-0001 justification struck** (critique finding
+>    13). See the item and `## Open questions — decisions required`.
+> 3. **Status rows added for TUI-027…TUI-041** (critique finding 17b), replacing the collapsed
+>    `new this pass` row that hid fifteen items from a table the README requires to cover every item
+>    from every pass.
+> 4. **A `packages/tui/src` input-pipeline sweep was run and absorbed as TUI-042…TUI-051** — nine
+>    findings off six upstream files (`stdin-buffer.ts`, `editor-component.ts`, `terminal-colors.ts`,
+>    `undo-stack.ts`, `word-navigation.ts`, `fuzzy.ts`) that **no file in this directory had ever
+>    named**, plus one `/reload` finding routed here from the migrations sweep. Two are critical and
+>    both are silent data loss in the prompt editor. This is precisely README structural blind spot 2
+>    — `stdin-buffer.ts` is 434 lines that draw nothing, and blind spot 2 exists to catch exactly that
+>    class. See `## Coverage` §Surface-driven sweep.
+>
+> **Baseline shift this file did not previously reflect.** The prior revision was written against cyrup `1806375`/`9219dcd`. Since then `crates/cyrup-tui` took 103 files / +38,826 / −2,362 across ten `fix(tui): batch N` commits (`0aaca00` … `922d90c`) plus `023c778` and `eed28c9`. Fifteen files in `crates/cyrup-tui/src/` did not exist at the old baseline: `panic_hook.rs`, `drain.rs`, `terminal_progress.rs`, `terminal_title.rs`, `tmux.rs`, `keyboard_protocol.rs`, `footer_data.rs`, `resume_hint.rs`, `stray_reply.rs`, `oauth_selector.rs`, `login_dialog.rs`, `user_message_selector.rs`, `native_modifiers.rs`, `markdown/latex.rs`, `component.rs`. Nine of the eleven `-S` surface-sweep items and four main-table items closed as a direct result.
+>
+> **Closed this pass** — TUI-022, TUI-023, TUI-024, TUI-026, TUI-S01 (as framed), TUI-S03, TUI-S04, TUI-S05, TUI-S06, TUI-S07, TUI-S08, TUI-S09, TUI-S11.
+>
+> **Auditor closures overturned** — **TUI-020** (`closed` → partially-closed): cyrup emits OSC-8 *nowhere*; `markdown.rs:133-141` documents the omission in its own words, and `image_fallback_text` still pushes a bare filename. **TUI-S02** (`closed` → partially-closed): the `uncaughtCrash` half landed as `panic_hook.rs`, but pi's second mechanism — `DEAD_TERMINAL_ERROR_CODES` → `emergencyTerminalExit` — has no counterpart. **TUI-S01** was re-framed rather than overturned: its sink now exists, so it is closed as framed and carried only as a pointer to TUI-014 and TUI-033, which own the three variants that remain unrendered.
+>
+> **Newly filed** — TUI-027 … TUI-041 in the main pass, TUI-042 … TUI-051 in the repair pass. Three are `critical`: TUI-027 (`/tree` has no search, its action keys are the characters pi types into that search, and the resulting label edit is **persisted to the session JSONL**), TUI-042 (the undo snapshot omits the paste registry, so undoing a delete over a paste marker silently sends the literal marker text to the model instead of the pasted content) and TUI-043 (Ctrl+W after a large paste orphans the marker and drops the paste). One is `high`: TUI-031 (a prompt typed during compaction is dispatched immediately, against a context the compaction is mid-rewrite of).
+>
+> **Structural note carried forward.** `cyrup/TUI-FIDELITY.md` (464 lines, ~150 presentation findings against v0.84.1) holds no stable IDs and no status table, so nothing in it reaches `00-residual-ledger.md`. That is not a hypothetical: TUI-FIDELITY's C14 recommendation to delete the `{n} queued` footer segment was applied, which is precisely what turned TUI-016 from "wrong surface" into "no surface at all". Merging that backlog into this file with real IDs remains the highest-value follow-up for this area.
 
-| ID | Status | Note |
+## Status of every item from prior analyses
+
+| ID | Status | Evidence |
 |---|---|---|
-| TUI-001 | **closed** | `6396841`. `stop_reason_notice()` (`cyrup/crates/cyrup-tui/src/app.rs:2886-2912`) matches `pi/packages/coding-agent/src/modes/interactive/components/assistant-message.ts:170-201` branch-for-branch, including pi's `length`-before-`hasToolCalls` asymmetry (`:175`). Wired on the live arm (`app.rs:2867`) **and** the replay walk (`app.rs:800-802`) — both checked, not assumed. Test `cyrup/crates/cyrup-tui/tests/stop_reason.rs:60-87` drives the real `App::ingest_event` seam. |
-| TUI-002 | partially closed — **open** | `d2c5509`. `Entry::Thinking`, `thinkingText` role, hidden label, `set_hide_thinking_block` all real. Three residues remain: block-ordering fold, no markdown rendering, no `hasVisibleContentAfter` spacer. |
-| TUI-003 | partially closed — **open** | `d2c5509`. `App::replay_session` (`app.rs:759-863`) is a faithful walk over `raw_context_messages()` with tool-call-id pairing. Residues: no `Session compacted N time(s)` status, no trust warning (now TUI-N04), async custom renderers unavailable on a sync walk, scrollback stacking (now TUI-N07). |
-| TUI-004 | partially closed — **open** | `d2c5509`. `terminal_query.rs` (OSC 11 + DSR ?996 + DA1 sentinel) and `ThemeController::sync_with_terminal` are faithful. Residues: no live mode-2031 colour-scheme sync (documented, defensible); `/reload` never re-runs `applyFromSettings`/`setRegisteredThemes`. |
-| TUI-005 | partially closed — **open** | `d2c5509`. `InterruptRestoreQueued` + `restore_queued_to_editor` match `restoreQueuedMessagesToEditor({abort:true})`. Residues: pi's bash-**mode** Escape branch missing; cyrup cancels a bash child even while streaming where pi's `else if` chain does not. |
-| TUI-006 | **OVERTURNED** `closed` → partially closed — **open** | `d2c5509` built the panel and the quiet-startup diagnostics gating correctly, but `[Extension issues]` is 1 of pi's 4 sources. Command conflicts, built-in shadowing and shortcut conflicts remain exactly as invisible as when the item was filed. |
-| TUI-007 | **closed** (with cross-reference) | `d2c5509`. The literal `[image]` placeholder is gone (grepped: zero hits) and images render. **Do not read this closure as tool-result-image parity** — the commit message's claimed capability fallback does not exist in the code; filed as TUI-N01. |
-| TUI-008 | open | Seven unbound keybinding ids; refs re-checked at HEAD. `app.thinking.toggle` downgraded to S — its destination now exists. |
-| TUI-009 | open | Unchanged; refs re-checked. |
-| TUI-010 | open | Unchanged; refs re-checked. `d2c5509` added two more commit-time-frozen entry kinds to the same family. |
-| TUI-011 | open | Unchanged; refs re-checked. |
-| TUI-012 | open | Unchanged; refs re-checked. |
-| TUI-013 | open | Unchanged; refs re-checked. |
-| TUI-014 | open | Unchanged; refs re-checked. `1d87913` made dialogs and custom/tool renderers live, leaving widgets the last unrendered `ui.*` surface. |
-| TUI-015 | open | Unchanged; refs re-checked. `d2c5509` raised the per-draw cost (thinking re-layout, image re-rasterization per token). |
-| TUI-016 | open | Unchanged; refs re-checked. TUI-005 raised its value — Escape now performs the action pi's missing hint line advertises. |
-| TUI-017 | partially closed — **open** | `d2c5509` ported `image_fallback_text` and gave `imageWidthCells` a reader on the tool-result path only. The attachment strip is untouched: every site re-read. |
-| TUI-018 | open | Unchanged; refs re-checked. |
-| TUI-019 | open | Unchanged; refs re-checked. |
-| TUI-020 | open | Unchanged; refs re-checked. |
-| TUI-021 | open | Unchanged; refs re-checked. |
-| TUI-022 | open | Unchanged; refs re-checked. Two in-repo precedents for the direct-fd write now exist. |
-| TUI-023 | open | Unchanged; refs re-checked. `ace01cb`'s summarization-retry arm has the identical frozen-delay shape. |
-| TUI-024 | open | Unchanged; refs re-checked. |
-| TUI-025 | open | Unchanged; refs re-checked. |
-| TUI-026 | open | Unchanged; refs re-checked. Documented cyrup-original — do not change without asking. |
+| TUI-001 | **closed** | Adversarially re-read at v0.84.1 (`assistant-message.ts` moved 45 lines in the drift window). `crates/cyrup-tui/src/app.rs:4948-4985` `stop_reason_notice` matches `pi/packages/coding-agent/src/modes/interactive/components/assistant-message.ts:172-195` branch-for-branch: `Length` returns *before* the `has_tool_calls` early-return (the same asymmetry as `:177`), `Aborted` special-cases `"Request was aborted"` (`app.rs:4960` vs `:180-183`), `Error` maps `Error: {m|Unknown error}`, and Pending/Deferred/Stop/ToolUse fall through — `"deferred"` appears nowhere in pi's file either. Wired on the live arm (`app.rs:4899`) and the replay walk. Closure holds. |
+| TUI-002 | **partially-closed** — open | Markdown half landed: `crates/cyrup-tui/src/transcript.rs:1232` now routes `thinking_lines` through `crate::markdown::render_with_default_style(body, width.max(1), theme, style.fg, true)`, matching `assistant-message.ts:144-162`. Fold-ordering and the `hasVisibleContentAfter` spacer are still absent — see the item. |
+| TUI-003 | still-open | `rg 'Session compacted\|compaction_count' crates/ -g '*.rs'` → zero hits at HEAD. pi still emits it at `interactive-mode.ts:3706`. The swap arm (`app.rs:6981-6989`) replays and pushes no compaction status. |
+| TUI-004 | still-open | Both halves re-verified. mode 2031: `rg 2031 crates/` hits only the rationale prose at `theme.rs:1483-1485`; pi writes it at `packages/tui/src/tui.ts:701, :731, :749`. `/reload`: `rg 'apply_from_settings\|set_registered_themes' crates/` → zero; pi calls `setRegisteredThemes(...)` then `await themeController.applyFromSettings()` at `interactive-mode.ts:5734-5735`. |
+| TUI-005 | still-open | Worse than filed — `Action::Interrupt` (`app.rs:1886-1913`) cancels a running bash block in a plain `if`, not an `else if`. See the item. |
+| TUI-006 | still-open | One half landed since the baseline: extension **tool** and **flag** conflicts are now recorded (`crates/cyrup-ext/src/registry.rs:222, :604`) and folded into `LoadExtensionsResult::errors`. Slash-command conflicts, built-in shadowing and shortcut conflicts remain invisible; `rg 'command_diagnostics\|shortcut_diagnostics\|builtin_conflicts' crates/ -g '*.rs'` → zero. |
+| TUI-007 | **closed** (with cross-reference) | The literal `[image]` placeholder is still absent and tool-result images render (`transcript.rs:1270-1295`). **Do not read this closure as tool-result-image parity** — the capability gate its closing commit claimed still does not exist. See TUI-N01. |
+| TUI-008 | still-open | `keymap.rs:96-114` `Action::from_id` recognizes exactly 14 ids; the seven pi wires at `interactive-mode.ts:2804-2814` are absent. `app.session.toggleNamedFilter` is now handled, but only inside the session selector (`keymap.rs:801`). The `app.pageUp`/`app.pageDown` spelling complaint moved to TUI-028. |
+| TUI-009 | still-open | `rg 'last_escape' crates/ -g '*.rs'` → zero; `AppState` has no escape timestamp (contrast `last_sigint`) and `Action::Interrupt` has no empty-editor branch. The `doubleEscapeAction` settings row is still live at `app.rs:5719-5721`. |
+| TUI-010 | **partially-closed** — open | Committed tool blocks now honour the live expand flag (`transcript.rs:2769`, `ImageOpts::tools_expanded` documented at `:1317-1323`) and branch/compaction summaries render collapsed with an expand hint (`transcript.rs:2873, :2876-2891`). The Ctrl+O status echo is still missing. |
+| TUI-011 | still-open | `app.rs:1823-1826` is verbatim `"changelog" => { push_block("What's New", "No changelog entries found."); }`. pi really parses and renders (`interactive-mode.ts:102` imports, `:1178-1188` startup notice, `:6056-6057` the command). |
+| TUI-012 | still-open | `autocomplete.rs:28-36` `CompletionContext` is still `{Slash, Path, Mention}`; `has_arg_completion` (`commands.rs:44`) still has no reader. pi installs real argument completions at `interactive-mode.ts:648` and `:674`. |
+| TUI-013 | still-open | `autocomplete.rs:168` `PATH_DELIMS` and `:202` `before.rfind(PATH_DELIMS)` unchanged; no unclosed-quote scan in that file. **New for the fix:** cyrup already owns an unclosed-quote scanner at `crates/cyrup-tui/src/session_search.rs:149, :179, :183` (`had_unclosed_quote`) — an in-repo precedent the original item did not know about. |
+| TUI-014 | still-open | The host sink is now installed, so `UiEffect::SetWidget` *reaches* the TUI and is dropped into a field with no reader: `app.rs:3228`, declared `:390`, cleared `:1211`, only other references are two test assertions. |
+| TUI-015 | still-open | The run loop's event arm still ends in `self.draw_synchronized()?;` (`app.rs:6849-6875`); `rg 'MIN_RENDER\|needs_render\|request_render' crates/cyrup-tui/src` → zero. pi has `MIN_RENDER_INTERVAL_MS = 16` at `packages/tui/src/tui.ts:343`. |
+| TUI-016 | still-open — **regressed** | `QueueUpdate` still discards the texts (`app.rs:4612-4614`) **and** the fidelity work deleted the footer segment that displayed the count: `grep -n 'queued' crates/cyrup-tui/src/status.rs` now returns only the doc lines and the setter at `:149-150`, no render site. The queue is now entirely invisible. |
+| TUI-017 | still-open | `image.rs:102-106` still installs `Halfblocks` when `caps.images == None`; `:152-171` takes the placeholder branch only on `!show_images`/zero area/encode error; `:242-247` still emits the invented `🖼 {label} ({w}×{h})`; `app.rs:6085-6096` passes `area.width` with no cap. |
+| TUI-018 | **partially-closed** — open | pi's `compactOnboarding` and the standing `onboarding` line now exist (`chrome.rs:98-114`). The **logo/version** line and the whole expanded body are still absent — `chrome.rs:127-130` states outright that cyrup does not draw the logo part, so the app name and version appear nowhere in the UI. |
+| TUI-019 | still-open | Absent in cyrup, and the upstream side grew by an order of magnitude in the drift window (`tui-alt-screen.ts` +1047, `tui-main-screen.ts` +586, `scroll-view.ts`, `layout.ts`, `stack.ts`, the eight `tui.altScreen.*` ids at `packages/tui/src/keybindings.ts:43-50`, and the `tui-mode`/`fullscreen-scrollbar` settings rows at `settings-selector.ts:633-643`). Severity stays low as a deliberate ADR-0001 divergence; effort is now L+. |
+| TUI-020 | **OVERTURNED** `closed` → partially-closed | The auditor closed this on `markdown.rs:126/:142-148` passing a capability flag. The capability is now *consulted* — but nothing is *emitted*. `markdown.rs:133-141` says so in its own words, and the only `\x1b]8` bytes anywhere in `crates/cyrup-tui/src` are that comment plus two strip-ANSI fixtures. The image-fallback half is untouched. See the item. |
+| TUI-021 | still-open | `rg 'cache_miss\|CacheMiss\|showCacheMissNotices' crates/ -g '*.rs'` → one unrelated subagents test name. pi keeps the whole surface at v0.84.1: `settings-selector.ts:547` plus `interactive-mode.ts:3568, :3623, :3670, :4403, :4487-4488`. |
+| TUI-022 | **closed** | `crates/cyrup-tui/src/terminal_progress.rs` (363 lines) is a full port of `ProcessTerminal.setProgress`: module docs give the exact byte sequences (`\x1b]9;4;3\x07` / `\x1b]9;4;0\x07`) and the 1000 ms keepalive, and `:47` records that v0.83.0 spelled the clear sequence with a trailing `;` while v0.84.1 (pi `e8a17822d`) dropped it — cyrup tracks the **newer** form. Wiring re-checked live: `app.rs:4462/:4471/:4620/:4647` set it, `:886-909` flush/keepalive/shutdown, `:6140` flushes per frame, `:4074` makes the settings row live, `:6957-6958` re-reads on swap. Test `crates/cyrup-tui/tests/terminal_progress.rs`. |
+| TUI-023 | **closed** | `status_indicator.rs:149-157` `set_retry` stores `{attempt, max_attempts, initial_seconds}` plus a start `Instant`; `:161-164` `retry_message` recomputes from `started.elapsed()`, so the label ticks. **Both** arms converted together — `app.rs:4655-4667` (`AutoRetryStart`) and `:4669-4682` (`SummarizationRetryScheduled`) — with a comment naming pi's `CountdownTimer` as the reason not to format inline. Matches `components/status-indicator.ts:46-64` + `countdown-timer.ts:21-30`. |
+| TUI-024 | **closed** | `status.rs:343-351` pushes the context segment **unconditionally** with an explicit comment citing `footer.ts:161`, and `:366-380` `context_text` returns `0.0%/0{auto}` when the window is unknown and `?/{window}{auto}` when only the percent is. Matches `footer.ts:107-110, :146-152, :161` including the zero-window case. |
+| TUI-025 | still-open | All three literals unchanged: `commands.rs:51` `"<model>"`, `:65` `login` with no hint at all, `:70` `"…prompts, and themes"`. pi v0.84.1 `slash-commands.ts:21` `"<provider/model>"`, `:35` `"<provider>"`, `:40` `"…prompts, themes, and context files"`. `/reload` status still `"reloaded resources"` (`app.rs:4240`). |
+| TUI-026 | **closed** | Closed by the fidelity work (TUI-FIDELITY X1). `grep -n '"you: "\|"assistant: "' crates/cyrup-tui/src/transcript.rs` returns only historical comments (`:1136` "was budgeting for the deleted `assistant: `", `:2678`, `:2717`) plus regression tests at `:3290-3291` and `:3316` asserting the labels are **absent**. No label spans are constructed. Matches `components/{user-message,assistant-message}.ts`. |
+| TUI-N01 | still-open | `transcript.rs:1275`'s `inline` gate still consults only `images.show` and decodability; `ImageOpts` (`:1309-1324`) gained `expand_key`, `cwd` and `tools_expanded` but no capability field, so `App::detect_image_support`'s `state.image_renderer` (`app.rs:1118-1125`) cannot reach it. |
+| TUI-N02 | still-open | `push_loaded_resources` has exactly ONE production call site — `crates/cyrup/src/main.rs:1669`, the boot path. The `session_swapped` arm does nine other things and never pushes the panel. |
+| TUI-N03 | still-open | `confirm_selector`'s `SelectorKind::Theme` arm (`app.rs:3399-3403`) still returns `None`, so no `ApplySetting` reaches the persist arm at `:4040`. `open_selector` still has exactly one call site (`:3380`, Theme only). |
+| TUI-N04 | still-open | `rg 'This project is not trusted' crates/` → zero. pi has the whole path live: `interactive-mode.ts:3699` calls `renderProjectTrustWarningIfNeeded()`, body at `:3710-3723`. |
+| TUI-N05 | still-open | `app.rs:1660-1703` still consults the built-in keymap first; `rg 'RESERVED_KEYBINDINGS\|restrict_override' crates/` → zero. pi's `runner.ts:71-90` + `getShortcuts` `:510-533` inverts the precedence and records a diagnostic. |
+| TUI-N06 | still-open | `transcript.rs:631-643` still stamps `hidden` at commit time; `app.rs:4053-4056`'s own comment concedes the divergence from pi's `chatContainer.clear()` + `rebuildChatFromMessages()` (`interactive-mode.ts:4050-4066`). |
+| TUI-N07 | still-open | The swap arm calls `rebind_session()` then `replay_session_with_extensions` (`app.rs:6988`) and appends below the previous session's flushed scrollback; no clear, no boundary rule. |
+| TUI-N08 | still-open | `crates/cyrup-tui/tests/image.rs:56` asserts the glyph is absent on the inline path and `:67-70` asserts `🖼`, the label and `64×48` are present — pinning the invented format while `image_fallback_text` (`image.rs:353-367`) produces pi's real one. |
+| TUI-N09 | still-open | `tests/extension_dialog_countdown.rs:85` still sleeps 1,100 ms and `:88` asserts the literal `"Proceed? (2s)"`; `tick_extension_dialog_countdown()` at `:86` still takes no argument, so no injectable instant exists. |
+| TUI-S01 | **closed (as framed)** — see TUI-014 + TUI-033 | The item's own Overlap note said "the correct framing is the missing sink, not seven separate items". The sink now exists: `app.rs:3090-3096` `install_ui_sinks` calls `services.set_ui_effect_sink(effects)`, re-run on every session swap (`:6915-6919`). Six mutators are live — Notify `:3195`, SetStatus `:3205`, SetEditorText/paste `:3210`, SetToolsExpanded `:3217` (which *does* push the `Tool output: …` status), SetTitle `:3225` + the OSC-0 write at `:7098-7102`. The residue is exactly three variants, and holding S01 open as well would book them a third time: widgets are **TUI-014**, header/footer are **TUI-033**. Carried at low purely as a pointer. |
+| TUI-S02 | **OVERTURNED** `closed` → partially-closed | `panic_hook.rs` landed (`:82-89` `install_panic_hook` chains `restore_terminal_best_effort()` before the previous hook; installed at `app.rs:6112` before `enable_raw_mode`), closing pi's `uncaughtCrash` half. The item's *second* named mechanism did not: pi `interactive-mode.ts:212-220` `DEAD_TERMINAL_ERROR_CODES`/`isDeadTerminalError` → `emergencyTerminalExit()` (`:3816-3823`) has no cyrup counterpart. See the item. |
+| TUI-S03 | **closed** | `crates/cyrup-tui/src/footer_data.rs` (358 lines) ports `resolveGitBranchSync`: `HEAD_REF_PREFIX = "ref: refs/heads/"` at `:38`, worktree + reftable handling documented at `:14-26`, `POLL_INTERVAL = 500ms` at `:35` matching pi's debounce. Wired live — `app.rs:399` field, `:521` init, `:986` `FooterGitBranch::discover(cwd)`, `:988`/`:1013` `set_branch`, `:6438` the poll interval in the run loop, production populator at `crates/cyrup/src/main.rs:1779`. Test `crates/cyrup-tui/tests/footer_git_branch.rs`. |
+| TUI-S04 | **closed** | `crates/cyrup-tui/src/keyboard_protocol.rs`: `KITTY_FLAGS_QUERY = "\x1b[?u"` (`:65`), `MODIFY_OTHER_KEYS_ENABLE = "\x1b[>4;2m"` (`:69`), `MODIFY_OTHER_KEYS_DISABLE = "\x1b[>4;0m"` (`:73`), `NEGOTIATION_TIMEOUT = 100ms` (`:79`), exchange at `:217`; re-exported at `lib.rs:135`. Negotiation runs **before** the reader thread starts (`app.rs:6125-6128`), with `:6166-6167` documenting why it is deliberately not re-run after suspend/external-editor. Matches `packages/tui/src/terminal.ts:172, :331, :337`. |
+| TUI-S05 | **closed** | `terminal_query.rs:87` `CELL_SIZE_QUERY = "\x1b[16t"` (doc at `:10`, `:84-86` citing pi's `queryCellSize`, `tui.ts:735-742`), consumed at `:376` and fed into `ImageRenderer::from_capabilities_with_cell_size` from `app.rs:1118-1125` under the same `caps.images.is_some()` gate pi uses at `tui.ts:703`. `image.rs:110-116` `cell_pixels()` documents the measured-vs-default distinction. Test `crates/cyrup-tui/tests/cell_size_query.rs`. |
+| TUI-S06 | **closed** | `app.rs:7091-7104` `write_terminal_title` writes `\x1b]0;{safe}\x07`, citing `packages/tui/src/terminal.ts:515`. Re-applied at `:6403`, `:6796`, `:6863`, `:6901` — boot, rename, `SessionInfoChanged`, session swap — and recomputed only on change (`:1166`). Control-char stripping is a documented CYRUP-DELTA hardening, not a behaviour loss. Sanitization/branding in `terminal_title.rs`; test `crates/cyrup-tui/tests/terminal_title.rs`. |
+| TUI-S07 | **closed** | `crates/cyrup-tui/src/tmux.rs` (153 lines) ports `checkTmuxKeyboardSetup`: the `$TMUX` gate, the `tmux show -gv extended-keys` / `extended-keys-format` probes, and `:42-47` `EXTENDED_KEYS_OFF_WARNING` / `EXTENDED_KEYS_FORMAT_WARNING` — pi's sentences verbatim with `Pi`→`cyrup`. Called at `app.rs:6468`. Matches `interactive-mode.ts:1120-1161`, invoked at `:1045`. |
+| TUI-S08 | **closed** | `crates/cyrup-tui/src/drain.rs`: `:90` `drain_input<D: InputDrain>(source, max, idle)`, `:134` `drain_stdin_before_exit()`. The run loop exits through `self.drain_and_restore()` (`app.rs:7007`), with `:7002-7007` and `:872-878` documenting why the drain must precede the restore ("run disables raw mode on the way out, so a drain after it returns is a guaranteed no-op"). Matches `terminal.ts:377` `drainInput(maxMs = 1000, idleMs = 50)`, called at `interactive-mode.ts:3792`. |
+| TUI-S09 | **closed** | `crates/cyrup-tui/src/resume_hint.rs` (241 lines) with the exact output shapes at `:10`/`:17` and `:95` citing `${chalk.dim("To resume this session:")} ${resumeCommand}\n`; exported at `lib.rs:101`; called out as a verified-clean non-drawing helper in `TUI-FIDELITY.md:111`. Matches `interactive-mode.ts:240` `formatResumeCommand` + the post-stop stdout write at `:3808-3810`. |
+| TUI-S10 | still-open | `rg 'debug' crates/cyrup-tui/src/keymap.rs` → zero; `rg 'onDebug\|on_debug' crates/ -g '*.rs'` → zero. `/debug` is still reachable only by typing it (`commands.rs:76` `HIDDEN_COMMANDS`, handler `app.rs:1827`). pi installs the hook globally at `interactive-mode.ts:2803` and checks the chord before dispatching to the focused component (`tui.ts`). |
+| TUI-S11 | **closed** (as the item itself scoped it) | `crates/cyrup/src/update_check.rs` (343 lines) ports the git-source update detection (`getGitUpstreamRef` at `:166-175`, `first_sha` at `:255-262`) and is spawned at boot behind the offline gate — `crates/cyrup/src/main.rs:549-558`, with `:552` recording that only the **package** half of pi's pair is ported. The `checkForNewPiVersion` release-feed poll was excluded as a fork/product decision, which is exactly what the item's own Impact paragraph recommended. Receiver threaded into `run_interactive` (`main.rs:1582-1583`, `app.rs:761`, `:996`). Test `crates/cyrup-tui/tests/package_update_notice.rs`. |
+| TUI-027 | **new this pass** — open (**critical**, raised from high in the repair pass) | `/tree` has no `searchQuery`; `z`/`x`/`e`/`t` are bound to actions where pi accumulates them into a filter. The `e` path opens the inline label editor, which captures all keys and on Enter **persists** the typed text as the entry's label via `app.rs:3767` → `host_services.set_label` → `manager.append_label`. Corruption of persisted user data. |
+| TUI-028 | **new this pass** — open (medium) | Editor/input keybinding ids use an `editor.*` namespace upstream abandoned — 24 ids inert. Absorbed TUI-008's `app.pageUp`/`app.pageDown` spelling complaint. **Cite correction (repair pass):** the upstream offsets are `keybindings.ts:209-269` and `migrateKeybindingsConfig` `:289-309`, not `:208-270`/`:294-311`; identical at both tags. **Must land after CFG-048** or it silently breaks every `editor.*` config written against shipped cyrup. |
+| TUI-029 | **new this pass** — open (medium) | Extension autocomplete providers are never consulted by the interactive editor. The registration half exists in area 06; the consumer does not. Confirmed still the correct framing by the repair pass's `editor-component.ts` read — `setAutocompleteProvider` is one of only two `EditorComponent` members with no `InputEditor` counterpart. |
+| TUI-030 | **new this pass** — open (medium) | Nine `ExtensionUIContext` methods have no cyrup counterpart at all. Needs WIT-world changes reconciled with area 06. The `setEditorComponent`/`getEditorComponent` half is the other of the two missing `EditorComponent` members. |
+| TUI-031 | **new this pass** — open (high) | A prompt typed during compaction is sent immediately instead of queued; the session layer does not serialize behind compaction either. Drain design is area 03's to own. |
+| TUI-032 | **new this pass** — open (medium) | `/settings` is missing the `Warnings` and `Thinking level` submenus. |
+| TUI-033 | **new this pass** — open (medium) | `ui.setHeader` / `ui.setFooter` are delivered to the TUI and dropped into fields nothing renders. One of the two residues TUI-S01 was closed in favour of. |
+| TUI-034 | **new this pass** — open (medium) | No markdown-transformer hook — extension transformers and pi's Mermaid renderer both absent. Post-baseline drift; guest-facing registration needs area 06. Settings off-switch is CFG-040. |
+| TUI-035 | **new this pass** — open (low) | `tui.editor.historyPrevious` / `historyNext` are unbound. The single v0.84.1 hunk to `components/editor.ts`. |
+| TUI-036 | **new this pass** — open (low) | `Show images` / `Image width` rows are offered on terminals with no image protocol. Same capability-gate root as TUI-N01 and TUI-017. |
+| TUI-037 | **new this pass** — open (medium) | `/reload` never persists an implicitly-granted project trust (`maybeSaveImplicitProjectTrustAfterReload`). |
+| TUI-038 | **new this pass** — open (low) | Ctrl+O is an if/else in cyrup and a fan-out upstream — a live bash block blocks tool expansion. |
+| TUI-039 | **new this pass** — open (low) | Terminal geometry never falls back to `$COLUMNS` / `$LINES`. |
+| TUI-040 | **new this pass** — open (low) | No `PI_TUI_WRITE_LOG` equivalent — no escape-sequence write log. Elevated in usefulness by the repair pass: it is the only tractable instrument for the negotiation items (TUI-045, TUI-046) whose verification requires a live terminal. |
+| TUI-041 | **new this pass** — open (low) | `/settings` shows env-overridden rows with the wrong value. |
+| TUI-042 | **new (repair pass)** — open (**critical**) | The undo snapshot omits the paste registry. `Snapshot { lines, row, col }` (`editor.rs:71-78`) has no `pastes`; `backspace()`/`delete()` erase `pastes[id]` on paths that already pushed a snapshot; `undo()` (`:748-756`) restores only `lines`/`row`. The marker text reappears on screen while `expanded_text()` can no longer resolve it, so Enter sends the 20-character marker instead of the paste. Silent data loss with a UI asserting the opposite. |
+| TUI-043 | **new (repair pass)** — open (**critical**) | Word motion and Ctrl+W are not paste-marker atomic. `word_left_target`/`word_right_target` (`editor.rs:1074-1128`) classify by `is_word_char` alone and never consult `marker_covering` (`:697-712`), which has exactly two callers. One Ctrl+W after a large paste deletes the single `]`, orphaning the marker and unreachably losing the pasted content. |
+| TUI-044 | **new (repair pass)** — open (medium) | `undo()` discards the snapshot's cursor column — `Snapshot::col` is written at `:718` and never read (`rg 'snap\.col'` → nothing); `preferred_visual_col` is not reset either. Ships with TUI-042 so `Snapshot` is corrected once. |
+| TUI-045 | **new (repair pass)** — open (medium) | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — crossterm emits a spurious `Escape` plus the tail as typed text. `stray_reply.rs` documents observing this exact split and rescues only OSC 11. Escape is not inert: it aborts the turn. |
+| TUI-046 | **new (repair pass)** — open (medium) | cyrup pushes Kitty flag 1; pi pushes 7 — and neither stdin-buffer guard flag 7 requires exists, so the obvious one-token "fix" would double every composed character and leak CSI-u text on WezTerm. Filed as one change with the two guards for exactly that reason. Also corrects `drain.rs:11-16`'s unfounded release-report premise. |
+| TUI-047 | **new (repair pass)** — open (low) | A late or unsolicited DCS/APC frame is shredded into ~20 typed characters; `stray_reply.rs` recognises only OSC 11. Reachability is narrow (tmux passthrough), blast radius is not. |
+| TUI-048 | **new (repair pass)** — open (low) | Word navigation classifies by ASCII-style character class instead of Unicode word segmentation, so CJK/Thai word motion jumps whole runs. Internally inconsistent too — the same file already uses grapheme segmentation for wrapping. |
+| TUI-049 | **new (repair pass)** — open (low) | `marker_at` accepts any text between `[paste #N ` and `]`, so cyrup expands paste markers pi's regex rejects — silently replacing text the user typed. Also widens the surface of TUI-042/043. |
+| TUI-050 | **new (repair pass)** — open (low) | An 8-bit meta byte (a single byte > 127) is silently dropped instead of becoming `ESC` + char, so every Alt chord is dead under `metaSendsEscape: false`. **Dependent on TUI-045** — without that pre-parser there is no seam. |
+| TUI-051 | **new (repair pass)** — open (medium) | `/reload` never re-reads `keybindings.json`, while both the command's help string (`commands.rs:70`) and its in-source comment (`app.rs:4236-4238`) claim it does. Routed here from the migrations sweep; the config half is CFG-048. |
 
 ## Open items
 
-> **⚠ THIS TABLE IS NOT THE COMPLETE OPEN SET.** 11 further items from the 2026-08-03
-> surface-driven sweep live in their own table under `## Surface-sweep findings` (line ~580), with
-> `-S` ids — **including 1 rated critical/high**. Enumerating only this table undercounts the
-> area by 11 items, which is exactly how `SEAM-S01` (high) escaped a full audit pass on
-> 2026-08-07. Count BOTH tables. See structural defect A in `00-residual-ledger.md`.
+> The `-S` surface-sweep items are merged into this single table. The prior revision kept them in a
+> second table further down the file, and enumerating only the first table undercounted the area by
+> 11 — which is how `SEAM-S01` escaped a full audit pass on 2026-08-07. One table now; `-S` ids keep
+> their suffix to mark provenance.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
+| TUI-042 | **critical** | parity-bug | S | The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message |
+| TUI-043 | **critical** | parity-bug | S | Word motion and Ctrl+W are not paste-marker atomic — one Ctrl+W after a large paste orphans the marker and drops the paste |
+| TUI-027 | **critical** | not-ported | M | `/tree` has no text search, its four action keys are the characters pi types *into* that search, and the resulting label edit is persisted to the session JSONL |
+| TUI-031 | **high** | not-ported | M | A prompt typed during compaction is sent immediately instead of queued |
+| TUI-004 | medium | upstream-drift | M | No live colour-scheme sync; `/reload` does not re-apply themes |
 | TUI-005 | medium | not-ported | S | Escape branches: bash-mode clear missing; bash child killed while streaming |
-| TUI-006 | medium | not-ported | M | `[Extension issues]` renders 1 of pi's 4 diagnostic sources |
+| TUI-006 | medium | not-ported | M | `[Extension issues]` renders 2 of pi's 4 diagnostic sources |
 | TUI-008 | medium | not-ported | M | Seven upstream global keybinding ids are unbound |
-| TUI-009 | medium | not-ported | S | Double-Escape → tree/fork never implemented although `doubleEscapeAction` ships in /settings |
+| TUI-009 | medium | not-ported | S | Double-Escape → tree/fork never implemented although `doubleEscapeAction` ships in `/settings` |
 | TUI-012 | medium | not-ported | M | No argument autocomplete for `/model <prefix>` or `/login <prefix>` |
-| TUI-014 | medium | not-ported | M | Extension widgets (`ui.set-widget`) stored host-side but never rendered |
+| TUI-014 | medium | not-ported | M | Extension widgets (`ui.setWidget`) now reach the TUI and are stored where nothing renders them |
 | TUI-015 | medium | cyrup-original | M | No render coalescing — one draw per streaming event, no frame budget |
-| TUI-016 | medium | parity-bug | M | Queued messages show a footer count, not pi's per-message list |
+| TUI-016 | medium | parity-bug | M | Queued messages are now entirely invisible — texts discarded, footer count deleted |
 | TUI-017 | medium | parity-bug | S | Attachment image strip: rasterizes without a protocol, invented placeholder, no 60-cell cap |
+| TUI-028 | medium | parity-bug | S | Editor/input keybinding ids use an `editor.*` namespace upstream abandoned — 24 ids inert |
+| TUI-029 | medium | not-ported | M | Extension autocomplete providers are never consulted by the interactive editor |
+| TUI-030 | medium | not-ported | L | Nine `ExtensionUIContext` methods have no cyrup counterpart at all |
+| TUI-032 | medium | not-ported | S | `/settings` is missing the `Warnings` and `Thinking level` submenus |
+| TUI-033 | medium | not-ported | M | `ui.setHeader` / `ui.setFooter` are delivered to the TUI and dropped into fields nothing renders |
+| TUI-034 | medium | upstream-drift | L | No markdown-transformer hook — extension transformers and pi's Mermaid renderer both absent |
+| TUI-037 | medium | not-ported | S | `/reload` never persists an implicitly-granted project trust |
+| TUI-044 | medium | parity-bug | S | `undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read |
+| TUI-045 | medium | not-ported | M | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — a spurious `Escape` aborts the turn and the tail is typed as text |
+| TUI-046 | medium | parity-bug | M | cyrup pushes Kitty keyboard flag 1, pi pushes 7 — and neither guard flag 7 requires exists, so raising it alone would duplicate characters and leak CSI-u text |
+| TUI-051 | medium | parity-bug | S | `/reload` never re-reads `keybindings.json`, while the command's help text and its in-source comment both claim it does |
+| TUI-019 | medium | upstream-drift | L | No alt-screen UI mode, mouse, scrollbars, prompt navigation — **re-rated from low; the ADR-0001 justification does not hold** |
 | TUI-N01 | medium | parity-bug | S | Tool-result images rasterize on terminals with no image protocol |
 | TUI-N02 | medium | not-ported | S | `/reload` does not re-emit the loaded-resources / diagnostics panel |
 | TUI-N03 | medium | parity-bug | S | A theme chosen in `/settings` is applied live but never persisted |
 | TUI-N04 | medium | not-ported | S | The untrusted-project warning banner is never rendered at startup |
-| TUI-002 | low | parity-bug | M | Thinking blocks: fold-ordering, no markdown, no visible-content spacer |
+| TUI-002 | low | parity-bug | M | Thinking blocks: fold-ordering and the visible-content spacer (markdown half closed) |
 | TUI-003 | low | parity-bug | S | Replay omits the compaction-count status |
-| TUI-004 | low | upstream-drift | M | No live colour-scheme sync; `/reload` does not re-apply themes |
-| TUI-010 | low | parity-bug | M | Ctrl+O expands only the live block; no status; committed entries always expanded |
+| TUI-010 | low | parity-bug | S | Ctrl+O pushes no `Tool output: …` status (committed-entry half closed) |
 | TUI-011 | low | not-ported | M | `/changelog` is a hardcoded stub; no "What's New" startup notice |
 | TUI-013 | low | parity-bug | S | Quoted paths with spaces break `@`-mention autocomplete |
-| TUI-018 | low | not-ported | M | Expanded startup help missing — only the 5-item compact bar |
-| TUI-019 | low | upstream-drift | L | No alt-screen UI mode, mouse, scrollbars, prompt navigation |
-| TUI-020 | low | not-ported | S | OSC-8 hyperlink capability detected and tested but never emitted |
+| TUI-018 | low | not-ported | M | Startup header has no logo/version line and no expanded body |
+| TUI-020 | low | not-ported | S | OSC-8 hyperlinks: capability now consulted, still never emitted |
 | TUI-021 | low | upstream-drift | M | Cache-miss notices not implemented |
-| TUI-022 | low | not-ported | S | `terminal.showTerminalProgress` is a dead setting — OSC 9;4 never emitted |
-| TUI-023 | low | parity-bug | S | Retry indicator shows a frozen delay instead of counting down |
-| TUI-024 | low | parity-bug | S | Footer context segment vanishes when usage is unknown instead of `?/{window}` |
 | TUI-025 | low | stale-port | S | Slash-command metadata one baseline behind |
-| TUI-026 | low | cyrup-original | S | Transcript prefixes `you:` / `assistant:` labels |
+| TUI-035 | low | upstream-drift | S | `tui.editor.historyPrevious` / `historyNext` are unbound |
+| TUI-036 | low | parity-bug | S | `Show images` / `Image width` rows are offered on terminals with no image protocol |
+| TUI-038 | low | parity-bug | S | Ctrl+O is an if/else in cyrup and a fan-out upstream — a live bash block blocks tool expansion |
+| TUI-039 | low | parity-bug | S | Terminal geometry never falls back to `$COLUMNS` / `$LINES` |
+| TUI-040 | low | not-ported | S | No `PI_TUI_WRITE_LOG` equivalent — no escape-sequence write log |
+| TUI-041 | low | parity-bug | S | `/settings` shows env-overridden rows with the wrong value |
+| TUI-047 | low | not-ported | M | A late or unsolicited DCS/APC frame is shredded into ~20 typed characters — `stray_reply.rs` recognises only OSC 11 |
+| TUI-048 | low | parity-bug | M | Word navigation classifies by character class instead of Unicode word segmentation — CJK word motion jumps whole runs |
+| TUI-049 | low | parity-bug | S | `marker_at` accepts any text between `[paste #N ` and `]`, expanding markers pi's regex rejects |
+| TUI-050 | low | not-ported | S | An 8-bit meta byte is silently dropped instead of being converted to `ESC` + char (depends on TUI-045) |
 | TUI-N05 | low | parity-bug | S | Extension shortcuts can never override a built-in key; no conflict reported |
 | TUI-N06 | low | parity-bug | L | `Entry::Thinking` freezes hide/show at commit time |
 | TUI-N07 | low | parity-bug | L | Mid-session `/resume` cannot erase the previous session's scrollback |
 | TUI-N08 | low | test-defect | S | `tests/image.rs` pins the invented `🖼` placeholder and the rasterize-anyway fallback |
 | TUI-N09 | low | test-defect | S | `extension_dialog_countdown` asserts an exact countdown it cannot control |
+| TUI-S02 | low | not-ported | S | No dead-terminal (EIO/EPIPE/ENOTCONN) emergency exit path (panic-hook half closed) |
+| TUI-S10 | low | not-ported | S | Shift+Ctrl+D global debug chord absent — `/debug` reachable only by typing into the editor |
 
-## TUI-005 — Escape branches: bash-mode clear missing; bash child killed while streaming
+## TUI-042 — The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message
 
-**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
+**Kind** parity-bug · **Severity** critical · **Effort** S · **Confidence** confirmed (both sides re-read at HEAD / v0.83.0 in the repair pass)
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:1242-1263` `Action::Interrupt` cancels the bash block unconditionally at `:1244-1247` *before* testing `self.state.status.streaming`, and has no branch for "editor buffer is in bash mode". The restore half is correct: `AppAction::InterruptRestoreQueued` → run-loop arm `app.rs:3944-3959` (`drain_queue`, steering then follow-up, `restore_queued_to_editor` at `app.rs:890-902`, then `abort()`), matching pi's ordering and no-status contract. Bash mode is known to cyrup only for the editor rule colour (`cyrup/crates/cyrup-tui/src/editor.rs:1509-1520`).
+**cyrup** — `crates/cyrup-tui/src/editor.rs:71-78` defines `struct Snapshot { lines: Vec<Vec<char>>, row: usize, col: usize }` — **no paste registry**. `snapshot()` (`:716-719`) clones only those three fields; `undo()` (`:748-756`) restores `lines` and `row` and nothing else. The registry it fails to snapshot is `pastes: BTreeMap<u32, String>` (`:149`) with `paste_counter: u32` (`:151`), and both are *mutated destructively* on the very paths that push an undo snapshot: `backspace()` at `:814` and `delete()` at `:852` each call `self.pastes.remove(&id)` **after** the `E::DeleteCharBackward` / `E::DeleteCharForward` arms (`:1487-1500`) have already pushed the snapshot. Expansion is gated on the registry: `marker_at` (`:663-694`) ends with `let content = self.pastes.get(&id)?;`, so once the entry is gone the marker text is **no longer a marker**, and `expanded_text` (`:639-659`) — the function `E::Submit` calls at `:1570-1571` to build what the agent actually receives — emits it verbatim.
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2635-2660` — four mutually exclusive `else if` branches on `onEscape`: streaming → `restoreQueuedMessagesToEditor({abort:true})`; bash child running → kill; bash *mode* (`text.trimStart().startsWith("!")`) → clear editor and exit bash mode (`:2640-2643`); empty editor → double-escape. Because they are exclusive, pi never touches a bash child while streaming. `getAllQueuedMessages` (`:4030-4042`) also folds `compactionQueuedMessages`.
+**upstream** — `pi/packages/tui/src/components/editor.ts:216-220` @v0.83.0 (identical at v0.84.1, same line numbers): `interface EditorSnapshot { state: EditorState; pastes: Map<number, string>; pasteCounter: number }`, commented "Undo snapshot: editor text state plus the paste registry." `:2012-2014` `pushUndoSnapshot()` pushes `{ state, pastes, pasteCounter }` (v0.84.1 `:2024`); `:2016-2030` `undo()` does `Object.assign(this.state, snapshot.state); this.pastes = snapshot.pastes; this.pasteCounter = snapshot.pasteCounter;` (v0.84.1 `:2028`). The deep copy that makes it work is `packages/tui/src/undo-stack.ts:11-13` — `push(state) { this.stack.push(structuredClone(state)) }` — `structuredClone` deep-clones a `Map`, so each snapshot owns its own registry.
 
-**Impact** Escape in bash mode with a typed-but-unsent `!cmd` does nothing in cyrup where pi clears it. Escape during a turn that also has a `!`-child kills the child as collateral. Both are uncommon paths but the second is destructive.
+**Impact** — paste 2,000 characters (or >10 lines) into the prompt; the buffer shows `[paste #1 2000 chars]` and `pastes[1]` holds the text. Backspace once — the marker is atomic for backspace (`editor.rs:801-816`), so it vanishes and `pastes[1]` is erased. Press Ctrl+- to undo: **the marker text reappears on screen**, so the user sees their paste restored. Press Enter. `expanded_text()` cannot resolve id 1 any more, so the model receives the 20-character literal string `[paste #1 2000 chars]` instead of the 2,000 characters. Silent data loss with a UI that actively asserts the opposite, on the most ordinary editing sequence there is. pi restores the registry and sends the full text. A second, quieter variant: paste → undo (no delete) leaves an orphan `pastes` entry and never rolls back `paste_counter`, so ids drift from pi's and the map grows for the life of the session.
 
-**Fix** Restructure `Action::Interrupt` (`app.rs:1242-1263`) into pi's exclusive chain: streaming first (return `InterruptRestoreQueued` without touching bash), then bash-child cancel, then a new bash-mode branch clearing the editor and dropping the `!` prefix, then the empty-editor double-tap (TUI-009). Land with TUI-009 so the precedence is right in one pass. Separately confirm whether cyrup has a compaction queue for `drain_queue` to fold.
+**Fix** — add `pastes: BTreeMap<u32, String>` and `paste_counter: u32` to `Snapshot` (`editor.rs:71-78`); have `snapshot()` (`:716-719`) clone both and `undo()` (`:748-756`) restore both alongside `lines`/`row`. That is the whole fix — every call site already goes through `snapshot()` / `push_undo_for*`. While there, make `history_draft` (`:93`, `:1199`, `:1218`) carry them too, since it reuses `Snapshot` and browsing history away from a draft containing a marker has the identical failure. **Ships with TUI-044** so `Snapshot` is corrected once. Note cyrup's 500-entry stack bound (`:728-730`, `:742-744`) is a cyrup-original — pi's `UndoStack` is unbounded (`undo-stack.ts:7-28`); keep the bound but state it as a delta rather than leaving it undocumented.
 
-**Verify** App tests: (a) `!sleep 100` running + streaming, press Esc, assert the child is still alive and the queue restored; (b) editor holds `!foo`, nothing streaming/running, press Esc, assert the editor is empty and bash mode off.
+**Verify** — `crates/cyrup-tui/tests/editor.rs`: build an `InputEditor`, `handle_paste(&"x".repeat(1500))`, assert `expanded_text()` contains the 1500 chars; send `E::DeleteCharBackward`, then `E::Undo`; assert `text()` again shows `[paste #1 1500 chars]` **and** `expanded_text()` once more contains the 1500 chars (fails today — it returns the literal marker). Second case: paste, `E::Undo`, paste again, assert the second marker is `#1` not `#2`.
 
-## TUI-006 — `[Extension issues]` renders 1 of pi's 4 diagnostic sources
+## TUI-043 — Word motion and Ctrl+W are not paste-marker atomic — one Ctrl+W after a large paste orphans the marker and drops the pasted content
 
-**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
+**Kind** parity-bug · **Severity** critical · **Effort** S · **Confidence** confirmed (both sides re-read at HEAD / v0.83.0 in the repair pass)
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/startup.rs:204-220` `extension_diagnostics` maps `ExtensionLoadDiagnostic` and nothing else. `StartupDiagnostics` (`cyrup/crates/cyrup-session-svc/src/services.rs:34-46`) has no field for command diagnostics, built-in command conflicts or shortcut diagnostics — a workspace grep for `command_diagnostics|shortcut_diagnostics|restrict_override` in `.rs` returns nothing. The panel itself is correct: `build_startup_lines` (`startup.rs:222-246`) emits pi's five listing sections gated on `show_listing()` (`:148-151`) then the diagnostic blocks unconditionally, matching `{force:false, showDiagnosticsWhenQuiet:true}`. cyrup *computes* the same invocation-name disambiguation pi does (`cyrup/crates/cyrup-ext/src/registry.rs:336-375`) and reports nothing about it. `StartupDiagnostics::models` is collected but never rendered in the TUI (only stderr pre-TUI, `cyrup/crates/cyrup/src/main.rs:222-234`).
+**cyrup** — `crates/cyrup-tui/src/editor.rs:1074-1100` `word_left_target()` and `:1102-1128` `word_right_target()` classify purely by `is_word_char` (`:1637-1639`, `c.is_alphanumeric() || c == '_'`) and **never consult `marker_covering()`** — which exists at `:697-712` and is called from exactly two places, `backspace()` `:801-816` and `delete()` `:840-855`. `delete_word_backward()` `:874-884` and `delete_word_forward()` `:886-892` route straight through those two targets, and Ctrl+W / Alt+Backspace are bound to `E::DeleteWordBackward` at `keymap.rs:1002-1003`. Traced concretely on `[paste #1 +42 lines]` with the cursor at the end (col 20): the whitespace skip does not fire (`line[19] == ']'`), `want_word = is_word_char(']') = false`, and the class run consumes only `]` before hitting the word char `s` — so `take_range` (`:921-946`, itself marker-unaware) deletes exactly **one** character and leaves `[paste #1 +42 lines`. `marker_at` (`:663-694`) requires a closing `]`, so the text is no longer a marker and `expanded_text` (`:639-659`) emits it verbatim.
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:1658-1680` — `[Extension issues]` is the union of extension load errors, `extensionRunner.getCommandDiagnostics()` (`pi/packages/coding-agent/src/core/extensions/runner.ts:648`), `getBuiltInCommandConflictDiagnostics()` (`interactive-mode.ts:569-582`) and `extensionRunner.getShortcutDiagnostics()` (`runner.ts:539`, populated at `:494-534`). Expanded listing bodies are scope-grouped per-path (`interactive-mode.ts:1574-1637`). `models.json error:` is shown at boot (`:937-940`) and on reload (`:5482-5485`).
+**upstream** — `pi/packages/tui/src/word-navigation.ts:9-14` declares `WordNavigationOptions.isAtomicSegment` — "Predicate identifying atomic segments that should be treated as single units (e.g. paste markers)"; `:44-46` (backward) and `:97-99` (forward) skip exactly one such segment whole, and the whitespace/punctuation loops at `:32-38`, `:59-66`, `:90-93`, `:105-113` all guard with `!isAtomic?.(…)`. Both consumers pass it: `packages/tui/src/components/editor.ts:1869-1889` `moveWordBackwards()` → `findWordBackward(currentLine, cursorCol, { segment: …, isAtomicSegment: isPasteMarker })` (the option at `:1886`), and `:2064-2083` `moveWordForwards()` (`:2080`). `:1588-1631` `deleteWordBackwards()` computes its delete range by calling `moveWordBackwards()`, so Ctrl+W inherits the atomicity. `isPasteMarker` is `:27-29` over `PASTE_MARKER_SINGLE` `:24`. v0.84.1 offsets: `:1881`/`:1898`, `:2076`/`:2092`, `:1600`; code identical.
 
-**Impact** Two extensions registering `/deploy`, an extension shadowing built-in `/model`, or two extensions claiming the same shortcut are all silent — the exact invisibility class this item was filed for. The user sees an extension "loaded" and one of its commands simply never runs.
+**Impact** — Ctrl+W ("delete previous word") is the most-used editing key in a readline-style prompt, and the cursor sits at the end of a freshly-inserted marker. One press deletes the single character `]`; the prompt now reads `[paste #1 +42 lines` and the 42-line paste is unreachable — pressing Enter sends that 19-character string to the model instead of the file the user pasted. Nothing warns, and the visible text still says "+42 lines". Alt+D at the start of a marker does the mirror (`[` is eaten). In pi both keys remove the whole marker and drop the registry entry with it. Alt+B / Alt+Left / Alt+F also park the cursor *inside* the marker, where any subsequent keystroke corrupts it the same way.
 
-**Fix** Add `commands: Vec<CommandDiagnostic>`, `builtin_conflicts: Vec<…>` and `shortcuts: Vec<ShortcutDiagnostic>` to `StartupDiagnostics` (`services.rs:34-46`); emit them from `cyrup-ext`'s `registry.rs` disambiguation path (`:336-375`) and from `register_shortcut` (`registry.rs:388-395`, see TUI-N05); fold all three into `extension_diagnostics` (`startup.rs:204-220`) under the existing `[Extension issues]` heading. Secondary: scope-group the listing bodies in `push_listing` (`startup.rs:248-262`) and render `diagnostics.models` in the panel.
+**Fix** — in `word_left_target()` (`editor.rs:1074-1100`): after the whitespace skip, call `self.marker_covering(i)` and, when it returns `Some((s, _, _))` with `i > s`, return `(self.row, s)` immediately — the port of `findWordBackward`'s `isAtomic` branch (`word-navigation.ts:44-46`). Mirror it in `word_right_target()` (`:1102-1128`) returning `(self.row, e)` for `i < e` (`word-navigation.ts:97-99`). Then make `delete_word_backward()` / `delete_word_forward()` (`:874-892`) drop the registry entry for any marker fully inside the deleted range, as `backspace()` already does at `:814` — otherwise the atomic delete leaves an orphan `pastes` entry. **Land with TUI-042 and TUI-049**: all three are the paste-marker invariant, and fixing the deletion without tightening `marker_at` leaves the partially-chewed-marker case open.
 
-**Verify** `crates/cyrup-tui/tests/startup_resources_panel.rs`: two extensions declaring the same slash command produce a conflict line; an extension shadowing a built-in produces the built-in-conflict line; both appear with `quietStartup=true`.
+**Verify** — `crates/cyrup-tui/tests/editor.rs`: paste 1,500 chars, assert `text() == "[paste #1 1500 chars]"`; send `E::DeleteWordBackward`; assert `text().is_empty()` and `pastes` no longer contains id 1 (today: `text() == "[paste #1 1500 chars"` and the content is orphaned). Same for `E::DeleteWordForward` with the cursor at col 0, and assert `E::CursorWordBackward` from the marker's end lands on the marker's **start** column, not one char short.
 
-## TUI-008 — Seven upstream global keybinding ids are unbound
+## TUI-027 — `/tree` has no text search, and its four action keys are the characters pi types into that search
 
-**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
+**Kind** not-ported · **Severity** critical · **Effort** M · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/keymap.rs:97-114` `Action::from_id` recognizes exactly 14 ids; `app.model.select`, `app.thinking.toggle`, `app.message.copy` and `app.session.{new,tree,fork,resume}` are all absent, and `Keymap::default` binds no Ctrl+L / Ctrl+T / Ctrl+X. cyrup also spells `app.pageUp`/`app.pageDown` (`keymap.rs:101-102`) where upstream has `tui.editor.pageUp`/`pageDown`.
+> **Raised `high` → `critical` in the 2026-08-12 repair pass**, on the persistence half rather than
+> the keybinding half. The mutation was re-verified end to end at HEAD: `handle_label_edit`'s confirm
+> arm (`tree_selector.rs:540-546`) returns `SelectorOutcome::Apply(format!("{entry_id}{FIELD_SEP}{label}"))`
+> after `update_node_label`, and the chrome does not merely repaint — `app.rs:3306-3307` splits that
+> payload and `app.rs:3763-3767` persists it through the **live** session path,
+> `session.services().host_services.set_label(&entry_id, &label)` → `manager.append_label`, which is
+> the same path a loaded extension's `setLabel` uses (stated in the comment at `:3763-3766`). So the
+> characters a pi user types expecting a text search are appended to the session JSONL as that entry's
+> label. README:106-107 classes corruption of persisted user data as `critical` with no reachability
+> qualifier, and the trigger here is the ordinary act of typing into a picker.
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2673-2686` wires all seven: `app.model.select` → `showModelSelector`, `app.thinking.toggle` → `toggleThinkingBlockVisibility`, `app.message.copy` → `handleCopyCommand`, `app.session.{new,tree,fork,resume}`.
+**cyrup** — `crates/cyrup-tui/src/tree_selector.rs:850-889` `TreeSelector::handle`: after the label-edit capture it consults `self.keymap.action_for(key)` (fold / unfold / edit-label / toggle-timestamp), then treats bare characters `1`–`5` as filter-mode switches (`FilterMode::from_digit`, `:867-873`), then falls through to the shared select map. There is **no search state** — `rg 'search|query' crates/cyrup-tui/src/tree_selector.rs` finds only `LabelEdit.query` (`:347-348`), the inline label editor. The four defaults are `z` / `x` / `e` / `t` (`crates/cyrup-tui/src/keymap.rs:908-915`), advertised in the hint row at `tree_selector.rs:841-843` as `z/x branch   e label   t label time`. `TreeAction::from_id` (`keymap.rs:887-895`) knows only the four `app.tree.*` ids and none of the seven `app.tree.filter.*` ids. `app.message.copy` has no tree binding.
 
-**Impact** A user's `keybindings.json` carrying any of these ids silently does nothing, and the documented default chords are dead keys.
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/tree-selector.ts:113` `private searchQuery = ""`, accumulated by the final `else` of `handleInput` at `:1093-1100` (`if (!hasControlChars && keyData.length > 0) { this.searchQuery += keyData; … }`), filtered at `:337`, cleared by `tui.select.cancel` at `:1032-1035` and by backspace at `:1079-1084`. Fold/unfold are `app.tree.foldOrUp` / `unfoldOrDown` = `["alt+left","ctrl+left"]` / `["alt+right","ctrl+right"]`; edit-label and toggle-timestamp are `shift+l` / `shift+t` (`pi/packages/coding-agent/src/core/keybindings.ts:119-134`). The five filter modes plus two cycle actions are `app.tree.filter.*` on ctrl+d / ctrl+t / ctrl+u / ctrl+l / ctrl+a and ctrl+o / shift+ctrl+o (`keybindings.ts:258-288`, handled at `tree-selector.ts:1039-1076`). `app.message.copy` copies the selected entry (`tree-selector.ts:1029-1031`). **All of this is present at the ported baseline** — `git show v0.83.0:…/tree-selector.ts` has `searchQuery` at `:113` and the filter ids at `:1039-1076`, so this is not drift.
 
-**Fix** Extend `Action` and `Action::from_id` (`keymap.rs:97-114`) with the seven ids plus the `tui.editor.page*` names, and route them. `app.thinking.toggle` is now mechanical: `TranscriptView::set_hide_thinking_block` exists (`cyrup/crates/cyrup-tui/src/transcript.rs:480-482`) and the settings row already persists `hideThinkingBlock` (`app.rs:3364`). `app.model.select` has its destination built (`app.rs:1449-1470` `open_data_selector`) with no key routed to it.
+**Impact** On a session with more than a screenful of entries `/tree` cannot be narrowed at all, and typing is pi's primary way to find a branch. The four characters cyrup binds are ordinary search input upstream, so a pi user typing `text` into `/tree` gets a label editor opened (`e`) and the timestamp column toggled (`t`). **The consequence is worse than a wrong keystroke:** once `e` opens the inline editor it captures *all* subsequent keys (`tree_selector.rs:852-854`), and Enter emits the captured text as an `Apply` payload (`:540-546`) which `app.rs:3763-3767` **persists to the session JSONL** via `host_services.set_label` → `manager.append_label` — silent mutation of durable session data from what the user believed was a search, with the wrong entry (whichever row the cursor happened to be on) receiving it. Rebinding via `keybindings.json` cannot rescue it: the seven `app.tree.filter.*` ids are unknown to `TreeAction::from_id`, so a config carrying pi's defaults is silently ignored and the digit bindings stay. Note the interaction with **CFG-048** — a pi user's legacy keybindings file is not even name-migrated, so nothing they can write fixes this before the search lands.
 
-**Verify** Keymap unit tests round-tripping each id, plus app tests asserting Ctrl+T flips `hide_thinking` and Ctrl+L opens the model selector.
+**Fix** In `crates/cyrup-tui/src/tree_selector.rs`: add `search_query: String` to `TreeSelector`, append printable non-control characters in the fall-through arm (replacing the digit-filter arm), filter `filtered_nodes` on it, clear it on `SelectAction::Cancel` before cancelling, and pop on backspace — mirroring `tree-selector.ts:1079-1100`. In `crates/cyrup-tui/src/keymap.rs`: change `TreeKeymap::default` (`:908-915`) to pi's `alt+left`/`ctrl+left`, `alt+right`/`ctrl+right`, `shift+l`, `shift+t`; add the seven `app.tree.filter.*` ids to `TreeAction` / `TreeAction::from_id` with pi's ctrl defaults and route them to `set_filter` / cycle. Update the hint row at `tree_selector.rs:841-843` to resolve its labels from the live keymap.
 
-## TUI-009 — Double-Escape → tree/fork never implemented although `doubleEscapeAction` ships in /settings
+**Verify** `crates/cyrup-tui/tests/tree_selector.rs`: typing `abc` into the tree filters to matching labels and fires no `TreeAction` and mutates no label; `shift+l` opens the label editor; `ctrl+u` switches to user-only; a `keybindings.json` rebinding `app.tree.filter.noTools` takes effect. Add one assertion specifically for the persistence half — after typing `abc` into `/tree`, no `SelectorOutcome::Apply` carrying `FIELD_SEP` is produced and `host_services.set_label` is never called. Then, per this workspace's standing rule, a **live terminal run**: open `/tree` on a real session, type a word, quit, reopen `/tree`, and confirm no entry gained a label.
 
-**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
+## TUI-031 — A prompt typed during compaction is sent immediately instead of queued
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:3395-3400` renders `SettingRow::choice("doubleEscapeAction", …, ["fork","tree","none"])` backed by `cyrup/crates/cyrup-config/src/settings.rs:768-772` (default `tree`); a workspace grep for `double_escape|doubleEscape|last_escape` finds only those two sites plus the unit test at `settings.rs:1795`. `Action::Interrupt` (`app.rs:1242-1263`) has no empty-editor/double-tap branch and `AppState` has no `last_escape` field (contrast `last_sigint`, used at `app.rs:1270-1281`).
+**Kind** not-ported · **Severity** high · **Effort** M · **Confidence** confirmed
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2635-2660`, the fourth `else if`.
+**cyrup** — `crates/cyrup-tui/src/app.rs:1740-1752` `dispatch_submission` classifies the line and returns `AppAction::Submit(prompt)` after optimistically echoing it into the transcript; the run-loop arm at `:6606-6626` branches on `session.is_streaming().await` **only** — `steer` when streaming, `prompt_accepted` otherwise. `is_compacting` is never consulted from the TUI: `rg 'is_compacting' crates/ -g '*.rs'` finds the session accessor (`crates/cyrup-session-svc/src/session.rs:4108-4110`), one RPC status field (`crates/cyrup-modes/src/rpc.rs:1428`) and tests — no `cyrup-tui` hit. `rg 'compaction_queued|compactionQueued' crates/ -g '*.rs'` → zero; the concept does not exist.
 
-**Impact** A live, persisted, documented setting has no consumer: choosing `fork` or `tree` changes nothing.
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3023-3033` — the submit handler tests `if (this.session.isCompacting)` **before** the streaming branch: an extension command runs immediately, anything else goes to `this.queueCompactionMessage(text, "steer")` and returns. `queueCompactionMessage` (`:4230-4236`) pushes onto `compactionQueuedMessages` (declared `:475`), clears the editor, refreshes the pending-messages display and shows `"Queued message for after compaction"`. The queue is folded into `getAllQueuedMessages` (`:4162-4166`) and drained by `clearAllQueues` (`:4177-4183`). Present at v0.83.0.
 
-**Fix** Add `last_escape: Option<Instant>` to `AppState` mirroring `last_sigint`; in the final `Action::Interrupt` branch, on a second Escape inside the window dispatch `/tree` or `/fork` per `settings.double_escape_action()`. Must land with TUI-005 so the branch order matches pi.
+**Impact** Compaction is a multi-second operation with no input lock in cyrup. **The session layer does not serialize behind it** — `AgentSession::prepare` (`crates/cyrup-session-svc/src/session.rs:849-900`) has no compaction guard either: extension-command dispatch, `input` event, then `if streaming { Prepared::Queued } else { Prepared::Run(...) }` at `:899`, and `prompt_with` (`:658-674`) hands `Prepared::Run` straight to `spawn_run` (`:681-689`). `is_streaming` reads the agent snapshot (`:3202-3204`), which compaction does not set (compaction aborts the active run, `session.rs:1391`). So a message typed during compaction is echoed into the transcript and dispatched as a fresh turn assembled from a context the compaction is in the middle of rewriting, with no status and no queue. pi holds it, tells the user it is held, and releases it afterwards. This also compounds TUI-016: even if the message did land in a queue, cyrup now has no surface that would show it.
 
-**Verify** App test: two Escapes on an empty editor within the window emit the tree command; outside the window, nothing; with `none`, nothing.
+**Fix** In the `AppAction::Submit` run-loop arm (`app.rs:6606-6626`), check `session.is_compacting()` before `is_streaming()`; when compacting, push the text onto a new `AppState::compaction_queue: Vec<(String, QueueMode)>`, clear the editor, push pi's `Queued message for after compaction` status, and suppress the optimistic transcript echo `dispatch_submission` does at `:1750`. Drain the queue into `steer`/`follow_up` on `CompactionComplete` (`app.rs:4650-4654`) and fold it into the `Dequeue`/`InterruptRestoreQueued` drains so Escape restores it too, matching `getAllQueuedMessages` / `clearAllQueues`.
 
-## TUI-012 — No argument autocomplete for `/model <prefix>` or `/login <prefix>`
-
-**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-tui/src/commands.rs:38` declares `has_arg_completion`; its only other occurrences in the crate are the two `const fn` constructors at `:82`/`:96` — there is no reader. `cyrup/crates/cyrup-tui/src/autocomplete.rs:140` `slash_context` bails as soon as `before` contains whitespace; the only other contexts are `path_context` (`:171`) and `mention_query` (`:253`). No `CompletionContext::CommandArg` exists.
-
-**upstream** — `pi/packages/tui/src/autocomplete.ts:338-358` plus `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:592-616` (`/model` via `getArgumentCompletions`) and `:619-629` (`/login`).
-
-**Impact** Typing `/model anth<Tab>` gives nothing; the user must know the exact `provider/model` string or open the selector. `has_arg_completion` is dead metadata claiming a feature that does not exist.
-
-**Fix** Add `CompletionContext::CommandArg { command, prefix }` to `autocomplete.rs`, produced when `before` starts with `/`, names a command with `has_arg_completion`, and has exactly one whitespace run; feed it from the model catalog and the provider list already reachable through the session services.
-
-**Verify** Autocomplete unit tests for `/model anth`, `/login op`, and a negative for a command without `has_arg_completion`.
-
-## TUI-014 — Extension widgets (`ui.set-widget`) stored host-side but never rendered
-
-**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-ext/src/host/services.rs:1342-1345` pushes the payload onto `widgets: Mutex<Vec<Value>>` (`:1042`), with the default trait impl an empty body (`:234`). A grep for `widget` across `cyrup/crates/cyrup-tui/src` returns only ratatui's own `render_widget`/`widgets::` plus `flatten_widget_json` for extension *dialog* bodies (`app.rs:3080-3111`) — a different mechanism. `AppState` has no widget container and `live_region_height` reserves no rows.
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:441-444, 503-504, 759-776, 2000-2038` — widgets are mounted into the live region above the editor and updated in place.
-
-**Impact** An extension calling `ui.set-widget` gets a success return and draws nothing. Status widgets — the intended surface for long-running extension state — are unusable.
-
-**Fix** Give `AppState` a widget list keyed by extension id, populate it from the host service callback through the existing extension→TUI command channel (the same path `1d87913` used for dialogs), render it in the live region above the editor, and include its height in `live_region_height`.
-
-**Verify** App test: an extension emits `ui.set-widget`, assert the text appears in the live region and that a second emit replaces rather than appends.
-
-## TUI-015 — No render coalescing — one draw per streaming event, no frame budget
-
-**Kind** cyrup-original · **Severity** medium · **Effort** M · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:4118-4135`: the run loop's event arm is `maybe_ev = events.next() => { … self.draw_synchronized()?; }` — one full draw per `MessageUpdate`/`TextDelta`. `draw` (`app.rs:906-945`) queries backend size, recomputes `live_region_height`, may rebuild the viewport and calls `flush_committed` every time. No dirty flag, no interval batching.
-
-**upstream** — `pi/packages/tui/src/tui.ts:332` `MIN_RENDER_INTERVAL_MS = 16` and `:745-780` `requestRender` — renders are requested, coalesced and rate-limited.
-
-**Impact** On a fast stream cyrup redraws per token. Since `d2c5509` the per-draw cost is higher: every frame re-runs `thinking_lines` for the live block, and on any turn whose tools returned images `image_raster_lines` (`transcript.rs:970-981`) re-rasterizes each image — an image re-encode per token.
-
-**Fix** Introduce a `needs_render` flag plus a `MIN_RENDER_INTERVAL` (16 ms) timer in the run loop: event arms set the flag, a `tokio::time::interval` arm performs the draw. Memoize `image_raster_lines` output per `(image, width_cells)` in `ToolRun`.
-
-**Verify** Bench/counter test: N streaming deltas within one interval produce one draw; an image-bearing turn rasterizes once, not per delta.
-
-## TUI-016 — Queued messages show a footer count, not pi's per-message list
-
-**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:2659-2661`: the `QueueUpdate` arm calls only `status.set_queued(steering.len() + follow_up.len())`, discarding the texts; `cyrup/crates/cyrup-tui/src/status.rs:124` and `:275-279` render that as the cyrup-invented `N queued` footer segment.
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:4045-4062` `updatePendingMessagesDisplay` — per-message `Steering: {text}` / `Follow-up: {text}` `TruncatedText` rows above the editor, plus the `↳ {key} to edit all queued messages` hint; it folds `compactionQueuedMessages` in via `getAllQueuedMessages` (`:4030-4042`).
-
-**Impact** The user cannot see *what* is queued, cannot tell steering from follow-up, and is never told the queue can be edited — which matters more now that TUI-005 landed the Escape restore that hint advertises.
-
-**Fix** Carry the message texts on `QueueUpdate` into `AppState`, render truncated rows in the live region above the editor, and append the hint line resolved from the keymap. Keep the footer count or drop it, but not as the only surface.
-
-**Verify** App test: two steering + one follow-up produce three labelled rows in the right order plus the hint line; the rows clear when the queue drains.
-
-## TUI-017 — Attachment image strip: rasterizes without a protocol, invented placeholder, no 60-cell cap
-
-**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
-
-**cyrup** — every site re-read at HEAD. `ImageRenderer::from_capabilities` (`cyrup/crates/cyrup-tui/src/image.rs:66-74`) keeps the half-block picker when `caps.images == None`; `ImageRenderer::render` (`image.rs:107-129`) rasterizes for that case and takes the placeholder branch only on `!show_images`, a zero area, or an encode error; `cell_size` (`image.rs:89-105`) clamps to the passed-in width only; `render_images` (`app.rs:3661-3673`) passes `area.width` with no `image_width_cells` cap; `ImageBlock::placeholder_line` (`image.rs:197-207`) emits the cyrup-invented `🖼 {label} ({w}×{h})`. `image_fallback_text` (`image.rs:311-330`) — pi's real format — exists in the same file and is used only by the tool-result path.
-
-**upstream** — `pi/packages/tui/src/components/image.ts:65` `Math.max(1, Math.min(width - 2, this.options.maxWidthCells ?? 60))` and `:114-118`, which emit one `imageFallback` line whenever `!caps.images`. Format defined at `pi/packages/tui/src/terminal-image.ts:546-558`.
-
-**Impact** Attaching an image on a terminal with no image protocol dumps a coloured half-block raster (unreadable on monochrome, ~20-30 rows of scrollback) instead of one `[Image: …]` line, and on a wide terminal the raster is unbounded where pi caps at 60 cells.
-
-**Fix** In `image.rs`: (a) take the placeholder branch in `render` when `caps.images.is_none()`; (b) replace `placeholder_line`'s `🖼 …` with `image_fallback_text` from the same file; (c) clamp `cell_size`/`render_images` to `min(width - 2, image_width_cells)` with pi's 60 default. The tool-result path's own capability gate is TUI-N01 — different call site, different fix. `crates/cyrup-tui/tests/image.rs` currently pins (a) and (b) — see TUI-N08.
-
-**Verify** With a no-protocol capability set, an attachment renders exactly one `[Image: …]` line; with a graphical set, the raster paints and never exceeds 60 cells.
-
-## TUI-N01 — Tool-result images rasterize on terminals with no image protocol
-
-**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-tui/src/transcript.rs:920`: `let inline = images.show && !run.images.is_empty() && run.images.iter().all(|i| i.block.is_some());` — the gate consults `terminal.showImages` and decodability only. `ImageOpts` (`transcript.rs:937-940`) carries just `show` and `width_cells`, built at `transcript.rs:824` from `TranscriptView` fields whose only writers are settings (`app.rs:1814`, `:2320`, `:3867`, `:4169`). `App::detect_image_support` (`app.rs:660-664`) does set `state.capabilities` and `state.image_renderer` from the real probe, but neither reaches the transcript. The raster is `ImageBlock::halfblock_lines` (`image.rs:227+`) off a hard-coded `Picker::halfblocks()`.
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/tool-execution.ts:331-334`: `const caps = getCapabilities(); … if (caps.images && this.showImages && img.data && img.mimeType)` — no protocol means no `Image` child at all, and `getTextOutput` supplies the one-line `imageFallback`. Same rule at the component level, `pi/packages/tui/src/components/image.ts:70,114-118`.
-
-**Impact** On a plain xterm, the Linux console, CI, or a pipe, a `read` of a screenshot dumps ~20-30 rows of coloured `▀` into scrollback where pi prints one `[Image: shot.png [image/png] 1920x1080]` line — unreadable on monochrome. `d2c5509`'s commit message asserts it "falls back to `[image]` where the terminal cannot display them"; the code does not, so this defect is currently invisible to anyone reading history. `crates/cyrup-tui/tests/tool_result_images.rs:16-21` frames the substitution as an upside, which holds only where the terminal shows colour.
-
-**Fix** Add `graphical: bool` (or the whole `TerminalCapabilities`) to `ImageOpts` (`transcript.rs:937`), seed it from `AppState::image_renderer.is_graphical()` wherever `show_images` is already pushed into the transcript (`app.rs:1814`, `:2320`, `:3867`, `:4169`), and require it in the `inline` gate at `transcript.rs:920` so a no-protocol terminal takes the existing `push_image_fallbacks` branch. Keep the half-block raster for the graphical case — that ADR-0001 rationale (`image.rs:216-226`) is sound and orthogonal.
-
-**Verify** Extend `crates/cyrup-tui/tests/tool_result_images.rs`: with a no-protocol capability set, a finished `read` whose result carries a PNG commits exactly one `[Image: [image/png] WxH]` line and paints zero red cells; with a graphical capability set the raster still paints.
-
-## TUI-N02 — `/reload` does not re-emit the loaded-resources / diagnostics panel
-
-**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:2435-2444` (`C::Reload`) only sets `pending_swap_status = "reloaded resources"`. Traced end-to-end: `rt.reload(None)` (`cyrup/crates/cyrup-session-svc/src/runtime.rs:507-524`) → `install_inner` bumps `generation` and sends `gen_tx` (`:309-317`) → the run loop's `session_swapped` arm (`app.rs:4143-4189`) re-subscribes, `rebind_session`, re-reads outputPad/hideThinkingBlock/showImages/imageWidthCells, replays the conversation, re-sources shortcuts — and never calls `App::push_loaded_resources` (`app.rs:874-876`), whose only call site is `cyrup/crates/cyrup/src/main.rs:1346` on the boot path. `startup.rs:145-147` states the omission outright.
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:5477-5480`: inside `handleReloadCommand`, after `session.reload`, `keybindings.reload`, `setRegisteredThemes` and `themeController.applyFromSettings`, pi calls `showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true })` — the identical options object it uses at boot (`:1769`). It also re-surfaces `models.json error:` (`:5482-5485`).
-
-**Impact** `/reload` is the command a user runs right after editing an extension, skill or prompt. If the edit broke the extension, shadowed a skill name or introduced a prompt conflict, cyrup says only `reloaded resources` and the diagnostics TUI-006 built are never shown. The data is re-collected server-side by the factory and discarded.
-
-**Fix** In the `session_swapped` arm (`app.rs:4143-4189`), after the settings re-read and before the replay, push the panel for the swapped-in session. `build_startup_report` is private in `cyrup/crates/cyrup/src/main.rs:1198`; move it to `cyrup-session-svc` or expose it as `cyrup_tui::StartupReport::from_session` behind the existing services accessors. pi does not gate it by swap reason, so neither should we initially. Pair with TUI-025's `/reload` status string and TUI-004's remaining `applyFromSettings`.
-
-**Verify** In `crates/cyrup-tui/tests/startup_resources_panel.rs`, drive a `session_swapped` whose services report one extension load error and assert `[Extension issues]` lands in committed scrollback even with `quietStartup=true`.
-
-## TUI-N03 — A theme chosen in `/settings` is applied live but never persisted
-
-**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:1794-1799`: `SelectorKind::Theme => { self.set_theme(UiTheme::builtin(value)); self.state.transcript.push_status(format!("theme → {value}")); None }`. Returning `None` means `handle_selector_key` (`app.rs:1713-1720`) yields `AppAction::Redraw`, no `AppCommand` reaches the run loop, and the `persist_setting(Global, …)` call at `app.rs:2327` is never made. The design is stated at `app.rs:1788-1791`. The submenu is the only entry point (`app.rs:1774-1777`, from `SettingRow::submenu("theme", …)` at `app.rs:3313`) — `open_selector(` has exactly one call site workspace-wide.
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:4300-4302`: `onThemeChange: (themeSetting) => { this.settingsManager.setTheme(themeSetting); void this.themeController.applyFromSettings(); }`. `onThemePreview` (`:4303` → `themeController.preview`) is the separate, non-persisting hook — pi distinguishes preview from confirm; cyrup treats confirm as a preview that sticks until exit.
-
-**Impact** The only in-app way to change theme does not survive the session. Worse with TUI-004 landed: `ThemeController::sync_with_terminal` persists a high-confidence OSC-11 detection into `settings.theme` only when the setting is UNSET (`cyrup/crates/cyrup-tui/src/theme.rs:1073-1081`) — exactly the state a never-persisted user choice leaves behind — so the next launch writes the auto-detected theme over the user's choice.
-
-**Fix** Give `confirm_selector`'s `Theme` arm an `AppCommand::ApplySetting { id: "theme", value }` return instead of `None`; the arm at `app.rs:2297-2330` already persists to Global and pushes the status. Keep `set_theme` for the immediate repaint. While there: `SelectorKind::Thinking` (`app.rs:1800-1808`) and `SelectorKind::ShowImages` (`:1809-1816`) have the same non-persisting shape but are currently **unreachable** — no `open_selector` call site constructs them, and the live paths are Shift+Tab (`app.rs:1320` → `AppCommand::CycleThinking` → `session.cycle_thinking_level()`, correct) and the `terminal.showImages` settings-grid toggle (correct). Either wire them like pi or delete them; do not leave a third half-live path.
-
-**Verify** App test: open the settings selector, drive the `theme` submenu to `light`, confirm, assert an `ApplySetting{id:"theme", value:"light"}` command is emitted, plus a settings-layer assertion that the global layer holds `"theme": "light"`.
-
-## TUI-N04 — The untrusted-project warning banner is never rendered at startup
-
-**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** high
-
-**cyrup** — a grep for `not trusted` across `cyrup/crates/cyrup-tui/src` and `cyrup/crates/cyrup/src` finds only `cyrup/crates/cyrup/src/subcommands.rs:408` (an `--approve` message on a non-interactive package path). The interactive boot sequence (`cyrup/crates/cyrup/src/main.rs:1264-1372`) pushes the startup panel (`:1346`) and replays the session (`:1357-1360`) with no trust check, and `App::replay_session` (`app.rs:759-858`) ends at `commit_tools()`. Both halves already exist: `AgentSessionServices::project_trusted` (`cyrup/crates/cyrup-session-svc/src/services.rs:68`, read at `app.rs:1998` for the `/trust` dialog) and `cyrup_config::has_trust_requiring_resources` (`cyrup/crates/cyrup-config/src/trust.rs:196-208`).
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3554` — `renderInitialMessages()` calls `renderProjectTrustWarningIfNeeded()`, body at `:3565-3583`: when `!isProjectTrusted() && hasTrustRequiringProjectResources(cwd)` it emits a `theme.fg("warning", …)` line reading `This project is not trusted. Project {CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart pi.`
-
-**Impact** Open cyrup in a repo shipping `.cyrup/` skills, prompts, themes or settings that has not been trusted, and those resources are silently ignored with no indication and no pointer to `/trust`. It is the surface that tells the user a security decision is in force.
-
-**Fix** After `push_loaded_resources` and before the replay in `cyrup/crates/cyrup/src/main.rs:1346-1357`, and in the `session_swapped` arm alongside the other per-session re-reads, evaluate `!services.project_trusted && cyrup_config::has_trust_requiring_resources(cwd, home)` and push a warning-styled entry with pi's string rebranded (`.cyrup`, `/trust`, `cyrup`). Reuse `StartupRole::Warning` (`startup.rs:39-41`) rather than inventing a role.
-
-**Verify** App test over a temp cwd containing `.cyrup/skills/x.md` with `project_trusted = false`: committed scrollback contains `This project is not trusted` in warning style; absent when `project_trusted = true` or when the cwd has no trust-requiring resources.
-
-## TUI-002 — Thinking blocks: fold-ordering, no markdown, no visible-content spacer
-
-**Kind** parity-bug · **Severity** low · **Effort** M · **Confidence** high
-
-**cyrup** — `thinking_text` (`cyrup/crates/cyrup-tui/src/transcript.rs:1857-1867`) folds *every* thinking block of the message into one string joined by `\n\n`, committed before the answer text (`app.rs:2842-2853`); the replay path does the same fold (`app.rs:779-786`). `thinking_lines` (`transcript.rs:868-878`) emits raw `Line::styled` per source line — documented as deliberate at `transcript.rs:861-867`. No `hasVisibleContentAfter` spacer rule.
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/assistant-message.ts:104-166` walks `message.content` in index order, keeping each *run* of adjacent thinking blocks as its own `Markdown` section (run collector at `:115-127`) interleaved with text sections, renders each through `Markdown(..., {color, italic})` (`:145-165`), and adds a blank only when more visible assistant content follows (`:133-137`, `:163-165`).
-
-**Impact** On interleaved-thinking models, all reasoning is hoisted above all prose instead of being interleaved as the model produced it; markdown in reasoning renders as literal syntax; spacing differs at the end of a message. `crates/cyrup-tui/tests/thinking.rs:147-163` exercises only adjacent blocks, so no test pins the divergence either way.
-
-**Fix** Change `thinking_text` to return `Vec<String>` of adjacent-run sections and have `app.rs:2842-2853` (and the replay walk at `app.rs:779-786`) commit them interleaved with text sections in content order. Route each section through the existing markdown renderer with the `thinkingText` style. Add the `has_visible_content_after` spacer condition.
-
-**Verify** Extend `tests/thinking.rs` with an interleaved `[think, text, think, text]` message and assert commit order; a markdown assertion that `**bold**` in reasoning renders bold-italic, not literally.
-
-## TUI-003 — Replay omits the compaction-count status
-
-**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
-
-**cyrup** — `App::replay_session` (`cyrup/crates/cyrup-tui/src/app.rs:759-863`) ends at `commit_tools()` (`:857`) with no compaction status. A grep for `Session compacted|compaction_count` over `cyrup/crates/cyrup-tui/src` and `cyrup/crates/cyrup/src` returns nothing. (A replayed extension `custom` message also draws with the built-in `[type] body` framing because the renderer lookup is async and this walk is synchronous — self-documented at `app.rs:753-758`; accepted, not owed work.)
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3557-3562` — after `renderInitialMessages`, pi emits `Session compacted {N} time(s)` when the count is non-zero.
-
-**Impact** A resumed session that has been compacted gives no indication that earlier context was summarized away, so the user cannot explain why the model has forgotten something.
-
-**Fix** Expose the compaction count on the session accessor already used by `replay_session`, and push a status line after `commit_tools()` (`app.rs:857`) when it is non-zero.
-
-**Verify** `crates/cyrup-tui/tests/session_replay.rs`: a session whose context carries two compaction summaries produces `Session compacted 2 time(s)` after the replayed conversation; a fresh session produces nothing.
+**Verify** App test: with a session reporting `is_compacting = true`, submit `hello` — assert no `prompt_accepted` call is made, the status line reads `Queued message for after compaction`, and the text is not echoed as a user turn; on `CompactionComplete` assert it is delivered exactly once.
 
 ## TUI-004 — No live colour-scheme sync; `/reload` does not re-apply themes
 
 **Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** high
 
-> **RE-RATED 2026-08-06, and two claims in the original entry were wrong.** This entry previously read
-> *"the rationale … is sound"* and *"the probe machinery itself is faithful"*, and was rated `low`.
-> Both statements were false, and a user hit the consequence live: a stray OSC-11 reply
-> (`11;rgb:0c0c/0b0b/1313`) typed itself into the prompt on launch. See **TUI-N09** for the bug and
-> its fix (`b0e57b3`). Two lessons were recorded from this, both structural rather than local:
->
-> 1. **The ADR-0001 substrate carve-out was applied too broadly.** "cyrup delegates rendering to
->    ratatui, so pi's hand-rolled renderer is out of scope" is correct for the *drawing* layer. It
->    was silently extended to behaviour that lives in pi's `TuiBase` but is not rendering at all —
->    input sanitation, terminal-reply handling, mode negotiation. Those are portable and in scope.
->    Before invoking ADR-0001 on a `tui.ts` line, check whether it draws anything.
-> 2. **Not-enabling a feature does not make its hazards moot.** The reasoning "mode 2031 is off, so
->    unsolicited pushes cannot arrive" ignored that cyrup *does* issue the OSC-11 background query
->    and so must handle its reply — and that a reply can arrive late, after the read loop has moved
->    on. pi handles both in one place (`handleTerminalInput`); cyrup handled neither.
+**cyrup** — Mode `2031` is never enabled and nothing consumes an unsolicited `CSI ? 997 ; N n`: `rg 2031 crates/` hits only the rationale prose at `crates/cyrup-tui/src/theme.rs:1483-1485`. Separately, `/reload` never touches the `ThemeController`: `rg 'apply_from_settings|set_registered_themes' crates/` → **zero**. The swap arm (`app.rs:6884-6995`) re-reads `outputPad`, `hideThinking`, `showImages`, `imageWidthCells` and `editorPaddingX` and never touches the controller, which is owned by `crates/cyrup/src/main.rs:1590-1600` and consulted once at boot.
 
-**cyrup** — mode `2031` is never enabled and nothing consumes an unsolicited `CSI ? 997 ; N n`. The
-rationale at `cyrup/crates/cyrup-tui/src/theme.rs:1088-1097` states crossterm surfaces no such
-event — true as far as it goes, but it was written as a justification for *not handling terminal
-replies at all*, which is the part that was wrong (TUI-N09). Separately, `/reload` never touches the
-`ThemeController`: the `C::Reload` arm (`app.rs:2435-2444`) and the swap arm (`app.rs:4143-4189`) do
-not call it, and the controller is owned by `cyrup/crates/cyrup/src/main.rs` and consulted once at
-boot (`main.rs:1272-1294`). The probe machinery (`terminal_query.rs`, `theme.rs:918-947`,
-`:1056-1084`) is faithful *in what it sends*; what it does with what comes back was not, until
-`crates/cyrup-tui/src/stray_reply.rs` landed.
+**upstream** — `pi/packages/tui/src/tui.ts:701, :731, :749` enable/disable mode 2031 and re-theme via `onTerminalColorSchemeChange`. `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:5734-5735` calls `setRegisteredThemes(...)` then `await this.themeController.applyFromSettings()` inside `handleReloadCommand`, immediately before `showLoadedResources` at `:5742`.
 
-**upstream** — `pi/packages/tui/src/tui.ts:686,716,737` enables/disables mode 2031 and re-themes via `onTerminalColorSchemeChange` (`pi/packages/coding-agent/src/modes/interactive/theme/theme-controller.ts:34`). `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:5471` awaits `themeController.applyFromSettings()` on reload, between `setRegisteredThemes` and `showLoadedResources`.
+> The ADR-0001 substrate carve-out does **not** cover this. The probe machinery is faithful in what it *sends*; what it does with what comes back was not, until `stray_reply.rs` landed. Not enabling mode 2031 does not make its hazards moot — cyrup still issues the OSC-11 query and must handle a late reply.
 
-**Impact** (1) Flipping the OS/terminal to dark mode mid-session leaves cyrup on the old palette until restart — a documented divergence, keep as such. (2) Editing a custom theme file and running `/reload` does not pick it up, and newly-registered extension themes are not re-registered.
+**Impact** (1) Flipping the OS/terminal to dark mode mid-session leaves cyrup on the old palette until restart. (2) Editing a custom theme file and running `/reload` does not pick it up, and newly-registered extension themes are not re-registered.
 
-**Fix** For (2): plumb the `ThemeController` into the app or expose a `ReapplyThemes` command, and in the `session_swapped` arm call `set_registered_themes(...)` then `apply_from_settings()` before the replay — the same place TUI-N02 adds the panel re-emit. Leave (1) as a recorded divergence in `theme.rs:1088-1097` unless crossterm gains an event.
+**Fix** For (2): plumb the `ThemeController` into the app or expose a `ReapplyThemes` command, and in the `session_swapped` arm call `set_registered_themes(...)` then `apply_from_settings()` before the replay — the same place TUI-N02 adds the panel re-emit. Leave (1) as a recorded divergence in `theme.rs:1483-1485` unless crossterm gains an event.
 
 **Verify** App test: `/reload` with a changed `settings.theme` and a newly-registered extension theme repaints to the new palette and lists the new theme.
 
-## TUI-010 — Ctrl+O expands only the live block; no status; committed entries always expanded
+## TUI-005 — Escape branches: bash-mode clear missing; bash child killed while streaming
 
-**Kind** parity-bug · **Severity** low · **Effort** M · **Confidence** high
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:1284-1294` `Action::ToolsExpand` toggles only `toggle_bash_expanded()`/`toggle_tool_expanded()` and returns `Redraw` with no status line. Committed entries render permanently expanded (`transcript.rs:1715` `tool_lines(run, true, …)`), and `Entry::CompactionSummary` emits its whole summary unconditionally (`transcript.rs:1743-1746`).
+**cyrup** — `crates/cyrup-tui/src/app.rs:1886-1913` `Action::Interrupt`: `branch_summary_in_flight` early-returns, then `if self.state.transcript.bash_running() { bash_complete_simple(None, true); commit_bash(); }` — a **plain `if`, not an `else if`** — and only afterwards reads `let streaming = self.state.status.streaming` (`:1904`). There is no bash-**mode** branch: `rg 'bash_mode|starts_with("!")' crates/cyrup-tui/src/app.rs` → nothing. The restore half is correct: `AppAction::InterruptRestoreQueued` → `drain_queue`, steering then follow-up, `restore_queued_to_editor`, then `abort()`.
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3883-3903` `setToolsExpanded` fans out to every message component and calls `showStatus('Tool output: expanded'|'collapsed')`; `pi/packages/coding-agent/src/modes/interactive/components/compaction-summary-message.ts:11,39-57` collapses by default.
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2766-2792` — four mutually exclusive `else if` branches: streaming → `restoreQueuedMessagesToEditor({abort:true})`; else bash child running → `abortBash()`; else `isBashMode` → clear the editor and exit bash mode (`:2773-2776`); else empty editor → double-escape. Because they are exclusive, pi never touches a bash child while streaming.
 
-**Impact** Compaction summaries, branch summaries and skill bodies flood the transcript with no way to collapse them, and Ctrl+O gives no feedback that it did anything.
+**Impact** Escape during a turn that also has a `!`-child kills the child as collateral — destructive, and the branch structure makes it unconditional. Escape in bash mode with a typed-but-unsent `!cmd` does nothing where pi clears it.
 
-**Fix** Adopt collapsed-at-commit-time (now the established pattern — `startup.rs:19-25` states the concession, and `d2c5509` added `Entry::Thinking` to the same family): render `CompactionSummary`, branch and skill entries collapsed with a `Ctrl+O`-style hint, apply the current expand flag at commit time, and add the `showStatus` line to `Action::ToolsExpand`.
+**Fix** Restructure `Action::Interrupt` (`app.rs:1886-1913`) into pi's exclusive chain: streaming first (return `InterruptRestoreQueued` without touching bash), then bash-child cancel, then a new bash-mode branch clearing the editor and dropping the `!` prefix, then the empty-editor double-tap (TUI-009). Land with TUI-009 so the precedence is right in one pass, and with TUI-031 so the compaction branch sits ahead of all four.
 
-**Verify** App test: a committed compaction summary renders as one collapsed line by default; with expand on before commit it renders in full; Ctrl+O pushes the status string.
+**Verify** App tests: (a) `!sleep 100` running **and** streaming, press Esc, assert the child is still alive and the queue restored; (b) editor holds `!foo`, nothing streaming or running, press Esc, assert the editor is empty and bash mode off.
+
+## TUI-006 — `[Extension issues]` renders 2 of pi's 4 diagnostic sources
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `rg 'command_diagnostics|shortcut_diagnostics|builtin_conflicts|CommandDiagnostic|ShortcutDiagnostic' crates/ -g '*.rs'` → **zero hits at HEAD**. `crates/cyrup-session-svc/src/services.rs:43-68` `StartupDiagnostics` carries only `{resources, extensions, models, flag errors}`, and `crates/cyrup/src/main.rs:1511-1568` `build_startup_report` maps exactly those. **One half did land since the baseline:** extension **tool** and **flag** conflicts are now recorded (`crates/cyrup-ext/src/registry.rs:222, :604`) and folded into `LoadExtensionsResult::errors` (`facade.rs:1108-1117`), so those reach the panel.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:1788-1792` — `[Extension issues]` is a four-source union: extension load errors, `getCommandDiagnostics()`, `getBuiltInCommandConflictDiagnostics()` (`:623`) and `getShortcutDiagnostics()`. Both remaining sources are live upstream: `core/extensions/runner.ts:296` `commandDiagnostics`, `:295` `shortcutDiagnostics` populated in `getShortcuts` at `:499-533` and exposed at `:539-541`.
+
+**Impact** Two extensions registering `/deploy`, an extension shadowing built-in `/model`, or two extensions claiming the same shortcut are all silent. The user sees an extension "loaded" and one of its commands simply never runs.
+
+**Fix** Add `commands: Vec<CommandDiagnostic>`, `builtin_conflicts: Vec<…>` and `shortcuts: Vec<ShortcutDiagnostic>` to `StartupDiagnostics` (`services.rs:43-68`); emit them from `cyrup-ext`'s registry disambiguation path and from `register_shortcut` (see TUI-N05); fold all three into the existing `[Extension issues]` heading in `build_startup_report` (`main.rs:1511-1568`). Secondary: scope-group the listing bodies and render `diagnostics.models` in the panel. Hand the `StartupDiagnostics` field additions to area 08.
+
+**Verify** `crates/cyrup-tui/tests/startup_resources_panel.rs`: two extensions declaring the same slash command produce a conflict line; an extension shadowing a built-in produces the built-in-conflict line; both appear with `quietStartup=true`.
+
+## TUI-008 — Seven upstream global keybinding ids are unbound
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:96-114` `Action::from_id` recognizes exactly 14 ids; `app.model.select`, `app.thinking.toggle`, `app.message.copy` and `app.session.{new,tree,fork,resume}` are all absent, and `Keymap::default` binds no Ctrl+L / Ctrl+T / Ctrl+X. `app.session.toggleNamedFilter` **is** now handled, but only inside the session selector (`keymap.rs:801`).
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2804-2814` wires all seven (`onAction("app.model.select", … showModelSelector)`, `"app.thinking.toggle"`, `"app.message.copy"`, `"app.session.new/tree/fork/resume"`), declared at `pi/packages/coding-agent/src/core/keybindings.ts:115-118` with defaults ctrl+l / ctrl+t / ctrl+x at `:85, :87-90, :99-102`.
+
+**Impact** A user's `keybindings.json` carrying any of these ids silently does nothing, and the documented default chords are dead keys.
+
+**Fix** Extend `Action` and `Action::from_id` (`keymap.rs:96-114`) with the seven ids and route them. `app.thinking.toggle` is mechanical — `TranscriptView::set_hide_thinking_block` exists and the settings row already persists `hideThinkingBlock`. `app.model.select` has its destination built with no key routed to it. The `app.pageUp`/`app.pageDown` spelling half of the original item moved to **TUI-028**, which owns the whole namespace question.
+
+**Verify** Keymap unit tests round-tripping each id, plus app tests asserting Ctrl+T flips `hide_thinking` and Ctrl+L opens the model selector.
+
+## TUI-009 — Double-Escape → tree/fork never implemented although `doubleEscapeAction` ships in `/settings`
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `rg 'last_escape|double_escape' crates/ -g '*.rs'` finds only the setting getter (`crates/cyrup-config/src/settings.rs:801-804`), the `/settings` row (`crates/cyrup-tui/src/app.rs:5719-5721`) and one unrelated test name in `stray_reply.rs`. `AppState` has no `last_escape` field (contrast `last_sigint`, used in the `Action::Clear` arm) and `Action::Interrupt` (`app.rs:1886-1913`) has no empty-editor branch.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2777-2791`, the fourth `else if`: reads `getDoubleEscapeAction()` and applies a 500 ms window.
+
+**Impact** A live, persisted, documented setting has no consumer: choosing `fork` or `tree` changes nothing.
+
+**Fix** Add `last_escape: Option<Instant>` to `AppState` mirroring `last_sigint`; in the final `Action::Interrupt` branch, on a second Escape inside the 500 ms window dispatch `/tree` or `/fork` per `settings.double_escape_action()`. Must land with TUI-005 so the branch order matches pi.
+
+**Verify** App test: two Escapes on an empty editor within the window emit the tree command; outside the window, nothing; with `none`, nothing.
+
+## TUI-012 — No argument autocomplete for `/model <prefix>` or `/login <prefix>`
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/autocomplete.rs:28-36` `CompletionContext` is still exactly `{Slash, Path, Mention}`; `slash_context` (`:140-142`) bails on any whitespace in `before`. `has_arg_completion` (`crates/cyrup-tui/src/commands.rs:44`) still has only the two `const fn` constructors as writers (`:91`, `:105`) and **no reader**.
+
+**upstream** — `pi/packages/tui/src/autocomplete.ts`'s argument-completion path, fed by `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:648` (`modelCommand.getArgumentCompletions = (prefix) => …`) and `:674` (the same for `loginCommand`), threaded through at `:699`.
+
+**Impact** Typing `/model anth<Tab>` gives nothing; the user must know the exact `provider/model` string or open the selector. `has_arg_completion` is dead metadata claiming a feature that does not exist.
+
+**Fix** Add `CompletionContext::CommandArg { command, prefix }` to `autocomplete.rs`, produced when `before` starts with `/`, names a command with `has_arg_completion`, and has exactly one whitespace run; feed it from the model catalog and provider list already reachable through the session services. Land alongside TUI-029, which needs the same seam.
+
+**Verify** Autocomplete unit tests for `/model anth`, `/login op`, and a negative for a command without `has_arg_completion`.
+
+## TUI-014 — Extension widgets (`ui.setWidget`) now reach the TUI and are stored where nothing renders them
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — The host sink is now installed (`crates/cyrup-tui/src/app.rs:3090-3096` `install_ui_sinks`), so `UiEffect::SetWidget` **does** reach the TUI — and is dropped into a field with no reader: `app.rs:3228` `UiEffect::SetWidget { widget } => self.state.extension_widget = Some(widget)`, declared at `:390`, initialised at `:516`, cleared at `:1211`. `rg 'extension_widget' crates/` returns only those sites plus one test assertion (`tests/extension_ui_reset_on_swap.rs:36`) — no render function reads it, and `live_region_height` reserves no rows.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2109-2160` `setExtensionWidget` mounts widgets as real components into `widgetContainerAbove` / `widgetContainerBelow` (`:492-493`, `:557-558`, `:879-894`), keyed by `key`, with a `placement` option and `MAX_WIDGET_LINES = 10` (`:2197`), updated in place at `:2196-2233`.
+
+**Impact** An extension calling `ui.setWidget` gets a success return and draws nothing. Status widgets — the intended surface for long-running extension state — are unusable. Because the value is stored, a future implementation that starts reading the field would render a stale widget from an extension that has since been unloaded.
+
+**Fix** Render `state.extension_widget` in the live region above the editor, keyed by `key` with pi's `placement` and a 10-line cap, and include its height in `live_region_height`. Land with TUI-033, which needs the same live-region plumbing.
+
+**Verify** App test: an extension emits `ui.setWidget`, assert the text appears in the live region and that a second emit with the same key replaces rather than appends.
+
+## TUI-015 — No render coalescing — one draw per streaming event, no frame budget
+
+**Kind** cyrup-original · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:6849-6875`: the run loop's `maybe_ev = events.next()` arm still ends in `self.draw_synchronized()?;` — one full draw per `MessageUpdate` / `TextDelta`. `rg 'MIN_RENDER_INTERVAL|needs_render|request_render' crates/cyrup-tui/src` → no render-coalescing machinery of any kind.
+
+**upstream** — `pi/packages/tui/src/tui.ts:343` `private static readonly MIN_RENDER_INTERVAL_MS = 16`, with `renderTimer` / `lastRenderAt` / `immediateRenderScheduled` at `:340-342` and `requestRender` coalescing on top of them.
+
+**Impact** On a fast stream cyrup redraws per token, and the per-draw cost is now higher than when this was filed: every frame re-runs `thinking_lines` through the markdown renderer (TUI-002's closed half), and on any turn whose tools returned images the raster path re-encodes per token.
+
+**Fix** Introduce a `needs_render` flag plus a `MIN_RENDER_INTERVAL` (16 ms) timer in the run loop: event arms set the flag, a `tokio::time::interval` arm performs the draw. Memoize the image raster output per `(image, width_cells)` in `ToolRun`.
+
+**Verify** Bench/counter test: N streaming deltas within one interval produce one draw; an image-bearing turn rasterizes once, not per delta.
+
+## TUI-016 — Queued messages are now entirely invisible — texts discarded, footer count deleted
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — **Regressed since this item was filed.** `crates/cyrup-tui/src/app.rs:4612-4614` `QueueUpdate` still calls only `status.set_queued(steering.len() + follow_up.len())`, discarding the texts — and the fidelity work then deleted the footer segment that displayed the count (TUI-FIDELITY C14): `grep -n 'queued' crates/cyrup-tui/src/status.rs` now returns only the doc lines `:76`, `:80-81` and the setter at `:149-150`, with **no render site anywhere**. The count is dead state and the queue has no surface at all.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:4190-4207` `updatePendingMessagesDisplay` renders per-message `Steering: {text}` / `Follow-up: {text}` `TruncatedText` rows above the editor plus the `↳ {key} to edit all queued messages` hint, fed from `getAllQueuedMessages` (`:4192`), which folds `compactionQueuedMessages` (`:4162-4166`).
+
+**Impact** The user cannot see *that* anything is queued, let alone what, cannot tell steering from follow-up, and is never told the queue can be edited — which matters because TUI-005's Escape restore is the action that hint advertises. This is the concrete instance of the two-document drift called out in the header block: a fidelity fix removed the only surface a gap item depended on, and nothing replaced it.
+
+**Fix** Carry the message texts on `QueueUpdate` into `AppState`, render truncated per-message rows in the live region above the editor, and append the hint line resolved from the keymap. Fold TUI-031's compaction queue in through the same `getAllQueuedMessages` shape.
+
+**Verify** App test: two steering + one follow-up produce three labelled rows in the right order plus the hint line; the rows clear when the queue drains.
+
+## TUI-017 — Attachment image strip: rasterizes without a protocol, invented placeholder, no 60-cell cap
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — Every site re-read at HEAD. `crates/cyrup-tui/src/image.rs:100-107` `from_capabilities` still installs `ProtocolType::Halfblocks` when `caps.images == None`; `:152-171` `render` takes the placeholder branch only on `!show_images`, a zero area, or an encode error; `:242-247` `placeholder_line` still emits the cyrup-invented `🖼 {label} ({w}×{h})`; `crates/cyrup-tui/src/app.rs:6085-6097` `render_images` passes `area.width` with no `image_width_cells` and no 60-cell cap. `image_fallback_text` (`image.rs:353-367`) — pi's real format — exists in the same file and is used only by the tool-result path.
+
+**upstream** — `pi/packages/tui/src/components/image.ts:65` `Math.max(1, Math.min(width - 2, this.options.maxWidthCells ?? 60))` and `:114-118`, which emit one `imageFallback` line whenever `!caps.images`.
+
+**Impact** Attaching an image on a terminal with no image protocol dumps a coloured half-block raster (unreadable on monochrome, ~20–30 rows of scrollback) instead of one `[Image: …]` line, and on a wide terminal the raster is unbounded where pi caps at 60 cells.
+
+**Fix** In `image.rs`: (a) take the placeholder branch in `render` when `caps.images.is_none()`; (b) replace `placeholder_line`'s `🖼 …` with `image_fallback_text` from the same file; (c) clamp `cell_size` / `render_images` to `min(width - 2, image_width_cells)` with pi's 60 default. The tool-result path's own capability gate is TUI-N01 — different call site, different fix. `crates/cyrup-tui/tests/image.rs` currently pins (a) and (b) — see TUI-N08.
+
+**Verify** With a no-protocol capability set, an attachment renders exactly one `[Image: …]` line; with a graphical set, the raster paints and never exceeds 60 cells.
+
+## TUI-028 — Editor and input keybinding ids use an `editor.*` namespace upstream abandoned
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:157-185` `EditorAction::from_id` matches **24** ids spelled `editor.cursorLeft`, `editor.cursorUp`, … `editor.pageUp`, `editor.newLine`, `editor.submit`, `editor.tab` — none namespaced `tui.`. They are merged from the user's file at `crates/cyrup/src/main.rs:1624-1626` → `crates/cyrup-tui/src/app.rs:951-963` `load_keybindings_json`, which fans the same JSON out to six maps, each of whose `merge_json` silently ignores ids it does not recognize (`keymap.rs:487-489` and its five twins). cyrup also invents `app.pageUp` / `app.pageDown` (`keymap.rs:102-103`) and a whole `tui.autocomplete.{previous,next,accept,acceptSubmit,cancel}` family (`keymap.rs:606-613`). There is no legacy-name migration table: `rg 'migrat' crates/cyrup-tui/src/keymap.rs` → nothing.
+
+**upstream** — `pi/packages/tui/src/keybindings.ts:9-32` declares `tui.editor.cursorUp` … `tui.editor.undo` (22 ids) and `tui.input.{newLine,submit,tab,copy}`, defaults at `:64-137`. That is already the spelling at the ported baseline (`git show v0.83.0:packages/tui/src/keybindings.ts` → `"tui.editor.cursorUp"` at `:9`, `"tui.editor.pageUp"` at `:19`). pi *migrates the older bare names forward*: `pi/packages/coding-agent/src/core/keybindings.ts:208-270` `KEYBINDING_NAME_MIGRATIONS` maps `cursorUp → tui.editor.cursorUp`, `pageUp → tui.editor.pageUp`, `newLine → tui.input.newLine`, applied by `migrateKeybindingsConfig` (`:294-311`) on every load. pi has no `app.pageUp`/`app.pageDown` and no `tui.autocomplete.*`: autocomplete navigation reuses `tui.select.up/down/cancel/confirm` and `tui.input.tab` (`pi/packages/tui/src/components/editor.ts:664-712`).
+
+> **Refuter's caveat, adopted:** the count is 24, not 26, and the situation is worse than the auditor stated — cyrup's `editor.cursorLeft` matches **neither** pi's current `tui.editor.cursorLeft` **nor** pi's legacy bare `cursorLeft`, so a config written from either era of pi's documentation is inert. `tui.input.copy` also has no cyrup destination at all.
+
+**Impact** A user who writes `~/.cyrup/keybindings.json` from pi's documented id list gets nothing for all 24 editor/input bindings — no error, no diagnostic, the defaults just stay. The autocomplete family is worse than inert: rebinding `tui.select.up` in cyrup moves selector highlights but **not** the autocomplete popup, because cyrup routes the popup through a separate invented map, so one user-visible action needs two different config keys.
+
+**Fix** In `crates/cyrup-tui/src/keymap.rs`, rename the `EditorAction::from_id` arms to `tui.editor.*` / `tui.input.*` (keeping the old spellings as accepted aliases the way pi's migration table does); drop `app.pageUp` / `app.pageDown` in favour of `tui.editor.pageUp` / `pageDown` on the editor map (the deferral logic at `app.rs:1685-1687` stays); delete `AutocompleteAction::from_id`'s invented ids so the popup resolves through `SelectKeymap` + `tui.input.tab` as pi does. Optionally port `KEYBINDING_NAME_MIGRATIONS` into `keybindings_object` (`keymap.rs:32`).
+
+**Verify** `crates/cyrup-tui/tests/keybindings.rs`: a JSON containing `{"tui.editor.cursorWordLeft": "alt+h"}` rebinds the editor; `{"tui.select.up": "ctrl+k"}` moves the autocomplete highlight as well as selector highlights; a round-trip test asserting every id in pi's `TUI_KEYBINDINGS` + `KEYBINDINGS` resolves to some cyrup action.
+
+## TUI-029 — Extension autocomplete providers are never consulted by the interactive editor
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — The whole guest→host chain exists and terminates in nothing. `ExtensionHost::autocomplete_suggest` (`crates/cyrup-ext/src/host/live.rs:1327-1343`, whose doc names it as the port of pi's `AutocompleteProviderFactory` chain) has **no production caller** — `rg 'autocomplete_suggest' crates/ -g '*.rs'` returns the definition, the SDK guest side (`crates/cyrup-ext-sdk/src/{api.rs:844,guest.rs:312-318,macros.rs:120-124}`) and two tests (`crates/cyrup-ext-sdk/tests/ergonomic.rs:260,:267`, `crates/cyrup-ext/tests/wasm_provider.rs:115`). Host-side `add_autocomplete_provider` (`crates/cyrup-ext/src/host/services.rs:1468-1471`) only increments a counter read back by the guest (`:1474-1476`). The TUI's autocomplete is closed over three sync contexts with no extension seam: `crates/cyrup-tui/src/autocomplete.rs:28-36`, and `rg 'autocomplete' crates/cyrup-tui/src/app.rs` finds only `set_autocomplete_max_visible`, popup geometry and the Esc-cancel arm.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2370-2373` `addAutocompleteProvider: (factory) => { this.autocompleteProviderWrappers.push(factory); this.setupAutocompleteProvider(); }`; `setupAutocompleteProvider` (`:723-738`) folds every registered wrapper over the base provider, unions their `triggerCharacters`, and installs the result on both the default and any custom editor (`:734-737`). Re-run at `:1886`, `:2182`, `:2372`, `:4444`, `:5739`. Present at v0.83.0.
+
+**Impact** An extension that registers an autocomplete provider — the documented way to add trigger-character or `@`-style completions — produces zero suggestions in the shipped interactive mode, with a successful registration return. The capability is fully built on both the WIT and SDK sides and dies at the last hop, so the failure looks like a cyrup bug to the extension author and there is no diagnostic.
+
+**Fix** Give `crates/cyrup-tui/src/autocomplete.rs` an extension pass: after `slash_context` / `path_context` / `mention_query` produce a base `Autocomplete` (or `None`), if `ext_host.autocomplete_provider_count() > 0` call `ExtensionHost::autocomplete_suggest(base, {lines, cursorLine, cursorCol, force})` from the run loop — spawned, not inline, following the discipline `AppAction::ExtensionShortcut` already uses at `app.rs:6606-6626`, since a guest can re-enter `ui.*` — and feed the folded result back into the popup through the existing extension→TUI command channel. Re-run the fold on session swap alongside `set_extension_shortcuts` (`app.rs:6991-6993`).
+
+**Verify** App test with a stub extension host whose `autocomplete_suggest` appends one item: typing a trigger character shows that item in the popup and accepting it inserts the guest-supplied text; with zero registered providers the popup is byte-identical to today's.
+
+## TUI-030 — Nine `ExtensionUIContext` methods have no cyrup counterpart at all
+
+**Kind** not-ported · **Severity** medium · **Effort** L · **Confidence** confirmed
+
+**cyrup** — `rg` across all of `crates/` returns **zero hits** for each of `set_working_message`, `set_working_visible`, `set_working_indicator`, `set_hidden_thinking_label`, `on_terminal_input`, `set_editor_component`, `get_all_themes`. `crates/cyrup-session-svc/src/host_services.rs:142-174` enumerates the complete `UiEffect` surface — Notify, SetStatus, SetWidget, SetHeader, SetFooter, SetTitle, SetEditorText, SetToolsExpanded — eight variants, none of them any of the above. The working-band copy is fixed at `crates/cyrup-tui/src/status_indicator.rs:176-188`; the hidden-thinking label is the constant `HIDDEN_THINKING_LABEL` used at `crates/cyrup-tui/src/transcript.rs:1226`. `set_theme` exists only as the TUI's own internal method (`app.rs:3400`), not as an extension capability.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2344-2396` `createExtensionUIContext()` returns all of them: `onTerminalInput` (`:2350` → `addExtensionTerminalInputListener`, `:2120-2127`, with `rebindExtensionTerminalInputListeners` at `:828` and the clear at `:2174`), `setWorkingMessage` (`:2352-2357`), `setWorkingVisible` (`:2358`), `setWorkingIndicator` (`:2359`), `setHiddenThinkingLabel` (`:2093-2101`, `:2360`), `setEditorComponent`/`getEditorComponent` (`:2374-2375`), `getAllThemes`/`getTheme`/`setTheme` (`:2379-2392`, the last persisting through `settingsManager.setTheme`). All present at the ported baseline.
+
+**Impact** Seven documented extension capabilities are unimplementable in cyrup. An extension cannot replace `Working...` with what it is actually doing, cannot hide the working band while it owns the screen, cannot relabel the hidden-thinking placeholder, cannot observe raw terminal input (the hook a terminal-integration extension needs), cannot supply a custom editor component, and cannot enumerate or switch themes. Because `resetExtensionUI` (`interactive-mode.ts:2175-2193`) restores all of them on reload, an extension written against pi will also leave cyrup in whatever state it reached through the six variants that do exist.
+
+**Fix** Extend `UiEffect` (`crates/cyrup-session-svc/src/host_services.rs:142-174`) with `SetWorkingMessage{Option<String>}`, `SetWorkingVisible{bool}`, `SetWorkingIndicator{Option<Value>}`, `SetHiddenThinkingLabel{Option<String>}` and the theme trio, and handle them in `App::apply_ui_effect` (`crates/cyrup-tui/src/app.rs:3195-3228`) against `status_indicator`'s message/visibility, the transcript's hidden label and `set_theme`. Reset all of them from `rebind_session` (`app.rs:1209-1211`), mirroring `resetExtensionUI`. **`onTerminalInput` and `setEditorComponent` need a WIT/world change and must be scoped with area 06.**
+
+**Verify** `crates/cyrup-tui/tests/extension_ui_effects.rs`: an extension setting a working message changes the band text and a later `None` restores `Working...`; `setWorkingVisible(false)` removes the band row; `setHiddenThinkingLabel("redacted")` changes the committed placeholder; all four reset to defaults across a session swap.
+
+## TUI-032 — `/settings` is missing the `Warnings` and `Thinking level` submenus
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — The cyrup settings grid is `crates/cyrup-tui/src/app.rs:5595-5745`; its ids are `theme`, `compaction.enabled`, `terminal.showImages`, `terminal.imageWidthCells`, `images.autoResize`, `images.blockImages`, `enableSkillCommands`, `showHardwareCursor`, `terminal.clearOnShrink`, `editorPaddingX`, `outputPad`, `autocompleteMaxVisible`, `httpIdleTimeoutMs`, `hideThinkingBlock`, `collapseChangelog`, `quietStartup`, `enableInstallTelemetry`, `terminal.showTerminalProgress`, `steeringMode`, `followUpMode`, `transport`, `doubleEscapeAction`, `treeFilterMode`, `defaultProjectTrust`. There is no `warnings` row and no `thinking` row. `warnings.anthropicExtraUsage` **is** fully parsed and merged (`crates/cyrup-config/src/settings.rs:52, :879-890`, tests at `:2039`, `:2088`) with no editor. `SelectorKind::Thinking`'s confirm arm exists at `app.rs:3404-3412` but is **unreachable** — `open_selector` (`:2167`) has exactly one call site, `:3380`, which only ever constructs `SelectorKind::Theme`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/settings-selector.ts:596-609` the `warnings` row (`submenu: … new WarningSettingsSubmenu(currentWarnings, …)`, body at `:138-165` with its single `anthropic-extra-usage` item) and `:610-631` the `thinking` row (`label: "Thinking level"`, `submenu: … new SelectSubmenu("Thinking Level", …, config.availableThinkingLevels, …, callbacks.onThinkingLevelChange)`). Both present at the ported baseline.
+
+**Impact** The Anthropic paid-extra-usage warning cannot be turned off from inside cyrup even though the setting is honoured — the only route is hand-editing `settings.json`. And the thinking-level picker cyrup already built has no way in: Shift+Tab cycles blindly through the levels with no list of what they are or what they cost, which is exactly the affordance pi's submenu provides.
+
+**Fix** Add two `SettingRow::submenu` rows to `settings_rows` (`app.rs:5595-5745`): `"warnings"` opening a toggle list over `eff.warnings()` and persisting through the existing `AppCommand::ApplySetting` path (`app.rs:4040`/`:4116`), and `"thinking"` routed to the already-built `SelectorKind::Thinking` via `open_selector` — which also requires giving that arm a persisting return, the same change TUI-N03 needs for `Theme`.
+
+**Verify** `crates/cyrup-tui/tests/settings_trust_selectors.rs`: opening `/settings` lists a `Warnings` row whose submenu toggles `anthropicExtraUsage` and writes it to the global layer; a `Thinking level` row opens the thinking selector and a confirm persists the level.
+
+## TUI-033 — `ui.setHeader` / `ui.setFooter` are delivered to the TUI and dropped into fields nothing renders
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:3226-3227` `UiEffect::SetHeader { content } => self.state.extension_header = Some(content)` and `UiEffect::SetFooter { content } => self.state.extension_footer = Some(content)`. Fields declared at `app.rs:382-385`, initialised `:514-515`, cleared `:1209-1210`. `rg 'extension_header|extension_footer' crates/` returns **only** those sites plus four test assertions (`tests/extension_ui_effects.rs:213-214`, `tests/extension_ui_reset_on_swap.rs:34-35`). Neither name appears in `render`, `region_constraints` or any chrome function — checked across the whole crate, not just `app.rs`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2362-2363` wires `setFooter` / `setHeader` into `setExtensionFooter` (`:2235-2257`) and `setExtensionHeader` (`:2262-2290`). The footer version clears `footerContainer` and swaps the extension component in for the built-in footer, restoring the built-in when the factory is `undefined` (`:2245-2254`); the header version splices the custom header into `headerContainer` in place of `builtInHeader` (`:2273-2290`). Both are reset by `resetExtensionUI` (`:2175-2176`). Present at v0.83.0.
+
+**Impact** An extension replacing the header or footer gets a success return and nothing happens — the built-in footer keeps drawing. Because cyrup stores the value, the state also survives until the next `rebind_session`, so a future implementation that starts reading the field would suddenly render a stale header from an extension that has since been unloaded. This is the residue TUI-S01's closure left behind; TUI-014 scopes itself explicitly to widgets and does not cover these two.
+
+**Fix** In `crates/cyrup-tui/src/app.rs`, render `state.extension_header` as the first row of the message region (replacing the compact startup block when present) and `state.extension_footer` in place of `StatusLine`'s rows in the footer region — the same swap semantics pi's containers give, including restoring the built-in when the value is cleared. Include the header's height in the layout constraints at `app.rs:6005-6014` so it does not steal editor rows. Land with TUI-014, which needs the same live-region plumbing.
+
+**Verify** `crates/cyrup-tui/tests/extension_ui_effects.rs`: an extension emitting `ui.setFooter` paints its text where the model/cwd footer was and clearing it restores the built-in footer; `ui.setHeader` paints above the transcript; both vanish across a session swap.
+
+## TUI-034 — No markdown-transformer hook — extension transformers and pi's Mermaid renderer are both absent
+
+**Kind** upstream-drift · **Severity** medium · **Effort** L · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/markdown.rs` exposes `render(text, width, theme)` / `render_with_hyperlink_support` / `render_with_default_style`, all funnelling into `render_inner(text, width, theme, color, italic, hyperlinks)` (`:126-176`) — no transform parameter and no hook; `rg 'transform' crates/cyrup-tui/src/markdown.rs` → nothing. `rg -i mermaid crates/` finds only two comments citing pi's `mermaid.ts:15` fence test (`markdown.rs:964-965`, `tests/markdown.rs:841`) — no renderer. There is no `mermaidRendering` settings row in the grid at `app.rs:5595-5745`, and no `MarkdownTransformer` anywhere in the extension host or WIT surface.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/markdown-transform.ts:3-10` `createMarkdownTransform(messageType, isStreaming, transformers)`, consumed by `new Markdown(..., { transform: createMarkdownTransform("assistant", …) })` at `components/assistant-message.ts:108-113` and `"assistant-thinking"` at `:146-162`, and inside `Markdown` at `packages/tui/src/components/markdown.ts`. The public API is `registerMarkdownTransformer` at `packages/coding-agent/src/core/extensions/types.ts:1292` (type at `:1153`, re-export `:1703`). Mermaid ships as one of these transformers: `components/mermaid.ts:60` `createMermaidMarkdownTransformer({getMode, theme})`, with the `mermaid-rendering` settings row (`values: ["off","final","streaming"]`) at `components/settings-selector.ts:540-546`. **New in the drift window** — `git show v0.83.0:packages/coding-agent/src/core/extensions/types.ts | rg MarkdownTransformer` → nothing; landed in pi `66534fbdc` / `05e89b418` for v0.84.0.
+
+**Impact** ` ```mermaid ` fences render as a raw code block where pi draws a Unicode diagram, and the `mermaidRendering` setting a pi user expects is absent. More structurally, no extension can rewrite markdown before it is drawn — the single hook pi routes every assistant text and thinking section through, and the mechanism its own diagram support is built on.
+
+**Fix** Add an optional transform callback to `render_inner` (`markdown.rs:157`) and thread it from `transcript.rs`'s assistant-text and `thinking_lines` (`:1232`) call sites, keyed by pi's `messageType`/`isStreaming` context. Then either port a Mermaid renderer as a built-in transformer behind a `mermaidRendering` settings row, or expose the hook to guests via a WIT `markdown-transform` export (**scope the WIT half with area 06**). LaTeX — the sibling v0.84.0 markdown feature — is already ported (`crates/cyrup-tui/src/markdown/latex.rs`, 2242 lines), so the precedent for the built-in half exists.
+
+**Verify** Markdown unit test: a ` ```mermaid ` fence renders box-drawing output with `mermaidRendering=final` and a plain code block with `off`; a registered transformer that uppercases its input changes the rendered assistant text and does not change tool output.
+
+## TUI-037 — `/reload` never persists an implicitly-granted project trust
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `rg 'implicit_project_trust|implicit_trust|save_implicit' crates/ -g '*.rs'` → **zero hits**, and the `session_swapped` arm (`crates/cyrup-tui/src/app.rs:6884-6995`) touches no trust state at all. `C::Reload` (`app.rs:4235-4242`) only sets `pending_swap_status`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:5746` calls `const savedImplicitProjectTrust = this.maybeSaveImplicitProjectTrustAfterReload();` inside `handleReloadCommand`. The body at `:4683-4706` checks `this.autoTrustOnReloadCwd === cwd`, then `isProjectTrusted() && hasTrustRequiringProjectResources(cwd)`, and writes `trustStore.set(cwd, true)` through a `ProjectTrustStore` — with an explicit `showWarning("Could not save project trust after reload: …")` on failure. The saved flag also feeds the reload status string variant TUI-025 tracks.
+
+**Impact** A project the user trusted implicitly this session silently loses that decision across `/reload`, so its `.cyrup/` resources go back to being ignored — and with TUI-N04 open there is no banner to say so either. It fails closed, so it is not a security bypass, but it is a persisted security decision being silently dropped.
+
+**Fix** Add a `maybe_save_implicit_project_trust_after_reload()` to `App` mirroring `interactive-mode.ts:4683-4706`: hold the `auto_trust_on_reload_cwd` that granted implicit trust, and in the `session_swapped` arm — the same place TUI-N02 adds the panel re-emit and TUI-004 re-applies themes — write it through the trust store when the cwd matches and the project still has trust-requiring resources (`cyrup::has_trust_requiring_project_resources`, `crates/cyrup/src/startup_ui.rs:340-344`), pushing pi's warning on failure. Land as one S with TUI-N02, TUI-004 and TUI-025, which all touch this call site.
+
+**Verify** App test over a temp cwd with `.cyrup/skills/x.md` and implicit trust granted this session: after `/reload`, the trust store holds `cwd → true` and the reload status carries pi's `; saved project trust` variant; with no implicit grant, the store is untouched.
+
+## TUI-044 — `undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/editor.rs:748-756`:
+
+```rust
+fn undo(&mut self) {
+    if let Some(snap) = self.undo.pop() {
+        self.lines = snap.lines;
+        self.row = snap.row.min(self.lines.len().saturating_sub(1));
+        self.col = self.col.min(self.cur_len());
+        self.exit_history();
+    }
+}
+```
+
+The third line reads `self.col`, i.e. the **live pre-undo** column, and merely clamps it. `rg 'snap\.col' crates/cyrup-tui/src/editor.rs` returns nothing — the field populated at `:718` is dead. The `E::Undo` arm (`:1541-1546`) resets `last_action` and refreshes autocomplete but never touches `preferred_visual_col` (`:144`, cleared by `reset_preferred_col()` at `:601-603`), so a stale sticky goal column survives an undo too.
+
+**upstream** — `pi/packages/tui/src/components/editor.ts:2016-2030` @v0.83.0 (v0.84.1 `:2028`): `undo()` does `Object.assign(this.state, snapshot.state)`, and `EditorState` is `{ lines, cursorLine, cursorCol }` (`:209-213`), so **both** cursor coordinates are restored from the snapshot. The same function then explicitly sets `this.lastAction = null; this.preferredVisualCol = null;` before firing `onChange`.
+
+**Impact** — after Ctrl+-, the caret is wherever it happened to be rather than where the undone edit happened. Concrete: text `hello`, caret at 5, Ctrl+Y yanks `world` (snapshot taken at col 5); move the caret to col 2; Ctrl+-. pi puts the caret back at col 5 next to the restored text; cyrup leaves it at col 2. Because undo has already swapped the whole buffer underneath, the very next keystroke inserts or deletes at a position the user did not choose — a wrong-edit path, not merely a cosmetic one. The unreset `preferred_visual_col` compounds it: the first Up/Down after an undo can jump to a column from the pre-undo layout.
+
+**Fix** — `editor.rs:750-754` — restore from the snapshot: `self.row = snap.row.min(self.lines.len().saturating_sub(1)); self.col = snap.col.min(self.cur_len());` (clamping only for safety, since `cur_len()` depends on the just-restored `row`). Add `self.reset_preferred_col();` inside `undo()` to match `editor.ts:2022`. **Fold into TUI-042's change** so `Snapshot` is corrected once.
+
+**Verify** — `crates/cyrup-tui/tests/editor.rs`: set text `hello`, caret 5, `E::Yank` with `world` in the kill ring, then `E::CursorLeft` ×8 (caret 2), then `E::Undo`; assert `(row, col) == (0, 5)`. Second case asserting Up/Down immediately after an undo re-seeds the goal column from the restored caret.
+
+## TUI-045 — An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed (crossterm's source read directly, not assumed)
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:7125-7152` is the whole input pipeline: `event::poll(wait)` → `event::read()` → `StrayReplyFilter::push` → `map_event`. There is **no sequence-reassembly stage of cyrup's own**; the only buffering is crossterm's. crossterm 0.29.0 reassembles a split CSI correctly (`src/event/source/unix/tty.rs:247-268` pushes one byte at a time and keeps `self.buffer` on `Ok(None)`) — **except for a lone ESC**: `src/event/sys/unix/parse.rs:34-41` is `if buffer.len() == 1 { if input_available { Ok(None) } else { Ok(Some(Esc)) } }`, and `input_available` is `read_count == TTY_BUFFER_SIZE` (`tty.rs:149-154`, `TTY_BUFFER_SIZE = 1_024` at `:40`). So any read that does not fill 1,024 bytes and ends on `0x1B` emits `Esc` and clears the buffer; the sequence's tail arrives in the next read and is decoded as literal characters (`\x1b` `[` `A` → `Esc`, `Char('[')`, `Char('A')`). `stray_reply.rs:29-32` documents that cyrup **already observes this exact split form in the wild** ("When the reply is split across `read(2)` calls exactly at the `ESC` byte the opener instead arrives as `Key(Esc)` then `Key(']')`"), but its state machine only rescues an OSC 11 frame — every other sequence class falls through.
+
+**upstream** — this is the entire reason `pi/packages/tui/src/stdin-buffer.ts` exists; its header `:1-18` states it: "stdin data events can arrive in partial chunks… Without buffering, partial sequences can be misinterpreted as regular keypresses", with a worked example of `\x1b` / `[<35` / `;20;5m` arriving as three events. `extractCompleteSequences` (`:192-255`) walks the buffer and returns `{ sequences, remainder }`; `process()` (`:371-386`) keeps the remainder and arms a `setTimeout(this.timeoutMs)` (default 10 ms, `:262`, `:284`) that flushes only if nothing completes it; `flush()` is `:400-414`. `isCompleteSequence` (`:29-78`) is the classifier that says a bare `ESC` is `"incomplete"` (`:34-36`) rather than a key. Identical at v0.84.1.
+
+**Impact** — when it fires the user gets a spurious `Escape` **and** junk characters. Escape is not inert in cyrup: `app.rs:6585` records that "an Esc during a turn silently discards every steering …" message and `:109-120` route it to abort/interrupt, so a fragmented arrow key while a turn is streaming **aborts the run** and types `[A` into the prompt. Reachability is honest-but-real: on a local PTY a keypress is normally one write and one read, so the exposure is over SSH/mosh/tmux where the transport fragments, and for multi-byte sequences arriving back-to-back with other input. cyrup has no mitigation at all; pi has a 10 ms hold.
+
+**Fix** — extend the machine already sitting on this path. `stray_reply.rs` (`:97-100`, `:165-193`) already holds a bare `Esc` in `State::Esc` and already has an idle flush driven by the reader thread's shortened poll (`app.rs:7131-7137`, `HELD_FLUSH_INTERVAL = 20 ms` at `:7113`). Generalise it: when `State::Esc` is followed by any of `[`, `O`, `]`, `P`, `_` with no modifier, do not replay — re-inject the held `Esc` plus the follower into the parser. crossterm exposes no such re-injection, so the tractable form is **a small pre-parser owned by cyrup between `read(2)` and crossterm** — a direct port of `extractCompleteSequences` plus the 10 ms flush, fed by a raw-fd reader like `terminal_query::read_reply` (`terminal_query.rs:408-447`), which is the same shape pi uses. That is a real design decision, hence effort M. **TUI-046, TUI-047 and TUI-050 all land on this pre-parser** — scope the four together.
+
+**Verify** — unit: drive `input_pipeline` (`app.rs:7206+`) with the two-chunk form and assert one `Up` arrives rather than `Esc` + `[` + `A`. Then, per this workspace's standing rule, a **live terminal run**: `ssh` into a box (or run under tmux with a throttled pipe), hold an arrow key while a turn streams, and confirm no `Escape`-abort and no `[A` text in the prompt. A TestBackend assertion alone does not close this item.
+
+## TUI-046 — cyrup pushes Kitty keyboard flag 1; pi pushes 7 — and neither guard flag 7 requires exists
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — all three push sites push a single flag: `crates/cyrup-tui/src/app.rs:6119`, `:6173`, `:6257` — `PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)` (value 1). `rg 'KeyboardEnhancementFlags::' crates/cyrup-tui/src/` returns only those three lines: `REPORT_EVENT_TYPES` (2) and `REPORT_ALTERNATE_KEYS` (4) are pushed nowhere. `keyboard_protocol.rs:8-19` transcribes pi's composite query as `ESC [ > 7 u` and calls the push "the caller's (`PushKeyboardEnhancementFlags`, `crate::App::into_stdout`)" — but the caller pushes 1, so cyrup queries with `CSI ? u` after asking for a different flag set than its own module doc describes. `drain.rs:11-16` compounds it by asserting "With `DISAMBIGUATE_ESCAPE_CODES` pushed, the final Ctrl+D / Ctrl+C … also generates a release report" — release reports require `REPORT_EVENT_TYPES`, which cyrup never pushes. Separately, neither stdin-buffer behaviour that flag 7 makes load-bearing is ported: `rg` across `crates/` finds no equivalent of `pendingKittyPrintableCodepoint`, and crossterm collapses `\x1b\x1b` into a single `Esc` at `crossterm-0.29.0/src/event/sys/unix/parse.rs:76`, clearing the buffer so a following `[27;…u` is decoded character by character as literal text.
+
+**upstream** — `pi/packages/tui/src/terminal.ts:15` @v0.83.0: `const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;` and `:17` `KITTY_KEYBOARD_PROTOCOL_QUERY = \`\x1b[>${…}u\x1b[?u\x1b[c\`` — disambiguate | report-event-types | report-alternate-keys. The two guards pi needs *because of* that choice both live in `stdin-buffer.ts`: **(a)** `parseUnmodifiedKittyPrintableCodepoint` `:184-190` + the `pendingKittyPrintableCodepoint` field `:280` + `emitDataSequence` `:389-398`, which drops a raw character duplicating the Kitty CSI-u for the same codepoint (pi commit `bdb416cbc` "fix(tui): deduplicate kitty printable input", closes #3780; pinned by `packages/tui/test/stdin-buffer.test.ts:227-246` — `\x1b[224uà` must emit only `\x1b[224u`, including across two chunks, while `\x1b[97ub` and `\x1b[64;3u@` must keep the raw char); and **(b)** the WezTerm split at `:207-230`, which emits a lone `ESC` and restarts from the second `ESC` when `\x1b\x1b` is followed by `[`/`]`/`O`/`P`/`_` (test `:201-213`: `\x1b\x1b[27;129:3u` must emit `["\x1b", "\x1b[27;129:3u"]`). Identical at v0.84.1.
+
+**Impact** — today, with flag 1 only: no alternate-key reports, so on a non-US layout the shifted/base codepoint pi uses to resolve a keybinding is unavailable and bindings can fail to match; `drain.rs`'s stated rationale is unfounded for the release-event half; and `keyboard_protocol.rs` reports a negotiation over a flag set cyrup never asked for. **The moment anyone corrects the flags to 7 to close that — a one-token change that looks obviously right — the two missing guards bite immediately:** every composed/accented character is typed **twice** on a Kitty-protocol terminal (issue #3780's exact symptom), and on WezTerm the Escape key emits `Esc` followed by the literal text `[27;129:3u` into the prompt. Filing the three parts as one item is the point — the flags change is unsafe alone.
+
+**Fix** — decide the flag set explicitly and land the parts as one change. (1) `app.rs:6119`, `:6173`, `:6257` → `DISAMBIGUATE_ESCAPE_CODES | REPORT_EVENT_TYPES | REPORT_ALTERNATE_KEYS`, matching `terminal.ts:15`; if any flag is deliberately withheld, say which and why in `keyboard_protocol.rs`'s `[CYRUP-DELTA]` block (`:33-42`) beside the existing `modifyOtherKeys` delta. (2) Port `pendingKittyPrintableCodepoint` (`stdin-buffer.ts:184-190`, `:389-398`) into the reader thread next to `StrayReplyFilter` (`app.rs:7125-7152`): remember the codepoint of the last unmodified Kitty printable event and drop the next event that is exactly that bare character. (3) The `\x1b\x1b`+CSI split needs **TUI-045's pre-parser** — crossterm consumes `\x1b\x1b` before cyrup can see it, so it cannot be fixed at the event level. (4) Correct `drain.rs:11-16`'s premise once the flags are settled.
+
+**Verify** — unit: feed the pipeline `\x1b[224u` then `à` in two chunks and assert one character reaches the editor; feed `\x1b[97ub` and assert two. Then a **live terminal run** on kitty/ghostty (composed characters via a dead key are not doubled; a non-US layout binding resolves) and on WezTerm with `enable_kitty_keyboard` (Escape aborts the turn and types nothing). Cross-check the negotiated value with `keyboard_protocol::current()` in the startup diagnostics.
+
+## TUI-051 — `/reload` never re-reads `keybindings.json`, while both its help text and its in-source comment claim it does
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `grep -rn load_keybindings_json crates | grep -v /tests/` returns exactly two lines: the definition at `crates/cyrup-tui/src/app.rs:951` and one call at `crates/cyrup/src/main.rs:1626`, on the boot path before `app.run`. The `/reload` handler at `crates/cyrup-tui/src/app.rs:4235-4241` calls only `rt.reload(None).await` — nothing re-reads `<agent_dir>/keybindings.json` and nothing resets the keymaps. **Two in-source statements assert the opposite**: the comment at `app.rs:4236-4238` ("re-reads settings/resources/keybindings") and the command's own description at `crates/cyrup-tui/src/commands.rs:70`, `"Reload keybindings, extensions, skills, prompts, and themes"` — which cyrup prints in the `/` menu. Separately, `Keymap::merge_json` (`keymap.rs:487-493`) only *sets* the ids present in the document and never restores a default for an id the user removed, so even a wired-up reload would leave a deleted entry's old binding live.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:5386` @v0.83.0 — inside `handleReloadCommand`, immediately after `await this.session.reload(...)`, pi calls `this.keybindings.reload()`. That is `core/keybindings.ts:354-357` → `setUserBindings(KeybindingsManager.loadFromFile(this.configPath))` → `loadFromFile` (`:363-367`), which re-reads the file, re-runs `migrateKeybindingsConfig` (`:366`) and hands the result to `packages/tui/src/keybindings.ts:167-192` `rebuild()`. `rebuild()` **replaces** rather than merges: for every id in `definitions`, `userKeys === undefined ? normalizeKeys(definition.defaultKeys) : normalizeKeys(userKeys)` (`:187-191`), so removing an entry from the file restores its default on the next `/reload`.
+
+**Impact** — the single documented way to apply an edited `keybindings.json` does nothing. A user follows the `/reload` help string cyrup itself prints, sees `reloaded resources`, and the new binding is not live — the only remedy is restarting the process, which nothing tells them. The stale comment at `app.rs:4236-4238` means the next auditor reading the handler concludes it works. Note the compounding with **TUI-025/CFG-047**: `/reload`'s description is *also* one baseline behind, so the string is wrong in two independent ways.
+
+**Fix** — give `App` the resolved `keybindings.json` path (it already receives `agent_dir` transitively via `session.services()`), and in the `C::Reload` arm (`app.rs:4235-4241`) re-read and re-apply the file after `rt.reload` succeeds — pi's ordering (session reload first, then `keybindings.reload()`). Add a `reset_to_defaults()` to each of the six maps and call it before merging so a removed entry restores its default, matching `packages/tui/src/keybindings.ts:187-191`'s replace semantics; today's merge-only path cannot un-bind. Correct the comment at `app.rs:4236-4238`. **Must land together with CFG-048** (this is pi's second application site for the name migration) and with **CFG-038** (a bad spec on reload must not wipe the live keymap).
+
+**Verify** — `crates/cyrup-tui/tests/keybindings.rs` with a real temp `agent_dir`: boot against a `keybindings.json` binding `app.tools.expand` to `ctrl+e`, assert ctrl+e expands; rewrite the file to `ctrl+y`, dispatch `/reload`, assert ctrl+y expands and ctrl+e does not; delete the entry entirely, `/reload` again, assert the stock ctrl+o default is back. Because this is TUI work, verification must also include a **live terminal run** — edit `~/.cyrup/keybindings.json`, type `/reload`, and observe the new chord working without restarting.
+
+## TUI-N01 — Tool-result images rasterize on terminals with no image protocol
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/transcript.rs:1275` is still `let inline = images.show && !run.images.is_empty() && run.images.iter().all(|i| i.block.is_some());` — the gate consults `terminal.showImages` and decodability only, never a capability. `ImageOpts` (`transcript.rs:1309-1324`) has since gained `expand_key`, `cwd` and `tools_expanded` but still carries no `graphical`/capability field, so `App::detect_image_support`'s `state.image_renderer` (`app.rs:1118-1125`) cannot reach the gate.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/tool-execution.ts:331-334`: `const caps = getCapabilities(); … if (caps.images && this.showImages && img.data && img.mimeType)` — no protocol means no `Image` child at all, and `getTextOutput` supplies the one-line `imageFallback`. The same rule at the component level, `pi/packages/tui/src/components/image.ts:70, :114-118`.
+
+**Impact** On a plain xterm, the Linux console, CI or a pipe, a `read` of a screenshot dumps ~20–30 rows of coloured `▀` into scrollback where pi prints one `[Image: shot.png [image/png] 1920x1080]` line. TUI-007's closing commit asserts a capability fallback that does not exist, so this defect is invisible to anyone reading history.
+
+**Fix** Add `graphical: bool` (or the whole `TerminalCapabilities`) to `ImageOpts` (`transcript.rs:1309-1324`), seed it from `AppState::image_renderer.is_graphical()` wherever `show_images` is already pushed into the transcript, and require it in the `inline` gate at `transcript.rs:1275` so a no-protocol terminal takes the existing `push_image_fallbacks` branch. Keep the half-block raster for the graphical case — that ADR-0001 rationale is sound and orthogonal. Land with TUI-036, which needs the same capability plumbed into the settings grid.
+
+**Verify** Extend `crates/cyrup-tui/tests/tool_result_images.rs`: with a no-protocol capability set, a finished `read` whose result carries a PNG commits exactly one `[Image: [image/png] WxH]` line and paints zero coloured cells; with a graphical capability set the raster still paints.
+
+## TUI-N02 — `/reload` does not re-emit the loaded-resources / diagnostics panel
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `App::push_loaded_resources` (`crates/cyrup-tui/src/app.rs:1466-1468`) has exactly **one** production call site: `crates/cyrup/src/main.rs:1669`, the boot path. (`rg 'push_loaded_resources' crates/ -g '*.rs'` otherwise returns the transcript sink at `transcript.rs:919` and three test call sites.) The `session_swapped` arm (`app.rs:6884-6995`) re-subscribes, re-titles, refreshes auth and context, re-installs sinks, rebuilds the command registry, re-reads seven settings and replays the conversation — and never pushes the panel. `C::Reload` (`app.rs:4235-4242`) only sets `pending_swap_status`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:5742-5745` — inside `handleReloadCommand`, after `session.reload`, `keybindings.reload`, `setRegisteredThemes` and `themeController.applyFromSettings`, pi calls `showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true })` — the identical options object it uses at boot (`:1890`).
+
+**Impact** `/reload` is the command a user runs right after editing an extension, skill or prompt. If the edit broke the extension, shadowed a skill name or introduced a prompt conflict, cyrup says only `reloaded resources` and the diagnostics are never shown. The data is re-collected server-side by the factory and discarded.
+
+**Fix** In the `session_swapped` arm, after the settings re-read and before the replay, push the panel for the swapped-in session. `build_startup_report` is private in `crates/cyrup/src/main.rs:1511`; move it to `cyrup-session-svc` or expose it as `cyrup_tui::StartupReport::from_session` behind the existing services accessors. pi does not gate it by swap reason, so neither should we initially. Pair with TUI-004, TUI-025 and TUI-037, which touch the same call site.
+
+**Verify** In `crates/cyrup-tui/tests/startup_resources_panel.rs`, drive a `session_swapped` whose services report one extension load error and assert `[Extension issues]` lands in committed scrollback even with `quietStartup=true`.
+
+## TUI-N03 — A theme chosen in `/settings` is applied live but never persisted
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:3399-3403`: `SelectorKind::Theme => { self.set_theme(...); self.state.transcript.push_status(...); None }`. Returning `None` means no `AppCommand::ApplySetting` reaches the persist arms at `app.rs:4040` / `:4116`. The design is stated in the function's own doc at `:3393-3396`. The submenu at `app.rs:3376-3380` remains the only `open_selector` call site (`rg 'open_selector\(' crates/cyrup-tui/src` → definition at `:2167`, one call at `:3380`).
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts` `onThemeChange: (t) => { this.settingsManager.setTheme(t); void this.themeController.applyFromSettings(); }`, with `onThemePreview` kept as the separate, non-persisting hook — pi distinguishes preview from confirm; cyrup treats confirm as a preview that sticks until exit.
+
+**Impact** The only in-app way to change theme does not survive the session. Worse in combination with TUI-004: `ThemeController::sync_with_terminal` persists a high-confidence OSC-11 detection into `settings.theme` only when the setting is **unset** — exactly the state a never-persisted user choice leaves behind — so the next launch writes the auto-detected theme over the user's choice.
+
+**Fix** Give `confirm_selector`'s `Theme` arm an `AppCommand::ApplySetting { id: "theme", value }` return instead of `None`; the arm at `app.rs:4040` already persists to Global and pushes the status. Keep `set_theme` for the immediate repaint. TUI-032 needs the same change for `SelectorKind::Thinking` — do both in one pass.
+
+**Verify** App test: open the settings selector, drive the `theme` submenu to `light`, confirm, assert an `ApplySetting{id:"theme", value:"light"}` command is emitted, plus a settings-layer assertion that the global layer holds `"theme": "light"`.
+
+## TUI-N04 — The untrusted-project warning banner is never rendered at startup
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `rg 'This project is not trusted|project_trusted' crates/cyrup-tui/src crates/cyrup/src/main.rs` → `crates/cyrup-tui/src/app.rs:3630` only, which feeds the `/trust` dialog's `TrustSelector::new(cwd, saved_label, session.services().project_trusted, …)`. No startup banner anywhere; the boot path (`crates/cyrup/src/main.rs` around `:1669`) pushes the panel and replays with no trust check. Both halves already exist unused: `AgentSessionServices::project_trusted` and `cyrup::has_trust_requiring_project_resources` (`crates/cyrup/src/startup_ui.rs:340-344`).
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3699` — `renderInitialMessages()` calls `renderProjectTrustWarningIfNeeded()`, body at `:3710-3723`, emitting a warning-styled `This project is not trusted. Project {CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart pi.`
+
+**Impact** Open cyrup in a repo shipping `.cyrup/` skills, prompts, themes or settings that has not been trusted, and those resources are silently ignored with no indication and no pointer to `/trust`. It is the surface that tells the user a security decision is in force.
+
+**Fix** After `push_loaded_resources` and before the replay in `crates/cyrup/src/main.rs:1669`, and in the `session_swapped` arm alongside the other per-session re-reads, evaluate `!services.project_trusted && cyrup::has_trust_requiring_project_resources(cwd)` and push a warning-styled entry with pi's string rebranded (`.cyrup`, `/trust`, `cyrup`). Reuse the existing warning startup role rather than inventing one. Pairs with TUI-037, which owns the other half of the trust lifecycle.
+
+**Verify** App test over a temp cwd containing `.cyrup/skills/x.md` with `project_trusted = false`: committed scrollback contains `This project is not trusted` in warning style; absent when `project_trusted = true` or when the cwd has no trust-requiring resources.
+
+## TUI-002 — Thinking blocks: fold-ordering and the visible-content spacer
+
+**Kind** parity-bug · **Severity** low · **Effort** M · **Confidence** confirmed
+
+> **Half closed.** `thinking_lines` now routes through the markdown renderer — `crates/cyrup-tui/src/transcript.rs:1232` `crate::markdown::render_with_default_style(body, width.max(1), theme, style.fg, true)` — matching pi's `new Markdown(thinkingBlocks.join("\n\n"), …, {color, italic:true})` at `assistant-message.ts:144-162`. Only the ordering and spacer halves remain.
+
+**cyrup** — `crates/cyrup-tui/src/transcript.rs:3176-3186` `thinking_text` `filter_map`s **every** `Content::Thinking` in the message and joins with `\n\n` — no adjacency, no index order — and `app.rs:4874-4882` commits that single blob before `commit_assistant`. The replay path repeats the fold at `app.rs:1353-1358`. There is no `has_visible_content_after` spacer rule.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/assistant-message.ts:104-166` walks `message.content` in index order, keeping each **run of adjacent** thinking blocks as its own section (run collector at `:115-127`) interleaved with text sections, and adds a blank only when more visible assistant content follows (`:133-137`, `:163-165`).
+
+**Impact** On interleaved-thinking models all reasoning is hoisted above all prose instead of appearing as the model produced it; spacing differs at the end of a message. `crates/cyrup-tui/tests/thinking.rs` exercises only adjacent blocks, so no test pins the divergence either way.
+
+**Fix** Change `thinking_text` to return `Vec<String>` of adjacent-run sections and have `app.rs:4874-4882` (and the replay walk at `app.rs:1353-1358`) commit them interleaved with text sections in content order, keeping the now-correct markdown call per section. Add the `has_visible_content_after` spacer condition.
+
+**Verify** Extend `tests/thinking.rs` with an interleaved `[think, text, think, text]` message and assert commit order and the trailing-blank rule.
+
+## TUI-003 — Replay omits the compaction-count status
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `rg 'Session compacted|compaction_count' crates/ -g '*.rs'` → zero hits at HEAD. The swap arm (`crates/cyrup-tui/src/app.rs:6981-6989`) replays the conversation and pushes no compaction status; the boot replay does the same.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3706` — `this.showStatus(\`Session compacted ${times}\`)`, emitted from the initial-render path after `renderInitialMessages`.
+
+**Impact** A resumed session that has been compacted gives no indication that earlier context was summarized away, so the user cannot explain why the model has forgotten something.
+
+**Fix** Expose the compaction count on the session accessor already used by the replay, and push a status line after the replay completes when it is non-zero.
+
+**Verify** `crates/cyrup-tui/tests/session_replay.rs`: a session whose context carries two compaction summaries produces `Session compacted 2` after the replayed conversation; a fresh session produces nothing.
+
+## TUI-010 — Ctrl+O pushes no `Tool output: …` status
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+> **Half closed.** Committed tool blocks now honour the live expand flag (`crates/cyrup-tui/src/transcript.rs:2769` `tool_lines(run, images.tools_expanded, …)`, with `ImageOpts::tools_expanded` documented at `:1317-1323` as pi's live `toolOutputExpanded`), and branch/compaction summaries render collapsed with an expand hint (`transcript.rs:2873, :2876-2891`).
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:1935-1946` `Action::ToolsExpand` toggles and returns `AppAction::Redraw` with **no status**. The `Tool output: expanded|collapsed` string exists in the codebase only on the extension effect path (`app.rs:3216-3222`).
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2805` routes Ctrl+O through `toggleToolOutputExpansion` (`:4028`) → `setToolsExpanded` (`:4032`), whose body ends at `this.showStatus(\`Tool output: ${expanded ? "expanded" : "collapsed"}\`)` (`:4047`) — the **same** function the extension path uses, so the echo is unconditional upstream apart from a no-op early return. `setToolsExpanded` also calls `setExpanded(expanded)` on the active header (`:4036-4039`), which cyrup has nothing to do (see TUI-N06 for the committed-entry constraint and TUI-038 for the fan-out).
+
+**Impact** Ctrl+O gives no feedback that it did anything, and the same user-visible action produces a status when an extension triggers it and none when a keystroke does.
+
+**Fix** Push `Tool output: expanded|collapsed` from `Action::ToolsExpand` (`app.rs:1935-1946`), reusing the string already built on the extension path so the two cannot drift. Land with TUI-038, which restructures the same arm.
+
+**Verify** App test: Ctrl+O pushes the status string with the correct word in both directions, and the extension path continues to push the identical string.
 
 ## TUI-011 — `/changelog` is a hardcoded stub; no "What's New" startup notice
 
-**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** high
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:1179-1181` is verbatim `"changelog" => { self.state.transcript.push_block("What's New", "No changelog entries found."); }`. `collapseChangelog` is a live settings row with no consumer (`app.rs:3366`); `last_changelog_version` a live accessor with none (`cyrup/crates/cyrup-config/src/settings.rs:882`).
+**cyrup** — `crates/cyrup-tui/src/app.rs:1823-1826` is verbatim `"changelog" => { self.state.transcript.push_block("What's New", "No changelog entries found."); AppAction::Redraw }`. `collapseChangelog` is a live settings row with no consumer (`app.rs:5667`), and `last_changelog_version` a live accessor with none.
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:687-716` (parse and render the shipped changelog, honouring `collapseChangelog`) and `:2777-2781` (the startup notice gated on `lastChangelogVersion` vs the current version).
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:102` imports `getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog`; the startup notice gated on the last-seen version is at `:1178-1188` and the `/changelog` command at `:6056-6057`.
 
 **Impact** `/changelog` always claims there is nothing, and two settings with persisted state have no effect. Users are never told what changed on upgrade.
 
@@ -355,195 +683,311 @@ boot (`main.rs:1272-1294`). The probe machinery (`terminal_query.rs`, `theme.rs:
 
 ## TUI-013 — Quoted paths with spaces break `@`-mention autocomplete
 
-**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/autocomplete.rs:168` `PATH_DELIMS = [' ', '\t', '"', '\'', '=']`; `:200-207` `trailing_token` splits on the *last* delimiter (`before.rfind(PATH_DELIMS)`), so `see @"my dir/fi` yields `dir/fi` and `mention_query` (`:253-258`) fails its `strip_prefix('@')`. There is no unclosed-quote scan in the file.
+**cyrup** — `crates/cyrup-tui/src/autocomplete.rs:168` `const PATH_DELIMS: [char; 5] = [' ', '\t', '"', '\'', '=']`; `:201-206` `trailing_token` splits on the **last** delimiter (`before.rfind(PATH_DELIMS)`), so `see @"my dir/fi` yields `dir/fi` and `mention_query` fails its `strip_prefix('@')`. `rg 'unclosed_quote|find_unclosed' crates/cyrup-tui/src/autocomplete.rs` → zero.
 
-**upstream** — `pi/packages/tui/src/autocomplete.ts:54-72` `findUnclosedQuoteStart`, `:74-92` `extractQuotedPrefix`, `:463-470` `extractAtPrefix` — pi scans back for an unclosed quote first and treats everything after it as one token.
+**upstream** — `pi/packages/tui/src/autocomplete.ts` `findUnclosedQuoteStart` / `extractQuotedPrefix` / `extractAtPrefix` — pi scans back for an unclosed quote first and treats everything after it as one token.
 
-**Impact** Any path containing a space cannot be completed via `@`, on a project layout where such paths are common.
+**Impact** Any path containing a space cannot be completed via `@`, on project layouts where such paths are common.
 
-**Fix** Port `findUnclosedQuoteStart` into `autocomplete.rs` and consult it in `trailing_token` (`:200-207`) before falling back to `rfind(PATH_DELIMS)`; make `mention_query` accept the quoted form.
+**Fix** Port `findUnclosedQuoteStart` into `autocomplete.rs` and consult it in `trailing_token` (`:201-206`) before falling back to `rfind(PATH_DELIMS)`; make `mention_query` accept the quoted form. **There is an in-repo precedent to reuse rather than reinvent:** `crates/cyrup-tui/src/session_search.rs:149, :179, :183` already implements an unclosed-quote scan (`had_unclosed_quote`).
 
 **Verify** Autocomplete unit tests for `@"my dir/fi`, `@'my dir/fi`, and a closed-quote negative.
 
-## TUI-018 — Expanded startup help missing — only the 5-item compact bar
+## TUI-018 — Startup header has no logo/version line and no expanded body
 
-**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** high
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/chrome.rs:75-87` `compact_hints` builds exactly pi's five `compactInstructions`; `app.rs:3578` renders that single row gated on `show_startup_hints`. There is no expanded form and no expandable header state; a grep for `CARGO_PKG_VERSION|logo` across `cyrup/crates/cyrup-tui/src` returns nothing.
+> **Half closed.** pi's `compactOnboarding` and the standing `onboarding` line now exist — `crates/cyrup-tui/src/chrome.rs:98-114` (`compact_onboarding`, `STARTUP_ONBOARDING`) against `interactive-mode.ts:943-951`.
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:789-836` — the expanded header with logo, version, cwd, model and the onboarding lines, toggled by Ctrl+O.
+**cyrup** — (a) The **logo** line is absent. pi's collapsed header body is `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}` (`interactive-mode.ts:952-953`) where `logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", \` v${this.version}\`)` (`:910`); cyrup's `compact_hint_entries` (`chrome.rs:154-184`) emits blank / bar / compact-onboarding / blank / onboarding / blank with **no logo entry**, and `chrome.rs:127-130` states outright "cyrup does not draw the `logo` part, so 1 + 4 + 1 = 6". The app name and version therefore appear nowhere in the UI. (b) The **expanded** body (`expandedInstructions`, 19 hints, `interactive-mode.ts:915-934`) has no counterpart and no `ExpandableText` state — `state.show_startup_hints` is a boolean that is only ever cleared (`app.rs:1745`).
 
-**Impact** New users get five terse hints and no orientation; the version is not visible anywhere in the UI. TUI-006 landed the loaded-resources half of pi's `Press {ctrl+o} to show full startup help and loaded resources.` line, but cyrup's panel is unconditionally expanded (`startup.rs:19-25`), so the Ctrl+O affordance still has nothing to toggle.
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:910-953`.
 
-**Fix** Add an expanded startup header in `chrome.rs` (logo, `CARGO_PKG_VERSION`, cwd, model, onboarding lines), hold an `expanded` flag in `AppState`, and route Ctrl+O to it alongside TUI-010's tool expansion, matching pi's shared toggle.
+**Impact** New users get a terse bar and no orientation, and the version is not visible anywhere in the UI — the first thing anyone is asked for in a bug report. pi's `Press {ctrl+o} to show full startup help` affordance still has nothing to toggle.
 
-**Verify** App test: default boot shows the compact bar; Ctrl+O shows the version string and onboarding lines; a second Ctrl+O collapses.
+**Fix** Add a logo entry to `compact_hint_entries` (`chrome.rs:154-184`) rendering `APP_NAME` bold-accent plus ` v{CARGO_PKG_VERSION}` dim, and add an expanded body carrying pi's 19 hints behind an `expanded` flag in `AppState`, routed from Ctrl+O alongside TUI-010's tool expansion, matching pi's shared toggle.
+
+**Verify** App test: default boot shows the logo line with the crate version; Ctrl+O shows the expanded hints; a second Ctrl+O collapses.
 
 ## TUI-019 — No alt-screen UI mode, mouse, scrollbars, prompt navigation
 
-**Kind** upstream-drift · **Severity** low · **Effort** L · **Confidence** high
+**Kind** upstream-drift · **Severity** medium · **Effort** L · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/lib.rs:3` states the inline viewport (not the alternate screen); `App::into_stdout` (`app.rs:3677-3695`) enables raw mode, `EnableBracketedPaste` and the Kitty disambiguation flag only — no `EnterAlternateScreen`, no `EnableMouseCapture`. The crate's only `EnterAlternateScreen` is the pre-session startup wizard (`cyrup/crates/cyrup-tui/src/startup_selector.rs:20,44`), not the chat UI. No `uiMode`/`fullscreenScrollbar` settings row, no `tui.altScreen.*` ids.
+> **Re-rated `low` → `medium` in the 2026-08-12 repair pass, and the ADR-0001 justification struck.**
+> The prior text read "Severity stays low as a deliberate ADR-0001 divergence". That is not admissible
+> here for two independent reasons. **(1) The ADR does not exist in this workspace** —
+> `PARITY-GAPS.md:709` records it as unreadable, and README:208-212 says a code comment or item
+> invoking an ADR id to justify a divergence is an unverifiable claim, not a decision of record.
+> **(2) Even a real ADR would not hold the rating down**, because README:213-215 and PARITY-GAPS both
+> state that there is no accepted-divergence category and that a mechanism difference which *costs
+> behaviour* stays on the list as work. This one costs behaviour, and the cost is now filed
+> concretely in two adjacent items: **SEAM-051** — `--tui-mode regular`, the **default** value of a
+> v0.84.1 flag, is not in `crates/cyrup/src/cli.rs`, so it is captured by `partition_extension_flags`,
+> becomes an error-severity diagnostic, and makes the binary exit 1 with a message claiming the option
+> is unknown; and **CFG-021** — the `tuiMode` / `fullscreenScrollbar` settings keys are modelled
+> nowhere. The rating below is therefore judged **on consequence**, per README:106.
+>
+> **Consequence, stated plainly.** Within this item's own scope the losses are: no fullscreen mode, no
+> mouse scrolling, no scrollbar, and no jump-to-previous-prompt — four features a user reaches for on
+> a normal path, with native terminal scrollback as the only substitute. That is not data loss, a
+> permission bypass or a crash, so it is not critical; it is squarely more than "`get_tree` drops
+> `labelTimestamp`", so it is not low. **Medium.** The *launch failure* consequence is deliberately
+> **not** counted here — it belongs to SEAM-051, and counting it twice would inflate the ledger.
+>
+> **This item also carries a genuine open question that is not a severity question** — whether cyrup
+> builds an alt-screen mode at all is a scope decision no human has made in a readable document. It is
+> recorded in `## Open questions — decisions required` below rather than encoded as a low severity.
+> Note the asymmetry that makes the decision non-optional: SEAM-051 and CFG-021 must be fixed
+> **whatever** is decided — a flag that exits 1 on its own default value and two settings keys that
+> parse nowhere are defects under either answer.
 
-**upstream** — `pi/packages/tui/src/TuiAltScreen.ts` (post-baseline) plus the `uiMode` setting and the scrollbar / mouse / prompt-navigation surfaces built on it.
+**cyrup** — `rg EnterAlternateScreen crates/cyrup-tui/src` → only the pre-session wizard (`startup_selector.rs:20, :44`), never the chat UI. No `uiMode` / `tuiMode` / `fullscreenScrollbar` settings row in the grid (`app.rs:5595-5745`), and no `tui.altScreen.*` ids in the keymap.
 
-**Impact** No fullscreen mode, no mouse scrolling, no scrollbar, no jump-to-previous-prompt. Users on the inline viewport rely entirely on native terminal scrollback.
+**upstream** — pi v0.84.1 added `packages/tui/src/tui-alt-screen.ts` (1047 new lines), `tui-main-screen.ts` (586), `components/scroll-view.ts` (195), `components/alt-screen-flash.ts` (51), `layout.ts` (402), `stack.ts` (154), the eight `tui.altScreen.*` keybinding ids (`packages/tui/src/keybindings.ts:43-50`), runtime mode switching (`switchTuiMode`, `interactive-mode.ts:788-841`), and the `tui-mode` (`regular|fullscreen`) + `fullscreen-scrollbar` (`auto|always|hidden`) settings rows (`components/settings-selector.ts:633-643`).
 
-**Fix** Large and architectural (ADR-0001 chose the inline viewport deliberately). If pursued: add an alt-screen `App` variant behind a `uiMode` setting, owning its own scroll state and rendering the full transcript, with `EnableMouseCapture` and a scrollbar; keep the inline path as default.
+**Impact** No fullscreen mode, no mouse scrolling, no scrollbar, no jump-to-previous-prompt. Users on the inline viewport rely entirely on native terminal scrollback, and there is no in-product way to ask for anything else. The two surfaces through which a user would *request* the missing mode are separately broken and separately owned: the CLI flag makes the binary exit 1 (SEAM-051) and the settings keys parse nowhere (CFG-021).
 
-**Verify** Out of scope until scoped as a project; at minimum a decision recorded in `lib.rs`'s ADR notes.
+**Fix** Large and architectural; the drift window is why the effort is L+. Two parts, and the first is not contingent on the decision. **(a) Unconditional, ship regardless:** accept `--tui-mode <regular|fullscreen>` in `crates/cyrup/src/cli.rs` and model `tuiMode` / `fullscreenScrollbar` in `cyrup-config` — SEAM-051 and CFG-021 own these, and until they land a pi command line cannot even start cyrup. Accepting the flag and honouring only `regular` (rejecting `fullscreen` with a message that names the gap) is a legitimate interim that costs no design work and removes the launch failure. **(b) Contingent on the decision below:** add an alt-screen `App` variant behind `tuiMode` owning its own scroll state, with mouse capture, a scrollbar and semantic-prompt navigation, keeping the inline path as default — porting the behaviours of `tui-alt-screen.ts`, `scroll-view.ts`, `layout.ts` and the eight `tui.altScreen.*` ids rather than pi's renderer.
 
-## TUI-020 — OSC-8 hyperlink capability detected and tested but never emitted
+**Verify** For (a): `cyrup --tui-mode regular` starts a session, and a `settings.json` carrying `tuiMode` round-trips through `/settings`. For (b), once scoped: mouse wheel scrolls the transcript, the scrollbar tracks position under each of `auto`/`always`/`hidden`, and the prompt-navigation chord jumps between user turns — each confirmed in a **live terminal run**, since this is TUI work and TestBackend cannot show viewport behaviour. The prior text's "at minimum a decision recorded in `lib.rs`'s ADR notes" is **withdrawn**: an in-source ADR note is not a verification step, and per README:208-212 it would not be a decision of record either.
 
-**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** high
+## TUI-020 — OSC-8 hyperlinks: capability now consulted, still never emitted
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/image.rs:365` carries `TerminalCapabilities.hyperlinks` with the tmux `client_termfeatures` probe (`:378-381`), exercised by `crates/cyrup-tui/tests/image_capabilities.rs`, and nothing reads it: `cyrup/crates/cyrup-tui/src/markdown.rs:398-407` `TagEnd::Link` unconditionally appends ` ({href})`. `image_fallback_text`'s own doc comment (`image.rs:309-310`) records the same omission for the filename.
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
 
-**upstream** — `pi/packages/tui/src/components/markdown.ts:543-546` emits OSC-8 when the capability is present; `pi/packages/tui/src/terminal-image.ts:552-556` links the image filename.
+> **Auditor closure overturned.** The auditor closed this on `markdown.rs:126` passing `crate::image::hyperlinks_supported()` and `:142-148` taking the capability explicitly. The capability is now consulted — but **nothing is emitted**, which is the item's title.
 
-**Impact** Markdown links render as noisy `text (https://…)` even on terminals that support clickable links, and image fallback filenames are not clickable. Fully-built detection is dead code.
+**cyrup** — `crates/cyrup-tui/src/markdown.rs:133-141` says so in its own words: "ratatui … has no channel for an OSC-8 escape … so the capable branch here emits the link text alone, matching upstream's VISIBLE row exactly while omitting the (unrepresentable) clickable wrapper." Confirmed by grep — the only `\x1b]8` bytes anywhere in `crates/cyrup-tui/src` are that comment at `markdown.rs:136` and two strip-ANSI test fixtures at `ansi.rs:247, :292`. The image half is untouched: `crates/cyrup-tui/src/image.rs:353-367` `image_fallback_text` pushes `shorten_image_path(name)` bare.
 
-**Fix** Thread `TerminalCapabilities.hyperlinks` into the markdown renderer and `image_fallback_text`; when true, wrap in `\x1b]8;;{href}\x1b\\{text}\x1b]8;;\x1b\\` and drop the parenthetical.
+**upstream** — `pi/packages/tui/src/components/markdown.ts:692-696` `if (getCapabilities().hyperlinks) { result += hyperlink(styledLink, token.href) … }`; `pi/packages/tui/src/terminal-image.ts:646-652` wraps the fallback filename in `hyperlink(display, pathToFileURL(filename).href)` when `getCapabilities().hyperlinks && isAbsolute(filename)`.
 
-**Verify** Markdown unit test: with `hyperlinks = true` the output contains the OSC-8 wrapper and no parenthetical; with false, current behavior.
+**Impact** Links are not clickable on terminals that support it. What *did* land is dropping the noisy ` ({href})` parenthetical — a real improvement, and the visible row now matches pi — but the clickable wrapper is still absent, and per this ledger's no-accepted-divergence rule a mechanism gap that costs behaviour stays on the list.
+
+**Fix** ratatui cannot carry the escape inside a styled `Span`, so emit it the way cyrup already emits other raw sequences outside the buffer (`terminal_title.rs`, `terminal_progress.rs`, `drain.rs` are three in-repo precedents): wrap the link text in `\x1b]8;;{href}\x1b\\ … \x1b]8;;\x1b\\` at flush time for committed rows, gated on `hyperlinks_supported()`. Do the same for `image_fallback_text`'s filename with a `file://` URL.
+
+**Verify** Markdown unit test over the flushed byte stream (not the ratatui buffer): with `hyperlinks = true` the output contains the OSC-8 wrapper and no parenthetical; with false, exactly today's output.
 
 ## TUI-021 — Cache-miss notices not implemented
 
-**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** high
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed
 
-**cyrup** — a workspace grep for `cache_miss|CacheMiss|cacheMiss` in `.rs` finds only an unrelated subagents test name (`cyrup/crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs:1050`); `settings_rows` (`cyrup/crates/cyrup-tui/src/app.rs:3308-3412`) has no cache-miss row. The footer computes a per-turn cache-hit rate (`cyrup/crates/cyrup-tui/src/status.rs:311-318`) but nothing warns on a miss.
+**cyrup** — `rg 'cache_miss|CacheMiss|showCacheMissNotices' crates/ -g '*.rs'` → one hit, an unrelated subagents test name (`crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs:1050`). No `cache-miss-notices` row in the settings grid (`crates/cyrup-tui/src/app.rs:5595-5745`). The footer computes a per-turn cache-hit rate but nothing warns on a miss.
 
-**upstream** — `pi/packages/coding-agent/src/core/cache-stats.ts:158` detects a miss; `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3524-3546` renders the notice, with the `onShowCacheMissNoticesChange` settings hook at `:4316-4319`.
+**upstream** — Live at v0.84.1: the settings row at `pi/packages/coding-agent/src/modes/interactive/components/settings-selector.ts:547`, the notice renderer at `interactive-mode.ts:3568, :3623, :3670, :4403`, and the `onShowCacheMissNoticesChange` hook at `:4487-4488`.
 
 **Impact** A prompt-cache miss — often caused by an edit to a system prompt or a tool-set change, and directly expensive — passes unremarked.
 
-**Fix** Port `cache-stats.ts`'s miss detection into the session layer, add a `showCacheMissNotices` settings row, and push a transcript notice from the usage-update arm in `app.rs`.
+**Fix** Port pi's miss detection into the session layer, add a `showCacheMissNotices` settings row, and push a transcript notice from the usage-update arm in `app.rs`.
 
 **Verify** App test: two turns whose usage shows cache creation without a read emit exactly one notice; with the setting off, none.
 
-## TUI-022 — `terminal.showTerminalProgress` is a dead setting — OSC 9;4 never emitted
-
-**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:3373-3377` exposes the toggle backed by `cyrup/crates/cyrup-config/src/settings.rs:748`; a workspace grep for `9;4|setProgress|show_terminal_progress` in `.rs` finds only those two sites — no emitter.
-
-**upstream** — `pi/packages/tui/src/terminal.ts:12-13,509-522` — OSC `9;4` progress states driven by run start/end.
-
-**Impact** A persisted setting does nothing; taskbar/tab progress indicators never appear during a run.
-
-**Fix** Emit `ESC]9;4;1;0BEL` on run start and `ESC]9;4;0;0BEL` on end, gated on the setting, from the run-loop arms in `app.rs`. `draw_synchronized` (`app.rs:3065-3071`) already writes raw BSU/ESU bytes outside the ratatui buffer and `terminal_query.rs` established the direct-fd write pattern — two precedents.
-
-**Verify** App test over a capturing writer: run start/end with the setting on produce the two sequences; with it off, none.
-
-## TUI-023 — Retry indicator shows a frozen delay instead of counting down
-
-**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:2686-2694` `AutoRetryStart` computes `seconds = delay_ms.div_ceil(1000)` once and calls `indicator.set(IndicatorKind::Retry, Some(msg))` with nothing decrementing it; the 1-second `dialog_countdown` interval is gated exclusively on a pending UI reply with a deadline. `ace01cb`'s `SummarizationRetryScheduled` arm (`app.rs:2695-2709`) has the identical frozen shape.
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/status-indicator.ts:42-65` plus `countdown-timer.ts:21-30` — the remaining seconds tick down each second.
-
-**Impact** During a 30-second backoff the UI reads "retrying in 30s" for the whole 30 seconds, so the user cannot tell whether it is progressing or hung.
-
-**Fix** Store the retry deadline on `AppState` and un-gate the existing 1-second `dialog_countdown` interval to also fire for an active retry, recomputing the label from `deadline - Instant::now()`. Fix both arms together.
-
-**Verify** `crates/cyrup-tui/tests/status_indicator.rs` currently asserts only the initial string (`:99-111,178`), so nothing blocks the fix — add a tick-driven assertion that the label decreases. Prefer an injectable instant (see TUI-N09) over sleeping.
-
-## TUI-024 — Footer context segment vanishes when usage is unknown instead of `?/{window}`
-
-**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
-
-**cyrup** — `cyrup/crates/cyrup-tui/src/status.rs:301-310` `context_text` returns `None` unless *both* `context_percent` and `context_window` are `Some`, and the caller at `:281` pushes the segment only when it is `Some`.
-
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/footer.ts:108-110` falls back to `state.model?.contextWindow ?? 0` and renders the percent as `"?"` when null; `:148-160` pushes `contextPercentStr` unconditionally.
-
-**Impact** Before the first usage report the footer's segment layout shifts as the context indicator appears, and the user gets no context-window figure at all on a fresh session.
-
-**Fix** In `context_text`, fall back to the model's context window and render `?` for an unknown percent; make the push at `status.rs:281` unconditional.
-
-**Verify** The only tests touching this segment (`crates/cyrup-tui/tests/render.rs:131`, `crates/cyrup-tui/tests/assembled_render.rs:166`) assert the populated form, so nothing pins the vanishing case — add a fresh-session case asserting `?/200k`-shaped output.
-
 ## TUI-025 — Slash-command metadata one baseline behind
 
-**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** high
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** confirmed
 
-**cyrup** — all three literals unchanged: `cyrup/crates/cyrup-tui/src/commands.rs:45` `arg_cmd("model", …, "<model>")`, `:59` `cmd("login", "Configure provider authentication", None)`, `:64` `"Reload keybindings, extensions, skills, prompts, and themes"`. The `/reload` *status* is `"reloaded resources"` (`app.rs:2440`).
+**cyrup** — All three literals unchanged at HEAD: `crates/cyrup-tui/src/commands.rs:51` `arg_cmd("model", …, "<model>")`, `:65` `cmd("login", "Configure provider authentication", None)` (no argument hint at all), `:70` `"Reload keybindings, extensions, skills, prompts, and themes"`. The `/reload` status string is still `"reloaded resources"` (`app.rs:4240`).
 
-**upstream** — `pi/packages/coding-agent/src/core/slash-commands.ts:21` `argumentHint: "<provider/model>"`, `:35` `"<provider>"`, `:40` `"… themes, and context files"`. pi's reload status is the longer wording with a trust variant (`pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:5486-5490`: `Reloaded keybindings, extensions, skills, prompts, themes, and context files[; saved project trust]`).
+**upstream** — pi v0.84.1 `packages/coding-agent/src/core/slash-commands.ts:21` `argumentHint: "<provider/model>"`, `:35` `argumentHint: "<provider>"`, `:40` `"Reload keybindings, extensions, skills, prompts, themes, and context files"`. pi's reload status is the longer wording with a trust variant (`interactive-mode.ts`, `Reloaded keybindings, extensions, skills, prompts, themes, and context files[; saved project trust]`).
 
 **Impact** Cosmetic but misleading: `/model <model>` understates the required `provider/model` form, and `/reload` does not mention context files, which it does reload.
 
-**Fix** Update the three literals in `commands.rs` and the status string in `app.rs:2440` including the trust variant. Fold into the same S as TUI-N02, which touches the same reload path.
+**Fix** Update the three literals in `commands.rs` and the status string in `app.rs:4240` including the trust variant — which needs TUI-037's implicit-trust flag to be meaningful. Fold into the same S as TUI-N02, TUI-004 and TUI-037.
 
-**Verify** Snapshot/unit assertions on the command table and the reload status.
+**Verify** Snapshot/unit assertions on the command table and the reload status, including the trust variant.
 
-## TUI-026 — Transcript prefixes `you:` / `assistant:` labels
+## TUI-035 — `tui.editor.historyPrevious` / `historyNext` are unbound
 
-**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** high
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/transcript.rs:1677` inserts `Span::styled("you: ", theme.user_style())` and `:1697` `"assistant: "`, with wrap widths reduced at `:1671` and `:1690`. Inline tests at `transcript.rs:1938-1951` assert the prefixes. Documented as deliberate at `transcript.rs:1663-1670`.
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:121-155` `EditorAction` has no history variants and `:157-185` `from_id` no history ids; prompt recall is hard-wired to Up/Down at the buffer edges (documented at `crates/cyrup-tui/src/editor.rs:7`, with `:519`/`:539` noting "history is handled by the caller", exercised by `crates/cyrup-tui/tests/editor.rs:221` `prompt_history_recall_with_up_down`).
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/user-message.ts` (background Box, no label) and `components/assistant-message.ts:104-113` (bare Markdown).
+**upstream** — `pi/packages/tui/src/keybindings.ts:11-12` declares `tui.editor.historyPrevious` / `tui.editor.historyNext`, defaults `[]` at `:67-74`, handled at `pi/packages/tui/src/components/editor.ts:767-777` under the comment `// Dedicated history actions always browse entries instead of moving the cursor`, each cancelling autocomplete then calling `navigateHistory(∓1)`. **Added in the drift window** — absent from `git show v0.83.0:packages/tui/src/keybindings.ts`; the `v0.83.0..v0.84.1` diff to `editor.ts` is exactly this hunk.
 
-**Impact** 5 and 11 columns of every wrapped line lost to labels pi does not draw; transcripts diff differently from pi's. Note `d2c5509`'s `Entry::Thinking` renders with **no** label (`transcript.rs:1704-1710`), so the transcript is now internally inconsistent about labelling.
+**Impact** A user who wants shell-style history on ctrl+p/ctrl+n, or who wants Up/Down to move the caret and never recall, has no way to say so — the two ids pi added for exactly that are silently ignored.
 
-**Fix** **Do not change without asking** — this is a documented cyrup-original design choice. If revisited: drop the labels, restore full wrap width, and distinguish roles by background/colour as pi does. At minimum, resolve the internal inconsistency with thinking entries one way or the other.
+**Fix** Add `EditorAction::{HistoryPrevious, HistoryNext}` with empty default bindings, map `tui.editor.historyPrevious` / `historyNext` in `EditorAction::from_id` (`keymap.rs:157-185`), and in `crates/cyrup-tui/src/editor.rs` route them to the existing history navigation **unconditionally** (not only at the buffer edges), cancelling any open autocomplete first, per `editor.ts:767-777`. Land with TUI-028, which renames the surrounding namespace.
 
-**Verify** Whichever way it is resolved, update `transcript.rs:1938-1951` to pin the decision.
+**Verify** `crates/cyrup-tui/tests/keybindings.rs`: with `{"tui.editor.historyPrevious": "ctrl+p"}`, ctrl+p recalls the previous prompt from the **middle** of a multi-line buffer while Up still moves the caret.
+
+## TUI-036 — `Show images` / `Image width` rows are offered on terminals with no image protocol
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:5599-5607` pushes `SettingRow::toggle("terminal.showImages", …)` and `SettingRow::choice("terminal.imageWidthCells", …, ["60","80","120"])` unconditionally into `settings_rows`; the function takes no capability argument, and `state.image_renderer` / `state.capabilities` (set by `detect_image_support`, `app.rs:1118-1125`) are not consulted anywhere in the grid builder.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/settings-selector.ts:654-671` — `// Only show image toggle if terminal supports it` / `if (supportsImages) { items.splice(1, 0, {id:"show-images", …}); items.splice(2, 0, {id:"image-width-cells", …}); }`, where `supportsImages` comes from `getCapabilities()`. The neighbouring `auto-resize-images` row is deliberately **not** gated (spliced at `supportsImages ? 3 : 1`), which is exactly the distinction cyrup loses. Present at v0.83.0.
+
+**Impact** On a plain xterm, the Linux console or over a pipe, `/settings` offers two rows that cannot change anything, and the index positions of every row below them differ from pi's — so a user following pi's documentation, or a keyboard macro, lands on the wrong setting. It also makes the TUI-017 / TUI-N01 no-protocol behaviour look configurable when it is not.
+
+**Fix** Give `settings_rows` (`app.rs:5595`) the capability flag already on `AppState` and push the two image rows only when `state.image_renderer.is_graphical()` (or `state.capabilities.images.is_some()`), keeping `images.autoResize` unconditional exactly as pi does. Land with TUI-N01, which plumbs the same capability into the transcript.
+
+**Verify** App test with a no-protocol capability set: `/settings` contains neither `Show images` nor `Image width` but does contain `Auto-resize images`; with a Kitty capability set all three appear, in pi's order.
+
+## TUI-038 — Ctrl+O is an if/else in cyrup and a fan-out upstream
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:1937-1946`: `if self.state.transcript.has_bash() { toggle_bash_expanded() } else { toggle_tool_expanded() }` — mutually exclusive.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:4032-4051` `setToolsExpanded` sets `this.toolOutputExpanded`, then calls `setExpanded(expanded)` on the active header (`isExpandable(activeHeader)`, `:4042-4044`) **and** on every `isExpandable` child of `loadedResourcesContainer` and `chatContainer` (`:4045-4051`). The bash component is one of them — `components/bash-execution.ts:29` `private expanded = false` with `setExpanded(expanded)` at `:70`.
+
+**Impact** Upstream one Ctrl+O expands the bash block and the tool blocks together. In cyrup, while any `!cmd` block is present the tool-expansion flag cannot be moved at all, and afterwards the two flags are out of sync with each other and with what the user last asked for. Distinct from TUI-010, which is about the missing status line.
+
+**Fix** Restructure `Action::ToolsExpand` (`app.rs:1937-1946`) into a fan-out: set one `tools_expanded` flag and apply it to the bash block, the tool blocks and any expandable startup/loaded-resources entry, mirroring `setToolsExpanded`'s container walk. Land with TUI-010, which adds the status echo to the same arm.
+
+**Verify** App test: with a live bash block present, Ctrl+O expands both the bash output and the tool output, and a second Ctrl+O collapses both; the flag observed by a subsequently committed tool entry matches the last Ctrl+O.
+
+## TUI-039 — Terminal geometry never falls back to `$COLUMNS` / `$LINES`
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:1508-1510`: `let size = self.terminal.backend().size().ok(); let term_h = size.map(|s| s.height).unwrap_or(self.viewport_height).max(1); let term_w = size.map(|s| s.width).unwrap_or(80);` — the same `.unwrap_or(80)` pattern repeats at `:1569`, `:1594` and `:1862`. `rg 'COLUMNS|"LINES"' crates/ -g '*.rs'` returns only comments and test prose — no environment read anywhere.
+
+**upstream** — `pi/packages/tui/src/tui.ts:1730-1736`: `get columns() { return process.stdout.columns || Number(process.env.COLUMNS) || 80; }` and `get rows() { return process.stdout.rows || Number(process.env.LINES) || 24; }` — a two-step fallback, not a constant.
+
+**Impact** Wherever the ioctl gives no size — a pipe, a CI harness, some container PTY setups — cyrup pins 80 columns and silently ignores a `COLUMNS=200` the user or harness set, where pi honours it.
+
+**Fix** Add a `fallback_columns()` / `fallback_rows()` helper reading `$COLUMNS` / `$LINES` (parsed, positive) before the 80/24 constants, and use it at all four `unwrap_or` sites in `app.rs`.
+
+**Verify** App test with a backend reporting no size and `COLUMNS=200` set: the computed width is 200; unset, it is 80; with `COLUMNS=garbage`, it is 80.
+
+## TUI-040 — No `PI_TUI_WRITE_LOG` equivalent — no escape-sequence write log
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `rg 'TUI_WRITE_LOG' crates/ -g '*.rs'` → zero. There is no tee of the terminal write stream anywhere.
+
+**upstream** — `pi/packages/tui/src/tui.ts:1375-1384` resolves `process.env.PI_TUI_WRITE_LOG` (accepting a directory, in which case it derives `tui-{timestamp}-{pid}.log`), and `:1723` `fs.appendFileSync(this.writeLogPath, data)` tees every terminal write.
+
+**Impact** This matters more in cyrup than upstream. This workspace's own rule is that the TUI is not done until it has been run in a real terminal, and every one of the `-S` closures recorded this pass (`keyboard_protocol.rs`, `terminal_query.rs`, `drain.rs`, `terminal_progress.rs`, `terminal_title.rs`) is argued from byte constants and module docs alone. The write log is exactly the instrument that would let those be confirmed against a live kitty/iTerm2/tmux, and it is the one piece of pi's TUI debug surface nobody filed.
+
+**Fix** Add a `CYRUP_TUI_WRITE_LOG` (accepting `PI_TUI_WRITE_LOG` as an alias, consistent with the env aliasing in `crates/cyrup-config/src/env.rs`) resolved once at `App::into_stdout`, and tee every write in the same place `draw_synchronized` and the raw-sequence writers already funnel through. Accept a directory and derive `tui-{timestamp}-{pid}.log` as pi does.
+
+**Verify** With the variable pointing at a temp directory, one session produces a single log file whose bytes contain the OSC-0 title write, the keyboard-protocol negotiation and the drain-time disable sequences, in order.
+
+## TUI-041 — `/settings` shows env-overridden rows with the wrong value
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:5616-5627` builds the `showHardwareCursor` and `terminal.clearOnShrink` rows from `eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::default())` / `eff.clear_on_shrink(&cyrup_session_svc::EnvVars::default())`, with the comment at `:5613-5615` stating the choice ("a default `EnvVars` yields the persisted setting (else `false`), which is what the grid edits"). The **live** value takes the other branch: `crates/cyrup/src/main.rs:1642-1648` uses `EnvVars::from_process()` and feeds the result to `app.set_reserve_status_rows(reserve)`. The getters honour the environment — `crates/cyrup-config/src/settings.rs:849-861` `.unwrap_or(env.hardware_cursor)` / `.unwrap_or(env.clear_on_shrink)`, sourced from `CYRUP_HARDWARE_CURSOR`/`PI_HARDWARE_CURSOR` and `CYRUP_CLEAR_ON_SHRINK`/`PI_CLEAR_ON_SHRINK` at `crates/cyrup-config/src/env.rs:88-90`.
+
+**upstream** — pi's settings selector renders each row from the same resolved value the runtime uses; there is no second, env-blind read path.
+
+**Impact** With either environment variable set and nothing persisted, `/settings` reports `false` for behaviour that is on, and toggling the row to `true` looks like a no-op. Neither id is in the live-apply list at `app.rs:4040-4090` either, so `terminal.clearOnShrink` additionally does not take effect until the next launch.
+
+**Fix** Thread the process `EnvVars` already built at `crates/cyrup/src/main.rs:1642-1648` into `settings_rows` and use it for both rows so the grid displays the resolved value; when the resolved value comes from the environment rather than the settings layer, mark the row the way pi marks non-editable state rather than silently accepting a write that will not win. Add both ids to the live-apply list at `app.rs:4040-4090`.
+
+**Verify** App test with `CYRUP_CLEAR_ON_SHRINK=1` and nothing persisted: the `/settings` row reads `true`; toggling it writes the global layer and takes effect within the session without a relaunch.
+
+## TUI-047 — A late or unsolicited DCS/APC frame is shredded into ~20 typed characters — `stray_reply.rs` recognises only OSC 11
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/stray_reply.rs:72-88` enumerates the machine's states, and `:88` fixes the tail to `['1','1',';']` — the filter matches exactly one frame shape, an OSC 11 background-colour reply, and `:53-61` states that as the deliberate scope. There is no DCS (`ESC P … ST`) or APC (`ESC _ … ST`) arm, and `rg 'x1bP|x1b_G|APC|DCS' crates/cyrup-tui/src/` returns only three comment lines in `image.rs`. crossterm has no DCS/APC handling either: `crossterm-0.29.0/src/event/sys/unix/parse.rs:76-88` routes `ESC` + anything other than `O`/`[`/`ESC` to the Alt-key fallback, so `ESC P` becomes `Alt+P`, the payload is decoded one printable character at a time, and the `ESC \` terminator becomes `Alt+\` — all of it delivered to the editor as text.
+
+**upstream** — `pi/packages/tui/src/stdin-buffer.ts:55-63` classifies both families as first-class sequence types — "DCS sequences: ESC P … ESC \\ (includes XTVersion responses)" and "APC sequences: ESC _ … ESC \\ (includes Kitty graphics responses)" — with the completion tests at `:150-161` (`isCompleteDcsSequence`) and `:168-179` (`isCompleteApcSequence`). The consequence upstream is structural: a DCS/APC frame is emitted to `handleTerminalInput` as **one** `data` sequence, so the worst case is a single unrecognised keypress, not a line of garbage. Identical at v0.84.1.
+
+**Impact** — blast radius, not likelihood. Neither pi nor cyrup issues an XTVersion query (`git grep` over `v0.83.0:packages/tui packages/coding-agent` finds no `ESC [ > q`), and cyrup's Kitty image writes go through ratatui-image 11.0.6, which sets `q=2` (`.../ratatui-image-11.0.6/src/protocol/kitty.rs:251`) and therefore suppresses both OK and error responses — so the common APC reply path is closed. What remains open is any **unsolicited** DCS/APC (a tmux passthrough echo, a terminal answering a query cyrup did not send, a `q=2`-ignoring terminal): pi degrades to one bogus keystroke, cyrup degrades to ~20 characters typed into the prompt plus two Alt-chords — the same failure mode `stray_reply.rs` was written for in the OSC 11 case. Filed at low because reachability is genuinely narrow, **not** because the mechanism is acceptable.
+
+**Fix** — generalise `stray_reply.rs`'s state machine from one hard-coded tail to a small family: recognise the three ST-terminated introducers pi does — `ESC P` (DCS), `ESC _` (APC) and the existing `ESC ]` (OSC) — hold until an `ESC \` / BEL terminator or the `MAX_HELD` cap (`:70`), and swallow only on a complete terminator, preserving the replay-on-any-mismatch contract documented at `:34-51`. Keep the OSC 11 payload-alphabet check (`:273-275`) for the OSC arm; DCS/APC payloads are arbitrary, so bound them by `MAX_HELD` and the idle flush alone. **If TUI-045's pre-parser lands instead, port `isCompleteDcsSequence` / `isCompleteApcSequence` there verbatim and delete this arm** — do not build both.
+
+**Verify** — unit in `stray_reply.rs`'s test module: feed the crossterm shredding of `\x1bP>|cyrup 1.0\x1b\\` and assert the output is empty; feed `\x1b_Gi=31;OK\x1b\\` and assert the same; then re-run the existing keystroke-safety battery (`:394-608`) unchanged, especially `every_event_of_a_non_matching_burst_is_accounted_for`, to prove the wider machine still cannot eat a real key. Follow with a **live terminal run** under tmux, since that is the reachable source.
+
+## TUI-048 — Word navigation classifies by character class instead of Unicode word segmentation — CJK word motion jumps whole runs
+
+**Kind** parity-bug · **Severity** low · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/editor.rs:1637-1639`: `fn is_word_char(c: char) -> bool { c.is_alphanumeric() || c == '_' }`, and `word_left_target` / `word_right_target` (`:1074-1128`) consume a maximal run of one class (word vs non-word-non-whitespace). There is no segmenter anywhere in the crate: `rg 'segment|Segmenter|unicode_segmentation' crates/cyrup-tui/src/editor.rs` finds only the wrap-related comment at `:1738`. Verified by hand that this **coincides with pi** for ASCII prose, identifiers, `foo'bar`, `3.14` and `foo.bar` — the divergence is confined to scripts where a run of `is_alphanumeric` characters spans several dictionary words.
+
+**upstream** — `pi/packages/tui/src/word-navigation.ts:1-3` imports and instantiates `getWordSegmenter()` (`packages/tui/src/utils.ts:17-19`, an `Intl.Segmenter(undefined, { granularity: "word" })` created at `utils.ts:5`), and both functions iterate `Intl.SegmentData` with `isWordLike` (`:47`, `:100`). Inside a word-like segment they honour ASCII punctuation sub-boundaries via `PUNCTUATION_REGEX` (`utils.ts:821`) — backward takes the last match (`:50-56`), forward the first (`:102`). Whitespace is tested with `isWhitespaceChar` (`utils.ts:826-829`). Identical at v0.84.1.
+
+**Impact** — in CJK text Alt+B / Alt+F / Ctrl+W treat an entire ideograph run as one word: `你好世界` is two segments to `Intl.Segmenter` (so pi's Alt+B from the end lands after `你好`) and one alphanumeric run to cyrup (so it lands at column 0, and Ctrl+W deletes all four characters instead of two). The same applies to Thai and other unspaced scripts. cyrup already depends on Unicode segmentation elsewhere in this file (`grapheme_boundaries`, the wrap code at `:1744`), so the inconsistency is internal as well as against pi.
+
+**Fix** — route `word_left_target` / `word_right_target` (`editor.rs:1074-1128`) through a word segmenter — `unicode-segmentation`'s `UnicodeSegmentation::split_word_bound_indices` is the closest in-ecosystem match for UAX#29 and is very likely already in the graph via ratatui — keeping pi's three-branch shape from `word-navigation.ts:32-67` / `:89-114`: skip a whitespace run, then either one atomic segment (**TUI-043**), or one word-like segment truncated at its last/first `PUNCTUATION_REGEX` match, or a whole non-word non-whitespace run. Port `PUNCTUATION_REGEX` (`utils.ts:821`) as a `matches!` set rather than reusing `is_word_char`'s complement — the two are not the same set. `is_word_char` can stay for non-motion callers. **Sequence after TUI-043**, which touches the same two functions and is critical.
+
+**Verify** — `crates/cyrup-tui/tests/editor.rs`: with text `你好世界` and the caret at 4, `E::CursorWordBackward` lands at 2, not 0; `E::DeleteWordBackward` leaves `你好`. Add ASCII regression cases (`foo.bar`, `don't`, `3.14`, `foo bar`) asserting the current, already-correct targets so the segmenter swap cannot silently change them.
+
+## TUI-049 — `marker_at` accepts any text between `[paste #N ` and `]`, so cyrup expands paste markers pi's regex rejects
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/editor.rs:663-694` `marker_at()` matches the literal prefix `[paste #`, then one or more digits, then scans to the closing `]` on the same marker (a stray `[` aborts, `:682-686`) — **the body between the id and the `]` is unconstrained**. So with paste id 1 live, the user-typed string `[paste #1 see the file above]` satisfies `marker_at`, and `expanded_text()` (`:639-659`) substitutes the full stored paste for it at submit time (`:1570-1571`).
+
+**upstream** — `pi/packages/tui/src/components/editor.ts:21` @v0.83.0: `const PASTE_MARKER_REGEX = /\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]/g;` and `:24` the anchored single form. `expandPasteMarkers` (`:985-993`, v0.84.1 `:997`) builds its per-id regex from exactly that shape, so only `[paste #1]`, `[paste #1 +42 lines]` and `[paste #1 1500 chars]` are expandable. `isPasteMarker` (`:27-29`) additionally requires `segment.length >= 10`. Identical at v0.84.1.
+
+**Impact** — text the user typed is silently replaced by unrelated content in the message the model receives, with no trace in the visible buffer. Contrived to hit deliberately, which is why it is low, but it is a silent-substitution path — and the looseness widens the surface of TUI-042 and TUI-043, because a partially-chewed marker that still happens to end in `]` keeps expanding. The reverse direction is safe: `marker_covering` is used for atomic delete, so a looser matcher there only over-protects.
+
+**Fix** — tighten `marker_at` (`editor.rs:663-694`) to pi's grammar: after the digit run, accept either an immediate `]`, or a single space followed by `+<digits> lines]` or `<digits> chars]`, and nothing else. A dozen lines of straight-line parsing in the existing bounds-checked `chars.get` style, and it makes `marker_at` agree with the two formats `handle_paste` actually produces (`:619-624`). **Land with TUI-042 / TUI-043** — one invariant, three symptoms.
+
+**Verify** — `crates/cyrup-tui/tests/editor.rs`: paste 1,500 chars (creating id 1), then type `[paste #1 see above]` on a second line; assert `expanded_text()` contains that literal string and expands only the real marker (today it expands both).
+
+## TUI-050 — An 8-bit meta byte is silently dropped instead of being converted to `ESC` + char
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — nothing in `crates/cyrup-tui/src/app.rs:7125-7152` inspects raw bytes — crossterm owns them. crossterm 0.29.0 falls through to `parse_utf8_char` for any byte outside its recognised control set (`src/event/sys/unix/parse.rs:115-122`); a lone `0xE1` is a UTF-8 lead byte with no continuation, so with `more == false` the call errors, and `Parser::advance` handles `Err(_)` by `self.buffer.clear()` (`src/event/source/unix/tty.rs:263-266`) — the byte is discarded with no event emitted.
+
+**upstream** — `pi/packages/tui/src/stdin-buffer.ts:294-306` @v0.83.0, in `process()`: "Handle high-byte conversion (for compatibility with parseKeypress) — If buffer has single byte > 127, convert to ESC + (byte - 128)", i.e. `str = \`\x1b${String.fromCharCode(data[0] - 128)}\``, so `0xE1` becomes `ESC a` and reaches the key parser as `Alt+a`. Identical at v0.84.1.
+
+**Impact** — on a terminal configured for 8-bit meta (xterm with `metaSendsEscape` off, some legacy emulators and serial consoles), every `Alt+<letter>` chord is swallowed entirely — no key event at all, so `Alt+B` / `Alt+F` / `Alt+D` / `Alt+Y` and any extension shortcut on Alt are dead. pi handles them. Low because `metaSendsEscape` has been the default for two decades, so almost no user is in this mode.
+
+**Fix** — **dependent on TUI-045.** If that pre-parser lands, port `stdin-buffer.ts:294-306` into it verbatim (a one-byte read whose sole byte is > 0x7F becomes `ESC` + `byte - 128`). Without the pre-parser there is no seam — crossterm eats the byte before cyrup can see it — so this item must be scheduled **with** TUI-045 and never attempted alone.
+
+**Verify** — unit on the pre-parser: feed a one-byte chunk `0xE1` and assert `Alt+a` is produced. **Live run** on `xterm -xrm 'XTerm*metaSendsEscape: false'`: `Alt+B` moves the caret back one word instead of doing nothing.
 
 ## TUI-N05 — Extension shortcuts can never override a built-in key; no conflict reported
 
-**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** high
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:1042-1072`: the global `Keymap::action_for(key)` is consulted first and, unless the action is `ClipboardPasteImage` with no image or a deferred `Interrupt`/`Quit`, returns immediately; only an unmatched key reaches `state.extension_shortcuts` at `:1069-1072`. The comment at `:1065-1068` frames this as protecting Ctrl+D/Esc, but it applies to *every* built-in binding. `cyrup/crates/cyrup-ext/src/registry.rs:388-395` `register_shortcut` is a bare `HashMap` insert — a later registration silently replaces an earlier one with no record. Workspace grep: no `restrict_override`, no `shortcut_diagnostics`.
+**cyrup** — `crates/cyrup-tui/src/app.rs:1660-1704`: the global `Keymap::action_for(key)` is consulted **first** and returns unless the action is `ClipboardPasteImage` with no image or a deferred `Interrupt`/`Quit`/`PageUp`/`PageDown`; only an unmatched key reaches `state.extension_shortcuts` at `:1698-1703`. The comment there frames this as protecting Ctrl+D/Esc, but it applies to *every* built-in binding. `rg 'RESERVED_KEYBINDINGS|restrict_override' crates/ -g '*.rs'` → **zero**.
 
-**upstream** — `pi/packages/coding-agent/src/core/extensions/runner.ts:71-89` `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` lists 18 ids; `getShortcuts` (`:494-534`) skips an extension shortcut only when the colliding built-in is reserved (`restrictOverride === true`, `:511-517`), otherwise the extension *wins* and pi records `Extension shortcut conflict: '{key}' is built-in shortcut for {keybinding} and {path}. Using {path}.` (`:519-525`); a second extension on the same key also wins with its own warning (`:527-533`). All land in `shortcutDiagnostics`, surfaced under `[Extension issues]` (`interactive-mode.ts:1671-1680`).
+**upstream** — `pi/packages/coding-agent/src/core/extensions/runner.ts:71-90` `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` lists 18 ids; `getShortcuts` (`:510-533`) skips an extension shortcut **only** when the colliding built-in is reserved (`restrictOverride === true`), otherwise the extension **wins** and pi records `Extension shortcut conflict: '{key}' is built-in shortcut for {id} and {path}. Using {path}.` All land in `shortcutDiagnostics` (`:295`, exposed `:539-541`), surfaced under `[Extension issues]`.
 
 **Impact** An extension binding a non-reserved key (any editor motion, page-up/down, history nav) silently never fires — the key does its built-in thing and the guest handler is dead, with no diagnostic to explain it. Two extensions on the same key is likewise silent last-wins.
 
-**Fix** Port `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` as a const set of cyrup `Action`s; in `apply_key` check `state.extension_shortcuts` *before* the built-in keymap when the matched built-in action is not reserved, keeping the current precedence when it is. Have `register_shortcut` (`registry.rs:388-395`) record a `ShortcutDiagnostic` on replacement, add a `shortcuts` field to `StartupDiagnostics` (`cyrup/crates/cyrup-session-svc/src/services.rs:34-46`) and fold it into `[Extension issues]` — the same plumbing TUI-006 needs. Work them together.
+**Fix** Port `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` as a const set of cyrup `Action`s; in the key path check `state.extension_shortcuts` **before** the built-in keymap when the matched built-in action is not reserved, keeping the current precedence when it is. Have `register_shortcut` record a `ShortcutDiagnostic` on replacement, add a `shortcuts` field to `StartupDiagnostics` and fold it into `[Extension issues]` — the same plumbing TUI-006 needs. Work them together.
 
 **Verify** App test: register an extension shortcut on a non-reserved key, press it, assert `AppAction::ExtensionShortcut` (not the built-in action); register one on `Esc`, press it, assert `Action::Interrupt` still wins **and** a conflict diagnostic is recorded.
 
 ## TUI-N06 — `Entry::Thinking` freezes hide/show at commit time
 
-**Kind** parity-bug · **Severity** low · **Effort** L · **Confidence** high
+**Kind** parity-bug · **Severity** low · **Effort** L · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/transcript.rs:467-475` `commit_thinking` stamps `hidden: self.hide_thinking` into `Entry::Thinking { text, hidden }`, and `entry_lines` (`transcript.rs:1704-1710`) reads that frozen field. `set_hide_thinking_block` (`:480-482`) affects only the in-flight block and entries committed afterwards. The constraint is structural: committed entries are drained to `Terminal::insert_before` (`app.rs:994-1010`) into the terminal's own scrollback. Self-documented at `transcript.rs:45-52` and in `d2c5509`'s message under KNOWN LIMITATION.
+**cyrup** — `crates/cyrup-tui/src/transcript.rs:631-639` `commit_thinking` stamps `hidden: self.hide_thinking` into `Entry::Thinking`, and `:641-643`'s own doc says the setter "affects the live reasoning block and every entry committed afterwards; already-flushed scrollback is immutable". `app.rs:4053-4056` concedes the divergence in a comment. The constraint is structural: committed entries are drained to `Terminal::insert_before` into the terminal's own scrollback.
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/assistant-message.ts:57-62` `setHideThinkingBlock` re-runs `updateDisplay()`; `interactive-mode.ts:4305-4313` `onHideThinkingBlockChange` walks every `AssistantMessageComponent`, calls `setHideThinkingBlock` on each, then `chatContainer.clear()` + `rebuildChatFromMessages()` — the toggle retroactively collapses or expands the whole visible conversation.
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:4050-4066` `toggleThinkingBlockVisibility` does `this.chatContainer.clear(); this.rebuildChatFromMessages();` then re-adds the streaming component — the toggle retroactively collapses or expands the whole visible conversation.
 
 **Impact** Toggling "Hide thinking" mid-session changes only future turns. On the replay path the asymmetry is sharper: a `/resume` re-commits every historical turn's reasoning at the *current* setting, so the same conversation renders differently depending on when it was resumed.
 
-**Fix** Decide, do not patch. (A) accept it and record it in `lib.rs`'s ADR-0001 notes plus the `/settings` row label; (B) keep the last N committed entries in a re-renderable tail above `insert_before`; (C) on a toggle, re-run `replay_session` so the conversation re-commits below in the new form, accepting duplicated scrollback (which the sibling `/resume` divergence already produces). Mutating already-flushed rows is not achievable under `insert_before`.
+**Fix** Decide, do not patch. (A) accept it and record it in `lib.rs`'s ADR-0001 notes plus the `/settings` row label; (B) keep the last N committed entries in a re-renderable tail above `insert_before`; (C) on a toggle, re-run the replay so the conversation re-commits below in the new form, accepting duplicated scrollback (which the sibling `/resume` divergence already produces). Mutating already-flushed rows is not achievable under `insert_before`. Per this ledger's no-accepted-divergence rule, option (A) is a decision to record, not a closure.
 
 **Verify** Whatever is chosen, pin it: commit a `Thinking` entry with `hide_thinking = false`, flip `set_hide_thinking_block(true)`, assert the documented outcome so it cannot drift silently again.
 
 ## TUI-N07 — Mid-session `/resume` cannot erase the previous session's scrollback
 
-**Kind** parity-bug · **Severity** low · **Effort** L · **Confidence** high
+**Kind** parity-bug · **Severity** low · **Effort** L · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/src/app.rs:698-708` `rebind_session` resets `TranscriptView` and live state, but previously committed rows have already gone to native scrollback via `flush_committed` → `Terminal::insert_before` (`app.rs:994-1010`) and are unreachable; `replay_session` (`app.rs:759`) then appends the new session's conversation below the old one. Self-documented at `app.rs:749-753` and in `d2c5509`'s message.
+**cyrup** — The swap arm (`crates/cyrup-tui/src/app.rs:6884-6995`) calls `rebind_session()` then `replay_session_with_extensions(&restored, &ext_host)` (`:6988`) and appends below the previous session's already-flushed `insert_before` scrollback; there is no clear and no boundary rule.
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:1737-1742` — the tree/fork navigate path does `this.chatContainer.clear(); this.renderInitialMessages();` and restores `result.editorText`; `:3599-3601` `rebuildChatFromMessages()` does the same after compaction. pi owns its whole viewport, so a clear is a real clear.
+**upstream** — pi owns its whole viewport, so a clear is a real clear: `this.chatContainer.clear(); this.renderInitialMessages();` on the tree/fork navigate path, and `rebuildChatFromMessages()` (`interactive-mode.ts:4055-4056`) after compaction.
 
-**Impact** After `/resume`, `/fork`, `/tree`, `/import` or `/clone` the terminal shows the old conversation, a `session replaced` status, then the new conversation in full. Scrolling up crosses a session boundary marked only by that one line. TUI-003's fix made this far more prominent — before, there was nothing below the boundary at all.
+**Impact** After `/resume`, `/fork`, `/tree`, `/import` or `/clone` the terminal shows the old conversation, a `session replaced` status, then the new conversation in full. Scrolling up crosses a session boundary marked only by that one line.
 
 **Fix** Same ADR-0001 family as TUI-N06; decide rather than patch. Cheapest honest improvement: replace the plain `session replaced` status with a full-width rule plus the new session's id/name/branch so the seam reads as deliberate. A true clear needs either the alternate screen (TUI-019) or a raw `ESC[3J` outside the ratatui buffer, which destroys the user's pre-cyrup scrollback and must be opt-in at most.
 
-**Verify** App test: commit two entries, call `rebind_session` + `replay_session` with a different message set, assert `scrollback_lines()` still contains the pre-swap text plus the chosen boundary marker — pinning the behaviour instead of leaving it in a commit message.
+**Verify** App test: commit two entries, drive a session swap with a different message set, assert `scrollback_lines()` still contains the pre-swap text plus the chosen boundary marker — pinning the behaviour instead of leaving it in a commit message.
 
 ## TUI-N08 — `tests/image.rs` pins the invented `🖼` placeholder and the rasterize-anyway fallback
 
-**Kind** test-defect · **Severity** low · **Effort** S · **Confidence** high
+**Kind** test-defect · **Severity** low · **Effort** S · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/tests/image.rs:59-73` `show_images_off_renders_text_placeholder` asserts the buffer contains `🖼`, `red.png` and `64×48` — locking in `ImageBlock::placeholder_line`'s invented format (`cyrup/crates/cyrup-tui/src/image.rs:197-207`) as correct. `:38-57` `attached_image_renders_inline_halfblocks_when_show_images_on` asserts a half-block raster paints on a backend with no image protocol, and its `:42` precondition `assert!(!app.state().image_renderer.is_graphical(), ...)` makes the no-protocol case explicitly the tested one. Since `d2c5509` the same crate contains `image_fallback_text` (`image.rs:311-330`) producing pi's real format, so the test and the code disagree about what the placeholder should be.
+**cyrup** — `crates/cyrup-tui/tests/image.rs:56` asserts the buffer does **not** contain `🖼` when inline rendering happens, and `:67-70` asserts `🖼`, the label and `64×48` are present when `show_images = false` — both pinning `crates/cyrup-tui/src/image.rs:242-247`'s invented `🖼 {label} ({w}×{h})` as correct. The same crate contains `image_fallback_text` (`image.rs:353-367`) producing pi's real form, so the test and the code disagree about what the placeholder should be. The inline test's own precondition makes a backend with **no image protocol** explicitly the tested case.
 
-**upstream** — `pi/packages/tui/src/components/image.ts:114-118`: when `!caps.images`, exactly one line, `truncateToWidth(this.theme.fallbackColor(imageFallback(...)), width)`; `pi/packages/tui/src/terminal-image.ts:546-558` defines that string as `[Image: {shortened path} [{mime}] {w}x{h}]`. pi has no half-block rasterizer anywhere.
+**upstream** — `pi/packages/tui/src/components/image.ts:114-118`: when `!caps.images`, exactly one line, `truncateToWidth(this.theme.fallbackColor(imageFallback(...)), width)`; `pi/packages/tui/src/terminal-image.ts` defines that string as `[Image: {shortened path} [{mime}] {w}x{h}]`. pi has no half-block rasterizer anywhere.
 
-**Impact** A green test pinning current-but-wrong behavior — the same shape that let `providers/anthropic.rs` assert the buggy xhigh→max mapping. Anyone implementing TUI-017 hits two failing assertions and must decide whether the test or the gap doc is authoritative, while the suite reports parity on a path that has none.
+**Impact** A green test pinning current-but-wrong behaviour. Anyone implementing TUI-017 hits two failing assertions and must decide whether the test or this document is authoritative, while the suite reports parity on a path that has none.
 
 **Fix** Retarget both to state the divergence rather than the format: assert that *some* placeholder line is emitted, or annotate the two assertions `// TUI-017: pins the current cyrup format; flip to image_fallback_text when the attachment strip is ported` plus an `#[ignore]`d companion asserting pi's `[Image: …]` form. Delete the comment and un-ignore when TUI-017 lands.
 
@@ -551,233 +995,131 @@ boot (`main.rs:1272-1294`). The probe machinery (`terminal_query.rs`, `theme.rs:
 
 ## TUI-N09 — `extension_dialog_countdown` asserts an exact countdown it cannot control
 
-**Kind** test-defect · **Severity** low · **Effort** S · **Confidence** high
+**Kind** test-defect · **Severity** low · **Effort** S · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-tui/tests/extension_dialog_countdown.rs:79-91`: opens a dialog with `timeout_ms = 3_000`, does `std::thread::sleep(Duration::from_millis(1_100))`, ticks, and asserts the rendered title contains the literal `"Proceed? (2s)"`. The displayed value is `remaining.div_ceil(1000)` off a real `Instant`, so the assertion holds only while total elapsed wall time stays under 2000 ms — a 900 ms budget for scheduler delay, in a workspace of ~3,180 tests. It is the only wall-clock-exact assertion in the file; the two expiry tests (`:106`, `:135`) sleep 120 ms against a 50 ms deadline and only require `elapsed >= deadline`, which is monotone-safe.
+**cyrup** — `crates/cyrup-tui/tests/extension_dialog_countdown.rs:85` `std::thread::sleep(Duration::from_millis(1_100))`, `:86` `app.tick_extension_dialog_countdown()` (no argument, so no injectable instant), `:88` `assert!(text.contains("Proceed? (2s)"))` — a wall-clock-exact assertion against a 3 s budget with ~900 ms of scheduler slack, in a workspace of ~3,180 tests. The deterministic alternative already exists in-repo: `StatusIndicator::retry_message` reads `started.elapsed()` (`crates/cyrup-tui/src/status_indicator.rs:161-164`), landed by TUI-023's fix this pass.
 
-**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/countdown-timer.ts:21-30` drives the same countdown from an injected timer rather than a wall-clock sleep; cyrup has no equivalent injection point because `App` reads `Instant::now()` directly.
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/components/countdown-timer.ts:21-30` drives the same countdown from an injected timer rather than a wall-clock sleep.
 
-**Impact** The second test-defect shape this project keeps finding — the one that produced `1806375`'s fix in `caps/proc.rs`. A CI or loaded-laptop stall past 900 ms turns it red with a message pointing at the countdown logic rather than at the scheduler, which is how a suite starts being ignored.
+**Impact** A CI or loaded-laptop stall past 900 ms turns it red with a message pointing at the countdown logic rather than at the scheduler, which is how a suite starts being ignored.
 
-**Fix** (a) weaken to a monotone assertion — after the sleep the title shows fewer seconds than at open and more than zero (`(2s)` or `(1s)`, never `(3s)`); or better (b) give the countdown an injectable instant (`tick_extension_dialog_countdown_at(Instant)`, mirroring `StatusIndicator::spinner_at(Duration)` in `cyrup/crates/cyrup-tui/src/status_indicator.rs`, already the deterministic pattern here) and drive it synthetically. (b) also removes 1.1 s of real sleep from the suite and unblocks TUI-023's countdown test.
+**Fix** (a) weaken to a monotone assertion — after the sleep the title shows fewer seconds than at open and more than zero; or better (b) give the countdown an injectable instant (`tick_extension_dialog_countdown_at(Instant)`), mirroring the `started.elapsed()` pattern `status_indicator.rs` now uses, and drive it synthetically. (b) also removes 1.1 s of real sleep from the suite.
 
 **Verify** With (b): `tick_extension_dialog_countdown_at(open + 1_100ms)` renders `(2s)` and `+ 2_100ms` renders `(1s)`, with no `thread::sleep` and no dependence on wall time.
 
+## TUI-S02 — No dead-terminal (EIO/EPIPE/ENOTCONN) emergency exit path
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+> **Auditor closure overturned — half only.** The `uncaughtCrash` half landed: `crates/cyrup-tui/src/panic_hook.rs:82-89` `install_panic_hook` chains `restore_terminal_best_effort()` before the previous hook, with a test double at `:132`, installed at `crates/cyrup-tui/src/app.rs:6112` **before** `enable_raw_mode` — and `app.rs:6106-6110` documents that ordering and cites pi's install site. The item's *second* named mechanism did not land.
+
+**cyrup** — `grep -n 'EIO\|emergency\|BrokenPipe\|unhandled' crates/cyrup-tui/src/panic_hook.rs crates/cyrup-tui/src/app.rs` → nothing relevant. A write failure to a dead terminal runs the full normal restore path straight back into the dead fd and exits with an ordinary code.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:212-220` `DEAD_TERMINAL_ERROR_CODES = new Set(["EIO","EPIPE","ENOTCONN"])` plus `isDeadTerminalError`, feeding `emergencyTerminalExit()` at `:3816-3823`, which deliberately **skips** normal shutdown ("TUI and extension cleanup can write restore sequences and re-trigger EIO") and exits 129.
+
+**Impact** A dropped SSH connection or a killed tmux pane sends cyrup through the restore path it must not take: each restore write hits the dead fd, and the exit code does not signal a terminal death to the parent. Low because it needs the terminal to die mid-session, but the failure mode is exactly the one pi added a dedicated path for.
+
+**Fix** Classify write errors from the draw/flush and restore paths against pi's three codes in `crates/cyrup-tui/src/drain.rs` or `panic_hook.rs`, and on a match take an emergency path that skips `drain_and_restore()` and extension cleanup entirely and exits 129 — mirroring `emergencyTerminalExit`. Coordinate the exit code with `SEAM-008` in area 08, which owns cyrup's signal exit codes.
+
+**Verify** Unit test over a writer that returns `ErrorKind::BrokenPipe`: the emergency path is taken, no restore sequences are written, and the process exit code is 129; a `PermissionDenied` write error still takes the normal path.
+
+## TUI-S10 — Shift+Ctrl+D global debug chord absent
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `rg 'debug' crates/cyrup-tui/src/keymap.rs` → **zero** at HEAD; `rg 'onDebug|on_debug' crates/ -g '*.rs'` → **zero**. `/debug` is reachable only by typing it (`crates/cyrup-tui/src/commands.rs:76` `HIDDEN_COMMANDS`, handler at `crates/cyrup-tui/src/app.rs:1827`).
+
+**upstream** — `pi/packages/tui/src/tui.ts:850`, inside `handleTerminalInput` and **before** dispatch to the focused component: `if (matchesKey(data, "shift+ctrl+d") && this.onDebug) { this.onDebug(); return; }`. Wired at `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2803` `this.ui.onDebug = () => this.handleDebugCommand();` — "works regardless of focus".
+
+**Impact** When a selector, dialog or overlay has focus — precisely when a diagnostic dump is wanted — there is no route to it, because the only route is the editor that no longer has focus.
+
+**Fix** Add a pre-dispatch chord check in the key path (`app.rs:1660`), ahead of the focused-component dispatch, matching shift+ctrl+d to the existing `/debug` handler at `app.rs:1827`. Structurally outside TUI-008/TUI-028, which cover configurable ids; pi hardcodes this one.
+
+**Verify** App test: with a selector focused, shift+ctrl+d emits the debug dump and the selector keeps its selection; with the editor focused, the same.
+
 ## Coverage
 
-**Method.** Read-only and static at HEAD `1806375` (confirmed clean). No cargo, no npm. For every `closed` / `partially-closed` verdict I opened the named cyrup function at HEAD *and* the cited upstream file and compared branch-for-branch, rather than trusting commit messages. One commit message (`d2c5509`) was read deliberately to check it against the code; it overstates TUI-007.
-
-**Read on the cyrup side.** `cyrup/crates/cyrup-tui/src/`: `app.rs`, `transcript.rs`, `startup.rs`, `image.rs`, `theme.rs`, `terminal_query.rs`, `status.rs`, `status_indicator.rs`, `keymap.rs`, `commands.rs`, `autocomplete.rs`, `chrome.rs`, `editor.rs`, `markdown.rs`, `lib.rs`, `startup_selector.rs`. Plus `cyrup/crates/cyrup/src/main.rs` (boot sequence), `cyrup/crates/cyrup-session-svc/src/{services.rs,runtime.rs}`, `cyrup/crates/cyrup-ext/src/{registry.rs,host/services.rs}`, `cyrup/crates/cyrup-config/src/{settings.rs,trust.rs}`, and all 46 files under `cyrup/crates/cyrup-tui/tests/`.
-
-**Read on the upstream side.** `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts` and its `components/{assistant-message,user-message,tool-execution,footer,status-indicator,countdown-timer,compaction-summary-message}.ts`, `theme/{theme,theme-controller}.ts`; `pi/packages/tui/src/{tui,autocomplete,terminal,terminal-image}.ts` and `components/{image,markdown}.ts`; `pi/packages/coding-agent/src/core/{slash-commands,cache-stats}.ts` and `core/extensions/runner.ts`.
-
-**Overturned.** TUI-006 downgraded `closed` → `partially-closed`: pi's `[Extension issues]` is a four-source union and cyrup renders one, so duplicate slash commands, built-in shadowing and duplicate shortcuts remain exactly as invisible as when the item was filed. TUI-007 was re-examined and *kept* closed, but only with the TUI-N01 cross-reference attached — its closure must not be read as tool-result-image parity.
-
-**Test-defect sweep.** Grepped all 46 test files for `thread::sleep|Instant::now|elapsed` and for negative assertions. Exactly two timing-dependent sites: `extension_dialog_countdown.rs:85` (filed, TUI-N09) and `terminal_theme_query.rs:220-224` (a `< 1s` upper bound on a bounded probe — monotone-safe, not filed). Bug-pinning candidates examined and *not* filed, with reasons: `status_indicator.rs:99-111,178` assert only the retry band's initial string, so they do not block TUI-023; `render.rs:131` / `assembled_render.rs:166` assert only the populated context segment, so nothing pins TUI-024; `thinking.rs:147-163` uses only adjacent thinking blocks, so it does not pin TUI-002's fold; `transcript.rs:1938-1951` pins the `you:`/`assistant:` prefixes but TUI-026 is a documented cyrup-original the brief says not to change unasked.
-
-**Taken on trust / could not verify.** (1) Runtime behavior of `terminal_query.rs` against a real TTY — the parsers are unit-tested against pi's byte forms and the DA1/timeout contract is argued in the module docs, but whether iTerm2/kitty/tmux answer within 100 ms without leaking bytes into crossterm is untestable here. (2) Whether cyrup has a compaction-queue analog to pi's `compactionQueuedMessages` (affects TUI-005 and TUI-016 scope). (3) Whether `image_width_cells` survives a settings round-trip through `/reload` — the swap arm re-reads it (`app.rs:4166`) but the settings layer was not traced. (4) `spec/architecture/*` and `R-NN-NNN` text: that tree is absent from this workspace; ids were used only as a grep index and no claim is made about their content.
-
-**Blind spots.** `session_search.rs`, `tree_selector.rs`, `config_selector.rs`, `diff.rs`, `export.rs`, `fuzzy.rs` and the theme file-watcher / colour-precedence path were not compared against upstream, so this ledger is not exhaustive for those files. The ratatui-vs-hand-rolled substrate difference (OSC 133 prompt zones, focus reporting, non-re-renderable committed rows) is excluded per the brief except where a concrete pi behavior depends on it (TUI-N06, TUI-N07).
-
-
-
----
-
-## Surface-sweep findings (2026-08-03, HEAD `9219dcd`)
-
-Found by a **surface-driven** sweep that walked pi asking what has NO cyrup counterpart at
-all, rather than checking a list of known items. That inversion exists because the
-item-driven method missed pi's stray-OSC-reply swallow (`pi/packages/tui/src/tui.ts:788-794`)
-— a real, user-reported bug — and by construction cannot see behaviour nobody wrote an item
-for. IDs use an `-SNN` suffix to mark their provenance.
-
-| ID | Severity | Kind | Effort | Title |
-|---|---|---|---|---|
-| TUI-S01 | high | not-ported | M | The interactive TUI never installs a `UiEffectSink` — every fire-and-forget extension `ui.*` mutator is silently dropped |
-| TUI-S02 | medium | not-ported | S | No panic hook — an abort leaves the terminal in raw mode with the cursor hidden (SIGHUP half is a duplicate) |
-| TUI-S03 | medium | not-ported | M | The footer's `(git branch)` segment can never be populated — no git-HEAD resolution anywhere in cyrup |
-| TUI-S04 | medium | not-ported | M | Kitty keyboard flags pushed blind — no capability negotiation and no `modifyOtherKeys` fallback |
-| TUI-S05 | medium | not-ported | M | No terminal cell-size query (`CSI 16 t`) — image geometry uses ratatui-image's half-block cell |
-| TUI-S06 | low | not-ported | S | The terminal window/tab title is never set (no OSC 0 write) |
-| TUI-S07 | low | not-ported | S | No `checkTmuxKeyboardSetup` — tmux users get silently broken modified-Enter with no diagnosis |
-| TUI-S08 | low | not-ported | S | No stdin drain before exit and no `stdin.pause()` — buffered escape bytes leak to the parent shell |
-| TUI-S09 | low | not-ported | S | No resume-command hint printed on exit |
-| TUI-S10 | low | not-ported | S | Shift+Ctrl+D global debug chord absent — `/debug` reachable only by typing into the editor |
-| TUI-S11 | low | not-ported | M | No startup version-update or package-update notifications |
-
-## TUI-S01 — The interactive TUI never installs a `UiEffectSink` — every fire-and-forget extension `ui.*` mutator is silently dropped
-
-**Kind** not-ported · **Severity** high · **Effort** M · **Confidence** confirmed
-
-**upstream** — pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2218-2270 `createExtensionUIContext` wires notify/setStatus/setTitle/setEditorText/pasteToEditor/setHeader/setFooter/setToolsExpanded/setWidget to live TUI actions.
-
-**cyrup** — ABSENT. Re-ran independently. `grep -rn "UiEffect" crates/ --include=*.rs` → producers in cyrup-session-svc/src/host_services.rs:122-650 and exactly ONE consumer, cyrup-modes/src/rpc.rs:366-419 + :549. `grep -rn "set_ui_effect_sink" crates/` → definition at host_services.rs:408, call sites only rpc.rs:487/:550. cyrup-tui/src/app.rs:4127 and :4456 install `set_ui_sink` (the BLOCKING `UiRequest` dialog channel) and nothing else — no `set_ui_effect_sink` anywhere in cyrup-tui or crates/cyrup/src/main.rs. `grep -rn "set_extension_status" crates/` → definition cyrup-tui/src/status.rs:194 + only tests/footer_extensions.rs:31,32,46,48. `emit_ui_effect` (host_services.rs:414-418) drops silently when the sink is `None`, and its own doc at :407 says "Only interactive/rpc call this" — interactive does not.
-
-**Impact** — In the shipped default mode an extension calling ui.notify / setStatus / setTitle / setEditorText / pasteEditorText / setHeader / setFooter / setToolsExpanded gets a success return and nothing happens. Extension self-reported errors (`ui.notify`) go silent in exactly the mode a human is watching, and the same call works over RPC, so it looks like a cyrup bug to the extension author. The footer extension-status row (status.rs:194/:367) is unreachable in production.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — The `setWidget` member alone is already TUI-014 ('Extension widgets stored host-side but never rendered'). The other seven variants are untracked; the correct framing is the missing sink, not seven separate items. Verified TUI-014's text scopes itself to widgets only.
-
-## TUI-S02 — No panic hook — an abort leaves the terminal in raw mode with the cursor hidden (SIGHUP half is a duplicate)
-
-**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
-
-**upstream** — pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:3750-3755 `process.prependListener("uncaughtException")` → `uncaughtCrash` (:3691-3708), whose doc names the exact failure: raw mode + hidden cursor left behind, requiring `stty sane && reset`. :3739-3748 routes stdout/stderr EIO to `emergencyTerminalExit`.
-
-**cyrup** — ABSENT. `grep -rn "panic::set_hook" crates/` → ZERO (the only `catch_unwind` hits are cyrup-agent/src/agent.rs:167,387,1686 and cyrup-ext/src/{native.rs:480,facade.rs:323} — unrelated handler guards). `grep -rn "impl Drop" crates/cyrup-tui/src/app.rs` → zero. Cargo.toml:215 sets `panic = "abort"` for release, so no unwind and no Drop fallback exists either. `App::restore` (cyrup-tui/src/app.rs:3981-3988) is reached only from app.rs:3998, :4085, :4495 and crates/cyrup/src/main.rs:1219, :1413 — all normal paths (I checked: there is no `process::exit` in cyrup-tui/src or crates/cyrup/src that bypasses it). Note restore()'s own doc comment at app.rs:3979 claims it is 'total and idempotent so a `Drop` guard / error path always leaves a usable terminal' — the Drop guard it refers to does not exist.
-
-**Impact** — Any panic on any thread (dependency arithmetic overflow, image-decode assert, ratatui slice, poisoned-mutex re-panic) aborts with raw mode on, bracketed paste on, kitty flags pushed and the cursor hidden; the user's shell is unusable until they blind-type `stty sane; reset`. `panic = "abort"` makes this strictly worse than pi — only a `set_hook` can save it. Downgraded from the claim's `high` because it needs a panic to occur (no normal path bypasses restore) and the workspace clippy no-panic policy lowers first-party probability; dependencies are still uncovered.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — The SIGHUP half of this claim is ALREADY TRACKED as SEAM-008 in gap-analysis/08-cyrup-session-svc-and-modes.md:217-229 ('SIGHUP ignored; no 143/129 signal exit codes'), which cites the same absence in crates/cyrup/src/signals.rs. Report only the panic-hook half as new.
-
-## TUI-S03 — The footer's `(git branch)` segment can never be populated — no git-HEAD resolution anywhere in cyrup
-
-**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
-
-**upstream** — pi/packages/coding-agent/src/core/footer-data-provider.ts:99-382 resolves the branch from .git/HEAD (worktree-aware, `detached` fallback, `git symbolic-ref` escape hatch) and watches it with a 500 ms debounce; interactive-mode.ts:516 constructs it, :866 subscribes a re-render, components/footer.ts:112-120 renders `pwd (branch)`.
-
-**cyrup** — ABSENT. `grep -rn "set_branch" crates/ --include=*.rs` → setter at cyrup-tui/src/status.rs:156 and ONLY two test call sites (cyrup-tui/tests/assembled_render.rs:143, tests/render.rs:111). The one production footer populator, crates/cyrup/src/main.rs:1455-1481, sets model/provider/reasoning/provider_count/cwd/thinking_level — and its comment at :1475 literally says "Location line (`cwd (branch) • name`, footer.ts:116-130)" then calls only `set_cwd`. `grep -rni "symbolic-ref|refs/heads|git_branch|current_branch|head_ref|\.git/HEAD" crates/ --include=*.rs` → zero production hits (only cyrup-tui/tests/autocomplete.rs:276 writing a fixture). `gix::` is used only in cyrup-resources/src/package/install.rs (clone/checkout), never for HEAD resolution of the cwd.
-
-**Impact** — The footer renders `~/path • session` where pi renders `~/path (david/cyrup) • session`, permanently, and a mid-session `git checkout` is never reflected. Invisible to the test suite because both rendering tests call `set_branch` themselves.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — Not tracked. Grepped all 12 gap files for 'branch' — hits are TUI-005/TUI-009 (escape branches), TUI-N07 (branch summaries) and SESS-023, none about the footer git branch.
-
-## TUI-S04 — Kitty keyboard flags pushed blind — no capability negotiation and no `modifyOtherKeys` fallback
-
-**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
-
-**upstream** — pi/packages/tui/src/terminal.ts:17 `\x1b[>7u\x1b[?u\x1b[c`; :228-250 `handleKeyboardProtocolNegotiationSequence` enables kitty only on a non-zero flags reply and calls `enableModifyOtherKeys()` (`\x1b[>4;2m`, :320-324) when flags are 0 or DA1 arrives first; :326-330 `disableModifyOtherKeys` on drain and stop. Re-read all three hunks — accurate as claimed.
-
-**cyrup** — ABSENT. `grep -rn "modify_other_keys|modifyOtherKeys|4;2m|>4;" crates/` → ZERO. `grep -rn "supports_keyboard_enhancement" crates/` → ZERO. cyrup-tui/src/app.rs:3959-3966 unconditionally `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)` with the comment 'ignore failure (legacy terminals)' — a blind `CSI > 1 u` write with no reply read; repeated verbatim at :4010-4013 (resume) and :4093-4096 (external editor). cyrup-tui/src/terminal_query.rs handles only OSC 11, DSR ?996 and the DA1 sentinel — no `CSI ? u` flags query, no parser for a flags reply.
-
-**Impact** — On any terminal without the kitty protocol (xterm, Terminal.app, older VTE, tmux without extended-keys) pi still disambiguates modified keys via modifyOtherKeys and cyrup gets nothing: Shift/Ctrl/Alt+Enter arrive indistinguishable from Enter, so newline-vs-submit and follow-up bindings silently do the wrong thing. Not substrate — crossterm exposes the push primitive and explicitly leaves negotiation to the caller.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — Not tracked. TUI-008 covers unbound keybinding *ids*, a different layer; the only other 'Kitty' mention in the gap files is TUI-019's alt-screen item noting the flag is pushed.
-
-## TUI-S05 — No terminal cell-size query (`CSI 16 t`) — image geometry uses ratatui-image's half-block cell
-
-**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
-
-**upstream** — pi/packages/tui/src/tui.ts:720-728 `queryCellSize()` writes `\x1b[16t` at start (gated on capabilities.images); :898-918 `consumeCellSizeResponse` parses `ESC[6;h;w t`, calls `setCellDimensions` then `invalidate()`+`requestRender()`. Default it replaces is {9,18} (terminal-image.ts:37). Both hunks read and verified.
-
-**cyrup** — ABSENT. `grep -rn "16t|cell_dimensions|CellDimensions|set_cell_dimensions" crates/` → ZERO. cyrup-tui/src/image.rs:66-73 `from_capabilities` builds `Picker::halfblocks()` and only `set_protocol_type`s it for Kitty/Iterm2, so `self.picker.font_size()` at image.rs:91 (and :233) is always the half-block cell, never terminal-reported; image.rs:52-59 documents deliberately replacing `Picker::from_query_stdio` with an env sniff because the query blocked on stdin.
-
-**Impact** — `cell_size` (image.rs:90-105) mis-sizes on graphical terminals. Nuance I verified that the claim did not: half-blocks are 1:2 (w:h) and a real cell is typically ~9:18 = 1:2, so a WIDTH-CLAMPED large image comes out nearly right by coincidence. The damage is on images narrower than the terminal — a 40x40px icon reserves 40 cols x 20 rows under half-blocks vs 5x3 under a real 9x18 cell, ~8x oversized, on exactly the kitty/iTerm2 terminals where real pixels are drawn. Severity medium stands but for the small-image case, not uniformly.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — Not tracked. TUI-017 and TUI-N01 cover protocol selection, the invented placeholder and the missing 60-cell cap — neither touches the pixels-per-cell input to the calculation.
-
-## TUI-S06 — The terminal window/tab title is never set (no OSC 0 write)
-
-**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
-
-**upstream** — interactive-mode.ts:877-885 `updateTerminalTitle()` → `terminal.setTitle` (pi/packages/tui/src/terminal.ts:504-507, `\x1b]0;<title>\x07`), re-applied after the Windows npm check clobbers it (:915-921).
-
-**cyrup** — ABSENT. `grep -rn "SetTitle|]0;|]2;|set_terminal_title|window_title" crates/ --include=*.rs` → the only OSC-0 literals are ANSI *strippers* in cyrup-tui/src/bash.rs:272 and cyrup-session-svc/src/bash.rs:486 (test strings for stripping child output). host_services.rs:642 emits `UiEffect::SetTitle`, consumed only by rpc.rs:402 — i.e. dead in the TUI per finding 1. crossterm's `SetTitle` is never imported. The `set_title` methods in selector.rs/text_input.rs/extension_editor.rs are dialog widget titles.
-
-**Impact** — Multiple cyrup sessions in tabs/panes are indistinguishable. Same primitive `ui.setTitle` needs, so both close together. Correctly classified as behaviour, not ADR-0001 substrate: crossterm exposes `SetTitle` and declines to decide when to use it.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — Not tracked in any gap file (grepped 'title'/'setTitle' across gap-analysis/ — only 08's SEAM item about the RPC widget wire shape mentions setTitle, and that says rpc.rs:401-407 already matches).
-
-## TUI-S07 — No `checkTmuxKeyboardSetup` — tmux users get silently broken modified-Enter with no diagnosis
-
-**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
-
-**upstream** — interactive-mode.ts:999-1044 (read in full — matches the claim): on $TMUX, spawns `tmux show -gv extended-keys` / `extended-keys-format` with a 2 s timeout and returns a warning naming the exact `set -g extended-keys on` remedy; wired at :928-932 through `showWarning`.
-
-**cyrup** — ABSENT. `grep -rn "extended-keys|extended_keys" crates/` → ZERO. `grep -rn "TMUX" crates/ --include=*.rs` → only cyrup-tui/src/image.rs:407,450 (image-protocol suppression) and tests/image_capabilities.rs. No startup warning of this shape in cyrup-tui/src/startup.rs.
-
-**Impact** — tmux defaults extended-keys off. A cyrup user in tmux finds Shift/Alt/Ctrl+Enter simply don't work, with no hint their multiplexer is the cause. Compounds with the missing modifyOtherKeys fallback above — tmux-without-extended-keys is exactly the case that fallback partially rescues.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — Not tracked (grepped 'tmux' across gap-analysis/ — only TUI-020's hyperlink-probe mention).
-
-## TUI-S08 — No stdin drain before exit and no `stdin.pause()` — buffered escape bytes leak to the parent shell
-
-**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
-
-**upstream** — pi/packages/tui/src/terminal.ts:368-404 `drainInput(maxMs=1000, idleMs=50)` — disables kitty (`\x1b[<u`) FIRST so no new sequences are generated, disables modifyOtherKeys, detaches the handler, idles to quiescence; interface doc :59-64 names the purpose (kitty key-releases leaking to the parent shell over slow SSH). :443-451 `process.stdin.pause()` before restoring raw mode, commented as fixing a Ctrl+D-closes-the-parent-shell race.
-
-**cyrup** — ABSENT. `grep -rn "drain_input|drain_stdin" crates/` → ZERO. `App::restore` (cyrup-tui/src/app.rs:3981-3988) is exactly four statements — PopKeyboardEnhancementFlags, DisableBracketedPaste, disable_raw_mode, show_cursor — no drain, no pause; the crossterm reader thread is stopped only by its cancel token, unsynchronized with restore().
-
-**Impact** — On exit over a high-latency link, in-flight bytes (query replies, a trailing Ctrl+D) surface on the parent shell prompt or close an SSH session. Lower exposure than pi's because cyrup requests only DISAMBIGUATE_ESCAPE_CODES (no REPORT_EVENT_TYPES → no key-release traffic); the query-reply and Ctrl+D races remain.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — Not tracked.
-
-## TUI-S09 — No resume-command hint printed on exit
-
-**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
-
-**upstream** — interactive-mode.ts:3660-3666 (read verbatim): after `this.stop()` and `runtimeHost.dispose()`, writes `To resume this session: <cmd>` to stdout; `formatResumeCommand` (:238-251) gates on isTTY + session persisted + file exists and shell-quotes.
-
-**cyrup** — ABSENT. `grep -rni "to resume|resume this session|formatResumeCommand" crates/` → zero matches of the behaviour. The interactive exit path (crates/cyrup/src/main.rs:1403-1414: `app.run(...).await` then `let _ = app.restore();`) writes nothing to stdout after restore; the file's only println!/eprintln! sites (main.rs:45,456,809,902,1036,1040,1088,1106,1183,1188,1334,1434,1518,1547) are all other paths.
-
-**Impact** — A user who quits loses the handle to the session; recovery means `/resume` into a picker instead of pasting one line. All the pieces (--session, --session-dir, persistence state) already exist.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — Not tracked. Straddles the TUI/bin lifecycle boundary, which is why no area file owns it.
-
-## TUI-S10 — Shift+Ctrl+D global debug chord absent — `/debug` reachable only by typing into the editor
-
-**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
-
-**upstream** — pi/packages/tui/src/tui.ts:818-822 (read verbatim): inside `handleTerminalInput`, BEFORE dispatch to the focused component, `if (matchesKey(data,"shift+ctrl+d") && this.onDebug) { this.onDebug(); return; }`; interactive-mode.ts:2672 wires it 'works regardless of focus'.
-
-**cyrup** — ABSENT. `grep -rn "debug" crates/cyrup-tui/src/keymap.rs` → ZERO. The keymap's global table (keymap.rs:368-390) has no shift+ctrl chord other than ctrl+shift+p (ModelCycleBackward). `debug` appears only as commands.rs:70 HIDDEN_COMMANDS and its handler app.rs:1252 — i.e. reachable solely by typing `/debug`+Enter in the prompt editor.
-
-**Impact** — When a selector, dialog or overlay has focus — precisely when a diagnostic dump is wanted — there is no route to it, because the only route is the editor that no longer has focus.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — TUI-008 audits configurable keybinding *ids*; `onDebug` is a hardcoded pre-dispatch chord and structurally outside it. Not tracked.
-
-## TUI-S11 — No startup version-update or package-update notifications
-
-**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed
-
-**upstream** — interactive-mode.ts:901-921 (read in full): `checkForNewPiVersion(this.version)` → `showNewVersionNotification`, and `checkForPackageUpdates()` → `showPackageUpdateNotification` (a bordered panel naming each stale package + the `pi update --extensions` remedy), both after the PI_OFFLINE gate at :894. `package-manager.ts:1159-1221 checkForAvailableUpdates` handles BOTH npm and git sources (git branch at :1204-1217, `gitHasAvailableUpdate`), skipping local and pinned.
-
-**cyrup** — ABSENT. `grep -rni "available_update|check_for_new|new_version|update_available|checkForAvailableUpdates|outdated|latest_version" crates/` → ZERO. cyrup-resources/src/package/ (git_url/install/lock/manifest/source/store) has install + a packages.json registry but no update-availability check of any kind. The offline gate IS ported (cyrup-config/src/policy.rs:54-56, crates/cyrup/src/provider.rs:98,155 citing the exact `run()` lines) — the guard was ported and the two promises it guards were not.
-
-**Impact** — A user with stale extension packages is never told; a package behind its source fails in ways that look like cyrup bugs. cyrup's package channel is git-first (PackageSource::Git, source.rs:13-20), so pi's git half of checkForAvailableUpdates maps directly — the npm half does not apply. Caveat on the other half: `checkForNewPiVersion` polls pi's own release feed, and a rebranded fork doing that is the same product decision the sweep author already excluded for `reportInstallTelemetry`. Recommend scoping any item to the extension-package check.
-
-**Fix** — port the upstream behaviour named above; the pi reference gives the exact shape.
-
-**Verify** — assert the behaviour end to end, not that a function exists.
-
-**Overlap** — Not tracked.
-
+**Method.** Read-only and static, at cyrup HEAD `04c1ba2` (last code commit; tree clean at the docs-only `a9000b1`) against pi `v0.84.1`, with `v0.83.0` read directly wherever a finding had to be classified `not-ported` versus `upstream-drift`. No cargo, no npm, no execution of cyrup or pi. Every `closed`, `partially-closed` and `overturned` verdict was reached by opening the named Rust function at HEAD **and** the cited TypeScript at the tag; commit messages were treated as hypotheses throughout, and two auditor closures (TUI-020, TUI-S02) were overturned on exactly that basis.
+
+**Read first-hand on the cyrup side.** `crates/cyrup-tui/src/`: `app.rs` (targeted, ~1.5k of ~7,100 lines), `transcript.rs`, `keymap.rs`, `commands.rs`, `autocomplete.rs`, `chrome.rs`, `image.rs`, `status.rs`, `status_indicator.rs`, `tree_selector.rs`, `markdown.rs`, `footer_data.rs`, `terminal_query.rs`, `terminal_progress.rs`, `terminal_title.rs`, `keyboard_protocol.rs`, `tmux.rs`, `drain.rs`, `panic_hook.rs`, `resume_hint.rs`, `startup.rs`, `session_search.rs`, `editor.rs` (keybinding ids and prompt history only), `theme.rs` (targeted). Plus `crates/cyrup/src/{main.rs, update_check.rs, startup_ui.rs}`; `crates/cyrup-session-svc/src/{host_services.rs, services.rs, session.rs}` (including the compaction/streaming lifecycle traced for TUI-031); `crates/cyrup-ext/src/{registry.rs, facade.rs, host/services.rs, host/live.rs}`; `crates/cyrup-config/src/{settings.rs, env.rs}`; the 85-file test inventory plus `image.rs`, `extension_dialog_countdown.rs`, `extension_ui_effects.rs`, `extension_ui_reset_on_swap.rs`, `turn_interleaving.rs` read directly.
+
+**Read first-hand on the upstream side.** At v0.84.1: `packages/coding-agent/src/modes/interactive/interactive-mode.ts` (escape chain, `createExtensionUIContext`, `setExtensionWidget`/`Footer`/`Header`, `setupAutocompleteProvider`, `setToolsExpanded`, `updatePendingMessagesDisplay`, `queueCompactionMessage`, `maybeSaveImplicitProjectTrustAfterReload`, `handleReloadCommand`, the startup header, `switchTuiMode`, `renderProjectTrustWarningIfNeeded`, `emergencyTerminalExit`), `components/{assistant-message,user-message,tool-execution,footer,status-indicator,countdown-timer,settings-selector,tree-selector,bash-execution,markdown-transform,mermaid}.ts`, `core/{keybindings,slash-commands,extensions/runner,extensions/types}.ts`, `packages/tui/src/{tui,keybindings,terminal,terminal-image,autocomplete}.ts`, `packages/tui/src/components/{editor,image,markdown}.ts`. At v0.83.0 specifically, to classify: `tree-selector.ts`, `keybindings.ts` (both packages), `extensions/types.ts`, `interactive-mode.ts`. Plus the `v0.83.0..v0.84.1` diffstat and log for `packages/tui` and `packages/coding-agent/src/modes/interactive`.
+
+**Version-lag sweep result.** Four drift-relevant clusters were examined. (a) Alt-screen / `tui-mode` / scroll-view / mouse / semantic-prompt navigation — folded into the **TUI-019** re-audit rather than filed separately, since TUI-019 already owns it and only its size changed. (b) LaTeX — **already ported** (`crates/cyrup-tui/src/markdown/latex.rs`, 2242 lines); no item. (c) Mermaid plus the markdown-transformer API — filed as **TUI-034**. (d) The `scrollbarThumb` theme token — **already ported** with pi's optional-with-fallback semantics (`crates/cyrup-tui/src/theme.rs:480-483, :1032-1033`); no item. Two small v0.84.x coding-agent fixes were checked and found already correct in cyrup: `fc4a3d99b` (errors honour `outputPad` — `transcript.rs:2933`) and `e8a17822d` (progress clear sequence — `terminal_progress.rs:47` explicitly tracks the v0.84.1 spelling).
+
+**Surface-driven sweep — the axis used, and the one that had never been run (repair pass).** The critique was right on both counts: this file never used the term, and the specific sweep README blind spot 2 prescribes had not been performed. What the main pass ran was a **version-lag** sweep (the four clusters above) plus item-driven verification — neither of which can see a `packages/tui/src` file that draws nothing and that no item names.
+
+The repair pass ran the missing one. Axis: **enumerate every non-drawing file under `pi/packages/tui/src`, read it at both v0.83.0 and v0.84.1, and trace every exported symbol to its cyrup consumer by ripgrep over `crates/`.** Six files, 863 lines: `stdin-buffer.ts` (434), `editor-component.ts` (74), `terminal-colors.ts` (73), `undo-stack.ts` (28), `word-navigation.ts` (117), `fuzzy.ts` (137). **Zero mentions of any of these six basenames existed anywhere in `docs/gap-analysis` before this pass** — a grep over all fifteen files returned nothing, which is the confirmation of blind spot 2 rather than an inference about it. Only `terminal-colors.ts` differs between the tags (`COLOR_SCHEME_REPORT_PATTERN` widened to `(?:…)+`); the other five are byte-identical at both.
+
+Yield: **nine items, two of them critical** — TUI-042, TUI-043, TUI-044, TUI-045, TUI-046, TUI-047, TUI-048, TUI-049, TUI-050. The two criticals are both silent data loss in the prompt editor on ordinary keystrokes, in code that has shipped and that no pass had ever opened.
+
+**Substrate note, load-bearing for four of the nine.** cyrup routes input through crossterm 0.29.0, whose `Parser::advance` (`crossterm-0.29.0/src/event/source/unix/tty.rs:247-268`) feeds `parse_event` byte-at-a-time and retains a partial buffer — so **most of `stdin-buffer.ts`'s reassembly duty is genuinely covered**, and this was verified in crossterm's own source rather than assumed. A CSI/SS3/mouse sequence split at any byte *after* the introducer is reassembled; bracketed paste spanning many reads comes out as one `Event::Paste` (`parse.rs:198-200` + `parse_csi_bracketed_paste`, routed at `app.rs:7198` → `:1711-1719` → `InputEditor::handle_paste`); the old-style `ESC[M`+3-byte mouse completion is handled by `parse_csi_normal_mouse`. Four behaviours are **not** covered and are the items above.
+
+**Confirmed covered by this sweep — do not re-file.**
+- **`fuzzy.ts` — both exports ported faithfully and widely consumed.** Every constant was re-derived against upstream: consecutive-run reward `-5·run` (`fuzzy.ts:37` / `fuzzy.rs:52`), gap penalty `+2·gap` (`:42` / `:56`), word-boundary bonus `-10` over `/[\s\-_./:]/` (`:32`,`:48` / `is_boundary_sep` `:19-21`, `:61`), later-match penalty `+0.1·i` (`:52` / `:65`), whole-string-exact `-100` (`:63-65` / `:75-77`), the empty-query-before-length-check ordering (`:17-23` / `:26-31`), and the alphanumeric-swap retry at `+5` with pi's `[a-z]`-then-`[0-9]` precedence (`:75-92` / `:83-117`). `fuzzyFilter` (`:99-137`) → `filter` (`:143-174`): same `/[\s/]+/` tokenisation, all-tokens-must-match with summed scores, empty-query passthrough, stable ascending sort. Nine consumers verified.
+- **`terminal-colors.ts` — all four exports ported, including the only inter-tag change in the six.** `parseOscHexChannel` → `terminal_query.rs:188-201`; `parseOsc11BackgroundColor` → `:143-184`; `parseTerminalColorSchemeReport` → `:221-239`, and cyrup **already carries** the v0.84.1 widening of `COLOR_SCHEME_REPORT_PATTERN` (pi `0e633790c`) with both load-bearing properties (last-frame-wins, the all-or-nothing `^…$` anchor) and transcribes pi's own test case at `terminal_query.rs:528-559`. `isOsc11BackgroundColorResponse`'s consumer role is `stray_reply.rs` in full. The remaining live-resync consumer is TUI-004.
+- **`undo-stack.ts` — the container is ported.** `UndoStack<S>` → `undo: Vec<Snapshot>` with push/pop/clear/length; `structuredClone` is mechanism-N/A (`Vec<Vec<char>>: Clone` is already deep). pi's fish-style coalescing is ported correctly on both arms (`editor.ts:1092-1097` → `push_undo_for_type` `:739-746`; the non-typing always-push → `push_undo_for` `:723-732`). pi has no redo and neither does cyrup, so `editor.rs:748`'s parity comment is correct. **Only the snapshot PAYLOAD diverges** — TUI-042 and TUI-044.
+- **`editor-component.ts` — every interface member has a concrete `InputEditor` counterpart**, so there is no missing *behaviour*, only missing *pluggability*: `getText`/`setText`, `handleInput`, `onSubmit`/`onChange`, `addToHistory`, `insertTextAtCursor`, `getExpandedText`, `setPaddingX`, `setAutocompleteMaxVisible`, `borderColor` all map. The two genuinely absent members are already owned — `setEditorComponent`/`getEditorComponent` is **TUI-030**, `setAutocompleteProvider` is **TUI-029**. Do not re-file either.
+- **`utils.ts:826-829 isWhitespaceChar`** — ported with its delta stated at `editor.rs:1655-1660` (JS `\s` vs `char::is_whitespace` differ on U+FEFF and U+0085; both unreachable because `sanitize_paste` `:1834-1836` strips them). `sanitize_paste` was re-read and the claim holds.
+
+**Explicitly N/A, recorded so the absence is not read as an oversight.** `stdin-buffer.ts`'s `EventEmitter` plumbing (`:20`, `:265-268`, `:274`) — cyrup's transport is the `tokio::sync::mpsc` channel at `app.rs:7126` with `InputEvent::Key`/`Paste` standing in for `data`/`paste`. `StdinBufferOptions` (`:257-263`) — a constructor knob with no object to configure; **the 10 ms default's *behaviour* is not N/A and is TUI-045**. `flush()`/`clear()`/`getBuffer()`/`destroy()` (`:400-433`) — public API servicing pi's own buffer instance; crossterm owns the equivalent and exposes none of it, and `clear()`'s teardown role is served by `drain.rs`. The zero-length-chunk guard (`:308-311`) — crossterm's reader never surfaces a zero-byte event (`tty.rs:88-101`). The SGR-mouse completion logic (`:43-46`, `:102-120`) — cyrup enables no mouse reporting and `map_event_on` drops `Event::Mouse(_)` (`app.rs:7203`); already owned by TUI-019, and crossterm parses both forms correctly regardless. `word-navigation.ts:11`'s `segment?` option **as a pluggable option** — the two behaviours it delivers are TUI-043 and TUI-048, filed rather than dismissed.
+
+**Rejected, with reasons — do not re-derive these.**
+- **TUI-S01 re-filed as a separate open item.** Rejected. Its own Overlap note says the correct framing is the missing sink, and the sink now exists; the three unrendered variants are TUI-014 (widgets) and TUI-033 (header/footer). Holding S01 open as well would book the same defect three times. It is closed as framed and carried in the status table as a pointer.
+- **TUI-008's `app.pageUp`/`app.pageDown` spelling complaint as part of TUI-008.** Rejected as scoped there. `app.rs:1676-1684` now self-documents the deferral behaviour as deliberate, and the spelling question belongs to the whole-namespace problem — moved to **TUI-028**.
+- **TUI-020 as `closed`.** Rejected; overturned to partially-closed. Dropping the ` ({href})` parenthetical made the visible row match pi, but the item's title is "never emitted" and cyrup still emits OSC-8 nowhere.
+- **TUI-S02 as `closed`.** Rejected; overturned to partially-closed. The `uncaughtCrash` half landed; `DEAD_TERMINAL_ERROR_CODES` → `emergencyTerminalExit` did not.
+- **TUI-S11's release-feed half as an open item.** Rejected. The item's own Impact paragraph recommended scoping to the extension-package check, and `crates/cyrup/src/main.rs:552` records the fork/product decision explicitly. Closed as scoped.
+- **`crates/cyrup-tui/tests/terminal_theme_query.rs:220-224`** as a `test-defect` sibling of TUI-N09. Rejected: a `< 1s` upper bound on a bounded probe is monotone-safe.
+- **`crates/cyrup-tui/src/terminal_title.rs`'s control-char stripping** as a parity divergence from `terminal.ts:515`. Rejected: it is a documented CYRUP-DELTA hardening that removes no behaviour.
+
+**Blind spots — where the next pass should look first.**
+
+1. **Rendering fidelity is not covered by this file.** `cyrup/TUI-FIDELITY.md`'s ~150 presentation divergences live in a document with no stable IDs and no status table, and this pass did not re-audit which of its rows batches 4–10 actually closed. Any row still open there is invisible to `00-residual-ledger.md`. **TUI-016 is already an instance of the two documents drifting apart** — a fidelity fix (C14) removed the only surface a gap item depended on. Merging that backlog into this file with real IDs is the single highest-value follow-up for area 07.
+2. **Selector internals were sampled, not swept.** `tree_selector.rs` was read end to end because a lead pointed there, and TUI-027 (high) was found in the first selector opened. `session_selector.rs`, `config_selector.rs`, `settings_selector.rs`, `model_selector.rs`, `auth_select.rs`, `user_message_selector.rs`, `oauth_selector.rs`, `login_dialog.rs`, `session_search.rs`, `export.rs`, `diff.rs`, `fuzzy.rs`, `overlay.rs` and `component.rs` were **not** compared against their upstream components for behaviour. In particular `/resume`'s `app.session.*` keymap and `/scoped-models`' `app.models.*` keymap carry cyrup-chosen defaults never diffed against `core/keybindings.ts:135-176`. The base rate suggests more of TUI-027's class.
+3. **`crates/cyrup-tui/src/app.rs` is now ~7,100 lines and roughly a fifth was read.** The run loop, `ingest_session_event`'s ~60 event arms and `run_command`'s ~40 command arms were sampled only at the points items pointed to. An event arm that is a silent no-op where pi does something would not have surfaced.
+4. **Editor internals unexamined.** `editor.rs` (visual motion, wrapping, undo, kill-ring, paste, bracketed paste, hardware cursor) was touched only for keybinding ids and prompt history. pi's `packages/tui/src/components/editor.ts` is ~1,400 lines; the v0.84.1 diff to it was one hunk (TUI-035), but the v0.83.0 baseline port has never been audited behaviourally by any pass.
+5. **The seven new `-S` closures are now unaudited new code.** `panic_hook.rs`, `drain.rs`, `tmux.rs`, `keyboard_protocol.rs`, `footer_data.rs`, `resume_hint.rs`, `update_check.rs`, `terminal_progress.rs`, `terminal_title.rs` each exist, are wired, and cite the correct upstream sites in their docs — enough to overturn "ABSENT", but per this method's own rule a closure means the subsystem now **exists**, not that it is **correct**. TUI-S02's overturned closure is the first instance found; the PROV-005 precedent (a closure that hid three new highs) says to expect more. None of the nine was read line-for-line against pi.
+6. **Runtime behaviour is unverifiable statically.** Terminal negotiation (`keyboard_protocol.rs`, `terminal_query.rs`, `drain.rs`) is argued from module docs and byte constants matching pi's. Whether a real kitty/iTerm2/tmux answers within the timeouts, and whether the OSC-0 / OSC-9;4 / OSC-8 writes interleave correctly with ratatui's buffer flush, cannot be shown by reading. Per this workspace's rule that the TUI is not done until run in a real terminal, every `-S` closure recorded here should be confirmed live before being trusted — which is also the argument for **TUI-040**.
+7. **Cross-area handoffs opened this pass.** TUI-030's `onTerminalInput` / `setEditorComponent` halves and TUI-034's guest-facing transformer registration need WIT-world changes and must be reconciled with **area 06**. TUI-031's queue drain touches the session's compaction lifecycle in **area 03** (the compaction/streaming interaction was traced in `session.rs` for this pass, but the drain design is area 03's to own). TUI-006's and TUI-N05's remaining diagnostic sources need new fields on `StartupDiagnostics` in `cyrup-session-svc`, **area 08**, which also owns the exit code TUI-S02 needs. **Added in the repair pass:** TUI-051 and **CFG-048** are one behaviour split across two areas (the keybinding name migration has a write-time site in `migrations.rs` and a read-time site on `/reload`), and CFG-048 must land before **TUI-028** or the namespace rename breaks every `editor.*` config written against shipped cyrup. TUI-019's launch-failure and settings halves are **SEAM-051** (area 08) and **CFG-021** (area 05) and are deliberately not counted here.
+8. **NEW (repair pass) — a startup-path sweep landed on `crates/cyrup-tui` code that area 08 owns, and nothing here duplicates it.** A separate sweep over `pi/packages/coding-agent/src/cli/` (`session-picker.ts`, `startup-ui.ts`, `config-selector.ts`, `list-models.ts`, `file-processor.ts`, `initial-message.ts`) produced ten findings routed to **area 08** and this area jointly. Several of them edit files in this crate — `crates/cyrup-tui/src/session_selector.rs` (the `--resume` picker merges current-folder and all-projects sessions into one list headed "Current Folder", and advertises a `tab scope` toggle that has no `SessionAction`; the pre-launch picker also offers a rename it silently discards), and the pre-launch surfaces that hardwire `UiTheme::default()` and `SelectKeymap::default()` instead of the user's theme and `keybindings.json`. **No TUI id is filed for any of them**, because the defects live in the pre-launch chrome (`crates/cyrup/src/{main,startup_ui,subcommands}.rs`) that area 08 owns, and double-filing would inflate the count. Recorded here per README blind spot 4 so the work is not orphaned: **if area 08's file does not carry these, they are unowned.** Note two of them are direct siblings of TUI-027's class — typed text accepted, echoed, and thrown away — and the pre-launch keymap gap is a sibling of TUI-051's.
+9. **NEW (repair pass) — the six `packages/tui/src` non-drawing files are now read, but the drawing-adjacent ones still are not.** The sweep in `## Coverage` was scoped to files that draw nothing. `packages/tui/src/` also holds `autocomplete.ts`, `components/editor.ts` (~1,400 lines) and `components/markdown.ts`, which draw *and* carry portable behaviour, and blind spot 4 above already flags `editor.rs` as never behaviourally audited. TUI-042/043/044/049 were all found in `editor.rs` from the *outside* — by reading pi's helpers and tracing their consumers — which strongly implies more inside it. **`editor.rs` read line-for-line against `components/editor.ts` at v0.83.0 is the highest-value remaining target in this area**, ahead of the selector sweep in blind spot 2.
+
+## Open questions — decisions required
+
+Recorded separately because they are **not** severity judgements and must not be encoded as one. Per
+the no-unapproved-deferrals rule, each names what is blocked, what is *not* blocked by it, and who
+must decide.
+
+**OQ-07-1 — Does cyrup build an alt-screen / fullscreen TUI mode at all? (TUI-019)**
+
+- **Status:** undecided in any readable document. The prior "deliberate ADR-0001 divergence"
+  justification is withdrawn — `PARITY-GAPS.md:709` records ADR-0001 as unreadable in this workspace,
+  and README:208-212 forbids resting an item on an unverifiable ADR reference. **No decision of record
+  exists**, so the previous `low` was encoding a decision nobody made.
+- **Blocked on the answer:** the alt-screen `App` variant, mouse capture, the scrollbar, semantic
+  prompt navigation, and the eight `tui.altScreen.*` keybinding ids — jointly effort L+, the largest
+  single unit of unscheduled work in this area.
+- **NOT blocked on the answer, and must be fixed either way:** **SEAM-051** (`--tui-mode`, whose
+  *default* value `regular` currently makes the binary exit 1 with "unknown option") and **CFG-021**
+  (`tuiMode` / `fullscreenScrollbar` modelled nowhere). A flag that rejects its own default is a
+  defect under both answers. Do not let these wait on the decision.
+- **Who decides:** a human, in a document in this workspace. If the answer is "no", it belongs in a
+  readable ADR that this file can cite — at which point TUI-019 becomes a *scoped* mechanism
+  difference whose behavioural cost (no mouse, no scrollbar, no jump-to-prompt) still stays on the
+  list as work, because there is no accepted-divergence category.
+- **Interim rating:** `medium`, judged on consequence within the item's own scope, as recorded in the
+  item. It is not a placeholder for the decision and should not be re-lowered without one.
+
+**OQ-07-2 — Does `cyrup/TUI-FIDELITY.md` get merged into this file with real IDs?**
+
+- **Status:** raised by every recent pass (see blind spot 1) and never answered. 464 lines, ~150
+  presentation findings against v0.84.1, no stable IDs, no status table, therefore invisible to
+  `00-residual-ledger.md`.
+- **Why it is a decision and not just work:** merging it would add on the order of 150 rows to a
+  426-item ledger, most of them low. The alternative — leaving it out — has already cost real
+  behaviour once: TUI-FIDELITY C14 deleted the `{n} queued` footer segment, which is exactly what
+  turned **TUI-016** from "wrong surface" into "no surface at all", and no ledger reader could have
+  seen that coming.
+- **Who decides:** whoever owns backlog shape. Either answer is defensible; silence is not, because
+  the two documents are actively drifting into each other.
