@@ -39,6 +39,7 @@ the evidence.
 | file | area | open items | crit | high |
 |---|---|---:|---:|---:|
 | [`../PARITY-PLAN.md`](../PARITY-PLAN.md) | **the execution plan derived from this directory — 30 batches, the next three moves, deferrals and open questions** | — | — | — |
+| [`../adr/README.md`](../adr/README.md) | **decisions of record — where the nine open questions of `PARITY-PLAN.md` §7 were settled (eleven ADRs), plus the ledger changes those decisions imply** | — | — | — |
 | [`PARITY-GAPS.md`](PARITY-GAPS.md) | **the same 448 items grouped by gap class — read first** | — | — | — |
 | [`00-residual-ledger.md`](00-residual-ledger.md) | ranked cross-cutting view | — | — | — |
 | [`01-cyrup-core-and-provider.md`](01-cyrup-core-and-provider.md) | wire APIs, providers, auth, streaming, catalogs, cost | 40 | 0 | 6 |

@@ -1401,6 +1401,19 @@ The standing rule is that there are no unapproved deferrals, and that disclosure
 
 Nine decisions the plan stops at rather than guessing. Batch 2 exists to force them.
 
+> **All nine are now decided.** Each question below keeps its original text — it is the record of why
+> the question existed and what was on the table — and gains a **Decided** line naming the ADR that
+> settled it. The decisions live in [`docs/adr/`](adr/README.md); that index also carries the ledger
+> changes they imply, the contradictions reconciled between them, and the convention for overturning
+> one. **One half of one question survives:** OQ-8 bundles two unrelated questions and only the
+> `CFG-005` half is decided — the `~163 non-user-observable lows` half is still open and unowned.
+>
+> Two numbering notes, because both cost time this pass. **`OQ-N` here is not `OQ-N` in
+> `PARITY-GAPS.md`** — that document's §6 carries its own nine numbered questions, and the mapping is
+> `PG §6 q3 = OQ-5` · `q4 ⊂ OQ-6` · `q6 = OQ-9` · `q7 = OQ-2` · `q8 = OQ-3` · `q9 = OQ-1`. And
+> `PARITY-PLAN.md:242`'s gloss of **OQ-6** as "SDK-surface parity" is a partial reading: OQ-6 is the
+> `spec/` question, which *also* carries the SDK decision (see `:1465`).
+
 **OQ-1 — What is `bash` allowed to be? (`TOOL-039` + `TOOL-007` as ONE decision.)**
 *Why:* the two items are mutually contradictory as shipped. TOOL-007 concedes the `ProtectedFs` guard
 is theatre **because** bash is undecorated; TOOL-039 shows that same bash runs under whatever
@@ -1414,6 +1427,12 @@ are mandatory: a `[CYRUP-DELTA]` stamp, the resolved interpreter reported at ses
 result details, a second explicitly-named scrub group, and path validation per `shell.ts:73`. Half of
 (ii) is not an option.
 *Blocks:* batch 9 entirely (14 items) and transitively batch 10 (15 more in the same crate).
+***Decided:*** [`adr/ADR-0003-bash-scope.md`](adr/ADR-0003-bash-scope.md) — **option (i), both
+halves**: delete the `CYRUP_SHELL` arm (`ops/shell.rs:101-105`), add none of option (ii)'s four
+compensating limbs, and default `protect_paths` to `false`, keeping `ProtectedFs` as an inert
+embedder-only opt-in. The same "cyrup never silently picks an interpreter the user did not choose"
+rule also decides `TOOL-038` — the `cmd.exe` arm becomes pi's `No bash shell found` error — under
+either answer to OQ-5. *(This is also `PARITY-GAPS` §6 q9.)*
 
 **OQ-2 — Is `pi packages/agent/src/harness/**` in scope?**
 *Why:* ~11.4k insertions / ~10.9k deletions owned by **no** area file. Four trackers point at it and
@@ -1423,6 +1442,13 @@ out of scope (record the behavioural cost, close all four trackers with the reas
 batch 18's measurement, which is what this plan schedules.
 *Blocks:* `AGENT-028`, `SESS-038`, `DRIFT-040`, VL-P22; the trustworthiness of the 448 figure; and any
 date anyone tries to attach to this plan.
+***Decided:*** [`adr/ADR-0004-agent-harness-scope.md`](adr/ADR-0004-agent-harness-scope.md) — **port
+the behaviour the harness pins, not the harness.** Measured: harness-v2 is a published SDK that pi's
+own shipping binary does not consume (its ten symbols reach exactly one file, which nothing in `src/`
+imports and no export path publishes), so it contributes **zero** behaviour to be 1:1 with; absorbing
+it would add a second unused agent stack and make cyrup *less* faithful. All four trackers close, the
+`:262` re-sizing branch does **not** fire, batch 18 loses its measurement task, and the headline
+figure was wrong by 2.3× (`4,977/2,936`, not `~11.4k/~10.9k`). *(This is `PARITY-GAPS` §6 q7.)*
 
 **OQ-3 — Does cyrup build an alt-screen / fullscreen TUI mode at all? (`TUI-019`, L+.)**
 *Why:* TUI-019's `low` rested on ADR-0001, which is unreadable in this workspace; the severity was
@@ -1433,6 +1459,14 @@ permanent and TUI-019 is reclassified with its cost written down) · out of scop
 recorded in the flag's own error text.
 *Blocks:* batch 30's scope; `TUI-019`; the rendering half of `CFG-021`; tracker `DRIFT-022`. **Not
 blocked:** `SEAM-051` and `CFG-021`'s settings half ship under every answer.
+***Decided:*** [`adr/ADR-0005-alt-screen-tui-mode.md`](adr/ADR-0005-alt-screen-tui-mode.md) — **port
+it.** The mechanism-impossibility argument is refuted by cyrup's own code (crossterm's
+`EnterAlternateScreen` already executes at `startup_selector.rs:44`, `Viewport::Fullscreen` is
+ratatui's default, `ratatui::widgets::Scrollbar` exists), leaving an ordinary application layer, which
+under the parity rule is work. Batch 30 splits into **30a** (21 presentation items, L) and **30b**
+(`TUI-019`, now **unconditional**, L+, decomposed into fourteen named units B-1…B-14). Premise
+correction: `tui-alt-screen.ts` does not exist at v0.83.0, so this is `upstream-drift`, never a
+divergence. *(This is `PARITY-GAPS` §6 q8 and area 07's `OQ-07-1`.)*
 
 **OQ-4 — Do we chase the four moving upstreams before or after the port bugs?**
 *Why:* this plan freezes all four tags and absorbs drift batch-by-batch. That is a strategy call.
@@ -1442,6 +1476,16 @@ fifteen documents is re-baselined) · **partial concession** (take pi-intercom a
 early, hold only pi-subagents until batch 18).
 *Blocks:* whether a rebase batch exists at all; the ordering of batches 18 and 24-26; and the meaning
 of every `upstream-drift` classification made in the meantime.
+***Decided:*** [`adr/ADR-0006-upstream-chase-cadence.md`](adr/ADR-0006-upstream-chase-cadence.md) —
+**pin each upstream to its latest *tag*, re-baseline on the tag event, never on a commit**, splitting
+the single "baseline" field into three that move on three different triggers (ported baseline /
+comparison tag / upstream HEAD, the last cited for nothing). Re-baseline pi-permission-system to
+v0.8.0 and pi-intercom's comparison tag to v0.10.1 **today** — both have HEAD == latest tag. pi and
+pi-subagents stay pinned not because rebasing is expensive but because their HEADs are **untagged**,
+and the project's own evidence rule forbids classifying against an untagged commit. The question's
+premise was false: all four windows to the latest tag are already chased and filed. The post-batch-26
+rebase batch is **deleted** in favour of an event-triggered procedure, and the 74 `upstream-drift`
+rows are ordinary work at filed severity — never "deferred until the next bump".
 
 **OQ-5 — Is Windows in scope?**
 *Why:* 161 `cfg(unix)` sites against 6 `cfg(windows)`. `PB-19`, `DRIFT-046`, `TOOL-036`'s win32 leg
@@ -1449,6 +1493,15 @@ and `TOOL-038` are four items whose meaning depends on one answer.
 *Options:* in scope (the imbalance becomes a port-wide problem) · out of scope (record it and close the
 four) · tier-2 best-effort.
 *Blocks:* the value of four scheduled items, and how batch 9 writes `TOOL-036`.
+***Decided:*** [`adr/ADR-0007-windows-scope.md`](adr/ADR-0007-windows-scope.md) — **Windows is in
+scope.** pi gates its own releases on producing `pi-windows-x64.zip` and `pi-windows-arm64.zip`,
+ships `docs/windows.md`, a Windows-only regression test and hand-written win32 C, so under the parity
+rule cyrup ports the behaviour. The measurement in the *Why* above is wrong — it is **162 unix sites
+against 62 Windows-aware sites**, not 6, because cyrup branches predominantly through the runtime
+`cfg!(windows)` macro — and **17 of 18 crates already cross-compile**; the whole binary is blocked on
+one file (`PB-19`, re-rated `low` → `high`). The named prerequisite is verification, not scope: until
+a Windows runner exists the enforceable gate is `cargo check --target {x86_64,aarch64}-pc-windows-msvc
+--workspace` in xtask. Opens a new area file `13-windows-platform.md`. *(This is `PARITY-GAPS` §6 q3.)*
 
 **OQ-6 — Does `spec/` exist anywhere outside this workspace, and does it mandate `PERM-009`'s bash
 bypass?**
@@ -1464,6 +1517,20 @@ workspace, which batch 2 already schedules.
 `R-NN-NNN` and ADR citations in cyrup's source are decisions of record or decoration. **This question
 also carries the SDK-surface decision** (`SESS-038`, `SEAM-058`, `DRIFT-047`/VL-P5) — four area files
 asked it independently; answer it once.
+***Decided:***
+[`adr/ADR-0008-requirement-ids-and-sdk-surface.md`](adr/ADR-0008-requirement-ids-and-sdk-surface.md) —
+**`spec/` does not exist and is unrecoverable** (it lived in an untracked workspace root on a
+disposable VM; `.workflows/check-citations.py:24` and commit `a9000b1`'s own message are the receipt),
+so all ~2 195 in-source citations across **five** schemes are a **grep index carrying no authority**:
+keep them, never let one justify a divergence or hold a severity, close the `R-NN-NNN` namespace to
+new mints, and quarantine the ~45 normative ones behind `cargo xtask lint-citations`. `PERM-009`'s
+premise is false — the bash branch cites no id at all — so it **deletes cleanly** and the "produce the
+mandate" option is struck, not deferred. **SDK-surface parity is in scope, by capability rather than
+export list.** The TUI and extension halves are written out separately as
+[`adr/ADR-0001-tui-substrate.md`](adr/ADR-0001-tui-substrate.md) (the substrate carve-out covers
+**drawing only**) and
+[`adr/ADR-0002-extension-io-is-serde.md`](adr/ADR-0002-extension-io-is-serde.md) (extension I/O
+crosses as serialized data, on the native tier too). *(The SDK half is `PARITY-GAPS` §6 q4.)*
 
 **OQ-7 — Is `cyrup/TUI-FIDELITY.md` merged with real IDs, or formally retired?**
 *Why:* 464 lines, ~150 presentation findings, no IDs, no status rows — invisible to every count. It has
@@ -1473,6 +1540,17 @@ already cost behaviour once (the C14 footer deletion → TUI-016).
 one regression.
 *Blocks:* batch 30's scope; this plan's coverage claim, which explicitly excludes those ~150 findings;
 and the credibility of any future "the TUI is at parity" statement.
+***Decided:*** [`adr/ADR-0009-tui-fidelity-doc.md`](adr/ADR-0009-tui-fidelity-doc.md) — **it is not a
+backlog; it is a work order that was executed in full**, and none of the four documents asking this
+question checked. All ten of its §7 batches shipped (`0aaca00`…`922d90c`), and a 46-of-117 sample
+re-read at HEAD against pi v0.84.1 — one sample mechanical, one **adversarially** selected against the
+conclusion — found **46 landed, 0 open**. So: archive it to
+`docs/audits/2026-08-09-tui-presentation-fidelity.md` stamped EXECUTED AND CLOSED / non-normative,
+merge **none** of its 117 rows, and change no count — the premise that the medium/low counts would
+rise materially is the false one. It creates **zero** new ids. Two consequences survive: `TUI-016`'s
+fix shape is corrected to pi's real surface (`updatePendingMessagesDisplay`, not a footer segment
+pi does not have), and §8's 15 killed claims must migrate into the README traps list before the
+archive goes non-normative.
 
 **OQ-8 — Are the ~163 non-user-observable lows ordinary work items, or a mechanically-executed
 conformance suite? And does `CFG-005`'s deprioritisation still hold?**
@@ -1488,6 +1566,16 @@ batch 12) and hold cloudflare.
 *Blocks:* the size of batches 10, 20, 24-26, 27 and 30; interactive auth for two registered providers;
 and part of batch 12's end-to-end verification, which currently needs a manually-provisioned ADC
 credential.
+***Decided (the `CFG-005` half only):***
+[`adr/ADR-0010-oauth-acquisition.md`](adr/ADR-0010-oauth-acquisition.md) — **withdraw the
+deprioritisation and schedule all FOUR missing api-key login bodies** (cloudflare-workers-ai,
+cloudflare-ai-gateway, google-vertex, amazon-bedrock) into batch 11 in the same diff as `PROV-003`'s
+trait member, deleting the `api_key_strategy_supports_login` name sniffer. Three premises were false:
+none of this is OAuth (all four are `ApiKeyAuth.login`), there are four bodies not two, and the
+providers are not un-loginnable — `/login` offers them, **reports success, and silently stores an
+unusable partial credential**. `CFG-005` goes `medium`→`high`, `not-ported`→`parity-bug`, `L`→`M`.
+***Still open:*** the **`~163 non-user-observable lows`** half of this question is **not** decided by
+that ADR and has no owner. It is the one §7 question this batch leaves unanswered.
 
 **OQ-9 — The first-run wizard (`UW-2`): wire `startup.rs:256`, or delete the predicate and correct the
 trap list?**
@@ -1496,6 +1584,15 @@ first-run wizard"), and `PARITY-GAPS.md` now records that the trap is contested 
 that is wrong poisons every future pass.
 *Options:* wire it · delete the predicate and correct the trap list · leave it and document why.
 *Blocks:* `UW-2`'s implementation, which batch 14 owns.
+***Decided:*** [`adr/ADR-0011-first-run-wizard.md`](adr/ADR-0011-first-run-wizard.md) — **wire it,
+delete nothing.** pi ships and still invokes the wizard at v0.84.1; cyrup has a complete, unit-tested
+port of every piece and is missing only the call. The trap's premise is **inverted**:
+`is_official_distribution()` is a compile-time **`true`** for this build, and the repo's own test
+asserts it (`tests/first_time_setup.rs:124-134`) — nobody read the trap and the test together. The fix
+grows by two things a naive patch would miss: the missing `cli.list_models.is_none()` conjunct (or
+`--list-models` mounts a full-screen wizard) and the call-site position. The wizard entry is
+**removed** from the known-traps list; a wrong trap is not downgraded. *(This is `PARITY-GAPS` §6 q6;
+`PARITY-GAPS.md:508`'s bare "OQ-6" is ambiguous under both numbering schemes.)*
 
 ---
 
