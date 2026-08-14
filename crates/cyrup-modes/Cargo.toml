@@ -25,6 +25,13 @@ thiserror = { workspace = true }
 tokio.workspace = true
 tokio-stream.workspace = true
 
+# SEAM-017: `RpcClient::stop` sends Pi's graceful `SIGTERM` before escalating to `SIGKILL`
+# (rpc-client.ts:149-156). `tokio::process::Child::kill` is SIGKILL-only and `libc::kill` is
+# `unsafe`, which this crate forbids — so the signal goes through `nix`'s safe wrapper, the same
+# route `cyrup-ext-subagents` already uses (background/control.rs:433-434).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal", "process"] }
+
 [dev-dependencies]
 cyrup-provider = { workspace = true, features = ["faux"] }
 # SEAM-024: the RPC `abort` test drives a session into a long auto-retry backoff, which needs the

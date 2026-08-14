@@ -1225,10 +1225,18 @@ impl SessionBuilder {
         // Neither file was read at all before this: `.cyrup/SYSTEM.md` and `.cyrup/APPEND_SYSTEM.md`
         // were only TRUST-GATE MARKERS (`cyrup-config/src/trust.rs:208-209`), so cyrup asked the
         // user to trust a project because of a file it then never opened.
+        //
+        // The discoverer itself is `cyrup_resources`' — the SAME function whose result rides out on
+        // `DiscoveryReport::{system_prompt_file, append_system_prompt_file}`. A private second copy
+        // lived here until this pass; two copies of one upstream function is the `encode_cwd`
+        // duplication hazard (two drift-free copies that were both wrong), and here the dead copy
+        // was the one covered by tests while the live one was not.
         let discovered_system_prompt = cfg
             .system_prompt
             .is_none()
-            .then(|| discover_prompt_file(&cwd, &cfg.agent_dir, trusted, "SYSTEM.md"))
+            .then(|| {
+                cyrup_resources::discover_system_prompt_file(&cwd, &cfg.agent_dir, trusted)
+            })
             .flatten()
             .and_then(|p| read_discovered_prompt(&p, "system prompt"));
         // pi REPLACES rather than accumulates: `let appendSources = this.appendSystemPromptSource;
@@ -1237,7 +1245,9 @@ impl SessionBuilder {
         let discovered_append = cfg
             .append_system_prompt
             .is_none()
-            .then(|| discover_prompt_file(&cwd, &cfg.agent_dir, trusted, "APPEND_SYSTEM.md"))
+            .then(|| {
+                cyrup_resources::discover_append_system_prompt_file(&cwd, &cfg.agent_dir, trusted)
+            })
             .flatten()
             .and_then(|p| read_discovered_prompt(&p, "append system prompt"));
 
@@ -2159,41 +2169,8 @@ fn ext_mode(mode: AppMode) -> (ExtMode, bool) {
     }
 }
 
-/// Today's date (UTC) for the prompt footer; falls back to the epoch on a clock fault.
-/// pi `discoverSystemPromptFile` / `discoverAppendSystemPromptFile` (`resource-loader.ts:1022-1032`
-/// and `:1034-1044` @v0.83.0) — one function because the two bodies are identical apart from the
-/// file name:
-///
-/// ```ts
-/// const projectPath = join(this.cwd, CONFIG_DIR_NAME, "SYSTEM.md");
-/// if (this.settingsManager.isProjectTrusted() && existsSync(projectPath)) return projectPath;
-/// const globalPath = join(this.agentDir, "SYSTEM.md");
-/// if (existsSync(globalPath)) return globalPath;
-/// return undefined;
-/// ```
-///
-/// Three mechanisms are load-bearing and each was absent:
-/// - the PROJECT file is `<cwd>/.cyrup/<name>`, the GLOBAL one is `<agent_dir>/<name>` — different
-///   parents, not the same name in two roots;
-/// - the trust gate applies ONLY to the project rung, so an untrusted project silently falls
-///   through to the global file rather than yielding nothing;
-/// - the result is exactly ONE path. Upstream returns on the first hit, so a project file does not
-///   stack with the global one — which is the accumulation `cyrup-session/src/prompt/overrides.rs`
-///   documents and pi does not do.
-fn discover_prompt_file(cwd: &Path, agent_dir: &Path, trusted: bool, name: &str) -> Option<PathBuf> {
-    let project = cwd.join(".cyrup").join(name);
-    if trusted && project.exists() {
-        return Some(project);
-    }
-    let global = agent_dir.join(name);
-    if global.exists() {
-        return Some(global);
-    }
-    None
-}
-
 /// `resolvePromptInput(source, description)`'s read leg (`resource-loader.ts:53-68` @v0.83.0), for a
-/// source that [`discover_prompt_file`] already `exists()`-checked:
+/// source that `cyrup_resources::discover_system_prompt_file` already `exists()`-checked:
 ///
 /// ```ts
 /// if (existsSync(input)) {
@@ -2227,6 +2204,7 @@ fn read_discovered_prompt(path: &Path, description: &str) -> Option<String> {
     }
 }
 
+/// Today's date (UTC) for the prompt footer; falls back to the epoch on a clock fault.
 fn today() -> time::Date {
     time::OffsetDateTime::now_utc().date()
 }

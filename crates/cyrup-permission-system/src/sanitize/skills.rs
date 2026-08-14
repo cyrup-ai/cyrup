@@ -164,6 +164,14 @@ fn is_structured_skill_reference_line(line: &str) -> bool {
 
 /// pi `lineContainsBacktickedHiddenSkill` (`:181-194`): does the line backtick-quote any hidden skill
 /// name (`` `name` ``, XML-decoded)?
+///
+/// The scan emulates pi's `matchAll(/`([^`]+)`/g)` exactly, including its **backtracking on an empty
+/// span**: `[^`]+` requires at least one non-backtick character, so on `` ``x` `` the engine fails at
+/// offset 0, advances the start by ONE, and matches `x` from offset 1. The previous implementation
+/// consumed both backticks of the empty span and resumed AFTER them, which desynchronized the
+/// open/close pairing for the rest of the line — on `` See ``x` and `secret` here `` it extracted
+/// `"and"` and never saw `secret`, so a structured line referencing a hidden skill was left in the
+/// prompt where pi prunes it.
 fn line_contains_backticked_hidden_skill(line: &str, hidden: &[String]) -> bool {
     if hidden.is_empty() || !line.contains('`') {
         return false;
@@ -172,6 +180,12 @@ fn line_contains_backticked_hidden_skill(line: &str, hidden: &[String]) -> bool 
     while let Some(open) = rest.find('`') {
         let after_open = rest.get(open + 1..).unwrap_or("");
         let Some(close) = after_open.find('`') else { break };
+        if close == 0 {
+            // Empty span: `[^`]+` cannot match. pi's engine retries from the NEXT character, so the
+            // second backtick becomes a candidate OPEN delimiter rather than being consumed.
+            rest = after_open;
+            continue;
+        }
         let inner = after_open.get(..close).unwrap_or("");
         let name = decode_xml(inner.trim());
         if !name.is_empty() && hidden.iter().any(|h| h == &name) {
@@ -392,6 +406,38 @@ mod tests {
             "the structured list item referencing the hidden skill must be pruned:\n{}",
             out.prompt
         );
+    }
+
+    /// RED before the fix. pi's `matchAll(/`([^`]+)`/g)` retries after a failed EMPTY span, so on
+    /// `` See ``x` and `secret` here `` it yields `["x", "secret"]` (verified by running the regex
+    /// under node against `skill-prompt-sanitizer.ts:187`). The old scan consumed the empty span's
+    /// closing backtick as an opener, drifting one delimiter out of phase for the rest of the line
+    /// — it saw `["and"]` and left the hidden-skill row in the prompt.
+    #[test]
+    fn backtick_scan_recovers_from_an_empty_span_like_pis_regex() {
+        let hidden = vec!["secret".to_string()];
+        assert!(
+            line_contains_backticked_hidden_skill("- See ``x` and `secret` here", &hidden),
+            "an earlier doubled backtick must not hide the later `secret` span"
+        );
+        // The un-drifted cases still behave.
+        assert!(line_contains_backticked_hidden_skill("- `secret` leaks", &hidden));
+        assert!(!line_contains_backticked_hidden_skill("- `deploy` deploys", &hidden));
+        // An unterminated span matches nothing, as pi's regex does.
+        assert!(!line_contains_backticked_hidden_skill("- `secret leaks", &hidden));
+        // ...and the whole prune path sees it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_global(
+            dir.path(),
+            r#"{ "skills": { "deploy": "allow", "secret": "deny" } }"#,
+        );
+        let prompt = format!(
+            "<available_skills>\n{}\n{}\n</available_skills>\n\n- see ``x` and `secret` here\n",
+            skill_block("deploy", "/x/skills/deploy/SKILL.md"),
+            skill_block("secret", "/x/skills/secret/SKILL.md"),
+        );
+        let out = resolve_skill_prompt_entries(&prompt, &mut m, None, "/x");
+        assert!(!out.prompt.contains("`secret`"), "row must be pruned:\n{}", out.prompt);
     }
 
     #[test]

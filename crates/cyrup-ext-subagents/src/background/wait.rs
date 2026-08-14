@@ -243,15 +243,19 @@ async fn active_runs(id: Option<&str>, deps: &WaitDeps) -> Result<Vec<ActiveRun>
     })
 }
 
-/// Every run for this cwd in ANY state, for the closing summary (pi `allRunsForSession`). Built by
-/// re-reading each initially-tracked run's own reconciled status rather than re-listing, because
-/// [`list_active_runs`] deliberately surfaces only the active ones.
-async fn terminal_summary_for(initial_ids: &[String], deps: &WaitDeps) -> (usize, String) {
-    let mut complete = 0usize;
-    let mut failed = 0usize;
-    let mut paused = 0usize;
-    // G77: stopped runs are counted and reported in their own bucket, never folded into `failed`.
-    let mut stopped = 0usize;
+/// Every initially-tracked run that has reached a TERMINAL state, reconciled from disk — pi's
+/// `terminal` binding (`subagent-wait.ts:613`: `allRunsForSession(…).filter(run =>
+/// !ACTIVE_STATES.includes(run.state) && initialAsyncIds.has(run.id))`).
+///
+/// Built by re-reading each initially-tracked run's own reconciled status rather than re-listing,
+/// because [`list_active_runs`] deliberately surfaces only the active ones.
+///
+/// Returned as the statuses themselves rather than as a rendered summary because upstream derives
+/// TWO independent things from this one list — `summarizeTerminalRuns(terminal, …)` at `:616` and
+/// `formatResumeFirstFailedRunsNote(terminal)` at `:617` (SUBA-060) — and reading the run tree
+/// twice for them would be both slower and racy against a run that changes state in between.
+async fn terminal_runs_for(initial_ids: &[String], deps: &WaitDeps) -> Vec<super::RunStatus> {
+    let mut terminal = Vec::new();
     for id in initial_ids {
         let paths = super::RunPaths::for_run(
             &deps.async_root,
@@ -267,6 +271,19 @@ async fn terminal_summary_for(initial_ids: &[String], deps: &WaitDeps) -> (usize
         if is_active(status.state) {
             continue;
         }
+        terminal.push(status);
+    }
+    terminal
+}
+
+/// pi `summarizeTerminalRuns` (`subagent-wait.ts:616`) — the `Outcome: …` bucket counts.
+fn summarize_terminal_runs(terminal: &[super::RunStatus]) -> (usize, String) {
+    let mut complete = 0usize;
+    let mut failed = 0usize;
+    let mut paused = 0usize;
+    // G77: stopped runs are counted and reported in their own bucket, never folded into `failed`.
+    let mut stopped = 0usize;
+    for status in terminal {
         match status.state {
             RunState::Complete => complete += 1,
             RunState::Failed => failed += 1,
@@ -427,7 +444,13 @@ pub async fn wait_for_subagents(
             .collect();
     }
 
-    let (finished_count, terminal_summary) = terminal_summary_for(&initial_ids, deps).await;
+    let terminal_runs = terminal_runs_for(&initial_ids, deps).await;
+    let (finished_count, terminal_summary) = summarize_terminal_runs(&terminal_runs);
+    // SUBA-060 / pi `resumeGuidance = formatResumeFirstFailedRunsNote(terminal)`
+    // (`subagent-wait.ts:617`), interpolated at `:642`/`:660` immediately after the outcome clause
+    // and before the attention note. Empty unless a failed run actually has a revivable child
+    // session, so an ordinary wait is unchanged.
+    let resume_guidance = super::resume_guidance::format_resume_first_failed_runs_note(&terminal_runs);
     let attention_note = if attention.is_empty() {
         String::new()
     } else {
@@ -459,7 +482,8 @@ pub async fn wait_for_subagents(
              notification is not visible yet."
         };
         return Ok(format!(
-            "Waited {elapsed} for {scope}; {status}.{outcome}{attention_note} {notification}"
+            "Waited {elapsed} for {scope}; \
+             {status}.{outcome}{resume_guidance}{attention_note} {notification}"
         ));
     }
 
@@ -488,7 +512,8 @@ pub async fn wait_for_subagents(
          visible yet."
     };
     Ok(format!(
-        "Waited {elapsed}; {progress}.{outcome}{attention_note}{remainder}{notification}"
+        "Waited {elapsed}; \
+         {progress}.{outcome}{resume_guidance}{attention_note}{remainder}{notification}"
     ))
 }
 
@@ -680,6 +705,73 @@ mod tests {
             "the summary must report the finished run: {text}"
         );
         assert!(text.contains("Outcome: 1 complete."), "and how it came out: {text}");
+        assert!(
+            !text.contains("Resume-first"),
+            "SUBA-060 guidance is for FAILED runs only; a complete run must not carry it: {text}"
+        );
+    }
+
+    /// SUBA-060 — a run that FAILS while the wait is in flight, and whose child session was
+    /// persisted, must come back with pi's resume-first sentence naming the literal `resume` call
+    /// (`subagent-wait.ts:617`). Without it the orchestrator's default response to "1 failed" is to
+    /// spawn a replacement child and re-pay for every turn the failed one already took.
+    ///
+    /// The sibling assertion in
+    /// [`wait_blocks_until_the_background_run_actually_settles`](Self) is the vacuous-pass guard on
+    /// the other side: it pins that a COMPLETE run does not get the sentence, so this test cannot
+    /// pass merely because the note is emitted unconditionally.
+    #[tokio::test]
+    async fn a_failed_run_with_a_persisted_child_session_returns_resume_first_guidance() {
+        let fx = Fixture::new();
+        let run_id = RunId::new();
+        fx.write_status(&run_id, RunState::Running, false);
+
+        let transcript = fx._dir.path().join("child-session.jsonl");
+        std::fs::write(&transcript, b"{}").expect("write child transcript");
+
+        let settle = {
+            let run_id = run_id.clone();
+            let paths = fx.paths(&run_id);
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let mut status = RunStatus::queued(run_id, RunMode::Single, Some(1));
+                status.state = RunState::Failed;
+                status.ended_at = Some(crate::background::now_epoch_millis());
+                let mut step = crate::background::StepStatus::pending("worker");
+                step.status = crate::background::StepState::Failed;
+                step.session_file = Some(transcript);
+                status.steps = vec![step];
+                std::fs::write(
+                    &paths.status,
+                    serde_json::to_string(&status).expect("status serializes"),
+                )
+                .expect("write failed status");
+            })
+        };
+
+        let text = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &fx.deps(true)),
+        )
+        .await
+        .expect("wait must resolve once the run reaches a terminal state")
+        .expect("a failed run is reported, not errored");
+        settle.await.expect("settler task");
+
+        assert!(text.contains("Outcome: 1 failed."), "the run must be seen as failed: {text}");
+        assert!(
+            text.contains(&format!(
+                " Resume-first: failed run \"{}\" has a persisted child session. Revive the \
+                 original run with subagent({{ action: \"resume\", id: \"{}\", message: \
+                 \"Continue from the persisted child session and report the result.\" }}) before \
+                 reporting failure or launching a replacement. Launch a replacement only if revive \
+                 fails or the user explicitly asks for one.",
+                run_id.as_str(),
+                run_id.as_str()
+            )),
+            "pi's verbatim resume-first note must be present: {text}"
+        );
     }
 
     /// Escape hatch #1: a wedged run cannot hold the orchestrator past the caller's timeout, and

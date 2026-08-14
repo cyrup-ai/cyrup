@@ -62,11 +62,30 @@ pub const PERMISSION_FORWARDING_TIMEOUT: Duration = Duration::from_secs(10 * 60)
 /// 10-minute production default never has to elapse in a test.
 pub const CHILD_WAIT_TIMEOUT_ENV: &str = "CYRUP_PERMISSION_FORWARDING_TIMEOUT_MS";
 
-/// pi `PERMISSION_FORWARDING_AGENT_DIR_ENV_KEY` (`permission-forwarding.ts:10`) — the cyrup analog of
-/// the one non-subagent-scoped agent-dir override (the explicit, always-consulted level of pi's
-/// 5-level precedence). The 3 subagent-only middle levels (`PI_DELEGATED_AUTH_RUNTIME_DIR` etc.) are
-/// N/A on cyrup, whose subagents share the parent's agent dir (port doc §12 open-Q 5); the default
-/// (the passed `agent_dir`, pi `defaultAgentDir = PI_AGENT_DIR`) is the last level.
+/// pi `PERMISSION_FORWARDING_AGENT_DIR_ENV_KEY` (`permission-forwarding.ts:11` @v0.8.0) — the cyrup
+/// analog of the one non-subagent-scoped agent-dir override (the explicit, always-consulted level of
+/// pi's 5-level precedence, `permission-forwarding.ts:62-90`). The default (the passed `agent_dir`,
+/// pi `defaultAgentDir`) is the last level.
+///
+/// **PERM-017 — the three middle levels, restated after PERM-025 landed.** Upstream's chain is
+/// `PERMISSION_FORWARDING_AGENT_DIR` → `PI_DELEGATED_AUTH_RUNTIME_DIR` → `PI_MULTI_AUTH_RUNTIME_DIR`
+/// → `PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR` → default, with the three middle levels guarded by
+/// `options.isSubagent`. They exist for one reason pi states inline (`:83-85`): "Router-launched
+/// subagents run with an isolated `PI_CODING_AGENT_DIR`", so a child must be pointed BACK at a
+/// directory it shares with its parent or the two would spool into different trees.
+///
+/// Levels 2 and 3 still have no cyrup analog. **Level 4 now does** —
+/// [`crate::extension::POLICY_AGENT_DIR_ENV_KEY`] (`CYRUP_PERMISSION_SYSTEM_POLICY_AGENT_DIR`) landed
+/// with PERM-025 and relocates the POLICY root — and `forwarding_root_dir` deliberately does not
+/// consult it. That is safe **only because of a precondition that lives in another crate**: no cyrup
+/// subagent spawn site writes an isolated `CYRUP_AGENT_DIR` into the child's env overlay, so a child
+/// and its parent always compute the same `default_agent_dir` and therefore the same spool root, with
+/// or without the policy override. pi's level 4 is a *repair* for isolation cyrup does not have.
+///
+/// **If that ever changes** — if a subagent is launched with its own agent dir — this function must
+/// grow the subagent-guarded level 4 (and whatever cyrup's analog of levels 2/3 becomes) in upstream's
+/// order, or every forwarded child ask will be written where no parent watcher is looking and will
+/// fail closed at the child's own 10-minute bound with nothing on either side saying why.
 pub const FORWARDING_AGENT_DIR_ENV: &str = "CYRUP_PERMISSION_SYSTEM_FORWARDING_AGENT_DIR";
 
 const PERMISSION_FORWARDING_DIRECTORY_NAME: &str = "permission-forwarding";

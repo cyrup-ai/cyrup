@@ -14,6 +14,7 @@
 
 mod aggregation;
 mod capability_handle_ownership;
+mod command_dispatch;
 mod entry_renderer;
 mod ext_fail_closed;
 mod extension_flag_diagnostics;

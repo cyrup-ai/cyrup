@@ -1154,9 +1154,38 @@ pub async fn run_verify_commands_memoized(
     default_cwd: &Path,
     memo: Option<model::VerifyMemoContext<'_>>,
 ) -> Vec<model::AcceptanceVerifyResult> {
+    run_verify_commands_memoized_with_cancel(
+        commands,
+        default_cwd,
+        memo,
+        &cyrup_core::CancelToken::new(),
+    )
+    .await
+}
+
+/// SUBA-028 — [`run_verify_commands_memoized`] with the caller's cancellation token, pi's
+/// `input.signal` (`acceptance.ts:1290`).
+///
+/// The break is placed exactly where upstream puts it (`:1295`): AFTER the command's own result is
+/// pushed, not before the command runs. That ordering is not cosmetic — the running command's own
+/// abort (below) produces a `timed-out` result that upstream records, so checking first would
+/// silently drop the evidence of what was interrupted.
+pub async fn run_verify_commands_memoized_with_cancel(
+    commands: &[VerifyCommand],
+    default_cwd: &Path,
+    memo: Option<model::VerifyMemoContext<'_>>,
+    cancel: &cyrup_core::CancelToken,
+) -> Vec<model::AcceptanceVerifyResult> {
     let mut results = Vec::with_capacity(commands.len());
     for command in commands {
-        results.push(model::run_memoized_verify_command(command, default_cwd, memo).await);
+        results.push(
+            model::run_memoized_verify_command_with_cancel(command, default_cwd, memo, cancel)
+                .await,
+        );
+        // pi `if (input.signal?.aborted) break;` (`acceptance.ts:1295`).
+        if cancel.is_cancelled() {
+            break;
+        }
     }
     results
 }
@@ -1350,6 +1379,50 @@ pub async fn evaluate_acceptance(
     // run with no configured output path, or one whose child never successfully wrote it.
     file_output: Option<AcceptanceFileOutput<'_>>,
 ) -> AcceptanceLedger {
+    // pi's `signal` is OPTIONAL (`acceptance.ts:1073`), and this entry is its `signal: undefined`
+    // form — the shape every caller that has no cancellation to offer (the whole test surface, and
+    // the group gate, which upstream likewise calls without a signal) uses. Production runs go
+    // through [`evaluate_acceptance_with_cancel`].
+    evaluate_acceptance_with_cancel(
+        contract,
+        gate,
+        final_output,
+        completion_guard,
+        verify_cwd,
+        memo,
+        file_output,
+        &cyrup_core::CancelToken::new(),
+    )
+    .await
+}
+
+/// SUBA-028 — [`evaluate_acceptance`] with the run's cancellation token (pi's `signal?:
+/// AbortSignal`, `acceptance.ts:1073`, threaded to `runMemoizedVerifyCommand` at `:1290` and
+/// checked between commands at `:1295`).
+///
+/// # The gap this closes
+///
+/// Cancelling a subagent run — Ctrl-C, an orchestrator cancel, a parent timeout — did not reach
+/// acceptance verification at all: the caller could be made to wait a full per-command
+/// `timeoutMs` (default minutes) after asking to stop, once per remaining command. SUBA-027's fix
+/// means the timed-out CHILD is killed, so nothing leaks; the LATENCY was what remained.
+///
+/// The token races the verify child's own `wait()` inside
+/// [`model::run_verify_command_with_cancel`], so a cancellation lands mid-command rather than only
+/// between commands, and the abort path is upstream's `abortVerification` — SIGTERM, hard SIGKILL
+/// a second later, targeting the command's process GROUP.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub async fn evaluate_acceptance_with_cancel(
+    contract: &AcceptanceContract,
+    gate: CleanCompletionGate,
+    final_output: Option<&str>,
+    completion_guard: CompletionMutationGuardResult,
+    verify_cwd: &Path,
+    memo: Option<model::VerifyMemoContext<'_>>,
+    file_output: Option<AcceptanceFileOutput<'_>>,
+    cancel: &cyrup_core::CancelToken,
+) -> AcceptanceLedger {
     if !gate.is_clean() {
         return AcceptanceLedger::not_required();
     }
@@ -1400,8 +1473,13 @@ pub async fn evaluate_acceptance(
         if contract.verify.is_empty() {
             detail.push("verified: no verify[] commands were declared".to_string());
         } else {
-            verify_results =
-                run_verify_commands_memoized(&contract.verify, verify_cwd, memo).await;
+            verify_results = run_verify_commands_memoized_with_cancel(
+                &contract.verify,
+                verify_cwd,
+                memo,
+                cancel,
+            )
+            .await;
             // `verifyRuns.some((run) => run.status === "failed" || run.status === "timed-out")`
             // (`acceptance.ts:1297` @v0.43.0) — NOT `!every(passed)`, which would also reject a
             // command the author explicitly marked `allowFailure: true`.
@@ -2360,6 +2438,88 @@ mod tests {
             wait_for_pid_gone(pid, Duration::from_secs(5)).await,
             "verify command pid {pid} must be gone once run_one_verify_command returns — a \
              timed-out command has to be killed, not abandoned"
+        );
+    }
+
+    /// SUBA-028 — a CANCELLED run's acceptance verification stops now, not after a full
+    /// per-command `timeoutMs` (pi's `options.signal` → `abortVerification`,
+    /// `acceptance.ts:1180-1181`).
+    ///
+    /// THE USER ACTION: the user hits Ctrl-C (or a parent timeout fires) while the acceptance gate
+    /// is running `cargo test`. Before this the token reached the CHILD and stopped there — the
+    /// verify command kept running to its own deadline, once per remaining command, so "stop"
+    /// could take minutes. The assertion is the elapsed wall clock against a 30-SECOND command
+    /// budget: a two-order-of-magnitude gap that no amount of scheduling jitter can close, so this
+    /// is not a marginal timing test.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_run_aborts_its_verify_command_instead_of_waiting_out_the_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let cancel = cyrup_core::CancelToken::new();
+        // 30s budget, cancelled ~150ms in: the command cannot end on its own timeout in the window
+        // this test allows, so a `timed-out` verdict here can only have come from the cancel arm.
+        let command = vc_timeout("echo $$ > pid; exec sleep 300", Duration::from_secs(30));
+
+        let canceller = {
+            let cancel = cancel.clone();
+            let pid_file = pid_file.clone();
+            tokio::spawn(async move {
+                // Cancel only once the command is genuinely running — otherwise this would be the
+                // already-aborted branch and would prove nothing about a MID-command abort.
+                let pid = wait_for_published_pid(&pid_file, Duration::from_secs(10)).await;
+                cancel.cancel();
+                pid
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let result =
+            model::run_verify_command_with_cancel(&command, dir.path(), &cancel).await;
+        let elapsed = started.elapsed();
+        let pid = canceller.await.expect("canceller task");
+
+        assert!(!passed(&result), "an aborted command never passes: {result:?}");
+        assert_eq!(result.status, model::VerifyRunStatus::TimedOut, "{result:?}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the cancel must end the command promptly, not at its own 30s deadline: {elapsed:?}"
+        );
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(5)).await,
+            "the aborted command's pid {pid} must be killed, not abandoned — pi's abort path IS \
+             its timeout path"
+        );
+    }
+
+    /// SUBA-028 — the loop-level half (pi `if (input.signal?.aborted) break;`,
+    /// `acceptance.ts:1295`): once cancelled, the REMAINING verify commands do not run at all.
+    ///
+    /// The break is post-push, so the interrupted command's own result survives — asserted here,
+    /// because dropping it would hide what was interrupted.
+    #[tokio::test]
+    async fn a_cancelled_verify_sequence_records_the_aborted_command_and_skips_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("second-ran");
+        let cancel = cyrup_core::CancelToken::new();
+        cancel.cancel();
+
+        let results = run_verify_commands_memoized_with_cancel(
+            &[
+                vc_timeout("sleep 300", Duration::from_secs(30)),
+                VerifyCommand::shell(&format!("touch {}", marker.display())),
+            ],
+            dir.path(),
+            None,
+            &cancel,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1, "only the interrupted command is recorded: {results:?}");
+        assert_eq!(results[0].status, model::VerifyRunStatus::TimedOut, "{results:?}");
+        assert!(
+            !marker.exists(),
+            "the second command must never have run after the abort"
         );
     }
 
@@ -6621,14 +6781,34 @@ pub mod model {
         default_cwd: &Path,
         memo: Option<VerifyMemoContext<'_>>,
     ) -> AcceptanceVerifyResult {
+        run_memoized_verify_command_with_cancel(
+            command,
+            default_cwd,
+            memo,
+            &cyrup_core::CancelToken::new(),
+        )
+        .await
+    }
+
+    /// SUBA-028 — [`run_memoized_verify_command`] with the caller's cancellation token (pi's
+    /// `options.signal`, forwarded to `runVerifyCommand` at `acceptance.ts:1130`).
+    ///
+    /// A memo HIT is unaffected by cancellation and deliberately so: it spawns nothing, so there is
+    /// nothing to abort and returning the recorded result is strictly faster than checking.
+    pub async fn run_memoized_verify_command_with_cancel(
+        command: &AcceptanceVerifyCommand,
+        default_cwd: &Path,
+        memo: Option<VerifyMemoContext<'_>>,
+        cancel: &cyrup_core::CancelToken,
+    ) -> AcceptanceVerifyResult {
         let cwd = resolve_verify_cwd(command, default_cwd);
         let Some(memo) = memo else {
-            return run_verify_command(command, default_cwd).await;
+            return run_verify_command_with_cancel(command, default_cwd, cancel).await;
         };
         // `try { workspaceState = readVerifyWorkspaceState(cwd) } catch { undefined }`
         // (`acceptance.ts:1079-1084`).
         let Some(workspace_state) = read_verify_workspace_state(&cwd).await else {
-            return run_verify_command(command, default_cwd).await;
+            return run_verify_command_with_cancel(command, default_cwd, cancel).await;
         };
         let identity = MemoIdentity::derive(
             command,
@@ -6660,7 +6840,7 @@ pub mod model {
             };
         }
 
-        let result = run_verify_command(command, default_cwd).await;
+        let result = run_verify_command_with_cancel(command, default_cwd, cancel).await;
         let mut evidenced = AcceptanceVerifyResult {
             artifact_path: Some(identity.artifact_path.display().to_string()),
             cache_key: Some(identity.cache_key.clone()),
@@ -6788,6 +6968,24 @@ pub mod model {
         command: &AcceptanceVerifyCommand,
         default_cwd: &Path,
     ) -> AcceptanceVerifyResult {
+        run_verify_command_with_cancel(command, default_cwd, &cyrup_core::CancelToken::new()).await
+    }
+
+    /// SUBA-028 — [`run_verify_command`] with the caller's cancellation token: pi's
+    /// `options.signal` (`acceptance.ts:1134`), whose listener is the SAME `abortVerification`
+    /// the per-command timeout fires (`:1180-1181`: `if (options.signal?.aborted)
+    /// abortVerification(); else addEventListener("abort", abortVerification, { once: true })`).
+    ///
+    /// Reproducing that identity is the whole design here: the cancellation arm below is the
+    /// timeout arm — same group SIGTERM→SIGKILL escalation, same bounded output drain, same
+    /// `timed-out` result — because upstream has literally one abort function. An
+    /// ALREADY-cancelled token therefore aborts the command immediately after spawn, which is
+    /// upstream's `signal.aborted` branch, not a separate early return.
+    pub async fn run_verify_command_with_cancel(
+        command: &AcceptanceVerifyCommand,
+        default_cwd: &Path,
+        cancel: &cyrup_core::CancelToken,
+    ) -> AcceptanceVerifyResult {
         let started = Instant::now();
         let cwd: PathBuf = resolve_verify_cwd(command, default_cwd);
         let mut cmd = super::shell_command(&command.command);
@@ -6841,10 +7039,19 @@ pub mod model {
         // the post-`wait()` drain must be inside it (upstream `acceptance.ts:742-759`).
         let deadline = tokio::time::Instant::now() + timeout;
 
+        // `biased;` is load-bearing (and is why the JS→Rust shapes differ): an unbiased `select!`
+        // whose exit arm and cancel arm are BOTH ready picks at random, so a command that had
+        // already finished when the token was cancelled would report `timed-out` about half the
+        // time. Upstream cannot express that race at all — `finish` sets `settled` and
+        // `abortVerification` returns early on it, so a completed command is never re-reported as
+        // aborted. Polling the exit first reproduces that ordering.
         let waited = tokio::select! {
             biased;
             result = child.wait() => Some(result),
             () = tokio::time::sleep_until(deadline) => None,
+            // SUBA-028 / pi's `options.signal` listener (`acceptance.ts:1180-1181`) — the same
+            // `abortVerification` the timeout arm above fires, hence the same `None`.
+            () = cancel.cancelled() => None,
         };
 
         let Some(waited) = waited else {
@@ -7126,6 +7333,16 @@ pub mod model {
                 // `runMemoizedVerifyCommand(command, input.cwd, { …, artifactsDir, runId })`
                 // (`acceptance.ts:1289-1293`) — memoized when the caller supplied both, a plain
                 // execution otherwise.
+                //
+                // SUBA-028: no `signal`/`abortMessage` is threaded here, and that is upstream's
+                // own shape for THIS entry's only production caller — `spawn::chain_graph`'s
+                // completed-GROUP gate, whose two upstream counterparts
+                // (`chain-execution.ts:1037-1046,1233-1242` @v0.43.0) pass neither. The per-RUN
+                // gate, which upstream does give a signal, is the sibling
+                // [`super::evaluate_acceptance_with_cancel`]. If a caller with a live token ever
+                // reaches this entry, thread it through `run_memoized_verify_command_with_cancel`
+                // and add the `if aborted break` after the push (`acceptance.ts:1295`) rather than
+                // leaving the token unread here.
                 runs.push(run_memoized_verify_command(command, input.cwd, input.memo).await);
             }
             ledger.verify_runs = runs;

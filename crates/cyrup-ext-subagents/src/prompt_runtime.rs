@@ -9,12 +9,13 @@
 //! them had ZERO callers outside their own file. The mechanism was ported faithfully and wired to
 //! nothing.
 //!
-//! What ran instead was [`crate::exec::structured::extract_structured_output_value`], a heuristic
-//! that scans the child's assistant messages for the newest fenced ```json block. That has no pi
-//! counterpart, and it quietly contradicts the very rule `structured.rs` documents: pi's defining
+//! What ran instead was `exec::structured::extract_structured_output_value`, a heuristic that
+//! scanned the child's assistant messages for the newest fenced ```json block. That had no pi
+//! counterpart, and it quietly contradicted the very rule `structured.rs` documents: pi's defining
 //! property (`structured-output.ts:157-159`) is that a missing capture file is a HARD failure "EVEN
 //! WHEN prose was produced". A fenced block IS prose, so cyrup was accepting exactly what pi
-//! rejects — while its own doc comment claimed otherwise.
+//! rejects — while its own doc comment claimed otherwise. That heuristic is now DELETED (SUBA-S01's
+//! residual pass); the capture file this module writes is the only channel there is.
 //!
 //! # The mechanism (pi `subagent-prompt-runtime.ts:279-313`)
 //!

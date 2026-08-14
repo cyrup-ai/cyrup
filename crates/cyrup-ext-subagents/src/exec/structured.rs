@@ -1,122 +1,46 @@
-//! Parent-side structured-output extraction and JSON-Schema re-validation (func-SA §5.2 R-SA-030;
+//! Parent-side structured-output capture and JSON-Schema re-validation (func-SA §5.2 R-SA-030;
 //! arch-SA §6.3.3/§12 item 13).
 //!
 //! # Scope
 //!
-//! This module owns exactly two algorithms, both operating strictly on already-parsed/already-
-//! collected data — it spawns nothing itself and owns no subprocess lifecycle, mirroring
-//! `exec/output.rs`'s own scope discipline:
+//! This module owns the PARENT half of pi's file-based structured-output contract
+//! (`runs/shared/structured-output.ts` @`pi-subagents` v0.43.0) — runtime creation, the injected
+//! instruction wording, the env-var contract, the read-back, and the temp-dir cleanup — plus the
+//! JSON-Schema validator both the parent read-back and the child-side `structured_output` tool
+//! ([`crate::prompt_runtime`]) share. It spawns nothing itself and owns no subprocess lifecycle,
+//! mirroring `exec/output.rs`'s own scope discipline:
 //!
-//! 1. [`extract_structured_output_value`] — recover the child's structured-output JSON value from
-//!    its NDJSON event stream. As of this crate's build-out, there is no dedicated wire event or
-//!    env-var/file-handoff channel a child uses to emit a structured-output value (arch-SA §12
-//!    open question 6: "Structured-output capture mechanism ... is unspecified at the
-//!    CLI-flag/env-var level"); the only channel this crate can observe today is the same
-//!    `MessageEnd` text-content stream [`crate::exec::output::extract_final_output`] (R-SA-029)
-//!    already folds. This function therefore reuses the exact same reverse-chronological,
-//!    most-recent-message-first scan (and [`crate::exec::output::fenced_blocks`]'s shared fence
-//!    scanner) to recover a fenced ` ```json `/`jsonc`/`json5` block from the winning message and
-//!    parse ITS body as one JSON value — the structured-output analogue of R-SA-029's own
-//!    acceptance-report-shaped-block detection, over the identical wire bytes.
+//! 1. [`create_structured_output_runtime`] / [`read_structured_output`] /
+//!    [`cleanup_structured_output_runtime`] — pi's `createStructuredOutputRuntime` (`:127-136`),
+//!    `readStructuredOutput` (`:156-173`) and `cleanupStructuredOutputRuntime` (`:175-182`). The
+//!    child's value arrives through a private CAPTURE FILE, never through the transcript.
 //! 2. [`validate_structured_output`] — compile the task's declared JSON Schema and check the
-//!    extracted value against it via the `jsonschema` crate (arch-SA §12 item 13's resolved crate
+//!    captured value against it via the `jsonschema` crate (arch-SA §12 item 13's resolved crate
 //!    choice — see the workspace `Cargo.toml`'s own comment for why `jsonschema`, not `schemars`,
 //!    is correct here), returning a human-readable validation-error message on failure rather than
 //!    a boolean, so [`crate::exec::run_sync`]'s caller sees exactly why the run was rejected.
 //!
-//! [`resolve_structured_output`] composes both steps into the single entry point `run_sync` calls,
-//! implementing R-SA-030's full contract: absence when a schema is declared is a hard failure
-//! (unless plain text was also produced as a fallback — the fallback exemption is `run_sync`'s own
-//! concern via its already-separate "produced no output at all" check, not this module's); a
-//! present-but-invalid value is also a hard failure; a present-and-valid value populates
-//! `SingleResult::structured_output`. When no schema was declared at all, this module is a pure
-//! no-op — `run_sync` never even calls into it in that case (mirrored by
-//! [`resolve_structured_output`] returning [`StructuredOutcome::NotRequested`] defensively even if
-//! it is called anyway, so a caller cannot mis-order this check ahead of the "was a schema even
-//! declared" gate without still getting the correct, harmless outcome).
+//! [`StructuredOutcome`] is the three-way branch `run_sync` needs on top of that: R-SA-030's
+//! contract is conditioned on "if the task declares a structured-output schema", so "no schema was
+//! declared at all" is a distinct, non-error case from both success and failure.
+//!
+//! # SUBA-S01 — what this module deliberately no longer has
+//!
+//! Until SUBA-S01's residual pass, this module also exported `extract_structured_output_value` /
+//! `resolve_structured_output`: a reverse-chronological scan of the child's assistant messages that
+//! returned the first parseable fenced ` ```json ` block as "the structured output". That heuristic
+//! has NO pi counterpart at any tag — upstream's defining property (`structured-output.ts:157-159`)
+//! is that a missing capture file is a HARD failure "EVEN WHEN prose was produced", and a fenced
+//! block IS prose. It was worse than merely lenient: a coincidental fence in the child's prose
+//! could validate against the caller's schema and become the run's structured result, silently
+//! feeding a wrong answer into a chain's output bindings. Both functions and their tests are gone;
+//! the capture file is now the ONLY channel, and a declared schema whose runtime could not even be
+//! created is [`STRUCTURED_OUTPUT_MISSING_ERROR`], not a transcript scan.
 //!
 //! This module has ZERO dependency on `cyrup-agent` — every message/content shape it inspects is
 //! the same opaque `serde_json::Value` [`crate::exec::ndjson::SubagentEvent`] already exposes,
 //! never a typed `AgentMessage`/`Content` re-import (arch-SA §2.1/§1.1, restated at every module
 //! boundary in this crate, identical to `exec/output.rs`'s own module doc).
-
-use crate::exec::ndjson::SubagentEvent;
-use crate::exec::output::fenced_blocks;
-
-/// The three fenced-code-block language tags this module (and R-SA-029's acceptance-report
-/// detection) both treat as "this fenced body is meant to be parsed as JSON" — mirrors
-/// `output::looks_like_acceptance_report`'s own `"json" | "jsonc" | "json5"` set exactly, so a
-/// child that fences its structured-output value under any of these three conventional tags is
-/// recognized identically by both R-SA-029 and R-SA-030's extraction paths.
-const JSON_FENCE_LANGS: &[&str] = &["json", "jsonc", "json5"];
-
-/// R-SA-030 (extraction half): recover the child's structured-output JSON value from `events` (the
-/// same chronologically ordered [`SubagentEvent::MessageEnd`] slice
-/// [`crate::exec::output::extract_final_output`] scans), or `None` if no non-error assistant
-/// message contains a parseable fenced JSON block.
-///
-/// Mirrors [`crate::exec::output::extract_final_output`]'s reverse-scan priority exactly: the most
-/// recent non-error-flagged assistant `MessageEnd` wins; within that message's content parts (in
-/// original order), the FIRST fenced `json`/`jsonc`/`json5` block whose body parses as valid JSON
-/// is the returned value. A message containing no parseable fenced JSON block does NOT fall
-/// through to an OLDER message — exactly like R-SA-029's own "message recency is the outer
-/// priority level" rule, restated here: an older message's structured-output block must never be
-/// preferred over a newer message that simply chose not to emit one at all (that newer message's
-/// absence is what R-SA-030 classifies as "structured output absent", not a reason to keep
-/// searching backward past it).
-#[must_use]
-pub fn extract_structured_output_value(events: &[SubagentEvent]) -> Option<serde_json::Value> {
-    for event in events.iter().rev() {
-        let SubagentEvent::MessageEnd { message } = event else {
-            continue;
-        };
-        if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if event.is_error_or_aborted_message() {
-            continue;
-        }
-
-        let Some(content) = message.get("content").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-
-        for part in content {
-            let is_text = part.get("type").and_then(serde_json::Value::as_str) == Some("text");
-            if !is_text {
-                continue;
-            }
-            let Some(text) = part.get("text").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            if let Some(value) = first_parseable_json_fence(text) {
-                return Some(value);
-            }
-        }
-
-        // This (most recent, non-error) message had text content but no parseable fenced JSON
-        // block — per this function's own doc comment, this is "absent", not a cue to keep
-        // scanning further back for an older message's block.
-        return None;
-    }
-    None
-}
-
-/// Scan `text`'s fenced blocks (via [`fenced_blocks`]) in original order and return the first one
-/// tagged `json`/`jsonc`/`json5` whose body parses as valid JSON. A fenced block with a matching
-/// language tag but an unparseable body is skipped (not an error) — this function's contract is
-/// "find A block that actually is JSON", matching pi-subagents' own tolerant read-back (a malformed
-/// body degrades to "missing", never a panic/hard-error at the extraction step; validation-shaped
-/// errors are [`validate_structured_output`]'s job, not this scan's).
-fn first_parseable_json_fence(text: &str) -> Option<serde_json::Value> {
-    fenced_blocks(text).into_iter().find_map(|block| {
-        let lang = block.lang.to_ascii_lowercase();
-        if !JSON_FENCE_LANGS.contains(&lang.as_str()) {
-            return None;
-        }
-        serde_json::from_str::<serde_json::Value>(block.body).ok()
-    })
-}
 
 // ============================================================================================
 // R-SA-030 (validation half): compiled JSON-Schema check via the `jsonschema` crate
@@ -177,60 +101,32 @@ pub fn validate_structured_output(
 }
 
 // ============================================================================================
-// resolve_structured_output: the single R-SA-030 entry point run_sync calls
+// StructuredOutcome: the three-way branch `run_sync` takes on the read-back
 // ============================================================================================
 
-/// The outcome of [`resolve_structured_output`] — deliberately not a bare `Result` since "no
-/// schema was declared at all" is a distinct, non-error case from both success and failure, and
-/// `run_sync` needs to branch on all three (R-SA-030's own text: absence is a hard failure ONLY
-/// "if the task declares a structured-output schema").
+/// The outcome `run_sync` branches on after [`read_structured_output`] — deliberately not a bare
+/// `Result` since "no schema was declared at all" is a distinct, non-error case from both success
+/// and failure, and `run_sync` needs to branch on all three (R-SA-030's own text: absence is a hard
+/// failure ONLY "if the task declares a structured-output schema").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructuredOutcome {
     /// No `structured_output_schema` was declared for this run — R-SA-030 does not apply at all;
     /// `run_sync` must leave `SingleResult::structured_output` as `None` without treating that as
     /// any kind of failure.
     NotRequested,
-    /// A schema was declared, a value was extracted, and it validated successfully — carries the
-    /// validated value verbatim (never a re-serialized/normalized copy), for direct assignment to
-    /// `SingleResult::structured_output`.
+    /// A schema was declared, the capture file was read back, and it validated successfully —
+    /// carries the validated value verbatim (never a re-serialized/normalized copy), for direct
+    /// assignment to `SingleResult::structured_output`.
     Valid(serde_json::Value),
-    /// A schema was declared but no structured-output value could be extracted from the child's
-    /// event stream at all (R-SA-030: "MUST treat its absence as a hard run failure unless plain
-    /// text was also produced as a fallback" — the plain-text-fallback exemption is `run_sync`'s
-    /// own separate concern, since it depends on `extract_final_output`'s result, which this
-    /// module does not have visibility into; this variant always signals "no structured value was
-    /// present", leaving the fallback decision to the caller).
+    /// A schema was declared but the child never wrote a captured value —
+    /// [`STRUCTURED_OUTPUT_MISSING_ERROR`]. pi's rule (`structured-output.ts:157-159`) is that this
+    /// is a hard failure EVEN WHEN prose was produced, so prose is never an exemption here. This
+    /// variant is also what a declared schema whose capture runtime could not be created at all
+    /// resolves to: there is no file, therefore there is no value — never a transcript scan.
     Missing,
-    /// A schema was declared, a value was extracted, but it failed schema validation — carries the
+    /// A schema was declared, a value was captured, but it failed schema validation — carries the
     /// human-readable validation-error message R-SA-030 requires the run to fail with.
     Invalid(String),
-}
-
-/// R-SA-030's single composed entry point: given the task's declared `schema` (if any) and the
-/// winning attempt's chronologically ordered `MessageEnd` events, extract and validate the child's
-/// structured-output value.
-///
-/// `schema.is_none()` short-circuits to [`StructuredOutcome::NotRequested`] before touching
-/// `events` at all — R-SA-030's whole contract is conditioned on "if the task declares a
-/// structured-output schema"; a task with no such declaration has nothing for this function to
-/// enforce, regardless of what the child's transcript happens to contain.
-#[must_use]
-pub fn resolve_structured_output(
-    schema: Option<&serde_json::Value>,
-    events: &[SubagentEvent],
-) -> StructuredOutcome {
-    let Some(schema) = schema else {
-        return StructuredOutcome::NotRequested;
-    };
-
-    let Some(value) = extract_structured_output_value(events) else {
-        return StructuredOutcome::Missing;
-    };
-
-    match validate_structured_output(schema, &value) {
-        Ok(()) => StructuredOutcome::Valid(value),
-        Err(message) => StructuredOutcome::Invalid(message),
-    }
 }
 
 // ============================================================================================
@@ -361,124 +257,78 @@ pub fn cleanup_structured_output_runtime(runtime: &StructuredOutputRuntime) {
     }
 }
 
+/// SUBA-S01 residual — the RAII port of pi's `finally { if (!r?.detached)
+/// cleanupStructuredOutputRuntime(structuredRuntime); }`
+/// (`runs/foreground/subagent-executor.ts:3780-3787` @`pi-subagents` v0.43.0).
+///
+/// Two things about that `finally` do not survive a naive statement-at-the-end translation, and
+/// both were wrong before this guard existed:
+///
+/// 1. **`finally` always runs; a Rust statement does not.** A JS `async function` ALWAYS settles,
+///    so upstream's `finally` fires on the throw path too. A Rust future can be dropped at ANY
+///    `.await` — and `run_sync` awaits the entire fallback ladder between creating the runtime and
+///    cleaning it up. A host that cancels the `subagent` tool call by dropping its future therefore
+///    left the private directory — containing a 0600 `schema.json` that carries whatever the
+///    caller's schema describes — behind PERMANENTLY, one per cancelled run. `Drop` is the only
+///    construct with `finally`'s guarantee, so the cleanup lives here.
+/// 2. **The `!r?.detached` half is not an optimization, it is correctness.** A detached run's child
+///    is STILL ALIVE (R-SA-037) and its `structured_output` tool has not written yet; the capture
+///    file lives IN this directory. Deleting it on the detach receipt destroys the directory the
+///    live child must still write into. Upstream says so in its own words at `:3782-3784` — "A
+///    successful detached receipt transfers both to onDetachedExit while the authoritative
+///    completion remains live" — and hands the same cleanup to `onDetachedExit`'s inner `finally`
+///    (`:3757-3761`) instead. [`Self::disarm`] is that transfer.
+#[derive(Debug)]
+pub struct StructuredOutputCleanupGuard {
+    runtime: StructuredOutputRuntime,
+    armed: bool,
+}
+
+impl StructuredOutputCleanupGuard {
+    /// Take ownership of `runtime`'s private directory. Armed: dropping this value removes the
+    /// directory unless [`disarm`](Self::disarm) was called first.
+    #[must_use]
+    pub fn new(runtime: StructuredOutputRuntime) -> Self {
+        Self {
+            runtime,
+            armed: true,
+        }
+    }
+
+    /// The paths/schema to hand to the child and to read back — borrowing, never transferring
+    /// ownership of the directory's lifetime.
+    #[must_use]
+    pub fn runtime(&self) -> &StructuredOutputRuntime {
+        &self.runtime
+    }
+
+    /// pi's `if (!r?.detached)`: give up ownership of the directory because the still-live detached
+    /// child now owns it. Idempotent.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Whether dropping this guard would still remove the directory. Test-facing; the production
+    /// path only ever arms (at construction) or disarms (on a detach receipt).
+    #[must_use]
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+}
+
+impl Drop for StructuredOutputCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            cleanup_structured_output_runtime(&self.runtime);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
-
-    fn message_end(role: &str, texts: &[&str]) -> SubagentEvent {
-        let content: Vec<serde_json::Value> = texts
-            .iter()
-            .map(|t| serde_json::json!({"type": "text", "text": t}))
-            .collect();
-        SubagentEvent::MessageEnd {
-            message: serde_json::json!({"role": role, "content": content}),
-        }
-    }
-
-    fn message_end_error(texts: &[&str]) -> SubagentEvent {
-        let content: Vec<serde_json::Value> = texts
-            .iter()
-            .map(|t| serde_json::json!({"type": "text", "text": t}))
-            .collect();
-        SubagentEvent::MessageEnd {
-            message: serde_json::json!({
-                "role": "assistant",
-                "content": content,
-                "stopReason": "error",
-                "errorMessage": "boom",
-            }),
-        }
-    }
-
-    // ---- extract_structured_output_value ----
-
-    #[test]
-    fn extracts_a_fenced_json_block_from_the_most_recent_assistant_message() {
-        let events = vec![message_end(
-            "assistant",
-            &["Here is my result:\n```json\n{\"ok\": true, \"count\": 3}\n```\n"],
-        )];
-        let value = extract_structured_output_value(&events).expect("must extract");
-        assert_eq!(value, serde_json::json!({"ok": true, "count": 3}));
-    }
-
-    #[test]
-    fn recognizes_jsonc_and_json5_fence_tags_too() {
-        for lang in ["jsonc", "json5"] {
-            let text = format!("```{lang}\n{{\"a\": 1}}\n```");
-            let events = vec![message_end("assistant", &[text.as_str()])];
-            let value = extract_structured_output_value(&events).expect("must extract");
-            assert_eq!(value, serde_json::json!({"a": 1}));
-        }
-    }
-
-    #[test]
-    fn most_recent_message_wins_even_without_a_json_block_of_its_own() {
-        // The newest message has plain text only (no fenced json block); an OLDER message does
-        // have one. Per this function's own doc contract, the newest message's absence must NOT
-        // fall through to the older message's block.
-        let events = vec![
-            message_end("assistant", &["```json\n{\"old\": true}\n```"]),
-            message_end("assistant", &["just a plain final answer"]),
-        ];
-        assert_eq!(extract_structured_output_value(&events), None);
-    }
-
-    #[test]
-    fn skips_error_flagged_messages_and_falls_back_to_the_last_good_one() {
-        let events = vec![
-            message_end("assistant", &["```json\n{\"good\": 1}\n```"]),
-            message_end_error(&["```json\n{\"never\": true}\n```"]),
-        ];
-        let value = extract_structured_output_value(&events).expect("must extract");
-        assert_eq!(value, serde_json::json!({"good": 1}));
-    }
-
-    #[test]
-    fn ignores_non_assistant_and_non_message_end_events() {
-        let events = vec![
-            SubagentEvent::AgentStart,
-            message_end("user", &["```json\n{\"user\": true}\n```"]),
-            message_end("assistant", &["```json\n{\"real\": true}\n```"]),
-        ];
-        let value = extract_structured_output_value(&events).expect("must extract");
-        assert_eq!(value, serde_json::json!({"real": true}));
-    }
-
-    #[test]
-    fn a_fenced_block_with_unparseable_json_body_is_treated_as_no_block() {
-        let events = vec![message_end(
-            "assistant",
-            &["```json\nthis is not valid json\n```"],
-        )];
-        assert_eq!(extract_structured_output_value(&events), None);
-    }
-
-    #[test]
-    fn a_non_json_fenced_language_is_ignored() {
-        let events = vec![message_end(
-            "assistant",
-            &["```rust\nfn main() {}\n```\nplain trailer"],
-        )];
-        assert_eq!(extract_structured_output_value(&events), None);
-    }
-
-    #[test]
-    fn no_events_at_all_returns_none() {
-        assert_eq!(extract_structured_output_value(&[]), None);
-    }
-
-    #[test]
-    fn prefers_the_first_json_fence_within_one_message_when_multiple_are_present() {
-        let events = vec![message_end(
-            "assistant",
-            &["```json\n{\"first\": 1}\n```\nsome text\n```json\n{\"second\": 2}\n```"],
-        )];
-        let value = extract_structured_output_value(&events).expect("must extract");
-        assert_eq!(value, serde_json::json!({"first": 1}));
-    }
 
     // ---- validate_structured_output ----
 
@@ -557,60 +407,6 @@ mod tests {
         );
     }
 
-    // ---- resolve_structured_output: the composed entry point ----
-
-    #[test]
-    fn no_schema_declared_short_circuits_to_not_requested_without_inspecting_events() {
-        let events = vec![message_end("assistant", &["```json\n{\"x\": 1}\n```"])];
-        assert_eq!(
-            resolve_structured_output(None, &events),
-            StructuredOutcome::NotRequested
-        );
-    }
-
-    #[test]
-    fn schema_declared_and_value_present_and_valid_yields_valid_outcome() {
-        let schema = serde_json::json!({"type": "object", "required": ["x"]});
-        let events = vec![message_end("assistant", &["```json\n{\"x\": 1}\n```"])];
-        assert_eq!(
-            resolve_structured_output(Some(&schema), &events),
-            StructuredOutcome::Valid(serde_json::json!({"x": 1}))
-        );
-    }
-
-    #[test]
-    fn schema_declared_but_no_value_present_yields_missing_outcome() {
-        let schema = serde_json::json!({"type": "object"});
-        let events = vec![message_end(
-            "assistant",
-            &["just plain text, no json block"],
-        )];
-        assert_eq!(
-            resolve_structured_output(Some(&schema), &events),
-            StructuredOutcome::Missing
-        );
-    }
-
-    #[test]
-    fn schema_declared_and_value_present_but_invalid_yields_invalid_outcome_with_message() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {"count": {"type": "integer"}},
-            "required": ["count"]
-        });
-        let events = vec![message_end(
-            "assistant",
-            &["```json\n{\"count\": \"nope\"}\n```"],
-        )];
-        let outcome = resolve_structured_output(Some(&schema), &events);
-        assert!(
-            matches!(&outcome, StructuredOutcome::Invalid(message) if message.contains("count")),
-            "expected Invalid outcome mentioning the offending field, got {outcome:?}"
-        );
-    }
-
-    // ---- file-based structured_output tool contract (pi structured-output.ts:156-173) ----
-
     fn sample_schema() -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -667,5 +463,68 @@ mod tests {
         assert!(structured_output_instruction().contains("structured_output"));
         assert_eq!(STRUCTURED_OUTPUT_SCHEMA_ENV, "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA");
         assert_eq!(STRUCTURED_OUTPUT_CAPTURE_ENV, "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE");
+    }
+
+    // ---- StructuredOutputCleanupGuard: pi's `finally { if (!r?.detached) cleanup(...) }` ----
+
+    /// The `finally` half. A JS `async function` always settles, so upstream's `finally` fires even
+    /// when `runSync` throws; a Rust future can be dropped at any `.await`, and `run_sync` awaits
+    /// the whole fallback ladder between creating this runtime and cleaning it up. Only `Drop`
+    /// reproduces the guarantee — a plain end-of-function statement leaks the 0600 schema dir on
+    /// every cancelled run.
+    #[test]
+    fn dropping_an_armed_guard_removes_the_runtime_directory() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let runtime =
+            create_structured_output_runtime(&sample_schema(), base.path()).expect("runtime");
+        let dir = runtime
+            .schema_path
+            .parent()
+            .expect("runtime dir")
+            .to_path_buf();
+        // Guard against a vacuous pass: the directory must exist BEFORE we assert it is gone.
+        assert!(dir.exists(), "precondition: the runtime dir exists");
+
+        {
+            let guard = StructuredOutputCleanupGuard::new(runtime);
+            assert!(guard.is_armed());
+            assert!(dir.exists(), "the guard must not clean up while it is alive");
+        }
+
+        assert!(!dir.exists(), "dropping an armed guard removes the dir");
+    }
+
+    /// The `!r?.detached` half (pi `subagent-executor.ts:3780-3787` @v0.43.0). A detached run's
+    /// child is STILL ALIVE and its `structured_output` tool has not written yet — the capture file
+    /// lives in this very directory. Cleaning up on the detach receipt would destroy the directory
+    /// the live child must still write into, so ownership transfers instead.
+    #[test]
+    fn a_disarmed_guard_leaves_the_directory_for_the_still_live_detached_child() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let runtime =
+            create_structured_output_runtime(&sample_schema(), base.path()).expect("runtime");
+        let dir = runtime
+            .schema_path
+            .parent()
+            .expect("runtime dir")
+            .to_path_buf();
+        let output_path = runtime.output_path.clone();
+
+        {
+            let mut guard = StructuredOutputCleanupGuard::new(runtime);
+            guard.disarm();
+            assert!(!guard.is_armed());
+        }
+
+        assert!(dir.exists(), "a detach receipt must not delete the live child's capture dir");
+        // The whole point: the child can still write its captured value afterwards.
+        std::fs::write(&output_path, br#"{"summary":"late","count":1}"#)
+            .expect("the still-live child must be able to write its capture file");
+        cleanup_structured_output_runtime(&StructuredOutputRuntime {
+            schema: sample_schema(),
+            schema_path: dir.join("schema.json"),
+            output_path,
+        });
+        assert!(!dir.exists(), "the detached-exit path still cleans up eventually");
     }
 }

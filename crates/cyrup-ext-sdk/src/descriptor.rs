@@ -23,6 +23,55 @@ pub enum RenderShell {
     SelfRendered,
 }
 
+/// pi `ConstrainedSamplingConfig` — `packages/ai/src/types.ts:469-477` @v0.83.0. Declared on a
+/// tool with [`ToolDescriptor::constrained_sampling`]; resolved provider-side by
+/// `packages/ai/src/api/constrained-sampling.ts`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConstrainedSamplingConfig {
+    /// Ask the provider for a strict JSON-schema-constrained tool call.
+    JsonSchema { strict: StrictSampling },
+    /// Ask the provider for a Lark/regex grammar-constrained tool call. The tool's parameter
+    /// schema must be an object with EXACTLY ONE required string property — upstream's
+    /// `inferGrammarInputProperty` (`constrained-sampling.ts:69-88` @v0.83.0) rejects anything
+    /// else and the host reports it as a provider error.
+    Grammar { variants: GrammarVariants },
+}
+
+/// pi's `strict: "prefer" | "require"` (`packages/ai/src/types.ts:472` @v0.83.0). `Require` makes
+/// an unsupporting model an ERROR ("requires JSON-schema constrained sampling, but strict tools
+/// are unsupported"); `Prefer` silently falls back to unconstrained sampling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StrictSampling {
+    Prefer,
+    Require,
+}
+
+/// pi `GrammarVariants = Partial<Record<GrammarFormat, string>>` where
+/// `GrammarFormat = "openai_lark" | "openai_regex"` (`packages/ai/src/types.ts:459-461`
+/// @v0.83.0). Lark wins when both are present, matching
+/// `resolveGrammarConstrainedSampling`'s `hasLarkDefinition ? … : …`. The keys are snake_case
+/// upstream, so this struct deliberately carries no `rename_all`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GrammarVariants {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_lark: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_regex: Option<String>,
+}
+
+/// pi `ToolDefinition.constrainedSampling?: false | ConstrainedSamplingConfig`
+/// (`extensions/types.ts:463` @v0.83.0): "Optional provider-side constrained sampling request for
+/// this tool. Set false to explicitly disable it, equivalent to leaving it undefined."
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConstrainedSampling {
+    Config(ConstrainedSamplingConfig),
+    /// pi's `false` — serialized as the bare JSON literal, not an object.
+    Disabled(bool),
+}
+
 /// What a guest sends to register a tool (R-08-012/013; Pi `ToolDefinition`, types.ts:435-482).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +96,13 @@ pub struct ToolDescriptor {
     /// before validation when set.
     #[serde(default)]
     pub prepare_arguments: bool,
+    /// `constrainedSampling` (`extensions/types.ts:463` @v0.83.0) — opt in to provider-side
+    /// grammar- or strict-JSON-schema-constrained sampling for this tool. `None` = the omitted
+    /// field, which upstream is indistinguishable from
+    /// [`ConstrainedSampling::Disabled`]`(false)`. Set with
+    /// [`ToolDescriptor::constrained_sampling`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_sampling: Option<ConstrainedSampling>,
 }
 
 impl ToolDescriptor {
@@ -64,6 +120,7 @@ impl ToolDescriptor {
             has_renderer: false,
             render_shell: RenderShell::Default,
             prepare_arguments: false,
+            constrained_sampling: None,
         }
     }
 
@@ -94,6 +151,17 @@ impl ToolDescriptor {
     /// [`crate::ExtensionApi::register_message_renderer`] under the SAME name.
     pub fn has_renderer(mut self, yes: bool) -> Self {
         self.has_renderer = yes;
+        self
+    }
+
+    /// Opt this tool in to provider-side constrained sampling (pi
+    /// `ToolDefinition.constrainedSampling`, `extensions/types.ts:463` @v0.83.0). The host copies
+    /// the declaration onto the runtime tool — upstream's `wrapToolDefinition`
+    /// (`core/tools/tool-definition-wrapper.ts:14`) — and the provider adapter resolves it per
+    /// model. A model that does not support the requested mode ignores it, except for
+    /// [`StrictSampling::Require`], which upstream turns into an error.
+    pub fn constrained_sampling(mut self, cs: ConstrainedSamplingConfig) -> Self {
+        self.constrained_sampling = Some(ConstrainedSampling::Config(cs));
         self
     }
 }

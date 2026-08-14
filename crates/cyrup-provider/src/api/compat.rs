@@ -46,6 +46,21 @@ pub enum CacheControlFormat {
     Anthropic,
 }
 
+/// How deferred (mid-transcript-introduced) tools are rendered on the wire.
+/// Pi: `deferredToolsMode?: "kimi"` on `OpenAICompletionsCompat` (`types.ts:567` @v0.83.0).
+///
+/// PROV-025. The one upstream mode is Kimi's: instead of repeating a tool's schema in the
+/// top-level `tools` array on every turn, the schema is emitted ONCE, inline, in a
+/// `{role: "system", tools: [...]}` message placed immediately after the tool-result run that
+/// introduced it (`openai-completions.ts:1266-1276` @v0.83.0), and the tool is then EXCLUDED from
+/// `params.tools` (`:719-721`). The anchor is `ToolResultMessage.addedToolNames`, which cyrup
+/// already produces (PROV-009).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeferredToolsMode {
+    Kimi,
+}
+
 /// Which session-affinity headers a provider reads.
 /// Pi: `sessionAffinityFormat?: SessionAffinityFormat` — `"openai" | "openai-nosession" |
 /// "openrouter"` — declared on `OpenAICompletionsCompat` (`types.ts:569` @v0.83.0) and on
@@ -138,6 +153,10 @@ pub struct ModelCompat {
     pub supports_strict_mode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cache_control_format: Option<CacheControlFormat>,
+    /// Pi `deferredToolsMode?: "kimi"` (`types.ts:567` @v0.83.0 on `OpenAICompletionsCompat`).
+    /// Never detected — only the generated catalog turns it on (PROV-025).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub deferred_tools_mode: Option<DeferredToolsMode>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub send_session_affinity_headers: Option<bool>,
     /// Pi `sessionAffinityFormat` (`types.ts:569` @v0.83.0 on the completions compat, `:579` on the
@@ -296,6 +315,9 @@ pub struct ResolvedCompat {
     /// [`crate::utils::constrained_sampling::resolve_grammar_constrained_sampling`] (PROV-011).
     pub supports_openai_grammar_tools: bool,
     pub cache_control_format: Option<CacheControlFormat>,
+    /// Pi `deferredToolsMode` — detected `undefined` (`openai-completions.ts:1472` @v0.83.0),
+    /// catalog override resolved at `:1514` (PROV-025).
+    pub deferred_tools_mode: Option<DeferredToolsMode>,
     pub send_session_affinity_headers: bool,
     /// Pi `sessionAffinityFormat` — detected `isOpenRouter ? "openrouter" : "openai"`
     /// (`openai-completions.ts:1473` @v0.83.0), catalog override resolved at `:1515` (PROV-024).
@@ -464,6 +486,8 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         // detected, only enabled by the generated catalog.
         supports_openai_grammar_tools: false,
         cache_control_format,
+        // `deferredToolsMode: undefined` (openai-completions.ts:1472 @v0.83.0) — never detected.
+        deferred_tools_mode: None,
         send_session_affinity_headers: false,
         // `sessionAffinityFormat: isOpenRouter ? "openrouter" : "openai"`
         // (openai-completions.ts:1473 @v0.83.0).
@@ -529,6 +553,9 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
             .supports_openai_grammar_tools
             .unwrap_or(detected.supports_openai_grammar_tools),
         cache_control_format: c.cache_control_format.or(detected.cache_control_format),
+        // `deferredToolsMode: model.compat.deferredToolsMode ?? detected.deferredToolsMode`
+        // (openai-completions.ts:1514 @v0.83.0).
+        deferred_tools_mode: c.deferred_tools_mode.or(detected.deferred_tools_mode),
         send_session_affinity_headers: c
             .send_session_affinity_headers
             .unwrap_or(detected.send_session_affinity_headers),

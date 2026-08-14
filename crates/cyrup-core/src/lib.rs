@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 pub mod cancel;
+pub mod constrained_sampling;
 pub mod diagnostics;
 pub mod error;
 pub mod event_stream;
@@ -16,6 +17,9 @@ pub mod message;
 pub mod tool;
 
 pub use cancel::{CancelToken, RunCancel};
+pub use constrained_sampling::{
+    ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
+};
 pub use diagnostics::{
     append_assistant_message_diagnostic, create_assistant_message_diagnostic,
     create_assistant_message_diagnostic_from, extract_diagnostic_error, format_thrown_value,

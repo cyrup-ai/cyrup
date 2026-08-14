@@ -138,6 +138,25 @@ pub trait Tool: Send + Sync {
         ToolRenderKind::Default
     }
 
+    /// Per-tool opt-in to provider-side constrained sampling (Pi
+    /// `ToolDefinition.constrainedSampling`, extensions/types.ts:463 @v0.83.0).
+    ///
+    /// PROV-011 / EXT-024. Upstream the declaration is copied verbatim from the `ToolDefinition`
+    /// onto the runtime `AgentTool` by `wrapToolDefinition`
+    /// (`packages/coding-agent/src/core/tools/tool-definition-wrapper.ts:14` @v0.83.0, and back at
+    /// `:42`), reaches the loop as `Context.tools[].constrainedSampling`, and is resolved by
+    /// `packages/ai/src/api/constrained-sampling.ts`. This accessor is that copy's Rust
+    /// counterpart: the runtime `Tool` is where the loop reads it from.
+    ///
+    /// Default `None` = the field is absent, which upstream is indistinguishable from `false`
+    /// (`ConstrainedSampling::Disabled`). No pi built-in tool declares it — the three hits of
+    /// `git grep constrainedSampling v0.83.0 -- packages/coding-agent/src packages/agent/src` are
+    /// the field declaration and the two wrapper copies — so every built-in correctly keeps the
+    /// default.
+    fn constrained_sampling(&self) -> Option<&crate::ConstrainedSampling> {
+        None
+    }
+
     /// Compatibility shim to normalize raw tool-call arguments before schema validation (Pi
     /// `ToolDefinition.prepareArguments`, extensions/types.ts:451-452). Default: identity
     /// passthrough — the arguments are returned unchanged (today's behavior).
@@ -206,6 +225,7 @@ mod tests {
         assert_eq!(t.prompt_snippet(), None);
         assert!(t.prompt_guidelines().is_empty());
         assert_eq!(t.render_kind(), ToolRenderKind::Default);
+        assert!(t.constrained_sampling().is_none());
         assert_eq!(t.render_call(&serde_json::json!({"a": 1})), None);
         assert_eq!(t.render_result(&ToolResult::default()), None);
         // prepare_arguments is an identity passthrough.
@@ -213,5 +233,62 @@ mod tests {
         assert_eq!(t.prepare_arguments(args.clone()).await, args);
         // The pre-existing defaults are unchanged.
         assert_eq!(t.execution_mode(), ExecMode::Parallel);
+    }
+
+    /// PROV-011: a tool that DOES declare `constrainedSampling` must be able to hand it to the
+    /// loop. Without this the `is_none()` assertion above is vacuous — it would hold for a trait
+    /// surface that had no way to say yes.
+    struct OptingTool {
+        params: serde_json::Value,
+        cs: crate::ConstrainedSampling,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for OptingTool {
+        fn name(&self) -> &str {
+            "opting"
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            &self.params
+        }
+        fn constrained_sampling(&self) -> Option<&crate::ConstrainedSampling> {
+            Some(&self.cs)
+        }
+        async fn execute(
+            &self,
+            _call_id: ToolCallId,
+            _params: serde_json::Value,
+            _cancel: CancelToken,
+            _on_update: ToolUpdateSink,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::default())
+        }
+    }
+
+    #[test]
+    fn a_tool_can_opt_in_to_constrained_sampling() {
+        use crate::constrained_sampling::{
+            ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants,
+        };
+        let t = OptingTool {
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            }),
+            cs: ConstrainedSampling::Config(ConstrainedSamplingConfig::Grammar {
+                variants: GrammarVariants {
+                    openai_lark: Some("start: /[a-z]+/".into()),
+                    openai_regex: None,
+                },
+            }),
+        };
+        let declared = t.constrained_sampling().expect("the tool declared it");
+        match declared.config() {
+            Some(ConstrainedSamplingConfig::Grammar { variants }) => {
+                assert_eq!(variants.openai_lark.as_deref(), Some("start: /[a-z]+/"));
+            }
+            other => panic!("expected a grammar config, got {other:?}"),
+        }
     }
 }

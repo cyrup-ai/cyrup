@@ -26,7 +26,7 @@ pub mod bindings {
     });
 }
 
-use bindings::cyrup::ext::{registration, types};
+use bindings::cyrup::ext::{registration, types, ui};
 
 thread_local! {
     static API: RefCell<Option<ExtensionApi>> = const { RefCell::new(None) };
@@ -76,6 +76,13 @@ fn lower_tool_descriptor(d: &crate::descriptor::ToolDescriptor) -> types::ToolDe
             crate::descriptor::RenderShell::Default => None,
             crate::descriptor::RenderShell::SelfRendered => Some("self".to_string()),
         },
+        // PROV-011 / EXT-024: pi `ToolDefinition.constrainedSampling` crosses as the JSON of
+        // `false | ConstrainedSamplingConfig`. An OMITTED field lowers to `none`, which the host
+        // treats identically to `false` — upstream's stated equivalence.
+        constrained_sampling: d
+            .constrained_sampling
+            .as_ref()
+            .map(|cs| serde_json::to_string(cs).unwrap_or_else(|_| "false".to_string())),
     }
 }
 
@@ -99,6 +106,7 @@ fn _lower_tool_descriptor_is_exhaustive(d: crate::descriptor::ToolDescriptor) {
         has_renderer: _,
         render_shell: _,
         prepare_arguments: _,
+        constrained_sampling: _,
     } = d;
 }
 
@@ -145,6 +153,12 @@ fn push_registrations(api: &ExtensionApi) {
     // `extensions/loader.ts:309-312` @v0.84.1.
     if api.has_markdown_transformer() {
         registration::register_markdown_transformer();
+    }
+    // EXT-021: declare (not send) the raw terminal-input handler — the closure stays guest-side
+    // and the host reaches it through the `on-terminal-input` export. Pi
+    // `ctx.ui.onTerminalInput(handler)`, `extensions/types.ts:145` @v0.83.0.
+    if api.has_terminal_input_handler() {
+        ui::subscribe_terminal_input();
     }
     for command in &api.autocomplete {
         registration::add_autocomplete(command);
@@ -306,6 +320,12 @@ pub fn transform_markdown(markdown: String, ctx_json: String) -> String {
         Some(api) => api.transform_markdown(&markdown, &ctx),
         None => markdown,
     })
+}
+
+/// `on-terminal-input` export body (EXT-021; Pi `TerminalInputHandler`, types.ts:113 @v0.83.0).
+/// `None` when this guest registered no handler, so an unexpected call is harmless.
+pub fn on_terminal_input(data: String) -> Option<crate::api::TerminalInputResult> {
+    API.with(|c| c.borrow().as_ref().and_then(|api| api.handle_terminal_input(&data)))
 }
 
 /// `provider-login` export body (Pi `oauth.login`): returns the credentials JSON to persist.

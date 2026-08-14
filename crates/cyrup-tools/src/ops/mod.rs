@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use local::{kill_pid, terminate_pid};
+pub use local::{
+    kill_pid, kill_process_tree, kill_tracked_detached_children, terminate_pid,
+    track_detached_child_pid, untrack_detached_child_pid,
+};
 pub use shell::{shell_env, ShellConfig, Transport};
 
 /// Access mode for [`FsOps::access`].
@@ -391,6 +394,144 @@ pub trait ProcOps: Send + Sync {
     }
 }
 
+/// Execution options for one [`BashOperations::exec`] call — the port of the options bag pi's
+/// `BashOperations.exec` takes as its third argument (`{onData, signal, timeout, env}`,
+/// `packages/coding-agent/src/core/tools/bash.ts:64-71` @v0.83.0).
+///
+/// `on_data` is pi's `onData: (data: Buffer) => void`: RAW bytes, combined stdout+stderr, sanitized
+/// by the CALLER (`executeBashWithOperations` strips ANSI and normalizes CR inside its own `onData`
+/// wrapper, `bash-executor.ts:78-102`), never by the backend.
+///
+/// `cancel` is pi's `signal?: AbortSignal` re-shaped as a poll+notify token, the same substitution
+/// `ProcOps::exec` already makes; `timeout` is pi's `timeout?: number` in seconds, carried here as a
+/// `Duration` because the seconds→ms conversion and the `MAX_TIMEOUT_MS` ceiling are the bash TOOL's
+/// input validation (`bash.ts:20-38`), not the backend's.
+///
+/// `env` is ADDITIVE over the inherited parent environment and `env_remove` names keys to UNSET,
+/// applied FIRST — identical to [`ExecSpec`], and for the same reason: pi materializes the whole
+/// environment (`env: env ?? getShellEnv()`, `bash.ts:100`) so it can express a deletion by omission,
+/// while cyrup inherits and therefore has to name it. An EMPTY `env` here is pi's `env: undefined`,
+/// i.e. "use the inherited shell environment", NOT "run with an empty environment".
+pub struct BashExecOptions<'a> {
+    pub on_data: &'a mut (dyn for<'b> FnMut(&'b [u8]) + Send),
+    pub cancel: CancelToken,
+    pub timeout: Option<Duration>,
+    pub env: Vec<(String, String)>,
+    pub env_remove: Vec<String>,
+}
+
+/// A PER-CALL, pluggable command-execution backend for the bash seams — the port of pi's
+/// `BashOperations` (`packages/coding-agent/src/core/tools/bash.ts:52-73` @v0.83.0: *"Pluggable
+/// operations for the bash tool. Override these to delegate command execution to remote systems (for
+/// example SSH)."*).
+///
+/// **Why this is a SEPARATE trait from [`ProcOps`] rather than a re-use of it.** The two seams have
+/// different lifetimes and different suppliers, which is exactly pi's split:
+///
+/// * [`ProcOps`] is the SESSION-lifetime backend chosen at construction — pi has no interface for it
+///   at all, because in pi it is just "whatever `spawn` does". It carries the argv surface
+///   ([`ProcOps::exec_argv`], pi `execCommand`, `exec.ts:34-46`) that the capability-scoped `exec`
+///   grant needs and that a bash backend has no business providing.
+/// * `BashOperations` is the PER-CALL override an *extension* supplies: `BashToolOptions.operations`
+///   (`bash.ts:186-188`) for the agent-loop `bash` tool, and `UserBashEventResult.operations`
+///   (`extensions/types.ts:1078-1081`) for one single `user_bash` command — pi's `executeBash`
+///   resolves it fresh on every invocation, `options?.operations ?? createLocalBashOperations({
+///   shellPath })` (`agent-session.ts:2782`). It is a ONE-METHOD interface upstream and stays one
+///   here; widening it to `ProcOps` would demand an argv backend from every `ssh`/sandbox extension
+///   that only ever wanted to redirect a shell command.
+///
+/// The default implementation is [`LocalBashOperations`] — pi's `createLocalBashOperations`
+/// (`bash.ts:82`), which upstream exports to extensions for exactly the wrap-then-delegate case
+/// (`packages/coding-agent/src/index.ts:281`).
+///
+/// [CYRUP-DELTA, mechanism] A WASM guest cannot RETURN an implementation of this trait: ADR-0002
+/// (`docs/adr/ADR-0002-extension-io-is-serde.md`, rule 4) makes extension I/O values rather than
+/// references, so the guest half of `UserBashEventResult.operations` needs a registration import plus
+/// a keyed dispatch export in `crates/cyrup-ext/wit/world.wit` before an extension can supply one.
+/// That round-trip is NOT built yet; the register entry naming its cost lives in
+/// `crates/cyrup-ext/src/lib.rs` (DRIFT-004 / SEAM-015). This trait is the host-side half and is
+/// complete: any in-host caller — the isolation decorators (arch-12), a future keyed guest proxy —
+/// can already supply one.
+#[async_trait::async_trait]
+pub trait BashOperations: Send + Sync {
+    /// Execute `command` in `cwd`, streaming combined stdout+stderr to `opts.on_data`.
+    ///
+    /// Pi returns `{ exitCode: number | null }` (`bash.ts:72`), where `null` is "killed"; cyrup
+    /// returns the richer [`ExitStatus`] its callers already interpret, so a cancel
+    /// ([`ExitStatus::Killed`]) and a timeout ([`ExitStatus::TimedOut`]) stay distinguishable
+    /// instead of collapsing into pi's single `null` and being re-derived from the signal afterwards.
+    /// A genuine backend failure (spawn error, missing cwd, …) is an `Err` — pi `throw`s those and
+    /// `executeBashWithOperations` re-throws everything that is not an abort (`bash-executor.ts:154`).
+    async fn exec(
+        &self,
+        command: &str,
+        cwd: &Path,
+        opts: BashExecOptions<'_>,
+    ) -> Result<ExitStatus, ToolError>;
+}
+
+/// Pi's built-in local-shell [`BashOperations`] — `createLocalBashOperations(options?: {shellPath?})`
+/// (`packages/coding-agent/src/core/tools/bash.ts:82-148` @v0.83.0).
+///
+/// The shell is resolved **per `exec` call**, not baked in at construction: upstream's returned
+/// closure calls `getShellConfig(options?.shellPath)` on every invocation (`bash.ts:89`), so a
+/// `shellPath` setting changed mid-session takes effect on the next command. Storing a resolved
+/// [`ShellConfig`] here instead would silently pin the shell at session-build time, which is the
+/// exact divergence `AgentSession::execute_bash` already documents on the immediate-bash path.
+///
+/// `shell_path` = `None` is upstream's absent `shellPath`, i.e. auto-detection.
+pub struct LocalBashOperations {
+    proc: Arc<dyn ProcOps>,
+    shell_path: Option<String>,
+}
+
+impl LocalBashOperations {
+    /// Over the default local process backend (pi `createLocalBashOperations({ shellPath })`).
+    pub fn new(shell_path: Option<String>) -> Self {
+        Self {
+            proc: Arc::new(local::LocalProc::new(ShellConfig::detect())),
+            shell_path,
+        }
+    }
+
+    /// Over an explicit [`ProcOps`] — the form the isolation decorators (arch-12) need, so a
+    /// sandboxed or traversal-guarded backend keeps its wrapping when it is reached through the
+    /// per-call bash seam rather than through [`Backend::proc`].
+    pub fn with_proc(proc: Arc<dyn ProcOps>, shell_path: Option<String>) -> Self {
+        Self { proc, shell_path }
+    }
+}
+
+#[async_trait::async_trait]
+impl BashOperations for LocalBashOperations {
+    async fn exec(
+        &self,
+        command: &str,
+        cwd: &Path,
+        opts: BashExecOptions<'_>,
+    ) -> Result<ExitStatus, ToolError> {
+        // Pi resolves the shell INSIDE `exec` (bash.ts:89) — see the struct doc. A missing custom
+        // `shellPath` is an `Err` here, matching `ShellConfig::resolve`'s contract and the
+        // `Custom shell path not found` error both existing bash front-ends already surface.
+        let shell = ShellConfig::resolve(self.shell_path.as_deref())?;
+        let BashExecOptions { on_data, cancel, timeout, env, env_remove } = opts;
+        self.proc
+            .exec(
+                ExecSpec {
+                    command: command.to_string(),
+                    cwd: cwd.to_path_buf(),
+                    env,
+                    env_remove,
+                    shell,
+                },
+                cancel,
+                timeout,
+                on_data,
+            )
+            .await
+    }
+}
+
 /// A bundle of both operation surfaces (arch-03 §3.3).
 #[derive(Clone)]
 pub struct Backend {
@@ -411,5 +552,145 @@ impl Backend {
 impl Default for Backend {
     fn default() -> Self {
         Self::local(ShellConfig::detect())
+    }
+}
+
+#[cfg(test)]
+mod bash_operations_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A [`ProcOps`] that records the [`ExecSpec`] it was handed and replays a canned chunk, so the
+    /// adapter's forwarding can be asserted without spawning anything.
+    #[derive(Default)]
+    struct RecordingProc {
+        seen: Mutex<Vec<ExecSpec>>,
+        emit: Option<&'static [u8]>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcOps for RecordingProc {
+        async fn exec(
+            &self,
+            spec: ExecSpec,
+            _cancel: CancelToken,
+            _timeout: Option<Duration>,
+            on_data: &mut (dyn for<'a> FnMut(&'a [u8]) + Send),
+        ) -> Result<ExitStatus, ToolError> {
+            #[allow(clippy::unwrap_used)]
+            self.seen.lock().unwrap().push(spec);
+            if let Some(bytes) = self.emit {
+                on_data(bytes);
+            }
+            Ok(ExitStatus::Exited(0))
+        }
+    }
+
+    fn opts<'a>(on_data: &'a mut (dyn for<'b> FnMut(&'b [u8]) + Send)) -> BashExecOptions<'a> {
+        BashExecOptions {
+            on_data,
+            cancel: CancelToken::new(),
+            timeout: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+        }
+    }
+
+    /// `LocalBashOperations` forwards pi's `(command, cwd, {onData, timeout, env})` onto the
+    /// [`ProcOps`] seam verbatim, streaming the backend's raw bytes straight through — pi's `onData`
+    /// receives the RAW `Buffer` and the CALLER sanitizes (`bash-executor.ts:78-102` @v0.83.0), so a
+    /// backend that filtered here would double-sanitize.
+    #[tokio::test]
+    async fn local_bash_operations_forwards_command_cwd_and_env_onto_the_proc_seam() {
+        let proc = Arc::new(RecordingProc { seen: Mutex::new(Vec::new()), emit: Some(b"hi\x1b[0m") });
+        let ops = LocalBashOperations::with_proc(proc.clone(), None);
+
+        let mut streamed: Vec<u8> = Vec::new();
+        let mut sink = |b: &[u8]| streamed.extend_from_slice(b);
+        let status = ops
+            .exec(
+                "echo hi",
+                Path::new("/tmp"),
+                BashExecOptions {
+                    on_data: &mut sink,
+                    cancel: CancelToken::new(),
+                    timeout: Some(Duration::from_secs(5)),
+                    env: vec![("A".into(), "1".into())],
+                    env_remove: vec!["PI_SESSION_ID".into()],
+                },
+            )
+            .await
+            .expect("recording backend cannot fail");
+
+        assert_eq!(status, ExitStatus::Exited(0));
+        // Raw bytes, ANSI intact — the sanitization is the caller's (pi `bash-executor.ts:84`).
+        assert_eq!(streamed, b"hi\x1b[0m");
+
+        let seen = proc.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one exec per `BashOperations::exec` call");
+        assert_eq!(seen[0].command, "echo hi");
+        assert_eq!(seen[0].cwd, Path::new("/tmp"));
+        assert_eq!(seen[0].env, vec![("A".to_string(), "1".to_string())]);
+        assert_eq!(seen[0].env_remove, vec!["PI_SESSION_ID".to_string()]);
+        assert!(
+            !seen[0].shell.program.as_os_str().is_empty(),
+            "the adapter must resolve a shell itself, not leave it to `LocalProc`'s baked default"
+        );
+    }
+
+    /// Pi resolves the shell INSIDE the `exec` closure (`bash.ts:89`: `getShellConfig(options
+    /// ?.shellPath)`), not when `createLocalBashOperations` returns. The observable consequence is
+    /// that a bad `shellPath` fails on the CALL and never reaches the process backend — a
+    /// construction-time resolve would either have to make the constructor fallible or would pin a
+    /// stale shell for the session's life.
+    ///
+    /// Presence before absence: the same constructor with a REAL shell path runs and reaches the
+    /// backend, so the `Err` below is the path check firing and not the adapter being inert.
+    #[tokio::test]
+    async fn local_bash_operations_resolves_the_shell_per_call_so_a_bad_path_fails_before_spawn() {
+        let proc = Arc::new(RecordingProc::default());
+
+        // Presence: a resolvable shell path reaches the backend.
+        let good = ShellConfig::detect().program;
+        let ok_ops = LocalBashOperations::with_proc(
+            proc.clone(),
+            Some(good.to_string_lossy().into_owned()),
+        );
+        let mut noop = |_: &[u8]| {};
+        ok_ops
+            .exec("true", Path::new("/tmp"), opts(&mut noop))
+            .await
+            .expect("a resolvable shellPath must execute");
+        assert_eq!(proc.seen.lock().unwrap().len(), 1);
+        assert_eq!(proc.seen.lock().unwrap()[0].shell.program, good);
+
+        // Absence: constructing with a missing path is fine — only `exec` fails.
+        let bad_ops = LocalBashOperations::with_proc(
+            proc.clone(),
+            Some("/definitely/not/a/shell/on/this/box".to_string()),
+        );
+        let mut noop2 = |_: &[u8]| {};
+        let err = bad_ops
+            .exec("true", Path::new("/tmp"), opts(&mut noop2))
+            .await
+            .expect_err("a missing custom shellPath must fail the call");
+        assert!(
+            err.to_string().contains("Custom shell path not found"),
+            "pi's message (`shell.ts:67-120` via `ShellConfig::resolve`), got: {err}"
+        );
+        assert_eq!(
+            proc.seen.lock().unwrap().len(),
+            1,
+            "the failing call must NOT have reached the process backend"
+        );
+    }
+
+    /// `LocalBashOperations` is usable as `Arc<dyn BashOperations>` — the object-safety the per-call
+    /// override seam exists for (pi's `operations?: BashOperations` is an interface value, both on
+    /// `BashToolOptions` (`bash.ts:186-188`) and on `UserBashEventResult` (`types.ts:1078-1081`)).
+    #[test]
+    fn bash_operations_is_object_safe() {
+        let _erased: Arc<dyn BashOperations> = Arc::new(LocalBashOperations::new(None));
     }
 }

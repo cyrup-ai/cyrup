@@ -42,6 +42,16 @@ pub struct ToolDescriptor {
     /// renders its own framing." `None` is upstream's omitted field, i.e. `"default"` (EXT-024).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_shell: Option<String>,
+    /// pi `ToolDefinition.constrainedSampling?: false | ConstrainedSamplingConfig`
+    /// (`extensions/types.ts:463` @v0.83.0). Copied verbatim onto the runtime tool upstream by
+    /// `wrapToolDefinition` (`core/tools/tool-definition-wrapper.ts:14`) and read back off
+    /// `Context.tools` by the provider adapters; here it is surfaced by
+    /// `<WasmTool as Tool>::constrained_sampling` so the agent loop can forward it. Stored PARSED
+    /// rather than as the raw JSON string so a malformed declaration is rejected once, at
+    /// registration, instead of on every turn (PROV-011 / EXT-024). `None` = the omitted field,
+    /// which upstream is indistinguishable from `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_sampling: Option<cyrup_core::ConstrainedSampling>,
 }
 
 impl ToolDescriptor {
@@ -232,6 +242,13 @@ struct RegistryInner {
     /// for exactly that reason; re-registration by the same owner is idempotent rather than a
     /// second fold step, because upstream's field ASSIGNMENT replaces rather than appends.
     markdown_transformers: Vec<ExtensionId>,
+    /// Extensions subscribed to raw terminal input, in LOAD order (EXT-021; pi
+    /// `ExtensionUIContext.onTerminalInput`, `extensions/types.ts:145` @v0.83.0).
+    ///
+    /// pi keeps the handlers in an insertion-ordered `Set` (`packages/tui/src/tui.ts:651-655`) and
+    /// folds them in that order (`:773-788`), so a `Vec` reproduces both the ordering and the
+    /// `Set.add` idempotence. `unsubscribe` is `Set.delete` and is likewise idempotent.
+    terminal_input_subscribers: Vec<ExtensionId>,
 }
 
 impl ExtensionRegistry {
@@ -460,6 +477,31 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.markdown_transformers.clone())
     }
 
+    /// Record that `owner` subscribed to raw terminal input (EXT-021; pi
+    /// `onTerminalInput(handler)`, `extensions/types.ts:145` @v0.83.0). Idempotent, matching
+    /// upstream's `Set.add`.
+    pub fn subscribe_terminal_input(&self, owner: ExtensionId) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        if !g.terminal_input_subscribers.contains(&owner) {
+            g.terminal_input_subscribers.push(owner);
+        }
+        Ok(())
+    }
+
+    /// The unsubscribe function upstream's `onTerminalInput` returns (`Set.delete`,
+    /// `packages/tui/src/tui.ts:652-654`). Idempotent; unsubscribing a non-subscriber is a no-op.
+    pub fn unsubscribe_terminal_input(&self, owner: &ExtensionId) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        g.terminal_input_subscribers.retain(|o| o != owner);
+        Ok(())
+    }
+
+    /// Terminal-input subscribers in LOAD order — the fold order of pi's `TUI.handleInput`
+    /// (`packages/tui/src/tui.ts:773-788`).
+    pub fn terminal_input_subscribers(&self) -> Result<Vec<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.terminal_input_subscribers.clone())
+    }
+
     pub fn message_renderer_owner(&self, custom_type: &str) -> Result<Option<ExtensionId>, ExtError> {
         Ok(self.lock_read()?.message_renderer_owner.get(custom_type).cloned())
     }
@@ -638,14 +680,34 @@ impl ExtensionRegistry {
     }
 
     /// Route an invocation name (bare `name` OR a disambiguated `name:N`) back to its owning
-    /// extension (Pi resolves the handler from the `ResolvedCommand`, runner.ts). Falls back to the
-    /// last-wins `commands` map for a bare name with no disambiguation.
+    /// extension, exactly as far as pi routes one.
+    ///
+    /// 1:1 with `ExtensionRunner.getCommand` (`core/extensions/runner.ts:647-649` @v0.83.0):
+    ///
+    /// ```text
+    /// return this.resolveRegisteredCommands().find((command) => command.invocationName === name);
+    /// ```
+    ///
+    /// `invocationName` is the ONLY key upstream matches on, and there is no second lookup behind
+    /// it. SEAM-048 — this used to end with a `self.command_owner(invocation)` fallback into the
+    /// last-wins `commands` map, which is unreachable for every name that HAS a resolution (a
+    /// registration lands in `commands` and `command_order` together, so `resolved_commands()`
+    /// yields a row for each) and wrong for the one case it did catch: after `a` and `b` both
+    /// register `deploy`, `resolveRegisteredCommands` emits `deploy:1`/`deploy:2` and NOTHING named
+    /// `deploy`, so pi's `getCommand("deploy")` returns `undefined` and `_tryExecuteExtensionCommand`
+    /// returns `false` — the bare `/deploy` falls through to a normal prompt
+    /// (`core/agent-session.ts:1276-1277`). The fallback instead handed bare `/deploy` to whichever
+    /// extension registered LAST, which is precisely the last-registration-wins behaviour the
+    /// disambiguation tier exists to remove. Both dispatch gates that read this — the native one via
+    /// [`crate::ExtensionHost::execute_native_command`] and `AgentSession::try_execute_wasm_command`
+    /// (`cyrup-session-svc/src/session.rs:1131`) — already treat `None` as pi's `false`, so removing
+    /// it yields upstream's fall-through at both.
     pub fn resolved_command_owner(&self, invocation: &str) -> Result<Option<ExtensionId>, ExtError> {
-        if let Some(r) = self.resolved_commands()?.into_iter().find(|r| r.invocation_name == invocation)
-        {
-            return Ok(Some(r.owner));
-        }
-        self.command_owner(invocation)
+        Ok(self
+            .resolved_commands()?
+            .into_iter()
+            .find(|r| r.invocation_name == invocation)
+            .map(|r| r.owner))
     }
 
     /// Register a keyboard shortcut owned by an extension (R-08-017; pi `registerShortcut(shortcut,

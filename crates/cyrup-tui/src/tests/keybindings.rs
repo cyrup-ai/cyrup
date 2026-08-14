@@ -293,3 +293,74 @@ fn reload_with_no_keybindings_file_leaves_the_defaults_in_place() {
         Some(Action::ToolsExpand)
     );
 }
+
+/// CFG-048 read half — Pi applies `migrateKeybindingsConfig` on EVERY read
+/// (`core/keybindings.ts:366`, inside `loadFromFile`), not only from `runMigrations`. A legacy id
+/// must therefore bind from a document that has never been through the on-disk migration.
+///
+/// RED before this pass: `keybindings_object` handed the raw map straight to the entry loop and
+/// `Action::from_id("interrupt")` is `None`, so the entry was dropped with no diagnostic and the
+/// default (Esc) stayed bound — a pi-migrant's whole keybindings file was silently inert.
+#[test]
+fn legacy_keybinding_ids_bind_at_read_time_without_an_on_disk_migration() {
+    let mut km = Keymap::default();
+    km.merge_json(r#"{ "interrupt": "ctrl+q" }"#).unwrap();
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        Some(Action::Interrupt)
+    );
+    // A rebind moves the key, so the default must be gone — this is what proves the entry was
+    // APPLIED rather than merely not-erroring (the vacuous-pass guard).
+    assert_eq!(km.action_for(&key(KeyCode::Esc, KeyModifiers::NONE)), None);
+
+    // The renamed target is what the migration table names, so a `tui.*`-namespaced legacy id lands
+    // in the editor map through the same shared parse.
+    //
+    // The chord is `ctrl+p` — deliberately one NO stock editor binding claims. This assertion was
+    // first written with `ctrl+y`, which is `tui.editor.yank`'s own default
+    // (`packages/tui/src/keybindings.ts` @v0.83.0, ported at `EditorKeymap::default`), and pi does
+    // NOT hand a user-rebound id priority over a default that already claims the chord: its editor
+    // resolves by asking each binding id in `handleInput` source order, and
+    // `kb.matches(data, "tui.editor.yank")` is asked at `packages/tui/src/components/editor.ts:758`
+    // — four lines BEFORE `"tui.editor.yankPop"` at `:762`. So upstream yanks, and the migration
+    // half being tested here is invisible on that chord. A collision-free chord is what actually
+    // isolates the rename.
+    let mut ek = EditorKeymap::default();
+    ek.merge_json(r#"{ "yankPop": "ctrl+p" }"#).unwrap();
+    assert_eq!(
+        ek.action_for(&key(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+        Some(EditorAction::YankPop)
+    );
+    // Same vacuous-pass guard as above: `yankPop`'s stock `alt+y` must be GONE, which is what
+    // proves the migrated entry was applied rather than merely appended alongside the default.
+    assert_eq!(ek.action_for(&key(KeyCode::Char('y'), KeyModifiers::ALT)), None);
+
+    // And pin the shadowing itself, so the agreement with upstream above is a fact of this suite
+    // rather than a coincidence of `EditorKeymap`'s vector order: rebinding `yankPop` onto `yank`'s
+    // default chord leaves the chord yanking, exactly as `editor.ts:758` before `:762` does.
+    let mut shadowed = EditorKeymap::default();
+    shadowed.merge_json(r#"{ "yankPop": "ctrl+y" }"#).unwrap();
+    assert_eq!(
+        shadowed.action_for(&key(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+        Some(EditorAction::Yank)
+    );
+}
+
+/// `core/keybindings.ts:302-305` — when both spellings are present the MODERN entry wins and the
+/// legacy one is discarded.
+///
+/// This is the rule that makes the read-time rename safe rather than merely useful: once a legacy id
+/// is renamed, both entries target ONE binding id, and something has to decide. Plain renaming would
+/// hand that to `serde_json::Map`'s (alphabetical) iteration order — a coin flip on the id spelling,
+/// not on the user's intent. `migrate_keybindings_config` drops the legacy entry instead, so the
+/// winner is pi's regardless of how the document was written or how the map iterates.
+#[test]
+fn a_modern_id_beats_its_legacy_twin_regardless_of_map_order() {
+    let mut km = Keymap::default();
+    km.merge_json(r#"{ "interrupt": "ctrl+q", "app.interrupt": "ctrl+e" }"#).unwrap();
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+        Some(Action::Interrupt)
+    );
+    assert_eq!(km.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)), None);
+}

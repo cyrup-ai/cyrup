@@ -31,53 +31,16 @@ pub struct ToolDef {
     pub constrained_sampling: Option<ConstrainedSampling>,
 }
 
-/// Pi `Tool["constrainedSampling"]` — `false | ConstrainedSamplingConfig` (`types.ts:484`
-/// @v0.83.0). The `false` literal is kept as its own variant rather than collapsed into `None` so
-/// a pi-authored tool definition round-trips byte-identically; upstream states it "behaves the same
-/// as omitting the field" (`packages/ai/README.md:483`) and every resolver here treats it so.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-pub enum ConstrainedSampling {
-    Config(ConstrainedSamplingConfig),
-    /// pi's `false`. `true` is not expressible upstream; it is accepted here and treated as
-    /// `false`, because the resolvers key on `config.type` and neither bool has one.
-    Disabled(bool),
-}
-
-impl ConstrainedSampling {
-    /// The config, or `None` for pi's `false` — i.e. `!config || config.type !== …`'s first
-    /// clause (`constrained-sampling.ts:85`, `:105` @v0.83.0).
-    pub fn config(&self) -> Option<&ConstrainedSamplingConfig> {
-        match self {
-            ConstrainedSampling::Config(c) => Some(c),
-            ConstrainedSampling::Disabled(_) => None,
-        }
-    }
-}
-
-/// Pi `ConstrainedSamplingConfig` — `types.ts:469-477` @v0.83.0.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ConstrainedSamplingConfig {
-    JsonSchema { strict: StrictSampling },
-    Grammar { variants: GrammarVariants },
-}
-
-/// Pi's `strict: "prefer" | "require"` (`types.ts:472` @v0.83.0).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StrictSampling {
-    Prefer,
-    Require,
-}
-
-/// Pi `GrammarVariants = Partial<Record<GrammarFormat, string>>` where
-/// `GrammarFormat = "openai_lark" | "openai_regex"` (`types.ts:459-461` @v0.83.0). The keys are
-/// snake_case upstream, so this struct deliberately carries no `rename_all`.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct GrammarVariants {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openai_lark: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openai_regex: Option<String>,
-}
+// PROV-011 — the constrained-sampling DECLARATION types moved down into `cyrup-core`
+// (`cyrup_core::constrained_sampling`) and are re-exported here so every provider-facing path
+// (`cyrup_provider::context::ConstrainedSampling`, `cyrup_provider::ConstrainedSampling`) is
+// unchanged.
+//
+// They had to move because upstream the declaration is copied off the tool onto the runtime
+// `AgentTool` (`tool-definition-wrapper.ts:14` @v0.83.0) and read back out of `Context.tools`;
+// the Rust `AgentTool` analogue is `cyrup_core::Tool`, and `cyrup-provider` DEPENDS ON
+// `cyrup-core`, so a type defined here could never appear on that trait. With the definition in
+// core, `Tool::constrained_sampling()` exists and a tool can finally opt in.
+pub use cyrup_core::constrained_sampling::{
+    ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
+};

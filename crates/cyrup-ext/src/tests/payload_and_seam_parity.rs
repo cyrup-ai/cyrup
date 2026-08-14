@@ -785,6 +785,7 @@ fn the_tool_descriptor_carries_prepare_arguments_and_render_shell() {
         has_renderer: false,
         prepare_arguments: true,
         render_shell: Some("self".into()),
+        constrained_sampling: None,
     };
     d.validate().unwrap();
 
@@ -795,6 +796,81 @@ fn the_tool_descriptor_carries_prepare_arguments_and_render_shell() {
     let back: ToolDescriptor = serde_json::from_value(wire).unwrap();
     assert!(back.prepare_arguments);
     assert_eq!(back.render_shell.as_deref(), Some("self"));
+}
+
+/// PROV-011 / EXT-024 — `constrainedSampling` on the descriptor, and a `WasmTool` built from it
+/// answering `Tool::constrained_sampling`.
+///
+/// BEFORE: `tool-descriptor` had no such field and `cyrup_core::Tool` had no such accessor, so a
+/// guest tool asking for grammar-constrained sampling was answered with silence at BOTH ends —
+/// the provider-side resolvers (`cyrup-provider/src/utils/constrained_sampling.rs`) existed and
+/// could never be reached from a tool.
+#[test]
+fn the_tool_descriptor_carries_constrained_sampling_in_pis_wire_shape() {
+    use cyrup_core::constrained_sampling::{
+        ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
+    };
+
+    // The ABSENCE side first, so the presence assertions below cannot pass vacuously.
+    let absent = ToolDescriptor {
+        name: "plain".into(),
+        label: "Plain".into(),
+        description: String::new(),
+        parameters: json!({ "type": "object", "properties": {} }),
+        execution_mode: None,
+        prompt_snippet: None,
+        prompt_guidelines: Vec::new(),
+        has_renderer: false,
+        prepare_arguments: false,
+        render_shell: None,
+        constrained_sampling: None,
+    };
+    assert!(serde_json::to_value(&absent).unwrap().get("constrainedSampling").is_none());
+
+    // pi's grammar config: `{"type":"grammar","variants":{"openai_lark":"…"}}`.
+    let grammar = ToolDescriptor {
+        constrained_sampling: Some(ConstrainedSampling::Config(
+            ConstrainedSamplingConfig::Grammar {
+                variants: GrammarVariants {
+                    openai_lark: Some("start: /[a-z]+/".into()),
+                    openai_regex: None,
+                },
+            },
+        )),
+        ..absent.clone()
+    };
+    let wire = serde_json::to_value(&grammar).unwrap();
+    assert_eq!(
+        wire.get("constrainedSampling"),
+        Some(&json!({"type": "grammar", "variants": {"openai_lark": "start: /[a-z]+/"}}))
+    );
+    let back: ToolDescriptor = serde_json::from_value(wire).unwrap();
+    assert!(matches!(
+        back.constrained_sampling.as_ref().and_then(|c| c.config()),
+        Some(ConstrainedSamplingConfig::Grammar { .. })
+    ));
+
+    // pi's `false` is the bare literal, NOT an object, and resolves to "no config".
+    let disabled = ToolDescriptor {
+        constrained_sampling: Some(ConstrainedSampling::Disabled(false)),
+        ..absent.clone()
+    };
+    let wire = serde_json::to_value(&disabled).unwrap();
+    assert_eq!(wire.get("constrainedSampling"), Some(&json!(false)));
+    let back: ToolDescriptor = serde_json::from_value(wire).unwrap();
+    assert!(back.constrained_sampling.as_ref().unwrap().config().is_none());
+
+    // And the strict-JSON-schema arm keeps pi's snake_case tag + lowercase strictness.
+    let strict = ToolDescriptor {
+        constrained_sampling: Some(ConstrainedSampling::Config(
+            ConstrainedSamplingConfig::JsonSchema { strict: StrictSampling::Require },
+        )),
+        ..absent
+    };
+    assert_eq!(
+        serde_json::to_value(&strict).unwrap().get("constrainedSampling"),
+        Some(&json!({"type": "json_schema", "strict": "require"}))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -855,4 +931,92 @@ fn a_configured_path_that_resolves_to_nothing_produces_exactly_one_diagnostic_na
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert!(diags[0].error.contains("neither"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// DRIFT-004 / SEAM-015 — `UserBashEventResult.operations` survives the reduction.
+// ---------------------------------------------------------------------------
+
+/// A `user_bash` handler that returns BOTH halves of pi's `UserBashEventResult`
+/// (`extensions/types.ts:1076-1082` @v0.83.0): an `operations` backend override AND a `result`.
+/// Upstream's two fields are independent — `rpc-mode.ts:566-579` short-circuits on `result` and
+/// otherwise threads `operations` into `executeBash` — so a reduction that carried only one of them
+/// would silently drop the other.
+struct BashRedirect {
+    id: ExtensionId,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for BashRedirect {
+    fn id(&self) -> ExtensionId {
+        self.id.clone()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::UserBash]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        match ev {
+            HostEvent::UserBash { command, exclude_from_context, cwd } => {
+                self.seen.lock().unwrap().push(format!("{command}:{exclude_from_context}:{cwd}"));
+                HookOutcome::Handled(crate::HandledValue(json!({
+                    "operations": { "backend": "ssh", "remote": "build-box" },
+                    "result": { "output": "Linux build-box\n", "exitCode": 0 },
+                })))
+            }
+            _ => HookOutcome::Noop,
+        }
+    }
+}
+
+/// The `operations` half of `UserBashEventResult` is NOT lost at the `cyrup-ext` boundary.
+///
+/// This test exists to pin WHERE the DRIFT-004 / SEAM-015 omission actually lives, because the item
+/// was filed against `crates/cyrup-modes/src/rpc.rs` and that is the wrong site twice over:
+///
+///  1. `rpc.rs`'s literal `None` is the `on_chunk` argument — the port of pi's own `undefined`
+///     second argument to `session.executeBash(command.command, undefined, {…})`
+///     (`rpc-mode.ts:573` @v0.83.0). Nothing is dropped there.
+///  2. `cyrup-ext` carries a `handled` payload through `decode_outcome`
+///     (`host/live.rs`: `HookOutcome::Handled(s)` -> `serde_json::from_str` VERBATIM, with no
+///     per-event key filter — `decode_patch`'s per-kind shaping applies to `mutate` only) and out of
+///     [`ExtensionHost::emit_user_bash`] as the whole `UserBashReduction::Handled(Value)`.
+///
+/// So the drop is downstream of both, in `cyrup-session-svc`: `emit_user_bash_event`
+/// (`session.rs`) reads only the `"result"` key off this value, and `BashOptions` (`bash.rs`) has no
+/// `operations` field for it to land in. The assertion below fails the moment anyone "fixes" the
+/// omission by filtering `operations` out here instead.
+///
+/// Presence before absence: the `result` half is asserted first, so a reduction that dropped the
+/// whole payload could not pass by vacuously satisfying the `operations` check.
+#[tokio::test]
+async fn user_bash_reduction_carries_the_operations_half_not_only_the_result_half() {
+    let host = ExtensionHost::new(cfg());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    host.load_native(Arc::new(BashRedirect { id: "bash-redirect".into(), seen: seen.clone() }))
+        .await
+        .unwrap();
+
+    let cancel = CancelToken::new();
+    let reduced = host.emit_user_bash("uname -a", &cancel).await;
+
+    assert_eq!(seen.lock().unwrap().len(), 1, "the handler must have been reached");
+
+    let v = match reduced {
+        crate::UserBashReduction::Handled(v) => v,
+        other => panic!("wrong arm: {other:?}"),
+    };
+    // Presence: the half cyrup already consumes.
+    assert_eq!(v["result"]["output"], json!("Linux build-box\n"));
+    assert_eq!(v["result"]["exitCode"], json!(0));
+    // The half under test: pi `UserBashEventResult.operations` (`extensions/types.ts:1078-1080`).
+    assert_eq!(
+        v["operations"],
+        json!({ "backend": "ssh", "remote": "build-box" }),
+        "the `operations` override must reach the caller intact; the seam that can act on it is \
+         `cyrup_tools::ops::BashOperations`, and the guest-side round-trip that would let a WASM \
+         extension supply one is the open half of DRIFT-004 (see the CYRUP-DELTA register in \
+         `crates/cyrup-ext/src/lib.rs`)"
+    );
 }

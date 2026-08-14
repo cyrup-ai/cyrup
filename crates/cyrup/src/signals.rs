@@ -21,52 +21,59 @@
 //! must not race a `process::exit` from this task), and every non-interactive host disposes and
 //! exits from the handler itself with pi's code. SIGINT is cyrup-only — see [`ShutdownSignal`].
 //!
-//! # CYRUP-DELTA — `killTrackedDetachedChildren` (SEAM-S03, UNPORTED)
+//! # `killTrackedDetachedChildren` — SEAM-S03, PORTED
 //!
 //! All three pi handlers open with `killTrackedDetachedChildren()` as their FIRST statement, before
 //! any dispose/shutdown: `modes/print-mode.ts:55`, `modes/rpc/rpc-mode.ts:373`,
-//! `modes/interactive/interactive-mode.ts:3663` @v0.83.0 (interactive's two emergency paths call it
-//! too — `emergencyTerminalExit` at `:3605`, the `uncaughtException` handler at `:3631`). It drains
-//! a process-global registry — `const trackedDetachedChildPids = new Set<number>()`,
-//! `utils/shell.ts:180`, with `trackDetachedChildPid`/`untrackDetachedChildPid`/
-//! `killTrackedDetachedChildren` at `:182-195` — and `killProcessTree`s every pid in it
-//! (`shell.ts:200-225`: on unix a `process.kill(-pid, "SIGKILL")`, i.e. the whole process GROUP,
-//! falling back to the bare pid). The registry is filled by the bash tool at spawn
-//! (`core/tools/bash.ts:108`, `if (child.pid) trackDetachedChildPid(child.pid);`, right beside its
-//! `detached: process.platform !== "win32"`) and drained in that spawn's `finally`
-//! (`bash.ts:142`) — so at signal time it holds exactly the bash children still running.
+//! `modes/interactive/interactive-mode.ts:3663` @v0.83.0. It drains a process-global registry —
+//! `const trackedDetachedChildPids = new Set<number>()`, `utils/shell.ts:180`, with
+//! `trackDetachedChildPid`/`untrackDetachedChildPid`/`killTrackedDetachedChildren` at `:182-195` —
+//! and `killProcessTree`s every pid in it (`shell.ts:200-225`: on unix a
+//! `process.kill(-pid, "SIGKILL")`, i.e. the whole process GROUP, falling back to the bare pid). The
+//! registry is filled by the bash tool at spawn (`core/tools/bash.ts:108`,
+//! `if (child.pid) trackDetachedChildPid(child.pid);`, right beside its
+//! `detached: process.platform !== "win32"`) and drained in that spawn's `finally` (`bash.ts:142`) —
+//! so at signal time it holds exactly the bash children still running.
 //!
-//! **cyrup has no such registry, so the sequence below starts at pi's SECOND statement.** What
-//! cyrup has instead is an indirect and LATE route to the same kill, and the difference is worth
-//! stating exactly rather than as "orphans survive": `LocalProc::exec` `setsid`s its shell into its
-//! own process group (`crates/cyrup-tools/src/ops/local.rs:267-279`) and `killpg(SIGKILL)`s that
-//! group from a `cancel.cancelled()` select arm (`send_sigkill_tree`, `:327-337`, armed at
-//! `:506-509`), where `cancel` is `self.session_cancel.child_token()`. `runtime.dispose()` below
-//! ends in `session_cancel.cancel()` (`cyrup-session-svc/src/session.rs:2486`, inside
-//! `dispose_with`). So on any path that actually reaches a dispose, an IN-FLIGHT detached bash group
-//! is still killed — but *after* the whole teardown (`session_shutdown` fanout, extension dispatch,
-//! the invalidate hook) rather than as its first synchronous act.
+//! cyrup mirrors that end to end. The registry is `TRACKED_DETACHED_CHILD_PIDS` in
+//! `crates/cyrup-tools/src/ops/local.rs`, sitting beside the `setsid` and `killpg` primitives it
+//! needs; `LocalProc::exec` enrolls its shell at spawn and — this is the
+//! JS→Rust half — unenrolls it from `KillTreeOnDrop::drop`, not from a statement after the
+//! `select!` loop, because an abandoned future never reaches that statement and would leak the pid
+//! for the life of the process. [`kill_tracked_detached_children`] is called below as the first act
+//! of the handler, before the abort/dispose sequence, and again as the first act of the repeat
+//! watcher.
 //!
-//! Two things do not survive that translation, and they are what **SEAM-S03** ("No detached-child
-//! registry: `setsid`-detached bash children survive teardown", medium, not-ported) still covers:
-//! the SECOND-delivery hard exit below runs no dispose and no destructors, so a group live at that
-//! moment is orphaned — pi's repeat path hard-exits too, but only *after* its first delivery already
-//! SIGKILLed the group synchronously; and cyrup's route is scoped to the CURRENT session's
-//! `session_cancel`, where pi's `Set<number>` is process-global and survives session replacement.
+//! **Why the repeat watcher needs its own call, when pi's repeat path has none.** pi's second
+//! delivery is a bare `process.exit(exitCode)` behind the `shuttingDown` guard (`rpc-mode.ts:723`),
+//! and that is safe upstream precisely because its FIRST delivery already SIGKILLed every tracked
+//! group synchronously. cyrup's repeat is a hard `process::exit` on the interactive host too, where
+//! pi's is inert (`if (this.isShuttingDown) return`, `interactive-mode.ts:3560`) — the CYRUP-DELTA
+//! [`spawn_abort_on_signal`] already documents. Since the interactive run loop keeps executing after
+//! the first delivery, a bash child spawned in that window would be orphaned by cyrup's escalation
+//! and not by pi's. Draining again closes a hole cyrup's own delta opened rather than adding
+//! behaviour pi lacks.
 //!
-//! It is not closed from this file, and that is a boundary fact rather than a preference: pi's two
-//! tracking call sites are the spawn and its `finally` INSIDE the bash tool, which in cyrup is
-//! `cyrup-tools` — a crate `cyrup` depends on, not the reverse — so a registry living in this bin
-//! crate could never be written to. Closing SEAM-S03 means adding the pid set plus track/untrack to
-//! `cyrup-tools` around `LocalProc::exec`'s spawn/completion, exposing a
-//! `kill_tracked_detached_children()` drain over the existing `killpg` primitive, and calling it as
-//! the first statement of [`spawn_abort_on_signal`]'s handler body — and, for pi's repeat-path
-//! parity, of the repeat watcher's too.
+//! What this replaces is worth recording, because it is still the fallback on every non-signal path:
+//! `LocalProc::exec` `setsid`s its shell into its own process group and `killpg(SIGKILL)`s that
+//! group from a `cancel.cancelled()` select arm, where `cancel` is
+//! `self.session_cancel.child_token()`, and `runtime.dispose()` ends in `session_cancel.cancel()`
+//! (`cyrup-session-svc/src/session.rs`, inside `dispose_with`). That route is LATE (after the whole
+//! `session_shutdown` fanout) and scoped to the CURRENT session, where the registry is drained first
+//! and is process-global — so it also covers groups left by a session that `/new`, `/fork`,
+//! `switchSession` or `reload` has already replaced.
+//!
+//! RESIDUAL — pi's interactive host also drains from two EMERGENCY paths: `emergencyTerminalExit`
+//! (`interactive-mode.ts:3605`) and its `process.on("uncaughtException")` handler (`:3631`). cyrup
+//! has no analog of either site — no panic hook and no emergency terminal-restore path exists in
+//! this crate at all — so there is nothing to add the call to from here. Those are a `cyrup-tui` /
+//! `main.rs` concern; the drain they would need is now exported and ready.
 
 use std::sync::Arc;
 
 use cyrup_sdk::core::CancelToken;
 use cyrup_session_svc::{AgentSessionRuntime, AppMode};
+use cyrup_tools::kill_tracked_detached_children;
 
 /// Which shutdown signal was delivered, so a REPEAT delivery can exit with the conventional code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,22 +194,30 @@ pub fn spawn_abort_on_signal(
     tokio::spawn(async move {
         let first = wait_for_signal().await;
 
+        // SEAM-S03 — pi's handler body opens with `killTrackedDetachedChildren()` (print-mode.ts:55,
+        // rpc-mode.ts:373, interactive-mode.ts:3663 @v0.83.0), so this is genuinely first: before
+        // the repeat watcher, before the abort, before the dispose. It is synchronous and takes no
+        // lock across the `killpg` loop, so unlike everything below it there is no `.await` at which
+        // this task could be dropped without it having run. Placing it ahead of the `tokio::spawn`
+        // costs a `killpg` per live bash group in the window where a second signal has no stream
+        // listening — a window that exists at HEAD regardless (each `wait_for_signal` builds fresh
+        // streams) and that tokio's already-installed process-wide handler keeps from being fatal.
+        kill_tracked_detached_children();
+
         // Arm the repeat watcher BEFORE the (awaiting) teardown below, so a second signal lands
         // while the first is still disposing — pi's handler is re-entrant for the same reason.
         let repeat = tokio::spawn(async move {
+            // Drain again: pi's repeat path is a bare `process.exit` (rpc-mode.ts:723) and can
+            // afford to be, because its first delivery already SIGKILLed every tracked group AND
+            // its interactive repeat is inert. cyrup's repeat hard-exits on the interactive host
+            // too (the CYRUP-DELTA below), where the run loop keeps executing after the first
+            // delivery — so a bash child spawned in that window would be orphaned by cyrup's
+            // escalation and by nothing upstream. This closes a hole cyrup's own delta opened.
             let again = wait_for_signal().await;
+            kill_tracked_detached_children();
             std::process::exit(again.exit_code());
         });
 
-        // CYRUP-DELTA — pi's handler body opens with `killTrackedDetachedChildren()`
-        // (print-mode.ts:55, rpc-mode.ts:373, interactive-mode.ts:3663 @v0.83.0) and cyrup has no
-        // detached-child registry to drain, so this sequence starts at pi's SECOND statement. The
-        // `runtime.dispose()` below reaches in-flight detached groups indirectly and late (its
-        // `session_cancel.cancel()` fires the child token `LocalProc::exec` killpgs on); the
-        // repeat watcher armed just above does not. UNPORTED, tracked as SEAM-S03 — the module doc
-        // gives the exact residual and why the fix cannot land in this crate (the track/untrack
-        // call sites are inside `cyrup-tools`' bash spawn, which `cyrup` depends on).
-        //
         // SEAM-059 (which this function's rewrite was told to land with): dereference the CURRENT
         // session, never the startup `Arc`. pi's handlers reach the agent through the runtime host
         // (`runtimeHost.dispose()`, print-mode.ts:57 / rpc-mode.ts:733), so a `/new`, `/fork`,

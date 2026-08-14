@@ -16,9 +16,15 @@
 //! **single-pid** signal — the SAME single-pid mechanism `cyrup-ext`'s `proc.rs::kill` already uses
 //! for the unrelated long-lived `proc` capability ([`terminate_pid`]/[`kill_pid`], reused directly
 //! here) — NOT a process-group kill. The only `unsafe` in the crate lives here, isolated to the
-//! unix process-group calls (`setsid`/`killpg`, [`build_command`]/[`send_sigkill_tree`], used ONLY
-//! by [`LocalProc::exec`]) and the single-pid `kill(2)` calls ([`terminate_pid`]/[`kill_pid`]) with
-//! safety comments.
+//! unix process-group calls (`setsid`/`killpg`, [`build_command`]/[`send_sigkill_tree`]/
+//! [`kill_process_tree`], used ONLY by [`LocalProc::exec`] and its shutdown drain) and the
+//! single-pid `kill(2)` calls ([`terminate_pid`]/[`kill_pid`]) with safety comments.
+//!
+//! [`LocalProc::exec`] additionally enrolls each spawned shell in the process-global
+//! `TRACKED_DETACHED_CHILD_PIDS` registry, so a shutdown signal can `killpg` every detached bash
+//! child still running BEFORE any teardown runs — Pi's `trackedDetachedChildPids` /
+//! `killTrackedDetachedChildren` (`utils/shell.ts:180-195` @v0.83.0), drained as the first statement
+//! of all three of its signal handlers. See [`kill_tracked_detached_children`] (SEAM-S03).
 
 use super::{
     Access, ArgvOutput, ArgvSpec, DirEntry, ExecSpec, ExitStatus, FsOps, Meta, ProcOps, ShellConfig,
@@ -341,6 +347,123 @@ fn build_argv_command(spec: &ArgvSpec) -> std::process::Command {
     std_cmd
 }
 
+/// Process-global registry of the detached bash children that are currently running — a literal
+/// port of Pi's `const trackedDetachedChildPids = new Set<number>()`
+/// (`packages/coding-agent/src/utils/shell.ts:180` @v0.83.0), whose own comment states the purpose:
+/// "Detached child processes must be tracked so they can be killed on parent shutdown signals
+/// (SIGHUP/SIGTERM)."
+///
+/// Filled at [`LocalProc::exec`]'s spawn and emptied when that exec finishes, mirroring Pi's two
+/// call sites — `if (child.pid) trackDetachedChildPid(child.pid);` right after the
+/// `detached: process.platform !== "win32"` spawn (`core/tools/bash.ts:108`) and
+/// `if (child.pid) untrackDetachedChildPid(child.pid);` as the FIRST statement of that spawn's
+/// `finally` (`bash.ts:142`). [`LocalProc::exec_argv`] deliberately does NOT participate: its real
+/// consumer `execCommand` (`exec.ts:41-45`) passes no `detached` and Pi never tracks it.
+///
+/// Process-global on purpose, exactly as Pi's module-level `Set` is: it must survive session
+/// replacement (`/new`, `/fork`, `switchSession`), which the per-session `session_cancel` route
+/// [`send_sigkill_tree`] hangs off does not — that scoping difference is half of what SEAM-S03
+/// records.
+static TRACKED_DETACHED_CHILD_PIDS: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Lock the registry, ignoring poisoning.
+///
+/// A panic while the set is held cannot corrupt it (a `BTreeSet<u32>` has no invariant a partial
+/// mutation can break) and this runs on the shutdown path, where refusing to kill orphans because
+/// some unrelated task panicked is strictly worse than proceeding. Pi has no lock at all — JS is
+/// single-threaded — so there is no upstream behaviour to mirror here, only a Rust obligation.
+fn tracked_detached_child_pids()
+-> std::sync::MutexGuard<'static, std::collections::BTreeSet<u32>> {
+    TRACKED_DETACHED_CHILD_PIDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Pi `trackDetachedChildPid` (`utils/shell.ts:182-184` @v0.83.0), called at the bash spawn
+/// (`bash.ts:108`).
+pub fn track_detached_child_pid(pid: u32) {
+    tracked_detached_child_pids().insert(pid);
+}
+
+/// Pi `untrackDetachedChildPid` (`utils/shell.ts:186-188` @v0.83.0), called from the bash spawn's
+/// `finally` (`bash.ts:142`).
+pub fn untrack_detached_child_pid(pid: u32) {
+    tracked_detached_child_pids().remove(&pid);
+}
+
+/// Kill every still-running detached bash child and empty the registry — Pi
+/// `killTrackedDetachedChildren` (`utils/shell.ts:190-195` @v0.83.0).
+///
+/// This is the FIRST statement of all three of Pi's signal handlers (`modes/print-mode.ts:55`,
+/// `modes/rpc/rpc-mode.ts:373`, `modes/interactive/interactive-mode.ts:3663`) and of interactive's
+/// two emergency paths (`emergencyTerminalExit` at `:3605`, the `uncaughtException` handler at
+/// `:3631`), all @v0.83.0. It is synchronous and total: by the time anything can re-enter the
+/// handler, the groups are already signalled.
+///
+/// CYRUP-DELTA — order of drain vs. kill. Pi loops the live `Set` and clears it AFTERWARDS
+/// (`for (const pid of trackedDetachedChildPids) killProcessTree(pid); trackedDetachedChildPids
+/// .clear();`, `shell.ts:191-194`). This takes the set out of the lock FIRST and kills without
+/// holding it. Two Rust-only obligations force that: another thread's [`KillTreeOnDrop`] may be
+/// blocked on `untrack_detached_child_pid` while this runs, so holding the lock across a
+/// syscall-per-pid loop makes that thread wait on a shutdown path; and a re-entrant call would
+/// deadlock a `std::sync::Mutex` where Pi's re-entered handler is merely a nested call over a
+/// single-threaded `Set`. The observable result is identical — every pid present at entry is
+/// killed, and none of them is present at exit.
+pub fn kill_tracked_detached_children() {
+    drain_and_kill(&TRACKED_DETACHED_CHILD_PIDS);
+}
+
+/// The body of [`kill_tracked_detached_children`], parameterised over the registry.
+///
+/// Split out ONLY so the drain can be tested against a registry the test owns. Calling the real
+/// drain from a test would kill every detached child tracked by whatever else is running in the
+/// same process — harmless under the nextest gate (one process per test), a cross-test SIGKILL
+/// under a threaded `cargo test`, and this project's rule is not to introduce a flake.
+fn drain_and_kill(registry: &std::sync::Mutex<std::collections::BTreeSet<u32>>) {
+    let mut guard = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let pids = std::mem::take(&mut *guard);
+    drop(guard);
+    for pid in pids {
+        kill_process_tree(pid);
+    }
+}
+
+/// Pi `killProcessTree` (`utils/shell.ts:200-225` @v0.83.0) addressed by PID ALONE, for the
+/// [`kill_tracked_detached_children`] drain — which, unlike [`send_sigkill_tree`], holds no
+/// `tokio::process::Child` for the pids it is killing.
+///
+/// Ports Pi's fallback, which [`send_sigkill_tree`] expresses differently: upstream tries
+/// `process.kill(-pid, "SIGKILL")` and, if that THROWS, falls back to `process.kill(pid,
+/// "SIGKILL")` (`shell.ts:214-224`) — a group kill can fail with `ESRCH` when the pid is not a
+/// group leader, i.e. when the `setsid` never took effect. `send_sigkill_tree` reaches the same
+/// place via its unconditional `child.start_kill()`; here there is no `Child`, so the fallback is
+/// spelled out.
+#[allow(unsafe_code)]
+pub fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `killpg(2)` and `kill(2)` read two integer arguments and touch no memory. A
+        // failure (`ESRCH` — group or process already gone) is the expected benign outcome.
+        let killed_group = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) } == 0;
+        if !killed_group {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Pi's win32 arm is a fire-and-forget `spawn("taskkill", ["/F","/T","/PID", …], {stdio:
+        // "ignore", detached: true, windowsHide: true})` (`shell.ts:203-212`) — NOT a blocking
+        // wait, which matters because this runs inside a signal handler.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 /// Force-kill [`LocalProc::exec`]'s (the `bash`-tool/shell path's) child's whole process tree —
 /// Pi's real `killProcessTree` (`shell.ts:200-225`: `process.kill(-pid, "SIGKILL")`), the ONLY step
 /// of that escalation (no `SIGTERM`, no grace period, ever — see the module doc comment) —
@@ -368,6 +491,115 @@ fn send_sigkill_tree(child: &mut tokio::process::Child) {
         }
     }
     let _ = child.start_kill();
+}
+
+/// RAII group-kill for [`LocalProc::exec`], armed at spawn and disarmed only once the child has
+/// been reaped on the normal path.
+///
+/// **This closes a JS→Rust mechanism gap, not a missing feature.** Pi's abort and timeout handlers
+/// hang off an `async` function that ALWAYS settles: `bash.ts:111-121` registers `onAbort` →
+/// `killProcessTree` (`shell.ts:200-225`, `process.kill(-pid, "SIGKILL")`) and the same handler runs
+/// on the timeout leg, so upstream cannot reach a state where the shell's process GROUP outlives the
+/// call. A Rust future has no such guarantee — it can be dropped at ANY `.await`: a cancelled
+/// `tokio::spawn`, a `tokio::time::timeout`, an unwinding panic, or runtime teardown all abandon the
+/// `select!` loop below without running a single one of its `send_sigkill_tree` arms.
+///
+/// `tokio::process`'s own `kill_on_drop(true)` is NOT a substitute and must not be mistaken for one:
+/// it SIGKILLs the SINGLE direct child, so every grandchild the `setsid` group contains survives as
+/// an orphan still holding this process's stdio pipes. That survival is already on the record as an
+/// unfixed consequence in `docs/gap-analysis/12-upstream-drift-pi-core.md` (the `DRIFT-043`
+/// rejection note: "grandchildren do survive — single-pid kill, not killpg"); this type is what
+/// makes the drop path do what every non-drop path already does.
+///
+/// The pid cannot be recycled underneath the `killpg`: the guard is disarmed only AFTER the loop has
+/// observed `child.wait()`, and until then [`LocalProc::exec`] still owns the un-reaped `Child`, so
+/// the pid — and therefore the process-group id, which `setsid` made equal to it — remains ours.
+/// Declared AFTER `child` in `exec` so Rust's reverse-declaration drop order runs this guard while
+/// that ownership still holds.
+/// It also owns the registry membership from [`TRACKED_DETACHED_CHILD_PIDS`], and that half is
+/// deliberately NOT affected by [`Self::disarm`]. Pi untracks in a `finally` (`bash.ts:142`), which
+/// runs on the normal return, the abort throw and the timeout throw alike; the Rust equivalent of
+/// "runs no matter how we leave" is `Drop`, not a statement placed after the `select!` loop. Putting
+/// the untrack on the success path instead would leak the pid PERMANENTLY whenever the future is
+/// dropped mid-flight — the same class of gap this guard's `killpg` half already closes — and a
+/// leaked pid is worse than a merely-forgotten one: the next
+/// [`kill_tracked_detached_children`] would `killpg` a pid this process no longer owns and that the
+/// kernel may since have recycled onto an unrelated process group.
+#[cfg(unix)]
+struct KillTreeOnDrop {
+    pgid: Option<u32>,
+    tracked: Option<u32>,
+}
+
+#[cfg(unix)]
+impl KillTreeOnDrop {
+    fn arm(pid: Option<u32>) -> Self {
+        // Pi `bash.ts:108`: `if (child.pid) trackDetachedChildPid(child.pid);` — the `if` is why
+        // this is keyed off the `Option` rather than a placeholder pid.
+        if let Some(pid) = pid {
+            track_detached_child_pid(pid);
+        }
+        Self { pgid: pid, tracked: pid }
+    }
+
+    /// The child has been reaped by the normal path; the group must NOT be signalled on drop.
+    ///
+    /// Registry membership is untouched here on purpose — see the type's doc comment. `Drop` still
+    /// runs immediately afterwards (the guard is a local in [`LocalProc::exec`]), so the untrack is
+    /// not deferred by disarming, only made unconditional.
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+impl Drop for KillTreeOnDrop {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            // SAFETY: identical to `send_sigkill_tree` — `killpg(2)` reads two integers and touches
+            // no memory. `ESRCH` (group already gone) is the expected benign outcome and is ignored.
+            unsafe {
+                libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        // Pi's `finally` (`bash.ts:142`), unconditional on how this exec ended.
+        if let Some(pid) = self.tracked {
+            untrack_detached_child_pid(pid);
+        }
+    }
+}
+
+/// Windows has no process-group primitive that matches `setsid`; [`build_command`] installs none
+/// there either, so the guard degrades to `kill_on_drop`'s single-pid behaviour — the same shape
+/// the non-unix arm of [`send_sigkill_tree`] already documents.
+///
+/// The registry half is NOT degraded: Pi tracks on every platform (`bash.ts:108` is outside any
+/// platform check, and its `killProcessTree` has a `taskkill /F /T` arm — `shell.ts:203-212` — that
+/// kills a tree without needing a process group).
+#[cfg(not(unix))]
+struct KillTreeOnDrop {
+    tracked: Option<u32>,
+}
+
+#[cfg(not(unix))]
+impl KillTreeOnDrop {
+    fn arm(pid: Option<u32>) -> Self {
+        if let Some(pid) = pid {
+            track_detached_child_pid(pid);
+        }
+        Self { tracked: pid }
+    }
+    fn disarm(&mut self) {}
+}
+
+#[cfg(not(unix))]
+impl Drop for KillTreeOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.tracked {
+            untrack_detached_child_pid(pid);
+        }
+    }
 }
 
 /// Send SIGTERM to a SINGLE process by pid — NOT a process group (contrast [`send_sigkill_tree`],
@@ -486,6 +718,10 @@ impl ProcOps for LocalProc {
         let mut child = cmd.spawn().map_err(|e| {
             error::io(&format!("spawn {}", error::show(&spec.shell.program)), &e)
         })?;
+        // Declared AFTER `child` on purpose: locals drop in reverse declaration order, so an
+        // abandoned future runs this `killpg` while `child` is still un-reaped and the pid is still
+        // ours. See [`KillTreeOnDrop`] for why `kill_on_drop` alone leaves the group behind.
+        let mut kill_guard = KillTreeOnDrop::arm(child.id());
 
         if let Some(command) = stdin_command
             && let Some(mut stdin) = child.stdin.take() {
@@ -592,6 +828,11 @@ impl ProcOps for LocalProc {
                 }
             }
         };
+        // Every break above is reached only after `child.wait()` has been observed (`exit_status`
+        // is `Some` on the EOF breaks, and `idle_armed` — the only gate on the idle-grace break —
+        // is set in the `child.wait()` arm itself), so the child is reaped here and the group must
+        // not be signalled again.
+        kill_guard.disarm();
         Ok(status)
     }
 
@@ -769,6 +1010,79 @@ mod tests {
             env_remove: Vec::new(),
             shell: ShellConfig::detect(),
         }
+    }
+
+    /// Liveness probe that does NOT perturb what it measures: `kill(pid, 0)` performs the
+    /// permission/existence check and delivers nothing. `terminate_pid` cannot be used here — its
+    /// `SIGTERM` would kill a `sleep` that the assertion needs to observe as still alive.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn pid_exists(pid: u32) -> bool {
+        // SAFETY: `kill(2)` with signal 0 reads its two integer arguments and touches no memory.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// THE JS→Rust mechanism gap [`KillTreeOnDrop`] closes: pi's abort/timeout handling hangs off an
+    /// `async` function that always settles (`bash.ts:111-121` → `killProcessTree`,
+    /// `shell.ts:200-225`), so the shell's process GROUP can never outlive the call. A Rust future
+    /// can be dropped at any `.await` — here by `tokio::time::timeout`, but equally by a cancelled
+    /// `tokio::spawn`, an unwinding panic, or runtime teardown — and every `send_sigkill_tree` arm
+    /// in `exec`'s `select!` is then simply never reached.
+    ///
+    /// RED before the guard: `kill_on_drop(true)` SIGKILLs the direct `setsid` shell ONLY, so the
+    /// backgrounded `sleep 30` in its process group survives the drop for its full 30s (recorded as
+    /// an unfixed consequence in `12-upstream-drift-pi-core.md`'s `DRIFT-043` rejection note —
+    /// "grandchildren do survive — single-pid kill, not killpg"). GREEN after: the group is
+    /// `killpg`'d on the drop path exactly as it is on every non-drop path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_exec_future_kills_the_whole_process_group_not_just_the_direct_child() {
+        let proc = LocalProc::new(ShellConfig::detect());
+        let marker = std::env::temp_dir()
+            .join(format!("cyrup-exec-dropguard-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // The shell backgrounds a descendant in its own (`setsid`) process group and then blocks, so
+        // the future is still mid-`select!` when the timeout below drops it.
+        let spec = exec_spec(&format!("sleep 30 & echo $! > {}; wait", marker.display()));
+
+        let elapsed = tokio::time::timeout(
+            Duration::from_millis(500),
+            proc.exec(spec, CancelToken::new(), None, &mut |_data: &[u8]| {}),
+        )
+        .await;
+        assert!(
+            elapsed.is_err(),
+            "fixture: the command must still be running when the timeout DROPS the future — \
+             otherwise this test observes a normal return, not the drop path"
+        );
+
+        let descendant: u32 = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .expect("fixture: the backgrounded descendant must have recorded its pid");
+        let _ = std::fs::remove_file(&marker);
+
+        // A `killpg`'d process is a zombie until its (now-dead) parent's reaper collects it, and
+        // `kill(pid, 0)` succeeds on a zombie, so poll rather than sampling once. A survivor would
+        // stay observable for the full 30s, so this bound discriminates by a wide margin.
+        let mut gone = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if !pid_exists(descendant) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Cleanup BEFORE the assertion so a failing run does not itself leak the `sleep 30` it is
+        // complaining about.
+        let _ = kill_pid(descendant);
+        assert!(
+            gone,
+            "dropping the `exec` future must `killpg` the whole `setsid` group — the backgrounded \
+             descendant (pid {descendant}) outlived the drop, which is `kill_on_drop`'s single-pid \
+             behaviour, not pi's `killProcessTree`"
+        );
     }
 
     /// `LocalProc::exec` (the `bash` tool / immediate-bash backend) must SIGKILL a SIGTERM-ignoring
@@ -1201,14 +1515,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exec_argv_does_not_hang_on_a_backgrounded_descendant_holding_the_pipe_open() {
         let proc = LocalProc::new(ShellConfig::detect());
+        // The descendant records its own pid so this fixture can REAP it. The pipe-holding shape it
+        // exists to prove is unchanged — `sleep` is still backgrounded out of a subshell that exits
+        // immediately, still inherits the exec stdout/stderr pipes, and is still alive for the whole
+        // of the assertion window below — but it no longer survives the test process by ~4.9s. A
+        // fixture that deliberately orphans a process is the exact "spawns and does not reap" shape
+        // the surrounding suite is being audited for, and under `cargo nextest run` a survivor with
+        // inherited handles is what turns into a `LEAK-FAIL`.
+        let marker = std::env::temp_dir()
+            .join(format!("cyrup-exec-argv-idlegrace-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!("( sleep 5 & echo $! > {} ) ; exit 0", marker.display());
         let started = tokio::time::Instant::now();
         let out = tokio::time::timeout(
             Duration::from_secs(3),
-            proc.exec_argv(
-                argv("sh", &["-c", "(sleep 5 &) ; exit 0"]),
-                CancelToken::new(),
-                None,
-            ),
+            proc.exec_argv(argv("sh", &["-c", &script]), CancelToken::new(), None),
         )
         .await
         .expect("exec_argv must not hang past the idle-grace fallback")
@@ -1220,6 +1541,231 @@ mod tests {
             "must finalize within EXIT_STDIO_GRACE of the parent's exit, not wait on the \
              backgrounded descendant's pipe, got {:?}",
             started.elapsed()
+        );
+
+        // `terminate_pid` doubles as the liveness PROOF and the cleanup: `Ok(true)` means the
+        // descendant was genuinely still alive at this point — i.e. `exec_argv` really did finalize
+        // while the pipe was still held open, which is the whole premise of the timing assertion
+        // above — and the same call is what stops it outliving this process.
+        let descendant = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .expect("the backgrounded descendant must have written its pid");
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            terminate_pid(descendant).unwrap_or(false),
+            "the backgrounded descendant must still be alive here — otherwise the idle-grace \
+             fallback was never the thing that let `exec_argv` return"
+        );
+    }
+
+    /// Is `pid` currently in the process-global detached-child registry?
+    #[cfg(unix)]
+    fn is_tracked(pid: u32) -> bool {
+        tracked_detached_child_pids().contains(&pid)
+    }
+
+    /// Poll until `pid` is gone, up to `deadline`. A `killpg`'d process is a zombie until reaped and
+    /// `kill(pid, 0)` succeeds on a zombie, so a single sample would be racy.
+    #[cfg(unix)]
+    async fn wait_gone(pid: u32, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if !pid_exists(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// SEAM-S03, the registry half: `LocalProc::exec` must enroll its `setsid` shell for the whole
+    /// time that shell is running and remove it when the exec ends — Pi's
+    /// `if (child.pid) trackDetachedChildPid(child.pid);` at the spawn (`core/tools/bash.ts:108`
+    /// @v0.83.0) and the matching `untrackDetachedChildPid` in that spawn's `finally` (`:142`).
+    ///
+    /// The membership is asserted PRESENT first, from inside the `on_data` callback while the child
+    /// is provably alive (it has just written its own `$$` and is now blocked in `sleep`). Without
+    /// that half the absence assertion afterwards would pass just as well against a registry that
+    /// was never written to at all.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_tracks_its_detached_shell_for_exactly_as_long_as_it_runs() {
+        let proc = LocalProc::new(ShellConfig::detect());
+        let cancel = CancelToken::new();
+        let mut child_pid: Option<u32> = None;
+        let mut tracked_while_running = false;
+        {
+            // `$$` in the spawned shell IS the direct child's pid — the same value
+            // `KillTreeOnDrop::arm` was handed — and `setsid` made it the group id too.
+            let stopper = cancel.clone();
+            let status = proc
+                .exec(
+                    exec_spec("echo $$; sleep 30"),
+                    cancel.clone(),
+                    None,
+                    &mut |data: &[u8]| {
+                        if child_pid.is_none()
+                            && let Ok(pid) = String::from_utf8_lossy(data).trim().parse::<u32>()
+                        {
+                            child_pid = Some(pid);
+                            tracked_while_running = is_tracked(pid);
+                            stopper.cancel();
+                        }
+                    },
+                )
+                .await
+                .expect("exec runs");
+            assert_eq!(
+                status,
+                ExitStatus::Killed,
+                "fixture: the callback cancels, so this must be the cancel path"
+            );
+        }
+
+        let pid = child_pid.expect("fixture: the shell must have reported its own pid");
+        assert!(
+            tracked_while_running,
+            "a running detached bash child must be in the registry Pi's signal handlers drain \
+             (pid {pid}) — otherwise `killTrackedDetachedChildren` has nothing to kill"
+        );
+        assert!(
+            !is_tracked(pid),
+            "the finished exec must have left the registry (Pi's `finally` untrack, bash.ts:142) — \
+             a retained pid {pid} is worse than a forgotten one, since the next drain would \
+             `killpg` a group this process no longer owns"
+        );
+    }
+
+    /// The JS→Rust guarantee gap on the UNTRACK side, and why it lives in `Drop`.
+    ///
+    /// Pi's untrack sits in a `finally` (`core/tools/bash.ts:142` @v0.83.0), so it runs on the
+    /// normal return, the `aborted` throw and the `timeout:` throw alike — an `async` function
+    /// always settles. A Rust future does not: dropping `exec` mid-`select!` (here via
+    /// `tokio::time::timeout`, equally a cancelled `tokio::spawn`, a panic, or runtime teardown)
+    /// skips everything written after the loop. An untrack placed on the success path would
+    /// therefore leak this pid for the life of the process, and the next
+    /// `kill_tracked_detached_children` would `killpg` a pid the kernel may have recycled onto an
+    /// unrelated group.
+    ///
+    /// RED if the untrack moves next to `kill_guard.disarm()`; GREEN with it in `Drop`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_exec_future_untracks_its_pid_instead_of_leaking_it() {
+        let proc = LocalProc::new(ShellConfig::detect());
+        let mut child_pid: Option<u32> = None;
+        let mut tracked_while_running = false;
+        {
+            let elapsed = tokio::time::timeout(
+                Duration::from_millis(500),
+                proc.exec(
+                    exec_spec("echo $$; sleep 30"),
+                    CancelToken::new(),
+                    None,
+                    &mut |data: &[u8]| {
+                        if child_pid.is_none()
+                            && let Ok(pid) = String::from_utf8_lossy(data).trim().parse::<u32>()
+                        {
+                            child_pid = Some(pid);
+                            tracked_while_running = is_tracked(pid);
+                        }
+                    },
+                ),
+            )
+            .await;
+            assert!(
+                elapsed.is_err(),
+                "fixture: the command must still be running when the timeout DROPS the future — \
+                 otherwise this observes a normal return, not the drop path"
+            );
+        }
+
+        let pid = child_pid.expect("fixture: the shell must have reported its own pid");
+        assert!(
+            tracked_while_running,
+            "fixture: the pid must have been in the registry before the drop, or the absence \
+             assertion below is vacuous"
+        );
+        assert!(
+            !is_tracked(pid),
+            "an ABANDONED exec must still untrack pid {pid} — the untrack is Pi's `finally` \
+             (bash.ts:142) and its only faithful Rust home is `Drop`, not a statement after the \
+             `select!` loop that a dropped future never reaches"
+        );
+    }
+
+    /// SEAM-S03, the drain half: `killTrackedDetachedChildren` (`utils/shell.ts:190-195` @v0.83.0)
+    /// must `killProcessTree` every registered pid — on unix `process.kill(-pid, "SIGKILL")`
+    /// (`:214`), the whole process GROUP, not just the leader — and empty the registry afterwards
+    /// (`:194`).
+    ///
+    /// The discriminating assertion is the GRANDCHILD: a single-pid kill would leave the
+    /// backgrounded `sleep 30` running for its full 30s, which is exactly the orphan SEAM-S03 is
+    /// about. Its liveness is asserted BEFORE the drain so a fixture that never started cannot pass
+    /// this vacuously.
+    ///
+    /// Runs against a registry this test owns rather than the process-global one — see
+    /// [`drain_and_kill`] for why.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_drain_sigkills_each_registered_group_and_empties_the_registry() {
+        let marker =
+            std::env::temp_dir().join(format!("cyrup-drain-{}-{}.pid", std::process::id(), 1));
+        let _ = std::fs::remove_file(&marker);
+        // Same fixture shape as the drop-guard test: a `setsid` leader that backgrounds a
+        // descendant into its own group and then blocks.
+        let spec = exec_spec(&format!("sleep 30 & echo $! > {}; wait", marker.display()));
+        let mut cmd = tokio::process::Command::from(build_command(&spec));
+        cmd.kill_on_drop(true);
+        let mut leader_child = cmd.spawn().expect("fixture: the shell must spawn");
+        let leader = leader_child.id().expect("fixture: the shell must have a pid");
+        // `build_command` only appends the command to argv under `Transport::Argv`; the WSL-legacy
+        // `bash -s` config `try_detect` can return instead expects it on stdin (`shell.rs:52`), and
+        // without this the shell would block on an open pipe and never start the fixture.
+        if spec.shell.transport == Transport::Stdin
+            && let Some(mut stdin) = leader_child.stdin.take()
+        {
+            let _ = stdin.write_all(spec.command.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        }
+
+        let mut descendant = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(pid) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                descendant = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_file(&marker);
+        let descendant = descendant.expect("fixture: the descendant must have recorded its pid");
+        assert!(
+            pid_exists(descendant),
+            "fixture: the backgrounded descendant (pid {descendant}) must be alive before the \
+             drain, or its absence afterwards proves nothing"
+        );
+
+        let registry = std::sync::Mutex::new(std::collections::BTreeSet::from([leader]));
+        drain_and_kill(&registry);
+
+        assert!(
+            registry.lock().map(|set| set.is_empty()).unwrap_or(false),
+            "the drain must empty the registry (Pi's `trackedDetachedChildPids.clear()`, \
+             shell.ts:194), so a second delivery does not re-signal recycled pids"
+        );
+        let group_died = wait_gone(descendant, Duration::from_secs(3)).await;
+        // Clean up before asserting, so a failing run does not itself leak the `sleep 30`.
+        let _ = kill_pid(descendant);
+        let _ = leader_child.start_kill();
+        assert!(
+            group_died,
+            "the drain must `killpg` the whole group: the backgrounded descendant (pid \
+             {descendant}) outlived it, which is a single-pid kill of the leader ({leader}), not \
+             Pi's `killProcessTree`"
         );
     }
 }

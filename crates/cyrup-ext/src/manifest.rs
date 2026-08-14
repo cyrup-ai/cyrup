@@ -15,7 +15,7 @@ pub const MANIFEST_FILE: &str = "extension.json";
 pub struct ExtensionManifest {
     pub id: String,
     pub version: String,
-    /// WIT world compatibility, e.g. `cyrup:ext@0.6` (see [`HOST_WORLD`]).
+    /// WIT world compatibility, e.g. `cyrup:ext@0.7` (see [`HOST_WORLD`]).
     pub world: String,
     /// Source entry for a Tier-1 build; absent for a prebuilt `.wasm` package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,7 +177,14 @@ impl Capabilities {
 ///   `transform-markdown` (EXT-019; pi `MarkdownTransformer`, `extensions/types.ts:1153`
 ///   @v0.84.1), which would have required the bump on its own, plus its declaring import
 ///   `registration.register-markdown-transformer` (`:1292`).
-pub const HOST_WORLD: &str = "cyrup:ext@0.6";
+/// - 0.6 → 0.7: IMPORT RE-SIGNING — `types.tool-descriptor` gained `constrained-sampling`, which
+///   re-signs `registration.register-tool` (PROV-011 / EXT-024; pi
+///   `ToolDefinition.constrainedSampling?: false | ConstrainedSamplingConfig`,
+///   `extensions/types.ts:463` @v0.83.0, copied onto the runtime tool at
+///   `core/tools/tool-definition-wrapper.ts:14`). A 0.6 guest calls `register-tool` with the
+///   nine-field record the 0.7 host no longer accepts, so it fails to LINK — the same failure
+///   mode as a stale export, hence the bump.
+pub const HOST_WORLD: &str = "cyrup:ext@0.7";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

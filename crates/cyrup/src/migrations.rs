@@ -1,13 +1,18 @@
 //! One-time startup migrations (Pi `migrations.ts`). A faithful port of `runMigrations(cwd)`
 //! (migrations.ts:296-315): migrate legacy `oauth.json`/`settings.json` API keys into `auth.json`,
 //! move stray `*.jsonl` sessions out of the agent root into their per-cwd session dir, move managed
-//! `fd`/`rg` binaries from `tools/` to `bin/`, migrate a `commands/` resource dir to `prompts/`, and
+//! `fd`/`rg` binaries from `tools/` to `bin/`, rename legacy keybinding ids in
+//! `<agent_dir>/keybindings.json`, migrate a `commands/` resource dir to `prompts/`, and
 //! collect deprecation warnings for legacy `hooks/`/`tools/` dirs (surfaced in interactive mode by
 //! [`format_deprecation_warnings`], Pi `showDeprecationWarnings`, migrations.ts:265-289).
 //!
 //! Each step is best-effort and never fatal — a malformed/locked file is skipped exactly as Pi's
-//! `try { … } catch {}` arms do. The keybindings-config migration is intentionally NOT ported here:
-//! cyrup's keybindings store (`cyrup-tui`) has no legacy on-disk shape to migrate from.
+//! `try { … } catch {}` arms do. The keybindings step is Pi's `migrateKeybindingsConfigFile()`
+//! (migrations.ts:157-174, called at `:312`); its mechanism lives in
+//! [`cyrup_config::migrate_keybindings_config_file`] rather than in this file because Pi applies the
+//! same rename table a SECOND time on every read (`core/keybindings.ts:366`), and cyrup's read-time
+//! consumer (`cyrup-tui`'s `keymap.rs`) shares no ancestor with this binary other than
+//! `cyrup-config` — the same argument that puts `migrate_settings` there.
 
 use std::path::Path;
 
@@ -28,6 +33,9 @@ pub fn run_migrations(dirs: &ConfigDirs) -> MigrationResult {
     let migrated_auth_providers = migrate_auth_to_auth_json(&dirs.agent_dir);
     migrate_sessions_from_agent_root(&dirs.agent_dir);
     migrate_tools_to_bin(&dirs.agent_dir, &dirs.bin_dir());
+    // migrations.ts:312 — between `migrateToolsToBin()` (`:311`) and `migrateExtensionSystem()`
+    // (`:313`). Every failure mode is swallowed inside the callee, as Pi's `try { … } catch {}` does.
+    cyrup_config::migrate_keybindings_config_file(&dirs.agent_dir);
     let deprecation_warnings = migrate_extension_system(&dirs.agent_dir, &dirs.cwd);
     MigrationResult {
         migrated_auth_providers,
@@ -429,5 +437,41 @@ mod tests {
         let formatted = format_deprecation_warnings(&result.deprecation_warnings);
         assert!(formatted.contains("Warning:"));
         assert!(formatted.contains("extensions/ directory"));
+    }
+
+    /// CFG-048 — Pi's FIFTH `runMigrations` call (`migrations.ts:312`, between `migrateToolsToBin()`
+    /// `:311` and `migrateExtensionSystem()` `:313`) rewrites legacy keybinding ids in
+    /// `<agent_dir>/keybindings.json`. RED before this pass: `run_migrations` made four calls and a
+    /// legacy file was left untouched forever, so every legacy binding was silently inert.
+    ///
+    /// The table/format behaviour is covered exhaustively in `cyrup-config`'s `keybindings` module;
+    /// what this test pins is that `run_migrations` REACHES it, and at Pi's position.
+    #[test]
+    fn migrates_legacy_keybinding_ids_in_the_agent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        std::fs::create_dir_all(&d.agent_dir).unwrap();
+        let path = d.agent_dir.join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{"cursorUp":"ctrl+p","interrupt":"ctrl+q","app.clear":"ctrl+k"}"#,
+        )
+        .unwrap();
+
+        run_migrations(&d);
+
+        // `${JSON.stringify(config, null, 2)}\n` in Pi's `KEYBINDINGS` declaration order.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\n  \"tui.editor.cursorUp\": \"ctrl+p\",\n  \"app.interrupt\": \"ctrl+q\",\n  \"app.clear\": \"ctrl+k\"\n}\n"
+        );
+
+        // migrations.ts:168 — a clean file is not rewritten, so a second run is a no-op.
+        let before = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        run_migrations(&d);
+        assert_eq!(
+            std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
+            before
+        );
     }
 }

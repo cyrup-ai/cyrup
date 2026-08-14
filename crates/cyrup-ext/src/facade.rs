@@ -3,7 +3,7 @@
 //! `wasm-host` feature is on). Exposes the two agent seams — [`ExtSubscriber`] (notify) and
 //! [`ExtHooks`] (mutating) — plus the merged active tool set.
 
-use crate::contract::{HandledValue, Reduced};
+use crate::contract::{HandledValue, Reduced, TerminalInputDecision, TerminalInputResult};
 use crate::dispatch::Dispatcher;
 use crate::error::ExtError;
 use crate::event::{HostEvent, InputEventSource, InputStreamingBehavior};
@@ -338,6 +338,7 @@ impl ExtensionHost {
             autocomplete_providers,
             bus_topics,
             markdown_transformer,
+            terminal_input,
         ) = api.into_parts();
 
         // EXT-003 footgun guard: a native that subscribes to `project_trust` but did NOT override
@@ -399,6 +400,12 @@ impl ExtensionHost {
         if markdown_transformer {
             self.registry.register_markdown_transformer(id.clone())?;
         }
+        // EXT-021: terminal-input subscription, also in LOAD ORDER — pi folds its listeners in the
+        // insertion order of the `Set` `addInputListener` writes to
+        // (`packages/tui/src/tui.ts:651-655`, folded `:773-788`).
+        if terminal_input {
+            self.registry.subscribe_terminal_input(id.clone())?;
+        }
         // EXT-018: a native's bus subscriptions land in the SAME host-owned bus a guest's
         // `bus.subscribe` import writes to (pi's single `createEventBus()`, `loader.ts:389`).
         for topic in bus_topics {
@@ -432,15 +439,16 @@ impl ExtensionHost {
         cancel: &CancelToken,
     ) -> Result<Option<Result<Option<String>, ExtError>>, ExtError> {
         // SEAM-048 — route by INVOCATION name, not by the raw last-wins map. pi disambiguates two
-        // extensions registering `deploy` into `deploy` / `deploy:2` in load order
+        // extensions registering `deploy` into `deploy:1` / `deploy:2` in load order
         // (`resolveRegisteredCommands`, `extensions/runner.ts:598-631` @v0.83.0) and dispatches from
         // the `ResolvedCommand`; `command_owner` is a last-wins `HashMap` lookup on the raw name, so
-        // `deploy:2` resolved to nothing and the second registrant was silently unexecutable. The
-        // wasm route (`live_for_command`) was converted already; this is the native one.
-        // `resolved_command_owner` falls back to the raw map for an uncollided name, which is
-        // exactly what `resolveRegisteredCommands` leaves unsuffixed.
-        let owner = match self.registry.resolved_command_owner(name)? {
-            Some(o) => o,
+        // `deploy:2` resolved to nothing and the second registrant was silently unexecutable.
+        //
+        // [`Self::command_route`] carries the REGISTERED name back alongside the owner, and that is
+        // what goes to the handler below — see its doc comment for why passing `name` through was
+        // still a dead end for every suffixed invocation.
+        let (owner, registered) = match self.command_route(name)? {
+            Some(route) => route,
             None => return Ok(None),
         };
         let ext = match self.native.read().ok().and_then(|g| g.get(&owner).cloned()) {
@@ -456,7 +464,7 @@ impl ExtensionHost {
             Some(svc) => ctx.with_rich(crate::native::rich_from_services(svc.as_ref())),
             None => ctx,
         };
-        let fut = std::panic::AssertUnwindSafe(ext.execute_command(name, args, &ctx));
+        let fut = std::panic::AssertUnwindSafe(ext.execute_command(&registered, args, &ctx));
         use futures::FutureExt;
         let raced = tokio::select! {
             biased;
@@ -991,6 +999,84 @@ impl ExtensionHost {
         current
     }
 
+    /// Offer one raw terminal-input chunk to every subscribed extension, in LOAD order, and say
+    /// what the caller should do with it (EXT-021).
+    ///
+    /// 1:1 with pi's `TUI.handleInput` listener fold (`packages/tui/src/tui.ts:773-788` @v0.83.0),
+    /// clause for clause:
+    /// * each listener sees the CURRENT — possibly already rewritten — data, not the original;
+    /// * `result?.consume` truthy STOPS the fold and drops the keystroke (`:777-779`);
+    /// * `result?.data !== undefined` replaces the buffer for the listeners after it (`:780-782`);
+    /// * a fold that ends with an EMPTY string also drops the keystroke (`:784-786`).
+    ///
+    /// With no subscribers this is the identity — upstream guards the whole block on
+    /// `inputListeners.size > 0` (`:773`) — so the ordinary keystroke path costs one `Vec` read.
+    ///
+    /// A faulting or panicking extension is CONTAINED and treated as `undefined`. That direction
+    /// is load-bearing rather than merely tidy: the alternative (fail closed) would let one broken
+    /// extension swallow the user's keyboard with no way to type the command that unloads it.
+    pub async fn terminal_input(&self, data: &str) -> TerminalInputDecision {
+        let owners = self.registry.terminal_input_subscribers().unwrap_or_default();
+        if owners.is_empty() {
+            return TerminalInputDecision::Deliver(data.to_string());
+        }
+        let mut current = data.to_string();
+        for owner in owners {
+            let result = self.terminal_input_via(&owner, &current).await;
+            let Some(result) = result else { continue };
+            if result.consume.unwrap_or(false) {
+                return TerminalInputDecision::Consume;
+            }
+            if let Some(next) = result.data {
+                current = next;
+            }
+        }
+        if current.is_empty() {
+            return TerminalInputDecision::Consume;
+        }
+        TerminalInputDecision::Deliver(current)
+    }
+
+    /// One terminal-input handler invocation, whichever tier its owner lives in. A fault is
+    /// contained as `None` — upstream's `undefined` — for the reason stated on
+    /// [`Self::terminal_input`].
+    async fn terminal_input_via(
+        &self,
+        owner: &ExtensionId,
+        data: &str,
+    ) -> Option<TerminalInputResult> {
+        if let Some(native) = self.native.read().ok().and_then(|g| g.get(owner).cloned()) {
+            return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                native.on_terminal_input(data)
+            })) {
+                Ok(v) => v,
+                Err(panic) => {
+                    tracing::warn!(
+                        extension = %owner, error = %native_panic_msg(panic),
+                        "native terminal-input handler panicked (input passes through untouched)"
+                    );
+                    None
+                }
+            };
+        }
+        #[cfg(feature = "wasm-host")]
+        {
+            let ext = self.live.read().ok().and_then(|g| g.get(owner).cloned())?;
+            return match ext.on_terminal_input(data).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        extension = %owner, error = %e,
+                        "terminal-input handler contained (input passes through untouched)"
+                    );
+                    None
+                }
+            };
+        }
+        #[cfg(not(feature = "wasm-host"))]
+        None
+    }
+
     /// One transformer invocation, whichever tier its owner lives in. A native's panic is caught
     /// for the same reason a native renderer's is (R-08-036): a presentation hook must never take
     /// the frame down.
@@ -1503,8 +1589,8 @@ impl ExtensionHost {
         args: &str,
         cancel: &CancelToken,
     ) -> Result<Option<String>, ExtError> {
-        let ext = self.live_for_command(name)?;
-        let out = ext.execute_command(name, args, cancel).await;
+        let (ext, registered) = self.live_for_command(name)?;
+        let out = ext.execute_command(&registered, args, cancel).await;
         // Fan out any inter-extension bus events this command emitted (Pi's EventEmitter dispatch
         // runs the listeners after the emit call, event-bus.ts; gap-08 §5.3) — deferred to here
         // because wasm reentrancy forbids delivering inside the guest's `bus.emit` import. Delivery
@@ -1520,32 +1606,64 @@ impl ExtensionHost {
         name: &str,
         prefix: &str,
     ) -> Result<Vec<String>, ExtError> {
-        let ext = self.live_for_command(name)?;
-        ext.argument_completions(name, prefix).await
+        let (ext, registered) = self.live_for_command(name)?;
+        ext.argument_completions(&registered, prefix).await
     }
 
-    /// EXT-017 — resolve the OWNER of an invoked command name.
+    /// SEAM-048 / EXT-017 — resolve an INVOCATION name to `(owner, registered name)`.
     ///
     /// `registry.command_owner` is a last-wins `HashMap` lookup on the RAW name, so when two
     /// extensions both register `deploy` only the last registrant is reachable and the other is
     /// silently unexecutable. pi disambiguates instead: `resolveRegisteredCommands` assigns
     /// `name:N` in LOAD ORDER with a `takenInvocationNames` bump loop
     /// (`extensions/runner.ts:598-631` @v0.83.0), and `name: cmd.invocationName` is what reaches
-    /// autocomplete (`modes/interactive/interactive-mode.ts:605`). `resolved_command_owner` is
-    /// cyrup's port of that rule and was production-dead. It is tried FIRST so `deploy:2` reaches
-    /// its own owner; the raw-name lookup remains as the fallback for a name with no collision,
-    /// which is exactly what `resolveRegisteredCommands` leaves unsuffixed.
-    #[cfg(feature = "wasm-host")]
-    fn live_for_command(&self, name: &str) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
-        let owner = self
+    /// autocomplete (`modes/interactive/interactive-mode.ts:605`).
+    ///
+    /// The SECOND half of the port is the one this function exists to carry: upstream looks the
+    /// invocation name up ONCE — `getCommand(name)` matches `command.invocationName`
+    /// (`extensions/runner.ts:647-649`) — and then calls the BOUND closure, `command.handler(args,
+    /// ctx)` (`agent-session.ts:1283`) / `getArgumentCompletions: cmd.getArgumentCompletions`
+    /// (`interactive-mode.ts:607`). The registered `name` is never used for a second lookup, so a
+    /// suffix upstream never leaves the resolver.
+    ///
+    /// cyrup cannot bind a closure across the WIT boundary: the handler is reached by NAME again,
+    /// inside the extension (`SdkApi::execute_command` matches `n == name`,
+    /// `cyrup-ext-sdk/src/api.rs:1033`; `NativeExtension::execute_command`'s default arm errors on
+    /// an unknown name, `native.rs:545`). Resolving the owner alone therefore left `deploy:2`
+    /// routed correctly and then failing INSIDE its own owner with `no such command: deploy:2` —
+    /// the disambiguation tier looked live while every suffixed command remained unexecutable.
+    /// Returning the registered name and handing THAT to the extension is what makes the tier real.
+    ///
+    /// An uncollided command keeps its bare name unsuffixed, exactly as `resolveRegisteredCommands`
+    /// leaves it, so on that path invocation and registered name are equal and the extra field
+    /// costs nothing. Matching is on `invocation_name` ALONE — see
+    /// [`ExtensionRegistry::resolved_command_owner`] for why the old raw-name fallback was the
+    /// last-registration-wins defect rather than a safety net.
+    fn command_route(&self, invocation: &str) -> Result<Option<(ExtensionId, String)>, ExtError> {
+        Ok(self
             .registry
-            .resolved_command_owner(name)?
+            .resolved_commands()?
+            .into_iter()
+            .find(|r| r.invocation_name == invocation)
+            .map(|r| (r.owner, r.name)))
+    }
+
+    /// [`Self::command_route`] narrowed to the live-WASM tier, with pi's not-found errors.
+    #[cfg(feature = "wasm-host")]
+    fn live_for_command(
+        &self,
+        name: &str,
+    ) -> Result<(Arc<crate::host::LiveExtension>, String), ExtError> {
+        let (owner, registered) = self
+            .command_route(name)?
             .ok_or_else(|| ExtError::Component(format!("no such command: {name}")))?;
-        self.live
+        let ext = self
+            .live
             .read()
             .ok()
             .and_then(|g| g.get(&owner).cloned())
-            .ok_or_else(|| ExtError::Component(format!("command `{name}` has no live owner")))
+            .ok_or_else(|| ExtError::Component(format!("command `{name}` has no live owner")))?;
+        Ok((ext, registered))
     }
 
     /// Every key-id an extension has registered a keyboard shortcut for (R-08-017; Pi

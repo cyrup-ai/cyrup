@@ -136,6 +136,20 @@ enum StreamSlot {
 /// "done" semantics for the eventual MCP transport consumer.
 pub struct HttpCaps {
     client: reqwest::Client,
+    /// PROV-047 — per-proxy clients, keyed by the resolved proxy URL.
+    ///
+    /// Pi's `httpProxy` setting is written into `process.env` at startup and observed by EVERY
+    /// later `getProxyEnv` consultation, extension HTTP included; cyrup cannot write its own env
+    /// (`set_var` is `unsafe` from edition 2024), so the setting lives in
+    /// `cyrup_provider::stream::sse::configure_http_proxy` and is consulted by the ported resolver
+    /// `cyrup_provider::utils::node_http_proxy::resolve_http_proxy_url_for_target`. That resolver
+    /// is PER-TARGET (`no_proxy`, scheme, port all matter), so one client cannot serve every
+    /// request — hence a small cache rather than a field on the struct. The un-proxied
+    /// [`Self::client`] stays the fast path for the overwhelmingly common no-proxy case.
+    ///
+    /// Every client in here is built by [`client_builder`], so the no-auto-decompression contract
+    /// [`Self::new`] documents holds for proxied requests identically.
+    proxied: Mutex<HashMap<String, reqwest::Client>>,
     streams: Mutex<HashMap<u32, StreamSlot>>,
     next_handle: AtomicU32,
     /// [`MAX_OPEN_STREAMS`] in production; overridable ONLY for tests
@@ -187,6 +201,7 @@ impl HttpCaps {
     pub fn with_client(client: reqwest::Client) -> Self {
         Self {
             client,
+            proxied: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
             next_handle: AtomicU32::new(1),
             max_open_streams: MAX_OPEN_STREAMS,
@@ -255,10 +270,66 @@ impl HttpCaps {
     /// connect+headers is bounded" contract. `request_stream`'s outer `tokio::time::timeout` around
     /// `.send()` already bounds connect+headers on its own; the body stream is separately bounded
     /// per-poll by [`HTTP_POLL_IDLE_TIMEOUT`] in [`Self::poll_stream_chunk`], never by this timeout.
-    fn build_request(&self, req: &HttpRequest, apply_reqwest_timeout: bool) -> Result<reqwest::RequestBuilder, String> {
+    /// Pick the client for `url`: the shared un-proxied one, or a cached per-proxy client when
+    /// pi's `httpProxy` / the ambient `HTTP_PROXY`-family variables select one for this target
+    /// (PROV-047).
+    ///
+    /// A malformed proxy setting is a WARNING and falls back to the direct client rather than
+    /// failing the guest's request: upstream a bad proxy URL surfaces at connect time as an
+    /// ordinary transport failure of that one request, and the wire APIs' own resolver already
+    /// reports the typed error on the provider path — refusing every extension HTTP call because
+    /// of an unrelated setting would be a strictly larger blast radius than upstream has.
+    async fn client_for(&self, url: &str) -> reqwest::Client {
+        let resolved = cyrup_provider::utils::node_http_proxy::resolve_http_proxy_url_for_target(
+            url,
+            &cyrup_provider::auth::types::EnvAuthContext,
+            None,
+        )
+        .await;
+        let proxy_url = match resolved {
+            Ok(Some(u)) => u,
+            Ok(None) => return self.client.clone(),
+            Err(e) => {
+                tracing::warn!(error = %e, "ignoring proxy setting for extension HTTP request");
+                return self.client.clone();
+            }
+        };
+        self.client_through(&proxy_url)
+    }
+
+    /// The cached client that routes through `proxy_url`, building it on first use. Split out of
+    /// [`Self::client_for`] so the cache and the fallback are testable without mutating the
+    /// PROCESS-GLOBAL proxy setting — doing that from a unit test would race every other HTTP test
+    /// in this crate, which talks to local mock servers a proxy would swallow.
+    fn client_through(&self, proxy_url: &reqwest::Url) -> reqwest::Client {
+        let key = proxy_url.to_string();
+        if let Ok(guard) = self.proxied.lock()
+            && let Some(c) = guard.get(&key)
+        {
+            return c.clone();
+        }
+        let built = reqwest::Proxy::all(proxy_url.clone())
+            .and_then(|p| client_builder().proxy(p).build())
+            .map_err(|e| {
+                tracing::warn!(error = %e, "proxy client build failed; using a direct connection");
+            })
+            .ok();
+        let Some(built) = built else { return self.client.clone() };
+        if let Ok(mut guard) = self.proxied.lock() {
+            guard.insert(key, built.clone());
+        }
+        built
+    }
+
+    fn build_request(
+        &self,
+        client: &reqwest::Client,
+        req: &HttpRequest,
+        apply_reqwest_timeout: bool,
+    ) -> Result<reqwest::RequestBuilder, String> {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| format!("invalid HTTP method `{}`: {e}", req.method))?;
-        let mut builder = self.client.request(method, req.url.as_str());
+        let mut builder = client.request(method, req.url.as_str());
         let has_accept_encoding =
             req.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
         if !has_accept_encoding {
@@ -326,7 +397,9 @@ impl HttpCaps {
             // reqwest's own request-level timeout doubling up with the outer `tokio::time::timeout`
             // above is intentional, redundant-but-harmless belt-and-suspenders — see
             // [`Self::build_request`]'s doc for why [`Self::request_stream`] below must NOT do this.
-            let resp = self.build_request(req, true)?.send().await.map_err(|e| e.to_string())?;
+            let client = self.client_for(req.url.as_str()).await;
+            let resp =
+                self.build_request(&client, req, true)?.send().await.map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
             let headers = collect_headers(resp.headers());
             let encoding = content_encoding_of(resp.headers());
@@ -391,7 +464,9 @@ impl HttpCaps {
         // request-level timeout, which would keep running as a TOTAL-request timer and silently kill
         // the long-lived body stream this function hands back, contradicting this function's own
         // documented contract (see [`Self::build_request`]'s doc for the full `reqwest` internals).
-        let resp = tokio::time::timeout(effective_timeout, self.build_request(req, false)?.send())
+        let client = self.client_for(req.url.as_str()).await;
+        let resp =
+            tokio::time::timeout(effective_timeout, self.build_request(&client, req, false)?.send())
             .await
             .map_err(|_| {
                 format!("request_stream: timed out after {effective_timeout:?} waiting for the initial response")
@@ -1434,6 +1509,54 @@ mod tests {
         );
     }
 
+    /// PROV-047 — extension HTTP must go through pi's proxy resolver, and a resolved proxy must
+    /// produce a DISTINCT client from the direct one, cached per proxy URL.
+    ///
+    /// BEFORE: `HttpCaps` built exactly one `reqwest::Client` at construction and every guest
+    /// request used it, so `httpProxy` (and the ambient `HTTP_PROXY` family, which pi's
+    /// `getProxyEnv` also reads) reached only the streaming wire APIs. An operator behind a
+    /// corporate proxy had working model traffic and silently failing extension traffic.
+    ///
+    /// The absence side is asserted FIRST: with no proxy resolvable for a plain public URL,
+    /// `client_for` must hand back the shared direct client untouched — otherwise the
+    /// distinctness assertion below would hold for a `client_for` that proxied everything.
+    #[tokio::test]
+    async fn a_resolved_proxy_yields_a_distinct_cached_client_and_no_proxy_yields_the_direct_one() {
+        let caps = HttpCaps::new();
+
+        // No proxy configured and none in the ambient env for this target ⇒ the direct client.
+        // (`cyrup_provider::stream::sse::configure_http_proxy` is untouched by this test, so the
+        // resolver falls through to the ambient environment, which carries no proxy in CI.)
+        let direct = caps.client_for("https://example.invalid/x").await;
+        assert!(
+            caps.proxied.lock().expect("cache lock").is_empty(),
+            "the no-proxy path must not populate the per-proxy cache"
+        );
+        drop(direct);
+
+        // A resolved proxy takes the other branch: a client built through `client_builder()` (so
+        // the no-auto-decompression contract still holds) and memoized under the proxy URL.
+        let proxy = reqwest::Url::parse("http://proxy.internal:3128").expect("proxy url");
+        let first = caps.client_through(&proxy);
+        assert_eq!(
+            caps.proxied.lock().expect("cache lock").len(),
+            1,
+            "the proxied client must be cached under its proxy URL"
+        );
+        let _second = caps.client_through(&proxy);
+        assert_eq!(
+            caps.proxied.lock().expect("cache lock").len(),
+            1,
+            "a second request for the same proxy must reuse the cached client, not rebuild it"
+        );
+
+        // A second, different proxy gets its own entry — the cache is keyed, not a single slot.
+        let other = reqwest::Url::parse("http://other.internal:8080").expect("proxy url");
+        let _third = caps.client_through(&other);
+        assert_eq!(caps.proxied.lock().expect("cache lock").len(), 2);
+        drop(first);
+    }
+
     /// `Accept-Encoding` defaults must match real `fetch()`'s request-header algorithm exactly
     /// (`undici/lib/web/fetch/index.js:1552-1566`), not `reqwest`'s own auto-decompression toggle set
     /// — scheme-conditional (`https:` → `"br, gzip, deflate"`, anything else → `"gzip, deflate"`,
@@ -1445,7 +1568,7 @@ mod tests {
     fn build_request_defaults_accept_encoding_scheme_conditionally_and_identity_for_range() {
         let caps = HttpCaps::new();
         let get_accept_encoding = |req: &HttpRequest| {
-            caps.build_request(req, true)
+            caps.build_request(&caps.client.clone(), req, true)
                 .expect("builds")
                 .build()
                 .expect("materializes without connecting")

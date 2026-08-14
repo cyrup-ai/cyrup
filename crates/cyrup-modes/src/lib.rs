@@ -11,6 +11,9 @@
 //! - [`run_rpc`] — RPC mode: a bidirectional strict-LF JSONL protocol over a reader + writer; parse
 //!   incoming [`SessionCommand`] requests, drive the session, and emit response/event lines
 //!   ([`RpcOut`]). The headless server other tools embed (R-11-011…016).
+//! - [`RpcClient`] — the OTHER end of that protocol (Pi `modes/rpc/rpc-client.ts`, SEAM-017): a
+//!   typed, id-correlated client that either spawns the agent in RPC mode or attaches to an
+//!   already-open transport, so an embedder never hand-rolls NDJSON framing.
 //!
 //! All three are adapters over the same seam — no mode reaches behaviour the others structurally
 //! cannot (the "one seam" invariant).
@@ -22,6 +25,7 @@ mod json_event;
 mod print;
 pub mod raw_stdout;
 mod rpc;
+mod rpc_client;
 #[cfg(test)]
 mod tests;
 
@@ -31,3 +35,7 @@ pub use json_event::{to_json_event, JsonAgentSessionEvent};
 pub use print::{run_print, PrintOptions};
 pub use raw_stdout::{flush_raw_stdout, write_raw_stdout, RAW_STDOUT_RETRY_DELAY_MS};
 pub use rpc::{run_rpc, QueueModeArg, RpcOut, RpcResponse, SessionCommand};
+pub use rpc_client::{
+    event_type, EventSubscription, ForkMessage, ModelInfo, RpcClient, RpcClientError,
+    RpcClientOptions, DEFAULT_CLI_PATH, DEFAULT_IDLE_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
+};

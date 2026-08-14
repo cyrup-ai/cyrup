@@ -93,6 +93,11 @@ pub mod tool_call_summary;
 /// `runs/shared/tool-budget.ts`. Enforcement lives child-side in [`crate::prompt_runtime`].
 pub mod tool_budget;
 
+/// SUBA-046 — the per-session subagent SPAWN budget, its snapshot, and the explicit grant path
+/// behind an exhausted cap: a port of pi-subagents' `runs/shared/spawn-budget.ts`. Consumed by
+/// `extension.rs`'s `reserve_subagent_spawns` and by the `grant-spawn-budget` dispatch arm.
+pub mod spawn_budget;
+
 /// SUBA-045 — the child tool-availability diagnostic (`CYRUP_SUBAGENT_TOOL_DIAGNOSTIC_PATH`), a
 /// port of pi-subagents' `runs/shared/tool-availability.ts`. The child writes it from its live
 /// registry; this module's `run_attempt` reads it back so a tool that was never registered becomes
@@ -111,7 +116,7 @@ use crate::discovery::types::{
 use crate::error::SubagentError;
 use crate::exec::acceptance::{
     AcceptanceContract, AcceptanceLedger, CleanCompletionGate, apply_post_hoc_correction,
-    build_timed_out_acceptance_ledger, evaluate_acceptance, inject_acceptance_contract,
+    build_timed_out_acceptance_ledger, inject_acceptance_contract,
 };
 use crate::exec::completion_guard::evaluate_completion_mutation_guard;
 use crate::exec::fallback::{
@@ -126,7 +131,7 @@ use crate::exec::output::{
     message_end_has_error_message, resolve_output_handoff, snapshot_output_file,
     trailing_assistant_error, truncate_output, validate_file_only_requires_path,
 };
-use crate::exec::structured::{StructuredOutcome, resolve_structured_output};
+use crate::exec::structured::StructuredOutcome;
 use crate::fork_context::{ContextMode, ForkContext, ForkContextResolver};
 use crate::spawn::depth::DepthEnvelope;
 use crate::spawn::{ChildSpawnSpec, SpawnCommand, SpawnedChild};
@@ -937,10 +942,11 @@ pub struct AgentProgress {
     /// list [`SingleResult`] carries (R-SA-043).
     pub tool_end_events: Vec<SubagentEvent>,
     /// The full parsed transcript of every recognized event this attempt observed, in
-    /// chronological order — feeds [`structured::resolve_structured_output`] (R-SA-030), which
-    /// needs more than the two narrower vectors above; `run_sync` also reads this directly for
-    /// that R-SA-030 wiring, alongside `message_end_events`/`tool_end_events` for its own
-    /// R-SA-029/034 wiring.
+    /// chronological order — needs more than the two narrower vectors above. `run_sync` reads it
+    /// directly alongside `message_end_events`/`tool_end_events` for its R-SA-029/034 wiring.
+    /// R-SA-030 (structured output) is deliberately NOT among its consumers any more: SUBA-S01's
+    /// residual pass removed the transcript scan, because pi's structured value only ever travels
+    /// through the child's capture file (`structured-output.ts:156-173`), never through prose.
     pub all_events: Vec<SubagentEvent>,
     /// The short argument preview captured when [`Self::current_tool`] STARTED (pi
     /// `progress.currentToolArgs = extractToolArgsPreview(toolArgs)`,
@@ -2503,7 +2509,6 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             && structured_output_absent(
                 self.opts.structured_output_schema.as_ref(),
                 self.structured_runtime.as_ref(),
-                &progress.all_events,
             )
         {
             exit_code = 1;
@@ -2690,27 +2695,26 @@ struct DriveOutcome {
 /// afterward (pi `readStructuredOutput`, `execution.ts:1204-1224`).
 ///
 /// The presence channel is pi's literally: `!existsSync(options.structuredOutput.outputPath)`
-/// (`execution.ts:1189-1191`) — the CAPTURE FILE the child's `structured_output` tool writes, not
-/// the transcript. Consulting the transcript here instead would fail a perfectly good run: a child
-/// that calls `structured_output` and then stops without prose has `finalText` empty and a written
+/// (`execution.ts:1189-1191`) — the CAPTURE FILE the child's `structured_output` tool writes, and
+/// nothing else. Consulting the transcript instead would fail a perfectly good run: a child that
+/// calls `structured_output` and then stops without prose has `finalText` empty and a written
 /// capture file, which pi passes (`missingStructuredOutput === false`) and a fenced-block scan
-/// would classify `Missing`, flipping the attempt to a retryable "produced no output" failure the
-/// ladder then burns a fallback model on. The transcript scan survives ONLY as the degraded
-/// no-runtime fallback (`run_sync` could not create the capture runtime at all), where there is
-/// genuinely no file to stat — the same split [`run_sync`]'s own read-back makes.
+/// would classify as missing, flipping the attempt to a retryable "produced no output" failure the
+/// ladder then burns a fallback model on.
+///
+/// SUBA-S01 residual: the no-runtime case (`run_sync` could not create the capture runtime at all)
+/// used to fall through to that fenced-block scan. It no longer does — with no runtime there is no
+/// capture file, so the value is absent by definition, which is also exactly what [`run_sync`]'s
+/// own read-back now concludes for the same state. The two can no longer disagree.
 fn structured_output_absent(
     schema: Option<&serde_json::Value>,
     runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
-    events: &[SubagentEvent],
 ) -> bool {
     match schema {
         None => true,
-        Some(schema) => match runtime {
+        Some(_) => match runtime {
             Some(runtime) => !runtime.output_path.exists(),
-            None => matches!(
-                resolve_structured_output(Some(schema), events),
-                StructuredOutcome::Missing
-            ),
+            None => true,
         },
     }
 }
@@ -3177,16 +3181,16 @@ fn resolve_run_acceptance(
 ///    (detach) both terminate the ladder outright without advancing, exactly as
 ///    `run_fallback_ladder` itself already enforces (this module supplies the signal, not the
 ///    ladder-control logic, which stays [`fallback`]'s sole responsibility).
-/// 5. R-SA-030: structured-output extraction + parent-side JSON-Schema re-validation, via
-///    [`structured::resolve_structured_output`] (arch-SA §12 item 13's resolved crate choice,
-///    `jsonschema`). Only evaluated when the run is otherwise clean (exit 0, not detached/
-///    interrupted/timed-out) — mirrors R-SA-032/033's own "don't re-diagnose an already-failed
-///    attempt" gate. If `opts.structured_output_schema` is `None`, this step is a no-op
-///    (`SingleResult::structured_output` stays `None`). If a schema IS declared: an extracted value
-///    that validates populates `SingleResult::structured_output`; an extracted value that fails
-///    validation, or no value at all when no plain-text fallback was produced either, forces
-///    `exit_code = 1` with a validation-error `error` message — never silently downgraded, per
-///    R-SA-030's "MUST also fail the run" text.
+/// 5. R-SA-030: structured-output CAPTURE-FILE read-back + parent-side JSON-Schema re-validation,
+///    via [`structured::read_structured_output`] and [`structured::validate_structured_output`]
+///    (arch-SA §12 item 13's resolved crate choice, `jsonschema`). Only evaluated when the run is
+///    otherwise clean (exit 0, not detached/interrupted/timed-out) — mirrors R-SA-032/033's own
+///    "don't re-diagnose an already-failed attempt" gate. If `opts.structured_output_schema` is
+///    `None`, this step is a no-op (`SingleResult::structured_output` stays `None`). If a schema IS
+///    declared: a captured value that validates populates `SingleResult::structured_output`; a
+///    captured value that fails validation, or no captured value at all, forces `exit_code = 1`
+///    with an error message — never silently downgraded, per R-SA-030's "MUST also fail the run"
+///    text, and never satisfied by prose, per pi's "EVEN WHEN prose was produced" rule.
 /// 6. R-SA-034: completion-mutation guard, via [`completion_guard::evaluate_completion_mutation_guard`].
 /// 7. R-SA-032: acceptance-gate evaluation, gated on `exit_code == 0 && !detached && !interrupted
 ///    && !timed_out` (R-SA-033's own gate condition), via [`acceptance::evaluate_acceptance`].
@@ -3440,10 +3444,23 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // A creation failure degrades to `None` rather than failing the run: the child then never
     // receives the env vars, never registers `structured_output`, and the read-back reports pi's
     // own "missing" hard failure — which is the correct outcome for "the schema never reached the
-    // child", and strictly better than aborting a run that might still produce useful prose.
-    let structured_runtime = opts.structured_output_schema.as_ref().and_then(|schema| {
-        crate::exec::structured::create_structured_output_runtime(schema, &scratch_dir).ok()
-    });
+    // child", and strictly better than aborting a run that might still produce useful prose. It is
+    // NOT a licence to go looking for the value somewhere pi never looks: see the read-back below.
+    //
+    // SUBA-S01 residual: the runtime is held by a `StructuredOutputCleanupGuard`, which is the RAII
+    // port of pi's `finally { if (!r?.detached) cleanupStructuredOutputRuntime(structuredRuntime); }`
+    // (`runs/foreground/subagent-executor.ts:3780-3787` @v0.43.0). See that type's own doc for why
+    // the end-of-function statement this replaces was wrong on BOTH halves.
+    let mut structured_guard = opts
+        .structured_output_schema
+        .as_ref()
+        .and_then(|schema| {
+            crate::exec::structured::create_structured_output_runtime(schema, &scratch_dir).ok()
+        })
+        .map(crate::exec::structured::StructuredOutputCleanupGuard::new);
+    let structured_runtime = structured_guard
+        .as_ref()
+        .map(|guard| guard.runtime().clone());
 
     // Step 4: drive the fallback ladder.
     let mut runner = SpawnedChildAttemptRunner {
@@ -3581,13 +3598,18 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     })
     .is_clean()
     {
-        // SUBA-S01: with a capture runtime, read the FILE the child's `structured_output` tool
-        // wrote (pi `readStructuredOutput`, `structured-output.ts:156-173`) rather than scanning the
-        // transcript. The event scan is a cyrup-original heuristic that accepts the newest fenced
-        // ```json block — i.e. prose — which is exactly what the "EVEN WHEN prose was produced"
-        // rule below says must NOT satisfy a declared schema. It stays as the fallback for the one
-        // degraded case where the runtime could not be created at all (see `run_sync`), because
-        // there is genuinely no capture file to consult then.
+        // SUBA-S01: read the FILE the child's `structured_output` tool wrote (pi
+        // `readStructuredOutput`, `structured-output.ts:156-173`). The capture file is the ONLY
+        // channel — pi has no other, and neither does this port any more.
+        //
+        // The `None` arm used to fall back to `resolve_structured_output`, a cyrup-original scan
+        // that accepted the newest fenced ```json block in the child's prose. That is exactly what
+        // the "EVEN WHEN prose was produced" rule below says must NOT satisfy a declared schema,
+        // and it was not merely lenient: a coincidental fence could VALIDATE against the caller's
+        // schema and become the run's structured result, silently feeding a wrong answer into a
+        // chain's output bindings. A schema that was declared but whose capture runtime could not
+        // be created is therefore `Missing` — no file, no value — which is the same hard failure
+        // upstream produces when the child never called the tool.
         let structured_outcome = match structured_runtime.as_ref() {
             Some(runtime) => match crate::exec::structured::read_structured_output(runtime) {
                 Ok(value) => StructuredOutcome::Valid(value),
@@ -3598,9 +3620,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
                 }
                 Err(message) => StructuredOutcome::Invalid(message),
             },
-            None => {
-                resolve_structured_output(opts.structured_output_schema.as_ref(), &progress.all_events)
-            }
+            None if opts.structured_output_schema.is_some() => StructuredOutcome::Missing,
+            None => StructuredOutcome::NotRequested,
         };
         match structured_outcome {
             StructuredOutcome::NotRequested => None,
@@ -3732,7 +3753,12 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             }),
             _ => None,
         };
-        let ledger = evaluate_acceptance(
+        // SUBA-028 / pi `evaluateAcceptance({ …, signal: options.signal })`
+        // (`runs/foreground/execution.ts:1704-1706` @v0.43.0). THIS is the call the item was about:
+        // without the token, cancelling a run (Ctrl-C, orchestrator cancel, parent timeout) left
+        // acceptance verification running, so the caller waited out a full per-command `timeoutMs`
+        // — once per remaining command — after asking to stop.
+        let ledger = acceptance::evaluate_acceptance_with_cancel(
             &contract,
             post_guard_gate,
             final_output.as_deref(),
@@ -3740,6 +3766,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             &opts.cwd,
             memo,
             file_output,
+            &opts.cancel,
         )
         .await;
 
@@ -3863,12 +3890,21 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         None
     };
 
-    // SUBA-S01 (pi `cleanupStructuredOutputRuntime`, `structured-output.ts:175-182`): remove the
-    // runtime's private temp dir once the value has been read back. Best-effort and deliberately
-    // unconditional — the schema file is written 0600 because it can carry whatever the caller's
-    // schema describes, and leaving one behind per run would accumulate under the scratch dir.
-    if let Some(runtime) = structured_runtime.as_ref() {
-        crate::exec::structured::cleanup_structured_output_runtime(runtime);
+    // SUBA-S01 (pi `cleanupStructuredOutputRuntime`, `structured-output.ts:175-182`, invoked from
+    // `subagent-executor.ts:3780-3787`'s `finally`): the removal itself is `structured_guard`'s
+    // `Drop`, so it happens on EVERY exit from `run_sync` — including a cancellation that drops
+    // this future mid-ladder, which an end-of-function statement could never cover.
+    //
+    // This statement is upstream's `if (!r?.detached)` guard and nothing else. A detached run's
+    // child is still alive (R-SA-037) and has not written its capture file yet; that file lives
+    // inside the very directory cleanup removes. pi says so in its own words at `:3782-3784` — "A
+    // successful detached receipt transfers both to onDetachedExit while the authoritative
+    // completion remains live" — and defers the cleanup to `onDetachedExit`'s inner `finally`
+    // (`:3757-3761`). Disarming is that transfer. Before this, cyrup deleted the directory out from
+    // under the live child on every detach, so a detached run could never produce a structured
+    // value at all and the child's `structured_output` call would fail on a vanished parent dir.
+    if detached && let Some(guard) = structured_guard.as_mut() {
+        guard.disarm();
     }
 
     SingleResult {
@@ -5577,6 +5613,42 @@ mod tests {
                     .env_overlay
                     .contains_key(crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV),
             "a step with no outputSchema must carry no structured-output env"
+        );
+    }
+
+    /// SUBA-S01 residual — the per-attempt cold-start gate's presence test is pi's `existsSync` on
+    /// the CAPTURE FILE (`execution.ts:1189-1191`) and nothing else.
+    ///
+    /// The `None`-runtime arm used to fall through to the fenced-```json-block scan, so a child
+    /// that produced only prose containing an incidental JSON fence looked like it had "delivered"
+    /// a structured value to this gate. That both suppressed a retryable empty-output failure and
+    /// disagreed with `run_sync`'s own post-ladder read-back, which had no file to read. With no
+    /// runtime there is no capture file, so the value is absent by definition and the two agree.
+    #[test]
+    fn a_declared_schema_with_no_capture_runtime_is_absent_and_never_consults_the_transcript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let schema = serde_json::json!({"type": "object"});
+
+        // No schema declared at all: pi's `!options.structuredOutput` leg — unconditionally absent,
+        // which is what makes empty prose an empty-output failure on its own.
+        assert!(structured_output_absent(None, None));
+
+        // Declared, but the runtime could not be created. Absent — no file, no value. (Pre-fix this
+        // arm scanned the transcript, where a stray ```json fence read as "present".)
+        assert!(structured_output_absent(Some(&schema), None));
+
+        // Declared WITH a runtime: strictly the capture file's existence, both ways. Asserting the
+        // present case first keeps the absent assertion from passing vacuously.
+        let runtime = crate::exec::structured::create_structured_output_runtime(&schema, dir.path())
+            .expect("runtime is created");
+        assert!(
+            structured_output_absent(Some(&schema), Some(&runtime)),
+            "no capture file written yet => absent"
+        );
+        std::fs::write(&runtime.output_path, b"{}").expect("child writes its capture file");
+        assert!(
+            !structured_output_absent(Some(&schema), Some(&runtime)),
+            "a written capture file => present, even with no prose at all"
         );
     }
 

@@ -334,10 +334,22 @@ mod tests {
     fn path_probe_is_bounded() {
         assert_eq!(BASH_PROBE_TIMEOUT, Duration::from_secs(5), "shell.ts:47 `timeout: 5000`");
         // A probe whose child never exits must be reaped at the deadline, not waited on forever.
+        //
+        // ALL THREE handles are set explicitly, and this is load-bearing, not tidiness:
+        // `std::process::Command` defaults every UNSET handle to `Stdio::inherit()`, so the version
+        // of this fixture that named only `stdout` handed the child the HARNESS's own stdin and
+        // stderr. Under `cargo nextest run` the harness stderr is the pipe its leak detector waits
+        // on (`.config/nextest.toml` `leak-timeout = 500ms, result = "fail"`), so any path that
+        // let this `sleep 30` outlive the test process converted into a LEAK-FAIL. This was the
+        // only spawn under `crates/cyrup-tools/**` that inherited a harness handle at all — every
+        // other one (`find_bash_on_path` above, `build_command`/`build_argv_command` in
+        // `ops/local.rs`, the `ops/local.rs` fixtures) already pins all three.
         let started = Instant::now();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn sleep");
         let deadline = Instant::now() + Duration::from_millis(200);
@@ -352,7 +364,14 @@ mod tests {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Err(_) => break,
+                // A `try_wait` error must still reap: leaving the loop without killing left a live
+                // 30-second `sleep` behind, which is precisely the "spawns and does not reap" shape
+                // this fixture exists to prove the production probe does NOT have.
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
             }
         }
         assert!(started.elapsed() < Duration::from_secs(5), "the poll loop must reap on expiry");

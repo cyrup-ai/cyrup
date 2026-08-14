@@ -453,6 +453,13 @@ impl NativeExtension for IntercomExtension {
         {
             api.register_tool(Arc::new(ContactSupervisorTool::new(self.state.clone(), metadata.clone())));
         }
+        // ICOM-028: claim the durable inbound-message entry so [`Self::render_entry`] is reached.
+        // Without this registration the TUI's `has_entry_renderer` check short-circuits
+        // (`cyrup-tui/src/app.rs:5845`) and the card `surface_incoming_message` pre-renders is
+        // written to the session and then drawn by nothing — the human sees only a grey
+        // `entry appended → intercom_message` status line. This surface is cyrup's, not pi's; see
+        // [`Self::render_entry`] for why upstream has no counterpart.
+        api.register_entry_renderer(crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE);
         // The `/intercom` overlay command (pi `registerCommand("intercom", …)`, index.ts:1877). cyrup
         // has no `register_shortcut`, so the `alt+m` binding degrades to this command (the port doc
         // §4.3); `execute_command` renders the session picker + drives the compose send.
@@ -653,6 +660,83 @@ impl NativeExtension for IntercomExtension {
             _ => HookOutcome::Noop,
         }
     }
+
+    /// `renderCall` for both tools (`v0.10.1 index.ts:2298-2315` and `:1743-1756`). Until this
+    /// landed, neither intercom tool registered a renderer at all, so every `intercom` /
+    /// `contact_supervisor` row in the transcript fell back to the host's generic tool rendering —
+    /// upstream draws an action-coloured header with the target and a message preview.
+    ///
+    /// See [`crate::tools::render`] for the three upstream renderer inputs this seam does not carry
+    /// (`theme`, `isPartial`, `context`) and which branches are therefore unreachable.
+    fn render_call(&self, key: &str, call: &serde_json::Value) -> Option<serde_json::Value> {
+        let text = match key {
+            "intercom" => crate::tools::render::render_intercom_call(call),
+            "contact_supervisor" => crate::tools::render::render_contact_supervisor_call(call),
+            _ => return None,
+        };
+        Some(serde_json::Value::String(text))
+    }
+
+    /// `renderResult` for both tools (`v0.10.1 index.ts:2316-2331` and `:1757-1773`).
+    fn render_result(&self, key: &str, result: &serde_json::Value) -> Option<serde_json::Value> {
+        let text = match key {
+            "intercom" => crate::tools::render::render_intercom_result(result),
+            "contact_supervisor" => crate::tools::render::render_contact_supervisor_result(result),
+            _ => return None,
+        };
+        Some(serde_json::Value::String(text))
+    }
+
+    /// ICOM-028 — draw the durable `intercom_message` entry [`crate::inbound::surface_incoming_message`]
+    /// writes, instead of letting the TUI fall through to `push_status("entry appended → …")`.
+    ///
+    /// **This surface has no upstream analogue and is not a port.** `pi-intercom` registers no entry
+    /// renderer at any tag — its one displayed custom MESSAGE (`v0.10.1 index.ts:656`, `display:
+    /// true`) is simultaneously the model's context and the human's card, drawn by
+    /// `registerMessageRenderer("intercom_message", …)`. cyrup splits the two (the port doc
+    /// §4.2/§7.2), so the durable half needs a renderer of its own or the pre-rendered card it
+    /// carries is written and never drawn. This is ICOM-028's option (a): option (b) — delete the
+    /// split — depends on ICOM-024/ICOM-029, and `HostServices::inject_message` still carries no
+    /// `details` for a message renderer to read, so it is not reachable from this crate.
+    ///
+    /// `entry` is the SERIALIZED session entry (`KnownEntry::Custom`, `cyrup-session/src/entry.rs:125-131`,
+    /// `#[serde(tag = "type", rename_all_fields = "camelCase")]`), so the payload
+    /// `surface_incoming_message` wrote is under `data` — not at the top level.
+    ///
+    /// The card is emitted at the width it was rendered at (`SURFACE_CARD_WIDTH`); re-rendering at
+    /// the live terminal width is ICOM-024's half, which needs a width this seam does not carry.
+    fn render_entry(
+        &self,
+        custom_type: &str,
+        entry: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        if custom_type != crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE {
+            return None;
+        }
+        let data = entry.get("data")?;
+        // The pre-rendered card is an array of lines. Fall back to the markdown `content` (the same
+        // body the model was injected with) if a payload from an older writer has no `card`, and
+        // return `None` — upstream's `Component | undefined`, i.e. "draw nothing" — rather than an
+        // empty box if neither is present.
+        let card: Option<String> = data
+            .get("card")
+            .and_then(serde_json::Value::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|s| !s.is_empty());
+        let text = card.or_else(|| {
+            data.get("content")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })?;
+        Some(serde_json::Value::String(text))
+    }
 }
 
 // ================================================================================= binary wiring
@@ -729,6 +813,108 @@ pub fn default_agent_dir() -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// The `TempDir` is returned, not dropped, so the extension's agent/cwd paths stay valid for the
+    /// life of the test — an extension holding paths into an already-removed directory is a fixture
+    /// that only happens to work because these renderers touch no filesystem.
+    fn test_extension() -> (tempfile::TempDir, IntercomExtension) {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = IntercomExtension::new(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            IntercomConfig::default(),
+            None,
+        )
+        .expect("a default config builds an extension");
+        (dir, ext)
+    }
+
+    /// ICOM-028 — the durable `intercom_message` entry is DRAWN, not swallowed. Reads the payload
+    /// out of `data`, which is where `KnownEntry::Custom`'s serialization puts it — a renderer that
+    /// looked at the top level would silently return `None` on every real entry.
+    #[test]
+    fn intercom_message_entry_renders_the_prerendered_card() {
+        let (_dir, ext) = test_extension();
+        let entry = serde_json::json!({
+            "type": "custom",
+            "customType": crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE,
+            "id": "e1",
+            "data": {
+                "content": "**From reviewer** (/repo)\n\nlooks good",
+                "card": ["┌──────┐", "│ hi   │", "└──────┘"],
+            },
+        });
+        let drawn = ext
+            .render_entry(crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE, &entry)
+            .expect("the registered type must render");
+        assert_eq!(drawn.as_str().unwrap(), "┌──────┐\n│ hi   │\n└──────┘");
+
+        // A payload with no `card` degrades to the markdown body rather than drawing nothing.
+        let no_card = serde_json::json!({
+            "customType": crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE,
+            "data": { "content": "body only" },
+        });
+        assert_eq!(
+            ext.render_entry(crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE, &no_card)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "body only"
+        );
+
+        // Neither present is upstream's `Component | undefined` — draw nothing, not an empty box.
+        assert!(
+            ext.render_entry(
+                crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE,
+                &serde_json::json!({ "data": {} })
+            )
+            .is_none()
+        );
+        // And another extension's entry type is never claimed.
+        assert!(ext.render_entry("subagent_run", &entry).is_none());
+    }
+
+    /// The renderer is UNREACHABLE unless `init` also claims the type — `cyrup-tui/src/app.rs:5845`
+    /// short-circuits on `has_entry_renderer` before ever calling the extension. Asserting the
+    /// registration is what stops this from being ICOM-028 all over again with a live renderer
+    /// nobody calls (README blind spot: a test asserting an absence must first assert the presence).
+    #[tokio::test]
+    async fn init_claims_the_intercom_message_entry_type() {
+        let host = cyrup_ext::ExtensionHost::new(cyrup_ext::HostConfig::default());
+        let (_dir, ext) = test_extension();
+        host.load_native(Arc::new(ext)).await.expect("the native loads");
+        assert!(
+            host.has_entry_renderer(crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE),
+            "init must claim the entry type, or `cyrup-tui/src/app.rs:5845` never calls the renderer"
+        );
+        // The claim is type-scoped, not a blanket one.
+        assert!(!host.has_entry_renderer("subagent_run"));
+    }
+
+    /// The two tool renderers are wired to the names the tools actually register under — a renderer
+    /// keyed on the wrong string is a silent no-op, since the host simply falls through.
+    #[test]
+    fn both_tool_renderers_are_keyed_on_the_registered_tool_names() {
+        let (_dir, ext) = test_extension();
+        let call = serde_json::json!({ "action": "send", "to": "reviewer", "message": "hi" });
+        assert_eq!(
+            ext.render_call("intercom", &call).unwrap().as_str().unwrap(),
+            "intercom send → reviewer\n  hi"
+        );
+        assert!(ext.render_call("contact_supervisor", &serde_json::json!({})).is_some());
+        assert!(ext.render_call("not_our_tool", &call).is_none());
+
+        let result = serde_json::json!({
+            "content": [{ "type": "text", "text": "Message sent to reviewer" }],
+            "details": { "messageId": "0192f3c1-9a10-7000", "delivered": true },
+        });
+        assert_eq!(
+            ext.render_result("intercom", &result).unwrap().as_str().unwrap(),
+            "✓ Message sent to reviewer (0192f3c1)"
+        );
+        assert!(ext.render_result("contact_supervisor", &result).is_some());
+        assert!(ext.render_result("not_our_tool", &result).is_none());
+    }
 
     #[test]
     fn disabled_config_attaches_nothing() {

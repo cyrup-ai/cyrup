@@ -12,7 +12,7 @@ use crate::identity::{ChildMessageKind, ChildOrchestratorMetadata, format_child_
 use crate::session_state::SharedIntercomState;
 use crate::transport::client::{IntercomClient, SendOptions};
 
-use super::text_result;
+use super::{detailed_result, text_result};
 
 /// The `contact_supervisor` tool.
 pub struct ContactSupervisorTool {
@@ -90,7 +90,11 @@ impl ContactSupervisorTool {
                     .await
                     .map_err(to_tool_err)?;
                 if result.delivered {
-                    Ok(text_result(format!("Progress update sent to supervisor ({supervisor}).")))
+                    // `v0.10.1 index.ts:1635`: `details: { messageId: result.id, delivered: true }`.
+                    Ok(detailed_result(
+                        format!("Progress update sent to supervisor ({supervisor})."),
+                        serde_json::json!({ "messageId": result.id, "delivered": true }),
+                    ))
                 } else {
                     Err(ToolError::new(result.reason.unwrap_or_else(|| "update not delivered".to_string())))
                 }

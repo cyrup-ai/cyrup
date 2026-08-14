@@ -69,12 +69,29 @@ fn parse_key_values(value: &serde_json::Value) -> Result<Vec<Key>, TuiError> {
 }
 
 /// Parse a keybindings document into the `(id, value)` entries of its top-level JSON object
-/// (spec/tui/07 §3.9; `core/keybindings.ts:14-262`). Shared by every map's `merge_json`.
+/// (spec/tui/07 §3.9; `core/keybindings.ts:14-262`), applying Pi's legacy-id rename table on the
+/// way. Shared by every map's `merge_json`.
+///
+/// CFG-048 — Pi applies `migrateKeybindingsConfig` **twice**: once at write time from
+/// `runMigrations` (`migrations.ts:312`) and once on EVERY read inside
+/// `KeybindingsManager.loadFromFile` (`core/keybindings.ts:366`, reached from `create()` `:348-352`
+/// and `reload()` `:354-357`). The read-time application is what makes a legacy id work before the
+/// on-disk migration has ever run, after a hand-edit, and for a document that never came from a file
+/// at all — so it belongs here, in the one function every `merge_json` shares.
+///
+/// The migration returns an ordered list because `orderKeybindingsConfig` matters for the bytes
+/// written back to disk; it does not matter here, so the entries are collected back into a `Map` and
+/// no caller changes. Order-independence is a property of the rename, not an accident: the table is
+/// injective and a legacy id whose modern twin is also present is DROPPED
+/// (`core/keybindings.ts:302-305`), so no two surviving entries can target one id.
 fn keybindings_object(json: &str) -> Result<serde_json::Map<String, serde_json::Value>, TuiError> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| TuiError::Keybindings(e.to_string()))?;
     match value {
-        serde_json::Value::Object(map) => Ok(map),
+        serde_json::Value::Object(map) => Ok(cyrup_config::migrate_keybindings_config(&map)
+            .0
+            .into_iter()
+            .collect()),
         other => Err(TuiError::Keybindings(format!("expected a JSON object, got {other}"))),
     }
 }
@@ -1242,6 +1259,19 @@ impl EditorKeymap {
         } else {
             Some(keys.join("/"))
         }
+    }
+
+    /// **All** keys bound to `action` — the key set behind [`Self::keys_label`], handed out so a
+    /// component that owns the input slot can ask "was this an editor binding?" for ONE id without
+    /// running the whole editor table over the event.
+    ///
+    /// This is what pi's `kb.matches(keyData, "tui.input.tab")` is inside a selector
+    /// (`session-selector.ts:551` @v0.83.0): the session picker resolves that single editor-tier id
+    /// while every other editor binding stays inert, because upstream asks per-id rather than
+    /// resolving an event against a table. Calling [`Self::action_for`] there instead would let
+    /// `tui.editor.cursorUp` and friends fire inside a list selector, which upstream never does.
+    pub fn keys_for(&self, action: EditorAction) -> Vec<Key> {
+        self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| *k).collect()
     }
 
     /// Rebind `action` to exactly `keys`.
