@@ -99,7 +99,10 @@ pub enum SubagentError {
     /// charges the budget itself.
     ///
     /// Carries pi's verbatim over-limit notice (`Subagent spawn limit reached for this session
-    /// (N/M used, K requested). Complete the work directly or start a new session.`) as the whole
+    /// (N/M used, K requested). R remaining; the declared run cannot fit, so no children were
+    /// started. Grant budget explicitly from the root interactive session or start a new
+    /// session.` — `spawn-budget.ts:69`, the v0.43.0 text, which points at the SUBA-046 grant
+    /// path) as the whole
     /// message — byte-identical to the text the tool path returns as its `ToolError` — so the
     /// refusal reads the same on either surface.
     #[error("{0}")]

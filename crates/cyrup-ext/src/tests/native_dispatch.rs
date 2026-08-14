@@ -1304,6 +1304,201 @@ async fn ext019_a_panicking_transformer_is_contained_and_the_text_survives() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// EXT-021 (residual): onTerminalInput.
+// ---------------------------------------------------------------------------
+
+/// Rewrites the input by appending its marker, or consumes it outright when it sees `"!"`.
+struct InputWatcher {
+    id: &'static str,
+    marker: &'static str,
+    consume_on_bang: bool,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for InputWatcher {
+    fn id(&self) -> ExtensionId {
+        self.id.into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.subscribe_terminal_input();
+        // Idempotent, matching upstream's `Set.add`.
+        api.subscribe_terminal_input();
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+    fn on_terminal_input(&self, data: &str) -> Option<crate::TerminalInputResult> {
+        self.seen.lock().unwrap().push(data.to_string());
+        if self.consume_on_bang && data.contains('!') {
+            return Some(crate::TerminalInputResult { consume: Some(true), data: None });
+        }
+        Some(crate::TerminalInputResult {
+            consume: None,
+            data: Some(format!("{data}{}", self.marker)),
+        })
+    }
+}
+
+/// EXT-021's residual, closed. The crate-level CYRUP-DELTA register named `onTerminalInput`
+/// (`extensions/types.ts:145` @v0.83.0) as the ONE member of `interface ui` that was an open GAP
+/// rather than a delta, blocked only on the `HOST_WORLD` bump this pass spends.
+///
+/// The fold is pi's `TUI.handleInput` (`packages/tui/src/tui.ts:773-788`): each listener sees the
+/// CURRENT (possibly rewritten) data, in insertion order.
+#[tokio::test]
+async fn ext021_terminal_input_handlers_fold_in_load_order_and_each_sees_the_rewritten_data() {
+    let host = ExtensionHost::new(cfg());
+    let first_seen = Arc::new(Mutex::new(Vec::new()));
+    let second_seen = Arc::new(Mutex::new(Vec::new()));
+    host.load_native(Arc::new(InputWatcher {
+        id: "first",
+        marker: "-A",
+        consume_on_bang: false,
+        seen: first_seen.clone(),
+    }))
+    .await
+    .unwrap();
+    host.load_native(Arc::new(InputWatcher {
+        id: "second",
+        marker: "-B",
+        consume_on_bang: false,
+        seen: second_seen.clone(),
+    }))
+    .await
+    .unwrap();
+
+    let decision = host.terminal_input("k").await;
+    assert_eq!(decision, crate::TerminalInputDecision::Deliver("k-A-B".into()));
+    assert_eq!(first_seen.lock().unwrap().as_slice(), ["k"]);
+    assert_eq!(
+        second_seen.lock().unwrap().as_slice(),
+        ["k-A"],
+        "the second listener sees the FIRST one's rewrite, not the original (tui.ts:780-782)"
+    );
+}
+
+/// With no subscriber the chunk is delivered untouched — upstream guards the whole fold on
+/// `inputListeners.size > 0` (`tui.ts:773`). Asserted FIRST-CLASS rather than implied, because it
+/// is the path every keystroke in an extension-less session takes.
+#[tokio::test]
+async fn ext021_no_subscriber_delivers_the_input_untouched() {
+    let host = ExtensionHost::new(cfg());
+    assert_eq!(
+        host.terminal_input("\x1b[A").await,
+        crate::TerminalInputDecision::Deliver("\x1b[A".into())
+    );
+}
+
+/// `consume: true` STOPS the fold and drops the keystroke (`tui.ts:777-779`) — the listeners after
+/// it never run.
+#[tokio::test]
+async fn ext021_consume_stops_the_fold_and_drops_the_keystroke() {
+    let host = ExtensionHost::new(cfg());
+    let first_seen = Arc::new(Mutex::new(Vec::new()));
+    let second_seen = Arc::new(Mutex::new(Vec::new()));
+    host.load_native(Arc::new(InputWatcher {
+        id: "eater",
+        marker: "-A",
+        consume_on_bang: true,
+        seen: first_seen.clone(),
+    }))
+    .await
+    .unwrap();
+    host.load_native(Arc::new(InputWatcher {
+        id: "after",
+        marker: "-B",
+        consume_on_bang: false,
+        seen: second_seen.clone(),
+    }))
+    .await
+    .unwrap();
+
+    // A non-bang chunk still reaches both, so the assertion below is not vacuous.
+    assert_eq!(host.terminal_input("q").await, crate::TerminalInputDecision::Deliver("q-A-B".into()));
+    assert_eq!(second_seen.lock().unwrap().len(), 1);
+
+    assert_eq!(host.terminal_input("!").await, crate::TerminalInputDecision::Consume);
+    assert_eq!(
+        second_seen.lock().unwrap().len(),
+        1,
+        "the listener after a consuming one must not run"
+    );
+}
+
+/// A PANICKING handler is contained and treated as upstream's `undefined`: the input passes
+/// through and the rest of the fold still runs. Failing CLOSED here would let one broken extension
+/// swallow the keyboard with no way to type the command that unloads it.
+struct PanickingWatcher;
+
+#[async_trait::async_trait]
+impl NativeExtension for PanickingWatcher {
+    fn id(&self) -> ExtensionId {
+        "panics-on-input".into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.subscribe_terminal_input();
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+    fn on_terminal_input(&self, _data: &str) -> Option<crate::TerminalInputResult> {
+        panic!("input handler bug");
+    }
+}
+
+#[tokio::test]
+async fn ext021_a_panicking_input_handler_is_contained_and_the_keystroke_survives() {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(PanickingWatcher)).await.unwrap();
+    host.load_native(Arc::new(InputWatcher {
+        id: "after",
+        marker: "-B",
+        consume_on_bang: false,
+        seen: Arc::new(Mutex::new(Vec::new())),
+    }))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        host.terminal_input("z").await,
+        crate::TerminalInputDecision::Deliver("z-B".into()),
+        "the panicking step passes its input through and the chain continues"
+    );
+}
+
+/// A fold that ends with an EMPTY string also drops the keystroke (`tui.ts:784-786`) — distinct
+/// from `consume`, and the reason `TerminalInputResult.data` is an `Option<String>` rather than a
+/// bare `String`.
+struct BlankingWatcher;
+
+#[async_trait::async_trait]
+impl NativeExtension for BlankingWatcher {
+    fn id(&self) -> ExtensionId {
+        "blanks".into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.subscribe_terminal_input();
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+    fn on_terminal_input(&self, _data: &str) -> Option<crate::TerminalInputResult> {
+        Some(crate::TerminalInputResult { consume: None, data: Some(String::new()) })
+    }
+}
+
+#[tokio::test]
+async fn ext021_a_fold_that_ends_empty_drops_the_keystroke_without_consume() {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(BlankingWatcher)).await.unwrap();
+    assert_eq!(host.terminal_input("x").await, crate::TerminalInputDecision::Consume);
+}
+
 /// EXT-034, the re-entrancy half. A `Some(exclude)` on a dispatch means a guest is SUSPENDED inside
 /// one of its own host imports (`provider-stream.on-payload`) holding its single-instance
 /// `tokio::Mutex` store guard — the forced divergence documented on

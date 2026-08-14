@@ -54,6 +54,13 @@ cyrup-session-svc = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-modes = { workspace = true }
 cyrup-tui = { workspace = true }
+# SEAM-S03 — `signals.rs` drains the process-global detached-bash-child registry as the FIRST act of
+# every shutdown handler, exactly as Pi's three handlers open with `killTrackedDetachedChildren()`
+# (`utils/shell.ts:190-195` @v0.83.0). The registry has to live in `cyrup-tools` because the only two
+# things that write it are `LocalProc::exec`'s spawn and its RAII drop, so this bin can only read it
+# through a direct edge — it is already in the graph transitively (`cyrup-session-svc` depends on it),
+# so this names the existing rlib rather than adding a build.
+cyrup-tools = { workspace = true }
 # The SubAgents extension (arch-SA): registered as a native built-in at all three session
 # construction sites below, plus this bin owns the internal `__subagent-runner --config <path>`
 # hop-2 subcommand (`subagent_runner_cmd.rs`) that calls straight into its `background::runner_main`.

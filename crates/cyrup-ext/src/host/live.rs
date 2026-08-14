@@ -107,6 +107,7 @@ impl bindings::cyrup::ext::registration::Host for HostState {
     async fn register_tool(&mut self, t: wit_types::ToolDescriptor) {
         let Ok(guest) = guest_of(self) else { return };
         let parameters: Value = serde_json::from_str(&t.parameters_json).unwrap_or(Value::Null);
+        let desc_name_for_log = t.name.clone();
         let desc = ToolDescriptor {
             name: t.name,
             label: t.label,
@@ -123,6 +124,25 @@ impl bindings::cyrup::ext::registration::Host for HostState {
             // registry, so a guest set a documented field that did nothing and got no diagnostic.
             prepare_arguments: t.prepare_arguments,
             render_shell: t.render_shell,
+            // PROV-011 / EXT-024: pi `ToolDefinition.constrainedSampling`
+            // (`extensions/types.ts:463` @v0.83.0). Parsed ONCE here so a malformed declaration
+            // is a registration-time diagnostic instead of a per-turn surprise; an unparseable
+            // value degrades to the omitted field, which upstream is indistinguishable from
+            // `false`, rather than failing the whole registration — refusing the tool over a
+            // sampling HINT would be strictly worse than running it unconstrained.
+            constrained_sampling: t.constrained_sampling.as_deref().and_then(|raw| {
+                match serde_json::from_str::<cyrup_core::ConstrainedSampling>(raw) {
+                    Ok(cs) => Some(cs),
+                    Err(e) => {
+                        tracing::warn!(
+                            tool = %desc_name_for_log,
+                            error = %e,
+                            "ignoring unparseable constrainedSampling declaration"
+                        );
+                        None
+                    }
+                }
+            }),
         };
         // A guest tool is dispatched back across the boundary; register it via the registry's
         // descriptor table so the active-tool set can surface it (R-08-012/014).
@@ -246,6 +266,19 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         if let Ok(guest) = ui_guest_of(self) {
             guest.abort_signal(signal_id);
         }
+    }
+    /// pi `onTerminalInput(handler)` (`extensions/types.ts:145` @v0.83.0) — records that this
+    /// guest has a raw-input handler; the handler itself is reached through the
+    /// `on-terminal-input` EXPORT. EXT-021.
+    async fn subscribe_terminal_input(&mut self) {
+        let Ok(guest) = ui_guest_of(self) else { return };
+        let _ = guest.registry.subscribe_terminal_input(guest.owner.clone());
+    }
+    /// The unsubscribe function upstream's `onTerminalInput` returns (`Set.delete`,
+    /// `packages/tui/src/tui.ts:652-654`). Idempotent.
+    async fn unsubscribe_terminal_input(&mut self) {
+        let Ok(guest) = ui_guest_of(self) else { return };
+        let _ = guest.registry.unsubscribe_terminal_input(&guest.owner);
     }
     async fn confirm(&mut self, prompt: String, message: String, opts_json: String) -> bool {
         let opts = DialogOptions::parse(&opts_json);
@@ -1486,6 +1519,29 @@ impl LiveExtension {
         }
     }
 
+    /// Offer one raw terminal-input chunk to this guest's `onTerminalInput` handler (EXT-021; pi
+    /// `TerminalInputHandler`, `extensions/types.ts:113` @v0.83.0). Runs at EVENT tier: it is a
+    /// per-keystroke hook, so it must not be able to hold the draw loop past the epoch budget.
+    #[cfg(feature = "wasm-host")]
+    pub async fn on_terminal_input(
+        &self,
+        data: &str,
+    ) -> Result<Option<crate::TerminalInputResult>, ExtError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Event);
+        let api = inner.instance.cyrup_ext_events();
+        match api.call_on_terminal_input(&mut inner.store, data).await {
+            Ok(out) => Ok(out.map(|r| crate::TerminalInputResult {
+                consume: r.consume,
+                data: r.data,
+            })),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
     /// Run the guest provider's `login(callbacks)` flow (Pi `oauth.login`, host gap #1). Runs at
     /// COMMAND tier (user-initiated `/login`); during it the guest drives the `oauth` host imports.
     /// Returns the credentials JSON to persist. A guest fault is contained as a typed `ExtError`.
@@ -1728,6 +1784,16 @@ impl Tool for WasmTool {
             Some("self") => cyrup_core::ToolRenderKind::SelfRendered,
             _ => cyrup_core::ToolRenderKind::Default,
         }
+    }
+    /// The guest's declared `constrainedSampling` (pi
+    /// `ToolDefinition.constrainedSampling?: false | ConstrainedSamplingConfig`,
+    /// `extensions/types.ts:463` @v0.83.0). PROV-011 / EXT-024 — the field had no WIT
+    /// representation and `cyrup_core::Tool` had no accessor, so a guest tool asking for
+    /// grammar- or strict-JSON-schema-constrained sampling was answered with silence at BOTH
+    /// ends. Upstream the copy happens in `wrapToolDefinition`
+    /// (`core/tools/tool-definition-wrapper.ts:14`); this accessor is that copy.
+    fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
+        self.descriptor.constrained_sampling.as_ref()
     }
     /// pi `ToolDefinition.prepareArguments?: (args: unknown) => Static<TParams>`
     /// (`extensions/types.ts:468` @v0.83.0), run BEFORE `validateToolArguments` in

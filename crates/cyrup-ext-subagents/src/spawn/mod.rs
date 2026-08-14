@@ -388,7 +388,13 @@ pub enum ChildStep {
 }
 
 pub struct SpawnedChild {
-    child: tokio::process::Child,
+    /// The live child process — `Option` ONLY so [`SpawnedChild::terminate_with_graces`] can hand
+    /// the `Child` to [`signal::terminate_with_graces`] by value while this type still implements
+    /// [`Drop`] (SUBA-039). Rust forbids moving a field out of a type with a `Drop` impl, and the
+    /// guard is worth the `Option`: see the `impl Drop` below for what it prevents. `None` only
+    /// after the child has been handed to the escalation ladder, i.e. only inside a method that
+    /// consumes `self`.
+    child: Option<tokio::process::Child>,
     /// The child's stdout, read through the BOUNDED line reader (pi `createBoundedLineReader`,
     /// `child-protocol.ts:244`) rather than `tokio::io::Lines`. The distinction is not cosmetic:
     /// `Lines` grows one `String` until it sees a `\n`, so a child emitting one enormous line grows
@@ -482,7 +488,7 @@ impl SpawnedChild {
         let temp_files = std::mem::take(&mut spec.temp_files);
         match Self::spawn_wired(&spec, jsonl_path).await {
             Ok((child, stdout, stderr, jsonl_writer)) => Ok(Self {
-                child,
+                child: Some(child),
                 stdout: BoundedLineStream::stdout(stdout),
                 // Pumped from THIS instant, before anything can await the child — pi attaches its
                 // own `proc.stderr.on("data", …)` handler at the same point (`execution.ts:1056`).
@@ -578,7 +584,7 @@ impl SpawnedChild {
     /// and been reaped, in which case `tokio` no longer exposes a pid).
     #[must_use]
     pub fn id(&self) -> Option<u32> {
-        self.child.id()
+        self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
     /// Read and return the next line of the child's stdout as NDJSON (R-SA-057/058).
@@ -647,17 +653,20 @@ impl SpawnedChild {
             ..
         } = self;
 
-        let read = if *exited {
-            stdout.next().await
-        } else {
-            tokio::select! {
+        let read = match (*exited, child.as_mut()) {
+            (false, Some(child)) => tokio::select! {
                 biased;
                 line = stdout.next() => line,
                 status = child.wait() => {
                     *exited = true;
                     return ChildStep::Exited(status);
                 }
-            }
+            },
+            // Already reaped — or, structurally unreachable while a caller still holds `&mut self`,
+            // the `Child` was handed to the escalation ladder by `terminate_with_graces` (which
+            // consumes `self`). Either way: degrade to a pure stdout read, exactly as the reaped
+            // case already did, so a caller that keeps draining never double-`wait()`s.
+            _ => stdout.next().await,
         };
 
         let line = match read {
@@ -706,12 +715,17 @@ impl SpawnedChild {
     /// timeout here does not send any signal, it only tells the caller the bounded wait is over
     /// so *they* can decide whether to escalate.
     pub async fn wait_final_drain(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            // Structurally unreachable: the `Child` is taken only by `terminate_with_graces`, which
+            // consumes `self`. Reported as "not confirmed exited" rather than fabricating a status.
+            return Ok(None);
+        };
         if self.exited {
-            return Ok(self.child.wait().await.ok());
+            return Ok(child.wait().await.ok());
         }
         tokio::select! {
             biased;
-            result = self.child.wait() => {
+            result = child.wait() => {
                 let status = result?;
                 self.exited = true;
                 Ok(Some(status))
@@ -760,7 +774,15 @@ impl SpawnedChild {
         graces: signal::EscalationGraces,
     ) -> std::io::Result<signal::TerminationOutcome> {
         self.exited = true;
-        let outcome = signal::terminate_with_graces(self.child, cancel, graces).await;
+        let Some(child) = self.child.take() else {
+            // Structurally unreachable (the `Child` is taken only here, and this method consumes
+            // `self`), and deliberately not a panic: this crate forbids them outside tests.
+            cleanup_temp_files(&self.temp_files);
+            return Err(std::io::Error::other(
+                "subagent child was already consumed by the escalation ladder",
+            ));
+        };
+        let outcome = signal::terminate_with_graces(child, cancel, graces).await;
         cleanup_temp_files(&self.temp_files); // R-SA-067: cleaned up on this (failure/cancel) path too
         outcome
     }
@@ -771,8 +793,74 @@ impl SpawnedChild {
     /// counterpart to [`SpawnedChild::terminate`]'s cleanup on the failure/cancellation path.
     /// Consuming `self` makes it a compile-time error to keep using a `SpawnedChild` after
     /// either exit path has run.
-    pub fn finish(self) {
+    pub fn finish(mut self) {
+        // SUBA-039: `finish`'s documented precondition is "the caller has CONFIRMED the child
+        // exited on its own", so record that confirmation before the value drops. Without it the
+        // new `Drop` guard below would read `exited: false` on a perfectly healthy success path
+        // and SIGKILL the child's process group — which on the success path means killing whatever
+        // descendants the child deliberately left running, a behaviour neither cyrup nor pi has.
+        self.exited = true;
         cleanup_temp_files(&self.temp_files); // R-SA-067: cleaned up on this (success) path too
+    }
+}
+
+/// SUBA-039 — the RAII guard that keeps an ABANDONED subagent child from orphaning its whole
+/// detached process group.
+///
+/// # Why this exists at all: a JS→Rust mechanism gap, not a missing feature
+///
+/// pi never passes `detached`, so its children stay in pi's own process group and a terminal
+/// signal reaches the whole tree however a promise unwinds; and a JS `async` function always
+/// settles, so pi's cleanup on the failure path always runs. Neither guarantee exists here. This
+/// crate deliberately puts every child in its OWN group (`command.process_group(0)`, so the
+/// escalation ladder can reach the child's descendants — see [`signal::terminate`]), and a Rust
+/// future can be DROPPED at any `.await`. A `select!` arm that wins, a `tokio::time::timeout` that
+/// fires, a `JoinHandle::abort`, or a host abandoning the tool call therefore drops the drive
+/// future mid-run — and the only two paths that signalled the child ([`SpawnedChild::terminate`])
+/// or cleaned up after it ([`SpawnedChild::finish`]) are *success-shaped* calls that never happen.
+///
+/// What is left behind is not one process: it is a re-exec'd `cyrup` plus whatever `cargo`/`npm`/
+/// `git`/nested subagent it was blocked in, in a process group that `process_group(0)` has already
+/// detached from the terminal's foreground group — so the user's own Ctrl-C cannot reach it and it
+/// runs for the machine's uptime.
+///
+/// # Why `kill_on_drop(true)` is NOT the fix
+///
+/// tokio's `kill_on_drop` targets the bare pid. The direct child is exactly the process this
+/// crate cares least about: it is the descendants — the ones `process_group(0)` exists to make
+/// reachable — that survive a pid-only kill. This guard sends the group kill instead, through the
+/// same [`signal::send_sigkill`] the ladder's own final rung uses, which negates the pid only when
+/// the child genuinely LEADS its group (`getpgid(pid) == pid`) and otherwise falls back to the
+/// single pid — never signalling a group this process merely belongs to.
+///
+/// # What it does, and what it deliberately does not
+///
+/// * Temp files (R-SA-067) are removed on EVERY drop, which is what finally makes that cleanup
+///   unconditional; the explicit calls in `finish`/`terminate_with_graces` are retained (removal
+///   is idempotent) because they document the two ordinary paths.
+/// * The kill fires only when the child was never confirmed exited (`exited == false`) and is
+///   still owned here. Every ordinary path — `wait_final_drain` returning a status,
+///   `next_event_or_exit` observing `Exited`, `finish`, `terminate` — has already set `exited`, so
+///   on those paths this is a pure no-op and no signal is sent.
+/// * It cannot `await`, so it does not wait for the group to die. It does not have to: `kill(-pgid,
+///   SIGKILL)` is not catchable and not maskable. Dropping the `tokio::process::Child` afterwards
+///   hands the pid to tokio's orphan queue, which reaps it on the next `SIGCHLD` — so this leaves
+///   no zombie either.
+impl Drop for SpawnedChild {
+    fn drop(&mut self) {
+        cleanup_temp_files(&self.temp_files);
+        if self.exited {
+            return;
+        }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        tracing::warn!(
+            pid = ?child.id(),
+            "subagent child dropped without terminate()/finish(); SIGKILLing its process group \
+             (SUBA-039) so the detached subtree is not orphaned"
+        );
+        signal::send_sigkill(&mut child);
     }
 }
 
@@ -1740,6 +1828,76 @@ mod tests {
             "the child's own descendant (pid {grandchild_pid}) must be terminated by the \
              escalation ladder too, not left running as an orphan after the direct child \
              (pid {child_pid}) was signalled"
+        );
+    }
+
+    /// SUBA-039 — DROPPING a `SpawnedChild` (rather than calling `terminate`/`finish`) must not
+    /// orphan its detached process group.
+    ///
+    /// THE USER ACTION: an orchestrator cancels a delegation, a `timeout` fires, or a `select!`
+    /// arm wins, and the future driving a live child is dropped at an `.await`. This is the
+    /// JS→Rust gap: a JS `async` function always settles, so pi's cleanup always runs; a Rust
+    /// future can be dropped at ANY await point, and neither of this type's two cleanup entry
+    /// points (`terminate`, `finish`) is reached when that happens. Combined with
+    /// `process_group(0)` — which detaches the child from the terminal's foreground group so the
+    /// user's Ctrl-C cannot reach it either — the whole subtree ran for the machine's uptime.
+    ///
+    /// The assertion is on the DESCENDANT, and that is the point: `kill_on_drop(true)` would kill
+    /// the direct child and leave this pid running, so a test that only checked the direct child
+    /// would pass against the inadequate fix. The direct child is deliberately not asserted on —
+    /// after its parent (this test process) drops the handle it is a zombie until tokio's orphan
+    /// reaper runs on the next SIGCHLD, which is not what this test is about.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_spawned_child_kills_its_whole_process_group_rather_than_orphaning_it() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let pid_path = dir.path().join("grandchild.pid");
+        // Same fixture shape as the escalation-ladder descendant test above, including the
+        // load-bearing trailing `; :` that defeats `sh -c`'s exec-through optimization (SUBA-067:
+        // without it all three processes collapse into ONE pid and the test proves nothing).
+        let script = format!(
+            "sh -c 'echo $$ > \"{path}.tmp\"; mv \"{path}.tmp\" \"{path}\"; exec sleep 300' ; :",
+            path = pid_path.display()
+        );
+        let spec = ChildSpawnSpec {
+            command: sh_command(&script),
+            args: Vec::new(),
+            task_arg: String::new(),
+            env_overlay: HashMap::new(),
+            cwd: dir.path().to_path_buf(),
+            temp_files: vec![dir.path().join("task.txt")],
+        };
+        std::fs::write(dir.path().join("task.txt"), b"spilled task")
+            .expect("write the temp file the drop must also clean up");
+        let jsonl_path = dir.path().join("dropped.jsonl");
+        let child = SpawnedChild::spawn(spec, &jsonl_path)
+            .await
+            .expect("scripted sh child spawns");
+        let child_pid = child.id().expect("live child has a pid");
+        let grandchild_pid = read_published_pid(&pid_path, Duration::from_secs(10))
+            .await
+            .expect("the child script publishes its descendant's pid");
+        assert_ne!(
+            grandchild_pid, child_pid,
+            "the script must really have forked a separate descendant process"
+        );
+        // The precondition the absence-assertion below needs (blind spot 4 in the sweep rules): the
+        // descendant is genuinely ALIVE right now, so "it is gone" cannot pass vacuously.
+        assert!(
+            !pid_is_terminated(grandchild_pid, Duration::from_millis(0)).await,
+            "precondition: the descendant must be running before the handle is dropped"
+        );
+
+        drop(child);
+
+        assert!(
+            pid_is_terminated(grandchild_pid, Duration::from_secs(10)).await,
+            "an abandoned child's descendant (pid {grandchild_pid}) must be SIGKILLed by the Drop \
+             guard, not left running in a detached group nothing holds a handle to"
+        );
+        assert!(
+            !dir.path().join("task.txt").exists(),
+            "R-SA-067 temp-file cleanup is now unconditional: the drop path must remove it too"
         );
     }
 

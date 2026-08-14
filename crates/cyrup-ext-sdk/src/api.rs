@@ -12,7 +12,7 @@ use crate::ctx::{CommandCtx, Ctx, ToolCall};
 use crate::descriptor::{CommandDescriptor, FlagSpec, ProviderConfig, ToolDescriptor};
 use crate::events::*;
 use crate::provider::{OAuthCallbacks, OAuthCredentials, ProviderHandlers, ProviderStream};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -357,6 +357,54 @@ pub trait MarkdownTransformer: 'static {
     fn transform(&self, markdown: &str, ctx: &MarkdownTransformContext) -> String;
 }
 
+/// One terminal-input handler's answer (EXT-021; pi `TerminalInputHandler`'s return,
+/// `extensions/types.ts:113` @v0.83.0: `{ consume?: boolean; data?: string } | undefined`).
+///
+/// Both members stay `Option`: the host's fold — a port of `packages/tui/src/tui.ts:773-788` —
+/// tests `consume` for truthiness and `data` for PRESENCE, so `{data: Some("")}` rewrites the
+/// buffer to empty (and the keystroke is then dropped) while `TerminalInputResult::default()`
+/// leaves it alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalInputResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consume: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
+impl TerminalInputResult {
+    /// Swallow this keystroke — pi's `{consume: true}`.
+    pub fn consume() -> Self {
+        Self { consume: Some(true), data: None }
+    }
+
+    /// Rewrite this keystroke and let the remaining handlers (and the editor) see the new value —
+    /// pi's `{data}`.
+    pub fn rewrite(data: impl Into<String>) -> Self {
+        Self { consume: None, data: Some(data.into()) }
+    }
+}
+
+/// A raw terminal-input handler (EXT-021; pi `TerminalInputHandler`,
+/// `extensions/types.ts:113` @v0.83.0). `None` is upstream's `undefined` — "I looked at it and
+/// did nothing".
+///
+/// Interactive mode only, exactly as upstream documents `onTerminalInput`
+/// (`types.ts:144`): in RPC mode pi's own implementation is a no-op that returns an unsubscribe
+/// doing nothing (`modes/rpc/rpc-mode.ts:162`).
+pub trait TerminalInputHandler: 'static {
+    fn on_input(&self, data: &str) -> Option<TerminalInputResult>;
+}
+
+impl<F> TerminalInputHandler for F
+where
+    F: Fn(&str) -> Option<TerminalInputResult> + 'static,
+{
+    fn on_input(&self, data: &str) -> Option<TerminalInputResult> {
+        self(data)
+    }
+}
+
 impl<F> MarkdownTransformer for F
 where
     F: Fn(&str, &MarkdownTransformContext) -> String + 'static,
@@ -389,6 +437,12 @@ pub struct ExtensionApi {
     /// EXT-019: at most one per extension (Pi `extension.markdownTransformer`, types.ts:1703
     /// @v0.84.1).
     pub(crate) markdown_transformer: Option<Box<dyn MarkdownTransformer>>,
+    /// EXT-021: this extension's raw terminal-input handler, if it subscribed. AT MOST ONE —
+    /// upstream allows several `onTerminalInput` calls per extension, but each returns its own
+    /// unsubscribe and the host's subscriber table is keyed by EXTENSION, so a guest with two
+    /// handlers would be folded once. Modelling it as one handler makes that explicit instead of
+    /// silently dropping the second.
+    pub(crate) terminal_input_handler: Option<Box<dyn TerminalInputHandler>>,
     pub(crate) autocomplete: Vec<String>,
     /// Stacked global autocomplete providers (Pi `addAutocompleteProvider`, sdk gap #2). Folded in
     /// registration order over the host's built-in suggestions by [`Self::autocomplete_suggest`].
@@ -584,6 +638,26 @@ impl ExtensionApi {
     /// `register-markdown-transformer` import at init).
     pub fn has_markdown_transformer(&self) -> bool {
         self.markdown_transformer.is_some()
+    }
+
+    /// Listen to raw terminal input (EXT-021; pi `ctx.ui.onTerminalInput(handler)`,
+    /// `extensions/types.ts:145` @v0.83.0 — "Listen to raw terminal input (interactive mode
+    /// only)"). A second call REPLACES the first; see
+    /// [`ExtensionApi::terminal_input_handler`]'s field doc for why.
+    pub fn on_terminal_input(&mut self, handler: impl TerminalInputHandler) {
+        self.terminal_input_handler = Some(Box::new(handler));
+    }
+
+    /// Run this extension's terminal-input handler, if it registered one (the
+    /// `on-terminal-input` export body). `None` — upstream's `undefined` — when it did not.
+    pub fn handle_terminal_input(&self, data: &str) -> Option<TerminalInputResult> {
+        self.terminal_input_handler.as_ref().and_then(|h| h.on_input(data))
+    }
+
+    /// Whether this extension subscribed to raw terminal input (drives the
+    /// `ui.subscribe-terminal-input` import at init).
+    pub fn has_terminal_input_handler(&self) -> bool {
+        self.terminal_input_handler.is_some()
     }
 
     /// Register a custom ENTRY renderer (Pi `pi.registerEntryRenderer(customType, renderer)`,

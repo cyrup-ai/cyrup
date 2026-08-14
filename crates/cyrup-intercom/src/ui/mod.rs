@@ -5,15 +5,21 @@
 //! - [`inline_message::InlineMessage`] renders the inbound-message card AND builds the
 //!   `append_entry("intercom_message", …)` payload that surfaces an inbound broker message to the
 //!   human — driven from [`crate::inbound::surface_incoming_message`] on EVERY real inbound message
-//!   (`crate::extension`'s `SessionStart` inbound loop). This is the port doc §4.2/§7.2 human surface.
+//!   (`crate::extension`'s `SessionStart` inbound loop). This is the port doc §4.2/§7.2 human
+//!   surface, and as of ICOM-028 the card it pre-renders is actually DRAWN: `IntercomExtension`
+//!   registers an entry renderer for `intercom_message` and implements
+//!   `NativeExtension::render_entry`. Before that the payload was written and consumed by nothing —
+//!   the transcript showed a grey `entry appended → intercom_message` line instead of the card.
 //! - [`session_list::SessionListOverlay::render`] + [`compose::compose_send`] are driven by the
 //!   `/intercom` slash command ([`crate::extension::IntercomExtension::execute_command`]).
 //!
 //! **What DEGRADES (the port doc §4.3, precise later-phase TODO):** cyrup's native `InitApi` has no
-//! `register_message_renderer` / `register_shortcut`, so the *interactive* overlay-host surface — the
-//! `alt+m` shortcut opening a live [`compose::ComposeOverlay`]/[`session_list::SessionListOverlay`]
-//! with live keystroke handling, and the live `intercom_message` inline-card renderer — is not
-//! reachable yet. The overlays' interactive `handle_input` state machines are ported faithfully and
+//! `register_message_renderer`, so the live *message* renderer for the injected
+//! `intercom_message` custom message is still unreachable — and blocked outside this crate besides,
+//! since `HostServices::inject_message` carries no `details` for one to read (ICOM-029/ICOM-024).
+//! The *interactive* overlay-host surface — the `alt+m` shortcut opening a live
+//! [`compose::ComposeOverlay`]/[`session_list::SessionListOverlay`] with live keystroke handling —
+//! is likewise not reachable yet. The overlays' interactive `handle_input` state machines are ported faithfully and
 //! exercised by unit tests; they are wired to a real event source only once Phase 6 adds those two
 //! `InitApi` hooks (a small arch-08 addition). This is DOCUMENTED, not silently dead: the render/send
 //! paths ARE wired via the command + inbound surface above.

@@ -33,7 +33,7 @@ const REPLY_HINT_COMMAND: &str = "intercom({ action: \"reply\", message: \"...\"
 /// The custom-message type an inbound intercom message is injected under when it drives an agent turn
 /// (matches the durable surface's `append_entry("intercom_message", …)` type, so the live host routes
 /// both under the same kind — pi `sendMessage({customType:"intercom_message"})`, `index.ts:656`).
-const INBOUND_MESSAGE_CUSTOM_TYPE: &str = "intercom_message";
+pub(crate) const INBOUND_MESSAGE_CUSTOM_TYPE: &str = "intercom_message";
 /// The busy auto-reply sent back to a sender when this session is running non-interactively and
 /// cannot surface the message to a human (pi's non-interactive busy reply,
 /// `v0.10.1 index.ts:946-947`, byte for byte).
@@ -559,7 +559,7 @@ pub fn surface_incoming_message(
         "bodyText": card.body(),
         "collapsed": card.collapsed,
     });
-    match services.append_entry("intercom_message", &payload) {
+    match services.append_entry(INBOUND_MESSAGE_CUSTOM_TYPE, &payload) {
         Ok(id) => Some(id),
         Err(e) => {
             tracing::warn!(error = %e, "intercom: failed to surface inbound message via append_entry");

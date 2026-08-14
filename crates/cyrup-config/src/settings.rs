@@ -558,6 +558,23 @@ impl EffectiveSettings {
         self.merged.get_bool("hideThinkingBlock").unwrap_or(false)
     }
 
+    /// `getShowCacheMissNotices` — `showCacheMissNotices`, default `false` (Pi
+    /// settings-manager.ts:96 declares the key, `:850-852` the getter, `:872-875` the setter, which
+    /// is cyrup's generic [`SettingsManager::set`] on the GLOBAL scope; upstream's per-key setter
+    /// writes `this.globalSettings` too). CFG-014.
+    ///
+    /// **Consumer half is NOT here and this accessor is not the item's closure.** Pi reads it at
+    /// `modes/interactive/interactive-mode.ts:3354` @v0.83.0 to re-inject a per-message cache-miss
+    /// notice into the transcript; the detection side already exists at
+    /// `cyrup-provider/src/cache_stats.rs`, whose module doc names this key as the missing
+    /// prerequisite for PROV-035's wiring half. Landing the accessor unblocks that work — an
+    /// accessor with no consumer is a `/settings` row, not a feature.
+    pub fn show_cache_miss_notices(&self) -> bool {
+        self.merged
+            .get_bool("showCacheMissNotices")
+            .unwrap_or(false)
+    }
+
     /// `getThemeSetting` — the raw `theme` string, or `None` when unset / not a string
     /// (Pi settings-manager.ts:718-721). No default is applied here.
     pub fn theme_setting(&self) -> Option<String> {
@@ -1931,8 +1948,20 @@ mod tests {
         assert_eq!(s.tree_filter_mode(), "default");
         assert_eq!(s.autocomplete_max_visible(), 5);
         assert_eq!(s.code_block_indent(), "  ");
+        // CFG-014 — `showCacheMissNotices` defaults to false (settings-manager.ts:96 @v0.83.0).
+        assert!(!s.show_cache_miss_notices());
         // `outputPad` defaults to 1 (Pi `getOutputPad`: only an explicit 0 yields 0).
         assert_eq!(s.output_pad(), 1);
+    }
+
+    /// CFG-014 — the key round-trips through the merged view, so the TUI consumer (PROV-035's
+    /// wiring half) has a real value to read rather than a hardcoded `false`.
+    #[test]
+    fn show_cache_miss_notices_reads_the_settings_key() {
+        let s = EffectiveSettings::from_settings(
+            Settings::parse(r#"{"showCacheMissNotices": true}"#).expect("valid settings"),
+        );
+        assert!(s.show_cache_miss_notices());
     }
 
     /// CFG-030: a top level that is valid JSON but not an object is an ERROR, so the load-error

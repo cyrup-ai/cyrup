@@ -137,6 +137,13 @@ pub mod fleet_view;
 /// `runs/background/wait.ts`. See [`wait`] for the full subsystem doc.
 pub mod wait;
 
+/// SUBA-060 — "resume-first" guidance for FAILED async runs: port of pi
+/// `runs/background/resume-guidance.ts` (v0.45.2). Tells the orchestrator to revive a failed run's
+/// persisted child session before launching a replacement; consumed by [`wait`] at pi's own
+/// position in the result text. See [`resume_guidance`] for the one upstream formatter this module
+/// deliberately leaves to PARITY-GAPS VL-S8.
+pub mod resume_guidance;
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -234,6 +234,7 @@ pub(crate) type InitParts = (
     u32,
     Vec<String>,
     bool,
+    bool,
 );
 
 /// What a native extension declares during [`NativeExtension::init`]: its subscriptions plus any
@@ -264,6 +265,10 @@ pub struct InitApi {
     /// because upstream stores `extension.markdownTransformer = transformer` — at most one per
     /// extension (`extensions/loader.ts:309-312` @v0.84.1, field at `types.ts:1703`).
     markdown_transformer: bool,
+    /// EXT-021: whether this extension subscribed to raw terminal input. A BOOL, not a list, for
+    /// the same reason as `markdown_transformer`: upstream's `Set` de-duplicates by handler and a
+    /// native has exactly one [`NativeExtension::on_terminal_input`].
+    terminal_input: bool,
 }
 
 impl InitApi {
@@ -346,6 +351,15 @@ impl InitApi {
         self.markdown_transformer = true;
     }
 
+    /// Subscribe to raw terminal input (EXT-021; pi
+    /// `ExtensionUIContext.onTerminalInput(handler)`, `extensions/types.ts:145` @v0.83.0). The
+    /// handler itself is [`NativeExtension::on_terminal_input`]; this only declares that it
+    /// exists, matching the guest side where the closure lives behind the `on-terminal-input`
+    /// export.
+    pub fn subscribe_terminal_input(&mut self) {
+        self.terminal_input = true;
+    }
+
     /// Declare a CLI flag (EXT-035; pi `registerFlag`, `extensions/loader.ts:274-410` @v0.83.0).
     /// `spec` is the flag's JSON spec; the resolved value is read back through
     /// [`crate::ExtensionRegistry::flag`].
@@ -397,6 +411,7 @@ impl InitApi {
             self.autocomplete_providers,
             self.bus_topics,
             self.markdown_transformer,
+            self.terminal_input,
         )
     }
 }
@@ -587,6 +602,17 @@ pub trait NativeExtension: Send + Sync {
     /// never blank a line of transcript.
     fn transform_markdown(&self, markdown: &str, _ctx: &serde_json::Value) -> String {
         markdown.to_string()
+    }
+
+    /// Inspect one raw terminal-input chunk (EXT-021; pi `TerminalInputHandler`,
+    /// `extensions/types.ts:113` @v0.83.0: `(data: string) => {consume?, data?} | undefined`).
+    /// Only consulted on a native that declared [`InitApi::subscribe_terminal_input`].
+    ///
+    /// `None` is upstream's `undefined` — "I looked at it and did nothing". Sync for the same
+    /// reason as [`Self::render_call`]: it runs on the UI's input path. A PANIC is contained by
+    /// the host and treated as `None`, so a broken extension can never swallow the keyboard.
+    fn on_terminal_input(&self, _data: &str) -> Option<crate::TerminalInputResult> {
+        None
     }
 
     /// Render a custom ENTRY this extension declared a renderer for via

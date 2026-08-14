@@ -186,6 +186,7 @@ fn a_guest_descriptor_cannot_displace_an_already_owned_tool_name() {
         ToolDescriptor {
             prepare_arguments: false,
             render_shell: None,
+            constrained_sampling: None,
             name: "shared".to_string(),
             label: "Shared".to_string(),
             description: "guest".to_string(),

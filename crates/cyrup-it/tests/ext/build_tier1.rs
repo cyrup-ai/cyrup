@@ -74,7 +74,9 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     // ---------------------------------------------------------------------------------------
     // THE WORLD-BUMP PROOF. Everything above is a byte check: the preamble says "a component",
     // not "a component THIS host can link". Sweep 2 moved `HOST_WORLD` from `cyrup:ext@0.5` to
-    // `@0.6` on the strength of host `bindgen!` accepting the new shapes and
+    // `@0.6`, and sweep 4 to `@0.7` (`types.tool-descriptor` gained `constrained-sampling`, which
+    // re-signs the `registration.register-tool` import — PROV-011/EXT-024), on the strength of
+    // host `bindgen!` accepting the new shapes and
     // `cargo check -p cyrup-ext-sdk --target wasm32-wasip2` expanding `export_extension!` cleanly
     // — i.e. host and guest agreeing at the TYPE level, in two separate compilations that never
     // met. A world whose two copies have drifted, or an import re-signing the guest did not pick
@@ -86,7 +88,7 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     // `crates/cyrup-it/build.rs` builds with a plain `cargo build -p cyrup-ext-sdk`. Nothing
     // instantiated the bytes the PRODUCTION Tier-1 loop returns until this assertion.
     // ---------------------------------------------------------------------------------------
-    assert_eq!(HOST_WORLD, "cyrup:ext@0.6", "the world this artifact is being linked against");
+    assert_eq!(HOST_WORLD, "cyrup:ext@0.7", "the world this artifact is being linked against");
 
     let host = ExtensionHost::with_wasm(HostConfig {
         mode: cyrup_ext::ExtMode::Tui,

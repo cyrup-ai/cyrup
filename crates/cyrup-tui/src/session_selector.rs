@@ -22,7 +22,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::keymap::{
-    EditorAction, EditorKeymap, SelectAction, SelectKeymap, SessionAction, SessionKeymap,
+    EditorAction, EditorKeymap, Key, SelectAction, SelectKeymap, SessionAction, SessionKeymap,
 };
 use crate::selector::{Selector, SelectorOutcome};
 use crate::session_search::{filter_and_sort, NameFilter, SearchRow, SortMode};
@@ -47,9 +47,10 @@ pub struct SessionRow {
 }
 
 /// Which session set the picker is showing (`SessionScope`, `session-selector.ts:24`). The header
-/// radio at `:144-148` reports it; the `Tab` toggle at `:551-556` needs an all-sessions loader,
-/// which the cyrup chrome does not hand the selector yet — the state is settable
-/// ([`SessionSelector::set_scope`]) so the header can tell the truth about which set is on screen.
+/// radio at `:144-148` reports it and the `Tab` toggle at `:551-556` flips it
+/// ([`SessionSelector::set_all_rows`] supplies the second set, upstream's `allSessionsLoader`).
+/// The scope also decides `showCwd` — `const showCwd = scope === "all"` (`:844`, `:923`) — which is
+/// why the cwd column in [`SessionSelector::set_session_cwds`] appears only here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SessionScope {
     /// Sessions rooted at the current folder (pi's `"current"`).
@@ -142,7 +143,21 @@ impl SessionSelectorOutcome {
 
 /// The interactive `/resume` selector.
 pub struct SessionSelector {
+    /// The set currently on screen — pi's `SessionList.allSessions` (`session-selector.ts:288`),
+    /// i.e. whichever of [`Self::current_rows`] / [`Self::all_rows`] the live [`Self::scope`] names.
+    /// Always re-derived through [`Self::resync_rows`]; never edited independently of the two caches.
     rows: Vec<SessionRow>,
+    /// pi's `SessionSelectorComponent.currentSessions` (`:707`) — the `currentSessionsLoader` result,
+    /// the cwd's own sessions.
+    current_rows: Vec<SessionRow>,
+    /// pi's `allSessions` (`:708`) — the `allSessionsLoader` result, every project's sessions.
+    /// `None` is upstream's un-wired `onToggleScope` (`:551-556`): `Tab` is still SWALLOWED, it just
+    /// has nothing to switch to. A host that can reach other projects calls [`Self::set_all_rows`].
+    all_rows: Option<Vec<SessionRow>>,
+    /// Session file path → the session's stored `cwd` (`SessionInfo.cwd`), for the `showCwd` column
+    /// at `:468-470`. Fed like [`Self::set_parent_paths`] rather than carried on [`SessionRow`], so
+    /// the row struct every existing caller builds stays source-compatible.
+    cwds: HashMap<String, String>,
     /// The live search query (the embedded `Input`).
     query: String,
     /// Cursor byte offset within `query`.
@@ -174,9 +189,16 @@ pub struct SessionSelector {
     /// The live `tui.select.*` table, for the delete-confirmation hint's `confirm`/`cancel` keys
     /// (`:159`). Refreshed from whatever table actually routed a key, like [`crate::ListSelector`].
     select_keymap: SelectKeymap,
-    /// The label of the key bound to `tui.input.tab` — the `scope` hint at `:170`. cyrup's editor
-    /// tier owns that binding (`EditorAction::Tab`), the same source `/model`'s scope hint reads.
-    tab_key: String,
+    /// The keys bound to `tui.input.tab`. They answer pi's `kb.matches(keyData, "tui.input.tab")`
+    /// (`:551`) AND label the `scope` hint at `:170` — one source, so a rebind moves both. cyrup's
+    /// editor tier owns that binding (`EditorAction::Tab`), the same source `/model`'s scope hint
+    /// reads. Matching per-id like this is what upstream does; resolving the event against the whole
+    /// `EditorKeymap` instead would let unrelated editor bindings fire inside a list selector.
+    ///
+    /// Empty means the user unbound `tui.input.tab`: `Tab` then matches nothing and the hint drops
+    /// its key run, exactly as `keyText`'s `keys.length === 0` → `""` arm produces
+    /// (`keybinding-hints.ts:29-36`).
+    tab_keys: Vec<Key>,
     /// `showRenameHint` (`:102-104`, defaulted from `!!renameSession` at `:772`): whether the
     /// `rename` pair is appended to hint row 2 (`:177-179`). Upstream hides it when the host wired
     /// no rename callback.
@@ -191,6 +213,9 @@ impl SessionSelector {
     /// no edges every row is a root, so the list degrades to the same flat, newest-first order.
     pub fn new(rows: Vec<SessionRow>) -> Self {
         SessionSelector {
+            current_rows: rows.clone(),
+            all_rows: None,
+            cwds: HashMap::new(),
             rows,
             query: String::new(),
             cursor: 0,
@@ -206,9 +231,7 @@ impl SessionSelector {
             parents: HashMap::new(),
             session_keymap: SessionKeymap::default(),
             select_keymap: SelectKeymap::default(),
-            tab_key: EditorKeymap::default()
-                .keys_label(EditorAction::Tab)
-                .unwrap_or_else(|| "tab".to_string()),
+            tab_keys: EditorKeymap::default().keys_for(EditorAction::Tab),
             // `options?.showRenameHint ?? this.canRename` (`:772`), and cyrup's `/resume` always
             // wires the rename path (`SessionSelectorOutcome::Rename` → `rename_session`).
             show_rename_hint: true,
@@ -221,9 +244,10 @@ impl SessionSelector {
     #[must_use]
     pub fn with_keymaps(mut self, session: &SessionKeymap, editor: &EditorKeymap) -> Self {
         self.session_keymap = session.clone();
-        if let Some(label) = editor.keys_label(EditorAction::Tab) {
-            self.tab_key = label;
-        }
+        // The handler and the hint move together because they are one field: pi resolves BOTH
+        // through the same `tui.input.tab` binding (`:551` and `:170`), so a user who rebinds tab
+        // gets a picker that listens for — and advertises — the key they chose.
+        self.tab_keys = editor.keys_for(EditorAction::Tab);
         self
     }
 
@@ -246,14 +270,68 @@ impl SessionSelector {
         self.current_path = path;
     }
 
-    /// Set the scope the header radio reports (`session-selector.ts:144-148`).
+    /// Supply the **all-projects** session set — pi's `allSessionsLoader`
+    /// (`cli/session-picker.ts:15-19`, `:26-28` / `interactive-mode.ts:4787-4790`, both
+    /// `SessionManager.listAll`). Wiring it is what makes `Tab` a scope toggle: upstream's handler
+    /// is `if (this.onToggleScope) this.onToggleScope();` (`session-selector.ts:551-556`), so a host
+    /// that never wires the second loader still SWALLOWS `Tab` — it just has nowhere to go.
+    ///
+    /// pi loads this set lazily on the first toggle (`toggleScope`, `:1003-1018`) because its loader
+    /// is async and can report progress; cyrup's picker is fed synchronously, so the host hands both
+    /// sets over up front and the "loading" header branch (`:141-143`) has nothing to report.
+    pub fn set_all_rows(&mut self, rows: Vec<SessionRow>) {
+        self.all_rows = Some(rows);
+        self.resync_rows();
+    }
+
+    /// Session file path → that session's stored `cwd` (`SessionInfo.cwd`), for the extra right-hand
+    /// column pi draws when `showCwd` is on: `rightPart = ${shortenPath(session.cwd)} ${rightPart}`
+    /// (`session-selector.ts:468-470`). Only the `All` scope shows it (`showCwd = scope === "all"`,
+    /// `:844`/`:923`), which is the whole point — in the merged listing a row from another project
+    /// is otherwise indistinguishable from one of this folder's.
+    pub fn set_session_cwds(&mut self, cwds: impl IntoIterator<Item = (String, String)>) {
+        self.cwds = cwds.into_iter().collect();
+    }
+
+    /// Set the scope the header radio reports (`session-selector.ts:144-148`) and swap the row set
+    /// under it — pi's `header.setScope(...)` + `sessionList.setSessions(...)` pair (`:1005-1010`,
+    /// `:1021-1024`), which are never performed apart.
     pub fn set_scope(&mut self, scope: SessionScope) {
         self.scope = scope;
+        self.resync_rows();
     }
 
     /// The scope the header radio reports (test/inspection).
     pub fn scope(&self) -> SessionScope {
         self.scope
+    }
+
+    /// `toggleScope` (`session-selector.ts:1003-1026`): `current` ⇄ `all`, re-pointing the list at
+    /// the other cached set. Upstream flips `this.scope` FIRST (`:1005`) and only then decides
+    /// whether the set is cached (`:1008`) or has to be loaded (`:1015-1017`) — cyrup has no async
+    /// load, so the only reachable "nothing to switch to" case is a host that supplied no all-set,
+    /// and that is upstream's un-wired `onToggleScope` (`:552`), where the scope does not move
+    /// either because `toggleScope` is never entered.
+    fn toggle_scope(&mut self) {
+        if self.all_rows.is_none() {
+            return;
+        }
+        self.scope = match self.scope {
+            SessionScope::Current => SessionScope::All,
+            SessionScope::All => SessionScope::Current,
+        };
+        self.resync_rows();
+    }
+
+    /// Re-point the display list at the set the live scope names — pi's `setSessions(sessions,
+    /// showCwd)` (`:361-365`), whose `filterSessions` tail clamps the highlight into the new,
+    /// possibly shorter list (`:386`).
+    fn resync_rows(&mut self) {
+        self.rows = match self.scope {
+            SessionScope::Current => self.current_rows.clone(),
+            SessionScope::All => self.all_rows.clone().unwrap_or_default(),
+        };
+        self.clamp_selection();
     }
 
     /// The filtered + sorted display list for the current query/sort/name-filter (clones for borrow
@@ -342,6 +420,37 @@ impl SessionSelector {
             NameFilter::Named => NameFilter::All,
         };
         self.clamp_selection();
+    }
+
+    /// Drop a deleted session from **both** cached sets, then re-derive the display list — pi's
+    /// `onDeleteSession` filters `currentSessions` AND `allSessions` before re-setting the list
+    /// (`session-selector.ts:835-845` — `:836-841` filters, `:845` re-sets). Filtering only the visible set would resurrect the row on
+    /// the next `Tab`.
+    fn remove_row(&mut self, path: &str) {
+        self.current_rows.retain(|r| r.path != path);
+        if let Some(all) = self.all_rows.as_mut() {
+            all.retain(|r| r.path != path);
+        }
+        self.resync_rows();
+    }
+
+    /// Apply a rename to **both** cached sets, for the same reason [`Self::remove_row`] does.
+    /// (pi reloads the scope instead — `refreshSessionsAfterMutation`, `:999-1001`; cyrup's picker
+    /// has no loader to re-run, so it patches the caches it was handed.)
+    fn apply_rename(&mut self, path: &str, name: &str) {
+        let patch = |rows: &mut Vec<SessionRow>| {
+            if let Some(row) = rows.iter_mut().find(|r| r.path == path) {
+                row.name = Some(name.to_string());
+                if !name.is_empty() {
+                    row.label = name.to_string();
+                }
+            }
+        };
+        patch(&mut self.current_rows);
+        if let Some(all) = self.all_rows.as_mut() {
+            patch(all);
+        }
+        self.resync_rows();
     }
 
     /// Keep the highlight inside the (possibly shrunken) filtered list.
@@ -452,9 +561,24 @@ impl SessionSelector {
             // S14 (`:464-473`): the right-hand column is `"<msgCount> <age>"`, and the `Ctrl+P` path
             // toggle **prepends the path to that same column** — pi never grows a second line per
             // session, so toggling the path does not halve how many sessions fit.
+            // `:464-473` builds the column back-to-front — `"<msgCount> <age>"`, then the cwd is
+            // PREPENDED when `showCwd` (`:468-470`), then the path when `showPath` (`:471-473`) —
+            // so left-to-right the order is path, cwd, counts. `showCwd` is `scope === "all"`
+            // (`:844`, `:923`): in the merged listing this column is the only thing that says which
+            // project a row belongs to.
             let mut right = String::new();
             if self.show_path {
                 right.push_str(&shorten_path(&row.path));
+            }
+            if self.scope == SessionScope::All
+                && let Some(cwd) = self.cwds.get(&row.path)
+                // `if (this.showCwd && session.cwd)` (`:468`) — an empty cwd draws no column.
+                && !cwd.is_empty()
+            {
+                if !right.is_empty() {
+                    right.push(' ');
+                }
+                right.push_str(&shorten_path(cwd));
             }
             if let Some(desc) = &row.desc {
                 if !right.is_empty() {
@@ -671,7 +795,11 @@ impl SessionSelector {
 
         // `:167-182`.
         let path_state = if self.show_path { "(on)" } else { "(off)" };
-        let mut hint1 = pair(Some(self.tab_key.clone()), "scope");
+        // `keyHint("tui.input.tab", "scope")` (`:170`) — every key bound to the id, joined `/`, or
+        // no key run at all when the user unbound it (`keyText`'s `keys.length === 0` arm).
+        let tab_label = (!self.tab_keys.is_empty())
+            .then(|| self.tab_keys.iter().map(|k| k.label()).collect::<Vec<_>>().join("/"));
+        let mut hint1 = pair(tab_label, "scope");
         hint1.push(sep());
         hint1.push(Span::styled(
             "re:<pattern> regex · \"phrase\" exact",
@@ -777,8 +905,7 @@ impl Selector for SessionSelector {
             match keymap.action_for(key) {
                 Some(SelectAction::Confirm) => {
                     self.confirming_delete = None;
-                    self.rows.retain(|r| r.path != path);
-                    self.clamp_selection();
+                    self.remove_row(&path);
                     return SelectorOutcome::Apply(SessionSelectorOutcome::delete_payload(&path));
                 }
                 Some(SelectAction::Cancel) => {
@@ -795,10 +922,7 @@ impl Selector for SessionSelector {
                 KeyCode::Enter => {
                     let name = buf.trim().to_string();
                     self.renaming = None;
-                    if let Some(row) = self.rows.iter_mut().find(|r| r.path == path) {
-                        row.name = Some(name.clone());
-                        row.label = if name.is_empty() { row.label.clone() } else { name.clone() };
-                    }
+                    self.apply_rename(&path, &name);
                     return SelectorOutcome::Apply(SessionSelectorOutcome::rename_payload(&path, &name));
                 }
                 KeyCode::Esc => {
@@ -817,7 +941,17 @@ impl Selector for SessionSelector {
             }
         }
 
-        // 3) The `app.session.*` chords, resolved through the live table rather than matched as
+        // 3) `tui.input.tab` → the scope toggle (`session-selector.ts:551-556`). Upstream asks this
+        // ONE editor-tier id here, ahead of every `app.session.*` chord and after the
+        // delete-confirmation intercept, and `return`s whether or not a toggle is wired — so `Tab`
+        // never falls through to the search input. Order matters: a user who rebinds an
+        // `app.session.*` action onto tab would, in pi, still get the scope toggle.
+        if self.tab_keys.iter().any(|k| k.matches(key)) {
+            self.toggle_scope();
+            return SelectorOutcome::Redraw;
+        }
+
+        // 4) The `app.session.*` chords, resolved through the live table rather than matched as
         // literal `ctrl+…` chars (R-10-018) — this is the same table the hint rows name, so the two
         // cannot drift apart.
         if let Some(action) = self.session_keymap.action_for(key) {
@@ -839,7 +973,7 @@ impl Selector for SessionSelector {
             return SelectorOutcome::Redraw;
         }
 
-        // 4) Navigation / confirm / cancel.
+        // 5) Navigation / confirm / cancel.
         match keymap.action_for(key) {
             Some(SelectAction::Up) => {
                 self.selected = self.selected.saturating_sub(1);
@@ -869,7 +1003,7 @@ impl Selector for SessionSelector {
             },
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
             None => {
-                // 5) Printable text → search input.
+                // 6) Printable text → search input.
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
@@ -1535,6 +1669,9 @@ mod tests {
     #[test]
     fn header_reports_the_all_scope() {
         let mut sel = SessionSelector::new(rows());
+        // SEAM-061: the `All` scope now DISPLAYS the all-projects set, so a selector that was never
+        // handed one shows an empty list. Wire it, or this test asserts the header of a blank list.
+        sel.set_all_rows(rows());
         sel.set_scope(SessionScope::All);
         let buf = draw(&mut sel, 100, 20);
         let text = row_text(&buf, find_row(&buf, "Resume Session"));
@@ -1700,7 +1837,11 @@ mod tests {
         // A query that matches nothing, so the list is empty in every configuration.
         let empty = |scope: SessionScope, named: bool| -> String {
             let mut sel = SessionSelector::new(rows());
+            // Both scopes must be NON-empty to start with, so the empty state under test is
+            // produced by the query below and not by an unwired `all` set (SEAM-061).
+            sel.set_all_rows(rows());
             sel.set_scope(scope);
+            assert_eq!(sel.visible_len(), 3, "the fixture must be non-empty before the query");
             if named {
                 sel.handle(&ctrl('n'), &SelectKeymap::default());
             }
@@ -1741,6 +1882,7 @@ mod tests {
         let mut km = SessionKeymap::default();
         km.set_action(SessionAction::ToggleNamedFilter, vec![Key::ctrl('j')]);
         let mut sel = SessionSelector::new(rows()).with_keymaps(&km, &EditorKeymap::default());
+        sel.set_all_rows(rows());
         sel.set_scope(SessionScope::All);
         sel.handle(&ctrl('j'), &SelectKeymap::default());
         for c in "zzzqqq".chars() {
@@ -1749,6 +1891,195 @@ mod tests {
         let buf = draw(&mut sel, 100, 20);
         let text: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
         assert!(text.contains("Press ctrl+j to show all."), "{text}");
+    }
+
+    // ---- SEAM-061: the `Tab` scope toggle (`session-selector.ts:551-556`, `:1003-1026`) ---------
+
+    /// A second project's session, absent from the current-folder set and present in the
+    /// all-projects one — pi's two loaders (`cli/session-picker.ts:15-19`).
+    fn foreign_row() -> SessionRow {
+        row("/other/z.jsonl", Some("Other project"), "z other project work", 9)
+    }
+
+    fn scoped_selector() -> SessionSelector {
+        let mut all = rows();
+        all.push(foreign_row());
+        let mut sel = SessionSelector::new(rows());
+        sel.set_all_rows(all);
+        sel.set_session_cwds([
+            ("/s/a.jsonl".to_string(), "/home/dev/here".to_string()),
+            ("/s/b.jsonl".to_string(), "/home/dev/here".to_string()),
+            ("/s/c.jsonl".to_string(), "/home/dev/here".to_string()),
+            ("/other/z.jsonl".to_string(), "/home/dev/elsewhere".to_string()),
+        ]);
+        sel
+    }
+
+    /// **SEAM-061.** `kb.matches(keyData, "tui.input.tab")` → `onToggleScope()`
+    /// (`session-selector.ts:551-556`) → `toggleScope` (`:1003-1026`), which re-points the list at
+    /// the other cached set and flips the header.
+    ///
+    /// FAILS before the fix: `Tab` resolved to no action at all — it fell out of `handle` as
+    /// `Ignored` — while the header advertised `tab scope` and the ONE merged list showed another
+    /// project's sessions under the title "Resume Session (Current Folder)".
+    #[test]
+    fn tab_swaps_the_list_between_pis_two_loaders() {
+        let mut sel = scoped_selector();
+        let km = SelectKeymap::default();
+
+        // Presence before absence: the foreign row exists in the fixture's `all` set.
+        assert_eq!(sel.scope(), SessionScope::Current);
+        assert_eq!(sel.visible_len(), 3);
+        let current_paths: Vec<String> =
+            sel.filtered().into_iter().map(|n| n.row.path).collect();
+        assert!(
+            !current_paths.contains(&"/other/z.jsonl".to_string()),
+            "the current-folder scope must not list another project: {current_paths:?}"
+        );
+
+        let out = sel.handle(&key(KeyCode::Tab), &km);
+        assert_eq!(out, SelectorOutcome::Redraw, "`Tab` is handled, not ignored");
+        assert_eq!(sel.scope(), SessionScope::All);
+        assert_eq!(sel.visible_len(), 4, "the `all` set is on screen");
+        let all_paths: Vec<String> = sel
+            .filtered()
+            .into_iter()
+            .map(|n| n.row.path)
+            .collect();
+        assert!(
+            all_paths.contains(&"/other/z.jsonl".to_string()),
+            "the other project's session is reachable: {all_paths:?}"
+        );
+
+        // `:1021-1025` — the second press goes back, it does not cycle onward.
+        sel.handle(&key(KeyCode::Tab), &km);
+        assert_eq!(sel.scope(), SessionScope::Current);
+        assert_eq!(sel.visible_len(), 3);
+    }
+
+    /// **SEAM-061.** `const showCwd = scope === "all"` (`:844`, `:923`) and
+    /// `rightPart = ${shortenPath(session.cwd)} ${rightPart}` (`:468-470`): the cwd column exists
+    /// ONLY in the `all` scope, and it is what tells a merged row which project it belongs to.
+    #[test]
+    fn the_cwd_column_appears_only_in_the_all_scope() {
+        let mut sel = scoped_selector();
+        let buf = draw(&mut sel, 100, 24);
+        let text: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
+        assert!(text.contains("Build pipeline"), "the current set is on screen: {text}");
+        assert!(!text.contains("/home/dev/here"), "no cwd column in `current`: {text}");
+
+        sel.handle(&key(KeyCode::Tab), &SelectKeymap::default());
+        let buf = draw(&mut sel, 100, 24);
+        let y = find_row(&buf, "Other project");
+        let line = row_text(&buf, y);
+        assert!(line.contains("/home/dev/elsewhere"), "foreign row names its cwd: {line:?}");
+        let here = row_text(&buf, find_row(&buf, "Build pipeline"));
+        assert!(here.contains("/home/dev/here"), "local row names its cwd too: {here:?}");
+        // `:464-473` prepends cwd to the counts column, it does not add a second line per session.
+        assert!(
+            here.find("/home/dev/here").unwrap() < here.find("3 msgs").unwrap(),
+            "cwd precedes the counts in the same right column: {here:?}"
+        );
+    }
+
+    /// **SEAM-061.** `if (this.onToggleScope) { this.onToggleScope(); } return;` (`:551-556`):
+    /// upstream RETURNS whether or not a toggle is wired, so `Tab` is swallowed by the picker and
+    /// never reaches the search input. cyrup's un-wired case is `set_all_rows` never called.
+    #[test]
+    fn tab_is_swallowed_when_the_host_wired_no_all_set() {
+        let mut sel = SessionSelector::new(rows());
+        let out = sel.handle(&key(KeyCode::Tab), &SelectKeymap::default());
+        assert_eq!(out, SelectorOutcome::Redraw, "consumed, like upstream's bare `return`");
+        assert_eq!(sel.scope(), SessionScope::Current, "nowhere to switch to");
+        assert_eq!(sel.visible_len(), 3, "and the list is untouched");
+    }
+
+    /// **SEAM-061.** `onDeleteSession` filters `currentSessions` AND `allSessions` before re-setting
+    /// the list (`session-selector.ts:835-845`).
+    ///
+    /// FAILS if only the visible set is filtered: the deleted row reappears on the next `Tab`.
+    #[test]
+    fn a_delete_removes_the_row_from_both_scopes() {
+        let mut sel = scoped_selector();
+        let km = SelectKeymap::default();
+        sel.handle(&ctrl('d'), &km);
+        assert!(sel.is_confirming_delete());
+        sel.handle(&key(KeyCode::Enter), &km);
+        assert_eq!(sel.visible_len(), 2, "gone from the current scope");
+        sel.handle(&key(KeyCode::Tab), &km);
+        let all_paths: Vec<String> = sel.filtered().into_iter().map(|n| n.row.path).collect();
+        assert_eq!(all_paths.len(), 3, "gone from the all scope too: {all_paths:?}");
+        assert!(
+            !all_paths.contains(&"/s/a.jsonl".to_string()),
+            "the deleted session must not come back on `Tab`: {all_paths:?}"
+        );
+    }
+
+    /// **SEAM-061.** A rename applied in one scope must survive the toggle, for the same reason a
+    /// delete does — pi reloads BOTH sets after a mutation (`refreshSessionsAfterMutation`,
+    /// `:999-1001` → `loadScope`).
+    #[test]
+    fn a_rename_survives_the_scope_toggle() {
+        let mut sel = scoped_selector();
+        let km = SelectKeymap::default();
+        sel.handle(&ctrl('r'), &km);
+        for c in "Zed".chars() {
+            sel.handle(&key(KeyCode::Char(c)), &km);
+        }
+        sel.handle(&key(KeyCode::Enter), &km);
+        sel.handle(&key(KeyCode::Tab), &km);
+        let renamed = sel
+            .filtered()
+            .into_iter()
+            .find(|n| n.row.path == "/s/a.jsonl")
+            .expect("the row is still in the all scope");
+        assert_eq!(renamed.row.name.as_deref(), Some("Build pipelineZed"));
+        assert_eq!(renamed.row.label, "Build pipelineZed");
+    }
+
+    /// **SEAM-061.** The toggle and its hint are ONE binding — pi asks `tui.input.tab` at `:551`
+    /// and labels the hint with `keyHint("tui.input.tab", "scope")` at `:170`. Rebinding the editor
+    /// id must move both, and must leave the stock key dead.
+    #[test]
+    fn rebinding_tui_input_tab_moves_both_the_scope_toggle_and_its_hint() {
+        let mut editor = EditorKeymap::default();
+        editor.set_action(EditorAction::Tab, vec![Key::ctrl('t')]);
+        let mut all = rows();
+        all.push(foreign_row());
+        let mut sel = SessionSelector::new(rows())
+            .with_keymaps(&SessionKeymap::default(), &editor);
+        sel.set_all_rows(all);
+
+        let buf = draw(&mut sel, 100, 24);
+        let text: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
+        assert!(text.contains("ctrl+t scope"), "the hint names the NEW key: {text}");
+        assert!(!text.contains("tab scope"), "and not the stock one: {text}");
+
+        // The stock key is dead...
+        let km = SelectKeymap::default();
+        sel.handle(&key(KeyCode::Tab), &km);
+        assert_eq!(sel.scope(), SessionScope::Current, "`tab` is no longer bound");
+        // ...and the rebound one drives the toggle.
+        sel.handle(&ctrl('t'), &km);
+        assert_eq!(sel.scope(), SessionScope::All);
+        assert_eq!(sel.visible_len(), 4);
+    }
+
+    /// **SEAM-061.** `tui.input.tab` is asked BEFORE every `app.session.*` id (`:551` vs `:558`),
+    /// so a user who rebinds a session action onto tab still gets the scope toggle. Pinning the
+    /// precedence keeps cyrup's agreement with upstream from being an accident of statement order.
+    #[test]
+    fn tab_beats_a_session_action_rebound_onto_the_same_chord() {
+        let mut km = SessionKeymap::default();
+        km.set_action(SessionAction::Delete, vec![Key::parse("tab").unwrap()]);
+        let mut all = rows();
+        all.push(foreign_row());
+        let mut sel =
+            SessionSelector::new(rows()).with_keymaps(&km, &EditorKeymap::default());
+        sel.set_all_rows(all);
+        sel.handle(&key(KeyCode::Tab), &SelectKeymap::default());
+        assert_eq!(sel.scope(), SessionScope::All, "the scope toggle wins");
+        assert!(!sel.is_confirming_delete(), "the rebound delete does not fire");
     }
 
     /// `:158-161` — the confirmation replaces hint row 1 and sets `hintLine2 = ""`, so the row is

@@ -196,3 +196,32 @@ pub enum Reduced {
     /// An extension fully serviced the action.
     Handled(HandledValue),
 }
+
+/// One terminal-input handler's answer (EXT-021; pi `TerminalInputHandler`'s return,
+/// `packages/coding-agent/src/core/extensions/types.ts:113` @v0.83.0:
+/// `{ consume?: boolean; data?: string } | undefined`).
+///
+/// Both members stay `Option` because upstream's fold (`packages/tui/src/tui.ts:773-788`) tests
+/// `result?.consume` (truthy) and `result?.data !== undefined` — so `{data: ""}` REWRITES the
+/// buffer to empty (and the keystroke is then dropped by the end-of-fold length check at `:784`),
+/// while `{}` leaves it alone. Collapsing either to a bare `bool`/`String` would erase that
+/// distinction.
+///
+/// A `None` return from a handler is upstream's `undefined`: "I looked at it and did nothing".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalInputResult {
+    pub consume: Option<bool>,
+    pub data: Option<String>,
+}
+
+/// What the host tells its caller to do with one raw terminal-input chunk, after folding every
+/// subscriber (EXT-021). The Rust shape of pi's `TUI.handleInput` outcome
+/// (`packages/tui/src/tui.ts:773-788`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalInputDecision {
+    /// Deliver `data` to the editor. Equal to the input when no handler rewrote it.
+    Deliver(String),
+    /// Drop the keystroke entirely — either a handler returned `consume: true` (`:777-779`) or the
+    /// fold ended with an empty string (`:784-786`).
+    Consume,
+}

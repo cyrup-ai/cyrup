@@ -210,14 +210,12 @@ pub struct SubagentExecutor {
     control_notice_sink_override: Option<Arc<dyn crate::tui::notices::ControlNoticeSink>>,
 }
 
-/// One session's subagent spawn budget (pi `SubagentState.subagentSpawns`, `shared/types.ts:842`).
-/// `session_id` is the session the `count` was accumulated under — pi's `string | null`, so a
-/// headless/unpersisted session (`None`) is a legitimate identity that still accumulates.
-#[derive(Debug, Default)]
-struct SpawnBudget {
-    session_id: Option<String>,
-    count: u32,
-}
+/// SUBA-046 — one session's subagent spawn budget is now
+/// [`crate::exec::spawn_budget::SpawnBudgetCounters`] (pi `SubagentState.subagentSpawns`,
+/// `shared/types.ts:842`), which carries the resolved configured limit, the granted allowance and
+/// the bounded grant log beside the count. The old two-field local struct could express neither a
+/// grant nor "unlimited", which is why an exhausted cap was terminal for the whole session.
+type SpawnBudget = crate::exec::spawn_budget::SpawnBudgetCounters;
 
 /// pi's `state.lastParentModel` alongside the `state.currentSessionId` it is scoped to — the two
 /// fields `rememberParentModel` reads and writes (`subagent-executor.ts:284-291` @v0.43.0).
@@ -799,8 +797,18 @@ impl SubagentExecutor {
     /// dispatch is billed twice.
     ///
     /// # Errors
-    /// The over-limit notice (pi's verbatim string) when `used + requested` exceeds `max_spawns`.
+    /// The over-limit notice (pi's verbatim string) when the declared run does not fit in what
+    /// remains of the effective cap (configured + granted).
+    ///
+    /// # SUBA-046
+    /// The comparison, the "unlimited" case and the message all moved into
+    /// [`crate::exec::spawn_budget`], which is the port of pi's `spawn-budget.ts`. Two behaviours
+    /// changed with the move, both toward upstream: a configured `0` now means UNLIMITED (it used
+    /// to refuse the first delegation of every session), and the refusal text is upstream's
+    /// v0.43.0 one, which points at the grant path that now exists instead of saying "complete the
+    /// work directly".
     pub fn reserve_subagent_spawns(&self, requested: u32, max_spawns: u32) -> Result<(), String> {
+        use crate::exec::spawn_budget as budget_ops;
         if requested == 0 {
             return Ok(());
         }
@@ -809,18 +817,84 @@ impl SubagentExecutor {
             .spawn_budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if budget.session_id != session_id {
-            *budget = SpawnBudget { session_id, count: 0 };
-        }
-        let used = budget.count;
-        if u64::from(used) + u64::from(requested) > u64::from(max_spawns) {
-            return Err(format!(
-                "Subagent spawn limit reached for this session ({used}/{max_spawns} used, \
-                 {requested} requested). Complete the work directly or start a new session."
-            ));
-        }
-        budget.count = used.saturating_add(requested);
+        budget_ops::session_state(&mut budget, session_id.as_deref(), max_spawns);
+        let snapshot = budget_ops::snapshot(&budget);
+        budget_ops::preflight_spawn_budget(&snapshot, requested)?;
+        budget.count = budget.count.saturating_add(requested);
         Ok(())
+    }
+
+    /// SUBA-046 — the read-only [`crate::exec::spawn_budget::SpawnBudgetSnapshot`] for the current
+    /// session (pi `getSpawnBudgetSnapshot`, `spawn-budget.ts:29`), so the cap is observable in a
+    /// tool result's `details.spawnBudget` even when no grant is being requested.
+    #[must_use]
+    pub fn spawn_budget_snapshot(
+        &self,
+        max_spawns: u32,
+    ) -> crate::exec::spawn_budget::SpawnBudgetSnapshot {
+        use crate::exec::spawn_budget as budget_ops;
+        let session_id = self.root_parent_session();
+        let mut budget = self
+            .spawn_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        budget_ops::session_state(&mut budget, session_id.as_deref(), max_spawns);
+        budget_ops::snapshot(&budget)
+    }
+
+    /// SUBA-046 — apply an explicit grant to the current session's cap (pi `grantSpawnBudget`,
+    /// `spawn-budget.ts:107`), after the caller has confirmed it.
+    ///
+    /// # Errors
+    /// pi's three verbatim grant refusals (non-positive amount, no configured cap, or more than
+    /// the remaining grant allowance), re-checked here against the live counters so a grant that
+    /// went stale while the confirmation dialog was open cannot be applied.
+    pub fn grant_subagent_spawn_budget(
+        &self,
+        additional: i64,
+        max_spawns: u32,
+    ) -> Result<crate::exec::spawn_budget::SpawnBudgetSnapshot, String> {
+        use crate::exec::spawn_budget as budget_ops;
+        let session_id = self.root_parent_session();
+        let mut budget = self
+            .spawn_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        budget_ops::session_state(&mut budget, session_id.as_deref(), max_spawns);
+        budget_ops::grant_spawn_budget(
+            &mut budget,
+            additional,
+            crate::background::now_epoch_millis_pub(),
+        )
+    }
+
+    /// SUBA-046 / pi `hasActiveSubagentChildren` (`subagent-executor.ts:433-437` @v0.43.0) — is any
+    /// child of THIS session queued or running right now?
+    ///
+    /// A spawn-budget grant is refused while children are in flight, because the preview the user
+    /// confirmed would be measured against a `used` count that is still moving. pi's predicate is
+    /// `state.subagentInProgress || state.foregroundControls.size > 0 || any async/fleet job in
+    /// {queued,running}`; cyrup's equivalents are the live `foreground_controls` map (a foreground
+    /// run holds an entry for exactly as long as it is driving) and the async tracker's own
+    /// snapshot.
+    #[must_use]
+    pub fn has_active_subagent_children(&self) -> bool {
+        let foreground_active = !self
+            .foreground_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty();
+        if foreground_active {
+            return true;
+        }
+        self.tracker.snapshot().into_iter().any(|job| {
+            job.last_status.is_some_and(|status| {
+                matches!(
+                    status.state,
+                    crate::background::RunState::Queued | crate::background::RunState::Running
+                )
+            })
+        })
     }
 
     /// Reset this session's spawn budget to zero under the CURRENT session id (pi
@@ -831,11 +905,16 @@ impl SubagentExecutor {
     /// case [`Self::reserve_subagent_spawns`]' own id-change guard cannot detect on its own.
     pub fn reset_spawn_budget(&self) {
         let session_id = self.root_parent_session();
+        // SUBA-046: the reset clears the GRANTS and the grant log with the count — pi rebuilds the
+        // whole `subagentSpawns` record, so a grant made in the previous session cannot survive
+        // into the new one. `configured_limit` is left unresolved here and re-resolved by
+        // `session_state` on the next reserve/snapshot, which is the only place that knows the
+        // effective config.
         *self
             .spawn_budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            SpawnBudget { session_id, count: 0 };
+            SpawnBudget { session_id, ..SpawnBudget::default() };
     }
 
     /// The out-of-band delivery channel (R-SA-123/124/125), for the run driver's grouped-result
@@ -5406,12 +5485,18 @@ const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently supports li
 ///
 /// * The **blocked** line is v0.43.0's, which renamed the lead-in from "Agent config mutation
 ///   actions" to "Mutating management actions" and added an eighth verb, `grant-spawn-budget`
-///   (`fanout-child.ts:180`). cyrup does not implement a `grant-spawn-budget` action at all, so
-///   naming it here is accurate on both sides: upstream refuses it because it is on
-///   `MUTATING_MANAGEMENT_ACTIONS`, cyrup refuses it because it is not a verb —
-///   [`SubagentTool::route_management_or_control`]'s catch-all arm answers `unknown subagent action
-///   'grant-spawn-budget'`. [`crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS`] is
-///   deliberately NOT extended to match: upstream's v0.43.0 set has 26 entries
+///   (`fanout-child.ts:180`). Naming it here is accurate on both sides, though the two sides now
+///   refuse it at DIFFERENT gates: upstream refuses it because it is on
+///   `MUTATING_MANAGEMENT_ACTIONS`; cyrup — since SUBA-046 gave the verb a real dispatch arm,
+///   [`SubagentTool::route_grant_spawn_budget`] — refuses it at that arm's FIRST gate, pi's own
+///   `if (deps.allowMutatingManagementActions === false || !ctx.hasUI)`
+///   (`subagent-executor.ts:4458` @v0.43.0), which a fanout-child registration fails on the
+///   `allow_mutating_management` half. A child therefore gets upstream's verbatim "available only
+///   from the root interactive parent session." refusal rather than an unknown-action error, which
+///   is what upstream's own child would get were its denylist not consulted first.
+///   [`crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS`] is still deliberately NOT
+///   extended to match: it gates [`SubagentTool::route_management_action`], which
+///   `grant-spawn-budget` does not route through, and upstream's v0.43.0 set has 26 entries
 ///   (`subagent-executor.ts:151`), almost all of them naming actions this crate has not ported
 ///   (`watchdog.configure`, `mission.*`, `inspector.*`, `project.*`, `schedule.*`, `refine*`), and
 ///   grafting one of them onto a 7-entry port would make the runtime denylist message advertise a
@@ -5452,6 +5537,10 @@ const SUBAGENT_ACTIONS: &[&str] = &[
     "enable",
     "reset",
     "status",
+    // SUBA-046 — pi's own position for this verb (`shared/types.ts:1885` @v0.43.0: `… "status",
+    // "grant-spawn-budget", "interrupt", …`). It was already advertised in the child-safe tool
+    // description while landing on the unknown-action arm; now it dispatches.
+    "grant-spawn-budget",
     "interrupt",
     "resume",
     "steer",
@@ -5701,6 +5790,13 @@ struct SubagentToolParams {
     timeout_ms: Option<u64>,
     max_runtime_ms: Option<u64>,
     agent_scope: Option<String>,
+    /// SUBA-046 / pi `params.additional` (`extension/schemas.ts:283` @v0.43.0) — the launches to
+    /// add with `action='grant-spawn-budget'`. Typed `i64` rather than `u32` deliberately: pi
+    /// validates `Number.isInteger(additional) && additional > 0` INSIDE
+    /// `preflightSpawnBudgetGrant` and answers with its own message, so a `0`/negative value must
+    /// reach that validator instead of being rejected by deserialization with a serde error the
+    /// model cannot act on.
+    additional: Option<i64>,
     /// `action='watchdog.configure'` write scope — `session` (the default, and the one that touches
     /// no file), `user`, or `project` (pi `extension/schemas.ts:285`).
     scope: Option<String>,
@@ -5953,6 +6049,7 @@ impl SubagentToolParams {
         if self.model.is_some() { keys.push("model"); }
         if self.output_schema.is_some() { keys.push("outputSchema"); }
         if self.tool_budget.is_some() { keys.push("toolBudget"); }
+        if self.additional.is_some() { keys.push("additional"); }
         if self.acceptance.is_some() { keys.push("acceptance"); }
         if self.mission_id.is_some() { keys.push("missionId"); }
         if self.mission.is_some() { keys.push("mission"); }
@@ -7035,6 +7132,15 @@ fn subagent_tool_parameters() -> serde_json::Value {
     // a delegation's tool spend was to edit the agent file on disk and a per-call budget passed by
     // an orchestrator was silently discarded.
     props.insert("toolBudget".to_string(), sj_tool_budget_override());
+    // SUBA-046 / pi `extension/schemas.ts:283` @v0.43.0 — `additional`, with upstream's description
+    // verbatim. `grant-spawn-budget` was advertised in the child-safe tool description while the
+    // verb itself landed on the unknown-action arm, and the param it needs was never advertised at
+    // all; both halves land together, because advertising either alone is the defect class.
+    props.insert("additional".to_string(), serde_json::json!({
+        "type": "integer",
+        "minimum": 1,
+        "description": "Positive launches to add with action='grant-spawn-budget'. Root interactive parent with native user confirmation only; total grants cannot exceed the original configured cap."
+    }));
     props.insert("acceptance".to_string(), serde_json::json!({
         "anyOf": [
             { "type": "string", "enum": ["auto", "none", "attested", "checked", "verified", "reviewed"] },
@@ -7973,6 +8079,9 @@ impl SubagentTool {
             "status" | "interrupt" | "stop" | "resume" | "steer" | "append-step" => {
                 self.route_control_action(action, p, cwd).await
             }
+            // SUBA-046 — pi `subagent-executor.ts:4457-4527` @v0.43.0, in upstream's own dispatch
+            // position (after the management CRUD, before `children.list`/`doctor`).
+            "grant-spawn-budget" => self.route_grant_spawn_budget(p).await,
             // The four `watchdog.*` actions (pi `WATCHDOG_TOOL_ACTIONS` /
             // `handleWatchdogToolAction`, dispatched at `subagent-executor.ts:4432`).
             watchdog_action
@@ -8024,6 +8133,161 @@ impl SubagentTool {
             // model recovering from the error was steered away from verbs that exist.
             other => Err(ToolError::new(unknown_subagent_action_message(other))),
         }
+    }
+
+    /// SUBA-046 — `action: "grant-spawn-budget"`: add launches to an exhausted per-session spawn
+    /// cap, behind an explicit user confirmation (pi `subagent-executor.ts:4457-4527` @v0.43.0).
+    ///
+    /// THE USER ACTION: a session hits `maxSubagentSpawnsPerSession` mid-task. Before this, that
+    /// was terminal — cyrup had no grant path, so the only escape was restarting the session and
+    /// losing the conversation. Upstream's design is that the cap is a speed bump with a confirmed
+    /// grant behind it, which is why its own refusal text says "Grant budget explicitly from the
+    /// root interactive session"; cyrup printed that sentence while implementing no such thing,
+    /// and additionally ADVERTISED the verb in the child-safe tool description.
+    ///
+    /// Every refusal below is upstream's verbatim text, in upstream's order — the order is
+    /// load-bearing, because each gate assumes the previous one held (the session-id check runs
+    /// before the active-children check, which runs before the amount is validated, which runs
+    /// before the authority policy is consulted, which runs before the user is asked).
+    ///
+    /// The authority consult is deliberately NOT
+    /// [`crate::registration::authority::AuthorityAction::for_tool_action`]'s generic
+    /// control-arm gate: upstream maps only `stop`/`steer`/`schedule.create` there and gives the
+    /// grant path its OWN `resolveAuthorityDecision({action:"spawnBudgetGrant"})` with its own
+    /// messages and its own confirmation body (`:4493-4500`), which is what is reproduced here.
+    ///
+    /// Where upstream attaches `details.spawnBudget` to a refusal, cyrup surfaces the same numbers
+    /// in the message text instead: a cyrup [`ToolError`] carries a message and nothing else
+    /// (`cyrup-core/src/tool.rs:78-80`), and upstream itself prefixes result text with
+    /// `formatSpawnBudget(...)` on the same surface (`withSpawnBudget`, `:425-430`). The SUCCESS
+    /// result carries the snapshot in `details.spawnBudget`, where the type does allow it.
+    async fn route_grant_spawn_budget(
+        &self,
+        p: &SubagentToolParams,
+    ) -> Result<ToolResult, ToolError> {
+        use crate::exec::spawn_budget as budget_ops;
+        use crate::registration::authority as auth;
+
+        // pi `if (deps.allowMutatingManagementActions === false || !ctx.hasUI)` (`:4458`). cyrup's
+        // `hasUI` is "a live host-services surface is bound", the same equivalence the SUBA-064
+        // authority gate already draws.
+        let Some(services) = self.executor.host_services().filter(|_| self.allow_mutating_management)
+        else {
+            return Err(ToolError::new(
+                "Action 'grant-spawn-budget' is available only from the root interactive parent \
+                 session.",
+            ));
+        };
+        // pi `deps.state.currentSessionId = resolveCurrentSessionId(...); if (!...)` (`:4465-4471`).
+        let Some(session_id) = self.executor.current_session_id() else {
+            return Err(ToolError::new(
+                "Action 'grant-spawn-budget' requires an active parent session id.",
+            ));
+        };
+        let cfg = self.executor.config_snapshot().await;
+        let max_spawns = cfg.max_subagent_spawns_per_session;
+
+        // pi `if (hasActiveSubagentChildren(deps.state))` (`:4472-4479`) — the preview the user
+        // confirms must be measured against a `used` count that is not still moving.
+        if self.executor.has_active_subagent_children() {
+            let snapshot = self.executor.spawn_budget_snapshot(max_spawns);
+            return Err(ToolError::new(format!(
+                "Spawn budget grants are rejected while current-session children are queued or \
+                 running. Wait for them to settle, then retry the explicit grant. {}",
+                budget_ops::format_spawn_budget(&snapshot)
+            )));
+        }
+
+        // pi `const additional = paramsWithResolvedCwd.additional ?? Number.NaN;` (`:4482`) — an
+        // OMITTED `additional` is not a distinct case upstream: it flows into the same validator
+        // and comes back with the "requires additional to be a positive integer" message.
+        let requested = p.additional.unwrap_or(0);
+        let preview = self.executor.spawn_budget_snapshot(max_spawns);
+        let additional = budget_ops::preflight_spawn_budget_grant(&preview, requested)
+            .map_err(|error| {
+                ToolError::new(format!(
+                    "{error} {}",
+                    budget_ops::format_spawn_budget(&preview)
+                ))
+            })?;
+
+        // pi `resolveAuthorityDecision({ action: "spawnBudgetGrant", … })` (`:4491`), whose DEFAULT
+        // for this action is `confirm` (`policy/authority.ts:14-21`).
+        let decision = auth::resolve_authority_decision(
+            auth::AuthorityAction::SpawnBudgetGrant,
+            cfg.authority_policy.as_ref(),
+        );
+        if decision == auth::AuthorityDecision::Forbid {
+            return Err(ToolError::new(format!(
+                "Authority policy forbids spawn budget grants. {}",
+                budget_ops::format_spawn_budget(&preview)
+            )));
+        }
+        // pi `authority === "auto" || await ctx.ui.confirm(title, body)` (`:4497-4500`), with
+        // upstream's title and body verbatim.
+        let confirmed = decision == auth::AuthorityDecision::Auto
+            || services.confirm(
+                "Grant subagent spawn budget?",
+                &format!(
+                    "Add {additional} launches to this logical session?\n\n{}\n\nUsage is not \
+                     reset. Compaction keeps the same budget; a new parent session starts a fresh \
+                     one.",
+                    budget_ops::format_spawn_budget(&preview)
+                ),
+                &cyrup_ext::host::DialogOptions::default(),
+            );
+        if !confirmed {
+            // pi returns the cancel text WITHOUT `isError: true` (`:4502-4506`) — declining is a
+            // choice, not a failure.
+            return Ok(ToolResult {
+                content: vec![cyrup_core::Content::text(
+                    "Spawn budget grant canceled; no capacity was added.",
+                )],
+                details: Some(serde_json::json!({
+                    "mode": "management",
+                    "results": [],
+                    "spawnBudget": preview,
+                })),
+                terminate: false,
+                ..Default::default()
+            });
+        }
+
+        // pi's post-confirmation re-check (`:4508-4520`): the dialog was open for an unbounded
+        // amount of wall clock, so the session, the usage and the active-child state are all
+        // re-read and the grant is abandoned if ANY of them moved. This is the JS→Rust hazard in
+        // reverse — upstream needs the check because `await ctx.ui.confirm` yields, and so does
+        // this `.await`.
+        let current = self.executor.spawn_budget_snapshot(max_spawns);
+        if self.executor.current_session_id().as_deref() != Some(session_id.as_str())
+            || self.executor.has_active_subagent_children()
+            || current.used != preview.used
+            || current.granted != preview.granted
+        {
+            return Err(ToolError::new(format!(
+                "Spawn budget grant was not applied because the session, budget, or active-child \
+                 state changed while confirmation was open. {}",
+                budget_ops::format_spawn_budget(&current)
+            )));
+        }
+
+        let granted = self
+            .executor
+            .grant_subagent_spawn_budget(i64::from(additional), max_spawns)
+            .map_err(ToolError::new)?;
+        Ok(ToolResult {
+            content: vec![cyrup_core::Content::text(format!(
+                "Spawn budget grant applied: +{additional}. {}",
+                budget_ops::format_spawn_budget(&granted)
+            ))],
+            details: Some(serde_json::json!({
+                "mode": "management",
+                "results": [],
+                "spawnBudget": granted,
+            })),
+            terminate: false,
+            ..Default::default()
+        })
     }
 
     /// `handleWatchdogToolAction(action, paramsWithResolvedCwd, ctx, deps.watchdog)`
@@ -13074,13 +13338,17 @@ mod tests {
             serde_json::json!(["event", "async", "intercom"])
         );
 
-        // The management/control action enum (schemas.ts:199-202 + SUBAGENT_ACTIONS,
-        // shared/types.ts:1121), exact values AND order. 16 of pi's 20: SUBA-005 added
-        // eject/disable/enable/reset, and G90 added `steer` TOGETHER WITH its
-        // `route_control_action` dispatch arm (`SubagentExecutor::control_steer`) in the same
-        // change. The four still missing are the `schedule*` family, which MUST NOT be advertised
-        // until their manager exists — advertising a verb the dispatcher rejects is worse than
-        // omitting it.
+        // The management/control action enum, exact values AND order, against
+        // [`SUBAGENT_ACTIONS`] — pi's own list is `shared/types.ts:1885` @v0.43.0 (53 verbs) and
+        // both pi's schema and its unknown-action message read it.
+        //
+        // This is cyrup's CURRENT surface, not upstream's 53: a verb joins this list only in the
+        // same change that gives it a dispatch arm, because advertising a verb the dispatcher
+        // rejects is worse than omitting it. SUBA-005 added eject/disable/enable/reset, G90 added
+        // `steer` with `SubagentExecutor::control_steer`, and SUBA-046 added `grant-spawn-budget`
+        // with `route_grant_spawn_budget` — at pi's own position for it (`shared/types.ts:1885`:
+        // `… "reset", … "status", "grant-spawn-budget", "interrupt", …`). The `schedule*` family
+        // and the rest of upstream's 53 stay out until their managers exist.
         let action_enum = props
             .get("action")
             .and_then(|a| a.get("enum"))
@@ -13091,8 +13359,8 @@ mod tests {
             action_values,
             vec![
                 "list", "get", "models", "create", "update", "delete", "eject", "disable",
-                "enable", "reset", "status", "interrupt", "resume", "steer", "stop",
-                "append-step", "doctor", "mission.create", "mission.list", "mission.show",
+                "enable", "reset", "status", "grant-spawn-budget", "interrupt", "resume", "steer",
+                "stop", "append-step", "doctor", "mission.create", "mission.list", "mission.show",
                 "mission.update", "mission.attach-run", "mission.close", "watchdog.status",
                 "watchdog.check", "watchdog.configure", "watchdog.recommend-model"
             ],
@@ -13854,6 +14122,174 @@ mod tests {
         assert!(!clarify_true.is_background(&SubagentExtensionConfig::default(), 0));
     }
 
+    /// SUBA-046 — THE user-facing behaviour: an exhausted per-session spawn cap is a speed bump
+    /// with an explicitly confirmed grant behind it, not a dead end that requires restarting the
+    /// session (pi `subagent-executor.ts:4457-4527` @v0.43.0).
+    ///
+    /// The whole flow is exercised against the real dispatch surface, because every half of this
+    /// item was individually present-and-useless before: the counter existed with no grant path,
+    /// the verb was advertised in the child-safe tool description with no dispatch arm, and the
+    /// refusal text told the user to "grant budget explicitly" against a verb that answered
+    /// `Unknown action`.
+    #[tokio::test]
+    async fn an_exhausted_spawn_cap_can_be_reopened_by_a_confirmed_grant() {
+        /// A host that reports a session id and ACCEPTS the confirmation, recording the body it was
+        /// shown — pi passes the preview snapshot into the dialog, and a grant confirmed against
+        /// numbers the user never saw would be the interesting way to get this wrong.
+        #[derive(Default)]
+        struct ConfirmingHost {
+            confirmed: Arc<std::sync::Mutex<Vec<String>>>,
+            accept: bool,
+        }
+        impl cyrup_ext::host::HostServices for ConfirmingHost {
+            fn session_id(&self) -> Option<String> {
+                Some("session-a".to_string())
+            }
+            fn confirm(
+                &self,
+                _prompt: &str,
+                message: &str,
+                _opts: &cyrup_ext::host::DialogOptions,
+            ) -> bool {
+                if let Ok(mut seen) = self.confirmed.lock() {
+                    seen.push(message.to_string());
+                }
+                self.accept
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                max_subagent_spawns_per_session: 1,
+                missions: Some(scoped_missions(dir.path())),
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        ext.executor().set_host_services(Arc::new(ConfirmingHost {
+            confirmed: Arc::clone(&seen),
+            accept: true,
+        }));
+        let tool = ext.subagent_tool();
+
+        // Spend the single configured launch, then confirm the cap is really closed — the
+        // precondition without which every assertion below could pass vacuously.
+        let _spent = dispatch_tool(&tool, serde_json::json!({ "agent": "ghost", "task": "a" }))
+            .await
+            .expect_err("an unresolvable agent still fails after the reservation is granted");
+        let closed = dispatch_tool(&tool, serde_json::json!({ "agent": "ghost", "task": "b" }))
+            .await
+            .expect_err("the session's spawn budget is exhausted");
+        assert_eq!(
+            closed.to_string(),
+            "Subagent spawn limit reached for this session (1/1 used, 1 requested). 0 remaining; \
+             the declared run cannot fit, so no children were started. Grant budget explicitly \
+             from the root interactive session or start a new session.",
+            "and the refusal points at the grant path, which must therefore exist"
+        );
+
+        // A grant larger than the ORIGINAL configured cap is refused (pi caps total grants at the
+        // configured limit) — with the live numbers in the text, not a bare rejection.
+        let too_big = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "grant-spawn-budget", "additional": 2 }),
+        )
+        .await
+        .expect_err("2 is more than the 1 grantable");
+        assert!(
+            too_big.to_string().starts_with(
+                "Spawn budget grant rejected: 2 requested but only 1 of the original configured \
+                 limit remains grantable."
+            ),
+            "pi's verbatim grant-allowance refusal: {too_big}"
+        );
+
+        let granted = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "grant-spawn-budget", "additional": 1 }),
+        )
+        .await
+        .expect("a grant within the allowance is applied");
+        assert_eq!(
+            tool_text(&granted),
+            "Spawn budget grant applied: +1. Spawn budget: 1/2 used, 1 remaining (configured 1; \
+             granted 1; grant allowance 0)"
+        );
+        assert_eq!(
+            granted.details.as_ref().and_then(|d| d.get("spawnBudget")).and_then(|b| b.get("limit")),
+            Some(&serde_json::json!(2)),
+            "the snapshot rides along in details.spawnBudget: {:?}",
+            granted.details
+        );
+        let bodies = seen.lock().expect("confirm log").clone();
+        assert_eq!(bodies.len(), 1, "exactly one confirmation was asked for");
+        assert!(
+            bodies[0].starts_with("Add 1 launches to this logical session?")
+                && bodies[0].contains("Spawn budget: 1/1 used, 0 remaining")
+                && bodies[0].ends_with(
+                    "Usage is not reset. Compaction keeps the same budget; a new parent session \
+                     starts a fresh one."
+                ),
+            "pi's confirmation body, showing the PREVIEW numbers: {}",
+            bodies[0]
+        );
+
+        // The grant is real: the next delegation is admitted past the budget and fails only on the
+        // unresolvable agent, exactly as the first one did.
+        let readmitted = dispatch_tool(&tool, serde_json::json!({ "agent": "ghost", "task": "c" }))
+            .await
+            .expect_err("an unresolvable agent still fails");
+        assert!(
+            readmitted.to_string().contains("agent not found: ghost"),
+            "the granted launch must be ADMITTED past the budget: {readmitted}"
+        );
+    }
+
+    /// SUBA-046 — the refusals that do NOT depend on a live confirmation, each pi's verbatim text.
+    #[tokio::test]
+    async fn a_spawn_budget_grant_is_refused_without_a_root_interactive_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                max_subagent_spawns_per_session: 1,
+                missions: Some(scoped_missions(dir.path())),
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+        let tool = ext.subagent_tool();
+
+        // pi `:4458` — no host services bound at all is cyrup's `!ctx.hasUI`.
+        let no_ui = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "grant-spawn-budget", "additional": 1 }),
+        )
+        .await
+        .expect_err("no interactive parent session");
+        assert_eq!(
+            no_ui.to_string(),
+            "Action 'grant-spawn-budget' is available only from the root interactive parent \
+             session."
+        );
+
+        // pi `:4465-4471` — a bound host that reports no session id.
+        struct NoSessionHost;
+        impl cyrup_ext::host::HostServices for NoSessionHost {}
+        ext.executor().set_host_services(Arc::new(NoSessionHost));
+        let no_session = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "grant-spawn-budget", "additional": 1 }),
+        )
+        .await
+        .expect_err("no session id");
+        assert_eq!(
+            no_session.to_string(),
+            "Action 'grant-spawn-budget' requires an active parent session id."
+        );
+    }
+
     /// SUBA-002 regression (pi `reserveSubagentSpawns`, `subagent-executor.ts:266-282` +
     /// `:3434-3441`): `maxSubagentSpawnsPerSession` is ENFORCED across a session's successive
     /// dispatches, not merely parsed. Pre-fix, the config field had no read site anywhere in the
@@ -13909,8 +14345,9 @@ mod tests {
             .expect_err("the session's spawn budget is exhausted");
         assert_eq!(
             rejected.to_string(),
-            "Subagent spawn limit reached for this session (2/2 used, 1 requested). \
-             Complete the work directly or start a new session.",
+            "Subagent spawn limit reached for this session (2/2 used, 1 requested). 0 remaining; \
+             the declared run cannot fit, so no children were started. Grant budget explicitly \
+             from the root interactive session or start a new session.",
             "pi's verbatim over-limit notice, with used/max/requested filled in"
         );
         assert!(
@@ -14089,8 +14526,9 @@ mod tests {
             );
             assert_eq!(
                 err.to_string(),
-                "Subagent spawn limit reached for this session (1/1 used, 1 requested). \
-                 Complete the work directly or start a new session.",
+                "Subagent spawn limit reached for this session (1/1 used, 1 requested). 0 \
+                 remaining; the declared run cannot fit, so no children were started. Grant \
+                 budget explicitly from the root interactive session or start a new session.",
                 "pi's verbatim over-limit notice, identical to the tool path's"
             );
             assert!(
@@ -14209,7 +14647,9 @@ mod tests {
                     err.to_string(),
                     format!(
                         "Subagent spawn limit reached for this session (0/1 used, {expected} \
-                         requested). Complete the work directly or start a new session."
+                         requested). 1 remaining; the declared run cannot fit, so no children were \
+                         started. Grant budget explicitly from the root interactive session or \
+                         start a new session."
                     ),
                     "background={background}: the lowered graph must bill pi's per-step count"
                 );
@@ -14376,8 +14816,9 @@ mod tests {
             .expect_err("the session's spawn budget is now exactly exhausted");
         assert_eq!(
             exhausted.to_string(),
-            "Subagent spawn limit reached for this session (3/3 used, 1 requested). \
-             Complete the work directly or start a new session.",
+            "Subagent spawn limit reached for this session (3/3 used, 1 requested). 0 remaining; \
+             the declared run cannot fit, so no children were started. Grant budget explicitly \
+             from the root interactive session or start a new session.",
             "the tool's chain dispatch must have been billed once (3), not twice (6)"
         );
     }

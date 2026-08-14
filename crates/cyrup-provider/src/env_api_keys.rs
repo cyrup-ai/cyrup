@@ -46,6 +46,12 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
             "ANTHROPIC_API_KEY",
         ]),
         "ant-ling" => Some(&["ANT_LING_API_KEY"]),
+        // PROV-014. `"qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY"` /
+        // `"qwen-token-plan-cn": "QWEN_TOKEN_PLAN_CN_API_KEY"` (env-api-keys.ts:80-81 @v0.83.0) —
+        // the two entries pi's `envMap` places immediately after `ant-ling`, kept in upstream's
+        // order here so the two maps stay diffable.
+        "qwen-token-plan" => Some(&["QWEN_TOKEN_PLAN_API_KEY"]),
+        "qwen-token-plan-cn" => Some(&["QWEN_TOKEN_PLAN_CN_API_KEY"]),
         "openai" => Some(&["OPENAI_API_KEY"]),
         "azure-openai-responses" => Some(&["AZURE_OPENAI_API_KEY"]),
         "nvidia" => Some(&["NVIDIA_API_KEY"]),
@@ -55,6 +61,9 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "groq" => Some(&["GROQ_API_KEY"]),
         "cerebras" => Some(&["CEREBRAS_API_KEY"]),
         "xai" => Some(&["XAI_API_KEY"]),
+        // PROV-014. `radius: "RADIUS_API_KEY"` (env-api-keys.ts:91 @v0.83.0), between `xai` and
+        // `openrouter` upstream.
+        "radius" => Some(&["RADIUS_API_KEY"]),
         "openrouter" => Some(&["OPENROUTER_API_KEY"]),
         "vercel-ai-gateway" => Some(&["AI_GATEWAY_API_KEY"]),
         "zai" => Some(&["ZAI_API_KEY"]),

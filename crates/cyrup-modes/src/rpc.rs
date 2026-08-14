@@ -240,6 +240,44 @@ pub struct RpcResponse {
     pub error: Option<String>,
 }
 
+/// The read direction of the same wire object, for [`crate::RpcClient`] (SEAM-017). Pi shares ONE
+/// `RpcResponse` type between its host and its client (`rpc-types.ts`, imported by both
+/// `rpc-mode.ts` and `rpc-client.ts:15`), so cyrup shares one too rather than growing a second,
+/// drift-prone client-side mirror.
+///
+/// Hand-written because `kind` is a `&'static str` — the tag is a constant of the type, not data —
+/// so the derive cannot produce a `Deserialize`. The `type` key is read and discarded (a
+/// `type` other than `"response"` never reaches here: the client tests it before deserializing,
+/// exactly as Pi's `handleLine` does at `rpc-client.ts:512`), and every field is defaulted so a
+/// truncated or partial response object degrades to `success:false` rather than failing the parse
+/// and silently dropping a correlated reply.
+impl<'de> serde::Deserialize<'de> for RpcResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            id: Option<Value>,
+            #[serde(default)]
+            command: String,
+            #[serde(default)]
+            success: bool,
+            #[serde(default)]
+            data: Option<Value>,
+            #[serde(default)]
+            error: Option<String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            id: wire.id,
+            kind: "response",
+            command: wire.command,
+            success: wire.success,
+            data: wire.data,
+            error: wire.error,
+        })
+    }
+}
+
 impl RpcResponse {
     fn ok(command: impl Into<String>, id: Option<Value>, data: Option<Value>) -> Self {
         Self { id, kind: "response", command: command.into(), success: true, data, error: None }
@@ -1268,8 +1306,25 @@ async fn handle(
             // no longer bypass user_bash", #7214). `execute_bash_with_user_event` is the shared
             // emit-then-execute wrapper the interactive `!`/`!!` front-end uses as well — calling
             // the bare `execute_bash` here would bypass the event exactly as pre-#7214 Pi did.
-            // (Pi's sibling `operations` override is deliberately not honored: cyrup has no per-call
-            // bash-backend override seam — see `execute_bash_with_user_event`'s doc.)
+            // The `None` third argument is `on_chunk`, and it is a FAITHFUL port, not an omission:
+            // pi passes `undefined` in the same position (`session.executeBash(command.command,
+            // undefined, {…})`, `rpc-mode.ts:573` @v0.83.0) because the RPC front-end observes output
+            // through the `bash_execution_update` events keyed by `id` above, not through a callback.
+            //
+            // Pi's sibling `operations` override (`UserBashEventResult.operations`,
+            // `extensions/types.ts:1078-1080`) is NOT threadable from HERE, and that is a shape
+            // difference rather than a carve-out: pi emits `user_bash` AT this call site, so
+            // `rpc-mode.ts:577` still holds `eventResult` and can pass `operations` down; cyrup emits
+            // inside the shared `execute_bash_with_user_event` wrapper (so the interactive `!`/`!!`
+            // front-end and this one cannot drift on WHETHER they emit), and the event result never
+            // surfaces here. The override therefore has to be honored inside that wrapper, and the
+            // two open halves both live outside this file: the WIT round-trip that would let a WASM
+            // guest supply a backend at all (the CYRUP-DELTA register in `crates/cyrup-ext/src/lib.rs`)
+            // and the consumption in `cyrup-session-svc` (`emit_user_bash_event` reads only the
+            // `"result"` key; `BashOptions` has no `operations` field to put one in). The host-side
+            // seam an override is expressed as now exists: `cyrup_tools::ops::BashOperations` /
+            // `LocalBashOperations`, the port of pi's `createLocalBashOperations` (`tools/bash.ts:82`).
+            // DRIFT-004 / SEAM-015.
             match session
                 .execute_bash_with_user_event(
                     &command,

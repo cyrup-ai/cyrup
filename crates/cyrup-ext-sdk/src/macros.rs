@@ -95,6 +95,18 @@ macro_rules! export_extension {
                 ) -> ::std::string::String {
                     $crate::guest::transform_markdown(markdown, ctx_json)
                 }
+                fn on_terminal_input(
+                    data: ::std::string::String,
+                ) -> ::core::option::Option<
+                    $crate::guest::bindings::exports::cyrup::ext::events::TerminalInputResult,
+                > {
+                    $crate::guest::on_terminal_input(data).map(|r| {
+                        $crate::guest::bindings::exports::cyrup::ext::events::TerminalInputResult {
+                            consume: r.consume,
+                            data: r.data,
+                        }
+                    })
+                }
 
                 // --- provider OAuth + streamSimple + autocomplete stacking ---
                 fn provider_login(

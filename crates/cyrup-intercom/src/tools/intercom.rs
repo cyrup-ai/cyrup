@@ -13,7 +13,7 @@ use crate::session_state::SharedIntercomState;
 use crate::transport::client::SendOptions;
 use crate::transport::protocol::{Attachment, SessionInfo, now_ms};
 
-use super::text_result;
+use super::{detailed_result, text_result};
 
 /// The `intercom` tool.
 pub struct IntercomTool {
@@ -394,11 +394,23 @@ impl IntercomTool {
                 // `reviewer` echoes back `reviewer` rather than the raw UUID the name resolved to.
                 // When the reply target was INFERRED the result says so, because the model needs to
                 // know its plain send just closed an ask.
-                Ok(text_result(if inferred_ask.is_some() {
-                    format!("Reply sent to {target_display} (inferred from pending ask)")
-                } else {
-                    format!("Message sent to {target_display}")
-                }))
+                // `v0.10.1 index.ts:2054-2060`: `{ messageId, delivered: true, ...(effectiveReplyTo
+                // ? { replyTo: effectiveReplyTo } : {}) }` — the spread means `replyTo` is OMITTED,
+                // not null, when the send was not a reply.
+                let mut details = serde_json::json!({ "messageId": result.id, "delivered": true });
+                if let Some(reply_to) = &effective_reply_to
+                    && let Some(map) = details.as_object_mut()
+                {
+                    map.insert("replyTo".to_string(), serde_json::json!(reply_to));
+                }
+                Ok(detailed_result(
+                    if inferred_ask.is_some() {
+                        format!("Reply sent to {target_display} (inferred from pending ask)")
+                    } else {
+                        format!("Message sent to {target_display}")
+                    },
+                    details,
+                ))
             }
             "ask" => {
                 // `v0.10.1 index.ts:2071-2076`: the same single `(!to && !cwd) || !message` guard
@@ -566,8 +578,17 @@ impl IntercomTool {
                     }
                     // `v0.10.1 index.ts:2233`: `Reply sent to ${target.from.name || target.from.id}`
                     // — name preferred over id (JS `||`, so a blank name falls through to the id),
-                    // and NO trailing period.
-                    Ok(text_result(format!("Reply sent to {}", display_name(&target.from))))
+                    // and NO trailing period. `:2234` carries `{ messageId, delivered: true,
+                    // replyTo: target.message.id }` — here `replyTo` is unconditional, unlike the
+                    // `send` arm's spread, because a reply always has one.
+                    Ok(detailed_result(
+                        format!("Reply sent to {}", display_name(&target.from)),
+                        serde_json::json!({
+                            "messageId": result.id,
+                            "delivered": true,
+                            "replyTo": target.message.id,
+                        }),
+                    ))
                 } else {
                     // `v0.10.1 index.ts:2222-2225`: the failure names the peer and keeps pi's
                     // fallback reason.

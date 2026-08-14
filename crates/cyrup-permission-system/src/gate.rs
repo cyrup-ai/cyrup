@@ -59,21 +59,62 @@ pub fn is_likely_filesystem_tool_name(tool_name: &str) -> bool {
         .any(|&suffix| normalized.ends_with(suffix) || name_parts.contains(&suffix))
 }
 
-/// pi `getPathBearingToolPath` (`index.ts:218-233`): the `path`/`file_path` of a filesystem tool.
-/// Recognizes the exact path-bearing name set ([`PATH_BEARING_TOOLS`]), a structured-edit payload
-/// (an `edits` key, pi `hasStructuredEditPayload`), OR the broader [`is_likely_filesystem_tool_name`]
-/// heuristic — so a non-builtin filesystem tool (`read_file`, `grep_files`, `fs_search`, a
-/// `*_read`/`*_write`/`*_search`/`*_list`) is recognized as path-bearing. This is an ENFORCEMENT
-/// input, not merely cosmetic: `extension.rs`'s external-directory guard skips the whole ask/deny
-/// check when this returns `None`, so a filesystem-like tool that went unrecognized would reach a
-/// path OUTSIDE the working directory ungated.
+/// pi `STRUCTURED_EDIT_OPERATION_NAMES` (v0.8.0 `permission-prompts.ts:6`): the `op` values that
+/// make an entry a recognized structured edit.
+const STRUCTURED_EDIT_OPERATION_NAMES: [&str; 5] =
+    ["replace", "append", "prepend", "delete", "replace_text"];
+
+/// pi `hasStructuredEditPayload` (v0.8.0 `permission-prompts.ts:23-30`): true when ANY payload
+/// returned by [`get_structured_edit_payloads`] is a RECOGNIZED edit — its `op` (defaulting to
+/// `"replace_text"` when absent or non-string) is in [`STRUCTURED_EDIT_OPERATION_NAMES`], **or** it
+/// carries both `oldText` and `newText` as strings.
+///
+/// This is deliberately NOT `input.contains_key("edits")`, which is what
+/// [`get_path_bearing_tool_path`] used before and which diverges from pi in **both** directions:
+///
+/// * **Fail-open (the serious one).** A tool input with top-level `oldText`+`newText` strings and no
+///   `edits` key IS a structured-edit payload upstream (`permission-prompts.ts:16-18` synthesizes a
+///   one-element `replace_text` list), so pi recognizes the tool as path-bearing and runs the
+///   external-directory guard. The old key test said `false`, so for any tool whose name is not in
+///   [`PATH_BEARING_TOOLS`] and does not trip [`is_likely_filesystem_tool_name`] — say a
+///   `patch_document` tool called with `{path, oldText, newText}` — cyrup skipped the
+///   external-directory ask/deny entirely and let the write land outside the working directory
+///   ungated.
+/// * **Fail-closed.** `"edits": {}` / `"edits": "x"` (not an array), `"edits": []`, or an array whose
+///   every entry carries an unrecognized `op` all made the old test say `true` where pi says `false`,
+///   changing both the guard and the approval subject
+///   ([`get_pattern_approval_subject`] resolves a path resource instead of falling through).
+#[must_use]
+pub fn has_structured_edit_payload(input: &Map<String, Value>) -> bool {
+    get_structured_edit_payloads(input).iter().any(|edit| {
+        let record = to_record(edit);
+        // pi `typeof editRecord.op === "string" ? editRecord.op : "replace_text"`.
+        let op = record.get("op").and_then(Value::as_str).unwrap_or("replace_text");
+        STRUCTURED_EDIT_OPERATION_NAMES.contains(&op)
+            || (record.get("oldText").and_then(Value::as_str).is_some()
+                && record.get("newText").and_then(Value::as_str).is_some())
+    })
+}
+
+/// pi `getPathBearingToolPath` (`index.ts:216-232` @v0.8.0): the `path`/`file_path` of a filesystem
+/// tool. Recognizes the exact path-bearing name set ([`PATH_BEARING_TOOLS`]), a structured-edit
+/// payload ([`has_structured_edit_payload`], pi `hasStructuredEditPayload`), OR the broader
+/// [`is_likely_filesystem_tool_name`] heuristic — so a non-builtin filesystem tool (`read_file`,
+/// `grep_files`, `fs_search`, a `*_read`/`*_write`/`*_search`/`*_list`) is recognized as
+/// path-bearing. This is an ENFORCEMENT input, not merely cosmetic: `extension.rs`'s
+/// external-directory guard skips the whole ask/deny check when this returns `None`, so a
+/// filesystem-like tool that went unrecognized would reach a path OUTSIDE the working directory
+/// ungated.
 #[must_use]
 pub fn get_path_bearing_tool_path(tool_name: &str, input: &Value) -> Option<String> {
     let record = to_record(input);
     let path = get_non_empty_string(record.get("path"))
         .or_else(|| get_non_empty_string(record.get("file_path")))?;
+    // pi checks `PATH_BEARING_TOOLS.has(toolName)` FIRST and returns early (`index.ts:224-226`),
+    // then the structured-edit / filesystem-heuristic pair (`:228-230`); `||` makes the order
+    // unobservable, but the arms are kept in upstream's sequence.
     if PATH_BEARING_TOOLS.contains(&tool_name)
-        || record.contains_key("edits")
+        || has_structured_edit_payload(record)
         || is_likely_filesystem_tool_name(tool_name)
     {
         Some(path)
@@ -622,7 +663,16 @@ pub fn format_ask_unavailable_reason(result: &PermissionCheckResult) -> String {
     format!("Using tool '{}' requires approval, but no interactive UI is available.", result.tool_name)
 }
 
-/// pi `formatMissingToolNameReason` (`index.ts:336-338`).
+/// pi `formatMissingToolNameReason` (v0.8.0 `permission-prompts.ts:32-34`; v0.7.1
+/// `index.ts:336-338`).
+///
+/// **\[CYRUP-DELTA]** upstream's literal ends `"Use a registered tool name from pi.getAllTools()."`
+/// (`permission-prompts.ts:33`). The trailing clause names pi's JavaScript extension-runtime global,
+/// which does not exist in cyrup — the analog is the Rust
+/// [`cyrup_ext::HostServices::all_tool_names`], not something a model could be told to "call" — so
+/// the sentence is truncated after `"Use a registered tool name."` rather than shipping a
+/// model-facing instruction to invoke an API that is absent from this runtime. Recorded here
+/// because it was previously an undocumented silent divergence in a model-facing block reason.
 #[must_use]
 pub fn format_missing_tool_name_reason() -> String {
     "Tool call was blocked because no tool name was provided. Use a registered tool name."
@@ -871,6 +921,104 @@ mod tests {
         assert_eq!(path.as_deref(), Some("/x/secret"));
         // A non-filesystem tool with a `path`-shaped field is NOT treated as path-bearing.
         assert!(get_path_bearing_tool_path("bash", &serde_json::json!({ "path": "/x" })).is_none());
+    }
+
+    // ------------------------------- pi `hasStructuredEditPayload` (`permission-prompts.ts:23-30`)
+    //
+    // These pin the predicate that `get_path_bearing_tool_path` consults. It used to be the bare
+    // key test `input.contains_key("edits")`, which is neither necessary nor sufficient upstream.
+
+    /// RED before the fix, the FAIL-OPEN direction. `getStructuredEditPayloads`
+    /// (`permission-prompts.ts:16-18`) synthesizes a one-element `replace_text` payload from
+    /// top-level `oldText`+`newText` when there is no `edits` array, so pi's
+    /// `getPathBearingToolPath` (`index.ts:227-230`) returns the path for a tool whose NAME says
+    /// nothing filesystem-ish. The old `contains_key("edits")` test said `false`, so
+    /// `extension.rs:1267-1273`'s external-directory guard was skipped entirely and the path
+    /// reached the main check ungated by the `external_directory` special policy.
+    #[test]
+    fn top_level_old_new_text_is_a_structured_edit_payload_without_an_edits_key() {
+        let input = serde_json::json!({
+            "path": "/outside/secret.txt",
+            "oldText": "a",
+            "newText": "b",
+        });
+        assert!(has_structured_edit_payload(to_record(&input)));
+        // `patch_document` is not in PATH_BEARING_TOOLS and does not trip the filesystem-name
+        // heuristic, so the ONLY thing that can recognize it is the structured-edit payload.
+        assert!(!is_likely_filesystem_tool_name("patch_document"));
+        assert_eq!(
+            get_path_bearing_tool_path("patch_document", &input).as_deref(),
+            Some("/outside/secret.txt"),
+            "pi recognizes this as path-bearing; the bare `edits` key test did not"
+        );
+    }
+
+    /// RED before the fix, the FAIL-CLOSED direction: an `edits` key that is not an array, an empty
+    /// array, and an array of unrecognized ops are all `false` upstream (`Array.isArray` fails, or
+    /// `.some()` finds nothing), where the bare key test said `true`.
+    #[test]
+    fn an_edits_key_alone_is_not_a_structured_edit_payload() {
+        for edits in [
+            serde_json::json!("replace"),          // not an array
+            serde_json::json!({ "op": "replace" }), // not an array
+            serde_json::json!([]),                  // empty array — `.some()` is false
+            serde_json::json!([{ "op": "frobnicate" }]), // unrecognized op, no oldText/newText
+        ] {
+            let input = serde_json::json!({ "path": "/x/f.txt", "edits": edits });
+            assert!(
+                !has_structured_edit_payload(to_record(&input)),
+                "pi's `.some()` finds no recognized edit in {edits}"
+            );
+            assert!(
+                get_path_bearing_tool_path("patch_document", &input).is_none(),
+                "and so the tool is not path-bearing for {edits}"
+            );
+        }
+    }
+
+    /// The recognized shapes, all five `STRUCTURED_EDIT_OPERATION_NAMES` plus the missing-`op`
+    /// default (`typeof editRecord.op === "string" ? … : "replace_text"`), and the
+    /// `oldText`+`newText` escape hatch on an otherwise-unrecognized op.
+    #[test]
+    fn recognized_structured_edit_ops_and_the_replace_text_default() {
+        for op in ["replace", "append", "prepend", "delete", "replace_text"] {
+            let input = serde_json::json!({ "edits": [{ "op": op }] });
+            assert!(has_structured_edit_payload(to_record(&input)), "op {op} is recognized");
+        }
+        // Missing `op` defaults to "replace_text", which IS in the set.
+        let defaulted = serde_json::json!({ "edits": [{ "lines": ["x"] }] });
+        assert!(has_structured_edit_payload(to_record(&defaulted)));
+        // A non-string `op` defaults the same way.
+        let non_string_op = serde_json::json!({ "edits": [{ "op": 7 }] });
+        assert!(has_structured_edit_payload(to_record(&non_string_op)));
+        // An unrecognized op still counts when it carries both texts (pi's `||` arm).
+        let escape_hatch =
+            serde_json::json!({ "edits": [{ "op": "frobnicate", "oldText": "a", "newText": "b" }] });
+        assert!(has_structured_edit_payload(to_record(&escape_hatch)));
+        // `.some()` — one recognized entry among unrecognized ones is enough.
+        let mixed = serde_json::json!({ "edits": [{ "op": "frobnicate" }, { "op": "delete" }] });
+        assert!(has_structured_edit_payload(to_record(&mixed)));
+        // A non-string oldText/newText pair does NOT satisfy pi's `typeof === "string"` test.
+        let non_string_texts =
+            serde_json::json!({ "edits": [{ "op": "frobnicate", "oldText": 1, "newText": 2 }] });
+        assert!(!has_structured_edit_payload(to_record(&non_string_texts)));
+    }
+
+    /// The structured-edit recognition also decides the APPROVAL SUBJECT
+    /// (`get_pattern_approval_subject` → `get_path_bearing_tool_path`), so an "Allow always" on a
+    /// `{path, oldText, newText}` call now persists against the path resource pi uses rather than
+    /// falling through to the bare tool name.
+    #[test]
+    fn approval_subject_uses_the_path_for_a_structured_edit_payload() {
+        let input = serde_json::json!({
+            "path": "/w/src/a.rs",
+            "cwd": "/w",
+            "oldText": "a",
+            "newText": "b",
+        });
+        let subject = get_pattern_approval_subject(&ask_result("patch_document"), &input);
+        assert_ne!(subject, "patch_document", "the path must win, as it does upstream");
+        assert!(subject.contains("a.rs"), "got {subject}");
     }
 
     #[test]

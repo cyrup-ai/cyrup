@@ -191,12 +191,25 @@ pub fn interpret_resume(outcome: &SelectorOutcome) -> ResumeChoice {
 pub fn run_resume_picker(
     theme: &UiTheme,
     keymaps: &(SelectKeymap, SessionKeymap),
-    sessions: &[SessionInfo],
+    current_sessions: &[SessionInfo],
+    all_sessions: &[SessionInfo],
     current_id: Option<&str>,
 ) -> anyhow::Result<(ResumeChoice, Vec<String>)> {
-    let rows = session_rows(sessions, current_id);
-    let mut selector =
-        SessionSelector::new(rows).with_keymaps(&keymaps.1, &cyrup_tui::EditorKeymap::default());
+    let rows = session_rows(current_sessions, current_id);
+    let mut selector = SessionSelector::new(rows)
+        .with_keymaps(&keymaps.1, &cyrup_tui::EditorKeymap::default());
+    // SEAM-061 — pi hands `selectSession` BOTH loaders (`cli/session-picker.ts:15-19`), and `Tab`
+    // swaps the list between them (`session-selector.ts:551-556` → `:1003-1026`). Wiring only the
+    // current-folder set leaves the toggle with nowhere to go.
+    selector.set_all_rows(session_rows(all_sessions, current_id));
+    // The cwd column the `all` scope turns on (`:468-470`) — the only thing that says which project
+    // a row in the merged listing belongs to.
+    selector.set_session_cwds(
+        current_sessions
+            .iter()
+            .chain(all_sessions.iter())
+            .map(|s| (s.path.display().to_string(), s.cwd.clone())),
+    );
     let mut status: Vec<String> = Vec::new();
     let outcome = run_startup_selector(theme, &keymaps.0, &mut selector, |payload| {
         // The session selector emits delete/rename via a tagged `Apply` payload; effect it on disk so

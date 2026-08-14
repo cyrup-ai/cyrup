@@ -359,7 +359,7 @@ fn send_sigterm(child: &Child) {
 /// to tokio's own portable `start_kill` rather than another best-effort signal send. On Unix this
 /// too targets the process group when the child leads one ([`send_signal`]) — a pid-only `SIGKILL`
 /// here is what would otherwise leak the child's entire descendant subtree.
-fn send_sigkill(child: &mut Child) {
+pub(crate) fn send_sigkill(child: &mut Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {

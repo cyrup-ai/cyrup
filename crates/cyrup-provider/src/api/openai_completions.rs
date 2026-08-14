@@ -10,7 +10,8 @@
 
 use crate::HeaderMap;
 use crate::api::compat::{
-    CacheControlFormat, MaxTokensField, ResolvedCompat, SessionAffinityFormat, ThinkingFormat,
+    CacheControlFormat, DeferredToolsMode, MaxTokensField, ResolvedCompat, SessionAffinityFormat,
+    ThinkingFormat,
     clamp_openai_prompt_cache_key, get_compat, level_map_lookup, mapped_effort_or, off_is_not_null,
     off_value_or, sanitize_surrogates, thinking_level_key,
 };
@@ -336,7 +337,7 @@ pub(crate) fn build_body_with_env(
 ) -> Result<Value, ConstrainedSamplingError> {
     let compat = get_compat(model);
     let cache = resolve_cache_retention(opts.cache_retention, env);
-    let mut messages = convert_messages(model, ctx, &compat);
+    let mut messages = convert_messages(model, ctx, &compat)?;
     let cache_control = compat_cache_control(&compat, cache);
     let base_url = model.base_url.as_str();
 
@@ -384,8 +385,27 @@ pub(crate) fn build_body_with_env(
     // Tools (+ z.ai tool_stream) / empty-tools-for-tool-history.
     let has_tool_history = ctx.messages.iter().any(message_has_tool_use);
     let mut tools: Option<Vec<Value>> = None;
-    if !ctx.tools.is_empty() {
-        tools = Some(convert_tools(&ctx.tools, &compat)?);
+    // PROV-025 — `const deferredToolNames = compat.deferredToolsMode === "kimi" ?
+    // getDeferredToolNames(context.messages) : new Set(); const activeTools =
+    // context.tools?.filter((tool) => !deferredToolNames.has(tool.name));`
+    // (`openai-completions.ts:719-721` @v0.83.0). A tool introduced mid-transcript is emitted ONCE
+    // inline by `convert_messages` and must NOT be repeated in the top-level array — that
+    // repetition is exactly the prompt-prefix churn the mode exists to avoid. Note the emptiness
+    // test below is on the FILTERED list, so a transcript whose every tool is deferred falls
+    // through to the `has_tool_history` arm, as upstream's `activeTools.length > 0` does.
+    let active_tools: Vec<ToolDef> = if compat.deferred_tools_mode == Some(DeferredToolsMode::Kimi)
+    {
+        let deferred = deferred_tool_names(&ctx.messages);
+        ctx.tools
+            .iter()
+            .filter(|t| !deferred.iter().any(|n| n == &t.name))
+            .cloned()
+            .collect()
+    } else {
+        ctx.tools.clone()
+    };
+    if !active_tools.is_empty() {
+        tools = Some(convert_tools(&active_tools, &compat)?);
         if compat.zai_tool_stream {
             obj.insert("tool_stream".to_string(), json!(true));
         }
@@ -730,6 +750,37 @@ fn message_has_tool_use(msg: &Message) -> bool {
 /// JSON-schema constrained sampling gets `strict: true` and every other tool keeps `false`
 /// (PROV-011). A `strict: "require"` tool on a provider without strict mode fails the request with
 /// pi's exact message.
+/// Every tool name introduced mid-transcript by a `toolResult`'s `addedToolNames` — Pi
+/// `getDeferredToolNames`, `openai-completions.ts:91-101` @v0.83.0.
+///
+/// PROV-025. Insertion-ordered for the same reason [`tools_by_name`] is: upstream's `Set` walks in
+/// insertion order and that order reaches the wire. This is a DIFFERENT accessor from
+/// [`crate::utils::deferred_tools`]'s placement map — it works off message names only, with no
+/// notion of WHERE the tool became available.
+fn deferred_tool_names(messages: &[cyrup_core::Message]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for message in messages {
+        if let cyrup_core::Message::ToolResult { added_tool_names, .. } = message {
+            for name in added_tool_names {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// `names.map(n => toolsByName.get(n)).filter(Boolean)` — Pi `getToolsByName`,
+/// `openai-completions.ts:103-110` @v0.83.0. Walks `names` (not `tools`), so the emitted order is
+/// the order the tools were introduced, and a name with no matching tool is dropped.
+fn tools_by_name(tools: &[ToolDef], names: &[String]) -> Vec<ToolDef> {
+    names
+        .iter()
+        .filter_map(|name| tools.iter().find(|t| &t.name == name).cloned())
+        .collect()
+}
+
 pub(crate) fn convert_tools(
     tools: &[ToolDef],
     compat: &ResolvedCompat,
@@ -1087,7 +1138,7 @@ pub(crate) fn convert_messages(
     model: &Model,
     ctx: &Context,
     compat: &ResolvedCompat,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ConstrainedSamplingError> {
     let transformed = transform_messages(&ctx.messages, model);
     let mut params: Vec<Value> = Vec::new();
 
@@ -1140,11 +1191,20 @@ pub(crate) fn convert_messages(
             },
             Message::ToolResult { .. } => {
                 let mut image_blocks: Vec<Value> = Vec::new();
+                // PROV-025 — pi's per-RUN `const deferredToolNames = new Set<string>()`
+                // (`openai-completions.ts:1194` @v0.83.0), declared inside the tool-result branch
+                // so each run emits its OWN inline tool block. A `Vec` rather than a set because
+                // upstream's `Array.from(names)` walks a JS `Set` in INSERTION order and
+                // `getToolsByName` preserves it (`:104-110`); a `HashSet` would randomize the
+                // emitted tool order and a `BTreeSet` would sort it, and neither is what the wire
+                // sees upstream.
+                let mut deferred_tool_names: Vec<String> = Vec::new();
                 let mut j = i;
                 while let Some(Message::ToolResult {
                     tool_call_id,
                     tool_name,
                     content,
+                    added_tool_names,
                     ..
                 }) = transformed.get(j)
                 {
@@ -1174,6 +1234,18 @@ pub(crate) fn convert_messages(
                         tr.insert("name".to_string(), json!(tool_name));
                     }
                     params.push(Value::Object(tr));
+
+                    // `if (compat.deferredToolsMode === "kimi") { for (const name of
+                    // toolMsg.addedToolNames ?? []) deferredToolNames.add(name); }`
+                    // (`openai-completions.ts:1221-1226` @v0.83.0) — immediately after the tool
+                    // message is pushed, before the image handling.
+                    if compat.deferred_tools_mode == Some(DeferredToolsMode::Kimi) {
+                        for name in added_tool_names {
+                            if !deferred_tool_names.iter().any(|n| n == name) {
+                                deferred_tool_names.push(name.clone());
+                            }
+                        }
+                    }
 
                     if has_images && model.supports_image_input() {
                         for c in content {
@@ -1205,13 +1277,28 @@ pub(crate) fn convert_messages(
                     params.push(json!({ "role": "user", "content": Value::Array(arr) }));
                     last_role = Some("user");
                 }
+
+                // `if (deferredToolNames.size > 0) { … params.push(kimiToolMessage) }`
+                // (`openai-completions.ts:1266-1276` @v0.83.0), positioned exactly here: AFTER the
+                // image/`lastRole` handling and immediately before the `continue`. Kimi accepts a
+                // system message carrying `tools` and omitting the standard `content` field, so
+                // the object has exactly the two keys upstream emits.
+                if !deferred_tool_names.is_empty() {
+                    let deferred_tools = tools_by_name(&ctx.tools, &deferred_tool_names);
+                    if !deferred_tools.is_empty() {
+                        params.push(json!({
+                            "role": "system",
+                            "tools": convert_tools(&deferred_tools, compat)?,
+                        }));
+                    }
+                }
                 continue;
             }
         }
         i += 1;
     }
 
-    params
+    Ok(params)
 }
 
 /// Build an assistant chat message (Pi `convertMessages` assistant branch, L913-1013); `None` when
@@ -2262,6 +2349,136 @@ mod tests {
         );
         assert!(!plain.contains_key("X-Initiator"));
         assert!(!plain.contains_key("Copilot-Vision-Request"));
+    }
+
+    /// PROV-025 — `deferredToolsMode: "kimi"`.
+    ///
+    /// BEFORE: `rg 'deferred_tools_mode|DeferredToolsMode' crates/` returned nothing, so a Kimi
+    /// model received the FULL tool schema set on every single turn and the prompt-prefix cache
+    /// churned on exactly the provider family upstream added the mode for.
+    ///
+    /// Pi's mechanism, reproduced here clause for clause: the deferred tool is dropped from
+    /// `params.tools` (`openai-completions.ts:719-721` @v0.83.0) and emitted ONCE as a
+    /// `{role: "system", tools: [...]}` message directly after the tool-result run that introduced
+    /// it (`:1266-1276`).
+    #[test]
+    fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message() {
+        fn tool(name: &str) -> ToolDef {
+            ToolDef {
+                name: name.into(),
+                description: format!("the {name} tool"),
+                parameters: json!({ "type": "object", "properties": {} }),
+                constrained_sampling: None,
+            }
+        }
+        fn transcript() -> Vec<Message> {
+            vec![
+                Message::User { content: vec![Content::text("go")], timestamp: 0 },
+                Message::Assistant(AssistantMessage {
+                    content: vec![Content::ToolCall(ToolCall {
+                        id: ToolCallId::from("c1"),
+                        name: "early".into(),
+                        arguments: Map::new(),
+                        thought_signature: None,
+                    })],
+                    provider: "moonshotai".into(),
+                    model: "kimi-k2".into(),
+                    api: API_ID.into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    deferred: None,
+                    error_message: None,
+                    raw_stop_reason: None,
+                    timestamp: 0,
+                }),
+                Message::ToolResult {
+                    tool_call_id: ToolCallId::from("c1"),
+                    tool_name: "early".into(),
+                    content: vec![Content::text("ok")],
+                    is_error: false,
+                    details: None,
+                    timestamp: 0,
+                    usage: None,
+                    // The anchor: this result introduced `late`.
+                    added_tool_names: vec!["late".to_string()],
+                },
+            ]
+        }
+        let ctx = Context {
+            system_prompt: None,
+            messages: transcript(),
+            tools: vec![tool("early"), tool("late")],
+        };
+
+        // ---- WITHOUT the flag: today's behaviour, and the control that keeps the assertions
+        // below from passing vacuously.
+        let plain = build_body(&model(), &ctx, &StreamOptions::default());
+        let plain_tools = plain.get("tools").and_then(Value::as_array).expect("tools array");
+        assert_eq!(
+            plain_tools.len(),
+            2,
+            "without deferredToolsMode both tools stay in the top-level array"
+        );
+        assert!(
+            !plain
+                .get("messages")
+                .and_then(Value::as_array)
+                .expect("messages")
+                .iter()
+                .any(|m| m.get("tools").is_some()),
+            "without the flag no message carries an inline `tools` key"
+        );
+
+        // ---- WITH `compat: {"deferredToolsMode": "kimi"}`.
+        let mut kimi_model = model();
+        kimi_model.compat = Some(ModelCompat {
+            deferred_tools_mode: Some(DeferredToolsMode::Kimi),
+            ..Default::default()
+        });
+        let body = build_body(&kimi_model, &ctx, &StreamOptions::default());
+
+        // `late` is gone from the top-level array; `early` (never deferred) stays.
+        let tools = body.get("tools").and_then(Value::as_array).expect("tools array");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["early"], "a deferred tool must not be repeated in `tools`");
+
+        // …and appears exactly once, inline, in a `{role: "system", tools: [...]}` message with no
+        // `content` key, positioned after the tool-result run that introduced it.
+        let messages = body.get("messages").and_then(Value::as_array).expect("messages");
+        let inline_at = messages
+            .iter()
+            .position(|m| m.get("tools").is_some())
+            .expect("an inline kimi tool message is emitted");
+        let inline = &messages[inline_at];
+        assert_eq!(inline.get("role").and_then(Value::as_str), Some("system"));
+        assert!(
+            inline.get("content").is_none(),
+            "Kimi's tool system message omits the standard `content` field"
+        );
+        let inline_names: Vec<&str> = inline
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("inline tools")
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(inline_names, vec!["late"]);
+        assert_eq!(
+            messages[inline_at - 1].get("role").and_then(Value::as_str),
+            Some("tool"),
+            "the inline block follows the tool-result run that introduced the tool"
+        );
+        assert_eq!(
+            messages.iter().filter(|m| m.get("tools").is_some()).count(),
+            1,
+            "the schema is emitted ONCE — repeating it is the churn the mode exists to avoid"
+        );
     }
 
     fn ctx_with_tool_call_ids(ids: &[&str]) -> Context {

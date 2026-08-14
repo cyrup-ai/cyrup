@@ -1351,8 +1351,11 @@ fn resolve_startup_ui(
     // resume the chosen session (Pi `selectSession`, session-picker.ts:15-55). A bare `--resume`
     // mapped to `New` in `to_session_config`; the picker resolves the real target here.
     if cli.resume && matches!(config.target, SessionTarget::New) {
-        let sessions = gather_session_infos(dirs);
-        let (choice, status) = cyrup::run_resume_picker(&theme, &keymaps, &sessions, None)?;
+        // SEAM-061: the picker takes pi's two loaders, not one merged list — `Tab` swaps between
+        // them (`session-picker.ts:15-19` hands `selectSession` both).
+        let (current_sessions, all_sessions) = gather_session_scopes(dirs);
+        let (choice, status) =
+            cyrup::run_resume_picker(&theme, &keymaps, &current_sessions, &all_sessions, None)?;
         // Pi renders these inside the picker header with a 2 s / 3 s dwell
         // (session-selector.ts:847,851); cyrup's selector has no status channel yet (area 07), so
         // they are printed after the alternate screen is torn down rather than dropped. SEAM-063.
@@ -1367,8 +1370,12 @@ fn resolve_startup_ui(
                 // must still get the interactive Continue/Cancel prompt, exactly as the
                 // `--session`/`--session-id` open paths do via `resolve_session`. The picked session's
                 // stored cwd comes from its `SessionInfo` listing (Pi `sessionManager.getCwd()`).
-                let stored_cwd = sessions
+                // Searched across BOTH scopes: with the `Tab` toggle live the chosen row may have
+                // come from the all-projects set, and a cross-project session is exactly the one
+                // whose stored cwd is most likely to be gone.
+                let stored_cwd = current_sessions
                     .iter()
+                    .chain(all_sessions.iter())
                     .find(|s| s.path == path)
                     .map(|s| s.cwd.clone())
                     .unwrap_or_default();
@@ -1542,20 +1549,19 @@ fn list_global_sessions(dirs: &ConfigDirs) -> Vec<SessionInfo> {
     }
 }
 
-/// Scan the cwd's local session listing and the global cross-project listing into a merged
-/// [`SessionInfo`] vector (locals first, globals de-duplicated by path) for the `--resume` picker (Pi
-/// `selectSession`'s `current`/`all` `SessionsLoader`s, session-picker.ts:23-25 — fed by
-/// `SessionManager.list(cwd, sessionDir, onProgress)` / `SessionManager.listAll(sessionDir,
-/// onProgress)`, main.ts:372-373).
-fn gather_session_infos(dirs: &ConfigDirs) -> Vec<SessionInfo> {
+/// The `--resume` picker's TWO session sets, kept apart the way pi keeps them apart: `.0` is the
+/// **current-folder** listing (Pi `SessionManager.list(cwd, sessionDir, onProgress)`,
+/// main.ts:372 = `session-picker.ts`'s `currentSessionsLoader`) and `.1` is the **all-projects**
+/// listing (`SessionManager.listAll(sessionDir, onProgress)`, main.ts:373 = `allSessionsLoader`).
+///
+/// SEAM-061 — these used to be MERGED into one vector behind a picker headed "Resume Session
+/// (Current Folder)", so the screen listed other projects' sessions with no cwd column and no way
+/// back; upstream never merges them, it swaps between them on `Tab` (`session-selector.ts:
+/// 1003-1026`) and turns the cwd column on for the `all` set (`:844`, `:923`).
+fn gather_session_scopes(dirs: &ConfigDirs) -> (Vec<SessionInfo>, Vec<SessionInfo>) {
     let layout = session_list_layout(dirs);
-    let mut sessions = list_in_dir(&layout.dir(), session_list_cwd_filter(dirs), None);
-    for global in list_global_sessions(dirs) {
-        if !sessions.iter().any(|s| s.path == global.path) {
-            sessions.push(global);
-        }
-    }
-    sessions
+    let current = list_in_dir(&layout.dir(), session_list_cwd_filter(dirs), None);
+    (current, list_global_sessions(dirs))
 }
 
 /// Scan the cwd's session listing and the global cross-project listing into [`SessionRef`]s (Pi
@@ -2433,13 +2439,22 @@ mod tests {
             "Pi's listAll(sessionDir) overload scans the custom dir itself, unfiltered"
         );
 
-        // The merged `--resume` listing keeps both, locals first, de-duplicated by path.
-        let infos = super::gather_session_infos(&dirs);
-        assert_eq!(infos.len(), 2, "merged picker listing de-duplicates by path");
+        // SEAM-061 — the `--resume` picker takes the two sets APART (pi's two loaders), so the
+        // "Current Folder" scope really is this folder's sessions and the foreign one is reachable
+        // only after `Tab`. Assert the presence of the foreign row in `all` before asserting its
+        // absence from `current`, so a scan that silently found nothing cannot pass this.
+        let (current, all) = super::gather_session_scopes(&dirs);
+        let all_cwds: Vec<String> = all.iter().map(|i| i.cwd.clone()).collect();
+        assert!(
+            all_cwds.contains(&other.to_string_lossy().into_owned()),
+            "the all-projects scope must reach the other project's session: {all_cwds:?}"
+        );
+        assert_eq!(all.len(), 2, "listAll(sessionDir) scans the shared dir unfiltered");
+        let current_cwds: Vec<String> = current.iter().map(|i| i.cwd.clone()).collect();
         assert_eq!(
-            infos.first().map(|i| i.cwd.clone()),
-            Some(here.to_string_lossy().into_owned()),
-            "the cwd-filtered locals come first in the merged listing"
+            current_cwds,
+            vec![here.to_string_lossy().into_owned()],
+            "the current-folder scope must NOT carry another project's session"
         );
     }
 

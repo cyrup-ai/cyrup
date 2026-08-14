@@ -1,16 +1,21 @@
-// cyrup:ext@0.6.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.7.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
 // lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
 // values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
 //
-// The `events` interface exports 33 `on-*` event hooks, mirroring pi's `pi.on(...)` catalog
-// one-for-one (`extensions/types.ts:1190-1231` @v0.83.0 — 33 `on(event: "…")` overloads, hand
-// re-derived; the range `:1198-1239` this header used to cite corresponds to NO upstream version
-// and was fabricated, EXT-036). `before_provider_headers` (EXT-009, upstream `:1212`) and
-// `session_info_changed` (EXT-011, upstream `:1203`) closed the last two gaps. The host calls only
-// the exports a guest subscribed to (the subscription gate, R-08-034).
+// The `events` interface exports 34 `on-*` hooks. THIRTY-THREE of them mirror pi's `pi.on(...)`
+// catalog one-for-one (`extensions/types.ts:1190-1231` @v0.83.0 — 33 `on(event: "…")` overloads,
+// hand re-derived; the range `:1198-1239` this header used to cite corresponds to NO upstream
+// version and was fabricated, EXT-036). `before_provider_headers` (EXT-009, upstream `:1212`) and
+// `session_info_changed` (EXT-011, upstream `:1203`) closed the last two gaps. The 34th,
+// `on-terminal-input`, is NOT an `on(event: …)` overload: it is the guest-side half of
+// `ExtensionUIContext.onTerminalInput(handler)` (`extensions/types.ts:145` @v0.83.0), which
+// upstream registers as a closure rather than a named event — a closure cannot cross a component
+// boundary, so it lands here as an export paired with the `ui.subscribe-terminal-input` import
+// (EXT-021). Count the `on-*` lines, not the pi events: the two numbers are 34 and 33.
+// The host calls only the exports a guest subscribed to (the subscription gate, R-08-034).
 //
 // VERSIONING (EXT-028): this package version and `cyrup_ext::HOST_WORLD` move TOGETHER, and ANY
 // change to an EXPORT — added, removed, or RE-SIGNED — bumps the MINOR. A guest built against an
@@ -23,8 +28,12 @@
 // such batch (ADR-0002's one-bump-per-pass rule): `ui.set-widget` gained pi's key/placement
 // (EXT-047) and `ui.theme-list` widened to `{name, path}` rows (EXT-021). Purely ADDITIVE imports
 // in the same batch (`ui.set-working-*`, `ui.set-hidden-thinking-label`, `ui.theme-get-by-name`)
-// would not have needed a bump on their own.
-package cyrup:ext@0.6.0;
+// would not have needed a bump on their own. 0.6 -> 0.7 is another such batch, and this one hits
+// BOTH directions: `types.tool-descriptor` gained `constrained-sampling`, which RE-SIGNS the
+// `registration.register-tool` import (PROV-011 / EXT-024), and the `events.on-terminal-input`
+// EXPORT was ADDED alongside the `ui.subscribe-terminal-input`/`ui.unsubscribe-terminal-input`
+// imports (EXT-021). Either one alone forces the bump.
+package cyrup:ext@0.7.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -75,6 +84,26 @@ interface types {
     // "Controls whether ToolExecutionComponent renders the standard colored shell or the tool
     // renders its own framing." `none` = upstream's omitted field = "default" (EXT-024).
     render-shell: option<string>,
+    // pi `ToolDefinition.constrainedSampling?: false | ConstrainedSamplingConfig`
+    // (extensions/types.ts:463 @v0.83.0), copied verbatim onto the runtime tool by
+    // `wrapToolDefinition` (core/tools/tool-definition-wrapper.ts:14) and resolved provider-side
+    // by `packages/ai/src/api/constrained-sampling.ts`. Carried as the JSON of that union —
+    // `false`, `{"type":"json_schema","strict":"prefer"|"require"}` or
+    // `{"type":"grammar","variants":{"openai_lark"?,"openai_regex"?}}` — because it is an
+    // open-shaped value per the header's rule. `none` = the omitted field, which upstream is
+    // indistinguishable from `false` (PROV-011 / EXT-024).
+    constrained-sampling: option<string>,
+  }
+
+  // Pi `TerminalInputHandler`'s return, `extensions/types.ts:113` @v0.83.0:
+  // `{ consume?: boolean; data?: string } | undefined`. Both members stay OPTIONAL because
+  // upstream distinguishes "absent" from "false"/"empty" in neither direction by accident: the
+  // fold tests `result?.consume` (truthy) and `result?.data !== undefined`, so a handler returning
+  // `{data: ""}` REWRITES the buffer to empty (and the keystroke is then dropped by the
+  // end-of-fold length check), while one returning `{}` leaves it alone.
+  record terminal-input-result {
+    consume: option<bool>,
+    data: option<string>,
   }
 
   // Result of a capability-scoped exec (arch-08 caps/exec.rs). 1:1 with Pi's `ExecResult`
@@ -117,12 +146,15 @@ interface types {
 // host -> guest: the §5 event catalog (exports the guest may implement).
 // The host only calls events the guest subscribed to (subscription gate, R-08-034).
 // All 33 pi events (the `on(event: "…")` overload block, extensions/types.ts:1190-1231 @v0.83.0)
-// are represented here. EXT-036: this line used to claim "All 30" against a range that matches no
-// upstream version, contradicting the file's own header 81 lines above — and the count test only
-// ties the header's number, so the disagreement passed straight through an audit that quoted it.
+// are represented here, plus `on-terminal-input` — the `ExtensionUIContext.onTerminalInput`
+// closure (`extensions/types.ts:145`), which has no `on(event: …)` name upstream — for 34 `on-*`
+// exports against 33 pi events. EXT-036: this line used to claim "All 30" against a range that
+// matches no upstream version, contradicting the file's own header 81 lines above — and the count
+// test only ties the header's number, so the disagreement passed straight through an audit that
+// quoted it.
 // ---------------------------------------------------------------------------
 interface events {
-  use types.{hook-outcome, tool-output};
+  use types.{hook-outcome, tool-output, terminal-input-result};
 
   // --- provider OAuth + custom streaming (Pi ProviderConfig.oauth/streamSimple, types.ts:1373-1392) ---
   // The host invokes these on a guest that registered a provider carrying OAuth/`streamSimple`
@@ -226,6 +258,22 @@ interface events {
   // Called only on a guest that declared `registration.register-markdown-transformer`. A guest
   // fault leaves the markdown untouched (the identity default), never dropping the transcript text.
   transform-markdown: func(markdown: string, ctx-json: string) -> string;
+
+  // --- raw terminal input (EXT-021's residual; pi `ExtensionUIContext.onTerminalInput(handler)`,
+  // `extensions/types.ts:145` @v0.83.0, handler type `TerminalInputHandler` at `:113`:
+  // `(data: string) => { consume?: boolean; data?: string } | undefined`) ---
+  //
+  // Called only on a guest that declared `ui.subscribe-terminal-input`, in LOAD order — pi keeps
+  // its listeners in an insertion-ordered `Set` and folds them in `TUI.handleInput`
+  // (`packages/tui/src/tui.ts:773-788`): each listener sees the CURRENT (possibly already
+  // rewritten) data, a `consume: true` stops the fold and drops the keystroke, and a returned
+  // `data` replaces the buffer for the listeners after it. A fold that ends with an EMPTY string
+  // also drops the keystroke (`:784-786`).
+  //
+  // `none` is upstream's `undefined` return — "I looked at it and did nothing" — and is what a
+  // faulting or panicking guest is treated as, so a broken extension can never swallow the user's
+  // keyboard.
+  on-terminal-input: func(data: string) -> option<terminal-input-result>;
 
   // --- 5.4 tools — the mutating seams ---
   // tool_call [block/mutate] (types.ts:1145), tool_result [mutate] (types.ts:1146).
@@ -426,6 +474,18 @@ interface ui {
   // AbortSignal, types.ts:89-94): a dialog subsequently opened carrying that signal id returns
   // cancelled (`confirm` -> false, `input`/`select` -> none).
   abort-signal: func(signal-id: string);
+  // Pi `onTerminalInput(handler: TerminalInputHandler): () => void` (`extensions/types.ts:145`
+  // @v0.83.0) — "Listen to raw terminal input (interactive mode only). Returns an unsubscribe
+  // function." Argument-less for the same reason `register-markdown-transformer` is: the handler
+  // is a guest closure the host reaches through the `on-terminal-input` EXPORT, so this import
+  // only declares that this guest HAS one. The returned unsubscribe function is
+  // `unsubscribe-terminal-input`, which is idempotent — upstream's is a `Set.delete`.
+  //
+  // EXT-021: this pair is what the crate-level CYRUP-DELTA register named as the ONE member of
+  // `interface ui` that was an open GAP rather than a delta ("It is expressible … unported only
+  // because an export addition forces a HOST_WORLD bump"). That bump is 0.6 -> 0.7.
+  subscribe-terminal-input:   func();
+  unsubscribe-terminal-input: func();
   // `opts-json` is pi's `ExtensionUIDialogOptions` bag (`extensions/types.ts:95-100` @v0.83.0):
   // `{signal, timeout}` — `timeout?: number`, "Timeout in milliseconds. Dialog auto-dismisses with
   // live countdown display" (:100), and/or a programmatic-dismiss signal id (none = `{}`).

@@ -205,12 +205,49 @@ fn format_prompt_compaction_notice(omitted_lines: usize, omitted_characters: usi
     format!("[Permission prompt compacted: omitted {summary} to keep the permission dialog usable.]")
 }
 
+/// JS `String.prototype.length` — UTF-16 CODE UNITS, not Unicode scalars and not UTF-8 bytes.
+///
+/// PERM-030 established this convention for `gate.rs`'s inline formatters and `wildcard.rs:81`, but
+/// its "crate-wide sweep for `chars().count()` standing in for JS `String.length`" missed
+/// `permission-dialog.ts`'s compaction, which is the OTHER half of the same human-facing dialog.
+/// Every length in [`compact_permission_prompt_for_select`] is a `value.length` upstream
+/// (`permission-dialog.ts:53`, `:63`, `:65`, `:74`), so an emoji in a bash command, a path or
+/// `write` content counted 1 here and 2 upstream — shifting the 2 200-unit threshold, the cut point,
+/// and the `omitted N characters` the notice reports.
+fn utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
+/// JS `value.slice(0, max_units)` measured in UTF-16 code units.
+///
+/// \[CYRUP-DELTA] JS can cut mid-surrogate-pair and produce a lone surrogate; a Rust `String`
+/// cannot hold one, so a cut that would land inside a pair backs up to the preceding char boundary.
+/// The difference is at most one code unit and it shows less rather than producing an unpaired
+/// surrogate — the same delta PERM-030 recorded for `gate::truncate_inline_text`.
+fn slice_utf16(value: &str, max_units: usize) -> &str {
+    if utf16_len(value) <= max_units {
+        return value;
+    }
+    let mut units = 0usize;
+    let mut end = 0usize;
+    for (index, ch) in value.char_indices() {
+        let width = ch.len_utf16();
+        if units + width > max_units {
+            end = index;
+            break;
+        }
+        units += width;
+        end = index + ch.len_utf8();
+    }
+    value.get(..end).unwrap_or("")
+}
+
 /// pi `compactPermissionPromptForSelect` (`permission-dialog.ts:51-84`): a UX guard capping the
 /// dialog body to 32 lines / 2200 chars, appending a compaction notice. Pure; ported for fidelity.
 fn compact_permission_prompt_for_select(value: &str) -> String {
     let lines = split_prompt_lines(value);
     if lines.len() <= PERMISSION_DIALOG_MAX_VISIBLE_LINES
-        && value.chars().count() <= PERMISSION_DIALOG_MAX_VISIBLE_CHARACTERS
+        && utf16_len(value) <= PERMISSION_DIALOG_MAX_VISIBLE_CHARACTERS
     {
         return value.to_string();
     }
@@ -221,21 +258,21 @@ fn compact_permission_prompt_for_select(value: &str) -> String {
     let mut prefix = prefix_lines.join("\n");
 
     for _ in 0..3 {
-        let omitted_characters = value.chars().count().saturating_sub(prefix.chars().count());
+        let omitted_characters = utf16_len(value).saturating_sub(utf16_len(&prefix));
         let notice = format_prompt_compaction_notice(omitted_lines, omitted_characters);
         let separator_length = usize::from(!prefix.trim_end().is_empty());
         let max_prefix_characters = PERMISSION_DIALOG_MAX_VISIBLE_CHARACTERS
-            .saturating_sub(notice.chars().count())
+            .saturating_sub(utf16_len(&notice))
             .saturating_sub(separator_length);
 
-        if prefix.chars().count() <= max_prefix_characters {
+        if utf16_len(&prefix) <= max_prefix_characters {
             let trimmed = prefix.trim_end();
             return if trimmed.is_empty() { notice } else { format!("{trimmed}\n{notice}") };
         }
-        prefix = prefix.chars().take(max_prefix_characters).collect::<String>().trim_end().to_string();
+        prefix = slice_utf16(&prefix, max_prefix_characters).trim_end().to_string();
     }
 
-    let omitted_characters = value.chars().count().saturating_sub(prefix.chars().count());
+    let omitted_characters = utf16_len(value).saturating_sub(utf16_len(&prefix));
     let notice = format_prompt_compaction_notice(omitted_lines, omitted_characters);
     let trimmed = prefix.trim_end();
     if trimmed.is_empty() {
@@ -334,6 +371,46 @@ impl AskChannel for ForwardingAskChannel {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
+
+    // ---------------- PERM-030 sibling: `permission-dialog.ts` counts UTF-16 code units too
+    //
+    // RED before the fix. Every length in `compactPermissionPromptForSelect` is JS
+    // `String.prototype.length` (`permission-dialog.ts:53,63,65,74`) — UTF-16 code units. This half
+    // of the dialog kept `chars().count()` after PERM-030 fixed `gate.rs`, so an astral-plane
+    // character moved BOTH the 2 200-unit threshold and the reported `omitted N characters`.
+
+    #[test]
+    fn compaction_threshold_counts_utf16_code_units() {
+        // 1 100 emoji = 1 100 scalars but 2 200 UTF-16 units — exactly AT pi's cap, so pi does not
+        // compact. `chars().count()` said 1 100, also under the cap, so this case agrees; add one
+        // more emoji and pi is OVER (2 202) while `chars().count()` (1 101) is still far under.
+        let at_cap = "\u{1F600}".repeat(1_100);
+        assert_eq!(utf16_len(&at_cap), PERMISSION_DIALOG_MAX_VISIBLE_CHARACTERS);
+        assert_eq!(compact_permission_prompt_for_select(&at_cap), at_cap, "at the cap: unchanged");
+
+        let over_cap = "\u{1F600}".repeat(1_101);
+        assert_eq!(over_cap.chars().count(), 1_101, "scalars stay far under the 2 200 cap");
+        assert!(utf16_len(&over_cap) > PERMISSION_DIALOG_MAX_VISIBLE_CHARACTERS);
+        let out = compact_permission_prompt_for_select(&over_cap);
+        assert_ne!(out, over_cap, "pi compacts here; the scalar count did not");
+        assert!(out.contains("[Permission prompt compacted:"), "got {out}");
+        assert!(
+            utf16_len(&out) <= PERMISSION_DIALOG_MAX_VISIBLE_CHARACTERS,
+            "the result must fit the cap in pi's own unit; got {} units",
+            utf16_len(&out)
+        );
+    }
+
+    #[test]
+    fn slice_utf16_never_splits_a_surrogate_pair() {
+        // 3 UTF-16 units requested out of "a😀b" keeps "a" + the whole emoji is NOT admissible
+        // (that would be 3 units exactly) — check both boundaries.
+        assert_eq!(slice_utf16("a\u{1F600}b", 3), "a\u{1F600}");
+        // A cut landing INSIDE the pair backs up one unit rather than emitting a lone surrogate.
+        assert_eq!(slice_utf16("a\u{1F600}b", 2), "a");
+        assert_eq!(slice_utf16("abc", 10), "abc");
+        assert_eq!(slice_utf16("abc", 0), "");
+    }
 
     #[tokio::test]
     async fn noop_channel_never_allows() {
