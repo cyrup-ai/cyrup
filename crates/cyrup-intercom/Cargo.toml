@@ -61,7 +61,11 @@ required-features = ["test-fixtures"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "macros", "rt-multi-thread", "process"] }
+# `test-util` supplies `#[tokio::test(start_paused = true)]` + `tokio::time::advance`, which the
+# reconnect-backoff test uses instead of real sleeps (ICOM-025): a wall-clock assertion over a
+# 1000 ms timer plus a spawn hop is intermittent red on a loaded tree, and widening the slack hides
+# the backoff regression the test exists to catch. Dev-only.
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "macros", "rt-multi-thread", "process", "test-util"] }
 # The C3 cross-companion proof (`tests/shared_human_lock.rs`, reconciliation §1 / §4 step 6): drives
 # the REAL permission gate (`PermissionSystemExtension::on_event` ask path) AND the REAL intercom
 # `IntercomClarifyChannel::ask` against ONE shared `HostServices` sink (== ONE `HumanInteractionLock`),

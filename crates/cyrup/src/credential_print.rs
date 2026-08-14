@@ -38,9 +38,13 @@ use crate::diagnostics::apply_arg_leniency;
 /// Pi `DEFAULT_BEARER_TOKEN_MIN_EXPIRY_MS = 30 * 60_000` (credential-print.ts:8).
 const DEFAULT_BEARER_TOKEN_MIN_EXPIRY_MS: i64 = 30 * 60_000;
 
-/// Which credential the command prints (Pi `CredentialPrintKind`, credential-print.ts:6).
+/// Which auth command was invoked — Pi `AuthCommandKind = "check" | "api_key" | "bearer_token"`
+/// (`cli/auth-command.ts:4` @v0.84.1; the v0.83.0 file was `CredentialPrintKind` with the two print
+/// kinds only, `credential-print.ts:6`). SEAM-050.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialPrintKind {
+    /// `auth check` — new at v0.84.1. Reports `ready` / `not_ready` / `invalid` and exits 0/1/2.
+    Check,
     ApiKey,
     BearerToken,
 }
@@ -51,6 +55,66 @@ impl CredentialPrintKind {
         match self {
             CredentialPrintKind::ApiKey => "API key",
             CredentialPrintKind::BearerToken => "OAuth bearer token",
+            CredentialPrintKind::Check => "credential",
+        }
+    }
+
+    /// Pi `getAuthCommandName` (`auth-command.ts:23-25`) — the name quoted in
+    /// `Unknown option --X for "<name>".`
+    pub const fn command_name(self) -> &'static str {
+        match self {
+            CredentialPrintKind::Check => "auth check",
+            CredentialPrintKind::ApiKey => "auth print-api-key",
+            CredentialPrintKind::BearerToken => "auth print-bearer-token",
+        }
+    }
+
+    /// Pi `AUTH_COMMAND_USAGE` (`auth-command.ts:17-21`), rebranded.
+    pub const fn usage(self) -> &'static str {
+        match self {
+            CredentialPrintKind::Check => {
+                "cyrup auth check --provider <provider> [--json] [--credentials] [--no-refresh]"
+            }
+            CredentialPrintKind::ApiKey => {
+                "cyrup auth print-api-key --provider <provider> [--model <model>]"
+            }
+            CredentialPrintKind::BearerToken => {
+                "cyrup auth print-bearer-token --provider <provider> [--model <model>] \
+                 [--min-expiry <duration>]"
+            }
+        }
+    }
+}
+
+/// The `auth check` verdict — Pi `AuthCheckResult` (`cli/auth-check.ts:15-20` @v0.84.1). Field names
+/// are pi's, because `--json` serializes this object verbatim (`main.ts:207`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AuthCheckResult {
+    /// `"ready" | "not_ready" | "invalid"` (`auth-check.ts:8`) — drives the 0/1/2 exit code.
+    pub status: &'static str,
+    pub provider: String,
+    /// `"provider_not_found" | "credentials_not_configured" | "credential_not_available" |
+    /// "invalid_state"` (`auth-check.ts:9-13`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// `"api_key" | "oauth"` (`auth-check.ts:19`), present only on `ready`.
+    #[serde(rename = "authType", skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<&'static str>,
+    /// Pi splices this in beside the result rather than declaring it on the interface:
+    /// `JSON.stringify({ ...result, ...(credential ? { credentials: credential } : {}) })`
+    /// (`main.ts:207`), so it is elided when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<String>,
+}
+
+impl AuthCheckResult {
+    /// Pi `process.exitCode = result.status === "ready" ? 0 : result.status === "not_ready" ? 1 : 2`
+    /// (`main.ts:208`).
+    pub fn exit_code(&self) -> i32 {
+        match self.status {
+            "ready" => 0,
+            "not_ready" => 1,
+            _ => 2,
         }
     }
 }
@@ -63,6 +127,11 @@ pub struct CredentialPrintCommand {
     pub kind: CredentialPrintKind,
     pub args: Vec<String>,
     pub min_expiry_ms: Option<i64>,
+    /// `--json`, `--credentials`, `--no-refresh` — accepted **only** by `check`
+    /// (`auth-command.ts:82-88` @v0.84.1). SEAM-050.
+    pub json: bool,
+    pub credentials: bool,
+    pub no_refresh: bool,
 }
 
 /// A credential-print failure (Pi `CredentialPrintError` vs. any other thrown error,
@@ -101,13 +170,16 @@ pub fn is_credential_print_help(argv: &[String]) -> bool {
     )
 }
 
-/// The `auth` usage block (Pi `printCredentialPrintHelp`, credential-print.ts:24-30), rebranded.
+/// The `auth` usage block (Pi `printAuthCommandHelp`, `cli/auth-command.ts:38-45` @v0.84.1 — the
+/// v0.83.0 `printCredentialPrintHelp`, `credential-print.ts:24-30`, listed only the two print
+/// verbs), rebranded. SEAM-050 added the `check` line and pi's provider-OR-model sentence.
 pub fn credential_print_help() -> String {
-    "Usage:\n  cyrup auth print-api-key --model <model> [--provider <provider>]\n  cyrup auth \
-     print-bearer-token --model <model> [--provider <provider>] [--min-expiry <duration>]\n\nPrints \
-     the configured credential alone on stdout. Provider inference uses configured credentials; \
-     specify --provider to select explicitly. Bearer tokens have a 30-minute minimum expiry by \
-     default. --min-expiry accepts ms, s, m, or h (for example, 30m).\n"
+    "Usage:\n  cyrup auth print-api-key [--provider <provider>] [--model <model>]\n  cyrup auth \
+     print-bearer-token [--provider <provider>] [--model <model>] [--min-expiry <duration>]\n  \
+     cyrup auth check [--provider <provider>] [--model <model>] [--json] [--credentials] \
+     [--no-refresh]\n\nAuth commands require at least one of --provider or --model. Checks refresh \
+     expired OAuth credentials by default; --no-refresh prevents this. --credentials emits the \
+     credential, or includes it in JSON output.\n"
         .to_string()
 }
 
@@ -146,12 +218,14 @@ pub fn parse_credential_print_command(
         return Ok(None);
     }
     let kind = match argv.get(1).map(String::as_str) {
+        Some("check") => CredentialPrintKind::Check,
         Some("print-api-key") => CredentialPrintKind::ApiKey,
         Some("print-bearer-token") => CredentialPrintKind::BearerToken,
         other => {
+            // Pi `auth-command.ts:60-62` @v0.84.1 — the sentence gained the third verb.
             return Err(format!(
-                "Unknown auth command \"{}\". Use \"cyrup auth print-api-key\" or \"cyrup auth \
-                 print-bearer-token\".",
+                "Unknown auth command \"{}\". Use \"cyrup auth print-api-key\", \"cyrup auth \
+                 print-bearer-token\", or \"cyrup auth check\".",
                 other.unwrap_or("")
             ));
         }
@@ -159,8 +233,25 @@ pub fn parse_credential_print_command(
 
     let mut args: Vec<String> = Vec::new();
     let mut min_expiry_ms: Option<i64> = None;
+    let mut json = false;
+    let mut credentials = false;
+    let mut no_refresh = false;
     let mut index = 2usize;
     while let Some(arg) = argv.get(index) {
+        // Pi `auth-command.ts:82-88` @v0.84.1: the three check-only flags are consumed here and
+        // rejected outright for the print kinds, with the flag itself in the message.
+        if matches!(arg.as_str(), "--json" | "--credentials" | "--no-refresh") {
+            if kind != CredentialPrintKind::Check {
+                return Err(format!("{arg} is only supported by auth check"));
+            }
+            match arg.as_str() {
+                "--json" => json = true,
+                "--credentials" => credentials = true,
+                _ => no_refresh = true,
+            }
+            index += 1;
+            continue;
+        }
         if arg != "--min-expiry" {
             args.push(arg.clone());
             index += 1;
@@ -183,27 +274,54 @@ pub fn parse_credential_print_command(
         kind,
         args,
         min_expiry_ms,
+        json,
+        credentials,
+        no_refresh,
     }))
 }
 
-/// Reject anything outside `--provider` / `--model` (Pi `validateCredentialPrintArgs`,
-/// credential-print.ts:66-76). `positionals` is cyrup's combined carrier for Pi's `messages` +
+/// Reject anything outside `--provider` / `--model` — Pi `validateAuthCommandArgs`
+/// (`cli/auth-command.ts:96-116` @v0.84.1; the v0.83.0 `validateCredentialPrintArgs`,
+/// `credential-print.ts:66-76`). `positionals` is cyrup's combined carrier for Pi's `messages` +
 /// `fileArgs`; `extension_flags` is Pi's `unknownFlags`.
-pub fn validate_credential_print_args(cli: &Cli) -> Result<(), CredentialPrintError> {
-    if !cli.model.as_deref().is_some_and(|m| !m.trim().is_empty()) {
+///
+/// SEAM-050 changed three things to match v0.84.1, which routes BOTH print verbs through this same
+/// function (`credential-print.ts:24` calls `validateAuthCommandArgs(args, kind)`):
+/// * an unmatched flag is now `Unknown option --X for "auth print-api-key".` (`:99-102`) rather than
+///   folded into the generic "only accepts" message, and it is checked FIRST, as pi checks it;
+/// * the requirement is `--provider` **or** `--model` (`:113-115`), not `--model` alone — v0.83.0's
+///   `credential-print.ts:67-68` required `--model`, so `cyrup auth print-api-key --provider openai`
+///   was rejected where pi v0.84.1 accepts it;
+/// * `check` gets its own sentence, `Auth checks require …` (`:108-110`).
+pub fn validate_credential_print_args(
+    cli: &Cli,
+    kind: CredentialPrintKind,
+) -> Result<(), CredentialPrintError> {
+    // Pi `:97-102` — the unknown-flag rejection comes first and names the command.
+    if let Some(flag) = cli.extension_flags.first() {
+        return Err(CredentialPrintError::msg(format!(
+            "Unknown option --{} for \"{}\".",
+            flag.name,
+            kind.command_name()
+        )));
+    }
+    // Pi `:103-105` — `apiKey !== undefined || messages.length > 0 || fileArgs.length > 0`.
+    if cli.api_key.is_some() || !cli.positionals.is_empty() {
         return Err(CredentialPrintError::msg(
-            "Credential printing requires --model <model>",
+            "Auth commands only accept --provider and --model",
         ));
     }
-    if cli.api_key.is_some() {
-        return Err(CredentialPrintError::msg(
-            "Credential printing reads configured credentials; --api-key is not supported",
-        ));
-    }
-    if !cli.positionals.is_empty() || !cli.extension_flags.is_empty() {
-        return Err(CredentialPrintError::msg(
-            "Credential printing only accepts --provider and --model",
-        ));
+    let provider = cli.provider.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    let model = cli.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    if provider.is_none() && model.is_none() {
+        return Err(CredentialPrintError::msg(match kind {
+            // Pi `:108-110`.
+            CredentialPrintKind::Check => {
+                "Auth checks require --provider <provider> or --model <model>"
+            }
+            // Pi `:113-115`.
+            _ => "Credential printing requires --provider <provider> or --model <model>",
+        }));
     }
     Ok(())
 }
@@ -255,7 +373,7 @@ pub async fn resolve_credential_for_print(
     kind: CredentialPrintKind,
     min_expiry_ms: Option<i64>,
 ) -> Result<String, CredentialPrintError> {
-    validate_credential_print_args(cli)?;
+    validate_credential_print_args(cli, kind)?;
     let requested_model = cli.model.as_deref().unwrap_or_default();
 
     // Seed the provider-side store from `auth.json` so `get_auth_with` resolves exactly what a
@@ -362,7 +480,10 @@ pub async fn resolve_credential_for_print(
                 CredentialPrintKind::BearerToken => {
                     Some(min_expiry_ms.unwrap_or(DEFAULT_BEARER_TOKEN_MIN_EXPIRY_MS))
                 }
-                CredentialPrintKind::ApiKey => None,
+                // `Check` never reaches this function — `dispatch` routes it to `run_auth_check`
+                // before the print path, exactly as pi's `if (command.kind !== "check")` guard does
+                // (`main.ts:171`).
+                CredentialPrintKind::ApiKey | CredentialPrintKind::Check => None,
             },
         };
         // Pi lets a non-`CredentialPrintError` throw here reach the outer catch, which reports the
@@ -384,7 +505,7 @@ pub async fn resolve_credential_for_print(
             .and_then(strip_bearer);
         let value = match kind {
             CredentialPrintKind::BearerToken => api_key.or(bearer),
-            CredentialPrintKind::ApiKey => api_key,
+            CredentialPrintKind::ApiKey | CredentialPrintKind::Check => api_key,
         };
         if let Some(value) = value {
             credentials.push((model.provider.as_str().to_string(), value));
@@ -421,6 +542,209 @@ pub async fn resolve_credential_for_print(
         "Model \"{requested_model}\" has multiple configured providers ({}). Specify --provider.",
         ids.join(", ")
     )))
+}
+
+/// `cyrup auth check` — Pi `checkProviderAuth` (`cli/auth-check.ts:22-52` @v0.84.1) plus the
+/// `--credentials` splice its driver applies (`main.ts:190-199`). SEAM-050.
+///
+/// pi's tiers, in pi's order:
+/// 1. `validateAuthCommandArgs(args, "check")` (`:26`) — done by the caller;
+/// 2. an explicit `--model` resolves the provider through `resolveCliModel`, and a resolution
+///    failure is a THROWN `AuthCommandError`, not a `not_ready` (`:28-34`);
+/// 3. `modelRuntime.getError()` ⇒ `invalid` / `invalid_state` (`:37-39`) — cyrup's analog is a
+///    `models.json` composition error;
+/// 4. `!modelRuntime.getProvider(provider)` ⇒ `not_ready` / `provider_not_found` (`:40-42`);
+/// 5. `!(await modelRuntime.checkAuth(provider))` ⇒ `not_ready` / `credentials_not_configured`
+///    (`:44-45`);
+/// 6. with refresh on, `!(await modelRuntime.getAuth(provider))` ⇒ the same (`:46-48`);
+/// 7. otherwise `ready`, carrying `authType` (`:49`).
+///
+/// CYRUP-DELTA — the `--no-refresh` credential source. pi swaps the whole store for a
+/// `ReadOnlyAuthStorage` (`main.ts:186`) so an expired OAuth credential cannot be silently
+/// refreshed on disk; cyrup's equivalent is that `--no-refresh` skips tier 6 and reads the STORED
+/// `access` token directly (pi's `getProviderCredential` early-return, `auth-check.ts:60`), because
+/// cyrup's credential-print path already seeds an in-memory store from `auth.json` and never writes
+/// back — the read-only property pi's wrapper exists to guarantee holds by construction here.
+pub async fn run_auth_check(
+    cli: &Cli,
+    dirs: &ConfigDirs,
+    want_credentials: bool,
+    refresh: bool,
+) -> Result<AuthCheckResult, CredentialPrintError> {
+    validate_credential_print_args(cli, CredentialPrintKind::Check)?;
+
+    let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));
+    let seed = InMemoryCredentialStore::new();
+    for info in auth.list_credentials().unwrap_or_default() {
+        if let Ok(Some(cred)) = auth.read(&info.provider).await {
+            seed.insert(info.provider.clone(), to_provider_credential(cred));
+        }
+    }
+    let store = Arc::new(seed) as Arc<dyn CredentialStore>;
+    let credential_types: BTreeMap<String, CredentialType> = store
+        .list()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|info| (info.provider.as_str().to_string(), info.credential_type))
+        .collect();
+
+    let (models_json, load_errors) =
+        cyrup_config::load_models_file_reporting(&dirs.agent_dir.join("models.json"));
+    let registry = crate::provider::registry_with_credentials(&models_json, store);
+    let all = registry.get_models(None);
+    let has_configured_auth =
+        |m: &Model| cyrup_config::provider_is_configured(&auth, &models_json, &m.provider, None);
+
+    // Tier 2 — an explicit `--model` names the provider (`auth-check.ts:28-34`).
+    let mut provider = cli
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    if let Some(model_pattern) = cli.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        let resolved = cyrup_config::resolve_cli_model(
+            cli.provider.as_deref(),
+            Some(model_pattern),
+            None,
+            &all,
+            &has_configured_auth,
+        );
+        match (resolved.error, resolved.model) {
+            (Some(error), _) => return Err(CredentialPrintError::msg(error)),
+            (None, None) => {
+                return Err(CredentialPrintError::msg(format!(
+                    "Unable to resolve model \"{model_pattern}\""
+                )));
+            }
+            (None, Some(model)) => provider = Some(model.provider.as_str().to_string()),
+        }
+    }
+    // Pi `:35` — `if (!provider) throw new AuthCommandError("Unable to resolve an auth provider");`
+    let Some(provider) = provider else {
+        return Err(CredentialPrintError::msg("Unable to resolve an auth provider"));
+    };
+
+    // Tier 3 — `modelRuntime.getError()` (`:37-39`).
+    if load_errors.is_some() {
+        return Ok(AuthCheckResult {
+            status: "invalid",
+            provider,
+            reason: Some("invalid_state"),
+            auth_type: None,
+            credentials: None,
+        });
+    }
+    // Tier 4 — `modelRuntime.getProvider(provider)` (`:40-42`).
+    if !registry
+        .get_providers()
+        .iter()
+        .any(|p| p.id().as_str() == provider)
+    {
+        return Ok(AuthCheckResult {
+            status: "not_ready",
+            provider,
+            reason: Some("provider_not_found"),
+            auth_type: None,
+            credentials: None,
+        });
+    }
+    // Tier 5 — `modelRuntime.checkAuth(provider)` (`:44-45`). cyrup's predicate is the same one the
+    // launch path and `--list-models` use: a stored credential, a known provider env var, or a
+    // `models.json` block carrying its own `apiKey`.
+    let configured = cyrup_config::provider_is_configured(
+        &auth,
+        &models_json,
+        &cyrup_sdk::core::ProviderId::from(provider.as_str()),
+        None,
+    );
+    if !configured {
+        return Ok(AuthCheckResult {
+            status: "not_ready",
+            provider,
+            reason: Some("credentials_not_configured"),
+            auth_type: None,
+            credentials: None,
+        });
+    }
+    let stored = credential_types.get(&provider).copied();
+    let auth_type = match stored {
+        Some(CredentialType::Oauth) => "oauth",
+        _ => "api_key",
+    };
+
+    // Tiers 6-7, plus the driver's `--credentials` splice. Both need the RESOLVED request auth, so
+    // they share one call: pi runs `getAuth(provider)` for the refresh probe (`:46-48`) and again
+    // inside `getProviderCredential` (`auth-check.ts:62`).
+    let model = all.iter().find(|m| m.provider.as_str() == provider);
+    let resolved = match model {
+        Some(model) => registry
+            .get_auth_with(
+                model,
+                AuthOverrides { api_key: None, env: None, min_oauth_validity_ms: None },
+            )
+            .await
+            .map_err(|_| CredentialPrintError::Opaque)?,
+        None => None,
+    };
+    if refresh && resolved.is_none() {
+        return Ok(AuthCheckResult {
+            status: "not_ready",
+            provider,
+            reason: Some("credentials_not_configured"),
+            auth_type: None,
+            credentials: None,
+        });
+    }
+
+    let mut result = AuthCheckResult {
+        status: "ready",
+        provider,
+        reason: None,
+        auth_type: Some(auth_type),
+        credentials: None,
+    };
+    if want_credentials {
+        // Pi `getProviderCredential` (`auth-check.ts:54-63`): without refresh an OAuth credential
+        // answers with its STORED `access` token; otherwise the resolved request auth's api key,
+        // else the `Bearer` half of its `Authorization` header (`getAuthCredential`, `:118-125`).
+        let credential = if !refresh && stored == Some(CredentialType::Oauth) {
+            match auth.read(&cyrup_sdk::core::ProviderId::from(result.provider.as_str())).await {
+                Ok(Some(cyrup_config::Credential::Oauth { access, .. })) => Some(access),
+                _ => None,
+            }
+        } else {
+            let api_key = resolved.as_ref().and_then(|r| r.auth.api_key.clone());
+            api_key.or_else(|| {
+                resolved
+                    .as_ref()
+                    .and_then(|r| r.auth.headers.as_ref())
+                    .and_then(|headers| {
+                        headers
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                            .and_then(|(_, value)| value.as_deref())
+                    })
+                    .and_then(strip_bearer)
+            })
+        };
+        match credential {
+            // Pi `main.ts:196-198` — a `ready` check that cannot produce the credential the caller
+            // asked for degrades to `not_ready` / `credential_not_available`.
+            None => {
+                return Ok(AuthCheckResult {
+                    status: "not_ready",
+                    provider: result.provider,
+                    reason: Some("credential_not_available"),
+                    auth_type: None,
+                    credentials: None,
+                });
+            }
+            Some(c) => result.credentials = Some(c),
+        }
+    }
+    Ok(result)
 }
 
 /// The pre-parse dispatcher (Pi `runCredentialPrintCommand`, main.ts:130-167).
@@ -475,6 +799,33 @@ pub async fn dispatch(argv: &[String]) -> Option<i32> {
         return Some(1);
     };
 
+    if command.kind == CredentialPrintKind::Check {
+        // Pi `main.ts:184-208` @v0.84.1. The output is the credential when `--credentials` produced
+        // one, else the bare status word; `--json` serializes the whole result object instead
+        // (`:206-207`). The exit code is the status, 0/1/2 (`:208`).
+        return Some(
+            match run_auth_check(&cli, &dirs, command.credentials, !command.no_refresh).await {
+                Ok(result) => {
+                    let output = if command.json {
+                        serde_json::to_string(&result).unwrap_or_else(|_| result.status.to_string())
+                    } else {
+                        result
+                            .credentials
+                            .clone()
+                            .unwrap_or_else(|| result.status.to_string())
+                    };
+                    println!("{output}");
+                    result.exit_code()
+                }
+                Err(error) => {
+                    eprintln!("Error: {}", error.message());
+                    // Pi `process.exitCode = command.kind === "check" ? 2 : 1` (main.ts:210-211).
+                    2
+                }
+            },
+        );
+    }
+
     match resolve_credential_for_print(&cli, &dirs, command.kind, command.min_expiry_ms).await {
         Ok(credential) => {
             println!("{credential}");
@@ -522,8 +873,94 @@ mod tests {
         let err = parse_credential_print_command(&v(&["auth", "login"])).unwrap_err();
         assert_eq!(
             err,
-            "Unknown auth command \"login\". Use \"cyrup auth print-api-key\" or \"cyrup auth \
-             print-bearer-token\"."
+            "Unknown auth command \"login\". Use \"cyrup auth print-api-key\", \"cyrup auth \
+             print-bearer-token\", or \"cyrup auth check\"."
+        );
+    }
+
+    /// SEAM-050 — `auth check` is a real verb at v0.84.1 (`cli/auth-command.ts:4`, `:50-58`), and
+    /// its three flags are accepted by IT ALONE (`:82-88`). Before this, `cyrup auth check` hit the
+    /// unknown-command arm and exited 1, which an external tool branching on pi's 0/1/2 contract
+    /// could not distinguish from `not_ready`.
+    #[test]
+    fn auth_check_parses_with_its_three_flags() {
+        let cmd = parse_credential_print_command(&v(&[
+            "auth",
+            "check",
+            "--provider",
+            "openai",
+            "--json",
+            "--credentials",
+            "--no-refresh",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(cmd.kind, CredentialPrintKind::Check);
+        assert!(cmd.json && cmd.credentials && cmd.no_refresh);
+        // The check-only flags are CONSUMED, so the residual argv the ordinary parser sees is just
+        // the provider pair (pi pushes only non-flag args into `commandArgs`, `:89`).
+        assert_eq!(cmd.args, v(&["--provider", "openai"]));
+
+        // …and are rejected for the print verbs, with pi's message (`:83`).
+        for flag in ["--json", "--credentials", "--no-refresh"] {
+            let err =
+                parse_credential_print_command(&v(&["auth", "print-api-key", flag])).unwrap_err();
+            assert_eq!(err, format!("{flag} is only supported by auth check"));
+        }
+    }
+
+    /// SEAM-050 — the 0/1/2 mapping is pi's `main.ts:208`, and it is the whole point of the verb:
+    /// an external tool branches on it.
+    #[test]
+    fn auth_check_exit_codes_match_pi() {
+        let mk = |status| AuthCheckResult {
+            status,
+            provider: "openai".to_string(),
+            reason: None,
+            auth_type: None,
+            credentials: None,
+        };
+        assert_eq!(mk("ready").exit_code(), 0);
+        assert_eq!(mk("not_ready").exit_code(), 1);
+        assert_eq!(mk("invalid").exit_code(), 2);
+    }
+
+    /// SEAM-050 — v0.84.1 routes the PRINT verbs through `validateAuthCommandArgs` too
+    /// (`credential-print.ts:24`), so `--provider` alone is enough; v0.83.0's `--model`-required
+    /// check (`credential-print.ts:67-68`) rejected `cyrup auth print-api-key --provider openai`,
+    /// which pi accepts. Also pins pi's per-command unknown-option message (`auth-command.ts:99-102`).
+    #[test]
+    fn auth_arg_validation_matches_v0_84_1() {
+        let mut cli = Cli::default();
+        cli.provider = Some("openai".to_string());
+        assert!(validate_credential_print_args(&cli, CredentialPrintKind::ApiKey).is_ok());
+        assert!(validate_credential_print_args(&cli, CredentialPrintKind::Check).is_ok());
+
+        let bare = Cli::default();
+        assert_eq!(
+            validate_credential_print_args(&bare, CredentialPrintKind::Check)
+                .unwrap_err()
+                .message(),
+            "Auth checks require --provider <provider> or --model <model>"
+        );
+        assert_eq!(
+            validate_credential_print_args(&bare, CredentialPrintKind::BearerToken)
+                .unwrap_err()
+                .message(),
+            "Credential printing requires --provider <provider> or --model <model>"
+        );
+
+        let mut unknown = Cli::default();
+        unknown.provider = Some("openai".to_string());
+        unknown.extension_flags = vec![crate::cli::ExtensionFlag {
+            name: "bogus".to_string(),
+            value: crate::cli::ExtFlagValue::Bool(true),
+        }];
+        assert_eq!(
+            validate_credential_print_args(&unknown, CredentialPrintKind::Check)
+                .unwrap_err()
+                .message(),
+            "Unknown option --bogus for \"auth check\"."
         );
     }
 
@@ -579,6 +1016,10 @@ mod tests {
         assert_eq!(strip_bearer("Basic tok"), None);
     }
 
+    /// v0.84.1's `validateAuthCommandArgs` (`cli/auth-command.ts:96-116`), which BOTH the print
+    /// verbs and `check` now route through (`credential-print.ts:24`). SEAM-050 rewrote three of
+    /// these expectations against that function; the v0.83.0 `--model`-required shape they used to
+    /// pin is gone upstream.
     #[test]
     fn validation_mirrors_upstream() {
         let base = |args: &[&str]| {
@@ -586,33 +1027,55 @@ mod tests {
             argv.extend(v(args));
             Cli::try_parse_from(&argv).unwrap()
         };
+        // pi `:113-115` — provider OR model, and the sentence names neither as required alone.
         assert_eq!(
-            validate_credential_print_args(&base(&[]))
+            validate_credential_print_args(&base(&[]), CredentialPrintKind::ApiKey)
                 .unwrap_err()
                 .message(),
-            "Credential printing requires --model <model>"
+            "Credential printing requires --provider <provider> or --model <model>"
+        );
+        // A whitespace-only value is `args.model?.trim() || undefined` (`:98`) — i.e. absent.
+        assert_eq!(
+            validate_credential_print_args(&base(&["--model", "   "]), CredentialPrintKind::ApiKey)
+                .unwrap_err()
+                .message(),
+            "Credential printing requires --provider <provider> or --model <model>"
+        );
+        // pi `:103-105` — `apiKey !== undefined || messages.length > 0 || fileArgs.length > 0`, one
+        // message for all three.
+        assert_eq!(
+            validate_credential_print_args(
+                &base(&["--model", "m", "--api-key", "k"]),
+                CredentialPrintKind::ApiKey
+            )
+            .unwrap_err()
+            .message(),
+            "Auth commands only accept --provider and --model"
         );
         assert_eq!(
-            validate_credential_print_args(&base(&["--model", "   "]))
-                .unwrap_err()
-                .message(),
-            "Credential printing requires --model <model>"
-        );
-        assert_eq!(
-            validate_credential_print_args(&base(&["--model", "m", "--api-key", "k"]))
-                .unwrap_err()
-                .message(),
-            "Credential printing reads configured credentials; --api-key is not supported"
-        );
-        assert_eq!(
-            validate_credential_print_args(&base(&["--model", "m", "hello"]))
-                .unwrap_err()
-                .message(),
-            "Credential printing only accepts --provider and --model"
+            validate_credential_print_args(
+                &base(&["--model", "m", "hello"]),
+                CredentialPrintKind::BearerToken
+            )
+            .unwrap_err()
+            .message(),
+            "Auth commands only accept --provider and --model"
         );
         assert!(
-            validate_credential_print_args(&base(&["--model", "m", "--provider", "openai"]))
-                .is_ok()
+            validate_credential_print_args(
+                &base(&["--model", "m", "--provider", "openai"]),
+                CredentialPrintKind::ApiKey
+            )
+            .is_ok()
+        );
+        // SEAM-050: `--provider` ALONE is now enough for a print verb — v0.83.0's
+        // `credential-print.ts:67-68` rejected this and v0.84.1 accepts it.
+        assert!(
+            validate_credential_print_args(
+                &base(&["--provider", "openai"]),
+                CredentialPrintKind::ApiKey
+            )
+            .is_ok()
         );
     }
 }

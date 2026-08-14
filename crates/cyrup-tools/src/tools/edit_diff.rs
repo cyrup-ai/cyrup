@@ -295,20 +295,41 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatch {
     }
     let fuzzy_content = normalize_for_fuzzy(content);
     let fuzzy_old = normalize_for_fuzzy(old_text);
-    match (fuzzy_old.is_empty(), fuzzy_content.find(&fuzzy_old)) {
-        (false, Some(idx)) => {
+    // `const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);` then `if (fuzzyIndex === -1)`
+    // (edit-diff.ts:222/:225). There is NO empty-needle guard upstream, and JS `indexOf("")`
+    // returns 0 — i.e. FOUND, at index 0, with `matchLength` 0. Rust's `str::find("")` returns
+    // `Some(0)` identically, so the guard cyrup carried here was a pure divergence: it sent an
+    // `oldText` that is non-empty but NORMALIZES to empty (an all-whitespace needle) down the
+    // not-found arm, where pi falls through to `countOccurrences` and raises the DUPLICATE error
+    // instead — different remediation advice for the same input.
+    match fuzzy_content.find(&fuzzy_old) {
+        Some(idx) => {
             FuzzyMatch { found: true, index: idx, match_length: fuzzy_old.len(), used_fuzzy: true }
         }
-        _ => FuzzyMatch { found: false, index: 0, match_length: 0, used_fuzzy: false },
+        None => FuzzyMatch { found: false, index: 0, match_length: 0, used_fuzzy: false },
     }
 }
 
-/// `countOccurrences` over the fuzzy-normalized buffer (edit-diff.ts:251-255).
+/// `countOccurrences` over the fuzzy-normalized buffer (edit-diff.ts:252-256):
+/// `return fuzzyContent.split(fuzzyOldText).length - 1;`
+///
+/// JS `split` has two distinct behaviours and the empty-separator one is load-bearing here:
+/// * a NON-empty separator splits on non-overlapping occurrences, so `length - 1` is exactly the
+///   occurrence count — `str::matches().count()`;
+/// * an EMPTY separator splits into one element per **UTF-16 code unit**, so `length - 1` is the
+///   code-unit count minus one, which for any content longer than two units is `> 1` and drives
+///   the caller (edit-diff.ts:333) into the duplicate-occurrences error. Returning 0 here sent
+///   that input to the not-found arm instead.
+///
+/// The one place the ports differ is unobservable: for EMPTY content and an empty separator JS
+/// yields `[]`, so pi returns `-1` where the `saturating_sub` below returns `0`. The only consumer
+/// is `occurrences > 1` (edit-diff.ts:333), false for both, and the duplicate message that
+/// interpolates the count is unreachable unless that test passes.
 fn count_occurrences(content: &str, old_text: &str) -> usize {
     let fuzzy_content = normalize_for_fuzzy(content);
     let fuzzy_old = normalize_for_fuzzy(old_text);
     if fuzzy_old.is_empty() {
-        return 0;
+        return fuzzy_content.encode_utf16().count().saturating_sub(1);
     }
     fuzzy_content.matches(&fuzzy_old).count()
 }

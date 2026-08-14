@@ -55,6 +55,22 @@ impl FsOps for LocalFs {
         tokio::fs::read(path).await.map_err(|e| error::io(&error::show(path), &e))
     }
 
+    /// A real `std::fs::File`, so `grep`'s search pulls the file through `grep_searcher`'s rolling
+    /// buffer instead of allocating it whole — the property Pi gets for free by running the search
+    /// in a separate ripgrep process (grep.ts:226). The `open(2)` itself runs on the blocking pool;
+    /// the reads happen inside the caller's `spawn_blocking`, per [`FsOps::read_stream`].
+    async fn read_stream(
+        &self,
+        path: &Path,
+    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+        let owned = path.to_path_buf();
+        let file = tokio::task::spawn_blocking(move || std::fs::File::open(&owned))
+            .await
+            .map_err(|e| error::invalid(format!("read_stream: {e}")))?
+            .map_err(|e| error::io(&error::show(path), &e))?;
+        Ok(Box::new(file))
+    }
+
     /// 1:1 with Pi's `fsWriteFile(path, content, "utf-8")` (write.ts:33 / edit.ts:85):
     /// `O_WRONLY|O_CREAT|O_TRUNC` with creation mode `0o666` (umask applies), write, close.
     ///
@@ -116,7 +132,12 @@ impl FsOps for LocalFs {
             // writes and touches no parent memory. Returns 0 on success, or -1 with `errno` set.
             let rc = unsafe { libc::access(c_path.as_ptr(), amode) };
             if rc != 0 {
-                return Err(error::io(&error::show(path), &std::io::Error::last_os_error()));
+                // `io_errno`, not `io`: Pi's `edit` reports `Error code: ${error.code}`
+                // (edit.ts:332-333) off the caught Node error object, and `ToolError` is flat, so
+                // the errno NAME has to ride in the message for `edit.rs` to recover it. `read`
+                // propagates this string verbatim (read.ts:241 uncaught) and Node's own raw text
+                // leads with the same code, so the prefix moves `read` toward Pi as well.
+                return Err(error::io_errno(&error::show(path), &std::io::Error::last_os_error()));
             }
             Ok(())
         }
@@ -126,7 +147,7 @@ impl FsOps for LocalFs {
             // readonly bit (the pre-`access(2)` behavior).
             let meta = tokio::fs::metadata(path)
                 .await
-                .map_err(|e| error::io(&error::show(path), &e))?;
+                .map_err(|e| error::io_errno(&error::show(path), &e))?;
             if mode == Access::ReadWrite && meta.permissions().readonly() {
                 return Err(error::invalid(format!("{} is not writable", error::show(path))));
             }
@@ -147,10 +168,13 @@ impl FsOps for LocalFs {
         })
     }
 
+    /// `io_errno` rather than `io` so `ls`'s `Cannot read directory: ${e.message}` wrapper
+    /// (ls.ts:150-152) renders a Node-shaped body leading with the errno code, which is what
+    /// `e.message` is on the upstream side.
     async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ToolError> {
         let mut rd = tokio::fs::read_dir(path)
             .await
-            .map_err(|e| error::io(&error::show(path), &e))?;
+            .map_err(|e| error::io_errno(&error::show(path), &e))?;
         let mut out = Vec::new();
         loop {
             match rd.next_entry().await {
@@ -159,7 +183,7 @@ impl FsOps for LocalFs {
                     out.push(DirEntry { name, path: entry.path() });
                 }
                 Ok(None) => break,
-                Err(e) => return Err(error::io(&error::show(path), &e)),
+                Err(e) => return Err(error::io_errno(&error::show(path), &e)),
             }
         }
         Ok(out)
@@ -809,26 +833,39 @@ mod tests {
 
     /// An ALREADY-cancelled token must never spawn a process at all — Pi's real
     /// `createLocalBashOperations.exec` checks `signal?.aborted` and throws BEFORE calling `spawn()`
-    /// (`bash.ts:86-88`), ahead of even the cwd-exists check. Proven here the same way the sibling
-    /// SIGKILL tests prove immediacy: a marker file the child would create if it ever ran must stay
-    /// absent, and the call must return near-instantly (no real process start/teardown latency).
+    /// (`bash.ts:86-88`), ahead of even the cwd-exists check.
+    ///
+    /// TOOL-030: proven WITHOUT any wall-clock bound. The cwd is deliberately a path that does not
+    /// exist, which makes the short-circuit's position observable rather than merely fast: the
+    /// cancel check at `LocalProc::exec` sits strictly BEFORE the `Working directory does not
+    /// exist` guard, which itself sits before `spawn()`. So
+    ///   * short-circuit present ⇒ `Ok(ExitStatus::Killed)` (this assertion),
+    ///   * short-circuit removed ⇒ `Err("Working directory does not exist: …")`, and
+    ///   * short-circuit moved after `spawn()` ⇒ still `Err`, since the spawn itself fails.
+    /// No ordering other than Pi's can produce `Ok(Killed)` here. The marker check is kept as a
+    /// belt-and-braces witness (it is NOT sufficient on its own — a child that spawned and was
+    /// killed before `touch` completed also leaves it absent).
     #[tokio::test]
     async fn exec_pre_cancelled_never_spawns() {
         let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
         let marker = std::env::temp_dir().join(format!("cyrup-exec-precancel-{}", unique_suffix()));
+        let missing_cwd =
+            std::env::temp_dir().join(format!("cyrup-exec-precancel-cwd-{}", unique_suffix()));
+        assert!(!missing_cwd.exists(), "the sentinel cwd must not exist");
         let cancel = CancelToken::new();
         cancel.cancel();
-        let started = tokio::time::Instant::now();
+        let spec = ExecSpec {
+            cwd: missing_cwd,
+            ..exec_spec(&format!("touch {}", marker.display()))
+        };
         let status = proc
-            .exec(exec_spec(&format!("touch {}", marker.display())), cancel, None, &mut |_data: &[u8]| {})
+            .exec(spec, cancel, None, &mut |_data: &[u8]| {})
             .await
-            .expect("a pre-cancelled exec resolves Ok, not Err");
+            .expect(
+                "a pre-cancelled exec resolves Ok(Killed) — reaching the cwd-exists guard or \
+                 `spawn()` at all would have produced Err",
+            );
         assert_eq!(status, ExitStatus::Killed, "pre-cancelled reports the same reason as mid-run cancel");
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "must short-circuit before spawning, not pay real process start/teardown latency, got {:?}",
-            started.elapsed()
-        );
         assert!(
             !marker.exists(),
             "the shell command must NEVER have run — an already-cancelled token guarantees zero \
@@ -1025,11 +1062,19 @@ mod tests {
                  printf '%s\\n' \"$i\"; i=$((i+1)); done",
                 gt_path.display()
             );
+            // TOOL-030/TOOL-020: the RUN window (250ms) is decoupled from the KILL GRACE (15ms,
+            // configured above). The grace is what this test exercises — SIGTERM is trapped, so
+            // the forced-SIGKILL escalation still fires 15ms after the timeout — while the run
+            // window only has to guarantee the child completed at least one loop iteration before
+            // being killed. At 15ms that guarantee was a scheduling gamble (fork + exec of
+            // `/bin/sh` plus one iteration inside roughly 30ms); at 250ms it holds by construction
+            // on any host that can start a process at all, with the SIGKILL race the test is
+            // actually about completely unchanged.
             let out = proc
                 .exec_argv(
                     argv("sh", &["-c", &script]),
                     CancelToken::new(),
-                    Some(Duration::from_millis(15)),
+                    Some(Duration::from_millis(250)),
                 )
                 .await
                 .expect("exec_argv runs");
@@ -1046,8 +1091,15 @@ mod tests {
             assert!(
                 gt_last >= 0,
                 "trial {trial}: the child must have run at least one loop iteration before being \
-                 killed (ground truth file was empty)"
+                 killed (ground truth file was empty) — with a 250ms run window this is a real \
+                 failure, not the scheduling race the old 15ms window made it"
             );
+            // TOOL-020 claimed this bound "assumes the host `ShellConfig::detect()` shell flushes
+            // stdout once per iteration". That half is REFUTED at HEAD: `exec_argv` runs the
+            // program it is handed, and this call hands it `argv("sh", …)` literally — the
+            // `ShellConfig::detect()` passed to `with_kill_grace` is only consulted by `exec`, not
+            // by `exec_argv`. The dependence is on `/bin/sh`'s builtin `printf`, which flushes per
+            // command, and is identical on every POSIX host.
             assert!(
                 gt_last - stdout_last <= 1,
                 "trial {trial}: captured stdout (last line {stdout_last}) lagged the ground-truth \

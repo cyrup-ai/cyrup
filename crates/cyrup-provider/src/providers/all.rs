@@ -9,7 +9,7 @@
 //!
 //! | Pi line | provider id              | here                                   |
 //! |---------|--------------------------|----------------------------------------|
-//! | 72      | `amazon-bedrock`         | **pending** (bedrock-converse-stream)  |
+//! | 72      | `amazon-bedrock`         | ✓                                      |
 //! | 73      | `ant-ling`               | ✓ fleet                                |
 //! | 74      | `anthropic`              | ✓                                      |
 //! | 75      | `azure-openai-responses` | ✓                                      |
@@ -18,9 +18,9 @@
 //! | 78      | `cloudflare-workers-ai`  | ✓                                      |
 //! | 79      | `deepseek`               | ✓ fleet                                |
 //! | 80      | `fireworks`              | ✓                                      |
-//! | 81      | `github-copilot`         | ported                                 |
+//! | 81      | `github-copilot`         | ✓                                      |
 //! | 82      | `google`                 | ✓                                      |
-//! | 83      | `google-vertex`          | **pending** (vertex auth)              |
+//! | 83      | `google-vertex`          | ✓ registered — **wire api missing**    |
 //! | 84      | `groq`                   | ✓ fleet                                |
 //! | 85      | `huggingface`            | ✓ fleet                                |
 //! | 86      | `kimi-coding`            | ✓ anthropic-compat fleet               |
@@ -31,7 +31,7 @@
 //! | 91      | `moonshotai-cn`          | ✓ fleet                                |
 //! | 92      | `nvidia`                 | ✓ fleet                                |
 //! | 93      | `openai`                 | ✓                                      |
-//! | 94      | `openai-codex`           | **pending** (codex oauth)              |
+//! | 94      | `openai-codex`           | ✓                                      |
 //! | 95      | `opencode`               | ✓                                      |
 //! | 96      | `opencode-go`            | ✓                                      |
 //! | 97      | `openrouter`             | ✓ fleet                                |
@@ -43,8 +43,18 @@
 //! | 105     | `zai`                    | ✓ fleet                                |
 //! | 106     | `zai-coding-cn`          | ✓ fleet                                |
 //!
-//! Pending (NOT registered — no fabrication, they slot in when their auth/wire lands):
-//! `amazon-bedrock`, `github-copilot`, `google-vertex`, `openai-codex`.
+//! Every provider pi's `builtinProviders()` constructs is registered below. The table above was
+//! stale for four rows (`amazon-bedrock`, `github-copilot`, `google-vertex`, `openai-codex` were
+//! marked *pending (NOT registered)* by the very sweep that registered them, PROV-030), which read
+//! as "this file does not do what it does" to anyone who stopped at the header.
+//!
+//! **One caveat is real, and it is not a registration gap.** `google-vertex` is registered with its
+//! full 10-row catalog and working auth precedence, but this crate ships no `google-vertex` wire
+//! impl — [`crate::api::register_builtins`] registers nine api ids and that is not among them. So
+//! all 10 rows resolve, appear in `/model`, and then fail at request time with the registry's
+//! terminal `StreamEvent::Error` (`wire.rs`, R-01-008/017/018). See
+//! [`crate::providers::google_vertex`] for what the transport port needs (upstream
+//! `packages/ai/src/api/google-vertex.ts`).
 //!
 //! Provider ids are unique, so the [`Models`] collection holds them in a `BTreeMap`; the `Vec`
 //! ordering returned by [`all_providers`] is therefore informational only (grouped by constructor

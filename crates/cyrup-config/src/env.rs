@@ -63,7 +63,13 @@ fn truthy(s: &str) -> bool {
 impl EnvVars {
     /// Reads the process environment once.
     pub fn from_process() -> Self {
-        let path = |keys: &[&str]| first_env(keys).map(PathBuf::from);
+        // Pi normalizes every dir env var as it reads it — `getAgentDir()` is
+        // `if (envDir) { return expandTildePath(envDir); }` (config.ts:515-521 @v0.83.0) and
+        // `getPackageDir()` the same for `PI_PACKAGE_DIR` (`:367-372`); the session-dir env tier is
+        // `expandTildePath(envSessionDir)` at main.ts:625-628. `expandTildePath` IS `normalizePath`
+        // (config.ts:498-500). CFG-036.
+        let path =
+            |keys: &[&str]| first_env(keys).map(|raw| crate::paths::normalize_path_buf(&raw));
         Self {
             agent_dir: path(&["CYRUP_AGENT_DIR", "PI_CODING_AGENT_DIR"]),
             session_dir: path(&["CYRUP_SESSION_DIR", "PI_CODING_AGENT_SESSION_DIR"]),
@@ -142,23 +148,34 @@ impl ConfigDirs {
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
             .ok_or_else(|| ConfigError::Dir("could not determine home directory".to_string()))?;
 
+        // Pi normalizes the CLI tier too — `parsed.sessionDir ? normalizePath(parsed.sessionDir)`
+        // (main.ts:625-626 @v0.83.0) — so a quoted `--session-dir ~/sessions`, or one supplied from
+        // a config file or CI variable where no shell expanded it, resolves under `$HOME` instead
+        // of creating a directory literally named `~`. CFG-036.
+        let normalize_cli = |p: &PathBuf| crate::paths::normalize_path_buf(&p.to_string_lossy());
+
         let agent_dir = cli
             .agent_dir
-            .clone()
+            .as_ref()
+            .map(normalize_cli)
             .or_else(|| env.agent_dir.clone())
             .unwrap_or_else(|| home.join(".cyrup").join("agent"));
 
         // Tiers 1 and 2 of Pi's three-tier `sessionDir` chain (main.ts:625-630). The third —
         // `startupSettingsManager.getSessionDir()` — is applied afterwards by the bin via
         // [`ConfigDirs::with_settings_session_dir`]; see that method for why it cannot live here.
-        let session_dir_override = cli.session_dir.clone().or_else(|| env.session_dir.clone());
+        let session_dir_override = cli
+            .session_dir
+            .as_ref()
+            .map(normalize_cli)
+            .or_else(|| env.session_dir.clone());
         let session_dir_explicit = session_dir_override.is_some();
-        let session_dir =
-            session_dir_override.unwrap_or_else(|| agent_dir.join("sessions"));
+        let session_dir = session_dir_override.unwrap_or_else(|| agent_dir.join("sessions"));
 
         let package_dir = cli
             .package_dir
-            .clone()
+            .as_ref()
+            .map(normalize_cli)
             .or_else(|| env.package_dir.clone())
             .unwrap_or_else(|| agent_dir.join("packages"));
 
@@ -287,6 +304,39 @@ mod tests {
         assert_eq!(dirs.agent_dir, dirs.home.join(".cyrup").join("agent"));
         assert_ne!(dirs.home, dirs.agent_dir);
         assert!(dirs.agent_dir.starts_with(&dirs.home));
+    }
+
+    /// CFG-036: Pi normalizes EVERY directory tier, not only the settings one — the CLI flag at
+    /// main.ts:625-626 (`normalizePath(parsed.sessionDir)`) and the env vars at config.ts:515-521 /
+    /// `:367-372` (`expandTildePath(envDir)`). At HEAD before this fix, `path()` was
+    /// `first_env(keys).map(PathBuf::from)` and the CLI overrides were cloned verbatim, so a `~`
+    /// survived into the resolved layout as a literal directory component.
+    #[test]
+    fn tilde_and_file_url_dirs_are_normalized_on_the_env_and_cli_tiers() {
+        let home = super::super::paths::normalize_path("~");
+        let home = PathBuf::from(&home);
+
+        let env = EnvVars {
+            agent_dir: Some(PathBuf::from(super::super::paths::normalize_path("~/alt"))),
+            ..Default::default()
+        };
+        let cli = CliConfigOverrides {
+            cwd: Some(PathBuf::from("/")),
+            ..Default::default()
+        };
+        let dirs = ConfigDirs::resolve(&cli, &env).unwrap();
+        assert_eq!(dirs.agent_dir, home.join("alt"));
+
+        let cli = CliConfigOverrides {
+            cwd: Some(PathBuf::from("/")),
+            session_dir: Some(PathBuf::from("~/sessions")),
+            package_dir: Some(PathBuf::from("file:///abs/packages")),
+            ..Default::default()
+        };
+        let dirs = ConfigDirs::resolve(&cli, &EnvVars::default()).unwrap();
+        assert_eq!(dirs.session_dir, home.join("sessions"));
+        assert!(dirs.session_dir_explicit);
+        assert_eq!(dirs.package_dir, PathBuf::from("/abs/packages"));
     }
 
     /// Tier 3 of Pi's `sessionDir` chain (main.ts:625-630): with neither `--session-dir` nor

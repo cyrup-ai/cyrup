@@ -48,7 +48,9 @@ impl Diagnostic {
     }
 }
 
-/// Valid `--thinking` levels (Pi `VALID_THINKING_LEVELS`, args.ts:59 — `max` added in fbdd4638).
+/// Valid `--thinking` levels (Pi `VALID_THINKING_LEVELS`, args.ts:**57** — `max` added in fbdd4638;
+/// `:59` is `isValidThinkingLevel`, the predicate over this array). SEAM-029: the citation was off
+/// by two.
 const VALID_THINKING_LEVELS: [&str; 7] =
     ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// Valid `--mode` values (Pi args.ts:80).

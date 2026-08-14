@@ -31,14 +31,19 @@ pub async fn run_print_dispatch<W: Write>(
     // (SEAM-033); see [`announce_session_start`].
     let messages = turn_inputs(inputs);
     let mut err = std::io::stderr();
+    // SEAM-016: the code comes from `run_print` itself, which decides it inside pi's terminal
+    // output block from the same `lastMessage` it prints (print-mode.ts:139-148) and RETURNS it
+    // (`return exitCode;`, :151) — exactly as `runPrintMode` does. It used to be recomputed here by
+    // reverse-scanning the transcript, which disagreed with the printed message whenever the final
+    // transcript entry was not an assistant message, and used a 130/1 mapping pi never emits.
     let ran = run_print(runtime, messages, out, &mut err, PrintOptions::default()).await;
-    let code = exit_code(&*runtime.session().await).await;
     // Teardown on EVERY exit path — Pi's `finally { await disposeRuntime() }` (print-mode.ts:152-157),
     // which emits `session_shutdown{reason:"quit"}` before releasing the session (see
-    // [`dispose_session`]). The exit code is read FIRST because dispose aborts the run.
+    // [`dispose_session`]).
     runtime.dispose().await;
-    ran?;
-    Ok(code)
+    // Pi's `catch (error) { console.error(...); return 1; }` (print-mode.ts:153-155) sits INSIDE the
+    // same try, so a mode error is exit 1 — which is what the `?` produces through `main`.
+    Ok(ran?)
 }
 
 /// JSON dispatch: run the initial prompt then each follow-up, streaming every event as JSONL to `out`.
@@ -115,36 +120,34 @@ where
     Ok(())
 }
 
-/// The process exit code for a settled one-shot run, from the last assistant message's stop reason
-/// (arch-11 §6.6): `error` ⇒ 1, `aborted` ⇒ 130, otherwise (`stop`/`length`/`toolUse`/`deferred`)
-/// ⇒ 0.
+/// The process exit code for a settled one-shot run — pi's `print-mode.ts:139-148`, reproduced
+/// exactly: look at the **last** transcript message (not the last ASSISTANT message), and raise the
+/// code to 1 only when it is an assistant message whose `stopReason` is `error` or `aborted`.
+/// Everything else keeps the `exitCode = 0` pi initialises at `:35`.
 ///
-/// `pending` — the in-flight sentinel — exits **1**, not 0. A transcript whose last assistant
-/// message never settled is a stream that was cut off, and reporting success for it is precisely
-/// the silent-truncation failure PROV-010 / AGENT-014 / DRIFT-012 closed on the decoder side. The
-/// match is exhaustive on purpose: the `_ => 0` it replaces would have swallowed `Pending` (and
-/// will not swallow whatever variant comes next either).
+/// SEAM-016. Three divergences lived here and all three are gone:
+/// * the reverse scan (`.iter().rev()`) walked PAST a trailing non-assistant message to an older
+///   assistant one, so a run ending in a `Custom` bash message (which `flush_pending_bash_messages`
+///   appends) could exit non-zero while `run_print` printed nothing, or exit zero on a stale
+///   message;
+/// * `Aborted => 130` — pi folds `aborted` into the same `exitCode = 1` as `error` (`:145-147`);
+/// * `Pending => 1` — pi has no such arm; an unsettled last message falls to the `else` and keeps 0.
 ///
-/// `deferred` exits **0**, and that is Pi's answer, not a guess: Pi's print mode raises `exitCode`
-/// only for `"error"`/`"aborted"` (`v0.84.1 coding-agent/src/modes/print-mode.ts:144-147`) and
-/// everything else falls to the text-printing `else`. It is also the semantically right answer —
-/// Pi puts `deferred` in the `done` (success) extract, not the `error` one
-/// (`v0.84.1 ai/src/types.ts:527-531`): the request WAS accepted, and the caller holds a handle.
+/// This is the shared decision function; [`run_print`](cyrup_modes::run_print) applies it inline in
+/// pi's own block, and this remains for embedders holding a bare [`AgentSession`].
 pub async fn exit_code(session: &AgentSession) -> i32 {
     use cyrup_sdk::core::{Message, StopReason};
-    for message in session.messages().await.iter().rev() {
-        if let Message::Assistant(assistant) = message {
-            return match assistant.stop_reason {
-                StopReason::Error | StopReason::Pending => 1,
-                StopReason::Aborted => 130,
-                StopReason::Stop
-                | StopReason::Length
-                | StopReason::ToolUse
-                | StopReason::Deferred => 0,
-            };
-        }
+    match session.messages().await.last() {
+        Some(Message::Assistant(assistant)) => match assistant.stop_reason {
+            StopReason::Error | StopReason::Aborted => 1,
+            StopReason::Stop
+            | StopReason::Length
+            | StopReason::ToolUse
+            | StopReason::Deferred
+            | StopReason::Pending => 0,
+        },
+        _ => 0,
     }
-    0
 }
 
 /// Wrap one-shot text as a CLI-sourced [`UserInput`].

@@ -1,21 +1,23 @@
-// cyrup:ext@0.3.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.5.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
 // lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
 // values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
 //
-// The `events` interface exports 31 `on-*` event hooks, mirroring Pi's `pi.on(...)` catalog
-// (extensions/types.ts:1198-1239, 33 overloads — `session_info_changed` and
-// `before_provider_headers` have no export here). The host calls only the exports a guest
-// subscribed to (the subscription gate, R-08-034).
+// The `events` interface exports 33 `on-*` event hooks, mirroring pi's `pi.on(...)` catalog
+// one-for-one (`extensions/types.ts:1190-1231` @v0.83.0 — 33 `on(event: "…")` overloads, hand
+// re-derived; the range `:1198-1239` this header used to cite corresponds to NO upstream version
+// and was fabricated, EXT-036). `before_provider_headers` (EXT-009, upstream `:1212`) and
+// `session_info_changed` (EXT-011, upstream `:1203`) closed the last two gaps. The host calls only
+// the exports a guest subscribed to (the subscription gate, R-08-034).
 //
 // VERSIONING (EXT-028): this package version and `cyrup_ext::HOST_WORLD` move TOGETHER, and ANY
 // change to an EXPORT — added, removed, or RE-SIGNED — bumps the MINOR. A guest built against an
 // older MINOR either lacks the export or has it at the old signature, so it must be refused by
 // `ExtensionManifest::check_world` before instantiation rather than trapping inside wasmtime.
 // `crates/cyrup-ext/tests/wit_world_sync.rs` enforces that tie, in BOTH copies.
-package cyrup:ext@0.4.0;
+package cyrup:ext@0.5.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -24,12 +26,23 @@ interface types {
   enum exec-mode { parallel, sequential }
   enum ext-mode  { tui, rpc, json, print }
 
+  // A `[block]` outcome (EXT-049). `reason` is pi's `ToolCallEventResult.reason`; `terminate` is
+  // pi's `ToolCallEventResult.terminate` (`extensions/types.ts:1072-1079` @v0.84.1 — ABSENT at the
+  // ported v0.83.0 baseline): "Hint that the agent should stop after the current tool batch when
+  // this call is blocked. Early termination only happens when every finalized tool result in the
+  // batch sets this to true." Only `on-tool-call` reads it; every other seam ignores it, exactly as
+  // upstream does (no other `*EventResult` declares the field).
+  record block-result {
+    reason: option<string>,
+    terminate: bool,
+  }
+
   // What a single event handler contributes to the block/mutate/notify reduction
   // (arch-08 §3.3). `mutate`/`handled` carry serde_json patch payloads as strings; the host
   // interprets the patch shape per the event kind (Pi extensions/runner.ts emit* reducers).
   variant hook-outcome {
     noop,
-    block(option<string>),
+    block(block-result),
     mutate(string),
     handled(string),
   }
@@ -45,6 +58,16 @@ interface types {
     prompt-snippet: option<string>,
     prompt-guidelines: list<string>,
     has-renderer: bool,
+    // pi `ToolDefinition.prepareArguments?: (args: unknown) => Static<TParams>`
+    // (extensions/types.ts:468 @v0.83.0), run before `validateToolArguments` in
+    // `packages/agent/src/agent-loop.ts`. A function value cannot cross a component boundary, so
+    // the descriptor carries a FLAG and the host calls the `prepare-arguments` export when it is
+    // set (EXT-023). `false` = the identity default.
+    prepare-arguments: bool,
+    // pi `ToolDefinition.renderShell?: "default" | "self"` (extensions/types.ts:465 @v0.83.0):
+    // "Controls whether ToolExecutionComponent renders the standard colored shell or the tool
+    // renders its own framing." `none` = upstream's omitted field = "default" (EXT-024).
+    render-shell: option<string>,
   }
 
   // Result of a capability-scoped exec (arch-08 caps/exec.rs). 1:1 with Pi's `ExecResult`
@@ -86,7 +109,10 @@ interface types {
 // ---------------------------------------------------------------------------
 // host -> guest: the §5 event catalog (exports the guest may implement).
 // The host only calls events the guest subscribed to (subscription gate, R-08-034).
-// All 30 Pi events (extensions/types.ts:1133-1171) are represented here.
+// All 33 pi events (the `on(event: "…")` overload block, extensions/types.ts:1190-1231 @v0.83.0)
+// are represented here. EXT-036: this line used to claim "All 30" against a range that matches no
+// upstream version, contradicting the file's own header 81 lines above — and the count test only
+// ties the header's number, so the disagreement passed straight through an audit that quoted it.
 // ---------------------------------------------------------------------------
 interface events {
   use types.{hook-outcome, tool-output};
@@ -126,6 +152,14 @@ interface events {
   // is delivered by the host epoch/cancel; streaming updates go back via host-tool.emit-update;
   // `ctx` is reconstructed guest-side from the capability imports.
   execute-tool: func(name: string, call-id: string, params-json: string) -> result<tool-output, string>;
+
+  // --- guest tool argument preparation (EXT-023; pi `ToolDefinition.prepareArguments`,
+  // extensions/types.ts:468 @v0.83.0) ---
+  // Called ONLY for a tool whose descriptor sets `prepare-arguments`, and only BEFORE schema
+  // validation — pi runs `prepareArguments` ahead of `validateToolArguments` in
+  // `packages/agent/src/agent-loop.ts`, so the coerced value is what gets validated. `none` (or a
+  // guest fault) leaves the arguments untouched, which is upstream's identity default.
+  prepare-arguments: func(name: string, args-json: string) -> option<string>;
 
   // --- guest slash-command execution (R-08-016) ---
   // The host invokes a guest-registered command at COMMAND tier (session ops legal). `args` is the
@@ -200,11 +234,23 @@ interface events {
   // --- 5.6 provider ---
   // before_provider_request [mutate] (types.ts:1160), after_provider_response [notify] (types.ts:1161).
   on-before-provider-request: func(payload-json: string) -> hook-outcome;
+  // before_provider_headers [mutate] (pi `BeforeProviderHeadersEvent`, extensions/types.ts:686-689
+  // @v0.83.0, subscribed at :1212, reduced by `emitBeforeProviderHeaders` at runner.ts:1045).
+  // `headers-json` is the assembled `ProviderHeaders` bag. The doc at types.ts:681-685 is exact:
+  // "Handlers mutate `headers` in place (e.g. to inject tracing/session headers); the return value
+  // is ignored. A `null` value deletes that header." So the mutate payload is an OBJECT whose
+  // values are `string | null`, and a `null` DELETES that header rather than setting it empty
+  // (EXT-009).
+  on-before-provider-headers: func(headers-json: string) -> hook-outcome;
   on-after-provider-response: func(status: u32, headers-json: string);
 
-  // model_select [notify] (types.ts:1162), thinking_level_select [notify] (types.ts:1163).
-  on-model-select:          func(model-json: string);
-  on-thinking-level-select: func(level: string);
+  // model_select [notify] (types.ts:1226), thinking_level_select [notify] (types.ts:1227).
+  // pi `ModelSelectEvent {type, model, previousModel, source}` (extensions/types.ts:794-799
+  // @v0.83.0) and `ThinkingLevelSelectEvent {type, level, previousLevel}` (:802-806) — three and
+  // three SIBLING fields. cyrup used to nest `previousModel`/`source` INSIDE `model` (so `model`
+  // was not a `Model` shape either) and drop `previousLevel` outright (EXT-042).
+  on-model-select:          func(model-json: string, previous-model-json: option<string>, source: string);
+  on-thinking-level-select: func(level: string, previous-level: option<string>);
 
   // --- notify-only (return ignored); high-frequency ones are subscription-gated ---
   on-agent-start:           func();
@@ -227,18 +273,47 @@ interface events {
   // `assistant-message-event` delta (carried here as `delta-json`). HIGH-FREQ, gated.
   on-message-update:        func(message-json: string, delta-json: string);   // HIGH-FREQ, gated
   on-tool-exec-start:       func(call-id: string, name: string, args-json: string);
-  on-tool-exec-update:      func(call-id: string, chunk-json: string); // HIGH-FREQ, gated
-  on-tool-exec-end:         func(call-id: string, result-json: string, is-error: bool);
+  // tool_execution_update (pi `ToolExecutionUpdateEvent`, extensions/types.ts:770-776 @v0.83.0):
+  // `{type, toolCallId, toolName, args, partialResult}` — FIVE fields; cyrup used to drop `toolName`
+  // AND `args`, forcing every observer to keep its own callId->name map (EXT-014).
+  on-tool-exec-update:      func(call-id: string, name: string, args-json: string, chunk-json: string); // HIGH-FREQ, gated
+  // tool_execution_end (pi `ToolExecutionEndEvent`, extensions/types.ts:779-785 @v0.83.0):
+  // `{type, toolCallId, toolName, result, isError}`.
+  on-tool-exec-end:         func(call-id: string, name: string, result-json: string, is-error: bool);
 
   // --- 5.1/5.2 startup & session lifecycle ---
-  on-session-start:         func(reason: string);
-  on-session-shutdown:      func(reason: string);
-  on-resources-discover:    func() -> hook-outcome;   // provide skill/prompt/theme paths
-  on-project-trust:         func() -> hook-outcome;    // decide {trusted, remember}
+  // session_start (pi `SessionStartEvent`, extensions/types.ts:562-569 @v0.83.0): the `reason`
+  // ("startup"|"reload"|"new"|"resume"|"fork") AND `previousSessionFile?`, documented "Present for
+  // \"new\", \"resume\", and \"fork\"" — the field that tells a fresh session from a resume
+  // (EXT-015).
+  on-session-start:         func(reason: string, previous-session-file: option<string>);
+  // session_shutdown (pi `SessionShutdownEvent`, extensions/types.ts:616-621 @v0.83.0): `reason`
+  // plus `targetSessionFile?`, "Destination session file when shutting down due to session
+  // replacement" (EXT-015).
+  on-session-shutdown:      func(reason: string, target-session-file: option<string>);
+  // session_info_changed (pi `SessionInfoChangedEvent`, extensions/types.ts:571-575 @v0.83.0,
+  // subscribed at :1203): "Current normalized session name. Undefined when the name is cleared" —
+  // hence `option<string>`, where `none` is upstream's `undefined` (EXT-011).
+  on-session-info-changed:  func(name: option<string>);
+  // resources_discover (pi `ResourcesDiscoverEvent`, extensions/types.ts:544-548 @v0.83.0):
+  // `{type, cwd, reason: "startup" | "reload"}` (EXT-016).
+  on-resources-discover:    func(cwd: string, reason: string) -> hook-outcome;   // provide skill/prompt/theme paths
+  // project_trust (pi `ProjectTrustEvent`, extensions/types.ts:519-522 @v0.83.0): `{type, cwd}`.
+  // The whole decision is per-DIRECTORY upstream — the store is keyed by it
+  // (`options.trustStore.set(options.cwd, trusted)`, core/project-trust.ts:63-65) — so a handler
+  // that cannot see the cwd cannot key an allowlist or honour `remember` (EXT-043).
+  on-project-trust:         func(cwd: string) -> hook-outcome;    // decide {trusted, remember}
 
-  // session control hooks (types.ts:1148-1156): before_* are block/mutate, the rest notify.
-  on-session-before-switch:  func(target-id: string) -> hook-outcome;
-  on-session-before-fork:    func(entry-id: string) -> hook-outcome;
+  // session control hooks (pi's overload block, extensions/types.ts:1190-1231 @v0.83.0):
+  // before_* are block/mutate, the rest notify.
+  // session_before_switch (pi `SessionBeforeSwitchEvent`, extensions/types.ts:578-582 @v0.83.0):
+  // `reason: "new" | "resume"` AND `targetSessionFile?`. `reason` is the field that distinguishes
+  // the two cases a handler most needs to tell apart, and cyrup dropped it entirely (EXT-015).
+  on-session-before-switch:  func(reason: string, target-session-file: option<string>) -> hook-outcome;
+  // session_before_fork (pi `SessionBeforeForkEvent`, extensions/types.ts:585-589 @v0.83.0):
+  // `entryId` AND `position: "before" | "at"` — a fork BEFORE an entry and a fork AT it are
+  // different operations (EXT-015).
+  on-session-before-fork:    func(entry-id: string, position: string) -> hook-outcome;
   // session_before_compact (Pi SessionBeforeCompactEvent, types.ts:577-587): the computed
   // `preparation` (CompactionPreparation, compaction.ts:634) + the `branch-entries` in scope + optional
   // `custom-instructions` + the trigger `reason` ("manual"|"threshold"|"overflow") + `will-retry`. A
@@ -321,8 +396,13 @@ interface ui {
   // AbortSignal, types.ts:89-94): a dialog subsequently opened carrying that signal id returns
   // cancelled (`confirm` -> false, `input`/`select` -> none).
   abort-signal: func(signal-id: string);
-  // `opts-json` is the Pi `ExtensionUIDialogOptions` bag (types.ts:89): `{timeoutMs, signal}` —
-  // a live-countdown timeout and/or a programmatic-dismiss signal id (none = `{}`).
+  // `opts-json` is pi's `ExtensionUIDialogOptions` bag (`extensions/types.ts:95-100` @v0.83.0):
+  // `{signal, timeout}` — `timeout?: number`, "Timeout in milliseconds. Dialog auto-dismisses with
+  // live countdown display" (:100), and/or a programmatic-dismiss signal id (none = `{}`).
+  // EXT-048: the citation this comment used to carry (`types.ts:89`, key `timeoutMs`) was wrong on
+  // both counts — `:89` is a blank line before the UI Context banner at v0.83.0 and upstream has no
+  // `timeoutMs` anywhere. `timeout` is now the CANONICAL key; `timeoutMs` is still accepted as a
+  // serde alias for back-compat with bags cyrup's own SDK already wrote.
   // Pi `confirm(title, message, opts)` (rpc-types.ts:232): `prompt` is the short `title`, `message`
   // is the (often large, formatted) body — both genuinely used, e.g. pi-mcp-adapter's sampling
   // handler passes a label as `title` and the full prompt/conversation text as `message`.
@@ -368,11 +448,20 @@ interface session {
   append-entry: func(custom-type: string, data-json: string) -> result<string, string>;
   set-session-name: func(name: string);
   get-session-name: func() -> option<string>;
-  set-label:        func(entry-id: string, label: string);
+  // pi `setLabel(entryId: string, label: string | undefined): void` (extensions/types.ts:1314
+  // @v0.83.0), documented "Set or clear a label on an entry. Labels are user-defined markers for
+  // bookmarking/navigation." `none` CLEARS (EXT-046) — an empty string writes an empty label, which
+  // is not the same thing and left the entry marked forever.
+  set-label:        func(entry-id: string, label: option<string>);
 }
 
 interface models {
   list-models:        func() -> string;          // json array of model refs
+  // pi `ctx.scopedModels: readonly ScopedModel[]` (extensions/types.ts:326 @v0.83.0) — on the BASE
+  // `ExtensionContext`, so available to every handler: "Models scoped to this session (resolved
+  // from `--models` / `enabledModels` settings against the available catalogue). Same set the
+  // `/scoped-models` command shows. Empty when no scoping is configured." json array (EXT-045).
+  scoped-models:      func() -> string;
   current:            func() -> option<string>;
   set-model:          func(model-json: string);  // COMMAND-only at the host
   context-usage:      func() -> string;
@@ -487,6 +576,12 @@ interface bus {
   emit:      func(topic: string, payload-json: string);
   // Declare that this guest listens on `topic` (Pi `pi.events.on(channel, handler)`, event-bus.ts:18).
   subscribe: func(topic: string);
+  // Stop listening on `topic` (EXT-050). pi's `on()` returns an unsubscribe closure and, since
+  // v0.84.1, the loader TRACKS it — `return runtime.trackEventBusSubscription(eventBus.on(channel,
+  // handler));` (extensions/loader.ts:413-421) — so a listener wanted only while a mode is active
+  // can be taken down. Without this a `subscribe` was permanent for the instance's life and the
+  // guest had to filter by hand.
+  unsubscribe: func(topic: string);
 }
 
 // streaming tool output: the `onUpdate` callback of Pi's ToolDefinition.execute (types.ts:467).
@@ -516,6 +611,22 @@ interface oauth {
 // provider pipeline (the streaming analog of `host-tool.emit-update`).
 interface provider-stream {
   emit-event: func(stream-id: string, event-json: string);
+
+  // EXT-052 — the `streamSimple` MUST-INVOKE contract, quoted verbatim from pi's
+  // `ProviderConfig.streamSimple` doc (`extensions/types.ts:1452-1457` @v0.84.1):
+  //
+  //   "Implementations must invoke `options.onPayload` before sending the provider request and use
+  //    any returned replacement payload. They must invoke `options.onResponse` after receiving the
+  //    response and before consuming its body, matching built-in providers."
+  //
+  // These are how `before_provider_request` (extensions/types.ts:676-679) and
+  // `after_provider_response` (:692-696) reach requests an EXTENSION-supplied provider issues. A
+  // guest provider that skips them makes every one of its requests invisible to every other
+  // extension — a redaction or audit extension silently stops working the moment the user switches
+  // model. `on-payload` returns a REPLACEMENT payload (`none` = unchanged), which is the mutating
+  // half; `on-response` is notify-only.
+  on-payload:  func(stream-id: string, payload-json: string) -> option<string>;
+  on-response: func(stream-id: string, status: u16, headers-json: string);
 }
 
 // Active-tool / command introspection (Pi getActiveTools/getAllTools/setActiveTools/getCommands,
@@ -549,6 +660,23 @@ interface ctx-state {
   is-project-trusted:   func() -> bool;
   // Pi `ctx.getSystemPrompt()` (types.ts:346); empty string when no session backend is attached.
   get-system-prompt:    func() -> string;
+  // pi `ctx.cwd: string` (extensions/types.ts:315 @v0.83.0) — on the BASE `ExtensionContext`, in
+  // the same block as `mode` (:311) and `hasUI` (:313), so it is available to every handler and
+  // every tool `execute`, not just command handlers. Without it a guest can resolve no relative
+  // path at all: it cannot tell which project it is in, scope a cache, interpret a path in a tool
+  // argument, or compose one for its `ext-fs`/`exec` grant (EXT-044). cyrup's NATIVE tier already
+  // exposed it (`HostCtx.cwd`), so this was a divergence between cyrup's own two tiers as well.
+  get-cwd:              func() -> string;
+  // The run-scoped analog of `host-tool.is-cancelled` (EXT-045). pi puts `signal: AbortSignal |
+  // undefined` on the base `ExtensionContext` (extensions/types.ts:334 @v0.83.0, "The current abort
+  // signal, or undefined when the agent is not streaming").
+  //
+  // CYRUP-DELTA: a live `AbortSignal` is an object with `addEventListener`, and a component-model
+  // value cannot be a callback target — the guest cannot be WOKEN by an abort, only ask about it.
+  // So the signal is ported as a poll, not as a subscription: a long-running non-tool handler
+  // checks this between units of work. `true` also once the whole run is cancelled, which is when
+  // upstream's `signal.aborted` flips.
+  is-run-cancelled:     func() -> bool;
 }
 
 // COMMAND-ONLY (arch-08 §6.3, deadlock rule): session/runtime mutation. Calling any of

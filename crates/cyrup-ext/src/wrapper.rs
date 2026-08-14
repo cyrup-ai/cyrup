@@ -104,7 +104,7 @@ impl Tool for RegisteredTool {
     fn prompt_snippet(&self) -> Option<&str> {
         self.inner.prompt_snippet()
     }
-    fn prompt_guidelines(&self) -> &[&str] {
+    fn prompt_guidelines(&self) -> Vec<&str> {
         self.inner.prompt_guidelines()
     }
     fn render_kind(&self) -> ToolRenderKind {
@@ -177,9 +177,19 @@ mod tests {
         }
     }
 
+    /// TOOL-024 — every surface method carries a DISTINCT non-default value.
+    ///
+    /// This fixture used to override only `name`, `parameters` and `execute`, so nine of the
+    /// eleven assertions in `every_surface_method_delegates` compared a default against a default:
+    /// deleting `RegisteredTool::prompt_snippet` (or `label`, or `render_kind`, or
+    /// `prepare_arguments`) left the test GREEN, because the trait default the wrapper inherited
+    /// equals the trait default the inner tool inherited. `prompt_guidelines` also owns a
+    /// `Vec<String>` rather than a `&'static [&str]` — the exact shape `WasmTool` has, which is
+    /// what forced TOOL-021's signature widening.
     struct Fixed {
         params: Value,
         result: Result<Vec<String>, ()>,
+        guidelines: Vec<String>,
     }
 
     #[async_trait::async_trait]
@@ -189,6 +199,38 @@ mod tests {
         }
         fn parameters(&self) -> &Value {
             &self.params
+        }
+        fn description(&self) -> &str {
+            "the fixed tool's description"
+        }
+        fn label(&self) -> Option<&str> {
+            Some("Fixed Label")
+        }
+        fn prompt_snippet(&self) -> Option<&str> {
+            Some("fixed prompt snippet")
+        }
+        fn prompt_guidelines(&self) -> Vec<&str> {
+            self.guidelines.iter().map(String::as_str).collect()
+        }
+        fn render_kind(&self) -> ToolRenderKind {
+            ToolRenderKind::SelfRendered
+        }
+        fn execution_mode(&self) -> ExecMode {
+            ExecMode::Sequential
+        }
+        fn render_call(&self, args: &Value) -> Option<String> {
+            Some(format!("call:{args}"))
+        }
+        fn render_result(&self, result: &ToolResult) -> Option<String> {
+            Some(format!("result:{}", result.content.len()))
+        }
+        /// A MUTATING shim: an identity default would be indistinguishable from a dropped
+        /// delegation (which is exactly how EXT-023 stayed invisible on the guest side).
+        async fn prepare_arguments(&self, mut args: Value) -> Value {
+            if let Some(o) = args.as_object_mut() {
+                o.insert("prepared".to_string(), Value::Bool(true));
+            }
+            args
         }
         async fn execute(
             &self,
@@ -212,6 +254,7 @@ mod tests {
         Arc::new(Fixed {
             params: serde_json::json!({}),
             result: Ok(added.into_iter().map(str::to_string).collect()),
+            guidelines: vec!["use fixed sparingly".to_string(), "fixed is not read".to_string()],
         })
     }
 
@@ -269,27 +312,55 @@ mod tests {
     async fn a_failing_tool_propagates_unchanged() {
         let active = ScriptedActive::new(vec![Some(vec!["a"]), Some(vec!["a", "late"])]);
         let inner: Arc<dyn Tool> =
-            Arc::new(Fixed { params: serde_json::json!({}), result: Err(()) });
+            Arc::new(Fixed {
+                params: serde_json::json!({}),
+                result: Err(()),
+                guidelines: Vec::new(),
+            });
         let w = wrap_registered_tool(inner, active);
         assert!(run(&w).await.is_err());
     }
 
+    /// TOOL-024 — `wrapRegisteredTool` returns a tool that is INDISTINGUISHABLE from the wrapped
+    /// one on every non-`execute` surface (pi `wrapper.ts:22-35` wraps only `execute` and spreads
+    /// the rest: `{...tool, execute: instrumented}`).
+    ///
+    /// Every value below is asserted against a LITERAL as well as against the inner tool, because
+    /// `assert_eq!(w.x(), inner.x())` alone is vacuous whenever both sides fall through to the
+    /// same trait default — which was true for nine of these eleven before this fixture grew real
+    /// metadata. A deleted delegation now fails on the literal even if it "agrees" with the inner.
     #[tokio::test]
     async fn every_surface_method_delegates() {
         let active = ScriptedActive::new(vec![]);
         let inner = tool(vec![]);
         let w = wrap_registered_tool(inner.clone(), active);
+
         assert_eq!(w.name(), inner.name());
+        assert_eq!(w.name(), "fixed");
         assert_eq!(w.description(), inner.description());
+        assert_eq!(w.description(), "the fixed tool's description");
         assert_eq!(w.label(), inner.label());
+        assert_eq!(w.label(), Some("Fixed Label"));
         assert_eq!(w.prompt_snippet(), inner.prompt_snippet());
+        assert_eq!(w.prompt_snippet(), Some("fixed prompt snippet"));
+        // TOOL-021: the inner tool's guidelines are OWNED `String`s, so this delegation is only
+        // expressible since `Tool::prompt_guidelines` returns `Vec<&str>`.
         assert_eq!(w.prompt_guidelines(), inner.prompt_guidelines());
+        assert_eq!(w.prompt_guidelines(), vec!["use fixed sparingly", "fixed is not read"]);
         assert_eq!(w.render_kind(), inner.render_kind());
+        assert_eq!(w.render_kind(), ToolRenderKind::SelfRendered);
         assert_eq!(w.execution_mode(), inner.execution_mode());
+        assert_eq!(w.execution_mode(), ExecMode::Sequential);
         assert_eq!(w.parameters(), inner.parameters());
-        assert_eq!(w.render_call(&serde_json::json!({})), None);
-        assert_eq!(w.render_result(&ToolResult::default()), None);
+        assert_eq!(w.render_call(&serde_json::json!({})), inner.render_call(&serde_json::json!({})));
+        assert_eq!(w.render_call(&serde_json::json!({})), Some("call:{}".to_string()));
+        assert_eq!(w.render_result(&ToolResult::default()), Some("result:0".to_string()));
+
+        // A MUTATING `prepare_arguments`: the identity default cannot satisfy this.
         let args = serde_json::json!({"z": 1});
-        assert_eq!(w.prepare_arguments(args.clone()).await, args);
+        assert_eq!(
+            w.prepare_arguments(args.clone()).await,
+            serde_json::json!({"z": 1, "prepared": true})
+        );
     }
 }

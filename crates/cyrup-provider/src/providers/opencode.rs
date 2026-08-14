@@ -27,7 +27,7 @@ pub fn opencode_models() -> Vec<Model> {
 
 /// The OpenCode [`ProviderAuth`]: `OPENCODE_API_KEY` (Pi `envApiKeyAuth`, env-api-keys.ts:97).
 pub fn opencode_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key(["OPENCODE_API_KEY"]))
+    ProviderAuth::with_api_key(env_key("OpenCode API key", ["OPENCODE_API_KEY"]))
 }
 
 /// Construct the OpenCode provider over the given credential store + shared api registry. The

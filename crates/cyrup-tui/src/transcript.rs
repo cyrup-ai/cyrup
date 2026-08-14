@@ -291,6 +291,11 @@ pub struct TranscriptView {
     /// stand-in (`getTextOutput`, render-utils.ts:49-59). Default `true`, matching
     /// `settings.terminal.showImages`.
     show_images: bool,
+    /// Whether the terminal negotiated a real image protocol — Pi's `getCapabilities().images`
+    /// (`components/tool-execution.ts:331`). TUI-N01: seeded from
+    /// `AppState::image_renderer.is_graphical()` at boot and on session swap. Default `true` so a
+    /// bare `TranscriptView::default()` in a test still exercises the inline raster path.
+    graphical_images: bool,
     /// `terminal.imageWidthCells` (Pi `maxWidthCells`, tool-execution.ts:348; default 60): the cell
     /// width an inline tool-result image is clamped to.
     image_width_cells: u16,
@@ -330,6 +335,7 @@ impl TranscriptView {
         TranscriptView {
             output_pad: 1,
             show_images: true,
+            graphical_images: true,
             image_width_cells: DEFAULT_IMAGE_WIDTH_CELLS,
             ..TranscriptView::default()
         }
@@ -359,6 +365,19 @@ impl TranscriptView {
     /// Whether inline tool-result images are on (read by the shell when flushing committed entries).
     pub fn show_images(&self) -> bool {
         self.show_images
+    }
+
+    /// Set whether the terminal has a real image protocol (TUI-N01; Pi's `getCapabilities().images`
+    /// gate at `tool-execution.ts:331`). Off ⇒ a tool result's `image` blocks take the same
+    /// `[Image: …]` text branch `showImages: false` takes, rather than rasterizing anyway.
+    pub fn set_graphical_images(&mut self, graphical: bool) {
+        self.graphical_images = graphical;
+    }
+
+    /// Whether the terminal has a real image protocol (read by the shell when flushing committed
+    /// entries, so a committed block and the live one it scrolled up from agree).
+    pub fn graphical_images(&self) -> bool {
+        self.graphical_images
     }
 
     /// Set `terminal.imageWidthCells` (Pi `maxWidthCells`): the cell width an inline image is
@@ -458,6 +477,18 @@ impl TranscriptView {
             b.set_expanded(next);
             next
         })
+    }
+
+    /// Set the live bash block's expansion ABSOLUTELY — TUI-038. `setToolsExpanded` broadcasts one
+    /// value to every `isExpandable` child of `loadedResourcesContainer` and `chatContainer`
+    /// (`interactive-mode.ts:4040-4046` @v0.84.1), and the bash component is one of them
+    /// (`components/bash-execution.ts:29` `private expanded = false`, `setExpanded` at `:70`). It is
+    /// a fan-out upstream, not a choice between the bash block and the tool blocks. No-op when no
+    /// block is live.
+    pub fn set_bash_expanded(&mut self, expanded: bool) {
+        if let Some(b) = self.bash.as_mut() {
+            b.set_expanded(expanded);
+        }
     }
 
     /// Commit the live bash block to scrollback (called once it has finished). A still-running block
@@ -1156,6 +1187,7 @@ impl TranscriptView {
                 theme,
                 ImageOpts {
                     show: self.show_images,
+                    graphical: self.graphical_images,
                     width_cells: self.image_width_cells,
                     expand_key: self.expand_key(),
                     cwd: self.cwd.as_deref(),
@@ -1272,7 +1304,16 @@ pub(crate) fn tool_lines(
     // `imageFallback` indicator to the text body (render-utils.ts:49-59). The two cases split around
     // `finalize_block` because a half-block raster must NOT get the tool block's background tint
     // patched over its cells — matching Pi, whose images are siblings of the tool box, not children.
-    let inline = images.show && !run.images.is_empty() && run.images.iter().all(|i| i.block.is_some());
+    // TUI-N01 — the gate must consult the terminal's image CAPABILITY, not just `showImages` and
+    // decodability. Upstream is `const caps = getCapabilities(); … if (caps.images && this.showImages
+    // && img.data && img.mimeType)` (`components/tool-execution.ts:331-334` @v0.83.0): no protocol
+    // means no `Image` child at all, and `getTextOutput` supplies the one-line `imageFallback`. On a
+    // plain xterm, the Linux console, CI or a pipe, a `read` of a screenshot used to dump ~20-30 rows
+    // of coloured `▀` into scrollback where pi prints one `[Image: …]` line.
+    let inline = images.graphical
+        && images.show
+        && !run.images.is_empty()
+        && run.images.iter().all(|i| i.block.is_some());
     if !inline {
         push_image_fallbacks(run, theme, &mut block);
     }
@@ -1308,6 +1349,11 @@ pub(crate) fn tool_lines(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ImageOpts<'a> {
     pub show: bool,
+    /// Whether the terminal negotiated a real image protocol — Pi's `getCapabilities().images`
+    /// (`tool-execution.ts:331`). TUI-N01: fed from `AppState::image_renderer.is_graphical()`.
+    /// Defaults to `true` so a test constructing `ImageOpts::default()` still exercises the inline
+    /// path, which is the branch the raster tests are about.
+    pub graphical: bool,
     pub width_cells: u16,
     /// The live `app.tools.expand` label; [`EXPAND_KEY`] when the caller has no keymap in hand.
     pub expand_key: &'a str,
@@ -1327,6 +1373,7 @@ impl Default for ImageOpts<'_> {
     fn default() -> Self {
         ImageOpts {
             show: true,
+            graphical: true,
             width_cells: DEFAULT_IMAGE_WIDTH_CELLS,
             expand_key: EXPAND_KEY,
             cwd: None,

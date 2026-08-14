@@ -20,10 +20,14 @@ mod error;
 mod json;
 mod json_event;
 mod print;
+pub mod raw_stdout;
 mod rpc;
+#[cfg(test)]
+mod tests;
 
 pub use error::ModesError;
 pub use json::run_json;
 pub use json_event::{to_json_event, JsonAgentSessionEvent};
 pub use print::{run_print, PrintOptions};
+pub use raw_stdout::{flush_raw_stdout, write_raw_stdout, RAW_STDOUT_RETRY_DELAY_MS};
 pub use rpc::{run_rpc, QueueModeArg, RpcOut, RpcResponse, SessionCommand};

@@ -94,3 +94,6 @@ impl Default for ResourceHandle {
         Self::new(ResourceRegistry::default())
     }
 }
+
+#[cfg(test)]
+mod tests;

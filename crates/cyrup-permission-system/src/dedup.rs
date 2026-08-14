@@ -9,11 +9,15 @@
 //! `rememberPermissionPromptDecision`s it into the cache BEFORE awaiting it (`index.ts:1817-1892`,
 //! esp. the register-then-await ordering at `:1888-1895`), so a concurrent duplicate hits the cache
 //! and awaits the SAME still-pending promise instead of opening a second dialog
-//! (`getCachedPermissionPromptDecision`, `index.ts:758-774`, called from `:1799-1815`). [`DedupCache`]
-//! carries this via [`DedupCache::begin_pending`]/[`Lookup::Pending`]/[`Pending::wait`] — the caller
-//! (the gate's `ask` path, `extension.rs`) must register the in-flight decision with
-//! `begin_pending` BEFORE awaiting the human, mirroring pi's ordering exactly; [`Self::get`]/
-//! [`Self::remember`] remain for a caller that only ever stores an already-resolved decision.
+//! (`getCachedPermissionPromptDecision`, v0.8.0 `index.ts:465-481`, called from `:1580-1596`).
+//! [`DedupCache`] carries this via
+//! [`DedupCache::begin_pending`]/[`Lookup::Pending`]/[`Pending::wait`], and `extension.rs`'s
+//! `prompt_decision` USES it (PERM-014): it calls [`DedupCache::lookup`], awaits a
+//! [`Lookup::Pending`] rather than prompting again, registers with [`DedupCache::begin_pending`]
+//! BEFORE awaiting the human, and settles through [`PendingOwner::resolve`] or
+//! [`PendingOwner::forget`] — pi's ordering exactly. [`DedupCache::get`] / [`DedupCache::remember`]
+//! remain for a caller that only ever stores an already-resolved decision; neither is on the live
+//! gate path any more.
 //!
 //! Wired into `extension.rs`'s `prompt_decision` — the port of pi's `promptPermission`, and the
 //! single place EVERY ask surface funnels through. pi puts the cache inside `promptPermission` itself
@@ -89,7 +93,18 @@ impl DedupDetails {
 enum Slot {
     Ready(PermissionPromptDecision),
     Pending {
-        tx: watch::Sender<Option<PermissionPromptDecision>>,
+        /// A RECEIVER — never a clone of the sender. **[CYRUP-DELTA]** pi's `decisionPromise` is a
+        /// JS promise, which ALWAYS settles: an `async` function cannot be cancelled part-way, so
+        /// `rememberPermissionPromptDecision`'s stored promise is guaranteed to resolve or reject
+        /// and every `await` of it is guaranteed to wake (`index.ts:1632-1642`). A Rust future CAN
+        /// be dropped at any `.await` — a cancelled tool call drops `prompt_decision` while it is
+        /// parked in the dialog, so [`PendingOwner`] is dropped WITHOUT
+        /// [`PendingOwner::resolve`]/[`PendingOwner::forget`] ever running. Holding a sender clone
+        /// here kept the `watch` channel open across that drop, so every follower parked in
+        /// [`Pending::wait`] waited on a decision that could never arrive — an unbounded hang on a
+        /// cancellation path. With ONLY the owner holding a sender, dropping the owner closes the
+        /// channel, which is the exact Rust spelling of pi's "the promise always settles".
+        rx: watch::Receiver<Option<PermissionPromptDecision>>,
         /// Identity token so [`PendingOwner::resolve`]/[`PendingOwner::forget`] only ever touch the
         /// SAME registration they created — a later `remember`/`begin_pending` for the same key may
         /// have already replaced this entry (pi `forgetPermissionPromptDecision`'s
@@ -123,9 +138,10 @@ pub struct Pending {
 impl Pending {
     /// Await the owner's eventual decision, collapsed exactly like a resolved cache hit (pi
     /// `createDuplicatePermissionPromptDecision(await cachedDecision)`, `index.ts:1804`). If the
-    /// owner's prompt never resolved (its [`PendingOwner`] was dropped via
-    /// [`PendingOwner::forget`] without ever calling [`PendingOwner::resolve`]), fail CLOSED — there
-    /// is no decision to reuse, so this never silently grants access.
+    /// owner's prompt never resolved — [`PendingOwner::forget`] (pi's catch, `index.ts:1638-1642`)
+    /// or the owner simply DROPPED because its future was cancelled mid-dialog — fail CLOSED: there
+    /// is no decision to reuse, so this never silently grants access, and it never parks forever
+    /// (both spellings close the `watch` channel, see [`Slot::Pending::rx`]).
     pub async fn wait(mut self) -> PermissionPromptDecision {
         loop {
             if let Some(decision) = self.rx.borrow().as_ref() {
@@ -147,6 +163,10 @@ impl Pending {
 /// real prompt (mirroring pi's `rememberPermissionPromptDecision` call ahead of `await
 /// decisionPromise`, `index.ts:1890-1895`), then settles it with [`Self::resolve`] (success) or
 /// [`Self::forget`] (the prompt errored, pi's `catch` branch, `index.ts:1896-1901`).
+///
+/// Dropping one WITHOUT settling it (its future was cancelled at an `.await`, which is the one
+/// thing pi's promise cannot do) is safe: it holds the sole `watch::Sender`, so the drop closes the
+/// channel — waiters fail closed and [`DedupCache::lookup`] reports the orphaned entry as a miss.
 pub struct PendingOwner {
     key: String,
     tx: watch::Sender<Option<PermissionPromptDecision>>,
@@ -211,12 +231,26 @@ impl DedupCache {
             self.entries.remove(pos);
             return None;
         }
+        // An in-flight entry whose owner was DROPPED without settling (the future was cancelled —
+        // see [`Slot::Pending::rx`]) has a closed channel. Treat it exactly like pi's catch branch
+        // (`forgetPermissionPromptDecision`, `index.ts:1638-1642`): drop the entry and report a
+        // MISS, so this caller opens its own fresh prompt instead of joining a decision that will
+        // never arrive. (Followers ALREADY parked in [`Pending::wait`] fail CLOSED, which is pi's
+        // rejection propagating to every awaiter.)
+        let orphaned = self
+            .entries
+            .get(pos)
+            .is_some_and(|e| matches!(&e.slot, Slot::Pending { rx, .. } if rx.has_changed().is_err()));
+        if orphaned {
+            self.entries.remove(pos);
+            return None;
+        }
         match self.entries.get(pos) {
             Some(Entry { slot: Slot::Ready(decision), .. }) => {
                 Some(Lookup::Ready(create_duplicate_decision(decision)))
             }
-            Some(Entry { slot: Slot::Pending { tx, .. }, .. }) => {
-                Some(Lookup::Pending(Pending { rx: tx.subscribe() }))
+            Some(Entry { slot: Slot::Pending { rx, .. }, .. }) => {
+                Some(Lookup::Pending(Pending { rx: rx.clone() }))
             }
             None => None,
         }
@@ -253,12 +287,14 @@ impl DedupCache {
     /// [`PendingOwner::resolve`] or [`PendingOwner::forget`].
     pub fn begin_pending(&mut self, key: &str) -> PendingOwner {
         self.entries.retain(|e| e.key != key);
-        let (tx, _rx) = watch::channel(None);
+        // The returned [`PendingOwner`] holds the ONLY sender: see [`Slot::Pending::rx`] for why
+        // the entry must keep a receiver instead of a sender clone.
+        let (tx, rx) = watch::channel(None);
         let token = Arc::new(());
         self.entries.push(Entry {
             key: key.to_string(),
             cached_at: Instant::now(),
-            slot: Slot::Pending { tx: tx.clone(), token: Arc::clone(&token) },
+            slot: Slot::Pending { rx, token: Arc::clone(&token) },
         });
         self.prune();
         PendingOwner { key: key.to_string(), tx, token }
@@ -398,5 +434,41 @@ mod tests {
 
         // A fresh request now starts a NEW prompt rather than reusing the failed one.
         assert!(cache.lookup(&key).is_none());
+    }
+
+    /// **[CYRUP-DELTA] regression proof — this test HANGS FOREVER against the pre-fix code.**
+    ///
+    /// pi's `decisionPromise` always settles: a JS `async` function cannot be cancelled part-way,
+    /// so every `await cachedDecision` (`index.ts:1585`) is guaranteed to wake. A Rust future can
+    /// be DROPPED at any `.await` — cancelling a tool call drops `prompt_decision` while it is
+    /// parked in the dialog, so the [`PendingOwner`] is dropped without `resolve` or `forget` ever
+    /// running. The pre-fix cache entry held a CLONE of the `watch::Sender`, which kept the channel
+    /// open across that drop: `changed()` never fired and never errored, so every follower parked
+    /// in [`Pending::wait`] hung forever, and every later identical request joined the same dead
+    /// entry. The entry now holds a RECEIVER, so the drop closes the channel.
+    ///
+    /// Deterministic: the wake is caused by the drop itself, not by any timeout.
+    #[tokio::test]
+    async fn dropping_owner_without_settling_unblocks_waiters_and_yields_a_fresh_prompt() {
+        let mut cache = DedupCache::new();
+        let d = DedupDetails { request_id: "call-cancelled".into(), command: Some("z".into()), ..Default::default() };
+        let key = d.cache_key().unwrap();
+
+        let owner = cache.begin_pending(&key);
+        let follower = match cache.lookup(&key) {
+            Some(Lookup::Pending(p)) => p,
+            _ => panic!("expected an in-flight (Pending) hit"),
+        };
+
+        let waiter = tokio::spawn(follower.wait());
+        // The owner's future is cancelled: no `resolve`, no `forget`, just a drop.
+        drop(owner);
+        let decision = waiter.await.unwrap();
+        assert!(!decision.approved, "a cancelled prompt must never grant access");
+        assert_eq!(decision.state, PermissionDecisionState::Reject);
+
+        // And the orphaned registration must not latch the key: the next identical request has to
+        // raise its OWN prompt (pi's forgotten-entry behavior), not join the dead one.
+        assert!(cache.lookup(&key).is_none(), "an orphaned in-flight entry must read as a miss");
     }
 }

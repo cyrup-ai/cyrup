@@ -90,12 +90,27 @@ pub(crate) async fn run_bash(
     mut on_chunk: BashChunkSink,
 ) -> Result<BashResult, cyrup_core::ToolError> {
     // Pi's immediate-bash seam (`executeBashWithOperations`, bash-executor.ts) does NOT resolve a
-    // spawn context and never touches the session env — only the `bash` TOOL does
-    // (`resolveSpawnContext`, bash.ts:158-184). So no scrub, no injection here.
+    // spawn context and never touches the SESSION env — only the `bash` TOOL does
+    // (`resolveSpawnContext`, bash.ts:158-184). So no scrub, no session-key injection here.
+    let mut env = shell_env(bin_dir);
+    // TOOL-031 / PARITY-GAPS PB-5, the immediate-bash half. The agent-identity markers are NOT
+    // session keys: pi sets them on `process.env` in `cli.ts` before `main()` runs
+    // (`PI_CODING_AGENT = "true"` at `cli.ts:13` @v0.83.0; `AI_AGENT = "pi"` at `:14` @v0.84.1,
+    // mirrored in `rpc-entry.ts:7-8`), so EVERY child inherits them through `getShellEnv()`'s
+    // `{...process.env}` (`utils/shell.ts:130-133`) — including this seam, which reaches
+    // `getShellEnv()` by the same fall-through as the tool.
+    //
+    // cyrup's bin declines the process-GLOBAL mutation (`std::env::set_var` is `unsafe` under
+    // edition 2024; see `crates/cyrup/src/main.rs`), so each spawn site pushes them per-child. The
+    // `bash` tool already did (`cyrup-tools/src/tools/bash.rs`); this seam did not, so `!!cmd` and
+    // the RPC `executeBash` saw a DIFFERENT environment from the identical command run as a tool.
+    env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));
+    // [CYRUP-DELTA, value only] `AI_AGENT` names WHICH agent is running (`"pi"` upstream).
+    env.push(("AI_AGENT".to_string(), "cyrup".to_string()));
     let spec = ExecSpec {
         command,
         cwd,
-        env: shell_env(bin_dir),
+        env,
         env_remove: Vec::new(),
         shell: shell.clone(),
     };

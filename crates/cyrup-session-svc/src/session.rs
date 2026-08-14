@@ -20,7 +20,7 @@ use cyrup_ext::{
 };
 use cyrup_provider::{is_context_overflow, is_retryable_assistant_error, Model, RetryPolicy};
 use cyrup_session::compaction::{
-    context_tokens_from_usage, estimate_context_tokens, BranchSummaryOutput, BranchSummarySettings,
+    context_tokens_from_usage, BranchSummaryOutput, BranchSummarySettings,
     CompactionOverride, CompactionPreparation, CompactionReason, CompactionSettings, Compactor,
     NoHooks,
 };
@@ -85,6 +85,17 @@ pub enum ForkPosition {
     #[default]
     Before,
     At,
+}
+
+impl ForkPosition {
+    /// pi's own literal — `position: "before" | "at"` (`core/extensions/types.ts:585-589`
+    /// @v0.83.0), carried on `session_before_fork`. SEAM-012.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ForkPosition::Before => "before",
+            ForkPosition::At => "at",
+        }
+    }
 }
 
 /// The outcome of an entry-anchored fork (Pi returns `{cancelled, selectedText}`,
@@ -596,6 +607,18 @@ impl AgentSession {
         arc.services
             .host_services
             .attach_session_activity(Arc::new(SessionActivityHandle(Arc::downgrade(&arc))));
+        // AGENT-029: install pi's per-request `transformHeaders` (sdk.ts:312-328 @v0.83.0,
+        // byte- and offset-identical at v0.84.1). pi merges provider-attribution + session-affinity
+        // headers inside a callback closed over the `model` argument of THAT `streamSimple` call —
+        // i.e. the model the loop chose for that turn (`agent-loop.ts:308`, whose `config.model` is
+        // the possibly-overridden `nextTurnSnapshot.model ?? config.model` from `:237`). cyrup
+        // latched them into `StateInner::headers`, written only by the two SESSION-level model-change
+        // paths, so a per-turn `TurnUpdate::model` override retargeted the request while the previous
+        // provider's attribution rode along. Weak, so the resolver never keeps the session alive.
+        let hw = Arc::downgrade(&arc);
+        arc.agent.set_header_fn(Some(Arc::new(move |m: &ModelRef| {
+            hw.upgrade().and_then(|s| s.headers_for_model_ref(m))
+        })));
         arc
     }
 
@@ -605,6 +628,26 @@ impl AgentSession {
     /// awaiting so the SYNC `ctx.isIdle()` host import can answer.
     pub fn is_idle(&self) -> bool {
         !*self.driver_tx.borrow() && !self.agent.is_running()
+    }
+
+    /// Whether the session is processing an agent run **or a post-run continuation** — pi's
+    /// `_isAgentRunActive` (`packages/coding-agent/src/core/agent-session.ts:313` @v0.83.0), set at
+    /// the top of `_runAgentPrompt` at `:1062` and cleared only in `_emitAgentSettled` at `:582`, so
+    /// it spans `_handlePostAgentRun()` and every `agent.continue()`.
+    ///
+    /// AGENT-030: this — not the agent's per-run streaming flag — is what pi's `get isStreaming()`
+    /// returns (`:876-877`) and what `prompt()` consults at `:1159` to route a submission to
+    /// `_queueSteer` / `_queueFollowUp` instead of starting a run. cyrup's
+    /// [`Self::is_streaming`] reads `agent.snapshot().is_streaming`, which `SettlementGuard::drop`
+    /// clears the moment each INDIVIDUAL run settles, so a prompt landing in the post-run gap (an
+    /// auto-retry, an auto-compaction, a queued continuation) started a SECOND run that raced
+    /// `drive_run`'s `continue_run()`.
+    ///
+    /// The two latches are the exact complement of [`Self::is_idle`]: `driver_tx` covers the whole
+    /// post-run loop on a BOUND session, and `agent.is_running()` covers an unbound session, where
+    /// `spawn_run` drives `agent.prompt` directly and no driver loop exists.
+    pub fn is_run_active(&self) -> bool {
+        !self.is_idle()
     }
 
     /// Lock a `std::sync::Mutex` ignoring poisoning (no panic; arch-00 no-panic).
@@ -629,7 +672,10 @@ impl AgentSession {
         &self,
         input: impl Into<UserInput>,
     ) -> Result<EventStream<AgentSessionEvent>, SessionServiceError> {
-        if self.is_streaming().await {
+        // AGENT-030: the session-level run latch, not the agent's per-run streaming flag — pi's
+        // `prompt()` consults `this.isStreaming`, which IS `_isAgentRunActive`
+        // (agent-session.ts:876-877 / :1159 @v0.83.0). See [`Self::is_run_active`].
+        if self.is_run_active() {
             return Err(SessionServiceError::StreamingNeedsBehavior);
         }
         // Register the run-scoped subscription BEFORE starting the run so no event is missed.
@@ -856,7 +902,11 @@ impl AgentSession {
         mut ui: UserInput,
         options: PromptOptions,
     ) -> Result<Prepared, SessionServiceError> {
-        let streaming = self.is_streaming().await;
+        // AGENT-030: pi's whole preflight reads `this.isStreaming` == `_isAgentRunActive`
+        // (agent-session.ts:1022 for the `input` event's `streamingBehavior`, `:1159` for the
+        // queue routing) — the latch that spans `_handlePostAgentRun` and every `agent.continue()`,
+        // not a per-run flag. See [`Self::is_run_active`].
+        let streaming = self.is_run_active();
         // 0. Slash extension-command exec FIRST (Pi `_tryExecuteExtensionCommand`,
         //    agent-session.ts:1004-1013): for `expandPromptTemplates && text.startsWith("/")`, if a
         //    registered command name matches, run its handler and short-circuit (no prompt sent).
@@ -1038,7 +1088,14 @@ impl AgentSession {
     async fn try_execute_wasm_command(&self, name: &str, args: &str, cancel: &CancelToken) -> bool {
         // Only a REGISTERED command routes here; an unknown `/name` falls through (Pi `getCommand`
         // returns `undefined` ⇒ `false`, agent-session.ts:1184).
-        if !matches!(self.services.ext_host.registry().command_owner(name), Ok(Some(_))) {
+        // SEAM-048 — resolve through the DISAMBIGUATED name, so the `name:2` spelling
+        // `slash_command_catalog` advertises is a spelling the dispatcher accepts. pi's `getCommand`
+        // matches on `invocationName` (`core/extensions/runner.ts:648`); the bare last-wins
+        // `command_owner` did not, so an advertised `check:2` was unreachable.
+        if !matches!(
+            self.services.ext_host.registry().resolved_command_owner(name),
+            Ok(Some(_))
+        ) {
             return false;
         }
         // Run the guest handler. Pi discards the handler's return value (the command manages its own
@@ -1587,7 +1644,10 @@ impl AgentSession {
                     summary: entry.summary.clone(),
                     first_kept_entry_id: entry.first_kept_entry_id.to_string(),
                     tokens_before: entry.tokens_before,
-                    estimated_tokens_after,
+                    estimated_tokens_after: Some(estimated_tokens_after),
+                    // SEAM-034: pi's `usage?` (compaction.ts:93) — the token spend of the
+                    // summarization call(s), already recorded on the compaction entry.
+                    usage: entry.usage.clone(),
                     details: entry.details.clone(),
                 };
                 // session_compact ext notify (agent-session.ts:1740-1747): the full Pi payload —
@@ -1706,9 +1766,27 @@ impl AgentSession {
         }
     }
 
-    /// Cancel an in-flight manual/auto compaction (Pi `abortCompaction`, agent-session.ts:1788).
+    /// Cancel an in-flight manual **or auto** compaction — Pi `abortCompaction`
+    /// (`agent-session.ts:1930-1933` @v0.83.0), whose whole body is two aborts:
+    ///
+    /// ```ts
+    /// abortCompaction(): void {
+    ///     this._compactionAbortController?.abort();
+    ///     this._autoCompactionAbortController?.abort();
+    /// }
+    /// ```
+    ///
+    /// SESS-041: the second line was missing. `run_auto_compaction` installs its own child token in
+    /// `auto_compaction_cancel` (`:4535`) and NEVER writes `compaction_cancel`, so an auto
+    /// compaction — the 10-18 s one a user actually wants to escape, since they did not ask for it
+    /// — was unreachable from here: `abort_compaction` cancelled a `None` and returned, and the run
+    /// went to completion. `is_compacting` already reads both (`:4393`), which is what made the
+    /// asymmetry invisible.
     pub fn abort_compaction(&self) {
         if let Some(c) = Self::lock(&self.compaction_cancel).as_ref() {
+            c.cancel();
+        }
+        if let Some(c) = Self::lock(&self.auto_compaction_cancel).as_ref() {
             c.cancel();
         }
     }
@@ -2274,7 +2352,17 @@ impl AgentSession {
         // Emit `session_info_changed { name }` to every live subscription (Pi `_emit(event)`,
         // agent-session.ts:2714-2715); the `name` is re-read from the manager so it byte-matches Pi's
         // `getSessionName()` (an empty/whitespace name resolves to `None`).
-        self.fanout_emit(AgentSessionEvent::SessionInfoChanged { name: resolved }).await;
+        self.fanout_emit(AgentSessionEvent::SessionInfoChanged { name: resolved.clone() }).await;
+        // EXT-011 — the SAME rename is an EXTENSION event upstream (`SessionInfoChangedEvent`,
+        // `extensions/types.ts:571-575` @v0.83.0). The kind, the WIT export and the SDK hook all
+        // existed; nothing EMITTED it, so a guest could subscribe to `session_info_changed` and
+        // never be called. Notify-only, so it cannot block the rename.
+        let notify_cancel = self.session_cancel.child_token();
+        self.services
+            .ext_host
+            .dispatcher()
+            .dispatch_notify(&HostEvent::SessionInfoChanged { name: resolved }, &notify_cancel)
+            .await;
         Ok(())
     }
 
@@ -2338,18 +2426,31 @@ impl AgentSession {
     /// ([`cyrup_resources::ResourceOrigin::source_info_json`]).
     pub fn slash_command_catalog(&self) -> Vec<serde_json::Value> {
         let mut out: Vec<serde_json::Value> = Vec::new();
-        // Registered extension commands. Extension-contributed commands have no on-disk resource
-        // provenance; Pi passes through the extension-supplied `command.sourceInfo`. cyrup synthesizes
-        // a `temporary`/`top-level` SourceInfo anchored at the extension id (createSyntheticSourceInfo,
-        // source-info.ts:24-40).
-        if let Ok(cmds) = self.services.ext_host.registry().command_descriptions() {
-            for (name, desc) in cmds {
+        // Registered extension commands.
+        //
+        // SEAM-048 — sourced from `resolved_commands()`, NOT `command_descriptions()`. pi builds
+        // each `RpcSlashCommand` from `command.invocationName` (`rpc-mode.ts:680-687`), which comes
+        // from `getRegisteredCommands()` → `resolveRegisteredCommands()`
+        // (`core/extensions/runner.ts:598-641`): duplicates get `${name}:${occurrence}` and the
+        // list is in EXTENSION LOAD ORDER (`for (const ext of this.extensions) for (const command of
+        // ext.commands.values())`, `:602-607`). `command_descriptions()` enumerated the last-wins
+        // `HashMap`, so a duplicate command name made the second extension's command invisible AND
+        // the list order shuffled between runs.
+        //
+        // SEAM-055 — `sourceInfo.path` is the OWNING EXTENSION's id, not `""`. pi's `SourceInfo.path`
+        // is a non-optional `string` (`core/source-info.ts:6-12`) that `createSyntheticSourceInfo`
+        // (`:24-40`) takes as its first positional argument precisely so a synthetic entry still
+        // names something; an empty path collapses every extension command into one bucket for a
+        // client grouping or filtering by source. `ResolvedCommand` carries the owner, which is why
+        // the two fixes are one change.
+        if let Ok(cmds) = self.services.ext_host.registry().resolved_commands() {
+            for cmd in cmds {
                 out.push(serde_json::json!({
-                    "name": name,
-                    "description": desc.description,
+                    "name": cmd.invocation_name,
+                    "description": cmd.descriptor.description,
                     "source": "extension",
                     "sourceInfo": {
-                        "path": "",
+                        "path": cmd.owner.as_str(),
                         "source": "extension",
                         "scope": "temporary",
                         "origin": "top-level",
@@ -2388,9 +2489,16 @@ impl AgentSession {
             .collect()
     }
 
-    /// The session tree as `{entry, children, label?}` nodes (Pi `get_tree`, rpc-mode.ts:622). The
-    /// optional Pi `labelTimestamp` is omitted (the defensive [`cyrup_session::manager::TreeNode`]
-    /// carries only the resolved label; Pi marks `labelTimestamp?` optional).
+    /// The session tree as `{entry, children, label?, labelTimestamp?}` nodes (Pi `get_tree`,
+    /// rpc-mode.ts:622 → `SessionTreeNode`, `core/session-manager.ts:159-166`).
+    ///
+    /// SEAM-060 — `labelTimestamp` used to be dropped from every node, with an in-tree comment
+    /// declaring the omission deliberate. It is not vestigial upstream: `labelTimestampsById` is
+    /// maintained at `session-manager.ts:865`, `:970` and `:1247-1250` and read into the node at
+    /// `:1318`, and the wire contract names the type directly (`modes/rpc/rpc-types.ts:202-208`).
+    /// Without it a client cannot sort or age branch labels, cannot render "renamed 2 days ago",
+    /// and cannot spot a label that predates the entries beneath it. Emitted with the same
+    /// omit-when-`None` insert as `label`, so an unlabelled node still carries neither key.
     pub async fn tree_json(&self) -> Vec<serde_json::Value> {
         fn node_to_json(node: &cyrup_session::manager::TreeNode) -> serde_json::Value {
             let mut obj = serde_json::Map::new();
@@ -2403,6 +2511,12 @@ impl AgentSession {
             );
             if let Some(label) = &node.label {
                 obj.insert("label".to_string(), serde_json::Value::String(label.clone()));
+            }
+            if let Some(ts) = &node.label_timestamp {
+                obj.insert(
+                    "labelTimestamp".to_string(),
+                    serde_json::Value::String(ts.clone()),
+                );
             }
             serde_json::Value::Object(obj)
         }
@@ -2442,7 +2556,7 @@ impl AgentSession {
     /// let `session_shutdown` be announced — and `session_cancel` fired — while the aborted turn
     /// was still writing its tool results.
     pub async fn dispose(&self, reason: &str) {
-        self.dispose_with(reason, None).await;
+        self.dispose_with(reason, None, None).await;
     }
 
     /// [`Self::dispose`] with the host's `before_session_invalidate` hook (Pi
@@ -2466,10 +2580,20 @@ impl AgentSession {
     /// [`Self::dispose`] passes `None`; the only producer of a `Some` is
     /// [`crate::runtime::AgentSessionRuntime`], which reads whatever the host registered via
     /// `set_before_session_invalidate`.
+    /// `target_session_file` is pi's `teardownCurrent(reason, targetSessionFile?)` second argument
+    /// (`agent-session-runtime.ts:165`), spread onto the event at `:171-174`: *"Destination session
+    /// file when shutting down due to session replacement"*
+    /// (`core/extensions/types.ts:616-621`). Every replacement path supplies it —
+    /// `teardownCurrent("new", sessionManager.getSessionFile())` and its `resume`/`fork` siblings
+    /// (`:239`, `:210`, `:300`/`:322`/`:341`) — and a plain quit passes `undefined`. Without it an
+    /// extension observing a replacement could not tell WHICH session it was going to, so
+    /// transcript-linking, audit trails and intercom identity handoff across a switch or fork were
+    /// impossible. SEAM-025.
     pub async fn dispose_with(
         &self,
         reason: &str,
         before_invalidate: Option<crate::runtime::BeforeSessionInvalidate>,
+        target_session_file: Option<String>,
     ) {
         self.abort_and_settle().await;
         self.fanout_emit(AgentSessionEvent::SessionShutdown { reason: reason.to_string() }).await;
@@ -2478,7 +2602,13 @@ impl AgentSession {
         self.services
             .ext_host
             .dispatcher()
-            .dispatch_notify(&HostEvent::SessionShutdown { reason: reason.to_string() }, &cancel)
+            .dispatch_notify(
+                &HostEvent::SessionShutdown {
+                    reason: reason.to_string(),
+                    target_session_file,
+                },
+                &cancel,
+            )
             .await;
         // Pi `this.beforeSessionInvalidate?.()` (agent-session-runtime.ts:176 and :403): the last
         // point at which this session — and the extension context bound to it — is still live.
@@ -2578,6 +2708,25 @@ impl AgentSession {
     /// announces first wins and a later bind is a no-op (pi likewise emits `_sessionStartEvent`
     /// exactly once per `AgentSession`).
     pub async fn bind_extensions(&self) {
+        self.bind_extensions_with(BindOptions::default()).await;
+    }
+
+    /// [`Self::bind_extensions`] with pi's `bindExtensions({ … })` options — SEAM-006.
+    ///
+    /// pi's hosts pass THREE keys (`print-mode.ts:73-101` @v0.83.0, `:74-119` @v0.84.1):
+    /// * `mode: mode === "json" ? "json" : "print"` (`:74`) — already live in cyrup, installed at
+    ///   build time from `cfg.app_mode` (`builder.rs`'s `ext_mode` → `HostConfig { mode, has_ui }`),
+    ///   because cyrup's builder knows the resolved mode where pi's `bindExtensions` is the first
+    ///   place that does;
+    /// * `commandContextActions` (`:75-97`) — already live as `RuntimeActions`, installed onto every
+    ///   session by `AgentSessionRuntime::install_inner`;
+    /// * `onError` (`:98-100`) — **this**, and it was the piece with no counterpart: the print and
+    ///   json hosts registered no error sink at all, so an extension fault under `cyrup -p` or
+    ///   `cyrup --mode json` was contained and never surfaced anywhere. See [`BindOptions::on_error`].
+    pub async fn bind_extensions_with(&self, opts: BindOptions) {
+        if let Some(listener) = opts.on_error {
+            self.services.ext_host.add_error_listener(listener);
+        }
         self.emit_session_start("startup", None).await;
     }
 
@@ -2592,14 +2741,25 @@ impl AgentSession {
         }
         self.fanout_emit(AgentSessionEvent::SessionStart {
             reason: reason.to_string(),
-            previous_session_file,
+            previous_session_file: previous_session_file.clone(),
         })
         .await;
         let cancel = self.session_cancel.child_token();
         self.services
             .ext_host
             .dispatcher()
-            .dispatch_notify(&HostEvent::SessionStart { reason: reason.to_string() }, &cancel)
+            .dispatch_notify(
+                &HostEvent::SessionStart {
+                    reason: reason.to_string(),
+                    // SEAM-025 — pi's `SessionStartEvent.previousSessionFile?`, "Present for
+                    // \"new\", \"resume\", and \"fork\"" (`core/extensions/types.ts:562-569`
+                    // @v0.83.0), populated at `agent-session-runtime.ts:305`/`:328`/`:347`. The
+                    // FACADE event already carried it; the EXTENSION event dropped it, so the one
+                    // consumer that cannot see the facade — an extension — was the one that lost it.
+                    previous_session_file: previous_session_file.clone(),
+                },
+                &cancel,
+            )
             .await;
         // EXT-004: `session_start` is Pi's canonical place to register a tool dynamically
         // (`examples/extensions/dynamic-tools.ts`). Pi's `registerTool` refreshes the registry
@@ -2804,6 +2964,25 @@ impl AgentSession {
         )
     }
 
+    /// The attribution overlay for the model a TURN is actually going to, addressed by the loop's
+    /// [`ModelRef`] rather than by a resolved [`Model`] (AGENT-029). This is the body of the
+    /// `transform_headers` resolver installed in [`Self::into_shared`] — pi's per-request
+    /// `transformHeaders` closure (`sdk.ts:318-327` @v0.83.0), whose `model` argument is the model
+    /// of that very request.
+    ///
+    /// Fast path: the session's own resolved model, which is what every turn uses unless a
+    /// `prepare_next_turn` hook retargeted the loop. Only a genuinely different model pays for a
+    /// registry scan. `None` (an unknown model id) means "no opinion" and leaves the agent's static
+    /// [`cyrup_agent::Agent::set_headers`] overlay in place.
+    fn headers_for_model_ref(&self, m: &ModelRef) -> Option<cyrup_provider::HeaderMap> {
+        let matches = |c: &Model| c.provider == m.provider && c.id == m.model;
+        let current = Self::lock(&self.compaction_model).clone();
+        if let Some(cur) = current.as_ref().filter(|c| matches(c)) {
+            return self.attribution_headers(cur);
+        }
+        self.full_model_registry().into_iter().find(matches).and_then(|c| self.attribution_headers(&c))
+    }
+
     /// Emit the `model_select` extension event when the model actually changes (Pi `_emitModelSelect`,
     /// agent-session.ts:1429-1440). `source` ∈ `set`/`cycle`/`restore`. No-op when the model is
     /// unchanged (Pi `modelsAreEqual` guard).
@@ -2820,18 +2999,28 @@ impl AgentSession {
             return;
         }
         let cancel = self.session_cancel.child_token();
+        // EXT-042: `model`, `previousModel` and `source` are THREE SIBLING fields on pi's
+        // `ModelSelectEvent` (`core/extensions/types.ts:792-799` @v0.83.0), emitted as such at
+        // `agent-session.ts:1565-1570`. They used to be nested INSIDE `model` here, so a ported
+        // handler read `event.previousModel` and got `undefined`.
         let model_val = serde_json::json!({
             "provider": next.provider.as_str(),
             "id": next.id.as_str(),
-            "previousModel": previous.map(|p| serde_json::json!({
-                "provider": p.provider.as_str(), "id": p.model.as_str(),
-            })),
-            "source": source,
+        });
+        let previous_model = previous.map(|p| {
+            serde_json::json!({ "provider": p.provider.as_str(), "id": p.model.as_str() })
         });
         self.services
             .ext_host
             .dispatcher()
-            .dispatch_notify(&HostEvent::ModelSelect { model: model_val }, &cancel)
+            .dispatch_notify(
+                &HostEvent::ModelSelect {
+                    model: model_val,
+                    previous_model,
+                    source: source.to_string(),
+                },
+                &cancel,
+            )
             .await;
     }
 
@@ -3205,7 +3394,19 @@ impl AgentSession {
         self.services
             .ext_host
             .dispatcher()
-            .dispatch_notify(&HostEvent::ThinkingLevelSelect { level: level_str }, &cancel)
+            .dispatch_notify(
+                &HostEvent::ThinkingLevelSelect {
+                    level: level_str,
+                    // pi's `previousLevel` (`extensions/types.ts:802-806`), read off the agent
+                    // snapshot above and emitted only on a real change — the `effective ==
+                    // previous` early return is pi's `if (isChanging)` guard
+                    // (`agent-session.ts:1688-1697`).
+                    previous_level: Some(
+                        crate::builder::thinking_level_to_str(previous).to_string(),
+                    ),
+                },
+                &cancel,
+            )
             .await;
         Ok(effective)
     }
@@ -3427,7 +3628,7 @@ impl AgentSession {
     /// → `SessionManager.delete`, session-selector.ts:540). Additive seam for the TUI session selector:
     /// removes the JSONL from disk. Refuses to delete *this* session's own file (Pi guards the active
     /// session). An already-absent file is a no-op (idempotent), never an error.
-    pub fn delete_session_file(&self, path: &Path) -> Result<(), SessionServiceError> {
+    pub fn delete_session_file(&self, path: &Path) -> Result<DeleteMethod, SessionServiceError> {
         if let Some(active) = self.manager_path()
             && same_file(&active, path)
         {
@@ -3435,11 +3636,7 @@ impl AgentSession {
                 "refusing to delete the active session".to_string(),
             ));
         }
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(SessionServiceError::Io(e.to_string())),
-        }
+        delete_session_file_at(path)
     }
 
     /// Set a persisted session's display **name** by path (Pi `/resume` in-list rename →
@@ -4062,14 +4259,25 @@ impl AgentSession {
     /// slash command via this seam executes through the real run path end-to-end (proven by
     /// `tests/wasm_slash_command.rs`: `prompt("/greet …")` → `_tryExecuteExtensionCommand` → the
     /// guest's `execute-command` export).
+    /// EXT-059 — `caps` is REQUIRED, not implied. This used to call
+    /// [`cyrup_ext::ExtensionHost::load_wasm`], which is `load_wasm_with_caps(…,
+    /// &Capabilities::host_granted())`: a byte-level load with a TOTAL grant, chosen silently by a
+    /// function whose name says nothing about capabilities. `ExtensionHost::load_wasm_with_caps`
+    /// existed the whole time and had no session-level caller, so no embedder could restrict a
+    /// component it loaded through the session without dropping to the raw host.
+    ///
+    /// `Capabilities::host_granted()` is still the right answer for an EMBEDDER-supplied component
+    /// — pi has no capability model at all, so an embedder's own extension is unconditionally
+    /// total (`ExtensionHost::load_wasm`'s doc) — it just has to be SAID.
     #[cfg(feature = "wasm-host")]
     pub async fn load_wasm_extension(
         &self,
         id: cyrup_core::ExtensionId,
         bytes: &[u8],
+        caps: &cyrup_ext::Capabilities,
     ) -> Result<Arc<cyrup_ext::host::LiveExtension>, SessionServiceError> {
         let services: Arc<dyn cyrup_ext::host::HostServices> = self.services.host_services.clone();
-        Ok(self.services.ext_host.load_wasm(id, bytes, services).await?)
+        Ok(self.services.ext_host.load_wasm_with_caps(id, bytes, services, caps).await?)
     }
 }
 
@@ -4308,14 +4516,32 @@ impl AgentSession {
         let context_tokens: u32 = if assistant.stop_reason == cyrup_core::StopReason::Error
             || direct_context_tokens == 0
         {
-            let messages = self.messages().await;
-            let estimate = estimate_context_tokens(&messages);
+            // SESS-028 — the estimate basis is the RAW `AgentMessage` transcript, not the
+            // `convertToLlm`-flattened projection. pi reads `this.agent.state.messages`
+            // (`agent-session.ts:2020-2021` @v0.83.0), an `AgentMessage[]` that keeps the
+            // `bashExecution`/`branchSummary`/`compactionSummary`/`custom` roles intact.
+            //
+            // `self.messages()` is the flattened view: it renders summary wrappers into text
+            // (over-counting them) and DROPS `excludeFromContext` bash messages that pi's raw
+            // context still counts. Both errors are in the estimate that decides whether to
+            // compact, so this fallback fired at a different context size than upstream — and
+            // `Compactor::should_compact` next door already estimated over the raw basis
+            // correctly, so the two disagreed inside one crate.
+            // `raw_context_messages()` is `build_context_raw()` — `buildSessionContext(pathEntries)
+            // .messages` (`session-manager.ts:389-403`), the same basis `Compactor::should_compact`
+            // uses. It stands in for pi's `this.agent.state.messages` because
+            // `cyrup_agent::AgentMessage` is a NARROWER enum that cannot carry the
+            // bash/branch-summary/compaction-summary roles at all (SESS-043 is the widening).
+            let messages = self.raw_context_messages().await;
+            let estimate = cyrup_session::compaction::estimate_context_tokens_raw(&messages);
             let Some(last_usage_index) = estimate.last_usage_index else {
                 return Ok(false); // No usage data at all.
             };
             // If the usage source predates the compaction boundary, its tokens are stale.
-            if let (Some(boundary_ts), Some(Message::Assistant(usage_msg))) =
-                (compaction_ts, messages.get(last_usage_index))
+            if let (
+                Some(boundary_ts),
+                Some(cyrup_session::agent_message::AgentMessage::Core(Message::Assistant(usage_msg))),
+            ) = (compaction_ts, messages.get(last_usage_index))
                 && usage_msg.timestamp <= boundary_ts
             {
                 return Ok(false);
@@ -4494,7 +4720,10 @@ impl AgentSession {
                     summary: entry.summary.clone(),
                     first_kept_entry_id: entry.first_kept_entry_id.to_string(),
                     tokens_before: entry.tokens_before,
-                    estimated_tokens_after,
+                    estimated_tokens_after: Some(estimated_tokens_after),
+                    // SEAM-034: pi's `usage?` (compaction.ts:93) — the token spend of the
+                    // summarization call(s), already recorded on the compaction entry.
+                    usage: entry.usage.clone(),
                     details: entry.details.clone(),
                 };
                 let notify_cancel = self.session_cancel.child_token();
@@ -4911,6 +5140,18 @@ impl AgentSession {
         self.agent.tools().await
     }
 
+    /// The agent's live model + thinking level, for the per-turn refresh to stamp over whatever the
+    /// extension seam returned (AGENT-017). pi reads exactly these two off the AGENT — `model:
+    /// this.agent.state.model` (`agent-session.ts:537` @v0.83.0) and `thinkingLevel:
+    /// this.agent.state.thinkingLevel` (`:538`) — not the session's mirrors, and stamps them AFTER
+    /// the `...previousSnapshot` spread so the session out-votes an extension override.
+    pub(crate) async fn next_turn_model_baseline(
+        &self,
+    ) -> (ModelRef, cyrup_core::ModelThinkingLevel) {
+        let snap = self.agent.snapshot().await;
+        (snap.model, snap.thinking_level)
+    }
+
     /// Set the active tool set by name, rebuilding the base system prompt and re-pushing both the
     /// tool array and the prompt to the agent for the next turn (Pi `setActiveToolsByName`,
     /// agent-session.ts:812). Unknown names are ignored.
@@ -5032,6 +5273,152 @@ fn compaction_reason_str(r: CompactionReason) -> &'static str {
         CompactionReason::Threshold => "threshold",
         CompactionReason::Overflow => "overflow",
     }
+}
+
+/// Options for [`AgentSession::bind_extensions_with`] — pi's `bindExtensions({ … })` argument
+/// (`modes/print-mode.ts:73-101` @v0.83.0). Only the key cyrup did not already satisfy elsewhere is
+/// modelled; see that method for where `mode` and `commandContextActions` live. SEAM-006.
+#[derive(Default)]
+pub struct BindOptions {
+    /// pi's `onError` (`print-mode.ts:98-100`):
+    ///
+    /// ```text
+    /// onError: (err) => {
+    ///     console.error(`Extension error (${err.extensionPath}): ${err.error}`);
+    /// },
+    /// ```
+    ///
+    /// Registered on the session's [`cyrup_ext::ExtensionHost`] via `add_error_listener`, the same
+    /// channel the RPC host already used (`cyrup-modes/src/rpc.rs`). `None` keeps the previous
+    /// behaviour — a contained fault is logged and nothing else.
+    pub on_error: Option<cyrup_ext::ErrorListener>,
+}
+
+/// How a session file was removed — Pi's `{ method: "trash" | "unlink" }`
+/// (`modes/interactive/components/session-selector.ts:646` @v0.83.0, identical at v0.84.1). The
+/// caller renders a different status line for each (`:846`), so this is on the wire of the seam
+/// rather than an implementation detail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteMethod {
+    /// The OS `trash` CLI accepted it — the conversation is recoverable from the desktop trash.
+    Trash,
+    /// Permanent `unlink`, Pi's fallback when `trash` is absent or refused.
+    Unlink,
+}
+
+impl DeleteMethod {
+    /// Pi's own status text: `result.method === "trash" ? "Session moved to trash" : "Session
+    /// deleted"` (`session-selector.ts:846`).
+    pub const fn status_message(self) -> &'static str {
+        match self {
+            Self::Trash => "Session moved to trash",
+            Self::Unlink => "Session deleted",
+        }
+    }
+}
+
+/// Delete a session JSONL, **trying the `trash` CLI first** — a literal port of pi's
+/// `deleteSessionFile` (`modes/interactive/components/session-selector.ts:644-679` @v0.83.0,
+/// byte-identical at v0.84.1). SEAM-063.
+///
+/// ```text
+/// const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
+/// const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
+/// if (trashResult.status === 0 || !existsSync(sessionPath)) return { ok: true, method: "trash" };
+/// try { await unlink(sessionPath); return { ok: true, method: "unlink" }; }
+/// catch (err) { … return { ok: false, method: "unlink", error }; }
+/// ```
+///
+/// Four clauses are load-bearing and are reproduced exactly:
+/// * the `--` guard for a leading-dash path (`:649`), so a session file named `-x.jsonl` is not
+///   read as a `trash` option;
+/// * success on exit-0 **or** the file having disappeared (`:666`) — some `trash` builds exit
+///   non-zero while still moving the file;
+/// * only then the permanent `unlink` (`:672`);
+/// * the failure string carries BOTH the unlink message and pi's `trash: …` hint (`:675-678`),
+///   truncated to pi's 200 characters and joined with pi's ` · `.
+///
+/// An already-absent file is success (cyrup's pre-existing idempotence, kept: pi's `!existsSync`
+/// clause reaches the same verdict on that input).
+pub fn delete_session_file_at(path: &Path) -> Result<DeleteMethod, SessionServiceError> {
+    let mut cmd = std::process::Command::new("trash");
+    cmd.args(trash_args(path));
+    let trash = cmd.output();
+
+    // Pi's `getTrashErrorHint()` (:651-663): the spawn error message and/or the FIRST line of
+    // stderr, joined with " · " and sliced to 200 chars, prefixed `trash: `.
+    let trash_hint = match &trash {
+        Err(e) => Some(format!("trash: {e}")),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first = stderr.trim().lines().next().unwrap_or("").to_string();
+            (!first.is_empty()).then(|| {
+                let mut s = format!("trash: {first}");
+                s.truncate(pi_hint_char_boundary(&s, 200));
+                s
+            })
+        }
+    };
+
+    // Pi: `if (trashResult.status === 0 || !existsSync(sessionPath))` (:666).
+    let trash_ok = matches!(&trash, Ok(out) if out.status.success());
+    if trash_ok || !path.exists() {
+        return Ok(DeleteMethod::Trash);
+    }
+
+    // Pi: the permanent fallback (:672-674).
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(DeleteMethod::Unlink),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DeleteMethod::Unlink),
+        Err(e) => Err(SessionServiceError::Io(match trash_hint {
+            // Pi: `${unlinkError} (${trashErrorHint})` (:677).
+            Some(hint) => format!("{e} ({hint})"),
+            None => e.to_string(),
+        })),
+    }
+}
+
+/// Rename a persisted session **by path**, without a live session — the same two calls
+/// [`AgentSession::rename_session_file`] makes for a non-active target (Pi `onRenameSession` →
+/// `SessionManager.setSessionName`, `session-selector.ts:585`): open the JSONL, append a
+/// `session_info` record.
+///
+/// Exists so the PRE-LAUNCH `--resume` picker can persist a rename it already accepts on screen; it
+/// runs before any session services exist, and needs none. SEAM-062.
+pub fn rename_session_file_at(path: &Path, name: &str) -> Result<(), SessionServiceError> {
+    let mut mgr = cyrup_session::SessionManager::open(path)?;
+    mgr.append_session_info(name)?;
+    Ok(())
+}
+
+/// pi's `trashArgs` — `sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath]`
+/// (`modes/interactive/components/session-selector.ts:649` @v0.83.0).
+///
+/// The guard is load-bearing rather than defensive: a session file whose NAME begins with `-` (the
+/// picker labels rows by their first message, and nothing stops a session id or a `--session-dir`
+/// path producing one) would otherwise be parsed by `trash` as an option instead of a path.
+/// Extracted so it is unit-testable without putting a stub `trash` on `PATH` — this crate forbids
+/// `unsafe`, and `std::env::set_var` is `unsafe` under edition 2024.
+pub(crate) fn trash_args(path: &Path) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::with_capacity(2);
+    if path.to_string_lossy().starts_with('-') {
+        args.push(std::ffi::OsString::from("--"));
+    }
+    args.push(path.as_os_str().to_os_string());
+    args
+}
+
+/// The largest byte index `<= max` that is a char boundary — JS `String.slice(0, 200)` counts UTF-16
+/// units and never panics, so the port must not either.
+fn pi_hint_char_boundary(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    let mut idx = max;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 /// Current wall-clock time in milliseconds (Pi `Date.now()`); 0 on a clock fault.

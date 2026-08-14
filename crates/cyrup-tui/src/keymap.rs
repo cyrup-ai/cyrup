@@ -190,38 +190,90 @@ pub enum EditorAction {
     /// Move the caret DOWN one page inside the editor buffer — `tui.editor.pageDown`
     /// (`tui/src/keybindings.ts:90`; `editor.ts:860` → `pageScroll(1)`).
     PageDown,
+    /// Browse to the PREVIOUS prompt-history entry unconditionally — `tui.editor.historyPrevious`
+    /// (`tui/src/keybindings.ts:68-71` @v0.84.1, `defaultKeys: []`), handled at
+    /// `tui/src/components/editor.ts:767-771` under the comment "Dedicated history actions always
+    /// browse entries instead of moving the cursor": cancel the autocomplete, then
+    /// `navigateHistory(-1)` — NOT gated on the caret being at the buffer edge the way Up/Down are.
+    /// TUI-035; added in the `v0.83.0..v0.84.1` window (absent from `v0.83.0`'s `keybindings.ts`).
+    HistoryPrevious,
+    /// The forward half — `tui.editor.historyNext` (`keybindings.ts:72-75`, `editor.ts:772-776`).
+    HistoryNext,
 }
 
 impl EditorAction {
-    /// Resolve an editor binding id (`editor.cursorLeft`, …; `keybindings.ts:54-134`) to an
-    /// [`EditorAction`]. `None` for ids outside the editor map.
+    /// Resolve an editor binding id to an [`EditorAction`]. `None` for ids outside the editor map.
+    ///
+    /// **TUI-028.** The canonical spellings are pi's `tui.editor.*` / `tui.input.*`
+    /// (`packages/tui/src/keybindings.ts:9-32` @v0.83.0 — already the spelling at the ported
+    /// baseline). cyrup shipped a bare `editor.*` namespace that matches **neither** pi's current
+    /// ids nor pi's legacy ones, so all 24 bindings written from either era of pi's documentation
+    /// were silently inert — `merge_json` ignores an id it does not recognise, with no error and no
+    /// diagnostic.
+    ///
+    /// The `editor.*` spellings are kept as accepted ALIASES rather than deleted, the way pi keeps
+    /// its own legacy names working through `KEYBINDING_NAME_MIGRATIONS`
+    /// (`coding-agent/src/core/keybindings.ts:209-269`, applied by `migrateKeybindingsConfig` at
+    /// `:289-309`): a `keybindings.json` written against shipped cyrup must not break. pi's legacy
+    /// BARE names (`cursorUp`, `pageUp`, `newLine`, …) are accepted here too, since those are what
+    /// its migration table maps and a pi user's old file carries them.
     pub fn from_id(id: &str) -> Option<EditorAction> {
         use EditorAction as E;
         Some(match id {
-            "editor.cursorLeft" => E::CursorLeft,
-            "editor.cursorRight" => E::CursorRight,
-            "editor.cursorUp" => E::CursorUp,
-            "editor.cursorDown" => E::CursorDown,
-            "editor.cursorWordLeft" => E::CursorWordLeft,
-            "editor.cursorWordRight" => E::CursorWordRight,
-            "editor.cursorLineStart" => E::CursorLineStart,
-            "editor.cursorLineEnd" => E::CursorLineEnd,
-            "editor.deleteCharBackward" => E::DeleteCharBackward,
-            "editor.deleteCharForward" => E::DeleteCharForward,
-            "editor.deleteWordBackward" => E::DeleteWordBackward,
-            "editor.deleteWordForward" => E::DeleteWordForward,
-            "editor.deleteToLineStart" => E::DeleteToLineStart,
-            "editor.deleteToLineEnd" => E::DeleteToLineEnd,
-            "editor.yank" => E::Yank,
-            "editor.yankPop" => E::YankPop,
-            "editor.undo" => E::Undo,
-            "editor.newLine" => E::NewLine,
-            "editor.submit" => E::Submit,
-            "editor.tab" => E::Tab,
-            "editor.jumpForward" => E::JumpForward,
-            "editor.jumpBackward" => E::JumpBackward,
-            "editor.pageUp" => E::PageUp,
-            "editor.pageDown" => E::PageDown,
+            // Canonical (`keybindings.ts:9-29`).
+            "tui.editor.cursorLeft" | "editor.cursorLeft" | "cursorLeft" => E::CursorLeft,
+            "tui.editor.cursorRight" | "editor.cursorRight" | "cursorRight" => E::CursorRight,
+            "tui.editor.cursorUp" | "editor.cursorUp" | "cursorUp" => E::CursorUp,
+            "tui.editor.cursorDown" | "editor.cursorDown" | "cursorDown" => E::CursorDown,
+            "tui.editor.cursorWordLeft" | "editor.cursorWordLeft" | "cursorWordLeft" => {
+                E::CursorWordLeft
+            }
+            "tui.editor.cursorWordRight" | "editor.cursorWordRight" | "cursorWordRight" => {
+                E::CursorWordRight
+            }
+            "tui.editor.cursorLineStart" | "editor.cursorLineStart" | "cursorLineStart" => {
+                E::CursorLineStart
+            }
+            "tui.editor.cursorLineEnd" | "editor.cursorLineEnd" | "cursorLineEnd" => {
+                E::CursorLineEnd
+            }
+            "tui.editor.deleteCharBackward"
+            | "editor.deleteCharBackward"
+            | "deleteCharBackward" => E::DeleteCharBackward,
+            "tui.editor.deleteCharForward" | "editor.deleteCharForward" | "deleteCharForward" => {
+                E::DeleteCharForward
+            }
+            "tui.editor.deleteWordBackward"
+            | "editor.deleteWordBackward"
+            | "deleteWordBackward" => E::DeleteWordBackward,
+            "tui.editor.deleteWordForward" | "editor.deleteWordForward" | "deleteWordForward" => {
+                E::DeleteWordForward
+            }
+            "tui.editor.deleteToLineStart" | "editor.deleteToLineStart" | "deleteToLineStart" => {
+                E::DeleteToLineStart
+            }
+            "tui.editor.deleteToLineEnd" | "editor.deleteToLineEnd" | "deleteToLineEnd" => {
+                E::DeleteToLineEnd
+            }
+            "tui.editor.yank" | "editor.yank" | "yank" => E::Yank,
+            "tui.editor.yankPop" | "editor.yankPop" | "yankPop" => E::YankPop,
+            "tui.editor.undo" | "editor.undo" | "undo" => E::Undo,
+            "tui.editor.jumpForward" | "editor.jumpForward" | "jumpForward" => E::JumpForward,
+            "tui.editor.jumpBackward" | "editor.jumpBackward" | "jumpBackward" => E::JumpBackward,
+            // TUI-028 — `app.pageUp`/`app.pageDown` were cyrup inventions; upstream has neither.
+            // Paging inside the editor buffer is `tui.editor.pageUp`/`pageDown`
+            // (`keybindings.ts:19-20`). The `app.*` spellings stay as aliases for the same reason
+            // the `editor.*` ones do.
+            "tui.editor.pageUp" | "editor.pageUp" | "pageUp" => E::PageUp,
+            "tui.editor.pageDown" | "editor.pageDown" | "pageDown" => E::PageDown,
+            // TUI-035 (`keybindings.ts:11-12`, `:68-75` @v0.84.1) — no cyrup predecessor, so no
+            // alias to carry.
+            "tui.editor.historyPrevious" => E::HistoryPrevious,
+            "tui.editor.historyNext" => E::HistoryNext,
+            // `tui.input.*` (`keybindings.ts:30-33`).
+            "tui.input.newLine" | "editor.newLine" | "newLine" => E::NewLine,
+            "tui.input.submit" | "editor.submit" | "submit" => E::Submit,
+            "tui.input.tab" | "editor.tab" | "tab" => E::Tab,
             _ => return None,
         })
     }
@@ -642,14 +694,26 @@ pub enum AutocompleteAction {
 }
 
 impl AutocompleteAction {
-    /// Resolve a `tui.autocomplete.*` binding id (item #6).
+    /// Resolve a popup binding id.
+    ///
+    /// **TUI-028.** Upstream has no `tui.autocomplete.*` family at all: the popup reuses
+    /// `tui.select.up` / `tui.select.down` / `tui.select.confirm` / `tui.select.cancel` and
+    /// `tui.input.tab` (`packages/tui/src/components/editor.ts:664-712` @v0.83.0). cyrup routed the
+    /// popup through an invented map, so rebinding `tui.select.up` moved selector highlights but
+    /// NOT the popup — one user-visible action needing two different config keys.
+    ///
+    /// pi's ids are now accepted here, so a config written against pi's documentation moves both.
+    /// The `tui.autocomplete.*` spellings are kept as aliases for the same
+    /// do-not-break-a-shipped-config reason the `editor.*` ones are.
     pub fn from_id(id: &str) -> Option<AutocompleteAction> {
         match id {
-            "tui.autocomplete.previous" => Some(AutocompleteAction::Previous),
-            "tui.autocomplete.next" => Some(AutocompleteAction::Next),
-            "tui.autocomplete.accept" => Some(AutocompleteAction::Accept),
-            "tui.autocomplete.acceptSubmit" => Some(AutocompleteAction::AcceptSubmit),
-            "tui.autocomplete.cancel" => Some(AutocompleteAction::Cancel),
+            "tui.select.up" | "tui.autocomplete.previous" => Some(AutocompleteAction::Previous),
+            "tui.select.down" | "tui.autocomplete.next" => Some(AutocompleteAction::Next),
+            "tui.input.tab" | "tui.autocomplete.accept" => Some(AutocompleteAction::Accept),
+            "tui.select.confirm" | "tui.autocomplete.acceptSubmit" => {
+                Some(AutocompleteAction::AcceptSubmit)
+            }
+            "tui.select.cancel" | "tui.autocomplete.cancel" => Some(AutocompleteAction::Cancel),
             _ => None,
         }
     }
@@ -917,27 +981,58 @@ pub enum TreeAction {
     FoldOrUp,
     /// Unfold the selected branch, or move down at a leaf — `app.tree.unfoldOrDown` (`x`).
     UnfoldOrDown,
-    /// Begin inline label edit on the selected entry — `app.tree.editLabel` (`e`).
+    /// Begin inline label edit on the selected entry — `app.tree.editLabel` (`shift+l`).
     EditLabel,
-    /// Toggle the per-row label-timestamp column — `app.tree.toggleLabelTimestamp` (`t`).
+    /// Toggle the per-row label-timestamp column — `app.tree.toggleLabelTimestamp` (`shift+t`).
     ToggleLabelTimestamp,
+    /// Direct filter: default view — `app.tree.filter.default` (`ctrl+d`).
+    FilterDefault,
+    /// Toggle filter: hide tool results ↔ default — `app.tree.filter.noTools` (`ctrl+t`).
+    FilterNoTools,
+    /// Toggle filter: user messages only ↔ default — `app.tree.filter.userOnly` (`ctrl+u`).
+    FilterUserOnly,
+    /// Toggle filter: labeled entries only ↔ default — `app.tree.filter.labeledOnly` (`ctrl+l`).
+    FilterLabeledOnly,
+    /// Toggle filter: show everything ↔ default — `app.tree.filter.all` (`ctrl+a`).
+    FilterAll,
+    /// Cycle the filter forwards — `app.tree.filter.cycleForward` (`ctrl+o`).
+    FilterCycleForward,
+    /// Cycle the filter backwards — `app.tree.filter.cycleBackward` (`shift+ctrl+o`).
+    FilterCycleBackward,
 }
 
 impl TreeAction {
-    /// Resolve an `app.tree.*` binding id (spec/tui/05 §6.1).
+    /// Resolve an `app.tree.*` binding id (spec/tui/05 §6.1; pi `core/keybindings.ts:119-134`
+    /// and `:179-206` for the seven `app.tree.filter.*` ids).
     pub fn from_id(id: &str) -> Option<TreeAction> {
         match id {
             "app.tree.foldOrUp" => Some(TreeAction::FoldOrUp),
             "app.tree.unfoldOrDown" => Some(TreeAction::UnfoldOrDown),
             "app.tree.editLabel" => Some(TreeAction::EditLabel),
             "app.tree.toggleLabelTimestamp" => Some(TreeAction::ToggleLabelTimestamp),
+            "app.tree.filter.default" => Some(TreeAction::FilterDefault),
+            "app.tree.filter.noTools" => Some(TreeAction::FilterNoTools),
+            "app.tree.filter.userOnly" => Some(TreeAction::FilterUserOnly),
+            "app.tree.filter.labeledOnly" => Some(TreeAction::FilterLabeledOnly),
+            "app.tree.filter.all" => Some(TreeAction::FilterAll),
+            "app.tree.filter.cycleForward" => Some(TreeAction::FilterCycleForward),
+            "app.tree.filter.cycleBackward" => Some(TreeAction::FilterCycleBackward),
             _ => None,
         }
     }
 }
 
-/// The configurable `/tree` binding table (spec/tui/05 §6.1). Defaults: `z` fold/up, `x` unfold/down,
-/// `e` edit label, `t` toggle label-timestamp.
+/// The configurable `/tree` binding table (spec/tui/05 §6.1).
+///
+/// **TUI-027.** The defaults are pi's, read at `v0.83.0`
+/// `packages/coding-agent/src/core/keybindings.ts:119-134` (`app.tree.foldOrUp` =
+/// `["alt+left","ctrl+left"]`, `app.tree.unfoldOrDown` = `["alt+right","ctrl+right"]`,
+/// `app.tree.editLabel` = `shift+l`, `app.tree.toggleLabelTimestamp` = `shift+t`) and `:179-206`
+/// (the seven `app.tree.filter.*` ids on ctrl+d / ctrl+t / ctrl+u / ctrl+l / ctrl+a, ctrl+o and
+/// shift+ctrl+o). cyrup previously bound the four non-filter actions to the bare characters
+/// `z` / `x` / `e` / `t`, which upstream accumulates into `/tree`'s **text search** — so a pi user
+/// typing an ordinary word into the picker opened the inline label editor and persisted the rest of
+/// the word into the session JSONL as an entry label.
 #[derive(Clone, Debug)]
 pub struct TreeKeymap {
     bindings: Vec<(Key, TreeAction)>,
@@ -946,12 +1041,31 @@ pub struct TreeKeymap {
 impl Default for TreeKeymap {
     fn default() -> Self {
         use TreeAction as T;
+        let ctrl = |c: char| Key { code: KeyCode::Char(c), mods: KeyModifiers::CONTROL };
+        let alt_code = |code: KeyCode| Key { code, mods: KeyModifiers::ALT };
+        let ctrl_code = |code: KeyCode| Key { code, mods: KeyModifiers::CONTROL };
+        let shift = |c: char| Key { code: KeyCode::Char(c), mods: KeyModifiers::SHIFT };
         TreeKeymap {
             bindings: vec![
-                (Key::plain(KeyCode::Char('z')), T::FoldOrUp),
-                (Key::plain(KeyCode::Char('x')), T::UnfoldOrDown),
-                (Key::plain(KeyCode::Char('e')), T::EditLabel),
-                (Key::plain(KeyCode::Char('t')), T::ToggleLabelTimestamp),
+                (alt_code(KeyCode::Left), T::FoldOrUp),
+                (ctrl_code(KeyCode::Left), T::FoldOrUp),
+                (alt_code(KeyCode::Right), T::UnfoldOrDown),
+                (ctrl_code(KeyCode::Right), T::UnfoldOrDown),
+                (shift('l'), T::EditLabel),
+                (shift('t'), T::ToggleLabelTimestamp),
+                (ctrl('d'), T::FilterDefault),
+                (ctrl('t'), T::FilterNoTools),
+                (ctrl('u'), T::FilterUserOnly),
+                (ctrl('l'), T::FilterLabeledOnly),
+                (ctrl('a'), T::FilterAll),
+                (ctrl('o'), T::FilterCycleForward),
+                (
+                    Key {
+                        code: KeyCode::Char('o'),
+                        mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                    },
+                    T::FilterCycleBackward,
+                ),
             ],
         }
     }
@@ -961,6 +1075,30 @@ impl TreeKeymap {
     /// Resolve the tree action for an event, if any (R-10-018).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<TreeAction> {
         self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// The label of the **first** key bound to `action`, with pi's help-row arrow substitutions
+    /// applied — `formatHelpKeys` (`tree-selector.ts:1238-1253`) takes `getKeys(id)[0]` and rewrites
+    /// `up`/`down`/`left`/`right` to `↑`/`↓`/`←`/`→` and `pageUp`/`pageDown` to `pgup`/`pgdn`.
+    /// `None` when the action is unbound (upstream's `keys.length === 0` → `""`).
+    pub fn first_key_label(&self, action: TreeAction) -> Option<String> {
+        let raw = self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())?;
+        // pi's replacements are `\b`-anchored, so they rewrite the base key token and never the
+        // inside of a longer word. cyrup's labels are `mod+mod+base`, so rewrite the base token.
+        let (prefix, base) = match raw.rfind('+') {
+            Some(i) => raw.split_at(i + 1),
+            None => ("", raw.as_str()),
+        };
+        let base = match base {
+            "pageup" => "pgup",
+            "pagedown" => "pgdn",
+            "up" => "↑",
+            "down" => "↓",
+            "left" => "←",
+            "right" => "→",
+            other => other,
+        };
+        Some(format!("{prefix}{base}"))
     }
 
     /// Rebind `action` to exactly `keys`.

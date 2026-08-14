@@ -125,11 +125,16 @@ impl Hooks for PolicyHooks {
         match self.policy.evaluate(ctx.tool_name, ctx.args) {
             PolicyDecision::Proceed => {}
             PolicyDecision::Mutate { input } => *ctx.args = input,
-            PolicyDecision::Block { reason } => return Ok(BeforeOutcome::Block { reason: Some(reason) }),
+            // AGENT-022 `terminate: false` — a POLICY block is not pi's "stop after this batch"
+            // hint; that flag belongs to an extension's `BeforeToolCallResult.terminate`
+            // (`packages/agent/src/types.ts:61-69` @v0.84.1) and the permission gate never sets it.
+            PolicyDecision::Block { reason } => {
+                return Ok(BeforeOutcome::Block { reason: Some(reason), terminate: false });
+            }
             PolicyDecision::Confirm { reason } => {
                 if !self.has_ui {
                     // No UI to prompt: block-by-default (R-12-009).
-                    return Ok(BeforeOutcome::Block { reason: Some(reason) });
+                    return Ok(BeforeOutcome::Block { reason: Some(reason), terminate: false });
                 }
                 // With UI the front-end resolves confirmation; absent a wired confirm hook we
                 // proceed (the interactive front-end owns the prompt — arch-10/12).
@@ -149,11 +154,16 @@ impl Hooks for PolicyHooks {
 
     /// Pi `_installAgentNextTurnRefresh` (agent-session.ts:519-540): run whatever
     /// `prepareNextTurnWithContext` was already installed, then OVERWRITE the tool set with the
-    /// session's live one — every turn, unconditionally.
+    /// session's live tool set, model and thinking level — every turn, unconditionally.
     ///
-    /// Ordering matches Pi exactly: `previousSnapshot` is awaited first and its fields are spread,
-    /// then `context.tools` is assigned over the top. So an extension may still replace the
-    /// transcript, model or thinking level; it may not out-vote the session on which tools exist.
+    /// Ordering matches Pi: `previousSnapshot` is awaited first and its fields are spread, then
+    /// `context.tools` (`:534`), `model` (`:537`) and `thinkingLevel` (`:538`) are assigned over the
+    /// top. So an extension may still replace the transcript; it may not out-vote the session on
+    /// which tools exist, which model runs, or which reasoning tier is in force. The previous
+    /// revision of this comment claimed an extension's `model`/`thinkingLevel` survived and that
+    /// this "matches Pi exactly" — the first half described cyrup's own behaviour accurately, the
+    /// second half was false, because pi stamps the session's values OVER the extension's
+    /// (AGENT-017).
     ///
     /// Pi also re-pushes `context.systemPrompt` here. cyrup does not — see
     /// [`crate::session::AgentSession::next_turn_tools`] for why (one prompt slot instead of Pi's
@@ -170,18 +180,34 @@ impl Hooks for PolicyHooks {
     async fn prepare_next_turn(
         &self,
         ctx: PostTurn<'_>,
+        cancel: CancelToken,
     ) -> Result<Option<TurnUpdate>, HookError> {
-        let previous = self.inner.prepare_next_turn(ctx).await?;
+        let previous = self.inner.prepare_next_turn(ctx, cancel).await?;
         let Some(session) = self.session.get() else {
             return Ok(previous);
         };
         let mut update = previous.unwrap_or_default();
         update.tools = Some(session.next_turn_tools().await);
+        // AGENT-017 — pi's refresh returns THREE session-owned fields after the spread, not one:
+        // `context.tools` (agent-session.ts:534 @v0.83.0), `model` (`:537`) and `thinkingLevel`
+        // (`:538`). Only `tools` was re-pushed here, so `TurnUpdate::model` /
+        // `TurnUpdate::thinking_level` — which the loop folds stickily at `agent.rs:582-587` —
+        // never carried a value and a mid-run `/model` or thinking-level change did not reach the
+        // running loop until the next prompt, while the session still persisted the change and
+        // emitted its events. Stamped AFTER the inner hook for the same reason pi puts them after
+        // the spread: the session out-votes an extension override on all three.
+        let (model, thinking_level) = session.next_turn_model_baseline().await;
+        update.model = Some(model);
+        update.thinking_level = Some(thinking_level);
         Ok(Some(update))
     }
 
-    async fn should_stop_after_turn(&self, ctx: PostTurn<'_>) -> Result<bool, HookError> {
-        self.inner.should_stop_after_turn(ctx).await
+    async fn should_stop_after_turn(
+        &self,
+        ctx: PostTurn<'_>,
+        cancel: CancelToken,
+    ) -> Result<bool, HookError> {
+        self.inner.should_stop_after_turn(ctx, cancel).await
     }
 }
 

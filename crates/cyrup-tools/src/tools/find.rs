@@ -125,6 +125,18 @@ impl Tool for FindTool {
             .fs
             .walk(&search_root, WalkOpts { include_hidden: true, require_git: inside_git_repo });
         loop {
+            // `--max-results` (find.ts:252) makes **fd itself** stop traversing once it has emitted
+            // N paths; pi never sees the rest of the tree. Draining the whole walk and then
+            // `sort()`+`truncate()` cost the full-tree walk on every call regardless of `limit`,
+            // AND returned a different result SET — the alphabetically-first N rather than the
+            // first N discovered. Both are fixed by bounding the walk here. `grep -n sort find.ts`
+            // is empty at v0.84.1: pi relativizes only the lines it received (find.ts:321-326) and
+            // never reorders them, so the sort is dropped rather than moved. Note this bounds the
+            // stream, not just the vector: dropping out of the loop closes the receiver and
+            // `LocalFs::walk`'s producer task breaks on the send error (ops/local.rs).
+            if results.len() >= limit {
+                break;
+            }
             tokio::select! {
                 _ = cancel.cancelled() => return Err(error::aborted()),
                 item = walk.next() => {
@@ -139,7 +151,17 @@ impl Tool for FindTool {
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| rel.clone());
-                            if matcher.is_match(&rel, &basename) {
+                            // fd `--full-path` "matches against the absolute candidate path"
+                            // (find.ts:254-256, pi's own in-source note), and find.ts:267
+                            // `args.push("--", effectivePattern, searchPath)` hands fd the
+                            // ABSOLUTE search path as its root, so every candidate fd tests is
+                            // absolute. Matching the search-root-RELATIVE path instead made the
+                            // `pattern.starts_with('/')` arm in `PatternMatcher::build`
+                            // (globmatch.rs) dead — a relative posix path can never begin with `/`
+                            // — so a leading-slash pattern like `/src/**/*.ts` silently returned
+                            // the empty set. Relativization stays for OUTPUT only (find.ts:321-326).
+                            let abs_posix = to_posix(&w.path);
+                            if matcher.is_match(&abs_posix, &basename) {
                                 let entry = if w.is_dir { format!("{rel}/") } else { rel };
                                 results.push(entry);
                             }
@@ -151,14 +173,9 @@ impl Tool for FindTool {
             }
         }
 
-        results.sort();
-        if results.len() > limit {
-            results.truncate(limit);
-        }
-
-        // Pi's `results.length === 0` check (find.ts:172,297) runs on rows that `fd` has ALREADY
-        // capped with `--max-results` (find.ts:241), so the cap is applied before the empty test —
-        // hence the truncation above this block. Only reachable with `limit` folded to 0 (a
+        // Pi's `results.length === 0` check (find.ts:311) runs on rows that `fd` has ALREADY
+        // capped with `--max-results` (find.ts:252), so the cap is applied before the empty test —
+        // which the bounded walk above preserves. Only distinguishable with `limit` folded to 0 (a
         // non-positive argument); for every positive limit the two orders agree.
         if results.is_empty() {
             return Ok(ToolResult {

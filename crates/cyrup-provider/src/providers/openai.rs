@@ -29,7 +29,7 @@ pub fn openai_models() -> Vec<Model> {
 
 /// The OpenAI [`ProviderAuth`]: an API key from `$OPENAI_API_KEY` (Pi `envApiKeyAuth`).
 pub fn openai_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key([OPENAI_API_KEY_ENV]))
+    ProviderAuth::with_api_key(env_key("OpenAI API key", [OPENAI_API_KEY_ENV]))
 }
 
 /// Construct the OpenAI provider over the given credential store + shared api registry. The

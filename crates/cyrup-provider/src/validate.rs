@@ -101,30 +101,23 @@ fn coerce_object_schema(
     path: &str,
     strict: bool,
 ) -> Result<Value, ToolValidationError> {
-    // Unions (anyOf/oneOf): take the first branch that fits.
-    if let Some(branches) = schema
-        .get("anyOf")
-        .or_else(|| schema.get("oneOf"))
-        .and_then(Value::as_array)
-    {
-        // Strict pass first: a branch the value already matches exactly wins with no coercion.
-        for branch in branches {
-            if let Ok(v) = coerce(branch, value.clone(), path, true) {
-                return Ok(v);
-            }
+    // Composition keywords. Pi runs three INDEPENDENT sequential passes inside
+    // `coerceWithJsonSchema` (`pi/packages/ai/src/utils/validation.ts:189-201` @v0.83.0): `allOf`
+    // merges every nested schema in order (`:189-193`), then a non-`else` `anyOf` pass
+    // (`:195-197`), then a non-`else` `oneOf` pass (`:199-201`). The previous
+    // `anyOf`.or_else(`oneOf`) treated the two as mutually exclusive alternatives and ignored
+    // `allOf` entirely (PROV-016).
+    let mut value = value;
+    if let Some(nested) = schema.get("allOf").and_then(Value::as_array) {
+        for sub in nested {
+            value = coerce(sub, value, path, strict)?;
         }
-        // Lenient pass: allow scalar coercion within a branch (skipped if already strict).
-        let mut last_err = None;
-        if !strict {
-            for branch in branches {
-                match coerce(branch, value.clone(), path, false) {
-                    Ok(v) => return Ok(v),
-                    Err(e) => last_err = Some(e),
-                }
-            }
-        }
-        return Err(last_err
-            .unwrap_or_else(|| ToolValidationError::schema(path, "no union branch matched")));
+    }
+    if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
+        value = coerce_union(branches, value, path, strict)?;
+    }
+    if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
+        value = coerce_union(branches, value, path, strict)?;
     }
 
     // type-driven coercion.
@@ -187,6 +180,35 @@ fn coerce_object_schema(
         ));
     }
     Ok(coerced)
+}
+
+/// One union pass over `branches` — Pi's `coerceWithUnionSchema` (`validation.ts:174-184`
+/// @v0.83.0), which walks the members in order and takes the first whose coerced candidate
+/// validates.
+///
+/// Strict-then-lenient: a branch the value already matches exactly wins before any cross-type
+/// coercion is attempted, so a value that is already the right shape is never lossily re-coerced.
+fn coerce_union(
+    branches: &[Value],
+    value: Value,
+    path: &str,
+    strict: bool,
+) -> Result<Value, ToolValidationError> {
+    for branch in branches {
+        if let Ok(v) = coerce(branch, value.clone(), path, true) {
+            return Ok(v);
+        }
+    }
+    let mut last_err = None;
+    if !strict {
+        for branch in branches {
+            match coerce(branch, value.clone(), path, false) {
+                Ok(v) => return Ok(v),
+                Err(e) => last_err = Some(e),
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| ToolValidationError::schema(path, "no union branch matched")))
 }
 
 fn coerce_to_type(
@@ -312,7 +334,11 @@ fn coerce_boolean(value: Value, path: &str, strict: bool) -> Result<Value, ToolV
             path,
             format!("expected boolean, got {}", type_name(&value)),
         )),
-        Value::String(ref s) => match s.trim().to_ascii_lowercase().as_str() {
+        // Pi compares the string EXACTLY — `if (value === "true") … if (value === "false")`
+        // (`validation.ts:94-100` @v0.83.0, arm `:90-111`) — with no trim and no case fold; anything
+        // else falls through unchanged and is then rejected by the type check. A `to_ascii_lowercase`
+        // here executed a call pi refuses, on identical model output (PROV-046).
+        Value::String(ref s) => match s.as_str() {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
             _ => Err(ToolValidationError::schema(
@@ -760,6 +786,57 @@ mod tests {
         });
         let out = validate_tool_call(&schema, json!({ "a": [1, null], "b": [0, "7"] })).unwrap();
         assert_eq!(out, json!({ "a": [true, 0], "b": [false, 7] }));
+    }
+
+    /// PROV-016. `allOf` composition is a sequential merge (`validation.ts:189-193` @v0.83.0):
+    /// every nested schema's properties are coerced, not just the first. Red before the fix — the
+    /// `anyOf`/`oneOf` `or_else` never looked at `allOf` at all, so both values arrived uncoerced.
+    #[test]
+    fn all_of_coerces_every_branch() {
+        let schema = json!({
+            "allOf": [
+                { "type": "object", "properties": { "n": { "type": "integer" } } },
+                { "type": "object", "properties": { "b": { "type": "boolean" } } },
+            ],
+        });
+        let out = validate_tool_call(&schema, json!({ "n": "42", "b": "true" })).unwrap();
+        assert_eq!(out, json!({ "n": 42, "b": true }));
+    }
+
+    /// PROV-016, second half: `anyOf` and `oneOf` are INDEPENDENT passes (`:195-197`, `:199-201`),
+    /// not alternatives — a schema carrying both applies both. Red before the fix: `.or_else` took
+    /// `anyOf` and dropped `oneOf` on the floor.
+    #[test]
+    fn any_of_and_one_of_both_apply() {
+        let schema = json!({
+            "anyOf": [{ "type": "integer" }],
+            "oneOf": [{ "type": "string" }],
+        });
+        // `anyOf` coerces "5" → 5, then `oneOf` independently coerces 5 → "5".
+        assert_eq!(validate_tool_call(&schema, json!("5")).unwrap(), json!("5"));
+    }
+
+    /// PROV-046. Pi compares boolean strings exactly (`validation.ts:94-100` @v0.83.0), so `"True"`
+    /// is left unchanged and then rejected by the type check. Red before the fix: cyrup trimmed and
+    /// case-folded, so it EXECUTED a tool call pi refuses.
+    #[test]
+    fn boolean_string_coercion_is_exact() {
+        let schema = json!({ "type": "boolean" });
+        assert_eq!(validate_tool_call(&schema, json!("true")).unwrap(), json!(true));
+        assert_eq!(
+            validate_tool_call(&schema, json!("false")).unwrap(),
+            json!(false)
+        );
+        for rejected in ["True", " true ", "TRUE", "False"] {
+            assert!(
+                validate_tool_call(&schema, json!(rejected)).is_err(),
+                "{rejected:?} must be rejected, as pi rejects it"
+            );
+        }
+        // The number/null arms are unchanged (`validation.ts:102-109`).
+        assert_eq!(validate_tool_call(&schema, json!(1)).unwrap(), json!(true));
+        assert_eq!(validate_tool_call(&schema, json!(0)).unwrap(), json!(false));
+        assert_eq!(validate_tool_call(&schema, json!(null)).unwrap(), json!(false));
     }
 
     #[test]

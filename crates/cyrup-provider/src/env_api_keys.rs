@@ -35,8 +35,16 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
     match provider {
         // github-copilot uses an OAuth token carried in COPILOT_GITHUB_TOKEN (env-api-keys.ts:65).
         "github-copilot" => Some(&["COPILOT_GITHUB_TOKEN"]),
-        // ANTHROPIC_OAUTH_TOKEN takes precedence over ANTHROPIC_API_KEY (env-api-keys.ts:70).
-        "anthropic" => Some(&["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]),
+        // PROV-021. `if (provider === "anthropic") return [ANTHROPIC_AUTH_TOKEN_ENV,
+        // ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_API_KEY_ENV]` (env-api-keys.ts:73-76 @v0.83.0), with
+        // the inline carve-out comment that `ANTHROPIC_AUTH_TOKEN` "participates in env
+        // discovery/status, but getEnvApiKey() skips it because requests must pass it as
+        // Authorization: Bearer". The skip is implemented in [`get_env_api_key`].
+        "anthropic" => Some(&[
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]),
         "ant-ling" => Some(&["ANT_LING_API_KEY"]),
         "openai" => Some(&["OPENAI_API_KEY"]),
         "azure-openai-responses" => Some(&["AZURE_OPENAI_API_KEY"]),
@@ -104,9 +112,20 @@ pub async fn get_env_api_key(
     env: Option<&ProviderEnv>,
 ) -> Option<String> {
     if let Some(keys) = find_env_keys(provider, ctx, env).await
-        && let Some(first) = keys.first()
+        && keys.first().is_some()
     {
-        return get_provider_env_value(first, ctx, env).await;
+        // `const apiKeyEnv = provider === "anthropic" ? envKeys.find(key => key !==
+        // ANTHROPIC_AUTH_TOKEN_ENV) : envKeys[0]` (env-api-keys.ts:147 @v0.83.0) — PROV-021.
+        // `ANTHROPIC_AUTH_TOKEN` is discoverable (so auth STATUS reports it) but must never be
+        // turned into a literal api key, because it has to travel as `Authorization: Bearer`.
+        let api_key_env = if provider == "anthropic" {
+            keys.iter().find(|k| k.as_str() != "ANTHROPIC_AUTH_TOKEN")
+        } else {
+            keys.first()
+        };
+        if let Some(name) = api_key_env {
+            return get_provider_env_value(name, ctx, env).await;
+        }
     }
 
     // Vertex AI: explicit api key OR Application Default Credentials (env-api-keys.ts:144).

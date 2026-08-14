@@ -211,17 +211,33 @@ mod tests {
     /// [`crate::error::IntercomError::Io`] rather than hanging (`client.ts:171-176` rejects).
     #[tokio::test]
     async fn connect_surfaces_a_refused_tcp_endpoint_as_an_error() {
-        // Bind then immediately drop, so the port is (almost certainly) unbound but was real.
-        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // Bind then drop, so the port is unbound but was real. Dropping RETURNS that port to the
+        // ephemeral pool, and five other tests in this same binary bind `127.0.0.1:0`
+        // concurrently (`stream.rs:172`, `spawn.rs:428,471`, `client.rs:752`, and the sibling
+        // above), so one of them can legitimately claim it between the drop and the connect — at
+        // which point the connect SUCCEEDS and this test fails while the code under test is
+        // correct. That is what it did in a loaded workspace run. Re-draw a port instead of
+        // asserting the OS lost the race: the claim ("a closed TCP port surfaces as an error, it
+        // does not hang") is unchanged, and only a port that is refused on none of the attempts
+        // can fail it.
+        let mut last: Option<Result<BrokerStream>> = None;
+        for _ in 0..16 {
+            let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
 
-        let target = BrokerConnectTarget::Tcp(BrokerTcpEndpoint {
-            host: INTERCOM_TCP_HOST.to_string(),
-            port,
-            state_id: Some("s".to_string()),
-        });
-        assert!(BrokerStream::connect(&target).await.is_err());
+            let target = BrokerConnectTarget::Tcp(BrokerTcpEndpoint {
+                host: INTERCOM_TCP_HOST.to_string(),
+                port,
+                state_id: Some("s".to_string()),
+            });
+            let outcome = BrokerStream::connect(&target).await;
+            if outcome.is_err() {
+                return;
+            }
+            last = Some(outcome);
+        }
+        panic!("a just-released ephemeral port was re-bound on all 16 attempts: {:?}", last.map(|r| r.is_ok()));
     }
 
     /// The split halves are usable concurrently: a read pending on one half must not block a write

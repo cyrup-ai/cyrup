@@ -53,9 +53,16 @@ impl Tool for WriteTool {
     fn parameters(&self) -> &serde_json::Value {
         &self.params
     }
-    fn execution_mode(&self) -> cyrup_core::ExecMode {
-        cyrup_core::ExecMode::Sequential
-    }
+    // No `execution_mode` override (TOOL-006). Pi's `write` definition object is
+    // `write.ts:192-198` — `name`, `label`, `description`, `promptSnippet`, `promptGuidelines`,
+    // `parameters` — and declares no `executionMode`; `git grep -n executionMode` at v0.84.1 over
+    // `core/tools/` and `core/extensions/` hits only the plumbing
+    // (`tool-definition-wrapper.ts:16`/`:44`, `extensions/types.ts:477`), so no built-in sets it
+    // and every one of them inherits the parallel default. Upstream's ONLY serialization for the
+    // mutators is `withFileMutationQueue` (write.ts:208), which cyrup already provides per-file
+    // via [`FileMutationLocks`] in `execute` below. Declaring `Sequential` here made
+    // `cyrup-agent`'s `any_seq` (agent.rs:905-908) route the WHOLE batch — reads and greps
+    // included — through `execute_sequential`.
 
     // Verbatim from Pi (write.ts:189-192).
     fn description(&self) -> &str {
@@ -65,8 +72,8 @@ impl Tool for WriteTool {
     fn prompt_snippet(&self) -> Option<&str> {
         Some("Create or overwrite files")
     }
-    fn prompt_guidelines(&self) -> &[&str] {
-        &["Use write only for new files or complete rewrites."]
+    fn prompt_guidelines(&self) -> Vec<&str> {
+        vec!["Use write only for new files or complete rewrites."]
     }
 
     async fn execute(
@@ -87,6 +94,19 @@ impl Tool for WriteTool {
 
         let bytes = input.content.as_bytes();
         self.fs.write_in_place(&abs, bytes).await?;
+        // Pi brackets the write on BOTH sides: `throwIfAborted()` runs before `ops.writeFile`
+        // (write.ts:220) AND immediately after it (write.ts:224), before the success value is
+        // built — `throwIfAborted` itself is defined at write.ts:213-215 and throws
+        // `"Operation aborted"`. Present at the ported v0.83.0 too (`:219`). Without the second
+        // check a cancel landing during the write yields `Successfully wrote N bytes` here while
+        // pi reports an aborted tool error, so the transcript disagrees with the user's own
+        // cancellation. Pi does NOT undo the write — only the RESULT is reported as aborted — so
+        // this deliberately runs after `write_in_place` has already landed the bytes. The guard is
+        // still held, matching pi's "keep the queue locked until the current operation has
+        // settled" comment at write.ts:214-216.
+        if cancel.is_cancelled() {
+            return Err(error::aborted());
+        }
 
         // Pi reports `content.length` — JS string length = UTF-16 code units — not the UTF-8 byte
         // count, and uses the verb "Successfully wrote" (write.ts:222). Match both exactly.

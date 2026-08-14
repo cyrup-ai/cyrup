@@ -48,7 +48,7 @@ const CLARIFY_INPUT_PLACEHOLDER: &str = "Reply to the subagent";
 /// The synthetic sender id/name/model pi stamps on a locally-delivered subagent-result relay
 /// (`deliverLocalSubagentRelayMessage`'s `sender` argument, bound to `"subagent-result"` at the
 /// `SUBAGENT_RESULT_INTERCOM_EVENT` subscription, `index.ts:1042-1049` @v0.7.0). It is the string
-/// the attribution header renders (`**📨 From subagent-result** (cwd)`), so the model can tell a
+/// the attribution header renders (`**From subagent-result** (cwd)`), so the model can tell a
 /// relayed subagent result from a peer session's message and from a human turn.
 const LOCAL_RELAY_SENDER: &str = "subagent-result";
 
@@ -80,63 +80,18 @@ impl DeliveryChannel for IntercomDeliveryChannel {
         Box::pin(async move {
             // Format ONLY the allowlisted fields into the relay body (R-SA-124 preserved).
             let text = format_result_relay(&payload);
-            let Some(target) = self.supervisor_target.clone() else {
-                // Top-level orchestrator: no supervisor to relay to, so surface the result LOCALLY
-                // (`deliverLocalSubagentRelayMessage`, `index.ts:896-917` @v0.7.0) through the live
-                // `HostServices` bound via P-1. When no `HostServices` is bound (headless/degraded),
-                // degrade to `Ok(false)` so `cyrup-ext-subagents` keeps the full inline payload.
-                if self.state.host_services().is_none() {
-                    return Ok(false);
-                }
-                // ICOM-022 (third site): upstream does NOT hand this delivery a bare body. It builds a
-                // SYNTHETIC `SessionInfo` for the relay (`id`/`name`/`model` = `"subagent-result"`,
-                // `cwd` = the live session's cwd, `status` = `"result"`, `index.ts:900-909`) and hands
-                // the whole entry to the SAME `sendIncomingMessage` a peer message goes through
-                // (`index.ts:916`, with `delivery = "trigger"` and `forceTrigger = true`). That
-                // function is what stamps the attribution header, so a locally-delivered subagent
-                // result reaches the model as `**📨 From subagent-result** (<cwd>)\n\n<body>` — not as
-                // an unattributed string indistinguishable from a human turn.
-                //
-                // cyrup's port of `sendIncomingMessage` is `inbound::{surface_incoming_message,
-                // trigger_turn_over_inbound}` (pi's single `pi.sendMessage(display:true, triggerTurn)`
-                // splits into cyrup's durable `append_entry` surface + the model-facing
-                // `inject_message`), so this site calls THOSE rather than re-deriving the header —
-                // which also restores the `queueTurnContext` leg (`index.ts:657-659`) this site
-                // previously skipped, so a bare `intercom({action:"reply"})` in the triggered turn
-                // resolves against the entry that actually drove it.
-                //
-                // `forceTrigger = true` bypasses `shouldTriggerInboundMessage` upstream, so the
-                // trigger is unconditional here too (never `config.inbound_trigger`-gated).
-                let now = now_ms();
-                let from = SessionInfo {
-                    id: LOCAL_RELAY_SENDER.to_string(),
-                    name: Some(LOCAL_RELAY_SENDER.to_string()),
-                    cwd: self.state.cwd.display().to_string(),
-                    model: LOCAL_RELAY_SENDER.to_string(),
-                    pid: std::process::id().into(),
-                    started_at: now.into(),
-                    last_activity: now.into(),
-                    status: Some(LOCAL_RELAY_STATUS.to_string()),
-                    peer_uid: None,
-                    trusted_local: None,
-                    context_pct: None,
-                    context_tokens: None,
-                    context_window: None,
-                    extra: Default::default(),
-                };
-                let message = Message {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now.into(),
-                    reply_to: None,
-                    expects_reply: None,
-                    content: MessageContent { text, attachments: None, ..Default::default() },
-                    ..Default::default()
-                };
-                // Best-effort surface + trigger-turn: neither leg's failure changes "delivered
-                // locally" (a bound live session IS the local delivery target, pi's own semantics).
-                let _ = crate::inbound::surface_incoming_message(&self.state, &from, &message);
-                let _ = crate::inbound::trigger_turn_over_inbound(&self.state, &from, &message, true);
-                return Ok(true);
+            // `currentSessionTargetMatches(parsed.to)` (`v0.10.1 index.ts:1316`), the PRE-resolution
+            // check: a supervisor target that names this very session must take the local-delivery
+            // branch, not go out over the broker and come back as an inbound peer message with a
+            // synthetic sender. Reachable through a name collision between two same-named sessions
+            // (which the 8-char unnamed alias used to make routine) or a re-exec that inherited its
+            // own `CYRUP_SUBAGENT_ORCHESTRATOR_TARGET`.
+            let self_targeted = self
+                .supervisor_target
+                .as_deref()
+                .is_some_and(|t| self.state.current_session_target_matches(t, None));
+            let Some(target) = self.supervisor_target.clone().filter(|_| !self_targeted) else {
+                return deliver_local_relay(&self.state, text);
             };
             // pi's relay path uses `ensureConnected("background")` (`index.ts:1000`), so a relay that
             // lands while the connection is down reconnects instead of degrading forever; a failure
@@ -146,14 +101,85 @@ impl DeliveryChannel for IntercomDeliveryChannel {
             };
             let resolved = match self.state.resolve_target(&client, &target).await {
                 Ok(Some(id)) => id,
-                _ => target,
+                _ => target.clone(),
             };
+            // `currentSessionTargetMatches(parsed.to, target, activeClient)`
+            // (`v0.10.1 index.ts:1335`), the POST-resolution check: a name that resolved to this
+            // session's own broker id is still self-delivery. Neither check subsumes the other.
+            if self.state.current_session_target_matches(&target, Some(&resolved)) {
+                return deliver_local_relay(&self.state, text);
+            }
             match client.send(&resolved, SendOptions { text, ..Default::default() }).await {
                 Ok(result) => Ok(result.delivered),
                 Err(e) => Err(e.to_string()),
             }
         })
     }
+}
+
+/// `deliverLocalSubagentRelayMessage(sender, status, message)` (`v0.7.0 index.ts:896-917`,
+/// `v0.10.1 index.ts:1230-1252`) — the LOCAL delivery a relay takes when there is no supervisor to
+/// relay to, or when the supervisor target resolves to this very session
+/// ([`SharedIntercomState::current_session_target_matches`]).
+fn deliver_local_relay(state: &SharedIntercomState, text: String) -> Result<bool, String> {
+    // Top-level orchestrator: no supervisor to relay to, so surface the result LOCALLY
+    // (`deliverLocalSubagentRelayMessage`, `index.ts:896-917` @v0.7.0) through the live
+    // `HostServices` bound via P-1. When no `HostServices` is bound (headless/degraded),
+    // degrade to `Ok(false)` so `cyrup-ext-subagents` keeps the full inline payload.
+    if state.host_services().is_none() {
+        return Ok(false);
+    }
+    // ICOM-022 (third site): upstream does NOT hand this delivery a bare body. It builds a
+    // SYNTHETIC `SessionInfo` for the relay (`id`/`name`/`model` = `"subagent-result"`,
+    // `cwd` = the live session's cwd, `status` = `"result"`, `index.ts:900-909`) and hands
+    // the whole entry to the SAME `sendIncomingMessage` a peer message goes through
+    // (`index.ts:916`, with `delivery = "trigger"` and `forceTrigger = true`). That
+    // function is what stamps the attribution header, so a locally-delivered subagent
+    // result reaches the model as `**From subagent-result** (<cwd>)\n\n<body>` — not as
+    // an unattributed string indistinguishable from a human turn.
+    //
+    // cyrup's port of `sendIncomingMessage` is `inbound::{surface_incoming_message,
+    // trigger_turn_over_inbound}` (pi's single `pi.sendMessage(display:true, triggerTurn)`
+    // splits into cyrup's durable `append_entry` surface + the model-facing
+    // `inject_message`), so this site calls THOSE rather than re-deriving the header —
+    // which also restores the `queueTurnContext` leg (`index.ts:657-659`) this site
+    // previously skipped, so a bare `intercom({action:"reply"})` in the triggered turn
+    // resolves against the entry that actually drove it.
+    //
+    // `forceTrigger = true` bypasses `shouldTriggerInboundMessage` upstream, so the
+    // trigger is unconditional here too (never `config.inbound_trigger`-gated).
+    let now = now_ms();
+    let from = SessionInfo {
+        id: LOCAL_RELAY_SENDER.to_string(),
+        name: Some(LOCAL_RELAY_SENDER.to_string()),
+        // A synthetic relay sender is not an unnamed runtime: the name is chosen, not derived.
+        runtime_fallback_alias: None,
+        cwd: state.cwd.display().to_string(),
+        model: LOCAL_RELAY_SENDER.to_string(),
+        pid: std::process::id().into(),
+        started_at: now.into(),
+        last_activity: now.into(),
+        status: Some(LOCAL_RELAY_STATUS.to_string()),
+        peer_uid: None,
+        trusted_local: None,
+        context_pct: None,
+        context_tokens: None,
+        context_window: None,
+        extra: Default::default(),
+    };
+    let message = Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: now.into(),
+        reply_to: None,
+        expects_reply: None,
+        content: MessageContent { text, attachments: None, ..Default::default() },
+        ..Default::default()
+    };
+    // Best-effort surface + trigger-turn: neither leg's failure changes "delivered
+    // locally" (a bound live session IS the local delivery target, pi's own semantics).
+    let _ = crate::inbound::surface_incoming_message(state, &from, &message);
+    let _ = crate::inbound::trigger_turn_over_inbound(state, &from, &message, true);
+    Ok(true)
 }
 
 /// Broker-backed live-child steer channel (closes R-SA-086's follow-up delivery). Delivers an
@@ -190,8 +216,15 @@ impl SteerChannel for IntercomSteerChannel {
             // fall back to the raw target so the broker's own id/name/prefix resolution still runs.
             let resolved = match self.state.resolve_target(&client, &target).await {
                 Ok(Some(id)) => id,
-                _ => target,
+                _ => target.clone(),
             };
+            // Same `currentSessionTargetMatches` guard as the delivery channel
+            // (`v0.10.1 index.ts:1316`, `:1335`). Steering is the one seam that sends to an ARBITRARY
+            // resolved target, so a target that names or resolves to this session would loop a steer
+            // back into the very run it was meant to redirect.
+            if self.state.current_session_target_matches(&target, Some(&resolved)) {
+                return Ok(false);
+            }
             // Unsolicited send (no `reply_to`/`expects_reply`) — same call shape as
             // `IntercomDeliveryChannel::send`. `delivered` is pi's `delivered === true` signal: a
             // registered child took delivery.
@@ -247,10 +280,20 @@ impl ClarifyChannel for IntercomClarifyChannel {
                 .state
                 .host_services()
                 .ok_or_else(|| "no live host services (P-1 unbound): cannot surface the ask".to_string())?;
-            let client = self
-                .state
-                .client()
-                .ok_or_else(|| "intercom not connected: cannot route the human answer to the child".to_string())?;
+            // pi has NO bare `client` read on any send path — every one goes through
+            // `ensureConnected(...)` (`v0.7.0 index.ts:805,959,1000,1231,1477,1827,1864`), and the
+            // relay/clarify path specifically uses `"background"` (`:1000`). A bare read fails a
+            // clarify whose human answer becomes ready inside a reconnect backoff gap with a
+            // misleading "not connected", and the human's answer is lost from the child's
+            // perspective — even though the ladder is already armed and about to reconnect. Its two
+            // siblings in this file (`IntercomDeliveryChannel::send`, `IntercomSteerChannel::steer`)
+            // already do this.
+            let client =
+                crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Background)
+                    .await
+                    .map_err(|e| {
+                        format!("intercom not connected: cannot route the human answer to the child: {e}")
+                    })?;
 
             // C3 (reconciliation §1 / §4 step 6): acquire the ONE host-owned, session-scoped human-
             // interaction lock BEFORE surfacing the prompt, WAITING if the permission gate's `ask`
@@ -332,6 +375,7 @@ mod tests {
         let from = SessionInfo {
             id: "child-session".to_string(),
             name: Some("subagent-chat-1".to_string()),
+            runtime_fallback_alias: None,
             cwd: "/w".to_string(),
             model: "m".to_string(),
             pid: 1u32.into(),
@@ -375,6 +419,7 @@ mod tests {
         let from = SessionInfo {
             id: "child-session".to_string(),
             name: Some("subagent-chat-1".to_string()),
+            runtime_fallback_alias: None,
             cwd: "/w".to_string(),
             model: "m".to_string(),
             pid: 1u32.into(),
@@ -526,10 +571,13 @@ mod tests {
         let content = &injected[0].0;
         assert!(content.contains("the answer"), "the relay body carries the output: {content:?}");
         // THE ICOM-022 ASSERTION: the MODEL sees the attribution header, not a bare body.
+        // `**From ${senderDisplay}** (${entry.from.cwd})…` (`v0.10.1 index.ts:891`). The `📨` was
+        // dropped in v0.10.0 (`633e782`), and the `_{deliveryMetadata}_` line sits between the
+        // header and the body — so the header is asserted as the content's leading line.
         assert!(
-            content.starts_with("**📨 From subagent-result** (/w)\n\n"),
+            content.starts_with("**From subagent-result** (/w)\n\n_id "),
             "the injected content must carry pi's attribution header \
-             (`**📨 From {{sender}}** ({{cwd}})`, `index.ts:665`), not the bare relay body: \
+             (`**From {{sender}}** ({{cwd}})`, `v0.10.1 index.ts:891`), not the bare relay body: \
              {content:?}"
         );
         assert_eq!(
@@ -537,12 +585,17 @@ mod tests {
             Some("intercom_message"),
             "injected under the same custom type as the durable surface (pi `customType`)"
         );
+        // `display: true` (`v0.10.1 index.ts:894`). The local relay is not a special case: it hands
+        // its synthetic entry to the SAME `sendIncomingMessage` a peer message goes through
+        // (`v0.10.1 index.ts:1239`), and that function's `pi.sendMessage` literal sets
+        // `display: true` unconditionally. `HostServices::inject_message`'s `display` IS that flag
+        // (`cyrup-ext/src/host/services.rs:333-344`), so it is true here exactly as it is on the
+        // peer-message path, and the relay survives a transcript replay.
+        assert!(injected[0].2, "display=true, as on every `sendIncomingMessage` delivery");
         assert!(
-            !injected[0].2,
-            "display=false: the durable `append_entry` above IS the visible surface (this crate's \
-             established split of pi's single `sendMessage(display:true)`)"
+            injected[0].3,
+            "trigger_turn is true (pi's `forceTrigger = true`, `v0.10.1 index.ts:1239`)"
         );
-        assert!(injected[0].3, "trigger_turn is true (pi's `forceTrigger = true`, `index.ts:916`)");
     }
 
     /// ICOM-022 (third site), the second half of pi's `sendIncomingMessage` contract: a

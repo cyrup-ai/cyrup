@@ -21,11 +21,65 @@ use std::time::SystemTime;
 use cyrup_config::trust::{
     TrustInputs, TrustOption, TrustOutcome, TrustStore, decide_trust, has_trust_requiring_resources,
 };
+use cyrup_config::{ConfigDirs, Settings, SettingsManager};
 use cyrup_session_svc::{AppMode, DefaultProjectTrust, SessionInfo, TrustDecision, TrustEntry};
 use cyrup_tui::{
-    ListSelector, SelectKeymap, SelectorOutcome, SessionRow, SessionSelector,
-    SessionSelectorOutcome, TrustSelector, UiTheme, run_startup_selector,
+    ListSelector, SelectKeymap, SelectorOutcome, SessionKeymap, SessionRow, SessionSelector,
+    SessionSelectorOutcome, ThemeController, TrustSelector, UiTheme, run_startup_selector,
 };
+
+// ---------------------------------------------------------------------------------------------
+// Pre-launch settings-derived inputs — Pi `createStartupTui` (startup-ui.ts:77-85).
+// ---------------------------------------------------------------------------------------------
+
+/// The palette every pre-launch selector renders in — Pi `createStartupTui`'s
+/// `initTheme(resolveThemeSetting(settingsManager.getThemeSetting(), detectTerminalBackgroundFromEnv().theme) ?? terminalTheme)`
+/// (`packages/coding-agent/src/cli/startup-ui.ts:79-80` @v0.83.0, identical at v0.84.1).
+///
+/// The settings manager is Pi's own startup one: the file store with the **project scope
+/// untrusted** (`startup-ui.ts:65-67` — trust has not been resolved yet at this point), so a
+/// project `settings.json` cannot re-theme a folder before the user has trusted it.
+///
+/// SEAM-066. This is the boot half only; the live OSC-11 re-theme
+/// (`applyDetectedStartupTheme`, `startup-ui.ts:92-100`) belongs to whichever selector owns the
+/// terminal, and `ThemeController::boot_from_env` already folds in `COLORFGBG`.
+pub fn startup_theme(dirs: &ConfigDirs) -> UiTheme {
+    let mgr = SettingsManager::load(
+        crate::startup::file_settings_store(dirs),
+        Settings::new(),
+        false,
+    );
+    let setting = mgr.effective().theme_setting();
+    ThemeController::boot_from_env(setting.as_deref()).theme()
+}
+
+/// The user's `<agent_dir>/keybindings.json`, merged into the two keymaps the pre-launch selectors
+/// resolve their chords AND their hint labels from — Pi `createStartupTui`'s
+/// `setKeybindings(KeybindingsManager.create())` (`cli/startup-ui.ts:81` @v0.83.0, identical at
+/// v0.84.1), which installs the user's file globally for every startup selector, plus
+/// `cli/session-picker.ts:22-23,48`, which threads the same manager into the session component so
+/// `app.session.delete`/`rename`/`toggleSort`/`togglePath` resolve through it too
+/// (`session-selector.ts:532-582`).
+///
+/// A missing or malformed document leaves the defaults in place (Pi's manager likewise falls back
+/// rather than failing startup). SEAM-067.
+pub fn startup_keymaps(dirs: &ConfigDirs) -> (SelectKeymap, SessionKeymap) {
+    let mut select = SelectKeymap::default();
+    let mut session = SessionKeymap::default();
+    let path = dirs.agent_dir.join("keybindings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (select, session);
+    };
+    if let Err(e) = select.merge_json(&text) {
+        tracing::warn!(path = %path.display(), error = %e, "ignoring malformed keybindings.json");
+        return (SelectKeymap::default(), session);
+    }
+    if let Err(e) = session.merge_json(&text) {
+        tracing::warn!(path = %path.display(), error = %e, "ignoring malformed keybindings.json");
+        return (select, SessionKeymap::default());
+    }
+    (select, session)
+}
 
 // ---------------------------------------------------------------------------------------------
 // `--resume` picker (#1) — Pi `selectSession` (session-picker.ts:15-55).
@@ -114,29 +168,62 @@ pub fn interpret_resume(outcome: &SelectorOutcome) -> ResumeChoice {
 }
 
 /// Run the `--resume` picker over a real terminal (Pi `selectSession`): mount a [`SessionSelector`]
-/// built from `sessions`, drive it to a confirm/cancel, and return the choice. Delete `Apply`
-/// payloads remove the session file from disk (the selector already dropped the row); rename is a
-/// no-op pre-launch (the picker runs before the session services that own the header rewrite —
-/// renaming remains available from the in-app `/resume`). TTY-only; not unit-tested.
+/// built from `sessions`, drive it to a confirm/cancel, and return the choice plus the status lines
+/// the mutations produced. TTY-only; not unit-tested (the pure halves it composes are).
+///
+/// `keymaps` is the user's `keybindings.json` merge (Pi `setKeybindings(KeybindingsManager.create())`
+/// at `cli/startup-ui.ts:81` plus the manager threaded into the component at
+/// `cli/session-picker.ts:48`) — SEAM-067.
+///
+/// Mutations, both of which pi performs from this same screen:
+/// * **Delete** routes through [`cyrup_session_svc::delete_session_file_at`], i.e. `trash` first
+///   then `unlink` (`session-selector.ts:644-679`), and its outcome is REPORTED rather than
+///   discarded — pi renders `"Session moved to trash"` / `"Session deleted"` / `"Failed to delete:
+///   …"` (`:846`, `:849`). SEAM-063.
+/// * **Rename** is persisted by appending the `session_info` record to the target JSONL — the same
+///   sequence `AgentSession::rename_session_file` performs for the in-app `/resume`. It used to be
+///   parsed, echoed on screen and dropped. SEAM-062.
+///
+/// CYRUP-DELTA — where the status lines land. pi shows them INSIDE the picker
+/// (`header.setStatusMessage(...)` with a 2 s / 3 s dwell, `session-selector.ts:847`, `:851`);
+/// `cyrup_tui::SessionSelector` has no status channel, so they are returned here and printed by the
+/// caller after the alternate screen is torn down. The channel itself is area 07's file.
 pub fn run_resume_picker(
     theme: &UiTheme,
+    keymaps: &(SelectKeymap, SessionKeymap),
     sessions: &[SessionInfo],
     current_id: Option<&str>,
-) -> anyhow::Result<ResumeChoice> {
+) -> anyhow::Result<(ResumeChoice, Vec<String>)> {
     let rows = session_rows(sessions, current_id);
-    let mut selector = SessionSelector::new(rows);
-    let keymap = SelectKeymap::default();
-    let outcome = run_startup_selector(theme, &keymap, &mut selector, |payload| {
-        // The session selector emits delete/rename via a tagged `Apply` payload; effect the delete on
-        // disk so the picker stays consistent (Pi's `SessionSelectorComponent` deletes through the
-        // loader). Rename is deferred to the in-app `/resume` (no header-rewrite seam pre-launch).
-        if let Some(SessionSelectorOutcome::Delete(path)) =
-            SessionSelectorOutcome::parse_apply(payload)
-        {
-            let _ = std::fs::remove_file(&path);
+    let mut selector =
+        SessionSelector::new(rows).with_keymaps(&keymaps.1, &cyrup_tui::EditorKeymap::default());
+    let mut status: Vec<String> = Vec::new();
+    let outcome = run_startup_selector(theme, &keymaps.0, &mut selector, |payload| {
+        // The session selector emits delete/rename via a tagged `Apply` payload; effect it on disk so
+        // the picker's optimistic row edit is not a lie (Pi's `SessionSelectorComponent` performs
+        // both through its loaders, `session-selector.ts:831-855` and `:857-880`).
+        match SessionSelectorOutcome::parse_apply(payload) {
+            Some(SessionSelectorOutcome::Delete(path)) => {
+                match cyrup_session_svc::delete_session_file_at(std::path::Path::new(&path)) {
+                    Ok(method) => status.push(method.status_message().to_string()),
+                    // Pi: `Failed to delete: ${errorMessage}` (session-selector.ts:849).
+                    Err(e) => status.push(format!("Failed to delete: {e}")),
+                }
+            }
+            Some(SessionSelectorOutcome::Rename { path, name }) => {
+                if let Err(e) = cyrup_session_svc::rename_session_file_at(
+                    std::path::Path::new(&path),
+                    &name,
+                ) {
+                    status.push(format!("Failed to rename: {e}"));
+                }
+            }
+            // `Resume` is not an `Apply` payload (the picker confirms it as a `SelectorOutcome::
+            // Confirm`), and a non-session payload parses to `None` — neither is a mutation.
+            Some(SessionSelectorOutcome::Resume(_)) | None => {}
         }
     })?;
-    Ok(interpret_resume(&outcome))
+    Ok((interpret_resume(&outcome), status))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -169,9 +256,23 @@ pub fn trust_needs_prompt(
     outcome == TrustOutcome::NeedsPrompt
 }
 
-/// The `saved decision` header line for the trust prompt (Pi `formatSavedTrust`): `none`, or
-/// `trusted (<path>)` / `untrusted (<path>)`.
-pub fn format_saved_trust(saved: &Option<TrustEntry>) -> String {
+/// The `Saved decision:` header line for the trust prompt — a literal port of pi's `formatDecision`
+/// (`modes/interactive/components/trust-selector.ts:21-30` @v0.83.0, identical at v0.84.1):
+///
+/// ```text
+/// if (decision === null) return "none";
+/// const label = decision.decision ? "trusted" : "untrusted";
+/// if (trustPath !== undefined && decision.path !== trustPath) {
+///     return `${label} (inherited from ${decision.path})`;
+/// }
+/// return `${label} (${decision.path})`;
+/// ```
+///
+/// `trust_path` is pi's first argument, `this.trustOptions[0]?.savedPath` (`:61`) — the CURRENT
+/// folder's normalized trust path. `TrustStore::nearest` walks to ancestors, so a decision saved two
+/// levels up used to render identically to one made for this folder, on the one prompt whose job is
+/// to say which folder is being changed. SEAM-069.
+pub fn format_saved_trust(trust_path: Option<&std::path::Path>, saved: &Option<TrustEntry>) -> String {
     match saved {
         None => "none".to_string(),
         Some(entry) => {
@@ -180,7 +281,12 @@ pub fn format_saved_trust(saved: &Option<TrustEntry>) -> String {
             } else {
                 "untrusted"
             };
-            format!("{label} ({})", entry.path.display())
+            match trust_path {
+                Some(p) if p != entry.path.as_path() => {
+                    format!("{label} (inherited from {})", entry.path.display())
+                }
+                _ => format!("{label} ({})", entry.path.display()),
+            }
         }
     }
 }
@@ -267,6 +373,7 @@ fn persist_trust_choice(trust_store: &TrustStore, option: &TrustOption) -> anyho
 /// TTY-only; the persistence branch it runs is unit-tested through [`persist_trust_choice`].
 pub fn run_trust_prompt(
     theme: &UiTheme,
+    keymap: &SelectKeymap,
     cwd: &std::path::Path,
     options: &[TrustOption],
     saved: &Option<TrustEntry>,
@@ -279,15 +386,16 @@ pub fn run_trust_prompt(
     let selected = trust_selected_index(options, saved);
     let mut selector = TrustSelector::new(
         cwd.display().to_string(),
-        format_saved_trust(saved),
+        // pi passes `this.trustOptions[0]?.savedPath` (trust-selector.ts:61) — the current folder's
+        // own trust path, which is what makes an ANCESTOR decision render as "inherited from".
+        format_saved_trust(options.first().and_then(|o| o.saved_path.as_deref()), saved),
         false,
         labels,
         selected,
     )
     // S20: the ` ✓` on the option the trust store already holds (`trust-selector.ts:109-110`).
     .with_saved_index(trust_saved_index(options, saved));
-    let keymap = SelectKeymap::default();
-    let outcome = run_startup_selector(theme, &keymap, &mut selector, |_| {})?;
+    let outcome = run_startup_selector(theme, keymap, &mut selector, |_| {})?;
     match interpret_trust(&outcome, options) {
         TrustChoice::Chosen { index, trusted } => {
             if let Some(option) = options.get(index) {
@@ -337,6 +445,7 @@ pub fn interpret_missing_cwd(outcome: &SelectorOutcome) -> MissingCwdChoice {
 /// TTY-only; not unit-tested (the pure mapper [`interpret_missing_cwd`] is).
 pub fn run_missing_cwd_prompt(
     theme: &UiTheme,
+    keymap: &SelectKeymap,
     prompt_body: &str,
     fallback_cwd: &std::path::Path,
 ) -> anyhow::Result<MissingCwdChoice> {
@@ -359,8 +468,7 @@ pub fn run_missing_cwd_prompt(
         ("cancel".to_string(), "Cancel".to_string(), None),
     ];
     let mut selector = ListSelector::prompt(title, rows, 0);
-    let keymap = SelectKeymap::default();
-    let outcome = run_startup_selector(theme, &keymap, &mut selector, |_| {})?;
+    let outcome = run_startup_selector(theme, keymap, &mut selector, |_| {})?;
     Ok(interpret_missing_cwd(&outcome))
 }
 
@@ -516,17 +624,50 @@ mod tests {
 
     #[test]
     fn format_saved_trust_matches_pi() {
-        assert_eq!(format_saved_trust(&None), "none");
+        let here = PathBuf::from("/work");
+        assert_eq!(format_saved_trust(Some(&here), &None), "none");
         let entry = TrustEntry {
             path: PathBuf::from("/work"),
             decision: TrustDecision::Trusted,
         };
-        assert_eq!(format_saved_trust(&Some(entry)), "trusted (/work)");
+        assert_eq!(
+            format_saved_trust(Some(&here), &Some(entry)),
+            "trusted (/work)"
+        );
         let entry2 = TrustEntry {
             path: PathBuf::from("/work"),
             decision: TrustDecision::Untrusted,
         };
-        assert_eq!(format_saved_trust(&Some(entry2)), "untrusted (/work)");
+        assert_eq!(
+            format_saved_trust(Some(&here), &Some(entry2)),
+            "untrusted (/work)"
+        );
+    }
+
+    /// SEAM-069 — pi's `formatDecision` second branch: when the nearest decision's path is not the
+    /// CURRENT folder's trust path, the line says so (`trust-selector.ts:27-29`). Before this the
+    /// two cases were byte-identical, so an ancestor decision looked like one made here.
+    #[test]
+    fn format_saved_trust_marks_an_inherited_ancestor_decision() {
+        let here = PathBuf::from("/work/repo");
+        let ancestor = TrustEntry {
+            path: PathBuf::from("/work"),
+            decision: TrustDecision::Trusted,
+        };
+        assert_eq!(
+            format_saved_trust(Some(&here), &Some(ancestor)),
+            "trusted (inherited from /work)"
+        );
+        // pi's `trustPath !== undefined` guard: with no current-folder path there is nothing to
+        // compare against, so it falls through to the plain form (`:27`).
+        let ancestor2 = TrustEntry {
+            path: PathBuf::from("/work"),
+            decision: TrustDecision::Untrusted,
+        };
+        assert_eq!(
+            format_saved_trust(None, &Some(ancestor2)),
+            "untrusted (/work)"
+        );
     }
 
     #[test]
@@ -697,6 +838,19 @@ mod tests {
                 .unwrap()
                 .is_some_and(|e| e.decision.is_trusted()),
             "the seed must be a store the reader actually accepts"
+        );
+        // CFG-013: that probe is a READ, and pi reads under the trust lock too — `get()` routes
+        // through `getEntry`, which wraps its read in `withTrustFileLock`
+        // (trust-manager.ts:216-222), so cyrup's `nearest` takes `FileLock` and leaves the sidecar
+        // `trust.json.lock` behind (cyrup-config/src/lock.rs:13-38 — the sidecar is never unlinked
+        // so the lock inode survives the writer's `rename`). It is the READER that put it there,
+        // which is precisely why the baseline has to be re-snapshotted here: comparing the loop
+        // below against the pre-probe listing would blame the writer for the reader's lock file.
+        let before_entries = dir_entries(&agent_dir);
+        assert_eq!(
+            before_entries,
+            vec!["trust.json".to_string(), "trust.json.lock".to_string()],
+            "a locked read adds the sidecar lock and nothing else"
         );
         for &index in &session_only {
             persist_trust_choice(&store, &real[index]).unwrap();

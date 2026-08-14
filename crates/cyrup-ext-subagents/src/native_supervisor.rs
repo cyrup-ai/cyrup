@@ -1220,7 +1220,7 @@ impl Tool for SubagentSupervisorTool {
         }
     }
 
-    fn prompt_guidelines(&self) -> &[&str] {
+    fn prompt_guidelines(&self) -> Vec<&str> {
         const GUIDELINES: &[&str] = &[
             "When a subagent supervisor request appears, answer it with \
              `subagent_supervisor({ action: \"reply\", replyTo: \"<id>\", message: \"...\" })` — \
@@ -1231,7 +1231,7 @@ impl Tool for SubagentSupervisorTool {
              `intercom({ action: \"reply\", replyTo: \"<id>\", message: \"...\" })` — the child \
              is blocked until the reply lands.",
         ];
-        if self.alias { ALIAS_GUIDELINES } else { GUIDELINES }
+        if self.alias { ALIAS_GUIDELINES.to_vec() } else { GUIDELINES.to_vec() }
     }
 
     /// Sequential: a reply mutates the shared pending map and writes a file the blocked child is

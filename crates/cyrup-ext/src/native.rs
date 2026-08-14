@@ -216,12 +216,22 @@ impl HostCtx {
 /// The decomposed result of [`InitApi`]: the declared subscriptions, registered tools, registered
 /// `(name, descriptor)` commands, and the tool names / custom message types / custom ENTRY types
 /// this extension declared a renderer for (EXT-006, X15).
+// The tail six members are EXT-035 / EXT-018: shortcuts `(key, description)`, flags
+// `(name, spec)`, provider registrations `(id, config)`, per-command autocomplete opt-ins, the
+// count of stacked GLOBAL autocomplete providers, and the inter-extension bus topics this
+// extension listens on.
 pub(crate) type InitParts = (
     Subscriptions,
     Vec<Arc<dyn Tool>>,
     Vec<(String, CommandDescriptor)>,
     Vec<String>,
     Vec<String>,
+    Vec<String>,
+    Vec<(String, Option<String>)>,
+    Vec<(String, serde_json::Value)>,
+    Vec<(String, serde_json::Value)>,
+    Vec<String>,
+    u32,
     Vec<String>,
 );
 
@@ -235,6 +245,20 @@ pub struct InitApi {
     tool_renderers: Vec<String>,
     message_renderers: Vec<String>,
     entry_renderers: Vec<String>,
+    // --- EXT-035: the six surfaces `interface registration` offered and `InitApi` did not. pi has
+    // ONE extension kind and ONE api object (`extensions/loader.ts:274-410` @v0.83.0 builds a
+    // single `ExtensionAPI` carrying registerTool/registerCommand/registerShortcut/registerFlag/
+    // getFlag/registerProvider/unregisterProvider/registerMessageRenderer/registerEntryRenderer/
+    // addAutocompleteProvider/events and hands it to EVERY extension it loads), so there is no
+    // upstream notion of an extension that can register tools but not shortcuts, flags or
+    // providers. A native reached 5 of 11.
+    shortcuts: Vec<(String, Option<String>)>,
+    flags: Vec<(String, serde_json::Value)>,
+    providers: Vec<(String, serde_json::Value)>,
+    autocomplete: Vec<String>,
+    autocomplete_providers: u32,
+    /// EXT-018: bus topics, pi's `events` on the same one API object.
+    bus_topics: Vec<String>,
 }
 
 impl InitApi {
@@ -296,6 +320,49 @@ impl InitApi {
         self.entry_renderers.push(custom_type.into());
     }
 
+    /// Register a keyboard shortcut (EXT-035 / EXT-040; pi `registerShortcut(shortcut,
+    /// {description?, handler})`, `extensions/types.ts:1250` @v0.83.0, whose `ExtensionShortcut`
+    /// carries `{shortcut, description?, handler, extensionPath}` at `:1524-1529`). The host
+    /// invokes [`NativeExtension::execute_shortcut`] when the key fires. `description` is what
+    /// `/hotkeys` renders in the Action column — upstream's `const description =
+    /// shortcut.description ?? shortcut.extensionPath;`
+    /// (`modes/interactive/interactive-mode.ts:5856`).
+    pub fn register_shortcut(&mut self, key: impl Into<String>, description: Option<String>) {
+        self.shortcuts.push((key.into(), description));
+    }
+
+    /// Declare a CLI flag (EXT-035; pi `registerFlag`, `extensions/loader.ts:274-410` @v0.83.0).
+    /// `spec` is the flag's JSON spec; the resolved value is read back through
+    /// [`crate::ExtensionRegistry::flag`].
+    pub fn register_flag(&mut self, name: impl Into<String>, spec: serde_json::Value) {
+        self.flags.push((name.into(), spec));
+    }
+
+    /// Contribute a custom provider (EXT-035; pi `registerProvider`). `config` is the
+    /// [`crate::ProviderConfig`] shape as JSON, matching the guest's
+    /// `registration.register-provider` import so the two tiers register identically.
+    pub fn register_provider(&mut self, id: impl Into<String>, config: serde_json::Value) {
+        self.providers.push((id.into(), config));
+    }
+
+    /// Opt a registered command into argument autocomplete (EXT-035; the native analog of the
+    /// guest's `registration.add-autocomplete` import).
+    pub fn add_autocomplete(&mut self, command: impl Into<String>) {
+        self.autocomplete.push(command.into());
+    }
+
+    /// Stack one global autocomplete provider (EXT-035; pi `addAutocompleteProvider`,
+    /// `extensions/types.ts:218`).
+    pub fn add_autocomplete_provider(&mut self) {
+        self.autocomplete_providers += 1;
+    }
+
+    /// Listen on an inter-extension bus topic (EXT-018; pi `pi.events.on(channel, handler)`,
+    /// `core/event-bus.ts:18`). Deliveries arrive at [`NativeExtension::on_bus_event`].
+    pub fn subscribe_bus(&mut self, topic: impl Into<String>) {
+        self.bus_topics.push(topic.into());
+    }
+
     pub fn subscriptions(&self) -> Subscriptions {
         self.subs
     }
@@ -308,6 +375,12 @@ impl InitApi {
             self.tool_renderers,
             self.message_renderers,
             self.entry_renderers,
+            self.shortcuts,
+            self.flags,
+            self.providers,
+            self.autocomplete,
+            self.autocomplete_providers,
+            self.bus_topics,
         )
     }
 }
@@ -322,6 +395,33 @@ pub trait NativeExtension: Send + Sync {
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError>;
     /// Handle one event. Returns this extension's block/mutate/notify contribution.
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome;
+
+    /// Receive an inter-extension bus event this extension subscribed to (EXT-018).
+    ///
+    /// pi hangs ONE `createEventBus()` on the ONE `ExtensionAPI` object it builds for every
+    /// extension it loads — `events: eventBus,`
+    /// (`pi/packages/coding-agent/src/core/extensions/loader.ts:389` @v0.83.0, impl
+    /// `core/event-bus.ts:12-32`) — and upstream has a single extension kind, so "every extension
+    /// gets the bus" needs no qualification. cyrup's bus lived inside the `wasm-host` feature gate
+    /// and resolved subscribers out of the LIVE WASM map only, which meant the three extensions
+    /// cyrup actually ships (permission-system, intercom, subagents — all natives) had no
+    /// `pi.events` at all and had to re-invent cross-extension coordination out of band.
+    ///
+    /// Subscribe by declaring the topic through [`InitApi::subscribe_bus`] during
+    /// [`Self::init`]; the host then calls this with an EVENT-tier ctx (a bus listener is not a
+    /// command, so session-replacement ops stay refused, matching the tier every other handler
+    /// runs at). Default: ignore, so a built-in that does not use the bus needs no code.
+    ///
+    /// An `Err` is CONTAINED, logged, and surfaced on the `onError` channel (EXT-057) — it never
+    /// stops the rest of the fan-out, matching pi's per-listener `catch`.
+    async fn on_bus_event(
+        &self,
+        _topic: &str,
+        _payload: &serde_json::Value,
+        _ctx: &HostCtx,
+    ) -> Result<(), ExtError> {
+        Ok(())
+    }
 
     /// Opt in to the PRE-TRUST bootstrap pass, where `project_trust` is asked (EXT-003). Default
     /// `false`, and that default is load-bearing.

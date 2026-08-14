@@ -265,6 +265,37 @@ pub fn all_available_models(models_json: &ModelFile) -> Vec<cyrup_provider::Mode
     models.get_models(None)
 }
 
+/// The **auth-configured** subset of [`all_available_models`] — Pi `modelRuntime.getAvailable()`
+/// (`packages/ai/src/models.ts:394-405` @v0.83.0, `:522-538` @v0.84.1), whose interface comment is
+/// unambiguous (`models.ts:152-153`): *"Return models whose providers have complete auth
+/// configuration."*
+///
+/// ```text
+/// return checks.flatMap(({ provider, credential, auth }) => {
+///     if (!auth) return [];
+///     return provider.filterModels?.(models, credential) ?? models;
+/// });
+/// ```
+///
+/// This is what `--list-models` must enumerate (`cli/list-models.ts:35` @v0.83.0, `:39` @v0.84.1),
+/// and what makes its empty branch — pi's `formatNoModelsAvailableMessage()` at `list-models.ts:
+/// 37-40` — reachable on a fresh install. [`all_available_models`] is pi's `getModels()`, i.e. the
+/// whole compiled catalog, which is a different question. SEAM-020.
+///
+/// `has_configured_auth` is the same predicate [`default_launch_model`] already consumes (pi step 4's
+/// `hasConfiguredAuth`, `model-resolver.ts:633-648`), so the listing and the launch answer "which
+/// provider can I actually use?" identically. The per-provider `filterModels` narrowing has no cyrup
+/// counterpart yet and is a no-op here.
+pub fn available_models(
+    models_json: &ModelFile,
+    has_configured_auth: &dyn Fn(&cyrup_provider::Model) -> bool,
+) -> Vec<cyrup_provider::Model> {
+    all_available_models(models_json)
+        .into_iter()
+        .filter(|m| has_configured_auth(m))
+        .collect()
+}
+
 /// The one-shot composition report for `<agent_dir>/models.json`: the messages a caller should print
 /// once at startup (Pi's `ModelRuntime.compositionErrors` —
 /// `packages/coding-agent/src/core/model-runtime.ts:103` declares the map, `:220` fills it, and

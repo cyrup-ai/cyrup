@@ -86,6 +86,28 @@ impl Dispatcher {
     /// for BOTH dispositions — the skipped fail-open case and the blocking fail-closed one — so a
     /// gate that denied because it faulted is never invisible.
     fn report(&self, kind: EventKind, id: &cyrup_core::ExtensionId, err: &ExtError) {
+        // EXT-029. A run abort is NOT an extension fault. cyrup hands every handler a child of the
+        // run's cancel token (`self.hooks.before_tool_call(ctx, self.cancel.child())`,
+        // `cyrup-agent/src/agent.rs:1009`), so pressing Esc mid-dispatch surfaces
+        // `ExtError::Cancelled` out of a perfectly healthy extension. Reporting it drives
+        // `onError` and — since EXT-S03 wired that channel into the transcript — writes
+        // `Extension "<id>" error: cancelled` into the interactive UI, blaming the extension for
+        // the user's own abort.
+        //
+        // CYRUP-DELTA: pi has no counterpart to suppress. `emitToolCall`
+        // (pi/packages/coding-agent/src/core/extensions/runner.ts:932-953 @v0.83.0) takes no
+        // signal and has no cancellation race at all; the abort path returns
+        // `createErrorToolResult("Operation aborted")` before the block branch
+        // (packages/agent/src/agent-loop.ts:629-635). The cancellation is a cyrup-original
+        // mechanism, so the rule that keeps it invisible to `onError` is cyrup-original too.
+        if matches!(err, ExtError::Cancelled) {
+            tracing::debug!(
+                extension = %id,
+                event = kind.name(),
+                "extension call cancelled by run abort (not reported as an extension fault)"
+            );
+            return;
+        }
         let event = kind.name();
         let disposition = if kind.fails_closed() {
             "blocking the action"
@@ -101,6 +123,20 @@ impl Dispatcher {
         );
         let payload =
             ExtensionError { extension: id.clone(), event, error: err.to_string() };
+        if let Ok(g) = self.error_listeners.read() {
+            for l in g.iter() {
+                l(&payload);
+            }
+        }
+    }
+
+    /// Surface a fault that did NOT come from an event dispatch — today the inter-extension bus
+    /// (EXT-057). The bus has its own fan-out loop outside [`Self::dispatch_notify`] and friends,
+    /// so a trapping `bus-deliver` or a queue dropped at the round bound had no way onto the
+    /// `onError` channel `App::show_extension_error` drains. pi's bus surfaces its handler faults
+    /// too (`catch (err) { console.error(\`Event handler error (${channel}):\`, err); }`,
+    /// `core/event-bus.ts` @v0.83.0).
+    pub fn report_external(&self, payload: ExtensionError) {
         if let Ok(g) = self.error_listeners.read() {
             for l in g.iter() {
                 l(&payload);
@@ -151,11 +187,25 @@ impl Dispatcher {
 
     /// Notify-only dispatch (return ignored, R-08-009). Subscription-gated; awaited in load order.
     pub async fn dispatch_notify(&self, ev: &HostEvent, cancel: &CancelToken) {
+        self.dispatch_notify_excluding(ev, cancel, None).await
+    }
+
+    /// [`Self::dispatch_notify`] with one extension held out (EXT-052) — see
+    /// [`Self::dispatch_block_mutate_excluding`] for why exclusion exists at all.
+    pub async fn dispatch_notify_excluding(
+        &self,
+        ev: &HostEvent,
+        cancel: &CancelToken,
+        exclude: Option<&cyrup_core::ExtensionId>,
+    ) {
         let kind = ev.kind();
         if self.no_subscribers(kind) {
             return;
         }
         for ext in self.subscribers_for(kind) {
+            if exclude.is_some_and(|x| ext.id() == x) {
+                continue;
+            }
             // Fault-contained: an error is reported and skipped (R-08-036).
             if let Err(e) = self.invoke_contained(&ext, ev, cancel).await {
                 self.report(kind, ext.id(), &e);
@@ -217,16 +267,34 @@ impl Dispatcher {
 
     /// Subscription-gated, load-ordered block/mutate chaining (arch-08 §6.1). First `Block` wins;
     /// `[mutate]` patches fold into `ev` so the next handler observes the folded value (R-08-011).
-    pub async fn dispatch_block_mutate(
+    pub async fn dispatch_block_mutate(&self, ev: HostEvent, cancel: &CancelToken) -> Reduced {
+        self.dispatch_block_mutate_excluding(ev, cancel, None).await
+    }
+
+    /// [`Self::dispatch_block_mutate`] with one extension held out of the chain (EXT-052).
+    ///
+    /// CYRUP-DELTA: upstream never needs this. pi runs every subscribed handler because the whole
+    /// runner is one JS process, so a provider extension that also subscribes to
+    /// `before_provider_request` simply re-enters its own handler. cyrup's guest is suspended
+    /// inside its own single-instance wasmtime `Store` while its `provider-stream.on-payload`
+    /// import runs; re-entering that store would DEADLOCK on the store mutex rather than fail, so
+    /// the emitting guest is excluded. Every OTHER subscriber runs exactly as it does upstream —
+    /// which is the whole point of EXT-052, since the observers that matter are the other
+    /// extensions.
+    pub async fn dispatch_block_mutate_excluding(
         &self,
         mut ev: HostEvent,
         cancel: &CancelToken,
+        exclude: Option<&cyrup_core::ExtensionId>,
     ) -> Reduced {
         let kind = ev.kind();
         if self.no_subscribers(kind) {
             return Reduced::Pass(Box::new(ev));
         }
         for ext in self.subscribers_for(kind) {
+            if exclude.is_some_and(|x| ext.id() == x) {
+                continue;
+            }
             let outcome = match self.invoke_contained(&ext, &ev, cancel).await {
                 Ok(o) => o,
                 // A contained fault (returned error, guest trap/OOM, epoch or invocation-budget
@@ -248,8 +316,25 @@ impl Dispatcher {
                 Err(e) => {
                     self.report(kind, ext.id(), &e);
                     if kind.fails_closed() {
+                        // EXT-029. A run abort still BLOCKS (the gated action must not run — see
+                        // EXT-001; `fails_closed` is untouched) but carries NO reason, so nothing
+                        // synthesizes "Extension failed, blocking execution: cancelled" out of the
+                        // user's own Esc. `ExtHooks::before_tool_call` turns that reason-less block
+                        // into `Proceed` when the run token is already cancelled, at which point
+                        // `cyrup-agent`'s own re-check produces "Operation aborted" — pi's text
+                        // (packages/agent/src/agent-loop.ts:629-635).
+                        let reason = if matches!(e, ExtError::Cancelled) {
+                            None
+                        } else {
+                            Some(format!("Extension failed, blocking execution: {e}"))
+                        };
                         return Reduced::Blocked {
-                            reason: Some(format!("Extension failed, blocking execution: {e}")),
+                            reason,
+                            // A FAULT is not a terminate hint: pi's `terminate` can only come from
+                            // a handler that returned `{block: true, terminate: true}`
+                            // (types.ts:1072-1079 @v0.84.1), and a handler that trapped returned
+                            // nothing at all.
+                            terminate: false,
                             by: ext.id().clone(),
                         };
                     }
@@ -257,8 +342,8 @@ impl Dispatcher {
                 }
             };
             match outcome {
-                HookOutcome::Block { reason } => {
-                    return Reduced::Blocked { reason, by: ext.id().clone() }
+                HookOutcome::Block { reason, terminate } => {
+                    return Reduced::Blocked { reason, terminate, by: ext.id().clone() }
                 }
                 HookOutcome::Handled(HandledValue(v)) => {
                     return Reduced::Handled(HandledValue(v))

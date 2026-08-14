@@ -29,7 +29,7 @@ pub fn opencode_go_models() -> Vec<Model> {
 
 /// The OpenCode [`ProviderAuth`]: an API key from `$OPENCODE_API_KEY` (Pi `envApiKeyAuth`).
 pub fn opencode_go_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key([OPENCODE_API_KEY_ENV]))
+    ProviderAuth::with_api_key(env_key("OpenCode API key", [OPENCODE_API_KEY_ENV]))
 }
 
 /// Construct the OpenCode Go provider over the given credential store + shared api registry.

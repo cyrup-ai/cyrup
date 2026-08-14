@@ -156,12 +156,7 @@ impl ApiImpl for AnthropicMessagesApi {
             }
         };
 
-        let is_oauth = auth
-            .auth
-            .api_key
-            .as_deref()
-            .map(is_oauth_token)
-            .unwrap_or(false);
+        let is_oauth = resolve_is_oauth(model, auth);
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
         let body = crate::stream::apply_on_payload(
             opts,
@@ -436,6 +431,30 @@ fn is_oauth_token(api_key: &str) -> bool {
     api_key.contains("sk-ant-oat")
 }
 
+/// `model.provider === "github-copilot"` — the branch Pi tests FIRST inside `createClient`
+/// (anthropic-messages.ts:868). Copilot's 9 anthropic-messages rows are routed here, not through
+/// the `isOAuthToken` sniff, because a Copilot token (`tid=…;exp=…;proxy-ep=…`) contains no
+/// `sk-ant-oat` marker and would otherwise fall through to `x-api-key` — which Copilot's edge
+/// rejects (PROV-027).
+fn is_github_copilot(model: &Model) -> bool {
+    model.provider.as_str() == crate::api::github_copilot_headers::GITHUB_COPILOT_PROVIDER
+}
+
+/// The `isOAuthToken` value Pi's `createClient` RETURNS, which is what `buildParams` consumes
+/// (anthropic-messages.ts:536-546, consumed by `buildParams` at `:938`). The Copilot branch returns
+/// `false` unconditionally (`:887`), so Copilot never gets the Claude-Code tool-name normalization
+/// even if its token happened to contain the marker; only the second branch (`:891`) reports `true`.
+fn resolve_is_oauth(model: &Model, auth: &AuthResult) -> bool {
+    if is_github_copilot(model) {
+        return false;
+    }
+    auth.auth
+        .api_key
+        .as_deref()
+        .map(is_oauth_token)
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Request encoding
 // ---------------------------------------------------------------------------
@@ -505,7 +524,19 @@ pub(crate) fn build_headers(
         Some("true".to_string()),
     );
 
-    if is_oauth {
+    if is_github_copilot(model) {
+        // PROV-027 — Copilot: Bearer auth, SELECTIVE betas (Pi anthropic-messages.ts:867-888).
+        // `new Anthropic({ apiKey: null, authToken: apiKey })` sends `Authorization: Bearer …`,
+        // never `x-api-key`. Note what this branch deliberately does NOT send: the
+        // `claude-code-20250219`/`oauth-2025-04-20` betas, the `claude-cli` user-agent, `x-app`, and
+        // the session-affinity header — Copilot's edge is not Anthropic's.
+        if let Some(key) = &auth.auth.api_key {
+            headers.insert("authorization".to_string(), Some(format!("Bearer {key}")));
+        }
+        if !betas.is_empty() {
+            headers.insert("anthropic-beta".to_string(), Some(betas.join(",")));
+        }
+    } else if is_oauth {
         // OAuth: Bearer auth + Claude Code identity headers (Pi anthropic-messages.ts:855-872).
         if let Some(key) = &auth.auth.api_key {
             headers.insert("authorization".to_string(), Some(format!("Bearer {key}")));
@@ -553,6 +584,14 @@ pub(crate) fn build_headers(
             headers.insert(name.clone(), value.clone());
         }
     }
+    // PROV-028: the per-request Copilot headers, in Pi's merge slot — `mergeHeaders(defaults,
+    // model.headers, dynamicHeaders, optionsHeaders)` (anthropic-messages.ts:875-884; `model.headers`
+    // at `:881`, `dynamicHeaders` at `:882`), computed at `:525-531`. No-op for every other provider.
+    crate::api::github_copilot_headers::apply_copilot_dynamic_headers(
+        &mut headers,
+        model.provider.as_str(),
+        &ctx.messages,
+    );
     if let Some(overlay) = &opts.headers {
         for (name, value) in overlay {
             headers.insert(name.clone(), value.clone());
@@ -2343,6 +2382,124 @@ mod tests {
             !beta.contains(INTERLEAVED_THINKING_BETA),
             "explicit false suppresses the beta"
         );
+    }
+
+    /// PROV-027/PROV-028 — the Copilot branch of `createClient`
+    /// (anthropic-messages.ts:867-888) plus the dynamic Copilot headers computed at `:525-531`.
+    ///
+    /// A real Copilot token is a `tid=…;exp=…;proxy-ep=…` claim string with no `sk-ant-oat`
+    /// marker, so the `isOAuthToken` sniff cyrup used to key off cannot select Bearer for it: every
+    /// request on Copilot's 9 anthropic-messages rows went out as `x-api-key` and was rejected.
+    #[test]
+    fn copilot_uses_bearer_and_dynamic_headers_not_x_api_key() {
+        const COPILOT_TOKEN: &str =
+            "tid=abc123;exp=1789000000;proxy-ep=proxy.individual.githubcopilot.com;sku=copilot";
+
+        let mut m = model();
+        m.provider = "github-copilot".into();
+        m.headers = Some(std::collections::BTreeMap::from([(
+            "Editor-Version".to_string(),
+            Some("vscode/1.107.0".to_string()),
+        )]));
+        let auth = auth_with(Some(COPILOT_TOKEN));
+
+        // The sniff alone never selects Bearer for this token — that is the whole bug.
+        assert!(!is_oauth_token(COPILOT_TOKEN));
+        // …but the provider branch does, and it also keeps `isOAuthToken` false for `buildParams`
+        // (anthropic-messages.ts:887).
+        assert!(!resolve_is_oauth(&m, &auth));
+
+        let ctx = user_ctx("hi");
+        let headers = build_headers(&m, &ctx, &auth, &StreamOptions::default(), false);
+
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|v| v.clone())
+                .as_deref(),
+            Some(format!("Bearer {COPILOT_TOKEN}").as_str()),
+            "Copilot takes `authToken`, not `apiKey` (anthropic-messages.ts:870-871)"
+        );
+        assert!(
+            !headers.contains_key("x-api-key"),
+            "the api-key branch must not run for Copilot"
+        );
+        // Selective betas: none of the Claude-Code/OAuth identity is sent.
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.clone())
+            .unwrap_or_default();
+        assert!(!beta.contains("claude-code-20250219"), "got: {beta}");
+        assert!(!beta.contains("oauth-2025-04-20"), "got: {beta}");
+        assert!(!headers.contains_key("x-app"));
+
+        // PROV-028: the dynamic headers, on top of the static `model.headers` identity.
+        assert_eq!(
+            headers.get("X-Initiator").and_then(|v| v.clone()).as_deref(),
+            Some("user"),
+            "the last turn is a user turn (github-copilot-headers.ts:5-8)"
+        );
+        assert_eq!(
+            headers
+                .get("Openai-Intent")
+                .and_then(|v| v.clone())
+                .as_deref(),
+            Some("conversation-edits")
+        );
+        assert!(
+            !headers.contains_key("Copilot-Vision-Request"),
+            "no image in this turn"
+        );
+        assert_eq!(
+            headers
+                .get("Editor-Version")
+                .and_then(|v| v.clone())
+                .as_deref(),
+            Some("vscode/1.107.0"),
+            "the static model.headers identity still merges"
+        );
+
+        // An agent-loop follow-up (last turn is a toolResult carrying an image) flips both.
+        let mut agent_ctx = ctx.clone();
+        agent_ctx.messages.push(Message::ToolResult {
+            tool_call_id: cyrup_core::ToolCallId::from("call_1"),
+            tool_name: "screenshot".to_string(),
+            content: vec![Content::Image {
+                data: "aGk=".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: Vec::new(),
+            timestamp: 0,
+        });
+        let headers = build_headers(&m, &agent_ctx, &auth, &StreamOptions::default(), false);
+        assert_eq!(
+            headers.get("X-Initiator").and_then(|v| v.clone()).as_deref(),
+            Some("agent")
+        );
+        assert_eq!(
+            headers
+                .get("Copilot-Vision-Request")
+                .and_then(|v| v.clone())
+                .as_deref(),
+            Some("true")
+        );
+
+        // Non-Copilot anthropic providers are untouched by any of this.
+        let plain = build_headers(
+            &model(),
+            &ctx,
+            &auth_with(Some("sk-ant-api03-xxx")),
+            &StreamOptions::default(),
+            false,
+        );
+        assert_eq!(
+            plain.get("x-api-key").and_then(|v| v.clone()).as_deref(),
+            Some("sk-ant-api03-xxx")
+        );
+        assert!(!plain.contains_key("X-Initiator"));
     }
 
     #[test]

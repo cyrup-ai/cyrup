@@ -31,6 +31,12 @@ pub struct TreeNode {
     pub entry: Entry,
     pub children: Vec<TreeNode>,
     pub label: Option<String>,
+    /// Timestamp of the latest label change for this entry, if any — Pi
+    /// `SessionTreeNode.labelTimestamp` (`session-manager.ts:159-167`), the value the `/tree`
+    /// selector's `t` toggle renders beside the label. The manager has always held it
+    /// (`labels: id → (label, timestamp)`); `getTree` simply never handed it out, so the TUI's
+    /// timestamp column had no producer.
+    pub label_timestamp: Option<String>,
 }
 
 pub struct SessionManager {
@@ -99,17 +105,48 @@ impl SessionManager {
             // Missing/empty file → fresh session anchored here. The override (when given) seeds both
             // the header and the manager cwd, since there is no persisted header to preserve.
             let id = gen_session_id();
-            let cwd = cwd_override.map(Path::to_path_buf).unwrap_or_default();
+            // Pi: `const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined)
+            // ?? process.cwd();` (`session-manager.ts:1546`) — with no file there is no header, so
+            // the fallback is the PROCESS cwd. `PathBuf::default()` is the EMPTY path, and
+            // `newSession` writes it straight into the header (`:941`), producing `"cwd": ""` —
+            // a session `session_cwd_matches` can never match, so it silently vanishes from every
+            // cwd-filtered listing.
+            let cwd = cwd_override
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
             let header = SessionHeader::new(id, cwd.to_string_lossy(), now_ts());
-            let store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
-            return Ok(Self::assemble(header, cwd, store, Vec::new(), false));
+            let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
+            // The two branches differ upstream in exactly one respect. An EXISTING zero-length file
+            // is rewritten with the fresh header immediately and marked flushed
+            // (`session-manager.ts:907-911`: `this.newSession(); … this._rewriteFile();
+            // this.flushed = true;`), because the file is already there. A MISSING file takes the
+            // `else` branch (`:923-927`), which only calls `newSession()` — the write stays
+            // deferred to the first assistant message. Treating both as deferred made the
+            // zero-length case fail at that first flush: `create_exclusive` is pi's `"wx"` and
+            // errors `AlreadyExists` on a file that already exists.
+            let flushed = !missing;
+            if flushed {
+                store.rewrite(&header, &[])?;
+            }
+            return Ok(Self::assemble(header, cwd, store, Vec::new(), flushed));
         }
         let (mut header, mut entries, recovered) = load(path)?;
         let migrated = crate::migrate::to_current(&mut header, &mut entries);
-        // Pi `cwdOverride ?? header?.cwd` — the override wins; the persisted header is left intact.
+        // Pi `cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd()`
+        // (`session-manager.ts:1546`), then `this.cwd = resolvePath(cwd)` (`:876`). An EMPTY header
+        // cwd (written by an older cyrup — see the missing-file branch above) survives the `??`
+        // chain upstream because `""` is a string, but `resolvePath("")` is
+        // `nodeResolvePath(process.cwd(), "")` = the process cwd (`utils/paths.ts:81-85`), so pi
+        // never runs with an empty `this.cwd`. The persisted header is left intact either way.
         let cwd = cwd_override
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(&header.cwd));
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| {
+                Some(PathBuf::from(&header.cwd)).filter(|p| !p.as_os_str().is_empty())
+            })
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
         let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
         if migrated && !recovered {
             // Rewrite once at the current version (never silently discard a recovered prefix).
@@ -271,7 +308,7 @@ impl SessionManager {
                     id: gen_short_id(),
                     parent_id: prev.clone(),
                     timestamp: label_ts.clone(),
-                };
+ extra: Default::default() };
                 let lbl = Entry::known(KnownEntry::Label {
                     base,
                     target_id: target_id.clone(),
@@ -387,7 +424,7 @@ impl SessionManager {
     // ----------------------------------------------------------------- append (R-04-016) ------
 
     fn make_base(&self) -> EntryBase {
-        EntryBase { id: self.mint_id(), parent_id: self.leaf.clone(), timestamp: now_ts() }
+        EntryBase { id: self.mint_id(), parent_id: self.leaf.clone(), timestamp: now_ts(), extra: Default::default() }
     }
 
     fn mint_id(&self) -> EntryId {
@@ -580,6 +617,12 @@ impl SessionManager {
         self.labels.get(id).map(|(l, _)| l.as_str())
     }
 
+    /// Timestamp of the latest label change for `id` — Pi's `labelTimestampsById`
+    /// (`session-manager.ts:865`), surfaced on [`TreeNode::label_timestamp`].
+    pub fn label_timestamp(&self, id: &EntryId) -> Option<&str> {
+        self.labels.get(id).map(|(_, ts)| ts.as_str())
+    }
+
     /// Walk to root from `from` (default: the current leaf), returned root→leaf (R-04-010).
     pub fn branch_path(&self, from: Option<&EntryId>) -> Vec<&Entry> {
         let mut out = Vec::new();
@@ -618,7 +661,12 @@ impl SessionManager {
         let mut kids = self.children.get(id).cloned().unwrap_or_default();
         kids.sort_by_key(|k| self.entry(k).and_then(|e| e.base()).map(|b| b.timestamp.clone()));
         let children = kids.iter().filter_map(|k| self.build_node(k, visited)).collect();
-        Some(TreeNode { entry, children, label: self.label(id).map(str::to_string) })
+        Some(TreeNode {
+            entry,
+            children,
+            label: self.label(id).map(str::to_string),
+            label_timestamp: self.label_timestamp(id).map(str::to_string),
+        })
     }
 
     // ---------------------------------------------------------------- tree mutate (R-04-009) --
@@ -846,8 +894,23 @@ fn apply_label(
     }
 }
 
-/// Tolerant streaming load (R-04-034/032): header on line 1, entries after; a malformed or
-/// truncated trailing line is dropped (valid prefix kept), returning `recovered = true`.
+/// Tolerant streaming load (R-04-034/032): the header is the FIRST PARSED entry, not the first
+/// physical line; entries after; a malformed or truncated trailing line is dropped (valid prefix
+/// kept), returning `recovered = true`.
+///
+/// Pi's `parseSessionEntryLine` returns `null` for a blank line **and** for an unparseable one
+/// (`session-manager.ts:503-511`), and `loadEntriesFromFile` pushes only the parsed ones before
+/// validating `entries[0].type === "session"` (`:548-553`). So the header candidate is the first
+/// line that PARSES — a stray leading newline (a truncated write, an editor, a merge) or a garbage
+/// first line does not make the file unopenable. Testing `lineno == 0` off
+/// `reader.lines().enumerate()` did: the real header landed at `lineno == 1`, was parsed as an
+/// ordinary `Entry`, and `header` stayed `None` → `NotASession`.
+///
+/// `NotASession` for a non-empty file whose first parsed entry is NOT a session header is
+/// deliberately kept: Pi's `loadEntriesFromFile` returns `[]`, and `_setSessionFile` then throws
+/// `Session file is not a valid pi session: <path>` because `statSync(path).size > 0`
+/// (`session-manager.ts:900-906`). Only a MISSING or ZERO-LENGTH file is a soft new session, which
+/// [`SessionManager::open_with_cwd`] handles before reaching here.
 fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), SessionError> {
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
@@ -855,7 +918,7 @@ fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), SessionError> 
     let mut entries: Vec<Entry> = Vec::new();
     let mut recovered = false;
 
-    for (lineno, line) in reader.lines().enumerate() {
+    for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(_) => {
@@ -866,7 +929,13 @@ fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), SessionError> 
         if line.trim().is_empty() {
             continue;
         }
-        if lineno == 0 {
+        if header.is_none() {
+            // Pi skips an unparseable line and KEEPS SCANNING for the first parsed entry
+            // (`parseSessionEntryLine`'s `catch { return null }`, `session-manager.ts:507-510`).
+            if serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                recovered = true;
+                continue;
+            }
             match serde_json::from_str::<SessionHeader>(&line) {
                 Ok(h) if h.kind == "session" => header = Some(h),
                 _ => return Err(SessionError::NotASession { path: path.to_path_buf() }),

@@ -7,6 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# PERM-029 — the two shipped, non-Rust artifacts, declared so `cargo package` carries them exactly
+# as upstream declares them in `package.json:14-15` (`"config/config.example.json"`,
+# `"schemas/permissions.schema.json"`). Listing `include` at all means it is now the WHOLE manifest
+# of what ships, hence the explicit `src`/`Cargo.toml`/licence entries.
+include = [
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "Cargo.toml",
+    "schemas/cyrup-permissions.schema.json",
+    "config/config.example.json",
+]
 
 [lints]
 workspace = true

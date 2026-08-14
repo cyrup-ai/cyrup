@@ -51,12 +51,57 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Set this process's name — pi's `process.title` (`bun/cli.ts:5` and `src/cli.ts:12`
+/// `process.title = APP_NAME`; `rpc-entry.ts:6` `process.title = `${APP_NAME}-rpc``). SEAM-070.
+///
+/// The BASE title is already satisfied for cyrup by accident — a Rust binary's argv[0] is `cyrup`,
+/// where Node's is `node`, which is the whole reason pi needs the assignment at all. What was
+/// genuinely lost is the **role suffix**: pi advertises an RPC-mode process as `pi-rpc`, so an
+/// operator can `pkill pi-rpc` or spot a stuck RPC child in `ps` without touching an interactive
+/// session. In cyrup an rpc-mode process, a `__subagent-runner` child and an `__intercom-broker`
+/// child all appeared as plain `cyrup`.
+///
+/// This is a syscall against the CURRENT process, not a mutation of the shared environment, so the
+/// `std::env::set_var`-is-`unsafe` rationale that used to gate the whole identity block here does
+/// not cover it — that rationale applies only to the `PI_CODING_AGENT` half of the same pi
+/// statement, which is TOOL-031 / PARITY-GAPS PB-5 and is deliberately still not done here.
+///
+/// CYRUP-DELTA — reach. On Linux `prctl(PR_SET_NAME)` is what `ps -o comm=` reads, so the item's
+/// verification works verbatim. On macOS there is no supported way to change what `ps -o comm=`
+/// prints (it reports the executable path); `pthread_setname_np` is the closest equivalent and is
+/// what shows up in Activity Monitor, `ps -M` and a debugger. Best-effort on both: a failure is
+/// silent, exactly as a `process.title` assignment that the OS truncates is silent upstream.
+fn set_process_name(name: &str) {
+    let Ok(c_name) = std::ffi::CString::new(name) else {
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    // SAFETY: `prctl(PR_SET_NAME, ptr)` reads at most 16 bytes from `ptr`, which points at a live
+    // NUL-terminated `CString` owned by this frame, and mutates only this process's own name.
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, c_name.as_ptr());
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: the macOS `pthread_setname_np` takes only the name and applies it to the CALLING
+    // thread; `c_name` is a live NUL-terminated buffer owned by this frame.
+    unsafe {
+        libc::pthread_setname_np(c_name.as_ptr());
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = c_name;
+}
+
 async fn run() -> anyhow::Result<i32> {
-    // Process identity (Pi `cli.ts:12-13`: `process.title = APP_NAME` + `PI_CODING_AGENT=true`) is
-    // NOT replicated here: `process.title` has no std API, and `std::env::set_var` is `unsafe` under
-    // edition 2024 (the env is not thread-safe to mutate once the runtime has spawned threads). The
-    // bin is `unsafe`-free by policy, so this cosmetic identity marker is gated as a hard-language
-    // limit (residual ledger §cyrup #20) rather than introducing `unsafe`.
+    // Process identity, first half — pi `cli.ts:12` `process.title = APP_NAME` (SEAM-070). The
+    // rpc-mode suffix (pi's separate `rpc-entry.ts:6`) is applied once the mode is resolved, below.
+    //
+    // The SECOND half of pi's statement, `process.env.PI_CODING_AGENT = "true"` (`cli.ts:13`), is
+    // still NOT replicated: `std::env::set_var` is `unsafe` under edition 2024 because the env is
+    // not thread-safe to mutate once the runtime has spawned threads. That is a real hazard and a
+    // real gate; it never applied to the process NAME, which is a syscall on this process alone —
+    // conflating the two is how SEAM-070 stayed unfiled. The env half is TOOL-031 / PARITY-GAPS
+    // PB-5 (area 04).
+    set_process_name("cyrup");
 
     let mut timings = timings::Timings::new();
 
@@ -75,6 +120,9 @@ async fn run() -> anyhow::Result<i32> {
     // `subagent_runner_cmd::is_selected` expects the binary name at index 0, matching
     // `std::env::args()`'s own shape.
     if cyrup::subagent_runner_cmd::is_selected(&raw) {
+        // SEAM-070: a distinct role name so a stuck subagent child is identifiable in `ps`, the
+        // same reason pi gives its rpc child its own `process.title` (rpc-entry.ts:6).
+        set_process_name("cyrup-subagent");
         return Ok(cyrup::subagent_runner_cmd::dispatch(&raw).await);
     }
 
@@ -84,6 +132,9 @@ async fn run() -> anyhow::Result<i32> {
     // user-facing arg leniency/clap parsing, exactly like `__subagent-runner` above (the broker's own
     // `--config`-free argv must never reach the user-facing `Cli` surface).
     if cyrup::intercom_broker_cmd::is_selected(&raw) {
+        // SEAM-070: likewise for the detached broker — the process most likely to outlive its
+        // parent and need finding by name.
+        set_process_name("cyrup-broker");
         return Ok(cyrup::intercom_broker_cmd::dispatch().await);
     }
 
@@ -137,6 +188,14 @@ async fn run() -> anyhow::Result<i32> {
         return Ok(1);
     }
 
+    // `--version` (Pi main.ts:573-576): `console.log(VERSION); process.exit(0);` — a BARE semver,
+    // no program name — and, decisively, AFTER the diagnostics gate above, so `cyrup -x --version`
+    // reports `Unknown option: -x` and exits 1 exactly as pi does. SEAM-052.
+    if cli.version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
+
     // `--tui-mode fullscreen` parses (pi args.ts:180-192 @v0.84.1) and is then declined HERE, at
     // startup, falling back to `regular` — ADR-0005 §Decision A.2, which also fixes this wording and
     // makes a grep for it the tripwire that the interim was cleaned up when work unit B-13 lands the
@@ -164,6 +223,13 @@ async fn run() -> anyhow::Result<i32> {
     let stdin_tty = io::stdin().is_terminal();
     let stdout_tty = io::stdout().is_terminal();
     let mode = resolve_app_mode(&cli, stdin_tty, stdout_tty);
+    // pi gives its RPC host its OWN entry point with its own title — `process.title =
+    // `${APP_NAME}-rpc`` (rpc-entry.ts:6) — so an rpc child is distinguishable from an interactive
+    // session in `ps`. cyrup has one entry point, so the suffix is applied here, at the first point
+    // the resolved mode is known. SEAM-070.
+    if mode == AppMode::Rpc {
+        set_process_name("cyrup-rpc");
+    }
 
     // Stdout takeover (Pi main.ts:535-537): for a non-interactive run that is not a plain-metadata
     // command, install the guard so every *incidental* stdout write between here and the protocol
@@ -318,11 +384,28 @@ async fn run() -> anyhow::Result<i32> {
     // listing run therefore shows the cache and issues no request.
     cyrup::provider::restore_model_catalog(&dirs).await;
 
-    // `--list-models` enumerates the FULL multi-provider registry (Pi `modelRegistry.getAvailable()`,
+    // `--list-models` enumerates the multi-provider registry (Pi `modelRuntime.getAvailable()`,
     // list-models.ts:35) — independent of `--provider`/`--model`, and resolved BEFORE provider
     // selection (so a `--provider <unknown>` does not gate the listing, matching Pi).
+    //
+    // SEAM-020: `getAvailable()`, not `getModels()`. Pi keeps only models whose provider has
+    // COMPLETE auth configuration (`packages/ai/src/models.ts:394-405` @v0.83.0), and prints
+    // `formatNoModelsAvailableMessage()` when that set is empty (`list-models.ts:37-40`). cyrup was
+    // calling `all_available_models` — the whole compiled catalog — so a fresh install saw hundreds
+    // of rows for providers it has no credential for and the guidance branch was unreachable.
     if let Some(search) = &cli.list_models {
-        return list_models(&cyrup::provider::all_available_models(&models_json), search);
+        let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));
+        let auth_models_json = models_json.clone();
+        // The same `hasConfiguredAuth` predicate the default-launch path uses (`main.rs`'s
+        // `default_launch_model` call below): a stored credential, a known provider env var, or a
+        // user-declared `models.json` block carrying its own `apiKey` (CFG-022).
+        let has_configured_auth = move |m: &cyrup_provider::Model| {
+            cyrup_config::provider_is_configured(&auth, &auth_models_json, &m.provider, None)
+        };
+        return list_models(
+            &cyrup::provider::available_models(&models_json, &has_configured_auth),
+            search,
+        );
     }
     let mut provider = select_provider(
         cli.provider.as_deref(),
@@ -481,6 +564,12 @@ async fn run() -> anyhow::Result<i32> {
         let mut factory_builder = SessionFactory::new(provider, config)
             .settings_store(settings_store.clone())
             .auth(auth_store.clone())
+            // SEAM-065: trust is resolved INSIDE the build, in pi's tier order, so the extension
+            // `project_trust` hook runs BEFORE the human is asked (project-trust.ts:54-70 vs
+            // :90-94). The prompt callback is supplied for the interactive host only — pi's
+            // `hasUI` gate (:86-88).
+            .trust_store(trust_store_for(&dirs))
+            .trust_prompt(trust_prompt_callback(&dirs))
             .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
         // SubAgents opt-in gate (default OFF, mirrors the two sibling companions) composed with the T6
         // child-mode gate (Pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`): a plain
@@ -560,7 +649,12 @@ async fn run() -> anyhow::Result<i32> {
         // (pi `interactive-mode.ts:883-884`), and the first turn attempted without a model answers
         // with `formatNoModelSelectedMessage()` (pi `agent-session.ts:1178-1180`) instead of
         // killing the process. The rpc and print/json arms carry pi's `:852-855` stop.
-        let runtime = AgentSessionRuntime::create(factory, target)
+        // SEAM-033 — `create_unannounced` is pi's `createAgentSessionRuntime`
+        // (agent-session-runtime.ts:414-432), which never emits `session_start`; the HOST announces.
+        // `--name` (pi main.ts:650) and the scoped `--models` (pi main.ts:742-750) are applied in
+        // the window this opens, so an extension's `session_start` handler observes the configured
+        // session rather than an unnamed one on the pre-scope model.
+        let runtime = AgentSessionRuntime::create_unannounced(factory, target)
             .await
             .context("building agent session runtime")?;
         // Pi main.ts:843-848 — report the runtime's build diagnostics and exit 1 on any error
@@ -571,6 +665,10 @@ async fn run() -> anyhow::Result<i32> {
         }
         let session = runtime.session().await;
         apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
+        // SEAM-033 — announce NOW, after `--name`/`--models`, which is where pi's interactive host
+        // does it (its own `bindExtensions` inside `InteractiveMode`, the sibling of
+        // print-mode.ts:73 / rpc-mode.ts:319). Idempotent per session.
+        session.bind_extensions().await;
         // Migrated-credential notice (Pi `InteractiveMode` startup warning, interactive-mode.ts:797):
         // when `runMigrations` moved any provider credential into `auth.json`, name them.
         if !migration.migrated_auth_providers.is_empty() {
@@ -658,6 +756,11 @@ async fn run() -> anyhow::Result<i32> {
             let mut factory_builder = SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
                 .auth(auth_store.clone())
+                // SEAM-065: the SAVED-decision tier is not mode-gated upstream — pi's
+                // `resolveProjectTrusted` reads the store at project-trust.ts:72-75 for every host,
+                // and only the PROMPT is behind `hasUI` (:86-88). So the store is wired here too
+                // and the prompt deliberately is not.
+                .trust_store(trust_store_for(&dirs))
                 .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
             // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/
@@ -710,7 +813,11 @@ async fn run() -> anyhow::Result<i32> {
                 factory_builder = factory_builder.with_native_extension(ext);
             }
             let factory = Arc::new(factory_builder);
-            let runtime = match AgentSessionRuntime::create(factory, target).await {
+            // SEAM-033 — `create_unannounced` (pi's `createAgentSessionRuntime`, which never emits
+            // `session_start`, agent-session-runtime.ts:414-432), so `apply_post_build` below can
+            // apply `--name` (pi main.ts:650) and the scoped `--models` (pi main.ts:742-750) BEFORE
+            // the host announces. `run_rpc` announces at pi's own point, rpc-mode.ts:319.
+            let runtime = match AgentSessionRuntime::create_unannounced(factory, target).await {
                 Ok(r) => r,
                 Err(e) => {
                     return Err(anyhow::Error::new(e).context("building agent session runtime"));
@@ -762,6 +869,11 @@ async fn run() -> anyhow::Result<i32> {
             let mut factory_builder = SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
                 .auth(auth_store.clone())
+                // SEAM-065: the SAVED-decision tier is not mode-gated upstream — pi's
+                // `resolveProjectTrusted` reads the store at project-trust.ts:72-75 for every host,
+                // and only the PROMPT is behind `hasUI` (:86-88). So the store is wired here too
+                // and the prompt deliberately is not.
+                .trust_store(trust_store_for(&dirs))
                 .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
             // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/
@@ -1132,10 +1244,13 @@ fn resolve_session(
     // main.ts:575-580): a resumed session whose stored cwd is gone is offered a continuation against
     // the current cwd, or cancels to exit 0. The non-interactive arm already errored above.
     if let Some(issue) = resolution.missing_cwd {
-        let theme = UiTheme::default();
+        // SEAM-066/067: pi's `createStartupTui` resolves the theme AND installs the user's
+        // keybindings before mounting any pre-launch selector (startup-ui.ts:78-83).
+        let theme = cyrup::startup_theme(dirs);
+        let (select_keymap, _) = cyrup::startup_keymaps(dirs);
         let body =
             cyrup::format_missing_session_cwd_prompt(&issue.session_cwd, &issue.fallback_cwd);
-        return match cyrup::run_missing_cwd_prompt(&theme, &body, &issue.fallback_cwd)? {
+        return match cyrup::run_missing_cwd_prompt(&theme, &select_keymap, &body, &issue.fallback_cwd)? {
             cyrup::MissingCwdChoice::Continue => {
                 // Reopen the session against the chosen (fallback) cwd (Pi `SessionManager.open(
                 // sessionFile, sessionDir, selectedCwd)`, main.ts:578).
@@ -1177,14 +1292,26 @@ fn resolve_startup_ui(
     mode: AppMode,
     config: &mut SessionConfig,
 ) -> anyhow::Result<Option<i32>> {
-    let theme = UiTheme::default();
+    // SEAM-066/067 — pi's `createStartupTui` does four settings-derived things before mounting
+    // anything (startup-ui.ts:77-85); the two that reach these selectors are the resolved theme
+    // (`initTheme(resolveThemeSetting(...))`, :79-80) and the user's keybindings
+    // (`setKeybindings(KeybindingsManager.create())`, :81).
+    let theme = cyrup::startup_theme(dirs);
+    let keymaps = cyrup::startup_keymaps(dirs);
 
     // --resume (#1): mount the `SessionSelector` over the merged local+global session listing and
     // resume the chosen session (Pi `selectSession`, session-picker.ts:15-55). A bare `--resume`
     // mapped to `New` in `to_session_config`; the picker resolves the real target here.
     if cli.resume && matches!(config.target, SessionTarget::New) {
         let sessions = gather_session_infos(dirs);
-        match cyrup::run_resume_picker(&theme, &sessions, None)? {
+        let (choice, status) = cyrup::run_resume_picker(&theme, &keymaps, &sessions, None)?;
+        // Pi renders these inside the picker header with a 2 s / 3 s dwell
+        // (session-selector.ts:847,851); cyrup's selector has no status channel yet (area 07), so
+        // they are printed after the alternate screen is torn down rather than dropped. SEAM-063.
+        for line in &status {
+            eprintln!("{line}");
+        }
+        match choice {
             cyrup::ResumeChoice::Selected(path) => {
                 // Pi runs `getMissingSessionCwdIssue(sessionManager, cwd)` UNCONDITIONALLY after
                 // `createSessionManager` — which handles `--resume` by returning the opened manager
@@ -1200,7 +1327,7 @@ fn resolve_startup_ui(
                 if cyrup::session_cwd_is_missing(&stored_cwd) {
                     let body =
                         cyrup::format_missing_session_cwd_prompt(&stored_cwd, &dirs.cwd);
-                    match cyrup::run_missing_cwd_prompt(&theme, &body, &dirs.cwd)? {
+                    match cyrup::run_missing_cwd_prompt(&theme, &keymaps.0, &body, &dirs.cwd)? {
                         // Reopen the session against the current cwd (Pi `SessionManager.open(
                         // sessionFile, sessionDir, selectedCwd)`, main.ts:580).
                         cyrup::MissingCwdChoice::Continue => {
@@ -1224,45 +1351,64 @@ fn resolve_startup_ui(
         }
     }
 
-    // Project trust (#3): when the resolved trust decision needs a prompt (trust-requiring project
-    // resources, no `--approve`/`--no-approve`, no saved decision, default policy `prompt`), run the
-    // `TrustSelector` and feed the chosen decision in as this run's trust override (the builder honors
-    // an override directly, so no rebuild is needed). Cancelling proceeds untrusted (Pi `ui.select →
-    // undefined`). Pi `createProjectTrustContext` (project-trust.ts:7-62) / `resolveProjectTrusted`
-    // (main.ts:610-734).
-    if config.trust_override.is_none() {
-        let trust_store = cyrup_config::trust::TrustStore::new(dirs.agent_dir.join("trust.json"));
-        let saved = trust_store.nearest(&dirs.cwd).ok().flatten();
-        let default_trust = default_project_trust(dirs);
-        let has_resources =
-            cyrup::has_trust_requiring_project_resources(&dirs.cwd, &dirs.agent_dir);
-        if cyrup::trust_needs_prompt(
-            has_resources,
-            None,
-            saved.as_ref().map(|e| e.decision),
-            default_trust,
-            mode,
-        ) {
-            // `includeSessionOnly: true` — pi's PRE-LAUNCH prompt
-            // (`selectProjectTrustOption`, project-trust.ts:32) is the one call site that asks for
-            // the two session-only rows, so an answer here can decline to record a verdict at all
-            // (their `updates` are empty, so `set_many` writes nothing). SEAM-064. pi's IN-APP
-            // selector is the other call site and genuinely passes the default `false`
-            // (trust-selector.ts:44) — do not "fix" that one to match.
-            let options = cyrup_config::trust::trust_options(&dirs.cwd, true);
-            if let Some(trusted) =
-                cyrup::run_trust_prompt(&theme, &dirs.cwd, &options, &saved, &trust_store)?
-            {
-                config.trust_override = Some(trusted);
-            }
-        }
-    }
+    // Project trust is NOT resolved here — SEAM-065. pi reaches its prompt from *inside*
+    // `createAgentSessionServices`' `resolveProjectTrust` callback (`main.ts:687-706` @v0.83.0), so
+    // by then `extensionsResult` exists and `resolveProjectTrusted` can run its tiers in pi's order:
+    // `trustOverride` (project-trust.ts:47) → no-trust-requiring-resources (`:50`) →
+    // **`emitProjectTrustEvent`** (`:54-70`) → the store (`:72-75`) → the default policy (`:77-84`)
+    // → `hasUI` (`:86-88`) → `selectProjectTrustOption` (`:90-94`). Resolving it out here inverted
+    // that: an answered prompt became a `trust_override`, which short-circuited the builder's
+    // `pre_trust_extension_verdict` and killed the `on-project-trust` hook on the one path it
+    // matters. The prompt is now the builder's `trust_prompt` callback (`SessionFactory::
+    // trust_prompt`, wired in `run` for the interactive host only), invoked only on
+    // `TrustOutcome::NeedsPrompt`.
+    let _ = mode;
 
     Ok(None)
 }
 
+/// The bin's half of pi's `resolveProjectTrust` callback (`main.ts:687-706` @v0.83.0): render the
+/// pre-launch `TrustSelector` and persist the chosen option, for the builder to invoke *after* the
+/// extension `project_trust` verdict and the trust store have had their say. SEAM-065.
+///
+/// pi supplies this callback only where it has a UI (`hasUI`, project-trust.ts:86-88), which is what
+/// the interactive-only wiring in [`run`] reproduces; every other host leaves it unset and the
+/// builder falls through to untrusted, exactly as pi's `if (!hasUI) return false;` does.
+fn trust_prompt_callback(dirs: &ConfigDirs) -> cyrup_session_svc::TrustPromptFn {
+    let cwd = dirs.cwd.clone();
+    let store = trust_store_for(dirs);
+    // SEAM-066/067: the same two settings-derived inputs every other pre-launch selector takes.
+    let theme = cyrup::startup_theme(dirs);
+    let (keymap, _) = cyrup::startup_keymaps(dirs);
+    Arc::new(move |options, saved| {
+        match cyrup::run_trust_prompt(&theme, &keymap, &cwd, options, saved, &store) {
+            Ok(choice) => choice,
+            Err(e) => {
+                eprintln!("Error: project trust prompt failed: {e}");
+                None
+            }
+        }
+    })
+}
+
+/// The project-trust store the builder reads its saved-decision tier from and the prompt persists
+/// into (Pi `getProjectTrustStore()`, project-trust.ts:72/93). SEAM-065.
+fn trust_store_for(dirs: &ConfigDirs) -> Arc<cyrup_config::trust::TrustStore> {
+    Arc::new(cyrup_config::trust::TrustStore::new(
+        dirs.agent_dir.join("trust.json"),
+    ))
+}
+
 /// The global-only `defaultProjectTrust` policy (Pi `getDefaultProjectTrust`), read from the file
 /// settings store with the project scope untrusted (matching the startup settings manager).
+///
+/// Unused since SEAM-065 moved trust resolution INSIDE the build, where `SessionBuilder` reads the
+/// same policy off its own startup settings manager (`builder.rs`, step 1) — which is pi's own
+/// arrangement (`resolveProjectTrusted` reads `getDefaultProjectTrust()` at
+/// `core/project-trust.ts:77-84`, inside the callback). Kept because it is the bin's only
+/// expression of pi's "global scope, project untrusted" read and the next pre-launch consumer will
+/// want it verbatim.
+#[allow(dead_code)]
 fn default_project_trust(dirs: &ConfigDirs) -> DefaultProjectTrust {
     let mgr = SettingsManager::load(file_settings_store(dirs), Settings::new(), false);
     mgr.effective().default_project_trust()
@@ -1456,19 +1602,6 @@ fn format_token_count(count: u64) -> String {
     }
 }
 
-/// Token-based fuzzy membership (Pi `fuzzyFilter` over `"{provider} {id}"`, list-models.ts:45): each
-/// whitespace-separated token of `search` must be a case-insensitive subsequence of the haystack.
-fn fuzzy_match(haystack: &str, search: &str) -> bool {
-    let hay = haystack.to_ascii_lowercase();
-    search.split_whitespace().all(|token| {
-        let mut hay_chars = hay.chars();
-        token
-            .to_ascii_lowercase()
-            .chars()
-            .all(|c| hay_chars.any(|h| h == c))
-    })
-}
-
 /// `--list-models [search]` (Pi `listModels`, list-models.ts:29-110): print the provider catalog as
 /// an aligned `provider/model/context/max-out/thinking/images` table — token counts humanised, sorted
 /// by provider then id, fuzzy-filtered by `search` — with Pi's `No models matching "x"` empty message.
@@ -1480,19 +1613,22 @@ fn list_models(models: &[cyrup_provider::Model], search: &str) -> anyhow::Result
         return Ok(0);
     }
 
-    let mut filtered: Vec<&cyrup_provider::Model> = if search.is_empty() {
-        models.iter().collect()
-    } else {
-        models
-            .iter()
-            .filter(|m| {
-                fuzzy_match(
-                    &format!("{} {}", m.provider.as_str(), m.id.as_str()),
-                    search,
-                )
-            })
-            .collect()
-    };
+    // Pi: `fuzzyFilter(models, searchPattern, (m) => `${m.provider} ${m.id}`)` (list-models.ts:45
+    // @v0.83.0, `:49` @v0.84.1). SEAM-068 — this used to be a hand-rolled filter that split the
+    // query on WHITESPACE only, so `--list-models anthropic/sonnet` (the very `provider/model` form
+    // `--model` documents) matched nothing, and pi's alphanumeric-swap retry (`o4` → `4o`,
+    // `packages/tui/src/fuzzy.ts:75-92`) was absent. `cyrup_tui::fuzzy_filter` is the faithful port
+    // of `fuzzyFilter`: it splits on `/[\s/]+/` (`:104-107`), requires every token (`:120-128`),
+    // and stable-sorts ascending by score (`:135`).
+    let keys: Vec<String> = models
+        .iter()
+        .map(|m| format!("{} {}", m.provider.as_str(), m.id.as_str()))
+        .collect();
+    let mut filtered: Vec<&cyrup_provider::Model> =
+        cyrup_tui::fuzzy_filter(&keys, search, |k| k.as_str())
+            .into_iter()
+            .filter_map(|m| models.get(m.index))
+            .collect();
     if filtered.is_empty() {
         println!("No models matching \"{search}\"");
         return Ok(0);
@@ -1747,7 +1883,13 @@ async fn run_interactive(
     // Extension keyboard shortcuts (feature #10; Pi `registerShortcut`): source the registered
     // shortcut key-ids from the session's extension host so a matching press routes to the owning
     // live extension's `execute-shortcut` (refreshed after a session swap inside the run loop).
-    app.set_extension_shortcuts(session.services().ext_host.shortcut_keys());
+    //
+    // EXT-040 — `shortcut_specs()`, not `shortcut_keys()`. pi stores an `ExtensionShortcut
+    // {shortcut, description?, handler, extensionPath}` (`extensions/types.ts:1250`, stored at
+    // `:1524-1529` @v0.83.0) and `/hotkeys` renders the DESCRIPTION. `shortcut_keys()` is the bare
+    // `Vec<String>`, so the description an extension registered was dropped one call from the
+    // renderer and `/hotkeys` printed the key id as its own label.
+    app.set_extension_shortcuts(session.services().ext_host.shortcut_specs());
 
     // Theme hot-reload (feature #1; Pi `ThemeWatcher`, theme.ts watch path): when the active theme
     // resolves to an on-disk file, watch it so `/theme` edits repaint live. The watcher must outlive
@@ -2031,8 +2173,8 @@ fn init_tracing(verbose: bool) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        DiagnosticLevel, ScopedModel, SessionTarget, format_token_count, fuzzy_match,
-        is_fresh_target, pick_scoped_active_model, resolve_scoped_models, scope_diagnostics,
+        DiagnosticLevel, ScopedModel, SessionTarget, format_token_count, is_fresh_target,
+        pick_scoped_active_model, resolve_scoped_models, scope_diagnostics,
     };
 
     /// The `--models`/`enabledModels` scope must report Pi's diagnostics, not resolve in silence
@@ -2336,14 +2478,69 @@ mod tests {
         assert_eq!(format_token_count(8_192), "8.2K");
     }
 
+    /// SEAM-068 — `--list-models <search>` now runs pi's `fuzzyFilter` over `"{provider} {id}"`
+    /// (`cli/list-models.ts:45` @v0.83.0, `:49` @v0.84.1) via the faithful port in
+    /// `cyrup_tui::fuzzy`, replacing a hand-rolled predicate that split the query on WHITESPACE
+    /// only and had no swap retry.
+    ///
+    /// Both assertions were RED before the change, and both are the first thing a user types:
+    /// * `anthropic/sonnet` — the `provider/model` form `--model` itself documents (`cli.rs`'s help
+    ///   row). pi splits the query on `/[\s/]+/` (`packages/tui/src/fuzzy.ts:104-107`), so it is two
+    ///   tokens; the old filter treated it as ONE and the haystack `"anthropic claude-sonnet-4-5"`
+    ///   contains no `/`, so `cyrup --list-models anthropic/sonnet` printed
+    ///   `No models matching "anthropic/sonnet"` while `pi` listed the rows.
+    /// * `4o` — pi's alphanumeric-swap retry (`fuzzy.ts:71-89`: a query that is letters-then-digits
+    ///   or digits-then-letters is retried swapped, at a +5 penalty) reaches `o4-mini`; the old
+    ///   filter found nothing.
+    ///
+    /// What this must NOT assert is a shortlist. `fuzzyMatch` is a SUBSEQUENCE match
+    /// (`fuzzy.ts:29-56` — "all query characters appear in order, not necessarily consecutive"),
+    /// so a two-character query matches nearly every row and pi ranks rather than prunes; the row
+    /// the user meant simply has to come FIRST. `listModels` then re-sorts the survivors by
+    /// provider/id (list-models.ts:57-62), so the rank is invisible in the printed table and only
+    /// membership drives the `No models matching` branch.
     #[test]
-    fn fuzzy_match_is_token_subsequence() {
-        // Each whitespace token must be a case-insensitive subsequence of "provider id".
-        assert!(fuzzy_match("anthropic claude-opus", "ant opus"));
-        assert!(fuzzy_match("openai gpt-4o", "GPT"));
-        assert!(fuzzy_match("together moonshotai/Kimi-K2.6", "kimi"));
-        assert!(!fuzzy_match("openai gpt-4o", "claude"));
-        // Empty search trivially matches (handled by the caller, but the predicate is total).
-        assert!(fuzzy_match("anything", ""));
+    fn list_models_search_uses_pis_fuzzy_filter() {
+        let keys = [
+            "anthropic claude-sonnet-4-5".to_string(),
+            "openai gpt-4o".to_string(),
+            "openai o4-mini".to_string(),
+        ];
+        let hit = |q: &str| -> Vec<usize> {
+            cyrup_tui::fuzzy_filter(&keys, q, |k| k.as_str())
+                .into_iter()
+                .map(|m| m.index)
+                .collect()
+        };
+        assert_eq!(
+            hit("anthropic/sonnet"),
+            vec![0],
+            "the slash form must split into two tokens (fuzzy.ts:104-107)"
+        );
+
+        // `4o` matches all three, and the ORDER is the whole point: `gpt-4o` scores best because
+        // the two characters land consecutively on a word boundary, `o4-mini` only qualifies at all
+        // through the swap retry's +5, and `claude-sonnet-4-5` is the incidental subsequence
+        // ('o' of "anthropic" … '4' of "-4-5") that a 36-point gap penalty pushes to last.
+        assert_eq!(
+            hit("4o"),
+            vec![1, 2, 0],
+            "swap retry + score order (fuzzy.ts:29-89)"
+        );
+        // The retry ITSELF, isolated: `4o` cannot match `openai o4-mini` in order (the only `o`
+        // after the `4` would have to come from `-mini`), so the score it does get can only be the
+        // swapped query's score plus pi's flat +5 penalty (`fuzzy.ts:88`).
+        let swapped = cyrup_tui::fuzzy_score("openai o4-mini", "o4").expect("`o4` matches directly");
+        assert_eq!(
+            cyrup_tui::fuzzy_score("openai o4-mini", "4o"),
+            Some(swapped + 5.0),
+            "`4o` may only reach this row through the swap retry, at +5"
+        );
+
+        assert_eq!(hit("claude"), vec![0]);
+        assert!(hit("nothing-here").is_empty());
+        // An empty query keeps every row in input order (fuzzy.ts's empty-token early return),
+        // which is what `--list-models` with no search argument relies on.
+        assert_eq!(hit(""), vec![0, 1, 2]);
     }
 }

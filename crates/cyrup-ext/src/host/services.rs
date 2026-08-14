@@ -10,7 +10,7 @@ use crate::native::{CtxTier, ExtMode};
 use crate::registry::{CommandDescriptor, ExtensionRegistry};
 use cyrup_core::{CancelToken, ExtensionId};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -487,9 +487,38 @@ pub trait HostServices: Send + Sync {
     /// this to the live tree's `set_session_name`/`append_session_info`.
     fn set_session_name(&self, _name: &str) {}
 
-    /// Set (or replace) an entry's label (Pi `setLabel`, agent-session.ts:2276-2279). No-op by
-    /// default; the session service routes this to the live tree's `append_label`.
-    fn set_label(&self, _entry_id: &str, _label: &str) {}
+    /// Set OR CLEAR an entry's label (pi `setLabel(entryId: string, label: string | undefined)`,
+    /// `extensions/types.ts:1314` @v0.83.0, documented "Set or clear a label on an entry. Labels
+    /// are user-defined markers for bookmarking/navigation").
+    ///
+    /// EXT-046: `label` is `Option<&str>` because `None` must CLEAR. The clearing primitive already
+    /// existed one layer down (`append_label` takes `Option<&str>`); only these signatures blocked
+    /// it, and an empty string is not a substitute — it writes an EMPTY label, leaving a marker the
+    /// user cannot remove through the extension that created it. No-op by default; the session
+    /// service routes this to the live tree's `append_label`.
+    fn set_label(&self, _entry_id: &str, _label: Option<&str>) {}
+
+    /// The models scoped to this session (pi `ctx.scopedModels: readonly ScopedModel[]`,
+    /// `extensions/types.ts:326` @v0.83.0 — "Same set the `/scoped-models` command shows. Empty
+    /// when no scoping is configured"). A json array; `[]` by default (no session backend, so no
+    /// scoping to report). EXT-045.
+    fn scoped_models(&self) -> Value {
+        json!([])
+    }
+
+    /// Whether the RUN this handler is executing inside has been cancelled — the run-scoped analog
+    /// of the per-call `host-tool.is-cancelled` poll (EXT-045).
+    ///
+    /// pi exposes this as `signal: AbortSignal | undefined` on the base `ExtensionContext`
+    /// (`extensions/types.ts:334` @v0.83.0, "The current abort signal, or undefined when the agent
+    /// is not streaming"). CYRUP-DELTA: an `AbortSignal` is an event target and a component-model
+    /// value cannot be one, so the guest polls instead of being woken — see the `is-run-cancelled`
+    /// comment in `world.wit`. `false` by default: with no live run there is nothing to cancel,
+    /// which is upstream's `undefined` (a guest reading `signal?.aborted` gets `undefined`, not
+    /// `true`).
+    fn is_run_cancelled(&self) -> bool {
+        false
+    }
 
     /// The live session's currently-active tool names (Pi `getActiveToolNames`,
     /// agent-session.ts:813, which the guest's `getActiveTools` binds DIRECTLY to,
@@ -961,9 +990,12 @@ impl HostServices for RecordingServices {
             g.session_name = Some(name.to_string());
         }
     }
-    fn set_label(&self, entry_id: &str, label: &str) {
+    fn set_label(&self, entry_id: &str, label: Option<&str>) {
         if let Ok(mut g) = self.state.lock() {
-            g.labels.push((entry_id.to_string(), label.to_string()));
+            // EXT-046: a `None` clear is recorded as an EMPTY string so a test can tell "cleared"
+            // from "never touched" (the pair is absent) — the RecordingServices analog of
+            // `append_label(id, None)`.
+            g.labels.push((entry_id.to_string(), label.unwrap_or_default().to_string()));
         }
     }
 }
@@ -1057,67 +1089,36 @@ impl FsCaps {
     }
 }
 
-/// The host-owned inter-extension event bus (Pi `createEventBus()`, event-bus.ts:12-32): ONE shared
-/// instance per [`crate::ExtensionHost`], threaded into EVERY loaded guest's [`GuestState`] — NOT a
-/// per-guest object (the exact defect gap-08 §5.3 named: `bus.emit` used to land in a private
-/// per-guest `Vec` no other guest could read). A guest `bus.subscribe(topic)` records `(owner,
-/// topic)` here; a guest `bus.emit(topic, payload)` enqueues into `pending`. The host drains
-/// `pending` after the emitting guest call unwinds and invokes each subscribed guest's `bus-deliver`
-/// export ([`crate::ExtensionHost::deliver_bus_events`]). Deferred delivery mirrors Pi's EventEmitter
-/// (`emit` returns without awaiting its async listeners) and is REQUIRED: wasm single-instance
-/// reentrancy forbids re-entering the emitting guest synchronously inside its own `bus.emit` import.
-#[derive(Default)]
-pub struct SharedBus {
-    /// `(owner, topic)` subscriptions in registration/load order (Pi's per-channel listener list).
-    subs: Mutex<Vec<(ExtensionId, String)>>,
-    /// Emitted `(topic, payload)` awaiting fan-out, FIFO (Pi emits in call order).
-    pending: Mutex<VecDeque<(String, Value)>>,
-}
+/// The host-owned inter-extension event bus. MOVED to [`crate::bus`] (EXT-018): it used to live
+/// here, inside the `wasm-host` feature gate, which is why the three extensions cyrup ships — all
+/// natives — had no `pi.events` at all. Re-exported from this module so existing `crate::host::`
+/// paths keep working.
+pub use crate::bus::SharedBus;
 
-impl SharedBus {
-    pub fn new() -> Self {
-        Self::default()
-    }
 
-    /// Record that `owner` listens on `topic` (Pi `pi.events.on`, event-bus.ts:18). Idempotent per
-    /// `(owner, topic)` pair so a re-declared subscription does not duplicate delivery.
-    pub fn subscribe(&self, owner: ExtensionId, topic: String) {
-        if let Ok(mut g) = self.subs.lock()
-            && !g.iter().any(|(o, t)| *o == owner && *t == topic)
-        {
-            g.push((owner, topic));
-        }
-    }
-
-    /// Enqueue an emitted event for deferred fan-out (Pi `emitter.emit`, event-bus.ts:15).
-    pub fn emit(&self, topic: String, payload: Value) {
-        if let Ok(mut g) = self.pending.lock() {
-            g.push_back((topic, payload));
-        }
-    }
-
-    /// Drain every queued event (the host delivers them, then re-checks for cascaded emits).
-    pub fn take_pending(&self) -> Vec<(String, Value)> {
-        self.pending.lock().map(|mut g| g.drain(..).collect()).unwrap_or_default()
-    }
-
-    /// The extension ids subscribed to `topic`, in subscription order (Pi listener order).
-    pub fn subscribers_for(&self, topic: &str) -> Vec<ExtensionId> {
-        self.subs
-            .lock()
-            .map(|g| g.iter().filter(|(_, t)| t == topic).map(|(o, _)| o.clone()).collect())
-            .unwrap_or_default()
-    }
-
-    /// Drop all subscriptions + queued events (hot-reload, R-08-005): the fresh load re-declares them.
-    pub fn clear(&self) {
-        if let Ok(mut g) = self.subs.lock() {
-            g.clear();
-        }
-        if let Ok(mut g) = self.pending.lock() {
-            g.clear();
-        }
-    }
+/// The `before_provider_request` / `after_provider_response` reductions, reachable from inside a
+/// guest's `provider-stream` imports (EXT-052).
+///
+/// pi makes these a HARD contract on `ProviderConfig.streamSimple`
+/// (`extensions/types.ts:1452-1457` @v0.84.1): "Implementations must invoke `options.onPayload`
+/// before sending the provider request and use any returned replacement payload. They must invoke
+/// `options.onResponse` after receiving the response and before consuming its body, matching
+/// built-in providers." Without them every request an extension-supplied provider makes is
+/// invisible to every other extension — a redaction or audit extension silently stops working the
+/// moment the user switches to that provider.
+///
+/// CYRUP-DELTA: the reduction SKIPS the calling guest. Upstream runs every subscribed handler,
+/// including the provider extension's own, because it is all one JS process. Here the caller is
+/// suspended inside its own single-instance wasmtime `Store`; re-entering it would deadlock on the
+/// store mutex rather than fail. `from` is the calling extension, excluded for exactly that reason.
+#[async_trait::async_trait]
+pub trait ProviderReduction: Send + Sync {
+    /// Reduce the outbound payload through `before_provider_request`, excluding `from`. Returns
+    /// the replacement when a handler mutated it, `None` when nothing changed (pi's "use any
+    /// returned replacement payload").
+    async fn before_provider_request(&self, from: &ExtensionId, payload: Value) -> Option<Value>;
+    /// Dispatch `after_provider_response`, excluding `from`. Notify-only.
+    async fn after_provider_response(&self, from: &ExtensionId, status: u32, headers: Value);
 }
 
 /// Host-side state backing one loaded WASM extension's imports (arch-08 §3.5/§3.6). Shared (via
@@ -1135,6 +1136,15 @@ pub struct GuestState {
     /// manifest-less [`crate::ExtensionHost::load_wasm`]) behaves as it did before EXT-054 — every
     /// DISCOVERED extension is narrowed by its own `extension.json` instead.
     caps: Capabilities,
+    /// The host's project cwd, copied in as DATA at load time — pi `ctx.cwd`
+    /// (`extensions/types.ts:315` @v0.83.0), which sits on the BASE `ExtensionContext` beside
+    /// `mode` (:311) and `hasUI` (:313). Backs the `ctx-state.get-cwd` import (EXT-044). Defaults
+    /// to the process cwd for a standalone [`GuestState`], exactly as [`crate::HostConfig`] does.
+    cwd: PathBuf,
+    /// The provider-hook reduction the host installs at load time (EXT-052). `None` on a standalone
+    /// [`GuestState`] — then `provider-stream.on-payload` returns no replacement and `on-response`
+    /// is dropped, the same degradation every other unattached-backend capability takes.
+    provider_reduction: Option<Arc<dyn ProviderReduction>>,
     /// The host's run mode + dialog-capability, i.e. Pi's `ctx.mode` / `ctx.hasUI` base-context
     /// FIELDS (extensions/types.ts:311,313). Unlike the `ctx-state` values above these are not
     /// session state — they are fixed host configuration, so they are copied in from
@@ -1269,6 +1279,8 @@ impl GuestState {
             services,
             fs: FsCaps::default(),
             caps: Capabilities::host_granted(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            provider_reduction: None,
             mode: ExtMode::default(),
             has_ui: true,
             tier: Mutex::new(CtxTier::Command), // init runs at command tier (load time)
@@ -1362,10 +1374,34 @@ impl GuestState {
     /// `ctx.hasUI`, extensions/types.ts:311,313). Called by [`crate::ExtensionHost::load_wasm`]
     /// before `init`, so a guest reads the SAME pair the native built-ins get through `HostCtx`
     /// instead of the standalone default.
-    pub fn with_host_mode(mut self, mode: ExtMode, has_ui: bool) -> Self {
+    pub fn with_host_mode(mut self, mode: ExtMode, has_ui: bool, cwd: PathBuf) -> Self {
         self.mode = mode;
         self.has_ui = has_ui;
+        // EXT-044: `cwd` travels with the other two members of the same upstream sentence. It used
+        // to be dropped here, so `ctx-state` had no path-shaped verb at all and a guest could not
+        // resolve a single relative path — while cyrup's own native tier read it off `HostCtx.cwd`.
+        self.cwd = cwd;
         self
+    }
+
+    /// pi `ctx.cwd` (`extensions/types.ts:315` @v0.83.0): what the `ctx-state.get-cwd` import
+    /// answers (EXT-044).
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
+    /// Install the provider-hook reduction (EXT-052). Called by
+    /// [`crate::ExtensionHost::load_wasm_with_caps`] before `init`, so a guest provider's
+    /// `on-payload`/`on-response` reach the same `before_provider_request` /
+    /// `after_provider_response` reductions the built-in provider path uses.
+    pub fn with_provider_reduction(mut self, hooks: Arc<dyn ProviderReduction>) -> Self {
+        self.provider_reduction = Some(hooks);
+        self
+    }
+
+    /// The installed provider-hook reduction, if any (EXT-052).
+    pub fn provider_reduction(&self) -> Option<Arc<dyn ProviderReduction>> {
+        self.provider_reduction.clone()
     }
 
     /// The host's run mode (Pi `ctx.mode`, types.ts:311): what the `ctx-state.get-mode` import
@@ -1396,6 +1432,12 @@ impl GuestState {
     /// Record a `bus.subscribe(topic)` declaration into the shared bus (Pi `pi.events.on`).
     pub fn bus_subscribe(&self, topic: String) {
         self.bus.subscribe(self.owner.clone(), topic);
+    }
+
+    /// Drop this guest's subscription to `topic` (EXT-050; the unsubscribe closure pi's `on()`
+    /// returns, `core/event-bus.ts:18-27`, tracked by the loader since v0.84.1).
+    pub fn bus_unsubscribe(&self, topic: &str) {
+        self.bus.unsubscribe(&self.owner, topic);
     }
 
     /// Set the dispatch tier (the loader sets `Event` before dispatching an event handler, keeps

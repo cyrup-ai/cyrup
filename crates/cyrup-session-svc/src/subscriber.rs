@@ -123,7 +123,7 @@ impl SvcSubscriber {
 
 #[async_trait::async_trait]
 impl EventSubscriber for SvcSubscriber {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         let session = self.handle.get();
 
         // 0. `_handleAgentEvent` head (Pi agent-session.ts:514-535): on a USER `message_start`, reset

@@ -32,6 +32,9 @@ pub mod widget;
 #[cfg(target_arch = "wasm32")]
 pub mod guest;
 
+#[cfg(test)]
+mod tests;
+
 pub use api::{
     CommandExec, ContentBlock, ExtensionApi, MessageRenderer, Outcome, RawOutcome,
     RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, ShortcutExec,

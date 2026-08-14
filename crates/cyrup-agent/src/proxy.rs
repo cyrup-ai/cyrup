@@ -20,7 +20,7 @@ use cyrup_core::{
 use cyrup_provider::stream::{DoneReason, ErrorReason};
 use cyrup_provider::{
     build_client, open_sse, parse_streaming_json_object, CacheRetention, Context, HeaderMap,
-    SseRequest, StreamEvent, StreamOptions, ThinkingBudgets, Transport,
+    ProviderError, SseRequest, StreamEvent, StreamOptions, ThinkingBudgets, Transport,
 };
 use cyrup_core::{ModelThinkingLevel, SessionId, ThinkingLevel};
 use futures::StreamExt;
@@ -304,6 +304,14 @@ fn empty_partial(model: &ModelRef) -> AssistantMessage {
 #[derive(Clone, Default)]
 pub struct ProxyStreamOptions {
     pub temperature: Option<f32>,
+    /// AGENT-026 — arbitrary sampling parameters merged into the request body as-is, after the named
+    /// request fields, so keys here override them (e.g. `top_p`, `top_k`, `min_p`,
+    /// `repetition_penalty`); merged over `Model.samplingParams` per key. Pi
+    /// `SimpleStreamOptions.samplingParams` (`packages/ai/src/types.ts:183-189`), added to the
+    /// proxy's `ProxySerializableStreamOptions` Pick at `proxy.ts:59-71` and to
+    /// `buildProxyRequestOptions` at `:102-114` in v0.84.1 — the entire v0.83.0→v0.84.1 diff of that
+    /// file. Only OpenAI-compatible adapters apply it, so on the proxy path the server decides.
+    pub sampling_params: Option<Map<String, Value>>,
     pub max_tokens: Option<u64>,
     pub reasoning: Option<ThinkingLevel>,
     pub cache_retention: Option<CacheRetention>,
@@ -329,6 +337,10 @@ pub struct ProxyStreamOptions {
 struct ProxyRequestOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// AGENT-026 — `samplingParams` sits between `temperature` and `maxTokens` in pi's Pick and in
+    /// `buildProxyRequestOptions` (proxy.ts:59-71 / :102-114 @v0.84.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sampling_params: Option<Map<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -377,6 +389,7 @@ fn cache_retention_wire(r: CacheRetention) -> &'static str {
 fn build_proxy_request_options(options: &ProxyStreamOptions) -> ProxyRequestOptions {
     ProxyRequestOptions {
         temperature: options.temperature,
+        sampling_params: options.sampling_params.clone(),
         max_tokens: options.max_tokens,
         reasoning: options.reasoning,
         cache_retention: options.cache_retention.map(cache_retention_wire),
@@ -475,8 +488,14 @@ async fn run_proxy(
     .await
     {
         Ok(s) => s,
+        // AGENT-013 — this is pi's `if (!response.ok)` branch (proxy.ts:166-177 @v0.83.0): a non-2xx
+        // response becomes `ProviderError::Http { status, message }` here, and pi's two-tier message
+        // (`Proxy error: {status} {statusText}`, upgraded to `Proxy error: {errorData.error}` when
+        // the body parses) is what the transcript must show. Every other failure mode reaching this
+        // arm — connect failure, TLS, connect-time cancel — is one pi surfaces through its outer
+        // catch as the raw thrown message, which `proxy_error_message` passes through unchanged.
         Err(e) => {
-            let _ = tx.send(error_terminal(&builder, &cancel, e.to_string())).await;
+            let _ = tx.send(error_terminal(&builder, &cancel, proxy_error_message(&e))).await;
             return;
         }
     };
@@ -520,6 +539,88 @@ async fn run_proxy(
     }
     // Clean end: the `done`/`error` event already carried the terminal (proxy.ts:213). Dropping `tx`
     // ends the stream.
+}
+
+/// The canonical HTTP reason phrase for `status` — the Rust stand-in for `fetch`'s
+/// `response.statusText`, which undici fills from the same IANA registry. Unknown codes yield an
+/// empty phrase, exactly as `statusText` is `""` for a response with no reason phrase.
+fn status_text(status: u16) -> &'static str {
+    match status {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Entity",
+        424 => "Failed Dependency",
+        425 => "Too Early",
+        426 => "Upgrade Required",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        451 => "Unavailable For Legal Reasons",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        505 => "HTTP Version Not Supported",
+        507 => "Insufficient Storage",
+        508 => "Loop Detected",
+        511 => "Network Authentication Required",
+        _ => "",
+    }
+}
+
+/// AGENT-013 — pi's two-tier proxy failure text (`packages/agent/src/proxy.ts:167-175` @v0.83.0,
+/// `:169-177` @v0.84.1):
+///
+/// ```js
+/// let errorMessage = `Proxy error: ${response.status} ${response.statusText}`;
+/// try {
+///   const errorData = await response.json();
+///   if (errorData.error) { errorMessage = `Proxy error: ${errorData.error}`; }
+/// } catch { /* Couldn't parse error response */ }
+/// throw new Error(errorMessage);
+/// ```
+///
+/// cyrup's transport hands back `ProviderError::Http { status, message }` where `message` IS the
+/// (truncated) response body, so the upgrade is a parse of that body rather than a second read.
+/// `errorData.error` is checked for JS truthiness, so an empty string keeps the status tier. Every
+/// non-HTTP failure keeps the raw `Display` — pi reaches those through its outer `catch`, which
+/// surfaces the thrown value's own message.
+pub(crate) fn proxy_error_message(e: &ProviderError) -> String {
+    match e {
+        ProviderError::Http { status, message } => {
+            if let Ok(body) = serde_json::from_str::<Value>(message)
+                && let Some(err) = body.get("error").and_then(|v| v.as_str())
+                && !err.is_empty()
+            {
+                return format!("Proxy error: {err}");
+            }
+            format!("Proxy error: {} {}", status, status_text(*status))
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Build a terminal `error` event from the partial assembled so far (Pi sets
@@ -573,6 +674,12 @@ impl ProxyStreamFn {
     fn options_from(&self, opts: &StreamOptions) -> ProxyStreamOptions {
         ProxyStreamOptions {
             temperature: opts.temperature,
+            // AGENT-026 — `cyrup_provider::StreamOptions` has no `sampling_params` field yet (area
+            // 01 owns adding it, beside `metadata` at `stream.rs:188`, plus the merge over
+            // `Model.sampling_params` in the OpenAI-compatible adapters). Until it lands there is
+            // nothing to copy here; a caller that builds `ProxyStreamOptions` directly — the shape
+            // pi's own `streamProxy` example uses — can set it and it reaches the wire body.
+            sampling_params: None,
             max_tokens: opts.max_tokens,
             reasoning: model_thinking_to_unified(opts.reasoning),
             cache_retention: opts.cache_retention,

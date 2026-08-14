@@ -1385,6 +1385,42 @@ pub fn build_attempt_spawn_plan(
     // child then registers no `structured_output` tool at all.
     structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
 ) -> Result<AttemptSpawnPlan, SubagentError> {
+    build_attempt_spawn_plan_with_read_requirement(
+        agent,
+        model,
+        task_text,
+        opts,
+        depth,
+        temp_dir,
+        structured_runtime,
+        false,
+    )
+}
+
+/// SUBA-014 — [`build_attempt_spawn_plan`] plus pi's `requireReadTool` input.
+///
+/// pi's `resolvePiLaunchToolPlan` takes `requireReadTool?: boolean`
+/// (`pi-subagents/src/runs/shared/pi-args.ts:118,208` @v0.43.0) and every one of its seven live
+/// setters derives it from "did any skill actually resolve" — `Boolean(shared.resolvedSkillNames
+/// ?.length)` (`runs/foreground/execution.ts:322,357`), `Boolean(resolvedSkills.length)`
+/// (`runs/background/async-execution.ts:731,1324`), `Boolean(step.skills?.length)`
+/// (`runs/background/subagent-runner.ts:1328,1366`), `resolvedSkills.resolved.length > 0`
+/// (`api/preflight.ts:277`). The parameter is OPTIONAL upstream and falsy when omitted, which is
+/// exactly what the seven-argument [`build_attempt_spawn_plan`] forwards.
+pub fn build_attempt_spawn_plan_with_read_requirement(
+    agent: &AgentConfig,
+    model: &ModelId,
+    task_text: &str,
+    opts: &RunOptions,
+    depth: DepthEnvelope,
+    temp_dir: &std::path::Path,
+    structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
+    // SUBA-014 (pi `runs/shared/pi-args.ts:365-370` @v0.43.0): the run resolved at least one skill,
+    // so the child is about to be told (`discovery/skills.rs`'s proactive block) to "use the read
+    // tool to load a skill's file" and MUST therefore be granted `read` even when the agent pinned
+    // an explicit `tools:` list that omits it.
+    require_read_tool: bool,
+) -> Result<AttemptSpawnPlan, SubagentError> {
     let command = crate::spawn::resolve_spawn_command();
 
     // T4 (pi `applyThinkingSuffix`): the per-attempt model id, suffixed with the agent's frontmatter
@@ -1463,6 +1499,40 @@ pub fn build_attempt_spawn_plan(
     let explicit_tool_allowlist = agent.tools.is_some();
     if explicit_tool_allowlist {
         let mut allowlist = builtin_tools.clone();
+
+        // SUBA-014 / pi `runs/shared/pi-args.ts:361-371` @v0.43.0. Upstream's `declaredBuiltinTools`
+        // is
+        //
+        //   input.tools === undefined
+        //     ? (ceiling ? [...ceiling] : [])
+        //     : (requireReadTool && requestedBuiltinTools.length > 0
+        //         && !requestedBuiltinTools.includes("read") && !allowedToolSet
+        //         ? ["read", ...requestedBuiltinTools]
+        //         : requestedBuiltinTools).filter(...)
+        //
+        // i.e. `read` is injected at the HEAD of the declared builtins — never appended, never
+        // deduplicated away — under a three-way condition, and only on the `tools !== undefined`
+        // arm, which is exactly this `explicit_tool_allowlist` branch. `requestedBuiltinTools` is
+        // pi's `tools` minus the extension-path entries (`/`, `.ts`, `.js`), which cyrup already
+        // split out as `ToolRef::ExtensionPath`, so `builtin_tools` IS that list.
+        //
+        // The `!allowedToolSet` term is vacuously true here: cyrup has no capability ceiling
+        // (tracked as SUBA-021), so `allowedToolSet` is permanently `undefined` and pi's companion
+        // throw at `:355-359` ("Capability ceiling ... excludes required tool 'read' for lazy skill
+        // loading") has nothing to fire on. When the ceiling lands, that throw lands with it.
+        //
+        // Injecting into `allowlist` rather than `builtin_tools` keeps `fanout_authorized`
+        // (computed above from `builtin_tools`) untouched — correct, since upstream's
+        // `fanoutAuthorized` tests for `subagent`, which this injection can never introduce — while
+        // still reaching BOTH consumers that pi's `declaredBuiltinTools` reaches: the `--tools` CSV
+        // and `requiredChildTools` (`:401-409`).
+        if require_read_tool
+            && !builtin_tools.is_empty()
+            && !builtin_tools.iter().any(|tool| tool == "read")
+        {
+            allowlist.insert(0, "read".to_string());
+        }
+
         if !mcp_direct_tools.is_empty() {
             allowlist.extend(mcp_direct_tools::resolve_mcp_direct_tool_names(
                 &mcp_direct_tools,
@@ -1669,6 +1739,23 @@ pub fn build_attempt_spawn_plan(
     // Model-inherit sentinel (R-SA-041) never leaks a global default into the child's own
     // resolution beyond what `--model` above already pins explicitly for this attempt.
     env_overlay.insert("CYRUP_SUBAGENT_RUN".to_string(), "1".to_string());
+    // TOOL-031 / PARITY-GAPS PB-5, the re-exec half. pi sets the agent-identity markers on
+    // `process.env` in `cli.ts` BEFORE `main()` runs (`PI_CODING_AGENT = "true"` at `cli.ts:13`
+    // @v0.83.0; `AI_AGENT = "pi"` at `:14` @v0.84.1, mirrored in `rpc-entry.ts:7-8`), so they
+    // reach every descendant by inheritance — including a re-exec'd subagent child and everything
+    // IT spawns.
+    //
+    // cyrup's bin declines the process-global `std::env::set_var` (`unsafe` under edition 2024,
+    // rationale at `crates/cyrup/src/main.rs`), so each spawn site writes them per-child. Without
+    // this the marker chain broke at the FIRST re-exec: a subagent child ran with
+    // `PI_CODING_AGENT` unset, and so did every tool and MCP server it launched — the exact
+    // scripts-detect-an-agent contract the vars exist for, silently off for the whole subtree.
+    //
+    // Written unconditionally (never merely omitted) for the same reason as the fanout flag above:
+    // the overlay is applied over an INHERITED environment, so these must be asserted, not assumed.
+    env_overlay.insert("PI_CODING_AGENT".to_string(), "true".to_string());
+    // [CYRUP-DELTA, value only] `AI_AGENT` names WHICH agent is running (`"pi"` upstream).
+    env_overlay.insert("AI_AGENT".to_string(), "cyrup".to_string());
     // Permission input (1) (port doc §4 / pi `resolveAgentName`, `pi-permission-system/src/index.ts:2033-2047` @v0.7.1): thread the
     // resolved persona name to the child as [`AGENT_NAME_ENV_VAR`] so its permission companion's
     // `agent` + `projectAgent` policy layers enforce for the named persona. Only a non-empty name is
@@ -1983,6 +2070,11 @@ struct SpawnedChildAttemptRunner<'a> {
     /// read back; its two paths become the child's
     /// [`crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV`]/`..._CAPTURE_ENV` overlay.
     structured_runtime: Option<crate::exec::structured::StructuredOutputRuntime>,
+    /// SUBA-014: pi's `requireReadTool` (`runs/shared/pi-args.ts:118`), derived ONCE per run from
+    /// "did any skill actually resolve" — `Boolean(shared.resolvedSkillNames?.length)`
+    /// (`runs/foreground/execution.ts:322,357`). Stable across fallback attempts for the same
+    /// reason [`Self::skill_injection`] is: skill resolution never depends on the model.
+    require_read_tool: bool,
 }
 
 /// The richer per-attempt payload [`SpawnedChildAttemptRunner::run_attempt`] returns alongside its
@@ -2079,7 +2171,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         let child_depth =
             crate::spawn::depth::next_envelope(&self.agent.depth, self.agent.max_subagent_depth);
 
-        let plan = match build_attempt_spawn_plan(
+        let plan = match build_attempt_spawn_plan_with_read_requirement(
             self.agent,
             model,
             &task_text,
@@ -2087,6 +2179,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             child_depth,
             &self.scratch_dir,
             self.structured_runtime.as_ref(),
+            self.require_read_tool,
         ) {
             Ok(plan) => plan,
             Err(err) => {
@@ -3259,6 +3352,12 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         skill_injection,
         attempt_index: 0,
         structured_runtime: structured_runtime.clone(),
+        // SUBA-014 / pi `runs/foreground/execution.ts:322,357` @v0.43.0:
+        // `requireReadTool: Boolean(shared.resolvedSkillNames?.length)`. `resolved_skill_names` is
+        // `Some` exactly when at least one declared skill resolved to a `SKILL.md`, so `is_some()`
+        // IS `Boolean(...?.length)` — a declared-but-unresolvable skill grants nothing, matching
+        // upstream, which derives the flag from the RESOLVED list rather than the requested one.
+        require_read_tool: resolved_skill_names.is_some(),
     };
     let outcome = run_fallback_ladder(&candidates, &mut runner).await;
 
@@ -4634,6 +4733,129 @@ mod tests {
         );
     }
 
+    // ---- SUBA-014: `requireReadTool` head-injection (pi `runs/shared/pi-args.ts:361-371`) ----
+
+    /// The USER ACTION: an author ships an agent whose `tools:` list omits `read` and whose
+    /// `skills:` list names a skill that resolves. cyrup's own proactive-skill block then tells that
+    /// child *"Use the read tool to load a skill's file"* (`discovery/skills.rs`), so the child is
+    /// instructed to use a tool the allowlist denies it and the failure surfaces as a model apology.
+    ///
+    /// pi injects `read` at the HEAD of the declared builtins under a three-way condition
+    /// (`pi-args.ts:365-370` @v0.43.0: `requireReadTool && requestedBuiltinTools.length > 0 &&
+    /// !requestedBuiltinTools.includes("read") && !allowedToolSet`). This table pins all four arms
+    /// of that condition plus the head position.
+    #[test]
+    fn require_read_tool_injects_read_at_the_head_under_pis_three_way_condition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let opts = base_opts(dir.path(), &["m1"]);
+
+        // (declared tools, require_read_tool, expected `--tools` value or None for "no --tools")
+        let cases: &[(Option<&[&str]>, bool, Option<&str>)] = &[
+            // The defect: a skill resolved, `read` is absent, so it is injected at the head.
+            (Some(&["bash"]), true, Some("read,bash")),
+            // No skill resolved — the list is untouched.
+            (Some(&["bash"]), false, Some("bash")),
+            // Already contains `read` — no duplicate, and the author's ORDER is preserved (pi
+            // spreads `requestedBuiltinTools` verbatim on this arm).
+            (Some(&["bash", "read"]), true, Some("bash,read")),
+            // `requestedBuiltinTools.length > 0` fails: an explicitly EMPTY allowlist still means
+            // "no tools", so `--no-tools` survives the injection rather than becoming `--tools read`.
+            (Some(&[]), true, None),
+        ];
+
+        for (tools, require_read_tool, expected) in cases {
+            let mut agent = sample_agent_config("m1", &[]);
+            agent.tools = tools.map(|names| {
+                names
+                    .iter()
+                    .map(|name| ToolRef::Builtin((*name).to_string()))
+                    .collect()
+            });
+            let plan = build_attempt_spawn_plan_with_read_requirement(
+                &agent,
+                &ModelId::from("m1"),
+                "do the thing",
+                &opts,
+                depth,
+                dir.path(),
+                None,
+                *require_read_tool,
+            )
+            .expect("plan builds");
+            let argv = plan.spec.build_argv();
+
+            match expected {
+                Some(csv) => {
+                    let idx = argv
+                        .iter()
+                        .position(|a| a == "--tools")
+                        .unwrap_or_else(|| panic!("expected --tools for {tools:?}; argv {argv:?}"));
+                    assert_eq!(
+                        argv.get(idx + 1).map(String::as_str),
+                        Some(*csv),
+                        "tools={tools:?} require_read_tool={require_read_tool}"
+                    );
+                    // pi's `requiredChildTools` is the SAME post-injection list (`pi-args.ts:401-409`).
+                    let required = plan
+                        .spec
+                        .env_overlay
+                        .get(crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS)
+                        .expect("a non-empty allowlist writes REQUIRED_CHILD_TOOLS");
+                    assert!(
+                        required.contains("read") == csv.contains("read"),
+                        "REQUIRED_CHILD_TOOLS must carry the injected `read` too; was {required}"
+                    );
+                }
+                None => {
+                    assert!(
+                        argv.contains(&"--no-tools".to_string()),
+                        "an empty allowlist must stay --no-tools even with require_read_tool; argv {argv:?}"
+                    );
+                    assert!(
+                        !argv.iter().any(|a| a == "--tools"),
+                        "argv {argv:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// MIRROR: an agent that pinned NO allowlist at all (`tools:` absent) is on pi's
+    /// `input.tools === undefined` arm, where the injection does not exist — the child inherits the
+    /// ambient set, which already contains `read`, so neither flag may appear.
+    #[test]
+    fn require_read_tool_does_not_pin_an_allowlist_on_an_agent_that_declared_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let opts = base_opts(dir.path(), &["m1"]);
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.tools = None;
+
+        let plan = build_attempt_spawn_plan_with_read_requirement(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+            true,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(
+            !argv.iter().any(|a| a == "--no-tools" || a == "--tools"),
+            "argv {argv:?}"
+        );
+    }
+
     // ---- `memory:` scopes reach the child persona (pi `execution.ts:1058-1061`) ----
 
     /// The USER ACTION: an agent `.md` declares `memory: { scope: user, path: reviewer }`, the user
@@ -5526,6 +5748,40 @@ mod tests {
         assert!(!env.contains_key(crate::spawn::intercom_target::ENV_ORCHESTRATOR_TARGET));
         assert!(!env.contains_key(crate::spawn::intercom_target::ENV_INTERCOM_SESSION_NAME));
         assert!(!env.contains_key(crate::spawn::intercom_target::ENV_CHILD_AGENT));
+    }
+
+    /// TOOL-031 / PARITY-GAPS PB-5 — the agent-identity markers must survive the re-exec.
+    ///
+    /// pi sets them on `process.env` in `cli.ts` before `main()` (`PI_CODING_AGENT = "true"`,
+    /// `cli.ts:13` @v0.83.0; `AI_AGENT = "pi"`, `:14` @v0.84.1, mirrored in `rpc-entry.ts:7-8`), so
+    /// a re-exec'd subagent child inherits them and so does everything the child then spawns.
+    ///
+    /// RED before this pass: cyrup's bin declines the process-global `set_var`, and only the `bash`
+    /// TOOL pushed the pair per-child. The subagent spawn overlay pushed neither, so the marker
+    /// chain broke at the first re-exec and the whole child subtree ran with them unset.
+    ///
+    /// Asserted unconditionally (not "present when some option is set") because the overlay is
+    /// applied OVER an inherited environment: an omitted key silently keeps whatever the parent
+    /// happened to have.
+    #[test]
+    fn the_spawn_overlay_carries_the_agent_identity_markers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        let env = &plan.spec.env_overlay;
+        assert_eq!(
+            env.get("PI_CODING_AGENT").map(String::as_str),
+            Some("true"),
+            "`PI_CODING_AGENT = \"true\"` (pi `cli.ts:13`) must reach the re-exec'd child"
+        );
+        assert_eq!(
+            env.get("AI_AGENT").map(String::as_str),
+            Some("cyrup"),
+            "`AI_AGENT` (pi `cli.ts:14`) names WHICH agent is running; the key is pi's verbatim"
+        );
     }
 
     #[test]

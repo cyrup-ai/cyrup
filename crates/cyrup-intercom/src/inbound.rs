@@ -8,9 +8,9 @@
 //! [`surface_incoming_message`] → `HostServices::append_entry` (the port doc §4.2/§7.2 human surface,
 //! P-1 Route B), and (4) dispatches the inbound delivery policy ([`decide_inbound_policy`], pi
 //! `index.ts:745-765`), which branches FIRST on whether an agent run is in flight: an IDLE session
-//! is delivered an agent turn OVER the message ([`trigger_turn_over_inbound`]); a BUSY interactive
-//! session PARKS the message ([`queue_idle_message`]) for the debounced [`flush_idle_messages`] to
-//! deliver once the run ends; and only a BUSY non-interactive session sends the sender the
+//! is delivered an agent turn OVER the message; a BUSY interactive session has it STEERED straight
+//! onto the live run ([`send_incoming_message`] with [`InboundDelivery::Steer`], v0.9.3 `25ffb96`);
+//! and only a BUSY non-interactive session sends the sender the
 //! "running in non-interactive mode" busy auto-reply ([`auto_reply_non_interactive`]). This is the
 //! real production path the integration test drives with a scripted `HostServices` sink.
 
@@ -38,12 +38,6 @@ const INBOUND_MESSAGE_CUSTOM_TYPE: &str = "intercom_message";
 /// cannot surface the message to a human (pi's non-interactive busy reply, `index.ts:739-748`).
 const NON_INTERACTIVE_BUSY_NOTICE: &str =
     "This session is running in non-interactive mode and cannot respond to messages right now.";
-/// How long a queued idle message waits before the flush is attempted, so a burst of inbound
-/// messages coalesces into one delivery (pi `INBOUND_FLUSH_DELAY_MS`, `index.ts:18`).
-pub const INBOUND_FLUSH_DELAY_MS: u64 = 200;
-/// How long the flush backs off for when the session is STILL busy at flush time (pi
-/// `INBOUND_IDLE_RETRY_MS`, `index.ts:19`).
-pub const INBOUND_IDLE_RETRY_MS: u64 = 500;
 
 /// The inbound delivery policy decision (pi `handleIncomingMessage`, `index.ts:745-765`), computed
 /// AFTER the durable surface (`append_entry`) from whether an agent run is in flight (`is_idle`),
@@ -64,10 +58,18 @@ pub enum InboundPolicy {
     /// message is itself a reply (`reply_to.is_some()`); `== Never` -> always `false` (still
     /// delivered, just without driving a turn — pi's `{ deliverAs: "followUp" }`).
     Deliver { trigger: bool },
-    /// The session is BUSY and interactive (`!is_idle && has_ui`): park the message in
-    /// [`SharedIntercomState`]'s pending-idle queue and let the debounced flush deliver it when the
-    /// run finishes (pi `queueIdleMessage`, `index.ts:711-714`) — never steer onto a live run.
-    Queue,
+    /// The session is BUSY and interactive (`!is_idle && has_ui`): hand the message STRAIGHT to the
+    /// live run's steering queue — `sendIncomingMessage(entry, "steer")`
+    /// (`v0.10.1 index.ts:956`).
+    ///
+    /// v0.9.3 (`25ffb96`, "fix: steer busy inbound messages promptly") deleted the whole
+    /// park-until-idle machine — `pendingIdleMessages`, `queueIdleMessage`, `scheduleInboundFlush`,
+    /// `flushIdleMessages`, `clearInboundFlushTimer`, `expirePendingIdleMessages`,
+    /// `INBOUND_FLUSH_DELAY_MS` and `INBOUND_IDLE_RETRY_MS` — and replaced it with this one line.
+    /// CHANGELOG 0.9.3: "Hand busy interactive inbound messages directly to Pi's safe steering queue
+    /// instead of waiting for aggregate idle, preventing stale coordination from appearing hours
+    /// after it was received."
+    Steer,
     /// The session is BUSY and non-interactive (`!is_idle && !has_ui`) and the message is a fresh
     /// (non-reply) one: there is no human to involve and no turn to attach to, so send the sender the
     /// "running in non-interactive mode" busy auto-reply + `markReplied` (`index.ts:747-760`).
@@ -110,116 +112,107 @@ pub fn decide_inbound_policy(
                 InboundPolicy::SurfaceOnly
             };
         }
-        return InboundPolicy::Queue;
+        return InboundPolicy::Steer;
     }
     InboundPolicy::Deliver { trigger: should_trigger_inbound_message(inbound_trigger, message) }
 }
 
-/// One message parked in [`SharedIntercomState`]'s pending-idle queue (pi's `InboundMessageEntry` in
-/// `pendingIdleMessages`, `index.ts:711-714`) — the sender plus the message, everything
-/// [`send_incoming_message`] needs to re-derive the card at flush time.
-#[derive(Clone, Debug)]
-pub struct PendingInbound {
-    /// The sending session (pi `entry.from`).
-    pub from: SessionInfo,
-    /// The message that arrived while this session was busy (pi `entry.message`).
-    pub message: Message,
-}
-
-/// pi's two `sendIncomingMessage` delivery modes (`index.ts:652`).
+/// pi's two `sendIncomingMessage` delivery modes (`v0.10.1 index.ts:876`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InboundDelivery {
-    /// `"trigger"`: queue the turn context AND (when `shouldTriggerInboundMessage` allows) drive an
-    /// agent turn over the message.
+    /// `"trigger"`: the session is idle, so (when `shouldTriggerInboundMessage` allows) drive a
+    /// fresh agent turn OVER the message.
     Trigger,
-    /// `"followUp"`: deliver the message as a non-triggering follow-up entry only — pi's
-    /// `{ deliverAs: "followUp" }`, which also skips `queueTurnContext` (`index.ts:655-657`). Used
-    /// for every queued message after the first when a burst is flushed.
-    FollowUp,
+    /// `"steer"`: the session is busy and interactive, so hand the message to the live run's
+    /// steering queue. v0.9.3 replaced the old `"followUp"` mode with this one.
+    Steer,
 }
 
-/// Queue an inbound message until this session goes idle (pi `queueIdleMessage`, `index.ts:711-714`):
-/// park it and (re)arm the [`INBOUND_FLUSH_DELAY_MS`] debounce.
-pub fn queue_idle_message(state: &Arc<SharedIntercomState>, from: SessionInfo, message: Message) {
-    state.push_pending_inbound(PendingInbound { from, message });
-    schedule_inbound_flush(state, INBOUND_FLUSH_DELAY_MS);
-}
-
-/// Answer-and-forget an INBOUND ask, both halves (pi `dismissIncomingAsk`, `index.ts:455-459`):
+/// Answer-and-forget an INBOUND ask (pi `dismissIncomingAsk`, `v0.10.1 index.ts:529-531`):
 ///
 /// ```text
 /// function dismissIncomingAsk(messageId: string): void {
 ///   replyTracker.dismissPendingAsk(messageId);
-///   const queuedIndex = pendingIdleMessages.findIndex((entry) => entry.message.id === messageId);
-///   if (queuedIndex >= 0) pendingIdleMessages.splice(queuedIndex, 1);
 /// }
 /// ```
 ///
-/// The tracker half alone is NOT enough. An inbound message that arrives while this session is busy
-/// and interactive is recorded in the tracker, surfaced to the human, AND parked in the pending-idle
-/// queue ([`queue_idle_message`]) — so the running agent can see it and answer it with
-/// `intercom{reply}` / `intercom{send, replyTo}` before the run ends. Dismissing only the tracker
-/// leaves the entry in the queue, and [`flush_idle_messages`] replays the whole queue
-/// unconditionally once the session goes idle: the already-answered message is re-injected and
-/// drives a second turn over it.
+/// v0.9.2's second half — splicing the id out of `pendingIdleMessages` — went away with the queue
+/// itself at v0.9.3 (`25ffb96`). A busy interactive message is now steered onto the live run
+/// immediately, so there is nothing left holding a copy to re-inject.
 ///
 /// Every pi call site is a point where the inbound ask has just been ANSWERED or has become
-/// undeliverable: the busy non-interactive auto-reply (`index.ts:755`), a `send` carrying `replyTo`
-/// (`:1568`), and both `reply` outcomes — delivered (`:1718`) and `"Session not found"` (`:1711`).
+/// undeliverable: the busy non-interactive auto-reply (`v0.10.1 index.ts:975`), a `send` carrying
+/// an effective `replyTo` (`:2045`), and both `reply` outcomes — delivered (`:2226`) and
+/// `"Session not found"` (`:2219`).
 pub fn dismiss_incoming_ask(state: &SharedIntercomState, message_id: &str) {
     state.tracker.lock().unwrap_or_else(|e| e.into_inner()).dismiss_pending_ask(message_id);
-    state.remove_pending_inbound(message_id);
 }
 
-/// (Re)arm the debounced pending-idle flush (pi `scheduleInboundFlush`, `index.ts:674-684`):
-/// `clearInboundFlushTimer()` then a fresh timer. `delay_ms == 0` is pi's
-/// `scheduleInboundFlush(0)` — the immediate drain the `agent_end`/`turn_end` handlers fire
-/// (`index.ts:1086`,`:1117`); it still hops through the scheduler (pi's `setTimeout(…, 0)`), so the
-/// event handler never blocks on delivery.
-pub fn schedule_inbound_flush(state: &Arc<SharedIntercomState>, delay_ms: u64) {
-    let flush_state = state.clone();
-    let handle = tokio::spawn(async move {
-        if delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        }
-        flush_idle_messages(&flush_state);
+/// `sendIncomingMessage(entry, delivery, generation?, forceTrigger?)`
+/// (`v0.10.1 index.ts:876-901`, 26 lines) — the ONE delivery function, for both an idle session's
+/// fresh turn and a busy interactive session's steer.
+///
+/// ```text
+/// const injectedMessage = { ...entry.message, injectedAt: Date.now() };
+/// const replyCommand = delivery === "steer" && entry.replyCommand && entry.message.expectsReply
+///   ? `intercom({ action: "reply", replyTo: ${JSON.stringify(entry.message.id)}, message: "..." })`
+///   : entry.replyCommand;
+/// replyTracker.queueTurnContext({ from: entry.from, message: injectedMessage, receivedAt: Date.now() });
+/// pi.sendMessage({ customType: "intercom_message", content: …, display: true, details: deliveredEntry },
+///   delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)
+///     ? { triggerTurn: true } : { deliverAs: "steer" });
+/// ```
+///
+/// Three mechanisms live here, all load-bearing:
+/// - **the `injectedAt` stamp** is on a per-delivery COPY, and it is that copy which is queued as
+///   the turn context and rendered into the `_…_` metadata line, so the two agree;
+/// - **the steer-mode reply-hint rewrite** carries the EXPLICIT message id, because a steered
+///   message lands mid-run where a bare `intercom({action:"reply"})` cannot rely on being the
+///   current turn context;
+/// - **`queueTurnContext` is unconditional** (v0.9.3 dropped the old `delivery !== "followUp"`
+///   guard), so a reply resolves against the entry that actually drove or steered this turn.
+///
+/// `display = true` unconditionally, matching pi's single `pi.sendMessage({… display: true …})`.
+/// It used to be `false` on the theory that [`surface_incoming_message`] had already shown the card
+/// — but the host honours the caller's flag only on the not-streaming, not-trigger branch, so the
+/// message was written to the session tree HIDDEN for `inboundTrigger: "replies"`/`"never"`: it
+/// appeared live and then vanished from `--resume` and every transcript replay.
+///
+/// Returns whether a live host was there to deliver through (`false` = headless/degraded).
+pub fn send_incoming_message(
+    state: &SharedIntercomState,
+    from: &SessionInfo,
+    message: &Message,
+    delivery: InboundDelivery,
+) -> bool {
+    let Some(services) = state.host_services() else {
+        return false;
+    };
+    let message = &stamp_injected_at(message);
+    state.tracker.lock().unwrap_or_else(|e| e.into_inner()).queue_turn_context(IntercomContext {
+        from: from.clone(),
+        message: message.clone(),
+        received_at: now_ms(),
     });
-    state.set_flush_timer(Some(handle));
+    let content = build_inline_message_for(state, from, message, delivery).content_markdown();
+    // `{ triggerTurn: true }` vs `{ deliverAs: "steer" }`. cyrup's seam takes the boolean:
+    // `AgentSession::inject_message` routes to `agent.steer(msg)` whenever `is_streaming()`
+    // regardless of the flag (`cyrup-session-svc/src/session.rs:3926-3928`), so a busy session's
+    // delivery steers exactly as upstream's `deliverAs: "steer"` does, and the flag only decides
+    // whether an IDLE session spawns a run over the message.
+    let trigger_turn = delivery == InboundDelivery::Trigger
+        && should_trigger_inbound_message(state.config.inbound_trigger, message);
+    if let Err(e) =
+        services.inject_message(&content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), true, trigger_turn)
+    {
+        tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
+    }
+    true
 }
 
-/// Deliver everything parked in the pending-idle queue, if the session is now idle (pi
-/// `flushIdleMessages`, `index.ts:685-710`): nothing queued → return; still busy → back off
-/// [`INBOUND_IDLE_RETRY_MS`] and try again; otherwise drain the whole queue oldest-first, the FIRST
-/// entry as a `"trigger"` delivery and every later one as a `"followUp"` (pi
-/// `sendIncomingMessage(entry, index === 0 ? "trigger" : "followUp")`, `index.ts:707-709`).
-pub fn flush_idle_messages(state: &Arc<SharedIntercomState>) {
-    // The handle currently in the timer slot is THIS task's own — release it rather than aborting.
-    state.release_flush_timer();
-    if state.pending_inbound_len() == 0 {
-        return;
-    }
-    if !state.is_idle() {
-        schedule_inbound_flush(state, INBOUND_IDLE_RETRY_MS);
-        return;
-    }
-    for (index, pending) in state.take_pending_inbound().into_iter().enumerate() {
-        let delivery =
-            if index == 0 { InboundDelivery::Trigger } else { InboundDelivery::FollowUp };
-        send_incoming_message(state, &pending.from, &pending.message, delivery);
-    }
-}
-
-/// Deliver an inbound message through the live `HostServices`, optionally driving/steering an agent
-/// turn OVER it (the interactive `has_ui` branch of [`decide_inbound_policy`], pi's
-/// `sendIncomingMessage(entry, "trigger")` gated by `shouldTriggerInboundMessage`): build the
-/// attributed message content ([`InlineMessage::content_markdown`], pi's `content` template at
-/// `index.ts:660-666`) and `inject_message(trigger_turn = trigger)` — the live host runs a fresh turn when idle and
-/// steers onto the active run when busy, or (when `trigger` is `false`, `config.inbound_trigger`
-/// having declined it) delivers the message as a non-triggering follow-up entry (pi's
-/// `{ deliverAs: "followUp" }`). `display = false` because the durable card was ALREADY surfaced via
-/// [`surface_incoming_message`]; this call only drives delivery/the turn, not a second visible copy.
-/// A no-op (returns `false`) when no `HostServices` is bound (headless/degraded). Returns whether the
-/// injection was attempted against a live host.
+/// [`send_incoming_message`] with an explicit trigger decision already made — the entry point the
+/// local subagent-relay seam uses, which is upstream's `forceTrigger = true`
+/// (`v0.10.1 index.ts:1251`, bypassing `shouldTriggerInboundMessage`).
 pub fn trigger_turn_over_inbound(
     state: &SharedIntercomState,
     from: &SessionInfo,
@@ -229,67 +222,28 @@ pub fn trigger_turn_over_inbound(
     let Some(services) = state.host_services() else {
         return false;
     };
-    // `sendIncomingMessage` queues the turn context whenever `delivery !== "followUp"`
-    // (`index.ts:655-657`) — i.e. on every call through THIS ("trigger" delivery mode) path,
-    // regardless of whether `shouldTriggerInboundMessage` ultimately allows the turn-trigger itself.
-    // `ReplyTracker::begin_turn` (fired on the next `turn_start`, `extension.rs`'s `HostEvent::TurnStart`
-    // arm) shifts this queued context into `current_turn_context`, giving a bare
-    // `intercom({action:"reply"})` (no `to`) absolute priority over the "single pending"/`to`-filter
-    // fallbacks for the message that actually triggered/is steering this turn.
+    let message = &stamp_injected_at(message);
     state.tracker.lock().unwrap_or_else(|e| e.into_inner()).queue_turn_context(IntercomContext {
         from: from.clone(),
         message: message.clone(),
         received_at: now_ms(),
     });
-    // pi `sendIncomingMessage` (`index.ts:652-672`) injects ONE string — the attribution header, the
-    // sender's cwd, the reply instruction and the body — and the human sees that same string. Inject
-    // `content_markdown()`, not the bare `body()`: without it the model cannot tell an intercom
-    // message from a user turn, cannot tell WHICH peer asked, and is never told the reply command.
     let content = build_inline_message(state, from, message).content_markdown();
     if let Err(e) =
-        services.inject_message(&content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), false, trigger)
+        services.inject_message(&content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), true, trigger)
     {
         tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
     }
     true
 }
 
-/// pi `sendIncomingMessage(entry, delivery)` (`index.ts:652-672`) — the delivery-mode-aware entry
-/// point the pending-idle flush uses. [`InboundDelivery::Trigger`] is exactly
-/// [`trigger_turn_over_inbound`] with pi's `shouldTriggerInboundMessage` applied;
-/// [`InboundDelivery::FollowUp`] delivers the message as a plain follow-up entry — no turn context
-/// queued, no turn driven — which is what every queued message after the first gets when a busy
-/// session's backlog is flushed. Returns whether a live host was there to deliver through.
-pub fn send_incoming_message(
-    state: &SharedIntercomState,
-    from: &SessionInfo,
-    message: &Message,
-    delivery: InboundDelivery,
-) -> bool {
-    match delivery {
-        InboundDelivery::Trigger => trigger_turn_over_inbound(
-            state,
-            from,
-            message,
-            should_trigger_inbound_message(state.config.inbound_trigger, message),
-        ),
-        InboundDelivery::FollowUp => {
-            let Some(services) = state.host_services() else {
-                return false;
-            };
-            // Same one-string shape as the `"trigger"` arm — pi's `sendIncomingMessage` builds the
-            // `content` identically for both deliveries, only the second argument to `pi.sendMessage`
-            // differs (`index.ts:663-670`). A flushed backlog must therefore carry N separately
-            // attributed messages, not N concatenated header-less bodies.
-            let content = build_inline_message(state, from, message).content_markdown();
-            if let Err(e) =
-                services.inject_message(&content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), false, false)
-            {
-                tracing::warn!(error = %e, "intercom: failed to deliver a follow-up inbound message");
-            }
-            true
-        }
-    }
+/// `{ ...entry.message, injectedAt: Date.now() }` (`v0.10.1 index.ts:878`) — the per-delivery copy
+/// upstream stamps before it renders the content, queues the turn context and passes `details`.
+#[must_use]
+fn stamp_injected_at(message: &Message) -> Message {
+    let mut injected = message.clone();
+    injected.injected_at = Some(now_ms().into());
+    injected
 }
 
 /// Send the "running in non-interactive mode" busy auto-reply back to the sender (the `AutoReply`
@@ -364,20 +318,20 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                     //     is in flight (`ctx.isIdle()`, read live off `HostServices`), this session's
                     //     static `has_ui`, and the message shape, then routed to the real
                     //     host/broker seam: an IDLE session (interactive or not) is delivered
-                    //     through `inject_message`; a BUSY interactive one queues the message for
-                    //     the debounced idle flush; a BUSY non-interactive one sends the sender the
-                    //     busy auto-reply.
+                    //     through `inject_message`; a BUSY interactive one is STEERED onto the live
+                    //     run (`v0.10.1 index.ts:956`); a BUSY non-interactive one sends the sender
+                    //     the busy auto-reply.
                     match decide_inbound_policy(
                         state.is_idle(),
                         state.has_ui(),
                         state.config.inbound_trigger,
                         &message,
                     ) {
-                        InboundPolicy::Deliver { trigger } => {
-                            trigger_turn_over_inbound(&state, &from, &message, trigger);
+                        InboundPolicy::Deliver { .. } => {
+                            send_incoming_message(&state, &from, &message, InboundDelivery::Trigger);
                         }
-                        InboundPolicy::Queue => {
-                            queue_idle_message(&state, from.clone(), message.clone());
+                        InboundPolicy::Steer => {
+                            send_incoming_message(&state, &from, &message, InboundDelivery::Steer);
                         }
                         InboundPolicy::AutoReply => {
                             auto_reply_non_interactive(&state, &from, &message).await;
@@ -402,17 +356,25 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
     });
 }
 
-/// Format inbound attachments into the message body (pi `formatAttachments`, `index.ts:73-82`).
+/// Format inbound attachments into the message body (pi `formatAttachments`,
+/// `v0.10.1 index.ts:94-104`).
+///
+/// The delimiter is `\n\n---\nAttachment: {name}` at v0.10.0 and later (`633e782`, "refactor:
+/// deslop intercom protocol cleanup") — it used to be `📎 {name}`. This string reaches the MODEL,
+/// which is expected to parse it when a peer sends files, so the two forms are not interchangeable.
 #[must_use]
 pub fn format_attachments(attachments: &[Attachment]) -> String {
     let mut text = String::new();
     for att in attachments {
         match &att.language {
             Some(lang) => {
-                text.push_str(&format!("\n\n---\n📎 {}\n~~~{lang}\n{}\n~~~", att.name, att.content));
+                text.push_str(&format!(
+                    "\n\n---\nAttachment: {}\n~~~{lang}\n{}\n~~~",
+                    att.name, att.content
+                ));
             }
             None => {
-                text.push_str(&format!("\n\n---\n📎 {}\n{}", att.name, att.content));
+                text.push_str(&format!("\n\n---\nAttachment: {}\n{}", att.name, att.content));
             }
         }
     }
@@ -428,6 +390,29 @@ pub fn build_inline_message(
     from: &SessionInfo,
     message: &Message,
 ) -> InlineMessage {
+    build_inline_message_for(state, from, message, InboundDelivery::Trigger)
+}
+
+/// [`build_inline_message`] with the delivery mode, which decides the reply hint's shape
+/// (`v0.10.1 index.ts:880-884`):
+///
+/// ```text
+/// const replyCommand = delivery === "steer" && entry.replyCommand && entry.message.expectsReply
+///   ? `intercom({ action: "reply", replyTo: ${JSON.stringify(entry.message.id)}, message: "..." })`
+///   : entry.replyCommand;
+/// ```
+///
+/// A steered message lands in the MIDDLE of a run, where `resolveReplyTarget`'s current-turn-context
+/// shortcut does not point at it — so the hint has to name the id explicitly or the model is told to
+/// use a command that would answer the wrong ask. `JSON.stringify` is what quotes the id, which for
+/// a broker-minted UUID is exactly a pair of double quotes.
+#[must_use]
+pub fn build_inline_message_for(
+    state: &SharedIntercomState,
+    from: &SessionInfo,
+    message: &Message,
+    delivery: InboundDelivery,
+) -> InlineMessage {
     let attachment_text = message
         .content
         .attachments
@@ -436,8 +421,16 @@ pub fn build_inline_message(
         .map(format_attachments)
         .unwrap_or_default();
     let body_text = format!("{}{attachment_text}", message.content.text);
-    let reply_command = (state.config.reply_hint && message.expects_reply == Some(true))
-        .then(|| REPLY_HINT_COMMAND.to_string());
+    let reply_command = (state.config.reply_hint && message.expects_reply == Some(true)).then(|| {
+        if delivery == InboundDelivery::Steer {
+            format!(
+                "intercom({{ action: \"reply\", replyTo: {}, message: \"...\" }})",
+                serde_json::Value::String(message.id.clone())
+            )
+        } else {
+            REPLY_HINT_COMMAND.to_string()
+        }
+    });
     InlineMessage {
         from: from.clone(),
         message: message.clone(),
@@ -494,6 +487,7 @@ mod tests {
         SessionInfo {
             id: "child-1234".to_string(),
             name: Some("subagent-chat-1".to_string()),
+            runtime_fallback_alias: None,
             cwd: "/w".to_string(),
             model: "m".to_string(),
             pid: 1u32.into(),
@@ -542,9 +536,10 @@ mod tests {
             extra: Default::default(),
         }]);
         let card = build_inline_message(&s, &from(), &msg);
-        assert!(card.body().contains("see this"));
-        assert!(card.body().contains("📎 ctx.md"));
-        assert!(card.body().contains("details"));
+        // `formatAttachments` (`v0.10.1 index.ts:95-105`) — the `📎 {name}` delimiter became
+        // `Attachment: {name}` in v0.10.0 (`633e782`, "refactor: deslop intercom protocol
+        // cleanup"). This string reaches the MODEL, so the exact delimiter is the contract.
+        assert_eq!(card.body(), "see this\n\n---\nAttachment: ctx.md\ndetails");
     }
 
     #[test]
@@ -561,8 +556,7 @@ mod tests {
     ///  * an IDLE HEADLESS session (`!has_ui`) received the busy auto-reply instead of a real
     ///    delivery — the sender was told "cannot respond right now" by a session that was doing
     ///    nothing at all; and
-    ///  * a BUSY INTERACTIVE session was steered onto its live run instead of having the message
-    ///    parked for the idle flush.
+    ///  * a BUSY INTERACTIVE session took the headless auto-reply arm instead of a delivery.
     ///
     /// Both of those are asserted here directly, so this test fails against the pre-fix branch.
     #[test]
@@ -582,10 +576,10 @@ mod tests {
             decide_inbound_policy(true, false, InboundTrigger::Always, &fresh),
             InboundPolicy::Deliver { trigger: true }
         );
-        // BUSY + interactive → parked for the idle flush, never steered onto the live run.
+        // BUSY + interactive → STEERED onto the live run (`v0.10.1 index.ts:956`), not parked.
         assert_eq!(
             decide_inbound_policy(false, true, InboundTrigger::Always, &fresh),
-            InboundPolicy::Queue
+            InboundPolicy::Steer
         );
         // BUSY + headless + a fresh message → the busy auto-reply (the only arm that reaches it).
         assert_eq!(
@@ -660,11 +654,17 @@ mod tests {
                 injected: std::sync::Mutex::new(Vec::new()),
             }
         }
+        #[allow(dead_code)]
         fn set_idle(&self, idle: bool) {
             self.idle.store(idle, std::sync::atomic::Ordering::SeqCst);
         }
         fn injected(&self) -> Vec<InjectedCall> {
             self.injected.lock().unwrap().clone()
+        }
+    }
+    impl IdleControlledHost {
+        fn clear_injected(&self) {
+            self.injected.lock().unwrap().clear();
         }
     }
     impl cyrup_ext::HostServices for IdleControlledHost {
@@ -695,55 +695,71 @@ mod tests {
         }
     }
 
-    /// ICOM-002's live half (pi `queueIdleMessage` → `flushIdleMessages`, `index.ts:685-714`): a
-    /// BUSY interactive session must deliver NOTHING at arrival time, and once the run ends the
-    /// whole backlog must be delivered in arrival order — the first as a turn-driving `"trigger"`
-    /// delivery, every later one as a non-triggering `"followUp"`.
+    /// ICOM-035 / v0.9.3 `25ffb96` ("fix: steer busy inbound messages promptly"): a message that
+    /// arrives while an interactive session is BUSY reaches the agent **immediately**, as a
+    /// non-turn-driving delivery, rather than being parked until the run ends.
     ///
-    /// Pre-fix this could not even be expressed: `decide_inbound_policy` had no idle axis, so both
-    /// messages were injected IMMEDIATELY (steering a live run), and both with `trigger_turn: true`.
+    /// This test would be red against the pre-fix branch on both halves. There, the arrival-time
+    /// assertion below was the *inverse* — `host.injected()` was empty and `pending_inbound_len()`
+    /// was 1 — and the delivery only appeared after `INBOUND_FLUSH_DELAY_MS + INBOUND_IDLE_RETRY_MS`
+    /// AND only once `set_idle(true)` had been called. CHANGELOG 0.9.3 names the harm the old
+    /// behaviour caused: "preventing stale coordination from appearing hours after it was received".
     #[tokio::test]
-    async fn busy_interactive_session_parks_inbound_and_flushes_the_backlog_when_the_run_ends() {
+    async fn busy_interactive_session_steers_inbound_onto_the_live_run_immediately() {
         let s = Arc::new(state(true));
         let host = Arc::new(IdleControlledHost::new(false)); // a run is in flight
         s.set_host_services(host.clone());
         s.set_has_ui(true);
 
-        // Two messages arrive while busy → both parked, nothing injected.
         assert_eq!(
             decide_inbound_policy(s.is_idle(), s.has_ui(), s.config.inbound_trigger, &ask("first")),
-            InboundPolicy::Queue
+            InboundPolicy::Steer
         );
-        queue_idle_message(&s, from(), ask("first"));
-        queue_idle_message(&s, from(), ask("second"));
-        assert_eq!(s.pending_inbound_len(), 2);
-        assert!(host.injected().is_empty(), "a busy session must not be steered mid-run");
-
-        // The debounce fires while still busy → it backs off and re-arms, delivering nothing.
-        tokio::time::sleep(std::time::Duration::from_millis(
-            INBOUND_FLUSH_DELAY_MS + 100,
-        ))
-        .await;
-        assert!(
-            host.injected().is_empty(),
-            "the flush must back off while the run is still in flight"
-        );
-        assert_eq!(s.pending_inbound_len(), 2, "the backlog is retained across a busy flush");
-
-        // The run ends → the retry (INBOUND_IDLE_RETRY_MS) drains the whole backlog.
-        host.set_idle(true);
-        tokio::time::sleep(std::time::Duration::from_millis(
-            INBOUND_IDLE_RETRY_MS + 200,
-        ))
-        .await;
+        assert!(send_incoming_message(&s, &from(), &ask("first"), InboundDelivery::Steer));
 
         let injected = host.injected();
-        assert_eq!(injected.len(), 2, "both queued messages are delivered: {injected:?}");
-        assert!(injected[0].0.contains("first"), "arrival order is preserved: {injected:?}");
-        assert!(injected[1].0.contains("second"), "arrival order is preserved: {injected:?}");
-        assert!(injected[0].3, "the FIRST queued message drives the turn (pi's \"trigger\")");
-        assert!(!injected[1].3, "every later message is a non-triggering \"followUp\"");
-        assert_eq!(s.pending_inbound_len(), 0, "the queue is drained");
+        assert_eq!(injected.len(), 1, "the message reaches the running agent at once: {injected:?}");
+        assert!(injected[0].0.contains("first"));
+        // `{ deliverAs: "steer" }`, never `{ triggerTurn: true }` (`v0.10.1 index.ts:897-899`): the
+        // host routes a custom message to `agent.steer` whenever it is streaming, so the flag stays
+        // false and a busy session is never handed a competing run.
+        assert!(!injected[0].3, "a steered delivery never drives a second turn");
+        assert!(injected[0].2, "display = true, so the message survives a transcript replay");
+    }
+
+    /// `v0.10.1 index.ts:880-884` — a STEERED ask rewrites the reply hint to name the message id
+    /// explicitly, because it lands mid-run where a bare `intercom({action:"reply"})` has no current
+    /// turn context to resolve against. A triggered delivery keeps the bare hint.
+    #[tokio::test]
+    async fn a_steered_ask_gets_an_explicit_reply_to_in_its_hint() {
+        let s = Arc::new(state(true));
+        let host = Arc::new(IdleControlledHost::new(false));
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+
+        assert!(send_incoming_message(&s, &from(), &ask("q"), InboundDelivery::Steer));
+        let injected = host.injected();
+        assert_eq!(injected.len(), 1);
+        assert!(
+            injected[0].0.contains(
+                "To reply, use the intercom tool: intercom({ action: \"reply\", replyTo: \"q1\", message: \"...\" })"
+            ),
+            "steer hint must carry the explicit message id: {:?}",
+            injected[0].0
+        );
+
+        // The trigger path is unchanged: the bare hint, because the message IS the turn context.
+        host.clear_injected();
+        assert!(send_incoming_message(&s, &from(), &ask("q"), InboundDelivery::Trigger));
+        let injected = host.injected();
+        assert_eq!(injected.len(), 1);
+        assert!(
+            injected[0]
+                .0
+                .contains("To reply, use the intercom tool: intercom({ action: \"reply\", message: \"...\" })"),
+            "trigger hint stays bare: {:?}",
+            injected[0].0
+        );
     }
 
     /// The other half of the same branch swap: an IDLE HEADLESS session (`!has_ui`) delivers the
@@ -774,7 +790,7 @@ mod tests {
     }
 
     /// ICOM-022 regression (pi `sendIncomingMessage`, `index.ts:652-672`): the string the model
-    /// receives IS the string the human sees — `**📨 From {sender}** ({cwd}){replyInstruction}` then
+    /// receives IS the string the human sees — `**From {sender}** ({cwd}){replyInstruction}` then
     /// a blank line then the body. Pre-fix the injected content was
     /// `build_inline_message(..).body()`, i.e. the body ALONE: no sender attribution, no cwd, and no
     /// `intercom({action:"reply"})` guidance even though the hint was already computed and shown on
@@ -786,13 +802,15 @@ mod tests {
         s.set_host_services(host.clone());
         s.set_has_ui(true);
 
+        let before = now_ms();
         assert!(trigger_turn_over_inbound(&s, &from(), &ask("Which DB?"), true));
+        let after = now_ms();
 
         let injected = host.injected();
         assert_eq!(injected.len(), 1, "one delivery: {injected:?}");
         let content = &injected[0].0;
         assert!(
-            content.starts_with("**📨 From subagent-chat-1** (/w)"),
+            content.starts_with("**From subagent-chat-1** (/w)"),
             "attribution header + sender cwd lead the injected content: {content:?}"
         );
         assert!(
@@ -800,18 +818,35 @@ mod tests {
             "the reply instruction reaches the MODEL, not just the append_entry surface: {content:?}"
         );
         assert!(content.ends_with("\n\nWhich DB?"), "body last, after a blank line: {content:?}");
-        // The injected string is byte-identical to the one the human surface carries — pi builds it
-        // exactly once (`index.ts:660-666`).
-        assert_eq!(content, &build_inline_message(&s, &from(), &ask("Which DB?")).content_markdown());
+        // The injected string is byte-identical to the card the human surface carries — pi builds
+        // it exactly once, off the SAME per-delivery copy it stamps (`v0.10.1 index.ts:878,890-895`:
+        // `const injectedMessage = { ...entry.message, injectedAt: Date.now() }`, then
+        // `formatInboundDeliveryMetadata(injectedMessage)`). `Date.now()` is a live clock, so the
+        // one unknown byte-range is the instant — recovered here by rendering the card for every
+        // millisecond the call could have observed and requiring the delivery to be one of them.
+        // Every other byte, including the whole `_id … · sent … · injected …_` segment, is pinned,
+        // and the stamp is pinned to the delivery instant.
+        let candidates: Vec<String> = (before..=after)
+            .map(|ms| {
+                let mut stamped = ask("Which DB?");
+                stamped.injected_at = Some(ms.into());
+                build_inline_message(&s, &from(), &stamped).content_markdown()
+            })
+            .collect();
+        assert!(
+            candidates.contains(content),
+            "injected content must be the card rendered from the injected-at-stamped message; \
+             got {content:?}, expected one of {candidates:?}"
+        );
         assert_eq!(injected[0].1.as_deref(), Some(INBOUND_MESSAGE_CUSTOM_TYPE));
     }
 
-    /// ICOM-022's flush half: a drained backlog must be N separately attributed messages, not N
-    /// concatenated header-less bodies. Pre-fix a busy session's backlog reached the model as a run
-    /// of bare bodies, so several peers' messages were indistinguishable from each other and from
-    /// the user's own turn.
+    /// ICOM-022, applied to the steer path: two peers' messages arriving during one run must be N
+    /// separately attributed messages, not N header-less bodies. Pre-fix a busy session's backlog
+    /// reached the model as a run of bare bodies, so several peers' messages were indistinguishable
+    /// from each other and from the user's own turn.
     #[tokio::test]
-    async fn every_flushed_backlog_message_carries_its_own_attribution_header() {
+    async fn every_steered_message_carries_its_own_attribution_header() {
         let s = Arc::new(state(true));
         let host = Arc::new(IdleControlledHost::new(false)); // a run is in flight
         s.set_host_services(host.clone());
@@ -822,29 +857,23 @@ mod tests {
         peer_b.id = "child-9999".to_string();
         peer_b.name = Some("subagent-chat-2".to_string());
         peer_b.cwd = "/other".to_string();
-        queue_idle_message(&s, from(), ask("first"));
-        queue_idle_message(&s, peer_b, ask("second"));
-
-        host.set_idle(true);
-        tokio::time::sleep(std::time::Duration::from_millis(
-            INBOUND_FLUSH_DELAY_MS + INBOUND_IDLE_RETRY_MS + 300,
-        ))
-        .await;
+        assert!(send_incoming_message(&s, &from(), &ask("first"), InboundDelivery::Steer));
+        assert!(send_incoming_message(&s, &peer_b, &ask("second"), InboundDelivery::Steer));
 
         let injected = host.injected();
-        assert_eq!(injected.len(), 2, "the whole backlog drains: {injected:?}");
+        assert_eq!(injected.len(), 2, "both steers land: {injected:?}");
         assert!(
-            injected[0].0.starts_with("**📨 From subagent-chat-1** (/w)"),
-            "the trigger delivery is attributed: {injected:?}"
+            injected[0].0.starts_with("**From subagent-chat-1** (/w)"),
+            "the first steer is attributed: {injected:?}"
         );
         assert!(
-            injected[1].0.starts_with("**📨 From subagent-chat-2** (/other)"),
-            "the followUp delivery is attributed to ITS OWN sender: {injected:?}"
+            injected[1].0.starts_with("**From subagent-chat-2** (/other)"),
+            "the second steer is attributed to ITS OWN sender: {injected:?}"
         );
         for call in &injected {
             assert!(
                 call.0.contains("To reply, use the intercom tool: intercom("),
-                "each flushed message keeps its reply instruction: {call:?}"
+                "each steered message keeps its reply instruction: {call:?}"
             );
         }
     }
@@ -864,6 +893,12 @@ mod tests {
 
         let injected = host.injected();
         assert_eq!(injected.len(), 1);
-        assert_eq!(injected[0].0, "**📨 From child-12** (/w)\n\nhi");
+        // `v0.10.1 index.ts:891-893`: no `📨` (the v0.10.0 deslop), and the `_…_` delivery-metadata
+        // line sits between the header and the body. `injected …` carries a live clock, so the
+        // clock-independent parts are asserted exactly.
+        let content = &injected[0].0;
+        assert!(content.starts_with("**From child-12** (/w)\n\n_id q1 · "), "{content:?}");
+        assert!(content.ends_with("_\n\nhi"), "{content:?}");
+        assert!(!content.contains("To reply"), "reply hint off ⇒ no instruction: {content:?}");
     }
 }

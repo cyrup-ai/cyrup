@@ -1,6 +1,6 @@
 //! The `Provider` abstraction (arch-01 §6 / func-01 §6).
 
-use crate::auth::ProviderAuth;
+use crate::auth::{Credential, ProviderAuth};
 use crate::collection::clamp_thinking_level;
 use crate::context::Context;
 use crate::error::ProviderError;
@@ -17,8 +17,38 @@ use cyrup_core::{EventStream, ProviderId};
 pub trait Provider: Send + Sync {
     fn id(&self) -> &ProviderId;
 
+    /// Human display name (Pi `Provider.name`, `models.ts:77` @v0.83.0). Provider pickers and
+    /// status output show this rather than the machine id. Defaults to the id so an existing
+    /// implementation is unchanged (PROV-017).
+    fn name(&self) -> &str {
+        self.id().as_str()
+    }
+
+    /// Provider-level default base URL (Pi `Provider.baseUrl?`, `models.ts:78` @v0.83.0).
+    /// `None` = the provider has none and every model carries its own (PROV-017).
+    fn base_url(&self) -> Option<&str> {
+        None
+    }
+
+    /// Provider-level default headers (Pi `Provider.headers?: ProviderHeaders`, `models.ts:79`
+    /// @v0.83.0), merged beneath the per-model and per-request overlays (PROV-017).
+    fn headers(&self) -> Option<&crate::HeaderMap> {
+        None
+    }
+
     /// Last-known catalog; synchronous and non-throwing (func-01 R-01-001).
     fn models(&self) -> &[Model];
+
+    /// Optional provider policy for credential-specific model availability (Pi
+    /// `Provider.filterModels?`, `models.ts:111` @v0.83.0, documented at `:105-110`).
+    ///
+    /// [`Provider::models`] remains the complete synchronous catalog; this is applied by
+    /// [`crate::collection::Models::get_available`] **after** confirming that provider auth is
+    /// configured — pi's exact position, `models.ts:407`. The default returns the catalog unchanged,
+    /// matching pi's optional member being absent (PROV-032).
+    fn filter_models(&self, models: &[Model], _credential: Option<&Credential>) -> Vec<Model> {
+        models.to_vec()
+    }
 
     /// The provider's auth strategy (Pi `Provider.auth`). Exposed so a [`crate::collection::Models`]
     /// can resolve request auth against the collection's own credential store + auth context

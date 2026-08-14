@@ -453,14 +453,30 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
     // Whether the pending block was opened by a FOLDED scalar indicator (`>` / `>-`), which changes
     // both what the block captures (blank lines too) and how it is stored (folded, not verbatim).
     let mut current_folded = false;
+    // SUBA-052 / pi `currentLiteral` (`agents/frontmatter.ts:86` @v0.47.1). A LITERAL scalar
+    // indicator (`|` / `|-`) captures blank lines exactly as a folded one does, but stores the
+    // dedented block VERBATIM — no folding. Landed upstream in `a4fc59a` ("fix: parse block scalar
+    // skill descriptions", #952), released v0.46.0; `git show v0.43.0:.../frontmatter.ts | grep
+    // isLiteral` is empty, so this is drift.
+    //
+    // Before this flag existed, `description: |` fell through BOTH the `value.is_empty()` and the
+    // `is_folded` arms — `strip_matching_quotes` yields `(false, "|")`, which is neither — and was
+    // stored as the one-character string `"|"`, after which the indented body lines failed the
+    // `^([\w-]+):` match and were silently discarded. Silent wrong value, no warning.
+    let mut current_literal = false;
 
     let flush_block = |fields: &mut Vec<(String, String)>,
                         current_key: &mut Option<String>,
                         current_block_lines: &mut Vec<String>,
                         current_indent: &mut Option<usize>,
-                        current_folded: &mut bool| {
+                        current_folded: &mut bool,
+                        current_literal: &mut bool| {
         if let Some(key) = current_key.take() {
             let stripped = dedent_block(current_block_lines);
+            // pi `frontmatter[currentKey] = currentFolded ? foldBlock(stripped) : stripped`
+            // (`:110`): a LITERAL block takes the same `stripped` branch an ordinary nested block
+            // does, so nothing extra happens here — only the CAPTURE and the DEFER conditions
+            // change.
             let value = if *current_folded {
                 fold_block(&stripped)
             } else {
@@ -471,6 +487,7 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
         current_block_lines.clear();
         *current_indent = None;
         *current_folded = false;
+        *current_literal = false;
     };
 
     for line in frontmatter_block.split('\n') {
@@ -480,8 +497,13 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
         // (`frontmatter.ts:91`). A blank line has `indent == 0` and so is NOT a continuation of an
         // ordinary block — but a FOLDED block keeps it, because blank lines are a folded scalar's
         // paragraph separator and `foldBlock` needs to see them.
+        // SUBA-052 / pi `:91` @v0.47.1: the blank-line continuation test is
+        // `(currentFolded || currentLiteral) && trimmed === ""` — a literal block keeps its blank
+        // lines for the same reason a folded one does, and here they are actually load-bearing
+        // (a literal scalar's blank line IS content).
         if current_key.is_some()
-            && (indent > current_indent.unwrap_or(0) || (current_folded && line.trim().is_empty()))
+            && (indent > current_indent.unwrap_or(0)
+                || ((current_folded || current_literal) && line.trim().is_empty()))
         {
             // Continuation of the current block value.
             current_block_lines.push(line.to_string());
@@ -496,6 +518,7 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
             &mut current_block_lines,
             &mut current_indent,
             &mut current_folded,
+            &mut current_literal,
         );
 
         // Match against the RAW line (source: `line.match(/^([\w-]+):.../)`, `frontmatter.ts:61`),
@@ -510,13 +533,19 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
         // A bare `>` or `>-` opens a YAML FOLDED block scalar. Source gates this on the value not
         // being quoted (`frontmatter.ts:121`), so `description: ">"` is still the literal string.
         let is_folded = !is_quoted && (raw_value == ">" || raw_value == ">-");
+        // SUBA-052 / pi `:125` @v0.47.1:
+        // `const isLiteral = !isQuoted && (rawValue === "|" || rawValue === "|-")`. Gated on the
+        // value not being quoted for the same reason `is_folded` is, so `description: "|"` stays
+        // the literal one-character string.
+        let is_literal = !is_quoted && (raw_value == "|" || raw_value == "|-");
 
-        if value.is_empty() || is_folded {
-            // Empty-valued key or folded indicator: defer storing until we see the block body.
+        if value.is_empty() || is_folded || is_literal {
+            // Empty-valued key or block-scalar indicator: defer storing until we see the block body.
             current_key = Some(key.to_string());
             current_block_lines = Vec::new();
             current_indent = Some(indent);
             current_folded = is_folded;
+            current_literal = is_literal;
         } else {
             fields.push((key.to_string(), value.to_string()));
         }
@@ -530,6 +559,7 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
         &mut current_block_lines,
         &mut current_indent,
         &mut current_folded,
+        &mut current_literal,
     );
 
     ParsedFrontmatter { fields, body }
@@ -1667,6 +1697,69 @@ mod tests {
             "---\nname: worker\ndescription: Worker\npermission:\n  \"*\": ask\n  bash:\n    \"*\": ask\n---\n\nBody\n",
         );
         assert_eq!(parsed.get("permission"), Some("\"*\": ask\nbash:\n  \"*\": ask"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-052 — LITERAL block scalars (`|` / `|-`), pi `agents/frontmatter.ts:86,91,125,126`
+    // @v0.47.1 (`a4fc59a`, released v0.46.0).
+    // -----------------------------------------------------------------------------------------
+
+    /// THE USER ACTION: an author writes the single most common YAML idiom for a multi-line
+    /// description. Before the fix `strip_matching_quotes` yielded `(false, "|")` — neither empty
+    /// nor folded — so the parser stored the one-character string `"|"` and then silently discarded
+    /// every indented body line (they fail the `^([\w-]+):` key match). The agent listed with a
+    /// description of `|`, matched nothing in proactive-skill selection, and any multi-line key that
+    /// feeds behaviour ran with a one-character value.
+    ///
+    /// One table over `|`, `|-`, `>`, `>-` and a plain scalar, exactly as the item's Verify asks.
+    #[test]
+    fn block_scalar_indicators_are_parsed_per_pis_folded_vs_literal_split() {
+        // (indicator, expected description)
+        let cases: &[(&str, &str)] = &[
+            // LITERAL: stored verbatim, newlines preserved. Red before the fix — was `"|"`.
+            ("|", "line one\nline two\nline three"),
+            ("|-", "line one\nline two\nline three"),
+            // FOLDED: unchanged behaviour, lines joined into one paragraph.
+            (">", "line one line two line three"),
+            (">-", "line one line two line three"),
+        ];
+        for (indicator, expected) in cases {
+            let parsed = parse_frontmatter_block(&format!(
+                "---\nname: worker\ndescription: {indicator}\n  line one\n  line two\n  line three\ntools: read\n---\n\nBody\n"
+            ));
+            assert_eq!(
+                parsed.get("description"),
+                Some(*expected),
+                "indicator {indicator:?}"
+            );
+            // The block must not swallow the following flat key.
+            assert_eq!(parsed.get("tools"), Some("read"), "indicator {indicator:?}");
+            assert_eq!(parsed.body, "Body", "indicator {indicator:?}");
+        }
+
+        // A PLAIN scalar is untouched by either arm.
+        let plain = parse_frontmatter_block("---\nname: worker\ndescription: just text\n---\n\nBody\n");
+        assert_eq!(plain.get("description"), Some("just text"));
+    }
+
+    /// pi gates BOTH indicators on `!isQuoted` (`:124-125`), so a quoted pipe is the literal
+    /// one-character string — the mirror of the existing `">"` test.
+    #[test]
+    fn a_quoted_pipe_is_a_literal_string_not_a_literal_block_indicator() {
+        let parsed = parse_frontmatter_block("---\nname: worker\ndescription: \"|\"\n---\n\nBody\n");
+        assert_eq!(parsed.get("description"), Some("|"));
+    }
+
+    /// pi `:91` folds `currentLiteral` into the blank-line continuation test alongside
+    /// `currentFolded`, so a literal block keeps its interior blank lines — which for a literal
+    /// scalar are content, not a paragraph separator.
+    #[test]
+    fn a_literal_block_keeps_its_interior_blank_lines() {
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: |\n  para one\n\n  para two\ntools: read\n---\n\nBody\n",
+        );
+        assert_eq!(parsed.get("description"), Some("para one\n\npara two"));
+        assert_eq!(parsed.get("tools"), Some("read"));
     }
 
     // -----------------------------------------------------------------------------------------

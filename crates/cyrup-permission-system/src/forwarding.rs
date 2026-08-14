@@ -34,6 +34,7 @@
 //! `watch_control_inbox` `notify::PollWatcher` pattern. The spool MECHANISM is pi's own.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -49,6 +50,7 @@ use crate::ask::{
 };
 use crate::error::PermissionError;
 use crate::ext_config::ExtensionConfig;
+use crate::logging::{sensitive_log_metadata, AuditTrail};
 
 /// pi `PERMISSION_FORWARDING_TIMEOUT_MS = 10 * 60 * 1000` (`permission-forwarding.ts:7`): the CHILD's
 /// blocking-wait deadline AND the parent's expired-on-read cutoff.
@@ -402,16 +404,33 @@ pub async fn wait_for_forwarded_approval(
     requester_agent_name: &str,
     message: &str,
     timeout: Duration,
+    audit: &AuditTrail,
 ) -> PermissionPromptDecision {
     let Some(target) = normalize_session_id(target_session_id) else {
-        return denied(); // pi null-target deny (`index.ts:1267-1272`).
+        // pi null-target deny (v0.8.0 `index.ts:1000-1005`), WITH its error entry (`:1001-1003`).
+        audit.forwarding_error(
+            "Permission forwarding target session could not be resolved from subagent runtime metadata (expected CYRUP_SUBAGENT_PARENT_SESSION)",
+            None,
+        );
+        return denied();
     };
     let location = match forwarding_location(default_agent_dir, &target) {
         Ok(l) => l,
-        Err(_) => return denied(),
+        Err(err) => {
+            audit.forwarding_error(
+                &format!("Permission forwarding is unavailable because session-scoped directories could not be prepared for '{target}'"),
+                Some(&err.to_string()),
+            );
+            return denied();
+        }
     };
     if !ensure_location(&location) {
-        return denied(); // pi unavailable-dirs deny (`index.ts:1275-1280`).
+        // pi unavailable-dirs deny + error entry (v0.8.0 `index.ts:1007-1013`).
+        audit.forwarding_error(
+            &format!("Permission forwarding is unavailable because session-scoped directories could not be prepared for '{target}'"),
+            None,
+        );
+        return denied();
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -427,20 +446,79 @@ pub async fn wait_for_forwarded_approval(
     let request_path = location.requests_dir.join(format!("{request_id}.json"));
     let response_path = location.responses_dir.join(format!("{request_id}.json"));
 
-    if write_json_atomic(&request_path, &request).is_err() {
-        return denied(); // pi request-write failure deny (`index.ts:1309-1312`).
+    // pi `writeReviewEntry("forwarded_permission.request_created", …)`
+    // (v0.8.0 `index.ts:1030-1037`) — written BEFORE the spool write, so a request that fails to
+    // land still leaves evidence that it was attempted.
+    audit.review(
+        "forwarded_permission.request_created",
+        &serde_json::json!({
+            "requestId": request_id,
+            "requesterAgentName": request.requester_agent_name,
+            "requesterSessionId": request.requester_session_id,
+            "targetSessionId": target,
+            "requestPath": request_path.display().to_string(),
+            "responsePath": response_path.display().to_string(),
+        }),
+    );
+
+    if let Err(err) = write_json_atomic(&request_path, &request) {
+        // pi request-write failure deny + error entry (v0.8.0 `index.ts:1039-1044`).
+        audit.forwarding_error(
+            &format!("Failed to write forwarded permission request '{}'", request_path.display()),
+            Some(&err.to_string()),
+        );
+        return denied();
     }
 
     // pi poll-to-deadline (`index.ts:1314-1343`). Reuse ONE `notify::PollWatcher` on the responses dir
     // for low-latency wakeups (fed by the parent's response write), with the poll interval as the
     // fallback tick — the pi `fs.watch` + `min(POLL, remaining)` structure.
-    let mut watcher = watch_dir(&location.responses_dir).ok();
+    let mut watcher = match watch_dir(&location.responses_dir) {
+        Ok(w) => Some(w),
+        Err(err) => {
+            // pi `writeDebugEntry("permission_forwarding.watch_setup_error", { responseDir, error })`
+            // (v0.8.0 `index.ts:658-664`), inside `waitForForwardedPermissionResponseFile`: a
+            // directory watch is best-effort across filesystems, and the poll tick below is the
+            // documented safe fallback, so this is diagnostic rather than a warning.
+            //
+            // \[CYRUP-DELTA] pi's sibling `permission_forwarding.watcher_close_error` (`:641-644`)
+            // has no reachable analog: it fires when node's `watcher.close()` throws, and Rust's
+            // `notify::PollWatcher` is torn down by `Drop`, which cannot fail or report. Nothing is
+            // dropped from the trail that a cyrup run could ever have produced.
+            audit.debug(
+                "permission_forwarding.watch_setup_error",
+                &serde_json::json!({
+                    "responseDir": location.responses_dir.display().to_string(),
+                    "error": err.to_string(),
+                }),
+            );
+            None
+        }
+    };
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if response_path.exists() {
             let bound = read_response(&response_path)
                 .filter(|resp| response_is_bound(resp, &request, &target));
-            let _ = std::fs::remove_file(&response_path); // consume-on-read (pi `:1333`).
+            // pi `writeReviewEntry("forwarded_permission.response_received", …)`
+            // (v0.8.0 `index.ts:1056-1064`) — written for EVERY response file observed, bound or
+            // not, with every field `null` when the binding check rejected it. That is the whole
+            // point: a forged or stale response is exactly what an operator needs to see.
+            audit.review(
+                "forwarded_permission.response_received",
+                &serde_json::json!({
+                    "requestId": request_id,
+                    "approved": bound.as_ref().map_or(serde_json::Value::Null, |r| serde_json::Value::Bool(r.approved)),
+                    "state": bound.as_ref().map_or(serde_json::Value::Null, |r| serde_json::json!(r.state)),
+                    "denialReasonMetadata": sensitive_log_metadata(
+                        bound.as_ref().and_then(|r| r.denial_reason.as_deref()),
+                    ),
+                    "responderSessionId": bound.as_ref().map_or(serde_json::Value::Null, |r| serde_json::Value::String(r.responder_session_id.clone())),
+                    "targetSessionId": target,
+                    "responsePath": response_path.display().to_string(),
+                }),
+            );
+            let _ = std::fs::remove_file(&response_path); // consume-on-read (pi `:1066`).
             if let Some(resp) = bound {
                 let _ = std::fs::remove_file(&request_path);
                 cleanup_location_if_empty(&location);
@@ -470,7 +548,24 @@ pub async fn wait_for_forwarded_approval(
         }
     }
 
-    // pi timeout deny (`index.ts:1345-1354`).
+    // pi timeout deny (v0.8.0 `index.ts:1077-1086`): a `permission_forwarding.warning` FIRST
+    // (`:1077`), then the `forwarded_permission.response_timed_out` review entry (`:1078-1083`).
+    audit.forwarding_warning(
+        &format!(
+            "Timed out waiting for forwarded permission response '{}'",
+            response_path.display()
+        ),
+        None,
+    );
+    audit.review(
+        "forwarded_permission.response_timed_out",
+        &serde_json::json!({
+            "requestId": request_id,
+            "requesterAgentName": request.requester_agent_name,
+            "targetSessionId": target,
+            "responsePath": response_path.display().to_string(),
+        }),
+    );
     let _ = std::fs::remove_file(&request_path);
     cleanup_location_if_empty(&location);
     denied()
@@ -531,7 +626,22 @@ pub async fn process_forwarded_requests(
     services: &Arc<dyn HostServices>,
     config: &ExtensionConfig,
     options: ProcessForwardedOptions,
+    audit: &AuditTrail,
+    has_ui: bool,
 ) {
+    // PERM-031 / pi `if (!ctx.hasUI) { return; }` (v0.8.0 `index.ts:1113-1116`) — re-checked on
+    // EVERY scan, not only at watcher start. Upstream's `permissionForwardingContext` is a live
+    // `ExtensionContext` reference, so a UI that detaches mid-session flips `ctx.hasUI` under the
+    // running poller and the spool simply stops being serviced; each request then stays on disk
+    // until the UI returns or the CHILD's own 10-minute bound expires.
+    //
+    // Without this, cyrup's watcher kept scanning between hooks and every pending child ask fell
+    // through to `AskOutcome::NoLiveChannel => denied()`, which writes a nonce-bound DENY the child
+    // consumes as the operator's FINAL answer. pi defers; cyrup answered "denied" on behalf of an
+    // absent human.
+    if !has_ui {
+        return;
+    }
     let Some(current) = normalize_session_id(session_id) else {
         return;
     };
@@ -549,7 +659,18 @@ pub async fn process_forwarded_requests(
             .filter_map(|entry| entry.ok().map(|e| e.path()))
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
             .collect(),
-        Err(_) => return,
+        Err(err) => {
+            // pi `logPermissionForwardingWarning("Failed to read … requests from '…'")`
+            // (v0.8.0 `index.ts:1131`).
+            audit.forwarding_warning(
+                &format!(
+                    "Failed to read primary permission forwarding requests from '{}'",
+                    location.requests_dir.display()
+                ),
+                Some(&err.to_string()),
+            );
+            return;
+        }
     };
     request_files.sort(); // pi `.sort()` (`index.ts:1375`) — deterministic order.
 
@@ -557,7 +678,7 @@ pub async fn process_forwarded_requests(
         let request = match read_request(&request_path) {
             Some(r) => r,
             None => {
-                let _ = std::fs::remove_file(&request_path); // invalid → delete (pi `:1392-1395`).
+                let _ = std::fs::remove_file(&request_path); // invalid → delete (pi `:1143-1146`).
                 continue;
             }
         };
@@ -565,6 +686,14 @@ pub async fn process_forwarded_requests(
         // pi `isForwardedPermissionRequestForSession` (`:1397-1403`): drop a request for another
         // session (a hostile/stale spool entry cannot steer THIS parent's human).
         if normalize_session_id(&request.target_session_id).as_deref() != Some(current.as_str()) {
+            // pi `logPermissionForwardingWarning` (v0.8.0 `index.ts:1149-1151`).
+            audit.forwarding_warning(
+                &format!(
+                    "Ignoring forwarded permission request '{}' because it targets session '{}' instead of '{current}'",
+                    request.id, request.target_session_id
+                ),
+                None,
+            );
             let _ = std::fs::remove_file(&request_path);
             continue;
         }
@@ -590,16 +719,71 @@ pub async fn process_forwarded_requests(
         // so denying it would not prevent the write. A request that cannot be answered safely must
         // never be shown at all.
         if validate_safe_token(&request.id).is_err() {
+            // pi's escaping-response-path warning (v0.8.0 `index.ts:1158`). Upstream folds both
+            // guards into `resolvePathWithinDirectory` returning `null`; cyrup keeps them as two
+            // checks (see above) and reports the same message from each.
+            audit.forwarding_warning(
+                &format!(
+                    "Ignoring forwarded permission request '{}' because its response path would escape '{}'",
+                    request.id,
+                    location.responses_dir.display()
+                ),
+                None,
+            );
             let _ = std::fs::remove_file(&request_path);
             continue;
         }
         let response_path = location.responses_dir.join(format!("{}.json", request.id));
         if validate_contains_root(&location.responses_dir, &response_path).is_err() {
+            audit.forwarding_warning(
+                &format!(
+                    "Ignoring forwarded permission request '{}' because its response path would escape '{}'",
+                    request.id,
+                    location.responses_dir.display()
+                ),
+                None,
+            );
             let _ = std::fs::remove_file(&request_path);
             continue;
         }
 
-        let decision = resolve_forwarded_decision(&request, services, config).await;
+        // pi `forwardedPermissionLogDetails` (v0.8.0 `index.ts:1164-1167`) =
+        // `createForwardedPermissionLogDetails(request, location)` (`:1091-1108`) plus
+        // `requestPath`. `source` is `location.label`, which is the constant `"primary"` in the
+        // single-location model both sides use.
+        let log_details = serde_json::json!({
+            "requestId": request.id,
+            "source": "primary",
+            "requesterAgentName": request.requester_agent_name,
+            "requesterSessionId": request.requester_session_id,
+            "targetSessionId": request.target_session_id,
+            "requestPath": request_path.display().to_string(),
+        });
+
+        let decision =
+            resolve_forwarded_decision(&request, services, config, audit, &log_details).await;
+
+        // pi `writeReviewEntry(decision.approved ? ".approved" : ".denied", …)`
+        // (v0.8.0 `index.ts:1225-1230`). Note the details here are
+        // `createForwardedPermissionLogDetails(...)` WITHOUT `requestPath` and WITH `responsePath`
+        // — a different shape from `forwardedPermissionLogDetails` above, deliberately.
+        audit.review(
+            if decision.approved {
+                "forwarded_permission.approved"
+            } else {
+                "forwarded_permission.denied"
+            },
+            &serde_json::json!({
+                "requestId": request.id,
+                "source": "primary",
+                "requesterAgentName": request.requester_agent_name,
+                "requesterSessionId": request.requester_session_id,
+                "targetSessionId": request.target_session_id,
+                "responsePath": response_path.display().to_string(),
+                "resolution": decision.state,
+                "denialReasonMetadata": sensitive_log_metadata(decision.denial_reason.as_deref()),
+            }),
+        );
 
         let response = ForwardedPermissionResponse {
             request_id: request.id.clone(),
@@ -610,8 +794,17 @@ pub async fn process_forwarded_requests(
             responder_session_id: current.clone(),
             responded_at: now_millis(),
         };
-        if write_json_atomic(&response_path, &response).is_err() {
-            continue; // pi response-write failure: leave the request for a retry (`:1493-1496`).
+        if let Err(err) = write_json_atomic(&response_path, &response) {
+            // pi response-write failure: report it and leave the request for a retry
+            // (v0.8.0 `index.ts:1240-1243`).
+            audit.forwarding_error(
+                &format!(
+                    "Failed to write primary forwarded permission response '{}'",
+                    response_path.display()
+                ),
+                Some(&err.to_string()),
+            );
+            continue;
         }
         let _ = std::fs::remove_file(&request_path); // pi `:1498`.
     }
@@ -630,10 +823,36 @@ async fn resolve_forwarded_decision(
     request: &ForwardedPermissionRequest,
     services: &Arc<dyn HostServices>,
     config: &ExtensionConfig,
+    audit: &AuditTrail,
+    log_details: &serde_json::Value,
 ) -> PermissionPromptDecision {
+    /// Spread `log_details` (pi's `...forwardedPermissionLogDetails`) then the extra keys, matching
+    /// JS object-literal ordering where the later keys win.
+    fn with_details(base: &serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+        let mut record = base.clone();
+        if let (serde_json::Value::Object(target), serde_json::Value::Object(source)) =
+            (&mut record, &extra)
+        {
+            for (key, value) in source {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        record
+    }
+
+    let timeout_ms = i64::try_from(PERMISSION_FORWARDING_TIMEOUT.as_millis()).unwrap_or(i64::MAX);
     let age_ms = now_millis().saturating_sub(request.created_at);
-    if age_ms >= i64::try_from(PERMISSION_FORWARDING_TIMEOUT.as_millis()).unwrap_or(i64::MAX) {
-        // pi expired-on-read (v0.8.0 `index.ts:1172-1182`).
+    if age_ms >= timeout_ms {
+        // pi `writeReviewEntry("forwarded_permission.expired", {...details, requestAgeMs,
+        // timeoutMs})` (v0.8.0 `index.ts:1173-1177`).
+        audit.review(
+            "forwarded_permission.expired",
+            &with_details(
+                log_details,
+                serde_json::json!({ "requestAgeMs": age_ms, "timeoutMs": timeout_ms }),
+            ),
+        );
+        // pi expired-on-read (v0.8.0 `index.ts:1178-1182`).
         return PermissionPromptDecision {
             approved: false,
             state: PermissionDecisionState::Denied,
@@ -647,12 +866,20 @@ async fn resolve_forwarded_decision(
     // pi `shouldAutoApprovePermissionState("ask", extensionConfig)` (v0.8.0 `index.ts:1183-1185`):
     // yolo auto-approves.
     if config.yolo_mode {
+        // pi `writeReviewEntry("forwarded_permission.auto_approved", forwardedPermissionLogDetails)`
+        // (v0.8.0 `index.ts:1184`).
+        audit.review("forwarded_permission.auto_approved", log_details);
         return PermissionPromptDecision {
             approved: true,
             state: PermissionDecisionState::Approved,
             denial_reason: None,
         };
     }
+
+    // pi `writeReviewEntry("forwarded_permission.prompted", forwardedPermissionLogDetails)`
+    // (v0.8.0 `index.ts:1187`) — written BEFORE the debug notify and before the dialog opens, so a
+    // parent killed mid-prompt still leaves evidence the request reached a human.
+    audit.review("forwarded_permission.prompted", log_details);
 
     // pi debug notify (v0.8.0 `index.ts:1188-1197`).
     if config.debug {
@@ -731,6 +958,17 @@ async fn resolve_forwarded_decision(
 /// snapshots it once per poll iteration (`snapshot_config`) instead of once per spawn.
 pub type SharedExtensionConfig = Arc<Mutex<ExtensionConfig>>;
 
+/// PERM-031 — a LIVE handle on `ctx.has_ui`, shared between the extension's event arms and the
+/// spawned watcher, threaded exactly the way PERM-005 threaded [`SharedExtensionConfig`].
+///
+/// This is the cyrup form of pi's `permissionForwardingContext` (`index.ts:1666`): upstream keeps a
+/// reference to the live `ExtensionContext` and `processForwardedPermissionRequests` re-reads
+/// `ctx.hasUI` off it on every scan (`:1114`), so a UI that detaches mid-session stops the spool
+/// being serviced WITHOUT any hook having to fire. cyrup's `HostCtx` is passed by reference per
+/// dispatch and cannot be held, so the one field the watcher needs is mirrored into an atomic that
+/// every ctx-bearing event arm refreshes.
+pub type SharedHasUi = Arc<AtomicBool>;
+
 /// Read the current [`ExtensionConfig`] out of a [`SharedExtensionConfig`], never holding the lock
 /// across an `await` (the clone is taken and the guard dropped inside this call).
 fn snapshot_config(config: &SharedExtensionConfig) -> ExtensionConfig {
@@ -760,6 +998,8 @@ pub fn spawn_forwarding_watcher(
     agent_dir: PathBuf,
     services: Arc<dyn HostServices>,
     config: SharedExtensionConfig,
+    audit: Arc<AuditTrail>,
+    has_ui: SharedHasUi,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(CONTROL_INBOX_POLL_INTERVAL);
@@ -794,10 +1034,30 @@ pub fn spawn_forwarding_watcher(
             &services,
             &snapshot_config(&config),
             ProcessForwardedOptions::preserve_location(),
+            &audit,
+            has_ui.load(Ordering::Relaxed),
         )
         .await;
 
-        let mut watcher = watch_dir(&location.requests_dir).ok();
+        let mut watcher = match watch_dir(&location.requests_dir) {
+            Ok(w) => Some(w),
+            Err(err) => {
+                // pi `logPermissionForwardingWarning("Unable to watch permission forwarding
+                // requests at '…'; using reduced-frequency polling fallback", error)`
+                // (v0.8.0 `index.ts:1763-1768`) — the PARENT-side watch-setup failure. It is a
+                // `warning` review entry, not a debug entry: the debug pair at `:641`/`:660` is
+                // the CHILD's response-dir watcher, and is written below in
+                // `wait_for_forwarded_approval`.
+                audit.forwarding_warning(
+                    &format!(
+                        "Unable to watch permission forwarding requests at '{}'; using reduced-frequency polling fallback",
+                        location.requests_dir.display()
+                    ),
+                    Some(&err.to_string()),
+                );
+                None
+            }
+        };
         loop {
             match watcher.as_mut() {
                 Some((_w, rx)) => {
@@ -818,6 +1078,9 @@ pub fn spawn_forwarding_watcher(
                 &services,
                 &snapshot_config(&config),
                 ProcessForwardedOptions::preserve_location(),
+                &audit,
+                // PERM-031: re-read on EVERY scan, not captured at spawn — pi's `ctx.hasUI`.
+                has_ui.load(Ordering::Relaxed),
             )
             .await;
         }
@@ -1032,7 +1295,14 @@ mod tests {
 
         let config = Arc::new(Mutex::new(ExtensionConfig::default()));
         let watcher =
-            spawn_forwarding_watcher(agent_dir.clone(), Arc::clone(&services), Arc::clone(&config));
+            spawn_forwarding_watcher(
+                agent_dir.clone(),
+                Arc::clone(&services),
+                Arc::clone(&config),
+                Arc::new(AuditTrail::detached(agent_dir.join("logs"))),
+                // PERM-031: a UI is present, which is the precondition for the spool being scanned.
+                Arc::new(AtomicBool::new(true)),
+            );
 
         let request_path = forwarding_location(&agent_dir, parent)
             .unwrap()
@@ -1094,7 +1364,14 @@ mod tests {
         assert!(!snapshot_config(&config).yolo_mode, "the watcher starts in non-yolo mode");
 
         let watcher =
-            spawn_forwarding_watcher(agent_dir.clone(), Arc::clone(&services), Arc::clone(&config));
+            spawn_forwarding_watcher(
+                agent_dir.clone(),
+                Arc::clone(&services),
+                Arc::clone(&config),
+                Arc::new(AuditTrail::detached(agent_dir.join("logs"))),
+                // PERM-031: a UI is present, which is the precondition for the spool being scanned.
+                Arc::new(AtomicBool::new(true)),
+            );
 
         // The mid-session `refreshExtensionConfig`. This lands strictly AFTER the pre-fix code took
         // its by-value snapshot (that snapshot was the `config: ExtensionConfig` argument itself,

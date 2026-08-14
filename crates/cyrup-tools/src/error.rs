@@ -23,6 +23,79 @@ pub(crate) fn io(context: &str, e: &std::io::Error) -> ToolError {
     ToolError::new(format!("{context}: {e}"))
 }
 
+/// Node's `error.code` for a filesystem `io::Error` — the libuv errno NAME (`ENOENT`, `EACCES`,
+/// …) that Pi interpolates as `` `Error code: ${error.code}` `` (edit.ts:332-333).
+///
+/// Rust's `io::Error` carries the raw platform errno and a Display string, but no code name, and
+/// [`ToolError`] is a flat `{message}` struct with nowhere to put a side channel. So the name is
+/// derived here and travels as the LEADING token of the message built by [`io_errno`], which is
+/// also the shape Node's own `Error.message` uses (`ENOENT: no such file or directory, access
+/// '/x'`). [`errno_code_of`] recovers it, and is the Rust analogue of Pi's `"code" in error` test.
+///
+/// The set below is exactly the errno list Node's `uv_err_name` can produce for `access(2)` /
+/// `open(2)` / `scandir(3)` on the paths these tools take; anything else falls through to `None`,
+/// which drives Pi's `String(error)` branch (edit.ts:333) rather than inventing a code.
+pub(crate) fn errno_name(e: &std::io::Error) -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        let code = e.raw_os_error()?;
+        let name = match code {
+            libc::ENOENT => "ENOENT",
+            libc::EACCES => "EACCES",
+            libc::EPERM => "EPERM",
+            libc::EROFS => "EROFS",
+            libc::EISDIR => "EISDIR",
+            libc::ENOTDIR => "ENOTDIR",
+            libc::ELOOP => "ELOOP",
+            libc::ENAMETOOLONG => "ENAMETOOLONG",
+            libc::ENOTEMPTY => "ENOTEMPTY",
+            libc::EEXIST => "EEXIST",
+            libc::EMFILE => "EMFILE",
+            libc::ENFILE => "ENFILE",
+            libc::ENOSPC => "ENOSPC",
+            libc::EIO => "EIO",
+            libc::EBUSY => "EBUSY",
+            libc::EINVAL => "EINVAL",
+            _ => return None,
+        };
+        Some(name)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no errno; map the portable kinds Node's libuv shim reports for the same
+        // syscalls. `raw_os_error` there is a Win32 code, not an errno, so go through `kind()`.
+        match e.kind() {
+            std::io::ErrorKind::NotFound => Some("ENOENT"),
+            std::io::ErrorKind::PermissionDenied => Some("EACCES"),
+            std::io::ErrorKind::AlreadyExists => Some("EEXIST"),
+            _ => None,
+        }
+    }
+}
+
+/// [`io`] with Node's errno code prepended, so the code survives the flattening into
+/// [`ToolError`]'s single `message` field. See [`errno_name`].
+pub(crate) fn io_errno(context: &str, e: &std::io::Error) -> ToolError {
+    match errno_name(e) {
+        Some(code) => ToolError::new(format!("{code}: {context}: {e}")),
+        None => io(context, e),
+    }
+}
+
+/// Recover the errno code from a message built by [`io_errno`] — Pi's `"code" in error` test
+/// (edit.ts:332). `None` means "this error object has no `code`", which is Pi's `String(error)`
+/// branch.
+pub(crate) fn errno_code_of(err: &ToolError) -> Option<&str> {
+    let (head, _rest) = err.message.split_once(": ")?;
+    // Guard against a path or free text that happens to contain `": "`: a code is a short,
+    // all-uppercase-ASCII `E…` token, exactly as `uv_err_name` produces.
+    let is_code = head.len() >= 2
+        && head.len() <= 16
+        && head.starts_with('E')
+        && head.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    is_code.then_some(head)
+}
+
 /// Cancellation (R-03-009). Pi throws `new Error("Operation aborted")` (capital O) on every
 /// non-bash tool's abort path — read.ts:226, edit.ts:319, ls.ts:115/119, write.ts:209, grep.ts:158,
 /// find.ts — so the model-observed literal must match exactly. (bash uses Pi's distinct

@@ -26,7 +26,12 @@ pub struct BeforeAgentStartInput {
     /// Echoed build options so the extension can re-derive/inspect (R-06-014).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_prompt: Option<Arc<str>>,
-    pub selected_tools: Vec<Arc<str>>,
+    /// Mirrors Pi's optional `BuildSystemPromptOptions.selectedTools?: string[]`
+    /// (`system-prompt.ts:12`): absent = the default set, `[]` = explicitly no tools. Echoing an
+    /// empty `Vec` for both would hide that distinction from the guest exactly as it used to hide
+    /// it from the builder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_tools: Option<Vec<Arc<str>>>,
     pub prompt_guidelines: Vec<Arc<str>>,
     pub context_files: Vec<ContextFile>,
     pub skills: Vec<SkillPointer>,

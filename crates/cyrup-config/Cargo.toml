@@ -29,6 +29,6 @@ thiserror = { workspace = true }
 tokio.workspace = true
 
 [dev-dependencies]
-# `tests/models_json_provider.rs` writes a real `models.json` into a tempdir and streams a request
+# `src/tests/models_json_provider.rs` writes a real `models.json` into a tempdir and streams a request
 # through the provider composed from it.
 tempfile = { workspace = true }

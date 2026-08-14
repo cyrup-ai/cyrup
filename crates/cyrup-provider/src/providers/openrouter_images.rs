@@ -17,7 +17,7 @@ use crate::images::{
 /// [`super::builtin_oauth::builtin_provider_oauth`].
 pub fn openrouter_images_auth() -> ProviderAuth {
     ProviderAuth {
-        api_key: Some(env_key(["OPENROUTER_API_KEY"])),
+        api_key: Some(env_key("OpenRouter API key", ["OPENROUTER_API_KEY"])),
         oauth: super::builtin_oauth::builtin_provider_oauth(OPENROUTER_PROVIDER_ID),
     }
 }

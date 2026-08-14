@@ -26,6 +26,27 @@ pub fn security_notice_for(source: PackageSource) -> SecurityNotice {
     }
 }
 
+/// Make a package install root self-ignoring (Pi `ensureGitIgnore`, package-manager.ts:1952-1960
+/// @v0.83.0): create the directory when absent, then write `*\n!.gitignore\n` — byte for byte —
+/// only when no `.gitignore` is already there, so a user's own file is never clobbered.
+pub(crate) fn ensure_git_ignore(dir: &std::path::Path) -> Result<(), ResourceError> {
+    if !dir.exists() {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            ResourceError::Manifest(format!(
+                "could not create package install root {}: {e}",
+                dir.display()
+            ))
+        })?;
+    }
+    let ignore_path = dir.join(".gitignore");
+    if !ignore_path.exists() {
+        std::fs::write(&ignore_path, "*\n!.gitignore\n").map_err(|e| {
+            ResourceError::Manifest(format!("could not write {}: {e}", ignore_path.display()))
+        })?;
+    }
+    Ok(())
+}
+
 impl PackageManager {
     pub fn new(store: PackageStore) -> Self {
         Self { store }
@@ -56,7 +77,7 @@ impl PackageManager {
         let id = source.package_id();
 
         let resolved_commit = match &source {
-            PackageSource::Oci { .. } => return Err(ResourceError::Unsupported),
+            PackageSource::Oci { .. } => return Err(ResourceError::UnsupportedOci),
             PackageSource::Path { path } => {
                 if !path.exists() {
                     return Err(ResourceError::Manifest(format!(
@@ -72,6 +93,14 @@ impl PackageManager {
                         "project package dir unavailable (no project root)".into(),
                     )
                 })?;
+                // `installGit` prepares the install ROOT before cloning — `const gitRoot =
+                // this.getGitInstallRoot(scope); if (gitRoot) { this.ensureGitIgnore(gitRoot); }`
+                // (package-manager.ts:1829-1834 @v0.83.0). At project scope that root is inside the
+                // user's repository, so without it the clone (and its nested `.git`) shows up in
+                // `git status` (CFG-037).
+                if let Some(root) = self.store.packages_root(scope) {
+                    ensure_git_ignore(&root)?;
+                }
                 let url = url.clone();
                 let ref_name = reff.ref_name().map(str::to_string);
                 let commit = tokio::task::spawn_blocking(move || git_clone(&url, &dir, ref_name))
@@ -219,7 +248,7 @@ fn refresh(
 ) -> Result<(), ResourceError> {
     match &pkg.source {
         PackageSource::Path { .. } => Ok(()),
-        PackageSource::Oci { .. } => Err(ResourceError::Unsupported),
+        PackageSource::Oci { .. } => Err(ResourceError::UnsupportedOci),
         PackageSource::Git { url, reff } => {
             let Some(dir) = store.package_dir(scope, &pkg.id) else {
                 return Ok(());
@@ -289,8 +318,7 @@ fn git_clone_url(
     if dir.exists() {
         let _ = std::fs::remove_dir_all(dir);
     }
-    let prepare =
-        gix::prepare_clone(url, dir).map_err(|e| ResourceError::Git(e.to_string()))?;
+    let prepare = gix::prepare_clone(url, dir).map_err(|e| ResourceError::Git(e.to_string()))?;
     // `prepare_clone` creates a FRESH repo whose config does NOT include the user's
     // ~/.gitconfig (credential helper, SSH command). Inject that auth config now — between
     // prepare_clone and fetch — so a PRIVATE https/ssh install authenticates with the user's

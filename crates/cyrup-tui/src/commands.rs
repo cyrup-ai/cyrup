@@ -48,7 +48,9 @@ pub struct SlashCommand {
 /// NOT alphabetical — order is user-visible and preserved exactly.
 pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     cmd("settings", "Open settings menu", None),
-    arg_cmd("model", "Select model (opens selector UI)", "<model>"),
+    // TUI-025 — pi's hint is `"<provider/model>"` (`slash-commands.ts:21` @v0.84.1); `"<model>"`
+    // understated the required form and left the user guessing at the `provider/` half.
+    arg_cmd("model", "Select model (opens selector UI)", "<provider/model>"),
     cmd("scoped-models", "Enable/disable models for Ctrl+P cycling", None),
     cmd("export", "Export session (HTML default, or specify path: .html/.jsonl)", None),
     cmd("import", "Import and resume a session from a JSONL file", None),
@@ -62,12 +64,21 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     cmd("clone", "Duplicate the current session at the current position", None),
     cmd("tree", "Navigate session tree (switch branches)", None),
     cmd("trust", "Save project trust decision for future sessions", None),
-    cmd("login", "Configure provider authentication", None),
+    // TUI-025 — pi carries `argumentHint: "<provider>"` here (`slash-commands.ts:35`); cyrup had no
+    // hint at all, which is also what left `has_arg_completion` false for `/login`.
+    arg_cmd("login", "Configure provider authentication", "<provider>"),
     cmd("logout", "Remove provider authentication", None),
     cmd("new", "Start a new session", None),
     cmd("compact", "Manually compact the session context", None),
     cmd("resume", "Resume a different session", None),
-    cmd("reload", "Reload keybindings, extensions, skills, prompts, and themes", None),
+    // TUI-025 — `slash-commands.ts:40`: `"Reload keybindings, extensions, skills, prompts, themes,
+    // and context files"`. `/reload` does reload context files, so the shorter sentence was wrong,
+    // not merely shorter.
+    cmd(
+        "reload",
+        "Reload keybindings, extensions, skills, prompts, themes, and context files",
+        None,
+    ),
     cmd("quit", "Quit cyrup", None),
 ];
 

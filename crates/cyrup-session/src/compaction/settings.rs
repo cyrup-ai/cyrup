@@ -32,11 +32,19 @@ impl Default for CompactionSettings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchSummarySettings {
-    /// Message budget (newest-first) for the branch summary (default 16384). Per the corrected
-    /// R-05-016 this IS the message budget, not `contextWindow − reserve`.
+    /// Headroom RESERVED out of the model context window; the newest-first message budget is
+    /// `(model.contextWindow || 128000) − reserve_tokens`, not this value
+    /// (`branch-summarization.ts:312-313` @v0.83.0, default `reserveTokens = 16384` at `:305`).
+    /// Implemented by [`super::branch::branch_token_budget`]. An earlier doc here claimed this
+    /// field WAS the budget; it is not, and a reader trusting that re-introduces the bug SESS-006
+    /// closed.
     #[serde(default = "default_reserve")]
     pub reserve_tokens: u32,
-    /// Skip summarization when the user did not ask for it (default false, R-05-018).
+    /// FRONT-END-ONLY: whether the TUI skips *asking* the user whether to summarize before a
+    /// `/tree` navigation. Pi's sole consumer repo-wide is `interactive-mode.ts:4672`; the word
+    /// `skipPrompt` does not appear in `agent-session.ts` at all, and `navigateTree`'s summarizer
+    /// gate is the user's choice alone (`agent-session.ts:2983`). The core branch-summary path
+    /// therefore does NOT consult this — see [`super::Compactor::run_branch_summary`].
     #[serde(default)]
     pub skip_prompt: bool,
 }

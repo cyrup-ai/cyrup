@@ -1,7 +1,7 @@
 //! In-memory agent state + the event reducer (arch-02 §4.1 / func-02 §10).
 
 use crate::event::{AgentEvent, AgentMessage};
-use cyrup_core::{ModelRef, StopReason, ModelThinkingLevel, Tool, ToolCallId};
+use cyrup_core::{ModelRef, ModelThinkingLevel, Tool, ToolCallId};
 use cyrup_provider::{CacheRetention, OnPayload, OnResponseHook, ThinkingBudgets, Transport};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -38,6 +38,24 @@ pub struct GenerationConfig {
     /// Static API key fallback used when no dynamic resolver yields one (Pi `config.apiKey`
     /// fallback, agent-loop.ts:301-302).
     pub api_key: Option<String>,
+    /// AGENT-S03 — provider-extracted request metadata (Pi `StreamOptions.metadata`,
+    /// `packages/ai/src/types.ts`: "For example, Anthropic uses `user_id` for abuse tracking and
+    /// rate limiting"). `AgentLoopConfig extends SimpleStreamOptions`
+    /// (`packages/agent/src/types.ts:271`) and `agent-loop.ts:308-312` spreads the whole config into
+    /// the provider call, so a pi low-level caller can set it by construction; cyrup had no field at
+    /// all and `stream_assistant` closed its `StreamOptions` literal with `..Default::default()`.
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    /// AGENT-031 — WebSocket connect (handshake) timeout in ms (Pi
+    /// `SimpleStreamOptions.websocketConnectTimeoutMs`, `packages/ai/src/types.ts:159`). pi's session
+    /// `streamFn` sets `websocketConnectTimeoutMs: options?.websocketConnectTimeoutMs ??
+    /// settingsManager.getWebSocketConnectTimeoutMs()` (`coding-agent/src/core/sdk.ts`, identical at
+    /// both tags), and a low-level caller can set it because `AgentLoopConfig extends
+    /// SimpleStreamOptions` (`packages/agent/src/types.ts:271`).
+    ///
+    /// `cyrup_provider::StreamOptions` has declared the field since `stream.rs:177-179`; before this
+    /// there was no path from the agent to it, so it was permanently `None` and the parsed
+    /// `websocketConnectTimeoutMs` setting had no consumer anywhere in the tree.
+    pub websocket_connect_timeout_ms: Option<u64>,
     /// Telemetry: inspect/replace the provider payload before sending (Pi `onPayload`, agent.ts:102).
     pub on_payload: Option<OnPayload>,
     /// Telemetry: invoked after the HTTP response arrives, before its body is read (Pi `onResponse`,
@@ -139,10 +157,13 @@ pub struct AgentStateSnapshot {
 /// - `errorMessage` is set on an error/aborted turn (R-02-042).
 pub fn reduce(st: &mut StateInner, ev: &AgentEvent) {
     match ev {
+        // AGENT-018 — no role check. pi is `case "message_start": this._state.streamingMessage =
+        // event.message; break;` (`packages/agent/src/agent.ts:531-533` @v0.83.0, `:546-548`
+        // @v0.84.1). The assistant-only guard meant a front-end rendering `streaming_message` showed
+        // nothing for user and tool-result messages, where pi shows them — and the matching
+        // `MessageEnd` arm below already clears unconditionally, so the two were asymmetric.
         AgentEvent::MessageStart { message } => {
-            if message.is_assistant() {
-                st.streaming_message = Some(message.clone());
-            }
+            st.streaming_message = Some(message.clone());
         }
         AgentEvent::MessageUpdate { message, .. } => {
             st.streaming_message = Some(message.clone());
@@ -157,16 +178,26 @@ pub fn reduce(st: &mut StateInner, ev: &AgentEvent) {
         AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
             st.pending_tool_calls.remove(tool_call_id);
         }
+        // AGENT-011 — gated purely on PRESENCE, with no stop-reason gate and no synthetic fallback.
+        // pi is `case "turn_end": if (event.message.role === "assistant" &&
+        // event.message.errorMessage) { this._state.errorMessage = event.message.errorMessage; }
+        // break;` (`packages/agent/src/agent.ts:558-562` @v0.83.0, `:573-577` @v0.84.1). The old
+        // stop-reason gate fabricated a user-visible "turn ended with error" on a deliberate cancel
+        // that carried no `errorMessage`, and dropped a recoverable-error annotation arriving on a
+        // turn whose stop reason was not error/aborted.
         AgentEvent::TurnEnd { message, .. } => {
             if let AgentMessage::Assistant(a) = message
-                && matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) {
-                    st.error_message =
-                        a.error_message.clone().or_else(|| Some("turn ended with error".to_string()));
-                }
+                && let Some(msg) = a.error_message.as_ref()
+                && !msg.is_empty()
+            {
+                st.error_message = Some(msg.clone());
+            }
         }
+        // AGENT-018 — pi's `agent_end` case clears ONLY `streamingMessage`
+        // (`agent.ts:564-566` @v0.83.0); `pendingToolCalls` is reset later, in `finishRun()`
+        // (`:514-520`), which cyrup mirrors in `SettlementGuard::drop`.
         AgentEvent::AgentEnd { .. } => {
             st.streaming_message = None;
-            st.pending_tool_calls.clear();
         }
         AgentEvent::AgentStart | AgentEvent::TurnStart | AgentEvent::ToolExecutionUpdate { .. } => {}
     }

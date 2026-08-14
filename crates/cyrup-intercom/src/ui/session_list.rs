@@ -191,6 +191,7 @@ mod tests {
         SessionInfo {
             id: id.to_string(),
             name: Some(name.to_string()),
+            runtime_fallback_alias: None,
             cwd: "/Users/envvar/.config/ghostty".to_string(),
             model: "bsy-deepseek-v4-pro".to_string(),
             pid: 1u32.into(),

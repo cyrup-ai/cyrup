@@ -3,12 +3,13 @@
 //! Anthropic-compatible providers only in base URL, env key, and catalog. Mirrors Pi's
 //! `providers/anthropic.ts` + the generated `anthropic.models.ts` catalog.
 //!
-//! Auth: `ANTHROPIC_OAUTH_TOKEN` takes precedence over `ANTHROPIC_API_KEY` (Pi
-//! `envApiKeyAuth("Anthropic API key", ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"])`), and the
-//! Pi provider's OAuth *login* clause (`lazyOAuth`/`loadAnthropicOAuth`,
-//! `providers/anthropic.ts:50-54`) is wired too — see
-//! [`super::builtin_oauth::builtin_provider_oauth`]. Both the resolution path (explicit → stored →
-//! env) and the login path are live.
+//! Auth is a 1:1 port of `anthropicApiKeyAuth()` (`providers/anthropic.ts:9-36` @v0.83.0), NOT the
+//! generic `envApiKeyAuth` helper: the order is stored credential → `ANTHROPIC_AUTH_TOKEN` as an
+//! `Authorization: Bearer` header → `ANTHROPIC_OAUTH_TOKEN` → `ANTHROPIC_API_KEY` as a literal api
+//! key. The Pi provider's OAuth *login* clause (`lazyOAuth`/`loadAnthropicOAuth`,
+//! `providers/anthropic.ts:45`) is wired too — see
+//! [`super::builtin_oauth::builtin_provider_oauth`] — and the api-key `login` (`:12-15`) is
+//! implemented on [`AnthropicApiKeyAuth`]. Resolution and both login paths are live.
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
@@ -31,14 +32,128 @@ pub fn anthropic_models() -> Vec<Model> {
     serde_json::from_str(ANTHROPIC_CATALOG_JSON).unwrap_or_default()
 }
 
-/// The Anthropic [`ProviderAuth`]: `ANTHROPIC_OAUTH_TOKEN` then `ANTHROPIC_API_KEY` (Pi
-/// `envApiKeyAuth`, env-api-keys.ts:70), **plus** the Claude Pro/Max OAuth login
-/// (`lazyOAuth({ name: "Anthropic (Claude Pro/Max)", isSubscription: true, load:
-/// loadAnthropicOAuth })`, `providers/anthropic.ts:50-54`) — see
+/// `ANTHROPIC_AUTH_TOKEN` — the bearer-token variable used by Anthropic-compatible gateways and
+/// proxies that authenticate with `Authorization: Bearer` rather than `x-api-key`
+/// (Pi `ANTHROPIC_AUTH_TOKEN_ENV`, `env-api-keys.ts:29` @v0.83.0).
+pub const ANTHROPIC_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
+/// Pi `ANTHROPIC_OAUTH_TOKEN_ENV` (`env-api-keys.ts:30` @v0.83.0).
+pub const ANTHROPIC_OAUTH_TOKEN_ENV: &str = "ANTHROPIC_OAUTH_TOKEN";
+/// Pi `ANTHROPIC_API_KEY_ENV` (`env-api-keys.ts:31` @v0.83.0).
+pub const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+/// The prompt text for the interactive api-key setup, verbatim from
+/// `providers/anthropic.ts:14` @v0.83.0.
+const ENTER_ANTHROPIC_API_KEY: &str = "Enter Anthropic API key";
+
+/// 1:1 port of `anthropicApiKeyAuth()` (`pi/packages/ai/src/providers/anthropic.ts:9-36`
+/// @v0.83.0).
+///
+/// PROV-021: the resolve order is stored credential, then **`ANTHROPIC_AUTH_TOKEN` as an
+/// `Authorization: Bearer` header** (`:21-27`), then `ANTHROPIC_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` as
+/// a literal api key (`:29-32`). The bearer arm cannot go through [`env_key`], which resolves every
+/// variable into `ModelAuth.api_key` and therefore into `x-api-key` — a header the gateways this
+/// variable exists for do not read.
+///
+/// PROV-003: `login` is the api-key half pi declares at `:12-15`.
+struct AnthropicApiKeyAuth;
+
+#[async_trait::async_trait]
+impl crate::auth::ApiKeyAuth for AnthropicApiKeyAuth {
+    fn name(&self) -> &str {
+        // Pi `name: "Anthropic API key"` (providers/anthropic.ts:11).
+        "Anthropic API key"
+    }
+
+    fn supports_login(&self) -> bool {
+        true
+    }
+
+    /// `login: async (interaction) => ({ type: "api_key", key: await interaction.prompt({ type:
+    /// "secret", message: "Enter Anthropic API key" }) })` (`providers/anthropic.ts:12-15`).
+    async fn login(
+        &self,
+        interaction: &dyn crate::auth::oauth::AuthInteraction,
+    ) -> Result<crate::auth::Credential, crate::auth::oauth::OAuthError> {
+        let key = interaction
+            .prompt(crate::auth::AuthPrompt::secret(ENTER_ANTHROPIC_API_KEY))
+            .await?;
+        Ok(crate::auth::Credential::ApiKey {
+            key: Some(key),
+            env: None,
+        })
+    }
+
+    async fn resolve(
+        &self,
+        _model: &Model,
+        ctx: &dyn crate::auth::AuthContext,
+        cred: Option<&crate::auth::Credential>,
+    ) -> Result<Option<crate::auth::AuthResult>, crate::error::AuthError> {
+        // `if (credential?.key) return { auth: { apiKey: credential.key }, env: credential.env,
+        // source: "stored credential" }` (:17-19). A stored credential owns the provider; env is
+        // not consulted.
+        if let Some(cred) = cred {
+            return Ok(match cred {
+                crate::auth::Credential::ApiKey { key, env } => Some(crate::auth::AuthResult {
+                    auth: crate::auth::ModelAuth {
+                        api_key: key.clone(),
+                        ..Default::default()
+                    },
+                    env: env.clone(),
+                    source: Some("stored".to_string()),
+                }),
+                // An OAuth credential is not this api-key strategy's concern.
+                crate::auth::Credential::Oauth { .. } => None,
+            });
+        }
+
+        // `const authToken = await ctx.env(ANTHROPIC_AUTH_TOKEN_ENV); if (authToken) return { auth:
+        // { headers: { Authorization: `Bearer ${authToken}` } }, source: ANTHROPIC_AUTH_TOKEN_ENV }`
+        // (:21-27). Note it resolves BEFORE the other two and produces NO `apiKey`, so no
+        // `x-api-key` is emitted.
+        if let Some(token) = ctx.env(ANTHROPIC_AUTH_TOKEN_ENV).await
+            && !token.is_empty()
+        {
+            let mut headers = crate::HeaderMap::new();
+            headers.insert("Authorization".to_string(), Some(format!("Bearer {token}")));
+            return Ok(Some(crate::auth::AuthResult {
+                auth: crate::auth::ModelAuth {
+                    api_key: None,
+                    headers: Some(headers),
+                    base_url: None,
+                },
+                env: None,
+                source: Some(ANTHROPIC_AUTH_TOKEN_ENV.to_string()),
+            }));
+        }
+
+        // `for (const envVar of [ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_API_KEY_ENV]) { … }` (:29-32).
+        for var in [ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_API_KEY_ENV] {
+            if let Some(val) = ctx.env(var).await
+                && !val.is_empty()
+            {
+                return Ok(Some(crate::auth::AuthResult {
+                    auth: crate::auth::ModelAuth {
+                        api_key: Some(val),
+                        ..Default::default()
+                    },
+                    env: None,
+                    source: Some(var.to_string()),
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The Anthropic [`ProviderAuth`]: `anthropicApiKeyAuth()` (`providers/anthropic.ts:9-36`
+/// @v0.83.0) — `ANTHROPIC_AUTH_TOKEN` as a bearer header, then `ANTHROPIC_OAUTH_TOKEN`, then
+/// `ANTHROPIC_API_KEY` — **plus** the Claude Pro/Max OAuth login
+/// (`lazyOAuth({ name: "Anthropic (Claude Pro/Max)", load: loadAnthropicOAuth })`, `:45`) — see
 /// [`super::builtin_oauth::builtin_provider_oauth`].
 pub fn anthropic_auth() -> ProviderAuth {
     ProviderAuth {
-        api_key: Some(env_key(["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"])),
+        api_key: Some(Arc::new(AnthropicApiKeyAuth)),
         oauth: super::builtin_oauth::builtin_provider_oauth(ANTHROPIC_PROVIDER_ID),
     }
 }
@@ -82,17 +197,22 @@ pub struct AnthropicFleetSpec {
     pub name: &'static str,
     /// API-key env var (matches `env-api-keys.ts`).
     pub env_var: &'static str,
+    /// Upstream's `envApiKeyAuth(<name>, …)` first argument — the user-facing api-key method label
+    /// (`ai/src/auth/helpers.ts:9`). Not derivable from `name`: `kimi-coding` is
+    /// `"Kimi API key"`, not `"Kimi For Coding API key"` (`providers/kimi-coding.ts:13`).
+    pub auth_name: &'static str,
     /// The verbatim JSON catalog (extracted from Pi's `<id>.models.ts`).
     pub catalog_json: &'static str,
 }
 
 macro_rules! anthropic_fleet {
-    ($($id:literal => ($const:ident, $name:literal, $env:literal, $file:literal)),* $(,)?) => {
+    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $file:literal)),* $(,)?) => {
         $(
             pub const $const: AnthropicFleetSpec = AnthropicFleetSpec {
                 id: $id,
                 name: $name,
                 env_var: $env,
+                auth_name: $auth,
                 catalog_json: include_str!(concat!("catalog/", $file, ".json")),
             };
         )*
@@ -102,10 +222,10 @@ macro_rules! anthropic_fleet {
 }
 
 anthropic_fleet! {
-    "kimi-coding"       => (KIMI_CODING, "Kimi For Coding", "KIMI_API_KEY", "kimi-coding"),
-    "minimax"           => (MINIMAX, "MiniMax", "MINIMAX_API_KEY", "minimax"),
-    "minimax-cn"        => (MINIMAX_CN, "MiniMax CN", "MINIMAX_CN_API_KEY", "minimax-cn"),
-    "vercel-ai-gateway" => (VERCEL_AI_GATEWAY, "Vercel AI Gateway", "AI_GATEWAY_API_KEY", "vercel-ai-gateway"),
+    "kimi-coding"       => (KIMI_CODING, "Kimi For Coding", "KIMI_API_KEY", "Kimi API key", "kimi-coding"),
+    "minimax"           => (MINIMAX, "MiniMax", "MINIMAX_API_KEY", "MiniMax API key", "minimax"),
+    "minimax-cn"        => (MINIMAX_CN, "MiniMax CN", "MINIMAX_CN_API_KEY", "MiniMax CN API key", "minimax-cn"),
+    "vercel-ai-gateway" => (VERCEL_AI_GATEWAY, "Vercel AI Gateway", "AI_GATEWAY_API_KEY", "Vercel AI Gateway API key", "vercel-ai-gateway"),
 }
 
 impl AnthropicFleetSpec {
@@ -120,7 +240,7 @@ impl AnthropicFleetSpec {
     /// (`providers/kimi-coding.ts:14-19`). See [`super::builtin_oauth::builtin_provider_oauth`].
     pub fn auth(&self) -> ProviderAuth {
         ProviderAuth {
-            api_key: Some(env_key([self.env_var])),
+            api_key: Some(env_key(self.auth_name, [self.env_var])),
             oauth: super::builtin_oauth::builtin_provider_oauth(self.id),
         }
     }
@@ -400,5 +520,99 @@ mod tests {
             .iter()
             .any(|c| matches!(c, Content::Text { text, .. } if !text.trim().is_empty()));
         assert!(has_text, "expected non-empty text, got: {:?}", msg.content);
+    }
+
+    /// PROV-021. `ANTHROPIC_AUTH_TOKEN` resolves FIRST and travels as `Authorization: Bearer`,
+    /// never as `x-api-key` (`providers/anthropic.ts:21-27` @v0.83.0). Red before the fix:
+    /// `anthropic_auth()` used the generic `env_key(["ANTHROPIC_OAUTH_TOKEN","ANTHROPIC_API_KEY"])`
+    /// helper, so the variable was unknown to the crate and a user with only it set got
+    /// "not configured" in an environment where pi works.
+    #[tokio::test]
+    async fn anthropic_auth_token_resolves_as_a_bearer_header() {
+        let auth = anthropic_auth();
+        let strategy = auth.api_key.expect("anthropic has an api-key strategy");
+        let m = anthropic_models().first().cloned().expect("catalog");
+
+        let env = |pairs: &[(&str, &str)]| {
+            MapEnv(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )
+        };
+
+        // Only the bearer token: `Authorization: Bearer t`, and NO api key.
+        let r = strategy
+            .resolve(&m, &env(&[("ANTHROPIC_AUTH_TOKEN", "t")]), None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+        assert_eq!(r.auth.api_key, None, "must not become x-api-key");
+        assert_eq!(
+            r.auth.headers.as_ref().and_then(|h| h.get("Authorization")),
+            Some(&Some("Bearer t".to_string()))
+        );
+        assert_eq!(r.source.as_deref(), Some("ANTHROPIC_AUTH_TOKEN"));
+
+        // Both set: the bearer wins (it is tested before the loop).
+        let r = strategy
+            .resolve(
+                &m,
+                &env(&[("ANTHROPIC_AUTH_TOKEN", "t"), ("ANTHROPIC_API_KEY", "k")]),
+                None,
+            )
+            .await
+            .expect("resolve")
+            .expect("configured");
+        assert_eq!(r.auth.api_key, None);
+
+        // Only the api key: unchanged behaviour.
+        let r = strategy
+            .resolve(&m, &env(&[("ANTHROPIC_API_KEY", "k")]), None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+        assert_eq!(r.auth.api_key.as_deref(), Some("k"));
+        assert!(r.auth.headers.is_none());
+    }
+
+    /// PROV-021, discovery half: all three variables are reported by `api_key_env_vars`
+    /// (`env-api-keys.ts:73-76`), but `get_env_api_key` SKIPS `ANTHROPIC_AUTH_TOKEN` (`:147`) —
+    /// turning it into a literal api key would send it as `x-api-key`.
+    #[tokio::test]
+    async fn anthropic_auth_token_is_discoverable_but_never_a_literal_key() {
+        assert_eq!(
+            crate::env_api_keys::api_key_env_vars("anthropic"),
+            Some(
+                &[
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_OAUTH_TOKEN",
+                    "ANTHROPIC_API_KEY"
+                ][..]
+            )
+        );
+        let only_bearer = MapEnv(
+            [("ANTHROPIC_AUTH_TOKEN".to_string(), "t".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            crate::env_api_keys::get_env_api_key("anthropic", &only_bearer, None).await,
+            None,
+            "the bearer token must never be returned as an api key"
+        );
+        let both = MapEnv(
+            [
+                ("ANTHROPIC_AUTH_TOKEN".to_string(), "t".to_string()),
+                ("ANTHROPIC_API_KEY".to_string(), "k".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            crate::env_api_keys::get_env_api_key("anthropic", &both, None).await,
+            Some("k".to_string())
+        );
     }
 }

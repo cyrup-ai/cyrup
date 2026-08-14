@@ -32,15 +32,18 @@ pub mod subcommands;
 pub mod timings;
 pub mod update_check;
 
+#[cfg(test)]
+mod tests;
+
 pub use cli::{
     Cli, ExtFlagValue, ExtensionFlag, Mode, OutputFormat, ThinkingArg, TuiMode,
     normalize_short_aliases, partition_extension_flags, render_help, resolve_app_mode,
     should_take_over_stdout,
 };
 pub use credential_print::{
-    CredentialPrintCommand, CredentialPrintError, CredentialPrintKind, credential_print_help,
-    is_credential_print_help, parse_credential_print_command, resolve_credential_for_print,
-    validate_credential_print_args,
+    AuthCheckResult, CredentialPrintCommand, CredentialPrintError, CredentialPrintKind,
+    credential_print_help, is_credential_print_help, parse_credential_print_command,
+    resolve_credential_for_print, run_auth_check, validate_credential_print_args,
 };
 pub use diagnostics::{
     Diagnostic, DiagnosticLevel, EXTENSION_LOAD_FAILURE_HINT, apply_arg_leniency,
@@ -67,7 +70,8 @@ pub use startup::{
 };
 pub use startup_ui::{
     MissingCwdChoice, ResumeChoice, TrustChoice, has_trust_requiring_project_resources,
-    run_missing_cwd_prompt, run_resume_picker, run_trust_prompt, session_rows, trust_needs_prompt,
+    run_missing_cwd_prompt, run_resume_picker, run_trust_prompt, session_rows, startup_keymaps,
+    startup_theme, trust_needs_prompt,
 };
 
 // Re-export the runtime-mode enum the whole bin pivots on (arch-11 §6.1).

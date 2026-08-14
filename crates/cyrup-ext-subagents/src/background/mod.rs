@@ -94,6 +94,22 @@ pub mod runner_main;
 /// R-SA-101's turn/prompt-path re-entry is a later phase's hand-off, not implemented here.
 pub mod watch;
 
+/// SUBA-051 — pi `DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000`
+/// (`runs/background/async-execution.ts:131` @v0.47.1), applied at `:782` as
+/// `timeoutMs: a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS` when building an async CHILD step.
+/// Landed in `635c1bd` ("fix: add default async child timeouts", fixes #978), released v0.47.0.
+///
+/// Upstream applies this to CHILDREN only and deliberately leaves the composite PARENT
+/// (`chain`/`tasks`/graph roots) unbounded — a parent's job is to outlive its children. cyrup
+/// reproduces that split by applying the constant on the async SINGLE path
+/// (`extension.rs::spawn_background`) and NOT inside `spawn_background_steps`, which the composite
+/// entry points share. It is deliberately NOT applied to foreground runs, which already have their
+/// own default.
+///
+/// Without it a background child that wedges — a hung `cargo test`, a non-terminating model, a
+/// retry loop — burns tokens and CPU until a human notices and issues `interrupt`.
+pub const DEFAULT_ASYNC_CHILD_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
 /// Orchestrator-side shared poller (`JobTracker`, R-SA-093/105): one `tokio::time::interval`-
 /// driven task per owning extension instance, self-starting on the first tracked job and
 /// self-stopping once the tracked-job map empties. Tails newly-appended `events.jsonl` bytes per

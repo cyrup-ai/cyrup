@@ -55,6 +55,14 @@ pub enum ImageMime {
     Bmp,
 }
 
+/// Pi `mime.ts:3` `const IMAGE_TYPE_SNIFF_BYTES = 4100;` — the size of the header buffer
+/// `detectSupportedImageMimeTypeFromFile` reads (mime.ts:28-29) before handing it to
+/// `detectSupportedImageMimeType`. Every structural check downstream therefore sees AT MOST this
+/// many bytes, and `isAnimatedPng` in particular bails `return false` the moment its chunk walk
+/// steps past the buffer (mime.ts:51) — so an `acTL` beyond the window is INVISIBLE upstream and
+/// the file is reported as `image/png`. `mime.ts` is byte-identical at v0.83.0 and v0.84.1.
+pub const IMAGE_TYPE_SNIFF_BYTES: usize = 4100;
+
 impl ImageMime {
     pub fn mime(self) -> &'static str {
         match self {
@@ -82,7 +90,30 @@ impl ImageMime {
     /// header; cyrup sniffs the bytes returned by the (remote-aware) [`FsOps::read`] seam. Animated
     /// PNG (`acTL` before `IDAT`) and the JPEG `0xFF 0xD8 0xFF 0xF7` (lossless JPEG) variant are
     /// rejected; BMP headers are structurally validated.
+    ///
+    /// The caller MUST pass at most [`IMAGE_TYPE_SNIFF_BYTES`] bytes — the window Pi's
+    /// `detectSupportedImageMimeTypeFromFile` reads (mime.ts:25-34) before calling this same
+    /// function. The bound is not applied inside here because it is Pi's read size, not a property
+    /// of the predicate: mime.ts:30 passes `buffer.subarray(0, bytesRead)` of a
+    /// `Buffer.alloc(IMAGE_TYPE_SNIFF_BYTES)`. See [`ImageMime::from_file_head`], which applies it.
     pub fn from_magic(buf: &[u8]) -> Option<Self> {
+        Self::from_magic_unbounded(buf)
+    }
+
+    /// [`ImageMime::from_magic`] over the same window Pi reads — the port of
+    /// `detectSupportedImageMimeTypeFromFile` (mime.ts:25-34) for a caller that already holds the
+    /// whole file, which is cyrup's shape because the bytes arrive through the remote-aware
+    /// [`FsOps::read`] seam rather than from a local `open`+`read`.
+    ///
+    /// [CYRUP-DELTA, mechanism only] Pi reads exactly [`IMAGE_TYPE_SNIFF_BYTES`] from the file;
+    /// cyrup slices that prefix off the buffer `FsOps::read` returned. The window handed to the
+    /// sniffer — and therefore every verdict — is identical. The read itself is deliberately NOT
+    /// bounded: the image branch needs the full bytes to encode.
+    pub fn from_file_head(buf: &[u8]) -> Option<Self> {
+        Self::from_magic_unbounded(buf.get(..IMAGE_TYPE_SNIFF_BYTES).unwrap_or(buf))
+    }
+
+    fn from_magic_unbounded(buf: &[u8]) -> Option<Self> {
         const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         if starts_with(buf, &[0xff, 0xd8, 0xff]) {
             return if buf.get(3) == Some(&0xf7) { None } else { Some(ImageMime::Jpeg) };
@@ -275,6 +306,29 @@ pub enum ExitStatus {
 #[async_trait::async_trait]
 pub trait FsOps: Send + Sync {
     async fn read(&self, path: &Path) -> Result<Vec<u8>, ToolError>;
+
+    /// Open `path` for a **streaming, bounded-memory** read — the seam `grep` searches through.
+    ///
+    /// Pi never reads a candidate file into the agent process at all on the search path: `grep`
+    /// runs the search in a separate ripgrep process (`spawn(rgPath, …)`, grep.ts:226) whose
+    /// bounded read buffer decouples file size from Node's heap entirely. cyrup's search is
+    /// in-process (the declared `ignore`/`grep-searcher` delta, grep.rs:1-3), so the equivalent
+    /// property has to come from the seam: this returns a `Read` that `grep_searcher`'s
+    /// `search_reader` pulls through its own rolling buffer instead of the whole-file `Vec<u8>`
+    /// that `FsOps::read` materializes before binary detection can even reject the file.
+    ///
+    /// The returned handle is a blocking [`std::io::Read`] because `grep_searcher`'s API is
+    /// synchronous; callers MUST drive it from `tokio::task::spawn_blocking`, never inline.
+    ///
+    /// Default implementation: read the whole file and hand back a cursor over it. That is the
+    /// correct fallback for a backend that genuinely cannot stream (a remote/RPC filesystem), and
+    /// it keeps every decorator in `isolation/` forwarding unchanged.
+    async fn read_stream(
+        &self,
+        path: &Path,
+    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+        Ok(Box::new(std::io::Cursor::new(self.read(path).await?)))
+    }
 
     /// Write `bytes` to `path` **through the existing inode**, creating the file if it is absent —
     /// the single mutation seam both `write` and `edit` use.

@@ -21,7 +21,20 @@ members = [
     "crates/cyrup-ext-subagents",
     "crates/cyrup-permission-system",
     "crates/cyrup-intercom",
+    "crates/cyrup-it",
 ]
+# cyrup-it is the workspace's ONE integration-test crate (docs/TEST-ARCHITECTURE.md §2): it holds
+# only the seam tests — the ones that spawn a binary, drive a subagent child, load a live wasm
+# component, or open a broker socket. It is a member (so it shares this Cargo.lock, these
+# `workspace.dependencies` and these `workspace.lints`) but is NOT in `default-members`, and it has
+# no `[lib]` and no `[dependencies]` at all, so nothing can ever depend on it.
+#
+# THE EXCLUSION BELOW IS NOT ITS GATE. `--workspace` overrides `default-members` entirely, and this
+# repo's merge gate is `cargo test --workspace` — exactly the subtlety already conceded for
+# cyrup-test-support above. What actually keeps the suite off the everyday path is
+# `required-features = ["it"]` on each of its `[[test]]` targets, with `it` default-off; its
+# build.rs no-ops on the same signal. Note that `--all-features` re-arms all of it silently.
+#
 # cyrup-ext-sdk is the GUEST sdk (compiled to wasm32-wasip2); it is NOT part of the
 # host binary build graph (arch-00 §2.2), so it is excluded from default-members.
 # Build it explicitly: `cargo build -p cyrup-ext-sdk --target wasm32-wasip2`.

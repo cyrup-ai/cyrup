@@ -13,6 +13,12 @@ workspace = true
 
 [dependencies]
 arc-swap = "1.9.2"
+# `cyrup_config::paths::normalize_path` — the single port of Pi `normalizePath`
+# (`coding-agent/src/utils/paths.ts:57-78`). Settings-declared resource paths and local package
+# sources go through the identical function as the settings/env/CLI dir tiers, so `~/team-skills`
+# cannot expand on one tier and stay literal on another (CFG-025). A second copy here is exactly
+# the duplication that let cyrup's two `encode_cwd` implementations drift into the same bug.
+cyrup-config = { workspace = true }
 cyrup-core = { workspace = true }
 gix = { version = "0.85.0", features = [
     "blocking-network-client",

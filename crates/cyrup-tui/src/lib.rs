@@ -47,6 +47,7 @@ mod diff;
 mod drain;
 mod editor;
 mod error;
+mod escape_reassembly;
 mod export;
 mod extension_editor;
 mod footer_data;
@@ -61,6 +62,7 @@ mod native_modifiers;
 mod oauth_selector;
 mod overlay;
 mod panic_hook;
+mod pending_messages;
 mod resume_hint;
 mod select_list;
 mod selector;
@@ -82,9 +84,15 @@ mod transcript;
 mod tree_selector;
 mod user_message_selector;
 
+/// The crate's headless render / keymap / selector suites. They lived one-file-per-binary under
+/// `tests/`; compiled here they are a single unit-test target instead of ~77 linked processes.
+#[cfg(test)]
+mod tests;
+
 pub use app::{
     crossterm_input_stream, extension_render, reanchor_inline_region, render,
     should_honor_extension_shutdown, tree_node_from_dag, App, AppAction, AppCommand, AppState,
+    CompactionQueued, ExtensionWidget,
     LoginProviderSource, RebuildBackend, TreeNavMsg,
 };
 pub use auth_select::{
@@ -124,9 +132,10 @@ pub use export::session_jsonl_to_html;
 pub use error::TuiError;
 pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
 pub use image::{
-    detect_capabilities, detect_capabilities_from, detect_capabilities_on_platform,
-    hyperlinks_supported, image_fallback_text, seed_hyperlink_support, ImageBlock, ImageProtocol,
-    ImageRenderer, TerminalCapabilities,
+    cached_capabilities, detect_capabilities, detect_capabilities_from,
+    detect_capabilities_on_platform, hyperlinks_supported, image_fallback_text,
+    reset_capabilities_cache, seed_capabilities, seed_hyperlink_support, set_capabilities,
+    ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities,
 };
 pub use keyboard_protocol::{
     current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,

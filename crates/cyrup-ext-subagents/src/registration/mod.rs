@@ -52,6 +52,11 @@ use crate::discovery::types::AgentOverrideConfig;
 /// agent-discovery count, chain-discovery count, and provider-catalog freshness — concurrently via
 /// `tokio::join!`, each catching its own failure independently rather than aborting the whole
 /// report. See [`doctor`] for the full subsystem doc.
+/// SUBA-064 — the `subagents.authorityPolicy` gate (`pi-subagents/src/policy/authority.ts`,
+/// present at both v0.43.0 and v0.47.1): six privileged actions, three decisions, and the
+/// `stop`/`steer` consult that makes it live-reachable today.
+pub mod authority;
+
 pub mod doctor;
 
 pub mod profiles;
@@ -208,6 +213,55 @@ pub struct SubagentExtensionConfig {
     /// accept an unknown key inside the block, and upstream refuses one loudly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub missions: Option<crate::missions::MissionStoreConfig>,
+    /// SUBA-059 — pi `ExtensionConfig.artifactConfig?: Pick<ArtifactConfig, "cleanupDays">`
+    /// (`shared/types.ts:1859` @v0.47.1, *"Artifact cleanup retention. Set cleanupDays to 0 to
+    /// disable cleanup."*), read at `extension/index.ts:369-370` as
+    /// `config.artifactConfig?.cleanupDays ?? DEFAULT_ARTIFACT_CONFIG.cleanupDays` and handed
+    /// straight to `cleanupAllArtifactDirs`. Landed in `b69aafb` ("fix: honor artifact cleanup
+    /// retention config", #1013), released v0.47.1.
+    ///
+    /// Note the upstream TYPE: it is a `Pick` of ONE field, not the whole `ArtifactConfig`. The
+    /// per-run `enabled`/`include*` switches are not configurable through `config.json` upstream,
+    /// so advertising them here would recreate the accepted-and-ignored defect this item exists to
+    /// close. [`ArtifactRetentionConfig`] mirrors the `Pick` exactly.
+    ///
+    /// `None` (the key omitted) means pi's `DEFAULT_ARTIFACT_CONFIG.cleanupDays` = 7.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_config: Option<ArtifactRetentionConfig>,
+    /// SUBA-048 — pi `ExtensionConfig.artifactDir?: ArtifactDirPreference`
+    /// (`shared/types.ts:1857` @v0.47.1: *"Where to store subagent artifact files. Defaults to
+    /// 'project' (cwd/.pi/subagents). Set to 'session' for pi session dir, or 'temp' for OS
+    /// temp."*), seeded onto the live state at `extension/index.ts:375` and consulted by
+    /// `getArtifactsDir`/`getChainRunsDir`.
+    ///
+    /// `None` (the key omitted) is pi's `project` default. An INVALID value must be refused at
+    /// config load — see [`Self::validate_artifact_dir`], which is upstream's own `throw`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_dir: Option<crate::artifacts::ArtifactDirPreference>,
+    /// SUBA-064 — pi `ExtensionConfig.authorityPolicy?: AuthorityPolicyConfig`, consulted by
+    /// `resolveAuthorityDecision` (`policy/authority.ts:23`) and — the live-reachable half — by the
+    /// `stop`/`steer` gate at `runs/foreground/subagent-executor.ts:4412-4423` @v0.43.0.
+    ///
+    /// `None` (the key omitted) means every action takes its
+    /// [`authority::AuthorityAction::default_decision`]. An INVALID block must fail config load —
+    /// see [`Self::validate_authority_policy`], which is upstream's own `throw`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority_policy: Option<authority::AuthorityPolicyConfig>,
+}
+
+/// SUBA-059 — pi's `Pick<ArtifactConfig, "cleanupDays">` (`shared/types.ts:1859` @v0.47.1): the
+/// only artifact field `config.json` may set. A separate type from
+/// [`crate::artifacts::ArtifactConfig`] precisely because that struct carries five more fields that
+/// upstream does NOT read from config.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactRetentionConfig {
+    /// Delete artifacts older than this many days on every extension load. `0` DISABLES the sweep
+    /// (`shared/types.ts:1858`), which is why [`crate::artifacts::cleanup_old_artifacts`] carries an
+    /// explicit `<= 0` short-circuit (`shared/artifacts.ts:231`) — a literal `0` under the
+    /// `now - days * ONE_DAY` arithmetic would otherwise mean "delete everything".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_days: Option<u64>,
 }
 
 /// pi's hardcoded default for `parallel.maxTasks` (func-SA §4.7) — the cap applied when the nested
@@ -239,6 +293,9 @@ impl Default for SubagentExtensionConfig {
             fleet_view_placement: None,
             wait_tool: None,
             missions: None,
+            artifact_config: None,
+            artifact_dir: None,
+            authority_policy: None,
         }
     }
 }
@@ -253,6 +310,92 @@ impl SubagentExtensionConfig {
     ///
     /// The upstream refusal text (`config.missions.<key> is unknown`, `… must be boolean`, `…
     /// must be a positive integer`).
+    /// SUBA-064 — pi `validateAuthorityPolicy(config.authorityPolicy)`
+    /// (`policy/authority.ts:30-45`), applied to the RAW config JSON beside
+    /// [`Self::validate_missions`] for the same reason: serde drops an unknown action key and a bad
+    /// decision string silently, where upstream throws.
+    ///
+    /// # Errors
+    ///
+    /// Upstream's typed refusals — see [`authority::validate_authority_policy`].
+    pub fn validate_authority_policy(raw: &serde_json::Value) -> Result<(), String> {
+        authority::validate_authority_policy(raw.get("authorityPolicy"), "config.authorityPolicy")
+    }
+
+    /// SUBA-048 — the artifact-directory preference this process resolves runs against: pi
+    /// `config.artifactDir ?? DEFAULT_ARTIFACT_CONFIG.dir` (`extension/index.ts:375` @v0.47.1).
+    #[must_use]
+    pub fn artifact_dir_preference(&self) -> crate::artifacts::ArtifactDirPreference {
+        self.artifact_dir.unwrap_or_default()
+    }
+
+    /// SUBA-048 — pi `validateConfig`'s first clause (`extension/config.ts:51-53` @v0.47.1):
+    /// `if (config.artifactDir !== undefined && !ARTIFACT_DIR_PREFERENCES.has(config.artifactDir))
+    /// throw ...`. Applied to the RAW config JSON because serde silently drops an unknown enum
+    /// string where upstream THROWS — the same reason [`Self::validate_missions`] exists.
+    ///
+    /// # Errors
+    ///
+    /// `config.artifactDir must be "project", "session", or "temp"`.
+    pub fn validate_artifact_dir(raw: &serde_json::Value) -> Result<(), String> {
+        let Some(value) = raw.get("artifactDir") else {
+            return Ok(());
+        };
+        let invalid = r#"config.artifactDir must be "project", "session", or "temp""#.to_string();
+        let Some(text) = value.as_str() else {
+            return Err(invalid);
+        };
+        crate::artifacts::ArtifactDirPreference::parse(text).map(|_| ())
+    }
+
+    /// SUBA-059 — the retention horizon this load will sweep with: pi
+    /// `config.artifactConfig?.cleanupDays ?? DEFAULT_ARTIFACT_CONFIG.cleanupDays`
+    /// (`extension/index.ts:369` @v0.47.1).
+    #[must_use]
+    pub fn artifact_cleanup_days(&self) -> u64 {
+        self.artifact_config
+            .and_then(|c| c.cleanup_days)
+            .unwrap_or(crate::artifacts::DEFAULT_CLEANUP_DAYS)
+    }
+
+    /// SUBA-059 — pi `validateArtifactConfig` (`extension/config.ts:40-47` @v0.47.1), applied to
+    /// the RAW config JSON for the same reason [`Self::validate_missions`] is: serde alone accepts
+    /// a wrong-typed `cleanupDays` and silently drops it, where upstream THROWS.
+    ///
+    /// Both messages are upstream's, verbatim.
+    ///
+    /// # Errors
+    ///
+    /// `config.artifactConfig must be a JSON object` for a non-object value, and
+    /// `config.artifactConfig.cleanupDays must be a non-negative integer` for anything that is not
+    /// a non-negative integer.
+    pub fn validate_artifact_config(raw: &serde_json::Value) -> Result<(), String> {
+        let Some(value) = raw.get("artifactConfig") else {
+            return Ok(());
+        };
+        // pi's guard is `!value || typeof value !== "object" || Array.isArray(value)`, so `null`
+        // is refused too — JS `!null` is true.
+        let Some(obj) = value.as_object().filter(|_| !value.is_null()) else {
+            return Err("config.artifactConfig must be a JSON object".to_string());
+        };
+        let Some(days) = obj.get("cleanupDays") else {
+            return Ok(());
+        };
+        if days.is_null() {
+            // `cleanupDays !== undefined` is TRUE for an explicit JSON `null`, which then fails
+            // `typeof === "number"`.
+            return Err(
+                "config.artifactConfig.cleanupDays must be a non-negative integer".to_string()
+            );
+        }
+        if days.as_u64().is_none() {
+            return Err(
+                "config.artifactConfig.cleanupDays must be a non-negative integer".to_string()
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate_missions(raw: &serde_json::Value) -> Result<(), String> {
         crate::missions::validate_mission_store_config(raw.get("missions"), "config.missions")
             .map(|_| ())
@@ -809,6 +952,61 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // SubagentExtensionConfig defaults (tier 5)
     // -----------------------------------------------------------------------------------------
+
+    /// SUBA-059 — pi `config.artifactConfig?.cleanupDays ?? DEFAULT_ARTIFACT_CONFIG.cleanupDays`
+    /// (`extension/index.ts:369` @v0.47.1) plus `validateArtifactConfig`
+    /// (`extension/config.ts:40-47`).
+    ///
+    /// THE USER ACTION: a user wants subagent transcripts kept for audit, or purged sooner, or not
+    /// swept at all. Before the fix both sweeps passed the hardcoded 7-day constant and the config
+    /// key did not exist on `SubagentExtensionConfig`, so `"artifactConfig": {"cleanupDays": 0}`
+    /// was accepted into `config.json`, dropped by serde, and every extension load still deleted
+    /// run inputs, outputs and JSONL older than a week — including the record of what a fan-out
+    /// actually did.
+    #[test]
+    fn artifact_cleanup_days_round_trips_and_validates_like_upstream() {
+        assert_eq!(
+            SubagentExtensionConfig::default().artifact_cleanup_days(),
+            crate::artifacts::DEFAULT_CLEANUP_DAYS,
+            "an omitted key must fall back to pi's DEFAULT_ARTIFACT_CONFIG.cleanupDays"
+        );
+
+        let parsed: SubagentExtensionConfig =
+            serde_json::from_value(serde_json::json!({ "artifactConfig": { "cleanupDays": 30 } }))
+                .expect("config parses");
+        assert_eq!(parsed.artifact_cleanup_days(), 30);
+
+        // `0` is upstream's documented opt-out, not "delete everything".
+        let disabled: SubagentExtensionConfig =
+            serde_json::from_value(serde_json::json!({ "artifactConfig": { "cleanupDays": 0 } }))
+                .expect("config parses");
+        assert_eq!(disabled.artifact_cleanup_days(), 0);
+
+        // Validation — upstream's exact texts.
+        assert!(SubagentExtensionConfig::validate_artifact_config(&serde_json::json!({})).is_ok());
+        assert_eq!(
+            SubagentExtensionConfig::validate_artifact_config(&serde_json::json!({
+                "artifactConfig": []
+            }))
+            .expect_err("an array is not an object"),
+            "config.artifactConfig must be a JSON object"
+        );
+        for bad in [
+            serde_json::json!("7"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(
+                SubagentExtensionConfig::validate_artifact_config(&serde_json::json!({
+                    "artifactConfig": { "cleanupDays": bad }
+                }))
+                .expect_err("cleanupDays must be a non-negative integer"),
+                "config.artifactConfig.cleanupDays must be a non-negative integer",
+                "value was {bad}"
+            );
+        }
+    }
 
     #[test]
     fn subagent_extension_config_default_matches_func_sa_4_7_constants() {

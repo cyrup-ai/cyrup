@@ -430,6 +430,11 @@ pub fn step_status_label(state: StepState) -> &'static str {
 /// upstream passes `state` itself.
 #[derive(Clone, Debug, Default)]
 pub struct FleetState {
+    /// SUBA-048 — pi `state.artifactDirPreference ?? "project"` (`fleet.ts:334-340`'s
+    /// `fleetArtifactsRoot`, seeded from `config.artifactDir` at `extension/index.ts:375`).
+    /// `Default` is [`crate::artifacts::ArtifactDirPreference::Project`], pi's own default, so an
+    /// unset config behaves exactly as before this field existed.
+    pub artifact_dir_preference: crate::artifacts::ArtifactDirPreference,
     /// pi `state.baseCwd` — the artifacts-root fallback for transcript targeting
     /// (`fleet.ts:344,359,373`).
     pub base_cwd: PathBuf,

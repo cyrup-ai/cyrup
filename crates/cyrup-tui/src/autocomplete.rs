@@ -169,8 +169,13 @@ const PATH_DELIMS: [char; 5] = [' ', '\t', '"', '\'', '='];
 
 /// Bare-path context (`extractPathPrefix` `:480-507` + `getFileSuggestions` `:560-693`).
 fn path_context(before: &str, force: bool, cwd: &Path) -> Option<Autocomplete> {
-    let token = trailing_token(before);
-    let looks_pathy = token.contains('/') || token.starts_with('.') || token.starts_with("~/");
+    let raw_token = trailing_token(before);
+    // `parsePathPrefix` (`autocomplete.ts:94-105`): the opening `"` of a quoted prefix is not part
+    // of the path. TUI-013 — `trailing_token` now returns the whole `"my dir/fi` span.
+    let quoted = raw_token.starts_with('"');
+    let token = raw_token.strip_prefix('"').unwrap_or(&raw_token).to_string();
+    let looks_pathy =
+        quoted || token.contains('/') || token.starts_with('.') || token.starts_with("~/");
     if !force && !looks_pathy {
         return None;
     }
@@ -194,11 +199,69 @@ fn path_context(before: &str, force: bool, cwd: &Path) -> Option<Autocomplete> {
         completions.push(Completion { value, is_dir });
     }
     let list = SelectList::new(items, ColumnLayout::DEFAULT).with_no_match("No matching files");
-    Some(Autocomplete { context: CompletionContext::Path, prefix: token, completions, list })
+    // The replaced span is the RAW token, quote included, so applying a completion overwrites the
+    // opening quote the user typed rather than leaving it stranded.
+    Some(Autocomplete { context: CompletionContext::Path, prefix: raw_token, completions, list })
+}
+
+/// `findUnclosedQuoteStart` (`packages/tui/src/autocomplete.ts:54-68` @v0.83.0): the byte index of
+/// the `"` that opened a quote never closed, or `None` when every `"` is balanced. TUI-013.
+fn find_unclosed_quote_start(text: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut quote_start = 0usize;
+    for (i, ch) in text.char_indices() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            if in_quotes {
+                quote_start = i;
+            }
+        }
+    }
+    in_quotes.then_some(quote_start)
+}
+
+/// `isTokenStart` (`autocomplete.ts:70-72`): index 0, or preceded by a [`PATH_DELIMS`] character.
+fn is_token_start(text: &str, index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    text.get(..index)
+        .and_then(|s| s.chars().next_back())
+        .is_some_and(|c| PATH_DELIMS.contains(&c))
+}
+
+/// `extractQuotedPrefix` (`autocomplete.ts:74-92`): when a quote is open, the token is everything
+/// from that quote (or from the `@` immediately before it) to the cursor — spaces included.
+fn extract_quoted_prefix(text: &str) -> Option<String> {
+    let quote_start = find_unclosed_quote_start(text)?;
+    // `@"my dir/fi` — the `@` belongs to the token (`:80-85`).
+    if quote_start > 0
+        && text.get(..quote_start).and_then(|s| s.chars().next_back()) == Some('@')
+    {
+        let at = quote_start - 1;
+        if !is_token_start(text, at) {
+            return None;
+        }
+        return text.get(at..).map(str::to_string);
+    }
+    if !is_token_start(text, quote_start) {
+        return None;
+    }
+    text.get(quote_start..).map(str::to_string)
 }
 
 /// The trailing token of `before`, bounded by [`PATH_DELIMS`] / start-of-line.
+///
+/// **TUI-013.** An unclosed quote wins over the delimiter split, exactly as
+/// `extractPathPrefix`/`extractAtPrefix` order the two upstream (`autocomplete.ts:463-470` and
+/// `:480-487`: `const quotedPrefix = extractQuotedPrefix(text); if (quotedPrefix) return
+/// quotedPrefix;` **before** `findLastDelimiter`). Without it `"` is itself a `PATH_DELIMS`
+/// character, so `see @"my dir/fi` split on the SPACE INSIDE the quotes and yielded `dir/fi`, whose
+/// `strip_prefix('@')` then failed — any path containing a space was uncompletable.
 fn trailing_token(before: &str) -> String {
+    if let Some(quoted) = extract_quoted_prefix(before) {
+        return quoted;
+    }
     match before.rfind(PATH_DELIMS) {
         Some(idx) => before.get(idx + 1..).unwrap_or("").to_string(),
         None => before.to_string(),

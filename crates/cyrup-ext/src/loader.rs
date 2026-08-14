@@ -168,7 +168,40 @@ pub fn discover_with_diagnostics(
         } else if is_extension_dir(p) {
             push_dir(p, ExtOrigin::Configured, &mut seen, &mut out, &mut diags);
         } else {
+            // EXT-033, the DIAGNOSTIC half. A CONFIGURED path — a `-e <path>` the user typed — that
+            // resolves to nothing used to fall into `scan_dir`, whose first statement is
+            // `let Ok(rd) = read_dir(dir) else { return };`: a silent return producing neither a
+            // `loaded` entry nor an `errors` entry, so a typo'd `-e` was indistinguishable from a
+            // correct one and the author's only symptom was that their tools and commands were
+            // absent. This is also the documented escape hatch under `--no-extensions`, i.e. the
+            // path a user is most likely to reach for.
+            //
+            // pi guards the same three shapes and surfaces the miss: `fs.existsSync(resolved) &&
+            // fs.statSync(resolved).isDirectory()` decides the directory branch and anything else
+            // falls through to `addPaths([resolved])`
+            // (`pi/packages/coding-agent/src/core/extensions/loader.ts:704-717` @v0.83.0), which
+            // then reports the failure as a per-path `LoadExtensionsResult.errors` entry.
+            //
+            // Non-fatal, matching pi: a bad `-e` does not abort startup, it is reported. The two
+            // DISCOVERY roots (project / global) are deliberately NOT guarded this way — a missing
+            // `.cyrup/extensions` directory is the ordinary case, not a user error, and pi says
+            // nothing about it either.
+            let before = out.len();
             scan_dir(p, ExtOrigin::Configured, &mut seen, &mut out, &mut diags);
+            if out.len() == before {
+                diags.push(LoadError {
+                    path: p.clone(),
+                    fatal: false,
+                    error: if p.exists() {
+                        "configured extension path is neither a `.wasm` component, an extension \
+                         directory (one holding `extension.json` or a `*.wasm`), nor a directory \
+                         containing any"
+                            .into()
+                    } else {
+                        "configured extension path does not exist".into()
+                    },
+                });
+            }
         }
     }
     (out, diags)

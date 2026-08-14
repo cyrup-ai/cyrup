@@ -176,22 +176,67 @@ fn estimate_messages(messages: &[Message]) -> ContextUsageEstimate {
     }
 }
 
-/// Estimate context tokens for a full [`Context`] (Pi `estimateContextTokens`, estimate.ts:94-111).
+/// `estimateToolsTokens` (Pi `estimate.ts:105-108` @v0.83.0): `undefined`/empty ⇒ 0, else the
+/// token estimate of the JSON-stringified tool array.
+fn estimate_tools_tokens(tools: &[ToolDef]) -> u64 {
+    if tools.is_empty() {
+        return 0;
+    }
+    estimate_text_tokens(&safe_json_stringify(&tools_to_json(tools)))
+}
+
+/// Estimate context tokens for a full [`Context`] (Pi `estimateContextTokens`,
+/// `estimate.ts:114-138` @v0.83.0).
+///
 /// When the message list already carries a recent assistant usage block, the system-prompt + tools
-/// prefix is assumed to be already accounted for and is NOT added (matching Pi's early return).
+/// prefix is assumed to be already accounted for and is NOT added — but the tools that arrived
+/// AFTER that block still have to be charged, because the provider billed their schemas and the
+/// usage snapshot predates them (`:118-133`).
 pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
     let estimate = estimate_messages(&context.messages);
-    if estimate.last_usage_index.is_some() {
-        return estimate;
+    if let Some(index) = estimate.last_usage_index {
+        // PROV-S04. `const addedNames = new Set(context.messages.slice(lastUsageIndex + 1)
+        // .filter(m => m.role === "toolResult").flatMap(m => m.addedToolNames ?? []))` (`:119-124`),
+        // then `estimateToolsTokens(context.tools?.filter(t => addedNames.has(t.name)))` (`:125`),
+        // added to BOTH totals (`:127-132`).
+        //
+        // **The item's classification was wrong.** It recorded this as post-baseline drift
+        // ("at v0.83.0 the same site was a bare early return, so cyrup's code is a faithful stale
+        // port"). It is not: this block is present and byte-identical at v0.83.0, so the bare early
+        // return was a port omission.
+        let mut added_names: Vec<&str> = Vec::new();
+        for message in context.messages.iter().skip(index.saturating_add(1)) {
+            if let cyrup_core::Message::ToolResult {
+                added_tool_names, ..
+            } = message
+            {
+                for name in added_tool_names {
+                    if !added_names.contains(&name.as_str()) {
+                        added_names.push(name.as_str());
+                    }
+                }
+            }
+        }
+        let added: Vec<ToolDef> = context
+            .tools
+            .iter()
+            .filter(|t| added_names.contains(&t.name.as_str()))
+            .cloned()
+            .collect();
+        let added_tool_tokens = estimate_tools_tokens(&added);
+        return ContextUsageEstimate {
+            tokens: estimate.tokens + added_tool_tokens,
+            usage_tokens: estimate.usage_tokens,
+            trailing_tokens: estimate.trailing_tokens + added_tool_tokens,
+            last_usage_index: estimate.last_usage_index,
+        };
     }
 
     let mut prefix_tokens = match context.system_prompt.as_deref() {
         Some(prompt) => estimate_text_tokens(prompt),
         None => 0,
     };
-    if !context.tools.is_empty() {
-        prefix_tokens += estimate_text_tokens(&safe_json_stringify(&tools_to_json(&context.tools)));
-    }
+    prefix_tokens += estimate_tools_tokens(&context.tools);
 
     ContextUsageEstimate {
         tokens: estimate.tokens + prefix_tokens,
@@ -352,5 +397,72 @@ mod tests {
         };
         let est = estimate_context_tokens(&ctx);
         assert_eq!(est.last_usage_index, None); // aborted usage ignored
+    }
+
+    /// PROV-S04. Tools that arrive AFTER the last usage block are charged by the provider but were
+    /// counted by nobody: `estimate_context_tokens` early-returned with no added-tool accounting.
+    /// pi collects `addedToolNames` from every `toolResult` past `lastUsageIndex`, sizes exactly
+    /// those tools, and adds the result to BOTH `tokens` and `trailingTokens`
+    /// (`estimate.ts:118-133` @v0.83.0 — present at the ported baseline, so this was a port
+    /// omission, not the drift the item recorded).
+    ///
+    /// Red before the fix: both `assert_eq!`s below saw `with == without`.
+    #[test]
+    fn late_loaded_tools_are_charged_after_the_last_usage_block() {
+        let late = ToolDef {
+            name: "late".into(),
+            description: "a tool introduced mid-conversation".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
+        };
+        let tool_result = |added: Vec<String>| Message::ToolResult {
+            tool_call_id: ToolCallId::from("tc1"),
+            tool_name: "loader".into(),
+            content: vec![Content::Text {
+                text: "ok".into(),
+                text_signature: None,
+            }],
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: added,
+            timestamp: 0,
+        };
+        let base = vec![
+            user("hi"),
+            assistant_with_usage(
+                Usage {
+                    total_tokens: 100,
+                    ..Usage::default()
+                },
+                StopReason::ToolUse,
+            ),
+        ];
+
+        let with_ctx = Context {
+            system_prompt: None,
+            messages: {
+                let mut m = base.clone();
+                m.push(tool_result(vec!["late".to_string()]));
+                m
+            },
+            tools: vec![late.clone()],
+        };
+        let without_ctx = Context {
+            system_prompt: None,
+            messages: {
+                let mut m = base;
+                m.push(tool_result(Vec::new()));
+                m
+            },
+            tools: vec![late.clone()],
+        };
+
+        let with = estimate_context_tokens(&with_ctx);
+        let without = estimate_context_tokens(&without_ctx);
+        assert!(with.last_usage_index.is_some(), "the early-return path");
+        let expected = estimate_tools_tokens(std::slice::from_ref(&late));
+        assert!(expected > 0, "the fixture tool must cost something");
+        assert_eq!(with.tokens, without.tokens + expected);
+        assert_eq!(with.trailing_tokens, without.trailing_tokens + expected);
     }
 }

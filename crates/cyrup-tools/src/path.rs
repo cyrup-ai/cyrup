@@ -88,8 +88,68 @@ fn expand_home(path: &str) -> String {
     path.to_string()
 }
 
+/// Mirror of Node's `os.homedir()`, which is what Pi's `normalizePath` calls (`paths.ts:67`
+/// @v0.83.0, `:88` @v0.84.1 — `const home = options.homeDir ?? homedir();`). `homedir()` resolves
+/// `USERPROFILE` on **Windows**, not `HOME`, which is normally unset there — so a `HOME`-only
+/// lookup left `~`/`~\rest` unexpanded and `resolve_to_cwd` joined the literal `~` onto the cwd
+/// (TOOL-036).
 fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(profile));
+        }
+        // libuv's `uv_os_homedir` falls back to the account's profile directory; the
+        // `HOMEDRIVE`+`HOMEPATH` pair is the environment-visible spelling of the same thing.
+        if let (Some(drive), Some(path)) =
+            (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        {
+            let mut joined = std::ffi::OsString::from(drive);
+            joined.push(path);
+            return Some(PathBuf::from(joined));
+        }
+    }
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// `normalizeWindowsShellPath` (v0.84.1 `paths.ts:67-73`): convert Git Bash / MSYS / Cygwin / WSL
+/// drive paths (`/c/…`, `/cygdrive/c/…`, `/mnt/c/…`) into a form the native Windows APIs accept
+/// (`C:\…`). Bails out unchanged on anything that is not a single-slash-rooted, backslash-free
+/// path, exactly like the guard at `:68`.
+///
+/// **v0.84.1 upstream-drift** (DRIFT-046): the function does not exist at v0.83.0 — `git show
+/// v0.83.0:packages/coding-agent/src/utils/paths.ts | grep -n normalizeWindowsShellPath` is empty
+/// — and it is ported here because ADR-0007 puts Windows in scope and this is the shape a Windows
+/// user's own `bash` tool output has.
+fn normalize_windows_shell_path(file_path: &str) -> String {
+    // `if (!filePath.startsWith("/") || filePath.startsWith("//") || filePath.includes("\\"))`
+    if !file_path.starts_with('/') || file_path.starts_with("//") || file_path.contains('\\') {
+        return file_path.to_string();
+    }
+    // `/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i` — the `i` flag covers the literal prefixes
+    // as well as the drive letter.
+    let after_root = file_path.get(1..).unwrap_or("");
+    let lowered = after_root.to_ascii_lowercase();
+    let body = if let Some(rest) = lowered.strip_prefix("mnt/") {
+        after_root.get(after_root.len() - rest.len()..).unwrap_or("")
+    } else if let Some(rest) = lowered.strip_prefix("cygdrive/") {
+        after_root.get(after_root.len() - rest.len()..).unwrap_or("")
+    } else {
+        after_root
+    };
+    let Some(drive) = body.chars().next().filter(char::is_ascii_alphabetic) else {
+        return file_path.to_string();
+    };
+    let tail = body.get(drive.len_utf8()..).unwrap_or("");
+    // `(?:\/(.*))?$` — either the drive letter ends the string, or a `/` and the rest follow.
+    let suffix = if tail.is_empty() {
+        String::new()
+    } else if let Some(rest) = tail.strip_prefix('/') {
+        rest.replace('/', "\\")
+    } else {
+        return file_path.to_string();
+    };
+    format!("{}:\\{suffix}", drive.to_ascii_uppercase())
 }
 
 /// Minimal `file://` URL → path, mirroring Node `fileURLToPath` for the cases the tools see
@@ -164,6 +224,12 @@ pub fn resolve_to_cwd(path: &str, cwd: &Path) -> PathBuf {
     let mut normalized = normalize_unicode_spaces(path);
     if let Some(rest) = normalized.strip_prefix('@') {
         normalized = rest.to_string();
+    }
+    // Pi's placement is exact and the order matters: the drive-path conversion runs BEFORE the
+    // tilde expansion (v0.84.1 `paths.ts:83-85`, between the `@`-strip at `:80-82` and the
+    // `expandTilde` block at `:87-93`).
+    if cfg!(windows) {
+        normalized = normalize_windows_shell_path(&normalized);
     }
     let normalized = expand_home(&normalized);
     if let Some(p) = file_url_to_path(&normalized) {
@@ -348,5 +414,44 @@ mod tests {
             v.iter().any(|p| p.to_string_lossy().contains('\u{202F}')),
             "variants: {v:?}"
         );
+    }
+
+    /// TOOL-036 / DRIFT-046 — `normalizeWindowsShellPath` (v0.84.1 `paths.ts:67-73`). Tested
+    /// directly (not through `resolve_to_cwd`) so the port is pinned on every host, since the call
+    /// site is `cfg!(windows)`-guarded exactly as Pi's `:83-85` is.
+    ///
+    /// RED before the fix (no such function existed anywhere in this file); GREEN after.
+    #[test]
+    fn normalize_windows_shell_path_ports_the_drive_forms() {
+        // Git Bash / MSYS.
+        assert_eq!(normalize_windows_shell_path("/c/Users/x/f.txt"), r"C:\Users\x\f.txt");
+        // Cygwin.
+        assert_eq!(normalize_windows_shell_path("/cygdrive/c/Users/x/f.txt"), r"C:\Users\x\f.txt");
+        // WSL.
+        assert_eq!(normalize_windows_shell_path("/mnt/c/Users/x/f.txt"), r"C:\Users\x\f.txt");
+        // The drive letter is upper-cased; the `i` flag also covers the literal prefixes.
+        assert_eq!(normalize_windows_shell_path("/D/tmp"), r"D:\tmp");
+        assert_eq!(normalize_windows_shell_path("/CYGDRIVE/e/tmp"), r"E:\tmp");
+        // Bare drive root: `(?:\/(.*))?` is optional, `suffix ?? ""`.
+        assert_eq!(normalize_windows_shell_path("/c"), r"C:\");
+        assert_eq!(normalize_windows_shell_path("/c/"), r"C:\");
+
+        // The `:68` guard: not `/`-rooted, UNC-ish `//`, or already containing a backslash.
+        assert_eq!(normalize_windows_shell_path("relative/x"), "relative/x");
+        assert_eq!(normalize_windows_shell_path("//server/share"), "//server/share");
+        assert_eq!(normalize_windows_shell_path(r"/c/Users\x"), r"/c/Users\x");
+        // No regex match: multi-char first segment, or a non-letter.
+        assert_eq!(normalize_windows_shell_path("/usr/local/bin"), "/usr/local/bin");
+        assert_eq!(normalize_windows_shell_path("/1/x"), "/1/x");
+        assert_eq!(normalize_windows_shell_path("/"), "/");
+    }
+
+    /// The unix behaviour of `resolve_to_cwd` is untouched by the win32 leg — the conversion is
+    /// behind `cfg!(windows)`, matching Pi's `process.platform === "win32"` guard at `:83-85`.
+    #[test]
+    fn unix_resolve_is_unaffected_by_the_win32_leg() {
+        let cwd = Path::new("/work");
+        assert_eq!(resolve_to_cwd("/c/Users/x/f.txt", cwd), PathBuf::from("/c/Users/x/f.txt"));
+        assert_eq!(resolve_to_cwd("/mnt/c/f.txt", cwd), PathBuf::from("/mnt/c/f.txt"));
     }
 }

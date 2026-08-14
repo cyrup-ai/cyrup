@@ -819,3 +819,6 @@ mod smoke {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -13,7 +13,9 @@ use cyrup_ext::NativeExtension;
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
 
-use crate::builder::{SessionBuilder, SessionConfig, SessionTarget};
+use cyrup_config::trust::TrustStore;
+
+use crate::builder::{SessionBuilder, SessionConfig, SessionTarget, TrustPromptFn};
 use crate::error::SessionServiceError;
 use crate::provider_swap::ProviderResolver;
 use crate::session::AgentSession;
@@ -27,6 +29,11 @@ pub struct SessionFactory {
     native_extensions: Vec<Arc<dyn NativeExtension>>,
     cli_settings: Settings,
     provider_resolver: Option<Arc<dyn ProviderResolver>>,
+    /// Project-trust store + interactive prompt, re-applied to every session this factory builds —
+    /// pi's `resolveProjectTrust` callback is part of `createAgentSessionServices` and therefore
+    /// runs on each rebuild too (`main.ts:687-706` @v0.83.0). SEAM-065.
+    trust_store: Option<Arc<TrustStore>>,
+    trust_prompt: Option<TrustPromptFn>,
 }
 
 impl SessionFactory {
@@ -41,7 +48,24 @@ impl SessionFactory {
             native_extensions: Vec::new(),
             cli_settings: Settings::new(),
             provider_resolver: None,
+            trust_store: None,
+            trust_prompt: None,
         }
+    }
+
+    /// Wire the project-trust store into every session this factory builds (SEAM-065).
+    #[must_use]
+    pub fn trust_store(mut self, store: Arc<TrustStore>) -> Self {
+        self.trust_store = Some(store);
+        self
+    }
+
+    /// Wire the interactive project-trust prompt into every session this factory builds — pi's
+    /// `resolveProjectTrust` callback (`main.ts:687-706`). SEAM-065.
+    #[must_use]
+    pub fn trust_prompt(mut self, prompt: TrustPromptFn) -> Self {
+        self.trust_prompt = Some(prompt);
+        self
     }
 
     /// Wire the provider resolver seam (the bin's `select_provider`) into every session this factory
@@ -134,6 +158,12 @@ impl SessionFactory {
         if let Some(auth) = &self.auth {
             builder = builder.auth(auth.clone());
         }
+        if let Some(store) = &self.trust_store {
+            builder = builder.trust_store(store.clone());
+        }
+        if let Some(prompt) = &self.trust_prompt {
+            builder = builder.trust_prompt(prompt.clone());
+        }
         for ext in &self.native_extensions {
             builder = builder.with_native_extension(ext.clone());
         }
@@ -159,6 +189,12 @@ impl SessionFactory {
         }
         if let Some(auth) = &self.auth {
             builder = builder.auth(auth.clone());
+        }
+        if let Some(store) = &self.trust_store {
+            builder = builder.trust_store(store.clone());
+        }
+        if let Some(prompt) = &self.trust_prompt {
+            builder = builder.trust_prompt(prompt.clone());
         }
         for ext in &self.native_extensions {
             builder = builder.with_native_extension(ext.clone());

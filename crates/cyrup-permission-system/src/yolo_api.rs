@@ -13,10 +13,22 @@
 //! [`crate::permission_extension_for_env`] hands the binary a `dyn` handle whose concrete type is
 //! erased. So the three methods are ported as INHERENT methods on the extension —
 //! [`crate::extension::PermissionSystemExtension::yolo_mode`] (pi `getYoloMode`, `:1482`),
-//! `set_yolo_mode` (`:1483`) and `toggle_yolo_mode` (`:1484`) — and reached through the
-//! `/permission-system` command rather than through a process-global slot. Nothing observable is
-//! lost for a user; what is lost is the ability for an unrelated extension to reach in, which is a
-//! cross-crate seam cyrup-ext does not currently offer.
+//! `set_yolo_mode` (`:1483`) and `toggle_yolo_mode` (`:1484`).
+//!
+//! **PERM-011 — correction to what this doc used to claim.** It said the three methods are "reached
+//! through the `/permission-system` command". They are NOT, and deliberately so: the command routes
+//! BOTH of its rows through `save_extension_config`, matching upstream, where `setConfig` is
+//! `saveExtensionConfig` (`index.ts:1508`) and the runtime API is a SEPARATE surface
+//! (`index.ts:1481-1485`). Routing the yolo row through `set_yolo_mode` would emit
+//! `yolo_mode.updated` where pi emits `config.saved`. So at HEAD these three methods have exactly
+//! one in-crate caller (`toggle_yolo_mode` → `set_yolo_mode`) and no external one.
+//!
+//! What is missing is the PUBLISH SEAM, not the methods: `cyrup-ext` has no
+//! extension-provided-API registry for one native extension to call another's methods, which is
+//! the direct analog of `globalThis.__piPermissionSystem`. Until that lands in `cyrup-ext`, no
+//! other extension or front-end can read or flip yolo mode. Tracked as PERM-011 half A; the
+//! permission-request EVENT channel (`PERMISSION_REQUEST_EVENT_CHANNEL`, `index.ts:150`, emitted at
+//! `:1606`/`:1612`/`:1626`) is half B and needs the same crate's bus accessor.
 
 /// pi `getNonEmptyString(options.source) ?? "runtime-api"` (`index.ts:1443,1460`): the `source`
 /// recorded in the `yolo_mode.*` debug entries when the caller supplies none.

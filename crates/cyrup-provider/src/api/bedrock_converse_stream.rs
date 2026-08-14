@@ -57,10 +57,11 @@ use crate::auth::{AuthResult, ProviderEnv};
 use crate::context::{Context, ToolDef};
 use crate::error::ProviderError;
 use crate::model::Model;
-use crate::stream::sse::build_client_for_target;
+use crate::stream::sse::build_client_for_target_forcing_http1;
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::compute_cost;
 use crate::utils::error_body::normalize_error_body;
+use crate::utils::provider_retry::{ProviderRetry, is_retryable_provider_error, retry_delay_ms};
 use crate::utils::json_parse::parse_streaming_json_object;
 use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context};
 use base64::Engine as _;
@@ -92,6 +93,11 @@ const SIGV4_SERVICE: &str = "bedrock";
 /// Response media type of `ConverseStream` — the AWS binary event stream the SDK decodes for
 /// upstream and [`EventStreamDecoder`] decodes here.
 const EVENT_STREAM_MEDIA_TYPE: &str = "application/vnd.amazon.eventstream";
+
+/// Retries after the first attempt on the Bedrock route. The AWS SDK v3 **standard** retry mode
+/// makes 3 attempts, and pi's client config (`bedrock-converse-stream.ts:150-222` @v0.83.0) never
+/// overrides `maxAttempts`/`retryStrategy`, so that is what pi inherits per turn (PROV-043).
+const BEDROCK_STANDARD_MODE_RETRIES: u32 = 2;
 
 /// The dummy credential pair upstream installs when `AWS_BEDROCK_SKIP_AUTH=1`
 /// (`bedrock-converse-stream.ts:186-189`).
@@ -446,31 +452,108 @@ async fn run_inner(
         BedrockFailure::errored(dec.snapshot(model, api), format_bedrock_error(&e))
     })?;
 
-    // pi resolves an HTTP(S) proxy per request (`:197-205`).
-    let client = build_client_for_target(
+    // pi resolves an HTTP(S) proxy per request (`:197-205`), and — only when there is no proxy —
+    // honours `AWS_BEDROCK_FORCE_HTTP1=1` by dropping to a plain HTTP/1.1 handler (`:206-209`,
+    // "Some custom endpoints require HTTP/1.1 instead of HTTP/2"). cyrup's client negotiates h2 by
+    // ALPN, so without this a custom Bedrock endpoint or corporate gateway that requires HTTP/1.1
+    // had no override at all (PROV-044).
+    let force_http1 = env.get("AWS_BEDROCK_FORCE_HTTP1").as_deref() == Some("1");
+    let client = build_client_for_target_forcing_http1(
         &url,
         &crate::auth::types::EnvAuthContext,
         auth.env.as_ref(),
         opts.timeout_ms,
+        force_http1,
     )
     .await
     .map_err(|e| {
         BedrockFailure::errored(dec.snapshot(model, api), format_bedrock_error(&e.to_string()))
     })?;
 
-    let mut request = client.post(&url).body(body_bytes);
-    for (name, value) in &headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
+    // PROV-043. pi builds `new BedrockRuntimeClient(config)` (`bedrock-converse-stream.ts:223`)
+    // with a config (`:150-222`) that sets credentials, region, token and `requestHandler` but
+    // NEVER `maxAttempts` or `retryStrategy` — so the AWS SDK v3 **standard** retry mode applies:
+    // three attempts with jittered backoff on throttling and 5xx, inside a single pi turn. cyrup
+    // speaks the wire directly and had no retry at all here, so a routine `ThrottlingException`
+    // that pi swallows became a visible turn failure. The budget is a constant, not
+    // `ProviderRetry::from_options`, because pi's is not configurable on this route either: a
+    // `retry.provider.maxRetries` setting reaches the other seven impls and not this one.
+    let retry = ProviderRetry {
+        max_retries: BEDROCK_STANDARD_MODE_RETRIES,
+        max_retry_delay_ms: opts.max_retry_delay_ms,
+    };
+    let max_retries = retry.max_retries;
+    let mut retries_remaining = max_retries;
+    let aborted = |dec: &Decoder| BedrockFailure {
+        partial: dec.snapshot(model, api),
+        stop_reason: StopReason::Aborted,
+        message: "Request was aborted".to_string(),
+        status: None,
+        error_code: None,
+        request_id: None,
+    };
+    let response = loop {
+        // The SigV4 signature is over the (unchanged) body and headers, so it is reused across
+        // attempts exactly as the SDK's retry middleware reuses the signed request.
+        let mut request = client.post(&url).body(body_bytes.clone());
+        for (name, value) in &headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let attempt = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ProviderError::Aborted),
+            sent = request.send() => sent.map_err(|e| ProviderError::Transport(Box::new(e))),
+        };
+        // An abort is terminal and is never retried (Pi `provider-retry.ts:117`).
+        if cancel.is_cancelled() {
+            return Err(aborted(&dec));
+        }
 
-    let response = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(ProviderError::Aborted),
-        sent = request.send() => sent.map_err(|e| ProviderError::Transport(Box::new(e))),
-    }
-    .map_err(|e| {
-        BedrockFailure::errored(dec.snapshot(model, api), format_bedrock_error(&e.to_string()))
-    })?;
+        let (retry_headers, message) = match attempt {
+            Err(ProviderError::Aborted) => return Err(aborted(&dec)),
+            // A transport failure carries no status: `error.status === undefined` ⇒ retryable.
+            Err(transport) => {
+                if retries_remaining == 0 {
+                    return Err(BedrockFailure::errored(
+                        dec.snapshot(model, api),
+                        format_bedrock_error(&transport.to_string()),
+                    ));
+                }
+                (None, transport.to_string())
+            }
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                // A success — and an exhausted or non-retryable failure — leaves the loop so the
+                // status/error-body path below is unchanged.
+                if resp.status().is_success()
+                    || retries_remaining == 0
+                    || !is_retryable_provider_error(Some(code), Some(resp.headers()))
+                {
+                    break resp;
+                }
+                let retry_headers = resp.headers().clone();
+                (Some(retry_headers), format!("http {code}"))
+            }
+        };
+
+        let retry_index = max_retries.saturating_sub(retries_remaining);
+        retries_remaining = retries_remaining.saturating_sub(1);
+        let delay = retry_delay_ms(retry_headers.as_ref(), &message, retry_index, retry)
+            .map_err(|e| {
+                BedrockFailure::errored(
+                    dec.snapshot(model, api),
+                    format_bedrock_error(&e.to_string()),
+                )
+            })?;
+        // Interruptible backoff, unlike the SDK's own retry timers.
+        if cancel
+            .run_until_cancelled(tokio::time::sleep(std::time::Duration::from_millis(delay)))
+            .await
+            .is_none()
+        {
+            return Err(aborted(&dec));
+        }
+    };
 
     // pi `:249-255`: fire `onResponse` with the status and the request-id header.
     let status = response.status().as_u16();
@@ -4019,6 +4102,117 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Spawn a mock server that answers each successive connection with the next entry of
+    /// `responses` (the last entry repeats), and report how many connections it accepted.
+    async fn spawn_mock_sequence(
+        responses: &'static [&'static [u8]],
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let body = responses.get(n).copied().unwrap_or_else(|| {
+                    responses.last().copied().unwrap_or(b"HTTP/1.1 500 x\r\n\r\n")
+                });
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// PROV-043. pi's Bedrock client inherits the AWS SDK v3 **standard** retry mode — 3 attempts —
+    /// because its config never sets `maxAttempts`/`retryStrategy`
+    /// (`bedrock-converse-stream.ts:150-222` @v0.83.0). cyrup issued exactly ONE `send()`, so a
+    /// routine `ThrottlingException` that pi swallows became a visible turn failure.
+    ///
+    /// Red before the fix: `hits == 1` and the terminal error was the 429.
+    #[tokio::test]
+    async fn a_throttled_bedrock_request_is_retried_to_the_sdk_attempt_count() {
+        const THROTTLE: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nx-amzn-errortype: ThrottlingException\r\nretry-after-ms: 1\r\nConnection: close\r\n\r\n{\"message\":\"slow down\"}";
+        // A 400 is NOT retryable (provider-retry.ts:22-34), so it terminates the loop and proves
+        // the two preceding 429s were retried rather than returned.
+        const VALIDATION: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nx-amzn-errortype: ValidationException\r\nConnection: close\r\n\r\n{\"message\":\"bad input\"}";
+        const SEQ: &[&[u8]] = &[THROTTLE, THROTTLE, VALIDATION];
+
+        let (url, hits) = spawn_mock_sequence(SEQ).await;
+        let events = run_against(url).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "standard mode is 3 attempts: the first plus BEDROCK_STANDARD_MODE_RETRIES"
+        );
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {:?}", kinds(&events));
+        };
+        assert!(
+            error
+                .error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("bad input")),
+            "the terminal must be the third response, not the first: {:?}",
+            error.error_message
+        );
+    }
+
+    /// PROV-043, exhaustion half: a throttle on every attempt fails after the SDK's attempt count,
+    /// not on the first response.
+    #[tokio::test]
+    async fn a_permanently_throttled_bedrock_request_stops_at_the_attempt_count() {
+        const THROTTLE: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nx-amzn-errortype: ThrottlingException\r\nretry-after-ms: 1\r\nConnection: close\r\n\r\n{\"message\":\"slow down\"}";
+        const SEQ: &[&[u8]] = &[THROTTLE];
+        let (url, hits) = spawn_mock_sequence(SEQ).await;
+        let events = run_against(url).await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(matches!(events.last(), Some(StreamEvent::Error { .. })));
+    }
+
+    /// PROV-044. `AWS_BEDROCK_FORCE_HTTP1=1` must reach the client builder as `http1_only()`
+    /// (pi `bedrock-converse-stream.ts:206-209` @v0.83.0), and only when no proxy was resolved —
+    /// pi's `else if`. Red before the fix: `rg AWS_BEDROCK_FORCE_HTTP1 crates/` was empty and
+    /// cyrup's client negotiated h2 by ALPN with no override.
+    #[tokio::test]
+    async fn force_http1_builds_an_http1_only_client_only_without_a_proxy() {
+        use crate::stream::sse::build_client_for_target_forcing_http1;
+        let ctx = crate::auth::types::EnvAuthContext;
+        // No proxy in the overlay ⇒ the override applies and the client still builds.
+        let no_proxy = env_map(&[]);
+        assert!(
+            build_client_for_target_forcing_http1(
+                "https://bedrock-runtime.us-east-1.amazonaws.com",
+                &ctx,
+                Some(&no_proxy),
+                None,
+                true,
+            )
+            .await
+            .is_ok()
+        );
+        // With a proxy the override is suppressed (pi's `else if`), and the proxied client builds.
+        let proxied = env_map(&[("HTTPS_PROXY", "http://127.0.0.1:3128")]);
+        assert!(
+            build_client_for_target_forcing_http1(
+                "https://bedrock-runtime.us-east-1.amazonaws.com",
+                &ctx,
+                Some(&proxied),
+                None,
+                true,
+            )
+            .await
+            .is_ok()
+        );
     }
 
     /// Drive the real `ApiImpl::run` (so the ported catch arm runs) against `base_url`.

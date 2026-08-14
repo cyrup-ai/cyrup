@@ -63,14 +63,11 @@
 //!   already resolved. That impl is also where AWS SigV4 signing lives — the ambient arms below
 //!   return **no** key precisely because the signature, not a bearer, is what authenticates those
 //!   requests.
-//! * **`bedrockAuth.login`** (`amazon-bedrock.ts:13-51`) — the three-way interactive picker (bearer
-//!   token / AWS profile / existing credential chain) that *writes* the credential, including the
-//!   `notify` with the AWS credential-provider-chain doc link. cyrup's [`crate::auth::ApiKeyAuth`]
-//!   trait has only `name` + `resolve` (`auth/mod.rs:56-71`); pi's `ApiKeyAuth` additionally carries
-//!   `login(interaction)` (`ai/src/auth/types.ts`). Adding it is a change to `auth/mod.rs`, outside
-//!   this module — the identical gap `providers/google_vertex.rs` documents. The prompt substrate
-//!   the flow needs ([`crate::auth::AuthInteraction`], `AuthPromptKind::Select`/`Text`/`Secret`) is
-//!   already ported, so the missing piece is the trait member, not the machinery.
+//! * **`bedrockAuth.login`** (`amazon-bedrock.ts:13-51`) — the three-way interactive picker
+//!   (bearer token / AWS profile / existing credential chain) that *writes* the credential,
+//!   including the `notify` with the AWS credential-provider-chain doc link — IS ported below, on
+//!   [`crate::auth::ApiKeyAuth::login`], the trait member CFG-005 added beside `name` + `resolve`
+//!   (pi `ai/src/auth/types.ts:166`).
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::types::{AuthContext, AuthResult, Credential, ModelAuth, ProviderEnv};
@@ -97,6 +94,23 @@ pub const BEDROCK_US_EAST_1_BASE_URL: &str = "https://bedrock-runtime.us-east-1.
 /// The `eu-central-1` Bedrock runtime endpoint — the `baseUrl` of the nine `eu.*` inference
 /// profiles (pi `amazon-bedrock.models.ts`).
 pub const BEDROCK_EU_CENTRAL_1_BASE_URL: &str = "https://bedrock-runtime.eu-central-1.amazonaws.com";
+
+/// The three `bedrockAuth.login` option ids (pi `amazon-bedrock.ts:18-20`).
+const METHOD_BEARER_TOKEN: &str = "bearer-token";
+const METHOD_AWS_PROFILE: &str = "aws-profile";
+const METHOD_CREDENTIAL_CHAIN: &str = "credential-chain";
+
+/// The `bedrockAuth.login` prompt/notify strings, verbatim from `amazon-bedrock.ts:16`, `:26`,
+/// `:31`, `:35`, `:42` and `:48`.
+const SELECT_AUTH_METHOD_MESSAGE: &str = "Select Amazon Bedrock authentication method:";
+const ENTER_BEARER_TOKEN_MESSAGE: &str = "Enter Amazon Bedrock bearer token";
+const CREDENTIAL_CHAIN_INFO_MESSAGE: &str =
+    "Amazon Bedrock supports AWS profiles, IAM credentials, and role-based credentials.";
+const AWS_CREDENTIAL_CHAIN_DOCS_URL: &str =
+    "https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html";
+const ENTER_AWS_PROFILE_MESSAGE: &str = "Enter AWS profile name";
+const CONFIGURE_THEN_CONTINUE_MESSAGE: &str =
+    "Configure AWS credentials, then press Enter to continue";
 
 /// A long-lived Bedrock API key, used as a bearer (pi `amazon-bedrock.ts:56`).
 pub const AWS_BEARER_TOKEN_BEDROCK_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
@@ -212,6 +226,101 @@ impl ApiKeyAuth for AmazonBedrockApiKeyAuth {
     /// pi `bedrockAuth.name` (`amazon-bedrock.ts:12`).
     fn name(&self) -> &str {
         AMAZON_BEDROCK_AUTH_NAME
+    }
+
+    fn supports_login(&self) -> bool {
+        true
+    }
+
+    /// 1:1 port of `bedrockAuth.login` (`amazon-bedrock.ts:13-51`): a three-way picker, then a
+    /// bearer-token secret, an AWS profile name, or a bare acknowledgement that the ambient
+    /// credential chain is configured. An unknown option id is upstream's
+    /// `Unknown Amazon Bedrock auth method: {method}` (`:45`).
+    ///
+    /// CFG-005: two of the three arms produce a credential with **no key** — one carries only
+    /// `AWS_PROFILE`, one carries nothing at all and exists purely to record that the operator
+    /// chose the ambient chain. A single-secret `/login` cannot express either.
+    async fn login(
+        &self,
+        interaction: &dyn crate::auth::oauth::AuthInteraction,
+    ) -> Result<Credential, crate::auth::oauth::OAuthError> {
+        use crate::auth::oauth::{
+            AuthEvent, AuthInfoLink, AuthPrompt, AuthSelectOption, OAuthError,
+        };
+
+        // `:14-22`
+        let method = interaction
+            .prompt(AuthPrompt::select(
+                SELECT_AUTH_METHOD_MESSAGE,
+                vec![
+                    AuthSelectOption {
+                        id: METHOD_BEARER_TOKEN.to_string(),
+                        label: "Bearer token".to_string(),
+                        description: None,
+                    },
+                    AuthSelectOption {
+                        id: METHOD_AWS_PROFILE.to_string(),
+                        label: "AWS profile".to_string(),
+                        description: None,
+                    },
+                    AuthSelectOption {
+                        id: METHOD_CREDENTIAL_CHAIN.to_string(),
+                        label: "Existing AWS credential chain".to_string(),
+                        description: None,
+                    },
+                ],
+            ))
+            .await?;
+
+        // `:23-28`
+        if method == METHOD_BEARER_TOKEN {
+            let key = interaction
+                .prompt(AuthPrompt::secret(ENTER_BEARER_TOKEN_MESSAGE))
+                .await?;
+            return Ok(Credential::ApiKey {
+                key: Some(key),
+                env: None,
+            });
+        }
+
+        // `:29-38` — the notify fires for BOTH remaining arms, before the profile prompt.
+        interaction.notify(AuthEvent::Info {
+            message: CREDENTIAL_CHAIN_INFO_MESSAGE.to_string(),
+            links: vec![AuthInfoLink {
+                label: Some("AWS credential provider chain".to_string()),
+                url: AWS_CREDENTIAL_CHAIN_DOCS_URL.to_string(),
+            }],
+        });
+
+        // `:39-44`
+        if method == METHOD_AWS_PROFILE {
+            let profile = interaction
+                .prompt(AuthPrompt::text(ENTER_AWS_PROFILE_MESSAGE))
+                .await?;
+            let mut env = ProviderEnv::new();
+            env.insert(AWS_PROFILE_ENV.to_string(), profile);
+            return Ok(Credential::ApiKey {
+                key: None,
+                env: Some(env),
+            });
+        }
+
+        // `:45`
+        if method != METHOD_CREDENTIAL_CHAIN {
+            return Err(OAuthError::Failed(format!(
+                "Unknown Amazon Bedrock auth method: {method}"
+            )));
+        }
+        // `:46-49` — a TEXT prompt used purely as "press Enter to continue"; its answer is
+        // discarded, but the await is what blocks until the operator has configured AWS.
+        let _ = interaction
+            .prompt(AuthPrompt::text(CONFIGURE_THEN_CONTINUE_MESSAGE))
+            .await?;
+        // `:50` — `{ type: "api_key" }`: no key, no env.
+        Ok(Credential::ApiKey {
+            key: None,
+            env: None,
+        })
     }
 
     /// pi `bedrockAuth.resolve` (`amazon-bedrock.ts:52-71`), rung for rung.

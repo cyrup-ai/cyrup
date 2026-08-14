@@ -53,12 +53,12 @@ tokio-util = { workspace = true, features = ["io"], optional = true }
 # pure-Rust in-crate feature that pulls no new crate.
 cyrup-provider = { workspace = true, features = ["faux"] }
 
-# `tests/build_tier1.rs` drives a REAL `cargo build --target wasm32-wasip2`, whose artifact cache is
-# ~213 MB. It previously wrote that cache to a nanos-suffixed `std::env::temp_dir()` path and never
-# removed it, leaking a fresh 213 MB on every run; 57 accumulated copies filled this box's 16 GB
-# `/tmp` tmpfs to 100% and made `ld` die with SIGBUS while linking unrelated doctests. A
-# `TempDir` ties the cache to the test's own lifetime.
-tempfile.workspace = true
+# `tempfile` was here for `tests/build_tier1.rs`, which drives a REAL `cargo build --target
+# wasm32-wasip2` and must tie that build's ~213 MB artifact cache to a `TempDir` (it once wrote to a
+# nanos-suffixed `std::env::temp_dir()` path and never removed it; 57 accumulated copies filled this
+# box's 16 GB `/tmp` tmpfs and made `ld` die with SIGBUS while linking unrelated doctests). That
+# test moved to `crates/cyrup-it/tests/ext/build_tier1.rs` and took its `tempfile` edge with it —
+# nothing under `crates/cyrup-ext/` references `tempfile` any more, so the dev-dependency is gone.
 
 [features]
 # The whole Wasmtime Component Model host is behind `wasm-host` (arch-08 §2) so the

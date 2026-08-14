@@ -19,7 +19,7 @@ pub mod state;
 pub mod stream_fn;
 pub mod subscriber;
 
-pub use agent::{Agent, AgentBuilder, PromptInput, RunHandle};
+pub use agent::{Agent, AgentBuilder, HeaderFn, PromptInput, RunHandle, Subscription};
 pub use error::{AgentError, HookError};
 pub use event::{AgentEvent, AgentMessage, ToolResultMessage};
 pub use loop_fn::{
@@ -41,3 +41,6 @@ pub use subscriber::EventSubscriber;
 // Re-export the load-bearing provider/core types the agent's public API exposes, so downstream
 // crates can drive the agent without depending on cyrup-provider directly for these.
 pub use cyrup_provider::{Context, StreamEvent, StreamOptions, ToolDef};
+
+#[cfg(test)]
+mod tests;

@@ -23,7 +23,7 @@ use cyrup_resources::{
 use cyrup_sdk::core::{CancelToken, PackageId};
 use cyrup_tui::{
     run_startup_selector, ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle,
-    ConfigWriteScope, ProjectOverrideState, SelectKeymap, UiTheme,
+    ConfigWriteScope, ProjectOverrideState,
 };
 
 /// The recognized subcommand verbs (Pi: `install`/`remove`/`update`/`list` + `uninstall` alias +
@@ -621,8 +621,13 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
         rows.iter().map(ConfigSelector::resource_key).collect()
     };
 
-    let theme = UiTheme::default();
-    let keymap = SelectKeymap::default();
+    // SEAM-066/067 — pi's `cli/config-selector.ts:22` runs the SAME `createStartupTui` preamble as
+    // every other pre-launch screen: `setRegisteredThemes` + `initTheme(resolveThemeSetting(...))`
+    // and `setKeybindings(KeybindingsManager.create())` (`cli/startup-ui.ts:78-81`). Hardwiring
+    // `UiTheme::default()` (= `dark()`) and `SelectKeymap::default()` here gave a `"theme": "light"`
+    // user a dark `cyrup config` and made its hint row name keys they had rebound.
+    let theme = crate::startup_ui::startup_theme(dirs);
+    let (keymap, _) = crate::startup_ui::startup_keymaps(dirs);
     // `getProjectOverrideState` for a top-level resource (`config-selector.ts:741-746`):
     // `getOverrideStateFromEntries(projectSettings[resourceType], patterns, false)` — scan the
     // PROJECT array for an entry naming this resource and read its marker, `!`/`-` ⇒ unload, else

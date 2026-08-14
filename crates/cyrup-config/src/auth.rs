@@ -68,19 +68,57 @@ pub struct AuthStore {
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// `--api-key`: explicit per-run override (top precedence tier). Not persisted.
     runtime: RwLock<HashMap<String, String>>,
+    /// The last VALID `auth.json` snapshot (Pi `AuthStorage.data`, auth-storage.ts:172 @v0.83.0).
+    /// Every query answers from here — `read()` is `this.data[provider]` (`:217-222`) — and it is
+    /// refreshed only by [`AuthStore::reload`] and by a successful [`AuthStore::modify`]. A failed
+    /// reload PRESERVES it (`catch { /* Preserve the last valid in-memory snapshot. */ }`,
+    /// `:204-215`), which is the whole point: before CFG-007 every query re-read the file and
+    /// coerced any `Err` to "not configured", so a transient read error or a mid-write window made
+    /// every configured provider look unauthenticated.
+    cached: RwLock<AuthFile>,
 }
 
 impl AuthStore {
-    /// Open the store; does not read `auth.json` until the first credential op (lazy).
+    /// Open the store. Reads `auth.json` once, exactly as pi's constructor calls `reload()`
+    /// (auth-storage.ts:172-178 @v0.83.0).
     pub fn open(dirs: &ConfigDirs) -> Self {
         Self::at(dirs.auth_path())
     }
 
     pub fn at(path: PathBuf) -> Self {
-        Self {
+        let store = Self {
             path,
             locks: Mutex::new(HashMap::new()),
             runtime: RwLock::new(HashMap::new()),
+            cached: RwLock::new(AuthFile::new()),
+        };
+        store.reload();
+        store
+    }
+
+    /// Re-read `auth.json` into the snapshot, PRESERVING the previous snapshot on any failure
+    /// (Pi `AuthStorage.reload`, auth-storage.ts:204-215 @v0.83.0). A missing file is a successful
+    /// read of an empty document, not a failure.
+    pub fn reload(&self) {
+        let Ok(map) = self.read_file_uncached() else {
+            return;
+        };
+        if let Ok(mut g) = self.cached.write() {
+            *g = map;
+        }
+    }
+
+    /// The current snapshot (`this.data`).
+    fn snapshot(&self) -> AuthFile {
+        self.cached
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+
+    fn store_snapshot(&self, map: &AuthFile) {
+        if let Ok(mut g) = self.cached.write() {
+            g.clone_from(map);
         }
     }
 
@@ -117,7 +155,9 @@ impl AuthStore {
             .and_then(|g| g.get(provider.as_str()).cloned())
     }
 
-    fn read_file(&self) -> Result<AuthFile, AuthError> {
+    /// The raw file read. Used under the cross-process lock by [`AuthStore::modify`] and by
+    /// [`AuthStore::reload`]; every other path answers from [`AuthStore::snapshot`].
+    fn read_file_uncached(&self) -> Result<AuthFile, AuthError> {
         match std::fs::read_to_string(&self.path) {
             Ok(text) => parse_auth(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AuthFile::new()),
@@ -125,14 +165,21 @@ impl AuthStore {
         }
     }
 
-    /// Read a provider's credential (`None` if absent). A bad file surfaces `Parse` (R-01-017).
+    /// Read a provider's credential (`None` if absent) from the cached snapshot (Pi
+    /// `AuthStorage.read`, auth-storage.ts:217-222 @v0.83.0 — `this.data[provider]`, no I/O).
+    /// Call [`AuthStore::reload`] to pick up an out-of-process write, as pi does.
     pub async fn read(&self, provider: &ProviderId) -> Result<Option<Credential>, AuthError> {
-        let map = self.read_file()?;
-        Ok(map.get(provider.as_str()).cloned())
+        Ok(self.snapshot().get(provider.as_str()).cloned())
     }
 
-    /// Provider-scoped env of a stored `api_key` credential (Pi `AuthStorage.getProviderEnv`,
-    /// auth-storage.ts:305-308). Returns `Some` (a copy of the credential's `env` map, possibly
+    /// Provider-scoped env of a stored `api_key` credential. Upstream has no `getProviderEnv`
+    /// symbol at the ported tag (`git grep getProviderEnv v0.83.0 -- packages` is empty, and
+    /// `auth-storage.ts` is 271 lines there, so the old `:305-308` cite pointed past end-of-file —
+    /// CFG-044). The real equivalent is the scoped `env` that `ModelRuntime.prepareRequest` builds
+    /// from the stored credential before resolving a `models.json` `apiKey`/`headers` config value
+    /// (`model-runtime.ts` @v0.83.0; consumers at model-registry.ts:704, :809).
+    ///
+    /// Returns `Some` (a copy of the credential's `env` map, possibly
     /// empty — mirroring Pi's truthy `cred.env` check on a present object) only for an `api_key`
     /// credential that carries an `env`; `None` for OAuth, a missing credential, or an `api_key`
     /// without `env`. The model-registry consumer (model-registry.ts:704,809) passes this map as
@@ -153,7 +200,9 @@ impl AuthStore {
     /// (interactive-mode.ts:4671). Keys are returned in sorted order (the on-disk map is a
     /// `BTreeMap`), which is deterministic; Pi returns `Object.keys` insertion order.
     pub fn list(&self) -> Result<Vec<String>, AuthError> {
-        Ok(self.read_file()?.into_keys().collect())
+        // `Object.keys(this.data)` (auth-storage.ts:329-331 @v0.83.0) — the cached snapshot, not a
+        // fresh read.
+        Ok(self.snapshot().into_keys().collect())
     }
 
     /// The COMPOSED credential enumeration `ModelRuntime.listCredentials()` returns
@@ -172,7 +221,7 @@ impl AuthStore {
     /// configured API-key commands while listing" (`ai/src/auth/types.ts:69-70`).
     pub fn list_credentials(&self) -> Result<Vec<CredentialInfo>, AuthError> {
         let mut out: Vec<CredentialInfo> = self
-            .read_file()?
+            .snapshot()
             .into_iter()
             .map(|(provider, cred)| CredentialInfo {
                 provider: ProviderId::from(provider.as_str()),
@@ -220,7 +269,7 @@ impl AuthStore {
         let flock = crate::lock::FileLock::acquire(&self.path)
             .map_err(|e| AuthError::Lock(e.to_string()))?;
 
-        let mut map = self.read_file()?;
+        let mut map = self.read_file_uncached()?;
         let current = map.get(provider.as_str()).cloned();
 
         // OAuth refresh / mutation happens here, under both locks.
@@ -246,6 +295,9 @@ impl AuthStore {
             .map_err(|e| AuthError::Lock(e.to_string()))?;
 
         drop(flock);
+        // Pi assigns the just-written document onto `this.data` inside `modify`
+        // (auth-storage.ts:224-247 @v0.83.0), so the snapshot never lags a write this process made.
+        self.store_snapshot(&map);
         Ok(map.get(provider.as_str()).cloned())
     }
 
@@ -255,55 +307,34 @@ impl AuthStore {
         Ok(())
     }
 
-    /// Whether any form of auth is configured for a provider WITHOUT refreshing tokens (Pi
-    /// `AuthStorage.hasAuth`, auth-storage.ts:344-349): runtime override, a stored credential, or a
-    /// known env var. `env` is an optional scoped override map for the env tier.
+    /// Whether any form of auth is configured for a provider WITHOUT refreshing tokens: runtime
+    /// override, a stored credential, or a known env var. `env` is an optional scoped override map
+    /// for the env tier.
+    ///
+    /// Ports `ModelRuntime.hasConfiguredAuth` (`model-runtime.ts:372-374` @v0.83.0). The previous
+    /// cite, `AuthStorage.hasAuth` at `auth-storage.ts:344-349`, names a symbol that does not exist
+    /// at the ported tag (`git grep 'hasAuth\b' v0.83.0 -- packages` is empty; the file is 271
+    /// lines) — CFG-044. The models.json tier of `hasConfiguredAuth` lives separately in
+    /// [`crate::model::provider_is_configured`].
     pub fn has_auth(&self, provider: &ProviderId, env: Option<&HashMap<String, String>>) -> bool {
         if self.runtime_api_key(provider).is_some() {
             return true;
         }
-        if matches!(self.read_file(), Ok(map) if map.contains_key(provider.as_str())) {
+        if self.snapshot().contains_key(provider.as_str()) {
             return true;
         }
         crate::env_keys::get_env_api_key(provider.as_str(), env).is_some()
     }
 
-    /// Report auth status without exposing values or refreshing (Pi `getAuthStatus`,
-    /// auth-storage.ts:354-369). Precedence: stored → runtime(`--api-key`) → environment.
-    pub fn get_auth_status(
-        &self,
-        provider: &ProviderId,
-        env: Option<&HashMap<String, String>>,
-    ) -> AuthStatus {
-        if matches!(self.read_file(), Ok(map) if map.contains_key(provider.as_str())) {
-            return AuthStatus {
-                configured: true,
-                source: Some(AuthSource::Stored),
-                label: None,
-            };
-        }
-        if self.runtime_api_key(provider).is_some() {
-            return AuthStatus {
-                configured: false,
-                source: Some(AuthSource::Runtime),
-                label: Some("--api-key".to_string()),
-            };
-        }
-        if let Some(keys) = crate::env_keys::find_env_keys(provider.as_str(), env)
-            && let Some(first) = keys.into_iter().next()
-        {
-            return AuthStatus {
-                configured: false,
-                source: Some(AuthSource::Environment),
-                label: Some(first),
-            };
-        }
-        AuthStatus {
-            configured: false,
-            source: None,
-            label: None,
-        }
-    }
+    // CFG-044: `AuthStore::get_auth_status` was DELETED here. It cited `getAuthStatus` at
+    // `auth-storage.ts:354-369`, a symbol that does not exist at v0.83.0 (`auth-storage.ts` is 271
+    // lines; `git grep getAuthStatus v0.83.0 -- packages` finds only prose in
+    // `packages/agent/docs/models.md:874` recording that `AuthStorage` was deleted upstream). It
+    // had ZERO production callers, and its semantics were the OPPOSITE of the real upstream
+    // function — it reported `configured: false` for the runtime and environment tiers where
+    // `ModelRuntime.getProviderAuthStatus` (`model-runtime.ts:428-437` @v0.83.0) reports
+    // `{ configured: true, source: "runtime" | "environment" }`. The ported function is
+    // [`crate::login::provider_auth_status`], which is what every caller uses.
 
     /// Resolve a usable API key for a provider (Pi `AuthStorage.getApiKey`, auth-storage.ts:462-520):
     /// runtime override → stored api_key (via `resolveConfigValue`) → OAuth access token (if not
@@ -332,10 +363,11 @@ impl AuthStore {
             }) => {
                 let scoped: Option<HashMap<String, String>> =
                     cred_env.map(|m| m.into_iter().collect());
-                return Ok(crate::config_value::resolve_config_value(
-                    &raw,
-                    scoped.as_ref(),
-                ));
+                // CFG-028: a `!command` credential helper runs on the blocking pool, not on the
+                // tokio worker that is driving this future.
+                return Ok(
+                    crate::config_value::resolve_config_value_async(&raw, scoped.as_ref()).await,
+                );
             }
             Some(Credential::ApiKey { key: None, .. }) => { /* fall through to env */ }
             Some(Credential::Oauth {
@@ -783,30 +815,66 @@ mod tests {
         assert_eq!(s.get_api_key(&provider, true, None).await.unwrap(), None);
     }
 
+    /// CFG-044 replaced `auth_status_sources` (which exercised the deleted
+    /// `AuthStore::get_auth_status`) with a test of the surviving predicate. `has_auth` must see
+    /// all three tiers — runtime, stored, environment — matching
+    /// `ModelRuntime.hasConfiguredAuth` (`model-runtime.ts:372-374` @v0.83.0).
     #[tokio::test]
-    async fn auth_status_sources() {
+    async fn has_auth_sees_stored_runtime_and_environment_tiers() {
         let (s, _p, _dir) = store();
         let openai = ProviderId::from("openai");
-        // environment source with label.
+        let empty: HashMap<String, String> = HashMap::new();
+        assert!(!s.has_auth(&openai, Some(&empty)));
+
         let env: HashMap<String, String> =
             [("OPENAI_API_KEY".to_string(), "sk-env".to_string())].into();
-        let st = s.get_auth_status(&openai, Some(&env));
-        assert!(!st.configured);
-        assert_eq!(st.source, Some(AuthSource::Environment));
-        assert_eq!(st.label.as_deref(), Some("OPENAI_API_KEY"));
-        // stored source.
-        s.modify(&openai, |_| async { Ok(Some(Credential::api_key("k"))) })
+        assert!(s.has_auth(&openai, Some(&env)));
+
+        let other = ProviderId::from("acme");
+        s.set_runtime_api_key(other.clone(), "sk-runtime".to_string());
+        assert!(s.has_auth(&other, Some(&empty)));
+
+        let stored = ProviderId::from("mistral");
+        s.modify(&stored, |_| async { Ok(Some(Credential::api_key("k"))) })
             .await
             .unwrap();
-        let st = s.get_auth_status(&openai, Some(&env));
-        assert!(st.configured);
-        assert_eq!(st.source, Some(AuthSource::Stored));
-        assert!(s.has_auth(&openai, Some(&env)));
+        assert!(s.has_auth(&stored, Some(&empty)));
+    }
+
+    /// CFG-007: a corrupt / unreadable `auth.json` must NOT make a configured provider read as
+    /// unauthenticated — pi keeps the last valid snapshot (`catch { /* Preserve the last valid
+    /// in-memory snapshot. */ }`, auth-storage.ts:204-215 @v0.83.0).
+    ///
+    /// Red at HEAD before the fix: `has_auth` was `matches!(self.read_file(), Ok(map) if …)`, so a
+    /// parse error coerced to `false`, and `read`/`list`/`list_credentials` propagated the error.
+    #[tokio::test]
+    async fn a_corrupt_auth_json_preserves_the_last_valid_snapshot() {
+        let (s, path, _dir) = store();
+        let prov = ProviderId::from("openai");
+        let empty: HashMap<String, String> = HashMap::new();
+
+        s.modify(&prov, |_| async { Ok(Some(Credential::api_key("k"))) })
+            .await
+            .unwrap();
+        assert!(s.has_auth(&prov, Some(&empty)));
+
+        std::fs::write(&path, "{ this is not json").unwrap();
+        // An explicit reload of a broken file must not clear the snapshot either.
+        s.reload();
+        assert!(s.has_auth(&prov, Some(&empty)));
+        assert_eq!(s.read(&prov).await.unwrap(), Some(Credential::api_key("k")));
+        assert_eq!(s.list().unwrap(), vec!["openai".to_string()]);
+
+        // A repaired file is picked up by `reload`, exactly as pi's is.
+        std::fs::write(&path, "{}\n").unwrap();
+        s.reload();
+        assert!(!s.has_auth(&prov, Some(&empty)));
     }
 
     #[tokio::test]
     async fn get_provider_env_returns_scoped_env_for_api_key_only() {
-        // Pi AuthStorage.getProviderEnv (auth-storage.ts:305-308).
+        // The scoped provider `env` a stored api-key credential contributes (CFG-044: the old
+        // `AuthStorage.getProviderEnv` cite resolves to nothing at v0.83.0).
         let (s, _p, _dir) = store();
         let prov = ProviderId::from("acme");
         // api_key with env → Some(copy).

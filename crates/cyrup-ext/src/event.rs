@@ -31,14 +31,16 @@ pub enum EventKind {
     ToolExecEnd = 15,
     SessionStart = 16,
     SessionShutdown = 17,
-    // input / provider / model — mutating + notify (Pi types.ts:1158-1163)
+    // input / provider / model — mutating + notify (pi's overload block,
+    // extensions/types.ts:1190-1231 @v0.83.0)
     Input = 18,
     UserBash = 19,
     BeforeProviderRequest = 20,
     AfterProviderResponse = 21,
     ModelSelect = 22,
     ThinkingLevelSelect = 23,
-    // session control lifecycle (Pi types.ts:1148-1156)
+    // session control lifecycle (pi's `on(event: "session_before_*")` overloads,
+    // extensions/types.ts:1190-1231 @v0.83.0)
     SessionBeforeSwitch = 24,
     SessionBeforeFork = 25,
     SessionBeforeCompact = 26,
@@ -51,12 +53,26 @@ pub enum EventKind {
     /// `_runAgentPrompt` (agent-session.ts:1063-1072) via `_emitAgentSettled` (:581-588), which
     /// notifies the extension runner FIRST and the session subscribers second (SEAM-005).
     AgentSettled = 30,
+    /// `before_provider_headers` (pi `BeforeProviderHeadersEvent`, extensions/types.ts:686-689
+    /// @v0.83.0, subscribed at :1212, reduced by `emitBeforeProviderHeaders` at runner.ts:1045).
+    /// EXT-009.
+    BeforeProviderHeaders = 31,
+    /// `session_info_changed` (pi `SessionInfoChangedEvent`, extensions/types.ts:571-575 @v0.83.0,
+    /// subscribed at :1203). EXT-011.
+    SessionInfoChanged = 32,
 }
 
 impl EventKind {
-    /// The number of distinct kinds (must stay <= 64 for the bitset). 1:1 with Pi's 31-event
-    /// catalog (extensions/types.ts:1133-1171 + `agent_settled` at :1225).
-    pub const COUNT: u8 = 31;
+    /// The number of distinct kinds (must stay <= 64 for the bitset).
+    ///
+    /// **33, and 1:1 with pi's catalog since EXT-009 and EXT-011 closed.** pi declares 33
+    /// `on(event: "…")` overloads at `extensions/types.ts:1190-1231` @v0.83.0 (`:1203-1244`
+    /// @v0.84.1), hand re-derived. EXT-036: the range this doc used to cite — `types.ts:1133-1171`
+    /// — matches no upstream version and was fabricated, and the "1:1 with Pi's 31-event catalog"
+    /// claim it carried was false while `before_provider_headers` and `session_info_changed` were
+    /// missing. Enumerating pi's overload names against [`EventKind::name`] now leaves an empty
+    /// set difference in both directions: no missing event and no cyrup-invented one.
+    pub const COUNT: u8 = 33;
 
     /// Parse the `u8` a guest passes via `subscribe(event-kinds)`.
     pub fn from_u8(v: u8) -> Option<EventKind> {
@@ -93,11 +109,14 @@ impl EventKind {
             28 => SessionBeforeTree,
             29 => SessionTree,
             30 => AgentSettled,
+            31 => BeforeProviderHeaders,
+            32 => SessionInfoChanged,
             _ => return None,
         })
     }
 
-    /// The snake_case event name (Pi extensions/types.ts:1133-1171; used in `ExtensionError.event`).
+    /// The snake_case event name (pi's `on(event: "…")` overload block,
+    /// `extensions/types.ts:1190-1231` @v0.83.0; used in `ExtensionError.event`).
     pub fn name(&self) -> &'static str {
         use EventKind::*;
         match self {
@@ -132,6 +151,8 @@ impl EventKind {
             SessionBeforeTree => "session_before_tree",
             SessionTree => "session_tree",
             AgentSettled => "agent_settled",
+            BeforeProviderHeaders => "before_provider_headers",
+            SessionInfoChanged => "session_info_changed",
         }
     }
 
@@ -301,14 +322,37 @@ pub enum HostEvent {
     /// `assistantMessageEvent` provider delta (carried as `delta`).
     MessageUpdate { message: Value, delta: Value },
     ToolExecStart { call_id: ToolCallId, name: String, args: Value },
-    ToolExecUpdate { call_id: ToolCallId, chunk: Value },
-    ToolExecEnd { call_id: ToolCallId, result: Value, is_error: bool },
+    /// `tool_execution_update` (pi `ToolExecutionUpdateEvent`, extensions/types.ts:770-776
+    /// @v0.83.0): `{type, toolCallId, toolName, args, partialResult}`. `name` and `args` were
+    /// dropped here while the arm directly above kept both, so an observer that missed
+    /// `tool_execution_start` — late registration, reload, or a run already in flight — could not
+    /// filter by tool at all (EXT-014).
+    ToolExecUpdate { call_id: ToolCallId, name: String, args: Value, chunk: Value },
+    /// `tool_execution_end` (pi `ToolExecutionEndEvent`, extensions/types.ts:779-785 @v0.83.0):
+    /// `{type, toolCallId, toolName, result, isError}` (EXT-014).
+    ToolExecEnd { call_id: ToolCallId, name: String, result: Value, is_error: bool },
     // 5.1/5.2 startup & session
-    SessionStart { reason: String },
-    SessionShutdown { reason: String },
-    ResourcesDiscover,
-    ProjectTrust,
-    // 5.5 input / 5.6 provider / model (Pi types.ts:1158-1163)
+    /// `session_start` (pi `SessionStartEvent`, extensions/types.ts:562-569 @v0.83.0): `reason`
+    /// (`"startup"|"reload"|"new"|"resume"|"fork"`) and `previousSessionFile?`, "Present for
+    /// \"new\", \"resume\", and \"fork\"" (EXT-015).
+    SessionStart { reason: String, previous_session_file: Option<String> },
+    /// `session_shutdown` (pi `SessionShutdownEvent`, extensions/types.ts:616-621 @v0.83.0):
+    /// `reason` and `targetSessionFile?`, "Destination session file when shutting down due to
+    /// session replacement" (EXT-015).
+    SessionShutdown { reason: String, target_session_file: Option<String> },
+    /// `session_info_changed` (pi `SessionInfoChangedEvent`, extensions/types.ts:571-575
+    /// @v0.83.0): "Current normalized session name. Undefined when the name is cleared" — so
+    /// `None` is upstream's `undefined`, not an empty name (EXT-011).
+    SessionInfoChanged { name: Option<String> },
+    /// `resources_discover` (pi `ResourcesDiscoverEvent`, extensions/types.ts:544-548 @v0.83.0):
+    /// `{type, cwd, reason: "startup" | "reload"}` (EXT-016).
+    ResourcesDiscover { cwd: String, reason: String },
+    /// `project_trust` (pi `ProjectTrustEvent`, extensions/types.ts:519-522 @v0.83.0):
+    /// `{type, cwd}`. The verdict is per-DIRECTORY upstream — the store is keyed by cwd
+    /// (`options.trustStore.set(options.cwd, trusted)`, core/project-trust.ts:63-65) — so without
+    /// this a trust-policy extension cannot key an allowlist or honour `remember` (EXT-043).
+    ProjectTrust { cwd: String },
+    // 5.5 input / 5.6 provider / model (pi's overload block, extensions/types.ts:1190-1231 @v0.83.0)
     // Carries the submission text AND the attached images (Pi `InputEvent.text`/`.images`,
     // types.ts:792-802) so an `input` handler can `transform` either (Pi runner.ts:1116-1119),
     // PLUS the `source` (Pi `InputEvent.source`, types.ts:799) and the in-flight `streaming_behavior`
@@ -325,12 +369,31 @@ pub enum HostEvent {
     /// via the `handled` outcome (Pi `UserBashEventResult`), not carried inbound.
     UserBash { command: String, exclude_from_context: bool, cwd: String },
     BeforeProviderRequest { payload: Value },
+    /// `before_provider_headers` (pi `BeforeProviderHeadersEvent`, extensions/types.ts:686-689
+    /// @v0.83.0). `headers` is the assembled header bag. Upstream's doc (:681-685) is exact:
+    /// "Handlers mutate `headers` in place … A `null` value deletes that header", so the patch is
+    /// an object whose values are `string | null` and a `null` DELETES rather than blanks
+    /// (EXT-009).
+    BeforeProviderHeaders { headers: Value },
     AfterProviderResponse { status: u32, headers: Value },
-    ModelSelect { model: Value },
-    ThinkingLevelSelect { level: String },
-    // session control lifecycle (Pi types.ts:1148-1156)
-    SessionBeforeSwitch { target_id: String },
-    SessionBeforeFork { entry_id: String },
+    /// `model_select` (pi `ModelSelectEvent`, extensions/types.ts:794-799 @v0.83.0): `model`,
+    /// `previousModel` and `source` are THREE SIBLING fields. cyrup used to nest the latter two
+    /// inside `model`, so a ported handler read `event.previousModel` and got `undefined` while
+    /// `event.model` was not a `Model` shape either (EXT-042).
+    ModelSelect { model: Value, previous_model: Option<Value>, source: String },
+    /// `thinking_level_select` (pi `ThinkingLevelSelectEvent`, extensions/types.ts:802-806
+    /// @v0.83.0): `{level, previousLevel}`. `previousLevel` is not optional upstream; `None` here
+    /// is the first event of a session, where there is genuinely no prior level (EXT-042).
+    ThinkingLevelSelect { level: String, previous_level: Option<String> },
+    // session control lifecycle (pi's overload block, extensions/types.ts:1190-1231 @v0.83.0)
+    /// `session_before_switch` (pi `SessionBeforeSwitchEvent`, extensions/types.ts:578-582
+    /// @v0.83.0): `reason: "new" | "resume"` and `targetSessionFile?`. cyrup carried a bare
+    /// `target_id` and dropped `reason` — the field that distinguishes the two cases a handler
+    /// most needs to tell apart (EXT-015).
+    SessionBeforeSwitch { reason: String, target_session_file: Option<String> },
+    /// `session_before_fork` (pi `SessionBeforeForkEvent`, extensions/types.ts:585-589 @v0.83.0):
+    /// `entryId` and `position: "before" | "at"` (EXT-015).
+    SessionBeforeFork { entry_id: String, position: String },
     /// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:577-587): the computed
     /// `preparation` (`CompactionPreparation`, whose `messagesToSummarize`/`turnPrefixMessages`
     /// carry RAW `AgentMessage`s with their roles intact), the `branch_entries` in scope, optional
@@ -394,11 +457,13 @@ impl HostEvent {
             HostEvent::ToolExecEnd { .. } => K::ToolExecEnd,
             HostEvent::SessionStart { .. } => K::SessionStart,
             HostEvent::SessionShutdown { .. } => K::SessionShutdown,
-            HostEvent::ResourcesDiscover => K::ResourcesDiscover,
-            HostEvent::ProjectTrust => K::ProjectTrust,
+            HostEvent::SessionInfoChanged { .. } => K::SessionInfoChanged,
+            HostEvent::ResourcesDiscover { .. } => K::ResourcesDiscover,
+            HostEvent::ProjectTrust { .. } => K::ProjectTrust,
             HostEvent::Input { .. } => K::Input,
             HostEvent::UserBash { .. } => K::UserBash,
             HostEvent::BeforeProviderRequest { .. } => K::BeforeProviderRequest,
+            HostEvent::BeforeProviderHeaders { .. } => K::BeforeProviderHeaders,
             HostEvent::AfterProviderResponse { .. } => K::AfterProviderResponse,
             HostEvent::ModelSelect { .. } => K::ModelSelect,
             HostEvent::ThinkingLevelSelect { .. } => K::ThinkingLevelSelect,
@@ -442,15 +507,21 @@ impl HostEvent {
                     args: args.clone(),
                 }
             }
-            AgentEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } => {
+            // EXT-014: `tool_name` and `args` are on the `AgentEvent` and were being discarded
+            // by the `..` — pi carries both through to the handler
+            // (`ToolExecutionUpdateEvent`, extensions/types.ts:770-776 @v0.83.0).
+            AgentEvent::ToolExecutionUpdate { tool_call_id, tool_name, args, partial_result } => {
                 HostEvent::ToolExecUpdate {
                     call_id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    args: args.clone(),
                     chunk: partial_result.clone(),
                 }
             }
-            AgentEvent::ToolExecutionEnd { tool_call_id, result, is_error, .. } => {
+            AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } => {
                 HostEvent::ToolExecEnd {
                     call_id: tool_call_id.clone(),
+                    name: tool_name.clone(),
                     result: result.clone(),
                     is_error: *is_error,
                 }

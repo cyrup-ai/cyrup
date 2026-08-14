@@ -33,7 +33,7 @@ pub fn fireworks_models() -> Vec<Model> {
 
 /// The Fireworks [`ProviderAuth`]: an API key from `$FIREWORKS_API_KEY` (Pi `envApiKeyAuth`).
 pub fn fireworks_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key([FIREWORKS_API_KEY_ENV]))
+    ProviderAuth::with_api_key(env_key("Fireworks API key", [FIREWORKS_API_KEY_ENV]))
 }
 
 /// Construct the Fireworks provider over the given credential store + shared api registry. The

@@ -13,8 +13,8 @@
 
 use crate::HeaderMap;
 use crate::api::compat::{
-    clamp_openai_prompt_cache_key, get_responses_compat, mapped_effort_or, off_is_not_null,
-    off_value_or, sanitize_surrogates, thinking_level_key,
+    SessionAffinityFormat, clamp_openai_prompt_cache_key, get_responses_compat, mapped_effort_or,
+    off_is_not_null, off_value_or, sanitize_surrogates, thinking_level_key,
 };
 use crate::api::openai_completions::transform_messages_with_source;
 use crate::api::{ApiImpl, EventSink};
@@ -45,6 +45,11 @@ const API_ID: &str = crate::known_api::OPENAI_RESPONSES;
 /// Providers whose tool-call ids carry the `call_id|item_id` Responses shape (Pi
 /// `OPENAI_TOOL_CALL_PROVIDERS`, openai-responses.ts:26).
 const OPENAI_TOOL_CALL_PROVIDERS: &[&str] = &["openai", "openai-codex", "opencode"];
+
+/// OpenAI Responses rejects `max_output_tokens` below 16:
+/// <https://github.com/earendil-works/pi/issues/6265>
+/// (Pi `OPENAI_RESPONSES_MIN_OUTPUT_TOKENS`, `openai-responses.ts:32` @v0.83.0.)
+pub(crate) const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: u64 = 16;
 
 /// Reasoning-summary verbosity (Pi `reasoningSummary`, openai-responses.ts:80:
 /// `"auto" | "detailed" | "concise" | null`). `Null` reproduces Pi's explicit `null`, which — like
@@ -88,9 +93,14 @@ pub struct OpenAiResponsesOptions {
 /// `options?.reasoningSummary || "auto"`, openai-responses.ts:257): a concrete non-null value wins;
 /// `None`/`Null` fall back to `"auto"`.
 fn reasoning_summary_or_auto(opts: Option<&OpenAiResponsesOptions>) -> &'static str {
+    reasoning_summary_wire(opts).unwrap_or("auto")
+}
+
+/// The truthy value of Pi's `options?.reasoningSummary` — `Some(wire)` when a summary was requested,
+/// `None` when unset or explicitly `null` (both falsy in the `||` at `openai-responses.ts:313`).
+fn reasoning_summary_wire(opts: Option<&OpenAiResponsesOptions>) -> Option<&'static str> {
     opts.and_then(|o| o.reasoning_summary)
         .and_then(ReasoningSummary::as_wire)
-        .unwrap_or("auto")
 }
 
 /// The `ApiImpl` for `"openai-responses"`.
@@ -166,7 +176,7 @@ impl ApiImpl for OpenAiResponsesApi {
             build_params(model, ctx, opts, auth.env.as_ref()),
         )
         .await;
-        let headers = build_headers(model, auth, opts, &api_key);
+        let headers = build_headers(model, ctx, auth, opts, &api_key);
         let req = SseRequest {
             method: reqwest::Method::POST,
             url,
@@ -330,7 +340,17 @@ pub(crate) fn build_params(
     );
 
     let messages =
-        convert_responses_messages(model, ctx, OPENAI_TOOL_CALL_PROVIDERS, &placement.deferred);
+        convert_responses_messages(
+            model,
+            ctx,
+            OPENAI_TOOL_CALL_PROVIDERS,
+            &placement.deferred,
+            ConvertResponsesToolsOptions {
+                defer_loading: false,
+                supports_strict_mode: compat.supports_strict_mode,
+                default_strict: Some(false),
+            },
+        );
     let cache = resolve_cache_retention(opts.cache_retention, env);
 
     let mut obj = Map::new();
@@ -351,10 +371,27 @@ pub(crate) fn build_params(
     if cache == CacheRetention::Long && compat.supports_long_cache_retention {
         obj.insert("prompt_cache_retention".to_string(), json!("24h"));
     }
+    // PROV-023. `const disableImplicitPromptCache = cacheRetention === "none" &&
+    // compat.supportsExplicitPromptCacheMode` (openai-responses.ts:278 @v0.83.0), emitted at `:285`
+    // in pi's literal — between `prompt_cache_retention` and `store`. Without it the endpoint
+    // implicitly cache-WRITES one-shot prompts (compaction/branch summaries run with
+    // `cacheRetention: "none"`) and bills the cache-write premium for a prefix nothing will re-read.
+    if cache == CacheRetention::None && compat.supports_explicit_prompt_cache_mode {
+        obj.insert(
+            "prompt_cache_options".to_string(),
+            json!({ "mode": "explicit" }),
+        );
+    }
     obj.insert("store".to_string(), json!(false));
 
-    if let Some(max) = opts.max_tokens {
-        obj.insert("max_output_tokens".to_string(), json!(max));
+    // PROV-019. `if (options?.maxTokens) params.max_output_tokens = Math.max(options.maxTokens,
+    // OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)` (openai-responses.ts:289-290 @v0.83.0). The `.filter`
+    // reproduces pi's JS truthiness gate, so `Some(0)` omits the key rather than sending `0`.
+    if let Some(max) = opts.max_tokens.filter(|m| *m > 0) {
+        obj.insert(
+            "max_output_tokens".to_string(),
+            json!(max.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)),
+        );
     }
     if let Some(temp) = opts.temperature {
         obj.insert("temperature".to_string(), json!(temp));
@@ -375,17 +412,35 @@ pub(crate) fn build_params(
     if !placement.immediate.is_empty() {
         obj.insert(
             "tools".to_string(),
-            Value::Array(convert_responses_tools(&placement.immediate, false)),
+            Value::Array(convert_responses_tools(
+                &placement.immediate,
+                ConvertResponsesToolsOptions {
+                    defer_loading: false,
+                    supports_strict_mode: compat.supports_strict_mode,
+                    default_strict: Some(false),
+                },
+            )),
         );
     }
 
     if model.reasoning {
         // The unified `reasoning` level maps to Pi's `reasoningEffort` (clamped; `off` => none).
         let clamped = clamp_thinking_level(model, opts.reasoning);
-        if clamped != ModelThinkingLevel::Off {
-            let key = thinking_level_key(clamped);
-            let effort = mapped_effort_or(model.thinking_level_map.as_ref(), clamped, key);
-            // Pi `summary: options?.reasoningSummary || "auto"` (openai-responses.ts:257).
+        // PROV-045(a). Pi's first arm fires on `options?.reasoningEffort || options?.reasoningSummary`
+        // (openai-responses.ts:313 @v0.83.0), so a caller setting ONLY a summary still gets
+        // `reasoning: {effort: "medium", summary}` plus `include`. cyrup represents "no effort" as
+        // `ModelThinkingLevel::Off`, so the effort half of pi's disjunction is `clamped != Off`.
+        let summary_only = reasoning_summary_wire(opts.openai_responses_options()).is_some();
+        if clamped != ModelThinkingLevel::Off || summary_only {
+            // `const effort = options?.reasoningEffort ? (map?.[effort] ?? effort) : "medium"`
+            // (openai-responses.ts:314-316).
+            let effort = if clamped == ModelThinkingLevel::Off {
+                "medium".to_string()
+            } else {
+                let key = thinking_level_key(clamped);
+                mapped_effort_or(model.thinking_level_map.as_ref(), clamped, key)
+            };
+            // Pi `summary: options?.reasoningSummary || "auto"` (openai-responses.ts:318).
             let summary = reasoning_summary_or_auto(opts.openai_responses_options());
             obj.insert(
                 "reasoning".to_string(),
@@ -401,6 +456,16 @@ pub(crate) fn build_params(
             let effort = off_value_or(model.thinking_level_map.as_ref(), "none");
             obj.insert("reasoning".to_string(), json!({ "effort": effort }));
         }
+        // PROV-045(b). `if (model.provider === "xai") params.include = [...]`
+        // (openai-responses.ts:327) sits OUTSIDE the if/else, so an xAI reasoning model gets
+        // `include` on the off path too — otherwise the next turn cannot replay its encrypted
+        // reasoning content.
+        if model.provider.as_str() == "xai" {
+            obj.insert(
+                "include".to_string(),
+                json!(["reasoning.encrypted_content"]),
+            );
+        }
     }
 
     Value::Object(obj)
@@ -411,6 +476,7 @@ pub(crate) fn build_params(
 /// < `model.headers` < session affinity < `opts.headers`.
 fn build_headers(
     model: &Model,
+    ctx: &Context,
     auth: &AuthResult,
     opts: &StreamOptions,
     api_key: &str,
@@ -432,19 +498,35 @@ fn build_headers(
         }
     }
 
+    // PROV-028: the per-request Copilot headers (openai-responses.ts:223-230), applied where Pi's
+    // `Object.assign(headers, copilotHeaders)` sits — after `{ ...model.headers }`, before the
+    // session headers and the opts overlay.
+    crate::api::github_copilot_headers::apply_copilot_dynamic_headers(
+        &mut headers,
+        model.provider.as_str(),
+        &ctx.messages,
+    );
+
     // Session headers (openai-responses.ts:211-216). Gated on cache retention != none.
     let cache = resolve_cache_retention(opts.cache_retention, auth.env.as_ref());
     let compat = get_responses_compat(model);
+    // PROV-033: the three-way branch (openai-responses.ts:233-241 @v0.83.0). The former
+    // `send_session_id_header` gate was a flag pi DELETED (#6496, `packages/ai/CHANGELOG.md:168`),
+    // and it made `x-session-id` — the only header OpenRouter reads — unreachable.
     if cache != CacheRetention::None
         && let Some(sid) = &opts.session_id
     {
-        if compat.send_session_id_header {
-            headers.insert("session_id".to_string(), Some(sid.as_str().to_string()));
+        if compat.session_affinity_format == SessionAffinityFormat::Openrouter {
+            headers.insert("x-session-id".to_string(), Some(sid.as_str().to_string()));
+        } else {
+            if compat.session_affinity_format == SessionAffinityFormat::Openai {
+                headers.insert("session_id".to_string(), Some(sid.as_str().to_string()));
+            }
+            headers.insert(
+                "x-client-request-id".to_string(),
+                Some(sid.as_str().to_string()),
+            );
         }
-        headers.insert(
-            "x-client-request-id".to_string(),
-            Some(sid.as_str().to_string()),
-        );
     }
 
     // Merge opts headers last so they override defaults (openai-responses.ts:219-221).
@@ -498,6 +580,7 @@ pub(crate) fn convert_responses_messages(
     ctx: &Context,
     allowed_tool_call_providers: &[&str],
     deferred_tools: &[(String, ToolDef)],
+    tool_options: ConvertResponsesToolsOptions,
 ) -> Vec<Value> {
     let provider = model.provider.as_str().to_string();
     let api = model.api.clone();
@@ -767,7 +850,13 @@ pub(crate) fn convert_responses_messages(
                         "status": "completed",
                         // `defer_loading: true` on every definition in the output (Pi
                         // `{ ...options?.toolOptions, deferLoading: true }`, :330).
-                        "tools": Value::Array(convert_responses_tools(&defs, true)),
+                        "tools": Value::Array(convert_responses_tools(
+                            &defs,
+                            ConvertResponsesToolsOptions {
+                                defer_loading: true,
+                                ..tool_options
+                            },
+                        )),
                     }));
                 }
             }
@@ -801,13 +890,36 @@ fn phase_wire(phase: TextPhase) -> &'static str {
     }
 }
 
-/// 1:1 port of Pi `convertResponsesTools` (openai-responses-shared.ts:273-282). `strict` defaults
-/// to `false`.
+/// Pi's `ConvertResponsesToolsOptions` (`openai-responses-shared.ts:344-347` @v0.83.0), carrying
+/// only the members cyrup's function-tool branch consumes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConvertResponsesToolsOptions {
+    /// Pi `options.deferLoading`: set only for definitions carried inside a `tool_search_output`,
+    /// never for `body.tools`.
+    pub defer_loading: bool,
+    /// Pi `const supportsStrictMode = options?.supportsStrictMode ?? true`
+    /// (`openai-responses-shared.ts:346`). Each caller resolves it from its OWN compat default —
+    /// `?? false` on openai-responses (`openai-responses.ts:72`), `?? true` on azure
+    /// (`azure-openai-responses.ts:302`) and codex (`openai-codex-responses.ts:539`).
+    pub supports_strict_mode: bool,
+    /// Pi `const defaultStrict = options?.strict === undefined ? false : options.strict`
+    /// (`:345`). `Some(b)` is a JSON boolean; **`None` is JSON `null`**, which is what
+    /// `openai-codex-responses.ts:576` passes (`strict: null`) — not an absent key.
+    pub default_strict: Option<bool>,
+}
+
+/// 1:1 port of Pi `convertResponsesTools` (`openai-responses-shared.ts:344-378` @v0.83.0).
 ///
-/// `defer_loading` is Pi's `options.deferLoading` (`ConvertResponsesToolsOptions`, :127): set only
-/// for the definitions carried inside a `tool_search_output`, never for `body.tools`. Cyrup ports
-/// only Pi's function-tool branch (no grammar/custom tools), so there is a single emission site.
-pub(crate) fn convert_responses_tools(tools: &[ToolDef], defer_loading: bool) -> Vec<Value> {
+/// PROV-034: the `strict` key is emitted **only** when `supportsStrictMode` (`:376-377`). pi's
+/// function-tool literal is built without it, so a model that does not opt in receives no `strict`
+/// key at all — where cyrup used to hard-code `"strict": false` on every tool of every request.
+///
+/// Cyrup ports only pi's function-tool branch; the grammar/custom-tool branch (`:355-364`) needs
+/// `resolveGrammarConstrainedSampling`, which is PROV-011.
+pub(crate) fn convert_responses_tools(
+    tools: &[ToolDef],
+    options: ConvertResponsesToolsOptions,
+) -> Vec<Value> {
     tools
         .iter()
         .map(|t| {
@@ -818,10 +930,18 @@ pub(crate) fn convert_responses_tools(tools: &[ToolDef], defer_loading: bool) ->
             o.insert("parameters".to_string(), t.parameters.clone());
             // Pi spreads `...(options?.deferLoading ? { defer_loading: true } : {})` — the key is
             // ABSENT, not `false`, when the tool is part of the request prefix.
-            if defer_loading {
+            if options.defer_loading {
                 o.insert("defer_loading".to_string(), json!(true));
             }
-            o.insert("strict".to_string(), json!(false));
+            if options.supports_strict_mode {
+                o.insert(
+                    "strict".to_string(),
+                    match options.default_strict {
+                        Some(b) => json!(b),
+                        None => Value::Null,
+                    },
+                );
+            }
             Value::Object(o)
         })
         .collect()
@@ -1581,7 +1701,9 @@ fn now_millis() -> i64 {
 )]
 mod tests {
     use super::*;
+    use crate::api::compat::ModelCompat;
     use crate::model::{Modality, ModelCost};
+    use crate::stream::ApiStreamOptions;
     use crate::stream::collect_message;
     use crate::stream::sse::decode_sse_bytes;
 
@@ -1777,7 +1899,161 @@ mod tests {
         let body = build_params(&model(), &ctx, &StreamOptions::default(), None);
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "echo");
+        // PROV-034: `getCompat` defaults `supportsStrictMode` to **false** on this route
+        // (openai-responses.ts:72 @v0.83.0), and `convertResponsesTools` only assigns `strict` when
+        // it is true (openai-responses-shared.ts:376-377) — so pi sends NO `strict` key here. The
+        // previous `assert_eq!(…["strict"], false)` pinned behaviour pi does not have; it was a
+        // test-defect, corrected rather than weakened.
+        assert!(
+            body["tools"][0].get("strict").is_none(),
+            "no compat ⇒ no strict key: {}",
+            body["tools"][0]
+        );
+    }
+
+    /// PROV-034, opt-in half: with `supportsStrictMode: true` the key appears, carrying pi's
+    /// `defaultStrict` (`options?.strict === undefined ? false : options.strict` — `false` here).
+    #[test]
+    fn strict_is_emitted_only_when_the_model_opts_in() {
+        let mut m = model();
+        m.compat = Some(ModelCompat {
+            supports_strict_mode: Some(true),
+            ..Default::default()
+        });
+        let mut ctx = user_ctx("hi");
+        ctx.tools = vec![ToolDef {
+            name: "echo".into(),
+            description: "e".into(),
+            parameters: json!({"type": "object"}),
+        }];
+        let body = build_params(&m, &ctx, &StreamOptions::default(), None);
         assert_eq!(body["tools"][0]["strict"], false);
+    }
+
+    /// PROV-019. `Math.max(options.maxTokens, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)` with pi's JS
+    /// truthiness gate (openai-responses.ts:289-290 @v0.83.0). Red before the fix on the `Some(4)`
+    /// and `Some(0)` rows: cyrup inserted the raw value, so the endpoint answered HTTP 400.
+    #[test]
+    fn max_output_tokens_is_clamped_to_sixteen() {
+        let m = model();
+        let ctx = user_ctx("hi");
+        let body = |max: Option<u64>| {
+            build_params(
+                &m,
+                &ctx,
+                &StreamOptions {
+                    max_tokens: max,
+                    ..Default::default()
+                },
+                None,
+            )
+        };
+        assert_eq!(body(Some(100))["max_output_tokens"], 100);
+        assert_eq!(body(Some(4))["max_output_tokens"], 16);
+        assert!(body(Some(0)).get("max_output_tokens").is_none());
+        assert!(body(None).get("max_output_tokens").is_none());
+    }
+
+    /// PROV-023. `prompt_cache_options: disableImplicitPromptCache ? {mode:"explicit"} : undefined`
+    /// (openai-responses.ts:285 @v0.83.0), where `disableImplicitPromptCache = cacheRetention ===
+    /// "none" && compat.supportsExplicitPromptCacheMode` (`:278`). The flag MUST stay default-false:
+    /// older OpenAI models reject the parameter.
+    #[test]
+    fn explicit_prompt_cache_mode_only_on_opt_in_and_none_retention() {
+        let mut m = model();
+        let ctx = user_ctx("hi");
+        let opts = |r: CacheRetention| StreamOptions {
+            cache_retention: Some(r),
+            session_id: Some("s1".into()),
+            ..Default::default()
+        };
+        // Flag absent ⇒ never, regardless of retention (the older-model regression guard).
+        for r in [CacheRetention::None, CacheRetention::Short, CacheRetention::Long] {
+            assert!(
+                build_params(&m, &ctx, &opts(r), None)
+                    .get("prompt_cache_options")
+                    .is_none()
+            );
+        }
+        m.compat = Some(ModelCompat {
+            supports_explicit_prompt_cache_mode: Some(true),
+            ..Default::default()
+        });
+        let body = build_params(&m, &ctx, &opts(CacheRetention::None), None);
+        assert_eq!(body["prompt_cache_options"], json!({"mode": "explicit"}));
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "retention none never writes a cache key"
+        );
+        for r in [CacheRetention::Short, CacheRetention::Long] {
+            assert!(
+                build_params(&m, &ctx, &opts(r), None)
+                    .get("prompt_cache_options")
+                    .is_none()
+            );
+        }
+    }
+
+    /// PROV-045. Pi's first reasoning arm fires on `reasoningEffort || reasoningSummary`
+    /// (openai-responses.ts:313 @v0.83.0) and the xAI `include` sits OUTSIDE the if/else (`:327`).
+    #[test]
+    fn reasoning_summary_alone_and_the_xai_include() {
+        let m = model();
+        let ctx = user_ctx("hi");
+        // (a) summary only, reasoning level off ⇒ effort "medium" + summary + include.
+        let opts = StreamOptions {
+            api_options: Some(ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                reasoning_summary: Some(ReasoningSummary::Detailed),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let body = build_params(&m, &ctx, &opts, None);
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+
+        // (b) an xai-provider reasoning model with reasoning OFF still emits `include`.
+        let mut xai = model();
+        xai.provider = "xai".into();
+        let body = build_params(&xai, &ctx, &StreamOptions::default(), None);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+
+        // (c) a non-xai model with reasoning off emits neither.
+        let body = build_params(&m, &ctx, &StreamOptions::default(), None);
+        assert!(body.get("include").is_none());
+    }
+
+    /// PROV-033. The three-way session-affinity branch (openai-responses.ts:233-241 @v0.83.0).
+    /// Red before the fix: `x-session-id` was unreachable on this route and the deleted
+    /// `sendSessionIdHeader` flag was the only knob.
+    #[test]
+    fn session_affinity_format_selects_the_header_set() {
+        let opts = StreamOptions {
+            session_id: Some("sess-7".into()),
+            ..Default::default()
+        };
+        // openrouter detected from the base url ⇒ x-session-id ONLY.
+        let mut router = model();
+        router.base_url = "https://openrouter.ai/api/v1".to_string();
+        let h = build_headers(&router, &Context::default(), &auth(), &opts, "sk");
+        assert_eq!(h.get("x-session-id"), Some(&Some("sess-7".to_string())));
+        assert!(h.get("session_id").is_none());
+        assert!(h.get("x-client-request-id").is_none());
+
+        // "openai-nosession" ⇒ x-client-request-id only.
+        let mut nos = model();
+        nos.compat = Some(ModelCompat {
+            session_affinity_format: Some(SessionAffinityFormat::OpenaiNosession),
+            ..Default::default()
+        });
+        let h = build_headers(&nos, &Context::default(), &auth(), &opts, "sk");
+        assert!(h.get("session_id").is_none());
+        assert_eq!(
+            h.get("x-client-request-id"),
+            Some(&Some("sess-7".to_string()))
+        );
+        assert!(h.get("x-session-id").is_none());
     }
 
     #[test]
@@ -1787,7 +2063,7 @@ mod tests {
             session_id: Some("sess-7".into()),
             ..Default::default()
         };
-        let h = build_headers(&m, &auth(), &opts, "sk-test");
+        let h = build_headers(&m, &Context::default(), &auth(), &opts, "sk-test");
         assert_eq!(
             h.get("Authorization"),
             Some(&Some("Bearer sk-test".to_string()))
@@ -1797,6 +2073,34 @@ mod tests {
             h.get("x-client-request-id"),
             Some(&Some("sess-7".to_string()))
         );
+    }
+
+    /// PROV-028 — `buildCopilotDynamicHeaders` on the `/responses` route
+    /// (openai-responses.ts:223-230). Copilot's GPT/Gemini/MAI families ride this api.
+    #[test]
+    fn copilot_dynamic_headers_on_the_responses_route() {
+        let mut m = model();
+        m.provider = "github-copilot".into();
+
+        let ctx = user_ctx("hi");
+        let h = build_headers(&m, &ctx, &auth(), &StreamOptions::default(), "tid=abc");
+        assert_eq!(h.get("X-Initiator"), Some(&Some("user".to_string())));
+        assert_eq!(
+            h.get("Openai-Intent"),
+            Some(&Some("conversation-edits".to_string()))
+        );
+        assert!(!h.contains_key("Copilot-Vision-Request"));
+
+        // Non-Copilot providers get none of them.
+        let plain = build_headers(
+            &model(),
+            &ctx,
+            &auth(),
+            &StreamOptions::default(),
+            "sk-test",
+        );
+        assert!(!plain.contains_key("X-Initiator"));
+        assert!(!plain.contains_key("Openai-Intent"));
     }
 
     #[test]
@@ -2249,6 +2553,14 @@ mod tests {
 
         // (4) The exact `tool_search_output` shape: same call id, and the definition carries
         // `defer_loading: true`.
+        //
+        // PROV-034: there is **no `strict` key**. pi builds its function-tool literal without one
+        // and only then does `if (supportsStrictMode) functionTool.strict = constrainedStrict ??
+        // defaultStrict` (`openai-responses-shared.ts:365-378` @v0.83.0), and this api resolves
+        // `supportsStrictMode: model.compat?.supportsStrictMode ?? false` (`openai-responses.ts:72`).
+        // The embedded `gpt-5.4` row carries `compat: { supportsToolSearch: true }` and nothing
+        // else, so the flag is false and the key is absent — where cyrup used to hard-code
+        // `"strict": false` onto every tool of every request.
         assert_eq!(
             *out,
             json!({
@@ -2266,9 +2578,20 @@ mod tests {
                         "required": ["value"],
                     },
                     "defer_loading": true,
-                    "strict": false,
                 }],
             })
+        );
+        // Stated positively as well, so the absence is an assertion rather than a gap in the
+        // literal above: `strict` must be missing on BOTH sides of the split — the searched-for
+        // definition and the immediate `body.tools` prefix — because the same
+        // `supportsStrictMode: false` governs both call sites.
+        assert!(
+            out["tools"][0].get("strict").is_none(),
+            "supportsStrictMode is false for gpt-5.4, so pi emits no `strict` key at all"
+        );
+        assert!(
+            body["tools"][0].get("strict").is_none(),
+            "the immediate tool prefix must not carry `strict` either"
         );
 
         // (5) Nothing was displaced or lost: the tool result's own output is untouched.
@@ -2561,7 +2884,14 @@ mod tests {
         let body = build_params(&model(), &ctx, &StreamOptions::default(), None);
         assert_eq!(
             body["tools"],
-            Value::Array(convert_responses_tools(&ctx.tools, false))
+            Value::Array(convert_responses_tools(
+                &ctx.tools,
+                ConvertResponsesToolsOptions {
+                    defer_loading: false,
+                    supports_strict_mode: get_responses_compat(&model()).supports_strict_mode,
+                    default_strict: Some(false),
+                },
+            ))
         );
         assert!(
             !serde_json::to_string(&body)

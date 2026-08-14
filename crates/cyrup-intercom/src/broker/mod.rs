@@ -196,6 +196,13 @@ struct BrokerState {
     /// Bumped on every `register` so a pending auto-shutdown check becomes stale (`broker.ts:378-381`).
     shutdown_gen: u64,
     shutdown_scheduled: bool,
+    /// The pending auto-shutdown task, i.e. pi's `shutdownTimer` HANDLE
+    /// (`v0.10.1 broker/broker.ts:106`). Holding it is what makes `register`'s
+    /// `clearTimeout(this.shutdownTimer); this.shutdownTimer = null` (`:378-381`) portable: without
+    /// it, a register inside the 5 s window left `shutdown_scheduled` set, so the next disconnect's
+    /// `schedule_shutdown_check` early-returned and the re-arm was LOST — the broker then idled
+    /// forever with zero sessions until an unrelated connect/disconnect cycle re-armed it.
+    shutdown_task: Option<tokio::task::JoinHandle<()>>,
     /// Global shutdown signal awaited by [`run`].
     shutdown: Arc<Notify>,
 }
@@ -257,6 +264,7 @@ impl BrokerState {
             ask_timeout_ms,
             shutdown_gen: 0,
             shutdown_scheduled: false,
+            shutdown_task: None,
             shutdown,
         }
     }
@@ -669,6 +677,10 @@ impl BrokerState {
         let info = SessionInfo {
             id: id.clone(),
             name: registration.name,
+            // `v0.10.1 broker/broker.ts:358` copies the registration's `runtimeFallbackAlias` onto
+            // the stored `SessionInfo`, so every peer's roster can tell a chosen name from a
+            // synthesized alias.
+            runtime_fallback_alias: registration.runtime_fallback_alias,
             cwd: registration.cwd,
             model: registration.model,
             pid: registration.pid,
@@ -689,8 +701,16 @@ impl BrokerState {
             tx: self_tx.clone(),
             last_presence_broadcast_at: now,
         });
-        // A register cancels any pending auto-shutdown (broker.ts:378-381).
+        // A register cancels any pending auto-shutdown (`v0.10.1 broker/broker.ts:378-381`):
+        //   if (this.shutdownTimer) { clearTimeout(this.shutdownTimer); this.shutdownTimer = null; }
+        // NULLING THE HANDLE is the load-bearing half — it is what lets a LATER disconnect arm a
+        // fresh check. The generation bump alone only makes the pending check stale; it is kept as
+        // belt-and-braces for a check already past its sleep.
         self.shutdown_gen = self.shutdown_gen.wrapping_add(1);
+        self.shutdown_scheduled = false;
+        if let Some(task) = self.shutdown_task.take() {
+            task.abort();
+        }
 
         send_msg(self_tx, &BrokerMessage::Registered { session_id: id.clone(), features: None });
         self.broadcast(&BrokerMessage::SessionJoined { session: info }, Some(&id));
@@ -790,9 +810,19 @@ impl BrokerState {
             return FrameResult::cont();
         }
         let Some(target_id) = targets.first().cloned() else {
+            // `v0.10.1 broker/broker.ts:631-638` (v0.10.0): a BLOCKING ask against a target the
+            // broker cannot route gets a reason that says so, because nothing queues it — the
+            // caller must switch to `send` or retry after the peer reconnects. A bare
+            // `Session not found` told the model nothing actionable, so it retried the same
+            // blocking ask.
+            let reason = if message.expects_reply == Some(true) {
+                "Target session is not currently connected; blocking asks are not queued"
+            } else {
+                "Session not found"
+            };
             send_msg(self_tx, &BrokerMessage::DeliveryFailed {
                 message_id: message.id.clone(),
-                reason: "Session not found".to_string(),
+                reason: reason.to_string(),
             });
             return FrameResult::cont();
         };
@@ -900,16 +930,31 @@ impl BrokerState {
         let Some(current_id) = session_id.clone() else {
             return FrameResult::protocol_error();
         };
-        // Validate field types first (a wrong type is fatal — `v0.9.2 broker/broker.ts:892-894`,
-        // `:901-903`, `:910-912`). `value.get` yields `Some(Value::Null)` for an explicit `null`,
-        // which is not a string, so `null` is fatal here exactly as `typeof null === "object"`
-        // makes it upstream.
+        // OWNERSHIP FIRST. Every `throw new Error("Invalid presence …")` upstream is nested INSIDE
+        // `if (session?.socket === socket) { … }` (`v0.10.1 broker/broker.ts:763-805`, guard at
+        // `:765`), so a NON-OWNING socket's malformed presence is ignored, not fatal. Running the
+        // type checks first killed a superseded socket's late malformed frame as a protocol error;
+        // the reconnect ladder deliberately re-offers the previous session id, so takeover races are
+        // a live path, not a theoretical one.
+        let Some(session) = self.sessions.get_mut(&current_id).filter(|s| s.conn_id == conn_id) else {
+            return FrameResult::cont();
+        };
+        // A wrong type IS fatal for the owner (`v0.9.2 broker/broker.ts:892-894`, `:901-903`,
+        // `:910-912`). `value.get` yields `Some(Value::Null)` for an explicit `null`, which is not a
+        // string, so `null` is fatal here exactly as `typeof null === "object"` makes it upstream.
         for key in ["name", "status", "model"] {
             if let Some(v) = value.get(key)
                 && !v.is_string()
             {
                 return FrameResult::protocol_error();
             }
+        }
+        // `runtimeFallbackAlias` (`v0.10.1 broker/broker.ts:779-787`) is a BOOLEAN, and its check
+        // sits inside the same ownership block.
+        if let Some(v) = value.get("runtimeFallbackAlias")
+            && !v.is_boolean()
+        {
+            return FrameResult::protocol_error();
         }
         // The context-usage trio obeys a DIFFERENT rule from the string trio above, and from
         // `isSessionInfo`'s (`v0.9.2 broker/client.ts:182-186`, where `null` is fatal). Here an
@@ -925,9 +970,6 @@ impl BrokerState {
                 return FrameResult::protocol_error();
             }
         }
-        let Some(session) = self.sessions.get_mut(&current_id).filter(|s| s.conn_id == conn_id) else {
-            return FrameResult::cont();
-        };
         let mut changed = false;
         if let Some(name) = value.get("name").and_then(|v| v.as_str())
             && session.info.name.as_deref() != Some(name)
@@ -945,6 +987,15 @@ impl BrokerState {
             && session.info.model != model
         {
             session.info.model = model.to_string();
+            changed = true;
+        }
+        // `v0.10.1 broker/broker.ts:779-787` — additive at v0.10.0 (`126875e`). The flag tells a
+        // peer a chosen name from a synthesized alias, and the mailbox identity guard reads it
+        // (`:1039-1047`).
+        if let Some(alias) = value.get("runtimeFallbackAlias").and_then(serde_json::Value::as_bool)
+            && session.info.runtime_fallback_alias != Some(alias)
+        {
+            session.info.runtime_fallback_alias = Some(alias);
             changed = true;
         }
         // `v0.9.2 broker/broker.ts:921-950`, one arm per field. Kept as three explicit calls (not a
@@ -1004,27 +1055,30 @@ fn apply_presence_context(
 /// Schedule the 5 s auto-shutdown check (`scheduleShutdownCheck`, `broker.ts:286-296`). Only one is
 /// ever pending; a `register` in the window bumps `shutdown_gen`, making the pending check stale.
 fn schedule_shutdown_check(state: &Arc<Mutex<BrokerState>>) {
-    let (generation, shutdown) = {
-        let mut g = lock(state);
-        if g.shutdown_scheduled {
-            return;
-        }
-        g.shutdown_scheduled = true;
-        (g.shutdown_gen, g.shutdown.clone())
-    };
-    let state = state.clone();
-    tokio::spawn(async move {
+    let mut g = lock(state);
+    if g.shutdown_scheduled {
+        return;
+    }
+    g.shutdown_scheduled = true;
+    let generation = g.shutdown_gen;
+    let shutdown = g.shutdown.clone();
+    let task_state = state.clone();
+    // The handle is installed under the SAME lock the flag was set under, so `handle_register`
+    // never observes `shutdown_scheduled == true` with an empty `shutdown_task` slot. The task's
+    // first action is a 5 s sleep, so it cannot contend for this guard.
+    g.shutdown_task = Some(tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(SHUTDOWN_DELAY_MS)).await;
         let empty_and_current = {
-            let mut g = lock(&state);
+            let mut g = lock(&task_state);
             g.shutdown_scheduled = false;
+            g.shutdown_task = None;
             g.shutdown_gen == generation && g.sessions.is_empty()
         };
         if empty_and_current {
             tracing::info!("no sessions connected, shutting down");
             shutdown.notify_one();
         }
-    });
+    }));
 }
 
 /// The per-connection writer task: drain queued frames to the socket, then half-close on EOF.
@@ -1240,7 +1294,23 @@ pub async fn run() -> std::io::Result<()> {
     // Unlink a stale socket left by a crashed broker (`v0.9.2 broker/broker.ts:233-238`;
     // `v0.7.0 broker/broker.ts:143-148`).
     let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path)?;
+    // CYRUP-DELTA (`v0.9.2 broker/broker.ts:239` `net.createServer().listen(LISTEN_TARGET)`, and
+    // `broker/paths.ts:65-74`, which has no length guard either): upstream loses the reason the same
+    // way, so this is a shared robustness gap, not a parity divergence. What is added here is only
+    // the DIAGNOSTIC — `sockaddr_un.sun_path` is 104 bytes on macOS and 108 on Linux, so a deep
+    // `HOME`/`CYRUP_AGENT_DIR` makes this bind fail with a bare "path must be shorter than SUN_LEN"
+    // that names neither the limit's cause nor the path. Naming both here is what makes the parent's
+    // captured-stderr message (`transport::spawn::BrokerStderrTail`) actionable.
+    let listener = UnixListener::bind(&socket_path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "failed to bind the intercom broker socket at {} ({} bytes): {e}",
+                socket_path.display(),
+                socket_path.as_os_str().len()
+            ),
+        )
+    })?;
     let _ = paths::restrict_intercom_runtime_file(&socket_path);
     std::fs::write(&pid_path, std::process::id().to_string())?;
     let _ = paths::restrict_intercom_runtime_file(&pid_path);
@@ -1555,5 +1625,165 @@ mod presence_context_tests {
                 );
             }
         }
+    }
+
+    /// ICOM-014 — every `throw new Error("Invalid presence …")` upstream is nested INSIDE
+    /// `if (session?.socket === socket)` (`v0.10.1 broker/broker.ts:763-805`, guard at `:765`), so a
+    /// NON-OWNING socket's malformed presence is IGNORED, not fatal.
+    ///
+    /// Red against the pre-fix ordering: the type-check loops ran before the ownership filter, so a
+    /// superseded socket sending a late `{"name": 5}` had its connection destroyed as a protocol
+    /// error. The reconnect ladder deliberately re-offers the previous session id, so a takeover
+    /// race is a live path.
+    #[test]
+    fn a_non_owning_socket_s_malformed_presence_is_ignored_not_fatal() {
+        let mut state = BrokerState::new(30_000, Arc::new(Notify::new()));
+        let (tx_owner, _rx_owner) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_loser, _rx_loser) = tokio::sync::mpsc::unbounded_channel();
+
+        // conn 1 registers as `s1`, then conn 2 takes the id over — conn 1 is now the LOSER.
+        let mut sid_loser = None;
+        let reg = json!({
+            "type": "register", "sessionId": "s1",
+            "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+        });
+        state.handle_frame(1, &tx_loser, &reg, &mut sid_loser, 1_000);
+        let mut sid_owner = None;
+        state.handle_frame(2, &tx_owner, &reg, &mut sid_owner, 1_001);
+
+        // The loser still believes it is `s1`, and sends a malformed presence.
+        let bad = json!({ "type": "presence", "name": 5 });
+        assert!(
+            matches!(state.handle_frame(1, &tx_loser, &bad, &mut sid_loser, 2_000).outcome, FrameOutcome::Continue),
+            "a non-owning socket's malformed presence must be ignored, not a protocol error"
+        );
+
+        // POSITIVE CONTROL: the OWNER sending the same frame is still fatal
+        // (`v0.10.1 broker/broker.ts:766-768`).
+        assert!(
+            matches!(state.handle_frame(2, &tx_owner, &bad, &mut sid_owner, 2_001).outcome, FrameOutcome::ProtocolError),
+            "the owner's malformed presence is still fatal"
+        );
+    }
+
+    /// ICOM-041 — `runtimeFallbackAlias` is a BOOLEAN checked inside the ownership block
+    /// (`v0.10.1 broker/broker.ts:779-787`) and applied to the stored `SessionInfo`.
+    #[test]
+    fn presence_carries_runtime_fallback_alias() {
+        let mut state = BrokerState::new(30_000, Arc::new(Notify::new()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sid = None;
+        state.handle_frame(
+            1,
+            &tx,
+            &json!({
+                "type": "register", "sessionId": "s1",
+                "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0,
+                             "name": "subagent-chat-0192", "runtimeFallbackAlias": true },
+            }),
+            &mut sid,
+            1_000,
+        );
+        // `v0.10.1 broker/broker.ts:358` copies it off the registration.
+        assert_eq!(
+            state.sessions.get("s1").and_then(|s| s.info.runtime_fallback_alias),
+            Some(true),
+            "register must carry the flag onto the stored SessionInfo"
+        );
+
+        // A presence frame flips it (`:779-787`).
+        assert!(matches!(
+            state
+                .handle_frame(1, &tx, &json!({ "type": "presence", "runtimeFallbackAlias": false }), &mut sid, 2_000)
+                .outcome,
+            FrameOutcome::Continue
+        ));
+        assert_eq!(state.sessions.get("s1").and_then(|s| s.info.runtime_fallback_alias), Some(false));
+
+        // A non-boolean is fatal, like every other presence type check.
+        assert!(matches!(
+            state
+                .handle_frame(1, &tx, &json!({ "type": "presence", "runtimeFallbackAlias": "yes" }), &mut sid, 3_000)
+                .outcome,
+            FrameOutcome::ProtocolError
+        ));
+    }
+
+    /// ICOM-045's broker half (`v0.10.1 broker/broker.ts:631-638`, v0.10.0): an unroutable target
+    /// gets a reason that says blocking asks are not queued, so the model switches to `send` or
+    /// retries instead of re-issuing the same blocking ask.
+    #[test]
+    fn an_unroutable_blocking_ask_is_refused_with_the_not_queued_reason() {
+        fn drive(expects_reply: bool) -> String {
+            let mut state = BrokerState::new(30_000, Arc::new(Notify::new()));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut sid = None;
+            state.handle_frame(
+                1,
+                &tx,
+                &json!({
+                    "type": "register", "sessionId": "s1",
+                    "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+                }),
+                &mut sid,
+                1_000,
+            );
+            while rx.try_recv().is_ok() {}
+            state.handle_frame(
+                1,
+                &tx,
+                &json!({
+                    "type": "send", "to": "ghost",
+                    "message": { "id": "m1", "timestamp": 1, "expectsReply": expects_reply,
+                                 "content": { "text": "hi" } },
+                }),
+                &mut sid,
+                2_000,
+            );
+            let frame = rx.try_recv().expect("a delivery_failed frame");
+            let payload: serde_json::Value =
+                serde_json::from_slice(frame.get(4..).unwrap_or_default()).expect("json");
+            payload["reason"].as_str().unwrap_or_default().to_string()
+        }
+        assert_eq!(drive(true), "Target session is not currently connected; blocking asks are not queued");
+        // POSITIVE CONTROL: a non-blocking send keeps pi's original wording.
+        assert_eq!(drive(false), "Session not found");
+    }
+
+    /// ICOM-005 — `register` must NULL the pending auto-shutdown handle
+    /// (`v0.10.1 broker/broker.ts:378-381`), not merely bump the generation. Red against the pre-fix
+    /// code: `shutdown_scheduled` stayed `true`, so the NEXT disconnect's `schedule_shutdown_check`
+    /// early-returned and the re-arm was lost, leaving an idle broker alive forever.
+    #[tokio::test]
+    async fn a_register_clears_the_pending_shutdown_so_a_later_disconnect_can_re_arm() {
+        let state: Arc<Mutex<BrokerState>> =
+            Arc::new(Mutex::new(BrokerState::new(30_000, Arc::new(Notify::new()))));
+        // t=0: the last session left → a check is armed.
+        schedule_shutdown_check(&state);
+        assert!(lock(&state).shutdown_scheduled, "armed");
+
+        // t=1: a register lands inside the 5 s window.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sid = None;
+        lock(&state).handle_frame(
+            1,
+            &tx,
+            &json!({
+                "type": "register", "sessionId": "s1",
+                "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+            }),
+            &mut sid,
+            1_000,
+        );
+        assert!(!lock(&state).shutdown_scheduled, "a register cancels the pending check");
+        assert!(lock(&state).shutdown_task.is_none(), "and drops its handle");
+
+        // t=2: that session disconnects → the check must arm AGAIN.
+        lock(&state).sessions.clear();
+        schedule_shutdown_check(&state);
+        assert!(
+            lock(&state).shutdown_scheduled,
+            "the re-arm must not be swallowed by a stale `shutdown_scheduled`"
+        );
     }
 }

@@ -41,7 +41,21 @@ impl Hooks for ExtHooks {
             input: ctx.args.clone(),
         };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
-            Reduced::Blocked { reason, .. } => Ok(BeforeOutcome::Block { reason }),
+            // EXT-029. `cancel` is a FRESH child of the run token, minted at the call site and
+            // handed to nobody else (`self.cancel.child()`, cyrup-agent/src/agent.rs:1009), so it
+            // can only be cancelled by the run root — a cancelled token here means the USER
+            // aborted, not that the extension declined. Returning `Proceed` does NOT run the tool:
+            // the agent re-checks the root immediately (`Ok(BeforeOutcome::Proceed) => if
+            // self.cancel.is_cancelled()`, agent.rs:1026-1028) and produces pi's own
+            // "Operation aborted" error result (packages/agent/src/agent-loop.ts:629-635
+            // @v0.84.1), which is the text the transcript should show.
+            _ if cancel.is_cancelled() => Ok(BeforeOutcome::Proceed),
+            // EXT-049: `terminate` rides the block through to the finalized error result, where
+            // the agent's every()-rule (`shouldTerminateToolBatch`,
+            // packages/agent/src/agent-loop.ts:583 @v0.84.1) decides whether the BATCH ends.
+            Reduced::Blocked { reason, terminate, .. } => {
+                Ok(BeforeOutcome::Block { reason, terminate })
+            }
             Reduced::Pass(ev) => {
                 if let HostEvent::ToolCall { input, .. } = *ev {
                     *ctx.args = input; // mutated args execute as-is, WITHOUT re-validation (R-02-022)

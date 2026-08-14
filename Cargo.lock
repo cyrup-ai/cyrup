@@ -1079,6 +1079,8 @@ dependencies = [
  "cyrup-tui",
  "futures",
  "image",
+ "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1153,7 +1155,6 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -1226,6 +1227,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyrup-it"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cyrup",
+ "cyrup-agent",
+ "cyrup-config",
+ "cyrup-core",
+ "cyrup-ext",
+ "cyrup-ext-sdk",
+ "cyrup-ext-subagents",
+ "cyrup-intercom",
+ "cyrup-modes",
+ "cyrup-permission-system",
+ "cyrup-provider",
+ "cyrup-resources",
+ "cyrup-sdk",
+ "cyrup-session",
+ "cyrup-session-svc",
+ "cyrup-test-support",
+ "cyrup-tools",
+ "cyrup-tui",
+ "futures",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "cyrup-modes"
 version = "0.0.0"
 dependencies = [
@@ -1236,6 +1270,7 @@ dependencies = [
  "cyrup-provider",
  "cyrup-session-svc",
  "futures",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -1295,6 +1330,7 @@ name = "cyrup-resources"
 version = "0.0.0"
 dependencies = [
  "arc-swap",
+ "cyrup-config",
  "cyrup-core",
  "gix",
  "globset",

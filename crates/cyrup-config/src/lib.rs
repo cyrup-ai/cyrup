@@ -26,6 +26,7 @@ pub mod lock;
 pub mod login;
 pub mod model;
 pub mod models_store;
+pub mod paths;
 pub mod policy;
 pub mod provider_compose;
 pub mod settings;
@@ -40,26 +41,29 @@ pub use auth::{
 pub use config_value::{
     clear_config_value_cache, config_value_env_var_name, config_value_env_var_names,
     is_command_config_value, is_config_value_configured, missing_config_value_env_var_names,
-    resolve_config_value, resolve_config_value_or_throw, resolve_config_value_uncached,
-    resolve_headers, resolve_headers_or_throw,
+    resolve_config_value, resolve_config_value_async, resolve_config_value_or_throw,
+    resolve_config_value_or_throw_async, resolve_config_value_uncached, resolve_headers,
+    resolve_headers_or_throw,
 };
 pub use env::{CacheRetention, CliConfigOverrides, ConfigDirs, EnvVars};
 pub use env_keys::{api_key_env_vars, find_env_keys, get_env_api_key};
 pub use error::{AuthError, ConfigError, ScopedError};
 pub use model::{
     CliModelResult, InitialModelResult, ModelCostOverride, ModelCycler, ModelDefinition, ModelFile,
-    ModelOverride, ModelResolver, ModelsJsonOauth, ParsedModel, ProviderConfig,
+    ModelOverride, ModelResolver, ModelScopeDiagnostic, ModelScopeDiagnosticCode,
+    ModelScopeDiagnosticLevel, ModelScopeResult, ModelsJsonOauth, ParsedModel, ProviderConfig,
     RestoredModelResult, ScopedModel, build_fallback_model, default_model_per_provider,
     find_initial_model, load_custom_models, load_models_file, load_models_file_reporting,
     models_json_provider_is_configured, parse_thinking_level, provider_is_configured,
     resolve_cli_model, restore_model_from_session,
 };
+pub use paths::{normalize_path, normalize_path_buf, normalize_path_with_home};
 pub use policy::NetworkPolicy;
 pub use provider_compose::{ConfiguredApiKeyAuth, compose_provider_registry};
 pub use settings::{
     CompactionSettings, DEFAULT_HTTP_IDLE_TIMEOUT_MS, DefaultProjectTrust, EffectiveSettings,
-    FileSettingsStore, InMemorySettingsStore, PackageSource, RetrySettings, Settings,
-    SettingsManager, SettingsScope, SettingsStore, deep_merge, migrate_settings,
+    FileSettingsStore, InMemorySettingsStore, MermaidRenderingMode, PackageSource, RetrySettings,
+    Settings, SettingsManager, SettingsScope, SettingsStore, deep_merge, migrate_settings,
     parse_http_idle_timeout_ms,
 };
 pub use trust::{
@@ -68,3 +72,6 @@ pub use trust::{
     format_project_trust_prompt, has_trust_requiring_resources, project_trust_parent_path,
     resource_stage, select_loaded, should_load, trust_options,
 };
+
+#[cfg(test)]
+mod tests;

@@ -400,7 +400,12 @@ pub fn build() -> ExtensionApi {
         |_args: &str, ctx: &crate::CommandCtx| {
             let id = ctx.ctx().session().append_entry("demoNote", json!({ "note": "from guest" }))?;
             ctx.ctx().session().set_session_name("renamed-by-guest");
-            ctx.ctx().session().set_label(&id, "guest-label");
+            ctx.ctx().session().set_label(&id, Some("guest-label"));
+            // EXT-046: `None` CLEARS (pi `setLabel(entryId, label: string | undefined)`,
+            // extensions/types.ts:1314 @v0.83.0) — set then clear, so the demo exercises both
+            // directions of the signature that used to be write-only.
+            ctx.ctx().session().set_label(&id, None);
+            ctx.ctx().session().set_label(&id, Some("guest-label"));
             Ok(Some(format!("appended {id}")))
         },
     );

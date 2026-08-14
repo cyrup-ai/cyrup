@@ -67,8 +67,8 @@ impl Tool for ReadTool {
     fn prompt_snippet(&self) -> Option<&str> {
         Some("Read file contents")
     }
-    fn prompt_guidelines(&self) -> &[&str] {
-        &["Use read to examine files instead of cat or sed."]
+    fn prompt_guidelines(&self) -> Vec<&str> {
+        vec!["Use read to examine files instead of cat or sed."]
     }
 
     async fn execute(
@@ -117,8 +117,14 @@ impl Tool for ReadTool {
         // sniffs the file header (read.ts:243 → mime.ts), not the extension.
         let bytes = self.fs.read(&abs).await?;
 
-        // Image branch (R-03-012).
-        if let Some(mime) = crate::ops::ImageMime::from_magic(&bytes) {
+        // Image branch (R-03-012). The sniff sees only the first `IMAGE_TYPE_SNIFF_BYTES` (4100)
+        // bytes, which is the window Pi's `detectSupportedImageMimeTypeFromFile` reads
+        // (mime.ts:28-30) before calling the same predicate — NOT the whole file. Handing the
+        // whole file to the sniffer let `isAnimatedPng`'s chunk walk (mime.ts:42-55) find an
+        // `acTL` past byte 4100, where Pi's walk has already bailed at `:51`; the file then fell
+        // through to the TEXT branch below and the model got `from_utf8_lossy` of a PNG instead of
+        // the picture Pi shows.
+        if let Some(mime) = crate::ops::ImageMime::from_file_head(&bytes) {
             return self.read_image(bytes, mime).await;
         }
 

@@ -40,7 +40,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
 
@@ -155,13 +155,12 @@ impl PermissionSystemLogger {
     /// entries that matter most (`permission_request.blocked`, `*.approval_persisted`) are exactly
     /// the ones nobody thinks to enable before the incident.
     ///
-    /// SCOPE, stated precisely so this doc does not overstate what un-gating delivers: upstream
-    /// v0.8.0 `index.ts` has 18 `writeReviewEntry` call sites; cyrup currently has 6, all in
-    /// `extension.rs`. The whole FORWARDING half of the trail is unported — `forwarding.rs` holds
-    /// no logger reference at all — so the `forwarded_permission.*` entries an operator wants when
-    /// a child's ask times out or auto-approves are still absent, gate or no gate. Un-gating makes
-    /// the 6 sites we do have reachable; it does not by itself produce v0.8.0's audit trail.
-    /// Tracked as G131b in `docs/gap-analysis/PARITY-GAPS.md`.
+    /// SCOPE (updated — PERM-008 landed). This doc used to record that the whole FORWARDING half of
+    /// the trail was unported because `forwarding.rs` held no logger reference at all. It now does:
+    /// [`AuditTrail`] is shared by the extension and the detached watcher, and `forwarding.rs`
+    /// writes upstream's eight `forwarded_permission.*` review entries, its
+    /// `permission_forwarding.warning`/`.error` pair, and the child-side
+    /// `permission_forwarding.watch_setup_error` debug entry.
     ///
     /// `debug` — the diagnostic/lifecycle stream — is deliberately still gated; the `debug` flag
     /// keeps its upstream meaning and this is not a rename of it.
@@ -172,6 +171,13 @@ impl PermissionSystemLogger {
     /// pi `logger.flush` (`logging.ts:106`). `[CYRUP-DELTA] 2` — a no-op: the write is already on
     /// the fd when `debug`/`review` returns. Kept so the pi call sites stay 1:1 recognizable.
     pub fn flush(&self) {}
+
+    /// `options.getConfig().debug` as a public read (`logging.ts:91`). Used by the forwarding
+    /// watcher's debug sites, which must not construct a second config handle to answer it.
+    #[must_use]
+    pub fn debug_enabled(&self) -> bool {
+        self.enabled()
+    }
 
     /// `options.getConfig().debug` (v0.8.0 `logging.ts:91`) — read by the `debug` stream ONLY;
     /// `review` is unconditional since v0.8.0.
@@ -229,6 +235,126 @@ impl PermissionSystemLogger {
     }
 }
 
+/// pi's module-scope logging trio — `extensionLogger` (`index.ts:160-162`),
+/// `reportedLoggingWarnings` (`:163`) and `loggingWarningReporter` (`:164`) — plus the two entry
+/// points every call site goes through: `writeLogEntry` (`:182-194`) and `reportLoggingWarning`
+/// (`:174-181`).
+///
+/// **Why this exists as an object rather than three fields on the extension** (PERM-008): upstream
+/// those bindings are MODULE scope, so the forwarding path's eight review entries and three debug
+/// entries share the same logger, the same dedup set and the same reporter as the gate's. cyrup's
+/// forwarding watcher is a detached `tokio` task that cannot borrow the extension, so the shared
+/// module scope becomes one `Arc<AuditTrail>` the extension and the watcher both hold. Before this,
+/// `forwarding.rs` had no logger reference at all and the entire forwarding half of the trail was
+/// unwritten.
+pub struct AuditTrail {
+    logger: PermissionSystemLogger,
+    /// pi `reportedLoggingWarnings` (`index.ts:163`).
+    reported: Mutex<std::collections::HashSet<String>>,
+    /// pi `loggingWarningReporter` (`index.ts:164`), installed by `setLoggingWarningReporter`
+    /// (`:170-172`). `None` until the host backend is attached, exactly as pi's is `null` until the
+    /// extension sets it — and `reportLoggingWarning` early-returns on `null` WITHOUT recording the
+    /// message (`:175-177`), so a warning raised before the reporter exists is reportable later.
+    reporter: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
+}
+
+impl AuditTrail {
+    #[must_use]
+    pub fn new(logger: PermissionSystemLogger) -> Self {
+        AuditTrail {
+            logger,
+            reported: Mutex::new(std::collections::HashSet::new()),
+            reporter: Mutex::new(None),
+        }
+    }
+
+    /// A standalone trail over a fresh default config, for callers that legitimately hold no
+    /// shared config handle: the crate's own forwarding tests, and any embedder driving
+    /// [`crate::forwarding::process_forwarded_requests`] directly. `debug` is off (the default), so
+    /// only the unconditional `review` stream writes.
+    #[must_use]
+    pub fn detached(default_logs_dir: PathBuf) -> Self {
+        Self::new(PermissionSystemLogger::new(
+            Arc::new(Mutex::new(crate::ext_config::ExtensionConfig::default())),
+            default_logs_dir,
+        ))
+    }
+
+    /// pi `setLoggingWarningReporter(reporter)` (`index.ts:170-172`).
+    pub fn set_reporter(&self, reporter: Arc<dyn Fn(&str) + Send + Sync>) {
+        *self.reporter.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reporter);
+    }
+
+    /// pi `writeDebugEntry` (`index.ts:196-198`) → `writeLogEntry("debug", …)`.
+    pub fn debug(&self, event: &str, details: &Value) {
+        if let Some(warning) = self.logger.debug(event, details) {
+            self.report_logging_warning(&warning);
+        }
+    }
+
+    /// pi `writeReviewEntry` (`index.ts:200-202`) → `writeLogEntry("review", …)`.
+    pub fn review(&self, event: &str, details: &Value) {
+        if let Some(warning) = self.logger.review(event, details) {
+            self.report_logging_warning(&warning);
+        }
+    }
+
+    /// pi `logger.flush()` — a no-op here, see [`PermissionSystemLogger::flush`].
+    pub fn flush(&self) {
+        self.logger.flush();
+    }
+
+    /// pi `getConfig().debug`, for the forwarding watcher's `debug`-gated notify.
+    #[must_use]
+    pub fn debug_enabled(&self) -> bool {
+        self.logger.debug_enabled()
+    }
+
+    /// pi `reportLoggingWarning` (`index.ts:174-181`): surface a NEW logging failure once through
+    /// the reporter, and remember it so a persistently broken trail cannot notify on every entry.
+    pub fn report_logging_warning(&self, message: &str) {
+        let reporter = {
+            let slot = self.reporter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match slot.as_ref() {
+                // pi `:175-177`: no reporter ⇒ return WITHOUT adding to the set.
+                None => return,
+                Some(r) => Arc::clone(r),
+            }
+        };
+        // Scoped so the memo lock is released before the reporter runs — it reaches the host.
+        let is_new = {
+            let mut reported =
+                self.reported.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            reported.insert(message.to_string())
+        };
+        if is_new {
+            reporter(message);
+        }
+    }
+
+    /// pi `logPermissionForwardingEntry(event, message, error?)` (`index.ts:730-736`): a
+    /// `permission_forwarding.warning` / `.error` REVIEW entry whose details are `{message}` or
+    /// `{message, error}` — the `error` key is ABSENT, not null, when no cause was supplied
+    /// (`typeof error === "undefined" ? { message } : { message, error }`).
+    pub fn forwarding_entry(&self, event: &str, message: &str, error: Option<&str>) {
+        let details = match error {
+            None => serde_json::json!({ "message": message }),
+            Some(error) => serde_json::json!({ "message": message, "error": error }),
+        };
+        self.review(&format!("permission_forwarding.{event}"), &details);
+    }
+
+    /// pi `logPermissionForwardingWarning` (`index.ts:738-740`).
+    pub fn forwarding_warning(&self, message: &str, error: Option<&str>) {
+        self.forwarding_entry("warning", message, error);
+    }
+
+    /// pi `logPermissionForwardingError` (`index.ts:742-744`).
+    pub fn forwarding_error(&self, message: &str, error: Option<&str>) {
+        self.forwarding_entry("error", message, error);
+    }
+}
+
 /// pi `new Date().toISOString()` (`logging.ts:72`) — UTC, millisecond precision, `Z` suffix.
 /// Hand-formatted (rather than `time`'s `Rfc3339`, which emits variable sub-second digits) so the
 /// JSONL timestamps are byte-shaped like pi's.
@@ -258,9 +384,20 @@ pub fn sensitive_log_metadata(value: Option<&str>) -> Value {
         return Value::Null;
     };
     let mut hasher = Sha256::new();
+    // The digest is unaffected by the unit question below: node's `hash.update(string)` defaults to
+    // utf8, so both sides hash the same bytes.
     hasher.update(value.as_bytes());
     let hex = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>();
-    serde_json::json!({ "present": true, "length": value.len(), "sha256": hex })
+    // PERM-028 — `length` is pi's `value.length`, i.e. UTF-16 CODE UNITS, not UTF-8 bytes.
+    // `str::len()` counted bytes, so "café" logged 5 where pi logs 4 and an emoji logged 4 where pi
+    // logs 2. The field exists so a redacted entry can still be correlated against another trail,
+    // which is exactly what a differing unit breaks. Same convention, same rationale, as
+    // `wildcard.rs:81`'s `encode_utf16().count()` for pi's `pattern.length`.
+    serde_json::json!({
+        "present": true,
+        "length": value.encode_utf16().count(),
+        "sha256": hex,
+    })
 }
 
 #[cfg(test)]
@@ -369,6 +506,41 @@ mod tests {
         assert_eq!(lines[0]["stream"], Value::String("review".to_string()));
         assert_eq!(lines[1]["stream"], Value::String("debug".to_string()));
         assert_eq!(lines[2]["event"], Value::String("c".to_string()));
+    }
+
+    // ------------------------------------------- PERM-028: `length` is UTF-16 code units, not bytes
+
+    /// PERM-028 (RED before the fix). pi's `createSensitiveLogMetadata` records `value.length`
+    /// (v0.8.0 `index.ts:370-380`), i.e. UTF-16 CODE UNITS. Cyrup used `str::len()` — UTF-8 BYTES —
+    /// so `"café"` logged 5 where pi logs 4, and an emoji logged 4 where pi logs 2. The field's
+    /// whole purpose is to let a redacted entry be correlated against another trail, which a
+    /// differing unit breaks.
+    #[test]
+    fn sensitive_metadata_length_is_utf16_code_units() {
+        let cafe = sensitive_log_metadata(Some("café"));
+        assert_eq!(cafe["length"], serde_json::json!(4), "UTF-8 bytes would say 5");
+        assert_eq!(cafe["present"], serde_json::json!(true));
+
+        // A surrogate pair counts 2, so "a😀b" is 4 — not 3 scalars and not 6 bytes.
+        assert_eq!(
+            sensitive_log_metadata(Some("a\u{1F600}b"))["length"],
+            serde_json::json!(4)
+        );
+
+        // ASCII is unaffected, and the digest is over UTF-8 BYTES on both sides (node's
+        // `hash.update(string)` defaults to utf8), so it must not have moved.
+        let ascii = sensitive_log_metadata(Some("abc"));
+        assert_eq!(ascii["length"], serde_json::json!(3));
+        assert_eq!(
+            ascii["sha256"],
+            serde_json::json!(
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            ),
+            "sha256(\"abc\") must be unchanged by the length-unit fix"
+        );
+
+        // Absent stays pi's `null`.
+        assert_eq!(sensitive_log_metadata(None), Value::Null);
     }
 
     // pi `getPermissionSystemLogsDir` (`extension-config.ts:48-51`): the env var overrides the

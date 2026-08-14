@@ -113,6 +113,12 @@ required-features = ["test-fixtures"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# SUBA-032: `#[tokio::test(start_paused = true)]` + `tokio::time::advance` — the virtual clock that
+# replaces `tui/notices.rs`'s three real-clock sleeps around a 60 ms debounce, whose load-bearing
+# assertion landed 15 ms inside the deadline and flaked under machine load. Dev-only: the feature
+# is additive to the runtime features the production dependency above already enables, and nothing
+# in `src/` outside `#[cfg(test)]` references it.
+tokio = { workspace = true, features = ["test-util"] }
 # `artifacts.rs`'s 7-day sweep / 24h-throttle unit tests must backdate an artifact's mtime to prove
 # a file older than the cleanup horizon is deleted while a fresh one survives; `std::fs` has no
 # portable mtime setter and this crate is `#![forbid(unsafe_code)]` (so a `libc::utimes` call is not

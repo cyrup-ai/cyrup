@@ -60,6 +60,38 @@ impl ProviderAuth {
 pub trait ApiKeyAuth: Send + Sync {
     fn name(&self) -> &str;
 
+    /// `true` when this strategy implements [`ApiKeyAuth::login`] — the Rust stand-in for
+    /// upstream's `typeof strategy.login === "function"`, since `login?` is an OPTIONAL member
+    /// (`ai/src/auth/types.ts:166`, *"Absent = ambient-only"*) and a Rust trait default is
+    /// indistinguishable from an override at the call site.
+    ///
+    /// CFG-005: `/login` needs this to decide whether a provider offers an interactive api-key
+    /// setup. It previously answered that question by SNIFFING the strategy's display *name*
+    /// (`cyrup-config/src/login.rs`'s `api_key_strategy_supports_login`), which cannot see a
+    /// multi-secret flow: the four strategies below all need a second (and sometimes third) value
+    /// alongside the key, so the single-secret flow the sniffer selected stored a partial
+    /// credential and reported success — leaving a provider that looks logged in and cannot
+    /// authenticate.
+    fn supports_login(&self) -> bool {
+        false
+    }
+
+    /// Interactive api-key setup — `login?(interaction): Promise<ApiKeyCredential>`
+    /// (`ai/src/auth/types.ts:166`). Prompts for whatever the provider needs (key, account id,
+    /// project/location, profile) and returns the [`Credential::ApiKey`] to persist.
+    ///
+    /// The default reports [`oauth::OAuthError::LoginUnsupported`], matching upstream's absent
+    /// `login`: an env-var strategy has no interactive setup, only ambient resolution. Guard a call
+    /// with [`ApiKeyAuth::supports_login`] to distinguish "declined" from "not offered".
+    async fn login(
+        &self,
+        _interaction: &dyn oauth::AuthInteraction,
+    ) -> Result<Credential, oauth::OAuthError> {
+        Err(oauth::OAuthError::LoginUnsupported {
+            name: self.name().to_string(),
+        })
+    }
+
     /// Resolve request auth. `cred` is the explicit/stored credential (when present); a `None` `cred`
     /// means the resolver may consult ambient sources (env vars) via `ctx` (func-01 R-01-011/012).
     async fn resolve(

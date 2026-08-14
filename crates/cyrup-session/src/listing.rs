@@ -1,6 +1,7 @@
 //! Session listing & selection (arch-04 §4.3/§6.6, R-04-015/018/019). Streaming header/text scan;
 //! selection by full path or unique uuid prefix.
 
+use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -172,25 +173,75 @@ fn load_infos(
     out
 }
 
-/// Read and parse just the header line of a session file (Pi `readSessionHeader`).
+/// Pi `SESSION_HEADER_READ_BUFFER_SIZE` (`session-manager.ts:492`).
+const SESSION_HEADER_READ_BUFFER_SIZE: usize = 4096;
+/// Pi `MAX_SESSION_HEADER_SCAN_BYTES` (`session-manager.ts:493-494`): "Bound synchronous header
+/// discovery while allowing large cwd and custom metadata fields."
+const MAX_SESSION_HEADER_SCAN_BYTES: u64 = 1024 * 1024;
+
+/// Classify one physical line while searching for the first parsed entry — Pi
+/// `parseSessionHeaderCandidate` (`session-manager.ts:563-568`): `None` (Pi `undefined`) = blank or
+/// unparseable, keep scanning; `Some(None)` (Pi `null`) = a parsed entry that is NOT a session
+/// header, stop with no header; `Some(Some(h))` = the header.
+///
+/// This is the ONE first-entry rule shared by [`read_header`], [`scan_file`] and
+/// `manager::load` — before it existed the three disagreed about whether a file with a leading
+/// blank line was a session at all.
+fn header_candidate(line: &str) -> Option<Option<SessionHeader>> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    // Pi's parse is untyped (`JSON.parse`), so a valid-JSON line that is not a header still stops
+    // the scan; only a line that fails to parse at all is skipped.
+    serde_json::from_str::<Value>(line).ok()?;
+    match serde_json::from_str::<SessionHeader>(line) {
+        Ok(h) if h.kind == "session" => Some(Some(h)),
+        _ => Some(None),
+    }
+}
+
+/// Read and parse just the header line of a session file — Pi `readSessionHeader`
+/// (`session-manager.ts:571-613`): a BOUNDED, chunked scan that stops at the first parsed entry and
+/// gives up after [`MAX_SESSION_HEADER_SCAN_BYTES`], rather than reading the whole file into memory.
+/// Listing N sessions previously read N whole files.
 fn read_header(path: &Path) -> Option<SessionHeader> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let first = text.lines().find(|l| !l.trim().is_empty())?;
-    let header: SessionHeader = serde_json::from_str(first).ok()?;
-    if header.kind == "session" {
-        Some(header)
-    } else {
-        None
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::with_capacity(SESSION_HEADER_READ_BUFFER_SIZE, file)
+        .take(MAX_SESSION_HEADER_SCAN_BYTES);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        // `read_line` stops at the newline, so at most one line is buffered at a time and the
+        // `take` adapter caps total bytes read exactly as Pi's `scannedBytes` loop does.
+        let n = reader.read_line(&mut line).ok()?;
+        if n == 0 {
+            // EOF (or the scan cap) — Pi's `bytesRead === 0` branch still evaluates the trailing
+            // partial line (`session-manager.ts:582-585`), which `read_line` has already yielded.
+            return None;
+        }
+        if let Some(verdict) = header_candidate(&line) {
+            return verdict;
+        }
     }
 }
 
 fn scan_file(path: &Path) -> Option<SessionInfo> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut lines = text.lines();
-    let header: SessionHeader = serde_json::from_str(lines.next()?).ok()?;
-    if header.kind != "session" {
-        return None;
-    }
+    // Pi's listing reads through `loadEntriesFromFile`, a CHUNKED `readSync` loop
+    // (`session-manager.ts:514-556`) — never `readFileSync`. Streaming keeps peak memory at one
+    // line instead of the whole file.
+    let file = std::fs::File::open(path).ok()?;
+    let mut lines = BufReader::new(file).lines().map_while(Result::ok);
+
+    // Same first-parsed-entry rule as `read_header` / `manager::load` (Pi validates
+    // `entries[0]` AFTER blank/malformed lines have been dropped, `session-manager.ts:548-553`).
+    let header = loop {
+        let line = lines.next()?;
+        if let Some(verdict) = header_candidate(&line) {
+            break verdict?;
+        }
+    };
 
     let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
 
@@ -205,7 +256,7 @@ fn scan_file(path: &Path) -> Option<SessionInfo> {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<Entry>(line) else {
+        let Ok(entry) = serde_json::from_str::<Entry>(&line) else {
             continue;
         };
         // Latest session_info wins, including explicit clears (Pi `session-manager.ts:616-618`).

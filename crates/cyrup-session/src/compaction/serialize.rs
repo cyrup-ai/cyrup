@@ -27,8 +27,15 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                 if !thinking.is_empty() {
                     parts.push(format!("[Assistant thinking]: {thinking}"));
                 }
-                let text = join_text(&a.content, "\n");
-                if !text.is_empty() {
+                // Pi guards the assistant line on the PRESENCE of a text block, not on the joined
+                // text being non-empty: `if (msg.content.some((block) => block.type === "text"))`
+                // (`utils.ts:135-137`). The asymmetry is deliberate upstream — the user arm
+                // (`:113-115`) and the toolResult arm (`:141-145`) both guard on emptiness, which
+                // the two arms around this one mirror. Guarding on the joined text here dropped the
+                // `[Assistant]: ` marker for a turn whose only text block is empty, shifting the
+                // interleaving the summarizer sees.
+                if a.content.iter().any(|c| matches!(c, Content::Text { .. })) {
+                    let text = join_text(&a.content, "\n");
                     parts.push(format!("[Assistant]: {text}"));
                 }
                 let calls = tool_calls_of(&a.content);

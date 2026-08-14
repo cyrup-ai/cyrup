@@ -72,10 +72,19 @@ impl<'a> ModelResolver<'a> {
         Self { available }
     }
 
-    fn match_reference(&self, reference: &str) -> Match<'a> {
+    /// Exact model-reference match, with NO partial fallback (Pi
+    /// `findExactModelReferenceMatch`, model-resolver.ts:79-120 @v0.83.0). Accepts either a
+    /// canonical `provider/modelId` reference or a bare model id; a bare id carried by more than
+    /// one provider is ambiguous and yields `None` (`:118`).
+    ///
+    /// Split out of [`ModelResolver::match_reference`] because Pi calls it in TWO places the
+    /// partial matcher must not run: `tryMatchModel`'s first step (`:128`) and — the case CFG-018
+    /// records — INSIDE the glob branch of `resolveModelScope` (`:297`), before the minimatch
+    /// filter.
+    fn exact_reference_match(&self, reference: &str) -> Option<&'a Model> {
         let reference = reference.trim();
         if reference.is_empty() {
-            return Match::None;
+            return None;
         }
         let lower = reference.to_ascii_lowercase();
 
@@ -87,22 +96,34 @@ impl<'a> ModelResolver<'a> {
                 m.provider.as_str().to_ascii_lowercase() == prov
                     && m.id.as_str().to_ascii_lowercase() == id
             }) {
-                return Match::One(m);
+                return Some(m);
             }
         }
 
         // 2. bare exact id. Pi's `findExactModelReferenceMatch` returns the model ONLY when exactly
         // one id matches; a bare id present on >1 provider returns `undefined` (it does NOT error),
-        // so it falls through to partial matching below (model-resolver.ts:116-118). Likewise a
-        // zero-hit exact match falls through.
+        // so it falls through to partial matching in `tryMatchModel` (model-resolver.ts:116-118).
+        // Likewise a zero-hit exact match falls through.
         let exact: Vec<&Model> = self
             .available
             .iter()
             .filter(|m| m.id.as_str().to_ascii_lowercase() == lower)
             .collect();
-        if exact.len() == 1
-            && let Some(m) = exact.first()
-        {
+        if exact.len() == 1 {
+            return exact.first().copied();
+        }
+        None
+    }
+
+    fn match_reference(&self, reference: &str) -> Match<'a> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Match::None;
+        }
+        let lower = reference.to_ascii_lowercase();
+
+        // 1-2. exact reference (canonical or bare id) — Pi `tryMatchModel`'s first step, :128.
+        if let Some(m) = self.exact_reference_match(reference) {
             return Match::One(m);
         }
 
@@ -207,7 +228,12 @@ impl<'a> ModelResolver<'a> {
                 ParsedModel {
                     model: inner.model,
                     thinking_level: None,
-                    warning: Some(format!("invalid thinking level '{suffix}'")),
+                    // Pi's exact sentence (model-resolver.ts:243 @v0.83.0):
+                    // `Invalid thinking level "X" in pattern "Y". Using default instead.` — `Y` is
+                    // the pattern at THIS recursion level, which is what upstream interpolates.
+                    warning: Some(format!(
+                        "Invalid thinking level \"{suffix}\" in pattern \"{pattern}\". Using default instead."
+                    )),
                 }
             } else {
                 inner
@@ -233,7 +259,20 @@ impl<'a> ModelResolver<'a> {
 
     /// Expand scope patterns (incl. simple `*` globs) into an ordered, de-duplicated candidate set
     /// (R-07-022).
+    ///
+    /// Diagnostic-free convenience wrapper over [`ModelResolver::resolve_scope_reporting`]; Pi's
+    /// `resolveModelScope` always returns `{ scopedModels, diagnostics }` (model-resolver.ts:270
+    /// @v0.83.0), so a caller that wants the warnings must use the reporting form.
     pub fn resolve_scope(&self, patterns: &[String]) -> Vec<ScopedModel> {
+        self.resolve_scope_reporting(patterns).models
+    }
+
+    /// Expand scope patterns AND report Pi's `ModelScopeDiagnostic`s (`model-resolver.ts:261-270`
+    /// @v0.83.0): `no-match` for a pattern that resolves to nothing (pushed at `:316` on the glob
+    /// path and `:340` on the reference path) and `invalid-thinking-level` for a bad `:level`
+    /// suffix (minted at `:243`, pushed at `:334`).
+    pub fn resolve_scope_reporting(&self, patterns: &[String]) -> ModelScopeResult {
+        let mut diagnostics: Vec<ModelScopeDiagnostic> = Vec::new();
         let mut out: Vec<ScopedModel> = Vec::new();
         let mut seen: Vec<(String, String)> = Vec::new();
         let push = |model: Model,
@@ -266,21 +305,93 @@ impl<'a> ModelResolver<'a> {
                         glob_pattern = pattern.get(..idx).unwrap_or(pattern);
                     }
                 }
-                for m in self.available.iter().filter(|m| {
-                    glob_match(glob_pattern, &format!("{}/{}", m.provider, m.id))
-                        || glob_match(glob_pattern, m.id.as_str())
-                }) {
+                // Pi tries an EXACT reference match before the minimatch filter (`:297-303`), so a
+                // pattern that happens to carry a glob metacharacter (`[`, `?`) but names a real
+                // model resolves directly. CFG-018.
+                if let Some(exact) = self.exact_reference_match(glob_pattern) {
+                    push(exact.clone(), level, &mut seen, &mut out);
+                    continue;
+                }
+                let matching: Vec<&Model> = self
+                    .available
+                    .iter()
+                    .filter(|m| {
+                        glob_match(glob_pattern, &format!("{}/{}", m.provider, m.id))
+                            || glob_match(glob_pattern, m.id.as_str())
+                    })
+                    .collect();
+                if matching.is_empty() {
+                    diagnostics.push(ModelScopeDiagnostic {
+                        level: ModelScopeDiagnosticLevel::Warning,
+                        code: ModelScopeDiagnosticCode::NoMatch,
+                        message: format!("No models match pattern \"{pattern}\""),
+                        pattern: pattern.clone(),
+                    });
+                    continue;
+                }
+                for m in matching {
                     push(m.clone(), level, &mut seen, &mut out);
                 }
             } else {
                 let parsed = self.parse_pattern(pattern, false);
-                if let Some(m) = parsed.model {
-                    push(m, parsed.thinking_level, &mut seen, &mut out);
+                if let Some(warning) = parsed.warning {
+                    diagnostics.push(ModelScopeDiagnostic {
+                        level: ModelScopeDiagnosticLevel::Warning,
+                        code: ModelScopeDiagnosticCode::InvalidThinkingLevel,
+                        message: warning,
+                        pattern: pattern.clone(),
+                    });
+                }
+                match parsed.model {
+                    Some(m) => push(m, parsed.thinking_level, &mut seen, &mut out),
+                    None => diagnostics.push(ModelScopeDiagnostic {
+                        level: ModelScopeDiagnosticLevel::Warning,
+                        code: ModelScopeDiagnosticCode::NoMatch,
+                        message: format!("No models match pattern \"{pattern}\""),
+                        pattern: pattern.clone(),
+                    }),
                 }
             }
         }
-        out
+        ModelScopeResult {
+            models: out,
+            diagnostics,
+        }
     }
+}
+
+/// Severity of a [`ModelScopeDiagnostic`] (Pi's `type: "warning"`, model-resolver.ts:262 @v0.83.0 —
+/// upstream mints only warnings today, so the enum has one arm).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelScopeDiagnosticLevel {
+    Warning,
+}
+
+/// Machine-readable diagnostic code (Pi `code: "no-match" | "invalid-thinking-level"`,
+/// model-resolver.ts:263 @v0.83.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelScopeDiagnosticCode {
+    NoMatch,
+    InvalidThinkingLevel,
+}
+
+/// One warning emitted while expanding `--models` scope patterns (Pi `ModelScopeDiagnostic`,
+/// model-resolver.ts:261-268 @v0.83.0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelScopeDiagnostic {
+    pub level: ModelScopeDiagnosticLevel,
+    pub code: ModelScopeDiagnosticCode,
+    pub message: String,
+    /// The originating pattern, verbatim (Pi carries `pattern` on every diagnostic, `:267`).
+    pub pattern: String,
+}
+
+/// Result of [`ModelResolver::resolve_scope_reporting`] (Pi's `{ scopedModels, diagnostics }`,
+/// model-resolver.ts:270 @v0.83.0).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelScopeResult {
+    pub models: Vec<ScopedModel>,
+    pub diagnostics: Vec<ModelScopeDiagnostic>,
 }
 
 /// `minimatch`-style glob matcher (Pi uses `minimatch(.., { nocase: true })`,
@@ -406,7 +517,11 @@ fn as_pure_literal(p: &[char]) -> Option<String> {
             }
             '[' => {
                 out.push(single_char_class_literal(p.get(i..).unwrap_or(&[]))?);
-                i += if p.get(i + 1).copied() == Some('\\') { 4 } else { 3 };
+                i += if p.get(i + 1).copied() == Some('\\') {
+                    4
+                } else {
+                    3
+                };
             }
             '*' | '?' => return None,
             '@' | '+' | '!' if p.get(i + 1).copied() == Some('(') => return None,
@@ -802,12 +917,20 @@ fn expand_brace_range(body: &[char]) -> Option<Vec<String>> {
         let mut x = a;
         if a <= b {
             while x <= b {
-                out.push(char::from_u32(x as u32).map(String::from).unwrap_or_default());
+                out.push(
+                    char::from_u32(x as u32)
+                        .map(String::from)
+                        .unwrap_or_default(),
+                );
                 x += step;
             }
         } else {
             while x >= b {
-                out.push(char::from_u32(x as u32).map(String::from).unwrap_or_default());
+                out.push(
+                    char::from_u32(x as u32)
+                        .map(String::from)
+                        .unwrap_or_default(),
+                );
                 x -= step;
             }
         }
@@ -941,6 +1064,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "openai" => "gpt-5.5",
         "azure-openai-responses" => "gpt-5.4",
         "openai-codex" => "gpt-5.5",
+        "radius" => "auto",
         "nvidia" => "nvidia/nemotron-3-super-120b-a12b",
         "deepseek" => "deepseek-v4-pro",
         "google" => "gemini-3.1-pro-preview",
@@ -948,7 +1072,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "github-copilot" => "gpt-5.4",
         "openrouter" => "moonshotai/kimi-k2.6",
         "vercel-ai-gateway" => "zai/glm-5.1",
-        "xai" => "grok-4.20-0309-reasoning",
+        "xai" => "grok-4.5",
         "groq" => "openai/gpt-oss-120b",
         "cerebras" => "zai-glm-4.7",
         "zai" => "glm-5.1",
@@ -961,6 +1085,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "huggingface" => "moonshotai/Kimi-K2.6",
         "fireworks" => "accounts/fireworks/models/kimi-k2p6",
         "together" => "moonshotai/Kimi-K2.6",
+        "baseten" => "zai-org/GLM-5.2",
         "opencode" => "kimi-k2.6",
         "opencode-go" => "kimi-k2.6",
         "kimi-coding" => "kimi-for-coding",
@@ -972,6 +1097,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         // extrapolation from the `-cn` sibling: upstream writes `qwen3.7-max` on both keys.
         "qwen-token-plan" => "qwen3.7-max",
         "qwen-token-plan-cn" => "qwen3.7-max",
+        "qwen-token-plan-individual" => "qwen3.8-max",
         "xiaomi" => "mimo-v2.5-pro",
         "xiaomi-token-plan-cn" => "mimo-v2.5-pro",
         "xiaomi-token-plan-ams" => "mimo-v2.5-pro",
@@ -990,6 +1116,7 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "openai",
     "azure-openai-responses",
     "openai-codex",
+    "radius",
     "nvidia",
     "deepseek",
     "google",
@@ -1010,6 +1137,7 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "huggingface",
     "fireworks",
     "together",
+    "baseten",
     "opencode",
     "opencode-go",
     "kimi-coding",
@@ -1021,6 +1149,7 @@ const KNOWN_PROVIDERS: &[&str] = &[
     // qwen keys sit between `cloudflare-ai-gateway` and `xiaomi`.
     "qwen-token-plan",
     "qwen-token-plan-cn",
+    "qwen-token-plan-individual",
     "xiaomi",
     "xiaomi-token-plan-cn",
     "xiaomi-token-plan-ams",
@@ -1338,11 +1467,14 @@ pub fn find_initial_model(
         };
     }
 
-    // 3. Saved default from settings.
+    // 3. Saved default from settings if auth is configured (Pi model-resolver.ts:621-630
+    //    @v0.83.0: `if (found && modelRuntime.hasConfiguredAuth(found.provider))`, falling through
+    //    to step 4 at `:632` when the check fails).
     if let (Some(dp), Some(dm)) = (default_provider, default_model_id)
         && let Some(found) = all
             .iter()
             .find(|m| m.provider.as_str() == dp && m.id.as_str() == dm)
+        && has_configured_auth(found)
     {
         return InitialModelResult {
             model: Some(found.clone()),
@@ -1555,10 +1687,14 @@ pub struct ModelDefinition {
     pub input: Option<Vec<cyrup_provider::Modality>>,
     #[serde(default)]
     pub cost: Option<cyrup_provider::ModelCost>,
+    /// `Type.Optional(Type.Number())` (model-config.ts:163 @v0.83.0) — SIGNED, because pi accepts a
+    /// negative value at the schema layer and rejects it in `modelFromJson` with
+    /// `invalid contextWindow`, per PROVIDER, keeping the rest of the file. A `u64` would turn the
+    /// same document into a whole-file parse failure (CFG-046).
     #[serde(default)]
-    pub context_window: Option<u64>,
+    pub context_window: Option<i64>,
     #[serde(default)]
-    pub max_tokens: Option<u64>,
+    pub max_tokens: Option<i64>,
     #[serde(default)]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -1580,10 +1716,11 @@ pub struct ModelOverride {
     pub input: Option<Vec<cyrup_provider::Modality>>,
     #[serde(default)]
     pub cost: Option<ModelCostOverride>,
+    /// Signed for the same reason as [`ModelDefinition::context_window`] (model-config.ts:184).
     #[serde(default)]
-    pub context_window: Option<u64>,
+    pub context_window: Option<i64>,
     #[serde(default)]
-    pub max_tokens: Option<u64>,
+    pub max_tokens: Option<i64>,
     #[serde(default)]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -1690,6 +1827,325 @@ pub fn load_models_file(path: &Path) -> Result<ModelFile, ConfigError> {
     Ok(file)
 }
 
+/// One `models.json` schema violation, in the shape Pi renders it at model-config.ts:274-277
+/// @v0.83.0 — `  - ${formatValidationPath(error)}: ${error.message}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelsSchemaError {
+    /// The dotted instance path (`formatValidationPath`, model-config.ts:217-228): the JSON pointer
+    /// with its leading `/` stripped and the rest of the `/`s turned into `.`; `root` when empty,
+    /// and `<basePath>.<missingProperty>` for a `required` failure.
+    pub path: String,
+    /// The validator's message, e.g. `Expected number`.
+    pub message: String,
+}
+
+/// Typebox message strings. These are the messages the LIBRARY produces (`typebox/error`), not
+/// literals present in `model-config.ts`; the pi code opened at v0.83.0 only interpolates
+/// `error.message` (`:276`). Recorded here so the rendered report is one place, not eight.
+mod schema_msg {
+    pub const REQUIRED: &str = "Expected required property";
+    pub const OBJECT: &str = "Expected object";
+    pub const ARRAY: &str = "Expected array";
+    pub const STRING: &str = "Expected string";
+    pub const NUMBER: &str = "Expected number";
+    pub const BOOLEAN: &str = "Expected boolean";
+    pub const UNION: &str = "Expected union value";
+    /// `Type.String({ minLength: 1 })` — the check CFG-046 exists for.
+    pub const MIN_LENGTH_1: &str = "Expected string length greater or equal to 1";
+}
+
+/// Render a JSON-pointer-ish path segment list the way `formatValidationPath` does
+/// (model-config.ts:217-228 @v0.83.0): dotted, `root` when empty.
+fn schema_path(segments: &[String]) -> String {
+    if segments.is_empty() {
+        "root".to_string()
+    } else {
+        segments.join(".")
+    }
+}
+
+fn push_err(errs: &mut Vec<ModelsSchemaError>, segments: &[String], message: &str) {
+    errs.push(ModelsSchemaError {
+        path: schema_path(segments),
+        message: message.to_string(),
+    });
+}
+
+fn child(segments: &[String], key: &str) -> Vec<String> {
+    let mut out = segments.to_vec();
+    out.push(key.to_string());
+    out
+}
+
+/// `Type.Optional(Type.String({ minLength: 1 }))` — the shape carried by `name`, `baseUrl`,
+/// `apiKey` and `api` on `ProviderConfigSchema` (model-config.ts:188-198 @v0.83.0) and by `name` /
+/// `api` / `baseUrl` on `ModelDefinitionSchema` (`:155-158`).
+fn check_opt_string_min1(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    at: &[String],
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    let Some(v) = obj.get(key) else { return };
+    let here = child(at, key);
+    match v.as_str() {
+        None => push_err(errs, &here, schema_msg::STRING),
+        Some(s) if s.is_empty() => push_err(errs, &here, schema_msg::MIN_LENGTH_1),
+        Some(_) => {}
+    }
+}
+
+fn check_opt_number(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    at: &[String],
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    if let Some(v) = obj.get(key)
+        && !v.is_number()
+    {
+        push_err(errs, &child(at, key), schema_msg::NUMBER);
+    }
+}
+
+fn check_opt_bool(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    at: &[String],
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    if let Some(v) = obj.get(key)
+        && !v.is_boolean()
+    {
+        push_err(errs, &child(at, key), schema_msg::BOOLEAN);
+    }
+}
+
+/// `Type.Optional(Type.Record(Type.String(), Type.String()))` — `headers`.
+fn check_opt_string_record(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    at: &[String],
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    let Some(v) = obj.get(key) else { return };
+    let here = child(at, key);
+    let Some(map) = v.as_object() else {
+        push_err(errs, &here, schema_msg::OBJECT);
+        return;
+    };
+    for (k, hv) in map {
+        if !hv.is_string() {
+            push_err(errs, &child(&here, k), schema_msg::STRING);
+        }
+    }
+}
+
+/// `Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")])))` —
+/// `input` (model-config.ts:161 / :172 @v0.83.0).
+fn check_opt_modalities(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    at: &[String],
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    let Some(v) = obj.get("input") else { return };
+    let here = child(at, "input");
+    let Some(arr) = v.as_array() else {
+        push_err(errs, &here, schema_msg::ARRAY);
+        return;
+    };
+    for (i, item) in arr.iter().enumerate() {
+        if !matches!(item.as_str(), Some("text" | "image")) {
+            push_err(errs, &child(&here, &i.to_string()), schema_msg::UNION);
+        }
+    }
+}
+
+/// `ModelCostSchema` (model-config.ts:149-152 @v0.83.0): the four rates are REQUIRED, `tiers` is an
+/// optional array of `ModelCostTierSchema` (`:145-148`, whose `inputTokensAbove` plus the same four
+/// rates are all required).
+fn check_cost(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    at: &[String],
+    required_rates: bool,
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    let Some(v) = obj.get("cost") else { return };
+    let here = child(at, "cost");
+    let Some(map) = v.as_object() else {
+        push_err(errs, &here, schema_msg::OBJECT);
+        return;
+    };
+    for rate in ["input", "output", "cacheRead", "cacheWrite"] {
+        match map.get(rate) {
+            None if required_rates => push_err(errs, &child(&here, rate), schema_msg::REQUIRED),
+            None => {}
+            Some(rv) if !rv.is_number() => push_err(errs, &child(&here, rate), schema_msg::NUMBER),
+            Some(_) => {}
+        }
+    }
+    let Some(tiers) = map.get("tiers") else {
+        return;
+    };
+    let tiers_at = child(&here, "tiers");
+    let Some(arr) = tiers.as_array() else {
+        push_err(errs, &tiers_at, schema_msg::ARRAY);
+        return;
+    };
+    for (i, tier) in arr.iter().enumerate() {
+        let tier_at = child(&tiers_at, &i.to_string());
+        let Some(tm) = tier.as_object() else {
+            push_err(errs, &tier_at, schema_msg::OBJECT);
+            continue;
+        };
+        for field in [
+            "inputTokensAbove",
+            "input",
+            "output",
+            "cacheRead",
+            "cacheWrite",
+        ] {
+            match tm.get(field) {
+                None => push_err(errs, &child(&tier_at, field), schema_msg::REQUIRED),
+                Some(fv) if !fv.is_number() => {
+                    push_err(errs, &child(&tier_at, field), schema_msg::NUMBER);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// `ModelDefinitionSchema` (model-config.ts:154-166 @v0.83.0).
+fn check_model_definition(
+    value: &serde_json::Value,
+    at: &[String],
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    let Some(obj) = value.as_object() else {
+        push_err(errs, at, schema_msg::OBJECT);
+        return;
+    };
+    match obj.get("id") {
+        None => push_err(errs, &child(at, "id"), schema_msg::REQUIRED),
+        Some(v) => match v.as_str() {
+            None => push_err(errs, &child(at, "id"), schema_msg::STRING),
+            Some(s) if s.is_empty() => push_err(errs, &child(at, "id"), schema_msg::MIN_LENGTH_1),
+            Some(_) => {}
+        },
+    }
+    for key in ["name", "api", "baseUrl"] {
+        check_opt_string_min1(obj, key, at, errs);
+    }
+    check_opt_bool(obj, "reasoning", at, errs);
+    check_opt_modalities(obj, at, errs);
+    check_cost(obj, at, true, errs);
+    check_opt_number(obj, "contextWindow", at, errs);
+    check_opt_number(obj, "maxTokens", at, errs);
+    check_opt_string_record(obj, "headers", at, errs);
+}
+
+/// `ModelOverrideSchema` (model-config.ts:168-186 @v0.83.0). Its `cost` block differs from a model
+/// definition's: every rate is individually optional (`:174-182`).
+fn check_model_override(
+    value: &serde_json::Value,
+    at: &[String],
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    let Some(obj) = value.as_object() else {
+        push_err(errs, at, schema_msg::OBJECT);
+        return;
+    };
+    check_opt_string_min1(obj, "name", at, errs);
+    check_opt_bool(obj, "reasoning", at, errs);
+    check_opt_modalities(obj, at, errs);
+    check_cost(obj, at, false, errs);
+    check_opt_number(obj, "contextWindow", at, errs);
+    check_opt_number(obj, "maxTokens", at, errs);
+    check_opt_string_record(obj, "headers", at, errs);
+}
+
+/// Validate a parsed `models.json` against Pi's `ModelsConfigSchema`
+/// (`validateModelsConfig.Check(parsed)`, model-config.ts:265 @v0.83.0) and return every failure,
+/// which is what Pi renders — `.Errors(parsed).map(...)` at `:272-277`, not just the first.
+///
+/// **[CYRUP-DELTA]** `compat` is left to serde. Upstream types it as a three-way union of ~40
+/// optional keys (`ProviderCompatSchema`, model-config.ts:133-137); reproducing that union's
+/// per-arm error text here would duplicate `cyrup_provider::api::compat`'s own definition. A
+/// malformed `compat` therefore surfaces through the serde pass below, still under the
+/// `Invalid models.json schema:` heading and still naming the offending key.
+pub fn validate_models_config(value: &serde_json::Value) -> Vec<ModelsSchemaError> {
+    let mut errs: Vec<ModelsSchemaError> = Vec::new();
+    let root: Vec<String> = Vec::new();
+    let Some(obj) = value.as_object() else {
+        push_err(&mut errs, &root, schema_msg::OBJECT);
+        return errs;
+    };
+    // `providers: Type.Record(...)` is NOT optional (model-config.ts:201-203).
+    let Some(providers) = obj.get("providers") else {
+        push_err(&mut errs, &["providers".to_string()], schema_msg::REQUIRED);
+        return errs;
+    };
+    let providers_at = vec!["providers".to_string()];
+    let Some(providers) = providers.as_object() else {
+        push_err(&mut errs, &providers_at, schema_msg::OBJECT);
+        return errs;
+    };
+    for (provider_id, provider) in providers {
+        let at = child(&providers_at, provider_id);
+        let Some(pobj) = provider.as_object() else {
+            push_err(&mut errs, &at, schema_msg::OBJECT);
+            continue;
+        };
+        for key in ["name", "baseUrl", "apiKey", "api"] {
+            check_opt_string_min1(pobj, key, &at, &mut errs);
+        }
+        // `oauth: Type.Optional(Type.Literal("radius"))` (model-config.ts:194).
+        if let Some(oauth) = pobj.get("oauth")
+            && oauth.as_str() != Some("radius")
+        {
+            push_err(&mut errs, &child(&at, "oauth"), "Expected \"radius\"");
+        }
+        check_opt_string_record(pobj, "headers", &at, &mut errs);
+        check_opt_bool(pobj, "authHeader", &at, &mut errs);
+        if let Some(models) = pobj.get("models") {
+            let models_at = child(&at, "models");
+            match models.as_array() {
+                None => push_err(&mut errs, &models_at, schema_msg::ARRAY),
+                Some(arr) => {
+                    for (i, m) in arr.iter().enumerate() {
+                        check_model_definition(m, &child(&models_at, &i.to_string()), &mut errs);
+                    }
+                }
+            }
+        }
+        if let Some(overrides) = pobj.get("modelOverrides") {
+            let ov_at = child(&at, "modelOverrides");
+            match overrides.as_object() {
+                None => push_err(&mut errs, &ov_at, schema_msg::OBJECT),
+                Some(map) => {
+                    for (id, ov) in map {
+                        check_model_override(ov, &child(&ov_at, id), &mut errs);
+                    }
+                }
+            }
+        }
+    }
+    errs
+}
+
+/// Render a schema-failure list as Pi's report body (model-config.ts:272-278 @v0.83.0), including
+/// its `|| "Unknown schema error"` fallback for an empty list.
+fn render_schema_errors(errs: &[ModelsSchemaError]) -> String {
+    if errs.is_empty() {
+        return "Unknown schema error".to_string();
+    }
+    errs.iter()
+        .map(|e| format!("  - {}: {}", e.path, e.message))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Load `<agent_dir>/models.json` into a composed [`ModelFile`], turning EVERY failure mode into a
 /// human-readable message instead of an error the caller might treat as fatal.
 ///
@@ -1698,22 +2154,50 @@ pub fn load_models_file(path: &Path) -> Result<ModelFile, ConfigError> {
 /// built-in registry. This mirrors that contract: the returned `ModelFile` is empty on failure and
 /// the `Option<String>` is the diagnostic the startup panel renders.
 pub fn load_models_file_reporting(path: &Path) -> (ModelFile, Option<String>) {
-    match load_models_file(path) {
-        Ok(file) => (file, None),
-        Err(ConfigError::Serde(e)) => (
-            ModelFile::default(),
-            Some(format!(
-                "Failed to parse models.json: {e}\n\nFile: {}",
-                path.display()
-            )),
-        ),
-        Err(e) => (
-            ModelFile::default(),
-            Some(format!(
+    let empty = |msg: String| (ModelFile::default(), Some(msg));
+    // Tier 1 — read (`ModelConfig.load`'s catch at model-config.ts:251-256 @v0.83.0). ENOENT is an
+    // empty snapshot with NO message (`:250`).
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (ModelFile::default(), None),
+        Err(e) => {
+            return empty(format!(
                 "Failed to load models.json: {e}\n\nFile: {}",
                 path.display()
-            )),
-        ),
+            ));
+        }
+    };
+    if text.trim().is_empty() {
+        return (ModelFile::default(), None);
+    }
+    // Tier 2 — JSON syntax (`JSON.parse(stripJsonComments(content))`, `:259-270`).
+    let value: serde_json::Value = match serde_json::from_str(&strip_json_comments(&text)) {
+        Ok(v) => v,
+        Err(e) => {
+            return empty(format!(
+                "Failed to parse models.json: {e}\n\nFile: {}",
+                path.display()
+            ));
+        }
+    };
+    // Tier 3 — schema (`validateModelsConfig.Check`, `:265-279`). EVERY failing field is reported,
+    // by dotted key path, under a heading distinct from the syntax one.
+    let schema_errors = validate_models_config(&value);
+    if !schema_errors.is_empty() {
+        return empty(format!(
+            "Invalid models.json schema:\n{}\n\nFile: {}",
+            render_schema_errors(&schema_errors),
+            path.display()
+        ));
+    }
+    match serde_json::from_value::<ModelFile>(value) {
+        Ok(file) => (file, None),
+        // A typing failure the hand-written validator above does not cover (today: only `compat`'s
+        // three-arm union) is still a SCHEMA failure in Pi's model, not a syntax one.
+        Err(e) => empty(format!(
+            "Invalid models.json schema:\n  - {e}\n\nFile: {}",
+            path.display()
+        )),
     }
 }
 
@@ -1936,13 +2420,15 @@ fn model_from_json(
         .ok_or_else(|| {
             format!("Provider {provider_id}: \"baseUrl\" is required when defining custom models.")
         })?;
-    if definition.context_window == Some(0) {
+    // `definition.contextWindow !== undefined && definition.contextWindow <= 0`
+    // (provider-composer.ts:138-143 @v0.83.0) — NOT `=== 0`. CFG-046.
+    if definition.context_window.is_some_and(|v| v <= 0) {
         return Err(format!(
             "Provider {provider_id}, model {}: invalid contextWindow",
             definition.id
         ));
     }
-    if definition.max_tokens == Some(0) {
+    if definition.max_tokens.is_some_and(|v| v <= 0) {
         return Err(format!(
             "Provider {provider_id}, model {}: invalid maxTokens",
             definition.id
@@ -1963,8 +2449,9 @@ fn model_from_json(
             .clone()
             .unwrap_or_else(|| vec![cyrup_provider::Modality::Text]),
         cost: definition.cost.clone().unwrap_or_default(),
-        context_window: definition.context_window.unwrap_or(128_000),
-        max_tokens: definition.max_tokens.unwrap_or(16_384),
+        // Both are guaranteed `> 0` by the checks above, so the cast is total.
+        context_window: definition.context_window.map_or(128_000, |v| v as u64),
+        max_tokens: definition.max_tokens.map_or(16_384, |v| v as u64),
         thinking_level_map: definition.thinking_level_map.clone(),
         // Pi sets `headers: undefined` on the composed model — `models.json` headers are REQUEST
         // config resolved separately through `resolveConfiguredModelHeaders` (:156, :501-511), so
@@ -2000,11 +2487,18 @@ fn apply_model_override(model: &mut Model, ov: &ModelOverride) {
     if let Some(input) = &ov.input {
         model.input = input.clone();
     }
+    // `contextWindow: override.contextWindow ?? model.contextWindow` (provider-composer.ts:118-119
+    // @v0.83.0) — the override path has NO positivity check, unlike `modelFromJson`'s.
+    //
+    // [CYRUP-DELTA] pi stores a negative override verbatim (JS `number`); `Model::context_window`
+    // is `u64`, so a negative value saturates to 0 here rather than wrapping. Upstream's own
+    // behaviour on a negative override is an unguarded hole (a negative window reaches the request
+    // builder), and reproducing the wrap would be strictly worse than reproducing the intent.
     if let Some(cw) = ov.context_window {
-        model.context_window = cw;
+        model.context_window = cw.max(0) as u64;
     }
     if let Some(mt) = ov.max_tokens {
-        model.max_tokens = mt;
+        model.max_tokens = mt.max(0) as u64;
     }
     if let Some(cost) = &ov.cost {
         if let Some(v) = cost.input {
@@ -2096,7 +2590,6 @@ fn merge_compat(
     }
 }
 
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
@@ -2176,7 +2669,9 @@ mod tests {
         ];
         let r = ModelResolver::new(&models);
         // find_exact (Pi `tryMatchModel`) resolves to provider a, never erroring.
-        let found = r.find_exact("shared").expect("ambiguous bare id resolves, never errors");
+        let found = r
+            .find_exact("shared")
+            .expect("ambiguous bare id resolves, never errors");
         assert_eq!(found.provider.as_str(), "a");
         // parse_pattern likewise resolves (no warning, a concrete model).
         let parsed = r.parse_pattern("shared", true);
@@ -2193,7 +2688,11 @@ mod tests {
         ];
         let r = ModelResolver::new(&shared_kimi);
         let scoped = r.resolve_scope(&["kimi-k2.6".to_string()]);
-        assert_eq!(scoped.len(), 1, "Pi resolves an ambiguous bare id to 1 model");
+        assert_eq!(
+            scoped.len(),
+            1,
+            "Pi resolves an ambiguous bare id to 1 model"
+        );
         assert_eq!(
             scoped.first().unwrap().model.provider.as_str(),
             "moonshotai"
@@ -2329,11 +2828,20 @@ mod tests {
             built.context_window, 1_000_000,
             "the clone base must be the curated qwen3.7-max, not the first-listed MiniMax-M2.5"
         );
-        assert!(built.reasoning, "…and must therefore inherit the curated model's reasoning flag");
+        assert!(
+            built.reasoning,
+            "…and must therefore inherit the curated model's reasoning flag"
+        );
 
         // Both regions name the SAME default (`model-resolver.ts:47-48`), and both must be known.
-        assert_eq!(default_model_per_provider("qwen-token-plan"), Some("qwen3.7-max"));
-        assert_eq!(default_model_per_provider("qwen-token-plan-cn"), Some("qwen3.7-max"));
+        assert_eq!(
+            default_model_per_provider("qwen-token-plan"),
+            Some("qwen3.7-max")
+        );
+        assert_eq!(
+            default_model_per_provider("qwen-token-plan-cn"),
+            Some("qwen3.7-max")
+        );
         assert!(
             KNOWN_PROVIDERS.contains(&"qwen-token-plan")
                 && KNOWN_PROVIDERS.contains(&"qwen-token-plan-cn"),
@@ -2343,20 +2851,24 @@ mod tests {
 
     /// MIRROR — the scan ORDER. `first_default_or_first` returns the first KNOWN_PROVIDERS entry
     /// with an available match, so inserting the qwen keys anywhere but pi's `Object.keys` position
-    /// would silently re-rank every other provider's claim on the initial model. Pi places them
-    /// after `cloudflare-ai-gateway` and before `xiaomi` (`model-resolver.ts:45-49`).
+    /// would silently re-rank every other provider's claim on the initial model. Pi's
+    /// `defaultModelPerProvider` puts all THREE qwen keys — `qwen-token-plan`,
+    /// `qwen-token-plan-cn`, then `qwen-token-plan-individual` — between `cloudflare-ai-gateway`
+    /// and `xiaomi` (`model-resolver.ts:53-57`).
     #[test]
     fn mirror_qwen_keys_sit_where_pi_puts_them_in_the_scan_order() {
         let pos = |id: &str| KNOWN_PROVIDERS.iter().position(|p| *p == id);
-        let (gateway, qwen, qwen_cn, xiaomi) = (
+        let (gateway, qwen, qwen_cn, qwen_individual, xiaomi) = (
             pos("cloudflare-ai-gateway").unwrap(),
             pos("qwen-token-plan").unwrap(),
             pos("qwen-token-plan-cn").unwrap(),
+            pos("qwen-token-plan-individual").unwrap(),
             pos("xiaomi").unwrap(),
         );
         assert_eq!(qwen, gateway + 1);
         assert_eq!(qwen_cn, qwen + 1);
-        assert_eq!(xiaomi, qwen_cn + 1);
+        assert_eq!(qwen_individual, qwen_cn + 1);
+        assert_eq!(xiaomi, qwen_individual + 1);
 
         // And the consequence: with BOTH an xiaomi and a qwen default available, qwen wins.
         let available = vec![
@@ -2635,7 +3147,8 @@ mod tests {
         );
         // A single `*` segment does NOT match the multi-segment cloudflare id; `**` does.
         assert_eq!(
-            r.resolve_scope(&["cloudflare-workers-ai/*".to_string()]).len(),
+            r.resolve_scope(&["cloudflare-workers-ai/*".to_string()])
+                .len(),
             0
         );
         assert_eq!(
@@ -2829,6 +3342,226 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    /// CFG-019 + CFG-041: `defaultModelPerProvider` must equal pi v0.84.1's 40 entries key for key
+    /// AND in order — `Object.keys(defaultModelPerProvider)` IS the launch scan order at step 4
+    /// (`model-resolver.ts:683-692` @v0.84.1), so a missing or misplaced key changes which model a
+    /// user launches on.
+    ///
+    /// Red at HEAD: 37 entries; `xai` was the retired `grok-4.20-0309-reasoning`; `radius`,
+    /// `baseten` and `qwen-token-plan-individual` were absent entirely.
+    #[test]
+    fn default_model_per_provider_matches_pi_v0_84_1_key_for_key_and_in_order() {
+        // `git show v0.84.1:packages/coding-agent/src/core/model-resolver.ts`, `:20-61`.
+        const PI: &[(&str, &str)] = &[
+            ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
+            ("ant-ling", "Ring-2.6-1T"),
+            ("anthropic", "claude-opus-4-8"),
+            ("openai", "gpt-5.5"),
+            ("azure-openai-responses", "gpt-5.4"),
+            ("openai-codex", "gpt-5.5"),
+            ("radius", "auto"),
+            ("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
+            ("deepseek", "deepseek-v4-pro"),
+            ("google", "gemini-3.1-pro-preview"),
+            ("google-vertex", "gemini-3.1-pro-preview"),
+            ("github-copilot", "gpt-5.4"),
+            ("openrouter", "moonshotai/kimi-k2.6"),
+            ("vercel-ai-gateway", "zai/glm-5.1"),
+            ("xai", "grok-4.5"),
+            ("groq", "openai/gpt-oss-120b"),
+            ("cerebras", "zai-glm-4.7"),
+            ("zai", "glm-5.1"),
+            ("zai-coding-cn", "glm-5.1"),
+            ("mistral", "devstral-medium-latest"),
+            ("minimax", "MiniMax-M2.7"),
+            ("minimax-cn", "MiniMax-M2.7"),
+            ("moonshotai", "kimi-k2.6"),
+            ("moonshotai-cn", "kimi-k2.6"),
+            ("huggingface", "moonshotai/Kimi-K2.6"),
+            ("fireworks", "accounts/fireworks/models/kimi-k2p6"),
+            ("together", "moonshotai/Kimi-K2.6"),
+            ("baseten", "zai-org/GLM-5.2"),
+            ("opencode", "kimi-k2.6"),
+            ("opencode-go", "kimi-k2.6"),
+            ("kimi-coding", "kimi-for-coding"),
+            ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
+            (
+                "cloudflare-ai-gateway",
+                "workers-ai/@cf/moonshotai/kimi-k2.6",
+            ),
+            ("qwen-token-plan", "qwen3.7-max"),
+            ("qwen-token-plan-cn", "qwen3.7-max"),
+            ("qwen-token-plan-individual", "qwen3.8-max"),
+            ("xiaomi", "mimo-v2.5-pro"),
+            ("xiaomi-token-plan-cn", "mimo-v2.5-pro"),
+            ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
+            ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
+        ];
+        let ours: Vec<(&str, &str)> = KNOWN_PROVIDERS
+            .iter()
+            .map(|p| (*p, default_model_per_provider(p).unwrap_or("<missing>")))
+            .collect();
+        assert_eq!(ours, PI.to_vec());
+        assert_eq!(KNOWN_PROVIDERS.len(), 40);
+    }
+
+    /// CFG-023: step 3 accepts the saved default ONLY when its provider has configured auth
+    /// (`if (found && modelRuntime.hasConfiguredAuth(found.provider))`, model-resolver.ts:621-630
+    /// @v0.83.0), otherwise falling through to step 4 (`:632`).
+    ///
+    /// Red at HEAD: step 3 returned the saved default unconditionally, so a user who removed a
+    /// provider's credentials kept launching into it and got an auth error per turn.
+    #[test]
+    fn saved_default_is_skipped_when_its_provider_has_no_configured_auth() {
+        let all = vec![
+            model("anthropic", "claude-opus-4-8", "Claude Opus"),
+            model("openai", "gpt-5.5", "GPT 5.5"),
+        ];
+        let available = vec![model("openai", "gpt-5.5", "GPT 5.5")];
+        let has_auth = |m: &Model| m.provider.as_str() == "openai";
+
+        let r = find_initial_model(
+            None,
+            None,
+            &[],
+            false,
+            Some("anthropic"),
+            Some("claude-opus-4-8"),
+            None,
+            &all,
+            &available,
+            &has_auth,
+        );
+        // Step 4's curated default for the only configured provider, NOT the saved anthropic one.
+        assert_eq!(r.model.as_ref().unwrap().provider.as_str(), "openai");
+
+        // With auth present the saved default still wins.
+        let has_auth_all = |_: &Model| true;
+        let r = find_initial_model(
+            None,
+            None,
+            &[],
+            false,
+            Some("anthropic"),
+            Some("claude-opus-4-8"),
+            None,
+            &all,
+            &available,
+            &has_auth_all,
+        );
+        assert_eq!(r.model.as_ref().unwrap().provider.as_str(), "anthropic");
+    }
+
+    /// CFG-018: the glob branch tries `findExactModelReferenceMatch` BEFORE minimatch
+    /// (`model-resolver.ts:297-303` @v0.83.0), so an id carrying a glob metacharacter resolves to
+    /// itself. CFG-008: the same call now reports pi's `no-match` / `invalid-thinking-level`
+    /// diagnostics (`:316`, `:334`, `:243`).
+    ///
+    /// Red at HEAD: `resolve_scope` went straight to the filter (so `qwen[chat]` matched nothing)
+    /// and returned a bare `Vec`, dropping every diagnostic.
+    #[test]
+    fn glob_scope_short_circuits_on_an_exact_reference_and_reports_diagnostics() {
+        let models = vec![
+            model("qwen", "qwen[chat]", "Qwen Chat"),
+            model("anthropic", "claude-opus-4-8", "Claude Opus"),
+        ];
+        let r = ModelResolver::new(&models);
+
+        let out = r.resolve_scope_reporting(&["qwen/qwen[chat]".to_string()]);
+        assert_eq!(out.models.len(), 1);
+        assert_eq!(out.models[0].model.id.as_str(), "qwen[chat]");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+
+        let out = r.resolve_scope_reporting(&["anthorpic/*".to_string()]);
+        assert!(out.models.is_empty());
+        assert_eq!(out.diagnostics.len(), 1);
+        assert_eq!(out.diagnostics[0].code, ModelScopeDiagnosticCode::NoMatch);
+        assert_eq!(
+            out.diagnostics[0].message,
+            "No models match pattern \"anthorpic/*\""
+        );
+
+        let out = r.resolve_scope_reporting(&["claude-opus-4-8:bogus".to_string()]);
+        assert_eq!(out.models.len(), 1);
+        assert_eq!(
+            out.diagnostics[0].code,
+            ModelScopeDiagnosticCode::InvalidThinkingLevel
+        );
+        assert_eq!(
+            out.diagnostics[0].message,
+            "Invalid thinking level \"bogus\" in pattern \"claude-opus-4-8:bogus\". Using default instead."
+        );
+    }
+
+    /// CFG-046 + CFG-043: pi types `name`/`baseUrl`/`apiKey`/`api` as
+    /// `Type.Optional(Type.String({ minLength: 1 }))` (model-config.ts:188-198 @v0.83.0), so an
+    /// empty string FAILS `validateModelsConfig.Check` and `ModelConfig.load` returns an empty
+    /// provider map plus `Invalid models.json schema:` with one `  - <dotted.path>: <message>` line
+    /// per failure (`:272-279`) — a heading distinct from the JSON-syntax one.
+    ///
+    /// Red at HEAD: no length check anywhere, so `"baseUrl": ""` composed every model of that
+    /// provider onto an empty endpoint while the file was reported as VALID; and a wrong-typed
+    /// field surfaced as serde's byte-offset message under `Failed to parse models.json`.
+    #[test]
+    fn models_json_schema_failures_are_reported_per_field_not_as_a_parse_error() {
+        let dir = crate::test_util::temp_dir();
+
+        let path = dir.join("empty-base-url.json");
+        std::fs::write(&path, r#"{"providers":{"x":{"baseUrl":""}}}"#).unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert!(file.providers.is_empty());
+        let err = err.expect("an empty baseUrl must be a schema failure");
+        assert!(err.starts_with("Invalid models.json schema:"), "{err}");
+        assert!(
+            err.contains("  - providers.x.baseUrl: Expected string length greater or equal to 1"),
+            "{err}"
+        );
+
+        let path = dir.join("wrong-type.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"mycorp":{"models":[{"id":"m","contextWindow":"big"}]}}}"#,
+        )
+        .unwrap();
+        let (_file, err) = load_models_file_reporting(&path);
+        let err = err.expect("a wrong-typed field must be a schema failure");
+        assert!(err.starts_with("Invalid models.json schema:"), "{err}");
+        assert!(
+            err.contains("providers.mycorp.models.0.contextWindow: Expected number"),
+            "{err}"
+        );
+
+        // A JSON SYNTAX error keeps its own distinct heading (model-config.ts:265-270).
+        let path = dir.join("syntax.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let (_file, err) = load_models_file_reporting(&path);
+        assert!(
+            err.unwrap().starts_with("Failed to parse models.json"),
+            "syntax errors must not be relabelled as schema errors"
+        );
+    }
+
+    /// CFG-046, composition half: `definition.contextWindow <= 0` — not `=== 0` —
+    /// (provider-composer.ts:138-143 @v0.83.0), rejecting ONLY that provider block. A custom model
+    /// with an empty inherited `baseUrl` must still hit pi's
+    /// `"baseUrl" is required when defining custom models.`
+    #[test]
+    fn a_non_positive_context_window_rejects_only_its_own_provider_block() {
+        let base = vec![model("anthropic", "claude-opus-4-8", "Claude Opus")];
+        let file: ModelFile = serde_json::from_str(
+            r#"{"providers":{
+                 "mycorp":{"baseUrl":"https://x","api":"openai-completions",
+                           "models":[{"id":"m","contextWindow":-1}]},
+                 "anthropic":{"baseUrl":"https://ok"}}}"#,
+        )
+        .unwrap();
+        let (out, errors) = file.compose(&base);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("invalid contextWindow"), "{errors:?}");
+        // The good block still composed.
+        assert!(out.iter().any(|m| m.base_url == "https://ok"));
+    }
+
     #[test]
     fn malformed_models_json_reports_instead_of_erroring_out() {
         let dir = crate::test_util::temp_dir();
@@ -3014,6 +3747,9 @@ mod tests {
             "an invalid schema empties the file"
         );
         let err = err.expect("and reports why");
-        assert!(err.contains("radius"), "the message names the legal value: {err}");
+        assert!(
+            err.contains("radius"),
+            "the message names the legal value: {err}"
+        );
     }
 }

@@ -132,6 +132,9 @@ pub enum SessionCommand {
     SetThinkingLevel { level: ModelThinkingLevel },
     /// Cycle to the next thinking level.
     CycleThinkingLevel,
+    /// The thinking levels the ACTIVE model supports (`rpc-types.ts:39`, handler
+    /// `rpc-mode.ts:507-510`, response `{levels}` at `rpc-types.ts:158-164`). SEAM-014.
+    GetAvailableThinkingLevels,
 
     // ---- Queue modes ----
     /// Set the steering drain mode.
@@ -391,7 +394,7 @@ fn notify_kind_str(kind: NotifyKind) -> &'static str {
 /// mode never forwards THOSE three over the wire either ("not supported in RPC mode - requires TUI
 /// access" / "no TUI", rpc-mode.ts:209-215,296-298); [`run_rpc`]'s effect-drain arm below only writes
 /// out when this returns `Some`.
-fn extension_ui_effect_json(effect: &UiEffect) -> Option<Value> {
+pub(crate) fn extension_ui_effect_json(effect: &UiEffect) -> Option<Value> {
     Some(match effect {
         // Pi `notify(message, type)` → `{method:"notify", message, notifyType}` (rpc-mode.ts:149-157).
         UiEffect::Notify { message, kind } => json!({
@@ -581,6 +584,15 @@ where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
+    // SEAM-033 — pi's RPC host announces the session ITSELF, from `rpc-mode.ts:319`, not from
+    // `createAgentSessionRuntime` (which never emits `session_start`,
+    // `agent-session-runtime.ts:414-432`). The distinction is load-bearing: `main.ts` applies
+    // `--name` (`:650`) and the scoped `--models` (`:742-750`) BETWEEN building the session and
+    // running the mode, so announcing at construction time showed every `session_start` handler a
+    // session with no display name and the pre-scope model. Idempotent per session
+    // (`AgentSession::emit_session_start` latches), so a host that already announced is unaffected.
+    runtime.session().await.bind_extensions().await;
+
     let (out, out_rx) = mpsc::unbounded_channel::<RpcOut>();
     let mut pump = std::pin::pin!(write_pump(writer, out_rx));
     // Set only when the pump finished FIRST, which can only mean a write error (it otherwise runs
@@ -1159,6 +1171,15 @@ async fn handle(
                 Err(e) => RpcResponse::err("cycle_thinking_level", id, e.to_string()),
             }
         }
+        // Pi `rpc-mode.ts:507-510` @v0.83.0:
+        //   `const levels = session.getAvailableThinkingLevels();`
+        //   `return success(id, "get_available_thinking_levels", { levels });`
+        // Infallible upstream and here — the backing accessor is synchronous and always answers.
+        SessionCommand::GetAvailableThinkingLevels => RpcResponse::ok(
+            "get_available_thinking_levels",
+            raw_id.clone(),
+            Some(json!({ "levels": session.available_thinking_levels() })),
+        ),
 
         // ------------------------------------------------------------ Queue modes ----
         SessionCommand::SetSteeringMode { mode } => {
@@ -1413,8 +1434,8 @@ async fn state_view(session: &AgentSession) -> Value {
     // the FULL auth-filtered registry so a model owned by a non-active provider still carries its
     // real metadata; only a genuinely unknown model degrades to a minimal `{provider, id}`.
     // `RpcSessionState.model` is `Model | undefined` (rpc-types.ts:95) because
-    // `AgentSession.model` is (agent-session.ts:866-868), so a modelless session reports
-    // `"model": null` rather than a synthesized address.
+    // `AgentSession.model` is (agent-session.ts:866-868), so a modelless session OMITS the key
+    // rather than reporting a synthesized address (see the insertion note below).
     let model = model_ref.map(|model_ref| {
         session
             .available_model_catalog()
@@ -1426,20 +1447,54 @@ async fn state_view(session: &AgentSession) -> Value {
                 "id": model_ref.model.as_str(),
             }))
     });
-    json!({
-        "model": model,
-        "thinkingLevel": session.thinking_level().await,
-        "isStreaming": session.is_streaming().await,
-        "isCompacting": session.is_compacting(),
-        "steeringMode": queue_mode_str(session.steering_mode()),
-        "followUpMode": queue_mode_str(session.follow_up_mode()),
-        "sessionFile": session.session_file().await.map(|p| p.display().to_string()),
-        "sessionId": session.session_id().as_str(),
-        "sessionName": session.session_name().await,
-        "autoCompactionEnabled": session.auto_compaction_enabled(),
-        "messageCount": session.messages().await.len(),
-        "pendingMessageCount": session.pending_message_count(),
-    })
+    // SEAM-053 — the three OPTIONAL members (`model?`, `sessionFile?`, `sessionName?`,
+    // rpc-types.ts:95/102/104) are built by insertion rather than by `json!`, because pi builds the
+    // object as a TS literal and `JSON.stringify` DROPS an `undefined` property: pi's line for an
+    // unnamed ephemeral session contains neither key, where a `json!` `None` emits an explicit
+    // `null`. A client using `"sessionName" in state` — the natural idiom for an optional property —
+    // took the wrong branch against cyrup. The required members keep their `null`-free types and are
+    // always present, exactly as upstream.
+    let mut state = serde_json::Map::new();
+    if let Some(model) = model {
+        state.insert("model".to_string(), model);
+    }
+    state.insert(
+        "thinkingLevel".to_string(),
+        json!(session.thinking_level().await),
+    );
+    state.insert("isStreaming".to_string(), json!(session.is_streaming().await));
+    state.insert("isCompacting".to_string(), json!(session.is_compacting()));
+    state.insert(
+        "steeringMode".to_string(),
+        json!(queue_mode_str(session.steering_mode())),
+    );
+    state.insert(
+        "followUpMode".to_string(),
+        json!(queue_mode_str(session.follow_up_mode())),
+    );
+    if let Some(file) = session.session_file().await {
+        state.insert("sessionFile".to_string(), json!(file.display().to_string()));
+    }
+    state.insert(
+        "sessionId".to_string(),
+        json!(session.session_id().as_str()),
+    );
+    if let Some(name) = session.session_name().await {
+        state.insert("sessionName".to_string(), json!(name));
+    }
+    state.insert(
+        "autoCompactionEnabled".to_string(),
+        json!(session.auto_compaction_enabled()),
+    );
+    state.insert(
+        "messageCount".to_string(),
+        json!(session.messages().await.len()),
+    );
+    state.insert(
+        "pendingMessageCount".to_string(),
+        json!(session.pending_message_count()),
+    );
+    Value::Object(state)
 }
 
 /// Serialize one protocol record and write it as a single LF-terminated line, flushed immediately so
@@ -1447,13 +1502,28 @@ async fn state_view(session: &AgentSession) -> Value {
 async fn write_out<W: AsyncWrite + Unpin>(writer: &mut W, out: &RpcOut) -> Result<(), ModesError> {
     let mut line = serde_json::to_string(out)?;
     line.push('\n');
+    // TOOL-037 note — pi's RPC writer is `writeRawStdout` (`rpc-mode.ts:60`), whose retry loop
+    // (`core/output-guard.ts:36-41`) covers `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS`. This sink is a tokio
+    // `AsyncWrite`, not a `std::io::Write`: the executor's own readiness machinery IS that loop —
+    // a would-block registers a waker and re-polls instead of surfacing the error — so
+    // `crate::raw_stdout`'s explicit sleep-and-retry is the SYNC-sink half only and would be a
+    // second, worse implementation here. `ENOBUFS` likewise reaches the caller as a genuine error
+    // on both sides.
     writer.write_all(line.as_bytes()).await?;
     writer.flush().await?;
     Ok(())
 }
 
-/// Read strict-LF JSONL lines from `reader` and forward each non-empty record over `tx`. Splits on
+/// Read strict-LF JSONL lines from `reader` and forward **every** record over `tx`. Splits on
 /// `\n` only; a trailing `\r` is stripped (CRLF tolerance). Ends at EOF or when the receiver drops.
+///
+/// SEAM-054 — an EMPTY line is forwarded like any other, because pi forwards it: `emitLine` is
+/// invoked for every newline-delimited slice with no emptiness filter (`modes/rpc/jsonl.ts:25-41`
+/// @v0.84.1, the emit at `:38`), it reaches `handleInputLine` (`rpc-mode.ts:748-762`), `JSON.parse("")`
+/// throws, and pi answers `error(undefined, "parse", "Failed to parse command: …")` on stdout
+/// (`:752-758`). Dropping it here made cyrup silent for an input class pi replies to, so any client
+/// correlating n-lines-in to n-responses-out desynchronised. [`dispatch`]'s existing
+/// `serde_json::from_str` failure arm produces pi's exact response with no id.
 async fn read_lines<R: AsyncBufRead + Unpin>(mut reader: R, tx: mpsc::Sender<String>) {
     let mut buf = Vec::new();
     loop {
@@ -1466,9 +1536,6 @@ async fn read_lines<R: AsyncBufRead + Unpin>(mut reader: R, tx: mpsc::Sender<Str
                 }
                 if buf.last() == Some(&b'\r') {
                     buf.pop();
-                }
-                if buf.is_empty() {
-                    continue;
                 }
                 let line = String::from_utf8_lossy(&buf).into_owned();
                 if tx.send(line).await.is_err() {

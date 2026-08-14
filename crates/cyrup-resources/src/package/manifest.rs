@@ -355,13 +355,17 @@ pub(crate) fn resolve_local_entries(
         if is_pattern(entry) {
             patterns.push(entry.clone());
         } else {
-            // `resolvePathFromBase` with `trim: true`: a trimmed, base-relative (or absolute) path.
-            let trimmed = entry.trim();
-            let p = PathBuf::from(trimmed);
+            // `resolvePathFromBase` with `trim: true` (package-manager.ts:2069-2071 @v0.83.0): the
+            // entry goes through `normalizePath` FIRST — tilde and `file://` — and only the
+            // normalized string is tested for absoluteness (`resolvePath`, paths.ts:81-85). Doing
+            // the `is_absolute` test on the raw entry turned `~/team-skills` into
+            // `<base>/~/team-skills`, which silently loads nothing (CFG-025).
+            let normalized = cyrup_config::paths::normalize_path(entry.trim());
+            let p = PathBuf::from(&normalized);
             plain.push(if p.is_absolute() {
                 p
             } else {
-                base.join(trimmed)
+                base.join(&normalized)
             });
         }
     }

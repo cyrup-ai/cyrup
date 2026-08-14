@@ -24,6 +24,16 @@
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// pi's `writeRawStdout`/`flushRawStdout` (`core/output-guard.ts:85-108` @v0.84.1) — the OTHER half
+/// of this module upstream, and the one that carries the `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS` retry
+/// loop (`:20-43`). TOOL-037.
+///
+/// It lives in `cyrup-modes` rather than here, and the direction of the dependency is why: the
+/// consumers are the protocol writers (`json.rs`, `print.rs`), and `cyrup` depends on
+/// `cyrup-modes`, not the reverse. Re-exported so this module still names pi's full surface and a
+/// reader looking for `writeRawStdout` in the file that ports `output-guard.ts` finds it.
+pub use cyrup_modes::{flush_raw_stdout, write_raw_stdout, RAW_STDOUT_RETRY_DELAY_MS};
+
 /// Process-global takeover state — the analog of Pi's module-level `stdoutTakeoverState`
 /// (output-guard.ts:7). `false` (not taken over) until `main` installs the guard for a
 /// non-interactive run, mirroring Pi's default.

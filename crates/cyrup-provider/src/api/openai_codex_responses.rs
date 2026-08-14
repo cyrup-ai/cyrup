@@ -54,7 +54,7 @@
 use crate::HeaderMap;
 use crate::api::compat::{clamp_openai_prompt_cache_key, level_map_lookup, thinking_level_key};
 use crate::api::openai_responses::{
-    convert_responses_messages, convert_responses_tools, decode_stream,
+    ConvertResponsesToolsOptions, convert_responses_messages, convert_responses_tools, decode_stream,
 };
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;
@@ -329,11 +329,29 @@ impl ApiImpl for CodexResponsesApi {
         };
 
         // Honor HTTP(S)_PROXY for the live client (pi `resolveHttpProxyUrlForTarget`).
+        //
+        // PROV-051, second half. `None` — NOT `opts.timeout_ms` — is what makes this client pi's.
+        // Codex is the one api that does not hand `timeoutMs` to an SDK client: it calls raw
+        // `fetch` with `AbortSignal.timeout(httpTimeoutMs)` merged in for the HEADER phase only
+        // (`openai-codex-responses.ts:401-410` @v0.83.0), and `combinedSignal.cleanup()` in the
+        // `finally` at `:417` retires that deadline the instant headers arrive. The body is then
+        // bounded solely by the process-global undici dispatcher
+        // (`bodyTimeout`/`headersTimeout` = `DEFAULT_HTTP_IDLE_TIMEOUT_MS`, 300_000,
+        // `coding-agent/src/core/http-dispatcher.ts:4,86-88`), whose cyrup analogue is
+        // [`crate::stream::sse::configure_http_idle_timeout`] — reached by passing `None` here.
+        // (Contrast `openai-responses.ts:146`, which really does pass
+        // `timeout: options.timeoutMs` to its SDK client; that api keeps forwarding it.)
+        //
+        // Feeding `opts.timeout_ms` in as the client's `read_timeout` broke both halves: it capped
+        // the BODY at a value pi had already stopped applying, and — because reqwest's read
+        // deadline covers the header read too — it raced the header deadline below at the very same
+        // duration and usually won, so a stalled endpoint terminated with
+        // `transport error: … operation timed out` instead of pi's attributable message.
         let client = match build_client_for_target(
             &req.url,
             &crate::auth::types::EnvAuthContext,
             auth.env.as_ref(),
-            opts.timeout_ms,
+            None,
         )
         .await
         {
@@ -373,7 +391,23 @@ impl ApiImpl for CodexResponsesApi {
                     }
                 });
 
-            let attempted = open_sse(
+            // PROV-051 — pi's HEADER-phase deadline (`openai-codex-responses.ts:401-419`
+            // @v0.83.0): `AbortSignal.timeout(httpTimeoutMs)` merged with the caller's signal via
+            // `combineAbortSignals`, with `combinedSignal.cleanup()` in a `finally` so the deadline
+            // stops applying the moment headers arrive. cyrup fed `opts.timeout_ms` to the client
+            // as a whole-stream `read_timeout` instead, which both bounded the body by a number pi
+            // had stopped applying and lost the dedicated message.
+            //
+            // CYRUP-DELTA: `combineAbortSignals` itself (`utils/abort-signals.ts:6-41`) is NOT
+            // ported — its only consumer at either tag is this call site, and `CancelToken` +
+            // `tokio::time::timeout` covers it. The client's `read_timeout` stays for the body
+            // phase, the analogue of pi's global undici `bodyTimeout`/`headersTimeout`
+            // (`core/http-dispatcher.ts:87-88`).
+            let header_timeout_ms = opts.timeout_ms.filter(|n| *n > 0);
+            // Set only when the header phase actually elapsed, so the terminal carries pi's exact
+            // wording rather than a `Display`-decorated transport error.
+            let mut header_timeout_message: Option<String> = None;
+            let open = open_sse(
                 &client,
                 req.clone(),
                 cancel.clone(),
@@ -382,8 +416,25 @@ impl ApiImpl for CodexResponsesApi {
                 // The ladder below IS pi's retry policy for this api; the shared provider-retry
                 // ladder must not also fire.
                 ProviderRetry::NONE,
-            )
-            .await;
+            );
+            let attempted = match header_timeout_ms {
+                Some(ms) => {
+                    match tokio::time::timeout(std::time::Duration::from_millis(ms), open).await {
+                        Ok(result) => result,
+                        // `if (headerTimeoutSignal?.aborted && !options?.signal?.aborted) throw new
+                        // Error(...)` (:412-413) — the caller's own cancellation is reported as an
+                        // abort, not as a timeout.
+                        Err(_) if cancel.is_cancelled() => Err(ProviderError::Aborted),
+                        Err(_) => {
+                            let message =
+                                format!("Codex SSE response headers timed out after {ms}ms");
+                            header_timeout_message = Some(message.clone());
+                            Err(ProviderError::Transport(message.into()))
+                        }
+                    }
+                }
+                None => open.await,
+            };
 
             // pi fires `options?.onResponse?.(...)` on EVERY attempt that produced a response head
             // (:419-422), not only the last one.
@@ -432,11 +483,15 @@ impl ApiImpl for CodexResponsesApi {
 
             // Everything else reaches pi's `catch` (:447-465): the error text is the friendly
             // usage-limit message when the body parses as one, else the raw provider text.
-            let text = match &failure {
-                ProviderError::Http { status, message } => {
+            let text = match (&failure, &header_timeout_message) {
+                // pi throws a bare `Error` with this exact message (:412-413) and its catch runs
+                // it through `formatProviderError(normalizeProviderError(error))`, which returns
+                // `error.message` unchanged — so the terminal text is byte-identical to pi's.
+                (_, Some(message)) => message.clone(),
+                (ProviderError::Http { status, message }, _) => {
                     parse_error_response(*status, message, now_millis())
                 }
-                other => other.to_string(),
+                (other, _) => other.to_string(),
             };
             // pi retries network AND already-formatted errors alike, refusing only a
             // retry-delay-exceeded failure and anything mentioning a usage limit (:455-462).
@@ -664,11 +719,24 @@ pub fn build_request_body(
         messages: ctx.messages.clone(),
         tools: ctx.tools.clone(),
     };
+    // Codex's own tool options (openai-codex-responses.ts:539-540, `:575-579` @v0.83.0):
+    // `supportsStrictMode ?? true` (NOT openai-responses' `?? false`), and `strict: null` as the
+    // default — a JSON `null` on the wire, not an absent key.
+    let tool_options = ConvertResponsesToolsOptions {
+        defer_loading: false,
+        supports_strict_mode: model
+            .compat
+            .as_ref()
+            .and_then(|c| c.supports_strict_mode)
+            .unwrap_or(true),
+        default_strict: None,
+    };
     let messages = convert_responses_messages(
         model,
         &body_ctx,
         CODEX_TOOL_CALL_PROVIDERS,
         &placement.deferred,
+        tool_options,
     );
 
     let mut obj = Map::new();
@@ -713,7 +781,7 @@ pub fn build_request_body(
     if !placement.immediate.is_empty() {
         obj.insert(
             "tools".to_string(),
-            Value::Array(convert_responses_tools(&placement.immediate, false)),
+            Value::Array(convert_responses_tools(&placement.immediate, tool_options)),
         );
     }
 
@@ -2098,6 +2166,76 @@ mod tests {
         assert!(
             text.contains("Invalid Codex SSE JSON"),
             "expected pi's CodexProtocolError text, got {text}"
+        );
+    }
+
+    /// PROV-051. A Codex endpoint that accepts the TCP connection and never writes a byte must
+    /// terminate with pi's exact header-phase message (`openai-codex-responses.ts:412-413`
+    /// @v0.83.0), not with an unattributable transport error. Red before the fix: `opts.timeout_ms`
+    /// only became a reqwest `read_timeout`, so the terminal was
+    /// `transport error: … operation timed out` with no mention of the configured value.
+    #[tokio::test]
+    async fn a_stalled_header_phase_names_the_timeout_and_its_value() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold the connection open, writing nothing.
+        let held = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                sockets.push(sock);
+            }
+        });
+
+        let mut model = codex_model("gpt-5-codex");
+        model.base_url = format!("http://{addr}");
+        let (sink, mut rx) = channel(64);
+        // The key MUST be a real Codex JWT carrying the namespaced account claim: pi runs
+        // `const accountId = extractAccountId(apiKey)` at `openai-codex-responses.ts:276` @v0.83.0,
+        // BEFORE the request is built, and it throws on anything else. A bare `sk-test` therefore
+        // terminates with "Failed to extract accountId from token" and the header phase is never
+        // reached — the request under test never leaves the process.
+        let token = fake_jwt(&json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct_timeout" },
+        }));
+        let opts = StreamOptions {
+            api_key: Some(token.clone()),
+            timeout_ms: Some(200),
+            // One attempt, so the assertion is on the FIRST failure's text.
+            max_retries: Some(0),
+            ..Default::default()
+        };
+        let task = tokio::spawn(async move {
+            CodexResponsesApi::new()
+                .run(
+                    &model,
+                    &Context {
+                        system_prompt: None,
+                        messages: vec![cyrup_core::Message::User {
+                            content: vec![cyrup_core::Content::text("hi")],
+                            timestamp: 0,
+                        }],
+                        tools: Vec::new(),
+                    },
+                    &AuthResult::from_key(&token, "test"),
+                    &opts,
+                    CancelToken::new(),
+                    sink,
+                )
+                .await;
+        });
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        let _ = task.await;
+        held.abort();
+
+        let Some(StreamEvent::Error { error, .. }) = events.last() else {
+            panic!("expected an error terminal, got {events:?}");
+        };
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("Codex SSE response headers timed out after 200ms")
         );
     }
 }

@@ -16,6 +16,7 @@ use cyrup_config::{
     ExtensionTrust, InMemorySettingsStore,
     ModelResolver, Settings, SettingsManager, SettingsStore, TrustInputs, TrustOutcome,
 };
+use cyrup_config::trust::{trust_options, TrustEntry, TrustOption, TrustStore};
 use cyrup_ext::{EventKind, ExtMode, ExtensionHost, HostConfig, HostEvent, NativeExtension};
 use cyrup_provider::{Model, Provider};
 use cyrup_resources::{
@@ -166,7 +167,17 @@ pub struct SessionConfig {
     pub custom_tools: Vec<Arc<dyn cyrup_core::Tool>>,
     /// Opt-in permission policy gate (empty ⇒ YOLO default, R-12-001).
     pub permission_policy: PermissionPolicy,
-    /// Wrap the fs backend in [`ProtectedFs`] (blocks writes to `.env`/`.git`/… R-12-006).
+    /// [CYRUP-DELTA] Wrap the **fs** backend in [`ProtectedFs`], refusing `write`/`edit` to
+    /// `.env`, `.git/` and `node_modules/` (R-12-006). **Off by default** and embedder-only: there
+    /// is deliberately no CLI flag and no `settings.json` key, because pi has no protected-path
+    /// concept at all — `pi/packages/coding-agent/src/core/tools/write.ts:195-225` @v0.83.0
+    /// resolves the path and calls `ops.writeFile` with no path predicate (ADR-0003 D5/D6).
+    ///
+    /// Scope is the **fs seam only**: the process seam is passed through undecorated (see the
+    /// `Backend { fs, proc: base.proc.clone() }` construction below), so `bash 'echo x >> .env'`
+    /// is NOT covered by this flag even when it is on. That is intentional — deciding from command
+    /// text alone whether an arbitrary shell command mutates a protected path has no correct
+    /// solution — and it is why the default is `false`.
     pub protect_paths: bool,
     /// Wrap the fs backend in [`TraversalFs`] confined to `cwd` (R-03-006).
     pub confine_to_cwd: bool,
@@ -222,7 +233,10 @@ impl SessionConfig {
             exclude_tools: Vec::new(),
             custom_tools: Vec::new(),
             permission_policy: PermissionPolicy::new(),
-            protect_paths: true,
+            // ADR-0003 D5: pi has no protected-path concept (`write.ts:195-225` @v0.83.0 writes
+            // whatever path it is given), and `bash` bypassed the guard anyway, so on-by-default
+            // bought nothing and cost a failed turn. Inert embedder-only opt-in now.
+            protect_paths: false,
             confine_to_cwd: false,
             extension_flag_values: Vec::new(),
         }
@@ -351,7 +365,34 @@ pub struct SessionBuilder {
     /// `DefaultResourceLoader.agentsFilesOverride`, resource-loader.ts:155,474). Runs over the loaded
     /// [`ContextFile`]s before the system prompt reads them. `None` ⇒ the loaded set is used verbatim.
     context_files_override: Option<ContextFilesOverrideFn>,
+    /// The project-trust store (`<agent_dir>/trust.json`). Pi's `resolveProjectTrusted` reads it as
+    /// tier 4 — AFTER the extension `project_trust` verdict (`project-trust.ts:72-75` vs `:54-70`) —
+    /// and writes to it both when an extension answers with `remember: true` (`:64-66`) and when the
+    /// prompt's chosen option carries updates (`:40-44`, `:92-93`). `None` ⇒ no saved decisions are
+    /// visible and nothing is persisted (embedders/tests). SEAM-065.
+    trust_store: Option<Arc<TrustStore>>,
+    /// The interactive project-trust prompt (pi `selectProjectTrustOption` → `ctx.ui.select`,
+    /// `project-trust.ts:28-44`, `:90-94`). Invoked **only** when the tiered decision comes back
+    /// [`TrustOutcome::NeedsPrompt`], i.e. after `pre_trust_extension_verdict` and the store —
+    /// which is the ordering SEAM-065 exists to restore. `None` ⇒ no UI (pi's `hasUI` false branch,
+    /// `:86-88`), so the run proceeds untrusted.
+    trust_prompt: Option<TrustPromptFn>,
 }
+
+/// The interactive project-trust prompt seam (pi `selectProjectTrustOption`,
+/// `packages/coding-agent/src/core/project-trust.ts:28-44` @v0.83.0).
+///
+/// The builder supplies the option set pi builds — `getProjectTrustOptions(cwd, {
+/// includeSessionOnly: true })` (`:32`) — plus the nearest saved decision for the header line, and
+/// the callback returns the resolved trust flag (`Some(true)`/`Some(false)`) or `None` for a
+/// cancelled prompt (pi's `ui.select → undefined`, which falls through to `return false` at `:95`).
+///
+/// Persisting the chosen option's `updates` is the callback's job, because it is pi's:
+/// `saveProjectTrustPromptResult(trustStore, result)` runs inside `selectProjectTrustOption`
+/// (`:39`) under the `updates.length > 0` guard (`:40-44`) that makes the two "(this session only)"
+/// rows write nothing.
+pub type TrustPromptFn =
+    Arc<dyn Fn(&[TrustOption], &Option<TrustEntry>) -> Option<bool> + Send + Sync>;
 
 impl SessionBuilder {
     /// Start a builder over the resolved `provider` and a `config`.
@@ -369,7 +410,25 @@ impl SessionBuilder {
             key_resolver: None,
             skills_override: None,
             context_files_override: None,
+            trust_store: None,
+            trust_prompt: None,
         }
+    }
+
+    /// Wire the project-trust store so the saved-decision tier and the `remember` persist can run
+    /// inside the build, where pi runs them (`project-trust.ts:64-66`, `:72-75`). SEAM-065.
+    #[must_use]
+    pub fn trust_store(mut self, store: Arc<TrustStore>) -> Self {
+        self.trust_store = Some(store);
+        self
+    }
+
+    /// Wire the interactive project-trust prompt (pi `ctx.ui.select`, `project-trust.ts:90-94`).
+    /// See [`TrustPromptFn`]. SEAM-065.
+    #[must_use]
+    pub fn trust_prompt(mut self, prompt: TrustPromptFn) -> Self {
+        self.trust_prompt = Some(prompt);
+        self
     }
 
     /// Wire the provider resolver seam (the bin's `select_provider`) so a `/model` selection that
@@ -515,30 +574,67 @@ impl SessionBuilder {
         } else {
             None
         };
+        // SEAM-065 — the saved-decision tier is read HERE, not by the caller, because pi reads it
+        // at `project-trust.ts:72-75`, i.e. strictly AFTER `emitProjectTrustEvent` (`:54-70`).
+        let saved = self
+            .trust_store
+            .as_ref()
+            .and_then(|store| store.nearest(&cwd).ok().flatten());
         if let Some(d) = &ext_trust
             && d.remember
         {
-            // Pi persists via `trustStore.set` (project-trust.ts:46-95). The builder has no
-            // `TrustStore` wired (it also passes `saved: None`), so say so rather than pretending
-            // the decision was remembered.
-            tracing::warn!(
-                extension = %d.by, trusted = d.trusted,
-                "extension project_trust asked to `remember` the decision, but no trust store is \
-                 wired into the session builder — the verdict applies to this session only"
-            );
+            // Pi persists the extension's verdict itself when it asked to be remembered:
+            // `if (result.remember) { trustStore.set(cwd, trusted); }` (project-trust.ts:64-66).
+            match self.trust_store.as_ref() {
+                Some(store) => {
+                    let decision = if d.trusted {
+                        cyrup_config::TrustDecision::Trusted
+                    } else {
+                        cyrup_config::TrustDecision::Untrusted
+                    };
+                    if let Err(e) = store.set(&cwd, Some(decision)) {
+                        tracing::warn!(error = %e, "persisting extension project_trust verdict");
+                    }
+                }
+                None => tracing::warn!(
+                    extension = %d.by, trusted = d.trusted,
+                    "extension project_trust asked to `remember` the decision, but no trust store \
+                     is wired into the session builder — the verdict applies to this session only"
+                ),
+            }
         }
+        let inputs = TrustInputs {
+            has_resources,
+            trust_override: cfg.trust_override,
+            saved: saved.as_ref().map(|e| e.decision),
+            default_trust,
+            mode: cfg.app_mode,
+            prompt_choice: None,
+        };
         let outcome = decide_trust_with_extension(
-            TrustInputs {
-                has_resources,
-                trust_override: cfg.trust_override,
-                saved: None,
-                default_trust,
-                mode: cfg.app_mode,
-                prompt_choice: None,
-            },
+            inputs,
             ext_trust.map(|d| ExtensionTrust { trusted: d.trusted, remember: d.remember }),
         );
-        let trusted = matches!(outcome, TrustOutcome::Trusted);
+        let trusted = match outcome {
+            TrustOutcome::Trusted => true,
+            TrustOutcome::Untrusted => false,
+            // Pi reaches its prompt LAST — `if (!hasUI) return false;` then
+            // `selectProjectTrustOption(...)` (project-trust.ts:86-94). Both the `hasUI` gate and
+            // the mode gate are already folded in: `decide_trust` only yields `NeedsPrompt` for an
+            // interactive mode (`cyrup-config/src/trust.rs:294-299`), and a host with no terminal
+            // wires no callback, which is pi's `hasUI === false` — proceed untrusted.
+            TrustOutcome::NeedsPrompt => match self.trust_prompt.as_ref() {
+                Some(prompt) => {
+                    // `includeSessionOnly: true` — pi's PRE-LAUNCH prompt is the one call site that
+                    // asks for the two ephemeral rows (project-trust.ts:32). SEAM-064. pi's IN-APP
+                    // selector is the other call site and genuinely passes the default `false`
+                    // (trust-selector.ts:44) — do not "fix" that one to match.
+                    let options = trust_options(&cwd, true);
+                    prompt(&options, &saved).unwrap_or(false)
+                }
+                None => false,
+            },
+        };
         settings.set_project_trusted(trusted);
 
         // ---- 2. auth (cyrup-config) ------------------------------------------------------------
@@ -1088,17 +1184,77 @@ impl SessionBuilder {
         }
         let snapshot = context_store.snapshot();
 
+        // The extension-shaped active tool set (Pi `pi.getActiveTools()` after the extension
+        // `active_tools` merge): base build-time selection PLUS any extension additions/overrides
+        // (e.g. a native extension that overrides a built-in `bash`).
+        //
+        // EXT-038 — this used to be computed AFTER the prompt was built, so the prompt was derived
+        // from `base_tools` alone. Upstream builds `_toolPromptSnippets` / `_toolPromptGuidelines`
+        // from `definitionRegistry`, which is the base definitions with `allCustomTools` (the
+        // extension-contributed ones) merged over them (`agent-session.ts:2471-2504` @v0.83.0) —
+        // so an extension tool's `promptSnippet`/`promptGuidelines` DO reach the system prompt, and
+        // an extension OVERRIDE of a built-in contributes the override's text, not the built-in's.
+        // In cyrup neither happened: a guest could register a fully-described tool and the model
+        // was never told it existed.
+        let active_tools = ext_host.active_tools(&base_tools)?;
+
+        // pi's `definitionRegistry`: base first, then each custom/extension tool `set` over it by
+        // NAME — so an override replaces the built-in's entry rather than adding a second one, and
+        // the base order is preserved for everything not overridden (`:2471-2487`).
+        let prompt_tools: Vec<Arc<dyn cyrup_core::Tool>> = {
+            let mut order: Vec<Arc<dyn cyrup_core::Tool>> = base_tools.clone();
+            for t in active_tools.iter() {
+                match order.iter().position(|b| b.name() == t.name()) {
+                    Some(i) => order[i] = t.clone(),
+                    None => order.push(t.clone()),
+                }
+            }
+            order
+        };
         let selected_tools: Vec<Arc<str>> =
-            base_tools.iter().map(|t| Arc::from(t.name())).collect();
+            prompt_tools.iter().map(|t| Arc::from(t.name())).collect();
         let tool_contributions: Vec<ToolPromptContribution> =
-            base_tools.iter().map(tool_contribution).collect();
+            prompt_tools.iter().map(tool_contribution).collect();
+
+        // CFG-035 — `SYSTEM.md` / `APPEND_SYSTEM.md` discovery. Pi's `load()` resolves
+        // `this.systemPromptSource ?? this.discoverSystemPromptFile()` and, for the append leg,
+        // uses the CLI sources when present and otherwise the SINGLE discovered file
+        // (`resource-loader.ts:525,531-535` @v0.83.0). Both discoverers are the same two rungs
+        // (`:1022-1032`, `:1034-1044`): the project file under the trust gate, then the global one.
+        //
+        // Neither file was read at all before this: `.cyrup/SYSTEM.md` and `.cyrup/APPEND_SYSTEM.md`
+        // were only TRUST-GATE MARKERS (`cyrup-config/src/trust.rs:208-209`), so cyrup asked the
+        // user to trust a project because of a file it then never opened.
+        let discovered_system_prompt = cfg
+            .system_prompt
+            .is_none()
+            .then(|| discover_prompt_file(&cwd, &cfg.agent_dir, trusted, "SYSTEM.md"))
+            .flatten()
+            .and_then(|p| read_discovered_prompt(&p, "system prompt"));
+        // pi REPLACES rather than accumulates: `let appendSources = this.appendSystemPromptSource;
+        // if (!appendSources) { …discovered… }` (`:531-535`) — a CLI `--append-system-prompt` means
+        // the discovered file is not consulted, and discovery itself yields exactly ONE path.
+        let discovered_append = cfg
+            .append_system_prompt
+            .is_none()
+            .then(|| discover_prompt_file(&cwd, &cfg.agent_dir, trusted, "APPEND_SYSTEM.md"))
+            .flatten()
+            .and_then(|p| read_discovered_prompt(&p, "append system prompt"));
 
         let prompt_inputs = PromptInputs {
-            custom_prompt: cfg.system_prompt.clone().map(Arc::from),
-            selected_tools,
+            custom_prompt: cfg
+                .system_prompt
+                .clone()
+                .or(discovered_system_prompt)
+                .map(Arc::from),
+            selected_tools: Some(selected_tools),
             tool_contributions,
             prompt_guidelines: Vec::new(),
-            append_system_prompt: cfg.append_system_prompt.clone().map(Arc::from),
+            append_system_prompt: cfg
+                .append_system_prompt
+                .clone()
+                .or(discovered_append)
+                .map(Arc::from),
             cwd: cwd.clone(),
             context_files: snapshot.context_files.clone(),
             skills: snapshot.skills.clone(),
@@ -1106,12 +1262,6 @@ impl SessionBuilder {
             today: today(),
         };
         let system_prompt = SystemPromptBuilder::new().build(&prompt_inputs);
-
-        // The extension-shaped active tool set (Pi `pi.getActiveTools()` after extension `active_tools`
-        // merge): base build-time selection PLUS any extension additions/overrides (e.g. a native
-        // extension that overrides a built-in `bash`). Computed here (moved ahead of the registry) so
-        // the dynamic registry below can include these overrides — see the extend below.
-        let active_tools = ext_host.active_tools(&base_tools)?;
 
         // The dynamic-tool registry (Pi `_toolRegistry`): every Availability-visible tool, the caller's
         // custom tools, AND the extension-contributed/override tools are enable-able; the active set
@@ -1136,7 +1286,7 @@ impl SessionBuilder {
         // The rebuilder base = the prompt inputs with the per-run tool fields cleared (re-derived
         // from the active set on each `setActiveToolsByName`).
         let mut rebuild_base = prompt_inputs.clone();
-        rebuild_base.selected_tools = Vec::new();
+        rebuild_base.selected_tools = Some(Vec::new());
         rebuild_base.tool_contributions = Vec::new();
         // Shared with `host_services` so a loaded guest's `setActiveTools`/`getActiveTools`
         // capability read+mutates the SAME authoritative active-tool view the host/CLI toggle uses
@@ -1297,6 +1447,23 @@ impl SessionBuilder {
             if retry.max_retry_delay_ms >= 0 {
                 agent_builder = agent_builder.max_retry_delay_ms(retry.max_retry_delay_ms as u64);
             }
+        }
+
+        // CFG-006 / AGENT-031 — `websocketConnectTimeoutMs`. pi's `streamFn` resolves it as
+        // `options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs()`
+        // (`core/sdk.ts:310-311` @v0.83.0) and spreads it onto every `streamSimple` call.
+        //
+        // Both halves existed and neither was connected: `Settings::websocket_connect_timeout_ms`
+        // parsed and validated the key, `AgentBuilder::websocket_connect_timeout_ms` threaded it to
+        // `StreamOptions` (`cyrup-provider/src/stream.rs:201`) — and NOTHING assigned it, so a user
+        // who set the key got no error and no effect. Deliberately NOT applied in the retry block
+        // above: it is a separate pi rung with its own settings getter, and (unlike `timeoutMs`) no
+        // `retry.provider.*` value overrides it.
+        //
+        // A parse error is dropped exactly as the `http_idle_timeout_ms` rung above drops one — the
+        // invalid-setting diagnostic is the settings layer's, not this builder's.
+        if let Ok(Some(ms)) = eff.websocket_connect_timeout_ms() {
+            agent_builder = agent_builder.websocket_connect_timeout_ms(ms);
         }
 
         // gap-08 #2/#3: install the provider transport extension seams. `on_payload` routes the
@@ -1987,6 +2154,73 @@ fn ext_mode(mode: AppMode) -> (ExtMode, bool) {
 }
 
 /// Today's date (UTC) for the prompt footer; falls back to the epoch on a clock fault.
+/// pi `discoverSystemPromptFile` / `discoverAppendSystemPromptFile` (`resource-loader.ts:1022-1032`
+/// and `:1034-1044` @v0.83.0) — one function because the two bodies are identical apart from the
+/// file name:
+///
+/// ```ts
+/// const projectPath = join(this.cwd, CONFIG_DIR_NAME, "SYSTEM.md");
+/// if (this.settingsManager.isProjectTrusted() && existsSync(projectPath)) return projectPath;
+/// const globalPath = join(this.agentDir, "SYSTEM.md");
+/// if (existsSync(globalPath)) return globalPath;
+/// return undefined;
+/// ```
+///
+/// Three mechanisms are load-bearing and each was absent:
+/// - the PROJECT file is `<cwd>/.cyrup/<name>`, the GLOBAL one is `<agent_dir>/<name>` — different
+///   parents, not the same name in two roots;
+/// - the trust gate applies ONLY to the project rung, so an untrusted project silently falls
+///   through to the global file rather than yielding nothing;
+/// - the result is exactly ONE path. Upstream returns on the first hit, so a project file does not
+///   stack with the global one — which is the accumulation `cyrup-session/src/prompt/overrides.rs`
+///   documents and pi does not do.
+fn discover_prompt_file(cwd: &Path, agent_dir: &Path, trusted: bool, name: &str) -> Option<PathBuf> {
+    let project = cwd.join(".cyrup").join(name);
+    if trusted && project.exists() {
+        return Some(project);
+    }
+    let global = agent_dir.join(name);
+    if global.exists() {
+        return Some(global);
+    }
+    None
+}
+
+/// `resolvePromptInput(source, description)`'s read leg (`resource-loader.ts:53-68` @v0.83.0), for a
+/// source that [`discover_prompt_file`] already `exists()`-checked:
+///
+/// ```ts
+/// if (existsSync(input)) {
+///     try { return readFileSync(input, "utf-8"); }
+///     catch (error) {
+///         console.error(chalk.yellow(`Warning: Could not read ${description} file ${input}: ${error}`));
+///         return input;
+///     }
+/// }
+/// ```
+///
+/// The `return input` on a read failure is upstream's literal behaviour and is ported as such: the
+/// PATH STRING becomes the prompt body. It looks wrong and it is faithful — `resolvePromptInput`
+/// cannot distinguish "a path that failed to read" from "prompt text that happens to name a file",
+/// so it falls back to the same branch as the not-a-path case. `cyrup/src/cli.rs`'s
+/// `resolve_prompt_input` already ports the identical rung for the `--system-prompt` flag.
+///
+/// The warning goes to `tracing` rather than to `StartupDiagnostics`: upstream's is a bare
+/// `console.error`, not a resource diagnostic, and `ResourceKind` has no variant for a prompt FILE
+/// (its `Prompt` is the prompt-template family, which would file this under `[Prompt conflicts]`).
+fn read_discovered_prompt(path: &Path, description: &str) -> Option<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) => {
+            tracing::warn!(
+                "Warning: Could not read {description} file {}: {e}",
+                path.display()
+            );
+            Some(path.to_string_lossy().into_owned())
+        }
+    }
+}
+
 fn today() -> time::Date {
     time::OffsetDateTime::now_utc().date()
 }

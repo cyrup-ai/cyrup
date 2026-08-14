@@ -71,6 +71,9 @@ use cyrup_ext::{
     NativeExtension, NotifyKind,
 };
 
+use crate::agent_start_cache::{
+    self, AgentStartCache, CachedPromptState, PromptStateKeyInput,
+};
 use crate::ask::{
     AskChannel, AskOutcome, ForwardingAskChannel, LocalAskChannel, NoOpAskChannel,
     PermissionDecisionState, PermissionPromptDecision, PromptOpts,
@@ -105,9 +108,24 @@ pub const COMMAND_YOLO_CONTROL_SOURCE: &str = "permission-system-command";
 /// string, which it does not today — carried because upstream carries it.
 const YOLO_PERSIST_FALLBACK_ERROR: &str = "Failed to persist cyrup-permission-system config.";
 
+/// PERM-029 — the shipped JSON Schema for `cyrup-permissions.jsonc`, a rebranded port of upstream's
+/// `schemas/permissions.schema.json` @v0.8.0 (`$id` and title rebranded; every keyword, `$def`,
+/// `patternProperties` entry and description otherwise upstream's). Embedded rather than merely
+/// shipped so `/permission-system schema` can emit it from a running binary with no install-layout
+/// assumptions, and so [`schema_is_wellformed`] can validate it at test time — cyrup's analog of
+/// upstream's `scripts/validate-artifacts.mjs:50` wired into the package `check` script.
+pub const PERMISSIONS_JSON_SCHEMA: &str =
+    include_str!("../schemas/cyrup-permissions.schema.json");
+
+/// PERM-029 — the starter policy, a rebranded port of upstream's `config/config.example.json`
+/// @v0.8.0. Every category the manager understands appears at least once, so an operator has a
+/// working template rather than a blank file. Validated against a real [`PermissionManager`] by
+/// this crate's own test, which is what upstream's `validate-artifacts.mjs:56` buys.
+pub const PERMISSIONS_EXAMPLE_CONFIG: &str = include_str!("../config/config.example.json");
+
 /// The `/permission-system` usage line. The two setting ids and the `on`/`off` value set are pi's
 /// (`config-modal.ts:18,27,34`); the textual framing is cyrup's, since upstream renders a modal.
-const COMMAND_USAGE: &str = "Usage: /permission-system [debug|yoloMode on|off]";
+const COMMAND_USAGE: &str = "Usage: /permission-system [debug|yoloMode on|off] [schema] [example]";
 
 /// pi `toOnOff` (`config-modal.ts:20-22`).
 fn on_off(value: bool) -> &'static str {
@@ -163,6 +181,44 @@ pub const SUBAGENT_ENV_HINT_KEYS: [&str; 3] = [
 
 /// The explicit opt-in flag (DI-5): set truthy to force-install the gate even with no policy file.
 pub const INSTALL_ENV_VAR: &str = "CYRUP_PERMISSION_SYSTEM";
+
+/// pi `PERMISSION_POLICY_AGENT_DIR_ENV_KEY = "PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR"`
+/// (v0.8.0 `permission-manager.ts:29`), renamed to this crate's `CYRUP_` env-var convention (see
+/// [`INSTALL_ENV_VAR`], [`crate::ext_config::CONFIG_PATH_ENV_KEY`],
+/// `forwarding::FORWARDING_AGENT_DIR_ENV`).
+///
+/// Relocates the **global policy root** — the directory the four global policy artifacts live in
+/// (`cyrup-permissions.jsonc`, `agents/`, `settings.json`, `mcp.json`). It does NOT move the
+/// project-scoped `<cwd>/.cyrup/agent` tree, matching upstream: `createPermissionManagerForCwd`
+/// (`index.ts:1287-1301`) supplies only `projectGlobalConfigPath` / `projectAgentsDir`, so every
+/// GLOBAL path in a live session falls back to `defaultPolicyAgentDir()` (`:31-38`).
+pub const POLICY_AGENT_DIR_ENV_KEY: &str = "CYRUP_PERMISSION_SYSTEM_POLICY_AGENT_DIR";
+
+/// pi `defaultPolicyAgentDir()` (v0.8.0 `permission-manager.ts:31-33`):
+/// `const override = process.env[KEY]?.trim(); return override ? resolve(override) : getAgentDir();`
+///
+/// The precedence is exactly upstream's: an env value that trims to the empty string is NOT an
+/// override (JS `""` is falsy), and a non-empty one is `resolve`d — absolutized against the process
+/// cwd — before use. [`std::path::absolute`] is the direct analog of node's `path.resolve` for a
+/// single argument: it is purely lexical and never touches the filesystem, so a not-yet-created
+/// policy root still resolves. On the (io-error) failure path the trimmed value is used as given,
+/// which is what `resolve` would have produced for an already-absolute path.
+///
+/// **The probe and the engine must both go through this**, or they inspect different trees and
+/// disagree — the PERM-018 hazard, one rung up: [`PermissionSystemExtension::manager_paths_for`]
+/// builds the enforced paths from it and [`is_installed`] probes it.
+#[must_use]
+fn policy_agent_dir(agent_dir: &Path) -> PathBuf {
+    let Some(raw) = std::env::var(POLICY_AGENT_DIR_ENV_KEY)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return agent_dir.to_path_buf();
+    };
+    let raw = PathBuf::from(raw);
+    std::path::absolute(&raw).unwrap_or(raw)
+}
 
 /// pi's `notifyWarning` + `shownWarnings` pair (`index.ts:1573,1586-1592`): the ONE user-visible
 /// sink every policy-file / config-file load warning funnels into, deduped for the life of a
@@ -278,6 +334,12 @@ pub struct PermissionSystemExtension {
     /// `<available_skills>` block (pi `activeSkillEntries`, `index.ts:1558` / `resolveSkillPromptEntries`,
     /// built at `before_agent_start`, read at `tool_call` for the skill-read bypass, `index.ts:2232`).
     active_skill_entries: Mutex<Vec<SkillPromptEntry>>,
+    /// PERM-013 / pi `lastActiveToolsCacheKey` + `lastPromptStateCacheKey` +
+    /// `lastPromptStateCacheResult` (`index.ts:1312-1314`), grouped so
+    /// [`PermissionSystemExtension::invalidate_agent_start_cache`] is one assignment (pi
+    /// `invalidateAgentStartCache`, `:1326-1331`). Read and written only inside
+    /// [`PermissionSystemExtension::on_before_agent_start`].
+    agent_start_cache: Mutex<AgentStartCache>,
     /// Skill names the human explicitly invoked via a `/skill:<name>` slash command (pi
     /// `explicitlyRequestedSkillNames`, `index.ts:1559` / `index.ts:2192-2206`): a direct user action,
     /// so its skill-file reads bypass the skill-read ask/deny even under a hiding agent (`index.ts:2243`).
@@ -294,11 +356,16 @@ pub struct PermissionSystemExtension {
     /// ([`crate::logging`], pi `logging.ts`). Shares the SAME `config` `Arc` above, so the operator
     /// flipping `"debug": true` in `config.json` arms it on the next
     /// `session_start` / `resources_discover` reload with no restart.
-    logger: crate::logging::PermissionSystemLogger,
-    /// pi `reportedLoggingWarnings` (`index.ts:151`): a logging failure (an unwritable log dir) is
-    /// surfaced ONCE per distinct message, so a broken trail cannot spam the human on every gated
-    /// tool call (`reportLoggingWarning`, `index.ts:162-169`).
-    reported_logging_warnings: Mutex<HashSet<String>>,
+    /// pi's module-scope logging trio ([`crate::logging::AuditTrail`]): the `extensionLogger`,
+    /// the `reportedLoggingWarnings` dedup set and the `loggingWarningReporter`
+    /// (`index.ts:160-164`). Held as an `Arc` so the detached forwarding watcher writes into the
+    /// SAME trail with the SAME dedup set — pi's module scope, made explicit (PERM-008).
+    logger: Arc<crate::logging::AuditTrail>,
+    /// PERM-031 — the live `ctx.has_ui`, mirrored out of every ctx-bearing event dispatch so the
+    /// detached forwarding watcher can re-check it on every scan (pi reads `ctx.hasUI` off the
+    /// retained `permissionForwardingContext`, `index.ts:1114`). See
+    /// [`crate::forwarding::SharedHasUi`].
+    has_ui: forwarding::SharedHasUi,
 }
 
 impl PermissionSystemExtension {
@@ -319,7 +386,7 @@ impl PermissionSystemExtension {
         Self::from_parts_full(
             paths,
             config,
-            Arc::new(NoOpAskChannel),
+            |_| Arc::new(NoOpAskChannel),
             agent_dir,
             false,
             Arc::new(OnceLock::new()),
@@ -347,7 +414,7 @@ impl PermissionSystemExtension {
         Self::from_parts_full(
             paths,
             config,
-            Arc::new(NoOpAskChannel),
+            |_| Arc::new(NoOpAskChannel),
             agent_dir,
             true,
             Arc::new(OnceLock::new()),
@@ -375,12 +442,23 @@ impl PermissionSystemExtension {
     ) -> Self {
         let paths = Self::manager_paths_for(&agent_dir, &cwd);
         let host_services: Arc<OnceLock<Arc<dyn HostServices>>> = Arc::new(OnceLock::new());
-        let channel: Arc<dyn AskChannel> = Arc::new(ForwardingAskChannel::new(
-            agent_dir.clone(),
-            forwarding::resolve_child_wait_timeout(),
-            host_services.clone(),
-        ));
-        Self::from_parts_full(paths, config, channel, agent_dir, false, host_services)
+        let channel_agent_dir = agent_dir.clone();
+        let channel_services = Arc::clone(&host_services);
+        Self::from_parts_full(
+            paths,
+            config,
+            move |audit| {
+                Arc::new(ForwardingAskChannel::new(
+                    channel_agent_dir,
+                    forwarding::resolve_child_wait_timeout(),
+                    channel_services,
+                    Arc::clone(audit),
+                ))
+            },
+            agent_dir,
+            false,
+            host_services,
+        )
     }
 
     /// Derive the [`ManagerPaths`] for `agent_dir` + `cwd` (pi `createPermissionManagerForCwd`'s path
@@ -389,13 +467,20 @@ impl PermissionSystemExtension {
     /// this from the CURRENT cwd, not just the process's original one).
     fn manager_paths_for(agent_dir: &Path, cwd: &Path) -> ManagerPaths {
         let project_dir = PROJECT_AGENT_SUBDIR.iter().fold(cwd.to_path_buf(), |acc, seg| acc.join(seg));
+        // PERM-025 / pi `defaultGlobalConfigPath` / `defaultAgentsDir` /
+        // `defaultLegacyGlobalSettingsPath` / `defaultGlobalMcpConfigPath`
+        // (v0.8.0 `permission-manager.ts:35-38`): all four GLOBAL artifacts hang off
+        // `defaultPolicyAgentDir()`, i.e. the `POLICY_AGENT_DIR_ENV_KEY` override when set. The two
+        // PROJECT paths are supplied explicitly upstream too (`index.ts:1296-1300`) and are NOT
+        // relocated.
+        let policy_dir = policy_agent_dir(agent_dir);
         ManagerPaths {
-            global_config_path: agent_dir.join(POLICY_FILE),
-            agents_dir: agent_dir.join("agents"),
+            global_config_path: policy_dir.join(POLICY_FILE),
+            agents_dir: policy_dir.join("agents"),
             project_global_config_path: Some(project_dir.join(POLICY_FILE)),
             project_agents_dir: Some(project_dir.join("agents")),
-            legacy_global_settings_path: agent_dir.join("settings.json"),
-            global_mcp_config_path: agent_dir.join("mcp.json"),
+            legacy_global_settings_path: policy_dir.join("settings.json"),
+            global_mcp_config_path: policy_dir.join("mcp.json"),
             mcp_server_names_override: None,
         }
     }
@@ -470,14 +555,46 @@ impl PermissionSystemExtension {
     /// `index.ts:1600-1618`) — this is the one place a malformed `config.json` becomes visible,
     /// since construction happens before any host backend is attached.
     fn refresh_config_and_manager(&self, cwd: &Path) {
-        // pi order (`refreshSessionRuntimeState`, `index.ts:2077-2085`): config first, manager
-        // second.
+        // pi order (`refreshSessionRuntimeState`, v0.8.0 `index.ts:1819-1826`): config first,
+        // manager second, agent-start cache invalidated third.
+        self.refresh_extension_config();
+        *guard(&self.manager) =
+            manager_with_warnings(Self::manager_paths_for(&self.agent_dir, cwd), &self.warnings);
+        self.invalidate_agent_start_cache();
+    }
+
+    /// pi `refreshExtensionConfig(ctx?)` (v0.8.0 `index.ts:1383-1386`) = `loadExtensionConfigState()`
+    /// (`:1350-1354`) + `applyExtensionConfigSideEffects(result, ctx)` (`:1356-1381`), in that
+    /// order. The **config half only** — no manager rebuild, no agent-start-cache invalidation.
+    ///
+    /// Split out of [`Self::refresh_config_and_manager`] for PERM-024: pi calls this on THREE
+    /// surfaces (`session_start` via `refreshSessionRuntimeState` `:1821`, the `resources_discover`
+    /// reload branch `:1848`, and `before_agent_start` `:1877`) but rebuilds the manager and
+    /// invalidates the cache on only the first two. Calling the combined function from
+    /// `before_agent_start` would rebuild the `PermissionManager` and blow away the agent-start
+    /// cache on every single turn — the exact per-turn cost PERM-013's cache exists to remove.
+    ///
+    /// The side-effect ORDER inside `applyExtensionConfigSideEffects` is pi's and is load-bearing:
+    /// status pill (`:1364-1366`) → warning memo (`:1368-1374`) → `config.loaded` debug entry
+    /// (`:1376-1381`). PERM-026 was the status sync being absent from here entirely, so a
+    /// `resources_discover` reload changed the live gating behaviour while the pill kept the stale
+    /// value until the next `before_agent_start` repainted it.
+    fn refresh_extension_config(&self) {
         let loaded = ExtensionConfig::load_with_result(&Self::config_path_for(&self.agent_dir));
         let (created, debug, yolo_mode) =
             (loaded.created, loaded.config.debug, loaded.config.yolo_mode);
+        // pi `setExtensionConfig(result.config)` inside `loadExtensionConfigState` (`:1352`).
         *guard(&self.config) = loaded.config;
+        // PERM-026 / pi `:1364-1366`: `if (runtimeContext?.hasUI) { syncPermissionSystemStatus(...) }`
+        // — reached on EVERY refresh surface, which is why a reload re-syncs the pill upstream.
+        // `sync_status_when_possible` is the ported form of that guard (see its doc for why the
+        // `hasUI` half collapses into "is a backend attached").
+        {
+            let config = guard(&self.config).clone();
+            self.sync_status_when_possible(&config);
+        }
         self.report_config_warning(loaded.warning.clone());
-        // pi `refreshExtensionConfig`'s tail (`index.ts:1619-1624`) — emitted AFTER the new config
+        // pi `writeDebugEntry("config.loaded", …)` (`:1376-1381`) — emitted AFTER the new config
         // is installed, so a reload that turns `debug` ON records its own arrival as the trail's
         // first line.
         self.write_debug_entry(
@@ -489,9 +606,17 @@ impl PermissionSystemExtension {
                 "yoloMode": yolo_mode,
             }),
         );
-        *guard(&self.manager) =
-            manager_with_warnings(Self::manager_paths_for(&self.agent_dir, cwd), &self.warnings);
+    }
+
+    /// pi `invalidateAgentStartCache()` (v0.8.0 `index.ts:1326-1331`): drop the cached skill
+    /// enforcement entries AND both `before_agent_start` cache keys, so the next turn recomputes
+    /// from scratch. Called from `session_start` (`:1823`), the `resources_discover` reload branch
+    /// (`:1852`) and `session_shutdown` (`:1871`) — never from `before_agent_start` itself.
+    fn invalidate_agent_start_cache(&self) {
+        // pi `activeSkillEntries = []` (`:1327`).
         guard(&self.active_skill_entries).clear();
+        // pi `:1328-1330`.
+        *guard(&self.agent_start_cache) = AgentStartCache::default();
     }
 
     /// pi `refreshExtensionConfig`'s warning branch (`index.ts:1610-1618`): report a NEW warning
@@ -700,12 +825,23 @@ impl PermissionSystemExtension {
     ///
     /// \[CYRUP-DELTA] Upstream's body is `openPermissionSystemSettingsModal(ctx, controller)`
     /// (`config-modal.ts:63-123`): a `ctx.ui.custom` overlay rendering pi's own `ZellijSettingsModal`
-    /// over two rows. cyrup cannot build that here — the crate has no dependency on `cyrup-tui` and
-    /// must not acquire one (dependencies point downward only), and `HostServices` exposes no
-    /// custom-overlay seam. What IS expressible is the modal's *content*, so this handler is a
-    /// textual form of exactly the same controller: the same two setting ids, the same `on`/`off`
-    /// value set (`config-modal.ts:18`), the same `applySetting` mapping (`:43-56`), the same
-    /// `setConfig` writer, and the same `Config file: <path>` help text (`:85`).
+    /// over two rows. This handler is a textual form of the same controller instead: the same two
+    /// setting ids, the same `on`/`off` value set (`config-modal.ts:18`), the same `applySetting`
+    /// mapping (`:43-56`), the same `setConfig` writer, and the same `Config file: <path>` help
+    /// text (`:85`).
+    ///
+    /// **PERM-007 — the reason recorded here was STALE and is corrected.** It claimed
+    /// "`HostServices` exposes no custom-overlay seam". One exists:
+    /// `cyrup_ext::HostServices::open_overlay` (`cyrup-ext/src/host/services.rs`) over
+    /// `cyrup_ext::host::overlay::InteractiveOverlay`, with a live implementation in
+    /// `cyrup-session-svc`'s `LiveHostServices` and a production caller in
+    /// `cyrup-ext-subagents`. The `cyrup-tui` half of the old reason still holds and is why the
+    /// seam is shaped as serializable `OverlayLine`s rather than ratatui types, but it is not a
+    /// reason the modal cannot be built. What remains is the work itself: an `InteractiveOverlay`
+    /// implementation is `'static`, so it cannot borrow `&self` and needs the config writer
+    /// extracted into a shared controller object — pi's own
+    /// `{getConfig, setConfig, getConfigPath}` (`index.ts:1504-1511`) made explicit. Until that
+    /// lands, the operator gets a read-only dump plus two blind toggles.
     ///
     /// Grammar (`<setting> <value>`; no args renders the modal's initial view):
     /// - `/permission-system` — current values + config path.
@@ -739,6 +875,16 @@ impl PermissionSystemExtension {
         let Some(setting) = parts.next() else {
             return Some(self.render_settings());
         };
+        // PERM-029 — two zero-argument emitters for the artifacts upstream ships as FILES and
+        // documents in its README (`README.md:655`'s CLI validation recipe, `:659`'s "Add
+        // `"$schema"`: … to your config for autocomplete support"). cyrup ships them as crate
+        // files too, but a Rust binary has no `node_modules` path an operator can point an editor
+        // at, so the command is how they are reached from a running install.
+        match setting {
+            "schema" => return Some(PERMISSIONS_JSON_SCHEMA.to_string()),
+            "example" => return Some(PERMISSIONS_EXAMPLE_CONFIG.to_string()),
+            _ => {}
+        }
         let value = parts.next();
         if parts.next().is_some() {
             return Some(format!("Unexpected extra arguments.\n{COMMAND_USAGE}"));
@@ -835,10 +981,17 @@ impl PermissionSystemExtension {
         let config = guard(&self.config).clone();
         format!(
             "Permission System Settings\n  debug     {:<3}  Debug logging\n  yoloMode  {:<3}  YOLO \
-             mode\n{}\n{COMMAND_USAGE}",
+             mode\n{}\n{}\n{COMMAND_USAGE}",
             on_off(config.debug),
             on_off(config.yolo_mode),
-            self.config_path_line()
+            self.config_path_line(),
+            // PERM-029: name the policy file and its schema alongside the extension-config path,
+            // upstream's `README.md:659` advice made reachable from the app.
+            format_args!(
+                "Policy file: {}\n  `/permission-system schema` prints the JSON Schema; \
+                 `/permission-system example` prints a starter policy.",
+                policy_agent_dir(&self.agent_dir).join(POLICY_FILE).display()
+            )
         )
     }
 
@@ -865,7 +1018,7 @@ impl PermissionSystemExtension {
         Self::from_parts_full(
             paths,
             config,
-            ask_channel,
+            |_| ask_channel,
             agent_dir,
             false,
             Arc::new(OnceLock::new()),
@@ -877,7 +1030,10 @@ impl PermissionSystemExtension {
     fn from_parts_full(
         paths: ManagerPaths,
         config: ExtensionConfig,
-        ask_channel: Arc<dyn AskChannel>,
+        // A BUILDER rather than a value: the child's `ForwardingAskChannel` needs the shared
+        // `AuditTrail` (PERM-008), which cannot exist until `shared_config` does, which is built
+        // here. Every other constructor ignores the argument.
+        ask_channel: impl FnOnce(&Arc<crate::logging::AuditTrail>) -> Arc<dyn AskChannel>,
         agent_dir: PathBuf,
         install_watcher: bool,
         host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
@@ -891,10 +1047,20 @@ impl PermissionSystemExtension {
         // reads the module-scope `extensionConfig` binding `refreshExtensionConfig` reassigns
         // (`index.ts:146-150`), so a reload must be observable through both.
         let shared_config: crate::forwarding::SharedExtensionConfig = Arc::new(Mutex::new(config));
-        let logger = crate::logging::PermissionSystemLogger::new(
-            Arc::clone(&shared_config),
-            Self::logs_dir_for(&agent_dir),
-        );
+        let logger = Arc::new(crate::logging::AuditTrail::new(
+            crate::logging::PermissionSystemLogger::new(
+                Arc::clone(&shared_config),
+                Self::logs_dir_for(&agent_dir),
+            ),
+        ));
+        // pi `setLoggingWarningReporter(...)` (`index.ts:170-172`): the reporter is the SAME
+        // `notifyWarning` sink every other warning uses. Installed here rather than at
+        // `set_host_services` because `WarningSink` is itself late-bound on the `OnceLock`.
+        {
+            let sink = Arc::clone(&warnings);
+            logger.set_reporter(Arc::new(move |message: &str| sink.notify(message)));
+        }
+        let ask_channel = ask_channel(&logger);
         Self {
             id: ExtensionId::from(EXTENSION_ID),
             manager: Mutex::new(manager_with_warnings(paths, &warnings)),
@@ -908,41 +1074,26 @@ impl PermissionSystemExtension {
             watcher: Mutex::new(None),
             agent_name: resolve_agent_name_from_env(),
             active_skill_entries: Mutex::new(Vec::new()),
+            agent_start_cache: Mutex::new(AgentStartCache::default()),
             explicitly_requested_skill_names: Mutex::new(HashSet::new()),
             warnings,
             last_config_warning: Mutex::new(None),
             logger,
-            reported_logging_warnings: Mutex::new(HashSet::new()),
+            has_ui: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     /// pi `writeDebugEntry` (`index.ts:171-176`): the diagnostic stream, with the logger's own
     /// failure funnelled into the dedup-once warning reporter.
     fn write_debug_entry(&self, event: &str, details: &Value) {
-        if let Some(warning) = self.logger.debug(event, details) {
-            self.report_logging_warning(&warning);
-        }
+        self.logger.debug(event, details);
     }
 
     /// pi `writeReviewEntry` (v0.8.0 `index.ts:200-202`, via `writeLogEntry` `:183-194`): the
     /// SECURITY-relevant decision stream — the
     /// "why was this blocked / who approved this" trail. Same warning funnel.
     fn write_review_entry(&self, event: &str, details: &Value) {
-        if let Some(warning) = self.logger.review(event, details) {
-            self.report_logging_warning(&warning);
-        }
-    }
-
-    /// pi `reportLoggingWarning` (v0.8.0 `index.ts:174-181`): surface a NEW logging failure once through
-    /// the same `ui.notify` channel every other warning uses, and remember it so a persistently
-    /// broken trail cannot notify on every gated tool call.
-    fn report_logging_warning(&self, message: &str) {
-        // Scoped so the memo lock is released before the sink is touched — `notify` takes its own
-        // lock and reaches the host.
-        let is_new = guard(&self.reported_logging_warnings).insert(message.to_string());
-        if is_new {
-            self.warnings.notify(message);
-        }
+        self.logger.review(event, details);
     }
 
     /// pi `reviewPermissionDecision` (`index.ts:1767-1793`): the ONE shaped `review` record every
@@ -977,20 +1128,36 @@ impl PermissionSystemExtension {
         self.write_review_entry(event, &record);
     }
 
-    /// pi `getPermissionDecisionScope` (`index.ts:876-888`): the first non-empty of
+    /// pi `getPermissionDecisionScope` (v0.8.0 `index.ts:581-592`): the first non-empty of
     /// `target`, `command`, `path`, `toolName`, `skillName`.
+    ///
+    /// **PERM-028 — the first three go through `getNonEmptyString`, the last two do not.** Upstream
+    /// is `getNonEmptyString(details.target) ?? getNonEmptyString(details.command) ??
+    /// getNonEmptyString(details.path) ?? details.toolName ?? details.skillName ?? null`, and
+    /// `getNonEmptyString` TRIMS (`common.ts:15-22`). So `command: "  git status  "` keys as
+    /// `"git status"` upstream, and a whitespace-ONLY command is skipped entirely rather than
+    /// selected. Cyrup previously filtered on a raw `!is_empty()` across all five, which both kept
+    /// the padding and let `"   "` win. The asymmetry is deliberate and is upstream's: do not
+    /// "tidy" it by trimming `toolName`/`skillName` too.
     fn permission_decision_scope(details: &DedupDetails) -> Value {
-        [
-            details.target.as_deref(),
-            details.command.as_deref(),
-            details.path.as_deref(),
-            details.tool_name.as_deref(),
-            details.skill_name.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|s| !s.is_empty())
-        .map_or(Value::Null, |s| Value::String(s.to_string()))
+        // pi's first three arms — `getNonEmptyString` = trim, then drop if empty
+        // (`common::get_non_empty_string`, `common.rs:20`).
+        let trimmed = [details.target.as_deref(), details.command.as_deref(), details.path.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|s| !s.is_empty());
+        if let Some(s) = trimmed {
+            return Value::String(s.to_string());
+        }
+        // pi's last two arms — RAW `??` fallthrough, no trim and no empty check. `??` skips only
+        // `null`/`undefined`, which is `Option::None` here, so an empty-string `toolName` is
+        // selected upstream and must be selected here.
+        [details.tool_name.as_deref(), details.skill_name.as_deref()]
+            .into_iter()
+            .flatten()
+            .next()
+            .map_or(Value::Null, |s| Value::String(s.to_string()))
     }
 
     /// Override the resolved persona name (deterministic tests / an embedder that resolves the name
@@ -1008,7 +1175,7 @@ impl PermissionSystemExtension {
     async fn decide(&self, call_id: &str, tool_name: &str, input: &Value, ctx: &HostCtx) -> HookOutcome {
         let normalized = tool_name.trim();
         if normalized.is_empty() {
-            return HookOutcome::Block { reason: Some(gate::format_missing_tool_name_reason()) };
+            return HookOutcome::Block { reason: Some(gate::format_missing_tool_name_reason()), terminate: false };
         }
         let agent_name = self.agent_name.as_deref();
 
@@ -1023,7 +1190,7 @@ impl PermissionSystemExtension {
         // unknown-tool allowlist.
         let registered = self.registered_tool_names().unwrap_or_default();
         if let Some(reason) = gate::check_requested_tool_registration(normalized, &registered) {
-            return HookOutcome::Block { reason: Some(reason) };
+            return HookOutcome::Block { reason: Some(reason), terminate: false };
         }
 
         // pi `index.ts:2305-2309`: anchor a path-bearing input's resource resolution to the SESSION
@@ -1081,7 +1248,7 @@ impl PermissionSystemExtension {
                     }),
                 );
                 self.logger.flush();
-                HookOutcome::Block { reason: Some(gate::format_deny_reason(&check, agent_name)) }
+                HookOutcome::Block { reason: Some(gate::format_deny_reason(&check, agent_name)), terminate: false }
             }
             PermissionState::Allow => HookOutcome::Noop,
             PermissionState::Ask => self.resolve_ask(call_id, input, &check, ctx).await,
@@ -1154,6 +1321,7 @@ impl PermissionSystemExtension {
                     );
                     return Some(HookOutcome::Block {
                         reason: Some(skill::format_skill_path_deny_reason(&read_skill, agent_name)),
+                        terminate: false,
                     });
                 }
                 PermissionState::Ask => {
@@ -1193,6 +1361,7 @@ impl PermissionSystemExtension {
                             );
                             return Some(HookOutcome::Block {
                                 reason: Some(skill::skill_ask_unavailable_reason()),
+                                terminate: false,
                             });
                         }
                         AskOutcome::Decided(d) if !d.approved => {
@@ -1200,6 +1369,7 @@ impl PermissionSystemExtension {
                                 reason: Some(skill::format_skill_user_denied_reason(
                                     d.denial_reason.as_deref(),
                                 )),
+                                terminate: false,
                             });
                         }
                         AskOutcome::Decided(_) => {}
@@ -1252,6 +1422,7 @@ impl PermissionSystemExtension {
                     reason: Some(gate::format_external_directory_deny_reason(
                         tool_name, path, cwd, agent_name,
                     )),
+                    terminate: false,
                 })
             }
             PermissionState::Ask => {
@@ -1291,6 +1462,7 @@ impl PermissionSystemExtension {
                         );
                         Some(HookOutcome::Block {
                             reason: Some(gate::format_external_directory_unavailable_reason(path)),
+                            terminate: false,
                         })
                     }
                     AskOutcome::Decided(d) if !d.approved => Some(HookOutcome::Block {
@@ -1299,6 +1471,7 @@ impl PermissionSystemExtension {
                             path,
                             d.denial_reason.as_deref(),
                         )),
+                        terminate: false,
                     }),
                     AskOutcome::Decided(d) => {
                         // pi `persistPatternApprovalDecision` (`:2391`): an approved-Always persists an
@@ -1337,13 +1510,28 @@ impl PermissionSystemExtension {
         }
     }
 
-    /// Remember a resolved decision under `key` (pi `rememberPermissionPromptDecision`,
-    /// `index.ts:1890-1892`) so an identical re-emission reuses it instead of re-prompting. A `None`
-    /// key is pi's uncacheable case (empty `requestId`, `createPermissionPromptCacheKey`
-    /// `index.ts:728-737`) — nothing is stored.
-    fn remember_prompt_decision(&self, key: Option<&String>, decision: &PermissionPromptDecision) {
-        if let Some(k) = key {
-            guard(&self.dedup).remember(k, decision.clone());
+    /// Settle an in-flight dedup registration with the decision that resolved it (pi's
+    /// `decisionPromise` fulfilling, observed by `rememberPermissionPromptDecision`'s stored promise
+    /// at v0.8.0 `index.ts:1633`). A `None` owner is pi's uncacheable case (empty `requestId`,
+    /// `createPermissionPromptCacheKey` `index.ts:472-481`) — nothing was registered and nothing is
+    /// stored.
+    fn resolve_prompt_decision(
+        &self,
+        owner: Option<crate::dedup::PendingOwner>,
+        decision: &PermissionPromptDecision,
+    ) {
+        if let Some(owner) = owner {
+            owner.resolve(&mut guard(&self.dedup), decision.clone());
+        }
+    }
+
+    /// pi `forgetPermissionPromptDecision` in `promptPermission`'s catch
+    /// (v0.8.0 `index.ts:1638-1642`): the prompt never produced a decision, so the in-flight
+    /// registration must be dropped rather than left latched — otherwise every later identical
+    /// request would await a promise that will never settle.
+    fn forget_prompt_decision(&self, owner: Option<crate::dedup::PendingOwner>) {
+        if let Some(owner) = owner {
+            owner.forget(&mut guard(&self.dedup));
         }
     }
 
@@ -1381,9 +1569,27 @@ impl PermissionSystemExtension {
 
         // Dedup hit: reuse the prior decision (collapsed to Allow-Once by `create_duplicate_decision`,
         // so a re-emitted approval never re-persists an `Always` grant) — zero additional prompts.
+        //
+        // PERM-014 — this is `lookup`, not `get`, and the difference is the whole item. pi's cache
+        // stores the still-unsettled `decisionPromise` (`index.ts:1633`, run BEFORE the `await` at
+        // `:1637`), so a CONCURRENT identical ask hits `getCachedPermissionPromptDecision`
+        // (`:1581-1583`) and `await`s that same promise (`:1585`) instead of opening a second
+        // dialog. `get` treated an in-flight entry as a miss, so two concurrently-executing tool
+        // calls with the same dedup key each raised their own prompt and the operator answered the
+        // same question twice — with nothing making the two answers agree.
         let key = details.cache_key();
         if let Some(k) = &key {
-            let cached = guard(&self.dedup).get(k);
+            let cached = guard(&self.dedup).lookup(k);
+            let cached = match cached {
+                // pi `:1585` `createDuplicatePermissionPromptDecision(await cachedDecision)` — the
+                // already-settled arm.
+                Some(crate::dedup::Lookup::Ready(decision)) => Some(decision),
+                // The same statement's OTHER arm: `cachedDecision` is a pending promise, so the
+                // `await` blocks here until the owner settles it. The lock is released first —
+                // `lookup` returned an owned `Pending` precisely so nothing is held across it.
+                Some(crate::dedup::Lookup::Pending(pending)) => Some(pending.wait().await),
+                None => None,
+            };
             if let Some(decision) = cached {
                 // pi `index.ts:1804-1812`: a reused decision is STILL audited — otherwise a
                 // re-emitted tool call looks like it was never gated at all.
@@ -1405,8 +1611,15 @@ impl PermissionSystemExtension {
             }
         }
 
+        // pi `rememberPermissionPromptDecision(..., decisionPromise)` (v0.8.0 `index.ts:1632-1634`)
+        // — registered BEFORE the body below runs, which is why the yolo arm and the dialog arm are
+        // BOTH inside the window a concurrent duplicate can join. Settled by
+        // `resolve_prompt_decision` on every path that produces a decision, and dropped by
+        // `forget_prompt_decision` on the one that does not (pi's catch, `:1638-1642`).
+        let owner = key.as_ref().map(|k| guard(&self.dedup).begin_pending(k));
+
         if yolo_mode {
-            // pi `index.ts:1820-1826`.
+            // pi `index.ts:1598-1608`.
             self.review_permission_decision(
                 "permission_request.auto_approved",
                 details,
@@ -1423,9 +1636,9 @@ impl PermissionSystemExtension {
                 denial_reason: None,
             };
             // pi caches the yolo auto-approval too: `rememberPermissionPromptDecision`
-            // (`index.ts:1890`) is handed the SAME `decisionPromise` whose body took the
-            // `shouldAutoApprovePermissionState` early return at `:1817-1841`.
-            self.remember_prompt_decision(key.as_ref(), &decision);
+            // (`index.ts:1633`) is handed the SAME `decisionPromise` whose body took the
+            // `shouldAutoApprovePermissionState` early return at `:1599-1609`.
+            self.resolve_prompt_decision(owner, &decision);
             return AskOutcome::Decided(decision);
         }
         // pi `index.ts:1843` — recorded BEFORE the dialog opens, so a session killed mid-prompt
@@ -1464,9 +1677,18 @@ impl PermissionSystemExtension {
                     "approvalScope": if d.approved && always { scope.clone() } else { Value::Null },
                 }),
             );
-            // pi `index.ts:1890-1892` — the resolved decision enters the cache, so the NEXT identical
-            // request (same `toolCallId` + same fingerprint) short-circuits at the lookup above.
-            self.remember_prompt_decision(key.as_ref(), d);
+            // pi `:1637` — the `decisionPromise` settles, so the entry registered above flips from
+            // pending to resolved and BOTH the next identical request and any concurrent follower
+            // already awaiting it see this decision.
+            self.resolve_prompt_decision(owner, d);
+        } else {
+            // No decision was produced (no reachable human). pi's `confirmPermission` cannot reach
+            // this shape — it always resolves to `{approved:false}` — but cyrup's channel can
+            // return `NoLiveChannel`, which the CALLER turns into a fail-closed block. The
+            // registration must not be left latched: pi's catch arm is
+            // `forgetPermissionPromptDecision` (`:1638-1642`), and a follower blocked on
+            // `Pending::wait` fails CLOSED when the owner's sender drops here.
+            self.forget_prompt_decision(owner);
         }
         outcome
     }
@@ -1505,7 +1727,7 @@ impl PermissionSystemExtension {
                     &details,
                     json!({ "source": "tool_call", "resolution": "confirmation_unavailable" }),
                 );
-                return HookOutcome::Block { reason: Some(gate::format_ask_unavailable_reason(check)) };
+                return HookOutcome::Block { reason: Some(gate::format_ask_unavailable_reason(check)), terminate: false };
             }
         };
 
@@ -1547,6 +1769,7 @@ impl PermissionSystemExtension {
         if !decision.approved {
             return HookOutcome::Block {
                 reason: Some(gate::format_user_denied_reason(check, decision.denial_reason.as_deref())),
+                terminate: false,
             };
         }
         if decision.state == PermissionDecisionState::Always {
@@ -1574,51 +1797,143 @@ impl PermissionSystemExtension {
     ///    reads at every `tool_call`. ONE parse, both consumers.
     ///
     /// Also syncs the `"yolo"` status pill (pi `syncPermissionSystemStatus`, `:2136`).
+    /// **PERM-013 — both cache layers are ported** (pi `before-agent-start-cache.ts`, consumed at
+    /// `index.ts:1894-1898` and `:1900-1913`): step 1's `set_active_tools` fires only when the
+    /// exposed tool list actually changed, and steps 2+3 are skipped wholesale on a prompt-state
+    /// key hit, replaying the cached entries + prompt. Both keys are invalidated together by
+    /// [`Self::invalidate_agent_start_cache`].
+    ///
+    /// The status pill is NOT synced here: pi's `before_agent_start` reaches it through
+    /// `refreshExtensionConfig(ctx)` (`index.ts:1877` → `applyExtensionConfigSideEffects`
+    /// `:1364-1366`), which cyrup's `BeforeAgentStart` arm now calls before this function
+    /// (PERM-024 / PERM-026). Syncing again here would be a second write of the same value.
     fn on_before_agent_start(&self, system_prompt: &str, ctx: &HostCtx) -> HookOutcome {
         let cwd = ctx.cwd.to_string_lossy().into_owned();
         let agent = self.agent_name.as_deref();
         let services = self.host_services.get();
 
         // (1) Active-tools exposure — only when the live backend can enumerate the FULL registry.
-        let working_prompt = match services.and_then(|s| s.all_tool_names()) {
-            Some(tools) => {
-                let allowed: Vec<String> = tools
-                    .into_iter()
-                    .filter(|name| self.should_expose_tool(name, agent))
-                    .collect();
+        //
+        // \[CYRUP-DELTA] pi has no "registry unavailable" case (`pi.getAllTools()` always returns a
+        // list), so the `None` arm below is cyrup-only: the exposed set cannot be computed, the
+        // tools section is left intact, and the agent-start cache is BYPASSED entirely rather than
+        // keyed on an empty tool list — which would be indistinguishable from a registry that
+        // legitimately exposes nothing, and would replay the wrong prompt if the backend attached
+        // between turns.
+        let allowed: Option<Vec<String>> = services.and_then(|s| s.all_tool_names()).map(|tools| {
+            tools.into_iter().filter(|name| self.should_expose_tool(name, agent)).collect()
+        });
+
+        let Some(allowed) = allowed else {
+            return self.shape_agent_start_prompt(system_prompt, system_prompt, agent, &cwd, None);
+        };
+
+        // pi `:1894-1898`: `setActiveTools` runs ONLY when the tool-list key changed.
+        let active_tools_key = agent_start_cache::create_active_tools_cache_key(&allowed);
+        {
+            let mut cache = guard(&self.agent_start_cache);
+            if agent_start_cache::should_apply_cached_agent_start_state(
+                cache.last_active_tools_key.as_deref(),
+                &active_tools_key,
+            ) {
                 if let Some(s) = services {
                     s.set_active_tools(&allowed);
                 }
-                // (2) Strip the "Available tools:" section + denied-tool guideline bullets.
-                sanitize::tools::sanitize_available_tools_section(system_prompt, &allowed).prompt
+                cache.last_active_tools_key = Some(active_tools_key);
             }
-            // No live registry (default host / headless): cannot compute the exposed set → leave the
-            // tools section intact (pi always has `getAllTools`); still resolve/hide skills below.
-            None => system_prompt.to_string(),
-        };
+        }
 
+        // pi `:1900-1907`: the prompt-state key. `permissionStamp` is what makes a mid-session
+        // policy edit invalidate this — see [`PermissionManager::policy_cache_stamp`].
+        let permission_stamp = guard(&self.manager).policy_cache_stamp(agent);
+        let prompt_state_key = agent_start_cache::create_prompt_state_key(&PromptStateKeyInput {
+            agent_name: agent,
+            cwd: &cwd,
+            permission_stamp: &permission_stamp,
+            system_prompt,
+            allowed_tool_names: &allowed,
+        });
+
+        // pi `:1908-1913`: on a key HIT with a recorded result, restore the skill entries and
+        // return the cached prompt without re-running either sanitizer.
+        let cached_hit = {
+            let cache = guard(&self.agent_start_cache);
+            if agent_start_cache::should_apply_cached_agent_start_state(
+                cache.last_prompt_state_key.as_deref(),
+                &prompt_state_key,
+            ) {
+                None
+            } else {
+                cache.last_prompt_state_result.clone()
+            }
+        };
+        if let Some(cached) = cached_hit {
+            *guard(&self.active_skill_entries) = cached.entries;
+            return match cached.system_prompt {
+                None => HookOutcome::Noop,
+                Some(prompt) => HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
+                    system: Some(prompt),
+                    inject: None,
+                }),
+            };
+        }
+
+        // (2) Strip the "Available tools:" section + denied-tool guideline bullets (pi `:1915`).
+        let working_prompt =
+            sanitize::tools::sanitize_available_tools_section(system_prompt, &allowed).prompt;
+        self.shape_agent_start_prompt(
+            system_prompt,
+            &working_prompt,
+            agent,
+            &cwd,
+            Some(prompt_state_key),
+        )
+    }
+
+    /// The tail of [`Self::on_before_agent_start`] (pi `index.ts:1916-1930`): resolve the skill
+    /// prompt entries over `working_prompt`, install them as the enforcement cache, record the
+    /// `CachedPromptStateResult` under `prompt_state_key` when one was computed, and return the
+    /// sanitized prompt as a `[mutate]` only when it differs from the ORIGINAL `system_prompt`
+    /// (pi `skillPromptResult.prompt !== event.systemPrompt`, `:1922`).
+    ///
+    /// `prompt_state_key: None` is the cyrup-only registry-unavailable path: shape, but record no
+    /// cache entry.
+    fn shape_agent_start_prompt(
+        &self,
+        system_prompt: &str,
+        working_prompt: &str,
+        agent: Option<&str>,
+        cwd: &str,
+        prompt_state_key: Option<String>,
+    ) -> HookOutcome {
         // (3) Hide ask/deny skills from `<available_skills>` + cache the enforcement entries. ONE
         // parse feeds both the enforcement cache (read at every `tool_call`) and the hidden prompt.
         let resolution = {
             let mut mgr = guard(&self.manager);
-            sanitize::skills::resolve_skill_prompt_entries(&working_prompt, &mut mgr, agent, &cwd)
+            sanitize::skills::resolve_skill_prompt_entries(working_prompt, &mut mgr, agent, cwd)
         };
-        *guard(&self.active_skill_entries) = resolution.entries;
+        // pi `:1919` `activeSkillEntries = skillPromptResult.entries`.
+        *guard(&self.active_skill_entries) = resolution.entries.clone();
 
-        // pi `syncPermissionSystemStatus` (`:2136`): reflect yolo on the live status bar.
-        if let Some(s) = services {
-            status::sync_status(s, &guard(&self.config));
+        // pi `:1921-1924`: `systemPrompt` is ABSENT (not null) when the sanitizers changed nothing,
+        // which is what decides between `{ systemPrompt }` and `{}` on both the fresh and the
+        // cached path.
+        let changed = (resolution.prompt != system_prompt).then_some(resolution.prompt);
+        if let Some(key) = prompt_state_key {
+            let mut cache = guard(&self.agent_start_cache);
+            cache.last_prompt_state_key = Some(key);
+            cache.last_prompt_state_result = Some(CachedPromptState {
+                entries: resolution.entries,
+                system_prompt: changed.clone(),
+            });
         }
 
-        // Return the sanitized prompt as a [mutate] ONLY when it differs from the original (pi
-        // `skillPromptResult.prompt !== event.systemPrompt ? { systemPrompt } : {}`, `:2185-2189`).
-        if resolution.prompt == system_prompt {
-            HookOutcome::Noop
-        } else {
-            HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
-                system: Some(resolution.prompt),
+        match changed {
+            None => HookOutcome::Noop,
+            Some(prompt) => HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
+                system: Some(prompt),
                 inject: None,
-            })
+            }),
         }
     }
 
@@ -1692,6 +2007,15 @@ impl PermissionSystemExtension {
     /// A missing `host_services` backend is NOT a disqualifier — it is the "cannot attach yet" case
     /// (pi's `if (!location) return;`, `:1991-1993`), which upstream leaves running for the next hook.
     fn maybe_start_forwarding_watcher(&self, ctx: &HostCtx) {
+        // PERM-031: publish the live `has_ui` for the detached watcher BEFORE the disqualifying
+        // branch, so a scan already in flight sees the new value even on the teardown path. pi gets
+        // this for free — `permissionForwardingContext` holds the ctx object itself and
+        // `processForwardedPermissionRequests` re-reads `ctx.hasUI` (`index.ts:1114`).
+        //
+        // Called from all four of pi's `startForwardedPermissionPolling` hooks
+        // (`session_start`/`before_agent_start`/`input`/`tool_call`), which is every event arm that
+        // carries a ctx, so this is the exact set of moments upstream reassigns `runtimeContext`.
+        self.has_ui.store(ctx.has_ui, std::sync::atomic::Ordering::Relaxed);
         if !self.install_watcher || !ctx.has_ui {
             // pi `:1985`: a non-parent / headless context tears the watcher DOWN, it does not merely
             // decline to start one.
@@ -1710,6 +2034,8 @@ impl PermissionSystemExtension {
             self.agent_dir.clone(),
             services.clone(),
             Arc::clone(&self.config),
+            Arc::clone(&self.logger),
+            Arc::clone(&self.has_ui),
         ));
     }
 
@@ -1998,9 +2324,21 @@ impl NativeExtension for PermissionSystemExtension {
                 // gate reads at every `tool_call`), and sync the yolo status pill — returning the
                 // sanitized prompt as a `[mutate]`.
                 //
-                // PERM-005 / pi `before_agent_start` (`index.ts:2137`): re-enter
-                // `startForwardedPermissionPolling` first, so each turn re-arms the forwarding
-                // watcher (and tears it down if the UI has gone away). Idempotent.
+                // PERM-024 / pi `before_agent_start` (v0.8.0 `index.ts:1875-1878`): the handler's
+                // first two statements are `runtimeContext = ctx; refreshExtensionConfig(ctx);`,
+                // i.e. `config.json` is re-read at the TOP OF EVERY TURN — before the watcher is
+                // re-armed and before any shaping. Without it an operator's mid-session
+                // `yoloMode`/`debug` edit took effect only at the next session start or resource
+                // reload.
+                //
+                // The CONFIG half only (`refresh_extension_config`, not
+                // `refresh_config_and_manager`): pi does not rebuild the `PermissionManager` here
+                // and does not invalidate the agent-start cache here — doing either per turn would
+                // defeat the cache PERM-013 just landed.
+                self.refresh_extension_config();
+                // PERM-005 / pi `before_agent_start` (`index.ts:1878`): re-enter
+                // `startForwardedPermissionPolling`, so each turn re-arms the forwarding watcher
+                // (and tears it down if the UI has gone away). Idempotent.
                 self.maybe_start_forwarding_watcher(ctx);
                 self.on_before_agent_start(system_prompt, ctx)
             }
@@ -2015,7 +2353,7 @@ impl NativeExtension for PermissionSystemExtension {
                 }
                 HookOutcome::Noop
             }
-            HostEvent::SessionStart { .. } => {
+            HostEvent::SessionStart { reason, .. } => {
                 // pi `index.ts:2089,2092`: clear session store + dedup + explicit-skill set; refresh.
                 guard(&self.session_approvals).clear();
                 guard(&self.dedup).clear();
@@ -2044,23 +2382,59 @@ impl NativeExtension for PermissionSystemExtension {
                 // subagent children's forwarded asks. This is the FIRST of four re-entry points
                 // (PERM-005) — see the `BeforeAgentStart` / `Input` / `ToolCall` arms.
                 self.maybe_start_forwarding_watcher(ctx);
-                // pi `syncPermissionSystemStatus` (`index.ts:2091` via `refreshSessionRuntimeState`):
-                // reflect the yolo pill on the live status bar at session start.
-                if let Some(s) = self.host_services.get() {
-                    status::sync_status(s, &guard(&self.config));
+                // PERM-026: the yolo status pill is NO LONGER synced here. Upstream reaches it from
+                // inside `refreshExtensionConfig` → `applyExtensionConfigSideEffects`
+                // (v0.8.0 `index.ts:1364-1366`), which `refreshSessionRuntimeState` calls at
+                // `:1821`; `refresh_config_and_manager` above now does the same, so a second write
+                // here would only duplicate it — and keeping it here is exactly what let the
+                // `resources_discover` arm, which never had one, go stale.
+                //
+                // PERM-027 / pi `:1834-1843`: a session_start whose `reason` is `"reload"` records
+                // a `lifecycle.reload` line, so an operator diagnosing "did my policy edit take
+                // effect" can tell a reload from a fresh start in the debug trail. Gated on the
+                // reason exactly as upstream is: a `"startup"` session writes none.
+                if reason == "reload" {
+                    self.write_debug_entry(
+                        "lifecycle.reload",
+                        &json!({
+                            "triggeredBy": "session_start",
+                            "reason": reason,
+                            "cwd": ctx.cwd.to_string_lossy(),
+                        }),
+                    );
                 }
                 HookOutcome::Noop
             }
-            HostEvent::ResourcesDiscover => {
-                // pi `pi.on("resources_discover", ...)` reload branch (`index.ts:2103-2118`): reset the
-                // dedup cache, re-read `config.json`, rebuild the `PermissionManager` from the current
-                // cwd, and invalidate the agent-start cache. Cyrup's `HostEvent::ResourcesDiscover`
-                // carries no `reason` field (unlike pi's event), so every dispatch is treated as the
-                // "reload" case — the only variant this host event exposes.
-                guard(&self.dedup).clear();
-                // pi `resetShownWarnings()` (`index.ts:2105`, the reload branch's first statement).
+            HostEvent::ResourcesDiscover { reason, .. } => {
+                // pi `pi.on("resources_discover", …)` (v0.8.0 `index.ts:1844-1859`). The WHOLE body
+                // is gated on `event.reason === "reload"` (`:1845`) — a `"startup"` discovery does
+                // nothing here, because `session_start` has already refreshed everything.
+                //
+                // Cyrup's `HostEvent::ResourcesDiscover` used to carry no `reason`, so this arm
+                // treated every dispatch as the reload case; the field now exists
+                // (`cyrup-ext/src/event.rs:349`, EXT-016) and `facade::aggregate_resources`
+                // genuinely sends `"startup"` for the discovery pass, so the gate is both
+                // expressible and load-bearing.
+                if reason != "reload" {
+                    return HookOutcome::Noop;
+                }
+                // pi `resetShownWarnings()` (`:1846`, the reload branch's first statement).
                 self.warnings.reset();
+                guard(&self.dedup).clear();
+                // pi `refreshExtensionConfig` + `createPermissionManagerForCwd` +
+                // `invalidateAgentStartCache` (`:1848-1852`).
                 self.refresh_config_and_manager(&ctx.cwd);
+                // PERM-027 / pi `writeDebugEntry("lifecycle.reload", …)` (`:1853-1857`). pi's `cwd`
+                // is `runtimeContext?.cwd ?? null`; cyrup's `ctx` is always live at dispatch, so
+                // the null arm is unreachable rather than dropped.
+                self.write_debug_entry(
+                    "lifecycle.reload",
+                    &json!({
+                        "triggeredBy": "resources_discover",
+                        "reason": reason,
+                        "cwd": ctx.cwd.to_string_lossy(),
+                    }),
+                );
                 HookOutcome::Noop
             }
             HostEvent::SessionShutdown { .. } => {
@@ -2072,7 +2446,10 @@ impl NativeExtension for PermissionSystemExtension {
                 guard(&self.session_approvals).clear();
                 guard(&self.dedup).clear();
                 guard(&self.explicitly_requested_skill_names).clear();
-                guard(&self.active_skill_entries).clear();
+                // pi `invalidateAgentStartCache()` (v0.8.0 `index.ts:1871`) — the WHOLE cache, not
+                // just the skill entries: a shutdown must not leave a live prompt-state key that a
+                // later session could hit (PERM-013).
+                self.invalidate_agent_start_cache();
                 // pi `resetShownWarnings()` (`index.ts:2125`).
                 self.warnings.reset();
                 self.stop_forwarding_watcher();
@@ -2145,6 +2522,17 @@ fn env_truthy(name: &str) -> bool {
     )
 }
 
+/// True iff `dir` is a readable directory holding at least one entry (PERM-023's install signal).
+///
+/// An unreadable-but-present directory reports `false` here rather than the fail-safe `true`
+/// [`ExtensionConfig::is_pristine_default_file`] uses for the ambiguous case, and deliberately so:
+/// there, "I cannot read the file" means "I cannot rule out that it was configured"; here, an
+/// `agents/` the process cannot even list is one the `PermissionManager` cannot load frontmatter
+/// from either, so attaching the gate on it would advertise enforcement that will not happen.
+fn dir_has_entry(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 /// DI-5 "installed" detection (opt-in): the gate attaches only when the user has installed it —
 /// either the [`INSTALL_ENV_VAR`] is truthy, or a policy file exists, or the extension config has
 /// been edited away from its auto-generated template. NOT installed → zero gating (unchanged core
@@ -2188,7 +2576,25 @@ pub fn is_installed(agent_dir: &Path, cwd: &Path) -> bool {
         return true;
     }
     let project_dir = PROJECT_AGENT_SUBDIR.iter().fold(cwd.to_path_buf(), |acc, seg| acc.join(seg));
-    if [agent_dir.join(POLICY_FILE), project_dir.join(POLICY_FILE)].iter().any(|p| p.exists()) {
+    // PERM-025: the GLOBAL policy file is probed at the same relocatable root
+    // `manager_paths_for` enforces from, so the probe and the engine can never inspect two
+    // different trees (the PERM-018 property, one rung up).
+    let policy_dir = policy_agent_dir(agent_dir);
+    if [policy_dir.join(POLICY_FILE), project_dir.join(POLICY_FILE)].iter().any(|p| p.exists()) {
+        return true;
+    }
+    // PERM-023: agent-scoped `permission:` frontmatter is an ENFORCED policy layer —
+    // `manager_paths_for` wires `agents_dir` / `project_agents_dir` and
+    // `PermissionManager::load_agent_permissions` reads `<agents_dir>/<agent>.md` on every check
+    // (pi `loadAgentPermissionsFrom` via `resolveAgentMarkdownPath`,
+    // `permission-manager.ts:582-595`, `:715-745` @v0.8.0). Probing only the two `.jsonc` files
+    // left an operator whose ONLY policy artifact is a persona's frontmatter with no extension
+    // attached and their deny rules silently inert — a fail-open.
+    //
+    // "Non-empty", not "exists": neither directory is ever written by this crate (unlike
+    // `config.json`, whose auto-materialization produced PERM-002's latch), but an empty
+    // `agents/` left behind by another tool is not an authored policy.
+    if [policy_dir.join("agents"), project_dir.join("agents")].iter().any(|p| dir_has_entry(p)) {
         return true;
     }
     // The RESOLVED path, not the raw default: `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` can point the
@@ -2295,6 +2701,175 @@ mod tests {
         assert!(is_installed(dir.path(), dir.path()));
     }
 
+    // ---------------------------------------------------------------- PERM-023: the install probe
+    // must see the agent-markdown policy layer the manager ENFORCES.
+
+    /// PERM-023 (RED before the fix). `manager_paths_for` wires `agents_dir` and
+    /// `PermissionManager::load_agent_permissions` reads `<agents_dir>/<agent>.md` frontmatter as an
+    /// enforced layer (pi `loadAgentPermissionsFrom`, `permission-manager.ts:715-745` @v0.8.0), but
+    /// `is_installed` looked only at the env var, the two `.jsonc` files and `config.json`. An
+    /// operator whose ONLY policy artifact is a persona's frontmatter therefore got no extension
+    /// attached and their `permission:` deny rules were silently inert — a fail-open.
+    #[test]
+    fn agent_markdown_frontmatter_alone_installs_the_gate() {
+        without_install_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let cwd = dir.path().join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            // No policy file, no config.json, no env var — before the fix this is `false`.
+            assert!(!is_installed(&agent_dir, &cwd), "control: nothing authored yet");
+
+            let agents = agent_dir.join("agents");
+            std::fs::create_dir_all(&agents).unwrap();
+            // An EMPTY agents dir is not an authored policy.
+            assert!(!is_installed(&agent_dir, &cwd), "an empty agents/ is not an install signal");
+
+            std::fs::write(
+                agents.join("coder.md"),
+                "---\npermission:\n  tools:\n    bash: deny\n---\n\nYou are a coder.\n",
+            )
+            .unwrap();
+            assert!(
+                is_installed(&agent_dir, &cwd),
+                "agent-scoped `permission:` frontmatter is an ENFORCED layer, so it must install"
+            );
+        });
+    }
+
+    /// The project-scoped half of the same signal: `<cwd>/.cyrup/agent/agents/` is wired as
+    /// `project_agents_dir` and enforced identically.
+    #[test]
+    fn project_scoped_agent_markdown_also_installs_the_gate() {
+        without_install_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let cwd = dir.path().join("work");
+            let project_agents =
+                PROJECT_AGENT_SUBDIR.iter().fold(cwd.clone(), |acc, seg| acc.join(seg)).join("agents");
+            std::fs::create_dir_all(&project_agents).unwrap();
+            assert!(!is_installed(&agent_dir, &cwd));
+            std::fs::write(project_agents.join("reviewer.md"), "---\npermission: {}\n---\n").unwrap();
+            assert!(is_installed(&agent_dir, &cwd));
+        });
+    }
+
+    // ------------------------------------------------ PERM-025: the relocatable global policy root
+
+    /// PERM-025 (RED before the fix — `POLICY_AGENT_DIR_ENV_KEY` had zero occurrences anywhere in
+    /// cyrup). pi `defaultPolicyAgentDir()` (`permission-manager.ts:31-33` @v0.8.0) relocates all
+    /// four global policy artifacts, and `createPermissionManagerForCwd` (`index.ts:1287-1301`)
+    /// supplies only the PROJECT paths, so in a live pi session every global path comes from that
+    /// override. Both the probe and the engine must consult it, or they inspect different trees.
+    #[test]
+    fn the_policy_agent_dir_override_moves_both_the_probe_and_the_engine() {
+        without_install_env(|| {
+            let _lock_note = (); // `without_install_env` already holds `env_lock`.
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let elsewhere = dir.path().join("elsewhere");
+            let cwd = dir.path().join("work");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::write(elsewhere.join(POLICY_FILE), r#"{"tools":{"bash":"deny"}}"#).unwrap();
+
+            // Control: the policy lives somewhere the un-overridden probe cannot see.
+            assert!(!is_installed(&agent_dir, &cwd));
+            assert_eq!(
+                PermissionSystemExtension::manager_paths_for(&agent_dir, &cwd).global_config_path,
+                agent_dir.join(POLICY_FILE)
+            );
+
+            let previous = std::env::var(POLICY_AGENT_DIR_ENV_KEY).ok();
+            // SAFETY: serialized by `env_lock`, held by the enclosing `without_install_env`.
+            unsafe { std::env::set_var(POLICY_AGENT_DIR_ENV_KEY, &elsewhere) };
+            let installed = is_installed(&agent_dir, &cwd);
+            let paths = PermissionSystemExtension::manager_paths_for(&agent_dir, &cwd);
+            // SAFETY: same scope/serialization.
+            unsafe {
+                match previous {
+                    Some(v) => std::env::set_var(POLICY_AGENT_DIR_ENV_KEY, v),
+                    None => std::env::remove_var(POLICY_AGENT_DIR_ENV_KEY),
+                }
+            }
+
+            assert!(installed, "the probe must follow the override, or it fails OPEN");
+            assert_eq!(paths.global_config_path, elsewhere.join(POLICY_FILE));
+            assert_eq!(paths.agents_dir, elsewhere.join("agents"));
+            assert_eq!(paths.legacy_global_settings_path, elsewhere.join("settings.json"));
+            assert_eq!(paths.global_mcp_config_path, elsewhere.join("mcp.json"));
+            // The PROJECT paths are supplied explicitly upstream too and must NOT be relocated.
+            let project =
+                PROJECT_AGENT_SUBDIR.iter().fold(cwd.clone(), |acc, seg| acc.join(seg));
+            assert_eq!(paths.project_global_config_path, Some(project.join(POLICY_FILE)));
+        });
+    }
+
+    /// pi's precedence detail: `process.env[KEY]?.trim()` and then a JS truthiness test, so a value
+    /// that trims to `""` is NOT an override.
+    #[test]
+    fn a_blank_policy_agent_dir_override_is_not_an_override() {
+        let _lock = crate::ext_config::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var(POLICY_AGENT_DIR_ENV_KEY).ok();
+        // SAFETY: serialized by `env_lock`, restored below.
+        unsafe { std::env::set_var(POLICY_AGENT_DIR_ENV_KEY, "   ") };
+        let resolved = policy_agent_dir(dir.path());
+        // SAFETY: same scope/serialization.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(POLICY_AGENT_DIR_ENV_KEY, v),
+                None => std::env::remove_var(POLICY_AGENT_DIR_ENV_KEY),
+            }
+        }
+        assert_eq!(resolved, dir.path(), "a whitespace-only value is falsy in pi and inert here");
+    }
+
+    // ----------------------------------------------- PERM-028: `decisionScope` trims like pi's
+
+    /// PERM-028. pi applies `getNonEmptyString` — which TRIMS (`common.ts:15-22`) — to
+    /// `target`/`command`/`path` and then falls through to a RAW `toolName ?? skillName`
+    /// (v0.8.0 `index.ts:581-592`). Cyrup filtered all five on a raw `!is_empty()`, so it kept the
+    /// padding and, worse, SELECTED a whitespace-only command that pi skips.
+    #[test]
+    fn permission_decision_scope_trims_the_first_three_and_not_the_last_two() {
+        let padded = DedupDetails {
+            command: Some("  git status  ".to_string()),
+            tool_name: Some("bash".to_string()),
+            ..DedupDetails::default()
+        };
+        assert_eq!(
+            PermissionSystemExtension::permission_decision_scope(&padded),
+            json!("git status"),
+            "pi's `getNonEmptyString` trims the command"
+        );
+
+        // A whitespace-only command must FALL THROUGH, not be selected.
+        let blank = DedupDetails {
+            command: Some("   ".to_string()),
+            tool_name: Some("bash".to_string()),
+            ..DedupDetails::default()
+        };
+        assert_eq!(PermissionSystemExtension::permission_decision_scope(&blank), json!("bash"));
+
+        // `toolName` is NOT run through `getNonEmptyString` upstream, so its padding survives.
+        let raw_tool =
+            DedupDetails { tool_name: Some("  bash  ".to_string()), ..DedupDetails::default() };
+        assert_eq!(
+            PermissionSystemExtension::permission_decision_scope(&raw_tool),
+            json!("  bash  "),
+            "pi falls through to a RAW `details.toolName`; trimming it here would be a NEW divergence"
+        );
+
+        // Nothing at all ⇒ pi returns `undefined`, cyrup's `null`.
+        assert_eq!(
+            PermissionSystemExtension::permission_decision_scope(&DedupDetails::default()),
+            Value::Null
+        );
+    }
+
     // ============================================================================================
     // Wave1b pi-parity regression tests (dossier: cyrup-permission-system/src/extension.rs).
     // ============================================================================================
@@ -2389,7 +2964,13 @@ mod tests {
         // extension's construction and a later `resources_discover` reload).
         write_file(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE), r#"{ "yoloMode": true }"#);
 
-        let outcome = ext.on_event(&HostEvent::ResourcesDiscover, &event_ctx(agent_dir)).await;
+        let outcome = ext.on_event(
+            &HostEvent::ResourcesDiscover {
+                cwd: agent_dir.display().to_string(),
+                reason: "reload".to_string(),
+            },
+            &event_ctx(agent_dir),
+        ).await;
         assert!(matches!(outcome, HookOutcome::Noop));
 
         assert!(guard(&ext.config).yolo_mode, "resources_discover reload must re-read config.json");
@@ -2428,7 +3009,7 @@ mod tests {
 
         let start_ctx = event_ctx(cwd2);
         let start_outcome =
-            ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &start_ctx).await;
+            ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &start_ctx).await;
         assert!(matches!(start_outcome, HookOutcome::Noop));
 
         // A bash call now, under `cwd2`, must be DENIED by the project override the rebuilt manager
@@ -2863,6 +3444,258 @@ mod tests {
         }
     }
 
+    // ==========================================================================================
+    // PERM-013 / PERM-024 / PERM-026 / PERM-027 — the lifecycle refresh + agent-start cache.
+    // ==========================================================================================
+
+    /// Records `set_active_tools` and `set_status` so the cache's call COUNTS can be asserted, and
+    /// enumerates a fixed registry so `should_expose_tool` has something to filter.
+    struct LifecycleRecorder {
+        names: Vec<String>,
+        active_tools: Mutex<Vec<Vec<String>>>,
+        statuses: Mutex<Vec<Option<String>>>,
+    }
+
+    impl LifecycleRecorder {
+        fn new() -> Self {
+            Self {
+                names: vec!["bash".to_string(), "read".to_string()],
+                active_tools: Mutex::new(Vec::new()),
+                statuses: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HostServices for LifecycleRecorder {
+        fn all_tool_names(&self) -> Option<Vec<String>> {
+            Some(self.names.clone())
+        }
+        fn set_active_tools(&self, tools: &[String]) {
+            guard(&self.active_tools).push(tools.to_vec());
+        }
+        fn set_status(&self, _key: &str, value: Option<&str>) {
+            guard(&self.statuses).push(value.map(str::to_string));
+        }
+    }
+
+    fn before_agent_start(prompt: &str) -> HostEvent {
+        HostEvent::BeforeAgentStart {
+            prompt: "hi".to_string(),
+            images: json!([]),
+            system_prompt: prompt.to_string(),
+            options: json!({}),
+            injected: Vec::new(),
+        }
+    }
+
+    /// PERM-013 (RED before the fix). pi calls `setActiveTools` ONLY when the active-tools cache key
+    /// changed (v0.8.0 `index.ts:1894-1898`) and short-circuits the two sanitizers on a prompt-state
+    /// key hit (`:1908-1913`). Cyrup recomputed and re-applied everything on every turn.
+    #[test]
+    fn repeated_before_agent_start_applies_the_active_tool_set_once() {
+        with_config_env_lock(async {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().to_path_buf();
+            let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+            init_ext(&ext).await;
+            let host = Arc::new(LifecycleRecorder::new());
+            ext.set_host_services(host.clone());
+            let ctx = event_ctx(agent_dir.clone());
+
+            for _ in 0..3 {
+                let _ = ext.on_event(&before_agent_start("SYSTEM"), &ctx).await;
+            }
+            assert_eq!(
+                guard(&host.active_tools).len(),
+                1,
+                "an unchanged policy + registry must apply the tool set exactly once (pi `:1895`)"
+            );
+
+            // A DIFFERENT system prompt changes the prompt-state key but not the tools key, so the
+            // sanitizers re-run while `setActiveTools` still does not.
+            let _ = ext.on_event(&before_agent_start("SYSTEM v2"), &ctx).await;
+            assert_eq!(guard(&host.active_tools).len(), 1);
+
+            // A session_start invalidates the whole cache (pi `invalidateAgentStartCache`,
+            // `index.ts:1823`), so the next turn re-applies.
+            let _ = ext
+                .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
+                .await;
+            let _ = ext.on_event(&before_agent_start("SYSTEM"), &ctx).await;
+            assert_eq!(
+                guard(&host.active_tools).len(),
+                2,
+                "the cache must be invalidated by session_start"
+            );
+        });
+    }
+
+    /// PERM-013's correctness hinge: a mid-session POLICY edit must invalidate the cached prompt
+    /// state even though prompt / cwd / registry are unchanged. That is why
+    /// `PermissionManager::policy_cache_stamp` is public upstream (`permission-manager.ts:781`).
+    #[test]
+    fn a_mid_session_policy_edit_re_applies_the_shaped_tool_set() {
+        with_config_env_lock(async {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().to_path_buf();
+            let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+            init_ext(&ext).await;
+            let host = Arc::new(LifecycleRecorder::new());
+            ext.set_host_services(host.clone());
+            let ctx = event_ctx(agent_dir.clone());
+
+            let _ = ext.on_event(&before_agent_start("SYSTEM"), &ctx).await;
+            assert_eq!(guard(&host.active_tools).last().map(Vec::len), Some(2));
+
+            // Deny `bash` at the tool level; the exposed set must shrink on the NEXT turn.
+            write_file(&agent_dir.join(POLICY_FILE), r#"{"tools":{"bash":"deny"}}"#);
+            // The manager is rebuilt at session_start / resources_discover, matching pi — a policy
+            // edit takes effect through the same reload path an operator triggers.
+            let _ = ext
+                .on_event(&HostEvent::SessionStart { reason: "reload".to_string(), previous_session_file: None }, &ctx)
+                .await;
+            let _ = ext.on_event(&before_agent_start("SYSTEM"), &ctx).await;
+            assert_eq!(
+                guard(&host.active_tools).last().cloned(),
+                Some(vec!["read".to_string()]),
+                "a tool-level bash deny must withhold `bash` (PERM-009's rule, re-applied)"
+            );
+        });
+    }
+
+    /// PERM-024 (RED before the fix). pi's `before_agent_start` handler's SECOND statement is
+    /// `refreshExtensionConfig(ctx)` (v0.8.0 `index.ts:1877`), so a mid-session `config.json` edit
+    /// takes effect at the top of the very next turn. Cyrup refreshed only at `session_start` and
+    /// `resources_discover`.
+    #[test]
+    fn before_agent_start_re_reads_config_json() {
+        with_config_env_lock(async {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().to_path_buf();
+            let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
+            write_file(&config_path, r#"{"yoloMode": false}"#);
+
+            let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+            init_ext(&ext).await;
+            let ctx = event_ctx(agent_dir.clone());
+            let _ = ext
+                .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
+                .await;
+            assert!(!ext.yolo_mode(), "control: the session started with yolo off");
+
+            write_file(&config_path, r#"{"yoloMode": true}"#);
+            let _ = ext.on_event(&before_agent_start("SYSTEM"), &ctx).await;
+            assert!(
+                ext.yolo_mode(),
+                "a mid-session config edit must be live at the top of the next turn (pi `:1877`)"
+            );
+        });
+    }
+
+    /// PERM-026 (RED before the fix). pi syncs the status pill from inside
+    /// `applyExtensionConfigSideEffects` (v0.8.0 `index.ts:1364-1366`), which EVERY refresh surface
+    /// reaches — including the `resources_discover` reload branch (`:1848`). Cyrup's sync lived only
+    /// in the `SessionStart` and `before_agent_start` arms, so a reload changed the live gating
+    /// behaviour while the pill kept the stale value.
+    #[test]
+    fn a_resources_discover_reload_re_syncs_the_yolo_pill() {
+        with_config_env_lock(async {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().to_path_buf();
+            let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
+            write_file(&config_path, r#"{"yoloMode": false}"#);
+
+            let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+            init_ext(&ext).await;
+            let host = Arc::new(LifecycleRecorder::new());
+            ext.set_host_services(host.clone());
+            let ctx = event_ctx(agent_dir.clone());
+            let _ = ext
+                .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
+                .await;
+            assert_eq!(
+                guard(&host.statuses).last().cloned(),
+                Some(None),
+                "control: yolo off paints no pill"
+            );
+
+            write_file(&config_path, r#"{"yoloMode": true}"#);
+            let _ = ext
+                .on_event(
+                    &HostEvent::ResourcesDiscover {
+                        cwd: agent_dir.display().to_string(),
+                        reason: "reload".to_string(),
+                    },
+                    &ctx,
+                )
+                .await;
+            assert_eq!(
+                guard(&host.statuses).last().cloned().flatten(),
+                Some(status::YOLO_STATUS_VALUE.to_string()),
+                "the reload must repaint the pill BEFORE any before_agent_start does"
+            );
+        });
+    }
+
+    /// PERM-027 (RED before the fix). pi writes a `lifecycle.reload` debug entry from BOTH reload
+    /// surfaces (v0.8.0 `index.ts:1834-1843` and `:1853-1857`) and from NEITHER on a startup
+    /// session, so an operator can tell a reload from a fresh start in the trail. Cyrup wrote none.
+    #[test]
+    fn reload_surfaces_write_lifecycle_reload_debug_entries() {
+        with_config_env_lock(async {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().to_path_buf();
+            write_file(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE), r#"{"debug": true}"#);
+
+            let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+            init_ext(&ext).await;
+            let ctx = event_ctx(agent_dir.clone());
+
+            // A STARTUP session writes no lifecycle line (pi gates on `event.reason === "reload"`).
+            let _ = ext
+                .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
+                .await;
+            assert_eq!(lifecycle_reload_entries(&agent_dir).len(), 0);
+
+            let _ = ext
+                .on_event(&HostEvent::SessionStart { reason: "reload".to_string(), previous_session_file: None }, &ctx)
+                .await;
+            let _ = ext
+                .on_event(
+                    &HostEvent::ResourcesDiscover {
+                        cwd: agent_dir.display().to_string(),
+                        reason: "reload".to_string(),
+                    },
+                    &ctx,
+                )
+                .await;
+
+            let triggers: Vec<String> = lifecycle_reload_entries(&agent_dir)
+                .into_iter()
+                .filter_map(|e| e["triggeredBy"].as_str().map(str::to_string))
+                .collect();
+            assert_eq!(
+                triggers,
+                vec!["session_start".to_string(), "resources_discover".to_string()],
+                "both reload surfaces must name themselves in the trail"
+            );
+        });
+    }
+
+    /// Read every `lifecycle.reload` record out of the debug JSONL this extension writes.
+    fn lifecycle_reload_entries(agent_dir: &Path) -> Vec<Value> {
+        let path = crate::logging::debug_path(
+            &PermissionSystemExtension::logs_dir_for(agent_dir),
+        );
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["event"] == json!("lifecycle.reload"))
+            .collect()
+    }
+
     /// PERM-003. pi threads `notifyWarning` into EVERY `PermissionManager` it builds
     /// (`createPermissionManagerForCwd(cwd, notifyWarning)`, `index.ts:1595,2081,2109-2110`) and
     /// into `refreshExtensionConfig` (`index.ts:1614`), so a policy or config file that exists but
@@ -2893,7 +3726,7 @@ mod tests {
         ext.set_host_services(host.clone());
 
         let ctx = event_ctx(agent_dir.clone());
-        let start = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx).await;
+        let start = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
         assert!(matches!(start, HookOutcome::Noop));
         // A real tool call is what forces the policy layers to be read.
         let _ = ext.on_event(&bash_call("call-1"), &ctx).await;
@@ -2918,13 +3751,70 @@ mod tests {
         let _ = ext.on_event(&bash_call("call-2"), &ctx).await;
         assert_eq!(host.warnings().len(), before, "warnings must be deduped within a session");
 
-        // ...and a NEW session re-arms them (pi `resetShownWarnings`, `index.ts:2079`), so a file
+        // ...and a NEW session re-arms them (pi `resetShownWarnings`, `index.ts:1819`), so a file
         // that is still broken is reported again rather than silently suppressed forever.
-        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx).await;
+        //
+        // PERM-021 — this asserts on the CONTENT of the delta, not on its size. The old
+        // `warnings().len() > before` was satisfiable by the POLICY warning alone, so a regression
+        // that stopped re-arming it while leaving the config channel alone would still have passed.
+        // It also cannot be satisfied by the CONFIG warning: `WarningSink::reset` clears only
+        // `shown`, while `last_config_warning` is cleared solely by a clean load or a successful
+        // save — a suppression that is pi's own (`index.ts:1370-1374`'s
+        // `result.warning !== lastConfigWarning` memo survives `resetShownWarnings`), so pi
+        // likewise reports a still-broken `config.json` once per PROCESS. The sibling test below
+        // covers the config channel through the clean-load-then-corrupt sequence that legitimately
+        // clears that memo.
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
         let _ = ext.on_event(&bash_call("call-3"), &ctx).await;
+        let after = host.warnings();
+        let delta = after.get(before..).unwrap_or_default();
         assert!(
-            host.warnings().len() > before,
-            "a new session must re-report a still-broken file; got {:?}",
+            delta.iter().any(|w| w.starts_with("Failed to parse permission config at")
+                && w.contains(POLICY_FILE)),
+            "a new session must re-report the still-broken POLICY file; delta was {delta:?}"
+        );
+        assert!(
+            !delta.iter().any(|w| w.starts_with("Failed to parse permission-system config at")),
+            "the CONFIG warning is memoized per-process by `last_config_warning` (pi              `index.ts:1370-1374`); a re-report here would mean that memo stopped working"
+        );
+    }
+
+    /// PERM-021's sibling: the CONFIG warning channel re-arms once `last_config_warning` is
+    /// legitimately cleared. pi clears it on a CLEAN load (`index.ts:1373-1374`
+    /// `else if (!result.warning) { lastConfigWarning = null; }`), so a session that loads a good
+    /// `config.json` and then finds a corrupt one reports the corruption — the case the count-based
+    /// assertion above could never distinguish from the policy warning firing twice.
+    #[tokio::test]
+    async fn a_config_warning_re_arms_after_a_clean_load_clears_the_memo() {
+        let _guard = crate::ext_config::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
+        // A VALID config: the load is clean, so `last_config_warning` is `None`.
+        write_file(&config_path, "{ \"debug\": false }");
+
+        let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+        init_ext(&ext).await;
+        let host = Arc::new(NotifyRecorder::new());
+        ext.set_host_services(host.clone());
+        let ctx = event_ctx(agent_dir.clone());
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
+        assert!(
+            !host.warnings().iter().any(|w| w.starts_with("Failed to parse permission-system config at")),
+            "a valid config must not warn; got {:?}",
+            host.warnings()
+        );
+
+        // Now corrupt it and reload. The memo is `None`, so the warning is NEW and must surface.
+        write_file(&config_path, "{ not json");
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
+        assert!(
+            host.warnings().iter().any(|w| w
+                .starts_with("Failed to parse permission-system config at")
+                && w.ends_with("using default extension config.")),
+            "a corrupt config after a clean load must reach the host; got {:?}",
             host.warnings()
         );
     }
@@ -3032,7 +3922,7 @@ mod tests {
         let ctx = event_ctx(dir.path().to_path_buf());
 
         cyrup_ext_subagents::clear_parent_session_anchor();
-        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx).await;
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
         assert_eq!(
             cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor()
                 .as_deref(),
@@ -3041,7 +3931,7 @@ mod tests {
         );
 
         let _ = ext
-            .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string() }, &ctx)
+            .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string(), target_session_file: None }, &ctx)
             .await;
         assert_eq!(
             cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor(),
@@ -3092,7 +3982,7 @@ mod tests {
 
         cyrup_ext_subagents::clear_parent_session_anchor();
         let _ = child
-            .on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx)
+            .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
             .await;
         assert_eq!(
             cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor(),
@@ -3119,7 +4009,7 @@ mod tests {
         // anchor out from under it.
         cyrup_ext_subagents::publish_parent_session_anchor("root-session-anchor");
         let _ = child
-            .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string() }, &ctx)
+            .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string(), target_session_file: None }, &ctx)
             .await;
         assert_eq!(
             cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor()
@@ -3196,7 +4086,7 @@ mod tests {
         let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-idem").await;
         let ctx = ui_ctx(dir.path());
 
-        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ctx).await;
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None }, &ctx).await;
         assert!(ext.has_live_forwarding_watcher(), "SessionStart must arm the watcher");
 
         // Ten more turns' worth of hooks — the exact re-entry pi performs.
@@ -3255,7 +4145,7 @@ mod tests {
 
         let _ = ext
             .on_event(
-                &HostEvent::SessionStart { reason: "startup".into() },
+                &HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None },
                 &headless_ctx(dir.path()),
             )
             .await;
@@ -3294,7 +4184,7 @@ mod tests {
         let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-detach").await;
 
         let _ = ext
-            .on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ui_ctx(dir.path()))
+            .on_event(&HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None }, &ui_ctx(dir.path()))
             .await;
         assert!(ext.has_live_forwarding_watcher(), "SessionStart with a UI arms the watcher");
 
@@ -3326,7 +4216,7 @@ mod tests {
         let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-config").await;
         let ctx = ui_ctx(dir.path());
 
-        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ctx).await;
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None }, &ctx).await;
         assert_eq!(ext.live_watcher_task_count(), 1, "one watcher, holding the shared handle");
 
         // The watcher's handle IS the extension's handle: a write here is visible to the task.

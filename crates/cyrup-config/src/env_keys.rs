@@ -182,7 +182,9 @@ mod tests {
         // This crate is `#![forbid(unsafe_code)]` and `std::env::remove_var` is unsafe in Rust
         // 2024, so the test cannot scrub the ambient value — reading it is safe and sufficient.
         let empty = env_of(&[]);
-        let ambient = std::env::var("OPENAI_API_KEY").ok().filter(|v| !v.is_empty());
+        let ambient = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|v| !v.is_empty());
         assert_eq!(
             find_env_keys("openai", Some(&empty)),
             ambient.as_ref().map(|_| vec!["OPENAI_API_KEY".to_string()]),

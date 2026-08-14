@@ -67,17 +67,44 @@ fn read_settings_file_strict(path: &Path) -> Result<Map<String, Value>, Subagent
     }
 }
 
+/// SUBA-029 — the RAII cross-process lock held across the whole read-modify-write of one
+/// `settings.json`.
+///
+/// This is a `cyrup-original` finding: pi's `agents.ts` is likewise unlocked, so the bar being
+/// missed is **cyrup's own** — `cyrup-config/src/settings.rs:1138` takes a `FileLock` plus
+/// `write_atomic` for exactly this file. Without it two concurrent `disable`/`enable`/`reset`
+/// actions can lose one another's write (both read the same base, the second write wins), or leave
+/// a truncated `settings.json` if the process dies mid-`fs::write` — disabling every agent until
+/// the file is hand-repaired.
+///
+/// The lock lives on a sidecar `<path>.lock`, so it survives the atomic rename over the target.
+fn lock_settings_file(path: &Path) -> Result<cyrup_config::lock::FileLock, SubagentError> {
+    cyrup_config::lock::FileLock::acquire(path).map_err(|e| {
+        SubagentError::MalformedSettings(format!(
+            "Failed to lock settings file '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
 /// pi `writeSettingsFile` (`agents.ts:706-709`): `mkdir -p` the parent, then write
 /// `JSON.stringify(settings, null, 2) + "\n"`. The two-space indent and the trailing newline are
 /// matched exactly so a cyrup-written settings file is diff-clean against a pi-written one.
+///
+/// SUBA-029: the bytes are unchanged; only the DELIVERY changed, from a bare `std::fs::write` to
+/// `cyrup_config::lock::write_atomic`'s temp-then-rename. `secret: false` because a settings file
+/// is not a credential store and pi writes it with the ordinary umask — this is a durability fix,
+/// not a permissions change.
 fn write_settings_file(path: &Path, settings: &Map<String, Value>) -> Result<(), SubagentError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(SubagentError::Spawn)?;
-    }
     let mut body = serde_json::to_string_pretty(&Value::Object(settings.clone()))
         .map_err(|e| SubagentError::Spawn(std::io::Error::other(e)))?;
     body.push('\n');
-    std::fs::write(path, body).map_err(SubagentError::Spawn)
+    cyrup_config::lock::write_atomic(path, body.as_bytes(), false).map_err(|e| {
+        SubagentError::MalformedSettings(format!(
+            "Failed to write settings file '{}': {e}",
+            path.display()
+        ))
+    })
 }
 
 /// Borrow `settings.subagents.agentOverrides` as an object, if all three levels are objects.
@@ -125,6 +152,9 @@ pub fn merge_builtin_agent_override(
     name: &str,
     fields: &Map<String, Value>,
 ) -> Result<(), SubagentError> {
+    // SUBA-029: ONE lock spans the read AND the write, so the read-modify-write is atomic against
+    // a concurrent management action on the same file rather than three independent operations.
+    let _lock = lock_settings_file(path)?;
     let mut settings = read_settings_file_strict(path)?;
     let mut next_overrides = overrides_of(&settings).cloned().unwrap_or_default();
     let mut entry = next_overrides.get(name).and_then(Value::as_object).cloned().unwrap_or_default();
@@ -149,6 +179,8 @@ pub fn merge_builtin_agent_override(
 ///
 /// As [`merge_builtin_agent_override`].
 pub fn remove_builtin_agent_override(path: &Path, name: &str) -> Result<bool, SubagentError> {
+    // SUBA-029: held across read+write; see `lock_settings_file`.
+    let _lock = lock_settings_file(path)?;
     let mut settings = read_settings_file_strict(path)?;
     let Some(overrides) = overrides_of(&settings) else {
         return Ok(false);
@@ -181,6 +213,8 @@ pub fn remove_builtin_agent_override_fields(
     name: &str,
     fields: &[&str],
 ) -> Result<bool, SubagentError> {
+    // SUBA-029: held across read+write; see `lock_settings_file`.
+    let _lock = lock_settings_file(path)?;
     let mut settings = read_settings_file_strict(path)?;
     let Some(overrides) = overrides_of(&settings) else {
         return Ok(false);
@@ -213,6 +247,62 @@ pub fn remove_builtin_agent_override_fields(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// SUBA-029 — the read-modify-write must be serialized and the write must be atomic.
+    ///
+    /// THE USER ACTION: two management actions land at once (a `/subagents` disable while a
+    /// background reset finishes, or two sessions in the same repo). Before the fix
+    /// `write_settings_file` was `create_dir_all` + a bare `std::fs::write`, and
+    /// `read_settings_file_strict` was a separate unlocked call — so both readers saw the same
+    /// base document and the second writer silently discarded the first's change, and a crash
+    /// mid-write left a truncated `settings.json` that disables every agent until hand-repaired.
+    /// cyrup's own bar (`cyrup-config/src/settings.rs:1138`) is `FileLock` + `write_atomic`.
+    ///
+    /// Red before the fix: with the bare `fs::write` both threads read `{}` and the last write
+    /// wins, so exactly ONE override survives.
+    #[test]
+    fn two_concurrent_overrides_on_one_settings_file_both_survive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        std::thread::scope(|scope| {
+            for name in ["scout", "worker"] {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let mut fields = Map::new();
+                    fields.insert("disabled".to_string(), Value::Bool(true));
+                    merge_builtin_agent_override(&path, name, &fields)
+                        .expect("each concurrent override must succeed");
+                });
+            }
+        });
+
+        let settings = read_settings_file_strict(&path).expect("settings parse");
+        let overrides = overrides_of(&settings).expect("agentOverrides written");
+        assert!(
+            overrides.contains_key("scout") && overrides.contains_key("worker"),
+            "both concurrent writes must persist — one losing the other is the lost-update bug; \
+             got {overrides:?}"
+        );
+    }
+
+    /// SUBA-029's format half: the lock/atomic change must not alter a single byte of the document
+    /// pi writes (two-space indent + trailing newline, `agents.ts:706-709`), or a cyrup-written
+    /// settings file stops being diff-clean against a pi-written one.
+    #[test]
+    fn the_written_settings_document_is_still_pi_byte_shaped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("settings.json");
+        let mut fields = Map::new();
+        fields.insert("disabled".to_string(), Value::Bool(true));
+        merge_builtin_agent_override(&path, "scout", &fields).expect("write");
+
+        let raw = std::fs::read_to_string(&path).expect("written");
+        assert!(raw.ends_with("}\n"), "trailing newline required: {raw:?}");
+        assert!(raw.contains("\n  \"subagents\": {"), "two-space indent required: {raw}");
+        // The parent directory is created on demand, as `mkdir -p` does.
+        assert!(path.parent().is_some_and(std::path::Path::is_dir));
+    }
 
     fn field(key: &str, value: Value) -> Map<String, Value> {
         let mut m = Map::new();

@@ -22,14 +22,30 @@ fn utf16_len(s: &str) -> usize {
 }
 
 /// Conservative chars/4 estimate for a single core message (Pi `estimateTokens`,
-/// `compaction.ts:256-296`).
+/// `compaction.ts:266-301`).
+///
+/// The per-role content functions are DIFFERENT upstream and are reproduced here:
+/// * `user` (`:270-275`) and `toolResult` (`:289-293`) both call
+///   `estimateTextAndImageContentChars` (`:246-260`), which counts **text and image only** — a
+///   `thinking` or `toolCall` block contributes 0.
+/// * `assistant` (`:276-288`) walks the blocks itself and counts **text, thinking and toolCall
+///   only** — an `image` block contributes 0.
+///
+/// Applying one content function to every role over-counted an assistant image by
+/// `ESTIMATED_IMAGE_CHARS` (1200 tokens) and counted thinking/toolCall blocks that reach a
+/// user/toolResult message through the read-tolerant deserializer. This estimate feeds the
+/// persisted `tokensBefore`, the keep-recent cut-point walk and the raw trigger, so the divergence
+/// moves the cut point. `cyrup_provider::estimate_message_tokens`
+/// (`cyrup-provider/src/utils/estimate.rs`) is the second port of the same function and already
+/// splits the arms this way.
 pub fn estimate_tokens(msg: &Message) -> u32 {
-    let blocks = match msg {
-        Message::User { content, .. } | Message::ToolResult { content, .. } => content,
-        Message::Assistant(a) => &a.content,
+    let chars: usize = match msg {
+        Message::User { content, .. } | Message::ToolResult { content, .. } => {
+            content.iter().map(text_and_image_chars).sum()
+        }
+        Message::Assistant(a) => a.content.iter().map(assistant_content_chars).sum(),
     };
-    let chars: usize = blocks.iter().map(content_chars).sum();
-    // Pi rounds UP: `Math.ceil(chars / 4)` (`compaction.ts:264,277,287,291`). Flooring would
+    // Pi rounds UP: `Math.ceil(chars / 4)` (`compaction.ts:274,288,293,297,301`). Flooring would
     // systematically under-count every message by up to 1 token and shift the cut-point / trigger.
     chars.div_ceil(4) as u32
 }
@@ -83,7 +99,20 @@ fn custom_content_chars(content: &serde_json::Value) -> usize {
     }
 }
 
-fn content_chars(c: &Content) -> usize {
+/// Pi `estimateTextAndImageContentChars` (`compaction.ts:246-260`) over a typed block: text and
+/// image only — `thinking` and `toolCall` fall through the `if/else if` chain and contribute 0.
+/// Used for the `user`, `toolResult` and `custom` roles.
+fn text_and_image_chars(c: &Content) -> usize {
+    match c {
+        Content::Text { text, .. } => utf16_len(text),
+        Content::Image { .. } => ESTIMATED_IMAGE_CHARS,
+        Content::Thinking { .. } | Content::ToolCall(_) => 0,
+    }
+}
+
+/// Pi's inline `assistant` accumulator (`compaction.ts:276-288`): text, thinking and toolCall only
+/// — an `image` block on an assistant message contributes **nothing**.
+fn assistant_content_chars(c: &Content) -> usize {
     match c {
         Content::Text { text, .. } => utf16_len(text),
         Content::Thinking { thinking, .. } => utf16_len(thinking),
@@ -91,7 +120,7 @@ fn content_chars(c: &Content) -> usize {
             utf16_len(&tc.name)
                 + serde_json::to_string(&tc.arguments).map(|s| utf16_len(&s)).unwrap_or(0)
         }
-        Content::Image { .. } => ESTIMATED_IMAGE_CHARS,
+        Content::Image { .. } => 0,
     }
 }
 

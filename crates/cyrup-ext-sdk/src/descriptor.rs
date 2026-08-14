@@ -161,13 +161,23 @@ impl ExecOptions {
     }
 }
 
-/// UI dialog options for `confirm`/`input`/`select` (Pi `ExtensionUIDialogOptions`, types.ts:89;
-/// sdk gap #4): a live-countdown `timeout_ms` and/or a programmatic-dismiss `signal_id` (the host
-/// maps the id to an abort token). Both optional; the default `{}` is an indefinite dialog.
+/// UI dialog options for `confirm`/`input`/`select` (pi `ExtensionUIDialogOptions`,
+/// `extensions/types.ts:95-100` @v0.83.0): a live-countdown timeout and/or a programmatic-dismiss
+/// `signal_id` (the host maps the id to an abort token). Both optional; the default `{}` is an
+/// indefinite dialog.
+///
+/// **EXT-048 — the wire key is `timeout`, not `timeoutMs`.** Upstream is
+/// `interface ExtensionUIDialogOptions { signal?: AbortSignal; timeout?: number; }` with
+/// `timeout?: number` at `:100`, documented "Timeout in milliseconds. Dialog auto-dismisses with
+/// live countdown display". `git grep -n timeoutMs v0.83.0 -- packages/coding-agent/src` returns
+/// only unrelated startup-ui / http-dispatcher / package-manager hits, so there is no wire variant
+/// spelled `timeoutMs` anywhere upstream — and the in-tree comments that cited `types.ts:89` for
+/// it were citing a blank line. `timeout` is now the canonical name; `timeoutMs` is accepted as an
+/// alias so bags cyrup's own SDK already wrote keep deserializing.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DialogOptions {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "timeout", alias = "timeoutMs", default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_id: Option<String>,

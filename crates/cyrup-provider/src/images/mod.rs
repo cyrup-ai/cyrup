@@ -745,7 +745,7 @@ mod tests {
         Arc::new(create_images_provider(CreateImagesProviderOptions {
             id: "openrouter".into(),
             name: Some("OpenRouter".into()),
-            auth: ProviderAuth::with_api_key(env_key(["OPENROUTER_API_KEY"])),
+            auth: ProviderAuth::with_api_key(env_key("OpenRouter API key", ["OPENROUTER_API_KEY"])),
             models: openrouter_image_models(),
             refresh_models: None,
             api: openrouter::factory(),

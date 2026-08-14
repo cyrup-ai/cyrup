@@ -934,9 +934,9 @@ impl Tool for StructuredOutputTool {
 
     /// Per func-03 R-03-039 a guideline must NAME its tool so it stays meaningful once the tool is
     /// absent — pi's wording already does ("...calling the `structured_output` tool...").
-    fn prompt_guidelines(&self) -> &[&str] {
+    fn prompt_guidelines(&self) -> Vec<&str> {
         const GUIDELINES: &[&str] = &[STRUCTURED_OUTPUT_INSTRUCTION];
-        GUIDELINES
+        GUIDELINES.to_vec()
     }
 
     /// Sequential, not [`ExecMode::Parallel`]: this call terminates the step and writes the single
@@ -1474,7 +1474,13 @@ impl NativeExtension for SubagentPromptRuntime {
             && let HostEvent::ToolCall { name, input, .. } = ev
             && let Some(reason) = gate.evaluate(name, input).await
         {
-            return HookOutcome::Block { reason: Some(reason) };
+            return HookOutcome::Block {
+                reason: Some(reason),
+                // pi's `ToolCallEventResult.terminate` is `undefined` on every refusal it emits
+                // (`extensions/types.ts:1072-1079` @v0.84.1); a permission refusal asks for THIS
+                // call to be blocked, not for the batch to end.
+                terminate: false,
+            };
         }
         match ev {
             // pi `:323-341`.
@@ -1537,6 +1543,9 @@ impl NativeExtension for SubagentPromptRuntime {
                             name,
                             tool_count,
                         )),
+                        // A budget block exists so the child can FINALIZE with the tools left to
+                        // it (`tool-budget.ts`'s `block` list), so it must not hint termination.
+                        terminate: false,
                     };
                 }
                 HookOutcome::Noop
@@ -1854,7 +1863,7 @@ mod tool_budget_runtime_tests {
         let mut blocked = Vec::new();
         for n in 1..=5u32 {
             match ext.on_event(&call(n, "read"), &ctx).await {
-                HookOutcome::Block { reason } => blocked.push((n, reason.unwrap_or_default())),
+                HookOutcome::Block { reason, .. } => blocked.push((n, reason.unwrap_or_default())),
                 HookOutcome::Noop => {}
                 other => panic!("unexpected tool_call outcome at {n}: {other:?}"),
             }
@@ -1975,7 +1984,7 @@ mod permission_gate_tests {
         );
 
         let ctx = ctx();
-        let HookOutcome::Block { reason } = ext.on_event(&call("write"), &ctx).await else {
+        let HookOutcome::Block { reason, .. } = ext.on_event(&call("write"), &ctx).await else {
             panic!("a denied tool must be blocked");
         };
         assert_eq!(
@@ -1999,7 +2008,7 @@ mod permission_gate_tests {
             "{\"write\":\"ask\"}",
             Some(&audit.display().to_string()),
         );
-        let HookOutcome::Block { reason } = ext.on_event(&call("write"), &ctx()).await else {
+        let HookOutcome::Block { reason, .. } = ext.on_event(&call("write"), &ctx()).await else {
             panic!("an unanswerable ask must fail closed");
         };
         assert_eq!(
@@ -2053,7 +2062,7 @@ mod permission_gate_tests {
     #[tokio::test]
     async fn an_invalid_policy_blocks_every_gated_tool_instead_of_failing_open() {
         let ext = env_extension("{\"write\":\"maybe\"}", None);
-        let HookOutcome::Block { reason } = ext.on_event(&call("write"), &ctx()).await else {
+        let HookOutcome::Block { reason, .. } = ext.on_event(&call("write"), &ctx()).await else {
             panic!("an invalid policy must not fail open");
         };
         let reason = reason.expect("a reason");

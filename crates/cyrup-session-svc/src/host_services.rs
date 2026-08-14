@@ -1064,11 +1064,13 @@ impl HostServices for LiveHostServices {
         }
     }
 
-    fn set_label(&self, entry_id: &str, label: &str) {
+    fn set_label(&self, entry_id: &str, label: Option<&str>) {
         // Set/replace the entry's label on the live tree (Pi `setLabel` → `appendLabel`,
-        // agent-session.ts:2276-2279). A no-op result (unknown id / busy) degrades silently.
+        // agent-session.ts:2276-2279). `None` CLEARS the label — pi's `setLabel(entryId, undefined)`
+        // — which is why the capability's parameter is optional. A no-op result (unknown id / busy)
+        // degrades silently.
         let _ = self.with_manager(|mgr| {
-            mgr.append_label(&EntryId::from(entry_id), Some(label)).map_err(|e| e.to_string())?;
+            mgr.append_label(&EntryId::from(entry_id), label).map_err(|e| e.to_string())?;
             Ok(())
         });
     }

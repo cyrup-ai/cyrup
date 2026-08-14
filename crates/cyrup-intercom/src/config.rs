@@ -1,8 +1,10 @@
 //! [`IntercomConfig`] + `load_config` + `ask_timeout_ms` — a 1:1 port of `pi-intercom/config.ts`.
 //!
-//! The load-bearing behavior (`config.test.ts:63-80`): `load_config` validates every key and
-//! **fails CLOSED to `inbound_trigger = Never`** on ANY parse/validation error (`config.ts:139-142`)
-//! — a corrupt config must never leave inbound auto-triggering at its permissive default.
+//! The load-bearing behavior: `load_config` validates every key and, from **v0.10.0**, raises
+//! `Failed to load intercom config at {path}: {message}` on ANY parse/validation error
+//! (`v0.10.1 config.ts:153-155`). It used to fail CLOSED to `inbound_trigger = Never`; upstream
+//! removed that fallback because it was indistinguishable from a deliberate restrictive setting and
+//! never named the file.
 
 use std::path::Path;
 
@@ -41,6 +43,12 @@ pub struct IntercomConfig {
     pub inbound_trigger: InboundTrigger,
     /// Optional custom status suffix (`config.ts:37`).
     pub status: Option<String>,
+    /// `stableId` (`v0.10.1 config.ts:38-39`) — "Optional stable intercom session ID for
+    /// restart-stable addressing". Preferred over the host's per-process session id at registration
+    /// (`v0.10.1 index.ts:435` `resolveConfiguredIntercomSessionId`), so a restarted worker keeps
+    /// the address its peers already hold. Trimmed non-empty or a hard error; never a silent
+    /// default (`v0.10.1 config.ts:141-150`).
+    pub stable_id: Option<String>,
     /// Enable/disable intercom (`config.ts:54`, true).
     pub enabled: bool,
     /// Show the reply hint in incoming messages (`config.ts:55`, true).
@@ -55,6 +63,7 @@ impl Default for IntercomConfig {
             confirm_send: false,
             inbound_trigger: InboundTrigger::Always,
             status: None,
+            stable_id: None,
             enabled: true,
             reply_hint: true,
         }
@@ -67,26 +76,36 @@ pub fn config_path(intercom_dir: &Path) -> std::path::PathBuf {
     intercom_dir.join("config.json")
 }
 
-/// `loadConfig` (`config.ts:58-143`): read `<intercomDir>/config.json`, validate each key, and
-/// **fail CLOSED to `inbound_trigger = Never`** on ANY parse/validation error. A missing file
-/// returns the defaults unchanged.
-#[must_use]
-pub fn load_config(intercom_dir: &Path) -> IntercomConfig {
+/// `loadConfig` (`v0.10.1 config.ts:58-156`): read `<intercomDir>/config.json` and validate each
+/// key. A missing file returns the defaults unchanged; ANY parse/validation error is a hard error
+/// naming the path.
+///
+/// v0.10.0 **replaced** the fail-closed fallback (`console.error(...); return { ...defaults,
+/// inboundTrigger: "never" }`) with a throw (`v0.10.1 config.ts:153-155`):
+///
+/// ```text
+/// const message = error instanceof Error ? error.message : String(error);
+/// throw new Error(`Failed to load intercom config at ${configPath}: ${message}`, { cause: error });
+/// ```
+///
+/// CHANGELOG 0.10.0: "Surface malformed intercom config errors with path context instead of silently
+/// falling back to defaults." The old behaviour was indistinguishable from a deliberate
+/// `inboundTrigger: "never"` — intercom connected, listed, sent and asked normally but never
+/// auto-triggered, and the only diagnostic was a `tracing::warn!` invisible in the TUI.
+///
+/// # Errors
+/// `Failed to load intercom config at {path}: {message}` for an unreadable or invalid config.
+pub fn load_config(intercom_dir: &Path) -> Result<IntercomConfig, String> {
     let path = config_path(intercom_dir);
     if !path.exists() {
-        return IntercomConfig::default();
+        return Ok(IntercomConfig::default());
     }
-    match parse_config(&std::fs::read_to_string(&path).unwrap_or_default()) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            // pi: `console.error(...); return { ...defaults, inboundTrigger: "never" }` (config.ts:140-141).
-            tracing::warn!(path = %path.display(), error = %err, "failed to load intercom config; failing closed to inbound_trigger=never");
-            IntercomConfig {
-                inbound_trigger: InboundTrigger::Never,
-                ..IntercomConfig::default()
-            }
-        }
-    }
+    // pi's `readFileSync` throw is caught by the same `catch`, so a read failure carries the same
+    // path-prefixed message a parse failure does.
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to load intercom config at {}: {e}", path.display()))?;
+    parse_config(&raw)
+        .map_err(|e| format!("Failed to load intercom config at {}: {e}", path.display()))
 }
 
 /// The pure validation core (`config.ts:64-138`), split out so the fail-closed table can be tested
@@ -138,6 +157,16 @@ fn parse_config(raw: &str) -> Result<IntercomConfig, String> {
     if let Some(v) = obj.get("status") {
         let s = v.as_str().ok_or_else(|| "\"status\" must be a string".to_string())?;
         config.status = Some(s.to_string());
+    }
+    // `v0.10.1 config.ts:141-150`. Fail-closed on both halves: a non-string is an error, and a
+    // present-but-blank value is an error too rather than a silent `undefined`.
+    if let Some(v) = obj.get("stableId") {
+        let s = v.as_str().ok_or_else(|| "\"stableId\" must be a string".to_string())?;
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err("\"stableId\" must not be empty".to_string());
+        }
+        config.stable_id = Some(trimmed.to_string());
     }
     Ok(config)
 }
@@ -206,18 +235,45 @@ mod tests {
         assert!(parse_config("[]").is_err());
     }
 
+    /// `v0.10.1 config.ts:153-155` (v0.10.0). A malformed config must NAME ITS PATH and fail, not
+    /// silently become `inboundTrigger: "never"` — that fallback made a typo indistinguishable from
+    /// a deliberate restrictive setting.
     #[test]
-    fn load_config_fails_closed_to_never_on_corrupt_file() {
+    fn load_config_errors_with_the_path_on_a_corrupt_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(config_path(dir.path()), "{ this is not valid json").unwrap();
-        let cfg = load_config(dir.path());
-        assert_eq!(cfg.inbound_trigger, InboundTrigger::Never);
+        let path = config_path(dir.path());
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let err = load_config(dir.path()).expect_err("a corrupt config is a hard error");
+        assert!(
+            err.starts_with(&format!("Failed to load intercom config at {}: ", path.display())),
+            "must name the config path: {err}"
+        );
+        assert!(err.contains("valid JSON"), "must carry the underlying parse message: {err}");
     }
 
     #[test]
     fn load_config_missing_file_is_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_config(dir.path()), IntercomConfig::default());
+        assert_eq!(load_config(dir.path()).expect("missing file is not an error"), IntercomConfig::default());
+    }
+
+    /// `v0.10.1 config.ts:141-150`. `stableId` used to be accepted and silently ignored, which reads
+    /// as a working feature.
+    #[test]
+    fn stable_id_is_parsed_trimmed_and_fails_closed() {
+        assert_eq!(
+            parse_config(r#"{"stableId":"  worker-a  "}"#).expect("valid").stable_id.as_deref(),
+            Some("worker-a")
+        );
+        assert!(parse_config("{}").expect("valid").stable_id.is_none());
+        assert_eq!(
+            parse_config(r#"{"stableId":7}"#).expect_err("non-string"),
+            "\"stableId\" must be a string"
+        );
+        assert_eq!(
+            parse_config(r#"{"stableId":"   "}"#).expect_err("blank"),
+            "\"stableId\" must not be empty"
+        );
     }
 
     #[test]

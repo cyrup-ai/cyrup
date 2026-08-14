@@ -244,14 +244,39 @@ const TOOL_INPUT_PREVIEW_MAX_LENGTH: usize = 200;
 /// Max inline sanitized-text summary length (pi `TOOL_TEXT_SUMMARY_MAX_LENGTH`, `index.ts:396`).
 const TOOL_TEXT_SUMMARY_MAX_LENGTH: usize = 80;
 
-/// pi `truncateInlineText` (`index.ts:398-400`): truncate to `max_length` chars with a trailing `…`.
+/// pi `truncateInlineText` (v0.8.0 `permission-prompts.ts:91-93`):
+/// `value.length > maxLength ? `${value.slice(0, maxLength)}…` : value`.
+///
+/// **PERM-030 — the unit is UTF-16 code units**, both for the test and for the cut point, because
+/// that is what JS `String.length` and `String.slice` operate on. This previously used
+/// `chars().count()` / `chars().take()` (Unicode scalars), so any astral-plane character — an emoji
+/// in a bash command, a path, or `write` content — moved the truncation boundary relative to pi
+/// for byte-identical input. Same convention as `wildcard.rs:81` and
+/// `logging::sensitive_log_metadata`; this is the surface a HUMAN reads before allowing or denying,
+/// so it is the one place the three counting units in this crate mattered most.
+///
+/// `slice(0, maxLength)` in JS can split a surrogate pair, yielding a lone surrogate. Rust `String`
+/// cannot hold one, so a cut that would land mid-pair backs up to the preceding boundary — the only
+/// possible divergence, it is one code unit, and it is in the direction of showing less rather than
+/// producing an unpaired surrogate. \[CYRUP-DELTA]
 fn truncate_inline_text(value: &str, max_length: usize) -> String {
-    if value.chars().count() > max_length {
-        let head: String = value.chars().take(max_length).collect();
-        format!("{head}…")
-    } else {
-        value.to_string()
+    if value.encode_utf16().count() <= max_length {
+        return value.to_string();
     }
+    // Walk char boundaries accumulating UTF-16 width, stopping at the last boundary that does not
+    // exceed `max_length`.
+    let mut units = 0usize;
+    let mut end = 0usize;
+    for (index, ch) in value.char_indices() {
+        let width = ch.len_utf16();
+        if units + width > max_length {
+            end = index;
+            break;
+        }
+        units += width;
+        end = index + ch.len_utf8();
+    }
+    format!("{}…", &value[..end])
 }
 
 /// pi `sanitizeInlineText` (`index.ts:402-405`): whitespace-collapsed, trimmed, truncated inline
@@ -446,14 +471,16 @@ fn format_edit_input_for_prompt(input: &Map<String, Value>) -> String {
         .unwrap_or_else(|| "with edit input".to_string())
 }
 
-/// pi `formatWriteInputForPrompt` (`index.ts:495-500`).
+/// pi `formatWriteInputForPrompt` (v0.8.0 `permission-prompts.ts:189-194`).
 fn format_write_input_for_prompt(input: &Map<String, Value>) -> String {
     let path = get_prompt_path(input);
     let content = input.get("content").and_then(Value::as_str).unwrap_or("");
     let summary = format!(
         "({}, {})",
         format_count(count_text_lines(content), "line", "lines"),
-        format_count(content.chars().count(), "character", "characters")
+        // PERM-030: pi `formatCount(content.length, …)` (`permission-prompts.ts:193`) — UTF-16 code
+        // units, so a single emoji reads "2 characters" upstream. `chars().count()` said 1.
+        format_count(content.encode_utf16().count(), "character", "characters")
     );
     match path {
         Some(p) => format!("for '{p}' {summary}"),
@@ -724,6 +751,62 @@ pub fn format_external_directory_unavailable_reason(path_value: &str) -> String 
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+    use serde_json::json;
+
+    // ------------------------------------------------------- PERM-030: UTF-16 counting units
+
+    /// PERM-030 (RED before the fix). pi truncates with `value.slice(0, maxLength)` against
+    /// `value.length` (v0.8.0 `permission-prompts.ts:91-93`) — UTF-16 CODE UNITS. Cyrup used
+    /// `chars().count()` / `chars().take()` (Unicode SCALARS), so an astral-plane character moved
+    /// the boundary: with `max_length = 2`, pi's `"a😀b".slice(0,2)` keeps `"a"` plus the emoji's
+    /// HIGH surrogate, i.e. one whole scalar's worth of budget consumed by the emoji, while
+    /// `chars().take(2)` kept `"a😀"` — a visibly different approval dialog for identical input.
+    #[test]
+    fn truncate_inline_text_counts_utf16_code_units() {
+        // Under the cap in scalars (3) but OVER it in UTF-16 units (4) ⇒ pi truncates, cyrup used
+        // not to.
+        assert_eq!("a\u{1F600}b".chars().count(), 3);
+        assert_eq!("a\u{1F600}b".encode_utf16().count(), 4);
+        let out = truncate_inline_text("a\u{1F600}b", 3);
+        assert!(out.ends_with('…'), "3 UTF-16 units < 4 ⇒ pi truncates; got {out:?}");
+        // "a" costs 1 unit and the emoji costs 2, so the pair fits a 3-unit budget EXACTLY — pi's
+        // `"a😀b".slice(0, 3)` keeps both code units of the surrogate pair and yields "a😀", the
+        // only character dropped being the trailing "b".
+        assert_eq!(out, "a\u{1F600}\u{2026}");
+
+        // `max_length = 2` is the case where the budget lands INSIDE the surrogate pair, and the
+        // one the doc comment above is about. pi's `slice(0, 2)` keeps "a" plus the emoji's lone
+        // HIGH surrogate — an unpaired surrogate, which is a well-formed JS string but has no
+        // UTF-8 representation at all, so Rust cannot reproduce it byte-for-byte and stops at the
+        // last whole scalar instead. Same visible result: a lone high surrogate has no glyph and
+        // renders as U+FFFD in any terminal pi's prompt would be drawn in, so "a…" is what both
+        // sides show. This is the boundary `chars().take(2)` used to get wrong by keeping "a😀".
+        assert_eq!(truncate_inline_text("a\u{1F600}b", 2), "a\u{2026}");
+
+        // Exactly at the cap in UTF-16 units ⇒ untouched (pi's test is `>`, not `>=`).
+        assert_eq!(truncate_inline_text("a\u{1F600}b", 4), "a\u{1F600}b");
+
+        // Pure ASCII is unchanged in every unit, so the classic case still behaves.
+        assert_eq!(truncate_inline_text("abcdef", 3), "abc…");
+        assert_eq!(truncate_inline_text("abc", 3), "abc");
+
+        // A BMP non-ASCII char is 1 UTF-16 unit (and 2 UTF-8 bytes) — the byte-count reading would
+        // have truncated here and must not.
+        assert_eq!(truncate_inline_text("café", 4), "café");
+    }
+
+    /// The write-tool summary's character count is `content.length` upstream
+    /// (`permission-prompts.ts:193`), so one emoji reads "2 characters".
+    #[test]
+    fn the_write_summary_counts_characters_in_utf16_units() {
+        let input: Map<String, Value> =
+            serde_json::from_value(json!({ "path": "/w/a.txt", "content": "\u{1F600}" })).unwrap();
+        let summary = format_write_input_for_prompt(&input);
+        assert!(
+            summary.contains("2 characters"),
+            "pi's `formatCount(content.length, …)` is UTF-16 units; got {summary:?}"
+        );
+    }
 
     fn bash_deny() -> PermissionCheckResult {
         PermissionCheckResult {
