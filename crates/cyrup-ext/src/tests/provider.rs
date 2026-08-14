@@ -132,3 +132,40 @@ fn provider_hub_defers_until_bind_then_flushes() {
     assert!(hub.get("acme").is_none());
     assert!(!hub.unregister("acme"), "second unregister is a no-op");
 }
+
+/// EXT-051 — pi's `oauth` block gained `isSubscription?: boolean` at
+/// `pi/packages/coding-agent/src/core/extensions/types.ts:1475` @v0.84.1 ("Whether access through
+/// this auth method is backed by a provider subscription"); it is ABSENT at the v0.83.0 baseline.
+/// The value already crossed the seam inside the untyped `oauth` blob — what was missing was the
+/// typed read, so an extension-supplied subscription provider was indistinguishable from a metered
+/// API-key one on the host side.
+#[test]
+fn ext051_oauth_is_subscription_is_readable_on_a_guest_provider() {
+    let mut hub = ProviderHub::new();
+    hub.register(
+        "sub".into(),
+        &json!({ "name": "Sub", "oauth": { "name": "Sub Login", "isSubscription": true } }),
+    )
+    .unwrap();
+    hub.register(
+        "metered".into(),
+        &json!({ "name": "Metered", "oauth": { "name": "Metered Login" } }),
+    )
+    .unwrap();
+    hub.register("keyed".into(), &json!({ "name": "Keyed", "apiKey": "sk-x" })).unwrap();
+
+    let sub = hub.get("sub").expect("registered");
+    assert!(sub.has_oauth());
+    assert!(sub.oauth_is_subscription(), "a declared isSubscription must reach the host typed");
+
+    let metered = hub.get("metered").expect("registered");
+    assert!(metered.has_oauth());
+    assert!(
+        !metered.oauth_is_subscription(),
+        "an OMITTED optional reads false — upstream's `isSubscription?`, not a tri-state"
+    );
+
+    let keyed = hub.get("keyed").expect("registered");
+    assert!(!keyed.has_oauth());
+    assert!(!keyed.oauth_is_subscription(), "no oauth block at all is not a subscription");
+}

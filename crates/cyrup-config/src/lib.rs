@@ -22,6 +22,7 @@ pub mod config_value;
 pub mod env;
 pub mod env_keys;
 pub mod error;
+pub mod keybindings;
 pub mod lock;
 pub mod login;
 pub mod model;
@@ -48,6 +49,10 @@ pub use config_value::{
 pub use env::{CacheRetention, CliConfigOverrides, ConfigDirs, EnvVars};
 pub use env_keys::{api_key_env_vars, find_env_keys, get_env_api_key};
 pub use error::{AuthError, ConfigError, ScopedError};
+pub use keybindings::{
+    KEYBINDING_IDS, KEYBINDING_NAME_MIGRATIONS, OrderedKeybindings, migrate_keybindings_config,
+    migrate_keybindings_config_file, migrated_keybinding_name, stringify_keybindings,
+};
 pub use model::{
     CliModelResult, InitialModelResult, ModelCostOverride, ModelCycler, ModelDefinition, ModelFile,
     ModelOverride, ModelResolver, ModelScopeDiagnostic, ModelScopeDiagnosticCode,
@@ -57,7 +62,9 @@ pub use model::{
     models_json_provider_is_configured, parse_thinking_level, provider_is_configured,
     resolve_cli_model, restore_model_from_session,
 };
-pub use paths::{normalize_path, normalize_path_buf, normalize_path_with_home};
+pub use paths::{
+    normalize_path, normalize_path_buf, normalize_path_with_home, normalize_windows_shell_path,
+};
 pub use policy::NetworkPolicy;
 pub use provider_compose::{ConfiguredApiKeyAuth, compose_provider_registry};
 pub use settings::{

@@ -351,7 +351,17 @@ pub struct PermissionSystemExtension {
     /// pi `lastConfigWarning` (`index.ts:1572`): the extension-config warning already reported, so
     /// a repeated refresh that keeps failing the same way notifies once and a refresh that STOPS
     /// failing re-arms the report (`refreshExtensionConfig`, `index.ts:1610-1618`).
-    last_config_warning: Mutex<Option<String>>,
+    ///
+    /// PERM-007: `Arc`-wrapped so the shared [`crate::config_modal::ConfigController`] clears the
+    /// SAME memo the load path sets — the modal's writer is pi's `saveExtensionConfig`, which does
+    /// `lastConfigWarning = null` at `index.ts:1414`.
+    last_config_warning: Arc<Mutex<Option<String>>>,
+    /// PERM-007 — pi's `PermissionSystemConfigController` (`config-modal.ts:8-12`), registered at
+    /// `index.ts:1504-1511`. The config WRITER, extracted into a shared object so the `'static`
+    /// [`crate::config_modal::PermissionSystemSettingsOverlay`] can hold it without borrowing this
+    /// extension. [`Self::save_extension_config`] delegates here, so there is exactly one
+    /// implementation of the normalize → write → touch-memory ordering contract.
+    controller: Arc<crate::config_modal::ConfigController>,
     /// pi `extensionLogger` (`index.ts:148-150`): the `debug`-gated audit/debug JSONL trail
     /// ([`crate::logging`], pi `logging.ts`). Shares the SAME `config` `Arc` above, so the operator
     /// flipping `"debug": true` in `config.json` arms it on the next
@@ -493,7 +503,7 @@ impl PermissionSystemExtension {
     /// entirely, and only [`Self::resolved_config_path_for`] honours that. Every consumer here
     /// either goes through that helper or through [`ExtensionConfig::load`] /
     /// [`ExtensionConfig::save`], which resolve internally.
-    fn config_path_for(agent_dir: &Path) -> PathBuf {
+    pub(crate) fn config_path_for(agent_dir: &Path) -> PathBuf {
         agent_dir.join(CONFIG_DIR).join(CONFIG_FILE)
     }
 
@@ -509,7 +519,7 @@ impl PermissionSystemExtension {
     /// so with the override set the install decision and the `enabled` decision could inspect two
     /// different files and disagree. This helper is the one accessor; use it, not
     /// [`Self::config_path_for`].
-    fn resolved_config_path_for(agent_dir: &Path) -> PathBuf {
+    pub(crate) fn resolved_config_path_for(agent_dir: &Path) -> PathBuf {
         ExtensionConfig::resolve_config_path(&Self::config_path_for(agent_dir))
     }
 
@@ -696,36 +706,21 @@ impl PermissionSystemExtension {
     /// rather than two toasts saying half each. See [`Self::run_permission_system_command`], the
     /// only caller, and the `Ok(None)` convention documented on
     /// [`cyrup_ext::NativeExtension::execute_command`].
+    ///
+    /// PERM-007: the BODY now lives on the shared
+    /// [`crate::config_modal::ConfigController`] — pi's own `{getConfig, setConfig, getConfigPath}`
+    /// indirection (`config-modal.ts:8-12`, registered `index.ts:1504-1511`) — so the `'static`
+    /// settings overlay commits through the identical writer this method does. Nothing about the
+    /// ordering contract moved with it; see [`crate::config_modal::ConfigController::set_config`].
     pub fn save_extension_config(&self, next: &ExtensionConfig) -> Result<(), String> {
-        // pi `const normalized = normalizePermissionSystemConfig(next)` (`:1403`).
-        let normalized = next.normalized();
-        // pi `const saved = savePermissionSystemConfig(normalized)` (`:1404`).
-        let saved = normalized.save(&Self::config_path_for(&self.agent_dir));
-        if !saved.success {
-            // pi `:1405-1410`: report the error (which the caller raises as an `error`-level
-            // notification, NOT the deduped `warning` sink — a save the human just asked for and did
-            // not get must be reported every time) and return WITHOUT mutating in-memory state. A
-            // failure that carries no message still reports one: the caller must never be left with
-            // an empty explanation, which is what an `Option` here would allow.
-            return Err(saved
-                .error
-                .unwrap_or_else(|| "the permission-system config could not be written".to_string()));
-        }
+        self.controller.set_config(next)
+    }
 
-        // pi `setExtensionConfig(normalized)` (`:1412`).
-        *guard(&self.config) = normalized.clone();
-        // pi `syncPermissionSystemStatusWhenPossible(normalized, ctx)` (`:1413`).
-        self.sync_status_when_possible(&normalized);
-        // pi `lastConfigWarning = null` (`:1414`): the file on disk is now this extension's own
-        // output, so whatever the last load complained about is resolved — a later recurrence must
-        // be reported again rather than suppressed by the memo.
-        *guard(&self.last_config_warning) = None;
-        // pi `writeDebugEntry("config.saved", {...})` (`:1416-1419`).
-        self.write_debug_entry(
-            "config.saved",
-            &json!({ "debug": normalized.debug, "yoloMode": normalized.yolo_mode }),
-        );
-        Ok(())
+    /// PERM-007 — the shared config controller, so a caller that needs the WRITER without holding
+    /// this extension (an overlay, a runtime-API consumer) can take an `Arc` of it.
+    #[must_use]
+    pub fn config_controller(&self) -> Arc<crate::config_modal::ConfigController> {
+        Arc::clone(&self.controller)
     }
 
     /// pi `getYoloMode: () => extensionConfig.yoloMode` (v0.8.0 `index.ts:1482`).
@@ -873,7 +868,13 @@ impl PermissionSystemExtension {
     fn run_permission_system_command(&self, args: &str) -> Option<String> {
         let mut parts = args.split_whitespace();
         let Some(setting) = parts.next() else {
-            return Some(self.render_settings());
+            // PERM-007 — pi's bare `/permission-system` is
+            // `openPermissionSystemSettingsModal(ctx, controller)` (`config-modal.ts:63-122`), a
+            // live `ctx.ui.custom(…, { overlay: true, … })`. Hand the host the real overlay; the
+            // text dump below is now only the fall-back for a host that owns no interactive
+            // surface, which is precisely pi's own `if (!ctx.hasUI)` branch (`common.ts:188-198`)
+            // and NOT an error.
+            return self.open_settings_overlay();
         };
         // PERM-029 — two zero-argument emitters for the artifacts upstream ships as FILES and
         // documents in its README (`README.md:655`'s CLI validation recipe, `:659`'s "Add
@@ -975,6 +976,40 @@ impl PermissionSystemExtension {
         }
     }
 
+    /// PERM-007 — hand [`crate::config_modal::PermissionSystemSettingsOverlay`] to the host and
+    /// block until the human closes it, then report whatever the overlay could not commit.
+    ///
+    /// Returns `None` when the overlay ran (the human has already seen everything on screen, so a
+    /// trailing Info toast would be noise — the `Ok(None)` convention on
+    /// [`cyrup_ext::NativeExtension::execute_command`]), and `Some(text)` with the read-only dump
+    /// when no interactive surface took it. [`cyrup_ext::HostServices::open_overlay`] returning
+    /// `false` is exactly pi's `if (!ctx.hasUI)` case, not a failure.
+    fn open_settings_overlay(&self) -> Option<String> {
+        let Some(services) = self.host_services.get() else {
+            return Some(self.render_settings());
+        };
+        let overlay = Box::new(crate::config_modal::PermissionSystemSettingsOverlay::new(
+            self.config_controller(),
+        ));
+        // `open_overlay` consumes the box, so the commit failure cannot be read back off it. It is
+        // read off the CONTROLLER's own last-error slot instead, which the overlay writes through.
+        let controller = self.config_controller();
+        if !services.open_overlay(overlay) {
+            return Some(self.render_settings());
+        }
+        // pi's modal notifies inline through `ctx.ui.notify` while it is still on screen
+        // (`index.ts:1407`); cyrup's overlay owns the whole screen and has already shown the cause,
+        // so the toast here is the SAME one the text path raises and only for a failure that
+        // survived to the close.
+        if let Some(cause) = controller.take_last_error() {
+            self.notify_save_failure(
+                "Failed to save the permission-system config; the last change was not applied.",
+                &cause,
+            );
+        }
+        None
+    }
+
     /// The modal's initial view (pi `buildSettingItems`, `config-modal.ts:24-41`, plus its
     /// `helpText: \`Config file: ${controller.getConfigPath()}\``, `:85`), as text.
     fn render_settings(&self) -> String {
@@ -1061,6 +1096,17 @@ impl PermissionSystemExtension {
             logger.set_reporter(Arc::new(move |message: &str| sink.notify(message)));
         }
         let ask_channel = ask_channel(&logger);
+        // PERM-007: built here so the controller and this extension share ONE `config` cell, ONE
+        // `lastConfigWarning` memo, ONE host-services slot and ONE audit trail — pi's module-scope
+        // bindings, made explicit (the same shape PERM-008 gave `AuditTrail`).
+        let last_config_warning = Arc::new(Mutex::new(None));
+        let controller = Arc::new(crate::config_modal::ConfigController::new(
+            Arc::clone(&shared_config),
+            agent_dir.clone(),
+            Arc::clone(&last_config_warning),
+            Arc::clone(&host_services),
+            Arc::clone(&logger),
+        ));
         Self {
             id: ExtensionId::from(EXTENSION_ID),
             manager: Mutex::new(manager_with_warnings(paths, &warnings)),
@@ -1077,7 +1123,8 @@ impl PermissionSystemExtension {
             agent_start_cache: Mutex::new(AgentStartCache::default()),
             explicitly_requested_skill_names: Mutex::new(HashSet::new()),
             warnings,
-            last_config_warning: Mutex::new(None),
+            last_config_warning,
+            controller,
             logger,
             has_ui: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -2065,16 +2112,25 @@ impl PermissionSystemExtension {
     /// non-idempotent start: the slot only ever holds ONE `JoinHandle`, so overwriting it would hide
     /// a leaked task, whereas the leaked task's `Arc` clone cannot hide.
     ///
-    /// The non-watcher holders are exactly two and are structural, not incidental: the extension's
-    /// own `self.config` field, and `self.logger`, which must share the SAME handle so a config
-    /// reload re-arms the audit trail (pi's `extensionLogger` reads the module-scope
-    /// `extensionConfig` binding, `index.ts:146-150`). Adding a THIRD holder without updating this
-    /// constant makes the count read one watcher too many — which is precisely how this seam is
-    /// meant to fail: loudly, at the assertion, rather than silently under-counting a leak.
+    /// The non-watcher holders are exactly three and are structural, not incidental:
+    ///
+    /// 1. the extension's own `self.config` field;
+    /// 2. `self.logger`, which must share the SAME handle so a config reload re-arms the audit
+    ///    trail (pi's `extensionLogger` reads the module-scope `extensionConfig` binding,
+    ///    `index.ts:146-150`);
+    /// 3. `self.controller` (PERM-007), which must share the SAME handle so the settings modal's
+    ///    writer and this extension's reader are one cell — pi's controller literal closes over the
+    ///    same module-scope `extensionConfig` binding the logger reads (`getConfig: () =>
+    ///    extensionConfig`, v0.8.0 `index.ts:1507`, in the `registerCommand` at `:1502-1512`).
+    ///
+    /// Adding a FOURTH holder without updating this constant makes the count read one watcher too
+    /// many — which is precisely how this seam is meant to fail: loudly, at the assertion, rather
+    /// than silently under-counting a leak. `a_fresh_extension_holds_no_watcher_config_handles`
+    /// pins the baseline directly, so drift is caught even when no watcher is armed.
     #[cfg(test)]
     fn live_watcher_task_count(&self) -> usize {
-        /// `self.config` + `self.logger` — see the note above.
-        const NON_WATCHER_CONFIG_HOLDERS: usize = 2;
+        /// `self.config` + `self.logger` + `self.controller` — see the note above.
+        const NON_WATCHER_CONFIG_HOLDERS: usize = 3;
         Arc::strong_count(&self.config).saturating_sub(NON_WATCHER_CONFIG_HOLDERS)
     }
 
@@ -2187,7 +2243,7 @@ fn source_str(s: CheckSource) -> &'static str {
 
 /// Lock a `Mutex`, recovering from poison rather than panicking (no-panic policy). Held only across
 /// synchronous sections — never across an `.await`.
-fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -4076,6 +4132,29 @@ mod tests {
         let ext = PermissionSystemExtension::new_forwarding_parent(agent_dir, dir.to_path_buf());
         ext.set_host_services(Arc::new(WatcherHost(session.to_string())));
         (guard, ext)
+    }
+
+    /// The BASELINE `live_watcher_task_count` subtracts. It is a hand-maintained constant naming
+    /// the structural `config` holders (`self.config`, `self.logger`, `self.controller`), and it
+    /// has already gone stale once: PERM-007 added the `ConfigController` as a third holder, and
+    /// every watcher-count assertion silently started reading one watcher too many.
+    ///
+    /// Pinned here, on an extension with NO watcher armed, so a future holder trips this test —
+    /// which names the cause — instead of only the PERM-005 tests, which would blame a watcher leak
+    /// that never happened.
+    #[test]
+    fn a_fresh_extension_holds_no_watcher_config_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let ext =
+            PermissionSystemExtension::new_forwarding_parent(agent_dir, dir.path().to_path_buf());
+        assert_eq!(
+            ext.live_watcher_task_count(),
+            0,
+            "no hook has run, so no watcher exists; a non-zero count means a new structural holder \
+             of the shared `config` handle was added without updating NON_WATCHER_CONFIG_HOLDERS"
+        );
     }
 
     /// PERM-005, the crux: the three per-turn hooks fire on EVERY turn, so a non-idempotent start

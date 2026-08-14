@@ -145,12 +145,19 @@ pub enum UiEffect {
     /// Pi `setStatus(key, text?)`, types.ts:141-142; RPC wire `method:"setStatus"`
     /// (rpc-mode.ts:163-172). `text: None` clears the key.
     SetStatus { key: String, text: Option<String> },
-    /// Pi `setWidget(key, content, options?)`, types.ts:164-173; RPC wire `method:"setWidget"`
-    /// (rpc-mode.ts:190-206). Cyrup's WIT `set-widget(widget-json)` collapsed Pi's 3-argument
-    /// `{key, content, options}` shape into ONE opaque JSON payload (`cyrup-ext-sdk::Ctx::set_widget`
-    /// takes `impl Serialize` verbatim) — `widget` carries that payload as-is, not re-split into
-    /// Pi's `widgetKey`/`widgetLines`/`widgetPlacement` fields (there is no cyrup-side convention to
-    /// re-derive them from).
+    /// Pi `setWidget(key, content, options?)`, types.ts:164-173 @v0.83.0; RPC wire
+    /// `method:"setWidget"` (rpc-mode.ts:193-206).
+    ///
+    /// SEAM-011/EXT-047: the WIT no longer collapses pi's three arguments — `set-widget` carries
+    /// `key`, `lines` and `placement` separately and the host receives them as
+    /// [`cyrup_ext::host::WidgetPlacement`] + `Option<&[String]>`. This variant is a FRONT-END
+    /// CHANNEL carrier, not the wire, so it keeps one JSON object; the object's keys are pi's own
+    /// (`key`, `lines`, `placement`) and every consumer — the TUI's `ExtensionWidget::from_json` and
+    /// `cyrup-modes`' `extension_ui_effect_json`, which projects them onto pi's
+    /// `widgetKey`/`widgetLines`/`widgetPlacement` — reads them by those names.
+    ///
+    /// `lines: null` is pi's `content: undefined` and REMOVES the key's widget
+    /// (`interactive-mode.ts:1935-1938`); it is never merely an empty list.
     SetWidget { widget: Value },
     /// Pi `setHeader(factory)`, types.ts:184. Pi's RPC mode never delivers this over the wire at all
     /// ("Custom header not supported in RPC mode - requires TUI access", rpc-mode.ts:209-211) because
@@ -714,8 +721,21 @@ impl HostServices for LiveHostServices {
         self.emit_ui_effect(UiEffect::SetStatus { key: key.to_string(), text: text.map(str::to_string) });
     }
 
-    fn set_widget(&self, widget: &Value) {
-        self.emit_ui_effect(UiEffect::SetWidget { widget: widget.clone() });
+    fn set_widget(
+        &self,
+        key: &str,
+        lines: Option<&[String]>,
+        placement: cyrup_ext::host::WidgetPlacement,
+    ) {
+        // SEAM-011 — pi's three arguments, carried under pi's own field names. `lines: null` is
+        // pi's `content: undefined` (remove this key), which is why it is not flattened to `[]`.
+        self.emit_ui_effect(UiEffect::SetWidget {
+            widget: json!({
+                "key": key,
+                "lines": lines,
+                "placement": placement.as_str(),
+            }),
+        });
     }
 
     fn set_header(&self, content: &str) {

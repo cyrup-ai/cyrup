@@ -504,8 +504,12 @@ async fn run_proxy(
         let frame = match frame {
             Ok(f) => f,
             // A mid-stream transport error / cancellation (Pi: the read loop throws, proxy.ts:184).
+            // AGENT-035 — route through `proxy_error_message` so a cancellation carries pi's own
+            // `"Request aborted by user"` (proxy.ts:186-190) rather than `ProviderError::Aborted`'s
+            // bare `Display`. Non-abort variants are unaffected: only `Http` and `Aborted` have
+            // arms, and `Http` cannot arise once the response headers are already accepted.
             Err(e) => {
-                let _ = tx.send(error_terminal(&builder, &cancel, e.to_string())).await;
+                let _ = tx.send(error_terminal(&builder, &cancel, proxy_error_message(&e))).await;
                 return;
             }
         };
@@ -536,6 +540,20 @@ async fn run_proxy(
                 return;
             }
         }
+    }
+    // AGENT-035 — pi's SECOND hand-written abort check, the one after the read loop drains:
+    // `if (options.signal?.aborted) { throw new Error("Request aborted by user"); }`
+    // (`packages/agent/src/proxy.ts:208-211` @v0.83.0, `:210-213` @v0.84.1) — it sits between the
+    // loop and `stream.end()` at `:212`, so an abort that lands after the last frame still produces
+    // a terminal `error` event with `stopReason: "aborted"` instead of a silent clean close.
+    // Reachable here for the same reason it is upstream: the frame stream's own cancel branch only
+    // fires while a poll is outstanding, so a cancel landing after it returned `None` is seen only
+    // by this check.
+    if cancel.is_cancelled() {
+        let _ = tx
+            .send(error_terminal(&builder, &cancel, "Request aborted by user".to_string()))
+            .await;
+        return;
     }
     // Clean end: the `done`/`error` event already carried the terminal (proxy.ts:213). Dropping `tx`
     // ends the stream.
@@ -619,6 +637,22 @@ pub(crate) fn proxy_error_message(e: &ProviderError) -> String {
             }
             format!("Proxy error: {} {}", status, status_text(*status))
         }
+        // AGENT-035 — pi's own abort message. `streamProxy` checks the signal by hand at two
+        // points and throws a LITERAL: `if (options.signal?.aborted) { throw new Error("Request
+        // aborted by user"); }` — once between reads (`packages/agent/src/proxy.ts:186-190`
+        // @v0.83.0, `:188-192` @v0.84.1) and once after the read loop drains (`:208-211` /
+        // `:210-213`). The outer catch then puts that text in `partial.errorMessage` (`:215-218`),
+        // so it is what an aborted proxy turn shows in the transcript. cyrup surfaced
+        // `ProviderError::Aborted`'s `Display` — the bare `"aborted"` — instead.
+        //
+        // [CYRUP-DELTA] pi has a SECOND abort string on this path that cyrup cannot reproduce: an
+        // abort that interrupts `fetch`/`reader.read()` mid-await rejects with undici's own
+        // `AbortError`, whose message pi passes through unchanged. cyrup's `open_sse` frame stream
+        // is itself cancel-aware (`crates/cyrup-provider/src/stream/sse.rs:406-412`, a `biased`
+        // select that yields `ProviderError::Aborted` before polling the body), so both of pi's
+        // cases collapse onto one value here and are indistinguishable. The string pi's own SOURCE
+        // contains is the one ported; the other is a JS-runtime artifact.
+        ProviderError::Aborted => "Request aborted by user".to_string(),
         other => other.to_string(),
     }
 }

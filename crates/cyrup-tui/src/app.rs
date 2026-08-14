@@ -124,14 +124,19 @@ impl ExtensionWidget {
     /// `theme.fg("muted", "... (widget truncated)")`).
     pub const TRUNCATED: &'static str = "... (widget truncated)";
 
-    /// Recover Pi's three arguments from cyrup's single opaque `set-widget(widget-json)` payload.
+    /// Read Pi's three `setWidget` arguments off the [`UiEffect::SetWidget`] carrier.
     ///
-    /// An object shaped like Pi's call — `{"key": …, "content": …, "options": {"placement": …}}` —
-    /// is read field by field; `content` may be a string (split on newlines, as Pi's `Text` rows
-    /// are) or an array of strings (Pi's `string[]` arm at `:1942-1951`). `placement` is also
-    /// accepted at the top level, since cyrup's SDK takes any `impl Serialize` and there is no
-    /// enforced envelope. Anything else is rendered as its JSON text under an empty key, which is
-    /// the only honest reading of a payload with no structure to recover.
+    /// SEAM-011/EXT-047: `set-widget` carries pi's `key`, `lines` and `placement` separately now
+    /// (`wit/world.wit`, `HostServices::set_widget`), and `LiveHostServices` re-packs exactly those
+    /// three under pi's own names for this in-process channel (`host_services.rs:724-737`) — so this
+    /// reads `{"key": …, "lines": [...], "placement": "aboveEditor" | "belowEditor"}` and nothing
+    /// else. It used to read a cyrup-invented `{"content": …, "options": {"placement": …}}` blob;
+    /// after the seam widened, that spelling stopped arriving and every widget was dropped.
+    ///
+    /// `lines` is Pi's `content: string[]` arm (`:1942-1951`); `null`/absent is Pi's
+    /// `content === undefined`, which REMOVES the key (`:1935-1938`) and is read here as an empty
+    /// line list. A payload that is not an object at all has no structure to recover, so it renders
+    /// as its JSON text under an empty key.
     pub fn from_json(v: &serde_json::Value) -> Self {
         let obj = v.as_object();
         let key = obj
@@ -139,12 +144,14 @@ impl ExtensionWidget {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // `options?.placement ?? "aboveEditor"` (`interactive-mode.ts:1925` @v0.83.0) — the WIT
+        // resolves the default host-side, so the carrier always spells the placement out.
         let placement = obj
-            .and_then(|o| o.get("options").and_then(|opt| opt.get("placement")).or_else(|| o.get("placement")))
+            .and_then(|o| o.get("placement"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("aboveEditor");
         let below = placement == "belowEditor";
-        let content = obj.and_then(|o| o.get("content"));
+        let content = obj.and_then(|o| o.get("lines"));
         let mut lines: Vec<String> = match content {
             Some(serde_json::Value::String(text)) => {
                 text.lines().map(str::to_string).collect()
@@ -517,10 +524,10 @@ pub struct AppState {
     /// `extensionWidgetsBelow`, removes the key from BOTH before re-inserting, and drops it entirely
     /// when `content` is `undefined`. TUI-014.
     ///
-    /// **[CYRUP-DELTA]** cyrup's WIT collapses Pi's three-argument `setWidget(key, content,
-    /// options)` into one opaque JSON payload (`host_services.rs:148-154`), so the key, the lines
-    /// and the placement are recovered from that payload by [`ExtensionWidget::from_json`] instead
-    /// of arriving as separate arguments.
+    /// Pi's three `setWidget(key, content, options)` arguments arrive separately since SEAM-011
+    /// widened the WIT; the in-process [`UiEffect::SetWidget`] carrier re-packs them under pi's own
+    /// `key`/`lines`/`placement` names (`host_services.rs:150-161`), which
+    /// [`ExtensionWidget::from_json`] reads back field by field.
     pub extension_widgets: Vec<ExtensionWidget>,
     /// Whether a branch summarization spawned by [`App::begin_tree_navigation`] is still in flight.
     /// While set, `Esc` routes to `AgentSession::abort_branch_summary` instead of the turn abort —

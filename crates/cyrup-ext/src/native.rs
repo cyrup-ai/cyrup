@@ -233,6 +233,7 @@ pub(crate) type InitParts = (
     Vec<String>,
     u32,
     Vec<String>,
+    bool,
 );
 
 /// What a native extension declares during [`NativeExtension::init`]: its subscriptions plus any
@@ -259,6 +260,10 @@ pub struct InitApi {
     autocomplete_providers: u32,
     /// EXT-018: bus topics, pi's `events` on the same one API object.
     bus_topics: Vec<String>,
+    /// EXT-019: whether this extension registered a markdown transformer. A BOOL, not a list,
+    /// because upstream stores `extension.markdownTransformer = transformer` — at most one per
+    /// extension (`extensions/loader.ts:309-312` @v0.84.1, field at `types.ts:1703`).
+    markdown_transformer: bool,
 }
 
 impl InitApi {
@@ -331,6 +336,16 @@ impl InitApi {
         self.shortcuts.push((key.into(), description));
     }
 
+    /// Register this extension's markdown transformer (EXT-019; pi
+    /// `registerMarkdownTransformer(transformer)`, `extensions/types.ts:1292` @v0.84.1, impl
+    /// `loader.ts:309-312`). The transformer itself is [`NativeExtension::transform_markdown`];
+    /// this only declares that it exists, matching the guest side, where the closure lives behind
+    /// the `transform-markdown` export. Calling it twice is the same as calling it once — upstream
+    /// ASSIGNS the field, so an extension has at most one transformer.
+    pub fn register_markdown_transformer(&mut self) {
+        self.markdown_transformer = true;
+    }
+
     /// Declare a CLI flag (EXT-035; pi `registerFlag`, `extensions/loader.ts:274-410` @v0.83.0).
     /// `spec` is the flag's JSON spec; the resolved value is read back through
     /// [`crate::ExtensionRegistry::flag`].
@@ -381,6 +396,7 @@ impl InitApi {
             self.autocomplete,
             self.autocomplete_providers,
             self.bus_topics,
+            self.markdown_transformer,
         )
     }
 }
@@ -520,6 +536,26 @@ pub trait NativeExtension: Send + Sync {
         Err(ExtError::Component(format!("native extension has no handler for command `{name}`")))
     }
 
+    /// Run the keyboard shortcut declared through [`InitApi::register_shortcut`] (EXT-035).
+    ///
+    /// pi's shortcut handler is `handler: (ctx: ExtensionContext) => Promise<void> | void`
+    /// (`pi/packages/coding-agent/src/core/extensions/types.ts:1249-1255` @v0.83.0, the same shape
+    /// on `ExtensionShortcut` at `:1524-1529`) — it returns nothing, so there is no output channel
+    /// to mirror here: a handler with something to say calls [`crate::HostServices::notify`], as it
+    /// does upstream through `ctx.ui.notify`.
+    ///
+    /// `ctx` is COMMAND tier, matching the guest path
+    /// ([`crate::host::LiveExtension::execute_shortcut`]) and pi, where a shortcut handler receives
+    /// the same `ExtensionContext` a command handler does and may therefore call session-replacing
+    /// ops.
+    ///
+    /// Without this, `InitApi::register_shortcut` was a write-only surface: the key landed in the
+    /// registry, `shortcut_keys()` advertised it, `/hotkeys` listed it, and pressing it resolved an
+    /// owner that `run_shortcut` could not reach because it looked only in the live-WASM map.
+    async fn execute_shortcut(&self, key: &str, _ctx: &HostCtx) -> Result<(), ExtError> {
+        Err(ExtError::Component(format!("native extension has no handler for shortcut `{key}`")))
+    }
+
     /// Render a tool CALL / custom MESSAGE this extension declared a renderer for (Pi
     /// `renderCall`, extensions/types.ts:472-473). `key` is the TOOL NAME for a tool renderer
     /// declared via [`InitApi::register_tool_renderer`], or the CUSTOM TYPE for a message renderer
@@ -536,6 +572,21 @@ pub trait NativeExtension: Send + Sync {
     /// extensions/types.ts:475-481).
     fn render_result(&self, _key: &str, _result: &serde_json::Value) -> Option<serde_json::Value> {
         None
+    }
+
+    /// Transform transcript markdown before the host renders it (EXT-019; pi
+    /// `MarkdownTransformer = (markdown, context) => string`, `extensions/types.ts:1153` @v0.84.1
+    /// — a POST-BASELINE addition, absent at v0.83.0). Called only when [`Self::init`] declared one
+    /// through [`InitApi::register_markdown_transformer`].
+    ///
+    /// `ctx` is `MarkdownTransformContext` (`types.ts:1147-1151`):
+    /// `{messageType: "user"|"assistant"|"assistant-thinking", isStreaming, availableWidth}`.
+    ///
+    /// Sync for the same reason as [`Self::render_call`]: it runs on the UI's render path. A PANIC
+    /// is contained by the host and the text passes through unchanged, so a broken transformer can
+    /// never blank a line of transcript.
+    fn transform_markdown(&self, markdown: &str, _ctx: &serde_json::Value) -> String {
+        markdown.to_string()
     }
 
     /// Render a custom ENTRY this extension declared a renderer for via

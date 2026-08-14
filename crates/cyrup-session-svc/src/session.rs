@@ -351,6 +351,17 @@ pub struct AgentSession {
     /// an all-`&self` type and so is frozen at build time; reading the reset path from it made every
     /// run with a `before_agent_start` subscriber revert the prompt to the startup tool set.
     base_system_prompt: Mutex<String>,
+    /// The `before_agent_start` handler's replacement prompt for the CURRENT run, or `None` when no
+    /// handler replaced it — Pi `private _systemPromptOverride?: string` (agent-session.ts:373
+    /// @v0.83.0). Assigned at `:1247`, cleared at `:1251`, and cleared again in `_runAgentPrompt`'s
+    /// `finally` (`:1069`) so it never outlives its run. Every site that writes
+    /// `agent.state.systemPrompt` resolves `this._systemPromptOverride ?? this._baseSystemPrompt`
+    /// (`:534`, `:940`) — [`Self::effective_system_prompt`].
+    ///
+    /// Holding it apart from [`Self::base_system_prompt`] is the whole point: it is what lets the
+    /// turn-boundary refresh re-push a system prompt WITHOUT undoing a handler's mid-run
+    /// sanitization, which is why cyrup's single-slot version could not push one at all (DRIFT-033).
+    system_prompt_override: Mutex<Option<String>>,
     compaction_settings: CompactionSettings,
     branch_summary_settings: BranchSummarySettings,
     /// Long-lived token handed to the extension subscriber (distinct from per-run cancellation).
@@ -418,8 +429,17 @@ pub struct AgentSession {
     shell: ShellConfig,
     shell_path: Option<String>,
     shell_command_prefix: Option<String>,
-    /// Cancel handle for an in-flight `execute_bash` (Pi `_bashAbortController`).
-    bash_cancel: Mutex<Option<CancelToken>>,
+    /// Cancel handles for the in-flight `execute_bash` calls, one entry per call — Pi
+    /// `private readonly _bashAbortControllers = new Set<AbortController>()`
+    /// (agent-session.ts:337 @v0.83.0). Pi keys the set on `AbortController` object IDENTITY, not on
+    /// the caller-supplied `options.id` (which is optional and may repeat), so cyrup keys it on a
+    /// private monotonic handle minted per call by [`Self::next_bash_cancel_id`]. It was a single
+    /// `Option<CancelToken>` slot: with two user bash commands in flight the second overwrote the
+    /// first, so `abort_bash` reached only the newest and the first to finish cleared the slot while
+    /// the other still ran (DRIFT-029).
+    bash_cancels: Mutex<Vec<(u64, CancelToken)>>,
+    /// Source of the identity handles in [`Self::bash_cancels`]; see that field.
+    next_bash_cancel_id: std::sync::atomic::AtomicU64,
     /// Bash messages deferred while a run streams, flushed after the turn (Pi `_pendingBashMessages`).
     pending_bash: Mutex<Vec<AgentMessage>>,
     /// The live session metadata the `bash` TOOL publishes to every child as `CYRUP_*` (Pi
@@ -503,6 +523,7 @@ impl AgentSession {
             model: Mutex::new(model),
             compaction_model: Mutex::new(compaction_model),
             base_system_prompt: Mutex::new(base_system_prompt),
+            system_prompt_override: Mutex::new(None),
             compaction_settings: extras.compaction_settings,
             branch_summary_settings: extras.branch_summary_settings,
             session_cancel,
@@ -533,7 +554,8 @@ impl AgentSession {
             shell: extras.shell,
             shell_path: extras.shell_path,
             shell_command_prefix: extras.shell_command_prefix,
-            bash_cancel: Mutex::new(None),
+            bash_cancels: Mutex::new(Vec::new()),
+            next_bash_cancel_id: std::sync::atomic::AtomicU64::new(0),
             pending_bash: Mutex::new(Vec::new()),
             bash_session_env: extras.bash_session_env,
             read_model_vision: extras.read_model_vision,
@@ -774,6 +796,11 @@ impl AgentSession {
                 }
             }
         }
+        // Pi `_runAgentPrompt`'s `finally` opens with `this._systemPromptOverride = undefined;`
+        // (agent-session.ts:1069 @v0.83.0), BEFORE the bash flush and the settle emit — a
+        // `before_agent_start` replacement is scoped to its own run and must not survive into the
+        // next one (DRIFT-033).
+        *Self::lock(&self.system_prompt_override) = None;
         // Pi `finally` (agent-session.ts:982-984): flush deferred bash messages from this turn.
         self.flush_pending_bash_messages().await;
         // SEAM-005: the run has FULLY settled — the post-run loop above is done, so no retry,
@@ -1235,6 +1262,10 @@ impl AgentSession {
         // Fast path: no extension listens for `before_agent_start` — keep the assembled base prompt.
         if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::BeforeAgentStart)
         {
+            // No handler ran, so there is nothing to override with — pi's `else` branch
+            // (agent-session.ts:1251 @v0.83.0) clears the slot for exactly this reason, and a stale
+            // override from a PREVIOUS run must not leak into this one.
+            *Self::lock(&self.system_prompt_override) = None;
             let mut messages = vec![user_msg];
             messages.extend(pending);
             return messages;
@@ -1270,15 +1301,32 @@ impl AgentSession {
         if let Reduced::Pass(ev) = reduced
             && let HostEvent::BeforeAgentStart { system_prompt, injected, .. } = *ev
         {
-            // Apply the (possibly handler-replaced / sanitized) system prompt; reset to base otherwise.
+            // Apply the (possibly handler-replaced / sanitized) system prompt; reset to base
+            // otherwise. Pi's two branches are `if (result?.systemPrompt !== undefined) {
+            // this._systemPromptOverride = result.systemPrompt; this.agent.state.systemPrompt =
+            // result.systemPrompt; } else { this._systemPromptOverride = undefined;
+            // this.agent.state.systemPrompt = this._baseSystemPrompt; }` (agent-session.ts:1246-1252
+            // @v0.83.0) — the OVERRIDE SLOT is written on both, which is what makes the turn-boundary
+            // refresh able to re-push `override ?? base` without clobbering this sanitization
+            // (DRIFT-033).
+            //
+            // CYRUP-DELTA on the discriminator only: pi distinguishes "handler returned no prompt"
+            // (`undefined`) from "handler returned one"; cyrup's `HostEvent::BeforeAgentStart`
+            // carries the prompt as a mutated-in-place `String`, so a handler that returns the base
+            // verbatim is indistinguishable from one that returns nothing. Equality with `base` is
+            // therefore read as "no override", which agrees with pi on the resulting prompt for
+            // every input and differs only in which slot holds the identical text.
             if system_prompt == base {
+                *Self::lock(&self.system_prompt_override) = None;
                 self.agent.set_system_prompt(base.clone()).await;
             } else {
+                *Self::lock(&self.system_prompt_override) = Some(system_prompt.clone());
                 self.agent.set_system_prompt(system_prompt).await;
             }
             messages.extend(injected.iter().map(core_message_to_agent));
         } else {
             // Blocked/Handled (no Pi analogue here): keep the base prompt, no injection.
+            *Self::lock(&self.system_prompt_override) = None;
             self.agent.set_system_prompt(base.clone()).await;
         }
         messages
@@ -3680,6 +3728,24 @@ impl AgentSession {
         Self::lock(&self.base_system_prompt).clone()
     }
 
+    /// The `before_agent_start` replacement in force for the CURRENT run, if any (Pi
+    /// `this._systemPromptOverride`, agent-session.ts:373 @v0.83.0). `None` between runs and
+    /// whenever no handler replaced the prompt.
+    pub fn system_prompt_override(&self) -> Option<String> {
+        Self::lock(&self.system_prompt_override).clone()
+    }
+
+    /// `override ?? base` — the exact expression pi evaluates at every site that writes
+    /// `agent.state.systemPrompt` (agent-session.ts:534 in the turn-boundary refresh, `:940` in
+    /// `setActiveToolsByName` @v0.83.0). This is the value the agent must be running with at any
+    /// moment, and the value the per-turn refresh re-pushes (DRIFT-033).
+    pub fn effective_system_prompt(&self) -> String {
+        // Two statements, not one chained expression: the override guard must be released before
+        // `base_system_prompt()` takes the second lock.
+        let over = Self::lock(&self.system_prompt_override).clone();
+        over.unwrap_or_else(|| self.base_system_prompt())
+    }
+
     /// The agent's *current* system prompt — equal to the base unless a `before_agent_start` handler
     /// replaced it for the in-flight run (Pi `agent.state.systemPrompt`, agent-session.ts:1127).
     pub async fn current_system_prompt(&self) -> String {
@@ -4805,6 +4871,28 @@ impl AgentSession {
 
 // =========================================================================== immediate-bash seam ====
 // Pi `agent-session.ts:2582-2684`. The out-of-loop bash RPC path.
+
+/// Removes this call's entry from [`AgentSession::bash_cancels`] on drop — cyrup's stand-in for pi's
+/// `finally { this._bashAbortControllers.delete(abortController); }` (agent-session.ts:2794-2796
+/// @v0.83.0).
+///
+/// A guard rather than a removal written at each exit, because pi's `finally` covers exits Rust
+/// reaches differently: the early `?` on `Custom shell path not found`, the `?` on the backend
+/// failure pi lets propagate straight *through* its `finally` uncaught, and — with no JS counterpart
+/// at all — an `execute_bash` future DROPPED at an `.await` by a caller that went away, which a JS
+/// `async` function cannot do because it always settles. Without the guard that last case leaks a
+/// dead handle into the set and makes `is_bash_running()` answer true forever.
+struct BashCancelGuard<'a> {
+    session: &'a AgentSession,
+    id: u64,
+}
+
+impl Drop for BashCancelGuard<'_> {
+    fn drop(&mut self) {
+        AgentSession::lock(&self.session.bash_cancels).retain(|(id, _)| *id != self.id);
+    }
+}
+
 impl AgentSession {
     /// Execute a bash command out-of-band and record its result (Pi `executeBash`,
     /// agent-session.ts:2588). Streams combined output to `on_chunk`; the result is recorded into the
@@ -4823,16 +4911,22 @@ impl AgentSession {
     /// A genuine backend failure is returned as `Err` and NEVER recorded into history — Pi's
     /// `executeBash` only calls `recordBashResult` on the success path inside its `try` block
     /// (`agent-session.ts:2628-2643`); a rejection from `executeBashWithOperations` propagates
-    /// straight through the `finally` (which only clears `_bashAbortController`) uncaught, all the
-    /// way to the RPC dispatcher's `catch` (`rpc-mode.ts:756-772`).
+    /// straight through the `finally` (which only deletes this call's handle from
+    /// `_bashAbortControllers`, agent-session.ts:2794-2796) uncaught, all the way to the RPC
+    /// dispatcher's `catch` (`rpc-mode.ts:756-772`).
     pub async fn execute_bash(
         &self,
         command: &str,
         options: BashOptions,
         on_chunk: crate::bash::BashChunkSink,
     ) -> Result<BashResult, SessionServiceError> {
+        // Pi `const abortController = new AbortController(); this._bashAbortControllers.add(...)`
+        // (agent-session.ts:2770-2771 @v0.83.0) — one handle PER CALL, added to the set, removed in
+        // the `finally` (here: `_bash_guard`'s drop). Concurrent calls each keep their own.
         let cancel = self.session_cancel.child_token();
-        *Self::lock(&self.bash_cancel) = Some(cancel.clone());
+        let bash_cancel_id = self.next_bash_cancel_id();
+        Self::lock(&self.bash_cancels).push((bash_cancel_id, cancel.clone()));
+        let _bash_guard = BashCancelGuard { session: self, id: bash_cancel_id };
         let cwd = self.services.cwd.clone();
         // Managed bin dir (Pi `getBinDir()`, `config.ts:549`: `join(getAgentDir(), "bin")`), matching
         // `cyrup_config::ConfigDirs::bin_dir()`'s layout — see `run_bash`'s doc comment.
@@ -4854,10 +4948,8 @@ impl AgentSession {
         let shell = match self.shell_path.as_deref() {
             Some(p) => match ShellConfig::resolve(Some(p)) {
                 Ok(shell) => shell,
-                Err(e) => {
-                    *Self::lock(&self.bash_cancel) = None;
-                    return Err(e.into());
-                }
+                // `_bash_guard` performs pi's `finally` removal on this path too.
+                Err(e) => return Err(e.into()),
             },
             None => self.shell.clone(),
         };
@@ -4892,7 +4984,9 @@ impl AgentSession {
         // `run_bash` consumed the sink, so its `chunk_tx` is already dropped: awaiting the pump
         // flushes every delta before the caller sees the result.
         let _ = chunk_pump.await;
-        *Self::lock(&self.bash_cancel) = None;
+        // No explicit removal here — `_bash_guard` is pi's `finally` and fires on BOTH the `?` below
+        // and the `Ok` return, and only for THIS call's handle. Clearing the whole slot here is what
+        // used to make `is_bash_running()` lie while a concurrent command was still running.
         let result = outcome?;
         self.record_bash_result(command, &result, options).await;
         Ok(result)
@@ -4983,16 +5077,30 @@ impl AgentSession {
         self.append_bash_message(msg, &payload).await;
     }
 
-    /// Cancel a running bash command (Pi `abortBash`, agent-session.ts:2660).
+    /// Mint the next identity handle for [`Self::bash_cancels`] (pi gets identity for free from the
+    /// `AbortController` object it puts in the set).
+    fn next_bash_cancel_id(&self) -> u64 {
+        self.next_bash_cancel_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Cancel EVERY running bash command (Pi `abortBash`, agent-session.ts:2832-2836 @v0.83.0:
+    /// `for (const abortController of [...this._bashAbortControllers]) abortController.abort();`).
+    ///
+    /// The snapshot is pi's spread copy, and it is load-bearing here for a reason pi does not have:
+    /// `CancelToken::cancel` runs registered callbacks synchronously, one of which could re-enter
+    /// this session, so the lock is released before any token is fired.
     pub fn abort_bash(&self) {
-        if let Some(c) = Self::lock(&self.bash_cancel).as_ref() {
+        let snapshot: Vec<CancelToken> =
+            Self::lock(&self.bash_cancels).iter().map(|(_, c)| c.clone()).collect();
+        for c in snapshot {
             c.cancel();
         }
     }
 
-    /// Whether a bash command is running (Pi `isBashRunning`, agent-session.ts:2665).
+    /// Whether ANY bash command is running (Pi `isBashRunning`, agent-session.ts:2839-2841
+    /// @v0.83.0: `return this._bashAbortControllers.size > 0;`).
     pub fn is_bash_running(&self) -> bool {
-        Self::lock(&self.bash_cancel).is_some()
+        !Self::lock(&self.bash_cancels).is_empty()
     }
 
     /// Whether deferred bash messages await flush (Pi `hasPendingBashMessages`, agent-session.ts:2670).
@@ -5049,13 +5157,19 @@ impl AgentSession {
     /// [`Self::apply_pending_control`] so both reach the live agent identically.
     async fn push_active_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>, prompt: String) {
         self.agent.set_tools(tools).await;
-        self.agent.set_system_prompt(prompt.clone()).await;
         // The rebuilt prompt is the new BASE, not just this turn's value (Pi
         // `this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames)`, agent-session.ts:939).
         // Without this write the next run's `before_agent_start` reset in
         // [`Self::assemble_run_messages`] would restore the startup prompt and the model would be
         // described the startup tool set for the rest of the session.
         *Self::lock(&self.base_system_prompt) = prompt.clone();
+        // …and what reaches the AGENT is `override ?? base` — pi's very next line,
+        // `this.agent.state.systemPrompt = this._systemPromptOverride ?? this._baseSystemPrompt;`
+        // (agent-session.ts:940 @v0.83.0). A rebuild triggered mid-run by a tool registration used to
+        // overwrite a `before_agent_start` handler's sanitized prompt with the raw rebuilt one
+        // (DRIFT-033); resolving through the override slot is what stops it.
+        let effective = self.effective_system_prompt();
+        self.agent.set_system_prompt(effective).await;
         // EXT-005: keep the guest-visible `ctx.getSystemPrompt()` mirror in step with the agent —
         // a tool-set rebuild rewrites the prompt (Pi `_rebuildSystemPrompt`, agent-session.ts:2304)
         // and a guest reading it back must see the rebuilt one.
@@ -5117,16 +5231,15 @@ impl AgentSession {
     /// still has the last word. Both are cheap no-ops when nothing changed (a relaxed atomic load
     /// and an `Option` take), which is the common case on every turn of every run.
     ///
-    /// TOOL ARRAY ONLY — the rebuilt system prompt is deliberately NOT propagated into the running
-    /// turn. Pi can return one because it keeps `_systemPromptOverride` and `_baseSystemPrompt` in
-    /// separate slots and resolves `override ?? base` on every turn (agent-session.ts:531); cyrup
-    /// has a single slot, into which `assemble_run_messages` already wrote exactly that resolved
-    /// value — including a `before_agent_start` handler's SANITIZED prompt (the permission
-    /// companion's `shouldExposeTool` shaping). Pushing a `DynamicToolState`-rebuilt prompt over it
-    /// mid-run would silently undo that sanitization, which is the same clobber the in-turn drain at
-    /// [`Self::assemble_run_messages`] already refuses to perform. The cost is narrow and known: a
-    /// tool that becomes active mid-run is CALLABLE for the rest of the run but its `promptSnippet`
-    /// only joins the prompt at the next run.
+    /// The rebuilt system prompt IS propagated now, through [`Self::effective_system_prompt`] —
+    /// `PolicyHooks::prepare_next_turn` reads it beside this array and returns both, mirroring pi's
+    /// `systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt` (agent-session.ts:534
+    /// @v0.83.0). The reason it used not to be is gone: cyrup now keeps pi's two slots, so re-pushing
+    /// resolves back to a `before_agent_start` handler's SANITIZED prompt (the permission companion's
+    /// `shouldExposeTool` shaping) rather than clobbering it with the raw rebuild (DRIFT-033). Both
+    /// drains below still discard their locally rebuilt prompt string for the same reason they always
+    /// did — the authority is the base slot [`Self::push_active_tools`] writes, not a drain's
+    /// by-product.
     pub(crate) async fn next_turn_tools(&self) -> Vec<Arc<dyn cyrup_core::Tool>> {
         // EXT-004: a tool an extension registered from a LIVE handler during this run.
         self.refresh_extension_tools().await;

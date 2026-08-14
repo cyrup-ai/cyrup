@@ -236,6 +236,25 @@ pub fn resolve_artifacts_dir(
     }
 }
 
+/// Resolve the chain-runs ROOT for a cwd — pi `getChainRunsDir(projectCwd, dirPreference =
+/// "project")` (`shared/artifacts.ts:145-158` @v0.43.0).
+///
+/// SUBA-048 / PARITY-GAPS PB-13: upstream's `project` arm (the default) returns
+/// `getProjectChainRunsDir`, i.e. `<cwd>/.pi-subagents/chain-runs`; only `session` and `temp`
+/// collapse onto the flat temp `CHAIN_RUNS_DIR`. cyrup previously had no preference parameter here
+/// and unconditionally used the temp root, so [`project_chain_runs_dir`] had zero references and a
+/// chain run's artifacts were invisible to the project and swept by OS tmp cleanup.
+///
+/// Note upstream's `session` arm deliberately does NOT mirror [`resolve_artifacts_dir`]'s
+/// session-sibling branch — chain runs have no per-session directory upstream either.
+#[must_use]
+pub fn resolve_chain_runs_dir(project_cwd: &Path, preference: ArtifactDirPreference) -> PathBuf {
+    match preference {
+        ArtifactDirPreference::Project => project_chain_runs_dir(project_cwd),
+        ArtifactDirPreference::Session | ArtifactDirPreference::Temp => chain_runs_dir(project_cwd),
+    }
+}
+
 /// Replace every character outside pi's `[\w.-]` class with `_` (pi `safeAgent`,
 /// `shared/artifacts.ts:188`). `\w` in the pi regex (no `u` flag) is exactly ASCII `[A-Za-z0-9_]`.
 fn safe_agent(agent: &str) -> String {
@@ -624,6 +643,38 @@ mod tests {
         );
         // The default IS `project` (pi `DEFAULT_ARTIFACT_CONFIG.dir`).
         assert_eq!(ArtifactDirPreference::default(), ArtifactDirPreference::Project);
+    }
+
+    /// SUBA-048 / PARITY-GAPS PB-13 — pi `getChainRunsDir(projectCwd, dirPreference = "project")`
+    /// (`shared/artifacts.ts:145-158` @v0.43.0): only `project` goes to the project tree, and
+    /// `session` shares `temp`'s arm rather than getting a session sibling of its own.
+    ///
+    /// RED before the fix: there was no `resolve_chain_runs_dir` at all, `project_chain_runs_dir`
+    /// had zero references anywhere in the crate, and every chain run's artifacts went to the temp
+    /// root regardless of configuration.
+    #[test]
+    fn the_chain_runs_root_follows_pis_two_arm_preference_split() {
+        let cwd = Path::new("/repo");
+        assert_eq!(
+            resolve_chain_runs_dir(cwd, ArtifactDirPreference::Project),
+            project_chain_runs_dir(cwd),
+            "upstream's default arm returns getProjectChainRunsDir"
+        );
+        assert_eq!(
+            resolve_chain_runs_dir(cwd, ArtifactDirPreference::Session),
+            chain_runs_dir(cwd),
+            "upstream folds `session` into the temp arm for chain runs"
+        );
+        assert_eq!(
+            resolve_chain_runs_dir(cwd, ArtifactDirPreference::Temp),
+            chain_runs_dir(cwd)
+        );
+        // The default preference therefore puts chain runs INSIDE the project, which is the whole
+        // of PB-13's observable claim.
+        assert_eq!(
+            resolve_chain_runs_dir(cwd, ArtifactDirPreference::default()),
+            project_subagents_dir(cwd).join(CHAIN_RUNS_SUBDIR)
+        );
     }
 
     /// SUBA-048's validation half — pi `extension/config.ts:22-24,51-53` THROWS on an unsupported

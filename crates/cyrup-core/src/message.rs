@@ -485,9 +485,19 @@ pub struct AssistantMessage {
     /// (`mistral-conversations.ts:356`), OpenAI-completions `choice.finish_reason`
     /// (`openai-completions.ts:459`) and OpenAI-responses `response.status`
     /// (`openai-responses-shared.ts:567,721`) — line numbers at v0.83.0, unchanged in kind at
-    /// v0.84.1. cyrup does not set it yet on any decoder, but it MUST round-trip: a Pi-written
-    /// session file carries it on every assistant entry, and dropping it on re-export is silent
-    /// loss of the only record of what the provider actually said (R-00-013).
+    /// v0.84.1.
+    ///
+    /// cyrup populates it from every decoder that has a raw reason to carry: `anthropic_messages`,
+    /// `google_generative_ai` (shared by `google_vertex`), `openai_completions`,
+    /// `openai_responses` (shared by `azure_openai_responses`), `openai_codex_responses`,
+    /// `mistral_conversations` and `bedrock_converse_stream`. The one decoder that leaves it `None`
+    /// is `pi_messages`, and that is parity, not a gap: pi's own `api/pi-messages.ts` @v0.83.0
+    /// never assigns `rawStopReason` — its wire `event.reason` IS the canonical `stopReason`
+    /// (`:193`, `:201`), so there is no vendor string underneath it to preserve.
+    ///
+    /// It MUST also round-trip regardless of producer: a Pi-written session file carries it on
+    /// every assistant entry, and dropping it on re-export is silent loss of the only record of
+    /// what the provider actually said (R-00-013).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_stop_reason: Option<String>,
     pub timestamp: i64,

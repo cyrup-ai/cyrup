@@ -12,6 +12,66 @@ without anyone ever watching them happen.
 
 ---
 
+## 0. AMENDMENT 2026-08-14 — what two parity sweeps did to these seventeen rows
+
+> **This log remains a measurement and nothing below has been re-measured.** What follows records
+> which of its seventeen rows have had the *code under them changed* since 2026-08-13, so nobody
+> reads a transcript as current behaviour. cyrup HEAD is now **`380c713`** (this log ran at
+> `0c76986`). **Every row marked FIXED below is fixed by reading, not by re-running** — the two
+> sweeps were restricted to `cargo check` and the orchestrator ran only the gate.
+
+**The suite numbers moved again, and this time for a structural reason.** §1's central finding — that
+"3932" was carried forward by citation and the real figure was **6387** — holds and was the right
+correction. It is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**, because the integration
+tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`): **310
+integration binaries → 6 + 8 gated**, behind a new `cyrup-it` harness crate. **Two consequences for
+this log specifically:**
+
+1. Every path of the form `crates/<crate>/tests/<x>.rs` in §2 and §3 is stale unless it names
+   `cyrup-it`. The `one_shot_parity.rs` hang recorded in §1 is in a file that no longer exists at
+   that path.
+2. **`cyrup-it` is `required-features = ["it"]`, so the gate does not build or run it.** The 16.4 s
+   figure buys no coverage of the broker-socket seam tests at all — filed as **structural defect J**
+   in `00-residual-ledger.md`, with four `cyrup-it` assertions currently contradicting production as
+   the evidence that it is not theoretical.
+
+### Row-by-row status of the seventeen
+
+| row | 2026-08-13 verdict | status at `380c713` |
+|---|---|---|
+| `SEAM-051` | CONFIRMED | **FIXED** — `--tui-mode` is parsed instead of rejected with exit 1. Closes `DRIFT-022`'s flag half. |
+| `SEAM-064` | CONFIRMED | **FIXED** — the pre-launch trust prompt carries both "(this session only)" rows. The one-character `includeSessionOnly: true` fix, exactly as filed. |
+| `SEAM-047` | CONFIRMED | **FIXED** — first SIGTERM/SIGHUP tears down and exits 143/129. `SEAM-008` and `SEAM-059` both landed on its back and are closed. |
+| `SEAM-063` | CONFIRMED | **FIXED (sweep 1)**, with a residual this log's transcript would still show: the pre-launch status lines print AFTER teardown, not in the picker header with pi's 2 s/3 s dwell, because `SessionSelector` has no status channel. **The live re-run in its Verify block is still owed.** |
+| `SEAM-062` | CONFIRMED | **FIXED (sweep 1)** via the "preferred full fix" route — the rename now persists — rather than the parity route of disabling rename. |
+| `SEAM-061` | CONFIRMED | **STILL OPEN, and now the top of the whole backlog.** The transcript in §3 is current behaviour. What changed is only that the missing piece narrowed: `SessionScope`, `set_scope` and `scope()` exist; `SessionAction::ToggleScope`, its handler and `show_path`-follows-scope do not. **Two sweeps split it across areas 07 and 08 and neither took it.** |
+| `TUI-042` | CONFIRMED | **FIXED** (pre-sweep) — the paste registry is carried on the undo snapshot. |
+| `TUI-043` | CONFIRMED | **FIXED** (pre-sweep) — word motion is paste-marker atomic. |
+| `TUI-044` | CONFIRMED | **FIXED** (pre-sweep). |
+| `TUI-027` | CONFIRMED | **FIXED (sweep 1)** — `/tree` has a real text search; the digit-filter arm and `FilterMode::from_digit` are deleted, and pi's help row and standing `Type to search:` line were ported with it. **The data-loss path this log measured is closed.** |
+| `TUI-016` | CONFIRMED (corrected headline) | **FIXED** — and this row is the one that most deserves re-reading: it was **already fixed at HEAD by `c8c86bc`** while both its status row and its item body still said still-open/regressed. Same for `TUI-045`, `TUI-052` and `TUI-055`. |
+| `PERM-009` | CONFIRMED | **FIXED (sweep 1)** — the cyrup-only `bash` bypass in `should_expose_tool` is deleted. The permission bypass this log demonstrated headlessly is gone. |
+| `AGENT-020` | **REFUTED** | **FIXED anyway, and the refutation stands.** The guard is now the first statement of `Agent::continue_run` and both drain sites restore via `PendingQueue::push_front` on `Err(RunActive)`. The row's finding — that the predicted loss does not occur on the normal path — is unaffected and is still why the item is `low`. **`AGENT-034` later added the same guard at `Agent::prompt`, which had none at all**; read the two as one pattern, not two. |
+| `EXT-054` | CONFIRMED (stronger than filed) | **FIXED** (pre-sweep) with `EXT-055`. `EXT-059` is the named residual and is still open (`AgentSession::load_wasm_extension` is a full-authority manifest-less load). |
+| `SESS-040` | CONFIRMED, mechanism half REFUTED | **STILL OPEN, and it is now the cheapest of the three remaining highs.** Both siblings closed: `SESS-041` (auto-compaction token — refuted at HEAD, `abort_compaction` cancels both tokens) and `SESS-042` (the `aborted: true` payload — present at both `compaction_end` failure sites). **040, 041 and 042 now differ only in wiring: the moment 040 lands a dispatch site the abort takes effect.** `TUI-055` is fixed, so the band renders — **but nobody has watched it, and this row's mechanism correction (no indicator rendered at all) was measured against a build where it could not**. Re-run before trusting either half. |
+| `TUI-045` | CONFIRMED | **FIXED** by `c8c86bc`, with the same stale-record caveat as `TUI-016`. |
+
+**Fifteen of the seventeen are now fixed; two — `SEAM-061` and `SESS-040` — are open and are two of
+the three remaining highs in the entire backlog.** Both are blocked on coordination across crates
+rather than on analysis, which is the same thing this log's §5 concluded about the method.
+
+### What §5's argument looks like a year later, in one paragraph
+
+§5 asked whether the backlog's confidence was justified and answered "only 3 of 17 items survived a
+live run unchanged". Two static sweeps have now produced a comparable figure from the other
+direction: **≈12% of the items they worked were refuted** — already fixed, wrongly diagnosed, or
+resting on a premise that was false at the tag. **The two numbers are measuring the same thing from
+opposite ends: a written status in this directory is evidence, not fact.** The difference is that
+running the binary corrected *severities*, while re-reading at HEAD corrected *existence*. Neither
+substitutes for the other, and the sweeps did the cheaper one — nothing in either sweep was executed.
+
+---
+
 ## Header — what was run, where, and with what honesty about scope
 
 | | |

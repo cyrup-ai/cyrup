@@ -15,7 +15,7 @@ pub const MANIFEST_FILE: &str = "extension.json";
 pub struct ExtensionManifest {
     pub id: String,
     pub version: String,
-    /// WIT world compatibility, e.g. `cyrup:ext@0.5` (see [`HOST_WORLD`]).
+    /// WIT world compatibility, e.g. `cyrup:ext@0.6` (see [`HOST_WORLD`]).
     pub world: String,
     /// Source entry for a Tier-1 build; absent for a prebuilt `.wasm` package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,7 +165,19 @@ impl Capabilities {
 ///   same batch, which would not have required a bump on their own: `ctx-state.get-cwd`
 ///   (EXT-044), `ctx-state.is-run-cancelled` + `models.scoped-models` (EXT-045),
 ///   `bus.unsubscribe` (EXT-050), `provider-stream.on-payload`/`on-response` (EXT-052).)
-pub const HOST_WORLD: &str = "cyrup:ext@0.5";
+/// - 0.5 → 0.6 (the same one-batched-bump rule): the `ctx.ui` surface batch. IMPORT RE-SIGNINGS —
+///   `ui.set-widget` became pi's three arguments `(key, content-json: option<string>,
+///   opts-json)` (EXT-047; upstream `setWidget(key, content, options?)`, `types.ts:170-175`
+///   @v0.83.0), and `ui.theme-list` widened from a json array of NAMES to `{name, path}` rows
+///   (EXT-021; upstream `getAllThemes(): {name, path}[]`, `types.ts:269`). Both are the
+///   fails-to-LINK kind of import change, hence the bump. (Additive IMPORTS in the same batch,
+///   which would not have required a bump on their own: `ui.set-working-message` (`types.ts:151`),
+///   `ui.set-working-visible` (`:154`), `ui.set-working-indicator` (`:164`),
+///   `ui.set-hidden-thinking-label` (`:167`), `ui.theme-get-by-name` (`:272`).) EXPORT ADDITION —
+///   `transform-markdown` (EXT-019; pi `MarkdownTransformer`, `extensions/types.ts:1153`
+///   @v0.84.1), which would have required the bump on its own, plus its declaring import
+///   `registration.register-markdown-transformer` (`:1292`).
+pub const HOST_WORLD: &str = "cyrup:ext@0.6";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

@@ -35,9 +35,16 @@ const REPLY_HINT_COMMAND: &str = "intercom({ action: \"reply\", message: \"...\"
 /// both under the same kind — pi `sendMessage({customType:"intercom_message"})`, `index.ts:656`).
 const INBOUND_MESSAGE_CUSTOM_TYPE: &str = "intercom_message";
 /// The busy auto-reply sent back to a sender when this session is running non-interactively and
-/// cannot surface the message to a human (pi's non-interactive busy reply, `index.ts:739-748`).
+/// cannot surface the message to a human (pi's non-interactive busy reply,
+/// `v0.10.1 index.ts:946-947`, byte for byte).
+///
+/// ICOM-013. The shortened cyrup wording ("This session is running in non-interactive mode and
+/// cannot respond to messages right now.") dropped the two facts the sender acts on: that the peer
+/// is *working* rather than merely unattended, and that it will finish and exit rather than come
+/// back. A supervisor reading the short form has no way to tell "retry in a moment" from "this
+/// worker is gone", so it retries a peer that will never answer.
 const NON_INTERACTIVE_BUSY_NOTICE: &str =
-    "This session is running in non-interactive mode and cannot respond to messages right now.";
+    "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.";
 
 /// The inbound delivery policy decision (pi `handleIncomingMessage`, `index.ts:745-765`), computed
 /// AFTER the durable surface (`append_entry`) from whether an agent run is in flight (`is_idle`),
@@ -185,6 +192,33 @@ pub fn send_incoming_message(
     message: &Message,
     delivery: InboundDelivery,
 ) -> bool {
+    // `generation = runtimeGeneration` is a DEFAULT parameter upstream (`v0.10.1 index.ts:876`), so
+    // a caller that does not stamp one is checked against the current generation — which still
+    // catches `disposed`/`shuttingDown`/no-context, just not a generation the caller predates.
+    send_incoming_message_at(state, from, message, delivery, state.connect.generation())
+}
+
+/// [`send_incoming_message`] with the caller's captured runtime generation — pi's explicit third
+/// argument (`sendIncomingMessage(entry, "trigger", messageGeneration)`, `v0.10.1 index.ts:963`).
+///
+/// The guard is upstream's first statement (`:877`):
+///
+/// ```text
+/// if (runtimeStarted && !getLiveContext(runtimeContext, generation)) return;
+/// ```
+///
+/// `runtimeStarted &&` matters: before `SessionStart` there is no runtime to be stale relative to,
+/// and the local subagent relay delivers through this path in exactly that window.
+pub fn send_incoming_message_at(
+    state: &SharedIntercomState,
+    from: &SessionInfo,
+    message: &Message,
+    delivery: InboundDelivery,
+    generation: u64,
+) -> bool {
+    if state.connect.runtime_ever_started() && !crate::connect::is_live_at(state, generation) {
+        return false;
+    }
     let Some(services) = state.host_services() else {
         return false;
     };
@@ -259,6 +293,22 @@ pub async fn auto_reply_non_interactive(
     from: &SessionInfo,
     message: &Message,
 ) -> bool {
+    auto_reply_non_interactive_at(state, from, message, state.connect.generation()).await
+}
+
+/// [`auto_reply_non_interactive`] fenced on the caller's captured runtime generation
+/// (`v0.10.1 index.ts:950`: `if (result.delivered && getLiveContext(liveContext, messageGeneration))`).
+///
+/// The `send` here is an `await` across which the session runtime can be replaced. Upstream
+/// re-checks liveness AFTER it resolves and before `dismissIncomingAsk`, so a reply that lands
+/// against a runtime that has since been swapped does not mutate the NEW runtime's pending-ask
+/// state.
+pub async fn auto_reply_non_interactive_at(
+    state: &SharedIntercomState,
+    from: &SessionInfo,
+    message: &Message,
+    generation: u64,
+) -> bool {
     let Some(client) = state.client() else {
         return false;
     };
@@ -276,6 +326,13 @@ pub async fn auto_reply_non_interactive(
             // dismissIncomingAsk (`index.ts:755`): the inbound ask is now answered — drop it from
             // pending so a later `intercom{list}`/`intercom{reply}` does not re-surface it, AND
             // from the pending-idle queue so the debounced flush does not re-inject it.
+            //
+            // `result.delivered && getLiveContext(liveContext, messageGeneration)`
+            // (`v0.10.1 index.ts:950`): the reply was delivered either way, but the state mutation
+            // belongs to the runtime that asked for it.
+            if !crate::connect::is_live_at(state, generation) {
+                return false;
+            }
             dismiss_incoming_ask(state, &message.id);
             true
         }
@@ -300,6 +357,18 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
             match rx.recv().await {
                 Ok(InboundEvent::Message { from, message }) => {
                     let message = *message;
+                    // (0) `const messageGeneration = runtimeGeneration;`
+                    //     `const liveContext = getLiveContext(ctx, messageGeneration);`
+                    //     `if (!liveContext) return;` (`v0.10.1 index.ts:903-906`) — the FIRST two
+                    //     statements of `handleIncomingMessage`, before the dedupe, the waiter match
+                    //     and `recordIncomingMessage`. A message that arrives against a runtime that
+                    //     has already been replaced must not touch this session's state at all;
+                    //     without the stamp, the checks further down would pass against whatever
+                    //     runtime happens to be live by the time they run.
+                    let message_generation = state.connect.generation();
+                    if !crate::connect::is_live_at(&state, message_generation) {
+                        continue;
+                    }
                     // (1) Resolve an outstanding OUTBOUND ask first (index.ts:715-724). When matched,
                     //     the message is the reply to our own ask — do NOT also surface it.
                     if state.waiter.try_deliver(&from, &message) {
@@ -321,6 +390,14 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                     //     through `inject_message`; a BUSY interactive one is STEERED onto the live
                     //     run (`v0.10.1 index.ts:956`); a BUSY non-interactive one sends the sender
                     //     the busy auto-reply.
+                    // `const activeContext = getLiveContext(liveContext, messageGeneration);`
+                    // `if (!activeContext) return;` (`v0.10.1 index.ts:937-940`) — the head of the
+                    // async IIFE, i.e. the re-check after the synchronous recording work above and
+                    // before ANY delivery decision is taken. `isIdle`/`hasUI` are read off the live
+                    // context upstream, so reading them from a dead one is the exact defect.
+                    if !crate::connect::is_live_at(&state, message_generation) {
+                        continue;
+                    }
                     match decide_inbound_policy(
                         state.is_idle(),
                         state.has_ui(),
@@ -328,13 +405,34 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                         &message,
                     ) {
                         InboundPolicy::Deliver { .. } => {
-                            send_incoming_message(&state, &from, &message, InboundDelivery::Trigger);
+                            // `if (getLiveContext(liveContext, messageGeneration)) {`
+                            // `  sendIncomingMessage(entry, "trigger", messageGeneration); }`
+                            // (`:962-963`) — the trigger arm is the only one upstream double-checks
+                            // AND stamps, because it is the one that spawns a whole new run.
+                            if crate::connect::is_live_at(&state, message_generation) {
+                                send_incoming_message_at(
+                                    &state,
+                                    &from,
+                                    &message,
+                                    InboundDelivery::Trigger,
+                                    message_generation,
+                                );
+                            }
                         }
                         InboundPolicy::Steer => {
+                            // `sendIncomingMessage(entry, "steer");` (`:961`) — no explicit
+                            // generation, so upstream's default (`= runtimeGeneration`) applies and
+                            // the guard degenerates to the disposed/shuttingDown/no-context check.
                             send_incoming_message(&state, &from, &message, InboundDelivery::Steer);
                         }
                         InboundPolicy::AutoReply => {
-                            auto_reply_non_interactive(&state, &from, &message).await;
+                            auto_reply_non_interactive_at(
+                                &state,
+                                &from,
+                                &message,
+                                message_generation,
+                            )
+                            .await;
                         }
                         InboundPolicy::SurfaceOnly => {}
                     }
@@ -481,6 +579,17 @@ mod tests {
     fn state(reply_hint: bool) -> SharedIntercomState {
         let config = IntercomConfig { reply_hint, ..IntercomConfig::default() };
         SharedIntercomState::new(config, 600_000, PathBuf::from("/w"))
+    }
+
+    /// ICOM-013 / `v0.10.1 index.ts:947`. This string is prompt-visible on the SENDER's side — it
+    /// arrives as the reply to a blocking `ask` — so a paraphrase changes what a peer agent
+    /// concludes. Byte-for-byte against upstream, not a "means the same thing" check.
+    #[test]
+    fn the_busy_auto_reply_is_upstreams_exact_text() {
+        assert_eq!(
+            NON_INTERACTIVE_BUSY_NOTICE,
+            "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done."
+        );
     }
 
     fn from() -> SessionInfo {
@@ -693,6 +802,85 @@ mod tests {
             ));
             Ok(())
         }
+    }
+
+    /// ICOM-049 / `v0.10.1 index.ts:877`, `:903`, `:963`. An inbound delivery is stamped with the
+    /// runtime generation it was decided under, and re-checked before it injects. Without the
+    /// stamp, a delivery task still in flight when the session runtime is replaced (an RPC
+    /// re-attach, a runtime rebuild) lands in the NEW session, attributed to a peer that session
+    /// never talked to.
+    ///
+    /// RED before the fix: `send_incoming_message` took no generation and consulted none, so the
+    /// second `assert!(!…)` below was `true` and `host.injected()` held the stale message.
+    #[tokio::test]
+    async fn a_delivery_stamped_at_a_replaced_runtime_is_not_injected_into_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = || crate::connect::ConnectParams {
+            agent_dir: dir.path().join("agent"),
+            metadata: None,
+            model: None,
+        };
+        let s = Arc::new(state(true));
+        let host = Arc::new(IdleControlledHost::new(true));
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+
+        crate::connect::begin_runtime(&s, params());
+        let stamped = s.connect.generation();
+        assert!(
+            send_incoming_message_at(&s, &from(), &ask("first"), InboundDelivery::Trigger, stamped),
+            "a delivery at its own generation is live"
+        );
+        assert_eq!(host.injected().len(), 1);
+        host.clear_injected();
+
+        // The session runtime is replaced under the in-flight delivery.
+        crate::connect::begin_runtime(&s, params());
+        assert_ne!(s.connect.generation(), stamped, "begin_runtime bumps the generation");
+        assert!(
+            !send_incoming_message_at(&s, &from(), &ask("first"), InboundDelivery::Trigger, stamped),
+            "the stale-generation delivery must be fenced out"
+        );
+        assert!(
+            host.injected().is_empty(),
+            "nothing reaches the new runtime: {:?}",
+            host.injected()
+        );
+
+        // …and the new runtime's own generation still delivers, so the fence is not a blanket stop.
+        assert!(send_incoming_message_at(
+            &s,
+            &from(),
+            &ask("second"),
+            InboundDelivery::Trigger,
+            s.connect.generation()
+        ));
+        assert_eq!(host.injected().len(), 1);
+
+        // A deliberate shutdown fences everything, including the current generation
+        // (`disposed || shuttingDown`, `v0.10.1 index.ts:647`).
+        //
+        // This half is why the guard reads `runtime_ever_started()` and NOT the supervisor's
+        // `started` flag. pi's `runtimeStarted` is a latch — set at `index.ts:1253` and never
+        // cleared — whereas cyrup's `started` is cleared by `shutdown` because the reconnect ladder
+        // needs "is a runtime active right now". Collapsing the two makes `runtimeStarted &&` false
+        // after shutdown, which SKIPS the fence and lets a stale delivery through, inverting the
+        // guard. Found while writing this test.
+        host.clear_injected();
+        let live = s.connect.generation();
+        crate::connect::shutdown(&s);
+        assert!(
+            s.connect.runtime_ever_started(),
+            "pi's runtimeStarted latch must survive shutdown (v0.10.1 index.ts:522,1253)"
+        );
+        assert!(!send_incoming_message_at(
+            &s,
+            &from(),
+            &ask("third"),
+            InboundDelivery::Trigger,
+            live
+        ));
+        assert!(host.injected().is_empty());
     }
 
     /// ICOM-035 / v0.9.3 `25ffb96` ("fix: steer busy inbound messages promptly"): a message that

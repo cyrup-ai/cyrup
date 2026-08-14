@@ -3,6 +3,260 @@
 Ranked, cross-cutting view. The per-area files hold the evidence; this file is for **picking the
 next work item**.
 
+---
+
+# RECONCILED 2026-08-14 — two parity sweeps applied, every count re-derived
+
+> **cyrup HEAD `380c713`** (was `04c1ba2` when the edition below was written), branch `david/cyrup`,
+> tree clean. Gate: **`cargo nextest run --workspace` = 6440 tests, 6440 passed, 8 skipped, 16.4 s**;
+> `cargo check --workspace --all-targets` clean.
+>
+> **Everything below this block — including the `REGENERATED 2026-08-12` header that follows it — is
+> the previous edition, and is superseded on every number.** It is
+> retained unedited because its *reasoning* — the severity-scale correction, the duplication census,
+> the structural-defect list — is still the argument this file rests on. Only the arithmetic is dead.
+
+## What happened, honestly
+
+Two whole-backlog parity sweeps ran against this directory's twelve area files. Area agents were
+**forbidden from editing documentation** so that a single writer could reconcile all sixteen files in
+one pass without sixteen partial edits racing each other; this section, and the per-row dispositions
+now written into every `## Open items` table, are that reconciliation.
+
+**Sweep 1** landed **232 items across 11 crates** (commit `380c713`) and handed back **184
+`docUpdatesNeeded` entries**. **Sweep 2** ran the same shape over what remained. Both were restricted
+to `cargo check -p <crate> [--all-targets]` — **neither executed the test suite**; the orchestrator
+ran the gate once over the combined work.
+
+### The open set — before and after, derived from the twelve tables, nothing carried forward
+
+| | critical | high | medium | low | **counted open** |
+|---|---:|---:|---:|---:|---:|
+| **before** (the twelve tables as this reconciliation found them) | 1 | 34 | 195 | 233 | **463** |
+| **after** | **0** | **3** | **75** | **95** | **173** |
+
+**290 rows moved to closed.** 21 rows already carried a closure marker before either sweep, so
+**311 of the 492 rows across the twelve tables now carry one**. Eight rows are new: seven filed and
+closed in the same pass (`PROV-053`, `AGENT-034`, `AGENT-035`, `SESS-045`…`SESS-048`) and one filed
+open (`EXT-060`). **Nine `tracker` rows** are excluded from every figure above, as always — seven in
+the area tables, plus `SEAM-058` and `SUBA-005` in their areas' separate `## Trackers` tables.
+
+Note that the "before" row does not match this file's own previous headline of 448 raw / ~420
+distinct, nor `README.md`'s 458. Both were computed before the repair pass finished growing the
+tables, and neither was re-derived afterwards. **463 is what the tables actually contained**; every
+figure in this section was produced by parsing them, and the parse is reproducible.
+
+### By area
+
+| file | crit | high | medium | low | **open** |
+|---|---:|---:|---:|---:|---:|
+| `01-cyrup-core-and-provider.md` | 0 | 1 | 5 | 6 | **12** |
+| `02-cyrup-agent.md` | 0 | 0 | 0 | 2 | **2** |
+| `03-cyrup-session.md` | 0 | 1 | 1 | 6 | **8** |
+| `04-cyrup-tools.md` | 0 | 0 | 1 | 5 | **6** |
+| `05-cyrup-config-and-resources.md` | 0 | 0 | 11 | 7 | **18** |
+| `06-cyrup-ext.md` | 0 | 0 | 11 | 13 | **24** |
+| `07-cyrup-tui.md` | 0 | 0 | 14 | 20 | **34** |
+| `08-cyrup-session-svc-and-modes.md` | 0 | 1 | 3 | 4 | **8** |
+| `09-cyrup-ext-subagents.md` | 0 | 0 | 14 | 12 | **26** |
+| `10-cyrup-permission-system.md` | 0 | 0 | 2 | 3 | **5** |
+| `11-cyrup-intercom.md` | 0 | 0 | 6 | 8 | **14** |
+| `12-upstream-drift-pi-core.md` | 0 | 0 | 7 | 9 | **16** |
+| | **0** | **3** | **75** | **95** | **173** |
+
+**The three remaining highs, and they are the whole actionable set:**
+
+| # | ID | area | why it is still the top of the backlog |
+|---|---|---|---|
+| 1 | **`SEAM-061`** | 08 + **07** | The `--resume` picker lists every project's sessions under a header that says "Current Folder", with a `tab scope` hint bound to nothing. The blocking evidence has NARROWED to one crate: `SessionScope`, `SessionSelector::set_scope` and `scope()` all exist (`session_selector.rs:54`, `:250`, `:255`); what is missing is `SessionAction::ToggleScope` in `keymap.rs:888-909`, its `handle` arm, and making `show_path` follow the scope. **Two sweeps have split this across areas 07 and 08 and neither took it. It must go to one agent holding both crates.** |
+| 2 | **`SESS-040`** | 03 + 07 + 08 | A shipped control that bills tokens and rewrites the session file still has no dispatch site. Its two siblings are now closed — `SESS-041` (auto-compaction token) and `SESS-042` (the `aborted: true` payload) — so **040, 041 and 042 now differ only in wiring: the moment 040 lands a caller the abort actually takes effect.** Blocked on `TUI-055`'s consequence, not on `TUI-055`: the band renders now, but nobody has watched it. |
+| 3 | **`PROV-047`** | 01 + 02 + 06 + 08 | `httpProxy` now reaches OAuth and the ADC minting path, but **the fix is inert in production until one line lands**: `configure_http_proxy(...)` beside the existing `configure_http_idle_timeout(timeout_ms)` in `cyrup-session-svc/src/builder.rs`. Two further one-liners (`cyrup-agent/src/proxy.rs:468`, `cyrup-ext/src/caps/http.rs:599`) complete it. |
+
+## The analysis's own error rate is now measured, not estimated
+
+This is the most useful thing the two sweeps produced, and it is a property of *this directory*, not
+of the port.
+
+- **Sweep 1 refuted 31 items** out of ~290 it worked — **≈11%** — including 9 of 23 in
+  `cyrup-tools` and 8 of 41 in `cyrup-session-svc`.
+- **Sweep 2 recorded 16 further `refuted-not-fixed` outcomes** and roughly a dozen more in-body
+  factual corrections to items it *did* fix (a wrong upstream constant, a wrong line range, a wrong
+  premise about what blocks the work).
+- Combined: **≈47 recorded refutations against ~380 items worked across the two sweeps ≈ 12%.**
+  **Fifteen rows carry an explicit `REFUTED, CLOSED 2026-08-14` marker**; the rest are recorded
+  inside the closure note of an item that was also fixed, or as a correction on a row that stays
+  open. No refuted ID was renumbered or deleted.
+
+**Refuting is a success, not a shortfall** — but a 12% error rate has three consequences a planner
+must act on:
+
+1. **A stale-closed item costs a whole pass.** `PROV-027`, `PROV-028` and `PROV-029` — three of area
+   01's six highs — were already fixed and were closed by *neither* sweep's code work; the file had
+   simply never been re-read. `SEAM-047`, `SEAM-051`, `SEAM-064`, `SEAM-072` and `DRIFT-049` were all
+   marked fixed in their *kind* cell while their *severity* cell still read `high`, which is how two
+   consecutive recounts published phantom highs.
+2. **Verify a deferral's stated blocker before accepting the deferral.** `PROV-030` sat open through
+   sweep 1 on the ground that "cyrup-provider has no crypto/JWT dep". `ring` 0.17 was already in
+   `Cargo.lock` via rustls — checkable in thirty seconds. The same deferral was masking a second,
+   independent defect (`PROV-053`) that would have kept the feature dead anyway. Likewise
+   `EXT-007`'s "blocked on the `Tool::prompt_guidelines` signature", which three separate places in
+   the record were still planning around after the signature had been widened.
+3. **A handoff field is not a record.** `SESS-037` appears in none of sweep 1's structured
+   `fixedIds` / `partial` / `notReached` buckets because its area's free-text `unresolved` string was
+   **truncated at exactly 2500 characters mid-sentence**. It was re-verified from scratch and would
+   have been re-worked. That truncation is systematic across areas in the handoff file. Area 01's
+   sweep-2 agent independently reported the same thing: its structured fields said "1 not-reached, 2
+   partial" while the prose named six not-reached and mentioned none of the three highs it found
+   already closed. **Plan from the prose, not the buckets — or fix the buckets.**
+
+## JS→Rust mechanism gaps — the register
+
+This is the highest-value class in this port, and it is not "cyrup does X where pi does Y". It is
+**pi relying on a guarantee Rust does not give**. Sweep 1's dedup deadlock came from this class; so
+did the two worst near-misses of sweep 2. Every entry below is recorded on the item it belongs to;
+they are collected here because the *class* is what a future pass should hunt, not the instances.
+
+**A. A future can be dropped at any `.await`; a JS `async` function always settles.**
+
+- Sweep 1's dedup deadlock: a `PendingOwner` died at an `.await` without settling, and its cache
+  entry's live `Sender` kept the channel open forever. pi cannot reach it.
+- `DRIFT-029`: pi's `executeBash` removes its `AbortController` in a `finally`. A plain
+  `let … = …; …; remove()` sequence leaks a live `CancelToken` on a dropped future and makes
+  `is_bash_running()` **permanently true**. Closed with an RAII `BashCancelGuard`.
+- `EXT-034`: a re-entrancy latch cleared only on the success path stays set forever after an aborted
+  run and permanently disables bus delivery. `bus::DrainLatch` is therefore RAII, not a
+  `store(false)` at the end.
+- `AGENT-035`: a cancelled Rust stream can end **cleanly** where a JS read loop always throws, so a
+  cancel landing after the last `None` was invisible and the consumer saw a well-formed stream end
+  with no terminal event.
+- **Generalisation, cheap to run:** `grep -n 'finally {' packages/coding-agent/src/core/agent-session.ts`
+  enumerates every pi site where a `finally` mutates session state. Each one is a place the Rust port
+  needs either a guard or a provably-reached statement.
+
+**B. A `tokio::Mutex` has no deadlock detection, so the failure mode is a HANG, not a red test.**
+
+`EXT-034`'s first cut drained the bus unconditionally at every dispatch seam. `dispatch_*_excluding`
+with `exclude = Some(id)` exists precisely because that guest is **suspended inside its own
+`provider-stream.on-payload` host import, holding its single-instance store guard** — so a queued
+event addressed to it would have re-taken a lock it already held: an infinite await. pi cannot reach
+it: its runner is one JS process, `emit` runs listeners synchronously, and a re-entered handler is an
+ordinary nested call with no lock. **The invariant — never drain while a dispatch carries an
+`exclude` — is now a comment, a test, and a line in `EXT-034`'s row, because removing the argument
+reintroduces a hang rather than a failure.**
+
+**C. TypeScript field types are compile-time only; pi's readers re-validate by hand.**
+
+`SESS-045`: `interface SessionHeader` declares `timestamp` and `cwd` required, but pi's two runtime
+validators check `type` and `id` and nothing else, and every consumer carries a
+`typeof … ? … : fallback` ternary. Rust's serde turns the declared type into an **enforced** one, so
+cyrup hard-failed the whole session file where pi opens it and falls back to `process.cwd()`.
+**Anywhere cyrup mirrored a pi `interface` field-for-field as a required Rust field, check whether
+pi's readers re-validate it.** `SESS-001` and `SESS-027` are the same mechanism one layer down.
+
+**D. JS coercion has no Rust counterpart, in four distinct shapes.**
+
+- `SESS-048`: `typeof x === "number"` is true for negatives and fractions, so pi's `delete` runs for
+  every number where an `as_u64` match returns early. **The Rust idiom for a JS number guard is
+  `as_f64`.** And `entries[2.0]` is `entries["2"]` — a JS array index is stringified, so pi resolves
+  an integral float where cyrup resolved nothing.
+- `SESS-046`: `Array.prototype.sort()` with no comparator is **UTF-16 code-unit order**, which is not
+  Rust's `Ord for str` (UTF-8 byte order). They disagree for every pair where one string carries an
+  astral code point and the other a code point in U+E000..=U+FFFF. **Any `BTreeSet`/`.sort()` that
+  reproduces a pi `.sort()` over user-supplied strings — file paths, model ids, session names, skill
+  names — is a candidate.** This one reached persisted summary text.
+- `PROV-053`: `std::env::var(name).ok()` returns `Some("")` for a blank variable where pi's ambient
+  accessor collapses it to `undefined`. Every precedence chain ported from a JS `??` then reads a
+  blank var as CONFIGURED — **a silent inversion of the upstream semantics at every such site, and
+  the bug is in the adapter, not in any call site, so a per-item review of the call sites cannot see
+  it.**
+- `CFG-042` / `CFG-048`: `serde_json::Map` is a `BTreeMap` in this workspace, so it cannot represent
+  the insertion order a JS object literal carries and `JSON.stringify` writes. A straight port of
+  `orderKeybindingsConfig` would have **silently alphabetised the user's keybindings file**. Handled
+  with `Vec<(String, Value)>` plus a hand-written two-space printer; the same gap blocks `CFG-042`'s
+  remaining half and needs `indexmap` in the workspace dependency table.
+
+**E. pi keys maps on object identity; Rust has none for a value type.**
+
+`PROV-035`: `collectCacheMisses` returns `Map<AssistantMessage, CacheMiss>` keyed on the message
+**reference**, and its consumer looks it up by the same reference while re-rendering. Two structurally
+equal `AssistantMessage`s are the same key in Rust. Resolved by keying on the entry index, which
+pushes an obligation onto the renderer. `DRIFT-029` is the same shape: pi's Set keys on
+`AbortController` identity, **not** on the optional-and-repeatable `options.id` the item proposed.
+
+**F. Rust ports keep inventing defensive clamps upstream does not have.**
+
+`SESS-047`'s `.max(1)` on the summarization `maxTokens` had no counterpart in pi's
+`Math.min(Math.floor(frac * reserveTokens), …)`. This is the *inverse* of the usual gap — not a JS
+guarantee Rust lacks, but a Rust-side clamp invented to avoid a zero pi is perfectly happy to send.
+
+**G. A faithful port would sometimes reproduce an upstream bug, and that decision needs recording.**
+
+pi's `generateId(byId)` inside `migrateV1ToV2` guards against a set the function never `.add()`s to,
+so **pi's collision check is a no-op and can mint the same 8-hex id twice**. cyrup's working dedup
+can only differ in the case pi gets wrong. Recorded in-source rather than ported. The same question
+will recur.
+
+**H. Two cyrup-original surfaces are wearing fabricated pi citations.**
+
+`EXT-036` was filed for this class in the event catalog. Sweep 2 found a second instance in
+`interface ui`: `working-start` / `working-stop` are documented "(Pi startWorking/stopWorking,
+types.ts:265-275)" and **neither function exists upstream at v0.83.0** — the cited range is
+getAllThemes/getTheme/setTheme/getToolsExpanded. Worse, the invented shape is strictly weaker than
+pi's: it welds the message to the visibility, so `setWorkingVisible(false)` with the message intact
+was unexpressible. `EXT-060` is the third instance, filed by this reconciliation: cyrup's
+`registry.tool_info()` emits a `source: "extension"|"guest"` discriminator that pi's `ToolInfo` does
+not have — **the WASM-vs-native tier leaking into a guest-facing introspection API**, a distinction
+pi's one-extension-kind model has no word for. **Re-run the `EXT-036` sweep over the import surfaces,
+not only the event catalog.**
+
+## Structural defect J — the merge gate does not cover the `cyrup-it` harness
+
+New this pass, and it is a property of the gate rather than of any item.
+
+`crates/cyrup-it` is `required-features = ["it"]` (its own `Cargo.toml:26-34` says so), so
+`cargo test --workspace` / `cargo nextest run --workspace` **does not build or run it**. The 6440-test
+figure therefore gives **zero coverage of the broker-socket seam tests**. The evidence that this is
+not theoretical: four `cyrup-it` assertions (`tests/intercom/tool_actions.rs:319`, `:372`, `:502`,
+`tests/intercom/intercom_command_transcript.rs:142`) currently **contradict production** — they pin a
+trailing period `tools/intercom.rs` stopped emitting when `ICOM-013`'s closed half landed — and they
+are green only because nothing runs them. `PERM-022` moved into the same crate and inherits the
+problem. **Either the gate gains a second invocation with `--features it`, or every assertion in that
+crate should be treated as unverified.**
+
+## Test architecture — recorded because it invalidates path citations everywhere
+
+The integration tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` /
+`d973906`): **310 integration binaries → 6 + 8 gated**, behind the new `cyrup-it` harness crate, with
+the gate at **6440 tests in 16.4 s** (the previously-inherited figure of 3932, and the 6387 the repro
+pass measured, are both superseded). **Every `crates/<crate>/tests/<x>.rs` citation in this directory
+is stale unless it names `cyrup-it`** — the affected items are enumerated in each area file's
+reconciliation block. Areas 02, 03 and 04 additionally have no out-of-crate `tests/` directory at all.
+
+## What a planner should do next, in order
+
+1. **`SEAM-061`** — one agent, both crates (07 + 08). It is the only high whose fix is fully
+   understood and fully blocked on coordination.
+2. **The one-line residuals**, which are cheap and are what makes three landed features actually
+   reachable by a user: `PROV-047`'s `configure_http_proxy` call in the session-svc builder;
+   `EXT-037`/`EXT-038`'s two `LiveHostServices` impls (`commands()` off
+   `AgentSession::slash_command_catalog`, `all_tools()` off the dynamic tool registry, so built-ins
+   appear); `SESS-035`'s doc line. Each is small, mechanical, and named exactly in its row.
+3. **Build and instantiate the Tier-1 WASM fixture.** `HOST_WORLD` moved `0.5 → 0.6` in sweep 2 and
+   **nothing has proven it against a real guest** — host and guest agree at the type level and no
+   further. A failure will present as an opaque wasmtime link error.
+4. **Move the items that cannot be closed where they are filed**, rather than letting a fourth pass
+   re-derive the same blocked plan: `EXT-025`, `EXT-003`, `EXT-059`, `EXT-013`, `EXT-041`, `EXT-053`,
+   the residuals of `EXT-039`/`040`/`019`, `TOOL-024`, `PERM-011`, `PERM-022`, `SEAM-073`(b).
+5. **Read `caps/{http,fs,proc}.rs` and the `is_trusted` gate** (area 06, blind spot 4). Roughly 1000
+   lines, never read by any pass, and now the only part of `host/services.rs` nobody has walked —
+   in the same file where `EXT-054` found the entire manifest capability model inert.
+6. **Re-derive every remaining `upstream-drift` row at `v0.83.0` before scheduling it.** Four more
+   kind corrections landed this pass (`DRIFT-013`, `DRIFT-029`, `DRIFT-046`, plus `DRIFT-033`'s
+   scope), all in the same direction: filed as version lag, actually a port omission inside the
+   baseline. **This file's default assumption about that class is wrong more often than it is right.**
+
+---
+
 > **REGENERATED 2026-08-12 (second edition, same day) — cyrup HEAD `04c1ba2`** (last code commit;
 > repo HEAD `a9000b1` is docs-only, branch `david/cyrup`), against **pi `v0.84.1`**,
 > **pi-subagents `v0.47.1`**, **pi-permission-system `v0.8.0`**, **pi-intercom `v0.10.1`**.
@@ -60,6 +314,13 @@ next work item**.
 
 ## The open set at `04c1ba2` — two figures, both published
 
+> **SUPERSEDED 2026-08-14.** Both figures below were computed before the repair pass finished
+> growing the tables and neither was re-derived afterwards; the tables actually contained **463**
+> counted rows, not 448. The current figure is **173 open — 0 critical, 3 high, 75 medium, 95 low**.
+> See *RECONCILED 2026-08-14* at the top of this file. The **deduplication reasoning** below (the
+> `duplicate-of` census and the F4 cluster) is still valid and was not re-run; a deduplicated figure
+> for 173 has not been computed.
+
 The previous edition called 426 a floor while its own cluster tables documented ≥25 IDs of
 double-count inside it. Both numbers are now stated, each labelled, so the count can be used.
 
@@ -94,6 +355,13 @@ its full body.
 ---
 
 ## The actionable set — 6 criticals + 22 highs
+
+> **SUPERSEDED 2026-08-14 — every row below is dispositioned.** All six criticals and 31 of the 34
+> highs are closed; the actionable set is now three items (`SEAM-061`, `SESS-040`, `PROV-047`) and is
+> tabled at the top of this file. The section is retained because each row's *fix sketch* is still the
+> best short statement of what the work was, and because several rows record a refutation that must
+> not be lost — in particular row 1 (`AGENT-020`, refuted by measurement) and row 6 (`EXT-054`).
+> **Do not plan from the ranking below.**
 
 Ranked by the criterion stated in *Ranking proposal*. One row per item, written so a planner can
 schedule without opening the area file. Every row names the file and the fix.
@@ -138,6 +406,12 @@ un-swept, not clean (area 11 blind spot 10).
 
 ## Closure rates — the mechanism that produced 3.9% is still gone
 
+> **SUPERSEDED 2026-08-14.** Two sweeps closed **290 rows** in one commit cycle. Whatever this
+> section concluded about closure rate is answered: the mechanism that was missing was a
+> whole-backlog sweep with per-item pi re-derivation, and it works. What it did *not* fix is
+> verification — nothing below the gate was executed, and the analysis's own 12% error rate is now
+> the binding constraint. See *The analysis's own error rate is now measured* at the top.
+
 > The 2026-08-07 pass measured highs closing at 82% and mediums at **3.9%**, and correctly attributed
 > the gap to *every commit being explicitly high-targeted*. That diagnosis was right and it is what
 > predicted the change: **the rate moved when the commits stopped being item-targeted.**
@@ -174,6 +448,10 @@ in the backlog before this pass, mis-rated.
 ---
 
 ## The medium/low picture — 197 medium + 223 low
+
+> **SUPERSEDED 2026-08-14 — the current split is 75 medium + 95 low.** The clustering below is still
+> the right way to read that population and was not re-derived; treat the cluster membership as a map
+> and the counts as dead.
 
 ### Item kinds, re-derived from the twelve open tables
 
@@ -638,6 +916,8 @@ three editions.
 ---
 
 ## By area
+
+> **SUPERSEDED 2026-08-14** — see the *By area* table at the top of this file.
 
 Highs, mediums **and** lows have all been audited against code at HEAD `04c1ba2`. Counts are derived
 from each file's own single `## Open items` table; the `trk` column is excluded from every other

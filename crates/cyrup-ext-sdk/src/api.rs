@@ -314,6 +314,58 @@ pub struct RegisteredRenderer {
     pub renderer: Box<dyn MessageRenderer>,
 }
 
+// --- markdown transformer (EXT-019; Pi `MarkdownTransformer`, types.ts:1153 @v0.84.1) ---
+
+/// The `MarkdownTransformContext` pi hands a transformer
+/// (`pi/packages/coding-agent/src/core/extensions/types.ts:1147-1151` @v0.84.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownTransformContext {
+    /// `"user" | "assistant" | "assistant-thinking"`.
+    pub message_type: String,
+    pub is_streaming: bool,
+    pub available_width: u32,
+}
+
+impl MarkdownTransformContext {
+    /// Parse the host's `ctx-json`. Unknown/absent fields take conservative defaults rather than
+    /// failing — a transformer must never be skipped because the host added a field.
+    pub fn from_json(v: &Value) -> Self {
+        Self {
+            message_type: v
+                .get("messageType")
+                .and_then(Value::as_str)
+                .unwrap_or("assistant")
+                .to_string(),
+            is_streaming: v.get("isStreaming").and_then(Value::as_bool).unwrap_or(false),
+            available_width: v
+                .get("availableWidth")
+                .and_then(Value::as_u64)
+                .and_then(|w| u32::try_from(w).ok())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Transform transcript markdown before the host renders it (Pi
+/// `type MarkdownTransformer = (markdown: string, context: MarkdownTransformContext) => string`,
+/// `extensions/types.ts:1153` @v0.84.1 — a POST-BASELINE addition, absent at v0.83.0).
+///
+/// An extension has AT MOST ONE, because upstream stores it as `extension.markdownTransformer`
+/// (`loader.ts:309-312`). The host folds every extension's transformer in load order, so this
+/// receives whatever the previous extension produced.
+pub trait MarkdownTransformer: 'static {
+    fn transform(&self, markdown: &str, ctx: &MarkdownTransformContext) -> String;
+}
+
+impl<F> MarkdownTransformer for F
+where
+    F: Fn(&str, &MarkdownTransformContext) -> String + 'static,
+{
+    fn transform(&self, markdown: &str, ctx: &MarkdownTransformContext) -> String {
+        self(markdown, ctx)
+    }
+}
+
 /// A uniform handler: parses the ordered string args the host passes and returns a [`RawOutcome`].
 type Handler = Box<dyn Fn(&[&str], &Ctx) -> RawOutcome + 'static>;
 
@@ -334,6 +386,9 @@ pub struct ExtensionApi {
     /// [`Self::renderers`], mirroring upstream's disjoint `messageRenderers`/`entryRenderers` maps
     /// (types.ts:1703-1704); on the wire an entry still travels over `render-call`.
     pub(crate) entry_renderers: Vec<RegisteredRenderer>,
+    /// EXT-019: at most one per extension (Pi `extension.markdownTransformer`, types.ts:1703
+    /// @v0.84.1).
+    pub(crate) markdown_transformer: Option<Box<dyn MarkdownTransformer>>,
     pub(crate) autocomplete: Vec<String>,
     /// Stacked global autocomplete providers (Pi `addAutocompleteProvider`, sdk gap #2). Folded in
     /// registration order over the host's built-in suggestions by [`Self::autocomplete_suggest`].
@@ -506,6 +561,29 @@ impl ExtensionApi {
             custom_type: custom_type.into(),
             renderer: Box::new(renderer),
         });
+    }
+
+    /// Register this extension's markdown transformer (EXT-019; Pi
+    /// `registerMarkdownTransformer(transformer)`, `extensions/types.ts:1292` @v0.84.1, impl
+    /// `loader.ts:309-312`). AT MOST ONE per extension — a second call REPLACES the first, exactly
+    /// as upstream's field assignment does.
+    pub fn register_markdown_transformer(&mut self, transformer: impl MarkdownTransformer) {
+        self.markdown_transformer = Some(Box::new(transformer));
+    }
+
+    /// Run this extension's markdown transformer, if it registered one (the `transform-markdown`
+    /// export body). Identity when it did not.
+    pub fn transform_markdown(&self, markdown: &str, ctx: &MarkdownTransformContext) -> String {
+        match &self.markdown_transformer {
+            Some(t) => t.transform(markdown, ctx),
+            None => markdown.to_string(),
+        }
+    }
+
+    /// Whether this extension registered a markdown transformer (drives the
+    /// `register-markdown-transformer` import at init).
+    pub fn has_markdown_transformer(&self) -> bool {
+        self.markdown_transformer.is_some()
     }
 
     /// Register a custom ENTRY renderer (Pi `pi.registerEntryRenderer(customType, renderer)`,

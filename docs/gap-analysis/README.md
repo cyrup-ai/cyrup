@@ -16,9 +16,31 @@ the evidence.
 > actually does. Closed items keep their IDs in each area file's status table so a closure can be
 > re-audited later.
 >
-> **Open set: 458 work items — 5 critical, 29 high**, plus **9 `tracker` rows** that keep their IDs
-> but propose no schedulable work and are excluded from the count. *(Was 448 / 6 / 22 at the
-> 2026-08-12 re-baseline; the delta is the 2026-08-13 repro pass — see below.)*
+> **RECONCILED 2026-08-14 against cyrup HEAD `380c713`.** Two whole-backlog parity sweeps have
+> landed — **sweep 1, 232 items across 11 crates, plus sweep 2** — and every count in this file has
+> been re-derived from the twelve `## Open items` tables. **Open set: 173 work items — 0 critical,
+> 3 high, 75 medium, 95 low**, plus **9 `tracker` rows** excluded from the count as always. **290 rows
+> moved to closed**; eight rows are new (`PROV-053`, `AGENT-034`, `AGENT-035`, `SESS-045`…`SESS-048`
+> filed and closed on arrival, `EXT-060` filed open). **No ID was renumbered, merged or deleted** — a
+> refuted item keeps its ID with the refutation recorded in its row. Start at
+> [`00-residual-ledger.md`](00-residual-ledger.md), whose top section is the reconciliation.
+>
+> **The three remaining highs are `SEAM-061`, `SESS-040` and `PROV-047`**, and all three are blocked
+> on coordination across two or more crates rather than on analysis.
+>
+> **The analysis's own error rate is now measured: ≈12%.** Sweep 1 refuted 31 of ~290 items it
+> worked; sweep 2 recorded 16 further `refuted-not-fixed` outcomes plus about a dozen in-body factual
+> corrections. **Refuting is a success, not a shortfall** — but it means a status in this directory is
+> evidence, not fact, until it has been re-read at HEAD. See the ledger's error-rate section.
+>
+> **The test architecture changed**: 310 integration binaries → **6 + 8 gated** behind a new
+> `cyrup-it` harness crate, gate at **6440 tests in 16.4 s**. Every `crates/<crate>/tests/<x>.rs`
+> citation in this directory is stale unless it names `cyrup-it` — **and `cyrup-it` is
+> `required-features = ["it"]`, so the gate does not build or run it** (structural defect J).
+>
+> *The superseded figures, retained for provenance: 458 / 5 / 29 after the 2026-08-13 repro pass;
+> 448 / 6 / 22 at the 2026-08-12 re-baseline. Neither matches what the tables actually contained
+> (463) — see the ledger.*
 >
 > **Amended 2026-08-13 by [`REPRO-LOG.md`](REPRO-LOG.md), the first pass that ran the binary.**
 > Seventeen items were driven through a real pty or headless: **16 CONFIRMED, 1 REFUTED, 0 BLOCKED**
@@ -51,22 +73,22 @@ the evidence.
 |---|---|---:|---:|---:|
 | [`../PARITY-PLAN.md`](../PARITY-PLAN.md) | **the execution plan derived from this directory — 30 batches, the next three moves, deferrals and open questions** | — | — | — |
 | [`../adr/README.md`](../adr/README.md) | **decisions of record — where the nine open questions of `PARITY-PLAN.md` §7 were settled (eleven ADRs), plus the ledger changes those decisions imply** | — | — | — |
-| [`PARITY-GAPS.md`](PARITY-GAPS.md) | **the same 448 items grouped by gap class — read first** | — | — | — |
+| [`PARITY-GAPS.md`](PARITY-GAPS.md) | **the same items grouped by gap class — read first.** Its §0 census and §0a above-medium table are **superseded 2026-08-14** (they enumerate the 448-item set); the class taxonomy, the per-entry fix sketches and §7 Method are current | — | — | — |
 | [`REPRO-LOG.md`](REPRO-LOG.md) | **the first execution of this binary — 17 items driven through a real pty or headless, 16 confirmed / 1 refuted / 0 blocked, plus the real suite numbers (6387, not the inherited 3932) and 9 new items filed from what the binary was seen doing.** Every row carries a transcript. **Read this before trusting a severity: only 3 of 17 items survived a live run unchanged.** | — | — | — |
 | [`00-residual-ledger.md`](00-residual-ledger.md) | ranked cross-cutting view | — | — | — |
-| [`01-cyrup-core-and-provider.md`](01-cyrup-core-and-provider.md) | wire APIs, providers, auth, streaming, catalogs, cost | 41 | 0 | 7 |
-| [`02-cyrup-agent.md`](02-cyrup-agent.md) | the turn loop, tool dispatch, hooks, abort | 26 | 0 | 1 |
-| [`03-cyrup-session.md`](03-cyrup-session.md) | JSONL session tree, compaction, system prompt | 29 | 0 | 1 |
-| [`04-cyrup-tools.md`](04-cyrup-tools.md) | the built-in tool set | 29 | 0 | 1 |
-| [`05-cyrup-config-and-resources.md`](05-cyrup-config-and-resources.md) | settings, model resolution, trust, skills, packages | 38 | 0 | 1 |
-| [`06-cyrup-ext.md`](06-cyrup-ext.md) | extension host, WIT world, event catalog | 51 | 1 | 0 |
-| [`07-cyrup-tui.md`](07-cyrup-tui.md) | terminal UI application layer | 62 | 3 | 7 |
-| [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes | 40 | 0 | 7 |
-| [`09-cyrup-ext-subagents.md`](09-cyrup-ext-subagents.md) | subagent delegation | 45 | 0 | 2 |
-| [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate | 22 | 1 | 1 |
-| [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker | 45 | 0 | 0 |
-| [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline | 30 | 0 | 1 |
-| | **total** | **458** | **5** | **29** |
+| [`01-cyrup-core-and-provider.md`](01-cyrup-core-and-provider.md) | wire APIs, providers, auth, streaming, catalogs, cost | **12** | 0 | 1 |
+| [`02-cyrup-agent.md`](02-cyrup-agent.md) | the turn loop, tool dispatch, hooks, abort | **2** | 0 | 0 |
+| [`03-cyrup-session.md`](03-cyrup-session.md) | JSONL session tree, compaction, system prompt | **8** | 0 | 1 |
+| [`04-cyrup-tools.md`](04-cyrup-tools.md) | the built-in tool set | **6** | 0 | 0 |
+| [`05-cyrup-config-and-resources.md`](05-cyrup-config-and-resources.md) | settings, model resolution, trust, skills, packages | **18** | 0 | 0 |
+| [`06-cyrup-ext.md`](06-cyrup-ext.md) | extension host, WIT world, event catalog | **24** | 0 | 0 |
+| [`07-cyrup-tui.md`](07-cyrup-tui.md) | terminal UI application layer | **34** | 0 | 0 |
+| [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes | **8** | 0 | 1 |
+| [`09-cyrup-ext-subagents.md`](09-cyrup-ext-subagents.md) | subagent delegation | **26** | 0 | 0 |
+| [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate | **5** | 0 | 0 |
+| [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker | **14** | 0 | 0 |
+| [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline | **16** | 0 | 0 |
+| | **total** | **173** | **0** | **3** |
 
 Counts are the `## Open items` table of each file. **Every file now carries exactly one such table**
 — area 03's second table was the last one and was folded in during the repair pass — so a single
@@ -75,8 +97,10 @@ separate `## Trackers` table) and are deliberately outside the arithmetic: one e
 03, 08 and 09, and four in area 12.
 
 **Every one of these is a floor, not a total** — see blind spot 1. It is also not a clean total in
-the other direction: area 12 marks **16 of its 30** rows `duplicate-of` an item another area owns, so
-432 is the largest deduplicated figure anyone has actually computed, and the ledger's F4 cluster
+the other direction: area 12 marks **16 of its 30** rows `duplicate-of` an item another area owns
+(**2026-08-14: 14 of those 30 rows are now closed, so the duplication census needs re-running before
+any deduplicated figure is quoted against 173**), so
+432 was the largest deduplicated figure anyone had actually computed against the old set, and the ledger's F4 cluster
 lists further multi-ID defects nobody has reduced to a number.
 
 Numbering follows the convention already referenced in cyrup's source

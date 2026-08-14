@@ -302,14 +302,23 @@ fn model_ref(model: &Model) -> ModelRef {
 }
 
 /// `min(floor(frac*reserve), model.max_tokens)` (treating a zero `max_tokens` as unbounded).
-/// `frac` is `(num, den)`: history summaries use `0.8` (Pi `compaction.ts:578-581`); the turn-prefix
-/// half uses `0.5` (Pi `compaction.ts:863-866`).
-fn compute_max_tokens_frac(reserve: u32, model_max: u32, num: u64, den: u64) -> u32 {
+/// `frac` is `(num, den)`: history summaries use `0.8` (Pi `generateSummaryWithUsage`,
+/// `compaction.ts:637-640` @v0.83.0); the turn-prefix half uses `0.5` (Pi
+/// `generateTurnPrefixSummary`, `compaction.ts:937-940`).
+///
+/// Pi is verbatim
+/// `Math.min(Math.floor(0.8 * reserveTokens), model.maxTokens > 0 ? model.maxTokens : Infinity)`
+/// with **no lower bound**: a `reserveTokens` under `den/num` floors to `0` and pi sends
+/// `maxTokens: 0`. cyrup previously applied a `.max(1)` floor here, which is a cyrup-original
+/// clamp — the one input where the two differ (`reserve_tokens ∈ 1..=1` for the 0.8 fraction,
+/// `1` for the 0.5 fraction) is reachable from settings, since `CompactionSettings.reserve_tokens`
+/// is a plain deserialized `u32` with no minimum. Parity is the bar, so the floor is gone.
+pub(crate) fn compute_max_tokens_frac(reserve: u32, model_max: u32, num: u64, den: u64) -> u32 {
     let from_reserve = (u64::from(reserve) * num / den) as u32;
     if model_max == 0 {
-        from_reserve.max(1)
+        from_reserve
     } else {
-        from_reserve.min(model_max).max(1)
+        from_reserve.min(model_max)
     }
 }
 

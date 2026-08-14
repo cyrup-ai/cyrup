@@ -59,6 +59,19 @@ fn v2_to_v3(entries: &mut [Entry]) {
 /// the previous entry). Entries that already carry an id keep it. Legacy id-less entries (stored
 /// verbatim as `Entry::Unknown`) are given an id + parent and re-typed if their `type` is known.
 ///
+/// **Two deliberate spellings, both unobservable on any file pi wrote** (walked statement-by-
+/// statement against `migrateV1ToV2`, `session-manager.ts:229-256` @v0.83.0, closing the
+/// `migrate.rs` blind spot the 2026-08-12 area-03 audit named):
+///
+/// 1. Pi assigns `entry.id = generateId(ids)` **unconditionally**; cyrup keeps a pre-existing id.
+///    A v1 entry has no `id` — that is the whole point of the v1→v2 migration — so the two agree
+///    on every v1 file, and they can only differ for a hand-built file that declares `version < 2`
+///    while already carrying ids. Preserving such an id keeps any external reference to it valid.
+/// 2. Pi's `generateId(byId)` retries while `byId.has(id)`, but `migrateV1ToV2` **never calls
+///    `ids.add(...)`**, so pi's collision check is a no-op on an always-empty set and pi can mint
+///    the same 8-hex id twice. cyrup seeds `used` from the surviving ids and inserts each minted
+///    one. This can only ever change the outcome in the case pi gets wrong.
+///
 /// A v1 `compaction` entry referenced its first-kept entry by numeric `firstKeptEntryIndex`; Pi
 /// `migrateV1ToV2` (`session-manager.ts:241-250`) resolves that index into the freshly-id'd entry
 /// array's `firstKeptEntryId` and drops the index field, otherwise the entry can never parse as a
@@ -135,11 +148,23 @@ fn convert_first_kept_index(obj: &mut serde_json::Map<String, Value>, assigned: 
     if obj.get("type").and_then(Value::as_str) != Some("compaction") {
         return;
     }
-    let Some(idx) = obj.get("firstKeptEntryIndex").and_then(Value::as_u64) else {
+    // Pi's guard is `typeof comp.firstKeptEntryIndex === "number"` — true for a NEGATIVE and for a
+    // FRACTIONAL value too, and the `delete comp.firstKeptEntryIndex` that follows it runs on every
+    // one of those. Matching on `as_u64` alone returned early for both, leaving the dead v1
+    // `firstKeptEntryIndex` key on the entry that the migration rewrite then persisted. Read the
+    // value as an `f64` (JSON numbers are doubles upstream) and always strip the key.
+    let Some(raw) = obj.get("firstKeptEntryIndex").and_then(Value::as_f64) else {
         return;
     };
+    // `entries[idx]` is a JS property access, so the index is coerced with `ToString`: `1.0`
+    // stringifies to `"1"` and hits element 1, while `1.5` stringifies to `"1.5"`, matches no
+    // element, and yields `undefined` (Pi's `if (targetEntry && …)` then skips). A negative index
+    // is likewise a miss, since JS arrays have no negative-index elements.
+    #[allow(clippy::float_cmp)]
+    let integral = raw >= 0.0 && raw.fract() == 0.0 && raw <= u64::MAX as f64;
     // Header-inclusive (Pi) index → cyrup position; index 0 is the session header.
-    if let Some(pos) = (idx as usize).checked_sub(1)
+    if integral
+        && let Some(pos) = (raw as usize).checked_sub(1)
         && let Some(target) = assigned.get(pos)
     {
         obj.insert(

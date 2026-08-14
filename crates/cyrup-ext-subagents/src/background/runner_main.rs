@@ -2451,6 +2451,14 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             output_mode: step
                 .output_mode
                 .unwrap_or(crate::discovery::types::OutputMode::Inline),
+            // SUBA-054 residual, stated rather than silently defaulted: a step dispatched through
+            // this runner already gets its `[Read from: …]` line from
+            // `spawn::chain_graph::build_chain_instructions`, which resolves `step.reads` against
+            // the CHAIN dir. Populating `RunOptions::reads` here as well would emit the line TWICE
+            // for every chain step. Upstream's async single path resolves against `effectiveCwd`
+            // (`async-execution.ts:1300-1302`), so closing the async half means teaching the step
+            // builder which of the two cwds applies — not setting this field.
+            reads: None,
             structured_output_schema: step.structured_output_schema.clone(),
             model_override,
             preferred_provider: None,

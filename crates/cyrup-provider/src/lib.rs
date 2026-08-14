@@ -14,6 +14,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod cache_stats;
 pub mod catalog;
 pub mod collection;
 pub mod config_provider;
@@ -47,6 +48,7 @@ pub mod faux;
 pub use api::anthropic_messages::AnthropicMessagesApi;
 pub use api::azure_openai_responses::AzureOpenAiResponsesApi;
 pub use api::google_generative_ai::GoogleGenerativeAiApi;
+pub use api::google_vertex::GoogleVertexApi;
 pub use api::mistral_conversations::MistralConversationsApi;
 pub use api::openai_completions::OpenAiCompletionsApi;
 pub use api::openai_responses::OpenAiResponsesApi;
@@ -57,6 +59,10 @@ pub use auth::{
     ApiKeyAuth, AuthContext, AuthOverrides, AuthResult, Credential, CredentialInfo,
     CredentialStore, CredentialType, EnvAuthContext, InMemoryCredentialStore, ModelAuth, ModifyFn,
     OAuthAuth, ProviderAuth, ProviderEnv, env_key, keyless_local, resolve_provider_auth,
+};
+pub use cache_stats::{
+    CACHE_TTL_MS, CacheMiss, CacheScan, CacheScanEntry, CacheWasteTotals, ModelPriceSource,
+    NOISE_FLOOR_TOKENS, NoPrices, collect_cache_misses, compute_cache_waste, detect_cache_miss,
 };
 pub use catalog::{builtin_catalog, load_catalog};
 pub use collection::{
@@ -139,7 +145,8 @@ pub use providers::builtin_provider_oauth;
 pub use providers::{openrouter_images_auth, openrouter_images_provider};
 pub use stream::sse::{
     DEFAULT_HTTP_IDLE_TIMEOUT_MS, OnRequest, OnResponse, SseFrame, SseRequest, build_client,
-    build_client_for_target, build_client_with_proxy, configure_http_idle_timeout, decode_sse_bytes,
+    build_client_for, build_client_for_target, build_client_with_proxy,
+    configure_http_idle_timeout, configure_http_proxy, configured_http_proxy, decode_sse_bytes,
     http_idle_timeout_ms, open_sse,
 };
 pub use utils::error_body::{MAX_PROVIDER_ERROR_BODY_CHARS, truncate_error_text};
@@ -180,6 +187,9 @@ pub mod known_api {
     pub const OPENAI_RESPONSES: &str = "openai-responses";
     pub const AZURE_OPENAI_RESPONSES: &str = "azure-openai-responses";
     pub const GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
+    /// pi `KnownApi` (`ai/src/types.ts:25` @v0.83.0, `:26` @v0.84.1). Ported by PROV-030;
+    /// implemented in [`crate::api::google_vertex`].
+    pub const GOOGLE_VERTEX: &str = "google-vertex";
     pub const MISTRAL_CONVERSATIONS: &str = "mistral-conversations";
     pub const BEDROCK_CONVERSE_STREAM: &str = "bedrock-converse-stream";
     /// pi `KnownApi` (`ai/src/types.ts:16-26`). Ported in the unported-work sweep.

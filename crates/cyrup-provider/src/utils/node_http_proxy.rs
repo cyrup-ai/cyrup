@@ -55,6 +55,25 @@ async fn get_proxy_env(key: &str, ctx: &dyn AuthContext, env: Option<&ProviderEn
     if let Some(v) = ctx.env(&upper).await.filter(|v| !v.is_empty()) {
         return v;
     }
+    // PROV-047. pi's `applyHttpProxySettings` (`coding-agent/src/core/http-dispatcher.ts:43-48`
+    // @v0.83.0) writes the `httpProxy` SETTING into the process environment as
+    // `process.env.HTTP_PROXY ??= proxy; process.env.HTTPS_PROXY ??= proxy`, so by the time
+    // `getProxyEnv` runs it is indistinguishable from an ambient variable — which is precisely why
+    // the setting reaches every egress path upstream and reached exactly one here.
+    //
+    // cyrup cannot write its own environment (see `sse::configure_http_proxy`), so the setting is
+    // consulted at this layer instead, and ONLY for the two names pi writes. `??=` gives the
+    // ambient variable precedence, which the four lookups above already have.
+    //
+    // One corner is not reproduced and is stated rather than hidden: pi's `??=` does not overwrite
+    // an ambient variable explicitly set to the EMPTY string, and `getProxyEnv`'s `||` then skips
+    // it, so `HTTPS_PROXY=""` upstream means "no proxy" even with the setting configured. Here the
+    // empty value is indistinguishable from unset and the setting applies.
+    if lower == "http_proxy" || lower == "https_proxy" {
+        if let Some(configured) = crate::stream::sse::configured_http_proxy() {
+            return configured;
+        }
+    }
     String::new()
 }
 
@@ -306,5 +325,64 @@ mod tests {
             .expect("ok")
             .expect("proxy");
         assert_eq!(out.host_str(), Some("fallback"));
+    }
+
+    // ------------------------------------------------------------------ PROV-047
+
+    /// The `httpProxy` SETTING must reach the resolver, not just the `provider_env` overlay the
+    /// streaming APIs happen to receive. Upstream this is automatic because
+    /// `applyHttpProxySettings` writes `process.env.HTTP_PROXY`
+    /// (`coding-agent/src/core/http-dispatcher.ts:43-48`); here it is
+    /// `sse::configure_http_proxy`, consulted at the same layer.
+    ///
+    /// These four assertions run as one test on purpose: the setting is process-global, so two
+    /// `#[test]`s writing it would race inside the shared test binary.
+    #[tokio::test]
+    async fn the_http_proxy_setting_reaches_the_resolver_and_yields_to_everything_above_it() {
+        let none = ctx([]);
+
+        // (1) Unset ⇒ unchanged behaviour: no setting, no ambient var, no proxy.
+        crate::stream::sse::configure_http_proxy(None);
+        assert!(
+            resolve_http_proxy_url_for_target("https://api.example.com/", &none, None)
+                .await
+                .expect("ok")
+                .is_none()
+        );
+
+        // (2) Set ⇒ the request that previously bypassed the proxy now uses it. This is the
+        // whole of PROV-047's user-visible failure: OAuth login on a proxy-only network.
+        crate::stream::sse::configure_http_proxy(Some("http://corp-proxy:3128".to_string()));
+        let out = resolve_http_proxy_url_for_target("https://api.example.com/", &none, None)
+            .await
+            .expect("ok")
+            .expect("the configured proxy applies");
+        assert_eq!(out.host_str(), Some("corp-proxy"));
+        assert_eq!(out.port(), Some(3128));
+
+        // (3) `??=` — an ambient variable WINS over the setting.
+        let ambient = ctx([("https_proxy", "http://ambient:9")]);
+        let out = resolve_http_proxy_url_for_target("https://api.example.com/", &ambient, None)
+            .await
+            .expect("ok")
+            .expect("proxy");
+        assert_eq!(
+            out.host_str(),
+            Some("ambient"),
+            "process.env.HTTPS_PROXY ??= proxy does not overwrite an existing value"
+        );
+
+        // (4) `NO_PROXY` still bypasses — the setting is a value for HTTP(S)_PROXY, not an
+        // override of the resolver. PROV-047's negative Verify clause.
+        let bypass = ctx([("no_proxy", "api.example.com")]);
+        assert!(
+            resolve_http_proxy_url_for_target("https://api.example.com/", &bypass, None)
+                .await
+                .expect("ok")
+                .is_none(),
+            "NO_PROXY must beat the configured setting"
+        );
+
+        crate::stream::sse::configure_http_proxy(None);
     }
 }

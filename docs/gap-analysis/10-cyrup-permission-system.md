@@ -36,6 +36,63 @@ Covers `cyrup/crates/cyrup-permission-system/` — the allow/ask/deny gate, its 
 >
 > **Version-lag result: ZERO `upstream-drift` items.** `git diff v0.7.1..v0.8.0` was read per shipping file. Of the 28 changed files, 11 are non-shipping (package/lock/CHANGELOG/README + 7 tests); `permission-manager.ts`, `jsonc-config.ts`, `permission-dialog.ts`, `system-prompt-sanitizer.ts`, `permission-forwarding.ts` and `before-agent-start-cache.ts` are extract/export refactors with no behavioural delta. The five genuinely behavioural v0.8.0 changes are **all ported**: `PermanentApprovalStore` removal (PERM-004), the 500-char wildcard cap (PERM-015), review-stream un-gating (`logging.rs:168-170`), the `enabled` master switch (PERM-010), and merge-preserving config save + prototype-pollution key skip (PERM-007 half / PERM-016). This corroborates `PARITY-GAPS` §3d independently. **The `pi-intercom` v0.9.2..v0.10.1 and `pi-subagents` v0.43.0..v0.47.1 deltas were NOT swept here** — the four `-S` items in this file that touch those repos are now closed, and areas 09/11 own the new territory.
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 10 — recount: 22 rows → 5 open (0 critical · 0 high · 2 medium · 3 low).** The area's
+> critical (`PERM-009`) and its high (`PERM-023`) are both closed, and 16 of its 21 counted rows are
+> now closed.
+>
+> **`PERM-007`'s recorded blocker is DISCHARGED, and the resolution is worth generalising.** The
+> blocker was that `InteractiveOverlay` is `'static`, so the config writer had to be extracted into a
+> shared controller before any overlay could exist. **pi's own `{getConfig, setConfig, getConfigPath}`
+> controller (config-modal.ts:8-12) is exactly the indirection Rust forces — the faithful port and the
+> borrow-checker-legal port are the same design, and no divergence was needed.** Also strike the
+> item's remark that the `open_overlay` seam is unreachable: it was reachable all along.
+>
+> **`PERM-008`'s Verify recipe was one-third wrong and the test pins the correction.** The recipe asks
+> for a `permission_forwarding.warning` on the malformed-request leg. Upstream emits none — pi's
+> `if (!request) { safeDeleteFile(...); continue; }` at index.ts:1144-1147 has no log call above it,
+> unlike every branch below it. **Writing the assertion as filed would have pinned cyrup-invented
+> behaviour, which is the exact class that produced 29 of sweep 1's 32 fallout failures.** The test
+> pins the SILENCE and uses the off-session branch (:1149-1151) for the warning.
+>
+> **Two of the five remaining items are not area-10 work at all.** `PERM-011`'s two halves both land in
+> cyrup-ext (half A needs a native-extension runtime-API registry; half B needs an event accessor on
+> `SharedBus`), and `PERM-022` follows its code to `crates/cyrup-it/tests/permission/forwarding_spawn_env.rs`.
+> `PERM-032` remains unclassified and blocked on a decisive experiment that needs a live provider call —
+> declined by both sweeps for the same reason, since `TOGETHER_API_KEY`/`TOGETHER_AI_API_KEY` are
+> exported in this environment.
+>
+> **The Coverage caveats stand.** Nothing was executed in either sweep. The blind spot flagged as "the
+> highest-value target for the next pass" — `formatToolInputForPrompt`'s structured-edit literals vs
+> `gate.rs` — was NOT diffed by either sweep and remains open. The upstream ReDoS concern is REFUTED
+> (`wildcard.rs` caps at 500 UTF-16 units before escaping and short-circuits to `regex: None`).
+
+
 ## Status since the 2026-08-03 re-baseline
 
 | ID | Status | Note |
@@ -86,30 +143,32 @@ Closed this pass: **10**. Reopened: **0**. Newly filed: **7**.
 > table above; `PERM-S01`/`S02`/`S03` are intercom/subagents concerns and **area 11 owns them going
 > forward**. Per structural defect A in `00-residual-ledger.md`, treat this count as a **floor**.
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 2 medium, 3 low = 5.** 16 rows are now marked CLOSED, including the area's critical (`PERM-009`) and its high (`PERM-023`).
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | ~~PERM-009~~ | ~~**critical**~~ | parity-bug | S | **FIXED 2026-08-13** — bash arm deleted; the bypass no longer reproduces in the shipped binary |
-| PERM-032 | low | *unclassified — lead* | M | A permission-**denied** tool result breaks the next provider request on `together/openai/gpt-oss-20b` (3/3), while two other models handle it fine — **new, observed 2026-08-13, low confidence** |
-| PERM-023 | high | cyrup-original | S | Install probe ignores agent-scoped `permission:` frontmatter the manager enforces — the gate never attaches |
-| PERM-007 | medium | not-ported | M | `/permission-system` renders text where upstream opens a live settings overlay |
-| PERM-008 | medium | not-ported | M | The forwarding path writes no audit entries — 8 review + 3 debug sites unported |
-| PERM-011 | medium | not-ported | M | Yolo runtime API has no publish seam; permission-request event channel absent |
-| PERM-012 | medium | not-ported | M | `registerModelOptionCompatibilityGuard` (temperature stripping) has no cyrup counterpart |
-| PERM-014 | medium | not-ported | M | Concurrent-duplicate ask collapse implemented in `dedup.rs` but never wired |
-| PERM-020 | medium | test-defect | S | Two env-mutating test sites still not serialized on a lock |
-| PERM-013 | low | not-ported | M | `before_agent_start` result caching not ported |
+| PERM-032 | low | *unclassified — lead* | M | A permission-**denied** tool result breaks the next provider request on `together/openai/gpt-oss-20b` (3/3), while two other models handle it fine — **new, observed 2026-08-13, low confidence** — **2026-08-14, still open**: sweep 1 + 2 — unclassified, and unchanged for the same reason both passes gave: the item forbids scheduling work before a decisive experiment that requires a live provider call, and TOGETHER_API_KEY/TOGETHER_AI_API_KEY are exported in this environment, so spawning the binary risks a real network call. Note `HookOutcome::Block` gained a `terminate` field (EXT-049) since it was filed, so the request-body diff must be re-baselined against the current block shape. |
+| ~~PERM-023~~ | ~~high~~ **CLOSED 2026-08-14** | cyrup-original | S | Install probe ignores agent-scoped `permission:` frontmatter the manager enforces — the gate never attaches — **CLOSED 2026-08-14**: sweep 1 — the area's remaining `high`. `is_installed` now recognises a non-empty `<policy_dir>/agents/` or `<cwd>/.cyrup/agent/agents/`; helper `dir_has_entry`; tests `agent_markdown_frontmatter_alone_installs_the_gate` + `project_scoped_agent_markdown_also_installs_the_gate`. The item's line citations were correct in substance but the numbers have shifted. |
+| ~~PERM-007~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | `/permission-system` renders text where upstream opens a live settings overlay — **CLOSED 2026-08-14**: sweep 2 — the recorded blocker is DISCHARGED. `config-modal.ts` ported as `crates/cyrup-permission-system/src/config_modal.rs`: (1) a `ConfigController` carrying pi's own `{getConfig, setConfig, getConfigPath}` (config-modal.ts:8-12, registered index.ts:1504-1511), with the BODY of `save_extension_config` moved onto it verbatim (normalize → write → only then touch memory) and the extension delegating, so there is ONE implementation of the ordering contract; `last_config_warning` became `Arc<Mutex<..>>` so the controller clears the same memo. (2) `PermissionSystemSettingsOverlay` implementing `cyrup_ext::host::overlay::InteractiveOverlay`, porting `SettingsList` with upstream's verbatim strings — wrapping navigation, Enter OR Space cycling the ON_OFF ring, Esc cancel, the `enableSearch` label filter that resets selection, the scroll indicator, the wrapped description and hint lines — and `run_permission_system_command`'s bare arm now calls `HostServices::open_overlay`, with the text dump surviving only as pi's own `if (!ctx.hasUI)` fallback. The commit loop is pi's literally, including the unconditional `current = controller.getConfig()` re-read that makes a refused write snap the row back. **STRIKE the item's remark that the seam is unreachable — `open_overlay` was reachable all along.** One `[CYRUP-DELTA]`: pi notifies inline through `ctx.ui.notify` while the modal is on screen; cyrup's overlay is handed to the host BY VALUE, so a `last_error` slot on the controller raises the same single error toast one frame later. |
+| ~~PERM-008~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | The forwarding path writes no audit entries — 8 review + 3 debug sites unported — **CLOSED 2026-08-14**: sweep 1 + 2 — sweep 1 landed the mechanism: a new `logging::AuditTrail` porting pi's MODULE-SCOPE `extensionLogger`/`reportedLoggingWarnings`/`loggingWarningReporter` trio (index.ts:160-164), held as an `Arc` by the extension, the `ForwardingAskChannel` and the watcher; eleven sites. Sweep 2 discharged the outstanding Verify recipe with `src/tests/forwarding_audit_trail.rs`, which reads the JSONL back and asserts the entries LAND, in order, on the right stream, with upstream's per-entry shapes. **AND REFUTED ONE THIRD OF THE RECIPE:** its "malformed" leg asserts a `permission_forwarding.warning` that upstream does not emit — pi's `if (!request) { safeDeleteFile(...); continue; }` at index.ts:1144-1147 has no log call above it, unlike every branch below it. The test pins that SILENCE and uses the off-session branch (:1149-1151) for the warning. **Writing the recipe as filed would have pinned cyrup-invented behaviour — the exact class that produced 29 of sweep 1's 32 fallout failures.** |
+| PERM-011 | medium | not-ported | M | Yolo runtime API has no publish seam; permission-request event channel absent — **2026-08-14, still open**: sweep 1 + 2 — unchanged. The named sub-defect (yolo_api.rs's false claim that the three methods are reached through the `/permission-system` command) is fixed; the doc now names the missing publish seam and the event channel as halves A and B. **Both halves land in cyrup-ext (area 06): half A needs a native-extension runtime-API registry so a second extension can call `yolo_mode`/`set_yolo_mode`/`toggle_yolo_mode`; half B needs an event accessor on `SharedBus`. Neither seam exists.** |
+| PERM-012 | medium | not-ported | M | `registerModelOptionCompatibilityGuard` (temperature stripping) has no cyrup counterpart — **2026-08-14, still open**: sweep 1 — citations refreshed to HEAD: openai_responses.rs:396-397, openai_codex_responses.rs:757-758, azure_openai_responses.rs:409-410, compat.rs:171 (`supports_temperature`), anthropic_messages.rs:256/:741 (its only consumers). |
+| ~~PERM-014~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | Concurrent-duplicate ask collapse implemented in `dedup.rs` but never wired — **CLOSED 2026-08-14**: sweep 1 — `dedup.rs:13-16`'s module doc is now TRUE (it was the stale-doc instance the Citation-hazard section calls out). Test `two_concurrent_identical_asks_collapse_to_one_prompt`. Citations corrected to v0.8.0: :1580-1596 lookup, :1632-1634 remember, :1637 await, :1638-1642 catch (the item cites v0.7.1 offsets). |
+| ~~PERM-020~~ | ~~medium~~ **CLOSED 2026-08-14** | test-defect | S | Two env-mutating test sites still not serialized on a lock — **CLOSED 2026-08-14**: sweep 1 — BOTH sites. `ask.rs` takes `ext_config::env_lock()` for the whole test body; `tests/prompt_dedup.rs` got its own `static ENV_LOCK` + `env_guard()` taken by every test in the binary. The "Known incomplete-fix trap" note at the file's end is discharged. Remaining exposure recorded as a new gap: `tests/forwarding_persist.rs` still mutates `CYRUP_SUBAGENT_CHILD` unlocked and is safe only because it is a single-test binary. |
+| ~~PERM-013~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | M | `before_agent_start` result caching not ported — **CLOSED 2026-08-14**: sweep 1 — new module `src/agent_start_cache.rs`; `PermissionManager::policy_cache_stamp` is now `pub` (as upstream's is at permission-manager.ts:781); `invalidate_agent_start_cache` is called from session_start, the resources_discover reload branch and session_shutdown. One `[CYRUP-DELTA]`: the cyrup-only registry-unavailable arm bypasses the cache rather than keying on an empty tool list. |
 | PERM-017 | low | not-ported | S | Forwarding-root agent-dir env overrides not ported (documented as deliberate) |
-| PERM-019 | low | cyrup-original | S | Install state inferred from a byte-exact template comparison |
-| PERM-021 | low | test-defect | S | PERM-003 test's re-arm assertion covers only the policy warning |
-| PERM-022 | low | test-defect | S | Spool test's child bound is shorter than the poll window |
-| PERM-024 | low | not-ported | S | Extension config not refreshed on `before_agent_start` |
-| PERM-025 | low | not-ported | S | Policy-root env override `PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR` has no cyrup analog |
-| PERM-026 | low | parity-bug | S | A `resources_discover` reload never re-syncs the yolo status pill |
-| PERM-027 | low | not-ported | S | `lifecycle.reload` debug entries never written |
-| PERM-028 | low | parity-bug | S | `sensitive_log_metadata` length unit and untrimmed `decisionScope` |
-| PERM-029 | low | not-ported | S | Shipped permissions JSON Schema and starter policy example not ported |
-| PERM-030 | low | parity-bug | S | Ask-dialog formatters count Unicode scalars where pi counts UTF-16 units |
-| PERM-031 | low | parity-bug | S | Forwarding watcher drops upstream's per-scan `hasUI` guard |
+| ~~PERM-019~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | Install state inferred from a byte-exact template comparison — **CLOSED 2026-08-14**: sweep 1. |
+| ~~PERM-021~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | PERM-003 test's re-arm assertion covers only the policy warning — **CLOSED 2026-08-14**: sweep 1. |
+| PERM-022 | low | test-defect | S | Spool test's child bound is shorter than the poll window — **2026-08-14, still open**: sweep 1 — RETARGETED: the file moved to `crates/cyrup-it/tests/permission/forwarding_spawn_env.rs` and the 8_000 is now at :288 (sibling 20_000 at :345). Ownership follows the code, so this is now a cyrup-it item. |
+| ~~PERM-024~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | Extension config not refreshed on `before_agent_start` — **CLOSED 2026-08-14**: sweep 1 — `refresh_config_and_manager` was SPLIT as the item's own Fix suggested: the BeforeAgentStart arm calls the config half only (`refresh_extension_config`), matching pi's `refreshExtensionConfig`, so the per-turn manager rebuild the item worried about does not happen and PERM-013's cache survives. |
+| ~~PERM-025~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | Policy-root env override `PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR` has no cyrup analog — **CLOSED 2026-08-14**: sweep 1 — `extension::POLICY_AGENT_DIR_ENV_KEY` = `CYRUP_PERMISSION_SYSTEM_POLICY_AGENT_DIR`, helper `policy_agent_dir`, routed through both `manager_paths_for`'s four global paths and `is_installed`'s global probe. Retires the item's scope note against PERM-017: the two no longer share a hole. |
+| ~~PERM-026~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | A `resources_discover` reload never re-syncs the yolo status pill — **CLOSED 2026-08-14**: sweep 1 — the status sync moved into the new `refresh_extension_config` at pi's exact position inside `applyExtensionConfigSideEffects` (status → warning memo → config.loaded), and the now-duplicate syncs were removed from BOTH the SessionStart arm and `on_before_agent_start` (the item only anticipated the first). |
+| ~~PERM-027~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `lifecycle.reload` debug entries never written — **CLOSED 2026-08-14**: sweep 1 — with a correction: the item says "cyrup's `HostEvent::ResourcesDiscover` carries no reason, so pass the constant \"reload\"". No longer true — cyrup-ext's event now carries `cwd` + `reason` (event.rs:349, EXT-016) and `facade::aggregate_resources` genuinely sends "startup". The arm is therefore gated on `reason == "reload"` for its WHOLE body, which is pi's index.ts:1845 and was previously unexpressible. |
+| ~~PERM-028~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `sensitive_log_metadata` length unit and untrimmed `decisionScope` — **CLOSED 2026-08-14**: sweep 1 — the item slightly understated the `decisionScope` defect: an untrimmed whitespace-only command was not merely padded, it was SELECTED where pi skips it. The fix is pi's asymmetric getNonEmptyString-on-three-then-raw-fallthrough (index.ts:581-592, read first-hand). |
+| ~~PERM-029~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | Shipped permissions JSON Schema and starter policy example not ported — **CLOSED 2026-08-14**: sweep 1 — `schemas/cyrup-permissions.schema.json` + `config/config.example.json` added, declared in Cargo.toml's `include`, embedded as `extension::PERMISSIONS_JSON_SCHEMA` / `PERMISSIONS_EXAMPLE_CONFIG`, reachable as `/permission-system schema` and `/permission-system example`, and named from `render_settings`. `COMMAND_USAGE` changed. |
+| ~~PERM-030~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Ask-dialog formatters count Unicode scalars where pi counts UTF-16 units — **CLOSED 2026-08-14**: sweep 1 — `gate.rs`'s `truncate_inline_text` and the write summary count UTF-16 units. One `[CYRUP-DELTA]` the item did not anticipate: JS `slice()` can split a surrogate pair, Rust `String` cannot, so a cut landing mid-pair backs up one code unit. |
+| ~~PERM-031~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Forwarding watcher drops upstream's per-scan `hasUI` guard — **CLOSED 2026-08-14**: sweep 1 — new `forwarding::SharedHasUi`; the flag is stored by `maybe_start_forwarding_watcher` BEFORE the disqualifying branch and re-read per scan. Test `src/tests/forwarding_has_ui_guard.rs`. Discharges the Coverage line "PERM-031's detach window has never been observed running" — now covered by a deterministic test, though still not by a live run. |
 
 ## PERM-009 — `should_expose_tool` keeps `bash` advertised despite a tool-level deny, and the allow-listed command then executes
 

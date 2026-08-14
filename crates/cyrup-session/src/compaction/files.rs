@@ -84,12 +84,17 @@ impl FileOps {
     }
 
     /// `modifiedFiles = edited ∪ written` (sorted); `readFiles = read \ modified` (sorted).
+    /// Both lists are ordered by [`utf16_cmp`], which is Pi's `.sort()`, not Rust's byte order —
+    /// see that function for why the two disagree.
     pub fn compute_lists(&self) -> (Vec<String>, Vec<String>) {
         let mut modified: BTreeSet<String> = self.edited.clone();
         modified.extend(self.written.iter().cloned());
-        let read: Vec<String> =
+        let mut read: Vec<String> =
             self.read.iter().filter(|p| !modified.contains(*p)).cloned().collect();
-        (read, modified.into_iter().collect())
+        let mut modified: Vec<String> = modified.into_iter().collect();
+        read.sort_by(|a, b| utf16_cmp(a, b));
+        modified.sort_by(|a, b| utf16_cmp(a, b));
+        (read, modified)
     }
 
     /// Build the default `CompactionDetails` from the computed lists.
@@ -97,6 +102,25 @@ impl FileOps {
         let (read_files, modified_files) = self.compute_lists();
         CompactionDetails { read_files, modified_files }
     }
+}
+
+/// Order two paths the way Pi's `computeFileLists` does — `[...].sort()` with **no comparator**
+/// (`utils.ts:64-65` @v0.83.0), which ECMA-262 defines as ordering by the UTF-16 code-unit
+/// sequence of the string.
+///
+/// Rust's `Ord for str` compares UTF-8 bytes, and the two orders are **not** the same relation.
+/// UTF-8 sorts by code point; UTF-16 sorts a supplementary-plane code point (`U+10000..=U+10FFFF`)
+/// by its leading surrogate, which lies in `0xD800..=0xDBFF` — *below* every code point in
+/// `U+E000..=U+FFFF`. So for any pair where one path carries an astral character (an emoji, most
+/// CJK Extension B+ ideographs) and the other a character in `U+E000..=U+FFFF` (private use,
+/// CJK compatibility forms, `U+FFFD`), Rust puts the astral one last and Pi puts it first.
+///
+/// `readFiles` / `modifiedFiles` are joined into the `<read-files>` / `<modified-files>` blocks
+/// appended to every compaction and branch summary (`format_file_operations`, Pi
+/// `formatFileOperations`, `utils.ts:72-82`), and that text is persisted on the entry and fed to
+/// the next summarization prompt — so the order is observable output, not an internal detail.
+fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.encode_utf16().cmp(b.encode_utf16())
 }
 
 /// Pull the filesystem path from a tool call's `args.path`. Pi reads ONLY `args.path`

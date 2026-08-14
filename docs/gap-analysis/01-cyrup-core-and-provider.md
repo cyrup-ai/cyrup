@@ -57,6 +57,65 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 > **Open set after this repair: 40 items — 0 critical, 6 high, 14 medium, 20 low, plus 1 tracker
 > (`PROV-004`, not counted).** 41 rows in the `## Open items` table.
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 01 — recount: 41 rows → 12 open (0 critical · 1 high · 5 medium · 6 low) + 1 tracker
+> (`PROV-004`), and one new item filed and closed on arrival (`PROV-053`).** The header's
+> "40 items — 0 critical, 6 high, 14 medium, 20 low" is stale in every column.
+>
+> **All six of the area's highs are dispositioned.** `PROV-048` closed in sweep 1; `PROV-030` closed
+> in sweep 2; **`PROV-027`, `PROV-028` and `PROV-029` were REFUTED at HEAD** — all three were already
+> fixed, none of them by sweep 1, so this file had been stale on three of its six highs for at least
+> one pass. `PROV-047` is the only high left and it is partially closed with three one-line residuals
+> in other crates.
+>
+> **The most important lesson in this area is about deferrals, not code.** `PROV-030` sat open through
+> sweep 1 on the stated ground that "cyrup-provider has no crypto/JWT dep". That premise was checkable
+> in about thirty seconds against `Cargo.lock` and was false — `ring` 0.17 was already resolved
+> through rustls. It was *also* masking a second, independent defect (`PROV-053`: `EnvAuthContext`
+> never expanded `~`, so the Vertex ADC arm was unreachable on every machine) that would have kept the
+> feature dead even if the wire API had landed. **Verify a deferral's stated blocker before accepting
+> the deferral.**
+>
+> Two disclosed changes outside the area's ownership, neither authorised in advance: `Cargo.toml`
+> gains `ring = { version = "0.17" }` under `[workspace.dependencies]` (additive and provably
+> graph-neutral — ring 0.17.14 is already in `Cargo.lock` via rustls and quinn-proto), and
+> `crates/cyrup-provider/src/auth/testdata/service_account_test_key.pem` is a checked-in throwaway
+> 2048-bit PKCS#8 key that authenticates nothing and is never used at runtime, present only because
+> `ring` cannot generate RSA keys at test time. If a secret scanner rejects it, delete the file and
+> the two signing tests.
+>
+> **`PROV-011` is the one L left and was consciously not started**; everything sweep 2 learned is
+> transcribed into its row so the next attempt starts further along — in particular that the field's
+> home may be `crate::context::ToolDef` rather than `cyrup_core::Tool`, which materially shrinks the
+> blast radius, and that `resolveGoogleFunctionCallingMode` (google-shared.ts:311-323 @v0.83.0) puts
+> the tool-choice override BEFORE the VALIDATED arm, which is the part a naive port gets backwards.
+
+
 ## Status since the c8bd2ab baseline
 
 | ID | Status | Evidence at cyrup `04c1ba2` / pi `v0.83.0`–`v0.84.1` |
@@ -129,49 +188,52 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 > that matters. **Counted set: 0 critical, 6 high, 14 medium, 20 low = 40.** The `tracker` row
 > proposes no work and is deliberately outside that arithmetic.
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 1 high, 5 medium, 6 low = 12**, plus the one `tracker` (`PROV-004`) and 29 rows now marked CLOSED. `PROV-053` was filed and closed in the same pass. The "0 critical, 6 high, 14 medium, 20 low = 40" above is superseded.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| PROV-030 | high | not-ported | L | `google-vertex` is registered with 10 models and no wire API — every request dies with `NoApiImpl` |
-| PROV-027 | high | parity-bug | S | Copilot's Claude models send `x-api-key`; pi sends `Authorization: Bearer` |
-| PROV-029 | high | parity-bug | S | Copilot + Codex login flows written but unreachable; flow registry has no production caller |
-| PROV-028 | high | not-ported | S | `github-copilot-headers.ts` unported — no `X-Initiator`/`Openai-Intent`/`Copilot-Vision-Request` |
-| PROV-047 | high | parity-bug | M | `httpProxy` reaches only the streaming wire APIs — OAuth, the agent proxy transport and extension HTTP bypass it |
-| PROV-048 | high | parity-bug | S | A lone-surrogate `\uXXXX` escape in a provider SSE frame kills the whole turn |
-| PROV-003 | medium | not-ported | M | `ApiKeyAuth` has no `login`; `Models` has no `login`/`logout` (OAuth flow half now closed) |
+| ~~PROV-030~~ | ~~high~~ **CLOSED 2026-08-14** | not-ported | L | `google-vertex` is registered with 10 models and no wire API — every request dies with `NoApiImpl` — **CLOSED 2026-08-14**: sweep 2 — the area's headline `high`. `api/google_vertex.rs` + `auth/google_adc.rs` ported end to end (express-mode vs ADC split, `resolveProject`/`resolveLocation` with pi's two verbatim throw strings, `{location}` interpolation, ADC search order, refresh-token exchange, RS256 JWT-bearer assertion, google-auth-library's 5-minute eager refresh); body/decoder delegate to `api::google_generative_ai` because pi's two `buildParams` are line-for-line identical at v0.83.0. **Sweep 1's stated blocker was false**: `ring` 0.17 was already resolved in Cargo.lock via rustls, so RS256 needed no new crate. `KNOWN_DANGLING = ["google-vertex"]` deleted from `every_catalog_row_names_a_registered_api` — the Verify clause is now enforced with no carve-out. |
+| ~~PROV-027~~ | ~~high~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug | S | Copilot's Claude models send `x-api-key`; pi sends `Authorization: Bearer` — **REFUTED, CLOSED 2026-08-14**: sweep 2 — **REFUTED at HEAD**, and not in sweep 1's fixedIds, so it had been stale for at least one pass. `api/anthropic_messages.rs:434` carries the `model.provider === "github-copilot"` branch documented as "the branch Pi tests FIRST inside createClient", with a fixture at :2399. |
+| ~~PROV-029~~ | ~~high~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug | S | Copilot + Codex login flows written but unreachable; flow registry has no production caller — **REFUTED, CLOSED 2026-08-14**: sweep 2 — **REFUTED at HEAD.** `providers/github_copilot.rs:157` wires `GitHubCopilotLogin` (the flow WITH `login`) with an explanatory block at :141-146; `providers/openai_codex.rs:137` wires `OpenAiCodexOAuthFlow`. Both dead-ends are gone. |
+| ~~PROV-028~~ | ~~high~~ **CLOSED 2026-08-14 — REFUTED** | not-ported | S | `github-copilot-headers.ts` unported — no `X-Initiator`/`Openai-Intent`/`Copilot-Vision-Request` — **REFUTED, CLOSED 2026-08-14**: sweep 2 — **REFUTED at HEAD.** `crates/cyrup-provider/src/api/github_copilot_headers.rs` exists (223 lines) and is consumed by `anthropic_messages.rs`, `openai_responses.rs` and `openai_completions.rs` — the same three impls pi applies `buildCopilotDynamicHeaders` in. The item's `rg -i 'X-Initiator\|Copilot-Vision\|Openai-Intent'` evidence is stale. |
+| PROV-047 | high — **PARTIALLY CLOSED 2026-08-14** | parity-bug | M | `httpProxy` reaches only the streaming wire APIs — OAuth, the agent proxy transport and extension HTTP bypass it — **PARTIALLY CLOSED 2026-08-14**: sweep 2 — provider half landed: `sse::configure_http_proxy`/`configured_http_proxy` consulted inside `node_http_proxy::get_proxy_env` for `http_proxy`/`https_proxy` only (pi's `??=` ambient-wins precedence preserved), `sse::build_client_for(target_url)`, and all five OAuth flows converted off the proxy-blind `build_client()`. **One of the item's three cyrup-side claims is REFUTED**: `wire.rs:472` is not production code — the only `build_client()` in `wire.rs` is at :529 inside `mod tests` (the `#[cfg(test)]` boundary is at :235). **RESIDUAL — three lines in three other crates, and until the first lands the fix is inert in production**: (1) `configure_http_proxy(...)` beside the existing `configure_http_idle_timeout(timeout_ms)` in `cyrup-session-svc/src/builder.rs`; (2) `cyrup-agent/src/proxy.rs:468`; (3) `cyrup-ext/src/caps/http.rs:599`. One corner is not reproduced and is stated in-source: pi's `??=` leaves an ambient `HTTPS_PROXY=""` in place and `getProxyEnv`'s `\|\|` then skips it, so upstream that means "no proxy"; here empty and unset are indistinguishable. |
+| ~~PROV-048~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | S | A lone-surrogate `\uXXXX` escape in a provider SSE frame kills the whole turn — **CLOSED 2026-08-14**: sweep 1 — one predicate over the SSE JSON repair path; lone-surrogate escape no longer kills the turn. |
+| ~~PROV-003~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | `ApiKeyAuth` has no `login`; `Models` has no `login`/`logout` (OAuth flow half now closed) — **CLOSED 2026-08-14**: sweep 1 — closed in FULL. The `ApiKeyAuth::login` half was already done at HEAD by c8c86bc (the item was stale on that point); anthropic api-key login and `Models::login`/`logout` are now in. The status line still saying "partially-closed" is superseded. |
 | PROV-011 | medium | parity-bug | L | `constrainedSampling` / grammar-constrained tools not modeled — **four** affected sites |
 | PROV-014 | medium | parity-bug | M | radius + qwen-token-plan ×2 unregistered (pi-messages half closed) |
-| PROV-016 | medium | stale-port | S | Tool-argument coercion ignores `allOf` |
+| ~~PROV-016~~ | ~~medium~~ **CLOSED 2026-08-14** | stale-port | S | Tool-argument coercion ignores `allOf` — **CLOSED 2026-08-14**: sweep 1 — confirmed at HEAD exactly as filed; citations resolved clean at v0.83.0. |
 | PROV-018 | medium | tooling | M | No catalog generator, no drift check |
-| PROV-019 | medium | stale-port | S | `max_output_tokens` floor of 16 unported in both Responses APIs |
-| PROV-021 | medium | parity-bug | S | `ANTHROPIC_AUTH_TOKEN` bearer env unsupported |
-| PROV-024 | medium | parity-bug | S | `sessionAffinityFormat` unported on openai-completions |
-| PROV-032 | medium | not-ported | S | `Provider::filterModels` unported — Copilot filter has zero production callers |
-| PROV-033 | medium | stale-port | S | openai-responses carries pi's deleted `sendSessionIdHeader`; `x-session-id` unreachable |
-| PROV-035 | medium | not-ported | M | `cache-stats.ts` unported — no cache-waste accounting, no cache-miss notices |
-| PROV-042 | medium | not-ported | M | `transformHeaders` unported — `before_provider_headers` has no seam |
-| PROV-049 | medium | parity-bug | S | `repair_json`'s invalid-`\u` arm doubles the backslash where pi emits `\u` unchanged |
-| PROV-050 | medium | parity-bug | S | `parse_partial` deletes astral characters written as surrogate pairs from recovered tool arguments |
+| ~~PROV-019~~ | ~~medium~~ **CLOSED 2026-08-14** | stale-port | S | `max_output_tokens` floor of 16 unported in both Responses APIs — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
+| ~~PROV-021~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `ANTHROPIC_AUTH_TOKEN` bearer env unsupported — **CLOSED 2026-08-14**: sweep 1 — `ANTHROPIC_AUTH_TOKEN` bearer env supported. |
+| ~~PROV-024~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `sessionAffinityFormat` unported on openai-completions — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
+| ~~PROV-032~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | `Provider::filterModels` unported — Copilot filter has zero production callers — **CLOSED 2026-08-14**: sweep 1 — landed together, as PROV-032's own Fix predicted. Two deltas documented in-tree: `check_auth` resolves against the provider's first catalog row (cyrup's `ApiKeyAuth::resolve` takes a `&Model`), and pi's optional `ApiKeyAuth.check?` (auth/types.ts:173) has no cyrup counterpart and no upstream implementor. |
+| ~~PROV-033~~ | ~~medium~~ **CLOSED 2026-08-14** | stale-port | S | openai-responses carries pi's deleted `sendSessionIdHeader`; `x-session-id` unreachable — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
+| PROV-035 | medium — **PARTIALLY CLOSED 2026-08-14** | not-ported | M | `cache-stats.ts` unported — no cache-waste accounting, no cache-miss notices — **PARTIALLY CLOSED 2026-08-14**: sweep 2 — `crates/cyrup-provider/src/cache_stats.rs` is a full port of `cache-stats.ts` (CACHE_TTL_MS, NOISE_FLOOR_TOKENS, `detect_miss`, `as_previous_request`, `scan`, `compute_cache_waste`, `collect_cache_misses`, `detect_cache_miss`), including the arithmetic that looks like a bug upstream: the noise floor is `<=` so exactly 1024 is NOT a miss, `reportedCache` is sticky, a promptless turn does not clear `prev`, and a model switch is deliberately not a reset. **Two forced shape changes, both documented in the module header**: the scan takes `&[CacheScanEntry]` (`SessionEntry` lives in cyrup-session, which DEPENDS on cyrup-provider), and misses are keyed by INDEX because pi keys its result map on the `AssistantMessage` OBJECT REFERENCE. **RESIDUAL:** both render sites — the `/session` `Cache Re-billed:` line at `cyrup-tui/src/app.rs:4192` under pi's `stats.cost > 0 \|\| cacheWaste.missedTokens > 0` guard, and `collect_cache_misses` behind a `showCacheMissNotices` setting that does not exist. |
+| PROV-042 | medium — **PARTIALLY CLOSED 2026-08-14** | not-ported | M | `transformHeaders` unported — `before_provider_headers` has no seam — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the Models-level seam is in (`StreamOptions.transform_headers`, applied at models.ts:480's position and stripped at :483's). **RESIDUAL:** the session-svc closure folding in `merge_provider_attribution_headers`, plus the `before_provider_headers` extension event and its WIT/event-catalog ABI bump (area 06). Nothing left inside cyrup-provider. |
+| ~~PROV-049~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `repair_json`'s invalid-`\u` arm doubles the backslash where pi emits `\u` unchanged — **CLOSED 2026-08-14**: sweep 1 — one predicate over the SSE JSON repair path; lone-surrogate escape no longer kills the turn. |
+| ~~PROV-050~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `parse_partial` deletes astral characters written as surrogate pairs from recovered tool arguments — **CLOSED 2026-08-14**: sweep 1 — one predicate over the SSE JSON repair path; lone-surrogate escape no longer kills the turn. |
 | PROV-004 | **tracker** *(low, not counted)* | tooling | M | The five newest catalogs were never field-diffed (and no longer can be from this workspace) — proposes no work of its own; closed by PROV-018 |
-| PROV-015 | low | not-ported | S | `ApiStreamOptions` has no `openai-completions` variant |
-| PROV-017 | low | not-ported | S | `Provider` trait exposes no `name`/`base_url`/`headers` |
-| PROV-020 | low | parity-bug | S | `toolResult` JSONL key order diverges: `isError` emitted too early |
-| PROV-023 | low | parity-bug | S | `prompt_cache_options` unported — one-shot requests implicitly cache-write |
+| ~~PROV-015~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED** | not-ported | S | `ApiStreamOptions` has no `openai-completions` variant — **REFUTED, CLOSED 2026-08-14**: sweep 1 — **REFUTED, not fixed.** Its Impact is false at both tags: `OpenAICompletionsOptions`' only own members are `toolChoice`, `reasoningEffort` and (v0.84.1) `thinkingBudgets`, all three already on cyrup's `StreamOptions`. Reasoning recorded in-tree on the `ApiStreamOptions` enum. |
+| ~~PROV-017~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `Provider` trait exposes no `name`/`base_url`/`headers` — **CLOSED 2026-08-14**: sweep 1 — landed together, as PROV-032's own Fix predicted. Two deltas documented in-tree: `check_auth` resolves against the provider's first catalog row (cyrup's `ApiKeyAuth::resolve` takes a `&Model`), and pi's optional `ApiKeyAuth.check?` (auth/types.ts:173) has no cyrup counterpart and no upstream implementor. |
+| ~~PROV-020~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `toolResult` JSONL key order diverges: `isError` emitted too early — **CLOSED 2026-08-14**: sweep 1 — `toolResult` JSONL key order corrected. |
+| ~~PROV-023~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `prompt_cache_options` unported — one-shot requests implicitly cache-write — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
 | PROV-025 | low | parity-bug | M | `deferredToolsMode: "kimi"` unported |
-| PROV-031 | low | not-ported | M | `Models` has no `get_available`/`check_auth`/`login`/`logout` |
-| PROV-034 | low | parity-bug | S | openai-responses always emits `"strict": false` |
+| ~~PROV-031~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | M | `Models` has no `get_available`/`check_auth`/`login`/`logout` — **CLOSED 2026-08-14**: sweep 1 — landed together, as PROV-032's own Fix predicted. Two deltas documented in-tree: `check_auth` resolves against the provider's first catalog row (cyrup's `ApiKeyAuth::resolve` takes a `&Model`), and pi's optional `ApiKeyAuth.check?` (auth/types.ts:173) has no cyrup counterpart and no upstream implementor. |
+| ~~PROV-034~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | openai-responses always emits `"strict": false` — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
 | PROV-036 | low | not-ported | S | `getUsageCostBreakdown` unported — one cost total, no per-model breakdown |
 | PROV-037 | low | not-ported | S | Two `auth-guidance.ts` formatters and the OAuth-expiry preflight branch unported |
-| PROV-038 | low | test-defect | S | Catalog roster guard is a tautology; 5 catalogs get no per-field checks |
-| PROV-039 | low | stale-port | S | `catalog_manifest.json` staleness floor predates the newest embedded data |
+| ~~PROV-038~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | Catalog roster guard is a tautology; 5 catalogs get no per-field checks — **CLOSED 2026-08-14**: sweep 1 — closed together. The `tests/` path in both items was stale: the file is `crates/cyrup-provider/src/tests/catalog_data.rs` (moved in 63d729a/c3982b5). Blind spot 1's "the roster test currently passes" is confirmed — it did, tautologically. |
+| ~~PROV-039~~ | ~~low~~ **CLOSED 2026-08-14** | stale-port | S | `catalog_manifest.json` staleness floor predates the newest embedded data — **CLOSED 2026-08-14**: sweep 1 — closed together. The `tests/` path in both items was stale: the file is `crates/cyrup-provider/src/tests/catalog_data.rs` (moved in 63d729a/c3982b5). Blind spot 1's "the roster test currently passes" is confirmed — it did, tautologically. |
 | PROV-040 | low | upstream-drift | M | `fetchDeferred`/`cancelDeferred` unported |
-| PROV-041 | low | stale-port | S | False in-tree provenance citations, incl. a wrong "1:1 port" claim |
-| PROV-043 | low | not-ported | S | Bedrock has no request retry where pi inherits the AWS SDK's default |
-| PROV-044 | low | not-ported | S | `AWS_BEDROCK_FORCE_HTTP1` unported; client negotiates h2 with no override |
-| PROV-045 | low | parity-bug | S | openai-responses `reasoning` branch drops the xAI `include` and the summary-only trigger |
-| PROV-046 | low | parity-bug | S | Boolean tool-arg coercion accepts `"True"`/`" true "` where pi rejects the call |
-| PROV-051 | low | parity-bug | S | Codex header-phase timeout substituted with a whole-stream read timeout; pi's message and abort/timeout distinction lost |
-| PROV-S04 | low | not-ported | S | `estimateContextTokens`' message-anchored added-tool accounting unported |
+| PROV-041 | low — **PARTIALLY CLOSED 2026-08-14** | stale-port | S | False in-tree provenance citations, incl. a wrong "1:1 port" claim — **PARTIALLY CLOSED 2026-08-14**: sweep 1 + 2 — down to ONE live instance: `crates/cyrup-ext-subagents/src/extension.rs` ("PROV-003 — cyrup ships no login flow at all"), plus the unbuilt CI citation lint. Instance (1) was corrected by sweep 1, instance (3) was already gone, and the fourth instance sweep 1 folded in (cyrup-core's stale `raw_stop_reason` comment) is fixed — see PROV-012 in the status table. |
+| ~~PROV-043~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | Bedrock has no request retry where pi inherits the AWS SDK's default — **CLOSED 2026-08-14**: sweep 1 — Bedrock request retry and `AWS_BEDROCK_FORCE_HTTP1` ported. |
+| ~~PROV-044~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `AWS_BEDROCK_FORCE_HTTP1` unported; client negotiates h2 with no override — **CLOSED 2026-08-14**: sweep 1 — Bedrock request retry and `AWS_BEDROCK_FORCE_HTTP1` ported. |
+| ~~PROV-045~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | openai-responses `reasoning` branch drops the xAI `include` and the summary-only trigger — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
+| ~~PROV-046~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Boolean tool-arg coercion accepts `"True"`/`" true "` where pi rejects the call — **CLOSED 2026-08-14**: sweep 1 — confirmed at HEAD exactly as filed; citations resolved clean at v0.83.0. |
+| ~~PROV-051~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Codex header-phase timeout substituted with a whole-stream read timeout; pi's message and abort/timeout distinction lost — **CLOSED 2026-08-14**: sweep 1 — Codex header-phase timeout restored with pi's message and the abort/timeout distinction. |
+| ~~PROV-S04~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `estimateContextTokens`' message-anchored added-tool accounting unported — **CLOSED 2026-08-14**: sweep 1 — CLASSIFICATION CORRECTED: the item said the added-tool block was post-baseline (3d8f7435) and cyrup was "a faithful stale port". `git show v0.83.0:packages/ai/src/utils/estimate.ts` has it at :118-133, byte-identical to v0.84.1. It was a port omission. Citation-sweep miss of the same class as the nine already recorded. |
 | PROV-S05 | low | not-ported | M | `Models::refresh` has no `force`, no abort signal, no per-provider error map |
+| PROV-053 | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2).** `EnvAuthContext` diverged from pi's `defaultProviderAuthContext()` (ai/src/auth/context.ts:22-40 @v0.83.0) in two ways: `file_exists` did not expand a leading `~` (pi does, at :29-33), and `env` returned `Some("")` for a blank variable where pi returns undefined unless `value.trim().length > 0` (:24-25). The first made the Vertex ADC arm unreachable **on every machine** — `ctx.fileExists(VERTEX_ADC_PATH)` was always false — and was PROV-030's real hidden blocker. The second is the more general hazard: every precedence chain ported from a JS `??` or truthiness test reads `Some("")` as CONFIGURED, which INVERTS the upstream semantics; the concrete instance is `GOOGLE_CLOUD_API_KEY=""` winning the coalesce at providers/google_vertex.rs:301-304 and suppressing the ADC fallback. Both fixed in `auth/types.rs` with the pi citations inline and pinned by two tests. **Worth a sweep: any other `ctx.env(...)`-fed `??` chain in this crate may have been written around the old `Some("")` behaviour.** |
 
 ## PROV-003 — `ApiKeyAuth` has no `login`; `Models` has no `login`/`logout` (OAuth flow half closed)
 

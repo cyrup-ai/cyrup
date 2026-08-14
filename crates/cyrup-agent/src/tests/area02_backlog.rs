@@ -742,9 +742,16 @@ async fn agent023_reset_is_refused_while_a_run_is_in_flight() {
     tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("tool body entered");
 
     let before = agent.snapshot().await.messages.len();
+    let refused_reset = agent.reset().await;
     assert!(
-        matches!(agent.reset().await, Err(AgentError::RunActive)),
+        matches!(refused_reset, Err(AgentError::RunActive(crate::BusyEntry::Reset))),
         "upstream throws \"Agent is already processing. Wait for completion before resetting.\""
+    );
+    // AGENT-034 — and it must be `reset()`'s own text, not the latch's or `continue()`'s. pi keys
+    // four distinct messages off the same `this.activeRun` condition (agent.ts:335 @v0.84.1).
+    assert_eq!(
+        refused_reset.err().map(|e| e.to_string()).unwrap_or_default(),
+        "Agent is already processing. Wait for completion before resetting."
     );
     assert_eq!(
         agent.snapshot().await.messages.len(),
@@ -759,6 +766,121 @@ async fn agent023_reset_is_refused_while_a_run_is_in_flight() {
     // Once idle it is allowed again, and it really does clear.
     assert!(agent.reset().await.is_ok());
     assert!(agent.snapshot().await.messages.is_empty());
+}
+
+// ===========================================================================
+// AGENT-034 — pi keys FOUR distinct throw messages off one `this.activeRun` condition, and two
+// more off the two `continue` surfaces' empty-transcript check. cyrup collapsed all six into
+// three generic Rust strings, none of which matched pi's text. The strings are not cosmetic:
+// `AgentError` is re-emitted verbatim by `SessionServiceError::Agent` ("agent: {0}",
+// `crates/cyrup-session-svc/src/error.rs:16-17`), so they reach the user. pi's own suite asserts
+// them (`packages/agent/test/agent.test.ts:508-547`, `:548-583`;
+// `packages/agent/test/agent-loop.test.ts:1368-1385`, all @v0.83.0).
+//
+// The second half of the item is control flow, not text: pi's `prompt()` carries its OWN guard at
+// `agent.ts:340-344`, ahead of `normalizePromptInput` and of the latch inside `runWithLifecycle`
+// (`:472-474`). cyrup's `prompt` had no guard at all and fell through to the latch, so a prompt
+// during a live run reported the latch's bare message instead of the one string in the family
+// that tells the caller what to do instead ("Use steer() or followUp() to queue messages").
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent034_busy_entry_points_carry_pis_per_entry_point_message() {
+    let sf = faux_stream_fn(vec![
+        faux_assistant_message(vec![faux_tool_call("park", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let tool = Arc::new(ParkingTool {
+        name: "park".into(),
+        params: obj_schema(),
+        release: Mutex::new(Some(rx)),
+        entered: entered.clone(),
+    });
+    let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
+
+    let waiter = entered.notified();
+    let handle = agent.prompt("go").await.unwrap();
+    // Park inside the tool body: the run holds the latch for the whole of the assertions below,
+    // with no wall-clock sleep anywhere.
+    tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("tool body entered");
+    assert!(agent.is_running());
+
+    // (1) `prompt` — pi agent.ts:341-343 @v0.83.0. RED before: cyrup had no guard here, so this
+    // fell through to the latch and reported "Agent is already processing." instead.
+    let busy_prompt = agent.prompt("second").await.err().expect("a second prompt is refused");
+    assert!(matches!(busy_prompt, AgentError::RunActive(crate::BusyEntry::Prompt)));
+    assert_eq!(
+        busy_prompt.to_string(),
+        "Agent is already processing a prompt. Use steer() or followUp() to queue messages, \
+         or wait for completion."
+    );
+
+    // The image overload is the same upstream method behind the same guard (agent.ts:326).
+    let busy_images = agent
+        .prompt_with_images("second", Vec::new())
+        .await
+        .err()
+        .expect("the image overload is refused identically");
+    assert!(matches!(busy_images, AgentError::RunActive(crate::BusyEntry::Prompt)));
+
+    // (2) `continue` — pi agent.ts:352 @v0.83.0. Different sentence from (1) and (3).
+    let busy_continue = agent.continue_run().await.err().expect("a continuation is refused");
+    assert!(matches!(busy_continue, AgentError::RunActive(crate::BusyEntry::Continue)));
+    assert_eq!(
+        busy_continue.to_string(),
+        "Agent is already processing. Wait for completion before continuing."
+    );
+
+    // (3) `reset` — pi agent.ts:335 @v0.84.1 (the AGENT-023 drift).
+    let busy_reset = agent.reset().await.err().expect("a reset is refused");
+    assert!(matches!(busy_reset, AgentError::RunActive(crate::BusyEntry::Reset)));
+    assert_eq!(
+        busy_reset.to_string(),
+        "Agent is already processing. Wait for completion before resetting."
+    );
+
+    // All three are distinct sentences, which is the whole point of the item.
+    assert_ne!(busy_prompt.to_string(), busy_continue.to_string());
+    assert_ne!(busy_continue.to_string(), busy_reset.to_string());
+
+    tx.send(()).unwrap();
+    handle.finished().await;
+    agent.wait_for_idle().await;
+}
+
+/// The bare latch message (pi `runWithLifecycle`, agent.ts:472-474 @v0.83.0) is the fourth
+/// variant. In pi it is unreachable from `prompt`/`continue`/`reset` because single-threaded JS
+/// makes their guards atomic with the claim; in cyrup it is what the check-then-claim race falls
+/// through to, so it must exist and must carry pi's shorter sentence.
+#[test]
+fn agent034_latch_variant_carries_pis_bare_run_with_lifecycle_message() {
+    assert_eq!(
+        AgentError::RunActive(crate::BusyEntry::Run).to_string(),
+        "Agent is already processing."
+    );
+}
+
+/// The two `continue` surfaces reject an empty transcript with DIFFERENT pi strings, and the
+/// assistant-tail rejection uses one string on all three of pi's sites.
+#[test]
+fn agent034_continue_validation_messages_are_surface_specific() {
+    assert_eq!(
+        AgentError::NoMessages(crate::ContinueSurface::Agent).to_string(),
+        "No messages to continue from",
+        "pi Agent.continue, agent.ts:357 @v0.83.0"
+    );
+    assert_eq!(
+        AgentError::NoMessages(crate::ContinueSurface::Loop).to_string(),
+        "Cannot continue: no messages in context",
+        "pi agentLoopContinue agent-loop.ts:71 / runAgentLoopContinue :128, both tags"
+    );
+    assert_eq!(
+        AgentError::ContinueFromAssistant.to_string(),
+        "Cannot continue from message role: assistant",
+        "pi agent.ts:373, agent-loop.ts:75 and :132 — one string on all three sites"
+    );
 }
 
 // ===========================================================================
@@ -1073,6 +1195,31 @@ fn agent013_proxy_error_message_is_pis_two_tier_construction() {
         "Proxy error: 429 Too Many Requests"
     );
     // Non-HTTP failures keep their raw text: pi reaches those through its outer catch.
+    assert_eq!(
+        crate::proxy::proxy_error_message(&ProviderError::Decode("bad frame".to_string())),
+        "decode error: bad frame"
+    );
+}
+
+// ===========================================================================
+// AGENT-035 — pi's abort text on the proxy path. `streamProxy` checks the signal BY HAND at two
+// points and throws a literal both times — `proxy.ts:186-190` (between reads) and `:208-211`
+// (after the read loop drains) @v0.83.0, `:188-192` / `:210-213` @v0.84.1 — and the outer catch
+// puts that text straight into `partial.errorMessage` (`:215-218`). cyrup surfaced
+// `ProviderError::Aborted`'s bare `Display`, `"aborted"`, so an aborted proxy turn showed a
+// different string in the transcript from the one pi writes. The RUN-level abort string already
+// matched on both sides (`agent.rs`'s `"Operation aborted"` vs `agent-loop.ts:632`); this is the
+// TRANSPORT-level one, which nothing covered.
+// ===========================================================================
+
+#[test]
+fn agent035_proxy_abort_carries_pis_request_aborted_by_user() {
+    assert_eq!(
+        crate::proxy::proxy_error_message(&ProviderError::Aborted),
+        "Request aborted by user",
+        "pi proxy.ts:189 / :210 @v0.83.0 — a literal in pi's own source, not a runtime artifact"
+    );
+    // The neighbouring arms are untouched: only `Http` and `Aborted` are special-cased.
     assert_eq!(
         crate::proxy::proxy_error_message(&ProviderError::Decode("bad frame".to_string())),
         "decode error: bad frame"

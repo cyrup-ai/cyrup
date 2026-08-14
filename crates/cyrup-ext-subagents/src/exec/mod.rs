@@ -498,6 +498,20 @@ pub struct RunOptions {
     pub timeout_ms: Option<u64>,
     pub output_path: Option<PathBuf>,
     pub output_mode: OutputMode,
+    /// SUBA-054 — the run's declared read paths, pi's `reads` binding at
+    /// `runs/foreground/subagent-executor.ts:3869`:
+    /// `readsOverride !== undefined ? readsOverride : agentConfig.defaultReads ?? false`.
+    ///
+    /// Carried UNRESOLVED (declared, not existence-filtered): resolution needs [`Self::cwd`], which
+    /// is upstream's `effectiveCwd`, and it happens once in [`build_task_text`] through
+    /// `spawn::chain_graph::build_single_reads_instruction`. `None` is upstream's `false` — no read
+    /// instruction at all.
+    ///
+    /// Before this existed, `defaultReads` was parsed off frontmatter and rendered in agent
+    /// listings but never reached a run: the bundled `reviewer`'s `defaultReads: plan.md,
+    /// progress.md` was documentation. Chain steps had the instruction all along, through the
+    /// separate `SingleStepSpec::reads` → `build_chain_instructions` path.
+    pub reads: Option<Vec<PathBuf>>,
     pub structured_output_schema: Option<serde_json::Value>,
     /// R-SA-041's inherit sentinel — `Inherit` MUST NOT itself fall through to a global
     /// cross-session default inside [`run_sync`]; a caller wanting that global-default behavior
@@ -2039,11 +2053,19 @@ fn build_task_text(
         opts.output_path.as_deref(),
         Some(&capabilities),
     );
-    if skill_injection.is_empty() {
+    // SUBA-054 / pi `task = readsInstruction + task` (`subagent-executor.ts:3873`), which runs
+    // BEFORE `injectSingleOutputInstruction` (`:3874`) — so the read line is the FIRST thing in the
+    // task text, ahead of every other injected block. Prepending here rather than threading it
+    // through the injectors keeps that ordering true whatever else is appended later.
+    let reads_instruction = opts.reads.as_deref().map_or_else(String::new, |reads| {
+        crate::spawn::chain_graph::build_single_reads_instruction(reads, &opts.cwd)
+    });
+    let body = if skill_injection.is_empty() {
         with_output_path
     } else {
         format!("{with_output_path}\n\n{skill_injection}")
-    }
+    };
+    format!("{reads_instruction}{body}")
 }
 
 /// The production [`AttemptRunner`] implementation: spawns a REAL child OS process per
@@ -2514,24 +2536,22 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
 /// signal))` hands Node's signal NAME straight through), for
 /// [`crate::exec::fallback::StartupEvidence::process_signal`]. `None` on a normal exit, and `None`
 /// on non-Unix, where no such concept crosses `ExitStatus`.
+/// SUBA-023 (consumer half) — the name comes from [`crate::spawn::signal::signal_name_of`], the
+/// single crate-wide mapping that also populates
+/// [`crate::spawn::signal::TerminationOutcome::signal_name`]. This function used to carry its OWN
+/// three-entry table (`SIGINT`/`SIGKILL`/`SIGTERM`) and render everything else as `SIG<number>`, so
+/// a child that segfaulted reported `SIG11` and one that aborted reported `SIG6` where pi — which
+/// hands Node's signal NAME straight through — reports `SIGSEGV` and `SIGABRT`. Those are precisely
+/// the deaths worth diagnosing, and they are what the ladder's own three signals are not.
+///
+/// The numeric `SIG<n>` form survives only as the fall-back for a signal the shared table does not
+/// name, so no previously-reported value is lost.
 #[cfg(unix)]
 fn process_signal_name(status: &std::process::ExitStatus) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
-    status.signal().map(|signal| match signal {
-        libc_signal::SIGINT => "SIGINT".to_string(),
-        libc_signal::SIGKILL => "SIGKILL".to_string(),
-        libc_signal::SIGTERM => "SIGTERM".to_string(),
-        other => format!("SIG{other}"),
-    })
-}
-
-/// The three signal numbers this crate's own escalation ladder sends (R-SA-059), named locally so
-/// this module needs no `libc` dependency of its own.
-#[cfg(unix)]
-mod libc_signal {
-    pub const SIGINT: i32 = 2;
-    pub const SIGKILL: i32 = 9;
-    pub const SIGTERM: i32 = 15;
+    crate::spawn::signal::signal_name_of(status)
+        .map(ToString::to_string)
+        .or_else(|| status.signal().map(|signal| format!("SIG{signal}")))
 }
 
 #[cfg(not(unix))]
@@ -3911,6 +3931,44 @@ mod tests {
     use super::*;
     use crate::exec::acceptance::AcceptanceStatus;
 
+    /// SUBA-023 (consumer half): the signal name published on a run record must come from the
+    /// crate's ONE mapping (`spawn::signal::signal_name_of`, which also fills
+    /// `TerminationOutcome::signal_name`), not from a local three-entry table.
+    ///
+    /// RED before the fix: `process_signal_name` named only SIGINT/SIGKILL/SIGTERM, so a crashed
+    /// child's `SingleResult.process_signal` read `SIG11`/`SIG6` where pi (passing Node's signal
+    /// NAME through at `execution.ts:1081`) reports `SIGSEGV`/`SIGABRT`.
+    #[cfg(unix)]
+    #[test]
+    fn a_crashed_child_reports_the_posix_signal_name_not_a_number() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        for (signal, expected) in [
+            (2, "SIGINT"),
+            (6, "SIGABRT"),
+            (9, "SIGKILL"),
+            (11, "SIGSEGV"),
+            (15, "SIGTERM"),
+            (1, "SIGHUP"),
+        ] {
+            assert_eq!(
+                process_signal_name(&std::process::ExitStatus::from_raw(signal)).as_deref(),
+                Some(expected),
+                "signal {signal} must be named the way pi names it"
+            );
+        }
+
+        // A normal exit names no signal at all (pi's `if (signal) result.processSignal = signal`).
+        assert_eq!(process_signal_name(&std::process::ExitStatus::from_raw(0)), None);
+
+        // …and a signal the shared table does not name still falls back to the numeric form rather
+        // than disappearing, so nothing previously reported is lost.
+        assert_eq!(
+            process_signal_name(&std::process::ExitStatus::from_raw(64)).as_deref(),
+            Some("SIG64")
+        );
+    }
+
     fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig {
         AgentConfig {
             name: "worker".to_string(),
@@ -3946,6 +4004,7 @@ mod tests {
             timeout_ms: None,
             output_path: None,
             output_mode: OutputMode::Inline,
+            reads: None,
             structured_output_schema: None,
             model_override: ModelOverride::Inherit,
             preferred_provider: None,
@@ -4157,6 +4216,80 @@ mod tests {
     }
 
     // ---- build_task_text / build_attempt_spawn_plan ----
+
+    /// SUBA-054 — a SINGLE run must carry the persona's `defaultReads` as pi's leading
+    /// `[Read from: …]` instruction (`subagent-executor.ts:3869-3873` @v0.47.1).
+    ///
+    /// RED before the fix: `RunOptions` had no `reads` field at all and `build_task_text` composed
+    /// nothing from `defaultReads` — the key was parsed off frontmatter, rendered in agent
+    /// listings, and inert for every non-chain invocation. The bundled `reviewer` shipped
+    /// `defaultReads: plan.md, progress.md` and was never told to read either file.
+    #[test]
+    fn build_task_text_prepends_the_default_reads_instruction_for_a_single_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("plan.md"), "the plan").expect("plan");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.reads = Some(vec![PathBuf::from("plan.md")]);
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
+
+        let text = build_task_text(&agent, "review it", &opts, &contract, "");
+        assert_eq!(
+            text,
+            format!("[Read from: {}]\n\nreview it", dir.path().join("plan.md").display()),
+            "the read line is FIRST, closed by a blank line — pi's `readsInstruction + task`"
+        );
+    }
+
+    /// pi's `resolveExistingReadPaths` filter (`shared/settings.ts:356-367`, upstream `bc1b689`):
+    /// a declared read that does not exist is DROPPED, and an all-missing list emits no line at all
+    /// rather than an empty `[Read from: ]` that would burn a turn on a failed read.
+    #[test]
+    fn a_missing_default_read_is_dropped_and_an_all_missing_list_emits_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("present.md"), "here").expect("present");
+        let agent = sample_agent_config("m1", &[]);
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
+
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.reads =
+            Some(vec![PathBuf::from("present.md"), PathBuf::from("gone.md")]);
+        let text = build_task_text(&agent, "go", &opts, &contract, "");
+        assert_eq!(
+            text,
+            format!("[Read from: {}]\n\ngo", dir.path().join("present.md").display())
+        );
+
+        let mut none_present = base_opts(dir.path(), &["m1"]);
+        none_present.reads = Some(vec![PathBuf::from("gone.md")]);
+        assert_eq!(
+            build_task_text(&agent, "go", &none_present, &contract, ""),
+            "go",
+            "no surviving read means NO instruction, not an empty one"
+        );
+
+        // `None` is upstream's `false`: no instruction either.
+        let bare = base_opts(dir.path(), &["m1"]);
+        assert_eq!(build_task_text(&agent, "go", &bare, &contract, ""), "go");
+    }
+
+    /// An ABSOLUTE declared read is used verbatim (pi `resolveChainPath`'s `isAbsolute` arm), which
+    /// is what lets a persona point at a file outside the child's cwd.
+    #[test]
+    fn an_absolute_default_read_is_not_rejoined_onto_the_run_cwd() {
+        let repo = tempfile::tempdir().expect("repo");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let target = elsewhere.path().join("notes.md");
+        std::fs::write(&target, "notes").expect("notes");
+
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(repo.path(), &["m1"]);
+        opts.reads = Some(vec![target.clone()]);
+        assert_eq!(
+            build_task_text(&agent, "go", &opts, &AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]), ""),
+            format!("[Read from: {}]\n\ngo", target.display())
+        );
+    }
 
     #[test]
     fn build_task_text_injects_acceptance_contract_and_output_path_instruction() {

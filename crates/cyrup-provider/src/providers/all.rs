@@ -20,7 +20,7 @@
 //! | 80      | `fireworks`              | ✓                                      |
 //! | 81      | `github-copilot`         | ✓                                      |
 //! | 82      | `google`                 | ✓                                      |
-//! | 83      | `google-vertex`          | ✓ registered — **wire api missing**    |
+//! | 83      | `google-vertex`          | ✓                                      |
 //! | 84      | `groq`                   | ✓ fleet                                |
 //! | 85      | `huggingface`            | ✓ fleet                                |
 //! | 86      | `kimi-coding`            | ✓ anthropic-compat fleet               |
@@ -43,18 +43,23 @@
 //! | 105     | `zai`                    | ✓ fleet                                |
 //! | 106     | `zai-coding-cn`          | ✓ fleet                                |
 //!
-//! Every provider pi's `builtinProviders()` constructs is registered below. The table above was
-//! stale for four rows (`amazon-bedrock`, `github-copilot`, `google-vertex`, `openai-codex` were
-//! marked *pending (NOT registered)* by the very sweep that registered them, PROV-030), which read
-//! as "this file does not do what it does" to anyone who stopped at the header.
+//! Every provider pi's `builtinProviders()` constructs is registered below, and every api id those
+//! providers' catalogs name has a registered impl — the invariant is not left to this comment:
+//! `src/tests/catalog_data.rs`'s `every_catalog_api_has_a_registered_impl` walks all 35 catalogs and
+//! asserts `builtin_registry().contains(&row.api)` for every row.
 //!
-//! **One caveat is real, and it is not a registration gap.** `google-vertex` is registered with its
-//! full 10-row catalog and working auth precedence, but this crate ships no `google-vertex` wire
-//! impl — [`crate::api::register_builtins`] registers nine api ids and that is not among them. So
-//! all 10 rows resolve, appear in `/model`, and then fail at request time with the registry's
-//! terminal `StreamEvent::Error` (`wire.rs`, R-01-008/017/018). See
-//! [`crate::providers::google_vertex`] for what the transport port needs (upstream
-//! `packages/ai/src/api/google-vertex.ts`).
+//! The table above was stale for four rows (`amazon-bedrock`, `github-copilot`, `google-vertex`,
+//! `openai-codex` were marked *pending (NOT registered)* by the very sweep that registered them,
+//! PROV-030), which read as "this file does not do what it does" to anyone who stopped at the
+//! header. It is now accurate, and the residual it used to carry — `google-vertex` registered with
+//! ten catalog rows and no wire api, so every request died with `no API implementation for
+//! google-vertex` — is closed by [`crate::api::google_vertex`].
+//!
+//! **The one caveat left is not a registration gap.** `google-vertex`'s ADC arm mints its bearer in
+//! [`crate::auth::google_adc`], which accepts `authorized_user` and `service_account` credentials
+//! plus the GCE metadata server, and rejects `external_account` /
+//! `impersonated_service_account` / `gdch_service_account` by name; see that module's
+//! `[CYRUP-DELTA]`.
 //!
 //! Provider ids are unique, so the [`Models`] collection holds them in a `BTreeMap`; the `Vec`
 //! ordering returned by [`all_providers`] is therefore informational only (grouped by constructor

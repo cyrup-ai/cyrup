@@ -60,6 +60,29 @@ pub fn hstack(children: impl IntoIterator<Item = Value>) -> Value {
     json!({ "widget": "hstack", "children": children.into_iter().collect::<Vec<_>>() })
 }
 
+/// Where an extension widget is drawn (Pi `WidgetPlacement = "aboveEditor" | "belowEditor"`,
+/// `extensions/types.ts:104` @v0.83.0). Passed to [`crate::ctx::Ui::set_widget`] through
+/// `ExtensionWidgetOptions.placement` (`:107-110`), whose documented default is `AboveEditor`.
+///
+/// EXT-047: before the WIT carried pi's three `setWidget` arguments, placement was unexpressible —
+/// every extension widget landed in the one slot cyrup had.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WidgetPlacement {
+    #[default]
+    AboveEditor,
+    BelowEditor,
+}
+
+impl WidgetPlacement {
+    /// The upstream wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AboveEditor => "aboveEditor",
+            Self::BelowEditor => "belowEditor",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
@@ -86,5 +109,16 @@ mod tests {
         );
         assert_eq!(boxed([])["widget"], json!("box"));
         assert_eq!(hstack([])["widget"], json!("hstack"));
+    }
+
+    /// EXT-047 — the placement strings are pi's literal union members
+    /// (`extensions/types.ts:104` @v0.83.0) and cross the WIT as `opts-json`, so a typo here is a
+    /// silently-ignored placement host-side (`WidgetPlacement::from_opts` falls back to the
+    /// default). Pin them.
+    #[test]
+    fn placement_spells_pis_union_members() {
+        assert_eq!(WidgetPlacement::AboveEditor.as_str(), "aboveEditor");
+        assert_eq!(WidgetPlacement::BelowEditor.as_str(), "belowEditor");
+        assert_eq!(WidgetPlacement::default(), WidgetPlacement::AboveEditor);
     }
 }

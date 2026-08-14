@@ -171,6 +171,14 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         let _ = guest.registry.unregister_provider(&id);
     }
 
+    /// EXT-019 — pi `registerMarkdownTransformer(transformer)` (`extensions/types.ts:1292`
+    /// @v0.84.1, impl `loader.ts:309-312`). Argument-less: the closure lives guest-side behind the
+    /// `transform-markdown` export, so this only records that this guest HAS one, in load order.
+    async fn register_markdown_transformer(&mut self) {
+        let Ok(guest) = guest_of(self) else { return };
+        let _ = guest.registry.register_markdown_transformer(guest.owner.clone());
+    }
+
     async fn register_message_renderer(&mut self, custom_type: String) {
         let Ok(guest) = guest_of(self) else { return };
         // Record it in the SHARED registry so the host can route a custom type back to its owning
@@ -288,12 +296,66 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         guest.note_dialog_wait(started);
         result
     }
-    async fn set_widget(&mut self, widget_json: String) {
+    /// EXT-047 — pi's `setWidget(key, content: string[] | undefined, options?)`
+    /// (`extensions/types.ts:170-175` @v0.83.0). `content-json` is the LINES array; `none` removes
+    /// this key's widget (upstream's `content: undefined`).
+    async fn set_widget(
+        &mut self,
+        key: String,
+        content_json: Option<String>,
+        opts_json: String,
+    ) {
         if let Ok(guest) = ui_guest_of(self) {
-            let v: Value = serde_json::from_str(&widget_json).unwrap_or(Value::Null);
-            guest.services.set_widget(&v);
-            guest.set_widget(v);
+            // A malformed lines array is NOT a removal: it is a broken write, and treating it as
+            // `undefined` would silently tear down a widget the guest was trying to update. Fall
+            // back to an empty line list, which upstream renders as a present-but-blank widget.
+            let lines: Option<Vec<String>> = content_json
+                .map(|j| serde_json::from_str::<Vec<String>>(&j).unwrap_or_default());
+            let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
+            let placement = crate::host::WidgetPlacement::from_opts(&opts);
+            guest.services.set_widget(&key, lines.as_deref(), placement);
+            guest.set_widget(crate::host::WidgetEffect { key, lines, placement });
         }
+    }
+
+    /// Pi `setWorkingMessage(message?)` (`extensions/types.ts:151` @v0.83.0); `none` = the
+    /// no-argument call, "restore default" (EXT-021).
+    async fn set_working_message(&mut self, message: Option<String>) {
+        if let Ok(guest) = ui_guest_of(self) {
+            guest.services.set_working_message(message.as_deref());
+        }
+    }
+
+    /// Pi `setWorkingVisible(visible)` (`extensions/types.ts:154` @v0.83.0) — visibility
+    /// independent of the message (EXT-021).
+    async fn set_working_visible(&mut self, visible: bool) {
+        if let Ok(guest) = ui_guest_of(self) {
+            guest.services.set_working_visible(visible);
+        }
+    }
+
+    /// Pi `setWorkingIndicator(options?)` (`extensions/types.ts:164` @v0.83.0); the bag is
+    /// `{frames?, intervalMs?}` (`:116-121`), `none` restores the default spinner (EXT-021).
+    async fn set_working_indicator(&mut self, opts_json: Option<String>) {
+        if let Ok(guest) = ui_guest_of(self) {
+            let opts: Option<Value> =
+                opts_json.map(|j| serde_json::from_str(&j).unwrap_or(Value::Null));
+            guest.services.set_working_indicator(opts.as_ref());
+        }
+    }
+
+    /// Pi `setHiddenThinkingLabel(label?)` (`extensions/types.ts:167` @v0.83.0) (EXT-021).
+    async fn set_hidden_thinking_label(&mut self, label: Option<String>) {
+        if let Ok(guest) = ui_guest_of(self) {
+            guest.services.set_hidden_thinking_label(label.as_deref());
+        }
+    }
+
+    /// Pi `getTheme(name): Theme | undefined` (`extensions/types.ts:272` @v0.83.0) — inspect a
+    /// theme WITHOUT switching to it (EXT-021).
+    async fn theme_get_by_name(&mut self, name: String) -> Option<String> {
+        let guest = ui_guest_of(self).ok()?;
+        guest.services.theme_by_name(&name).map(|t| t.to_string())
     }
     async fn set_header(&mut self, content: String) {
         if let Ok(guest) = ui_guest_of(self) {
@@ -851,8 +913,18 @@ impl bindings::cyrup::ext::ext_tools::Host for HostState {
     }
     async fn get_all_tools(&mut self) -> String {
         let Ok(guest) = guest_of(self) else { return "[]".into() };
-        serde_json::to_string(&guest.registry.tool_info().unwrap_or_default())
-            .unwrap_or_else(|_| "[]".into())
+        // EXT-038: prefer the LIVE session's merged registry — pi's `getAllTools()` maps
+        // `this._toolDefinitions`, which is built-ins + MCP + extension tools
+        // (`core/agent-session.ts:906-914` @v0.83.0). `registry.tool_info()` walks the two
+        // EXTENSION tables only, so a plan-mode extension reading it computed a restriction set
+        // that silently omitted read/write/edit/bash — and `set_active_tools` (which DOES route to
+        // the live backend, just below) then honoured it. Same live-source-with-registry-fallback
+        // shape `get_active_tools` above already uses.
+        let infos = match guest.services.all_tools() {
+            Some(live) => live,
+            None => guest.registry.tool_info().unwrap_or_default(),
+        };
+        serde_json::to_string(&infos).unwrap_or_else(|_| "[]".into())
     }
     async fn set_active_tools(&mut self, names_json: String) {
         if let Ok(guest) = guest_of(self) {
@@ -866,8 +938,43 @@ impl bindings::cyrup::ext::ext_tools::Host for HostState {
     }
     async fn get_commands(&mut self) -> String {
         let Ok(guest) = guest_of(self) else { return "[]".into() };
-        let names = guest.registry.command_names().unwrap_or_default();
-        let infos: Vec<Value> = names.into_iter().map(|n| serde_json::json!({ "name": n })).collect();
+        // EXT-037. pi's `getCommands()` is `[...extensionCommands, ...templates, ...skills]`, each
+        // row `{name: command.invocationName, description, source, sourceInfo}`
+        // (`core/agent-session.ts:2332-2354` @v0.83.0, type `SlashCommandInfo` at
+        // `core/slash-commands.ts:6-11`). cyrup emitted `{name}` only, from a `HashMap::keys()`
+        // walk: extension commands only, RAW names (so a colliding second `deploy` was uncallable
+        // — the guest never saw `deploy:2`), no description, no source, and nondeterministic order.
+        //
+        // Prefer the live catalog, which is the only source that has prompt templates and skills;
+        // fall back to the registry's RESOLVED commands (load order, `name:N` assigned) rather than
+        // the raw map.
+        let infos = match guest.services.commands() {
+            Some(live) => live,
+            None => guest
+                .registry
+                .resolved_commands()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "name": r.invocation_name,
+                        "description": r.descriptor.description,
+                        "source": "extension",
+                        // pi's `SourceInfo` is `{path, source, scope, origin, baseDir?}`
+                        // (`core/source-info.ts:6-12`); with no session attached the only thing the
+                        // registry knows is the owning extension, so this is the synthetic form
+                        // `createSyntheticSourceInfo` produces (`:24-38`: scope "temporary",
+                        // origin "top-level").
+                        "sourceInfo": {
+                            "path": r.owner.to_string(),
+                            "source": r.owner.to_string(),
+                            "scope": "temporary",
+                            "origin": "top-level",
+                        },
+                    })
+                })
+                .collect(),
+        };
         serde_json::to_string(&infos).unwrap_or_else(|_| "[]".into())
     }
 }
@@ -1328,6 +1435,27 @@ impl LiveExtension {
         result: &Value,
     ) -> Result<Option<Value>, ExtError> {
         self.render(custom_type, result, false).await
+    }
+
+    /// Transform transcript markdown through this guest's registered transformer (EXT-019; pi
+    /// `MarkdownTransformer`, `extensions/types.ts:1153` @v0.84.1). EVENT tier — it is a rendering
+    /// hook, not a command. `ctx` is `MarkdownTransformContext` (`:1147-1151`).
+    pub async fn transform_markdown(
+        &self,
+        markdown: &str,
+        ctx: &Value,
+    ) -> Result<String, ExtError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Event);
+        let ctx_s = ctx.to_string();
+        let api = inner.instance.cyrup_ext_events();
+        match api.call_transform_markdown(&mut inner.store, markdown, &ctx_s).await {
+            Ok(out) => Ok(out),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
     }
 
     /// Run the guest provider's `login(callbacks)` flow (Pi `oauth.login`, host gap #1). Runs at

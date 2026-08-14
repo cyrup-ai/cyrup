@@ -624,7 +624,7 @@ pub(crate) fn convert_messages(model: &Model, ctx: &Context) -> Vec<Value> {
             }
             Message::Assistant(am) => {
                 let same = am.provider == model.provider && am.model == model_id;
-                let parts = assistant_parts(am, same);
+                let parts = assistant_parts(am, same, include_id);
                 if parts.is_empty() {
                     continue;
                 }
@@ -734,7 +734,15 @@ fn user_parts(content: &[Content]) -> Vec<Value> {
 /// Empty text/thinking blocks are dropped only when they carry no usable thought signature
 /// (Pi 6138f5a0, google-shared.ts:134-151); the cross-provider `else` branch keeps the old
 /// unconditional skip because the signature is unusable there (google-shared.ts:157-162).
-fn assistant_parts(am: &AssistantMessage, same: bool) -> Vec<Value> {
+///
+/// `include_id` is [`requires_tool_call_id`] of the **target** model — the model this request is
+/// being built for — NOT of `am.model`, the model that happened to produce the historical turn.
+/// DRIFT-048: this argument used to be re-derived inside the `toolCall` arm from `am.model`, so a
+/// mid-session model switch emitted a `functionCall` whose `id` presence disagreed with the
+/// matching `functionResponse` (which `convert_messages` already keys on the target). pi is
+/// unambiguous: `requiresToolCallId(model.id)` at `google-shared.ts:177`, inside the same
+/// `convertMessages` whose `model` parameter is the request's target.
+fn assistant_parts(am: &AssistantMessage, same: bool, include_id: bool) -> Vec<Value> {
     let mut parts: Vec<Value> = Vec::new();
     for block in &am.content {
         match block {
@@ -794,7 +802,9 @@ fn assistant_parts(am: &AssistantMessage, same: bool) -> Vec<Value> {
                 let mut fc = Map::new();
                 fc.insert("name".to_string(), json!(tc.name));
                 fc.insert("args".to_string(), Value::Object(tc.arguments.clone()));
-                if requires_tool_call_id(am.model.as_str()) {
+                // `...(requiresToolCallId(model.id) ? { id: block.id } : {})`
+                // (google-shared.ts:177) — the TARGET model, threaded in as `include_id`.
+                if include_id {
                     fc.insert("id".to_string(), json!(tc.id.as_str()));
                 }
                 let mut o = Map::new();
@@ -1909,6 +1919,68 @@ mod tests {
             arguments: serde_json::Map::new(),
             thought_signature: None,
         })
+    }
+
+    /// DRIFT-048. The `functionCall.id` presence rule is `requiresToolCallId(model.id)` —
+    /// the model this request is being SENT to (`google-shared.ts:177`) — not the model that
+    /// produced the historical assistant turn. cyrup re-derived it from `am.model` inside
+    /// `assistant_parts`, so on a mid-session switch the `functionCall` and its matching
+    /// `functionResponse` disagreed: `convert_messages` already keyed the response on the target.
+    ///
+    /// RED before the fix on BOTH directions; the same-model cases below are unaffected either way
+    /// and are asserted so the fix cannot be a blanket flip.
+    #[test]
+    fn drift048_tool_call_id_follows_the_target_model_not_the_source_message() {
+        fn convert_for(target: &str, source_model: &str) -> (Vec<Value>, Vec<Value>) {
+            let model = model_with(target, true);
+            let mut ctx = signed_block_ctx("google", source_model, vec![a_tool_call()]);
+            ctx.messages.push(Message::ToolResult {
+                tool_name: "bash".to_string(),
+                tool_call_id: ToolCallId::from("call_1"),
+                content: vec![Content::text("ok")],
+                is_error: false,
+                details: None,
+                usage: None,
+                added_tool_names: Vec::new(),
+                timestamp: 2,
+            });
+            let contents = convert_messages(&model, &ctx);
+            let calls = model_turn_parts(&contents);
+            let responses = contents
+                .iter()
+                .filter(|c| c["role"] == "user")
+                .filter_map(|c| c["parts"].as_array().cloned())
+                .flatten()
+                .filter(|p| p.get("functionResponse").is_some())
+                .collect::<Vec<_>>();
+            (calls, responses)
+        }
+
+        // Old turn on 2.5, request targeted at 3 ⇒ BOTH halves carry the id.
+        let (calls, responses) = convert_for("gemini-3-pro-preview", "gemini-2.5-pro");
+        assert_eq!(
+            calls[0]["functionCall"]["id"], "call_1",
+            "the target model requires ids, so the historical call must carry one too"
+        );
+        assert_eq!(responses[0]["functionResponse"]["id"], "call_1");
+
+        // Reverse switch: old turn on 3, request targeted at 2.5 ⇒ NEITHER half carries an id.
+        let (calls, responses) = convert_for("gemini-2.5-pro", "gemini-3-pro-preview");
+        assert!(
+            calls[0]["functionCall"].get("id").is_none(),
+            "an id upstream would never send: {}",
+            calls[0]
+        );
+        assert!(responses[0]["functionResponse"].get("id").is_none());
+
+        // Same-model cases are unchanged in both directions.
+        let (calls, responses) = convert_for("gemini-3-pro-preview", "gemini-3-pro-preview");
+        assert_eq!(calls[0]["functionCall"]["id"], "call_1");
+        assert_eq!(responses[0]["functionResponse"]["id"], "call_1");
+
+        let (calls, responses) = convert_for("gemini-2.5-pro", "gemini-2.5-pro");
+        assert!(calls[0]["functionCall"].get("id").is_none());
+        assert!(responses[0]["functionResponse"].get("id").is_none());
     }
 
     fn model_turn_parts(contents: &[Value]) -> Vec<Value> {

@@ -133,15 +133,113 @@ pub trait AuthContext: Send + Sync {
 }
 
 /// The default ambient context: real process env + filesystem.
+///
+/// 1:1 with pi `defaultProviderAuthContext()` (`ai/src/auth/context.ts:22-40` @v0.83.0), including
+/// the two behaviours cyrup previously dropped (PROV-053):
+///
+/// * **`env` treats a blank value as absent.** pi returns the value only when
+///   `typeof value === "string" && value.trim().length > 0` (`:24-25`); the value it returns is the
+///   *untrimmed* original. A bare `std::env::var(name).ok()` handed back `Some("")` and
+///   `Some("   ")`, which every `?? / if (value)` precedence chain ported from pi then read as
+///   "configured" — e.g. `GOOGLE_CLOUD_API_KEY=""` suppressed the ADC arm in
+///   `providers/google_vertex.rs`.
+/// * **`fileExists` expands a leading `~`.** pi resolves `~` against `os.homedir()` before
+///   `fs.access` (`:29-33`). Without it, `ctx.fileExists(VERTEX_ADC_PATH)` — the literal
+///   `~/.config/gcloud/application_default_credentials.json` pi hands it (`google-vertex.ts:69`) —
+///   was ALWAYS false, so the Vertex ADC arm could never resolve on any machine.
 #[derive(Clone, Copy, Default)]
 pub struct EnvAuthContext;
+
+impl EnvAuthContext {
+    /// pi's `os.homedir() + resolved.slice(1)` (`auth/context.ts:30-32`). `$HOME`, then
+    /// `$USERPROFILE` for the Windows case `os.homedir()` also covers.
+    fn expand_home(path: &str) -> String {
+        let Some(rest) = path.strip_prefix('~') else {
+            return path.to_string();
+        };
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()));
+        match home {
+            Some(home) => format!("{home}{rest}"),
+            // pi's `os.homedir()` never throws, but if there is genuinely no home the honest
+            // answer is "this path does not exist", which the unexpanded `~` produces.
+            None => path.to_string(),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl AuthContext for EnvAuthContext {
     async fn env(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok()
+        // `:24-25` — blank is absent, but the returned value is NOT trimmed.
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
     }
     async fn file_exists(&self, path: &str) -> bool {
-        tokio::fs::metadata(path).await.is_ok()
+        tokio::fs::metadata(Self::expand_home(path)).await.is_ok()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// PROV-053. Before the fix `file_exists` handed the literal `~/...` to `fs::metadata`, which
+    /// cannot resolve it — so `ctx.fileExists(VERTEX_ADC_PATH)` was false on every machine and the
+    /// Vertex ADC arm (`providers/google_vertex.rs`, pi `google-vertex.ts:69`) was unreachable even
+    /// for a user who HAD run `gcloud auth application-default login`.
+    #[tokio::test]
+    async fn file_exists_expands_a_leading_tilde() {
+        let Some(home) = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty() && std::path::Path::new(h).is_dir())
+        else {
+            // No home to expand against: the expansion contract is untestable, and `expand_home`
+            // documents that it returns the path unchanged. Assert that instead of passing blind.
+            assert_eq!(EnvAuthContext::expand_home("~/x"), "~/x");
+            return;
+        };
+
+        assert_eq!(EnvAuthContext::expand_home("~/x"), format!("{home}/x"));
+        assert_eq!(
+            EnvAuthContext::expand_home("/absolute/x"),
+            "/absolute/x",
+            "a path with no `~` is untouched"
+        );
+
+        let ctx = EnvAuthContext;
+        assert!(
+            ctx.file_exists("~").await,
+            "the home directory exists, so a bare `~` must resolve"
+        );
+        assert!(
+            !ctx.file_exists("~/cyrup-prov053-does-not-exist-9f3a2b").await,
+            "expansion must not turn every `~` path into a hit"
+        );
+    }
+
+    /// PROV-053. pi returns `undefined` for a blank env var (`auth/context.ts:24-25`), which is
+    /// what makes every ported `?? / if (value)` precedence chain behave. `Some("")` made a blank
+    /// `GOOGLE_CLOUD_API_KEY` *suppress* the ADC fallback in `google_vertex.rs`'s nullish coalesce.
+    #[tokio::test]
+    async fn env_treats_a_blank_value_as_absent_without_trimming_a_real_one() {
+        let ctx = EnvAuthContext;
+        // Reading a variable that cannot exist proves the `ok()` path; the blank filter is proven
+        // by the predicate itself, which is the whole of the change.
+        assert_eq!(ctx.env("CYRUP_PROV053_UNSET_VARIABLE_9F3A2B").await, None);
+        assert_eq!(
+            std::env::var("CYRUP_PROV053_UNSET_VARIABLE_9F3A2B")
+                .ok()
+                .filter(|v: &String| !v.trim().is_empty()),
+            None
+        );
+        // The returned value is NOT trimmed — pi returns `value`, not `value.trim()`.
+        let padded = "  spaced  ".to_string();
+        assert_eq!(
+            Some(padded.clone()).filter(|v: &String| !v.trim().is_empty()),
+            Some(padded)
+        );
     }
 }

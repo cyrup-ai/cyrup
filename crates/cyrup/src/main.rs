@@ -103,7 +103,9 @@ async fn run() -> anyhow::Result<i32> {
     // PB-5 (area 04).
     set_process_name("cyrup");
 
-    let mut timings = timings::Timings::new();
+    // Pi `resetTimings()` at the top of `main()` (main.ts:474). The namespace is explicit here
+    // because the table is process-global, exactly as pi's module-level Map is (AGENT-027).
+    timings::reset_timings(timings::TimingLabel::Main);
 
     // Pi rewrites its multi-char short aliases in its hand-rolled parser; clap cannot express them as
     // native shorts, so normalize them up front (`-nt` ⇒ `--no-tools`, …).
@@ -177,7 +179,7 @@ async fn run() -> anyhow::Result<i32> {
     // `" grep"` and silently drop the tool. Run before any consumer reads these Vecs.
     cli.normalize_list_flags();
     init_tracing(cli.verbose);
-    timings.mark("parseArgs");
+    timings::time("parseArgs", timings::TimingLabel::Main);
 
     // Report parse diagnostics (Pi main.ts:504-512): warnings + errors to stderr, any error exits 1.
     report_diagnostics(&parse_diagnostics);
@@ -263,7 +265,7 @@ async fn run() -> anyhow::Result<i32> {
     // One-time startup migrations (Pi `runMigrations(cwd)`, main.ts:549): legacy auth/session/tools
     // moves + extension-system deprecation warnings.
     let migration = migrations::run_migrations(&dirs);
-    timings.mark("runMigrations");
+    timings::time("runMigrations", timings::TimingLabel::Main);
 
     // Pi's `startupSettingsManager` (main.ts:610-611), created after the migrations and used for
     // exactly two things: surfacing settings load/parse errors as warnings
@@ -316,7 +318,7 @@ async fn run() -> anyhow::Result<i32> {
         // Pi's `showFirstTimeSetup` returns void; a cancel at either step persists nothing
         // (startup.rs), and a persistence failure is propagated rather than swallowed.
         let _ = cyrup::run_first_time_setup(&theme, &mut startup_settings, detected)?;
-        timings.mark("firstTimeSetup");
+        timings::time("firstTimeSetup", timings::TimingLabel::Main);
     }
 
     // `sessionDir` tier 3 (Pi main.ts:625-630): CLI `--session-dir` > `$CYRUP_SESSION_DIR` >
@@ -451,6 +453,13 @@ async fn run() -> anyhow::Result<i32> {
     {
         return Ok(code);
     }
+
+    // AGENT-027 — pi's `time("createSessionManager")` (main.ts:652) closes the block that resolves
+    // WHICH session this run attaches to (its `createSessionManager`, `:254-350`, plus the `--name`
+    // append at `:650`). cyrup's counterpart is the pair above: `resolve_session` for the
+    // non-interactive refs and `resolve_startup_ui` for the `--resume` picker, after which
+    // `config.target` is final.
+    timings::time("createSessionManager", timings::TimingLabel::Main);
 
     let deprecation_warnings = migration.deprecation_warnings.clone();
     let settings_store = file_settings_store(&dirs);
@@ -654,17 +663,29 @@ async fn run() -> anyhow::Result<i32> {
         // `--name` (pi main.ts:650) and the scoped `--models` (pi main.ts:742-750) are applied in
         // the window this opens, so an extension's `session_start` handler observes the configured
         // session rather than an unnamed one on the pre-scope model.
+        // AGENT-027 — pi marks either side of the runtime construction: `time("createRuntime")`
+        // immediately before awaiting it (main.ts:792) and `time("createAgentSessionRuntime")`
+        // immediately after (`:798`), so a slow extension load is attributable to the runtime rather
+        // than lost in an unexplained gap.
+        timings::time("createRuntime", timings::TimingLabel::Main);
         let runtime = AgentSessionRuntime::create_unannounced(factory, target)
             .await
             .context("building agent session runtime")?;
+        timings::time("createAgentSessionRuntime", timings::TimingLabel::Main);
         // Pi main.ts:843-848 — report the runtime's build diagnostics and exit 1 on any error
         // (today: the extension-flag reconciliation errors, SEAM-S01).
         if report_runtime_diagnostics(&runtime).await {
             runtime.dispose().await;
             return Ok(1);
         }
+        // pi's `time("createAgentSession")` sits directly after the same diagnostics gate
+        // (main.ts:843-850).
+        timings::time("createAgentSession", timings::TimingLabel::Main);
         let session = runtime.session().await;
         apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
+        // pi marks the scoped-`--models` resolution separately (`time("resolveModelScope")`,
+        // main.ts:842); in cyrup that work happens inside `apply_post_build`.
+        timings::time("resolveModelScope", timings::TimingLabel::Main);
         // SEAM-033 — announce NOW, after `--name`/`--models`, which is where pi's interactive host
         // does it (its own `bindExtensions` inside `InteractiveMode`, the sibling of
         // print-mode.ts:73 / rpc-mode.ts:319). Idempotent per session.
@@ -691,11 +712,10 @@ async fn run() -> anyhow::Result<i32> {
         // drain terminal query replies for ~150ms, stop, then print timings — never the event loop.
         if timings::startup_benchmark_enabled() {
             run_interactive_benchmark().await?;
-            timings.mark("interactiveMode.init");
-            timings.print();
+            timings::time("interactiveMode.init", timings::TimingLabel::Main);
+            timings::print_timings();
             return Ok(0);
         }
-        timings.print();
         // Pi `prepareInitialMessage(parsed, settingsManager.getImageAutoResize(), stdinContent)`
         // (main.ts:828-832): the `images.autoResize` setting decides whether an `@image.png`
         // positional is downsampled to 2000px or inlined at full resolution.
@@ -703,7 +723,18 @@ async fn run() -> anyhow::Result<i32> {
         // Pi main.ts:819-826 reads piped stdin in `main` (never in `prepareInitialMessage`, and
         // never for RPC mode, which owns stdin for JSON-RPC) and passes the string in at :831.
         let piped_stdin = cyrup::read_piped_stdin().await?;
+        // AGENT-027 — pi's `time("readPipedStdin")` (main.ts:826) and `time("prepareInitialMessage")`
+        // (`:833`) bracket exactly this pair. `initTheme` (`:835`) has no separate mark here: cyrup's
+        // theme boot happens inside `run_interactive` (`ThemeController::boot_from_env` +
+        // `sync_with_terminal`), downstream of the print below, so a mark placed here would time
+        // nothing. Recorded rather than silently dropped.
+        timings::time("readPipedStdin", timings::TimingLabel::Main);
         let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images, piped_stdin).await?;
+        timings::time("prepareInitialMessage", timings::TimingLabel::Main);
+        // Pi prints immediately before entering the mode's own loop (`printTimings()` at
+        // main.ts:899, after every `main` mark has been taken) — moved down from above the stdin
+        // read, where it truncated the table to the phases that happened to precede it.
+        timings::print_timings();
         // The startup package-update check (Pi `interactive-mode.ts:850-856`): DETACHED, gated on
         // `NetworkPolicy::allow_update_check()` (`--offline` / `CYRUP_OFFLINE` /
         // `CYRUP_SKIP_VERSION_CHECK`), and delivered to the run loop over a channel so nothing here
@@ -817,18 +848,23 @@ async fn run() -> anyhow::Result<i32> {
             // `session_start`, agent-session-runtime.ts:414-432), so `apply_post_build` below can
             // apply `--name` (pi main.ts:650) and the scoped `--models` (pi main.ts:742-750) BEFORE
             // the host announces. `run_rpc` announces at pi's own point, rpc-mode.ts:319.
+            // AGENT-027 — pi's `main` timing sequence is ONE linear path covering every mode, so
+            // the runtime marks belong on this arm too (main.ts:792/:798/:850).
+            timings::time("createRuntime", timings::TimingLabel::Main);
             let runtime = match AgentSessionRuntime::create_unannounced(factory, target).await {
                 Ok(r) => r,
                 Err(e) => {
                     return Err(anyhow::Error::new(e).context("building agent session runtime"));
                 }
             };
+            timings::time("createAgentSessionRuntime", timings::TimingLabel::Main);
             // Pi main.ts:843-848 (SEAM-S01) — same checkpoint, every mode.
             if report_runtime_diagnostics(&runtime).await {
                 runtime.dispose().await;
                 cyrup::output_guard::restore_stdout();
                 return Ok(1);
             }
+            timings::time("createAgentSession", timings::TimingLabel::Main);
             let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             // Pi main.ts:852-855 — the modelless hard stop, gated on the MODE:
@@ -846,7 +882,7 @@ async fn run() -> anyhow::Result<i32> {
                 cyrup::output_guard::restore_stdout();
                 return no_models_available();
             }
-            timings.print();
+            timings::print_timings();
             let _signals = spawn_abort_on_signal(runtime.clone(), cancel.clone(), AppMode::Rpc);
             let reader = tokio::io::BufReader::new(tokio::io::stdin());
             let mut writer = tokio::io::stdout();
@@ -943,18 +979,23 @@ async fn run() -> anyhow::Result<i32> {
             // inside the constructor would show every `session_start` handler an unnamed, unscoped
             // session — and this arm is what a spawned subagent child re-execs into, so every
             // subagent run would inherit it. `run_print_dispatch`/`run_json_dispatch` announce.
+            // AGENT-027 — pi's `main` timing sequence is ONE linear path covering every mode, so
+            // the runtime marks belong on this arm too (main.ts:792/:798/:850).
+            timings::time("createRuntime", timings::TimingLabel::Main);
             let runtime = match AgentSessionRuntime::create_unannounced(factory, target).await {
                 Ok(r) => r,
                 Err(e) => {
                     return Err(anyhow::Error::new(e).context("building agent session runtime"));
                 }
             };
+            timings::time("createAgentSessionRuntime", timings::TimingLabel::Main);
             // Pi main.ts:843-848 (SEAM-S01) — same checkpoint, every mode.
             if report_runtime_diagnostics(&runtime).await {
                 runtime.dispose().await;
                 cyrup::output_guard::restore_stdout();
                 return Ok(1);
             }
+            timings::time("createAgentSession", timings::TimingLabel::Main);
             let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             // Pi main.ts:852-855 — the modelless hard stop, gated on the MODE:
@@ -972,7 +1013,6 @@ async fn run() -> anyhow::Result<i32> {
                 cyrup::output_guard::restore_stdout();
                 return no_models_available();
             }
-            timings.print();
             // `settingsManager.getImageAutoResize()` for the `@file` image path (Pi main.ts:830),
             // read before `session` moves into the signal guard.
             let auto_resize_images = session.services().settings.effective().image_auto_resize();
@@ -989,7 +1029,15 @@ async fn run() -> anyhow::Result<i32> {
             // Pi main.ts:819-826 / :831 — the read happens here, in `main`, and the content is
             // passed into prompt assembly.
             let piped_stdin = cyrup::read_piped_stdin().await?;
+            // AGENT-027 — pi's `time("readPipedStdin")` / `time("prepareInitialMessage")`
+            // (main.ts:826/:833) are on the shared path, so they cover this arm too.
+            timings::time("readPipedStdin", timings::TimingLabel::Main);
             let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images, piped_stdin).await?;
+            timings::time("prepareInitialMessage", timings::TimingLabel::Main);
+            // Pi prints once every `main` mark has been taken, immediately before entering the mode
+            // (main.ts:902) — moved down from above the stdin read for the same reason as the
+            // interactive arm.
+            timings::print_timings();
             let mut out = io::stdout();
             let dispatch = if let AppMode::Json = mode {
                 run_json_dispatch(&runtime, &inputs, &mut out).await

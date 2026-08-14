@@ -1066,14 +1066,7 @@ impl SubagentFleetStatus {
     /// `ctx.ui.setWidget(FLEET_STATUS_WIDGET_KEY, undefined)` (`:309,320`) does.
     #[must_use]
     pub fn widget_payload(&self, width: usize, now: i64) -> Option<serde_json::Value> {
-        if !self.widget_registered {
-            return None;
-        }
-        let lines: Vec<String> = self
-            .render(width, now)
-            .iter()
-            .map(th::line_text)
-            .collect();
+        let lines = self.widget_lines(width, now)?;
         Some(serde_json::json!({
             "key": FLEET_STATUS_WIDGET_KEY,
             "placement": self.placement.as_str(),
@@ -1083,6 +1076,22 @@ impl SubagentFleetStatus {
                 .map(|text| serde_json::json!({ "widget": "text", "text": text }))
                 .collect::<Vec<_>>(),
         }))
+    }
+
+    /// The widget's CONTENT as pi's `content: string[]` — the shape
+    /// [`cyrup_ext::HostServices::set_widget`] takes since EXT-047 gave it upstream's three
+    /// arguments (`key`, `lines`, `placement`) instead of one opaque blob.
+    ///
+    /// `None` means "this widget is not registered", which the caller renders as upstream's
+    /// `setWidget(key, undefined)` — a REMOVAL, not an empty box. Before EXT-047 that removal was
+    /// unexpressible and this crate hand-rolled `{"key": …, "content": null}`, which left the slot
+    /// occupied.
+    #[must_use]
+    pub fn widget_lines(&self, width: usize, now: i64) -> Option<Vec<String>> {
+        if !self.widget_registered {
+            return None;
+        }
+        Some(self.render(width, now).iter().map(th::line_text).collect())
     }
 }
 

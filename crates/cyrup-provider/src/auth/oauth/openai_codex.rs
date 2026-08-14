@@ -368,7 +368,10 @@ impl DeviceCodePoller for DeviceTokenPoller<'_> {
 
     async fn poll(&self) -> Result<DeviceCodePollResult<DeviceTokenSuccess>, OAuthError> {
         let cancel = self.cancel.as_ref();
-        let client = self.flow.client()?;
+        let client = self
+            .flow
+            .client(&self.flow.endpoints.device_token_url)
+            .await?;
         // `:227-236`
         let body = serde_json::json!({
             "device_auth_id": self.device.device_auth_id,
@@ -548,8 +551,13 @@ impl OpenAiCodexOAuthFlow {
         &self.endpoints
     }
 
-    fn client(&self) -> Result<reqwest::Client, OAuthError> {
-        crate::stream::sse::build_client().map_err(|e| OAuthError::Failed(e.to_string()))
+    /// PROV-047: proxy-aware, per target. `build_client()` consulted neither the ported resolver
+    /// nor the `httpProxy` setting, so every OAuth token exchange and silent refresh bypassed a
+    /// configured proxy while provider streaming used it.
+    async fn client(&self, target_url: &str) -> Result<reqwest::Client, OAuthError> {
+        crate::stream::sse::build_client_for(target_url)
+            .await
+            .map_err(|e| OAuthError::Failed(e.to_string()))
     }
 
     /// `getCallbackHost()` (`openai-codex.ts:44-46`).
@@ -658,7 +666,7 @@ impl OpenAiCodexOAuthFlow {
         redirect_uri: &str,
         cancel: Option<&CancelToken>,
     ) -> Result<OAuthToken, OAuthError> {
-        let client = self.client()?;
+        let client = self.client(&self.endpoints.token_url).await?;
         // `:152-157`
         let body = encode_query([
             ("grant_type", "authorization_code"),
@@ -698,7 +706,9 @@ impl OpenAiCodexOAuthFlow {
         &self,
         cancel: Option<&CancelToken>,
     ) -> Result<DeviceAuthInfo, OAuthError> {
-        let client = self.client()?;
+        let client = self
+            .client(&self.endpoints.device_user_code_url)
+            .await?;
         // `:182-188`
         let send = client
             .post(&self.endpoints.device_user_code_url)

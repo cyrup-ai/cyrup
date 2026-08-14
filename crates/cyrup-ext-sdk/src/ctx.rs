@@ -11,6 +11,7 @@
 //! arm so the host arm can be a distinct tail expression.
 #![allow(clippy::needless_return)]
 
+use crate::widget::WidgetPlacement;
 use crate::descriptor::{
     CompactOptions, DialogOptions, ExecOptions, ForkOptions, NavigateOptions, NewSessionOptions,
     SwitchSessionOptions,
@@ -792,12 +793,37 @@ impl Ui {
             None
         }
     }
-    pub fn set_widget(&self, widget: impl Serialize) {
-        let widget_json = serde_json::to_string(&widget).unwrap_or_else(|_| "null".into());
+    /// Set the widget stored under `key` (Pi `setWidget(key, content, options?)`,
+    /// `extensions/types.ts:170-175` @v0.83.0).
+    ///
+    /// EXT-047: this used to take one opaque payload, which meant two extensions setting a widget
+    /// clobbered each other and a widget could not be removed at all. `key` makes the surface the
+    /// MAP it is upstream; [`Self::clear_widget`] is upstream's `content: undefined`.
+    ///
+    /// `placement` is `None` for upstream's default `"aboveEditor"`
+    /// (`ExtensionWidgetOptions.placement`, `:107-110`).
+    pub fn set_widget(&self, key: &str, lines: &[String], placement: Option<WidgetPlacement>) {
+        let content_json = serde_json::to_string(lines).unwrap_or_else(|_| "[]".into());
+        let opts_json = match placement {
+            Some(p) => format!(r#"{{"placement":"{}"}}"#, p.as_str()),
+            None => "{}".to_string(),
+        };
         #[cfg(target_arch = "wasm32")]
-        crate::guest::bindings::cyrup::ext::ui::set_widget(&widget_json);
+        crate::guest::bindings::cyrup::ext::ui::set_widget(key, Some(&content_json), &opts_json);
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = widget_json;
+        let _ = (key, content_json, opts_json);
+    }
+
+    /// Remove the widget stored under `key` — Pi's `setWidget(key, undefined)`
+    /// (`extensions/types.ts:170` @v0.83.0, `content: string[] | undefined`).
+    ///
+    /// Before EXT-047 there was no way to express this: the shipped subagents extension hand-rolled
+    /// `{"key": …, "content": null}` and the host kept the slot occupied with a null payload.
+    pub fn clear_widget(&self, key: &str) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::set_widget(key, None, "{}");
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = key;
     }
 
     // --- chrome (Pi setHeader/setFooter/setTitle, types.ts:130-150) ---
@@ -855,7 +881,8 @@ impl Ui {
         let _ = text;
     }
 
-    // --- theme get/list/set (Pi getTheme/listThemes/setTheme, types.ts:240-260) ---
+    // --- theme read/list/switch (Pi `theme`/`getAllThemes`/`getTheme`/`setTheme`,
+    // extensions/types.ts:266-275 @v0.83.0) ---
     pub fn theme(&self) -> Option<String> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -864,6 +891,10 @@ impl Ui {
         #[cfg(not(target_arch = "wasm32"))]
         None
     }
+    /// Every available theme as `{name, path}` (Pi `getAllThemes(): {name, path}[]`,
+    /// `extensions/types.ts:269` @v0.83.0). `path` is null for a built-in theme — EXT-021: this
+    /// returned bare names, so a guest could neither tell a built-in from a file-backed theme nor
+    /// locate the file.
     pub fn theme_list(&self) -> Value {
         #[cfg(target_arch = "wasm32")]
         {
@@ -871,6 +902,20 @@ impl Ui {
         }
         #[cfg(not(target_arch = "wasm32"))]
         Value::Array(vec![])
+    }
+
+    /// Load one theme by name WITHOUT switching to it (Pi `getTheme(name): Theme | undefined`,
+    /// `extensions/types.ts:272` @v0.83.0). `None` = no such theme (EXT-021).
+    pub fn theme_by_name(&self, name: &str) -> Option<Value> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ui::theme_get_by_name(name).map(parse_json);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = name;
+            None
+        }
     }
     pub fn set_theme(&self, name: &str) -> Result<(), String> {
         #[cfg(target_arch = "wasm32")]
@@ -884,13 +929,59 @@ impl Ui {
         }
     }
 
-    // --- working-indicator controls (Pi startWorking/stopWorking, types.ts:265-275) ---
+    // --- working / streaming indicator (Pi `ExtensionUIContext`, extensions/types.ts:151-167
+    // @v0.83.0). EXT-021: cyrup had only the invented `working_start`/`working_stop` pair below,
+    // whose `types.ts:265-275` citation pointed at getAllThemes/getTheme/setTheme/getToolsExpanded
+    // — pi has no `startWorking`/`stopWorking` at all. ---
+
+    /// Pi `setWorkingMessage(message?)` (`extensions/types.ts:151`): the message shown during
+    /// streaming. `None` is upstream's no-argument call, "restore default".
+    pub fn set_working_message(&self, message: Option<&str>) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::set_working_message(message);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = message;
+    }
+
+    /// Pi `setWorkingVisible(visible)` (`extensions/types.ts:154`): show/hide the built-in working
+    /// loader row, INDEPENDENTLY of the message.
+    pub fn set_working_visible(&self, visible: bool) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::set_working_visible(visible);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = visible;
+    }
+
+    /// Pi `setWorkingIndicator(options?)` (`extensions/types.ts:164`; the bag is
+    /// `{frames?: string[], intervalMs?: number}` at `:116-121`). `None` restores the default
+    /// animated spinner; `frames: []` hides the indicator entirely.
+    pub fn set_working_indicator(&self, opts: Option<&Value>) {
+        let opts_json = opts.map(|v| v.to_string());
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::set_working_indicator(opts_json.as_deref());
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = opts_json;
+    }
+
+    /// Pi `setHiddenThinkingLabel(label?)` (`extensions/types.ts:167`). `None` restores the
+    /// default.
+    pub fn set_hidden_thinking_label(&self, label: Option<&str>) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::set_hidden_thinking_label(label);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = label;
+    }
+
+    /// CYRUP-DELTA: cyrup-original — pi has no `startWorking`/`stopWorking` at v0.83.0. Kept
+    /// because guests already call it; equivalent to `set_working_message(Some(label))` followed by
+    /// `set_working_visible(true)`.
     pub fn working_start(&self, label: &str) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::working_start(label);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = label;
     }
+    /// CYRUP-DELTA: see [`Self::working_start`]. Equivalent to `set_working_visible(false)`.
     pub fn working_stop(&self) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::working_stop();

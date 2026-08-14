@@ -208,6 +208,22 @@ fn all_registered_tool_names_is_first_registration_wins() {
     assert_eq!(info.len(), 3);
     assert_eq!(info[0]["name"], json!("alpha"));
     assert_eq!(info[0]["source"], json!("extension"));
+
+    // EXT-038 — pi's `ToolInfo` is
+    // `Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> & {sourceInfo}`
+    // (`extensions/types.ts:1551-1553` @v0.83.0), emitted by `getAllTools()`
+    // (`core/agent-session.ts:906-914`). Both trailing fields were absent entirely, so a plan-mode
+    // extension could not see a tool's guidelines or where it came from.
+    assert!(
+        info[0].get("promptGuidelines").is_some(),
+        "promptGuidelines is one of the four `Pick`ed ToolDefinition fields: {:?}",
+        info[0]
+    );
+    let src = info[0].get("sourceInfo").expect("pi's ToolInfo carries sourceInfo");
+    // pi's `SourceInfo` shape (`core/source-info.ts:6-12`).
+    for key in ["path", "source", "scope", "origin"] {
+        assert!(src.get(key).is_some(), "sourceInfo.{key} missing: {src:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

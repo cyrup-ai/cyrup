@@ -140,6 +140,12 @@ fn push_registrations(api: &ExtensionApi) {
     for r in &api.entry_renderers {
         registration::register_entry_renderer(&r.custom_type);
     }
+    // EXT-019: declare (not send) the markdown transformer — the closure stays guest-side and the
+    // host reaches it through the `transform-markdown` export. Pi `registerMarkdownTransformer`,
+    // `extensions/loader.ts:309-312` @v0.84.1.
+    if api.has_markdown_transformer() {
+        registration::register_markdown_transformer();
+    }
     for command in &api.autocomplete {
         registration::add_autocomplete(command);
     }
@@ -287,6 +293,18 @@ pub fn render_result(custom_type: String, result_json: String) -> Option<String>
             .as_ref()
             .and_then(|api| api.render_result(&custom_type, &result))
             .map(|v| v.to_string())
+    })
+}
+
+/// `transform-markdown` export body (EXT-019; Pi `MarkdownTransformer`, types.ts:1153 @v0.84.1).
+/// Identity when this guest registered no transformer, so an unexpected call is harmless.
+pub fn transform_markdown(markdown: String, ctx_json: String) -> String {
+    let ctx = crate::api::MarkdownTransformContext::from_json(
+        &serde_json::from_str(&ctx_json).unwrap_or(Value::Null),
+    );
+    API.with(|c| match c.borrow().as_ref() {
+        Some(api) => api.transform_markdown(&markdown, &ctx),
+        None => markdown,
     })
 }
 

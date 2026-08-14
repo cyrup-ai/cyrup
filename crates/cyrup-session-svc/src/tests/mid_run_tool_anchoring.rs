@@ -118,6 +118,12 @@ impl Tool for LateTool {
     fn parameters(&self) -> &serde_json::Value {
         &self.params
     }
+    /// A distinctive marker so a test can tell whether the SYSTEM PROMPT the model was sent
+    /// describes this tool (DRIFT-033) — only tools with a snippet reach the prompt's tool list
+    /// (`prompt/builder.rs:198-209`).
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("LATE_TOOL_SNIPPET")
+    }
     async fn execute(
         &self,
         _call_id: ToolCallId,
@@ -250,6 +256,108 @@ async fn a_tool_added_mid_run_is_callable_from_that_turn_onward_and_not_before()
         })
         .collect();
     assert!(errors.is_empty(), "no tool result errored: {errors:?}");
+}
+
+/// The system prompt the agent handed the provider, one entry per request.
+type OfferedPrompts = Arc<Mutex<Vec<String>>>;
+
+/// Same three-turn script as [`faux_three_turns`], but capturing the SYSTEM PROMPT of each request
+/// instead of the tool array.
+fn faux_three_turns_capturing_prompts(prompts: &OfferedPrompts) -> Arc<FauxProvider> {
+    let mk = |prompts: &OfferedPrompts, reply: AssistantReply| {
+        let cap = prompts.clone();
+        FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
+            cap.lock().unwrap().push(ctx.system_prompt.clone().unwrap_or_default());
+            match &reply {
+                AssistantReply::Call(name) => faux_assistant_message(
+                    vec![faux_tool_call(name.clone(), serde_json::json!({}))],
+                    StopReason::ToolUse,
+                ),
+                AssistantReply::Text(t) => {
+                    faux_assistant_message(vec![faux_text(t.clone())], StopReason::Stop)
+                }
+            }
+        })
+    };
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![
+        mk(prompts, AssistantReply::Call("loader".into())),
+        mk(prompts, AssistantReply::Call("late".into())),
+        mk(prompts, AssistantReply::Text("done".into())),
+    ]);
+    faux
+}
+
+/// DRIFT-033 — the turn-boundary refresh must re-push the SYSTEM PROMPT beside the tool array, so a
+/// tool added mid-run is DESCRIBED to the model in the same run it becomes callable in.
+///
+/// Pi returns both from one object literal: `context: { ...previousContext, systemPrompt:
+/// this._systemPromptOverride ?? this._baseSystemPrompt, tools: this.agent.state.tools.slice() }`
+/// (agent-session.ts:533-535 @v0.83.0). cyrup returned only `tools`, because it had a single prompt
+/// slot and re-pushing it would have clobbered a `before_agent_start` sanitization; with pi's two
+/// slots modelled that objection is gone.
+///
+/// RED before the fix: `RunCtx` copies the system prompt once at `start_run` and only a
+/// `TurnUpdate::system_prompt` replaces it (`cyrup-agent/src/agent.rs:692-693`), so turn 2 was sent
+/// the run-start prompt and `LATE_TOOL_SNIPPET` never appeared — even though `late` was in the tool
+/// array that same request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drift033_a_mid_run_tool_addition_reaches_the_system_prompt() {
+    let fx = fixture();
+    let prompts: OfferedPrompts = Arc::new(Mutex::new(Vec::new()));
+    let faux = faux_three_turns_capturing_prompts(&prompts);
+    let (session, _late_ran) = session_with_loader(&fx, faux, PermissionPolicy::new()).await;
+
+    let _ = session.prompt("go").await.unwrap();
+    session.wait_for_idle().await;
+
+    let seen = prompts.lock().unwrap().clone();
+    assert!(seen.len() >= 2, "the run drove at least two turns: {}", seen.len());
+    assert!(
+        !seen[0].contains("LATE_TOOL_SNIPPET"),
+        "turn 1 must not describe the not-yet-added tool"
+    );
+    assert!(
+        seen[1].contains("LATE_TOOL_SNIPPET"),
+        "turn 2 of the SAME run must describe the tool turn 1 added"
+    );
+}
+
+/// DRIFT-033, the other half — a mid-run tool rebuild must not overwrite a `before_agent_start`
+/// handler's replacement prompt, and that replacement must not survive its own run.
+///
+/// pi scopes it with two slots: `_systemPromptOverride` is assigned in `emitBeforeAgentStart`'s
+/// caller (agent-session.ts:1247 @v0.83.0), every write of `agent.state.systemPrompt` resolves
+/// `override ?? base` (`:534`, `:940`), and `_runAgentPrompt`'s `finally` clears it (`:1069`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drift033_a_start_hook_override_outranks_a_mid_run_rebuild_and_dies_with_its_run() {
+    let fx = fixture();
+    let prompts: OfferedPrompts = Arc::new(Mutex::new(Vec::new()));
+    let faux = faux_three_turns_capturing_prompts(&prompts);
+    let (session, _late_ran) = session_with_loader(&fx, faux, PermissionPolicy::new()).await;
+
+    // No handler ran, so nothing may be held in the override slot at any point of a plain run.
+    assert_eq!(session.system_prompt_override(), None, "nothing overrides before a run");
+    let base_before = session.base_system_prompt();
+    assert_eq!(
+        session.effective_system_prompt(),
+        base_before,
+        "with no override the effective prompt IS the base (pi's `override ?? base`)"
+    );
+
+    let _ = session.prompt("go").await.unwrap();
+    session.wait_for_idle().await;
+
+    assert_eq!(
+        session.system_prompt_override(),
+        None,
+        "`_runAgentPrompt`'s finally clears the override; a run may never leave one behind"
+    );
+    // The mid-run `set_active_tools_by_name` rebuilt the base, and with no override in force the
+    // effective prompt follows it — the `late` snippet is now permanent for the session.
+    let base_after = session.base_system_prompt();
+    assert!(base_after.contains("LATE_TOOL_SNIPPET"), "the rebuild became the new base");
+    assert_eq!(session.effective_system_prompt(), base_after);
 }
 
 /// The ANCHOR ITSELF rides on the tool result and is persisted to the append-only session JSONL, so

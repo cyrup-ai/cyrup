@@ -8,11 +8,12 @@ use crate::dispatch::Dispatcher;
 use crate::error::ExtError;
 use crate::event::{HostEvent, InputEventSource, InputStreamingBehavior};
 use crate::hooks::ExtHooks;
-use crate::loader::{DiscoveredExtension, DiscoveryRoots};
-// Only the wasm-host guest-loading path constructs these; `discover()` (ungated) needs just the
-// two above, so gate the rest to keep `--no-default-features` warning-free.
+use crate::loader::{DiscoveredExtension, DiscoveryRoots, LoadError};
+// EXT-026: `LoadError` is NOT wasm-host-gated — `discover_with_diagnostics` returns it in every
+// build (a manifest that will not parse is a diagnostic whether or not a guest could be
+// instantiated). `LoadExtensionsResult` genuinely is guest-loading only.
 #[cfg(feature = "wasm-host")]
-use crate::loader::{LoadError, LoadExtensionsResult};
+use crate::loader::LoadExtensionsResult;
 #[cfg(feature = "wasm-host")]
 use crate::manifest::{Capabilities, HOST_WORLD};
 use crate::native::{ExtMode, HostCtx, InitApi, NativeExtension, NativeHandle};
@@ -125,12 +126,16 @@ pub struct ExtensionHost {
     /// Loaded native built-ins keyed by id — the native slash-command routing table (R-08-016). A
     /// native command runs in-process (no wasm), so the handle is kept here to reach its
     /// [`NativeExtension::execute_command`] when a `/<cmd>` it owns is invoked.
-    native: RwLock<std::collections::HashMap<ExtensionId, Arc<dyn NativeExtension>>>,
+    ///
+    /// `Arc`-shared with [`BusFanout`] (EXT-034) so the bus drain can resolve a subscriber without
+    /// borrowing the host — the dispatcher holds the fan-out, not the facade.
+    native: Arc<NativeMap>,
     #[cfg(feature = "wasm-host")]
     wasm: Option<crate::host_runtime::WasmRuntime>,
     /// Loaded live wasm instances keyed by id — the slash-command/reload routing table (R-08-016/005).
+    /// `Arc`-shared with [`BusFanout`] for the same reason as [`Self::native`].
     #[cfg(feature = "wasm-host")]
-    live: RwLock<std::collections::HashMap<ExtensionId, Arc<crate::host::LiveExtension>>>,
+    live: Arc<LiveMap>,
     /// The single host-owned inter-extension event bus (pi's one `createEventBus()` threaded to
     /// every extension, `core/event-bus.ts:12-32` / `extensions/loader.ts:389` @v0.83.0). Shared
     /// into every loaded guest AND consulted for every loaded native, so a `bus.emit` reaches any
@@ -151,6 +156,39 @@ pub struct ExtensionHost {
     /// via [`Self::set_active_tool_source`], in which case [`Self::active_tools`] hands tools back
     /// UNWRAPPED — there is no live agent whose tool set could change, so the diff has no meaning.
     active_tool_source: RwLock<Option<Arc<dyn crate::wrapper::ActiveToolNames>>>,
+    /// The bus fan-out (EXT-034). Owned here (strong) and handed to the dispatcher as a `Weak`, so
+    /// every dispatch entry point drains after its subscriber loop — not just the two command-tier
+    /// call sites that used to be the only drain.
+    fanout: Arc<BusFanout>,
+}
+
+/// The native routing table, shared between the facade and the bus fan-out.
+type NativeMap = RwLock<std::collections::HashMap<ExtensionId, Arc<dyn NativeExtension>>>;
+/// The live-guest routing table, shared between the facade and the bus fan-out.
+#[cfg(feature = "wasm-host")]
+type LiveMap = RwLock<std::collections::HashMap<ExtensionId, Arc<crate::host::LiveExtension>>>;
+
+/// The inter-extension bus fan-out, extracted from the facade so it can be reached from the
+/// dispatcher (EXT-034).
+///
+/// pi needs no such object: `createEventBus()` delivers synchronously at the emit call
+/// (`pi/packages/coding-agent/src/core/event-bus.ts:12-32` @v0.83.0), so there is no drain point
+/// and nothing to give a handle to. cyrup's delivery is deferred (a guest's `bus.emit` import runs
+/// while that guest holds its own single-instance store), so the drain has to be invoked at every
+/// seam that can have re-entered a guest — and [`Dispatcher`], which owns the event seams, holds no
+/// reference to the facade.
+pub(crate) struct BusFanout {
+    bus: Arc<crate::bus::SharedBus>,
+    config: HostConfig,
+    native: Arc<NativeMap>,
+    #[cfg(feature = "wasm-host")]
+    live: Arc<LiveMap>,
+    /// For [`Dispatcher::report_external`] — the `onError` channel EXT-057b routes bus faults onto.
+    dispatcher: Arc<Dispatcher>,
+    /// Set while a drain is in progress, so a nested seam (the facade's own explicit
+    /// [`ExtensionHost::deliver_bus_events`], or a handler reached from a delivery) does not start a
+    /// second concurrent fan-out over the same queue.
+    draining: std::sync::atomic::AtomicBool,
 }
 
 impl Default for ExtensionHost {
@@ -163,20 +201,40 @@ impl ExtensionHost {
     /// A native-only host foundation (no Wasmtime engine spun up). Sufficient for the full
     /// dispatch/registration/seam/containment surface (tested without wasm).
     pub fn new(config: HostConfig) -> Self {
+        let dispatcher = Arc::new(Dispatcher::new());
+        let registry = Arc::new(ExtensionRegistry::new());
+        let bus = Arc::new(crate::bus::SharedBus::new());
+        let native: Arc<NativeMap> = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        #[cfg(feature = "wasm-host")]
+        let live: Arc<LiveMap> = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let fanout = Arc::new(BusFanout {
+            bus: bus.clone(),
+            config: config.clone(),
+            native: native.clone(),
+            #[cfg(feature = "wasm-host")]
+            live: live.clone(),
+            dispatcher: dispatcher.clone(),
+            draining: std::sync::atomic::AtomicBool::new(false),
+        });
+        // EXT-034: the dispatcher holds the drain WEAKLY. `fanout` already holds the dispatcher
+        // strongly (it needs `report_external`), so a strong edge back would be a reference cycle
+        // that leaks the whole host.
+        dispatcher.set_bus_drain(Arc::downgrade(&fanout) as std::sync::Weak<dyn crate::bus::BusDrain>);
         Self {
-            dispatcher: Arc::new(Dispatcher::new()),
-            registry: Arc::new(ExtensionRegistry::new()),
+            dispatcher,
+            registry,
             config,
             loaded: RwLock::new(Vec::new()),
-            native: RwLock::new(std::collections::HashMap::new()),
+            native,
             #[cfg(feature = "wasm-host")]
             wasm: None,
             #[cfg(feature = "wasm-host")]
-            live: RwLock::new(std::collections::HashMap::new()),
-            bus: Arc::new(crate::bus::SharedBus::new()),
+            live,
+            bus,
             #[cfg(feature = "wasm-host")]
             services: RwLock::new(None),
             active_tool_source: RwLock::new(None),
+            fanout,
         }
     }
 
@@ -279,6 +337,7 @@ impl ExtensionHost {
             autocomplete,
             autocomplete_providers,
             bus_topics,
+            markdown_transformer,
         ) = api.into_parts();
 
         // EXT-003 footgun guard: a native that subscribes to `project_trust` but did NOT override
@@ -333,6 +392,12 @@ impl ExtensionHost {
         }
         for _ in 0..autocomplete_providers {
             self.registry.add_autocomplete_provider(id.clone())?;
+        }
+        // EXT-019: at most one markdown transformer per extension, recorded in LOAD ORDER (pi
+        // assigns `extension.markdownTransformer`, `extensions/loader.ts:309-312` @v0.84.1, and
+        // folds them in `this.extensions` order, `runner.ts:589-591`).
+        if markdown_transformer {
+            self.registry.register_markdown_transformer(id.clone())?;
         }
         // EXT-018: a native's bus subscriptions land in the SAME host-owned bus a guest's
         // `bus.subscribe` import writes to (pi's single `createEventBus()`, `loader.ts:389`).
@@ -881,6 +946,78 @@ impl ExtensionHost {
         self.render_via(&owner, custom_type, entry, RenderKind::Entry).await
     }
 
+    /// Fold every registered markdown transformer over `markdown`, in extension LOAD ORDER
+    /// (EXT-019).
+    ///
+    /// pi: `getMarkdownTransformers(): this.extensions.flatMap(ext => ext.markdownTransformer ? [..]
+    /// : [])` (`pi/packages/coding-agent/src/core/extensions/runner.ts:589-591` @v0.84.1) — a
+    /// POST-BASELINE addition, absent at the ported v0.83.0 — with the transformer typed
+    /// `(markdown: string, context: MarkdownTransformContext) => string` (`types.ts:1153`). Each
+    /// transformer's output is the next one's input, which is why this is a fold and not a
+    /// first-wins lookup like the renderer tables.
+    ///
+    /// `message_type` is one of `"user"` / `"assistant"` / `"assistant-thinking"`; `is_streaming`
+    /// and `available_width` are the other two `MarkdownTransformContext` fields
+    /// (`types.ts:1147-1151`). A faulting transformer is CONTAINED and SKIPPED — its input passes
+    /// through unchanged, so a broken extension can never blank a line of transcript.
+    pub async fn transform_markdown(
+        &self,
+        markdown: &str,
+        message_type: &str,
+        is_streaming: bool,
+        available_width: u32,
+    ) -> String {
+        let owners = self.registry.markdown_transformer_owners().unwrap_or_default();
+        if owners.is_empty() {
+            return markdown.to_string();
+        }
+        let ctx = serde_json::json!({
+            "messageType": message_type,
+            "isStreaming": is_streaming,
+            "availableWidth": available_width,
+        });
+        let mut current = markdown.to_string();
+        for owner in owners {
+            match self.transform_markdown_via(&owner, &current, &ctx).await {
+                Ok(next) => current = next,
+                Err(e) => {
+                    tracing::warn!(
+                        extension = %owner, error = %e,
+                        "markdown transformer contained (skipped; text passes through unchanged)"
+                    );
+                }
+            }
+        }
+        current
+    }
+
+    /// One transformer invocation, whichever tier its owner lives in. A native's panic is caught
+    /// for the same reason a native renderer's is (R-08-036): a presentation hook must never take
+    /// the frame down.
+    async fn transform_markdown_via(
+        &self,
+        owner: &ExtensionId,
+        markdown: &str,
+        ctx: &Value,
+    ) -> Result<String, ExtError> {
+        if let Some(native) = self.native.read().ok().and_then(|g| g.get(owner).cloned()) {
+            return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                native.transform_markdown(markdown, ctx)
+            }))
+            .map_err(|panic| ExtError::Panicked(native_panic_msg(panic)));
+        }
+        #[cfg(feature = "wasm-host")]
+        {
+            let Some(ext) = self.live.read().ok().and_then(|g| g.get(owner).cloned()) else {
+                // Recorded owner with no live instance: nothing threw, nothing to call.
+                return Ok(markdown.to_string());
+            };
+            return ext.transform_markdown(markdown, ctx).await;
+        }
+        #[cfg(not(feature = "wasm-host"))]
+        Ok(markdown.to_string())
+    }
+
     /// Invoke the owner's renderer, containing faults LOCALLY (`warn!` + [`RenderOutcome::Failed`])
     /// the way [`Self::deliver_bus_events`] does. Deliberately NOT routed through
     /// `dispatch_block_mutate`: a renderer is a presentation concern and a faulting one must never
@@ -1087,74 +1224,15 @@ impl ExtensionHost {
     ///   `[Extension issues]` surface EXT-S03 exists to make faults visible in. pi's own `on`
     ///   wrapper surfaces handler faults (`catch (err) { console.error(...) }`); this now does too,
     ///   keeping the `tracing::warn!` as well.
+    /// * **EXT-034** — the drain used to be wired only into the command tier (`run_command` /
+    ///   `run_shortcut`), so `pi.events` silently worked from a slash-command handler and silently
+    ///   did NOT work from an event handler, which is where cross-extension coordination actually
+    ///   happens. The body now lives on [`BusFanout`], which [`Dispatcher`] holds, and every
+    ///   dispatch entry point drains after its subscriber loop. This method stays as the explicit
+    ///   host-tier drain and is a no-op when a drain is already running.
     pub async fn deliver_bus_events(&self, cancel: &CancelToken) {
-        // Bound on delivery rounds: each round drains the whole queue, then re-checks for events a
-        // just-delivered handler emitted. A cycle (A→B→A→…) stops after the bound rather than
-        // hanging.
-        const MAX_ROUNDS: usize = 64;
-        for _ in 0..MAX_ROUNDS {
-            let batch = self.bus.take_pending();
-            if batch.is_empty() {
-                return;
-            }
-            for (topic, payload) in batch {
-                for id in self.bus.subscribers_for(&topic) {
-                    if let Err(e) = self.bus_deliver_one(&id, &topic, &payload, cancel).await {
-                        tracing::warn!(
-                            extension = %id, topic = %topic, error = %e,
-                            "inter-extension bus delivery contained (skipped)"
-                        );
-                        // EXT-057b: also onto the onError channel, so a trapping bus listener is
-                        // as visible as a trapping event handler.
-                        self.report_bus_error(&id, format!("bus `{topic}`: {e}"));
-                    }
-                }
-            }
-        }
-        // EXT-057a: the bound was reached. Anything still queued is dropped — say so.
-        let dropped = self.bus.drop_pending();
-        if dropped > 0 {
-            let msg = format!(
-                "inter-extension bus gave up after {MAX_ROUNDS} delivery rounds; {dropped} queued \
-                 event(s) dropped (a handler is emitting on every round)"
-            );
-            tracing::warn!(rounds = MAX_ROUNDS, dropped, "{msg}");
-            self.report_bus_error(&ExtensionId::from("bus"), msg);
-        }
-    }
-
-    /// Deliver one bus event to one subscriber, whichever tier it lives in (EXT-018). A subscriber
-    /// that is in NEITHER map has gone stale — its instance left the host — so its subscription is
-    /// torn down here rather than left to accumulate (EXT-050; pi's `invalidate()` runs every
-    /// tracked unsubscribe, `extensions/loader.ts:206-214` @v0.84.1).
-    async fn bus_deliver_one(
-        &self,
-        id: &ExtensionId,
-        topic: &str,
-        payload: &Value,
-        cancel: &CancelToken,
-    ) -> Result<(), ExtError> {
-        #[cfg(feature = "wasm-host")]
-        if let Some(ext) = self.live.read().ok().and_then(|g| g.get(id).cloned()) {
-            return ext.bus_deliver(topic, payload, cancel).await;
-        }
-        if let Some(ext) = self.native.read().ok().and_then(|g| g.get(id).cloned()) {
-            let ctx = HostCtx::event(self.config.mode, self.config.has_ui, self.config.cwd.clone());
-            return ext.on_bus_event(topic, payload, &ctx).await;
-        }
-        self.bus.unsubscribe(id, topic);
-        Ok(())
-    }
-
-    /// Surface a bus-layer fault on the same `onError` channel a contained handler fault uses.
-    fn report_bus_error(&self, id: &ExtensionId, error: String) {
-        self.dispatcher.report_external(crate::ExtensionError {
-            extension: id.clone(),
-            // pi's bus faults are logged with the CHANNEL, not an event name; `"bus"` is the
-            // closest honest label in `ExtensionError.event`'s `&'static str` vocabulary.
-            event: "bus",
-            error,
-        });
+        use crate::bus::BusDrain;
+        self.fanout.drain_bus(cancel).await;
     }
 
     /// The host-owned inter-extension bus (pi's single `createEventBus()`,
@@ -1489,32 +1567,54 @@ impl ExtensionHost {
     }
 
     /// Execute the extension-registered keyboard shortcut bound to `key` (R-08-017; Pi
-    /// `registerShortcut` handler). Resolves the owning live extension from the registry and runs its
-    /// [`crate::host::LiveExtension::execute_shortcut`] at command tier. An unregistered key or a
-    /// shortcut with no live owner is a typed `ExtError`.
-    #[cfg(feature = "wasm-host")]
+    /// `registerShortcut` handler, `extensions/types.ts:1249-1255` @v0.83.0). Resolves the owning
+    /// extension from the registry and runs its handler at COMMAND tier — a live guest through
+    /// [`crate::host::LiveExtension::execute_shortcut`], a native through
+    /// [`NativeExtension::execute_shortcut`]. An unregistered key, or a key whose owner is in
+    /// neither map, is a typed `ExtError`.
+    ///
+    /// EXT-035: this used to be `#[cfg(feature = "wasm-host")]` and resolve owners out of
+    /// `self.live` only, with a `#[cfg(not(...))]` twin that failed unconditionally. A native's
+    /// shortcut therefore registered, was advertised by `shortcut_keys()`, listed by `/hotkeys` —
+    /// and could never fire. pi has one extension kind and one `ExtensionAPI`
+    /// (`extensions/loader.ts:274-410`), so which tier the owner runs in cannot be allowed to
+    /// decide whether its keybinding works.
     pub async fn run_shortcut(&self, key: &str, cancel: &CancelToken) -> Result<(), ExtError> {
         let owner = self
             .registry
             .shortcut_owner(key)?
             .ok_or_else(|| ExtError::Component(format!("no such shortcut: {key}")))?;
-        let ext = self
-            .live
-            .read()
-            .ok()
-            .and_then(|g| g.get(&owner).cloned())
-            .ok_or_else(|| ExtError::Component(format!("shortcut `{key}` has no live owner")))?;
-        let out = ext.execute_shortcut(key, cancel).await;
+        // Native first: a native handle is in-process and cannot be mid-instantiation, and the
+        // two maps are disjoint by construction (an id loads through exactly one path).
+        let native = self.native.read().ok().and_then(|g| g.get(&owner).cloned());
+        let out = if let Some(ext) = native {
+            let ctx =
+                HostCtx::command(self.config.mode, self.config.has_ui, self.config.cwd.clone());
+            // Live rich fields, exactly as the native COMMAND route does (EXT-005) — a shortcut
+            // handler reading `ctx.is_idle()`/`ctx.is_project_trusted()` must not get
+            // `HostCtxRich::default()`.
+            #[cfg(feature = "wasm-host")]
+            let ctx = match self.host_services() {
+                Some(svc) => ctx.with_rich(crate::native::rich_from_services(svc.as_ref())),
+                None => ctx,
+            };
+            ext.execute_shortcut(key, &ctx).await
+        } else {
+            #[cfg(feature = "wasm-host")]
+            {
+                let ext = self.live.read().ok().and_then(|g| g.get(&owner).cloned()).ok_or_else(
+                    || ExtError::Component(format!("shortcut `{key}` has no live owner")),
+                )?;
+                ext.execute_shortcut(key, cancel).await
+            }
+            #[cfg(not(feature = "wasm-host"))]
+            {
+                Err(ExtError::Component(format!("shortcut `{key}` has no live owner")))
+            }
+        };
         // Fan out any inter-extension bus events the shortcut handler emitted (gap-08 §5.3).
         self.deliver_bus_events(cancel).await;
         out
-    }
-
-    /// Native-host fallback for [`ExtensionHost::run_shortcut`] (no `wasm-host` feature): no live
-    /// guest can own a shortcut, so a fired key is a typed error rather than a silent success.
-    #[cfg(not(feature = "wasm-host"))]
-    pub async fn run_shortcut(&self, key: &str, _cancel: &CancelToken) -> Result<(), ExtError> {
-        Err(ExtError::Component(format!("shortcut `{key}` has no live owner (wasm-host disabled)")))
     }
 
     /// Hot reload (`/reload`, R-08-005): emit `session_shutdown{reload}` to the live set, cache-bust
@@ -1753,5 +1853,87 @@ impl crate::host::ProviderReduction for DispatcherProviderReduction {
                 Some(from),
             )
             .await;
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::bus::BusDrain for BusFanout {
+    /// The fan-out proper (EXT-018 / EXT-034 / EXT-057). See
+    /// [`ExtensionHost::deliver_bus_events`] for the full provenance.
+    async fn drain_bus(&self, cancel: &CancelToken) {
+        // Re-entrancy: a nested seam (the host's explicit drain called from `run_command`, or a
+        // dispatch reached from a delivered handler) must not start a second fan-out over the same
+        // queue — the outer one already owns it and will pick up whatever the inner seam enqueued
+        // on its next round. RAII, because a dropped future must not leave the latch stuck.
+        let Some(_latch) = crate::bus::DrainLatch::acquire(&self.draining) else { return };
+        // Bound on delivery rounds: each round drains the whole queue, then re-checks for events a
+        // just-delivered handler emitted. A cycle (A→B→A→…) stops after the bound rather than
+        // hanging.
+        const MAX_ROUNDS: usize = 64;
+        for _ in 0..MAX_ROUNDS {
+            let batch = self.bus.take_pending();
+            if batch.is_empty() {
+                return;
+            }
+            for (topic, payload) in batch {
+                for id in self.bus.subscribers_for(&topic) {
+                    if let Err(e) = self.deliver_one(&id, &topic, &payload, cancel).await {
+                        tracing::warn!(
+                            extension = %id, topic = %topic, error = %e,
+                            "inter-extension bus delivery contained (skipped)"
+                        );
+                        // EXT-057b: also onto the onError channel, so a trapping bus listener is
+                        // as visible as a trapping event handler.
+                        self.report_bus_error(&id, format!("bus `{topic}`: {e}"));
+                    }
+                }
+            }
+        }
+        // EXT-057a: the bound was reached. Anything still queued is dropped — say so.
+        let dropped = self.bus.drop_pending();
+        if dropped > 0 {
+            let msg = format!(
+                "inter-extension bus gave up after {MAX_ROUNDS} delivery rounds; {dropped} queued \
+                 event(s) dropped (a handler is emitting on every round)"
+            );
+            tracing::warn!(rounds = MAX_ROUNDS, dropped, "{msg}");
+            self.report_bus_error(&ExtensionId::from("bus"), msg);
+        }
+    }
+}
+
+impl BusFanout {
+    /// Deliver one bus event to one subscriber, whichever tier it lives in (EXT-018). A subscriber
+    /// that is in NEITHER map has gone stale — its instance left the host — so its subscription is
+    /// torn down here rather than left to accumulate (EXT-050; pi's `invalidate()` runs every
+    /// tracked unsubscribe, `extensions/loader.ts:206-214` @v0.84.1).
+    async fn deliver_one(
+        &self,
+        id: &ExtensionId,
+        topic: &str,
+        payload: &Value,
+        #[cfg_attr(not(feature = "wasm-host"), allow(unused_variables))] cancel: &CancelToken,
+    ) -> Result<(), ExtError> {
+        #[cfg(feature = "wasm-host")]
+        if let Some(ext) = self.live.read().ok().and_then(|g| g.get(id).cloned()) {
+            return ext.bus_deliver(topic, payload, cancel).await;
+        }
+        if let Some(ext) = self.native.read().ok().and_then(|g| g.get(id).cloned()) {
+            let ctx = HostCtx::event(self.config.mode, self.config.has_ui, self.config.cwd.clone());
+            return ext.on_bus_event(topic, payload, &ctx).await;
+        }
+        self.bus.unsubscribe(id, topic);
+        Ok(())
+    }
+
+    /// Surface a bus-layer fault on the same `onError` channel a contained handler fault uses.
+    fn report_bus_error(&self, id: &ExtensionId, error: String) {
+        self.dispatcher.report_external(crate::ExtensionError {
+            extension: id.clone(),
+            // pi's bus faults are logged with the CHANNEL, not an event name; `"bus"` is the
+            // closest honest label in `ExtensionError.event`'s `&'static str` vocabulary.
+            event: "bus",
+            error,
+        });
     }
 }

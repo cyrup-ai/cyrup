@@ -246,9 +246,19 @@ pub trait HostServices: Send + Sync {
     fn theme(&self) -> Option<String> {
         None
     }
-    /// Available theme names (Pi `listThemes`).
+    /// Every available theme as `{name, path}` (Pi `getAllThemes(): {name, path}[]`,
+    /// `extensions/types.ts:269` @v0.83.0). `path` is `null` for a built-in theme, which is the
+    /// only way a guest can tell a built-in from a file-backed one — EXT-021: cyrup returned bare
+    /// names.
     fn theme_list(&self) -> Value {
         json!([])
+    }
+
+    /// Load one theme BY NAME without switching to it (Pi `getTheme(name): Theme | undefined`,
+    /// `extensions/types.ts:272` @v0.83.0). `None` = no such theme. Distinct from [`Self::theme`],
+    /// which reports the ACTIVE theme.
+    fn theme_by_name(&self, _name: &str) -> Option<Value> {
+        None
     }
     /// Switch the active theme (Pi `setTheme`); denied by default.
     fn set_theme(&self, _name: &str) -> Result<(), String> {
@@ -270,8 +280,42 @@ pub trait HostServices: Send + Sync {
     /// A keyed status-bar segment (Pi `setStatus(key, text?)`, types.ts:141-142); `None` clears the
     /// key.
     fn set_status(&self, _key: &str, _text: Option<&str>) {}
-    /// A custom status-line widget payload (Pi `setWidget`, types.ts:164-173).
-    fn set_widget(&self, _widget: &Value) {}
+    /// One keyed extension widget (Pi `setWidget(key, content, options?)`,
+    /// `extensions/types.ts:170-175` @v0.83.0).
+    ///
+    /// EXT-047: this took a single opaque `&Value` — the cyrup-invented collapse of pi's three
+    /// arguments — and its own doc admitted there was "no cyrup-side convention to re-derive them
+    /// from". Three concrete losses followed: two extensions setting a widget clobbered each other,
+    /// a widget could not be REMOVED (the shipped subagents extension hand-rolled
+    /// `{"key": …, "content": null}` for it and the slot stayed occupied), and `belowEditor`
+    /// placement was unexpressible.
+    ///
+    /// * `key` — the map key. One widget per key; upstream's `setWidget` is a map write, not a
+    ///   single slot.
+    /// * `lines` — pi's `content: string[] | undefined`. `None` REMOVES this key's widget.
+    /// * `placement` — [`WidgetPlacement`], upstream's `ExtensionWidgetOptions.placement`
+    ///   (`:107-110`), defaulting to `AboveEditor` (`:108`).
+    fn set_widget(&self, _key: &str, _lines: Option<&[String]>, _placement: WidgetPlacement) {}
+
+    /// The streaming working/loading MESSAGE (Pi `setWorkingMessage(message?)`,
+    /// `extensions/types.ts:151` @v0.83.0). `None` is upstream's no-argument call: "restore
+    /// default".
+    fn set_working_message(&self, _message: Option<&str>) {}
+
+    /// Show/hide the built-in working loader row (Pi `setWorkingVisible(visible)`,
+    /// `extensions/types.ts:154` @v0.83.0). Independent of the message — which is exactly what
+    /// cyrup's collapsed `working-start(label)`/`working-stop()` pair could not express.
+    fn set_working_visible(&self, _visible: bool) {}
+
+    /// Configure the working indicator's frames/interval (Pi `setWorkingIndicator(options?)`,
+    /// `extensions/types.ts:164` @v0.83.0; `WorkingIndicatorOptions {frames?, intervalMs?}` at
+    /// `:116-121`). `None` restores the default animated spinner; `Some` with `frames: []` hides
+    /// the indicator entirely.
+    fn set_working_indicator(&self, _opts: Option<&Value>) {}
+
+    /// The label shown for hidden thinking blocks (Pi `setHiddenThinkingLabel(label?)`,
+    /// `extensions/types.ts:167` @v0.83.0). `None` restores the default.
+    fn set_hidden_thinking_label(&self, _label: Option<&str>) {}
     /// Custom header content (Pi `setHeader`, types.ts:184).
     fn set_header(&self, _content: &str) {}
     /// Custom footer content (Pi `setFooter`, types.ts:174-177).
@@ -553,6 +597,43 @@ pub trait HostServices: Send + Sync {
     /// service routes this to the live agent's tool set + system-prompt rebuild — the SAME method the
     /// host/CLI tool-toggle path uses, so a guest's call has full, real effect.
     fn set_active_tools(&self, _names: &[String]) {}
+
+    /// The live session's FULL tool set as `ToolInfo` rows — `{name, description, parameters,
+    /// promptGuidelines, sourceInfo}` (EXT-038).
+    ///
+    /// pi's `getAllTools()` maps `this._toolDefinitions` — the MERGED registry including built-ins,
+    /// MCP and extension tools — at
+    /// `pi/packages/coding-agent/src/core/agent-session.ts:906-914` @v0.83.0; the type is `ToolInfo`
+    /// at `extensions/types.ts:1552` and the API doc at `:1323` reads "Get all configured tools with
+    /// parameter schema, prompt guidelines, and source metadata."
+    ///
+    /// Distinct from [`Self::all_tool_names`], which is the same set as bare names for the
+    /// permission companion's registry gate. This is the introspection row a plan-mode or
+    /// tool-restriction extension reads BEFORE calling [`Self::set_active_tools`] — and cyrup's
+    /// version reported extension tools only, so such an extension computed a restriction set that
+    /// silently omitted every built-in and then had that restriction honoured.
+    ///
+    /// `None` when no live session backend is attached; the guest binding then falls back to the
+    /// registry's extension-only view, which is at least honest about being a fallback.
+    fn all_tools(&self) -> Option<Vec<Value>> {
+        None
+    }
+
+    /// The live session's slash-command catalog as `SlashCommandInfo` rows — `{name, description,
+    /// source, sourceInfo}` (EXT-037).
+    ///
+    /// pi's `getCommands()` returns `[...extensionCommands, ...templates, ...skills]`, where an
+    /// extension command maps to `{name: command.invocationName, description, source: "extension",
+    /// sourceInfo}` (`pi/packages/coding-agent/src/core/agent-session.ts:2332-2354` @v0.83.0); the
+    /// type is `SlashCommandInfo` (`core/slash-commands.ts:6-11`), declared on the API at
+    /// `extensions/types.ts:1329`. Note `invocationName`, not `name`: a second extension registering
+    /// `deploy` is invocable only as `deploy:2`, and a guest handed the raw name cannot call it.
+    ///
+    /// `None` when no live session backend is attached; the guest binding then falls back to the
+    /// registry's RESOLVED commands, which at least carry the `name:N` invocation names.
+    fn commands(&self) -> Option<Vec<Value>> {
+        None
+    }
 }
 
 /// Recorded extended-UI chrome effects (Pi `ExtensionUIContext` mutators, types.ts:124-275). These
@@ -1172,8 +1253,8 @@ pub struct GuestState {
     /// `ui.set-status` log: keyed status segments (Pi `setStatus(key, text?)`, types.ts:141). A
     /// `None` text clears that key (Pi `setStatus(key, undefined)`).
     statuses: Mutex<Vec<(String, Option<String>)>>,
-    /// `ui.set-widget` payloads.
-    widgets: Mutex<Vec<Value>>,
+    /// `ui.set-widget` calls in pi's `(key, content, placement)` shape (EXT-047).
+    widgets: Mutex<Vec<WidgetEffect>>,
     /// Extended UI chrome effects (header/footer/title/editor/theme/working/tools-expanded).
     chrome: Mutex<UiChrome>,
     /// `bus.emit` topics + payloads this guest emitted (R-08-029). A per-guest observability log kept
@@ -1251,6 +1332,45 @@ pub enum NotifyKind {
     Info,
     Warning,
     Error,
+}
+
+/// Where an extension widget is drawn (Pi `WidgetPlacement = "aboveEditor" | "belowEditor"`,
+/// `extensions/types.ts:104` @v0.83.0). `AboveEditor` is upstream's default
+/// (`ExtensionWidgetOptions.placement`, `:107-110`: "Defaults to \"aboveEditor\"").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WidgetPlacement {
+    #[default]
+    AboveEditor,
+    BelowEditor,
+}
+
+impl WidgetPlacement {
+    /// Parse pi's `ExtensionWidgetOptions` bag. An absent, malformed or unknown `placement` falls
+    /// back to the documented default rather than erroring — upstream's optional field.
+    pub fn from_opts(opts: &Value) -> Self {
+        match opts.get("placement").and_then(Value::as_str) {
+            Some("belowEditor") => Self::BelowEditor,
+            _ => Self::AboveEditor,
+        }
+    }
+
+    /// The upstream wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AboveEditor => "aboveEditor",
+            Self::BelowEditor => "belowEditor",
+        }
+    }
+}
+
+/// One recorded `ui.set-widget` call in pi's shape (EXT-047).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WidgetEffect {
+    /// pi's `key` — the map key. One widget per key.
+    pub key: String,
+    /// pi's `content: string[] | undefined`; `None` REMOVES this key's widget.
+    pub lines: Option<Vec<String>>,
+    pub placement: WidgetPlacement,
 }
 
 /// An OAuth login-flow callback the guest invoked during `provider-login` (Pi `OAuthLoginCallbacks`).
@@ -1586,10 +1706,15 @@ impl GuestState {
             .and_then(|g| g.iter().rfind(|(k, _)| k == key).and_then(|(_, t)| t.clone()))
     }
 
-    pub fn set_widget(&self, widget: Value) {
+    pub fn set_widget(&self, effect: WidgetEffect) {
         if let Ok(mut g) = self.widgets.lock() {
-            g.push(widget);
+            g.push(effect);
         }
+    }
+
+    /// Every recorded `ui.set-widget` call, in call order (tests/diagnostics).
+    pub fn widgets(&self) -> Vec<WidgetEffect> {
+        self.widgets.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     // --- extended UI chrome (Pi ExtensionUIContext mutators) ---
@@ -2128,5 +2253,89 @@ mod tests {
         s.abort_signal("sig-0".to_string()); // already tracked — must remain a harmless no-op.
         assert!(s.is_signal_aborted("sig-0"));
         assert_eq!(s.aborted_signals().len(), MAX_ABORTED_SIGNALS);
+    }
+    /// EXT-047 — pi's `setWidget(key, content, options?)` is a MAP write
+    /// (`extensions/types.ts:170-175` @v0.83.0): one widget per key, `content: undefined` removes
+    /// that key's widget, `placement` chooses the chrome slot. cyrup collapsed all three into one
+    /// opaque `widget-json` blob, so two extensions clobbered each other, a widget could not be
+    /// removed, and `belowEditor` was unexpressible.
+    #[test]
+    fn ext047_set_widget_keeps_pis_key_content_and_placement() {
+        let s = state();
+        s.set_widget(WidgetEffect {
+            key: "fleet".into(),
+            lines: Some(vec!["a".into(), "b".into()]),
+            placement: WidgetPlacement::AboveEditor,
+        });
+        s.set_widget(WidgetEffect {
+            key: "todo".into(),
+            lines: Some(vec!["x".into()]),
+            placement: WidgetPlacement::BelowEditor,
+        });
+        // Upstream's removal: `setWidget(key, undefined)`.
+        s.set_widget(WidgetEffect { key: "fleet".into(), lines: None, placement: WidgetPlacement::default() });
+
+        let got = s.widgets();
+        assert_eq!(got.len(), 3, "each call is recorded — two keys never collapse into one slot");
+        assert_eq!(got[0].key, "fleet");
+        assert_eq!(got[0].lines.as_deref(), Some(["a".to_string(), "b".to_string()].as_slice()));
+        assert_eq!(got[1].placement, WidgetPlacement::BelowEditor, "belowEditor is expressible");
+        assert!(got[2].lines.is_none(), "a clear is a real removal, not a null-content payload");
+    }
+
+    /// The placement bag is pi's `ExtensionWidgetOptions` (`extensions/types.ts:107-110`), whose
+    /// `placement` is OPTIONAL and defaults to `"aboveEditor"` (`:108`).
+    #[test]
+    fn ext047_placement_parses_pis_optional_options_bag() {
+        assert_eq!(
+            WidgetPlacement::from_opts(&json!({"placement": "belowEditor"})),
+            WidgetPlacement::BelowEditor
+        );
+        assert_eq!(
+            WidgetPlacement::from_opts(&json!({"placement": "aboveEditor"})),
+            WidgetPlacement::AboveEditor
+        );
+        assert_eq!(
+            WidgetPlacement::from_opts(&json!({})),
+            WidgetPlacement::AboveEditor,
+            "an omitted placement is upstream's documented default, not an error"
+        );
+        assert_eq!(WidgetPlacement::from_opts(&Value::Null), WidgetPlacement::AboveEditor);
+        assert_eq!(WidgetPlacement::AboveEditor.as_str(), "aboveEditor");
+        assert_eq!(WidgetPlacement::BelowEditor.as_str(), "belowEditor");
+    }
+
+    /// EXT-021 — the four `ctx.ui` verbs that had no WIT representation at all, plus the theme
+    /// inspector. The default [`HostServices`] denies everything, so these assert only that the
+    /// trait CARRIES them (a backend that overrides them is what makes them visible); the point of
+    /// the test is that a rename or removal on the trait breaks here rather than silently
+    /// un-porting the capability again.
+    #[test]
+    fn ext021_the_missing_ctx_ui_verbs_exist_on_hostservices() {
+        let deny = DenyServices;
+        // pi `setWorkingMessage(message?)` types.ts:151 — `None` is the no-argument call.
+        deny.set_working_message(None);
+        deny.set_working_message(Some("thinking"));
+        // pi `setWorkingVisible(visible)` types.ts:154.
+        deny.set_working_visible(false);
+        // pi `setWorkingIndicator(options?)` types.ts:164, bag at :116-121.
+        deny.set_working_indicator(None);
+        deny.set_working_indicator(Some(&json!({"frames": [], "intervalMs": 80})));
+        // pi `setHiddenThinkingLabel(label?)` types.ts:167.
+        deny.set_hidden_thinking_label(Some("thought"));
+        // pi `getTheme(name)` types.ts:272 — inspect WITHOUT switching.
+        assert!(deny.theme_by_name("dracula").is_none(), "the default backend grants no theme read");
+        // pi `getAllThemes()` types.ts:269 — `{name, path}` rows, empty by default.
+        assert_eq!(deny.theme_list(), json!([]));
+    }
+
+    /// EXT-038 / EXT-037 — the two introspection accessors a live session backend fills in. Both
+    /// default to `None` so the guest binding falls back to the registry rather than reporting an
+    /// empty session.
+    #[test]
+    fn ext037_038_all_tools_and_commands_default_to_no_live_session() {
+        let deny = DenyServices;
+        assert!(deny.all_tools().is_none(), "no live session ⇒ fall back to the registry view");
+        assert!(deny.commands().is_none());
     }
 }

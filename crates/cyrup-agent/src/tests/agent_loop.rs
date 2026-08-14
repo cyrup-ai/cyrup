@@ -1032,10 +1032,15 @@ async fn run_active_guard_and_continue_validation() {
     let agent = Agent::builder(model_ref(), sf).key_resolver(Arc::new(KeyResolver)).build();
 
     // continue with no messages => error
-    assert!(matches!(
-        agent.continue_run().await,
-        Err(crate::AgentError::NoMessages)
-    ));
+    // AGENT-034 — pi's `Agent.continue()` throws the literal `"No messages to continue from"`
+    // (`packages/agent/src/agent.ts:357` @v0.83.0, `:368` @v0.84.1), which is NOT the string the
+    // low-level `agentLoopContinue` uses for the same condition.
+    let no_msgs = agent.continue_run().await;
+    assert!(matches!(no_msgs, Err(crate::AgentError::NoMessages(crate::ContinueSurface::Agent))));
+    assert_eq!(
+        no_msgs.err().map(|e| e.to_string()).unwrap_or_default(),
+        "No messages to continue from"
+    );
 
     let _ = agent.prompt("hi").await.unwrap();
     agent.wait_for_idle().await;
@@ -1376,8 +1381,13 @@ async fn agent020_rejected_continue_keeps_the_steering_message() {
     agent.steer(AgentMessage::user_text("keep-me"));
     let rejected = agent.continue_run().await;
     assert!(
-        matches!(rejected, Err(crate::AgentError::RunActive)),
+        matches!(rejected, Err(crate::AgentError::RunActive(crate::BusyEntry::Continue))),
         "a continuation during an active run is refused, as pi throws at agent.ts:351-353"
+    );
+    // AGENT-034 — and it is `continue()`'s OWN message, not the latch's or `prompt()`'s.
+    assert_eq!(
+        rejected.err().map(|e| e.to_string()).unwrap_or_default(),
+        "Agent is already processing. Wait for completion before continuing."
     );
     // RED before the fix: `continue_run` had already drained the queue by the time `start_run`
     // rejected it, so the message was gone.
@@ -1409,7 +1419,7 @@ async fn agent020_rejected_continue_keeps_the_follow_up_message() {
     // (pi `followUpQueue.drain()`, agent.ts:367).
     agent.follow_up(AgentMessage::user_text("keep-me-too"));
     let rejected = agent.continue_run().await;
-    assert!(matches!(rejected, Err(crate::AgentError::RunActive)));
+    assert!(matches!(rejected, Err(crate::AgentError::RunActive(crate::BusyEntry::Continue))));
     assert!(
         agent.has_queued_messages(),
         "a REFUSED continuation must leave the follow-up queue intact too"

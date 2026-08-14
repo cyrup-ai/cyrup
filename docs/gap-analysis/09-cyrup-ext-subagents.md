@@ -55,6 +55,79 @@ clone-HEAD line numbers and file existence both mislead here).
 > **Open set after the repair pass: 45 items — 0 critical, 2 high, 23 medium, 20 low — plus 1
 > tracker (`SUBA-005`) excluded from that count.**
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 09 — recount: 48 rows → 26 open (0 critical · 0 high · 14 medium · 12 low).** All five of the
+> area's highs are closed: `SUBA-014` and `SUBA-043` in sweep 1, `SUBA-067` and `SUBA-068` before it,
+> and `SUBA-069` in sweep 2.
+>
+> **`SUBA-069` closed only after its own premise was refuted**, and both errors are worth recording
+> because they were checkable in seconds with `git show`: (1) "pi's default is the same 5000 ms" —
+> pi's `DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS` is **30000** at both v0.43.0:113 and v0.47.1:114, and
+> cyrup's already matched it; (2) "these use the production DEFAULT … so unlike SUBA-068 they cannot
+> simply be re-budgeted" — all three fixtures passed `timeout_ms: Some(5_000)` explicitly at HEAD, so
+> they were always re-budgetable. The fix is real; the diagnosis was not.
+>
+> **`SUBA-048` closes PARITY-GAPS `PB-13` with it, as PB-13's own text instructs.** `project_chain_runs_dir`
+> had ZERO references crate-wide before sweep 2; `resolve_chain_runs_dir` now gives it a live caller
+> and upstream's `project` default takes effect on all three surfaces. Sweep 1 had already REWRITTEN
+> this item's Impact — its central claim was measurably wrong, since both run-artifact sites called
+> `temp_artifacts_dir(cwd)` directly, so the defect was the inverse of the one filed.
+>
+> **`SUBA-054` is handed back partial on a decision, not on effort.** The foreground SINGLE half is
+> complete and is the whole of the item's Verify. The async half needs a choice the sweep would not
+> guess — which of upstream's two cwds (`effectiveCwd` vs the chain dir) a runner step's reads resolve
+> against — and guessing would double-emit the instruction on every chain step. **The blocker is
+> written into `background/runner_main.rs` at the field rather than left as a silent `None`.** Its
+> Fix line is also corrected: upstream has NO top-level `reads` param, so `defaultReads` is the entire
+> SINGLE precedence chain and no new advertised param is owed.
+>
+> **`SUBA-028` was consciously declined and the reason is on the record**: threading a `CancelToken`
+> through `evaluate_acceptance` → `run_verify_commands_memoized` → `model::run_memoized_verify_command`
+> plus a field on `model::EvaluateAcceptanceInput` touches 40+ call sites, and three other crates
+> broke the shared build in sequence during the pass.
+>
+> **AN ADJACENT REPAIR, flagged for the integration phase:** cyrup-ext's `HostServices::set_widget`
+> changed signature mid-pass (`EXT-047`) from one opaque `&Value` to pi's three arguments, and its new
+> doc names THIS crate as the defect's victim — "the shipped subagents extension hand-rolled
+> `{"key": …, "content": null}` for it and the slot stayed occupied". All four call sites in
+> `extension.rs` were adapted, `SubagentFleetStatus::widget_lines` was added beside the retained
+> `widget_payload`, `FleetViewPlacement` maps onto `WidgetPlacement`, and the dispose/inspector-open
+> paths now issue a real REMOVAL (`lines: None`).
+>
+> **COVERAGE NOTE:** no item in `12-upstream-drift-pi-core.md` lands in this crate. `DRIFT-014` is the
+> only row that names cyrup-ext-subagents and its Fix explicitly says "Do not follow the original
+> filing's instruction to add these to `cyrup-ext-subagents/src/exec/fallback.rs`" — recorded here so
+> a future pass does not re-derive it.
+>
+> **`SUBA-030`'s persona half should carry a cross-area dependency marker** rather than reading as
+> in-crate work: `crates/cyrup/src/cli.rs` must accept a path form for `--system-prompt` first.
+
+
 ## Status table (every item from every prior pass)
 
 | ID | Status | Evidence |
@@ -145,56 +218,58 @@ Newly filed: **24**. Refuted and recorded: **1**.
 
 ## Open items
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 14 medium, 12 low = 26** (`SUBA-005` remains under `## Trackers` and is not counted). 22 rows are now marked CLOSED, including all five of the area's highs.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| SUBA-014 | **high** | not-ported | S | `requireReadTool` unported — a skill-carrying agent can be told to `read` a skill it has no `read` tool for |
-| SUBA-043 | **high** | not-ported | S | SINGLE-mode `outputSchema` is unadvertised and hardcoded `None` on both single paths |
+| ~~SUBA-014~~ | ~~**high**~~ **CLOSED 2026-08-14** | not-ported | S | `requireReadTool` unported — a skill-carrying agent can be told to `read` a skill it has no `read` tool for — **CLOSED 2026-08-14**: sweep 1 — the seam is now `exec::build_attempt_spawn_plan_with_read_requirement`; the 7-arg `build_attempt_spawn_plan` survives as pi's `requireReadTool: undefined` form so no external caller broke. |
+| ~~SUBA-043~~ | ~~**high**~~ **CLOSED 2026-08-14** | not-ported | S | SINGLE-mode `outputSchema` is unadvertised and hardcoded `None` on both single paths — **CLOSED 2026-08-14**: sweep 1 — the schema/dispatch guard the Verify asked for already existed (`every_advertised_schema_property_is_read_outside_provided_keys`) and now covers `outputSchema` and `toolBudget` automatically — narrows blind spot 6. |
 | SUBA-008 | medium | not-ported | M | `turnBudget` unported; the only consumers read a hard-coded `false` |
 | SUBA-016 | medium | not-ported | L | `scheduledRuns` unported (+ **nine** `schedule.*` verbs, not four) |
 | SUBA-021 | medium | not-ported | L | `capability-ceiling` / `usage-budget` / `spawn-budget` unported — all three are **in-baseline** |
 | SUBA-025 | medium | not-ported | S | `toolDescriptionMode`, the file override, and the mandatory safety-guidance appender unported |
-| SUBA-028 | medium | parity-bug | S | Acceptance verification cannot be aborted |
-| SUBA-030 | medium | parity-bug | S | Persona inline on argv; task spill written with the default umask under a doc asserting 0600 |
+| SUBA-028 | medium | parity-bug | S | Acceptance verification cannot be aborted — **2026-08-14, still open**: sweep 2 — deliberately declined, with the reason on the record: threading a `CancelToken` through `evaluate_acceptance` → `run_verify_commands_memoized` → `model::run_memoized_verify_command` plus a field on `model::EvaluateAcceptanceInput` touches 40+ call sites (positional args on two public fns and ~20 struct literals). With three other agents concurrently breaking the shared build during the pass, that volume of churn was not a responsible trade. |
+| SUBA-030 | medium — **PARTIALLY CLOSED 2026-08-14** | parity-bug | S | Persona inline on argv; task spill written with the default umask under a doc asserting 0600 — **PARTIALLY CLOSED 2026-08-14**: sweep 1 + 2 — the task-spill 0600 half is closed and the module's own `cleanup_temp_files` doc is now true. **RESIDUAL: the PERSONA half (E2BIG guard + a 0600 spill file for an over-threshold persona), whose HARD PREREQUISITE is outside area 09 — `crates/cyrup/src/cli.rs` must accept a path form for `--system-prompt` before an over-threshold persona can be spilled to a file instead of going inline on argv.** The item should carry a cross-area dependency marker rather than reading as in-crate work. |
 | SUBA-031 | medium | parity-bug | M | `wait` scopes runs by cwd, not by session, and says "in this session" |
-| SUBA-032 | medium | test-defect | S | Notice-debounce test asserts a wall-clock outcome with ~15 ms margin |
-| SUBA-044 | medium | upstream-drift | S | Bundled `reviewer` agent still grants `bash`/`edit`/`write`; upstream made the lane read-only |
+| ~~SUBA-032~~ | ~~medium~~ **CLOSED 2026-08-14** | test-defect | S | Notice-debounce test asserts a wall-clock outcome with ~15 ms margin — **CLOSED 2026-08-14**: sweep 1 — `tokio` gained a `test-util` dev-feature in this crate's Cargo.toml, so `start_paused`/`advance` are available to any other wall-clock-marginal test here. |
+| ~~SUBA-044~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | Bundled `reviewer` agent still grants `bash`/`edit`/`write`; upstream made the lane read-only — **CLOSED 2026-08-14**: sweep 1 — including the second correction (the delegate/worker strict-allowlist paragraph, in-baseline at v0.43.0). All six bundled agents now diff clean against v0.47.1 except researcher.md, whose divergence carries a `[CYRUP-DELTA]` header per SUBA-062. |
 | SUBA-045 | medium | not-ported | M | Child tool-availability diagnostic unported — a silently missing tool reports nothing |
 | SUBA-046 | medium | not-ported | M | `grant-spawn-budget` unported *and advertised*, so an exhausted cap is terminal for the session |
-| SUBA-047 | medium | not-ported | S | `toolBudget` honoured but never advertised |
-| SUBA-048 | medium | not-ported | S | `artifactDir` config key unported — `session` and `temp` are unreachable |
+| ~~SUBA-047~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | `toolBudget` honoured but never advertised — **CLOSED 2026-08-14**: sweep 1 — the top-level half; SUBA-007 becomes fully closed. Residual filed: the PER-ITEM `toolBudget` override on `tasks[]`/`chain[]` (schemas.ts:148, :178) is still unadvertised and unconsumed, deliberately, because a `SingleStepSpec`/`RunnerStep` field is needed first and advertising without a consumer is the defect class. |
+| ~~SUBA-048~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | `artifactDir` config key unported — `session` and `temp` are unreachable — **CLOSED 2026-08-14**: sweep 1 + 2 — sweep 1 REWROTE the Impact (its central claim was measurably wrong: both run-artifact sites called `artifacts::temp_artifacts_dir(cwd)` directly, so runs already landed in temp, NOT in `<cwd>/.cyrup-subagents` — the defect was the inverse, an unreachable `project` default). Sweep 2 closed it: new `artifacts::resolve_chain_runs_dir` (pi `getChainRunsDir`), and both run-artifact sites — `run_foreground_impl` and `spawn_background` — routed through `artifacts::resolve_artifacts_dir(session_file, Some(cwd), cwd, cfg.artifact_dir_preference())`. **Closes PARITY-GAPS PB-13 with it, as PB-13's own text instructs**: `project_chain_runs_dir` had ZERO references crate-wide before this. |
 | SUBA-049 | medium | not-ported | M | Steer ack, delivery `mode` and `steeringRecovery` unported — a steer is fire-and-forget |
-| SUBA-050 | medium | upstream-drift | S | `subagents.modelScope.strict` unported — inherited/fallback out-of-scope models can only warn |
-| SUBA-051 | medium | upstream-drift | S | Async **child** runs have no default wall-clock timeout; upstream bounds them at 30 minutes |
-| SUBA-052 | medium | upstream-drift | S | YAML literal block scalars (`\|`, `\|-`) parse to the literal string `"\|"` |
-| SUBA-053 | medium | upstream-drift | S | `~` never expanded in chain read/write paths |
-| SUBA-054 | medium | upstream-drift | M | `defaultReads` never reaches a single run — no `[Read from: …]` outside chains |
+| ~~SUBA-050~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | `subagents.modelScope.strict` unported — inherited/fallback out-of-scope models can only warn — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SUBA-051~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | Async **child** runs have no default wall-clock timeout; upstream bounds them at 30 minutes — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SUBA-052~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | YAML literal block scalars (`\|`, `\|-`) parse to the literal string `"\|"` — **CLOSED 2026-08-14**: sweep 1 — the parser half. The second sentence (route `parseSkillDescription` through the shared parser, as `a4fc59a` did) is NOT done and is cross-crate: skill descriptions come from `cyrup_resources::Skill.front.description`, not from this crate's parser. Filed against the resources area. |
+| ~~SUBA-053~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | `~` never expanded in chain read/write paths — **CLOSED 2026-08-14**: sweep 1. |
+| SUBA-054 | medium — **PARTIALLY CLOSED 2026-08-14** | upstream-drift | M | `defaultReads` never reaches a single run — no `[Read from: …]` outside chains — **PARTIALLY CLOSED 2026-08-14**: sweep 2 — the FOREGROUND SINGLE half is closed, which is the item's headline and its whole Verify recipe: `RunOptions::reads` (the declared, unfiltered list, pi's `reads` binding) populated from `agent.default_reads`, and `build_task_text` prepending `[Read from: …]\n\n` through two new shared helpers in `spawn/chain_graph.rs` (`resolve_existing_read_paths`, `build_single_reads_instruction`); `build_chain_instructions` was refactored onto the same helper so the two paths cannot drift. The separator difference is deliberate and both forms are upstream's. **FIX LINE CORRECTED: "add the `reads` param on the async path" — upstream has NO top-level `reads` param.** `extension/schemas.ts`'s `SubagentParamProperties` has no such key and the three `reads` entries at :144/:174/:204 are all per-ITEM, so `defaultReads` is the entire SINGLE precedence chain and no new advertised param is owed. **RESIDUAL, and the blocker is written into `background/runner_main.rs` at the field rather than silently defaulted: the ASYNC half needs a decision — a runner step already gets its read line from `build_chain_instructions` resolved against the CHAIN dir, while upstream's async single resolves against `effectiveCwd`, so setting `RunOptions::reads` there would double-emit.** The SUBA-044 interaction is moot — reviewer.md no longer carries `defaultReads`. |
 | SUBA-055 | medium | upstream-drift | M | The `guide` action and its packaged version-matched docs unported |
 | SUBA-056 | medium | upstream-drift | L | Durable completion replay and output archives unported |
 | SUBA-057 | medium | upstream-drift | M | `dismiss` unported — a recovered workflow with no live controller is stuck "running" forever |
-| SUBA-064 | medium | not-ported | M | The whole `authorityPolicy` subsystem is unported, and the `stop`/`steer` gate it drives is live-reachable |
+| ~~SUBA-064~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | The whole `authorityPolicy` subsystem is unported, and the `stop`/`steer` gate it drives is live-reachable — **CLOSED 2026-08-14**: sweep 1 — the subsystem + the stop/steer gate. Hard prerequisite carried verbatim into SUBA-005's unowned-verb list: whoever lands `worktree.discard` or `destructiveCleanup` must route it through `registration::authority::resolve_authority_decision` in the same change. `spawnBudgetGrant` is now pre-wired for SUBA-046 and `scheduleCreate` for SUBA-016, so both are cheaper than filed. |
 | SUBA-017 | low | not-ported | M | Completion batching unported (**in-baseline**, not drift) |
 | SUBA-022 | low | not-ported | L | Typed extension delegation API unported (**in-baseline**, not drift) |
-| SUBA-023 | low | upstream-drift | L | Async lifecycle hardening unported; no signal-name attribution |
+| SUBA-023 | low — **PARTIALLY CLOSED 2026-08-14** | upstream-drift | L | Async lifecycle hardening unported; no signal-name attribution — **PARTIALLY CLOSED 2026-08-14**: sweep 1 + 2 — the signal-name attribution half closed in sweep 1; sweep 2 closed the consumer half sweep 1 left open. `exec/mod.rs::process_signal_name` carried its OWN three-entry table (SIGINT/SIGKILL/SIGTERM) plus a `SIG{n}` fallback, so a child that segfaulted reported `SIG11` and one that aborted `SIG6` on `SingleResult.process_signal`, where pi passes Node's signal NAME through and reports SIGSEGV/SIGABRT. It now delegates to `spawn::signal::signal_name_of`, the single crate-wide mapping; the numeric form survives only as the fallback for a signal that table does not name. The dead `libc_signal` module is deleted. **RESIDUAL: the two unported upstream subsystems only — `process-terminal.ts` and `session-lease.ts` (= VL-S3 / VL-S4).** |
 | SUBA-024 | low | upstream-drift | L | `parallel-handoff` / `agent-contract` unported (`task-intent` closed; `chain-validation` struck) |
 | SUBA-026 | low | upstream-drift | L | Interactive admin UI, selector and `/subagents` unported (`/subagents-stop` landed) |
-| SUBA-029 | low | cyrup-original | S | Management actions read-modify-write subagents `settings.json` unlocked |
-| SUBA-033 | low | test-defect | S | Tests assert a lower bound on observed concurrency |
+| ~~SUBA-029~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | Management actions read-modify-write subagents `settings.json` unlocked — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SUBA-033~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | Tests assert a lower bound on observed concurrency — **CLOSED 2026-08-14**: sweep 1 — both lower bounds removed; overlap is enforced by a `tokio::sync::Barrier` rendezvous inside the worker with a bounded wait, so a serialization regression fails loudly instead of hanging. |
 | SUBA-034 | low | not-ported | M | `wait`'s event-bus wake unported; pure polling at a 1 s floor |
-| SUBA-035 | low | not-ported | S | Active `subagents.modelScope` policy not surfaced by doctor/models |
-| SUBA-037 | low | cyrup-original | S | Doctor's `--version` probe leaks the probe process on timeout |
-| SUBA-038 | low | parity-bug | S | Three denial/unknown-action messages still diverge from pi's text |
+| SUBA-035 | low — **PARTIALLY CLOSED 2026-08-14** | not-ported | S | Active `subagents.modelScope` policy not surfaced by doctor/models — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the doctor half is closed. **RESIDUAL: the same line in the models-report header (`registration/mod.rs` / `profiles.rs`), a separate surface.** |
+| ~~SUBA-037~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | Doctor's `--version` probe leaks the probe process on timeout — **CLOSED 2026-08-14**: sweep 1 — no test was added and the reason is recorded: `VERSION_PROBE_TIMEOUT` is not injectable and the flag's effect is a tokio guarantee. |
+| ~~SUBA-038~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Three denial/unknown-action messages still diverge from pi's text — **CLOSED 2026-08-14**: sweep 1 — residual 2 was closed by porting the v0.47.1 message (SUBA-065) rather than the v0.43.0 text, since the two items rewrite the same three strings and the richer form supersedes the bare one. |
 | SUBA-039 | low | cyrup-original | M | `SpawnedChild` has no `Drop` guard, so a dropped drive future orphans a group |
-| SUBA-058 | low | upstream-drift | S | Chain read instructions not filtered by existence |
-| SUBA-059 | low | upstream-drift | S | `artifactConfig.cleanupDays` never wired to the type that already parses it |
+| ~~SUBA-058~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | Chain read instructions not filtered by existence — **CLOSED 2026-08-14**: sweep 1 — citation drift recorded: the pinned expectation is at `spawn/chain_graph.rs` in `build_chain_instructions_emits_reads_output_prefix_and_previous_suffix`, not at the stated `:2522`. |
+| ~~SUBA-059~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | `artifactConfig.cleanupDays` never wired to the type that already parses it — **CLOSED 2026-08-14**: sweep 1 — one correction: the item says to add `artifact_config: Option<ArtifactConfig>`; upstream's type is `Pick<ArtifactConfig,"cleanupDays">`, so the new field is `Option<ArtifactRetentionConfig>` (one key). The full struct would advertise five per-run switches upstream does not read from config. |
 | SUBA-060 | low | upstream-drift | S | "Resume-first" guidance for failed async runs unported |
 | SUBA-061 | low | not-ported | M | Four config keys silently ignored: `asyncWidget`, `inlineToolDisplay`, `fleetKeybindings`, `legacyChainControls` |
-| SUBA-062 | low | cyrup-original | L | Bundled `researcher` cannot do web research — the crate's target has no web tools |
+| ~~SUBA-062~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | L | Bundled `researcher` cannot do web research — the crate's target has no web tools — **CLOSED 2026-08-14**: sweep 1 — the in-crate half (the `[CYRUP-DELTA]` header). The handoff to areas 04/12 for `web_search`/`fetch_content`/`get_search_content` stands. |
 | SUBA-063 | low | not-ported | M | Zero-tool-budget authorisation and the runtime-extension acknowledgement path unported |
-| SUBA-065 | low | upstream-drift | S | `unknownSubagentActionMessage` — did-you-mean recovery and its destructive-action gate — unported |
+| ~~SUBA-065~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | `unknownSubagentActionMessage` — did-you-mean recovery and its destructive-action gate — unported — **CLOSED 2026-08-14**: sweep 1 — `SUBAGENT_ACTIONS` is now a single const feeding BOTH the schema enum and the message, which is the structural half of SUBA-005's owed "completeness assertion": the enum can no longer drift from the advertised list, only from upstream's. |
 | SUBA-066 | low | upstream-drift | S | `/subagents-guide` slash command unported (outside both VL-S11 and SUBA-055) |
-| SUBA-067 | high | test-defect | S | Descendant-termination fixture exec-collapses to one pid; test never exercised group-kill (FIXED) |
-| SUBA-068 | high | test-defect | S | Setup-hook timeout fixture races macOS ~200 ms first-exec verification with a 200 ms budget (FIXED) |
-| SUBA-069 | high | test-defect | M | Setup-hook test family is wall-clock-budgeted; 3 siblings go red under machine load (OPEN) |
+| ~~SUBA-067~~ | ~~high~~ **CLOSED 2026-08-14** | test-defect | S | Descendant-termination fixture exec-collapses to one pid; test never exercised group-kill (FIXED) — **CLOSED 2026-08-14**: closed pre-sweep — the descendant-termination fixture exec-collapsed to one pid, so the test never exercised group-kill. Found by RUNNING the suite. |
+| ~~SUBA-068~~ | ~~high~~ **CLOSED 2026-08-14** | test-defect | S | Setup-hook timeout fixture races macOS ~200 ms first-exec verification with a 200 ms budget (FIXED) — **CLOSED 2026-08-14**: closed pre-sweep — the setup-hook timeout fixture raced macOS's ~200 ms first-exec verification with a 200 ms budget. Found by RUNNING the suite. |
+| ~~SUBA-069~~ | ~~high~~ **CLOSED 2026-08-14** | test-defect | M | Setup-hook test family is wall-clock-budgeted; 3 siblings go red under machine load (OPEN) — **CLOSED 2026-08-14**: sweep 2 — **and TWO FACTUAL ERRORS IN THE ITEM ARE CORRECTED FIRST.** (1) "pi's default is the same 5000 ms" is wrong: pi's constant is **30000** at both v0.43.0:113 and v0.47.1:114 (`DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`), and cyrup's already matched it. (2) "These use the production DEFAULT 5000 ms hook timeout rather than a fixture constant, so unlike SUBA-068 they cannot simply be re-budgeted" is wrong: all three fixtures passed `timeout_ms: Some(5_000)` explicitly at HEAD, so they were always re-budgetable. Fix landed options (a)+(b) together: `write_hook_script` emits a `[ -n "$CYRUP_HOOK_WARMUP" ] && exit 0` guard as line 2 and a new `warm_hook_exec` helper pays macOS's one-off first-`exec` verification (measured 197-242 ms) OUTSIDE any timeout budget, and the four non-timeout fixtures now use the SHIPPED 30 s default. The production constant is untouched. **The Verify (green under deliberate load ≥8, 3×) was NOT executed — the warm-up mechanism is unit-pinned, the flake reduction is not measured.** |
 
 **45 items — 0 critical, 2 high, 23 medium, 20 low.** Per structural defect A in
 `00-residual-ledger.md`, treat the count as a floor.

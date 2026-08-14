@@ -382,12 +382,21 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         || is_cloudflare_ai_gateway
         || is_ant_ling;
 
+    // pi `useMaxTokens` — `openai-completions.ts:1427-1435` @**v0.83.0**, byte-identical at
+    // v0.84.1 apart from the line offset (`:1478-1485`).
+    //
+    // DRIFT-013: the trailing `|| isZai` was dropped in the port, so every Z.AI request carried
+    // `max_completion_tokens`, which Z.AI ignores — an effectively uncapped completion. The item
+    // classified this `upstream-drift`; it is **not-ported**. `git show
+    // v0.83.0:packages/ai/src/api/openai-completions.ts` has `isZai` at `:1435`, inside the
+    // ported baseline, so a rebase would never have swept it up.
     let use_max_tokens = base_url.contains("chutes.ai")
         || is_moonshot
         || is_cloudflare_ai_gateway
         || is_together
         || is_nvidia
-        || is_ant_ling;
+        || is_ant_ling
+        || is_zai;
 
     let is_grok = provider == "xai" || base_url.contains("api.x.ai");
     let is_deepseek = provider == "deepseek" || base_url.contains("deepseek.com");
@@ -578,6 +587,34 @@ mod tests {
         assert_eq!(c.thinking_format, ThinkingFormat::Together);
         assert!(!c.supports_strict_mode);
         assert!(!c.supports_long_cache_retention);
+    }
+
+    /// DRIFT-013. pi's `useMaxTokens` disjunction ends `|| isZai`
+    /// (`openai-completions.ts:1427-1435` @v0.83.0). Without it every Z.AI request carried
+    /// `max_completion_tokens`, which Z.AI ignores, so the cap silently did nothing.
+    ///
+    /// All four `isZai` inputs are asserted (`:1400-1404`): both provider ids and both base-URL
+    /// hosts, because the two self-hosted-gateway cases are exactly the ones a provider-id check
+    /// would miss.
+    #[test]
+    fn drift013_zai_uses_max_tokens_through_every_detection_route() {
+        for (provider, base_url) in [
+            ("zai", "https://api.z.ai/api/paas/v4"),
+            ("zai-coding-cn", "https://open.bigmodel.cn/api/paas/v4"),
+            ("custom", "https://api.z.ai/api/paas/v4"),
+            ("custom", "https://open.bigmodel.cn/api/paas/v4"),
+        ] {
+            let c = detect_compat(&base_model(provider, base_url, "glm-4.6"));
+            assert_eq!(
+                c.max_tokens_field,
+                MaxTokensField::MaxTokens,
+                "{provider} @ {base_url} must send max_tokens"
+            );
+        }
+
+        // The negative half: a plain OpenAI model is untouched by the new term.
+        let c = detect_compat(&base_model("openai", "https://api.openai.com/v1", "gpt-5"));
+        assert_eq!(c.max_tokens_field, MaxTokensField::MaxCompletionTokens);
     }
 
     #[test]

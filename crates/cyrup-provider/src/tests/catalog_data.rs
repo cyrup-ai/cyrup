@@ -203,12 +203,13 @@ fn the_catalog_file_set_matches_the_registered_providers() {
 /// registry can actually construct, otherwise the model resolves, lists in `/model`, and then dies
 /// at `wire.rs` with `no API implementation for <api>`.
 ///
-/// `google-vertex` is the ONE known dangling api and is carved out below with its item id. **Delete
-/// the carve-out in the same change that registers `api/google_vertex.rs`** — a fresh dangling api
-/// on any other provider fails here immediately, which is what let PROV-030 ship unnoticed.
+/// **There is no carve-out, and there must never be one again.** `google-vertex` was the single
+/// dangling api this guard was written around; `api/google_vertex.rs` closed it (PROV-030) and the
+/// `KNOWN_DANGLING` exemption list was deleted in the same change, as the guard's own instructions
+/// required. A fresh dangling api on any provider now fails here immediately — which is exactly what
+/// would have stopped PROV-030 shipping.
 #[test]
 fn every_catalog_row_names_a_registered_api() {
-    const KNOWN_DANGLING: &[&str] = &["google-vertex"]; // PROV-030
     let registry = crate::api::builtin_registry();
     for (name, blob) in catalogs() {
         if IMAGES_CATALOGS.contains(&name.as_str()) {
@@ -216,9 +217,6 @@ fn every_catalog_row_names_a_registered_api() {
         }
         let models: Vec<Model> = serde_json::from_str(&blob).unwrap_or_default();
         for m in &models {
-            if KNOWN_DANGLING.contains(&m.api.as_str()) {
-                continue;
-            }
             assert!(
                 registry.contains(&m.api),
                 "{name}: {} names api `{}`, which register_builtins() does not provide — \

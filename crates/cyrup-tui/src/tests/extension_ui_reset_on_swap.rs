@@ -25,10 +25,18 @@ async fn a_session_swap_clears_extension_owned_surfaces() {
     app.apply_ui_effect(UiEffect::SetHeader { content: "ext header".to_string() });
     app.apply_ui_effect(UiEffect::SetFooter { content: "ext footer".to_string() });
     app.apply_ui_effect(UiEffect::SetWidget {
-        widget: serde_json::json!({"key": "k", "content": "widget"}),
+        widget: serde_json::json!({"key": "k", "lines": ["widget"], "placement": "aboveEditor"}),
     });
     app.apply_ui_effect(UiEffect::SetStatus { key: "ext".to_string(), text: Some("busy".to_string()) });
     app.set_extension_shortcuts(["ctrl+g".to_string()]);
+
+    // Non-vacuity: every surface must actually be OCCUPIED before the swap, or the assertions below
+    // pass on a payload the app silently dropped.
+    assert_eq!(app.state().extension_widgets.len(), 1, "the widget mounted before the swap");
+    assert!(app.state().extension_header.is_some(), "the header mounted before the swap");
+    assert!(app.state().extension_footer.is_some(), "the footer mounted before the swap");
+    assert!(!app.state().status.extension_statuses.is_empty(), "a status row exists pre-swap");
+    assert!(!app.state().extension_shortcuts.is_empty(), "a shortcut exists pre-swap");
 
     app.rebind_session();
 
