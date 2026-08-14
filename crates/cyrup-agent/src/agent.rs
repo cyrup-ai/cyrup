@@ -811,6 +811,11 @@ impl RunCtx {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 parameters: t.parameters().clone(),
+                // PROV-011: pi's `constrainedSampling` is a per-tool OPT-IN declared on the tool
+                // definition (`types.ts:484` @v0.83.0); `undefined` and `false` behave identically.
+                // `cyrup_core::Tool` exposes no such accessor, so an agent-loop tool never opts in
+                // — the field is absent, exactly as it is for a pi tool that does not declare it.
+                constrained_sampling: None,
             })
             .collect();
 

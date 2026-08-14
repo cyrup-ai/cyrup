@@ -413,6 +413,7 @@ mod tests {
             name: "late".into(),
             description: "a tool introduced mid-conversation".into(),
             parameters: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
+            constrained_sampling: None,
         };
         let tool_result = |added: Vec<String>| Message::ToolResult {
             tool_call_id: ToolCallId::from("tc1"),

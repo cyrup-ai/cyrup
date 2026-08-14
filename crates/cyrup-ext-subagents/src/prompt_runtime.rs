@@ -1034,16 +1034,40 @@ pub struct SubagentPromptRuntime {
     /// block turned it on. Owns its own [`crate::watchdog::runtime::MainWatchdogRuntime`], distinct
     /// from the orchestrator's ([`crate::extension::SubagentsExtension::watchdog`]).
     watchdog: Option<Arc<crate::watchdog::register_child::ChildWatchdog>>,
-    /// The late-bound capability backend the child watchdog's warning sink reads. `set_host_services`
-    /// runs before `init`, but the watchdog is built before BOTH (it has to be, to decide the
-    /// subscription set), so the sink resolves through this slot at delivery time. Shared with the
-    /// closure handed to [`crate::watchdog::register_child::register_child_watchdog`].
-    watchdog_services: Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
+    /// The late-bound capability backend (`NativeExtension::set_host_services`), shared by the two
+    /// halves of this runtime that need one at DELIVERY time rather than construction time: the
+    /// child watchdog's warning sink, and SUBA-045's tool-availability diagnostic (which needs
+    /// `all_tool_names()` — pi's `pi.getAllTools()` — at `agent_start`).
+    ///
+    /// `set_host_services` runs before `init`, but both consumers are built before BOTH (they have
+    /// to be, to decide the subscription set), so each resolves through this slot when it fires.
+    /// Shared with the closure handed to
+    /// [`crate::watchdog::register_child::register_child_watchdog`].
+    services: Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
     /// pi `registerPermissionGate(pi)` (`subagent-prompt-runtime.ts:281-305,475`). `Some` only when
     /// the parent shipped a policy in
     /// [`crate::watchdog::permission_arbiter::PERMISSION_POLICY_ENV`] — upstream returns early on a
     /// missing policy (`:286`) and subscribes nothing.
     permission_gate: Option<PermissionGate>,
+    /// SUBA-045 — pi's `refreshChildToolDiagnostic` inputs (`subagent-prompt-runtime.ts:98-103`).
+    /// `Some` only when the parent wrote BOTH the diagnostic path and the required-tools list, which
+    /// is the same gate upstream applies (`if (!filePath || !required) return undefined;`).
+    tool_diagnostic: Option<ChildToolDiagnosticPlan>,
+}
+
+/// SUBA-045 — the child-side half of pi's `refreshChildToolDiagnostic`
+/// (`subagent-prompt-runtime.ts:98-103`), resolved once from the environment at construction so the
+/// `agent_start` handler is a registry read plus a diff.
+#[derive(Clone, Debug)]
+struct ChildToolDiagnosticPlan {
+    /// `process.env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV]`.
+    path: PathBuf,
+    /// `readRequiredChildTools()`.
+    required: Vec<String>,
+    /// `process.env[SUBAGENT_CHILD_AGENT_ENV]`, when the parent named the agent.
+    agent: Option<String>,
+    /// `readMcpDirectChildTools()`.
+    mcp_direct_tools: Option<Vec<String>>,
 }
 
 /// pi `registerPermissionGate`'s closure state (`subagent-prompt-runtime.ts:281-305`): the decoded
@@ -1157,8 +1181,9 @@ impl SubagentPromptRuntime {
             tool_budget: None,
             steering: None,
             watchdog: None,
-            watchdog_services: Arc::new(std::sync::Mutex::new(None)),
+            services: Arc::new(std::sync::Mutex::new(None)),
             permission_gate: None,
+            tool_diagnostic: None,
         }
     }
 
@@ -1180,8 +1205,9 @@ impl SubagentPromptRuntime {
             tool_budget: None,
             steering: None,
             watchdog: None,
-            watchdog_services: Arc::new(std::sync::Mutex::new(None)),
+            services: Arc::new(std::sync::Mutex::new(None)),
             permission_gate: None,
+            tool_diagnostic: None,
         }
     }
 
@@ -1233,8 +1259,64 @@ impl SubagentPromptRuntime {
         services: Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
     ) -> Self {
         self.watchdog = watchdog;
-        self.watchdog_services = services;
+        self.services = services;
         self
+    }
+
+    /// SUBA-045 — arm the tool-availability diagnostic from the parent's two env vars (pi
+    /// `refreshChildToolDiagnostic`'s `filePath`/`required` pair, `subagent-prompt-runtime.ts:99-101`).
+    ///
+    /// Both must be present, which is upstream's `if (!filePath || !required) return undefined;`:
+    /// the parent writes them together (`pi-args.ts:610-616`) or not at all, so one without the
+    /// other is not a configuration to interpret.
+    #[must_use]
+    pub fn with_tool_diagnostic(mut self, get: &dyn Fn(&str) -> Option<String>) -> Self {
+        use crate::exec::tool_availability as ta;
+        let path = get(ta::CHILD_TOOL_DIAGNOSTIC_PATH_ENV)
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty());
+        let required = crate::native_supervisor::read_required_child_tools(get);
+        if let (Some(path), Some(required)) = (path, required) {
+            self.tool_diagnostic = Some(ChildToolDiagnosticPlan {
+                path: PathBuf::from(path),
+                required,
+                agent: get(crate::spawn::intercom_target::ENV_CHILD_AGENT)
+                    .map(|raw| raw.trim().to_string())
+                    .filter(|raw| !raw.is_empty()),
+                mcp_direct_tools: ta::read_mcp_direct_child_tools(get),
+            });
+        }
+        self
+    }
+
+    /// SUBA-045 — pi `refreshChildToolDiagnostic(pi)` (`subagent-prompt-runtime.ts:98-103`), fired
+    /// from `agent_start` (`:514-516`).
+    ///
+    /// The available list is `pi.getAllTools().map((tool) => tool.name)`, which is
+    /// [`cyrup_ext::host::HostServices::all_tool_names`]. A backend that cannot answer is treated as
+    /// "no snapshot", and the refresh is SKIPPED rather than run against an empty registry — an
+    /// empty answer would report every required tool as missing, which is the loudest possible way
+    /// to be wrong. (Upstream cannot reach this state: `pi.getAllTools()` is synchronous and always
+    /// present.)
+    fn refresh_tool_diagnostic(&self) {
+        let Some(plan) = &self.tool_diagnostic else {
+            return;
+        };
+        let services = self
+            .services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(available) = services.and_then(|s| s.all_tool_names()) else {
+            return;
+        };
+        crate::exec::tool_availability::write_child_tool_diagnostic(
+            &plan.path,
+            &plan.required,
+            &available,
+            plan.agent.as_deref(),
+            plan.mcp_direct_tools.as_deref(),
+        );
     }
 
     /// The child watchdog this runtime drives, if any — exposed so a test can drive the real
@@ -1300,6 +1382,11 @@ impl SubagentPromptRuntime {
             && self.steering.is_none()
             && self.watchdog.is_none()
             && self.permission_gate.is_none()
+            // SUBA-045: a child armed with ONLY the tool-availability diagnostic is not inert — it
+            // has a real `agent_start` job. Upstream never faces the question (it loads the runtime
+            // into every child unconditionally); cyrup's `is_inert` gate is the cyrup-side stand-in
+            // for that, so every half that does work has to be named here.
+            && self.tool_diagnostic.is_none()
     }
 
     /// Attach the parent-supplied tool budget (pi `registerToolBudget`,
@@ -1407,6 +1494,13 @@ impl NativeExtension for SubagentPromptRuntime {
                 EventKind::SessionShutdown,
             ]);
         }
+        // SUBA-045 / pi `onRuntimeEvent("agent_start", () => { refreshChildToolDiagnostic(pi); })`
+        // (`subagent-prompt-runtime.ts:514-516`). Subscribed only when the parent armed the
+        // diagnostic, so an agent with no explicit `tools:` allowlist declares no listener at all
+        // and `Dispatcher::no_subscribers` short-circuits the event.
+        if self.tool_diagnostic.is_some() {
+            kinds.push(EventKind::AgentStart);
+        }
         api.subscribe(&kinds);
         Ok(())
     }
@@ -1422,7 +1516,7 @@ impl NativeExtension for SubagentPromptRuntime {
         // The child watchdog's warning sink resolves through this slot — without it a displayed
         // child warning has nowhere to go (pi's sink is `pi.sendMessage`, always available).
         *self
-            .watchdog_services
+            .services
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(services);
     }
@@ -1444,6 +1538,12 @@ impl NativeExtension for SubagentPromptRuntime {
                 | HostEvent::TurnEnd { .. } => steering.activate().await,
                 _ => {}
             }
+        }
+        // SUBA-045 / pi `onRuntimeEvent("agent_start", …)` (`subagent-prompt-runtime.ts:514-516`).
+        // Same rule as the two blocks around it: a pure side effect that falls through, never a
+        // `HookOutcome`.
+        if matches!(ev, HostEvent::AgentStart) {
+            self.refresh_tool_diagnostic();
         }
         // pi `registerChildWatchdog`'s handlers (`watchdog/register-child.ts:89-115`). Like the
         // steering block above they run FIRST and always fall through: the watchdog observes, it
@@ -1703,10 +1803,10 @@ pub fn prompt_runtime_from_env(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let raw_watchdog_config =
         non_empty(crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV);
-    let watchdog_services: Arc<
+    let services: Arc<
         std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>,
     > = Arc::new(std::sync::Mutex::new(None));
-    let sink_services = Arc::clone(&watchdog_services);
+    let sink_services = Arc::clone(&services);
     // `review: createMainWatchdogReview(() => currentContext, { getThinkingLevel: () =>
     // pi.getThinkingLevel() })` (`register-child.ts:77`). Passing `None` here left the child on
     // `InertWatchdogReview` — a runtime that resolves no model, calls nothing and reports every
@@ -1714,7 +1814,7 @@ pub fn prompt_runtime_from_env(
     // the child is actually armed, since constructing it opens the process's `auth.json`.
     let child_review = raw_watchdog_config
         .as_ref()
-        .map(|_| child_watchdog_review(&cwd, &watchdog_services));
+        .map(|_| child_watchdog_review(&cwd, &services));
     let watchdog = crate::watchdog::register_child::register_child_watchdog(
         raw_watchdog_config.as_deref(),
         &cwd,
@@ -1750,7 +1850,10 @@ pub fn prompt_runtime_from_env(
             // the fail-closed one: an `ask` denies as `malformed` rather than approving silently.
             Arc::new(crate::watchdog::permission_arbiter::NoDecisionPermissionAgent),
         )
-        .with_watchdog(watchdog, watchdog_services);
+        .with_watchdog(watchdog, services)
+        // SUBA-045 / pi `refreshChildToolDiagnostic` (`subagent-prompt-runtime.ts:98-103`), armed
+        // from the pair of env vars the parent writes at `pi-args.ts:610-616`.
+        .with_tool_diagnostic(get);
 
     if runtime.is_inert() {
         return None;
@@ -2102,6 +2205,126 @@ mod tests {
 
     fn tool(schema: serde_json::Value, path: PathBuf) -> StructuredOutputTool {
         StructuredOutputTool::new(schema, path)
+    }
+
+    /// SUBA-045 — a [`cyrup_ext::host::HostServices`] double that answers only `all_tool_names`,
+    /// which is pi's `pi.getAllTools()`. Every other capability keeps the trait's default.
+    struct RegistryHost(Option<Vec<String>>);
+    impl cyrup_ext::host::HostServices for RegistryHost {
+        fn all_tool_names(&self) -> Option<Vec<String>> {
+            self.0.clone()
+        }
+    }
+
+    /// SUBA-045 — the whole child-side hop: the parent's two env vars arm the diagnostic, an
+    /// `agent_start` diffs the required list against the LIVE registry, and the file is written
+    /// only when something is genuinely absent.
+    ///
+    /// The three legs are ordered so none can pass vacuously: the missing leg proves the file
+    /// appears, the present leg then proves the SAME path is cleaned up (the stale-file case), and
+    /// the un-armed leg proves the whole thing stays off without the env pair.
+    #[tokio::test]
+    async fn agent_start_writes_the_tool_diagnostic_only_for_a_genuinely_missing_tool() {
+        use crate::exec::tool_availability as ta;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ta::tool_diagnostic_path_in(dir.path());
+        let path_string = path.display().to_string();
+
+        let env = |armed: bool| {
+            let path_string = path_string.clone();
+            move |key: &str| -> Option<String> {
+                match key {
+                    k if k == ta::CHILD_TOOL_DIAGNOSTIC_PATH_ENV && armed => {
+                        Some(path_string.clone())
+                    }
+                    k if k == crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS => {
+                        Some(r#"["read","mcp__srv__gone"]"#.to_string())
+                    }
+                    k if k == crate::spawn::intercom_target::ENV_CHILD_AGENT => {
+                        Some("researcher".to_string())
+                    }
+                    k if k == ta::MCP_DIRECT_CHILD_TOOLS_ENV => {
+                        Some(r#"["mcp__srv__gone"]"#.to_string())
+                    }
+                    _ => None,
+                }
+            }
+        };
+
+        async fn fire(
+            env: &dyn Fn(&str) -> Option<String>,
+            registry: Option<Vec<String>>,
+        ) {
+            let runtime =
+                SubagentPromptRuntime::from_parts(None, None, false).with_tool_diagnostic(env);
+            runtime.set_host_services(Arc::new(RegistryHost(registry)));
+            runtime
+                .on_event(
+                    &HostEvent::AgentStart,
+                    &HostCtx::event(cyrup_ext::native::ExtMode::Json, false, PathBuf::from(".")),
+                )
+                .await;
+        }
+
+        // (1) The MCP tool the host never registered: the file lands, names it, and says so.
+        fire(&env(true), Some(vec!["read".to_string()])).await;
+        let reported = ta::read_child_tool_diagnostic_error(Some(&path))
+            .expect("a missing tool must produce a reportable diagnostic");
+        assert!(
+            reported.starts_with("Agent 'researcher' requested unavailable child tools: mcp__srv__gone."),
+            "{reported}"
+        );
+        assert!(
+            reported.contains("host/pi-mcp-adapter registration problem"),
+            "the MCP-direct half must be attributed, not folded into the generic line: {reported}"
+        );
+
+        // (2) Same path, everything present now — upstream's `rmSync(..., { force: true })`.
+        fire(
+            &env(true),
+            Some(vec!["read".to_string(), "mcp__srv__gone".to_string()]),
+        )
+        .await;
+        assert!(
+            !path.exists(),
+            "a healthy child must leave NO diagnostic behind, or the next attempt inherits it"
+        );
+
+        // (3) Un-armed (the parent wrote no diagnostic path): nothing is written at all, even
+        //     though the required list and an empty-ish registry would otherwise report `read` and
+        //     `mcp__srv__gone` as missing.
+        fire(&env(false), Some(Vec::new())).await;
+        assert!(!path.exists(), "the handshake must stay off without its path env");
+    }
+
+    /// SUBA-045 — a backend that cannot answer `all_tool_names` (no live session bound) is "no
+    /// snapshot", not "no tools". Writing a diagnostic here would report EVERY required tool as
+    /// missing, which is the loudest possible way to be wrong.
+    #[tokio::test]
+    async fn an_unanswerable_registry_writes_no_diagnostic_at_all() {
+        use crate::exec::tool_availability as ta;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ta::tool_diagnostic_path_in(dir.path());
+        let path_string = path.display().to_string();
+        let env = move |key: &str| -> Option<String> {
+            if key == ta::CHILD_TOOL_DIAGNOSTIC_PATH_ENV {
+                Some(path_string.clone())
+            } else if key == crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS {
+                Some(r#"["read"]"#.to_string())
+            } else {
+                None
+            }
+        };
+        let runtime =
+            SubagentPromptRuntime::from_parts(None, None, false).with_tool_diagnostic(&env);
+        runtime.set_host_services(Arc::new(RegistryHost(None)));
+        runtime
+            .on_event(
+                &HostEvent::AgentStart,
+                &HostCtx::event(cyrup_ext::native::ExtMode::Json, false, PathBuf::from(".")),
+            )
+            .await;
+        assert!(!path.exists());
     }
 
     /// pi nests the caller's schema under `value` rather than exposing it at the top level

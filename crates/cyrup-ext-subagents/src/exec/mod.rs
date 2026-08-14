@@ -93,6 +93,12 @@ pub mod tool_call_summary;
 /// `runs/shared/tool-budget.ts`. Enforcement lives child-side in [`crate::prompt_runtime`].
 pub mod tool_budget;
 
+/// SUBA-045 — the child tool-availability diagnostic (`CYRUP_SUBAGENT_TOOL_DIAGNOSTIC_PATH`), a
+/// port of pi-subagents' `runs/shared/tool-availability.ts`. The child writes it from its live
+/// registry; this module's `run_attempt` reads it back so a tool that was never registered becomes
+/// the run's error instead of a model apology.
+pub mod tool_availability;
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -1202,6 +1208,14 @@ pub struct ProgressSnapshotInput<'a> {
 pub struct AttemptSpawnPlan {
     /// The fully-assembled child spawn description: binary, argv, task arg, env overlay, cwd.
     pub spec: ChildSpawnSpec,
+    /// SUBA-045 — where this attempt told the child to write its tool-availability diagnostic
+    /// (pi's `toolDiagnosticPath`, `pi-args.ts:610-616`), so the parent can read it back at settle.
+    ///
+    /// `None` whenever the env var was not written, which is upstream's own gate: an agent with no
+    /// explicit `tools:` allowlist requires nothing, so there is nothing to be missing. Returned
+    /// alongside the spec rather than re-derived from the overlay so the read side cannot drift
+    /// from the write side.
+    pub tool_diagnostic_path: Option<PathBuf>,
 }
 
 /// The reasoning-level suffixes [`apply_thinking_suffix`] recognizes on a model id (pi-subagents
@@ -1460,6 +1474,9 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     // declared out here because the value has to survive into the env overlay, which is built
     // further down.
     let mut required_child_tools: Option<Vec<String>> = None;
+    // SUBA-045 — pi's `toolPlan.effectiveMcpTools`: the RESOLVED direct-MCP tool names (not the
+    // `mcp:` selectors). Empty unless the agent declared `mcp:` entries.
+    let mut effective_mcp_tools: Vec<String> = Vec::new();
     let mut builtin_tools: Vec<String> = Vec::new();
     let mut tool_extension_paths: Vec<String> = Vec::new();
     let mut mcp_direct_tools: Vec<String> = Vec::new();
@@ -1548,10 +1565,14 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         }
 
         if !mcp_direct_tools.is_empty() {
-            allowlist.extend(mcp_direct_tools::resolve_mcp_direct_tool_names(
-                &mcp_direct_tools,
-                &opts.cwd,
-            ));
+            // SUBA-045: kept as its own binding because it is pi's `toolPlan.effectiveMcpTools`,
+            // which has a SECOND consumer besides the `--tools` CSV — `MCP_DIRECT_CHILD_TOOLS_ENV`
+            // (`pi-args.ts:618-621`), which is what lets the child's diagnostic distinguish a
+            // missing MCP tool ("a host/pi-mcp-adapter registration problem") from a missing
+            // extension tool.
+            effective_mcp_tools =
+                mcp_direct_tools::resolve_mcp_direct_tool_names(&mcp_direct_tools, &opts.cwd);
+            allowlist.extend(effective_mcp_tools.iter().cloned());
         }
         if allowlist.is_empty() {
             args.push("--no-tools".to_string());
@@ -1947,12 +1968,46 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         );
     }
 
+    // SUBA-045 (pi `pi-args.ts:610-621`): the diagnostic path and the resolved direct-MCP names go
+    // out BESIDE the required-tools list and under upstream's own gate — `if
+    // (toolPlan.requiredChildTools.length > 0)`. An agent with no explicit `tools:` requires
+    // nothing, so nothing can be missing and neither var is written.
+    let mut tool_diagnostic_path: Option<PathBuf> = None;
     if let Some(tools) = required_child_tools {
         env_overlay.insert(
             crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS.to_string(),
-            serde_json::Value::Array(tools.into_iter().map(serde_json::Value::String).collect())
-                .to_string(),
+            serde_json::Value::Array(
+                tools
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            )
+            .to_string(),
         );
+        let diagnostic_path = crate::exec::tool_availability::tool_diagnostic_path_in(temp_dir);
+        env_overlay.insert(
+            crate::exec::tool_availability::CHILD_TOOL_DIAGNOSTIC_PATH_ENV.to_string(),
+            diagnostic_path.display().to_string(),
+        );
+        tool_diagnostic_path = Some(diagnostic_path);
+        // pi writes this one UNCONDITIONALLY at `:618-621` — but as `env[...] = undefined` when the
+        // list is empty, which in Node deletes rather than sets the key. An absent key is what an
+        // empty list means, so cyrup writes it only when non-empty, inside the same gate: without a
+        // required list there is no diagnostic to enrich.
+        if !effective_mcp_tools.is_empty() {
+            env_overlay.insert(
+                crate::exec::tool_availability::MCP_DIRECT_CHILD_TOOLS_ENV.to_string(),
+                serde_json::Value::Array(
+                    effective_mcp_tools
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                )
+                .to_string(),
+            );
+        }
     }
 
     // G90 (pi `runs/shared/pi-args.ts:251-252` @v0.34.0: `if (input.steerInboxDir) env[SUBAGENT_STEER_INBOX_ENV]
@@ -1986,6 +2041,7 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
             cwd,
             temp_files: temp_file.into_iter().collect(),
         },
+        tool_diagnostic_path,
     })
 }
 
@@ -2230,6 +2286,21 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             .join(format!("attempt-{}.jsonl", self.attempt_index));
         self.attempt_index += 1;
 
+        // SUBA-045: taken off the plan BEFORE `plan.spec` is moved into the spawn, and read back in
+        // the close-handler chain below (pi's `toolDiagnosticPath` local, `execution.ts:1072`).
+        //
+        // [CYRUP-DELTA] pi mkdtemps a FRESH dir per attempt (`pi-args.ts:603-604`), so its
+        // diagnostic path is unique per attempt by construction. cyrup's attempts share one
+        // `scratch_dir`, so the file is cleared HERE, immediately before the spawn, to restore the
+        // same guarantee: a child that dies before `agent_start` — the one case where it never gets
+        // to write or delete the file itself — must not inherit the previous model attempt's
+        // verdict. Without this, the model-fallback ladder could attribute attempt N's missing
+        // tools to attempt N+1's startup crash.
+        let tool_diagnostic_path = plan.tool_diagnostic_path;
+        if let Some(path) = tool_diagnostic_path.as_deref() {
+            let _ = std::fs::remove_file(path);
+        }
+
         let mut child = match SpawnedChild::spawn(plan.spec, &jsonl_path).await {
             Ok(child) => child,
             Err(err) => {
@@ -2336,6 +2407,18 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             .map(crate::exec::child_protocol::format_protocol_output_limit);
         if error.is_none() {
             error = spawn_error;
+        }
+        // (a.1) SUBA-045 — the child tool-availability diagnostic, in pi's exact rank: `closeError =
+        //     result.error ?? toolDiagnosticError ?? assistantError` (`execution.ts:1079`). It sits
+        //     ABOVE the trailing assistant error deliberately, and that ordering is the whole point
+        //     of the item: a child told to use a tool its host never registered produces a
+        //     perfectly ordinary model apology, and the apology would otherwise become the run's
+        //     error and hide the cause. The file exists only when something was actually missing
+        //     (the child DELETES it otherwise), so this is silent on every healthy run.
+        if error.is_none() {
+            error = crate::exec::tool_availability::read_child_tool_diagnostic_error(
+                tool_diagnostic_path.as_deref(),
+            );
         }
         if error.is_none() {
             error = trailing_assistant_error(&progress.all_events);
@@ -4861,6 +4944,85 @@ mod tests {
                 .env_overlay
                 .get(crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS)
                 .is_some_and(|v| v.contains("read")),
+            "env was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// SUBA-045 — the diagnostic handshake is armed under pi's own gate (`if
+    /// (toolPlan.requiredChildTools.length > 0)`, `pi-args.ts:611`) and nowhere else.
+    ///
+    /// Both halves are asserted against the SAME builder call shape, so the "not armed" leg cannot
+    /// pass merely because the plan failed to build.
+    #[test]
+    fn the_tool_diagnostic_handshake_is_armed_with_the_required_tools_list() {
+        use crate::exec::tool_availability as ta;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let opts = base_opts(dir.path(), &["m1"]);
+
+        // Armed: an explicit allowlist means the child has something it can be missing.
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.tools = Some(vec![ToolRef::Builtin("read".to_string())]);
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let path = plan
+            .tool_diagnostic_path
+            .clone()
+            .expect("an explicit allowlist must arm the diagnostic path");
+        assert_eq!(
+            path,
+            ta::tool_diagnostic_path_in(dir.path()),
+            "the diagnostic lives in the attempt's own temp dir (pi `path.join(tempDir, …)`)"
+        );
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(ta::CHILD_TOOL_DIAGNOSTIC_PATH_ENV)
+                .map(String::as_str),
+            Some(path.display().to_string().as_str()),
+            "the plan's path and the child's env must be the SAME value, or the read side drifts \
+             from the write side; env was {:?}",
+            plan.spec.env_overlay
+        );
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(ta::MCP_DIRECT_CHILD_TOOLS_ENV),
+            "an agent with no `mcp:` entries resolves no direct-MCP names, so the key is ABSENT \
+             rather than an empty array"
+        );
+
+        // Not armed: no `tools:` at all — upstream requires nothing, so nothing can be missing.
+        let bare = sample_agent_config("m1", &[]);
+        let plan = build_attempt_spawn_plan(
+            &bare,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        assert_eq!(plan.tool_diagnostic_path, None);
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(ta::CHILD_TOOL_DIAGNOSTIC_PATH_ENV),
             "env was {:?}",
             plan.spec.env_overlay
         );

@@ -26,6 +26,9 @@ use crate::model::{Modality, Model};
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
+use crate::utils::constrained_sampling::{
+    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+};
 use crate::utils::json_parse::parse_json_with_repair;
 use crate::utils::provider_retry::ProviderRetry;
 use crate::utils::simple_options::ThinkingBudgets;
@@ -109,7 +112,17 @@ impl ApiImpl for GoogleGenerativeAiApi {
         };
 
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
-        let body = crate::stream::apply_on_payload(opts, model, build_params(model, ctx, opts)).await;
+        // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP.
+        let params = match build_params(model, ctx, opts) {
+            Ok(p) => p,
+            Err(e) => {
+                let e = ProviderError::from(e);
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
+                return;
+            }
+        };
+        let body = crate::stream::apply_on_payload(opts, model, params).await;
         let headers = build_headers(model, opts, &api_key);
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -276,13 +289,17 @@ pub struct GoogleOptions {
 /// Test-only convenience wrapper for [`build_params`].
 #[cfg(test)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
-    build_params(model, ctx, opts)
+    build_params(model, ctx, opts).expect("fixture declares no unsatisfiable constrained sampling")
 }
 
 /// Build the `:streamGenerateContent` request body (1:1 port of Pi `buildParams` + the `streamSimple`
 /// thinking lowering, google-generative-ai.ts:283-400). The unified `opts.reasoning` level drives the
 /// `thinkingConfig` (level-based for Gemini 3 / Gemma 4, token-budget-based otherwise).
-pub(crate) fn build_params(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
+pub(crate) fn build_params(
+    model: &Model,
+    ctx: &Context,
+    opts: &StreamOptions,
+) -> Result<Value, ConstrainedSamplingError> {
     let contents = convert_messages(model, ctx);
 
     let mut generation_config = Map::new();
@@ -318,15 +335,22 @@ pub(crate) fn build_params(model: &Model, ctx: &Context, opts: &StreamOptions) -
         );
     }
 
-    // tools + toolConfig (Pi google-generative-ai.ts:360-371).
+    // tools + toolConfig (Pi google-generative-ai.ts:369-378 @v0.83.0). PROV-011: the mode comes
+    // from `resolveGoogleFunctionCallingMode`, which can return `VALIDATED`; the old code mapped
+    // `tool_choice` alone and so could never emit it.
     if !ctx.tools.is_empty() {
         if let Some(tools) = convert_tools(&ctx.tools) {
             obj.insert("tools".to_string(), tools);
         }
-        if let Some(tc) = &opts.tool_choice {
+        let mode = resolve_google_function_calling_mode(
+            &ctx.tools,
+            opts.tool_choice.as_ref(),
+            supports_google_strict_tool_sampling(model.id.as_str()),
+        )?;
+        if let Some(mode) = mode {
             obj.insert(
                 "toolConfig".to_string(),
-                json!({ "functionCallingConfig": { "mode": map_tool_choice(tc) } }),
+                json!({ "functionCallingConfig": { "mode": mode } }),
             );
         }
     }
@@ -338,7 +362,7 @@ pub(crate) fn build_params(model: &Model, ctx: &Context, opts: &StreamOptions) -
         );
     }
 
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 /// Build `thinkingConfig` (Pi `buildParams` thinking branch + `streamSimple`,
@@ -848,6 +872,49 @@ fn map_tool_choice(tc: &ToolChoice) -> &'static str {
         ToolChoice::Required | ToolChoice::Function { .. } => "ANY",
         ToolChoice::Auto => "AUTO",
     }
+}
+
+/// Pi `supportsGoogleStrictToolSampling` (`google-shared.ts:292-295` @**v0.83.0**): Gemini major
+/// version >= 3. A non-Gemini id has no major version and is therefore **false** — note this is
+/// the OPPOSITE default from [`supports_multimodal_function_response`], which returns `true` for
+/// the same input.
+fn supports_google_strict_tool_sampling(model_id: &str) -> bool {
+    gemini_major_version(model_id).is_some_and(|v| v >= 3)
+}
+
+/// Pi `resolveGoogleFunctionCallingMode` (`google-shared.ts:311-324` @**v0.83.0**) — PROV-011.
+///
+/// The `VALIDATED` mode is the whole point of the Google leg: it is the one route where a strict
+/// tool buys a server-side guarantee that the emitted `functionCall` matches the declared schema,
+/// rather than a hint. It is returned only when no explicit `none`/`any` choice overrides it.
+///
+/// `Array.prototype.some` short-circuits on the first `true`, so a later tool whose
+/// `strict: "require"` cannot be honoured is never evaluated. That is reproduced exactly: the
+/// iteration stops at the first tool that resolves `true`.
+fn resolve_google_function_calling_mode(
+    tools: &[ToolDef],
+    tool_choice: Option<&ToolChoice>,
+    supports_strict_mode: bool,
+) -> Result<Option<&'static str>, ConstrainedSamplingError> {
+    let mut use_strict_mode = false;
+    for tool in tools {
+        if resolve_json_schema_strict_sampling(tool, supports_strict_mode)? == Some(true) {
+            use_strict_mode = true;
+            break;
+        }
+    }
+    // `toolChoice === "none" || toolChoice === "any"` — an explicit hard choice wins over
+    // VALIDATED. cyrup's `ToolChoice::Required`/`Function` are the two spellings that map to
+    // pi's `"any"`; `Auto` is pi's `"auto"` and does NOT take this branch.
+    if let Some(tc @ (ToolChoice::None | ToolChoice::Required | ToolChoice::Function { .. })) =
+        tool_choice
+    {
+        return Ok(Some(map_tool_choice(tc)));
+    }
+    if use_strict_mode {
+        return Ok(Some("VALIDATED"));
+    }
+    Ok(tool_choice.map(map_tool_choice))
 }
 
 /// Map a raw Gemini `finishReason` to `(stop_reason, error_message)` (Pi `mapStopReason`,
@@ -1617,6 +1684,7 @@ mod tests {
             name: "read".to_string(),
             description: "Read a file".to_string(),
             parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
+            constrained_sampling: None,
         }];
         let m = model_with("gemini-2.0-flash", false);
         let opts = StreamOptions {
@@ -1651,6 +1719,80 @@ mod tests {
         ));
         assert!(!supports_multimodal_function_response("gemini-2.5-pro"));
         assert!(supports_multimodal_function_response("claude-opus-4-5"));
+    }
+
+    // PROV-011 — `resolveGoogleFunctionCallingMode` (`google-shared.ts:311-324` @v0.83.0). The
+    // Google leg is the only route where a strict tool buys a SERVER-side guarantee (`VALIDATED`)
+    // rather than a hint, and cyrup could never emit it because the mode was mapped from
+    // `tool_choice` alone.
+    #[test]
+    fn strict_tools_select_validated_function_calling_mode() {
+        use crate::context::{ConstrainedSampling, ConstrainedSamplingConfig, StrictSampling};
+
+        let tool = |constrained| ToolDef {
+            name: "calc".into(),
+            description: "calculate".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "expr": { "type": "string" } },
+                "required": ["expr"],
+            }),
+            constrained_sampling: constrained,
+        };
+        let strict = || {
+            Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictSampling::Prefer,
+                },
+            ))
+        };
+
+        // Gemini 3 supports strict sampling ⇒ VALIDATED, with no explicit tool choice.
+        let m3 = model_with("gemini-3-pro-preview", true);
+        let mut ctx = user_ctx("x");
+        ctx.tools = vec![tool(strict())];
+        let body = build_body(&m3, &ctx, &StreamOptions::default());
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"],
+            json!("VALIDATED")
+        );
+
+        // Gemini 2.5 does not (`supportsGoogleStrictToolSampling` is major >= 3), and `prefer`
+        // degrades silently ⇒ no toolConfig at all.
+        let m2 = model_with("gemini-2.5-pro", true);
+        let body = build_body(&m2, &ctx, &StreamOptions::default());
+        assert!(body.get("toolConfig").is_none());
+
+        // An explicit `none`/`any` choice wins over VALIDATED (`google-shared.ts:317-319`)…
+        let opts = StreamOptions {
+            tool_choice: Some(ToolChoice::None),
+            ..Default::default()
+        };
+        let body = build_body(&m3, &ctx, &opts);
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"],
+            json!("NONE")
+        );
+        // …but `auto` does not.
+        let opts = StreamOptions {
+            tool_choice: Some(ToolChoice::Auto),
+            ..Default::default()
+        };
+        let body = build_body(&m3, &ctx, &opts);
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"],
+            json!("VALIDATED")
+        );
+
+        // A plain tool on the same model still maps from tool_choice only.
+        ctx.tools = vec![tool(None)];
+        let body = build_body(&m3, &ctx, &opts);
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"],
+            json!("AUTO")
+        );
+        let body = build_body(&m3, &ctx, &StreamOptions::default());
+        assert!(body.get("toolConfig").is_none());
     }
 
     #[test]

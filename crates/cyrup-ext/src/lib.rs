@@ -43,6 +43,35 @@
 //! `session` / `models` / `control`, or filed. If you find a third omission, it is a gap, not a
 //! delta — file it rather than adding it here.
 //!
+//! ## CYRUP-DELTA register — what `interface ui` deliberately does NOT mirror
+//!
+//! `interface ui` mirrors pi's `ExtensionUI` (`types.ts:130-290` @v0.83.0). EXT-021 closed the
+//! import-shaped half (`set-working-message`, `set-working-visible`, `set-working-indicator`,
+//! `set-hidden-thinking-label`, `theme-get-by-name`, and `theme-list`'s widening to `{name, path}`
+//! rows). **ONE** member is deliberately unported; the third is a filed GAP and is named here so
+//! the two are not confused — the failure EXT-045 was filed for is exactly a delta that nobody
+//! wrote down.
+//!
+//! * **`setEditorComponent(factory: EditorFactory | undefined)` / `getEditorComponent()`**
+//!   (`types.ts:260`, `:263`) are deliberately unported. `EditorFactory` is
+//!   `(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => EditorComponent`
+//!   (`:125`): the extension hands back a live component the host then drives through a
+//!   draw/handle-input/dispose protocol, holding a reference for the editor's whole lifetime.
+//!   **Reason:** the same one that keeps `sessionManager` out of `ctx-state` — ADR-0002 makes
+//!   extension I/O values rather than references, and the Component Model has no way to hand a
+//!   guest three live host objects and take back an object the host can re-enter on every keystroke
+//!   (each re-entry would re-enter the guest's single-instance store from inside the host's own draw
+//!   pass). A guest that wants editor behaviour uses the value-shaped surface — `ui.get-editor-text`
+//!   / `set-editor-text` / `paste-editor-text` — which cyrup already exports. `getEditorComponent`
+//!   is the reader of the same handle and goes with it.
+//! * **`onTerminalInput(handler: TerminalInputHandler): () => void`** (`types.ts:145`, handler type
+//!   `:113`) is **NOT a delta — it is an open gap** (EXT-021's residual). It is expressible: the
+//!   handler takes a `string` and returns `{consume?: boolean, data?: string} | undefined`, all
+//!   values, so it ports as a guest EXPORT plus an `ui.subscribe-terminal-input` import, exactly
+//!   like every other guest callback in this world. It is unported only because an export addition
+//!   forces a `HOST_WORLD` bump (`manifest.rs`), which ADR-0002 allows once per pass. Do not
+//!   promote this bullet into a delta; close it.
+//!
 //! No-panic policy (arch-00 §8) is enforced crate-wide via `[workspace.lints]`; tests may
 //! `#[allow(...)]` where unwrap/expect is acceptable.
 #![forbid(unsafe_code)]

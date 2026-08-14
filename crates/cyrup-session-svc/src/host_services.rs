@@ -101,7 +101,13 @@ pub struct UiRequest {
     /// `input`'s placeholder (Pi `input(title, placeholder, opts)`, rpc-types.ts:233-240); `None` for
     /// the other kinds, or when the guest omitted it (L4 review §2.7).
     pub placeholder: Option<String>,
-    /// The Pi `ExtensionUIDialogOptions` bag (`{timeoutMs, signalId}`, types.ts:89).
+    /// The Pi `ExtensionUIDialogOptions` bag — `{signal?: AbortSignal; timeout?: number}`
+    /// (`extensions/types.ts:95-101` @v0.83.0, `timeout?: number` at `:100`, documented "Timeout in
+    /// milliseconds. Dialog auto-dismisses with live countdown display"). EXT-048: the wire key is
+    /// `timeout`, NOT `timeoutMs` — this comment used to assert the opposite and cite `types.ts:89`,
+    /// which is a `keybindings.ts` re-export, not this interface. `DialogOptions` accepts `timeoutMs`
+    /// as a serde alias for the bags cyrup's own SDK already writes. `signalId` is the cyrup
+    /// component-boundary stand-in for `signal` (an `AbortSignal` is not a component value).
     pub opts: DialogOptions,
     /// The one-shot the renderer fulfils to resume the suspended guest.
     pub reply: tokio::sync::oneshot::Sender<UiReply>,
@@ -238,6 +244,56 @@ pub trait SessionActivity: Send + Sync {
     fn abort(&self);
 }
 
+/// The live session's guest-facing INTROSPECTION catalog — the two listings only the running
+/// session can compose (EXT-037 / EXT-038). Pi binds both straight to the session object in
+/// `_bindExtensionCore`: `getAllTools: () => this.getAllTools()` (agent-session.ts:2394) and the
+/// `getCommands` closure (`:2332-2354`, bound at `:2397`) @v0.83.0.
+///
+/// A separate trait for the same reason [`SessionActivity`] is one: these are LIVE reads over state
+/// this backend does not own, and a mirrored copy would be stale exactly when a handler asks —
+/// `getCommands()` must see a command an extension registered a moment ago, and `getAllTools()`
+/// must see a tool `refreshTools` just merged. Attached by `AgentSession::into_shared` over a weak
+/// self-handle, so it never keeps the session alive.
+pub trait SessionCatalog: Send + Sync {
+    /// pi `getCommands(): SlashCommandInfo[]` — `[...extensionCommands, ...templates, ...skills]`,
+    /// extension rows keyed on `command.invocationName` (`core/agent-session.ts:2332-2354`
+    /// @v0.83.0; type `SlashCommandInfo`, `core/slash-commands.ts:6-11`). That is exactly
+    /// `AgentSession::slash_command_catalog`, which is the ONLY source carrying prompt templates
+    /// and skills — the registry fallback in `cyrup-ext` has extension commands and nothing else.
+    fn commands(&self) -> Vec<Value>;
+
+    /// The `SourceInfo` (`core/source-info.ts:6-12` @v0.83.0) pi stamps on each `_toolDefinitions`
+    /// entry, for the EXTENSION-contributed tools only, keyed by tool name.
+    ///
+    /// pi tags the registry three ways while rebuilding it (`_refreshToolRegistry`,
+    /// `agent-session.ts:2455-2488`): a built-in gets `createSyntheticSourceInfo("<builtin:${name}>",
+    /// {source: "builtin"})`, an SDK custom tool `("<sdk:${name}>", {source: "sdk"})`, and a
+    /// registered extension tool carries the runner's real `tool.sourceInfo`. Only the last is
+    /// recoverable here, so a name absent from this map falls back to the builtin synthetic form
+    /// (see `builtin_tool_source_info` below).
+    fn extension_tool_source_info(&self) -> std::collections::HashMap<String, Value>;
+}
+
+/// pi's synthetic `SourceInfo` for a tool the extension registry does not own — the value
+/// `createSyntheticSourceInfo("<builtin:NAME>", { source: "builtin" })` produces
+/// (`core/agent-session.ts:2478`, defaults from `core/source-info.ts:24-40` @v0.83.0: scope
+/// `"temporary"`, origin `"top-level"`, no `baseDir`).
+///
+/// CYRUP-DELTA (`core/agent-session.ts:2468` @v0.83.0): pi distinguishes an SDK-supplied custom
+/// tool with a THIRD tag, `("<sdk:${name}>", {source: "sdk"})`. cyrup's dynamic-tool registry (the
+/// port of `_toolDefinitions`, [`crate::tools::DynamicToolState`]) folds the caller's `custom_tools`
+/// into the same by-name map as the built-ins at build time (`builder.rs`, "the SDK-supplied custom
+/// tools go through the same registered-tool wrapper") and keeps no provenance column, so an SDK
+/// tool is indistinguishable from a built-in at this seam and reports as `builtin`.
+fn builtin_tool_source_info(name: &str) -> Value {
+    json!({
+        "path": format!("<builtin:{name}>"),
+        "source": "builtin",
+        "scope": "temporary",
+        "origin": "top-level",
+    })
+}
+
 /// A host-originated message injection routed from a background task's `inject_message` to the live
 /// session's turn loop (Pi `pi.sendMessage(message, {triggerTurn})` → `sendCustomMessage`,
 /// agent-session.ts:1337-1370). The REQUEST payload of the late-bound [`InjectSink`]; carries the
@@ -354,6 +410,11 @@ pub struct LiveHostServices {
     /// [`Self::attach_session_activity`]. `None` on the default/by-value host, where the trait
     /// defaults (idle, no pending messages, a no-op abort) are the honest answers.
     activity: Mutex<Option<Arc<dyn SessionActivity>>>,
+    /// The live session's guest-facing introspection catalog (EXT-037 / EXT-038), attached
+    /// post-build via [`Self::attach_session_catalog`]. `None` on the default host and on a
+    /// by-value session (nothing calls `into_shared`), where [`HostServices::commands`] answers
+    /// `None` so the guest binding falls back to the extension registry's own resolved commands.
+    catalog: Mutex<Option<Arc<dyn SessionCatalog>>>,
     /// EXT-005: `ctx.shutdown()` latched SYNCHRONOUSLY at the capability seam, exactly as Pi does
     /// (`shutdownHandler` is literally `() => { shutdownRequested = true }`, rpc-mode.ts:344-346,
     /// and interactive-mode.ts:1753-1757 sets the field before anything else).
@@ -394,6 +455,7 @@ impl LiveHostServices {
             inject_sink: Mutex::new(None),
             human_interaction: Arc::new(HumanInteractionLock::new()),
             activity: Mutex::new(None),
+            catalog: Mutex::new(None),
         }
     }
 
@@ -438,6 +500,14 @@ impl LiveHostServices {
     /// `AgentSession::into_shared` over a weak self-handle.
     pub fn attach_session_activity(&self, activity: Arc<dyn SessionActivity>) {
         *Self::lock(&self.activity) = Some(activity);
+    }
+
+    /// Attach the live session's guest-facing introspection catalog (EXT-037 / EXT-038) — the
+    /// source behind [`HostServices::commands`] and the extension-tool provenance half of
+    /// [`HostServices::all_tools`]. Installed by `AgentSession::into_shared` over a weak
+    /// self-handle, exactly like [`Self::attach_session_activity`].
+    pub fn attach_session_catalog(&self, catalog: Arc<dyn SessionCatalog>) {
+        *Self::lock(&self.catalog) = Some(catalog);
     }
 
     /// Attach the command-tier control sink (the runtime owns it once the session is live).
@@ -930,11 +1000,22 @@ impl HostServices for LiveHostServices {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.cwd.clone());
+        // The timeout key is pi's `timeout`, not `timeoutMs`: `ExecOptions { signal?: AbortSignal;
+        // timeout?: number; cwd?: string }` at `core/exec.ts:11-18` @v0.83.0, `timeout?: number` on
+        // `:15` ("Timeout in milliseconds"). This read accepted ONLY `timeoutMs` — cyrup's own SDK
+        // spelling (`cyrup-ext-sdk/src/descriptor.rs` `ExecOptions`) — so both halves agreed and the
+        // divergence was invisible, exactly as EXT-048 describes for the sibling dialog bag. It stops
+        // being invisible the moment anything else writes the bag: a hand-written guest or a ported pi
+        // extension sending `{timeout: 5000}` had it silently ignored and got the fallback ceiling
+        // instead of its own bound, with no error. `timeout` is canonical; `timeoutMs` is accepted for
+        // the bags cyrup's SDK already writes.
+        //
         // L4 review: falls back to [`DEFAULT_EXEC_TIMEOUT`] (`self.exec_timeout`) when the guest gave
-        // no `timeoutMs` (or gave `0`) — see that constant's doc for why an unbounded `exec` here,
+        // neither key (or gave `0`) — see that constant's doc for why an unbounded `exec` here,
         // unlike Pi's own unbounded `execCommand`, has no live abort escape hatch to fall back on.
         let timeout = opts
-            .get("timeoutMs")
+            .get("timeout")
+            .or_else(|| opts.get("timeoutMs"))
             .and_then(Value::as_u64)
             .filter(|ms| *ms > 0)
             .map(Duration::from_millis)
@@ -1124,6 +1205,74 @@ impl HostServices for LiveHostServices {
         let (tools, prompt) = { Self::lock(&dt).set_active(names) };
         *Self::lock(&self.pending_active_tools) = Some((tools, prompt));
     }
+
+    fn all_tools(&self) -> Option<Vec<Value>> {
+        // EXT-038. pi's `getAllTools()` maps `this._toolDefinitions` — the MERGED definition
+        // registry (built-ins + SDK custom + extension tools) — to
+        // `{name, description, parameters, promptGuidelines, sourceInfo}`
+        // (`core/agent-session.ts:906-914` @v0.83.0; type `ToolInfo`, `extensions/types.ts:1552-1554`,
+        // which is `Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> &
+        // {sourceInfo}` — those five keys and NO others). cyrup's port of `_toolDefinitions` is the
+        // shared `DynamicToolState`, so that is what this reads: the guest-facing `getAllTools` now
+        // reports read/write/edit/bash, not the extension-only view `registry.tool_info()` gives.
+        //
+        // Load-bearing rather than cosmetic: this is the introspection a plan-mode / tool-restriction
+        // extension reads BEFORE calling `setActiveTools`, and `set_active_tools` (just above) DOES
+        // route to the live agent — so an extension-only read produced a restriction set that
+        // silently omitted every built-in and then had that restriction honoured.
+        //
+        // `None` only when no dynamic-tool view is attached (the default host), which is what keeps
+        // the `cyrup-ext` binding's registry fallback reachable.
+        let dt = Self::lock(&self.dynamic_tools).clone()?;
+        // Snapshot the tools and RELEASE the registry lock before touching the catalog: the catalog
+        // upgrades a weak `AgentSession` and takes the extension registry's lock, and nothing may
+        // hold two of these at once.
+        let tools = { Self::lock(&dt).tools() };
+        let catalog = Self::lock(&self.catalog).clone();
+        let ext_source_info = catalog.map(|c| c.extension_tool_source_info()).unwrap_or_default();
+        Some(
+            tools
+                .iter()
+                .map(|t| {
+                    let name = t.name();
+                    json!({
+                        "name": name,
+                        "description": t.description(),
+                        "parameters": t.parameters(),
+                        // EXT-007/TOOL-021 widened `Tool::prompt_guidelines` to an OWNED `Vec<&str>`
+                        // precisely so a WASM guest tool's decoded guidelines are readable here.
+                        "promptGuidelines": t.prompt_guidelines(),
+                        "sourceInfo": ext_source_info
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(|| builtin_tool_source_info(name)),
+                    })
+                })
+                .collect(),
+        )
+        // CYRUP-DELTA (`core/agent-session.ts:2471-2488` @v0.83.0): pi's `_toolDefinitions` is a JS
+        // `Map` seeded from `_baseToolDefinitions` and then `set` per extension/SDK tool, so
+        // `getAllTools()` emits built-ins in registration order followed by the extension tools, with
+        // an override keeping the built-in's SLOT. cyrup's `DynamicToolState.registry` is a
+        // `BTreeMap`, so the rows come out name-sorted. The dedup rule is identical (by name,
+        // last registration wins the definition); only the ordering differs, and it is deterministic
+        // — which the `HashMap::keys()` walk this replaces was not.
+    }
+
+    fn commands(&self) -> Option<Vec<Value>> {
+        // EXT-037. pi's `getCommands()` is `[...extensionCommands, ...templates, ...skills]`, in
+        // that order and with no dedup across the three (`core/agent-session.ts:2332-2354`
+        // @v0.83.0), extension rows keyed on `command.invocationName` so a colliding second `deploy`
+        // is handed to the guest as the `deploy:2` it can actually invoke. cyrup's port of that
+        // exact concatenation is `AgentSession::slash_command_catalog`, which the catalog handle
+        // delegates to — it is the only source that has the prompt templates and skills at all.
+        //
+        // `None` when no catalog is attached (the default host, and a by-value session that never
+        // called `into_shared`); the `cyrup-ext` binding then falls back to the registry's RESOLVED
+        // commands, which are extension-only but at least carry the `name:N` invocation names.
+        let catalog = Self::lock(&self.catalog).clone()?;
+        Some(catalog.commands())
+    }
 }
 
 /// The `getActiveTools` source the registered-tool wrapper diffs around every `execute` (Pi binds
@@ -1245,13 +1394,20 @@ mod tests {
         );
         assert!(out.stdout.is_empty(), "no injected value may ever reach the child's environment");
 
-        // 5) `timeoutMs` ⇒ the host SIGTERMs the group, then (since `sleep` obeys SIGTERM and dies
+        // 5) a timeout ⇒ the host SIGTERMs the group, then (since `sleep` obeys SIGTERM and dies
         //    well within the 5s grace period, no SIGKILL escalation needed here) reports
-        //    `killed=true` (Pi `killProcess` sets `killed`, exec.ts:52-63).
-        let out = svc
-            .exec("sleep", &["30".to_string()], &json!({ "timeoutMs": 100 }), CancelToken::new())
-            .expect("sleep runs then is killed on timeout");
-        assert!(out.killed, "a timed-out exec is `killed`");
+        //    `killed=true` (Pi `killProcess` sets `killed`, exec.ts:52-63). Asserted under BOTH
+        //    spellings: pi's real key is `timeout` (`ExecOptions.timeout?: number`, `core/exec.ts:15`
+        //    @v0.83.0) — the host used to accept ONLY cyrup's SDK spelling `timeoutMs`, so a bag
+        //    written by anything else was silently ignored and fell through to the 120s ceiling.
+        for key in ["timeout", "timeoutMs"] {
+            let opts =
+                Value::Object(serde_json::Map::from_iter([(key.to_string(), json!(100))]));
+            let out = svc
+                .exec("sleep", &["30".to_string()], &opts, CancelToken::new())
+                .expect("sleep runs then is killed on timeout");
+            assert!(out.killed, "a timed-out exec is `killed` under the `{key}` key");
+        }
 
         // 6) an already-aborted signal (pre-cancelled token) kills immediately ⇒ `killed=true`.
         let cancelled = CancelToken::new();
@@ -1718,5 +1874,176 @@ mod tests {
             .exec("echo", &["hi".to_string()], &json!({}), CancelToken::new())
             .expect_err("deny-all backend refuses exec");
         assert!(err.contains("not granted"), "denied with the Pi message: {err}");
+    }
+
+    // ---------------------------------------------------- EXT-037 / EXT-038: guest introspection --
+
+    /// A tool double carrying the two fields pi's `ToolInfo` reads off the definition and cyrup's
+    /// internal [`crate::tools::ToolInfo`] does not: `description` + `promptGuidelines`.
+    struct CatalogTool {
+        name: &'static str,
+        params: Value,
+        guidelines: Vec<&'static str>,
+    }
+
+    impl CatalogTool {
+        fn new(name: &'static str, guidelines: Vec<&'static str>) -> Self {
+            Self { name, params: json!({"type": "object", "properties": {}}), guidelines }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CatalogTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn parameters(&self) -> &Value {
+            &self.params
+        }
+        fn description(&self) -> &str {
+            "described"
+        }
+        fn prompt_guidelines(&self) -> Vec<&str> {
+            self.guidelines.clone()
+        }
+        async fn execute(
+            &self,
+            _call_id: cyrup_core::ToolCallId,
+            _args: Value,
+            _cancel: CancelToken,
+            _on_update: cyrup_core::ToolUpdateSink,
+        ) -> Result<cyrup_core::ToolResult, cyrup_core::ToolError> {
+            Ok(cyrup_core::ToolResult::default())
+        }
+    }
+
+    /// A [`SessionCatalog`] double standing in for the live `AgentSession` (which a unit test here
+    /// cannot build): pi's three-source command concatenation, plus the extension registry's
+    /// per-tool `sourceInfo`.
+    struct FakeCatalog;
+
+    impl SessionCatalog for FakeCatalog {
+        fn commands(&self) -> Vec<Value> {
+            vec![
+                json!({"name": "deploy", "description": "first", "source": "extension"}),
+                json!({"name": "deploy:2", "description": "second", "source": "extension"}),
+                json!({"name": "review", "description": "a template", "source": "prompt"}),
+                json!({"name": "skill:pdf", "description": "a skill", "source": "skill"}),
+            ]
+        }
+
+        fn extension_tool_source_info(&self) -> std::collections::HashMap<String, Value> {
+            std::collections::HashMap::from([(
+                "ext_tool".to_string(),
+                json!({"path": "demo-ext", "source": "demo-ext", "scope": "temporary", "origin": "top-level"}),
+            )])
+        }
+    }
+
+    fn dynamic_tools_with(tools: Vec<Arc<dyn Tool>>) -> Arc<Mutex<DynamicToolState>> {
+        let contributions = tools
+            .iter()
+            .map(|t| (t.name().to_string(), crate::builder::tool_contribution(t)))
+            .collect();
+        let rebuilder = crate::tools::PromptRebuilder::new(
+            cyrup_session::prompt::PromptInputs::default(),
+            contributions,
+        );
+        Arc::new(Mutex::new(DynamicToolState::new(tools.clone(), tools, rebuilder)))
+    }
+
+    /// EXT-038 — `all_tools()` must report the WHOLE merged registry (built-ins included) in pi's
+    /// `ToolInfo` shape, not the extension-only view `registry.tool_info()` gives. Guards the
+    /// functional half: a plan-mode extension reads this before calling `setActiveTools`, and the
+    /// write IS honoured, so an extension-only read silently strips read/write/edit/bash.
+    #[test]
+    fn all_tools_reports_the_whole_merged_registry_in_pis_toolinfo_shape() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+
+        // Unattached: `None`, which is what keeps the cyrup-ext registry fallback reachable.
+        assert!(svc.all_tools().is_none(), "no dynamic-tool view attached ⇒ no live answer");
+
+        let builtin: Arc<dyn Tool> = Arc::new(CatalogTool::new("read", vec!["read: prefer read"]));
+        let ext: Arc<dyn Tool> = Arc::new(CatalogTool::new("ext_tool", vec![]));
+        svc.attach_dynamic_tools(dynamic_tools_with(vec![builtin, ext]));
+        svc.attach_session_catalog(Arc::new(FakeCatalog));
+
+        let rows = svc.all_tools().expect("a live dynamic-tool view answers");
+        let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert!(names.contains(&"read"), "the BUILT-IN must appear — the whole point of EXT-038: {names:?}");
+        assert!(names.contains(&"ext_tool"), "the extension tool must still appear: {names:?}");
+
+        let read = rows.iter().find(|r| r["name"] == json!("read")).expect("read row");
+        // pi's `ToolInfo` is EXACTLY these five keys (`extensions/types.ts:1552-1554` @v0.83.0) —
+        // no `source` discriminator (EXT-060).
+        let keys: Vec<&str> = read.as_object().expect("object").keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["description", "name", "parameters", "promptGuidelines", "sourceInfo"],
+            "pi's ToolInfo keys and no others"
+        );
+        assert_eq!(read["description"], json!("described"));
+        assert_eq!(read["promptGuidelines"], json!(["read: prefer read"]), "guidelines must survive");
+        assert_eq!(
+            read["sourceInfo"],
+            json!({"path": "<builtin:read>", "source": "builtin", "scope": "temporary", "origin": "top-level"}),
+            "a tool the extension registry does not own gets pi's synthetic builtin SourceInfo"
+        );
+
+        let ext_row = rows.iter().find(|r| r["name"] == json!("ext_tool")).expect("ext row");
+        assert_eq!(
+            ext_row["sourceInfo"]["source"],
+            json!("demo-ext"),
+            "an extension-contributed tool keeps the REGISTRY's sourceInfo, not the builtin synthetic"
+        );
+    }
+
+    /// EXT-038 — with no catalog attached the merged set is still reported (the built-ins are what
+    /// matter); only the extension provenance degrades to the synthetic form.
+    #[test]
+    fn all_tools_without_a_catalog_still_reports_builtins() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+        let builtin: Arc<dyn Tool> = Arc::new(CatalogTool::new("bash", vec![]));
+        svc.attach_dynamic_tools(dynamic_tools_with(vec![builtin]));
+
+        let rows = svc.all_tools().expect("a live dynamic-tool view answers");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], json!("bash"));
+        assert_eq!(rows[0]["sourceInfo"]["source"], json!("builtin"));
+    }
+
+    /// EXT-037 — the override must (a) answer `None` when no catalog is attached, so the cyrup-ext
+    /// binding's registry fallback stays reachable, and (b) pass the live catalog's rows through
+    /// UNCHANGED — same order, same `name:N` invocation spelling, same descriptions.
+    ///
+    /// Scope note: that pass-through is the whole contract of this override. That the rows THEMSELVES
+    /// are pi's `[...extensionCommands, ...templates, ...skills]` is `slash_command_catalog`'s
+    /// contract, asserted against a real session in `crate::tests::round8_postrun` and
+    /// `crate::tests::install_noop`; the double here stands in for it because a `LiveHostServices`
+    /// unit test cannot build an `AgentSession`.
+    #[test]
+    fn commands_passes_the_live_catalog_through_unchanged() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+
+        // Unattached: `None` ⇒ the cyrup-ext binding falls back to the registry's resolved commands.
+        assert!(svc.commands().is_none(), "no catalog attached ⇒ no live answer");
+
+        svc.attach_session_catalog(Arc::new(FakeCatalog));
+        let rows = svc.commands().expect("an attached catalog answers");
+        let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            ["deploy", "deploy:2", "review", "skill:pdf"],
+            "extension commands (with the `name:N` collision spelling), then templates, then skills"
+        );
+        let sources: Vec<&str> = rows.iter().filter_map(|r| r["source"].as_str()).collect();
+        assert_eq!(sources, ["extension", "extension", "prompt", "skill"]);
+        assert!(
+            rows.iter().all(|r| !r["description"].as_str().unwrap_or_default().is_empty()),
+            "every row carries a description — the bare-name walk carried none"
+        );
     }
 }

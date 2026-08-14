@@ -180,8 +180,15 @@ impl ApiImpl for GoogleVertexApi {
             }
         };
 
-        // The body is byte-for-byte the Gemini body — see the module note.
-        let body = crate::stream::apply_on_payload(opts, model, build_params(model, ctx, opts)).await;
+        // The body is byte-for-byte the Gemini body — see the module note. PROV-011: an
+        // unsatisfiable `constrainedSampling` fails the turn before any HTTP, and pi resolves the
+        // Vertex leg through the same `resolveGoogleFunctionCallingMode` (`google-vertex.ts:469`
+        // @v0.83.0) as the Gemini leg (`google-generative-ai.ts:370`).
+        let params = match build_params(model, ctx, opts) {
+            Ok(p) => p,
+            Err(e) => fail!(ProviderError::from(e)),
+        };
+        let body = crate::stream::apply_on_payload(opts, model, params).await;
         let headers = build_headers(model, opts, api_key, bearer.as_deref());
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -704,7 +711,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let body = build_params(&model, &ctx, &StreamOptions::default());
+        let body = build_params(&model, &ctx, &StreamOptions::default()).unwrap();
         assert!(body.get("contents").is_some(), "got: {body}");
     }
 }

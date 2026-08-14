@@ -139,7 +139,13 @@ async fn slash_intercom_send_appends_an_intercom_sent_entry() {
         .expect("the command produces output");
 
     // MIRROR 1 (green pre- AND post-fix): the command reports the send to the model/user.
-    assert_eq!(reply, "Message sent to reviewer.", "the reply text is unchanged by this fix");
+    assert_eq!(
+        reply,
+        "Message sent to reviewer",
+        "ICOM-013: v0.10.1 index.ts:2429 interpolates targetLabel with NO trailing period, \
+and the label is `formatSessionLabel` over the RESOLVED peer — which is the peer's own name \
+here because it is unique in the roster"
+    );
 
     // MIRROR 2 (green pre- AND post-fix): the peer really received it over the broker.
     let delivered = next_message(&mut peer_events, Duration::from_secs(20)).await;

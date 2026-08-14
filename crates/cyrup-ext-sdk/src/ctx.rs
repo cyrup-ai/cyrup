@@ -661,7 +661,7 @@ impl ProcSpawnOptions {
     }
 }
 
-/// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:135).
+/// Notification severity (Pi `notify(message, type?)`, `extensions/types.ts:142` @v0.83.0).
 /// [`NotifyKind::Info`] is Pi's default when the argument is omitted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NotifyKind {
@@ -683,7 +683,19 @@ impl NotifyKind {
     }
 }
 
-/// The UI capability surface (Pi `ExtensionUIContext`, types.ts:124-275).
+/// The UI capability surface (Pi `ExtensionUIContext`, `extensions/types.ts:131-290` @v0.83.0).
+///
+/// EXT-036 (the import-surface re-run): the `types.ts` line citations on this type's methods were
+/// re-derived one by one against `v0.83.0` and a cluster of them was stale by a consistent ~7 lines
+/// — `notify` was cited `:135` (that line is `confirm`'s doc comment; `notify` is `:142`),
+/// `setStatus` `:141` (it is `:148`), `select` `:127` (`:133`), `editor` `:216` (that is
+/// `setEditorText`; `editor` is `:222`), the dialog-options `AbortSignal` `:89-94` (`:95-101`, and
+/// the sibling comment four lines below it already said `:95-100` — the file contradicted itself,
+/// which is EXT-036's signature), and the chrome trio `:130-150` (they are `:183`/`:190`/`:193`).
+/// The uniform offset says these were taken against a pi version this region is 7 lines shorter in,
+/// not invented. **The same stale citations are still in both `world.wit` copies** (`:420`, `:423`,
+/// `:426`, `:446`, `:470`) and were left there deliberately: the world is frozen for the 0.6 bump
+/// this pass. Fix them there in the next pass that opens it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Ui;
 
@@ -692,14 +704,14 @@ impl Ui {
     pub fn notify(&self, message: &str) {
         self.notify_with(message, NotifyKind::Info);
     }
-    /// Show a notification with an explicit severity (Pi `notify(message, type)`, types.ts:135).
+    /// Show a notification with an explicit severity (Pi `notify(message, type)`, `types.ts:142`).
     pub fn notify_with(&self, message: &str, kind: NotifyKind) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::notify(message, kind.to_wit());
         #[cfg(not(target_arch = "wasm32"))]
         let _ = (message, kind);
     }
-    /// Set a keyed status segment (Pi `setStatus(key, text)`, types.ts:141). Pass [`None`] for
+    /// Set a keyed status segment (Pi `setStatus(key, text)`, `types.ts:148`). Pass [`None`] for
     /// `text` to clear that segment (Pi `setStatus(key, undefined)`).
     pub fn set_status(&self, key: &str, text: Option<&str>) {
         #[cfg(target_arch = "wasm32")]
@@ -712,7 +724,7 @@ impl Ui {
         self.set_status(key, None);
     }
     /// Programmatically dismiss any dialog bound to `signal_id` (Pi `ExtensionUIDialogOptions.signal`
-    /// `AbortSignal.abort()`, types.ts:89-94; sdk gap #2). A dialog subsequently opened via
+    /// `AbortSignal.abort()`, `types.ts:95-101`; sdk gap #2). A dialog subsequently opened via
     /// [`Self::confirm_with`]/[`Self::input_with`]/[`Self::select_with`] carrying that signal id
     /// returns cancelled.
     pub fn abort_signal(&self, signal_id: &str) {
@@ -762,7 +774,7 @@ impl Ui {
         }
     }
     /// Single-choice select; returns the chosen option string (Pi `select(title, options, opts):
-    /// Promise<string|undefined>`, types.ts:127).
+    /// Promise<string|undefined>`, `types.ts:133`).
     pub fn select(&self, prompt: &str, options: &[&str]) -> Option<String> {
         self.select_with(prompt, options, &DialogOptions::default())
     }
@@ -781,7 +793,7 @@ impl Ui {
         }
     }
     /// Multiline editor labeled `title`, seeded with `initial` (Pi `editor(title, prefill):
-    /// Promise<string|undefined>`, types.ts:216); returns the edited text (None = cancelled).
+    /// Promise<string|undefined>`, `types.ts:222`); returns the edited text (None = cancelled).
     pub fn editor(&self, title: &str, initial: &str) -> Option<String> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -826,7 +838,7 @@ impl Ui {
         let _ = key;
     }
 
-    // --- chrome (Pi setHeader/setFooter/setTitle, types.ts:130-150) ---
+    // --- chrome (Pi setFooter/setHeader/setTitle, `types.ts:183`/`:190`/`:193` @v0.83.0) ---
     pub fn set_header(&self, content: &str) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::set_header(content);
@@ -859,7 +871,16 @@ impl Ui {
         }
     }
 
-    // --- editor buffer access (Pi getEditorText/setEditorText/pasteEditorText, types.ts:200-230) ---
+    // --- editor buffer access (Pi `setEditorText` `types.ts:216`, `getEditorText` `:219`, and
+    // `pasteToEditor` `:213` @v0.83.0 — NOTE the upstream name is `pasteToEditor`; there is no
+    // `pasteEditorText` in pi, and the WIT import that carries this is spelled `paste-editor-text`) ---
+    //
+    // CYRUP-DELTA (EXT-021): these three ARE the editor surface a guest gets. pi additionally has
+    // `setEditorComponent(factory)` / `getEditorComponent()` (`extensions/types.ts:260`, `:263`
+    // @v0.83.0), where `EditorFactory` (`:125`) returns a live component the host then drives
+    // through a draw/handle-input/dispose protocol. That is a reference, not a value, and ADR-0002
+    // makes extension I/O values — the full reasoning, and the reason `onTerminalInput` (`:145`) is
+    // an open GAP rather than a delta, is in the register at `crates/cyrup-ext/src/lib.rs`.
     pub fn editor_text(&self) -> String {
         #[cfg(target_arch = "wasm32")]
         {

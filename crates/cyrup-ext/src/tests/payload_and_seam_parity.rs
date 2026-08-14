@@ -694,6 +694,46 @@ fn a_bus_subscription_can_be_taken_down_individually_and_per_owner() {
     assert!(bus.subscribers_for("t2").is_empty());
 }
 
+/// EXT-050's other half: pi's `events` wrapper calls `runtime.assertActive()` before BOTH `emit` and
+/// `on` (`extensions/loader.ts:413-421` @v0.84.1), and `invalidate()` (`:208-214`) sets the stale
+/// message and runs every tracked unsubscribe. cyrup had neither: a whole-bus `clear()` inside
+/// `reload` was the only teardown, and an instance that had already been replaced could still
+/// publish onto the bus the FRESH set was listening on.
+#[cfg(feature = "wasm-host")]
+#[test]
+fn an_invalidated_instance_loses_its_subscriptions_and_may_no_longer_publish() {
+    use crate::GuestState;
+    use std::sync::Arc;
+
+    let bus = Arc::new(crate::SharedBus::new());
+    let guest = GuestState::new("a".into(), Arc::new(ExtensionRegistry::new())).with_bus(bus.clone());
+
+    // PRESENCE first — while active, both halves work.
+    guest.bus_subscribe("t1".into());
+    assert_eq!(bus.subscribers_for("t1"), vec![ExtensionId::from("a")]);
+    guest.bus_emit("t1".into(), serde_json::json!({"n": 1}));
+    assert_eq!(bus.pending_len(), 1, "an active instance publishes");
+    assert!(guest.stale_reason().is_none());
+
+    guest.invalidate(None);
+
+    // pi's `invalidate` runs every tracked unsubscribe...
+    assert!(
+        bus.subscribers_for("t1").is_empty(),
+        "invalidate tears down this owner's subscriptions"
+    );
+    // ...and `assertActive` refuses both verbs afterwards.
+    guest.bus_emit("t1".into(), serde_json::json!({"n": 2}));
+    assert_eq!(bus.pending_len(), 1, "a stale instance may not publish onto the fresh set's bus");
+    guest.bus_subscribe("t1".into());
+    assert!(bus.subscribers_for("t1").is_empty(), "nor re-subscribe");
+
+    // Idempotent, and the FIRST reason wins (upstream `if (state.staleMessage) return;`).
+    let first = guest.stale_reason().expect("a stale instance carries its reason");
+    guest.invalidate(Some("a later, vaguer reason".into()));
+    assert_eq!(guest.stale_reason().as_deref(), Some(first.as_str()));
+}
+
 // ---------------------------------------------------------------------------
 // EXT-017 — a colliding command is reachable at its own suffixed name.
 // ---------------------------------------------------------------------------

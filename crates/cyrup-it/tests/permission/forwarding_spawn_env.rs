@@ -169,6 +169,8 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         timeout_ms: None,
         output_path: None,
         output_mode: OutputMode::Inline,
+        // SUBA-054: `None` is upstream's `false` — no `reads` instruction at all.
+        reads: None,
         structured_output_schema: None,
         model_override: RunModelOverride::Inherit,
         preferred_provider: None,

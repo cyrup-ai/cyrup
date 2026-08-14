@@ -1278,6 +1278,15 @@ pub struct GuestState {
     stream_events: Mutex<Vec<(String, Value)>>,
     /// The active-tool restriction set via `ext-tools.set-active-tools` (Pi `setActiveTools`).
     active_tools_restriction: Mutex<Option<Vec<String>>>,
+    /// `Some(reason)` once this instance's context has been invalidated (pi's
+    /// `runtime.state.staleMessage`, `extensions/loader.ts:177` @v0.84.1). See
+    /// [`GuestState::invalidate`].
+    stale: Mutex<Option<String>>,
+    /// Every `proc.spawn` handle minted FOR THIS GUEST, and every `http-client.request-stream`
+    /// handle likewise. See [`GuestState::own_proc_handle`] for why per-guest ownership is
+    /// load-bearing rather than bookkeeping.
+    proc_handles: Mutex<HashSet<u32>>,
+    stream_handles: Mutex<HashSet<u32>>,
     /// Named abort signals dismissed via `ui.abort-signal` (Pi `ExtensionUIDialogOptions.signal`,
     /// sdk gap #2): a dialog opened carrying an aborted signal id returns cancelled; a tool whose
     /// `call-id` matches polls `is-cancelled` true (Pi `ToolDefinition.execute` `signal`, sdk gap #1).
@@ -1420,6 +1429,9 @@ impl GuestState {
             oauth_events: Mutex::new(Vec::new()),
             stream_events: Mutex::new(Vec::new()),
             active_tools_restriction: Mutex::new(None),
+            stale: Mutex::new(None),
+            proc_handles: Mutex::new(HashSet::new()),
+            stream_handles: Mutex::new(HashSet::new()),
             aborted_signals: Mutex::new(HashSet::new()),
             tool_cancel: Mutex::new(None),
             pending_with_session: Mutex::new(Vec::new()),
@@ -1490,6 +1502,73 @@ impl GuestState {
         }
     }
 
+    /// Record that `handle` was minted for THIS guest by `proc.spawn`.
+    ///
+    /// # Why handles need an owner (the second half of EXT-054)
+    ///
+    /// `capabilities.exec`/`net` decide whether a guest may open a child process or an HTTP stream.
+    /// They say nothing about WHOSE child or WHOSE stream, and the engines that mint the handles —
+    /// [`crate::caps::proc::ProcCaps`] / [`crate::caps::http::HttpCaps`] — are **one per session**,
+    /// living on the single `LiveHostServices` that every loaded guest shares
+    /// (`cyrup-session-svc/src/host_services.rs`), with handles allocated from one `AtomicU32`
+    /// counter. Without this set, a `u32` was ambient authority: extension B could
+    /// `proc.read-stdout(1)` extension A's child (its output, including anything A's subprocess
+    /// prints — tokens, file contents), `proc.write-stdin(1)` INTO it, `proc.kill(1)` it, or
+    /// `http-client.poll-stream-chunk(1)` A's response body, purely by counting from 1. Both guests
+    /// need the relevant grant, so this is not a grant bypass; it is a bypass of the ISOLATION the
+    /// grant model implies, and it is the exact shape of EXT-054 — a per-extension sandbox that is
+    /// declared and then not enforced across a boundary nobody looked at.
+    ///
+    /// pi has no analog in either direction: extensions there are ordinary JS in the agent's own
+    /// process with unrestricted `node:child_process`, so upstream has neither the handle table nor
+    /// the isolation it needs. That makes the invariant cyrup's own to state, exactly as EXT-054's
+    /// was: **a capability handle belongs to the extension that opened it.**
+    pub fn own_proc_handle(&self, handle: u32) {
+        if let Ok(mut g) = self.proc_handles.lock() {
+            g.insert(handle);
+        }
+    }
+
+    /// Refuse a `proc.*` handle this guest did not open (see [`Self::own_proc_handle`]).
+    ///
+    /// The message deliberately does NOT distinguish "belongs to another extension" from "never
+    /// existed": telling a guest which handles are live elsewhere is the same information leak in a
+    /// smaller package.
+    pub fn require_proc_handle(&self, handle: u32) -> Result<(), String> {
+        match self.proc_handles.lock() {
+            Ok(g) if g.contains(&handle) => Ok(()),
+            _ => Err(format!("proc handle {handle} is not open for this extension")),
+        }
+    }
+
+    /// Record that `handle` was minted for THIS guest by `http-client.request-stream`.
+    pub fn own_stream_handle(&self, handle: u32) {
+        if let Ok(mut g) = self.stream_handles.lock() {
+            g.insert(handle);
+        }
+    }
+
+    /// Refuse an `http-client` stream handle this guest did not open.
+    pub fn require_stream_handle(&self, handle: u32) -> Result<(), String> {
+        match self.stream_handles.lock() {
+            Ok(g) if g.contains(&handle) => Ok(()),
+            _ => Err(format!("http stream handle {handle} is not open for this extension")),
+        }
+    }
+
+    /// Forget a stream handle after `http-client.close-stream` — the engine drops the entry, so
+    /// keeping the id would let a LATER handle with the same number (the counter is monotonic, so
+    /// this cannot actually recur) look owned. Kept symmetrical rather than clever.
+    ///
+    /// `proc` handles are deliberately NOT released on `kill`: [`crate::caps::proc::ProcCaps`]
+    /// documents that `kill` terminates without evicting, precisely so the guest can still
+    /// `poll-exit` and drain trailing output afterwards.
+    pub fn release_stream_handle(&self, handle: u32) {
+        if let Ok(mut g) = self.stream_handles.lock() {
+            g.remove(&handle);
+        }
+    }
+
     /// Copy the host's run mode + dialog capability in from [`crate::HostConfig`] (Pi `ctx.mode` /
     /// `ctx.hasUI`, extensions/types.ts:311,313). Called by [`crate::ExtensionHost::load_wasm`]
     /// before `init`, so a guest reads the SAME pair the native built-ins get through `HostCtx`
@@ -1551,6 +1630,9 @@ impl GuestState {
 
     /// Record a `bus.subscribe(topic)` declaration into the shared bus (Pi `pi.events.on`).
     pub fn bus_subscribe(&self, topic: String) {
+        if !self.assert_active("bus.subscribe") {
+            return;
+        }
         self.bus.subscribe(self.owner.clone(), topic);
     }
 
@@ -1558,6 +1640,63 @@ impl GuestState {
     /// returns, `core/event-bus.ts:18-27`, tracked by the loader since v0.84.1).
     pub fn bus_unsubscribe(&self, topic: &str) {
         self.bus.unsubscribe(&self.owner, topic);
+    }
+
+    /// Mark this guest's context STALE — the port of pi's `runtime.invalidate(message?)`
+    /// (`extensions/loader.ts:208-214` @v0.84.1), which sets a one-shot `staleMessage` and then runs
+    /// every tracked event-bus unsubscribe and clears the set.
+    ///
+    /// Called when the instance leaves the host's live map ([`crate::ExtensionHost::reload`]), which
+    /// is cyrup's structural equivalent of the session replacement / reload pi invalidates on. Both
+    /// halves are ported: the flag, and the subscription teardown — which here is
+    /// [`SharedBus::unsubscribe_all`] for this owner rather than a set of closures, because cyrup's
+    /// bus keys subscriptions by `(owner, topic)` instead of handing back an unsubscribe function.
+    ///
+    /// Idempotent, exactly as upstream's `if (state.staleMessage) return;` is: the FIRST reason wins,
+    /// so a later, vaguer invalidation cannot overwrite a specific one.
+    pub fn invalidate(&self, message: Option<String>) {
+        if let Ok(mut g) = self.stale.lock() {
+            if g.is_some() {
+                return;
+            }
+            // pi's default text, `extensions/loader.ts:210-212` @v0.84.1, trimmed to the clauses that
+            // have a cyrup meaning: cyrup guests hold no capturable `ctx` OBJECT (every import reads
+            // ambient store state), so upstream's "do not use a captured pi or command ctx" advice is
+            // about a JS closure hazard that does not exist here — what survives is the fact itself.
+            *g = Some(message.unwrap_or_else(|| {
+                "This extension instance is stale after a session replacement or reload.".to_string()
+            }));
+        }
+        self.bus.unsubscribe_all(&self.owner);
+    }
+
+    /// The stale reason, if [`Self::invalidate`] has run (pi's `state.staleMessage`).
+    pub fn stale_reason(&self) -> Option<String> {
+        self.stale.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// pi's `runtime.assertActive()` (`extensions/loader.ts:180-184` @v0.84.1), which the v0.84.1
+    /// `events` wrapper calls before BOTH `emit` and `on`
+    /// (`loader.ts:413-421`). Returns whether the call may proceed.
+    ///
+    /// CYRUP-DELTA on the failure MODE only, not on the check: upstream THROWS, and the throw
+    /// reaches the extension because `pi.events` is a plain JS object call. `interface bus`'s
+    /// `emit`/`subscribe` are declared `func(...)` with no `result` (`world.wit`), so there is no
+    /// error channel to raise into and re-signing them would break every built guest at link time
+    /// (`HOST_WORLD`'s bump rule, `manifest.rs`). A refused call is therefore dropped with a
+    /// `tracing::warn!` instead — the same degradation the rest of the result-less import surface
+    /// takes (see [`GuestState::require_ui`]).
+    fn assert_active(&self, what: &str) -> bool {
+        match self.stale_reason() {
+            None => true,
+            Some(reason) => {
+                tracing::warn!(
+                    extension = %self.owner, call = what, %reason,
+                    "refused a capability call from a stale extension instance"
+                );
+                false
+            }
+        }
     }
 
     /// Set the dispatch tier (the loader sets `Event` before dispatching an event handler, keeps
@@ -1751,6 +1890,13 @@ impl GuestState {
     }
 
     pub fn bus_emit(&self, topic: String, payload: Value) {
+        // pi's `events.emit` runs `runtime.assertActive()` first (`extensions/loader.ts:414-417`
+        // @v0.84.1) — a stale instance may not publish, or it would be delivered to the FRESH set
+        // that replaced it. See `GuestState::assert_active` for why a refusal here is a dropped call
+        // rather than a raised error.
+        if !self.assert_active("bus.emit") {
+            return;
+        }
         // Per-guest observability log (tests/diagnostics) — a record of what THIS guest sent.
         if let Ok(mut g) = self.bus_emits.lock() {
             g.push((topic.clone(), payload.clone()));

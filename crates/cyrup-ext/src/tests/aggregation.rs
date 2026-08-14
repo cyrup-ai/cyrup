@@ -203,11 +203,24 @@ fn all_registered_tool_names_is_first_registration_wins() {
         vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
         "first-registration-wins order (the alpha override keeps alpha's original position)"
     );
-    // tool_info mirrors the same first-wins order + carries source/parameters.
+    // tool_info mirrors the same first-wins order + carries the parameter schema.
     let info = reg.tool_info().unwrap();
     assert_eq!(info.len(), 3);
     assert_eq!(info[0]["name"], json!("alpha"));
-    assert_eq!(info[0]["source"], json!("extension"));
+
+    // EXT-060 — pi's `ToolInfo` has FIVE keys and no `source`:
+    // `Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> & {sourceInfo}`
+    // (`extensions/types.ts:1552-1554` @v0.83.0). cyrup used to add
+    // `source: "extension"|"guest"` — its native-vs-WASM tier — onto this guest-facing surface.
+    // Assert the ABSENCE against the presence of the rest, so this cannot pass vacuously.
+    let obj = info[0].as_object().expect("ToolInfo is an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["description", "name", "parameters", "promptGuidelines", "sourceInfo"],
+        "ToolInfo must be pi's five keys exactly — no cyrup tier discriminator: {info:?}"
+    );
 
     // EXT-038 — pi's `ToolInfo` is
     // `Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> & {sourceInfo}`

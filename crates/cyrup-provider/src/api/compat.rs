@@ -165,6 +165,11 @@ pub struct ModelCompat {
     /// tool definitions.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_cache_control_on_tools: Option<bool>,
+    /// Pi `supportsStrictTools` (`types.ts:639` @v0.83.0, default **false**): model accepts
+    /// `tools[].strict: true` and the full JSON schema in `input_schema`, i.e. JSON-schema
+    /// constrained sampling on the Anthropic route (PROV-011).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_strict_tools: Option<bool>,
     /// Pi `supportsTemperature` (default true): model accepts the Anthropic `temperature` field
     /// (Claude Opus 4.7+ rejects non-default temperatures).
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -286,6 +291,10 @@ pub struct ResolvedCompat {
     pub chat_template_kwargs: Map<String, Value>,
     pub zai_tool_stream: bool,
     pub supports_strict_mode: bool,
+    /// Pi `supportsOpenAIGrammarTools` — detected **false** (`openai-completions.ts:1469`
+    /// @v0.83.0), catalog override resolved at `:1511`. Read by
+    /// [`crate::utils::constrained_sampling::resolve_grammar_constrained_sampling`] (PROV-011).
+    pub supports_openai_grammar_tools: bool,
     pub cache_control_format: Option<CacheControlFormat>,
     pub send_session_affinity_headers: bool,
     /// Pi `sessionAffinityFormat` — detected `isOpenRouter ? "openrouter" : "openai"`
@@ -451,6 +460,9 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
             && !is_together
             && !is_cloudflare_ai_gateway
             && !is_nvidia,
+        // `supportsOpenAIGrammarTools: false` (openai-completions.ts:1469 @v0.83.0) — never
+        // detected, only enabled by the generated catalog.
+        supports_openai_grammar_tools: false,
         cache_control_format,
         send_session_affinity_headers: false,
         // `sessionAffinityFormat: isOpenRouter ? "openrouter" : "openai"`
@@ -511,6 +523,11 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
         supports_strict_mode: c
             .supports_strict_mode
             .unwrap_or(detected.supports_strict_mode),
+        // `supportsOpenAIGrammarTools: model.compat.supportsOpenAIGrammarTools ??
+        // detected.supportsOpenAIGrammarTools` (openai-completions.ts:1511 @v0.83.0).
+        supports_openai_grammar_tools: c
+            .supports_openai_grammar_tools
+            .unwrap_or(detected.supports_openai_grammar_tools),
         cache_control_format: c.cache_control_format.or(detected.cache_control_format),
         send_session_affinity_headers: c
             .send_session_affinity_headers

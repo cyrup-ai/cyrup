@@ -461,24 +461,51 @@ impl HttpCaps {
         // Restore the registry entry once this poll concludes, UNLESS `close_stream` ran while it was
         // in flight (`Polling { closed: true }`) — in that case remove the handle HERE instead,
         // exactly when the real resource (the local `stream`, about to drop) is actually released,
-        // never earlier (L4 round-12 finding #2a). `next` is the state to install when NOT closed;
-        // ignored (removal wins) when closed.
-        let finalize = |next: StreamSlot| {
-            if let Ok(mut g) = self.streams.lock() {
-                match g.get_mut(&handle) {
-                    Some(StreamSlot::Polling { closed: true }) => {
-                        g.remove(&handle);
+        // never earlier (L4 round-12 finding #2a).
+        //
+        // RAII, not a closure called on each success path. `Polling { closed: false }` is a LATCH:
+        // while it is installed the handle answers `Ok(None)` to every other poll and still occupies
+        // a `MAX_OPEN_STREAMS` accounting slot that only this poll's completion can free. A latch
+        // that is cleared solely on the paths that return normally is a permanent wedge the moment
+        // one of them is skipped — this function's four outcomes each used to clear it by hand, so a
+        // panic unwinding out of `stream.next()` (a decoder fault; contained upstream by the host's
+        // catch_unwind, so the process survives to keep the leak) left the handle stuck `Polling`
+        // for the session's lifetime: unusable, uncloseable — `close_stream` only sets
+        // `closed: true` and waits for a finalizer that will never run — and permanently one slot
+        // off the cap. The same hole would open the day a caller `.await`s this future in a
+        // cancellable context; today's only caller bridges it with `block_in_place` + `block_on`
+        // (`cyrup-session-svc::host_services::http_poll_stream_chunk`), which cannot be dropped
+        // mid-flight, and that is a property of the CALLER, not of this function.
+        struct PollFinalizer<'a> {
+            caps: &'a HttpCaps,
+            handle: u32,
+            /// The state to install when the poll concluded normally and `close_stream` did not run.
+            /// `None` means the poll never concluded (unwind/cancel) — the `ChunkStream` is being
+            /// dropped with the frame, which cancels the connection, so the handle is terminal.
+            next: Option<StreamSlot>,
+        }
+
+        impl Drop for PollFinalizer<'_> {
+            fn drop(&mut self) {
+                let next = self.next.take().unwrap_or(StreamSlot::Eof);
+                if let Ok(mut g) = self.caps.streams.lock() {
+                    match g.get_mut(&self.handle) {
+                        Some(StreamSlot::Polling { closed: true }) => {
+                            g.remove(&self.handle);
+                        }
+                        Some(slot @ StreamSlot::Polling { closed: false }) => {
+                            *slot = next;
+                        }
+                        // Defensive only — the state machine above never lets `handle` be in any
+                        // other shape (or vanish) while a poll owns it; a silent no-op is the
+                        // no-panic-safe fallback if it somehow did.
+                        _ => {}
                     }
-                    Some(slot @ StreamSlot::Polling { closed: false }) => {
-                        *slot = next;
-                    }
-                    // Defensive only — the state machine above never lets `handle` be in any other
-                    // shape (or vanish) while a poll owns it; a silent no-op is the no-panic-safe
-                    // fallback if it somehow did.
-                    _ => {}
                 }
             }
-        };
+        }
+
+        let mut finalizer = PollFinalizer { caps: self, handle, next: None };
         // L4 review §6: bound THIS SINGLE poll's wait, never the stream's overall lifetime — a
         // legitimate long-lived SSE/StreamableHTTP connection (the real consumer's actual protocol
         // need, MCP SDK `streamableHttp.js:75-105`) can go quiet between server-pushed messages for a
@@ -488,7 +515,7 @@ impl HttpCaps {
         let poll_idle_timeout = self.poll_idle_timeout;
         match tokio::time::timeout(poll_idle_timeout, stream.next()).await {
             Err(_) => {
-                finalize(StreamSlot::Idle(stream));
+                finalizer.next = Some(StreamSlot::Idle(stream));
                 Err(format!(
                     "poll_stream_chunk: no chunk within {poll_idle_timeout:?} — the connection \
                      may still be open, poll again"
@@ -497,13 +524,13 @@ impl HttpCaps {
             Ok(Some(Ok(bytes))) => {
                 // The chunk we already fetched is returned regardless of a racing close — it was real
                 // data read off the wire before the close happened, independent of the registry's
-                // bookkeeping (`finalize` above still honors the close: removes rather than
+                // bookkeeping (the finalizer above still honors the close: removes rather than
                 // reinstates `Idle`).
-                finalize(StreamSlot::Idle(stream));
+                finalizer.next = Some(StreamSlot::Idle(stream));
                 Ok(Some(bytes.to_vec()))
             }
             Ok(Some(Err(e))) => {
-                finalize(StreamSlot::Eof); // terminal: subsequent polls degrade to EOF
+                finalizer.next = Some(StreamSlot::Eof); // terminal: subsequent polls degrade to EOF
                 if is_network_stream_error(&e) {
                     // A genuine transport failure — always a hard error, exactly as before.
                     Err(e.to_string())
@@ -519,7 +546,7 @@ impl HttpCaps {
                 }
             }
             Ok(None) => {
-                finalize(StreamSlot::Eof); // natural EOF
+                finalizer.next = Some(StreamSlot::Eof); // natural EOF
                 Ok(None)
             }
         }
@@ -538,7 +565,8 @@ impl HttpCaps {
     /// so removing the registry entry now would free the accounting slot long before the resource
     /// is actually released, letting a guest evade [`MAX_OPEN_STREAMS`] by racing `close_stream`
     /// against every `poll_stream_chunk` (L4 round-12 finding #2a). Instead this only flags the entry
-    /// `closed`; the in-flight poll's own completion (`poll_stream_chunk`'s `finalize`) performs the
+    /// `closed`; the in-flight poll's own completion (`poll_stream_chunk`'s `PollFinalizer`, which
+    /// runs on unwind and cancellation too, not only on the paths that return normally) performs the
     /// actual removal at the moment the resource genuinely frees.
     pub fn close_stream(&self, handle: u32) {
         if let Ok(mut g) = self.streams.lock() {
@@ -2103,6 +2131,85 @@ mod tests {
         let freed = handles.pop().expect("at least one handle to close");
         caps.close_stream(freed);
         caps.request_stream(&req).await.expect("a stream opens again once a slot is freed by closing");
+    }
+
+    /// A mock server that answers ONE connection with headers only and then holds the socket open
+    /// forever, so a `poll_stream_chunk` against it is genuinely pending — with no data ever
+    /// arriving, and therefore no timing dependence in the test that uses it.
+    async fn spawn_quiet_mock() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                // No Content-Length and no body: the response never completes, so the client's body
+                // stream stays open and quiet.
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").await;
+                let _ = sock.flush().await;
+                // Park forever holding the socket — a oneshot whose sender is dropped here would
+                // close it, so keep both halves alive in this frame.
+                let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                let _ = rx.await;
+                drop(sock);
+            }
+        });
+        format!("http://{addr}/probe")
+    }
+
+    /// A `poll_stream_chunk` future that is DROPPED before it completes must not wedge its handle.
+    ///
+    /// `Polling { closed: false }` is a latch: while installed, the handle answers `Ok(None)` to
+    /// every other poll AND still occupies a [`MAX_OPEN_STREAMS`] accounting slot that only this
+    /// poll's completion can free — and `close_stream` deliberately does not free it, it only sets
+    /// `closed: true` and defers to the finalizer. Clearing that latch on the four paths that return
+    /// normally therefore leaks the slot permanently the moment one of them is skipped (a panic
+    /// unwinding out of the decoder, contained by the host so the process survives to keep the leak;
+    /// or, the day a caller stops bridging this with `block_in_place`+`block_on`, an ordinary
+    /// cancellation). The RAII `PollFinalizer` runs on every exit, so the handle lands terminal and
+    /// `close_stream` can genuinely release it.
+    ///
+    /// Deterministic by construction: `now_or_never` polls the future exactly once and drops it, and
+    /// the mock never sends a body byte, so there is no sleep and no scheduling race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_poll_does_not_wedge_the_handle_or_leak_its_cap_slot() {
+        use futures::FutureExt;
+
+        let caps = HttpCaps::with_max_open_streams(1);
+        let req =
+            HttpRequest { method: "GET".into(), url: spawn_quiet_mock().await, ..Default::default() };
+        let handle = caps.request_stream(&req).await.expect("first stream opens under the cap").handle;
+
+        // PRESENCE first: the cap really is 1 and really is held by this open stream, so the
+        // release assertion below cannot pass vacuously.
+        let second_url = spawn_persistent_mock().await;
+        let second_req = HttpRequest { method: "GET".into(), url: second_url, ..Default::default() };
+        assert!(
+            caps.request_stream(&second_req)
+                .await
+                .expect_err("the cap of 1 is held by the open stream")
+                .contains("too many open http streams")
+        );
+
+        // Poll once and drop the future mid-await: the chunk never arrives, so this is Pending.
+        assert!(
+            caps.poll_stream_chunk(handle).now_or_never().is_none(),
+            "the quiet mock sends no body, so the poll must still be pending when it is dropped"
+        );
+
+        // The handle is terminal rather than stuck mid-poll...
+        assert_eq!(
+            caps.poll_stream_chunk(handle).await.expect("a known handle is not an error"),
+            None,
+            "a handle whose poll was dropped reads as EOF, not as an unknown handle"
+        );
+        // ...and closing it genuinely frees the accounting slot. Before the RAII finalizer this
+        // `close_stream` hit a `Polling { closed: false }` entry, set `closed: true`, and waited for
+        // a finalizer that would never run — so this last open stayed refused forever.
+        caps.close_stream(handle);
+        caps.request_stream(&second_req)
+            .await
+            .expect("closing the dropped-poll handle releases its MAX_OPEN_STREAMS slot");
     }
 
     /// Closes the shared-host-memory-exhaustion finding: a response that DECLARES (via

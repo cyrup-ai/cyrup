@@ -808,8 +808,12 @@ async fn a09_5_local_path_install_list_remove() {
 #[tokio::test]
 async fn a09_5_update_skips_pinned_and_one_moves_it() {
     // Construct two git installs directly in the registry: one Default (bulk-updatable), one
-    // Tag-pinned (bulk-skipped). No network: refresh re-reads HEAD from a (possibly absent) local
-    // clone and degrades gracefully.
+    // Tag-pinned (bulk-skipped). Neither URL resolves, so the evidence that a package was ATTEMPTED
+    // is its appearance in `report.failed` — Pi's `ensureGitRef` (package-manager.ts:1870-1896
+    // @v0.83.0) opens with `runCommand("git", fetchArgs)`, which rejects on a non-zero exit and
+    // propagates. This test used to assert `report.updated.contains(&default_id)` for a
+    // `file:///x/a` that cannot be cloned: it passed VACUOUSLY, pinning the exact defect that a
+    // failed fetch was reported to the user as a successful update.
     let tmp = tempfile::tempdir().unwrap();
     let global = tmp.path().join("global");
     let store = PackageStore::new(global.clone(), None);
@@ -860,20 +864,150 @@ async fn a09_5_update_skips_pinned_and_one_moves_it() {
         "bulk update skips pinned (R-09-020)"
     );
     assert!(
-        report.updated.contains(&default_id),
-        "bulk update moves unpinned"
+        report.failed.iter().any(|(id, _)| id == &default_id),
+        "bulk update ATTEMPTS the unpinned package, and an unreachable remote is a failure"
+    );
+    assert!(
+        !report.updated.contains(&default_id),
+        "an unreachable remote must never be reported as an update"
     );
     assert!(!report.updated.contains(&tag_id));
+    assert!(
+        !report.failed.iter().any(|(id, _)| id == &tag_id),
+        "the pinned package was skipped, so it cannot have been attempted"
+    );
 
-    // update(One) moves the pinned package regardless.
+    // update(One) targets the pinned package regardless of the pin.
     let one = mgr
         .update(UpdateTarget::One(tag_id.clone()), CancelToken::new())
         .await
         .unwrap();
     assert!(
-        one.updated.contains(&tag_id),
-        "explicit update(One) moves a pinned package"
+        one.skipped_pinned.is_empty(),
+        "explicit update(One) does not skip a pinned package"
     );
+    assert!(
+        one.failed.iter().any(|(id, _)| id == &tag_id),
+        "explicit update(One) attempts the pinned package"
+    );
+}
+
+/// A git fetch that fails must leave the installed working tree byte-identical, and must be
+/// reported as a failure rather than an update.
+///
+/// Pi never clones over an existing tree: `installGit` early-returns into a fetch when
+/// `existsSync(targetDir)` (package-manager.ts:1822-1830 @v0.83.0) and `updateGit` fetches IN PLACE
+/// and only `git reset --hard`s once the fetch succeeded (`:1853-1868` → `ensureGitRef`
+/// `:1870-1896`), so an unreachable remote throws with the tree untouched.
+///
+/// Red at HEAD: `git_clone_url` opened with an unconditional `remove_dir_all(dir)`, so the tree was
+/// destroyed BEFORE the fetch could fail — one offline `cyrup update` wiped every git package's
+/// working tree — and `refresh` then swallowed the error, re-read nothing, and returned `Ok(())`,
+/// which `update` recorded in `report.updated`.
+#[tokio::test]
+async fn a_failed_git_update_preserves_the_installed_tree_and_is_reported_as_failed() {
+    let Some((_tmp, repo_dir)) = make_local_git_repo() else {
+        eprintln!("skipping failed-update test: `git` CLI not available");
+        return;
+    };
+    let url = format!("file://{}", repo_dir.display());
+
+    let global = tempfile::tempdir().unwrap();
+    let store = PackageStore::new(global.path().to_path_buf(), None);
+    let mgr = PackageManager::new(store.clone());
+    let (rec, _notice) = mgr
+        .install(
+            PackageSource::Git {
+                url,
+                reff: PinRef::Default,
+            },
+            InstallScope::Global,
+            true,
+            CancelToken::new(),
+        )
+        .await
+        .expect("initial clone over file://");
+
+    let dir = store
+        .package_dir(InstallScope::Global, &rec.id)
+        .expect("package dir");
+    assert!(dir.is_dir(), "the install materialized a working tree");
+    let listing = |p: &std::path::Path| {
+        let mut names: Vec<_> = fs::read_dir(p)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing(&dir);
+    assert!(!before.is_empty(), "the clone produced files");
+
+    // Make the remote unreachable, exactly as an offline machine or a deleted repo would.
+    fs::remove_dir_all(&repo_dir).unwrap();
+
+    let report = mgr
+        .update(UpdateTarget::All, CancelToken::new())
+        .await
+        .unwrap();
+    assert!(
+        report.failed.iter().any(|(id, _)| id == &rec.id),
+        "an unreachable remote is a per-package failure, not an update"
+    );
+    assert!(!report.updated.contains(&rec.id));
+
+    assert!(dir.is_dir(), "the installed working tree must still exist");
+    assert_eq!(before, listing(&dir), "the working tree must be unchanged");
+
+    // No staging or backup residue is left beside it.
+    let root = store.packages_root(InstallScope::Global).unwrap();
+    for entry in fs::read_dir(&root).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.ends_with(".cyrup-incoming") && !name.ends_with(".cyrup-previous"),
+            "staging residue left behind: {name}"
+        );
+    }
+}
+
+/// A git install whose clone fails part-way must leave NOTHING at the target path — Pi's
+/// `installGit` catch is `rmSync(targetDir, { recursive: true, force: true })`
+/// (package-manager.ts:1847 @v0.83.0).
+///
+/// Red at HEAD: the bare-on-disk-repo arm of `git_clone` `copy_tree`d the source into `dir` and only
+/// THEN resolved the ref, so a directory that is not a git repo left a full copy of itself at
+/// exactly the path `installed_dir` resolves — with no `packages.json` row behind it. Because
+/// `resolve_configured_package` keys off the DIRECTORY and not the registry, the orphan then loads
+/// as an installed package on every later session.
+#[tokio::test]
+async fn a_failed_git_install_leaves_no_partial_tree_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("not-a-repo");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("SKILL.md"), "---\nname: ghost\n---\n").unwrap();
+
+    let global = tempfile::tempdir().unwrap();
+    let store = PackageStore::new(global.path().to_path_buf(), None);
+    let mgr = PackageManager::new(store.clone());
+    let source = PackageSource::Git {
+        url: src.to_string_lossy().into_owned(),
+        reff: PinRef::Default,
+    };
+    let id = source.package_id();
+
+    mgr.install(source, InstallScope::Global, true, CancelToken::new())
+        .await
+        .expect_err("a directory that is not a git repo cannot be installed");
+
+    let dir = store
+        .package_dir(InstallScope::Global, &id)
+        .expect("package dir");
+    assert!(
+        !dir.exists(),
+        "a failed install must leave nothing at {}",
+        dir.display()
+    );
+    assert!(mgr.list().is_empty(), "and no registry row");
 }
 
 #[tokio::test]

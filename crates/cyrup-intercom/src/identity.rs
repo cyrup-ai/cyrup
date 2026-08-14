@@ -273,6 +273,65 @@ pub fn short_session_id(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
 
+/// `duplicateSessionNames` (`v0.10.1 index.ts:379-386`): the lowercased names held by MORE THAN ONE
+/// session in a roster.
+///
+/// ```text
+/// new Set(
+///   sessions.map(s => s.name?.toLowerCase())
+///     .filter((name): name is string => Boolean(name))
+///     .filter((name, index, names) => names.indexOf(name) !== index)
+/// )
+/// ```
+///
+/// Two mechanism notes: the `Boolean(name)` filter drops `undefined` **and** `""`, so an empty name
+/// is never "duplicated"; and `names.indexOf(name) !== index` runs over the ALREADY-FILTERED array,
+/// so the surviving indices are the second and later occurrences. Counting occurrences reproduces
+/// that exactly and is what the `> 1` below expresses.
+#[must_use]
+pub fn duplicate_session_names<'a, I>(names: I) -> std::collections::HashSet<String>
+where
+    I: IntoIterator<Item = Option<&'a str>>,
+{
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for name in names {
+        let Some(name) = name.filter(|n| !n.is_empty()) else { continue };
+        *counts.entry(name.to_lowercase()).or_insert(0) += 1;
+    }
+    counts.into_iter().filter(|(_, count)| *count > 1).map(|(name, _)| name).collect()
+}
+
+/// `formatSessionLabel` (`v0.10.1 index.ts:440-446`): how a peer is NAMED back to the human in the
+/// picker, the compose header and the sent-confirmation.
+///
+/// ```text
+/// if (!session.name) return session.id;
+/// return duplicates.has(session.name.toLowerCase())
+///   ? `${session.name} (${session.id.slice(0, 8)})`
+///   : session.name;
+/// ```
+///
+/// `!session.name` is a truthiness test, so an empty name falls through to the raw id — the same
+/// `||`-shaped rule `formatSessionListRow` uses, but resolving to the **id** rather than to
+/// "Unnamed session". The 8-char suffix is deliberately [`short_session_id`] and not the
+/// distinguishing [`session_id_prefixes`]: the label is disambiguating text for a human who has the
+/// picker in front of them, not an addressable token.
+#[must_use]
+pub fn format_session_label(
+    name: Option<&str>,
+    session_id: &str,
+    duplicates: &std::collections::HashSet<String>,
+) -> String {
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return session_id.to_string();
+    };
+    if duplicates.contains(&name.to_lowercase()) {
+        format!("{name} ({})", short_session_id(session_id))
+    } else {
+        name.to_string()
+    }
+}
+
 /// `sessionIdPrefixes` (`v0.10.1 index.ts:387-406`, v0.9.3 `72309e0` "fix: show unique session ID
 /// prefixes"): the shortest *distinguishing* id prefix for every session in one roster.
 ///
@@ -470,6 +529,43 @@ mod tests {
         assert_ne!(presence_name(None, a), presence_name(None, b));
         assert_eq!(presence_name(None, a), "subagent-chat-0192f3c1-9a10-7a3c");
         assert_eq!(presence_name(None, b), "subagent-chat-0192f3c1-9a10-7f21");
+    }
+
+    /// `formatSessionLabel` + `duplicateSessionNames` (`v0.10.1 index.ts:379-386,440-446`) —
+    /// ICOM-013's residual. The unique-name case must NOT carry an id suffix, or every peer label
+    /// in the picker, the compose header and the sent-confirmation would grow one.
+    #[test]
+    fn a_session_label_carries_its_id_suffix_only_when_the_name_is_ambiguous() {
+        let roster = [Some("reviewer"), Some("Reviewer"), Some("builder"), None, Some("")];
+        let duplicates = duplicate_session_names(roster);
+        // Case-insensitive: `reviewer` and `Reviewer` collide.
+        assert!(duplicates.contains("reviewer"));
+        assert!(!duplicates.contains("builder"));
+        // `Boolean(name)` drops both `undefined` and `""`, so neither can ever be "duplicated" —
+        // two unnamed sessions must not both start rendering an id suffix.
+        assert!(!duplicates.contains(""));
+        assert_eq!(duplicates.len(), 1);
+
+        let id = "0192f3c1-9a10-7000-8000-aaaaaaaaaaaa";
+        assert_eq!(format_session_label(Some("builder"), id, &duplicates), "builder");
+        assert_eq!(
+            format_session_label(Some("Reviewer"), id, &duplicates),
+            "Reviewer (0192f3c1)",
+            "the original casing is preserved; only the LOOKUP is lowercased"
+        );
+        // `!session.name` is a truthiness test, so an absent OR empty name is the raw id — not
+        // "Unnamed session", which is `formatSessionListRow`'s rule, not this one.
+        assert_eq!(format_session_label(None, id, &duplicates), id);
+        assert_eq!(format_session_label(Some(""), id, &duplicates), id);
+    }
+
+    /// A name held three times is still one duplicate entry — the `indexOf(name) !== index` filter
+    /// keeps occurrences 2..n, and the `Set` collapses them.
+    #[test]
+    fn duplicate_session_names_collapses_repeats() {
+        let duplicates = duplicate_session_names([Some("worker"), Some("worker"), Some("WORKER")]);
+        assert_eq!(duplicates.len(), 1);
+        assert!(duplicates.contains("worker"));
     }
 
     /// `v0.10.1 index.ts:387-406`. Two ids sharing 20 characters must get prefixes that differ, are

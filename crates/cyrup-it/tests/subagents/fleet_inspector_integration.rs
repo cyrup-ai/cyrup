@@ -29,20 +29,31 @@ use std::sync::Mutex;
 
 use cyrup_ext::HostServices;
 use cyrup_ext::event::HostEvent;
+use cyrup_ext::host::{WidgetEffect, WidgetPlacement};
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::tui::fleet_status::FLEET_STATUS_WIDGET_KEY;
 
-/// A `HostServices` backend that records every `set_widget` payload the extension publishes.
+/// A `HostServices` backend that records every `set_widget` call the extension publishes.
+///
+/// EXT-047 re-signed `HostServices::set_widget` from one opaque `&Value` to pi's three arguments
+/// `(key, content, options)` (`extensions/types.ts:170-175` @v0.83.0), and that re-signing is a
+/// member of the `cyrup:ext@0.5` → `@0.6` world bump (`manifest.rs:169-176`). Recording a
+/// [`WidgetEffect`] rather than a hand-rolled JSON blob is the point of the change: the removal
+/// case is `lines: None`, not `{"content": null}`.
 #[derive(Default)]
 struct RecordingWidgetServices {
-    widgets: Mutex<Vec<serde_json::Value>>,
+    widgets: Mutex<Vec<WidgetEffect>>,
 }
 
 impl HostServices for RecordingWidgetServices {
-    fn set_widget(&self, widget: &serde_json::Value) {
-        self.widgets.lock().expect("widget lock").push(widget.clone());
+    fn set_widget(&self, key: &str, lines: Option<&[String]>, placement: WidgetPlacement) {
+        self.widgets.lock().expect("widget lock").push(WidgetEffect {
+            key: key.to_string(),
+            lines: lines.map(<[String]>::to_vec),
+            placement,
+        });
     }
     fn session_id(&self) -> Option<String> {
         Some(TEST_SESSION_ID.to_string())
@@ -54,6 +65,8 @@ impl HostServices for RecordingWidgetServices {
 /// (`async-status.ts:432`) compares exactly those two.
 const TEST_SESSION_ID: &str = "fleet-session";
 
+/// As [`RecordingWidgetServices`], but for the overlay backend below.
+///
 /// A `HostServices` backend that DRIVES an interactive overlay the way `cyrup-tui`'s run loop does:
 /// paints a frame, feeds a scripted key sequence, paints again, and tears the modal down.
 ///
@@ -62,7 +75,7 @@ const TEST_SESSION_ID: &str = "fleet-session";
 /// component is genuinely hosted — rendered AND driven — rather than constructed and dropped.
 #[derive(Default)]
 struct OverlayHostServices {
-    widgets: Mutex<Vec<serde_json::Value>>,
+    widgets: Mutex<Vec<WidgetEffect>>,
     /// Keys fed to the overlay between the first and last captured frame.
     script: Mutex<Vec<cyrup_ext::OverlayKey>>,
     /// Every frame painted, flattened to text, in paint order.
@@ -104,8 +117,12 @@ fn flatten(lines: &[cyrup_ext::OverlayLine]) -> String {
 }
 
 impl HostServices for OverlayHostServices {
-    fn set_widget(&self, widget: &serde_json::Value) {
-        self.widgets.lock().expect("widget lock").push(widget.clone());
+    fn set_widget(&self, key: &str, lines: Option<&[String]>, placement: WidgetPlacement) {
+        self.widgets.lock().expect("widget lock").push(WidgetEffect {
+            key: key.to_string(),
+            lines: lines.map(<[String]>::to_vec),
+            placement,
+        });
     }
     fn session_id(&self) -> Option<String> {
         Some(TEST_SESSION_ID.to_string())
@@ -352,11 +369,11 @@ async fn the_fleet_status_widget_is_published_and_cleared_through_live_host_serv
     let clear = widgets
         .last()
         .expect("shutdown publishes a clear");
-    assert_eq!(
-        clear.get("key").and_then(serde_json::Value::as_str),
-        Some(FLEET_STATUS_WIDGET_KEY)
-    );
-    assert_eq!(clear.get("content"), Some(&serde_json::Value::Null));
+    assert_eq!(clear.key, FLEET_STATUS_WIDGET_KEY);
+    // EXT-047: the removal is pi's `setWidget(key, undefined)` — an absent `content` ARGUMENT
+    // (`tui/fleet-status.ts:309,320`) — not a `{"content": null}` blob. `lines: None` is the only
+    // shape that removes the key; anything else leaves the slot occupied.
+    assert_eq!(clear.lines, None, "shutdown REMOVES the widget: {clear:?}");
 }
 
 // =================================================================================================

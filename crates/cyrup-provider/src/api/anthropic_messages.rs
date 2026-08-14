@@ -21,6 +21,9 @@ use crate::model::Model;
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
+use crate::utils::constrained_sampling::{
+    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+};
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
 use crate::utils::provider_retry::ProviderRetry;
@@ -157,13 +160,19 @@ impl ApiImpl for AnthropicMessagesApi {
         };
 
         let is_oauth = resolve_is_oauth(model, auth);
+        // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
+        // pi's own message.
+        let params = match build_params(model, ctx, opts, auth.env.as_ref(), is_oauth) {
+            Ok(p) => p,
+            Err(e) => {
+                let e = ProviderError::from(e);
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
+                return;
+            }
+        };
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
-        let body = crate::stream::apply_on_payload(
-            opts,
-            model,
-            build_params(model, ctx, opts, auth.env.as_ref(), is_oauth),
-        )
-        .await;
+        let body = crate::stream::apply_on_payload(opts, model, params).await;
         let headers = build_headers(model, ctx, auth, opts, is_oauth);
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -231,6 +240,10 @@ struct ResolvedAnthropicCompat {
     supports_cache_control_on_tools: bool,
     supports_temperature: bool,
     allow_empty_signature: bool,
+    /// Pi `supportsStrictTools: model.compat?.supportsStrictTools ?? false`
+    /// (`anthropic-messages.ts:183` @v0.83.0, type at `types.ts:639`) — the model accepts
+    /// `tools[].strict: true` plus the FULL JSON schema in `input_schema`. PROV-011.
+    supports_strict_tools: bool,
     /// DRIFT-001: emit `tool_reference` blocks + `defer_loading` tools. Defaults from
     /// [`default_supports_tool_references`], NOT to a constant.
     supports_tool_references: bool,
@@ -255,6 +268,7 @@ fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
             .unwrap_or(true),
         supports_temperature: c.and_then(|c| c.supports_temperature).unwrap_or(true),
         allow_empty_signature: c.and_then(|c| c.allow_empty_signature).unwrap_or(false),
+        supports_strict_tools: c.and_then(|c| c.supports_strict_tools).unwrap_or(false),
         supports_tool_references: c
             .and_then(|c| c.supports_tool_references)
             .unwrap_or_else(|| default_supports_tool_references(model)),
@@ -628,18 +642,23 @@ fn map_thinking_level_to_effort(model: &Model, level: ThinkingLevel) -> String {
 #[cfg(test)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
     build_params(model, ctx, opts, None, false)
+        .expect("fixture declares no unsatisfiable constrained sampling")
 }
 
 /// Build the Messages request JSON body (1:1 port of Pi `buildParams` + the `streamSimple` thinking
 /// lowering, anthropic-messages.ts:767-1004). The unified `opts.reasoning` level drives the thinking
 /// config and (for budget-based models) the `max_tokens` split.
+/// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws: `convertTools` rejects a
+/// `strict: "require"` tool on a model without `supportsStrictTools`
+/// (`constrained-sampling.ts:91-95` @v0.83.0). Upstream that unwinds into `stream`'s catch and
+/// becomes the turn's terminal error message; here the caller emits the identical event (PROV-011).
 pub(crate) fn build_params(
     model: &Model,
     ctx: &Context,
     opts: &StreamOptions,
     env: Option<&ProviderEnv>,
     is_oauth: bool,
-) -> Value {
+) -> Result<Value, ConstrainedSamplingError> {
     let compat = get_anthropic_compat(model);
     let cache_control = get_cache_control(model, opts.cache_retention, env);
 
@@ -757,16 +776,18 @@ pub(crate) fn build_params(
             &immediate_tools,
             is_oauth,
             compat.supports_eager_tool_input_streaming,
+            compat.supports_strict_tools,
             tool_cc,
             false,
-        );
+        )?;
         tools.extend(convert_tools(
             &deferred_tools,
             is_oauth,
             compat.supports_eager_tool_input_streaming,
+            compat.supports_strict_tools,
             None,
             true,
-        ));
+        )?);
         obj.insert("tools".to_string(), Value::Array(tools));
     }
 
@@ -817,7 +838,7 @@ pub(crate) fn build_params(
         obj.insert("tool_choice".to_string(), tool_choice_wire(tc));
     }
 
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 /// Map cyrup's unified [`crate::stream::ToolChoice`] onto Anthropic's tool-choice wire shape.
@@ -1216,14 +1237,17 @@ pub(crate) fn convert_tools(
     tools: &[ToolDef],
     is_oauth: bool,
     supports_eager: bool,
+    supports_strict_tools: bool,
     cache_control: Option<&Value>,
     defer_loading: bool,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ConstrainedSamplingError> {
     let last = tools.len().saturating_sub(1);
     tools
         .iter()
         .enumerate()
         .map(|(index, tool)| {
+            // PROV-011 — `anthropic-messages.ts:1298` @v0.83.0.
+            let strict = resolve_json_schema_strict_sampling(tool, supports_strict_tools)?;
             let name = if is_oauth {
                 to_claude_code_name(&tool.name)
             } else {
@@ -1239,16 +1263,38 @@ pub(crate) fn convert_tools(
                 .get("required")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
+            // `legacyInputSchema` (`:1300-1304`) — the three-key subset Anthropic has always
+            // accepted. Under strict sampling pi sends the WHOLE schema with that subset spread
+            // over it (`:1305-1311`), so `type`/`properties`/`required` still win and any extra
+            // keyword (`$defs`, `additionalProperties`, …) survives for the constrainer.
+            let legacy = json!({ "type": "object", "properties": properties, "required": required });
+            let input_schema = if strict == Some(true) {
+                let mut merged = tool
+                    .parameters
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_else(Map::new);
+                for (k, v) in legacy.as_object().expect("legacy schema is an object") {
+                    merged.insert(k.clone(), v.clone());
+                }
+                Value::Object(merged)
+            } else {
+                legacy
+            };
             let mut o = Map::new();
             o.insert("name".to_string(), json!(name));
             o.insert("description".to_string(), json!(tool.description));
             if supports_eager {
                 o.insert("eager_input_streaming".to_string(), json!(true));
             }
-            o.insert(
-                "input_schema".to_string(),
-                json!({ "type": "object", "properties": properties, "required": required }),
-            );
+            // `...(strict === true ? { strict: true } : {})` (`:1317`) — inserted where pi spreads
+            // it, between `eager_input_streaming` and `input_schema`. As with `defer_loading`
+            // above, that insertion order is for readability against pi only: `serde_json`'s `Map`
+            // is a `BTreeMap` here, so the wire order is lexicographic regardless.
+            if strict == Some(true) {
+                o.insert("strict".to_string(), json!(true));
+            }
+            o.insert("input_schema".to_string(), input_schema);
             if defer_loading {
                 o.insert("defer_loading".to_string(), json!(true));
             }
@@ -1257,7 +1303,7 @@ pub(crate) fn convert_tools(
             {
                 o.insert("cache_control".to_string(), cc.clone());
             }
-            Value::Object(o)
+            Ok(Value::Object(o))
         })
         .collect()
 }
@@ -1970,6 +2016,110 @@ mod tests {
         }
     }
 
+    // PROV-011 — `resolveJsonSchemaStrictSampling` on the Anthropic route
+    // (`anthropic-messages.ts:1298` @v0.83.0, `supportsStrictTools` read at `:183`).
+    #[test]
+    fn constrained_sampling_drives_anthropic_strict_tools() {
+        use crate::api::compat::AnthropicMessagesCompat;
+        use crate::context::{ConstrainedSampling, ConstrainedSamplingConfig, StrictSampling};
+        use crate::utils::constrained_sampling::ConstrainedSamplingError;
+
+        let strict_tool = |strict| ToolDef {
+            name: "Edit".into(),
+            description: "edit a file".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "additionalProperties": false,
+            }),
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema { strict },
+            )),
+        };
+
+        // (a) No `supportsStrictTools` (the default) + `prefer` ⇒ degrade silently: no `strict`
+        // key, and the legacy three-key `input_schema` — byte-identical to a plain tool.
+        let mut ctx = user_ctx("hi");
+        ctx.tools = vec![strict_tool(StrictSampling::Prefer)];
+        let body = build_body(&model(), &ctx, &StreamOptions::default());
+        assert!(body["tools"][0].get("strict").is_none());
+        assert!(
+            body["tools"][0]["input_schema"]
+                .get("additionalProperties")
+                .is_none(),
+            "the non-strict branch sends only pi's legacy type/properties/required subset"
+        );
+
+        // (b) `supportsStrictTools` ⇒ `strict: true` AND the whole schema, with pi's legacy subset
+        // spread over it so `type`/`properties`/`required` still win.
+        let mut m = model();
+        m.compat = Some(AnthropicMessagesCompat {
+            supports_strict_tools: Some(true),
+            ..Default::default()
+        });
+        let body = build_body(&m, &ctx, &StreamOptions::default());
+        assert_eq!(body["tools"][0]["strict"], json!(true));
+        assert_eq!(
+            body["tools"][0]["input_schema"]["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(body["tools"][0]["input_schema"]["type"], json!("object"));
+        // The EXACT key set of a strict tool. pi's object literal is written
+        // `name, description, eager_input_streaming?, strict?, input_schema, defer_loading?,
+        // cache_control?` (`anthropic-messages.ts:1313-1321` @v0.83.0), but a JSON object is
+        // unordered and this workspace's `serde_json` has no `preserve_order` feature, so `Map` is
+        // a `BTreeMap` and emission order is lexicographic — only the key SET is observable on the
+        // wire. pi asserts key sets the same way, `.sort()`ed
+        // (`packages/ai/test/bedrock-error-metadata.test.ts:117`). Equality on the whole vector
+        // still pins it exactly: no missing key, no extra key.
+        //
+        // `cache_control` IS part of that set here. `StreamOptions::default()` leaves
+        // `cacheRetention` unset, which resolves to "short" (`:49-57`), so `getCacheControl`
+        // returns `{ type: "ephemeral" }` (`:59-73`); `supportsCacheControlOnTools` defaults to
+        // TRUE (`:180`) so `buildParams` forwards it to `convertTools` (`:1014`), which stamps the
+        // LAST tool — `index === tools.length - 1` (`:1320`) — and this context has exactly one.
+        let keys: Vec<&str> = body["tools"][0]
+            .as_object()
+            .expect("tool is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "cache_control",
+                "description",
+                "eager_input_streaming",
+                "input_schema",
+                "name",
+                "strict"
+            ]
+        );
+        // Its VALUE is the plain ephemeral marker for "short" retention. `build_body` passes no
+        // env overlay, so `resolve_cache_retention` falls through to the ambient
+        // `PI_CACHE_RETENTION` (`:371-378`, pi `:49-57`); pin the overlay so an exported "long" in
+        // the developer's shell cannot swap in the 1h-ttl variant — that branch is pinned
+        // separately by `tools_encode_eager_streaming_and_cache_control`.
+        let short = ProviderEnv::from([("PI_CACHE_RETENTION".into(), "short".into())]);
+        let pinned = build_params(&m, &ctx, &StreamOptions::default(), Some(&short), false)
+            .expect("supports_strict_tools satisfies the `prefer` tool");
+        assert_eq!(
+            pinned["tools"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+
+        // (c) `require` on a model without strict tools fails the whole turn, with pi's text.
+        ctx.tools = vec![strict_tool(StrictSampling::Require)];
+        assert_eq!(
+            build_params(&model(), &ctx, &StreamOptions::default(), None, false),
+            Err(ConstrainedSamplingError(
+                "Tool \"Edit\" requires JSON-schema constrained sampling, but strict tools are unsupported."
+                    .to_string()
+            ))
+        );
+    }
+
     fn user_ctx(text: &str) -> Context {
         Context {
             system_prompt: Some("be brief".to_string()),
@@ -2266,6 +2416,7 @@ mod tests {
             name: "read".to_string(),
             description: "Read a file".to_string(),
             parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
+            constrained_sampling: None,
         }];
         let m = model();
         let opts = StreamOptions {
@@ -2295,6 +2446,7 @@ mod tests {
             name: "read".to_string(),
             description: "d".to_string(),
             parameters: json!({}),
+            constrained_sampling: None,
         }];
         let auth = auth_with(None);
         let headers = build_headers(&m, &ctx, &auth, &StreamOptions::default(), false);
@@ -2542,10 +2694,11 @@ mod tests {
             name: "bash".to_string(),
             description: "run".to_string(),
             parameters: json!({}),
+            constrained_sampling: None,
         }];
         let m = model();
         // build_params with is_oauth=true via direct call.
-        let body = build_params(&m, &ctx, &StreamOptions::default(), None, true);
+        let body = build_params(&m, &ctx, &StreamOptions::default(), None, true).unwrap();
         assert_eq!(body["tools"][0]["name"], "Bash");
     }
 
@@ -3012,6 +3165,7 @@ mod tests {
             name: name.to_string(),
             description: format!("The {name} tool"),
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+            constrained_sampling: None,
         }
     }
 
@@ -3401,7 +3555,7 @@ mod tests {
             cache_retention: Some(CacheRetention::None),
             ..Default::default()
         };
-        let body = build_params(&opus_4_6(), &ctx, &opts, None, true);
+        let body = build_params(&opus_4_6(), &ctx, &opts, None, true).unwrap();
 
         assert_eq!(tool_names(&body), ["base_tool", "Read"]);
         assert_eq!(body["tools"][1]["defer_loading"], json!(true));
@@ -3417,7 +3571,7 @@ mod tests {
         // marker is `read` — same tool after canonicalization, so nothing defers.
         let mut ctx = deferred_ctx(vec![tool_def("base_tool"), tool_def("read")], &["read"]);
         ctx.messages[1] = tc_assistant(&[("call_1", "Read")]);
-        let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, true);
+        let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, true).unwrap();
 
         assert_eq!(tool_names(&body), ["base_tool", "Read"]);
         assert!(
@@ -3452,11 +3606,12 @@ mod tests {
                     name: "Read".to_string(),
                     description: "Canonical definition".to_string(),
                     parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+                    constrained_sampling: None,
                 },
             ],
         };
         // Tool references ON (opus 4.6).
-        let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, true);
+        let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, true).unwrap();
         assert_eq!(tool_names(&body), ["Read"]);
         assert_eq!(body["tools"][0]["description"], "Canonical definition");
 
@@ -3465,11 +3620,11 @@ mod tests {
             id: "claude-haiku-4-5".into(),
             ..model()
         };
-        let body = build_params(&haiku, &ctx, &StreamOptions::default(), None, true);
+        let body = build_params(&haiku, &ctx, &StreamOptions::default(), None, true).unwrap();
         assert_eq!(tool_names(&body), ["Read"]);
 
         // Non-OAuth normalizer is the identity, so both survive — no silent collapse.
-        let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, false);
+        let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, false).unwrap();
         assert_eq!(tool_names(&body), ["read", "Read"]);
     }
 

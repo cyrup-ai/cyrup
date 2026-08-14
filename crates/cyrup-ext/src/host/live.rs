@@ -626,10 +626,18 @@ impl bindings::cyrup::ext::proc::Host for HostState {
         let started = std::time::Instant::now();
         let result = guest.services.proc_spawn(&spec);
         guest.note_dialog_wait(started);
+        // The minted handle belongs to THIS guest — every `proc.*` call below checks it. See
+        // `GuestState::own_proc_handle`: `ProcCaps` is one session-wide registry keyed by a
+        // monotonic `u32`, shared by every loaded extension, so an unowned handle is ambient
+        // authority over another extension's child process.
+        if let Ok(h) = &result {
+            guest.own_proc_handle(*h);
+        }
         result
     }
     async fn write_stdin(&mut self, handle: u32, data: Vec<u8>) -> Result<u32, String> {
         let guest = exec_guest_of(self)?;
+        guest.require_proc_handle(handle)?;
         // Same rationale as `exec::Host::run`/`http_client::Host::request` above — `ProcCaps::write_stdin`
         // `.await`s a real pipe write (`stdin.write_all`, `caps/proc.rs`), which can legitimately
         // block for a while if the child isn't currently reading its stdin. No `note_dialog_wait`
@@ -642,17 +650,25 @@ impl bindings::cyrup::ext::proc::Host for HostState {
     }
     async fn read_stdout(&mut self, handle: u32, max_bytes: u32) -> Result<Vec<u8>, String> {
         let guest = exec_guest_of(self)?;
+        guest.require_proc_handle(handle)?;
         guest.services.proc_read_stdout(handle, max_bytes)
     }
     async fn read_stderr(&mut self, handle: u32, max_bytes: u32) -> Result<Vec<u8>, String> {
         let guest = exec_guest_of(self)?;
+        guest.require_proc_handle(handle)?;
         guest.services.proc_read_stderr(handle, max_bytes)
     }
     async fn poll_exit(&mut self, handle: u32) -> Option<i32> {
-        exec_guest_of(self).ok().and_then(|g| g.services.proc_poll_exit(handle))
+        // No error channel in the WIT signature, so a foreign handle degrades to `none` — the same
+        // answer a never-spawned handle already gives, which is the honest one: from this guest's
+        // point of view that process does not exist.
+        let guest = exec_guest_of(self).ok()?;
+        guest.require_proc_handle(handle).ok()?;
+        guest.services.proc_poll_exit(handle)
     }
     async fn kill(&mut self, handle: u32) -> Result<(), String> {
         let guest = exec_guest_of(self)?;
+        guest.require_proc_handle(handle)?;
         // Same rationale — `ProcCaps::kill` runs the real stdin-EOF/SIGTERM/SIGKILL escalation
         // (`caps/proc.rs`), up to `DEFAULT_KILL_GRACE`*2 + `KILL_CONFIRM_TIMEOUT` (~6s worst case)
         // of real wall-clock blocking, far past the WASM epoch budget. Without this, the SAME
@@ -714,6 +730,10 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
         let result = guest.services.http_request_stream(&request);
         guest.note_dialog_wait(started);
         let opened = result?;
+        // Same ownership rule as `proc.spawn` above: `HttpCaps` is one session-wide stream table
+        // shared by every guest, so an unowned handle would let another extension read this
+        // extension's response body (`GuestState::own_stream_handle`).
+        guest.own_stream_handle(opened.handle);
         Ok(bindings::cyrup::ext::http_client::HttpStreamResponse {
             handle: opened.handle,
             status: opened.status,
@@ -722,6 +742,7 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
     }
     async fn poll_stream_chunk(&mut self, handle: u32) -> Result<Option<Vec<u8>>, String> {
         let guest = net_guest_of(self)?;
+        guest.require_stream_handle(handle)?;
         // Same rationale — `HttpCaps::poll_stream_chunk` `.await`s the underlying stream's `next()`,
         // which can legitimately block for a while on a slow/sparse server-sent stream (the real MCP
         // SSE-over-HTTP transport shape `pi-mcp-adapter` targets).
@@ -732,7 +753,14 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
     }
     async fn close_stream(&mut self, handle: u32) {
         if let Ok(guest) = net_guest_of(self) {
+            // Closing ANOTHER guest's stream is the cheapest of the cross-extension attacks and the
+            // hardest to notice (the victim's next `poll-stream-chunk` simply ends). No error
+            // channel in the signature, so a foreign handle is a silent no-op.
+            if guest.require_stream_handle(handle).is_err() {
+                return;
+            }
             guest.services.http_close_stream(handle);
+            guest.release_stream_handle(handle);
         }
     }
 }

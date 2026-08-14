@@ -39,13 +39,23 @@
 //! could publish to, so the fallback IS the mechanism. The cost is bounded by
 //! [`DEFAULT_POLL_INTERVAL_MS`] (1s, pi's own value).
 //!
-//! # Scoping delta
+//! # Scoping (SUBA-031)
 //!
-//! pi filters runs by `state.currentSessionId`. cyrup's [`super::RunStatus`] carries no session id;
-//! its runs are partitioned by cwd instead (`async_root` is derived per-cwd via
-//! [`super::run_artifact_roots`]), which is the same partition every other control action in this
-//! crate uses (`status`, `interrupt`, `resume`). `wait` follows that convention rather than
-//! inventing a second one.
+//! pi scopes `subagent_wait` to `state.currentSessionId` (`activeRunsForSession` passes
+//! `sessionId: deps.state.currentSessionId ?? undefined` into `listAsyncRuns`,
+//! `subagent-wait.ts:265`), and cyrup now does the same through [`WaitDeps::session_id`]. The cwd
+//! partition (`async_root`, derived per-cwd by [`super::run_artifact_roots`]) is still the outer
+//! one; the session filter is the inner one, exactly as upstream layers them — pi's async root is
+//! also per-scope and the session id narrows within it.
+//!
+//! This is the difference between "two cyrup sessions in the same repo block on each other's
+//! background runs" and pi's behaviour, and it is also what makes the empty-set text
+//! ("No active async runs **in this session**.") true; before the filter existed the message said
+//! the opposite of what the code did.
+//!
+//! `session_id: None` (headless / unpersisted orchestrator) applies no filter, which is pi's own
+//! falsy-`sessionId` path — see [`super::run_status::list_active_runs`] for why an unattributed run
+//! is dropped when a filter IS supplied.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -168,18 +178,24 @@ pub struct WaitDeps {
     pub poll_interval: Duration,
     /// `false` makes the tool return immediately without blocking (pi `deps.enabled`).
     pub enabled: bool,
+    /// SUBA-031 — the live orchestrator session (pi `deps.state.currentSessionId`), narrowing every
+    /// listing this wait performs. `None` applies no filter; see the module docs.
+    pub session_id: Option<String>,
 }
 
 impl WaitDeps {
-    /// Production defaults for `cwd`: the shared per-cwd roots and pi's 1s poll interval.
+    /// Production defaults for `cwd`: the shared per-cwd roots and pi's 1s poll interval. The
+    /// caller supplies the live session id (pi `deps.state.currentSessionId`); pass `None` only
+    /// when there genuinely is no session identity.
     #[must_use]
-    pub fn for_cwd(cwd: &std::path::Path, enabled: bool) -> Self {
+    pub fn for_cwd(cwd: &std::path::Path, enabled: bool, session_id: Option<String>) -> Self {
         let roots = super::run_artifact_roots(cwd);
         Self {
             async_root: roots.async_root,
             results_dir: roots.results_dir,
             poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
             enabled,
+            session_id,
         }
     }
 }
@@ -214,9 +230,13 @@ fn matches_id(run: &ActiveRun, id: &str) -> bool {
 
 /// Queued/running runs for this cwd, optionally narrowed to `id` (pi `activeRunsForSession`).
 async fn active_runs(id: Option<&str>, deps: &WaitDeps) -> Result<Vec<ActiveRun>, String> {
-    let runs = list_active_runs(&deps.async_root, &deps.results_dir)
-        .await
-        .map_err(|e| e.to_string())?;
+    let runs = list_active_runs(
+        &deps.async_root,
+        &deps.results_dir,
+        deps.session_id.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(match id {
         Some(id) => runs.into_iter().filter(|run| matches_id(run, id)).collect(),
         None => runs,
@@ -504,6 +524,7 @@ mod tests {
                 results_dir: self.results_dir.clone(),
                 poll_interval: Duration::from_millis(MIN_POLL_INTERVAL_MS),
                 enabled,
+                session_id: None,
             }
         }
 
@@ -514,10 +535,24 @@ mod tests {
         /// Write a `status.json` for a run in the given state — the on-disk shape
         /// `list_active_runs` reads.
         fn write_status(&self, run_id: &RunId, state: RunState, attention: bool) {
+            self.write_status_for_session(run_id, state, attention, None);
+        }
+
+        /// SUBA-031 — the same writer, with the run's OWN recorded orchestrator session
+        /// (pi `AsyncStatus.sessionId`, stamped from `config.sessionId` at
+        /// `subagent-runner.ts:2088`).
+        fn write_status_for_session(
+            &self,
+            run_id: &RunId,
+            state: RunState,
+            attention: bool,
+            session_id: Option<&str>,
+        ) {
             let paths = self.paths(run_id);
             std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
             let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(1));
             status.state = state;
+            status.session_id = session_id.map(str::to_string);
             if attention {
                 status.telemetry.activity_state = Some(ActivityState::NeedsAttention);
             }
@@ -554,6 +589,50 @@ mod tests {
         let text = wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &fx.deps(true))
             .await
             .expect("no runs is not an error");
+        assert_eq!(text, "No active async runs in this session. Nothing to wait for.");
+    }
+
+    /// SUBA-031 — `wait` is scoped to the SESSION, not merely to the cwd, so two cyrup sessions in
+    /// the same repository no longer block on each other's background runs.
+    ///
+    /// The first assertion is the control and it is not decoration: it proves the foreign run is on
+    /// disk, active, and would otherwise be waited on — without it, the scoped assertion below
+    /// would pass just as happily against an empty async root.
+    ///
+    /// The message is asserted too, because it was the visible half of the defect: the empty-set
+    /// text has always said "in this session" while the scope was the cwd, so before this change
+    /// the two sentences the tool could produce were both wrong for the same run.
+    #[tokio::test]
+    async fn wait_ignores_another_sessions_background_run() {
+        let fx = Fixture::new();
+        let foreign = RunId::new();
+        fx.write_status_for_session(&foreign, RunState::Running, false, Some("session-b"));
+
+        // Control: with no session identity (pi's falsy `sessionId`) the run IS in scope, so the
+        // wait blocks on it — which is exactly what session A used to do.
+        let unscoped = tokio::time::timeout(
+            Duration::from_millis(700),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &fx.deps(true)),
+        )
+        .await;
+        assert!(
+            unscoped.is_err(),
+            "an unscoped wait must block on the foreign run, got {unscoped:?}"
+        );
+
+        // Scoped to session A: the foreign run is out of scope, so the wait returns at once with
+        // the empty-set text — which is now true rather than merely printed.
+        let deps = WaitDeps {
+            session_id: Some("session-a".to_string()),
+            ..fx.deps(true)
+        };
+        let text = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps),
+        )
+        .await
+        .expect("a session-scoped wait must not block on another session's run")
+        .expect("no in-scope runs is not an error");
         assert_eq!(text, "No active async runs in this session. Nothing to wait for.");
     }
 

@@ -70,7 +70,10 @@ pub use collection::{
     get_supported_thinking_levels, has_api, models_are_equal,
 };
 pub use config_provider::ConfigProvider;
-pub use context::{Context, ToolDef};
+pub use context::{
+    ConstrainedSampling, ConstrainedSamplingConfig, Context, GrammarVariants, StrictSampling,
+    ToolDef,
+};
 pub use cyrup_core::ApiId;
 pub use env_api_keys::{
     AUTHENTICATED_SENTINEL, api_key_env_vars, find_env_keys, get_env_api_key,

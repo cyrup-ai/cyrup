@@ -2,6 +2,8 @@
 //! `api/simple-options.ts`.
 //!
 //! These are pure functions over the shared data model (no transport, no new external deps):
+//! - [`constrained_sampling`] — provider-side strict-JSON-schema and Lark/regex grammar tool
+//!   sampling (`api/constrained-sampling.ts`), PROV-011.
 //! - [`deferred_tools`] — split the active tool list into an immediate prefix and transcript-
 //!   anchored definitions (`utils/deferred-tools.ts`), DRIFT-001.
 //! - [`estimate`] — heuristic context-token estimation (`utils/estimate.ts`).
@@ -23,6 +25,7 @@
 //! - [`node_http_proxy`] — `HTTP(S)_PROXY`/`NO_PROXY` resolution (`utils/node-http-proxy.ts`).
 //! - [`provider_retry`] — the server-directed request-retry policy (`utils/provider-retry.ts`).
 
+pub mod constrained_sampling;
 pub mod deferred_tools;
 pub mod error_body;
 pub mod estimate;

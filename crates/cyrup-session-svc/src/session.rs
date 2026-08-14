@@ -629,6 +629,14 @@ impl AgentSession {
         arc.services
             .host_services
             .attach_session_activity(Arc::new(SessionActivityHandle(Arc::downgrade(&arc))));
+        // EXT-037/EXT-038: give the capability backend the LIVE introspection catalog behind a
+        // guest's `getCommands()` and the extension-tool provenance half of its `getAllTools()`. Pi
+        // binds both straight to the session in `_bindExtensionCore` (agent-session.ts:2394,2397),
+        // and only the session can see the prompt templates + skills `getCommands()` concatenates.
+        // Weak, so the backend never keeps the session alive.
+        arc.services
+            .host_services
+            .attach_session_catalog(Arc::new(SessionCatalogHandle(Arc::downgrade(&arc))));
         // AGENT-029: install pi's per-request `transformHeaders` (sdk.ts:312-328 @v0.83.0,
         // byte- and offset-identical at v0.84.1). pi merges provider-attribution + session-affinity
         // headers inside a callback closed over the `model` argument of THAT `streamSimple` call —
@@ -5298,6 +5306,39 @@ impl crate::host_services::SessionActivity for SessionActivityHandle {
         if let Some(s) = self.0.upgrade() {
             s.abort();
         }
+    }
+}
+
+/// The live [`crate::host_services::SessionCatalog`] backing a guest's `getCommands()` and the
+/// extension-tool provenance half of its `getAllTools()` (EXT-037 / EXT-038). Weak for the same
+/// reason [`SessionActivityHandle`] is.
+struct SessionCatalogHandle(std::sync::Weak<AgentSession>);
+
+impl crate::host_services::SessionCatalog for SessionCatalogHandle {
+    fn commands(&self) -> Vec<serde_json::Value> {
+        // Pi `getCommands()` = `[...extensionCommands, ...templates, ...skills]`
+        // (agent-session.ts:2332-2354 @v0.83.0), which is exactly what `slash_command_catalog`
+        // builds. A dropped session has no commands, which is the honest empty answer.
+        self.0.upgrade().map(|s| s.slash_command_catalog()).unwrap_or_default()
+    }
+
+    fn extension_tool_source_info(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        // The `sourceInfo` half of pi's `_toolDefinitions` entry, for the extension-contributed
+        // tools only (agent-session.ts:2482-2487: `definitionRegistry.set(name, {definition,
+        // sourceInfo: tool.sourceInfo})`). `ExtensionRegistry::tool_info` already emits one row per
+        // registered extension/guest tool carrying the same `SourceInfo` shape, so it is the map's
+        // source; every other name in the dynamic registry is a built-in (or an SDK custom tool) and
+        // gets the synthetic form on the host-services side.
+        let Some(s) = self.0.upgrade() else { return std::collections::HashMap::new() };
+        let Ok(rows) = s.services.ext_host.registry().tool_info() else {
+            return std::collections::HashMap::new();
+        };
+        rows.into_iter()
+            .filter_map(|r| {
+                let name = r.get("name")?.as_str()?.to_string();
+                Some((name, r.get("sourceInfo")?.clone()))
+            })
+            .collect()
     }
 }
 

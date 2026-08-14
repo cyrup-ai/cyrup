@@ -742,6 +742,25 @@ impl SubagentExecutor {
             .map(str::to_string)
     }
 
+    /// SUBA-031 — the LIVE session identity, cyrup's analog of pi's `state.currentSessionId` /
+    /// `ctx.currentSessionId` (`async-execution.ts:1042` @v0.43.0).
+    ///
+    /// Read straight off the bound P-1 backend on every call rather than off
+    /// [`Self::root_parent_session`], for two reasons: `root_parent_session` is captured once at a
+    /// PARENT-role `SessionStart` (so a fanout child, which legitimately owns its own async root,
+    /// has none), and a session SWITCH inside one process moves the live id while the captured
+    /// anchor deliberately keeps addressing the root. Everything that scopes a listing wants the
+    /// former; only forwarding wants the latter.
+    ///
+    /// `None`/empty (headless, unpersisted, or no host services bound) means "no session identity",
+    /// which every consumer treats as pi treats a falsy `sessionId`: no filter, no stamp.
+    #[must_use]
+    pub fn current_session_id(&self) -> Option<String> {
+        self.host_services()
+            .and_then(|services| services.session_id())
+            .filter(|id| !id.is_empty())
+    }
+
     /// Reserve `requested` subagent spawns against THIS session's budget (pi `reserveSubagentSpawns`,
     /// `runs/foreground/subagent-executor.ts:266-282`), returning pi's exact over-limit text on
     /// breach and `Ok(())` otherwise.
@@ -2578,6 +2597,10 @@ impl SubagentExecutor {
             steps,
             cwd: cwd.to_path_buf(),
             session_file,
+            // SUBA-031 (pi `sessionId: ctx.currentSessionId`, `async-execution.ts:1042`): the
+            // launching session, carried into the one-shot config so the detached runner can stamp
+            // it onto `status.json` and every session-scoped listing can honour it.
+            session_id: self.current_session_id(),
             global_concurrency_limit: cfg.global_concurrency_limit as usize,
             worktree_base_dir: cfg.worktree_base_dir,
             max_subagent_depth: cfg.max_subagent_depth,
@@ -3397,6 +3420,13 @@ impl SubagentExecutor {
             }
             lines.push("Current session model:".to_string());
             lines.push(format!("  {}", current_model.unwrap_or("(unavailable)")));
+            // SUBA-035: the policy that decides whether the resolved model above is even allowed to
+            // run. Without it this report can show a model that enforcement will refuse, and say
+            // nothing about why.
+            lines.push("Model scope:".to_string());
+            lines.push(crate::exec::model_scope::model_scope_summary_line(
+                discovered.model_scope.as_ref(),
+            ));
             return lines.join("\n");
         }
 
@@ -3405,6 +3435,9 @@ impl SubagentExecutor {
             String::new(),
             "Current session model:".to_string(),
             format!("  {}", current_model.unwrap_or("(unavailable)")),
+            // SUBA-035 — see the single-agent view above; the same line, on the same report.
+            "Model scope:".to_string(),
+            crate::exec::model_scope::model_scope_summary_line(discovered.model_scope.as_ref()),
             String::new(),
         ];
         // pi's all-agents view walks the fixed `BUILTIN_AGENT_NAMES` list (agent-management.ts:608),
@@ -3721,7 +3754,7 @@ impl SubagentExecutor {
         }
         // (2) pi `run-status.ts:200`.
         if view == Some("fleet") {
-            let runs = run_status::list_active_runs(&async_root, &results_dir)
+            let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
             return crate::background::fleet_view::format_fleet(
@@ -3742,7 +3775,7 @@ impl SubagentExecutor {
                         .to_string(),
                 );
             }
-            let runs = run_status::list_active_runs(&async_root, &results_dir)
+            let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
             if !transcript {
@@ -3849,7 +3882,7 @@ impl SubagentExecutor {
                 // No id: interrupt the most-recently-updated running run (the list is already sorted
                 // running-first, most-recent-first), mirroring pi's "defaults to the most recently
                 // active controllable run" contract for interrupt.
-                let runs = run_status::list_active_runs(&async_root, &results_dir)
+                let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
                     .await
                     .map_err(|e| e.to_string())?;
                 runs.iter()
@@ -4021,7 +4054,7 @@ impl SubagentExecutor {
     pub async fn format_stop_targets(&self, cwd: &Path) -> Result<String, String> {
         let async_root = default_async_root(cwd);
         let results_dir = default_results_dir(cwd);
-        let runs = run_status::list_active_runs(&async_root, &results_dir)
+        let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
             .await
             .map_err(|e| e.to_string())?;
         if runs.is_empty() {
@@ -7178,7 +7211,14 @@ impl Tool for WaitTool {
         // Re-resolved per call (not cached from registration) so a mid-session config/env change
         // takes effect; the registration-time verdict only fixes the advertised description.
         let enabled = Self::resolve_enabled(&self.executor).await;
-        let deps = crate::background::wait::WaitDeps::for_cwd(&self.cwd, enabled);
+        // SUBA-031: re-read per call for the same reason `enabled` is — pi reads
+        // `deps.state.currentSessionId` at wait time, so a session switch between registration and
+        // the call scopes the wait to the session that actually issued it.
+        let deps = crate::background::wait::WaitDeps::for_cwd(
+            &self.cwd,
+            enabled,
+            self.executor.current_session_id(),
+        );
         match crate::background::wait::wait_for_subagents(&parsed, &cancel, &deps).await {
             Ok(text) => Ok(ToolResult {
                 content: vec![cyrup_core::Content::text(text)],
@@ -17246,6 +17286,13 @@ mod tests {
             "the report must be the runtime builtin->model mapping, not a catalog dump: {full}"
         );
         assert!(full.contains("Current session model:"), "{full}");
+        // SUBA-035: the report must say which scope policy is in force, not only which model
+        // resolved. With no `subagents.modelScope` configured that is the explicit "none" line —
+        // asserted here rather than only in the configured case so a silently-dropped block fails.
+        assert!(
+            full.contains("Model scope:\n  (none configured"),
+            "the models report must surface the active modelScope policy: {full}"
+        );
         // The old behavior dumped the static provider catalog ("... — context {n}k, reasoning=...");
         // the runtime mapping must not.
         assert!(
@@ -20569,6 +20616,7 @@ mod tests {
             steps: Vec::new(),
             cwd: PathBuf::from("/tmp"),
             session_file: None,
+            session_id: None,
             global_concurrency_limit: 4,
             worktree_base_dir: None,
             max_subagent_depth: 2,

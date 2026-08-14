@@ -501,8 +501,20 @@ impl ExtensionRegistry {
         Ok(out)
     }
 
-    /// `ToolInfo[]` for every registered tool (Pi `getAllTools`, types.ts:1260): name + source +
-    /// parameter schema. First-registration-wins order (matches [`Self::all_registered_tool_names`]).
+    /// `ToolInfo[]` for every registered tool (Pi `getAllTools`, `extensions/types.ts:1323`,
+    /// implemented at `core/agent-session.ts:906-914` @v0.83.0). First-registration-wins order
+    /// (matches [`Self::all_registered_tool_names`]).
+    ///
+    /// EXT-060 — the emitted object is EXACTLY pi's five keys:
+    /// `ToolInfo = Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> &
+    /// {sourceInfo}` (`extensions/types.ts:1552-1554` @v0.83.0). It previously also carried a
+    /// cyrup-invented `source: "extension"|"guest"` discriminator, which leaked cyrup's
+    /// native-vs-WASM TIER onto a guest-facing parity surface — a distinction pi's one-extension-kind
+    /// model has no word for, and one a guest could read and branch on. Note that pi DOES have a
+    /// `source` on the sibling command info (`SlashCommandSource = "extension"|"prompt"|"skill"`,
+    /// `core/slash-commands.ts:4`), which is what makes the key look plausible here; it is not the
+    /// same field and does not license one. The tier a tool runs in is already recoverable from
+    /// `sourceInfo` if a guest genuinely needs provenance.
     pub fn tool_info(&self) -> Result<Vec<Value>, ExtError> {
         let g = self.lock_read()?;
         let mut out: Vec<Value> = Vec::new();
@@ -514,7 +526,6 @@ impl ExtensionRegistry {
             if let Some(t) = g.tools.get(n) {
                 out.push(serde_json::json!({
                     "name": t.name(),
-                    "source": "extension",
                     "description": t.description(),
                     "parameters": t.parameters(),
                     // EXT-038: pi's `ToolInfo` is
@@ -535,7 +546,6 @@ impl ExtensionRegistry {
             if let Some((owner, d)) = g.guest_tools.get(n) {
                 out.push(serde_json::json!({
                     "name": d.name,
-                    "source": "guest",
                     "description": d.description,
                     "parameters": d.parameters,
                     "promptGuidelines": d.prompt_guidelines,

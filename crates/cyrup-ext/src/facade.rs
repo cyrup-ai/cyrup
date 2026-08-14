@@ -1451,7 +1451,8 @@ impl ExtensionHost {
         result
     }
 
-    /// Load one discovered extension, applying the world-version check + trust gate (R-08-002).
+    /// Load one discovered extension, applying the trust gate then the world-version check
+    /// (R-08-002).
     #[cfg(feature = "wasm-host")]
     pub async fn load_discovered(
         &self,
@@ -1459,11 +1460,28 @@ impl ExtensionHost {
         project_trusted: bool,
         services: Arc<dyn crate::host::HostServices>,
     ) -> Result<ExtensionId, ExtError> {
-        disc.manifest.check_world(HOST_WORLD)?;
+        // The trust gate runs FIRST, before anything about the extension is judged.
+        //
+        // This order is load-bearing, not stylistic. `check_world` used to run above it, so an
+        // untrusted project-local extension declaring a stale world returned
+        // `ExtError::WorldVersion` instead of `ExtError::Untrusted` — and `discover_and_load`
+        // classifies everything but `Untrusted` as `fatal: true` (`:1433`), which
+        // `cyrup-session-svc/src/runtime.rs:128-138` turns into a `runtime.diagnostics` error and
+        // the bin exits 1. Merely OPENING an untrusted project that happens to contain an
+        // out-of-date extension therefore aborted startup — the exact failure `LoadError::fatal`'s
+        // own doc says the trust skip exists to avoid, and one pi cannot have: pi filters untrusted
+        // project resources out of the enabled set BEFORE `loadExtensions` runs
+        // (`resource-loader.ts:379-384`, `setProjectTrusted(false)` + `reload()` @v0.83.0), so an
+        // untrusted project-local extension is never inspected at all, let alone diagnosed.
+        //
+        // The general rule this encodes: an untrusted extension must be examined as little as
+        // possible. Every check placed above this line is one more thing an untrusted project's
+        // files get to influence.
         if !disc.is_trusted(project_trusted) {
             // Project-local extension in an untrusted project: not loaded (R-ARCH-EXT-017).
             return Err(ExtError::Untrusted);
         }
+        disc.manifest.check_world(HOST_WORLD)?;
         let bytes = crate::loader::resolve_component_bytes(disc)?;
         let id = disc.id();
         // EXT-054: the manifest this function has been holding all along now reaches instantiation.
@@ -1617,6 +1635,29 @@ impl ExtensionHost {
         out
     }
 
+    /// Mark every LIVE guest's context stale — the host-level port of pi's
+    /// `_extensionRunner.invalidate(message?)` (`extensions/loader.ts:208-214` @v0.84.1, called from
+    /// `AgentSession.dispose()` at `core/agent-session.ts:848`).
+    ///
+    /// Two effects, both upstream's: each instance's bus subscriptions are torn down (pi runs every
+    /// tracked unsubscribe), and any later `bus.emit`/`bus.subscribe` from a call still in flight on
+    /// an outgoing instance is refused rather than landing on the bus the REPLACEMENT set is
+    /// listening on (pi's `assertActive`). See [`crate::host::GuestState::invalidate`].
+    ///
+    /// [`Self::reload`] calls this itself. It is `pub` because pi invalidates at the OTHER
+    /// replacement points too — `dispose`/`teardownCurrent` for new/resume/fork/switch
+    /// (`agent-session-runtime.ts:167-177`) — and those live in `cyrup-session-svc`
+    /// (`AgentSession::dispose_with`, which already documents itself as sitting at exactly pi's
+    /// `invalidate` position). This is the one call that seam needs.
+    #[cfg(feature = "wasm-host")]
+    pub fn invalidate_live(&self, reason: Option<String>) {
+        if let Ok(g) = self.live.read() {
+            for ext in g.values() {
+                ext.guest().invalidate(reason.clone());
+            }
+        }
+    }
+
     /// Hot reload (`/reload`, R-08-005): emit `session_shutdown{reload}` to the live set, cache-bust
     /// (drop the dispatcher + registry + live table + loaded ids), re-discover + re-load across the
     /// three roots, then emit `session_start{reload}`. Returns the fresh [`LoadExtensionsResult`].
@@ -1646,6 +1687,14 @@ impl ExtensionHost {
         // 2) cache-bust: drop dispatcher entries, registry tables, live instances, loaded ids.
         self.dispatcher.clear()?;
         self.registry.clear()?;
+        // EXT-050 — invalidate each outgoing instance BEFORE the map is cleared, the port of pi's
+        // `runtime.invalidate()` (`extensions/loader.ts:208-214` @v0.84.1). Two things follow from
+        // it: the instance's own subscriptions are torn down (upstream runs every tracked
+        // unsubscribe), and any later `bus.emit` from a call still in flight on the OLD instance is
+        // refused instead of being queued for the FRESH set that replaced it — upstream's
+        // `assertActive`. Without this the only teardown was the whole-bus `clear()` below, which is
+        // all-or-nothing and says nothing about who is still allowed to publish.
+        self.invalidate_live(None);
         // Drop stale bus subscriptions + any undelivered queued events; the fresh load re-declares
         // its subscriptions during `init` (gap-08 §5.3).
         self.bus.clear();

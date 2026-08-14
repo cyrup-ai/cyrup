@@ -41,11 +41,17 @@
 //!   its one sharp edge: `ensure_connected` clears a pending timer before attempting
 //!   (`clearReconnectTimer()`, `index.ts:824`), so a failed tool-triggered attempt leaves the
 //!   ladder disarmed until the next tool call or the next disconnect edge.
-//! - **Duplicate delivery is not possible and therefore not handled** — the broker is at-most-once
-//!   by construction (`broker/mod.rs::handle_send` answers every send synchronously with
-//!   `Delivered`/`DeliveryFailed`; there is no mailbox, no queue, no redelivery), exactly as
-//!   upstream `broker/broker.ts:422-494` at v0.7.0. A message in flight when a socket drops is
-//!   lost, never re-sent, so a reconnect cannot deliver it twice. What DOES need care is the
+//! - **Duplicate delivery is not possible and therefore not handled** — the broker answers every
+//!   send synchronously with `Delivered`/`DeliveryFailed` (`broker/mod.rs::handle_send`) and each
+//!   message is either handed to exactly one live socket or parked in the mailbox for exactly one
+//!   later `register`, never both: `flush_mailbox_for_session` SPLICES the entry out before it
+//!   writes (`v0.10.1 broker/broker.ts:933-943`). **Superseded 2026-08-14 (ICOM-010): this note
+//!   used to assert "there is no mailbox, no queue, no redelivery" — that was true of the v0.7.0
+//!   broker it was written against and is no longer true of this one.** A message in flight when a
+//!   socket drops is still lost rather than re-sent, so a reconnect cannot deliver it twice; what
+//!   changed is that a message the broker ACCEPTS for a departed peer is now retained for
+//!   `MAILBOX_MESSAGE_RETENTION_MS` instead of being refused `Session not found`. What DOES need
+//!   care is the
 //!   outbound reply waiter: pi rejects it on the disconnect edge BEFORE nulling the client
 //!   (`index.ts:784`) so an ask cannot hang across a reconnect — [`handle_disconnect`] does the
 //!   same via [`crate::reply_tracker::OutboundReplyWaiter::fail_pending`].

@@ -91,6 +91,36 @@ impl Drop for MutationGuard {
     }
 }
 
+/// Runs [`MutationGuard`]'s eviction check for an acquisition that never became a guard.
+///
+/// **This is a JS→Rust mechanism gap, not a tidiness measure.** Pi's `withFileMutationQueue`
+/// registers the key and releases it in a `finally` (file-mutation-queue.ts:53-60); a JS `async`
+/// function always settles, so the `finally` always runs and the key is always released. A Rust
+/// future can be dropped at ANY `.await`, and [`FileMutationLocks::guard`] inserts the map entry
+/// BEFORE awaiting the mutex. Both non-guard exits therefore leaked the entry: the
+/// `cancel.cancelled()` arm of the `select!` (an Esc during a `write`/`edit` that is queued behind
+/// another mutator on the same file) and an outright drop of the `guard()` future itself. The map
+/// is a process-global `static`, so nothing ever collected those entries; only a LATER successful
+/// lock on the identical path could, via [`MutationGuard::drop`].
+///
+/// Declared BEFORE the `lock` local in `guard` so that drop order (reverse declaration) releases
+/// the local `Arc` clone FIRST — otherwise the `strong_count == 1` predicate would always see this
+/// function's own clone and never evict.
+struct PendingLockEntry {
+    map: Arc<DashMap<PathBuf, Arc<Mutex<()>>>>,
+    key: PathBuf,
+}
+
+impl Drop for PendingLockEntry {
+    fn drop(&mut self) {
+        // Identical predicate to `MutationGuard::drop`: evict only when the map holds the last
+        // reference, so a concurrent waiter that has already cloned the `Arc` keeps its entry. On
+        // the SUCCESS path the returned `MutationGuard` holds a clone, so this is a no-op and the
+        // guard's own drop does the eviction.
+        self.map.remove_if(&self.key, |_, v| Arc::strong_count(v) == 1);
+    }
+}
+
 impl FileMutationLocks {
     /// Attach to the process-global lock map (Pi's module-scope `fileMutationQueues`). This is a
     /// cheap `Arc` clone, not a fresh map — see the type docs.
@@ -132,15 +162,28 @@ impl FileMutationLocks {
     }
 
     /// Acquire the lock for `path` for the whole read-modify-write. Cancel-aware: returns
-    /// `Err(aborted)` if cancelled before acquisition.
+    /// `Err(aborted)` if cancelled before acquisition — *always*, not just when the mutex happens
+    /// to be contended (see the `biased` note on the `select!` below).
     pub async fn guard(
         &self,
         path: &Path,
         cancel: &CancelToken,
     ) -> Result<MutationGuard, ToolError> {
         let key = Self::key(path).await?;
+        // Declared before `lock` so it drops LAST — see `PendingLockEntry`.
+        let _pending = PendingLockEntry { map: Arc::clone(&self.map), key: key.clone() };
         let lock = self.map.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone();
         tokio::select! {
+            biased;
+            // `biased` is REQUIRED, not a micro-optimisation. An unbiased `select!` polls its ready
+            // arms in a RANDOM order, so when the token is already cancelled AND the mutex is
+            // uncontended both arms are ready on the first poll and the outcome is a coin flip:
+            // roughly half of all pre-cancelled acquisitions on an idle path returned
+            // `Ok(MutationGuard)` and let the mutation proceed. Pi has no such window — the abort
+            // check is the FIRST statement inside the queue body (`throwIfAborted()`,
+            // write.ts:218 / edit.ts:327, defined at write.ts:213-215) and runs before any
+            // filesystem call, so an already-aborted `write`/`edit` deterministically throws
+            // "Operation aborted". Polling the cancel arm first reproduces exactly that ordering.
             _ = cancel.cancelled() => Err(error::aborted()),
             g = lock.clone().lock_owned() => Ok(MutationGuard {
                 inner: Some(g),
@@ -245,6 +288,77 @@ mod tests {
         assert!(locks.map.contains_key(&key));
         drop(g);
         assert!(!locks.map.contains_key(&key), "drained entry must be evicted, not leaked");
+    }
+
+    /// A cancelled acquisition must evict its map entry too. Pi's `finally`
+    /// (file-mutation-queue.ts:57-59) always runs because a JS `async` function always settles;
+    /// cyrup's `guard()` inserted the entry and then `select!`ed, so the cancel arm returned
+    /// `Err(aborted)` leaving a permanently unreferenced entry in a process-global static.
+    ///
+    /// Structural, not timing-based: the lock is HELD by `held`, so the second acquisition is
+    /// genuinely parked on the mutex — the exact state an Esc lands in — and the cancel arm is the
+    /// only way out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_acquisition_evicts_its_entry_instead_of_leaking_it() {
+        let locks = FileMutationLocks::new();
+        let path = unique_path("cancel-evict");
+        let key = FileMutationLocks::key(&path).await.unwrap();
+
+        let held = locks.guard(&path, &CancelToken::new()).await.unwrap();
+        // PRESENCE FIRST, so the absence assertion below cannot pass vacuously.
+        assert!(locks.map.contains_key(&key));
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let err = locks.guard(&path, &cancel).await;
+        assert!(err.is_err(), "a pre-cancelled acquisition must abort");
+        // Still held by `held`, so the entry legitimately survives this drop.
+        assert!(locks.map.contains_key(&key), "an entry with a live holder must not be evicted");
+
+        drop(held);
+        assert!(!locks.map.contains_key(&key));
+
+        // And with NO other holder at all, the cancelled acquisition must leave nothing behind.
+        // This is also the case that pins `guard()`'s `biased` ordering: with the mutex free, BOTH
+        // `select!` arms are ready on the first poll, and an unbiased `select!` chose between them
+        // at random — this `is_err()` failed roughly half the time.
+        let path2 = unique_path("cancel-evict-solo");
+        let key2 = FileMutationLocks::key(&path2).await.unwrap();
+        let cancel2 = CancelToken::new();
+        cancel2.cancel();
+        assert!(locks.guard(&path2, &cancel2).await.is_err());
+        assert!(
+            !locks.map.contains_key(&key2),
+            "RED before the fix: the entry stayed in the process-global map forever"
+        );
+    }
+
+    /// The same leak reached by DROPPING the `guard()` future rather than by cancelling it — the
+    /// shape a `tokio::select!`/`timeout` at a call site produces, which no `CancelToken` observes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_acquisition_future_evicts_its_entry() {
+        let locks = FileMutationLocks::new();
+        let path = unique_path("drop-evict");
+        let key = FileMutationLocks::key(&path).await.unwrap();
+        let cancel = CancelToken::new();
+
+        let held = locks.guard(&path, &cancel).await.unwrap();
+        assert!(locks.map.contains_key(&key));
+
+        // Drop the acquisition mid-`.await`, deterministically and with no wall clock: `biased`
+        // polls the arms in order, so the acquisition IS polled (inserting its map entry and then
+        // parking on the held mutex) before the already-ready arm wins and `select!` drops it.
+        tokio::select! {
+            biased;
+            _ = locks.guard(&path, &cancel) => unreachable!("`held` owns the lock, so this cannot resolve"),
+            () = std::future::ready(()) => {}
+        }
+
+        drop(held);
+        assert!(
+            !locks.map.contains_key(&key),
+            "the dropped acquisition must not keep the entry alive"
+        );
     }
 
     /// Pi's key helper catches ONLY `ENOENT`/`ENOTDIR` (`isMissingPathError`,
