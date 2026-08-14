@@ -35,6 +35,8 @@ mod services;
 mod session;
 mod state;
 mod subscriber;
+#[cfg(test)]
+mod tests;
 mod tools;
 
 pub use attribution::merge_provider_attribution_headers;

@@ -32,6 +32,9 @@ pub mod subcommands;
 pub mod timings;
 pub mod update_check;
 
+#[cfg(test)]
+mod tests;
+
 pub use cli::{
     Cli, ExtFlagValue, ExtensionFlag, Mode, OutputFormat, ThinkingArg, TuiMode,
     normalize_short_aliases, partition_extension_flags, render_help, resolve_app_mode,

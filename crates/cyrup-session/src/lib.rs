@@ -53,3 +53,6 @@ pub use prompt::{
     SkillPointer, SystemPromptBuilder, ToolPromptContribution, TrustQuery,
 };
 pub use store::{DiskStore, MemStore, SessionStore};
+
+#[cfg(test)]
+mod tests;

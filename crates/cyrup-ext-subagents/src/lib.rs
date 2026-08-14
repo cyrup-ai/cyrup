@@ -54,6 +54,11 @@ pub mod spawn;
 pub mod tui;
 pub mod watchdog;
 
+/// Crate-internal test modules relocated out of `tests/` (see [`tests`]'s own module doc):
+/// in-process tests that never needed a separate Cargo integration-test binary.
+#[cfg(test)]
+mod tests;
+
 // P-5 (cyrup-permission-system-port.md §4 / reconciliation §2): re-export the `background::control`
 // file-channel primitives + the R-SA-P1 parent-session anchor const at the crate root so the
 // permission companion's child→parent ask-forwarding spool (its own P-4 build) consumes them

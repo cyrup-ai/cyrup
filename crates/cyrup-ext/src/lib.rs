@@ -36,6 +36,9 @@ pub mod registry;
 pub mod subscriber;
 pub mod wrapper;
 
+#[cfg(test)]
+mod tests;
+
 #[cfg(feature = "wasm-host")]
 pub mod caps;
 #[cfg(feature = "wasm-host")]

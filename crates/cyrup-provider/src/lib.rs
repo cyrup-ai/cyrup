@@ -187,3 +187,6 @@ pub mod known_api {
     /// pi `KnownApi` (`ai/src/types.ts:16-26`). Ported in the unported-work sweep.
     pub const OPENAI_CODEX_RESPONSES: &str = "openai-codex-responses";
 }
+
+#[cfg(test)]
+mod tests;

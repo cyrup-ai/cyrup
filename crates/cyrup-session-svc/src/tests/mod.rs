@@ -1,0 +1,42 @@
+//! Crate-internal test modules (relocated from `tests/` so the whole crate's tests
+//! build and run as ONE binary instead of one process per file).
+
+mod abort_settles;
+mod added_tool_names_producer;
+mod agent_settled;
+mod attribution_follows_model;
+mod base_system_prompt;
+mod bash_session_env_wiring;
+mod before_session_invalidate;
+mod build_containment_and_flag_diagnostics;
+mod compact_refusals;
+mod compaction_tokens_after;
+mod control_ops;
+mod ctx_state_and_abort;
+mod fork_non_persisted;
+mod integration;
+mod mid_run_tool_anchoring;
+mod modelless_launch;
+mod native_host_services;
+mod native_slash_command_output;
+mod project_trust_extension;
+mod read_image_auto_resize;
+mod read_model_vision;
+mod remote_catalog_overlay;
+mod round2;
+mod round3;
+mod round4;
+mod round5;
+mod round6;
+mod round7;
+mod round8_postrun;
+mod round9_l5res;
+mod session_branch_dir;
+mod session_dag;
+mod session_list_dir;
+mod session_start_lifecycle;
+mod session_stats_shape;
+mod settings_resolve;
+mod summarization_retry_events;
+mod tool_usage_extension_seam;
+mod transport_setting;

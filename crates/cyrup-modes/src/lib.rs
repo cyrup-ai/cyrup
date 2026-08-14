@@ -21,6 +21,8 @@ mod json;
 mod json_event;
 mod print;
 mod rpc;
+#[cfg(test)]
+mod tests;
 
 pub use error::ModesError;
 pub use json::run_json;

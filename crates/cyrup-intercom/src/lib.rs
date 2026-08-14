@@ -30,5 +30,8 @@ pub mod tools;
 pub mod transport;
 pub mod ui;
 
+#[cfg(test)]
+mod tests;
+
 pub use error::{IntercomError, Result};
 pub use extension::{IntercomExtension, intercom_extension_for_env, intercom_extension_for_env_concrete};

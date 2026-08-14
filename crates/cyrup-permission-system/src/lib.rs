@@ -89,6 +89,9 @@ pub mod types;
 pub mod wildcard;
 pub mod yolo_api;
 
+#[cfg(test)]
+mod tests;
+
 pub use ask::{
     AskChannel, AskOutcome, ForwardingAskChannel, LocalAskChannel, NoOpAskChannel,
     PermissionDecisionState, PermissionPromptDecision, PromptOpts,

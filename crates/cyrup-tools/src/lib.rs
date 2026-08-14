@@ -49,3 +49,6 @@ pub use registry::{
     all_tools, coding_tools, read_only_tools, Availability, ToolRegistry, BUILTIN_NAMES,
 };
 pub use truncate::{Truncated, Truncation, TruncatedBy};
+
+#[cfg(test)]
+mod tests;

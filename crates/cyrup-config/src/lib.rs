@@ -68,3 +68,6 @@ pub use trust::{
     format_project_trust_prompt, has_trust_requiring_resources, project_trust_parent_path,
     resource_stage, select_loaded, should_load, trust_options,
 };
+
+#[cfg(test)]
+mod tests;

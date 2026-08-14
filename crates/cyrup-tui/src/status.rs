@@ -672,3 +672,33 @@ fn truncate_spans(
     out.push(Span::styled(ellipsis.to_string(), ellipsis_style));
     out
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod tests {
+    use super::StatusLine;
+
+    /// Salvaged from the retired `tests/footer_extensions.rs`: the only two assertions there that
+    /// were not already covered by `tests/footer_chrome_fidelity.rs` (rendered/resolved cell colour)
+    /// and `tests/extension_ui_effects.rs` (the real `UiEffect` set/clear path). Both are pure
+    /// statements about `extension_status_text` — `BTreeMap` key ordering and control-char collapse
+    /// (`footer.ts:235-240`).
+    #[test]
+    fn extension_status_text_is_key_sorted_and_sanitized() {
+        let mut status = StatusLine::new("anthropic/opus");
+        // Inserted out of order; the BTreeMap keys order the output (alpha before zeta).
+        status.set_extension_status("zeta", "z-status");
+        status.set_extension_status("alpha", "a\n\tline");
+        assert!(status.has_extension_statuses());
+        assert_eq!(status.extension_status_text(), "a line z-status");
+    }
+
+    #[test]
+    fn blank_extension_status_value_clears_the_entry() {
+        let mut status = StatusLine::new("m");
+        status.set_extension_status("ext", "busy");
+        assert!(status.has_extension_statuses());
+        status.set_extension_status("ext", "   ");
+        assert!(!status.has_extension_statuses(), "blank value removes the entry");
+    }
+}

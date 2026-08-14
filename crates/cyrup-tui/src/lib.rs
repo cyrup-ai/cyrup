@@ -84,6 +84,11 @@ mod transcript;
 mod tree_selector;
 mod user_message_selector;
 
+/// The crate's headless render / keymap / selector suites. They lived one-file-per-binary under
+/// `tests/`; compiled here they are a single unit-test target instead of ~77 linked processes.
+#[cfg(test)]
+mod tests;
+
 pub use app::{
     crossterm_input_stream, extension_render, reanchor_inline_region, render,
     should_honor_extension_shutdown, tree_node_from_dag, App, AppAction, AppCommand, AppState,
