@@ -1,0 +1,207 @@
+# crates/cyrup-it/Cargo.toml
+#
+# The workspace's ONE integration-test crate (docs/TEST-ARCHITECTURE.md §2). `it` = integration
+# test, matklad's convention, under this workspace's `cyrup-*` prefix.
+#
+# It holds ONLY the seam tests — the ones that spawn `cyrup`, drive a subagent child process, load a
+# live `wasm32-wasip2` component, or open a broker socket. Everything that can assert in-process
+# lives in its own crate's `#[cfg(test)]` modules and must stay there (§9.1).
+#
+# It has NO `[lib]` and NO `[dependencies]`. That is load-bearing, not an oversight — see the note
+# above `[dev-dependencies]`.
+[package]
+name                 = "cyrup-it"
+description          = "Cross-crate integration (seam) tests: spawned binaries, live wasm guests, real sockets"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+authors.workspace    = true
+
+# Hygiene only. `publish` is NOT a gate: it is a registry flag and has no effect whatsoever on
+# package selection or test execution (docs/TEST-ARCHITECTURE.md §2.3). The gate is
+# `required-features` below.
+publish   = false
+
+# No auto-discovery. Every target is declared explicitly below so that (a) each one carries its own
+# `required-features` gate and (b) the manifest is a greppable inventory of what exists. Without
+# this, cargo would pick up `tests/support/` as a target of its own.
+autotests = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+# ============================ THE GATE ============================
+# `it` arms every [[test]] target below via `required-features`. OFF by default, so the merge gate
+# (`cargo test --workspace`) does not build, link, or run any of them, and build.rs no-ops.
+#
+# Chosen over `default-members` exclusion because `--workspace` overrides `default-members`
+# ENTIRELY, and this repo's gate is `cargo test --workspace` — that lever is provably inert here.
+# `required-features` is the only manifest field that skips a target under any package-selection
+# flag (cargo-targets.html#the-required-features-field).
+#
+# !!! HAZARD !!!  `--all-features` SILENTLY RE-ARMS THIS ENTIRE SUITE.
+# `cargo test --workspace --all-features` turns `it` on and runs every seam test — spawning
+# processes, opening sockets, and requiring the wasm32-wasip2 toolchain — with no diagnostic
+# saying why the run suddenly takes minutes. The same flag also unifies `cyrup-provider/faux` onto
+# a normal edge (root Cargo.toml:27-38). `--all-features` must not appear in CI or in a script;
+# docs/TEST-ARCHITECTURE.md §9.3 makes that a checked invariant (G3).
+it = []
+
+# Forwards the Wasmtime Component Model host feature to the crates whose seam tests instantiate a
+# live guest. Both crates enable `wasm-host` in their OWN `default`, so with default features this
+# is already on and the flag is a no-op; it exists so a caller who builds this crate with
+# `--no-default-features` on the graph can re-arm the host explicitly. NOTE the deliberate
+# deviation from §2.2: the `[[test]]` targets require ONLY `it`, never `it, wasm-host` — see the
+# comment on the `ext` target.
+wasm-host = ["cyrup-ext/wasm-host", "cyrup-session-svc/wasm-host"]
+
+# ======================= NO [dependencies] SECTION. DELIBERATE. =======================
+#
+# A `[lib]` here would need real `[dependencies]` (dev-deps are invisible to a lib), and
+# `cargo build --workspace` unifies features PER PACKAGE across everything it builds. That is
+# exactly the PROV-052 trap the root Cargo.toml documents at lines 25-48: `cyrup-test-support` is
+# the only crate whose `[dependencies]` enables `cyrup-provider/faux`, and leaving it in
+# `default-members` compiled the test double into the shipping binary. `cyrup-it` must not reopen
+# that hole. All shared harness code therefore lives in `cyrup-test-support`, which already owns
+# that edge and already carries the exclusion rationale; anything genuinely local to this suite
+# lives in `tests/support/` and is compiled only into the test targets.
+
+[dev-dependencies]
+# `cyrup-test-support` has no `[workspace.dependencies]` entry (it is deliberately not a normal
+# dependency of anything); the two crates that dev-depend on it today use a path, so this matches.
+cyrup-test-support      = { path = "../cyrup-test-support" }
+cyrup-core              = { workspace = true }
+# `features = ["faux"]` is REQUIRED, not decorative: `tests/bin/{embedder_seams,embedding,
+# lifecycle,runtime}.rs` build real sessions over `cyrup_provider::faux::FauxProvider`, and the
+# module does not exist without it. This matches `crates/cyrup-sdk/Cargo.toml`'s own dev-dependency,
+# which is where those four files came from. It is a DEV edge, so PROV-052 is untouched: the
+# invariant `tests/bin/faux_not_in_normal_build.rs` asserts is about
+# `cargo tree -p cyrup -e features --edges normal`, which no dev-dependency of this crate appears in.
+cyrup-provider          = { workspace = true, features = ["faux"] }
+cyrup-agent             = { workspace = true }
+cyrup-tools             = { workspace = true }
+cyrup-session           = { workspace = true }
+cyrup-config            = { workspace = true }
+cyrup-resources         = { workspace = true }
+cyrup-ext               = { workspace = true }
+cyrup-session-svc       = { workspace = true }
+cyrup-modes             = { workspace = true }
+cyrup-sdk               = { workspace = true }
+cyrup-tui               = { workspace = true }
+cyrup-intercom          = { workspace = true }
+cyrup-permission-system = { workspace = true }
+cyrup-ext-subagents     = { workspace = true }
+# The GUEST sdk, on the HOST target. Two reasons it is here: `tests/ext/ergonomic.rs` drives its
+# ergonomic dispatch layer directly (the crate is `["cdylib", "rlib"]` precisely so that layer is
+# host-testable — crates/cyrup-ext-sdk/Cargo.toml:19), and `tests/ext/build_tier1.rs` uses it as the
+# authored-extension crate the Tier-1 build loop compiles. No `[workspace.dependencies]` entry
+# exists for it (it is deliberately not a normal dependency of anything, being excluded from
+# default-members as a wasm32-wasip2 guest), so this is a path dep, matching `cyrup-test-support`
+# above. This edge is the HOST rlib only; the wasm32-wasip2 component comes from build.rs.
+cyrup-ext-sdk           = { path = "../cyrup-ext-sdk" }
+# The `cyrup` BIN package's library half. `tests/bin/package_update_check.rs` drives
+# `cyrup::update_check::{git_has_available_update, check_for_available_updates}` in-process against
+# real git repositories — the binary seam is not involved, so this is an ordinary library edge, and
+# it is exactly the edge the design says an external API-surface test may take. NO
+# `features = ["faux"]` here: nothing in this crate calls the CLI's faux arm in-process, the five
+# tests that need `--model faux/faux-1` get it from the SPAWNED binary that `build.rs` builds with
+# that feature, and adding it here would put a `faux` edge on a package this crate links directly.
+# There is no `[workspace.dependencies]` entry for `cyrup` (it is the leaf bin, depended on by
+# nothing), so this is a path dep, matching `cyrup-test-support` above.
+cyrup                   = { path = "../cyrup" }
+tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "process", "net", "time", "io-util", "fs", "sync"] }
+# `futures::StreamExt` in `tests/bin/{embedding,runtime}.rs` (draining an `AgentSessionEvent`
+# stream); `async_trait` for the `ApiKeyResolver` / `NativeExtension` impls the SDK seam tests
+# declare inline (`tests/bin/{embedder_seams,lifecycle}.rs`), and for the `permission` target's two
+# hand-written async-trait doubles: `cyrup_core::Tool` (the recording `bash` in
+# gate_integration/human_dialog/empty_command_truthiness) and `cyrup_permission_system::AskChannel`.
+futures    = { workspace = true }
+async-trait = { workspace = true }
+# `ratatui::backend::TestBackend` — `tests/bin/wasm_renderer_screen.rs` asserts on terminal CELLS,
+# so it needs the backend type by name. Pinned to the same version `crates/cyrup-tui/Cargo.toml`
+# declares; there is no `[workspace.dependencies]` entry for ratatui to point at, and creating one
+# is not this crate's call.
+ratatui    = "0.30.2"
+serde_json = { workspace = true }
+# `tests/subagents/background_cascade_integration.rs` has a generic
+# `read_json<T: serde::de::DeserializeOwned>` helper, so it names the `serde` trait directly rather
+# than going through `serde_json`'s re-exports. It resolved in the source crate because
+# cyrup-ext-subagents carries serde as a normal dependency; here it needs its own dev-dep entry.
+serde      = { workspace = true }
+tempfile   = { workspace = true }
+# No `[workspace.dependencies]` entry exists for anyhow (only `crates/cyrup` declares it, as a
+# bin-only external at crates/cyrup/Cargo.toml:85). Declared literally here at the same version
+# rather than promoting it workspace-wide, which is not this crate's call to make.
+anyhow     = "1"
+# `uuid::Uuid::new_v4()` for the question ids and per-probe session names in
+# `tests/intercom/{broker_roundtrip,broker_extension_bus_miss_branches}.rs`. The
+# `[workspace.dependencies]` entry (root Cargo.toml:173) carries only `v7`, so `v4` is added here
+# exactly as `crates/cyrup-intercom/Cargo.toml` does — features are additive, so this widens nothing
+# for anyone else.
+uuid       = { workspace = true, features = ["v4"] }
+
+[build-dependencies]
+# The build script parses `cargo build --message-format=json` artifact records. Nothing else.
+serde_json = { workspace = true }
+
+# ============================== TARGETS ==============================
+# ONE TARGET PER SOURCE CRATE, not per seam (deviation from §3.1's seam grouping, recorded here so
+# the next reader does not "fix" it back): six agents migrate six source crates concurrently, and
+# per-crate targets keep their file ownership disjoint — a seam grouping would put two agents in
+# `tests/wasm/` at once.
+#
+# Each is a DIRECTORY target (`tests/<name>/main.rs`), the shape `rust-lang/cargo`'s own
+# `tests/testsuite/` uses to hold 154 files in one binary. `main.rs` is nothing but `mod`
+# declarations plus `mod support;`.
+#
+# One binary per crate, not one for the workspace, also means a `process::exit`, an abort or a
+# segfault in one crate's seam cannot take the other six down with no report (§4 R6).
+
+[[test]]
+name              = "subagents"
+path              = "tests/subagents/main.rs"
+required-features = ["it"]
+
+[[test]]
+name              = "intercom"
+path              = "tests/intercom/main.rs"
+required-features = ["it"]
+
+[[test]]
+# NOT `required-features = ["it", "wasm-host"]`, despite §2.2's `wasm` target. `wasm-host` is
+# already on through `cyrup-ext`'s own default features, so adding it here would change nothing
+# about what compiles — while making `--features it` silently SKIP this target, which is the exact
+# failure mode the gate exists to make visible. Re-add it the day `cyrup-ext` stops defaulting it on.
+name              = "ext"
+path              = "tests/ext/main.rs"
+required-features = ["it"]
+
+[[test]]
+name              = "permission"
+path              = "tests/permission/main.rs"
+required-features = ["it"]
+
+[[test]]
+name              = "session_svc"
+path              = "tests/session_svc/main.rs"
+required-features = ["it"]
+
+[[test]]
+# The `cyrup` binary's own seam: argv, exit codes, stdio. Named `bin` (not `cli`) because the
+# source crate it drains is `crates/cyrup`.
+name              = "bin"
+path              = "tests/bin/main.rs"
+required-features = ["it"]
+
+[[test]]
+# The small tails: cyrup-sdk (4), cyrup-tui (2), cyrup-tools (2), cyrup-provider (1),
+# cyrup-ext-sdk (1). Follow ripgrep's habit and keep a curation note in the target's module doc —
+# `misc` is where a suite goes to rot if nobody says stop.
+name              = "misc"
+path              = "tests/misc/main.rs"
+required-features = ["it"]

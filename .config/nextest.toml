@@ -25,3 +25,50 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # Never silently absorb a crash/kill: a test that leaves no result must not be retried into green.
 # (Retries stay off on purpose — an intermittent red is a defect to diagnose, not to re-roll.)
 retries = 0
+
+# The tripwire this file's header describes, made into a bounded, NAMED failure.
+#
+# A test "leaks" when it exits but leaves a child holding the harness's stdout/stderr pipe open.
+# `Command::output()` / `wait_with_output()` read to EOF, NOT to child exit, so the read blocks
+# until that grandchild dies — which is exactly what a detached `__intercom-broker` with an
+# inherited FD above 2 did to `crates/cyrup/tests/piped_stdin_trim.rs` on 2026-08-12, hanging the
+# batch until the broker was killed by hand. nextest bounds this class ("leaky tests"), and the
+# caveat cuts the right way here: it only detects children that inherited stdout/stderr, and the
+# broker did. 500ms is far beyond any legitimate teardown, so this converts a silent 180s stall
+# into a LEAK-FAIL naming the test in half a second.
+#
+# It is a tripwire, not a fix. A leaked test is a RED (`result = "fail"`), never a warning — the
+# two defects behind that hang are being closed at their source.
+leak-timeout = { period = "500ms", result = "fail" }
+
+# ---------------------------------------------------------------------------------------------
+# Test groups — cross-PROCESS mutual exclusion, which an in-binary `Mutex` cannot provide.
+#
+# nextest runs each test in its own process, so a shared `static ENV_LOCK` serializes nothing
+# between them. These groups are what actually bound concurrency for tests that touch a global
+# system resource. They apply to the `cyrup-it` seam suite (`cargo nextest run -p cyrup-it
+# --features it`); under the everyday `--workspace` gate those targets are not built at all, so
+# the filters simply match nothing.
+# ---------------------------------------------------------------------------------------------
+[test-groups]
+# One at a time, full stop. These tests mutate or depend on process-global state (env vars a child
+# inherits, first-writer-wins statics) where two concurrent processes race each other. It replaces
+# the 33 per-file `static ENV_MUTATION_LOCK`s that became no-ops the moment two files shared a
+# binary.
+env-mutating = { max-threads = 1 }
+
+# The broker suite spawns real processes bound to real sockets. Not serial — each test owns its own
+# socket under its own TempDir — but bounded, because 18 concurrent brokers plus their children is
+# a lot of live FDs and PIDs for one machine, and a leak here is expensive to diagnose.
+broker = { max-threads = 4 }
+
+[[profile.default.overrides]]
+# `binary(subagents)` is the whole cyrup-ext-subagents seam target: every one of those tests hands
+# `CYRUP_SUBAGENT_*` / `CYRUP_HOME` to a child and several assert on what the child inherited.
+# `test(/env_/)` catches the same shape wherever else it lands.
+filter     = 'binary(subagents) or test(/env_/)'
+test-group = 'env-mutating'
+
+[[profile.default.overrides]]
+filter     = 'binary(intercom)'
+test-group = 'broker'

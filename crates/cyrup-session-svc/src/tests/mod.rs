@@ -14,6 +14,7 @@ mod compaction_tokens_after;
 mod control_ops;
 mod ctx_state_and_abort;
 mod fork_non_persisted;
+mod install_noop;
 mod integration;
 mod mid_run_tool_anchoring;
 mod modelless_launch;

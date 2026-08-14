@@ -1153,7 +1153,6 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -1222,6 +1221,39 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "cyrup-it"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cyrup",
+ "cyrup-agent",
+ "cyrup-config",
+ "cyrup-core",
+ "cyrup-ext",
+ "cyrup-ext-sdk",
+ "cyrup-ext-subagents",
+ "cyrup-intercom",
+ "cyrup-modes",
+ "cyrup-permission-system",
+ "cyrup-provider",
+ "cyrup-resources",
+ "cyrup-sdk",
+ "cyrup-session",
+ "cyrup-session-svc",
+ "cyrup-test-support",
+ "cyrup-tools",
+ "cyrup-tui",
+ "futures",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "uuid",
 ]
 
