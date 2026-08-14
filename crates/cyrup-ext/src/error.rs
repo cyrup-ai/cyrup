@@ -34,6 +34,11 @@ pub enum ExtError {
     /// World-version incompatibility recorded in the manifest (arch-08 §4.1).
     #[error("world version mismatch: found {found}, required {required}")]
     WorldVersion { found: String, required: String },
+    /// A malformed `capabilities` declaration in `extension.json` (EXT-054). Fails the load rather
+    /// than dropping the grant: a typo that quietly widens or narrows the sandbox is precisely the
+    /// failure EXT-054 was filed for.
+    #[error("invalid capability declaration: {0}")]
+    Capability(String),
     /// Invalid tool `parameters` JSON-Schema at registration (R-ARCH-EXT-008).
     #[error("invalid tool schema: {0}")]
     Schema(String),

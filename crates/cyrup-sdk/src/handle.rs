@@ -327,16 +327,19 @@ impl Session {
         Ok(self.inner.set_model(pattern).await?)
     }
 
-    /// The current model address.
+    /// The current model address, or `None` when no model is selected (pi
+    /// `AgentSession.model: Model | undefined`, agent-session.ts:866-868 — the state a
+    /// credential-less session launches in).
     ///
     /// # Examples
     /// ```no_run
     /// # async fn demo(session: &cyrup_sdk::Session) {
-    /// let model = session.model();
-    /// println!("{}/{}", model.provider, model.model);
+    /// if let Some(model) = session.model() {
+    ///     println!("{}/{}", model.provider, model.model);
+    /// }
     /// # }
     /// ```
-    pub fn model(&self) -> ModelRef {
+    pub fn model(&self) -> Option<ModelRef> {
         self.inner.model()
     }
 

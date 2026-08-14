@@ -117,11 +117,11 @@ the embedder SDK (`cyrup/crates/cyrup-sdk/`), measured against
 | SEAM-S03 | still open | `grep -rn 'kill_tracked\|track_detached\|DETACHED_PIDS\|tracked_pids' crates/` returns ZERO. Detached children ARE created (`cyrup-tools/src/ops/local.rs:272` `setsid`, `:334` `killpg`) with no process-global registry. |
 | SEAM-S04 | **closed** | `runtime.rs:36` `BeforeSessionInvalidate = Arc<dyn Fn() + Send + Sync>` (synchronous, matching pi's `() => void`), field `:239`, setter `:364-365`, fired at `session.rs:2427-2429` — after `dispatch_notify(SessionShutdown)`, before `session_cancel.cancel()` (`:2431`). |
 | SEAM-S05 | **closed** | `rpc.rs:575-606` splits `rpc_driver` from `write_pump` (`:618-629`) and races them; every driver emission is a non-awaited `let _ = out.send(...)`. Upstream `output-guard.ts:85-103`. |
-| SEAM-047 | **new** | First SIGTERM/SIGHUP neither tears down nor exits — `--mode rpc` runs forever. **high**. |
+| SEAM-047 | **new** · **FIXED 2026-08-13** | First SIGTERM/SIGHUP neither tears down nor exits — `--mode rpc` runs forever. **high**. |
 | SEAM-048 | **new** | `get_commands` enumerates the last-wins command `HashMap`; pi's `name:N` disambiguation tier is dead code. `medium` (mechanism corrected by the refuter). |
 | SEAM-049 | **new** | Forking before the first message drops pi's `parentSession` link. |
 | SEAM-050 | **new** | `cyrup auth check` unrecognized; the whole v0.84.1 auth-command surface unported. |
-| SEAM-051 | **new** — **raised to `high`** in the repair pass | `--tui-mode <regular\|fullscreen>` rejected with exit 1 instead of parsed. Supersedes SEAM-019. The default value refuses to launch the binary. |
+| SEAM-051 | **new** — **raised to `high`** · **FIXED 2026-08-13** | `--tui-mode <regular\|fullscreen>` rejected with exit 1 instead of parsed. Supersedes SEAM-019. The default value refuses to launch the binary. |
 | SEAM-052 | **new** | `--version` prints `cyrup <version>` and pre-empts the parse-error diagnostics pi reports first. |
 | SEAM-053 | **new** | Optional RPC wire fields emitted as explicit `null` where pi omits the key (second instance corrected by the refuter). |
 | SEAM-054 | **new** | A blank stdin line is dropped instead of producing pi's `parse` error response. |
@@ -134,14 +134,15 @@ the embedder SDK (`cyrup/crates/cyrup-sdk/`), measured against
 | SEAM-061 | **new** (repair pass) | `--resume` picker merges current-folder AND all-projects sessions into one list, labels it "Current Folder", and advertises a dead `tab scope` toggle. **high**. |
 | SEAM-062 | **new** (repair pass) | Pre-launch `--resume` picker offers rename, shows the new name, and discards it. **high**. |
 | SEAM-063 | **new** (repair pass) | Session delete permanently unlinks; pi tries the `trash` CLI first. The `io::Result` is discarded, so a failed delete still reports success. **high**. |
-| SEAM-064 | **new** (repair pass) | Pre-launch trust prompt omits both "(this session only)" options, so every trust answer is persisted. **high**. |
+| SEAM-064 | **new** (repair pass) · **FIXED 2026-08-13** | Pre-launch trust prompt omits both "(this session only)" options, so every trust answer is persisted. **high**. |
 | SEAM-065 | **new** (repair pass) | Trust resolved pre-launch, inverting pi's tier order — an extension `project_trust` verdict is skipped entirely. **high**. |
 | SEAM-066 | **new** (repair pass) | Every pre-launch TUI surface hardwires the dark palette. |
 | SEAM-067 | **new** (repair pass) | Pre-launch selectors never load `keybindings.json`; hint rows print the wrong keys. |
 | SEAM-068 | **new** (repair pass) | `--list-models <search>` uses a lossy hand-rolled filter while a faithful port of `fuzzyFilter` sits unused. |
 | SEAM-069 | **new** (repair pass) | Trust prompt's saved-decision line never says "inherited from". |
 | SEAM-070 | **new** (repair pass) | `process.title` role suffix unported — rpc/subagent/broker children are indistinguishable in `ps`. |
-| SEAM-071 | **new** (suite-verification pass) | `--no-extensions` nulls only the WASM/disk discovery roots; the three native built-ins load anyway (`builder.rs:775`, no `no_extensions` anywhere in `crates/cyrup/src/main.rs`). |
+| SEAM-071 | **FIXED 2026-08-13** | Gated in `builder.rs` (pi gates in its resource loader, not its CLI). THREE paths closed, not one: the native loop, the package tier re-admitted through `configured`, and the pre-trust vote. Gates only the AMBIENT tier — pi loads its inline `extensionFactories` regardless of `noExtensions` (`resource-loader.ts:579-581`), which ten test files here depend on. Subagent-child carve-out decided from `pi-args.ts:413-417` — permission-system/prompt-runtime/subagents survive in a CHILD only; intercom does not. **Live-verified 2026-08-13**: broker count 0→1 with extensions on, 0→0 with `-ne`. Residual SEAM-074 also now closed. |
+| SEAM-074 | **FIXED 2026-08-13** (filed from the SEAM-071 fix, closed in the verification pass) | The four shipped built-ins now answer `NativeExtension::is_ambient()`; the `AMBIENT_NATIVE_IDS` list is deleted. It was **not** cosmetic: matching on the id also caught an INLINE extension sharing the name, which dropped `build_containment_and_flag_diagnostics`'s hand-injected `FailingExt { id: "subagents" }` out of the load and lost its init failure from both the panel and the fatal exit channel. |
 | SEAM-072 | **new**, **closed** (fixed) · high | `build_inputs` read process stdin instead of taking Pi's `stdinContent` argument; any inherited open pipe hung the target forever. Read moved to `main.rs`, matching `main.ts:819-832`. |
 | SEAM-073 | **new** (suite-verification pass) | 14 temp dirs leaked per `-p cyrup-session-svc` run; `FileLock` never removes its lock file and a models-store access lands after `TempDir` teardown. |
 
@@ -157,10 +158,11 @@ the check that establishes it. Do not "recover" them.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| SEAM-051 | high | upstream-drift | S | `--tui-mode` rejected with exit 1 — the DEFAULT value makes the binary refuse to start |
-| SEAM-047 | high | parity-bug | M | First SIGTERM/SIGHUP neither tears down nor exits 143/129 — `--mode rpc` never returns |
+| SEAM-075 | **high** | parity-bug (regression) | M | **NEW 2026-08-13** — a credential-less INTERACTIVE launch hard-errors where pi opens the TUI so `/login` can be typed |
+| SEAM-051 | high | upstream-drift | S | **FIXED 2026-08-13** — `--tui-mode` rejected with exit 1 — the DEFAULT value makes the binary refuse to start |
+| SEAM-047 | high | parity-bug | M | **FIXED 2026-08-13** — First SIGTERM/SIGHUP neither tears down nor exits 143/129 — `--mode rpc` never returns |
 | SEAM-065 | high | parity-bug | M | Trust resolved pre-launch, inverting pi's tier order — the extension `project_trust` hook is skipped |
-| SEAM-064 | high | parity-bug | S | Pre-launch trust prompt omits both "(this session only)" options — every answer is persisted |
+| SEAM-064 | high | parity-bug | S | **FIXED 2026-08-13** — Pre-launch trust prompt omits both "(this session only)" options — every answer is persisted |
 | SEAM-063 | high | parity-bug | M | Session delete permanently unlinks where pi routes through `trash`; the failure is swallowed |
 | SEAM-061 | high | parity-bug | M | `--resume` picker lists every project's sessions under "Current Folder" with a dead `tab scope` toggle |
 | SEAM-062 | high | parity-bug | S | Pre-launch rename is accepted, echoed on screen, and silently discarded |
@@ -183,7 +185,8 @@ the check that establishes it. Do not "recover" them.
 | SEAM-066 | medium | parity-bug | M | Every pre-launch TUI surface hardwires the dark palette, ignoring `settings.theme` |
 | SEAM-067 | medium | not-ported | S | Pre-launch selectors never load `keybindings.json`, and their hint rows name the wrong keys |
 | SEAM-068 | medium | parity-bug | S | `--list-models <search>` uses a lossy hand-rolled fuzzy filter; the faithful port sits unused |
-| SEAM-071 | medium | parity-bug | S | `--no-extensions` does not gate the native built-ins (permission-system, subagents, intercom) |
+| ~~SEAM-071~~ | ~~medium~~ | parity-bug | S | **FIXED 2026-08-13** — `--no-extensions` now gates the AMBIENT natives, the package tier and the pre-trust vote; pi's inline-factory tier is correctly left alone; **live broker-count verification NOW DONE** (see the item) |
+| ~~SEAM-074~~ | ~~low~~ → medium | cyrup-original | S | **FIXED 2026-08-13** — the four shipped built-ins now answer `NativeExtension::is_ambient()`; `AMBIENT_NATIVE_IDS` deleted. Not cosmetic after all: the id list was dropping a hand-injected `FailingExt { id: "subagents" }` and turned `build_containment_and_flag_diagnostics` RED |
 | SEAM-072 | high | parity-bug | S | `build_inputs` owned fd 0 instead of taking `stdinContent` — indefinite hang on an inherited pipe — **fixed this pass** |
 | SEAM-073 | low | cyrup-original | S | 14 temp dirs leaked per session-svc run; `FileLock` never deletes its lock file |
 | SEAM-017 | low | not-ported | M | No `RpcClient` counterpart |
@@ -217,7 +220,32 @@ Keeps its ID and its body; proposes no schedulable work today.
 
 ## SEAM-047 — First SIGTERM/SIGHUP neither tears down nor exits 143/129; `--mode rpc` keeps running forever and never emits session_shutdown
 
-**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md)) · **FIXED 2026-08-13**
+
+> **FIXED 2026-08-13.** `crates/cyrup/src/signals.rs` is now a per-host port of pi's three
+> `registerSignalHandlers` sites. `spawn_abort_on_signal(runtime, cancel, host)` takes the
+> `Arc<AgentSessionRuntime>` and the resolved `AppMode`; on the FIRST SIGTERM/SIGHUP in a
+> non-interactive host it aborts the CURRENT session, fires `cancel`, `await runtime.dispose()`
+> (the `session_shutdown{quit}` emission — pi `runtimeHost.dispose()`, print-mode.ts:57 /
+> rpc-mode.ts:733) and `process::exit(143|129)` (print-mode.ts:52-62, rpc-mode.ts:374). The repeat
+> watcher is armed *concurrently* with that dispose, which is pi's re-entrancy guard
+> `if (shuttingDown) process.exit(exitCode)` (rpc-mode.ts:723-726). Interactive keeps the cancel
+> token as its whole handler because its exit is the run loop's (`main.rs` disposes and returns 0,
+> matching interactive-mode.ts:3559-3580) — exiting from the watcher would race the terminal restore.
+>
+> **Test** `crates/cyrup/tests/signal_shutdown.rs` — drives the real binary in `--mode rpc`, waits
+> for a `get_state` round-trip so the serving loop is provably up, delivers ONE signal, and requires
+> exit 143 (SIGTERM) / 129 (SIGHUP) within 15 s. **RED before** (probe: first delivery restored to
+> "no exit" → `still alive 15s after the FIRST -TERM — SEAM-047`, both cases), **GREEN after**
+> (`2 passed`). `cargo test -p cyrup` → 19 targets, 0 failed.
+>
+> **Two riders closed with it, as their own entries instruct.** `SEAM-059` — the watcher no longer
+> holds the startup session `Arc`; it does `runtime.session().await.abort()`, pi's always-current
+> dereference. `DRIFT-049` (duplicate-of this item) is closed by the same change.
+> **NOT closed:** `SEAM-S03` — no detached-child registry exists to drain (pi's
+> `killTrackedDetachedChildren()` has no cyrup counterpart, and `cyrup-tools` is outside this
+> group's file ownership), so the handler cannot yet do pi's synchronous first step. **`SEAM-008`'s
+> Fix is now the wrong mechanism** — see its entry.
 
 > **Reproduced 2026-08-13, exit codes as evidence.** A live `cyrup --mode rpc` (stdin held open on a
 > fifo) absorbs the first SIGTERM **and** the first SIGHUP completely — still running 15 s later,
@@ -252,7 +280,28 @@ Keeps its ID and its body; proposes no schedulable work today.
 
 ## SEAM-064 — The pre-launch trust prompt omits both "(this session only)" options, so every trust answer is written to `trust.json` permanently
 
-**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed (both sides re-read in the repair pass) · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed (both sides re-read in the repair pass) · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md)) · **FIXED 2026-08-13**
+
+> **FIXED 2026-08-13.** `crates/cyrup/src/main.rs` now calls
+> `cyrup_config::trust::trust_options(&dirs.cwd, true)` at the pre-launch site, with a comment citing
+> pi `project-trust.ts:32` (`getProjectTrustOptions(cwd, { includeSessionOnly: true })`) and warning
+> the next reader NOT to make the same change at `cyrup-session-svc/src/session.rs:3255`, which is
+> pi's in-app selector and genuinely passes the default `false` (trust-selector.ts:44). One literal;
+> `trust.rs` was already correct on both sides of the flag.
+>
+> **Test** `startup_ui.rs` gains `pre_launch_trust_prompt_offers_pi_five_rows_and_session_only_writes_nothing`:
+> asserts pi's five labels in pi's order, that rows 2 and 4 carry an EMPTY `updates` and no
+> `saved_path` (so `set_many` writes nothing — pi's `if (result.updates.length > 0)` guard,
+> project-trust.ts:40-44), that `interpret_trust` still maps those indices to `Chosen`, and — as the
+> control that keeps it from being a blanket disarm — that rows 0/1/3 still persist.
+>
+> **Honest limit on the evidence.** That test pins the OPTION-SET contract; it cannot reach the
+> `main.rs` argument, because the prompt is a `CrosstermBackend` surface with no unit-test seam. The
+> production line is verified by inspection only. **A live pty run must still show:** five rows in a
+> folder with `.cyrup/` resources; Enter on "Trust (this session only)" → the session runs trusted
+> and `<agent_dir>/trust.json` is **not created**; Enter on "Do not trust (this session only)" →
+> untrusted, still no file; Enter on "Trust" → the file appears, exactly as the 2026-08-13 repro
+> measured for the three-row prompt.
 
 > **Reproduced 2026-08-13 on a real pty.** The startup prompt renders exactly **three** rows — Trust
 > / Trust parent folder (`<parent>`) / Do not trust — with no session-only variant of either answer.
@@ -389,7 +438,21 @@ at all**, so this fix must add one, not merely correct one.)* Add a `delete_sess
 
 **Impact** — A SIGTERM'd or hung-up cyrup reports the transcript's 0/1/130 rather than 143/129, so supervisors and CI cannot distinguish a killed run from a clean one on the first signal — only on a second one, which most supervisors never send before SIGKILL.
 
-**Fix** — Publish the `ShutdownSignal` from the first delivery: change `spawn_abort_on_signal` (`signals.rs:88-101`) to send it on a `watch`/`oneshot` before `cancel.cancel()`, and have the dispatchers in `run.rs:22`/`:50`/`:101` prefer that code over the transcript-derived one. This is the data half of SEAM-047's plumbing; land them together.
+**Fix** — ~~Publish the `ShutdownSignal` from the first delivery: change `spawn_abort_on_signal` (`signals.rs:88-101`) to send it on a `watch`/`oneshot` before `cancel.cancel()`, and have the dispatchers in `run.rs:22`/`:50`/`:101` prefer that code over the transcript-derived one.~~
+
+> **REWRITTEN 2026-08-13 — the old Fix is not pi's mechanism, do not implement it.** SEAM-047's fix
+> landed and pi's own shape settles this: pi's signal handler **exits the process itself** with
+> `signal === "SIGHUP" ? 129 : 143` (print-mode.ts:52-62, rpc-mode.ts:374/740) — the code never
+> travels to a dispatcher, and neither `runPrintMode` nor `rpc-mode`'s normal return path ever sees
+> it. `signals.rs` now does exactly that, so SIGTERM→143 and SIGHUP→129 are live on the first
+> delivery in print/json/rpc and a `watch`/`oneshot` into `run.rs` would be an invented seam.
+>
+> **What actually remains** is one case: **SIGINT**. pi registers no `SIGINT` handler in any host
+> (its Ctrl-C is a TUI key event, interactive-mode.ts:3539-3546), whereas cyrup's tokio `ctrl_c()`
+> future necessarily intercepts the signal and keeps the graceful abort, so a `kill -INT` still
+> exits with the transcript-derived code rather than 130. That is a stated `CYRUP-DELTA` in
+> `signals.rs`, not the item as written. Re-scope or close this ID against the new code before
+> scheduling it.
 
 **Verify** — Unit test that `wait_for_signal` reports the right `ShutdownSignal` variant per signal (already partly covered at `signals.rs:111-116`), plus SEAM-047's end-to-end exit-code assertions.
 
@@ -557,7 +620,41 @@ at all**, so this fix must add one, not merely correct one.)* Add a `delete_sess
 
 ## SEAM-051 — --tui-mode <regular|fullscreen> is rejected with exit 1 instead of parsed, so the flag's DEFAULT value refuses to launch the binary
 
-**Kind** upstream-drift · **Severity** **high** *(raised from medium in the repair pass)* · **Effort** S · **Confidence** confirmed — every link re-read at HEAD · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+**Kind** upstream-drift · **Severity** **high** *(raised from medium in the repair pass)* · **Effort** S · **Confidence** confirmed — every link re-read at HEAD · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md)) · **FIXED 2026-08-13**
+
+> **FIXED 2026-08-13**, as ADR-0005 §Decision A.1-A.2 specifies. `crates/cyrup/src/cli.rs`: a
+> `TuiMode { Regular, Fullscreen }` value-enum, a `tui_mode: Option<TuiMode>` field on `Cli`,
+> `--tui-mode` in **both** `KNOWN_LONG_FLAGS` and `KNOWN_VALUE_LONG_FLAGS` (pi consumes
+> `args[i + 1]`, args.ts:181 @v0.84.1), and the help row byte-identical to args.ts:291 at pi's
+> position (between `--verbose` and `--approve`). `crates/cyrup/src/diagnostics.rs`: pi's two error
+> diagnostics, branch for branch against args.ts:180-192 — `--tui-mode requires regular or
+> fullscreen` when the value is missing or `-`-prefixed (and the next token is **not** consumed, as
+> pi does not `i++` there), `Invalid TUI mode "<v>". Valid values: regular, fullscreen` otherwise
+> (value consumed). `crates/cyrup/src/main.rs`: `fullscreen` parses and is declined at startup with
+> ADR-0005's own interim string — *"--tui-mode fullscreen is not built yet in this release
+> (ADR-0005); falling back to regular."* — a **warning, not an exit**, because pi accepts the value
+> and exiting would refuse a launch pi performs. That string is the grep tripwire work unit B-13
+> deletes with the renderer.
+>
+> **Test** `crates/cyrup/tests/tui_mode_flag.rs` (5 tests, real binary): `regular` accepted in space
+> form, `=` form, `--mode json` and `--mode rpc`; `bogus` prints pi's exact text on **stderr** and
+> exits 1 in both forms; no value / a flag as the value / `--tui-mode=` print pi's `requires` text
+> and exit 1; `fullscreen` prints the ADR-0005 line and does NOT report an unknown option; `--help`
+> carries the row between `--verbose` and `--approve`. **RED before** (probe: `--tui-mode` removed
+> from `KNOWN_LONG_FLAGS` → `["--tui-mode", "regular"] must not be an unknown option; stderr was:
+> Error: Unknown option: --tui-mode`), **GREEN after** (`5 passed`).
+>
+> **One CYRUP-DELTA, stated in `diagnostics.rs`:** the `=` form. pi's parser matches only
+> `arg === "--tui-mode"`, so `--tui-mode=regular` lands in its `unknownFlags` map — as does
+> `--model=x` and every other `=` form, since pi has no `=` handling at all. cyrup has always
+> accepted `=` for every known long flag (`cli.rs`'s `split('=')`), and that pre-existing,
+> workspace-wide divergence is **not** re-litigated here; it only forced the two diagnostics to cover
+> the `=` spelling as well, or `--tui-mode=bogus` would have died with a clap usage error (exit 2)
+> instead of pi's text. **No id owns the general `=`-form divergence** — see the note at the end of
+> this entry.
+>
+> **Also settles `DRIFT-022`** (tracker, `duplicate-of: SEAM-051`): the flag half is done; the
+> renderer half is `TUI-019` under ADR-0005 §B.
 
 > **Reproduced 2026-08-13 in the shipped binary.** `cyrup --offline --no-session --no-extensions
 > --tui-mode regular -p hi` prints `Error: Unknown option: --tui-mode` and exits 1; the control run
@@ -591,7 +688,19 @@ at all**, so this fix must add one, not merely correct one.)* Add a `delete_sess
 
 **Fix** — Add `--tui-mode` to `KNOWN_LONG_FLAGS` and `KNOWN_VALUE_LONG_FLAGS` (`cli.rs:757-799`, `:803+`), add a `TuiMode { Regular, Fullscreen }` value-enum field to `Cli`, and add pi's two error diagnostics to `apply_arg_leniency` (`diagnostics.rs:90-152`) so an invalid value is an ERROR-severity diagnostic rather than a swallowed extension flag. Add the help line to `render_help` (`cli.rs:828-930`). Accepting `regular` as a no-op and rejecting `fullscreen` with an explicit "not supported in this build" message is a legitimate interim; silently exiting 1 on `regular` is not. The rendering half is the alt-screen work (PARITY-GAPS VL-P19, area 07).
 
-**Verify** — `cyrup --tui-mode regular` starts normally; `cyrup --tui-mode bogus` prints `Invalid TUI mode "bogus". Valid values: regular, fullscreen` and exits 1; `cyrup --tui-mode` (no value) prints `--tui-mode requires regular or fullscreen`.
+**Verify** — `cyrup --tui-mode regular` starts normally; `cyrup --tui-mode bogus` prints `Invalid TUI mode "bogus". Valid values: regular, fullscreen` and exits 1; `cyrup --tui-mode` (no value) prints `--tui-mode requires regular or fullscreen`. **All three are now covered by `crates/cyrup/tests/tui_mode_flag.rs` against the real binary.**
+
+> **New gap found while fixing this, owned by no id — the `--flag=value` form, workspace-wide.**
+> pi's hand-rolled parser has **no `=` handling for known flags at all**: `parseArgs` compares
+> `arg === "--model"` etc., so `--model=gpt-5`, `--theme=x`, `--session-dir=/tmp` and every other
+> `=` spelling falls through to `arg.startsWith("--")` and is captured into `unknownFlags`
+> (args.ts:204-207 @v0.84.1), which reconciles to `Unknown option: --model` and exit 1. cyrup accepts
+> all of them, because `partition_extension_flags` keys on `arg.split('=').next()`
+> (`crates/cyrup/src/cli.rs`) and clap parses the `=` form natively. So cyrup silently accepts a
+> whole spelling of the CLI that pi rejects. It is a **superset**, not a launch failure, which is why
+> it is filed here rather than fixed inside SEAM-051 — closing it means deciding whether cyrup
+> narrows to pi's exact rejection (and eats the exit-code change for every `=` user) or records a
+> deliberate delta. Effort S once decided; scope is `cli.rs` + `diagnostics.rs` + one test.
 
 ## SEAM-059 — The signal watcher holds the startup session Arc, so after any replacement it aborts a disposed session
 
@@ -919,9 +1028,217 @@ at all**, so this fix must add one, not merely correct one.)* Add a `delete_sess
 
 **Verify** — Launch `cyrup --mode rpc`, then `ps -o comm= -p <pid>` returns `cyrup-rpc`; launch an interactive session and it returns `cyrup`. Both return `cyrup` today.
 
+## SEAM-075 — a credential-less INTERACTIVE launch hard-errors instead of opening the TUI, so first-run `/login` is unreachable
+
+**Kind** parity-bug (**regression**, introduced by the `PROV-052` fix) · **Severity** high · **Effort** M · **Confidence** confirmed · **filed 2026-08-13 in the cross-group verification pass**
+
+**cyrup** — `crates/cyrup/src/main.rs:550` builds the interactive runtime as
+`AgentSessionRuntime::create(factory, target).await.context("building agent session runtime")?`, with
+**no `Err(SessionServiceError::NoModels(_))` arm** — unlike the rpc arm (`:697-703`) and the
+print/json arm (`:806-812`), which both `return no_models_available()`. Underneath,
+`cyrup-session-svc/src/builder.rs::resolve_model` makes an empty catalog fatal for *every* mode: it
+early-returns `Err(SessionServiceError::NoModels(..))` at `:1487` before any mode is consulted.
+
+**upstream** — pi gates the hard stop on the mode: `if (appMode !== "interactive" && !session.model)
+{ console.error(chalk.red(formatNoModelsAvailableMessage())); process.exit(1); }` (`main.ts:851-854`
+@v0.83.0, **re-read at the tag in this pass**). Interactive is deliberately excluded. `findInitialModel`
+returns `{ model: undefined }` as a normal outcome (`core/model-resolver.ts:649-650`), and `sdk.ts:216-218`
+turns that into a *banner*, not an error: `model = result.model; if (!model) { modelFallbackMessage =
+formatNoModelsAvailableMessage(); }`. A modelless interactive session is a supported state upstream —
+it is pi's entire first-run onboarding path.
+
+**Impact** — a new user with no credentials runs bare `cyrup` and gets
+`Error: building agent session runtime` and exit 1, with no way to reach `/login`. Before the
+`PROV-052` fix this never fired, because the faux test double always supplied a model — so the fix
+traded a *misleading* first run (the footer advertising `faux/faux-1` as a live model) for a *blocked*
+one. The non-interactive half of `PROV-052` is correct and verified; this is only the interactive half.
+Disclosed honestly by that group as unresolved item #2 rather than left to be discovered.
+
+**Fix** — two parts, and the second is why this is M not S. (1) `cyrup-session-svc` needs a modelless
+session path: `resolve_model`'s empty-catalog branch must yield `None` plus
+`format_no_models_available_message()` as the fallback banner instead of `Err`, which means an
+`Option<Model>` on the built session and a decision at every use site about what a turn does with no
+model (pi's answer: the send path is what refuses, not the build path). (2) `main.rs:550` then takes
+the arm its two siblings already have, but inverted — it *proceeds* rather than exits, surfacing the
+banner the way `modelFallbackMessage` is surfaced today. Land it with the first-time-setup wizard
+(`crates/cyrup/src/startup_ui.rs`, `crates/cyrup/tests/first_time_setup.rs`), which is the other half
+of the same first-run story.
+
+**Verify** — cannot be closed by `cargo test`; this is a TUI surface and needs a real terminal (the
+`cyrup-tui` live-render rule). A live run must show: fresh `CYRUP_AGENT_DIR`, no provider credentials
+in the environment and no `auth.json`, bare `cyrup` → **the TUI opens** with the no-models banner and
+`/login` is usable, NOT `Error: building agent session runtime`. The non-interactive control must keep
+its current behaviour: `cyrup -p hi` under the same conditions prints
+`No models available. Use /login to log into a provider via OAuth or API key.` on stderr and exits 1
+— **measured in this pass** (scrubbed `env -i`, scratch agent dir): exit 1, that exact message on
+stderr, empty stdout.
+
+## SEAM-074 — the four shipped built-ins are identified as ambient by an id list in `builder.rs` instead of by `NativeExtension::is_ambient()`
+
+**Kind** cyrup-original · **Severity** low → **medium** (it was not cosmetic) · **Effort** S · **Confidence** confirmed · **filed 2026-08-13 from the SEAM-071 fix**
+
+> **FIXED 2026-08-13** in the cross-group verification pass. Claim re-verified at HEAD first:
+> `AMBIENT_NATIVE_IDS` was present at `builder.rs:1755` and `native_survives_no_extensions` read
+> `!ext.is_ambient() && !AMBIENT_NATIVE_IDS.contains(&id)`, with no crate overriding `is_ambient`.
+>
+> **The "cosmetic today" rating was wrong, and the full-workspace suite proved it.** Matching on the
+> id also catches an INLINE extension that merely shares the name. `cyrup-session-svc/tests/build_containment_and_flag_diagnostics.rs`
+> injects `FailingExt { id: "subagents" }` by hand under `cfg.no_extensions = true`, so the id list
+> dropped it from the load entirely and its init failure reached neither the `[Extension issues]`
+> panel nor the fatal exit channel: `the_failure_reaches_the_panel_and_the_exit_channel_together`
+> was **RED** in the first full run after the SEAM-071 batch — `panel channel lost the failure: []`,
+> `left: 0 / right: 1` at `build_containment_and_flag_diagnostics.rs:312`. That is a code-defect, not
+> a test-defect: pi separates its tiers by ORIGIN and never by name, so a by-value extension is
+> always loaded (`loadFinalExtensionSet` → `loadExtensionFactories` unconditionally,
+> `resource-loader.ts:579-581` @v0.83.0, over `main.ts:523`; only `extensionPaths` is collapsed at
+> `:451-453`, re-read at the tag in this pass). The SEAM-071 pass missed it because its targeted run
+> covered `--lib --test added_tool_names_producer --test integration --test control_ops` only.
+>
+> **Change** — `fn is_ambient(&self) -> bool { true }` on `PermissionSystemExtension`
+> (`cyrup-permission-system/src/extension.rs`), `IntercomExtension` (`cyrup-intercom/src/extension.rs`),
+> `SubagentsExtension` and `SubagentPromptRuntime` (`cyrup-ext-subagents/src/{extension,prompt_runtime}.rs`),
+> each carrying the pi citation for why it stands in for an installed package; `AMBIENT_NATIVE_IDS`
+> deleted and `native_survives_no_extensions` reduced to `if !ext.is_ambient() { return true; }`.
+> The `SUBAGENT_CHILD_RUNTIME_NATIVES` carve-out is unchanged and still keyed by id — correct, since
+> it is a positive re-injection list for the real built-ins (pi-args.ts:413-417 @v0.47.1).
+>
+> **Tests** — `builder.rs`'s `StubNative` now carries a tier flag instead of relying on its name, so
+> the five SEAM-071 tests pin the discriminator rather than the list; plus a new
+> `an_inline_extension_that_shares_a_built_ins_id_is_still_inline`, RED before this change and GREEN
+> after. The integration proof is the previously-red target going green:
+> `build_containment_and_flag_diagnostics` 10 passed / 0 failed.
+
+**cyrup** — SEAM-071 needed to tell pi's two extension tiers apart: the PATH tier that `noExtensions` reduces (`resource-loader.ts:451-452` @v0.83.0) and the INLINE tier it leaves alone (`loadExtensionFactories`, `:579-581`, over `main.ts:523`'s `[...builtInExtensions, ...options.extensionFactories]`). cyrup routes both through one seam, `SessionBuilder::with_native_extension`, so the tiers are indistinguishable by construction. The fix added the right hook — `NativeExtension::is_ambient()` (`crates/cyrup-ext/src/native.rs`), default `false` = inline tier — but **nothing overrides it**: the four shipped built-ins are recognised by a hardcoded `AMBIENT_NATIVE_IDS` list in `crates/cyrup-session-svc/src/builder.rs` instead (`cyrup-permission-system`, `cyrup-intercom`, `subagents`, `subagent-prompt-runtime`).
+
+**upstream** — n/a; pi's two tiers are separate arrays reaching separate loaders, so it never has to ask an extension which one it is.
+
+**Impact** — cosmetic today and correct in behaviour, but a coupling that rots silently: a fifth built-in, or a renamed extension id, is ambient in fact and inline by the list, and nothing fails. `--no-extensions` then quietly stops matching pi for that extension only.
+
+**Fix** — override `fn is_ambient(&self) -> bool { true }` on `PermissionSystemExtension` (`crates/cyrup-permission-system/src/extension.rs`), `IntercomExtension` (`crates/cyrup-intercom/src/extension.rs`), `SubagentsExtension` and `PromptRuntimeExtension` (`crates/cyrup-ext-subagents/src/{extension,prompt_runtime}.rs`), then delete `AMBIENT_NATIVE_IDS` and its use in `native_survives_no_extensions`. The builder-side tests keep working unchanged if the stubs take the override instead of the ids. **Not done in the SEAM-071 pass: those four crates were outside its file ownership.**
+
+**Verify** — with `AMBIENT_NATIVE_IDS` emptied, `native_survives_no_extensions` still drops all four in a root session under `--no-extensions`, and still keeps an embedder-supplied extension.
+
 ## SEAM-071 — `--no-extensions` gates only the WASM/disk discovery roots, so the three native built-ins load anyway and `-ne` cannot produce pi's bare session
 
 **Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+> **FIXED 2026-08-13.** Claim re-verified at HEAD before the change: `builder.rs`'s native loop was
+> `for ext in self.native_extensions` with no reference to `cfg.no_extensions`, and
+> `extension_discovery_roots` was the flag's only consumer. Both confirmed.
+>
+> **LIVE VERIFICATION DONE 2026-08-13** (cross-group verification pass) — the check this item's own
+> Verify block asked for, which the fixing pass could not perform. It is the one that matters,
+> because unit tests pin which natives the *builder selects* and only a live run proves no broker
+> PROCESS is spawned. A/B on the flag alone: same binary, same scratch `CYRUP_AGENT_DIR`, same
+> `--model together/openai/gpt-oss-20b -p "say ok"`, `CYRUP_INTERCOM=1`, `--no-session`.
+> **CONTROL** (extensions enabled): turn succeeds, and `ps -axo pid,command | grep -cE '[/]cyrup
+> __intercom-broker'` goes **0 → 1** — a real detached broker (`38135 …/cyrup __intercom-broker`)
+> that OUTLIVES the parent's exit, i.e. the immortal-broker mechanism this item was filed about,
+> observed directly. **TREATMENT** (`--no-extensions`, everything else byte-identical): turn
+> succeeds identically (`ok`, exit 0), stderr contains **zero** mentions of intercom, and the broker
+> count stays **0 → 0**. The extension is not merely deselected — it never initialises, so it never
+> reaches its spawn.
+>
+> A first attempt at this A/B was VACUOUS and is recorded so nobody repeats it: under a scrubbed
+> `env -i` with no credentials, `PROV-052`'s no-models guard exits before extension init, so both
+> arms trivially show 0 brokers. A credential is required for the control to mean anything. The
+> second attempt was vacuous for a different reason and turned up a real bug: with a long scratch
+> agent-dir path the broker died at startup in the CONTROL too — which is **`ICOM-052`
+> (missing `SUN_LEN` guard), independently reproduced** and raised low → medium in `REPRO-LOG.md`.
+> Only with a short agent dir (`/tmp/cy1/a`) does the control spawn a surviving broker, which is
+> what makes the A/B above decisive.
+>
+> **The item's mechanism is half right, and the missing half is what makes the fix safe.** pi does
+> not have ONE extension set that `noExtensions` reduces — it has two tiers and gates only one. The
+> PATH tier is reduced to the explicit `-e` paths (`const extensionPaths = this.noExtensions ?
+> cliEnabledExtensions : this.mergePaths(cliEnabledExtensions, enabledExtensions)`,
+> `resource-loader.ts:451-452`, and again at `:555-557` for the reload path @v0.83.0); that is where
+> installed packages live, and the item is right that `@gotgenes/pi-permission-system`, pi-intercom
+> and pi-subagents all live there. But the INLINE tier is untouched: `loadFinalExtensionSet` calls
+> `loadExtensionFactories(...)` with **no `noExtensions` check** (`:579-581`) over
+> `extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])]`
+> (`main.ts:523`) — pi's own `llama.cpp` provider extension plus anything an embedder passed
+> programmatically. An extension the caller handed over by value is not something a flag about
+> *discovery* can be about.
+>
+> cyrup routes BOTH tiers through the same `SessionBuilder::with_native_extension` seam, because it
+> compiles in what pi installs. A blanket "skip `self.native_extensions` when `no_extensions`" —
+> route (b) as the item words it — therefore gates pi's inline tier too, and that is not
+> theoretical: **ten test files in this workspace set `cfg.no_extensions = true` *and* inject their
+> own probe extension**, and the first attempt at this fix turned three of them red
+> (`added_tool_names_producer.rs`, all three cases: `the extension tool is active: ["read", "bash",
+> "edit", "write"]`). Those tests are correct and pi-faithful; the fix was not.
+>
+> **What shipped.** `natives_to_load` (`builder.rs`, called from the step-4b native loop) drops a
+> native only when it is AMBIENT — `cyrup_ext::NativeExtension::is_ambient()` (new,
+> `crates/cyrup-ext/src/native.rs`, default `false` = pi's inline tier) or a member of
+> `AMBIENT_NATIVE_IDS` (`cyrup-permission-system`, `cyrup-intercom`, `subagents`,
+> `subagent-prompt-runtime`). The id list is an explicit stopgap: the answer belongs on each of those
+> four crates as an `is_ambient()` override, which this pass could not write because those crates
+> were outside its file ownership — **filed as SEAM-074**, and the list deletes itself when that
+> lands.
+>
+> **Route (b) was taken over the item's preferred (a), and the placement is right even though the
+> first attempt at it was not.** pi does not gate at its CLI: `main.ts:720` passes `noExtensions`
+> straight into the RESOURCE LOADER, which applies it at the single point where the extension set is
+> computed. `builder.rs` is cyrup's resource loader. Gating at four `*_extension_for_env` call sites
+> × three session-build sites in `main.rs` would be twelve places holding one rule. (Ownership also
+> forced it: this pass owns the extension-loading functions in `builder.rs`, not `main.rs`.)
+>
+> **Three loading paths were closed, not one.** The item found the first; the other two are the same
+> defect and were found while fixing it.
+> 1. The native loop — now `natives_to_load(self.native_extensions, cfg.no_extensions, is_child)`.
+> 2. **The package tier.** `ext_roots.configured.extend(report.registry.ext_crate_paths)` appended
+>    every installed package's extension dir into the one tier `--no-extensions` is defined to KEEP.
+>    That tier is pi's `enabledExtensions` — literally the operand `noExtensions` drops in
+>    `mergePaths(cliEnabledExtensions, enabledExtensions)` — so the flag was re-admitting through the
+>    back door exactly what it nulled at the front. Now gated.
+> 3. **The pre-trust vote** (`pre_trust_extension_verdict`). A native that `--no-extensions` will not
+>    load was still voting on the project-trust decision. pi's pre-trust pass reads the SAME reduced
+>    `extensionPaths` its main pass does (`resource-loader.ts:451-455`), so a dropped extension
+>    cannot vote. Now filtered by the same predicate.
+>
+> **The subagent-child carve-out, decided and documented as the item requires — and it DIFFERS from
+> what the item assumed.** pi's subagent launcher pairs `--no-extensions` with an explicit
+> re-injection of exactly three extensions as `--extension <path>` args: `runtimeExtensions =
+> [PROMPT_RUNTIME_EXTENSION_PATH, FANOUT_CHILD_EXTENSION_PATH when fanout-authorized,
+> resolvePermissionSystemExtension()]` (pi-subagents v0.47.1 `src/runs/shared/pi-args.ts:413-417`),
+> emitted at `:556-560` immediately after the `--no-extensions` at `:557`. cyrup selects those same
+> three by ENV rather than by path (`main.rs:480-506`), because its child-side runtime is compiled in
+> rather than loadable — env selection IS cyrup's re-injection channel. So
+> `SUBAGENT_CHILD_RUNTIME_NATIVES` exempts `cyrup-permission-system`, `subagent-prompt-runtime` and
+> `subagents`, **and only in a child** (`CYRUP_SUBAGENT_CHILD`); a root session drops all three.
+> Without that exemption the permission gate would fail OPEN in a child launched with a pinned
+> `agent.extensions` allowlist — strictly worse than the over-loading this item is about.
+>
+> **`cyrup-intercom` is NOT exempt**, contradicting this item's Fix note ("a `__subagent-runner`
+> child attaches intercom unconditionally so `contact_supervisor` exists … those two must survive
+> `-ne`"). pi's `runtimeExtensions` list does not contain pi-intercom, so an upstream child launched
+> under `disableAmbientExtensions` loses it and its supervisor channel too. That is parity, and it is
+> the branch that was actually producing brokers. The cyrup mechanism the item cited
+> (`cyrup-intercom/src/extension.rs:628-630`, `:670-673` at HEAD — a child with orchestrator metadata
+> attaches regardless of `is_installed`) is real, but it is an INSTALL gate, not an extension-set
+> gate; `--no-extensions` sits above it. Overturning this decision is one entry in
+> `SUBAGENT_CHILD_RUNTIME_NATIVES`.
+>
+> **Evidence** — five unit tests in `builder.rs`'s existing `mod tests`:
+> `every_native_loads_without_no_extensions`,
+> `no_extensions_drops_every_ambient_native_in_a_root_session`,
+> `an_extension_the_embedder_passed_by_hand_survives_no_extensions`,
+> `a_subagent_child_keeps_exactly_the_natives_pi_re_injects`,
+> `the_child_exemption_does_not_leak_into_a_root_session`. RED before / GREEN after was measured by
+> forcing `natives_to_load` back to its pre-fix "return everything" behaviour:
+> `test result: FAILED. 42 passed; 2 failed` → `test result: ok. 45 passed; 0 failed`.
+>
+> The three integration tests the FIRST (over-broad) attempt broke are green under the shipped fix:
+> `cargo test -p cyrup-session-svc --all-features --lib --test added_tool_names_producer
+> --test integration --test control_ops` → **45 + 3 + 7 + 11 = 66 passed, 0 failed, exit 0**.
+>
+> **NOT closed by this fix, and it is the item's own Verify step:** the live assertion
+> `CYRUP_INTERCOM=1 cyrup --no-extensions --offline --no-session -p hi` → zero
+> `[/]cyrup __intercom-broker` processes. The unit tests pin the SELECTION; only a live run proves no
+> broker is spawned. `crates/cyrup/tests/*` and `crates/cyrup/src/main.rs` are outside this pass's
+> file ownership, so that run is unperformed here.
 
 **cyrup** — `crates/cyrup-session-svc/src/builder.rs:775` is `for ext in self.native_extensions { … host.load_native_with_services(ext, …) … }` — unconditional; `cfg.no_extensions` is never consulted on that path. The only place the flag acts is `extension_discovery_roots` (`:1677-1690`), which nulls `project_cwd` and `agent_dir` and so suppresses **disk** extensions only. The natives are pushed at `crates/cyrup/src/main.rs:481/:490/:493/:506` (and again at the `:630`/`:724` session-build sites) from `subagent_extension_for_env`, `prompt_runtime_extension_for_env`, `intercom_extension_for_env` and `permission_extension_for_env`; `rg 'no_extensions' crates/cyrup/src/main.rs` returns **nothing**, so none of the four gates sees the flag. A user with `CYRUP_INTERCOM=1` running `cyrup --no-extensions -p hi` therefore still attaches intercom and still spawns a broker.
 

@@ -354,6 +354,28 @@ pub trait NativeExtension: Send + Sync {
         false
     }
 
+    /// Whether this built-in is **ambient** — present because it is installed, not because the
+    /// embedder named it — and therefore switched off by `--no-extensions` (SEAM-071).
+    ///
+    /// pi splits the extension set in exactly this way and gates only one half. `noExtensions`
+    /// reduces the PATH tier to the explicit `-e` paths
+    /// (`const extensionPaths = this.noExtensions ? cliEnabledExtensions : this.mergePaths(...)`,
+    /// `resource-loader.ts:451-452` @v0.83.0), which is where installed packages like
+    /// `@gotgenes/pi-permission-system` and pi-intercom live. The INLINE tier is untouched:
+    /// `loadFinalExtensionSet` calls `loadExtensionFactories(...)` unconditionally (`:579-581`) over
+    /// `extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])]`
+    /// (`main.ts:523`) — pi's own `llama.cpp` provider extension plus whatever an embedder passed
+    /// programmatically. An inline factory the caller handed in by value is not something a flag
+    /// about *discovery* can be about.
+    ///
+    /// `false` is therefore the right default: [`crate::ExtensionHost::load_native`]'s caller passed
+    /// this object by hand, which is pi's inline-factory tier. A built-in that stands in for an
+    /// upstream INSTALLED PACKAGE — cyrup compiles in what pi installs — must override this to
+    /// `true` so `--no-extensions` means the same thing in both products.
+    fn is_ambient(&self) -> bool {
+        false
+    }
+
     /// Execute a registered slash command this extension owns (Pi `command.handler(args, ctx)`,
     /// agent-session.ts:1159; R-08-016). `ctx` is **command-tier** (session mutation allowed). The
     /// optional `String` is the command's text output (Pi commands return `void`; cyrup mirrors the

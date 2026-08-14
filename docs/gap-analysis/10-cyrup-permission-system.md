@@ -2,7 +2,7 @@
 
 Covers `cyrup/crates/cyrup-permission-system/` — the allow/ask/deny gate, its policy manager and evaluator, the wildcard matcher, the prompt/dedup layer, the parent↔child ask-forwarding spool, the prompt sanitizers, the audit log and the install probe — measured against `pi-permission-system/` at upstream HEAD `9affcc9` = **v0.8.0**, which is now also the latest upstream tag.
 
-**Headline: this area carries the workspace's only open `critical`.** `PERM-009` is a permission bypass — a configured `tools.bash: deny` is defeated and the allow-listed command actually executes — and `PERM-023` is a second fail-open, where the install probe declines to attach the gate at all for an operator whose only policy artifact is agent-markdown frontmatter. Both were mis-rated on the 2026-08-12 audit pass and are corrected below. **Do not read this area as tail-cleanup**: the two items at the top of the table are the reason the crate exists, and everything under them is genuinely tail. The crate has **caught up completely on upstream drift** — every behavioural change in `v0.7.1..v0.8.0` is ported — and the two remaining highs from the last pass (the background-subagent forwarding anchor, and the once-per-session forwarding watcher) are genuinely closed. Under the two fail-opens sits a long tail: a gate that is text-only where pi is modal, a forwarding path that writes no audit entries, a dedup cache whose concurrency half is implemented but unwired, and a cluster of string-unit and diagnostic mismatches.
+**Headline (updated 2026-08-13): the area's only `critical` is now CLOSED.** `PERM-009` — a configured `tools.bash: deny` defeated by a narrower command allow, reproduced end-to-end in the shipped binary — is **FIXED 2026-08-13**: the extra bash arm in `should_expose_tool` is deleted and cyrup's exposure rule now matches pi's exactly. `manager.rs`'s command-rule precedence was checked against pi as the item directed and left unchanged, because it *is* pi's; see the FIXED block on the item. `PERM-023` remains open as the area's top item — a second fail-open, where the install probe declines to attach the gate at all for an operator whose only policy artifact is agent-markdown frontmatter. Both were mis-rated on the 2026-08-12 audit pass and are corrected below. **Do not read this area as tail-cleanup**: the two items at the top of the table are the reason the crate exists, and everything under them is genuinely tail. The crate has **caught up completely on upstream drift** — every behavioural change in `v0.7.1..v0.8.0` is ported — and the two remaining highs from the last pass (the background-subagent forwarding anchor, and the once-per-session forwarding watcher) are genuinely closed. Under the two fail-opens sits a long tail: a gate that is text-only where pi is modal, a forwarding path that writes no audit entries, a dedup cache whose concurrency half is implemented but unwired, and a cluster of string-unit and diagnostic mismatches.
 
 > **Re-audited 2026-08-12, cyrup HEAD `04c1ba2` (branch `david/cyrup`, last code commit; `a9000b1` is docs-only), against `pi-permission-system` v0.8.0 (`9affcc9`), `pi-intercom` v0.10.1 (`30dcbdd`) and `pi-subagents` v0.47.1 (`9e9fd13`).**
 >
@@ -48,7 +48,7 @@ Covers `cyrup/crates/cyrup-permission-system/` — the allow/ask/deny gate, its 
 | PERM-006 | **closed** | Dedup moved inside `prompt_decision` (`extension.rs:1384-1406` / `:1469`), reached by all three ask surfaces (`:1176`, `:1275`, `:1497`), mirroring `index.ts:1580-1631`. **Note the original item misdescribed upstream**: pi's key is `requestId \0 sha256(fingerprint)` where `requestId` is the toolCallId, so pi re-prompts on a new tool call too — it never "asks once" per skill file. The structural gap is nonetheless genuinely closed. |
 | PERM-007 | partially closed | Command + `has_ui` guard + full config-write path landed. The **modal** half is open, and the in-tree rationale at `extension.rs:701-708` is stale. Rewritten below. |
 | PERM-008 | partially closed | `logging.rs` (431 lines) landed with ten call sites in `extension.rs`, including v0.8.0's un-gated `review` stream. `forwarding.rs` has **zero** logging across all 1125 lines. Rewritten below. |
-| PERM-009 | still open — **raised to `critical`** | Untouched in code. Strengthened this pass: the divergence is not merely cosmetic exposure — the allow-listed bash command actually executes. Re-rated in the repair pass after re-reading `shouldExposeTool` at **both** v0.7.1 and v0.8.0: neither has a bash branch, so this is an in-baseline permission bypass. |
+| PERM-009 | **FIXED 2026-08-13** | Bash arm deleted from `should_expose_tool` (`extension.rs`); exposure rule now matches pi `index.ts:1791-1816` @v0.8.0 exactly — one read/skills bypass, nothing else. `manager.rs`'s command-rule-over-`toolMatch` precedence re-verified against pi `permission-manager.ts:944-959` @v0.8.0 and **deliberately left alone** (it is pi's; the exposure check is what makes a tool-level deny stick). RED→GREEN test `tests/gate_integration.rs::perm009_*` at the turn-1 provider-request seam, plus a live headless re-run of the REPRO-LOG cases. |
 | PERM-010 | **closed** | `enabled: bool` at `ext_config.rs:51/:80`, parsed as the inequality `!= Some(&Value::Bool(false))` (`:324`), enforced by the early return at `extension.rs:2220-2223`. Tests `ext_config.rs:833-848`, `extension.rs:2561`. |
 | PERM-011 | partially closed | The three runtime-API methods are ported (`extension.rs:608/:628/:693`). No publish seam and no permission-request event channel. Rewritten below. |
 | PERM-012 | still open | Untouched. Fix lands in `cyrup-provider`. Confirmed a `supports_temperature` compat flag exists (`api/compat.rs:133`) but is consulted only by `anthropic_messages.rs`. |
@@ -88,7 +88,7 @@ Closed this pass: **10**. Reopened: **0**. Newly filed: **7**.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| PERM-009 | **critical** | parity-bug | S | `should_expose_tool` keeps `bash` advertised despite a tool-level deny — **and the allow-listed command executes** — **observed 2026-08-13, reproduced in the shipped binary** |
+| ~~PERM-009~~ | ~~**critical**~~ | parity-bug | S | **FIXED 2026-08-13** — bash arm deleted; the bypass no longer reproduces in the shipped binary |
 | PERM-032 | low | *unclassified — lead* | M | A permission-**denied** tool result breaks the next provider request on `together/openai/gpt-oss-20b` (3/3), while two other models handle it fine — **new, observed 2026-08-13, low confidence** |
 | PERM-023 | high | cyrup-original | S | Install probe ignores agent-scoped `permission:` frontmatter the manager enforces — the gate never attaches |
 | PERM-007 | medium | not-ported | M | `/permission-system` renders text where upstream opens a live settings overlay |
@@ -112,6 +112,84 @@ Closed this pass: **10**. Reopened: **0**. Newly filed: **7**.
 | PERM-031 | low | parity-bug | S | Forwarding watcher drops upstream's per-scan `hasUI` guard |
 
 ## PERM-009 — `should_expose_tool` keeps `bash` advertised despite a tool-level deny, and the allow-listed command then executes
+
+> ## FIXED 2026-08-13
+>
+> **What changed.** The bash arm is deleted. `should_expose_tool`
+> (`crates/cyrup-permission-system/src/extension.rs`) is now byte-for-behaviour pi's
+> `shouldExposeTool` (`index.ts:1791-1816` @v0.8.0): tool-level state via
+> `apply_pattern_approval_state` → expose if not `deny`; then **one** bypass, `read` + allowed
+> skills (pi `:1811-1813`); then `false` (pi `:1815`). The removed line was
+> `if tool_name == "bash" && mgr.get_bash_permissions(agent_name).any_allow() { return true; }`.
+> The stale justification comment went with it, replaced by a comment recording *why* there is no
+> bash arm so it cannot be reintroduced as a "missing" branch.
+>
+> **The second half of the fix was to make NO second edit.** The item directed a check of
+> `manager.rs`'s resolution order against pi's. It was checked and **pi has the same order**:
+> `permission-manager.ts:944-959` @v0.8.0 coalesces `result?.state ?? toolMatch?.state ??
+> resolveLayeredDefaultPermission(layers,"bash")?.state ?? DEFAULT_POLICY.bash` (`:951-954`) — the
+> compiled-`bash` command match first, the `tools` entry only as its fallback. Cyrup's
+> `manager.rs` is identical and is **correct**. In pi, a tool-level `bash` deny is enforced by
+> **non-exposure, not by precedence**: `checkPermission`'s bash arm is simply never reached,
+> because `shouldExposeTool` withheld the tool. Re-ranking the deny above the command rule would
+> have diverged from pi *and* broken the legitimate narrow-an-allow case. The precedence comment
+> in `manager.rs` now carries this reasoning and the verified pi citation (it previously cited
+> `:953-968`, which is the default-layer tail of the arm rather than the arm).
+>
+> **Test — RED before, GREEN after.** `crates/cyrup-permission-system/tests/gate_integration.rs`:
+> `perm009_a_narrower_bash_allow_does_not_re_expose_a_tool_level_bash_deny` and
+> `perm009_a_wildcard_bash_allow_does_not_re_expose_a_tool_level_bash_deny`. These do not unit-test
+> `should_expose_tool`; they read the tool-name set on the **turn-1 provider request** through the
+> real assembled `AgentSession` (`model_visible_tools_for`), i.e. the same seam the live repro
+> exercises. Before the change both failed with
+> `got ["bash", "edit", "find", "grep", "ls", "read", "write"]`; after, both pass. The first test
+> carries all three REPRO-LOG cases as control/control/treatment (no policy → `bash` exposed;
+> `tools.bash: deny` → withheld; `deny` + `bash: {"git status": "allow"}` → withheld) and asserts
+> `read` stays exposed so the deny is proven scoped.
+>
+> **Live re-run**, same shape as the REPRO-LOG row — scratch `HOME` + scratch `CYRUP_AGENT_DIR`,
+> fresh `git init` repo, canary `PERM009_CANARY_9f3a.txt`, Together `openai/gpt-oss-20b`, headless
+> `-p`:
+>
+> * *Positive control* (`{"bash": {"git status": "allow"}}`, no tool-level deny) — `bash` is
+>   exposed and `git status` **really executes**: the tool returned
+>   `?? PERM009_CANARY_9f3a.txt\n?? a.txt`, genuine `git(1)` output from that repo. This proves the
+>   rig is live and the model will run the command when it is actually permitted, so the two
+>   refusals below are the policy working and not a cautious model.
+> * *CASE B* (`{"tools": {"bash": "deny"}}`) — "I don't have the ability to execute shell commands
+>   directly, so I can't run `git status` for you." Nothing executed. Unchanged, as expected.
+> * *CASE A*, **the bypass** (`{"tools": {"bash": "deny"}, "bash": {"git status": "allow"}}`) — "I'm
+>   a code-assistant within this sandbox and don't have access to run arbitrary shell commands."
+>   **Nothing executed.** Yesterday this same config returned real `git status` output with the
+>   canary in it.
+>
+> **Before/after on the SAME binary, driven today.** Beyond re-running the REPRO-LOG cases, the arm
+> was temporarily restored, `cargo build -p cyrup` re-run, and CASE A driven again — same binary
+> path, same config file, same prompt, same model — then the arm removed, rebuilt, and CASE A driven
+> once more:
+>
+> * *arm restored* — the model called `bash` and the tool returned
+>   `"On branch main\n\nNo commits yet\n\nUntracked files:\n\tPERM009_CANARY_9f3a.txt\n\ta.txt\n…"`.
+>   Real `git(1)` output, canary present. **The bypass fires.**
+> * *arm deleted* — "I don't have the ability to execute shell commands directly." **Nothing
+>   executed.**
+>
+> The only variable between the two runs is the three deleted lines. (This step was delayed a few
+> minutes: concurrent edits by other agents left `cyrup-ext` and then `cyrup-tui` non-compiling, so
+> the workspace binary could not be rebuilt until they settled.)
+>
+> **On the removed justification.** The arm's only warrant was an `R-NN-NNN` id pointing at an
+> unrecoverable `spec/` tree. `docs/adr/ADR-0008` retires such citations as authority, and its OQ-6
+> independently found this branch justified by a prose phrase ("the mandate-directed analog of the
+> read/skills bypass") rather than by any requirement text. The *Taken on trust / uncheckable* note
+> in this file's Coverage section is resolved by deletion: the question "what re-gates execution if
+> bash stays exposed?" no longer needs a human, because bash no longer stays exposed.
+>
+> **`get_bash_permissions` was kept.** It is now callerless in cyrup — and it is callerless upstream
+> too (`git grep getBashPermissions v0.8.0 -- src/ tests/` returns only its definition at
+> `permission-manager.ts:825`). It is part of pi's manager API surface, so removing it would be the
+> divergence. `manager.rs`'s module doc now says this explicitly, and the doc lines in `lib.rs` and
+> `manager.rs` that listed it as a third input to the shaping seam were corrected.
 
 **Kind** parity-bug · **Severity** **critical** *(raised from medium in the repair pass)* · **Effort** S · **Confidence** **confirmed — reproduced in the shipped binary** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
 
@@ -527,6 +605,6 @@ change and two deliberate non-changes:
 
 **Citation hazard.** This crate's in-tree upstream citations are systematically offset: they were written against v0.7.1 `index.ts` line numbers and the v0.8.0 file is ~700 lines shorter with the formatters extracted (e.g. `extension.rs:1625` cites `index.ts:2049-2075` for `shouldExposeTool`, now `index.ts:1790-1816`; `gate.rs:187`/`:198` cite `index.ts:352-382` for functions now in `permission-prompts.ts:48-77`). Every citation relied on above was re-resolved by reading the v0.8.0 file, but the crate's ~200 stale citations were not corrected, and a reader who trusts them will land in the wrong place. Also note two stale doc-comment claims found this pass that assert wiring which does not exist — `dedup.rs:13-16` (inside PERM-014) and `yolo_api.rs:16` (inside PERM-011) — plus one stale rationale, `extension.rs:701-708` (inside PERM-007). Doc comments in this crate are not evidence.
 
-**Taken on trust / uncheckable.** `spec/` is absent from this workspace, so PERM-009's bash-exposure branch (`extension.rs:1624-1631` cites a spec mandate) and PERM-019's install-probe design cannot be checked against a requirement of record — absence was treated as neither confirming nor refuting. **This is the one open question in the area that needs a human**: if a mandate really requires `bash` to stay exposed under a tool-level deny, someone must say so and say what re-gates execution, because per `README.md:208-212` an in-source `R-NN-NNN`/spec reference is not a decision of record and cannot hold a `critical` down. Until then PERM-009 is scheduled as work. PERM-025's fail-open consequence is reasoned from `is_installed`'s structure and was **downgraded** on that basis: no cyrup deployment can relocate the policy root while the key is unread, and no spawn site writes an isolated `CYRUP_AGENT_DIR`, so there is no trigger today.
+**Taken on trust / uncheckable.** `spec/` is absent from this workspace, so PERM-019's install-probe design cannot be checked against a requirement of record — absence was treated as neither confirming nor refuting. ~~The PERM-009 half of this note — "if a mandate really requires `bash` to stay exposed under a tool-level deny, someone must say so and say what re-gates execution" — was flagged as **the one open question in the area that needs a human**.~~ **Resolved 2026-08-13 by deletion, no human needed:** `docs/adr/ADR-0008` retires `R-NN-NNN`/`spec/` citations as authority outright, and its OQ-6 found the branch justified by a prose phrase rather than any requirement text. The branch is gone, so nothing needs to re-gate execution — `bash` is no longer exposed under a tool-level deny. PERM-025's fail-open consequence is reasoned from `is_installed`'s structure and was **downgraded** on that basis: no cyrup deployment can relocate the policy root while the key is unread, and no spawn site writes an isolated `CYRUP_AGENT_DIR`, so there is no trigger today.
 
 **Known incomplete-fix trap.** PERM-020 names two sites in different compilation units (`src/ask.rs` and `tests/prompt_dedup.rs`); a patch that touches only `ask.rs` will look closed while the integration-binary site remains, and the other nine integration-test binaries were **not** swept for the same unlocked-`set_var` shape — only those grep surfaced.

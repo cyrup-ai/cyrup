@@ -43,6 +43,33 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 >
 > **Newly filed** — TUI-027 … TUI-041 in the main pass, TUI-042 … TUI-051 in the repair pass. Three are `critical`: TUI-027 (`/tree` has no search, its action keys are the characters pi types into that search, and the resulting label edit is **persisted to the session JSONL**), TUI-042 (the undo snapshot omits the paste registry, so undoing a delete over a paste marker silently sends the literal marker text to the model instead of the pasted content) and TUI-043 (Ctrl+W after a large paste orphans the marker and drops the paste). One is `high`: TUI-031 (a prompt typed during compaction is dispatched immediately, against a context the compaction is mid-rewrite of).
 >
+> ### Repair batch 5 — editor paste / undo / word motion, applied 2026-08-13
+>
+> **`TUI-042`, `TUI-043`, `TUI-044`, `TUI-049` and `TUI-053` are FIXED; `TUI-048` is partially fixed
+> and stays open.** All five fixed items were reproduced live on 2026-08-13 and each now has a test
+> that was RED at HEAD `85bc8bd` and is GREEN after (the RED outputs are quoted in the items). The
+> work is confined to `crates/cyrup-tui/src/{editor.rs,keymap.rs}` and `tests/editor.rs`.
+>
+> Three corrections to the items as filed, all from reading pi at the tag rather than from the code:
+>
+> 1. **TUI-043's Fix asked for the wrong mechanism twice.** `deleteWordBackwards`/`deleteWordForward`
+>    do **not** drop the registry entry upstream (`editor.ts:1607-1672`), and upstream has no
+>    `marker_covering`-style predicate at all — atomicity is a property of the marker-merging
+>    SEGMENTER that motion, deletion and wrapping all share (`:361-363`). Ported that way;
+>    `marker_covering` is deleted. This also closed a half of the item nothing had filed: plain
+>    **Left/Right arrows could park the caret inside a marker**.
+> 2. **TUI-042's `history_draft` half was already benign** — nothing mutates the registry while
+>    browsing, in either codebase. The draft path was broken differently: pi pushes an undo snapshot
+>    on *entering* history browsing (`:435-438`) and cyrup pushed none.
+> 3. **TUI-048 cannot be closed with `unicode-segmentation`.** UAX#29 has no dictionary pass for
+>    unspaced scripts, so pi lands at column 2 in `你好世界` where cyrup now lands at 3 (it landed at
+>    0 before). Closing it needs `icu_segmenter` + CJK/Thai data — a workspace-level dependency call.
+>
+> **Four items were filed in the process** — `TUI-058` and `TUI-059` (both **FIXED** in the same
+> change: pi renumbers the surviving pastes when a marker is backspaced, `:1293-1315`; and every
+> motion clears `lastAction`, which cyrup did on Left/Right only, so two kills separated by `Home`
+> merged into one kill-ring entry), plus `TUI-060` and `TUI-061`, which are **open**.
+
 > **Structural note carried forward.** `cyrup/TUI-FIDELITY.md` (464 lines, ~150 presentation findings against v0.84.1) holds no stable IDs and no status table, so nothing in it reaches `00-residual-ledger.md`. That is not a hypothetical: TUI-FIDELITY's C14 recommendation to delete the `{n} queued` footer segment was applied, which is precisely what turned TUI-016 from "wrong surface" into "no surface at all". Merging that backlog into this file with real IDs remains the highest-value follow-up for this area.
 
 ## Status of every item from prior analyses
@@ -114,14 +141,14 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-039 | **new this pass** — open (low) | Terminal geometry never falls back to `$COLUMNS` / `$LINES`. |
 | TUI-040 | **new this pass** — open (low) | No `PI_TUI_WRITE_LOG` equivalent — no escape-sequence write log. Elevated in usefulness by the repair pass: it is the only tractable instrument for the negotiation items (TUI-045, TUI-046) whose verification requires a live terminal. |
 | TUI-041 | **new this pass** — open (low) | `/settings` shows env-overridden rows with the wrong value. |
-| TUI-042 | **new (repair pass)** — open (**critical**) | The undo snapshot omits the paste registry. `Snapshot { lines, row, col }` (`editor.rs:71-78`) has no `pastes`; `backspace()`/`delete()` erase `pastes[id]` on paths that already pushed a snapshot; `undo()` (`:748-756`) restores only `lines`/`row`. The marker text reappears on screen while `expanded_text()` can no longer resolve it, so Enter sends the 20-character marker instead of the paste. Silent data loss with a UI asserting the opposite. |
-| TUI-043 | **new (repair pass)** — open (**critical**) | Word motion and Ctrl+W are not paste-marker atomic. `word_left_target`/`word_right_target` (`editor.rs:1074-1128`) classify by `is_word_char` alone and never consult `marker_covering` (`:697-712`), which has exactly two callers. One Ctrl+W after a large paste deletes the single `]`, orphaning the marker and unreachably losing the pasted content. |
-| TUI-044 | **new (repair pass)** — open (medium) | `undo()` discards the snapshot's cursor column — `Snapshot::col` is written at `:718` and never read (`rg 'snap\.col'` → nothing); `preferred_visual_col` is not reset either. Ships with TUI-042 so `Snapshot` is corrected once. |
+| TUI-042 | **FIXED 2026-08-13** | Was: the undo snapshot omits the paste registry — `Snapshot { lines, row, col }` had no `pastes`, so the marker text reappeared on screen while `expanded_text()` could no longer resolve it and Enter sent the literal marker. Now: `Snapshot` carries `pastes` + `paste_counter` (`editor.rs:71-93`), `snapshot()` clones them and `undo()` restores them (`editor.ts:2012-2030`); the undo snapshot moved to the TOP of `handle_paste` so an undone paste rolls the counter back and the next paste re-issues the same id (`editor.ts:1160`); `clear()` resets `paste_counter` (`editor.ts:1264-1266`) and both submit paths clear the undo stack (`:1268`). RED→GREEN: `tests/editor.rs::undo_restores_the_paste_registry_not_just_the_marker_text` (RED output: `left: "[paste #1 1500 chars]"`, right: the 1500 chars), `::undo_rolls_back_the_paste_counter_so_the_next_paste_is_still_marker_one`, `::browsing_history_away_from_a_draft_keeps_its_paste_registry`. |
+| TUI-043 | **FIXED 2026-08-13** | Was: word motion and Ctrl+W were not paste-marker atomic — one Ctrl+W deleted the single `]`. Now: `word_left_target`/`word_right_target` are a statement-for-statement port of `findWordBackward`/`findWordForward` (`word-navigation.ts:22-114`) over a marker-merging segmenter (`segmentWithMarkers`, `editor.ts:37-90`), including the `isAtomic` branches at `:44-46`/`:97-99`; `prev_grapheme`/`next_grapheme` route through the same merge, so **cursor motion** is marker-atomic too (pi's `moveCursor`, `editor.ts:1808-1830`) and the caret can no longer be parked inside a marker. `marker_covering` is deleted — upstream has no such predicate. Per `editor.ts:1607-1630`, `deleteWordBackwards` does **not** drop the registry entry, so cyrup no longer does either (see the correction below). RED→GREEN: `::ctrl_w_at_a_marker_end_deletes_the_whole_marker` (RED output: `left: "[paste #1 1500 chars"`), `::alt_d_at_a_marker_start_deletes_the_whole_marker`, `::word_motion_treats_a_paste_marker_as_one_unit`, `::arrow_keys_step_over_a_paste_marker_as_one_grapheme`. |
+| TUI-044 | **FIXED 2026-08-13** | `undo()` restores `snap.col` and calls `reset_preferred_col()` (`editor.ts:2019-2022`); `exit_history()` moved ahead of the pop to match `:2017`. RED→GREEN: `::undo_restores_the_snapshot_cursor_column` — the item's own live scenario, asserting `(0, 5)` and that the next keystroke yields `helloZ` rather than `heZllo`. |
 | TUI-045 | **new (repair pass)** — open, **raised to high 2026-08-13** | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — crossterm emits a spurious `Escape` plus the tail as typed text. `stray_reply.rs` documents observing this exact split and rescues only OSC 11. Escape is not inert: it aborts the turn. **Reproduced live, idle and mid-stream — a 60 ms gap between two writes on a LOCAL pty is enough; the "exposure is over SSH/mosh/tmux" hedge was too conservative.** |
 | TUI-046 | **new (repair pass)** — open (medium) | cyrup pushes Kitty flag 1; pi pushes 7 — and neither stdin-buffer guard flag 7 requires exists, so the obvious one-token "fix" would double every composed character and leak CSI-u text on WezTerm. Filed as one change with the two guards for exactly that reason. Also corrects `drain.rs:11-16`'s unfounded release-report premise. |
 | TUI-047 | **new (repair pass)** — open (low) | A late or unsolicited DCS/APC frame is shredded into ~20 typed characters; `stray_reply.rs` recognises only OSC 11. Reachability is narrow (tmux passthrough), blast radius is not. |
-| TUI-048 | **new (repair pass)** — open (low) | Word navigation classifies by ASCII-style character class instead of Unicode word segmentation, so CJK/Thai word motion jumps whole runs. Internally inconsistent too — the same file already uses grapheme segmentation for wrapping. |
-| TUI-049 | **new (repair pass)** — open (low) | `marker_at` accepts any text between `[paste #N ` and `]`, so cyrup expands paste markers pi's regex rejects — silently replacing text the user typed. Also widens the surface of TUI-042/043. |
+| TUI-048 | **PARTIALLY FIXED 2026-08-13 — still open** | The character-class run is gone: word motion now goes through `unicode-segmentation`'s UAX#29 word iterator plus pi's `PUNCTUATION_REGEX` sub-boundaries (`utils.ts:821`) in pi's three-branch shape. CJK no longer jumps the whole run (`::cjk_word_motion_no_longer_swallows_the_whole_run`, RED at HEAD). **Not parity**: ICU's `Intl.Segmenter` adds a dictionary/LSTM pass, so pi lands at col 2 in `你好世界` where UAX#29 lands at 3. Closing it needs an ICU-class segmenter (`icu_segmenter` + CJK/Thai data) — a new workspace dependency, deliberately not taken here. CYRUP-DELTA recorded on `InputEditor::word_segments`. |
+| TUI-049 | **FIXED 2026-08-13** | `marker_at` now matches `PASTE_MARKER_SINGLE` exactly (`editor.ts:24`): id, then either an immediate `]` or one space and exactly one of `+<digits> lines` / `<digits> chars`. RED→GREEN: `::a_hand_typed_marker_shaped_string_is_not_expanded`, which also pins that the bare `[paste #N]` form pi's regex allows still expands. |
 | TUI-050 | **new (repair pass)** — open (low) | An 8-bit meta byte (a single byte > 127) is silently dropped instead of becoming `ESC` + char, so every Alt chord is dead under `metaSendsEscape: false`. **Dependent on TUI-045** — without that pre-parser there is no seam. |
 | TUI-051 | **new (repair pass)** — open (medium) | `/reload` never re-reads `keybindings.json`, while both the command's help string (`commands.rs:70`) and its in-source comment (`app.rs:4236-4238`) claim it does. Routed here from the migrations sweep; the config half is CFG-048. |
 
@@ -134,14 +161,14 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| TUI-042 | **critical** | parity-bug | S | The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message |
-| TUI-043 | **critical** | parity-bug | S | Word motion and Ctrl+W are not paste-marker atomic — one Ctrl+W after a large paste orphans the marker and drops the paste |
+| TUI-042 | **FIXED 2026-08-13** | parity-bug | S | ~~The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message~~ |
+| TUI-043 | **FIXED 2026-08-13** | parity-bug | S | ~~Word motion and Ctrl+W are not paste-marker atomic — one Ctrl+W after a large paste orphans the marker and drops the paste~~ |
 | TUI-027 | **critical** | not-ported | M | `/tree` has no text search, its four action keys are the characters pi types *into* that search, and the resulting label edit is persisted to the session JSONL |
 | TUI-031 | **high** | not-ported | M | A prompt typed during compaction is sent immediately instead of queued |
 | TUI-045 | **high** | not-ported | M | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — a spurious `Escape` aborts the turn and the tail is typed as text — **observed 2026-08-13, raised from medium** |
 | TUI-016 | **high** | parity-bug | M | A queued message is echoed into the transcript as if delivered, and has no queue surface at all — **observed 2026-08-13, retitled and raised from medium** |
 | TUI-052 | **high** | parity-bug | S | A queued message dequeued by Escape stays in the transcript forever as a phantom user message that was never sent — **new, observed 2026-08-13** |
-| TUI-053 | **high** | parity-bug | S | `Ctrl+-` (`editor.undo`) is unreachable from any terminal without the kitty keyboard protocol — pi maps the legacy `0x1F` byte, cyrup does not — **new, observed 2026-08-13** |
+| TUI-053 | **FIXED 2026-08-13** | parity-bug | S | ~~`Ctrl+-` (`editor.undo`) is unreachable from any terminal without the kitty keyboard protocol — pi maps the legacy `0x1F` byte, cyrup does not~~ — fixed by porting `keys.ts:1275-1281`; still wants a live non-kitty run to close by hand |
 | TUI-054 | **high** | parity-bug | S | A failed or aborted compaction is announced to the user as "compaction complete" — `CompactionEnd`'s `aborted`/`error_message` are destructured away — **new, observed 2026-08-13** |
 | TUI-055 | **high** | parity-bug | M | No status indicator renders for the entire duration of a compaction — the screen is blank for 10–20 s — **new, observed 2026-08-13** |
 | TUI-004 | medium | upstream-drift | M | No live colour-scheme sync; `/reload` does not re-apply themes |
@@ -160,9 +187,11 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-033 | medium | not-ported | M | `ui.setHeader` / `ui.setFooter` are delivered to the TUI and dropped into fields nothing renders |
 | TUI-034 | medium | upstream-drift | L | No markdown-transformer hook — extension transformers and pi's Mermaid renderer both absent |
 | TUI-037 | medium | not-ported | S | `/reload` never persists an implicitly-granted project trust |
-| TUI-044 | medium | parity-bug | S | `undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read |
+| TUI-044 | **FIXED 2026-08-13** | parity-bug | S | ~~`undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read~~ |
 | TUI-046 | medium | parity-bug | M | cyrup pushes Kitty keyboard flag 1, pi pushes 7 — and neither guard flag 7 requires exists, so raising it alone would duplicate characters and leak CSI-u text |
 | TUI-051 | medium | parity-bug | S | `/reload` never re-reads `keybindings.json`, while the command's help text and its in-source comment both claim it does |
+| TUI-058 | **FIXED 2026-08-13** | parity-bug | S | ~~Deleting a paste marker does not renumber the pastes that follow it — ids diverge from pi's for the life of the session~~ — **new, found 2026-08-13** |
+| TUI-059 | **FIXED 2026-08-13** | parity-bug | S | ~~Only Left/Right clear `lastAction`, so a kill survives every other motion and the next kill accumulates into the same ring entry~~ — **new, found 2026-08-13** |
 | TUI-019 | medium | upstream-drift | L | No alt-screen UI mode, mouse, scrollbars, prompt navigation — **re-rated from low; the ADR-0001 justification does not hold** |
 | TUI-N01 | medium | parity-bug | S | Tool-result images rasterize on terminals with no image protocol |
 | TUI-N02 | medium | not-ported | S | `/reload` does not re-emit the loaded-resources / diagnostics panel |
@@ -184,9 +213,11 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-040 | low | not-ported | S | No `PI_TUI_WRITE_LOG` equivalent — no escape-sequence write log |
 | TUI-041 | low | parity-bug | S | `/settings` shows env-overridden rows with the wrong value |
 | TUI-047 | low | not-ported | M | A late or unsolicited DCS/APC frame is shredded into ~20 typed characters — `stray_reply.rs` recognises only OSC 11 |
-| TUI-048 | low | parity-bug | M | Word navigation classifies by character class instead of Unicode word segmentation — CJK word motion jumps whole runs |
-| TUI-049 | low | parity-bug | S | `marker_at` accepts any text between `[paste #N ` and `]`, expanding markers pi's regex rejects |
+| TUI-048 | low — **partially fixed 2026-08-13** | parity-bug | M | Word navigation classifies by character class instead of Unicode word segmentation — CJK word motion jumps whole runs. Class-run motion replaced by UAX#29 + pi's punctuation sub-boundaries; the ICU dictionary pass for unspaced scripts remains |
+| TUI-049 | **FIXED 2026-08-13** | parity-bug | S | ~~`marker_at` accepts any text between `[paste #N ` and `]`, expanding markers pi's regex rejects~~ |
 | TUI-050 | low | not-ported | S | An 8-bit meta byte is silently dropped instead of being converted to `ESC` + char (depends on TUI-045) |
+| TUI-060 | low | parity-bug | M | The wrap / visual-line map is not paste-marker aware, so a marker can be torn across visual rows — pi passes a marker-merged `preSegmented` to `wordWrapLine` — **new, found 2026-08-13** |
+| TUI-061 | low | parity-bug | S | `set_text` collapses pi's `setText` and `setTextInternal`, so a programmatic buffer replacement leaves the paste registry live and is not undoable — **new, found 2026-08-13** |
 | TUI-N05 | low | parity-bug | S | Extension shortcuts can never override a built-in key; no conflict reported |
 | TUI-N06 | low | parity-bug | L | `Entry::Thinking` freezes hide/show at commit time |
 | TUI-N07 | low | parity-bug | L | Mid-session `/resume` cannot erase the previous session's scrollback |
@@ -202,6 +233,35 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-057 | low | port-divergence | M | Slash-command palette submission is inconsistent — sometimes one Enter, sometimes two, sometimes a trailing space suppresses it — **new, observed 2026-08-13, low confidence** |
 
 ## TUI-042 — The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message
+
+> ## FIXED 2026-08-13 — `crates/cyrup-tui/src/editor.rs`
+>
+> `Snapshot` now carries `pastes: BTreeMap<u32, String>` and `paste_counter: u32` (pi's
+> `EditorSnapshot`, `editor.ts:216-220`); `snapshot()` clones both (`:2012-2014`) and `undo()`
+> restores both (`:2016-2030`). Three things the item did not name were needed for the fix to
+> actually match pi:
+>
+> 1. **The paste's own snapshot was pushed too late.** cyrup incremented `paste_counter` and inserted
+>    into `pastes` *before* `push_undo_for`, so the snapshot already contained the new paste and undo
+>    could not roll it back. `handlePaste` pushes the snapshot as its FIRST statement
+>    (`editor.ts:1160`). Moved. This is what makes paste → undo → paste re-issue `#1`.
+> 2. **`clear()` never reset `paste_counter`.** `submitValue` does `pastes.clear(); pasteCounter = 0`
+>    (`editor.ts:1264-1266`) and so does `setText` (`:1018-1020`). Without it, ids climbed for the
+>    life of the session, so cyrup's `[paste #7 …]` was pi's `[paste #1 …]`.
+> 3. **The undo stack survived a submit.** `submitValue` clears it (`:1268`); both cyrup submit paths
+>    now do.
+>
+> The `history_draft` half the item asks for was already benign — nothing mutates the registry while
+> browsing, in either codebase (pi's `historyDraft` is a bare `EditorState`, `:319`). The draft path
+> *was* broken in another way: pi pushes an undo snapshot when browsing is entered
+> (`editor.ts:435-438`) and cyrup pushed none, so `Ctrl+-` after an `Up` skipped past the draft and
+> emptied the buffer. Added; pinned by `::browsing_history_away_from_a_draft_keeps_its_paste_registry`
+> (RED at HEAD: `left: ""`, right: `"[paste #1 1500 chars]"`).
+>
+> **Tests** (all RED at HEAD, GREEN after, `crates/cyrup-tui/tests/editor.rs`):
+> `undo_restores_the_paste_registry_not_just_the_marker_text` (RED: `left: "[paste #1 1500 chars]"`),
+> `undo_rolls_back_the_paste_counter_so_the_next_paste_is_still_marker_one`,
+> `browsing_history_away_from_a_draft_keeps_its_paste_registry`.
 
 **Kind** parity-bug · **Severity** critical · **Effort** S · **Confidence** **confirmed — reproduced in a live terminal, with the model's input read out of the session JSONL** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
 
@@ -231,6 +291,37 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 **Verify** — `crates/cyrup-tui/tests/editor.rs`: build an `InputEditor`, `handle_paste(&"x".repeat(1500))`, assert `expanded_text()` contains the 1500 chars; send `E::DeleteCharBackward`, then `E::Undo`; assert `text()` again shows `[paste #1 1500 chars]` **and** `expanded_text()` once more contains the 1500 chars (fails today — it returns the literal marker). Second case: paste, `E::Undo`, paste again, assert the second marker is `#1` not `#2`.
 
 ## TUI-043 — Word motion and Ctrl+W are not paste-marker atomic — one Ctrl+W after a large paste orphans the marker and drops the pasted content
+
+> ## FIXED 2026-08-13 — `crates/cyrup-tui/src/editor.rs`
+>
+> Ported the mechanism rather than the symptom. `word_left_target`/`word_right_target` are now
+> statement-for-statement ports of `findWordBackward`/`findWordForward`
+> (`word-navigation.ts:22-114`), driven by a port of `segmentWithMarkers` (`editor.ts:37-90`) —
+> whitespace skip, then one of the three branches: atomic segment (`:44-46` / `:97-99`), word-like
+> segment truncated at its last/first `PUNCTUATION_REGEX` match, or a punctuation run. `marker_at`
+> supplies the `validIds` gate (`:44`).
+>
+> **Two corrections to the item's Fix, both from reading upstream at the tag:**
+>
+> 1. **"make `delete_word_backward`/`forward` drop the registry entry the way `backspace()` does" is
+>    not pi's mechanism.** `deleteWordBackwards` (`editor.ts:1607-1630`) and `deleteWordForward`
+>    (`:1633-1672`) compute a range from `moveWordBackwards`/`moveWordForwards` and slice the text —
+>    they never touch `pastes`. The orphan entry is harmless in both codebases (`expandPasteMarkers`
+>    only replaces markers that are *in the text*), and it is what lets the undo snapshot resolve the
+>    marker again. cyrup now matches: no registry mutation on either word-delete path.
+> 2. **`marker_covering` is the wrong seam and is deleted.** Upstream has no "is this column inside a
+>    marker" predicate at all; atomicity is a property of the SEGMENTER, and `moveCursor`
+>    (`editor.ts:1808-1830`), `handleBackspace` (`:1287-1290`) and `handleForwardDelete`
+>    (`:1687-1690`) all step by `this.segment(text, "grapheme")`, which merges markers. So
+>    `prev_grapheme`/`next_grapheme` now merge them too — which is the fix for the half of this item
+>    the Verify section could not otherwise reach: **plain Left/Right arrows could park the caret
+>    inside a marker**, where the next keystroke destroys it silently.
+>
+> **Tests** (RED at HEAD, GREEN after): `ctrl_w_at_a_marker_end_deletes_the_whole_marker` (RED:
+> `left: "[paste #1 1500 chars"` — exactly the live repro),
+> `alt_d_at_a_marker_start_deletes_the_whole_marker`, `word_motion_treats_a_paste_marker_as_one_unit`
+> (asserts col 0 from the marker's end, per the REPRO-LOG correction),
+> `arrow_keys_step_over_a_paste_marker_as_one_grapheme`.
 
 **Kind** parity-bug · **Severity** critical · **Effort** S · **Confidence** **confirmed — reproduced in a live terminal, with the model's input read out of the session JSONL** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
 
@@ -587,6 +678,15 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 **Verify** App test over a temp cwd with `.cyrup/skills/x.md` and implicit trust granted this session: after `/reload`, the trust store holds `cwd → true` and the reload status carries pi's `; saved project trust` variant; with no implicit grant, the store is untouched.
 
 ## TUI-044 — `undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read
+
+> ## FIXED 2026-08-13 — `crates/cyrup-tui/src/editor.rs`
+>
+> `undo()` restores `snap.col` (clamped only as a bounds guard), calls `reset_preferred_col()` to
+> match `this.preferredVisualCol = null` (`editor.ts:2022`), and calls `exit_history()` *before* the
+> pop rather than inside the `if`, matching `:2017`. Shipped with TUI-042 as instructed, so `Snapshot`
+> was corrected once. **Test** `undo_restores_the_snapshot_cursor_column` runs the item's own live
+> scenario and asserts both readouts it names: the caret at `(0, 5)`, and the next keystroke producing
+> `helloZ` (pi) rather than `heZllo` (cyrup at HEAD).
 
 **Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** **confirmed — reproduced in a live terminal by two independent readouts** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
 
@@ -1021,6 +1121,26 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 
 ## TUI-048 — Word navigation classifies by character class instead of Unicode word segmentation — CJK word motion jumps whole runs
 
+> ## PARTIALLY FIXED 2026-08-13 — still open · `crates/cyrup-tui/src/editor.rs`
+>
+> The character-class run is gone. Word motion is now pi's three-branch shape over
+> `unicode_segmentation`'s UAX#29 word-boundary iterator, with `PUNCTUATION_REGEX` (`utils.ts:821`)
+> ported as its own `matches!` set — explicitly **not** the complement of the old `is_word_char`,
+> which the item was right to warn about. `is_word_char` had no other caller and is deleted.
+>
+> **What is NOT closed, and why the item stays open.** `Intl.Segmenter` is ICU, and ICU adds a
+> dictionary/LSTM pass for unspaced scripts that UAX#29 alone has no data for: `你好世界` is two
+> segments to pi and four to `unicode-segmentation`. So Alt+B from the end lands at column 2 upstream
+> and column 3 here — better than the pre-fix column 0, still not parity. Closing it means taking
+> `icu_segmenter` plus its CJK/Thai data as a workspace dependency, which is a call for the workspace
+> owner, not this change. Recorded as a CYRUP-DELTA on `InputEditor::word_segments`.
+>
+> **Tests**: `word_motion_keeps_pis_ascii_boundaries_after_the_segmenter_swap` (GREEN before AND
+> after — it is the regression guard the item's Verify asks for: `foo.bar`, `don't`, `3.14`,
+> `foo bar`, `a  b`, plus the forward direction) and `cjk_word_motion_no_longer_swallows_the_whole_run`
+> (RED at HEAD), which asserts a RANGE rather than a column, precisely because pinning column 3 would
+> pin behaviour pi does not have.
+
 **Kind** parity-bug · **Severity** low · **Effort** M · **Confidence** confirmed
 
 **cyrup** — `crates/cyrup-tui/src/editor.rs:1637-1639`: `fn is_word_char(c: char) -> bool { c.is_alphanumeric() || c == '_' }`, and `word_left_target` / `word_right_target` (`:1074-1128`) consume a maximal run of one class (word vs non-word-non-whitespace). There is no segmenter anywhere in the crate: `rg 'segment|Segmenter|unicode_segmentation' crates/cyrup-tui/src/editor.rs` finds only the wrap-related comment at `:1738`. Verified by hand that this **coincides with pi** for ASCII prose, identifiers, `foo'bar`, `3.14` and `foo.bar` — the divergence is confined to scripts where a run of `is_alphanumeric` characters spans several dictionary words.
@@ -1034,6 +1154,16 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 **Verify** — `crates/cyrup-tui/tests/editor.rs`: with text `你好世界` and the caret at 4, `E::CursorWordBackward` lands at 2, not 0; `E::DeleteWordBackward` leaves `你好`. Add ASCII regression cases (`foo.bar`, `don't`, `3.14`, `foo bar`) asserting the current, already-correct targets so the segmenter swap cannot silently change them.
 
 ## TUI-049 — `marker_at` accepts any text between `[paste #N ` and `]`, so cyrup expands paste markers pi's regex rejects
+
+> ## FIXED 2026-08-13 — `crates/cyrup-tui/src/editor.rs`
+>
+> `marker_at` is split into a syntactic matcher (`marker_span_at`, a hand-rolled
+> `PASTE_MARKER_SINGLE` — `editor.ts:24`) and the registry gate (`validIds`, `:44`). After the digits
+> it accepts only an immediate `]`, or one space and exactly one of `+<digits> lines` /
+> `<digits> chars`. The ungated matcher is also what the marker renumbering needs, since pi's
+> renumber replaces on the bare `PASTE_MARKER_REGEX` with no id filter (`:1308-1314`).
+> **Test** `a_hand_typed_marker_shaped_string_is_not_expanded` (RED at HEAD) — and it pins the other
+> direction too: the bare `[paste #N]` form pi's regex *does* allow still expands.
 
 **Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
 
@@ -1249,6 +1379,22 @@ The session JSONL proves it was never sent — the only user messages recorded a
 
 ## TUI-053 — `Ctrl+-` (`editor.undo`) is unreachable from any terminal that does not implement the kitty keyboard protocol
 
+> ## FIXED 2026-08-13 — `crates/cyrup-tui/src/keymap.rs`
+>
+> Ported `keys.ts:1275-1281` as `normalize_legacy_control_byte`, applied at the head of
+> `EditorKeymap::action_for`: `Char('4'|'5'|'7') + CONTROL` — which is how crossterm 0.29.0 renders
+> the bytes `0x1C`/`0x1D`/`0x1F` (`event/sys/unix/parse.rs:110-113`) — is rewritten to
+> `Char('\\'|']'|'-') + CONTROL`, preserving ALT so pi's `\x1b\x1f` → `ctrl+alt+-` forms map too.
+> `0x1E` is left alone because pi maps no chord to it. The rewrite is **gated on
+> `keyboard_protocol::current() != Kitty`**: under the kitty protocol `Ctrl+7` is genuinely `Ctrl+7`
+> (`CSI 55;5u`) and pi's byte branch is unreachable, so the alias must be too. Chosen over adding a
+> second binding to the table so `/hotkeys` still reports `ctrl+-`, and over waiting for TUI-045's
+> pre-parser, which does not exist yet — if that lands, this function is what moves into it.
+>
+> **Test** `ctrl_undo_is_reachable_from_a_terminal_without_the_kitty_protocol` (RED at HEAD) covers
+> undo *and* the `0x1D` → `ctrl+]` char-jump of the same class. **Still wants the live half**: a run
+> on a real non-kitty terminal (Terminal.app or plain xterm), which this pass could not perform.
+
 **Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** **confirmed — measured live, and pi's legacy mapping read at the tag** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
 
 **cyrup** — `crates/cyrup-tui/src/keymap.rs:1010` binds `(ctrl('-'), E::Undo)` and nothing else; `:176` maps the id `"editor.undo"` to `E::Undo`. Matching `Char('-') + CONTROL` requires a CSI-u report. On a legacy terminal `Ctrl+-` arrives as the single byte `0x1F`, and crossterm 0.29.0 decodes the whole `0x1C..=0x1F` range arithmetically — `src/event/sys/unix/parse.rs:110-113`, `c @ b'\x1C'..=b'\x1F' => KeyCode::Char((c - 0x1C + b'4') as char) + CONTROL` — so `0x1F` becomes **`Char('7') + CONTROL`** and can never match `Char('-') + CONTROL`. There is no fallback binding and no diagnostic. Note the keymap already carries an explicit `(Kitty-gated)` comment for the char-jump keys directly below this line: the gating hazard was understood there and not applied to undo.
@@ -1377,6 +1523,67 @@ The conversation is still in the transcript and still in the session file, but t
 **Fix** — First reproduce deterministically: drive the palette from a test harness rather than a terminal, with the completion source stubbed to resolve on a controllable schedule, and establish whether Enter-before-population is the trigger. Then read pi's palette submission path and port its ordering. Do not change behaviour before both steps.
 
 **Verify** — Once characterised: a test that submits `/compact` with the completion source resolving after the keypress and asserts the command runs exactly once; plus the trailing-space case. Then a live run issuing the same command ten times and asserting ten executions.
+
+## TUI-058 — Deleting a paste marker does not renumber the pastes that follow it
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed — **new, found 2026-08-13 while porting TUI-042/043** · **FIXED 2026-08-13**
+
+**cyrup (at HEAD)** — `backspace()` (`editor.rs:801-816` at HEAD) did `self.pastes.remove(&id)` and nothing else.
+
+**upstream** — `handleBackspace` (`editor.ts:1291-1315` @v0.83.0) does four things when the deleted grapheme is a paste marker: `pastes.delete(targetId)`, `pasteCounter--`, shift every registry entry with a higher id down by one ("`[paste #3]` becomes `[paste #2]` when `[paste #1]` is removed"), and rewrite the buffer text with `line.replace(PASTE_MARKER_REGEX, …)` so the visible ids follow. The text rewrite is **not** filtered by `validIds` — it renumbers any syntactic marker.
+
+**Impact** — after deleting an earlier marker, cyrup's remaining marker ids diverged permanently from pi's: the user saw `[paste #2 …]` where pi shows `[paste #1 …]`, and the next paste took an id pi had already recycled. Cosmetic on its own; it compounds TUI-042, because the ids in the buffer and the ids in the registry are the *same namespace* the undo snapshot restores.
+
+**Fixed** — ported literally as `InputEditor::drop_paste` + `renumber_markers` (`editor.rs`). A `BTreeMap` gives the ascending iteration upstream buys with `.sort()`. **One upstream hazard is reproduced rather than corrected, and is flagged in the code**: upstream computes the deletion offsets *before* the rewrite and re-reads the line *after* it (`:1317-1322`), so renumbering a two-digit id (`#10` → `#9`) on the same line ahead of the caret shifts the deletion by one column. Reachable only with ≥10 live pastes in one prompt. Deviating there would have been an un-signed-off design change; it is called out here so the decision is visible.
+
+**Verify** — `crates/cyrup-tui/tests/editor.rs::deleting_a_marker_renumbers_the_pastes_that_follow_it` (RED at HEAD): paste two large blocks, backspace over the first, assert the survivor reads `[paste #1 …]` **and** that `expanded_text()` returns the second block's content.
+
+---
+
+## TUI-059 — Only Left/Right clear `lastAction`, so a kill survives every other motion and the next kill accumulates into the same ring entry
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed — **new, found 2026-08-13** · **FIXED 2026-08-13**
+
+**cyrup (at HEAD)** — `apply_editor_action` set `last_action = LastAction::None` in the `CursorLeft`/`CursorRight` arms only. `CursorUp`, `CursorDown`, `CursorWordLeft`, `CursorWordRight`, `CursorLineStart`, `CursorLineEnd` and the history-recall path left it untouched.
+
+**upstream** — every motion clears it: `moveCursor` (`editor.ts:1791`), `moveToLineStart`/`moveToLineEnd` (`:1783`/`:1787`), `moveWordBackwards`/`moveWordForwards` (`:1870`/`:2065`), `navigateHistory` (`:430`), `jumpToChar`, `pageScroll`.
+
+**Impact** — measured: `hello world`, Ctrl+W, Home, Ctrl+K produced the single kill-ring entry `"worldhello "` where pi produces two entries and leaves `"hello "` on top, so Ctrl+Y pasted a mangled concatenation of two unrelated kills. The same stale flag left Alt+Y (yank-pop) armed after a vertical motion, where pi disarms it.
+
+**Fixed** — the six arms now clear it, each citing its upstream function. **Verify** — `::a_motion_between_two_kills_starts_a_new_kill_ring_entry` (RED at HEAD: `left: Some("worldhello ")`).
+
+---
+
+## TUI-060 — The wrap/visual-line map is not paste-marker aware, so a marker can be split across visual rows
+
+**Kind** parity-bug · **Severity** low · **Effort** M · **Confidence** confirmed — **new, found 2026-08-13, open**
+
+**cyrup** — `word_wrap_line` (`editor.rs`) segments with plain extended grapheme clusters, and its `[CYRUP-DELTA]` block states the divergence as a fact about cyrup's segments ("never composite") without noting the consequence.
+
+**upstream** — both wrap callers pass the marker-merging segmentation explicitly: `layoutText` at `editor.ts:928` and `buildVisualLineMap` at `:1745` are each `wordWrapLine(line, width, [...this.segment(line, "grapheme")])`. A `[paste #N …]` marker is therefore one indivisible segment for wrapping, and `wordWrapLine:163-178` exists precisely to re-wrap a segment wider than the line.
+
+**Impact** — a marker that straddles the right edge is torn across two visual rows upstream keeps whole. Because the same map drives vertical motion and the caret's screen position ([`Self::cursor_in`]), the divergence is not purely cosmetic. Low because the marker is ~20 columns and the tear needs a narrow terminal or a long prefix.
+
+**Fix** — thread a marker-merged segment list into `word_wrap_line` as pi's `preSegmented` parameter. Note the recursion at `:163-178` is what upstream needs for an over-wide *composite* segment; cyrup's existing delta comment about an over-wide single cluster stays valid and should be kept alongside it.
+
+**Verify** — a marker positioned to straddle the wrap width occupies one visual line, not two, and `visual_line_map()` reports its whole span on that line.
+
+---
+
+## TUI-061 — `set_text` collapses pi's `setText` and `setTextInternal` into one function, so the paste registry outlives a programmatic buffer replacement
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed — **new, found 2026-08-13, open**
+
+**cyrup** — one `pub fn set_text` (`editor.rs`) serves both the programmatic replacement (`app.rs`, the queued-message restore) and history browsing (`history_older`/`history_newer`). It clears neither `pastes` nor `paste_counter` and pushes no undo snapshot.
+
+**upstream** — two functions. `setText` (`editor.ts:1010-1021`) cancels autocomplete, clears `lastAction`, exits history browsing, **pushes an undo snapshot when the content actually differs**, then `this.pastes.clear(); this.pasteCounter = 0;` before delegating. `setTextInternal` (`:1043-1056`) — "Internal setText that doesn't reset history state - used by navigateHistory" — does none of it.
+
+**Impact** — after a programmatic buffer replacement the registry keeps entries whose markers are no longer in the buffer, so a subsequently typed `[paste #1 1500 chars]` still expands (TUI-049's surface, narrowed but not closed by that fix), and the replacement is not undoable. Low: both call sites replace the buffer with text the user can retype.
+
+**Fix** — split the two, exactly as upstream does, and route `history_older`/`history_newer` to the internal form; the external form gets the snapshot + registry reset. Small, but it changes a `pub` method's contract, so it is filed rather than folded into the paste-registry batch.
+
+**Verify** — `set_text` after a large paste leaves `expanded_text()` unable to resolve a hand-retyped marker; a `set_text` that changes the content is undoable with Ctrl+-.
+
 
 ## Coverage
 

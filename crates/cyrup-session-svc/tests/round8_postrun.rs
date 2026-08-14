@@ -135,7 +135,7 @@ async fn assembled_run_triggers_post_run_overflow_compaction() {
 
     // The overflow error must be attributed to the SAME model the session runs (Pi `_checkCompaction`
     // same-model guard), so build it from the live model address.
-    let model = session.model();
+    let model = session.model().expect("session must have a resolved model");
     let overflow = AssistantMessage::errored(
         model.provider.clone(),
         model.model.as_str(),

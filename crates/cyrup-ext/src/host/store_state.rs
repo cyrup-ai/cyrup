@@ -18,8 +18,13 @@ pub struct HostState {
 }
 
 impl HostState {
-    /// Build a capability-scoped WASI context. By default there is NO ambient fs/net authority;
-    /// only explicitly preopened dirs (granted via the manifest, arch-12) are visible.
+    /// Build a capability-scoped WASI context: NO ambient fs/net authority, and — corrected as part
+    /// of EXT-054 — no preopened dirs either, ever. `WasiCtxBuilder::new().build()` preopens
+    /// nothing, and nothing in the crate adds one. The manifest's `capabilities.fs` grants do NOT
+    /// become WASI preopens; they feed [`crate::host::FsCaps`], which backs the host's own `ext-fs`
+    /// import and resolves each guest path against the granted roots. The previous wording here
+    /// ("only explicitly preopened dirs (granted via the manifest, arch-12) are visible") described
+    /// a mechanism that does not exist and implied a grant path that, until EXT-054, was inert.
     pub fn new(limits: StoreLimits) -> Self {
         let ctx = WasiCtxBuilder::new().build();
         Self { ctx, table: ResourceTable::new(), limits, guest: None }

@@ -487,7 +487,7 @@ async fn set_model_resolved_auth_precheck_and_typed_cycle() {
     let faux2 = provider.models().iter().find(|m| m.id.as_str() == "faux-2").unwrap().clone();
     assert!(session.has_configured_auth(&faux2));
     session.set_model_resolved(faux2.clone()).await.unwrap();
-    assert_eq!(session.model().model.as_str(), "faux-2");
+    assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), "faux-2");
 
     // A fabricated model not in the catalog fails the auth-proxy precheck.
     let mut bogus = faux2.clone();

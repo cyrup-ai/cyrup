@@ -32,10 +32,12 @@ use cyrup_resources::theme::ThemeWatcher;
 use cyrup_sdk::core::CancelToken;
 use cyrup_session_svc::{
     AgentSession, AgentSessionRuntime, InputSource, ScopedModel, SessionConfig,
-    SessionFactory, SessionInfo, SessionLayout, SessionServiceError, SessionTarget, SessionsRoot,
+    SessionFactory, SessionInfo, SessionLayout, SessionTarget, SessionsRoot,
     UserInput, list_all, list_in_dir,
 };
 use cyrup_tui::{App, StdinTerminalProbe, ThemeController, UiTheme, crossterm_input_stream};
+
+
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -135,6 +137,18 @@ async fn run() -> anyhow::Result<i32> {
         return Ok(1);
     }
 
+    // `--tui-mode fullscreen` parses (pi args.ts:180-192 @v0.84.1) and is then declined HERE, at
+    // startup, falling back to `regular` — ADR-0005 §Decision A.2, which also fixes this wording and
+    // makes a grep for it the tripwire that the interim was cleaned up when work unit B-13 lands the
+    // alternate-screen renderer. Deliberately NOT phrased as a pi diagnostic and NOT fatal: pi
+    // accepts the value, so exiting here would refuse a launch pi performs. `regular` is a no-op.
+    if cli.tui_mode == Some(cyrup::TuiMode::Fullscreen) {
+        eprintln!(
+            "--tui-mode fullscreen is not built yet in this release (ADR-0005); falling back to regular."
+        );
+        cli.tui_mode = Some(cyrup::TuiMode::Regular);
+    }
+
     // Rich `--help` body (Pi printHelp, args.ts:212). Loaded-extension flags are the outer extension
     // tier; the bin injects an empty set today (the injection point is preserved 1:1).
     if cli.help {
@@ -202,6 +216,43 @@ async fn run() -> anyhow::Result<i32> {
         "startup session lookup",
     ));
 
+    // Experimental first-time setup — Pi main.ts:615-617 (`:663-664` @v0.84.1), verbatim position:
+    // between `startupSettingsManager` (`:610`) and the `sessionDir` tier chain (`:625-630`), for
+    // pi's stated reason at `:613-614` — "Runs before any runtime services are created so the chosen
+    // settings apply everywhere". Wired per ADR-0011 (the port at `startup.rs:91-291` was complete
+    // and unit-tested; only this call was missing).
+    //
+    // pi's condition is `appMode === "interactive" && !parsed.help && parsed.listModels === undefined
+    // && shouldRunFirstTimeSetup()`. `!parsed.help` needs no conjunct here — `main.rs` prints help
+    // and returns above, upstream of this gate — but `list_models` does: `resolve_app_mode` answers
+    // `Interactive` for `cyrup --list-models gpt` on a TTY and the listing exit is DOWNSTREAM, so
+    // without it the wizard would mount on a command pi answers with a model list.
+    //
+    // `detected` is pi's own detection (`detectTerminalThemeForAuto({ ui, timeoutMs: 100 })`,
+    // startup-ui.ts:180) — the 100 ms bound is pi's. The theme is the detected polarity rather than
+    // `UiTheme::default()`: pi's `createStartupTui` resolves the theme *setting* first
+    // (startup-ui.ts:77-84), and on a first run there is no `settings.json` by definition (the
+    // gate's own fourth clause), so what it resolves to is exactly this.
+    if mode == AppMode::Interactive
+        && cli.list_models.is_none()
+        && cyrup::should_run_first_time_setup(&dirs.settings_path(), env.agent_dir.is_some())
+    {
+        let detected = cyrup_tui::detect_terminal_theme_for_auto(
+            &StdinTerminalProbe,
+            std::time::Duration::from_millis(100),
+            &std::env::var("COLORFGBG").unwrap_or_default(),
+        );
+        let theme = if detected == cyrup_tui::TerminalTheme::Light {
+            UiTheme::light()
+        } else {
+            UiTheme::dark()
+        };
+        // Pi's `showFirstTimeSetup` returns void; a cancel at either step persists nothing
+        // (startup.rs), and a persistence failure is propagated rather than swallowed.
+        let _ = cyrup::run_first_time_setup(&theme, &mut startup_settings, detected)?;
+        timings.mark("firstTimeSetup");
+    }
+
     // `sessionDir` tier 3 (Pi main.ts:625-630): CLI `--session-dir` > `$CYRUP_SESSION_DIR` >
     // `startupSettingsManager.getSessionDir()` (settings-manager.ts:670-673). `ConfigDirs::resolve`
     // folded in the first two tiers; the settings tier has to be applied out here because the
@@ -211,16 +262,6 @@ async fn run() -> anyhow::Result<i32> {
     // through the same argument slot as `--session-dir`, so it is used literally rather than
     // cwd-encoded, and `session_list_layout`/`Cli::to_session_config` below key off that flag.
     let dirs = cyrup::apply_settings_session_dir(dirs, &startup_settings);
-
-    // First-time-setup gate (Pi main.ts:557 / startup-ui.ts:115). Faithfully `false` for the cyrup
-    // rebrand (not the official distribution), so the wizard is never invoked; the call-site exists
-    // so the gate is real (the wizard UI itself is the ext-UI dialog host, an outer layer).
-    if mode == AppMode::Interactive
-        && cyrup::should_run_first_time_setup(&dirs.settings_path(), env.agent_dir.is_some())
-    {
-        // The interactive first-time-setup wizard is the ext-UI dialog host (outer layer); the
-        // predicate above is the closeable gate.
-    }
 
     // `--name` must be non-empty after trim (Pi main.ts:586-592).
     let session_name = cli.validated_name().map_err(|m| anyhow::anyhow!("{m}"))?;
@@ -369,12 +410,16 @@ async fn run() -> anyhow::Result<i32> {
     // Default-launch model (Pi `findInitialModel`, model-resolver.ts:527-607): when NEITHER
     // `--provider` nor `--model` (nor a `--models` scope) is given, cyrup must launch on a REAL
     // configured provider — the saved settings default, else a configured provider's curated default
-    // — instead of always falling back to the offline scripted faux provider. The `select_provider`
-    // call above yields faux for this no-flag case (there is no provider prefix to key off); here we
+    // — instead of stopping at the zero-model `UnconfiguredProvider`. The `select_provider`
+    // call above yields `unconfigured` for this no-flag case (there is no provider prefix to key
+    // off); here we
     // upgrade it to the resolved default provider/model when one is configured, and set the
     // corresponding `model_pattern` so the builder launches on that exact model (footer shows e.g.
     // `together/moonshotai/Kimi-K2.6`). Only for a FRESH session — a resumed/continued session keeps
-    // its own restored model. When NOTHING is configured this is a no-op and faux stays the fallback.
+    // its own restored model. When NOTHING is configured this is a no-op and the empty catalog
+    // stands: `resolve_model` then yields `model: None` + `modelFallbackMessage` (pi sdk.ts:216-218),
+    // which the interactive TUI shows as a banner and the non-interactive modes turn into
+    // `no_models_available()` ⇒ pi `main.ts:852-855`.
     if cli.provider.is_none()
         && cli.model.is_none()
         && cli.models.is_empty()
@@ -386,7 +431,7 @@ async fn run() -> anyhow::Result<i32> {
         // `configuredProviders` set is filled by running `checkAuth` over every COMPOSED provider
         // (model-runtime.ts:372-374), so a user-declared provider counts with an empty `auth.json`;
         // without the second tier a fresh custom-provider-only install filtered its own provider out
-        // of step 4 and launched on the offline faux provider instead.
+        // of step 4 and dead-ended on the empty `unconfigured` catalog instead.
         let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));
         let auth_models_json = models_json.clone();
         let has_configured_auth = move |m: &cyrup_provider::Model| {
@@ -506,6 +551,15 @@ async fn run() -> anyhow::Result<i32> {
             factory_builder = factory_builder.with_native_extension(ext);
         }
         let factory = Arc::new(factory_builder);
+        // SEAM-075: this arm deliberately has NO modelless hard stop. pi gates it on the MODE —
+        // `if (appMode !== "interactive" && !session.model) { … process.exit(1); }`
+        // (main.ts:852-855 @v0.83.0) — so a credential-less first run still gets a TUI to type
+        // `/login` and then `/model` into. The session type carries that state:
+        // `resolve_model` yields `model: None` + a `modelFallbackMessage`
+        // (`cyrup-session-svc/src/builder.rs`, pi `sdk.ts:216-218`), the banner is shown below
+        // (pi `interactive-mode.ts:883-884`), and the first turn attempted without a model answers
+        // with `formatNoModelSelectedMessage()` (pi `agent-session.ts:1178-1180`) instead of
+        // killing the process. The rpc and print/json arms carry pi's `:852-855` stop.
         let runtime = AgentSessionRuntime::create(factory, target)
             .await
             .context("building agent session runtime")?;
@@ -525,12 +579,16 @@ async fn run() -> anyhow::Result<i32> {
                 migration.migrated_auth_providers.join(", ")
             );
         }
+        // (The `modelFallbackMessage` warning is NOT printed here — pi shows it INSIDE the TUI via
+        // `this.showWarning(modelFallbackMessage)` (interactive-mode.ts:883-884), so it lands in the
+        // transcript rather than scrolling off behind the alternate screen. See `run_interactive`.)
         // Show extension-system deprecation warnings in interactive mode (Pi main.ts:781).
         let warnings = migrations::format_deprecation_warnings(&deprecation_warnings);
         if !warnings.is_empty() {
             eprint!("{warnings}");
         }
-        let _signals = spawn_abort_on_signal(session.clone(), cancel.clone());
+        let _signals =
+            spawn_abort_on_signal(runtime.clone(), cancel.clone(), AppMode::Interactive);
         // `PI_STARTUP_BENCHMARK` interactive run path (Pi main.ts:819-835): init the TUI, let stdin
         // drain terminal query replies for ~150ms, stop, then print timings — never the event loop.
         if timings::startup_benchmark_enabled() {
@@ -654,9 +712,6 @@ async fn run() -> anyhow::Result<i32> {
             let factory = Arc::new(factory_builder);
             let runtime = match AgentSessionRuntime::create(factory, target).await {
                 Ok(r) => r,
-                // Non-interactive no-models-available guard (Pi main.ts:795-798): print the provider
-                // login guidance + exit 1 instead of a generic build error.
-                Err(SessionServiceError::NoModels(_)) => return no_models_available(),
                 Err(e) => {
                     return Err(anyhow::Error::new(e).context("building agent session runtime"));
                 }
@@ -669,8 +724,23 @@ async fn run() -> anyhow::Result<i32> {
             }
             let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
+            // Pi main.ts:852-855 — the modelless hard stop, gated on the MODE:
+            //   `if (appMode !== "interactive" && !session.model) {`
+            //   `    console.error(chalk.red(formatNoModelsAvailableMessage()));`
+            //   `    process.exit(1);`
+            //   `}`
+            // It lives HERE, on the built session, not in the builder: `sdk.ts:216-218` resolves a
+            // credential-less start to `model: undefined` + a `modelFallbackMessage` banner rather
+            // than an error (SEAM-075), so every mode reaches this point and only the
+            // non-interactive ones stop. Placed after `apply_post_build` because pi applies
+            // `--name` (main.ts:650) and the scoped `--models` (main.ts:742-750) before :852.
+            if session.model().is_none() {
+                runtime.dispose().await;
+                cyrup::output_guard::restore_stdout();
+                return no_models_available();
+            }
             timings.print();
-            let _signals = spawn_abort_on_signal(session, cancel.clone());
+            let _signals = spawn_abort_on_signal(runtime.clone(), cancel.clone(), AppMode::Rpc);
             let reader = tokio::io::BufReader::new(tokio::io::stdin());
             let mut writer = tokio::io::stdout();
             run_rpc_dispatch(&runtime, reader, &mut writer).await?;
@@ -763,8 +833,6 @@ async fn run() -> anyhow::Result<i32> {
             // subagent run would inherit it. `run_print_dispatch`/`run_json_dispatch` announce.
             let runtime = match AgentSessionRuntime::create_unannounced(factory, target).await {
                 Ok(r) => r,
-                // Non-interactive no-models-available guard (Pi main.ts:795-798).
-                Err(SessionServiceError::NoModels(_)) => return no_models_available(),
                 Err(e) => {
                     return Err(anyhow::Error::new(e).context("building agent session runtime"));
                 }
@@ -777,11 +845,28 @@ async fn run() -> anyhow::Result<i32> {
             }
             let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
+            // Pi main.ts:852-855 — the modelless hard stop, gated on the MODE:
+            //   `if (appMode !== "interactive" && !session.model) {`
+            //   `    console.error(chalk.red(formatNoModelsAvailableMessage()));`
+            //   `    process.exit(1);`
+            //   `}`
+            // It lives HERE, on the built session, not in the builder: `sdk.ts:216-218` resolves a
+            // credential-less start to `model: undefined` + a `modelFallbackMessage` banner rather
+            // than an error (SEAM-075), so every mode reaches this point and only the
+            // non-interactive ones stop. Placed after `apply_post_build` because pi applies
+            // `--name` (main.ts:650) and the scoped `--models` (main.ts:742-750) before :852.
+            if session.model().is_none() {
+                runtime.dispose().await;
+                cyrup::output_guard::restore_stdout();
+                return no_models_available();
+            }
             timings.print();
             // `settingsManager.getImageAutoResize()` for the `@file` image path (Pi main.ts:830),
             // read before `session` moves into the signal guard.
             let auto_resize_images = session.services().settings.effective().image_auto_resize();
-            let _signals = spawn_abort_on_signal(session, cancel.clone());
+            // `mode` here is `Print` or `Json`; both are pi's `runPrintMode` host, whose handler
+            // exits 143/129 on the first SIGTERM/SIGHUP (print-mode.ts:48-64).
+            let _signals = spawn_abort_on_signal(runtime.clone(), cancel.clone(), mode);
             // NO prompt-required guard here: Pi has none. `buildInitialMessage` answers
             // `initialMessage: undefined` for a run with no stdin/`@file`/message
             // (initial-message.ts:36-42) and `runPrintMode` simply skips its send loops
@@ -1158,7 +1243,13 @@ fn resolve_startup_ui(
             default_trust,
             mode,
         ) {
-            let options = cyrup_config::trust::trust_options(&dirs.cwd, false);
+            // `includeSessionOnly: true` — pi's PRE-LAUNCH prompt
+            // (`selectProjectTrustOption`, project-trust.ts:32) is the one call site that asks for
+            // the two session-only rows, so an answer here can decline to record a verdict at all
+            // (their `updates` are empty, so `set_many` writes nothing). SEAM-064. pi's IN-APP
+            // selector is the other call site and genuinely passes the default `false`
+            // (trust-selector.ts:44) — do not "fix" that one to match.
+            let options = cyrup_config::trust::trust_options(&dirs.cwd, true);
             if let Some(trusted) =
                 cyrup::run_trust_prompt(&theme, &dirs.cwd, &options, &saved, &trust_store)?
             {
@@ -1674,6 +1765,18 @@ async fn run_interactive(
     // reader thread starts. `quietStartup` hides the inventory; it never hides a load failure.
     app.push_loaded_resources(&build_startup_report(&session, verbose));
 
+    // The startup `modelFallbackMessage` warning (Pi `if (modelFallbackMessage) {
+    // this.showWarning(modelFallbackMessage); }`, interactive-mode.ts:883-884). It goes in the
+    // TRANSCRIPT, not on stderr, because that is the only place a first-run user will still see it
+    // once the alternate screen is up — and reading it is the whole point: on a credential-less
+    // start it is `formatNoModelsAvailableMessage()`, i.e. "No models available. Use /login …"
+    // (auth-guidance.ts:14-16), the instruction that turns a modelless launch (SEAM-075) into a
+    // working session. Pushed after `showLoadedResources` (which pi runs from `init()`, ahead of
+    // `run()`'s startup-warning block) and before the replay, matching pi's order.
+    if let Some(msg) = runtime.model_fallback_message().await {
+        app.state_mut().transcript.push_warning(msg);
+    }
+
     let input_stream = crossterm_input_stream(cancel.clone());
     let events = session.subscribe();
 
@@ -1757,12 +1860,20 @@ async fn seed_footer<B: cyrup_tui::RebuildBackend>(
     runtime: &AgentSessionRuntime,
     session: &AgentSession,
 ) {
+    // pi's footer reads the OPTIONAL `state.model`: the model cell is
+    // `state.model?.id || "no-model"` (footer.ts:169) and the `(provider)` prefix is gated on
+    // `state.model` being present (footer.ts:192-193). A modelless session (SEAM-075) therefore
+    // seeds an empty model — which `cyrup_tui::status` already renders as `no-model` (status.rs:394)
+    // — and no provider, instead of a fabricated `provider/model` pair.
     let model = session.model();
-    let provider = model.provider.as_str().to_string();
-    let model_id = model.model.as_str().to_string();
+    let provider = model.as_ref().map(|m| m.provider.as_str().to_string()).unwrap_or_default();
+    let model_id = model.as_ref().map(|m| m.model.as_str().to_string()).unwrap_or_default();
     let status = app.status_mut();
-    status.set_model(format!("{provider}/{model_id}"));
-    status.set_provider(Some(provider.clone()));
+    status.set_model(match model.as_ref() {
+        Some(_) => format!("{provider}/{model_id}"),
+        None => String::new(),
+    });
+    status.set_provider(model.as_ref().map(|_| provider.clone()));
 
     // Reasoning support + provider breadth from the resolved catalog (drives the ` • {level}` suffix
     // and the `(provider)` prefix gate, footer.ts:184-199).
@@ -1894,8 +2005,11 @@ fn collect_settings_diagnostics(
         .collect()
 }
 
-/// The non-interactive no-models-available exit (Pi main.ts:795-798): print the provider login
-/// guidance to stderr and return exit code 1.
+/// The non-interactive no-models-available exit — pi
+/// `console.error(chalk.red(formatNoModelsAvailableMessage())); process.exit(1);`
+/// (main.ts:853-854 @v0.83.0, inside the `appMode !== "interactive"` gate at :852-855). Prints the
+/// provider login guidance to stderr and returns exit code 1. Interactive never calls this: it
+/// launches modelless and shows the same text as a banner instead (SEAM-075).
 fn no_models_available() -> anyhow::Result<i32> {
     eprintln!("{}", format_no_models_available_message());
     Ok(1)

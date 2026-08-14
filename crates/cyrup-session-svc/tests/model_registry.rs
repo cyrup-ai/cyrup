@@ -168,7 +168,7 @@ async fn selecting_a_different_provider_swaps_the_session_provider() {
         .unwrap();
 
     // Starts on the injected faux provider.
-    assert_eq!(session.model().provider.as_str(), "faux");
+    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "faux");
     assert!(session.model_catalog().iter().all(|m| m.provider.as_str() == "faux"));
 
     // Target a real together model (the fully-qualified `provider/id` the selector confirms).
@@ -181,8 +181,8 @@ async fn selecting_a_different_provider_swaps_the_session_provider() {
 
     let new_ref = session.set_model(&pattern).await.expect("cross-provider set_model succeeds");
     assert_eq!(new_ref.provider.as_str(), "together", "active model switched to together");
-    assert_eq!(session.model().provider.as_str(), "together");
-    assert_eq!(session.model().model.as_str(), target.id.as_str());
+    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "together");
+    assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), target.id.as_str());
 
     // The injected provider was swapped: the current catalog is together's, faux is gone.
     let catalog = session.model_catalog();
@@ -251,14 +251,14 @@ async fn guest_registered_provider_is_selectable_and_installed() {
     assert_eq!(target.context_window, 64000);
 
     // Starts on the injected faux provider.
-    assert_eq!(session.model().provider.as_str(), "faux");
+    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "faux");
 
     // set_model resolves the guest model AND installs the guest provider in place (no resolver seam
     // needed — the guest provider is a realized `Provider`).
     let new_ref = session.set_model("acme/acme-fast").await.expect("guest set_model succeeds");
     assert_eq!(new_ref.provider.as_str(), "acme");
-    assert_eq!(session.model().provider.as_str(), "acme");
-    assert_eq!(session.model().model.as_str(), "acme-fast");
+    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "acme");
+    assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), "acme-fast");
 
     // STREAMABLE: the installed provider is the guest one, exposing the registered model in its
     // catalog (what `ProviderStreamFn` resolves against when the agent loop streams).
@@ -297,5 +297,5 @@ async fn cross_provider_select_without_resolver_errors() {
         "a cross-provider select with no resolver must error, not mis-stream"
     );
     // The active provider is unchanged.
-    assert_eq!(session.model().provider.as_str(), "faux");
+    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "faux");
 }

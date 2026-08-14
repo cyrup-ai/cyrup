@@ -1,17 +1,36 @@
 //! Provider selection seam (arch-11 §1, §3.6 note).
 //!
 //! Resolves a `(provider, model, apiKey)` triple to the owning [`Provider`] exactly as Pi's
-//! `resolveCliModel` does (main.ts:352-448): an explicit `--provider` wins, else the `provider/...`
-//! prefix on `--model`, else the default offline [`FauxProvider`]. A `--api-key` is installed as a
-//! runtime credential for the resolved provider (Pi `options.apiKey`). The default / `faux/*` pattern
-//! returns the in-process scripted [`FauxProvider`] (offline, runnable end-to-end); any explicit
-//! provider is looked up in the registry. There is intentionally NO silent fallback: a prefix that
-//! is not a known provider is a clear error listing the providers that ARE available.
+//! `resolveCliModel` does (`packages/coding-agent/src/core/model-resolver.ts:385` @v0.83.0, called
+//! from `packages/coding-agent/src/main.ts:423-429`): an explicit `--provider` wins, else the `provider/...`
+//! prefix on `--model`, else — when nothing else in startup upgrades it — the zero-model
+//! [`UnconfiguredProvider`]. A `--api-key` is installed as a runtime credential for the resolved
+//! provider (Pi `options.apiKey`); any explicit provider is looked up in the registry. There is
+//! intentionally NO silent fallback: a prefix that is not a known provider is a clear error listing
+//! the providers that ARE available.
+//!
+//! **PROV-052.** This used to return the scripted `FauxProvider` for the no-flag case, so a bare
+//! credential-less `cyrup -p hi` answered `No more faux responses queued`. pi does not have a
+//! faux fallback at all: `faux.ts` is exported from the `pi-ai` package for tests, is absent from
+//! `providers/all.ts`, is not a `KnownProvider`, and `git grep faux v0.83.0 --
+//! packages/coding-agent/src/` matches zero files. With no credential pi's `getAvailable()` is
+//! empty, `findInitialModel` returns `{model: undefined}` at its step 5
+//! (`packages/coding-agent/src/core/model-resolver.ts:650-651`) and
+//! `packages/coding-agent/src/main.ts:852-855` prints `formatNoModelsAvailableMessage()` to stderr
+//! and exits 1 for every mode EXCEPT `interactive`. The empty catalog of [`UnconfiguredProvider`]
+//! reproduces that, mode gating included: `resolve_model` turns it into `model: None` + the
+//! `modelFallbackMessage` banner (`cyrup-session-svc/src/builder.rs:1601-1612`, pi
+//! `sdk.ts:216-218`), and the hard stop lives one tier up on the built session — `main.rs`'s rpc
+//! (`:741-745`) and print/json (`:862-866`) arms check `session.model().is_none()` and return
+//! `no_models_available()`, while the interactive arm (`:552`) deliberately does not, so a
+//! credential-less first run still gets a TUI to type `/login` into (SEAM-075). See
+//! `cyrup_provider::unconfigured`'s module docs.
 //!
 //! **The registry every function here reads is the COMPOSED one** — the built-ins
 //! (`cyrup_provider::all_providers`, the 1:1 port of Pi `providers/all.ts`) with
 //! `<agent_dir>/models.json` layered over them. Pi has exactly one registry and it is the composed
-//! one (`ModelRuntime.rebuildProviders`, model-runtime.ts:225-231); reaching for
+//! one (`ModelRuntime.rebuildProviders`,
+//! `packages/coding-agent/src/core/model-runtime.ts:226-231`); reaching for
 //! `cyrup_provider::default_models` directly here would read a registry Pi does not have, and a
 //! provider declared only in `models.json` would be unlaunchable, unlistable and unselectable.
 //! Hence every entry point takes the loaded [`ModelFile`]; pass `&ModelFile::default()` when there
@@ -23,9 +42,9 @@ use anyhow::bail;
 use cyrup_config::ModelFile;
 use cyrup_config::models_store::FileModelsStore;
 use cyrup_config::policy::NetworkPolicy;
-use cyrup_provider::faux::FauxProvider;
+use cyrup_provider::unconfigured::UnconfiguredProvider;
 use cyrup_provider::{
-    CatalogOverlay, CreateModelsOptions, Credential, InMemoryCredentialStore, ModelsStore, Models,
+    CatalogOverlay, CreateModelsOptions, Credential, InMemoryCredentialStore, Models, ModelsStore,
     Provider, RefreshOptions, RemoteCatalog,
 };
 use cyrup_sdk::core::ProviderId;
@@ -73,11 +92,13 @@ fn all_provider_ids() -> Vec<String> {
 /// `<agent_dir>/models-store.json` is loaded and installed, so the composed registry immediately
 /// reflects the catalogs the last run fetched — including when this run is offline. This is Pi's
 /// cache-only restore, `await modelRuntime.refresh({ allowNetwork: false })`
-/// (`agent-session-services.ts:180`), which runs inside `createAgentSessionRuntime`.
+/// (`packages/coding-agent/src/core/agent-session-services.ts:180`), which runs inside
+/// `createAgentSessionRuntime`.
 ///
 /// **Call-site ordering is load-bearing.** Pi performs this restore during runtime CREATION
-/// (`main.ts:793`), which is upstream of the `--list-models` exit at `main.ts:816`. So `pi
-/// --list-models` renders the persisted pi.dev overlay. cyrup must call this before its own
+/// (`packages/coding-agent/src/main.ts:793`), which is upstream of the `--list-models` exit at
+/// `main.ts:812-816`. So `pi --list-models` renders the persisted pi.dev overlay. cyrup must call
+/// this before its own
 /// `--list-models` early return for the same reason — that listing is the one entry point that
 /// never reaches the rest of startup. It is awaited because it is a single small local file read;
 /// it performs no network I/O of any kind, so awaiting it cannot block on a remote host.
@@ -93,13 +114,15 @@ pub async fn restore_model_catalog(dirs: &cyrup_config::ConfigDirs) {
 ///
 /// Pi has exactly TWO catalog-refresh triggers and neither of them is a scripted run:
 ///
-/// - RPC: `main.ts:863-866` — `if (!offlineMode && appMode === "rpc") { void modelRuntime.refresh() }`,
+/// - RPC: `packages/coding-agent/src/main.ts:863-866` — `if (!offlineMode && appMode === "rpc") { void modelRuntime.refresh() }`,
 ///   guarded on the mode by name.
 /// - Interactive: `interactive-mode.ts` `run()` — `if (!process.env.PI_OFFLINE) { void
 ///   this.session.modelRuntime.refresh()… }`, reached only from the interactive front-end.
 ///
 /// Runtime CREATION never fetches: every `ModelRuntime.create` call in `coding-agent` passes
-/// `allowModelNetwork: false` (`main.ts:158`, `package-manager-cli.ts:401`) and `model-runtime.ts:163`
+/// `allowModelNetwork: false` (`packages/coding-agent/src/main.ts:158`,
+/// `packages/coding-agent/src/package-manager-cli.ts:401`) and
+/// `packages/coding-agent/src/core/model-runtime.ts:163`
 /// computes `refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true`.
 /// So `pi -p "…"` and pi's JSON output mode issue no catalog request at all.
 ///
@@ -122,12 +145,13 @@ pub fn mode_refreshes_catalogs(mode: cyrup_config::trust::AppMode) -> bool {
 /// error is swallowed: the worst case is the embedded catalogs.
 ///
 /// Like Pi's, this is deliberately NOT reached by a `--list-models` run: upstream's trigger is
-/// downstream of the `main.ts:816` listing exit, so a listing issues no request. Keeping this call
+/// downstream of the `main.ts:812-816` listing exit, so a listing issues no request. Keeping this call
 /// at its post-startup-UI site preserves that.
 ///
 /// `configured_providers` restricts the fetch to providers the user has actually configured, exactly
 /// as Pi's `Models.refresh` does by bailing when `resolveRefreshCredential` yields nothing
-/// (`models.ts:296`). Without it a bare `cyrup` would fan out one request per built-in provider on
+/// (`packages/ai/src/models.ts:296` — `if (!credential) return;`). Without it a bare `cyrup` would
+/// fan out one request per built-in provider on
 /// every start.
 pub fn spawn_model_catalog_refresh(
     dirs: &cyrup_config::ConfigDirs,
@@ -207,7 +231,7 @@ fn composed_registry(
 
 /// The composed registry over an EXPLICIT credential store — the shape a caller that must resolve
 /// request auth for a model needs (Pi `ModelRuntime.create({ allowModelNetwork: false })` followed
-/// by `modelRuntime.getAuth(model, …)`, model-runtime.ts:376-384).
+/// by `modelRuntime.getAuth(model, …)`, `packages/coding-agent/src/core/model-runtime.ts:376-384`).
 ///
 /// [`composed_registry`] can only seed a single runtime `--api-key`; the credential-print surface
 /// (`cyrup auth print-api-key`) must instead present every credential persisted in `auth.json` so
@@ -230,17 +254,21 @@ pub fn registry_with_credentials(
 }
 
 /// Every model across ALL built-in providers — the faithful data source for `--list-models` (Pi
-/// `modelRegistry.getAvailable()`, list-models.ts:35). Independent of `--provider`/`--model`: Pi's
-/// `listModels` always enumerates the full multi-provider registry (`providers/all.ts`), never just
-/// the session's selected provider. The offline scripted faux provider is intentionally excluded (it
-/// is a cyrup run-time default, not a catalog entry, and has no analog in Pi's production registry).
+/// `modelRuntime.getAvailable()`, `packages/coding-agent/src/cli/list-models.ts:35`). Independent
+/// of `--provider`/`--model`: Pi's `listModels` always enumerates the full multi-provider
+/// registry (`providers/all.ts`), never just
+/// the session's selected provider. Neither the scripted `faux` double nor the zero-model
+/// [`UnconfiguredProvider`] appears here: pi's `faux.ts` is absent from `providers/all.ts`, and the
+/// unconfigured stand-in is a cyrup run-time placeholder, not a catalog entry (PROV-052).
 pub fn all_available_models(models_json: &ModelFile) -> Vec<cyrup_provider::Model> {
     let (models, _errors) = composed_registry(models_json, None, None);
     models.get_models(None)
 }
 
 /// The one-shot composition report for `<agent_dir>/models.json`: the messages a caller should print
-/// once at startup (Pi's `ModelRuntime.compositionErrors`, model-runtime.ts:104/218). Empty when the
+/// once at startup (Pi's `ModelRuntime.compositionErrors` —
+/// `packages/coding-agent/src/core/model-runtime.ts:103` declares the map, `:220` fills it, and
+/// `getError()` at `:336-344` renders it). Empty when the
 /// file is absent or every provider block composes.
 pub fn models_json_composition_errors(models_json: &ModelFile) -> Vec<String> {
     let (_models, errors) = composed_registry(models_json, None, None);
@@ -248,18 +276,21 @@ pub fn models_json_composition_errors(models_json: &ModelFile) -> Vec<String> {
 }
 
 /// Resolve the launch `(provider_id, "provider/model_id")` for the **no-`--provider`/no-`--model`**
-/// default path, by Pi's `findInitialModel` precedence (model-resolver.ts:527-607, steps 3-4):
+/// default path, by Pi's `findInitialModel` precedence
+/// (`packages/coding-agent/src/core/model-resolver.ts:621-648` @v0.83.0, steps 3-4):
 ///
 /// 1. the saved settings default `(defaultProvider, defaultModelId)` when it resolves in the full
-///    registry (Pi step 3, `modelRegistry.find`), else
-/// 2. the first *configured* provider's curated default model (Pi step 4, `getAvailable()` filtered
-///    to `hasConfiguredAuth`, scanning `defaultModelPerProvider`), else the first configured model.
+///    registry (Pi step 3, `model-resolver.ts:621-631`, `modelRuntime.getModel` +
+///    `hasConfiguredAuth`), else
+/// 2. the first *configured* provider's curated default model (Pi step 4, `model-resolver.ts:633-648`:
+///    `getAvailable()` scanned against `defaultModelPerProvider`), else the first available model.
 ///
 /// Returns `Some((provider_id, pattern))` for a REAL configured provider so the caller launches on it
 /// (footer shows e.g. `together/moonshotai/Kimi-K2.6`), or `None` when NOTHING is configured — in
-/// which case the caller keeps the offline scripted [`FauxProvider`] as the fallback. `faux` is never
-/// returned here: it is not a registry entry (excluded from [`all_available_models`]), so it stays the
-/// fallback ONLY when this yields `None`. `has_configured_auth` mirrors Pi `modelRegistry`'s check (a
+/// which case the caller keeps the zero-model [`UnconfiguredProvider`], the session builds
+/// modelless with pi's `modelFallbackMessage` banner, and the non-interactive modes then stop with
+/// `formatNoModelsAvailableMessage()` (Pi `findInitialModel` step 5, model-resolver.ts:650-651 ⇒
+/// the mode-gated `main.ts:852-855`). `has_configured_auth` mirrors Pi `modelRegistry`'s check (a
 /// provider with a stored credential / known env var such as `TOGETHER_API_KEY` / runtime `--api-key`).
 pub fn default_launch_model(
     default_provider: Option<&str>,
@@ -297,7 +328,10 @@ pub fn default_launch_model(
 /// A [`cyrup_session_svc::ProviderResolver`] backed by [`select_provider`]: rebuilds the owning
 /// built-in provider — installing its env-backed credentials — for a target provider id. Wired into
 /// the session so a `/model` selection that targets a DIFFERENT provider than the current one swaps
-/// the owning provider live (Pi model+provider switch, model-selector.ts:328-332). The provider's
+/// the owning provider live (Pi model+provider switch —
+/// `packages/coding-agent/src/modes/interactive/components/model-selector.ts:354-359`, whose
+/// `handleSelect` calls `setDefaultModelAndProvider(model.provider, model.id)` then the session's
+/// select callback). The provider's
 /// key resolves at stream time from the environment (e.g. `TOGETHER_API_KEY`), matching Pi.
 pub struct BuiltinProviderResolver {
     models_json: Arc<ModelFile>,
@@ -330,7 +364,7 @@ fn provider_prefix(model_pattern: Option<&str>) -> Option<&str> {
 }
 
 /// The resolved provider id (Pi `resolveCliModel` precedence): explicit `--provider`, else the
-/// `--model` prefix, else `None` (⇒ the offline faux provider).
+/// `--model` prefix, else `None` (⇒ the zero-model [`UnconfiguredProvider`]).
 fn resolve_provider_id<'a>(
     provider_override: Option<&'a str>,
     model_pattern: Option<&'a str>,
@@ -342,10 +376,19 @@ fn resolve_provider_id<'a>(
 
 /// Resolve a [`Provider`] for the requested `(provider, model, apiKey)` triple.
 ///
-/// - No explicit provider/prefix, or an explicit `faux` ⇒ the in-process [`FauxProvider`].
-/// - Any other explicit provider ⇒ looked up in the built-in registry (Pi `providers/all.ts`), with
+/// - No explicit provider/prefix ⇒ the zero-model [`UnconfiguredProvider`]. Startup may still
+///   upgrade this to a real configured provider (`main.rs`'s `default_launch_model` block, Pi
+///   `findInitialModel` steps 3-4); when it does not, the empty catalog resolves to `model: None`
+///   plus Pi's `modelFallbackMessage` banner (`cyrup-session-svc/src/builder.rs:1601-1612`, pi
+///   `sdk.ts:216-218`), and the MODE-gated stop in `main.rs` (rpc `:741-745`, print/json
+///   `:862-866`) turns that into `formatNoModelsAvailableMessage()` + exit 1 for the
+///   non-interactive modes only (`packages/coding-agent/src/main.ts:852-855`). PROV-052 — this arm
+///   used to hand back the scripted `FauxProvider`.
+/// - Any explicit provider ⇒ looked up in the built-in registry (Pi `providers/all.ts`), with
 ///   `api_key` installed as a runtime credential when present (Pi `options.apiKey`).
-/// - A provider that is not a built-in ⇒ a clear error listing the available built-ins.
+/// - A provider that is not a built-in ⇒ a clear error listing the available built-ins. `faux` is
+///   deliberately NOT among them: Pi's own scripted provider is not in `providers/all.ts` either
+///   and is unreachable from its CLI.
 pub fn select_provider(
     provider_override: Option<&str>,
     model_pattern: Option<&str>,
@@ -353,7 +396,16 @@ pub fn select_provider(
     models_json: &ModelFile,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     match resolve_provider_id(provider_override, model_pattern) {
-        None | Some("faux") => Ok(Arc::new(FauxProvider::new())),
+        None => Ok(Arc::new(UnconfiguredProvider::new())),
+        // PROV-052 — TEST-ONLY, and compiled out of every normal build. `faux` is not a provider a
+        // shipped binary can select: pi's own `faux.ts` is absent from `providers/all.ts`, is not a
+        // `KnownProvider`, and is referenced by zero files under `packages/coding-agent/src/`
+        // @v0.83.0. The feature is enabled solely by this package's self-dev-dependency (Cargo.toml),
+        // so `cargo tree -p cyrup -e features --edges normal` carries no `faux` and this arm does not
+        // exist in `cargo build`/`--release`/`cargo install`. It exists so the integration tests that
+        // spawn `CARGO_BIN_EXE_cyrup` can still script an offline turn end-to-end.
+        #[cfg(feature = "faux")]
+        Some("faux") => Ok(Arc::new(cyrup_provider::faux::FauxProvider::new())),
         Some(id) => {
             let (models, _errors) = composed_registry(models_json, api_key, Some(id));
             match models.get_provider(id) {
@@ -368,9 +420,8 @@ pub fn select_provider(
                     bail!(
                         "model targets provider '{id}', which is not a known provider. \
                          Available providers: {}. \
-                         (Declare a custom one under \"providers\" in <agent-dir>/models.json, or \
-                         use a 'faux/...' model for the offline scripted provider; there is \
-                         intentionally no silent fallback.)",
+                         (Declare a custom one under \"providers\" in <agent-dir>/models.json; \
+                         there is intentionally no silent fallback.)",
                         available.join(", ")
                     )
                 }
@@ -379,7 +430,9 @@ pub fn select_provider(
     }
 }
 
-/// The Pi `resolveCliModel` **unknown-model diagnostic** (model-resolver.ts:494-500): when a
+/// The Pi `resolveCliModel` **unknown-model diagnostic**
+/// (`packages/coding-agent/src/core/model-resolver.ts:520-544` @v0.83.0 — the `if (provider)`
+/// custom-id fallback block, whose warning string is composed at `:543-544`): when a
 /// `--model` targets a *known* provider (explicit `--provider`, or a `provider/…` prefix that is a
 /// built-in) but no catalog model matches the requested id, Pi still builds a custom-id model and
 /// **warns** `Model "<pattern>" not found for provider "<provider>". Using custom model id.`. Returns
@@ -418,7 +471,7 @@ pub fn unknown_model_warning(
             (canonical, rest)
         }
         None => {
-            // Infer from a `provider/…` prefix; a non-provider prefix maps to faux (ledgered) — no warn.
+            // Infer from a `provider/…` prefix; a non-provider prefix has no provider to diagnose — no warn.
             let (prefix, after) = pattern.split_once('/')?;
             (known(prefix)?, after.to_string())
         }
@@ -466,66 +519,91 @@ mod tests {
         assert!(providers.contains("anthropic"));
         assert!(providers.contains("openai"));
         assert!(providers.contains("together"));
-        // The offline scripted faux provider is NOT a catalog entry.
+        // Neither the scripted double nor the unconfigured stand-in is a catalog entry.
         assert!(!providers.contains("faux"));
     }
 
+    /// PROV-052. Replaces `defaults_and_faux_resolve_to_faux`, which was a **test-defect**: it
+    /// pinned behaviour pi does not have. pi's scripted provider (`packages/ai/src/providers/faux.ts`)
+    /// is exported only from the `pi-ai` package for tests — it is absent from
+    /// `packages/ai/src/providers/all.ts`, it is not a member of `KnownProvider`, and
+    /// `git grep faux v0.83.0 -- packages/coding-agent/src/` matches **zero** files. Neither a bare
+    /// invocation nor any `--provider`/`--model` spelling can reach it in pi. This test was RED
+    /// before the fix (`select_provider(None, ..)` returned `FauxProvider`, id `"faux"`) and is
+    /// GREEN after.
     #[test]
-    fn defaults_and_faux_resolve_to_faux() {
-        assert_eq!(
-            select_provider(None, None, None, &ModelFile::default()).unwrap().id().as_str(),
-            "faux"
+    fn no_flags_resolve_to_an_empty_catalog_never_to_a_test_double() {
+        // The bare invocation: a zero-model provider, which `resolve_model` turns into
+        // `model: None` + pi's `modelFallbackMessage` ⇒ the mode-gated stop in `main.rs` prints
+        // `packages/coding-agent/src/main.ts:852-855`'s message and exits 1 in the non-interactive
+        // modes, while interactive still opens a TUI to type `/login` into.
+        let p = select_provider(None, None, None, &ModelFile::default()).unwrap();
+        assert_eq!(p.id().as_str(), "unconfigured");
+        assert!(
+            p.models().is_empty(),
+            "the no-credential fallback must expose no models — an available model here is what \
+             silently launched the scripted double"
         );
-        assert_eq!(
-            select_provider(None, Some("faux-1"), None, &ModelFile::default())
-                .unwrap()
-                .id()
-                .as_str(),
-            "faux"
-        );
-        assert_eq!(
-            select_provider(None, Some("faux/faux-1"), None, &ModelFile::default())
-                .unwrap()
-                .id()
-                .as_str(),
-            "faux"
-        );
-        assert_eq!(
-            select_provider(Some("faux"), None, None, &ModelFile::default())
-                .unwrap()
-                .id()
-                .as_str(),
-            "faux"
-        );
+        // A bare id with no `provider/` prefix is the same no-flag path.
+        let p = select_provider(None, Some("faux-1"), None, &ModelFile::default()).unwrap();
+        assert_eq!(p.id().as_str(), "unconfigured");
+        assert!(p.models().is_empty());
+        // An unrecognised prefix is the ordinary unknown-provider error, never a silent double.
+        // (`Arc<dyn Provider>` is not `Debug`, so `expect_err` is unavailable — take the `Err` side.)
+        let err = select_provider(None, Some("not-a-provider/x"), None, &ModelFile::default())
+            .err()
+            .expect("an unknown prefix is an error");
+        assert!(err.to_string().contains("not a known provider"));
+        // `faux` itself is selectable ONLY under this package's TEST-ONLY `faux` feature, which is
+        // reached solely through the self-dev-dependency; the shipped binary has no such arm. That
+        // half of the invariant is pinned by a Cargo-graph test that cannot be expressed here —
+        // `crates/cyrup-provider/tests/faux_not_in_normal_build.rs`.
     }
 
     #[test]
     fn explicit_provider_override_wins_over_model_prefix() {
         // `--provider openai` with a bare model resolves to openai (Pi precedence).
-        let p = select_provider(Some("openai"), Some("gpt-4o"), None, &ModelFile::default()).expect("openai built-in");
+        let p = select_provider(Some("openai"), Some("gpt-4o"), None, &ModelFile::default())
+            .expect("openai built-in");
         assert_eq!(p.id().as_str(), "openai");
     }
 
     #[test]
     fn built_in_real_providers_resolve_from_the_registry() {
-        let anthropic =
-            select_provider(None, Some("anthropic/claude-opus"), None, &ModelFile::default()).expect("anthropic built-in");
+        let anthropic = select_provider(
+            None,
+            Some("anthropic/claude-opus"),
+            None,
+            &ModelFile::default(),
+        )
+        .expect("anthropic built-in");
         assert_eq!(anthropic.id().as_str(), "anthropic");
-        let openai = select_provider(None, Some("openai/gpt-4o"), None, &ModelFile::default()).expect("openai built-in");
+        let openai = select_provider(None, Some("openai/gpt-4o"), None, &ModelFile::default())
+            .expect("openai built-in");
         assert_eq!(openai.id().as_str(), "openai");
     }
 
     #[test]
     fn api_key_is_accepted_for_a_real_provider() {
-        let p = select_provider(Some("openai"), Some("openai/gpt-4o"), Some("sk-runtime"), &ModelFile::default())
-            .expect("openai built-in with runtime key");
+        let p = select_provider(
+            Some("openai"),
+            Some("openai/gpt-4o"),
+            Some("sk-runtime"),
+            &ModelFile::default(),
+        )
+        .expect("openai built-in with runtime key");
         assert_eq!(p.id().as_str(), "openai");
     }
 
     #[test]
     fn together_kimi_resolves_to_together_provider() {
-        let together = select_provider(None, Some("together/moonshotai/Kimi-K2.6"), None, &ModelFile::default())
-            .expect("together is built-in");
+        let together = select_provider(
+            None,
+            Some("together/moonshotai/Kimi-K2.6"),
+            None,
+            &ModelFile::default(),
+        )
+        .expect("together is built-in");
         assert_eq!(together.id().as_str(), "together");
         assert!(
             together
@@ -558,38 +636,48 @@ mod tests {
         let warn2 = unknown_model_warning(Some("openai"), Some("nope-model"), &catalog)
             .expect("explicit-provider warning");
         assert!(warn2.contains("not found for provider \"openai\""));
-        // No `provider/` prefix and no `--provider` → faux-mapped, ledgered → NO warning.
+        // No `provider/` prefix and no `--provider` → unconfigured (no provider to diagnose) → NO warning.
         assert_eq!(unknown_model_warning(None, Some("gpt-4o"), &catalog), None);
         // No `--model` at all → nothing to diagnose.
         assert_eq!(unknown_model_warning(Some("openai"), None, &catalog), None);
     }
 
     #[test]
-    fn no_model_with_configured_provider_launches_that_provider_default_not_faux() {
+    fn no_model_with_configured_provider_launches_that_provider_default() {
         // Given a configured provider (Pi `hasConfiguredAuth` true — e.g. `TOGETHER_API_KEY` set) and
-        // no `--model`/`--provider`, the launch model is that provider's curated default, NOT faux
-        // (Pi `findInitialModel` step 4, model-resolver.ts:611-626).
+        // no `--model`/`--provider`, the launch model is that provider's curated default, NOT the
+        // unconfigured stand-in
+        // (Pi `findInitialModel` step 4, packages/coding-agent/src/core/model-resolver.ts:633-648).
         let together_configured = |m: &cyrup_provider::Model| m.provider.as_str() == "together";
-        let (provider, pattern) = default_launch_model(None, None, &together_configured, &ModelFile::default())
-            .expect("a configured provider yields a real launch model");
+        let (provider, pattern) =
+            default_launch_model(None, None, &together_configured, &ModelFile::default())
+                .expect("a configured provider yields a real launch model");
         assert_eq!(provider, "together");
-        assert_ne!(provider, "faux");
-        // Pi `defaultModelPerProvider["together"]` (model-resolver.ts:40).
+        assert_ne!(provider, "unconfigured");
+        // Pi `defaultModelPerProvider.together` — `together: "moonshotai/Kimi-K2.6"`,
+        // packages/coding-agent/src/core/model-resolver.ts:41 @v0.83.0.
         assert_eq!(pattern, "together/moonshotai/Kimi-K2.6");
     }
 
     #[test]
-    fn no_model_and_nothing_configured_stays_faux_fallback() {
-        // Nothing configured ⇒ `None` ⇒ the caller keeps the offline scripted faux provider (Pi
-        // `findInitialModel` step 5, model-resolver.ts:628-629 — no available model).
+    fn no_model_and_nothing_configured_yields_no_launch_model() {
+        // Nothing configured ⇒ `None` ⇒ the caller keeps the zero-model `UnconfiguredProvider`, the
+        // session builds modelless with pi's `modelFallbackMessage`, and the non-interactive modes
+        // then stop (Pi `findInitialModel` step 5,
+        // packages/coding-agent/src/core/model-resolver.ts:650-651 — `model: undefined` ⇒ the
+        // mode-gated `packages/coding-agent/src/main.ts:852-855`).
         let nothing_configured = |_: &cyrup_provider::Model| false;
-        assert_eq!(default_launch_model(None, None, &nothing_configured, &ModelFile::default()), None);
+        assert_eq!(
+            default_launch_model(None, None, &nothing_configured, &ModelFile::default()),
+            None
+        );
     }
 
     #[test]
     fn saved_settings_default_wins_over_curated_provider_default() {
         // A saved settings default `(provider, model)` that resolves in the registry wins over the
-        // configured-provider curated default (Pi `findInitialModel` step 3, model-resolver.ts:600-609).
+        // configured-provider curated default (Pi `findInitialModel` step 3,
+        // packages/coding-agent/src/core/model-resolver.ts:621-631).
         let together_configured = |m: &cyrup_provider::Model| m.provider.as_str() == "together";
         // The saved default names together's curated model explicitly; still resolves to together.
         let (provider, pattern) = default_launch_model(
@@ -605,7 +693,12 @@ mod tests {
 
     #[test]
     fn truly_unknown_provider_errors_clearly() {
-        let err = match select_provider(None, Some("definitely-not-a-provider/whatever"), None, &ModelFile::default()) {
+        let err = match select_provider(
+            None,
+            Some("definitely-not-a-provider/whatever"),
+            None,
+            &ModelFile::default(),
+        ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected an error for an unknown provider"),
         };

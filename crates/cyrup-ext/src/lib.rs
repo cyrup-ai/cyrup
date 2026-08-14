@@ -59,10 +59,10 @@ pub use facade::{
 pub use build::build_component;
 pub use hooks::ExtHooks;
 pub use loader::{
-    discover, resolve_component_bytes, DiscoveredExtension, DiscoveryRoots, ExtOrigin, LoadError,
-    LoadExtensionsResult,
+    discover, discover_with_diagnostics, resolve_component_bytes, DiscoveredExtension,
+    DiscoveryRoots, ExtOrigin, LoadError, LoadExtensionsResult,
 };
-pub use manifest::{Capabilities, ExtensionManifest, HOST_WORLD};
+pub use manifest::{Capabilities, ExtensionManifest, FsGrant, HOST_WORLD, MANIFEST_FILE};
 pub use native::{
     CtxTier, ExtMode, HostCtx, HostCtxRich, HumanWaitGate, HumanWaitGuard, InitApi,
     NativeExtension, NativeHandle,
@@ -81,6 +81,7 @@ pub use wrapper::{wrap_registered_tool, ActiveToolNames, RegisteredTool};
 #[cfg(feature = "wasm-host")]
 pub use host::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
+    DENIED_EXEC, DENIED_NET, DENIED_UI,
     GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
     HumanInteractionLock, InstancePool, InteractiveOverlay, LiveExtension, NotifyKind, OAuthEvent,
     OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome, OverlaySpan,

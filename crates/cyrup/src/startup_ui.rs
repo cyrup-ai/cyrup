@@ -230,11 +230,41 @@ pub fn interpret_trust(outcome: &SelectorOutcome, options: &[TrustOption]) -> Tr
     }
 }
 
+/// Persist a chosen trust option's `updates` — a literal port of pi's
+/// `saveProjectTrustPromptResult` (`packages/coding-agent/src/core/project-trust.ts:40-44`
+/// @v0.83.0):
+///
+/// ```text
+/// function saveProjectTrustPromptResult(trustStore: ProjectTrustStore, result: ProjectTrustOption): void {
+///     if (result.updates.length > 0) {
+///         trustStore.setMany(result.updates);
+///     }
+/// }
+/// ```
+///
+/// The `updates.length > 0` guard is load-bearing, not an optimisation. Both session-only rows
+/// (`trust_options(cwd, true)` indices 2 and 4) carry an EMPTY `updates`, and
+/// [`TrustStore::set_many`] is unconditional once entered: it takes a `FileLock` (creating
+/// `trust.json.lock`), re-reads and re-serialises the whole map, and `write_atomic`s the result
+/// (`cyrup-config/src/trust.rs:160-186`) even for an empty slice. Calling it anyway is what made a
+/// "…(this session only)" answer leave exactly the permanent trace the row exists to avoid: an
+/// otherwise-untouched agent dir gained a `trust.json` (`{}`) plus a `trust.json.lock`, and a
+/// pre-seeded store was rewritten byte-for-byte-differently. SEAM-064.
+fn persist_trust_choice(trust_store: &TrustStore, option: &TrustOption) -> anyhow::Result<()> {
+    if option.updates.is_empty() {
+        return Ok(());
+    }
+    trust_store
+        .set_many(&option.updates)
+        .map_err(|e| anyhow::anyhow!("writing project trust: {e}"))
+}
+
 /// Run the project-trust prompt over a real terminal (Pi `createProjectTrustContext`'s
 /// `ui.select`/`showStartupSelector`): mount a [`TrustSelector`] over the `options`, drive it to a
-/// confirm/cancel, persist the chosen option's `updates` to the `trust_store`, and return the
-/// resolved trust decision (`Some(true/false)` ⇒ feed as the run's `trust_override`; `None` ⇒
-/// cancelled, proceed untrusted). TTY-only; not unit-tested.
+/// confirm/cancel, persist the chosen option's `updates` through pi's `updates.length > 0` guard
+/// ([`persist_trust_choice`], project-trust.ts:40-44), and return the resolved trust decision
+/// (`Some(true/false)` ⇒ feed as the run's `trust_override`; `None` ⇒ cancelled, proceed untrusted).
+/// TTY-only; the persistence branch it runs is unit-tested through [`persist_trust_choice`].
 pub fn run_trust_prompt(
     theme: &UiTheme,
     cwd: &std::path::Path,
@@ -261,11 +291,10 @@ pub fn run_trust_prompt(
     match interpret_trust(&outcome, options) {
         TrustChoice::Chosen { index, trusted } => {
             if let Some(option) = options.get(index) {
-                // Persist the decision (Pi `write_project_trust(option.updates)`); a session-only
-                // option has empty updates and writes nothing.
-                trust_store
-                    .set_many(&option.updates)
-                    .map_err(|e| anyhow::anyhow!("writing project trust: {e}"))?;
+                // Persist the decision through pi's `saveProjectTrustPromptResult` guard
+                // (project-trust.ts:40-44) — a session-only option has empty `updates` and must not
+                // reach `set_many` at all. See [`persist_trust_choice`].
+                persist_trust_choice(trust_store, option)?;
             }
             Ok(Some(trusted))
         }
@@ -533,6 +562,171 @@ mod tests {
         assert_eq!(
             interpret_trust(&SelectorOutcome::Cancel, &options),
             TrustChoice::Cancelled
+        );
+    }
+
+    /// Snapshot a directory's entry names, sorted — so a stray `trust.json` / `trust.json.lock`
+    /// appearing is observable, not just a change to a file that already existed.
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// SEAM-064 — the PRE-LAUNCH prompt (`main.rs`, pi `selectProjectTrustOption`,
+    /// project-trust.ts:32) asks for `includeSessionOnly: true`, so it renders pi's FIVE rows in
+    /// pi's order (`getProjectTrustOptions`, trust-manager.ts:65-95), and either session-only row
+    /// carries an EMPTY `updates` — pi's `saveProjectTrustPromptResult` (project-trust.ts:40-44)
+    /// only calls `setMany` when `updates.length > 0`, which is how an answer avoids recording a
+    /// permanent verdict.
+    ///
+    /// The name's second clause is an observation, not a paraphrase of the options data. The first
+    /// half of this test asserts the option SET; the second half drives the actual writer
+    /// ([`persist_trust_choice`], the branch `run_trust_prompt` runs) and looks at the disk: a
+    /// folder with no trust store must still have none afterwards — no `{}` `trust.json`, no
+    /// `trust.json.lock` — and a pre-seeded store must come back byte-identical. Asserting only
+    /// `option.updates.is_empty()` is what let the missing guard ship: it passed happily while
+    /// `run_trust_prompt` called `set_many` unconditionally.
+    #[test]
+    fn pre_launch_trust_prompt_offers_pi_five_rows_and_session_only_writes_nothing() {
+        let options = cyrup_config::trust::trust_options(Path::new("/work"), true);
+        let labels: Vec<&str> = options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Trust",
+                "Trust parent folder (/)",
+                "Trust (this session only)",
+                "Do not trust",
+                "Do not trust (this session only)",
+            ]
+        );
+        // The two session-only rows keep their verdict for this run and persist NOTHING.
+        for index in [2usize, 4] {
+            let option = &options[index];
+            assert!(
+                option.updates.is_empty(),
+                "row {index} ({}) must write nothing",
+                option.label
+            );
+            assert!(option.saved_path.is_none());
+            assert_eq!(
+                interpret_trust(&SelectorOutcome::Confirm(index.to_string()), &options),
+                TrustChoice::Chosen {
+                    index,
+                    trusted: index == 2
+                }
+            );
+        }
+        // …and the persisting rows still do persist, so this is not a blanket disarm.
+        for index in [0usize, 1, 3] {
+            assert!(!options[index].updates.is_empty());
+        }
+
+        // --------------------------------------------------------------------------------------
+        // The above is options DATA. What "writes nothing" actually claims is about the WRITER, so
+        // drive the persistence branch `run_trust_prompt` runs ([`persist_trust_choice`]) and
+        // observe the disk. Without pi's `updates.length > 0` guard (project-trust.ts:40-44) every
+        // one of these assertions fails: `TrustStore::set_many` takes a `FileLock`, re-serialises
+        // the map and `write_atomic`s it even for an empty slice (cyrup-config/src/trust.rs:160-186).
+        // --------------------------------------------------------------------------------------
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store_path = agent_dir.join("trust.json");
+        let store = TrustStore::new(store_path.clone());
+        let real = cyrup_config::trust::trust_options(&cwd, true);
+        let session_only: Vec<usize> = real
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.label.contains("this session only"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(session_only.len(), 2, "both session-only rows must be present");
+
+        // 1. A folder with NO trust store: a session-only answer must not CREATE one — no `{}`
+        //    trust.json, and no `trust.json.lock` from the lock the writer would have taken.
+        assert!(dir_entries(&agent_dir).is_empty());
+        for &index in &session_only {
+            persist_trust_choice(&store, &real[index]).unwrap();
+            assert_eq!(
+                dir_entries(&agent_dir),
+                Vec::<String>::new(),
+                "row {index} ({}) created files in a folder that had none: {:?}",
+                real[index].label,
+                dir_entries(&agent_dir)
+            );
+        }
+        assert!(!store_path.exists(), "no trust.json may be created");
+
+        // 2. A PRE-SEEDED store must come back BYTE-IDENTICAL. The seed is written as raw bytes in a
+        //    compact shape deliberately, because that is what the live repro measured (28 bytes →
+        //    34 bytes after a "Trust (this session only)") and because a store seeded through
+        //    `set_many` itself would NOT prove anything here: re-serialising an unchanged
+        //    `BTreeMap` is idempotent, so an unguarded `set_many(&[])` over canonical bytes lands
+        //    the same bytes back. Against a hand-written store it does not — it normalises the file
+        //    to sorted pretty JSON + trailing newline. Byte-identity is only an observation of the
+        //    absent write when the on-disk form is one the writer would change.
+        let key = real[0]
+            .saved_path
+            .as_deref()
+            .expect("the `Trust` row persists the canonicalised cwd")
+            .to_string_lossy()
+            .into_owned();
+        let seed = format!("{{{:?}:true}}", key).into_bytes();
+        std::fs::write(&store_path, &seed).expect("seed the trust store by hand");
+        let before = std::fs::read(&store_path).expect("seeded trust.json");
+        let before_entries = dir_entries(&agent_dir);
+        assert_eq!(before, seed);
+        assert_eq!(
+            before_entries,
+            vec!["trust.json".to_string()],
+            "the hand-written seed must not have produced a lock file"
+        );
+        assert!(
+            store
+                .nearest(&cwd)
+                .unwrap()
+                .is_some_and(|e| e.decision.is_trusted()),
+            "the seed must be a store the reader actually accepts"
+        );
+        for &index in &session_only {
+            persist_trust_choice(&store, &real[index]).unwrap();
+            assert_eq!(
+                std::fs::read(&store_path).expect("trust.json still readable"),
+                before,
+                "row {index} ({}) rewrote the trust store",
+                real[index].label
+            );
+            assert_eq!(dir_entries(&agent_dir), before_entries);
+        }
+
+        // 3. The same helper on a PERSISTING row does write — so the assertions above are capable
+        //    of observing a write, and the guard is not a blanket disarm.
+        let do_not_trust = real
+            .iter()
+            .position(|o| o.label == "Do not trust")
+            .expect("the `Do not trust` row");
+        persist_trust_choice(&store, &real[do_not_trust]).unwrap();
+        let after = std::fs::read(&store_path).expect("trust.json after a persisting row");
+        assert_ne!(
+            after, before,
+            "a persisting row must still reach `set_many` (pi calls it when updates.length > 0)"
+        );
+        assert!(
+            store
+                .nearest(&cwd)
+                .unwrap()
+                .is_some_and(|e| !e.decision.is_trusted()),
+            "the persisting row's verdict must be readable back from the store"
         );
     }
 }

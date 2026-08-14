@@ -3805,8 +3805,14 @@ impl<B: Backend> App<B> {
                 } else {
                     let current = session.model();
                     let n = cycle.len();
+                    // `session.model()` is `Option` (pi `AgentSession.model: Model | undefined`,
+                    // agent-session.ts:866-868): a modelless session matches nothing, so the cycle
+                    // starts at the head exactly as pi's `findIndex === -1 ⇒ 0` does
+                    // (agent-session.ts:1650-1653).
                     let cur = cycle.iter().position(|(id, prov, _)| {
-                        id == current.model.as_str() && prov == current.provider.as_str()
+                        current.as_ref().is_some_and(|c| {
+                            id == c.model.as_str() && prov == c.provider.as_str()
+                        })
                     });
                     let next = match direction {
                         CycleDirection::Forward => cur.map_or(0, |i| (i + 1) % n),
@@ -5484,8 +5490,11 @@ fn model_entries(session: &AgentSession) -> Vec<ModelEntry> {
             id: m.id.to_string(),
             name: m.name.clone(),
             provider: m.provider.to_string(),
-            current: m.id.as_str() == current.model.as_str()
-                && m.provider.as_str() == current.provider.as_str(),
+            // No model selected ⇒ no row is marked current (pi renders the `/model` list against
+            // the optional `session.model`).
+            current: current.as_ref().is_some_and(|c| {
+                m.id.as_str() == c.model.as_str() && m.provider.as_str() == c.provider.as_str()
+            }),
             scoped: scoped.contains(m.id.as_str()),
         })
         .collect()

@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 mod attribution;
+pub mod auth_guidance;
 mod bash;
 mod builder;
 mod command;

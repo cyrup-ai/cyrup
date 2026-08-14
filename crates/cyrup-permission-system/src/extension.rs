@@ -1622,13 +1622,31 @@ impl PermissionSystemExtension {
         }
     }
 
-    /// pi `shouldExposeTool` (`index.ts:2049-2075`): keep a tool exposed iff its TOOL-LEVEL permission
+    /// pi `shouldExposeTool` (`index.ts:1791-1816` @v0.8.0; `:2049-2075` @v0.7.1 — the two are the
+    /// same function, only `permanentApprovals` was dropped from the `applyPatternApprovalState`
+    /// call): keep a tool exposed iff its TOOL-LEVEL permission
     /// ([`PermissionManager::get_tool_permission`]) — with the session approval overlay (pi
-    /// `applyPatternApprovalState(..., {}, ...)`) — is not `deny`. A `deny` `read` is still exposed when
-    /// the agent has allowed skills ([`PermissionManager::has_allowed_skills`], pi `:2070`) so it can
-    /// reach skill files; a `deny` `bash` is still exposed when the agent has an explicitly allowed bash
-    /// command ([`PermissionManager::get_bash_permissions`]) so the agent keeps its permitted commands
-    /// (the gate re-checks each — the mandate-directed analog of the read/skills bypass).
+    /// `applyPatternApprovalState(..., {}, ...)`, `:1795-1803`) — is not `deny`. There is **exactly
+    /// one** bypass below that: a `deny` `read` is still exposed when the agent has allowed skills
+    /// ([`PermissionManager::has_allowed_skills`], pi `:1811-1813`) so it can reach skill files.
+    /// Everything else denied at the tool level falls through to `false` (pi `:1815`).
+    ///
+    /// **No bash arm — deliberately (`PERM-009`).** Cyrup previously carried
+    /// `if tool_name == "bash" && get_bash_permissions(agent).any_allow() { return true; }` here.
+    /// Neither upstream tag has any such branch, and it was a **live permission bypass in the
+    /// shipped binary**, reproduced end-to-end (`docs/gap-analysis/REPRO-LOG.md` §`PERM-009`):
+    /// `tools.bash: deny` alone correctly withheld the tool, but adding the strictly NARROWER
+    /// `bash: {"git status": "allow"}` to the same file re-exposed `bash`, and
+    /// [`PermissionManager::check_permission`]'s bash arm then resolved that command rule ABOVE the
+    /// tool-level deny (`manager.rs`, pi `permission-manager.ts:944-959`), so real `git status`
+    /// output came back. A rule that can only ever NARROW an allow must never widen a deny. The
+    /// command-rule-over-`toolMatch` precedence in `manager.rs` is pi's and stays as-is; **this
+    /// exposure check is the only thing that made a tool-level `bash` deny stick**, which is why
+    /// the arm had to go rather than the precedence.
+    ///
+    /// The deleted arm's sole justification was an `R-NN-NNN` requirement id whose `spec/` tree is
+    /// unrecoverable; `docs/adr/ADR-0008` retires such citations as authority (see its OQ-6, which
+    /// independently found this branch justified by prose alone).
     fn should_expose_tool(&self, tool_name: &str, agent_name: Option<&str>) -> bool {
         let session_rules = guard(&self.session_approvals).get_rules();
         let mut mgr = guard(&self.manager);
@@ -1645,12 +1663,11 @@ impl PermissionSystemExtension {
         if state != PermissionState::Deny {
             return true;
         }
+        // pi `:1811-1813` — the ONE bypass. Do not add a second (see the doc comment: PERM-009).
         if tool_name == "read" && mgr.has_allowed_skills(agent_name) {
             return true;
         }
-        if tool_name == "bash" && mgr.get_bash_permissions(agent_name).any_allow() {
-            return true;
-        }
+        // pi `:1815`.
         false
     }
 
@@ -1868,6 +1885,16 @@ fn resolve_agent_name_from_env() -> Option<String> {
 impl NativeExtension for PermissionSystemExtension {
     fn id(&self) -> ExtensionId {
         self.id.clone()
+    }
+
+    /// Ambient (SEAM-071/SEAM-074): upstream `@gotgenes/pi-permission-system` is an installed
+    /// package in the PATH tier that `noExtensions` collapses (`resource-loader.ts:451-453`
+    /// @v0.83.0). A subagent CHILD keeps the gate — pi re-injects it by path via
+    /// `resolvePermissionSystemExtension` (`pi-subagents/src/runs/shared/pi-args.ts:413-417`
+    /// @v0.47.1) — so the builder's `SUBAGENT_CHILD_RUNTIME_NATIVES` carve-out, not this flag, is
+    /// what keeps a pinned-allowlist child from failing OPEN.
+    fn is_ambient(&self) -> bool {
+        true
     }
 
     /// P-1 (reconciliation §2 item 1): capture the late-bound live capability backend BEFORE `init`

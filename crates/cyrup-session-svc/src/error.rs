@@ -40,8 +40,24 @@ pub enum SessionServiceError {
     #[error("no configured auth for model: {0}")]
     NoConfiguredAuth(String),
 
-    #[error("no model available in provider catalog '{0}'")]
-    NoModels(String),
+    /// A prompt / manual compaction was attempted on a session that has NO model — pi
+    /// `if (!this.model) { throw new Error(formatNoModelSelectedMessage()); }`
+    /// (agent-session.ts:1178-1180 for `prompt`, :1790-1792 for `compact`).
+    ///
+    /// This is the state a credential-less first run legitimately launches in
+    /// (`main.ts:852-855` excludes `interactive` from the modelless hard stop on purpose), so the
+    /// message is the `/login` → `/model` instruction, not a fatal diagnostic. The string is
+    /// verbatim pi (`formatNoModelSelectedMessage`, auth-guidance.ts:18-20) because it is what an
+    /// RPC client, the SDK and the TUI error line all surface.
+    #[error("{}", crate::auth_guidance::format_no_model_selected_message())]
+    NoModelSelected,
+
+    /// A branch navigation asked for a summary on a modelless session — pi
+    /// `if (options.summarize && !this.model) { throw new Error("No model available for
+    /// summarization"); }` (agent-session.ts:2910-2912). Distinct string from
+    /// [`Self::NoModelSelected`], matching pi.
+    #[error("No model available for summarization")]
+    NoModelForSummarization,
 
     #[error("agent is streaming; specify steer or follow_up")]
     StreamingNeedsBehavior,

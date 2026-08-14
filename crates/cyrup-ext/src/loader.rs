@@ -7,7 +7,7 @@
 //! [`crate::facade::ExtensionHost`] (feature-gated on `wasm-host`); discovery itself needs no wasm.
 
 use crate::error::ExtError;
-use crate::manifest::{ExtensionManifest, HOST_WORLD};
+use crate::manifest::{ExtensionManifest, HOST_WORLD, MANIFEST_FILE};
 use cyrup_core::ExtensionId;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -80,12 +80,21 @@ pub struct LoadError {
     /// Pi's bin turns into `Failed to load extension "<path>": <err>` and `process.exit(1)`
     /// (main.ts:735-738, :843-849).
     ///
-    /// `false` for [`crate::ExtError::Untrusted`] ONLY: cyrup applies the project-trust gate
-    /// *inside* the load (`load_discovered`, R-ARCH-EXT-017) and records the skip in this same
-    /// vector, whereas Pi filters untrusted project resources out **before** `loadExtensions` runs,
-    /// so an untrusted project-local extension never reaches Pi's `errors[]` at all. Treating it as
-    /// a load failure would make merely opening an untrusted project a fatal startup — the exact
-    /// opposite of the trust gate's intent. It is still reported in the `[Extension issues]` panel.
+    /// `false` for the two records Pi's `errors[]` does not contain at all:
+    ///
+    /// 1. [`crate::ExtError::Untrusted`]. cyrup applies the project-trust gate *inside* the load
+    ///    (`load_discovered`, R-ARCH-EXT-017) and records the skip in this same vector, whereas Pi
+    ///    filters untrusted project resources out **before** `loadExtensions` runs, so an untrusted
+    ///    project-local extension never reaches Pi's `errors[]`. Treating it as a load failure would
+    ///    make merely opening an untrusted project a fatal startup — the exact opposite of the trust
+    ///    gate's intent.
+    /// 2. An unparseable `extension.json` (see [`discover_with_diagnostics`]). Pi's manifest reader
+    ///    `readPiManifest` swallows a malformed `package.json` outright — `catch { return null }`,
+    ///    `loader.ts:568-579` @v0.83.0 — and `resolveExtensionEntries` (`loader.ts:594-624`) then
+    ///    falls through to the `index.ts`/`index.js` convention, so the directory still loads and
+    ///    startup still continues. Making it fatal here would abort a startup Pi completes.
+    ///
+    /// Both are still reported in the `[Extension issues]` panel.
     pub fatal: bool,
 }
 
@@ -105,17 +114,49 @@ impl LoadExtensionsResult {
 /// Discover extensions across the three roots, de-duplicated by canonical directory path
 /// (Pi `discoverAndLoadExtensions`). Project root first, then global, then configured — first
 /// occurrence of a path wins (load-order determinism, R-08-004).
+///
+/// Discovery diagnostics are dropped; see [`discover_with_diagnostics`] to keep them.
 pub fn discover(roots: &DiscoveryRoots) -> Vec<DiscoveredExtension> {
+    discover_with_diagnostics(roots).0
+}
+
+/// [`discover`], additionally returning the non-fatal diagnostics discovery produced — today, one
+/// per directory whose `extension.json` exists but could not be read or parsed.
+///
+/// # Why this exists (the silent-fallback hole)
+///
+/// [`push_dir`] falls back to the manifest-less "bare `.wasm`" rule when [`ExtensionManifest::load`]
+/// fails, which is Pi's own shape: `readPiManifest` returns `null` on a malformed `package.json`
+/// (`loader.ts:568-579` @v0.83.0) and `resolveExtensionEntries` then falls through to the
+/// `index.ts`/`index.js` convention (`loader.ts:594-624`), or returns `null` and the subdirectory
+/// contributes nothing (`discoverExtensionsInDir`, `loader.ts:636-668`).
+///
+/// Pi can afford that silence: its manifest is a *pointer list* (`pi.extensions`), so falling back
+/// to `index.ts` yields the same extension, at the same path-derived identity, with the same (total)
+/// privileges. cyrup's `extension.json` also carries the **id** and the **capability grant**, so the
+/// same fallback silently produces a DIFFERENT extension — id from the artifact stem — holding
+/// [`crate::Capabilities::none`]. The author whose manifest has a trailing comma gets a nameless,
+/// powerless extension and no message, which also contradicts `manifest.rs`'s own stated rule that a
+/// malformed entry is an error rather than a silently-dropped grant.
+///
+/// So the LOAD OUTCOME stays Pi's (fall back, keep going, do not abort startup — hence
+/// [`LoadError::fatal`] `false`) and only the message is added, because Pi has no capability model
+/// to report on. A directory with NO `extension.json` at all is the plain manifest-less convention
+/// and produces no diagnostic, exactly as a directory with no `package.json` does in Pi.
+pub fn discover_with_diagnostics(
+    roots: &DiscoveryRoots,
+) -> (Vec<DiscoveredExtension>, Vec<LoadError>) {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut out: Vec<DiscoveredExtension> = Vec::new();
+    let mut diags: Vec<LoadError> = Vec::new();
 
     if let Some(cwd) = &roots.project_cwd {
         let dir = cwd.join(PROJECT_CONFIG_DIR).join(EXTENSIONS_SUBDIR);
-        scan_dir(&dir, ExtOrigin::Project, &mut seen, &mut out);
+        scan_dir(&dir, ExtOrigin::Project, &mut seen, &mut out, &mut diags);
     }
     if let Some(agent) = &roots.agent_dir {
         let dir = agent.join(EXTENSIONS_SUBDIR);
-        scan_dir(&dir, ExtOrigin::Global, &mut seen, &mut out);
+        scan_dir(&dir, ExtOrigin::Global, &mut seen, &mut out, &mut diags);
     }
     for p in &roots.configured {
         // A configured path may be a bare prebuilt `.wasm` artifact, a single extension dir, or a
@@ -125,17 +166,17 @@ pub fn discover(roots: &DiscoveryRoots) -> Vec<DiscoveredExtension> {
         if is_component_file(p) {
             push_file(p, ExtOrigin::Configured, &mut seen, &mut out);
         } else if is_extension_dir(p) {
-            push_dir(p, ExtOrigin::Configured, &mut seen, &mut out);
+            push_dir(p, ExtOrigin::Configured, &mut seen, &mut out, &mut diags);
         } else {
-            scan_dir(p, ExtOrigin::Configured, &mut seen, &mut out);
+            scan_dir(p, ExtOrigin::Configured, &mut seen, &mut out, &mut diags);
         }
     }
-    out
+    (out, diags)
 }
 
 /// True iff `dir` directly holds an extension (an `extension.json` or a `*.wasm` component).
 fn is_extension_dir(dir: &Path) -> bool {
-    dir.join("extension.json").is_file() || first_wasm(dir).is_some()
+    dir.join(MANIFEST_FILE).is_file() || first_wasm(dir).is_some()
 }
 
 /// Find the first `*.wasm` artifact in `dir` (a prebuilt component).
@@ -165,6 +206,7 @@ fn scan_dir(
     origin: ExtOrigin,
     seen: &mut HashSet<PathBuf>,
     out: &mut Vec<DiscoveredExtension>,
+    diags: &mut Vec<LoadError>,
 ) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
@@ -172,7 +214,7 @@ fn scan_dir(
     for path in entries {
         if path.is_dir() {
             if is_extension_dir(&path) {
-                push_dir(&path, origin, seen, out);
+                push_dir(&path, origin, seen, out, diags);
             }
         } else if is_component_file(&path) {
             push_file(&path, origin, seen, out);
@@ -210,7 +252,11 @@ fn push_file(
         version: "0.0.0".into(),
         world: HOST_WORLD.into(),
         entry: None,
-        capabilities: Default::default(),
+        // EXT-054, deny-by-default: a bare artifact ships no `extension.json`, so it DECLARED
+        // nothing and is granted nothing. Synthesizing a permissive grant here would reopen the
+        // bypass from the other end — the artifact whose capabilities nobody can read is exactly
+        // the one that must not receive `exec`/`net`/`ui`/`fs`. Ship an `extension.json` to ask.
+        capabilities: crate::manifest::Capabilities::none(),
     };
     out.push(DiscoveredExtension {
         dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -220,22 +266,30 @@ fn push_file(
     });
 }
 
-/// Parse the manifest for one extension dir and push it (deduplicated). A missing/invalid manifest
-/// is skipped during discovery; the per-path error surfaces at load time so callers can report it.
+/// Parse the manifest for one extension dir and push it (deduplicated).
+///
+/// A dir with NO `extension.json` takes the manifest-less "bare `.wasm`" rule silently — that is
+/// Pi's `index.ts` convention (`loader.ts:594-624`) and needs no comment. A dir whose
+/// `extension.json` EXISTS but does not read/parse takes the same fallback (Pi's `readPiManifest`
+/// `catch { return null }`, `loader.ts:568-579`) and additionally records a non-fatal diagnostic in
+/// `diags`, because unlike Pi's pointer-list manifest cyrup's carries the id and the capability
+/// grant — see [`discover_with_diagnostics`] for the full parity argument.
 fn push_dir(
     dir: &Path,
     origin: ExtOrigin,
     seen: &mut HashSet<PathBuf>,
     out: &mut Vec<DiscoveredExtension>,
+    diags: &mut Vec<LoadError>,
 ) {
     let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     if !seen.insert(key) {
         return; // de-dup (Pi `seen` set)
     }
     let wasm = first_wasm(dir);
+    let manifest_path = dir.join(MANIFEST_FILE);
     let manifest = match ExtensionManifest::load(dir) {
         Ok(m) => m,
-        Err(_) => {
+        Err(e) => {
             // Synthesize a minimal manifest for a bare prebuilt `.wasm` (Pi's "direct file" rule):
             // id from the artifact/dir stem, host world. No manifest + no wasm => skip.
             //
@@ -244,19 +298,45 @@ fn push_dir(
             // and still surfaces as a wasmtime link error at instantiation. There is nothing to
             // check — the bytes carry no declared world — and refusing every manifest-less `.wasm`
             // would drop Pi's direct-file rule. Ship an `extension.json` to get the typed error.
-            let Some(w) = &wasm else { return };
-            let id = w
-                .file_stem()
+            let id = wasm
+                .as_deref()
+                .and_then(|w| w.file_stem())
                 .and_then(|s| s.to_str())
                 .or_else(|| dir.file_name().and_then(|s| s.to_str()))
                 .unwrap_or("extension")
                 .to_string();
+            // The manifest is only "absent" if the file is not there; an existing-but-broken one is
+            // the operator-visible case. `is_file()` also catches an unreadable file (permissions),
+            // which is just as invisible to its author as a syntax error.
+            if manifest_path.is_file() {
+                diags.push(LoadError {
+                    path: dir.to_path_buf(),
+                    // Pi keeps loading and does not abort startup on a malformed manifest.
+                    fatal: false,
+                    error: match &wasm {
+                        Some(w) => format!(
+                            "{MANIFEST_FILE} could not be read: {e}; falling back to the \
+                             manifest-less rule — `{}` loads as extension `{id}` with NO declared \
+                             capabilities",
+                            w.file_name().and_then(|s| s.to_str()).unwrap_or("<artifact>"),
+                        ),
+                        None => format!(
+                            "{MANIFEST_FILE} could not be read: {e}; the directory has no prebuilt \
+                             .wasm to fall back to and was skipped"
+                        ),
+                    },
+                });
+            }
+            if wasm.is_none() {
+                return;
+            }
             ExtensionManifest {
                 id,
                 version: "0.0.0".into(),
                 world: HOST_WORLD.into(),
                 entry: None,
-                capabilities: Default::default(),
+                // EXT-054, deny-by-default — see `push_file`'s note: no manifest, no grant.
+                capabilities: crate::manifest::Capabilities::none(),
             }
         }
     };

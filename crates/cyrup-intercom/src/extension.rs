@@ -454,6 +454,18 @@ impl NativeExtension for IntercomExtension {
         self.id.clone()
     }
 
+    /// Ambient (SEAM-071/SEAM-074): cyrup compiles in what pi *installs*. Upstream pi-intercom is an
+    /// ordinary installed package living in the PATH tier that `noExtensions` collapses to the
+    /// explicit `-e` paths (`resource-loader.ts:451-453` @v0.83.0), so `--no-extensions` must drop it
+    /// here too. Declared on the type rather than by an id list in cyrup-session-svc, because only a
+    /// built-in knows which of pi's two tiers it stands in for — an id list also catches a test's
+    /// hand-injected double that merely shares the name, which is pi's INLINE tier and is never
+    /// gated (`loadFinalExtensionSet` calls `loadExtensionFactories` unconditionally, `:579-581`,
+    /// over `main.ts:523`).
+    fn is_ambient(&self) -> bool {
+        true
+    }
+
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
         // `intercom` is always registered; `contact_supervisor` only for a subagent child with
         // orchestrator metadata (index.ts:1162-1163,1425).

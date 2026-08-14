@@ -1323,6 +1323,14 @@ impl NativeExtension for SubagentPromptRuntime {
         self.id.clone()
     }
 
+    /// Ambient (SEAM-071/SEAM-074): the prompt runtime ships inside upstream's installed
+    /// pi-subagents package, so it lives in the PATH tier `noExtensions` collapses
+    /// (`resource-loader.ts:451-453` @v0.83.0) and is re-injected by path in a subagent child
+    /// (`pi-subagents/src/runs/shared/pi-args.ts:413-417` @v0.47.1).
+    fn is_ambient(&self) -> bool {
+        true
+    }
+
     /// Registers the tool when one exists and declares the two mutating seams pi's runtime hooks
     /// (`onRuntimeEvent("context", …)` `:317` and `onRuntimeEvent("before_agent_start", …)` `:323`).
     ///

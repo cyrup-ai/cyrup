@@ -3,7 +3,8 @@
 //! The binary's real logic lives here so it can be exercised without a TTY: argument parsing
 //! ([`cli`]) and its mapping onto a [`cyrup_session_svc::SessionConfig`], prompt-input assembly from
 //! positionals / `@file` / piped stdin ([`input`], R-11-006/024/025), the provider-selection seam
-//! ([`provider`], faux today / clear error for an unimplemented real provider), the non-interactive
+//! ([`provider`], the real registry / an actionable no-models error when nothing is authenticated —
+//! PROV-052), the non-interactive
 //! mode dispatchers over injectable readers/writers ([`run`], R-11-005/007/011), and per-mode signal
 //! handling ([`signals`], R-11-010/018).
 //!
@@ -32,8 +33,9 @@ pub mod timings;
 pub mod update_check;
 
 pub use cli::{
-    Cli, ExtFlagValue, ExtensionFlag, Mode, OutputFormat, ThinkingArg, normalize_short_aliases,
-    partition_extension_flags, render_help, resolve_app_mode, should_take_over_stdout,
+    Cli, ExtFlagValue, ExtensionFlag, Mode, OutputFormat, ThinkingArg, TuiMode,
+    normalize_short_aliases, partition_extension_flags, render_help, resolve_app_mode,
+    should_take_over_stdout,
 };
 pub use credential_print::{
     CredentialPrintCommand, CredentialPrintError, CredentialPrintKind, credential_print_help,
@@ -61,7 +63,7 @@ pub use session_resolve::{
 pub use signals::spawn_abort_on_signal;
 pub use startup::{
     apply_settings_session_dir, are_experimental_features_enabled, file_settings_store,
-    is_official_distribution, should_run_first_time_setup,
+    is_official_distribution, run_first_time_setup, should_run_first_time_setup,
 };
 pub use startup_ui::{
     MissingCwdChoice, ResumeChoice, TrustChoice, has_trust_requiring_project_resources,

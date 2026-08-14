@@ -102,7 +102,7 @@ async fn the_agents_header_overlay_is_live_and_model_derived() {
     // Whatever the active model's attribution is, the agent's live overlay must EQUAL it. Before the
     // fix the agent held a build-time snapshot with no way to be updated, so this could only ever
     // agree by accident.
-    let active = session.model();
+    let active = session.model().expect("session must have a resolved model");
     let resolved = models
         .iter()
         .find(|m| m.id == active.model && m.provider == active.provider)

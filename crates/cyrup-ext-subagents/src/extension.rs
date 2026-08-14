@@ -9171,6 +9171,15 @@ impl NativeExtension for SubagentsExtension {
         self.id.clone()
     }
 
+    /// Ambient (SEAM-071/SEAM-074): upstream pi-subagents is an installed package in the PATH tier
+    /// that `noExtensions` collapses (`resource-loader.ts:451-453` @v0.83.0). A subagent CHILD still
+    /// keeps it — pi's launcher re-injects it by path (`pi-subagents/src/runs/shared/pi-args.ts:413-417`
+    /// @v0.47.1) — which is why `SUBAGENT_CHILD_RUNTIME_NATIVES` in cyrup-session-svc's builder
+    /// carves it back in rather than this flag being the whole answer.
+    fn is_ambient(&self) -> bool {
+        true
+    }
+
     /// Register the extension surface for this process's [`RegistrationMode`] (T6 child-mode gate):
     ///
     /// - [`RegistrationMode::Full`] (root orchestrator): the `subagent` tool (R-SA-128), all 12

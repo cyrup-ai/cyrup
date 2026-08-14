@@ -814,6 +814,21 @@ $ grep -rn capabilities crates/cyrup-ext/src --include='*.rs'
 
 Every bit off, the full host surface granted.
 
+**RESOLVED 2026-08-13** (sandbox-and-extension-gating pass). Fixed; see `06-cyrup-ext.md` EXT-054 for
+the evidence block. The regression fixture is the one this repro used: build `cyrup-ext-sdk` for
+`wasm32-wasip2`, lay it out with an `extension.json`, load it through `discover_and_load`. It lives
+at `crates/cyrup-ext/tests/manifest_capabilities.rs` (9 tests; 5 go RED if the one-line manifest
+threading in `load_discovered` is reverted).
+
+**One line of this transcript's conclusion is withdrawn.** The `--offline` observation is factually
+correct — the `net` bypass WAS measured with `--offline` set — but the inference that it constitutes
+a second failed control is not. pi's `--offline` is documented, verbatim, as "Disable startup network
+operations" (`packages/coding-agent/src/cli/args.ts:277` @v0.83.0), pi has no extension network gate
+of any kind, and cyrup's help text is the identical sentence. A guest reaching the network on an
+`--offline` host is parity. `EXT-058` is re-rated `low` and reclassified as a product decision rather
+than a defect; the control that was genuinely missing was the manifest's `"net": false`, which now
+works.
+
 **Correction applied** — two edits. (1) Impact's "Blast radius today: **zero WASM guests ship** … so
 nothing is currently mis-granted" overstates the safety margin. The SDK's **own reference guest** is
 a complete, loadable component that exercises `exec` and `http-client`, `wasm32-wasip2` builds it in
@@ -921,7 +936,7 @@ and the next pass should not re-derive them.
 
 | new ID | area | severity | what |
 |---|---|---|---|
-| `PROV-052` | 01 | **high** | The shipped binary's **default model is the in-process faux TEST provider**. A bare `cyrup -p hi` with no credentials fails with the internal string `No more faux responses queued`, and the interactive footer advertises `faux/faux-1` as the live model — while `--help` documents `--provider <name> (default: google)`. |
+| `PROV-052` **FIXED 2026-08-13** | 01 | **critical** (raised on the fix pass) | The shipped binary's **default model was the in-process faux TEST provider**. A bare `cyrup -p hi` with no credentials fails with the internal string `No more faux responses queued`, and the interactive footer advertises `faux/faux-1` as the live model — while `--help` documents `--provider <name> (default: google)`. **Fixed 2026-08-13** — the `faux` feature edge moved out of every `[dependencies]` section (`cargo tree -p cyrup -e features --edges normal` now reports no `faux`, guarded by `crates/cyrup-provider/tests/faux_not_in_normal_build.rs`), and the no-credential path now resolves to a zero-model provider ⇒ pi's `formatNoModelsAvailableMessage()` on stderr + exit 1 (`main.ts:852-855` @v0.83.0). NB the `(default: google)` help line is a **stale string in pi itself** — `args.ts:87-88` applies no default — so it was correctly left alone; see the item body. |
 | `TUI-052` | 07 | **high** | A queued message dequeued by Escape **stays in the transcript forever** as a phantom user message that was never sent and is not in the session JSONL. Survives both `TUI-016`'s and `TUI-005`'s fixes. |
 | `TUI-053` | 07 | **high** | `Ctrl+-` (`editor.undo`) is **unreachable from any terminal without the kitty keyboard protocol**. pi maps the legacy byte explicitly (`keys.ts:1277`); cyrup relies on crossterm, which decodes `0x1F` as `Ctrl+'7'`. |
 | `TUI-054` | 07 | **high** | A **failed or aborted** compaction is announced as `compaction complete`. `CompactionEnd` is destructured `{ .. }`, discarding `aborted` and `error_message`. |
@@ -930,7 +945,7 @@ and the next pass should not re-derive them.
 | `TUI-057` | 07 | low | Slash-command palette submission is **inconsistent** — sometimes one Enter, sometimes two, sometimes a trailing space suppresses it. Filed with its instrument caveat intact. |
 | `EXT-058` | 06 | medium | Guest WASM `http-client` is **not gated by `--offline`**. |
 | `PERM-032` | 10 | low | A permission-**denied** tool result breaks the next provider request on `together/openai/gpt-oss-20b` (3/3), while the same denial is handled fine by two other models. Filed at **low confidence** as a lead. |
-| `ICOM-052` | 11 | low | The intercom broker socket path has **no `SUN_LEN` guard**; on a long agent-dir path the broker dies and the only trace is a WARN that names neither the cause nor the path. |
+| `ICOM-052` | 11 | low → **medium** | The intercom broker socket path has **no `SUN_LEN` guard**; on a long agent-dir path the broker dies and the only trace is a WARN that names neither the cause nor the path. **INDEPENDENTLY REPRODUCED 2026-08-13** (cross-group verification pass), as a by-product of the `SEAM-071` live check below — and the reproduction is a clean A/B on path length alone, so it is no longer a lead. Same binary, same model, same flags, only `CYRUP_AGENT_DIR` differs. **107-char agent dir** (`/private/tmp/claude-501/-Users-davidmaple-cyrup-ai/<uuid>/scratchpad/live4/agent`): the turn still succeeds (`Ok.`, exit 0) but stderr carries exactly the WARN the item describes — `intercom: startup connect failed; scheduling reconnect error=intercom broker error: intercom broker exited before startup with code 1` — naming neither `SUN_LEN`, nor the path, nor the length, and **0 brokers** are left running, so intercom is silently dead for the whole session. **10-char agent dir** (`/tmp/cy1/a`): no WARN at all, and the broker comes up and stays up (`38135 …/cyrup __intercom-broker`). Raised low → medium: the failure is total (no intercom for the session), silent (one WARN that misdirects toward a connect/retry problem), and triggered by an ordinary long path — every run under a temp dir with a UUID in it hits it. |
 
 ### Struck after audit — do not re-file
 

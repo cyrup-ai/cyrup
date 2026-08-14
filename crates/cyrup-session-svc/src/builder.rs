@@ -41,6 +41,8 @@ use crate::services::AgentSessionServices;
 use crate::session::AgentSession;
 use crate::subscriber::{Fanout, SvcSubscriber};
 
+
+
 /// Which session to start (arch-11 §3.3, `SessionStartEvent` analogue).
 #[derive(Clone, Debug, Default)]
 pub enum SessionTarget {
@@ -110,8 +112,23 @@ pub struct SessionConfig {
     pub no_prompt_templates: bool,
     /// `--no-themes`: disable theme discovery (Pi `noThemes`).
     pub no_themes: bool,
-    /// `--no-extensions` / `-ne`: disable extension *discovery* (the project + global roots). Explicit
-    /// `--extension` paths still load (Pi `resourceLoaderOptions.noExtensions`, main.ts:664).
+    /// `--no-extensions` / `-ne`: reduce the extension set to the explicitly-named `--extension`
+    /// paths (Pi `resourceLoaderOptions.noExtensions`, main.ts:664 →
+    /// `const extensionPaths = this.noExtensions ? cliEnabledExtensions : this.mergePaths(...)`,
+    /// `resource-loader.ts:451-452` and `:555-557` @v0.83.0).
+    ///
+    /// SEAM-071: "the extension set" means pi's PATH tier in ALL of its forms, not just the
+    /// disk-discovery roots. It drops the project + global roots, the package tier
+    /// (`ext_crate_paths`, which is pi's `enabledExtensions`), and the AMBIENT native built-ins —
+    /// cyrup's `cyrup-permission-system` / `cyrup-intercom` / `subagents` stand in for upstream's
+    /// `@gotgenes/pi-permission-system`, pi-intercom and pi-subagents, which are ordinary installed
+    /// packages in exactly the tier `noExtensions` removes.
+    ///
+    /// It does NOT drop pi's INLINE tier — `extensionFactories`, loaded unconditionally
+    /// (`resource-loader.ts:579-581` over `main.ts:523`) — which is what a native handed to
+    /// [`SessionBuilder::with_native_extension`] by an embedder is. See
+    /// [`native_survives_no_extensions`] for the discriminator and for the one carve-out pi makes in
+    /// a subagent child.
     pub no_extensions: bool,
     /// Explicit `--extension <path>` resources to load as pre-trust *configured* extensions (Pi
     /// `resourceLoaderOptions.additionalExtensionPaths`, main.ts:660). Each may be a single extension
@@ -468,6 +485,7 @@ impl SessionBuilder {
         (!overlay.is_empty()).then(|| Arc::new(overlay))
     }
 
+
     /// Assemble the wired [`AgentSession`] (arch-11 §3.3). Async: discovery + context load + native
     /// extension `init` run here.
     pub async fn build(self) -> Result<AgentSession, SessionServiceError> {
@@ -655,16 +673,22 @@ impl SessionBuilder {
         // `ReadOpts::model_vision` stayed `None` and `supports_images_now()` fell back to `true`,
         // so the warning was unreachable and an image handed to a text-only model produced a
         // provider error instead of the tool's own diagnostic.
-        let read_model_vision =
-            cyrup_tools::config::ModelVisionHandle::new(resolved_model.supports_image_input());
+        // A modelless session (SEAM-075) has no declared modalities to seed from; `read` then keeps
+        // its `supports_images_now()` default until the first `/model` re-pushes the real value.
+        let read_model_vision = cyrup_tools::config::ModelVisionHandle::new(
+            resolved_model.as_ref().is_none_or(cyrup_provider::Model::supports_image_input),
+        );
         let bash_session_env = cyrup_tools::config::SessionEnvHandle::new(
             cyrup_tools::config::SessionEnvInfo {
                 session_id: Some(session_id.to_string()),
                 // `None` for an ephemeral/in-memory session — Pi leaves `PI_SESSION_FILE` unset
                 // rather than empty in that case (bash.ts:173-174).
                 session_file: manager.session_file().map(std::path::Path::to_path_buf),
-                provider: Some(model_ref.provider.to_string()),
-                model: Some(model_ref.model.to_string()),
+                // Likewise `None` while the session has no model: pi resolves `CYRUP_PROVIDER`/
+                // `CYRUP_MODEL` from `ctx.model` per command (bash.ts:171-181), so a modelless
+                // session leaves them unset rather than exporting a placeholder.
+                provider: model_ref.as_ref().map(|m| m.provider.to_string()),
+                model: model_ref.as_ref().map(|m| m.model.to_string()),
                 reasoning_level: Some(thinking_level_to_str(thinking)),
             },
         );
@@ -725,11 +749,15 @@ impl SessionBuilder {
             bash_proc.clone(),
             cwd.clone(),
         ));
-        host_services.update_model(
-            model_ref.clone(),
-            resolved_model.context_window,
-            Some(thinking_level_to_str(thinking)),
-        );
+        // Only when there IS one: a guest's `getModel()` reads `Option`-shaped state
+        // (`host_services.rs`), matching pi's `ctx.model` being `undefined` on a modelless session.
+        if let (Some(mr), Some(m)) = (model_ref.as_ref(), resolved_model.as_ref()) {
+            host_services.update_model(
+                mr.clone(),
+                m.context_window,
+                Some(thinking_level_to_str(thinking)),
+            );
+        }
         host_services.wire_control_channel();
 
         // ---- 4b. extension host (cyrup-ext) — built BEFORE resource discovery so the
@@ -772,7 +800,16 @@ impl SessionBuilder {
         // built-ins (permission-system, intercom), so anything short of a non-zero exit would turn
         // a failed permission gate into a fail-OPEN session.
         let mut native_load_errors: Vec<crate::services::ExtensionLoadDiagnostic> = Vec::new();
-        for ext in self.native_extensions {
+        // SEAM-071: `--no-extensions` gates the AMBIENT natives too. It used to gate only the
+        // WASM/disk discovery roots (`extension_discovery_roots`), while this loop loaded every
+        // native unconditionally — so `cyrup --no-extensions` still started an intercom broker,
+        // which is how the suite accumulated 13 immortal broker processes per run. Upstream, the
+        // analogs of these three are installed packages in `resolvedPaths.extensions`, and
+        // `noExtensions` reduces THAT tier to the explicit `-e` paths alone
+        // (`resource-loader.ts:451-452`, `:555-557` @v0.83.0). It does not touch pi's inline
+        // `extensionFactories` tier, and neither does this — see `native_survives_no_extensions`.
+        let is_subagent_child = std::env::var_os(SUBAGENT_CHILD_ENV).is_some();
+        for ext in natives_to_load(self.native_extensions, cfg.no_extensions, is_subagent_child) {
             let id = ext.id();
             if let Err(e) = host.load_native_with_services(ext, native_services.clone()).await {
                 tracing::error!(extension = %id, error = %e, "native extension failed to load");
@@ -912,7 +949,16 @@ impl SessionBuilder {
         // toolchain — the gated arch-08b live-wasm tail, residual ledger §09 #13). Native built-ins
         // are already loaded above.
         let mut ext_roots = extension_discovery_roots(&cfg);
-        ext_roots.configured.extend(report.registry.ext_crate_paths.iter().cloned());
+        // SEAM-071, second half: the package tier is pi's `enabledExtensions`, the exact operand
+        // `noExtensions` drops (`extensionPaths = this.noExtensions ? cliEnabledExtensions :
+        // this.mergePaths(cliEnabledExtensions, enabledExtensions)`, resource-loader.ts:451-452
+        // @v0.83.0). Appending it into `configured` unconditionally re-admitted every installed
+        // package's extension through the one tier `--no-extensions` is defined to keep, so the flag
+        // silently did not mean what it says. `cfg.extra_extension_paths` — the real `-e` tier — is
+        // still merged by `extension_discovery_roots` either way.
+        if !cfg.no_extensions {
+            ext_roots.configured.extend(report.registry.ext_crate_paths.iter().cloned());
+        }
         #[cfg(feature = "wasm-host")]
         {
             // Inject the session's OWN `host_services` (built at 4a) so a disk-discovered guest's
@@ -1143,12 +1189,16 @@ impl SessionBuilder {
         // env override (`CYRUP_TELEMETRY`/`PI_TELEMETRY`) else the `enableInstallTelemetry` setting.
         let env = cyrup_config::EnvVars::from_process();
         let telemetry_enabled = env.telemetry.unwrap_or_else(|| eff.enable_install_telemetry());
-        let attribution_headers = crate::attribution::merge_provider_attribution_headers(
-            &resolved_model,
-            telemetry_enabled,
-            Some(&session_id),
-            &[],
-        );
+        // No model ⇒ no provider to attribute to; the headers are recomputed on the first
+        // `/model` anyway (`apply_model_change`).
+        let attribution_headers = resolved_model.as_ref().and_then(|m| {
+            crate::attribution::merge_provider_attribution_headers(
+                m,
+                telemetry_enabled,
+                Some(&session_id),
+                &[],
+            )
+        });
         // The swappable stream source the agent loop streams through: it wraps the resolved provider
         // and the (optional) resolver seam so a cross-provider `/model` select can install a new
         // provider in place without rebuilding the agent (Pi live model+provider switch). The SAME
@@ -1162,7 +1212,23 @@ impl SessionBuilder {
             Some(f) => f,
             None => provider_swap.clone(),
         };
-        let mut agent_builder = Agent::builder(model_ref.clone(), agent_stream_fn)
+        // SEAM-075 — the agent's run baseline. pi's agent holds `Model | undefined`
+        // (`AgentSession.model` is a straight read of `this.agent.state.model`,
+        // agent-session.ts:866-868), so a modelless session builds an agent with no model at all.
+        // `cyrup_agent::StateInner::model` is a non-optional `ModelRef`, so it is seeded with an
+        // EMPTY address here. That value is unreachable while the session is modelless: every path
+        // into `Agent::run` goes through [`AgentSession::prompt`] → `prepare_and_assemble`, which
+        // returns [`SessionServiceError::NoModelSelected`] before touching the agent (pi
+        // agent-session.ts:1178-1180), and the first `/model` overwrites it through
+        // `agent.set_model`. It is NOT a catalog entry and no reader sees it — the `/model` picker,
+        // the footer, `state_view`, the attribution headers and the `CYRUP_*` env all read the
+        // session's `Option<ModelRef>`, which stays `None` until a model is selected.
+        let agent_model = model_ref.clone().unwrap_or_else(|| ModelRef {
+            provider: cyrup_core::ProviderId::from(""),
+            api: None,
+            model: cyrup_core::ModelId::from(""),
+        });
+        let mut agent_builder = Agent::builder(agent_model, agent_stream_fn)
         .system_prompt(system_prompt.clone())
         .thinking_level(thinking)
         .tools(active_tools)
@@ -1288,7 +1354,14 @@ impl SessionBuilder {
                 manager.append_thinking_level_change(&thinking_level_to_str(thinking))?;
             }
         } else {
-            manager.append_model_change(resolved_model.provider.clone(), resolved_model.id.clone())?;
+            // Pi sdk.ts:370-373 guards this on the model existing —
+            // `if (model) { sessionManager.appendModelChange(model.provider, model.id); }` —
+            // while the thinking-level entry is appended unconditionally. A modelless session must
+            // therefore persist NO `model_change` entry, so a later resume has nothing bogus to
+            // restore from.
+            if let Some(m) = resolved_model.as_ref() {
+                manager.append_model_change(m.provider.clone(), m.id.clone())?;
+            }
             manager.append_thinking_level_change(&thinking_level_to_str(thinking))?;
         }
 
@@ -1434,13 +1507,36 @@ pub(crate) fn thinking_level_from_str(s: &str) -> Option<ModelThinkingLevel> {
     serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
 }
 
-/// Resolve `(Model, ModelRef, ModelThinkingLevel, modelFallbackMessage)` from the explicit pattern,
-/// the resumed session, settings, and finally the catalog (Pi sdk.ts:191-242; R-07-019).
+/// What [`resolve_model`] hands back: the resolved catalog `Model` and its address (both `None` on
+/// a modelless launch, see below), the clamped thinking level, and pi's `modelFallbackMessage`.
+type ResolvedModel = (Option<Model>, Option<ModelRef>, ModelThinkingLevel, Option<String>);
+
+/// Resolve `(Option<Model>, Option<ModelRef>, ModelThinkingLevel, modelFallbackMessage)` from the
+/// explicit pattern, the resumed session, settings, and finally the catalog (Pi sdk.ts:191-242;
+/// R-07-019).
 ///
 /// Precedence mirrors Pi: an explicit `--model` pattern wins; otherwise a resumed session's saved
 /// model is restored when it is still resolvable in the catalog (else a `modelFallbackMessage` is
 /// produced and we fall back to settings/catalog). The thinking level is likewise restored from the
 /// session's `thinking_level_change` entry, then clamped to the chosen model's capabilities.
+///
+/// # The modelless result (SEAM-075)
+/// The model is an `Option` because pi's is: `findInitialModel` legitimately returns
+/// `{ model: undefined }` when nothing is configured (model-resolver.ts:648-650), and `sdk.ts:
+/// 216-218` turns that into a `modelFallbackMessage` — **a banner, not an error**:
+///
+/// ```text
+/// model = result.model;
+/// if (!model) {
+///     modelFallbackMessage = formatNoModelsAvailableMessage();
+/// } else if (modelFallbackMessage) { … }
+/// ```
+///
+/// The hard stop lives one tier up and is MODE-GATED — `if (appMode !== "interactive" &&
+/// !session.model) { console.error(…); process.exit(1); }` (main.ts:852-855) — precisely so a
+/// credential-less first run still gets a TUI to type `/login` and then `/model` into. Making an
+/// empty catalog fatal HERE would kill that onboarding for every mode, which is exactly the
+/// regression this signature closes.
 fn resolve_model(
     provider: &dyn Provider,
     cfg: &SessionConfig,
@@ -1448,11 +1544,8 @@ fn resolve_model(
     existing: &cyrup_session::context::SessionContext,
     has_existing_session: bool,
     has_thinking_entry: bool,
-) -> Result<(Model, ModelRef, ModelThinkingLevel, Option<String>), SessionServiceError> {
+) -> Result<ResolvedModel, SessionServiceError> {
     let available = provider.models();
-    if available.is_empty() {
-        return Err(SessionServiceError::NoModels(provider.id().to_string()));
-    }
     let resolver = ModelResolver::new(available);
     let mut fallback: Option<String> = None;
 
@@ -1511,18 +1604,19 @@ fn resolve_model(
             }
             None => None,
         };
-        let m = match resolved {
-            Some(m) => m,
-            None => available.first().cloned().ok_or_else(|| {
-                SessionServiceError::NoModels(provider.id().to_string())
-            })?,
-        };
-        if let Some(msg) = fallback.as_mut() {
-            msg.push_str(&format!(". Using {}/{}", m.provider.as_str(), m.id.as_str()));
+        match resolved.or_else(|| available.first().cloned()) {
+            Some(m) => {
+                if let Some(msg) = fallback.as_mut() {
+                    msg.push_str(&format!(". Using {}/{}", m.provider.as_str(), m.id.as_str()));
+                }
+                model = Some(m);
+            }
+            // Pi sdk.ts:216-218 — `findInitialModel` returned `{model: undefined}`
+            // (model-resolver.ts:648-650). The message REPLACES any "Could not restore model …"
+            // text set in step 2, because pi's `if (!model)` branch assigns rather than appends.
+            None => fallback = Some(crate::auth_guidance::format_no_models_available_message()),
         }
-        model = Some(m);
     }
-    let model = model.ok_or_else(|| SessionServiceError::NoModels(provider.id().to_string()))?;
 
     // 4. Thinking level: explicit option → restored from session → settings default; clamped to the
     //    chosen model's supported levels (Pi sdk.ts:223-242).
@@ -1536,13 +1630,19 @@ fn resolve_model(
         });
     }
     let thinking = thinking.unwrap_or_else(|| settings.effective().default_thinking_level());
-    let thinking = cyrup_provider::clamp_thinking_level(&model, thinking);
-
-    let model_ref = ModelRef {
-        provider: model.provider.clone(),
-        api: Some(model.api.clone()),
-        model: model.id.clone(),
+    // Pi sdk.ts:238-242: `if (!model) { thinkingLevel = "off"; } else { thinkingLevel =
+    // clampThinkingLevel(model, thinkingLevel); }` — a modelless session has nothing to clamp
+    // against, so the level is forced off rather than carried from settings.
+    let thinking = match model.as_ref() {
+        Some(m) => cyrup_provider::clamp_thinking_level(m, thinking),
+        None => ModelThinkingLevel::Off,
     };
+
+    let model_ref = model.as_ref().map(|m| ModelRef {
+        provider: m.provider.clone(),
+        api: Some(m.api.clone()),
+        model: m.id.clone(),
+    });
     Ok((model, model_ref, thinking, fallback))
 }
 
@@ -1649,7 +1749,14 @@ async fn pre_trust_extension_verdict(
     #[cfg(not(feature = "wasm-host"))]
     let host = ExtensionHost::new(host_config);
 
-    for ext in natives.iter().filter(|e| e.decides_project_trust()) {
+    // SEAM-071: a native that `--no-extensions` will not load must not vote on project trust
+    // either — pi's pre-trust pass (`loadProjectTrustExtensions()`) runs over the SAME reduced set
+    // its main pass does, because both read `extensionPaths` (resource-loader.ts:451-455 @v0.83.0).
+    let is_subagent_child = std::env::var_os(SUBAGENT_CHILD_ENV).is_some();
+    let voters = natives
+        .iter()
+        .filter(|e| !cfg.no_extensions || native_survives_no_extensions(e, is_subagent_child));
+    for ext in voters.filter(|e| e.decides_project_trust()) {
         // A load failure in the throwaway pass must not fail the build — the real load at step 4b
         // surfaces it. Skip and keep polling the rest.
         if let Err(e) = host.load_native(ext.clone()).await {
@@ -1668,6 +1775,79 @@ async fn pre_trust_extension_verdict(
     let decision = host.aggregate_project_trust(&CancelToken::new()).await;
     // The host (and every instance it loaded) is dropped here — Pi's `clearExtensionCache()`.
     decision
+}
+
+/// The subagent-child marker (`cyrup_ext_subagents::spawn::nested_events::CHILD_ENV`). Read as a
+/// literal rather than imported because `cyrup-session-svc` sits BELOW `cyrup-ext-subagents` in the
+/// crate graph — the natives are injected into the builder from `crates/cyrup/src/main.rs`, which is
+/// the only place that depends on both. See [`native_survives_no_extensions`] for why the builder
+/// needs to know.
+const SUBAGENT_CHILD_ENV: &str = "CYRUP_SUBAGENT_CHILD";
+
+/// The natives a subagent CHILD keeps across `--no-extensions`, and only a child (SEAM-071).
+///
+/// pi's subagent launcher passes `--no-extensions` to the child whenever the agent pins an extension
+/// allowlist, and in the SAME breath re-adds three extensions as explicit `--extension <path>` args:
+/// `PROMPT_RUNTIME_EXTENSION_PATH`, the fanout-child extension when the child is fanout-authorized,
+/// and the resolved `@gotgenes/pi-permission-system` — `pi-subagents v0.47.1
+/// src/runs/shared/pi-args.ts:413-420` (`runtimeExtensions`) emitted at `:556-560`. So in pi a child
+/// under `--no-extensions` keeps exactly these three and loses everything else, pi-intercom included.
+///
+/// cyrup selects the same three by ENV rather than by path — `subagent_extension_for_env`,
+/// `prompt_runtime_extension_for_env`, `permission_extension_for_env` in `crates/cyrup/src/main.rs`
+/// — because its child-side runtime is compiled in, not a loadable file (the mechanism note at
+/// `cyrup-ext-subagents/src/exec/mod.rs:1495-1499`). Env-selection IS cyrup's re-injection channel,
+/// so gating these three in a child would drop what pi explicitly keeps — and for
+/// `cyrup-permission-system` that is a permission gate failing OPEN, which is worse than the
+/// unfiltered load SEAM-071 was filed about.
+const SUBAGENT_CHILD_RUNTIME_NATIVES: [&str; 3] =
+    ["cyrup-permission-system", "subagent-prompt-runtime", "subagents"];
+
+/// Whether a native built-in survives `--no-extensions` (SEAM-071).
+///
+/// The discriminator is [`cyrup_ext::NativeExtension::is_ambient`], declared by each built-in on
+/// itself (SEAM-074). It USED to be a hardcoded `AMBIENT_NATIVE_IDS` list here, which was unsound:
+/// pi's two tiers differ by HOW an extension arrived, not by what it is called, so matching on the
+/// id also caught anything that merely shared the name. That is not hypothetical — it gated
+/// `build_containment_and_flag_diagnostics.rs`'s hand-injected `FailingExt { id: "subagents" }` out
+/// of the load entirely, so a native init failure stopped reaching the startup panel and the exit
+/// channel. An extension the embedder passed by value IS pi's inline tier by construction:
+/// `loadFinalExtensionSet` calls `loadExtensionFactories` unconditionally (`resource-loader.ts:579-581`
+/// @v0.83.0) over `extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])]`
+/// (`main.ts:523`), while only `extensionPaths` — the PATH tier — is collapsed by the flag (`:451-453`).
+fn native_survives_no_extensions(ext: &Arc<dyn NativeExtension>, is_subagent_child: bool) -> bool {
+    let id = ext.id();
+    let id = id.as_str();
+    // pi's inline-factory tier: never gated by a flag about discovery.
+    if !ext.is_ambient() {
+        return true;
+    }
+    // The ambient tier, plus pi's one carve-out: a subagent child keeps the extensions its launcher
+    // re-injects by path (see [`SUBAGENT_CHILD_RUNTIME_NATIVES`]).
+    is_subagent_child && SUBAGENT_CHILD_RUNTIME_NATIVES.contains(&id)
+}
+
+/// The native built-ins this session actually loads (SEAM-071). Pure, so the flag's meaning is
+/// testable without standing up a session: before this existed the build loop iterated
+/// `self.native_extensions` unconditionally and `--no-extensions` reached only the disk roots.
+fn natives_to_load(
+    natives: Vec<Arc<dyn NativeExtension>>,
+    no_extensions: bool,
+    is_subagent_child: bool,
+) -> Vec<Arc<dyn NativeExtension>> {
+    if !no_extensions {
+        return natives;
+    }
+    natives
+        .into_iter()
+        .filter(|e| {
+            let keep = native_survives_no_extensions(e, is_subagent_child);
+            if !keep {
+                tracing::debug!(extension = %e.id(), "native built-in skipped: --no-extensions");
+            }
+            keep
+        })
+        .collect()
 }
 
 /// Build the extension discovery roots from the config (Pi `resourceLoaderOptions`
@@ -1815,6 +1995,172 @@ fn today() -> time::Date {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::http_proxy_overlay;
+
+    // ---- SEAM-071: `--no-extensions` gates the native built-ins ----------------------------
+    //
+    // These were RED before the fix: the build loop iterated `self.native_extensions` with no
+    // reference to `cfg.no_extensions` at all (the flag reached only `extension_discovery_roots`),
+    // so `cyrup --no-extensions` still loaded the permission system, subagents and intercom — and
+    // an intercom load starts a detached broker, which is how the suite accumulated 13 immortal
+    // broker processes per run.
+
+    /// A minimal native whose only job is to have an id and a tier. The second field is
+    /// `is_ambient`: `true` stands in for one of pi's INSTALLED packages (the PATH tier
+    /// `noExtensions` collapses), `false` for its INLINE `extensionFactories` tier. Ambience is a
+    /// property of the extension, never of its name — see [`super::native_survives_no_extensions`].
+    struct StubNative(cyrup_core::ExtensionId, bool);
+
+    #[async_trait::async_trait]
+    impl cyrup_ext::NativeExtension for StubNative {
+        fn id(&self) -> cyrup_core::ExtensionId {
+            self.0.clone()
+        }
+        fn is_ambient(&self) -> bool {
+            self.1
+        }
+        async fn init(
+            &self,
+            _api: &mut cyrup_ext::InitApi,
+        ) -> Result<(), cyrup_ext::ExtError> {
+            Ok(())
+        }
+        async fn on_event(
+            &self,
+            _ev: &cyrup_ext::HostEvent,
+            _ctx: &cyrup_ext::HostCtx,
+        ) -> cyrup_ext::HookOutcome {
+            cyrup_ext::HookOutcome::Noop
+        }
+    }
+
+    /// The four shipped built-ins (pi's INSTALLED-package tier) plus one embedder-supplied
+    /// extension (pi's INLINE-factory tier) — the two tiers `noExtensions` treats differently.
+    fn stubs() -> Vec<std::sync::Arc<dyn cyrup_ext::NativeExtension>> {
+        [
+            ("cyrup-permission-system", true),
+            ("subagents", true),
+            ("subagent-prompt-runtime", true),
+            ("cyrup-intercom", true),
+            ("an-embedders-own-extension", false),
+        ]
+        .into_iter()
+        .map(|(id, ambient)| {
+            std::sync::Arc::new(StubNative(cyrup_core::ExtensionId::from(id), ambient))
+                as std::sync::Arc<dyn cyrup_ext::NativeExtension>
+        })
+        .collect()
+    }
+
+    fn ids(v: &[std::sync::Arc<dyn cyrup_ext::NativeExtension>]) -> Vec<String> {
+        v.iter().map(|e| e.id().to_string()).collect()
+    }
+
+    /// Without the flag nothing changes — the whole point is that this is a FLAG, not a policy.
+    #[test]
+    fn every_native_loads_without_no_extensions() {
+        assert_eq!(ids(&super::natives_to_load(stubs(), false, false)).len(), 5);
+        assert_eq!(ids(&super::natives_to_load(stubs(), false, true)).len(), 5);
+    }
+
+    /// A ROOT session under `--no-extensions` loads none of the four shipped built-ins. pi's
+    /// `noExtensions` reduces the path tier to the explicit `-e` paths (`const extensionPaths =
+    /// this.noExtensions ? cliEnabledExtensions : this.mergePaths(...)`, resource-loader.ts:451-452
+    /// @v0.83.0), and `@gotgenes/pi-permission-system`, pi-intercom and pi-subagents are ordinary
+    /// installed packages living in exactly that tier upstream.
+    #[test]
+    fn no_extensions_drops_every_ambient_native_in_a_root_session() {
+        let kept = ids(&super::natives_to_load(stubs(), true, false));
+        assert_eq!(
+            kept,
+            vec!["an-embedders-own-extension".to_string()],
+            "the four shipped built-ins go; the inline one stays"
+        );
+    }
+
+    /// The half that is NOT gated, and the reason SEAM-071's own preferred fix would have been
+    /// wrong here: pi loads its inline tier unconditionally — `loadFinalExtensionSet` calls
+    /// `loadExtensionFactories(...)` with no `noExtensions` check (`resource-loader.ts:579-581`)
+    /// over `[...builtInExtensions, ...(options?.extensionFactories ?? [])]` (`main.ts:523`). An
+    /// extension the caller handed over by value is not something a flag about discovery is about.
+    /// Ten test files in this workspace rely on exactly that combination.
+    #[test]
+    fn an_extension_the_embedder_passed_by_hand_survives_no_extensions() {
+        for child in [false, true] {
+            assert!(
+                ids(&super::natives_to_load(stubs(), true, child))
+                    .contains(&"an-embedders-own-extension".to_string()),
+                "inline tier survives (is_subagent_child={child})"
+            );
+        }
+    }
+
+    /// SEAM-074, the regression that motivated it: an INLINE extension whose id happens to collide
+    /// with a shipped built-in's still survives `--no-extensions`. The predicate used to match on a
+    /// hardcoded id list, so a hand-injected `FailingExt { id: "subagents" }` was silently dropped
+    /// from the load — which is exactly what `tests/build_containment_and_flag_diagnostics.rs`'s
+    /// `the_failure_reaches_the_panel_and_the_exit_channel_together` does, and it went RED: the
+    /// native never loaded, so its init failure reached neither the `[Extension issues]` panel nor
+    /// the fatal exit channel. pi cannot have that bug — it separates the tiers by ORIGIN
+    /// (`extensionPaths` is collapsed, `resource-loader.ts:451-453` @v0.83.0; `loadExtensionFactories`
+    /// is not, `:579-581`), never by name.
+    #[test]
+    fn an_inline_extension_that_shares_a_built_ins_id_is_still_inline() {
+        let inline_double = |id: &str| -> std::sync::Arc<dyn cyrup_ext::NativeExtension> {
+            std::sync::Arc::new(StubNative(cyrup_core::ExtensionId::from(id), false))
+        };
+        for id in ["subagents", "cyrup-permission-system", "cyrup-intercom", "subagent-prompt-runtime"]
+        {
+            for child in [false, true] {
+                assert!(
+                    super::native_survives_no_extensions(&inline_double(id), child),
+                    "a by-value extension named {id} is pi's inline tier and must load \
+                     (is_subagent_child={child})"
+                );
+            }
+        }
+    }
+
+    /// A subagent CHILD keeps exactly the three pi re-injects by path, and pi-intercom is not one of
+    /// them: `runtimeExtensions = [PROMPT_RUNTIME_EXTENSION_PATH, fanout-child when authorized,
+    /// permSystemExt]` (pi-subagents v0.47.1 `src/runs/shared/pi-args.ts:413-417`), emitted as
+    /// `--extension <path>` right after the `--no-extensions` it pairs with (`:556-560`). Dropping
+    /// the permission system here would be a permission gate failing OPEN.
+    #[test]
+    fn a_subagent_child_keeps_exactly_the_natives_pi_re_injects() {
+        let kept = ids(&super::natives_to_load(stubs(), true, true));
+        assert_eq!(
+            kept,
+            vec![
+                "cyrup-permission-system".to_string(),
+                "subagents".to_string(),
+                "subagent-prompt-runtime".to_string(),
+                "an-embedders-own-extension".to_string(),
+            ],
+            "load order preserved, intercom dropped"
+        );
+        assert!(!kept.contains(&"cyrup-intercom".to_string()), "pi re-injects no intercom");
+    }
+
+    /// The exemption is CHILD-only. A root session that happens to have the permission system
+    /// installed still drops it under `--no-extensions`, exactly as pi does — pi only re-adds it
+    /// from the subagent launcher, never from `main.ts`.
+    #[test]
+    fn the_child_exemption_does_not_leak_into_a_root_session() {
+        let one = |id: &str| -> std::sync::Arc<dyn cyrup_ext::NativeExtension> {
+            std::sync::Arc::new(StubNative(cyrup_core::ExtensionId::from(id), true))
+        };
+        for id in super::SUBAGENT_CHILD_RUNTIME_NATIVES {
+            assert!(
+                super::native_survives_no_extensions(&one(id), true),
+                "{id} survives in a child"
+            );
+            assert!(
+                !super::native_survives_no_extensions(&one(id), false),
+                "{id} drops at the root"
+            );
+        }
+        assert!(!super::native_survives_no_extensions(&one("cyrup-intercom"), true));
+    }
 
     /// CFG-010 (dedupe half) — Pi's `dedupePackages` keeps BOTH entries, delta first, when a
     /// PROJECT entry carrying `autoload: false` collides with a USER one for the same package

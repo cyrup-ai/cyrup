@@ -28,6 +28,7 @@ pub use overlay::{
 };
 pub use services::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState,
+    DENIED_EXEC, DENIED_NET, DENIED_UI,
     HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
     HumanInteractionLock, NotifyKind, OAuthEvent, ProcSpawnSpec, RecordingServices, SharedBus,
     UiChrome,

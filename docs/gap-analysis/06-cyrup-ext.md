@@ -12,6 +12,18 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 >
 > Open now: **1 critical · 0 high · 28 medium · 21 low** (50 items). Treat that as a floor, not a total — see `## Coverage`.
 >
+> ### Update 2026-08-13 (sandbox-and-extension-gating pass)
+>
+> **EXT-054 and EXT-055 are FIXED**, so the area has **no open critical**. Recount:
+> **0 critical · 0 high · 27 medium · 22 low** (49 open). The deltas: `EXT-054` (crit) and `EXT-055`
+> (medium) close; `EXT-058` is re-rated medium → low with its DEFECT classification refuted (pi's
+> `--offline` is documented "startup network operations" verbatim, `args.ts:277` @v0.83.0, and pi has
+> no extension network gate at all — see the item); `EXT-059` is filed new (medium,
+> `AgentSession::load_wasm_extension` is still a full-authority manifest-less load). Blind spot 4 /
+> repair-pass note 9 — "nobody has verified the `is_trusted = origin.is_pre_trust() ||
+> project_trusted` gate" — is **still open**: this pass threaded the manifest grant through and
+> enforced it, but did not audit `caps/{http,proc}.rs` for a hole in the trust gate itself.
+>
 > ### Repair pass 2026-08-12 (post-critique)
 >
 > Applied after the completeness critique of the twelve finished area files. Three changes, no new
@@ -98,8 +110,10 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 | EXT-051 | **new this pass** — open (low) | Extension provider OAuth drifted: `refreshToken` gained a signal, `oauth` gained `isSubscription`. Auditor's "grep returns nothing" evidence was **corrected** — the transport exists; the typed field and a consumer do not. |
 | EXT-052 | **new this pass** — open (medium) | An extension-supplied `streamSimple` provider fires neither `before_provider_request` nor `after_provider_response`. Post-baseline drift; the reduction reuses area 01's existing path. |
 | EXT-053 | **new this pass** — open (low) | An extension command shadowing a built-in is dropped from autocomplete with no diagnostic. Surfaced by EXT-S02's closure. |
-| EXT-054 | **new this pass** — open (**critical**, raised from high in the repair pass) | `ExtensionManifest.capabilities` is parsed and never read by any code path — the declared per-extension WASM sandbox grant model is entirely inert. Re-verified at HEAD: `load_wasm` (`facade.rs:1063-1070`) never receives the manifest `load_discovered` (`:1166-1184`) holds. Permission bypass per README:106-107. |
-| EXT-055 | **new this pass** — open (medium) | `FsCaps::with_fs_root` has zero callers, so `ext-fs` is permanently denied for every guest. Fail-closed, and the mirror of EXT-054 — same root cause, opposite failure direction. Fix in the same change. |
+| EXT-054 | **FIXED 2026-08-13** (was **critical**) | `ExtensionManifest.capabilities` is parsed and never read by any code path — the declared per-extension WASM sandbox grant model is entirely inert. Re-verified at HEAD: `load_wasm` (`facade.rs:1063-1070`) never receives the manifest `load_discovered` (`:1166-1184`) holds. Permission bypass per README:106-107. |
+| EXT-055 | **FIXED 2026-08-13** (was medium; fixed with EXT-054, and its `with_fs_root` symbol name was wrong — the mutator is `GuestState::with_fs`) | `FsCaps::with_fs_root` has zero callers, so `ext-fs` is permanently denied for every guest. Fail-closed, and the mirror of EXT-054 — same root cause, opposite failure direction. Fix in the same change. |
+| EXT-058 | **open** (re-rated medium → low 2026-08-13; DEFECT classification refuted — pi's `--offline` is documented "startup network operations" verbatim and pi has no extension network gate) | Guest WASM `http-client` is not gated by `--offline`. |
+| EXT-059 | **new 2026-08-13** — open (medium) | `AgentSession::load_wasm_extension` is a full-authority manifest-less load reachable as public API. Filed from the EXT-054 fix; `session.rs` was outside that pass's ownership. |
 | EXT-056 | **new this pass** — open (low) | `register_tool_renderer` is last-wins while every sibling registration table is first-wins. |
 | EXT-057 | **new this pass** — open (low) | `deliver_bus_events` silently drops queued events at the round bound, and a faulting listener never reaches the `onError` channel. Found inside EXT-034's function. |
 
@@ -110,8 +124,9 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| EXT-054 | **critical** | cyrup-original | M | `ExtensionManifest.capabilities` is never read — the declared per-extension WASM sandbox grant model is entirely inert — **observed 2026-08-13** |
-| EXT-058 | medium | cyrup-original | S | Guest WASM `http-client` is not gated by `--offline` — a guest reaches the network on a host launched offline — **new, observed 2026-08-13** |
+| ~~EXT-054~~ | ~~**critical**~~ | cyrup-original | M | **FIXED 2026-08-13** — `capabilities` now reaches instantiation via `load_wasm_with_caps`; enforced host-side; `tests/manifest_capabilities.rs` (9 tests, 5 RED before) |
+| EXT-059 | medium | cyrup-original | S | `AgentSession::load_wasm_extension` is a full-authority manifest-less load reachable as public API — **new, filed 2026-08-13 from the EXT-054 fix** |
+| EXT-058 | low | product-decision | S | Guest WASM `http-client` is not gated by `--offline` — **classification refuted 2026-08-13**: pi's flag is documented "startup network operations" verbatim (`args.ts:277` @v0.83.0) and pi has no extension network gate at all, so this is parity, not a defect. The control that was missing was EXT-054's `"net": false`, now enforced. Open as a decision |
 | EXT-003 | medium | not-ported | M | Project-trust store is unwired at the extension seam |
 | EXT-006 | medium | parity-bug | L | Renderers run without display options or theme, and only once |
 | EXT-007 | medium | parity-bug | M | The first system prompt is built from built-ins only; guest promptGuidelines are dropped |
@@ -139,7 +154,7 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 | EXT-047 | medium | parity-bug | M | ui.set-widget drops pi's widget key and placement |
 | EXT-049 | medium | upstream-drift | S | ToolCallEventResult.terminate is unrepresentable |
 | EXT-052 | medium | not-ported | M | An extension-supplied streamSimple provider fires neither before_provider_request nor after_provider_response |
-| EXT-055 | medium | cyrup-original | S | FsCaps::with_fs_root has zero callers, so ext-fs is permanently denied for every guest |
+| ~~EXT-055~~ | ~~medium~~ | cyrup-original | S | **FIXED 2026-08-13** with EXT-054 — `ext-fs` now has manifest-derived roots and mode-aware read/write; the SDK gained the `read_file`/`write_file` wrappers it had never had. The title's `FsCaps::with_fs_root` is a symbol that does not exist; the mutator was `GuestState::with_fs` |
 | EXT-016 | low | parity-bug | S | resources_discover carries neither cwd nor reason |
 | EXT-019 | low | not-ported | M | registerMarkdownTransformer has no counterpart (re-scoped to v0.84.1) |
 | EXT-022 | low | not-ported | M | ProviderConfig.refreshModels is not represented (re-scoped to the publish/persist contract) |
@@ -166,6 +181,40 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 ## EXT-054 — `ExtensionManifest.capabilities` is never read by any code path — the declared per-extension WASM sandbox grant model is entirely inert
 
 **Kind** cyrup-original · **Severity** critical · **Effort** M · **Confidence** **confirmed — the mis-grant reproduced end to end with a real WASM guest** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **FIXED 2026-08-13.** `load_discovered` (`facade.rs:1223`) now calls
+> `self.load_wasm_with_caps(id.clone(), &bytes, services, &disc.manifest.capabilities)` — the new
+> capped entry point (`facade.rs:1094-1116`) — which parses the `fs` grants and seeds the guest via
+> `GuestState::with_capabilities` (`host/services.rs:1288-1305`) BEFORE `init` runs. `load_wasm`
+> keeps its old three-argument signature and delegates with `Capabilities::host_granted()`
+> (`manifest.rs:63-72`): it is the manifest-LESS host-internal entry, so it is not narrowed by a
+> manifest it was never given, and none of the ~30 existing `load_wasm` call sites changed.
+> Enforcement is host-side at the import boundary — `exec_guest_of` / `net_guest_of` /
+> `ui_guest_of` (`host/live.rs:53-88`) gate `exec.run`, all six `proc.*`, all four
+> `http-client.*` and all 22 `ui.*` imports; `ext-fs` is gated by `FsCaps` having no root
+> (EXT-055). Grants cross as DATA and the guest gets no import that reads or changes them, per
+> ADR-0002's batch-17 instruction. A malformed grant now FAILS the load (`ExtError::Capability`)
+> rather than being dropped. Deny-by-default held: both `loader.rs` synthesis sites are now the
+> explicit `Capabilities::none()` (`:213`, `:264`).
+>
+> **Evidence** — new `crates/cyrup-ext/tests/manifest_capabilities.rs`, 9 tests, driven through the
+> real `discover_and_load` path with the real `wasm32-wasip2` SDK component and asserted at the
+> `HostServices` BOUNDARY (a denied guest produces zero `exec_calls`/`http_requests`, not merely an
+> error string it printed itself). RED before / GREEN after was measured by reverting the single
+> `load_discovered` line to `self.load_wasm(id.clone(), &bytes, services)`:
+> `test result: FAILED. 4 passed; 5 failed` → `test result: ok. 9 passed; 0 failed`. The five that
+> flip are `exec_is_refused_when_the_manifest_denies_it`,
+> `net_is_refused_when_the_manifest_denies_it`, `ui_effects_are_dropped_when_the_manifest_denies_ui`,
+> `fs_grants_are_scoped_by_mode_and_by_subtree` and `a_malformed_fs_grant_fails_the_load`.
+>
+> Whole-crate gate after the change, pasted verbatim from the run:
+> `cargo test -p cyrup-ext -p cyrup-ext-sdk --all-features` → **33 targets, 271 passed, 0 failed,
+> 1 ignored, exit 0**.
+>
+> **Wording corrected on this item** (as the assignment instructed): `FsCaps::with_fs_root` does not
+> exist and never did — `rg with_fs_root crates` returns zero. The mutator was `GuestState::with_fs`
+> (`host/services.rs:1263`), which had zero callers. Both the Fix text below and EXT-055 said
+> `with_fs_root`; batch 3's lint spec inherits the same wrong name and should be corrected there too.
 
 > **Reproduced 2026-08-13, and the result is stronger than this item claims.** `wasm32-wasip2` was
 > already installed; `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` finished in **0.10 s** and
@@ -201,13 +250,13 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 > blast radius today is not the class of the defect: the grant model is the control a reviewer reads
 > to decide an extension is safe to install, and it is inert.
 
-**cyrup** — `grep -rn capabilities crates/cyrup-ext/src --include='*.rs'` at HEAD returns only *producers* and prose: the struct field (`crates/cyrup-ext/src/manifest.rs:20`), the `Capabilities { fs: Vec<String>, exec: bool, net: bool, ui: bool }` definition (`:23-35`), two `capabilities: Default::default()` synthesis sites in the loader (`crates/cyrup-ext/src/loader.rs:213`, `:259`), and doc comments. **There is no consumer anywhere.** `ExtensionHost::load_discovered` (`crates/cyrup-ext/src/facade.rs:1166-1182`) reads `disc.manifest.check_world(HOST_WORLD)?` and `disc.is_trusted(project_trusted)` and then calls `self.load_wasm(id.clone(), &bytes, services)`; `load_wasm` (`facade.rs:1063-1103`) takes only `(id, bytes, services)` and never sees the manifest, so the capability declaration is dropped on the floor at the one place it could be applied. `capabilities.{exec,net,ui}` therefore narrow nothing: a guest whose `extension.json` declares `{"exec": false, "net": false, "ui": false}` still reaches `exec.run`, `http-client`, `proc` and every `ui.*` import, gated solely by the coarse load-time trust check `origin.is_pre_trust() || project_trusted` (`crates/cyrup-ext/src/loader.rs:56-59`). This contradicts the crate's own documented control in three places: `manifest.rs:2` ("Declares the capabilities a guest requests (granted subject to trust, arch-07/12)"), `crates/cyrup-ext/src/host/store_state.rs:1-3` and `:20-22` ("capability-scoped — NO ambient fs/net unless granted, R-ARCH-EXT-011" / "only explicitly preopened dirs (granted via the manifest, arch-12) are visible"), and ADR-0002.
+**cyrup** — `grep -rn capabilities crates/cyrup-ext/src --include='*.rs'` at HEAD returns only *producers* and prose: the struct field (`crates/cyrup-ext/src/manifest.rs:20`), the `Capabilities { fs: Vec<String>, exec: bool, net: bool, ui: bool }` definition (`:23-35`), two `capabilities: Default::default()` synthesis sites in the loader (`crates/cyrup-ext/src/loader.rs:213`, `:259`), and doc comments. **There is no consumer anywhere.** `ExtensionHost::load_discovered` (`crates/cyrup-ext/src/facade.rs:1166-1182`) reads `disc.manifest.check_world(HOST_WORLD)?` and `disc.is_trusted(project_trusted)` and then calls `self.load_wasm(id.clone(), &bytes, services)`; `load_wasm` (`facade.rs:1063-1103`) takes only `(id, bytes, services)` and never sees the manifest, so the capability declaration is dropped on the floor at the one place it could be applied. `capabilities.{exec,net,ui}` therefore narrow nothing: a guest whose `extension.json` declares `{"exec": false, "net": false, "ui": false}` still reaches `exec.run`, `http-client`, `proc` and every `ui.*` import, gated solely by the coarse load-time trust check `origin.is_pre_trust() || project_trusted` (`crates/cyrup-ext/src/loader.rs:56-59`). This contradicts the crate's own documented control in three places: `manifest.rs:2` ("Declares the capabilities a guest requests (granted subject to trust, arch-07/12)"), `crates/cyrup-ext/src/host/store_state.rs:1-3` and `:20-22` ("capability-scoped — NO ambient fs/net unless granted, R-ARCH-EXT-011" / "only explicitly preopened dirs (granted via the manifest, arch-12) are visible"). **The third citation, ADR-0002, is withdrawn 2026-08-13**: that ADR is about encoding (values, not references) and makes no claim about capability scoping — its own Consequences section says so and asks for this re-pointing (`ADR-0002-extension-io-is-serde.md:252-255`, new-work item 3). The `store_state.rs:20-22` claim was ALSO wrong on its own terms and has been corrected in the source: there are no WASI preopens at all, and `capabilities.fs` feeds `FsCaps`/`ext-fs`, not preopens.
 
 **upstream** — none, and that is the point: pi has no capability model at all (every TypeScript extension runs with the whole process's authority, `pi/packages/coding-agent/src/core/extensions/loader.ts` @v0.83.0). This is a divergence from **cyrup's own** security design rather than a pi parity gap, which is precisely why a pi-anchored, item-driven sweep cannot see it (README structural blind spot 1).
 
 **Impact** — the sandbox cyrup advertises does not exist. Every loaded WASM guest gets the full host surface regardless of what it declared, and the declaration is the thing a reviewer would read to decide whether an extension is safe to install. The trust gate that *is* enforced is all-or-nothing and directory-scoped, so "trusted enough to run" silently means "trusted with process execution, network and the filesystem". **Blast radius today (corrected 2026-08-13 from a live run):** no *third-party* guest ships, **but the in-tree SDK example is itself a loadable guest that demonstrates the mis-grant end to end** — `crates/cyrup-ext-sdk/src/example.rs` ships `/execdemo` and `/httpdemo`, `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` produces the component in 0.10 s, and `-e <dir>` loads it pre-trusted. Measured: an all-false manifest still reached a real host process and a real TLS round trip. `wasm-host` is default-on and `load_discovered` is a live path, so the first installed guest is mis-granted on arrival and the mis-grant is invisible because the manifest says otherwise. Schedule it **before** the first third-party component, not after. **`--offline` is not a second line of defence** — the `net` bypass reproduces with `--offline` set on the host (**EXT-058**).
 
-**Fix** — thread the manifest into instantiation: change `load_wasm` (`facade.rs:1063-1103`) to take `&ExtensionManifest` (or a resolved `Capabilities`) and have `load_discovered` (`facade.rs:1166-1182`) pass `disc.manifest`. In `GuestState` construction (`crates/cyrup-ext/src/host/services.rs:1181` region) seed `ProcCaps`/`HttpCaps`/`FsCaps` from the grant rather than from `Default`, and make the `exec`/`net`/`ui` host imports in `crates/cyrup-ext/src/host/live.rs` return a typed denial when the corresponding bit is false. The `fs` grant strings (`manifest.rs:26-28`, e.g. `"read:."`, `"write:.cyrup/todo"`) need a parser and must feed `FsCaps::with_fs_root` — which is EXT-055 and should be done in the same change. Deny-by-default: an absent `capabilities` block grants nothing, and the loader's two `Default::default()` synthesis sites (`loader.rs:213`, `:259`) must therefore stay the empty grant, not a permissive one.
+**Fix** — thread the manifest into instantiation: change `load_wasm` (`facade.rs:1063-1103`) to take `&ExtensionManifest` (or a resolved `Capabilities`) and have `load_discovered` (`facade.rs:1166-1182`) pass `disc.manifest`. In `GuestState` construction (`crates/cyrup-ext/src/host/services.rs:1181` region) seed `ProcCaps`/`HttpCaps`/`FsCaps` from the grant rather than from `Default`, and make the `exec`/`net`/`ui` host imports in `crates/cyrup-ext/src/host/live.rs` return a typed denial when the corresponding bit is false. The `fs` grant strings (`manifest.rs:26-28`, e.g. `"read:."`, `"write:.cyrup/todo"`) need a parser and must feed the `FsCaps` mutator — **`GuestState::with_fs` (`services.rs:1263`), NOT `FsCaps::with_fs_root`, which does not exist** — which is EXT-055 and should be done in the same change. Deny-by-default: an absent `capabilities` block grants nothing, and the loader's two `Default::default()` synthesis sites (`loader.rs:213`, `:259`) must therefore stay the empty grant, not a permissive one.
 
 **Verify** — load two fixture components in one process, one declaring `{"exec": true}` and one declaring `{"exec": false}`; assert the first's `exec.run` succeeds and the second's returns a capability-denied error rather than running. Repeat for `net` against `http-client` and for a `fs` grant that permits one directory and refuses its sibling. **Added 2026-08-13:** include the `--offline` case — a guest declaring `{"net": false}` on a host launched `--offline` must not reach the network, which today it does (**EXT-058**). The regression fixture already exists: build `cyrup-ext-sdk` for `wasm32-wasip2` and load it with `-e`. Add to `crates/cyrup-ext/tests/wasm_component.rs` and a new `tests/manifest_capabilities.rs`.
 
@@ -597,6 +646,28 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 
 **Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** high
 
+> **FIXED 2026-08-13, and the title's symbol name is wrong** — `FsCaps::with_fs_root` has never
+> existed (`rg with_fs_root crates` → zero). The zero-caller mutator was `GuestState::with_fs`
+> (`host/services.rs:1263`). Title kept verbatim per the no-renaming rule; read it as `with_fs`.
+>
+> Fixed in the same change as EXT-054, and the gap was WIDER than filed: `ext-fs` had no host root
+> *and* no guest-side surface at all — `crates/cyrup-ext-sdk` had no `read_file`/`write_file`
+> wrapper, so no guest could have called the interface even with a root. Both halves closed.
+> `FsCaps` is now multi-root and mode-aware (`host/services.rs:957-1035`): `from_grants(base,
+> grants)` resolves each `read:`/`write:` grant under `HostConfig.cwd`, `resolve`/`resolve_write`
+> split the two modes so a `read:` grant no longer authorizes a write, and the empty-grant refusal
+> names the manifest key (`"declares no capabilities.fs entry (e.g. \"read:.\" or
+> \"write:.cyrup/todo\")"`). SDK: `Ctx::read_file`/`Ctx::write_file` (`cyrup-ext-sdk/src/ctx.rs:288-320`)
+> plus `/fsread` + `/fswrite` demo commands in the reference guest (`example.rs:458-494`), the fs
+> analog of the existing `/execdemo` + `/httpdemo`.
+>
+> **Evidence** — `crates/cyrup-ext/tests/manifest_capabilities.rs`:
+> `fs_is_refused_when_no_grant_is_declared`, `fs_grants_are_scoped_by_mode_and_by_subtree` (a
+> `["read:.", "write:.cyrup/todo"]` guest reads a project file, writes into `.cyrup/todo`, is
+> REFUSED a write to a `read:`-only path, and is refused a `..` escape) and
+> `a_malformed_fs_grant_fails_the_load`. `fs_grants_are_scoped_by_mode_and_by_subtree` is RED before
+> the fix (measured) and GREEN after.
+
 **cyrup** — `GuestState.fs` is initialized `fs: FsCaps::default()` (`crates/cyrup-ext/src/host/services.rs:1181`), and `FsCaps { root: Option<PathBuf> }` documents `None => all fs access denied` (`:958-962`); `FsCaps::resolve` opens with `let root = self.root.as_ref().ok_or("filesystem capability not granted")?;` (`:967-969`). The only mutator — `self.fs = FsCaps { root: Some(root) };` (`services.rs:1211`) — has **zero callers** workspace-wide; the only grep hit is its own definition. Therefore `ext-fs.read-file` and `ext-fs.write-file` (`crates/cyrup-ext/wit/world.wit:462-466`, host impls `crates/cyrup-ext/src/host/live.rs:625-635`, both of which call `guest.fs.resolve(&path)?` first) return `Err("filesystem capability not granted")` for every extension ever loaded.
 
 **upstream** — none; pi has no capability model. Like EXT-054 this is a cyrup-original invariant that does not hold, and shares its root cause: the manifest's `fs: ["read:.", "write:.cyrup/todo"]` grant syntax (`crates/cyrup-ext/src/manifest.rs:26-28`) has no code that could ever honour it.
@@ -915,9 +986,51 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 
 **Verify** — a guest calling `compact_with` against a session where compaction fails; assert the guest observes the failure rather than waiting forever for a `session_compact` that never arrives.
 
+## EXT-059 — `AgentSession::load_wasm_extension` is a full-authority, manifest-less load reachable as public API
+
+**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** confirmed · **filed 2026-08-13 from the EXT-054 fix**
+
+**cyrup** — EXT-054 closed the DISCOVERY path: `load_discovered` (`facade.rs:1223`) now passes `disc.manifest.capabilities` to `load_wasm_with_caps`, so every extension that arrives from disk is capped by its own `extension.json`. `ExtensionHost::load_wasm` (`facade.rs:1078-1092`) deliberately keeps its three-argument signature as the host's OWN manifest-less entry point and applies `Capabilities::host_granted()` (`exec`/`net`/`ui` on, `fs` empty) — correct for a caller that is the host and has already decided, and it is why ~30 existing call sites did not have to change. But that entry point is re-exported one level up as `AgentSession::load_wasm_extension(id, bytes)` (`crates/cyrup-session-svc/src/session.rs:3956-3962`, `Ok(self.services.ext_host.load_wasm(id, bytes, services).await?)`), which is `pub` on the session type and takes RAW BYTES with no manifest — so any embedder holding an `AgentSession` can instantiate a component at full interactive authority with nothing to declare and nothing to review. Today its only callers are tests (`grep` at HEAD: eight `crates/cyrup-session-svc/tests/wasm_*.rs` files, no production caller).
+
+**upstream** — no analog: pi has no capability model at all, and no byte-level extension load — `loadExtensions` takes PATHS (`extensions/loader.ts` @v0.83.0). This is a cyrup-original surface, so the question is what cyrup's own invariant should be, exactly as EXT-054 was.
+
+**Impact** — narrow today (no production caller), but it is the second half of the door EXT-054 closed. An embedder who reads `manifest.rs`'s "capabilities a guest requests (granted subject to trust)" reasonably believes every guest is capped; this path caps none. Fail-open by construction, and unlike EXT-054 it cannot be reproduced through the binary, so it will not resurface in a live pass.
+
+**Fix** — give `AgentSession::load_wasm_extension` a manifest (or a `Capabilities`) parameter and route it to `ExtensionHost::load_wasm_with_caps`; the eight test call sites are the only churn. If a byte-level unrestricted load must remain, rename it to say so (`load_wasm_extension_unrestricted`) so the authority is in the name rather than in a doc comment. **Not done in the EXT-054 pass: `crates/cyrup-session-svc/src/session.rs` and `crates/cyrup-session-svc/tests/**` were outside that pass's file ownership.**
+
+**Verify** — the EXT-054 fixture, loaded through `AgentSession::load_wasm_extension` with an all-false declaration, must refuse `exec`/`net` the same way `crates/cyrup-ext/tests/manifest_capabilities.rs::exec_is_refused_when_the_manifest_denies_it` does through the discovery path. `the_manifest_less_load_keeps_the_host_grant` in that same file pins the CURRENT behaviour and must be updated, not deleted, when this lands.
+
 ## EXT-058 — Guest WASM `http-client` is not gated by `--offline`
 
 **Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** **confirmed — reproduced with a real WASM guest on an `--offline` host** · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md))
+
+> **INVESTIGATED 2026-08-13 — code claim HOLDS, defect classification REFUTED. Do not "fix" this by
+> wiring `--offline` into the guest gate.** The observation is exact: no code path connects the
+> offline flag to the `http-client` imports (`grep -rn offline crates/cyrup-ext/src` → zero hits at
+> HEAD). But the item's premise — that this diverges from what the flag promises — does not survive
+> reading upstream. pi's own flag is documented, verbatim and to the character, as
+> **"Disable startup network operations (same as PI_OFFLINE=1)"** (`packages/coding-agent/src/cli/args.ts:277`
+> @v0.83.0), and cyrup's help text is the identical sentence with `CYRUP_OFFLINE` substituted
+> (`crates/cyrup/src/cli.rs:936`). pi has NO extension network gate of any kind — its extensions run
+> in-process with the host's whole authority (`extensions/loader.ts` @v0.83.0) — so an extension
+> reaching the network on a `pi --offline` host is upstream's behaviour, not cyrup's divergence.
+> `cyrup-config/src/policy.rs:53-62` already records the same finding for the model-catalog fetch
+> ("upstream's only control is the offline switch", DRIFT-007). The Fix's own second branch — "if it
+> is genuinely startup-only, say so in the flag's help text" — is therefore already satisfied,
+> verbatim, and has been since the flag was written.
+>
+> **The control the operator actually lacked was EXT-054's, and it now exists.** An operator who
+> wants a guest kept off the network declares `"net": false` in its `extension.json`, which as of
+> today's fix is enforced host-side at the `http-client` import boundary
+> (`crates/cyrup-ext/tests/manifest_capabilities.rs::net_is_refused_when_the_manifest_denies_it`).
+> That is a per-extension, reviewable, deny-by-default control, which is strictly better than a
+> process-wide flag for this purpose. Adding an offline intersection on top would be a
+> cyrup-original divergence from pi's documented flag scope, and would silently break a guest
+> legitimately using a LAN/localhost endpoint on a host started `--offline` — so it is not being
+> added without a written decision. **Re-rated `medium` → `low`, kind `cyrup-original` →
+> documentation/hardening, and left OPEN as a product decision rather than a repair.** Whoever picks
+> it up owns the decision, not the code: the code is one `ExtensionHost::set_offline` setter away in
+> either direction.
 
 > **Filed 2026-08-13 from the `EXT-054` repro run.** Adjacent to `EXT-054` but **not covered by it**:
 > `EXT-054` is about the manifest grant being inert, this is about the *second* control — the host's

@@ -14,7 +14,7 @@ use crate::loader::{DiscoveredExtension, DiscoveryRoots};
 #[cfg(feature = "wasm-host")]
 use crate::loader::{LoadError, LoadExtensionsResult};
 #[cfg(feature = "wasm-host")]
-use crate::manifest::HOST_WORLD;
+use crate::manifest::{Capabilities, HOST_WORLD};
 use crate::native::{ExtMode, HostCtx, InitApi, NativeExtension, NativeHandle};
 use crate::registry::ExtensionRegistry;
 use crate::subscriber::ExtSubscriber;
@@ -1059,6 +1059,25 @@ impl ExtensionHost {
     /// subscriptions), and wire the live instance into the dispatcher in load order. The `services`
     /// backend supplies interactive capabilities (default: [`crate::host::DenyServices`] = deny-all).
     /// Returns the live handle so callers can observe its host-side effects.
+    ///
+    /// # Capabilities (EXT-054)
+    ///
+    /// This is the MANIFEST-LESS entry point: the caller is the host itself and has already made
+    /// the decision an `extension.json` would express, so the grant applied is
+    /// [`Capabilities::host_granted`] — `exec`/`net`/`ui` on, `fs` still empty (`ext-fs` has no
+    /// root to resolve against without a declared grant). A DISCOVERED extension never comes
+    /// through here: [`Self::load_discovered`] resolves its manifest and calls
+    /// [`Self::load_wasm_with_caps`], so `capabilities.{fs,exec,net,ui}` really do narrow it.
+    ///
+    /// The full grant is what PARITY requires of an embedder-supplied extension, not merely what
+    /// cyrup happens to do. Pi's embedder seam is `loadExtensionFromFactory`
+    /// (`packages/coding-agent/src/core/extensions/loader.ts:485-498` @v0.83.0) and
+    /// `DefaultResourceLoader`'s `extensionFactories` / `additionalExtensionPaths`
+    /// (`examples/sdk/06-extensions.ts` @v0.83.0): both build the extension straight from the
+    /// caller's own code and hand it the complete `ExtensionAPI` — Pi has no capability model at
+    /// all, so an embedder-supplied extension is unconditionally total. An embedder that wants LESS
+    /// than that is asking for something Pi cannot express, and [`Self::load_wasm_with_caps`] is
+    /// the seam for it; narrowing THIS function would diverge from Pi and silently break callers.
     #[cfg(feature = "wasm-host")]
     pub async fn load_wasm(
         &self,
@@ -1066,7 +1085,31 @@ impl ExtensionHost {
         bytes: &[u8],
         services: Arc<dyn crate::host::HostServices>,
     ) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
+        self.load_wasm_with_caps(id, bytes, services, &Capabilities::host_granted()).await
+    }
+
+    /// [`Self::load_wasm`] under an explicit capability grant — the seam EXT-054 was missing.
+    ///
+    /// The grant crosses into instantiation as **data** (`GuestState::with_capabilities`) and is
+    /// enforced **host-side** at the import boundary in `crates/cyrup-ext/src/host/live.rs`; the
+    /// guest is handed no reference to it and no import that could change it. That split is
+    /// ADR-0002's batch-17 instruction, and it is why a session that injects a fully-capable
+    /// `LiveHostServices` still cannot let a `{"exec": false}` guest run a process.
+    ///
+    /// `capabilities.fs` roots resolve against [`HostConfig::cwd`] — the project the host is
+    /// running in — so the manifest's own example `["read:.", "write:.cyrup/todo"]` means what it
+    /// reads as. A malformed grant fails the load ([`ExtError::Capability`]) instead of being
+    /// dropped.
+    #[cfg(feature = "wasm-host")]
+    pub async fn load_wasm_with_caps(
+        &self,
+        id: ExtensionId,
+        bytes: &[u8],
+        services: Arc<dyn crate::host::HostServices>,
+        caps: &Capabilities,
+    ) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
         let wasm = self.wasm.as_ref().ok_or(ExtError::WasmHostDisabled)?;
+        let fs_grants = caps.parse_fs_grants()?;
         self.reserve_id(&id)?;
         let guest = Arc::new(
             crate::host::GuestState::with_services(id.clone(), self.registry.clone(), services)
@@ -1074,6 +1117,10 @@ impl ExtensionHost {
                 // `bus.subscribe`/`bus.emit` reach other guests (Pi's single shared EventBus,
                 // gap-08 §5.3).
                 .with_bus(self.bus.clone())
+                // EXT-054: the declared grant, seeded BEFORE `init` so the guest's very first call
+                // — `init` itself registers tools and can already reach `ui`/`exec` — runs under
+                // the restriction its manifest declared.
+                .with_capabilities(caps.clone(), &fs_grants, &self.config.cwd)
                 // Pi `ctx.mode` / `ctx.hasUI` (extensions/types.ts:311,313) are host configuration,
                 // not session state: copy them in from the SAME [`HostConfig`] the native path
                 // hands to `HostCtx::event`/`::command` above, so a WASM guest's `ctx.mode()` and a
@@ -1122,6 +1169,16 @@ impl ExtensionHost {
         crate::loader::discover(roots)
     }
 
+    /// [`Self::discover`], additionally returning the non-fatal diagnostics the scan produced (an
+    /// `extension.json` that exists but does not parse). [`Self::discover_and_load`] folds these
+    /// into its `errors` for you; call this directly only when discovering without loading.
+    pub fn discover_with_diagnostics(
+        &self,
+        roots: &DiscoveryRoots,
+    ) -> (Vec<DiscoveredExtension>, Vec<LoadError>) {
+        crate::loader::discover_with_diagnostics(roots)
+    }
+
     /// Discover + load every eligible extension across the three roots, returning a
     /// [`LoadExtensionsResult`] of loaded ids + per-path errors (Pi `LoadExtensionsResult`). The
     /// trust split (R-08-002) is applied: global + configured (CLI) extensions are pre-trust;
@@ -1136,7 +1193,15 @@ impl ExtensionHost {
         services: Arc<dyn crate::host::HostServices>,
     ) -> LoadExtensionsResult {
         let mut result = LoadExtensionsResult::default();
-        for disc in self.discover(roots) {
+        // A directory whose `extension.json` exists but does not parse still loads under the
+        // manifest-less rule (Pi's `readPiManifest` -> `null` -> `index.ts` fall-through,
+        // `loader.ts:568-579,594-624` @v0.83.0), but at a DIFFERENT id and with
+        // `Capabilities::none()`. Pi's manifest carries neither, so it can afford to say nothing;
+        // cyrup's does, so the operator is told — non-fatally, since Pi does not abort the startup.
+        // Reported FIRST: it is the cause of whatever the load loop then reports about that id.
+        let (discovered, manifest_diags) = self.discover_with_diagnostics(roots);
+        result.errors.extend(manifest_diags);
+        for disc in discovered {
             match self.load_discovered(&disc, project_trusted, services.clone()).await {
                 Ok(id) => result.loaded.push(id),
                 Err(e) => result.errors.push(LoadError {
@@ -1178,7 +1243,12 @@ impl ExtensionHost {
         }
         let bytes = crate::loader::resolve_component_bytes(disc)?;
         let id = disc.id();
-        self.load_wasm(id.clone(), &bytes, services).await?;
+        // EXT-054: the manifest this function has been holding all along now reaches instantiation.
+        // Before this line the call was `self.load_wasm(id.clone(), &bytes, services)` — a signature
+        // with no manifest parameter — so `disc.manifest.capabilities` was parsed and dropped, and a
+        // guest declaring `{"fs": [], "exec": false, "net": false, "ui": false}` received the full
+        // host surface (reproduced live: `REPRO-LOG.md`, "EXT-054 — CONFIRMED").
+        self.load_wasm_with_caps(id.clone(), &bytes, services, &disc.manifest.capabilities).await?;
         Ok(id)
     }
 

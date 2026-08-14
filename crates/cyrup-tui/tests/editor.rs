@@ -561,3 +561,271 @@ fn cursor_at_end_of_wrapped_line_renders_on_second_row() {
     let (_, cy) = ed.cursor_in(Rect::new(0, 0, 14, 8)).unwrap();
     assert_eq!(cy, 2, "hardware cursor not on the second visual row:\n{rows:#?}");
 }
+
+// ---- paste-registry invariants: undo, word atomicity, marker grammar -----------------------
+//
+// TUI-042 / TUI-043 / TUI-044 / TUI-048 / TUI-049 / TUI-053, all reproduced live on 2026-08-13
+// (docs/gap-analysis/REPRO-LOG.md) with the model's actual input read out of the session JSONL.
+
+/// A single-line paste over 1000 chars — `[paste #N 1500 chars]` (`editor.ts:1206-1210`).
+fn big_paste(n: usize, fill: char) -> String {
+    std::iter::repeat_n(fill, n).collect()
+}
+
+#[test]
+fn undo_restores_the_paste_registry_not_just_the_marker_text() {
+    // TUI-042 (critical). RED before the fix: the marker text came back and `expanded_text()` — the
+    // string `E::Submit` hands the agent — was the literal 21 characters `[paste #1 1500 chars]`,
+    // because `Snapshot` carried no registry. pi snapshots `{ state, pastes, pasteCounter }`
+    // (`editor.ts:216-220`, `:2012-2014`) and restores all three (`:2016-2030`).
+    let mut ed = InputEditor::new();
+    let big = big_paste(1500, 'z');
+    ed.handle_paste(&big);
+    assert_eq!(ed.text(), "[paste #1 1500 chars]");
+    // One Backspace: the marker is atomic, so it vanishes whole and takes its registry entry.
+    ed.handle_key(&key(KeyCode::Backspace));
+    assert_eq!(ed.text(), "");
+    // Undo. The marker is back on screen AND resolvable again.
+    ed.handle_key(&ctrl('-'));
+    assert_eq!(ed.text(), "[paste #1 1500 chars]");
+    assert_eq!(ed.expanded_text(), big, "undo restored the marker text but not its content");
+    assert_eq!(ed.expanded_text().chars().count(), 1500);
+}
+
+#[test]
+fn undo_rolls_back_the_paste_counter_so_the_next_paste_is_still_marker_one() {
+    // TUI-042's quieter variant, also reproduced live: cyrup re-issued `#2` where pi re-issues `#1`,
+    // because `paste_counter` was bumped *before* the undo snapshot was pushed and never rolled back.
+    let mut ed = InputEditor::new();
+    ed.handle_paste(&big_paste(1200, 'a'));
+    assert_eq!(ed.text(), "[paste #1 1200 chars]");
+    ed.handle_key(&ctrl('-'));
+    assert_eq!(ed.text(), "", "undo must remove the pasted marker entirely");
+    let second = big_paste(1300, 'b');
+    ed.handle_paste(&second);
+    assert_eq!(ed.text(), "[paste #1 1300 chars]", "the undone id must be re-issued, not skipped");
+    assert_eq!(ed.expanded_text(), second);
+}
+
+#[test]
+fn undo_restores_the_snapshot_cursor_column() {
+    // TUI-044, the item's own scenario, confirmed live by two readouts. `undo()` used to keep the
+    // LIVE column and merely clamp it, so the next keystroke edited a position the user never chose.
+    // pi's `Object.assign(this.state, snapshot.state)` restores both coordinates (`editor.ts:2019`,
+    // `EditorState` at `:209-213`).
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "world");
+    ed.handle_key(&ctrl('u')); // kill ring ← "world", buffer empty
+    type_str(&mut ed, "hello");
+    assert_eq!(ed.cursor(), (0, 5));
+    ed.handle_key(&ctrl('y')); // yank → "helloworld" (snapshot taken at col 5)
+    assert_eq!(ed.text(), "helloworld");
+    for _ in 0..8 {
+        ed.handle_key(&key(KeyCode::Left));
+    }
+    assert_eq!(ed.cursor(), (0, 2));
+    ed.handle_key(&ctrl('-'));
+    assert_eq!(ed.text(), "hello");
+    assert_eq!(ed.cursor(), (0, 5), "undo must restore the snapshot's column, not clamp the live one");
+    // …and the very next keystroke therefore lands where pi puts it.
+    type_str(&mut ed, "Z");
+    assert_eq!(ed.text(), "helloZ");
+}
+
+#[test]
+fn ctrl_w_at_a_marker_end_deletes_the_whole_marker() {
+    // TUI-043 (critical). RED before the fix: exactly one character — the closing `]` — was deleted,
+    // the marker stopped matching, and Enter sent the 20/21-char fragment to the model. pi's
+    // `findWordBackward` skips one atomic segment whole (`word-navigation.ts:44-46`), and
+    // `deleteWordBackwards` inherits that by computing its range from `moveWordBackwards`
+    // (`editor.ts:1613-1616`).
+    let mut ed = InputEditor::new();
+    let big = big_paste(1500, 'q');
+    ed.handle_paste(&big);
+    ed.handle_key(&ctrl('w'));
+    assert_eq!(ed.text(), "", "Ctrl+W must take the whole marker, not just its ']'");
+    assert_eq!(ed.kill_ring_top(), Some("[paste #1 1500 chars]"));
+    assert_eq!(ed.expanded_text(), "");
+    // Upstream's `deleteWordBackwards` has NO paste branch — it slices text and leaves the registry
+    // alone (`editor.ts:1607-1630`), so the undo snapshot still resolves the marker.
+    ed.handle_key(&ctrl('-'));
+    assert_eq!(ed.expanded_text(), big);
+}
+
+#[test]
+fn alt_d_at_a_marker_start_deletes_the_whole_marker() {
+    // The mirror of the above: `findWordForward`'s atomic branch (`word-navigation.ts:97-99`).
+    let mut ed = InputEditor::new();
+    ed.handle_paste(&big_paste(1500, 'w'));
+    ed.handle_key(&KeyCode::Home.into());
+    ed.handle_key(&alt(KeyCode::Char('d')));
+    assert_eq!(ed.text(), "", "Alt+D must take the whole marker, not just its '['");
+}
+
+#[test]
+fn word_motion_treats_a_paste_marker_as_one_unit() {
+    // TUI-043's cursor half: measured live, Alt+Left from the marker's end (col 20) landed at col 19
+    // — inside the marker, where the next keystroke corrupts it. pi lands at col 0.
+    let mut ed = InputEditor::new();
+    ed.handle_paste(&big_paste(1500, 'e'));
+    assert_eq!(ed.cursor(), (0, 21));
+    ed.handle_key(&alt(KeyCode::Left));
+    assert_eq!(ed.cursor(), (0, 0), "word-left must clear the whole marker");
+    ed.handle_key(&alt(KeyCode::Right));
+    assert_eq!(ed.cursor(), (0, 21), "word-right must clear the whole marker");
+}
+
+#[test]
+fn arrow_keys_step_over_a_paste_marker_as_one_grapheme() {
+    // pi's `moveCursor` steps by `this.segment(text, "grapheme")`, which merges markers
+    // (`editor.ts:1808-1830`), so the caret can never be parked inside one. cyrup used plain
+    // grapheme boundaries, so Left from the end landed on the `]`.
+    let mut ed = InputEditor::new();
+    ed.handle_paste(&big_paste(1500, 'r'));
+    ed.handle_key(&key(KeyCode::Left));
+    assert_eq!(ed.cursor(), (0, 0));
+    ed.handle_key(&key(KeyCode::Right));
+    assert_eq!(ed.cursor(), (0, 21));
+}
+
+#[test]
+fn a_hand_typed_marker_shaped_string_is_not_expanded() {
+    // TUI-049: `marker_at` accepted any body between `[paste #N ` and `]`, so text the user typed was
+    // silently replaced by unrelated content in the message the model received. pi's grammar is
+    // `/^\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]$/` (`editor.ts:24`).
+    let mut ed = InputEditor::new();
+    let big = big_paste(1500, 'm');
+    ed.handle_paste(&big);
+    newline(&mut ed);
+    type_str(&mut ed, "[paste #1 see above]");
+    let expanded = ed.expanded_text();
+    assert!(expanded.starts_with(&big), "the REAL marker must still expand");
+    assert!(
+        expanded.ends_with("\n[paste #1 see above]"),
+        "a hand-typed marker must survive verbatim: {:?}",
+        &expanded[expanded.len().saturating_sub(40)..]
+    );
+    // The bare form pi's regex does allow is still a marker.
+    ed.clear();
+    ed.handle_paste(&big);
+    ed.handle_key(&ctrl('u'));
+    type_str(&mut ed, "[paste #1]");
+    assert_eq!(ed.expanded_text(), big, "`[paste #N]` is a legal marker upstream");
+}
+
+#[test]
+fn deleting_a_marker_renumbers_the_pastes_that_follow_it() {
+    // `handleBackspace`'s paste branch (`editor.ts:1293-1315`): drop the entry, decrement the
+    // counter, shift the higher ids down and renumber the markers in the buffer. cyrup did only
+    // `pastes.remove(&id)`, so ids drifted from pi's for the life of the session.
+    let mut ed = InputEditor::new();
+    let first = big_paste(1200, 'x');
+    let second = big_paste(1300, 'y');
+    ed.handle_paste(&first);
+    ed.handle_paste(&second);
+    assert_eq!(ed.text(), "[paste #1 1200 chars][paste #2 1300 chars]");
+    // Caret just past the FIRST marker, then Backspace.
+    ed.handle_key(&KeyCode::Home.into());
+    ed.handle_key(&key(KeyCode::Right));
+    assert_eq!(ed.cursor(), (0, 21));
+    ed.handle_key(&key(KeyCode::Backspace));
+    assert_eq!(ed.text(), "[paste #1 1300 chars]", "the survivor must be renumbered to #1");
+    assert_eq!(ed.expanded_text(), second, "…and its content must follow the renumbering");
+}
+
+#[test]
+fn browsing_history_away_from_a_draft_keeps_its_paste_registry() {
+    // The `history_draft` path reuses `Snapshot`, so it carries the registry now too. Entering
+    // history browsing also pushes an undo snapshot upstream (`editor.ts:435-438`), which cyrup
+    // never did — so Ctrl+- could not undo "I browsed away from what I was typing".
+    let mut ed = InputEditor::new();
+    ed.push_history("an earlier prompt");
+    let big = big_paste(1500, 'h');
+    ed.handle_paste(&big);
+    ed.handle_key(&KeyCode::Home.into()); // col 0 → Up recalls history
+    ed.handle_key(&key(KeyCode::Up));
+    assert_eq!(ed.text(), "an earlier prompt");
+    ed.handle_key(&key(KeyCode::Down));
+    assert_eq!(ed.text(), "[paste #1 1500 chars]", "the draft must come back");
+    assert_eq!(ed.expanded_text(), big, "…with its paste still resolvable");
+
+    // The Down path above was already correct at HEAD (nothing clears the registry while browsing).
+    // The path that was NOT is Ctrl+-: upstream pushes an undo snapshot on entering history browsing
+    // (`editor.ts:436`), so undo returns to the draft. cyrup pushed none, so the undo fell through to
+    // the snapshot from before the paste and emptied the buffer instead.
+    ed.handle_key(&KeyCode::Home.into());
+    ed.handle_key(&key(KeyCode::Up));
+    assert_eq!(ed.text(), "an earlier prompt");
+    ed.handle_key(&ctrl('-'));
+    assert_eq!(ed.text(), "[paste #1 1500 chars]", "undo must return to the draft, not past it");
+    assert_eq!(ed.expanded_text(), big);
+}
+
+#[test]
+fn ctrl_undo_is_reachable_from_a_terminal_without_the_kitty_protocol() {
+    // TUI-053: a legacy terminal sends Ctrl+- as the single byte 0x1F, which crossterm 0.29.0
+    // decodes arithmetically to `Char('7') + CONTROL` (`event/sys/unix/parse.rs:110-113`). pi decodes
+    // the byte explicitly — `if (data === "\x1f") return "ctrl+-"` (`keys.ts:1277`) — so undo works
+    // everywhere upstream. RED before the fix: nothing happened on Terminal.app/xterm/gnome-terminal.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "foo bar baz");
+    ed.handle_key(&ctrl('7'));
+    assert_eq!(ed.text(), "foo bar", "0x1F (ctrl+7 as crossterm renders it) must reach editor.undo");
+    // `\x1d` → `ctrl+]` (`keys.ts:1276`) is the same class: char-jump forward.
+    ed.handle_key(&KeyCode::Home.into());
+    ed.handle_key(&ctrl('5'));
+    ed.handle_key(&key(KeyCode::Char('b')));
+    assert_eq!(ed.cursor(), (0, 4), "0x1D must reach editor.jumpForward");
+}
+
+#[test]
+fn word_motion_keeps_pis_ascii_boundaries_after_the_segmenter_swap() {
+    // TUI-048 replaced the character-class run with UAX#29 word segmentation plus pi's
+    // `PUNCTUATION_REGEX` sub-boundaries (`word-navigation.ts:47-57`, `utils.ts:821`). These are the
+    // cases where the two must agree, pinned so the swap cannot silently move them.
+    for (text, from, expect) in
+        [("foo.bar", 7usize, 4usize), ("don't", 5, 4), ("3.14", 4, 2), ("foo bar", 7, 4), ("a  b", 4, 3)]
+    {
+        let mut ed = InputEditor::new();
+        type_str(&mut ed, text);
+        assert_eq!(ed.cursor(), (0, from));
+        ed.handle_key(&alt(KeyCode::Left));
+        assert_eq!(ed.cursor(), (0, expect), "word-left in {text:?}");
+    }
+    // Forward takes the FIRST punctuation match inside a word-like segment (`word-navigation.ts:102`).
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "foo.bar");
+    ed.handle_key(&KeyCode::Home.into());
+    ed.handle_key(&alt(KeyCode::Right));
+    assert_eq!(ed.cursor(), (0, 3));
+}
+
+#[test]
+fn cjk_word_motion_no_longer_swallows_the_whole_run() {
+    // TUI-048's headline case. The old class-run motion treated `你好世界` as ONE alphanumeric run
+    // and jumped to column 0. UAX#29 segments it per ideograph, so the caret now stops inside the
+    // run. **This is not yet parity**: ICU's `Intl.Segmenter` adds a dictionary pass that lands pi at
+    // column 2 (`你好` / `世界`), and `unicode-segmentation` carries no such data — hence the range
+    // assertion rather than a fixed column, and hence TUI-048 stays open. See the CYRUP-DELTA on
+    // `InputEditor::word_segments`.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "你好世界");
+    assert_eq!(ed.cursor(), (0, 4));
+    ed.handle_key(&alt(KeyCode::Left));
+    let (_, col) = ed.cursor();
+    assert!(col > 0 && col < 4, "word-left jumped the whole ideograph run: col {col}");
+}
+
+#[test]
+fn a_motion_between_two_kills_starts_a_new_kill_ring_entry() {
+    // Every motion clears `lastAction` upstream (`editor.ts:1791`, `:1783`, `:1787`, `:1870`,
+    // `:2065`, `:430`); cyrup cleared it on Left/Right only, so a Home between two kills let the
+    // second accumulate into the first entry. RED at HEAD: the ring top was "worldhello ".
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "hello world");
+    ed.handle_key(&ctrl('w')); // kill "world"
+    assert_eq!(ed.kill_ring_top(), Some("world"));
+    ed.handle_key(&KeyCode::Home.into()); // a motion → the kill run ends
+    ed.handle_key(&ctrl('k')); // kill "hello " into a NEW entry
+    assert_eq!(ed.kill_ring_top(), Some("hello "), "a motion must break the kill run");
+}

@@ -29,8 +29,9 @@
 //!
 //! The `before_agent_start` context-hygiene layer is ALSO wired (pi `index.ts:2134-2190`, port doc
 //! §9): the handler shapes the active tool set via [`cyrup_ext::HostServices::set_active_tools`]
-//! (driven by [`manager::PermissionManager::get_tool_permission`]/`has_allowed_skills`/
-//! `get_bash_permissions`, pi `shouldExposeTool`), RETURNS the sanitized system prompt as a `[mutate]`
+//! (driven by [`manager::PermissionManager::get_tool_permission`] + `has_allowed_skills`, and by
+//! those two ONLY — pi `shouldExposeTool`, `index.ts:1791-1816` @v0.8.0, has a read/skills bypass and
+//! no other; see `PERM-009`), RETURNS the sanitized system prompt as a `[mutate]`
 //! ([`sanitize::tools`] strips the "Available tools:" section + denied guideline bullets;
 //! [`sanitize::skills`] hides `ask`/`deny` skills from `<available_skills>` while KEEPING their
 //! enforcement entries for the skill-read gate), and surfaces the `"yolo"` status pill
