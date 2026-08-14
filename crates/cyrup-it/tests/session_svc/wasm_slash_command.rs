@@ -100,7 +100,13 @@ async fn wasm_guest_slash_command_executes_through_the_run_path() {
     // Load the guest COMPONENT through the session's host, injecting the session's OWN
     // LiveHostServices (arch-08 §5.6 — the same backend `apply_pending_control` drains).
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 
@@ -164,7 +170,13 @@ async fn wasm_guest_state_mutations_fire_against_the_live_session() {
         .await
         .unwrap();
     let _ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 
@@ -290,7 +302,13 @@ async fn wasm_guest_receives_agent_settled_across_the_wit_boundary() {
         .into_shared(); // bound: the post-run driver (and therefore the settle emit) is live.
 
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 

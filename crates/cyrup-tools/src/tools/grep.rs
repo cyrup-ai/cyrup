@@ -56,6 +56,164 @@ impl GrepTool {
         });
         Self { fs, cwd, opts, params }
     }
+
+    /// Search ONE candidate and append its formatted rows to `out`, advancing the GLOBAL match
+    /// `count`. Extracted from `execute` so the search can be fused into the walk (see the loop
+    /// there) instead of running as a second pass over a fully-drained, sorted file list.
+    ///
+    /// Pi gathers raw matches first (no context in the searcher), then formats each match as an
+    /// independent re-read block; mirror that so overlapping windows duplicate shared context
+    /// lines exactly as Pi does (`formatBlock`, grep.ts:255-273).
+    #[allow(clippy::too_many_arguments)]
+    async fn search_one(
+        &self,
+        file: &std::path::Path,
+        rel: &str,
+        matcher: &grep_regex::RegexMatcher,
+        context: usize,
+        limit: usize,
+        count: &mut usize,
+        out: &mut Vec<String>,
+        any_line_truncated: &mut bool,
+    ) -> Result<(), ToolError> {
+        // Pi never materializes the candidate in the agent process: the search runs in a separate
+        // ripgrep child (`spawn(rgPath, args, …)`, grep.ts:226) with rg's own bounded read buffer,
+        // so file size is decoupled from the agent's heap. cyrup's search is in-process (the
+        // declared `ignore`/`grep-searcher` delta, module doc above), so the same property comes
+        // from [`FsOps::read_stream`] + `search_reader`. A full `FsOps::read` here allocated the
+        // whole file BEFORE binary detection could reject it — one multi-GB log, database dump or
+        // vendored tarball in the tree was an RSS spike or an OOM kill of the session, on a file
+        // that need not match at all. A read failure is skipped, exactly as before: rg simply
+        // emits no match events for a file it cannot open.
+        let Ok(reader) = self.fs.read_stream(file).await else {
+            return Ok(());
+        };
+
+        // Binary detection. Pi spawns real ripgrep with no `--text`/`-a` (grep.ts:220-224), so
+        // ripgrep's default applies: files reached by traversal are searched with
+        // `BinaryDetection::quit(b'\x00')` — a NUL ends that file as if EOF, so a binary file
+        // contributes no `--json` match lines. `grep-searcher`'s own default is
+        // `BinaryDetection::None` ("Data reported by the searcher may contain arbitrary bytes"),
+        // which would dump raw bytes of PNG/wasm/font/sqlite hits into the model-facing result.
+        //
+        // [CYRUP-DELTA] ripgrep uses `convert(b'\x00')` instead of `quit` for a path named
+        // EXPLICITLY on the command line (Pi's `path` argument pointing at a single file). cyrup
+        // keeps `quit` there too: `convert` renumbers lines at every NUL, while the output blocks
+        // below are cut from a separate raw re-read of the file that splits on `\n` only, so the
+        // two numberings would disagree and emit the wrong lines.
+        //
+        // The searcher is built per file rather than hoisted because `search_reader` is a
+        // BLOCKING API driven from `spawn_blocking` (see [`FsOps::read_stream`]), so it and the
+        // reader must be owned by the blocking task.
+        let matcher_owned = matcher.clone();
+        // `MatchSink` counts against the REMAINING budget; the caller's global `count` is advanced
+        // by however many this file contributed. Pi's cap is global too — its line handler ignores
+        // every event once `matchCount >= effectiveLimit` (grep.ts:278) — so a file can only ever
+        // fill the gap.
+        let remaining = limit.saturating_sub(*count);
+        let matches: Vec<(u64, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+            let mut searcher: Searcher = SearcherBuilder::new()
+                .line_number(true)
+                .binary_detection(BinaryDetection::quit(b'\x00'))
+                .build();
+            let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut local = 0usize;
+            {
+                let sink =
+                    MatchSink { matches: &mut matches, count: &mut local, limit: remaining };
+                let _ = searcher.search_reader(&matcher_owned, reader, sink);
+            }
+            matches
+        })
+        .await
+        .map_err(|e| error::invalid(format!("grep: {e}")))?;
+
+        if matches.is_empty() {
+            return Ok(());
+        }
+        *count += matches.len();
+
+        // Which matches take Pi's `formatBlock` path (grep.ts:333-335) rather than the direct
+        // `match.lineText` path (grep.ts:323-331)? Pi's condition is
+        // `contextValue === 0 && match.lineText !== undefined`, and `lineText` is
+        // `event.data.lines.text` — ABSENT whenever ripgrep could not encode the line as UTF-8
+        // (it serialises `lines.bytes` instead). So: context>0, or a non-UTF-8 matched line.
+        let takes_block = |raw: &[u8]| context > 0 || std::str::from_utf8(raw).is_err();
+        // `formatBlock` reads through `getFileLines`, a **second, independent** read of the file
+        // (grep.ts:206-218) — ripgrep's own read was a different process against the real
+        // filesystem — cached for the rest of the invocation by `fileCache`. Do it at most once
+        // per file, and ONLY if some match actually needs it, so that at context==0 the file is
+        // never re-read (Pi does not) yet the read-your-latest-writes semantics and the failure
+        // path below stay reachable exactly where Pi has them. Pi's own `fileCache` is moot here:
+        // each candidate is now visited exactly once.
+        //
+        // `None` is Pi's `catch { lines = [] }` (grep.ts:212-214). A successfully-read EMPTY
+        // file is NOT that case — `"".split("\n")` is `[""]`, length 1. This one IS a whole-file
+        // read on both sides, and pi pays it too — but only for a file that ACTUALLY MATCHED and
+        // only on the `contextValue > 0` / non-UTF-8 path.
+        let src_lines: Option<Vec<String>> = if matches.iter().any(|(_, r)| takes_block(r)) {
+            match self.fs.read(file).await {
+                // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
+                // (grep.ts:211). The matcher numbered lines on raw `\n`, so a file using
+                // lone-`\r` separators yields context blocks that key off these folded segments
+                // — matching Pi even where that diverges from the matcher's numbering.
+                Ok(b) => {
+                    let content = String::from_utf8_lossy(&b);
+                    let folded = content.replace("\r\n", "\n").replace('\r', "\n");
+                    Some(folded.split('\n').map(str::to_owned).collect())
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        for (ln, raw) in &matches {
+            let l = *ln as usize;
+            if !takes_block(raw) {
+                // Pi grep.ts:325-331: format straight from the captured line text —
+                // `\r\n`→`\n`, then DROP every remaining `\r` (not fold it to `\n`, which is
+                // what `getFileLines` does), then strip ONE trailing `\n`.
+                let stripped =
+                    String::from_utf8_lossy(raw).replace("\r\n", "\n").replace('\r', "");
+                let text = stripped.strip_suffix('\n').unwrap_or(&stripped);
+                let (capped, tr) = truncate_line(text, GREP_MAX_LINE_LENGTH);
+                if tr {
+                    *any_line_truncated = true;
+                }
+                out.push(format!("{rel}:{l}: {capped}"));
+                continue;
+            }
+            // Pi `formatBlock`: an unreadable file collapses the whole block to ONE marker row
+            // per match (grep.ts:258). The rows still count as output, so they participate in
+            // byte truncation like any other line.
+            let Some(src_lines) = src_lines.as_ref() else {
+                out.push(format!("{rel}:{l}: (unable to read file)"));
+                continue;
+            };
+            // Pi: `start = max(1, n - context)`, `end = min(lines.length, n + context)` when
+            // context > 0, else just the single match line (grep.ts:260-261).
+            let (start, end) = if context > 0 {
+                (l.saturating_sub(context).max(1), (l + context).min(src_lines.len()))
+            } else {
+                (l, l)
+            };
+            for current in start..=end {
+                let raw = src_lines.get(current.saturating_sub(1)).map_or("", String::as_str);
+                // Pi's per-line `replace(/\r/g,"")` (grep.ts:264).
+                let text = raw.replace('\r', "");
+                let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
+                if tr {
+                    *any_line_truncated = true;
+                }
+                if current == l {
+                    out.push(format!("{rel}:{current}: {capped}"));
+                } else {
+                    out.push(format!("{rel}-{current}- {capped}"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Collects the 1-based line number AND the raw bytes of every match in a file, capping the GLOBAL
@@ -151,14 +309,29 @@ impl Tool for GrepTool {
             None => None,
         };
 
-        // Collect candidate files (sorted for stable output).
-        let mut files: Vec<(PathBuf, String)> = Vec::new();
+        let mut out: Vec<String> = Vec::new();
+        let mut count = 0usize;
+        let mut any_line_truncated = false;
+
         if meta.is_file {
+            if cancel.is_cancelled() {
+                return Err(error::aborted());
+            }
             let rel = search_root
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| to_posix(&search_root));
-            files.push((search_root.clone(), rel));
+            self.search_one(
+                &search_root,
+                &rel,
+                &matcher,
+                context,
+                limit,
+                &mut count,
+                &mut out,
+                &mut any_line_truncated,
+            )
+            .await?;
         } else {
             // Pi runs plain `rg --hidden` with NO `--no-require-git` flag (grep.ts:215-219): search
             // dotfiles/dot-dirs, but honor `.gitignore` only *inside* a git repo — ripgrep's default,
@@ -168,6 +341,25 @@ impl Tool for GrepTool {
             let mut walk =
                 self.fs.walk(&search_root, WalkOpts { include_hidden: true, require_git: true });
             loop {
+                // The walk and the search are FUSED, and both stop at the limit. Pi's line handler
+                // sets `matchLimitReached` and calls `stopChild(true)` (grep.ts:292-295, defined at
+                // `:240-245`) the instant `matchCount >= effectiveLimit`, which kills the rg child
+                // — so upstream neither finishes the traversal nor reads another file. Staging the
+                // whole walk into a `Vec`, sorting it, and only then searching cost a complete
+                // tree walk on EVERY call regardless of `limit`, and took the 100-match window
+                // from the alphabetically-first files rather than from the first matches
+                // discovered — a systematic `a*`-biased sample with nothing in the output to
+                // distinguish it. `grep -n sort grep.ts` is empty at v0.84.1, so the sort is
+                // dropped rather than moved.
+                if count >= limit {
+                    break;
+                }
+                // The `select!` below only observes a cancel while it is parked on `walk.next()`;
+                // one that lands while `search_one` is running is observed here, on the next turn
+                // — the same per-candidate granularity the staged loop had.
+                if cancel.is_cancelled() {
+                    return Err(error::aborted());
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(error::aborted()),
                     item = walk.next() => {
@@ -189,137 +381,22 @@ impl Tool for GrepTool {
                                     && !g.keeps_file(&glob_rel) {
                                         continue;
                                     }
-                                files.push((w.path, rel));
+                                self.search_one(
+                                    &w.path,
+                                    &rel,
+                                    &matcher,
+                                    context,
+                                    limit,
+                                    &mut count,
+                                    &mut out,
+                                    &mut any_line_truncated,
+                                )
+                                .await?;
                             }
                             Some(Ok(_)) => {}
                             Some(Err(e)) => return Err(e),
                             None => break,
                         }
-                    }
-                }
-            }
-            files.sort_by(|a, b| a.1.cmp(&b.1));
-        }
-
-        // Pi gathers raw matches first (no context in the searcher), then formats each match as an
-        // independent re-read block; mirror that so overlapping windows duplicate shared context
-        // lines exactly as Pi does (grep.ts:250-268).
-        //
-        // Binary detection. Pi spawns real ripgrep with no `--text`/`-a` (grep.ts:215-220), so
-        // ripgrep's default applies: files reached by traversal are searched with
-        // `BinaryDetection::quit(b'\x00')` — a NUL ends that file as if EOF, so a binary file
-        // contributes no `--json` match lines. `grep-searcher`'s own default is
-        // `BinaryDetection::None` ("Data reported by the searcher may contain arbitrary bytes"),
-        // which would dump raw bytes of PNG/wasm/font/sqlite hits into the model-facing result.
-        // On a slice search `quit` scans the first 8 KiB plus every matched line (glue.rs:118-121,
-        // core.rs:215-237) — the same conservative rule ripgrep uses for memory-mapped files.
-        //
-        // [CYRUP-DELTA] ripgrep uses `convert(b'\x00')` instead of `quit` for a path named
-        // EXPLICITLY on the command line (Pi's `path` argument pointing at a single file). cyrup
-        // keeps `quit` there too: `convert` renumbers lines at every NUL, while the output blocks
-        // below are cut from a separate raw re-read of the file that splits on `\n` only, so the
-        // two numberings would disagree and emit the wrong lines.
-        let mut searcher: Searcher = SearcherBuilder::new()
-            .line_number(true)
-            .binary_detection(BinaryDetection::quit(b'\x00'))
-            .build();
-
-        let mut out: Vec<String> = Vec::new();
-        let mut count = 0usize;
-        let mut any_line_truncated = false;
-
-        for (file, rel) in &files {
-            if count >= limit {
-                break;
-            }
-            if cancel.is_cancelled() {
-                return Err(error::aborted());
-            }
-            let bytes = match self.fs.read(file).await {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
-            {
-                let sink = MatchSink { matches: &mut matches, count: &mut count, limit };
-                let _ = searcher.search_slice(&matcher, &bytes, sink);
-            }
-            if matches.is_empty() {
-                continue;
-            }
-            // Which matches take Pi's `formatBlock` path (grep.ts:328-330) rather than the direct
-            // `match.lineText` path (grep.ts:318-327)? Pi's condition is
-            // `contextValue === 0 && match.lineText !== undefined`, and `lineText` is
-            // `event.data.lines.text` — ABSENT whenever ripgrep could not encode the line as UTF-8
-            // (it serialises `lines.bytes` instead). So: context>0, or a non-UTF-8 matched line.
-            let takes_block = |raw: &[u8]| context > 0 || std::str::from_utf8(raw).is_err();
-            // `formatBlock` reads through `getFileLines`, a **second, independent** read of the file
-            // (grep.ts:200-213) — ripgrep's own read was a different process against the real
-            // filesystem — cached for the rest of the invocation by `fileCache`. Do it at most once
-            // per file, and ONLY if some match actually needs it, so that at context==0 the file is
-            // never re-read (Pi does not) yet the read-your-latest-writes semantics and the failure
-            // path below stay reachable exactly where Pi has them.
-            //
-            // `None` is Pi's `catch { lines = [] }` (grep.ts:207-209). A successfully-read EMPTY
-            // file is NOT that case — `"".split("\n")` is `[""]`, length 1.
-            let src_lines: Option<Vec<String>> = if matches.iter().any(|(_, r)| takes_block(r)) {
-                match self.fs.read(file).await {
-                    // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
-                    // (grep.ts:206). The matcher numbered lines on raw `\n`, so a file using
-                    // lone-`\r` separators yields context blocks that key off these folded segments
-                    // — matching Pi even where that diverges from the matcher's numbering.
-                    Ok(b) => {
-                        let content = String::from_utf8_lossy(&b);
-                        let folded = content.replace("\r\n", "\n").replace('\r', "\n");
-                        Some(folded.split('\n').map(str::to_owned).collect())
-                    }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-            for (ln, raw) in &matches {
-                let l = *ln as usize;
-                if !takes_block(raw) {
-                    // Pi grep.ts:319-326: format straight from the captured line text —
-                    // `\r\n`→`\n`, then DROP every remaining `\r` (not fold it to `\n`, which is
-                    // what `getFileLines` does), then strip ONE trailing `\n`.
-                    let stripped =
-                        String::from_utf8_lossy(raw).replace("\r\n", "\n").replace('\r', "");
-                    let text = stripped.strip_suffix('\n').unwrap_or(&stripped);
-                    let (capped, tr) = truncate_line(text, GREP_MAX_LINE_LENGTH);
-                    if tr {
-                        any_line_truncated = true;
-                    }
-                    out.push(format!("{rel}:{l}: {capped}"));
-                    continue;
-                }
-                // Pi `formatBlock`: an unreadable file collapses the whole block to ONE marker row
-                // per match (grep.ts:253). The rows still count as output, so they participate in
-                // byte truncation like any other line.
-                let Some(src_lines) = src_lines.as_ref() else {
-                    out.push(format!("{rel}:{l}: (unable to read file)"));
-                    continue;
-                };
-                // Pi: `start = max(1, n - context)`, `end = min(lines.length, n + context)` when
-                // context > 0, else just the single match line (grep.ts:255-256).
-                let (start, end) = if context > 0 {
-                    (l.saturating_sub(context).max(1), (l + context).min(src_lines.len()))
-                } else {
-                    (l, l)
-                };
-                for current in start..=end {
-                    let raw = src_lines.get(current.saturating_sub(1)).map_or("", String::as_str);
-                    // Pi's per-line `replace(/\r/g,"")` (grep.ts:259).
-                    let text = raw.replace('\r', "");
-                    let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
-                    if tr {
-                        any_line_truncated = true;
-                    }
-                    if current == l {
-                        out.push(format!("{rel}:{current}: {capped}"));
-                    } else {
-                        out.push(format!("{rel}-{current}- {capped}"));
                     }
                 }
             }

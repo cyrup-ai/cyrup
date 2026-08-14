@@ -76,19 +76,33 @@ fn extension_dialog_without_timeout_shows_no_countdown() {
 /// Ticking the countdown after real time passes (but before the deadline) live-updates the title
 /// with the recomputed remaining seconds — Pi's `titleText.setText` on every `onTick`
 /// (`extension-selector.ts:55`).
-#[test]
-fn extension_dialog_countdown_ticks_down_with_real_elapsed_time() {
+///
+/// **TUI-N09 — driven from an INJECTED instant, not a `thread::sleep`.** This test used to sleep
+/// 1,100 ms of wall clock and then assert the literal `"Proceed? (2s)"` against a 3 s budget, i.e.
+/// an exact assertion with ~900 ms of scheduler slack: a CI or loaded-laptop stall turned it red
+/// with a message pointing at the countdown logic rather than at the scheduler. Pi drives the same
+/// countdown from an injected timer (`components/countdown-timer.ts:21-30`), and this crate already
+/// had the pattern in `StatusIndicator::retry_message`. It also removes 1.1 s of real sleep from
+/// the suite.
+#[tokio::test]
+async fn extension_dialog_countdown_ticks_down_with_elapsed_time() {
     let mut app = App::new(TestBackend::new(60, 16), UiTheme::dark()).unwrap();
     let (tx, _rx) = tokio::sync::oneshot::channel();
+    let opened = tokio::time::Instant::now();
     app.open_extension_dialog(confirm_request(tx, Some(3_000)));
 
-    std::thread::sleep(Duration::from_millis(1_100));
-    app.tick_extension_dialog_countdown();
+    app.tick_extension_dialog_countdown_at(opened + Duration::from_millis(1_100));
     app.draw().unwrap();
     let text = buf_text(&app);
     assert!(text.contains("Proceed? (2s)"), "expected the countdown to have ticked to 2s:\n{text}");
     // The dialog is still open — 1.1s elapsed of a 3s budget.
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionConfirm));
+
+    // …and one second further on it reads `(1s)`, with no wall-clock dependence either way.
+    app.tick_extension_dialog_countdown_at(opened + Duration::from_millis(2_100));
+    app.draw().unwrap();
+    let text = buf_text(&app);
+    assert!(text.contains("Proceed? (1s)"), "expected the countdown to have ticked to 1s:\n{text}");
 }
 
 /// THE headline fix: once the deadline passes, ticking the countdown auto-resolves the dialog to
@@ -103,8 +117,10 @@ async fn extension_dialog_auto_dismisses_and_replies_the_deny_default_on_expiry(
     app.open_extension_dialog(confirm_request(tx, Some(50)));
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionConfirm));
 
-    std::thread::sleep(Duration::from_millis(120));
-    app.tick_extension_dialog_countdown();
+    // TUI-N09 — injected, not slept: an expiry test does not need real time to pass.
+    app.tick_extension_dialog_countdown_at(
+        tokio::time::Instant::now() + Duration::from_millis(120),
+    );
 
     assert_eq!(app.active_selector_kind(), None, "the stale dialog must auto-close on expiry");
     let reply = tokio::time::timeout(Duration::from_secs(1), rx)
@@ -132,8 +148,9 @@ async fn extension_input_dialog_auto_dismisses_with_its_own_text_none_default() 
     app.open_extension_dialog(req);
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionInput));
 
-    std::thread::sleep(Duration::from_millis(120));
-    app.tick_extension_dialog_countdown();
+    app.tick_extension_dialog_countdown_at(
+        tokio::time::Instant::now() + Duration::from_millis(120),
+    );
 
     assert_eq!(app.active_selector_kind(), None);
     let reply = tokio::time::timeout(Duration::from_secs(1), rx).await.unwrap().unwrap();

@@ -39,7 +39,8 @@ use cyrup_session_svc::{NotifyKind, UiEffect, UiKind, UiReply, UiRequest};
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
-    self, Event, KeyEventKind, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::terminal::{
@@ -47,7 +48,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{execute, queue, ExecutableCommand};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
@@ -92,6 +93,82 @@ const PAGE_SCROLL_LINES: usize = 10;
 /// is still partial. See [`TranscriptView::has_running_elapsed_tool`].
 pub const ELAPSED_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// One entry of Pi's `compactionQueuedMessages` (`interactive-mode.ts:401`, the
+/// `CompactionQueuedMessage` record `{ text, mode: "steer" | "followUp" }`). TUI-031.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionQueued {
+    /// The submitted text, verbatim.
+    pub text: String,
+    /// `mode === "followUp"` — Alt+Enter's queue rather than Enter's steering queue.
+    pub follow_up: bool,
+}
+
+/// One mounted extension widget — Pi's entry in `extensionWidgetsAbove` / `extensionWidgetsBelow`
+/// (`interactive-mode.ts:1920-1960` @v0.83.0). TUI-014.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionWidget {
+    /// Pi's `key`: the identity a re-emit replaces on.
+    pub key: String,
+    /// The rendered rows, already capped at [`ExtensionWidget::MAX_WIDGET_LINES`] with pi's
+    /// truncation marker appended when the content was longer.
+    pub lines: Vec<String>,
+    /// `options.placement === "belowEditor"` (`:1925`, `:1957`); the default is `"aboveEditor"`.
+    pub below: bool,
+}
+
+impl ExtensionWidget {
+    /// `InteractiveMode.MAX_WIDGET_LINES` (`interactive-mode.ts:2008`).
+    pub const MAX_WIDGET_LINES: usize = 10;
+
+    /// Pi's truncation row, appended verbatim when the content exceeded the cap (`:1948-1950`,
+    /// `theme.fg("muted", "... (widget truncated)")`).
+    pub const TRUNCATED: &'static str = "... (widget truncated)";
+
+    /// Recover Pi's three arguments from cyrup's single opaque `set-widget(widget-json)` payload.
+    ///
+    /// An object shaped like Pi's call — `{"key": …, "content": …, "options": {"placement": …}}` —
+    /// is read field by field; `content` may be a string (split on newlines, as Pi's `Text` rows
+    /// are) or an array of strings (Pi's `string[]` arm at `:1942-1951`). `placement` is also
+    /// accepted at the top level, since cyrup's SDK takes any `impl Serialize` and there is no
+    /// enforced envelope. Anything else is rendered as its JSON text under an empty key, which is
+    /// the only honest reading of a payload with no structure to recover.
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        let obj = v.as_object();
+        let key = obj
+            .and_then(|o| o.get("key"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let placement = obj
+            .and_then(|o| o.get("options").and_then(|opt| opt.get("placement")).or_else(|| o.get("placement")))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("aboveEditor");
+        let below = placement == "belowEditor";
+        let content = obj.and_then(|o| o.get("content"));
+        let mut lines: Vec<String> = match content {
+            Some(serde_json::Value::String(text)) => {
+                text.lines().map(str::to_string).collect()
+            }
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|i| {
+                    i.as_str().map(str::to_string).unwrap_or_else(|| i.to_string())
+                })
+                .collect(),
+            // `content === undefined` removes the widget (`:1935-1938`) — an empty line list is
+            // what the caller reads as "remove".
+            Some(serde_json::Value::Null) | None if obj.is_some() => Vec::new(),
+            Some(other) => vec![other.to_string()],
+            None => vec![v.to_string()],
+        };
+        if lines.len() > Self::MAX_WIDGET_LINES {
+            lines.truncate(Self::MAX_WIDGET_LINES);
+            lines.push(Self::TRUNCATED.to_string());
+        }
+        ExtensionWidget { key, lines, below }
+    }
+}
+
 /// The decision produced by feeding one input event to the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppAction {
@@ -118,6 +195,13 @@ pub enum AppAction {
     /// dropped. The run loop drains ([`AgentSession::drain_queue`]), hands the result to
     /// [`App::restore_queued_to_editor`], and only then aborts.
     InterruptRestoreQueued,
+    /// Abort an in-flight COMPACTION — Pi rebinds `defaultEditor.onEscape` to
+    /// `() => this.session.abortCompaction()` for the whole compaction window
+    /// (`interactive-mode.ts:3080-3086` @v0.83.0, restored at `:3094-3097`), so Escape cancels the
+    /// compaction and nothing else. Without the rebind an Escape mid-compaction reached the ordinary
+    /// chain, where `isStreaming` is false (compaction ABORTS the active run and does not set the
+    /// agent snapshot) — i.e. it fell through to the empty-editor branch and did nothing.
+    AbortCompaction,
     /// Esc pressed **while a `/tree` branch summarization is in flight** — Pi's rebound
     /// `defaultEditor.onEscape = () => this.session.abortBranchSummary()`
     /// (`interactive-mode.ts:4792-4795`). Distinct from [`Self::Interrupt`] because it must NOT tear
@@ -200,6 +284,12 @@ pub enum AppCommand {
     /// (incl. `xhigh` where mapped), exactly like Pi's `cycleThinkingLevel` (agent-session.ts:1599 →
     /// interactive-mode.ts:3606-3614). Rides an `AppCommand` because the gate needs the live model.
     CycleThinking,
+    /// Set the reasoning level to a specific value — the `/settings` → `Thinking level` submenu
+    /// (TUI-032). Pi's `onThinkingLevelChange` calls `this.session.setThinkingLevel(level)`
+    /// (`interactive-mode.ts:4222-4226`), which clamps to the model's capabilities and emits
+    /// `ThinkingLevelChanged`; it is a session op, not a settings write, so it does not go through
+    /// [`Self::ApplySetting`].
+    SetThinking(String),
     /// Apply a confirmed data-bound selection (`{kind}` chose `{value}`): set the model, switch the
     /// branch, login/logout, etc.
     ConfirmSelection { kind: SelectorKind, value: String },
@@ -288,6 +378,23 @@ pub struct AppState {
     /// Fed from `queue_update`; see [`crate::pending_messages`] for why it exists and what it
     /// replaced (TUI-016 / TUI-052).
     pub pending_messages: crate::pending_messages::PendingMessages,
+    /// The last `queue_update` snapshot from the SESSION's own two queues, kept so the pending
+    /// region can be rebuilt whenever either source changes — Pi's `getAllQueuedMessages`
+    /// (`interactive-mode.ts:3942-3953`) folds `session.getSteeringMessages()` /
+    /// `getFollowUpMessages()` together with `compactionQueuedMessages` every time it renders.
+    /// TUI-031.
+    pub session_queue: (Vec<String>, Vec<String>),
+    /// Raised by the sync `compaction_end` arm and consumed by [`App::ingest_session_event`], which
+    /// has the session needed to actually deliver the queue. TUI-031.
+    pub compaction_flush_pending: bool,
+    /// Whether a compaction is currently running — set by `compaction_start` and cleared by
+    /// `compaction_end`, the window in which Pi's Escape handler is rebound to `abortCompaction`.
+    pub compacting: bool,
+    /// Pi's `compactionQueuedMessages` (`interactive-mode.ts:401`) — prompts submitted WHILE a
+    /// compaction is running. The session layer has no compaction guard of its own, so without this
+    /// a message typed mid-compaction was dispatched as a fresh turn assembled from a context the
+    /// compaction was in the middle of rewriting. TUI-031.
+    pub compaction_queue: Vec<CompactionQueued>,
     /// Reserve the 2-row status band even when idle (spec/tui/01 §6.3). Default `false` (Pi's
     /// non-`clearOnShrink` behavior) so the editor/footer never reflow on idle viewports.
     pub reserve_status_rows: bool,
@@ -319,6 +426,19 @@ pub struct AppState {
     /// interactive-mode.ts:3361-3369): a second `Ctrl+C` within 500 ms exits; otherwise it clears the
     /// editor and records the press time. `None` until the first press.
     last_sigint: Option<std::time::Instant>,
+    /// Timestamp of the last Escape on an EMPTY editor, for Pi's 500 ms double-Escape window
+    /// (`interactive-mode.ts:2579-2594`, `private lastEscapeTime = 0` at `:355`). `None` until the
+    /// first press, and reset to `None` when a pair fires so a third press starts a new pair.
+    /// TUI-009.
+    last_escape: Option<std::time::Instant>,
+    /// The persisted `doubleEscapeAction` setting (`tree` / `fork` / `none`), cached here because
+    /// [`App::apply_action`] resolves keys without a session in hand. Seeded at boot and re-seeded
+    /// on every session swap alongside the other per-session settings. TUI-009.
+    pub double_escape_action: String,
+    /// The persisted `warnings.anthropicExtraUsage` value, cached for the `/settings` → `Warnings`
+    /// submenu, which is opened from a selector outcome with no session in hand. Pi's default is
+    /// `true` (`settings-selector.ts:134` `(this.state.anthropicExtraUsage ?? true)`). TUI-032.
+    pub warn_anthropic_extra_usage: bool,
     /// A status line to show **after** the next runtime session-swap re-binds the UI (the swap
     /// resets the transcript, so a pre-swap status would be wiped). Set by the session-lifecycle
     /// command handlers (`/new`/`/resume`/`/fork`/`/reload`/`/import`); consumed by
@@ -383,18 +503,25 @@ pub struct AppState {
     /// re-pointed at the live session's cwd by [`App::run`] (and on every session swap), since a
     /// `/resume` of a session recorded elsewhere moves it.
     pub title_cwd: PathBuf,
-    /// The custom header content an extension published (Pi `setHeader`, `interactive-mode.ts:2237`).
-    /// Delivered (no longer dropped) and retained here — cyrup's TUI has no extension chrome slot to
-    /// render it in yet, which is TUI-014's remaining half.
+    /// The custom header content an extension published — Pi `setHeader(factory)` →
+    /// `setExtensionHeader` (`interactive-mode.ts:2262-2290` @v0.83.0), which splices the custom
+    /// header into `headerContainer` in place of `builtInHeader` and restores the built-in when the
+    /// factory is `undefined`. TUI-033: rendered as the first rows of the message region.
     pub extension_header: Option<String>,
-    /// The custom footer content an extension published (Pi `setFooter`, `interactive-mode.ts:2236`).
-    /// Same status as [`Self::extension_header`].
+    /// The custom footer content an extension published — Pi `setFooter(factory)` →
+    /// `setExtensionFooter` (`:2235-2257`), which clears `footerContainer` and swaps the extension
+    /// component in for the built-in footer. TUI-033: rendered in place of the [`StatusLine`] rows.
     pub extension_footer: Option<String>,
-    /// The most recent extension widget payload (Pi `setWidget`, `interactive-mode.ts:2235`). Cyrup's
-    /// WIT collapses Pi's `{key, content, options}` into one opaque JSON blob, so there is no key to
-    /// map by; the latest payload wins. Same "delivered, not rendered" status as the header/footer —
-    /// this is exactly TUI-014, which the sink wiring alone does NOT close.
-    pub extension_widget: Option<serde_json::Value>,
+    /// The extension widgets currently mounted, keyed by Pi's `key` — `setExtensionWidget`
+    /// (`interactive-mode.ts:1920-1960` @v0.83.0) keeps two maps, `extensionWidgetsAbove` and
+    /// `extensionWidgetsBelow`, removes the key from BOTH before re-inserting, and drops it entirely
+    /// when `content` is `undefined`. TUI-014.
+    ///
+    /// **[CYRUP-DELTA]** cyrup's WIT collapses Pi's three-argument `setWidget(key, content,
+    /// options)` into one opaque JSON payload (`host_services.rs:148-154`), so the key, the lines
+    /// and the placement are recovered from that payload by [`ExtensionWidget::from_json`] instead
+    /// of arriving as separate arguments.
+    pub extension_widgets: Vec<ExtensionWidget>,
     /// Whether a branch summarization spawned by [`App::begin_tree_navigation`] is still in flight.
     /// While set, `Esc` routes to `AgentSession::abort_branch_summary` instead of the turn abort —
     /// Pi's `defaultEditor.onEscape = () => this.session.abortBranchSummary()`
@@ -494,6 +621,10 @@ impl AppState {
             image_renderer: ImageRenderer::default(),
             pending_images: Vec::new(),
             pending_messages: crate::pending_messages::PendingMessages::default(),
+            session_queue: (Vec::new(), Vec::new()),
+            compaction_flush_pending: false,
+            compacting: false,
+            compaction_queue: Vec::new(),
             reserve_status_rows: false,
             term_rows: 24,
             show_startup_hints: true,
@@ -501,6 +632,13 @@ impl AppState {
             loader_tick: 0,
             should_quit: false,
             last_sigint: None,
+            last_escape: None,
+            // Pi's own default is `"tree"` (`settings.ts` `getDoubleEscapeAction`); the real value
+            // is seeded from the session's effective settings before the first frame.
+            double_escape_action: "tree".to_string(),
+            // Pi's `?? true` default (`settings-selector.ts:134`); re-seeded from the session's
+            // effective settings before the first frame.
+            warn_anthropic_extra_usage: true,
             pending_swap_status: None,
             scrollback: Vec::new(),
             extension_shortcuts: Vec::new(),
@@ -521,7 +659,7 @@ impl AppState {
             title_cwd: std::env::current_dir().unwrap_or_default(),
             extension_header: None,
             extension_footer: None,
-            extension_widget: None,
+            extension_widgets: Vec::new(),
             branch_summary_in_flight: false,
             // Pi constructs its `FooterDataProvider` from the session cwd; the binary points this at
             // the runtime's cwd via [`App::set_footer_git_cwd`] before the first frame. Booting as
@@ -649,8 +787,14 @@ fn default_ui_reply(kind: UiKind) -> UiReply {
 /// `Math.ceil(timeoutMs / 1000)`, `countdown-timer.ts:18`) so e.g. 4500ms remaining reads "5s", not
 /// "4s"; a `deadline` already in the past reads "0s" (the tick loop closes the dialog that same
 /// pass, so this is never rendered for more than one frame).
-fn countdown_title(base: &str, deadline: tokio::time::Instant) -> String {
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+///
+/// `now` is the instant of the tick being rendered — Pi's `CountdownTimer` decrements
+/// `remainingSeconds` inside the `setInterval` callback (`countdown-timer.ts:22-24`), i.e. the
+/// displayed value belongs to the tick, not to whenever the string happens to be formatted. Reading
+/// the clock in here instead left [`App::tick_extension_dialog_countdown_at`]'s injected instant
+/// governing only the expiry branch, so a ticked-forward countdown still printed its opening value.
+fn countdown_title(base: &str, deadline: tokio::time::Instant, now: tokio::time::Instant) -> String {
+    let remaining = deadline.saturating_duration_since(now);
     let secs = remaining.as_millis().div_ceil(1000);
     format!("{base} ({secs}s)")
 }
@@ -992,6 +1136,38 @@ impl<B: Backend> App<B> {
         self.state.editor.merge_keybindings_json(json)?;
         Ok(())
     }
+
+    /// TUI-051 — re-read `<agent_dir>/keybindings.json` and re-apply it to every live map.
+    ///
+    /// Pi calls `this.keybindings.reload()` inside `handleReloadCommand`, immediately after
+    /// `await this.session.reload(...)` (`interactive-mode.ts:5386` @v0.83.0) →
+    /// `core/keybindings.ts:354-357` `setUserBindings(KeybindingsManager.loadFromFile(configPath))`
+    /// → `loadFromFile` (`:363-367`) re-reads the file, re-runs `migrateKeybindingsConfig` and hands
+    /// the result to `packages/tui/src/keybindings.ts:167-192` `rebuild()`.
+    ///
+    /// cyrup's `/reload` never touched the file — while both the command's help string
+    /// (`commands.rs`) and the handler's own comment claimed it did — so the single documented way
+    /// to apply an edited `keybindings.json` was a process restart, which nothing told the user.
+    ///
+    /// **Reset-then-merge, not merge**: `rebuild()` REPLACES (`keybindings.ts:187-191`), so an entry
+    /// the user deleted must go back to its default. A missing file is not an error — it means "no
+    /// user bindings", i.e. every default (Pi's `loadFromFile` returns `{}` for one).
+    pub fn reload_keybindings_from(&mut self, agent_dir: &std::path::Path) -> Result<(), TuiError> {
+        let path = agent_dir.join("keybindings.json");
+        let json = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // No file ⇒ defaults only, which the reset below already produces.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::from("{}"),
+            Err(e) => return Err(TuiError::Backend(e.to_string())),
+        };
+        self.state.keymap = Keymap::default();
+        self.state.select_keymap = crate::keymap::SelectKeymap::default();
+        self.state.tree_keymap = crate::keymap::TreeKeymap::default();
+        self.state.session_keymap = crate::keymap::SessionKeymap::default();
+        self.state.models_keymap = crate::keymap::ModelsKeymap::default();
+        self.state.editor.reset_keybindings_to_defaults();
+        self.load_keybindings_json(&json)
+    }
     /// The transcript view.
     pub fn transcript_mut(&mut self) -> &mut TranscriptView {
         &mut self.state.transcript
@@ -1134,7 +1310,9 @@ impl<B: Backend> App<B> {
         // Seed the process-wide OSC-8 answer the markdown renderer reads (Pi's cached
         // `getCapabilities()`, terminal-image.ts:138-143) so the link gate at `markdown.ts:692`
         // sees the same detection this call already paid for.
-        crate::image::seed_hyperlink_support(caps.hyperlinks);
+        // TUI-N12 — seed the WHOLE record, not just `hyperlinks`: the cache now carries `images`
+        // and `true_color` too, and this call site already holds all three.
+        crate::image::seed_capabilities(caps);
         // …and, when the terminal HAS an image protocol, measure its font cell instead of guessing
         // it (Pi `queryCellSize`, `tui.ts:647`/`:679-686`, gated on `getCapabilities().images` at
         // `:681`). Without this every inline image is laid out against `ratatui-image`'s `10x20`
@@ -1153,6 +1331,13 @@ impl<B: Backend> App<B> {
             None
         };
         self.state.image_renderer = ImageRenderer::from_capabilities_with_cell_size(caps, cell_size);
+        // TUI-N01 / TUI-036 — publish the capability where the two consumers can reach it: the
+        // transcript's tool-result image gate (Pi `tool-execution.ts:331`) and the `/settings` grid
+        // builder, which must not offer image rows on a terminal with no protocol
+        // (`settings-selector.ts:654-671`). `AppState::image_renderer` is not reachable from either.
+        self.state
+            .transcript
+            .set_graphical_images(self.state.image_renderer.is_graphical());
     }
 
     /// Apply a new theme, bumping its generation so caches invalidate (R-10-026). The theme is
@@ -1238,7 +1423,7 @@ impl<B: Backend> App<B> {
     pub fn reset_extension_ui(&mut self) {
         self.state.extension_header = None;
         self.state.extension_footer = None;
-        self.state.extension_widget = None;
+        self.state.extension_widgets.clear();
         self.state.extension_shortcuts.clear();
         self.state.status.extension_statuses.clear();
         // An extension dialog/editor overlay belongs to the outgoing host; leaving it up would
@@ -1536,8 +1721,15 @@ impl<B: Backend> App<B> {
         // Resize **before** flushing so the committed `insert_before` lines scroll above the
         // correctly-anchored viewport (the active turn's height is unaffected by the flush).
         let size = self.terminal.backend().size().ok();
-        let term_h = size.map(|s| s.height).unwrap_or(self.viewport_height).max(1);
-        let term_w = size.map(|s| s.width).unwrap_or(80);
+        // TUI-039 — pi's `$LINES` / `$COLUMNS` step sits between the ioctl and the constant
+        // (`tui.ts:1730-1736`). cyrup's own last resort here stays the live viewport height rather
+        // than pi's bare `24`, since it is a strictly better guess when one is available.
+        let term_h = size
+            .map(|s| s.height)
+            .or_else(env_rows)
+            .unwrap_or(self.viewport_height)
+            .max(1);
+        let term_w = size.map(|s| s.width).unwrap_or_else(fallback_columns);
         // Publish the SCREEN height before anything measures: the editor's row budget is
         // `max(5, floor(terminalRows * 0.3))` against the terminal, not the live region
         // (`editor.ts:499-501`; see [`AppState::term_rows`]). A selector that windows its own body
@@ -1621,12 +1813,20 @@ impl<B: Backend> App<B> {
             return Ok(());
         }
         // Content width for markdown wrapping: the live terminal width (R-ARCH-TUI-005), fallback 80.
-        let width = self.terminal.backend().size().map(|s| s.width as usize).unwrap_or(80);
+        let width = self
+            .terminal
+            .backend()
+            .size()
+            .map(|s| s.width)
+            .unwrap_or_else(|_| fallback_columns()) as usize;
         let output_pad = self.state.transcript.output_pad();
         // Committed tool-result images keep rendering — a half-block raster is ordinary cells, so it
         // survives `insert_before` into native scrollback (see `ImageBlock::halfblock_lines`).
         let images = crate::transcript::ImageOpts {
             show: self.state.transcript.show_images(),
+            // TUI-N01 — the committed path reads the same capability the live one does, so a block
+            // that scrolled up cannot disagree with the one still on screen.
+            graphical: self.state.transcript.graphical_images(),
             width_cells: self.state.transcript.image_width_cells(),
             // X9/X7 — the same live `app.tools.expand` label and session cwd the in-viewport render
             // uses, so a committed block's hints and compact `read` header do not disagree with the
@@ -1666,6 +1866,23 @@ impl<B: Backend> App<B> {
             InputEvent::Key(key) => {
                 if matches!(key.kind, KeyEventKind::Release) {
                     return AppAction::None;
+                }
+                // TUI-S10 — the global debug chord, checked BEFORE any focus routing. Pi tests it
+                // inside `handleTerminalInput` and ahead of the dispatch to the focused component:
+                // `if (matchesKey(data, "shift+ctrl+d") && this.onDebug) { this.onDebug(); return; }`
+                // (`packages/tui/src/tui.ts:850` @v0.83.0), wired at
+                // `interactive-mode.ts:2803` `this.ui.onDebug = () => this.handleDebugCommand();`
+                // with the comment "works regardless of focus". It is deliberately NOT a
+                // configurable id — upstream hardcodes it — which is why it sits outside the
+                // `Keymap` rather than in `Action::from_id`. Without it `/debug` was reachable only
+                // by typing it into the editor, i.e. never while a selector, dialog or overlay had
+                // focus, which is exactly when a diagnostic dump is wanted.
+                if key.code == KeyCode::Char('d')
+                    && key
+                        .modifiers
+                        .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                {
+                    return self.run_command("debug", None);
                 }
                 // A floating overlay (hotkeys/help popup) captures input first (spec/tui/05 §2
                 // routing step 2): the topmost overlay handles the key; `Close` pops it, an unhandled
@@ -1912,6 +2129,71 @@ impl<B: Backend> App<B> {
         )
     }
 
+    /// Rebuild the pending-messages region from BOTH queue sources — Pi's `getAllQueuedMessages`
+    /// (`interactive-mode.ts:3942-3953` @v0.83.0), which concatenates the session's steering /
+    /// follow-up lists with the `compactionQueuedMessages` of the matching mode, in that order.
+    /// TUI-031.
+    fn rebuild_pending_messages(&mut self) {
+        let mut steering = self.state.session_queue.0.clone();
+        steering.extend(
+            self.state
+                .compaction_queue
+                .iter()
+                .filter(|m| !m.follow_up)
+                .map(|m| m.text.clone()),
+        );
+        let mut follow_up = self.state.session_queue.1.clone();
+        follow_up.extend(
+            self.state
+                .compaction_queue
+                .iter()
+                .filter(|m| m.follow_up)
+                .map(|m| m.text.clone()),
+        );
+        self.state.pending_messages.set(steering, follow_up);
+        self.state.status.set_queued(self.state.pending_messages.len());
+    }
+
+    /// Pi's `queueCompactionMessage(text, mode)` (`interactive-mode.ts:4014-4020` @v0.83.0): push
+    /// onto the compaction queue, refresh the pending-messages display, and show
+    /// `Queued message for after compaction`. The editor was already cleared by the submit path, and
+    /// history was already recorded, so only the queue + the two surfaces are left. TUI-031.
+    fn queue_compaction_message(&mut self, text: String, follow_up: bool) {
+        self.state.compaction_queue.push(CompactionQueued { text, follow_up });
+        self.rebuild_pending_messages();
+        self.state.transcript.push_status("Queued message for after compaction");
+    }
+
+    /// Take the whole compaction queue — Pi's `flushCompactionQueue` opens with
+    /// `const queuedMessages = [...this.compactionQueuedMessages]; this.compactionQueuedMessages =
+    /// []; this.updatePendingMessagesDisplay();` (`interactive-mode.ts:4038-4041`), and
+    /// `clearAllQueues` (`:3959-3971`) drains the same list for the Escape restore. TUI-031.
+    fn take_compaction_queue(&mut self) -> Vec<CompactionQueued> {
+        let taken = std::mem::take(&mut self.state.compaction_queue);
+        if !taken.is_empty() {
+            self.rebuild_pending_messages();
+        }
+        taken
+    }
+
+    /// Pi's `setToolsExpanded(expanded)` (`interactive-mode.ts:4032-4048` @v0.84.1) — the single
+    /// entry point BOTH `Ctrl+O` and an extension's `ui.setToolsExpanded` go through, so the two
+    /// cannot drift (TUI-010 / TUI-038).
+    ///
+    /// Early-returns when the value is unchanged (`:4033`), then sets the one flag, fans it out to
+    /// every expandable surface — the tool blocks and the live bash block are cyrup's two — and
+    /// echoes `Tool output: expanded|collapsed`.
+    fn set_tools_expanded(&mut self, expanded: bool) {
+        if !self.state.transcript.set_tool_expanded(expanded) {
+            return;
+        }
+        self.state.transcript.set_bash_expanded(expanded);
+        self.state.transcript.push_status(format!(
+            "Tool output: {}",
+            if expanded { "expanded" } else { "collapsed" }
+        ));
+    }
+
     /// Resolve a global keymap action (R-10-024 Ctrl+C, R-10-030 abort).
     fn apply_action(&mut self, action: Action) -> AppAction {
         match action {
@@ -1928,26 +2210,81 @@ impl<B: Backend> App<B> {
                 if self.state.branch_summary_in_flight {
                     return AppAction::AbortBranchSummary;
                 }
-                // A running `!`/`!!` bash block is cancelled first (the run loop kills the child),
-                // mirroring Pi's `tui.select.cancel` on the bash component.
+                // A compaction rebinds Escape the same way a branch summarization does — Pi's
+                // `case "compaction_start"` sets `this.defaultEditor.onEscape = () => {
+                // this.session.abortCompaction(); }` (`interactive-mode.ts:3080-3086` @v0.83.0) and
+                // `compaction_end` restores it (`:3094-3097`). Checked here for the same reason:
+                // the rebind SHADOWS the default chain for the whole window.
+                if self.state.compacting {
+                    return AppAction::AbortCompaction;
+                }
+                // TUI-005 / TUI-009 — Pi's `defaultEditor.onEscape` is a chain of **four mutually
+                // exclusive** `else if` branches (`interactive-mode.ts:2569-2595` @v0.83.0):
+                //
+                //   if      (isStreaming)   restoreQueuedMessagesToEditor({ abort: true })
+                //   else if (isBashRunning) abortBash()
+                //   else if (isBashMode)    editor.setText(""); isBashMode = false
+                //   else if (editor empty)  the 500 ms double-Escape window
+                //
+                // cyrup ran the bash-child cancel as a plain `if` ahead of the streaming read, so an
+                // Escape during a turn that also had a `!`-child killed the child as collateral —
+                // upstream never touches a bash child while streaming, precisely because the arms
+                // are exclusive. The third and fourth branches did not exist at all.
+                //
+                // 1. Streaming: restore the queued steering/follow-up text to the editor and THEN
+                //    abort, so nothing typed during the run is lost.
+                if self.state.status.streaming {
+                    self.state.transcript.discard_streaming();
+                    self.state.transcript.commit_tools();
+                    self.state.status.set_streaming(false);
+                    self.state.indicator.idle();
+                    return AppAction::InterruptRestoreQueued;
+                }
+                // 2. A running `!`/`!!` bash block — cancel it (the run loop kills the child).
                 if self.state.transcript.bash_running() {
                     self.state.transcript.bash_complete_simple(None, true);
                     self.state.transcript.commit_bash();
+                    self.state.transcript.discard_streaming();
+                    self.state.transcript.commit_tools();
+                    self.state.indicator.idle();
+                    return AppAction::Interrupt;
                 }
-                // Pi branches on `this.session.isStreaming` FIRST (interactive-mode.ts:2636): an Esc
-                // that lands mid-turn restores the queued steering/follow-up text to the editor and
-                // THEN aborts, so nothing the user typed during the run is lost. Read the flag
-                // before the local teardown below clears it.
-                let streaming = self.state.status.streaming;
-                self.state.transcript.discard_streaming();
-                self.state.transcript.commit_tools();
-                self.state.status.set_streaming(false);
-                self.state.indicator.idle();
-                if streaming {
-                    AppAction::InterruptRestoreQueued
-                } else {
-                    AppAction::Interrupt
+                // 3. Bash MODE — a typed-but-unsent `!cmd` in the editor. Pi clears the buffer and
+                //    leaves bash mode (`:2575-2578`); cyrup derives the mode from the buffer the way
+                //    Pi's `onChange` does (`:2621-2622`, `text.trimStart().startsWith("!")`), so
+                //    clearing the buffer *is* leaving the mode.
+                if self.state.editor.text().trim_start().starts_with('!') {
+                    self.state.editor.clear();
+                    return AppAction::Redraw;
                 }
+                // 4. Empty editor — the double-Escape window (`:2579-2594`). `doubleEscapeAction`
+                //    is a live, persisted `/settings` row that had no consumer at all; `tree` opens
+                //    the session tree, `fork` opens the user-message selector (Pi's
+                //    `showUserMessageSelector`), `none` does nothing. The window is 500 ms and a
+                //    fire resets the stamp to zero so a third press starts a new pair.
+                if self.state.editor.text().trim().is_empty() {
+                    let action = self.state.double_escape_action.clone();
+                    if action != "none" {
+                        let now = std::time::Instant::now();
+                        let within = self.state.last_escape.is_some_and(|t| {
+                            now.duration_since(t) < std::time::Duration::from_millis(500)
+                        });
+                        if within {
+                            self.state.last_escape = None;
+                            let kind = if action == "tree" {
+                                SelectorKind::Tree
+                            } else {
+                                SelectorKind::UserMessage
+                            };
+                            return AppAction::Command(AppCommand::OpenSelector(kind));
+                        }
+                        self.state.last_escape = Some(now);
+                    }
+                    return AppAction::Redraw;
+                }
+                // Nothing streaming, no bash, a non-`!` non-empty buffer: Pi's chain falls off the
+                // end and does nothing.
+                AppAction::Redraw
             }
             // `app.clear` (Ctrl+C, Pi `handleCtrlC` interactive-mode.ts:3361-3369): a second Ctrl+C
             // within 500 ms of the previous one EXITS — there is NO emptiness gate (Pi does not require
@@ -1971,13 +2308,19 @@ impl<B: Backend> App<B> {
             // `app.tools.expand` (Ctrl+O) toggles tool-output expansion in-crate (`tool-execution.ts`
             // expand); the live tools re-render expanded/collapsed on the next frame.
             Action::ToolsExpand => {
-                // `Ctrl+O` toggles the live bash block when one is present (`bash-execution.ts`
-                // `setExpanded`), else the tool-output expansion.
-                if self.state.transcript.has_bash() {
-                    self.state.transcript.toggle_bash_expanded();
-                } else {
-                    self.state.transcript.toggle_tool_expanded();
-                }
+                // TUI-038 / TUI-010 — this was an if/else: while ANY `!cmd` block was present the
+                // tool-expansion flag could not be moved at all, and afterwards the two flags were
+                // out of sync with each other and with what the user last asked for. Upstream is a
+                // FAN-OUT: `setToolsExpanded` sets one `toolOutputExpanded` and then broadcasts it
+                // to the active header and to every `isExpandable` child of
+                // `loadedResourcesContainer` and `chatContainer`
+                // (`interactive-mode.ts:4032-4048` @v0.84.1), of which the bash component is one
+                // (`components/bash-execution.ts:29`, `setExpanded` at `:70`). It also ends in
+                // `showStatus("Tool output: …")` (`:4047`) — the SAME line the extension path
+                // already pushed, so the identical user-visible action produced a status when an
+                // extension triggered it and none when a keystroke did.
+                let expanded = !self.state.transcript.tool_expanded();
+                self.set_tools_expanded(expanded);
                 AppAction::Redraw
             }
             // `app.suspend` (Ctrl+Z) is surfaced to the run loop, which tears down raw mode, raises
@@ -2080,11 +2423,18 @@ impl<B: Backend> App<B> {
     /// table — and each row is
     /// ``| `${formatKeyText(key, { capitalize: true })}` | ${shortcut.description ?? shortcut.extensionPath} |``
     /// (`:6193-6197`). cyrup's registry is [`AppState::extension_shortcuts`], the very set the input
-    /// router already matches presses against (`:1501`), fed from `ExtensionHost::shortcut_keys()`
-    /// — so the section is a read of live state, not a fabricated list.
+    /// router already matches presses against (`:1501`), fed from `ExtensionHost::shortcut_specs()`
+    /// — so the section is a read of live state, not a fabricated list. EXT-040: it used to be fed
+    /// from `shortcut_keys()`, a bare `Vec<String>`, so `description ?? extensionPath` always fell
+    /// through to the id and every Action cell repeated its own Key cell.
     ///
     /// The `newLine` row's `" (Ctrl+Enter on Windows Terminal)"` suffix (:6151) is gated on
     /// `process.platform === "win32"`; it is emitted here under the same `cfg(windows)` condition.
+    #[cfg(test)]
+    pub(crate) fn hotkeys_markdown_for_test(&self) -> String {
+        self.hotkeys_markdown()
+    }
+
     fn hotkeys_markdown(&self) -> String {
         let ek = self.state.editor.keymap_ref();
         let km = &self.state.keymap;
@@ -3128,12 +3478,11 @@ impl<B: Backend> App<B> {
         // [`App::tick_extension_dialog_countdown`] — closing the gap where the dialog otherwise never
         // showed the deadline `LiveHostServices::ui_roundtrip` already enforces host-side, and stayed
         // open on screen (stale) after that host-side timeout had already resolved the guest's call.
-        let deadline = opts
-            .timeout_ms
-            .filter(|&ms| ms > 0)
-            .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+        let opened_at = tokio::time::Instant::now();
+        let deadline =
+            opts.timeout_ms.filter(|&ms| ms > 0).map(|ms| opened_at + Duration::from_millis(ms));
         if let Some(deadline) = deadline {
-            inner.set_title(countdown_title(&base_title, deadline));
+            inner.set_title(countdown_title(&base_title, deadline, opened_at));
         }
         self.open_boxed_selector(selector_kind, inner);
         self.state.pending_ui_reply = Some(PendingUiReply { kind, reply, base_title, deadline });
@@ -3283,18 +3632,30 @@ impl<B: Backend> App<B> {
                     self.state.editor.set_text(&text);
                 }
             }
-            UiEffect::SetToolsExpanded { expanded } => {
-                if self.state.transcript.set_tool_expanded(expanded) {
-                    self.state.transcript.push_status(format!(
-                        "Tool output: {}",
-                        if expanded { "expanded" } else { "collapsed" }
-                    ));
+            UiEffect::SetToolsExpanded { expanded } => self.set_tools_expanded(expanded),
+            UiEffect::SetTitle { title } => self.state.terminal_title = Some(title),
+            // TUI-033 — an EMPTY string is the clear. Pi's `setHeader(factory)` /
+            // `setFooter(factory)` restore the built-in when the factory is `undefined`
+            // (`interactive-mode.ts:2245-2254`, `:2273-2290`); cyrup's WIT signature is
+            // `set-header(content: string)` (`world.wit:272`), which has no `undefined`, so the
+            // empty string is the only value that can carry "restore the built-in".
+            UiEffect::SetHeader { content } => {
+                self.state.extension_header = (!content.is_empty()).then_some(content)
+            }
+            UiEffect::SetFooter { content } => {
+                self.state.extension_footer = (!content.is_empty()).then_some(content)
+            }
+            UiEffect::SetWidget { widget } => {
+                // Pi keys widgets and UPDATES IN PLACE: `removeExisting(this.extensionWidgetsAbove);
+                // removeExisting(this.extensionWidgetsBelow);` then `targetMap.set(key, component)`
+                // (`interactive-mode.ts:1926-1958`), and a widget whose `content` is `undefined` is
+                // removed rather than re-mounted (`:1935-1938`). TUI-014.
+                let parsed = ExtensionWidget::from_json(&widget);
+                self.state.extension_widgets.retain(|w| w.key != parsed.key);
+                if !parsed.lines.is_empty() {
+                    self.state.extension_widgets.push(parsed);
                 }
             }
-            UiEffect::SetTitle { title } => self.state.terminal_title = Some(title),
-            UiEffect::SetHeader { content } => self.state.extension_header = Some(content),
-            UiEffect::SetFooter { content } => self.state.extension_footer = Some(content),
-            UiEffect::SetWidget { widget } => self.state.extension_widget = Some(widget),
         }
     }
 
@@ -3311,6 +3672,19 @@ impl<B: Backend> App<B> {
     /// `pub` for the same reason as [`Self::open_extension_dialog`]: `tests/*.rs` calls it directly
     /// to simulate the run loop's 1s tick without needing a real `tokio::time::sleep`.
     pub fn tick_extension_dialog_countdown(&mut self) {
+        self.tick_extension_dialog_countdown_at(tokio::time::Instant::now());
+    }
+
+    /// [`Self::tick_extension_dialog_countdown`] with an INJECTED instant — TUI-N09.
+    ///
+    /// `tests/extension_dialog_countdown.rs` used to `std::thread::sleep(1_100ms)` and then assert
+    /// the literal `"Proceed? (2s)"` against a 3 s budget, i.e. a wall-clock-exact assertion with
+    /// ~900 ms of scheduler slack in a suite of thousands of tests. A CI or loaded-laptop stall past
+    /// 900 ms turned it red with a message pointing at the countdown logic rather than at the
+    /// scheduler. Pi drives the same countdown from an injected timer rather than a wall-clock sleep
+    /// (`components/countdown-timer.ts:21-30`), and this crate already has the pattern in
+    /// `StatusIndicator::retry_message`, which recomputes from a stored `Instant`.
+    pub fn tick_extension_dialog_countdown_at(&mut self, now: tokio::time::Instant) {
         let Some((base_title, deadline)) = self
             .state
             .pending_ui_reply
@@ -3319,13 +3693,13 @@ impl<B: Backend> App<B> {
         else {
             return;
         };
-        if tokio::time::Instant::now() >= deadline {
+        if now >= deadline {
             if let Some(pending) = self.state.pending_ui_reply.take() {
                 let _ = pending.reply.send(default_ui_reply(pending.kind));
             }
             self.close_selector(true);
         } else if let Some(active) = self.state.selector.as_mut() {
-            active.inner.set_title(countdown_title(&base_title, deadline));
+            active.inner.set_title(countdown_title(&base_title, deadline, now));
         }
     }
 
@@ -3445,8 +3819,32 @@ impl<B: Backend> App<B> {
             // replace the settings selector with the nested picker. Only `"theme"` exists today — the
             // theme picker with live preview (`ThemeSubmenu`); an unknown id is a defensive no-op.
             SelectorOutcome::OpenSubmenu(id) => {
-                if id == "theme" {
-                    self.open_selector(SelectorKind::Theme);
+                match id.as_str() {
+                    "theme" => self.open_selector(SelectorKind::Theme),
+                    // TUI-032 — `thinking` opens the picker cyrup already had and could not reach:
+                    // Pi's `SelectSubmenu("Thinking Level", …, config.availableThinkingLevels, …,
+                    // callbacks.onThinkingLevelChange)` (`settings-selector.ts:591-611`).
+                    "thinking" => self.open_selector(SelectorKind::Thinking),
+                    // `warnings` is a nested toggle LIST, not a picker — Pi's
+                    // `WarningSettingsSubmenu` (`settings-selector.ts:120-160`) is a `SettingsList`
+                    // over one item, `anthropic-extra-usage`, whose `onChange` writes straight
+                    // through. cyrup reuses the same `SettingsSelector` component and the same
+                    // `Apply("id\u{1f}value")` → `AppCommand::ApplySetting` persist path the parent
+                    // grid rides, so the nested row writes the global layer with no new plumbing.
+                    "warnings" => {
+                        let rows = vec![SettingRow::toggle(
+                            "warnings.anthropicExtraUsage",
+                            "Anthropic extra usage",
+                            self.state.warn_anthropic_extra_usage,
+                        )
+                        .with_description(
+                            "Warn when Anthropic subscription auth may use paid extra usage",
+                        )];
+                        let inner: Box<dyn Selector> =
+                            Box::new(SettingsSelector::new("Warnings", rows));
+                        self.open_boxed_selector(SelectorKind::Settings, inner);
+                    }
+                    _ => {}
                 }
                 AppAction::Redraw
             }
@@ -3465,19 +3863,38 @@ impl<B: Backend> App<B> {
     /// model, switch branch, login…).
     fn confirm_selector(&mut self, kind: SelectorKind, value: &str) -> Option<AppCommand> {
         match kind {
+            // TUI-N03 — this arm used to return `None`, so a theme chosen in `/settings` repainted
+            // the UI and then died with the process: no `ApplySetting` ever reached the persist arm.
+            // Pi distinguishes PREVIEW from CONFIRM — `onThemePreview: (name) =>
+            // themeController.preview(name)` versus `onThemeChange: (t) => {
+            // this.settingsManager.setTheme(t); void this.themeController.applyFromSettings(); }`
+            // (`interactive-mode.ts:4226-4231`) — and cyrup treated confirm as a preview that stuck
+            // until exit. Worse in combination with TUI-004: `ThemeController::sync_with_terminal`
+            // persists an OSC-11 detection only when `settings.theme` is UNSET, which is exactly the
+            // state a never-persisted user choice leaves behind, so the next launch overwrote it.
+            //
+            // `set_theme` still runs for the immediate repaint; the persist arm (`C::ApplySetting`)
+            // pushes the `theme → {value}` status, so this arm no longer pushes its own.
             SelectorKind::Theme => {
                 self.set_theme(UiTheme::builtin(value));
-                self.state.transcript.push_status(format!("theme → {value}"));
-                None
+                Some(AppCommand::ApplySetting {
+                    id: "theme".to_string(),
+                    value: value.to_string(),
+                })
             }
+            // TUI-032 — the level is applied to the SESSION, not written to the settings layer:
+            // Pi's `onThinkingLevelChange` is `this.session.setThinkingLevel(level);
+            // this.footer.invalidate(); this.updateEditorBorderColor();`
+            // (`interactive-mode.ts:4222-4226`). The optimistic local mirror below keeps the footer
+            // and the editor rule in lockstep on the frame the picker closes; the session's
+            // `ThinkingLevelChanged` event then confirms (or clamps) it.
             SelectorKind::Thinking => {
                 self.state.thinking_level = value.to_string();
                 self.state.status.set_thinking_level(value);
                 // The editor's rule color is the always-visible thinking-level signal (spec/tui/03
                 // §3.3) — keep it in lockstep with the selected level.
                 self.state.editor.set_thinking_level(value);
-                self.state.transcript.push_status(format!("thinking → {value}"));
-                None
+                Some(AppCommand::SetThinking(value.to_string()))
             }
             SelectorKind::ShowImages => {
                 self.state.show_images = value == "yes";
@@ -3669,6 +4086,11 @@ impl<B: Backend> App<B> {
                     session.services().settings.effective(),
                     &self.state.theme.name,
                     &self.state.keymap,
+                    &self.state.thinking_level,
+                    // TUI-036 — `supportsImages` gates the two image rows upstream.
+                    self.state.image_renderer.is_graphical(),
+                    // TUI-041 — the PROCESS env, the same surface the runtime resolves against.
+                    &cyrup_session_svc::EnvVars::from_process(),
                 );
                 let inner: Box<dyn Selector> = Box::new(SettingsSelector::new("Settings", rows));
                 self.open_boxed_selector(SelectorKind::Settings, inner);
@@ -3833,7 +4255,12 @@ impl<B: Backend> App<B> {
                 // extension's `setLabel` uses (`LiveHostServices::set_label` → `manager.append_label`,
                 // host_services.rs:866). An empty label removes it (`apply_label` drops empty labels),
                 // matching Pi's `value || undefined`. Silently degrades (unknown id / busy), like Pi.
-                session.services().host_services.set_label(&entry_id, &label);
+                // `set_label` takes pi's optional label (`setLabel(entryId, label?)`): an EMPTY
+                // edit clears it, which is pi's `value || undefined`.
+                session.services().host_services.set_label(
+                    &entry_id,
+                    (!label.is_empty()).then_some(label.as_str()),
+                );
                 let msg = if label.is_empty() {
                     "label removed".to_string()
                 } else {
@@ -3921,6 +4348,46 @@ impl<B: Backend> App<B> {
                         self.state.transcript.push_status(format!("Thinking level: {label}"));
                     }
                     Err(e) => self.state.transcript.push_status(format!("thinking error: {e}")),
+                }
+            }
+            // TUI-032 — the `/settings` → `Thinking level` submenu's confirm. Pi's
+            // `onThinkingLevelChange` (`interactive-mode.ts:4222-4226`) calls
+            // `session.setThinkingLevel(level)`, which clamps to the model's capabilities and emits
+            // `ThinkingLevelChanged`; the footer + editor rule re-color off that event exactly as
+            // they do for Shift+Tab.
+            C::SetThinking(level) => {
+                let parsed = match level.as_str() {
+                    "off" => Some(ModelThinkingLevel::Off),
+                    "minimal" => Some(ModelThinkingLevel::Minimal),
+                    "low" => Some(ModelThinkingLevel::Low),
+                    "medium" => Some(ModelThinkingLevel::Medium),
+                    "high" => Some(ModelThinkingLevel::High),
+                    "xhigh" => Some(ModelThinkingLevel::Xhigh),
+                    "max" => Some(ModelThinkingLevel::Max),
+                    _ => None,
+                };
+                match parsed {
+                    Some(l) => match session.set_thinking_level(l).await {
+                        Ok(applied) => {
+                            let label = match applied {
+                                ModelThinkingLevel::Off => "off",
+                                ModelThinkingLevel::Minimal => "minimal",
+                                ModelThinkingLevel::Low => "low",
+                                ModelThinkingLevel::Medium => "medium",
+                                ModelThinkingLevel::High => "high",
+                                ModelThinkingLevel::Xhigh => "xhigh",
+                                ModelThinkingLevel::Max => "max",
+                            };
+                            self.state.transcript.push_status(format!("Thinking level: {label}"));
+                        }
+                        Err(e) => {
+                            self.state.transcript.push_status(format!("thinking error: {e}"))
+                        }
+                    },
+                    None => self
+                        .state
+                        .transcript
+                        .push_status(format!("thinking error: unknown level {level}")),
                 }
             }
             C::ConfirmSelection { kind: SelectorKind::ScopedModels, value } => {
@@ -4096,9 +4563,21 @@ impl<B: Backend> App<B> {
             C::DeleteSession(path) => {
                 // `/resume` in-list delete (`onDeleteSession`): remove the persisted JSONL via the
                 // additive `delete_session_file` seam (refuses the active session).
+                // SEAM-063 — the seam now routes through the OS `trash` CLI first and reports
+                // WHICH happened, so the status line is pi's own:
+                // `result.method === "trash" ? "Session moved to trash" : "Session deleted"`
+                // (`modes/interactive/components/session-selector.ts:846` @v0.83.0) and
+                // `Failed to delete: ${error}` (`:849`). It used to say "deleted session" whether
+                // or not the file went.
                 match session.delete_session_file(std::path::Path::new(&path)) {
-                    Ok(()) => self.state.transcript.push_status(format!("deleted session {path}")),
-                    Err(e) => self.state.transcript.push_status(format!("delete error: {e}")),
+                    Ok(method) => self
+                        .state
+                        .transcript
+                        .push_status(method.status_message().to_string()),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("Failed to delete: {e}")),
                 }
             }
             C::RenameSession { path, name } => {
@@ -4166,6 +4645,25 @@ impl<B: Backend> App<B> {
                 // immediately when turned off rather than waiting for a rebind).
                 if id == "showHardwareCursor" {
                     self.state.editor.set_show_hardware_cursor(value == "true");
+                }
+                // TUI-041 — `terminal.clearOnShrink` was in neither the live-apply list nor the
+                // grid's resolved read, so it did not take effect until the next launch. Pi's
+                // `onClearOnShrinkChange` calls `this.ui.setClearOnShrink(clearOnShrink)`
+                // immediately (`interactive-mode.ts`, and `handleReloadCommand` re-applies it at
+                // `:5401-5405`). cyrup's counterpart is the reserved idle status band.
+                if id == "terminal.clearOnShrink" {
+                    self.state.reserve_status_rows = value == "true";
+                }
+                // TUI-009 — the Escape chain reads the cached copy, so the row has to push into it
+                // or a flip would not take effect until the next session bind. Pi re-reads
+                // `getDoubleEscapeAction()` inside `onEscape` itself (`:2580`), which is the same
+                // liveness.
+                if id == "doubleEscapeAction" {
+                    self.state.double_escape_action = value.clone();
+                }
+                // TUI-032 — same reason: the submenu is rebuilt from the cache each time it opens.
+                if id == "warnings.anthropicExtraUsage" {
+                    self.state.warn_anthropic_extra_usage = value == "true";
                 }
                 // `enableSkillCommands` gates the `skill:<name>` half of the `/` menu
                 // (`interactive-mode.ts:613`); Pi rebuilds the autocomplete provider on the change,
@@ -4317,10 +4815,34 @@ impl<B: Backend> App<B> {
                 // `/reload` (handleReloadCommand): rebuild the active session in place (Pi `reload`,
                 // agent-session.ts:2451) — re-reads settings/resources/keybindings, resets the
                 // provider, preserves the persisted transcript.
-                Some(rt) => match rt.reload(None).await {
-                    Ok(()) => self.state.pending_swap_status = Some("reloaded resources".into()),
+                Some(rt) => {
+                    let agent_dir = session.services().agent_dir.clone();
+                    match rt.reload(None).await {
+                    // TUI-025 — Pi's own sentence, `interactive-mode.ts:5418-5423` @v0.83.0.
+                    // cyrup's `"reloaded resources"` said nothing about WHAT was reloaded, and the
+                    // `/` menu's own help string for the command was a second, different wording.
+                    // The `; saved project trust` variant is TUI-037's — it needs the implicit-trust
+                    // write, which lives in `crates/cyrup`.
+                    Ok(()) => {
+                        // TUI-051 — Pi's ordering: session reload first, THEN
+                        // `this.keybindings.reload()` (`interactive-mode.ts:5386`). A malformed
+                        // document must not wipe the live keymap silently, so the error is
+                        // surfaced; the maps have already been reset to defaults by then, which is
+                        // also what pi's replace-semantics `rebuild()` leaves behind.
+                        if let Err(e) = self.reload_keybindings_from(&agent_dir) {
+                            self.state
+                                .transcript
+                                .push_status(format!("keybindings error: {e}"));
+                        }
+                        self.state.pending_swap_status = Some(
+                            "Reloaded keybindings, extensions, skills, prompts, themes, and \
+                             context files"
+                                .into(),
+                        )
+                    }
                     Err(e) => self.state.transcript.push_status(format!("reload error: {e}")),
-                },
+                    }
+                }
                 None => self.state.transcript.push_status("reloading resources…"),
             },
             C::Import(p) => match (runtime, p) {
@@ -4475,6 +4997,23 @@ impl<B: Backend> App<B> {
     ) {
         let ext_host = session.services().ext_host.clone();
         self.ingest_event_with_extensions(ev, &ext_host).await;
+        // TUI-031 — `flushCompactionQueue` (`interactive-mode.ts:4036-4110` @v0.83.0), the last
+        // statement of pi's `compaction_end` arm. Runs here because it needs the session; the sync
+        // `ingest_event` half only raises the flag.
+        if std::mem::take(&mut self.state.compaction_flush_pending) {
+            for msg in self.take_compaction_queue() {
+                // `if (isExtensionCommand) prompt(text) else if (mode === "followUp")
+                // followUp(text) else steer(text)` (`:4055-4062`). Delivered in queue order.
+                let ui = UserInput::text(msg.text.clone(), InputSource::Tui);
+                if is_extension_command(session, &msg.text) {
+                    let _ = session.prompt_accepted(ui).await;
+                } else if msg.follow_up {
+                    let _ = session.follow_up(ui).await;
+                } else {
+                    let _ = session.steer(ui).await;
+                }
+            }
+        }
         // `autoCompactionEnabled` is a plain `bool` read with no session walk behind it, and
         // upstream's THIRD `setAutoCompactEnabled` call site is a settings toggle rather than a turn
         // event (`interactive-mode.ts:4417-4419`), so it must not ride the six-event predicate that
@@ -4711,8 +5250,10 @@ impl<B: Backend> App<B> {
             // (`status.set_queued`) and, since the fidelity pass deleted the `{n} queued` footer
             // segment, rendered it nowhere; the texts were dropped on the floor here.
             AgentSessionEvent::QueueUpdate { steering, follow_up } => {
-                self.state.pending_messages.set(steering.clone(), follow_up.clone());
-                self.state.status.set_queued(self.state.pending_messages.len());
+                self.state.session_queue = (steering.clone(), follow_up.clone());
+                // TUI-031 — the region shows the UNION of the session's queues and the compaction
+                // queue, as `getAllQueuedMessages` does (`interactive-mode.ts:3942-3953`).
+                self.rebuild_pending_messages();
             }
             AgentSessionEvent::CompactionStart { reason } => {
                 // Pi `case "compaction_start"` (`interactive-mode.ts:3076-3078`): compaction is
@@ -4740,8 +5281,10 @@ impl<B: Backend> App<B> {
                 // identical string into the transcript, which `insert_before` then froze into
                 // scrollback as a permanent dim `• Compacting context...` row upstream never writes.
                 self.state.indicator.set(IndicatorKind::Compaction, Some(msg));
+                // Pi rebinds `defaultEditor.onEscape` to `abortCompaction` here (`:3080-3086`).
+                self.state.compacting = true;
             }
-            AgentSessionEvent::CompactionEnd { .. } => {
+            AgentSessionEvent::CompactionEnd { reason, result, aborted, error_message, .. } => {
                 // Pi `case "compaction_end"` (`interactive-mode.ts:3090-3092`): clears
                 // unconditionally, even when this was an AUTO-compaction inside a still-streaming
                 // turn. Pi's own `agent_end` then re-clears; the visible effect is a brief gap in
@@ -4754,7 +5297,48 @@ impl<B: Backend> App<B> {
                 } else {
                     self.state.indicator.idle();
                 }
-                self.state.transcript.push_status("compaction complete");
+                // TUI-054 — this arm used to end in an unconditional
+                // `push_status("compaction complete")`, discarding every field of the event. A
+                // refusal ("Nothing to compact") and an outright provider failure (`http 400`) were
+                // both followed on screen by a claim that the context had been compacted, which it
+                // had not been; the user then reasons about their remaining window from a false
+                // premise.
+                //
+                // Pi branches instead (`interactive-mode.ts:3089-3123` @v0.83.0) and never states
+                // success in words: `aborted` ⇒ `showError("Compaction cancelled")` for a manual
+                // compaction and `showStatus("Auto-compaction cancelled")` otherwise; `result` ⇒
+                // the compaction-summary MESSAGE; `errorMessage` ⇒ `showError(...)` for manual and
+                // an error-styled chat line otherwise.
+                //
+                // **[CYRUP-DELTA]** Pi's `/compact` handler renders nothing at all
+                // (`handleCompactCommand`, `:6030-6038`: `await this.session.compact()` inside a
+                // `try {} catch {}` whose comment is "Ignore, will be emitted as an event"), so the
+                // event is upstream's ONLY renderer. cyrup's `/compact` returns a `CompactOutcome`
+                // that [`App::apply_compact_outcome`] renders on the command path — the seam that
+                // moved the compaction off the run loop. Both would fire for a manual compaction,
+                // so this arm renders the automatic reasons only and leaves `Manual` to the command
+                // path. Residual: a manual abort reads `compact error: …` here where pi reads
+                // `Compaction cancelled`.
+                if !matches!(reason, CompactionReason::Manual) {
+                    if *aborted {
+                        self.state.transcript.push_status("Auto-compaction cancelled");
+                    } else if let Some(msg) = error_message {
+                        self.state.transcript.push_error(msg.clone());
+                    } else if let Some(res) = result {
+                        self.state
+                            .transcript
+                            .push_compaction_summary(res.tokens_before, res.summary.clone());
+                    }
+                }
+                // TUI-031 — `void this.flushCompactionQueue({ willRetry: event.willRetry })` is the
+                // LAST statement of pi's `compaction_end` arm (`interactive-mode.ts:3103`), and it
+                // runs on every outcome, aborted and failed included. `ingest_event` cannot await a
+                // session call, so the drained batch rides out on `AppState` for the run loop's
+                // `ingest_session_event` wrapper to dispatch — see
+                // [`App::take_pending_compaction_flush`].
+                self.state.compaction_flush_pending = true;
+                // Pi restores the previous Escape handler here (`:3094-3097`).
+                self.state.compacting = false;
             }
             AgentSessionEvent::AutoRetryStart { attempt, max_attempts, delay_ms, .. } => {
                 // Pi's exact retry copy (status-indicator.ts:46-47): `Retrying (a/max) in Ns...`,
@@ -5705,6 +6289,9 @@ fn settings_rows(
     eff: &cyrup_session_svc::EffectiveSettings,
     current_theme: &str,
     keymap: &Keymap,
+    thinking_level: &str,
+    supports_images: bool,
+    env: &cyrup_session_svc::EnvVars,
 ) -> Vec<SettingRow> {
     let choices = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     // `const followUpKey = keyDisplayText("app.message.followUp")` (`settings-selector.ts:491`),
@@ -5715,42 +6302,58 @@ fn settings_rows(
         .keys_label(Action::FollowUp)
         .map(|k| crate::chrome::format_key_text(&k, true))
         .unwrap_or_default();
-    vec![
+    // TUI-036 — `Show images` / `Image width` are offered ONLY on a terminal that has an image
+    // protocol: `// Only show image toggle if terminal supports it` / `if (supportsImages) {
+    // items.splice(1, 0, {id:"show-images", …}); items.splice(2, 0, {id:"image-width-cells", …}); }`
+    // (`settings-selector.ts:654-671` @v0.83.0), where `supportsImages` comes from
+    // `getCapabilities()`. The neighbouring `auto-resize-images` row is deliberately NOT gated — it
+    // is spliced at `supportsImages ? 3 : 1` — which is exactly the distinction cyrup lost by
+    // pushing all three unconditionally. On a plain xterm the two rows could not change anything,
+    // and every row below them sat at a different index from pi's.
+    let image_rows: Vec<SettingRow> = if supports_images {
+        vec![
+            SettingRow::toggle("terminal.showImages", "Show images", eff.show_images())
+                .with_description("Render images inline in terminal"),
+            SettingRow::choice(
+                "terminal.imageWidthCells",
+                "Image width",
+                eff.image_width_cells().to_string(),
+                choices(&["60", "80", "120"]),
+            )
+            .with_description("Preferred inline image width in terminal cells"),
+        ]
+    } else {
+        Vec::new()
+    };
+    let mut rows = vec![
         // The "Theme" row opens the theme picker (Pi `SettingItem.submenu` → `ThemeSubmenu`,
         // settings-selector.ts:603-610) — the one in-app path Pi reaches theme switching through.
         SettingRow::submenu("theme", "Theme", current_theme.to_string(), "theme")
             .with_description("Color theme for the interface"),
         SettingRow::toggle("compaction.enabled", "Auto-compact", eff.compaction_enabled())
             .with_description("Automatically compact context when it gets too large"),
-        SettingRow::toggle("terminal.showImages", "Show images", eff.show_images())
-            .with_description("Render images inline in terminal"),
-        SettingRow::choice(
-            "terminal.imageWidthCells",
-            "Image width",
-            eff.image_width_cells().to_string(),
-            choices(&["60", "80", "120"]),
-        )
-        .with_description("Preferred inline image width in terminal cells"),
+    ];
+    rows.extend(image_rows);
+    rows.extend([
         SettingRow::toggle("images.autoResize", "Auto-resize images", eff.image_auto_resize())
             .with_description("Resize large images to 2000x2000 max for better model compatibility"),
         SettingRow::toggle("images.blockImages", "Block images", eff.block_images())
             .with_description("Prevent images from being sent to LLM providers"),
         SettingRow::toggle("enableSkillCommands", "Skill commands", eff.enable_skill_commands())
             .with_description("Register skills as /skill:name commands"),
-        // `showHardwareCursor` / `terminal.clearOnShrink` — the effective getters need the env surface;
-        // a default `EnvVars` yields the persisted setting (else `false`), which is what the grid edits.
-        SettingRow::toggle(
-            "showHardwareCursor",
-            "Show hardware cursor",
-            eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::default()),
-        )
-        .with_description("Show the terminal cursor while still positioning it for IME support"),
-        SettingRow::toggle(
-            "terminal.clearOnShrink",
-            "Clear on shrink",
-            eff.clear_on_shrink(&cyrup_session_svc::EnvVars::default()),
-        )
-        .with_description("Clear empty rows when content shrinks (may cause flicker)"),
+        // TUI-041 — these two getters resolve `setting → env → false`
+        // (`cyrup-config/src/settings.rs`, `.unwrap_or(env.hardware_cursor)` /
+        // `.unwrap_or(env.clear_on_shrink)`, sourced from `CYRUP_HARDWARE_CURSOR`/`PI_HARDWARE_CURSOR`
+        // and `CYRUP_CLEAR_ON_SHRINK`/`PI_CLEAR_ON_SHRINK`). The grid used to build both rows against
+        // a **default** `EnvVars`, i.e. an env-blind read, while the RUNTIME used
+        // `EnvVars::from_process()` (`crates/cyrup/src/main.rs`) — so with either variable set and
+        // nothing persisted, `/settings` reported `false` for behaviour that was on and toggling the
+        // row looked like a no-op. Pi renders every row from the same resolved value the runtime
+        // uses; it has no second, env-blind read path.
+        SettingRow::toggle("showHardwareCursor", "Show hardware cursor", eff.show_hardware_cursor(env))
+            .with_description("Show the terminal cursor while still positioning it for IME support"),
+        SettingRow::toggle("terminal.clearOnShrink", "Clear on shrink", eff.clear_on_shrink(env))
+            .with_description("Clear empty rows when content shrinks (may cause flicker)"),
         SettingRow::choice(
             "editorPaddingX",
             "Editor padding",
@@ -5864,7 +6467,47 @@ fn settings_rows(
         .with_description(
             "Fallback behavior when no extension or saved trust decision decides project trust",
         ),
-    ]
+        // TUI-032 — the two submenu rows pi ships that cyrup had no counterpart for.
+        //
+        // `warnings` (`settings-selector.ts:578-590` @v0.83.0): `currentValue: "configure"`,
+        // `submenu: … new WarningSettingsSubmenu(currentWarnings, …)` whose single item is
+        // `anthropic-extra-usage` (`:130-136`). `warnings.anthropicExtraUsage` is fully parsed and
+        // honoured by cyrup (`cyrup-config/src/settings.rs:922-926`) and had **no editor**, so the
+        // only way to turn the Anthropic paid-extra-usage warning off was to hand-edit
+        // `settings.json`.
+        SettingRow::submenu("warnings", "Warnings", "configure", "warnings")
+            .with_description("Enable or disable individual warnings"),
+        // `thinking` (`:591-611`): `label: "Thinking level"`, a `SelectSubmenu` over
+        // `config.availableThinkingLevels`. cyrup already had the picker built —
+        // `SelectorKind::Thinking` with a live confirm arm — and no way in: `open_selector` had
+        // exactly one call site and it only ever constructed `SelectorKind::Theme`. Shift+Tab
+        // cycled blindly with no list of the levels.
+        SettingRow::submenu("thinking", "Thinking level", thinking_level.to_string(), "thinking")
+            .with_description("Reasoning depth for thinking-capable models"),
+    ]);
+    rows
+}
+
+/// Build the `/settings` grid against default effective settings — the test seam for the two rows
+/// TUI-032 adds and the two TUI-036 gates. Production always goes through the `C::OpenSelector`
+/// arm, which sources the live session's settings.
+#[cfg(test)]
+pub(crate) fn settings_rows_for_test_with_images(supports_images: bool) -> Vec<SettingRow> {
+    let eff = cyrup_session_svc::EffectiveSettings::default();
+    settings_rows(
+        &eff,
+        "dark",
+        &Keymap::default(),
+        "medium",
+        supports_images,
+        &cyrup_session_svc::EnvVars::default(),
+    )
+}
+
+/// [`settings_rows_for_test_with_images`] with an image-capable terminal.
+#[cfg(test)]
+pub(crate) fn settings_rows_for_test() -> Vec<SettingRow> {
+    settings_rows_for_test_with_images(true)
 }
 
 /// The settings string for a [`cyrup_session_svc::DefaultProjectTrust`] (Pi serializes it as the
@@ -5994,7 +6637,26 @@ pub(crate) fn max_visible_editor_lines(term_rows: u16) -> u16 {
     ((u32::from(term_rows) * 3 / 10).min(u32::from(u16::MAX)) as u16).max(5)
 }
 
-fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 7] {
+/// The rows an extension widget list occupies, `above` or `below` the editor (TUI-014).
+fn widget_rows(state: &AppState, below: bool) -> u16 {
+    state
+        .extension_widgets
+        .iter()
+        .filter(|w| w.below == below)
+        .map(|w| w.lines.len().min(u16::MAX as usize) as u16)
+        .fold(0u16, u16::saturating_add)
+}
+
+/// The rows the extension header occupies (TUI-033).
+fn header_rows(state: &AppState) -> u16 {
+    state
+        .extension_header
+        .as_deref()
+        .map(|h| h.lines().count().min(u16::MAX as usize) as u16)
+        .unwrap_or(0)
+}
+
+fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 10] {
     let avail = avail.max(1);
     let max_editor = avail.saturating_sub(2).max(3);
     // A selector owns the slot at its desired height; otherwise the editor sizes to its line count +
@@ -6097,6 +6759,18 @@ fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 7] {
     // editor/footer floors, the popup, the band and the images reproduces that priority.
     let pending = state.pending_messages.height().min(remaining);
     remaining = remaining.saturating_sub(pending);
+    // TUI-014 — Pi's `widgetContainerAbove` / `widgetContainerBelow` are two more `VStack` entries
+    // in the dock, at `shrink: 1, minSize: 0`, sitting either side of `editorContainer`
+    // (`interactive-mode.ts:876-883`, and the mount order at `:709-719`). Taken after the editor and
+    // footer floors for the same reason the pending region is: they yield their rows first.
+    let widgets_above = widget_rows(state, false).min(remaining);
+    remaining = remaining.saturating_sub(widgets_above);
+    let widgets_below = widget_rows(state, true).min(remaining);
+    remaining = remaining.saturating_sub(widgets_below);
+    // TUI-033 — the custom header replaces `builtInHeader` inside `headerContainer`
+    // (`interactive-mode.ts:2273-2290`), which is docked ABOVE the chat container.
+    let header = header_rows(state).min(remaining);
+    remaining = remaining.saturating_sub(header);
     // The message region = the active turn's content, plus the startup-hint block at idle, capped
     // to whatever rows remain (so the inline viewport stays content-sized, not full-screen).
     let active = state.transcript.content_height(width as usize, &state.theme).min(u16::MAX as usize)
@@ -6113,7 +6787,7 @@ fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 7] {
         0
     };
     let msg = active.max(hint).min(remaining);
-    [msg, pending, band, images, slot, popup, footer]
+    [header, msg, pending, band, images, widgets_above, slot, popup, widgets_below, footer]
 }
 
 /// The inline-viewport height = the sum of the live-region rows (audit #1). Driven by
@@ -6132,21 +6806,49 @@ fn live_region_height(state: &AppState, width: u16, term_height: u16) -> u16 {
 /// Pure render: lay out conversation / editor / status and render each component (`state -> frame`).
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
-    let [msg_h, pending_h, band_h, images_h, slot_h, popup_h, footer_h] =
+    let [header_h, msg_h, pending_h, band_h, images_h, wabove_h, slot_h, popup_h, wbelow_h, footer_h] =
         region_constraints(state, area.width, area.height);
     let _ = msg_h; // the message region absorbs the remainder via `Min(0)` below.
-    let [msg_area, pending_area, band_area, images_area, slot_area, popup_area, status_area] =
-        Layout::vertical([
-            // `Min(0)` (not the old `Min(1)`): the empty turn must not balloon the viewport (audit #1).
-            Constraint::Min(0),
-            Constraint::Length(pending_h),
-            Constraint::Length(band_h),
-            Constraint::Length(images_h),
-            Constraint::Length(slot_h),
-            Constraint::Length(popup_h),
-            Constraint::Length(footer_h),
-        ])
-        .areas(area);
+    let [
+        header_area,
+        msg_area,
+        pending_area,
+        band_area,
+        images_area,
+        wabove_area,
+        slot_area,
+        popup_area,
+        wbelow_area,
+        status_area,
+    ] = Layout::vertical([
+        // TUI-033 — `headerContainer` is docked above `chatContainer` (`interactive-mode.ts:709`).
+        Constraint::Length(header_h),
+        // `Min(0)` (not the old `Min(1)`): the empty turn must not balloon the viewport (audit #1).
+        Constraint::Min(0),
+        Constraint::Length(pending_h),
+        Constraint::Length(band_h),
+        Constraint::Length(images_h),
+        // TUI-014 — `widgetContainerAbove`, immediately before `editorContainer` (`:715-716`).
+        Constraint::Length(wabove_h),
+        Constraint::Length(slot_h),
+        Constraint::Length(popup_h),
+        // TUI-014 — `widgetContainerBelow`, immediately after `editorContainer` (`:717`).
+        Constraint::Length(wbelow_h),
+        Constraint::Length(footer_h),
+    ])
+    .areas(area);
+    if header_h > 0
+        && let Some(content) = state.extension_header.as_deref()
+    {
+        let lines: Vec<Line<'static>> = content
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_string(), state.theme.base_style())))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines).style(state.theme.base_style()),
+            header_area,
+        );
+    }
     state.transcript.render(frame, msg_area, &state.theme);
     // The compact startup-help block (`compactInstructions` + `compactOnboarding` + `onboarding`,
     // the startup `ExpandableText`'s collapsed body at interactive-mode.ts:936-957, framed by
@@ -6215,7 +6917,28 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
             frame.render_widget(Paragraph::new(lines).style(state.theme.base_style()), inner);
         }
     }
-    state.status.render(frame, status_area, &state.theme);
+    if wabove_h > 0 {
+        render_extension_widgets(frame, wabove_area, state, false);
+    }
+    if wbelow_h > 0 {
+        render_extension_widgets(frame, wbelow_area, state, true);
+    }
+    // TUI-033 — `setExtensionFooter` CLEARS `footerContainer` and adds the extension component in
+    // place of the built-in footer, restoring the built-in when the factory is cleared
+    // (`interactive-mode.ts:2245-2254`). So this is a swap, not an overlay.
+    match state.extension_footer.as_deref() {
+        Some(content) => {
+            let lines: Vec<Line<'static>> = content
+                .lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), state.theme.base_style())))
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).style(state.theme.base_style()),
+                status_area,
+            );
+        }
+        None => state.status.render(frame, status_area, &state.theme),
+    }
     // Floating overlays draw last, on top of the live region, bottom→top (spec/tui/05 §2; arch-10
     // §6.4): each clears its own `Rect` then renders its box.
     for overlay in state.overlays.iter_mut() {
@@ -6226,16 +6949,77 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
 /// Render the attached-image strip inline above the editor (`components/image.ts`): stack each
 /// [`ImageBlock`] at its natural cell height, drawing the real protocol when `show_images` is on and a
 /// text placeholder when off (spec/tui/06 §6). Honors the live image protocol negotiated at startup.
+/// TUI-039 — the terminal-geometry fallback is a **two-step** one upstream, not a constant:
+/// `get columns() { return process.stdout.columns || Number(process.env.COLUMNS) || 80; }` and
+/// `get rows() { return process.stdout.rows || Number(process.env.LINES) || 24; }`
+/// (`packages/tui/src/tui.ts:1730-1736` @v0.83.0). Wherever the ioctl gives no size — a pipe, a CI
+/// harness, some container PTY setups — cyrup pinned 80 columns and silently ignored a `COLUMNS=200`
+/// the user or harness had set.
+///
+/// `Number("garbage")` is `NaN`, which is falsy, so pi falls through to the constant; a parse
+/// failure, a zero and a negative all do the same here.
+fn fallback_columns() -> u16 {
+    env_geometry("COLUMNS").unwrap_or(80)
+}
+
+/// The `$LINES` half (`tui.ts:1734-1736`). Returned as an `Option` rather than defaulted to pi's
+/// bare `24`, because cyrup's one caller has a strictly better last resort available — the live
+/// inline-viewport height — and chains onto this.
+fn env_rows() -> Option<u16> {
+    env_geometry("LINES")
+}
+
+/// `Number(process.env.X) || …` — a positive integer, else `None`.
+fn env_geometry(var: &str) -> Option<u16> {
+    std::env::var(var).ok()?.trim().parse::<u16>().ok().filter(|n| *n > 0)
+}
+
+/// Pi's `isExtensionCommand(text)` (`interactive-mode.ts:4022-4030` @v0.83.0): a leading `/`, the
+/// word up to the first space, looked up in the extension runner's command registry. An extension
+/// command is executed immediately even during a compaction — it is UI work, not a turn — which is
+/// why the compaction queue skips it. TUI-031.
+fn is_extension_command(session: &AgentSession, text: &str) -> bool {
+    let Some(body) = text.strip_prefix('/') else { return false };
+    let name = body.split_once(' ').map_or(body, |(n, _)| n);
+    session.services().ext_host.registry().has_command(name).unwrap_or(false)
+}
+
+/// Draw one placement's extension widgets, in mount order — Pi's `renderWidgets` re-adds every
+/// entry of the matching map to its container (`interactive-mode.ts:1920-1960`). Each row is a
+/// `Text(line, 1, 0)`, i.e. `paddingX` 1. TUI-014.
+fn render_extension_widgets(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    state: &AppState,
+    below: bool,
+) {
+    let lines: Vec<Line<'static>> = state
+        .extension_widgets
+        .iter()
+        .filter(|w| w.below == below)
+        .flat_map(|w| w.lines.iter())
+        .map(|l| Line::from(Span::styled(format!(" {l}"), state.theme.base_style())))
+        .collect();
+    frame.render_widget(Paragraph::new(lines).style(state.theme.base_style()), area);
+}
+
 fn render_images(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let mut y = area.y;
     let bottom = area.y.saturating_add(area.height);
+    // TUI-017 — Pi's width rule for the attachment strip is
+    // `Math.max(1, Math.min(width - 2, this.options.maxWidthCells ?? 60))`
+    // (`packages/tui/src/components/image.ts:65` @v0.83.0), where `maxWidthCells` comes from
+    // `terminal.imageWidthCells`. cyrup passed the raw `area.width` with no cap at all, so on a wide
+    // terminal the raster was unbounded where Pi stops at 60 cells.
+    let max_cells = state.transcript.image_width_cells().max(1);
+    let width = area.width.saturating_sub(2).min(max_cells).max(1);
     for block in &state.pending_images {
         if y >= bottom {
             break;
         }
-        let want = state.image_renderer.cell_size(block, area.width).1.max(1);
+        let want = state.image_renderer.cell_size(block, width).1.max(1);
         let h = want.min(bottom.saturating_sub(y));
-        let cell = ratatui::layout::Rect { x: area.x, y, width: area.width, height: h };
+        let cell = ratatui::layout::Rect { x: area.x, y, width, height: h };
         state.image_renderer.render(frame, cell, block, &state.theme, state.show_images);
         y = y.saturating_add(h);
     }
@@ -6518,6 +7302,12 @@ impl App<CrosstermBackend<Stdout>> {
         self.state
             .transcript
             .set_image_width_cells(eff.image_width_cells().clamp(1, u16::MAX as i64) as u16);
+        // TUI-009 — `doubleEscapeAction` had no consumer at all; the Escape chain reads it out of
+        // `AppState` because `apply_action` has no session in hand.
+        self.state.double_escape_action = eff.double_escape_action();
+        // TUI-032 — the `Warnings` submenu is built from this cache.
+        self.state.warn_anthropic_extra_usage =
+            eff.warnings().anthropic_extra_usage.unwrap_or(true);
         // `terminal.showTerminalProgress` — the gate on the OSC 9;4 taskbar indicator. Pi re-reads
         // it at each of its five call sites (`interactive-mode.ts:2865`/`:3057`/`:3076`/`:3090`/
         // `:6041`); cyrup caches it here and re-seeds it on a `/settings` flip and on a session swap,
@@ -6732,12 +7522,26 @@ impl App<CrosstermBackend<Stdout>> {
                             // put their text back in the editor, and only then abort. Without the
                             // restore, an Esc during a turn silently discards every steering /
                             // follow-up message the user typed while it ran.
+                            // TUI-031 — Pi's `clearAllQueues` (`interactive-mode.ts:3959-3971`)
+                            // drains the SESSION's two queues AND `compactionQueuedMessages`, in
+                            // `[...steering, ...compactionSteering]` /
+                            // `[...followUp, ...compactionFollowUp]` order. Without the second
+                            // source an Escape mid-compaction left the compaction queue holding
+                            // messages the user believed they had just taken back.
                             let (steering, follow_up) = session.drain_queue().await;
-                            let queued: Vec<String> =
-                                steering.into_iter().chain(follow_up).collect();
+                            let compaction = self.take_compaction_queue();
+                            let queued: Vec<String> = steering
+                                .into_iter()
+                                .chain(compaction.iter().filter(|m| !m.follow_up).map(|m| m.text.clone()))
+                                .chain(follow_up)
+                                .chain(compaction.iter().filter(|m| m.follow_up).map(|m| m.text.clone()))
+                                .collect();
                             self.restore_queued_to_editor(&queued);
                             session.abort();
                             session.abort_bash();
+                        }
+                        AppAction::AbortCompaction => {
+                            session.abort_compaction();
                         }
                         AppAction::AbortBranchSummary => {
                             // Pi `:4793` — cancel the summarization only. The spawned navigation
@@ -6750,6 +7554,21 @@ impl App<CrosstermBackend<Stdout>> {
                             // the first still runs supersedes it).
                             session.abort_bash();
                             bash_rx = Some(spawn_session_bash(session.clone(), command, excluded));
+                        }
+                        AppAction::Submit(text) if session.is_compacting()
+                            && !is_extension_command(&session, &text) =>
+                        {
+                            // TUI-031 — Pi tests `this.session.isCompacting` **before** the
+                            // streaming branch (`interactive-mode.ts:2813-2822` @v0.83.0): an
+                            // extension command runs immediately, anything else goes to
+                            // `queueCompactionMessage(text, "steer")` and returns. cyrup consulted
+                            // `is_streaming` only, and the session layer has no compaction guard
+                            // either (`AgentSession::prepare` has none, and `is_streaming` reads the
+                            // agent snapshot, which compaction does not set — compaction ABORTS the
+                            // active run), so a message typed during a 10-20 s compaction was
+                            // dispatched as a fresh turn assembled from a context the compaction was
+                            // in the middle of rewriting, with no status and no queue.
+                            self.queue_compaction_message(text, false);
                         }
                         AppAction::Submit(text) => {
                             // Spawned, not awaited inline (L4 review §2.1 — the SAME deadlock reason
@@ -6781,19 +7600,26 @@ impl App<CrosstermBackend<Stdout>> {
                             // streaming check. Spawned, not awaited, for the same guest-reentrancy reason
                             // as `Submit`.
                             self.state.editor.clear();
-                            let streaming = session.is_streaming().await;
-                            // TUI-016 / TUI-052 — no optimistic echo in EITHER branch. The idle
-                            // branch is Pi's plain submit, which also writes nothing to the chat
-                            // container; the bubble arrives with `message_start`.
-                            let session = session.clone();
-                            tokio::spawn(async move {
-                                let ui = UserInput::text(text, InputSource::Tui);
-                                if streaming {
-                                    let _ = session.follow_up(ui).await;
-                                } else {
-                                    let _ = session.prompt_accepted(ui).await;
-                                }
-                            });
+                            // TUI-031 — Pi's follow-up path has the identical compaction gate:
+                            // `this.queueCompactionMessage(text, "followUp")`
+                            // (`interactive-mode.ts:3744`), ahead of the streaming branch.
+                            if session.is_compacting() && !is_extension_command(&session, &text) {
+                                self.queue_compaction_message(text, true);
+                            } else {
+                                let streaming = session.is_streaming().await;
+                                // TUI-016 / TUI-052 — no optimistic echo in EITHER branch. The idle
+                                // branch is Pi's plain submit, which also writes nothing to the chat
+                                // container; the bubble arrives with `message_start`.
+                                let session = session.clone();
+                                tokio::spawn(async move {
+                                    let ui = UserInput::text(text, InputSource::Tui);
+                                    if streaming {
+                                        let _ = session.follow_up(ui).await;
+                                    } else {
+                                        let _ = session.prompt_accepted(ui).await;
+                                    }
+                                });
+                            }
                         }
                         AppAction::Dequeue => {
                             // Pi `handleDequeue` → `restoreQueuedMessagesToEditor`
@@ -6807,8 +7633,14 @@ impl App<CrosstermBackend<Stdout>> {
                             // not a read-then-clear pair — the split form loses any message queued
                             // between the two calls.
                             let (steering, follow_up) = session.drain_queue().await;
-                            let queued: Vec<String> =
-                                steering.into_iter().chain(follow_up).collect();
+                            // TUI-031 — `clearAllQueues` again (`interactive-mode.ts:3959-3971`).
+                            let compaction = self.take_compaction_queue();
+                            let queued: Vec<String> = steering
+                                .into_iter()
+                                .chain(compaction.iter().filter(|m| !m.follow_up).map(|m| m.text.clone()))
+                                .chain(follow_up)
+                                .chain(compaction.iter().filter(|m| m.follow_up).map(|m| m.text.clone()))
+                                .collect();
                             match self.restore_queued_to_editor(&queued) {
                                 0 => self
                                     .state
@@ -7124,6 +7956,12 @@ impl App<CrosstermBackend<Stdout>> {
                         self.state.editor.set_show_hardware_cursor(
                             eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::from_process()),
                         );
+                        // TUI-009 — same liveness as the rows above: a swap can move the settings
+                        // scope, so re-read `doubleEscapeAction` for the swapped-in session.
+                        self.state.double_escape_action = eff.double_escape_action();
+        // TUI-032 — the `Warnings` submenu is built from this cache.
+        self.state.warn_anthropic_extra_usage =
+            eff.warnings().anthropic_extra_usage.unwrap_or(true);
                                         // TUI-003: seed the view from the swapped-in session's conversation (Pi
                         // re-runs `renderInitialMessages()` after a tree/fork navigation,
                         // interactive-mode.ts:1737-1742). Without this a `/resume`, `/fork` or
@@ -7141,8 +7979,10 @@ impl App<CrosstermBackend<Stdout>> {
                             self.replay_session_with_extensions(&restored, &ext_host).await;
                         }
                         // The swapped-in session owns a fresh extension host; re-source its
-                        // registered shortcut key-ids (R-08-017) so a post-swap press still routes.
-                        let shortcuts = session.services().ext_host.shortcut_keys();
+                        // registered shortcuts (R-08-017) so a post-swap press still routes.
+                        // EXT-040: `shortcut_specs()` carries the description `/hotkeys` renders;
+                        // `shortcut_keys()` drops it.
+                        let shortcuts = session.services().ext_host.shortcut_specs();
                         self.state.set_extension_shortcuts(shortcuts);
                         self.draw_synchronized()?;
                     }

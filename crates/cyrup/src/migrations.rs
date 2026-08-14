@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use cyrup_config::ConfigDirs;
+use cyrup_session_svc::encode_cwd;
 use serde_json::{Map, Value};
 
 /// The result of a migration run (Pi `runMigrations` return), threaded into startup: provider names
@@ -140,7 +141,15 @@ fn migrate_sessions_from_agent_root(agent_dir: &Path) {
             Some(c) if !c.is_empty() => c,
             _ => continue,
         };
-        let safe = encode_cwd(cwd);
+        // SESS-044: the ONE encoder — `cyrup_session::layout::encode_cwd`, re-exported by
+        // `cyrup-session-svc`. This function used to carry a private duplicate whose
+        // `trim_start_matches` stripped ALL leading separators, while pi's first `replace` is
+        // anchored and NOT global (`migrations.ts:112` @v0.83.0, byte-identical to
+        // `session-manager.ts:479`). Once the canonical copy was corrected the two DISAGREED, so a
+        // migration and the live layout could resolve a multi-separator cwd to different directory
+        // names — this migration would then move sessions into a folder the session manager never
+        // looks in.
+        let safe = encode_cwd(std::path::Path::new(cwd));
         let correct_dir = agent_dir.join("sessions").join(&safe);
         if !correct_dir.exists() && std::fs::create_dir_all(&correct_dir).is_err() {
             continue;
@@ -153,23 +162,6 @@ fn migrate_sessions_from_agent_root(agent_dir: &Path) {
             let _ = std::fs::rename(&file, &new_path);
         }
     }
-}
-
-/// Encode a cwd into the session-dir folder name `--<cwd>--` (Pi: strip a leading separator, replace
-/// `/`/`\`/`:` with `-`, wrap in `--…--`).
-fn encode_cwd(cwd: &str) -> String {
-    let trimmed = cwd.trim_start_matches(['/', '\\']);
-    let replaced: String = trimmed
-        .chars()
-        .map(|c| {
-            if matches!(c, '/' | '\\' | ':') {
-                '-'
-            } else {
-                c
-            }
-        })
-        .collect();
-    format!("--{replaced}--")
 }
 
 /// Move managed `fd`/`rg` binaries from `tools/` to `bin/` (Pi `migrateToolsToBin`,
@@ -297,11 +289,26 @@ mod tests {
         }
     }
 
+    /// SESS-044 — this migration and the live session layout must resolve the SAME cwd to the SAME
+    /// directory, so it now calls the one shared encoder rather than a private copy.
+    ///
+    /// pi `migrations.ts:112` @v0.83.0 is byte-identical to `session-manager.ts:479`:
+    /// ``--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--``. The FIRST replace is anchored
+    /// and carries no `g`, so exactly ONE leading separator goes.
+    ///
+    /// RED before this pass: the deleted duplicate used `trim_start_matches(['/', '\\'])`, which
+    /// strips ALL leading separators — so `//net/x` encoded to `--net-x--` here while
+    /// `cyrup_session::encode_cwd` (corrected earlier this cycle) produced `---net-x--`, and a
+    /// migrated session landed in a folder the session manager does not list.
     #[test]
     fn encodes_cwd_like_session_manager() {
-        assert_eq!(encode_cwd("/Users/x/proj"), "--Users-x-proj--");
+        let enc = |s: &str| encode_cwd(std::path::Path::new(s));
+        assert_eq!(enc("/Users/x/proj"), "--Users-x-proj--");
         // Each of `:` and `\` is replaced individually (Pi `/[/\\:]/g`), yielding `--C--a-b--`.
-        assert_eq!(encode_cwd("C:\\a\\b"), "--C--a-b--");
+        assert_eq!(enc("C:\\a\\b"), "--C--a-b--");
+        // Exactly ONE leading separator is stripped; the second becomes a `-`.
+        assert_eq!(enc("//net/x"), "---net-x--");
+        assert_eq!(enc("\\\\srv\\share"), "---srv-share--");
     }
 
     #[test]

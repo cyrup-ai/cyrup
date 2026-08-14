@@ -40,7 +40,7 @@ use cyrup_core::EventStream;
 use cyrup_core::{ProviderId, StopReason};
 use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
 use cyrup_provider::auth::{
-    ApiKeyAuth, AuthContext, AuthResult, ModelAuth, OAuthAuth, ProviderAuth,
+    ApiKeyAuth, ModelAuth, OAuthAuth, ProviderAuth,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::AuthError as ProviderAuthError;
@@ -86,23 +86,17 @@ impl<const SUB: bool> OAuthAuth for ScriptedOauth<SUB> {
     }
 }
 
-/// The shared `env_key` strategy name (`cyrup-provider/src/auth/helpers.rs:35`), which is what
-/// `api_key_strategy_supports_login` keys the "this strategy has a login" answer off.
-struct EnvKeyLike;
-
-#[async_trait::async_trait]
-impl ApiKeyAuth for EnvKeyLike {
-    fn name(&self) -> &str {
-        "env-key"
-    }
-    async fn resolve(
-        &self,
-        _model: &Model,
-        _ctx: &dyn AuthContext,
-        _cred: Option<&Credential>,
-    ) -> Result<Option<AuthResult>, ProviderAuthError> {
-        Ok(None)
-    }
+/// The REAL shared `envApiKeyAuth` strategy (`cyrup_provider::auth::env_key`,
+/// `ai/src/auth/helpers.ts:9-27` @v0.83.0), carrying upstream's display string the way
+/// `providers/openrouter.ts:13` does.
+///
+/// CFG-005 / ADR-0010 step 2: this used to be a local stub reporting the `"env-key"` sentinel,
+/// because `cyrup_config::login` decided "does this strategy have a login?" by SNIFFING that name.
+/// The sniffer is gone — `/login` now reads `ApiKeyAuth::supports_login()` and dispatches to
+/// `ApiKeyAuth::login()` — so the fixture must be the real strategy or the dialog it drives is not
+/// the one production runs.
+fn env_key_like() -> std::sync::Arc<dyn ApiKeyAuth> {
+    cyrup_provider::auth::env_key("Stub API key", Vec::<String>::new())
 }
 
 struct StubProvider {
@@ -311,7 +305,7 @@ async fn api_key_login_to_a_subscription_capable_provider_does_not_light_the_mar
     let mut app = app_with(stub_registry(
         "stub",
         ProviderAuth {
-            api_key: Some(Arc::new(EnvKeyLike)),
+            api_key: Some(env_key_like()),
             oauth: Some(Arc::new(ScriptedOauth::<true>)),
         },
     ));

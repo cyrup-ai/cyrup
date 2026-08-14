@@ -137,7 +137,12 @@ impl TrustStore {
     }
 
     /// Walk cwd→root; the first canonical-path key with an explicit bool wins (R-07-013).
+    ///
+    /// The read runs UNDER the cross-process file lock, as pi's does: `getEntry` wraps its read in
+    /// `withTrustFileLock` (trust-manager.ts:219-222 @v0.83.0, lock defined `:168`) and `get()`
+    /// (`:216`) routes through `getEntry`. CFG-013.
     pub fn nearest(&self, cwd: &Path) -> Result<Option<TrustEntry>, ConfigError> {
+        let _guard = crate::lock::FileLock::acquire(&self.path)?;
         let map = self.read_map()?;
         let cwd = canonicalize(cwd);
         let mut current: Option<&Path> = Some(cwd.as_path());

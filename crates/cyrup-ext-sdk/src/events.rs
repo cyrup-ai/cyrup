@@ -114,12 +114,22 @@ pub struct AfterProviderResponseEvent {
 #[derive(Clone, Debug)]
 pub struct ModelSelectEvent {
     pub model: Value,
+    /// pi `ModelSelectEvent.previousModel` (`extensions/types.ts:797` @v0.83.0) — a SIBLING field.
+    /// cyrup used to nest it inside `model`, so a ported handler read `event.previousModel` and got
+    /// `undefined` (EXT-042).
+    pub previous_model: Option<Value>,
+    /// pi `ModelSelectEvent.source` (`extensions/types.ts:798` @v0.83.0) — also a sibling.
+    pub source: String,
 }
 
 /// `thinking_level_select` (Pi types.ts:1163).
 #[derive(Clone, Debug)]
 pub struct ThinkingLevelSelectEvent {
     pub level: String,
+    /// pi `ThinkingLevelSelectEvent.previousLevel` (`extensions/types.ts:805` @v0.83.0) — EXT-042.
+    /// Without it a handler that wants to react only to an INCREASE had to keep a shadow copy and
+    /// was wrong on the first event of a session. `None` is that first event.
+    pub previous_level: Option<String>,
 }
 
 /// `agent_end` (Pi types.ts:1138) — notify with the full final message list.
@@ -177,6 +187,10 @@ pub struct ToolExecStartEvent {
 #[derive(Clone, Debug)]
 pub struct ToolExecUpdateEvent {
     pub call_id: String,
+    /// pi `ToolExecutionUpdateEvent.toolName` (`extensions/types.ts:773` @v0.83.0) — EXT-014.
+    pub name: String,
+    /// pi `ToolExecutionUpdateEvent.args` (`extensions/types.ts:774` @v0.83.0) — EXT-014.
+    pub args: Value,
     pub chunk: Value,
 }
 
@@ -184,26 +198,82 @@ pub struct ToolExecUpdateEvent {
 #[derive(Clone, Debug)]
 pub struct ToolExecEndEvent {
     pub call_id: String,
+    /// pi `ToolExecutionEndEvent.toolName` (`extensions/types.ts:782` @v0.83.0) — EXT-014. Without
+    /// it an observer had to keep its own `callId -> toolName` map from `tool_execution_start`, and
+    /// could not filter by tool at all if it missed the start.
+    pub name: String,
     pub result: Value,
     pub is_error: bool,
 }
 
-/// `session_start` / `session_shutdown` (Pi types.ts:1136-1137) — `reason` includes `"reload"`.
+/// `session_start` / `session_shutdown` — `reason` includes `"reload"`.
+///
+/// EXT-015: both upstream events carry a second, optional session-file field, and cyrup dropped
+/// both. pi `SessionStartEvent {type, reason, previousSessionFile?}`
+/// (`extensions/types.ts:562-569` @v0.83.0, "Present for \"new\", \"resume\", and \"fork\"")
+/// and `SessionShutdownEvent {type, reason, targetSessionFile?}` (`:616-621`, "Destination session
+/// file when shutting down due to session replacement"). The two fields play the same role on the
+/// two sides of a replacement, so one struct carries it under one name.
 #[derive(Clone, Debug)]
 pub struct SessionLifecycleEvent {
     pub reason: String,
+    /// `previousSessionFile` on `session_start`, `targetSessionFile` on `session_shutdown`.
+    pub session_file: Option<String>,
+}
+
+/// `session_info_changed` (pi `SessionInfoChangedEvent`, `extensions/types.ts:571-575` @v0.83.0,
+/// subscribed at `:1203`) — EXT-011.
+#[derive(Clone, Debug)]
+pub struct SessionInfoChangedEvent {
+    /// "Current normalized session name. Undefined when the name is cleared" — so `None` is a
+    /// CLEARED name, not an unknown one.
+    pub name: Option<String>,
+}
+
+/// `resources_discover` (pi `ResourcesDiscoverEvent`, `extensions/types.ts:544-548` @v0.83.0) —
+/// EXT-016.
+#[derive(Clone, Debug)]
+pub struct ResourcesDiscoverEvent {
+    pub cwd: String,
+    /// `"startup" | "reload"`.
+    pub reason: String,
+}
+
+/// `project_trust` (pi `ProjectTrustEvent`, `extensions/types.ts:519-522` @v0.83.0) — EXT-043.
+/// The verdict is per-DIRECTORY upstream: the store is keyed by this value
+/// (`options.trustStore.set(options.cwd, trusted)`, `core/project-trust.ts:63-65`), so an
+/// allowlist policy cannot be written without it.
+#[derive(Clone, Debug)]
+pub struct ProjectTrustEvent {
+    pub cwd: String,
+}
+
+/// `before_provider_headers` (pi `BeforeProviderHeadersEvent`, `extensions/types.ts:686-689`
+/// @v0.83.0) — EXT-009. Upstream's doc at `:681-685`: "Handlers mutate `headers` in place (e.g. to
+/// inject tracing/session headers); the return value is ignored. A `null` value deletes that
+/// header." Return the patch through [`crate::Outcome::mutate`] — a key mapped to `null` DELETES.
+#[derive(Clone, Debug)]
+pub struct BeforeProviderHeadersEvent {
+    pub headers: Value,
 }
 
 /// `session_before_switch` (Pi types.ts:1148).
 #[derive(Clone, Debug)]
 pub struct SessionBeforeSwitchEvent {
-    pub target_id: String,
+    /// pi `SessionBeforeSwitchEvent.reason: "new" | "resume"` (`extensions/types.ts:580`
+    /// @v0.83.0) — the field that distinguishes the two cases, dropped entirely before EXT-015.
+    pub reason: String,
+    /// pi `targetSessionFile?` (`extensions/types.ts:581`).
+    pub target_session_file: Option<String>,
 }
 
 /// `session_before_fork` (Pi types.ts:1149).
 #[derive(Clone, Debug)]
 pub struct SessionBeforeForkEvent {
     pub entry_id: String,
+    /// pi `SessionBeforeForkEvent.position: "before" | "at"` (`extensions/types.ts:588`
+    /// @v0.83.0) — EXT-015. A fork BEFORE an entry and a fork AT it are different operations.
+    pub position: String,
 }
 
 /// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:577-587). Byte-shape:

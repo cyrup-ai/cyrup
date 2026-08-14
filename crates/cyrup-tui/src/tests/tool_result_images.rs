@@ -227,3 +227,28 @@ fn live_text(app: &App<TestBackend>) -> String {
     }
     out
 }
+
+/// TUI-N01 — a terminal with **no image protocol** takes the same `[Image: …]` text branch
+/// `showImages: false` takes, instead of rasterizing anyway.
+///
+/// RED at HEAD: the gate was `images.show && !run.images.is_empty() && …all decodable`, consulting
+/// `terminal.showImages` and decodability only, never a capability — so on a plain xterm, the Linux
+/// console, CI or a pipe a `read` of a screenshot dumped ~20-30 rows of coloured `▀` into
+/// scrollback. Upstream is `const caps = getCapabilities(); … if (caps.images && this.showImages &&
+/// img.data && img.mimeType)` (`components/tool-execution.ts:331-334` @v0.83.0), and `getTextOutput`
+/// supplies the one-line `imageFallback` otherwise.
+#[test]
+fn no_image_protocol_renders_the_fallback_text_not_a_raster() {
+    let mut app = new_app();
+    app.state_mut().transcript.set_graphical_images(false);
+    run_read_tool(&mut app, image_result(&red_png_base64(24, 24)));
+    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: Vec::new(), will_retry: false });
+    app.draw().unwrap();
+
+    let out = app.scrollback_text();
+    assert!(
+        out.contains("[Image: [image/png] 24x24]"),
+        "a no-protocol terminal must get Pi's fallback indicator; got:\n{out}"
+    );
+    assert!(!scrollback_painted_red(&app), "a no-protocol terminal must not paint a raster");
+}

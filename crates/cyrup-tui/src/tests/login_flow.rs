@@ -21,7 +21,7 @@ use cyrup_config::login::AuthType;
 use cyrup_core::{ProviderId, StopReason};
 use cyrup_provider::auth::oauth::{AuthEvent, AuthInteraction, AuthPrompt, OAuthError};
 use cyrup_provider::auth::{
-    ApiKeyAuth, AuthContext, AuthResult, ModelAuth, OAuthAuth, ProviderAuth,
+    ApiKeyAuth, ModelAuth, OAuthAuth, ProviderAuth,
 };
 use cyrup_provider::AuthError as ProviderAuthError;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
@@ -92,23 +92,17 @@ impl OAuthAuth for FailingOauth {
     }
 }
 
-/// The shared `env_key` strategy name (`cyrup-provider/src/auth/helpers.rs:35`), which is what
-/// `api_key_strategy_supports_login` keys the "this strategy has a login" answer off.
-struct EnvKeyLike;
-
-#[async_trait::async_trait]
-impl ApiKeyAuth for EnvKeyLike {
-    fn name(&self) -> &str {
-        "env-key"
-    }
-    async fn resolve(
-        &self,
-        _model: &Model,
-        _ctx: &dyn AuthContext,
-        _cred: Option<&Credential>,
-    ) -> Result<Option<AuthResult>, ProviderAuthError> {
-        Ok(None)
-    }
+/// The REAL shared `envApiKeyAuth` strategy (`cyrup_provider::auth::env_key`,
+/// `ai/src/auth/helpers.ts:9-27` @v0.83.0), carrying upstream's display string the way
+/// `providers/openrouter.ts:13` does.
+///
+/// CFG-005 / ADR-0010 step 2: this used to be a local stub reporting the `"env-key"` sentinel,
+/// because `cyrup_config::login` decided "does this strategy have a login?" by SNIFFING that name.
+/// The sniffer is gone — `/login` now reads `ApiKeyAuth::supports_login()` and dispatches to
+/// `ApiKeyAuth::login()` — so the fixture must be the real strategy or the dialog it drives is not
+/// the one production runs.
+fn env_key_like() -> std::sync::Arc<dyn ApiKeyAuth> {
+    cyrup_provider::auth::env_key("Stub API key", Vec::<String>::new())
 }
 
 struct StubProvider {
@@ -325,7 +319,7 @@ async fn picker_confirm_arm_opens_the_dialog_and_starts_the_flow() {
     let fx = fixture().await;
     // Two methods on one provider ⇒ the auth-type selector, then the picker path.
     let auth = ProviderAuth {
-        api_key: Some(Arc::new(EnvKeyLike)),
+        api_key: Some(env_key_like()),
         oauth: Some(Arc::new(ScriptedOauth)),
     };
     let mut app = app_with(stub_registry(auth));
@@ -468,9 +462,7 @@ async fn a_failed_login_shows_the_banner_and_writes_nothing() {
 #[tokio::test]
 async fn api_key_login_prompts_persists_and_uses_the_api_key_wording() {
     let fx = fixture().await;
-    let mut app = app_with(stub_registry(ProviderAuth::with_api_key(Arc::new(
-        EnvKeyLike,
-    ))));
+    let mut app = app_with(stub_registry(ProviderAuth::with_api_key(env_key_like())));
     let mut rx = app.install_login_channel();
 
     app.execute_command(
@@ -484,8 +476,8 @@ async fn api_key_login_prompts_persists_and_uses_the_api_key_wording() {
     let msg = next_msg(&mut rx).await;
     assert!(matches!(msg, LoginUiMsg::Prompt { .. }), "got {msg:?}");
     app.apply_login_msg(msg);
-    // `Enter ${method.name}` where the name is reconstructed as `${provider} API key`
-    // (`helpers.ts:12`, `api_key_login_label`).
+    // `Enter ${method.name}` — `method.name` verbatim off the strategy, no reconstruction
+    // (`ai/src/auth/helpers.ts:12-13`; `interactive-mode.ts:4880` carries `method` whole).
     let body = app.login_dialog_body().unwrap();
     assert!(body.contains("Stub API key"), "{body}");
 
@@ -624,7 +616,7 @@ async fn login_with_an_argument_skips_the_picker() {
 async fn login_with_an_unknown_argument_opens_the_picker() {
     let fx = fixture().await;
     let mut app = app_with(stub_registry(ProviderAuth {
-        api_key: Some(Arc::new(EnvKeyLike)),
+        api_key: Some(env_key_like()),
         oauth: Some(Arc::new(ScriptedOauth)),
     }));
     let _rx = app.install_login_channel();

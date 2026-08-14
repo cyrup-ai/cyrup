@@ -310,9 +310,35 @@ impl ExtensionConfig {
     /// deliberately configured.)
     #[must_use]
     pub fn is_pristine_default_file(path: &Path) -> bool {
-        std::fs::read_to_string(path).is_ok_and(|text| {
-            text == Self::default_config_content() || text == Self::LEGACY_DEFAULT_CONFIG_CONTENT
-        })
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        // Fast path: the exact bytes this crate writes. Kept first so the overwhelmingly common
+        // case never parses anything.
+        if text == Self::default_config_content() || text == Self::LEGACY_DEFAULT_CONFIG_CONTENT {
+            return true;
+        }
+        // PERM-019 — SEMANTIC fallback. The byte-exact compare alone made every future whitespace,
+        // key-order or comment change to the template silently RE-ARM the gate for every
+        // already-materialized agent dir: their on-disk file stops matching the new literal, reads
+        // as "hand-edited", and `is_installed` flips to true. Comparing the parsed key/value maps
+        // makes formatting inert while keeping both security directions the byte compare had:
+        //
+        // - Nothing that read pristine before stops reading pristine (the byte compare is still
+        //   tried first, and an identical map is a superset of identical bytes).
+        // - Nothing newly reads pristine except a document whose key SET and VALUES are exactly one
+        //   of the templates'. This is NOT the looser "normalizes to the default" rule that was
+        //   rejected in this doc's earlier revision: a hand-authored `{"yoloMode": false}` has a
+        //   different key set, so it still reads as configured and still installs the gate.
+        //
+        // An unparseable file falls through to `false` — "I cannot tell" stays "assume configured".
+        let Ok(actual) = jsonc::parse_config(&text, &path.display().to_string(), "config") else {
+            return false;
+        };
+        [Self::default_config_content(), Self::LEGACY_DEFAULT_CONFIG_CONTENT.to_string()]
+            .iter()
+            .filter_map(|template| jsonc::parse_config(template, "<template>", "config").ok())
+            .any(|template| template == actual)
     }
 
     /// pi `normalizePermissionSystemConfig` (v0.8.0 `extension-config.ts:76-93`).
@@ -776,6 +802,74 @@ pub(crate) fn load_count() -> usize {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+
+    // ------------------------------------------- PERM-019: the pristine probe is SEMANTIC, not bytes
+
+    /// PERM-019 (RED before the fix). `is_pristine_default_file` was a byte-exact compare, so any
+    /// future whitespace / key-order / comment change to the template would silently RE-ARM the gate
+    /// for every already-materialized agent dir: their on-disk file stops matching the new literal,
+    /// reads as "hand-edited", and `extension::is_installed` flips to true. Re-formatting the
+    /// template's own bytes must be inert.
+    #[test]
+    fn a_reformatted_pristine_template_is_still_pristine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        // The exact bytes: pristine (the fast path).
+        std::fs::write(&path, ExtensionConfig::default_config_content()).unwrap();
+        assert!(ExtensionConfig::is_pristine_default_file(&path));
+
+        // Same document, different whitespace, different key ORDER, plus a JSONC comment — the
+        // shapes a future template revision would produce.
+        let default = ExtensionConfig::default();
+        let reordered = format!(
+            "// generated\n{{\"yoloMode\":{}, \"debug\":{},\n  \"forwardedPromptTimeoutSeconds\": {},\n\"enabled\": {}}}",
+            default.yolo_mode,
+            default.debug,
+            default.forwarded_prompt_timeout_seconds.map_or("null".to_string(), |s| s.to_string()),
+            default.enabled,
+        );
+        std::fs::write(&path, &reordered).unwrap();
+        assert!(
+            ExtensionConfig::is_pristine_default_file(&path),
+            "formatting is not an operator decision; only a VALUE edit is"
+        );
+
+        // The legacy three-key template, reformatted, is still pristine too.
+        std::fs::write(&path, "{\n\n  \"debug\":false,\"yoloMode\":false,\n  \"forwardedPromptTimeoutSeconds\":30,\n}\n").unwrap();
+        assert!(ExtensionConfig::is_pristine_default_file(&path));
+    }
+
+    /// The security direction the byte compare had must survive: a real value edit, a different key
+    /// SET, and an unreadable/unparseable file all still read as CONFIGURED (so the gate installs).
+    #[test]
+    fn a_real_edit_or_a_different_key_set_is_never_pristine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        // One value changed ⇒ configured.
+        std::fs::write(&path, "{\"enabled\":true,\"debug\":true,\"yoloMode\":false,\"forwardedPromptTimeoutSeconds\":30}").unwrap();
+        assert!(!ExtensionConfig::is_pristine_default_file(&path));
+
+        // The explicitly-rejected looser rule: a hand-authored subset that NORMALIZES to the default
+        // must NOT read as pristine, or it would disable a gate the operator configured.
+        std::fs::write(&path, "{\"yoloMode\": false}").unwrap();
+        assert!(
+            !ExtensionConfig::is_pristine_default_file(&path),
+            "a key SUBSET is a hand-authored file, not the template"
+        );
+
+        // A superset (an extra key this crate never writes) is likewise authored.
+        std::fs::write(&path, "{\"enabled\":true,\"debug\":false,\"yoloMode\":false,\"forwardedPromptTimeoutSeconds\":30,\"$schema\":\"x\"}").unwrap();
+        assert!(!ExtensionConfig::is_pristine_default_file(&path));
+
+        // Unparseable ⇒ "I cannot tell" ⇒ assume configured (fail-safe, unchanged).
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(!ExtensionConfig::is_pristine_default_file(&path));
+
+        // Absent ⇒ false; callers test existence separately (unchanged).
+        assert!(!ExtensionConfig::is_pristine_default_file(&dir.path().join("missing.json")));
+    }
 
     #[test]
     fn absent_is_defaults() {

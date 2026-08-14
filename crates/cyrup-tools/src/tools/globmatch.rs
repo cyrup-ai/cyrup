@@ -41,11 +41,20 @@ impl PatternMatcher {
         Ok(Self { matcher: glob.compile_matcher(), full_path })
     }
 
-    /// Test a candidate. `rel_posix` is the path relative to the search root (posix separators);
-    /// `basename` is its final component.
-    pub fn is_match(&self, rel_posix: &str, basename: &str) -> bool {
+    /// Test a candidate. In full-path mode `path_posix` must be the **ABSOLUTE** candidate path in
+    /// posix form, because that is what fd tests: pi's own in-source note at find.ts:254-256 says
+    /// `--full-path` "matches against the absolute candidate path", and find.ts:267
+    /// `args.push("--", effectivePattern, searchPath)` hands fd the absolute search path as its
+    /// root. `find` relativizes only for OUTPUT (find.ts:321-326).
+    ///
+    /// Passing a search-root-RELATIVE path here made the `pattern.starts_with('/')` arm in
+    /// [`PatternMatcher::build`] dead — a relative posix path can never begin with `/`, so a
+    /// leading-slash pattern selected nothing at all rather than anchoring at the filesystem root
+    /// the way fd does. `basename` is the candidate's final component (fd's non-`--full-path`
+    /// mode), unchanged.
+    pub fn is_match(&self, path_posix: &str, basename: &str) -> bool {
         if self.full_path {
-            self.matcher.is_match(rel_posix)
+            self.matcher.is_match(path_posix)
         } else {
             self.matcher.is_match(basename)
         }
@@ -184,7 +193,31 @@ mod tests {
         // fd's rule (still correct for `find`) does the opposite, and that is exactly why `grep`
         // must not share it.
         let fd = PatternMatcher::build("src/**/*.ts").unwrap();
-        assert!(fd.is_match("vendor/src/a.ts", "a.ts"));
+        assert!(fd.is_match("/repo/vendor/src/a.ts", "a.ts"));
+    }
+
+    /// TOOL-011 — the `pattern.starts_with('/')` arm of [`PatternMatcher::build`] is only
+    /// reachable against an ABSOLUTE candidate, which is what fd tests in `--full-path` mode
+    /// (find.ts:254-256). Against the search-root-relative path it was dead code and a
+    /// leading-slash pattern matched nothing at all. RED before; GREEN after.
+    #[test]
+    fn fd_leading_slash_pattern_anchors_at_the_filesystem_root() {
+        let m = PatternMatcher::build("/src/*.ts").unwrap();
+        assert!(m.full_path, "a pattern containing `/` enables fd's --full-path mode");
+        assert!(m.is_match("/src/a.ts", "a.ts"));
+        // Anchored: a `src/` nested anywhere else does NOT match, exactly as fd's absolute
+        // full-path comparison behaves.
+        assert!(!m.is_match("/repo/src/a.ts", "a.ts"));
+    }
+
+    /// The common case is unchanged by the absolute-candidate switch: both sides prepend `**/`, so
+    /// a path-containing pattern still matches at any depth.
+    #[test]
+    fn fd_path_pattern_still_matches_at_any_depth_on_an_absolute_candidate() {
+        let m = PatternMatcher::build("src/**/*.ts").unwrap();
+        assert!(m.is_match("/tmp/repo/src/a.ts", "a.ts"));
+        assert!(m.is_match("/tmp/repo/src/deep/a.ts", "a.ts"));
+        assert!(!m.is_match("/tmp/repo/lib/a.ts", "a.ts"));
     }
 
     /// gitignore.rs:492-498: a leading `/` is STRIPPED and anchors the glob. Handing it to globset

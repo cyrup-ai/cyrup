@@ -357,8 +357,66 @@ async fn edit_legacy_shim_survives_the_preflight_schema_gate() {
 
 // ---------------------------------------------------------------- A-03-4 write
 
+/// An `FsOps` that observes the GUARDED REGION directly: it counts live entrants to
+/// `write_in_place` and records the high-water mark, the technique `lock.rs`'s
+/// `same_path_serializes` already uses at the primitive level.
+///
+/// A first entrant waits (bounded) for a second to appear. With the mutation guard held, the
+/// second is parked in `guard()` and never arrives, so the wait times out and `max_live` stays 1.
+/// Remove the `guard()` call from `write.rs` and both enter, both observe `live == 2`, and the
+/// assertion fails on EVERY run rather than on an unlucky interleaving — which is what TOOL-025's
+/// residual asked for. The property is pi's `withFileMutationQueue` (write.ts:208): mutual
+/// exclusion per resolved path, not a surviving byte pattern.
+struct MutexProbeFs {
+    inner: LocalFs,
+    live: Arc<AtomicUsize>,
+    max_live: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl FsOps for MutexProbeFs {
+    async fn read(&self, path: &Path) -> Result<Vec<u8>, ToolError> {
+        self.inner.read(path).await
+    }
+    async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+        let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_live.fetch_max(now, Ordering::SeqCst);
+        // Give a would-be second entrant every chance to arrive and be counted.
+        for _ in 0..50 {
+            if self.live.load(Ordering::SeqCst) > 1 {
+                self.max_live.fetch_max(self.live.load(Ordering::SeqCst), Ordering::SeqCst);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let r = self.inner.write_in_place(path, bytes).await;
+        self.live.fetch_sub(1, Ordering::SeqCst);
+        r
+    }
+    async fn access(&self, path: &Path, mode: crate::ops::Access) -> Result<(), ToolError> {
+        self.inner.access(path, mode).await
+    }
+    async fn metadata(&self, path: &Path) -> Result<crate::ops::Meta, ToolError> {
+        self.inner.metadata(path).await
+    }
+    async fn read_dir(&self, path: &Path) -> Result<Vec<crate::ops::DirEntry>, ToolError> {
+        self.inner.read_dir(path).await
+    }
+    fn walk(
+        &self,
+        root: &Path,
+        opts: crate::ops::WalkOpts,
+    ) -> cyrup_core::EventStream<Result<crate::ops::WalkItem, ToolError>> {
+        self.inner.walk(root, opts)
+    }
+}
+
+/// TOOL-025 residual: renamed from `write_creates_dirs_and_serializes`, which named an ordering it
+/// never observed. What it observes is (a) parent-directory creation and (b) mutual exclusion —
+/// now asserted STRUCTURALLY via `MutexProbeFs` rather than by hoping a corrupting interleaving
+/// happens to occur, plus the surviving-payload disjunction kept as a second, weaker witness.
 #[tokio::test]
-async fn write_creates_dirs_and_serializes() {
+async fn write_creates_dirs_and_holds_one_mutator_per_path() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
     let locks = Arc::new(FileMutationLocks::new());
@@ -386,7 +444,14 @@ async fn write_creates_dirs_and_serializes() {
     // (write.ts:9) plays the identical role. With unequal lengths any interleaving is observable:
     // a lost lock leaves a short read (`"AAAA"` where `B` was last), a tail (`"AAAABBBB…"`), or a
     // truncated prefix — none of which match either payload exactly.
-    let w = Arc::new(WriteTool::new(fs(), locks, cwd.clone(), Default::default()));
+    let live = Arc::new(AtomicUsize::new(0));
+    let max_live = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::new(MutexProbeFs {
+        inner: LocalFs,
+        live: Arc::clone(&live),
+        max_live: Arc::clone(&max_live),
+    });
+    let w = Arc::new(WriteTool::new(probe, locks, cwd.clone(), Default::default()));
     let a = {
         let w = w.clone();
         tokio::spawn(async move {
@@ -413,6 +478,20 @@ async fn write_creates_dirs_and_serializes() {
     };
     a.await.unwrap().unwrap();
     b.await.unwrap().unwrap();
+    // The load-bearing assertion: at most one mutator was ever inside the guarded region. This is
+    // the property `withFileMutationQueue` provides (write.ts:208) and it fails deterministically
+    // if the `guard()` call is removed from `write.rs`.
+    assert_eq!(
+        max_live.load(Ordering::SeqCst),
+        1,
+        "two mutators were inside `write_in_place` for the same path at once"
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 0, "every entrant left the guarded region");
+    // Weaker second witness, kept: the surviving bytes match exactly one payload. The two payloads
+    // have DIFFERENT LENGTHS on purpose — with equal lengths any interleaving still lands on a
+    // same-sized file and the check is vacuous. The backend is an in-place `O_TRUNC` write
+    // (TOOL-004, matching pi's `fsWriteFile`), so a lost lock leaves a short read, a tail, or a
+    // truncated prefix, none of which match either payload.
     let final_content = std::fs::read_to_string(cwd.join("race.txt")).unwrap();
     assert!(
         final_content == "AAAA" || final_content == "BBBBBBBBBBBBBBBB",
@@ -1373,6 +1452,46 @@ fn image_magic_detection() {
     assert_eq!(ImageMime::from_magic(b"hello world\n"), None);
 }
 
+/// TOOL-035 — Pi sniffs a fixed `IMAGE_TYPE_SNIFF_BYTES = 4100`-byte header (mime.ts:3, read at
+/// `:28-30`), so `isAnimatedPng`'s chunk walk bails at mime.ts:51 the moment it steps past the
+/// buffer and an `acTL` beyond the window is INVISIBLE — the file is reported as `image/png`.
+/// cyrup handed the whole file to the sniffer, found the far `acTL`, returned `None`, and dropped
+/// the file into `read`'s TEXT branch, so the model got `from_utf8_lossy` of a PNG.
+///
+/// RED before the fix (`from_file_head` did not exist and `from_magic` saw the whole buffer, so
+/// the far-`acTL` case returned `None`); GREEN after.
+#[test]
+fn image_sniff_window_matches_pis_4100_bytes() {
+    use crate::ops::{ImageMime, IMAGE_TYPE_SNIFF_BYTES};
+    assert_eq!(IMAGE_TYPE_SNIFF_BYTES, 4100, "mime.ts:3 `IMAGE_TYPE_SNIFF_BYTES = 4100`");
+
+    let png_sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    // signature(8) + IHDR(4 len + 4 type + 13 data + 4 crc = 25) = 33 bytes so far.
+    let mut base = Vec::from(png_sig);
+    base.extend_from_slice(&[0, 0, 0, 13]);
+    base.extend_from_slice(b"IHDR");
+    base.extend_from_slice(&[0u8; 13 + 4]);
+
+    // A large ancillary `iTXt` chunk that pushes the following `acTL` past byte 4100.
+    let filler_len: usize = 5000;
+    let mut far = base.clone();
+    far.extend_from_slice(&u32::try_from(filler_len).unwrap().to_be_bytes());
+    far.extend_from_slice(b"iTXt");
+    far.extend_from_slice(&vec![0u8; filler_len]);
+    far.extend_from_slice(&[0u8; 4]); // crc
+    far.extend_from_slice(&[0, 0, 0, 8]);
+    far.extend_from_slice(b"acTL");
+    // Pi's window never reaches that chunk, so the verdict is `image/png`.
+    assert_eq!(ImageMime::from_file_head(&far), Some(ImageMime::Png));
+
+    // The animation check is NOT disabled: an `acTL` INSIDE the window still rejects, exactly as
+    // `image_magic_detection` above pins for the unbounded predicate.
+    let mut near = base.clone();
+    near.extend_from_slice(&[0, 0, 0, 8]);
+    near.extend_from_slice(b"acTL");
+    assert_eq!(ImageMime::from_file_head(&near), None);
+}
+
 // gap #1 — an oversized image is resized to fit 2000px and carries the coordinate-mapping
 // dimension note (image-resize-core.ts + formatDimensionNote). Exercises decode→orientation→
 // resize→encode end to end.
@@ -1921,7 +2040,18 @@ async fn find_accepts_float_and_negative_limit() {
         .await
         .expect("float limit must not fail the call");
     let text = first_text(&float_limit);
-    assert!(text.starts_with("a.txt\nb.txt\n\n[2 results limit reached."), "got: {text}");
+    // Pi passes `--max-results N` to fd (find.ts:252) and NEVER sorts (`grep -n sort find.ts` is
+    // empty at v0.84.1) — fd's traversal is parallel and unordered, so the result SET is "the
+    // first N discovered", not "the alphabetically-first N". Asserting `a.txt\nb.txt` pinned
+    // cyrup's own `results.sort()`, which was the defect (TOOL-023), so the property asserted here
+    // is pi's: exactly `limit` rows, each a member of the candidate set, plus the notice.
+    let (rows, notice) = text.split_once("\n\n[").expect("notice bracket, got: {text}");
+    let rows: Vec<&str> = rows.lines().collect();
+    assert_eq!(rows.len(), 2, "the cap must bound the row count, got: {text}");
+    for row in &rows {
+        assert!(["a.txt", "b.txt", "c.txt"].contains(row), "unexpected row {row}, got: {text}");
+    }
+    assert!(notice.starts_with("2 results limit reached."), "got: {text}");
 
     let neg_limit = find
         .execute(

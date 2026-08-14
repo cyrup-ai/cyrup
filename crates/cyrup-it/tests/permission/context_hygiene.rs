@@ -93,7 +93,7 @@ fn mutate_system_prompt(o: &HookOutcome) -> Option<&str> {
 
 fn block_reason(o: &HookOutcome) -> Option<&str> {
     match o {
-        HookOutcome::Block { reason } => reason.as_deref(),
+        HookOutcome::Block { reason, .. } => reason.as_deref(),
         _ => None,
     }
 }
@@ -221,7 +221,7 @@ async fn yolo_status_pill_set_on_start_and_cleared_on_shutdown() {
     init(&ext).await;
 
     // Session start → the pill is set to "yolo".
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "new".into() }, &ctx(agent_dir)).await;
+    let _ = ext.on_event(&HostEvent::SessionStart { reason: "new".into(), previous_session_file: None }, &ctx(agent_dir)).await;
     {
         let rec = rec.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
@@ -234,7 +234,7 @@ async fn yolo_status_pill_set_on_start_and_cleared_on_shutdown() {
 
     // Session shutdown → the pill is cleared (None).
     let _ = ext
-        .on_event(&HostEvent::SessionShutdown { reason: "quit".into() }, &ctx(agent_dir))
+        .on_event(&HostEvent::SessionShutdown { reason: "quit".into(), target_session_file: None }, &ctx(agent_dir))
         .await;
     {
         let rec = rec.lock().unwrap_or_else(|e| e.into_inner());
@@ -259,7 +259,7 @@ async fn no_yolo_config_syncs_a_cleared_pill() {
     let (ext, rec) = ext_with(agent_dir, "{}", &["read"]);
     init(&ext).await;
 
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "new".into() }, &ctx(agent_dir)).await;
+    let _ = ext.on_event(&HostEvent::SessionStart { reason: "new".into(), previous_session_file: None }, &ctx(agent_dir)).await;
     let rec = rec.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(
         rec.statuses.last(),

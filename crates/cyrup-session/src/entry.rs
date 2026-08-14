@@ -23,6 +23,24 @@ pub struct EntryBase {
     pub parent_id: Option<EntryId>,
     /// RFC3339 timestamp.
     pub timestamp: String,
+    /// Every top-level key cyrup does not model, preserved verbatim and re-emitted on write.
+    ///
+    /// Pi's reader is a bare `JSON.parse` with a blank/malformed→null guard and NO schema check
+    /// (`parseSessionEntryLine`, `session-manager.ts:503-511`), so unknown keys survive any
+    /// rewrite. cyrup's typed variants dropped them: a session annotated by a newer cyrup, a fork
+    /// or an extension lost those annotations the first time this cyrup rewrote the file
+    /// (migration rewrite, `SessionManager::branch_to_file`, export). `Entry::Unknown` already
+    /// preserved the whole object for UNKNOWN tags (`entry.rs`'s `Err(_) => Entry::Unknown(v)`);
+    /// this closes the same hole for KNOWN ones.
+    ///
+    /// Serde applies flattened maps last, so this receives exactly the keys neither the variant's
+    /// own fields nor `id`/`parentId`/`timestamp` claimed. The internally-tagged `type`
+    /// discriminant is consumed by the enum before the content is handed to the variant, so it
+    /// never lands here and is never emitted twice.
+    ///
+    /// Standing caveat: keys nested INSIDE `AgentMessage`/`Content` are still not enumerated.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// The set of entry types cyrup interprets. Tags are snake_case (`message`, `model_change`, …);
@@ -116,7 +134,20 @@ pub enum KnownEntry {
         base: EntryBase,
         custom_type: String,
         /// `string | (Text|Image)[]` — mirrored as raw JSON to match Pi exactly.
+        ///
+        /// `#[serde(default)]` mirrors Pi's `entry.content ?? []`
+        /// (`session-manager.ts:396-399`): an ABSENT `content` must not fail the whole entry into
+        /// [`Entry::Unknown`], where it contributes nothing to context. The resulting
+        /// [`Value::Null`] is normalized to zero content blocks by
+        /// [`crate::agent_message::custom_to_message`], not rendered as the literal text `null`.
+        #[serde(default)]
         content: Value,
+        /// Pi passes `entry.display` straight through to `createCustomMessage`
+        /// (`session-manager.ts:396-399`), where an absent key is simply falsy — it is never
+        /// validated (`messages.ts:123-136`). Without `#[serde(default)]` an entry lacking the key
+        /// failed `from_value::<KnownEntry>` and was demoted to [`Entry::Unknown`], silently
+        /// vanishing from context.
+        #[serde(default)]
         display: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<Value>,

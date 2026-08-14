@@ -125,11 +125,16 @@ impl Hooks for PolicyHooks {
         match self.policy.evaluate(ctx.tool_name, ctx.args) {
             PolicyDecision::Proceed => {}
             PolicyDecision::Mutate { input } => *ctx.args = input,
-            PolicyDecision::Block { reason } => return Ok(BeforeOutcome::Block { reason: Some(reason) }),
+            // AGENT-022 `terminate: false` — a POLICY block is not pi's "stop after this batch"
+            // hint; that flag belongs to an extension's `BeforeToolCallResult.terminate`
+            // (`packages/agent/src/types.ts:61-69` @v0.84.1) and the permission gate never sets it.
+            PolicyDecision::Block { reason } => {
+                return Ok(BeforeOutcome::Block { reason: Some(reason), terminate: false });
+            }
             PolicyDecision::Confirm { reason } => {
                 if !self.has_ui {
                     // No UI to prompt: block-by-default (R-12-009).
-                    return Ok(BeforeOutcome::Block { reason: Some(reason) });
+                    return Ok(BeforeOutcome::Block { reason: Some(reason), terminate: false });
                 }
                 // With UI the front-end resolves confirmation; absent a wired confirm hook we
                 // proceed (the interactive front-end owns the prompt — arch-10/12).
@@ -175,8 +180,9 @@ impl Hooks for PolicyHooks {
     async fn prepare_next_turn(
         &self,
         ctx: PostTurn<'_>,
+        cancel: CancelToken,
     ) -> Result<Option<TurnUpdate>, HookError> {
-        let previous = self.inner.prepare_next_turn(ctx).await?;
+        let previous = self.inner.prepare_next_turn(ctx, cancel).await?;
         let Some(session) = self.session.get() else {
             return Ok(previous);
         };
@@ -196,8 +202,12 @@ impl Hooks for PolicyHooks {
         Ok(Some(update))
     }
 
-    async fn should_stop_after_turn(&self, ctx: PostTurn<'_>) -> Result<bool, HookError> {
-        self.inner.should_stop_after_turn(ctx).await
+    async fn should_stop_after_turn(
+        &self,
+        ctx: PostTurn<'_>,
+        cancel: CancelToken,
+    ) -> Result<bool, HookError> {
+        self.inner.should_stop_after_turn(ctx, cancel).await
     }
 }
 

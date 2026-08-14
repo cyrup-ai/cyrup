@@ -78,6 +78,9 @@ pub fn build_base_options(
         cache_retention: options.base.cache_retention,
         session_id: options.base.session_id.clone(),
         headers: options.base.headers.clone(),
+        // `ModelsSimpleStreamOptions` carries the transform too (Pi `models.ts:66`), and
+        // `model-runtime.ts:449-451` re-applies it on the simple path.
+        transform_headers: options.base.transform_headers.clone(),
         on_payload: options.base.on_payload.clone(),
         on_response: options.base.on_response.clone(),
         timeout_ms: options.base.timeout_ms,

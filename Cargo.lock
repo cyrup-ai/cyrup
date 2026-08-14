@@ -1079,6 +1079,8 @@ dependencies = [
  "cyrup-tui",
  "futures",
  "image",
+ "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1268,6 +1270,7 @@ dependencies = [
  "cyrup-provider",
  "cyrup-session-svc",
  "futures",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -1327,6 +1330,7 @@ name = "cyrup-resources"
 version = "0.0.0"
 dependencies = [
  "arc-swap",
+ "cyrup-config",
  "cyrup-core",
  "gix",
  "globset",

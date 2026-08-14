@@ -272,6 +272,10 @@ pub struct ForwardingAskChannel {
     /// child with no live backend forwards with a `"unknown"` requester id — binding keys on the
     /// PARENT id + nonce, not the requester).
     host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+    /// PERM-008 — the SAME shared audit trail the owning extension writes its gate entries into
+    /// (pi's module-scope `extensionLogger`/`reportedLoggingWarnings` pair). The child's forwarding
+    /// path writes four of upstream's eleven forwarding entries through it.
+    audit: Arc<crate::logging::AuditTrail>,
 }
 
 impl ForwardingAskChannel {
@@ -280,8 +284,9 @@ impl ForwardingAskChannel {
         agent_dir: PathBuf,
         timeout: Duration,
         host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+        audit: Arc<crate::logging::AuditTrail>,
     ) -> Self {
-        Self { agent_dir, timeout, host_services }
+        Self { agent_dir, timeout, host_services, audit }
     }
 }
 
@@ -318,6 +323,7 @@ impl AskChannel for ForwardingAskChannel {
             &requester_agent_name,
             message,
             self.timeout,
+            &self.audit,
         )
         .await;
         AskOutcome::Decided(decision)
@@ -390,20 +396,33 @@ mod tests {
     #[tokio::test]
     async fn forwarding_channel_denies_when_no_parent_anchor() {
         // No `CYRUP_SUBAGENT_PARENT_SESSION` set in this test env ⇒ null target ⇒ fail-closed deny
-        // (pi `index.ts:1267-1272`), never a hang, never an allow.
+        // (pi `index.ts:1000-1005` @v0.8.0), never a hang, never an allow.
+        //
+        // PERM-020 — the process-wide env lock is held across the ENTIRE body, not just the two
+        // mutations. In Rust 2024 `set_var`/`remove_var` are `unsafe` because they race any
+        // concurrent `getenv`, and this crate's other tests call `getenv` constantly:
+        // `ExtensionConfig::resolve_config_path` reads `CONFIG_PATH_ENV_KEY`, `resolve_logs_dir`
+        // reads `LOGS_DIR_ENV_KEY`, and `ForwardingAskChannel::confirm` below reads
+        // `PARENT_SESSION_ENV_VAR` and `AGENT_NAME_ENV_VAR` itself. Unsynchronized, that pairing is
+        // undefined behaviour rather than mere flakiness. `ext_config::env_lock()` is the same lock
+        // every other env-touching test in this crate takes.
+        let _env_guard =
+            crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let ch = ForwardingAskChannel::new(
             dir.path().to_path_buf(),
             Duration::from_millis(200),
             Arc::new(OnceLock::new()),
+            Arc::new(crate::logging::AuditTrail::detached(dir.path().join("logs"))),
         );
         // Guard against an ambient anchor leaking in from a parallel test process.
         let restore = std::env::var(cyrup_ext_subagents::PARENT_SESSION_ENV_VAR).ok();
-        // SAFETY: test-local, immediately restored; this test does not run its forward against a real
-        // sibling. Rust 2024 requires `unsafe` for env mutation.
+        // SAFETY: test-local, immediately restored, and serialized by `env_lock` above so no other
+        // test in this binary observes the mutation. Rust 2024 requires `unsafe` for env mutation.
         unsafe { std::env::remove_var(cyrup_ext_subagents::PARENT_SESSION_ENV_VAR) };
         let out = ch.confirm("Permission Required", "run bash 'rm -rf /'?", PromptOpts::default()).await;
         if let Some(v) = restore {
+            // SAFETY: same lock, same scope.
             unsafe { std::env::set_var(cyrup_ext_subagents::PARENT_SESSION_ENV_VAR, v) };
         }
         match out {

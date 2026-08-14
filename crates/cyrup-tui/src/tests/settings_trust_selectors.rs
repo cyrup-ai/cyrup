@@ -373,3 +373,92 @@ fn settings_navigation_wraps_at_both_ends() {
         other => panic!("expected ApplySetting, got {other:?}"),
     }
 }
+
+// ---- TUI-N03 / TUI-032 / TUI-036 -------------------------------------------------------------
+
+/// TUI-N03 — a theme chosen in `/settings` must PERSIST, not just repaint.
+///
+/// RED at HEAD: `confirm_selector`'s `SelectorKind::Theme` arm returned `None`, so no
+/// `AppCommand::ApplySetting` ever reached the persist arm and the choice died with the process.
+/// Pi distinguishes preview from confirm — `onThemePreview: (name) => themeController.preview(name)`
+/// versus `onThemeChange: (t) => { this.settingsManager.setTheme(t); void
+/// this.themeController.applyFromSettings(); }` (`interactive-mode.ts:4226-4231` @v0.83.0).
+///
+/// Worse in combination with TUI-004: `ThemeController::sync_with_terminal` persists an OSC-11
+/// detection only when `settings.theme` is UNSET — exactly the state a never-persisted user choice
+/// leaves behind — so the next launch overwrote it.
+#[test]
+fn confirming_a_theme_emits_an_apply_setting_command() {
+    let mut app = App::new(TestBackend::new(70, 20), UiTheme::dark()).unwrap();
+    app.open_selector(SelectorKind::Theme);
+    // Drive the list to a row and confirm.
+    let out = app.handle_input(&key(KeyCode::Enter));
+    match out {
+        AppAction::Command(AppCommand::ApplySetting { id, value }) => {
+            assert_eq!(id, "theme", "the persist arm keys on `theme`");
+            assert!(!value.is_empty(), "a theme name must ride along");
+        }
+        other => panic!("theme confirm must persist, got {other:?}"),
+    }
+}
+
+/// TUI-032 — confirming the `Thinking level` submenu applies the level to the SESSION.
+///
+/// Pi's `onThinkingLevelChange` is `this.session.setThinkingLevel(level); this.footer.invalidate();
+/// this.updateEditorBorderColor();` (`interactive-mode.ts:4222-4226`) — a session op, not a settings
+/// write. RED at HEAD: the arm returned `None`, and `SelectorKind::Thinking` was unreachable anyway
+/// because `open_selector` had exactly one call site and it only ever built `SelectorKind::Theme`.
+#[test]
+fn confirming_a_thinking_level_emits_a_set_thinking_command() {
+    let mut app = App::new(TestBackend::new(70, 20), UiTheme::dark()).unwrap();
+    app.open_selector(SelectorKind::Thinking);
+    match app.handle_input(&key(KeyCode::Enter)) {
+        AppAction::Command(AppCommand::SetThinking(level)) => {
+            assert!(!level.is_empty(), "a level must ride along");
+        }
+        other => panic!("thinking confirm must reach the session, got {other:?}"),
+    }
+}
+
+/// TUI-032 — the two submenu rows pi ships. `warnings` (`settings-selector.ts:578-590` @v0.83.0)
+/// and `thinking` (`:591-611`) had no cyrup counterpart at all, so `warnings.anthropicExtraUsage`
+/// — fully parsed and honoured by `cyrup-config` — could only be changed by hand-editing
+/// `settings.json`.
+#[test]
+fn the_settings_grid_offers_the_warnings_and_thinking_submenus() {
+    let rows = crate::app::settings_rows_for_test();
+    assert!(rows.iter().any(|r| r.id == "warnings"), "pi's `warnings` submenu row is missing");
+    assert!(rows.iter().any(|r| r.id == "thinking"), "pi's `Thinking level` submenu row is missing");
+}
+
+/// TUI-036 — `Show images` / `Image width` are offered ONLY on a terminal with an image protocol.
+///
+/// Pi: `// Only show image toggle if terminal supports it` / `if (supportsImages) { items.splice(1,
+/// 0, {id:"show-images", …}); items.splice(2, 0, {id:"image-width-cells", …}); }`
+/// (`settings-selector.ts:654-671` @v0.83.0). The neighbouring `auto-resize-images` row is
+/// deliberately NOT gated — it is spliced at `supportsImages ? 3 : 1` — which is exactly the
+/// distinction cyrup lost by pushing all three unconditionally.
+///
+/// RED at HEAD: `settings_rows` took no capability argument at all, so on a plain xterm both rows
+/// were offered and could not change anything, and every row below them sat at a different index
+/// from pi's.
+#[test]
+fn the_image_rows_are_gated_on_an_image_protocol() {
+    let with = crate::app::settings_rows_for_test_with_images(true);
+    assert!(with.iter().any(|r| r.id == "terminal.showImages"));
+    assert!(with.iter().any(|r| r.id == "terminal.imageWidthCells"));
+
+    let without = crate::app::settings_rows_for_test_with_images(false);
+    assert!(
+        !without.iter().any(|r| r.id == "terminal.showImages"),
+        "no protocol ⇒ no `Show images` row"
+    );
+    assert!(
+        !without.iter().any(|r| r.id == "terminal.imageWidthCells"),
+        "no protocol ⇒ no `Image width` row"
+    );
+    assert!(
+        without.iter().any(|r| r.id == "images.autoResize"),
+        "`Auto-resize images` is NOT gated upstream"
+    );
+}

@@ -344,7 +344,7 @@ async fn the_fleet_status_widget_is_published_and_cleared_through_live_host_serv
 
     // Shutdown always clears the key, so the host can never be left holding a stale widget.
     ext.on_event(
-        &HostEvent::SessionShutdown { reason: "test".into() },
+        &HostEvent::SessionShutdown { reason: "test".into(), target_session_file: None },
         &ctx,
     )
     .await;
@@ -452,7 +452,7 @@ async fn fleet_view_false_publishes_no_widget_at_all() {
     ext.set_host_services(services.clone());
     let ctx = HostCtx::event(ExtMode::Tui, true, dir.path().to_path_buf());
 
-    ext.on_event(&HostEvent::SessionStart { reason: "test".into() }, &ctx).await;
+    ext.on_event(&HostEvent::SessionStart { reason: "test".into(), previous_session_file: None }, &ctx).await;
     ext.on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &ctx).await;
     assert!(
         services.widgets.lock().expect("lock").is_empty(),

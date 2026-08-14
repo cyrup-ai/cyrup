@@ -380,6 +380,9 @@ impl HostileBroker {
 
 fn registration() -> SessionRegistration {
     SessionRegistration {
+        // ICOM-041: `runtimeFallbackAlias` (v0.10.1 types.ts:6-7) — these fixtures
+        // register under a REAL name, not a synthesized unnamed-runtime alias.
+        runtime_fallback_alias: None,
         name: Some("probe".to_string()),
         cwd: "/tmp/work".to_string(),
         model: "test-model".to_string(),

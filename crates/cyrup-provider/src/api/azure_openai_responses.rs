@@ -23,7 +23,8 @@ use crate::api::compat::{
     thinking_level_key,
 };
 use crate::api::openai_responses::{
-    convert_responses_messages, convert_responses_tools, decode_stream, provider_env_value,
+    ConvertResponsesToolsOptions, convert_responses_messages, convert_responses_tools, decode_stream,
+    provider_env_value,
 };
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;
@@ -46,6 +47,11 @@ const API_ID: &str = "azure-openai-responses";
 /// The default Azure OpenAI API version (Pi `DEFAULT_AZURE_API_VERSION`,
 /// azure-openai-responses.ts:19).
 const DEFAULT_AZURE_API_VERSION: &str = "v1";
+
+/// OpenAI Responses rejects `max_output_tokens` below 16:
+/// <https://github.com/earendil-works/pi/issues/6265>
+/// (Pi `OPENAI_RESPONSES_MIN_OUTPUT_TOKENS`, `azure-openai-responses.ts:26` @v0.83.0.)
+const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: u64 = 16;
 
 /// Per-API typed options for the `azure-openai-responses` wire protocol (Pi
 /// `AzureOpenAIResponsesOptions`, azure-openai-responses.ts:52-59). Each per-request override wins
@@ -364,7 +370,18 @@ pub(crate) fn build_params(
     // `convertResponsesMessages` with options that omit `deferredTools` and never imports
     // `splitDeferredTools`, so no `tool_search_call`/`tool_search_output` pair can ever be emitted
     // on this path and every tool stays in the request prefix (DRIFT-001).
-    let messages = convert_responses_messages(model, ctx, AZURE_TOOL_CALL_PROVIDERS, &[]);
+    // `supportsStrictMode: model.compat?.supportsStrictMode ?? true` — Azure's OWN default, which
+    // is `true` where openai-responses' is `false` (azure-openai-responses.ts:302 @v0.83.0).
+    let tool_options = ConvertResponsesToolsOptions {
+        defer_loading: false,
+        supports_strict_mode: model
+            .compat
+            .as_ref()
+            .and_then(|c| c.supports_strict_mode)
+            .unwrap_or(true),
+        default_strict: Some(false),
+    };
+    let messages = convert_responses_messages(model, ctx, AZURE_TOOL_CALL_PROVIDERS, &[], tool_options);
 
     let mut obj = Map::new();
     obj.insert("model".to_string(), json!(deployment_name));
@@ -380,8 +397,14 @@ pub(crate) fn build_params(
     }
     obj.insert("store".to_string(), json!(false));
 
-    if let Some(max) = opts.max_tokens {
-        obj.insert("max_output_tokens".to_string(), json!(max));
+    // PROV-019. `if (options?.maxTokens) params.max_output_tokens = Math.max(options.maxTokens,
+    // OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)` (azure-openai-responses.ts:292-293 @v0.83.0). The
+    // `.filter` reproduces pi's JS truthiness gate, so `Some(0)` omits the key.
+    if let Some(max) = opts.max_tokens.filter(|m| *m > 0) {
+        obj.insert(
+            "max_output_tokens".to_string(),
+            json!(max.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)),
+        );
     }
     if let Some(temp) = opts.temperature {
         obj.insert("temperature".to_string(), json!(temp));
@@ -390,7 +413,7 @@ pub(crate) fn build_params(
     if !ctx.tools.is_empty() {
         obj.insert(
             "tools".to_string(),
-            Value::Array(convert_responses_tools(&ctx.tools, false)),
+            Value::Array(convert_responses_tools(&ctx.tools, tool_options)),
         );
     }
 

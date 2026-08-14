@@ -22,7 +22,8 @@ use crate::state::{GenerationConfig, StateInner};
 use crate::stream_fn::{ApiKeyResolver, StreamFn};
 use crate::subscriber::EventSubscriber;
 use cyrup_core::{
-    finalizing_channel, FinalizingStream, ModelRef, ModelThinkingLevel, RunCancel, SessionId, Tool,
+    finalizing_channel, CancelToken, FinalizingStream, ModelRef, ModelThinkingLevel, RunCancel,
+    SessionId, Tool,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -96,7 +97,7 @@ struct SinkSubscriber(Arc<dyn AgentEventSink>);
 
 #[async_trait::async_trait]
 impl EventSubscriber for SinkSubscriber {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         self.0.emit(event).await;
     }
 }
@@ -127,7 +128,14 @@ fn build_run_ctx(
         streaming_message: None,
         pending_tool_calls: HashSet::new(),
         error_message: None,
-        headers: None,
+        // AGENT-021 — seed the live header overlay from the caller's config, exactly as
+        // `AgentBuilder::build` does. pi's `AgentLoopConfig extends SimpleStreamOptions`
+        // (`packages/agent/src/types.ts:271`) and `agent-loop.ts:308-312` spreads the WHOLE config
+        // into the provider call (`streamFunction(config.model, llmContext, { ...config, apiKey,
+        // signal })`), so a low-level caller that sets `headers` has them on the wire by
+        // construction. Hardcoding `None` here orphaned `AgentLoopConfig.gen_config.headers`:
+        // `stream_assistant` reads `state.headers` per turn, and nothing on this path wrote it.
+        headers: config.gen_config.headers.clone(),
         // The low-level loop has no live agent to mutate, so state mirrors the supplied config
         // (pi `createLoopConfig` reads `this.transport`; here the caller supplies it directly).
         transport: config.gen_config.transport,

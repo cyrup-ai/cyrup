@@ -98,7 +98,7 @@ struct Recorder {
 
 #[async_trait::async_trait]
 impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         self.events.lock().unwrap().push(event.clone());
     }
 }
@@ -669,7 +669,7 @@ impl Hooks for GateLateToolHook {
         _cancel: CancelToken,
     ) -> Result<crate::BeforeOutcome, HookError> {
         if ctx.tool_name == "late" {
-            Ok(crate::BeforeOutcome::Block { reason: Some("denied by policy".into()) })
+            Ok(crate::BeforeOutcome::Block { reason: Some("denied by policy".into()), terminate: false })
         } else {
             Ok(crate::BeforeOutcome::Proceed)
         }

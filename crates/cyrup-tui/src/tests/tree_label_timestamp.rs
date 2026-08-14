@@ -2,7 +2,7 @@
 //! `:741-743` (the render condition) and `:658-660` (the `[+label time]` status marker).
 //!
 //! Pi's column shows `labelTimestamp`: the time an entry's **label** was set. It is off until the
-//! `t` toggle (`app.tree.toggleLabelTimestamp`, `:1090`) turns it on, and even then it decorates
+//! `shift+t` toggle (`app.tree.toggleLabelTimestamp`, `:1090`) turns it on, and even then it decorates
 //! only rows that actually carry a label — `showLabelTimestamps && node.label && node.labelTimestamp`.
 //!
 //! cyrup had the toggle but not the value: the DAG→row projection fabricated the literal string
@@ -21,8 +21,12 @@ use crate::{
 };
 use ratatui::backend::TestBackend;
 
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+/// `app.tree.toggleLabelTimestamp` is bound to **`shift+t`** upstream (`keybindings.ts:131-134`,
+/// v0.83.0), which a terminal delivers as the shifted letter. A *bare* `t` is not the toggle at
+/// all — it falls through `handleInput`'s final `else` (`tree-selector.ts:1093-1100`) and is
+/// appended to the tree's text search.
+fn shift_t() -> InputEvent {
+    InputEvent::Key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT))
 }
 
 fn buf_text(app: &App<TestBackend>) -> String {
@@ -98,7 +102,7 @@ fn the_dag_projection_no_longer_fabricates_a_current_timestamp() {
     );
 }
 
-/// Pi's default is OFF (`private showLabelTimestamps = false`). `t` turns it on — and announces
+/// Pi's default is OFF (`private showLabelTimestamps = false`). `shift+t` turns it on — and announces
 /// itself in the header the way `getStatusLabels` does.
 #[test]
 fn the_label_timestamp_column_is_off_until_the_t_toggle() {
@@ -118,13 +122,13 @@ fn the_label_timestamp_column_is_off_until_the_t_toggle() {
         "the header marker belongs to the ON state only:\n{closed}"
     );
 
-    // `t` — `app.tree.toggleLabelTimestamp` (Pi `:1090`).
-    app.handle_input(&key(KeyCode::Char('t')));
+    // `shift+t` — `app.tree.toggleLabelTimestamp` (Pi `:1090`, bound at `keybindings.ts:131-134`).
+    app.handle_input(&shift_t());
     app.draw().unwrap();
     let open = buf_text(&app);
     assert!(
         open.contains("12:04"),
-        "`t` must reveal the labeled row's timestamp:\n{open}"
+        "`shift+t` must reveal the labeled row's timestamp:\n{open}"
     );
     assert!(
         open.contains("[+label time]"),
@@ -138,7 +142,7 @@ fn the_label_timestamp_column_is_off_until_the_t_toggle() {
 #[test]
 fn an_unlabeled_row_never_shows_a_label_timestamp() {
     let mut app = tree_app(labeled_and_unlabeled());
-    app.handle_input(&key(KeyCode::Char('t')));
+    app.handle_input(&shift_t());
     app.draw().unwrap();
     let screen = buf_text(&app);
     assert!(

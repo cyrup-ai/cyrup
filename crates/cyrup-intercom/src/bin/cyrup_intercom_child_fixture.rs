@@ -78,6 +78,10 @@ async fn run() -> i32 {
 
     let registration = SessionRegistration {
         name: Some(own_label),
+        // The child's label is the production-derived presence name, not a synthesized
+        // unnamed-runtime alias (`v0.10.1 types.ts:6-7`, carried by `buildRegistration`'s
+        // `...identity` spread at `v0.10.1 index.ts:772-774`).
+        runtime_fallback_alias: None,
         cwd: std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),

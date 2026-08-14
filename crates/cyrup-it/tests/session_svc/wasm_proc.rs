@@ -102,7 +102,13 @@ async fn wasm_guest_proc_is_a_real_live_duplex_pipe_across_multiple_polls() {
     let bytes = bins::component_bytes();
     let session = trusted_session().await;
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 
@@ -162,7 +168,13 @@ async fn wasm_guest_proc_poll_exit_reports_the_real_natural_exit_code() {
     let bytes = bins::component_bytes();
     let session = trusted_session().await;
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 
@@ -196,7 +208,13 @@ async fn wasm_guest_proc_kill_terminates_a_real_running_child_verified_at_the_os
     let bytes = bins::component_bytes();
     let session = trusted_session().await;
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 

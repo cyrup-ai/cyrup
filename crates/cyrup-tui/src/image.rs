@@ -157,7 +157,15 @@ impl ImageRenderer {
         theme: &UiTheme,
         show_images: bool,
     ) {
-        if !show_images || area.width == 0 || area.height == 0 {
+        // TUI-017 — the no-protocol case takes the SAME branch as `showImages: false`. Upstream's
+        // `Image.render` is `if (caps.images) { …draw… } else { …one imageFallback line… }`
+        // (`packages/tui/src/components/image.ts:70-118` @v0.83.0); there is no half-block
+        // rasterizer anywhere in pi. cyrup's `from_capabilities` installs `Halfblocks` when
+        // `caps.images == None` (`:102-106`), so on a plain xterm, the Linux console, CI or a pipe
+        // an attachment used to dump ~20-30 rows of coloured `▀` into scrollback where pi prints
+        // one `[Image: …]` line. `is_graphical()` is exactly `caps.images.is_some()` for the three
+        // protocols `from_capabilities` maps.
+        if !show_images || !self.is_graphical() || area.width == 0 || area.height == 0 {
             frame.render_widget(Paragraph::new(block.placeholder_line(theme)), area);
             return;
         }
@@ -176,6 +184,9 @@ impl ImageRenderer {
 pub struct ImageBlock {
     image: DynamicImage,
     label: String,
+    /// The MIME type Pi's fallback line prints (`[Image: {name} [{mime}] {w}x{h}]`,
+    /// `terminal-image.ts:546-558`). Sniffed from the encoded bytes in [`ImageBlock::decode`].
+    mime: String,
 }
 
 impl std::fmt::Debug for ImageBlock {
@@ -197,15 +208,30 @@ impl PartialEq for ImageBlock {
 
 impl ImageBlock {
     /// Wrap an already-decoded [`DynamicImage`] with a display `label`.
+    ///
+    /// The MIME type defaults to `image/png` because there are no bytes left to sniff — use
+    /// [`ImageBlock::decode`] or [`ImageBlock::from_path`] whenever the encoded bytes are in hand,
+    /// since the MIME reaches the user through Pi's `[Image: … [{mimeType}] …]` fallback line
+    /// ([`image_fallback_text`], `terminal-image.ts:546-558`).
     pub fn new(image: DynamicImage, label: impl Into<String>) -> Self {
-        ImageBlock { image, label: label.into() }
+        ImageBlock { image, label: label.into(), mime: "image/png".to_string() }
     }
 
     /// Decode raw image `bytes` (PNG/JPEG/GIF/WebP/BMP — the workspace `image` feature set), labelled
     /// `label`. `None` when the bytes are not a recognized image (`terminal-image.ts` guards the same).
     pub fn decode(bytes: &[u8], label: impl Into<String>) -> Option<Self> {
         let image = image::load_from_memory(bytes).ok()?;
-        Some(ImageBlock { image, label: label.into() })
+        // Sniffed from the same bytes rather than guessed from the label's extension, matching Pi's
+        // `getImageDimensions(base64Data, mimeType)` pairing of the decoded payload with its type.
+        let mime = image::guess_format(bytes)
+            .map(|f| f.to_mime_type().to_string())
+            .unwrap_or_else(|_| "image/png".to_string());
+        Some(ImageBlock { image, label: label.into(), mime })
+    }
+
+    /// The image's MIME type, as it appears in Pi's `[Image: {name} [{mime}] {w}x{h}]` fallback.
+    pub fn mime_type(&self) -> &str {
+        &self.mime
     }
 
     /// Downscale the raster (aspect-preserved) so neither side exceeds `max_px`; a no-op when it
@@ -219,7 +245,11 @@ impl ImageBlock {
         if w <= max_px && h <= max_px {
             return self;
         }
-        ImageBlock { image: self.image.thumbnail(max_px, max_px), label: self.label }
+        ImageBlock {
+            image: self.image.thumbnail(max_px, max_px),
+            label: self.label,
+            mime: self.mime,
+        }
     }
 
     /// Read + decode an image file, labelling it with the path (the `@`-mention / attachment source).
@@ -238,15 +268,20 @@ impl ImageBlock {
         &self.label
     }
 
-    /// The text-placeholder line shown when `show_images` is off (or on the scrollback/no-protocol
-    /// path): `🖼 {label} ({w}×{h})` (`components/image.ts` placeholder, spec/tui/06 §6).
+    /// The text stand-in shown when `showImages` is off or the terminal has no image protocol.
+    ///
+    /// **TUI-017.** This used to emit the cyrup-invented `🖼 {label} ({w}×{h})`. Upstream emits
+    /// exactly one line, `truncateToWidth(theme.fallbackColor(imageFallback(mimeType, dimensions,
+    /// filename)), width)` (`packages/tui/src/components/image.ts:114-118` @v0.83.0), i.e.
+    /// `[Image: {name} [{mime}] {w}x{h}]` — the string [`image_fallback_text`] has produced in this
+    /// same file all along, used only by the tool-result path. Pi has no emoji placeholder anywhere.
+    /// Styled `fallbackColor`, which is the dim/muted role.
     pub fn placeholder_line(&self, theme: &UiTheme) -> Line<'static> {
         let (w, h) = self.dimensions();
-        Line::from(vec![
-            Span::styled("🖼 ", theme.accent_style()),
-            Span::styled(self.label.clone(), theme.base_style()),
-            Span::styled(format!(" ({w}×{h})"), theme.dim_style()),
-        ])
+        Line::from(Span::styled(
+            image_fallback_text(&self.mime, Some((w, h)), Some(&self.label)),
+            theme.dim_style(),
+        ))
     }
 
     /// Rasterize this image into styled [`Line`]s using the portable Unicode **half-block** protocol
@@ -427,7 +462,21 @@ pub fn detect_capabilities() -> TerminalCapabilities {
 /// (`tui/src/terminal-image.ts:33`, `:138-143`): detect once, then hand the same answer to every
 /// later caller. Renderers consult it through [`hyperlinks_supported`]; the app seeds it from the
 /// capabilities it already detected at startup via [`seed_hyperlink_support`].
-static HYPERLINKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+///
+/// **TUI-N12.** This was a write-once `OnceLock` carrying only `hyperlinks`, so there was no way to
+/// pin the global for a test and no way to reset it — the hermeticity hole that produced TUI-N11 (a
+/// markdown test asserting a property of the developer's `TERM_PROGRAM`, red on ghostty, kitty,
+/// iTerm2, WezTerm, Warp, vscode, alacritty, Windows Terminal and forwarding tmux, green only on an
+/// unidentified terminal). Pi exports two mutators alongside the getter:
+/// `resetCapabilitiesCache()` (`packages/tui/src/terminal-image.ts:137-139`) and
+/// `setCapabilities(caps)` (`:142-144`), the latter doc-commented "Override the cached
+/// capabilities. Useful in tests to exercise both code paths". Both are pure state mutation and
+/// draw nothing, so ADR-0001 rule 2 puts them in scope with no substrate defence.
+///
+/// It is now a resettable cache over the whole [`TerminalCapabilities`] record, not just the one
+/// field, so `images` and `true_color` get the same seam.
+static CAPABILITIES: std::sync::RwLock<Option<TerminalCapabilities>> =
+    std::sync::RwLock::new(None);
 
 /// Whether the controlling terminal forwards OSC-8 hyperlinks — Pi `getCapabilities().hyperlinks`,
 /// the gate on `markdown.ts:692`. Detected once and cached for the life of the process, exactly as
@@ -448,14 +497,73 @@ static HYPERLINKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// terminal above" (`tui/src/terminal-image.ts:130-134`) — which prints the URL rather than risking
 /// a terminal that swallows OSC-8 and shows nothing.
 pub fn hyperlinks_supported() -> bool {
-    *HYPERLINKS.get_or_init(|| detect_capabilities_from(|k| std::env::var(k).ok(), false).hyperlinks)
+    cached_capabilities().hyperlinks
 }
 
-/// Seed [`hyperlinks_supported`] from capabilities that have already been detected, so startup's
-/// single `detectCapabilities()` serves the renderer too. First writer wins (later calls are no-ops),
-/// matching upstream's write-once `cachedCapabilities`.
+/// Pi's `getCapabilities()` (`terminal-image.ts:33`, `:138-143`): the cached record, detected on
+/// first use and reused for the life of the process unless [`set_capabilities`] or
+/// [`reset_capabilities_cache`] intervenes. TUI-N12.
+pub fn cached_capabilities() -> TerminalCapabilities {
+    if let Ok(guard) = CAPABILITIES.read()
+        && let Some(caps) = *guard
+    {
+        return caps;
+    }
+    let detected = detect_capabilities_from(|k| std::env::var(k).ok(), false);
+    if let Ok(mut guard) = CAPABILITIES.write() {
+        // First writer wins, so a `set_capabilities` that raced this detection is not clobbered.
+        if guard.is_none() {
+            *guard = Some(detected);
+        }
+        if let Some(caps) = *guard {
+            return caps;
+        }
+    }
+    detected
+}
+
+/// Pi's `setCapabilities(caps)` (`terminal-image.ts:142-144`) — "Override the cached capabilities.
+/// Useful in tests to exercise both code paths". Unlike the old first-writer-wins seed this
+/// REPLACES, which is what makes both branches reachable from a test. TUI-N12.
+pub fn set_capabilities(caps: TerminalCapabilities) {
+    if let Ok(mut guard) = CAPABILITIES.write() {
+        *guard = Some(caps);
+    }
+}
+
+/// Pi's `resetCapabilitiesCache()` (`terminal-image.ts:137-139`): drop the cache so the next read
+/// re-detects. TUI-N12.
+pub fn reset_capabilities_cache() {
+    if let Ok(mut guard) = CAPABILITIES.write() {
+        *guard = None;
+    }
+}
+
+/// Seed the capability cache from capabilities that have already been detected, so startup's single
+/// `detectCapabilities()` serves the renderer too. First writer wins, matching upstream's
+/// `cachedCapabilities ??= detectCapabilities()`.
+///
+/// Kept as a `hyperlinks`-shaped entry point because `App::detect_image_support` is its only caller
+/// and it has the whole record already; see [`seed_capabilities`] for that form.
 pub fn seed_hyperlink_support(supported: bool) {
-    let _ = HYPERLINKS.set(supported);
+    if let Ok(mut guard) = CAPABILITIES.write()
+        && guard.is_none()
+    {
+        *guard = Some(TerminalCapabilities {
+            hyperlinks: supported,
+            ..TerminalCapabilities::conservative(false)
+        });
+    }
+}
+
+/// Seed the whole record (the form `App::detect_image_support` should use — it already holds every
+/// field, where [`seed_hyperlink_support`] discards two of them). First writer wins. TUI-N12.
+pub fn seed_capabilities(caps: TerminalCapabilities) {
+    if let Ok(mut guard) = CAPABILITIES.write()
+        && guard.is_none()
+    {
+        *guard = Some(caps);
+    }
 }
 
 /// The pure core of [`detect_capabilities`] for the *host* platform (Pi `detectCapabilities`,

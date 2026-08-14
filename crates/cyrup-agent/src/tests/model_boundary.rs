@@ -3,7 +3,8 @@
 //! (distinct text/thinking/toolCall blocks), enriched hook contexts, `prepare_arguments`,
 //! `skip_initial_steering_poll`, `tool_execution_end.result.terminate`, the synthetic
 //! `handleRunFailure` closing sequence, and the small Agent accessors (`signal`,
-//! `has_queued_messages`, unconditional `reset`, `prompt_with_images`). Each closes a gap from
+//! `has_queued_messages`, `reset` (refused mid-run since AGENT-023), `prompt_with_images`).
+//! Each closes a gap from
 //! spec/gap-analysis/03-cyrup-agent.md and cites the Pi behavior it mirrors.
 #![allow(
     clippy::unwrap_used,
@@ -110,7 +111,7 @@ struct Recorder {
 
 #[async_trait::async_trait]
 impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         self.events.lock().unwrap().push(event.clone());
     }
 }
@@ -316,7 +317,7 @@ struct BumpThinkingHook {
 
 #[async_trait::async_trait]
 impl Hooks for BumpThinkingHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         // Only override once (turn 0 → turn 1).
         if self.bumped.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(Some(TurnUpdate {
@@ -327,7 +328,7 @@ impl Hooks for BumpThinkingHook {
             Ok(None)
         }
     }
-    async fn should_stop_after_turn(&self, ctx: PostTurn<'_>) -> Result<bool, HookError> {
+    async fn should_stop_after_turn(&self, ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<bool, HookError> {
         // Stop after the second assistant turn.
         Ok(ctx.turn_index >= 2)
     }
@@ -597,7 +598,7 @@ struct PanicHook;
 
 #[async_trait::async_trait]
 impl Hooks for PanicHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         panic!("hook exploded");
     }
 }
@@ -642,8 +643,12 @@ async fn gap23_24_signal_and_has_queued_messages() {
     assert!(agent.has_queued_messages(), "queued follow-up is observable");
 }
 
+/// AGENT-023 changed the CONTRACT this used to pin: `reset()` is refused under a live run, matching
+/// pi's `if (this.activeRun) { throw ... }` (`packages/agent/src/agent.ts:332-345` @v0.84.1). What
+/// survives is the IDLE behaviour asserted here — transcript and both queues cleared. The refusal
+/// half is `agent023_reset_is_refused_while_a_run_is_in_flight` in `area02_backlog`.
 #[tokio::test]
-async fn gap25_reset_is_unconditional() {
+async fn gap25_reset_clears_transcript_and_queues_when_idle() {
     let (sf, _captured) =
         recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
     let agent = Agent::builder(model_ref(), sf)
@@ -766,6 +771,7 @@ impl Hooks for SwitchModelOnce {
     async fn prepare_next_turn(
         &self,
         _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
     ) -> Result<Option<TurnUpdate>, HookError> {
         if self.fired.fetch_add(1, Ordering::SeqCst) == 0 {
             return Ok(Some(TurnUpdate { model: Some(self.to.clone()), ..Default::default() }));

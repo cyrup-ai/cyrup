@@ -40,7 +40,6 @@ use crate::connect::{self, ConnectParams};
 use crate::identity::{
     ChildOrchestratorMetadata, preferred_supervisor_target, read_child_orchestrator_metadata,
 };
-use crate::inbound::schedule_inbound_flush;
 use crate::paths::{agent_dir_path, intercom_dir_path};
 use crate::seams::{IntercomClarifyChannel, IntercomDeliveryChannel, IntercomSteerChannel};
 use crate::session_state::SharedIntercomState;
@@ -86,18 +85,6 @@ pub const EXTENSION_ID: &str = "cyrup-intercom";
 /// The explicit opt-in flag: set truthy to attach intercom to a plain (non-child) session.
 pub const INSTALL_ENV_VAR: &str = "CYRUP_INTERCOM";
 
-/// The three context-usage fields of a `presence` frame, in the tri-state the wire has
-/// (`v0.9.2 types.ts:86`): `None` omits the key, `Some(None)` sends an explicit `null` (the broker
-/// CLEARS the field), `Some(Some(n))` sets it. Produced by
-/// [`IntercomExtension::current_context_usage`], which is the port of pi's spread-in-place
-/// `...currentContextUsage()` (`v0.9.2 index.ts:816,847`) — Rust has no object spread, so the three
-/// keys travel as one value.
-#[derive(Debug, Default)]
-struct PresenceContext {
-    pct: Option<Option<serde_json::Number>>,
-    tokens: Option<Option<serde_json::Number>>,
-    window: Option<Option<serde_json::Number>>,
-}
 
 /// The intercom native extension.
 pub struct IntercomExtension {
@@ -105,6 +92,9 @@ pub struct IntercomExtension {
     state: Arc<SharedIntercomState>,
     agent_dir: PathBuf,
     metadata: Option<ChildOrchestratorMetadata>,
+    /// `nativeSupervisorChannelAvailable` (`v0.10.1 index.ts:1504`), probed ONCE at construction the
+    /// way [`read_child_orchestrator_metadata`] is, never re-read inside `init`.
+    native_supervisor_channel: bool,
     clarify: Arc<IntercomClarifyChannel>,
     delivery: Arc<IntercomDeliveryChannel>,
     steer: Arc<IntercomSteerChannel>,
@@ -127,6 +117,10 @@ impl IntercomExtension {
     ) -> Result<Self, String> {
         let ask_timeout = ask_timeout_ms()?;
         let state = Arc::new(SharedIntercomState::new(config, ask_timeout, cwd));
+        // Publish the metadata so `SharedIntercomState::sync_presence_identity` (reachable from the
+        // `intercom` tool, `v0.10.1 index.ts:1853`) derives the SAME presence name
+        // `connect::build_registration` does.
+        state.set_presence_metadata(metadata.clone());
         let supervisor_target = metadata.as_ref().map(preferred_supervisor_target);
         let clarify = Arc::new(IntercomClarifyChannel::new(state.clone()));
         let delivery = Arc::new(IntercomDeliveryChannel::new(state.clone(), supervisor_target));
@@ -136,10 +130,19 @@ impl IntercomExtension {
             state,
             agent_dir,
             metadata,
+            native_supervisor_channel: crate::identity::native_supervisor_channel_available(),
             clarify,
             delivery,
             steer,
         })
+    }
+
+    /// Override the `nativeSupervisorChannelAvailable` probe (`v0.10.1 index.ts:1504`) instead of
+    /// reading the process environment — for tests, which must not mutate process-global env state.
+    #[must_use]
+    pub fn with_native_supervisor_channel(mut self, available: bool) -> Self {
+        self.native_supervisor_channel = available;
+        self
     }
 
     /// The broker-backed [`ClarifyChannel`] this extension owns. HANDED (WIRED) into
@@ -187,24 +190,24 @@ impl IntercomExtension {
         }
     }
 
-    /// Derive the presence status suffix (`currentStatus`, `index.ts:562-583`) for a lifecycle
-    /// transition, appending the optional configured status suffix.
-    fn presence_status(&self, base: &str) -> String {
-        match &self.state.config.status {
-            Some(suffix) if !suffix.trim().is_empty() => format!("{base} · {suffix}"),
-            _ => base.to_string(),
-        }
-    }
-
-    fn sync_presence(&self, base: &str) {
+    /// `syncPresenceStatus()` (`v0.10.1 index.ts:843-849`, 7 lines):
+    ///
+    /// ```text
+    /// if (!client || !currentSessionId || !getLiveContext()) return;
+    /// // context% rides the status heartbeat so peers see live usage at turn boundaries.
+    /// client.updatePresence({ status: currentStatus(), ...currentContextUsage() });
+    /// ```
+    ///
+    /// The status is derived by [`SharedIntercomState::current_status`] from the active-tool map and
+    /// the `agentRunning` flag — it is NOT a per-call-site literal. It used to be: each lifecycle
+    /// arm passed its own `base` string, so with two overlapping tool calls the first `ToolExecEnd`
+    /// reset presence to `thinking` while the other tool was still running.
+    fn sync_presence_status(&self) {
         if let Some(client) = self.state.client() {
-            // `client.updatePresence({ status: currentStatus(), ...currentContextUsage() })`
-            // (`v0.9.2 index.ts:842-848`, 7 lines) — its own comment: "context% rides the status
-            // heartbeat so peers see live usage at turn boundaries" (`:846`).
-            let ctx_usage = self.current_context_usage();
+            let ctx_usage = self.state.current_context_usage();
             client.update_presence_with_context(
                 None,
-                Some(self.presence_status(base)),
+                Some(self.state.current_status()),
                 None,
                 ctx_usage.pct,
                 ctx_usage.tokens,
@@ -213,75 +216,23 @@ impl IntercomExtension {
         }
     }
 
-    /// pi `currentContextUsage()` (`v0.9.2 index.ts:790-808`, 19 lines incl. its 5-line comment):
+    /// `syncPresenceIdentity(sessionId)` (`v0.10.1 index.ts:808-815`, 8 lines):
     ///
     /// ```text
-    /// const usage = getLiveContext()?.getContextUsage?.();
-    /// if (!usage) return {};
-    /// const result = {
-    ///   contextPct: typeof usage.percent === "number" && Number.isFinite(usage.percent) ? Math.round(usage.percent) : null,
-    ///   contextTokens: typeof usage.tokens === "number" && Number.isFinite(usage.tokens) ? usage.tokens : null,
-    /// };
-    /// if (typeof usage.contextWindow === "number" && usage.contextWindow > 0) result.contextWindow = usage.contextWindow;
-    /// return result;
+    /// if (!client || !getLiveContext()) return;
+    /// const identity = buildPresenceIdentity(pi, currentIntercomSessionId ?? sessionId);
+    /// lastPresenceName = identity.name;
+    /// client.updatePresence({ ...identity, status: currentStatus(), ...currentContextUsage() });
     /// ```
     ///
-    /// Note the two tiers, which are what the tri-state on
-    /// [`IntercomClient::update_presence_with_context`] exists to carry:
-    /// - no usage at all → **omit** all three keys (the broker leaves the peer's view untouched);
-    /// - usage present but the token count unknown → send explicit **`null`** for
-    ///   `contextPct`/`contextTokens`, which CLEARS a peer's stale value instead of freezing the
-    ///   pre-compaction percentage (upstream's own comment, `v0.9.2 index.ts:791-793`; broker side at
-    ///   `v0.9.2 broker/broker.ts:922-924`).
-    ///
-    /// # Shape mapping
-    ///
-    /// pi's `ContextUsage` is `{tokens: number|null, contextWindow: number, percent: number|null}`
-    /// (`pi v0.84.1 coding-agent/src/core/extensions/types.ts:288-294`). cyrup's
-    /// `HostServices::context_usage()` deliberately answers in cyrup's own spelling,
-    /// `{usedTokens, contextWindow, fraction}` — a KNOWN, documented divergence
-    /// (`cyrup-session-svc/src/state.rs:69-75`: "Converging those onto Pi's spelling is a separate
-    /// divergence"). It lives in another crate, so this reads that shape and translates:
-    ///
-    /// - `contextWindow == 0` ⇒ pi's `getContextUsage()` returns `undefined` outright
-    ///   (`pi v0.84.1 agent-session.ts:3178-3179`: `if (contextWindow <= 0) return undefined;`), so
-    ///   this returns "omit everything", exactly as `if (!usage) return {}` does.
-    /// - `usedTokens == 0` ⇒ pi's `tokens: null` / `percent: null`. This is not an approximation:
-    ///   cyrup's `ContextUsage::from_last_assistant` yields `used_tokens == 0` precisely when there
-    ///   is no usable assistant usage to read (`cyrup-session-svc/src/state.rs:168-180`), which is
-    ///   the same condition pi's post-compaction check tests — `contextTokens > 0` over the
-    ///   post-compaction assistants, else `{ tokens: null, contextWindow, percent: null }`
-    ///   (`pi v0.84.1 agent-session.ts:3196-3207`).
-    /// - `contextPct` is computed from `usedTokens`/`contextWindow` rather than from cyrup's
-    ///   `fraction`, because `fraction` is clamped to `[0, 1]`
-    ///   (`cyrup-session-svc/src/state.rs:164`) while pi's `percent` is not — an over-window session
-    ///   must report pi's `104`, not a clamped `100`. Integer arithmetic (`u128`) rather than f64
-    ///   both matches `Math.round`'s round-half-up on non-negative inputs exactly and avoids a
-    ///   lossy float cast.
-    fn current_context_usage(&self) -> PresenceContext {
-        let Some(services) = self.state.host_services() else {
-            return PresenceContext::default();
-        };
-        let usage = services.context_usage();
-        let Some(obj) = usage.as_object() else {
-            return PresenceContext::default();
-        };
-        // `contextWindow <= 0` ⇒ pi has no usage object at all ⇒ omit all three keys.
-        let window = obj.get("contextWindow").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        if window == 0 {
-            return PresenceContext::default();
-        }
-        let tokens = obj.get("usedTokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        let (pct, tokens) = if tokens == 0 {
-            // pi `{ tokens: null, percent: null }` — send the CLEAR, do not omit.
-            (Some(None), Some(None))
-        } else {
-            let pct = u64::try_from((u128::from(tokens) * 100 + u128::from(window) / 2) / u128::from(window))
-                .unwrap_or(u64::MAX);
-            (Some(Some(serde_json::Number::from(pct))), Some(Some(serde_json::Number::from(tokens))))
-        };
-        PresenceContext { pct, tokens, window: Some(Some(serde_json::Number::from(window))) }
+    /// The difference from [`Self::sync_presence_status`] is the **name**: this one re-derives it
+    /// from the live host, so a session renamed by `/name`, a branch switch or a title change stops
+    /// advertising its startup label. Upstream calls it from three places — the name poll, every
+    /// `turn_start`, and the head of every `intercom` tool call.
+    pub fn sync_presence_identity(&self) {
+        self.state.sync_presence_identity();
     }
+
 
     /// pi `insertIntoEditor(ctx, text)` (`v0.9.2 index.ts:2261-2268`, 8 lines):
     ///
@@ -470,7 +421,14 @@ impl NativeExtension for IntercomExtension {
         // `intercom` is always registered; `contact_supervisor` only for a subagent child with
         // orchestrator metadata (index.ts:1162-1163,1425).
         api.register_tool(Arc::new(IntercomTool::new(self.state.clone())));
-        if let Some(metadata) = &self.metadata {
+        // `v0.10.1 index.ts:1505-1507`:
+        //   `if (childOrchestratorMetadata && !nativeSupervisorChannelAvailable) { pi.registerTool(…) }`
+        // A child launched through the NATIVE supervisor channel must not also be handed the legacy
+        // broker-routed tool: the model picks one, so the same decision can be requested through two
+        // mechanisms while the parent polls only one of them.
+        if let Some(metadata) = &self.metadata
+            && !self.native_supervisor_channel
+        {
             api.register_tool(Arc::new(ContactSupervisorTool::new(self.state.clone(), metadata.clone())));
         }
         // The `/intercom` overlay command (pi `registerCommand("intercom", …)`, index.ts:1877). cyrup
@@ -504,6 +462,9 @@ impl NativeExtension for IntercomExtension {
             // priority branch (reply_tracker.rs) is ever reachable in production.
             EventKind::TurnStart,
             EventKind::TurnEnd,
+            // `pi.on("model_select")` (`v0.10.1 index.ts:1471-1481`) → presence carrying the new
+            // model, so `intercom{list}` shows which worker is on which model.
+            EventKind::ModelSelect,
         ]);
         Ok(())
     }
@@ -555,6 +516,9 @@ impl NativeExtension for IntercomExtension {
                 // rebuilds its registration from, clear the shutdown latch, bump the generation and
                 // reset the backoff ladder.
                 connect::begin_runtime(&self.state, self.connect_params(ctx.model()));
+                // `startNamePoll()` (`v0.10.1 index.ts:1276`, inside `startSessionRuntime`): the
+                // third name-sync point. Cancelled in the `SessionShutdown` arm below.
+                self.state.start_name_poll();
                 // Connect off the event path: `ensure_broker` may spawn the broker + wait up to 5s;
                 // blocking the SessionStart dispatch that long is unacceptable (the port doc §2 notes
                 // intercom must not stall the session), so the connect runs on a background task and
@@ -574,7 +538,8 @@ impl NativeExtension for IntercomExtension {
             HostEvent::SessionShutdown { .. } => {
                 // `clearInboundFlushTimer()` (index.ts:1070): a pending debounce must not outlive the
                 // session and fire against a torn-down host.
-                self.state.set_flush_timer(None);
+                // `clearNamePollTimer()` (`v0.10.1 index.ts:1407`).
+                self.state.stop_name_poll();
                 // `shuttingDown = true; disposed = true; clearReconnectTimer()` (index.ts:1060-1064)
                 // BEFORE the disconnect below, so the disconnect edge this triggers cannot arm a
                 // reconnect: a deliberate shutdown never reconnects.
@@ -585,40 +550,82 @@ impl NativeExtension for IntercomExtension {
                 }
                 self.state.set_client(None);
                 self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).reset();
+                // `agentRunning = false; activeTools.clear()` (`v0.10.1 index.ts:1408-1409`).
+                self.state.set_agent_running(false);
                 HookOutcome::Noop
             }
             HostEvent::AgentStart => {
-                self.sync_presence("thinking");
+                // `agentRunning = true; activeTools.clear(); syncPresenceStatus()`
+                // (`v0.10.1 index.ts:1429-1431`).
+                self.state.set_agent_running(true);
+                self.sync_presence_status();
                 HookOutcome::Noop
             }
             HostEvent::AgentEnd { .. } => {
-                self.sync_presence("idle");
-                // `pi.on("agent_end") -> scheduleInboundFlush(0)` (index.ts:1116-1117): the run that
-                // was in flight has ended, so drain anything that arrived while this session was
-                // busy (`InboundPolicy::Queue`) instead of leaving it parked until the next message.
-                schedule_inbound_flush(&self.state, 0);
+                // `agentRunning = false; activeTools.clear(); syncPresenceStatus()`
+                // (`v0.10.1 index.ts:1451-1453`).
+                self.state.set_agent_running(false);
+                self.sync_presence_status();
+                // NO `scheduleInboundFlush(0)` here: v0.9.3 (`25ffb96`) deleted both the
+                // `agent_end` and `turn_end` flush calls along with the queue they drained
+                // (`v0.10.1 index.ts:1447-1454`, `:1416-1424` — neither handler mentions inbound
+                // delivery any more). A busy inbound message is steered onto the live run when it
+                // ARRIVES, so there is nothing left to drain at the end of one.
                 HookOutcome::Noop
             }
-            HostEvent::ToolExecStart { name, .. } => {
-                self.sync_presence(&format!("tool:{name}"));
+            HostEvent::ToolExecStart { call_id, name, .. } => {
+                // `activeTools.set(event.toolCallId, event.toolName); syncPresenceStatus()`
+                // (`v0.10.1 index.ts:1437-1438`) — keyed by CALL ID, so overlapping calls nest.
+                self.state.tool_started(call_id.clone(), name.clone());
+                self.sync_presence_status();
                 HookOutcome::Noop
             }
-            HostEvent::ToolExecEnd { .. } => {
-                self.sync_presence("thinking");
+            HostEvent::ToolExecEnd { call_id, .. } => {
+                // `activeTools.delete(event.toolCallId); syncPresenceStatus()`
+                // (`v0.10.1 index.ts:1444-1445`).
+                self.state.tool_ended(call_id);
+                self.sync_presence_status();
+                HookOutcome::Noop
+            }
+            HostEvent::ModelSelect { model, .. } => {
+                // `pi.on("model_select")` (`v0.10.1 index.ts:1471-1481`): presence carries the new
+                // model alongside the identity and the derived status. Without it every peer's
+                // `intercom{list}` shows the model this session registered with forever, so a
+                // supervisor cannot tell which worker is on which model.
+                if let Some(client) = self.state.client() {
+                    let model_id = model
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let identity = connect::presence_identity(&self.state, self.metadata.as_ref());
+                    let ctx_usage = self.state.current_context_usage();
+                    client.update_presence_full(
+                        identity.name.clone(),
+                        identity.name.as_ref().map(|_| identity.runtime_fallback_alias),
+                        Some(self.state.current_status()),
+                        model_id,
+                        ctx_usage.pct,
+                        ctx_usage.tokens,
+                        ctx_usage.window,
+                    );
+                }
                 HookOutcome::Noop
             }
             HostEvent::TurnStart { .. } => {
-                // `pi.on("turn_start") -> replyTracker.beginTurn()` (index.ts:1112-1127): prune expired
-                // pending asks, then adopt the oldest queued turn context (queued by
-                // `trigger_turn_over_inbound` right before this turn started) as `current_turn_context`.
+                // `pi.on("turn_start")` (`v0.10.1 index.ts:1459-1469`) calls `syncPresenceIdentity`
+                // BEFORE `replyTracker.beginTurn()` — one of upstream's three name-sync points, and
+                // the cheapest: a session renamed mid-run stops advertising its startup label at the
+                // very next turn instead of forever.
+                self.sync_presence_identity();
+                // `replyTracker.beginTurn()`: prune expired pending asks, then adopt the oldest
+                // queued turn context (queued by `trigger_turn_over_inbound` right before this turn
+                // started) as `current_turn_context`.
                 self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).begin_turn(now_ms());
                 HookOutcome::Noop
             }
             HostEvent::TurnEnd { .. } => {
-                // `pi.on("turn_end") -> replyTracker.endTurn()` + `scheduleInboundFlush(0)`
-                // (index.ts:1080-1086).
+                // `pi.on("turn_end") -> replyTracker.endTurn()` (`v0.10.1 index.ts:1416-1424`).
                 self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).end_turn();
-                schedule_inbound_flush(&self.state, 0);
                 HookOutcome::Noop
             }
             _ => HookOutcome::Noop,
@@ -675,7 +682,10 @@ pub fn intercom_extension_for_env_concrete(
     cwd: PathBuf,
 ) -> Result<Option<Arc<IntercomExtension>>, String> {
     let intercom_dir = intercom_dir_path(&agent_dir);
-    let config = load_config(&intercom_dir);
+    // `v0.10.1 config.ts:153-155`: a malformed config is a hard error naming the path, not a silent
+    // `inboundTrigger: "never"`. This function already returns `Result<_, String>` for the
+    // analogous `ask_timeout_ms()` throw, so the precedent for propagating is in place.
+    let config = load_config(&intercom_dir)?;
     if !config.enabled {
         return Ok(None);
     }
@@ -784,6 +794,7 @@ mod tests {
             from: SessionInfo {
                 id: "s-trigger".to_string(),
                 name: Some("trigger-sender".to_string()),
+                runtime_fallback_alias: None,
                 cwd: "/w".to_string(),
                 model: "m".to_string(),
                 pid: 1u32.into(),
@@ -820,6 +831,7 @@ mod tests {
                 SessionInfo {
                     id: "s-other".to_string(),
                     name: Some("other-sender".to_string()),
+                    runtime_fallback_alias: None,
                     cwd: "/w".to_string(),
                     model: "m".to_string(),
                     pid: 2u32.into(),

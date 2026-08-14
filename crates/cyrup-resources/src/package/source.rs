@@ -78,7 +78,7 @@ impl PackageSource {
         let trimmed = source.trim();
         if trimmed.starts_with("npm:") {
             // npm channel dropped in the Rust port (R-09-021): no JS runtime.
-            return Err(ResourceError::Unsupported);
+            return Err(ResourceError::UnsupportedNpm);
         }
         if is_local_path(trimmed) {
             return Ok(PackageSource::Path {

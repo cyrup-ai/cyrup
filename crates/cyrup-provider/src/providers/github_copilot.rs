@@ -152,7 +152,7 @@ pub fn github_copilot_models() -> Vec<Model> {
 /// unregistered loader yields `FlowUnavailable` where pi would always resolve.
 pub fn github_copilot_auth() -> ProviderAuth {
     ProviderAuth {
-        api_key: Some(env_key([COPILOT_GITHUB_TOKEN_ENV])),
+        api_key: Some(env_key("GitHub Copilot token", [COPILOT_GITHUB_TOKEN_ENV])),
         oauth: Some(Arc::new(
             crate::auth::oauth::github_copilot::GitHubCopilotLogin::new(),
         )),
@@ -174,6 +174,8 @@ pub fn github_copilot_provider_with(
         store,
         registry,
     )
+    // Pi `createProvider({ …, filterModels })` (`providers/github-copilot.ts:19-27` @v0.83.0).
+    .with_filter_models(filter_github_copilot_models)
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.
@@ -369,10 +371,10 @@ pub fn parse_available_copilot_model_ids(raw: &Value) -> Result<Vec<String>, Cop
 /// `availableModelIds` array of strings — a non-OAuth credential, a missing key, a non-array, or an
 /// array with any non-string element all fall through untouched (`:22-25`).
 ///
-/// **Not yet reachable from a registry.** Pi applies this only in `Models.getAvailable()`
-/// (`models.ts:407`), and cyrup's [`crate::collection::Models`] has no `get_available` counterpart —
-/// [`crate::provider::Provider`] exposes `models()` (the full catalog) with no credential-filtered
-/// sibling. Wiring it is a change to `provider.rs`/`collection.rs`, outside this module.
+/// Installed on the provider through `WireProvider::with_filter_models` — pi's
+/// `createProvider({ filterModels })` transport (`models.ts:545`/`:618`) — and applied by
+/// [`crate::collection::Models::get_available`] at pi's exact position, `models.ts:407`
+/// (PROV-032). `models()` still returns the complete 28-row catalog, as pi's `getModels()` does.
 pub fn filter_github_copilot_models(models: &[Model], credential: Option<&Credential>) -> Vec<Model> {
     let ext = match credential {
         Some(Credential::Oauth { ext, .. }) => ext,
@@ -1426,5 +1428,99 @@ mod tests {
         }
         // `edge` exists only to prove the negative half of the discrimination.
         let _ = edge;
+    }
+
+    /// PROV-032/PROV-031. The filter now has a PRODUCTION caller: it is installed on the provider
+    /// through pi's `createProvider({ filterModels })` transport and applied by
+    /// `Models::get_available` at pi's exact position (`models.ts:407` @v0.83.0).
+    ///
+    /// Red before the fix: `get_available` did not exist and `filter_github_copilot_models`' only
+    /// callers were the tests above, so a Business/Enterprise account whose token authorises 3 of
+    /// the 28 rows was offered all 28 in `/model`.
+    #[tokio::test]
+    async fn get_available_applies_the_copilot_filter_but_get_models_does_not() {
+        use crate::auth::InMemoryCredentialStore;
+        use crate::collection::{CreateModelsOptions, create_models};
+
+        let catalog = github_copilot_models();
+        let full = catalog.len();
+        let three: Vec<Value> = catalog
+            .iter()
+            .take(3)
+            .map(|m| json!(m.id.as_str()))
+            .collect();
+
+        let store = Arc::new(
+            InMemoryCredentialStore::new().with_credential(
+                GITHUB_COPILOT_PROVIDER_ID.into(),
+                oauth_cred(ext_with(EXT_AVAILABLE_MODEL_IDS, Value::Array(three))),
+            ),
+        );
+        let mut models = create_models(CreateModelsOptions {
+            credentials: Some(store.clone()),
+            ..Default::default()
+        });
+        models.set_provider(Arc::new(github_copilot_provider_with(
+            store,
+            Arc::new(builtin_registry()),
+        )));
+
+        assert_eq!(
+            models.get_models(Some(GITHUB_COPILOT_PROVIDER_ID)).len(),
+            full,
+            "getModels() stays the complete synchronous catalog (models.ts:105-110)"
+        );
+        assert_eq!(
+            models
+                .get_available(Some(GITHUB_COPILOT_PROVIDER_ID))
+                .await
+                .len(),
+            3,
+            "getAvailable() applies filterModels after the auth check"
+        );
+    }
+
+    /// PROV-031. An unconfigured provider contributes nothing to `get_available`, while
+    /// `get_models` still returns its whole catalog.
+    #[tokio::test]
+    async fn get_available_skips_a_provider_with_no_credential() {
+        use crate::auth::InMemoryCredentialStore;
+        use crate::collection::{CreateModelsOptions, create_models};
+
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let mut models = create_models(CreateModelsOptions {
+            credentials: Some(store.clone()),
+            // An auth context with NO variables, so `COPILOT_GITHUB_TOKEN` in the developer's real
+            // environment cannot make this provider look configured.
+            auth_context: Some(Arc::new(EmptyEnv)),
+            ..Default::default()
+        });
+        models.set_provider(Arc::new(github_copilot_provider_with(
+            store,
+            Arc::new(builtin_registry()),
+        )));
+        assert!(models.check_auth(GITHUB_COPILOT_PROVIDER_ID).await.is_none());
+        assert!(models.get_available(None).await.is_empty());
+        assert!(!models.get_models(None).is_empty());
+    }
+
+    struct EmptyEnv;
+    #[async_trait::async_trait]
+    impl crate::auth::AuthContext for EmptyEnv {
+        async fn env(&self, _name: &str) -> Option<String> {
+            None
+        }
+        async fn file_exists(&self, _path: &str) -> bool {
+            false
+        }
+    }
+
+    /// PROV-017. `Provider::name()` reaches the display name `WireProvider` already held.
+    #[test]
+    fn provider_exposes_its_display_name() {
+        use crate::provider::Provider;
+        let p = github_copilot_provider();
+        assert_eq!(p.name(), "GitHub Copilot");
+        assert_ne!(p.name(), p.id().as_str());
     }
 }

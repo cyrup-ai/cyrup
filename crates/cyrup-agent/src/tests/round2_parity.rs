@@ -155,7 +155,7 @@ struct StickyThinkingHook {
 
 #[async_trait::async_trait]
 impl Hooks for StickyThinkingHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         if self.overridden.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(Some(TurnUpdate {
                 thinking_level: Some(ModelThinkingLevel::High),
@@ -211,7 +211,7 @@ impl Hooks for TerminateAndCount {
     ) -> Result<Option<AfterOverride>, HookError> {
         Ok(Some(AfterOverride { terminate: Some(true), ..Default::default() }))
     }
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
         Ok(None)
     }
@@ -262,7 +262,7 @@ struct ExplodingHook;
 
 #[async_trait::async_trait]
 impl Hooks for ExplodingHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         panic!("kaboom: hook detonated");
     }
 }
@@ -311,7 +311,7 @@ struct AgentRec {
 
 #[async_trait::async_trait]
 impl crate::EventSubscriber for AgentRec {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         self.events.lock().unwrap().push(event.clone());
     }
 }
@@ -330,7 +330,7 @@ struct FailingPrepareHook;
 
 #[async_trait::async_trait]
 impl Hooks for FailingPrepareHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         Err(HookError::new("prepare exploded"))
     }
 }
@@ -340,7 +340,7 @@ struct FailingStopHook;
 
 #[async_trait::async_trait]
 impl Hooks for FailingStopHook {
-    async fn should_stop_after_turn(&self, _ctx: PostTurn<'_>) -> Result<bool, HookError> {
+    async fn should_stop_after_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<bool, HookError> {
         Err(HookError::new("stop check exploded"))
     }
 }

@@ -38,17 +38,22 @@ impl ContactSupervisorTool {
         Self { state, metadata, parameters: parameters_schema() }
     }
 
-    /// `resolveSupervisorTarget` (`index.ts:880-888`): prefer the stable orchestrator session id
-    /// (resolved against the live list), else resolve the orchestrator target, else the raw target.
-    async fn resolve_supervisor(&self, client: &Arc<IntercomClient>) -> String {
+    /// `resolveSupervisorTarget` (`v0.10.1 index.ts:1166-1174`): prefer the stable orchestrator
+    /// session id (resolved against the live list), else resolve the orchestrator target.
+    ///
+    /// Returns `Option<String>` from v0.10.0, not a target-with-fallback — a MISS has to be
+    /// distinguishable, because a blocking `need_decision`/`interview_request` against an offline
+    /// supervisor is refused up front (`v0.10.1 index.ts:1592-1597`) while a `progress_update`
+    /// falls through to the raw target (`:1598`).
+    async fn resolve_supervisor(&self, client: &Arc<IntercomClient>) -> Option<String> {
         if let Some(sid) = &self.metadata.orchestrator_session_id
             && let Ok(Some(target)) = self.state.resolve_target(client, sid).await
         {
-            return target;
+            return Some(target);
         }
         match self.state.resolve_target(client, &self.metadata.orchestrator_target).await {
-            Ok(Some(target)) => target,
-            _ => preferred_supervisor_target(&self.metadata),
+            Ok(Some(target)) => Some(target),
+            _ => None,
         }
     }
 
@@ -59,9 +64,20 @@ impl ContactSupervisorTool {
             .await
             .map_err(|e| ToolError::new(format!("intercom is not connected to the broker: {e}")))?;
 
-        let supervisor = self.resolve_supervisor(&client).await;
+        // `v0.10.1 index.ts:1585-1598`, in upstream's order: resolve → refuse a BLOCKING request
+        // against an offline supervisor → fall back to the raw target → self-guard.
+        let resolved = self.resolve_supervisor(&client).await;
+        if resolved.is_none() && params.reason != "progress_update" {
+            return Err(ToolError::new(format!(
+                "Supervisor \"{}\" is not currently connected. Blocking requests are not queued; use a progress update or retry after the supervisor reconnects.",
+                self.metadata.orchestrator_target
+            )));
+        }
+        let supervisor = resolved.unwrap_or_else(|| preferred_supervisor_target(&self.metadata));
+        // `v0.10.1 index.ts:1605-1610` — pi's single self-target string, shared with the whole
+        // `intercom` tool surface.
         if client.session_id().as_deref() == Some(supervisor.as_str()) {
-            return Err(ToolError::new("Cannot contact the supervisor: it resolves to this session."));
+            return Err(ToolError::new("Cannot message the current session"));
         }
 
         match params.reason.as_str() {

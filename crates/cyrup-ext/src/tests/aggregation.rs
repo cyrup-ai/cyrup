@@ -41,11 +41,11 @@ impl NativeExtension for DiscoveryExt {
     }
     async fn on_event(&self, ev: &HostEventAlias, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEventAlias::ProjectTrust => match &self.trust {
+            HostEventAlias::ProjectTrust { .. } => match &self.trust {
                 Some(v) => HookOutcome::Handled(HandledValue(v.clone())),
                 None => HookOutcome::Noop,
             },
-            HostEventAlias::ResourcesDiscover => match &self.resources {
+            HostEventAlias::ResourcesDiscover { .. } => match &self.resources {
                 Some(v) => HookOutcome::Handled(HandledValue(v.clone())),
                 None => HookOutcome::Noop,
             },
@@ -245,8 +245,8 @@ fn command_invocation_names_are_disambiguated_in_load_order() {
 fn registered_shortcut_resolves_owner_and_lists_keys() {
     use crate::ExtensionRegistry;
     let reg = ExtensionRegistry::new();
-    reg.register_shortcut(ExtensionId::from("a"), "ctrl+j").unwrap();
-    reg.register_shortcut(ExtensionId::from("b"), "alt+k").unwrap();
+    reg.register_shortcut(ExtensionId::from("a"), "ctrl+j", None).unwrap();
+    reg.register_shortcut(ExtensionId::from("b"), "alt+k", None).unwrap();
 
     let mut keys = reg.shortcut_keys().unwrap();
     keys.sort();

@@ -108,6 +108,10 @@ async fn the_parent_watcher_preserves_its_spool_across_a_drained_scan() {
         agent_dir.path().to_path_buf(),
         Arc::clone(&services),
         Arc::clone(&config),
+        Arc::new(crate::logging::AuditTrail::detached(agent_dir.path().join("logs"))),
+        // PERM-031: a UI is present for this test, which is the precondition for the spool being
+        // serviced at all.
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     );
 
     // The watcher's attach phase creates the spool (`ensure_location`). Without the fix this
@@ -178,6 +182,8 @@ async fn the_default_option_bag_still_cleans_up_an_empty_spool() {
         &services,
         &ExtensionConfig::default(),
         ProcessForwardedOptions::default(),
+        &crate::logging::AuditTrail::detached(agent_dir.path().join("logs")),
+        true,
     )
     .await;
 

@@ -48,7 +48,19 @@ pub struct BeforeToolCall<'a> {
 /// Outcome of [`Hooks::before_tool_call`] (func-02 R-02-021).
 pub enum BeforeOutcome {
     Proceed,
-    Block { reason: Option<String> },
+    Block {
+        reason: Option<String>,
+        /// AGENT-022 — pi `BeforeToolCallResult.terminate`
+        /// (`packages/agent/src/types.ts:61-69` @v0.84.1: "Hint that the agent should stop after the
+        /// current tool batch when this call is blocked. Early termination only happens when every
+        /// finalized tool result in the batch sets this to true"). Consumed at
+        /// `agent-loop.ts:636-645` @v0.84.1, which builds the error result and then
+        /// `if (beforeResult.terminate === true) { result.terminate = true; }` before returning it,
+        /// so the blocked result participates in `shouldTerminateToolBatch` (`agent-loop.ts:582-584`).
+        ///
+        /// `false` is pi's `undefined`/`false` — the blocked result carries no `terminate` at all.
+        terminate: bool,
+    },
 }
 
 /// Per-call context for [`Hooks::after_tool_call`].
@@ -66,7 +78,10 @@ pub struct AfterToolCall<'a> {
     /// hook can inspect what it is about to replace instead of overwriting blind.
     pub usage: Option<&'a Usage>,
     pub is_error: bool,
-    pub terminate: bool,
+    /// The early-termination hint the tool set, if any (Pi `AfterToolCallContext.result.terminate`
+    /// → `AgentToolResult.terminate?`, types.ts:354-368). `None` is pi's `undefined` — the tool did
+    /// not express an opinion, which is distinct from an explicit `false` (AGENT-009).
+    pub terminate: Option<bool>,
     /// The assistant message that requested this tool call (Pi `assistantMessage`, types.ts:102).
     pub assistant_message: &'a AssistantMessage,
     /// The raw tool-call block from `assistant_message.content` (Pi `toolCall`, types.ts:104).
@@ -225,15 +240,35 @@ pub trait Hooks: Send + Sync {
 
     /// After `turn_end`, before `should_stop_after_turn` (Pi `prepareNextTurn`, agent-loop.ts:226).
     /// A returned [`TurnUpdate`] is STICKY: it becomes the new running baseline for all later turns.
+    ///
+    /// AGENT-024 — `_cancel` is the run's abort signal. pi's *loop*-level `prepareNextTurn`
+    /// (`packages/agent/src/types.ts:229-231`) takes no signal, but the Agent-options layer above it
+    /// binds one into the closure it hands the loop:
+    /// `prepareNextTurn: async (context) => { if (this.prepareNextTurnWithContext) { return await
+    /// this.prepareNextTurnWithContext(context, this.signal); } return await
+    /// this.prepareNextTurn?.(this.signal); }` (`packages/agent/src/agent.ts:463-471` @v0.84.1;
+    /// identical `this.signal` argument at v0.83.0, so this half is not drift). cyrup has no
+    /// separate options wrapper, so the run's token enters here — the loop passes
+    /// `self.cancel.child()`, the same shape as `before_tool_call`/`after_tool_call`.
     async fn prepare_next_turn(
         &self,
         _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
     ) -> Result<Option<TurnUpdate>, HookError> {
         Ok(None)
     }
 
     /// After `turn_end` subscribers settle (func-02 R-02-032). `true` => emit `agent_end` & exit.
-    async fn should_stop_after_turn(&self, _ctx: PostTurn<'_>) -> Result<bool, HookError> {
+    ///
+    /// AGENT-024 — `_cancel` is the run's abort signal, bound the same way pi's Agent-options layer
+    /// binds it: `shouldStopAfterTurn: shouldStopAfterTurn ? async (context) => await
+    /// shouldStopAfterTurn(context, this.signal) : undefined` (`agent.ts:460-462` @v0.84.1, with the
+    /// `AgentOptions.shouldStopAfterTurn` field at `:108` and the public field at `:193-196`).
+    async fn should_stop_after_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<bool, HookError> {
         Ok(false)
     }
 }

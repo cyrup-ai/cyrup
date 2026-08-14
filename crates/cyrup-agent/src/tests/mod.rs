@@ -2,6 +2,7 @@
 //! into ONE binary instead of one process per file. Assertions are unchanged.
 
 mod agent_loop;
+mod area02_backlog;
 mod agent_message_role_key;
 mod hook_failure_text;
 mod model_boundary;

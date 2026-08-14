@@ -137,3 +137,58 @@ async fn without_a_channel_the_outcome_is_still_applied_inline() {
         "the inline fallback must still render the outcome:\n{s}"
     );
 }
+
+/// TUI-054 — a failed or cancelled compaction must never be announced as a success.
+///
+/// RED at HEAD: the arm was `AgentSessionEvent::CompactionEnd { .. }` — every field discarded —
+/// ending in an unconditional `push_status("compaction complete")`, so all three of these frames
+/// contained that line. Observed live three times, twice immediately after an error blob
+/// (`compact error: Nothing to compact (session too small)` and an `http 400` from the
+/// summarization provider) — see `docs/gap-analysis/REPRO-LOG.md`.
+///
+/// pi's `case "compaction_end"` (`interactive-mode.ts:3089-3123` @v0.83.0) branches on `aborted`,
+/// `result` and `errorMessage` and states success in words nowhere.
+#[tokio::test]
+async fn a_failed_or_cancelled_compaction_is_not_announced_as_complete() {
+    // (a) An automatic compaction that was cancelled reads pi's `Auto-compaction cancelled`.
+    let mut app = new_app();
+    app.ingest_event(&AgentSessionEvent::CompactionEnd {
+        reason: CompactionReason::Threshold,
+        result: None,
+        aborted: true,
+        will_retry: false,
+        error_message: None,
+    });
+    app.draw().unwrap();
+    let s = screen(&app);
+    assert!(!s.contains("compaction complete"), "a cancelled compaction claimed success:\n{s}");
+    assert!(s.contains("Auto-compaction cancelled"), "pi's cancel copy is missing:\n{s}");
+
+    // (b) A failure renders its own message, not a success line.
+    let mut app = new_app();
+    app.ingest_event(&AgentSessionEvent::CompactionEnd {
+        reason: CompactionReason::Overflow,
+        result: None,
+        aborted: false,
+        will_retry: false,
+        error_message: Some("summarization failed: http 400".to_string()),
+    });
+    app.draw().unwrap();
+    let s = screen(&app);
+    assert!(!s.contains("compaction complete"), "a failed compaction claimed success:\n{s}");
+    assert!(s.contains("summarization failed"), "the failure message is not rendered:\n{s}");
+
+    // (c) A manual compaction is rendered by the command path (`apply_compact_outcome`), so the
+    // event arm must stay silent rather than adding a second, contradictory line.
+    let mut app = new_app();
+    app.ingest_event(&AgentSessionEvent::CompactionEnd {
+        reason: CompactionReason::Manual,
+        result: None,
+        aborted: false,
+        will_retry: false,
+        error_message: Some("Nothing to compact (session too small)".to_string()),
+    });
+    app.draw().unwrap();
+    let s = screen(&app);
+    assert!(!s.contains("compaction complete"), "manual failure claimed success:\n{s}");
+}

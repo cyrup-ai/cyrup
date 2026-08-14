@@ -114,11 +114,11 @@ Use this EXACT format:
 Keep each section concise. Preserve exact file paths, function names, and error messages.";
 
 /// Pi's fallback context window for a model whose catalog reports none — `model.contextWindow ||
-/// 128000` (`branch-summarization.ts:315`).
+/// 128000` (`branch-summarization.ts:312` @v0.83.0).
 pub const DEFAULT_BRANCH_CONTEXT_WINDOW: u32 = 128_000;
 
 /// The branch-summary token budget: `(model.context_window || 128000) − reserve_tokens` (Pi
-/// `branch-summarization.ts:315-317`).
+/// `branch-summarization.ts:312-313` @v0.83.0; `reserveTokens = 16384` default at `:305`).
 ///
 /// The `|| 128000` fallback is load-bearing and its absence fails INVERTED.
 /// [`prepare_branch_entries`] reads `budget == 0` as "no limit" (as Pi reads a non-positive `tokenBudget`), so a model with a
@@ -236,6 +236,28 @@ pub async fn generate_branch_summary<S: Summarizer>(
     model: &Model,
     cancel: CancelToken,
 ) -> Result<BranchSummaryOutput, CompactionError> {
+    generate_branch_summary_with_instructions(summarizer, prep, model, None, false, cancel).await
+}
+
+/// Pi's `customInstructions` / `replaceInstructions` selector for the branch-summary prompt
+/// (`branch-summarization.ts:326-334`), verbatim:
+///
+/// ```text
+/// if (replaceInstructions && customInstructions) instructions = customInstructions;
+/// else if (customInstructions) instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+/// else instructions = BRANCH_SUMMARY_PROMPT;
+/// ```
+///
+/// `replace_instructions` alone (no `custom_instructions`) falls through to the plain prompt —
+/// the `&&` is load-bearing.
+pub async fn generate_branch_summary_with_instructions<S: Summarizer>(
+    summarizer: &S,
+    prep: &BranchPreparation,
+    model: &Model,
+    custom_instructions: Option<&str>,
+    replace_instructions: bool,
+    cancel: CancelToken,
+) -> Result<BranchSummaryOutput, CompactionError> {
     // Pi short-circuits BEFORE the model call when there is nothing to summarize, returning the
     // placeholder string (`branch-summarization.ts:309-311`). The caller decides whether to append.
     if prep.messages.is_empty() {
@@ -244,9 +266,16 @@ pub async fn generate_branch_summary<S: Summarizer>(
             usage: None,
         });
     }
+    // `.filter(|c| !c.is_empty())` reproduces JS falsiness: Pi's guards are bare truthiness tests
+    // on `customInstructions`, so an EMPTY string takes neither branch and the plain
+    // `BRANCH_SUMMARY_PROMPT` is used (`branch-summarization.ts:328-333`).
+    let instructions: String = match custom_instructions.filter(|c| !c.is_empty()) {
+        Some(c) if replace_instructions => c.to_string(),
+        Some(c) => format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {c}"),
+        None => BRANCH_SUMMARY_PROMPT.to_string(),
+    };
     let transcript = serialize_conversation(&prep.messages);
-    let prompt =
-        format!("<conversation>\n{transcript}\n</conversation>\n\n{BRANCH_SUMMARY_PROMPT}");
+    let prompt = format!("<conversation>\n{transcript}\n</conversation>\n\n{instructions}");
     let req = SummarizationRequest {
         system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
         prompt_text: prompt,

@@ -30,7 +30,7 @@ pub fn azure_openai_responses_models() -> Vec<Model> {
 /// The Azure OpenAI [`ProviderAuth`]: an API key from `AZURE_OPENAI_API_KEY` (Pi
 /// `envApiKeyAuth("Azure OpenAI API key", ["AZURE_OPENAI_API_KEY"])`).
 pub fn azure_openai_responses_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key([AZURE_OPENAI_API_KEY]))
+    ProviderAuth::with_api_key(env_key("Azure OpenAI API key", [AZURE_OPENAI_API_KEY]))
 }
 
 /// Construct the Azure OpenAI provider over the given credential store + shared api registry. The

@@ -176,3 +176,46 @@ fn the_colorterm_hint_is_an_equality_not_a_substring() {
         assert!(caps.true_color, "terminal-image.ts:124-129 — the win32 branch assumes truecolor");
     }
 }
+
+/// TUI-N12 — the capability cache is now settable AND resettable, over the whole record.
+///
+/// RED at HEAD: the only counterpart was `seed_hyperlink_support`, a first-writer-wins
+/// `OnceLock::set` that (a) could not be overwritten or reset once read and (b) carried only the
+/// `hyperlinks` field. Because there was no way to pin the global, a test wanting the non-ambient
+/// branch had to use a per-call override, and that override existed for exactly one consumer
+/// (`render_with_hyperlink_support`) — which is the structural hole TUI-N11 fell through.
+///
+/// Pi exports both mutators alongside the getter: `resetCapabilitiesCache()`
+/// (`packages/tui/src/terminal-image.ts:137-139`) and `setCapabilities(caps)` (`:142-144`,
+/// doc-commented "Override the cached capabilities. Useful in tests to exercise both code paths").
+///
+/// Serialized with the other cache-touching test in this file because the cache is process-wide.
+#[test]
+fn set_capabilities_pins_both_branches_and_reset_drops_the_pin() {
+    let _guard = CAPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    crate::set_capabilities(crate::TerminalCapabilities {
+        images: Some(crate::ImageProtocol::Kitty),
+        true_color: true,
+        hyperlinks: true,
+    });
+    assert!(crate::hyperlinks_supported(), "the pinned `true` branch must be reachable");
+    assert_eq!(crate::cached_capabilities().images, Some(crate::ImageProtocol::Kitty));
+
+    // …and the OTHER branch, which the old write-once lock made unreachable in the same process.
+    crate::set_capabilities(crate::TerminalCapabilities {
+        images: None,
+        true_color: false,
+        hyperlinks: false,
+    });
+    assert!(!crate::hyperlinks_supported(), "the pinned `false` branch must be reachable too");
+
+    crate::reset_capabilities_cache();
+    // After a reset the next read re-detects from the ambient environment; assert only that it does
+    // not keep the pin, never what the ambient answer IS (that is the TUI-N11 mistake).
+    let _ = crate::cached_capabilities();
+    crate::reset_capabilities_cache();
+}
+
+/// The process-wide cache makes these tests order-dependent; one lock serializes them.
+static CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

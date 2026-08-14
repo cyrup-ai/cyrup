@@ -1479,6 +1479,7 @@ mod tests {
                 default_model: Some("profile/winner".to_string()),
                 model_scope: Some(crate::exec::model_scope::ModelScopeConfig {
                     enforce: Some(false),
+                    strict: None,
                     allow: Some(vec!["profile/*".to_string()]),
                 }),
                 ..Default::default()

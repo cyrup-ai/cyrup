@@ -18,8 +18,12 @@ fn key(code: KeyCode, mods: KeyModifiers) -> InputEvent {
 #[test]
 fn registered_shortcut_keypress_dispatches_to_ext_host() {
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
-    // The host's `shortcut_keys()` returns raw key-id strings; install them the way the binary does.
-    app.set_extension_shortcuts(["ctrl+j".to_string(), "alt+k".to_string()]);
+    // The host's `shortcut_specs()` returns `(id, description?)` pairs; install them the way the
+    // binary does (EXT-040 — it used to install `shortcut_keys()`'s bare ids).
+    app.set_extension_shortcuts([
+        ("ctrl+j".to_string(), Some("Run the thing".to_string())),
+        ("alt+k".to_string(), None),
+    ]);
 
     // A matching press routes to the owning extension via its key-id (the run loop then calls
     // `ExtensionHost::run_shortcut(id)`), NOT into the editor as text.
@@ -66,4 +70,33 @@ fn unparseable_shortcut_ids_are_dropped_not_panicked() {
         app.handle_input(&key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
         AppAction::ExtensionShortcut("ctrl+j".to_string())
     );
+}
+
+/// EXT-040 — an extension's registered DESCRIPTION must reach the `/hotkeys` Extensions table.
+///
+/// pi stores `ExtensionShortcut { shortcut, description?, handler, extensionPath }`
+/// (`extensions/types.ts:1250`, stored at `:1524-1529` @v0.83.0) and renders each row as
+/// ``| `${formatKeyText(key, {capitalize:true})}` | ${shortcut.description ?? shortcut.extensionPath} |``
+/// (`interactive-mode.ts:6193-6197`).
+///
+/// RED before this pass: the binary and the session-swap arm both installed
+/// `ExtensionHost::shortcut_keys()` — a bare `Vec<String>` — so `description` was always `None`
+/// and every Action cell fell through to repeating its own Key cell. `shortcut_specs()` and the
+/// `From<(String, Option<String>)>` impl both already existed with no caller.
+#[test]
+fn hotkeys_renders_the_registered_shortcut_description() {
+    let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+    app.set_extension_shortcuts([
+        ("ctrl+j".to_string(), Some("Run the thing".to_string())),
+        ("alt+k".to_string(), None),
+    ]);
+
+    let body = app.hotkeys_markdown_for_test();
+    assert!(
+        body.contains("Run the thing"),
+        "the registered description must be the Action cell: {body}"
+    );
+    // `description ?? extensionPath` — with no description the id is the fallback, which is what
+    // cyrup has in place of pi's `extensionPath`.
+    assert!(body.contains("alt+k"), "an undescribed shortcut still lists, labelled by its id: {body}");
 }

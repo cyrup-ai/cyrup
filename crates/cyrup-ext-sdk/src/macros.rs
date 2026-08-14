@@ -14,7 +14,7 @@
 //! ```
 //!
 //! `cargo build --target wasm32-wasip2` then yields a loadable `cyrup:ext` COMPONENT. The macro emits
-//! the wasm guest glue — the world's `init` + `events` (all 30 hooks + `execute-tool` +
+//! the wasm guest glue — the world's `init` + `events` (all 33 hooks + `execute-tool` +
 //! `execute-command`/`get-argument-completions` + `render-call`/`render-result`) exports + the
 //! `export!` invocation — each delegating to the routing helpers in [`crate::guest`]. The
 //! `wit_bindgen::generate!` (with `pub_export_macro`) runs once in this crate; the downstream author's
@@ -62,6 +62,15 @@ macro_rules! export_extension {
                     prefix: ::std::string::String,
                 ) -> ::std::vec::Vec<::std::string::String> {
                     $crate::guest::completions(name, prefix)
+                }
+                // EXT-023 / TOOL-022 — `prepareArguments` (pi `ToolDefinition.prepareArguments?`,
+                // extensions/types.ts:468 @v0.83.0). Called ONLY for a descriptor that set the
+                // `prepare-arguments` flag, and only BEFORE schema validation.
+                fn prepare_arguments(
+                    name: ::std::string::String,
+                    args_json: ::std::string::String,
+                ) -> ::core::option::Option<::std::string::String> {
+                    $crate::guest::prepare_arguments(name, args_json)
                 }
                 fn execute_shortcut(
                     key: ::std::string::String,
@@ -197,17 +206,33 @@ macro_rules! export_extension {
                 fn on_before_provider_request(payload_json: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(20, &[&payload_json])
                 }
-                fn on_resources_discover() -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(5, &[])
+                // EXT-009 / PROV-042 — `before_provider_headers` (pi `BeforeProviderHeadersEvent`,
+                // extensions/types.ts:686-689 @v0.83.0; runner `emitBeforeProviderHeaders`,
+                // core/extensions/runner.ts:1049-1065). Kind 31.
+                fn on_before_provider_headers(headers_json: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(31, &[&headers_json])
                 }
-                fn on_project_trust() -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(6, &[])
+                // EXT-016 — `cwd` + `reason` (pi extensions/types.ts:544-548 @v0.83.0).
+                fn on_resources_discover(
+                    cwd: ::std::string::String,
+                    reason: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(5, &[&cwd, &reason])
                 }
-                fn on_session_before_switch(target_id: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(24, &[&target_id])
+                fn on_project_trust(cwd: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(6, &[&cwd])
                 }
-                fn on_session_before_fork(entry_id: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(25, &[&entry_id])
+                fn on_session_before_switch(
+                    reason: ::std::string::String,
+                    target_session_file: ::core::option::Option<::std::string::String>,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(24, &[&reason, target_session_file.as_deref().unwrap_or("")])
+                }
+                fn on_session_before_fork(
+                    entry_id: ::std::string::String,
+                    position: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(25, &[&entry_id, &position])
                 }
                 fn on_session_before_compact(
                     preparation_json: ::std::string::String,
@@ -272,30 +297,66 @@ macro_rules! export_extension {
                 ) {
                     $crate::guest::notify(13, &[&call_id, &name, &args_json]);
                 }
-                fn on_tool_exec_update(call_id: ::std::string::String, chunk_json: ::std::string::String) {
-                    $crate::guest::notify(14, &[&call_id, &chunk_json]);
+                fn on_tool_exec_update(
+                    call_id: ::std::string::String,
+                    name: ::std::string::String,
+                    args_json: ::std::string::String,
+                    chunk_json: ::std::string::String,
+                ) {
+                    $crate::guest::notify(14, &[&call_id, &name, &args_json, &chunk_json]);
                 }
                 fn on_tool_exec_end(
                     call_id: ::std::string::String,
+                    name: ::std::string::String,
                     result_json: ::std::string::String,
                     is_error: bool,
                 ) {
-                    $crate::guest::notify(15, &[&call_id, &result_json, $crate::guest::b(is_error)]);
+                    $crate::guest::notify(
+                        15,
+                        &[&call_id, &name, &result_json, $crate::guest::b(is_error)],
+                    );
                 }
-                fn on_session_start(reason: ::std::string::String) {
-                    $crate::guest::notify(16, &[&reason]);
+                fn on_session_start(
+                    reason: ::std::string::String,
+                    previous_session_file: ::core::option::Option<::std::string::String>,
+                ) {
+                    $crate::guest::notify(
+                        16,
+                        &[&reason, previous_session_file.as_deref().unwrap_or("")],
+                    );
                 }
-                fn on_session_shutdown(reason: ::std::string::String) {
-                    $crate::guest::notify(17, &[&reason]);
+                fn on_session_shutdown(
+                    reason: ::std::string::String,
+                    target_session_file: ::core::option::Option<::std::string::String>,
+                ) {
+                    $crate::guest::notify(
+                        17,
+                        &[&reason, target_session_file.as_deref().unwrap_or("")],
+                    );
+                }
+                // EXT-011 — `session_info_changed` (pi `SessionInfoChangedEvent`,
+                // extensions/types.ts:571-575 @v0.83.0). Kind 32; notify-only.
+                fn on_session_info_changed(name: ::core::option::Option<::std::string::String>) {
+                    $crate::guest::notify(32, &[name.as_deref().unwrap_or("")]);
                 }
                 fn on_after_provider_response(status: u32, headers_json: ::std::string::String) {
                     $crate::guest::notify(21, &[&status.to_string(), &headers_json]);
                 }
-                fn on_model_select(model_json: ::std::string::String) {
-                    $crate::guest::notify(22, &[&model_json]);
+                fn on_model_select(
+                    model_json: ::std::string::String,
+                    previous_model_json: ::core::option::Option<::std::string::String>,
+                    source: ::std::string::String,
+                ) {
+                    $crate::guest::notify(
+                        22,
+                        &[&model_json, previous_model_json.as_deref().unwrap_or(""), &source],
+                    );
                 }
-                fn on_thinking_level_select(level: ::std::string::String) {
-                    $crate::guest::notify(23, &[&level]);
+                fn on_thinking_level_select(
+                    level: ::std::string::String,
+                    previous_level: ::core::option::Option<::std::string::String>,
+                ) {
+                    $crate::guest::notify(23, &[&level, previous_level.as_deref().unwrap_or("")]);
                 }
                 fn on_session_compact(
                     compaction_entry_json: ::std::string::String,

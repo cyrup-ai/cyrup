@@ -66,7 +66,13 @@ async fn wasm_guest_exec_runs_a_real_command_through_the_assembled_session() {
     // Load the guest COMPONENT through the session's host, injecting the session's OWN LiveHostServices
     // (arch-08 §5.6) — the same backend whose `exec` grant runs argv commands through the real ProcOps.
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 

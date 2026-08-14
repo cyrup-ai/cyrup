@@ -37,8 +37,14 @@ pub enum ResourceError {
     Git(String),
     #[error("project not trusted; refused project-scoped resource: {0}")]
     Untrusted(PathBuf),
+    /// An `npm:` package source. The npm CHANNEL is a documented port drop (R-09-021: no JS
+    /// runtime), but pi's own `parseSource` npm branch (package-manager.ts:1419-1445 @v0.83.0) is
+    /// reached on a normal session start through settings `packages`, so the message must name npm
+    /// rather than blaming OCI (CFG-009).
+    #[error("unsupported source: npm packages are not supported")]
+    UnsupportedNpm,
     #[error("unsupported source (OCI deferred)")]
-    Unsupported,
+    UnsupportedOci,
     #[error("cancelled")]
     Cancelled,
     #[error(transparent)]
@@ -123,11 +129,7 @@ impl ResourceDiagnostic {
         }
     }
 
-    pub fn error(
-        kind: ResourceKind,
-        path: impl Into<PathBuf>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn error(kind: ResourceKind, path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
         Self {
             diagnostic_type: DiagnosticType::Error,
             resource_type: kind,

@@ -55,6 +55,22 @@ impl FsOps for LocalFs {
         tokio::fs::read(path).await.map_err(|e| error::io(&error::show(path), &e))
     }
 
+    /// A real `std::fs::File`, so `grep`'s search pulls the file through `grep_searcher`'s rolling
+    /// buffer instead of allocating it whole — the property Pi gets for free by running the search
+    /// in a separate ripgrep process (grep.ts:226). The `open(2)` itself runs on the blocking pool;
+    /// the reads happen inside the caller's `spawn_blocking`, per [`FsOps::read_stream`].
+    async fn read_stream(
+        &self,
+        path: &Path,
+    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+        let owned = path.to_path_buf();
+        let file = tokio::task::spawn_blocking(move || std::fs::File::open(&owned))
+            .await
+            .map_err(|e| error::invalid(format!("read_stream: {e}")))?
+            .map_err(|e| error::io(&error::show(path), &e))?;
+        Ok(Box::new(file))
+    }
+
     /// 1:1 with Pi's `fsWriteFile(path, content, "utf-8")` (write.ts:33 / edit.ts:85):
     /// `O_WRONLY|O_CREAT|O_TRUNC` with creation mode `0o666` (umask applies), write, close.
     ///
@@ -116,7 +132,12 @@ impl FsOps for LocalFs {
             // writes and touches no parent memory. Returns 0 on success, or -1 with `errno` set.
             let rc = unsafe { libc::access(c_path.as_ptr(), amode) };
             if rc != 0 {
-                return Err(error::io(&error::show(path), &std::io::Error::last_os_error()));
+                // `io_errno`, not `io`: Pi's `edit` reports `Error code: ${error.code}`
+                // (edit.ts:332-333) off the caught Node error object, and `ToolError` is flat, so
+                // the errno NAME has to ride in the message for `edit.rs` to recover it. `read`
+                // propagates this string verbatim (read.ts:241 uncaught) and Node's own raw text
+                // leads with the same code, so the prefix moves `read` toward Pi as well.
+                return Err(error::io_errno(&error::show(path), &std::io::Error::last_os_error()));
             }
             Ok(())
         }
@@ -126,7 +147,7 @@ impl FsOps for LocalFs {
             // readonly bit (the pre-`access(2)` behavior).
             let meta = tokio::fs::metadata(path)
                 .await
-                .map_err(|e| error::io(&error::show(path), &e))?;
+                .map_err(|e| error::io_errno(&error::show(path), &e))?;
             if mode == Access::ReadWrite && meta.permissions().readonly() {
                 return Err(error::invalid(format!("{} is not writable", error::show(path))));
             }
@@ -147,10 +168,13 @@ impl FsOps for LocalFs {
         })
     }
 
+    /// `io_errno` rather than `io` so `ls`'s `Cannot read directory: ${e.message}` wrapper
+    /// (ls.ts:150-152) renders a Node-shaped body leading with the errno code, which is what
+    /// `e.message` is on the upstream side.
     async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ToolError> {
         let mut rd = tokio::fs::read_dir(path)
             .await
-            .map_err(|e| error::io(&error::show(path), &e))?;
+            .map_err(|e| error::io_errno(&error::show(path), &e))?;
         let mut out = Vec::new();
         loop {
             match rd.next_entry().await {
@@ -159,7 +183,7 @@ impl FsOps for LocalFs {
                     out.push(DirEntry { name, path: entry.path() });
                 }
                 Ok(None) => break,
-                Err(e) => return Err(error::io(&error::show(path), &e)),
+                Err(e) => return Err(error::io_errno(&error::show(path), &e)),
             }
         }
         Ok(out)

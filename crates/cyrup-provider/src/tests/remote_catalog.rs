@@ -690,15 +690,35 @@ async fn an_overlay_not_newer_than_the_builtin_manifest_is_discarded_whole() {
 
 #[test]
 fn the_builtin_manifest_stamp_agrees_with_the_documented_provenance() {
-    // `tests/catalog_data.rs` documents the embedded catalogs as pi @ `91585d9a` (2026-07-10 16:34).
-    // Before DRIFT-007 that provenance existed only in prose; this pins the machine-readable copy.
-    // `date -u -d '2026-07-10T16:34:43Z' +%s` = 1783701283.
+    // `src/tests/catalog_data.rs` documents the embedded catalogs as two extractions: 31 files from
+    // pi `91585d9a` (its commit timestamp is 2026-07-10T14:34:43Z) and four — amazon-bedrock,
+    // github-copilot, google-vertex, openai-codex — from pi `b0c2a90e`
+    // (`git log -1 --format=%ct b0c2a90e` = 1784278803, i.e. 2026-07-17T09:00:03Z).
+    //
+    // PROV-039 moved the stamp from the EARLIER revision to the LATER one, and this test still
+    // pinned the earlier value. The later one is the only correct choice for what the field is
+    // used for: it is the staleness FLOOR (`remote_catalog.rs:188-196`), and `catalog.rs:9-12`
+    // lets an overlay REPLACE an embedded model by id — so a floor at 91585d9a accepts a persisted
+    // overlay dated between the two extractions and lets it shadow the four newer catalogs.
+    // pi's own field carries the same "generation timestamp shared by all built-in provider
+    // catalogs" meaning (`packages/ai/src/providers/all.ts:73-77` @v0.83.0).
     assert_eq!(
         builtin_model_data_generated_at(),
-        Some(1_783_701_283_000),
+        Some(1_784_278_803_000),
         "bump catalog_manifest.json in the same commit that refreshes providers/catalog/*.json"
     );
-    assert!(crate::BUILTIN_CATALOG_MANIFEST_JSON.contains("91585d9a"));
+    assert!(
+        crate::BUILTIN_CATALOG_MANIFEST_JSON.contains("b0c2a90e"),
+        "the manifest must name the revision its stamp comes from"
+    );
+    // The two guards must not be able to drift apart again: catalog_data.rs asserts the same value
+    // from the other side, so state the invariant that ties them — the floor is the NEWEST
+    // extraction, therefore strictly after the older one.
+    let older = 1_783_694_083_000_i64; // 91585d9a, `git log -1 --format=%ct` = 1783694083
+    assert!(
+        builtin_model_data_generated_at().is_some_and(|at| at > older),
+        "the floor must be the latest extraction revision, not the earliest"
+    );
 }
 
 // --------------------------------------------------------------------------------- single flight --

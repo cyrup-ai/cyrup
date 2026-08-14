@@ -189,7 +189,7 @@ impl NativeExtension for ResourceContributor {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::ResourcesDiscover => HookOutcome::Handled(HandledValue(serde_json::json!({
+            HostEvent::ResourcesDiscover { .. } => HookOutcome::Handled(HandledValue(serde_json::json!({
                 "skillPaths": [self.skill_path.to_string_lossy()],
             }))),
             _ => HookOutcome::Noop,

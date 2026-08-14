@@ -26,17 +26,17 @@ use crate::manager::SessionManager;
 
 pub use branch::{
     branch_token_budget, collect_entries_for_branch_summary, generate_branch_summary,
-    prepare_branch_entries, BranchCollection, BranchPreparation, BranchSummaryOutput,
-    BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
-    DEFAULT_BRANCH_CONTEXT_WINDOW,
+    generate_branch_summary_with_instructions, prepare_branch_entries, BranchCollection,
+    BranchPreparation, BranchSummaryOutput, BRANCH_SUMMARY_EMPTY_PLACEHOLDER,
+    BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT, DEFAULT_BRANCH_CONTEXT_WINDOW,
 };
 pub use cutpoint::{find_cut_point, find_turn_start, find_valid_cut_points, CutPoint};
 pub use error::CompactionError;
 pub use files::{format_file_operations, CompactionDetails, FileOps};
 pub use hooks::{
     BeforeCompactDecision, BeforeCompactEvent, BeforeTreeDecision, BeforeTreeEvent,
-    BranchSummaryEntry, CompactionEntry, CompactionHooks, CompactionOverride, CompactionReason,
-    NoHooks, PostCompactEvent, PostTreeEvent,
+    BeforeTreeOverrides, BranchSummaryEntry, CompactionEntry, CompactionHooks, CompactionOverride,
+    CompactionReason, NoHooks, PostCompactEvent, PostTreeEvent,
 };
 pub use prepare::{prepare_compaction, CompactionPreparation};
 pub use serialize::serialize_conversation;
@@ -286,6 +286,18 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
             }
         };
 
+        // Pi re-tests the abort signal IMMEDIATELY before the append, unconditionally, covering all
+        // three summary sources (extension override, hook `Custom`, default summarizer) — the
+        // manual path throws `new Error("Compaction cancelled")`
+        // (`agent-session.ts:1868-1870`), the auto path emits
+        // `compaction_end { result: undefined, aborted: true }` and returns `false` (`:2142-2151`).
+        // Without it, a cancel landing while a `session_before_compact` guest is producing a
+        // summary — or in the window after the summarization stream settles but before the write —
+        // still mutates the session file and reports success.
+        if cancel.is_cancelled() {
+            return Err(CompactionError::Aborted);
+        }
+
         let id = session.append_compaction(
             summary,
             first_kept,
@@ -341,35 +353,54 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         // before-tree hook: cancel navigation / supply custom summary / proceed (R-05-022).
         let decision = self.hooks.before_tree(&event, cancel.child_token()).await?;
         type SummaryPayload = Option<(String, serde_json::Value, Option<Usage>)>;
+        // Pi reads `customInstructions` / `replaceInstructions` / `label` off the SAME hook result
+        // that may also carry `cancel`/`summary` (`agent-session.ts:2968-2976`), so they are
+        // extracted before the decision is matched.
+        let overrides = match &decision {
+            BeforeTreeDecision::Cancel => BeforeTreeOverrides::default(),
+            BeforeTreeDecision::Proceed { overrides }
+            | BeforeTreeDecision::CustomSummary { overrides, .. } => overrides.clone(),
+        };
         let (summary_and_details, from_hook): (SummaryPayload, bool) =
             match decision {
                 BeforeTreeDecision::Cancel => return Ok(None),
-                BeforeTreeDecision::CustomSummary { summary, details } if user_wants_summary => {
+                BeforeTreeDecision::CustomSummary { summary, details, .. }
+                    if user_wants_summary =>
+                {
                     (Some((summary, details.unwrap_or_else(|| serde_json::json!({})), None)), true)
                 }
                 // Proceed, or a custom summary the user did not ask for → default path.
-                BeforeTreeDecision::Proceed | BeforeTreeDecision::CustomSummary { .. } => {
-                    if !user_wants_summary && settings.skip_prompt {
-                        (None, false) // R-05-018: skip generation
+                BeforeTreeDecision::Proceed { .. } | BeforeTreeDecision::CustomSummary { .. } => {
+                    // Pi's gate is the USER's choice alone: `if (options.summarize &&
+                    // entriesToSummarize.length > 0 && !extensionSummary)`
+                    // (`agent-session.ts:2983`). `skipPrompt` is a front-end-only setting upstream
+                    // — it never appears in `agent-session.ts`; its sole consumer repo-wide is
+                    // `interactive-mode.ts:4672`, which uses it to decide whether to ASK, not
+                    // whether to summarize. Consulting it here made an embedder's
+                    // `summarize: false` still pay for a summarization call.
+                    if !user_wants_summary {
+                        (None, false)
                     } else if collection.entries.is_empty() {
                         // Pi gates the default summarizer on `entriesToSummarize.length > 0`
-                        // (`agent-session.ts:2787`): with NO abandoned entries, produce nothing.
+                        // (`agent-session.ts:2983`): with NO abandoned entries, produce nothing.
                         (None, false)
                     } else {
                         // Budget = (context window || 128000) − reserve (Pi
-                        // `branch-summarization.ts:315-317`), NOT a flat reserve_tokens — this
+                        // `branch-summarization.ts:312-313`), NOT a flat reserve_tokens — this
                         // keeps far more branch history than a bare reserve would.
                         let budget = branch_token_budget(model, settings.reserve_tokens);
                         let prep = prepare_branch_entries(&collection.entries, budget);
                         // `generate_branch_summary` returns the "No content to summarize" placeholder
                         // when the abandoned branch filtered to no messages (all `toolResult` / over
                         // budget). Pi's caller still appends it — `if (summaryText)` is truthy on the
-                        // non-empty placeholder (`agent-session.ts:2844`) — so we append it too rather
+                        // non-empty placeholder (`agent-session.ts:3038`) — so we append it too rather
                         // than silently dropping an explored branch.
-                        let produced = generate_branch_summary(
+                        let produced = generate_branch_summary_with_instructions(
                             &self.summarizer,
                             &prep,
                             model,
+                            overrides.custom_instructions.as_deref(),
+                            overrides.replace_instructions.unwrap_or(false),
                             cancel.clone(),
                         )
                         .await?;
@@ -380,14 +411,16 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                 }
             };
 
-        // Navigate the leaf to the target (R-05-017: abandoned branch untouched).
-        session.branch(&target_id)?;
-
         let entry = match summary_and_details {
             Some((summary, details, usage)) => {
-                let from_id = old_leaf.clone().unwrap_or_else(|| EntryId::from("root"));
-                let id = session.append_branch_summary(
-                    from_id,
+                // Pi `branchWithSummary(newLeafId, …)` (`agent-session.ts:3040-3046`) with the
+                // comment "Summary is attached at the navigation target position (newLeafId), not
+                // the old branch" (`:3036`): ONE value — the navigation target — becomes `leafId`,
+                // `parentId` AND `fromId` (`session-manager.ts:1391-1397`). Recording the ABANDONED
+                // leaf as `fromId` gave the SDK path a different provenance graph than the live
+                // `/tree` path, which already routes through `branch_with_summary`.
+                let id = session.branch_with_summary(
+                    Some(&target_id),
                     summary,
                     Some(details),
                     usage,
@@ -395,8 +428,19 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                 )?;
                 branch_summary_entry_of(session, &id)
             }
-            None => None,
+            None => {
+                // Navigate the leaf to the target (R-05-017: abandoned branch untouched).
+                session.branch(&target_id)?;
+                None
+            }
         };
+
+        // Pi attaches the hook-supplied label to the SUMMARY entry when one was produced, and to the
+        // navigation TARGET otherwise (`agent-session.ts:3050-3052` / `:3062-3064`).
+        if let Some(label) = overrides.label.filter(|l| !l.is_empty()) {
+            let target = entry.as_ref().map_or_else(|| target_id.clone(), |e| e.id.clone());
+            session.append_label(&target, Some(label.as_str()))?;
+        }
 
         self.hooks
             .post_tree(&PostTreeEvent {

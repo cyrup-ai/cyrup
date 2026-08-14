@@ -83,7 +83,7 @@ struct Recorder {
 
 #[async_trait::async_trait]
 impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         self.events.lock().unwrap().push(event.clone());
     }
 }
@@ -153,7 +153,7 @@ struct ContextOverrideHook {
 
 #[async_trait::async_trait]
 impl Hooks for ContextOverrideHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         // After the FIRST turn only, replace the loop's working context with a sentinel transcript.
         // Pi `currentContext = snapshot.context` (agent-loop.ts:228) replaces only the loop copy.
         if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -165,7 +165,7 @@ impl Hooks for ContextOverrideHook {
             Ok(None)
         }
     }
-    async fn should_stop_after_turn(&self, ctx: PostTurn<'_>) -> Result<bool, HookError> {
+    async fn should_stop_after_turn(&self, ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<bool, HookError> {
         Ok(ctx.turn_index >= 2)
     }
 }
@@ -224,7 +224,7 @@ async fn miss1_mid_run_set_messages_does_not_leak_into_loop_payload() {
     }
     #[async_trait::async_trait]
     impl EventSubscriber for Meddler {
-        async fn on_event(&self, event: &AgentEvent) {
+        async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
             if let AgentEvent::MessageEnd { message: AgentMessage::Assistant(_) } = event
                 && self.fired.fetch_add(1, Ordering::SeqCst) == 0
             {
@@ -309,7 +309,7 @@ struct PanicHook;
 
 #[async_trait::async_trait]
 impl Hooks for PanicHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         panic!("boom");
     }
 }
@@ -550,18 +550,24 @@ async fn residual1_tool_update_partial_result_carries_terminate_byte_for_byte() 
         }),
         "first partialResult must carry terminate:true"
     );
-    // Byte-shape #2: a partial with `terminate = None` OMITS the key entirely — exactly as Pi omits
-    // an `undefined` `terminate?` (NOT a `null`).
+    // Byte-shape #2: a partial with `terminate = None` and `details = None` OMITS BOTH keys —
+    // exactly as Pi's `JSON.stringify` drops an `undefined` `terminate?` / `details?` (NOT a
+    // `null`). The `details` half was corrected alongside AGENT-009: pi emits the tool's
+    // `AgentToolResult` verbatim on `partialResult` (agent-loop.ts:681-691 @v0.83.0), so a tool that
+    // set no details produces no key, where cyrup used to write an explicit `null`.
     assert_eq!(
         partials[1],
         json!({
-            "content": [{ "type": "text", "text": "more" }],
-            "details": null
+            "content": [{ "type": "text", "text": "more" }]
         }),
-        "second partialResult must omit the terminate key"
+        "second partialResult must omit both optional keys"
     );
     assert!(
         partials[1].get("terminate").is_none(),
         "absent terminate must produce no key, matching Pi's optional field"
+    );
+    assert!(
+        partials[1].get("details").is_none(),
+        "absent details must produce no key, matching Pi's optional field"
     );
 }

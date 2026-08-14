@@ -167,7 +167,7 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
     }
 
     let ctx = ctx(dir.path());
-    child.on_event(&HostEvent::SessionStart { reason: "start".to_string() }, &ctx).await;
+    child.on_event(&HostEvent::SessionStart { reason: "start".to_string(), previous_session_file: None }, &ctx).await;
 
     // Nothing may be delivered before the session has a turn to steer (pi's `canSteer` gate).
     assert!(
@@ -216,7 +216,7 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
         "a delivered request must never be re-delivered"
     );
 
-    child.on_event(&HostEvent::SessionShutdown { reason: "end".to_string() }, &ctx).await;
+    child.on_event(&HostEvent::SessionShutdown { reason: "end".to_string(), target_session_file: None }, &ctx).await;
 }
 
 /// The lossless half (pi `:214-217`): a failed injection writes the undelivered requests BACK to
@@ -244,7 +244,7 @@ async fn a_failed_injection_returns_the_undelivered_guidance_to_the_inbox() {
     child.set_host_services(services.clone() as Arc<dyn cyrup_ext::host::HostServices>);
 
     let ctx = ctx(dir.path());
-    child.on_event(&HostEvent::SessionStart { reason: "start".to_string() }, &ctx).await;
+    child.on_event(&HostEvent::SessionStart { reason: "start".to_string(), previous_session_file: None }, &ctx).await;
     child.on_event(&HostEvent::MessageStart { message: serde_json::json!({"role": "assistant"}) }, &ctx).await;
 
     assert!(

@@ -29,7 +29,7 @@ pub fn mistral_models() -> Vec<Model> {
 
 /// The Mistral [`ProviderAuth`]: `MISTRAL_API_KEY` (Pi `envApiKeyAuth`, env-api-keys.ts).
 pub fn mistral_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key(["MISTRAL_API_KEY"]))
+    ProviderAuth::with_api_key(env_key("Mistral API key", ["MISTRAL_API_KEY"]))
 }
 
 /// Construct the Mistral provider over the given credential store + shared api registry. The

@@ -26,7 +26,7 @@ pub mod overrides;
 pub mod skills_inject;
 pub mod tool_prompts;
 
-pub use builder::{DocsPointers, PromptInputs, SystemPromptBuilder};
+pub use builder::{DocsPointers, PromptInputs, SystemPromptBuilder, DEFAULT_SELECTED_TOOLS};
 pub use cache::{ContextError, ContextSnapshot, ContextStore};
 pub use context_files::{
     ContextDiagnostic, ContextFile, ContextFileLoader, ContextScope, TrustQuery,

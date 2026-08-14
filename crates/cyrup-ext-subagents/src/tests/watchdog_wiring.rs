@@ -133,6 +133,7 @@ async fn session_start_binds_the_watchdog_and_shutdown_disposes_it() {
         .on_event(
             &HostEvent::SessionStart {
                 reason: "test".to_string(),
+                previous_session_file: None,
             },
             &ctx(root.path()),
         )
@@ -162,6 +163,7 @@ async fn session_start_binds_the_watchdog_and_shutdown_disposes_it() {
         .on_event(
             &HostEvent::SessionShutdown {
                 reason: "test".to_string(),
+                target_session_file: None,
             },
             &ctx(root.path()),
         )
@@ -185,10 +187,12 @@ async fn a_switch_a_fork_and_a_compaction_each_reset_the_watchdog() {
     let mut epoch = extension.watchdog().get_snapshot(None).epoch;
     for event in [
         HostEvent::SessionBeforeSwitch {
-            target_id: "t".to_string(),
+            reason: "test".to_string(),
+            target_session_file: None,
         },
         HostEvent::SessionBeforeFork {
             entry_id: "e".to_string(),
+            position: "before".to_string(),
         },
         HostEvent::SessionCompact {
             compaction_entry: serde_json::Value::Null,
@@ -474,6 +478,7 @@ async fn an_armed_child_drives_its_watchdog_through_the_extension_event_path() {
         .on_event(
             &HostEvent::SessionStart {
                 reason: "test".to_string(),
+                previous_session_file: None,
             },
             &cwd,
         )
@@ -485,6 +490,7 @@ async fn an_armed_child_drives_its_watchdog_through_the_extension_event_path() {
         .on_event(
             &HostEvent::SessionShutdown {
                 reason: "test".to_string(),
+                target_session_file: None,
             },
             &cwd,
         )
@@ -542,6 +548,7 @@ async fn a_child_watchdog_buffers_the_turn_delta_it_is_handed() {
         .on_event(
             &HostEvent::SessionStart {
                 reason: "test".to_string(),
+                previous_session_file: None,
             },
             &cwd,
         )
@@ -600,6 +607,7 @@ async fn the_delta_the_child_review_receives_carries_this_turns_tool_results() {
         .on_event(
             &HostEvent::SessionStart {
                 reason: "test".to_string(),
+                previous_session_file: None,
             },
             &cwd,
         )

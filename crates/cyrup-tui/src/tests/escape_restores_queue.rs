@@ -62,11 +62,25 @@ fn escape_mid_turn_asks_the_run_loop_to_restore_the_queue() {
     );
 }
 
+/// **Corrected for TUI-005.** This asserted `AppAction::Interrupt` for an idle Escape on an empty
+/// buffer, which is cyrup-original: pi's `onEscape` is four MUTUALLY EXCLUSIVE branches
+/// (`interactive-mode.ts:2569-2595` @v0.83.0), and an idle Escape on an empty buffer falls to the
+/// fourth — the 500 ms double-Escape window — which aborts nothing at all. cyrup returned a bare
+/// `Interrupt` from every non-streaming Escape, so it called `session.abort()` + `abort_bash()`
+/// against a session with nothing to abort, and the double-Escape branch could never be reached.
+///
+/// The property this test exists for — "not streaming ⇒ pi never reaches the restore branch" — is
+/// unchanged and still asserted.
 #[test]
-fn escape_while_idle_is_a_plain_interrupt() {
+fn escape_while_idle_does_not_restore_a_queue() {
     let mut app = new_app();
-    // Not streaming ⇒ Pi never reaches the restore branch, so there is nothing to give back.
-    assert_eq!(app.handle_input(&esc()), AppAction::Interrupt);
+    let out = app.handle_input(&esc());
+    assert_ne!(
+        out,
+        AppAction::InterruptRestoreQueued,
+        "not streaming ⇒ pi never reaches the restore branch"
+    );
+    assert_eq!(out, AppAction::Redraw, "pi's empty-editor arm only arms the double-Escape window");
 }
 
 #[test]

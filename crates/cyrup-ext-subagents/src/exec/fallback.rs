@@ -1532,6 +1532,7 @@ mod tests {
     fn armed_scope(patterns: &[&str]) -> crate::exec::model_scope::ModelScopeConfig {
         crate::exec::model_scope::ModelScopeConfig {
             enforce: Some(true),
+            strict: None,
             allow: Some(patterns.iter().map(|p| (*p).to_string()).collect()),
         }
     }
@@ -2127,6 +2128,7 @@ mod tests {
     fn an_inherit_sentinel_under_an_armed_scope_warns_rather_than_refusing() {
         let scope = ModelScopeConfig {
             enforce: Some(true),
+            strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
         };
         let parent = model("together/zai-org/GLM-5.2"); // outside the allow list
@@ -2164,6 +2166,7 @@ mod tests {
 
         let scope = ModelScopeConfig {
             enforce: Some(true),
+            strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
         };
         assert!(

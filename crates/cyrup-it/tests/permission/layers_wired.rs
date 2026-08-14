@@ -63,7 +63,7 @@ fn tool_call(name: &str, input: Value) -> HostEvent {
 
 fn block_reason(o: &HookOutcome) -> Option<&str> {
     match o {
-        HookOutcome::Block { reason } => reason.as_deref(),
+        HookOutcome::Block { reason, .. } => reason.as_deref(),
         _ => None,
     }
 }

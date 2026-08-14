@@ -621,6 +621,66 @@ fn bundled_resources_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")
 }
 
+/// SUBA-044 — pi made the reviewer lane READ-ONLY in `0b1976b` ("fix: make reviewer lanes
+/// read-only by default", #1008), released v0.47.1: `agents/reviewer.md:4` @v0.47.1 is
+/// `tools: read, grep, find, ls, intercom` and `defaultReads` is gone.
+///
+/// THE USER ACTION: a user delegates to the SHIPPED `reviewer` expecting pi's behaviour and gets a
+/// lane that can run arbitrary shell and write arbitrary files during what upstream defines as an
+/// inspection-only pass. cyrup's copy still granted `bash`, `edit` and `write`, with a prose-only
+/// restraint ("Use `bash` only for read-only inspection…") over a grant that permits neither
+/// restriction.
+///
+/// Asserted through the REAL discovery pipeline rather than by reading the file, so a `tools:` line
+/// that parses to something other than what it looks like still fails.
+#[test]
+fn the_bundled_reviewer_lane_is_read_only() {
+    let cfg = AgentDiscoveryConfig {
+        builtin_agents_dir: Some(bundled_resources_dir()),
+        ..AgentDiscoveryConfig::default()
+    };
+    let result = discover_agents_all(&cfg).expect("builtin-only discovery succeeds");
+    let reviewer = result
+        .agents
+        .iter()
+        .find(|a| a.name == "reviewer")
+        .expect("the bundled reviewer must be discoverable");
+
+    let tools: Vec<String> = reviewer
+        .tools
+        .as_ref()
+        .expect("the reviewer pins an explicit allowlist")
+        .iter()
+        .map(|t| match t {
+            crate::discovery::types::ToolRef::Builtin(name)
+            | crate::discovery::types::ToolRef::Mcp(name)
+            | crate::discovery::types::ToolRef::ExtensionPath(name) => name.clone(),
+        })
+        .collect();
+    for denied in ["bash", "edit", "write"] {
+        assert!(
+            !tools.iter().any(|t| t == denied),
+            "upstream's reviewer lane grants no `{denied}`; got {tools:?}"
+        );
+    }
+    assert_eq!(
+        tools,
+        vec![
+            "read".to_string(),
+            "grep".to_string(),
+            "find".to_string(),
+            "ls".to_string(),
+            "intercom".to_string()
+        ],
+        "the allowlist must be upstream's, in upstream's order"
+    );
+    assert!(
+        reviewer.default_reads.is_none(),
+        "upstream removed `defaultReads` from the reviewer in the same commit; got {:?}",
+        reviewer.default_reads
+    );
+}
+
 #[test]
 fn all_six_bundled_builtin_personas_are_discovered_with_builtin_source() {
     let cfg = AgentDiscoveryConfig {

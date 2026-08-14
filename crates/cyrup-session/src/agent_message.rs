@@ -254,6 +254,11 @@ pub fn custom_to_message(content: &Value, timestamp: i64) -> Message {
         Value::String(s) => vec![Content::text(s.clone())],
         Value::Array(_) => serde_json::from_value::<Vec<Content>>(content.clone())
             .unwrap_or_else(|_| vec![Content::text(content.to_string())]),
+        // Pi normalizes a null/absent `content` to `[]` BEFORE `createCustomMessage` ever sees it:
+        // `createCustomMessage(entry.customType, entry.content ?? [], …)`
+        // (`session-manager.ts:396-399`). The catch-all below stringifies its input, so without
+        // this arm a `"content": null` entry injected the four characters `null` into a user turn.
+        Value::Null => Vec::new(),
         other => vec![Content::text(other.to_string())],
     };
     Message::User { content: blocks, timestamp }

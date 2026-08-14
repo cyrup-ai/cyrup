@@ -190,14 +190,32 @@ impl ContextUsage {
 
 /// The outcome of a compaction (Pi `CompactionResult`, agent-session.ts:1751-1757). Returned by
 /// [`crate::AgentSession::compact`] and surfaced on the `compaction_end` event.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// No `Eq`: `usage` (SEAM-034) carries `f64` cost fields, so only `PartialEq` is derivable — which
+/// is also all any caller uses.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionResult {
     pub summary: String,
     pub first_kept_entry_id: String,
     pub tokens_before: u64,
     /// Estimated token count of the rebuilt (post-compaction) context.
-    pub estimated_tokens_after: u64,
+    ///
+    /// `Option` to match pi's `estimatedTokensAfter?` (`core/compaction/compaction.ts:92`
+    /// @v0.83.0), elided when absent so the key is missing rather than `null`. SEAM-034.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens_after: Option<u64>,
+    /// *"Usage from the LLM call(s) that generated this summary, if available"* — pi's own comment
+    /// on `usage?: Usage` (`core/compaction/compaction.ts:93` @v0.83.0), on the wire at
+    /// `modes/rpc/rpc-types.ts:171`. On a split turn pi records the SUM via `combineUsage`
+    /// (`compaction.ts:99`); cyrup takes the value the compaction ENTRY already carries
+    /// (`cyrup-session/src/entry.rs`'s `usage: Option<Usage>`), which is that same total.
+    ///
+    /// Without it a cost-tracking RPC client under-reported every compaction even though the
+    /// session totals (SEAM-031) include it. Elided when absent, so existing goldens stay
+    /// byte-identical. SEAM-034.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<cyrup_core::Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
 }

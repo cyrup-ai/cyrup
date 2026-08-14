@@ -181,7 +181,7 @@ async fn debug_off_keeps_the_diagnostic_stream_silent_while_the_review_stream_wr
     let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, false, &["bash"]).await;
 
     let _ = ext
-        .on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx(agent_dir))
+        .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx(agent_dir))
         .await;
     let _ = ext.on_event(&tool_call("bash", json!({ "command": "rm -rf /" })), &ctx(agent_dir)).await;
 
@@ -212,7 +212,7 @@ async fn debug_on_writes_both_streams() {
     let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, true, &["bash"]).await;
 
     let _ = ext
-        .on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx(agent_dir))
+        .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx(agent_dir))
         .await;
     let _ = ext.on_event(&tool_call("bash", json!({ "command": "rm -rf /" })), &ctx(agent_dir)).await;
 

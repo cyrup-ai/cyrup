@@ -191,8 +191,30 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
     assert!(prompt.contains("write"), "write tool snippet missing");
     assert!(prompt.contains("PROJECT_CONTEXT_MARKER"), "context file not injected:\n{prompt}");
     assert!(prompt.contains("<project_instructions"), "project_instructions wrapper missing");
-    assert!(prompt.contains("Available skills"), "skills section missing:\n{prompt}");
-    assert!(prompt.contains("demoskill"), "skill pointer missing");
+    // The skills block is pi's `formatSkillsForPrompt` (`packages/coding-agent/src/core/skills.ts:
+    // 342-358` @v0.83.0): three lead-in lines, then an `<available_skills>` element holding one
+    // `<skill>` per visible skill with `<name>`/`<description>`/`<location>` children. There is no
+    // "Available skills" prose heading anywhere in pi — asserting one pinned a format pi does not
+    // emit, and it only passed while cyrup's skills section was still unported.
+    assert!(
+        prompt.contains("The following skills provide specialized instructions for specific tasks."),
+        "skills lead-in missing:\n{prompt}"
+    );
+    assert!(prompt.contains("<available_skills>"), "skills section missing:\n{prompt}");
+    assert!(prompt.contains("</available_skills>"), "skills section unclosed:\n{prompt}");
+    // The skill's three children, not merely its name appearing somewhere in the prompt.
+    assert!(prompt.contains("<name>demoskill</name>"), "skill name missing:\n{prompt}");
+    assert!(
+        prompt.contains("<description>use this when you need a demo</description>"),
+        "skill description missing:\n{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "<location>{}</location>",
+            fx.agent_dir.join("skills").join("demoskill").join("SKILL.md").display()
+        )),
+        "skill location must be the absolute SKILL.md path pi points the model at:\n{prompt}"
+    );
 
     // Drive a prompt and collect the full event stream.
     let stream = session

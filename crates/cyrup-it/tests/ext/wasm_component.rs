@@ -61,7 +61,7 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
         )
         .await;
     match reduced {
-        Reduced::Blocked { reason, by } => {
+        Reduced::Blocked { reason, by, .. } => {
             assert_eq!(by.to_string(), "demo");
             assert!(
                 reason.as_deref().unwrap_or("").contains("bash is disabled"),

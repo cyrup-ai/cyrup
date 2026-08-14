@@ -240,6 +240,16 @@ pub struct SessionInfo {
     /// Optional presence name (`v0.9.2 broker/client.ts:170-172`).
     #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// `runtimeFallbackAlias` (`v0.10.1 types.ts:6-7`): "True only when the extension synthesized
+    /// name for an unnamed runtime."
+    ///
+    /// Additive at v0.10.0 (`126875e`). Relayed by the broker at every tag that carries `SessionInfo`
+    /// (`v0.10.1 broker/broker.ts:358` on register, `:779-787` on presence), and it is the input to
+    /// the mailbox identity guard (`:1039-1047`, `if (!lowerName || info.runtimeFallbackAlias)
+    /// return []`) that stops one unnamed session inheriting another's queued mail. A cyrup broker
+    /// sitting between two pi v0.10 sessions must not strip it.
+    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    pub runtime_fallback_alias: Option<bool>,
     /// The session's working directory (`v0.9.2 broker/client.ts:161`).
     pub cwd: String,
     /// The session's active model ref (`v0.9.2 broker/client.ts:162`).
@@ -603,6 +613,17 @@ pub struct SessionRegistration {
     /// Optional presence name (`v0.9.2 broker/broker.ts:207-209`).
     #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Whether `name` is a synthesized unnamed-runtime alias (`v0.10.1 types.ts:6-7`), carried on
+    /// the registration by `buildRegistration`'s `...identity` spread
+    /// (`v0.10.1 index.ts:772-774`) and copied onto the stored `SessionInfo` at
+    /// `v0.10.1 broker/broker.ts:358`.
+    ///
+    /// Unmodelled by `isSessionRegistration` upstream (it validates only the pre-v0.10 keys), so a
+    /// bad type is accepted-and-dropped there; modelled here because cyrup both SENDS it and copies
+    /// it into the stored `SessionInfo`, and `present_non_null` keeps a `null` from being a decode
+    /// failure.
+    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    pub runtime_fallback_alias: Option<bool>,
     /// The session's working directory (`v0.9.2 broker/broker.ts:198`).
     pub cwd: String,
     /// The session's active model ref (`v0.9.2 broker/broker.ts:199`).
@@ -700,6 +721,10 @@ pub enum ClientMessage {
         /// New presence name, if changed (`v0.9.2 broker/broker.ts:891-894`).
         #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// Whether the accompanying `name` is a synthesized unnamed-runtime alias
+        /// (`v0.10.1 types.ts:88`, applied at `v0.10.1 broker/broker.ts:779-787`).
+        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        runtime_fallback_alias: Option<bool>,
         /// New status string, if changed (`v0.9.2 broker/broker.ts:900-903`).
         #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
         status: Option<String>,
@@ -929,6 +954,7 @@ mod tests {
     fn client_register_serializes_with_pi_field_names() {
         let msg = ClientMessage::Register {
             session: SessionRegistration {
+                runtime_fallback_alias: None,
                 name: Some("alice".to_string()),
                 cwd: "/w".to_string(),
                 model: "m".to_string(),
@@ -1247,6 +1273,7 @@ mod tests {
     #[test]
     fn presence_context_fields_keep_all_three_states() {
         let msg = ClientMessage::Presence {
+            runtime_fallback_alias: None,
             name: None,
             status: None,
             model: None,

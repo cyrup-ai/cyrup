@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_core::{AssistantMessage, StopReason};
+use cyrup_core::{AssistantMessage, ExtensionId, StopReason};
+use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
 use cyrup_provider::faux::{
     faux_assistant_message, faux_assistant_message_with, faux_text, FauxMessageOptions, FauxProvider,
+    FauxResponseStep,
 };
 use cyrup_provider::Provider;
 use crate::{AgentSessionEvent, InputSource, SessionBuilder, SessionConfig, UserInput};
@@ -261,4 +263,289 @@ async fn set_session_name_emits_session_info_changed() {
     }
     assert_eq!(found, Some(Some("my session".to_string())), "session_info_changed{{name}} must fire");
     assert_eq!(session.session_name().await.as_deref(), Some("my session"));
+}
+
+/// A native extension that records every `session_info_changed` payload it is handed.
+struct InfoChangedRecorder(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+
+#[async_trait::async_trait]
+impl NativeExtension for InfoChangedRecorder {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("info-changed-recorder")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::SessionInfoChanged]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        if let HostEvent::SessionInfoChanged { name } = ev {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(name.clone());
+        }
+        HookOutcome::Noop
+    }
+}
+
+/// EXT-011 — the rename is also an EXTENSION event: pi `SessionInfoChangedEvent`
+/// (`extensions/types.ts:571-575` @v0.83.0), subscribed and dispatched like any other lifecycle
+/// notify.
+///
+/// RED before this pass: `EventKind::SessionInfoChanged`, `HostEvent::SessionInfoChanged`, the WIT
+/// export and the SDK's `on_session_info_changed` all existed, but NOTHING in the session emitted
+/// it — `set_session_name` fanned the event out to `AgentSessionEvent` subscribers only. A guest
+/// could subscribe and never be called, which is the worst failure shape: silent and untestable
+/// from the guest side. This recorder would collect zero payloads.
+#[tokio::test]
+async fn set_session_name_also_dispatches_the_session_info_changed_extension_event() {
+    let fx = fixture();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .with_native_extension(Arc::new(InfoChangedRecorder(Arc::clone(&seen))))
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    session.set_session_name("my session").await.expect("set name");
+
+    assert_eq!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        vec![Some("my session".to_string())],
+        "the extension must receive `session_info_changed` with the resolved name"
+    );
+
+    // An empty/whitespace name resolves to `None` through `getSessionName()`, and the extension
+    // sees the SAME `None` the `AgentSessionEvent` subscribers do.
+    session.set_session_name("   ").await.expect("clear name");
+    assert_eq!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).last().cloned(),
+        Some(None),
+        "a blank rename dispatches `name: None`, not the previous name"
+    );
+}
+
+/// CFG-006 / AGENT-031 — the `websocketConnectTimeoutMs` setting must reach the provider's
+/// `StreamOptions`.
+///
+/// pi resolves it in the session `streamFn` as
+/// `options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs()` and
+/// spreads it onto every `streamSimple` call (`core/sdk.ts:310-311,314` @v0.83.0).
+///
+/// RED before this pass: BOTH halves existed and neither was connected —
+/// `Settings::websocket_connect_timeout_ms` parsed and validated the key (`settings.rs:732`) and
+/// `AgentBuilder::websocket_connect_timeout_ms` threaded it onto `StreamOptions`
+/// (`cyrup-provider/src/stream.rs:201`), but nothing in `SessionBuilder` assigned it. A user who
+/// set the key got no error and no effect, which is the AGENT-021 defect shape: a field documented
+/// as live that silently sends nothing. The factory below would observe `None`.
+#[tokio::test]
+async fn websocket_connect_timeout_setting_reaches_the_providers_stream_options() {
+    let fx = fixture();
+    let mut cli = cyrup_config::Settings::new();
+    cli.set_field("websocketConnectTimeoutMs", serde_json::json!(7_500)).unwrap();
+
+    let seen: Arc<std::sync::Mutex<Vec<Option<u64>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![FauxResponseStep::factory({
+        let seen = Arc::clone(&seen);
+        move |_ctx, options, _state, _model| {
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(options.websocket_connect_timeout_ms);
+            faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)
+        }
+    })]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(cli)
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    let _ = session.prompt(UserInput::text("go", InputSource::Sdk)).await.expect("prompt");
+    session.wait_for_idle().await;
+
+    assert_eq!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        vec![Some(7_500)],
+        "the resolved `websocketConnectTimeoutMs` must arrive on `StreamOptions` for every request"
+    );
+}
+
+/// CFG-035 — `.cyrup/SYSTEM.md` / `.cyrup/APPEND_SYSTEM.md` must actually be READ.
+///
+/// pi `discoverSystemPromptFile` / `discoverAppendSystemPromptFile`
+/// (`core/resource-loader.ts:1022-1032`, `:1034-1044` @v0.83.0), consumed at `:525` and `:531-535`:
+/// the project file `<cwd>/.cyrup/<name>` wins when the project is TRUSTED, else the global
+/// `<agent_dir>/<name>`, else nothing — and exactly ONE path is returned per leg.
+///
+/// RED before this pass: both filenames existed in cyrup only as TRUST-GATE MARKERS
+/// (`cyrup-config/src/trust.rs:208-209`). `SessionBuilder` set `custom_prompt` /
+/// `append_system_prompt` from the CLI fields and nothing else, so cyrup asked the user to trust a
+/// project *because of* a file it never opened: the assembled prompt would carry neither string.
+#[tokio::test]
+async fn system_md_and_append_system_md_are_discovered_and_read() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.cwd.join(".cyrup")).unwrap();
+    std::fs::write(fx.cwd.join(".cyrup/SYSTEM.md"), "PROJECT-SYSTEM-BODY").unwrap();
+    std::fs::write(fx.cwd.join(".cyrup/APPEND_SYSTEM.md"), "PROJECT-APPEND-BODY").unwrap();
+    // A global pair too, to pin the PRECEDENCE: the trusted project file must win.
+    std::fs::write(fx.agent_dir.join("SYSTEM.md"), "GLOBAL-SYSTEM-BODY").unwrap();
+
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.expect("build");
+
+    let prompt = session.system_prompt().to_string();
+    assert!(
+        prompt.contains("PROJECT-SYSTEM-BODY"),
+        "the trusted project `.cyrup/SYSTEM.md` must REPLACE the default body: {prompt}"
+    );
+    assert!(
+        !prompt.contains("GLOBAL-SYSTEM-BODY"),
+        "the project file wins outright; upstream returns on the first hit and does not stack"
+    );
+    assert!(
+        prompt.contains("PROJECT-APPEND-BODY"),
+        "`.cyrup/APPEND_SYSTEM.md` must be appended: {prompt}"
+    );
+}
+
+/// CFG-035, the trust gate: the gate applies to the PROJECT rung ONLY, so an untrusted project
+/// falls THROUGH to the global `<agent_dir>/SYSTEM.md` rather than yielding nothing
+/// (`resource-loader.ts:1023-1030` — the `existsSync(globalPath)` rung is outside the
+/// `isProjectTrusted()` guard).
+#[tokio::test]
+async fn an_untrusted_project_falls_through_to_the_global_system_md() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.cwd.join(".cyrup")).unwrap();
+    std::fs::write(fx.cwd.join(".cyrup/SYSTEM.md"), "PROJECT-SYSTEM-BODY").unwrap();
+    std::fs::write(fx.agent_dir.join("SYSTEM.md"), "GLOBAL-SYSTEM-BODY").unwrap();
+
+    let mut cfg = base_config(&fx);
+    cfg.trust_override = Some(false);
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, cfg).build().await.expect("build");
+
+    let prompt = session.system_prompt().to_string();
+    assert!(
+        prompt.contains("GLOBAL-SYSTEM-BODY"),
+        "an untrusted project must still get the GLOBAL file: {prompt}"
+    );
+    assert!(
+        !prompt.contains("PROJECT-SYSTEM-BODY"),
+        "the untrusted project file must not be read"
+    );
+}
+
+/// CFG-035 — an explicit CLI `--system-prompt` / `--append-system-prompt` SUPPRESSES discovery
+/// (`this.systemPromptSource ?? this.discoverSystemPromptFile()`, `:525`; and `if (!appendSources)`
+/// at `:531`). pi does not stack the CLI value on top of the discovered file.
+#[tokio::test]
+async fn a_cli_prompt_suppresses_discovery_rather_than_stacking() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.cwd.join(".cyrup")).unwrap();
+    std::fs::write(fx.cwd.join(".cyrup/SYSTEM.md"), "PROJECT-SYSTEM-BODY").unwrap();
+    std::fs::write(fx.cwd.join(".cyrup/APPEND_SYSTEM.md"), "PROJECT-APPEND-BODY").unwrap();
+
+    let mut cfg = base_config(&fx);
+    cfg.system_prompt = Some("CLI-SYSTEM-BODY".to_string());
+    cfg.append_system_prompt = Some("CLI-APPEND-BODY".to_string());
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, cfg).build().await.expect("build");
+
+    let prompt = session.system_prompt().to_string();
+    assert!(prompt.contains("CLI-SYSTEM-BODY"), "{prompt}");
+    assert!(prompt.contains("CLI-APPEND-BODY"), "{prompt}");
+    assert!(!prompt.contains("PROJECT-SYSTEM-BODY"), "discovery must be suppressed: {prompt}");
+    assert!(!prompt.contains("PROJECT-APPEND-BODY"), "discovery must be suppressed: {prompt}");
+}
+
+/// EXT-038 / TOOL-021 — an extension-contributed tool's `promptSnippet` and `promptGuidelines`
+/// must reach the SYSTEM PROMPT.
+///
+/// pi builds `_toolPromptSnippets` / `_toolPromptGuidelines` from `definitionRegistry`, which is
+/// the base definitions with `allCustomTools` merged over them by name
+/// (`core/agent-session.ts:2471-2504` @v0.83.0) — so an extension tool contributes its own text,
+/// and an extension OVERRIDE of a built-in contributes the override's text instead of the
+/// built-in's.
+///
+/// RED before this pass, for two independent reasons:
+/// 1. `SessionBuilder` derived `selected_tools` + `tool_contributions` from `base_tools` alone and
+///    only called `ext_host.active_tools(&base_tools)` AFTER the prompt had been built, so a guest
+///    could register a fully-described tool and the model was never told it existed;
+/// 2. `Tool::prompt_guidelines` returned `&[&str]`, which no tool owning `Vec<String>` can
+///    implement — so even with the ordering fixed the guidelines leg had no reader (TOOL-021).
+#[tokio::test]
+async fn an_extension_tools_snippet_and_guidelines_reach_the_system_prompt() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .with_native_extension(Arc::new(DescribedToolExtension))
+        .build()
+        .await
+        .expect("build");
+
+    let prompt = session.system_prompt().to_string();
+    assert!(
+        prompt.contains("Deploys the thing to the place"),
+        "the extension tool's `promptSnippet` must reach the Available tools section: {prompt}"
+    );
+    assert!(
+        prompt.contains("Always dry-run deploy before deploying for real"),
+        "the extension tool's `promptGuidelines` must reach the Guidelines section: {prompt}"
+    );
+}
+
+/// A native extension contributing one tool with a snippet AND owned (`String`) guidelines — the
+/// same ownership shape a WASM guest's `ToolDescriptor` has.
+struct DescribedToolExtension;
+
+#[async_trait::async_trait]
+impl NativeExtension for DescribedToolExtension {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("described-tool-extension")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.register_tool(Arc::new(DeployTool {
+            params: serde_json::json!({"type": "object", "properties": {}}),
+            guidelines: vec!["Always dry-run deploy before deploying for real".to_string()],
+        }));
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+}
+
+struct DeployTool {
+    params: serde_json::Value,
+    guidelines: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_core::Tool for DeployTool {
+    fn name(&self) -> &str {
+        "deploy"
+    }
+    fn description(&self) -> &str {
+        "deploy things"
+    }
+    fn parameters(&self) -> &serde_json::Value {
+        &self.params
+    }
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Deploys the thing to the place")
+    }
+    fn prompt_guidelines(&self) -> Vec<&str> {
+        self.guidelines.iter().map(String::as_str).collect()
+    }
+    async fn execute(
+        &self,
+        _call_id: cyrup_core::ToolCallId,
+        _params: serde_json::Value,
+        _cancel: cyrup_core::CancelToken,
+        _on_update: cyrup_core::ToolUpdateSink,
+    ) -> Result<cyrup_core::ToolResult, cyrup_core::ToolError> {
+        Ok(cyrup_core::ToolResult::default())
+    }
 }

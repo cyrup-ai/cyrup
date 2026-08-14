@@ -630,8 +630,8 @@ impl AssistantMessage {
 pub enum Message {
     User {
         /// Pi `UserMessage.content: string | (TextContent | ImageContent)[]` (types.ts:379). On
-        /// READ, a bare JSON string is accepted and promoted to a single text block, and the array
-        /// form is validated to `Text|Image` only (gap 5/9 / R-00-013). On WRITE, the content array
+        /// READ, a bare JSON string is accepted and promoted to a single text block; the array form
+        /// is NOT validated against the role union (SESS-027 — see [`de_user_content`]). On WRITE, the content array
         /// is ALWAYS emitted — every real Pi entry point that builds a `UserMessage` constructs the
         /// array form `[{type:"text",text}]` (`agent.ts:389`, `agent-harness.ts:38`,
         /// `agent-session.ts:1117`) and Pi's session write path (`session-manager.ts:940,952,959`)
@@ -645,8 +645,9 @@ pub enum Message {
     ToolResult {
         tool_call_id: ToolCallId,
         tool_name: String,
-        /// Pi `ToolResultMessage.content: (TextContent | ImageContent)[]` (types.ts:402): validated
-        /// to `Text|Image` only on deserialize (gap 9).
+        /// Pi `ToolResultMessage.content: (TextContent | ImageContent)[]` (`ai/src/types.ts:402`).
+        /// SESS-027: the union is compile-time TS; deserialization is READ-TOLERANT and rejects no
+        /// block type (see [`de_tool_result_content`]).
         #[serde(default, deserialize_with = "de_tool_result_content")]
         content: Vec<Content>,
         #[serde(default)]
@@ -704,10 +705,22 @@ impl serde::Serialize for Message {
                 added_tool_names,
                 timestamp,
             } => {
-                // `usage` / `addedToolNames` are OMITTED when absent, reproducing Pi's bytes: it
+                // The key ORDER is pi's `createToolResultMessage` object literal
+                // (`pi/packages/agent/src/agent-loop.ts:773-787` @v0.83.0; the literal is
+                // `:774-786`): role `:775`, toolCallId `:776`, toolName `:777`, content `:780`,
+                // details `:781`, usage `:782`, the `...addedToolNames` conditional spread `:783`,
+                // **isError `:784`**, timestamp `:785`. pi's session write path is a bare
+                // `JSON.stringify(entry)`, so that literal IS the on-disk byte order.
+                //
+                // PROV-020: `isError` used to be emitted immediately after `content`, three keys
+                // too early, which falsified this serializer's whole reason to exist. The previous
+                // comment here claimed the new keys "sit next to `details` so every pre-existing key
+                // position is unchanged" — that claim was wrong, and it is why the defect survived
+                // two passes.
+                //
+                // `usage` / `addedToolNames` are OMITTED when absent, reproducing pi's bytes: it
                 // assigns `usage: finalized.result.usage` (an `undefined` key `JSON.stringify`
                 // drops) and spreads `addedToolNames` only when non-empty (agent-loop.ts:782-783).
-                // Both sit next to `details` so every pre-existing key position is unchanged.
                 let len = 6
                     + usize::from(details.is_some())
                     + usize::from(usage.is_some())
@@ -717,7 +730,6 @@ impl serde::Serialize for Message {
                 st.serialize_field("toolCallId", tool_call_id)?;
                 st.serialize_field("toolName", tool_name)?;
                 st.serialize_field("content", content)?;
-                st.serialize_field("isError", is_error)?;
                 match details {
                     Some(d) => st.serialize_field("details", d)?,
                     None => st.skip_field("details")?,
@@ -731,6 +743,7 @@ impl serde::Serialize for Message {
                 } else {
                     st.serialize_field("addedToolNames", added_tool_names)?;
                 }
+                st.serialize_field("isError", is_error)?;
                 st.serialize_field("timestamp", timestamp)?;
                 st.end()
             }
@@ -738,10 +751,17 @@ impl serde::Serialize for Message {
     }
 }
 
-/// Deserialize `UserMessage.content` accepting Pi's bare-string shorthand OR the content array, and
-/// validating the array to `Text|Image` only (Pi `content: string | (TextContent | ImageContent)[]`,
-/// types.ts:379). A bare string becomes a single [`Content::Text`]; a `Thinking`/`ToolCall` block is
-/// rejected.
+/// Deserialize `UserMessage.content` accepting Pi's bare-string shorthand OR the content array
+/// (Pi `content: string | (TextContent | ImageContent)[]`, `ai/src/types.ts:379`). A bare string
+/// becomes a single [`Content::Text`].
+///
+/// SESS-027 — this doc used to promise that "a `Thinking`/`ToolCall` block is rejected", which the
+/// body deliberately does NOT do. Pi's per-role content unions are COMPILE-TIME TypeScript only:
+/// its session read path is `JSON.parse(line) as FileEntry` with a catch that skips only
+/// MALFORMED JSON (`parseSessionEntryLine`, `core/session-manager.ts:503-511` @v0.83.0), so an
+/// off-union block loads fine there. SESS-001 removed the rejection here to match; the doc
+/// outliving it is worse than no doc, because the next reader "restores" a validation pi never
+/// had and cyrup then refuses a session file pi loads.
 fn de_user_content<'de, D>(deserializer: D) -> Result<Vec<Content>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -763,8 +783,12 @@ where
     })
 }
 
-/// Deserialize `ToolResultMessage.content`, validating to `Text|Image` only (Pi
-/// `content: (TextContent | ImageContent)[]`, types.ts:402).
+/// Deserialize `ToolResultMessage.content` (Pi `content: (TextContent | ImageContent)[]`,
+/// `ai/src/types.ts:402`).
+///
+/// SESS-027 — READ-TOLERANT, not validating: the union is compile-time TS only and pi's read path
+/// is a bare `JSON.parse` (`core/session-manager.ts:503-511` @v0.83.0). A `null` or absent
+/// `content` normalizes to `[]`.
 fn de_tool_result_content<'de, D>(deserializer: D) -> Result<Vec<Content>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -775,9 +799,12 @@ where
     Ok(Option::<Vec<Content>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// Deserialize `AssistantMessage.content`, validating to `Text|Thinking|ToolCall` only (Pi
-/// `content: (TextContent | ThinkingContent | ToolCall)[]`, types.ts:385); an `Image` block is
-/// rejected.
+/// Deserialize `AssistantMessage.content` (Pi
+/// `content: (TextContent | ThinkingContent | ToolCall)[]`, `ai/src/types.ts:385`).
+///
+/// SESS-027 — READ-TOLERANT, not validating; an `Image` block is ACCEPTED. pi's union is
+/// compile-time TS and its read path is `JSON.parse(line) as FileEntry`, skipping only malformed
+/// JSON (`core/session-manager.ts:503-511` @v0.83.0), so any session JSONL pi loads, cyrup loads.
 fn de_assistant_content<'de, D>(deserializer: D) -> Result<Vec<Content>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -856,8 +883,18 @@ mod tests {
         // Both keys present, and positioned after `details` (Pi keeps them adjacent, types.ts:419-428).
         assert!(first.contains(r#""usage":{"#), "{first}");
         assert!(first.contains(r#""addedToolNames":["late"]"#), "{first}");
-        let details_at = first.find(r#""details""#).expect("details key");
-        assert!(details_at < first.find(r#""usage""#).expect("usage key"));
+
+        // PROV-020 — the FULL key order of pi's `createToolResultMessage` literal
+        // (`agent-loop.ts:773-787` @v0.83.0): … details, usage, ...addedToolNames, isError,
+        // timestamp. `isError` used to be emitted right after `content`, three keys too early, so
+        // a cyrup-exported `toolResult` line was not byte-identical to pi's — the single property
+        // this hand-written serializer exists to provide. Red before the fix.
+        let at = |k: &str| first.find(k).unwrap_or_else(|| panic!("{k} missing in {first}"));
+        assert!(at(r#""content""#) < at(r#""details""#));
+        assert!(at(r#""details""#) < at(r#""usage""#));
+        assert!(at(r#""usage""#) < at(r#""addedToolNames""#));
+        assert!(at(r#""addedToolNames""#) < at(r#""isError""#));
+        assert!(at(r#""isError""#) < at(r#""timestamp""#));
 
         let back: Message = serde_json::from_str(&first).expect("deserialize");
         assert_eq!(back, m, "value round-trips");

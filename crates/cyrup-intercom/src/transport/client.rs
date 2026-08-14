@@ -386,9 +386,28 @@ impl IntercomClient {
     /// `client.updatePresence({ status: currentStatus(), ...currentContextUsage() })`
     /// (`v0.9.2 index.ts:842-848`). A peer's `/intercom` picker and `intercom({action:"list"})`
     /// therefore show this session's live `NN% ctx (used/window)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_presence_with_context(
         &self,
         name: Option<String>,
+        status: Option<String>,
+        model: Option<String>,
+        context_pct: Option<Option<serde_json::Number>>,
+        context_tokens: Option<Option<serde_json::Number>>,
+        context_window: Option<Option<serde_json::Number>>,
+    ) {
+        self.update_presence_full(name, None, status, model, context_pct, context_tokens, context_window);
+    }
+
+    /// [`Self::update_presence_with_context`] carrying `runtimeFallbackAlias`
+    /// (`v0.10.1 types.ts:88`), which travels alongside `name` in upstream's `{ ...identity }`
+    /// spread (`v0.10.1 index.ts:815`) — the two are one value there, so they are sent together
+    /// here rather than through separate calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_presence_full(
+        &self,
+        name: Option<String>,
+        runtime_fallback_alias: Option<bool>,
         status: Option<String>,
         model: Option<String>,
         context_pct: Option<Option<serde_json::Number>>,
@@ -400,6 +419,7 @@ impl IntercomClient {
         }
         if let Ok(frame) = encode_json(&ClientMessage::Presence {
             name,
+            runtime_fallback_alias,
             status,
             model,
             context_pct,
@@ -710,6 +730,7 @@ mod tests {
 
     fn registration() -> SessionRegistration {
         SessionRegistration {
+            runtime_fallback_alias: None,
             name: None,
             cwd: "/tmp".to_string(),
             model: "m".to_string(),
@@ -982,6 +1003,7 @@ mod tests {
         let from = SessionInfo {
             id: "sender".to_string(),
             name: Some("sender".to_string()),
+            runtime_fallback_alias: None,
             cwd: "/w".to_string(),
             model: "m".to_string(),
             pid: 1u32.into(),
@@ -1032,6 +1054,7 @@ mod tests {
         SessionInfo {
             id: id.to_string(),
             name: Some(id.to_string()),
+            runtime_fallback_alias: None,
             cwd: "/w".to_string(),
             model: "m".to_string(),
             pid: 1u32.into(),

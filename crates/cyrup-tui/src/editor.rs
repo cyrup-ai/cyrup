@@ -340,6 +340,19 @@ impl InputEditor {
         self.autocomplete_keymap.merge_json(json)
     }
 
+    /// Restore both editor-side binding tables to their defaults — TUI-051.
+    ///
+    /// `merge_json` only *sets* the ids present in the document, so a `/reload` after the user
+    /// DELETED an entry would leave its old binding live. Upstream's `rebuild()` replaces rather
+    /// than merges: for every id in `definitions`, `userKeys === undefined ?
+    /// normalizeKeys(definition.defaultKeys) : normalizeKeys(userKeys)`
+    /// (`packages/tui/src/keybindings.ts:187-191` @v0.83.0). Resetting to defaults and then merging
+    /// the freshly-read document reproduces that.
+    pub fn reset_keybindings_to_defaults(&mut self) {
+        self.keymap = EditorKeymap::default();
+        self.autocomplete_keymap = crate::keymap::AutocompleteKeymap::default();
+    }
+
     /// Set the max visible rows in the autocomplete dropdown (Pi `autocompleteMaxVisible`, item #6):
     /// clamped to 3–20 and applied to any already-open popup + every future one. Called by the binary
     /// from `settings.autocompleteMaxVisible`.
@@ -432,6 +445,39 @@ impl InputEditor {
 
     /// Replace the buffer contents and move the cursor to the end.
     pub fn set_text(&mut self, text: &str) {
+        // TUI-061 — Pi has TWO functions here and cyrup had collapsed them into one.
+        // `setText` (`editor.ts:1010-1021` @v0.83.0) is the PROGRAMMATIC entry point:
+        //
+        // ```ts
+        // this.cancelAutocomplete();
+        // this.lastAction = null;
+        // this.exitHistoryBrowsing();
+        // const normalized = this.normalizeText(text);
+        // if (this.getText() !== normalized) this.pushUndoSnapshot();   // makes it undoable
+        // this.pastes.clear(); this.pasteCounter = 0;
+        // this.setTextInternal(normalized);
+        // ```
+        //
+        // `setTextInternal` (`:1043-1056`) — "Internal setText that doesn't reset history state -
+        // used by navigateHistory" — does none of it. Collapsing the two left the paste registry
+        // ALIVE across a programmatic buffer replacement (so a subsequently hand-typed
+        // `[paste #1 …]` still expanded — TUI-049's surface, narrowed but not closed by that fix)
+        // and made the replacement un-undoable.
+        self.autocomplete = None;
+        self.last_action = LastAction::None;
+        self.exit_history();
+        if self.text() != text {
+            self.push_undo_for(LastAction::None);
+        }
+        self.pastes.clear();
+        self.paste_counter = 0;
+        self.set_text_internal(text);
+    }
+
+    /// Pi's `setTextInternal` (`editor.ts:1043-1056` @v0.83.0) — "Internal setText that doesn't
+    /// reset history state - used by navigateHistory". No autocomplete cancel, no undo snapshot, no
+    /// registry reset: the buffer is replaced and the scroll re-anchored, nothing else. TUI-061.
+    fn set_text_internal(&mut self, text: &str) {
         self.lines = text.split('\n').map(|l| l.chars().collect()).collect();
         if self.lines.is_empty() {
             self.lines.push(Vec::new());
@@ -1411,7 +1457,10 @@ impl InputEditor {
         let next = (self.history_index + 1).min(self.history.len() as isize - 1);
         self.history_index = next;
         if let Some(entry) = self.history.get(next as usize).cloned() {
-            self.set_text(&entry);
+            // TUI-061 — `navigateHistory` uses `setTextInternal` (`editor.ts:1043-1056`), never
+            // `setText`: browsing must not cancel the autocomplete, push a snapshot per step, or
+            // clear the paste registry the draft is about to be restored with.
+            self.set_text_internal(&entry);
             self.row = 0;
             self.col = 0; // cursor at start on Up (setTextInternal placement)
         }
@@ -1442,10 +1491,11 @@ impl InputEditor {
             } else {
                 // `setTextInternal("")` (`:451`), NOT `clear()`: upstream's fallback empties the
                 // buffer and leaves the paste registry, kill ring and popup state alone.
-                self.set_text("");
+                self.set_text_internal("");
             }
         } else if let Some(entry) = self.history.get(self.history_index as usize).cloned() {
-            self.set_text(&entry);
+            // TUI-061 — the internal form again (`editor.ts:1043-1056`), same reason as the Up path.
+            self.set_text_internal(&entry);
             self.move_end();
         }
     }
@@ -1685,6 +1735,26 @@ impl InputEditor {
                 } else {
                     self.move_down_visual();
                 }
+                EditorOutcome::Edited
+            }
+            // TUI-035 — `tui.editor.historyPrevious` / `historyNext`
+            // (`tui/src/components/editor.ts:766-777` @v0.84.1). Upstream's comment is "Dedicated
+            // history actions always browse entries instead of moving the cursor", and the two arms
+            // sit AHEAD of the cursor-movement block: they cancel the autocomplete and call
+            // `navigateHistory(∓1)` UNCONDITIONALLY, with none of the buffer-edge gating Up/Down
+            // carry. Default `defaultKeys: []` (`keybindings.ts:68-75`), so nothing is bound until
+            // the user says so — which is the point: they exist so Up/Down can be made pure caret
+            // motion while history moves to, say, ctrl+p/ctrl+n.
+            E::HistoryPrevious => {
+                self.autocomplete = None;
+                self.last_action = LastAction::None; // `navigateHistory` (`editor.ts:430`)
+                self.history_older();
+                EditorOutcome::Edited
+            }
+            E::HistoryNext => {
+                self.autocomplete = None;
+                self.last_action = LastAction::None;
+                self.history_newer();
                 EditorOutcome::Edited
             }
             // `tui.editor.pageUp` / `tui.editor.pageDown` (`editor.ts:855-862`): page the CARET

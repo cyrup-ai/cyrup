@@ -267,17 +267,10 @@ impl FilterMode {
         }
     }
 
-    /// Map a `1..=5` digit to a mode (the bespoke filter keys).
-    pub fn from_digit(d: char) -> Option<FilterMode> {
-        match d {
-            '1' => Some(FilterMode::Default),
-            '2' => Some(FilterMode::NoTools),
-            '3' => Some(FilterMode::UserOnly),
-            '4' => Some(FilterMode::LabeledOnly),
-            '5' => Some(FilterMode::All),
-            _ => None,
-        }
-    }
+    // TUI-027: `from_digit` is deleted. cyrup used to switch filter modes on the bare digits
+    // `1`-`5`; upstream has no digit arm anywhere in `handleInput` — every printable character no
+    // binding claims is appended to the tree's text SEARCH (`tree-selector.ts:1093-1100`), and the
+    // filter modes are the seven `app.tree.filter.*` ctrl chords instead.
 
     /// Whether `node` survives this filter.
     fn keeps(self, node: &TreeNode) -> bool {
@@ -361,8 +354,16 @@ pub struct TreeSelector {
     /// toggle turns it ON; it does not turn a default-on column off.
     show_time: bool,
     keymap: TreeKeymap,
-    /// The inline label editor, present only while renaming (`e`); see [`LabelEdit`].
+    /// The inline label editor, present only while renaming (`shift+l`); see [`LabelEdit`].
     label_edit: Option<LabelEdit>,
+    /// The live text search (`tree-selector.ts:113` `private searchQuery = ""`).
+    ///
+    /// **TUI-027.** Every printable, non-control key that no `app.tree.*` / `tui.select.*` binding
+    /// claims is appended here (`:1093-1100`), backspace pops one character (`:1079-1084`), and
+    /// `tui.select.cancel` clears it *instead of* cancelling when it is non-empty (`:1032-1035`).
+    /// It filters [`TreeSelector::visible_indices`] as whitespace-split lowercase tokens, all of
+    /// which must be substrings of the row's searchable text (`:337`, `:391-393`).
+    search_query: String,
 }
 
 impl TreeSelector {
@@ -375,6 +376,7 @@ impl TreeSelector {
             show_time: false,
             keymap: TreeKeymap::default(),
             label_edit: None,
+            search_query: String::new(),
         }
     }
 
@@ -383,7 +385,35 @@ impl TreeSelector {
         self.keymap = keymap;
     }
 
-    /// The indices of currently-visible nodes (filter passes + not inside a folded subtree).
+    /// The current search query (inspection/tests) — `getSearchQuery()` (`tree-selector.ts:619-621`).
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    /// Whether `node` survives the live search — `applyFilter`'s search arm
+    /// (`tree-selector.ts:337`, `:391-393`): the query is lowercased and split on whitespace, empty
+    /// tokens dropped, and **every** token must appear as a substring of the node's searchable text.
+    ///
+    /// **[CYRUP-DELTA]** Upstream's `getSearchableText` (`:560-614`) joins the user label, the
+    /// message role and the extracted content. cyrup's flattened [`TreeNode`] carries one
+    /// pre-rendered row text ([`TreeNode::label`]) which the DAG display already builds *from* those
+    /// same parts — the role prefix and the content preview are both in it (see the `S24(b)` note on
+    /// [`TreeRole`]) — so it is the available equivalent, not a narrowing choice. The one part it
+    /// cannot carry is a user label whose text is not on the row: `SessionDagNode` exposes only
+    /// `has_label`, the same limitation [`TreeSelector::begin_label_edit`] already documents.
+    fn matches_search(&self, node: &TreeNode) -> bool {
+        if self.search_query.trim().is_empty() {
+            return true;
+        }
+        let haystack = node.label.to_lowercase();
+        self.search_query
+            .to_lowercase()
+            .split_whitespace()
+            .all(|token| haystack.contains(token))
+    }
+
+    /// The indices of currently-visible nodes (filter passes + search matches + not inside a folded
+    /// subtree).
     pub fn visible_indices(&self) -> Vec<usize> {
         let mut out = Vec::new();
         let mut active_fold: Option<usize> = None;
@@ -396,7 +426,7 @@ impl TreeSelector {
             if active_fold.is_some() {
                 continue;
             }
-            if !self.filter.keeps(n) {
+            if !self.filter.keeps(n) || !self.matches_search(n) {
                 // A filtered-out foldable branch still suppresses its (also-filtered) descendants.
                 if n.foldable && n.folded {
                     active_fold = Some(n.depth);
@@ -509,6 +539,45 @@ impl TreeSelector {
     /// Toggle the relative-time column.
     fn toggle_time(&mut self) {
         self.show_time = !self.show_time;
+    }
+
+    /// Unfold every node — pi's `this.foldedNodes.clear()`, which **every** filter/search mutation
+    /// runs before `applyFilter()` (`tree-selector.ts:1033`, `:1040`, `:1045`, and each of the seven
+    /// filter arms and the backspace/typing arms).
+    fn clear_folds(&mut self) {
+        for node in &mut self.nodes {
+            node.folded = false;
+        }
+    }
+
+    /// Apply a filter mode the way pi's direct-filter arms do: set it, clear the folds, re-filter.
+    fn apply_filter_mode(&mut self, mode: FilterMode) {
+        self.filter = mode;
+        self.clear_folds();
+        self.clamp_selection();
+    }
+
+    /// pi's toggle arms (`tree-selector.ts:1039-1063`): a filter key whose mode is already active
+    /// returns to `default`; otherwise it selects that mode. `app.tree.filter.default` is the one
+    /// arm that is not a toggle (`:1036-1038`).
+    fn toggle_filter_mode(&mut self, mode: FilterMode) {
+        let next = if self.filter == mode { FilterMode::Default } else { mode };
+        self.apply_filter_mode(next);
+    }
+
+    /// pi's cycle arms (`tree-selector.ts:1064-1076`) over the ordered mode list
+    /// `["default","no-tools","user-only","labeled-only","all"]`, wrapping in both directions.
+    fn cycle_filter(&mut self, forward: bool) {
+        const MODES: [FilterMode; 5] = [
+            FilterMode::Default,
+            FilterMode::NoTools,
+            FilterMode::UserOnly,
+            FilterMode::LabeledOnly,
+            FilterMode::All,
+        ];
+        let cur = MODES.iter().position(|m| *m == self.filter).unwrap_or(0);
+        let next = if forward { (cur + 1) % MODES.len() } else { (cur + MODES.len() - 1) % MODES.len() };
+        self.apply_filter_mode(MODES[next]);
     }
 
     /// Begin inline label editing on the highlighted entry (`app.tree.editLabel` → `onLabelEdit` →
@@ -794,22 +863,80 @@ impl TreeSelector {
             ),
         ])
     }
+
+    /// pi's `SearchLine.render` (`tree-selector.ts:1165-1172`): the muted `Type to search:` prompt
+    /// unconditionally, plus the live query in `accent` when there is one.
+    fn search_line(&self, theme: &UiTheme) -> Line<'static> {
+        let mut spans =
+            vec![Span::styled("  Type to search:".to_string(), theme.dim_style())];
+        if !self.search_query.is_empty() {
+            spans.push(Span::styled(format!(" {}", self.search_query), theme.accent_style()));
+        }
+        Line::from(spans)
+    }
+
+    /// The help row, resolved from the **live** [`TreeKeymap`] — pi's `TreeHelp` over
+    /// `TREE_HELP_ITEMS` (`tree-selector.ts:1215-1236`), joined with pi's ` · ` separator. An
+    /// unbound action contributes nothing, as `formatHelpKeys` returns `""` for it.
+    ///
+    /// The `move` and `page` cells stay literal: those two rows read `tui.select.*` /
+    /// `tui.editor.cursor*` upstream, and cyrup's [`Selector::render`] signature carries no
+    /// [`SelectKeymap`], so there is nothing live to resolve them from here.
+    fn help_text(&self) -> String {
+        let mut items: Vec<String> = vec!["↑/↓ move".to_string(), "←/→ page".to_string()];
+        let pair = |a: TreeAction, b: TreeAction| -> Option<String> {
+            match (self.keymap.first_key_label(a), self.keymap.first_key_label(b)) {
+                (Some(x), Some(y)) => Some(format!("{x}/{y}")),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        };
+        if let Some(k) = pair(TreeAction::FoldOrUp, TreeAction::UnfoldOrDown) {
+            items.push(format!("{k} branch"));
+        }
+        if let Some(k) = self.keymap.first_key_label(TreeAction::EditLabel) {
+            items.push(format!("{k} label"));
+        }
+        if let Some(k) = self.keymap.first_key_label(TreeAction::ToggleLabelTimestamp) {
+            items.push(format!("{k} label time"));
+        }
+        let filters: Vec<String> = [
+            TreeAction::FilterDefault,
+            TreeAction::FilterNoTools,
+            TreeAction::FilterUserOnly,
+            TreeAction::FilterLabeledOnly,
+            TreeAction::FilterAll,
+        ]
+        .into_iter()
+        .filter_map(|a| self.keymap.first_key_label(a))
+        .collect();
+        if !filters.is_empty() {
+            items.push(format!("filters {}", filters.join("/")));
+        }
+        if let Some(k) =
+            pair(TreeAction::FilterCycleForward, TreeAction::FilterCycleBackward)
+        {
+            items.push(format!("cycle {k}"));
+        }
+        format!(" {}", items.join(" · "))
+    }
 }
 
 impl Selector for TreeSelector {
     fn desired_height(&self, _width: u16) -> u16 {
-        // top rule + header + body + hint line + bottom rule (+ one slack row, unchanged).
+        // top rule + header + search line + body + hint line + bottom rule (+ one slack row).
         let body = if self.label_edit.is_some() {
             // The label editor occupies the body (prompt + input + hint): at least 3 rows.
             3
         } else {
             self.visible_indices().len().min(u16::MAX as usize) as u16
         };
-        body.saturating_add(5)
+        body.saturating_add(6)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let [top, header, body, hint, bottom] = Layout::vertical([
+        let [top, header, search, body, hint, bottom] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
@@ -819,6 +946,11 @@ impl Selector for TreeSelector {
         .areas(area);
         frame.render_widget(border_rule(top.width, theme), top);
         frame.render_widget(Paragraph::new(self.header(theme)), header);
+        // The standing `Type to search:` prompt plus the live query — pi's `SearchLine`
+        // (`tree-selector.ts:1155-1173`), which renders the muted prompt whether or not a query is
+        // present and appends the query in `accent`. Placed between the header and the tree body,
+        // as pi's container order does (`:1375-1381`).
+        frame.render_widget(Paragraph::new(self.search_line(theme)), search);
         // While renaming, the body shows the inline label editor (Pi swaps `treeContainer` for the
         // `labelInputContainer`, `tree-selector.ts:1363-1372`); otherwise the filtered tree rows.
         if let Some(edit) = &self.label_edit {
@@ -838,10 +970,7 @@ impl Selector for TreeSelector {
                 theme.dim_style(),
             ))
         } else {
-            Line::from(Span::styled(
-                " ↑/↓ move   ←/→ page   z/x branch   e label   t label time".to_string(),
-                theme.dim_style(),
-            ))
+            Line::from(Span::styled(self.help_text(), theme.dim_style()))
         };
         frame.render_widget(Paragraph::new(hint_line), hint);
         frame.render_widget(border_rule(bottom.width, theme), bottom);
@@ -861,14 +990,14 @@ impl Selector for TreeSelector {
                 TreeAction::ToggleLabelTimestamp => self.toggle_time(),
                 // Open the inline label editor on the selected entry (`onLabelEdit` → `showLabelInput`).
                 TreeAction::EditLabel => self.begin_label_edit(),
+                TreeAction::FilterDefault => self.apply_filter_mode(FilterMode::Default),
+                TreeAction::FilterNoTools => self.toggle_filter_mode(FilterMode::NoTools),
+                TreeAction::FilterUserOnly => self.toggle_filter_mode(FilterMode::UserOnly),
+                TreeAction::FilterLabeledOnly => self.toggle_filter_mode(FilterMode::LabeledOnly),
+                TreeAction::FilterAll => self.toggle_filter_mode(FilterMode::All),
+                TreeAction::FilterCycleForward => self.cycle_filter(true),
+                TreeAction::FilterCycleBackward => self.cycle_filter(false),
             }
-            return SelectorOutcome::Redraw;
-        }
-        // Filter digits `1-5`.
-        if let ratatui::crossterm::event::KeyCode::Char(c) = key.code
-            && let Some(mode) = FilterMode::from_digit(c)
-        {
-            self.set_filter(mode);
             return SelectorOutcome::Redraw;
         }
         match keymap.action_for(key) {
@@ -884,8 +1013,47 @@ impl Selector for TreeSelector {
                 Some(id) => SelectorOutcome::Confirm(id),
                 None => SelectorOutcome::Redraw,
             },
-            Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
-            None => SelectorOutcome::Ignored,
+            // `tui.select.cancel` clears a live search FIRST and only cancels the selector when the
+            // query is already empty (`tree-selector.ts:1031-1037`).
+            Some(SelectAction::Cancel) => {
+                if self.search_query.is_empty() {
+                    SelectorOutcome::Cancel
+                } else {
+                    self.search_query.clear();
+                    self.clear_folds();
+                    self.clamp_selection();
+                    SelectorOutcome::Redraw
+                }
+            }
+            None => {
+                // Backspace pops one character off the query (`tree-selector.ts:1078-1084`).
+                if key.code == KeyCode::Backspace {
+                    if self.search_query.pop().is_some() {
+                        self.clear_folds();
+                        self.clamp_selection();
+                        return SelectorOutcome::Redraw;
+                    }
+                    return SelectorOutcome::Ignored;
+                }
+                // Otherwise: the final `else` of `handleInput` (`:1093-1100`) — any printable key
+                // data with no control characters is appended to the search query. cyrup's event
+                // model gives one `KeyCode::Char` at a time, and pi's `hasControlChars` test rejects
+                // `code < 32 || code === 0x7f || (0x80..=0x9f)`, which is exactly
+                // `char::is_control` for the codepoints a terminal can deliver here. A key carrying
+                // CONTROL/ALT/SUPER is a chord, not text, so it is not search input either.
+                if let KeyCode::Char(c) = key.code
+                    && !c.is_control()
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    )
+                {
+                    self.search_query.push(c);
+                    self.clear_folds();
+                    self.clamp_selection();
+                    return SelectorOutcome::Redraw;
+                }
+                SelectorOutcome::Ignored
+            }
         }
     }
 }

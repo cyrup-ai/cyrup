@@ -75,7 +75,7 @@ impl NativeExtension for CompactionVetoer {
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
             HostEvent::SessionBeforeCompact { .. } => {
-                HookOutcome::Block { reason: Some("not now".to_string()) }
+                HookOutcome::Block { reason: Some("not now".to_string()), terminate: false }
             }
             _ => HookOutcome::Noop,
         }
@@ -258,6 +258,107 @@ async fn compact_aborted_in_flight_errors_with_pi_s_bare_compaction_cancelled() 
         Some((true, None)),
         "compaction_end must carry aborted:true with no errorMessage"
     );
+}
+
+/// SESS-041 — `abortCompaction` must cancel the **auto** compaction too.
+///
+/// pi's whole body is two aborts (`agent-session.ts:1930-1933` @v0.83.0):
+///
+/// ```ts
+/// abortCompaction(): void {
+///     this._compactionAbortController?.abort();
+///     this._autoCompactionAbortController?.abort();
+/// }
+/// ```
+///
+/// cyrup had only the first line. `run_auto_compaction` installs its own child token in
+/// `auto_compaction_cancel` and never touches `compaction_cancel`, so pressing Escape during the
+/// post-run auto-compaction cancelled a `None` and the 10-18 s summarization ran to completion —
+/// the one compaction the user did NOT ask for was the one they could not escape. `is_compacting`
+/// already read BOTH fields, which is exactly what hid the asymmetry.
+///
+/// RED before the fix: `compaction_end` arrives with `aborted:false` (the summarization finishes
+/// normally) instead of `aborted:true`.
+#[tokio::test]
+async fn abort_compaction_also_cancels_an_auto_compaction() {
+    let fx = fixture();
+    // `reserveTokens` just under the window, so the real run's own usage trips the THRESHOLD arm
+    // and the post-run auto-compaction fires (round9's `real_run_threshold_compaction_emits_threshold_end`
+    // uses the same lever).
+    let mut cli = cyrup_config::Settings::new();
+    cli.set_field(
+        "compaction",
+        serde_json::json!({"enabled": true, "keepRecentTokens": 0, "reserveTokens": 127999}),
+    )
+    .unwrap();
+
+    // 1 token/s, so the summarization is unambiguously still streaming when the abort lands.
+    let faux = Arc::new(FauxProvider::with_config(FauxConfig {
+        tokens_per_second: Some(1.0),
+        ..FauxConfig::default()
+    }));
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("a real answer worth some tokens")], StopReason::Stop),
+        faux_assistant_message(
+            vec![faux_text(
+                "this auto-compaction summary is deliberately long so that it is still streaming \
+                 when the user presses escape and abort_compaction fires the auto cancel token",
+            )],
+            StopReason::Stop,
+        ),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(cli)
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    let mut stream = session.subscribe();
+    let running = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            let _ = session.prompt("go").await;
+            session.wait_for_idle().await;
+        }
+    });
+
+    // Wait for the AUTO compaction to start (reason `threshold`, not the manual `manual`), so the
+    // auto cancel token is definitely installed, then abort.
+    let mut started_auto = false;
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(15), stream.next()).await {
+        if let AgentSessionEvent::CompactionStart { reason } = &ev {
+            assert_eq!(
+                *reason,
+                crate::CompactionReason::Threshold,
+                "this test must exercise the AUTO path; a manual reason means the lever moved"
+            );
+            started_auto = true;
+            break;
+        }
+    }
+    assert!(started_auto, "the post-run threshold auto-compaction must start");
+    // Let the summarization stream actually open before cancelling it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    session.abort_compaction();
+
+    let mut end: Option<(bool, Option<String>)> = None;
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(15), stream.next()).await {
+        if let AgentSessionEvent::CompactionEnd { aborted, error_message, .. } = &ev {
+            end = Some((*aborted, error_message.clone()));
+            break;
+        }
+    }
+    assert_eq!(
+        end,
+        Some((true, None)),
+        "the auto compaction must report pi's abort shape — `aborted:true`, no errorMessage \
+         (agent-session.ts:2142-2151); `aborted:false` means `abort_compaction` never reached \
+         `auto_compaction_cancel`"
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(20), running).await;
 }
 
 /// The point of compaction: it must shrink what the NEXT request sends to the provider.

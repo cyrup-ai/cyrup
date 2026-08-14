@@ -31,7 +31,7 @@ pub fn google_models() -> Vec<Model> {
 
 /// The Google [`ProviderAuth`]: `GEMINI_API_KEY` (Pi `envApiKeyAuth`, env-api-keys.ts:80).
 pub fn google_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key(["GEMINI_API_KEY"]))
+    ProviderAuth::with_api_key(env_key("Gemini API key", ["GEMINI_API_KEY"]))
 }
 
 /// Construct the Google provider over the given credential store + shared api registry. The registry

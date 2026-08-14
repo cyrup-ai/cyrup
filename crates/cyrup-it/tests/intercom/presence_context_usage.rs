@@ -171,14 +171,14 @@ async fn live_pair(
         IntercomExtension::new(
             agent_dir.to_path_buf(),
             PathBuf::from("/tmp/work"),
-            load_config(&intercom_dir),
+            load_config(&intercom_dir).expect("config loads"),
             None,
         )
         .expect("build the extension"),
     );
     ext.set_host_services(sink);
     let ctx = HostCtx::command(ExtMode::Tui, true, agent_dir.to_path_buf());
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "test".to_string() }, &ctx).await;
+    let _ = ext.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
     let state = ext.state().clone();
     assert!(
         within(Duration::from_secs(30), || state.client().is_some_and(|c| c.is_connected())).await,
@@ -437,7 +437,7 @@ async fn a_peers_intercom_list_renders_this_sessions_context_usage() {
             IntercomExtension::new(
                 agent_dir.path().to_path_buf(),
                 PathBuf::from("/tmp/work"),
-                load_config(&intercom_dir),
+                load_config(&intercom_dir).expect("config loads"),
                 None,
             )
             .expect("build the extension"),
@@ -450,10 +450,10 @@ async fn a_peers_intercom_list_renders_this_sessions_context_usage() {
     // Session A — the one whose context usage is under observation.
     let sink = UsageSink::new(144_000, 200_000);
     let a = build(sink.clone());
-    let _ = a.on_event(&HostEvent::SessionStart { reason: "test".to_string() }, &ctx).await;
+    let _ = a.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
     // Session B — the observer, with no context usage of its own.
     let b = build(Arc::new(PlainSink(OBSERVER_SESSION_ID)));
-    let _ = b.on_event(&HostEvent::SessionStart { reason: "test".to_string() }, &ctx).await;
+    let _ = b.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
 
     for (label, ext) in [("A", &a), ("B", &b)] {
         let state = ext.state().clone();

@@ -30,6 +30,29 @@ pub enum DefaultProjectTrust {
     Never,
 }
 
+/// How mermaid fences are rendered (Pi `MermaidRenderingMode`, settings-manager.ts:57 @v0.84.1 —
+/// `"off" | "final" | "streaming"`; the key and the type are both v0.84.1 additions). CFG-040.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MermaidRenderingMode {
+    Off,
+    Final,
+    /// Pi's documented default (`settings-manager.ts:61`, `// default: "streaming"`).
+    #[default]
+    Streaming,
+}
+
+impl MermaidRenderingMode {
+    /// The settings-file spelling, i.e. the value `setMermaidRenderingMode` writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Final => "final",
+            Self::Streaming => "streaming",
+        }
+    }
+}
+
 /// Custom per-level thinking token budgets (Pi `ThinkingBudgetsSettings`, settings-manager.ts:46-51).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -189,15 +212,15 @@ impl Settings {
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
-        let value: Value = serde_json::from_str(text)?;
-        match value {
-            Value::Object(mut obj) => {
-                migrate_settings(&mut obj);
-                Ok(Self { obj })
-            }
-            // A non-object top-level is treated as empty (degraded), never a panic.
-            _ => Ok(Self::default()),
-        }
+        // A non-object top level is an ERROR, not a silent empty document (CFG-030). Deserializing
+        // straight into the map produces serde's own "invalid type" message, which then flows
+        // through `record_load_error` → the scope write latch (`ensure_scope_writable`), so the
+        // next `/config` write is REFUSED instead of rewriting the user's file from `{}`. pi has no
+        // degraded path either: `JSON.parse` + `migrateSettings` (settings-manager.ts:389
+        // @v0.83.0), and `persistScopedSettings` (`:585-593`) spreads whatever it parsed.
+        let mut obj: Map<String, Value> = serde_json::from_str(text)?;
+        migrate_settings(&mut obj);
+        Ok(Self { obj })
     }
 
     pub fn from_map(obj: Map<String, Value>) -> Self {
@@ -286,7 +309,12 @@ impl Settings {
         self.obj
             .get(key)
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -345,7 +373,6 @@ impl Settings {
         self.packages_with_errors().0
     }
 }
-
 
 /// Remove keys that are only honoured globally (§4.8: `defaultProjectTrust`).
 fn strip_global_only(settings: &mut Settings) {
@@ -843,6 +870,22 @@ impl EffectiveSettings {
             .unwrap_or_else(|| "  ".to_string())
     }
 
+    /// `markdown.mermaid` — how mermaid fences are rendered (Pi `getMermaidRenderingMode`,
+    /// settings-manager.ts:1251-1254 @v0.84.1). pi VALIDATES rather than parses: `mode === "off" ||
+    /// mode === "final" ? mode : "streaming"`, so an unknown value and an absent key both fall to
+    /// `Streaming`. CFG-040.
+    pub fn mermaid_rendering_mode(&self) -> MermaidRenderingMode {
+        match self
+            .merged
+            .get_nested_str(&["markdown", "mermaid"])
+            .as_deref()
+        {
+            Some("off") => MermaidRenderingMode::Off,
+            Some("final") => MermaidRenderingMode::Final,
+            _ => MermaidRenderingMode::Streaming,
+        }
+    }
+
     /// `showHardwareCursor` — the setting takes precedence, then the
     /// `CYRUP_HARDWARE_CURSOR`/`PI_HARDWARE_CURSOR` env (true only when exactly `"1"`), else false
     /// (Pi settings-manager.ts:1165-1167).
@@ -1033,21 +1076,12 @@ pub fn parse_http_idle_timeout_ms(value: &Value) -> Option<u64> {
     }
 }
 
-/// Tilde-expand a path string (Pi `normalizePath` expandTilde branch, paths.ts:66-72).
+/// Tilde-expand a path string. Thin alias for the shared [`crate::paths::normalize_path`], which
+/// is the whole of Pi `normalizePath` (paths.ts:57-78 @v0.83.0) — `~` / `~/` / win32 `~\\` AND
+/// `file://` — rather than the tilde branch alone. Kept as a name because two getters below read
+/// better with it.
 fn expand_tilde(input: &str) -> String {
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    let Some(home) = home else {
-        return input.to_string();
-    };
-    if input == "~" {
-        return home.to_string_lossy().into_owned();
-    }
-    if let Some(rest) = input.strip_prefix("~/") {
-        return home.join(rest).to_string_lossy().into_owned();
-    }
-    input.to_string()
+    crate::paths::normalize_path(input)
 }
 
 /// Serialized read-modify-write of one scope's raw JSON text (arch-07 §3.3).
@@ -1470,6 +1504,21 @@ impl SettingsManager {
         Ok(())
     }
 
+    /// `setMermaidRenderingMode` (Pi settings-manager.ts:1257-1262 @v0.84.1): writes the GLOBAL
+    /// scope through `markdown.mermaid`, so a sibling `markdown.codeBlockIndent` survives — pi does
+    /// `this.globalSettings.markdown ??= {}` and assigns one key, never replacing the block.
+    /// CFG-040.
+    pub fn set_mermaid_rendering_mode(
+        &mut self,
+        mode: MermaidRenderingMode,
+    ) -> Result<(), ConfigError> {
+        self.set_nested(
+            SettingsScope::Global,
+            &["markdown", "mermaid"],
+            Value::String(mode.as_str().to_string()),
+        )
+    }
+
     /// `setEditorPaddingX`: clamp to 0..=3 (Pi settings-manager.ts:1179-1183).
     pub fn set_editor_padding_x(&mut self, padding: f64) -> Result<(), ConfigError> {
         let clamped = (padding.floor() as i64).clamp(0, 3);
@@ -1762,8 +1811,14 @@ mod tests {
             mgr.project().skill_paths(),
             vec!["p-skill-a".to_string(), "p-skill-b".to_string()]
         );
-        assert_eq!(mgr.global().prompt_template_paths(), vec!["g-prompt".to_string()]);
-        assert_eq!(mgr.project().prompt_template_paths(), vec!["p-prompt".to_string()]);
+        assert_eq!(
+            mgr.global().prompt_template_paths(),
+            vec!["g-prompt".to_string()]
+        );
+        assert_eq!(
+            mgr.project().prompt_template_paths(),
+            vec!["p-prompt".to_string()]
+        );
         // `themes` set only globally: project layer is empty (NOT inheriting the global value).
         assert_eq!(mgr.global().theme_paths(), vec!["g-theme".to_string()]);
         assert!(mgr.project().theme_paths().is_empty());
@@ -1880,15 +1935,74 @@ mod tests {
         assert_eq!(s.output_pad(), 1);
     }
 
+    /// CFG-030: a top level that is valid JSON but not an object is an ERROR, so the load-error
+    /// latch (`record_load_error` → `ensure_scope_writable`) engages and the next `/config` write is
+    /// REFUSED instead of rewriting the user's file from an empty document.
+    ///
+    /// Red at HEAD: `Settings::parse` matched `Value::Object(..)` and returned `Ok(default)` for
+    /// everything else, so `[1,2,3]` parsed clean, produced no diagnostic, and was silently emptied
+    /// on the next write.
+    #[test]
+    fn a_non_object_top_level_settings_document_is_a_parse_error() {
+        for text in ["[1,2,3]", "\"hello\"", "42", "null", "true"] {
+            assert!(
+                Settings::parse(text).is_err(),
+                "non-object top level {text:?} must not parse as empty settings"
+            );
+        }
+        // An object and an empty document are still fine.
+        assert!(Settings::parse("{}").is_ok());
+        assert!(Settings::parse("   ").is_ok());
+    }
+
+    /// CFG-040: `getMermaidRenderingMode` VALIDATES rather than parses —
+    /// `mode === "off" || mode === "final" ? mode : "streaming"` (settings-manager.ts:1251-1254
+    /// @v0.84.1) — so an unknown value and an absent key both yield `Streaming`.
+    ///
+    /// Red at HEAD: `grep -rni mermaid crates/cyrup-config/src` returned ZERO; there was no getter.
+    #[test]
+    fn mermaid_rendering_mode_defaults_to_streaming_and_accepts_only_pis_three_values() {
+        let g = |json: &str| {
+            EffectiveSettings::from_settings(Settings::parse(json).unwrap())
+                .mermaid_rendering_mode()
+        };
+        assert_eq!(
+            g(r#"{"markdown":{"mermaid":"off"}}"#),
+            MermaidRenderingMode::Off
+        );
+        assert_eq!(
+            g(r#"{"markdown":{"mermaid":"final"}}"#),
+            MermaidRenderingMode::Final
+        );
+        assert_eq!(
+            g(r#"{"markdown":{"mermaid":"streaming"}}"#),
+            MermaidRenderingMode::Streaming
+        );
+        assert_eq!(
+            g(r#"{"markdown":{"mermaid":"nonsense"}}"#),
+            MermaidRenderingMode::Streaming
+        );
+        assert_eq!(g("{}"), MermaidRenderingMode::Streaming);
+        // A sibling markdown key is untouched by the getter.
+        let s =
+            Settings::parse(r#"{"markdown":{"codeBlockIndent":"\t","mermaid":"off"}}"#).unwrap();
+        let eff = EffectiveSettings::from_settings(s);
+        assert_eq!(eff.mermaid_rendering_mode(), MermaidRenderingMode::Off);
+        assert_eq!(eff.code_block_indent(), "\t");
+    }
+
     #[test]
     fn output_pad_only_explicit_zero_disables() {
         // Pi `getOutputPad`: `outputPad === 0 ? 0 : 1` — only an explicit 0 turns padding off.
-        let zero = EffectiveSettings::from_settings(Settings::parse(r#"{ "outputPad": 0 }"#).unwrap());
+        let zero =
+            EffectiveSettings::from_settings(Settings::parse(r#"{ "outputPad": 0 }"#).unwrap());
         assert_eq!(zero.output_pad(), 0);
-        let one = EffectiveSettings::from_settings(Settings::parse(r#"{ "outputPad": 1 }"#).unwrap());
+        let one =
+            EffectiveSettings::from_settings(Settings::parse(r#"{ "outputPad": 1 }"#).unwrap());
         assert_eq!(one.output_pad(), 1);
         // A stray/unexpected value (or unset) resolves to the default 1, not 0.
-        let stray = EffectiveSettings::from_settings(Settings::parse(r#"{ "outputPad": 5 }"#).unwrap());
+        let stray =
+            EffectiveSettings::from_settings(Settings::parse(r#"{ "outputPad": 5 }"#).unwrap());
         assert_eq!(stray.output_pad(), 1);
     }
 
@@ -2125,8 +2239,9 @@ mod tests {
         let unset = EffectiveSettings::from_settings(Settings::default());
         assert_eq!(unset.enabled_models(), None);
 
-        let empty =
-            EffectiveSettings::from_settings(Settings::parse(r#"{ "enabledModels": [] }"#).unwrap());
+        let empty = EffectiveSettings::from_settings(
+            Settings::parse(r#"{ "enabledModels": [] }"#).unwrap(),
+        );
         assert_eq!(empty.enabled_models(), Some(vec![]));
 
         let some = EffectiveSettings::from_settings(
@@ -2348,12 +2463,21 @@ mod tests {
     fn cfg001_set_refuses_to_clobber_a_malformed_file() {
         let (store, mut mgr) = malformed_global();
         // The load recorded the failure (R-00-009) and latched the scope (Pi globalSettingsLoadError).
-        assert!(mgr.load_error(SettingsScope::Global).is_some(), "the scope is latched");
+        assert!(
+            mgr.load_error(SettingsScope::Global).is_some(),
+            "the scope is latched"
+        );
 
-        assert_refused(mgr.set(SettingsScope::Global, "theme", "light"), SettingsScope::Global);
+        assert_refused(
+            mgr.set(SettingsScope::Global, "theme", "light"),
+            SettingsScope::Global,
+        );
 
         let after = store.read(SettingsScope::Global).unwrap().unwrap();
-        assert_eq!(after, MALFORMED, "the malformed file is byte-for-byte unchanged");
+        assert_eq!(
+            after, MALFORMED,
+            "the malformed file is byte-for-byte unchanged"
+        );
     }
 
     #[test]
@@ -2361,12 +2485,19 @@ mod tests {
         let (store, mut mgr) = malformed_global();
 
         assert_refused(
-            mgr.set_nested(SettingsScope::Global, &["terminal", "showImages"], false.into()),
+            mgr.set_nested(
+                SettingsScope::Global,
+                &["terminal", "showImages"],
+                false.into(),
+            ),
             SettingsScope::Global,
         );
 
         let after = store.read(SettingsScope::Global).unwrap().unwrap();
-        assert_eq!(after, MALFORMED, "the malformed file is byte-for-byte unchanged");
+        assert_eq!(
+            after, MALFORMED,
+            "the malformed file is byte-for-byte unchanged"
+        );
     }
 
     #[test]
@@ -2379,7 +2510,10 @@ mod tests {
         );
 
         let after = store.read(SettingsScope::Global).unwrap().unwrap();
-        assert_eq!(after, MALFORMED, "the malformed file is byte-for-byte unchanged");
+        assert_eq!(
+            after, MALFORMED,
+            "the malformed file is byte-for-byte unchanged"
+        );
     }
 
     #[test]
@@ -2396,7 +2530,10 @@ mod tests {
         assert_refused(mgr.set_enable_analytics(true), SettingsScope::Global);
 
         let after = store.read(SettingsScope::Global).unwrap().unwrap();
-        assert_eq!(after, MALFORMED, "six refused writes later, still untouched");
+        assert_eq!(
+            after, MALFORMED,
+            "six refused writes later, still untouched"
+        );
     }
 
     #[test]
@@ -2407,16 +2544,23 @@ mod tests {
         let mut mgr = SettingsManager::load(store.clone(), Settings::new(), true);
 
         assert!(mgr.load_error(SettingsScope::Project).is_some());
-        assert!(mgr.load_error(SettingsScope::Global).is_none(), "a healthy scope is not latched");
+        assert!(
+            mgr.load_error(SettingsScope::Global).is_none(),
+            "a healthy scope is not latched"
+        );
 
         assert_refused(
             mgr.set(SettingsScope::Project, "quietStartup", true),
             SettingsScope::Project,
         );
-        assert_eq!(store.read(SettingsScope::Project).unwrap().unwrap(), MALFORMED);
+        assert_eq!(
+            store.read(SettingsScope::Project).unwrap().unwrap(),
+            MALFORMED
+        );
 
         // The healthy GLOBAL scope still writes — the guard is per-scope, not a global kill switch.
-        mgr.set(SettingsScope::Global, "quietStartup", true).unwrap();
+        mgr.set(SettingsScope::Global, "quietStartup", true)
+            .unwrap();
         assert!(mgr.effective().quiet_startup());
     }
 
@@ -2428,15 +2572,28 @@ mod tests {
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Global, r#"{ "theme": "dark" }"#);
         let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
-        assert!(mgr.load_error(SettingsScope::Global).is_none(), "loaded clean");
+        assert!(
+            mgr.load_error(SettingsScope::Global).is_none(),
+            "loaded clean"
+        );
 
         store.seed(SettingsScope::Global, MALFORMED); // corrupted behind our back
 
-        assert_refused(mgr.set(SettingsScope::Global, "theme", "light"), SettingsScope::Global);
-        assert_eq!(store.read(SettingsScope::Global).unwrap().unwrap(), MALFORMED);
+        assert_refused(
+            mgr.set(SettingsScope::Global, "theme", "light"),
+            SettingsScope::Global,
+        );
+        assert_eq!(
+            store.read(SettingsScope::Global).unwrap().unwrap(),
+            MALFORMED
+        );
 
         assert_refused(
-            mgr.set_nested(SettingsScope::Global, &["terminal", "showImages"], true.into()),
+            mgr.set_nested(
+                SettingsScope::Global,
+                &["terminal", "showImages"],
+                true.into(),
+            ),
             SettingsScope::Global,
         );
         assert_refused(
@@ -2444,7 +2601,10 @@ mod tests {
             SettingsScope::Global,
         );
         assert_refused(mgr.set_enable_analytics(true), SettingsScope::Global);
-        assert_eq!(store.read(SettingsScope::Global).unwrap().unwrap(), MALFORMED);
+        assert_eq!(
+            store.read(SettingsScope::Global).unwrap().unwrap(),
+            MALFORMED
+        );
     }
 
     #[test]
@@ -2453,9 +2613,15 @@ mod tests {
         assert!(mgr.set(SettingsScope::Global, "theme", "light").is_err());
 
         // The user fixes the trailing comma and cyrup reloads: the latch clears and writes resume.
-        store.seed(SettingsScope::Global, r#"{ "defaultModel": "anthropic/claude-opus-4" }"#);
+        store.seed(
+            SettingsScope::Global,
+            r#"{ "defaultModel": "anthropic/claude-opus-4" }"#,
+        );
         mgr.reload().unwrap();
-        assert!(mgr.load_error(SettingsScope::Global).is_none(), "latch cleared on a clean reload");
+        assert!(
+            mgr.load_error(SettingsScope::Global).is_none(),
+            "latch cleared on a clean reload"
+        );
 
         mgr.set(SettingsScope::Global, "theme", "light").unwrap();
         let after = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
@@ -2475,7 +2641,12 @@ mod tests {
         assert!(mgr.load_error(SettingsScope::Global).is_none());
 
         mgr.set(SettingsScope::Global, "theme", "light").unwrap();
-        mgr.set_nested(SettingsScope::Global, &["terminal", "showImages"], true.into()).unwrap();
+        mgr.set_nested(
+            SettingsScope::Global,
+            &["terminal", "showImages"],
+            true.into(),
+        )
+        .unwrap();
         let after = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
         assert_eq!(after.get("theme"), Some(&serde_json::json!("light")));
     }

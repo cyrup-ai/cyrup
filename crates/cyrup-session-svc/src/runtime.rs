@@ -419,7 +419,15 @@ impl AgentSessionRuntime {
             // by hand at the top of `handleReloadCommand` (interactive-mode.ts:5340). cyrup's
             // `reload` REPLACES the session object through this same tail, so firing the hook here
             // gives a cyrup host the identical net effect from one registration.
-            current.dispose_with(reason, self.before_invalidate_hook().await).await;
+            // SEAM-025: pi's `teardownCurrent(reason, targetSessionFile)` — the INCOMING session's
+            // file, so an extension's `session_shutdown` handler can name where the session is
+            // going (`agent-session-runtime.ts:165`, `:171-174`; every replacement caller supplies
+            // it, `:210`/`:239`/`:300`/`:322`/`:341`). Read from the replacement before the
+            // outgoing one is torn down.
+            let target_session_file = next.session_file().await.map(|p| p.display().to_string());
+            current
+                .dispose_with(reason, self.before_invalidate_hook().await, target_session_file)
+                .await;
             // Invalidate prior subscriptions with a terminal `SessionReplaced` (R-11-021).
             current.notify_replaced(new_gen).await;
         }
@@ -460,7 +468,22 @@ impl AgentSessionRuntime {
         options: NewSessionOptions,
     ) -> Result<SwitchResult, SessionServiceError> {
         let current = self.session().await;
-        if self.vetoed(&current, HostEvent::SessionBeforeSwitch { target_id: String::new() }).await {
+        // SEAM-012 — pi's `emitBeforeSwitch("new", targetSessionFile?)`
+        // (`agent-session-runtime.ts:133-148` @v0.83.0, called with `"new"` at `:229`). A fresh
+        // session has no target file yet, so `targetSessionFile` is genuinely `undefined` here; the
+        // load-bearing field is `reason`, which is what lets a gate extension permit a `/new` and
+        // deny a `switchSession`. cyrup used to send an empty-string `target_id` and no reason at
+        // all, so the two cases were indistinguishable.
+        if self
+            .vetoed(
+                &current,
+                HostEvent::SessionBeforeSwitch {
+                    reason: "new".to_string(),
+                    target_session_file: None,
+                },
+            )
+            .await
+        {
             return Ok(SwitchResult { cancelled: true });
         }
         let previous = current.session_file().await.map(|p| p.display().to_string());
@@ -494,8 +517,19 @@ impl AgentSessionRuntime {
     ) -> Result<SwitchResult, SessionServiceError> {
         let path = path.into();
         let current = self.session().await;
-        let target_id = path.display().to_string();
-        if self.vetoed(&current, HostEvent::SessionBeforeSwitch { target_id }).await {
+        // SEAM-012 — `emitBeforeSwitch("resume", sessionPath)` (`agent-session-runtime.ts:133-148`,
+        // called with `"resume"` and the target path at `:199`).
+        let target_session_file = Some(path.display().to_string());
+        if self
+            .vetoed(
+                &current,
+                HostEvent::SessionBeforeSwitch {
+                    reason: "resume".to_string(),
+                    target_session_file,
+                },
+            )
+            .await
+        {
             return Ok(SwitchResult { cancelled: true });
         }
         // Pre-flight: resolve the effective cwd (override wins, else derived from the file) and
@@ -523,8 +557,20 @@ impl AgentSessionRuntime {
         position: ForkPosition,
     ) -> Result<RuntimeForkResult, SessionServiceError> {
         let current = self.session().await;
-        let veto =
-            self.vetoed(&current, HostEvent::SessionBeforeFork { entry_id: entry.to_string() }).await;
+        // SEAM-012 — pi spreads the whole options bag into the event:
+        // `runner.emit({ type: "session_before_fork", entryId, ...options })`
+        // (`agent-session-runtime.ts:150-161`), and `options` is `{ position: "before" | "at" }`
+        // (`:151`). cyrup passed only the entry id, so a policy that permits a fork AT an entry but
+        // denies one BEFORE it was unwritable — the exact distinction the field exists for.
+        let veto = self
+            .vetoed(
+                &current,
+                HostEvent::SessionBeforeFork {
+                    entry_id: entry.to_string(),
+                    position: position.as_str().to_string(),
+                },
+            )
+            .await;
         if veto {
             return Ok(RuntimeForkResult { cancelled: true, selected_text: None });
         }
@@ -548,6 +594,15 @@ impl AgentSessionRuntime {
         // brand-new empty session, on either path (Pi `newSession(...)`, :291/:335).
         let next = match (&target_leaf, session_file) {
             (Some(leaf), Some(file)) => {
+                // SEAM-056 — pi's actionable guard, verbatim and in pi's PLACE: inside the
+                // persisted has-target-leaf branch, immediately above `SessionManager.open`
+                // (`agent-session-runtime.ts:312-316` @v0.83.0). cyrup defers the first file write
+                // until an assistant message exists, so `/fork` or `/clone` on a brand-new session
+                // used to surface whatever `SessionManager::open` returned — an IO error naming an
+                // internal path, with no remedy — where pi tells the user exactly what to do.
+                if !file.exists() {
+                    return Err(SessionServiceError::SessionNotSaved);
+                }
                 let mut mgr = SessionManager::open(&file)?;
                 // Reuse the current session file's OWN directory literally (Pi
                 // `createBranchedSession`'s `this.sessionDir` reuse, session-manager.ts:1343)
@@ -579,8 +634,19 @@ impl AgentSessionRuntime {
                 let mgr = current.take_manager().await?;
                 self.factory.build_from_manager(mgr).await?.into_shared()
             }
-            // Fork before the first message: a brand-new session (both persistence modes).
-            (None, _) => self.factory.build(SessionTarget::New, None).await?.into_shared(),
+            // Fork before the first message: a brand-new session (both persistence modes) — and it
+            // records the outgoing file as its PARENT, because both of pi's no-leaf branches do:
+            // `sessionManager.newSession({ parentSession: currentSessionFile })` at
+            // `agent-session-runtime.ts:296-299` (persisted) and `:336-337` (in-memory), each
+            // BEFORE `teardownCurrent`. Without it the session tree loses the edge back to the
+            // session that was forked, silently — the fork still reports `cancelled:false`.
+            // SEAM-049. `previous` is the same value pi passes, already bound above for the
+            // `session_start{reason:"fork"}` event.
+            (None, _) => self
+                .factory
+                .build_with_parent(SessionTarget::New, None, previous.clone())
+                .await?
+                .into_shared(),
         };
         drop(current);
         self.install(next, "fork", previous).await;
@@ -629,8 +695,21 @@ impl AgentSessionRuntime {
             .ok_or_else(|| SessionServiceError::ImportFileNotFound(resolved.display().to_string()))?;
         let destination = session_dir.join(file_name);
 
-        let target_id = destination.display().to_string();
-        if self.vetoed(&current, HostEvent::SessionBeforeSwitch { target_id }).await {
+        // SEAM-012 — an import lands as a RESUME of the copied file (pi's `importFromJsonl` ends in
+        // the same replace-and-announce protocol as `switchSession`,
+        // `agent-session-runtime.ts:353-388`), so the reason is `"resume"` and the target is the
+        // destination path.
+        let target_session_file = Some(destination.display().to_string());
+        if self
+            .vetoed(
+                &current,
+                HostEvent::SessionBeforeSwitch {
+                    reason: "resume".to_string(),
+                    target_session_file,
+                },
+            )
+            .await
+        {
             return Ok(SwitchResult { cancelled: true });
         }
         let previous = current_file.map(|p| p.display().to_string());
@@ -694,7 +773,10 @@ impl AgentSessionRuntime {
     /// — so the registered hook fires on quit exactly as it does on a replacement.
     pub async fn dispose(&self) {
         let hook = self.before_invalidate_hook().await;
-        self.session().await.dispose_with("quit", hook).await;
+        // A plain quit is not a replacement, so pi passes no `targetSessionFile`
+        // (`agent-session-runtime.ts:398-405` calls `emitSessionShutdownEvent` with `{type, reason:
+        // "quit"}` and nothing else).
+        self.session().await.dispose_with("quit", hook, None).await;
     }
 
     /// The factory's base cwd.

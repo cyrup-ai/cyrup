@@ -10,7 +10,7 @@
 
 use crate::HeaderMap;
 use crate::api::compat::{
-    CacheControlFormat, MaxTokensField, ResolvedCompat, ThinkingFormat,
+    CacheControlFormat, MaxTokensField, ResolvedCompat, SessionAffinityFormat, ThinkingFormat,
     clamp_openai_prompt_cache_key, get_compat, level_map_lookup, mapped_effort_or, off_is_not_null,
     off_value_or, sanitize_surrogates, thinking_level_key,
 };
@@ -231,15 +231,23 @@ pub(crate) fn build_headers(
         model.provider.as_str(),
         &ctx.messages,
     );
-    // Session-affinity headers (Pi createClient openai-completions.ts:515-519). The flag is
-    // currently `false` for every provider in `detect_compat`, but the emission is ported for 1:1
-    // parity so an explicit `model.compat.sendSessionAffinityHeaders` override takes effect.
+    // Session-affinity headers (Pi `createClient`, openai-completions.ts:647-656 @v0.83.0). The
+    // enabling flag is `false` for every provider in `detect_compat`, but the emission is ported
+    // for 1:1 parity so an explicit `model.compat.sendSessionAffinityHeaders` override takes
+    // effect. PROV-024: the header SET is chosen by `sessionAffinityFormat`, not fixed — an
+    // OpenRouter model reads `x-session-id` and none of the other three.
     if compat.send_session_affinity_headers
         && let Some(sid) = cache_session_id
     {
-        headers.insert("session_id".to_string(), Some(sid.to_string()));
-        headers.insert("x-client-request-id".to_string(), Some(sid.to_string()));
-        headers.insert("x-session-affinity".to_string(), Some(sid.to_string()));
+        if compat.session_affinity_format == SessionAffinityFormat::Openrouter {
+            headers.insert("x-session-id".to_string(), Some(sid.to_string()));
+        } else {
+            if compat.session_affinity_format == SessionAffinityFormat::Openai {
+                headers.insert("session_id".to_string(), Some(sid.to_string()));
+            }
+            headers.insert("x-client-request-id".to_string(), Some(sid.to_string()));
+            headers.insert("x-session-affinity".to_string(), Some(sid.to_string()));
+        }
     }
     if let Some(overlay) = &opts.headers {
         for (name, value) in overlay {
@@ -3103,6 +3111,10 @@ mod tests {
             headers.get("x-session-affinity"),
             Some(&Some("sess-7".to_string()))
         );
+        assert!(
+            headers.get("x-session-id").is_none(),
+            "the openai form never sends OpenRouter's header"
+        );
 
         // Flag off (default for every provider) => not emitted even with a session id present.
         let compat_off = get_compat(&model());
@@ -3146,5 +3158,58 @@ mod tests {
             }
             other => panic!("expected Error terminal, got {other:?}"),
         }
+    }
+
+    /// PROV-024. `sessionAffinityFormat` selects the header SET
+    /// (openai-completions.ts:647-656 @v0.83.0); the detector is `isOpenRouter ? "openrouter" :
+    /// "openai"` (`:1473`) and the catalog override resolves at `:1515`. Red before the fix:
+    /// cyrup emitted the fixed OpenAI triple with no provider branch, so an OpenRouter completions
+    /// model got three headers it does not read and never got the one it does.
+    #[test]
+    fn session_affinity_format_selects_the_completions_header_set() {
+        let headers_for = |m: &Model| {
+            let compat = get_compat(m);
+            build_headers(
+                m,
+                &Context::default(),
+                &auth_with_key(),
+                &StreamOptions::default(),
+                &compat,
+                Some("sess-7"),
+            )
+        };
+
+        // OpenRouter, detected from the provider id: `x-session-id` ONLY.
+        let mut router = model();
+        router.provider = "openrouter".into();
+        router.compat = Some(crate::api::compat::OpenAiCompletionsCompat {
+            send_session_affinity_headers: Some(true),
+            ..Default::default()
+        });
+        let h = headers_for(&router);
+        assert_eq!(h.get("x-session-id"), Some(&Some("sess-7".to_string())));
+        assert!(h.get("session_id").is_none());
+        assert!(h.get("x-client-request-id").is_none());
+        assert!(h.get("x-session-affinity").is_none());
+
+        // "openai-nosession": the pair WITHOUT `session_id` — pi's documented migration target for
+        // the `sendSessionIdHeader: false` flag it deleted (packages/ai/CHANGELOG.md:168).
+        let mut nos = model();
+        nos.compat = Some(crate::api::compat::OpenAiCompletionsCompat {
+            send_session_affinity_headers: Some(true),
+            session_affinity_format: Some(crate::api::compat::SessionAffinityFormat::OpenaiNosession),
+            ..Default::default()
+        });
+        let h = headers_for(&nos);
+        assert!(h.get("session_id").is_none());
+        assert_eq!(
+            h.get("x-client-request-id"),
+            Some(&Some("sess-7".to_string()))
+        );
+        assert_eq!(
+            h.get("x-session-affinity"),
+            Some(&Some("sess-7".to_string()))
+        );
+        assert!(h.get("x-session-id").is_none());
     }
 }

@@ -92,7 +92,13 @@ async fn build_session() -> (Arc<AgentSession>, Arc<cyrup_ext::host::LiveExtensi
         SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, cfg).build().await.unwrap(),
     );
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
     (session, ext)

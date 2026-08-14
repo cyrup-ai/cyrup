@@ -44,6 +44,16 @@ pub struct ModelScopeConfig {
     /// When `Some(true)`, an out-of-scope model is rejected/warned per [`ModelSource`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enforce: Option<bool>,
+    /// SUBA-050 / pi `model-scope.ts:20` @v0.47.1 — *"Reject inherited and fallback models outside
+    /// the allowlist instead of warning."* Landed upstream in `94b0cb1` ("feat: enforce strict
+    /// subagent model scope", closes #995), released v0.47.0; `git show v0.43.0:.../model-scope.ts
+    /// | grep strict` is empty, so this is drift rather than a stale port.
+    ///
+    /// Without it an operator's allowlist is advisory for exactly the sources that are hardest to
+    /// audit: an agent whose frontmatter names an out-of-scope model, or whose fallback ladder walks
+    /// onto one, warns and then runs on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
     /// Glob-style allow patterns (only `*` is special), matched against the full `provider/id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow: Option<Vec<String>>,
@@ -172,8 +182,14 @@ pub fn check_model_scope(
     }
 
     let base_model = split_known_thinking_suffix(model).0.to_string();
+    // SUBA-050 / pi `model-scope.ts:73` @v0.47.1:
+    // `source === "explicit" || scope.strict === true ? "error" : "warn"`. The `=== true` is
+    // load-bearing on both sides — an absent `strict` and an explicit `strict: false` behave
+    // identically, and only the literal boolean `true` promotes an inherited/fallback violation to
+    // a hard error.
     let severity = match source {
         ModelSource::Explicit => ModelScopeSeverity::Error,
+        ModelSource::Inherited if scope.strict == Some(true) => ModelScopeSeverity::Error,
         ModelSource::Inherited => ModelScopeSeverity::Warn,
     };
     let message = format!(
@@ -242,6 +258,16 @@ pub fn parse_model_scope_config(
         saw_field = true;
     }
 
+    // SUBA-050 / pi `parseModelScopeConfig` (`model-scope.ts:108-113` @v0.47.1) validates `strict`
+    // between `enforce` and `allow`, with the same typed-error shape as `enforce`.
+    if let Some(raw) = input.get("strict") {
+        let Some(flag) = raw.as_bool() else {
+            return Err("invalid 'modelScope.strict'; expected a boolean".to_string());
+        };
+        config.strict = Some(flag);
+        saw_field = true;
+    }
+
     if let Some(raw) = input.get("allow") {
         let invalid = "invalid 'modelScope.allow'; expected an array of strings".to_string();
         let Some(entries) = raw.as_array() else {
@@ -285,6 +311,7 @@ mod tests {
     fn scope(patterns: &[&str]) -> ModelScopeConfig {
         ModelScopeConfig {
             enforce: Some(true),
+            strict: None,
             allow: Some(patterns.iter().map(|p| (*p).to_string()).collect()),
         }
     }
@@ -332,11 +359,90 @@ mod tests {
         assert_eq!(inherited.message, explicit.message);
     }
 
+    /// SUBA-050 — pi `model-scope.ts:73` @v0.47.1:
+    /// `source === "explicit" || scope.strict === true ? "error" : "warn"`.
+    ///
+    /// THE USER ACTION: an operator sets a model allowlist to keep subagents off expensive or
+    /// non-compliant models and wants it BINDING. Without `strict` the policy is advisory for
+    /// exactly the sources that are hardest to audit — an agent whose frontmatter names an
+    /// out-of-scope model, or a fallback ladder that walks onto one, warned and then ran on it.
+    ///
+    /// Red before the fix in the most literal way available: `ModelScopeConfig` had no `strict`
+    /// field at all, so this test would not compile; once the field existed but the severity match
+    /// stayed the unconditional `Inherited => Warn`, the first assertion would fail.
+    #[test]
+    fn strict_promotes_an_inherited_out_of_scope_model_from_a_warning_to_an_error() {
+        let mut strict = scope(&["anthropic/*"]);
+        strict.strict = Some(true);
+
+        let inherited = check_model_scope(Some("openai/gpt-5"), Some(&strict), ModelSource::Inherited)
+            .expect("out-of-scope inherited model must still violate");
+        assert_eq!(
+            inherited.severity,
+            ModelScopeSeverity::Error,
+            "strict:true must make an inherited violation a hard error"
+        );
+        // The message is unchanged — upstream only moves the severity.
+        assert_eq!(
+            inherited.message,
+            "Model 'openai/gpt-5' is outside the configured subagent model scope. Allowed \
+             patterns: anthropic/*."
+        );
+
+        // Explicit stays an error (it always was), so the strict arm cannot mask a regression there.
+        let explicit = check_model_scope(Some("openai/gpt-5"), Some(&strict), ModelSource::Explicit)
+            .expect("violates");
+        assert_eq!(explicit.severity, ModelScopeSeverity::Error);
+
+        // pi's `scope.strict === true` is strict equality: an EXPLICIT `false` behaves exactly like
+        // an absent key, so neither may promote.
+        let mut lax = scope(&["anthropic/*"]);
+        lax.strict = Some(false);
+        assert_eq!(
+            check_model_scope(Some("openai/gpt-5"), Some(&lax), ModelSource::Inherited)
+                .expect("violates")
+                .severity,
+            ModelScopeSeverity::Warn
+        );
+
+        // And `strict` alone never ARMS enforcement — pi's `!scope?.enforce` short-circuit runs
+        // first (`model-scope.ts:67`).
+        let mut strict_but_off = strict.clone();
+        strict_but_off.enforce = Some(false);
+        assert!(
+            check_model_scope(Some("openai/gpt-5"), Some(&strict_but_off), ModelSource::Inherited)
+                .is_none()
+        );
+    }
+
+    /// SUBA-050's settings half — pi `parseModelScopeConfig` (`model-scope.ts:108-113` @v0.47.1)
+    /// validates `strict` with the same typed error `enforce` gets. Before the fix the key was
+    /// silently dropped by serde, which is the exact "accepted, unvalidated and inert" shape the
+    /// item names.
+    #[test]
+    fn a_strict_key_round_trips_and_a_non_boolean_strict_is_rejected() {
+        let parsed = parse_model_scope_config(Some(&serde_json::json!({
+            "enforce": true,
+            "strict": true,
+            "allow": ["anthropic/*"]
+        })))
+        .expect("valid config parses");
+        assert_eq!(parsed.as_ref().and_then(|c| c.strict), Some(true));
+
+        let err = parse_model_scope_config(Some(&serde_json::json!({
+            "enforce": true,
+            "strict": "yes",
+            "allow": ["anthropic/*"]
+        })))
+        .expect_err("a non-boolean strict must abort discovery, not be dropped");
+        assert_eq!(err, "invalid 'modelScope.strict'; expected a boolean");
+    }
+
     #[test]
     fn enforcement_is_a_no_op_without_enforce_or_without_patterns() {
-        let off = ModelScopeConfig { enforce: Some(false), allow: Some(vec!["anthropic/*".into()]) };
+        let off = ModelScopeConfig { enforce: Some(false), strict: None, allow: Some(vec!["anthropic/*".into()]) };
         assert!(check_model_scope(Some("openai/gpt-5"), Some(&off), ModelSource::Explicit).is_none());
-        let empty = ModelScopeConfig { enforce: Some(true), allow: Some(Vec::new()) };
+        let empty = ModelScopeConfig { enforce: Some(true), strict: None, allow: Some(Vec::new()) };
         assert!(check_model_scope(Some("openai/gpt-5"), Some(&empty), ModelSource::Explicit).is_none());
         assert!(check_model_scope(Some("openai/gpt-5"), None, ModelSource::Explicit).is_none());
         assert!(check_model_scope(None, Some(&scope(&["anthropic/*"])), ModelSource::Explicit).is_none());
@@ -399,6 +505,7 @@ mod tests {
             parsed,
             Some(ModelScopeConfig {
                 enforce: Some(true),
+                strict: None,
                 allow: Some(vec!["anthropic/*".to_string(), "openai/gpt-5".to_string()]),
             })
         );

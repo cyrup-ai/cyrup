@@ -49,7 +49,7 @@ struct Recorder {
 
 #[async_trait::async_trait]
 impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         self.events.lock().unwrap().push(event.clone());
     }
 }
@@ -256,29 +256,143 @@ async fn a_02_1_no_tool_ordering() {
 
 // ----------------------------------------------------------------------------
 // A-02-2 — parallel: completion-order ends vs source-order results.
+//
+// AGENT-019 / DRIFT-039 — this test used to assert `elapsed < 115ms` over a span that includes
+// faux-provider streaming and every subscriber await, and to derive the expected completion order
+// from an 80ms-vs-50ms sleep race. Both are scheduler assertions: under load or a debug-profile
+// runner they fail while the code is correct, and the reflex remedy (raise the constant) makes them
+// prove nothing. The property actually under test is `await Promise.all(...)`
+// (`packages/agent/src/agent-loop.ts:540-542` @v0.83.0) — a STRUCTURAL claim that the batch is
+// concurrent — so it is now pinned by overlapping intervals plus a test-driven rendezvous, the dual
+// of `a_02_3`'s non-overlap check. No sleep, no wall-clock bound, no scheduler dependency.
 // ----------------------------------------------------------------------------
+
+/// A tool that (1) records its own `(name, start, end)` interval, (2) rendezvouses with its sibling
+/// on a shared [`tokio::sync::Barrier`] so BOTH bodies are provably in flight at the same instant,
+/// and (3) optionally waits for a release signal before returning, which makes completion order a
+/// fact rather than a race.
+struct OverlapTool {
+    name: String,
+    params: Value,
+    mode: ExecMode,
+    spans: Arc<Mutex<Vec<(String, Instant, Instant)>>>,
+    barrier: Arc<tokio::sync::Barrier>,
+    /// `Some` for the tool that must finish LAST: it parks here until the test releases it.
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl OverlapTool {
+    fn new(
+        name: &str,
+        mode: ExecMode,
+        spans: Arc<Mutex<Vec<(String, Instant, Instant)>>>,
+        barrier: Arc<tokio::sync::Barrier>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            params: obj_schema(),
+            mode,
+            spans,
+            barrier,
+            release: Mutex::new(release),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for OverlapTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    fn execution_mode(&self) -> ExecMode {
+        self.mode
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        let start = Instant::now();
+        // Neither body can pass this point until the other has entered its own body, so the two
+        // intervals provably overlap. If the loop serialized the batch this would deadlock, which
+        // the test's outer timeout turns into a failure.
+        self.barrier.wait().await;
+        let rx = self.release.lock().unwrap().take();
+        if let Some(rx) = rx {
+            let _ = rx.await;
+        }
+        let end = Instant::now();
+        self.spans.lock().unwrap().push((self.name.clone(), start, end));
+        Ok(ToolResult {
+            content: vec![Content::text(format!("done:{}", self.name))],
+            details: None,
+            terminate: false,
+            ..Default::default()
+        })
+    }
+}
+
+/// Releases the slow tool the moment the FAST tool's `tool_execution_end` has been emitted, so
+/// "fast completed before slow" is an observed ordering rather than a sleep race.
+struct ReleaseOnEnd {
+    after: String,
+    tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+#[async_trait::async_trait]
+impl EventSubscriber for ReleaseOnEnd {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
+        if let AgentEvent::ToolExecutionEnd { tool_name, .. } = event
+            && *tool_name == self.after
+            && let Some(tx) = self.tx.lock().unwrap().take()
+        {
+            let _ = tx.send(());
+        }
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_02_2_parallel_completion_vs_source_order() {
     let spans = Arc::new(Mutex::new(Vec::new()));
-    let slow = SpanTool::new("slow", 80, ExecMode::Parallel, spans.clone());
-    let fast = SpanTool::new("fast", 50, ExecMode::Parallel, spans.clone());
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    // Source order is `slow`, `fast`; `slow` parks until `fast`'s end event has been emitted.
+    let slow = OverlapTool::new(
+        "slow",
+        ExecMode::Parallel,
+        spans.clone(),
+        barrier.clone(),
+        Some(release_rx),
+    );
+    let fast = OverlapTool::new("fast", ExecMode::Parallel, spans.clone(), barrier, None);
 
     let (_faux, sf) = faux_stream_fn(vec![faux_assistant_message(
         vec![faux_tool_call("slow", json!({})), faux_tool_call("fast", json!({}))],
         StopReason::ToolUse,
     )]);
-    let agent = Agent::builder(model_ref(), sf)
-        .tools(vec![slow, fast])
-        .build();
+    let agent = Agent::builder(model_ref(), sf).tools(vec![slow, fast]).build();
     let recorder = Arc::new(Recorder::default());
+    agent.subscribe(Arc::new(ReleaseOnEnd {
+        after: "fast".to_string(),
+        tx: Mutex::new(Some(release_tx)),
+    }));
     agent.subscribe(recorder.clone());
 
-    let started = Instant::now();
-    let handle = agent.prompt("go").await.unwrap();
-    handle.finished().await;
-    agent.wait_for_idle().await;
-    let elapsed = started.elapsed();
+    // A generous ceiling: this is a HANG detector (a serialized batch deadlocks on the barrier),
+    // not a latency assertion.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let handle = agent.prompt("go").await.unwrap();
+        handle.finished().await;
+        agent.wait_for_idle().await;
+    })
+    .await
+    .expect("a concurrent batch settles; a serialized one deadlocks on the rendezvous barrier");
 
     let events = recorder.snapshot();
 
@@ -323,8 +437,13 @@ async fn a_02_2_parallel_completion_vs_source_order() {
         .unwrap();
     assert_eq!(turn_end_order, vec!["slow", "fast"], "turn_end.toolResults in source order");
 
-    // True concurrency: wall-clock ~= max(80,50)=80ms, well under the sum (130ms).
-    assert!(elapsed < Duration::from_millis(115), "parallel ran concurrently, took {elapsed:?}");
+    // TRUE concurrency, asserted structurally: sorted by start, the first interval must still be
+    // open when the second begins. This is the dual of `a_02_3`'s `s[0].2 <= s[1].1` non-overlap
+    // check and holds regardless of machine speed or scheduler pressure.
+    let mut s = spans.lock().unwrap().clone();
+    s.sort_by_key(|(_, start, _)| *start);
+    assert_eq!(s.len(), 2, "both tool bodies ran: {s:?}");
+    assert!(s[0].2 > s[1].1, "parallel batch must OVERLAP: {s:?}");
 }
 
 // ----------------------------------------------------------------------------
@@ -367,7 +486,7 @@ impl Hooks for BlockHook {
         _ctx: BeforeToolCall<'_>,
         _cancel: CancelToken,
     ) -> Result<BeforeOutcome, HookError> {
-        Ok(BeforeOutcome::Block { reason: Some("nope".into()) })
+        Ok(BeforeOutcome::Block { reason: Some("nope".into()), terminate: false })
     }
 }
 
@@ -532,7 +651,7 @@ struct SteerOnToolStart {
 
 #[async_trait::async_trait]
 impl EventSubscriber for SteerOnToolStart {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         if let AgentEvent::ToolExecutionStart { .. } = event
             && let Some(a) = self.agent.upgrade()
                 && let Some(m) = self.msg.lock().unwrap().take() {
@@ -635,7 +754,7 @@ struct SlowEnd {
 
 #[async_trait::async_trait]
 impl EventSubscriber for SlowEnd {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         if let AgentEvent::AgentEnd { .. } = event {
             tokio::time::sleep(Duration::from_millis(40)).await;
             self.done.store(true, Ordering::SeqCst);
@@ -808,15 +927,22 @@ async fn a_02_10_state_copy_on_assign() {
 }
 
 // ----------------------------------------------------------------------------
-// R-02-048 — a panicking subscriber is contained: the run still completes/emits agent_end,
-// wait_for_idle settles (no deadlock), and a subsequent prompt still runs.
+// AGENT-033 / R-02-048 — a FAILING subscriber fails the RUN, and settlement still cannot deadlock.
+//
+// pi's `processEvents` awaits each listener bare inside `runWithLifecycle`'s try
+// (`packages/agent/src/agent.ts:573-575` and `:487-490` @v0.83.0), so a throwing listener stops the
+// listener loop, unwinds, and produces the full `handleRunFailure` quartet with the listener's own
+// message as `errorMessage` (`:496-512`). cyrup used to `catch_unwind` and DISCARD, so a broken
+// observer was invisible. The half of R-02-048 that is load-bearing — `wait_for_idle()` can NEVER
+// deadlock — is carried by `SettlementGuard`, not by swallowing the panic, and is still asserted
+// here.
 // ----------------------------------------------------------------------------
 
 struct PanicSubscriber;
 
 #[async_trait::async_trait]
 impl EventSubscriber for PanicSubscriber {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         // Panic mid-run (on streaming updates) AND on the settlement-gating agent_end. If either
         // panic escaped emit(), the run task would unwind and settlement would never fire.
         match event {
@@ -829,21 +955,21 @@ impl EventSubscriber for PanicSubscriber {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn r_02_048_panicking_subscriber_is_contained_and_never_deadlocks() {
+async fn agent033_panicking_subscriber_fails_the_run_and_never_deadlocks() {
     let (_faux, sf) = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_text("first")], StopReason::Stop),
         faux_assistant_message(vec![faux_text("second")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf).build();
 
-    // The panicker is registered FIRST. If its panic were not contained, emit() would unwind the run
-    // task before the recorder (registered SECOND) ever observed agent_end, and the settlement signal
-    // would never flip -> wait_for_idle would hang forever.
-    agent.subscribe(Arc::new(PanicSubscriber));
+    // The recorder is registered FIRST so it still observes the events the panicker aborts on: pi
+    // stops iterating the listener set at the throw, so a listener registered AFTER the thrower
+    // never sees that event — same here.
     let recorder = Arc::new(Recorder::default());
     agent.subscribe(recorder.clone());
+    agent.subscribe(Arc::new(PanicSubscriber));
 
-    // (b) wait_for_idle must return rather than hang: the timeout turns a hang into a failure.
+    // (a) settlement still fires; the timeout turns a hang into a failure.
     let settled = tokio::time::timeout(Duration::from_secs(5), async {
         agent.prompt("hi").await.unwrap();
         agent.wait_for_idle().await;
@@ -851,14 +977,30 @@ async fn r_02_048_panicking_subscriber_is_contained_and_never_deadlocks() {
     .await;
     assert!(settled.is_ok(), "run must settle; wait_for_idle deadlocked");
 
-    // (a) the run still completed and emitted agent_end despite the contained panics.
-    let n = names(&recorder.snapshot());
+    // (b) the run closed through `handleRunFailure`: a synthetic errored assistant carrying the
+    // panic's own text, then the four-event quartet.
+    let events = recorder.snapshot();
+    let failure = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::TurnEnd { message: AgentMessage::Assistant(a), .. } => Some(a.clone()),
+            _ => None,
+        })
+        .expect("a turn_end carrying the failure assistant");
+    assert_eq!(failure.stop_reason, StopReason::Error, "not cancelled ⇒ `error`, not `aborted`");
+    assert_eq!(
+        failure.error_message.as_deref(),
+        Some("subscriber boom"),
+        "pi reports the thrown listener's own message as `errorMessage` (agent.ts:505)"
+    );
+    let n = names(&events);
     assert!(
-        matches!(n.last().map(String::as_str), Some("agent_end")),
-        "run completes and emits agent_end despite a panicking subscriber: {n:?}"
+        n.iter().any(|e| e == "turn_end"),
+        "the closing quartet reached the surviving listener: {n:?}"
     );
 
-    // (c) a subsequent prompt on the same agent still runs to completion.
+    // (c) the agent is reusable: the failure is a RUN failure, not an agent failure.
     let new = tokio::time::timeout(Duration::from_secs(5), async {
         let h = agent.prompt("again").await.unwrap();
         let new = h.finished().await;

@@ -19,6 +19,7 @@ pub mod compaction;
 pub mod context;
 pub mod entry;
 pub mod error;
+pub mod git_paths;
 pub mod header;
 pub mod ids;
 pub mod layout;
@@ -39,6 +40,7 @@ pub use agent_message::{
 pub use context::SessionContext;
 pub use entry::{Entry, EntryBase, KnownEntry};
 pub use error::SessionError;
+pub use git_paths::{canonicalize_path, find_git_paths, resolve_path, GitPaths};
 pub use header::{SessionHeader, CURRENT_VERSION};
 pub use layout::{encode_cwd, SessionLayout, SessionsRoot};
 pub use listing::{
@@ -51,6 +53,7 @@ pub use prompt::{
     ContextDiagnostic, ContextError, ContextFile, ContextFileLoader, ContextScope,
     ContextSnapshot, ContextStore, DocsPointers, PromptContributor, PromptInputs, ResolvedOverride,
     SkillPointer, SystemPromptBuilder, ToolPromptContribution, TrustQuery,
+    DEFAULT_SELECTED_TOOLS,
 };
 pub use store::{DiskStore, MemStore, SessionStore};
 

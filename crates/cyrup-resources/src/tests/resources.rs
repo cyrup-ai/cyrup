@@ -16,7 +16,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cyrup_core::CancelToken;
 use crate::package::lock;
 use crate::{
     DiagnosticType, DiscoveryConfig, InstallScope, InstalledPackage, InstalledPackages,
@@ -26,6 +25,7 @@ use crate::{
     has_unsafe_git_install_part, parse_command_args, parse_git_url, resolve_manifest,
     substitute_args, validate_name,
 };
+use cyrup_core::CancelToken;
 
 // ---------------------------------------------------------------------------
 // fixture helpers
@@ -293,12 +293,8 @@ license: MIT\n\
     let p = tmp.path().join("skills/pdf/SKILL.md");
     write(&p, md);
 
-    let skill = Skill::load(
-        &p,
-        ResourceScope::Cli,
-        crate::ResourceOrigin::Builtin,
-    )
-    .expect("standard SKILL.md loads unchanged");
+    let skill = Skill::load(&p, ResourceScope::Cli, crate::ResourceOrigin::Builtin)
+        .expect("standard SKILL.md loads unchanged");
     assert_eq!(skill.name, "pdf-processing");
     assert_eq!(skill.front.name.as_deref(), Some("pdf-processing"));
     assert_eq!(
@@ -397,6 +393,37 @@ fn prompt_substitute_args_and_quote_parsing() {
     assert_eq!(substitute_args("${9:-fallback}", &args), "fallback");
     // Unrecognized `${...}` is left literal.
     assert_eq!(substitute_args("${foo}", &args), "${foo}");
+}
+
+/// CFG-016 + CFG-017: pi's `:-` alternative is `(\d+|ARGUMENTS|@):-([^}]*)`
+/// (prompt-templates.ts:74 @v0.83.0), so the target may be `@` or `ARGUMENTS`, and index `0` is
+/// `args[-1]` — `undefined`, therefore falsy, therefore the default (`:78-79`).
+///
+/// Red at HEAD before the fix: `${0:-fallback}` aborted the whole form on `checked_sub(1)?` and was
+/// emitted verbatim as `${0:-fallback}`; `${@:-…}` / `${ARGUMENTS:-…}` failed the all-digits guard
+/// and were likewise emitted verbatim.
+#[test]
+fn prompt_default_forms_accept_zero_and_the_all_args_targets() {
+    let args = parse_command_args("a b");
+    let none: Vec<String> = Vec::new();
+
+    // CFG-016 — `${0:-…}` always takes the default; there is no positional 0.
+    assert_eq!(substitute_args("${0:-fallback}", &none), "fallback");
+    assert_eq!(substitute_args("${0:-fallback}", &args), "fallback");
+
+    // CFG-017 — `@` / `ARGUMENTS` resolve to allArgs, and fall back only when it is empty.
+    assert_eq!(substitute_args("${@:-fallback}", &args), "a b");
+    assert_eq!(substitute_args("${ARGUMENTS:-fallback}", &args), "a b");
+    assert_eq!(substitute_args("${@:-fallback}", &none), "fallback");
+    assert_eq!(substitute_args("${ARGUMENTS:-fallback}", &none), "fallback");
+
+    // An empty default is legal (`[^}]*`), and an unknown target is still not a placeholder.
+    assert_eq!(substitute_args("${9:-}", &args), "");
+    assert_eq!(substitute_args("${nope:-x}", &args), "${nope:-x}");
+
+    // The slice family is unaffected (re-pinned: `${@:1:-2}` is not a placeholder).
+    assert_eq!(substitute_args("${@:1}", &args), "a b");
+    assert_eq!(substitute_args("${@:1:-2}", &args), "${@:1:-2}");
 }
 
 #[tokio::test]
@@ -499,12 +526,7 @@ async fn a09_3_theme_hot_reload_and_runtime_switch() {
         &full_theme_json("mine", &[("bg", "#000000")], &[("background", "$bg")]),
     );
 
-    let theme = Theme::load(
-        &active,
-        ResourceScope::Cli,
-        crate::ResourceOrigin::Builtin,
-    )
-    .unwrap();
+    let theme = Theme::load(&active, ResourceScope::Cli, crate::ResourceOrigin::Builtin).unwrap();
     let watcher = ThemeWatcher::spawn(
         std::sync::Arc::new(theme.data.clone()),
         active.clone(),
@@ -568,10 +590,7 @@ fn theme_resolve_var_indirection_and_bad_hex() {
             b: 0x33
         })
     );
-    assert_eq!(
-        resolved.roles.get("bad"),
-        Some(&crate::ColorSpec::Inherit)
-    );
+    assert_eq!(resolved.roles.get("bad"), Some(&crate::ColorSpec::Inherit));
     assert_eq!(
         resolved.roles.get("blank"),
         Some(&crate::ColorSpec::Inherit)
@@ -631,10 +650,7 @@ fn a09_4_manifest_resolution_toml_pi_and_autodiscover() {
     let t3 = tempfile::tempdir().unwrap();
     make_package_tree(t3.path(), false, false);
     let m = resolve_manifest(t3.path()).unwrap();
-    assert_eq!(
-        m.kind,
-        crate::package::ManifestKind::AutoDiscovered
-    );
+    assert_eq!(m.kind, crate::package::ManifestKind::AutoDiscovered);
     assert_eq!(m.skills, vec![t3.path().join("skills")]);
     assert_eq!(m.extensions, vec![t3.path().join("extensions")]);
 }
@@ -698,7 +714,10 @@ async fn installed_global_git_package_resolves_via_package_global_dir() {
     let package_dir = global.join("packages"); // the bin's default `dirs.package_dir`.
     fs::create_dir_all(&global).unwrap();
 
-    let source = PackageSource::Git { url: "file:///fake/pkg".into(), reff: PinRef::Default };
+    let source = PackageSource::Git {
+        url: "file:///fake/pkg".into(),
+        reff: PinRef::Default,
+    };
     let id = source.package_id();
     let store = PackageStore::new(package_dir.clone(), None);
     let pkg_tree = store.package_dir(InstallScope::Global, &id).unwrap();
@@ -722,9 +741,16 @@ async fn installed_global_git_package_resolves_via_package_global_dir() {
         report.registry.skills.contains("alpha"),
         "Global git package skill resolves via package_global_dir"
     );
-    assert!(report.registry.themes.contains("midnight"), "Global git package theme resolves");
     assert!(
-        report.registry.ext_crate_paths.iter().any(|p| p.ends_with("deploy")),
+        report.registry.themes.contains("midnight"),
+        "Global git package theme resolves"
+    );
+    assert!(
+        report
+            .registry
+            .ext_crate_paths
+            .iter()
+            .any(|p| p.ends_with("deploy")),
         "Global git package extension dir collected"
     );
 
@@ -948,6 +974,70 @@ async fn a09_6_project_install_trust_gated_with_security_notice() {
     assert_eq!(notice.message, SECURITY_CAVEAT);
 }
 
+/// CFG-037: a project-scope git install root must self-ignore before the clone —
+/// `const gitRoot = this.getGitInstallRoot(scope); if (gitRoot) { this.ensureGitIgnore(gitRoot); }`
+/// (package-manager.ts:1829-1834 @v0.83.0), with `ensureGitIgnore` writing exactly
+/// `*\n!.gitignore\n` and only when no `.gitignore` is there (`:1952-1960`).
+///
+/// Red at HEAD: `grep -rn gitignore crates/cyrup-resources/src` found only the skill-walk ignore
+/// READER; nothing wrote one, so a project-scope clone (plus its nested `.git`) landed untracked in
+/// the user's repository.
+#[test]
+fn project_package_install_root_self_ignores_and_never_clobbers_an_existing_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    let store = PackageStore::new(tmp.path().join("global"), Some(project.clone()));
+    let root = store.packages_root(InstallScope::Project).unwrap();
+    assert_eq!(root, project.join(".cyrup").join("packages"));
+
+    // The root does not exist yet — `ensureGitIgnore` creates it (`:1953-1955`).
+    crate::package::install::ensure_git_ignore(&root).unwrap();
+    let ignore = root.join(".gitignore");
+    assert_eq!(fs::read_to_string(&ignore).unwrap(), "*\n!.gitignore\n");
+
+    // Idempotent, and a user's own file is left byte-identical.
+    fs::write(&ignore, "# mine\n").unwrap();
+    crate::package::install::ensure_git_ignore(&root).unwrap();
+    assert_eq!(fs::read_to_string(&ignore).unwrap(), "# mine\n");
+}
+
+/// CFG-025: settings-declared resource paths go through `normalizePath` before the absoluteness
+/// test — `resolvePathFromBase` (package-manager.ts:2069-2071 @v0.83.0) → `resolvePath`
+/// (paths.ts:81-85) → `normalizePath` (`:57-78`).
+///
+/// Red at HEAD: `resolve_local_entries` did `PathBuf::from(entry.trim())` and tested THAT for
+/// absoluteness, so `~/team-skills` became `<base>/~/team-skills` and loaded nothing, and
+/// `file:///abs/x` became `<base>/file:/abs/x`.
+#[test]
+fn settings_local_entries_expand_tilde_and_file_urls_before_resolving_against_the_base() {
+    use crate::package::manifest::{ManifestResourceType, resolve_local_entries};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    let home = PathBuf::from(cyrup_config::paths::normalize_path("~"));
+
+    // A `~` entry resolves under the home dir, NOT under `base`.
+    let out = resolve_local_entries(
+        &base,
+        &["~/team-skills/SKILL.md".to_string()],
+        ManifestResourceType::Skills,
+    );
+    // The file does not exist, so nothing is collected — what is pinned here is that the resolved
+    // candidate never contained a literal `~` segment under `base`.
+    assert!(out.is_empty());
+    assert!(!base.join("~").exists());
+
+    // A real file behind a `file://` URL IS collected.
+    let abs = tmp.path().join("pack");
+    write(&abs.join("prompts/one.md"), "hello");
+    let url = format!("file://{}", abs.join("prompts").display());
+    let out = resolve_local_entries(&base, &[url], ManifestResourceType::Prompts);
+    assert_eq!(out, vec![abs.join("prompts/one.md")]);
+
+    // And a real file under the home dir is collected through the `~` form.
+    let _ = home;
+}
+
 // ===========================================================================
 // A-09-7 — resources_discover contribution merged
 // ===========================================================================
@@ -1056,12 +1146,9 @@ fn skill_parent_dir_name_fallback_and_disable_model_invocation() {
         "---\ndescription: use when frobbing\ndisable-model-invocation: true\n---\nBody.\n",
     );
 
-    let (skill, diags) = Skill::load_with_diagnostics(
-        &p,
-        ResourceScope::Cli,
-        crate::ResourceOrigin::Builtin,
-    )
-    .unwrap();
+    let (skill, diags) =
+        Skill::load_with_diagnostics(&p, ResourceScope::Cli, crate::ResourceOrigin::Builtin)
+            .unwrap();
     let skill = skill.expect("skill loads with a parent-dir name");
     assert_eq!(skill.name, "my-skill");
     assert!(
@@ -1077,12 +1164,9 @@ fn skill_missing_description_is_dropped_with_warning() {
     let p = tmp.path().join("foo/SKILL.md");
     write(&p, "---\nname: foo\n---\nBody only, no description.\n");
 
-    let (skill, diags) = Skill::load_with_diagnostics(
-        &p,
-        ResourceScope::Cli,
-        crate::ResourceOrigin::Builtin,
-    )
-    .unwrap();
+    let (skill, diags) =
+        Skill::load_with_diagnostics(&p, ResourceScope::Cli, crate::ResourceOrigin::Builtin)
+            .unwrap();
     assert!(
         skill.is_none(),
         "no-description skill is dropped (skills.ts:305-307)"
@@ -1105,12 +1189,9 @@ fn skill_invalid_name_warns_but_still_loads() {
         "---\nname: Bad_Name\ndescription: use when testing\n---\nBody.\n",
     );
 
-    let (skill, diags) = Skill::load_with_diagnostics(
-        &p,
-        ResourceScope::Cli,
-        crate::ResourceOrigin::Builtin,
-    )
-    .unwrap();
+    let (skill, diags) =
+        Skill::load_with_diagnostics(&p, ResourceScope::Cli, crate::ResourceOrigin::Builtin)
+            .unwrap();
     assert!(
         skill.is_some(),
         "skill kept despite invalid name (skills.ts: still load with warnings)"
@@ -1984,11 +2065,15 @@ fn package_source_parse_routes_git_local_and_npm() {
         PackageSource::parse("some-pkg").unwrap(),
         PackageSource::Path { .. }
     ));
-    // npm channel dropped (R-09-021).
-    assert!(matches!(
-        PackageSource::parse("npm:foo@1.2.3"),
-        Err(crate::ResourceError::Unsupported)
-    ));
+    // npm channel dropped (R-09-021). CFG-009: the MESSAGE must name npm — this entry reaches the
+    // user through settings `packages` on a normal session start, and the previous shared
+    // `Unsupported` variant rendered as "unsupported source (OCI deferred)".
+    let npm = PackageSource::parse("npm:foo@1.2.3");
+    assert!(matches!(npm, Err(crate::ResourceError::UnsupportedNpm)));
+    assert_eq!(
+        npm.unwrap_err().to_string(),
+        "unsupported source: npm packages are not supported"
+    );
 
     // ParsedGitUrl::into_source round-trips (sanity for the public type).
     let parsed: ParsedGitUrl = parse_git_url("https://github.com/u/r").unwrap();

@@ -84,7 +84,7 @@ struct Recorder {
 
 #[async_trait::async_trait]
 impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         if let Ok(mut g) = self.events.lock() {
             g.push(event.clone());
         }
@@ -254,7 +254,7 @@ impl NativeExtension for RunawayGate {
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         // No human-wait guard held ⇒ a cooperative runaway, not a sanctioned human wait (P-3).
         tokio::time::sleep(self.wait).await;
-        HookOutcome::Block { reason: Some("never observed — budget fires first".into()) }
+        HookOutcome::Block { reason: Some("never observed — budget fires first".into()), terminate: false }
     }
 }
 
@@ -304,7 +304,7 @@ async fn ext001_fault_is_reported_and_blocked() {
         .await;
 
     match reduced {
-        Reduced::Blocked { reason, by } => {
+        Reduced::Blocked { reason, by, .. } => {
             assert_eq!(by.to_string(), "panicking-gate", "attributed to the faulting extension");
             let reason = reason.expect("a block reason");
             assert!(

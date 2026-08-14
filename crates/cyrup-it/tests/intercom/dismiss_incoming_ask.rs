@@ -1,25 +1,29 @@
-//! FULLY-WIRED regression proof for pi `dismissIncomingAsk`'s pending-idle SPLICE
-//! (`pi-intercom` v0.7.0 `index.ts:455-459`):
+//! FULLY-WIRED regression proof for pi `dismissIncomingAsk` (`pi-intercom` v0.10.1
+//! `index.ts:529-531`):
 //!
 //! ```text
 //! function dismissIncomingAsk(messageId: string): void {
 //!   replyTracker.dismissPendingAsk(messageId);
-//!   const queuedIndex = pendingIdleMessages.findIndex((entry) => entry.message.id === messageId);
-//!   if (queuedIndex >= 0) pendingIdleMessages.splice(queuedIndex, 1);
 //! }
 //! ```
 //!
-//! The scenario the splice exists for: a peer messages this session WHILE a run is in flight. The
-//! production inbound loop records the ask in the `ReplyTracker`, surfaces it to the human, and —
-//! because the session is busy and interactive — parks it in the pending-idle queue. The running
-//! agent can see the surfaced ask and answer it mid-run with `intercom{reply}`. Cyrup's `reply`
-//! only reached the tracker, so the answered message stayed in the queue and
-//! `flush_idle_messages` re-injected it as a fresh turn-driving delivery once the run ended.
+//! ICOM-035 — this file used to pin v0.7.0's TWO-part body, whose second half spliced the id out of
+//! `pendingIdleMessages`. Upstream deleted that queue wholesale at v0.9.3 (`25ffb96`) and deleted
+//! its tests with it; `flush_idle_messages` and `SharedIntercomState::pending_inbound_len` no
+//! longer exist in cyrup either. The SURVIVING contract, which is what this file now pins:
+//!
+//! 1. a message arriving at a BUSY, interactive session is **steered onto the live run
+//!    immediately** (`decide_inbound_policy` ⇒ `InboundPolicy::Steer`, pi `index.ts:876`'s
+//!    `deliverAs: "steer"`) — it is not parked anywhere;
+//! 2. answering it mid-run through the real `intercom{reply}` tool drops it from the reply
+//!    tracker's PENDING ASKS (`replyTracker.dismissPendingAsk`), so a later `intercom{list}` does
+//!    not re-surface an ask the agent already answered;
+//! 3. and because nothing holds a second copy, the message is delivered **exactly once** — going
+//!    idle afterwards re-injects nothing.
 //!
 //! Everything below the assertions is real: a genuine `cyrup-intercom-broker` child process, two
-//! real `IntercomClient`s over the real Unix socket, the real `spawn_inbound_loop`, the real
-//! `IntercomTool` dispatch, and the real `flush_idle_messages` drain observed through a
-//! `HostServices` that records `inject_message`.
+//! real `IntercomClient`s over the real Unix socket, the real `spawn_inbound_loop` and the real
+//! `IntercomTool` dispatch, observed through a `HostServices` that records `inject_message`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
@@ -31,16 +35,17 @@ use std::time::Duration;
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolUpdateSink};
 use cyrup_ext::HostServices;
 use cyrup_intercom::config::IntercomConfig;
-use cyrup_intercom::inbound::{flush_idle_messages, spawn_inbound_loop};
+use cyrup_intercom::inbound::spawn_inbound_loop;
 use cyrup_intercom::session_state::SharedIntercomState;
 use cyrup_intercom::tools::intercom::IntercomTool;
 use cyrup_intercom::transport::client::{IntercomClient, SendOptions};
+use cyrup_intercom::transport::protocol::now_ms;
 use cyrup_intercom::transport::spawn::wait_for_broker;
 use crate::common::registration;
 
-/// A `HostServices` with a SETTABLE `is_idle` (the live run-in-flight signal the inbound policy and
-/// the flush both read) that records every `inject_message` — so a re-injected message is directly
-/// observable rather than inferred.
+/// A `HostServices` with a SETTABLE `is_idle` (the live run-in-flight signal `decide_inbound_policy`
+/// reads) that records every `inject_message` — so the delivery COUNT is directly observable rather
+/// than inferred.
 struct IdleControlledHost {
     idle: AtomicBool,
     injected: Mutex<Vec<String>>,
@@ -93,7 +98,7 @@ async fn wait_until(bound: Duration, mut predicate: impl FnMut() -> bool) -> boo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replying_mid_run_removes_the_message_from_the_pending_idle_queue() {
+async fn replying_mid_run_dismisses_the_pending_ask_and_never_redelivers() {
     let broker_bin = crate::support::bins::intercom_broker();
     let agent_dir = tempfile::tempdir().expect("tempdir");
     let socket_path = agent_dir.path().join("intercom").join("broker.sock");
@@ -109,7 +114,7 @@ async fn replying_mid_run_removes_the_message_from_the_pending_idle_queue() {
         .await
         .expect("broker becomes health-connectable");
 
-    // THIS session — busy (a run is in flight) and interactive, so an inbound message is parked.
+    // THIS session — busy (a run is in flight) and interactive, so an inbound message is STEERED.
     let agent_client = Arc::new(
         IntercomClient::connect(&socket_path, registration("agent"), Some("agent-session".into()))
             .await
@@ -125,7 +130,7 @@ async fn replying_mid_run_removes_the_message_from_the_pending_idle_queue() {
     state.set_host_services(host.clone());
     state.set_has_ui(true);
     // The REAL production inbound loop: it records the ask, surfaces it, and applies the delivery
-    // policy (busy + has_ui ⇒ park in the pending-idle queue).
+    // policy (busy + has_ui ⇒ `InboundPolicy::Steer`).
     spawn_inbound_loop(state.clone(), agent_client.clone());
 
     // The PEER stays connected for the whole test — the `reply` below only dismisses on a CONFIRMED
@@ -147,12 +152,21 @@ async fn replying_mid_run_removes_the_message_from_the_pending_idle_queue() {
         .await
         .expect("peer's ask is accepted by the broker");
 
-    // The busy interactive session parked it rather than steering the live run.
+    // v0.9.3 onward: a busy INTERACTIVE session steers the message onto the live run at once
+    // (`decide_inbound_policy` ⇒ `Steer`; pi `index.ts:876`'s `deliverAs: "steer"`). Exactly one
+    // delivery, and it happens while the run is still in flight.
     assert!(
-        wait_until(Duration::from_secs(10), || state.pending_inbound_len() == 1).await,
-        "the inbound ask must be parked in the pending-idle queue while the run is in flight"
+        wait_until(Duration::from_secs(10), || host.injected().len() == 1).await,
+        "a busy interactive session must be STEERED with the inbound message, not parked; \
+         injected: {:?}",
+        host.injected()
     );
-    assert!(host.injected().is_empty(), "a busy session must not be steered mid-run");
+    // …and the ask is recorded as pending, so `intercom{reply}` can resolve it without a `replyTo`.
+    assert_eq!(
+        state.tracker.lock().unwrap().list_pending(now_ms()).len(),
+        1,
+        "the inbound ask must be tracked as pending until it is answered"
+    );
 
     // The running agent answers the ask MID-RUN through the REAL `Tool::execute` entry point — the
     // same call the agent loop makes. `to`/`replyTo` are omitted, so `resolveReplyTarget` resolves
@@ -177,24 +191,24 @@ async fn replying_mid_run_removes_the_message_from_the_pending_idle_queue() {
         .collect();
     assert!(out_text.contains("Reply sent"), "the reply reports delivery: {out_text}");
 
-    // THE DEFECT: pi splices the answered entry out of `pendingIdleMessages`. Without it the entry
-    // survives here and the flush below replays it.
-    assert_eq!(
-        state.pending_inbound_len(),
-        0,
-        "the answered inbound ask must be removed from the pending-idle queue \
-         (pi `dismissIncomingAsk`'s `pendingIdleMessages.splice(queuedIndex, 1)`)"
+    // THE CONTRACT: `dismissIncomingAsk` drops the ANSWERED ask from the tracker's pending set
+    // (`v0.10.1 index.ts:529-531`, called from the delivered-`reply` arm at `:2226`). Without it
+    // the agent's own `intercom{list}` keeps advertising a question it has already answered.
+    assert!(
+        state.tracker.lock().unwrap().list_pending(now_ms()).is_empty(),
+        "the answered inbound ask must be dismissed from the reply tracker's pending asks"
     );
 
-    // THE CONSEQUENCE, at the real drain: the run ends, the flush runs, and nothing is re-injected.
+    // THE CONSEQUENCE: nothing holds a second copy, so going idle re-injects nothing. (Pre-v0.9.3
+    // this was the `pendingIdleMessages` flush; the queue is gone, and the delivery count is the
+    // observable that survives it.)
     host.set_idle(true);
-    flush_idle_messages(&state);
-    // Give any surviving entry every chance to be delivered (the flush hops through the scheduler,
-    // and `queue_idle_message` also armed the debounce) before asserting the negative.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    assert!(
-        host.injected().is_empty(),
-        "an already-answered inbound ask must NOT be re-injected once the run ends; injected: {:?}",
+    assert_eq!(
+        host.injected().len(),
+        1,
+        "the inbound message must be delivered EXACTLY once (steered), never re-injected on idle; \
+         injected: {:?}",
         host.injected()
     );
 

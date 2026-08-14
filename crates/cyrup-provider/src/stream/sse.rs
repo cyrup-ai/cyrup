@@ -155,7 +155,22 @@ pub fn build_client_with_proxy(
     proxy: Option<reqwest::Url>,
     idle_timeout_ms: Option<u64>,
 ) -> Result<reqwest::Client, ProviderError> {
+    build_client_with_proxy_forcing_http1(proxy, idle_timeout_ms, false)
+}
+
+/// [`build_client_with_proxy`] plus Pi's HTTP/1.1 escape hatch. When `force_http1`, the client
+/// offers only `http/1.1` in ALPN — the analogue of pi swapping the default `NodeHttp2Handler` for
+/// a plain `NodeHttpHandler` (`bedrock-converse-stream.ts:206-209` @v0.83.0, comment: "Some custom
+/// endpoints require HTTP/1.1 instead of HTTP/2"). PROV-044.
+pub fn build_client_with_proxy_forcing_http1(
+    proxy: Option<reqwest::Url>,
+    idle_timeout_ms: Option<u64>,
+    force_http1: bool,
+) -> Result<reqwest::Client, ProviderError> {
     let mut builder = with_idle_timeout(reqwest::Client::builder(), idle_timeout_ms);
+    if force_http1 {
+        builder = builder.http1_only();
+    }
     builder = match proxy {
         Some(url) => {
             let proxy = reqwest::Proxy::all(url.as_str())
@@ -184,11 +199,27 @@ pub async fn build_client_for_target(
     env: Option<&crate::auth::types::ProviderEnv>,
     idle_timeout_ms: Option<u64>,
 ) -> Result<reqwest::Client, ProviderError> {
+    build_client_for_target_forcing_http1(target_url, ctx, env, idle_timeout_ms, false).await
+}
+
+/// [`build_client_for_target`] plus Pi's `AWS_BEDROCK_FORCE_HTTP1` escape hatch (PROV-044).
+///
+/// `force_http1` is applied only when NO proxy is resolved, reproducing pi's `else if`
+/// (`bedrock-converse-stream.ts:197-209` @v0.83.0): a proxied request already leaves HTTP/2 behind
+/// via the proxy agent, so the override is redundant there.
+pub async fn build_client_for_target_forcing_http1(
+    target_url: &str,
+    ctx: &dyn crate::auth::types::AuthContext,
+    env: Option<&crate::auth::types::ProviderEnv>,
+    idle_timeout_ms: Option<u64>,
+    force_http1: bool,
+) -> Result<reqwest::Client, ProviderError> {
     let proxy =
         crate::utils::node_http_proxy::resolve_http_proxy_url_for_target(target_url, ctx, env)
             .await
             .map_err(|e| ProviderError::Transport(Box::new(e)))?;
-    build_client_with_proxy(proxy, idle_timeout_ms)
+    let force_http1 = force_http1 && proxy.is_none();
+    build_client_with_proxy_forcing_http1(proxy, idle_timeout_ms, force_http1)
 }
 
 type FrameStream = Pin<Box<dyn Stream<Item = Result<SseFrame, ProviderError>> + Send>>;

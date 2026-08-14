@@ -39,6 +39,9 @@ use super::common::{Broker, registration};
 
 fn session(id: &str, cwd: &str) -> SessionInfo {
     SessionInfo {
+        // ICOM-041: `runtimeFallbackAlias` (v0.10.1 types.ts:6-7) — these fixtures
+        // register under a REAL name, not a synthesized unnamed-runtime alias.
+        runtime_fallback_alias: None,
         id: id.to_string(),
         name: Some(id.to_string()),
         cwd: cwd.to_string(),

@@ -13,7 +13,22 @@ pub enum HookOutcome {
     /// notify-only events; return ignored (R-08-009).
     Noop,
     /// `[block]` — short-circuits the action with an optional reason. First block wins.
-    Block { reason: Option<String> },
+    Block {
+        reason: Option<String>,
+        /// `tool_call` only (EXT-049) — pi `ToolCallEventResult.terminate`
+        /// (`pi/packages/coding-agent/src/core/extensions/types.ts:1072-1079` @v0.84.1, ABSENT at
+        /// the ported v0.83.0 baseline): "Hint that the agent should stop after the current tool
+        /// batch when this call is blocked. Early termination only happens when every finalized
+        /// tool result in the batch sets this to true." Consumed at
+        /// `packages/agent/src/agent-loop.ts:636-646`, folded by `shouldTerminateToolBatch` at
+        /// `:583` into `hasMoreToolCalls = !executedToolBatch.terminate` at `:216` — the every()
+        /// rule lives in the agent, not here, so a single blocking handler setting this does NOT
+        /// end the run on its own.
+        ///
+        /// `false` is pi's `undefined`/`false`. Ignored on every non-`tool_call` seam, exactly as
+        /// upstream ignores it (no other `*EventResult` declares the field).
+        terminate: bool,
+    },
     /// `[mutate]` — a typed patch applied to the in-flight value.
     Mutate(EventPatch),
     /// `input`/`user_bash` "handled"/"provide": the extension fully serviced it.
@@ -54,6 +69,13 @@ pub enum EventPatch {
     /// outbound payload wholesale (`currentPayload = handlerResult`); later handlers observe the
     /// replacement. Open-shaped: the provider request body crosses as `serde_json::Value`.
     ProviderRequest(Value),
+    /// `before_provider_headers` (EXT-009; pi `BeforeProviderHeadersEvent`,
+    /// extensions/types.ts:686-689 @v0.83.0). Upstream handlers "mutate `headers` in place … the
+    /// return value is ignored. A `null` value deletes that header" (:681-685), so this is a
+    /// PATCH object rather than a replacement: each key is set to its value, and a key whose value
+    /// is `null` is REMOVED. That asymmetry is the whole point of the event — a proxy or auth-shim
+    /// extension deletes a header it must not send, and setting it to `""` would still send it.
+    ProviderHeaders(Value),
     /// `session_before_compact` (Pi `SessionBeforeCompactResult.compaction`, types.ts:1079): an
     /// extension-supplied compaction override (a `CompactionResult`: `{summary, firstKeptEntryId?,
     /// tokensBefore?, details?}`). The LAST override wins across the chain; the producer threads its
@@ -123,6 +145,20 @@ impl HostEvent {
             (HostEvent::BeforeProviderRequest { payload }, EventPatch::ProviderRequest(v)) => {
                 *payload = v;
             }
+            // `before_provider_headers` (pi types.ts:681-685): in-place mutation semantics — set
+            // each supplied key, DELETE the ones whose value is `null`. A non-object patch is
+            // ignored (degrade, never panic).
+            (HostEvent::BeforeProviderHeaders { headers }, EventPatch::ProviderHeaders(v)) => {
+                if let (Some(dst), Some(src)) = (headers.as_object_mut(), v.as_object()) {
+                    for (k, val) in src {
+                        if val.is_null() {
+                            dst.remove(k);
+                        } else {
+                            dst.insert(k.clone(), val.clone());
+                        }
+                    }
+                }
+            }
             // `session_before_compact` (Pi `SessionBeforeCompactResult.compaction`): capture the
             // extension-supplied compaction override on the event so the producer folds it back.
             (
@@ -154,8 +190,9 @@ pub enum Reduced {
     /// No block; the (possibly folded) event proceeds. Boxed: `HostEvent` is much larger than the
     /// other variants, so boxing keeps `Reduced` small (clippy::large_enum_variant).
     Pass(Box<HostEvent>),
-    /// First `Block` wins; carries the reason and the blocking extension id.
-    Blocked { reason: Option<String>, by: cyrup_core::ExtensionId },
+    /// First `Block` wins; carries the reason, the blocking extension id, and (on `tool_call`
+    /// only) pi's `ToolCallEventResult.terminate` hint — see [`HookOutcome::Block::terminate`].
+    Blocked { reason: Option<String>, terminate: bool, by: cyrup_core::ExtensionId },
     /// An extension fully serviced the action.
     Handled(HandledValue),
 }

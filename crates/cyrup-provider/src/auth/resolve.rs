@@ -293,7 +293,7 @@ mod tests {
             "API_KEY".to_string(),
             "env-key".to_string(),
         )]));
-        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+        let auth = ProviderAuth::with_api_key(env_key("Test API key", ["API_KEY"]));
         let r = resolve_provider_auth(
             &ProviderId::from("p"),
             &auth,
@@ -316,7 +316,7 @@ mod tests {
             "API_KEY".to_string(),
             "env-key".to_string(),
         )]));
-        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+        let auth = ProviderAuth::with_api_key(env_key("Test API key", ["API_KEY"]));
         let r = resolve_provider_auth(
             &ProviderId::from("p"),
             &auth,
@@ -341,7 +341,7 @@ mod tests {
         // Ambient context has NO API_KEY — only the overlay does.
         let ctx = MapCtx(BTreeMap::new());
         let overlay = BTreeMap::from([("API_KEY".to_string(), "overlay-key".to_string())]);
-        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+        let auth = ProviderAuth::with_api_key(env_key("Test API key", ["API_KEY"]));
         let r = resolve_provider_auth(
             &ProviderId::from("p"),
             &auth,
@@ -370,7 +370,7 @@ mod tests {
             "API_KEY".to_string(),
             "ambient-key".to_string(),
         )]));
-        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+        let auth = ProviderAuth::with_api_key(env_key("Test API key", ["API_KEY"]));
 
         // Non-empty overlay wins.
         let overlay = BTreeMap::from([("API_KEY".to_string(), "overlay-key".to_string())]);
@@ -426,7 +426,7 @@ mod tests {
             },
         );
         let ctx = MapCtx(BTreeMap::new());
-        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+        let auth = ProviderAuth::with_api_key(env_key("Test API key", ["API_KEY"]));
         let overlay = BTreeMap::from([
             ("B".to_string(), "overlay-b".to_string()),
             ("C".to_string(), "overlay-c".to_string()),
@@ -461,7 +461,7 @@ mod tests {
             "API_KEY".to_string(),
             "env-key".to_string(),
         )]));
-        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+        let auth = ProviderAuth::with_api_key(env_key("Test API key", ["API_KEY"]));
         let r = resolve_provider_auth(
             &ProviderId::from("p"),
             &auth,
@@ -484,7 +484,7 @@ mod tests {
     async fn unconfigured_resolves_none() {
         let store = InMemoryCredentialStore::new();
         let ctx = MapCtx(BTreeMap::new());
-        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+        let auth = ProviderAuth::with_api_key(env_key("Test API key", ["API_KEY"]));
         let r = resolve_provider_auth(
             &ProviderId::from("p"),
             &auth,
@@ -535,7 +535,7 @@ mod tests {
         });
         // Provider supports BOTH oauth and an env key — but the failed refresh must NOT use the env.
         let auth = ProviderAuth {
-            api_key: Some(env_key(["API_KEY"])),
+            api_key: Some(env_key("Test API key", ["API_KEY"])),
             oauth: Some(oauth.clone()),
         };
         let err = resolve_provider_auth(

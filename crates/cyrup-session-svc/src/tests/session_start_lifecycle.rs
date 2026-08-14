@@ -45,7 +45,7 @@ impl NativeExtension for StartRecorder {
         Ok(())
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        if let HostEvent::SessionStart { reason } = ev
+        if let HostEvent::SessionStart { reason, .. } = ev
             && let Ok(mut g) = self.reasons.lock()
         {
             g.push(reason.clone());

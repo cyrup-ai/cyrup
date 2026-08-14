@@ -374,11 +374,21 @@ async fn connect_once(
     // `last_session_id()` stays as the fallback for a session with no live `HostServices` bound
     // (headless/degraded): a reconnect then still re-offers the identity the broker previously
     // assigned rather than appearing as a second, stale participant.
-    let session_id = state
-        .host_services()
-        .and_then(|services| services.session_id())
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
+    //
+    // `resolveConfiguredIntercomSessionId` (`v0.10.1 index.ts:434-436`) sits IN FRONT of that:
+    //
+    //   return process.env[STABLE_INTERCOM_SESSION_ID_ENV]?.trim() || config.stableId || piSessionId;
+    //
+    // — an explicitly configured stable id wins over the host's per-process one, so a restarted
+    // worker keeps the address its peers already hold instead of orphaning every stored target.
+    let session_id = configured_stable_session_id(state)
+        .or_else(|| {
+            state
+                .host_services()
+                .and_then(|services| services.session_id())
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+        })
         .or_else(|| state.connect.last_session_id());
     let client = Arc::new(IntercomClient::connect(&socket, registration, session_id).await?);
     if state.connect.shutting_down.load(Ordering::SeqCst)
@@ -431,29 +441,94 @@ pub fn handle_disconnect(state: &Arc<SharedIntercomState>, client: &Arc<Intercom
 ///   3. else the `CYRUP_INTERCOM_SESSION_ID`-derived alias (refined post-register).
 #[must_use]
 pub fn build_registration(state: &SharedIntercomState, params: &ConnectParams) -> SessionRegistration {
-    let session_id_env = std::env::var(ENV_INTERCOM_SESSION_ID).ok();
-    let name = params
-        .metadata
-        .as_ref()
-        .and_then(|m| m.session_name.clone())
-        .or_else(|| {
-            state.host_services().and_then(|services| {
-                services
-                    .session_id()
-                    .filter(|id| !id.is_empty())
-                    .map(|id| presence_name(services.session_name().as_deref(), &id))
-            })
-        })
-        .or_else(|| session_id_env.as_deref().map(|id| presence_name(None, id)));
+    let identity = presence_identity(state, params.metadata.as_ref());
     SessionRegistration {
-        name,
+        // `{ ...identity }` (`v0.10.1 index.ts:772-774`) — name AND the alias flag.
+        runtime_fallback_alias: identity.name.as_ref().map(|_| identity.runtime_fallback_alias),
+        name: identity.name,
         cwd: state.cwd.to_string_lossy().to_string(),
         model: params.model.clone().unwrap_or_else(|| "cyrup".to_string()),
         pid: std::process::id().into(),
         started_at: now_ms().into(),
         last_activity: now_ms().into(),
-        status: state.config.status.clone(),
+        // `buildRegistration` sets `status: currentStatus()` (`v0.10.1 index.ts:772-780`), NOT the
+        // raw configured suffix. `build_registration` is rebuilt on EVERY reconnect rung
+        // (`connect_once`), so reading `config.status` here re-registered a session that dropped
+        // mid-tool-call as having no lifecycle status at all.
+        status: Some(state.current_status()),
         extra: Default::default(),
+    }
+}
+
+/// `resolveConfiguredIntercomSessionId` (`v0.10.1 index.ts:434-436`), the env/config half:
+/// `process.env[STABLE_INTERCOM_SESSION_ID_ENV]?.trim() || config.stableId`.
+///
+/// JS `||` is falsy-based, so a blank env value falls through to `config.stableId`; `config.stableId`
+/// is already trimmed non-empty by `parse_config` (`v0.10.1 config.ts:141-150`).
+#[must_use]
+pub fn configured_stable_session_id(state: &SharedIntercomState) -> Option<String> {
+    std::env::var(crate::identity::ENV_INTERCOM_STABLE_ID)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| state.config.stable_id.clone())
+}
+
+/// `buildPresenceIdentity(pi, sessionId).name` (`v0.10.1 index.ts:427-433`) — recomputed from the
+/// LIVE host every time, never a snapshot.
+///
+/// Extracted out of [`build_registration`] so the registration and every later presence re-sync
+/// produce the SAME string; upstream gets that for free because both go through
+/// `buildPresenceIdentity`. The `metadata.session_name` first tier is cyrup's: a subagent child
+/// registers under the deterministic label its launcher minted, and re-deriving the name from the
+/// host would change the address the parent's `CYRUP_SUBAGENT_ORCHESTRATOR_TARGET` was built
+/// against.
+#[must_use]
+pub fn presence_identity_name(
+    state: &SharedIntercomState,
+    metadata: Option<&crate::identity::ChildOrchestratorMetadata>,
+) -> Option<String> {
+    presence_identity(state, metadata).name
+}
+
+/// `buildPresenceIdentity(pi, sessionId)` (`v0.10.1 index.ts:427-433`) — `{ name,
+/// runtimeFallbackAlias }` as ONE value, because upstream spreads it as one
+/// (`{ ...identity, status, ...contextUsage }`, `:815`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PresenceIdentity {
+    /// The presence name this session registers/advertises under.
+    pub name: Option<String>,
+    /// `!sessionName?.trim()` — true only when [`Self::name`] is a synthesized alias rather than a
+    /// name the user or launcher chose.
+    pub runtime_fallback_alias: bool,
+}
+
+/// [`PresenceIdentity`] for this session — see [`presence_identity_name`].
+#[must_use]
+pub fn presence_identity(
+    state: &SharedIntercomState,
+    metadata: Option<&crate::identity::ChildOrchestratorMetadata>,
+) -> PresenceIdentity {
+    // A launcher-assigned child label is a CHOSEN name, not a synthesized one, so it clears the
+    // flag exactly as a `/name` would.
+    if let Some(name) = metadata.and_then(|m| m.session_name.clone()) {
+        return PresenceIdentity { name: Some(name), runtime_fallback_alias: false };
+    }
+    if let Some(services) = state.host_services()
+        && let Some(id) = services.session_id().filter(|id| !id.is_empty())
+    {
+        let session_name = services.session_name();
+        return PresenceIdentity {
+            name: Some(presence_name(session_name.as_deref(), &id)),
+            runtime_fallback_alias: session_name.is_none_or(|n| n.trim().is_empty()),
+        };
+    }
+    // No live host: the id-derived alias is by construction synthesized.
+    match std::env::var(ENV_INTERCOM_SESSION_ID).ok() {
+        Some(id) => {
+            PresenceIdentity { name: Some(presence_name(None, &id)), runtime_fallback_alias: true }
+        }
+        None => PresenceIdentity::default(),
     }
 }
 
@@ -549,12 +624,19 @@ mod tests {
         shutdown(&state);
     }
 
-    /// Hazard 3, the busy-loop assertion, in real time: a failing rung WAITS its backoff. The agent
-    /// dir can never be created, so each attempt fails within microseconds — an unbounded
-    /// immediate-retry reconnect would therefore have burned thousands of attempts inside the first
-    /// 300 ms. Instead: 0 attempts at 300 ms, exactly 1 by 1.3 s (rung 0 = 1000 ms), and still
-    /// exactly 1 at 2.0 s because rung 1 waits a further 2000 ms.
-    #[tokio::test]
+    /// Hazard 3, the busy-loop assertion: a failing rung WAITS its backoff. The agent dir can never
+    /// be created, so each attempt fails within microseconds — an unbounded immediate-retry
+    /// reconnect would therefore have burned thousands of attempts inside the first 300 ms.
+    /// Instead: 0 attempts at 300 ms, exactly 1 past 1000 ms (rung 0), and still exactly 1 at
+    /// 2.0 s because rung 1 waits a further 2000 ms.
+    ///
+    /// ICOM-025 — driven on a PAUSED clock (`start_paused = true` + `tokio::time::advance`) rather
+    /// than a real one. The wall-clock version gave 300 ms of slack over a 1000 ms timer plus a
+    /// spawn hop plus a filesystem-failing `ensure_broker`, which is intermittent red on a loaded
+    /// tree and completes in ~2 s even when green; the standard reaction (widen the sleep) hides
+    /// the very backoff regression this is the only guard for. `advance` also yields to the
+    /// scheduler, so the awakened rung actually runs before each assertion.
+    #[tokio::test(start_paused = true)]
     async fn a_failing_rung_waits_its_backoff_instead_of_busy_looping() {
         let dir = tempfile::tempdir().unwrap();
         let state = state();
@@ -562,14 +644,17 @@ mod tests {
         assert_eq!(state.connect.attempt(), 0);
         schedule_reconnect(&state);
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
         assert_eq!(state.connect.attempt(), 0, "rung 0 must not fire before its 1000ms backoff");
 
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::advance(Duration::from_millis(1000)).await;
+        tokio::task::yield_now().await;
         assert_eq!(state.connect.attempt(), 1, "rung 0 fired exactly once");
         assert!(state.connect.reconnect_armed(), "its failure armed rung 1");
 
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        tokio::time::advance(Duration::from_millis(700)).await;
+        tokio::task::yield_now().await;
         assert_eq!(state.connect.attempt(), 1, "rung 1 backs off 2000ms; it does not retry immediately");
         shutdown(&state);
     }

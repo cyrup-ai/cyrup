@@ -114,6 +114,18 @@ pub enum SessionServiceError {
     #[error("session io: {0}")]
     Io(String),
 
+    /// `/fork` or `/clone` on a persisted session whose file has not been written yet. The `Display`
+    /// is pi's sentence **verbatim** — `throw new Error("This session has not been saved yet. Wait
+    /// for the first assistant response before cloning or forking it.")`
+    /// (`core/agent-session-runtime.ts:312-316` @v0.83.0, identical at v0.84.1) — because it is
+    /// user-facing text, relayed straight through the RPC `fork`/`clone` `error` field
+    /// (`cyrup-modes/src/rpc.rs`) and into whatever a client renders. SEAM-056.
+    #[error(
+        "This session has not been saved yet. Wait for the first assistant response before cloning \
+         or forking it."
+    )]
+    SessionNotSaved,
+
     /// A genuine immediate-bash backend failure (spawn error, missing cwd, …) — Pi's
     /// `executeBashWithOperations` only catches the abort case in its `catch` block; every other
     /// error hits `throw err` (`bash-executor.ts:154`), which propagates out of

@@ -28,7 +28,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{Agent, AgentEvent, AgentMessage, EventSubscriber, ProviderStreamFn, StreamFn};
-use cyrup_core::{AssistantMessage, ModelRef, StopReason};
+use cyrup_core::{AssistantMessage, CancelToken, ModelRef, StopReason};
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
 
@@ -50,7 +50,7 @@ struct Recorder {
 
 #[async_trait::async_trait]
 impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         self.events.lock().unwrap().push(event.clone());
     }
 }

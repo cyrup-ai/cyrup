@@ -285,7 +285,10 @@ async fn spawn_env_alone_carries_a_child_ask_into_the_parent_spool() {
     // session id. The child must independently arrive at this same directory from the anchor env.
     let location = forwarding_location(agent_dir.path(), &parent_id).expect("parent spool location");
 
-    let child = spawn_child(agent_dir.path(), &parent_id, &sentinel, 8_000);
+    // PERM-022: the child's ask must still be SPOOLED when the 15 s poll below gives up, so its
+    // own bound has to outlive that window by construction — 8 s did not, and the test could pass
+    // or fail on scheduling. 20 s matches the sibling at the allow test below.
+    let child = spawn_child(agent_dir.path(), &parent_id, &sentinel, 20_000);
     let request = await_spooled_request(&location.requests_dir, Duration::from_secs(15)).await;
 
     let request = request.unwrap_or_else(|| {
@@ -340,6 +343,15 @@ async fn spawn_env_alone_lets_the_parents_human_answer_a_child_ask() {
         agent_dir.path().to_path_buf(),
         services,
         Arc::new(Mutex::new(ExtensionConfig::default())),
+        // PERM-008: the watcher audits the forwarded request lifecycle
+        // (`forwarded_permission.request_created` / `.approved` / `.response_timed_out`), so it
+        // needs a trail. `detached` writes under `<agent_dir>/logs` with a default config.
+        Arc::new(cyrup_permission_system::AuditTrail::detached(
+            agent_dir.path().join("logs"),
+        )),
+        // These fixtures script a live human, so a UI IS present — the `has_ui` guard must not
+        // fail the forwarded ask closed.
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     );
 
     let child = spawn_child(agent_dir.path(), &parent_id, &sentinel, 20_000);

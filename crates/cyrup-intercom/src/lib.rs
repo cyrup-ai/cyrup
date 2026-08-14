@@ -1,5 +1,6 @@
 //! cyrup-intercom — out-of-band supervisor coordination companion (a 1:1 source port of
-//! `pi-intercom` v0.6.0).
+//! `pi-intercom` v0.9.2, with the v0.9.3/v0.10.x deltas listed in
+//! `docs/gap-analysis/11-cyrup-intercom.md` ported item-by-item).
 //!
 //! A native `cyrup_ext::native::NativeExtension` plus a hidden broker **process** (the
 //! `cyrup __intercom-broker` subcommand). Every local session connects to one shared broker over a
@@ -16,6 +17,7 @@
 pub mod broker;
 pub mod config;
 pub mod connect;
+pub mod cwd;
 pub mod error;
 pub mod extension;
 pub mod format_context;

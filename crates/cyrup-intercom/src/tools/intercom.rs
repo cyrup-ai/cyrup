@@ -1,5 +1,5 @@
-//! The `intercom` tool (`index.ts:1425-1806`): `list`/`send`/`ask`/`reply`/`pending`/`status` over
-//! the shared broker client. `ask` is the one blocking action (single-slot outbound waiter).
+//! The `intercom` tool (`v0.10.1 index.ts:1826+`): `list`/`list-cwd`/`send`/`ask`/`reply`/`pending`/
+//! `status` over the shared broker client. `ask` is the one blocking action (single-slot outbound waiter).
 
 use std::sync::Arc;
 
@@ -33,6 +33,9 @@ struct IntercomParams {
     attachments: Option<Vec<Attachment>>,
     #[serde(default)]
     reply_to: Option<String>,
+    /// `cwd` (`v0.10.1 index.ts:1832-1835`) — the working directory to filter `list-cwd` by.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 impl IntercomTool {
@@ -49,6 +52,11 @@ impl IntercomTool {
         let client = crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Tool)
             .await
             .map_err(|e| ToolError::new(format!("intercom is not connected to the broker: {e}")))?;
+        // `v0.10.1 index.ts:1853`: `syncPresenceIdentity(ctx.sessionManager.getSessionId())`
+        // immediately after `ensureConnected("tool")` and before the action `match`. One of pi's
+        // three name-sync points; without it a session renamed by `/name`, a branch switch or a
+        // title change keeps advertising its startup label to every peer's `intercom{list}` picker.
+        self.state.sync_presence_identity();
 
         match params.action.as_str() {
             "list" => {
@@ -64,9 +72,18 @@ impl IntercomTool {
                     return Err(ToolError::new("Current session is missing from intercom session list."));
                 };
                 let current_cwd = current_session.cwd.clone();
+                // `v0.10.1 index.ts:1872`: the addressable column is a DISTINGUISHING prefix
+                // computed over the whole roster, not a fixed 8-char slice. UUIDv7 ids minted in the
+                // same millisecond share far more than 8 characters, so the fixed slice printed the
+                // same `(abcdef12)` for two peers — and that string was exactly what the model was
+                // told to address them by.
+                let prefixes = crate::identity::session_id_prefixes(sessions.iter().map(|s| s.id.as_str()));
+                let id_prefix = |s: &SessionInfo| {
+                    prefixes.get(&s.id).cloned().unwrap_or_else(|| short_session_id(&s.id))
+                };
                 let current_section = format!(
                     "**Current session:**\n{}",
-                    format_session_list_row(current_session, &current_cwd, true)
+                    format_session_list_row(current_session, &current_cwd, true, &id_prefix(current_session))
                 );
                 let other_sessions: Vec<&SessionInfo> = sessions
                     .iter()
@@ -79,7 +96,78 @@ impl IntercomTool {
                         "**Other sessions:**\n{}",
                         other_sessions
                             .iter()
-                            .map(|s| format_session_list_row(s, &current_cwd, false))
+                            .map(|s| format_session_list_row(s, &current_cwd, false, &id_prefix(s)))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                };
+                Ok(text_result(format!("{current_section}\n\n{other_section}")))
+            }
+            // `v0.10.1 index.ts:1895-1941`: the same roster, filtered to one working directory —
+            // the common supervisor query ("who else is in this repo?"), which was otherwise
+            // unanswerable without knowing every peer's name in advance.
+            "list-cwd" => {
+                let self_id = client.session_id();
+                let sessions = client.list_sessions().await.map_err(to_tool_err)?;
+                let current_session =
+                    self_id.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
+                let Some(current_session) = current_session else {
+                    return Err(ToolError::new("Current session is missing from intercom session list."));
+                };
+                // `v0.10.1 index.ts:1903-1907`: default to the current session's cwd; an explicit
+                // `cwd` overrides, with a relative path resolved AGAINST the current session's cwd
+                // and `"."` meaning the current cwd.
+                let filter_cwd = match params.cwd.as_deref().filter(|c| *c != ".") {
+                    Some(cwd) => crate::cwd::resolve_path(std::path::Path::new(&current_session.cwd), cwd)
+                        .to_string_lossy()
+                        .to_string(),
+                    None => current_session.cwd.clone(),
+                };
+                let other_sessions: Vec<&SessionInfo> = sessions
+                    .iter()
+                    .filter(|s| {
+                        self_id.as_deref() != Some(s.id.as_str())
+                            && crate::cwd::same_cwd(&s.cwd, &filter_cwd)
+                    })
+                    .collect();
+                // `v0.10.1 index.ts:1913-1924`, comment verbatim: "Fail loud: filtering by a
+                // directory with no peers while the session's OWN cwd has some otherwise reads as a
+                // misleading empty result (common when a caller passes a guessed parent cwd)."
+                let mut empty_note = "No other sessions in this directory.".to_string();
+                if other_sessions.is_empty()
+                    && !crate::cwd::same_cwd(&filter_cwd, &current_session.cwd)
+                {
+                    let here = sessions
+                        .iter()
+                        .filter(|s| {
+                            self_id.as_deref() != Some(s.id.as_str())
+                                && crate::cwd::same_cwd(&s.cwd, &current_session.cwd)
+                        })
+                        .count();
+                    if here > 0 {
+                        let plural = if here == 1 { "" } else { "s" };
+                        empty_note.push_str(&format!(
+                            " Your session's cwd is {} ({here} peer{plural} there) — call list-cwd without a cwd argument to list them.",
+                            current_session.cwd
+                        ));
+                    }
+                }
+                let prefixes = crate::identity::session_id_prefixes(sessions.iter().map(|s| s.id.as_str()));
+                let id_prefix = |s: &SessionInfo| {
+                    prefixes.get(&s.id).cloned().unwrap_or_else(|| short_session_id(&s.id))
+                };
+                let current_section = format!(
+                    "**Current session:**\n{}",
+                    format_session_list_row(current_session, &current_session.cwd, true, &id_prefix(current_session))
+                );
+                let other_section = if other_sessions.is_empty() {
+                    format!("**Other sessions (cwd: {filter_cwd}):**\n{empty_note}")
+                } else {
+                    format!(
+                        "**Other sessions (cwd: {filter_cwd}):**\n{}",
+                        other_sessions
+                            .iter()
+                            .map(|s| format_session_list_row(s, &current_session.cwd, false, &id_prefix(s)))
                             .collect::<Vec<_>>()
                             .join("\n")
                     )
@@ -89,10 +177,47 @@ impl IntercomTool {
             "send" => {
                 let to = require(params.to, "send requires `to`")?;
                 let message = require(params.message, "send requires `message`")?;
-                let target = self.resolve_or_err(&client, &to).await?;
+                // `v0.10.1 index.ts:2002`: `{ id: await resolveSessionTarget(connectedClient, to) ?? to }`
+                // — a NON-blocking send that resolves to nothing is NOT refused here. It is handed to
+                // the broker as the raw `to`, whose own `findSessions` gets the last word, and an
+                // unroutable target comes back as the `Message to "…" was not delivered: …` result
+                // below. Only the blocking `ask` refuses up front (`:2103-2110`), because an ask has
+                // a waiter to hang.
+                let target = self
+                    .state
+                    .resolve_target(&client, &to)
+                    .await
+                    .map_err(to_tool_err)?
+                    .unwrap_or_else(|| to.clone());
+                // `v0.10.1 index.ts:2005-2010` — the SAME string as the `ask` and `reply` self-guards
+                // (`:2122`, `:2205`). pi has exactly one self-target message across all three arms.
                 if client.session_id().as_deref() == Some(target.as_str()) {
-                    return Err(ToolError::new("Cannot send an intercom message to yourself."));
+                    return Err(ToolError::new("Cannot message the current session"));
                 }
+                // `v0.10.1 index.ts:2011-2012` (v0.9.3 `5d76146`, CHANGELOG 0.9.3: "Treat a public
+                // send to the sole pending asker as its reply"):
+                //
+                //   const inferredAsk = replyTo ? null : replyTracker.findUniquePendingAskFrom(sendTo);
+                //   const effectiveReplyTo = replyTo ?? inferredAsk?.message.id;
+                //
+                // Without this, answering a peer's ask with the natural `send` phrasing left the ask
+                // pending forever: it stayed in `pending`, the flush re-injected it once the run
+                // ended, and the asking peer's blocking waiter hung to the full ask timeout.
+                //
+                // Note the lookup is keyed on `sendTo` — the RESOLVED id — not on the caller's `to`.
+                let inferred_ask = match params.reply_to {
+                    Some(_) => None,
+                    None => self
+                        .state
+                        .tracker
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .find_unique_pending_ask_from(&target, now_ms()),
+                };
+                let effective_reply_to = params
+                    .reply_to
+                    .clone()
+                    .or_else(|| inferred_ask.as_ref().map(|c| c.message.id.clone()));
                 // confirmSend gate (`index.ts:1524-1536`): only for a non-reply send, only when the
                 // config opts in, and only when this session actually has a UI to confirm through.
                 if params.reply_to.is_none() && self.state.config.confirm_send && self.state.has_ui()
@@ -117,14 +242,22 @@ impl IntercomTool {
                     .send(&target, SendOptions {
                         text: message.clone(),
                         attachments: params.attachments.clone(),
-                        reply_to: params.reply_to.clone(),
+                        reply_to: effective_reply_to.clone(),
                         expects_reply: None,
                         message_id: None,
                     })
                     .await
                     .map_err(to_tool_err)?;
                 if !result.delivered {
-                    return Err(ToolError::new(result.reason.unwrap_or_else(|| "delivery failed".to_string())));
+                    // `v0.10.1 index.ts:2032-2037`: the failure names the target and keeps pi's
+                    // fallback reason. A bare reason string tells the model nothing about which of
+                    // several in-flight sends failed.
+                    let reason = result
+                        .reason
+                        .unwrap_or_else(|| "Session may not exist or has disconnected.".to_string());
+                    return Err(ToolError::new(format!(
+                        "Message to \"{to}\" was not delivered: {reason}"
+                    )));
                 }
                 // `index.ts:1549-1557`: the audit entry + markReplied both run ONLY after a confirmed
                 // delivery — a failed/undelivered send must leave the original inbound ask pending.
@@ -136,42 +269,80 @@ impl IntercomTool {
                             "message": {
                                 "text": message,
                                 "attachments": params.attachments,
-                                "replyTo": params.reply_to,
+                                "replyTo": effective_reply_to,
                             },
                             "messageId": result.id,
                             "timestamp": now_ms(),
                         }),
                     );
                 }
-                if let Some(reply_to) = &params.reply_to {
-                    // `index.ts:1568` is `dismissIncomingAsk(replyTo)`, NOT a bare
-                    // `dismissPendingAsk`: the answered inbound message must also leave the
+                if let Some(reply_to) = &effective_reply_to {
+                    // `v0.10.1 index.ts:2044-2046` is `dismissIncomingAsk(effectiveReplyTo)`, NOT a
+                    // bare `dismissPendingAsk`: the answered inbound message must also leave the
                     // pending-idle queue, or the flush re-injects it once this run ends.
                     crate::inbound::dismiss_incoming_ask(&self.state, reply_to);
                 }
-                // `index.ts:1571`: `Message sent to ${to}` — the CALLER-SUPPLIED target, not the
-                // resolved id. pi deliberately splits the two (`const sendTo = await
-                // resolveSessionTarget(connectedClient, to) ?? to;`, `index.ts:1529`): it delivers
-                // to `sendTo` but reports `to`, so a send addressed to `reviewer` echoes back
-                // `reviewer` rather than the raw UUID the name resolved to.
-                Ok(text_result(format!("Message sent to {to}.")))
+                // `v0.10.1 index.ts:2051-2054`: `Message sent to ${targetDisplay}` — the
+                // CALLER-SUPPLIED target, not the resolved id, and with NO trailing period. pi
+                // deliberately splits the two (`const sendTo = await resolveSessionTarget(…) ?? to`,
+                // `:2002`): it delivers to `sendTo` but reports `to`, so a send addressed to
+                // `reviewer` echoes back `reviewer` rather than the raw UUID the name resolved to.
+                // When the reply target was INFERRED the result says so, because the model needs to
+                // know its plain send just closed an ask.
+                Ok(text_result(if inferred_ask.is_some() {
+                    format!("Reply sent to {to} (inferred from pending ask)")
+                } else {
+                    format!("Message sent to {to}")
+                }))
             }
             "ask" => {
                 let to = require(params.to, "ask requires `to`")?;
                 let message = require(params.message, "ask requires `message`")?;
-                let target = self.resolve_or_err(&client, &to).await?;
+                // `v0.10.1 index.ts:2103-2110` (v0.10.0): an ask whose target is offline is refused
+                // UP FRONT with the actionable text, not with the bare `Session not found: "x"` the
+                // shared resolver produces — a blocking ask is not queued anywhere, so the model has
+                // to be told to use `send` or to retry after the peer reconnects.
+                let Some(target) =
+                    self.state.resolve_target(&client, &to).await.map_err(to_tool_err)?
+                else {
+                    return Err(ToolError::new(format!(
+                        "Session \"{to}\" is not currently connected. Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects."
+                    )));
+                };
+                // `v0.10.1 index.ts:2122-2127` — pi's single self-target string, shared with `send`
+                // and `reply`.
                 if client.session_id().as_deref() == Some(target.as_str()) {
-                    return Err(ToolError::new("Cannot ask yourself."));
+                    return Err(ToolError::new("Cannot message the current session"));
                 }
                 let question_id = uuid::Uuid::new_v4().to_string();
-                let reply = self
+                // `v0.10.1 index.ts:2135-2143`: the ask's own send carries the caller's `replyTo`.
+                // Dropping it made a counter-ask against a peer's pending ask fail against cyrup's
+                // OWN broker with `Reply target does not match a pending ask`.
+                let reply_message = self
                     .state
-                    .ask_and_wait(&client, &target, question_id.clone(), message.clone(), params.attachments.clone(), cancel)
+                    .ask_and_wait_with_reply_to(
+                        &client,
+                        &target,
+                        question_id.clone(),
+                        message.clone(),
+                        params.attachments.clone(),
+                        params.reply_to.clone(),
+                        cancel,
+                    )
                     .await
                     .map_err(to_tool_err)?;
-                // `index.ts:1639-1655`: an audit entry for both the outbound ask and the inbound
-                // reply. `ask_and_wait` sends with `message_id: Some(question_id)`, so the delivered
-                // send's id is exactly `question_id` (`transport::client::send`, `client.rs:200-204`).
+                let reply_text = reply_message.content.text.clone();
+                let reply_attachments = reply_message
+                    .content
+                    .attachments
+                    .as_deref()
+                    .filter(|a| !a.is_empty())
+                    .map(format_attachments)
+                    .unwrap_or_default();
+                // `v0.10.1 index.ts:2161-2176`: an audit entry for both the outbound ask and the
+                // inbound reply. `ask_and_wait` sends with `message_id: Some(question_id)`, so the
+                // delivered send's id is exactly `question_id` (`transport::client::send`,
+                // `client.rs:200-204`).
                 if let Some(services) = self.state.host_services() {
                     let _ = services.append_entry(
                         "intercom_sent",
@@ -186,21 +357,27 @@ impl IntercomTool {
                             "timestamp": now_ms(),
                         }),
                     );
+                    // `v0.10.1 index.ts:2171-2176`. Three things this entry MUST carry that it used
+                    // to drop: the reply's own `messageId`, its `attachments`, and the SENDER's
+                    // timestamp (not the local receipt time). The durable record of an exchange has
+                    // to match what was exchanged, or the loss is undiscoverable afterwards.
                     let _ = services.append_entry(
                         "intercom_received",
                         &serde_json::json!({
                             "from": to,
-                            "message": { "text": reply },
-                            "timestamp": now_ms(),
+                            "message": {
+                                "text": reply_text,
+                                "attachments": reply_message.content.attachments,
+                            },
+                            "messageId": reply_message.id,
+                            "timestamp": reply_message.timestamp,
                         }),
                     );
                 }
-                // `index.ts:1669`: `**Reply from ${to}:**\n${replyText}${replyAttachments}`, keyed
-                // off the caller-supplied `to`. Without the header a transcript that has asked more
-                // than one peer cannot tell which of them answered. The attachment suffix is already
-                // inlined upstream-faithfully by `ask_and_wait` (`session_state.rs`
-                // `inline_reply_attachments`, `index.ts:1646-1649`), so `reply` already carries it.
-                Ok(text_result(format!("**Reply from {to}:**\n{reply}")))
+                // `v0.10.1 index.ts:2180`: `**Reply from ${targetDisplay}:**\n${replyText}${replyAttachments}`,
+                // keyed off the caller-supplied `to`. Without the header a transcript that has asked
+                // more than one peer cannot tell which of them answered.
+                Ok(text_result(format!("**Reply from {to}:**\n{reply_text}{reply_attachments}")))
             }
             "reply" => {
                 let message = require(params.message, "reply requires `message`")?;
@@ -217,10 +394,14 @@ impl IntercomTool {
                 if client.session_id().as_deref() == Some(target.from.id.as_str()) {
                     return Err(ToolError::new("Cannot message the current session"));
                 }
+                // `v0.10.1 index.ts:2211-2215` (v0.10.1 `2ba9f53`, "fix: preserve reply attachments
+                // (#100)"): `attachments` is threaded through, not dropped. Before this a reply
+                // carrying a file/snippet sent the prose and silently lost the payload — and the
+                // audit entry below recorded the same lie.
                 let result = client
                     .send(&target.from.id, SendOptions {
                         text: message.clone(),
-                        attachments: None,
+                        attachments: params.attachments.clone(),
                         reply_to: Some(target.message.id.clone()),
                         expects_reply: None,
                         message_id: None,
@@ -243,17 +424,30 @@ impl IntercomTool {
                             "intercom_sent",
                             &serde_json::json!({
                                 "to": target.from.name.clone().unwrap_or_else(|| target.from.id.clone()),
-                                "message": { "text": message, "replyTo": target.message.id },
+                                "message": {
+                                    "text": message,
+                                    "attachments": params.attachments,
+                                    "replyTo": target.message.id,
+                                },
                                 "messageId": result.id,
                                 "timestamp": now_ms(),
                             }),
                         );
                     }
-                    // `index.ts:1726`: `Reply sent to ${target.from.name || target.from.id}` —
-                    // name preferred over id (JS `||`, so a blank name falls through to the id).
-                    Ok(text_result(format!("Reply sent to {}.", display_name(&target.from))))
+                    // `v0.10.1 index.ts:2233`: `Reply sent to ${target.from.name || target.from.id}`
+                    // — name preferred over id (JS `||`, so a blank name falls through to the id),
+                    // and NO trailing period.
+                    Ok(text_result(format!("Reply sent to {}", display_name(&target.from))))
                 } else {
-                    Err(ToolError::new(result.reason.unwrap_or_else(|| "reply not delivered".to_string())))
+                    // `v0.10.1 index.ts:2222-2225`: the failure names the peer and keeps pi's
+                    // fallback reason.
+                    let reason = result
+                        .reason
+                        .unwrap_or_else(|| "Session may not exist or has disconnected.".to_string());
+                    Err(ToolError::new(format!(
+                        "Reply to \"{}\" was not delivered: {reason}",
+                        display_name(&target.from)
+                    )))
                 }
             }
             "pending" => {
@@ -316,13 +510,6 @@ impl IntercomTool {
         }
     }
 
-    async fn resolve_or_err(&self, client: &Arc<crate::transport::client::IntercomClient>, to: &str) -> Result<String, ToolError> {
-        self.state
-            .resolve_target(client, to)
-            .await
-            .map_err(to_tool_err)?
-            .ok_or_else(|| ToolError::new(format!("Session not found: \"{to}\"")))
-    }
 }
 
 fn require(value: Option<String>, msg: &str) -> Result<String, ToolError> {
@@ -342,17 +529,27 @@ fn display_name(session: &SessionInfo) -> &str {
     session.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&session.id)
 }
 
-/// `formatSessionListRow` (`v0.9.2 index.ts:423-429`, 7 lines):
+/// `formatSessionListRow` (`v0.10.1 index.ts:448-453`, 6 lines):
 ///
 /// ```text
-/// return `• ${name} (${shortSessionId(session.id)}) — ${session.cwd} (${session.model}${formatContextUsage(session)})${suffix}`;
+/// return `• ${name} (${idPrefix}) — ${session.cwd} (${session.model}${formatContextUsage(session)})${suffix}`;
 /// ```
+///
+/// `idPrefix` is a **fourth argument** from v0.9.3 (`72309e0`) — [`crate::identity::session_id_prefixes`]
+/// computed once per `list` call over the whole roster, replacing the fixed `shortSessionId(session.id)`
+/// that used to sit here. `short_session_id` survives only for the picker label
+/// (`formatSessionLabel`, `v0.10.1 index.ts:440-446`), which upstream deliberately kept at 8.
 ///
 /// The `formatContextUsage(session)` term sits INSIDE the model parentheses (`v0.9.2 index.ts:428`)
 /// and is the only place upstream surfaces a peer's context usage — `ui/session-list.ts` does not.
 /// It renders the empty string whenever `contextPct` is absent, so a peer that reports nothing is
 /// byte-for-byte the pre-v0.8.0 row.
-fn format_session_list_row(session: &SessionInfo, current_cwd: &str, is_self: bool) -> String {
+fn format_session_list_row(
+    session: &SessionInfo,
+    current_cwd: &str,
+    is_self: bool,
+    id_prefix: &str,
+) -> String {
     let name = session
         .name
         .as_deref()
@@ -361,7 +558,10 @@ fn format_session_list_row(session: &SessionInfo, current_cwd: &str, is_self: bo
     let mut tags: Vec<String> = Vec::new();
     if is_self {
         tags.push("self".to_string());
-    } else if session.cwd == current_cwd {
+    } else if crate::cwd::same_cwd(&session.cwd, current_cwd) {
+        // `sameCwd(...)` (`v0.10.1 cwd.ts:29-31`), not a raw byte compare: `/w` and `/w/`, or a
+        // symlinked vs realpath'd cwd, are the SAME project, and a byte compare marked every
+        // session started through a symlink as a different one.
         tags.push("same cwd".to_string());
     }
     if let Some(status) = &session.status {
@@ -371,7 +571,7 @@ fn format_session_list_row(session: &SessionInfo, current_cwd: &str, is_self: bo
     format!(
         "• {} ({}) — {} ({}{}){}",
         name,
-        short_session_id(&session.id),
+        id_prefix,
         session.cwd,
         session.model,
         format_context_usage(session),
@@ -385,8 +585,12 @@ fn parameters_schema() -> serde_json::Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "send", "ask", "reply", "pending", "status"],
+                "enum": ["list", "list-cwd", "send", "ask", "reply", "pending", "status"],
                 "description": "The intercom action to perform."
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Working directory to filter by (list-cwd). Relative paths resolve against this session's cwd; \".\" or omitted means this session's cwd."
             },
             "to": { "type": "string", "description": "Target session name or id (send/ask/reply)." },
             "message": { "type": "string", "description": "Message text (send/ask/reply)." },
@@ -420,7 +624,7 @@ impl Tool for IntercomTool {
     }
 
     fn description(&self) -> &str {
-        "Coordinate with other local agent sessions over the intercom broker: list/send/ask/reply/pending/status."
+        "Coordinate with other local agent sessions over the intercom broker: list/list-cwd/send/ask/reply/pending/status."
     }
 
     async fn execute(
@@ -501,10 +705,45 @@ mod tests {
         assert!(!preview.contains('\n') && !preview.contains('\t'));
     }
 
+    /// ICOM-039 (`v0.10.1 index.ts:448-453` + `:387-406`): the addressable column is a
+    /// DISTINGUISHING prefix over the whole roster, not `short_session_id`'s fixed 8 chars.
+    ///
+    /// Red against the pre-fix row builder: two UUIDv7 ids minted in the same millisecond share far
+    /// more than 8 leading characters, so both rows printed the identical `(0192f3c1)` — and that
+    /// string is exactly what the model is told to address them by, which then failed with
+    /// `Multiple sessions match …`.
+    #[test]
+    fn list_rows_print_distinguishing_id_prefixes_not_a_fixed_slice() {
+        let a = session("0192f3c1-9a10-7000-8000-aaaaaaaaaaaa", "/w");
+        let b = session("0192f3c1-9a10-7000-8000-bbbbbbbbbbbb", "/w");
+        let ids = [a.id.as_str(), b.id.as_str()];
+        let prefixes = crate::identity::session_id_prefixes(ids);
+
+        let row_a = format_session_list_row(&a, "/w", false, prefixes.get(&a.id).expect("a"));
+        let row_b = format_session_list_row(&b, "/w", false, prefixes.get(&b.id).expect("b"));
+        assert!(row_a.contains("(0192f3c1-9a10-7000-8000-a)"), "{row_a}");
+        assert!(row_b.contains("(0192f3c1-9a10-7000-8000-b)"), "{row_b}");
+        assert_ne!(row_a, row_b, "two peers must not print the same addressable id");
+        // The fixed 8-char slice — which upstream deliberately KEPT for the picker label
+        // (`formatSessionLabel`, `v0.10.1 index.ts:440-446`) — would have collided.
+        assert_eq!(short_session_id(&a.id), short_session_id(&b.id));
+    }
+
+    /// ICOM-018 (`v0.10.1 cwd.ts:29-31`): the "same cwd" tag is a NORMALIZED comparison, so a peer
+    /// whose cwd differs only by a trailing slash is still the same project. The raw byte compare
+    /// this replaced marked every symlink-started session as a different one.
+    #[test]
+    fn the_same_cwd_tag_normalizes_before_comparing() {
+        let peer = session("peer-1", "/definitely/not/here/");
+        let row = format_session_list_row(&peer, "/definitely/not/here", false, "peer-1");
+        assert!(row.contains("[same cwd]"), "{row}");
+    }
+
     fn session(id: &str, cwd: &str) -> SessionInfo {
         SessionInfo {
             id: id.to_string(),
             name: Some(id.to_string()),
+            runtime_fallback_alias: None,
             cwd: cwd.to_string(),
             model: "m".to_string(),
             pid: 1u32.into(),

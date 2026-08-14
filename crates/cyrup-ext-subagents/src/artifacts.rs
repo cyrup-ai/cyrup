@@ -165,24 +165,75 @@ pub fn chain_runs_dir(cwd: &Path) -> PathBuf {
     temp_root_dir().join(CHAIN_RUNS_SUBDIR).join(cwd_key(cwd))
 }
 
-/// Resolve the artifacts directory for a run (pi `getArtifactsDir`, `shared/artifacts.ts:160-184`):
-/// a `project_cwd` wins (project-local artifacts dir), else a `session_file`'s sibling
-/// `subagent-artifacts` dir, else the scoped temp root keyed by `temp_cwd`.
+/// SUBA-048 — pi `ArtifactDirPreference` (`shared/types.ts`, validated against
+/// `ARTIFACT_DIR_PREFERENCES` at `extension/config.ts:9,22-24` @v0.43.0, which THROWS on anything
+/// else): where a run's artifact files go.
+///
+/// Config key `subagents.artifactDir` (`shared/types.ts:1857` @v0.47.1). `project` is upstream's
+/// default (`DEFAULT_ARTIFACT_CONFIG.dir`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactDirPreference {
+    /// `<cwd>/.cyrup-subagents/artifacts` — pi's default.
+    #[default]
+    Project,
+    /// The active session file's sibling `subagent-artifacts/` directory; falls back to temp when
+    /// there is no session file.
+    Session,
+    /// The OS temp root, keyed per cwd. Chosen specifically to keep generated transcripts, inputs
+    /// and outputs OUT of a git working tree.
+    Temp,
+}
+
+impl ArtifactDirPreference {
+    /// pi `extension/config.ts:22-24`'s `ARTIFACT_DIR_PREFERENCES` membership test, with upstream's
+    /// exact refusal text.
+    ///
+    /// # Errors
+    ///
+    /// `config.artifactDir must be "project", "session", or "temp"` for anything else.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "project" => Ok(Self::Project),
+            "session" => Ok(Self::Session),
+            "temp" => Ok(Self::Temp),
+            _ => Err(r#"config.artifactDir must be "project", "session", or "temp""#.to_string()),
+        }
+    }
+}
+
+/// Resolve the artifacts directory for a run — pi `getArtifactsDir(sessionFile, projectCwd?,
+/// dirPreference = "project")` (`shared/artifacts.ts:160-183` @v0.43.0).
+///
+/// SUBA-048: this used to take three PATH arguments and no preference, so a `Some(project_cwd)`
+/// always won and `"artifactDir": "temp"` / `"session"` were unreachable — every run wrote
+/// `<cwd>/.cyrup-subagents/…` into the user's repository no matter what the config said. The three
+/// arms below are upstream's, including the fall-throughs: `session` without a session file falls
+/// to temp, and `project` without a project cwd falls to the session sibling and only then to temp.
 #[must_use]
 pub fn resolve_artifacts_dir(
     session_file: Option<&Path>,
     project_cwd: Option<&Path>,
     temp_cwd: &Path,
+    preference: ArtifactDirPreference,
 ) -> PathBuf {
-    if let Some(project) = project_cwd {
-        return project_artifacts_dir(project);
+    let session_sibling = || {
+        session_file
+            .and_then(Path::parent)
+            .map(|parent| parent.join(SESSION_ARTIFACTS_SUBDIR))
+    };
+    match preference {
+        ArtifactDirPreference::Session => {
+            session_sibling().unwrap_or_else(|| temp_artifacts_dir(temp_cwd))
+        }
+        ArtifactDirPreference::Temp => temp_artifacts_dir(temp_cwd),
+        ArtifactDirPreference::Project => {
+            if let Some(project) = project_cwd {
+                return project_artifacts_dir(project);
+            }
+            session_sibling().unwrap_or_else(|| temp_artifacts_dir(temp_cwd))
+        }
     }
-    if let Some(session) = session_file
-        && let Some(parent) = session.parent()
-    {
-        return parent.join(SESSION_ARTIFACTS_SUBDIR);
-    }
-    temp_artifacts_dir(temp_cwd)
 }
 
 /// Replace every character outside pi's `[\w.-]` class with `_` (pi `safeAgent`,
@@ -275,7 +326,12 @@ fn now_ms() -> u128 {
 /// current timestamp. Best-effort throughout — a file that disappears or is unreadable mid-scan is
 /// skipped so one bad entry never blocks the rest.
 pub fn cleanup_old_artifacts(dir: &Path, max_age_days: u64) {
-    if !dir.exists() {
+    // SUBA-059 / pi `if (maxAgeDays <= 0 || !fs.existsSync(dir)) return;`
+    // (`shared/artifacts.ts:231` @v0.47.1). `0` DISABLES the sweep — it is upstream's documented
+    // opt-out (`shared/types.ts:1858`, "Set cleanupDays to 0 to disable cleanup") and it MUST be
+    // checked before the arithmetic below, where `now - 0 * ONE_DAY_MS` is `now` and would delete
+    // every artifact rather than none.
+    if max_age_days == 0 || !dir.exists() {
         return;
     }
 
@@ -508,6 +564,105 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
+
+    /// SUBA-048 — pi `getArtifactsDir(sessionFile, projectCwd?, dirPreference = "project")`
+    /// (`shared/artifacts.ts:160-183` @v0.43.0), all three arms plus their fall-throughs.
+    ///
+    /// THE USER ACTION: a user sets `"artifactDir": "temp"` specifically to keep generated
+    /// transcripts, inputs and outputs out of a git working tree. Before the fix the resolver took
+    /// three PATH arguments and NO preference, so `Some(project_cwd)` always won and `session`/
+    /// `temp` were not expressible at all — the config key was accepted and inert.
+    #[test]
+    fn the_artifact_dir_preference_selects_pis_three_arms() {
+        let session_file = Path::new("/sessions/abc/session.jsonl");
+        let project = Path::new("/repo");
+        let temp_cwd = Path::new("/repo");
+        let session_sibling = Path::new("/sessions/abc").join(SESSION_ARTIFACTS_SUBDIR);
+
+        // `temp` ignores BOTH a project cwd and a session file.
+        assert_eq!(
+            resolve_artifacts_dir(
+                Some(session_file),
+                Some(project),
+                temp_cwd,
+                ArtifactDirPreference::Temp
+            ),
+            temp_artifacts_dir(temp_cwd)
+        );
+        // `session` ignores the project cwd...
+        assert_eq!(
+            resolve_artifacts_dir(
+                Some(session_file),
+                Some(project),
+                temp_cwd,
+                ArtifactDirPreference::Session
+            ),
+            session_sibling
+        );
+        // ...and falls back to temp when there is no session file (pi's `return TEMP_ARTIFACTS_DIR`).
+        assert_eq!(
+            resolve_artifacts_dir(None, Some(project), temp_cwd, ArtifactDirPreference::Session),
+            temp_artifacts_dir(temp_cwd)
+        );
+        // `project` is upstream's default and keeps the previous three-way fall-through.
+        assert_eq!(
+            resolve_artifacts_dir(
+                Some(session_file),
+                Some(project),
+                temp_cwd,
+                ArtifactDirPreference::Project
+            ),
+            project_artifacts_dir(project)
+        );
+        assert_eq!(
+            resolve_artifacts_dir(Some(session_file), None, temp_cwd, ArtifactDirPreference::Project),
+            session_sibling
+        );
+        assert_eq!(
+            resolve_artifacts_dir(None, None, temp_cwd, ArtifactDirPreference::Project),
+            temp_artifacts_dir(temp_cwd)
+        );
+        // The default IS `project` (pi `DEFAULT_ARTIFACT_CONFIG.dir`).
+        assert_eq!(ArtifactDirPreference::default(), ArtifactDirPreference::Project);
+    }
+
+    /// SUBA-048's validation half — pi `extension/config.ts:22-24,51-53` THROWS on an unsupported
+    /// value where cyrup silently ignored a good one.
+    #[test]
+    fn an_unsupported_artifact_dir_is_refused_with_pis_text() {
+        for ok in ["project", "session", "temp"] {
+            assert!(ArtifactDirPreference::parse(ok).is_ok(), "{ok}");
+        }
+        assert_eq!(
+            ArtifactDirPreference::parse("Project").expect_err("case-sensitive, like upstream"),
+            r#"config.artifactDir must be "project", "session", or "temp""#
+        );
+        assert_eq!(
+            ArtifactDirPreference::parse("").expect_err("empty is not a preference"),
+            r#"config.artifactDir must be "project", "session", or "temp""#
+        );
+    }
+
+    /// SUBA-059 — pi `if (maxAgeDays <= 0 || !fs.existsSync(dir)) return;`
+    /// (`shared/artifacts.ts:231` @v0.47.1). `cleanupDays: 0` DISABLES the sweep.
+    ///
+    /// Red before the fix in the worst possible direction: `cutoff = now - 0 * ONE_DAY_MS` is
+    /// `now`, so every artifact's mtime was below it and a user asking to keep everything would
+    /// have had everything deleted.
+    #[test]
+    fn a_zero_cleanup_horizon_disables_the_sweep_instead_of_purging_everything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("run_agent_output.md");
+        std::fs::write(&victim, "the record of what the fan-out did").expect("write");
+
+        cleanup_old_artifacts(dir.path(), 0);
+        assert!(
+            victim.exists(),
+            "cleanupDays: 0 must disable the sweep, not delete everything"
+        );
+        // ...and it must not even write the throttle marker, since it returned before doing work.
+        assert!(!dir.path().join(CLEANUP_MARKER_FILE).exists());
+    }
 
     #[test]
     fn artifact_paths_match_pi_getartifactpaths_naming() {

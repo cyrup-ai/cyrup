@@ -27,7 +27,7 @@
 //! ([`FooterDataProvider.WATCH_DEBOUNCE_MS`]); [`POLL_INTERVAL`] is the same figure, and the poll
 //! costs one `stat` — strictly less than the 80 ms spinner tick the loop already pays while working.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 /// Pi's `WATCH_DEBOUNCE_MS` (`footer-data-provider.ts`), reused as cyrup's poll period: the longest
@@ -43,73 +43,15 @@ const REFTABLE_PLACEHOLDER: &str = ".invalid";
 /// What Pi reports for a HEAD that names a commit rather than a branch.
 const DETACHED: &str = "detached";
 
-/// Git metadata locations for one working tree — Pi's `GitPaths`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GitPaths {
-    /// The directory that contains `.git` (Pi's `repoDir`) — the cwd `git` is invoked from.
-    pub repo_dir: PathBuf,
-    /// The *shared* git dir (Pi's `commonGitDir`): the `.git` dir itself for a normal checkout, or
-    /// the `commondir` target for a linked worktree. `reftable/` lives here.
-    pub common_git_dir: PathBuf,
-    /// The HEAD file to read (Pi's `headPath`) — per-worktree, NOT under `common_git_dir`.
-    pub head_path: PathBuf,
-}
-
-/// Resolve `relative` against `base` the way Node's `path.resolve(base, rel)` does: an absolute
-/// `relative` wins outright, otherwise it is joined onto `base`.
-fn resolve_against(base: &Path, relative: &str) -> PathBuf {
-    let p = Path::new(relative);
-    if p.is_absolute() { p.to_path_buf() } else { base.join(p) }
-}
-
-/// Pi's `findGitPaths` (`footer-data-provider.ts`): walk up from `cwd` to the filesystem root
-/// looking for `.git`, returning `None` when there is none (or when the one found has no `HEAD`).
+/// SESS-013 — `GitPaths` + `findGitPaths` (pi `footer-data-provider.ts:16-48`) live ONCE, in
+/// `cyrup-session`, and are re-exported here.
 ///
-/// Both layouts are handled, exactly as upstream:
-/// * `.git` is a **directory** — a normal clone; `HEAD` and the object store are both inside it.
-/// * `.git` is a **file** holding `gitdir: <path>` — a linked worktree or a submodule; `HEAD` lives
-///   in that git dir, while the shared dir comes from its `commondir` file when present.
-///
-/// A `.git` file that does NOT start with `gitdir: ` is ignored and the walk continues upward, which
-/// is what upstream's fall-through does.
-pub fn find_git_paths(cwd: &Path) -> Option<GitPaths> {
-    let mut dir = cwd.to_path_buf();
-    loop {
-        let git_path = dir.join(".git");
-        if let Ok(meta) = std::fs::metadata(&git_path) {
-            if meta.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&git_path)
-                    && let Some(rest) = content.trim().strip_prefix("gitdir: ")
-                {
-                    let git_dir = resolve_against(&dir, rest.trim());
-                    let head_path = git_dir.join("HEAD");
-                    if !head_path.exists() {
-                        return None;
-                    }
-                    let common_dir_path = git_dir.join("commondir");
-                    let common_git_dir = match std::fs::read_to_string(&common_dir_path) {
-                        Ok(c) => resolve_against(&git_dir, c.trim()),
-                        Err(_) => git_dir,
-                    };
-                    return Some(GitPaths { repo_dir: dir, common_git_dir, head_path });
-                }
-            } else if meta.is_dir() {
-                let head_path = git_path.join("HEAD");
-                if !head_path.exists() {
-                    return None;
-                }
-                return Some(GitPaths {
-                    repo_dir: dir,
-                    common_git_dir: git_path,
-                    head_path,
-                });
-            }
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
+/// pi has exactly one definition and both consumers import it (`resource-loader.ts:19`). This
+/// module used to carry a byte-for-byte second copy of the struct, the `path.resolve` helper and
+/// the whole upward `.git` walk; two copies of one predicate is the shape SESS-044 had just been
+/// filed for, and a fix applied to one of them (the linked-worktree `commondir` rung, say) would
+/// silently not reach the footer.
+pub use cyrup_session_svc::{find_git_paths, GitPaths};
 
 /// Pi's `resolveGitBranchSync`: the branch named by `HEAD`, `"detached"` when HEAD holds a raw
 /// commit, and `None` when HEAD cannot be read at all.

@@ -15,7 +15,7 @@ pub const MANIFEST_FILE: &str = "extension.json";
 pub struct ExtensionManifest {
     pub id: String,
     pub version: String,
-    /// WIT world compatibility, e.g. `cyrup:ext@0.3` (see [`HOST_WORLD`]).
+    /// WIT world compatibility, e.g. `cyrup:ext@0.5` (see [`HOST_WORLD`]).
     pub world: String,
     /// Source entry for a Tier-1 build; absent for a prebuilt `.wasm` package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,7 +149,23 @@ impl Capabilities {
 ///   ZERO-argument signature, which the 0.4 host no longer provides, so it fails to LINK exactly
 ///   the way a stale export does. (The `ctx-state.get-mode`/`has-ui` additions in the same batch
 ///   were purely additive imports and would not have required a bump on their own.)
-pub const HOST_WORLD: &str = "cyrup:ext@0.4";
+/// - 0.4 → 0.5 (ADR-0002's single batched bump; the "anything needing a new export is a member"
+///   rule): the payload-parity batch. EXPORT ADDITIONS — `events.on-before-provider-headers`
+///   (EXT-009), `events.on-session-info-changed` (EXT-011), `events.prepare-arguments` (EXT-023).
+///   EXPORT RE-SIGNINGS — `on-tool-exec-update`/`on-tool-exec-end` gained `name` (and `args-json`
+///   on the update, EXT-014); `on-session-start`/`on-session-shutdown`/`on-session-before-switch`/
+///   `on-session-before-fork` gained their discriminating fields (EXT-015);
+///   `on-resources-discover` gained `cwd`+`reason` (EXT-016); `on-project-trust` gained `cwd`
+///   (EXT-043); `on-model-select`/`on-thinking-level-select` gained their sibling fields
+///   (EXT-042); and `types.hook-outcome`'s `block` arm became a `block-result` record carrying
+///   `terminate` (EXT-049), which re-signs EVERY hook export at once. IMPORT RE-SIGNING —
+///   `session.set-label`'s `label` became `option<string>` so it can CLEAR (EXT-046). The
+///   `tool-descriptor` record gained `prepare-arguments` + `render-shell` (EXT-023 / EXT-024),
+///   which is a re-signing of the `registration.register-tool` import. (Additive IMPORTS in the
+///   same batch, which would not have required a bump on their own: `ctx-state.get-cwd`
+///   (EXT-044), `ctx-state.is-run-cancelled` + `models.scoped-models` (EXT-045),
+///   `bus.unsubscribe` (EXT-050), `provider-stream.on-payload`/`on-response` (EXT-052).)
+pub const HOST_WORLD: &str = "cyrup:ext@0.5";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

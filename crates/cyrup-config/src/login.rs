@@ -18,7 +18,6 @@
 //! | [`LoginError`] | `packages/ai/src/auth/resolve.ts:15-39` — `ModelsError`, codes `provider`/`auth` |
 //! | [`login`] | `packages/ai/src/models.ts:431-444` (`Models.login`) |
 //! | [`logout`] | `packages/ai/src/models.ts:446-452` (`Models.logout`) |
-//! | [`env_api_key_login`] | `packages/ai/src/auth/helpers.ts:9-27` (`envApiKeyAuth`'s `login`) |
 //! | [`provider_auth_status`] | `packages/coding-agent/src/core/model-runtime.ts:428-437` |
 //! | [`login_provider_options`] | `.../interactive-mode.ts:4857-4887` (`getLoginProviderOptions`) |
 //! | [`logout_provider_options`] | `.../interactive-mode.ts:4889-4898` (`getLogoutProviderOptions`) |
@@ -30,22 +29,15 @@
 //!
 //! ## Mechanism divergences (behaviour is the upstream one)
 //!
-//! * **`ApiKeyAuth` has no `login` member here.** Upstream `ApiKeyAuth.login?` is optional and
-//!   per-provider (`auth/types.ts:165`): `envApiKeyAuth` supplies a one-secret prompt
-//!   (`helpers.ts:12-13`), Cloudflare a two-prompt one (`providers/cloudflare-auth.ts:48-53`),
-//!   Vertex a four-prompt one (`providers/google-vertex.ts:15-45`), and ambient-only strategies
-//!   omit it. `cyrup_provider::auth::ApiKeyAuth` carries only `name`/`resolve`, and that trait is
-//!   outside this change. So the env-key login — the one every cyrup built-in except a
-//!   `keyless_local` provider uses — is ported here as [`env_api_key_login`], and
-//!   [`api_key_strategy_supports_login`] answers "does this strategy have a login?" from the
-//!   strategy's `name()`, the only signal the trait exposes. The two multi-prompt api-key logins
-//!   are still unported and need a `login` member on the trait.
-//! * **`env_key()` drops upstream's display name.** pi writes `envApiKeyAuth("OpenRouter API key",
-//!   ["OPENROUTER_API_KEY"])`, so `method.name` is a user-facing string; cyrup's
-//!   `cyrup_provider::auth::env_key(...)` hardcodes `"env-key"`. [`api_key_login_label`]
-//!   reconstructs upstream's string as `"{provider name} API key"` for that sentinel and passes
-//!   any other strategy's `name()` through untouched, so `Enter OpenRouter API key`
-//!   (`helpers.ts:12`) is byte-identical to pi's prompt.
+//! * ~~**`ApiKeyAuth` has no `login` member here.**~~ CLOSED by ADR-0010 step 2 (CFG-005).
+//!   `cyrup_provider::auth::ApiKeyAuth` now carries `supports_login`/`login`, the faithful stand-in
+//!   for upstream's optional `login?` member (`auth/types.ts:165-166`), and every strategy
+//!   implements its own: `EnvKeyAuth` the one-secret prompt (`helpers.ts:12-15`), Cloudflare the
+//!   two-prompt one (`providers/cloudflare-auth.ts:48-53`), Vertex the four-prompt one
+//!   (`providers/google-vertex.ts:15-45`). [`login`] dispatches to it unconditionally, and the
+//!   name sniffer that used to answer "does this strategy have a login?" from `name()` is deleted,
+//!   as is this module's `env_api_key_login` — that body now lives where upstream puts it, inside
+//!   `envApiKeyAuth` itself (`cyrup_provider::auth::env_key`).
 //! * **`Provider` has no `name()`.** Upstream's `Provider` interface carries `name` and
 //!   `getLoginProviderOptions` reads it off the registry; cyrup's `Provider` trait exposes only
 //!   `id()` (the display name lives on the concrete `WireProvider`). The option builders therefore
@@ -58,7 +50,7 @@ use std::collections::HashMap;
 
 use cyrup_core::ProviderId;
 use cyrup_provider::auth::ProviderAuth;
-use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
+use cyrup_provider::auth::oauth::{AuthInteraction, OAuthError};
 
 use crate::auth::{AuthSource, AuthStatus, AuthStore, Credential};
 
@@ -71,10 +63,9 @@ pub const NO_LOGIN_METHODS: &str = "No login methods available.";
 /// The `/logout`-with-nothing-stored status (`interactive-mode.ts:5055-5059`), verbatim — pi spells
 /// out that `/logout` is narrower than it looks.
 pub const NO_STORED_CREDENTIALS: &str = "No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.";
-/// The strategy name `cyrup_provider::auth::env_key` reports (`auth/helpers.rs:35`). Upstream has a
-/// real display name here; see the module divergence note.
-pub const ENV_KEY_STRATEGY: &str = "env-key";
-/// The strategy name `cyrup_provider::auth::keyless_local` reports (`auth/helpers.rs:77`).
+/// The strategy name `cyrup_provider::auth::keyless_local` reports (`auth/helpers.rs`). Kept as a
+/// named constant because it is the one built-in api-key strategy with NO upstream `login`
+/// (pi's local servers need no credential), i.e. the one whose `supports_login()` is `false`.
 pub const KEYLESS_LOCAL_STRATEGY: &str = "keyless-local";
 
 /// `AuthType` (`ai/src/auth/types.ts:111`). [`AuthType::as_str`] is the wire spelling the
@@ -306,57 +297,15 @@ pub fn credential_from_provider(value: cyrup_provider::Credential) -> Credential
     }
 }
 
-/// Does this api-key strategy have an interactive login?
-///
-/// Upstream the answer is `method.login !== undefined` (`interactive-mode.ts:4940`). cyrup's
-/// `ApiKeyAuth` trait has no `login`, so the strategy's `name()` stands in: a `keyless_local`
-/// provider needs no credential at all (`auth/helpers.rs:72-88`, pi's local servers), and every
-/// other strategy has one upstream — `envApiKeyAuth` (`helpers.ts:12`), Cloudflare
-/// (`cloudflare-auth.ts:48`), Vertex (`google-vertex.ts:15`), Bedrock (`amazon-bedrock.ts:13`).
-pub fn api_key_strategy_supports_login(strategy_name: &str) -> bool {
-    strategy_name != KEYLESS_LOCAL_STRATEGY
-}
-
-/// The user-facing name of an api-key strategy — upstream's `ApiKeyAuth.name`.
-///
-/// pi passes it in at the provider definition (`envApiKeyAuth("OpenRouter API key", …)`,
-/// `providers/openrouter.ts:13`); cyrup's shared `env_key()` helper reports the sentinel
-/// [`ENV_KEY_STRATEGY`] for every provider, so the upstream string is reconstructed from the
-/// provider's display name. Any strategy with a real name (`"Google Cloud credentials"`,
-/// `"Cloudflare API key"`) passes through unchanged.
-pub fn api_key_login_label(strategy_name: &str, provider_name: &str) -> String {
-    if strategy_name == ENV_KEY_STRATEGY {
-        format!("{provider_name} API key")
-    } else {
-        strategy_name.to_string()
-    }
-}
-
-/// `envApiKeyAuth`'s `login` (`ai/src/auth/helpers.ts:12-13`):
-///
-/// ```ts
-/// const key = await interaction.prompt({ type: "secret", message: `Enter ${name}` });
-/// return { type: "api_key", key };
-/// ```
-///
-/// `name` is [`api_key_login_label`]'s result, so the prompt reads `Enter OpenRouter API key`.
-pub async fn env_api_key_login(
-    name: &str,
-    interaction: &dyn AuthInteraction,
-) -> Result<Credential, OAuthError> {
-    let key = interaction
-        .prompt(AuthPrompt::secret(format!("Enter {name}")))
-        .await?;
-    Ok(Credential::api_key(key))
-}
 
 /// `ModelRuntime.getProviderAuthStatus` (`model-runtime.ts:428-437`) over the file store:
 /// runtime `--api-key` → stored credential → environment variable → nothing.
 ///
-/// Note this is **not** [`AuthStore::get_auth_status`], which reports `configured: false` for the
-/// runtime and environment tiers; at v0.83.0 all three tiers report `configured: true` and only
-/// the `source` distinguishes them. `AuthStore::get_auth_status` cites `auth-storage.ts:354-369`,
-/// a function that no longer exists at this tag.
+/// This is the ONLY status function. `AuthStore::get_auth_status` — which reported
+/// `configured: false` for the runtime and environment tiers, the opposite of upstream, on a cite
+/// (`auth-storage.ts:354-369`) that resolves past the end of a 271-line file at v0.83.0 — was
+/// deleted by CFG-044. At v0.83.0 all three tiers report `configured: true` and only the `source`
+/// distinguishes them.
 pub fn provider_auth_status(
     store: &AuthStore,
     provider: &ProviderId,
@@ -466,14 +415,17 @@ pub fn login_provider_options(
         if matches!(auth_type, None | Some(AuthType::ApiKey))
             && let Some(api_key) = provider.auth.api_key.as_ref()
         {
-            let strategy = api_key.name();
             options.push(LoginProviderOption {
                 id: provider.id.clone(),
                 name: provider.name.clone(),
                 auth_type: AuthType::ApiKey,
-                method_name: Some(api_key_login_label(strategy, &provider.name)),
+                // `method: provider.auth.apiKey` (:4880) — the option carries the strategy whole,
+                // so its label is `method.name` verbatim. No reconstruction: `env_key` now carries
+                // upstream's display string (`ai/src/auth/helpers.ts:9`).
+                method_name: Some(api_key.name().to_string()),
                 login_label: None,
-                supports_login: api_key_strategy_supports_login(strategy),
+                // `method.login !== undefined` (`interactive-mode.ts:4942`).
+                supports_login: api_key.supports_login(),
                 status: status.clone(),
             });
         }
@@ -784,21 +736,27 @@ pub async fn login(
             credential_from_provider(oauth.login(interaction).await?)
         }
         AuthType::ApiKey => {
-            // `!method?.login`: no api-key strategy at all, or one whose upstream counterpart
-            // omits `login` (see `api_key_strategy_supports_login`).
+            // `if (!method?.login) throw new ModelsError("auth", …)` (`ai/src/models.ts:433-435`
+            // @v0.83.0): no api-key strategy at all, or one that omits `login`. ADR-0010 step 2 —
+            // the answer comes from the strategy itself now, not from sniffing its display name.
             let Some(api_key) = provider
                 .auth
                 .api_key
                 .as_ref()
-                .filter(|s| api_key_strategy_supports_login(s.name()))
+                .filter(|s| s.supports_login())
             else {
                 return Err(LoginError::Unsupported {
                     name: provider.name.clone(),
                     auth_type,
                 });
             };
-            let label = api_key_login_label(api_key.name(), &provider.name);
-            env_api_key_login(&label, interaction).await?
+            // `await method.login(interaction)` (`ai/src/models.ts:436` @v0.83.0). Every strategy
+            // runs its OWN flow: `EnvKeyAuth` the one-secret prompt (`auth/helpers.ts:12-15`), and
+            // the multi-prompt ones — Cloudflare Workers AI / AI Gateway, Google Vertex, Amazon
+            // Bedrock — the account id / project+location / AWS profile they additionally need.
+            // Running the generic one-secret flow for those stored a partial credential and
+            // reported success (ADR-0010 §"(3)").
+            credential_from_provider(api_key.login(interaction).await?)
         }
     };
 
@@ -836,26 +794,9 @@ mod tests {
 
     use super::*;
     use cyrup_provider::auth::oauth::ScriptedInteraction;
-    use cyrup_provider::auth::{ApiKeyAuth, AuthContext, AuthResult, OAuthAuth};
-    use cyrup_provider::{AuthError as ProviderAuthError, CredentialStore, Model, ModelAuth};
+    use cyrup_provider::auth::OAuthAuth;
+    use cyrup_provider::{AuthError as ProviderAuthError, CredentialStore, ModelAuth};
     use std::sync::Arc;
-
-    struct NamedApiKey(&'static str);
-
-    #[async_trait::async_trait]
-    impl ApiKeyAuth for NamedApiKey {
-        fn name(&self) -> &str {
-            self.0
-        }
-        async fn resolve(
-            &self,
-            _model: &Model,
-            _ctx: &dyn AuthContext,
-            _cred: Option<&cyrup_provider::Credential>,
-        ) -> Result<Option<AuthResult>, ProviderAuthError> {
-            Ok(None)
-        }
-    }
 
     struct StubOauth {
         name: &'static str,
@@ -877,7 +818,7 @@ mod tests {
         ) -> Result<cyrup_provider::Credential, OAuthError> {
             // Consume one scripted answer so a test can drive a cancel through the flow.
             interaction
-                .prompt(AuthPrompt::text("paste the code"))
+                .prompt(cyrup_provider::auth::oauth::AuthPrompt::text("paste the code"))
                 .await?;
             Ok(self.credential.clone())
         }
@@ -922,11 +863,18 @@ mod tests {
         }
     }
 
+    /// The REAL `envApiKeyAuth` strategy (`cyrup_provider::auth::env_key`), carrying upstream's
+    /// display name the way `providers/openrouter.ts:13` does. CFG-005: these fixtures used to be a
+    /// local stub reporting the `"env-key"` sentinel, which meant no test ever exercised
+    /// `EnvKeyAuth::supports_login`/`::login` — the two members the sniffer stood in for.
     fn env_key_provider(id: &str, name: &str) -> ProviderLoginInput {
         provider(
             id,
             name,
-            ProviderAuth::with_api_key(Arc::new(NamedApiKey(ENV_KEY_STRATEGY))),
+            ProviderAuth::with_api_key(cyrup_provider::auth::env_key(
+                format!("{name} API key"),
+                Vec::<String>::new(),
+            )),
         )
     }
 
@@ -939,7 +887,10 @@ mod tests {
             id,
             name,
             ProviderAuth {
-                api_key: Some(Arc::new(NamedApiKey(ENV_KEY_STRATEGY))),
+                api_key: Some(cyrup_provider::auth::env_key(
+                    format!("{name} API key"),
+                    Vec::<String>::new(),
+                )),
                 oauth: Some(Arc::new(StubOauth {
                     name: "Anthropic (Claude Pro/Max)",
                     login_label,
@@ -1055,7 +1006,7 @@ mod tests {
         let providers = vec![provider(
             "ollama",
             "Ollama",
-            ProviderAuth::with_api_key(Arc::new(NamedApiKey(KEYLESS_LOCAL_STRATEGY))),
+            ProviderAuth::with_api_key(cyrup_provider::auth::keyless_local()),
         )];
         let options = login_provider_options(&providers, None);
         assert!(!options[0].supports_login);
@@ -1427,7 +1378,7 @@ mod tests {
         let ambient = vec![provider(
             "ollama",
             "Ollama",
-            ProviderAuth::with_api_key(Arc::new(NamedApiKey(KEYLESS_LOCAL_STRATEGY))),
+            ProviderAuth::with_api_key(cyrup_provider::auth::keyless_local()),
         )];
         let error = login(
             &store,
@@ -1691,18 +1642,66 @@ mod tests {
         assert_eq!(AuthType::Oauth.selector_label(), "subscription");
     }
 
-    /// The env-key sentinel is reconstructed; a real strategy name passes through
-    /// (`ai/src/providers/google-vertex.ts:14`).
+    /// CFG-005 / ADR-0010 step 2 — the "does this strategy have a login?" answer comes from the
+    /// STRATEGY (`method.login !== undefined`, `interactive-mode.ts:4942`), not from sniffing its
+    /// display name, and the listed label is `method.name` verbatim (`:4880`).
+    ///
+    /// RED before this pass: `api_key_strategy_supports_login` answered `name != "keyless-local"`,
+    /// so a `Vec<Arc<dyn ApiKeyAuth>>` of strategies whose names collide with neither sentinel —
+    /// exactly what `keyless_local()` and a bespoke multi-prompt strategy are — could not be
+    /// distinguished, and `env_key`'s own label was rebuilt as `"{provider name} API key"`, which
+    /// is wrong for `huggingface` ("Hugging Face token", `providers/huggingface.ts:11`) and for
+    /// `moonshotai-cn` ("Moonshot AI API key", `providers/moonshotai-cn.ts:11`).
     #[test]
-    fn api_key_login_label_reconstructs_only_the_sentinel() {
+    fn the_login_option_reads_its_label_and_login_support_off_the_strategy() {
+        // pi: `envApiKeyAuth("Hugging Face token", ["HF_TOKEN"])` on a provider NAMED "Hugging Face".
+        let hf = provider(
+            "huggingface",
+            "Hugging Face",
+            ProviderAuth::with_api_key(cyrup_provider::auth::env_key(
+                "Hugging Face token",
+                ["HF_TOKEN"],
+            )),
+        );
+        let options = login_provider_options(&[hf], None);
+        assert_eq!(options[0].method_name.as_deref(), Some("Hugging Face token"));
+        assert!(
+            options[0].supports_login,
+            "`envApiKeyAuth` always defines `login` (`ai/src/auth/helpers.ts:12-15`)"
+        );
+
+        // A strategy that omits `login` — pi's local servers.
+        let local = provider(
+            "ollama",
+            "Ollama",
+            ProviderAuth::with_api_key(cyrup_provider::auth::keyless_local()),
+        );
+        let options = login_provider_options(&[local], None);
+        assert!(!options[0].supports_login);
+    }
+
+    /// `EnvKeyAuth::login` is upstream's `envApiKeyAuth` body (`ai/src/auth/helpers.ts:12-15`): one
+    /// SECRET prompt reading `Enter {name}`, where `{name}` is the strategy's display string — not
+    /// a label rebuilt from the provider's name by the caller.
+    #[tokio::test]
+    async fn env_key_login_prompts_with_the_strategys_own_display_name() {
+        use cyrup_provider::auth::oauth::ScriptedInteraction;
+        let strategy = cyrup_provider::auth::env_key("Hugging Face token", ["HF_TOKEN"]);
+        let interaction = ScriptedInteraction::new(vec![Ok("hf_secret".to_string())]);
+        let cred = strategy.login(&interaction).await.expect("login");
         assert_eq!(
-            api_key_login_label(ENV_KEY_STRATEGY, "OpenRouter"),
-            "OpenRouter API key"
+            interaction.prompts()[0].message,
+            "Enter Hugging Face token",
+            "`message: `Enter ${{name}}`` (`ai/src/auth/helpers.ts:13`)"
         );
         assert_eq!(
-            api_key_login_label("Google Cloud credentials", "Google Vertex AI"),
-            "Google Cloud credentials"
+            interaction.prompts()[0].kind,
+            Some(cyrup_provider::auth::AuthPromptKind::Secret)
         );
+        assert!(matches!(
+            cred,
+            cyrup_provider::Credential::ApiKey { ref key, .. } if key.as_deref() == Some("hf_secret")
+        ));
     }
 
     #[test]

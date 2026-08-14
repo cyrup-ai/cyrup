@@ -534,7 +534,58 @@ pub fn resolve_config_value_or_throw(
     }
 }
 
+/// Async entry point for [`resolve_config_value`], for callers already inside a tokio runtime.
+///
+/// The body is unchanged and synchronous — pi's is too (`execSync(command, { timeout: 10000 })`,
+/// resolve-config-value.ts:186-196 @v0.83.0, inside an async `resolve`) — but a `!command`
+/// credential helper can occupy the calling thread for up to the full 10 s ceiling. pi has one
+/// event loop to block; cyrup has N tokio workers, and holding one of them for 10 s degrades
+/// unrelated concurrent work. Moving the blocking body onto the blocking pool keeps pi's timing
+/// EXACTLY (the 10 s is pi's number and is not touched here) while freeing the worker. CFG-028.
+pub async fn resolve_config_value_async(
+    config: &str,
+    env: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    // A pure template needs no process at all; staying on the caller's thread avoids a pool
+    // round-trip on the overwhelmingly common path.
+    if !is_command_config_value(config) {
+        return resolve_config_value(config, env);
+    }
+    let config = config.to_string();
+    let env = env.cloned();
+    match tokio::task::spawn_blocking(move || resolve_config_value(&config, env.as_ref())).await {
+        Ok(v) => v,
+        // A panic in the blocking body is "unresolvable", the same answer the sync path gives for
+        // a command that fails.
+        Err(_) => None,
+    }
+}
+
+/// Async entry point for [`resolve_config_value_or_throw`]. See
+/// [`resolve_config_value_async`] for why the blocking body is moved off the worker. CFG-028.
+pub async fn resolve_config_value_or_throw_async(
+    config: &str,
+    description: &str,
+    env: Option<&HashMap<String, String>>,
+) -> Result<String, String> {
+    if !is_command_config_value(config) {
+        return resolve_config_value_or_throw(config, description, env);
+    }
+    let config_owned = config.to_string();
+    let description_owned = description.to_string();
+    let env_owned = env.cloned();
+    match tokio::task::spawn_blocking(move || {
+        resolve_config_value_or_throw(&config_owned, &description_owned, env_owned.as_ref())
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => Err(format!("Failed to resolve {description}")),
+    }
+}
+
 /// Port of `resolveHeaders` (:256-269): resolve each header value (cached); drop ones that resolve
+/// to nothing; `None` when no header survives./// Port of `resolveHeaders` (:256-269): resolve each header value (cached); drop ones that resolve
 /// to nothing; `None` when no header survives.
 pub fn resolve_headers(
     headers: Option<&HashMap<String, String>>,

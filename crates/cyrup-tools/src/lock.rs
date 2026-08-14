@@ -29,6 +29,25 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 static FILE_MUTATION_LOCKS: LazyLock<Arc<DashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Arc::new(DashMap::new()));
 
+/// Pi `isMissingPathError` (file-mutation-queue.ts:7-14): `error.code === "ENOENT" || error.code
+/// === "ENOTDIR"`, and NOTHING else. Every other realpath failure is re-thrown at `:24`.
+fn is_missing_path_error(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // `ENOTDIR` has no stable `std::io::ErrorKind`, so match the raw errno.
+        e.raw_os_error() == Some(libc::ENOTDIR)
+    }
+    #[cfg(not(unix))]
+    {
+        // Win32's `ERROR_PATH_NOT_FOUND` / `ERROR_DIRECTORY` are what libuv maps to ENOTDIR; both
+        // surface as `NotFound` above on this platform, so there is nothing further to test.
+        false
+    }
+}
+
 /// A handle onto the process-global map of per-path async mutexes, keyed by a fully-resolved
 /// (realpath) path.
 ///
@@ -79,11 +98,37 @@ impl FileMutationLocks {
         Self { map: Arc::clone(&FILE_MUTATION_LOCKS) }
     }
 
-    /// Full-symlink-resolved key (Pi `realpath(resolve(filePath))`, file-mutation-queue.ts:16-26).
-    /// Falls back to the (already absolute) path when it does not exist yet — e.g. a `write` to a
-    /// brand-new file — mirroring Pi's ENOENT/ENOTDIR fallback.
-    fn key(path: &Path) -> PathBuf {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    /// Full-symlink-resolved key — a 1:1 port of Pi's `getMutationQueueKey`
+    /// (file-mutation-queue.ts:16-26):
+    /// ```ts
+    /// async function getMutationQueueKey(filePath: string): Promise<string> {
+    ///   const resolvedPath = resolve(filePath);
+    ///   try { return await realpath(resolvedPath); }
+    ///   catch (error) { if (isMissingPathError(error)) return resolvedPath; throw error; }
+    /// }
+    /// ```
+    ///
+    /// Two properties are load-bearing and were both wrong before.
+    ///
+    /// 1. **Non-blocking.** Pi's helper is `async` and `await realpath(...)`. `std::fs::canonicalize`
+    ///    is a BLOCKING `realpath(2)` on a tokio worker thread, and [`Self::guard`] is awaited by
+    ///    both mutators on every call, so an NFS/SSHFS/FUSE mount or a deep symlink chain stalled
+    ///    the whole runtime — unrelated in-flight tool calls and the provider stream included.
+    ///    `tokio::fs::canonicalize` runs it on the blocking pool instead.
+    /// 2. **A narrow catch.** Pi's `isMissingPathError` (file-mutation-queue.ts:7-14) tests ONLY
+    ///    `ENOENT` and `ENOTDIR` — the "writing a brand-new file" case — and `:24` re-`throw`s
+    ///    everything else, which propagates out of `withFileMutationQueue` (`:34`) BEFORE `fn()`
+    ///    runs, so the write/edit fails with the realpath errno rather than the later `open(2)`
+    ///    one. `unwrap_or_else(|_| …)` swallowed every kind, including EACCES on a parent's search
+    ///    bit, ELOOP and ENAMETOOLONG.
+    async fn key(path: &Path) -> Result<PathBuf, ToolError> {
+        match tokio::fs::canonicalize(path).await {
+            Ok(resolved) => Ok(resolved),
+            // Pi's `isMissingPathError`: ENOENT / ENOTDIR only. `ErrorKind::NotFound` is ENOENT;
+            // ENOTDIR has no stable `ErrorKind` on stable Rust, so it is matched on the raw errno.
+            Err(e) if is_missing_path_error(&e) => Ok(path.to_path_buf()),
+            Err(e) => Err(error::io_errno(&error::show(path), &e)),
+        }
     }
 
     /// Acquire the lock for `path` for the whole read-modify-write. Cancel-aware: returns
@@ -93,7 +138,7 @@ impl FileMutationLocks {
         path: &Path,
         cancel: &CancelToken,
     ) -> Result<MutationGuard, ToolError> {
-        let key = Self::key(path);
+        let key = Self::key(path).await?;
         let lock = self.map.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone();
         tokio::select! {
             _ = cancel.cancelled() => Err(error::aborted()),
@@ -168,7 +213,7 @@ mod tests {
         let path = unique_path("shared-domain");
         let cancel = CancelToken::new();
 
-        let key = FileMutationLocks::key(&path);
+        let key = FileMutationLocks::key(&path).await.unwrap();
         let ga = a.guard(&path, &cancel).await.unwrap();
 
         // Same map object behind every handle...
@@ -193,13 +238,68 @@ mod tests {
     async fn guard_evicts_its_entry_on_drop() {
         let locks = FileMutationLocks::new();
         let path = unique_path("evict");
-        let key = FileMutationLocks::key(&path);
+        let key = FileMutationLocks::key(&path).await.unwrap();
         let cancel = CancelToken::new();
 
         let g = locks.guard(&path, &cancel).await.unwrap();
         assert!(locks.map.contains_key(&key));
         drop(g);
         assert!(!locks.map.contains_key(&key), "drained entry must be evicted, not leaked");
+    }
+
+    /// Pi's key helper catches ONLY `ENOENT`/`ENOTDIR` (`isMissingPathError`,
+    /// file-mutation-queue.ts:7-14) and returns the resolved path for them. A `write` to a file
+    /// that does not exist yet is exactly that case and must still acquire a lock.
+    #[tokio::test]
+    async fn missing_path_falls_back_to_the_resolved_path() {
+        let path = unique_path("enoent");
+        assert!(!path.exists());
+        let key = FileMutationLocks::key(&path).await.expect("ENOENT is Pi's fallback, not an error");
+        assert_eq!(key, path);
+        // A path whose PARENT is a regular file is ENOTDIR, Pi's other caught kind.
+        let file = unique_path("enotdir-parent");
+        std::fs::write(&file, b"x").unwrap();
+        let under = file.join("child.txt");
+        let key = FileMutationLocks::key(&under).await.expect("ENOTDIR is Pi's other fallback");
+        assert_eq!(key, under);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The other half of `isMissingPathError`: every NON-missing realpath failure is re-`throw`n
+    /// at file-mutation-queue.ts:24, propagating out of `withFileMutationQueue` (`:34`) BEFORE the
+    /// mutation body runs. `unwrap_or_else(|_| path.to_path_buf())` swallowed all of them, so
+    /// cyrup took a differently-keyed lock and only failed later at `open(2)` with a different
+    /// errno. RED before the fix (`guard` returned `Ok`), GREEN after.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_missing_realpath_failure_propagates_instead_of_being_swallowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_path("eacces-parent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("f.txt");
+        std::fs::write(&target, b"x").unwrap();
+        // Drop the parent's search bit: `realpath(2)` on anything inside now fails EACCES.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root ignores the mode bits — same as Node for root, so skip rather than assert.
+        if std::fs::canonicalize(&target).is_ok() {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let locks = FileMutationLocks::new();
+        let err = locks
+            .guard(&target, &CancelToken::new())
+            .await
+            .err()
+            .expect("a non-ENOENT realpath failure must propagate (file-mutation-queue.ts:24)");
+        let msg = err.to_string();
+
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(msg.starts_with("EACCES: "), "must name the realpath errno, got: {msg}");
+        assert!(msg.contains(&*target.to_string_lossy()), "must name the path, got: {msg}");
     }
 
     /// Different paths must NOT serialize against each other even though they now share one map

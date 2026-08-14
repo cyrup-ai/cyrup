@@ -20,17 +20,25 @@ pub struct FleetSpec {
     pub name: &'static str,
     /// API-key env var (matches `env-api-keys.ts` `getApiKeyEnvVars`).
     pub env_var: &'static str,
+    /// Upstream's `envApiKeyAuth(<name>, …)` first argument — the user-facing api-key method label
+    /// `/login` lists and `login` interpolates into `Enter {name}` (`ai/src/auth/helpers.ts:9,12`).
+    /// It is NOT `"{name} API key"` for every member: `huggingface` is `"Hugging Face token"`
+    /// (`providers/huggingface.ts:11`) and `moonshotai-cn` is `"Moonshot AI API key"`, not
+    /// `"Moonshot AI CN API key"` (`providers/moonshotai-cn.ts:11`) — which is why it is a table
+    /// column rather than a format string.
+    pub auth_name: &'static str,
     /// The verbatim JSON catalog (extracted from Pi's `<id>.models.ts`).
     pub catalog_json: &'static str,
 }
 
 macro_rules! fleet {
-    ($($id:literal => ($const:ident, $name:literal, $env:literal, $file:literal)),* $(,)?) => {
+    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $file:literal)),* $(,)?) => {
         $(
             pub const $const: FleetSpec = FleetSpec {
                 id: $id,
                 name: $name,
                 env_var: $env,
+                auth_name: $auth,
                 catalog_json: include_str!(concat!("catalog/", $file, ".json")),
             };
         )*
@@ -41,22 +49,22 @@ macro_rules! fleet {
 }
 
 fleet! {
-    "ant-ling"              => (ANT_LING, "Ant Ling", "ANT_LING_API_KEY", "ant-ling"),
-    "cerebras"              => (CEREBRAS, "Cerebras", "CEREBRAS_API_KEY", "cerebras"),
-    "deepseek"              => (DEEPSEEK, "DeepSeek", "DEEPSEEK_API_KEY", "deepseek"),
-    "groq"                  => (GROQ, "Groq", "GROQ_API_KEY", "groq"),
-    "huggingface"           => (HUGGINGFACE, "Hugging Face", "HF_TOKEN", "huggingface"),
-    "moonshotai"            => (MOONSHOTAI, "Moonshot AI", "MOONSHOT_API_KEY", "moonshotai"),
-    "moonshotai-cn"         => (MOONSHOTAI_CN, "Moonshot AI CN", "MOONSHOT_API_KEY", "moonshotai-cn"),
-    "nvidia"                => (NVIDIA, "NVIDIA", "NVIDIA_API_KEY", "nvidia"),
-    "openrouter"            => (OPENROUTER, "OpenRouter", "OPENROUTER_API_KEY", "openrouter"),
-    "xai"                   => (XAI, "xAI", "XAI_API_KEY", "xai"),
-    "xiaomi"                => (XIAOMI, "Xiaomi", "XIAOMI_API_KEY", "xiaomi"),
-    "xiaomi-token-plan-ams" => (XIAOMI_TP_AMS, "Xiaomi Token Plan AMS", "XIAOMI_TOKEN_PLAN_AMS_API_KEY", "xiaomi-token-plan-ams"),
-    "xiaomi-token-plan-cn"  => (XIAOMI_TP_CN, "Xiaomi Token Plan CN", "XIAOMI_TOKEN_PLAN_CN_API_KEY", "xiaomi-token-plan-cn"),
-    "xiaomi-token-plan-sgp" => (XIAOMI_TP_SGP, "Xiaomi Token Plan SGP", "XIAOMI_TOKEN_PLAN_SGP_API_KEY", "xiaomi-token-plan-sgp"),
-    "zai"                   => (ZAI, "Z.AI", "ZAI_API_KEY", "zai"),
-    "zai-coding-cn"         => (ZAI_CODING_CN, "Z.AI Coding CN", "ZAI_CODING_CN_API_KEY", "zai-coding-cn"),
+    "ant-ling"              => (ANT_LING, "Ant Ling", "ANT_LING_API_KEY", "Ant Ling API key", "ant-ling"),
+    "cerebras"              => (CEREBRAS, "Cerebras", "CEREBRAS_API_KEY", "Cerebras API key", "cerebras"),
+    "deepseek"              => (DEEPSEEK, "DeepSeek", "DEEPSEEK_API_KEY", "DeepSeek API key", "deepseek"),
+    "groq"                  => (GROQ, "Groq", "GROQ_API_KEY", "Groq API key", "groq"),
+    "huggingface"           => (HUGGINGFACE, "Hugging Face", "HF_TOKEN", "Hugging Face token", "huggingface"),
+    "moonshotai"            => (MOONSHOTAI, "Moonshot AI", "MOONSHOT_API_KEY", "Moonshot AI API key", "moonshotai"),
+    "moonshotai-cn"         => (MOONSHOTAI_CN, "Moonshot AI CN", "MOONSHOT_API_KEY", "Moonshot AI API key", "moonshotai-cn"),
+    "nvidia"                => (NVIDIA, "NVIDIA", "NVIDIA_API_KEY", "NVIDIA API key", "nvidia"),
+    "openrouter"            => (OPENROUTER, "OpenRouter", "OPENROUTER_API_KEY", "OpenRouter API key", "openrouter"),
+    "xai"                   => (XAI, "xAI", "XAI_API_KEY", "xAI API key", "xai"),
+    "xiaomi"                => (XIAOMI, "Xiaomi", "XIAOMI_API_KEY", "Xiaomi API key", "xiaomi"),
+    "xiaomi-token-plan-ams" => (XIAOMI_TP_AMS, "Xiaomi Token Plan AMS", "XIAOMI_TOKEN_PLAN_AMS_API_KEY", "Xiaomi Token Plan AMS API key", "xiaomi-token-plan-ams"),
+    "xiaomi-token-plan-cn"  => (XIAOMI_TP_CN, "Xiaomi Token Plan CN", "XIAOMI_TOKEN_PLAN_CN_API_KEY", "Xiaomi Token Plan CN API key", "xiaomi-token-plan-cn"),
+    "xiaomi-token-plan-sgp" => (XIAOMI_TP_SGP, "Xiaomi Token Plan SGP", "XIAOMI_TOKEN_PLAN_SGP_API_KEY", "Xiaomi Token Plan SGP API key", "xiaomi-token-plan-sgp"),
+    "zai"                   => (ZAI, "Z.AI", "ZAI_API_KEY", "Z.AI API key", "zai"),
+    "zai-coding-cn"         => (ZAI_CODING_CN, "Z.AI Coding CN", "ZAI_CODING_CN_API_KEY", "Z.AI Coding CN API key", "zai-coding-cn"),
 }
 
 impl FleetSpec {
@@ -73,7 +81,7 @@ impl FleetSpec {
     /// [`super::builtin_oauth::builtin_provider_oauth`].
     pub fn auth(&self) -> ProviderAuth {
         ProviderAuth {
-            api_key: Some(env_key([self.env_var])),
+            api_key: Some(env_key(self.auth_name, [self.env_var])),
             oauth: super::builtin_oauth::builtin_provider_oauth(self.id),
         }
     }

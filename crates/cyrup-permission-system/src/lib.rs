@@ -68,6 +68,7 @@
 //! crate-level `#![deny(...)]` restates it. Tests `#[allow(...)]` at the module level.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
+pub mod agent_start_cache;
 pub mod ask;
 pub mod common;
 pub mod dedup;
@@ -100,14 +101,16 @@ pub use error::PermissionError;
 pub use ext_config::ExtensionConfig;
 pub use extension::{
     is_installed, permission_extension_for_env, PermissionSystemExtension, CHILD_ENV_VAR,
-    EXTENSION_ID, INSTALL_ENV_VAR, PERMISSION_SYSTEM_COMMAND,
+    EXTENSION_ID, INSTALL_ENV_VAR, PERMISSIONS_EXAMPLE_CONFIG, PERMISSIONS_JSON_SCHEMA,
+    PERMISSION_SYSTEM_COMMAND, POLICY_AGENT_DIR_ENV_KEY,
 };
 pub use forwarding::{
     process_forwarded_requests, resolve_child_wait_timeout, spawn_forwarding_watcher,
     wait_for_forwarded_approval, ForwardedPermissionRequest, ForwardedPermissionResponse,
-    ForwardingLocation, ProcessForwardedOptions, SharedExtensionConfig,
+    ForwardingLocation, ProcessForwardedOptions, SharedExtensionConfig, SharedHasUi,
     PERMISSION_FORWARDING_TIMEOUT,
 };
+pub use logging::AuditTrail;
 pub use manager::{ManagerPaths, PermissionManager};
 pub use types::{
     CheckSource, PermissionCheckResult, PermissionState,

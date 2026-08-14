@@ -2,8 +2,8 @@
 //!
 //! # Provenance
 //!
-//! cyrup's 31 embedded catalogs under `src/providers/catalog/*.json` are a **byte-faithful
-//! snapshot of pi @ `5c1a2977`** ("fix(ai): update generated model catalogue", 2026-06-30):
+//! cyrup ships **35** catalogs under `src/providers/catalog/*.json`. Thirty of them are a
+//! **byte-faithful snapshot of pi @ `5c1a2977`** ("fix(ai): update generated model catalogue", 2026-06-30):
 //! diffing every catalog field-by-field against that revision comes out identical for 30 of the 30
 //! files that have a `packages/ai/src/providers/*.models.ts` counterpart, modulo three deltas that
 //! upstream itself later adopted.
@@ -31,6 +31,14 @@
 //! is a provider that mysteriously offers no models. `every_embedded_catalog_parses_non_empty`
 //! closes that hole for the whole set, and the value assertions below stop a *well-formed but
 //! wrong* number from going unnoticed.
+//!
+//! The remaining five — `amazon-bedrock.json` (109 rows), `github-copilot.json` (28),
+//! `google-vertex.json` (10), `openai-codex.json` and `openrouter-images.json` — were extracted
+//! later, at pi `b0c2a90e` (2026-07-17), and have never been field-diffed against upstream: pi
+//! stopped committing `packages/ai/src/providers/data/*.json` (`.gitignore:11`), so no per-field
+//! comparison is obtainable from a checkout at any tag. That is PROV-004, and PROV-018's
+//! `xtask gen-catalogs` is what closes it. The guards here are structural, not value-level, for
+//! exactly that reason.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -43,49 +51,85 @@ use crate::{Model, all_providers};
 
 // ------------------------------------------------------------------- the silent-emptiness guard --
 
-/// Every embedded catalog blob, by file name. `include_str!` here mirrors the production loaders,
-/// so a file that stops parsing fails *this* test loudly instead of silently degrading a provider
-/// to zero models via `unwrap_or_default()`.
-const CATALOGS: &[(&str, &str)] = &[
-    ("ant-ling", include_str!("../providers/catalog/ant-ling.json")),
-    ("anthropic", include_str!("../providers/catalog/anthropic.json")),
-    ("azure-openai-responses", include_str!("../providers/catalog/azure-openai-responses.json")),
-    ("cerebras", include_str!("../providers/catalog/cerebras.json")),
-    ("cloudflare-ai-gateway", include_str!("../providers/catalog/cloudflare-ai-gateway.json")),
-    ("cloudflare-workers-ai", include_str!("../providers/catalog/cloudflare-workers-ai.json")),
-    ("deepseek", include_str!("../providers/catalog/deepseek.json")),
-    ("fireworks", include_str!("../providers/catalog/fireworks.json")),
-    ("google", include_str!("../providers/catalog/google.json")),
-    ("groq", include_str!("../providers/catalog/groq.json")),
-    ("huggingface", include_str!("../providers/catalog/huggingface.json")),
-    ("kimi-coding", include_str!("../providers/catalog/kimi-coding.json")),
-    ("minimax", include_str!("../providers/catalog/minimax.json")),
-    ("minimax-cn", include_str!("../providers/catalog/minimax-cn.json")),
-    ("mistral", include_str!("../providers/catalog/mistral.json")),
-    ("moonshotai", include_str!("../providers/catalog/moonshotai.json")),
-    ("moonshotai-cn", include_str!("../providers/catalog/moonshotai-cn.json")),
-    ("nvidia", include_str!("../providers/catalog/nvidia.json")),
-    ("openai", include_str!("../providers/catalog/openai.json")),
-    ("opencode", include_str!("../providers/catalog/opencode.json")),
-    ("opencode-go", include_str!("../providers/catalog/opencode-go.json")),
-    ("openrouter", include_str!("../providers/catalog/openrouter.json")),
-    ("vercel-ai-gateway", include_str!("../providers/catalog/vercel-ai-gateway.json")),
-    ("xai", include_str!("../providers/catalog/xai.json")),
-    ("xiaomi", include_str!("../providers/catalog/xiaomi.json")),
-    ("xiaomi-token-plan-ams", include_str!("../providers/catalog/xiaomi-token-plan-ams.json")),
-    ("xiaomi-token-plan-cn", include_str!("../providers/catalog/xiaomi-token-plan-cn.json")),
-    ("xiaomi-token-plan-sgp", include_str!("../providers/catalog/xiaomi-token-plan-sgp.json")),
-    ("zai", include_str!("../providers/catalog/zai.json")),
-    ("zai-coding-cn", include_str!("../providers/catalog/zai-coding-cn.json")),
-];
+/// The catalog directory, resolved at TEST time from `CARGO_MANIFEST_DIR`.
+///
+/// PROV-038: this replaces a hand-maintained `CATALOGS: &[(&str, &str)]` of 30 `include_str!`ed
+/// blobs whose roster guard was `assert_eq!(CATALOGS.len(), 30, "catalog roster drifted from the
+/// file set")` — an array compared against its own literal length, which can never observe the
+/// drift its message claims to detect. The directory held **35** files: `amazon-bedrock.json` (the
+/// 109-row largest cyrup ships), `github-copilot.json`, `google-vertex.json`, `openai-codex.json`
+/// and `openrouter-images.json` got no per-model field checks at all, and the last of those is an
+/// images provider that no test touched. `include_str!` cannot take a glob, so the array is
+/// replaced by a directory walk.
+fn catalog_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/catalog")
+}
+
+/// Every `*.json` under `src/providers/catalog/`, as `(file stem, contents)`.
+fn catalogs() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let dir = catalog_dir();
+    for entry in std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+    {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("utf-8 file stem")
+            .to_string();
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        out.push((stem, body));
+    }
+    out.sort();
+    assert!(!out.is_empty(), "no catalogs found under {}", dir.display());
+    out
+}
+
+/// Catalogs that are NOT text-model providers and therefore have no row in `all_providers()`.
+/// `openrouter-images` resolves through the separate images registry (`images/mod.rs:38`).
+const IMAGES_CATALOGS: &[&str] = &["openrouter-images"];
 
 /// The guard. Production loaders swallow a parse error into `Vec::default()`, so without this a
-/// typo'd catalog ships as an empty provider. Here the error is surfaced verbatim.
+/// typo'd catalog ships as an empty provider. Here the error is surfaced verbatim — for EVERY file
+/// present, not for a list someone remembered to extend.
+///
+/// Each file is parsed with **the type its own production loader uses**. That distinction is not a
+/// nicety: pi types the image catalogs as
+/// `ImagesModel<TApi> extends Omit<Model<Api>, "api" | "provider" | "reasoning" | "contextWindow" |
+/// "maxTokens" | "compat">` (`packages/ai/src/types.ts:825-829` @v0.83.0), so an image row has no
+/// `reasoning`, no `contextWindow` and no `maxTokens` **by design**. Parsing
+/// `openrouter-images.json` as a text [`Model`] therefore fails on `missing field reasoning` while
+/// the shipped data is exactly right — the file is loaded by
+/// [`crate::images::openrouter_image_models`] (`images/mod.rs:634`) as
+/// [`crate::images::ImagesModel`], never as [`Model`].
 #[test]
 fn every_embedded_catalog_parses_non_empty() {
-    assert_eq!(CATALOGS.len(), 30, "catalog roster drifted from the file set");
-    for (name, blob) in CATALOGS {
-        let models: Vec<Model> = serde_json::from_str(blob)
+    for (name, blob) in catalogs() {
+        if IMAGES_CATALOGS.contains(&name.as_str()) {
+            // The images half of the same guard: `openrouter_image_models()` also swallows a parse
+            // error into `Vec::default()`, so it needs the identical treatment against its own type.
+            let models: Vec<crate::images::ImagesModel> = serde_json::from_str(&blob)
+                .unwrap_or_else(|e| panic!("images catalog {name}.json failed to parse: {e}"));
+            assert!(
+                !models.is_empty(),
+                "images catalog {name}.json parsed to ZERO models"
+            );
+            for m in &models {
+                assert!(!m.id.is_empty(), "{name}: empty model id");
+                assert!(!m.base_url.is_empty(), "{name}: {} has empty baseUrl", m.id);
+                // The field that replaces the text catalog's `contextWindow` as the row's reason to
+                // exist: pi makes `output` REQUIRED on `ImagesModel` (`types.ts:828`), and a row
+                // that emits nothing is unusable.
+                assert!(!m.output.is_empty(), "{name}: {} declares no output", m.id);
+            }
+            continue;
+        }
+        let models: Vec<Model> = serde_json::from_str(&blob)
             .unwrap_or_else(|e| panic!("catalog {name}.json failed to parse: {e}"));
         assert!(!models.is_empty(), "catalog {name}.json parsed to ZERO models");
         for m in &models {
@@ -95,11 +139,118 @@ fn every_embedded_catalog_parses_non_empty() {
             // the user at runtime — pi's generated catalog ships `baseUrl: ""` for all 42 entries
             // (`azure-openai-responses.models.ts` @ `91585d9a`). Everywhere else an empty baseUrl
             // means the request would go nowhere.
-            if *name != "azure-openai-responses" {
+            if name != "azure-openai-responses" {
                 assert!(!m.base_url.is_empty(), "{name}: {} has empty baseUrl", m.id);
             }
         }
     }
+}
+
+/// The parse-type split above is only load-bearing if the images catalog really is a shape the text
+/// [`Model`] rejects — otherwise the `continue` is silently covering nothing. This pins the split
+/// itself: `openrouter-images.json` MUST fail as `Vec<Model>` (pi omits `reasoning` from
+/// `ImagesModel`, `types.ts:825-829`) and MUST succeed as `Vec<ImagesModel>` with the same row count
+/// the production loader hands the provider.
+#[test]
+fn the_images_catalog_is_an_images_shape_not_a_model_shape() {
+    let (_, blob) = catalogs()
+        .into_iter()
+        .find(|(name, _)| name == "openrouter-images")
+        .expect("openrouter-images.json is shipped");
+
+    let as_text = serde_json::from_str::<Vec<Model>>(&blob)
+        .expect_err("an images row has no `reasoning`/`contextWindow`/`maxTokens` — pi omits them");
+    assert!(
+        as_text.to_string().contains("reasoning"),
+        "expected the missing text-only field to be named, got {as_text}"
+    );
+
+    let as_images: Vec<crate::images::ImagesModel> =
+        serde_json::from_str(&blob).expect("parses as the type its loader uses");
+    assert_eq!(
+        as_images.len(),
+        crate::images::openrouter_image_models().len(),
+        "the loader must not be silently defaulting to an empty catalog"
+    );
+}
+
+/// PROV-038, roster half: the set of catalog file stems must equal the registered provider ids plus
+/// the images providers. Adding a sixth catalog without registering its provider now FAILS, which
+/// is the drift the old tautological `CATALOGS.len() == 30` claimed to detect and could not.
+#[test]
+fn the_catalog_file_set_matches_the_registered_providers() {
+    let mut on_disk: Vec<String> = catalogs().into_iter().map(|(name, _)| name).collect();
+    on_disk.sort();
+    let mut expected: Vec<String> = all_providers()
+        .iter()
+        .map(|p| p.id().as_str().to_string())
+        .chain(IMAGES_CATALOGS.iter().map(|s| (*s).to_string()))
+        .collect();
+    // Several providers share one catalog file or ship none of their own; only assert that every
+    // FILE has an owner, and that every registered provider that ships a file is present.
+    expected.sort();
+    expected.dedup();
+    for name in &on_disk {
+        assert!(
+            expected.contains(name),
+            "catalog {name}.json has no registered provider and is not an images catalog — \
+             register it in providers/all.rs or delete the file"
+        );
+    }
+}
+
+/// PROV-030's regression guard (PROV-038 asked for it here): every row's `api` must be an api the
+/// registry can actually construct, otherwise the model resolves, lists in `/model`, and then dies
+/// at `wire.rs` with `no API implementation for <api>`.
+///
+/// `google-vertex` is the ONE known dangling api and is carved out below with its item id. **Delete
+/// the carve-out in the same change that registers `api/google_vertex.rs`** — a fresh dangling api
+/// on any other provider fails here immediately, which is what let PROV-030 ship unnoticed.
+#[test]
+fn every_catalog_row_names_a_registered_api() {
+    const KNOWN_DANGLING: &[&str] = &["google-vertex"]; // PROV-030
+    let registry = crate::api::builtin_registry();
+    for (name, blob) in catalogs() {
+        if IMAGES_CATALOGS.contains(&name.as_str()) {
+            continue; // resolved through the images registry, not the text one
+        }
+        let models: Vec<Model> = serde_json::from_str(&blob).unwrap_or_default();
+        for m in &models {
+            if KNOWN_DANGLING.contains(&m.api.as_str()) {
+                continue;
+            }
+            assert!(
+                registry.contains(&m.api),
+                "{name}: {} names api `{}`, which register_builtins() does not provide — \
+                 every request on this row would die with `no API implementation for {}`",
+                m.id,
+                m.api,
+                m.api
+            );
+        }
+    }
+}
+
+/// PROV-039: the manifest's own note counts the embedded catalogs, and its `generatedAt` is the
+/// pi.dev overlay's staleness floor (`providers/all.rs:95` → `remote_catalog.rs:188-196`). Both
+/// drifted from the file set; this pins them together so the next refresh cannot repeat it.
+#[test]
+fn the_catalog_manifest_matches_the_file_set() {
+    let raw = include_str!("../providers/catalog_manifest.json");
+    let manifest: serde_json::Value = serde_json::from_str(raw).expect("manifest parses");
+    let note = manifest["note"].as_str().expect("note");
+    let count = catalogs().len();
+    assert!(
+        note.contains(&format!("{count} embedded catalogs")),
+        "the manifest note must state the real catalog count ({count}): {note}"
+    );
+    // The floor must be the LATEST extraction revision. b0c2a90e (2026-07-17T09:00:03Z) is the
+    // newest any embedded catalog was taken from — see providers/google_vertex.rs's provenance
+    // note — so an overlay dated between 2026-07-10 and that must be DISCARDED, not accepted.
+    let generated_at = crate::providers::all::builtin_model_data_generated_at()
+        .expect("generatedAt parses");
+    let jul_17 = 1_784_278_803_000_i64; // 2026-07-17T09:00:03Z
+    assert_eq!(generated_at, jul_17, "the floor must be b0c2a90e's timestamp");
 }
 
 /// The same guard one level up: every *registered* provider must expose a non-empty catalog. Catches

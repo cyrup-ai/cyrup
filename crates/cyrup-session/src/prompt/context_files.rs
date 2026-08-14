@@ -121,18 +121,35 @@ impl ContextFileLoader {
 
         // (b) PROJECT (ancestors + cwd) — trust-gated (R-06-009).
         if self.project_trusted {
-            let start = std::fs::canonicalize(&self.cwd).unwrap_or_else(|_| self.cwd.clone());
-            let cwd_canon = start.clone();
+            // Pi `const resolvedCwd = resolvePath(options.cwd);` (`resource-loader.ts:122`) then
+            // `let currentDir = resolvedCwd;` (`:137`) — LEXICAL resolution, not `realpath`. pi
+            // keeps `canonicalizePath` separate and uses it in exactly one place in this file, the
+            // worktree comparison below (`:102-103`, `:113`), precisely because that comparison
+            // needs realpaths and the walk does not. Canonicalizing here made cyrup walk the
+            // TARGET's ancestors where pi walks the LINK's, so an `--cwd <symlink>/proj` picked up
+            // a different AGENTS.md than the user can see — and put the realpath into the
+            // `<project_instructions path="…">` attribute the model is shown.
+            let start = crate::git_paths::resolve_path(&self.cwd);
+            let cwd_resolved = start.clone();
+            // Pi `findShadowedContextFile(resolvedCwd)` (`resource-loader.ts:136`), hoisted out of
+            // the loop exactly as upstream.
+            let shadowed = find_shadowed_context_file(&start);
             // Walk cwd → root; prepend so final order is top→down (R-06-007).
             let mut ancestors: Vec<ContextFile> = Vec::new();
             let mut dir = start;
             loop {
-                let scope = if dir == cwd_canon {
+                let scope = if dir == cwd_resolved {
                     ContextScope::Cwd
                 } else {
                     ContextScope::Ancestor
                 };
                 if let Some(cf) = first_context_file(&dir, scope, &mut diags)
+                    // Pi `const isShadowed = shadowedContextFile !== undefined &&
+                    // canonicalizePath(contextFile?.path ?? "") === shadowedContextFile;`
+                    // (`resource-loader.ts:140-142`), tested BEFORE the `seenPaths` insert.
+                    && !shadowed.as_ref().is_some_and(|s| {
+                        crate::git_paths::canonicalize_path(&cf.path) == *s
+                    })
                     && seen.insert(cf.path.clone()) {
                         ancestors.insert(0, cf);
                     }
@@ -148,6 +165,43 @@ impl ContextFileLoader {
 
         (files, diags)
     }
+}
+
+/// The MAIN repo's context file that a nested linked worktree's own copy shadows — Pi
+/// `findShadowedContextFile` (`resource-loader.ts:100-116`), ported guard-for-guard.
+///
+/// Both are the same tracked `AGENTS.md`/`CLAUDE.md`, so loading both injects the identical content
+/// twice: wasted context, and duplicated instructions the model may weight more heavily. `None`
+/// means nothing is shadowed, which leaves ordinary ancestor inheritance alone.
+///
+/// Returned CANONICALIZED, because `git worktree add` writes the `.git` file's `gitdir:` target in
+/// realpath form while the cwd may still be symlinked (macOS `/tmp` → `/private/tmp`) — Pi's own
+/// comment at `:96-98`.
+fn find_shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
+    use crate::git_paths::{canonicalize_path, find_git_paths};
+
+    let git = find_git_paths(cwd)?;
+    let common_git_dir = canonicalize_path(&git.common_git_dir);
+    let worktree_root = canonicalize_path(&git.repo_dir);
+    let main_repo_root = common_git_dir.parent()?.to_path_buf();
+    // Pi `if (!worktreeRoot.startsWith(`${mainRepoRoot}${sep}`)) return undefined;` (`:108`) —
+    // false for an ordinary repo, where the two are the same dir, and for a SIBLING worktree
+    // (`git worktree add ../feat`), whose main repo is not an ancestor. `Path::starts_with` is
+    // component-wise, so the equality case has to be excluded explicitly — that is what pi's
+    // trailing separator does.
+    if worktree_root == main_repo_root || !worktree_root.starts_with(&main_repo_root) {
+        return None;
+    }
+    // Pi `if (canonicalizePath(join(mainRepoRoot, ".git")) !== commonGitDir) return undefined;`
+    // (`:113`). `dirname(commonGitDir)` is the main worktree root only when that dir is itself
+    // checked out from the same repo: in a bare layout (`proj/.bare` + `proj/main`) it is just the
+    // directory holding `.bare`, which tracks nothing, and a submodule's gitdir has no `commondir`
+    // so it lands under `.git/modules`.
+    if canonicalize_path(&main_repo_root.join(".git")) != common_git_dir {
+        return None;
+    }
+    let worktree_context = first_context_file(&worktree_root, ContextScope::Cwd, &mut Vec::new())?;
+    Some(main_repo_root.join(worktree_context.path.file_name()?))
 }
 
 /// First-found context file in `dir` among [`CANDIDATES`] (R-06-007).

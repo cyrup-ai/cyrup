@@ -1,4 +1,17 @@
 ---
+# [CYRUP-DELTA] SUBA-062 — this file deliberately diverges from
+# `pi-subagents v0.47.1:agents/researcher.md`, which declares
+# `tools: read, write, web_search, fetch_content, get_search_content, intercom` and builds its whole
+# body on `web_search`. cyrup's tool crate ships no web tools at all
+# (`ls crates/cyrup-tools/src/tools/` = bash, edit, edit_diff, find, globmatch, grep, ls, read,
+# write), so the upstream persona would instruct this child to call three tools that do not exist.
+# The body below is a faithful adaptation to that missing capability, not drift: restore upstream's
+# text verbatim the moment `web_search`/`fetch_content`/`get_search_content` land (filed against
+# area 04 built-in tools / area 12 pi drift — they are not this crate's to build).
+# Recorded here so SUBA-044's bundled-agent diff does not read this file as an unowned divergence.
+# YAML comments are ignored by both parsers: pi's `agents/frontmatter.ts:117` matches only
+# `^([\w-]+):`, and so does this crate's `discovery/frontmatter.rs` port, so none of this reaches
+# the child's persona.
 name: researcher
 description: Autonomous researcher — gathers, evaluates, and synthesizes a focused research brief from available sources
 tools: read, grep, find, ls, write, intercom

@@ -131,11 +131,16 @@ pub struct ExtensionHost {
     /// Loaded live wasm instances keyed by id — the slash-command/reload routing table (R-08-016/005).
     #[cfg(feature = "wasm-host")]
     live: RwLock<std::collections::HashMap<ExtensionId, Arc<crate::host::LiveExtension>>>,
-    /// The single host-owned inter-extension event bus (Pi's one `createEventBus()` threaded to every
-    /// extension, event-bus.ts:12-32 / loader.ts:492,499). Shared into every loaded guest so a
-    /// `bus.emit` from one reaches another's subscribed `bus-deliver` handler (gap-08 §5.3).
-    #[cfg(feature = "wasm-host")]
-    bus: Arc<crate::host::SharedBus>,
+    /// The single host-owned inter-extension event bus (pi's one `createEventBus()` threaded to
+    /// every extension, `core/event-bus.ts:12-32` / `extensions/loader.ts:389` @v0.83.0). Shared
+    /// into every loaded guest AND consulted for every loaded native, so a `bus.emit` reaches any
+    /// subscriber whichever tier it lives in.
+    ///
+    /// NOT `wasm-host`-gated (EXT-018). It used to be, which meant the three extensions cyrup
+    /// ships — permission-system, intercom, subagents, all natives — had no `pi.events` at all.
+    /// Upstream hangs `events` on the ONE base `ExtensionAPI` every extension receives; which tier
+    /// an extension runs in is not something the coordination channel is allowed to know.
+    bus: Arc<crate::bus::SharedBus>,
     /// The live capability backend the session injected (via [`Self::load_native_with_services`]).
     /// Threaded into every native dispatch/command ctx so a built-in's `ctx.rich()` reports the
     /// LIVE idle/trust/usage/model/system-prompt instead of `HostCtxRich::default()` (EXT-005).
@@ -168,8 +173,7 @@ impl ExtensionHost {
             wasm: None,
             #[cfg(feature = "wasm-host")]
             live: RwLock::new(std::collections::HashMap::new()),
-            #[cfg(feature = "wasm-host")]
-            bus: Arc::new(crate::host::SharedBus::new()),
+            bus: Arc::new(crate::bus::SharedBus::new()),
             #[cfg(feature = "wasm-host")]
             services: RwLock::new(None),
             active_tool_source: RwLock::new(None),
@@ -262,8 +266,20 @@ impl ExtensionHost {
     ) -> Result<(), ExtError> {
         let mut api = InitApi::new();
         ext.init(&mut api).await?;
-        let (subs, tools, commands, tool_renderers, message_renderers, entry_renderers) =
-            api.into_parts();
+        let (
+            subs,
+            tools,
+            commands,
+            tool_renderers,
+            message_renderers,
+            entry_renderers,
+            shortcuts,
+            flags,
+            providers,
+            autocomplete,
+            autocomplete_providers,
+            bus_topics,
+        ) = api.into_parts();
 
         // EXT-003 footgun guard: a native that subscribes to `project_trust` but did NOT override
         // `decides_project_trust` is skipped by the pre-trust bootstrap pass, so its vote arrives
@@ -299,6 +315,31 @@ impl ExtensionHost {
             self.registry.register_entry_renderer(id.clone(), custom_type)?;
         }
 
+        // EXT-035: the six registration surfaces `interface registration` offered a WASM guest and
+        // `InitApi` did not, so a native reached 5 of 11. pi has one api object for one extension
+        // kind (`extensions/loader.ts:274-410` @v0.83.0) and no notion of an extension that can
+        // register tools but not shortcuts, flags or providers.
+        for (key, desc) in shortcuts {
+            self.registry.register_shortcut(id.clone(), key, desc)?;
+        }
+        for (name, spec) in flags {
+            self.registry.register_flag(id.clone(), name, spec)?;
+        }
+        for (provider_id, config) in providers {
+            self.registry.register_provider(id.clone(), provider_id, config)?;
+        }
+        for command in autocomplete {
+            self.registry.add_command_autocomplete(id.clone(), command)?;
+        }
+        for _ in 0..autocomplete_providers {
+            self.registry.add_autocomplete_provider(id.clone())?;
+        }
+        // EXT-018: a native's bus subscriptions land in the SAME host-owned bus a guest's
+        // `bus.subscribe` import writes to (pi's single `createEventBus()`, `loader.ts:389`).
+        for topic in bus_topics {
+            self.bus.subscribe(id.clone(), topic);
+        }
+
         // Keep the native handle for command-tier slash execution (R-08-016) before it is wrapped
         // for event dispatch.
         if let Ok(mut g) = self.native.write() {
@@ -325,7 +366,15 @@ impl ExtensionHost {
         args: &str,
         cancel: &CancelToken,
     ) -> Result<Option<Result<Option<String>, ExtError>>, ExtError> {
-        let owner = match self.registry.command_owner(name)? {
+        // SEAM-048 — route by INVOCATION name, not by the raw last-wins map. pi disambiguates two
+        // extensions registering `deploy` into `deploy` / `deploy:2` in load order
+        // (`resolveRegisteredCommands`, `extensions/runner.ts:598-631` @v0.83.0) and dispatches from
+        // the `ResolvedCommand`; `command_owner` is a last-wins `HashMap` lookup on the raw name, so
+        // `deploy:2` resolved to nothing and the second registrant was silently unexecutable. The
+        // wasm route (`live_for_command`) was converted already; this is the native one.
+        // `resolved_command_owner` falls back to the raw map for an uncollided name, which is
+        // exactly what `resolveRegisteredCommands` leaves unsuffixed.
+        let owner = match self.registry.resolved_command_owner(name)? {
             Some(o) => o,
             None => return Ok(None),
         };
@@ -423,13 +472,14 @@ impl ExtensionHost {
                 continue;
             };
             let tool: Arc<dyn Tool> = Arc::new(crate::host::WasmTool::new(ext, desc));
-            self.registry.register_tool(owner, tool)?;
+            // EXT-030: register QUIETLY. This pass is already the consumer of the dirty flag
+            // (`refresh_tools` took it at entry), so its own re-registrations are not new signal.
+            // The previous shape raised the flag here and then cleared it wholesale with
+            // `take_tools_dirty()`, which also swallowed the deliberate `mark_tools_dirty()`
+            // re-arm three lines above — a descriptor whose owner was not yet live was dropped
+            // for the rest of the session — plus any mark another extension raised concurrently.
+            self.registry.register_materialized_tool(owner, tool)?;
             changed = true;
-        }
-        // `register_tool` re-dirties the flag by design (it is the same signal a host-tool
-        // registration raises); clear the marks THIS pass produced so a caller does not loop.
-        if changed {
-            self.registry.take_tools_dirty();
         }
         Ok(changed)
     }
@@ -470,9 +520,17 @@ impl ExtensionHost {
         use crate::event::HostEvent;
         let hit = self
             .dispatcher
-            .dispatch_first_handled(&HostEvent::ProjectTrust, cancel, |HandledValue(v)| {
-                crate::aggregate::parse_trust_decision(v).is_some()
-            })
+            // EXT-043: the facade has held the cwd at `HostConfig.cwd` all along; pi's
+            // `ProjectTrustEvent` is `{type, cwd}` (extensions/types.ts:519-522 @v0.83.0) and the
+            // whole verdict is per-directory (`options.trustStore.set(options.cwd, trusted)`,
+            // core/project-trust.ts:63-65), so a handler without it cannot key an allowlist.
+            .dispatch_first_handled(
+                &HostEvent::ProjectTrust { cwd: self.config.cwd.to_string_lossy().into_owned() },
+                cancel,
+                |HandledValue(v)| {
+                    crate::aggregate::parse_trust_decision(v).is_some()
+                },
+            )
             .await?;
         crate::fold_project_trust(std::slice::from_ref(&hit))
     }
@@ -481,8 +539,19 @@ impl ExtensionHost {
     /// runner.ts:197; gap-08 #4) into a typed, attributed [`crate::ResourcesAggregate`].
     pub async fn aggregate_resources(&self, cancel: &CancelToken) -> crate::ResourcesAggregate {
         use crate::event::HostEvent;
-        let handled =
-            self.dispatcher.dispatch_collect_handled(&HostEvent::ResourcesDiscover, cancel).await;
+        // EXT-016: pi `ResourcesDiscoverEvent {type, cwd, reason: "startup" | "reload"}`
+        // (extensions/types.ts:544-548 @v0.83.0). This entry point is the STARTUP discovery; the
+        // reload path goes through `ExtensionHost::reload`, which passes "reload".
+        let handled = self
+            .dispatcher
+            .dispatch_collect_handled(
+                &HostEvent::ResourcesDiscover {
+                    cwd: self.config.cwd.to_string_lossy().into_owned(),
+                    reason: "startup".into(),
+                },
+                cancel,
+            )
+            .await;
         crate::fold_resources(&handled)
     }
 
@@ -541,7 +610,7 @@ impl ExtensionHost {
         let orig_images = images.clone();
         let ev = HostEvent::Input { text: orig_text.clone(), images, source, streaming_behavior };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
-            Reduced::Blocked { reason, by } => InputReduction::Blocked { reason, by },
+            Reduced::Blocked { reason, by, .. } => InputReduction::Blocked { reason, by },
             Reduced::Handled(_) => InputReduction::Handled,
             Reduced::Pass(ev) => {
                 if let HostEvent::Input { text, images, .. } = *ev
@@ -626,7 +695,7 @@ impl ExtensionHost {
             cwd,
         };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
-            Reduced::Blocked { reason, by } => UserBashReduction::Blocked { reason, by },
+            Reduced::Blocked { reason, by, .. } => UserBashReduction::Blocked { reason, by },
             Reduced::Handled(HandledValue(v)) => UserBashReduction::Handled(v),
             Reduced::Pass(_) => UserBashReduction::Continue,
         }
@@ -656,7 +725,7 @@ impl ExtensionHost {
             override_result: None,
         };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
-            Reduced::Blocked { reason, by } => CompactionReduction::Blocked { reason, by },
+            Reduced::Blocked { reason, by, .. } => CompactionReduction::Blocked { reason, by },
             Reduced::Pass(ev) => match *ev {
                 HostEvent::SessionBeforeCompact { override_result: Some(v), .. } => {
                     CompactionReduction::Override(v)
@@ -678,7 +747,7 @@ impl ExtensionHost {
     ) -> TreeReduction {
         let ev = HostEvent::SessionBeforeTree { preparation, override_result: None };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
-            Reduced::Blocked { reason, by } => TreeReduction::Blocked { reason, by },
+            Reduced::Blocked { reason, by, .. } => TreeReduction::Blocked { reason, by },
             Reduced::Pass(ev) => match *ev {
                 HostEvent::SessionBeforeTree { override_result: Some(v), .. } => {
                     TreeReduction::Override(v)
@@ -993,16 +1062,35 @@ impl ExtensionHost {
         Ok(diagnostics)
     }
 
-    /// Fan out every queued inter-extension bus event to its subscribers (gap-08 §5.3). Drains the
-    /// shared bus (Pi's `createEventBus()` fan-out) and invokes each subscribed guest's `bus-deliver`
-    /// export. Loops so a handler that emits during delivery is itself delivered (bounded to guard a
-    /// pathological emit cycle — never hangs). A faulting delivery is contained + skipped (R-08-036),
-    /// never crashing the host. Called at the tail of a guest call that may have emitted (e.g.
-    /// [`Self::run_command`]); also public so other guest-call seams can drain after their dispatch.
-    #[cfg(feature = "wasm-host")]
+    /// Fan out every queued inter-extension bus event to its subscribers.
+    ///
+    /// Upstream this is not a function at all: `createEventBus()` returns `emit: (channel, data)
+    /// => { emitter.emit(channel, data); }` over a node `EventEmitter`, so every listener runs
+    /// synchronously at the emit call (`pi/packages/coding-agent/src/core/event-bus.ts:12-32`
+    /// @v0.83.0) — no queue, no drain point, nothing that can go undelivered. cyrup MUST defer,
+    /// because a guest emitting from inside its own `bus.emit` import already holds its
+    /// single-instance store and delivering would re-enter it; this is the drain.
+    ///
+    /// Three defects closed here:
+    ///
+    /// * **EXT-018** — delivery now reaches NATIVE extensions as well as wasm guests. pi hangs the
+    ///   one bus on the one `ExtensionAPI` it builds for every extension it loads (`events:
+    ///   eventBus,`, `extensions/loader.ts:389` @v0.83.0); cyrup had it inside the `wasm-host`
+    ///   gate, resolving subscribers out of `self.live` only, so the three extensions that
+    ///   actually ship — permission-system, intercom, subagents, all natives — could not use the
+    ///   channel built for exactly their coordination.
+    /// * **EXT-057a** — reaching `MAX_ROUNDS` with work still queued used to fall out of the loop
+    ///   with events sitting in `SharedBus.pending`: no diagnostic, no error, no record. It now
+    ///   drops the remainder EXPLICITLY and reports one [`crate::ExtensionError`] through the same
+    ///   `add_error_listener` channel `App::show_extension_error` drains.
+    /// * **EXT-057b** — a faulting `bus-deliver` was `tracing::warn!` only, so it never reached the
+    ///   `[Extension issues]` surface EXT-S03 exists to make faults visible in. pi's own `on`
+    ///   wrapper surfaces handler faults (`catch (err) { console.error(...) }`); this now does too,
+    ///   keeping the `tracing::warn!` as well.
     pub async fn deliver_bus_events(&self, cancel: &CancelToken) {
         // Bound on delivery rounds: each round drains the whole queue, then re-checks for events a
-        // just-delivered handler emitted. A cycle (A→B→A→…) stops after the bound rather than hanging.
+        // just-delivered handler emitted. A cycle (A→B→A→…) stops after the bound rather than
+        // hanging.
         const MAX_ROUNDS: usize = 64;
         for _ in 0..MAX_ROUNDS {
             let batch = self.bus.take_pending();
@@ -1011,20 +1099,70 @@ impl ExtensionHost {
             }
             for (topic, payload) in batch {
                 for id in self.bus.subscribers_for(&topic) {
-                    let ext = self.live.read().ok().and_then(|g| g.get(&id).cloned());
-                    // Contained (R-08-036): a faulting listener is logged + skipped; the rest of the
-                    // fan-out proceeds and the host never crashes.
-                    if let Some(ext) = ext
-                        && let Err(e) = ext.bus_deliver(&topic, &payload, cancel).await
-                    {
+                    if let Err(e) = self.bus_deliver_one(&id, &topic, &payload, cancel).await {
                         tracing::warn!(
                             extension = %id, topic = %topic, error = %e,
                             "inter-extension bus delivery contained (skipped)"
                         );
+                        // EXT-057b: also onto the onError channel, so a trapping bus listener is
+                        // as visible as a trapping event handler.
+                        self.report_bus_error(&id, format!("bus `{topic}`: {e}"));
                     }
                 }
             }
         }
+        // EXT-057a: the bound was reached. Anything still queued is dropped — say so.
+        let dropped = self.bus.drop_pending();
+        if dropped > 0 {
+            let msg = format!(
+                "inter-extension bus gave up after {MAX_ROUNDS} delivery rounds; {dropped} queued \
+                 event(s) dropped (a handler is emitting on every round)"
+            );
+            tracing::warn!(rounds = MAX_ROUNDS, dropped, "{msg}");
+            self.report_bus_error(&ExtensionId::from("bus"), msg);
+        }
+    }
+
+    /// Deliver one bus event to one subscriber, whichever tier it lives in (EXT-018). A subscriber
+    /// that is in NEITHER map has gone stale — its instance left the host — so its subscription is
+    /// torn down here rather than left to accumulate (EXT-050; pi's `invalidate()` runs every
+    /// tracked unsubscribe, `extensions/loader.ts:206-214` @v0.84.1).
+    async fn bus_deliver_one(
+        &self,
+        id: &ExtensionId,
+        topic: &str,
+        payload: &Value,
+        cancel: &CancelToken,
+    ) -> Result<(), ExtError> {
+        #[cfg(feature = "wasm-host")]
+        if let Some(ext) = self.live.read().ok().and_then(|g| g.get(id).cloned()) {
+            return ext.bus_deliver(topic, payload, cancel).await;
+        }
+        if let Some(ext) = self.native.read().ok().and_then(|g| g.get(id).cloned()) {
+            let ctx = HostCtx::event(self.config.mode, self.config.has_ui, self.config.cwd.clone());
+            return ext.on_bus_event(topic, payload, &ctx).await;
+        }
+        self.bus.unsubscribe(id, topic);
+        Ok(())
+    }
+
+    /// Surface a bus-layer fault on the same `onError` channel a contained handler fault uses.
+    fn report_bus_error(&self, id: &ExtensionId, error: String) {
+        self.dispatcher.report_external(crate::ExtensionError {
+            extension: id.clone(),
+            // pi's bus faults are logged with the CHANNEL, not an event name; `"bus"` is the
+            // closest honest label in `ExtensionError.event`'s `&'static str` vocabulary.
+            event: "bus",
+            error,
+        });
+    }
+
+    /// The host-owned inter-extension bus (pi's single `createEventBus()`,
+    /// `core/event-bus.ts:12-32` @v0.83.0). Exposed so a NATIVE built-in can emit on it without a
+    /// wasm boundary — the guest tier reaches the same object through the `bus.emit`/`subscribe`
+    /// imports (EXT-018).
+    pub fn bus(&self) -> &Arc<crate::bus::SharedBus> {
+        &self.bus
     }
 
     /// Register a listener for contained extension faults (Pi `onError`, R-08-036). The listener
@@ -1125,7 +1263,14 @@ impl ExtensionHost {
                 // not session state: copy them in from the SAME [`HostConfig`] the native path
                 // hands to `HostCtx::event`/`::command` above, so a WASM guest's `ctx.mode()` and a
                 // built-in's `ctx.mode` cannot disagree about the mode the host is running in.
-                .with_host_mode(self.config.mode, self.config.has_ui),
+                .with_host_mode(self.config.mode, self.config.has_ui, self.config.cwd.clone())
+                // EXT-052: the `before_provider_request`/`after_provider_response` reductions a
+                // guest provider's `streamSimple` MUST invoke (pi extensions/types.ts:1452-1457
+                // @v0.84.1). Installed before `init` so a provider registered during `init` is
+                // never the one route whose requests are invisible.
+                .with_provider_reduction(Arc::new(DispatcherProviderReduction {
+                    dispatcher: self.dispatcher.clone(),
+                })),
         );
         let ext = crate::host::LiveExtension::load(
             wasm.engine(),
@@ -1283,11 +1428,22 @@ impl ExtensionHost {
         ext.argument_completions(name, prefix).await
     }
 
+    /// EXT-017 — resolve the OWNER of an invoked command name.
+    ///
+    /// `registry.command_owner` is a last-wins `HashMap` lookup on the RAW name, so when two
+    /// extensions both register `deploy` only the last registrant is reachable and the other is
+    /// silently unexecutable. pi disambiguates instead: `resolveRegisteredCommands` assigns
+    /// `name:N` in LOAD ORDER with a `takenInvocationNames` bump loop
+    /// (`extensions/runner.ts:598-631` @v0.83.0), and `name: cmd.invocationName` is what reaches
+    /// autocomplete (`modes/interactive/interactive-mode.ts:605`). `resolved_command_owner` is
+    /// cyrup's port of that rule and was production-dead. It is tried FIRST so `deploy:2` reaches
+    /// its own owner; the raw-name lookup remains as the fallback for a name with no collision,
+    /// which is exactly what `resolveRegisteredCommands` leaves unsuffixed.
     #[cfg(feature = "wasm-host")]
     fn live_for_command(&self, name: &str) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
         let owner = self
             .registry
-            .command_owner(name)?
+            .resolved_command_owner(name)?
             .ok_or_else(|| ExtError::Component(format!("no such command: {name}")))?;
         self.live
             .read()
@@ -1302,6 +1458,34 @@ impl ExtensionHost {
     /// with or without the `wasm-host` feature (an empty list when nothing is registered).
     pub fn shortcut_keys(&self) -> Vec<String> {
         self.registry.shortcut_keys().unwrap_or_default()
+    }
+
+    /// Every registered shortcut as `(key, description)` (EXT-040). pi's `/hotkeys` Extensions
+    /// table renders `shortcut.description ?? shortcut.extensionPath`
+    /// (`modes/interactive/interactive-mode.ts:5856` @v0.83.0) — never the key id as its own
+    /// label, which is what cyrup printed while `register_shortcut` discarded the description one
+    /// line inside the host.
+    pub fn shortcut_specs(&self) -> Vec<(String, Option<String>)> {
+        self.registry.shortcut_specs().unwrap_or_default()
+    }
+
+    /// Resolve extension shortcuts against the host's keybinding config, refusing reserved keys and
+    /// recording pi's warnings (EXT-039) — see [`crate::ExtensionRegistry::resolve_shortcuts`],
+    /// which is the direct port of `ExtensionRunner.getShortcuts`
+    /// (`extensions/runner.ts:492-534` @v0.83.0). The TUI passes its resolved `action -> keys` map
+    /// and installs only the returned keys; [`Self::shortcut_diagnostics`] carries the warnings to
+    /// the same `[Extension issues]` panel the load diagnostics use.
+    pub fn resolve_shortcuts(
+        &self,
+        resolved_keybindings: &[(String, Vec<String>)],
+    ) -> Vec<(String, ExtensionId)> {
+        self.registry.resolve_shortcuts(resolved_keybindings).unwrap_or_default()
+    }
+
+    /// Warnings from the last [`Self::resolve_shortcuts`] (pi `getShortcutDiagnostics()`,
+    /// `extensions/runner.ts:538-540` @v0.83.0).
+    pub fn shortcut_diagnostics(&self) -> Vec<crate::ExtensionConflict> {
+        self.registry.shortcut_diagnostics().unwrap_or_default()
     }
 
     /// Execute the extension-registered keyboard shortcut bound to `key` (R-08-017; Pi
@@ -1348,7 +1532,16 @@ impl ExtensionHost {
         use crate::event::HostEvent;
         // 1) signal shutdown to the current set (reason = "reload").
         self.dispatcher
-            .dispatch_notify(&HostEvent::SessionShutdown { reason: "reload".into() }, cancel)
+            .dispatch_notify(
+                // EXT-015: a reload is not a session REPLACEMENT, so pi's optional
+                // `targetSessionFile` ("Destination session file when shutting down due to session
+                // replacement", extensions/types.ts:619-620 @v0.83.0) is genuinely absent here.
+                &HostEvent::SessionShutdown {
+                    reason: "reload".into(),
+                    target_session_file: None,
+                },
+                cancel,
+            )
             .await;
         // 2) cache-bust: drop dispatcher entries, registry tables, live instances, loaded ids.
         self.dispatcher.clear()?;
@@ -1369,7 +1562,13 @@ impl ExtensionHost {
         let result = self.discover_and_load(roots, project_trusted, services).await;
         // 4) signal start to the fresh set (reason = "reload").
         self.dispatcher
-            .dispatch_notify(&HostEvent::SessionStart { reason: "reload".into() }, cancel)
+            .dispatch_notify(
+                // EXT-015: pi documents `previousSessionFile` as "Present for \"new\",
+                // \"resume\", and \"fork\"" (extensions/types.ts:568 @v0.83.0) — a reload keeps
+                // the SAME session file, so it is absent.
+                &HostEvent::SessionStart { reason: "reload".into(), previous_session_file: None },
+                cancel,
+            )
             .await;
         Ok(result)
     }
@@ -1497,5 +1696,62 @@ fn native_panic_msg(payload: Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "panic".to_string()
+    }
+}
+
+/// The [`crate::host::ProviderReduction`] the host installs into every loaded guest (EXT-052).
+///
+/// Backs `provider-stream.on-payload` / `on-response`, the two callbacks pi's
+/// `ProviderConfig.streamSimple` doc makes a MUST-INVOKE contract
+/// (`pi/packages/coding-agent/src/core/extensions/types.ts:1452-1457` @v0.84.1). Both route into
+/// the SAME reductions the built-in provider path already uses, so an extension-supplied provider's
+/// requests stop being invisible to every other extension — and, critically, so
+/// `before_provider_request`'s payload REPLACEMENT applies on that route, which is what keeps a
+/// redaction extension from leaking the moment the user switches model.
+#[cfg(feature = "wasm-host")]
+struct DispatcherProviderReduction {
+    dispatcher: Arc<Dispatcher>,
+}
+
+#[cfg(feature = "wasm-host")]
+#[async_trait::async_trait]
+impl crate::host::ProviderReduction for DispatcherProviderReduction {
+    async fn before_provider_request(&self, from: &ExtensionId, payload: Value) -> Option<Value> {
+        let original = payload.clone();
+        // The calling guest is suspended inside its own store; excluding it is the forced
+        // divergence documented on `Dispatcher::dispatch_block_mutate_excluding`.
+        let reduced = self
+            .dispatcher
+            .dispatch_block_mutate_excluding(
+                crate::event::HostEvent::BeforeProviderRequest { payload },
+                &CancelToken::new(),
+                Some(from),
+            )
+            .await;
+        match reduced {
+            Reduced::Pass(ev) => match *ev {
+                // pi's "use any returned replacement payload": only an ACTUAL change is a
+                // replacement, so an unchanged payload reports `None` and the guest sends its own.
+                crate::event::HostEvent::BeforeProviderRequest { payload }
+                    if payload != original =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            },
+            // A blocked/handled `before_provider_request` has no meaning on this seam upstream
+            // (the event is `[mutate]`, `extensions/types.ts:676-679`); keep the guest's payload.
+            _ => None,
+        }
+    }
+
+    async fn after_provider_response(&self, from: &ExtensionId, status: u32, headers: Value) {
+        self.dispatcher
+            .dispatch_notify_excluding(
+                &crate::event::HostEvent::AfterProviderResponse { status, headers },
+                &CancelToken::new(),
+                Some(from),
+            )
+            .await;
     }
 }

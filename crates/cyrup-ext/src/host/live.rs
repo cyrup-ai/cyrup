@@ -119,6 +119,10 @@ impl bindings::cyrup::ext::registration::Host for HostState {
             prompt_snippet: t.prompt_snippet,
             prompt_guidelines: t.prompt_guidelines,
             has_renderer: t.has_renderer,
+            // EXT-023 / EXT-024: both fields used to stop at the SDK struct and never reach the
+            // registry, so a guest set a documented field that did nothing and got no diagnostic.
+            prepare_arguments: t.prepare_arguments,
+            render_shell: t.render_shell,
         };
         // A guest tool is dispatched back across the boundary; register it via the registry's
         // descriptor table so the active-tool set can surface it (R-08-012/014).
@@ -131,9 +135,15 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         guest.push_command(name, desc);
     }
 
-    async fn register_shortcut(&mut self, key: String, _desc: String) {
+    async fn register_shortcut(&mut self, key: String, desc: String) {
         let Ok(guest) = guest_of(self) else { return };
-        let _ = guest.registry.register_shortcut(guest.owner.clone(), key);
+        // EXT-040: `desc` crossed the boundary and used to be discarded right here, so `/hotkeys`
+        // printed the raw key id as its own label. pi keeps it on `ExtensionShortcut.description`
+        // (extensions/types.ts:1524-1529 @v0.83.0) and renders `shortcut.description ??
+        // shortcut.extensionPath` (interactive-mode.ts:5856). An EMPTY string is upstream's absent
+        // field, which falls back to the extension ID — never to the key.
+        let desc = if desc.trim().is_empty() { None } else { Some(desc) };
+        let _ = guest.registry.register_shortcut(guest.owner.clone(), key, desc);
     }
 
     async fn register_flag(&mut self, name: String, spec_json: String) {
@@ -388,11 +398,12 @@ impl bindings::cyrup::ext::session::Host for HostState {
     async fn get_session_name(&mut self) -> Option<String> {
         guest_of(self).ok().and_then(|g| g.services.session_name())
     }
-    async fn set_label(&mut self, entry_id: String, label: String) {
-        // Route to the pluggable backend (Pi `setLabel`, agent-session.ts:2276-2279); the session
-        // service applies it to the live tree via `append_label`.
+    async fn set_label(&mut self, entry_id: String, label: Option<String>) {
+        // Route to the pluggable backend (pi `setLabel(entryId, label: string | undefined)`,
+        // extensions/types.ts:1314 @v0.83.0); the session service applies it to the live tree via
+        // `append_label`, which has always taken `Option<&str>`. `None` CLEARS (EXT-046).
         if let Ok(guest) = guest_of(self) {
-            guest.services.set_label(&entry_id, &label);
+            guest.services.set_label(&entry_id, label.as_deref());
         }
     }
 }
@@ -400,6 +411,12 @@ impl bindings::cyrup::ext::session::Host for HostState {
 impl bindings::cyrup::ext::models::Host for HostState {
     async fn list_models(&mut self) -> String {
         guest_of(self).map(|g| g.services.models().to_string()).unwrap_or_else(|_| "[]".into())
+    }
+    /// pi `ctx.scopedModels` (extensions/types.ts:326 @v0.83.0) — EXT-045.
+    async fn scoped_models(&mut self) -> String {
+        guest_of(self)
+            .map(|g| g.services.scoped_models().to_string())
+            .unwrap_or_else(|_| "[]".into())
     }
     async fn current(&mut self) -> Option<String> {
         guest_of(self).ok().and_then(|g| g.services.current_model())
@@ -688,6 +705,15 @@ impl bindings::cyrup::ext::bus::Host for HostState {
             guest.bus_subscribe(topic);
         }
     }
+    /// EXT-050 — the unsubscribe half. pi's `on()` has always returned an unsubscribe closure
+    /// (`core/event-bus.ts:18-27`) and since v0.84.1 the loader tracks it
+    /// (`extensions/loader.ts:413-421`); without this a `subscribe` was permanent for the
+    /// instance's life and a guest listening only while a mode is active had to filter by hand.
+    async fn unsubscribe(&mut self, topic: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.bus_unsubscribe(&topic);
+        }
+    }
 }
 
 impl bindings::cyrup::ext::host_tool::Host for HostState {
@@ -763,6 +789,48 @@ impl bindings::cyrup::ext::provider_stream::Host for HostState {
             let event: Value = serde_json::from_str(&event_json).unwrap_or(Value::Null);
             guest.push_stream_event(stream_id, event);
         }
+    }
+
+    /// EXT-052 — the `onPayload` half of pi's must-invoke `streamSimple` contract
+    /// (`extensions/types.ts:1452-1457` @v0.84.1: "Implementations must invoke `options.onPayload`
+    /// before sending the provider request and use any returned replacement payload").
+    ///
+    /// Routes into the SAME `before_provider_request` reduction the built-in provider path uses, so
+    /// an extension-supplied provider's requests stop being invisible to every other extension.
+    /// Returns the replacement payload when a handler mutated it, `None` when nothing changed.
+    ///
+    /// The reduction cannot run here — re-entering the dispatcher would re-enter THIS guest's
+    /// single-instance store while it is borrowed for the `stream-simple` call. So the payload is
+    /// queued on the guest state and reduced by the host at the stream seam
+    /// ([`crate::host::GuestState::take_stream_payloads`]), the same request/poll bridge every
+    /// other long-running capability uses (arch-08 §5.2).
+    async fn on_payload(&mut self, _stream_id: String, payload_json: String) -> Option<String> {
+        // Clone the two things out of the guest BEFORE awaiting: the reduction re-enters the
+        // dispatcher (other stores), and holding a borrow of `self` across it would pin the
+        // calling guest's state for the whole round trip.
+        let (owner, hooks) = {
+            let guest = guest_of(self).ok()?;
+            (guest.owner.clone(), guest.provider_reduction()?)
+        };
+        let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+        hooks.before_provider_request(&owner, payload).await.map(|v| v.to_string())
+    }
+
+    /// EXT-052 — the `onResponse` half ("They must invoke `options.onResponse` after receiving the
+    /// response and before consuming its body, matching built-in providers",
+    /// `extensions/types.ts:1452-1457` @v0.84.1). Notify-only, routed into the same
+    /// `after_provider_response` dispatch the built-in path uses.
+    async fn on_response(&mut self, _stream_id: String, status: u16, headers_json: String) {
+        let Some((owner, hooks)) = ({
+            match guest_of(self) {
+                Ok(guest) => guest.provider_reduction().map(|h| (guest.owner.clone(), h)),
+                Err(_) => None,
+            }
+        }) else {
+            return;
+        };
+        let headers: Value = serde_json::from_str(&headers_json).unwrap_or(Value::Null);
+        hooks.after_provider_response(&owner, u32::from(status), headers).await;
     }
 }
 
@@ -939,6 +1007,19 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
     }
     async fn get_system_prompt(&mut self) -> String {
         guest_of(self).ok().and_then(|g| g.services.system_prompt()).unwrap_or_default()
+    }
+    /// pi `ctx.cwd` (extensions/types.ts:315 @v0.83.0) — on the BASE `ExtensionContext`, so every
+    /// handler and every tool `execute` can read it, not just command handlers (EXT-044). Sourced
+    /// from the `HostConfig.cwd` copy `GuestState` takes at load time — the same value the native
+    /// tier has always exposed as `HostCtx.cwd`.
+    async fn get_cwd(&mut self) -> String {
+        guest_of(self).map(|g| g.cwd().to_string_lossy().into_owned()).unwrap_or_default()
+    }
+    /// The run-scoped cancellation poll (EXT-045; pi `ctx.signal`, extensions/types.ts:334
+    /// @v0.83.0). See the `is-run-cancelled` CYRUP-DELTA in `world.wit` for why this is a poll and
+    /// not a subscription.
+    async fn is_run_cancelled(&mut self) -> bool {
+        guest_of(self).map(|g| g.services.is_run_cancelled()).unwrap_or(false)
     }
 }
 
@@ -1381,6 +1462,29 @@ impl LiveExtension {
         }
     }
 
+    /// Invoke the guest's `prepare-arguments` export (EXT-023). `None` = the guest declined to
+    /// coerce, which the caller treats as pi's identity default.
+    pub async fn prepare_arguments(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, ExtError> {
+        let args_s = args.to_string();
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
+        // EVENT tier: argument preparation runs inside the agent's tool preflight, not from a
+        // command handler, so session-replacement ops must stay refused (arch-08 §6.3).
+        self.guest.set_tier(CtxTier::Event);
+        let api = inner.instance.cyrup_ext_events();
+        match api.call_prepare_arguments(&mut inner.store, name, &args_s).await {
+            Ok(Some(s)) => Ok(serde_json::from_str::<Value>(&s).ok()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
     async fn render(
         &self,
         custom_type: &str,
@@ -1443,6 +1547,58 @@ impl Tool for WasmTool {
     /// `tools.filter(name => !!toolSnippets?.[name])` does (system-prompt.ts:79-80).
     fn prompt_snippet(&self) -> Option<&str> {
         self.descriptor.prompt_snippet.as_deref()
+    }
+    /// The guest's declared `promptGuidelines` (pi `ToolDefinition.promptGuidelines`,
+    /// `extensions/types.ts:444-446` @v0.83.0) — the bullets that reach the system prompt's
+    /// "Guidelines" section.
+    ///
+    /// TOOL-021 / EXT-007: this override could not be written until `Tool::prompt_guidelines`
+    /// returned an OWNED slice. The data was already all the way here — declared in `world.wit`
+    /// (`prompt-guidelines`), copied off the descriptor at `register_tool` and stored on
+    /// `RegisteredTool` — but the trait's `-> &[&str]` can only be satisfied by a borrow of a
+    /// `[&'static str]`, which a `Vec<String>` decoded from a component cannot produce. So the
+    /// field crossed the ABI and had NO reader: a guest declaring guidelines contributed nothing,
+    /// silently, with no warning on either side.
+    fn prompt_guidelines(&self) -> Vec<&str> {
+        self.descriptor.prompt_guidelines.iter().map(String::as_str).collect()
+    }
+    /// The guest's declared `renderShell` (pi `ToolDefinition.renderShell?: "default" | "self"`,
+    /// `extensions/types.ts:465` @v0.83.0: "Controls whether ToolExecutionComponent renders the
+    /// standard colored shell or the tool renders its own framing"). EXT-024 — the field had no WIT
+    /// representation at all, so a self-rendering guest tool still drew the default row chrome.
+    /// Anything other than the literal `"self"` is upstream's `"default"`.
+    fn render_kind(&self) -> cyrup_core::ToolRenderKind {
+        match self.descriptor.render_shell.as_deref() {
+            Some("self") => cyrup_core::ToolRenderKind::SelfRendered,
+            _ => cyrup_core::ToolRenderKind::Default,
+        }
+    }
+    /// pi `ToolDefinition.prepareArguments?: (args: unknown) => Static<TParams>`
+    /// (`extensions/types.ts:468` @v0.83.0), run BEFORE `validateToolArguments` in
+    /// `packages/agent/src/agent-loop.ts`. EXT-023 — the whole shim was unreachable across the WASM
+    /// boundary: the string `prepare` did not occur in `world.wit`, and the SDK accepted a
+    /// documented `prepare_arguments` field that `lower_tool_descriptor` dropped.
+    ///
+    /// Only called across the boundary when the descriptor DECLARED the shim, so a tool that does
+    /// not use it costs no round trip. A guest fault or an unparseable return degrades to the
+    /// identity — pi's absent `prepareArguments` — rather than failing the call: the arguments are
+    /// about to be schema-validated anyway, which is where a genuinely bad shape is reported.
+    async fn prepare_arguments(&self, args: Value) -> Value {
+        if !self.descriptor.prepare_arguments {
+            return args;
+        }
+        match self.ext.prepare_arguments(&self.descriptor.name, &args).await {
+            Ok(Some(v)) => v,
+            Ok(None) => args,
+            Err(e) => {
+                tracing::warn!(
+                    tool = %self.descriptor.name,
+                    error = %e,
+                    "guest `prepare-arguments` faulted; using the raw arguments (pi's identity default)"
+                );
+                args
+            }
+        }
     }
     async fn execute(
         &self,
@@ -1554,13 +1710,21 @@ async fn invoke(
         HostEvent::BeforeProviderRequest { payload } => {
             api.call_on_before_provider_request(store, &payload.to_string()).await
         }
-        HostEvent::ResourcesDiscover => api.call_on_resources_discover(store).await,
-        HostEvent::ProjectTrust => api.call_on_project_trust(store).await,
-        HostEvent::SessionBeforeSwitch { target_id } => {
-            api.call_on_session_before_switch(store, target_id).await
+        // EXT-009 — pi `emitBeforeProviderHeaders` (extensions/runner.ts:1045 @v0.83.0).
+        HostEvent::BeforeProviderHeaders { headers } => {
+            api.call_on_before_provider_headers(store, &headers.to_string()).await
         }
-        HostEvent::SessionBeforeFork { entry_id } => {
-            api.call_on_session_before_fork(store, entry_id).await
+        // EXT-016 / EXT-043: both events now carry the cwd they are being asked about.
+        HostEvent::ResourcesDiscover { cwd, reason } => {
+            api.call_on_resources_discover(store, cwd, reason).await
+        }
+        HostEvent::ProjectTrust { cwd } => api.call_on_project_trust(store, cwd).await,
+        // EXT-015: the four session-lifecycle events keep their discriminating fields.
+        HostEvent::SessionBeforeSwitch { reason, target_session_file } => {
+            api.call_on_session_before_switch(store, reason, target_session_file.as_deref()).await
+        }
+        HostEvent::SessionBeforeFork { entry_id, position } => {
+            api.call_on_session_before_fork(store, entry_id, position).await
         }
         HostEvent::SessionBeforeCompact {
             preparation,
@@ -1612,30 +1776,48 @@ async fn invoke(
             .call_on_tool_exec_start(store, call_id.as_str(), name, &args.to_string())
             .await
             .and_then(|()| noop()),
-        HostEvent::ToolExecUpdate { call_id, chunk } => api
-            .call_on_tool_exec_update(store, call_id.as_str(), &chunk.to_string())
+        HostEvent::ToolExecUpdate { call_id, name, args, chunk } => api
+            .call_on_tool_exec_update(
+                store,
+                call_id.as_str(),
+                name,
+                &args.to_string(),
+                &chunk.to_string(),
+            )
             .await
             .and_then(|()| noop()),
-        HostEvent::ToolExecEnd { call_id, result, is_error } => api
-            .call_on_tool_exec_end(store, call_id.as_str(), &result.to_string(), *is_error)
+        HostEvent::ToolExecEnd { call_id, name, result, is_error } => api
+            .call_on_tool_exec_end(store, call_id.as_str(), name, &result.to_string(), *is_error)
             .await
             .and_then(|()| noop()),
-        HostEvent::SessionStart { reason } => {
-            api.call_on_session_start(store, reason).await.and_then(|()| noop())
-        }
-        HostEvent::SessionShutdown { reason } => {
-            api.call_on_session_shutdown(store, reason).await.and_then(|()| noop())
+        HostEvent::SessionStart { reason, previous_session_file } => api
+            .call_on_session_start(store, reason, previous_session_file.as_deref())
+            .await
+            .and_then(|()| noop()),
+        HostEvent::SessionShutdown { reason, target_session_file } => api
+            .call_on_session_shutdown(store, reason, target_session_file.as_deref())
+            .await
+            .and_then(|()| noop()),
+        // EXT-011 — pi `SessionInfoChangedEvent` (extensions/types.ts:571-575 @v0.83.0).
+        HostEvent::SessionInfoChanged { name } => {
+            api.call_on_session_info_changed(store, name.as_deref()).await.and_then(|()| noop())
         }
         HostEvent::AfterProviderResponse { status, headers } => api
             .call_on_after_provider_response(store, *status, &headers.to_string())
             .await
             .and_then(|()| noop()),
-        HostEvent::ModelSelect { model } => {
-            api.call_on_model_select(store, &model.to_string()).await.and_then(|()| noop())
+        // EXT-042: `previousModel`/`source` and `previousLevel` are pi SIBLING fields, not
+        // members of the `model` blob.
+        HostEvent::ModelSelect { model, previous_model, source } => {
+            let prev = previous_model.as_ref().map(|v| v.to_string());
+            api.call_on_model_select(store, &model.to_string(), prev.as_deref(), source)
+                .await
+                .and_then(|()| noop())
         }
-        HostEvent::ThinkingLevelSelect { level } => {
-            api.call_on_thinking_level_select(store, level).await.and_then(|()| noop())
-        }
+        HostEvent::ThinkingLevelSelect { level, previous_level } => api
+            .call_on_thinking_level_select(store, level, previous_level.as_deref())
+            .await
+            .and_then(|()| noop()),
         HostEvent::SessionCompact { compaction_entry, from_extension, reason, will_retry } => api
             .call_on_session_compact(
                 store,
@@ -1675,7 +1857,11 @@ fn streaming_behavior_str(b: InputStreamingBehavior) -> &'static str {
 fn decode_outcome(kind: EventKind, wit: wit_types::HookOutcome) -> HookOutcome {
     match wit {
         wit_types::HookOutcome::Noop => HookOutcome::Noop,
-        wit_types::HookOutcome::Block(reason) => HookOutcome::Block { reason },
+        // EXT-049: `block` is a record now — `{reason, terminate}` — so a guest can express pi's
+        // `ToolCallEventResult.terminate` (extensions/types.ts:1072-1079 @v0.84.1).
+        wit_types::HookOutcome::Block(b) => {
+            HookOutcome::Block { reason: b.reason, terminate: b.terminate }
+        }
         wit_types::HookOutcome::Handled(s) => {
             let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
             HookOutcome::Handled(HandledValue(v))
@@ -1744,6 +1930,9 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
         // `before_provider_request` (Pi runner.ts:962): the handler's return value REPLACES the
         // payload wholesale. The guest sends the replacement payload as the mutate value.
         EventKind::BeforeProviderRequest => Some(EventPatch::ProviderRequest(v)),
+        // `before_provider_headers` (EXT-009, pi types.ts:681-685): the guest's mutate value is a
+        // header PATCH — set each key, and a `null` value DELETES that header.
+        EventKind::BeforeProviderHeaders => Some(EventPatch::ProviderHeaders(v)),
         // `session_before_compact` / `session_before_tree` (Pi `SessionBeforeCompactResult.compaction`
         // / `SessionBeforeTreeResult`): the guest's `mutate` value is the override bag; the producer
         // interprets its shape (summary/details/label).

@@ -71,6 +71,17 @@ impl Ctx {
         self.ui().notify(message);
     }
 
+    /// Stop listening on an inter-extension bus topic (EXT-050) — the unsubscribe closure pi's
+    /// `pi.events.on()` returns (`core/event-bus.ts:18-27` @v0.83.0), tracked by the loader since
+    /// v0.84.1 (`extensions/loader.ts:413-421`). Before this a `subscribe` was permanent for the
+    /// instance's life and a guest listening only while a mode was active had to filter by hand.
+    pub fn unsubscribe(&self, topic: &str) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::bus::unsubscribe(topic);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = topic;
+    }
+
     /// Emit on the inter-extension event bus (R-08-029).
     pub fn emit(&self, topic: &str, payload: impl Serialize) {
         let payload = serde_json::to_string(&payload).unwrap_or_else(|_| "null".into());
@@ -159,6 +170,41 @@ impl Ctx {
         #[cfg(target_arch = "wasm32")]
         {
             return crate::guest::bindings::cyrup::ext::ctx_state::is_project_trusted();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        false
+    }
+
+    /// The host's current working directory — pi `ctx.cwd` (`extensions/types.ts:315` @v0.83.0),
+    /// on the BASE `ExtensionContext` beside `mode` (:311) and `hasUI` (:313), so it is available
+    /// to every handler and every tool `execute`, not just command handlers.
+    ///
+    /// EXT-044: without this a guest could resolve no relative path at all — it could not tell
+    /// which project it was in, scope a cache, interpret a path in a tool argument, or compose one
+    /// for its `ext-fs`/`exec` grant. cyrup's own native tier had always exposed it as
+    /// `HostCtx.cwd`, so this was a divergence between cyrup's two tiers as well as against pi.
+    pub fn cwd(&self) -> String {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ctx_state::get_cwd();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    /// Whether the RUN this handler is executing inside has been cancelled (EXT-045).
+    ///
+    /// pi exposes this as `signal: AbortSignal | undefined` on the base `ExtensionContext`
+    /// (`extensions/types.ts:334` @v0.83.0, "The current abort signal, or undefined when the agent
+    /// is not streaming"). CYRUP-DELTA: an `AbortSignal` is an event target, and a component-model
+    /// value cannot be a callback target — so the guest POLLS rather than being woken. Check it
+    /// between units of work in a long non-tool handler; a guest TOOL should keep using the
+    /// per-call [`ToolCall::is_cancelled`] poll, which is the closer analog of upstream's
+    /// `execute(…, signal, …)` parameter.
+    pub fn is_run_cancelled(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ctx_state::is_run_cancelled();
         }
         #[cfg(not(target_arch = "wasm32"))]
         false
@@ -908,7 +954,13 @@ impl Session {
         #[cfg(not(target_arch = "wasm32"))]
         let _ = name;
     }
-    pub fn set_label(&self, entry_id: &str, label: &str) {
+    /// Set OR CLEAR a label on an entry — pi `setLabel(entryId: string, label: string | undefined)`
+    /// (`extensions/types.ts:1314` @v0.83.0, "Set or clear a label on an entry. Labels are
+    /// user-defined markers for bookmarking/navigation").
+    ///
+    /// EXT-046: `None` CLEARS. An empty string does NOT — it writes an empty label, leaving a
+    /// marker the user cannot remove through the extension that created it.
+    pub fn set_label(&self, entry_id: &str, label: Option<&str>) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::session::set_label(entry_id, label);
         #[cfg(not(target_arch = "wasm32"))]
@@ -949,6 +1001,21 @@ fn parse_json(s: String) -> Value {
 pub struct Models;
 
 impl Models {
+    /// The models scoped to this session — pi `ctx.scopedModels: readonly ScopedModel[]`
+    /// (`extensions/types.ts:326` @v0.83.0): "Models scoped to this session (resolved from
+    /// `--models` / `enabledModels` settings against the available catalogue). Same set the
+    /// `/scoped-models` command shows. Empty when no scoping is configured (all available models
+    /// are usable)." EXT-045 — without it a guest could not offer a model picker restricted to the
+    /// session's scoped set.
+    pub fn scoped(&self) -> Value {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return parse_json(crate::guest::bindings::cyrup::ext::models::scoped_models());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Value::Array(vec![])
+    }
+
     pub fn list(&self) -> Value {
         #[cfg(target_arch = "wasm32")]
         {

@@ -13,9 +13,20 @@
 
 use cyrup_resources::SkillPointer;
 
-/// Skills section preamble lines (compact; DI-1).
-const SKILLS_PREAMBLE: &str =
-    "Available skills (open the SKILL.md with the read tool to use one):";
+/// Skills section preamble — Pi's five `lines` entries before `<available_skills>`
+/// (`skills.ts:342-347`), joined with `\n`. The three prose lines are behavioural instructions, not
+/// branding, so they are ported verbatim:
+///
+/// * `:343` "The following skills provide specialized instructions for specific tasks."
+/// * `:344` "Use the read tool to load a skill's file when the task matches its description."
+/// * `:345` the relative-path resolution rule — without it, a SKILL.md that references
+///   `references/palette.md` or `scripts/run.sh` resolves against the agent's cwd instead of the
+///   skill directory, so the model issues reads that miss and the skill silently fails.
+///
+/// `:346` is the empty string, i.e. the blank line before `<available_skills>`.
+const SKILLS_PREAMBLE: &str = "The following skills provide specialized instructions for specific tasks.\n\
+    Use the read tool to load a skill's file when the task matches its description.\n\
+    When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n";
 
 /// Emit the `<available_skills>` block. No-op when `skills` is empty or every skill is
 /// model-invocation-disabled.

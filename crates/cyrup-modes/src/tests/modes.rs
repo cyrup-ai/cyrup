@@ -184,6 +184,43 @@ async fn print_mode_routes_a_failed_turn_to_stderr_and_suppresses_stdout() {
     assert_eq!(stderr, "the model exploded\n", "the error message goes to stderr (G4): {stderr:?}");
 }
 
+/// SEAM-016 — `run_print` returns pi's `exitCode`, decided inside the terminal output block from
+/// the SAME `lastMessage` it prints (`print-mode.ts:139-148` @v0.84.1) and returned at `:151`.
+///
+/// Pins the three arms that used to diverge, all of which were computed elsewhere (`run.rs`'s
+/// reverse transcript scan) rather than here:
+/// * a clean `stop` keeps the `exitCode = 0` pi initialises at `:35`;
+/// * `error` raises it to 1 (`:147`);
+/// * **`aborted` raises it to 1 too** — pi's condition is `stopReason === "error" || stopReason ===
+///   "aborted"` (`:145`), one branch, one assignment. cyrup answered **130** for this case, a code
+///   pi never emits from print mode, so this assertion was RED before the change.
+#[tokio::test]
+async fn print_mode_exit_code_is_pis_zero_or_one_from_the_final_message() {
+    for (reason, expected) in [
+        (StopReason::Stop, 0),
+        (StopReason::Error, 1),
+        (StopReason::Aborted, 1),
+    ] {
+        let fx = fixture();
+        let faux = Arc::new(FauxProvider::new());
+        faux.set_responses(vec![faux_assistant_message(vec![faux_text("out")], reason)]);
+        let runtime = build_runtime(&fx, faux).await;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_print(
+            &runtime,
+            [UserInput::text("q", InputSource::Cli)],
+            &mut out,
+            &mut err,
+            PrintOptions::default(),
+        )
+        .await
+        .expect("print mode runs");
+        assert_eq!(code, expected, "pi's exitCode for stop reason {reason:?}");
+    }
+}
+
 /// G4 — an aborted final turn with NO `error_message` falls back to Pi's `Request ${stopReason}`
 /// string on stderr, still suppressing stdout (print-mode.ts:136, the `|| ` branch).
 #[tokio::test]
@@ -214,6 +251,82 @@ async fn print_mode_aborted_turn_without_message_uses_the_request_reason_fallbac
         "Request aborted\n",
         "an aborted turn without an error_message falls back to `Request aborted` (G4)"
     );
+}
+
+/// SEAM-014 / DRIFT-010 — `get_available_thinking_levels` is one of pi's 32 RPC verbs
+/// (`modes/rpc/rpc-types.ts:39` @v0.83.0), handled at `rpc-mode.ts:507-510` and answering
+/// `{levels}` (`rpc-types.ts:158-164`). It was the ONE verb missing from cyrup's `SessionCommand`
+/// switch, so a client could not enumerate which levels the active model supports and had to
+/// hard-code the list or offer levels the model rejects.
+///
+/// SEAM-054 — a BLANK stdin line must produce pi's `parse` error response, not silence. pi's
+/// `emitLine` has no emptiness filter (`modes/rpc/jsonl.ts:25-41` @v0.84.1, emit at `:38`), so the
+/// empty string reaches `handleInputLine`, `JSON.parse("")` throws, and pi writes
+/// `error(undefined, "parse", …)` (`rpc-mode.ts:752-758`). cyrup dropped the record before the
+/// command loop ever saw it, so any client correlating n-lines-in to n-responses-out desynchronised
+/// and one waiting on a reply hung.
+///
+/// SEAM-053 — the OPTIONAL `RpcSessionState` members (`sessionFile?`, `sessionName?`, `model?`,
+/// `rpc-types.ts:95/102/104`) must be ABSENT, not `null`: pi builds the object as a TS literal and
+/// `JSON.stringify` drops an `undefined` property (`rpc-mode.ts:445-458`), so its line for an
+/// unnamed ephemeral session contains neither key. A client using `"sessionName" in state` — the
+/// natural idiom for an optional property — took the wrong branch against cyrup's explicit `null`.
+#[tokio::test]
+async fn rpc_thinking_levels_blank_lines_and_omitted_optional_state_match_pi() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let runtime = build_runtime(&fx, faux).await;
+
+    let input = concat!(
+        "\n",
+        r#"{"type":"get_available_thinking_levels","id":"levels"}"#,
+        "\n",
+        r#"{"type":"get_state","id":"state"}"#,
+        "\n",
+    );
+    let reader = Cursor::new(input.as_bytes().to_vec());
+    let mut out: Vec<u8> = Vec::new();
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    let lines = parse_lines(&out);
+    let responses: Vec<&Value> = lines.iter().filter(|l| type_of(l) == "response").collect();
+
+    // SEAM-054: the blank line was ANSWERED, with pi's `parse` command and no id.
+    let parse_err = responses
+        .iter()
+        .find(|r| r["command"] == "parse")
+        .expect("a blank line must produce pi's `parse` error response, not silence");
+    assert_eq!(parse_err["success"], false);
+    assert!(parse_err.get("id").is_none() || parse_err["id"].is_null());
+
+    // SEAM-014: the verb exists and answers `{levels: [...]}`.
+    let levels = responses
+        .iter()
+        .find(|r| r["command"] == "get_available_thinking_levels")
+        .expect("get_available_thinking_levels must be a recognized verb");
+    assert_eq!(levels["success"], true, "{levels}");
+    assert!(
+        levels["data"]["levels"].is_array(),
+        "pi's response shape is {{levels}} (rpc-types.ts:158-164): {levels}"
+    );
+
+    // SEAM-053: `sessionName` was never set on this session, so the KEY is absent.
+    let state = responses
+        .iter()
+        .find(|r| r["command"] == "get_state")
+        .expect("a get_state response");
+    let data = state["data"].as_object().expect("get_state data object");
+    assert!(
+        !data.contains_key("sessionName"),
+        "an unnamed session must OMIT sessionName, not send null (rpc-types.ts:104): {state}"
+    );
+    // The required members are still all present and non-null.
+    for field in ["sessionId", "thinkingLevel", "isStreaming", "messageCount"] {
+        assert!(
+            data.get(field).is_some_and(|v| !v.is_null()),
+            "required RpcSessionState field {field} missing: {state}"
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -1011,12 +1124,22 @@ async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
     assert_eq!(req["statusKey"], "git");
     assert!(req.get("statusText").is_none(), "a cleared status must omit statusText: {req:?}");
 
-    // set_widget → `{method:"setWidget", widget}`: cyrup's WIT collapsed Pi's 3-arg `setWidget(key,
-    // content, options)` into ONE opaque JSON payload, forwarded verbatim (see `UiEffect::SetWidget`).
+    // SEAM-028 — this case DOCUMENTS a divergence; it does not bless one. cyrup's WIT collapsed
+    // pi's 3-arg `setWidget(key, content, options)` into one opaque JSON payload
+    // (`set-widget: func(widget-json: string)`, both `wit/world.wit` copies), so the emitter sends a
+    // cyrup-invented `widget` blob where pi's `RpcExtensionUIRequest` member pins
+    // `widgetKey: string; widgetLines: string[] | undefined; widgetPlacement?: "aboveEditor" |
+    // "belowEditor"` (`modes/rpc/rpc-types.ts:264-271`) and has NO `widget` key at all.
+    //
+    // Asserting the collapse as CORRECT is what made this suite certify the divergence and invited
+    // a revert of the fix, so the assertion below is the pi-shaped one and the case is `#[ignore]`d
+    // until SEAM-011 widens the WIT. Do not re-point it at `req["widget"]`.
     host_services.set_widget(&serde_json::json!({"widget": "text", "text": "hi"}));
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "setWidget");
-    assert_eq!(req["widget"], serde_json::json!({"widget": "text", "text": "hi"}));
+    // The `method` is the only part of this member cyrup gets right, so it is the only part
+    // asserted. The pi-shaped payload assertion lives in
+    // `set_widget_carries_pis_three_fields_and_no_widget_blob`, `#[ignore]`d against SEAM-011.
 
     // set_title → `{method:"setTitle", title}` (rpc-mode.ts:216-223).
     host_services.set_title("My Session");
@@ -1084,9 +1207,14 @@ async fn rpc_header_footer_and_tools_expanded_effects_never_reach_the_wire() {
     host_services.set_footer("custom footer");
     host_services.set_tools_expanded(true);
 
-    // Give the (silent-by-design) drain arm a moment to actually run before checking nothing landed.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
+    // SEAM-030 (b) — the 50 ms sleep that used to sit here is replaced by a POSITIVE
+    // synchronisation point: the `get_state` round-trip below is itself the barrier. Its response
+    // cannot be written until the loop has processed everything queued ahead of it, so "the very
+    // next wire line is the get_state response" proves no `extension_ui_request` was emitted
+    // WITHOUT depending on how long a sleep happens to be. (This one was a smell rather than a
+    // defect — `extension_ui_effect_json` returns `None` for `SetHeader`/`SetFooter`/
+    // `SetToolsExpanded`, so no request can ever be written regardless — but the sleep asserted
+    // nothing and cost 50 ms per run.)
     client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
     let after = read_json_line(&mut client_reader).await;
     assert_eq!(
@@ -1136,7 +1264,6 @@ async fn rpc_extension_ui_request_times_out_to_the_default_when_client_never_res
     // exactly as the wasm-suspended host import would be.
     let hs = host_services.clone();
     let opts = DialogOptions { timeout_ms: Some(80), signal_id: None };
-    let started = tokio::time::Instant::now();
     let guest_confirm = tokio::spawn(async move { hs.confirm("Proceed?", "body", &opts) });
 
     // The client sees the request, including Pi's `timeout` field — and simply never answers it.
@@ -1151,11 +1278,10 @@ async fn rpc_extension_ui_request_times_out_to_the_default_when_client_never_res
         .expect("the dialog must not hang past its timeout_ms")
         .expect("confirm task");
     assert!(!resolved, "an unanswered confirm settles to Pi's `false` default on timeout");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "must settle close to the 80ms timeout, not linger: {:?}",
-        started.elapsed()
-    );
+    // SEAM-030 — the `started.elapsed() < 2s` margin that used to follow is DELETED: it carried no
+    // semantic content the `timeout(5s)` + `assert!(!resolved)` above does not already carry (the
+    // dialog demonstrably settled on its own, unanswered), and it was the most flake-prone
+    // assertion in this file.
 
     // The loop is still alive and serving requests — the abandoned dialog never hung the session.
     client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
@@ -1274,9 +1400,7 @@ async fn rpc_abort_bash_interrupts_a_running_bash_command() {
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
 
-    let started = std::time::Instant::now();
     run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
-    let elapsed = started.elapsed();
 
     let lines = parse_lines(&out);
     let bash = lines.iter().find(|l| l["id"] == "b1").expect("bash response");
@@ -1284,14 +1408,12 @@ async fn rpc_abort_bash_interrupts_a_running_bash_command() {
     assert_eq!(abort["command"], "abort_bash");
     assert_eq!(abort["success"], true, "abort_bash must be acknowledged: {abort}");
 
-    // The decisive assembled observation: the exchange finished FAR faster than the 6s sleep — only
-    // possible if `abort_bash` was serviced WHILE `bash` was still running.
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "abort_bash did NOT interrupt the running bash: the whole exchange took {elapsed:?} \
-         (~the full 6s sleep), proving the command loop is serialized (G1)"
-    );
-    // Corroborates the interruption at the semantic level: the bash was cancelled, not run to term.
+    // SEAM-030 — the wall-clock assertion that used to sit here (`elapsed < 3s`, "proving the
+    // command loop is serialized") is DELETED. It asserted a scheduling outcome the test cannot
+    // control, so under CI load or a debug build it failed for reasons unrelated to the behaviour
+    // under test, while the deterministic assertion five lines below proves the same property: a
+    // `cancelled:true` bash result can ONLY arise if `abort_bash` was serviced while `bash` was
+    // still running (G1).
     assert_eq!(bash["command"], "bash");
     assert_eq!(
         bash["data"]["cancelled"], true,
@@ -1772,5 +1894,34 @@ async fn rpc_bash_honors_a_partial_user_bash_result_override() {
     assert!(
         msgs_json.to_string().contains("sandboxed-elsewhere"),
         "the partial override is recorded into the transcript: {msgs_json}"
+    );
+}
+
+/// SEAM-028/SEAM-011 — pi's `setWidget` union member is
+/// `{ method: "setWidget"; widgetKey: string; widgetLines: string[] | undefined; widgetPlacement?:
+/// "aboveEditor" | "belowEditor" }` (`modes/rpc/rpc-types.ts:264-271` @v0.83.0). The whole
+/// `RpcExtensionUIRequest` union carries **no** `widget` key on any member.
+///
+/// cyrup emits a cyrup-invented `{"widget": <blob>}` instead, because both `wit/world.wit` copies
+/// declare `set-widget: func(widget-json: string)` — one opaque payload where pi has three typed
+/// fields. An RPC client written to pi's contract therefore cannot render extension widgets at all:
+/// no key to key on, no lines to draw, no placement.
+///
+/// Ignored, not deleted, and deliberately written in pi's shape: this is the assertion that must go
+/// green when SEAM-011 widens the WIT, and its presence is what stops the divergence being
+/// re-certified as correct by the sibling case above.
+#[tokio::test]
+#[ignore = "SEAM-011: cyrup's WIT collapses pi's 3-arg setWidget into one opaque blob"]
+async fn set_widget_carries_pis_three_fields_and_no_widget_blob() {
+    let effect = cyrup_session_svc::UiEffect::SetWidget {
+        widget: serde_json::json!({"widget": "text", "text": "hi"}),
+    };
+    let req = crate::rpc::extension_ui_effect_json(&effect).expect("setWidget reaches the wire");
+    assert_eq!(req["method"], "setWidget");
+    assert_eq!(req["widgetKey"], "text");
+    assert_eq!(req["widgetLines"], serde_json::json!(["hi"]));
+    assert!(
+        req.get("widget").is_none(),
+        "pi's setWidget union member carries no `widget` key: {req:?}"
     );
 }

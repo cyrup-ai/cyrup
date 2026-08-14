@@ -303,8 +303,17 @@ impl Models {
         collect_message(self.stream_simple(model, context, options)).await
     }
 
-    /// Ask dynamic providers to re-fetch their model lists (1:1 port of Pi `refresh`,
-    /// models.ts:198-214).
+    /// Ask dynamic providers to re-fetch their model lists (Pi `Models.refresh`, declared
+    /// `models.ts:147` and implemented `:276-328` @v0.83.0).
+    ///
+    /// **This is NOT a 1:1 port**, and the previous claim that it was — together with a citation to
+    /// `models.ts:198-214`, which is `CreateModelsOptions` + `mergeHeaders`, not `refresh` — is
+    /// PROV-041. Four upstream features are missing and are tracked as PROV-S05: the
+    /// `ModelsRefreshOptions { allowNetwork, force, signal }` argument (`:46-51`), the
+    /// `ModelsRefreshResult { aborted, errors }` return (`:52-56`), the abort signal, and the
+    /// re-invocation with `allowNetwork: false` that restores the persisted catalog after any
+    /// failure. The allow-network split, the mode gate and the configured-provider restriction ARE
+    /// reproduced, by a different mechanism, in `crates/cyrup/src/provider.rs:71-130`.
     ///
     /// With a provider id: a static provider (no [`Provider::refresh_models`] source → `None`) is a
     /// no-op (`Ok(())`); a dynamic provider's fetch failure is surfaced as a `model_source`
@@ -335,6 +344,168 @@ impl Models {
         futures::future::join_all(refreshes).await;
         Ok(())
     }
+
+    // ---- auth status / availability (Pi models.ts:150-153, :364-409 @v0.83.0) ----
+
+    /// Whether a provider has complete auth configuration, **without** refreshing OAuth
+    /// (1:1 port of Pi `Models.checkAuth` `models.ts:150`/`:388-392` and the private
+    /// `checkProviderAuth` `:364-386` @v0.83.0). PROV-031.
+    ///
+    /// - A stored OAuth credential counts only when the provider declares an `oauth` strategy
+    ///   (`:368-370`).
+    /// - Otherwise the api-key strategy resolves (`:384-385`); `None` means unconfigured.
+    ///
+    /// **CYRUP-DELTA** (pi `models.ts:384`): pi's `resolveProviderAuth` is provider-scoped, while
+    /// cyrup's [`crate::auth::ApiKeyAuth::resolve`] takes a `&Model` — `providers/cloudflare.rs`
+    /// needs `model.base_url` for its `{CLOUDFLARE_ACCOUNT_ID}` substitution. The provider's first
+    /// catalog row stands in as the resolution subject; a provider with an empty catalog has
+    /// nothing to make available and reports `None`.
+    ///
+    /// pi's optional `ApiKeyAuth.check?` hook (`auth/types.ts:173`, consulted at `:373-382`) has no
+    /// counterpart on cyrup's trait, so the resolution path is always taken. No built-in provider
+    /// implements `check` upstream.
+    pub async fn check_auth(&self, provider: &str) -> Option<AuthCheck> {
+        let entry = self.providers.get(provider)?;
+        let auth = entry.provider_auth()?;
+        let id = entry.id().clone();
+        let stored = self.credentials.read(&id).await.ok().flatten();
+
+        // `if (credential?.type === "oauth") return provider.auth.oauth ? {source:"OAuth",
+        // type:"oauth"} : undefined` (models.ts:368-370).
+        if matches!(stored, Some(crate::auth::Credential::Oauth { .. })) {
+            return auth.oauth.as_ref().map(|_| AuthCheck {
+                auth_type: AuthType::Oauth,
+                source: Some("OAuth".to_string()),
+            });
+        }
+        // `const apiKey = provider.auth.apiKey; if (!apiKey) return undefined` (:371-372).
+        auth.api_key.as_ref()?;
+        let model = entry.models().first()?;
+        let resolved = resolve_provider_auth(
+            &id,
+            auth,
+            model,
+            self.credentials.as_ref(),
+            self.auth_context.as_ref(),
+            AuthOverrides::default(),
+        )
+        .await
+        .ok()
+        .flatten()?;
+        Some(AuthCheck {
+            auth_type: AuthType::ApiKey,
+            source: resolved.source,
+        })
+    }
+
+    /// Models whose providers have complete auth configuration (1:1 port of Pi
+    /// `Models.getAvailable` `models.ts:153`/`:394-409` @v0.83.0). PROV-031.
+    ///
+    /// Per provider: read the stored credential, run [`Models::check_auth`], skip the provider
+    /// entirely when it is unconfigured, and otherwise pass its complete catalog through
+    /// [`Provider::filter_models`] — pi's exact position, `models.ts:407` (PROV-032).
+    /// [`Models::get_models`] still returns everything, as pi's `getModels()` does.
+    pub async fn get_available(&self, provider: Option<&str>) -> Vec<Model> {
+        let entries: Vec<&Arc<dyn Provider>> = match provider {
+            Some(id) => self.providers.get(id).into_iter().collect(),
+            None => self.providers.values().collect(),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            if self.check_auth(entry.id().as_str()).await.is_none() {
+                continue;
+            }
+            let credential = self.credentials.read(entry.id()).await.ok().flatten();
+            out.extend(entry.filter_models(entry.models(), credential.as_ref()));
+        }
+        out
+    }
+
+    /// Run a provider-owned login flow and persist the credential it returns (Pi `Models.login`,
+    /// `models.ts:168` @v0.83.0). PROV-031.
+    pub async fn login(
+        &self,
+        provider: &str,
+        auth_type: AuthType,
+        interaction: &dyn crate::auth::oauth::AuthInteraction,
+    ) -> Result<crate::auth::Credential, ProviderError> {
+        let id: cyrup_core::ProviderId = provider.into();
+        let entry = self
+            .providers
+            .get(provider)
+            .ok_or_else(|| auth_err(&id, "unknown provider"))?;
+        let auth = entry
+            .provider_auth()
+            .ok_or_else(|| auth_err(&id, "provider has no auth strategy"))?;
+        let cred = match auth_type {
+            AuthType::Oauth => {
+                let flow = auth
+                    .oauth
+                    .as_ref()
+                    .ok_or_else(|| auth_err(&id, "provider has no OAuth flow"))?;
+                flow.login(interaction)
+                    .await
+                    .map_err(|e| auth_err(&id, &format!("login failed: {e}")))?
+            }
+            AuthType::ApiKey => {
+                let strategy = auth
+                    .api_key
+                    .as_ref()
+                    .ok_or_else(|| auth_err(&id, "provider has no api-key strategy"))?;
+                strategy
+                    .login(interaction)
+                    .await
+                    .map_err(|e| auth_err(&id, &format!("login failed: {e}")))?
+            }
+        };
+        let id = entry.id().clone();
+        let stored = cred.clone();
+        self.credentials
+            .modify(
+                &id,
+                Box::new(move |_| Box::pin(async move { Ok(Some(stored)) })),
+            )
+            .await?;
+        Ok(cred)
+    }
+
+    /// Remove the stored credential for a provider (Pi `Models.logout`, `models.ts:171` @v0.83.0).
+    /// PROV-031.
+    pub async fn logout(&self, provider: &str) -> Result<(), ProviderError> {
+        let id = match self.providers.get(provider) {
+            Some(entry) => entry.id().clone(),
+            None => provider.into(),
+        };
+        self.credentials.delete(&id).await?;
+        Ok(())
+    }
+}
+
+/// A `ProviderError::Auth` naming the provider — the shape [`crate::error::AuthError`] requires.
+fn auth_err(provider: &cyrup_core::ProviderId, detail: &str) -> ProviderError {
+    ProviderError::Auth(crate::error::AuthError::ApiKey {
+        provider: provider.clone(),
+        cause: detail.to_string().into(),
+    })
+}
+
+/// Whether a provider's configured auth is an api key or an OAuth credential
+/// (Pi `AuthType = "api_key" | "oauth"`, `auth/types.ts:111` @v0.83.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthType {
+    ApiKey,
+    Oauth,
+}
+
+/// The result of [`Models::check_auth`] (Pi `AuthCheck`, `auth/types.ts:106-109` @v0.83.0:
+/// `{ source?: string; type: "api_key" | "oauth" }`).
+///
+/// `cyrup-config` declares its own `AuthCheck` with the same two members
+/// (`cyrup-config/src/login.rs:116-119`); collapsing the two onto this one is cross-crate work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthCheck {
+    pub auth_type: AuthType,
+    pub source: Option<String>,
 }
 
 /// A snapshot of the data `apply_auth` needs, captured for the spawned stream task.
@@ -376,7 +547,17 @@ impl AuthHelper {
         }
         let mut request_options = options.clone();
         request_options.api_key = options.api_key.clone().or_else(|| auth.api_key.clone());
-        request_options.headers = merge_headers(auth.headers.as_ref(), options.headers.as_ref());
+        let mut headers = merge_headers(auth.headers.as_ref(), options.headers.as_ref());
+        // PROV-042. `if (options?.transformHeaders) headers = await options.transformHeaders(headers
+        // ?? {})` (Pi `models.ts:480` @v0.83.0) — LAST, after auth headers and request headers are
+        // merged, so the transform observes the final set and its return value wins. Then
+        // `const { transformHeaders: _t, ...providerOptions } = options ?? {}` (`:483`) strips it,
+        // so no provider or wire impl ever sees it as an option field.
+        if let Some(transform) = &options.transform_headers {
+            headers = Some(transform(headers.unwrap_or_default()).await);
+        }
+        request_options.headers = headers;
+        request_options.transform_headers = None;
         Ok((request_model, request_options))
     }
 }
@@ -984,5 +1165,147 @@ mod tests {
             1,
             "healthy source fetched"
         );
+    }
+
+    /// PROV-042. `transformHeaders` runs after auth + request headers are merged (Pi
+    /// `models.ts:480` @v0.83.0), sees the FINAL set, its return value wins, and it is stripped
+    /// from the options the provider receives (`:483`).
+    ///
+    /// Red before the fix: `rg transform_headers crates/` was empty workspace-wide, so an
+    /// extension could not observe or modify outbound provider headers at all while its two sibling
+    /// hooks (`before_provider_request` / `after_provider_response`) worked.
+    #[tokio::test]
+    async fn transform_headers_runs_last_and_is_stripped_from_provider_options() {
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Option<crate::HeaderMap>>> = Arc::new(Mutex::new(None));
+        let recorder = seen.clone();
+        let transform: crate::stream::TransformHeadersFn =
+            Arc::new(move |mut headers: crate::HeaderMap| {
+                let recorder = recorder.clone();
+                Box::pin(async move {
+                    *recorder.lock().unwrap_or_else(|e| e.into_inner()) = Some(headers.clone());
+                    // Removing an auth header inside the transform must actually suppress it.
+                    headers.remove("x-api-key");
+                    headers.insert("x-test".to_string(), Some("1".to_string()));
+                    headers
+                })
+            });
+
+        let mut request_headers = crate::HeaderMap::new();
+        request_headers.insert("x-request".to_string(), Some("r".to_string()));
+        let mut auth_headers = crate::HeaderMap::new();
+        auth_headers.insert("x-api-key".to_string(), Some("k".to_string()));
+
+        let helper = AuthHelper {
+            provider: Arc::new(HeaderAuthProvider {
+                id: "p".into(),
+                models: vec![header_model()],
+                auth: crate::auth::ProviderAuth::with_api_key(Arc::new(FixedHeaderAuth(
+                    auth_headers,
+                ))),
+            }),
+            credentials: Arc::new(InMemoryCredentialStore::new()),
+            auth_context: Arc::new(EnvAuthContext),
+        };
+        let options = StreamOptions {
+            headers: Some(request_headers),
+            transform_headers: Some(transform),
+            ..Default::default()
+        };
+        let (_model, out) = helper
+            .apply_auth(&header_model(), &options)
+            .await
+            .expect("apply_auth");
+
+        // The transform observed the ALREADY-MERGED auth + request headers.
+        let observed = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("transform ran");
+        assert_eq!(observed.get("x-api-key"), Some(&Some("k".to_string())));
+        assert_eq!(observed.get("x-request"), Some(&Some("r".to_string())));
+
+        // Its return value wins, in both directions.
+        let final_headers = out.headers.expect("headers");
+        assert_eq!(final_headers.get("x-test"), Some(&Some("1".to_string())));
+        assert!(
+            final_headers.get("x-api-key").is_none(),
+            "removing a header inside the transform must suppress it"
+        );
+        // And it is not visible to the api impl as an option field (models.ts:483).
+        assert!(out.transform_headers.is_none());
+    }
+
+    fn header_model() -> Model {
+        Model {
+            id: "m".into(),
+            name: "M".into(),
+            api: "openai-completions".into(),
+            provider: "p".into(),
+            base_url: "https://example.invalid".to_string(),
+            reasoning: false,
+            input: vec![crate::model::Modality::Text],
+            cost: crate::model::ModelCost::default(),
+            context_window: 1000,
+            max_tokens: 100,
+            thinking_level_map: None,
+            compat: None,
+            headers: None,
+        }
+    }
+
+    /// An api-key strategy that resolves to a fixed header overlay and no key.
+    struct FixedHeaderAuth(crate::HeaderMap);
+
+    #[async_trait::async_trait]
+    impl crate::auth::ApiKeyAuth for FixedHeaderAuth {
+        fn name(&self) -> &str {
+            "fixed-headers"
+        }
+        async fn resolve(
+            &self,
+            _model: &Model,
+            _ctx: &dyn AuthContext,
+            _cred: Option<&crate::auth::Credential>,
+        ) -> Result<Option<AuthResult>, crate::error::AuthError> {
+            Ok(Some(AuthResult {
+                auth: crate::auth::types::ModelAuth {
+                    api_key: None,
+                    headers: Some(self.0.clone()),
+                    base_url: None,
+                },
+                env: None,
+                source: Some("test".to_string()),
+            }))
+        }
+    }
+
+    struct HeaderAuthProvider {
+        id: cyrup_core::ProviderId,
+        models: Vec<Model>,
+        auth: crate::auth::ProviderAuth,
+    }
+
+    impl Provider for HeaderAuthProvider {
+        fn id(&self) -> &cyrup_core::ProviderId {
+            &self.id
+        }
+        fn models(&self) -> &[Model] {
+            &self.models
+        }
+        fn provider_auth(&self) -> Option<&crate::auth::ProviderAuth> {
+            Some(&self.auth)
+        }
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> EventStream<StreamEvent> {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Box::pin(ReceiverStream::new(rx))
+        }
     }
 }

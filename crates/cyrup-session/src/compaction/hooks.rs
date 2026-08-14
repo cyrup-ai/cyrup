@@ -141,17 +141,60 @@ pub struct BeforeTreeEvent {
     pub user_wants_summary: bool,
 }
 
+/// The instruction/label overrides a before-tree hook may return ALONGSIDE its
+/// proceed/cancel/custom-summary decision.
+///
+/// Pi's `session_before_tree` handler returns one `SessionBeforeTreeResult` object and the caller
+/// reads four independent fields off it: `result.cancel`, `result.summary`,
+/// `result.customInstructions`, `result.replaceInstructions` and `result.label`
+/// (`agent-session.ts:2958-2976`) — the instruction/label reads are NOT gated on which of
+/// `cancel`/`summary` was set, so a guest may steer the *default* summarizer's prompt without
+/// supplying a summary of its own. `custom_instructions` / `replace_instructions` are honoured by
+/// [`super::branch::generate_branch_summary_with_instructions`]
+/// (`branch-summarization.ts:326-334`); `label` is attached to the produced summary entry, or to
+/// the navigation target when no summary was produced (`agent-session.ts:3050-3064`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeforeTreeOverrides {
+    /// Pi `result.customInstructions` (`agent-session.ts:2968-2970`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+    /// Pi `result.replaceInstructions` (`agent-session.ts:2971-2973`). Only load-bearing when
+    /// `custom_instructions` is also set — Pi's selector is
+    /// `if (replaceInstructions && customInstructions)` (`branch-summarization.ts:328-329`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_instructions: Option<bool>,
+    /// Pi `result.label` (`agent-session.ts:2974-2976`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 /// The before-tree hook's decision (R-05-022).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "decision")]
 pub enum BeforeTreeDecision {
-    Proceed,
+    Proceed {
+        /// Pi reads the instruction/label overrides off the same result object regardless of
+        /// whether a summary was supplied (`agent-session.ts:2968-2976`).
+        #[serde(default, flatten)]
+        overrides: BeforeTreeOverrides,
+    },
     Cancel,
     CustomSummary {
         summary: String,
         #[serde(default)]
         details: Option<Value>,
+        #[serde(default, flatten)]
+        overrides: BeforeTreeOverrides,
     },
+}
+
+impl BeforeTreeDecision {
+    /// `Proceed` with no overrides — the common case, and what a hook that does not subscribe
+    /// returns.
+    pub fn proceed() -> Self {
+        BeforeTreeDecision::Proceed { overrides: BeforeTreeOverrides::default() }
+    }
 }
 
 /// Post-tree notification (R-05-022).
@@ -206,7 +249,7 @@ impl CompactionHooks for NoHooks {
         _ev: &BeforeTreeEvent,
         _cancel: CancelToken,
     ) -> Result<BeforeTreeDecision, CompactionError> {
-        Ok(BeforeTreeDecision::Proceed)
+        Ok(BeforeTreeDecision::proceed())
     }
     async fn post_tree(&self, _ev: &PostTreeEvent) {}
 }

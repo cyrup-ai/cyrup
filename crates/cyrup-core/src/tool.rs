@@ -116,9 +116,19 @@ pub trait Tool: Send + Sync {
     /// Tool-specific guideline bullets for the "Guidelines" section of the default system prompt
     /// (Pi `ToolDefinition.promptGuidelines`, extensions/types.ts:444-446). Per func-03 R-03-039
     /// each string MUST name its tool so it stays meaningful once the tool is disabled. Default
-    /// `&[]` contributes nothing (today's behavior).
-    fn prompt_guidelines(&self) -> &[&str] {
-        &[]
+    /// empty contributes nothing (today's behavior).
+    ///
+    /// TOOL-021 / EXT-007: the return type is `Vec<&str>`, not `&[&str]`. A borrowed slice of
+    /// `&'static str` can only be produced by a tool whose guidelines are a compile-time constant
+    /// array — which every BUILT-IN is, and which a WASM guest tool can never be: its descriptor
+    /// owns a `Vec<String>` decoded from the component (`cyrup-ext/wit/world.wit`
+    /// `prompt-guidelines`, copied at `host/live.rs:84` and stored at `registry.rs:27`). So the
+    /// data crossed the ABI, reached the host, and had no reader — a guest declaring
+    /// `promptGuidelines` silently contributed nothing to the system prompt. Borrowing `&str` from
+    /// `&self` keeps the zero-copy property for the built-ins (`SLICE.to_vec()` copies pointers,
+    /// not strings) while making the owned case expressible at all.
+    fn prompt_guidelines(&self) -> Vec<&str> {
+        Vec::new()
     }
 
     /// Whether the runtime draws the standard tool shell or the tool renders its own framing (Pi

@@ -32,16 +32,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cyrup_core::ProviderId;
 use cyrup_provider::wire::WireProvider;
 use cyrup_provider::{
     ApiKeyAuth, ApiRegistry, AuthContext, AuthError, AuthResult, CreateModelsOptions, Credential,
     CredentialStore, InMemoryCredentialStore, Model, ModelAuth, Models, ProviderAuth,
     all_providers_with_overlay, builtin_registry, create_models,
 };
-use cyrup_core::ProviderId;
 
 use crate::config_value::{
-    config_value_env_var_names, resolve_config_value_or_throw, resolve_headers_or_throw,
+    config_value_env_var_names, resolve_config_value_or_throw_async, resolve_headers_or_throw,
 };
 use crate::model::{ModelFile, ProviderConfig, apply_models_json};
 
@@ -206,11 +206,13 @@ impl ApiKeyAuth for ConfiguredApiKeyAuth {
             }
         } else if let Some(raw) = &self.api_key {
             let env = config_context_env(std::slice::from_ref(raw), ctx, None).await;
-            let key = resolve_config_value_or_throw(
+            // CFG-028: `!command` resolution runs on the blocking pool (same 10 s ceiling).
+            let key = resolve_config_value_or_throw_async(
                 raw,
                 &format!("API key for provider \"{}\"", self.provider_id),
                 env.as_ref(),
             )
+            .await
             .map_err(|m| auth_err(&model.provider, m))?;
             match &self.inherited {
                 Some(inner) => {
@@ -273,7 +275,11 @@ impl ApiKeyAuth for ConfiguredApiKeyAuth {
         if let Some(raw) = self.model_headers.get(model.id.as_str()) {
             let values: Vec<String> = raw.values().cloned().collect();
             let model_env = config_context_env(&values, ctx, Some(&explicit)).await;
-            let description = format!("model \"{}/{}\"", model.provider.as_str(), model.id.as_str());
+            let description = format!(
+                "model \"{}/{}\"",
+                model.provider.as_str(),
+                model.id.as_str()
+            );
             let resolved = resolve_headers_or_throw(Some(raw), &description, model_env.as_ref())
                 .map_err(|m| auth_err(&model.provider, m))?;
             if let Some(resolved) = resolved {
@@ -416,7 +422,8 @@ pub fn compose_provider_registry(
     let overlay = options.catalog_overlay.clone();
     let registry = Arc::new(builtin_registry());
     let mut models = create_models(options);
-    for provider in all_providers_with_overlay(store.clone(), registry.clone(), overlay.as_deref()) {
+    for provider in all_providers_with_overlay(store.clone(), registry.clone(), overlay.as_deref())
+    {
         models.set_provider(provider);
     }
     let errors = file.compose_providers(&mut models, store, registry, auth_context);

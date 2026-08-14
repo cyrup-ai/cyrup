@@ -232,6 +232,11 @@ pub const CHECK_CHAIN_DISCOVERY: &str = "chain-discovery";
 /// Check (f): provider/model catalog freshness.
 pub const CHECK_PROVIDER_CATALOG_FRESHNESS: &str = "provider-catalog-freshness";
 
+/// SUBA-035: the active `subagents.modelScope` policy — enforcement is live
+/// (`exec/model_scope.rs`) but nothing surfaced it, so an operator debugging "why did my model
+/// choice not apply" got no hint from `/subagents-doctor` that a scope policy was filtering it.
+pub const CHECK_MODEL_SCOPE: &str = "model-scope";
+
 // =================================================================================================
 // DoctorRunner
 // =================================================================================================
@@ -279,10 +284,10 @@ impl DoctorRunner {
             ),
         );
 
-        let (agents, chains) = discovery_result;
+        let (agents, chains, model_scope) = discovery_result;
 
         DoctorReport {
-            checks: vec![binary, temp_dir, config, agents, chains, catalog],
+            checks: vec![binary, temp_dir, config, agents, chains, catalog, model_scope],
         }
     }
 }
@@ -346,6 +351,17 @@ async fn check_binary_resolution_for(resolved: &SpawnCommand) -> DoctorCheck {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        // SUBA-037: without this, the `tokio::time::timeout` below drops the `status()` future on
+        // expiry and the probe child is LEAKED — `/subagents-doctor` on a misconfigured install
+        // (exactly what doctor exists for) would leave a hung `cyrup --version` behind on every
+        // invocation, and the report said only that the probe timed out.
+        //
+        // This probe deliberately does NOT set `process_group(0)` (unlike `spawn/mod.rs`'s subagent
+        // children), so the pid-targeted SIGKILL `kill_on_drop` sends is sufficient and no
+        // negative-pgid logic is needed here. The pattern is already established in this crate at
+        // `extension.rs`'s stream probe and `watchdog/lsp_diagnostics.rs`; this was the one site
+        // that missed it.
+        .kill_on_drop(true)
         .status();
 
     match tokio::time::timeout(VERSION_PROBE_TIMEOUT, probe).await {
@@ -545,7 +561,7 @@ async fn check_config_json(config_json_path: &Path) -> DoctorCheck {
 /// BOTH (d) and (e), since a single discovery pass covers both and a failure here means neither
 /// count was obtainable), matching this module's "each check catches its own failure" contract
 /// even though the two checks share one underlying computation.
-async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, DoctorCheck) {
+async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, DoctorCheck, DoctorCheck) {
     // Discovery (`discovery::run_discovery`'s callees) is synchronous, real filesystem I/O
     // (R-SA-019: re-scanned per call, never cached) — run it on a blocking-safe spawn so it never
     // blocks this async check's siblings running concurrently in the same `tokio::join!`. The
@@ -584,7 +600,7 @@ async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, Docto
                 format!("{chain_count} chain file(s) discovered across all scopes"),
             );
 
-            (agents_check, chains_check)
+            (agents_check, chains_check, model_scope_check(discovered.model_scope.as_ref()))
         }
         Ok(Err(err)) => {
             let detail = format!("agent/chain discovery failed: {err}");
@@ -593,7 +609,10 @@ async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, Docto
                 .to_string();
             (
                 DoctorCheck::fail(CHECK_AGENT_DISCOVERY, detail.clone(), remedy.clone()),
-                DoctorCheck::fail(CHECK_CHAIN_DISCOVERY, detail, remedy),
+                DoctorCheck::fail(CHECK_CHAIN_DISCOVERY, detail.clone(), remedy.clone()),
+                // The scope lives in the SAME discovery result, so a failed discovery means the
+                // policy is unknown too — reporting "no policy" here would be a lie.
+                DoctorCheck::fail(CHECK_MODEL_SCOPE, detail, remedy),
             )
         }
         Err(join_err) => {
@@ -603,10 +622,62 @@ async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, Docto
                 .to_string();
             (
                 DoctorCheck::fail(CHECK_AGENT_DISCOVERY, detail.clone(), remedy.clone()),
-                DoctorCheck::fail(CHECK_CHAIN_DISCOVERY, detail, remedy),
+                DoctorCheck::fail(CHECK_CHAIN_DISCOVERY, detail.clone(), remedy.clone()),
+                DoctorCheck::fail(CHECK_MODEL_SCOPE, detail, remedy),
             )
         }
     }
+}
+
+/// SUBA-035 — surface the `subagents.modelScope` policy that is actually in force for this cwd.
+///
+/// Enforcement has been live since SUBA-003 (`exec/model_scope.rs:170-188`), and pi surfaces
+/// warn-severity violations and validates the config as part of its settings surface
+/// (`runs/shared/model-scope.ts`) — but `rg 'model_scope|modelScope'` over this file returned
+/// nothing, so the one place an operator looks when a model override "did not apply" said nothing
+/// about the policy filtering it.
+///
+/// Never `Fail`: a configured scope is a working configuration, not a fault. `Warn` only for the
+/// one genuinely broken shape upstream's own `checkModelScope` treats as a no-op — `enforce: true`
+/// with no patterns — which looks armed and enforces nothing.
+///
+/// Includes `strict` (SUBA-050), because once inherited/fallback violations are hard errors an
+/// unsurfaced policy becomes an UNEXPLAINED hard failure rather than an unexplained warning.
+fn model_scope_check(scope: Option<&crate::exec::model_scope::ModelScopeConfig>) -> DoctorCheck {
+    let Some(scope) = scope else {
+        return DoctorCheck::ok(
+            CHECK_MODEL_SCOPE,
+            "no subagents.modelScope policy configured; every resolved model is in scope",
+        );
+    };
+    let patterns = scope.allow.as_deref().unwrap_or(&[]);
+    if scope.enforce != Some(true) {
+        return DoctorCheck::ok(
+            CHECK_MODEL_SCOPE,
+            format!(
+                "subagents.modelScope present but not enforcing (enforce is not true);                  {} allow pattern(s) are inert",
+                patterns.len()
+            ),
+        );
+    }
+    if patterns.is_empty() {
+        return DoctorCheck::warn(
+            CHECK_MODEL_SCOPE,
+            "subagents.modelScope has enforce: true with no allow patterns, so it enforces nothing",
+            "add an allow list (e.g. [\"anthropic/*\"]) or remove enforce"
+                .to_string(),
+        );
+    }
+    DoctorCheck::ok(
+        CHECK_MODEL_SCOPE,
+        format!(
+            "subagents.modelScope enforcing ({}): allow {}; an out-of-scope explicit model is an \
+             error, an inherited/fallback one {}",
+            if scope.strict == Some(true) { "strict" } else { "non-strict" },
+            patterns.join(", "),
+            if scope.strict == Some(true) { "is also an error" } else { "only warns" }
+        ),
+    )
 }
 
 // =================================================================================================
@@ -1322,7 +1393,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovery_checks_warn_zero_agents_but_ok_zero_chains() {
         let cfg = empty_discovery_config();
-        let (agents, chains) = run_discovery_checks(&cfg).await;
+        let (agents, chains, _scope) = run_discovery_checks(&cfg).await;
         assert_eq!(agents.status, CheckStatus::Warn, "{agents:?}");
         assert!(agents.detail.contains('0'));
         assert_eq!(
@@ -1343,7 +1414,7 @@ mod tests {
             ..AgentDiscoveryConfig::default()
         };
 
-        let (agents, chains) = run_discovery_checks(&cfg).await;
+        let (agents, chains, _scope) = run_discovery_checks(&cfg).await;
         assert_eq!(agents.status, CheckStatus::Ok);
         assert!(agents.detail.contains('2'));
         assert_eq!(chains.status, CheckStatus::Ok);
@@ -1364,7 +1435,7 @@ mod tests {
             ..AgentDiscoveryConfig::default()
         };
 
-        let (_agents, chains) = run_discovery_checks(&cfg).await;
+        let (_agents, chains, _scope) = run_discovery_checks(&cfg).await;
         assert_eq!(chains.status, CheckStatus::Ok);
         assert!(chains.detail.contains('1'));
     }
@@ -1402,7 +1473,7 @@ mod tests {
         // Baseline sanity: the ordinary empty-config path used elsewhere in this file must not be
         // confused with a failure — zero agents is Warn, never Fail; zero chains is Ok.
         let cfg = empty_discovery_config();
-        let (agents, chains) = run_discovery_checks(&cfg).await;
+        let (agents, chains, _scope) = run_discovery_checks(&cfg).await;
         assert_ne!(agents.status, CheckStatus::Fail);
         assert_ne!(chains.status, CheckStatus::Fail);
     }
@@ -1523,6 +1594,60 @@ mod tests {
     // reports Warn/Fail for EXACTLY the expected subset, Ok for the rest.
     // -----------------------------------------------------------------------------------------
 
+    /// SUBA-035 — the active `subagents.modelScope` policy must be visible in the doctor report.
+    ///
+    /// THE USER ACTION: an operator's `model:` override "did not apply" and they run
+    /// `/subagents-doctor` — the one place designed to answer that. Before the fix the file had
+    /// ZERO references to the scope (`rg 'model_scope|modelScope' doctor.rs` across all 1803 lines
+    /// returned nothing), so the report was silent about the policy filtering their choice.
+    /// Compounds with SUBA-050: once `strict` exists, an unsurfaced policy turns an unexplained
+    /// warning into an unexplained hard failure.
+    #[test]
+    fn the_doctor_report_surfaces_the_active_model_scope_policy() {
+        use crate::exec::model_scope::ModelScopeConfig;
+
+        let none = model_scope_check(None);
+        assert_eq!(none.name, CHECK_MODEL_SCOPE);
+        assert_eq!(none.status, CheckStatus::Ok);
+        assert!(none.detail.contains("no subagents.modelScope policy configured"), "{}", none.detail);
+
+        let armed = model_scope_check(Some(&ModelScopeConfig {
+            enforce: Some(true),
+            strict: None,
+            allow: Some(vec!["anthropic/*".to_string()]),
+        }));
+        assert_eq!(armed.status, CheckStatus::Ok);
+        assert!(armed.detail.contains("anthropic/*"), "{}", armed.detail);
+        assert!(armed.detail.contains("non-strict"), "{}", armed.detail);
+        assert!(armed.detail.contains("only warns"), "{}", armed.detail);
+
+        let strict = model_scope_check(Some(&ModelScopeConfig {
+            enforce: Some(true),
+            strict: Some(true),
+            allow: Some(vec!["anthropic/*".to_string()]),
+        }));
+        assert!(strict.detail.contains("strict"), "{}", strict.detail);
+        assert!(strict.detail.contains("is also an error"), "{}", strict.detail);
+
+        // Present but not enforcing: reported, and reported as inert.
+        let inert = model_scope_check(Some(&ModelScopeConfig {
+            enforce: None,
+            strict: None,
+            allow: Some(vec!["anthropic/*".to_string()]),
+        }));
+        assert_eq!(inert.status, CheckStatus::Ok);
+        assert!(inert.detail.contains("not enforcing"), "{}", inert.detail);
+
+        // The one genuinely broken shape — armed with nothing to enforce — is the only Warn.
+        let broken = model_scope_check(Some(&ModelScopeConfig {
+            enforce: Some(true),
+            strict: None,
+            allow: None,
+        }));
+        assert_eq!(broken.status, CheckStatus::Warn);
+        assert!(broken.detail.contains("enforces nothing"), "{}", broken.detail);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[cfg(unix)]
     async fn doctor_runner_reports_exactly_the_expected_warn_fail_subset_a_sa_16() {
@@ -1563,8 +1688,8 @@ mod tests {
 
         assert_eq!(
             report.checks.len(),
-            6,
-            "all six R-SA-131 checks must always be present in the report"
+            7,
+            "all six R-SA-131 checks plus SUBA-035's model-scope diagnostic must always be present"
         );
 
         if running_as_root() {

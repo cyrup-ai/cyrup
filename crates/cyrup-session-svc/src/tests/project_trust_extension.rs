@@ -69,7 +69,7 @@ impl NativeExtension for TrustVoter {
         Ok(())
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        if !matches!(ev, HostEvent::ProjectTrust) {
+        if !matches!(ev, HostEvent::ProjectTrust { .. }) {
             return HookOutcome::Noop;
         }
         self.asked.fetch_add(1, Ordering::AcqRel);
@@ -294,4 +294,109 @@ async fn an_opted_out_native_does_not_suppress_an_opted_in_voter() {
         !session.services().settings.project_trusted(),
         "and its verdict still decided the session's trust"
     );
+}
+
+// ============================================================ SEAM-065: the TIER ORDER ==========
+
+/// SEAM-065 — pi's `resolveProjectTrusted` orders the tiers explicitly
+/// (`core/project-trust.ts:46-95` @v0.83.0, identical at v0.84.1):
+/// `trustOverride` (`:47`) → no-trust-requiring-resources (`:50`) → **`emitProjectTrustEvent`
+/// (`:54-70`)** → the store (`:72-75`) → the default policy (`:77-84`) → `hasUI` (`:86-88`) →
+/// `selectProjectTrustOption` → `ctx.ui.select` (`:90-94`). The extension tier returns BEFORE
+/// anything else and persists when `result.remember === true`.
+///
+/// cyrup resolved trust PRE-LAUNCH instead, in `main.rs`'s `resolve_startup_ui`: the human was asked
+/// first, the answer became `config.trust_override`, and the builder's
+/// `if cfg.trust_override.is_none() && has_resources` guard then skipped
+/// `pre_trust_extension_verdict` entirely. So the `on-project-trust` hook was dead on the one path
+/// that matters — a policy extension could not stop a user selecting "Trust", could not auto-approve
+/// a known-good folder without a prompt, and `remember` never fired.
+///
+/// This asserts the inversion is gone: with an extension answering, the prompt callback is NEVER
+/// invoked. RED before the fix by construction — the callback did not exist, and the prompt ran in
+/// `main.rs` ahead of the builder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extension_verdict_pre_empts_the_prompt_entirely() {
+    let fx = fixture_with_trust_requiring_resources();
+    let (voter, asked, _inits) = TrustVoter::new("no", false);
+    let prompted = Arc::new(AtomicUsize::new(0));
+
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.home = fx.agent_dir.clone();
+    // Interactive is the ONLY mode whose tiered decision can reach `NeedsPrompt`
+    // (`cyrup-config/src/trust.rs`, tier 5), so this is the mode the inversion was live on.
+    cfg.app_mode = cyrup_config::AppMode::Interactive;
+    let counter = prompted.clone();
+    let session = SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
+        .with_native_extension(voter)
+        .trust_prompt(Arc::new(move |_options, _saved| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            Some(true)
+        }))
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(asked.load(Ordering::Acquire), 1, "the extension was consulted");
+    assert_eq!(
+        prompted.load(Ordering::Acquire),
+        0,
+        "SEAM-065: an extension verdict returns before `hasUI`/`ui.select` (project-trust.ts:54-70 \
+         vs :86-94), so the human must NOT be asked"
+    );
+    assert!(
+        !session.services().settings.project_trusted(),
+        "and the extension's `no` is what the session ends up with, not the callback's `yes`"
+    );
+}
+
+/// The control that keeps the assertion above from being a blanket disarm: with NO extension
+/// answering, the tiers fall through to pi's last one and the prompt IS run — and its answer decides
+/// (`project-trust.ts:90-94`). Also pins that the callback receives pi's five-row option set,
+/// `getProjectTrustOptions(cwd, { includeSessionOnly: true })` (`:32`) — SEAM-064's contract, now
+/// owned by the builder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_extension_verdict_the_prompt_runs_and_decides() {
+    let fx = fixture_with_trust_requiring_resources();
+    let seen_labels: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen_labels.clone();
+
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.home = fx.agent_dir.clone();
+    cfg.app_mode = cyrup_config::AppMode::Interactive;
+    let session = SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
+        .trust_prompt(Arc::new(move |options, _saved| {
+            *sink.lock().unwrap() = options.iter().map(|o| o.label.clone()).collect();
+            Some(true)
+        }))
+        .build()
+        .await
+        .unwrap();
+
+    assert!(
+        session.services().settings.project_trusted(),
+        "the prompt's answer decides when no extension answered (project-trust.ts:90-94)"
+    );
+    let labels = seen_labels.lock().unwrap().clone();
+    assert!(
+        labels.iter().any(|l| l == "Trust (this session only)")
+            && labels.iter().any(|l| l == "Do not trust (this session only)"),
+        "the pre-launch option set is `includeSessionOnly: true` (project-trust.ts:32) — SEAM-064: \
+         {labels:?}"
+    );
+}
+
+/// A host with no terminal wires no callback, which is pi's `if (!hasUI) return false;`
+/// (`project-trust.ts:86-88`) — proceed untrusted rather than hang or guess.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_prompt_callback_is_pis_no_ui_branch() {
+    let fx = fixture_with_trust_requiring_resources();
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.home = fx.agent_dir.clone();
+    cfg.app_mode = cyrup_config::AppMode::Interactive;
+    let session = SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
+        .build()
+        .await
+        .unwrap();
+    assert!(!session.services().settings.project_trusted());
 }

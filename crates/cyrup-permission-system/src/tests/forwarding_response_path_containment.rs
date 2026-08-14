@@ -99,6 +99,9 @@ async fn drain(agent_dir: &Path, session_id: &str) {
         &services,
         &ExtensionConfig::default(),
         ProcessForwardedOptions::preserve_location(),
+        // PERM-008/PERM-031: the shared audit trail, and the live `has_ui` pi re-reads per scan.
+        &crate::logging::AuditTrail::detached(agent_dir.join("logs")),
+        true,
     )
     .await;
 }

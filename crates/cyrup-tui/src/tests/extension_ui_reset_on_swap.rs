@@ -24,7 +24,9 @@ async fn a_session_swap_clears_extension_owned_surfaces() {
     // Drive the REAL effect path an extension uses, not the fields directly.
     app.apply_ui_effect(UiEffect::SetHeader { content: "ext header".to_string() });
     app.apply_ui_effect(UiEffect::SetFooter { content: "ext footer".to_string() });
-    app.apply_ui_effect(UiEffect::SetWidget { widget: serde_json::json!({"kind": "widget"}) });
+    app.apply_ui_effect(UiEffect::SetWidget {
+        widget: serde_json::json!({"key": "k", "content": "widget"}),
+    });
     app.apply_ui_effect(UiEffect::SetStatus { key: "ext".to_string(), text: Some("busy".to_string()) });
     app.set_extension_shortcuts(["ctrl+g".to_string()]);
 
@@ -33,7 +35,7 @@ async fn a_session_swap_clears_extension_owned_surfaces() {
     let st = app.state();
     assert_eq!(st.extension_header, None, "header");
     assert_eq!(st.extension_footer, None, "footer");
-    assert_eq!(st.extension_widget, None, "widget");
+    assert!(st.extension_widgets.is_empty(), "widget");
     assert!(st.extension_shortcuts.is_empty(), "shortcuts");
     assert!(st.status.extension_statuses.is_empty(), "status rows");
 }

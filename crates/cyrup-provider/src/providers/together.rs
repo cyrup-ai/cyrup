@@ -335,7 +335,7 @@ pub fn together_models() -> Vec<Model> {
 
 /// The Together [`ProviderAuth`]: an API key from `$TOGETHER_API_KEY` (R-01-063).
 pub fn together_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key([TOGETHER_API_KEY_ENV]))
+    ProviderAuth::with_api_key(env_key("Together API key", [TOGETHER_API_KEY_ENV]))
 }
 
 /// Construct the Together provider over the given credential store + shared api registry. The

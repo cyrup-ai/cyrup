@@ -123,7 +123,13 @@ async fn wasm_guest_http_request_gets_a_real_response_through_the_assembled_sess
     let session = trusted_session().await;
 
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
     assert!(
@@ -161,7 +167,13 @@ async fn wasm_guest_http_stream_receives_real_chunks_in_order_then_eof() {
     let session = trusted_session().await;
 
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 
@@ -222,7 +234,13 @@ async fn wasm_guest_http_stream_surfaces_real_non_2xx_status_and_headers_before_
     let session = trusted_session().await;
 
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 
@@ -274,7 +292,13 @@ async fn wasm_guest_http_request_delayed_past_the_epoch_budget_does_not_wedge_th
     let session = trusted_session().await;
 
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 

@@ -72,8 +72,8 @@ impl NativeExtension for PhaseRecorder {
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         let label = match ev {
-            HostEvent::SessionStart { reason } => Some(format!("session_start:{reason}")),
-            HostEvent::SessionShutdown { reason } => Some(format!("session_shutdown:{reason}")),
+            HostEvent::SessionStart { reason, .. } => Some(format!("session_start:{reason}")),
+            HostEvent::SessionShutdown { reason, .. } => Some(format!("session_shutdown:{reason}")),
             _ => None,
         };
         if let Some(label) = label

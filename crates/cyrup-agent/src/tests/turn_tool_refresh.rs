@@ -112,7 +112,7 @@ struct RefreshOnce {
 
 #[async_trait::async_trait]
 impl Hooks for RefreshOnce {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(Some(TurnUpdate {
                 tools: Some(self.tools.clone()),
@@ -181,7 +181,7 @@ struct ModelOnlyUpdate;
 
 #[async_trait::async_trait]
 impl Hooks for ModelOnlyUpdate {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         Ok(Some(TurnUpdate::default()))
     }
 }

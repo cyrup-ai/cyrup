@@ -1027,12 +1027,16 @@ fn unique_paths(values: Vec<Option<PathBuf>>) -> Vec<PathBuf> {
 /// pi `fleetArtifactsRoot(state, cwd)` (`fleet.ts:334-340`).
 #[must_use]
 pub fn fleet_artifacts_root(state: &FleetState, cwd: &Path) -> PathBuf {
-    // pi passes `state.artifactDirPreference ?? "project"`; cyrup's resolver takes the project cwd
-    // directly, and `Some(cwd)` IS the `"project"` preference (`artifacts.rs:169-183`).
+    // SUBA-048 / pi `getArtifactsDir(state.parentSessionFile ?? null, cwd,
+    // state.artifactDirPreference ?? "project")` (`fleet.ts:334-340`). The in-tree note that used
+    // to sit here — "cyrup's resolver takes the project cwd directly, and `Some(cwd)` IS the
+    // `project` preference" — recorded the defect: with no preference parameter there was no way
+    // to express `session` or `temp` at all.
     crate::artifacts::resolve_artifacts_dir(
         state.parent_session_file.as_deref(),
         Some(cwd),
         cwd,
+        state.artifact_dir_preference,
     )
 }
 

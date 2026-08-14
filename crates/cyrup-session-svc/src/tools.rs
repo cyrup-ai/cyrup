@@ -58,7 +58,7 @@ impl PromptRebuilder {
     /// precomputed map (Pi `_rebuildSystemPrompt`, agent-session.ts:2304-2396).
     fn rebuild(&self, active: &[String]) -> String {
         let mut inputs = self.base.clone();
-        inputs.selected_tools = active.iter().map(|n| Arc::from(n.as_str())).collect();
+        inputs.selected_tools = Some(active.iter().map(|n| Arc::from(n.as_str())).collect());
         inputs.tool_contributions = active
             .iter()
             .filter_map(|n| self.contributions.get(n).cloned())

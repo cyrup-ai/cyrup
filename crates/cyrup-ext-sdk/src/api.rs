@@ -52,6 +52,12 @@ mod kind {
     /// types.ts:1225) — the run has FULLY settled: no retry, post-run compaction or queued
     /// continuation will follow (SEAM-005).
     pub const AGENT_SETTLED: u8 = 30;
+    /// `before_provider_headers` (pi `extensions/types.ts:686-689` @v0.83.0, subscribed at
+    /// `:1212`) — EXT-009.
+    pub const BEFORE_PROVIDER_HEADERS: u8 = 31;
+    /// `session_info_changed` (pi `extensions/types.ts:571-575` @v0.83.0, subscribed at `:1203`)
+    /// — EXT-011.
+    pub const SESSION_INFO_CHANGED: u8 = 32;
 }
 
 /// The block/mutate/notify contribution a handler returns (mirrors the host `HookOutcome`). The
@@ -60,8 +66,12 @@ mod kind {
 pub enum Outcome {
     /// notify-only / no change.
     Noop,
-    /// Short-circuit the action with an optional reason (first block wins host-side).
-    Block(Option<String>),
+    /// Short-circuit the action with an optional reason (first block wins host-side), plus pi's
+    /// `terminate` hint (EXT-049; `extensions/types.ts:1072-1079` @v0.84.1: "Hint that the agent
+    /// should stop after the current tool batch when this call is blocked. Early termination only
+    /// happens when every finalized tool result in the batch sets this to true"). `terminate` is
+    /// read only on `tool_call`; build it with [`Outcome::block_and_terminate`].
+    Block(Option<String>, bool),
     /// Replace the in-flight value with this event-specific JSON patch.
     Mutate(Value),
     /// The extension fully serviced the action (`input`/`user_bash`/`resources_discover`).
@@ -73,10 +83,18 @@ impl Outcome {
         Outcome::Noop
     }
     pub fn block(reason: impl Into<String>) -> Self {
-        Outcome::Block(Some(reason.into()))
+        Outcome::Block(Some(reason.into()), false)
     }
     pub fn block_silent() -> Self {
-        Outcome::Block(None)
+        Outcome::Block(None, false)
+    }
+    /// Block AND hint that the agent should stop after this tool batch (EXT-049; pi
+    /// `ToolCallEventResult.terminate`, `extensions/types.ts:1072-1079` @v0.84.1). The agent
+    /// applies upstream's every()-rule — the run ends only if EVERY finalized result in the batch
+    /// set it (`shouldTerminateToolBatch`, `packages/agent/src/agent-loop.ts:583`) — so one
+    /// blocking handler setting this does not end the run on its own.
+    pub fn block_and_terminate(reason: impl Into<String>) -> Self {
+        Outcome::Block(Some(reason.into()), true)
     }
     /// A raw event-specific mutate patch.
     pub fn mutate(v: impl Serialize) -> Self {
@@ -123,7 +141,7 @@ impl Outcome {
     pub(crate) fn into_raw(self) -> RawOutcome {
         match self {
             Outcome::Noop => RawOutcome::Noop,
-            Outcome::Block(r) => RawOutcome::Block(r),
+            Outcome::Block(r, t) => RawOutcome::Block(r, t),
             Outcome::Mutate(v) => RawOutcome::Mutate(v.to_string()),
             Outcome::Handled(v) => RawOutcome::Handled(v.to_string()),
         }
@@ -134,7 +152,9 @@ impl Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RawOutcome {
     Noop,
-    Block(Option<String>),
+    /// `{reason, terminate}` — pi `ToolCallEventResult` (`extensions/types.ts:1072-1079`
+    /// @v0.84.1). `terminate` is read only on `tool_call` (EXT-049).
+    Block(Option<String>, bool),
     Mutate(String),
     Handled(String),
 }
@@ -189,6 +209,19 @@ impl ToolOutput {
 /// and the capability surface. Cancellation (Pi `signal`) is enforced host-side via the epoch.
 pub trait ToolExec: 'static {
     fn execute(&self, call: ToolCall) -> Result<ToolOutput, String>;
+
+    /// Coerce raw tool-call arguments BEFORE schema validation — pi
+    /// `ToolDefinition.prepareArguments?: (args: unknown) => Static<TParams>`
+    /// (`extensions/types.ts:468` @v0.83.0, run before `validateToolArguments` in
+    /// `packages/agent/src/agent-loop.ts`). EXT-023.
+    ///
+    /// Returning `None` (the default) is upstream's ABSENT `prepareArguments` — the identity. A
+    /// tool that overrides this must ALSO set `ToolDescriptor::prepare_arguments`, because that
+    /// flag is what tells the host to call the export at all; the descriptor field used to be
+    /// accepted, documented and silently discarded at the boundary.
+    fn prepare_arguments(&self, _args: &Value) -> Option<Value> {
+        None
+    }
 }
 
 impl<F> ToolExec for F
@@ -586,20 +619,64 @@ impl ExtensionApi {
             f(BeforeProviderRequestEvent { payload: json(arg(a, 0)) }, c).into_raw()
         }));
     }
-    pub fn on_resources_discover(&mut self, f: impl Fn(&Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::RESOURCES_DISCOVER, Box::new(move |_a, c| f(c).into_raw()));
+    /// `before_provider_headers` (EXT-009). Return the header patch via [`Outcome::mutate`]; a key
+    /// mapped to `null` DELETES that header (pi `extensions/types.ts:681-685` @v0.83.0).
+    pub fn on_before_provider_headers(
+        &mut self,
+        f: impl Fn(BeforeProviderHeadersEvent, &Ctx) -> Outcome + 'static,
+    ) {
+        self.handlers.insert(kind::BEFORE_PROVIDER_HEADERS, Box::new(move |a, c| {
+            f(BeforeProviderHeadersEvent { headers: json(arg(a, 0)) }, c).into_raw()
+        }));
     }
-    pub fn on_project_trust(&mut self, f: impl Fn(&Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::PROJECT_TRUST, Box::new(move |_a, c| f(c).into_raw()));
+    /// `session_info_changed` (EXT-011) — notify-only.
+    pub fn on_session_info_changed(&mut self, f: impl Fn(SessionInfoChangedEvent, &Ctx) + 'static) {
+        self.handlers.insert(
+            kind::SESSION_INFO_CHANGED,
+            notify(move |a, c| f(SessionInfoChangedEvent { name: opt_str(arg(a, 0)) }, c)),
+        );
+    }
+    pub fn on_resources_discover(
+        &mut self,
+        f: impl Fn(ResourcesDiscoverEvent, &Ctx) -> Outcome + 'static,
+    ) {
+        // EXT-016: `cwd` + `reason` (pi extensions/types.ts:544-548 @v0.83.0) — a
+        // resource-contributing extension could not tell which directory it was discovering for,
+        // nor startup from `/reload`, so it could not scope or cache its contribution.
+        self.handlers.insert(kind::RESOURCES_DISCOVER, Box::new(move |a, c| {
+            f(ResourcesDiscoverEvent { cwd: arg(a, 0).into(), reason: arg(a, 1).into() }, c)
+                .into_raw()
+        }));
+    }
+    pub fn on_project_trust(&mut self, f: impl Fn(ProjectTrustEvent, &Ctx) -> Outcome + 'static) {
+        // EXT-043: `cwd` (pi extensions/types.ts:519-522 @v0.83.0) — the key the trust store is
+        // keyed by, so `remember` has a well-defined meaning from the handler's point of view.
+        self.handlers.insert(kind::PROJECT_TRUST, Box::new(move |a, c| {
+            f(ProjectTrustEvent { cwd: arg(a, 0).into() }, c).into_raw()
+        }));
     }
     pub fn on_session_before_switch(&mut self, f: impl Fn(SessionBeforeSwitchEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::SESSION_BEFORE_SWITCH, Box::new(move |a, c| {
-            f(SessionBeforeSwitchEvent { target_id: arg(a, 0).into() }, c).into_raw()
+            f(
+                SessionBeforeSwitchEvent {
+                    reason: arg(a, 0).into(),
+                    target_session_file: opt_str(arg(a, 1)),
+                },
+                c,
+            )
+            .into_raw()
         }));
     }
     pub fn on_session_before_fork(&mut self, f: impl Fn(SessionBeforeForkEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::SESSION_BEFORE_FORK, Box::new(move |a, c| {
-            f(SessionBeforeForkEvent { entry_id: arg(a, 0).into() }, c).into_raw()
+            f(
+                SessionBeforeForkEvent {
+                    entry_id: arg(a, 0).into(),
+                    position: arg(a, 1).into(),
+                },
+                c,
+            )
+            .into_raw()
         }));
     }
     pub fn on_session_before_compact(&mut self, f: impl Fn(SessionBeforeCompactEvent, &Ctx) -> Outcome + 'static) {
@@ -666,19 +743,57 @@ impl ExtensionApi {
     }
     pub fn on_tool_exec_update(&mut self, f: impl Fn(ToolExecUpdateEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TOOL_EXEC_UPDATE, notify(move |a, c| {
-            f(ToolExecUpdateEvent { call_id: arg(a, 0).into(), chunk: json(arg(a, 1)) }, c)
+            f(
+                ToolExecUpdateEvent {
+                    call_id: arg(a, 0).into(),
+                    name: arg(a, 1).into(),
+                    args: json(arg(a, 2)),
+                    chunk: json(arg(a, 3)),
+                },
+                c,
+            )
         }));
     }
     pub fn on_tool_exec_end(&mut self, f: impl Fn(ToolExecEndEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TOOL_EXEC_END, notify(move |a, c| {
-            f(ToolExecEndEvent { call_id: arg(a, 0).into(), result: json(arg(a, 1)), is_error: arg(a, 2) == "true" }, c)
+            f(
+                ToolExecEndEvent {
+                    call_id: arg(a, 0).into(),
+                    name: arg(a, 1).into(),
+                    result: json(arg(a, 2)),
+                    is_error: arg(a, 3) == "true",
+                },
+                c,
+            )
         }));
     }
     pub fn on_session_start(&mut self, f: impl Fn(SessionLifecycleEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::SESSION_START, notify(move |a, c| f(SessionLifecycleEvent { reason: arg(a, 0).into() }, c)));
+        self.handlers.insert(
+            kind::SESSION_START,
+            notify(move |a, c| {
+                f(
+                    SessionLifecycleEvent {
+                        reason: arg(a, 0).into(),
+                        session_file: opt_str(arg(a, 1)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     pub fn on_session_shutdown(&mut self, f: impl Fn(SessionLifecycleEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::SESSION_SHUTDOWN, notify(move |a, c| f(SessionLifecycleEvent { reason: arg(a, 0).into() }, c)));
+        self.handlers.insert(
+            kind::SESSION_SHUTDOWN,
+            notify(move |a, c| {
+                f(
+                    SessionLifecycleEvent {
+                        reason: arg(a, 0).into(),
+                        session_file: opt_str(arg(a, 1)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     pub fn on_after_provider_response(&mut self, f: impl Fn(AfterProviderResponseEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::AFTER_PROVIDER_RESPONSE, notify(move |a, c| {
@@ -686,10 +801,33 @@ impl ExtensionApi {
         }));
     }
     pub fn on_model_select(&mut self, f: impl Fn(ModelSelectEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::MODEL_SELECT, notify(move |a, c| f(ModelSelectEvent { model: json(arg(a, 0)) }, c)));
+        self.handlers.insert(
+            kind::MODEL_SELECT,
+            notify(move |a, c| {
+                f(
+                    ModelSelectEvent {
+                        model: json(arg(a, 0)),
+                        previous_model: opt_json(arg(a, 1)),
+                        source: arg(a, 2).into(),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     pub fn on_thinking_level_select(&mut self, f: impl Fn(ThinkingLevelSelectEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::THINKING_LEVEL_SELECT, notify(move |a, c| f(ThinkingLevelSelectEvent { level: arg(a, 0).into() }, c)));
+        self.handlers.insert(
+            kind::THINKING_LEVEL_SELECT,
+            notify(move |a, c| {
+                f(
+                    ThinkingLevelSelectEvent {
+                        level: arg(a, 0).into(),
+                        previous_level: opt_str(arg(a, 1)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     pub fn on_session_compact(&mut self, f: impl Fn(SessionCompactEvent, &Ctx) + 'static) {
         // The host seam supplies the full Pi shape: the produced compaction entry, whether an
@@ -725,6 +863,16 @@ impl ExtensionApi {
             Some(t) => t.exec.execute(call),
             None => Err(format!("no such tool: {name}")),
         }
+    }
+
+    /// Run a registered tool's `prepareArguments` shim (EXT-023). `None` when the tool does not
+    /// exist or declares no shim — either way the host leaves the arguments untouched, which is
+    /// upstream's identity default.
+    pub fn prepare_tool_arguments(&self, name: &str, args: &Value) -> Option<Value> {
+        self.tools
+            .iter()
+            .find(|t| t.descriptor.name == name)
+            .and_then(|t| t.exec.prepare_arguments(args))
     }
 
     /// Execute a guest-registered slash command by name (R-08-016). Runs the handler with a

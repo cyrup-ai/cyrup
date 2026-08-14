@@ -46,6 +46,35 @@ pub enum CacheControlFormat {
     Anthropic,
 }
 
+/// Which session-affinity headers a provider reads.
+/// Pi: `sessionAffinityFormat?: SessionAffinityFormat` — `"openai" | "openai-nosession" |
+/// "openrouter"` — declared on `OpenAICompletionsCompat` (`types.ts:569` @v0.83.0) and on
+/// `OpenAIResponsesCompat` (`:579`). The doc block above the declaration spells out all three
+/// header sets; the branches are `openai-completions.ts:647-656` and `openai-responses.ts:233-241`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionAffinityFormat {
+    /// `session_id` + `x-client-request-id` (+ `x-session-affinity` on the completions route).
+    Openai,
+    /// As `openai` but WITHOUT `session_id` — pi's documented migration target for the flag it
+    /// deleted (`packages/ai/CHANGELOG.md:168`, #6496).
+    OpenaiNosession,
+    /// `x-session-id` only — the header OpenRouter actually reads for sticky routing.
+    Openrouter,
+}
+
+/// `detectSessionAffinityFormat(model)` — `openai-responses.ts:49` @v0.83.0, and the identical
+/// `isOpenRouter ? "openrouter" : "openai"` used by the completions detector
+/// (`openai-completions.ts:1473`, with `isOpenRouter` defined `:1404`).
+pub fn detect_session_affinity_format(model: &Model) -> SessionAffinityFormat {
+    if model.provider.as_str() == "openrouter" || model.base_url.as_str().contains("openrouter.ai")
+    {
+        SessionAffinityFormat::Openrouter
+    } else {
+        SessionAffinityFormat::Openai
+    }
+}
+
 /// Vercel AI Gateway routing preferences (Pi `VercelGatewayRouting`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,8 +140,17 @@ pub struct ModelCompat {
     pub cache_control_format: Option<CacheControlFormat>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub send_session_affinity_headers: Option<bool>,
+    /// Pi `sessionAffinityFormat` (`types.ts:569` @v0.83.0 on the completions compat, `:579` on the
+    /// responses compat). Shared by both openai routes exactly as pi shares it. Unset falls back to
+    /// [`detect_session_affinity_format`] (PROV-024/PROV-033).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_affinity_format: Option<SessionAffinityFormat>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_long_cache_retention: Option<bool>,
+    /// Pi `supportsOpenAIGrammarTools` (`openai-responses.ts:73` @v0.83.0, default **false**):
+    /// provider accepts OpenAI's grammar-constrained custom-tool encoding.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_openai_grammar_tools: Option<bool>,
 
     // --- `anthropic-messages` subset (Pi `AnthropicMessagesCompat`, types.ts:531). These are read
     // only by the anthropic-messages resolver; `supports_long_cache_retention` and
@@ -151,10 +189,13 @@ pub struct ModelCompat {
     // --- `openai-responses` subset (Pi `OpenAIResponsesCompat`, openai-responses.ts:57-63). Read
     // only by the openai-responses resolver. `supports_developer_role` and
     // `supports_long_cache_retention` above are SHARED with this subset. ---
-    /// Pi `sendSessionIdHeader` (default true): provider accepts the `session_id` request header for
-    /// prompt-cache session affinity (openai-responses.ts:60 / `createClient` :212-215).
+    /// Pi `supportsExplicitPromptCacheMode` (`openai-responses.ts:75` @v0.83.0, default
+    /// **false** — older OpenAI models reject the parameter): when a one-shot request runs with
+    /// `cacheRetention: "none"`, send `prompt_cache_options: {mode:"explicit"}` so the endpoint does
+    /// not implicitly cache-WRITE (and bill the premium for) a prompt that will never be re-read
+    /// (PROV-023).
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub send_session_id_header: Option<bool>,
+    pub supports_explicit_prompt_cache_mode: Option<bool>,
     /// Pi `supportsToolSearch` (types.ts:588-589, default **false**): provider accepts the
     /// client-side `tool_search_call`/`tool_search_output` pair, the Responses rendering of the
     /// same DRIFT-001 anchor `supports_tool_references` renders for Anthropic.
@@ -171,30 +212,52 @@ pub struct ModelCompat {
 /// openai-responses.ts:10).
 pub type OpenAiResponsesCompat = ModelCompat;
 
-/// Fully-resolved openai-responses compat (Pi `Required<OpenAIResponsesCompat>`,
-/// openai-responses.ts:57-63). Each flag defaults to `true` (Pi `?? true`) EXCEPT
-/// `supports_tool_search`, which is `?? false` (openai-responses.ts:74).
+/// Fully-resolved openai-responses compat (Pi `Required<OpenAIResponsesCompat>`, `getCompat`
+/// `openai-responses.ts:68-76` @v0.83.0). `supportsDeveloperRole` and `supportsLongCacheRetention`
+/// default `true`; `supportsStrictMode`, `supportsOpenAIGrammarTools`, `supportsToolSearch` and
+/// `supportsExplicitPromptCacheMode` default **false**; `sessionAffinityFormat` falls back to
+/// [`detect_session_affinity_format`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedResponsesCompat {
     pub supports_developer_role: bool,
-    pub send_session_id_header: bool,
+    /// Pi `sessionAffinityFormat: model.compat?.sessionAffinityFormat ??
+    /// detectSessionAffinityFormat(model)` (`openai-responses.ts:70`). Replaces the
+    /// `sendSessionIdHeader` flag pi DELETED in #6496 (`packages/ai/CHANGELOG.md:168`, whose
+    /// documented migration is `sendSessionIdHeader: false` ⇒ `"openai-nosession"`) — PROV-033.
+    pub session_affinity_format: SessionAffinityFormat,
     pub supports_long_cache_retention: bool,
+    /// Pi `supportsStrictMode: model.compat?.supportsStrictMode ?? false`
+    /// (`openai-responses.ts:72`).
+    pub supports_strict_mode: bool,
+    /// Pi `supportsOpenAIGrammarTools: … ?? false` (`openai-responses.ts:73`).
+    pub supports_openai_grammar_tools: bool,
     /// Pi `supportsToolSearch: model.compat?.supportsToolSearch ?? false`
     /// (openai-responses.ts:74). Catalog-driven; no predicate.
     pub supports_tool_search: bool,
+    /// Pi `supportsExplicitPromptCacheMode: … ?? false` (`openai-responses.ts:75`).
+    pub supports_explicit_prompt_cache_mode: bool,
 }
 
 /// Resolve the openai-responses compat for a model (1:1 port of Pi `getCompat`,
-/// openai-responses.ts:57-63): every flag defaults to `true` except `supportsToolSearch`.
+/// `openai-responses.ts:68-76` @v0.83.0).
 pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
     let c = model.compat.as_ref();
     ResolvedResponsesCompat {
         supports_developer_role: c.and_then(|c| c.supports_developer_role).unwrap_or(true),
-        send_session_id_header: c.and_then(|c| c.send_session_id_header).unwrap_or(true),
+        session_affinity_format: c
+            .and_then(|c| c.session_affinity_format)
+            .unwrap_or_else(|| detect_session_affinity_format(model)),
         supports_long_cache_retention: c
             .and_then(|c| c.supports_long_cache_retention)
             .unwrap_or(true),
+        supports_strict_mode: c.and_then(|c| c.supports_strict_mode).unwrap_or(false),
+        supports_openai_grammar_tools: c
+            .and_then(|c| c.supports_openai_grammar_tools)
+            .unwrap_or(false),
         supports_tool_search: c.and_then(|c| c.supports_tool_search).unwrap_or(false),
+        supports_explicit_prompt_cache_mode: c
+            .and_then(|c| c.supports_explicit_prompt_cache_mode)
+            .unwrap_or(false),
     }
 }
 
@@ -225,6 +288,9 @@ pub struct ResolvedCompat {
     pub supports_strict_mode: bool,
     pub cache_control_format: Option<CacheControlFormat>,
     pub send_session_affinity_headers: bool,
+    /// Pi `sessionAffinityFormat` — detected `isOpenRouter ? "openrouter" : "openai"`
+    /// (`openai-completions.ts:1473` @v0.83.0), catalog override resolved at `:1515` (PROV-024).
+    pub session_affinity_format: SessionAffinityFormat,
     pub supports_long_cache_retention: bool,
 }
 
@@ -378,6 +444,13 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
             && !is_nvidia,
         cache_control_format,
         send_session_affinity_headers: false,
+        // `sessionAffinityFormat: isOpenRouter ? "openrouter" : "openai"`
+        // (openai-completions.ts:1473 @v0.83.0).
+        session_affinity_format: if is_openrouter {
+            SessionAffinityFormat::Openrouter
+        } else {
+            SessionAffinityFormat::Openai
+        },
         supports_long_cache_retention: !(is_together
             || is_cloudflare_workers_ai
             || is_cloudflare_ai_gateway
@@ -433,6 +506,11 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
         send_session_affinity_headers: c
             .send_session_affinity_headers
             .unwrap_or(detected.send_session_affinity_headers),
+        // `sessionAffinityFormat: model.compat.sessionAffinityFormat ??
+        // detected.sessionAffinityFormat` (openai-completions.ts:1515 @v0.83.0).
+        session_affinity_format: c
+            .session_affinity_format
+            .unwrap_or(detected.session_affinity_format),
         supports_long_cache_retention: c
             .supports_long_cache_retention
             .unwrap_or(detected.supports_long_cache_retention),

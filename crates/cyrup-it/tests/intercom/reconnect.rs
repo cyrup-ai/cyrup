@@ -60,7 +60,7 @@ fn write_broker_command(intercom_dir: &Path, command: &Path) {
 }
 
 fn state_for(agent_dir: &Path) -> Arc<SharedIntercomState> {
-    let config = load_config(&intercom_dir_path(agent_dir));
+    let config = load_config(&intercom_dir_path(agent_dir)).expect("config loads");
     Arc::new(SharedIntercomState::new(config, 600_000, PathBuf::from("/tmp/work")))
 }
 
@@ -239,20 +239,20 @@ async fn a_deliberate_shutdown_never_reconnects() {
     let ext = IntercomExtension::new(
         agent_dir.path().to_path_buf(),
         PathBuf::from("/tmp/work"),
-        load_config(&intercom_dir),
+        load_config(&intercom_dir).expect("config loads"),
         None,
     )
     .expect("build the extension");
     let ctx = HostCtx::event(cyrup_ext::ExtMode::Print, false, agent_dir.path().to_path_buf());
 
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "test".to_string() }, &ctx).await;
+    let _ = ext.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
     let state = ext.state().clone();
     assert!(
         within(Duration::from_secs(20), || state.client().is_some_and(|c| c.is_connected())).await,
         "the session connects on SessionStart"
     );
 
-    let _ = ext.on_event(&HostEvent::SessionShutdown { reason: "test".to_string() }, &ctx).await;
+    let _ = ext.on_event(&HostEvent::SessionShutdown { reason: "test".to_string(), target_session_file: None }, &ctx).await;
     assert!(state.connect.is_shutting_down());
     assert!(state.client().is_none());
     assert!(!state.connect.reconnect_armed(), "shutdown leaves no armed backoff rung");

@@ -192,7 +192,7 @@ fn set_tools_expanded_flips_the_transcript_and_echoes_pi_status() {
 /// extension chrome slot, so the payload lands in state and stops there. This test pins that
 /// honestly so the remaining half is not mistaken for done.
 #[test]
-fn title_widget_header_footer_arrive_and_are_retained_but_not_yet_rendered() {
+fn title_widget_header_footer_arrive_and_are_rendered() {
     let svc = services();
     let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
     let (effect_tx, mut effect_rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
@@ -200,23 +200,102 @@ fn title_widget_header_footer_arrive_and_are_retained_but_not_yet_rendered() {
 
     let mut app = app();
     svc.set_title("cyrup — my-repo");
-    svc.set_widget(&serde_json::json!({"key": "todo", "lines": ["a", "b"]}));
+    svc.set_widget(&serde_json::json!({"key": "todo", "content": ["WIDGET-A", "WIDGET-B"]}));
     svc.set_header("HEADER-LINE");
     svc.set_footer("FOOTER-LINE");
     drain(&mut app, &mut effect_rx);
 
     assert_eq!(app.state().terminal_title.as_deref(), Some("cyrup — my-repo"));
-    assert_eq!(
-        app.state().extension_widget,
-        Some(serde_json::json!({"key": "todo", "lines": ["a", "b"]}))
-    );
+    assert_eq!(app.state().extension_widgets.len(), 1);
+    assert_eq!(app.state().extension_widgets[0].key, "todo");
     assert_eq!(app.state().extension_header.as_deref(), Some("HEADER-LINE"));
     assert_eq!(app.state().extension_footer.as_deref(), Some("FOOTER-LINE"));
 
-    // TUI-014 remains open: nothing draws them yet.
+    // TUI-014 / TUI-033 — they are DRAWN now. Before the fix all three were stored in fields no
+    // render function read: `rg 'extension_widget|extension_header|extension_footer'` returned only
+    // the assignment, the reset and these test assertions, and this test asserted the ABSENCE of
+    // the strings on screen. Upstream mounts them as real components — `setExtensionWidget`
+    // (`interactive-mode.ts:1920-1960`), `setExtensionHeader` (`:2262-2290`) and
+    // `setExtensionFooter` (`:2235-2257`).
     let text = rendered(&mut app);
-    assert!(!text.contains("HEADER-LINE"), "no extension chrome slot exists yet (TUI-014)");
-    assert!(!text.contains("FOOTER-LINE"), "no extension chrome slot exists yet (TUI-014)");
+    assert!(text.contains("HEADER-LINE"), "the extension header must paint:\n{text}");
+    assert!(text.contains("FOOTER-LINE"), "the extension footer must paint:\n{text}");
+    assert!(text.contains("WIDGET-A"), "the extension widget must paint:\n{text}");
+    assert!(text.contains("WIDGET-B"), "every widget row must paint:\n{text}");
+}
+
+/// The footer is REPLACED, not overlaid, and clearing it restores the built-in — Pi's
+/// `setExtensionFooter` clears `footerContainer` and adds the extension component, and re-adds
+/// `this.footer` when the factory is undefined (`interactive-mode.ts:2245-2254`). TUI-033.
+#[tokio::test]
+async fn an_extension_footer_swaps_the_built_in_one_out_and_back() {
+    let mut app = app();
+    app.state_mut().status.set_model("BUILTINMODEL");
+    let before = rendered(&mut app);
+    assert!(before.contains("BUILTINMODEL"), "the built-in footer paints first:\n{before}");
+
+    app.apply_ui_effect(UiEffect::SetFooter { content: "EXTFOOTER".to_string() });
+    let swapped = rendered(&mut app);
+    assert!(swapped.contains("EXTFOOTER"), "the extension footer paints:\n{swapped}");
+    assert!(!swapped.contains("BUILTINMODEL"), "the built-in must be swapped OUT:\n{swapped}");
+
+    app.apply_ui_effect(UiEffect::SetFooter { content: String::new() });
+    let restored = rendered(&mut app);
+    assert!(restored.contains("BUILTINMODEL"), "clearing restores the built-in:\n{restored}");
+    assert!(!restored.contains("EXTFOOTER"), "the extension footer is gone:\n{restored}");
+}
+
+/// A second `setWidget` under the same key REPLACES rather than appends — Pi removes the key from
+/// both placement maps before re-inserting (`interactive-mode.ts:1926-1933`, `:1958`). TUI-014.
+#[tokio::test]
+async fn a_second_widget_with_the_same_key_replaces_the_first() {
+    let mut app = app();
+    app.apply_ui_effect(UiEffect::SetWidget {
+        widget: serde_json::json!({"key": "todo", "content": "FIRST"}),
+    });
+    app.apply_ui_effect(UiEffect::SetWidget {
+        widget: serde_json::json!({"key": "todo", "content": "SECOND"}),
+    });
+    assert_eq!(app.state().extension_widgets.len(), 1, "same key must not append");
+    let text = rendered(&mut app);
+    assert!(text.contains("SECOND") && !text.contains("FIRST"), "replaced, not appended:\n{text}");
+}
+
+/// `content === undefined` REMOVES the widget (`interactive-mode.ts:1935-1938`). TUI-014.
+#[tokio::test]
+async fn a_widget_with_no_content_is_removed() {
+    let mut app = app();
+    app.apply_ui_effect(UiEffect::SetWidget {
+        widget: serde_json::json!({"key": "todo", "content": "GONE"}),
+    });
+    app.apply_ui_effect(UiEffect::SetWidget { widget: serde_json::json!({"key": "todo"}) });
+    assert!(app.state().extension_widgets.is_empty(), "an empty content list removes the widget");
+    let text = rendered(&mut app);
+    assert!(!text.contains("GONE"), "the removed widget must not paint:\n{text}");
+}
+
+/// `MAX_WIDGET_LINES = 10` with pi's own truncation row (`interactive-mode.ts:1945-1950`, `:2008`).
+#[test]
+fn a_widget_longer_than_ten_lines_is_truncated_with_pis_marker() {
+    let content: Vec<String> = (0..15).map(|i| format!("row{i}")).collect();
+    let w = crate::ExtensionWidget::from_json(&serde_json::json!({
+        "key": "big",
+        "content": content,
+    }));
+    assert_eq!(w.lines.len(), 11, "10 rows plus the marker");
+    assert_eq!(w.lines[10], crate::ExtensionWidget::TRUNCATED);
+    assert_eq!(w.lines[9], "row9");
+}
+
+/// `options.placement === "belowEditor"` routes to the other container (`:1925`, `:1957`).
+#[test]
+fn placement_below_editor_is_recovered_from_the_payload() {
+    let below = crate::ExtensionWidget::from_json(&serde_json::json!({
+        "key": "k", "content": "x", "options": {"placement": "belowEditor"},
+    }));
+    assert!(below.below);
+    let above = crate::ExtensionWidget::from_json(&serde_json::json!({"key": "k", "content": "x"}));
+    assert!(!above.below, "the default is `aboveEditor`");
 }
 
 fn drain(

@@ -1,7 +1,7 @@
 //! The wasm32 guest binding layer (arch-08 §4.1). Generates the `cyrup:ext` bindings with
 //! `wit-bindgen` (with `pub_export_macro` so a downstream author crate can call `export!`), then
 //! provides the routing free functions the [`crate::export_extension!`] macro wires the world's
-//! exports to: `init`, the 30 lifecycle hooks, `execute-tool`, `execute-command`/
+//! exports to: `init`, the 33 lifecycle hooks, `execute-tool`, `execute-command`/
 //! `get-argument-completions`, and `render-call`/`render-result`. Compiled ONLY for `wasm32`.
 //!
 //! The glue (the `Guest`/`events::Guest` impls + `export!`) is emitted by the macro — in THIS crate
@@ -65,7 +65,41 @@ fn lower_tool_descriptor(d: &crate::descriptor::ToolDescriptor) -> types::ToolDe
         prompt_snippet: d.prompt_snippet.clone(),
         prompt_guidelines: d.prompt_guidelines.clone(),
         has_renderer: d.has_renderer,
+        // EXT-023 / EXT-024: these two used to be dropped here. `lower_tool_descriptor` copied 8 of
+        // 10 fields into a DIFFERENT struct by struct literal, so there was no compile error and no
+        // warning — an author set `prepare_arguments` (documented "the host coerces args before
+        // validation when set") or `render_shell` and got silence.
+        prepare_arguments: d.prepare_arguments,
+        render_shell: match d.render_shell {
+            // pi `renderShell?: "default" | "self"` (extensions/types.ts:465 @v0.83.0); an OMITTED
+            // field is upstream's default, so `Default` lowers to `none` rather than `"default"`.
+            crate::descriptor::RenderShell::Default => None,
+            crate::descriptor::RenderShell::SelfRendered => Some("self".to_string()),
+        },
     }
+}
+
+/// Compile-time exhaustiveness guard for [`lower_tool_descriptor`] (EXT-023).
+///
+/// `lower_tool_descriptor` builds a DIFFERENT type by struct literal, so a field added to
+/// [`crate::descriptor::ToolDescriptor`] and forgotten there compiles clean and is silently
+/// dropped — which is exactly how `prepare_arguments` and `render_shell` went missing. Destructuring
+/// with no `..` makes that a hard error: add a field, and this stops compiling until the lowering
+/// is updated too.
+#[allow(dead_code)]
+fn _lower_tool_descriptor_is_exhaustive(d: crate::descriptor::ToolDescriptor) {
+    let crate::descriptor::ToolDescriptor {
+        name: _,
+        label: _,
+        description: _,
+        parameters: _,
+        execution_mode: _,
+        prompt_snippet: _,
+        prompt_guidelines: _,
+        has_renderer: _,
+        render_shell: _,
+        prepare_arguments: _,
+    } = d;
 }
 
 /// Register a tool from inside a live handler (the body behind [`crate::ctx::Ctx::register_tool`]).
@@ -132,7 +166,10 @@ fn dispatch(kind: u8, args: &[&str]) -> RawOutcome {
 fn to_wit(o: RawOutcome) -> types::HookOutcome {
     match o {
         RawOutcome::Noop => types::HookOutcome::Noop,
-        RawOutcome::Block(r) => types::HookOutcome::Block(r),
+        // EXT-049: `block` is a record now, carrying pi's `ToolCallEventResult.terminate`.
+        RawOutcome::Block(r, terminate) => {
+            types::HookOutcome::Block(types::BlockResult { reason: r, terminate })
+        }
         RawOutcome::Mutate(s) => types::HookOutcome::Mutate(s),
         RawOutcome::Handled(s) => types::HookOutcome::Handled(s),
     }
@@ -155,6 +192,30 @@ pub fn hook(kind: u8, args: &[&str]) -> types::HookOutcome {
 /// A notify-only hook export: dispatch, return ignored (macro entry point).
 pub fn notify(kind: u8, args: &[&str]) {
     dispatch(kind, args);
+}
+
+/// `prepare-arguments` export body (EXT-023; pi `ToolDefinition.prepareArguments?: (args:
+/// unknown) => Static<TParams>`, `extensions/types.ts:468` @v0.83.0).
+///
+/// Called by the host ONLY for a tool whose descriptor set `prepare_arguments`, and only BEFORE
+/// schema validation — upstream runs `prepareArguments` ahead of `validateToolArguments` in
+/// `packages/agent/src/agent-loop.ts`, so the coerced value is what gets validated. `None` leaves
+/// the arguments untouched, which is upstream's identity default for a tool that declares no shim.
+pub fn prepare_arguments(name: String, args_json: String) -> Option<String> {
+    let args: Value = serde_json::from_str(&args_json).unwrap_or(Value::Null);
+    let late = LATE_TOOLS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|t| t.descriptor.name == name)
+            .and_then(|t| t.exec.prepare_arguments(&args))
+    });
+    if let Some(v) = late {
+        return Some(v.to_string());
+    }
+    API.with(|c| {
+        c.borrow().as_ref().and_then(|api| api.prepare_tool_arguments(&name, &args))
+    })
+    .map(|v| v.to_string())
 }
 
 /// `execute-tool` export body (R-08-015).

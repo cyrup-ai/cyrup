@@ -336,3 +336,39 @@ fn select_list_normalizes_and_trims_descriptions() {
     let second: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(second, "  b", "a whitespace-only description drops the second column: {second:?}");
 }
+
+// ---- TUI-013: quoted paths with spaces ------------------------------------------------------
+
+/// A path containing a space is completable only through the quoted form, and cyrup's
+/// `trailing_token` split on `PATH_DELIMS` — which *includes* `"` and `' '` — so the token for
+/// `see @"my dir/fi` was `dir/fi`, whose `strip_prefix('@')` then failed and returned `None`.
+///
+/// Upstream scans back for an unclosed quote FIRST and treats everything after it (plus a leading
+/// `@`) as one token: `extractAtPrefix`/`extractPathPrefix` both open with
+/// `const quotedPrefix = extractQuotedPrefix(text); if (quotedPrefix) return quotedPrefix;`
+/// (`packages/tui/src/autocomplete.ts:463-470`, `:480-487` @v0.83.0), over
+/// `findUnclosedQuoteStart` (`:54-68`).
+#[test]
+fn an_unclosed_quote_keeps_a_path_with_spaces_as_one_mention_token() {
+    assert_eq!(crate::mention_query("see @\"my dir/fi").as_deref(), Some("my dir/fi"));
+    // Single quotes are a `PATH_DELIMITERS` member upstream but are NOT what
+    // `findUnclosedQuoteStart` scans for — it tests `text[i] === '"'` only — so `'` still splits.
+    assert_eq!(crate::mention_query("see @'my dir/fi").as_deref(), None);
+}
+
+/// A CLOSED quote is not a token boundary override: with every `"` balanced,
+/// `findUnclosedQuoteStart` returns `null` and the ordinary last-delimiter split applies.
+#[test]
+fn a_closed_quote_falls_back_to_the_delimiter_split() {
+    // `@"done" @stil` — the first pair is balanced, so the token is the trailing `@stil`.
+    assert_eq!(crate::mention_query("@\"done\" @stil").as_deref(), Some("stil"));
+}
+
+/// `isTokenStart` (`autocomplete.ts:70-72`) rejects a quote that opens mid-token, so an
+/// apostrophe-style `"` glued to a word does not swallow the line.
+#[test]
+fn a_quote_that_does_not_start_a_token_is_not_a_quoted_prefix() {
+    // The `"` is preceded by `o`, which is not a path delimiter → not a quoted prefix, so the
+    // ordinary split runs and the trailing token is everything after the last `"`.
+    assert_eq!(crate::mention_query("foo\"bar").as_deref(), None);
+}

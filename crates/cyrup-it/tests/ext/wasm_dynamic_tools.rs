@@ -43,7 +43,7 @@ async fn a_tool_registered_from_a_session_start_handler_is_executable() {
     // Drive the REAL lifecycle event. The guest's `session_start` handler calls
     // `ctx.register_tool(...)` across the `registration.register-tool` import.
     host.dispatcher()
-        .dispatch_notify(&HostEvent::SessionStart { reason: "startup".into() }, &cancel)
+        .dispatch_notify(&HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None }, &cancel)
         .await;
 
     // The host must now surface it as an EXECUTABLE tool, not just a descriptor.

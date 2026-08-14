@@ -21,9 +21,13 @@
 //! a drain here would be a no-op over an already-drained sink.
 
 use std::io::Write;
+use std::sync::Arc;
 
-use cyrup_session_svc::{AgentSessionRuntime, UserInput};
-use futures::StreamExt;
+use cyrup_session_svc::{
+    AgentSession, AgentSessionEvent, AgentSessionRuntime, BindOptions, EventStream, PromptAccepted,
+    UserInput,
+};
+use futures::{FutureExt, StreamExt};
 
 use crate::error::ModesError;
 
@@ -51,35 +55,95 @@ pub async fn run_json<W: Write>(
 ) -> Result<(), ModesError> {
     // Pi writes the header ONCE, from the session that is active when the mode starts, before
     // `rebindSession()` and the send loop (print-mode.ts:112-119).
-    let session = runtime.session().await;
+    let mut session = runtime.session().await;
     if session.claim_json_header() {
         let header = session.session_header().await;
         let line = serde_json::to_string(&header)?;
-        writeln!(out, "{line}")?;
-        out.flush()?;
+        // TOOL-037 — pi's header goes out through `writeRawStdout` like every other protocol line
+        // (`print-mode.ts:112-118` @v0.84.1), so it carries the same EAGAIN/EWOULDBLOCK/ENOBUFS
+        // retry (`core/output-guard.ts:36-41`). A plain `writeln!` turned a non-blocking stdout —
+        // the shape a supervisor or CI pipe presents — into a mode-fatal `io::Error`.
+        crate::raw_stdout::write_raw_stdout(out, &format!("{line}\n")).await?;
+        crate::raw_stdout::flush_raw_stdout(out).await?;
     }
-    // Pi orders the mode's `try` block header-then-bind: `writeRawStdout(header)` at
-    // print-mode.ts:112-118, then `await rebindSession()` at :119, then the send loop at :121.
-    // `rebindSession` ends in `session.bindExtensions(...)` (:73) whose tail emits
-    // `_sessionStartEvent` (agent-session.ts:2250). SEAM-033: the announcement belongs HERE, not in
-    // the runtime constructor, because `main.ts` applies `--name` (:650) and `--models` (:742-750)
-    // in between. Idempotent per session, so a host that announced at construction is unaffected.
-    session.bind_extensions().await;
-    drop(session);
+
+    // Pi's `rebindSession()` (print-mode.ts:71-119): bind the extension host — with the `onError`
+    // sink, SEAM-006 — and then install ONE session-wide subscription:
+    //
+    //   unsubscribe?.();
+    //   unsubscribe = session.subscribe((event) => { if (mode === "json") writeRawStdout(...); });
+    //
+    // SEAM-027 — that subscription is session-scoped and is held ACROSS the whole message loop
+    // (`:129-137`), torn down only in `disposeRuntime()`. cyrup used to take the RUN-scoped stream
+    // `AgentSession::prompt` returns and drain only that, so every event emitted BETWEEN runs —
+    // extension UI, `session_info_changed`, `model_changed`, background compaction progress — was
+    // silently absent from the json stream, and a consumer with `--follow-up` saw an incomplete
+    // event log.
+    let mut events = bind_and_subscribe(&session).await;
 
     for input in messages {
         // Pi's `rebindSession` (print-mode.ts:71-72): re-read the runtime's active session so a
-        // message submitted after a replacement addresses the NEW session.
-        let session = runtime.session().await;
-        let mut stream = session.prompt(input).await?;
-        while let Some(ev) = stream.next().await {
-            // Pi print-mode.ts:110 — `writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`)`.
-            // The projection (never the raw event) is what goes on the wire; see
-            // [`crate::to_json_event`] for what it drops and why.
-            let line = serde_json::to_string(&crate::to_json_event(&ev))?;
-            writeln!(out, "{line}")?;
-            out.flush()?;
+        // message submitted after a replacement addresses the NEW session — and, exactly as pi does
+        // at `:106-108`, drop the old subscription and take a fresh one, because the previous
+        // stream was terminated with `SessionReplaced` (R-11-021). Modelled on the RPC host's
+        // `rebind_session` (`rpc.rs`), which is pi's other consumer of the same callback.
+        let active = runtime.session().await;
+        if !Arc::ptr_eq(&session, &active) {
+            session = active;
+            events = bind_and_subscribe(&session).await;
+        }
+
+        // The run is observed through the PERSISTENT subscription, so the submission only has to
+        // resolve to pi's `preflightResult` — `prompt_accepted` is the seam documented for exactly
+        // "adapters that manage their own persistent subscription".
+        let accepted = session.prompt_accepted(input).await?;
+        if matches!(accepted, PromptAccepted::Handled) {
+            // An `input` extension handler serviced the submission and no run started, so no
+            // `agent_settled` will arrive; pi's `await session.prompt(...)` likewise resolves at
+            // once. Fall through to the next message.
+            continue;
+        }
+        // Drain until this run settles. `agent_settled` is pi's own terminal for a submission
+        // (`AgentSettledEvent`, extensions/types.ts:721-725) and is what the RPC host waits on too.
+        while let Some(ev) = events.next().await {
+            let settled = matches!(ev, AgentSessionEvent::AgentSettled);
+            write_event(out, &ev).await?;
+            if settled {
+                break;
+            }
         }
     }
+
+    // Everything the session emitted after the last settle and before the mode returns — pi's
+    // subscription is still installed at this point too (it is removed by `disposeRuntime()`,
+    // print-mode.ts:152-157, which runs after `runPrintMode` returns). Non-blocking: take only what
+    // is already queued, so a mode with no further events does not wait for one.
+    while let Some(Some(ev)) = events.next().now_or_never() {
+        write_event(out, &ev).await?;
+    }
+    Ok(())
+}
+
+/// Pi's `rebindSession` body (print-mode.ts:71-112): `bindExtensions({..., onError})` then a fresh
+/// session-wide `session.subscribe(...)`. Returns the new stream; the caller drops the old one,
+/// which is cyrup's `unsubscribe?.()` (`:106`).
+async fn bind_and_subscribe(
+    session: &Arc<AgentSession>,
+) -> EventStream<AgentSessionEvent> {
+    session
+        .bind_extensions_with(BindOptions { on_error: Some(crate::print::extension_error_sink()) })
+        .await;
+    session.subscribe()
+}
+
+/// Pi print-mode.ts:110 — `writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`)`. The
+/// projection (never the raw event) is what goes on the wire; see [`crate::to_json_event`] for what
+/// it drops and why.
+async fn write_event<W: Write>(out: &mut W, ev: &AgentSessionEvent) -> Result<(), ModesError> {
+    let line = serde_json::to_string(&crate::to_json_event(ev))?;
+    // TOOL-037 — pi's `writeRawStdout` (`core/output-guard.ts:85` → `writeRawStdoutChunk`,
+    // `:20-43`), retry loop included. See `crate::raw_stdout`.
+    crate::raw_stdout::write_raw_stdout(out, &format!("{line}\n")).await?;
+    crate::raw_stdout::flush_raw_stdout(out).await?;
     Ok(())
 }

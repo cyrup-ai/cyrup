@@ -22,6 +22,7 @@ mod loader_direct_file;
 mod malformed_manifest;
 mod manifest_cache;
 mod native_ctx_state;
+mod payload_and_seam_parity;
 mod native_dispatch;
 mod project_trust_shortcircuit;
 mod provider;

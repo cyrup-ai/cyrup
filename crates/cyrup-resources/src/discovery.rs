@@ -345,9 +345,8 @@ fn resolve_configured_package(
 ) -> Result<PackageTree, Box<ResourceDiagnostic>> {
     let tier = declared.scope.package_resource_scope();
     let delta_base = if declared.scope == InstallScope::Project && declared.filter.is_delta() {
-        all.iter().find(|e| {
-            e.scope == InstallScope::Global && e.source.trim() == declared.source.trim()
-        })
+        all.iter()
+            .find(|e| e.scope == InstallScope::Global && e.source.trim() == declared.source.trim())
     } else {
         None
     };
@@ -372,10 +371,16 @@ fn resolve_configured_package(
         // A local path resolves against the scope base dir, exactly like Pi's
         // `resolveLocalExtensionSource` (package-manager.ts:1301-1327).
         crate::package::PackageSource::Path { path } => {
-            if path.is_absolute() {
-                path.clone()
+            // `resolvePathFromBase` normalizes before testing absoluteness (package-manager.ts:
+            // 2069-2071 → paths.ts:57-85 @v0.83.0), so `"packages": ["~/pack"]` resolves under the
+            // home dir instead of producing `<base>/~/pack` and the misleading
+            // "not installed — run `cyrup install`" diagnostic below (CFG-025).
+            let normalized =
+                PathBuf::from(cyrup_config::paths::normalize_path(&path.to_string_lossy()));
+            if normalized.is_absolute() {
+                normalized
             } else {
-                base.join(path)
+                base.join(normalized)
             }
         }
         // git/oci: use the tree a previous `cyrup install` materialized, if any.
@@ -585,7 +590,10 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
         // The user-tier cross-tool `~/.agents/skills` (Pi `userAgentsSkillsDir`,
         // package-manager.ts:2286,2377-2389) is loaded as a USER/global-scope source when the
         // session-svc builder plumbs `user_agents_dir = $HOME/.agents`.
-        let mut roots = vec![cfg.global_dir.join("skills"), cfg.global_agents_dir.join("skills")];
+        let mut roots = vec![
+            cfg.global_dir.join("skills"),
+            cfg.global_agents_dir.join("skills"),
+        ];
         if let Some(user_agents) = &cfg.user_agents_dir {
             roots.push(user_agents.join("skills"));
         }
@@ -915,6 +923,23 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                 ext_paths.push(e);
             }
         }
+
+        // A package tree with no manifest AND none of the conventional resource dirs is a BARE
+        // EXTENSION directory: `collectPackageResources` returns false (package-manager.ts:2126-
+        // 2140 @v0.83.0 — `hasAnyDir` stays false), and `resolveLocalExtensionSource` then does
+        // `this.addResource(accumulator.extensions, resolved, metadata, true)` (`:1338-1341`),
+        // registering the directory itself. cyrup pushed only `manifest.extensions` entries, so
+        // `"packages": ["./my-ext"]` on a manifest-less extension loaded nothing (CFG-027).
+        if manifest.kind == crate::package::manifest::ManifestKind::AutoDiscovered
+            && manifest.extensions.is_empty()
+            && manifest.skills.is_empty()
+            && manifest.prompts.is_empty()
+            && manifest.themes.is_empty()
+            && manifest.agents.is_empty()
+            && !ext_paths.contains(&dir)
+        {
+            ext_paths.push(dir.clone());
+        }
     }
 
     // --- project loose resources (trust-gated) (R-09-002/003/008/012) ---
@@ -970,10 +995,10 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                 // `.filter((dir) => resolve(dir) !== resolve(userAgentsSkillsDir))`,
                 // package-manager.ts:2289) when plumbed; otherwise fall back to the legacy
                 // `global_agents_dir/skills` exclusion.
-                let user_agents_skills = cfg
-                    .user_agents_dir
-                    .as_ref()
-                    .map_or_else(|| cfg.global_agents_dir.join("skills"), |d| d.join("skills"));
+                let user_agents_skills = cfg.user_agents_dir.as_ref().map_or_else(
+                    || cfg.global_agents_dir.join("skills"),
+                    |d| d.join("skills"),
+                );
                 for root in collect_ancestor_agents_skill_dirs(&cfg.cwd) {
                     if root == user_agents_skills {
                         continue;
@@ -1372,7 +1397,11 @@ fn add_local_entries(
     // `extensions` is the FIRST entry of Pi's `RESOURCE_TYPES` (package-manager.ts:194) and goes
     // through the very same `resolveLocalEntries` pass (:905-931). A settings-declared extension
     // root is therefore LOADED, not just pattern-filtered (CFG-004).
-    for e in resolve_local_entries(base, &overrides.extensions, ManifestResourceType::Extensions) {
+    for e in resolve_local_entries(
+        base,
+        &overrides.extensions,
+        ManifestResourceType::Extensions,
+    ) {
         if !ext_paths.contains(&e) {
             ext_paths.push(e);
         }

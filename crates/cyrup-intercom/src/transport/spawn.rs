@@ -16,7 +16,9 @@
 //! default, else `current_exe()` (or the `CYRUP_INTERCOM_BROKER_BINARY` override) with argv
 //! `["__intercom-broker"]` — mirroring `getBrokerLaunchSpec`'s `usesDefaultBrokerCommand` gate
 //! (`spawn.ts:67-72,121-154`) and `ensureConnected`'s `spawnBrokerIfNeeded(config.brokerCommand,
-//! config.brokerArgs)` call (`index.ts:828`). Stdio null, `process_group(0)` (the unsafe-free analog
+//! config.brokerArgs)` call (`index.ts:828`). Stdin/stdout null and stderr PIPED into a bounded 4 KB
+//! tail (`v0.10.1 broker/spawn.ts:25,156-176,216-232`, commit `c9675a5`) so a startup failure can
+//! say why instead of only `exited before startup with code 1`; `process_group(0)` (the unsafe-free analog
 //! of pi's `detached:true`, mirroring `cyrup-ext-subagents`' `spawn_detached_runner`). The spawned
 //! child is then raced against `wait_for_broker` (5 s, `spawn.ts:205-237`): an early exit/error
 //! surfaces immediately as a descriptive [`IntercomError::Broker`] instead of waiting out the full
@@ -58,7 +60,7 @@ pub async fn ensure_broker(agent_dir: &Path) -> Result<()> {
     // `ensureConnected` passes `config.brokerCommand`/`config.brokerArgs` straight through to
     // `spawnBrokerIfNeeded` (`index.ts:828`) — load the same config here so a user override
     // genuinely changes what gets launched below, instead of being silently ignored.
-    let config = crate::config::load_config(&intercom_dir);
+    let config = crate::config::load_config(&intercom_dir).map_err(IntercomError::Broker)?;
 
     if is_broker_running_for(agent_dir, &pid_path).await {
         return Ok(());
@@ -85,13 +87,27 @@ async fn spawn_owner(
     if is_broker_running_for(agent_dir, pid_path).await {
         return Ok(());
     }
-    let mut child = spawn_detached_broker(agent_dir, broker_command, broker_args)?;
+    let (mut child, stderr_tail) = spawn_detached_broker(agent_dir, broker_command, broker_args)?;
     // Race the health-poll against the child's own exit (spawn.ts:205-236): a broker that fails to
     // spawn or dies before startup completes must fail fast with its exit code/signal, not silently
     // wait out the full 5s timeout only to report a generic "timed out".
     let result = tokio::select! {
         res = wait_for_broker_for(agent_dir, WAIT_FOR_BROKER_TIMEOUT) => res,
         wait = child.wait() => Err(broker_wait_error(wait)),
+    };
+    // Upstream switched its exit listener from `exit` to `close` in the same commit (`c9675a5`,
+    // `v0.10.1 broker/spawn.ts:262,271`) precisely so the stderr pipe has DRAINED before the error
+    // is built. `child.wait()` returns on process exit, which is `exit`, not `close`; give the drain
+    // task a bounded moment to reach EOF so the tail is not empty by a scheduling accident.
+    let result = match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // `brokerStartupError` decorates EVERY rejection path upstream (`:243`, `:254`, `:258`,
+            // `:267-268`) — the spawn error, both exit arms and the `waitForBroker` timeout — so a
+            // health-poll timeout gets the broker's reason too, not just an early exit.
+            Err(stderr_tail.decorate(e))
+        }
     };
     // The child keeps running under its own detached process group regardless of which branch of
     // the race won; dropping the handle here does not kill it (mirrors pi's `child.unref()`).
@@ -138,7 +154,7 @@ fn spawn_detached_broker(
     agent_dir: &Path,
     broker_command: &str,
     broker_args: &[String],
-) -> Result<tokio::process::Child> {
+) -> Result<(tokio::process::Child, BrokerStderrTail)> {
     let (binary, args) = resolve_broker_command(broker_command, broker_args);
     let mut command = tokio::process::Command::new(&binary);
     command
@@ -146,7 +162,10 @@ fn spawn_detached_broker(
         .env(paths::ENV_CODING_AGENT_DIR, agent_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        // `getBrokerSpawnOptions(extensionDir, env, captureStderr)` switches stdio to
+        // `["ignore","ignore","pipe"]` (`v0.10.1 broker/spawn.ts:156-176`, commit `c9675a5`).
+        // stdout stays null; only stderr is piped, and only so a startup failure can say WHY.
+        .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     {
         command.process_group(0);
@@ -167,8 +186,68 @@ fn spawn_detached_broker(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
-    let child = command.spawn().map_err(|e| IntercomError::Broker(format!("failed to spawn intercom broker: {e}")))?;
-    Ok(child)
+    let mut child = command.spawn().map_err(|e| IntercomError::Broker(format!("failed to spawn intercom broker: {e}")))?;
+    let tail = BrokerStderrTail::drain(child.stderr.take());
+    Ok((child, tail))
+}
+
+/// `BROKER_STARTUP_STDERR_LIMIT = 4_000` (`v0.10.1 broker/spawn.ts:25`) — how many trailing bytes of
+/// the broker's stderr are kept for the startup error message.
+const BROKER_STARTUP_STDERR_LIMIT: usize = 4_000;
+
+/// The last [`BROKER_STARTUP_STDERR_LIMIT`] bytes the detached broker wrote to stderr
+/// (`rememberBrokerStderr`, `v0.10.1 broker/spawn.ts:216-218`).
+///
+/// The drain task runs to EOF, not just for the startup window. That is upstream's
+/// `child.stderr?.resume()` in `cleanup` (`:228`): a piped stderr nobody reads fills its pipe buffer
+/// and BLOCKS the long-lived broker on its next write. Reading to EOF with a bounded tail keeps
+/// memory constant and the broker unblocked.
+#[derive(Clone)]
+pub(crate) struct BrokerStderrTail {
+    buffer: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl BrokerStderrTail {
+    fn drain(stderr: Option<tokio::process::ChildStderr>) -> Self {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(mut stderr) = stderr {
+            let sink = buffer.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stderr.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let text = String::from_utf8_lossy(chunk.get(..n).unwrap_or_default());
+                            let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.push_str(&text);
+                            // `.slice(-LIMIT)` — keep the TAIL, on a char boundary so the buffer
+                            // stays valid UTF-8.
+                            if guard.len() > BROKER_STARTUP_STDERR_LIMIT {
+                                let cut = guard.len() - BROKER_STARTUP_STDERR_LIMIT;
+                                let cut = (cut..guard.len())
+                                    .find(|i| guard.is_char_boundary(*i))
+                                    .unwrap_or(guard.len());
+                                *guard = guard.split_at(cut).1.to_string();
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Self { buffer }
+    }
+
+    /// `brokerStartupError(message, cause)` (`v0.10.1 broker/spawn.ts:219-223`): append
+    /// `\nBroker stderr:\n{stderr}` when the captured tail is non-empty.
+    fn decorate(&self, error: IntercomError) -> IntercomError {
+        let tail = self.buffer.lock().unwrap_or_else(|e| e.into_inner()).trim().to_string();
+        if tail.is_empty() {
+            return error;
+        }
+        IntercomError::Broker(format!("{error}\nBroker stderr:\n{tail}"))
+    }
 }
 
 /// Turn a completed/failed `child.wait()` into the descriptive early-failure error pi raises from

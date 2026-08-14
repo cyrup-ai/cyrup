@@ -216,3 +216,46 @@ fn a_message_dequeued_by_escape_leaves_no_phantom_in_the_transcript() {
          would be the phantom transcript entry TUI-052 describes:\n{s}"
     );
 }
+
+/// TUI-031 — a message queued during a COMPACTION shows up in the same pending region, because
+/// `getAllQueuedMessages` folds `compactionQueuedMessages` into the session's two queues
+/// (`interactive-mode.ts:3942-3953` @v0.83.0).
+///
+/// RED at HEAD: `AppState` had no compaction queue at all (`rg 'compaction_queued|compactionQueued'
+/// → zero`), so there was nothing to fold and nothing to render — the prompt was dispatched
+/// immediately as a fresh turn against a context the compaction was mid-rewrite of.
+#[tokio::test]
+async fn a_message_queued_during_compaction_renders_in_the_pending_region() {
+    let mut app = new_app();
+    // The session's own queues are empty; only the compaction queue has anything in it.
+    app.state_mut().compaction_queue.push(crate::CompactionQueued {
+        text: "QUEUEDDURINGCOMPACTION".to_string(),
+        follow_up: false,
+    });
+    app.ingest_event(&AgentSessionEvent::QueueUpdate {
+        steering: Vec::new(),
+        follow_up: Vec::new(),
+    });
+    app.draw().unwrap();
+    let s = screen(&app);
+    assert!(
+        s.contains("Steering: QUEUEDDURINGCOMPACTION"),
+        "the compaction queue must fold into the pending region:\n{s}"
+    );
+}
+
+/// The follow-up mode lands in the follow-up half of the fold (`:3948-3951`).
+#[tokio::test]
+async fn a_follow_up_queued_during_compaction_uses_the_follow_up_label() {
+    let mut app = new_app();
+    app.state_mut()
+        .compaction_queue
+        .push(crate::CompactionQueued { text: "LATER".to_string(), follow_up: true });
+    app.ingest_event(&AgentSessionEvent::QueueUpdate {
+        steering: Vec::new(),
+        follow_up: Vec::new(),
+    });
+    app.draw().unwrap();
+    let s = screen(&app);
+    assert!(s.contains("Follow-up: LATER"), "follow-up mode must use pi's label:\n{s}");
+}

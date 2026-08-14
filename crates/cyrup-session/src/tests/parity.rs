@@ -130,7 +130,7 @@ fn gap5_cut_point_validity_excludes_settings_and_summaries() {
         id: EntryId::from(id),
         parent_id: None,
         timestamp: "2026-01-01T00:00:00Z".into(),
-    };
+ extra: Default::default() };
     let entries = vec![
         ent(KnownEntry::Message { base: base("e0"), message: AgentMessage::Core(user("hi")) }),
         ent(KnownEntry::ModelChange {
@@ -165,7 +165,7 @@ fn gap6_back_scan_folds_leading_non_message_entries() {
         id: EntryId::from(id),
         parent_id: p.map(EntryId::from),
         timestamp: "2026-01-01T00:00:00Z".into(),
-    };
+ extra: Default::default() };
     let big = "word ".repeat(80);
     let entries = vec![
         ent(KnownEntry::Message {
@@ -893,7 +893,7 @@ fn g5_summary_messages_carry_entry_timestamp() {
         id: EntryId::from(id),
         parent_id: p.map(EntryId::from),
         timestamp: t.into(),
-    };
+ extra: Default::default() };
     let entries = [
         Entry::known(KnownEntry::Message {
             base: base("e0", None, "2026-01-01T00:00:00Z"),

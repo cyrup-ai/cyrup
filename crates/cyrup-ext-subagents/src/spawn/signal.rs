@@ -104,6 +104,62 @@ pub struct TerminationOutcome {
     pub status: std::process::ExitStatus,
     /// The escalation stage that was in force when the child was confirmed gone.
     pub stage: EscalationStage,
+    /// SUBA-023 — the NAME of the signal that killed the child (`"SIGKILL"`, `"SIGTERM"`, …), or
+    /// `None` when it exited normally.
+    ///
+    /// `ExitStatus::signal()` yields a bare number, which is what made signal attribution in run
+    /// results coarse ("failed" rather than "killed by SIGKILL") and escalation-ladder debugging
+    /// harder than it needs to be. The mapping is [`signal_name`]; it is derived from the observed
+    /// status rather than from [`Self::stage`] deliberately — a child can die of a signal nobody in
+    /// this ladder sent (an external `kill`, an OOM kill, a `SIGSEGV`), and reporting the rung we
+    /// happened to be on would misattribute exactly the cases worth debugging.
+    pub signal_name: Option<&'static str>,
+}
+
+/// SUBA-023 — map a raw Unix signal number to its POSIX name.
+///
+/// Covers the signals a subagent child can realistically die of: this ladder's own three, the
+/// terminal/job-control set a user's Ctrl-C or shell can deliver, and the fault signals that mean
+/// "the child crashed" rather than "someone stopped it". An unrecognized number returns `None`
+/// rather than a fabricated name — a wrong name is worse than a number.
+#[must_use]
+pub fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        // 17/19/23 and 18/20 differ across platforms; only the portable Linux/macOS-agreeing
+        // members of the job-control set are named here.
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        _ => return None,
+    })
+}
+
+/// SUBA-023 — the signal name for an observed exit status, or `None` for a normal exit.
+///
+/// On non-Unix there is no signal concept at all, so this is always `None` — which is exactly what
+/// a `TerminationOutcome` should report there.
+#[must_use]
+pub fn signal_name_of(status: &std::process::ExitStatus) -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal().and_then(signal_name)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }
 
 /// Drive `child` through the SIGINT → SIGTERM → SIGKILL escalation ladder (R-SA-059) and return
@@ -157,6 +213,7 @@ pub async fn terminate_with_graces(
     send_sigint(&child);
     if let Some(status) = race_wait(&mut child, graces.sigint, cancel).await? {
         return Ok(TerminationOutcome {
+            signal_name: signal_name_of(&status),
             status,
             stage: EscalationStage::Sigint,
         });
@@ -166,6 +223,7 @@ pub async fn terminate_with_graces(
     send_sigterm(&child);
     if let Some(status) = race_wait(&mut child, graces.sigterm, cancel).await? {
         return Ok(TerminationOutcome {
+            signal_name: signal_name_of(&status),
             status,
             stage: EscalationStage::Sigterm,
         });
@@ -177,6 +235,7 @@ pub async fn terminate_with_graces(
     send_sigkill(&mut child);
     let status = child.wait().await?;
     Ok(TerminationOutcome {
+        signal_name: signal_name_of(&status),
         status,
         stage: EscalationStage::Sigkill,
     })
@@ -373,6 +432,49 @@ mod tests {
     )]
 
     use super::*;
+
+    /// SUBA-023 — signal-name attribution on [`TerminationOutcome`].
+    ///
+    /// THE USER ACTION: a subagent run dies and the run record says "failed". Before the fix
+    /// `TerminationOutcome` carried only `status` + `stage` and there was no `ExitStatus::signal()`
+    /// name mapping anywhere in the module, so escalation-ladder debugging had a bare number at
+    /// best — and the run surface had nothing at all.
+    ///
+    /// The mapping is derived from the OBSERVED status rather than from the rung reached, because a
+    /// child can die of a signal this ladder never sent (external `kill`, OOM, `SIGSEGV`) and
+    /// reporting the rung would misattribute exactly the cases worth debugging.
+    #[test]
+    fn signal_numbers_map_to_their_posix_names() {
+        assert_eq!(signal_name(2), Some("SIGINT"));
+        assert_eq!(signal_name(9), Some("SIGKILL"));
+        assert_eq!(signal_name(15), Some("SIGTERM"));
+        assert_eq!(signal_name(11), Some("SIGSEGV"));
+        assert_eq!(signal_name(6), Some("SIGABRT"));
+        // An unrecognized number reports nothing rather than a fabricated name.
+        assert_eq!(signal_name(64), None);
+        assert_eq!(signal_name(0), None);
+    }
+
+    /// The status-side half, exercised against REAL exit statuses rather than a constructed one:
+    /// a normally-exiting child reports no signal, and a `SIGKILL`ed one reports `SIGKILL`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_killed_child_reports_its_signal_name_and_a_clean_exit_reports_none() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        // Clean exit: no signal.
+        let clean = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .expect("sh runs");
+        assert_eq!(signal_name_of(&clean), None, "a normal exit names no signal");
+
+        // Signalled exit, constructed from the same representation `wait()` produces.
+        let killed = std::process::ExitStatus::from_raw(9);
+        assert_eq!(signal_name_of(&killed), Some("SIGKILL"));
+        let termed = std::process::ExitStatus::from_raw(15);
+        assert_eq!(signal_name_of(&termed), Some("SIGTERM"));
+    }
 
     /// Production pins: the injectable [`EscalationGraces`] must not become a place where the
     /// R-SA-059 constants quietly drift. Every non-test call goes through

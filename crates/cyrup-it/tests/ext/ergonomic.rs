@@ -29,7 +29,9 @@ fn tool_call_gate_blocks_bash_passes_others() {
     let ctx = Ctx::new();
 
     let blocked = api.dispatch(0, &["tc1", "bash", "{}"], &ctx);
-    assert_eq!(blocked, RawOutcome::Block(Some("no bash".into())));
+    // EXT-049: `block` carries pi's `ToolCallEventResult.terminate`; `Outcome::block`
+    // is the non-terminating form (`extensions/types.ts:1072-1079` @v0.84.1).
+    assert_eq!(blocked, RawOutcome::Block(Some("no bash".into()), false));
 
     let passed = api.dispatch(0, &["tc2", "read", "{}"], &ctx);
     assert_eq!(passed, RawOutcome::Noop);
@@ -360,8 +362,8 @@ fn all_thirty_events_are_registerable() {
     api.on_context(|_, _| Outcome::noop());
     api.on_message_end(|_, _| Outcome::noop());
     api.on_before_agent_start(|_, _| Outcome::noop());
-    api.on_resources_discover(|_| Outcome::noop());
-    api.on_project_trust(|_| Outcome::noop());
+    api.on_resources_discover(|_, _| Outcome::noop());
+    api.on_project_trust(|_, _| Outcome::noop());
     api.on_agent_start(|_| {});
     api.on_agent_end(|_, _| {});
     api.on_turn_start(|_, _| {});
@@ -385,11 +387,17 @@ fn all_thirty_events_are_registerable() {
     api.on_session_compact(|_, _| {});
     api.on_session_before_tree(|_, _| Outcome::noop());
     api.on_session_tree(|_, _| {});
+    // Kinds 30-32, added after this test was written: `agent_settled`
+    // (pi `AgentSettledEvent`), `before_provider_headers` (`extensions/types.ts:686-689`
+    // @v0.83.0, EXT-009) and `session_info_changed` (`extensions/types.ts:571-575`, EXT-011).
+    api.on_agent_settled(|_| {});
+    api.on_before_provider_headers(|_, _| Outcome::noop());
+    api.on_session_info_changed(|_, _| {});
 
     let kinds = api.subscription_kinds();
-    assert_eq!(kinds.len(), 30, "all 30 Pi events registerable, got {kinds:?}");
+    assert_eq!(kinds.len(), 33, "all 33 Pi events registerable, got {kinds:?}");
     assert_eq!(kinds.first(), Some(&0));
-    assert_eq!(kinds.last(), Some(&29));
+    assert_eq!(kinds.last(), Some(&32));
 }
 
 #[test]

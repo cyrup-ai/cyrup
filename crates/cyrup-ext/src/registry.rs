@@ -27,6 +27,21 @@ pub struct ToolDescriptor {
     pub prompt_guidelines: Vec<String>,
     #[serde(default)]
     pub has_renderer: bool,
+    /// pi `ToolDefinition.prepareArguments?: (args: unknown) => Static<TParams>`
+    /// (`extensions/types.ts:468` @v0.83.0), run BEFORE `validateToolArguments` in
+    /// `packages/agent/src/agent-loop.ts`. A function cannot cross the component boundary, so the
+    /// descriptor carries the flag and the host calls the guest's `prepare-arguments` export when
+    /// it is set (EXT-023). Before this the whole field stopped at the SDK struct: the SDK accepted
+    /// `prepare_arguments`, documented it as "the host coerces args before validation when set",
+    /// and `lower_tool_descriptor` copied 8 of 10 fields — struct-literal construction of a
+    /// different type, so no compile error and no warning.
+    #[serde(default)]
+    pub prepare_arguments: bool,
+    /// pi `ToolDefinition.renderShell?: "default" | "self"` (`extensions/types.ts:465` @v0.83.0):
+    /// "Controls whether ToolExecutionComponent renders the standard colored shell or the tool
+    /// renders its own framing." `None` is upstream's omitted field, i.e. `"default"` (EXT-024).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_shell: Option<String>,
 }
 
 impl ToolDescriptor {
@@ -141,7 +156,25 @@ struct RegistryInner {
     /// disambiguation, runner.ts:559-565). The `commands` map is the fast last-wins lookup; this Vec
     /// retains duplicates + order so [`ExtensionRegistry::resolved_commands`] can assign `name:N`.
     command_order: Vec<(ExtensionId, String, CommandDescriptor)>,
-    shortcuts: HashMap<String, ExtensionId>,
+    /// Registered shortcuts, keyed by the RAW key id the extension declared, carrying the owner and
+    /// pi's optional `description` (EXT-040). Kept raw and unfiltered on purpose: this is the analog
+    /// of pi's per-extension `ext.shortcuts` map, which `getShortcuts` reads and normalizes at
+    /// RESOLUTION time (`extensions/runner.ts:492-534` @v0.83.0) rather than at registration.
+    shortcuts: HashMap<String, (ExtensionId, Option<String>)>,
+    /// Registration ORDER of `shortcuts`, so [`ExtensionRegistry::resolve_shortcuts`] can walk
+    /// them the way pi walks `this.extensions` — load order, last-wins with a warning.
+    shortcut_order: Vec<String>,
+    /// Commands opted into argument autocomplete, in registration order (pi
+    /// `addAutocompleteProvider`'s per-command sibling; the WASM tier records the same thing on
+    /// `GuestState`). Registry-backed so a NATIVE can reach it too (EXT-035).
+    command_autocomplete: Vec<(ExtensionId, String)>,
+    /// Count of stacked GLOBAL autocomplete providers (pi `addAutocompleteProvider`,
+    /// `extensions/types.ts:218`) contributed by natives (EXT-035).
+    autocomplete_providers: Vec<ExtensionId>,
+    /// Warnings produced by the last [`ExtensionRegistry::resolve_shortcuts`] call (pi
+    /// `getShortcutDiagnostics()`, `extensions/runner.ts:538-540` @v0.83.0), which upstream folds
+    /// into the `[Extension issues]` startup panel (`interactive-mode.ts:1612-1618`).
+    shortcut_diagnostics: Vec<ExtensionConflict>,
     flags: HashMap<String, Value>,
     /// Which extension owns each flag name. FIRST registration wins (Pi `getFlags`,
     /// runner.ts:473-483 — `if (!allFlags.has(name))` over `this.extensions` in load order).
@@ -214,6 +247,37 @@ impl ExtensionRegistry {
     /// re-registers its own tool (hot-reload, or the descriptor→`WasmTool` materialization pass)
     /// overwrites its previous entry.
     pub fn register_tool(&self, owner: ExtensionId, tool: Arc<dyn Tool>) -> Result<(), ExtError> {
+        self.register_tool_inner(owner, tool, true)
+    }
+
+    /// [`Self::register_tool`] WITHOUT raising the tools-dirty flag (EXT-030).
+    ///
+    /// The one legitimate caller is the guest-descriptor materializer
+    /// ([`crate::ExtensionHost::refresh_tools`]), which is running *because* the flag was already
+    /// taken: its own re-registrations are not new signal, and letting them raise the flag forced
+    /// the materializer to clear it again on the way out — a wholesale
+    /// `take_tools_dirty()` swap that also discarded its own deliberate re-arm for a
+    /// descriptor whose owner was not yet live, and any mark raised concurrently by another
+    /// extension. pi has no dirty flag to lose a signal in: `registerTool` ends with
+    /// `runtime.refreshTools()` on every registration
+    /// (pi/packages/coding-agent/src/core/extensions/loader.ts:245-252 @v0.83.0) and
+    /// `_refreshToolRegistry` rebuilds the whole registry each time
+    /// (core/agent-session.ts:2452-2546), so this quiet variant is what keeps cyrup's cheaper
+    /// flag-gated equivalent from dropping a registration that pi could not drop.
+    pub fn register_materialized_tool(
+        &self,
+        owner: ExtensionId,
+        tool: Arc<dyn Tool>,
+    ) -> Result<(), ExtError> {
+        self.register_tool_inner(owner, tool, false)
+    }
+
+    fn register_tool_inner(
+        &self,
+        owner: ExtensionId,
+        tool: Arc<dyn Tool>,
+        mark_dirty: bool,
+    ) -> Result<(), ExtError> {
         let name = tool.name().to_string();
         let mut g = self.lock_write()?;
         if let Some(existing) = Self::tool_owner_in(&g, &name)
@@ -228,7 +292,9 @@ impl ExtensionRegistry {
         g.tool_owner.insert(name.clone(), owner);
         g.tools.insert(name, tool);
         drop(g);
-        self.mark_tools_dirty();
+        if mark_dirty {
+            self.mark_tools_dirty();
+        }
         Ok(())
     }
 
@@ -312,15 +378,39 @@ impl ExtensionRegistry {
     /// [`ToolDescriptor`] — i.e. a NATIVE extension's tool, which arrives as an already-executable
     /// `Arc<dyn Tool>` and therefore carries no `has_renderer` flag (Pi does not distinguish:
     /// `ToolDefinition.renderCall` is declared the same way whichever runtime supplies the tool,
-    /// extensions/types.ts:472-481). LAST registration wins here, matching
-    /// [`Self::register_guest_tool`]'s descriptor path (a re-registered descriptor re-points the
-    /// owner) rather than the first-wins custom-MESSAGE rule.
+    /// extensions/types.ts:472-481).
+    ///
+    /// **FIRST registration wins** (EXT-056), like every sibling table. Upstream has no separate
+    /// tool-renderer table at all: `renderCall`/`renderResult` ride on the tool's own
+    /// `ToolDefinition` and are resolved by `getToolDefinition`, which returns the FIRST extension
+    /// in load order whose `ext.tools` map has the name
+    /// (pi/packages/coding-agent/src/core/extensions/runner.ts:463-471 @v0.83.0) — whoever wins the
+    /// TOOL wins its renderer. The previous last-wins rule let a later extension re-point rendering
+    /// to an extension that had lost (or never made) the tool registration, so the tool executed as
+    /// one extension's and drew as another's. Its stated justification — "matching
+    /// `register_guest_tool`'s descriptor path" — stopped holding when EXT-008 made that path
+    /// early-return on a foreign owner before it touches `tool_renderer_owner`. A second owner
+    /// claiming the same tool name is recorded as an [`ExtensionConflict`] so the drop is
+    /// diagnosable.
     pub fn register_tool_renderer(
         &self,
         owner: ExtensionId,
         tool_name: impl Into<String>,
     ) -> Result<(), ExtError> {
-        self.lock_write()?.tool_renderer_owner.insert(tool_name.into(), owner);
+        let tool_name = tool_name.into();
+        let mut g = self.lock_write()?;
+        if let Some(existing) = g.tool_renderer_owner.get(&tool_name)
+            && *existing != owner
+        {
+            let existing = existing.clone();
+            Self::record_conflict(
+                &mut g,
+                owner,
+                format!("Tool renderer for \"{tool_name}\" conflicts with {existing}"),
+            );
+            return Ok(());
+        }
+        g.tool_renderer_owner.insert(tool_name, owner);
         Ok(())
     }
 
@@ -511,26 +601,158 @@ impl ExtensionRegistry {
         self.command_owner(invocation)
     }
 
-    /// Register a keyboard shortcut owned by an extension (R-08-017).
+    /// Register a keyboard shortcut owned by an extension (R-08-017; pi `registerShortcut(shortcut,
+    /// {description?, handler})`, `extensions/types.ts:1250` @v0.83.0, storing an
+    /// `ExtensionShortcut {shortcut, description?, handler, extensionPath}` at `:1524-1529`).
+    ///
+    /// Deliberately UNGATED, matching upstream: pi's `registerShortcut` writes straight into the
+    /// per-extension `ext.shortcuts` map and every conflict rule — reserved-key refusal,
+    /// non-reserved override warning, extension-vs-extension warning — runs later, in `getShortcuts`
+    /// against the RESOLVED keybinding config (`extensions/runner.ts:492-534`), which registration
+    /// time does not have. [`Self::resolve_shortcuts`] is that function; putting the gate here
+    /// instead would refuse keys before knowing what the user bound them to.
+    ///
+    /// `description` is EXT-040: it crossed the WIT boundary and was thrown away one line inside the
+    /// host, so `/hotkeys` printed the key id as its own label.
     pub fn register_shortcut(
         &self,
         owner: ExtensionId,
         key: impl Into<String>,
+        description: Option<String>,
     ) -> Result<(), ExtError> {
+        let key = key.into();
         let mut g = self.lock_write()?;
-        g.shortcuts.insert(key.into(), owner);
+        if !g.shortcuts.contains_key(&key) {
+            g.shortcut_order.push(key.clone());
+        }
+        g.shortcuts.insert(key, (owner, description));
         Ok(())
     }
 
-    /// Keys with a registered shortcut.
+    /// Keys with a registered shortcut, in REGISTRATION order (pi walks `this.extensions` in load
+    /// order, `runner.ts:508`).
     pub fn shortcut_keys(&self) -> Result<Vec<String>, ExtError> {
-        Ok(self.lock_read()?.shortcuts.keys().cloned().collect())
+        Ok(self.lock_read()?.shortcut_order.clone())
+    }
+
+    /// Every registered shortcut as `(key, description)` in registration order (EXT-040). The
+    /// `/hotkeys` table renders the description, falling back the way pi does — `const description
+    /// = shortcut.description ?? shortcut.extensionPath;`
+    /// (`modes/interactive/interactive-mode.ts:5856` @v0.83.0), i.e. to the extension ID, never to
+    /// the key id itself.
+    pub fn shortcut_specs(&self) -> Result<Vec<(String, Option<String>)>, ExtError> {
+        let g = self.lock_read()?;
+        Ok(g.shortcut_order
+            .iter()
+            .filter_map(|k| {
+                g.shortcuts.get(k).map(|(owner, desc)| {
+                    (k.clone(), Some(desc.clone().unwrap_or_else(|| owner.to_string())))
+                })
+            })
+            .collect())
     }
 
     /// The extension that registered the shortcut bound to `key`, if any (R-08-017). Used by the host
     /// to route a fired key press to its owning live instance's `execute-shortcut` export.
+    /// Case-insensitive, because pi normalizes with `key.toLowerCase()` before it ever matches
+    /// (`runner.ts:510`).
     pub fn shortcut_owner(&self, key: &str) -> Result<Option<ExtensionId>, ExtError> {
-        Ok(self.lock_read()?.shortcuts.get(key).cloned())
+        let g = self.lock_read()?;
+        if let Some((owner, _)) = g.shortcuts.get(key) {
+            return Ok(Some(owner.clone()));
+        }
+        let lower = key.to_lowercase();
+        Ok(g.shortcuts
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == lower)
+            .map(|(_, (owner, _))| owner.clone()))
+    }
+
+    /// Resolve the extension shortcut map against the host's resolved keybinding config — the
+    /// direct port of pi `ExtensionRunner.getShortcuts(resolvedKeybindings)`
+    /// (`pi/packages/coding-agent/src/core/extensions/runner.ts:492-534` @v0.83.0), EXT-039.
+    ///
+    /// `resolved_keybindings` is upstream's `KeybindingsConfig`: action id → the key(s) bound to it.
+    /// Every rule below is upstream's, in upstream's order:
+    ///
+    /// 1. `buildBuiltinKeybindings` (`runner.ts:92-111`) inverts that map to key → `{keybinding,
+    ///    restrictOverride}`, lowercasing each key, where `restrictOverride` is membership of
+    ///    [`RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS`]. When several actions bind the same key
+    ///    the RESERVED one wins regardless of iteration order (`:104-106`).
+    /// 2. A shortcut colliding with a RESERVED built-in is SKIPPED with a warning (`:513-520`) —
+    ///    it never enters the map, so it cannot be listed by `/hotkeys` as if it were live.
+    /// 3. A shortcut colliding with a NON-reserved built-in warns but WINS (`:522-528`).
+    /// 4. Two extensions on the same key warn, and the LAST registrant wins — `extensionShortcuts.set`
+    ///    runs unconditionally after the warning (`:530-536`). This is deliberately NOT the
+    ///    first-wins rule the tool/command/renderer tables use; the warning text says so
+    ///    ("Using ${shortcut.extensionPath}").
+    ///
+    /// Returns the resolved `key → owner` map in insertion order. Diagnostics are read back with
+    /// [`Self::shortcut_diagnostics`], mirroring `getShortcutDiagnostics()` (`:538-540`).
+    pub fn resolve_shortcuts(
+        &self,
+        resolved_keybindings: &[(String, Vec<String>)],
+    ) -> Result<Vec<(String, ExtensionId)>, ExtError> {
+        let builtin = build_builtin_keybindings(resolved_keybindings);
+        let mut g = self.lock_write()?;
+        g.shortcut_diagnostics.clear();
+        let mut out: Vec<(String, ExtensionId)> = Vec::new();
+        let order = g.shortcut_order.clone();
+        for key in order {
+            let Some((owner, _)) = g.shortcuts.get(&key).cloned() else { continue };
+            let normalized = key.to_lowercase();
+            let warn = |g: &mut RegistryInner, message: String| {
+                let record = ExtensionConflict { path: owner.clone(), message };
+                if !g.shortcut_diagnostics.contains(&record) {
+                    g.shortcut_diagnostics.push(record);
+                }
+            };
+            match builtin.get(&normalized) {
+                // Rule 2 — reserved: skip. pi's text, verbatim (`runner.ts:515-518`).
+                Some(b) if b.restrict_override => {
+                    warn(
+                        &mut g,
+                        format!(
+                            "Extension shortcut '{key}' from {owner} conflicts with built-in \
+                             shortcut. Skipping."
+                        ),
+                    );
+                    continue;
+                }
+                // Rule 3 — non-reserved: warn, extension wins (`runner.ts:523-526`).
+                Some(b) => warn(
+                    &mut g,
+                    format!(
+                        "Extension shortcut conflict: '{key}' is built-in shortcut for {} and \
+                         {owner}. Using {owner}.",
+                        b.keybinding
+                    ),
+                ),
+                None => {}
+            }
+            // Rule 4 — extension vs extension: warn, LAST wins (`runner.ts:530-536`).
+            if let Some(pos) = out.iter().position(|(k, _)| *k == normalized) {
+                let existing = out[pos].1.clone();
+                warn(
+                    &mut g,
+                    format!(
+                        "Extension shortcut conflict: '{key}' registered by both {existing} and \
+                         {owner}. Using {owner}."
+                    ),
+                );
+                out.remove(pos);
+            }
+            out.push((normalized, owner));
+        }
+        Ok(out)
+    }
+
+    /// Warnings from the last [`Self::resolve_shortcuts`] (pi `getShortcutDiagnostics()`,
+    /// `extensions/runner.ts:538-540` @v0.83.0). Upstream folds these into the `[Extension issues]`
+    /// startup panel (`modes/interactive/interactive-mode.ts:1612-1618`); cyrup surfaces them
+    /// through the same `startup_diagnostics.extensions` channel the load diagnostics use.
+    pub fn shortcut_diagnostics(&self) -> Result<Vec<ExtensionConflict>, ExtError> {
+        Ok(self.lock_read()?.shortcut_diagnostics.clone())
     }
 
     /// Register a custom LLM provider (R-08-019; A-08-7). Parses the typed config, resolves the API
@@ -548,6 +770,34 @@ impl ExtensionRegistry {
         g.provider_hub.register(id.clone(), &config).map_err(ExtError::Component)?;
         g.provider_owner.insert(id, owner);
         Ok(())
+    }
+
+    /// Opt a registered command into argument autocomplete (EXT-035) — the registry-backed native
+    /// analog of the guest's `registration.add-autocomplete` import.
+    pub fn add_command_autocomplete(
+        &self,
+        owner: ExtensionId,
+        command: impl Into<String>,
+    ) -> Result<(), ExtError> {
+        self.lock_write()?.command_autocomplete.push((owner, command.into()));
+        Ok(())
+    }
+
+    /// Commands opted into argument autocomplete, in registration order (EXT-035).
+    pub fn command_autocomplete(&self) -> Result<Vec<(ExtensionId, String)>, ExtError> {
+        Ok(self.lock_read()?.command_autocomplete.clone())
+    }
+
+    /// Stack one global autocomplete provider (EXT-035; pi `addAutocompleteProvider`,
+    /// `extensions/types.ts:218`).
+    pub fn add_autocomplete_provider(&self, owner: ExtensionId) -> Result<(), ExtError> {
+        self.lock_write()?.autocomplete_providers.push(owner);
+        Ok(())
+    }
+
+    /// The extensions that stacked a global autocomplete provider, in registration order (EXT-035).
+    pub fn autocomplete_providers(&self) -> Result<Vec<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.autocomplete_providers.clone())
     }
 
     pub fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
@@ -714,4 +964,69 @@ impl ExtensionRegistry {
     fn lock_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, RegistryInner>, ExtError> {
         self.inner.write().map_err(|_| ExtError::Io("registry lock poisoned".into()))
     }
+}
+
+/// The editor-global keybinding ids an extension shortcut may NOT override, ported verbatim and in
+/// order from pi's `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS`
+/// (`pi/packages/coding-agent/src/core/extensions/runner.ts:70-89` @v0.83.0), including its comment:
+/// "Extension shortcuts compete with canonical keybinding ids from keybindings.json. Only
+/// editor-global shortcuts are reserved here. Picker-specific bindings are not." (EXT-039)
+pub const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS: &[&str] = &[
+    "app.interrupt",
+    "app.clear",
+    "app.exit",
+    "app.suspend",
+    "app.thinking.cycle",
+    "app.model.cycleForward",
+    "app.model.cycleBackward",
+    "app.model.select",
+    "app.tools.expand",
+    "app.thinking.toggle",
+    "app.editor.external",
+    "app.message.copy",
+    "app.message.followUp",
+    "tui.input.submit",
+    "tui.select.confirm",
+    "tui.select.cancel",
+    "tui.input.copy",
+    "tui.editor.deleteToLineEnd",
+];
+
+/// One built-in binding, as pi's `BuiltInKeyBindings` value (`runner.ts:91`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltinKeybinding {
+    /// The canonical action id the key is bound to (pi `keybinding`).
+    pub keybinding: String,
+    /// Whether an extension is REFUSED this key (pi `restrictOverride`).
+    pub restrict_override: bool,
+}
+
+/// Invert `action -> keys` into `lowercased key -> {keybinding, restrict_override}` — pi
+/// `buildBuiltinKeybindings` (`extensions/runner.ts:92-111` @v0.83.0).
+///
+/// The load-bearing detail is upstream's `:104-106`: when several actions bind the same key, the
+/// RESERVED action wins regardless of iteration order, "so extensions remain blocked by reserved
+/// shortcuts regardless of iteration order".
+pub fn build_builtin_keybindings(
+    resolved: &[(String, Vec<String>)],
+) -> HashMap<String, BuiltinKeybinding> {
+    let mut out: HashMap<String, BuiltinKeybinding> = HashMap::new();
+    for (keybinding, keys) in resolved {
+        let restrict_override =
+            RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS.contains(&keybinding.as_str());
+        for key in keys {
+            let normalized = key.to_lowercase();
+            if let Some(existing) = out.get(&normalized)
+                && existing.restrict_override
+                && !restrict_override
+            {
+                continue;
+            }
+            out.insert(
+                normalized,
+                BuiltinKeybinding { keybinding: keybinding.clone(), restrict_override },
+            );
+        }
+    }
+    out
 }

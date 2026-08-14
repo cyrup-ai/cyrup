@@ -387,7 +387,7 @@ impl cyrup_ext::NativeExtension for DenyByName {
     ) -> cyrup_ext::HookOutcome {
         match ev {
             cyrup_ext::HostEvent::ToolCall { name, .. } if name == self.0 => {
-                cyrup_ext::HookOutcome::Block { reason: Some(format!("{name} denied by extension")) }
+                cyrup_ext::HookOutcome::Block { reason: Some(format!("{name} denied by extension")), terminate: false }
             }
             _ => cyrup_ext::HookOutcome::Noop,
         }

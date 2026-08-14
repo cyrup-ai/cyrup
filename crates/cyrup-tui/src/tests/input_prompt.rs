@@ -111,8 +111,11 @@ fn session_selector_search_box_uses_the_shared_prompt() {
 #[test]
 fn tree_rename_box_indents_then_uses_the_shared_prompt() {
     let mut sel = TreeSelector::new(vec![TreeNode::message("root", 0, "initial prompt")]);
-    // `e` opens the inline label editor.
-    assert_eq!(sel.handle(&ch('e'), &SelectKeymap::default()), SelectorOutcome::Redraw);
+    // `shift+l` (`app.tree.editLabel`, `keybindings.ts:127-130` at v0.83.0) opens the inline label
+    // editor; a bare letter would be swallowed by the tree's text search instead
+    // (`tree-selector.ts:1093-1100`).
+    let shift_l = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+    assert_eq!(sel.handle(&shift_l, &SelectKeymap::default()), SelectorOutcome::Redraw);
     sel.handle(&ch('x'), &SelectKeymap::default());
     let rows = rows_of(&mut sel, 80);
     let (_, row) = prompt_row(&rows, "  > ");

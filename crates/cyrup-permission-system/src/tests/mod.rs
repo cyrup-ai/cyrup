@@ -31,5 +31,6 @@
 //! `FORWARDING_AGENT_DIR_ENV` is unset as a precondition; no test in this crate sets it.)
 
 mod forwarded_prompt_fractional_timeout;
+mod forwarding_has_ui_guard;
 mod forwarding_preserve_location;
 mod forwarding_response_path_containment;

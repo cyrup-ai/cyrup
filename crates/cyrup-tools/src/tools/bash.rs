@@ -117,11 +117,11 @@ impl Tool for BashTool {
     /// Saying `PI_*` here would point the model at variables cyrup guarantees are absent. This is
     /// also not one of the twelve live `PI_*` lower-precedence fallbacks in
     /// `cyrup-config/src/env.rs:68-91` — none of those five session-metadata names appears there.
-    fn prompt_guidelines(&self) -> &[&str] {
+    fn prompt_guidelines(&self) -> Vec<&str> {
         if self.opts.expose_session_environment {
-            &["You can inspect CYRUP_* environment variables for current model and session details."]
+            vec!["You can inspect CYRUP_* environment variables for current model and session details."]
         } else {
-            &[]
+            Vec::new()
         }
     }
 

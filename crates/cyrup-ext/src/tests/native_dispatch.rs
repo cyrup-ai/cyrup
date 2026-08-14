@@ -99,16 +99,16 @@ async fn a08_1_event_fires_with_payload_notify() {
         .unwrap();
 
     let sub = host.subscriber(CancelToken::new());
-    sub.on_event(&AgentEvent::AgentStart).await;
+    sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await;
     sub.on_event(&AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc1".into(),
         tool_name: "bash".into(),
         result: json!({"ok": true}),
         is_error: false,
-    })
+    }, CancelToken::new())
     .await;
     // An event the probe did NOT subscribe to must not be delivered.
-    sub.on_event(&AgentEvent::TurnStart).await;
+    sub.on_event(&AgentEvent::TurnStart, CancelToken::new()).await;
 
     let got = seen.lock().unwrap().clone();
     assert_eq!(got, vec!["agent_start", "tool_exec_end:tc1:false"]);
@@ -168,13 +168,13 @@ async fn a08_1b_turn_index_is_derived_and_resets_per_agent_run() {
         let (msg, _tc) = tool_call_msg("read", &"tc".into(), &json!({}));
         AgentEvent::TurnEnd { message: AgentMessage::Assistant(msg), tool_results: vec![] }
     };
-    sub.on_event(&AgentEvent::AgentStart).await;
-    sub.on_event(&AgentEvent::TurnStart).await;
-    sub.on_event(&turn_end()).await;
-    sub.on_event(&AgentEvent::TurnStart).await;
-    sub.on_event(&turn_end()).await;
-    sub.on_event(&AgentEvent::AgentStart).await; // reset back to 0
-    sub.on_event(&AgentEvent::TurnStart).await;
+    sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await;
+    sub.on_event(&AgentEvent::TurnStart, CancelToken::new()).await;
+    sub.on_event(&turn_end(), CancelToken::new()).await;
+    sub.on_event(&AgentEvent::TurnStart, CancelToken::new()).await;
+    sub.on_event(&turn_end(), CancelToken::new()).await;
+    sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await; // reset back to 0
+    sub.on_event(&AgentEvent::TurnStart, CancelToken::new()).await;
 
     let got = seen.lock().unwrap().clone();
     // start+end of a turn share the index; it increments after each end; agent_start resets it.
@@ -216,7 +216,7 @@ impl NativeExtension for BashGate {
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         if let HostEvent::ToolCall { name, .. } = ev
             && name == "bash" {
-                return HookOutcome::Block { reason: Some("bash is not allowed".into()) };
+                return HookOutcome::Block { reason: Some("bash is not allowed".into()), terminate: false };
             }
         HookOutcome::Noop
     }
@@ -242,7 +242,7 @@ async fn a08_2_tool_call_blocks_bash_with_reason() {
     };
     let outcome = hooks.before_tool_call(ctx, CancelToken::new()).await.unwrap();
     match outcome {
-        BeforeOutcome::Block { reason } => assert_eq!(reason.as_deref(), Some("bash is not allowed")),
+        BeforeOutcome::Block { reason, .. } => assert_eq!(reason.as_deref(), Some("bash is not allowed")),
         BeforeOutcome::Proceed => panic!("expected block"),
     }
 
@@ -381,7 +381,7 @@ async fn a08_3_tool_result_patch_chains() {
         details: None,
         usage: None,
         is_error: false,
-        terminate: false,
+        terminate: Some(false),
         assistant_message: &msg,
         tool_call: &tc,
         context: empty_view(),
@@ -580,11 +580,11 @@ async fn r08_034_subscription_gated_dispatch() {
         tool_name: "bash".into(),
         args: json!({}),
         partial_result: json!({}),
-    })
+    }, CancelToken::new())
     .await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-    sub.on_event(&AgentEvent::AgentStart).await;
+    sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -791,7 +791,7 @@ impl NativeExtension for HumanGateExt {
         // Enter a sanctioned human wait: the dispatch budget is suspended while the guard is held.
         let _human_wait = ctx.begin_human_wait();
         tokio::time::sleep(self.wait).await; // a "slow human" — longer than the budget
-        HookOutcome::Block { reason: Some("human rejected".to_string()) }
+        HookOutcome::Block { reason: Some("human rejected".to_string()), terminate: false }
     }
 }
 
@@ -811,7 +811,7 @@ impl NativeExtension for SlowNoGateExt {
     }
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         tokio::time::sleep(self.wait).await;
-        HookOutcome::Block { reason: Some("should never be observed (budget-timed-out)".to_string()) }
+        HookOutcome::Block { reason: Some("should never be observed (budget-timed-out)".to_string()), terminate: false }
     }
 }
 
@@ -868,13 +868,18 @@ async fn p3_no_human_wait_is_still_budget_contained() {
         name: "bash".into(),
         input: json!({ "command": "echo hi" }),
     };
-    let start = std::time::Instant::now();
     let reduced = dispatcher.dispatch_block_mutate(ev, &CancelToken::new()).await;
-    let elapsed = start.elapsed();
-    // The runaway is contained ~at the budget (not its full 400ms wait). Because this is the
+    // EXT-032: the wall-clock assertion that used to sit here
+    // (`assert!(elapsed < Duration::from_millis(300), …)`, a 220ms margin on an 80ms budget
+    // against a 400ms sleep) is GONE. It could only fail spuriously: it pinned the scheduler's
+    // interleaving under a full parallel run, and it proved nothing the deterministic assertion
+    // below does not already prove — the "budget never fired" case is rejected outright by
+    // requiring the reason to be pi's blocking-fault text, which a completed 400ms handler could
+    // never produce.
+    //
+    // The runaway is contained at the budget (not its full 400ms wait). Because this is the
     // `tool_call` seam, containment fails CLOSED (EXT-001): the undecided gate DENIES rather than
     // silently allowing the call it was meant to gate.
-    assert!(elapsed < Duration::from_millis(300), "budget-contained near 80ms, took {elapsed:?}");
     match reduced {
         Reduced::Blocked { reason, .. } => assert!(
             reason.as_deref().unwrap_or_default().contains("Extension failed, blocking execution"),
@@ -946,8 +951,8 @@ async fn ext002_message_end_handler_runs_once_per_finalized_message() {
     let agent_msg = AgentMessage::user_text("hello");
 
     // Seam 1 — the notify subscriber attached at builder.rs (`agent.subscribe(ext_subscriber)`).
-    sub.on_event(&AgentEvent::MessageStart { message: agent_msg.clone() }).await;
-    sub.on_event(&AgentEvent::MessageEnd { message: agent_msg.clone() }).await;
+    sub.on_event(&AgentEvent::MessageStart { message: agent_msg.clone() }, CancelToken::new()).await;
+    sub.on_event(&AgentEvent::MessageEnd { message: agent_msg.clone() }, CancelToken::new()).await;
     // Seam 2 — `SvcSubscriber`'s re-dispatch of the SAME finalized message through the mutating
     // facade (`cyrup-session-svc/src/subscriber.rs`).
     let core = cyrup_core::Message::User { content: vec![Content::text("hello")], timestamp: 0 };

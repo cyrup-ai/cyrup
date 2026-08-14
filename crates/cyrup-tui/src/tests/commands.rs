@@ -10,10 +10,20 @@ fn builtin_table_is_22_commands_in_pi_order() {
     assert_eq!(BUILTIN_SLASH_COMMANDS.first().unwrap().name, "settings");
     assert_eq!(BUILTIN_SLASH_COMMANDS[1].name, "model");
     assert_eq!(BUILTIN_SLASH_COMMANDS.last().unwrap().name, "quit");
-    // Only /model carries argument completion (§2.2 / edge 4).
+    // `/model` and `/login` are the two builtins that carry argument completion: at v0.83.0
+    // `interactive-mode.ts:553-590` (`createBaseAutocompleteProvider`) installs
+    // `getArgumentCompletions` on exactly those two entries, and `autocomplete.ts:342-352` returns
+    // `null` for any command without one. Their hints are `slash-commands.ts:21` and `:35`.
     assert!(BUILTIN_SLASH_COMMANDS[1].has_arg_completion);
-    assert_eq!(BUILTIN_SLASH_COMMANDS[1].argument_hint.as_deref(), Some("<model>"));
-    assert!(BUILTIN_SLASH_COMMANDS.iter().filter(|c| c.has_arg_completion).count() == 1);
+    assert_eq!(BUILTIN_SLASH_COMMANDS[1].argument_hint.as_deref(), Some("<provider/model>"));
+    let with_args: Vec<&str> = BUILTIN_SLASH_COMMANDS
+        .iter()
+        .filter(|c| c.has_arg_completion)
+        .map(|c| c.name.as_ref())
+        .collect();
+    assert_eq!(with_args, vec!["model", "login"]);
+    let login = BUILTIN_SLASH_COMMANDS.iter().find(|c| c.name == "login").unwrap();
+    assert_eq!(login.argument_hint.as_deref(), Some("<provider>"));
 }
 
 #[test]
@@ -200,4 +210,30 @@ fn a_builtin_wins_a_name_collision_with_a_dynamic_command() {
     let model = reg.get("model").expect("builtin /model survives");
     assert_eq!(model.source, crate::CommandSource::Builtin);
     assert_eq!(reg.commands().iter().filter(|c| c.name == "model").count(), 1);
+}
+
+/// TUI-025 — the slash-command metadata was one baseline behind.
+///
+/// pi v0.84.1 `packages/coding-agent/src/core/slash-commands.ts`: `:21`
+/// `argumentHint: "<provider/model>"`, `:35` `argumentHint: "<provider>"` on `/login`, and `:40`
+/// `"Reload keybindings, extensions, skills, prompts, themes, and context files"`. cyrup carried
+/// `"<model>"` (which understates the required `provider/model` form), no `/login` hint at all,
+/// and a `/reload` description that omitted context files — which `/reload` does reload.
+#[test]
+fn the_builtin_command_metadata_matches_pi() {
+    let by = |name: &str| {
+        crate::BUILTIN_SLASH_COMMANDS
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("`/{name}` must exist"))
+    };
+    assert_eq!(by("model").argument_hint.as_deref(), Some("<provider/model>"));
+    assert_eq!(by("login").argument_hint.as_deref(), Some("<provider>"));
+    assert_eq!(
+        by("reload").description,
+        "Reload keybindings, extensions, skills, prompts, themes, and context files"
+    );
+    // The `argumentHint` is what `has_arg_completion` reads, so `/login` now advertises one.
+    assert!(by("login").has_arg_completion);
+    assert!(by("model").has_arg_completion);
 }

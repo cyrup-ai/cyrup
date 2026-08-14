@@ -91,6 +91,19 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+/// `app.tree.foldOrUp` — `["alt+left","ctrl+left"]` upstream (`keybindings.ts:119-122`, v0.83.0).
+/// A bare letter is NOT a tree command: `handleInput`'s final `else`
+/// (`tree-selector.ts:1093-1100`) appends any printable key to the tree's text search.
+fn tree_fold_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)
+}
+
+/// `app.tree.toggleLabelTimestamp` — `shift+t` upstream (`keybindings.ts:131-134`, v0.83.0),
+/// delivered by the terminal as the shifted letter.
+fn tree_toggle_label_time_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)
+}
+
 /// A `ui.select` dialog — one of the four kinds backed by `ExtensionSelectorComponent`, i.e. one of
 /// the ones that DOES get a hint row and a one-column inset.
 fn extension_select_selector(keymap: &SelectKeymap) -> ListSelector {
@@ -475,7 +488,7 @@ fn tree_selector_draws_the_fold_state_inside_the_connector() {
     // Fold it and the SAME cell flips to `⊞` — the row does not grow or shift.
     let km = SelectKeymap::default();
     sel.handle(&key(KeyCode::Down), &km); // -> the foldable node
-    sel.handle(&key(KeyCode::Char('z')), &km); // fold
+    sel.handle(&tree_fold_key(), &km); // fold (`app.tree.foldOrUp`, `tree-selector.ts:1002-1009`)
     let rows = sel.rows(80, &theme);
     let folded: String = rows.iter().map(text).collect();
     assert!(folded.contains("└⊞ "), "folded node must render `└⊞ `: {folded:?}");
@@ -511,7 +524,7 @@ fn tree_selector_fold_marker_is_the_connectorless_fallback() {
 
     // Fold it: now the accent `⊞ ` fallback appears, because there is no connector to hold it.
     let km = SelectKeymap::default();
-    sel.handle(&key(KeyCode::Char('z')), &km);
+    sel.handle(&tree_fold_key(), &km);
     let rows = sel.rows(80, &theme);
     let marker = rows[0]
         .spans
@@ -1119,8 +1132,9 @@ fn tree_label_timestamp_pad_is_measured_in_columns_not_chars() {
     labeled.has_label = true;
     labeled.time_label = Some("12:04".to_string());
     let mut sel = TreeSelector::new(vec![labeled]);
-    // `t` = `app.tree.toggleLabelTimestamp` (`tree-selector.ts:1090`); the column is off by default.
-    sel.handle(&key(KeyCode::Char('t')), &SelectKeymap::default());
+    // `shift+t` = `app.tree.toggleLabelTimestamp` (`tree-selector.ts:1090`, bound at
+    // `keybindings.ts:131-134`); the column is off by default.
+    sel.handle(&tree_toggle_label_time_key(), &SelectKeymap::default());
 
     let width = 80u16;
     let row = &sel.rows(width, &theme)[0];

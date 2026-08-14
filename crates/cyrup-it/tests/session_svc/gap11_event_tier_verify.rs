@@ -107,7 +107,13 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
 
     // Load the REAL guest COMPONENT through the session's own host (arch-08 §5.6 seam).
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 

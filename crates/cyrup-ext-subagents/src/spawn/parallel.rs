@@ -657,12 +657,74 @@ mod tests {
     /// Spawns one real, short-lived `sh` child (sleeping briefly to give overlapping workers a
     /// real window to race in), incrementing/decrementing `running`/`peak` around its REAL
     /// lifetime (from spawn through confirmed exit), and returns its exit code.
+    /// SUBA-033 — the deterministic overlap rendezvous.
+    ///
+    /// The `peak >= 2` lower bounds these tests used to carry are wall-clock races: on a
+    /// single-core or heavily loaded runner the pool can legitimately finish task 0 before task 1
+    /// is dispatched, the observed peak is 1, and the test goes red for a reason that has nothing
+    /// to do with the invariant it names. The in-repo precedent is commit `1806375`, which deleted
+    /// an `orphaned > 0` lower bound for exactly this reason.
+    ///
+    /// A rendezvous sized to the concurrency actually being claimed converts "did two happen to
+    /// overlap?" into "two MUST overlap or nothing proceeds": the first `size` workers wait before
+    /// spawning their children, so the `size`-th arrival releases all of them and the overlap is a
+    /// precondition of the run rather than an observation about scheduling. The `<= cap` upper
+    /// bound — the real invariant — is unaffected and stays.
+    ///
+    /// The wait is bounded so a genuine serialization regression fails LOUDLY instead of hanging
+    /// the suite forever.
+    const OVERLAP_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A ONE-SHOT rendezvous for exactly the first `size` arrivals; every later arrival passes
+    /// straight through.
+    ///
+    /// [`tokio::sync::Barrier`] cannot be used directly for this, and quietly does the wrong
+    /// thing if you try: it is *cyclic*, re-arming after every `size` arrivals, so gating `n`
+    /// workers on a bare `Barrier::new(size)` strands the trailing `n % size` arrivals forever —
+    /// they wait for a generation that no remaining worker will ever complete. That is a
+    /// deterministic hang, not a flake: 8 tasks over a barrier of 3 always leaves workers 6 and 7
+    /// blocked. Counting arrivals and only letting the first `size` of them touch the barrier at
+    /// all is what makes "only the first `size` arrivals ever wait" actually true.
+    struct FirstArrivalsRendezvous {
+        barrier: tokio::sync::Barrier,
+        arrivals: AtomicUsize,
+        size: usize,
+    }
+
+    impl FirstArrivalsRendezvous {
+        fn new(size: usize) -> Self {
+            Self {
+                barrier: tokio::sync::Barrier::new(size),
+                arrivals: AtomicUsize::new(0),
+                size,
+            }
+        }
+
+        /// Blocks until `size` workers have arrived, for the first `size` callers only.
+        async fn join(&self) {
+            if self.arrivals.fetch_add(1, Ordering::SeqCst) < self.size {
+                drop(self.barrier.wait().await);
+            }
+        }
+    }
+
     async fn real_child_worker(
         dir: std::path::PathBuf,
         running: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
         index: usize,
         sleep_ms: u64,
+    ) -> Result<i32, String> {
+        real_child_worker_rendezvous(dir, running, peak, index, sleep_ms, None).await
+    }
+
+    async fn real_child_worker_rendezvous(
+        dir: std::path::PathBuf,
+        running: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        index: usize,
+        sleep_ms: u64,
+        rendezvous: Option<Arc<FirstArrivalsRendezvous>>,
     ) -> Result<i32, String> {
         let spec = crate::spawn::ChildSpawnSpec {
             command: sh_command(&format!("sleep {}; exit 0", sleep_ms as f64 / 1000.0)),
@@ -676,6 +738,22 @@ mod tests {
 
         let now = running.fetch_add(1, Ordering::SeqCst) + 1;
         peak.fetch_max(now, Ordering::SeqCst);
+
+        // SUBA-033: hold here until the expected number of workers have ALSO been dispatched, so
+        // the overlap the caller asserts is structural rather than incidental. Only the first
+        // `size` arrivals ever wait — later ones pass straight through, which is what keeps a group
+        // larger than the rendezvous from stranding its trailing workers.
+        if let Some(rendezvous) = &rendezvous {
+            tokio::time::timeout(OVERLAP_RENDEZVOUS_TIMEOUT, rendezvous.join())
+                .await
+                .map_err(|_| {
+                    format!(
+                        "worker {index} waited {OVERLAP_RENDEZVOUS_TIMEOUT:?} at the overlap \
+                         rendezvous without enough siblings joining it — the bounded pool \
+                         serialized work it was asked to run concurrently"
+                    )
+                })?;
+        }
 
         let mut child = crate::spawn::SpawnedChild::spawn(spec, &jsonl_path)
             .await
@@ -709,6 +787,11 @@ mod tests {
         let dir_path = dir.path().to_path_buf();
         let running_for_worker = Arc::clone(&running);
         let peak_for_worker = Arc::clone(&peak);
+        // SUBA-033: the cap IS the concurrency the pool is being asked to reach, so a rendezvous of
+        // exactly `cap` makes the overlap a precondition instead of an observation. `run_bounded`
+        // dispatches at most `cap` at a time, so the first `cap` arrivals release each other and
+        // every later worker sails through — no stranded tail, and no wall-clock lower bound left.
+        let rendezvous = Arc::new(FirstArrivalsRendezvous::new(cap));
 
         let result: FanOutResult<i32, String> = run_bounded(
             tasks,
@@ -720,26 +803,42 @@ mod tests {
                 let dir_path = dir_path.clone();
                 let running = Arc::clone(&running_for_worker);
                 let peak = Arc::clone(&peak_for_worker);
-                async move { real_child_worker(dir_path, running, peak, index, 150).await }
+                let rendezvous = Arc::clone(&rendezvous);
+                async move {
+                    real_child_worker_rendezvous(
+                        dir_path,
+                        running,
+                        peak,
+                        index,
+                        150,
+                        Some(rendezvous),
+                    )
+                    .await
+                }
             },
         )
         .await;
 
         assert_eq!(result.slots.len(), total_tasks, "one slot per input task");
-        assert!(!result.any_failed, "every real sh child must exit 0");
+        assert!(
+            !result.any_failed,
+            "every real sh child must exit 0 — a rendezvous timeout surfaces here as a failed \
+             slot: {:?}",
+            result.slots
+        );
         assert_eq!(result.fail_fast_skipped_count, 0);
 
         let observed_peak = peak.load(Ordering::SeqCst);
-        assert!(
-            observed_peak <= cap,
-            "at most {cap} real child processes may ever be concurrently alive, observed peak \
-             {observed_peak}"
-        );
-        assert!(
-            observed_peak >= 2,
-            "the test setup (150ms-sleeping children, 8 tasks, cap {cap}) must actually exercise \
-             SOME real overlap, not accidentally serialize everything down to peak 1 — observed \
-             peak {observed_peak}"
+        // `<= cap` is the invariant this test exists for (the semaphore pair enforces it). `>= cap`
+        // is now equally deterministic rather than a wall-clock race: every one of the first `cap`
+        // workers increments `running` BEFORE it waits at the rendezvous, and none of them is
+        // released until all `cap` have arrived, so the peak provably reaches `cap`. Asserting the
+        // equality therefore also catches the failure mode a bare `<=` cannot — a pool that
+        // silently under-dispatches and never reaches the concurrency it was configured for.
+        assert_eq!(
+            observed_peak, cap,
+            "exactly {cap} real child processes must be concurrently alive at the peak — no more \
+             (the group cap) and no fewer (the rendezvous forces all {cap} to overlap)"
         );
         assert_eq!(
             running.load(Ordering::SeqCst),
@@ -1112,6 +1211,10 @@ mod tests {
         let dir_path = dir.path().to_path_buf();
         let running_for_worker = Arc::clone(&running);
         let peak_for_worker = Arc::clone(&peak);
+        // SUBA-033: two is the concurrency this test's claim is about, so that is the rendezvous
+        // size. It is one-shot, so the two workers that do NOT take part (4 tasks, 2 gated) pass
+        // straight through rather than waiting on a generation that will never fill.
+        let rendezvous = Arc::new(FirstArrivalsRendezvous::new(2));
 
         let result: FanOutResult<i32, String> = run_bounded(
             tasks,
@@ -1123,16 +1226,44 @@ mod tests {
                 let dir_path = dir_path.clone();
                 let running = Arc::clone(&running_for_worker);
                 let peak = Arc::clone(&peak_for_worker);
-                async move { real_child_worker(dir_path, running, peak, index, 150).await }
+                let rendezvous = Arc::clone(&rendezvous);
+                async move {
+                    real_child_worker_rendezvous(
+                        dir_path,
+                        running,
+                        peak,
+                        index,
+                        150,
+                        Some(rendezvous),
+                    )
+                    .await
+                }
             },
         )
         .await;
 
-        assert!(!result.any_failed);
+        // SUBA-033: the claim — "the dispatch guard being held must not serialize the intentional
+        // in-call parallel fan-out down to peak concurrency 1" — is now enforced by the rendezvous
+        // itself: two workers cannot pass the barrier unless two are dispatched concurrently, and a
+        // serializing regression fails the run with the rendezvous-timeout message rather than
+        // flaking on an observed peak.
         assert!(
-            peak.load(Ordering::SeqCst) >= 2,
-            "the dispatch guard being held must not serialize the intentional in-call parallel \
-             fan-out down to peak concurrency 1"
+            !result.any_failed,
+            "a serialized fan-out surfaces as a rendezvous timeout in a failed slot: {:?}",
+            result.slots
+        );
+        // The rendezvous already makes this structural, so stating it is free and makes the claim
+        // the test's name asserts readable in the assertion itself rather than only in a comment.
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(
+            observed_peak >= 2,
+            "holding the top-level DispatchGuard token must not serialize the in-call fan-out; \
+             observed peak concurrent children {observed_peak}"
+        );
+        assert_eq!(
+            running.load(Ordering::SeqCst),
+            0,
+            "every real child must have been confirmed exited by the time run_bounded returns"
         );
     }
 

@@ -65,14 +65,37 @@ impl AskChannel for CountingOnceChannel {
     }
 }
 
+/// This binary's own env lock (PERM-020).
+///
+/// `crate::ext_config::env_lock()` is crate-private, so an INTEGRATION binary cannot reach it; this
+/// is the same guarantee for this compilation unit. Every test body in this file takes it, so the
+/// `set_var` in [`ensure_subagent_child`] can never be concurrent with another test's `getenv` —
+/// and every test here does `getenv` constantly, because the gate reads `CYRUP_SUBAGENT_CHILD`
+/// (`extension::is_subagent_child`), `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH`
+/// (`ExtensionConfig::resolve_config_path`) and `CYRUP_PERMISSION_SYSTEM_LOGS_DIR`
+/// (`logging::resolve_logs_dir`) on the decision path. In Rust 2024 an unsynchronized
+/// `set_var`/`getenv` pair is undefined behaviour, not merely flaky ordering.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`ENV_LOCK`] for the whole test body, recovering from poisoning so one failing test does
+/// not cascade into spurious failures in its siblings.
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// `prompt_decision`'s fail-fast pre-check (pi `canRequestPermissionConfirmation`,
 /// `index.ts:2263,2351,2452`) is `hasUI || isSubagent || yoloMode`, and the channel it then selects is
 /// the injected `ask_channel` only when `has_ui` is false. Marking this process child-shaped is what
 /// routes the prompt to [`CountingOnceChannel`] instead of a live `LocalAskChannel`. Set ONCE and
 /// never unset: both tests in this binary need it and may run concurrently.
+///
+/// PERM-020: the caller MUST already hold [`env_guard`]. The `Once` alone does not help — it makes
+/// the write happen once, but says nothing about whether another test is reading the environment
+/// while it happens.
 fn ensure_subagent_child() {
     static SET: Once = Once::new();
     SET.call_once(|| {
+        // SAFETY: serialized by `ENV_LOCK`, which the caller holds for the whole test body.
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var("CYRUP_SUBAGENT_CHILD", "1");
@@ -137,6 +160,7 @@ fn read_call(call_id: &str, path: &str) -> HostEvent {
 
 #[tokio::test]
 async fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt() {
+    let _env = env_guard();
     ensure_subagent_child();
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
@@ -198,6 +222,7 @@ async fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt()
 
 #[tokio::test]
 async fn reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt() {
+    let _env = env_guard();
     ensure_subagent_child();
     let cwd_dir = tempfile::tempdir().unwrap();
     let outside_dir = tempfile::tempdir().unwrap();
@@ -236,4 +261,140 @@ async fn reemitted_external_directory_read_reuses_the_cached_decision_with_no_se
         "a re-emitted IDENTICAL out-of-workdir tool_call must reuse the cached decision, \
          never open a second dialog"
     );
+}
+
+// ================================================================================================
+// (3) PERM-014 — the CONCURRENT-duplicate window.
+// ================================================================================================
+
+/// A channel that BLOCKS inside `confirm` until the test opens the gate, so the second identical ask
+/// arrives while the first prompt is genuinely still open — the window pi closes by caching the
+/// unsettled `decisionPromise` (v0.8.0 `index.ts:1633`, run BEFORE the `await` at `:1637`).
+///
+/// The gate is a LEVEL-triggered `watch`, deliberately not a `Notify`. `Notify::notify_waiters()`
+/// is edge-triggered and stores no permit, so any `confirm` that arrives after the release parks
+/// forever — which converts the regression this test exists to catch (a SECOND dialog) from a loud
+/// `prompts == 2` failure into an unbounded HANG. With a `watch`, a late `confirm` returns
+/// immediately and the count assertion fails loudly instead.
+struct GatedChannel {
+    prompts: Arc<AtomicUsize>,
+    gate: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait::async_trait]
+impl AskChannel for GatedChannel {
+    async fn confirm(&self, _title: &str, _message: &str, _opts: PromptOpts) -> AskOutcome {
+        self.prompts.fetch_add(1, Ordering::SeqCst);
+        let mut gate = self.gate.clone();
+        while !*gate.borrow_and_update() {
+            if gate.changed().await.is_err() {
+                break;
+            }
+        }
+        AskOutcome::Decided(PermissionPromptDecision {
+            approved: true,
+            state: PermissionDecisionState::Once,
+            denial_reason: None,
+        })
+    }
+}
+
+/// Drive every other task on this CURRENT-THREAD runtime until each has run to its next suspension
+/// point. Deterministic by construction — a fixed number of polls, never a wall-clock sleep: the
+/// only things any task in this test can park on are the [`GatedChannel`] gate and the dedup
+/// cache's in-flight wait, so once a task has been polled it runs to one of those and stays there.
+async fn settle() {
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// PERM-014 (RED before the fix). `prompt_decision` used `DedupCache::get`, which treats an
+/// in-flight entry as a MISS, and it stored the decision only AFTER the human answered. So two
+/// concurrently-executing tool calls with the same dedup key each opened their own dialog — the
+/// operator answered the same question twice, and the two answers could disagree. Reachability is
+/// not hypothetical: `cyrup-agent/src/loop_fn.rs` documents tool execution as "Default parallel".
+///
+/// pi's ordering is `rememberPermissionPromptDecision(..., decisionPromise)` (`index.ts:1633`) then
+/// `await decisionPromise` (`:1637`), so the follower hits `getCachedPermissionPromptDecision`
+/// (`:1581-1583`) and `await`s the SAME promise (`:1585`).
+///
+/// The target path is INSIDE `cwd` on purpose. A path outside it engages the external-directory
+/// guard (`decide`, pi `index.ts:2310-2414`) BEFORE the main check, and the two guards ask two
+/// DIFFERENT questions — different `details.message`, therefore different fingerprints and
+/// different cache keys (`DedupDetails::cache_key`), so one gated call legitimately raises TWO
+/// prompts, exactly as pi does. That is a second ask surface, not a dedup failure, and it has no
+/// place in a test whose readout is a prompt COUNT. Keeping the read in-workdir isolates the single
+/// surface under test (`read: ask` → the main check).
+#[tokio::test(flavor = "current_thread")]
+async fn two_concurrent_identical_asks_collapse_to_one_prompt() {
+    let _env = env_guard();
+    ensure_subagent_child();
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let policy_path = agent_dir.join("cyrup-permissions.jsonc");
+    write(&policy_path, r#"{ "tools": { "read": "ask" } }"#);
+    let prompts = Arc::new(AtomicUsize::new(0));
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let ext = Arc::new(PermissionSystemExtension::from_parts(
+        ManagerPaths {
+            global_config_path: policy_path,
+            agents_dir: agent_dir.join("agents"),
+            project_global_config_path: None,
+            project_agents_dir: None,
+            legacy_global_settings_path: agent_dir.join("settings.json"),
+            global_mcp_config_path: agent_dir.join("mcp.json"),
+            mcp_server_names_override: None,
+        },
+        ExtensionConfig::default(),
+        Arc::new(GatedChannel { prompts: Arc::clone(&prompts), gate: gate_rx }),
+    ));
+    ext.set_host_services(Arc::new(RegistryServices));
+    let mut api = InitApi::new();
+    ext.init(&mut api).await.unwrap();
+
+    let cwd = agent_dir.to_path_buf();
+    let target = cwd.join("a.txt").to_string_lossy().into_owned();
+    let call = move || read_call("call-concurrent", &target);
+
+    // LEADER: enters the gate and parks inside the dialog.
+    let leader = {
+        let ext = Arc::clone(&ext);
+        let cwd = cwd.clone();
+        let call = call.clone();
+        tokio::spawn(async move { ext.on_event(&call(), &ctx(&cwd)).await })
+    };
+    // Run the leader up to its suspension point — inside the open dialog — so the follower cannot
+    // simply lose the race. No timing involved: `settle` yields, it does not sleep.
+    settle().await;
+    assert_eq!(prompts.load(Ordering::SeqCst), 1, "the leader must have opened exactly one prompt");
+
+    // FOLLOWER: the SAME call_id and the SAME input ⇒ the same dedup key, while the leader's
+    // decision is still unsettled.
+    let follower = {
+        let ext = Arc::clone(&ext);
+        let cwd = cwd.clone();
+        let call = call.clone();
+        tokio::spawn(async move { ext.on_event(&call(), &ctx(&cwd)).await })
+    };
+    // Run the follower to ITS suspension point. If dedup works that is the in-flight wait; if it
+    // regressed it is a second dialog, which the gate lets it reach — so this is a real RED
+    // assertion, not one that a slow machine can pass vacuously.
+    settle().await;
+    assert_eq!(
+        prompts.load(Ordering::SeqCst),
+        1,
+        "a concurrent identical ask must await the in-flight decision, not open a SECOND dialog"
+    );
+
+    // Open the gate; both callers must now see the same approval.
+    gate_tx.send(true).unwrap();
+    let leader = leader.await.unwrap();
+    let follower = follower.await.unwrap();
+    assert!(matches!(leader, HookOutcome::Noop), "the leader's approval lets the call proceed");
+    assert!(
+        matches!(follower, HookOutcome::Noop),
+        "the follower must receive the LEADER's decision, collapsed to Allow-Once"
+    );
+    assert_eq!(prompts.load(Ordering::SeqCst), 1, "exactly one prompt, total");
 }

@@ -254,7 +254,7 @@ impl ChildSpawnSpec {
         }
         let file_name = format!("subagent-task-{}.txt", uuid::Uuid::now_v7().as_simple());
         let path = temp_dir.join(file_name);
-        std::fs::write(&path, task).map_err(SubagentError::Spawn)?;
+        write_private(&path, task)?;
         let arg = format!("@{}", path.display());
         Ok((arg, Some(path)))
     }
@@ -268,6 +268,41 @@ impl ChildSpawnSpec {
         argv.extend(self.args.iter().cloned());
         argv.push(self.task_arg.clone());
         argv
+    }
+}
+
+/// SUBA-030 — write `contents` to `path` with mode `0600`, matching pi's
+/// `fs.writeFileSync(taskFilePath, …, { mode: 0o600 })` (`runs/shared/pi-args.ts:593` @v0.43.0;
+/// the system-prompt file at `:579` uses the same mode).
+///
+/// The spill was a bare `std::fs::write` under the process umask — world-readable on a default
+/// `022` umask — while this module's own doc at [`cleanup_temp_files`] already called these
+/// *"the 0600 task/system-prompt temp files"*. The code's documentation asserted a mode the code
+/// never set; that internal contradiction is what SUBA-030 named.
+///
+/// `mode` is applied at CREATE time rather than by a follow-up `set_permissions`, so there is no
+/// window in which the file exists with the task text and the umask's permissions.
+fn write_private(path: &Path, contents: &str) -> Result<(), SubagentError> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(SubagentError::Spawn)?;
+        file.write_all(contents.as_bytes())
+            .map_err(SubagentError::Spawn)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        // **[CYRUP-DELTA]** pi `runs/shared/pi-args.ts:593`: Node's `mode` option is a no-op on
+        // Windows too, so this matches upstream's own behaviour rather than diverging from it.
+        std::fs::write(path, contents).map_err(SubagentError::Spawn)
     }
 }
 
@@ -1005,6 +1040,36 @@ mod tests {
         assert_eq!(
             contents, long_task,
             "the temp file must contain the exact task text verbatim"
+        );
+    }
+
+    /// SUBA-030 — pi writes the task overflow with `{ mode: 0o600 }`
+    /// (`runs/shared/pi-args.ts:593` @v0.43.0).
+    ///
+    /// THE USER ACTION: a delegation whose task text exceeds the argv threshold spills to disk.
+    /// Before the fix that spill was a bare `std::fs::write` under the process umask — `0644` on a
+    /// default `022` umask — so any local user could read the full task, while this module's own
+    /// doc on `cleanup_temp_files` already described these as *"the 0600 task/system-prompt temp
+    /// files"*. Red before the fix on any machine with a normal umask; the assertion is on the
+    /// permission bits, not on the umask, so it does not depend on the developer's environment.
+    #[cfg(unix)]
+    #[test]
+    fn a_spilled_task_file_is_written_0600_not_under_the_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let long_task = "s3cr3t ".repeat(TASK_ARGV_INLINE_THRESHOLD);
+        let (_, temp_file) =
+            ChildSpawnSpec::resolve_task_arg(&long_task, dir.path()).expect("long task resolves");
+        let temp_file = temp_file.expect("a temp file must have been created");
+        let mode = std::fs::metadata(&temp_file)
+            .expect("spilled task file exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the spilled task must be owner-only; personas and tasks routinely carry project \
+             context and occasionally credential-adjacent instructions"
         );
     }
 

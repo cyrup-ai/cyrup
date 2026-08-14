@@ -139,6 +139,16 @@ impl ToolChoice {
     }
 }
 
+/// A `Models`-level outbound-header transform (Pi `ModelsStreamTransforms.transformHeaders`,
+/// `models.ts:60` @v0.83.0). Async because pi's signature is
+/// `(headers) => ProviderHeaders | Promise<ProviderHeaders>` and its production consumer awaits an
+/// extension dispatch.
+pub type TransformHeadersFn = std::sync::Arc<
+    dyn Fn(crate::HeaderMap) -> futures::future::BoxFuture<'static, crate::HeaderMap>
+        + Send
+        + Sync,
+>;
+
 /// Per-request options (func-01 §13). Errors never throw; cancellation is delivered as a terminal
 /// `StreamEvent::Error` with `stop_reason: Aborted` (func-01 R-01-044).
 #[derive(Clone, Default)]
@@ -165,6 +175,18 @@ pub struct StreamOptions {
     pub thinking_budgets: Option<crate::utils::simple_options::ThinkingBudgets>,
     /// Per-request header overlay; a `None` value suppresses a default header (func-01 §4.1).
     pub headers: Option<crate::HeaderMap>,
+    /// `ModelsStreamTransforms.transformHeaders` — "Transform fully assembled model/auth/request
+    /// headers before provider dispatch" (Pi `models.ts:58-64` @v0.83.0, mixed into
+    /// `ModelsApiStreamOptions` / `ModelsSimpleStreamOptions` at `:65-66`).
+    ///
+    /// Applied by [`crate::collection::Models`] at pi's exact position — after auth headers and
+    /// request headers are merged, *last* (`models.ts:480`) — and then **stripped** from what the
+    /// provider and its wire impl see (`:483`, the `const { transformHeaders: _t, ...providerOptions }`
+    /// rest-spread), so it is a `Models`-level seam and not part of the api option surface.
+    ///
+    /// This is where `mergeProviderAttributionHeaders` and the `before_provider_headers` extension
+    /// hook belong; pi's production consumer is `coding-agent/src/core/sdk.ts:318-327`. PROV-042.
+    pub transform_headers: Option<TransformHeadersFn>,
     /// Optional tool-choice constraint (Pi `OpenAICompletionsOptions.toolChoice`). Additive,
     /// backward-compatible (defaults to `None`, which omits the `tool_choice` field).
     pub tool_choice: Option<ToolChoice>,
@@ -222,6 +244,14 @@ pub enum ApiStreamOptions {
     Google(crate::api::google_generative_ai::GoogleOptions),
     /// Options for the `mistral-conversations` wire protocol.
     Mistral(crate::api::mistral_conversations::MistralOptions),
+    // There is deliberately NO `OpenAiCompletions` variant, and PROV-015 should not add an empty
+    // one. `OpenAICompletionsOptions extends StreamOptions` (`api/openai-completions.ts:141-144`
+    // @v0.83.0) declares exactly two own members — `toolChoice` and `reasoningEffort` — and
+    // v0.84.1 adds one more, `thinkingBudgets` (`:142-147`). All three are already carried on
+    // cyrup's [`StreamOptions`] in the same role: `tool_choice`, `reasoning` and
+    // `thinking_budgets`. A variant here would therefore be an empty struct modelling nothing, and
+    // would create two sources of truth for `tool_choice`. Re-check this note if upstream adds a
+    // completions-only member that is NOT already on `StreamOptions`.
 }
 
 impl ApiStreamOptions {

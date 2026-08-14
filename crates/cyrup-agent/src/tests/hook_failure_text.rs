@@ -63,7 +63,7 @@ struct Recorder {
 
 #[async_trait::async_trait]
 impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent) {
+    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         self.events.lock().unwrap().push(event.clone());
     }
 }
@@ -276,6 +276,18 @@ async fn failing_transform_context_surfaces_the_hooks_own_message() {
         Some("compaction budget exceeded: 412k > 200k"),
         "the user must see the hook's cause, not a fixed label"
     );
+    // AGENT-025 — pi's `handleRunFailure` emits `{ type: "agent_end", messages: [failureMessage] }`
+    // (`agent.ts:511` @v0.83.0): the single synthetic message, NOT the run's accumulator.
+    let end = rec
+        .snapshot()
+        .into_iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::AgentEnd { messages } => Some(messages),
+            _ => None,
+        })
+        .expect("an agent_end");
+    assert_eq!(end.len(), 1, "agent_end carries only the failure message: {end:?}");
 }
 
 struct FailingConvert;
@@ -308,4 +320,16 @@ async fn failing_convert_to_llm_surfaces_the_hooks_own_message() {
         Some("custom role \"memo\" has no LLM projection"),
         "the user must see the hook's cause, not a fixed label"
     );
+    // AGENT-025 — pi's `handleRunFailure` emits `{ type: "agent_end", messages: [failureMessage] }`
+    // (`agent.ts:511` @v0.83.0): the single synthetic message, NOT the run's accumulator.
+    let end = rec
+        .snapshot()
+        .into_iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::AgentEnd { messages } => Some(messages),
+            _ => None,
+        })
+        .expect("an agent_end");
+    assert_eq!(end.len(), 1, "agent_end carries only the failure message: {end:?}");
 }

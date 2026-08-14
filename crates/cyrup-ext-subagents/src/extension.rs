@@ -420,6 +420,19 @@ pub struct SingleRunOverrides {
     /// truthiness gate (`progress: params.includeProgress ? allProgress : undefined`,
     /// `subagent-executor.ts:3819`).
     pub include_progress: Option<bool>,
+    /// SUBA-043: pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0), read on the
+    /// single path at `runs/foreground/subagent-executor.ts:3651,3671`. Threaded straight onto
+    /// [`crate::exec::RunOptions::structured_output_schema`], which is what creates the run's
+    /// capture runtime and writes the child's `STRUCTURED_OUTPUT_SCHEMA`/`_CAPTURE` env pair
+    /// (`runs/shared/pi-args.ts:759-762`). `None` = the caller declared no schema, and the child
+    /// then registers no `structured_output` tool at all.
+    pub output_schema: Option<serde_json::Value>,
+    /// SUBA-047: pi `params.toolBudget` (`extension/schemas.ts:354` @v0.43.0), already validated by
+    /// [`crate::exec::tool_budget::validate_tool_budget_config`]. Applied onto the resolved
+    /// persona's own budget with pi's precedence — `params.toolBudget ?? agentConfig.toolBudget ??
+    /// params.configToolBudget` (`runs/background/async-execution.ts:1298`) — i.e. caller wins,
+    /// then frontmatter. cyrup has no extension-config rung yet, so the chain is two long.
+    pub tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
 }
 
 /// The seven inputs one foreground single run needs, bundled into one borrowed request so
@@ -460,6 +473,17 @@ pub struct ForegroundRunRequest<'a> {
 /// general step-graph path. All borrowed fields live for the duration of the one
 /// `spawn_background` call they are passed to.
 pub struct BackgroundSingleRequest<'a> {
+    /// SUBA-043: pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0), forwarded to the
+    /// async SINGLE step exactly as `runSinglePath`'s foreground twin forwards it. Lands on
+    /// [`crate::spawn::chain_graph::SingleStepSpec::structured_output_schema`], which hop 2 lowers
+    /// into that step's [`crate::exec::RunOptions::structured_output_schema`]. Upstream:
+    /// `outputSchema: params.outputSchema` on the async-single step builder
+    /// (`runs/background/async-execution.ts`), the same field the `tasks[]` lowering already fills.
+    pub structured_output_schema: Option<serde_json::Value>,
+    /// SUBA-047: pi `params.toolBudget` on the async SINGLE path
+    /// (`runs/background/async-execution.ts:1298` @v0.43.0), already validated. Folded onto the
+    /// resolved persona in `spawn_background` so hop 2's dispatch sees it as that agent's budget.
+    pub tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
     /// The task's working directory (also the discovery root for the named persona).
     pub cwd: &'a Path,
     /// The persona name to resolve and run.
@@ -1799,7 +1823,16 @@ impl SubagentExecutor {
         // into `run_options` below — is what the live-progress payload's `[fork]` badge reflects.
         let resolved_context = fork_context.mode;
 
-        let agent_config = AgentConfig::from_agent_definition(&agent, depth);
+        let mut agent_config = AgentConfig::from_agent_definition(&agent, depth);
+        // SUBA-047 / pi `const toolBudgetInput = params.toolBudget ?? agentConfig.toolBudget ??
+        // params.configToolBudget` (`runs/background/async-execution.ts:1298` @v0.43.0, mirrored on
+        // the foreground path). Collapsing the caller override onto the resolved persona here is
+        // exactly that `??` chain: the encoder at `exec/mod.rs`'s spawn overlay reads
+        // `agent.tool_budget` and needs no new plumbing, and the precedence stays caller >
+        // frontmatter. `None` on the override leaves the persona's own budget untouched.
+        if let Some(budget) = overrides.tool_budget.clone() {
+            agent_config.tool_budget = Some(budget);
+        }
         // R-SA-038: `build_model_candidates` filters the ladder to `available_models`, so an
         // explicit `model` override (pi `slash-commands.ts:681` `/run [model=…]`, and the tool's
         // SINGLE-mode `model`) must be ADDED to the availability set — otherwise the override is
@@ -1931,7 +1964,10 @@ impl SubagentExecutor {
             timeout_ms,
             output_path,
             output_mode,
-            structured_output_schema: None,
+            // SUBA-043 / pi `runSinglePath` (`subagent-executor.ts:3651,3671` @v0.43.0): the
+            // top-level `outputSchema` param reaches the SINGLE run here. Pinned `None` until now,
+            // which is what made SUBA-S01's capture machinery unreachable from the single surface.
+            structured_output_schema: overrides.output_schema.clone(),
             model_override: effective_override,
             // SUBA-003: the same policy that just gated the explicit override, carried into
             // `run_sync` so the fallback ladder's own out-of-scope entries warn (pi
@@ -2184,6 +2220,8 @@ impl SubagentExecutor {
             session_dir,
             artifacts,
             timeout_ms,
+            structured_output_schema,
+            tool_budget,
         } = request;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before agent discovery or
         // fork-context resolution below, and therefore also before `spawn_background_steps`' own
@@ -2202,8 +2240,17 @@ impl SubagentExecutor {
         // T0.1/C13: the SAME resolved definition is projected into the plan-time persona map handed
         // to the runner, so hop 2 dispatches this agent's REAL persona rather than a placeholder.
         let agent = self.resolve_agent(cwd, agent_name, agent_scope)?;
+        let mut resolved_persona = crate::exec::resolve_step_agent_config(&agent);
+        // SUBA-047 (async half) / pi `params.toolBudget ?? agentConfig.toolBudget`
+        // (`runs/background/async-execution.ts:1298`). The persona map IS what hop 2 dispatches
+        // from (`ResolvedAgentPersona::to_agent_config`), so folding the caller's budget in here
+        // reaches the same `TOOL_BUDGET_ENV` encoder the foreground path does, with no new
+        // `RunnerConfig` field and no on-disk config-format change.
+        if let Some(budget) = tool_budget.clone() {
+            resolved_persona.tool_budget = Some(budget);
+        }
         let resolved_agents: BTreeMap<String, ResolvedAgentPersona> =
-            BTreeMap::from([(agent_name.to_string(), crate::exec::resolve_step_agent_config(&agent))]);
+            BTreeMap::from([(agent_name.to_string(), resolved_persona)]);
         // Fork default-mode (Tier-2): an OMITTED call-site `context` falls back to THIS agent's own
         // `default_context` (pi `resolveAgentDefaultContextPolicy`), an explicit value still wins.
         let effective_context = resolve_effective_context(context, agent.default_context);
@@ -2292,7 +2339,11 @@ impl SubagentExecutor {
             extensions: None,
             session_file: fork_context.session_file_path.clone(),
             max_depth_override: None,
-            structured_output_schema: None,
+            // SUBA-043 / pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0). Pinned
+            // `None` here until now, which is the async half of the same unreachable-capability
+            // defect the foreground `RunOptions` carried: hop 2 already threads this field into the
+            // step's `RunOptions`, so only the constructor was dropping it.
+            structured_output_schema,
             output: None,
             // SUBA-N03: the resolved output FILE path + mode (pi's runner step `outputPath`/
             // `outputMode`, `async-execution.ts:772,774` @v0.43.0). Previously hardcoded `None` — which is
@@ -2345,7 +2396,27 @@ impl SubagentExecutor {
                 // SUBA-N03: `timeoutMs`/`maxRuntimeMs` (pi `timeoutMs: data.timeoutMs`,
                 // `subagent-executor.ts:3653`). `spawn_background_steps` stamps the absolute
                 // `deadline_at_ms` from it at spawn time.
-                timeout_ms,
+                //
+                // SUBA-051 / pi `timeoutMs: a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS`
+                // (`runs/background/async-execution.ts:782` @v0.47.1, constant at `:131` =
+                // `30 * 60 * 1000`). Landed in `635c1bd` ("fix: add default async child timeouts",
+                // fixes #978), released v0.47.0.
+                //
+                // Upstream's split is deliberate and reproduced here: the default is applied when
+                // building an async CHILD step, and the composite PARENT (`chain`/`tasks`/graph
+                // roots) is left unbounded. This function IS the async SINGLE path — one child,
+                // one run — so the default belongs here and NOT in `spawn_background_steps`, which
+                // the composite entry points also route through. The stopping machinery already
+                // exists (SUBA-S03); only the default was missing, so every async fan-out was
+                // unbounded by default exactly as it was before that fix.
+                //
+                // Precedence: an explicit caller `timeoutMs`/`maxRuntimeMs` wins, then the agent's
+                // own frontmatter `timeoutMs` (already folded into `timeout_ms` upstream of this
+                // call by `applySingleAgentLaunchDefaults`, pi's `a.defaultTimeoutMs`), then this
+                // constant.
+                timeout_ms: Some(
+                    timeout_ms.unwrap_or(crate::background::DEFAULT_ASYNC_CHILD_TIMEOUT_MS),
+                ),
                 // SUBA-N03: `share` (pi `share: shareEnabled`, `async-execution.ts:965`).
                 share,
                 // SUBA-N03: pi's `artifactsDir: artifactConfig.enabled ? artifactsDir : undefined`
@@ -3560,6 +3631,9 @@ impl SubagentExecutor {
         }
 
         let mut state = FleetState {
+            // SUBA-048 / pi `state.artifactDirPreference` (`extension/index.ts:375`), seeded from
+            // `config.artifactDir` and read by `fleetArtifactsRoot` (`fleet.ts:334-340`).
+            artifact_dir_preference: self.config_snapshot().await.artifact_dir_preference(),
             base_cwd: cwd.to_path_buf(),
             current_session_id,
             parent_session_file,
@@ -5289,6 +5363,170 @@ const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently supports li
 ///   ([`subagent_tool_parameters`]), which does name `stop` and which both registrations share.
 const CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate to subagents from child-safe fanout mode.\nAllowed management/control actions: list, get, status, interrupt, resume, steer, append-step, doctor.\nMutating management actions (create, update, delete, eject, disable, enable, reset, grant-spawn-budget) are blocked in this mode.";
 
+/// SUBA-038/SUBA-065 — the tool's advertised management/control verbs, as ONE source of truth.
+///
+/// pi has `SUBAGENT_ACTIONS` (`shared/types.ts:1885` @v0.43.0 / `:1968` @v0.47.1) and both the JSON
+/// Schema `action` enum and the unknown-action message read it. cyrup hand-wrote the list in three
+/// places and two of them drifted: the management unknown-action text omitted the four `watchdog.*`
+/// verbs that DO dispatch, and the control-arm text omitted `stop`. A model recovering from a typo
+/// was therefore steered away from verbs that exist.
+///
+/// Order is pi's own (`stop` between `steer` and `append-step`, `shared/types.ts:1885`). This is
+/// cyrup's CURRENT surface, not upstream's full 53 — the missing verbs have their own items
+/// (SUBA-016, SUBA-046, SUBA-055, SUBA-057, …) and each adds its name here when it lands.
+const SUBAGENT_ACTIONS: &[&str] = &[
+    "list",
+    "get",
+    "models",
+    "create",
+    "update",
+    "delete",
+    "eject",
+    "disable",
+    "enable",
+    "reset",
+    "status",
+    "interrupt",
+    "resume",
+    "steer",
+    "stop",
+    "append-step",
+    "doctor",
+    "mission.create",
+    "mission.list",
+    "mission.show",
+    "mission.update",
+    "mission.attach-run",
+    "mission.close",
+    "watchdog.status",
+    "watchdog.check",
+    "watchdog.configure",
+    "watchdog.recommend-model",
+];
+
+/// SUBA-065 — pi `DESTRUCTIVE_MANAGEMENT_ACTIONS`
+/// (`runs/foreground/subagent-executor.ts:168` @v0.47.1), ported VERBATIM including the verbs cyrup
+/// does not yet dispatch: the set exists to make the did-you-mean rule STRICTER for these
+/// candidates, so carrying a name cyrup has not implemented costs nothing and carrying one fewer
+/// would silently loosen the gate the day that verb lands.
+///
+/// Distinct from [`crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS`], which is a
+/// different, smaller set serving the child-safe denylist.
+const DESTRUCTIVE_MANAGEMENT_ACTIONS: &[&str] = &[
+    "delete",
+    "eject",
+    "disable",
+    "reset",
+    "mission.close",
+    "worktree.discard",
+    "refine.rollback",
+    "inspector.close",
+    "project.close",
+    "stop",
+    "interrupt",
+    "reject-checkpoint",
+    "schedule.delete",
+];
+
+/// SUBA-065 — pi `editDistance` (`subagent-executor.ts:170-184` @v0.47.1): the standard
+/// single-row Levenshtein, ported with upstream's own row-reuse shape so the two cannot drift on an
+/// edge case.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for left_index in 1..=left.len() {
+        // Every index below is in range by construction (`previous.len() == right.len() + 1`), but
+        // the crate denies `clippy::indexing_slicing`, so each read goes through `get`/`get_mut`
+        // with a saturating fallback rather than a panic path.
+        let mut diagonal = previous.first().copied().unwrap_or(0);
+        if let Some(slot) = previous.get_mut(0) {
+            *slot = left_index;
+        }
+        for right_index in 1..=right.len() {
+            let above = previous.get(right_index).copied().unwrap_or(0);
+            let left_char = left.get(left_index - 1);
+            let right_char = right.get(right_index - 1);
+            let next = if left_char.is_some() && left_char == right_char {
+                diagonal
+            } else {
+                let west = previous.get(right_index - 1).copied().unwrap_or(0);
+                diagonal.min(above).min(west) + 1
+            };
+            if let Some(slot) = previous.get_mut(right_index) {
+                *slot = next;
+            }
+            diagonal = above;
+        }
+    }
+    previous.last().copied().unwrap_or(0)
+}
+
+/// SUBA-065 — pi `hasSingleAdjacentTransposition` (`subagent-executor.ts:186-192` @v0.47.1):
+/// equal-length strings differing only by one swap of adjacent characters (`statsu` vs `status`),
+/// which Levenshtein scores 2 and would otherwise miss.
+fn has_single_adjacent_transposition(left: &str, right: &str) -> bool {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.len() != right.len() {
+        return false;
+    }
+    let Some(mismatch) = left.iter().zip(right.iter()).position(|(l, r)| l != r) else {
+        return false;
+    };
+    // pi indexes `left[mismatch + 1]` / `right[mismatch + 1]` directly; JS yields `undefined` past
+    // the end and `undefined === undefined` is TRUE, so a mismatch at the final index would pass
+    // upstream's first two tests. It still fails the tail comparison only if the tails differ —
+    // and with `mismatch` at the last index both tails are empty, so upstream would return TRUE for
+    // e.g. ("ab", "ac"). That is unreachable in practice (a final-character mismatch means
+    // `left[mismatch] != right[mismatch]`, and the test `left[mismatch] === right[mismatch+1]`
+    // compares a real char against `undefined`, which is FALSE). Rust's bounds check reaches the
+    // same answer without the ambiguity.
+    let Some(&l_next) = left.get(mismatch + 1) else {
+        return false;
+    };
+    let Some(&r_next) = right.get(mismatch + 1) else {
+        return false;
+    };
+    let (Some(&l_at), Some(&r_at)) = (left.get(mismatch), right.get(mismatch)) else {
+        return false;
+    };
+    let (Some(l_tail), Some(r_tail)) = (left.get(mismatch + 2..), right.get(mismatch + 2..)) else {
+        return false;
+    };
+    l_at == r_next && l_next == r_at && l_tail == r_tail
+}
+
+/// SUBA-038/SUBA-065 — pi `unknownSubagentActionMessage`
+/// (`runs/foreground/subagent-executor.ts:195-208` @v0.47.1, from `28b9222`). At v0.43.0 the text
+/// was the bare `Unknown action: ${action}. Valid: …` (`:4861`); this is the richer v0.47.1 form
+/// that supersedes it.
+///
+/// The ASYMMETRIC destructive rule is the load-bearing half and is reproduced exactly: an ordinary
+/// candidate matches on `distance <= max(1, floor(len/4))` OR a single adjacent transposition, but
+/// a DESTRUCTIVE candidate matches only on `distance === 1 && requested.length >= candidate.length
+/// - 1`. That is what stops a loose typo being nudged toward `delete`. Porting a naive did-you-mean
+/// without it would be strictly worse than the wall of names it replaces.
+fn unknown_subagent_action_message(action: &str) -> String {
+    let requested = action.to_lowercase();
+    let suggestion = SUBAGENT_ACTIONS.iter().find(|candidate| {
+        let distance = edit_distance(&requested, candidate);
+        if DESTRUCTIVE_MANAGEMENT_ACTIONS.contains(*candidate) {
+            return distance == 1 && requested.chars().count() + 1 >= candidate.chars().count();
+        }
+        distance <= std::cmp::max(1, candidate.chars().count() / 4)
+            || has_single_adjacent_transposition(&requested, candidate)
+    });
+    let next_step = "Use subagent({ action: \"status\" }) to inspect runs or subagent({ action: \"list\" }) to inspect agents.";
+    let valid_actions = format!("Valid: {}.", SUBAGENT_ACTIONS.join(", "));
+    match suggestion {
+        Some(candidate) => {
+            format!("Unknown action: {action}. Did you mean {candidate}? {next_step} {valid_actions}")
+        }
+        None => format!("Unknown action: {action}. {next_step} {valid_actions}"),
+    }
+}
+
 /// pi's refusal text for an `action` that is present but blank, adapted — see
 /// [`normalize_public_subagent_execution`] for the `[CYRUP-DELTA]` on its second clause.
 const BLANK_ACTION_REFUSAL: &str = "action must be a non-empty management/control action, or omit \
@@ -5419,6 +5657,20 @@ struct SubagentToolParams {
     output_mode: Option<String>,
     skill: Option<serde_json::Value>,
     model: Option<String>,
+    /// SUBA-043 / pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0), read by
+    /// `runSinglePath` at `runs/foreground/subagent-executor.ts:3651,3671` and written into the
+    /// child's structured-output env pair by `runs/shared/pi-args.ts:759-762`. Carried raw here for
+    /// the same reason every other open sub-shape is: the capture runtime
+    /// ([`crate::exec::structured::create_structured_output_runtime`]) writes the schema verbatim to
+    /// the file the child reads, so nothing on this side needs it typed.
+    output_schema: Option<serde_json::Value>,
+    /// SUBA-047 / pi `params.toolBudget` (`extension/schemas.ts:354` @v0.43.0). Raw here and
+    /// validated at the dispatch boundary through
+    /// [`crate::exec::tool_budget::validate_tool_budget_config`] — pi's own
+    /// `validateToolBudgetConfig(toolBudgetInput, "toolBudget")`
+    /// (`runs/background/async-execution.ts:1298-1299`) — so a malformed budget is refused before
+    /// any child spawns rather than degrading to "no budget".
+    tool_budget: Option<serde_json::Value>,
     acceptance: Option<serde_json::Value>,
     /// The six mission parameters (`extension/schemas.ts:297-301` + `:302-304` @v0.43.0), read by
     /// [`crate::missions`]: `missionId`/`mission` bind a launch to a mission and are also the
@@ -5633,6 +5885,8 @@ impl SubagentToolParams {
         if self.output_mode.is_some() { keys.push("outputMode"); }
         if self.skill.is_some() { keys.push("skill"); }
         if self.model.is_some() { keys.push("model"); }
+        if self.output_schema.is_some() { keys.push("outputSchema"); }
+        if self.tool_budget.is_some() { keys.push("toolBudget"); }
         if self.acceptance.is_some() { keys.push("acceptance"); }
         if self.mission_id.is_some() { keys.push("missionId"); }
         if self.mission.is_some() { keys.push("mission"); }
@@ -6264,6 +6518,28 @@ fn sj_json_schema_object() -> serde_json::Value {
     serde_json::json!({ "type": "object", "additionalProperties": true })
 }
 
+/// SUBA-047 — `ToolBudgetOverride` (`extension/schemas.ts:116-120` @v0.43.0), including its
+/// `additionalProperties: false` and its description, verbatim. `block` is `ToolBudgetBlock`
+/// (`:112-117`): either an array of tool names or the literal `"*"`.
+fn sj_tool_budget_override() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hard"],
+        "properties": {
+            "soft": { "type": "integer", "minimum": 1 },
+            "hard": { "type": "integer", "minimum": 1 },
+            "block": {
+                "anyOf": [
+                    { "type": "array", "items": { "type": "string" } },
+                    { "type": "string", "enum": ["*"] }
+                ]
+            }
+        },
+        "description": "Optional child tool-call budget. soft nudges the child; after hard, block tools (default read/grep/find/ls, or '*' for all tools) are blocked so the child can finalize."
+    })
+}
+
 /// `TaskItem` (`schemas.ts:78-90`): one top-level PARALLEL `tasks[]` element (agent+task required).
 fn sj_task_item() -> serde_json::Value {
     serde_json::json!({
@@ -6554,7 +6830,9 @@ fn subagent_tool_parameters() -> serde_json::Value {
         // "stop", "append-step", …`). Advertised together with its `route_control_action` dispatch
         // arm (`SubagentExecutor::control_stop`) in this same change, per the crate's
         // advertise-vs-dispatch invariant.
-        "enum": ["list", "get", "models", "create", "update", "delete", "eject", "disable", "enable", "reset", "status", "interrupt", "resume", "steer", "stop", "append-step", "doctor", "mission.create", "mission.list", "mission.show", "mission.update", "mission.attach-run", "mission.close", "watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model"],
+        // SUBA-038: derived from [`SUBAGENT_ACTIONS`], not hand-written — a hand-written copy is
+        // exactly what let the two unknown-action messages drift away from what dispatches.
+        "enum": SUBAGENT_ACTIONS,
         "description": "Management/control action. Omit for execution mode."
     }));
     // G90 (advertise-vs-dispatch, the OTHER direction): these three, plus `message` below, are the
@@ -6655,6 +6933,26 @@ fn subagent_tool_parameters() -> serde_json::Value {
         "description": "Skill name(s) to make available (comma-separated), array of strings, or boolean (false disables, true uses default)"
     }));
     props.insert("model".to_string(), serde_json::json!({ "type": "string", "description": "Override model for single agent (e.g. 'anthropic/claude-sonnet-4')" }));
+    // SUBA-043 / pi `extension/schemas.ts:351` @v0.43.0 — `outputSchema:
+    // Type.Optional(JsonSchemaObject)` is a TOP-LEVEL `SubagentParamsSchema` property, in exactly
+    // this position (after `model`, before `agentContract`/`acceptance`) under upstream's "Workflow
+    // defaults forwarded to each child" comment. It was advertised only on the `tasks[]`/`chain[]`
+    // ITEM schemas here, which made the capability SUBA-S01 landed — schema in, typed JSON out —
+    // unreachable from the SINGLE surface a model actually calls: `subagent({agent, task,
+    // outputSchema})` parsed (the root schema is `additionalProperties: true`), dropped the schema
+    // without error, and returned free prose. The only workaround was a one-item `tasks:[…]`.
+    // pi gives the top-level entry no description of its own, so neither does this.
+    props.insert("outputSchema".to_string(), sj_json_schema_object());
+    // SUBA-047 / pi `extension/schemas.ts:354` @v0.43.0 — `toolBudget:
+    // Type.Optional(ToolBudgetOverride)`, shape at `:116-120` (`soft?`, `hard`, `block?`), with
+    // upstream's description verbatim. In-baseline since before the ported tag.
+    //
+    // The ENFORCEMENT half has been complete since SUBA-007 (`exec/tool_budget.rs` + the
+    // `TOOL_BUDGET_ENV` hand-off at `exec/mod.rs`), and the frontmatter key is read at
+    // `discovery/frontmatter.rs:880` — but the param was never advertised, so the only way to bound
+    // a delegation's tool spend was to edit the agent file on disk and a per-call budget passed by
+    // an orchestrator was silently discarded.
+    props.insert("toolBudget".to_string(), sj_tool_budget_override());
     props.insert("acceptance".to_string(), serde_json::json!({
         "anyOf": [
             { "type": "string", "enum": ["auto", "none", "attested", "checked", "verified", "reviewed"] },
@@ -7195,6 +7493,16 @@ impl SubagentTool {
             // pi's own `? :` truthiness gate, so an explicit `false` behaves exactly like an
             // omitted flag.
             include_progress: p.include_progress,
+            // SUBA-043 / pi `params.outputSchema` (`subagent-executor.ts:3651,3671` @v0.43.0).
+            output_schema: p.output_schema.clone(),
+            // SUBA-047 / pi `validateToolBudgetConfig(params.toolBudget, "toolBudget")`
+            // (`async-execution.ts:1299`): a malformed budget is a hard refusal at the tool
+            // boundary, with pi's own message text, not a silent downgrade to "unbudgeted".
+            tool_budget: crate::exec::tool_budget::validate_tool_budget_config(
+                p.tool_budget.as_ref(),
+                "toolBudget",
+            )
+            .map_err(ToolError::new)?,
         };
 
         // pi's own `validateFileOnlyOutputMode` gate (`single-output.ts:140-145`, applied at
@@ -7295,6 +7603,20 @@ impl SubagentTool {
             let run_id = self
                 .executor
                 .spawn_background(BackgroundSingleRequest {
+                    // SUBA-043 / pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0):
+                    // the async SINGLE branch forwards the top-level schema exactly as the
+                    // foreground branch does, so `{agent, task, outputSchema, async:true}` is not a
+                    // silently weaker call than the same request without `async`.
+                    structured_output_schema: p.output_schema.clone(),
+                    // SUBA-047 / pi `validateToolBudgetConfig(params.toolBudget, "toolBudget")`
+                    // (`async-execution.ts:1299` @v0.43.0). Validated here for the same reason the
+                    // foreground branch validates it: a malformed budget must refuse the call, not
+                    // silently downgrade to "unbudgeted".
+                    tool_budget: crate::exec::tool_budget::validate_tool_budget_config(
+                        p.tool_budget.as_ref(),
+                        "toolBudget",
+                    )
+                    .map_err(ToolError::new)?,
                     cwd,
                     agent_name: agent,
                     task: &task,
@@ -7606,12 +7928,12 @@ impl SubagentTool {
                     ..Default::default()
                 })
             }
-            other => Err(ToolError::new(format!(
-                "unknown subagent action '{other}'; valid actions are list, get, models, create, \
-                 update, delete, eject, disable, enable, reset, status, interrupt, resume, steer, \
-                 stop, append-step, doctor, mission.create, mission.list, mission.show, \
-                 mission.update, mission.attach-run, mission.close."
-            ))),
+            // SUBA-038/SUBA-065 / pi `unknownSubagentActionMessage`
+            // (`subagent-executor.ts:195-208` @v0.47.1, reached from `:4861`'s successor). This was
+            // cyrup's own `unknown subagent action '{other}'; valid actions are …` with a
+            // HAND-WRITTEN list that omitted the four `watchdog.*` verbs that do dispatch — so a
+            // model recovering from the error was steered away from verbs that exist.
+            other => Err(ToolError::new(unknown_subagent_action_message(other))),
         }
     }
 
@@ -7695,10 +8017,13 @@ impl SubagentTool {
         if !self.allow_mutating_management
             && crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS.contains(&action)
         {
+            // SUBA-038 / pi `Action '${action}' is not available from child-safe subagent fanout
+            // mode.` (`subagent-executor.ts:4867` @v0.43.0, and the identical text at `:4380`
+            // /`:4385` for the herdr arms). This was cyrup's own "subagent management action '…' is
+            // blocked in child-safe fanout mode; <list> are not permitted here." — a different
+            // sentence AND a different amount of information than pi gives.
             return Err(ToolError::new(format!(
-                "subagent management action '{action}' is blocked in child-safe fanout mode; {} are \
-                 not permitted here.",
-                crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS.join(", ")
+                "Action '{action}' is not available from child-safe subagent fanout mode."
             )));
         }
         let cfg = SubagentExecutor::discovery_config(cwd).map_err(|e| ToolError::new(e.to_string()))?;
@@ -7774,6 +8099,47 @@ impl SubagentTool {
         p: &SubagentToolParams,
         cwd: &Path,
     ) -> Result<ToolResult, ToolError> {
+        // SUBA-064 / pi `subagent-executor.ts:4412-4423` @v0.43.0. The authority consult sits
+        // BEFORE dispatch and covers `stop`→`stopRun`, `steer`→`steerRun` (and `schedule.create`
+        // →`scheduleCreate` once SUBA-016 lands). Every other control verb is ungated upstream and
+        // must stay ungated here, which is why the mapping returns `None` for them rather than
+        // this arm defaulting to "gated".
+        if let Some(policy_action) = crate::registration::authority::AuthorityAction::for_tool_action(action) {
+            use crate::registration::authority as auth;
+            let policy = self.executor.config_snapshot().await.authority_policy;
+            match auth::resolve_authority_decision(policy_action, policy.as_ref()) {
+                auth::AuthorityDecision::Auto => {}
+                auth::AuthorityDecision::Forbid => {
+                    return Err(ToolError::new(auth::forbidden_message(action)));
+                }
+                auth::AuthorityDecision::Confirm => {
+                    // pi `if (!ctx.hasUI) return …` (`:4419`): with no interactive UI there is
+                    // nobody to grant the authority, so the action is refused rather than
+                    // silently auto-granted. cyrup's `hasUI` is "a live host-services surface
+                    // exists"; without one `HostServices::confirm`'s own default is `false`
+                    // (deny), so the two agree even if this branch is ever bypassed.
+                    let Some(services) = self.executor.host_services() else {
+                        return Err(ToolError::new(auth::no_ui_message(action)));
+                    };
+                    if !services.confirm(
+                        &auth::confirm_prompt(action),
+                        &auth::confirm_message(action),
+                        &cyrup_ext::host::DialogOptions::default(),
+                    ) {
+                        // pi returns the DECLINED text WITHOUT `isError: true` (`:4421`) — a user
+                        // declining is a choice, not a failure — so this is an Ok result, not an
+                        // `Err`, and it is the one refusal on this path that is not a `ToolError`.
+                        return Ok(ToolResult {
+                            content: vec![cyrup_core::Content::text(auth::declined_message(action))],
+                            details: Some(serde_json::json!({ "mode": "management" })),
+                            terminate: false,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+
         let index = p.index.and_then(|value| usize::try_from(value).ok());
         let outcome = match action {
             "status" => {
@@ -7849,10 +8215,13 @@ impl SubagentTool {
                     .control_append_step(cwd, target, p.chain.as_deref().unwrap_or(&[]))
                     .await
             }
-            other => Err(format!(
-                "unknown subagent control action '{other}'; valid control actions are status, \
-                 interrupt, resume, steer, append-step."
-            )),
+            // SUBA-038 residual 3: this arm is defensively unreachable (only the six control verbs
+            // reach `route_control_action`), but it listed "status, interrupt, resume, steer,
+            // append-step" and omitted `stop` — which IS advertised and IS dispatched two arms up.
+            // Upstream has no separate control-arm message at all: every unknown action lands on
+            // the one `unknownSubagentActionMessage` (`subagent-executor.ts:195`), so routing here
+            // through the same function is the port, and it cannot drift again by construction.
+            other => Err(unknown_subagent_action_message(other)),
         };
         match outcome {
             Ok(text) => Ok(ToolResult {
@@ -9241,9 +9610,15 @@ impl NativeExtension for SubagentsExtension {
                         ))
                     })?;
                 crate::artifacts::cleanup_old_chain_dirs(&self.cwd);
+                // SUBA-059 / pi `const artifactCleanupDays = config.artifactConfig?.cleanupDays ??
+                // DEFAULT_ARTIFACT_CONFIG.cleanupDays; cleanupAllArtifactDirs(artifactCleanupDays);`
+                // (`extension/index.ts:369-370` @v0.47.1). This was the hardcoded 7-day constant, so
+                // a user who wanted subagent transcripts kept for audit — or deleted sooner, or not
+                // swept at all — had no way to say so, and every extension load silently deleted run
+                // inputs, outputs and JSONL older than a week.
                 crate::artifacts::cleanup_all_artifact_dirs(
                     &self.cwd,
-                    crate::artifacts::DEFAULT_CLEANUP_DAYS,
+                    self.executor.config_snapshot().await.artifact_cleanup_days(),
                 );
 
                 api.register_tool(Arc::new(
@@ -9408,11 +9783,23 @@ impl NativeExtension for SubagentsExtension {
                 if let Some(session_file) =
                     self.executor.host_services().and_then(|s| s.session_file())
                 {
-                    let artifacts_dir =
-                        crate::artifacts::resolve_artifacts_dir(Some(&session_file), None, &ctx.cwd);
+                    let cfg = self.executor.config_snapshot().await;
+                    // SUBA-048 / pi `getArtifactsDir(sessionFile, undefined,
+                    // state.artifactDirPreference)` — the per-session sweep must look where the
+                    // configured preference actually WRITES, or `"artifactDir": "temp"` would leave
+                    // its own artifacts unswept forever.
+                    let artifacts_dir = crate::artifacts::resolve_artifacts_dir(
+                        Some(&session_file),
+                        None,
+                        &ctx.cwd,
+                        cfg.artifact_dir_preference(),
+                    );
+                    // SUBA-059: the per-session sweep honours the same configured retention the
+                    // once-per-load sweep does (pi passes the resolved `artifactCleanupDays` to both,
+                    // `extension/index.ts:370,684-693`).
                     crate::artifacts::cleanup_old_artifacts(
                         &artifacts_dir,
-                        crate::artifacts::DEFAULT_CLEANUP_DAYS,
+                        cfg.artifact_cleanup_days(),
                     );
                 }
 
@@ -9553,7 +9940,7 @@ impl NativeExtension for SubagentsExtension {
             // user/project/package resource still wins — the bundled skill is a floor, never an
             // override. A contribution of nothing at all returns `Noop`, which leaves the
             // discovered registry untouched (the host's own early return, `builder.rs:997`).
-            HostEvent::ResourcesDiscover => {
+            HostEvent::ResourcesDiscover { .. } => {
                 let skill_paths: Vec<String> = crate::registration::resources::bundled_skill_files()
                     .iter()
                     .map(|p| p.display().to_string())
@@ -10072,6 +10459,8 @@ impl SubagentsExtension {
                     let run_id = self
                         .executor
                         .spawn_background(BackgroundSingleRequest {
+                            structured_output_schema: None,
+                            tool_budget: None,
                             cwd,
                             agent_name: &parsed.agent,
                             task: &parsed.task,
@@ -10467,6 +10856,8 @@ impl SubagentsExtension {
             let run_id = self
                 .executor
                 .spawn_background(BackgroundSingleRequest {
+                    structured_output_schema: None,
+                    tool_budget: None,
                     cwd: &effective_cwd,
                     agent_name: &run.agent,
                     task: &run.task,
@@ -14136,13 +14527,27 @@ mod tests {
         let unknown_err = dispatch(&tool, serde_json::json!({ "action": "frobnicate" }))
             .await
             .expect_err("an unknown action is rejected");
-        assert!(unknown_err.to_string().contains("unknown subagent action 'frobnicate'"));
+        // SUBA-038/SUBA-065: pi's own text (`unknownSubagentActionMessage`,
+        // `subagent-executor.ts:195-208` @v0.47.1), not cyrup's former
+        // "unknown subagent action '…'; valid actions are …".
+        assert!(
+            unknown_err.to_string().starts_with("Unknown action: frobnicate."),
+            "got: {unknown_err}"
+        );
         // The unknown-action message must enumerate the actions that DO dispatch, so a model that
         // guessed wrong is told the real set (SUBA-005 widened it by four).
         for action in crate::discovery::management::MANAGEMENT_ACTIONS {
             assert!(
                 unknown_err.to_string().contains(action),
                 "the unknown-action error must list '{action}'; got: {unknown_err}"
+            );
+        }
+        // SUBA-038 residual 2: the four `watchdog.*` verbs DO dispatch, and the hand-written list
+        // this replaced omitted all four.
+        for action in crate::watchdog::tool_actions::WATCHDOG_TOOL_ACTIONS {
+            assert!(
+                unknown_err.to_string().contains(action),
+                "the unknown-action error must list the dispatching '{action}'; got: {unknown_err}"
             );
         }
     }
@@ -14199,9 +14604,13 @@ mod tests {
             let err = result.err().unwrap_or_else(|| {
                 panic!("child-safe mode must refuse the mutating action '{action}'")
             });
-            assert!(
-                err.to_string().contains("blocked in child-safe fanout mode"),
-                "action '{action}' must be refused by the T6 denylist; got: {err}"
+            // SUBA-038: EQUALITY against pi's own text (`subagent-executor.ts:4867` @v0.43.0),
+            // not a substring of cyrup's former wording — the substring assertion is what let the
+            // divergence sit unnoticed.
+            assert_eq!(
+                err.to_string(),
+                format!("Action '{action}' is not available from child-safe subagent fanout mode."),
+                "action '{action}' must be refused by the T6 denylist with pi's exact text"
             );
         }
 
@@ -14715,6 +15124,8 @@ mod tests {
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                structured_output_schema: None,
+                tool_budget: None,
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
@@ -14817,6 +15228,362 @@ mod tests {
         );
     }
 
+    /// SUBA-064 — the `authorityPolicy` gate on the live `stop`/`steer` verbs.
+    ///
+    /// THE USER ACTION: an operator writes `"authorityPolicy": {"stopRun": "forbid"}` into
+    /// `config.json`. Before the port the key was silently dropped — `registration/mod.rs`'s only
+    /// validator was `validate_missions` — and `{action:"stop", id}` executed anyway. Unlike most
+    /// gaps in this area the gated actions are already live in cyrup, so this was not a dormant
+    /// hole: it was a policy surface a user could configure and that did nothing.
+    ///
+    /// Driven through the real tool so the gate is proven to sit BEFORE dispatch (pi
+    /// `subagent-executor.ts:4412-4423` @v0.43.0): the run id below does not exist, so an ungated
+    /// call fails with a run-not-found error — a forbid that produces the authority text instead is
+    /// proof the gate fired first.
+    #[tokio::test]
+    async fn a_forbidding_authority_policy_refuses_stop_before_it_dispatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(SubagentExecutor::new());
+        *executor.config.lock().await = SubagentExtensionConfig {
+                authority_policy: Some(crate::registration::authority::AuthorityPolicyConfig {
+                    stop_run: Some(crate::registration::authority::AuthorityDecision::Forbid),
+                    ..crate::registration::authority::AuthorityPolicyConfig::default()
+                }),
+            ..SubagentExtensionConfig::default()
+        };
+        let tool = SubagentTool::new(Arc::clone(&executor), dir.path().to_path_buf());
+
+        let err = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "nope" }))
+            .await
+            .expect_err("a forbidden action must refuse");
+        assert_eq!(
+            err.to_string(),
+            "Authority policy forbids action 'stop'.",
+            "pi's exact text (`subagent-executor.ts:4415`)"
+        );
+
+        // The mirror, and the half that proves the gate is not simply refusing everything: an
+        // UNGATED control verb is untouched by the same policy and still reaches dispatch (which
+        // fails on the unknown run, not on authority).
+        let untouched = dispatch_tool(&tool, serde_json::json!({ "action": "interrupt", "id": "nope" }))
+            .await
+            .expect_err("the run does not exist");
+        assert!(
+            !untouched.to_string().contains("Authority policy"),
+            "`interrupt` is not one of pi's AUTHORITY_ACTIONS: {untouched}"
+        );
+
+        // ...and `steer` under the SAME policy is likewise ungated, because only `stopRun` was set.
+        let steer = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "steer", "id": "nope", "message": "hi" }),
+        )
+        .await
+        .expect_err("the run does not exist");
+        assert!(
+            !steer.to_string().contains("Authority policy"),
+            "an unconfigured action keeps its `auto` default: {steer}"
+        );
+    }
+
+    /// SUBA-064's no-UI branch (pi `:4419`): `confirm` with nothing to confirm THROUGH is a
+    /// refusal, never a silent auto-grant. This test's executor has no host services attached,
+    /// which is exactly upstream's `!ctx.hasUI`.
+    #[tokio::test]
+    async fn a_confirming_authority_policy_refuses_when_the_session_has_no_ui() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(SubagentExecutor::new());
+        *executor.config.lock().await = SubagentExtensionConfig {
+                authority_policy: Some(crate::registration::authority::AuthorityPolicyConfig {
+                    steer_run: Some(crate::registration::authority::AuthorityDecision::Confirm),
+                    ..crate::registration::authority::AuthorityPolicyConfig::default()
+                }),
+            ..SubagentExtensionConfig::default()
+        };
+        let tool = SubagentTool::new(Arc::clone(&executor), dir.path().to_path_buf());
+
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "steer", "id": "nope", "message": "hi" }),
+        )
+        .await
+        .expect_err("no UI means no authority");
+        assert_eq!(
+            err.to_string(),
+            "Authority policy requires user confirmation for action 'steer', but this session has \
+             no interactive UI."
+        );
+    }
+
+    /// SUBA-065 — pi `unknownSubagentActionMessage` (`subagent-executor.ts:195-208` @v0.47.1,
+    /// from `28b9222`), including the ASYMMETRIC destructive-candidate rule.
+    ///
+    /// THE INTERESTING HALF is not the suggestion, it is the gate: a naive did-you-mean would nudge
+    /// a typo toward `delete`, `eject`, `stop` or `interrupt`. Upstream applies
+    /// `distance === 1 && requested.length >= candidate.length - 1` to destructive candidates and
+    /// the looser `distance <= max(1, floor(len/4)) || singleAdjacentTransposition` to everything
+    /// else. Ported verbatim; this test is what stops someone "improving" the message casually.
+    #[test]
+    fn the_unknown_action_message_suggests_safely() {
+        // A near miss on a SAFE verb is suggested.
+        let statu = unknown_subagent_action_message("statu");
+        assert!(statu.starts_with("Unknown action: statu. Did you mean status?"), "{statu}");
+        // …and the message always carries the next-step hint and the full valid list.
+        assert!(statu.contains(r#"Use subagent({ action: "status" }) to inspect runs"#), "{statu}");
+        assert!(statu.ends_with(&format!("Valid: {}.", SUBAGENT_ACTIONS.join(", "))), "{statu}");
+
+        // A transposition Levenshtein scores 2 is still caught, on a safe verb.
+        let statsu = unknown_subagent_action_message("statsu");
+        assert!(statsu.contains("Did you mean status?"), "{statsu}");
+
+        // A DESTRUCTIVE candidate needs distance EXACTLY 1 AND `requested.length >=
+        // candidate.length - 1`. `dele`/`del` are distance 2 and 3 from `delete`, and `res` is
+        // distance 2 from `reset` — a naive prefix-or-typo heuristic would happily suggest all
+        // three, which is exactly the nudge-toward-`delete` failure upstream's asymmetry prevents.
+        for loose_typo in ["dele", "del", "res"] {
+            let message = unknown_subagent_action_message(loose_typo);
+            for destructive in DESTRUCTIVE_MANAGEMENT_ACTIONS {
+                assert!(
+                    !message.contains(&format!("Did you mean {destructive}?")),
+                    "a loose typo {loose_typo:?} must never be nudged toward the destructive \
+                     '{destructive}': {message}"
+                );
+            }
+        }
+
+        // The rule is not "never suggest a destructive verb": distance 1 with a long-enough
+        // request still does, which is upstream's own behaviour.
+        let delet = unknown_subagent_action_message("delet");
+        assert!(delet.contains("Did you mean delete?"), "{delet}");
+
+        // No near candidate at all → the plain form, with no "Did you mean".
+        let nothing = unknown_subagent_action_message("frobnicate");
+        assert_eq!(
+            nothing,
+            format!(
+                "Unknown action: frobnicate. Use subagent({{ action: \"status\" }}) to inspect runs \
+                 or subagent({{ action: \"list\" }}) to inspect agents. Valid: {}.",
+                SUBAGENT_ACTIONS.join(", ")
+            )
+        );
+
+        // The list the message publishes must be exactly what dispatches — the drift SUBA-038
+        // named. Derived from the schema, which is itself derived from `SUBAGENT_ACTIONS`.
+        let advertised: Vec<String> = subagent_tool_parameters()["properties"]["action"]["enum"]
+            .as_array()
+            .expect("the action property advertises an enum")
+            .iter()
+            .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+            .collect();
+        assert_eq!(advertised, SUBAGENT_ACTIONS.iter().map(|a| (*a).to_string()).collect::<Vec<_>>());
+    }
+
+    /// SUBA-065's two primitives, pinned against upstream's own algorithms so a later refactor of
+    /// the message cannot quietly change which candidates match.
+    #[test]
+    fn edit_distance_and_transposition_match_pis_definitions() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+        assert_eq!(edit_distance("status", "status"), 0);
+        assert_eq!(edit_distance("statu", "status"), 1);
+        assert_eq!(edit_distance("statsu", "status"), 2);
+        assert_eq!(edit_distance("delet", "delete"), 1);
+        assert_eq!(edit_distance("dele", "delete"), 2);
+
+        assert!(has_single_adjacent_transposition("statsu", "status"));
+        assert!(!has_single_adjacent_transposition("status", "status"));
+        assert!(!has_single_adjacent_transposition("statu", "status"), "different lengths");
+        // `acb` and `abc` differ only by the adjacent swap at index 1.
+        assert!(has_single_adjacent_transposition("acb", "abc"));
+        // A mismatch at the FINAL index has no adjacent partner to swap with.
+        assert!(!has_single_adjacent_transposition("ab", "ac"));
+    }
+
+    /// SUBA-043 + SUBA-047 — the two capabilities that were implemented and unadvertised.
+    ///
+    /// THE USER ACTION: an orchestrator calls `subagent({agent, task, outputSchema:{…}})` to get
+    /// typed JSON back, or `subagent({agent, task, toolBudget:{hard:3}})` to bound one delegation's
+    /// tool spend. Both were accepted (the root schema is `additionalProperties: true` and
+    /// `SubagentToolParams` has no `deny_unknown_fields`), both were dropped without error, and both
+    /// capabilities were fully built underneath — `outputSchema` by SUBA-S01, `toolBudget` by
+    /// SUBA-007. Reachable only by wrapping a one-item `tasks:[…]`, or by editing the agent file.
+    ///
+    /// Asserted at the surface: advertised, deserialized, and — via the sibling guard
+    /// [`tests::every_advertised_schema_property_is_read_outside_provided_keys`] — consumed.
+    #[test]
+    fn output_schema_and_tool_budget_are_advertised_and_deserialized_at_the_top_level() {
+        let props = subagent_tool_parameters()["properties"]
+            .as_object()
+            .expect("properties object")
+            .clone();
+        for name in ["outputSchema", "toolBudget"] {
+            assert!(
+                props.contains_key(name),
+                "'{name}' is honoured on both single paths, so it must be advertised"
+            );
+        }
+        // pi `extension/schemas.ts:116-120`: `hard` is REQUIRED and the object is closed.
+        assert_eq!(props["toolBudget"]["required"], serde_json::json!(["hard"]));
+        assert_eq!(props["toolBudget"]["additionalProperties"], serde_json::json!(false));
+        // pi gives the top-level `outputSchema` no description of its own, and the shape is the
+        // same open `JsonSchemaObject` the `tasks[]` item schema already used.
+        assert_eq!(props["outputSchema"], sj_json_schema_object());
+
+        let parsed: SubagentToolParams = serde_json::from_value(serde_json::json!({
+            "agent": "x",
+            "task": "y",
+            "outputSchema": { "type": "object", "properties": { "n": { "type": "number" } }, "required": ["n"] },
+            "toolBudget": { "hard": 3 }
+        }))
+        .expect("params parse");
+        assert_eq!(
+            parsed.output_schema,
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": { "n": { "type": "number" } },
+                "required": ["n"]
+            })),
+            "the schema must survive deserialization, not be eaten by the permissive parse"
+        );
+        assert_eq!(parsed.tool_budget, Some(serde_json::json!({ "hard": 3 })));
+        // `provided_keys()` is what the dispatch surface reports as "you supplied these", so both
+        // must appear there too or an unknown-action error would still not explain the failure.
+        let keys = parsed.provided_keys();
+        assert!(keys.contains(&"outputSchema"), "{keys:?}");
+        assert!(keys.contains(&"toolBudget"), "{keys:?}");
+    }
+
+    /// SUBA-047's refusal half — pi `validateToolBudgetConfig(params.toolBudget, "toolBudget")`
+    /// (`runs/background/async-execution.ts:1299` @v0.43.0). A malformed budget must refuse the
+    /// call with the validator's own message; silently downgrading to "unbudgeted" is the same
+    /// silent-drop defect one layer down.
+    #[tokio::test]
+    async fn a_malformed_tool_budget_is_refused_on_both_single_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = scoped_tool(dir.path()).await;
+
+        for r#async in [false, true] {
+            let message = tool
+                .execute(
+                    ToolCallId::from(format!("tb-{async}").as_str()),
+                    serde_json::json!({
+                        "agent": "ghost",
+                        "task": "do it",
+                        "async": r#async,
+                        "toolBudget": { "hard": 0 }
+                    }),
+                    CancelToken::new(),
+                    Box::new(|_u: cyrup_core::ToolUpdate| {}),
+                )
+                .await
+                .expect_err("hard: 0 is not a valid budget")
+                .to_string();
+            assert!(
+                message.contains("toolBudget.hard must be an integer >= 1."),
+                "async={async}: a malformed budget must be refused with the validator's own text, \
+                 not dropped; got {message}"
+            );
+        }
+
+        // The mirror: a WELL-FORMED budget is not refused at all — it falls through to agent
+        // resolution like any other honoured param.
+        for r#async in [false, true] {
+            let message = tool
+                .execute(
+                    ToolCallId::from(format!("tb-ok-{async}").as_str()),
+                    serde_json::json!({
+                        "agent": "ghost",
+                        "task": "do it",
+                        "async": r#async,
+                        "toolBudget": { "hard": 3 },
+                        "outputSchema": { "type": "object" }
+                    }),
+                    CancelToken::new(),
+                    Box::new(|_u: cyrup_core::ToolUpdate| {}),
+                )
+                .await
+                .expect_err("the agent is unresolvable, so the call still errors")
+                .to_string();
+            assert!(
+                message.contains("agent not found"),
+                "async={async}: a valid toolBudget/outputSchema pair must reach agent resolution, \
+                 not be turned away at the router; got {message}"
+            );
+        }
+    }
+
+    /// SUBA-047's async half, at the hop-1 → hop-2 filesystem contract: the caller's budget must
+    /// arrive on the RESOLVED PERSONA the detached runner dispatches from, because that is what
+    /// `ResolvedAgentPersona::to_agent_config` feeds to the `TOOL_BUDGET_ENV` encoder. pi collapses
+    /// the same two rungs into one value — `params.toolBudget ?? agentConfig.toolBudget`
+    /// (`runs/background/async-execution.ts:1298`).
+    #[tokio::test]
+    async fn a_background_single_run_carries_the_callers_tool_budget_onto_the_resolved_persona() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let budget = crate::exec::tool_budget::validate_tool_budget_config(
+            Some(&serde_json::json!({ "hard": 3, "soft": 1 })),
+            "toolBudget",
+        )
+        .expect("valid budget")
+        .expect("Some");
+
+        let run_id = executor
+            .spawn_background(BackgroundSingleRequest {
+                structured_output_schema: Some(serde_json::json!({ "type": "object" })),
+                tool_budget: Some(budget.clone()),
+                cwd: dir.path(),
+                agent_name: "worker",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: None,
+                include_progress: None,
+                output: None,
+                output_mode: None,
+                skills: None,
+                share: None,
+                artifacts: None,
+                session_dir: None,
+                timeout_ms: None,
+            })
+            .await
+            .expect("spawn_background should succeed for a resolvable builtin agent");
+
+        let crate::background::RunArtifactRoots { async_root, results_dir } =
+            crate::background::run_artifact_roots(dir.path());
+        let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
+            .expect("runner-config.json must exist");
+        let cfg: crate::background::runner_main::RunnerConfig =
+            serde_json::from_str(&raw).expect("runner-config.json must deserialize");
+
+        let persona = cfg
+            .resolved_agents
+            .get("worker")
+            .expect("the resolved persona map must carry the dispatched agent");
+        assert_eq!(
+            persona.tool_budget.as_ref(),
+            Some(&budget),
+            "the caller's toolBudget must reach hop 2 on the persona; runner config was {raw}"
+        );
+
+        // SUBA-043's async half, asserted on the same config so the two land together: the step's
+        // `structuredOutputSchema` was pinned `None` at this constructor.
+        let RunnerStep::SingleStep(step) = &cfg.steps[0] else {
+            panic!("a single-agent background run must produce exactly one SingleStep");
+        };
+        assert_eq!(
+            step.structured_output_schema,
+            Some(serde_json::json!({ "type": "object" })),
+            "the top-level outputSchema must reach the async step; runner config was {raw}"
+        );
+    }
+
     /// SUBA-N03: `artifacts: false` reaches hop 2 as BOTH an absent artifacts dir and a disabled
     /// config — pi's own two-term gate (`artifactsDir: artifactConfig.enabled ? artifactsDir :
     /// undefined`, `runs/background/async-execution.ts:964`, read back by the runner as
@@ -14836,6 +15603,8 @@ mod tests {
         for artifacts in [None, Some(true), Some(false)] {
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    structured_output_schema: None,
+                    tool_budget: None,
                     cwd: dir.path(),
                     agent_name: "worker",
                     task: "do something",
@@ -14911,6 +15680,8 @@ mod tests {
         let before = crate::background::now_epoch_ms();
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                structured_output_schema: None,
+                tool_budget: None,
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
@@ -14957,10 +15728,15 @@ mod tests {
             after + 60_000
         );
 
-        // A run with NO timeout must carry neither — the absence is the "no wall-clock budget"
-        // default, not a zero deadline that would abort the run instantly.
+        // SUBA-051: a run with NO caller timeout now carries pi's DEFAULT async CHILD budget
+        // (`DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000`, `async-execution.ts:131,782` @v0.47.1),
+        // not `None`. This assertion used to pin `None` on both fields — which was pinning the
+        // defect: every async fan-out was unbounded by default, so a wedged child burned tokens
+        // and CPU until a human noticed and issued `interrupt`.
         let untimed = executor
             .spawn_background(BackgroundSingleRequest {
+                structured_output_schema: None,
+                tool_budget: None,
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
@@ -14987,8 +15763,18 @@ mod tests {
                 .expect("runner-config.json must exist"),
         )
         .expect("runner-config.json must deserialize");
-        assert_eq!(untimed_cfg.timeout_ms, None);
-        assert_eq!(untimed_cfg.deadline_at_ms, None);
+        assert_eq!(
+            untimed_cfg.timeout_ms,
+            Some(crate::background::DEFAULT_ASYNC_CHILD_TIMEOUT_MS),
+            "an async CHILD with no explicit timeout must be bounded at pi's 30-minute default"
+        );
+        let default_deadline = untimed_cfg
+            .deadline_at_ms
+            .expect("the default budget must also be stamped as an absolute deadline");
+        assert!(
+            default_deadline >= before + crate::background::DEFAULT_ASYNC_CHILD_TIMEOUT_MS,
+            "the default deadline is `now + 30min` in absolute epoch ms; got {default_deadline}"
+        );
     }
 
     /// SUBA-N03, the adversarial question a prior review raised: hoisting the `RunId` out of
@@ -15005,6 +15791,8 @@ mod tests {
 
         let request = |exec: Arc<SubagentExecutor>, root: std::path::PathBuf| async move {
             exec.spawn_background(BackgroundSingleRequest {
+                structured_output_schema: None,
+                tool_budget: None,
                 cwd: &root,
                 agent_name: "worker",
                 task: "do something",
@@ -15113,6 +15901,8 @@ mod tests {
 
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    structured_output_schema: None,
+                    tool_budget: None,
                     cwd: dir.path(),
                     agent_name: "worker",
                     task: "do something",
@@ -15194,6 +15984,8 @@ mod tests {
 
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                structured_output_schema: None,
+                tool_budget: None,
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
@@ -15647,6 +16439,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                structured_output_schema: None,
+                tool_budget: None,
                 cwd: dir.path(),
                 agent_name: "ghost",
                 task: "do something",
@@ -15697,6 +16491,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                structured_output_schema: None,
+                tool_budget: None,
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
@@ -15756,6 +16552,8 @@ mod tests {
         });
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                structured_output_schema: None,
+                tool_budget: None,
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
@@ -15827,6 +16625,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                structured_output_schema: None,
+                tool_budget: None,
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
@@ -18170,7 +18970,7 @@ mod tests {
                     "{label} registration, action={blank:?}"
                 );
                 assert!(
-                    !err.to_string().contains("unknown subagent action"),
+                    !err.to_string().contains("Unknown action:"),
                     "{label}: a blank action is not an UNKNOWN action — that was the pre-fix text"
                 );
             }
@@ -18190,8 +18990,7 @@ mod tests {
                 .await
                 .expect_err("an unknown action is still an error");
             assert!(
-                err.to_string()
-                    .contains("unknown subagent action 'nonesuch'"),
+                err.to_string().starts_with("Unknown action: nonesuch."),
                 "{label}: {err}"
             );
         }
@@ -18232,8 +19031,10 @@ mod tests {
         let err = dispatch_tool(&child_safe, serde_json::json!({ "action": "delete", "agent": "x" }))
             .await
             .expect_err("a fanout child must not delete an agent");
-        assert!(
-            err.to_string().contains("blocked in child-safe fanout mode"),
+        // SUBA-038: pi's exact text, asserted by equality.
+        assert_eq!(
+            err.to_string(),
+            "Action 'delete' is not available from child-safe subagent fanout mode.",
             "{err}"
         );
     }
@@ -19593,6 +20394,7 @@ mod tests {
         // With a policy that REFUSES it, the outcome is an error — never `Ok(<some other model>)`.
         let scope = crate::exec::model_scope::ModelScopeConfig {
             enforce: Some(true),
+            strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
         };
         let refused = crate::exec::fallback::resolve_model_inheritance(
@@ -19662,6 +20464,7 @@ mod tests {
     fn the_model_scope_reaches_the_detached_runner_through_the_serialized_config() {
         let scope = crate::exec::model_scope::ModelScopeConfig {
             enforce: Some(true),
+            strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
         };
         let config = crate::background::runner_main::RunnerConfig {

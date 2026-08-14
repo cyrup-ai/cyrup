@@ -42,8 +42,18 @@ pub enum OutputFormat {
     Json,
 }
 
-/// `--thinking <level>` (args.ts:57,130). Clap validates membership; the warning-on-invalid path Pi
-/// takes (args.ts:135) is unreachable here because clap rejects an unknown value with a usage error.
+/// `--thinking <level>` (args.ts:57,130).
+///
+/// Clap validates membership, but it never SEES an invalid value: pi's warn-and-continue path
+/// (`args.ts:135`) is ported and runs **pre-clap**, in `diagnostics.rs`'s `apply_arg_leniency`
+/// (called from `main.rs` before `Cli::parse_from`). That pass keeps a value in
+/// `VALID_THINKING_LEVELS` (`diagnostics.rs`, the same seven entries as `args.ts:57`) and otherwise
+/// DROPS both tokens with pi's `Invalid thinking level "{value}". Valid values: {joined}`, so clap
+/// only ever receives a valid value or no flag at all.
+///
+/// SEAM-029 — this comment used to claim the leniency path was "unreachable here", which is the
+/// opposite of the truth and is exactly what mis-set a previous edition of the gap analysis: a
+/// reader concludes the path does not exist and files a false gap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum ThinkingArg {
@@ -101,8 +111,15 @@ pub enum TuiMode {
 pub struct Cli {
     // ---- help/version (args.ts:74-77) ----
     /// Print the version and exit (`-v`, matching Pi; `--verbose` carries no short).
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
-    pub version: Option<bool>,
+    ///
+    /// A plain `bool`, deliberately: `clap::ArgAction::Version` prints `{display_name} {version}`
+    /// and exits from INSIDE the parse, i.e. before `main`'s diagnostics gate, where pi does both
+    /// the other way round — `main.ts:562-570` reports every parse diagnostic and exits 1 on any
+    /// error-severity one, and only then `:573-576` does `if (parsed.version) { console.log(VERSION);
+    /// process.exit(0); }` with a bare semver and no program name. `--help` was already ordered that
+    /// way here (`main.rs`'s `if cli.help` sits after the gate); `--version` now matches. SEAM-052.
+    #[arg(short = 'v', long = "version")]
+    pub version: bool,
     /// Show the rich help body and exit (`-h`/`--help`). Pi prints its own hand-rolled help
     /// (args.ts:212), so clap's auto-help is disabled and [`render_help`] is used instead.
     #[arg(short = 'h', long = "help")]
@@ -115,6 +132,22 @@ pub struct Cli {
     /// One-shot PRINT mode: run to completion, print the final assistant text, exit.
     #[arg(short = 'p', long)]
     pub print: bool,
+    // CYRUP-DELTA — SEAM-057. The next three flags are **cyrup-invented**: `git grep -nE
+    // '"--output-format"|"--json"|"--rpc"' v0.84.1 -- packages/coding-agent/src` matches only
+    // `cli/auth-command.ts:82-84` (an auth SUBCOMMAND flag) and three npm/ripgrep argv strings, and
+    // pi's `parseArgs` has no such arm at either tag. Each would fall through to pi's unknown-long-
+    // flag arm (`cli/args.ts:188-201`), land in `unknownFlags`, and — with no extension registering
+    // it — produce `Unknown option(s): --json` + `process.exit(1)`
+    // (`core/agent-session-services.ts:119-124`, `main.ts:844-848`).
+    //
+    // Two consequences, and the second is the one that matters: `cyrup --json` succeeds where
+    // `pi --json` is a hard exit-1, and — because all three are in `KNOWN_LONG_FLAGS` /
+    // `KNOWN_VALUE_LONG_FLAGS` and are therefore consumed by `partition_extension_flags` before the
+    // extension-flag capture — an extension that legitimately registers a `--json` or `--rpc` flag
+    // can never receive it under cyrup; the binary silently changes output mode instead. Closing
+    // THAT half means deleting these three, which is a decision with users outside this crate
+    // (`cyrup-it`'s own fixtures pass `--rpc`), so it is recorded here and in `render_help` below
+    // rather than taken unilaterally.
     /// One-shot output format: `text` (PRINT) or `json` (JSONL) — a cyrup back-compat alias.
     #[arg(long = "output-format", value_enum)]
     pub output_format: Option<OutputFormat>,
@@ -900,6 +933,9 @@ Options:
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --json                         cyrup alias for --mode json (not a pi flag)
+  --rpc                          cyrup alias for --mode rpc (not a pi flag)
+  --output-format <fmt>          cyrup alias: text = --print, json = --mode json (not a pi flag)
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
@@ -1119,12 +1155,16 @@ mod tests {
 
     #[test]
     fn version_short_is_v_not_verbose() {
-        // `-v` is version (Pi args.ts:76); it triggers clap's Version action (an Err on try_parse).
-        let full = vec!["cyrup".to_string(), "-v".to_string()];
-        let err = Cli::try_parse_from(full).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        // SEAM-052: `-v`/`--version` is a plain flag on `Cli`, NOT clap's `Version` action, so the
+        // parse SUCCEEDS and `main` reports pi's parse diagnostics first (`main.ts:562-570`) before
+        // printing the bare semver (`:573-576`). It used to exit from inside `Cli::parse_from`,
+        // which made `cyrup -x --version` exit 0 where `pi -x --version` exits 1.
+        assert!(parse(&["-v"]).version);
+        assert!(parse(&["--version"]).version);
+        assert!(!parse(&[]).version);
         // `--verbose` is a distinct boolean with no short.
         assert!(parse(&["--verbose"]).verbose);
+        assert!(!parse(&["--verbose"]).version);
     }
 
     #[test]

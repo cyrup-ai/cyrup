@@ -22,11 +22,70 @@ pub struct IntercomContext {
     pub received_at: u64,
 }
 
+/// `matchesPendingSender` (`v0.10.1 reply-tracker.ts:10-16`). The `starts_with` arm is v0.9.3
+/// (`c3543d6`) — `intercom{list}` prints an ID *prefix* as the addressable column, so the reply path
+/// has to accept the same form the roster handed the model.
 fn matches_pending_sender(context: &IntercomContext, to: &str) -> bool {
-    if context.from.id == to {
+    if context.from.id == to || context.from.id.starts_with(to) {
         return true;
     }
     context.from.name.as_deref().map(str::to_lowercase) == Some(to.to_lowercase())
+}
+
+/// `resolvePendingSender` (`v0.10.1 reply-tracker.ts:18-45`, v0.9.3 `c3543d6`): a four-tier ladder —
+/// exact id → exact name → id prefix → miss — with a *distinct* message per ambiguity so the caller
+/// is told which KIND of collision it hit and how to break it.
+///
+/// ```text
+/// exactIdMatches   == 1 → hit;  > 1 → `Multiple pending asks from session ID "${to}" — specify \`replyTo\``
+/// exactNameMatches == 1 → hit;  > 1 → `Multiple pending asks match sender name "${to}" — specify a full session ID or \`replyTo\``
+/// idPrefixMatches  == 1 → hit;  > 1 → `Multiple pending asks match ID prefix "${to}" — use a longer session ID prefix or specify \`replyTo\``
+/// otherwise            → `No pending ask from "${to}"`
+/// ```
+///
+/// Note the exact-id tier can only exceed one match when two pending asks share a sender, and that
+/// the prefix tier is evaluated LAST, so an id that is also somebody's exact name resolves by name.
+fn resolve_pending_sender(pending: &[IntercomContext], to: &str) -> Result<IntercomContext, String> {
+    let exact_id: Vec<&IntercomContext> = pending.iter().filter(|c| c.from.id == to).collect();
+    if exact_id.len() == 1
+        && let Some(hit) = exact_id.first()
+    {
+        return Ok((*hit).clone());
+    }
+    if exact_id.len() > 1 {
+        return Err(format!("Multiple pending asks from session ID \"{to}\" — specify `replyTo`"));
+    }
+
+    let lower_to = to.to_lowercase();
+    let exact_name: Vec<&IntercomContext> = pending
+        .iter()
+        .filter(|c| c.from.name.as_deref().map(str::to_lowercase) == Some(lower_to.clone()))
+        .collect();
+    if exact_name.len() == 1
+        && let Some(hit) = exact_name.first()
+    {
+        return Ok((*hit).clone());
+    }
+    if exact_name.len() > 1 {
+        return Err(format!(
+            "Multiple pending asks match sender name \"{to}\" — specify a full session ID or `replyTo`"
+        ));
+    }
+
+    let id_prefix: Vec<&IntercomContext> =
+        pending.iter().filter(|c| c.from.id.starts_with(to)).collect();
+    if id_prefix.len() == 1
+        && let Some(hit) = id_prefix.first()
+    {
+        return Ok((*hit).clone());
+    }
+    if id_prefix.len() > 1 {
+        return Err(format!(
+            "Multiple pending asks match ID prefix \"{to}\" — use a longer session ID prefix or specify `replyTo`"
+        ));
+    }
+
+    Err(format!("No pending ask from \"{to}\""))
 }
 
 /// Inbound ask → local reply tracking (`ReplyTracker`, `reply-tracker.ts:18-123`).
@@ -119,13 +178,11 @@ impl ReplyTracker {
 
         let pending: Vec<IntercomContext> = self.pending_asks.values().cloned().collect();
 
+        // `v0.10.1 reply-tracker.ts:96-97`: the whole `to` branch is `resolvePendingSender`, which
+        // is still TERMINAL — a miss errors rather than falling through to the turn context or the
+        // lone pending ask.
         if let Some(to) = to {
-            let matches: Vec<IntercomContext> =
-                pending.iter().filter(|c| matches_pending_sender(c, to)).cloned().collect();
-            if matches.len() > 1 {
-                return Err(format!("Multiple pending asks from \"{to}\" — use the sender session ID instead."));
-            }
-            return matches.into_iter().next().ok_or_else(|| format!("No pending ask from \"{to}\""));
+            return resolve_pending_sender(&pending, to);
         }
 
         if let Some(current) = &self.current_turn_context {
@@ -142,6 +199,37 @@ impl ReplyTracker {
             return Err("No active intercom context to reply to".to_string());
         }
         Err("Multiple pending asks — specify `to`".to_string())
+    }
+
+    /// `findUniquePendingAskFrom` (`v0.10.1 reply-tracker.ts:114-123`, v0.9.3 `5d76146` "Resolve
+    /// asks answered with send"): the single unexpired pending ask from `to`, or `None`.
+    ///
+    /// ```text
+    /// const candidates = Array.from(this.pendingAsks.values()).filter((context) => {
+    ///   if (now - context.receivedAt > this.askTimeoutMs) return false;
+    ///   return context.from.id === to || context.from.name?.toLowerCase() === to.toLowerCase();
+    /// });
+    /// return candidates.length === 1 ? candidates[0]! : null;
+    /// ```
+    ///
+    /// Deliberately NOT `matches_pending_sender`: upstream filters on exact id or exact name here,
+    /// with **no** prefix arm, because inferring a reply target is a silent side effect and a prefix
+    /// hit is too weak a signal for one. It also does not prune — it filters by age in place —
+    /// hence `&self`, so a plain `send` never mutates ask state before its delivery is confirmed.
+    #[must_use]
+    pub fn find_unique_pending_ask_from(&self, to: &str, now: u64) -> Option<IntercomContext> {
+        let lower_to = to.to_lowercase();
+        let mut candidates = self.pending_asks.values().filter(|c| {
+            if now.saturating_sub(c.received_at) > self.ask_timeout_ms {
+                return false;
+            }
+            c.from.id == to || c.from.name.as_deref().map(str::to_lowercase) == Some(lower_to.clone())
+        });
+        let first = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        Some(first.clone())
     }
 
     /// Mark an ask replied (`markReplied` → `dismissPendingAsk`, `:95-109`).
@@ -304,6 +392,7 @@ mod tests {
         SessionInfo {
             id: id.to_string(),
             name: name.map(str::to_string),
+            runtime_fallback_alias: None,
             cwd: "/w".to_string(),
             model: "m".to_string(),
             pid: 1u32.into(),
@@ -426,8 +515,81 @@ mod tests {
         rt.queue_turn_context(first);
         rt.begin_turn(1002);
 
+        // `v0.10.1 reply-tracker.ts:30-32`: two asks from ONE sender addressed by that sender's
+        // NAME is the sender-name tier, so it is the "specify a full session ID or `replyTo`" text.
         let err = rt.resolve_reply_target(Some("planner"), None, 1003).expect_err("ambiguous `to`");
-        assert_eq!(err, "Multiple pending asks from \"planner\" — use the sender session ID instead.");
+        assert_eq!(
+            err,
+            "Multiple pending asks match sender name \"planner\" — specify a full session ID or `replyTo`"
+        );
+    }
+
+    /// `v0.10.1 reply-tracker.ts:18-45` — all four tiers of `resolvePendingSender`, one assertion
+    /// per distinct upstream message. Before v0.9.3 cyrup collapsed the three ambiguity cases into a
+    /// single generic string that named no candidates and no remedy.
+    #[test]
+    fn resolve_pending_sender_ladder_has_four_distinct_upstream_messages() {
+        // Tier 1: exact id, two asks from the same sender id.
+        let mut rt = ReplyTracker::new(600_000);
+        rt.record_incoming_message(session("0192aaaa-1111", None), ask("a1"), 1000);
+        rt.record_incoming_message(session("0192aaaa-1111", None), ask("a2"), 1001);
+        let err = rt.resolve_reply_target(Some("0192aaaa-1111"), None, 1002).expect_err("exact-id collision");
+        assert_eq!(err, "Multiple pending asks from session ID \"0192aaaa-1111\" — specify `replyTo`");
+
+        // Tier 2: exact name shared by two DIFFERENT sender ids (what ICOM-040's 8-char alias made
+        // routine). Note the ids share no prefix with the name, so the name tier is the one hit.
+        let mut rt = ReplyTracker::new(600_000);
+        rt.record_incoming_message(session("id-a", Some("worker")), ask("b1"), 1000);
+        rt.record_incoming_message(session("id-b", Some("worker")), ask("b2"), 1001);
+        let err = rt.resolve_reply_target(Some("worker"), None, 1002).expect_err("name collision");
+        assert_eq!(
+            err,
+            "Multiple pending asks match sender name \"worker\" — specify a full session ID or `replyTo`"
+        );
+
+        // Tier 3: two distinct UUIDv7 senders sharing an id prefix.
+        let mut rt = ReplyTracker::new(600_000);
+        rt.record_incoming_message(session("0192f3c1-aaaa", Some("alpha")), ask("c1"), 1000);
+        rt.record_incoming_message(session("0192f3c1-bbbb", Some("beta")), ask("c2"), 1001);
+        let err = rt.resolve_reply_target(Some("0192f3c1"), None, 1002).expect_err("prefix collision");
+        assert_eq!(
+            err,
+            "Multiple pending asks match ID prefix \"0192f3c1\" — use a longer session ID prefix or specify `replyTo`"
+        );
+        // …and a UNIQUE prefix resolves, which is the feature: `list` prints prefixes, so `reply`
+        // must accept them.
+        let hit = rt.resolve_reply_target(Some("0192f3c1-a"), None, 1002).expect("unique prefix resolves");
+        assert_eq!(hit.message.id, "c1");
+
+        // Tier 4: miss.
+        let err = rt.resolve_reply_target(Some("nobody"), None, 1002).expect_err("miss");
+        assert_eq!(err, "No pending ask from \"nobody\"");
+    }
+
+    /// `v0.10.1 reply-tracker.ts:114-123`. A plain `send` to the sole pending asker is that ask's
+    /// reply (v0.9.3 `5d76146`); two asks from the same peer make it ambiguous, and an expired ask
+    /// is not a candidate at all.
+    #[test]
+    fn find_unique_pending_ask_from_matches_by_id_or_name_and_honours_the_timeout() {
+        let mut rt = ReplyTracker::new(600_000);
+        rt.record_incoming_message(session("s1", Some("Alice")), ask("q1"), 1000);
+        rt.record_incoming_message(session("s2", Some("bob")), ask("q2"), 1000);
+
+        assert_eq!(rt.find_unique_pending_ask_from("s1", 1001).map(|c| c.message.id), Some("q1".to_string()));
+        assert_eq!(rt.find_unique_pending_ask_from("alice", 1001).map(|c| c.message.id), Some("q1".to_string()));
+        assert!(rt.find_unique_pending_ask_from("nobody", 1001).is_none());
+
+        // Upstream has NO prefix arm here — inference is silent, so it demands an exact hit.
+        assert!(rt.find_unique_pending_ask_from("s", 1001).is_none());
+
+        // Two asks from one sender → ambiguous → None (no inference, the send stays a plain send).
+        rt.record_incoming_message(session("s1", Some("Alice")), ask("q3"), 1000);
+        assert!(rt.find_unique_pending_ask_from("s1", 1001).is_none());
+
+        // Past the ask timeout the candidate is filtered out rather than inferred.
+        let mut rt = ReplyTracker::new(100);
+        rt.record_incoming_message(session("s1", Some("Alice")), ask("q1"), 1000);
+        assert!(rt.find_unique_pending_ask_from("s1", 1_000_000).is_none());
     }
 
     // reply-tracker.ts:55-64 — `reply_to` still outranks `to`, and `to` is only a cross-check.

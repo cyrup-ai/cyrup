@@ -668,3 +668,41 @@ async fn bash_execution_update_omits_id_when_the_caller_supplied_none() {
         );
     }
 }
+
+/// TOOL-031 / PARITY-GAPS PB-5, the IMMEDIATE-BASH half.
+///
+/// pi sets the agent-identity markers on `process.env` in `cli.ts` before `main()` runs
+/// (`PI_CODING_AGENT = "true"`, `cli.ts:13` @v0.83.0; `AI_AGENT = "pi"`, `:14` @v0.84.1, mirrored
+/// in `rpc-entry.ts:7-8`), so EVERY child inherits them via `getShellEnv()`'s `{...process.env}`
+/// (`utils/shell.ts:130-133`) — including this seam, which reaches `getShellEnv()` by the same
+/// fall-through as the `bash` tool (`core/tools/bash.ts:100`).
+///
+/// RED before this pass: cyrup's bin declines the process-global `set_var`, so each spawn site has
+/// to push the pair itself. The `bash` TOOL did; `crate::bash::run_bash` did not — so `!!cmd` in
+/// the TUI and the RPC `executeBash` handed the child a DIFFERENT environment from the identical
+/// command run as a tool. Both `${PI_CODING_AGENT-}` expansions below rendered empty.
+#[tokio::test]
+async fn immediate_bash_carries_the_agent_identity_markers() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
+
+    let result = session
+        .execute_bash(
+            r#"printf '[%s][%s]\n' "${PI_CODING_AGENT-}" "${AI_AGENT-}""#,
+            BashOptions { exclude_from_context: false, id: None },
+            None,
+        )
+        .await
+        .expect("bash runs");
+
+    assert!(
+        result.output.contains("[true][cyrup]"),
+        "the immediate-bash child must see the same identity markers the `bash` tool's child sees \
+         (pi `cli.ts:13-14`); got: {:?}",
+        result.output
+    );
+}

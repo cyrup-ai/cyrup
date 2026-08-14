@@ -199,7 +199,7 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
         }
         // We are at a `$`. Try the `${...}` forms first, then the simple `$X` forms.
         if bytes.get(i + 1) == Some(&b'{') {
-            if let Some((repl, consumed)) = match_brace_form(content, i, args) {
+            if let Some((repl, consumed)) = match_brace_form(content, i, args, &all_args) {
                 out.push_str(&repl);
                 i += consumed;
                 continue;
@@ -233,24 +233,46 @@ fn push_char_at(s: &str, out: &mut String, i: &mut usize) {
 
 /// Match `${N:-default}`, `${@:N}`, or `${@:N:L}` at byte `start`. Returns `(replacement,
 /// bytes_consumed)` or `None` if the `${...}` is not one of these forms.
-fn match_brace_form(content: &str, start: usize, args: &[String]) -> Option<(String, usize)> {
+fn match_brace_form(
+    content: &str,
+    start: usize,
+    args: &[String],
+    all_args: &str,
+) -> Option<(String, usize)> {
     let open = start + 2; // past `${`
     let rest = content.get(open..)?;
     let close_rel = rest.find('}')?;
     let inner = rest.get(..close_rel)?;
     let consumed = 2 + close_rel + 1; // `${` + inner + `}`
 
-    // `${N:-default}`
-    if let Some((num, default)) = inner.split_once(":-")
-        && !num.is_empty()
-        && num.bytes().all(|b| b.is_ascii_digit())
+    // `${N:-default}` / `${@:-default}` / `${ARGUMENTS:-default}` — pi's first regex alternative is
+    // `\$\{(\d+|ARGUMENTS|@):-([^}]*)\}` (prompt-templates.ts:74 @v0.83.0), i.e. the target may be
+    // `@` or `ARGUMENTS` as well as a positional number (CFG-017), and the handler at `:78-79` is
+    // `const value = target === "@" || target === "ARGUMENTS" ? allArgs : args[parseInt(target)-1];
+    //  return value ? value : defaultValue;`.
+    if let Some((target, default)) = inner.split_once(":-")
+        && !target.is_empty()
     {
-        let idx = num.parse::<usize>().ok()?.checked_sub(1)?;
-        let value = args.get(idx).filter(|v| !v.is_empty());
-        return Some((
-            value.cloned().unwrap_or_else(|| default.to_string()),
-            consumed,
-        ));
+        let value: Option<String> = if target == "@" || target == "ARGUMENTS" {
+            Some(all_args.to_string())
+        } else if target.bytes().all(|b| b.is_ascii_digit()) {
+            // `args[parseInt("0", 10) - 1]` is `args[-1]` — `undefined`, hence falsy, hence the
+            // DEFAULT (CFG-016). `checked_sub(1)?` used to abort the whole form instead, leaving
+            // `${0:-default}` in the rendered prompt verbatim.
+            target
+                .parse::<usize>()
+                .ok()?
+                .checked_sub(1)
+                .and_then(|i| args.get(i))
+                .cloned()
+        } else {
+            // Not one of pi's three targets: the regex alternative does not match, so the token is
+            // not a placeholder at all.
+            return None;
+        };
+        // JS truthiness: `undefined` AND `""` both take the default.
+        let value = value.filter(|v| !v.is_empty());
+        return Some((value.unwrap_or_else(|| default.to_string()), consumed));
     }
 
     // `${@:N}` / `${@:N:L}`

@@ -688,14 +688,73 @@ fn compact_structured_text(value: &Value) -> String {
 // instructions prefix/suffix (chain-execution.ts:1039-1052, shared/settings.ts:312-357)
 // -------------------------------------------------------------------------------------------
 
+/// SUBA-053 — pi's `expandHomePath` (`shared/settings.ts:341-345` @v0.47.1):
+///
+/// ```text
+/// if (filePath === "~") return os.homedir();
+/// if (filePath.startsWith("~/")) return path.join(os.homedir(), filePath.slice(2));
+/// return filePath;
+/// ```
+///
+/// Exactly three cases, and the third is load-bearing: `~user/` is deliberately NOT expanded
+/// upstream, and neither is a bare `~something`. Landed in `87420e5` ("fix(reads): expand home paths
+/// and wire reads into single runs"), released v0.45.0; at v0.43.0 `resolveChainPath` had no
+/// expansion at all, which is why a step declaring `reads: ["~/notes.md"]` resolved to the literal
+/// `<chain_dir>/~/notes.md`.
+///
+/// `os.homedir()` follows this crate's `CYRUP_HOME` → `HOME` → tempdir convention (six identical
+/// resolvers, see `missions/store.rs::home_dir`).
+fn expand_home_path(file: &Path) -> PathBuf {
+    let Some(text) = file.to_str() else {
+        // A non-UTF-8 path can neither BE `~` nor START with `~/`, so both upstream branches are
+        // unreachable for it and the pass-through arm is the correct answer.
+        return file.to_path_buf();
+    };
+    if text == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        // Node's `path.join` drops empty segments, so upstream's `path.join(os.homedir(), "")` for
+        // the bare `"~/"` is the homedir itself. `Path::join("")` in Rust appends a separator
+        // instead, so the empty tail is short-circuited to keep the two identical.
+        if rest.is_empty() {
+            return home_dir();
+        }
+        return home_dir().join(rest);
+    }
+    file.to_path_buf()
+}
+
+/// `os.homedir()`, following this crate's `CYRUP_HOME` → `HOME` → tempdir convention
+/// (`missions/store.rs::home_dir`, `exec/mcp_direct_tools.rs:831`, `spawn/worktree.rs:236`, …).
+fn home_dir() -> PathBuf {
+    std::env::var_os("CYRUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// Resolve a chain-relative file path against `chain_dir` the way pi's `resolveChainPath`
-/// (`shared/settings.ts:335-342`) does: an absolute path is used verbatim; a relative path is joined onto
-/// `chain_dir`. Rendered lossily to a `String` for embedding in the child's prompt text.
+/// (`shared/settings.ts:351-354` @v0.47.1) does: `~`/`~/` expand to home FIRST, then an absolute
+/// path is used verbatim and a relative path is joined onto `chain_dir`. Rendered lossily to a
+/// `String` for embedding in the child's prompt text.
 fn resolve_chain_path(file: &Path, chain_dir: &Path) -> String {
-    if file.is_absolute() {
-        file.to_string_lossy().into_owned()
+    resolve_chain_path_buf(file, chain_dir)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// [`resolve_chain_path`] before the lossy `String` rendering — the form SUBA-058's existence
+/// filter needs, since `Path::exists` must run on the real path, not on its lossy transcription.
+fn resolve_chain_path_buf(file: &Path, chain_dir: &Path) -> PathBuf {
+    // SUBA-053 / pi `:352`: `const expanded = expandHomePath(filePath)` runs BEFORE the
+    // `isAbsolute` test, which matters — an expanded `~/x` is absolute and must not then be joined
+    // onto `chain_dir`.
+    let expanded = expand_home_path(file);
+    if expanded.is_absolute() {
+        expanded
     } else {
-        chain_dir.join(file).to_string_lossy().into_owned()
+        chain_dir.join(expanded)
     }
 }
 
@@ -727,11 +786,25 @@ fn build_chain_instructions(
     if let Some(reads) = reads
         && !reads.is_empty()
     {
+        // SUBA-058 / pi `resolveExistingReadInstructionPaths` (`shared/settings.ts:356-362`
+        // @v0.47.1): each declared read is resolved TWICE — once against the instruction cwd (the
+        // path the child is told to read) and once against the existence cwd (the tree checked for
+        // presence) — and only the entries whose existence path is present are emitted. cyrup has a
+        // single chain dir for both roles today, so both resolutions collapse onto `chain_dir`;
+        // the two-cwd shape is kept so a worktree child checks the right tree once
+        // `SingleStepSpec` carries one. Landed upstream in `bc1b689` ("fix: omit missing child read
+        // files"), released v0.47.1; at v0.43.0 `settings.ts:359` was the unfiltered `.map`.
+        //
+        // pi's `flatMap` also means an all-missing list emits NO read line at all, not an empty
+        // one — hence the `is_empty()` re-check after filtering rather than before.
         let files: Vec<String> = reads
             .iter()
+            .filter(|f| resolve_chain_path_buf(f, chain_dir).exists())
             .map(|f| resolve_chain_path(f, chain_dir))
             .collect();
-        prefix_parts.push(format!("[Read from: {}]", files.join(", ")));
+        if !files.is_empty() {
+            prefix_parts.push(format!("[Read from: {}]", files.join(", ")));
+        }
     }
 
     if let Some(output) = output_path {
@@ -2513,13 +2586,25 @@ mod tests {
 
     #[test]
     fn build_chain_instructions_emits_reads_output_prefix_and_previous_suffix() {
+        // SUBA-058: the read instruction is now filtered by existence, so the fixture needs a REAL
+        // file. `/chain/notes.md` never existed, which is exactly why the old expectation pinned
+        // the unfiltered behaviour this test used to assert.
+        let chain_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(chain_dir.path().join("notes.md"), "notes").expect("write");
+
         let (prefix, suffix) = build_chain_instructions(
             Some(&[PathBuf::from("notes.md")]),
             Some("out.md"),
-            Path::new("/chain"),
+            chain_dir.path(),
             Some("prev text"),
         );
-        assert_eq!(prefix, "[Read from: /chain/notes.md]\n[Write to: /chain/out.md]\n\n");
+        assert_eq!(
+            prefix,
+            format!(
+                "[Read from: {0}/notes.md]\n[Write to: {0}/out.md]\n\n",
+                chain_dir.path().display()
+            )
+        );
         assert_eq!(suffix, "\n\n---\nPrevious step output:\nprev text");
 
         // No reads/output/previous → empty prefix and suffix, and a blank previous summary is
@@ -2527,6 +2612,81 @@ mod tests {
         let (prefix, suffix) = build_chain_instructions(None, None, Path::new("/chain"), Some("   "));
         assert_eq!(prefix, "");
         assert_eq!(suffix, "");
+    }
+
+    /// SUBA-058 — pi `resolveExistingReadInstructionPaths` (`shared/settings.ts:356-362` @v0.47.1,
+    /// `bc1b689`).
+    ///
+    /// THE USER ACTION: a chain step declares two reads and its upstream sibling produced only one
+    /// of them. Before the fix the child was told `[Read from: <existing>, <missing>]`, burned a
+    /// turn on a failing read, and routinely narrated the missing file as a finding — which then
+    /// polluted `{previous}` for every later step. The `flatMap` shape also means an ALL-missing
+    /// list emits no read line at all, not an empty `[Read from: ]`.
+    #[test]
+    fn chain_read_instructions_omit_files_that_do_not_exist() {
+        let chain_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(chain_dir.path().join("present.md"), "x").expect("write");
+
+        let (prefix, _) = build_chain_instructions(
+            Some(&[PathBuf::from("present.md"), PathBuf::from("absent.md")]),
+            None,
+            chain_dir.path(),
+            None,
+        );
+        assert_eq!(
+            prefix,
+            format!("[Read from: {}/present.md]\n\n", chain_dir.path().display()),
+            "only the existing read may be emitted"
+        );
+
+        let (none_exist, _) = build_chain_instructions(
+            Some(&[PathBuf::from("absent-a.md"), PathBuf::from("absent-b.md")]),
+            None,
+            chain_dir.path(),
+            None,
+        );
+        assert_eq!(none_exist, "", "an all-missing reads list emits no read line at all");
+    }
+
+    /// SUBA-053 — pi `expandHomePath` + `resolveChainPath` (`shared/settings.ts:341-354` @v0.47.1,
+    /// `87420e5`).
+    ///
+    /// THE USER ACTION: a step declares `reads: ["~/.config/project.toml"]`. Before the fix that
+    /// resolved to the literal `<chain_dir>/~/.config/project.toml`, so the child was pointed at a
+    /// path that does not exist and either reported it missing or fabricated content — silently, at
+    /// the orchestrator, because the instruction line looked well-formed.
+    ///
+    /// The `~user/` case is the one it would be easy to get wrong in the generous direction:
+    /// upstream deliberately leaves it alone (`expandHomePath` handles ONLY `"~"` and a `"~/"`
+    /// prefix). Asserted against this module's own `home_dir()` rather than a mutated `CYRUP_HOME`,
+    /// so the test neither races 2200 siblings over process-global env nor depends on the
+    /// developer's real home.
+    #[test]
+    fn resolve_chain_path_expands_home_exactly_where_pi_does() {
+        let chain = Path::new("/chain");
+        let h = home_dir();
+        let cases: &[(&str, PathBuf)] = &[
+            ("~", h.clone()),
+            ("~/", h.clone()),
+            ("~/file", h.join("file")),
+            ("/abs/path", PathBuf::from("/abs/path")),
+            ("rel/path", PathBuf::from("/chain/rel/path")),
+            // NOT expanded upstream.
+            ("~user/file", PathBuf::from("/chain/~user/file")),
+            ("~notahome", PathBuf::from("/chain/~notahome")),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                resolve_chain_path(Path::new(input), chain),
+                expected.to_string_lossy(),
+                "input {input:?}"
+            );
+        }
+        // The regression itself, stated directly: the pre-fix result was the literal join.
+        assert_ne!(
+            resolve_chain_path(Path::new("~/notes.md"), chain),
+            "/chain/~/notes.md"
+        );
     }
 
     // ---- C9: chain stop-on-failure ----

@@ -251,6 +251,7 @@ mod tests {
         SessionInfo {
             id: "session-12345678".to_string(),
             name: Some("subagent-chat-019ecaf6".to_string()),
+            runtime_fallback_alias: None,
             cwd: "/Users/envvar/.config/ghostty".to_string(),
             model: "bsy-deepseek-v4-pro".to_string(),
             pid: 1u32.into(),

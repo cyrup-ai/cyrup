@@ -23,6 +23,9 @@ use super::common::Broker;
 
 fn session() -> SessionInfo {
     SessionInfo {
+        // ICOM-041: `runtimeFallbackAlias` (v0.10.1 types.ts:6-7) — these fixtures
+        // register under a REAL name, not a synthesized unnamed-runtime alias.
+        runtime_fallback_alias: None,
         id: "session-12345678".to_string(),
         name: Some("subagent-chat-019ecaf6".to_string()),
         cwd: "/Users/envvar/.config/ghostty".to_string(),
@@ -44,6 +47,9 @@ fn session() -> SessionInfo {
 /// not [`super::common::registration`], which takes a name and hardcodes `/tmp/work`.
 fn registration(cwd: &str) -> SessionRegistration {
     SessionRegistration {
+        // ICOM-041: `runtimeFallbackAlias` (v0.10.1 types.ts:6-7) — these fixtures
+        // register under a REAL name, not a synthesized unnamed-runtime alias.
+        runtime_fallback_alias: None,
         name: None,
         cwd: cwd.to_string(),
         model: "test-model".to_string(),

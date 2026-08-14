@@ -440,8 +440,16 @@ impl PermissionManager {
         resolved
     }
 
-    /// pi `getPolicyCacheStamp` (`permission-manager.ts:790-798`): the four policy files' mtimes.
-    fn policy_cache_stamp(&self, agent_name: Option<&str>) -> String {
+    /// pi `getPolicyCacheStamp` (`permission-manager.ts:781-798` @v0.8.0): the four policy files'
+    /// mtimes.
+    ///
+    /// **Public deliberately, exactly as upstream is** (`public getPolicyCacheStamp`, `:781`). Its
+    /// second consumer is the `before_agent_start` result cache
+    /// ([`crate::agent_start_cache`], pi `index.ts:1902`), which keys on it so a mid-session policy
+    /// edit invalidates the cached tool set and sanitized prompt. A private stamp would force that
+    /// cache to key on something cheaper and serve stale permissions after an edit.
+    #[must_use]
+    pub fn policy_cache_stamp(&self, agent_name: Option<&str>) -> String {
         let agent_path = resolve_agent_markdown_path(Some(&self.paths.agents_dir), agent_name);
         let project_agent_path = self
             .paths

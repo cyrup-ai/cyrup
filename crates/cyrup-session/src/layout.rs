@@ -92,11 +92,19 @@ pub fn default_root() -> PathBuf {
     home.join(".cyrup").join("agent").join("sessions")
 }
 
-/// Pi-compatible encoding: strip a leading separator, map `/` `\\` `:` → `-`, wrap in `--…--`.
-/// Reversible enough to group/list a directory's sessions (R-04-001).
+/// Pi-compatible encoding: strip EXACTLY ONE leading separator, map `/` `\\` `:` → `-`, wrap in
+/// `--…--`. Reversible enough to group/list a directory's sessions (R-04-001).
+///
+/// Pi (`session-manager.ts:479` @v0.83.0, byte-identical to `migrations.ts:112`):
+/// ``const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;``
+/// The first `replace` is anchored and carries **no `g` flag**, so exactly one separator is
+/// removed; only the second is global. `str::trim_start_matches` removes ALL leading matches, so a
+/// UNC (`\\srv\share`) or doubled-slash cwd encoded to a different directory name than pi's
+/// (`--srv-share--` vs pi's `---srv-share--`), making pi- and cyrup-written session trees mutually
+/// invisible for those cwds.
 pub fn encode_cwd(cwd: &Path) -> String {
     let raw = cwd.to_string_lossy();
-    let trimmed = raw.trim_start_matches(['/', '\\']);
+    let trimmed = raw.strip_prefix('/').or_else(|| raw.strip_prefix('\\')).unwrap_or(&raw);
     let mapped: String = trimmed
         .chars()
         .map(|c| if matches!(c, '/' | '\\' | ':') { '-' } else { c })

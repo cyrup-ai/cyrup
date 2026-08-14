@@ -829,3 +829,67 @@ fn a_motion_between_two_kills_starts_a_new_kill_ring_entry() {
     ed.handle_key(&ctrl('k')); // kill "hello " into a NEW entry
     assert_eq!(ed.kill_ring_top(), Some("hello "), "a motion must break the kill run");
 }
+
+/// TUI-061 — `set_text` is Pi's PROGRAMMATIC `setText`, not the internal one.
+///
+/// RED at HEAD: one `set_text` served both the programmatic replacement and history browsing, so a
+/// programmatic buffer replacement left the paste registry live (a subsequently hand-typed
+/// `[paste #1 …]` still expanded — TUI-049's surface, narrowed but not closed by that fix) and was
+/// not undoable. Pi splits them: `setText` (`editor.ts:1010-1021` @v0.83.0) cancels the
+/// autocomplete, clears `lastAction`, exits history browsing, pushes an undo snapshot **when the
+/// content actually differs**, and does `this.pastes.clear(); this.pasteCounter = 0;` before
+/// delegating; `setTextInternal` (`:1043-1056`) — "Internal setText that doesn't reset history
+/// state - used by navigateHistory" — does none of it.
+#[test]
+fn set_text_clears_the_paste_registry_and_is_undoable() {
+    let mut ed = InputEditor::new();
+    ed.handle_paste(&"x".repeat(1500));
+    assert_eq!(ed.text(), "[paste #1 1500 chars]");
+    assert!(ed.expanded_text().contains(&"x".repeat(1500)));
+
+    ed.set_text("replaced");
+    // The registry is gone, so a hand-retyped marker is literal text.
+    ed.set_text("[paste #1 1500 chars]");
+    assert_eq!(
+        ed.expanded_text(),
+        "[paste #1 1500 chars]",
+        "a programmatic replacement must clear the registry"
+    );
+}
+
+/// The undo snapshot half: a `set_text` that CHANGES the content is undoable (`editor.ts:1015-1017`,
+/// "makes programmatic changes undoable").
+#[test]
+fn a_programmatic_set_text_is_undoable() {
+    let mut ed = InputEditor::new();
+    ed.set_text("before");
+    ed.set_text("after");
+    ed.handle_key(&KeyEvent::new(KeyCode::Char('-'), KeyModifiers::CONTROL));
+    assert_eq!(ed.text(), "before", "Ctrl+- must undo a programmatic replacement");
+}
+
+/// Browsing history must NOT go through the external form — it uses `setTextInternal`, so the draft
+/// it is about to restore keeps its registry (`navigateHistory`, `editor.ts:435-452`).
+#[test]
+fn browsing_history_does_not_clear_the_draft_registry() {
+    let mut ed = InputEditor::new();
+    ed.push_history("older");
+    ed.handle_paste(&"y".repeat(1500));
+    assert_eq!(ed.text(), "[paste #1 1500 chars]");
+    // Up only recalls history when the caret is already at the start of a non-empty buffer:
+    // `editor.ts:821-831` gates on `isOnFirstVisualLine() && (isEditorEmpty() || historyIndex > -1
+    // || cursorCol === 0)` and otherwise does `moveToLineStart()`. The paste leaves the caret at
+    // the end of the marker, so the first Up is that line-start move and the buffer is untouched.
+    ed.handle_key(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(ed.text(), "[paste #1 1500 chars]", "the first Up only parks the caret at col 0");
+    assert_eq!(ed.cursor(), (0, 0), "…which is what makes the next Up eligible");
+    // Now Up into history, then Down back to the draft.
+    ed.handle_key(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(ed.text(), "older");
+    ed.handle_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(ed.text(), "[paste #1 1500 chars]");
+    assert!(
+        ed.expanded_text().contains(&"y".repeat(1500)),
+        "the draft's paste registry must survive a history round trip"
+    );
+}

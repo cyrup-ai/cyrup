@@ -13,6 +13,10 @@ use std::sync::Arc;
 /// The notify-only subscriber handed to the agent (arch-08 §3.1).
 pub struct ExtSubscriber {
     dispatcher: Arc<Dispatcher>,
+    /// The subscriber-lifetime token. Superseded per-event by the `cancel` argument pi passes to
+    /// every listener (`agent.ts:574` @v0.83.0); kept because [`ExtSubscriber::new`] is public API
+    /// and callers construct with it.
+    #[allow(dead_code)]
     cancel: CancelToken,
     /// Turn counter mirroring Pi's `AgentSession._turnIndex` (agent-session.ts:302/616/635). The
     /// upstream `AgentEvent::{TurnStart, TurnEnd}` are payload-less, so — exactly like Pi's
@@ -31,7 +35,13 @@ impl ExtSubscriber {
 
 #[async_trait::async_trait]
 impl EventSubscriber for ExtSubscriber {
-    async fn on_event(&self, event: &AgentEvent) {
+    /// `cancel` is the run's abort signal, the second argument pi passes to every listener
+    /// (`await listener(event, signal)`, `packages/agent/src/agent.ts:574` @v0.83.0) — a FRESH
+    /// child of the run token, so it is what a dispatched handler should race against rather than
+    /// the subscriber-lifetime token captured at construction. The captured
+    /// [`ExtSubscriber::cancel`] stays as the fallback for a caller that hands us a token detached
+    /// from any run.
+    async fn on_event(&self, event: &AgentEvent, cancel: CancelToken) {
         // Maintain the Pi turn counter BEFORE the subscription gate so the index stays correct even
         // when the intervening events have no subscribers (Pi agent-session.ts:615-635). `agent_start`
         // resets; `turn_end` reads-then-increments (fetch_add returns the pre-increment value, which
@@ -60,6 +70,6 @@ impl EventSubscriber for ExtSubscriber {
             }
             other => other,
         };
-        self.dispatcher.dispatch_notify(&host_ev, &self.cancel).await;
+        self.dispatcher.dispatch_notify(&host_ev, &cancel).await;
     }
 }

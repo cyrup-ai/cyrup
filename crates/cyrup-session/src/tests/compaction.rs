@@ -16,7 +16,8 @@ use cyrup_provider::{CacheRetention, Model, RetryPolicy, StreamOptions};
 use crate::compaction::cutpoint::{find_cut_point, CutPoint};
 use crate::compaction::hooks::{
     BeforeCompactDecision, BeforeCompactEvent, BeforeTreeDecision, BeforeTreeEvent,
-    CompactionHooks, CompactionReason, PostCompactEvent, PostTreeEvent,
+    BeforeTreeOverrides, BranchSummaryEntry, CompactionHooks, CompactionOverride, CompactionReason,
+    PostCompactEvent, PostTreeEvent,
 };
 use crate::compaction::summarize::{
     ProviderSummarizer, SummarizationRequest, Summarizer,
@@ -114,7 +115,7 @@ fn msg_entry(id: &str, parent: Option<&str>, message: Message) -> Entry {
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
-        },
+ extra: Default::default() },
         message: AgentMessage::Core(message),
     })
 }
@@ -180,7 +181,7 @@ impl CompactionHooks for ScriptHooks {
         _ev: &BeforeTreeEvent,
         _cancel: CancelToken,
     ) -> Result<BeforeTreeDecision, CompactionError> {
-        Ok(self.before_tree.lock().unwrap().clone().unwrap_or(BeforeTreeDecision::Proceed))
+        Ok(self.before_tree.lock().unwrap().clone().unwrap_or(BeforeTreeDecision::proceed()))
     }
     async fn post_tree(&self, ev: &PostTreeEvent) {
         self.post_tree.lock().unwrap().push(ev.clone());
@@ -519,9 +520,19 @@ async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
         .unwrap()
         .expect("branch summary should be appended");
 
-    // Appended at the navigation point: from_id is the abandoned leaf, parent is the target.
-    assert_eq!(entry.from_id, l1, "from_id is the leaf navigated from (R-05-016)");
+    // SESS-017/SESS-032: Pi's `branchWithSummary` sets `leafId`, `parentId` AND `fromId` from ONE
+    // value — the navigation target (`session-manager.ts:1391-1397`), called with `newLeafId` at
+    // `agent-session.ts:3040-3046` under the comment "Summary is attached at the navigation target
+    // position (newLeafId), not the old branch". These two assertions previously contradicted each
+    // other (`from_id` = abandoned leaf, `parent_id` = target) and cited `R-05-016`, which is not
+    // in this workspace and cannot be used to defend behaviour contradicting pi's code.
+    assert_eq!(entry.from_id, l2, "fromId is the navigation TARGET (session-manager.ts:1397)");
     assert_eq!(entry.parent_id.as_ref(), Some(&l2), "appended at the navigation point");
+    assert_eq!(
+        Some(entry.from_id.clone()),
+        entry.parent_id,
+        "pi's invariant: fromId == parentId == the new leaf"
+    );
 
     // The abandoned branch is never deleted (R-05-017).
     assert!(m.entry(&b1q).is_some());
@@ -530,8 +541,11 @@ async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
 }
 
 #[test]
-fn branch_budget_is_reserve_tokens_newest_first() {
-    // prepare_branch_entries uses the branchSummary.reserveTokens budget, newest-first (R-05-016).
+fn prepare_branch_entries_fills_the_token_budget_newest_first() {
+    // `prepare_branch_entries` fills the caller-supplied token budget newest-first
+    // (`branch-summarization.ts:315` @v0.83.0). The budget itself is
+    // `(model.contextWindow || 128000) − reserveTokens` (`:312-313`), NOT `reserveTokens` — see
+    // `branch::branch_token_budget`; this test passes the already-computed budget directly.
     let entries = vec![
         msg_entry("e0", None, user(&"old ".repeat(40))),
         msg_entry("e1", Some("e0"), assistant(&"mid ".repeat(40))),
@@ -651,6 +665,7 @@ async fn a05_9_before_tree_cancel_and_replace() {
         *hooks.before_tree.lock().unwrap() = Some(BeforeTreeDecision::CustomSummary {
             summary: "REPLACED-BRANCH-SUMMARY".to_string(),
             details: None,
+            overrides: BeforeTreeOverrides::default(),
         });
         let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
 
@@ -764,7 +779,7 @@ fn g1_tokens_before_pure_core_raw_equals_rendered() {
 #[test]
 fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
     fn base(id: &str, parent: Option<&str>) -> EntryBase {
-        EntryBase { id: EntryId::from(id), parent_id: parent.map(EntryId::from), timestamp: "2026-01-01T00:00:00Z".into() }
+        EntryBase { id: EntryId::from(id), parent_id: parent.map(EntryId::from), timestamp: "2026-01-01T00:00:00Z".into(), extra: Default::default() }
     }
 
     // e1: user core message (content len 42 → 11)
@@ -900,7 +915,9 @@ async fn g3_empty_branch_appends_no_content_placeholder() {
 
     assert_eq!(entry.summary, BRANCH_SUMMARY_EMPTY_PLACEHOLDER);
     assert_eq!(entry.summary, "No content to summarize");
-    assert_eq!(entry.from_id, abandoned, "from_id is the abandoned leaf navigated from");
+    // SESS-017/SESS-032: `fromId` is the navigation TARGET, not the abandoned leaf
+    // (`session-manager.ts:1391-1397`).
+    assert_eq!(entry.from_id, shared_a, "fromId is the navigation TARGET");
     assert_eq!(entry.parent_id.as_ref(), Some(&shared_a), "appended at the navigation target");
     // The abandoned branch is never deleted (R-05-017).
     assert!(m.entry(&abandoned).is_some());
@@ -914,7 +931,7 @@ fn custom_message_entry(id: &str, parent: Option<&str>, content: &str) -> Entry 
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
-        },
+ extra: Default::default() },
         custom_type: "ext.injected".to_string(),
         content: json!(content),
         display: true,
@@ -928,7 +945,7 @@ fn branch_summary_entry(id: &str, parent: Option<&str>, summary: &str) -> Entry 
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
-        },
+ extra: Default::default() },
         summary: summary.to_string(),
         from_id: EntryId::from("from"),
         details: None,
@@ -1012,7 +1029,7 @@ fn sess002_back_scan_stops_at_a_context_visible_entry() {
                 id: EntryId::from("e1"),
                 parent_id: Some(EntryId::from("e0")),
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
-            },
+ extra: Default::default() },
             provider: "p".into(),
             model_id: "m".into(),
         }),
@@ -1036,7 +1053,7 @@ fn sess002_previous_compaction_summary_counts_toward_the_keep_recent_budget() {
                 id: EntryId::from("e1"),
                 parent_id: Some(EntryId::from("e0")),
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
-            },
+ extra: Default::default() },
             summary: prior_summary,
             first_kept_entry_id: Some(EntryId::from("e0")),
             tokens_before: 99_999,
@@ -1072,7 +1089,7 @@ fn agent_msg_entry(id: &str, parent: Option<&str>, message: AgentMessage) -> Ent
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
-        },
+ extra: Default::default() },
         message,
     })
 }
@@ -1111,7 +1128,7 @@ impl CompactionHooks for CapturingHooks {
         _ev: &BeforeTreeEvent,
         _cancel: CancelToken,
     ) -> Result<BeforeTreeDecision, CompactionError> {
-        Ok(BeforeTreeDecision::Proceed)
+        Ok(BeforeTreeDecision::proceed())
     }
     async fn post_tree(&self, _ev: &PostTreeEvent) {}
 }
@@ -1416,7 +1433,7 @@ fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
                 id: EntryId::from("m9"),
                 parent_id: None,
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
-            },
+ extra: Default::default() },
             summary: "prior".to_string(),
             first_kept_entry_id: Some(EntryId::from("m0")),
             tokens_before: 10,
@@ -1429,7 +1446,7 @@ fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
                 id: EntryId::from("m10"),
                 parent_id: None,
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
-            },
+ extra: Default::default() },
             provider: "p".into(),
             model_id: "m".into(),
         }),
@@ -1438,7 +1455,7 @@ fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
                 id: EntryId::from("m11"),
                 parent_id: None,
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
-            },
+ extra: Default::default() },
             custom_type: "ext.state".to_string(),
             data: None,
         }),
@@ -2392,7 +2409,7 @@ fn compaction_entry_with_details(
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
-        },
+ extra: Default::default() },
         summary: "PRIOR SUMMARY".to_string(),
         first_kept_entry_id: Some(EntryId::from(first_kept)),
         tokens_before: 100,
@@ -2460,7 +2477,7 @@ fn g21_prepare_branch_entries_ignores_from_hook_details() {
                 id: EntryId::from("b1"),
                 parent_id: None,
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
-            },
+ extra: Default::default() },
             from_id: EntryId::from("from"),
             summary: "abandoned branch summary".to_string(),
             details: Some(prev_details()),
@@ -2488,4 +2505,262 @@ fn g21_prepare_branch_entries_ignores_from_hook_details() {
             "from_hook={pi_generated:?}"
         );
     }
+}
+
+// ================================================================= area-03 2026-08-14 pass ======
+//
+// Upstream citations are `pi` @ v0.83.0 (`git show v0.83.0:packages/coding-agent/src/<path>`).
+
+/// SESS-022 — `run_branch_summary` must gate the default summarizer on the USER's choice alone.
+///
+/// Pi: `if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary)`
+/// (`agent-session.ts:2983`). `skipPrompt` never appears in `agent-session.ts`; its only consumer
+/// repo-wide is `interactive-mode.ts:4672`, which decides whether to ASK. cyrup consulted
+/// `settings.skip_prompt` in the core, so `skip_prompt == false` (the default) made
+/// `user_wants_summary = false` fall through to the generator, billing an LLM call and appending an
+/// unwanted entry.
+#[tokio::test]
+async fn sess022_declined_summary_never_calls_the_summarizer_or_appends() {
+    let model = faux_model();
+    for skip_prompt in [false, true] {
+        let rec = Arc::new(RecordingSummarizer::new(vec!["SHOULD-NEVER-RUN"]));
+        let compactor = Compactor::new(RecordingArc(rec.clone()), ScriptHooks::default());
+        let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt };
+
+        let cwd = PathBuf::from("/proj/sess022");
+        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+        m.append_message(user("shared")).unwrap();
+        let shared = m.append_message(assistant("shared-a")).unwrap();
+        m.append_message(user("abandoned question")).unwrap();
+        let abandoned = m.append_message(assistant("abandoned answer")).unwrap();
+        let before = m.entries().len();
+
+        let out = compactor
+            .run_branch_summary(
+                &mut m,
+                &model,
+                shared.clone(),
+                Some(abandoned),
+                /* user_wants_summary */ false,
+                &settings,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.is_none(), "skip_prompt={skip_prompt}: no summary entry is returned");
+        assert!(
+            rec.prompts().is_empty(),
+            "skip_prompt={skip_prompt}: the summarizer must never be invoked"
+        );
+        assert_eq!(m.entries().len(), before, "skip_prompt={skip_prompt}: nothing appended");
+        // The navigation itself still happens (pi's gate is on the summary, not the move).
+        assert_eq!(m.leaf_id(), Some(&shared), "skip_prompt={skip_prompt}: leaf moved");
+    }
+}
+
+/// SESS-034 — the before-tree hook's `customInstructions` / `replaceInstructions` / `label` reach
+/// the generator and the appended entry.
+///
+/// Pi reads all three off the single `SessionBeforeTreeResult` (`agent-session.ts:2968-2976`) and
+/// `generateBranchSummary` selects the instructions at `branch-summarization.ts:326-334`; the label
+/// is attached to the summary entry at `agent-session.ts:3050-3052`.
+#[tokio::test]
+async fn sess034_before_tree_instructions_and_label_reach_the_generator() {
+    let model = faux_model();
+
+    async fn run(
+        decision: BeforeTreeDecision,
+    ) -> (Vec<String>, SessionManager, Option<BranchSummaryEntry>) {
+        let rec = Arc::new(RecordingSummarizer::new(vec!["S"]));
+        let hooks = ScriptHooks::default();
+        *hooks.before_tree.lock().unwrap() = Some(decision);
+        let compactor = Compactor::new(RecordingArc(rec.clone()), hooks);
+        let settings = BranchSummarySettings::default();
+
+        let cwd = PathBuf::from("/proj/sess034");
+        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+        m.append_message(user("shared")).unwrap();
+        let shared = m.append_message(assistant("shared-a")).unwrap();
+        m.append_message(user("abandoned question")).unwrap();
+        let abandoned = m.append_message(assistant("abandoned answer")).unwrap();
+        let entry = compactor
+            .run_branch_summary(
+                &mut m,
+                &faux_model(),
+                shared,
+                Some(abandoned),
+                true,
+                &settings,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        (rec.prompts(), m, entry)
+    }
+    let _ = &model;
+
+    // (a) customInstructions alone → appended after the standard prompt.
+    let (prompts, _m, _e) = run(BeforeTreeDecision::Proceed {
+        overrides: BeforeTreeOverrides {
+            custom_instructions: Some("focus on the API surface".into()),
+            ..BeforeTreeOverrides::default()
+        },
+    })
+    .await;
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].contains("Additional focus: focus on the API surface"),
+        "branch-summarization.ts:331; got:\n{}",
+        prompts[0]
+    );
+    assert!(prompts[0].contains(crate::compaction::BRANCH_SUMMARY_PROMPT), "prompt still present");
+
+    // (b) replaceInstructions + customInstructions → the custom text ALONE.
+    let (prompts, _m, _e) = run(BeforeTreeDecision::Proceed {
+        overrides: BeforeTreeOverrides {
+            custom_instructions: Some("ONLY THIS".into()),
+            replace_instructions: Some(true),
+            ..BeforeTreeOverrides::default()
+        },
+    })
+    .await;
+    assert!(prompts[0].ends_with("ONLY THIS"), "branch-summarization.ts:329; got:\n{}", prompts[0]);
+    assert!(
+        !prompts[0].contains(crate::compaction::BRANCH_SUMMARY_PROMPT),
+        "replaceInstructions drops the standard prompt"
+    );
+
+    // (c) replaceInstructions WITHOUT customInstructions → pi's `&&` makes it a no-op.
+    let (prompts, _m, _e) = run(BeforeTreeDecision::Proceed {
+        overrides: BeforeTreeOverrides {
+            replace_instructions: Some(true),
+            ..BeforeTreeOverrides::default()
+        },
+    })
+    .await;
+    assert!(prompts[0].contains(crate::compaction::BRANCH_SUMMARY_PROMPT));
+
+    // (d) label → attached to the SUMMARY entry (agent-session.ts:3050-3052).
+    let (_prompts, m, entry) = run(BeforeTreeDecision::Proceed {
+        overrides: BeforeTreeOverrides {
+            label: Some("explored".into()),
+            ..BeforeTreeOverrides::default()
+        },
+    })
+    .await;
+    let entry = entry.expect("a summary was produced");
+    assert_eq!(m.label(&entry.id), Some("explored"), "label lands on the summary entry");
+}
+
+/// SESS-042 — a cancel landing before the append must not mutate the session file, on ANY of the
+/// three summary sources.
+///
+/// Pi re-tests the signal immediately before `appendCompaction`, unconditionally: the manual path
+/// throws `new Error("Compaction cancelled")` (`agent-session.ts:1868-1870`) and the auto path
+/// emits `compaction_end { result: undefined, aborted: true }` and returns `false` (`:2142-2151`).
+#[tokio::test]
+async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
+    let model = faux_model();
+
+    // A hook that cancels the token WHILE producing a custom summary — the exact window pi guards.
+    struct CancellingHook {
+        cancel: CancelToken,
+        summary: Mutex<Option<BeforeCompactDecision>>,
+    }
+    impl CompactionHooks for CancellingHook {
+        async fn before_compact(
+            &self,
+            _ev: &BeforeCompactEvent,
+            _cancel: CancelToken,
+        ) -> Result<BeforeCompactDecision, CompactionError> {
+            self.cancel.cancel();
+            Ok(self.summary.lock().unwrap().take().unwrap_or(BeforeCompactDecision::Proceed))
+        }
+        async fn post_compact(&self, _ev: &PostCompactEvent) {
+            panic!("post_compact must not fire for a cancelled compaction");
+        }
+        async fn before_tree(
+            &self,
+            _ev: &BeforeTreeEvent,
+            _cancel: CancelToken,
+        ) -> Result<BeforeTreeDecision, CompactionError> {
+            Ok(BeforeTreeDecision::proceed())
+        }
+        async fn post_tree(&self, _ev: &PostTreeEvent) {}
+    }
+
+    fn seeded(dir: &str) -> SessionManager {
+        let mut m =
+            SessionManager::in_memory(&PathBuf::from(dir), NewSessionOpts::default()).unwrap();
+        m.append_message(user("q one with enough words to matter here now")).unwrap();
+        m.append_message(assistant("a one with enough words to matter here now")).unwrap();
+        m.append_message(user("q two with enough words to matter here now")).unwrap();
+        m.append_message(assistant("a two with enough words to matter here now")).unwrap();
+        m
+    }
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+
+    // (a) hook-supplied `Custom` summary — the only path with no cancellation awareness at all.
+    let cancel = CancelToken::new();
+    let hooks = CancellingHook {
+        cancel: cancel.clone(),
+        summary: Mutex::new(Some(BeforeCompactDecision::Custom {
+            summary: "HOOK-SUMMARY".into(),
+            first_kept_entry_id: EntryId::from("deadbeef"),
+            tokens_before: 1,
+            details: None,
+            usage: None,
+        })),
+    };
+    let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
+    let mut m = seeded("/proj/sess042a");
+    let before = m.entries().len();
+    let err = compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &settings,
+            CompactionReason::Manual,
+            None,
+            false,
+            cancel,
+        )
+        .await
+        .expect_err("a cancelled compaction is an error, not a success");
+    assert!(matches!(err, CompactionError::Aborted), "got {err:?}");
+    assert!(!has_compaction(&m), "no compaction entry is written after a cancel");
+    assert_eq!(m.entries().len(), before, "the session file is not mutated");
+
+    // (b) extension override — `run_compaction_prepared`'s `external_override` branch.
+    let cancel = CancelToken::new();
+    let compactor = Compactor::new(
+        RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))),
+        ScriptHooks::default(),
+    );
+    let mut m = seeded("/proj/sess042b");
+    let (prep, branch_entries) = compactor.prepare(&m, &settings).expect("something to compact");
+    let before = m.entries().len();
+    cancel.cancel();
+    let err = compactor
+        .run_compaction_prepared(
+            &mut m,
+            &model,
+            &settings,
+            CompactionReason::Threshold,
+            None,
+            false,
+            &prep,
+            branch_entries,
+            Some(CompactionOverride {
+                summary: "EXT-SUMMARY".into(),
+                ..CompactionOverride::default()
+            }),
+            cancel,
+        )
+        .await
+        .expect_err("a cancelled compaction is an error");
+    assert!(matches!(err, CompactionError::Aborted), "got {err:?}");
+    assert!(!has_compaction(&m), "an extension override is not exempt from the abort re-check");
+    assert_eq!(m.entries().len(), before);
 }

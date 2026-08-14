@@ -26,6 +26,7 @@ mod dialog_envelope_spacers;
 mod diff;
 mod edit_preview;
 mod editor;
+mod escape_chain;
 mod editor_fidelity;
 mod editor_min_height;
 mod editor_page_actions;

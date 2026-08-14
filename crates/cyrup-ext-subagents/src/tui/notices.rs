@@ -378,21 +378,32 @@ impl ControlNoticeState {
         sink: Arc<S>,
     ) {
         let key = ev.key.clone();
-        let debounce = {
-            let mut guard = state.lock().await;
-            // Coalesce: abort any timer already pending for this key before arming a fresh one,
-            // so a burst of repeated "still needs attention" pings for the same run+kind collapses
-            // to one re-armed wait rather than N racing deliveries.
-            if let Some(old) = guard.pending.remove(&key) {
-                old.abort();
-            }
-            guard.debounce
-        };
+        // ONE critical section spans coalesce -> arm -> register, mirroring the fact that pi does
+        // all three in a single synchronous block (`clearTimeout` / `setTimeout` / `pending.set`,
+        // `extension/control-notices.ts:84-91` @`6a26f25^`, the pre-v0.43.0 shape this module
+        // ports). JS cannot interleave a timer callback with the block that arms it; Rust can, and
+        // splitting this into two lock acquisitions around a `tokio::spawn` opened a window where a
+        // short-debounce timer fires, removes its (not-yet-present) key, and then has its already
+        // dead `JoinHandle` inserted by the arming task — leaving `pending` permanently claiming a
+        // timer that has already delivered, so the next ping "coalesces" against nothing.
+        let mut guard = state.lock().await;
+        // Coalesce: abort any timer already pending for this key before arming a fresh one,
+        // so a burst of repeated "still needs attention" pings for the same run+kind collapses
+        // to one re-armed wait rather than N racing deliveries.
+        if let Some(old) = guard.pending.remove(&key) {
+            old.abort();
+        }
+        // The deadline is fixed HERE, at ping time, exactly as pi's `setTimeout(…, delayMs)`
+        // (`extension/control-notices.ts:85` @`6a26f25^`) fixes it at call time. Constructing the
+        // `Sleep` inside the spawned task instead would start the countdown at the task's FIRST
+        // POLL — an unbounded, scheduler-dependent amount of time later — so a coalescing ping
+        // would push the fire time out by however long the runtime took to pick the task up.
+        let timer = tokio::time::sleep(guard.debounce);
 
         let state_for_task = Arc::clone(state);
         let key_for_task = key.clone();
         let handle = tokio::spawn(async move {
-            tokio::time::sleep(debounce).await;
+            timer.await;
             // Fire: re-validate against LIVE state at this exact moment, never against whatever
             // was true when this timer was scheduled (R-SA-116's core correctness property).
             let mut guard = state_for_task.lock().await;
@@ -407,7 +418,6 @@ impl ControlNoticeState {
             // changed step index, or is no longer in the needs-attention activity state (R-SA-116).
         });
 
-        let mut guard = state.lock().await;
         guard.pending.insert(key, handle);
     }
 
@@ -899,7 +909,17 @@ mod tests {
     // rather than both timers independently firing.
     // ---------------------------------------------------------------------------------------
 
-    #[tokio::test]
+    /// SUBA-032 — this used to be three REAL-clock sleeps (20/45/40 ms) around a 60 ms debounce,
+    /// with the load-bearing "must not have fired yet" assertion landing 15 ms inside the deadline
+    /// and an overshoot on the SECOND sleep being fatal. On a loaded box the second sleep
+    /// overshoots, the test flakes, a flaky test gets `#[ignore]`d, and the debounce loses coverage
+    /// entirely. The in-repo precedent is commit `1806375`, which removed a structurally identical
+    /// assertion from `cyrup-ext/src/caps/proc.rs`.
+    ///
+    /// `start_paused = true` puts the runtime on a virtual clock: `tokio::time::advance` moves it
+    /// by an EXACT amount and nothing else can, so the margins below are not margins at all — they
+    /// are the actual timeline. Runtime is ~0 regardless of machine load.
+    #[tokio::test(start_paused = true)]
     async fn a_second_ping_before_fire_time_coalesces_the_pending_timer() {
         let state = Arc::new(AsyncMutex::new(ControlNoticeState::with_debounce(
             Duration::from_millis(60),
@@ -924,21 +944,30 @@ mod tests {
         }
 
         // Re-ping partway through the first window — this must abort/replace the first timer.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::advance(Duration::from_millis(20)).await;
         let ev2 = needs_attention_notice(&run_id, Some("scout"), Some(0), RunSource::Foreground);
         ControlNoticeState::handle(&state, ev2, Arc::clone(&sink)).await;
 
-        // Only 45ms after the SECOND ping (65ms after the first) — if the first timer had not
-        // been coalesced away it would already have fired by now (60ms after the first ping).
-        tokio::time::sleep(Duration::from_millis(45)).await;
+        // t = 65 ms: 45 ms after the SECOND ping, and 5 ms PAST where the first timer would have
+        // fired (60 ms after the first ping). On the virtual clock this is exact, so the assertion
+        // below is a statement about the coalescing, not about scheduler luck.
+        tokio::time::advance(Duration::from_millis(45)).await;
+        tokio::task::yield_now().await;
         assert_eq!(
             sink.count(),
             0,
             "the original timer must have been aborted, not allowed to fire independently"
         );
 
-        // Now wait past the second timer's own window.
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        // t = 105 ms, past the second timer's own 80 ms deadline.
+        tokio::time::advance(Duration::from_millis(40)).await;
+        // The delivery runs in a spawned task; yield until it has been polled to completion.
+        for _ in 0..8 {
+            if sink.count() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(sink.count(), 1, "the re-armed (coalesced) timer must still eventually fire");
     }
 

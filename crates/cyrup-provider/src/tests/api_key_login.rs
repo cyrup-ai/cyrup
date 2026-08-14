@@ -1,8 +1,18 @@
-//! CFG-005 / PROV-003 — [`ApiKeyAuth::login`], the four multi-secret api-key setups.
+//! CFG-005 / PROV-003 — [`ApiKeyAuth::login`], with the four multi-secret api-key setups as the
+//! cases that matter.
 //!
 //! pi's `ApiKeyAuth` carries an OPTIONAL `login?(interaction): Promise<ApiKeyCredential>`
 //! (`ai/src/auth/types.ts:166`, *"Interactive setup (prompt for key/provider env). Absent =
-//! ambient-only."*). Four built-ins implement it, and **none of them is a single secret**:
+//! ambient-only."*). Optional is not the same as rare: `envApiKeyAuth` — which every plain env-var
+//! provider is built from — **always** defines it (`ai/src/auth/helpers.ts:12-15` @v0.83.0), and so
+//! does the bespoke `anthropicApiKeyAuth` (`providers/anthropic.ts:12-15`). Surveying every
+//! `packages/ai/src/providers/*.ts` at v0.83.0, the ONLY api-key strategy with no `login` is the
+//! faux provider's inline `{ name: "Faux", resolve: async () => ({ auth: {} }) }`
+//! (`providers/faux.ts:527`); cyrup's ambient-only counterpart is
+//! [`crate::auth::keyless_local`], whose strategy takes the trait default.
+//!
+//! What distinguishes the four below is not *having* a login but needing MORE THAN ONE answer,
+//! which is what a single-secret prompt cannot supply:
 //!
 //! | provider | prompts | pi |
 //! |---|---|---|
@@ -54,35 +64,73 @@ fn answers(values: &[&str]) -> ScriptedInteraction {
     ScriptedInteraction::new(values.iter().map(|v| Ok((*v).to_string())).collect())
 }
 
-/// The four are the ONLY built-ins that declare an interactive api-key setup — the env-var
-/// strategies stay ambient-only, exactly as upstream's absent `login?` does.
+/// EVERY built-in api-key strategy declares an interactive setup — the four multi-secret ones
+/// because they write their own, the rest because `envApiKeyAuth` unconditionally attaches one
+/// (`ai/src/auth/helpers.ts:12-15` @v0.83.0). A registered provider that reports otherwise is a
+/// provider `/login` silently refuses to configure.
+///
+/// This test used to assert the opposite — that the four were the ONLY ones — which was the
+/// deleted `api_key_strategy_supports_login` sniffer's contract, not pi's.
 #[test]
-fn exactly_the_four_multi_secret_strategies_declare_a_login() {
-    let mut with_login: Vec<String> = all_providers()
+fn every_builtin_api_key_strategy_declares_a_login() {
+    let with_api_key: Vec<(String, Arc<dyn ApiKeyAuth>)> = all_providers()
         .into_iter()
-        .filter(|p| {
+        .filter_map(|p| {
+            let id = p.id().as_str().to_string();
             p.provider_auth()
-                .and_then(|a| a.api_key.as_ref())
-                .is_some_and(|s| s.supports_login())
+                .and_then(|a| a.api_key.clone())
+                .map(|s| (id, s))
         })
-        .map(|p| p.id().as_str().to_string())
         .collect();
-    with_login.sort();
-    assert_eq!(
-        with_login,
-        vec![
-            "amazon-bedrock".to_string(),
-            "cloudflare-ai-gateway".to_string(),
-            "cloudflare-workers-ai".to_string(),
-            "google-vertex".to_string(),
-        ]
+    assert!(
+        with_api_key.len() > 30,
+        "the registry lost its api-key providers: {}",
+        with_api_key.len()
+    );
+
+    let missing: Vec<&str> = with_api_key
+        .iter()
+        .filter(|(_, s)| !s.supports_login())
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these providers expose an api-key strategy that `/login` cannot drive: {missing:?}"
+    );
+
+    // The four multi-secret setups are named explicitly, so losing one of them is not absorbed by
+    // the blanket check above.
+    for id in [
+        "amazon-bedrock",
+        "cloudflare-ai-gateway",
+        "cloudflare-workers-ai",
+        "google-vertex",
+    ] {
+        assert!(
+            api_key_strategy(id).supports_login(),
+            "{id} owns a bespoke multi-secret login"
+        );
+    }
+
+    // The negative control that keeps the two assertions above falsifiable: if `supports_login`
+    // were hard-coded `true` on the trait they would still pass, so pin the one strategy that must
+    // answer `false` — cyrup's ambient-only `keyless_local`, the counterpart of pi's login-less
+    // faux strategy (`providers/faux.ts:527`).
+    assert!(
+        !crate::auth::keyless_local().supports_login(),
+        "keyless-local has no interactive setup — it resolves as `configured, no key`"
     );
 }
 
-/// An ambient-only strategy reports `LoginUnsupported`, matching upstream's absent `login?`.
+/// The ambient-only strategy — pi's absent `login?` — reports `LoginUnsupported` and mints nothing.
+///
+/// The subject used to be `anthropic`, which was simply false: `anthropicApiKeyAuth` defines
+/// `login: async (interaction) => ({ type: "api_key", key: await interaction.prompt({ type:
+/// "secret", message: "Enter Anthropic API key" }) })` (`providers/anthropic.ts:12-15` @v0.83.0).
+/// The real login-less case is [`crate::auth::keyless_local`].
 #[tokio::test]
-async fn env_key_strategies_report_login_unsupported() {
-    let strategy = api_key_strategy("anthropic");
+async fn the_ambient_only_strategy_reports_login_unsupported() {
+    let strategy = crate::auth::keyless_local();
     assert!(!strategy.supports_login());
     let interaction = answers(&["never-read"]);
     match strategy.login(&interaction).await {
@@ -90,6 +138,32 @@ async fn env_key_strategies_report_login_unsupported() {
         Err(other) => panic!("expected LoginUnsupported, got {other}"),
         Ok(_) => panic!("an ambient-only strategy must not mint a credential"),
     }
+    assert!(
+        interaction.prompts().is_empty(),
+        "a strategy with no login must not reach the user at all"
+    );
+}
+
+/// The other side of the same contract: an env-key strategy's login is pi's single secret prompt,
+/// verbatim — `interaction.prompt({ type: "secret", message: `Enter ${name}` })` returning
+/// `{ type: "api_key", key }` (`ai/src/auth/helpers.ts:12-15` @v0.83.0). One prompt, no env
+/// overlay; that is precisely the shape the four above cannot be served by.
+#[tokio::test]
+async fn env_key_strategies_mint_a_credential_from_one_secret_prompt() {
+    let strategy = api_key_strategy("openai");
+    assert!(strategy.supports_login());
+
+    let interaction = answers(&["sk-live"]);
+    let (key, env) = parts(&strategy.login(&interaction).await.expect("login"));
+    assert_eq!(key.as_deref(), Some("sk-live"));
+    assert!(env.is_empty(), "a single-secret login stores no env overlay");
+
+    let prompts = interaction.prompts();
+    assert_eq!(prompts.len(), 1, "envApiKeyAuth asks exactly once");
+    assert_eq!(prompts[0].kind, Some(AuthPromptKind::Secret));
+    // `name` is pi `envApiKeyAuth("OpenAI API key", ["OPENAI_API_KEY"])` (`providers/openai.ts:11`),
+    // and the message is the template literal `Enter ${name}`.
+    assert_eq!(prompts[0].message, "Enter OpenAI API key");
 }
 
 /// `providers/cloudflare-auth.ts:50-54` — a secret AND a text prompt; the account id lands in the

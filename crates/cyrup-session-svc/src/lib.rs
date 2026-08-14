@@ -46,7 +46,7 @@ pub use attribution::merge_provider_attribution_headers;
 pub use bash::{BashChunkSink, BashOptions, BashResult};
 pub use builder::{
     extension_discovery_roots, ExtensionFlagValue, NoTools, SessionBuilder, SessionConfig,
-    SessionTarget,
+    SessionTarget, TrustPromptFn,
 };
 pub use command::{SessionCommand, SessionCommandOutput};
 pub use error::SessionServiceError;
@@ -74,8 +74,9 @@ pub use runtime::{
 };
 pub use services::{AgentSessionServices, ExtensionLoadDiagnostic, StartupDiagnostics};
 pub use session::{
-    AgentSession, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult, NavigateTreeOptions,
-    NavigateTreeOutcome, ScopedModel, SessionDagKind, SessionDagNode,
+    AgentSession, BindOptions, DeleteMethod, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult,
+    NavigateTreeOptions, NavigateTreeOutcome, ScopedModel, SessionDagKind, SessionDagNode,
+    delete_session_file_at, rename_session_file_at,
 };
 pub use state::{
     CompactionResult, ContextUsage, SessionStateView, SessionStats, StatsContextUsage,
@@ -114,7 +115,11 @@ pub use cyrup_session::agent_message;
 /// Re-exported so the CLI bin can resolve `--session`/`--fork` partial-UUID + global-cross-project
 /// references (Pi `resolveSessionPath`, main.ts:163-189) without a direct `cyrup-session` dependency:
 /// [`list_in_dir`] lists a cwd's sessions and [`list_all`] scans every project under the root.
-pub use cyrup_session::layout::{SessionLayout, SessionsRoot};
+pub use cyrup_session::layout::{encode_cwd, SessionLayout, SessionsRoot};
+/// SESS-013: the ONE `findGitPaths` (pi `footer-data-provider.ts:16-48`, imported by both
+/// consumers at `resource-loader.ts:19`). Re-exported so `cyrup-tui`'s footer reads the shared
+/// definition instead of carrying a second copy of the same walk.
+pub use cyrup_session::git_paths::{find_git_paths, GitPaths};
 pub use cyrup_session::listing::{list_all, list_in_dir};
 pub use cyrup_tools::{Availability, PermissionPolicy};
 /// Re-exported so front-ends (`cyrup-modes` RPC `set_steering_mode`/`set_follow_up_mode`) can name

@@ -92,6 +92,7 @@ mod tests;
 pub use app::{
     crossterm_input_stream, extension_render, reanchor_inline_region, render,
     should_honor_extension_shutdown, tree_node_from_dag, App, AppAction, AppCommand, AppState,
+    CompactionQueued, ExtensionWidget,
     LoginProviderSource, RebuildBackend, TreeNavMsg,
 };
 pub use auth_select::{
@@ -131,9 +132,10 @@ pub use export::session_jsonl_to_html;
 pub use error::TuiError;
 pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
 pub use image::{
-    detect_capabilities, detect_capabilities_from, detect_capabilities_on_platform,
-    hyperlinks_supported, image_fallback_text, seed_hyperlink_support, ImageBlock, ImageProtocol,
-    ImageRenderer, TerminalCapabilities,
+    cached_capabilities, detect_capabilities, detect_capabilities_from,
+    detect_capabilities_on_platform, hyperlinks_supported, image_fallback_text,
+    reset_capabilities_cache, seed_capabilities, seed_hyperlink_support, set_capabilities,
+    ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities,
 };
 pub use keyboard_protocol::{
     current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,

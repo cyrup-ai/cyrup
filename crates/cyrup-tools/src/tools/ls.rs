@@ -83,7 +83,22 @@ impl Tool for LsTool {
             return Err(error::invalid(format!("Not a directory: {}", error::show(&abs))));
         }
 
-        let mut entries = self.fs.read_dir(&abs).await?;
+        // Pi ls.ts:147-152:
+        // ```
+        // try { entries = await ops.readdir(dirPath); }
+        // catch (e: any) { reject(new Error(`Cannot read directory: ${e.message}`)); return; }
+        // ```
+        // — a THIRD stable prefix beside `Path not found:` (ls.ts:129) and `Not a directory:`
+        // (ls.ts:141) above, distinguishing "exists, is a directory, cannot be enumerated"
+        // (mode `0300`, EIO, a permissions-stripped `.git/objects`) from the other two. The `?`
+        // used to propagate `FsOps::read_dir`'s raw `"<path>: <io error>"` wrapper, which carries
+        // none of the three prefixes. `read_dir` now builds its error with `error::io_errno`, so
+        // `{e}` renders Node-shaped — leading with the errno code, as `e.message` does upstream.
+        let mut entries = self
+            .fs
+            .read_dir(&abs)
+            .await
+            .map_err(|e| error::invalid(format!("Cannot read directory: {e}")))?;
         // Pi: `entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))` (ls.ts:150) —
         // case-insensitive, locale-aware Unicode collation (ICU-backed in the JS engine). Rust std
         // orders by Unicode scalar value, which diverges for accented/punctuation-adjacent names

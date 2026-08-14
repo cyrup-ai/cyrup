@@ -184,6 +184,8 @@ fn a_guest_descriptor_cannot_displace_an_already_owned_tool_name() {
     reg.register_guest_tool(
         "beta".into(),
         ToolDescriptor {
+            prepare_arguments: false,
+            render_shell: None,
             name: "shared".to_string(),
             label: "Shared".to_string(),
             description: "guest".to_string(),

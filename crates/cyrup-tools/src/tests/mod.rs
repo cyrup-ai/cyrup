@@ -8,6 +8,7 @@ mod edit_preview_diff;
 mod grep_context_zero_line_text;
 mod isolation;
 mod pi_schema;
+mod pi_tool_semantics;
 mod read_access_errno;
 mod read_model_vision;
 mod tools;

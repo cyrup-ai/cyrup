@@ -51,8 +51,8 @@ impl NativeExtension for LifecycleRecorder {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         let entry = match ev {
-            HostEvent::SessionStart { reason } => Some(format!("session_start:{reason}")),
-            HostEvent::SessionShutdown { reason } => Some(format!("session_shutdown:{reason}")),
+            HostEvent::SessionStart { reason, .. } => Some(format!("session_start:{reason}")),
+            HostEvent::SessionShutdown { reason, .. } => Some(format!("session_shutdown:{reason}")),
             _ => None,
         };
         if let Some(e) = entry

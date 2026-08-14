@@ -128,7 +128,7 @@ async fn manual_compaction_reports_tokens_after_over_pi_s_raw_context() {
          raw={pi_tokens} flattened={flattened_tokens}"
     );
     assert_eq!(
-        result.estimated_tokens_after, pi_tokens,
+        result.estimated_tokens_after, Some(pi_tokens),
         "estimatedTokensAfter must be estimateMessagesTokens(sessionContext.messages) over pi's \
          RAW AgentMessage context (agent-session.ts:1876 + :284-288), not over the convertToLlm \
          projection (which reports {flattened_tokens} — the wrapper prose pi never bills)"

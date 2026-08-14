@@ -106,7 +106,13 @@ async fn wasm_guest_compaction_override_lands_through_agent_session_compact() {
     // LiveHostServices (arch-08 §5.6). This is the production injection seam, identical to the
     // wasm_slash_command headline proof.
     let ext = session
-        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .load_wasm_extension(
+            ExtensionId::from("demo"),
+            &bytes,
+            // EXT-059: the grant is now explicit. `host_granted()` is the TOTAL grant these
+            // fixtures previously got implicitly from `load_wasm_extension`'s `load_wasm` call.
+            &cyrup_ext::Capabilities::host_granted(),
+        )
         .await
         .expect("load + init the live wasm extension");
 

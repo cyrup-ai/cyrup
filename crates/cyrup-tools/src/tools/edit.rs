@@ -116,8 +116,20 @@ impl Tool for EditTool {
     fn parameters(&self) -> &serde_json::Value {
         &self.params
     }
-    fn execution_mode(&self) -> cyrup_core::ExecMode {
-        cyrup_core::ExecMode::Sequential
+    // No `execution_mode` override (TOOL-006). Pi's `edit` definition object (edit.ts:303-311,
+    // `name` through `prepareArguments`) declares
+    // no `executionMode`; upstream serialization for mutators is `withFileMutationQueue`
+    // (edit.ts:316) alone, which cyrup already provides per-file via [`FileMutationLocks`] in
+    // `execute` below. Declaring `Sequential` here made `cyrup-agent`'s `any_seq`
+    // (agent.rs:905-908) serialize the WHOLE batch, reads and greps included.
+
+    /// Pi declares `renderShell: "self"` on the `edit` definition (edit.ts:310) — the only built-in
+    /// that does — so the shell suppresses its own outer frame and the tool's `renderCall` /
+    /// `renderResult` own the whole component. `cyrup-tui` already renders `edit` with pi's
+    /// component shape by hard-coding on the run name; declaring the kind here makes the
+    /// declaration honest and gives the TUI a value to branch on instead.
+    fn render_kind(&self) -> cyrup_core::ToolRenderKind {
+        cyrup_core::ToolRenderKind::SelfRendered
     }
 
     /// Pi wires the legacy-shape shim onto the tool DEFINITION as
@@ -146,8 +158,8 @@ impl Tool for EditTool {
              in one call",
         )
     }
-    fn prompt_guidelines(&self) -> &[&str] {
-        &[
+    fn prompt_guidelines(&self) -> Vec<&str> {
+        vec![
             "Use edit for precise changes (edits[].oldText must match exactly)",
             "When changing multiple separate locations in one file, use one edit call with multiple \
              entries in edits[] instead of multiple edit calls",
@@ -189,10 +201,25 @@ impl Tool for EditTool {
         let _guard = self.locks.guard(&abs, &cancel).await?;
 
         // R-03-021: validate writable before reading.
-        // Pi: `Could not edit file: ${path}. ${errorMessage}.` — note the trailing period
-        // (edit.ts:329). The `${errorMessage}` body itself (a Node errno string) is irreducible.
+        //
+        // Pi (edit.ts:330-334):
+        // ```
+        // const errorMessage =
+        //   error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
+        // throw new Error(`Could not edit file: ${path}. ${errorMessage}.`);
+        // ```
+        // — the BARE `Error code: EACCES` form, never the full Node message, plus the trailing
+        // period. The ternary is ported literally: [`error::errno_code_of`] is the `"code" in
+        // error` test, and a `ToolError` with no recoverable code takes Pi's `String(error)`
+        // branch. `LocalFs::access` builds the code into the message via `error::io_errno`
+        // (ops/local.rs) precisely so this arm can recover it; the access mode matches on both
+        // sides (edit.ts:96 `R_OK | W_OK`, ops/local.rs `libc::R_OK | libc::W_OK`).
         self.fs.access(&abs, Access::ReadWrite).await.map_err(|e| {
-            error::invalid(format!("Could not edit file: {}. {e}.", input.path))
+            let body = match error::errno_code_of(&e) {
+                Some(code) => format!("Error code: {code}"),
+                None => e.to_string(),
+            };
+            error::invalid(format!("Could not edit file: {}. {body}.", input.path))
         })?;
 
         let bytes = self.fs.read(&abs).await?;
@@ -219,6 +246,14 @@ impl Tool for EditTool {
         let restored = edit_diff::restore_line_endings(&new_body, ending);
         let final_text = if had_bom { format!("\u{feff}{restored}") } else { restored };
         self.fs.write_in_place(&abs, final_text.as_bytes()).await?;
+        // Pi's `throwIfAborted()` immediately AFTER `ops.writeFile` (edit.ts:352, the sibling of
+        // write.ts:224), before the diff is generated and the success value is built. The write is
+        // deliberately not undone — pi leaves the same bytes on disk and only reports the RESULT
+        // as aborted — and the mutation guard is still held, matching pi's "keep the queue locked
+        // until the current operation has settled" note at edit.ts:317-320.
+        if cancel.is_cancelled() {
+            return Err(error::aborted());
+        }
 
         let (diff, first_changed_line) =
             edit_diff::generate_diff_string(&applied.base_content, &new_body);

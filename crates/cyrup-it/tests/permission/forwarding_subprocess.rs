@@ -190,6 +190,15 @@ async fn forwarded_allow_crosses_process_and_lets_child_proceed() {
         agent_dir.path().to_path_buf(),
         services,
         Arc::new(Mutex::new(ExtensionConfig::default())),
+        // PERM-008: the watcher audits the forwarded request lifecycle
+        // (`forwarded_permission.request_created` / `.approved` / `.response_timed_out`), so it
+        // needs a trail. `detached` writes under `<agent_dir>/logs` with a default config.
+        Arc::new(cyrup_permission_system::AuditTrail::detached(
+            agent_dir.path().join("logs"),
+        )),
+        // These fixtures script a live human, so a UI IS present — the `has_ui` guard must not
+        // fail the forwarded ask closed.
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     );
 
     let child = spawn_child(agent_dir.path(), &parent_id, "echo hi", &sentinel, 20_000);
@@ -217,6 +226,15 @@ async fn forwarded_deny_crosses_process_and_blocks_child() {
         agent_dir.path().to_path_buf(),
         services,
         Arc::new(Mutex::new(ExtensionConfig::default())),
+        // PERM-008: the watcher audits the forwarded request lifecycle
+        // (`forwarded_permission.request_created` / `.approved` / `.response_timed_out`), so it
+        // needs a trail. `detached` writes under `<agent_dir>/logs` with a default config.
+        Arc::new(cyrup_permission_system::AuditTrail::detached(
+            agent_dir.path().join("logs"),
+        )),
+        // These fixtures script a live human, so a UI IS present — the `has_ui` guard must not
+        // fail the forwarded ask closed.
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     );
 
     let child = spawn_child(agent_dir.path(), &parent_id, "rm -rf /", &sentinel, 20_000);

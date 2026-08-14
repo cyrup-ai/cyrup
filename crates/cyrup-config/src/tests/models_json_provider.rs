@@ -26,13 +26,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::{ModelFile, load_models_file};
+use cyrup_core::{AssistantMessage, CancelToken, Content, ProviderId, StopReason, Usage};
 use cyrup_provider::api::{ApiImpl, EventSink};
 use cyrup_provider::{
     ApiId, ApiRegistry, AuthContext, AuthResult, Context, CreateModelsOptions, Credential,
     CredentialStore, HeaderMap, InMemoryCredentialStore, Model, Models, StreamEvent, StreamOptions,
     create_models,
 };
-use cyrup_core::{AssistantMessage, CancelToken, Content, ProviderId, StopReason, Usage};
 
 /// What the wire protocol was actually handed for one request.
 #[derive(Clone, Debug, Default)]
@@ -270,7 +270,11 @@ async fn a_malformed_provider_block_is_named_and_the_rest_of_the_file_still_comp
         BTreeMap::new(),
         Arc::new(InMemoryCredentialStore::new()) as Arc<dyn CredentialStore>,
     );
-    assert_eq!(errors.len(), 1, "exactly the bad block is reported: {errors:?}");
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly the bad block is reported: {errors:?}"
+    );
     assert!(
         errors[0].contains("broken"),
         "the message must name the offending provider: {}",
@@ -301,7 +305,10 @@ async fn auth_header_without_a_resolvable_key_fails_the_stream_not_the_process()
         BTreeMap::new(),
         Arc::new(InMemoryCredentialStore::new()) as Arc<dyn CredentialStore>,
     );
-    assert!(errors.is_empty(), "composition itself is credential-blind: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "composition itself is credential-blind: {errors:?}"
+    );
     let model = models.get_model("mycorp", "mycorp-large").unwrap();
     let message = models
         .complete(&model, &Context::default(), &StreamOptions::default())

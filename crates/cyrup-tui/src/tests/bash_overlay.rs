@@ -241,10 +241,18 @@ fn hotkeys_does_not_capture_navigation_keys() {
         "arrow keys must reach the editor's history browse, not a modal"
     );
 
-    // Esc likewise reaches the app as an interrupt instead of being spent dismissing a popup, and
-    // the help survives it because it is scrollback.
+    // Esc likewise reaches the APP instead of being spent dismissing a popup, and the help survives
+    // it because it is scrollback.
+    //
+    // **TUI-005** — the action it produces is now pi's. `defaultEditor.onEscape` is four mutually
+    // exclusive branches (`interactive-mode.ts:2569-2595` @v0.83.0) and a STREAMING turn takes the
+    // first one, `restoreQueuedMessagesToEditor({ abort: true })`. cyrup used to return a bare
+    // `Interrupt` for every non-streaming Escape, which is why this line read `Interrupt` before;
+    // an idle Escape on an empty buffer reaches pi's FOURTH branch (the double-Escape window) and
+    // aborts nothing, so asserting an abort there would pin behaviour upstream does not have.
     app.editor_mut().set_text("");
-    assert_eq!(app.handle_input(&key(KeyCode::Esc)), AppAction::Interrupt);
+    app.state_mut().status.set_streaming(true);
+    assert_eq!(app.handle_input(&key(KeyCode::Esc)), AppAction::InterruptRestoreQueued);
     assert!(
         app.state().transcript.pending().iter().any(
             |e| matches!(e, Entry::Block { title, .. } if title == "Keyboard Shortcuts")

@@ -36,7 +36,19 @@ pub struct WireProvider {
     store: Arc<dyn CredentialStore>,
     auth_ctx: Arc<dyn AuthContext>,
     registry: Arc<ApiRegistry>,
+    /// Pi `createProvider({ baseUrl })` (`models.ts:78` @v0.83.0) — PROV-017.
+    base_url: Option<String>,
+    /// Pi `createProvider({ headers })` (`models.ts:79` @v0.83.0) — PROV-017.
+    headers: Option<crate::HeaderMap>,
+    /// Pi `createProvider({ filterModels })` — the option `models.ts:545`/`:618` transports onto
+    /// the constructed provider, applied by `Models.getAvailable()` at `:407`. PROV-032.
+    filter_models: Option<FilterModelsFn>,
 }
+
+/// A provider's credential-scoped availability policy (Pi `Provider.filterModels?`,
+/// `models.ts:111` @v0.83.0). A plain fn pointer, because every upstream implementation is a
+/// stateless pure function of `(models, credential)`.
+pub type FilterModelsFn = fn(&[Model], Option<&crate::auth::Credential>) -> Vec<Model>;
 
 impl WireProvider {
     /// Construct a provider. `auth_ctx` defaults to the real-env [`EnvAuthContext`] via
@@ -57,7 +69,29 @@ impl WireProvider {
             store,
             auth_ctx: Arc::new(EnvAuthContext),
             registry,
+            base_url: None,
+            headers: None,
+            filter_models: None,
         }
+    }
+
+    /// Set the provider-level default base URL (Pi `createProvider({ baseUrl })`) — PROV-017.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Set the provider-level default headers (Pi `createProvider({ headers })`) — PROV-017.
+    pub fn with_headers(mut self, headers: crate::HeaderMap) -> Self {
+        self.headers = Some(headers);
+        self
+    }
+
+    /// Install the credential-scoped availability policy (Pi `createProvider({ filterModels })`) —
+    /// PROV-032. Applied only by `Models::get_available`, never by `models()`.
+    pub fn with_filter_models(mut self, filter: FilterModelsFn) -> Self {
+        self.filter_models = Some(filter);
+        self
     }
 
     /// Override the ambient auth context (for tests / custom env sources).
@@ -76,8 +110,31 @@ impl Provider for WireProvider {
         &self.id
     }
 
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    fn headers(&self) -> Option<&crate::HeaderMap> {
+        self.headers.as_ref()
+    }
+
     fn models(&self) -> &[Model] {
         &self.models
+    }
+
+    fn filter_models(
+        &self,
+        models: &[Model],
+        credential: Option<&crate::auth::Credential>,
+    ) -> Vec<Model> {
+        match self.filter_models {
+            Some(f) => f(models, credential),
+            None => models.to_vec(),
+        }
     }
 
     fn provider_auth(&self) -> Option<&ProviderAuth> {
@@ -257,7 +314,7 @@ mod tests {
             "p",
             "Test Provider",
             vec![model.clone()],
-            ProviderAuth::with_api_key(env_key(["P_API_KEY"])),
+            ProviderAuth::with_api_key(env_key("P API key", ["P_API_KEY"])),
             store_with_key(),
             Arc::new(registry),
         )
@@ -430,7 +487,7 @@ mod tests {
             "p",
             "P",
             vec![model.clone()],
-            ProviderAuth::with_api_key(env_key(["P_API_KEY"])),
+            ProviderAuth::with_api_key(env_key("P API key", ["P_API_KEY"])),
             Arc::new(InMemoryCredentialStore::new()),
             Arc::new(registry),
         )

@@ -52,7 +52,7 @@ impl ConfigProvider {
         };
         // `env_key` with no vars: a stored credential owns the provider (used here); with none stored
         // it resolves to "not configured" rather than reading an unrelated env var.
-        let auth = ProviderAuth::with_api_key(env_key(Vec::<String>::new()));
+        let auth = ProviderAuth::with_api_key(env_key("API key", Vec::<String>::new()));
         let inner =
             WireProvider::new(id, name, models, auth, store, Arc::new(builtin_registry()));
         Self { inner }
