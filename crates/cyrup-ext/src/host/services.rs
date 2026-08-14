@@ -5,6 +5,7 @@
 //! capability (no ambient authority, R-ARCH-EXT-011); the session service injects a real one.
 
 use crate::event::{EventKind, Subscriptions};
+use crate::manifest::Capabilities;
 use crate::native::{CtxTier, ExtMode};
 use crate::registry::{CommandDescriptor, ExtensionRegistry};
 use cyrup_core::{CancelToken, ExtensionId};
@@ -37,6 +38,19 @@ pub use crate::caps::proc::ProcSpawnSpec;
 /// human"/"wait for the real host-side timeout", never a host crash or unbounded growth). An id
 /// already tracked stays tracked (this is a bound on DISTINCT ids, not a re-insert budget).
 const MAX_ABORTED_SIGNALS: usize = 4096;
+
+// EXT-054 denial messages. Each names the exact `extension.json` key that would grant the call, so
+// the operator reading the refusal reads the same words they would write to fix it. Kept as
+// constants because tests pin them and both the WIT `result` arms and the crate docs quote them.
+/// Refusal for `exec.run` and every `proc.*` import when `capabilities.exec` is false.
+pub const DENIED_EXEC: &str =
+    "capability denied: `extension.json` does not declare `capabilities.exec: true`";
+/// Refusal for every `http-client.*` import when `capabilities.net` is false.
+pub const DENIED_NET: &str =
+    "capability denied: `extension.json` does not declare `capabilities.net: true`";
+/// Refusal for the `ui.*` imports when `capabilities.ui` is false.
+pub const DENIED_UI: &str =
+    "capability denied: `extension.json` does not declare `capabilities.ui: true`";
 
 /// How stale [`GuestState::last_wait_touch`] is allowed to be, at the moment
 /// [`GuestState::take_dialog_extra_ticks`] runs, before the recorded wait anchor is distrusted as
@@ -955,23 +969,91 @@ impl HostServices for RecordingServices {
 }
 
 /// Capability-scoped filesystem roots for the `ext-fs` import (preopened dirs; no ambient fs).
+///
+/// EXT-054/EXT-055: the roots come from the extension's own `capabilities.fs` declaration
+/// (`["read:.", "write:.cyrup/todo"]`, [`crate::manifest::Capabilities::parse_fs_grants`]), resolved
+/// against the host's project cwd by [`Self::from_grants`] and handed to the guest's
+/// [`GuestState`] as DATA. No grants at all => every `ext-fs` call is refused, naming the manifest
+/// key that would have granted it. The single-root [`Self::single`]/`GuestState::with_fs` shape is
+/// kept for host-internal loads that have no manifest.
 #[derive(Clone, Debug, Default)]
 pub struct FsCaps {
-    /// A single granted root the guest may read/write under. `None` => all fs access denied.
-    pub root: Option<PathBuf>,
+    /// What a guest-supplied relative path is resolved against. `None` => no fs access at all.
+    base: Option<PathBuf>,
+    /// Granted subtrees (absolute, under `base`) and whether each permits writes, in declaration
+    /// order. Empty => all fs access denied.
+    grants: Vec<(PathBuf, bool)>,
 }
 
 impl FsCaps {
-    /// Resolve `path` under the granted root, rejecting escapes (`..`). Returns the absolute path or
-    /// an error string surfaced to the guest as a WIT `result` error (never a host panic).
+    /// One read+write root — the pre-EXT-055 shape, kept for host-internal loads with no manifest.
+    /// Guest paths resolve directly under `root`, exactly as `FsCaps { root: Some(..) }` did.
+    pub fn single(root: PathBuf) -> Self {
+        Self { base: Some(root.clone()), grants: vec![(root, true)] }
+    }
+
+    /// Build from parsed manifest grants (EXT-054/EXT-055). Guest paths are addressed relative to
+    /// `base` — the host's project cwd, [`crate::HostConfig::cwd`] — and each grant authorizes a
+    /// subtree of it, so the manifest example `["read:.", "write:.cyrup/todo"]` means exactly what
+    /// it reads as: inspect the project, write only inside `.cyrup/todo`. `base` is joined, not
+    /// canonicalized: the grant is already proven relative and `..`-free by
+    /// [`crate::manifest::Capabilities::parse_fs_grants`], and canonicalizing would fail for a
+    /// granted directory the extension is expected to CREATE.
+    pub fn from_grants(base: &std::path::Path, grants: &[crate::manifest::FsGrant]) -> Self {
+        if grants.is_empty() {
+            return Self::default();
+        }
+        Self {
+            base: Some(base.to_path_buf()),
+            grants: grants.iter().map(|g| (base.join(&g.path), g.write)).collect(),
+        }
+    }
+
+    /// Whether any root is granted at all.
+    pub fn is_empty(&self) -> bool {
+        self.grants.is_empty()
+    }
+
+    /// Resolve `path` for READING under some granted root, rejecting escapes (`..`). Returns the
+    /// absolute path or an error string surfaced to the guest as a WIT `result` error (never a host
+    /// panic). A `write:` grant implies read on the same subtree.
     pub fn resolve(&self, path: &str) -> Result<PathBuf, String> {
-        let root = self.root.as_ref().ok_or("filesystem capability not granted")?;
+        self.resolve_mode(path, false)
+    }
+
+    /// Resolve `path` for WRITING: only a `write:` grant qualifies, so a `read:`-only extension gets
+    /// a typed refusal instead of silently mutating the tree it was granted to inspect.
+    pub fn resolve_write(&self, path: &str) -> Result<PathBuf, String> {
+        self.resolve_mode(path, true)
+    }
+
+    fn resolve_mode(&self, path: &str, need_write: bool) -> Result<PathBuf, String> {
+        let Some(base) = self.base.as_ref() else {
+            return Err(
+                "filesystem capability not granted: `extension.json` declares no `capabilities.fs` \
+                 entry (e.g. \"read:.\" or \"write:.cyrup/todo\")"
+                    .into(),
+            );
+        };
         let candidate = PathBuf::from(path);
         // Reject absolute paths and parent-dir escapes (capability scoping, R-ARCH-EXT-011).
         if candidate.is_absolute() || candidate.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
             return Err(format!("path `{path}` escapes the granted capability root"));
         }
-        Ok(root.join(candidate))
+        let resolved = base.join(&candidate);
+        let allowed = self
+            .grants
+            .iter()
+            .any(|(root, write)| (*write || !need_write) && resolved.starts_with(root));
+        if allowed {
+            Ok(resolved)
+        } else if need_write {
+            Err(format!(
+                "path `{path}` is not inside a `write:` grant in `capabilities.fs`"
+            ))
+        } else {
+            Err(format!("path `{path}` is not inside any `capabilities.fs` grant"))
+        }
     }
 }
 
@@ -1046,6 +1128,13 @@ pub struct GuestState {
     pub registry: Arc<ExtensionRegistry>,
     pub services: Arc<dyn HostServices>,
     pub fs: FsCaps,
+    /// The extension's declared capability grant, copied in as DATA at load time (EXT-054). The
+    /// guest cannot reach it and cannot change it; the host reads it in `host/live.rs` before every
+    /// `exec`/`proc`/`http-client`/`ui` import runs. Defaults to
+    /// [`Capabilities::host_granted`] so a standalone [`GuestState`] (unit tests, the host's own
+    /// manifest-less [`crate::ExtensionHost::load_wasm`]) behaves as it did before EXT-054 — every
+    /// DISCOVERED extension is narrowed by its own `extension.json` instead.
+    caps: Capabilities,
     /// The host's run mode + dialog-capability, i.e. Pi's `ctx.mode` / `ctx.hasUI` base-context
     /// FIELDS (extensions/types.ts:311,313). Unlike the `ctx-state` values above these are not
     /// session state — they are fixed host configuration, so they are copied in from
@@ -1179,6 +1268,7 @@ impl GuestState {
             registry,
             services,
             fs: FsCaps::default(),
+            caps: Capabilities::host_granted(),
             mode: ExtMode::default(),
             has_ui: true,
             tier: Mutex::new(CtxTier::Command), // init runs at command tier (load time)
@@ -1208,8 +1298,64 @@ impl GuestState {
     }
 
     pub fn with_fs(mut self, root: PathBuf) -> Self {
-        self.fs = FsCaps { root: Some(root) };
+        self.fs = FsCaps::single(root);
         self
+    }
+
+    /// Seed the manifest capability grant (EXT-054/EXT-055). Called by
+    /// [`crate::ExtensionHost::load_wasm_with_caps`] BEFORE `init`, so the very first guest call
+    /// already runs under the declared restriction. `base` is the host's project cwd, which the
+    /// `capabilities.fs` roots are resolved against.
+    ///
+    /// The grant crosses as data and is enforced host-side — a guest has no import that reads or
+    /// changes it (ADR-0002, batch-17 instruction).
+    pub fn with_capabilities(
+        mut self,
+        caps: Capabilities,
+        grants: &[crate::manifest::FsGrant],
+        base: &std::path::Path,
+    ) -> Self {
+        self.fs = FsCaps::from_grants(base, grants);
+        self.caps = caps;
+        self
+    }
+
+    /// The declared grant (read-only).
+    pub fn caps(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    /// Host-side gate for the `exec` + `proc` imports (EXT-054). The `proc` interface is process
+    /// execution by another name — `world.wit`'s own comment ties it to the SAME gate `exec` uses —
+    /// so one bit governs both.
+    pub fn require_exec(&self) -> Result<(), String> {
+        if self.caps.exec {
+            Ok(())
+        } else {
+            Err(DENIED_EXEC.into())
+        }
+    }
+
+    /// Host-side gate for the `http-client` imports (EXT-054).
+    pub fn require_net(&self) -> Result<(), String> {
+        if self.caps.net {
+            Ok(())
+        } else {
+            Err(DENIED_NET.into())
+        }
+    }
+
+    /// Host-side gate for the `ui` imports (EXT-054). Most of `interface ui` is fire-and-forget or
+    /// returns a bare value rather than a `result`, so a refusal there degrades to exactly what an
+    /// untrusted extension already sees — [`DenyServices`]' no-op/`false`/`none` — rather than to a
+    /// typed error the WIT signature has no room for. `theme-set` is the one `result`-returning
+    /// member and does carry the message.
+    pub fn require_ui(&self) -> Result<(), String> {
+        if self.caps.ui {
+            Ok(())
+        } else {
+            Err(DENIED_UI.into())
+        }
     }
 
     /// Copy the host's run mode + dialog capability in from [`crate::HostConfig`] (Pi `ctx.mode` /

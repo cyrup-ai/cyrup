@@ -92,21 +92,23 @@ struct RuntimeInner {
 }
 
 /// Collect the build-time diagnostics for `session` (Pi `runtime.diagnostics`, main.ts:730-740).
-/// Three tier-available sources today: the model-restore fallback, the CLI extension-flag
-/// reconciliation errors (SEAM-S01), and the contained extension LOAD failures (EXT-S01).
-/// Extension provider-registration diagnostics (`#23`) join here once that lands.
+/// Two tier-available sources today: the CLI extension-flag reconciliation errors (SEAM-S01) and
+/// the contained extension LOAD failures (EXT-S01). Extension provider-registration diagnostics
+/// (`#23`) join here once that lands.
 ///
-/// Order matches Pi's array construction: `services.diagnostics` (model + flags) first, then the
-/// mapped `resourceLoader.getExtensions().errors` (main.ts:735-738).
+/// Order matches Pi's array construction: `services.diagnostics` (the provider-registration errors
+/// plus `applyExtensionFlagValues`, agent-session-services.ts:154-181) first, then the mapped
+/// `resourceLoader.getExtensions().errors` (main.ts:735-738).
+///
+/// The `modelFallbackMessage` is deliberately NOT here. pi carries it as a SEPARATE constructor
+/// argument alongside `diagnostics` (`new AgentSessionRuntime(session, services, createRuntime,
+/// result.diagnostics, result.modelFallbackMessage)` — agent-session-runtime.ts:425-431) and its only
+/// consumer is the interactive `showWarning` (interactive-mode.ts:883-884) — `reportDiagnostics`
+/// (main.ts:842) never prints it. Pushing it in here made every NON-interactive run echo the banner
+/// on stderr ahead of pi's own `main.ts:852-855` message, i.e. print it twice; read it off
+/// [`AgentSessionRuntime::model_fallback_message`] instead.
 fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
     let mut out = Vec::new();
-    if let Some(msg) = session.model_fallback_message() {
-        out.push(RuntimeDiagnostic {
-            severity: "warning".to_string(),
-            message: msg.to_string(),
-            source: Some("model".to_string()),
-        });
-    }
     // SEAM-S01: `Unknown option(s): --foo` / `Extension flag "--foo" requires a value`. Pi pushes
     // these onto the SAME `services.diagnostics` array (agent-session-services.ts:182) that becomes
     // `runtime.diagnostics`, and the bin reports them + exits 1 (main.ts:843-848).

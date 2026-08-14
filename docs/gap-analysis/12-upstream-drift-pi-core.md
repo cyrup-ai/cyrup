@@ -138,7 +138,7 @@ counts**: they propose no work and say so, so they are bookkeeping rather than b
 
 | ID | Severity | Kind | Effort | Dedup | Title |
 |---|---|---|---|---|---|
-| DRIFT-049 | **high** *(was medium)* | not-ported | M | duplicate-of: `SEAM-047` | SIGTERM/SIGHUP never disposes the runtime, and in RPC mode is never observed at all |
+| DRIFT-049 | **high** | **FIXED 2026-08-13** *(via `SEAM-047`)* | M | duplicate-of: `SEAM-047` | SIGTERM/SIGHUP never disposes the runtime, and in RPC mode is never observed at all |
 | DRIFT-041 | medium | not-ported | L | — | Session HTML export is a 131-line text dump against pi's 5,021-line templated document |
 | DRIFT-048 | medium | parity-bug | S | — | Google converter picks the tool-call-id rule off the SOURCE message's model, not the target model |
 | DRIFT-004 | medium | upstream-drift | M | — | RPC `bash`: `UserBashEventResult.operations` backend seam unported |
@@ -168,7 +168,7 @@ counts**: they propose no work and say so, so they are bookkeeping rather than b
 | DRIFT-047 | low | upstream-drift | L | duplicate-of: `VL-P5` | `packages/telemetry` and the `pi.ai.request` span contract absent |
 | DRIFT-050 | low | parity-bug | S | — | `CYRUP_TELEMETRY=` empty is an explicit OFF upstream and a silent no-op here |
 | DRIFT-051 | low | not-ported | S | — | `process.title`'s role suffix never set — RPC / runner / broker children are all bare `cyrup` in `ps` |
-| DRIFT-022 | **tracker** | tracking | L | duplicate-of: `SEAM-051` | TUI mode (`--tui-mode`, alternate screen) not ported |
+| DRIFT-022 | **tracker** | **flag half FIXED 2026-08-13** *(via `SEAM-051`)*; renderer half still tracking | L | duplicate-of: `SEAM-051` | TUI mode (`--tui-mode`, alternate screen) not ported |
 | DRIFT-023 | **tracker** · *lead* | tracking | L | duplicate-of: `CFG-020` | Model registry → `ModelRuntime` refactor not absorbed — **evidence unverified** |
 | DRIFT-032 | **tracker** | **not-ported** *(was upstream-drift)* | L | duplicate-of: `EXT-027` | llama.cpp router integration and Hugging Face model search entirely unported |
 | DRIFT-040 | **tracker** · *lead* | tracking | L | duplicate-of: `VL-P22` | pi's agent-harness v2 rearchitecture entirely unabsorbed — **evidence unverified** |
@@ -223,6 +223,16 @@ their IDs and their bodies below.
 
 **Kind** not-ported · **Severity** **high** *(raised from medium, repair pass)* · **Effort** M · **Confidence** high · **duplicate-of: `SEAM-047`**
 
+> **FIXED 2026-08-13 via `SEAM-047`** (`crates/cyrup/src/signals.rs`, rewritten as a per-host port;
+> three call sites in `main.rs`). Closed here for bookkeeping only — the work, its pi citations and
+> its two stated `CYRUP-DELTA`s live in area 08's `SEAM-047` entry, per the "schedule it once" note
+> below. The first SIGTERM/SIGHUP in print/json/rpc now aborts the session, fires `cancel`, awaits
+> `runtime.dispose()` and exits 143/129 (pi `print-mode.ts:48-64`, `rpc-mode.ts:365-379`,`:723-740`
+> @v0.83.0); the RPC half is pinned by `crates/cyrup/tests/signal_shutdown.rs`, which drives the real
+> binary and was measured RED before the change ("still alive 15s after the FIRST -TERM") and GREEN
+> after. `SEAM-059` (the watcher held a stale startup `Arc<AgentSession>`) landed in the same rewrite.
+> **`SEAM-008` is NOT closed by this** and was re-scoped rather than inherited — see area 08.
+>
 > **Severity and ownership corrected 2026-08-12 (repair pass).** This is the same defect area 08
 > files as **`SEAM-047`** (`08-cyrup-session-svc-and-modes.md:105`), which rates it **high**, and
 > `PARITY-GAPS` **PB-30** names both IDs at high. A defect cannot carry two severities, and a high
@@ -511,6 +521,14 @@ Missing four catalogs: `baseten`, `qwen-token-plan`, `qwen-token-plan-cn`, `qwen
 
 **Kind** tracking · **Severity** **tracker** *(excluded from the severity count, repair pass — was low)* · **Effort** L · **Confidence** high · **duplicate-of: `SEAM-051`**
 
+> **Flag half FIXED 2026-08-13 via `SEAM-051`**; the RENDERER half is still tracking, so this row
+> stays open. `--tui-mode regular|fullscreen` now parses (`crates/cyrup/src/cli.rs`), `regular` is a
+> working no-op and `fullscreen` is accepted and declined at startup with ADR-0005's interim string
+> — so the binary no longer exits 1 claiming pi's own default is an unknown option. Both of pi's
+> diagnostics are ported verbatim (`args.ts:180-192` @v0.84.1). What remains here is what this
+> tracker was always about: the alternate-screen RENDERER (`TUI-019`) and the `tuiMode` /
+> `fullscreenScrollbar` settings keys (`CFG-021`). Evidence in area 08's `SEAM-051` entry.
+>
 > **Marked tracker 2026-08-12 (repair pass).** Its Fix is "Do **not** implement yet" and its Verify
 > is "n/a while tracking", so it proposes no work — bookkeeping, not backlog. The **behavioural**
 > cost of the absence is filed and is concrete: `SEAM-051` (`--tui-mode regular`, pi's own default,

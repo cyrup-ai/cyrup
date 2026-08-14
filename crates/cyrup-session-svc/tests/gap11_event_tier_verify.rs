@@ -119,7 +119,7 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
         .expect("load + init the live wasm extension");
 
     // BASELINE: session starts on faux-1, thinking off (default).
-    assert_eq!(session.model().model.as_str(), "faux-1", "starts on faux-1");
+    assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), "faux-1", "starts on faux-1");
     assert_eq!(session.thinking_level().await, ModelThinkingLevel::Off, "starts thinking=off");
 
     // ---- TURN 1: drive a real turn whose user message fires on_message_end("gap11switch"),
@@ -146,7 +146,7 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
 
     // (1)+(2) The event-tier ops TOOK EFFECT: session model switched, thinking level switched.
     assert_eq!(
-        session.model().model.as_str(),
+        session.model().expect("session must have a resolved model").model.as_str(),
         "faux-2",
         "event-tier set_model took effect on the session model"
     );
@@ -198,7 +198,7 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
     let _ = session.prompt("/gap11setmodel faux/faux-1").await.unwrap();
     session.wait_for_idle().await;
     assert_eq!(
-        session.model().model.as_str(),
+        session.model().expect("session must have a resolved model").model.as_str(),
         "faux-1",
         "command-tier set_model still applies"
     );

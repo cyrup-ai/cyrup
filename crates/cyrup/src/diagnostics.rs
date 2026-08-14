@@ -53,6 +53,10 @@ const VALID_THINKING_LEVELS: [&str; 7] =
     ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// Valid `--mode` values (Pi args.ts:80).
 const VALID_MODES: [&str; 3] = ["text", "json", "rpc"];
+/// Valid `--tui-mode` values (pi args.ts:182 @v0.84.1 — `mode === "regular" || mode === "fullscreen"`).
+const VALID_TUI_MODES: [&str; 2] = ["regular", "fullscreen"];
+/// pi's `--tui-mode`-with-no-usable-value error (args.ts:186 @v0.84.1), verbatim.
+const TUI_MODE_REQUIRES: &str = "--tui-mode requires regular or fullscreen";
 
 /// The single-char short flags clap accepts (Pi's exact short set, args.ts). Any OTHER single-dash
 /// token is an unknown option (Pi args.ts:202-203) rather than a clap exit-2 usage error.
@@ -120,6 +124,53 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
                 )));
             }
             i += 2;
+            continue;
+        }
+        // `--tui-mode <value>` — pi args.ts:180-192 @v0.84.1, branch for branch:
+        //   * `regular`/`fullscreen`  → keep flag + value (`i++`), clap parses it into `Cli::tui_mode`
+        //   * missing, or a `-`-prefixed next token → error `--tui-mode requires regular or
+        //     fullscreen`, and the value token is NOT consumed (pi does not `i++` on this branch,
+        //     so `--tui-mode --offline` still parses `--offline`)
+        //   * anything else → consume the value (`i++`) and error `Invalid TUI mode "<v>". …`
+        // Both error branches leave the flag out of the cleaned argv: an error exits 1 in
+        // `main.rs`, and clap must never see a value it would reject with its own exit-2 text.
+        // SEAM-051 / ADR-0005 §Decision A.1.
+        //
+        // CYRUP-DELTA: the `--tui-mode=<v>` form is handled here too. pi's parser matches only
+        // `arg === "--tui-mode"`, so `--tui-mode=regular` falls into its `unknownFlags` map
+        // (args.ts:204-207) — as does `--model=x` and every other `=` form, which cyrup has always
+        // accepted through `KNOWN_LONG_FLAGS`'s `split('=')` (cli.rs:706). Given cyrup accepts the
+        // `=` form, the same two messages must cover it or `--tui-mode=bogus` would reach clap and
+        // die with a clap usage error (exit 2) instead of pi's text.
+        if arg == "--tui-mode" || arg.starts_with("--tui-mode=") {
+            let (value, eq_form) = match arg.strip_prefix("--tui-mode=") {
+                Some(v) => (Some(v.to_string()), true),
+                None => (argv.get(i + 1).cloned(), false),
+            };
+            match value.as_deref() {
+                Some(v) if VALID_TUI_MODES.contains(&v) => {
+                    clean.push(arg.clone());
+                    if !eq_form {
+                        clean.push(v.to_string());
+                        i += 1;
+                    }
+                }
+                // pi: `mode === undefined || mode.startsWith("-")` (args.ts:185) — no value consumed.
+                None | Some("") => diagnostics.push(Diagnostic::error(TUI_MODE_REQUIRES)),
+                Some(v) if !eq_form && v.starts_with('-') => {
+                    diagnostics.push(Diagnostic::error(TUI_MODE_REQUIRES));
+                }
+                Some(v) => {
+                    if !eq_form {
+                        i += 1;
+                    }
+                    diagnostics.push(Diagnostic::error(format!(
+                        "Invalid TUI mode \"{v}\". Valid values: {}",
+                        VALID_TUI_MODES.join(", ")
+                    )));
+                }
+            }
+            i += 1;
             continue;
         }
         // A known value-taking long flag (space form): pass the flag AND its next token through

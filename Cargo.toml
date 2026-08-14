@@ -25,6 +25,27 @@ members = [
 # cyrup-ext-sdk is the GUEST sdk (compiled to wasm32-wasip2); it is NOT part of the
 # host binary build graph (arch-00 §2.2), so it is excluded from default-members.
 # Build it explicitly: `cargo build -p cyrup-ext-sdk --target wasm32-wasip2`.
+#
+# cyrup-test-support is likewise excluded (PROV-052). It is the only crate whose `[dependencies]`
+# enables `cyrup-provider/faux` — its `src/` IS the scripted harness — and Cargo unifies features
+# per package across every crate built in one invocation, so leaving it in `default-members` would
+# make a plain `cargo build` at the workspace root compile the test double into the `cyrup` binary
+# even after the bin's own edge moved to `[dev-dependencies]`.
+#
+# This exclusion is DEFENSE IN DEPTH, not the gate. What makes the double unreachable is the
+# `#[cfg(feature = "faux")]` on `select_provider`'s `Some("faux")` arm (crates/cyrup/src/provider.rs),
+# keyed to the `cyrup` package's own feature — see crates/cyrup-provider/Cargo.toml for the full
+# statement. Under `cargo build --workspace` this crate IS built and `cyrup-provider/faux` IS
+# unified onto a normal edge; the module is then compiled but still unselectable.
+#
+# WHAT THE EXCLUSION COSTS, stated exactly (the previous wording here was wrong): cyrup-test-support
+# is a dev-dependency of cyrup-permission-system and cyrup-ext-subagents, so a bare `cargo test`
+# BUILDS it — but *building* is not *running*. `cargo metadata` confirms it is outside
+# `workspace_default_members`, so a bare `cargo test` no longer EXECUTES its 35 `src/` unit tests or
+# the 5 in `tests/deferred_interop.rs`. Nothing was lost from the merge gate, which is
+# `cargo test --workspace`. If you run a bare `cargo test` locally, add
+# `cargo test -p cyrup-test-support` or just use `--workspace`. Nothing depends on this crate
+# normally (`publish = false`).
 default-members = [
     "crates/cyrup-core",
     "crates/cyrup-provider",
@@ -39,7 +60,6 @@ default-members = [
     "crates/cyrup-sdk",
     "crates/cyrup-session-svc",
     "crates/cyrup",
-    "crates/cyrup-test-support",
     "crates/cyrup-ext-subagents",
     "crates/cyrup-permission-system",
     "crates/cyrup-intercom",

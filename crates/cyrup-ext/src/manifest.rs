@@ -5,6 +5,10 @@
 use crate::error::ExtError;
 use std::path::Path;
 
+/// The manifest file name inside an extension directory (arch-08 §4.2). Pi's analog is the
+/// `pi` field of `package.json` (`loader.ts:596` @v0.83.0).
+pub const MANIFEST_FILE: &str = "extension.json";
+
 /// The on-disk `extension.json` (arch-08 §4.2).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,10 +25,21 @@ pub struct ExtensionManifest {
 }
 
 /// Capabilities a guest requests (arch-08 §4.2). `net` is never ambient under WASI p2.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+///
+/// # This is a RESTRICTION the host applies, not a promise the guest keeps (EXT-054)
+///
+/// Every field defaults to the DENYING value, so a manifest with no `capabilities` block — and the
+/// two manifest-synthesis sites in [`crate::loader`] that stand in for a bare `.wasm` artifact —
+/// grant nothing at all. The grant crosses into instantiation as **data**
+/// ([`crate::ExtensionHost::load_wasm_with_caps`] → `GuestState::with_capabilities`) and is enforced
+/// **host-side** in `crates/cyrup-ext/src/host/live.rs`, per ADR-0002's batch-17 instruction
+/// ("seeding `GuestState` from the manifest must not introduce a host reference into `GuestState`
+/// that the guest can reach — the grant is data, the enforcement is host-side").
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
-    /// fs grants, e.g. `["read:.", "write:.cyrup/todo"]`.
+    /// fs grants, e.g. `["read:.", "write:.cyrup/todo"]`. Parsed by
+    /// [`Capabilities::parse_fs_grants`]; an empty list denies `ext-fs` outright.
     #[serde(default)]
     pub fs: Vec<String>,
     #[serde(default)]
@@ -33,6 +48,74 @@ pub struct Capabilities {
     pub net: bool,
     #[serde(default)]
     pub ui: bool,
+}
+
+/// One parsed `capabilities.fs` entry: `"<mode>:<relative-path>"` where `<mode>` is `read` or
+/// `write`. A `write` grant implies read on the same subtree (you cannot write what you cannot
+/// address), matching the ordinary meaning of the two words in the manifest example
+/// `["read:.", "write:.cyrup/todo"]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsGrant {
+    /// The grant's root, RELATIVE to the host's project cwd ([`crate::HostConfig::cwd`]). Never
+    /// absolute and never containing `..` — [`Capabilities::parse_fs_grants`] refuses both.
+    pub path: std::path::PathBuf,
+    /// `true` for `write:` (read+write), `false` for `read:` (read only).
+    pub write: bool,
+}
+
+impl Capabilities {
+    /// The EMPTY grant: nothing at all. Identical to [`Default`], named so the deny-by-default
+    /// intent is legible at the call sites that synthesize a manifest (`loader.rs`).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// The grant the host applies to a component it loads ITSELF, with no `extension.json` to read
+    /// — [`crate::ExtensionHost::load_wasm`]. The interactive capabilities are granted because the
+    /// CALLER is the host and has already made the decision the manifest otherwise expresses; `fs`
+    /// stays EMPTY because `ext-fs` has no root to resolve against without a declared grant, which
+    /// is exactly what it had before EXT-054/EXT-055 (`FsCaps::default()`). Every DISCOVERED
+    /// extension goes through [`crate::ExtensionHost::load_discovered`] and is capped by its own
+    /// manifest instead.
+    pub fn host_granted() -> Self {
+        Self { fs: Vec::new(), exec: true, net: true, ui: true }
+    }
+
+    /// Parse [`Self::fs`] into typed grants, refusing anything that would escape the project root.
+    ///
+    /// A malformed entry is an ERROR, not a silently-dropped grant: a typo in the manifest that
+    /// quietly widened or narrowed the sandbox is the failure mode EXT-054 is about. The load fails
+    /// and the operator sees the offending string.
+    pub fn parse_fs_grants(&self) -> Result<Vec<FsGrant>, ExtError> {
+        self.fs
+            .iter()
+            .map(|raw| {
+                let (mode, rel) = raw.split_once(':').ok_or_else(|| {
+                    ExtError::Capability(format!(
+                        "fs grant `{raw}` is not `read:<path>` or `write:<path>`"
+                    ))
+                })?;
+                let write = match mode.trim() {
+                    "read" => false,
+                    "write" => true,
+                    other => {
+                        return Err(ExtError::Capability(format!(
+                            "fs grant `{raw}` has unknown mode `{other}` (expected `read` or `write`)"
+                        )));
+                    }
+                };
+                let path = std::path::PathBuf::from(rel.trim());
+                if path.is_absolute()
+                    || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(ExtError::Capability(format!(
+                        "fs grant `{raw}` must be a relative path inside the project (no `..`, no absolute path)"
+                    )));
+                }
+                Ok(FsGrant { path, write })
+            })
+            .collect()
+    }
 }
 
 /// The world version this host implements. Kept in lockstep with the `package cyrup:ext@…` line of
@@ -75,8 +158,16 @@ impl ExtensionManifest {
     }
 
     /// Load and parse `extension.json` from an extension directory.
+    ///
+    /// The `Err` is not the last word on the directory: [`crate::loader::discover`] falls back to
+    /// the manifest-less "bare `.wasm`" rule, matching Pi's `readPiManifest` -> `null` ->
+    /// `index.ts` fall-through (`loader.ts:568-579`, `:594-624` @v0.83.0). It does NOT swallow the
+    /// error while doing so — [`crate::loader::discover_with_diagnostics`] reports the fallback and
+    /// its two consequences (a different id, an empty grant), which is the same principle
+    /// [`Capabilities::parse_fs_grants`] states below: a malformed declaration is never a silent
+    /// change of sandbox.
     pub fn load(dir: &Path) -> Result<Self, ExtError> {
-        let path = dir.join("extension.json");
+        let path = dir.join(MANIFEST_FILE);
         let bytes = std::fs::read(&path)?;
         Self::from_json(&bytes)
     }

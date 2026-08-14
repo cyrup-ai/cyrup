@@ -302,7 +302,7 @@ async fn model_resolution_wiring() {
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());
     let session = SessionBuilder::new(faux.clone(), cfg).build().await.unwrap();
-    let m = session.model();
+    let m = session.model().expect("session must have a resolved model");
     assert_eq!(m.model.as_str(), "faux-1");
     assert_eq!(m.provider.as_str(), "faux");
 
@@ -329,7 +329,7 @@ async fn unresolvable_model_on_known_provider_builds_a_custom_fallback() {
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux/custom-9000".to_string());
     let session = SessionBuilder::new(faux.clone(), cfg).build().await.unwrap();
-    let m = session.model();
+    let m = session.model().expect("session must have a resolved model");
     assert_eq!(m.model.as_str(), "custom-9000");
     assert_eq!(m.provider.as_str(), "faux");
 
@@ -338,7 +338,7 @@ async fn unresolvable_model_on_known_provider_builds_a_custom_fallback() {
     cfg2.model_pattern = Some("totally-made-up".to_string());
     cfg2.cli_provider_explicit = true;
     let session2 = SessionBuilder::new(faux, cfg2).build().await.unwrap();
-    assert_eq!(session2.model().model.as_str(), "totally-made-up");
+    assert_eq!(session2.model().expect("session must have a resolved model").model.as_str(), "totally-made-up");
 }
 
 #[tokio::test]
@@ -535,7 +535,7 @@ async fn queue_introspection_and_command_seam() {
     // The state view reflects the cleared queue.
     let state = session.state_view().await;
     assert_eq!(state.pending_message_count, 0);
-    assert_eq!(state.provider, "faux");
+    assert_eq!(state.provider.as_deref(), Some("faux"));
 }
 
 /// gap #1-11 / R-11-020/021: the AgentSessionRuntime multi-session tier — `new_session` tears down,

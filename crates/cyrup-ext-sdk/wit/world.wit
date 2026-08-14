@@ -298,6 +298,18 @@ interface registration {
 
 // ---------------------------------------------------------------------------
 // guest -> host: capabilities (arch-08 §3.6, caps/*).
+//
+// TWO gates stand in front of every interface in this block, and both are HOST-side (EXT-054).
+// (1) The load-time trust check `is_trusted = origin.is_pre_trust() || project_trusted`
+//     (`loader.rs`) decides whether the extension loads at all and which `HostServices` backend it
+//     is handed — an untrusted one gets `DenyServices`.
+// (2) The extension's OWN `extension.json` grant, `capabilities.{fs,exec,net,ui}`
+//     (`manifest.rs`), narrows what it may ask for even on a fully capable backend: `ui` gates
+//     `interface ui`, `exec` gates `exec` AND `proc` (process execution by another name), `net`
+//     gates `http-client`, and `fs` supplies the roots `ext-fs` resolves against — no grant, no
+//     root, no access. Every bit defaults to the DENYING value, so an absent `capabilities` block
+//     grants nothing. The grant crosses as data and the guest has no import that reads or changes
+//     it (ADR-0002).
 // ---------------------------------------------------------------------------
 interface ui {
   // notification severity (Pi notify `type`: "info" | "warning" | "error", types.ts:135); info is the default.

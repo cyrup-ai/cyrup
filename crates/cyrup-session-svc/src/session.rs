@@ -321,10 +321,15 @@ pub struct AgentSession {
     /// provider without rebuilding — 1:1 with Pi's live model+provider switch.
     provider: Arc<ProviderSwap>,
     services: AgentSessionServices,
-    /// The active model address (mutated by `set_model`).
-    model: Mutex<ModelRef>,
-    /// The resolved summarization/compaction model (kept in lockstep with `model`).
-    compaction_model: Mutex<cyrup_provider::Model>,
+    /// The active model address (mutated by `set_model`), or `None` when the session launched with
+    /// no model at all — pi `AgentSession.model: Model | undefined` (agent-session.ts:866-868),
+    /// which is `undefined` whenever `findInitialModel` found nothing to select
+    /// (sdk.ts:216-218, model-resolver.ts:648-650). This is the state a credential-less first run
+    /// starts in so the TUI can offer `/login` and then `/model` (SEAM-075).
+    model: Mutex<Option<ModelRef>>,
+    /// The resolved summarization/compaction model (kept in lockstep with `model`); `None` in the
+    /// same modelless state.
+    compaction_model: Mutex<Option<cyrup_provider::Model>>,
     /// The LIVE base system prompt — the value a run falls back to when no `before_agent_start`
     /// handler replaced it (Pi `private _baseSystemPrompt`, agent-session.ts:371).
     ///
@@ -462,7 +467,7 @@ impl AgentSession {
         fanout: Arc<Fanout>,
         provider: Arc<ProviderSwap>,
         services: AgentSessionServices,
-        model: ModelRef,
+        model: Option<ModelRef>,
         session_cancel: CancelToken,
         session_id: SessionId,
         model_fallback_message: Option<String>,
@@ -1078,9 +1083,15 @@ impl AgentSession {
         }
         // 2. Flush deferred bash messages so ordering is intact (agent-session.ts:1058).
         self.flush_pending_bash_messages().await;
-        // 3. Auth precheck: the active model must have configured auth (agent-session.ts:1062-1075).
+        // 3. Model + auth precheck. Pi validates the MODEL first —
+        // `if (!this.model) { throw new Error(formatNoModelSelectedMessage()); }`
+        // (agent-session.ts:1177-1180) — and only then the credential (`:1182-1195`). This is the
+        // first turn of a modelless first run (SEAM-075): the answer is the `/login` → `/model`
+        // instruction, surfaced as an error on the turn, never a process exit.
         {
-            let model = Self::lock(&self.compaction_model).clone();
+            let model = Self::lock(&self.compaction_model)
+                .clone()
+                .ok_or(SessionServiceError::NoModelSelected)?;
             if !self.has_configured_auth(&model) {
                 return Err(SessionServiceError::NoConfiguredAuth(format!(
                     "{}/{}",
@@ -1398,7 +1409,29 @@ impl AgentSession {
         *Self::lock(&self.compaction_cancel) = Some(cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
-        let model = { Self::lock(&self.compaction_model).clone() };
+        // Pi's very first statement inside `compact()`'s `try` is the model check —
+        // `if (!this.model) { throw new Error(formatNoModelSelectedMessage()); }`
+        // (agent-session.ts:1790-1792) — thrown AFTER `compaction_start` was emitted (`:1787`) and
+        // caught by the same handler that emits `compaction_end` with
+        // `errorMessage: "Compaction failed: …"` (`:1908-1917`), which is why the exit below mirrors
+        // the `NothingToCompact` arm rather than returning bare.
+        let current_model = Self::lock(&self.compaction_model).clone();
+        let model = match current_model {
+            Some(m) => m,
+            None => {
+                *Self::lock(&self.compaction_cancel) = None;
+                let err = SessionServiceError::NoModelSelected;
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(format!("Compaction failed: {err}")),
+                })
+                .await;
+                return Err(err);
+            }
+        };
         // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" })`
         // (agent-session.ts:1859).
         let (retry_observer, retry_rx) = crate::compact::summarization_retry_channel(
@@ -1702,7 +1735,27 @@ impl AgentSession {
         entry: EntryId,
         user_wants_summary: bool,
     ) -> Result<Option<String>, SessionServiceError> {
-        let model = { Self::lock(&self.compaction_model).clone() };
+        // Pi `navigateTree`: `if (options.summarize && !this.model) { throw new Error("No model
+        // available for summarization"); }` (agent-session.ts:2910-2912) — a DIFFERENT string from
+        // `formatNoModelSelectedMessage`, and gated on the caller actually asking for a summary, so
+        // a modelless session can still navigate the tree without one.
+        let current_model = Self::lock(&self.compaction_model).clone();
+        let model = match current_model {
+            Some(m) => m,
+            // pi's gate is on the SUMMARY, not the navigation, so a modelless session still moves
+            // the leaf; only the summarizing variant is refused.
+            None if !user_wants_summary => {
+                // `Compactor::run_branch_summary` takes `&Model` unconditionally even though it
+                // only reads it to build the summary, so the no-summary navigation is done
+                // directly here (`session.branch(&target_id)`, compaction/mod.rs:384). Residual:
+                // the `session_before_tree`/`session_tree` hooks that `run_branch_summary` also
+                // fires are skipped on this narrow path — `run_branch_summary` should take
+                // `Option<&Model>` so they are not.
+                self.manager.lock().await.branch(&entry)?;
+                return Ok(None);
+            }
+            None => return Err(SessionServiceError::NoModelForSummarization),
+        };
         // Pi: `this._summarizationRetryCallbacks({ source: "branchSummary" })`
         // (agent-session.ts:2998).
         let (retry_observer, retry_rx) =
@@ -1774,6 +1827,12 @@ impl AgentSession {
             // No-op if already at target, BEFORE the hook (agent-session.ts:2712).
             if old_leaf.as_ref() == Some(&target) {
                 return Ok(NavigateTreeOutcome::default());
+            }
+
+            // "Model required for summarization" (agent-session.ts:2910-2912) — after the
+            // already-at-target no-op and BEFORE the target lookup, exactly as pi orders it.
+            if options.summarize && Self::lock(&self.model).is_none() {
+                return Err(SessionServiceError::NoModelForSummarization);
             }
 
             // Target must exist (agent-session.ts:2721).
@@ -1886,7 +1945,12 @@ impl AgentSession {
         } else if options.summarize && !collection.entries.is_empty() {
             // Summarize the abandoned branch (agent-session.ts:2787). Pi still appends the non-empty
             // "No content to summarize" placeholder, so we gate only on the collected entry count.
-            let model = Self::lock(&self.compaction_model).clone();
+            // Non-`None` here: the `options.summarize && !this.model` gate above already returned
+            // `NoModelForSummarization` (agent-session.ts:2910-2912), and this arm is inside
+            // `options.summarize`.
+            let model = Self::lock(&self.compaction_model)
+                .clone()
+                .ok_or(SessionServiceError::NoModelForSummarization)?;
             // `(contextWindow || 128000) − reserve` (Pi `branch-summarization.ts:315-317`). The
             // fallback matters: without it a model reporting a zero context window would get budget
             // `0`, which `prepare_branch_entries` reads as "no limit".
@@ -2580,7 +2644,7 @@ impl AgentSession {
         }
         self.install_owning_provider(&model)?;
         let previous = Self::lock(&self.model).clone();
-        self.apply_model_change(&model, &previous, "set", None).await?;
+        self.apply_model_change(&model, previous.as_ref(), "set", None).await?;
         Ok(ModelRef {
             provider: model.provider.clone(),
             api: Some(model.api.clone()),
@@ -2746,18 +2810,22 @@ impl AgentSession {
     async fn emit_model_select(
         &self,
         next: &cyrup_provider::Model,
-        previous: &ModelRef,
+        previous: Option<&ModelRef>,
         source: &str,
     ) {
-        // `modelsAreEqual`: same provider + id.
-        if previous.provider == next.provider && previous.model == next.id {
+        // `modelsAreEqual`: same provider + id. Pi's `previousModel` is `Model | undefined`
+        // (agent-session.ts:1559-1571) and `modelsAreEqual(undefined, next)` is false, so the FIRST
+        // `/model` on a modelless session emits with `previousModel: undefined`.
+        if previous.is_some_and(|p| p.provider == next.provider && p.model == next.id) {
             return;
         }
         let cancel = self.session_cancel.child_token();
         let model_val = serde_json::json!({
             "provider": next.provider.as_str(),
             "id": next.id.as_str(),
-            "previousModel": { "provider": previous.provider.as_str(), "id": previous.model.as_str() },
+            "previousModel": previous.map(|p| serde_json::json!({
+                "provider": p.provider.as_str(), "id": p.model.as_str(),
+            })),
             "source": source,
         });
         self.services
@@ -2775,7 +2843,7 @@ impl AgentSession {
     ) -> Result<(), SessionServiceError> {
         let model_ref = ModelRef { provider: provider.clone(), api: None, model: model.clone() };
         self.agent.set_model(model_ref.clone()).await;
-        *Self::lock(&self.model) = model_ref.clone();
+        *Self::lock(&self.model) = Some(model_ref.clone());
         self.bash_session_env.set_model(provider.to_string(), model.to_string());
         // Same per-request attribution rule as `apply_model_change` (pi `sdk.ts:318-327`). This
         // path has only the `ModelRef`, so resolve the full `Model` to recompute; if it cannot be
@@ -3072,28 +3140,45 @@ impl AgentSession {
     }
 
     /// The thinking levels the active model supports (Pi `getAvailableThinkingLevels`,
-    /// agent-session.ts:1576). A non-reasoning model supports only `off`.
+    /// agent-session.ts:1721-1724). A non-reasoning model supports only `off`.
     pub fn available_thinking_levels(&self) -> Vec<ModelThinkingLevel> {
-        let model = { Self::lock(&self.compaction_model).clone() };
+        // Pi `if (!this.model) return THINKING_LEVELS;` (agent-session.ts:1722), where
+        // `const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"]`
+        // (agent-session.ts:297) — note it stops at `high`; `xhigh`/`max` are model-declared only.
+        let Some(model) = ({ Self::lock(&self.compaction_model).clone() }) else {
+            return vec![
+                ModelThinkingLevel::Off,
+                ModelThinkingLevel::Minimal,
+                ModelThinkingLevel::Low,
+                ModelThinkingLevel::Medium,
+                ModelThinkingLevel::High,
+            ];
+        };
         cyrup_provider::get_supported_thinking_levels(&model)
     }
 
     /// Whether the active model supports reasoning/thinking (Pi `supportsThinking`,
-    /// agent-session.ts:1585).
+    /// agent-session.ts:1729-1731).
     pub fn supports_thinking(&self) -> bool {
-        Self::lock(&self.compaction_model).reasoning
+        // Pi `return !!this.model?.reasoning;` (agent-session.ts:1730) — false with no model.
+        Self::lock(&self.compaction_model).as_ref().is_some_and(|m| m.reasoning)
     }
 
     /// Set the thinking level, clamping to the model's capabilities, persisting a
     /// `thinking_level_change` entry and emitting the `thinking_level_select` ext event + the
     /// facade event — but only when the effective level actually changes (Pi `setThinkingLevel`,
-    /// agent-session.ts:1541-1572).
+    /// agent-session.ts:1677-1698).
     pub async fn set_thinking_level(
         &self,
         level: ModelThinkingLevel,
     ) -> Result<ModelThinkingLevel, SessionServiceError> {
         let model = { Self::lock(&self.compaction_model).clone() };
-        let effective = cyrup_provider::clamp_thinking_level(&model, level);
+        // Pi `_clampThinkingLevel`: `return this.model ? clampThinkingLevel(this.model, level)
+        // : "off";` (agent-session.ts:1608-1610) — a modelless session clamps everything to off.
+        let effective = match model.as_ref() {
+            Some(m) => cyrup_provider::clamp_thinking_level(m, level),
+            None => ModelThinkingLevel::Off,
+        };
         let previous = self.agent.snapshot().await.thinking_level;
         self.agent.set_thinking_level(effective).await;
         // Republish `CYRUP_REASONING_LEVEL` for the NEXT `bash` child (Pi re-reads `ctx.thinkingLevel`
@@ -3106,11 +3191,15 @@ impl AgentSession {
         }
         let level_str = crate::builder::thinking_level_to_str(effective);
         self.manager.lock().await.append_thinking_level_change(&level_str)?;
-        self.services.host_services.update_model(
-            Self::lock(&self.model).clone(),
-            model.context_window,
-            Some(level_str.clone()),
-        );
+        // Only with a model installed: a guest's `ctx.model` stays `undefined` on a modelless
+        // session (pi's `ExtensionContext.model` is the optional `session.model`).
+        if let (Some(mr), Some(m)) = (Self::lock(&self.model).clone(), model.as_ref()) {
+            self.services.host_services.update_model(
+                mr,
+                m.context_window,
+                Some(level_str.clone()),
+            );
+        }
         self.fanout_emit(AgentSessionEvent::ThinkingLevelChanged { level: level_str.clone() }).await;
         let cancel = self.session_cancel.child_token();
         self.services
@@ -3187,8 +3276,14 @@ impl AgentSession {
 
     // ----------------------------------------------------------------- read access ----
 
-    /// The current model address.
-    pub fn model(&self) -> ModelRef {
+    /// The current model address, or `None` when the session has no model at all.
+    ///
+    /// Pi `get model(): Model<any> | undefined { return this.agent.state.model; }`
+    /// (agent-session.ts:865-868) — documented there as "may be undefined if not yet selected".
+    /// `None` is the state a credential-less first run launches in (SEAM-075): `main.ts:852-855`
+    /// exits 1 on it in every NON-interactive mode, while interactive shows the
+    /// `modelFallbackMessage` banner and waits for `/login` + `/model`.
+    pub fn model(&self) -> Option<ModelRef> {
         Self::lock(&self.model).clone()
     }
 
@@ -3575,7 +3670,11 @@ impl AgentSession {
             Message::Assistant(a) => Some(a),
             _ => None,
         });
-        let window = { Self::lock(&self.compaction_model).context_window };
+        // Pi `getContextUsage`: `const model = this.model; if (!model) return undefined;`
+        // (agent-session.ts:3165-3166) and `if (contextWindow <= 0) return undefined;` (:3168-3169). cyrup's return type is non-optional, so the modelless case
+        // degrades to a zero window, which `from_last_assistant` already renders as fraction 0.0 —
+        // the same "unknown occupancy" the TUI shows for an undefined usage.
+        let window = { Self::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window) };
         crate::state::ContextUsage::from_last_assistant(last, window)
     }
 
@@ -3588,14 +3687,14 @@ impl AgentSession {
             Message::Assistant(a) => Some(a),
             _ => None,
         });
-        let window = { Self::lock(&self.compaction_model).context_window };
+        let window = { Self::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window) };
         let context_usage = crate::state::ContextUsage::from_last_assistant(last, window);
         let model = Self::lock(&self.model).clone();
         crate::state::SessionStateView {
             session_id: self.session_id.to_string(),
             cwd: self.services.cwd.display().to_string(),
-            provider: model.provider.to_string(),
-            model: model.model.to_string(),
+            provider: model.as_ref().map(|m| m.provider.to_string()),
+            model: model.as_ref().map(|m| m.model.to_string()),
             session_name: self.session_name().await,
             is_streaming: self.is_streaming().await,
             message_count: messages.len(),
@@ -3812,7 +3911,15 @@ impl AgentSession {
         let current = Self::lock(&self.model).clone();
         let cur_idx = candidates
             .iter()
-            .position(|s| s.model.provider == current.provider && s.model.id == current.model)
+            // pi `modelsAreEqual(sm.model, currentModel)` with `currentModel: Model | undefined`
+            // never matches when the session is modelless, so `findIndex` returns -1 and pi's
+            // `if (currentIndex === -1) currentIndex = 0` starts the cycle at the head
+            // (agent-session.ts:1618-1621; the same shape at :1647-1650 for the available set).
+            .position(|s| {
+                current.as_ref().is_some_and(|c| {
+                    s.model.provider == c.provider && s.model.id == c.model
+                })
+            })
             .unwrap_or(0);
         let len = candidates.len();
         let next_idx = if forward { (cur_idx + 1) % len } else { (cur_idx + len - 1) % len };
@@ -3823,7 +3930,7 @@ impl AgentSession {
         let explicit = next.thinking_level;
         self.install_owning_provider(&next.model)?;
         let new_level = self
-            .apply_model_change(&next.model, &current, "cycle", explicit)
+            .apply_model_change(&next.model, current.as_ref(), "cycle", explicit)
             .await?;
         Ok(Some(ModelCycleResult { model: next.model.clone(), thinking_level: new_level, is_scoped: true }))
     }
@@ -3848,7 +3955,10 @@ impl AgentSession {
         let current = Self::lock(&self.model).clone();
         let cur_idx = candidates
             .iter()
-            .position(|m| m.provider == current.provider && m.id == current.model)
+            // Same `findIndex → -1 → 0` fallback as the scoped path (agent-session.ts:1647-1650).
+            .position(|m| {
+                current.as_ref().is_some_and(|c| m.provider == c.provider && m.id == c.model)
+            })
             .unwrap_or(0);
         let len = candidates.len();
         let next_idx = if forward { (cur_idx + 1) % len } else { (cur_idx + len - 1) % len };
@@ -3856,7 +3966,7 @@ impl AgentSession {
             return Ok(None);
         };
         self.install_owning_provider(&next)?;
-        let new_level = self.apply_model_change(&next, &current, "cycle", None).await?;
+        let new_level = self.apply_model_change(&next, current.as_ref(), "cycle", None).await?;
         Ok(Some(ModelCycleResult { model: next, thinking_level: new_level, is_scoped: false }))
     }
 
@@ -3866,7 +3976,7 @@ impl AgentSession {
     async fn apply_model_change(
         &self,
         next: &Model,
-        previous: &ModelRef,
+        previous: Option<&ModelRef>,
         source: &str,
         explicit_thinking: Option<ModelThinkingLevel>,
     ) -> Result<ModelThinkingLevel, SessionServiceError> {
@@ -3876,8 +3986,8 @@ impl AgentSession {
             model: next.id.clone(),
         };
         self.agent.set_model(model_ref.clone()).await;
-        *Self::lock(&self.model) = model_ref.clone();
-        *Self::lock(&self.compaction_model) = next.clone();
+        *Self::lock(&self.model) = Some(model_ref.clone());
+        *Self::lock(&self.compaction_model) = Some(next.clone());
         self.services.host_services.update_model(model_ref, next.context_window, None);
         // Republish `CYRUP_PROVIDER`/`CYRUP_MODEL` for the NEXT `bash` child (Pi re-reads `ctx.model`
         // on every `resolveSpawnContext`, bash.ts:175-178; docs/environment-variables.md:27).
@@ -4016,7 +4126,9 @@ impl AgentSession {
     /// Whether an assistant error is retryable (Pi `_isRetryableError`, agent-session.ts:2484).
     /// Context-overflow is handled by compaction, never retry.
     pub fn is_retryable_error(&self, message: &AssistantMessage) -> bool {
-        let window = { Some(Self::lock(&self.compaction_model).context_window) };
+        // Pi `if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;`
+        // (agent-session.ts:2637).
+        let window = { Some(Self::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window)) };
         if is_context_overflow(message, window) {
             return false;
         }
@@ -4138,11 +4250,16 @@ impl AgentSession {
         if skip_aborted && assistant.stop_reason == cyrup_core::StopReason::Aborted {
             return Ok(false);
         }
+        // Pi `_checkCompaction` reads `const contextWindow = this.model?.contextWindow ?? 0;`
+        // (agent-session.ts:1960) — a modelless session has window 0, which `shouldCompact` and
+        // `isContextOverflow` both treat as "unknown", so nothing triggers.
         let model = { Self::lock(&self.compaction_model).clone() };
-        let window = model.context_window;
+        let window = model.as_ref().map_or(0, |m| m.context_window);
         let same_model = {
             let cur = Self::lock(&self.model);
-            assistant.provider == cur.provider && assistant.model.as_str() == cur.model.as_str()
+            cur.as_ref().is_some_and(|c| {
+                assistant.provider == c.provider && assistant.model.as_str() == c.model.as_str()
+            })
         };
 
         // Stale-compaction-boundary guard (Pi agent-session.ts:1859-1864): skip all checks if this
@@ -4236,11 +4353,19 @@ impl AgentSession {
         reason: CompactionReason,
         will_retry: bool,
     ) -> Result<bool, SessionServiceError> {
+        // Pi's FIRST statement inside the try is `if (!this.model) { return false; }`
+        // (agent-session.ts:2052-2054) — before `_emit({type:"compaction_start"})` (`:2072`) and
+        // before `started = true`, so a modelless session emits NEITHER `compaction_start` nor
+        // `compaction_end`; it just declines. The check therefore sits ahead of the emit here too.
+        // (Unreachable in practice: `check_compaction`'s window is 0 with no model, so neither the
+        // overflow nor the threshold arm fires — but pi guards it and so do we.)
+        let Some(model) = ({ Self::lock(&self.compaction_model).clone() }) else {
+            return Ok(false);
+        };
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.auto_compaction_cancel) = Some(cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
-        let model = { Self::lock(&self.compaction_model).clone() };
         // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason })` — the LIVE
         // threshold/overflow reason, not a literal (agent-session.ts:2133).
         let (retry_observer, retry_rx) = crate::compact::summarization_retry_channel(

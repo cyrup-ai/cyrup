@@ -454,6 +454,45 @@ pub fn build() -> ExtensionApi {
         },
     );
 
+    // Two commands exercising the capability-scoped `ext-fs` grant (EXT-054/EXT-055): `/fswrite
+    // <name> <text>` and `/fsread <name>`, both addressing paths relative to the project root, both
+    // reporting the host's verbatim refusal when the manifest's `capabilities.fs` does not cover the
+    // path. They are the fs analog of `execdemo`/`httpdemo`: the same "granted ⇒ real effect,
+    // ungranted ⇒ typed denial" seam, in the one capability that had NO guest-reachable surface at
+    // all until the SDK gained `Ctx::read_file`/`Ctx::write_file`.
+    api.register_command(
+        "fswrite",
+        CommandDescriptor::new("Write `<name> <text>` through the ext-fs capability (demo)."),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let (name, text) = args.trim().split_once(' ').unwrap_or((args.trim(), ""));
+            match ctx.ctx().write_file(name, text.as_bytes()) {
+                Ok(()) => {
+                    ctx.ui().notify(&format!("fs wrote: {name}"));
+                    Ok(Some(format!("fs wrote {name}")))
+                }
+                Err(e) => {
+                    ctx.ui().notify(&format!("fs write denied: {e}"));
+                    Ok(Some(format!("fs write denied: {e}")))
+                }
+            }
+        },
+    );
+    api.register_command(
+        "fsread",
+        CommandDescriptor::new("Read `<name>` through the ext-fs capability (demo)."),
+        |args: &str, ctx: &crate::CommandCtx| match ctx.ctx().read_file(args.trim()) {
+            Ok(bytes) => {
+                let body = String::from_utf8_lossy(&bytes).into_owned();
+                ctx.ui().notify(&format!("fs read: {body}"));
+                Ok(Some(format!("fs read {body}")))
+            }
+            Err(e) => {
+                ctx.ui().notify(&format!("fs read denied: {e}"));
+                Ok(Some(format!("fs read denied: {e}")))
+            }
+        },
+    );
+
     // A command exercising the streaming half of the http-client grant (`request-stream` /
     // `poll-stream-chunk`): open a stream to `args`, immediately surface the initiating response's
     // status+headers (closes L4 §2.3 — available BEFORE and INDEPENDENT of draining any chunk, off

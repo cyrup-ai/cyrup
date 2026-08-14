@@ -29,11 +29,18 @@ pub mod providers;
 pub mod remote_catalog;
 pub mod session_resources;
 pub mod stream;
+/// The zero-model stand-in installed when nothing is authenticated (pi `main.ts:852-855`
+/// @v0.83.0). **Always compiled** — unlike [`faux`], this is production code.
+pub mod unconfigured;
 pub mod usage;
 pub mod utils;
 pub mod validate;
 pub mod wire;
 
+// The scripted test double. `feature = "faux"` must reach this crate ONLY through a
+// `[dev-dependencies]` edge — see `Cargo.toml`'s `[features]` comment and PROV-052. A normal
+// (`cargo tree --edges normal`) build of the shipped binary compiles neither this module nor any
+// path that can select it; the no-credential state resolves to [`unconfigured`] instead.
 #[cfg(any(test, feature = "faux"))]
 pub mod faux;
 

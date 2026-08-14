@@ -246,3 +246,66 @@ async fn installed_default_ask_fail_closes_to_block_not_open() {
         "the fail-closed ask block reason surfaced; messages: {msgs:?}"
     );
 }
+
+/// `PERM-009` — a configured `tools.bash: deny` must NOT be defeated by adding a NARROWER
+/// command-level allow. Reproduced live in the shipped binary (`REPRO-LOG.md` §`PERM-009`): with
+/// `tools.bash: deny` alone the model answered "I don't have permission to run arbitrary shell
+/// commands"; adding `bash: {"git status": "allow"}` to the SAME file made real `git status` output
+/// appear (canary file present). The whole difference is **exposure** — pi's `shouldExposeTool`
+/// (`index.ts:1791-1816` @v0.8.0) has a read/skills bypass and NO bash arm, so under a tool-level
+/// deny the bash tool never reaches the model in the first place. Cyrup had an extra bash arm.
+///
+/// This drives the same seam the live repro did: the tool-name set on the **turn-1 provider
+/// request**, not `should_expose_tool` in isolation.
+///
+/// RED before the fix (bash present in the treatment set), GREEN after.
+#[tokio::test]
+async fn perm009_a_narrower_bash_allow_does_not_re_expose_a_tool_level_bash_deny() {
+    // CONTROL 1 — no policy: `bash` IS exposed. Anchors that the seam can carry `bash` at all, so a
+    // later absence is a real exclusion rather than a harness that never had the tool.
+    let unset = model_visible_tools_for("{}").await;
+    assert!(
+        unset.contains(&"bash".to_string()),
+        "control: `bash` is exposed under default-ask; got {unset:?}"
+    );
+
+    // CONTROL 2 — REPRO-LOG "CASE B": tool-level deny alone. Already correct before the fix.
+    let deny_only = model_visible_tools_for(r#"{ "tools": { "bash": "deny" } }"#).await;
+    assert!(
+        !deny_only.contains(&"bash".to_string()),
+        "control: a tool-level `bash` deny withholds the tool; got {deny_only:?}"
+    );
+
+    // TREATMENT — REPRO-LOG "CASE A": the SAME deny plus a narrower command allow. A rule that can
+    // only ever NARROW an allow must not widen a deny.
+    let bypass = model_visible_tools_for(
+        r#"{ "tools": { "bash": "deny" }, "bash": { "git status": "allow" } }"#,
+    )
+    .await;
+    assert!(
+        !bypass.contains(&"bash".to_string()),
+        "PERM-009: a narrower `bash` command allow must NOT re-expose a tool-level `bash` deny; got {bypass:?}"
+    );
+    // The deny is scoped to `bash` only — other tools are untouched (pi returns `true` for every
+    // non-denied tool at `index.ts:1804-1806`).
+    assert!(
+        bypass.contains(&"read".to_string()),
+        "PERM-009: only `bash` is withheld; `read` must remain exposed; got {bypass:?}"
+    );
+}
+
+/// `PERM-009`, second half: the exposure rule is the ONLY defence pi has here, so it must hold for
+/// every allow-rule shape — including a wildcard, which is what a real config carries. pi's
+/// `checkPermission` bash arm (`permission-manager.ts:944-959` @v0.8.0) deliberately resolves a
+/// command rule ABOVE `toolMatch`, so once the tool is exposed the command DOES run; keeping it
+/// unexposed is what makes the deny stick.
+#[tokio::test]
+async fn perm009_a_wildcard_bash_allow_does_not_re_expose_a_tool_level_bash_deny() {
+    let bypass =
+        model_visible_tools_for(r#"{ "tools": { "bash": "deny" }, "bash": { "git *": "allow" } }"#)
+            .await;
+    assert!(
+        !bypass.contains(&"bash".to_string()),
+        "PERM-009: a wildcard `bash` allow must NOT re-expose a tool-level `bash` deny; got {bypass:?}"
+    );
+}

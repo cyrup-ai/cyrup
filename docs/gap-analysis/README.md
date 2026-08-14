@@ -180,9 +180,14 @@ open.
 
 Known traps are fed to every pass so they are not re-reported as discoveries: the `loop_fn.rs`
 facade, pi's two forked compaction implementations, the provider `fleet!` macro hiding ~20
-registrations, `wasm-host` being default-on, the out-of-scope pi packages, and the deliberately
-unreachable first-run wizard. **Two of those traps are now contested by evidence** — see
-`PARITY-GAPS.md` UW-2 / OQ-6 for the wizard, and blind spot 6 for the out-of-scope package list.
+registrations, `wasm-host` being default-on, and the out-of-scope pi packages. **One trap was
+removed on 2026-08-13: "the deliberately unreachable first-run wizard".** It was not downgraded, it
+was **wrong** — `is_official_distribution()` is a compile-time `true` for this build, the gate was
+measured firing on a live pty, and the wizard was a complete, unit-tested port with no caller
+(`UW-2`, decided by ADR-0011, wired and closed the same day). A wrong trap is worse than no trap: it
+converted a real finding into a non-finding across every pass, which is the only mechanism this
+project has for finding anything. The out-of-scope package list remains contested — see blind
+spot 6.
 
 ## Structural blind spots, all found the hard way
 

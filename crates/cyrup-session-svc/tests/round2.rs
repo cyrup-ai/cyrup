@@ -65,7 +65,7 @@ async fn new_session_seeds_then_resume_restores_model() {
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-2".to_string());
     let session = SessionBuilder::new(provider.clone(), cfg).build().await.unwrap();
-    assert_eq!(session.model().model.as_str(), "faux-2");
+    assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), "faux-2");
     let file = session.session_file().await.expect("persisted session");
     // Drive a turn so the resumed session has messages (hasExistingSession) and the file flushes.
     faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
@@ -84,7 +84,7 @@ async fn new_session_seeds_then_resume_restores_model() {
     let mut resume_cfg = base_config(&fx);
     resume_cfg.target = SessionTarget::Resume(file);
     let resumed = SessionBuilder::new(provider, resume_cfg).build().await.unwrap();
-    assert_eq!(resumed.model().model.as_str(), "faux-2", "resume must restore the saved model");
+    assert_eq!(resumed.model().expect("session must have a resolved model").model.as_str(), "faux-2", "resume must restore the saved model");
     assert!(resumed.model_fallback_message().is_none(), "clean restore = no fallback message");
 }
 

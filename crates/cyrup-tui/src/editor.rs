@@ -68,12 +68,28 @@ enum JumpDir {
     Backward,
 }
 
-/// An undo snapshot (deep clone of buffer + cursor, `undo-stack.ts`).
+/// An undo snapshot — "editor text state plus the paste registry"
+/// (`pi/packages/tui/src/components/editor.ts:216-220` @v0.83.0):
+///
+/// ```text
+/// interface EditorSnapshot { state: EditorState; pastes: Map<number, string>; pasteCounter: number }
+/// ```
+///
+/// [`lines`](Self::lines)/[`row`](Self::row)/[`col`](Self::col) are pi's `EditorState`
+/// (`editor.ts:209-213`, `{ lines, cursorLine, cursorCol }`); `pastes`/`paste_counter` are the
+/// registry, without which an undone marker deletion puts the marker TEXT back on screen while
+/// [`InputEditor::expanded_text`] can no longer resolve it — the model then receives the literal
+/// `[paste #N …]` string (TUI-042). The deep copy `structuredClone` gives pi for free
+/// (`undo-stack.ts:11-13`) is the `Clone` on this struct.
 #[derive(Clone, Debug)]
 struct Snapshot {
     lines: Vec<Vec<char>>,
     row: usize,
     col: usize,
+    /// The paste registry as of the snapshot (`EditorSnapshot.pastes`, `editor.ts:218`).
+    pastes: BTreeMap<u32, String>,
+    /// The paste id counter as of the snapshot (`EditorSnapshot.pasteCounter`, `editor.ts:219`).
+    paste_counter: u32,
 }
 
 /// A multi-line text editor with a block cursor, kill ring, undo, history, and autocomplete.
@@ -437,6 +453,11 @@ impl InputEditor {
         self.preferred_visual_col = None;
         self.scroll_offset = 0;
         self.pastes.clear();
+        // `this.pastes.clear(); this.pasteCounter = 0;` — both halves, on both upstream paths this
+        // method stands in for (`submitValue`, `editor.ts:1264-1266`; `setText`, `:1018-1020`).
+        // Clearing the map without resetting the counter left paste ids drifting up for the life of
+        // the session, so cyrup's `[paste #7 …]` was pi's `[paste #1 …]`.
+        self.paste_counter = 0;
         self.exit_history();
     }
 
@@ -615,6 +636,12 @@ impl InputEditor {
         let line_count = text.split('\n').count();
         let char_count = text.chars().count();
         if line_count > 10 || char_count > 1000 {
+            // The snapshot is the FIRST thing `handlePaste` does (`editor.ts:1160`), *before* the
+            // counter and the registry are touched — so one undo rolls the paste back completely and
+            // the next paste re-issues the same id. cyrup pushed it after `pastes.insert` + the
+            // increment, which is why paste → undo → paste re-issued `#2` where pi re-issues `#1`
+            // (TUI-042's quiet variant).
+            self.push_undo_for(LastAction::None);
             self.paste_counter += 1;
             let id = self.paste_counter;
             let marker = if line_count > 1 {
@@ -623,7 +650,6 @@ impl InputEditor {
                 format!("[paste #{id} {char_count} chars]")
             };
             self.pastes.insert(id, text);
-            self.push_undo_for(LastAction::None);
             for c in marker.chars() {
                 self.insert_char(c);
             }
@@ -662,60 +688,99 @@ impl InputEditor {
 
     /// If a `[paste #N …]` marker for a known id starts at `chars[i]`, return its `(id, content, end)`
     /// where `end` is the char index just past the closing `]`. Bounds-checked throughout (no-panic).
+    ///
+    /// The accepted grammar is `PASTE_MARKER_SINGLE` (`editor.ts:24` @v0.83.0), anchored at `i`:
+    ///
+    /// ```text
+    /// /^\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]$/
+    /// ```
+    ///
+    /// i.e. the id, then **either** an immediate `]`, **or** one space and exactly one of
+    /// `+<digits> lines` / `<digits> chars` before the `]` — the two shapes
+    /// [`handle_paste`](Self::handle_paste) produces, plus the bare `[paste #N]` the regex allows.
+    /// The previous implementation scanned to the first `]` with the body unconstrained, so a
+    /// hand-typed `[paste #1 see the file above]` matched and [`expanded_text`](Self::expanded_text)
+    /// silently replaced the user's own words with the stored paste (TUI-049). The id must also be
+    /// live in [`pastes`](Self::pastes) — pi's `validIds` gate (`segmentWithMarkers`, `:44`).
     fn marker_at<'a>(&'a self, chars: &[char], i: usize) -> Option<(u32, &'a str, usize)> {
-        const PREFIX: [char; 8] = ['[', 'p', 'a', 's', 't', 'e', ' ', '#'];
-        for (k, pc) in PREFIX.iter().enumerate() {
-            if chars.get(i + k) != Some(pc) {
-                return None;
-            }
-        }
-        let mut j = i + PREFIX.len();
-        let mut id: u32 = 0;
-        let mut digits = 0;
-        while let Some(&c) = chars.get(j).filter(|c| c.is_ascii_digit()) {
-            id = id.saturating_mul(10).saturating_add(c.to_digit(10).unwrap_or(0));
-            j += 1;
-            digits += 1;
-        }
-        if digits == 0 {
-            return None;
-        }
-        // Scan to the closing `]` on the same marker (a stray `[` aborts — no nested marker).
-        while let Some(&c) = chars.get(j) {
-            if c == ']' || c == '[' {
-                break;
-            }
-            j += 1;
-        }
-        if chars.get(j) != Some(&']') {
-            return None;
-        }
+        let (id, _, end) = marker_span_at(chars, i)?;
         let content = self.pastes.get(&id)?;
-        Some((id, content.as_str(), j + 1))
+        Some((id, content.as_str(), end))
     }
 
-    /// If `col` falls inside (or on either edge of) a complete `[paste #N …]` marker on the current
-    /// line, return its `(start_col, end_col, paste_id)` so deletion removes it atomically
-    /// (`segmentWithMarkers`, spec/tui/03 §5.5).
-    fn marker_covering(&self, col: usize) -> Option<(usize, usize, u32)> {
-        let line = self.lines.get(self.row)?;
+    /// Every **valid** marker span on `chars` as `(start, end, id)`, left to right and
+    /// non-overlapping — the marker scan `segmentWithMarkers` runs before merging
+    /// (`editor.ts:48-57`: `for (const m of text.matchAll(PASTE_MARKER_REGEX)) { if
+    /// (!validIds.has(id)) continue; markers.push(…) }`).
+    fn marker_spans(&self, chars: &[char]) -> Vec<(usize, usize, u32)> {
+        let mut spans = Vec::new();
         let mut i = 0;
-        while i < line.len() {
-            if let Some((id, _, end)) = self.marker_at(line, i) {
-                if col >= i && col <= end {
-                    return Some((i, end, id));
+        while i < chars.len() {
+            match self.marker_at(chars, i) {
+                Some((id, _, end)) => {
+                    spans.push((i, end, id));
+                    i = end;
                 }
-                i = end;
-            } else {
-                i += 1;
+                None => i += 1,
             }
         }
-        None
+        spans
     }
 
-    /// Snapshot the buffer + cursor for undo.
+    // `marker_covering(col)` — "is `col` inside or on either edge of a marker" — used to be the whole
+    // of cyrup's marker atomicity, called from `backspace()` and `delete()` and from nowhere else. It
+    // is gone: upstream has no such predicate. Atomicity there is a property of the SEGMENTER
+    // (`this.segment(text, "grapheme" | "word")`, `editor.ts:361-363`), which every motion and
+    // deletion path already goes through, so the marker is atomic for cursor motion too and the
+    // caret can never be parked inside one. See [`marker_grapheme_boundaries`](Self::marker_grapheme_boundaries)
+    // and [`word_segments`](Self::word_segments).
+
+    /// Retire the paste a just-backspaced `[paste #N …]` marker owned, then **renumber** — a literal
+    /// port of `handleBackspace`'s paste branch (`editor.ts:1293-1315` @v0.83.0):
+    ///
+    /// ```text
+    /// this.pastes.delete(targetId);
+    /// this.pasteCounter--;
+    /// // Shift registry entries down in ascending id order …
+    /// const higherIds = [...this.pastes.keys()].filter((id) => id > targetId).sort((a, b) => a - b);
+    /// for (const id of higherIds) { this.pastes.set(id - 1, this.pastes.get(id)!); this.pastes.delete(id); }
+    /// // Renumber markers with ids greater than the removed one.
+    /// this.state.lines = this.state.lines.map((line) => line.replace(PASTE_MARKER_REGEX, …));
+    /// ```
+    ///
+    /// A `BTreeMap` already iterates ascending, which is what upstream's `.sort()` buys. The text
+    /// rewrite runs on the **syntactic** matcher with no `validIds` filter, exactly as upstream's
+    /// bare `PASTE_MARKER_REGEX` replace does.
+    ///
+    /// [CYRUP-DELTA] none — including the hazard: renumbering `#10` → `#9` shortens a line, and
+    /// upstream computes the deletion offsets *before* the rewrite and re-reads the line *after* it
+    /// (`:1317-1322`), so a two-digit marker earlier on the same line shifts the deletion. That is
+    /// upstream's arithmetic and it is reproduced rather than quietly corrected; see the report.
+    fn drop_paste(&mut self, target: u32) {
+        self.pastes.remove(&target);
+        self.paste_counter = self.paste_counter.saturating_sub(1);
+        let higher: Vec<u32> = self.pastes.keys().copied().filter(|&id| id > target).collect();
+        for id in higher {
+            if let Some(content) = self.pastes.remove(&id) {
+                self.pastes.insert(id.saturating_sub(1), content);
+            }
+        }
+        for line in &mut self.lines {
+            *line = renumber_markers(line, target);
+        }
+    }
+
+    /// Snapshot the buffer + cursor **+ the paste registry** for undo — pi's `pushUndoSnapshot`
+    /// payload `{ state, pastes, pasteCounter }` (`editor.ts:2012-2014` @v0.83.0), deep-copied by
+    /// `structuredClone` upstream (`undo-stack.ts:11-13`) and by `Clone` here.
     fn snapshot(&self) -> Snapshot {
-        Snapshot { lines: self.lines.clone(), row: self.row, col: self.col }
+        Snapshot {
+            lines: self.lines.clone(),
+            row: self.row,
+            col: self.col,
+            pastes: self.pastes.clone(),
+            paste_counter: self.paste_counter,
+        }
     }
 
     /// Push an undo snapshot, coalescing consecutive typing into one unit (fish-style,
@@ -745,13 +810,34 @@ impl InputEditor {
         }
     }
 
-    /// Restore the most recent undo snapshot (Ctrl+-). No redo (Pi parity, `editor.ts:1974-1984`).
+    /// Restore the most recent undo snapshot (Ctrl+-). No redo (Pi parity). A statement-for-statement
+    /// port of `undo()` (`editor.ts:2016-2030` @v0.83.0):
+    ///
+    /// ```text
+    /// this.exitHistoryBrowsing();
+    /// const snapshot = this.undoStack.pop();
+    /// if (!snapshot) return;
+    /// Object.assign(this.state, snapshot.state);
+    /// this.pastes = snapshot.pastes;
+    /// this.pasteCounter = snapshot.pasteCounter;
+    /// this.lastAction = null;
+    /// this.preferredVisualCol = null;
+    /// ```
+    ///
+    /// `Object.assign(this.state, …)` restores **both** cursor coordinates (`EditorState` is
+    /// `{ lines, cursorLine, cursorCol }`, `:209-213`) — cyrup used to keep the live `self.col` and
+    /// merely clamp it, so the caret ended up wherever it happened to be and the next keystroke
+    /// edited a position the user never chose (TUI-044). `min(cur_len())` is a bounds guard only.
+    /// `last_action` is cleared by the [`EditorAction::Undo`] arm, matching `this.lastAction = null`.
     fn undo(&mut self) {
+        self.exit_history();
         if let Some(snap) = self.undo.pop() {
             self.lines = snap.lines;
             self.row = snap.row.min(self.lines.len().saturating_sub(1));
-            self.col = self.col.min(self.cur_len());
-            self.exit_history();
+            self.col = snap.col.min(self.cur_len());
+            self.pastes = snap.pastes;
+            self.paste_counter = snap.paste_counter;
+            self.reset_preferred_col();
         }
     }
 
@@ -800,23 +886,23 @@ impl InputEditor {
     /// Backspace: delete the whole grapheme cluster before the cursor (emoji/ZWJ/combining marks
     /// removed as one unit, `editor.ts`), joining lines at column 0.
     pub fn backspace(&mut self) {
-        // A large-paste marker is an atomic segment: backspacing anywhere across it (or just after its
-        // closing `]`) removes the whole marker and drops its stored content (spec/tui/03 §5.5).
-        // Backspace deletes the marker only when the cursor is *inside* or just-after it
-        // (`col > start`); at `col == start` it falls through to delete the preceding char.
-        if self.col > 0
-            && let Some((s, e, id)) =
-                self.marker_covering(self.col).filter(|&(s, _, _)| self.col > s)
-        {
-            if let Some(line) = self.lines.get_mut(self.row) {
-                line.drain(s..e.min(line.len()));
-            }
-            self.pastes.remove(&id);
-            self.col = s;
-            return;
-        }
         if self.col > 0 {
+            // The cluster about to be deleted, marker-aware ([`marker_grapheme_boundaries`]) — pi
+            // takes the LAST segment of `line.slice(0, cursorCol)` under `this.segment(…,
+            // "grapheme")` (`editor.ts:1287-1290`), which is a whole `[paste #N …]` marker exactly
+            // when the caret sits on the marker's closing `]`.
             let start = self.prev_grapheme(self.col);
+            // "This contains the id part e.g 4 from [paste #4 +123 lines]" (`editor.ts:1291-1315`):
+            // when the deleted cluster IS a marker, drop its registry entry and renumber.
+            let deleted_marker = self
+                .lines
+                .get(self.row)
+                .and_then(|line| self.marker_at(line, start))
+                .filter(|&(_, _, end)| end == self.col)
+                .map(|(id, _, _)| id);
+            if let Some(target) = deleted_marker {
+                self.drop_paste(target);
+            }
             if let Some(line) = self.lines.get_mut(self.row) {
                 let end = self.col.min(line.len());
                 if start < end {
@@ -838,21 +924,15 @@ impl InputEditor {
 
     /// Forward-delete: delete the whole grapheme cluster at the cursor (one user-perceived char),
     /// joining the next line at end-of-line.
+    ///
+    /// The cluster is marker-aware ([`marker_grapheme_boundaries`](Self::marker_grapheme_boundaries)),
+    /// so Delete at a marker's `[` removes the whole marker — pi's `handleForwardDelete` takes the
+    /// FIRST segment of `line.slice(cursorCol)` under `this.segment(…, "grapheme")`
+    /// (`editor.ts:1687-1690`). Note the deliberate asymmetry with [`backspace`](Self::backspace):
+    /// upstream's forward-delete has **no** paste branch — it neither drops the registry entry nor
+    /// renumbers (`:1674-1706`), so neither does this.
     pub fn delete(&mut self) {
         let len = self.cur_len();
-        // Forward-delete removes a whole marker when the cursor is inside or just-before it
-        // (`col < end`); at `col == end` it falls through to delete the following char.
-        if self.col < len
-            && let Some((s, e, id)) =
-                self.marker_covering(self.col).filter(|&(_, e, _)| self.col < e)
-        {
-            if let Some(line) = self.lines.get_mut(self.row) {
-                line.drain(s..e.min(line.len()));
-            }
-            self.pastes.remove(&id);
-            self.col = s;
-            return;
-        }
         if self.col < len {
             let end = self.next_grapheme(self.col);
             if let Some(line) = self.lines.get_mut(self.row) {
@@ -1045,11 +1125,26 @@ impl InputEditor {
         }
     }
 
+    /// The grapheme-cluster boundaries of the current line **with every valid paste marker merged
+    /// into one cluster** — pi's `this.segment(text, "grapheme")` (`editor.ts:361-363`), the
+    /// segmenter `moveCursor` (`:1808-1830`), `handleBackspace` (`:1287-1290`) and
+    /// `handleForwardDelete` (`:1687-1690`) all step by. Without the merge the caret can be parked
+    /// INSIDE a `[paste #N …]` marker, where the next keystroke silently destroys it (TUI-043's
+    /// cursor-motion half).
+    fn marker_grapheme_boundaries(&self, line: &[char]) -> Vec<usize> {
+        let mut bounds = grapheme_boundaries(line);
+        let markers = self.marker_spans(line);
+        if !markers.is_empty() {
+            bounds.retain(|&b| !markers.iter().any(|&(s, e, _)| b > s && b < e));
+        }
+        bounds
+    }
+
     /// The previous grapheme-cluster boundary strictly left of char-column `col` on the current line
-    /// (emoji/ZWJ/combining marks step as one unit; `editor.ts` grapheme motion). `0` if none.
+    /// (emoji/ZWJ/combining marks — and whole paste markers — step as one unit). `0` if none.
     fn prev_grapheme(&self, col: usize) -> usize {
         let Some(line) = self.lines.get(self.row) else { return col.saturating_sub(1) };
-        grapheme_boundaries(line).into_iter().rfind(|&b| b < col).unwrap_or(0)
+        self.marker_grapheme_boundaries(line).into_iter().rfind(|&b| b < col).unwrap_or(0)
     }
 
     /// The next grapheme-cluster boundary strictly right of char-column `col` on the current line.
@@ -1057,7 +1152,7 @@ impl InputEditor {
     fn next_grapheme(&self, col: usize) -> usize {
         let Some(line) = self.lines.get(self.row) else { return col + 1 };
         let len = line.len();
-        grapheme_boundaries(line).into_iter().find(|&b| b > col).unwrap_or(len)
+        self.marker_grapheme_boundaries(line).into_iter().find(|&b| b > col).unwrap_or(len)
     }
 
     pub fn move_home(&mut self) {
@@ -1068,60 +1163,170 @@ impl InputEditor {
         self.col = self.cur_len();
     }
 
-    /// The word-left target `(row, col)` (`word-navigation.ts`): skip a whitespace run, then consume
-    /// one word/punctuation segment; honor punctuation sub-boundaries inside a word. At col 0 step to
-    /// the previous line's end.
+    /// Word-granularity segments of `text`, with every **valid** paste marker merged into one atomic
+    /// segment — pi's `this.segment(text, "word")` (`editor.ts:361-363`), i.e. `segmentWithMarkers`
+    /// (`:37-90`) over `Intl.Segmenter(undefined, { granularity: "word" })` (`utils.ts:5`).
+    ///
+    /// [CYRUP-DELTA] The base segmenter is `unicode_segmentation`'s UAX#29 word-boundary iterator
+    /// rather than ICU's. They agree on Latin/Cyrillic/Greek prose, identifiers, `foo.bar`, `don't`
+    /// and `3.14`; they differ on **unspaced scripts**, where ICU adds a dictionary/LSTM pass that
+    /// UAX#29 alone has no data for — `你好世界` is two segments to ICU and four to UAX#29. Closing
+    /// that needs an ICU-class word segmenter (`icu_segmenter` + its CJK/Thai data), which is a new
+    /// workspace dependency and not this change's to take. See TUI-048.
+    fn word_segments(&self, text: &[char]) -> Vec<WordSeg> {
+        let markers = self.marker_spans(text);
+        let joined: String = text.iter().collect();
+        let mut out: Vec<WordSeg> = Vec::new();
+        let mut col = 0usize;
+        let mut mi = 0usize;
+        for seg in joined.split_word_bounds() {
+            let len = seg.chars().count();
+            let start = col;
+            col += len;
+            // "Skip past markers that are entirely before this segment" (`editor.ts:67-69`).
+            while markers.get(mi).is_some_and(|&(_, end, _)| end <= start) {
+                mi += 1;
+            }
+            match markers.get(mi) {
+                // "This segment falls inside a marker" (`:74`): emit the merged segment once, at the
+                // marker's first base segment, and skip the rest (`:76-86`).
+                Some(&(ms, me, _)) if start >= ms && start < me => {
+                    if start == ms {
+                        out.push(WordSeg {
+                            start: ms,
+                            len: me.saturating_sub(ms),
+                            word_like: false,
+                            atomic: true,
+                        });
+                    }
+                }
+                _ => out.push(WordSeg {
+                    start,
+                    len,
+                    word_like: seg.chars().any(char::is_alphanumeric),
+                    atomic: false,
+                }),
+            }
+        }
+        out
+    }
+
+    /// Whether `seg` is whitespace — pi's `isWhitespaceChar(segment)` = `/\s/.test(segment)`
+    /// (`utils.ts:826-829`), which is *contains* whitespace, hence `any`.
+    fn seg_is_whitespace(text: &[char], seg: &WordSeg) -> bool {
+        text.get(seg.start..seg.start.saturating_add(seg.len))
+            .is_some_and(|s| s.iter().any(|c| c.is_whitespace()))
+    }
+
+    /// The word-left target `(row, col)` — a statement-for-statement port of `findWordBackward`
+    /// (`pi/packages/tui/src/word-navigation.ts:22-68` @v0.83.0) as pi calls it from
+    /// `moveWordBackwards` (`editor.ts:1869-1889`), i.e. with
+    /// `{ segment: (t) => this.segment(t, "word"), isAtomicSegment: isPasteMarker }`.
+    ///
+    /// Three branches after the whitespace skip: **one atomic segment** whole (`:44-46` — a
+    /// `[paste #N …]` marker is never entered, which is what makes Ctrl+W delete the marker instead
+    /// of chewing its closing `]`, TUI-043), **one word-like segment** truncated at its last
+    /// `PUNCTUATION_REGEX` match (`:47-57`), or **a whole punctuation run** (`:58-66`).
+    /// At col 0 step to the previous line's end (`editor.ts:1874-1881`).
     fn word_left_target(&self) -> (usize, usize) {
         let Some(line) = self.lines.get(self.row) else { return (self.row, self.col) };
-        let mut i = self.col;
-        if i == 0 {
+        let cursor = self.col.min(line.len());
+        if cursor == 0 {
             if self.row > 0 {
                 let prev_len = self.lines.get(self.row - 1).map_or(0, Vec::len);
                 return (self.row - 1, prev_len);
             }
             return (self.row, 0);
         }
-        // Skip whitespace immediately left of the cursor.
-        while i > 0 && line.get(i - 1).is_some_and(|c| c.is_whitespace()) {
-            i -= 1;
+        // `const textBeforeCursor = text.slice(0, cursor)` (`:25`) — segmenting only the PREFIX is
+        // why a marker the cursor sits inside is not atomic: it is not whole in this slice.
+        let Some(before) = line.get(..cursor) else { return (self.row, cursor) };
+        let mut segs = self.word_segments(before);
+        let mut new_cursor = cursor;
+
+        // "Skip trailing whitespace" (`:31-38`).
+        while let Some(last) = segs.last() {
+            if last.atomic || !Self::seg_is_whitespace(before, last) {
+                break;
+            }
+            new_cursor = new_cursor.saturating_sub(last.len);
+            segs.pop();
         }
-        // Consume one class run (word chars OR punctuation chars).
-        if let Some(&c) = line.get(i.wrapping_sub(1)) {
-            let want_word = is_word_char(c);
-            while i > 0 {
-                match line.get(i - 1) {
-                    Some(&c) if is_word_char(c) == want_word && !c.is_whitespace() => i -= 1,
-                    _ => break,
+        // `if (segments.length === 0) return newCursor` (`:40`).
+        let Some(&last) = segs.last() else { return (self.row, new_cursor) };
+
+        if last.atomic {
+            // "Skip one atomic segment" (`:44-46`).
+            new_cursor = new_cursor.saturating_sub(last.len);
+        } else if last.word_like {
+            // "Skip inside one word-like segment, preserving ASCII punctuation boundaries"
+            // (`:47-57`): back up to just after the LAST punctuation character in the segment.
+            let seg = before.get(last.start..last.start.saturating_add(last.len)).unwrap_or(&[]);
+            match seg.iter().rposition(|&c| is_punctuation(c)) {
+                None => new_cursor = new_cursor.saturating_sub(last.len),
+                Some(idx) => {
+                    new_cursor = new_cursor.saturating_sub(last.len.saturating_sub(idx + 1));
                 }
             }
+        } else {
+            // "Skip non-word non-whitespace run (punctuation)" (`:58-66`).
+            while let Some(last) = segs.last() {
+                if last.atomic || last.word_like || Self::seg_is_whitespace(before, last) {
+                    break;
+                }
+                new_cursor = new_cursor.saturating_sub(last.len);
+                segs.pop();
+            }
         }
-        (self.row, i)
+        (self.row, new_cursor)
     }
 
-    /// The word-right target (mirror of [`word_left_target`](Self::word_left_target)).
+    /// The word-right target — the mirror port of `findWordForward` (`word-navigation.ts:76-114`),
+    /// called as `moveWordForwards` does (`editor.ts:2064-2083`). Same three branches, with the
+    /// atomic skip at `:97-99` and the word-like branch taking the FIRST punctuation match (`:102`).
     fn word_right_target(&self) -> (usize, usize) {
         let Some(line) = self.lines.get(self.row) else { return (self.row, self.col) };
         let len = line.len();
-        let mut i = self.col;
-        if i >= len {
+        let cursor = self.col.min(len);
+        if cursor >= len {
             if self.row + 1 < self.lines.len() {
                 return (self.row + 1, 0);
             }
             return (self.row, len);
         }
-        while i < len && line.get(i).is_some_and(|c| c.is_whitespace()) {
-            i += 1;
+        // `const textAfterCursor = text.slice(cursor)` (`:79`).
+        let Some(after) = line.get(cursor..) else { return (self.row, cursor) };
+        let segs = self.word_segments(after);
+        let mut idx = 0usize;
+        let mut new_cursor = cursor;
+
+        // "Skip leading whitespace" (`:88-93`).
+        while let Some(seg) = segs.get(idx) {
+            if seg.atomic || !Self::seg_is_whitespace(after, seg) {
+                break;
+            }
+            new_cursor = new_cursor.saturating_add(seg.len);
+            idx += 1;
         }
-        if let Some(&c) = line.get(i) {
-            let want_word = is_word_char(c);
-            while i < len {
-                match line.get(i) {
-                    Some(&c) if is_word_char(c) == want_word && !c.is_whitespace() => i += 1,
-                    _ => break,
+        // `if (next.done) return newCursor` (`:95`).
+        let Some(&next) = segs.get(idx) else { return (self.row, new_cursor) };
+
+        if next.atomic {
+            new_cursor = new_cursor.saturating_add(next.len);
+        } else if next.word_like {
+            let seg = after.get(next.start..next.start.saturating_add(next.len)).unwrap_or(&[]);
+            let step = seg.iter().position(|&c| is_punctuation(c)).unwrap_or(next.len);
+            new_cursor = new_cursor.saturating_add(step);
+        } else {
+            while let Some(seg) = segs.get(idx) {
+                if seg.atomic || seg.word_like || Self::seg_is_whitespace(after, seg) {
+                    break;
                 }
+                new_cursor = new_cursor.saturating_add(seg.len);
+                idx += 1;
             }
         }
-        (self.row, i)
+        (self.row, new_cursor)
     }
 
     fn move_word_left(&mut self) {
@@ -1196,6 +1401,11 @@ impl InputEditor {
             return;
         }
         if self.history_index < 0 {
+            // `navigateHistory` (`editor.ts:435-438` @v0.83.0) pushes an undo snapshot *and* clones
+            // the draft when browsing is first entered: `this.pushUndoSnapshot(); this.historyDraft =
+            // structuredClone(this.state);`. cyrup saved the draft but never pushed the snapshot, so
+            // Ctrl+- could not undo "I browsed history away from what I was typing".
+            self.push_undo_for(LastAction::None);
             self.history_draft = Some(self.snapshot());
         }
         let next = (self.history_index + 1).min(self.history.len() as isize - 1);
@@ -1214,13 +1424,25 @@ impl InputEditor {
         }
         self.history_index -= 1;
         if self.history_index < 0 {
-            // Restore the draft.
+            // Restore the draft (`editor.ts:442-452`: `this.state = draft` + `preferredVisualCol =
+            // null` + `scrollOffset = 0`, else `setTextInternal("")`). The draft reuses [`Snapshot`],
+            // so it now carries the paste registry too: pi's `historyDraft` is a bare `EditorState`
+            // (`:319`) only because nothing upstream mutates `pastes` while browsing — and nothing
+            // here does either (every edit path calls `exit_history`, which drops the draft), so
+            // restoring both fields is pi's outcome with the invariant made explicit rather than
+            // assumed.
             if let Some(draft) = self.history_draft.take() {
                 self.lines = draft.lines;
                 self.row = draft.row.min(self.lines.len().saturating_sub(1));
                 self.col = draft.col.min(self.cur_len());
+                self.pastes = draft.pastes;
+                self.paste_counter = draft.paste_counter;
+                self.reset_preferred_col();
+                self.scroll_offset = 0;
             } else {
-                self.clear();
+                // `setTextInternal("")` (`:451`), NOT `clear()`: upstream's fallback empties the
+                // buffer and leaves the paste registry, kill ring and popup state alone.
+                self.set_text("");
             }
         } else if let Some(entry) = self.history.get(self.history_index as usize).cloned() {
             self.set_text(&entry);
@@ -1410,6 +1632,7 @@ impl InputEditor {
                     let text = self.text().trim().to_string();
                     self.add_to_history(&text);
                     self.clear();
+                    self.undo.clear(); // `this.undoStack.clear()` (`editor.ts:1268`)
                     Some(EditorOutcome::Submit(text))
                 } else {
                     self.update_autocomplete();
@@ -1440,6 +1663,12 @@ impl InputEditor {
                 EditorOutcome::Edited
             }
             E::CursorUp => {
+                // Every motion clears `lastAction` upstream — `moveCursor` (`editor.ts:1791`),
+                // `navigateHistory` (`:430`), `moveWordBackwards`/`moveWordForwards` (`:1870`/`:2065`),
+                // `moveToLineStart`/`moveToLineEnd`. cyrup cleared it on Left/Right only, so a kill
+                // survived a vertical/word/line motion and the NEXT kill accumulated into the same
+                // ring entry instead of pushing a new one (and a stale `Yank` still armed Alt+Y).
+                self.last_action = LastAction::None;
                 // History recall only fires on the first visual line (`history_up_eligible` already
                 // requires `row == 0` + empty/browsing/col-0, which is always the first visual line).
                 if self.history_up_eligible() {
@@ -1450,6 +1679,7 @@ impl InputEditor {
                 EditorOutcome::Edited
             }
             E::CursorDown => {
+                self.last_action = LastAction::None; // `editor.ts:1791` / `:430`
                 if self.history_index >= 0 {
                     self.history_newer();
                 } else {
@@ -1469,18 +1699,22 @@ impl InputEditor {
                 EditorOutcome::Edited
             }
             E::CursorWordLeft => {
+                self.last_action = LastAction::None; // `moveWordBackwards`, `editor.ts:1870`
                 self.move_word_left();
                 EditorOutcome::Edited
             }
             E::CursorWordRight => {
+                self.last_action = LastAction::None; // `moveWordForwards`, `editor.ts:2065`
                 self.move_word_right();
                 EditorOutcome::Edited
             }
             E::CursorLineStart => {
+                self.last_action = LastAction::None; // `moveToLineStart`, `editor.ts:1783`
                 self.move_home();
                 EditorOutcome::Edited
             }
             E::CursorLineEnd => {
+                self.last_action = LastAction::None; // `moveToLineEnd`, `editor.ts:1787`
                 self.move_end();
                 EditorOutcome::Edited
             }
@@ -1575,6 +1809,9 @@ impl InputEditor {
                 }
                 self.add_to_history(&text);
                 self.clear();
+                // `submitValue` empties the undo stack with the buffer (`editor.ts:1268`), so
+                // Ctrl+- after a send cannot resurrect the prompt that was just submitted.
+                self.undo.clear();
                 EditorOutcome::Submit(text)
             }
             E::Tab => self.trigger_completion(),
@@ -1633,9 +1870,162 @@ impl InputEditor {
     }
 }
 
-/// Whether `c` is a word char (alphanumeric or `_`), for word-motion class runs.
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+/// The ASCII punctuation that sub-divides a word-like segment — a literal port of
+/// `PUNCTUATION_REGEX` (`pi/packages/tui/src/utils.ts:821` @v0.83.0):
+///
+/// ```text
+/// /[(){}[\]<>.,;:'"!?+\-=*/\\|&%^$#@~`]/
+/// ```
+///
+/// Deliberately **not** the complement of an `is_alphanumeric() || '_'` word-char test — the two are
+/// different sets (that test rejects every non-alphanumeric; this one names 31 specific ASCII
+/// characters), and word navigation must use pi's. The old class-run word motion used the former and
+/// was replaced wholesale (TUI-043 / TUI-048).
+fn is_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '(' | ')'
+            | '{'
+            | '}'
+            | '['
+            | ']'
+            | '<'
+            | '>'
+            | '.'
+            | ','
+            | ';'
+            | ':'
+            | '\''
+            | '"'
+            | '!'
+            | '?'
+            | '+'
+            | '-'
+            | '='
+            | '*'
+            | '/'
+            | '\\'
+            | '|'
+            | '&'
+            | '%'
+            | '^'
+            | '$'
+            | '#'
+            | '@'
+            | '~'
+            | '`'
+    )
+}
+
+/// Read a run of ASCII digits starting at `from`, returning `(value, index just past the run)` — or
+/// `None` when there is no digit there (`\d+` in `PASTE_MARKER_SINGLE`).
+fn read_digits(chars: &[char], from: usize) -> Option<(u32, usize)> {
+    let mut j = from;
+    let mut value: u32 = 0;
+    let mut count = 0usize;
+    while let Some(&c) = chars.get(j).filter(|c| c.is_ascii_digit()) {
+        value = value.saturating_mul(10).saturating_add(c.to_digit(10).unwrap_or(0));
+        j += 1;
+        count += 1;
+    }
+    (count > 0).then_some((value, j))
+}
+
+/// Match `PASTE_MARKER_SINGLE` (`editor.ts:24` @v0.83.0) anchored at `chars[i]`, **syntactically** —
+/// without consulting the paste registry. Returns `(id, index just past the id digits, index just
+/// past the closing `]`)`.
+///
+/// ```text
+/// /^\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]$/
+/// ```
+///
+/// The registry-gated form is [`InputEditor::marker_at`] (pi's `validIds` filter,
+/// `segmentWithMarkers` `:44`). The ungated form exists because pi's marker RENUMBERING replaces on
+/// the bare `PASTE_MARKER_REGEX` with no id filter (`editor.ts:1308-1314`).
+///
+/// `isPasteMarker`'s extra `segment.length >= 10` guard (`:28`) needs no counterpart: the shortest
+/// string this grammar accepts is `[paste #1]`, which is exactly 10 characters.
+fn marker_span_at(chars: &[char], i: usize) -> Option<(u32, usize, usize)> {
+    const PREFIX: [char; 8] = ['[', 'p', 'a', 's', 't', 'e', ' ', '#'];
+    for (k, pc) in PREFIX.iter().enumerate() {
+        if chars.get(i + k) != Some(pc) {
+            return None;
+        }
+    }
+    let (id, digits_end) = read_digits(chars, i + PREFIX.len())?;
+    // `( (\+\d+ lines|\d+ chars))?` then `\]`.
+    if chars.get(digits_end) == Some(&']') {
+        return Some((id, digits_end, digits_end + 1));
+    }
+    if chars.get(digits_end) != Some(&' ') {
+        return None;
+    }
+    let mut j = digits_end + 1;
+    let plus = chars.get(j) == Some(&'+');
+    if plus {
+        j += 1;
+    }
+    let (_, after) = read_digits(chars, j)?;
+    j = after;
+    let tail: &[char] =
+        if plus { &[' ', 'l', 'i', 'n', 'e', 's', ']'] } else { &[' ', 'c', 'h', 'a', 'r', 's', ']'] };
+    for (n, tc) in tail.iter().enumerate() {
+        if chars.get(j + n) != Some(tc) {
+            return None;
+        }
+    }
+    Some((id, digits_end, j + tail.len()))
+}
+
+/// Rewrite every syntactic `[paste #x …]` marker on `line` with `x > target` as `x - 1`, keeping its
+/// suffix — the `line.replace(PASTE_MARKER_REGEX, …)` of `handleBackspace` (`editor.ts:1308-1314`):
+///
+/// ```text
+/// (fullMatch, idGroup, suffixGroup) => { const x = Number(idGroup); if (x <= targetId) return fullMatch;
+///                                        return `[paste #${x - 1}${suffixGroup}]`; }
+/// ```
+fn renumber_markers(line: &[char], target: u32) -> Vec<char> {
+    let mut out: Vec<char> = Vec::with_capacity(line.len());
+    let mut i = 0usize;
+    while i < line.len() {
+        match marker_span_at(line, i) {
+            Some((id, digits_end, end)) => {
+                if id > target {
+                    out.extend(format!("[paste #{}", id.saturating_sub(1)).chars());
+                    out.extend(line.get(digits_end..end).unwrap_or(&[]).iter().copied());
+                } else {
+                    out.extend(line.get(i..end).unwrap_or(&[]).iter().copied());
+                }
+                i = end;
+            }
+            None => {
+                if let Some(&c) = line.get(i) {
+                    out.push(c);
+                }
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// One segment of a line for word navigation — pi's `Intl.SegmentData` after `segmentWithMarkers`
+/// has merged the paste markers (`editor.ts:37-90`). `start`/`len` are **char columns** into the
+/// slice the segments were built from.
+#[derive(Clone, Copy, Debug)]
+struct WordSeg {
+    start: usize,
+    len: usize,
+    /// `Intl.SegmentData.isWordLike`.
+    ///
+    /// [CYRUP-DELTA] ICU marks a segment word-like when it is made of letters, digits, kana or
+    /// ideographs; `unicode-segmentation` (UAX#29, the same algorithm without ICU's flag) exposes no
+    /// such bit, so it is recomputed as "contains an alphanumeric character". The two agree on every
+    /// segment UAX#29 can produce: a word-bound segment is either a run of letters/digits (with
+    /// MidLetter/MidNumLet joiners), a run of punctuation/symbols, or whitespace.
+    word_like: bool,
+    /// `isAtomicSegment(segment)` — a whole `[paste #N …]` marker (`isPasteMarker`, `editor.ts:27`).
+    atomic: bool,
 }
 
 /// The **display width** of `s` in terminal cells — Pi's `visibleWidth` (`utils.ts:240-...`), which

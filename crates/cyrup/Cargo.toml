@@ -19,6 +19,34 @@ path = "src/main.rs"
 name = "cyrup"
 path = "src/lib.rs"
 
+[features]
+# PROV-052 — **TEST-ONLY, DEFAULT-OFF, and it must stay that way.**
+#
+# Makes `--model faux/…` / `--provider faux` selectable in the BINARY (`src/provider.rs`'s
+# `#[cfg(feature = "faux")]` arm), which is what the five integration tests that spawn
+# `CARGO_BIN_EXE_cyrup` and script a whole offline turn need (`one_shot_parity.rs`,
+# `piped_stdin_trim.rs`, `unknown_flag_exit.rs`, `extension_load_failure_exit.rs`,
+# `auth_credential_print.rs`). Upstream has no CLI-reachable faux at all — `packages/ai/src/providers/faux.ts`
+# is absent from `providers/all.ts`, is not a `KnownProvider`, and has zero matches under
+# `packages/coding-agent/src/` @v0.83.0 — so this is a test seam, not a ported behaviour.
+#
+# It is turned on for `cargo test` ONLY, by the self-dev-dependency in `[dev-dependencies]` below.
+# NEVER add it to a `[dependencies]` edge or to `default`: Cargo unifies features additively, and
+# doing so is precisely the defect PROV-052 records.
+#
+# **THIS feature — the `cyrup` package's own — is the gate that actually holds.** Not the placement
+# of `cyrup-provider/faux` edges: `cyrup-test-support` enables that one on a NORMAL edge, so a
+# `cargo build --workspace` compiles `cyrup_provider::faux` into the rlib this binary links. It is
+# still unselectable there, because `src/provider.rs`'s `Some("faux")` arm is `#[cfg(feature =
+# "faux")]` on the line below, and nothing normal turns the line below on.
+#
+# The secondary, default-member-graph invariant, checked both ways by
+# `crates/cyrup-provider/tests/faux_not_in_normal_build.rs`:
+#
+#   cargo tree -p cyrup -e features --edges normal | grep faux   →   empty
+#   cargo tree -p cyrup -e features             | grep faux   →   the dev edge only
+faux = ["cyrup-provider/faux"]
+
 [dependencies]
 # Workspace seams (arch-11 §2.4): the SDK + facade + config + non-interactive adapters + TUI.
 cyrup-sdk = { workspace = true }
@@ -38,9 +66,16 @@ cyrup-permission-system = { workspace = true }
 cyrup-intercom = { workspace = true }
 # Package + config subcommands (Pi `package-manager-cli.ts`) drive the resources package manager.
 cyrup-resources = { workspace = true }
-# The provider seam — `faux` is the only runnable provider until real HTTP providers land, so the
-# bin enables it to be runnable end-to-end (a real-but-unimplemented model yields a clear error).
-cyrup-provider = { workspace = true, features = ["faux"] }
+# The provider seam. **NO `features = ["faux"]` HERE** (PROV-052): this is a NORMAL dependency, and
+# Cargo unifies features additively, so enabling `faux` here compiled the scripted test double into
+# the shipped binary and made a bare credential-less `cyrup -p hi` answer `No more faux responses
+# queued` instead of pi's `formatNoModelsAvailableMessage()`
+# (`packages/coding-agent/src/main.ts:852-855` @v0.83.0). The faux edge now lives in
+# `[dev-dependencies]` below. Invariant for THIS graph (the one the shipped binary is built from):
+#   cargo tree -p cyrup -e features --edges normal | grep faux   →   no output
+# (`--workspace` is a different graph and does unify it — see the `[features]` note above; the arm
+# in `src/provider.rs` stays compiled out regardless.)
+cyrup-provider = { workspace = true }
 
 # Async runtime + streams (arch-11 §5): multi-thread tokio with signal/io-util for modes & signals.
 tokio = { workspace = true }
@@ -65,6 +100,17 @@ serde_json = { workspace = true }
 # view (the `session_start`/`session_shutdown` consumer Pi's `bindExtensions` serves), which needs
 # the `NativeExtension` trait.
 cyrup-ext = { workspace = true }
+# PROV-052: the scripted double, TEST-ONLY. `crates/cyrup/src/provider.rs`'s `#[cfg(test)]` module
+# and `tests/dispatch.rs` build real sessions over it in-process.
+cyrup-provider = { workspace = true, features = ["faux"] }
+# PROV-052 — the SELF-dev-dependency that turns this package's own `faux` feature on for `cargo
+# test` and nothing else. Cargo permits a package to dev-depend on itself; the effect is that the
+# feature is unified into the `cyrup` package for test builds, so the `CARGO_BIN_EXE_cyrup` the
+# integration tests spawn has the `--model faux/…` arm compiled in, while `cargo build`,
+# `cargo build --release` and `cargo install` — none of which resolve dev-dependencies — do not.
+# This is the seam that lets requirement 1 (no faux on a normal edge) and the 69 binary-spawning
+# assertions coexist without weakening either.
+cyrup = { path = ".", features = ["faux"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 # `tests/catalog_refresh_modes.rs` proves the DRIFT-007 mode gate against a raw loopback listener

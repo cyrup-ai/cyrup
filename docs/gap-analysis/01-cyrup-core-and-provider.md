@@ -61,6 +61,7 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 
 | ID | Status | Evidence at cyrup `04c1ba2` / pi `v0.83.0`–`v0.84.1` |
 |---|---|---|
+| PROV-052 | **FIXED 2026-08-13** | Two separable defects, both closed. **(a) Feature graph:** the `faux` edge in `crates/cyrup/Cargo.toml` `[dependencies]` moved to `[dev-dependencies]`, and `crates/cyrup-test-support` removed from the workspace `default-members` (its `[dependencies]` faux edge unified into a plain root `cargo build`). `cargo tree -p cyrup -e features --edges normal \| grep -c faux` = **0** (was 1); `cargo tree -p cyrup -e features \| grep faux` still reports the dev edge. **(b) Resolution:** `crates/cyrup-provider/src/unconfigured.rs` (new, always compiled) supplies a zero-model provider; `crates/cyrup/src/provider.rs`'s `select_provider` `None` arm returns it and the `Some("faux")` arm is deleted, matching pi where `faux.ts` is absent from `providers/all.ts`, is not a `KnownProvider`, and has zero matches under `packages/coding-agent/src/` @v0.83.0. The empty catalog raises `SessionServiceError::NoModels` (`cyrup-session-svc/src/builder.rs:1453-1455`) ⇒ `main.rs:1899-1902` `no_models_available()` ⇒ `format_no_models_available_message()`, i.e. pi `main.ts:852-855` + `auth-guidance.ts:14-16` — same text, stderr, exit 1. Guarded by `crates/cyrup-provider/tests/faux_not_in_normal_build.rs` (RED-then-GREEN demonstrated mechanically). The five integration tests that spawn `CARGO_BIN_EXE_cyrup` with `--model faux/faux-1` are kept alive by a default-off, test-only `faux` feature on the `cyrup` package enabled through a **self-dev-dependency**, so `cargo test` has the arm and `cargo build`/`--release`/`install` do not. Bare `env -i` `cyrup -p hi`: `No more faux responses queued` → `No models available. Use /login to log into a provider via OAuth or API key. …`. **The item's own Fix text was wrong**: it prescribed defaulting to `google`, but `args.ts:87-88` @v0.83.0 applies no default — `(default: google)` at `args.ts:239` is a stale help line in pi itself. See the item body. |
 | PROV-001 | closed | Holds. `ModelCostTier{input_tokens_above,input,output,cache_read,cache_write}` and `ModelCost.tiers` at `cyrup-provider/src/model.rs:20-49`; `select_rates` at `usage.rs:18-45` (strict `>`, highest matching threshold wins, tier REPLACES all four rates) and `compute_cost` at `:37-58` incl. the 1h cache-write rule. vs pi `types.ts:774-782` @v0.84.1 and `models.ts:639-659` @v0.83.0 `calculateCost` (`matchedThreshold = -1` seed). Statement-equivalent. |
 | PROV-002 | closed | Holds. `ThinkingLevel{Minimal..Xhigh,Max}` at `cyrup-core/src/message.rs:30-40` and `ModelThinkingLevel` at `:46-56`, `Max` declared **last** in both so the ascending ladder the clamp walks is intact; `:86` maps `ThinkingLevel::Max => ModelThinkingLevel::Max`. vs pi `types.ts:82-83` @v0.84.1 and `models.ts:661` `EXTENDED_THINKING_LEVELS`. The `:max` suffix parsing in `cyrup-ext-subagents` remains area 09's. |
 | PROV-003 | partially-closed | Login half landed: `auth/oauth/` holds 11 flow modules (anthropic, github_copilot, kimi_coding, openai_codex, openrouter, radius, xai + device_code/callback/pkce/page/query/sha256/random), and `OAuthAuth::login` is declared at `auth/mod.rs:118-131` with a `LoginUnsupported` default; `auth/oauth/github_copilot.rs:821` and `openai_codex.rs:1038` are real impls. Still open: `ApiKeyAuth` (`auth/mod.rs:59-70`) has only `name`+`resolve` and no `login`, where pi gives anthropic an api-key `login` (`providers/anthropic.ts:9-14` @v0.83.0) — the same hole `providers/google_vertex.rs:41-43` documents for `vertexAuth.login`; and `Models` has no `login`/`logout` (PROV-031). See also PROV-029 (two flows unreachable) and PROV-041 (the in-tree comment at `cyrup-ext-subagents/src/extension.rs:11300-11302` still asserts "cyrup ships no login flow at all", now false). |
@@ -130,7 +131,6 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| PROV-052 | **high** | parity-bug | S | The shipped binary's default model is the in-process **faux TEST provider** — a bare `cyrup -p hi` fails with the internal string `No more faux responses queued` — **new, observed 2026-08-13** |
 | PROV-030 | high | not-ported | L | `google-vertex` is registered with 10 models and no wire API — every request dies with `NoApiImpl` |
 | PROV-027 | high | parity-bug | S | Copilot's Claude models send `x-api-key`; pi sends `Authorization: Bearer` |
 | PROV-029 | high | parity-bug | S | Copilot + Codex login flows written but unreachable; flow registry has no production caller |
@@ -951,9 +951,9 @@ The **inbound** direction has no counterpart at all, and it is where the damage 
 
 **Verify** — Loopback server that accepts the connection and never writes a byte; drive `openai_codex_responses` with `timeout_ms = Some(200)` and assert the terminal error text is exactly `Codex SSE response headers timed out after 200ms`. Then cancel the `CancelToken` before the deadline and assert the terminal is the aborted one, not the timeout message. Red today on both.
 
-## PROV-052 — The shipped binary's default model is the in-process faux TEST provider, so a bare `cyrup -p hi` fails with the internal string "No more faux responses queued"
+## PROV-052 — **FIXED 2026-08-13** — The shipped binary's default model was the in-process faux TEST provider, so a bare `cyrup -p hi` failed with the internal string "No more faux responses queued"
 
-**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** **confirmed — reproduced in the shipped binary; both sides read** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md))
+**Kind** parity-bug · **Severity** **critical** (raised from `high` on the fix pass: the product did not work out of the box, and `cargo tree -p cyrup -e features --edges normal` proved the test double was compiled into the ordinary build of the shipped binary, not merely reachable) · **Effort** S · **Confidence** **confirmed — reproduced in the shipped binary; both sides read** · **observed 2026-08-13** (headless-binary; [`REPRO-LOG.md`](REPRO-LOG.md)) · **FIXED 2026-08-13**
 
 > **Filed 2026-08-13 from a live run.** `rg 'faux' docs/gap-analysis/*.md` shows every existing
 > mention treats faux as a *test* provider; **no item covers it being the shipped default.** This is
@@ -991,6 +991,162 @@ So the out-of-box experience for a new user with no API key is a **test-harness 
 **Fix** — Make the default resolve to the documented provider: change `provider.rs:356` so `None` falls through to the registry lookup for `google` (pi's documented default) and only an **explicit** `Some("faux")` reaches `FauxProvider`. Re-examine `:421-424` in the same change — a `--model` with an unrecognised prefix should report the unknown provider, as it does for a recognised-but-unconfigured one, rather than silently becoming a test double; that arm's "(ledgered) — no warn" comment should cite this item or be deleted. Audit the test suite for fixtures that rely on the implicit default and make them pass `--provider faux` explicitly, so the test double stays reachable on purpose.
 
 **Verify** — `cyrup -p hi` with no credentials, no flags and a scratch `HOME` must print a credential/`/login` message naming `google` and must **not** print `No more faux responses queued`. Interactive: the footer on a first run must not read `faux/faux-1`. `cyrup --provider faux -p hi` must still reach the faux provider, and the existing faux-backed tests must stay green once they name it.
+
+---
+
+### FIXED 2026-08-13 — and the Fix above was **wrong about pi's mechanism**
+
+**The item's own `Fix` and `Verify` text asserted that the correct default is `google`** ("change
+`provider.rs:356` so `None` falls through to the registry lookup for `google` (pi's documented
+default)", "must print a credential/`/login` message naming `google`"). **That is not what pi does,
+and it was not implemented.** Read at the tag:
+
+* `pi/packages/coding-agent/src/cli/args.ts:87-88` @v0.83.0 — `else if (arg === "--provider" && i + 1 < args.length) { result.provider = args[++i]; }`. There is **no** `?? "google"` anywhere in the parser; `ParsedArgs.provider` (`:13`) is `string | undefined` and stays `undefined`.
+* The string `--provider <name>    Provider name (default: google)` at `args.ts:239` is a **stale help line in pi itself** — it documents a default pi's own code does not apply. cyrup ports it verbatim at `crates/cyrup/src/cli.rs:871`, which is correct parity and was deliberately left alone.
+* What pi actually does with no `--provider`/`--model` and no credential: `ModelRuntime.getAvailable()` is empty ⇒ `findInitialModel` falls through steps 1-4 and returns `{ model: undefined }` (`core/model-resolver.ts:648-650`) ⇒ `createAgentSession` sets `modelFallbackMessage = formatNoModelsAvailableMessage()` (`core/sdk.ts:216-218`) ⇒ `main.ts:852-855`:
+
+```ts
+if (appMode !== "interactive" && !session.model) {
+    console.error(chalk.red(formatNoModelsAvailableMessage()));
+    process.exit(1);
+}
+```
+
+  with `formatNoModelsAvailableMessage()` = `` `No models available. ${getProviderLoginHelp()}` `` (`core/auth-guidance.ts:6-16`). Provider-agnostic, actionable, `/login`.
+
+Had the item's `Fix` been implemented as written, cyrup would have emitted a **google-specific**
+credential error where pi emits a provider-agnostic `/login` message — a second parity bug in place
+of the first. Recorded here because the ledger's ~20%-citation-error rule applies to *Fix* text too,
+not only to line citations.
+
+**pi has no faux fallback of any kind, and none is reachable from its CLI.**
+`packages/ai/src/providers/faux.ts` is exported from the `pi-ai` package for tests only
+(`packages/ai/src/index.ts:36`); it is **absent from `packages/ai/src/providers/all.ts`**, it is not
+a member of `KnownProvider`, and `git grep faux v0.83.0 -- packages/coding-agent/src/` matches
+**zero files**. So neither the `None` arm nor the `Some("faux")` arm of cyrup's `select_provider`
+had an upstream referent.
+
+#### What changed
+
+Two separable defects, both closed.
+
+**1. The feature graph — the test double is out of the normal build.**
+
+`crates/cyrup-provider/Cargo.toml:14-17`'s comment claimed `faux` was "gated for downstream
+consumers". It was not, and naming cannot gate it: **Cargo features are additive and unified per
+package across everything built in one invocation**, so one `features = ["faux"]` edge in any
+`[dependencies]` section turns the feature on for *every* consumer of `cyrup-provider` in that
+build. Two enabling edges were found:
+
+* `crates/cyrup/Cargo.toml:41-43` — `cyrup-provider = { workspace = true, features = ["faux"] }` in `[dependencies]` of the **binary**. This is the one `--edges normal` reported. **Moved to `[dev-dependencies]`.**
+* `crates/cyrup-test-support/Cargo.toml:17` — a `[dependencies]` edge in a crate that was in the workspace `default-members`. It does not show under `cargo tree -p cyrup` (test-support is only ever a dev-dependency of others), but a plain `cargo build` at the workspace root builds it alongside the binary and unifies the feature in anyway. **`crates/cyrup-test-support` removed from `default-members`** (it stays a `members` entry, so `cargo test`/`--workspace` still build it). Its own `[dependencies]` edge is left in place: its `src/` *is* the scripted harness.
+
+The other seven `features = ["faux"]` edges (`cyrup-tui:93`, `cyrup-ext:54`, `cyrup-session:35`,
+`cyrup-agent:26`, `cyrup-modes:27`, `cyrup-sdk:28`, `cyrup-session-svc:59`) were verified to already
+be in `[dev-dependencies]` and were left untouched. The `[features]` comment in
+`crates/cyrup-provider/Cargo.toml` now states the real rule and the invariant.
+
+Five integration tests spawn `CARGO_BIN_EXE_cyrup` and script a whole offline turn through
+`--model faux/faux-1` (`one_shot_parity.rs`, `piped_stdin_trim.rs`, `unknown_flag_exit.rs`,
+`extension_load_failure_exit.rs`, `auth_credential_print.rs`) — moving the edge alone would have
+silently killed them, and deleting them would have traded one defect for a coverage hole. They are
+kept by a **default-off, test-only `faux` feature on the `cyrup` package itself**
+(`faux = ["cyrup-provider/faux"]`), enabled solely by a **self-dev-dependency**
+(`cyrup = { path = ".", features = ["faux"] }` in `[dev-dependencies]`). `cargo test` resolves
+dev-dependencies and therefore compiles the `#[cfg(feature = "faux")] Some("faux")` arm into the
+binary it spawns; `cargo build`, `cargo build --release` and `cargo install` do not resolve them and
+therefore do not. Both requirements hold simultaneously, and neither test nor product is weakened.
+
+Evidence, both directions:
+
+```
+$ cargo tree -p cyrup -e features --edges normal | grep faux      # BEFORE
+├── cyrup-provider feature "faux"
+│   └── cyrup-provider v0.0.0 (…/crates/cyrup-provider) (*)
+
+$ cargo tree -p cyrup -e features --edges normal | grep -c faux   # AFTER
+0
+
+$ cargo tree -p cyrup -e features | grep faux                     # AFTER, dev edges included
+├── cyrup-provider feature "faux"
+```
+
+**2. Default model resolution — pi's actual mechanism, ported.**
+
+pi's "no model" state is `model: undefined`. cyrup's `SessionBuilder` takes a non-optional
+`Arc<dyn Provider>`, so the state is represented by a provider with an **empty catalog**:
+`crates/cyrup-provider/src/unconfigured.rs` (**new**, always compiled, never feature-gated).
+`crates/cyrup/src/provider.rs`'s `select_provider` now reads
+`None => Ok(Arc::new(UnconfiguredProvider::new()))`, and the `Some("faux")` arm is compiled out of
+every normal build (`#[cfg(feature = "faux")]`, reached only by the self-dev-dependency above). In
+the shipped binary an explicit `--provider faux` or a `faux/…` prefix is the ordinary
+unknown-provider error, matching pi, where `faux` is not in `providers/all.ts`. Verified on the
+plainly-built binary:
+
+```
+$ cyrup --model faux/faux-1 -p hi
+cyrup: model targets provider 'faux', which is not a known provider. Available providers:
+amazon-bedrock, ant-ling, anthropic, … zai-coding-cn. (Declare a custom one under "providers" in
+<agent-dir>/models.json; there is intentionally no silent fallback.)
+```
+
+**No new error path was written**, because pi's was already ported and simply unreachable: an empty
+catalog raises `SessionServiceError::NoModels` at `crates/cyrup-session-svc/src/builder.rs:1453-1455`,
+which `crates/cyrup/src/main.rs`'s `no_models_available()` (`:1899-1902`, already citing
+`main.ts:795-798`) renders as `cyrup::format_no_models_available_message()`
+(`crates/cyrup/src/diagnostics.rs:157-165`, already a 1:1 port of `auth-guidance.ts:6-16`) on
+**stderr** with **exit 1**, from both non-interactive arms (`main.rs:659` rpc, `main.rs:767`
+print/json). The faux fallback was the only thing standing between the user and that message.
+
+`CYRUP-DELTA`: pi holds `model?: Model` and tolerates absence; cyrup holds a provider with zero
+models. Documented at the top of `unconfigured.rs` with pi's file:line. Observably identical —
+same text, same stream, same exit code, same mode gate.
+
+#### Reproduction, before and after
+
+Identical fixture both times: scrubbed `env -i`, scratch `HOME` and agent dir, **no provider keys**,
+**no `--model`**, **no `--provider`**.
+
+```
+$ cd <scratch> && env -i PATH=/usr/bin:/bin HOME=$TD CYRUP_AGENT_DIR=$TD/agent cyrup -p hi
+```
+
+BEFORE (`target/debug/cyrup` @ 85bc8bd):
+
+```
+No more faux responses queued
+EXIT=1
+```
+
+AFTER:
+
+```
+No models available. Use /login to log into a provider via OAuth or API key. See:
+  docs/providers.md
+  docs/models.md
+EXIT=1
+```
+
+byte-identical to `formatNoModelsAvailableMessage()`, on **stderr** (`2>/dev/null` yields empty
+stdout), exit 1 — pi `main.ts:852-855`.
+
+And the product now works out of the box once a credential exists — same fixture plus one env key,
+proving the `default_launch_model` upgrade path (pi `findInitialModel` step 4) is intact and that
+the run reaches the real vendor:
+
+```
+$ env -i … ANTHROPIC_API_KEY=sk-ant-bogus cyrup -p hi
+http 401: {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},…}
+```
+
+#### Tests
+
+* **`crates/cyrup/src/provider.rs` → `no_flags_resolve_to_an_empty_catalog_never_to_a_test_double`** — RED before (`select_provider(None, None, …)` returned `FauxProvider`, `id() == "faux"`), GREEN after. Asserts the no-flag provider has id `unconfigured` and an **empty** catalog, and that `faux/faux-1` / `--provider faux` are unknown-provider errors.
+* It **replaces `defaults_and_faux_resolve_to_faux`**, which was a **test-defect** by the ledger's rule: it pinned behaviour pi does not have. Proof cited in the test's own doc comment — `faux.ts` absent from `providers/all.ts`, not a `KnownProvider`, zero matches under `packages/coding-agent/src/` at v0.83.0.
+* **`crates/cyrup-provider/tests/faux_not_in_normal_build.rs`** (new) — the invariant is a **Cargo feature-graph** property, which no `#[cfg]`-based Rust test can express (the resolver decides `feature = "faux"` before any Rust is parsed, and the resolver is what regressed), so the guard runs `cargo tree -p cyrup -e features --edges normal` and fails on any `feature "faux"` line, with the offending lines and the fix in the assertion message. **Demonstrated RED-then-GREEN mechanically on this pass**: re-adding `features = ["faux"]` to `crates/cyrup/Cargo.toml`'s `[dependencies]` produced `test result: FAILED. 1 passed; 1 failed`, printing `├── cyrup-provider feature "faux"`; reverting produced `test result: ok. 2 passed; 0 failed`. Its companion asserts the feature is **still** reachable on a dev edge, so the guard cannot be satisfied by deleting the double and stranding nine crates' offline oracle.
+* **`crates/cyrup-provider/src/unconfigured.rs`** — three new tests: the catalog is empty; the message is byte-identical to `formatNoModelsAvailableMessage()`; the (session-unreachable) direct `stream()` yields an actionable `error` terminal rather than a scripted answer.
+* Stale `faux` prose corrected in the same pass at `crates/cyrup/src/{provider.rs,main.rs,lib.rs}` — including `provider.rs`'s "a non-provider prefix maps to faux (ledgered) — no warn", which this item's Fix text specifically called out.
+
 
 ## Coverage
 

@@ -245,7 +245,7 @@ mod smoke {
             .await
             .expect("build test session");
         // The session resolved a model and can report its current address.
-        assert_eq!(ts.session().model().provider.as_str(), "faux");
+        assert_eq!(ts.session().model().expect("session must have a resolved model").provider.as_str(), "faux");
     }
 
     /// Harness threads a model `contextWindow` override (Pi `HarnessOptions.contextWindow`) onto the
@@ -254,10 +254,10 @@ mod smoke {
     async fn harness_threads_context_window_override() {
         let opts = HarnessOptions { context_window: Some(2_048), ..Default::default() };
         let harness = create_harness(opts).await.expect("build harness");
-        assert_eq!(harness.session().services().model.context_window, 2_048);
+        assert_eq!(harness.session().services().model.as_ref().expect("session must have a resolved model").context_window, 2_048);
         // Default (no override) keeps the faux model's 128000.
         let dflt = create_harness(HarnessOptions::default()).await.expect("build harness");
-        assert_eq!(dflt.session().services().model.context_window, 128_000);
+        assert_eq!(dflt.session().services().model.as_ref().expect("session must have a resolved model").context_window, 128_000);
     }
 
     /// Harness threads CLI settings overrides (Pi `HarnessOptions.settings`: retry/compaction/etc.)
@@ -319,7 +319,7 @@ mod smoke {
         };
         let harness = create_harness(opts).await.expect("build harness");
         // No stored/runtime credential for the faux provider.
-        let provider = harness.session().model().provider.clone();
+        let provider = harness.session().model().expect("session must have a resolved model").provider.clone();
         assert!(harness.session().services().auth.runtime_api_key(&provider).is_none());
         // The turn still completes (the faux provider requires no auth).
         let events = harness.run("hello").await.expect("run");
@@ -423,7 +423,7 @@ mod smoke {
         assert!(harness.get_model("m-b").is_some());
         assert!(harness.get_model("nope").is_none());
         // The session resolves the default (first) model, and a turn completes.
-        assert_eq!(harness.session().services().model.id.as_str(), "m-a");
+        assert_eq!(harness.session().services().model.as_ref().expect("session must have a resolved model").id.as_str(), "m-a");
         let events = harness.run("hi").await.expect("run");
         assert_eq!(event_kind_sequence(&events).last().map(String::as_str), Some("agent_settled"));
     }
@@ -584,7 +584,7 @@ mod smoke {
         let opts = HarnessOptions { model: Some(custom), ..Default::default() };
         let harness = create_harness(opts).await.expect("build harness");
         assert_eq!(harness.model().map(|m| m.id.as_str()), Some("custom-1"));
-        let resolved = harness.session().services().model.clone();
+        let resolved = harness.session().services().model.clone().expect("session must have a resolved model");
         assert_eq!(resolved.id.as_str(), "custom-1");
         assert_eq!(resolved.context_window, 4_096);
         assert!(resolved.reasoning);

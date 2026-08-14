@@ -13,7 +13,43 @@ workspace = true
 
 [features]
 # The scripted faux provider for tests/demos (func-01 §15 / R-01-051..053). Always available to
-# this crate's own tests; gated for downstream consumers (e.g. cyrup-test-support enables it).
+# this crate's own tests (`#[cfg(any(test, feature = "faux"))]`, src/lib.rs).
+#
+# PROV-052 — READ BEFORE ADDING AN EDGE. Cargo features are ADDITIVE and UNIFIED per package
+# across everything built in one invocation: a single `features = ["faux"]` edge in ANY crate's
+# `[dependencies]` turns this on for EVERY consumer of cyrup-provider in that build, including the
+# shipped `cyrup` binary. The old comment here claimed the feature was "gated for downstream
+# consumers"; it was not — `crates/cyrup/Cargo.toml` enabled it as a NORMAL dependency, the scripted
+# double was compiled into the release binary, and a bare `cyrup -p hi` with no credentials answered
+# `No more faux responses queued`.
+#
+# THE INVARIANT THAT ACTUALLY HOLDS — one sentence, and it is the one to maintain:
+#
+#   A shipped `cyrup` cannot SELECT the scripted double because the only path to it,
+#   `select_provider`'s `Some("faux")` arm in `crates/cyrup/src/provider.rs`, is behind
+#   `#[cfg(feature = "faux")]` keyed to the **`cyrup` package's OWN** `faux` feature — enabled
+#   solely by cyrup's self-dev-dependency (`cyrup = { path = ".", features = ["faux"] }`), a dev
+#   edge that `cargo build` / `cargo build --release` / `cargo install` never resolve.
+#
+# It is NOT "placement, not naming". That earlier claim was wrong and would send a maintainer after
+# the wrong property: `cyrup-test-support` enables `cyrup-provider/faux` on a NORMAL edge (its
+# `src/` IS the scripted harness), so `cargo tree -e features --workspace --edges normal` DOES
+# report `cyrup-provider feature "faux"` and `cargo build --workspace` compiles this module into the
+# `cyrup-provider` rlib the binary links. Present is not reachable — the `#[cfg]` above is what
+# makes it unreachable, and it is a strictly stronger gate than placement.
+#
+# Placement is still maintained, as defense in depth: the DEFAULT-MEMBER graph the shipped binary is
+# produced from does not compile the module at all. `tests/faux_not_in_normal_build.rs` pins both
+# halves, and fails loudly (rather than skipping) when it cannot resolve the graph:
+#
+#   * every `features = ["faux"]` edge other than `cyrup-test-support`'s lives in a
+#     `[dev-dependencies]` section, so `cargo tree -p cyrup -e features --edges normal | grep faux`
+#     is EMPTY, and
+#   * the feature is still reachable on a dev edge, so the offline suite keeps its oracle.
+#
+# `cyrup-test-support` is additionally excluded from the workspace `default-members` (see the
+# workspace Cargo.toml, which states what that exclusion costs) so a plain `cargo build` at the root
+# does not unify it in either.
 faux = []
 
 [dependencies]

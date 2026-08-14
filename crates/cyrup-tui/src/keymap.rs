@@ -8,6 +8,47 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::error::TuiError;
 
+/// Decode the legacy C0 control bytes `0x1C..=0x1F` into the chords pi names for them — a port of
+/// `pi/packages/tui/src/keys.ts:1275-1281` @v0.83.0:
+///
+/// ```text
+/// if (data === "\x1c") return "ctrl+\\";
+/// if (data === "\x1d") return "ctrl+]";
+/// if (data === "\x1f") return "ctrl+-";
+/// if (data === "\x1b\x1c") return "ctrl+alt+\\";
+/// if (data === "\x1b\x1d") return "ctrl+alt+]";
+/// if (data === "\x1b\x1f") return "ctrl+alt+-";
+/// ```
+///
+/// A terminal without the kitty keyboard protocol sends `Ctrl+-` as the single byte `0x1F` and
+/// `Ctrl+]` as `0x1D`. crossterm 0.29.0 decodes that whole range **arithmetically** —
+/// `c @ b'\x1C'..=b'\x1F' => KeyCode::Char((c - 0x1C + b'4') as char) + CONTROL`
+/// (`src/event/sys/unix/parse.rs:110-113`) — so `0x1F` arrives as `Ctrl+7` and `0x1D` as `Ctrl+5`,
+/// matching neither `ctrl+-` nor `ctrl+]`. cyrup bound only the CSI-u spellings, so on Terminal.app,
+/// iTerm2's default profile, gnome-terminal and plain xterm `editor.undo` did not exist at all
+/// (TUI-053) and char-jump-forward was equally dead. `0x1E` is omitted because pi maps no chord to
+/// it.
+///
+/// Gated on the negotiated protocol: under kitty, `Ctrl+7` is genuinely `Ctrl+7` (the terminal sends
+/// `CSI 55;5u`) and pi's byte branch is unreachable, so the alias must be too. Under
+/// legacy/un-negotiated, `Char('7') + CONTROL` can only have come from `0x1F`. Returns `None` when
+/// nothing needs rewriting.
+fn normalize_legacy_control_byte(ev: &KeyEvent) -> Option<KeyEvent> {
+    if crate::keyboard_protocol::current() == crate::keyboard_protocol::KeyboardProtocol::Kitty {
+        return None;
+    }
+    if !ev.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    let decoded = match ev.code {
+        KeyCode::Char('4') => '\\',
+        KeyCode::Char('5') => ']',
+        KeyCode::Char('7') => '-',
+        _ => return None,
+    };
+    Some(KeyEvent::new(KeyCode::Char(decoded), ev.modifiers))
+}
+
 /// Parse one binding-id JSON value (a key-spec string or an array of them) into [`Key`]s
 /// (spec/tui/07 §3.9). `"ctrl+c"` and `["esc", "ctrl+["]` are both accepted.
 fn parse_key_values(value: &serde_json::Value) -> Result<Vec<Key>, TuiError> {
@@ -1034,7 +1075,13 @@ impl EditorKeymap {
     }
 
     /// Resolve the editor action for an event, if any.
+    ///
+    /// The event is first put through [`normalize_legacy_control_byte`], pi's `keys.ts:1275-1281`
+    /// decoding of the `0x1C..=0x1F` control bytes — without it `editor.undo` is unreachable on any
+    /// terminal that does not speak the kitty keyboard protocol (TUI-053).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<EditorAction> {
+        let normalized = normalize_legacy_control_byte(ev);
+        let ev = normalized.as_ref().unwrap_or(ev);
         self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 

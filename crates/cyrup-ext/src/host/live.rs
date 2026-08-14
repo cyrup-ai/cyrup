@@ -53,6 +53,42 @@ fn guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
     state.guest.as_ref().ok_or_else(|| "no guest state in store".to_string())
 }
 
+// --- EXT-054: the manifest capability grant, enforced HOST-SIDE ---------------------------------
+//
+// The three helpers below are the whole enforcement surface for `capabilities.{exec,net,ui}`. They
+// sit at the import boundary rather than inside `HostServices` on purpose: `HostServices` is the
+// pluggable BACKEND (what the running host is able to do), while `Capabilities` is the per-extension
+// RESTRICTION (what this particular guest was allowed to ask for). Enforcing here means a session
+// that injects a fully-capable `LiveHostServices` still cannot hand `exec` to a guest that declared
+// `"exec": false` — which is exactly the bypass EXT-054 reproduced, where an all-false manifest ran
+// `echo hi` as a real host process and opened a real TLS connection.
+//
+// `capabilities.fs` needs no helper: its enforcement lives in `FsCaps`, which simply has no root to
+// resolve against unless a grant declared one (EXT-055).
+
+/// [`guest_of`] + the `capabilities.exec` gate — `exec.run` and every `proc.*` import.
+fn exec_guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
+    let guest = guest_of(state)?;
+    guest.require_exec()?;
+    Ok(guest)
+}
+
+/// [`guest_of`] + the `capabilities.net` gate — every `http-client.*` import.
+fn net_guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
+    let guest = guest_of(state)?;
+    guest.require_net()?;
+    Ok(guest)
+}
+
+/// [`guest_of`] + the `capabilities.ui` gate — every `ui.*` import. A refused call falls through to
+/// the same no-op/`false`/`none` an untrusted extension already gets from [`crate::DenyServices`],
+/// because most of `interface ui` has no error channel in its WIT signature.
+fn ui_guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
+    let guest = guest_of(state)?;
+    guest.require_ui()?;
+    Ok(guest)
+}
+
 /// Map the WIT `notify-kind` severity onto the host-owned [`NotifyKind`] (keeps bindgen types out
 /// of [`GuestState`]'s public surface).
 fn notify_kind_from_wit(kind: bindings::cyrup::ext::ui::NotifyKind) -> NotifyKind {
@@ -176,26 +212,26 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     // all (they are Pi's `ExtensionUIContext` mutators, types.ts:130-275) — mirrors how `confirm`/
     // `input`/`select`/`editor` below already route through `guest.services`.
     async fn notify(&mut self, message: String, kind: bindings::cyrup::ext::ui::NotifyKind) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             let kind = notify_kind_from_wit(kind);
             guest.services.notify(&message, kind);
             guest.notify(message, kind);
         }
     }
     async fn set_status(&mut self, key: String, text: Option<String>) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.services.set_status(&key, text.as_deref());
             guest.set_status(key, text);
         }
     }
     async fn abort_signal(&mut self, signal_id: String) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.abort_signal(signal_id);
         }
     }
     async fn confirm(&mut self, prompt: String, message: String, opts_json: String) -> bool {
         let opts = DialogOptions::parse(&opts_json);
-        let Ok(guest) = guest_of(self) else { return false };
+        let Ok(guest) = ui_guest_of(self) else { return false };
         // Programmatic dismiss (Pi `signal`): a dialog bound to an aborted signal returns cancelled.
         if guest.dialog_dismissed(&opts) {
             return false;
@@ -212,7 +248,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     }
     async fn input(&mut self, prompt: String, placeholder: Option<String>, opts_json: String) -> Option<String> {
         let opts = DialogOptions::parse(&opts_json);
-        let guest = guest_of(self).ok()?;
+        let guest = ui_guest_of(self).ok()?;
         if guest.dialog_dismissed(&opts) {
             return None;
         }
@@ -222,7 +258,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         result
     }
     async fn select(&mut self, prompt: String, options_json: String, opts_json: String) -> Option<String> {
-        let guest = guest_of(self).ok()?;
+        let guest = ui_guest_of(self).ok()?;
         let options: Value = serde_json::from_str(&options_json).unwrap_or(Value::Null);
         let opts = DialogOptions::parse(&opts_json);
         if guest.dialog_dismissed(&opts) {
@@ -234,7 +270,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         result
     }
     async fn editor(&mut self, title: String, initial: String) -> Option<String> {
-        let guest = guest_of(self).ok()?;
+        let guest = ui_guest_of(self).ok()?;
         // `ui.editor` blocks the same way (tears the TUI down and waits for `$EDITOR` to exit, an
         // equally human-paced wait) — the SAME epoch-budget exemption applies.
         let started = std::time::Instant::now();
@@ -243,32 +279,32 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         result
     }
     async fn set_widget(&mut self, widget_json: String) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             let v: Value = serde_json::from_str(&widget_json).unwrap_or(Value::Null);
             guest.services.set_widget(&v);
             guest.set_widget(v);
         }
     }
     async fn set_header(&mut self, content: String) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.services.set_header(&content);
             guest.set_header(content);
         }
     }
     async fn set_footer(&mut self, content: String) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.services.set_footer(&content);
             guest.set_footer(content);
         }
     }
     async fn set_title(&mut self, title: String) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.services.set_title(&title);
             guest.set_title(title);
         }
     }
     async fn custom(&mut self, spec_json: String) -> Option<String> {
-        let guest = guest_of(self).ok()?;
+        let guest = ui_guest_of(self).ok()?;
         let spec: Value = serde_json::from_str(&spec_json).unwrap_or(Value::Null);
         // Same epoch-budget forgiveness its siblings (`confirm`/`input`/`select`/`editor` above)
         // carry: a custom overlay is just as human-paced a wait once a real `HostServices` backend
@@ -280,47 +316,47 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         result
     }
     async fn get_editor_text(&mut self) -> String {
-        guest_of(self).map(|g| g.services.editor_text()).unwrap_or_default()
+        ui_guest_of(self).map(|g| g.services.editor_text()).unwrap_or_default()
     }
     async fn set_editor_text(&mut self, text: String) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.services.set_editor_text(&text, false);
             guest.editor_write(text, false);
         }
     }
     async fn paste_editor_text(&mut self, text: String) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.services.set_editor_text(&text, true);
             guest.editor_write(text, true);
         }
     }
     async fn theme_get(&mut self) -> Option<String> {
-        guest_of(self).ok().and_then(|g| g.services.theme())
+        ui_guest_of(self).ok().and_then(|g| g.services.theme())
     }
     async fn theme_list(&mut self) -> String {
-        guest_of(self).map(|g| g.services.theme_list().to_string()).unwrap_or_else(|_| "[]".into())
+        ui_guest_of(self).map(|g| g.services.theme_list().to_string()).unwrap_or_else(|_| "[]".into())
     }
     async fn theme_set(&mut self, name: String) -> Result<(), String> {
-        let guest = guest_of(self)?;
+        let guest = ui_guest_of(self)?;
         guest.services.set_theme(&name)?;
         guest.theme_set(name);
         Ok(())
     }
     async fn working_start(&mut self, label: String) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.working(Some(label));
         }
     }
     async fn working_stop(&mut self) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.working(None);
         }
     }
     async fn get_tools_expanded(&mut self) -> bool {
-        guest_of(self).map(|g| g.services.tools_expanded()).unwrap_or(false)
+        ui_guest_of(self).map(|g| g.services.tools_expanded()).unwrap_or(false)
     }
     async fn set_tools_expanded(&mut self, expanded: bool) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = ui_guest_of(self) {
             guest.services.set_tools_expanded(expanded);
             guest.set_tools_expanded(expanded);
         }
@@ -414,7 +450,7 @@ impl bindings::cyrup::ext::exec::Host for HostState {
         args: Vec<String>,
         opts_json: String,
     ) -> Result<wit_types::ExecResult, String> {
-        let guest = guest_of(self)?;
+        let guest = exec_guest_of(self)?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
         // Resolve the Pi `signal` (exec.ts:66-72): a `signalId` that was already aborted (`ui.abort-signal`)
         // yields a pre-cancelled token so the grant kills the process immediately (the guest is
@@ -451,7 +487,7 @@ impl bindings::cyrup::ext::proc::Host for HostState {
         cwd: Option<String>,
         capture_stderr: bool,
     ) -> Result<u32, String> {
-        let guest = guest_of(self)?;
+        let guest = exec_guest_of(self)?;
         // `env-json` is a serde_json object map (guest `ctx.proc_spawn`'s `env` bag); an unparsable
         // or non-object payload degrades to no overrides rather than erroring (mirrors `exec.run`'s
         // permissive `opts-json` handling — never a trap-worthy host failure over a guest payload
@@ -514,7 +550,7 @@ impl bindings::cyrup::ext::proc::Host for HostState {
         result
     }
     async fn write_stdin(&mut self, handle: u32, data: Vec<u8>) -> Result<u32, String> {
-        let guest = guest_of(self)?;
+        let guest = exec_guest_of(self)?;
         // Same rationale as `exec::Host::run`/`http_client::Host::request` above — `ProcCaps::write_stdin`
         // `.await`s a real pipe write (`stdin.write_all`, `caps/proc.rs`), which can legitimately
         // block for a while if the child isn't currently reading its stdin. No `note_dialog_wait`
@@ -526,18 +562,18 @@ impl bindings::cyrup::ext::proc::Host for HostState {
         result
     }
     async fn read_stdout(&mut self, handle: u32, max_bytes: u32) -> Result<Vec<u8>, String> {
-        let guest = guest_of(self)?;
+        let guest = exec_guest_of(self)?;
         guest.services.proc_read_stdout(handle, max_bytes)
     }
     async fn read_stderr(&mut self, handle: u32, max_bytes: u32) -> Result<Vec<u8>, String> {
-        let guest = guest_of(self)?;
+        let guest = exec_guest_of(self)?;
         guest.services.proc_read_stderr(handle, max_bytes)
     }
     async fn poll_exit(&mut self, handle: u32) -> Option<i32> {
-        guest_of(self).ok().and_then(|g| g.services.proc_poll_exit(handle))
+        exec_guest_of(self).ok().and_then(|g| g.services.proc_poll_exit(handle))
     }
     async fn kill(&mut self, handle: u32) -> Result<(), String> {
-        let guest = guest_of(self)?;
+        let guest = exec_guest_of(self)?;
         // Same rationale — `ProcCaps::kill` runs the real stdin-EOF/SIGTERM/SIGKILL escalation
         // (`caps/proc.rs`), up to `DEFAULT_KILL_GRACE`*2 + `KILL_CONFIRM_TIMEOUT` (~6s worst case)
         // of real wall-clock blocking, far past the WASM epoch budget. Without this, the SAME
@@ -554,7 +590,7 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
         &mut self,
         req: bindings::cyrup::ext::http_client::HttpRequest,
     ) -> Result<bindings::cyrup::ext::http_client::HttpResponse, String> {
-        let guest = guest_of(self)?;
+        let guest = net_guest_of(self)?;
         let request = crate::caps::http::HttpRequest {
             method: req.method,
             url: req.url,
@@ -585,7 +621,7 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
         &mut self,
         req: bindings::cyrup::ext::http_client::HttpRequest,
     ) -> Result<bindings::cyrup::ext::http_client::HttpStreamResponse, String> {
-        let guest = guest_of(self)?;
+        let guest = net_guest_of(self)?;
         let request = crate::caps::http::HttpRequest {
             method: req.method,
             url: req.url,
@@ -606,7 +642,7 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
         })
     }
     async fn poll_stream_chunk(&mut self, handle: u32) -> Result<Option<Vec<u8>>, String> {
-        let guest = guest_of(self)?;
+        let guest = net_guest_of(self)?;
         // Same rationale — `HttpCaps::poll_stream_chunk` `.await`s the underlying stream's `next()`,
         // which can legitimately block for a while on a slow/sparse server-sent stream (the real MCP
         // SSE-over-HTTP transport shape `pi-mcp-adapter` targets).
@@ -616,7 +652,7 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
         result
     }
     async fn close_stream(&mut self, handle: u32) {
-        if let Ok(guest) = guest_of(self) {
+        if let Ok(guest) = net_guest_of(self) {
             guest.services.http_close_stream(handle);
         }
     }
@@ -630,7 +666,9 @@ impl bindings::cyrup::ext::ext_fs::Host for HostState {
     }
     async fn write_file(&mut self, path: String, data: Vec<u8>) -> Result<(), String> {
         let guest = guest_of(self)?;
-        let resolved = guest.fs.resolve(&path)?;
+        // EXT-055: a `read:` grant is not a `write:` grant. The manifest syntax has always had two
+        // modes (`manifest.rs`'s `["read:.", "write:.cyrup/todo"]`); nothing read them until now.
+        let resolved = guest.fs.resolve_write(&path)?;
         std::fs::write(&resolved, data).map_err(|e| e.to_string())
     }
 }

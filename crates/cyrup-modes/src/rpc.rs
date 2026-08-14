@@ -1412,15 +1412,20 @@ async fn state_view(session: &AgentSession) -> Value {
     // The full `Model` (Pi `session.model` is already the resolved `Model` object), resolved out of
     // the FULL auth-filtered registry so a model owned by a non-active provider still carries its
     // real metadata; only a genuinely unknown model degrades to a minimal `{provider, id}`.
-    let model = session
-        .available_model_catalog()
-        .iter()
-        .find(|m| m.provider == model_ref.provider && m.id == model_ref.model)
-        .and_then(|m| serde_json::to_value(m).ok())
-        .unwrap_or_else(|| json!({
-            "provider": model_ref.provider.as_str(),
-            "id": model_ref.model.as_str(),
-        }));
+    // `RpcSessionState.model` is `Model | undefined` (rpc-types.ts:95) because
+    // `AgentSession.model` is (agent-session.ts:866-868), so a modelless session reports
+    // `"model": null` rather than a synthesized address.
+    let model = model_ref.map(|model_ref| {
+        session
+            .available_model_catalog()
+            .iter()
+            .find(|m| m.provider == model_ref.provider && m.id == model_ref.model)
+            .and_then(|m| serde_json::to_value(m).ok())
+            .unwrap_or_else(|| json!({
+                "provider": model_ref.provider.as_str(),
+                "id": model_ref.model.as_str(),
+            }))
+    });
     json!({
         "model": model,
         "thinkingLevel": session.thinking_level().await,

@@ -8,8 +8,19 @@
 //! only the product name rebranded, exactly as Pi itself interpolates `APP_NAME` at :60.
 //!
 //! `run_first_time_setup` itself drives a real `CrosstermBackend` terminal (like `run_trust_prompt`)
-//! and is not exercised here; everything it is made of — the gate, both step definitions, the
+//! and cannot be driven from here; everything it is made of — the gate, both step definitions, the
 //! confirm-value mapping and the persistence — is.
+//!
+//! **UW-2 / ADR-0011.** This file used to be the whole story, and it could not see the hole it was
+//! written around: the wizard had NO production caller — `main.rs`'s gate evaluated into an empty
+//! `if` body — so every assertion below passed while the wizard was unreachable. It is now called at
+//! pi's position (`main.rs`, mirroring `main.ts:615-617` @v0.83.0 / `:663-664` @v0.84.1). What a
+//! unit test still cannot reach is the wizard APPEARING; that needs a pty, and a live run must show:
+//! `CYRUP_EXPERIMENTAL=1` + a fresh agent dir + no `settings.json` → the theme picker, then the
+//! analytics question; Light + "Don't share" → `settings.json` with `"theme":"light"`,
+//! `"enableAnalytics":false` and NO `trackingId`; the opt-in answer → a non-empty `trackingId`;
+//! Escape at either step → no `settings.json` at all; and a relaunch after completing it → no
+//! wizard. The `--list-models` conjunct below is the one clause a test here CAN pin.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -26,7 +37,9 @@ use cyrup::startup::{
     is_official_distribution_of, parse_analytics_choice, parse_theme_choice,
     should_run_first_time_setup, should_run_first_time_setup_with,
 };
+use cyrup::{Cli, resolve_app_mode};
 use cyrup_config::{ConfigDirs, Settings, SettingsManager};
+use cyrup_session_svc::AppMode;
 use cyrup_tui::TerminalTheme;
 
 // ---------------------------------------------------------------------------------------------
@@ -393,4 +406,28 @@ impl Drop for EnvRestore {
             set_env(key, value.as_deref());
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// UW-2 — the call site's `listModels` conjunct (pi main.ts:615, `parsed.listModels === undefined`).
+// ---------------------------------------------------------------------------------------------
+
+/// `cyrup --list-models gpt` on a TTY resolves to `AppMode::Interactive` and its listing exit is
+/// DOWNSTREAM of the first-run gate, so the gate MUST carry pi's `listModels` conjunct: without it
+/// the wizard mounts full-screen on a command pi answers with a model list. This pins the fact that
+/// makes the conjunct necessary — the conjunct itself lives at the `main.rs` call site.
+#[test]
+fn a_list_models_run_is_still_interactive_so_the_gate_needs_the_list_models_conjunct() {
+    let cli = Cli {
+        list_models: Some("gpt".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(resolve_app_mode(&cli, true, true), AppMode::Interactive);
+    assert!(cli.list_models.is_some(), "…and the conjunct sees it");
+
+    // The control: an ordinary interactive run has no `--list-models`, so the conjunct never blocks
+    // the wizard on the path it is meant for.
+    let plain = Cli::default();
+    assert_eq!(resolve_app_mode(&plain, true, true), AppMode::Interactive);
+    assert!(plain.list_models.is_none());
 }

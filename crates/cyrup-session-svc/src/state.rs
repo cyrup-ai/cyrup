@@ -209,8 +209,10 @@ pub struct CompactionResult {
 pub struct SessionStateView {
     pub session_id: String,
     pub cwd: String,
-    pub provider: String,
-    pub model: String,
+    /// `None` on a modelless session — pi's `RpcSessionState.model` is `Model | undefined`
+    /// (rpc-types.ts:95) because `AgentSession.model` is (agent-session.ts:866-868). SEAM-075.
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub session_name: Option<String>,
     pub is_streaming: bool,
     pub message_count: usize,

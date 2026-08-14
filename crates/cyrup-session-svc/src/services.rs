@@ -139,8 +139,11 @@ pub struct AgentSessionServices {
     /// installs the owning provider on a matching `set_model` (arch-08 §5.6). Empty until a guest
     /// `registerProvider` fires.
     pub guest_providers: Arc<crate::guest_providers::GuestProviderRegistry>,
-    /// The resolved active model for this session.
-    pub model: Model,
+    /// The resolved active model for this session, or `None` when the session launched with no
+    /// model — pi `AgentSession.model: Model | undefined`, the state `findInitialModel` produces
+    /// when nothing is configured (sdk.ts:216-218 ⇒ `modelFallbackMessage`, a banner rather than an
+    /// error; model-resolver.ts:648-650). See [`crate::session::AgentSession::model`] (SEAM-075).
+    pub model: Option<Model>,
     /// The assembled system prompt for this session (arch-06).
     pub system_prompt: String,
     /// The concrete [`cyrup_ext::host::HostServices`] backend wired to this session's provider +

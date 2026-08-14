@@ -47,10 +47,15 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 // ============================================================================ #24 diagnostics ====
 
-/// gap #24: the runtime `diagnostics` getter — empty on a clean build, and populated with the
-/// model-restore fallback warning when a resumed session's saved model is gone from the catalog.
+/// gap #24: the runtime `diagnostics` getter — empty on a clean build, and STILL empty when a
+/// resumed session's saved model is gone from the catalog, because pi keeps `modelFallbackMessage`
+/// out of `diagnostics`: it is a separate constructor argument
+/// (`new AgentSessionRuntime(session, services, createRuntime, result.diagnostics,
+/// result.modelFallbackMessage)`, agent-session-runtime.ts:425-431) whose only reader is the
+/// interactive `showWarning` (interactive-mode.ts:883-884). `reportDiagnostics` (main.ts:842) must
+/// not echo it, or every non-interactive run prints the banner twice.
 #[tokio::test]
-async fn runtime_diagnostics_surface_model_restore_fallback() {
+async fn model_restore_fallback_is_carried_beside_diagnostics_not_inside_them() {
     let fx = fixture();
 
     // Session 1 persists a `model_change` for `faux/faux-1` (a driven turn flushes the file).
@@ -77,13 +82,18 @@ async fn runtime_diagnostics_surface_model_restore_fallback() {
         .await
         .unwrap();
 
+    // The fallback IS produced and IS reachable — on its own getter, exactly as pi carries it.
+    let fallback = runtime
+        .model_fallback_message()
+        .await
+        .expect("an unrestorable saved model produces a modelFallbackMessage");
+    assert!(fallback.contains("faux-1"), "message names the unrestorable model: {fallback}");
+    // …and it is NOT duplicated into the diagnostics array that `reportDiagnostics` prints.
     let diags = runtime.diagnostics().await;
-    assert_eq!(diags.len(), 1, "model restore failure surfaces exactly one diagnostic");
-    assert_eq!(diags[0].severity, "warning");
-    assert_eq!(diags[0].source.as_deref(), Some("model"));
-    assert!(diags[0].message.contains("faux-1"), "message names the unrestorable model");
-    // And it matches the session's own fallback message.
-    assert_eq!(runtime.model_fallback_message().await.as_deref(), Some(diags[0].message.as_str()));
+    assert!(
+        diags.is_empty(),
+        "pi's `services.diagnostics` carries no model entry; got {diags:?}"
+    );
 }
 
 // ============================================================================ #26 option bags ====

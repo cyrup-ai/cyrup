@@ -1065,6 +1065,7 @@ dependencies = [
  "async-trait",
  "base64",
  "clap",
+ "cyrup",
  "cyrup-config",
  "cyrup-ext",
  "cyrup-ext-subagents",

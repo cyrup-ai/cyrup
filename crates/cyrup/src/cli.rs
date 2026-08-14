@@ -71,6 +71,21 @@ impl ThinkingArg {
     }
 }
 
+/// `--tui-mode <regular|fullscreen>` (pi `args.ts:180-192` @v0.84.1; the `TuiMode` type is
+/// `settings-manager.ts:36` @v0.84.1, re-exported from `pi-tui`). Upstream drift: the flag does not
+/// exist at v0.83.0, the tag cyrup ported — see ADR-0005, which decided cyrup DOES build the
+/// alternate-screen renderer, so the value is modelled in full here rather than being collapsed to a
+/// bool. `regular` is pi's documented default and is a working no-op; `fullscreen` parses and is
+/// declined at startup until the renderer lands (ADR-0005 §Decision A.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum TuiMode {
+    /// The inline (main-screen) renderer — pi's default (`settings-manager.ts:1129` @v0.84.1).
+    Regular,
+    /// The alternate-screen renderer (`tui-alt-screen.ts` @v0.84.1). Not built yet — ADR-0005.
+    Fullscreen,
+}
+
 /// The cyrup command line (arch-11 §3.7; Pi `cli/args.ts`).
 ///
 /// Mode precedence (R-11-001), resolved by [`resolve_app_mode`]: `--rpc`/`--mode rpc` ▷
@@ -219,6 +234,13 @@ pub struct Cli {
     /// List available models (with optional fuzzy search) and exit.
     #[arg(long = "list-models", num_args = 0..=1, default_missing_value = "")]
     pub list_models: Option<String>,
+
+    // ---- TUI renderer selection (args.ts:180-192 @v0.84.1) ----
+    /// TUI mode: `regular` (default) or `fullscreen`. Invalid/missing values are caught by
+    /// [`crate::diagnostics::apply_arg_leniency`] with pi's own two messages before clap sees them,
+    /// so clap's own value error is unreachable here (the same arrangement `--thinking` uses).
+    #[arg(long = "tui-mode", value_name = "MODE")]
+    pub tui_mode: Option<TuiMode>,
 
     // ---- network / diagnostics (args.ts:178,184) ----
     /// Disable startup network operations (same as `PI_OFFLINE=1`).
@@ -794,6 +816,7 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     "--name",
     "--export",
     "--list-models",
+    "--tui-mode",
     "--offline",
     "--verbose",
 ];
@@ -823,6 +846,9 @@ const KNOWN_VALUE_LONG_FLAGS: &[&str] = &[
     "--session-dir",
     "--name",
     "--export",
+    // pi consumes `args[i + 1]` for `--tui-mode` (args.ts:181 @v0.84.1), so the value token must
+    // reach clap rather than being captured as an extension flag (SEAM-051).
+    "--tui-mode",
 ];
 
 /// Render Pi's rich `--help` body (args.ts:212-389): usage, the package/config commands, the full
@@ -904,6 +930,7 @@ Options:
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
+  --tui-mode <mode>              TUI mode: regular (default) or fullscreen
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as CYRUP_OFFLINE=1)

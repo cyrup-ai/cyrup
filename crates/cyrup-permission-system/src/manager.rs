@@ -5,12 +5,18 @@
 //! matching, and mtime-stamped resolution caching.
 //!
 //! The primary wired entry point is [`PermissionManager::check_permission`], called by the gate
-//! (`gate.rs`) on every tool call. The three tool-shaping query methods
-//! [`PermissionManager::get_tool_permission`] / [`PermissionManager::has_allowed_skills`] /
-//! [`PermissionManager::get_bash_permissions`] (pi `permission-manager.ts:834-915`) drive the wired
-//! `before_agent_start` prompt-sanitization + active-tools shaping (pi `shouldExposeTool`,
-//! `index.ts:2049-2075`) — reached from `extension.rs`'s `should_expose_tool` at the live
-//! `before_agent_start` seam (§9). None is a callerless primitive.
+//! (`gate.rs`) on every tool call. The **two** tool-shaping query methods
+//! [`PermissionManager::get_tool_permission`] / [`PermissionManager::has_allowed_skills`] drive the
+//! wired `before_agent_start` prompt-sanitization + active-tools shaping (pi `shouldExposeTool`,
+//! `index.ts:1791-1816` @v0.8.0) — reached from `extension.rs`'s `should_expose_tool` at the live
+//! `before_agent_start` seam (§9).
+//!
+//! [`PermissionManager::get_bash_permissions`] (pi `permission-manager.ts:825-838` @v0.8.0) is
+//! deliberately **not** among them. It used to be a third input to `should_expose_tool`; that was
+//! `PERM-009`, a live permission bypass, and the arm is gone (see `extension.rs`). The method stays
+//! `pub` because it is part of pi's manager API surface and is likewise callerless inside
+//! `pi-permission-system` at v0.8.0 (`git grep getBashPermissions v0.8.0 -- src/ tests/` returns
+//! only its definition) — dropping it would be the divergence, keeping it is parity.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -202,7 +208,16 @@ impl PermissionManager {
             };
         }
 
-        // bash — command rules OUTRANK the tool-level `bash` fallback (pi `:953-968`).
+        // bash — command rules OUTRANK the tool-level `bash` fallback. VERIFIED against pi
+        // `permission-manager.ts:944-959` @v0.8.0, whose coalesce chain is literally
+        // `result?.state ?? toolMatch?.state ?? resolveLayeredDefaultPermission(layers, "bash")?.state
+        // ?? DEFAULT_POLICY.bash` (`:951-954`) — the compiled-`bash` command match first, the `tools`
+        // entry only as its fallback. This ordering is pi's and is CORRECT; it is deliberately NOT
+        // the fix for `PERM-009`. Under `tools.bash: deny` this arm is never reached, because
+        // `extension.rs::should_expose_tool` withholds the tool entirely (pi `index.ts:1791-1816`);
+        // pi's tool-level bash deny is enforced by non-exposure, not by precedence here.
+        // Re-ranking a deny above the command rule here would diverge from pi AND break the
+        // legitimate narrow-an-allow case, so the exposure arm was deleted instead.
         if normalized == "bash" {
             let command = to_record(input)
                 .get("command")
