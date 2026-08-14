@@ -316,7 +316,7 @@ async fn successful_send_appends_an_intercom_sent_audit_entry() {
     )
     .await
     .expect("send delivers");
-    assert_eq!(result_text(&result), "Message sent to target-session.");
+    assert_eq!(result_text(&result), "Message sent to target-session");
 
     let entries = services.entries_persisted();
     assert_eq!(entries.len(), 1, "exactly one intercom_sent entry: {entries:?}");
@@ -369,8 +369,8 @@ async fn send_reports_the_caller_supplied_target_not_the_resolved_session_id() {
     .expect("send delivers");
     assert_eq!(
         result_text(&result),
-        "Message sent to reviewer.",
-        "pi reports the caller-supplied `to`, not the resolved id"
+        "Message sent to reviewer",
+        "pi reports the caller-supplied `to`, not the resolved id, and with NO trailing period"
     );
 
     me.disconnect();
@@ -499,8 +499,8 @@ async fn reply_reports_the_sender_name_rather_than_the_raw_session_id() {
         .expect("reply delivers");
     assert_eq!(
         result_text(&result),
-        "Reply sent to reviewer.",
-        "pi prefers the sender's name over its session id"
+        "Reply sent to reviewer",
+        "pi prefers the sender's name over its session id, and appends no period"
     );
 
     me.disconnect();

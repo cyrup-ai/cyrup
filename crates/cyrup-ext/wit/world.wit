@@ -1,4 +1,4 @@
-// cyrup:ext@0.5.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.6.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -17,7 +17,14 @@
 // older MINOR either lacks the export or has it at the old signature, so it must be refused by
 // `ExtensionManifest::check_world` before instantiation rather than trapping inside wasmtime.
 // `crates/cyrup-ext/tests/wit_world_sync.rs` enforces that tie, in BOTH copies.
-package cyrup:ext@0.5.0;
+//
+// A RE-SIGNED IMPORT bumps the MINOR for the same reason in the opposite direction: an old guest
+// calls the import at the old signature and fails to LINK against the new host. 0.5 -> 0.6 is one
+// such batch (ADR-0002's one-bump-per-pass rule): `ui.set-widget` gained pi's key/placement
+// (EXT-047) and `ui.theme-list` widened to `{name, path}` rows (EXT-021). Purely ADDITIVE imports
+// in the same batch (`ui.set-working-*`, `ui.set-hidden-thinking-label`, `ui.theme-get-by-name`)
+// would not have needed a bump on their own.
+package cyrup:ext@0.6.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -203,6 +210,23 @@ interface events {
   render-call:   func(custom-type: string, call-json: string) -> option<string>;
   render-result: func(custom-type: string, result-json: string) -> option<string>;
 
+  // --- markdown transformation (EXT-019; pi `MarkdownTransformer`,
+  // `extensions/types.ts:1147-1153` @v0.84.1 — a POST-BASELINE addition, absent at v0.83.0) ---
+  // Upstream: `type MarkdownTransformer = (markdown: string, context: MarkdownTransformContext) =>
+  // string` (`:1153`), registered by `registerMarkdownTransformer` (`:1292`, impl
+  // `loader.ts:309-312`), stored as the AT-MOST-ONE `markdownTransformer?` per extension
+  // (`:1703`), and collected in extension LOAD ORDER by
+  // `ExtensionRunner.getMarkdownTransformers()` (`runner.ts:589-591`). The host folds them: each
+  // transformer's output is the next one's input.
+  //
+  // `ctx-json` is `MarkdownTransformContext` (`:1147-1151`):
+  //   {"messageType": "user"|"assistant"|"assistant-thinking", "isStreaming": bool,
+  //    "availableWidth": number}
+  //
+  // Called only on a guest that declared `registration.register-markdown-transformer`. A guest
+  // fault leaves the markdown untouched (the identity default), never dropping the transcript text.
+  transform-markdown: func(markdown: string, ctx-json: string) -> string;
+
   // --- 5.4 tools — the mutating seams ---
   // tool_call [block/mutate] (types.ts:1145), tool_result [mutate] (types.ts:1146).
   // tool_result carries the FULL Pi `ToolResultEventBase` shape (types.ts:883-929): the executed
@@ -352,6 +376,12 @@ interface registration {
   register-provider:         func(id: string, config-json: string);
   unregister-provider:       func(id: string);
   register-message-renderer: func(custom-type: string);
+  // Pi `registerMarkdownTransformer(transformer)` (`extensions/types.ts:1292` @v0.84.1, impl
+  // `loader.ts:309-312`). Argument-less because the transformer itself is a guest closure the host
+  // reaches through the `transform-markdown` EXPORT — this import only declares that this guest HAS
+  // one. Upstream stores it as `extension.markdownTransformer = transformer`, i.e. AT MOST ONE per
+  // extension with the last registration winning; the host models that the same way (EXT-019).
+  register-markdown-transformer: func();
   // Pi registerEntryRenderer(customType, renderer), types.ts:1295 / loader.ts:314-318 — the
   // custom-ENTRY surface, a SEPARATE table from register-message-renderer above (upstream keeps
   // `messageRenderers` and `entryRenderers` as disjoint maps, types.ts:1703-1704). An entry is
@@ -415,7 +445,21 @@ interface ui {
   // multiline editor seeded with `initial`, labeled `title` (Pi `editor(title, prefill)`,
   // types.ts:216); returns the edited text (none = cancelled).
   editor:     func(title: string, initial: string) -> option<string>;
-  set-widget: func(widget-json: string);
+  // Pi `setWidget(key, content: string[] | undefined, options?: ExtensionWidgetOptions)`
+  // (`extensions/types.ts:170-175` @v0.83.0, plus a component-factory overload at `:171-175`), with
+  // `ExtensionWidgetOptions {placement?}` at `:107-110` and
+  // `WidgetPlacement = "aboveEditor" | "belowEditor"` at `:104`.
+  //
+  // EXT-047: this was `set-widget: func(widget-json: string)` — ONE opaque payload where pi takes
+  // three arguments. The `key` is what makes the surface a MAP: one widget per key, so two
+  // extensions no longer clobber each other; `none` content REMOVES that key's widget (upstream's
+  // `content: undefined`), which cyrup could not express at all — the shipped subagents extension
+  // hand-rolled `{"key": …, "content": null}` to mean it and the slot stayed occupied; and
+  // `placement` decides which chrome slot it lands in, which was unexpressible.
+  //
+  // `content-json` is pi's `string[]` (the widget LINES) as serde_json, `none` = remove.
+  // `opts-json` is the `ExtensionWidgetOptions` bag; `{}` = pi's default `"aboveEditor"`.
+  set-widget: func(key: string, content-json: option<string>, opts-json: string);
 
   // --- chrome (Pi setHeader/setFooter/setTitle, types.ts:130-150) ---
   set-header: func(content: string);
@@ -427,11 +471,44 @@ interface ui {
   get-editor-text:   func() -> string;
   set-editor-text:   func(text: string);
   paste-editor-text: func(text: string);
-  // --- theme get/list/set (Pi getTheme/listThemes/setTheme, types.ts:240-260) ---
+  // --- theme read/list/switch ---
+  // Pi's live theme is the readonly `theme: Theme` property (`extensions/types.ts:266` @v0.83.0);
+  // `theme-get` returns its NAME, the only part that survives the serde seam.
   theme-get:  func() -> option<string>;
-  theme-list: func() -> string;          // json array of theme names
+  // Pi `getAllThemes(): { name: string; path: string | undefined }[]`
+  // (`extensions/types.ts:269` @v0.83.0). EXT-021: cyrup returned a bare json array of NAMES, so a
+  // guest could not tell a built-in theme from a file-backed one or locate the file to read it.
+  // Now a json array of `{name, path}` rows, `path` null for a built-in.
+  theme-list: func() -> string;          // json array of {name, path}
+  // Pi `getTheme(name): Theme | undefined` (`extensions/types.ts:272` @v0.83.0) — load a theme by
+  // name WITHOUT switching to it. `none` = no such theme. The serialized theme crosses as json.
+  theme-get-by-name: func(name: string) -> option<string>;
+  // Pi `setTheme(theme): {success, error?}` (`extensions/types.ts:275`).
   theme-set:  func(name: string) -> result<_, string>;
-  // --- working-indicator controls (Pi startWorking/stopWorking, types.ts:265-275) ---
+
+  // --- working / streaming indicator (Pi `ExtensionUIContext`, extensions/types.ts:151-167) ---
+  // Pi `setWorkingMessage(message?: string)` at `:151`, "Set the working/loading message shown
+  // during streaming. Call with no argument to restore default" — `none` IS that no-argument call.
+  set-working-message:   func(message: option<string>);
+  // Pi `setWorkingVisible(visible: boolean)` at `:154`, "Show or hide the built-in interactive
+  // working loader row during streaming" — visibility INDEPENDENT of the message, which is exactly
+  // what cyrup's collapsed `working-start(label)`/`working-stop()` pair could not express.
+  set-working-visible:   func(visible: bool);
+  // Pi `setWorkingIndicator(options?: WorkingIndicatorOptions)` at `:164`; the bag is
+  // `{frames?: string[], intervalMs?: number}` at `:116-121`, where `frames: []` hides the
+  // indicator entirely and omitting the argument restores the default animated spinner — hence
+  // `none` for "no argument" and a json `{}` for "explicitly empty options".
+  set-working-indicator: func(opts-json: option<string>);
+  // Pi `setHiddenThinkingLabel(label?: string)` at `:167`, "Set the label shown for hidden thinking
+  // blocks. Call with no argument to restore default".
+  set-hidden-thinking-label: func(label: option<string>);
+  // CYRUP-DELTA: `working-start`/`working-stop` are cyrup-ORIGINAL. Upstream has no `startWorking`
+  // or `stopWorking` at v0.83.0 (`git grep -n 'startWorking\|stopWorking' v0.83.0` is empty) and
+  // the `types.ts:265-275` this pair used to cite is `getAllThemes`/`getTheme`/`setTheme`/
+  // `getToolsExpanded` — a fabricated citation (EXT-021/EXT-036). They are kept because guests and
+  // the bundled example already call them; they are now defined in terms of the pi imports above:
+  // `working-start(label)` == `set-working-message(some(label))` + `set-working-visible(true)`,
+  // `working-stop()` == `set-working-visible(false)`.
   working-start: func(label: string);
   working-stop:  func();
   // --- tools-expanded get/set (Pi getToolsExpanded/setToolsExpanded) ---

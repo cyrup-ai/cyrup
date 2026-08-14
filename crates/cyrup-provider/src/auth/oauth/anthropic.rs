@@ -439,8 +439,13 @@ impl AnthropicOAuth {
         format!("{}?{params}", self.authorize_url)
     }
 
-    fn client(&self) -> Result<reqwest::Client, OAuthError> {
-        crate::stream::sse::build_client().map_err(|e| OAuthError::Failed(e.to_string()))
+    /// PROV-047: proxy-aware, per target. `build_client()` consulted neither the ported resolver
+    /// nor the `httpProxy` setting, so every OAuth token exchange and silent refresh bypassed a
+    /// configured proxy while provider streaming used it.
+    async fn client(&self, target_url: &str) -> Result<reqwest::Client, OAuthError> {
+        crate::stream::sse::build_client_for(target_url)
+            .await
+            .map_err(|e| OAuthError::Failed(e.to_string()))
     }
 
     /// 1:1 port of `exchangeAuthorizationCode` (`anthropic.ts:190-227`).
@@ -451,7 +456,7 @@ impl AnthropicOAuth {
         verifier: &str,
         redirect_uri: &str,
     ) -> Result<Credential, OAuthError> {
-        let client = self.client()?;
+        let client = self.client(&self.token_url).await?;
         // `:198-205`
         let body = serde_json::json!({
             "grant_type": "authorization_code",
@@ -487,7 +492,7 @@ impl AnthropicOAuth {
 
     /// 1:1 port of `refreshAnthropicToken` (`anthropic.ts:308-340`).
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<Credential, OAuthError> {
-        let client = self.client()?;
+        let client = self.client(&self.token_url).await?;
         // `:311-315`
         let body = serde_json::json!({
             "grant_type": "refresh_token",

@@ -132,6 +132,21 @@ pub struct RunnerConfig {
     /// top level (threaded into the terminal [`ResultFile::session_file`], R-SA-085's resume
     /// target).
     pub session_file: Option<PathBuf>,
+    /// SUBA-031 — the ORCHESTRATOR session that launched this run, pi's `sessionId:
+    /// ctx.currentSessionId` on every detached hand-off (`async-execution.ts:1042`, `:1159`,
+    /// `:1459`, `:1542` @v0.43.0), stamped onto `status.json` by the runner
+    /// (`...(config.sessionId ? { sessionId: config.sessionId } : {})`, `subagent-runner.ts:2088`)
+    /// and read back by every session-scoped listing (`async-status.ts:432`).
+    ///
+    /// It is carried EXPLICITLY here, exactly as pi carries it, rather than re-derived inside the
+    /// runner: the runner's previous source was
+    /// [`crate::background::parent_anchor::resolve_parent_session_anchor`], whose register is
+    /// published only by `cyrup-permission-system` at its parent-role `SessionStart`. With that
+    /// extension absent — a perfectly ordinary configuration — every background run recorded a
+    /// `None` session, which a session-scoped listing must drop. `None` here still means "no live
+    /// session identity" (headless / SDK embedder), and the runner then falls back to the anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Run-wide global concurrency ceiling (R-SA-050) — resolved once by the orchestrator from
     /// [`crate::registration::SubagentExtensionConfig::global_concurrency_limit`] and handed
     /// through verbatim rather than re-read from config inside the runner process.
@@ -551,11 +566,19 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     let mut status = RunStatus::queued(config.run_id.clone(), config.mode, Some(std::process::id()));
     // pi `...(config.sessionId ? { sessionId: config.sessionId } : {})` (`subagent-runner.ts:2088`):
     // stamp the ORCHESTRATOR session onto the run's own `status.json`, so a later reader can scope
-    // the async root to one session (`async-status.ts:432`). cyrup's `RunnerConfig` carries no
-    // session id, but the hop-1 spawn already writes the anchor into this process's environment
-    // (`parent_anchor::detached_runner_env_overlay`), which is the same value pi's `ctx
-    // .currentSessionId` is (`async-execution.ts:1042`).
-    status.session_id = crate::background::parent_anchor::resolve_parent_session_anchor();
+    // the async root to one session (`async-status.ts:432`).
+    //
+    // SUBA-031: the config field is the primary source and is pi's own (`sessionId:
+    // ctx.currentSessionId`, `async-execution.ts:1042`). The inherited
+    // `CYRUP_SUBAGENT_PARENT_SESSION` anchor survives only as the fallback, because it is published
+    // by `cyrup-permission-system` and is therefore absent whenever that extension is not loaded —
+    // which used to leave every background run unattributed, and a session-scoped listing must drop
+    // an unattributed run (pi's `!==` against `undefined`).
+    status.session_id = config
+        .session_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .or_else(crate::background::parent_anchor::resolve_parent_session_anchor);
     status.chain_step_count = Some(config.steps.len());
     status.steps = config
         .steps
@@ -2451,6 +2474,14 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             output_mode: step
                 .output_mode
                 .unwrap_or(crate::discovery::types::OutputMode::Inline),
+            // SUBA-054 residual, stated rather than silently defaulted: a step dispatched through
+            // this runner already gets its `[Read from: …]` line from
+            // `spawn::chain_graph::build_chain_instructions`, which resolves `step.reads` against
+            // the CHAIN dir. Populating `RunOptions::reads` here as well would emit the line TWICE
+            // for every chain step. Upstream's async single path resolves against `effectiveCwd`
+            // (`async-execution.ts:1300-1302`), so closing the async half means teaching the step
+            // builder which of the two cwds applies — not setting this field.
+            reads: None,
             structured_output_schema: step.structured_output_schema.clone(),
             model_override,
             preferred_provider: None,
@@ -3598,6 +3629,7 @@ mod tests {
             steps: vec![RunnerStep::SingleStep(single_step("worker", "do it"))],
             cwd: dir.path().to_path_buf(),
             session_file: None,
+            session_id: None,
             global_concurrency_limit: 20,
             worktree_base_dir: None,
             max_subagent_depth: 2,
@@ -3649,6 +3681,7 @@ mod tests {
             steps: vec![],
             cwd: dir.path().to_path_buf(),
             session_file: None,
+            session_id: None,
             global_concurrency_limit: 20,
             worktree_base_dir: None,
             max_subagent_depth: 2,
@@ -3772,6 +3805,7 @@ mod tests {
             steps: vec![RunnerStep::SingleStep(single_step("worker", "do it"))],
             cwd: dir.path().to_path_buf(),
             session_file: None,
+            session_id: None,
             global_concurrency_limit: 20,
             worktree_base_dir: None,
             max_subagent_depth: 2,
@@ -4378,6 +4412,7 @@ mod tests {
             )],
             cwd: dir.path().to_path_buf(),
             session_file: None,
+            session_id: None,
             global_concurrency_limit: 20,
             worktree_base_dir: None,
             max_subagent_depth: 2,

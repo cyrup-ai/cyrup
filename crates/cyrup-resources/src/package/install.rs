@@ -54,12 +54,42 @@ impl PackageManager {
 
     /// Install a package from a source ref (R-09-018). Explicit user action only (R-09-019).
     /// Project scope requires `trusted` (R-09-017).
+    ///
+    /// The whole install — trust gate, install-root `.gitignore`, clone, `packages.json` upsert —
+    /// runs inside ONE `spawn_blocking`, so it is a single unit that always settles.
+    ///
+    /// **Mechanism note (JS → Rust).** Pi's `installGit` (package-manager.ts:1820-1852 @v0.83.0)
+    /// is an `async` function, and a JS async function cannot be torn down part-way: whatever it
+    /// starts it finishes or throws, and its `catch` (`:1846-1851`) removes the partial tree. A
+    /// Rust future is droppable at every `.await`, and this function used to have one *between*
+    /// the clone and the registry write. Dropping there — a cancelled `cyrup install`, a Ctrl-C,
+    /// a `select!` losing the race — does **not** stop the clone (`spawn_blocking` tasks are never
+    /// aborted, the `JoinHandle` merely detaches), so a complete working tree landed at exactly
+    /// the path [`crate::package::store::installed_dir`] resolves while `packages.json` never
+    /// learned about it. `resolve_configured_package` keys off the DIRECTORY, not the registry
+    /// (`discovery.rs`, the `installed_dir` arm), so the orphan then loads as a real installed
+    /// package on every later session. There is no `.await` inside the unit any more.
     pub async fn install(
         &self,
         source: PackageSource,
         scope: InstallScope,
         trusted: bool,
         cancel: CancelToken,
+    ) -> Result<(InstalledPackage, SecurityNotice), ResourceError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.install_blocking(source, scope, trusted, &cancel))
+            .await
+            .map_err(|e| ResourceError::Git(e.to_string()))?
+    }
+
+    /// The body of [`install`](Self::install), on a blocking thread. See that method for why the
+    /// clone and the registry write must not be separated by an `.await`.
+    fn install_blocking(
+        &self,
+        source: PackageSource,
+        scope: InstallScope,
+        trusted: bool,
+        cancel: &CancelToken,
     ) -> Result<(InstalledPackage, SecurityNotice), ResourceError> {
         if scope == InstallScope::Project && !trusted {
             let p = match &source {
@@ -101,12 +131,12 @@ impl PackageManager {
                 if let Some(root) = self.store.packages_root(scope) {
                     ensure_git_ignore(&root)?;
                 }
-                let url = url.clone();
                 let ref_name = reff.ref_name().map(str::to_string);
-                let commit = tokio::task::spawn_blocking(move || git_clone(&url, &dir, ref_name))
-                    .await
-                    .map_err(|e| ResourceError::Git(e.to_string()))??;
-                Some(commit)
+                // A failed clone must leave NOTHING at `dir` — Pi's `installGit` catch is
+                // `rmSync(targetDir, { recursive: true, force: true })` (package-manager.ts:1847
+                // @v0.83.0). [`git_clone`] guarantees that by staging, so the `?` here is the
+                // whole of Pi's `throw error` (`:1849`).
+                Some(git_clone(url, &dir, ref_name)?)
             }
         };
 
@@ -238,9 +268,16 @@ impl PackageManager {
 
 /// Refresh an installed package. Git: re-clone the source URL (real fetch via `gix`) so the working
 /// tree and recorded commit advance with the remote, mirroring Pi `updateGit`; for a bare on-disk
-/// source path the local repo is re-copied and re-resolved. If the source is unreachable the update
-/// degrades gracefully — the last known commit (or the local clone's HEAD) is retained rather than
-/// failing the whole run. Path: no-op.
+/// source path the local repo is re-copied and re-resolved. Path: no-op.
+///
+/// An unreachable source is a **failure of that package**, not a silent success. Pi's `updateGit`
+/// (package-manager.ts:1853-1868 @v0.83.0) delegates to `ensureGitRef` (`:1870-1896`), whose very
+/// first statement is `await this.runCommand("git", fetchArgs, …)`; `runCommand` rejects on a
+/// non-zero exit, so the rejection propagates out of `update()` and the caller is told. cyrup used
+/// to swallow the error, re-read the local `HEAD` and return `Ok(())` — which `PackageManager::update`
+/// then recorded in `report.updated`, telling the user a package had been updated when the remote
+/// had never been contacted. The error goes into `report.failed` now; the installed working tree is
+/// untouched either way, because [`git_clone`] stages.
 fn refresh(
     pkg: &mut InstalledPackage,
     scope: InstallScope,
@@ -253,15 +290,7 @@ fn refresh(
             let Some(dir) = store.package_dir(scope, &pkg.id) else {
                 return Ok(());
             };
-            match git_clone(url, &dir, reff.ref_name().map(str::to_string)) {
-                Ok(commit) => pkg.resolved_commit = Some(commit),
-                Err(_) => {
-                    // Unreachable source: keep going. If a local clone is present, re-read its HEAD.
-                    if let Ok(commit) = git_head(&dir) {
-                        pkg.resolved_commit = Some(commit);
-                    }
-                }
-            }
+            pkg.resolved_commit = Some(git_clone(url, &dir, reff.ref_name().map(str::to_string))?);
             Ok(())
         }
     }
@@ -279,7 +308,82 @@ fn refresh(
 /// and its tree materialized over the working copy so the pin is actually applied (R-09-018/020) —
 /// the recorded commit is the ref's commit, not default HEAD. When it is absent, the cloned HEAD is
 /// used.
+///
+/// **`dir` is only ever touched on success.** The clone runs into a staging sibling and is renamed
+/// into place at the end; on any failure the staging tree is deleted and `dir` is byte-identical to
+/// what it was. That is Pi's guarantee, arrived at differently: Pi never clones over an existing
+/// tree at all — `installGit` early-returns into a fetch when `existsSync(targetDir)`
+/// (package-manager.ts:1822-1830 @v0.83.0) and `updateGit` fetches **in place** and only then
+/// `git reset --hard`s (`:1853-1868` → `ensureGitRef` `:1870-1896`), so a fetch that fails throws
+/// with the installed tree untouched. cyrup has no in-place fetch path and re-clones instead, and
+/// the previous shape wiped `dir` *first* (`git_clone_url`'s opening `remove_dir_all`), so a single
+/// unreachable remote — an offline `cyrup update`, an expired token, a deleted branch — DELETED the
+/// installed working tree of every git package it touched, while [`refresh`] went on to report
+/// those packages as updated.
 fn git_clone(
+    url: &str,
+    dir: &std::path::Path,
+    ref_name: Option<String>,
+) -> Result<String, ResourceError> {
+    let staging = sibling_dir(dir, ".cyrup-incoming");
+    let _ = std::fs::remove_dir_all(&staging);
+    match git_clone_into(url, &staging, ref_name) {
+        Ok(commit) => match promote_clone(&staging, dir) {
+            Ok(()) => Ok(commit),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                Err(e)
+            }
+        },
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// `<dir>` with `suffix` appended to its final component, in the same parent directory — so the
+/// rename in [`promote_clone`] stays on one filesystem.
+fn sibling_dir(dir: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "package".to_string());
+    match dir.parent() {
+        Some(parent) => parent.join(format!("{name}{suffix}")),
+        None => std::path::PathBuf::from(format!("{name}{suffix}")),
+    }
+}
+
+/// Move a completed staging clone onto `dir`, replacing any previous tree. The previous tree is
+/// moved aside first and only deleted once the new one is in place, so a failure mid-swap restores
+/// it rather than leaving the package missing.
+fn promote_clone(staging: &std::path::Path, dir: &std::path::Path) -> Result<(), ResourceError> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !dir.exists() {
+        return std::fs::rename(staging, dir).map_err(ResourceError::Io);
+    }
+    let backup = sibling_dir(dir, ".cyrup-previous");
+    let _ = std::fs::remove_dir_all(&backup);
+    std::fs::rename(dir, &backup).map_err(ResourceError::Io)?;
+    match std::fs::rename(staging, dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup);
+            Ok(())
+        }
+        Err(e) => {
+            // Put the working tree back before surfacing the failure.
+            let _ = std::fs::rename(&backup, dir);
+            Err(ResourceError::Io(e))
+        }
+    }
+}
+
+/// [`git_clone`]'s body, writing into `dir` directly. Callers other than [`git_clone`] must not use
+/// it: it is the half that can leave a partial tree behind.
+fn git_clone_into(
     url: &str,
     dir: &std::path::Path,
     ref_name: Option<String>,
@@ -314,10 +418,8 @@ fn git_clone_url(
 ) -> Result<String, ResourceError> {
     use std::sync::atomic::AtomicBool;
 
-    // A fresh clone requires the target dir to be empty/absent; clear any stale tree.
-    if dir.exists() {
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    // `dir` is the staging path [`git_clone`] just cleared, so it is empty/absent by construction.
+    // The old unconditional `remove_dir_all` lived here and is what made a failed fetch destructive.
     let prepare = gix::prepare_clone(url, dir).map_err(|e| ResourceError::Git(e.to_string()))?;
     // `prepare_clone` creates a FRESH repo whose config does NOT include the user's
     // ~/.gitconfig (credential helper, SSH command). Inject that auth config now — between

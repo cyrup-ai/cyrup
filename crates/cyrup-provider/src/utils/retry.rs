@@ -30,7 +30,30 @@ const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS: &[&str] = &[
 ];
 
 /// Transient provider/transport errors that ARE retryable (Pi `RETRYABLE_PROVIDER_ERROR_PATTERN`,
-/// retry.ts:26-80).
+/// `retry.ts:26-89` @**v0.83.0** — `git diff v0.83.0..v0.84.1 -- packages/ai/src/utils/retry.ts` is
+/// empty, so this list is the same at both tags).
+///
+/// DRIFT-014: seven upstream literals were missing from the port — `"524"` (ts:36),
+/// `"getaddrinfo"` (ts:54), `"ENOTFOUND"` (ts:55), `"EAI_AGAIN"` (ts:56), `"socket connection was
+/// closed"` (ts:60), `"stream ended before a terminal response event"` (ts:74) and
+/// `"ResourceExhausted"` (ts:88). Each is restored below in pi's own position and comment group.
+/// The item was filed `upstream-drift`; it is **not-ported** — all seven predate the ported
+/// baseline, so no rebase would have swept them up.
+///
+/// `[CYRUP-DELTA]` — one **added** literal, `"dns error"`, marked inline. pi's three DNS literals
+/// are Node-shaped (`getaddrinfo`/`ENOTFOUND`/`EAI_AGAIN`, all emitted by libuv) and cyrup's
+/// transport never produces them. cyrup's classifier input is
+/// `ProviderError::Transport`'s flattened source chain
+/// ([`crate::stream::sse`]'s `flatten_source_chain`/`transport_error`), and on a failed lookup that
+/// chain is reqwest's terse `"error sending request for url (…)"` followed by
+/// `hyper_util::client::legacy::connect::http::ConnectError`, whose `Display` writes its
+/// `&'static str` msg — `"dns error"`, set by `ConnectError::dns` at
+/// `hyper-util-0.1.20/src/client/legacy/connect/http.rs:668` — followed by the platform
+/// `std::io::Error` (`"failed to lookup address information: …"` on macOS, `"Name or service not
+/// known"` on glibc). Only the hyper-util literal is stable across platforms, so that is the one
+/// matched. Without it pi's DNS retry behaviour is unreachable here no matter how faithfully the
+/// three Node literals are transcribed — which is why transcribing them alone does not close the
+/// item.
 const RETRYABLE_PROVIDER_PATTERNS: &[&str] = &[
     // Generic provider load, HTTP status, and server-side transient failures.
     "overloaded",
@@ -41,6 +64,7 @@ const RETRYABLE_PROVIDER_PATTERNS: &[&str] = &[
     "502",
     "503",
     "504",
+    "524",
     "service.?unavailable",
     "server.?error",
     "internal.?error",
@@ -53,9 +77,16 @@ const RETRYABLE_PROVIDER_PATTERNS: &[&str] = &[
     "connection.?lost",
     "other side closed",
     "fetch failed",
+    "getaddrinfo",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    // `[CYRUP-DELTA]` — the hyper-util counterpart of the three Node DNS literals above; see the
+    // doc comment. Not present upstream because pi has no Rust transport.
+    "dns error",
     "upstream.?connect",
     "reset before headers",
     "socket hang up",
+    "socket connection was closed",
     "timed? out",
     "timeout",
     "terminated",
@@ -65,6 +96,7 @@ const RETRYABLE_PROVIDER_PATTERNS: &[&str] = &[
     // Premature stream endings.
     "ended without",
     "stream ended before message_stop",
+    "stream ended before a terminal response event",
     "http2 request did not get a response",
     // Provider-requested retry delay cap failures.
     "retry delay",
@@ -72,6 +104,8 @@ const RETRYABLE_PROVIDER_PATTERNS: &[&str] = &[
     "you can retry your request",
     "try your request again",
     "please retry your request",
+    // gRPC based providers (e.g. NVIDIA NIM).
+    "ResourceExhausted",
 ];
 
 fn non_retryable_regex() -> &'static Regex {
@@ -315,6 +349,56 @@ mod tests {
                 "should be retryable: {msg}"
             );
         }
+    }
+
+    // DRIFT-014 — the seven literals that were absent from the port, each exercised through the
+    // classifier rather than by comparing the array to itself.
+    #[test]
+    fn drift_014_restored_upstream_literals_classify_retryable() {
+        for msg in [
+            // "524" (retry.ts:36) — Cloudflare origin timeout.
+            "524 A timeout occurred",
+            // Node/libuv DNS failures (retry.ts:54-56).
+            "getaddrinfo ENOTFOUND api.anthropic.com",
+            "getaddrinfo EAI_AGAIN api.openai.com",
+            // retry.ts:60.
+            "The socket connection was closed unexpectedly",
+            // retry.ts:74 — the sibling of "stream ended before message_stop".
+            "stream ended before a terminal response event",
+            // retry.ts:88 — gRPC providers (NVIDIA NIM).
+            "ResourceExhausted: quota for this model is temporarily exhausted",
+        ] {
+            assert!(
+                is_retryable_assistant_error(&err(StopReason::Error, Some(msg))),
+                "should be retryable: {msg}"
+            );
+        }
+    }
+
+    // `[CYRUP-DELTA]` — pi's three DNS literals never appear in a cyrup transcript, so the
+    // upstream literals alone leave DNS retries unreachable. This pins the string cyrup's own
+    // transport actually produces: `ProviderError::Transport`'s flattened source chain for a
+    // failed lookup, i.e. reqwest's terse Display, then hyper-util's `ConnectError` (`Display`
+    // writes its `&'static str` msg, `"dns error"`), then the platform `std::io::Error`.
+    #[test]
+    fn cyrup_transport_dns_failure_classifies_retryable() {
+        // macOS (BSD getaddrinfo wording).
+        let macos = "transport error: error sending request for url (https://api.anthropic.com/v1/messages): client error (Connect): dns error: failed to lookup address information: nodename nor servname provided, or not known";
+        // glibc wording.
+        let glibc = "transport error: error sending request for url (https://api.anthropic.com/v1/messages): client error (Connect): dns error: failed to lookup address information: Name or service not known";
+        for msg in [macos, glibc] {
+            assert!(
+                is_retryable_assistant_error(&err(StopReason::Error, Some(msg))),
+                "cyrup's own DNS-failure text must classify retryable: {msg}"
+            );
+        }
+        // The delta is load-bearing: strip the hyper-util literal and nothing else in the chain
+        // matches, which is the state the port was in before DRIFT-014.
+        let without = macos.replace("dns error: ", "");
+        assert!(
+            !is_retryable_assistant_error(&err(StopReason::Error, Some(&without))),
+            "guard is vacuous unless `dns error` is the only matching token"
+        );
     }
 
     #[test]

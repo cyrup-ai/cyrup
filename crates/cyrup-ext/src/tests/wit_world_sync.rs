@@ -93,6 +93,34 @@ fn host_world_matches_the_wit_package_version_in_both_copies() {
     }
 }
 
+/// EXT-028's named residual: line 1 of each copy is a `// cyrup:ext@MAJOR.MINOR.PATCH` marker, and
+/// it is a SECOND declaration of the version that no test tied to anything.
+///
+/// That is exactly how the original defect happened: both copies sat at `// cyrup:ext@0.3.0` while
+/// their `package` line read `0.4.0`, through two consecutive bumps, because the existing tie test
+/// parses only the `package` line. A stale marker is the first thing a reader of the world sees, so
+/// it is the first thing that misleads them about which world they are editing.
+#[test]
+fn the_header_version_marker_matches_the_package_line_in_both_copies() {
+    for path in [host_wit(), guest_wit()] {
+        let src = read(&path);
+        let declared = package_version(&src, &path);
+        let marker = src
+            .lines()
+            .next()
+            .and_then(|l| l.trim().strip_prefix("//"))
+            .map(|rest| rest.trim().split_whitespace().next().unwrap_or("").to_string())
+            .unwrap_or_else(|| panic!("no leading `// cyrup:ext@…` marker in {}", path.display()));
+        assert_eq!(
+            marker,
+            declared,
+            "{} opens with `// {marker}` but declares `package {declared};` — the marker is a \
+             second copy of the version and must move with it (EXT-028)",
+            path.display(),
+        );
+    }
+}
+
 /// EXT-028, the header half: the `// … exports N `on-*` event hooks` claim in the world's own
 /// preamble is checked against the exports actually declared, so it cannot rot the way the old
 /// "30-event catalog" line did (the `events` interface has long declared 31).

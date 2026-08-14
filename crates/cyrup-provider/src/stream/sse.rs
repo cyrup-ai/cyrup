@@ -73,6 +73,42 @@ pub fn http_idle_timeout_ms() -> u64 {
     HTTP_IDLE_TIMEOUT_MS.load(Ordering::Relaxed)
 }
 
+/// The process-global `httpProxy` setting (PROV-047).
+static HTTP_PROXY_SETTING: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Install the `httpProxy` setting process-wide — 1:1 with pi `applyHttpProxySettings`
+/// (`coding-agent/src/core/http-dispatcher.ts:43-48` @v0.83.0, `:45-50` @v0.84.1).
+///
+/// pi does this by writing the **process environment**: `process.env.HTTP_PROXY ??= proxy;
+/// process.env.HTTPS_PROXY ??= proxy` (`:46-47`), called at startup from `cli.ts:18` /
+/// `rpc-entry.ts:10` and re-applied from `main.ts:744-745`. Because it lands in the env, EVERY
+/// later proxy consultation sees it — the SDK dispatcher, `fetch`, OAuth token exchange, extension
+/// HTTP — not just the streaming wire APIs.
+///
+/// cyrup cannot mutate its own environment safely (`std::env::set_var` is `unsafe` from edition
+/// 2024 and is a data race against every concurrently-running thread's `getenv`), so the value is
+/// stored here instead and consulted by
+/// [`crate::utils::node_http_proxy::resolve_http_proxy_url_for_target`] at exactly the layer pi's
+/// env write is observed: as the value of `HTTP_PROXY`/`HTTPS_PROXY` when the ambient environment
+/// supplies neither. `??=` means an ambient variable WINS, and that precedence is preserved.
+///
+/// `None` clears the setting. Applies to every client built from the next call onward.
+pub fn configure_http_proxy(proxy: Option<String>) {
+    let normalized = proxy.filter(|p| !p.trim().is_empty());
+    if let Ok(mut guard) = HTTP_PROXY_SETTING.write() {
+        *guard = normalized;
+    }
+}
+
+/// The configured `httpProxy`, if any. Read by the ported proxy resolver; not a public precedence
+/// decision of its own.
+pub fn configured_http_proxy() -> Option<String> {
+    HTTP_PROXY_SETTING
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
 /// Resolve a per-request override against the global default. `None` ⇒ the global default;
 /// `Some(0)` ⇒ disabled; `Some(n)` ⇒ `n` ms (Pi: `options?.timeoutMs ?? …`, with `0` meaning "no
 /// timeout" at both layers).
@@ -135,8 +171,39 @@ pub struct SseFrame {
     pub data: String,
 }
 
+/// Build a proxy-aware HTTP client for one target URL, with the process-global idle timeout
+/// (PROV-047).
+///
+/// This is [`build_client`]'s replacement for every **non-streaming** egress path — the OAuth
+/// flows and the non-streaming provider dispatch in [`crate::wire`] — and it exists because
+/// `build_client()` consults neither the ported resolver nor `configure_http_proxy`, so a user who
+/// configured `httpProxy` the documented way got working model streaming and a hard failure on
+/// login, on every silent token refresh, and on catalog refreshes.
+///
+/// Ambient `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY` are read through [`EnvAuthContext`], so the same
+/// ported resolver decides for these requests as for provider streams — retiring the second,
+/// competing `no_proxy` implementation reqwest's own env detection was applying to them.
+///
+/// [`EnvAuthContext`]: crate::auth::types::EnvAuthContext
+pub async fn build_client_for(target_url: &str) -> Result<reqwest::Client, ProviderError> {
+    build_client_for_target(
+        target_url,
+        &crate::auth::types::EnvAuthContext,
+        None,
+        // Non-streaming requests take the process-global idle timeout, as pi's global dispatcher
+        // applies its `bodyTimeout`/`headersTimeout` to every request in the process.
+        None,
+    )
+    .await
+}
+
 /// Build the shared HTTP client (arch-01 §7.1: rustls-tls, no native-tls), carrying the
 /// process-global idle timeout ([`configure_http_idle_timeout`]).
+///
+/// **Proxy-blind.** It applies neither the ported resolver nor [`configure_http_proxy`], and it does
+/// NOT call [`reqwest::ClientBuilder::no_proxy`], so reqwest's own env detection decides — a second
+/// `no_proxy`/`all_proxy` implementation inside the same process. Prefer [`build_client_for`]
+/// whenever a target URL is known; this remains for clients that genuinely have no single target.
 pub fn build_client() -> Result<reqwest::Client, ProviderError> {
     with_idle_timeout(reqwest::Client::builder(), None)
         .build()

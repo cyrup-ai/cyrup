@@ -42,7 +42,8 @@ pub use cyrup_core::PackageId;
 
 pub use discovery::{
     CliResourcePaths, DiscoveredPaths, DiscoveryConfig, DiscoveryReport, Named, ResourceOverrides,
-    ResourceRegistry, ResourceSet, discover,
+    ResourceRegistry, ResourceSet, discover, discover_append_system_prompt_file,
+    discover_system_prompt_file,
 };
 pub use error::{
     Collision, DiagnosticType, ResourceDiagnostic, ResourceError, ResourceKind, ResourceWarning,

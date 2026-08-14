@@ -22,6 +22,7 @@ use crate::api::compat::{
     clamp_openai_prompt_cache_key, mapped_effort_or, off_is_not_null, off_value_or,
     thinking_level_key,
 };
+use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use crate::api::openai_responses::{
     ConvertResponsesToolsOptions, convert_responses_messages, convert_responses_tools, decode_stream,
     provider_env_value,
@@ -142,13 +143,18 @@ impl ApiImpl for AzureOpenAiResponsesApi {
         };
 
         let deployment = resolve_deployment_name(model, env, azure);
+        // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP.
+        let params = match build_params(model, ctx, opts, &deployment) {
+            Ok(p) => p,
+            Err(e) => {
+                let e = ProviderError::from(e);
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
+                return;
+            }
+        };
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
-        let body = crate::stream::apply_on_payload(
-            opts,
-            model,
-            build_params(model, ctx, opts, &deployment),
-        )
-        .await;
+        let body = crate::stream::apply_on_payload(opts, model, params).await;
         let headers = build_headers(model, opts, &api_key);
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -360,12 +366,15 @@ fn resolve_request_url(
 /// `openai-responses` `buildParams`: the `model` field carries the resolved *deployment* name, the
 /// `prompt_cache_key` is set whenever a session id is present (no cache-retention gate), and there
 /// is no `prompt_cache_retention`.
+/// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws: `convertResponsesTools` rejects a
+/// `strict: "require"` tool on a route without strict mode (`constrained-sampling.ts:91-95`
+/// @v0.83.0). PROV-011.
 pub(crate) fn build_params(
     model: &Model,
     ctx: &Context,
     opts: &StreamOptions,
     deployment_name: &str,
-) -> Value {
+) -> Result<Value, ConstrainedSamplingError> {
     // Azure gets NO deferred-tool loading: Pi's `azure-openai-responses.ts:280` calls
     // `convertResponsesMessages` with options that omit `deferredTools` and never imports
     // `splitDeferredTools`, so no `tool_search_call`/`tool_search_output` pair can ever be emitted
@@ -381,7 +390,8 @@ pub(crate) fn build_params(
             .unwrap_or(true),
         default_strict: Some(false),
     };
-    let messages = convert_responses_messages(model, ctx, AZURE_TOOL_CALL_PROVIDERS, &[], tool_options);
+    let messages =
+        convert_responses_messages(model, ctx, AZURE_TOOL_CALL_PROVIDERS, &[], tool_options)?;
 
     let mut obj = Map::new();
     obj.insert("model".to_string(), json!(deployment_name));
@@ -413,7 +423,7 @@ pub(crate) fn build_params(
     if !ctx.tools.is_empty() {
         obj.insert(
             "tools".to_string(),
-            Value::Array(convert_responses_tools(&ctx.tools, tool_options)),
+            Value::Array(convert_responses_tools(&ctx.tools, tool_options)?),
         );
     }
 
@@ -439,7 +449,7 @@ pub(crate) fn build_params(
         }
     }
 
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 /// Build the request headers (Pi `createClient`, azure-openai-responses.ts:282-308): the AzureOpenAI
@@ -633,7 +643,7 @@ mod tests {
             max_tokens: Some(128),
             ..Default::default()
         };
-        let body = build_params(&m, &ctx, &opts, "my-deployment");
+        let body = build_params(&m, &ctx, &opts, "my-deployment").unwrap();
         assert_eq!(
             body.get("model").and_then(Value::as_str),
             Some("my-deployment")
@@ -663,7 +673,7 @@ mod tests {
             reasoning: ModelThinkingLevel::High,
             ..Default::default()
         };
-        let body = build_params(&m, &Context::default(), &opts, "o5");
+        let body = build_params(&m, &Context::default(), &opts, "o5").unwrap();
         let reasoning = body.get("reasoning").expect("reasoning");
         assert_eq!(
             reasoning.get("effort").and_then(Value::as_str),
@@ -705,11 +715,13 @@ mod tests {
                 name: "base_tool".into(),
                 description: "The base_tool tool".into(),
                 parameters: json!({ "type": "object" }),
+                constrained_sampling: None,
             },
             crate::context::ToolDef {
                 name: "late_tool".into(),
                 description: "The late_tool tool".into(),
                 parameters: json!({ "type": "object" }),
+                constrained_sampling: None,
             },
         ];
         let ctx = Context {
@@ -749,7 +761,7 @@ mod tests {
             tools,
         };
 
-        let body = build_params(&m, &ctx, &StreamOptions::default(), "dep");
+        let body = build_params(&m, &ctx, &StreamOptions::default(), "dep").unwrap();
         let names: Vec<&str> = body["tools"]
             .as_array()
             .expect("tools")

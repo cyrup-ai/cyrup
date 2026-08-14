@@ -74,6 +74,71 @@ the embedder SDK (`cyrup/crates/cyrup-sdk/`), measured against
 > Static analysis only: nothing was built, run or tested, and no Rust or TypeScript source was
 > modified.
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 08 — recount: 45 rows → 8 open (0 critical · 1 high · 3 medium · 4 low).** The header's
+> "43 items — 0 critical, 8 high" is stale: **every one of the area's nine high rows is closed except
+> `SEAM-061`.** Four (`SEAM-047`, `SEAM-051`, `SEAM-064`, `SEAM-072`) were already fixed and only
+> their severity cells were stale; `SEAM-065`, `SEAM-063`, `SEAM-062` closed in sweep 1; and
+> **`SEAM-075` was REFUTED — the area's newest high never existed at HEAD.**
+>
+> **Three items closed by refutation, all of them things this file asserted about its own crate:**
+> `SEAM-075` (`resolve_model` already returns `Option<Model>` + a fallback message, and `main.rs:643`
+> carries an explicit "this arm deliberately has NO modelless hard stop" comment), `SEAM-059`
+> (`spawn_abort_on_signal` already takes the runtime and dereferences the CURRENT session), and
+> `SEAM-008` (143/129 already live on the FIRST delivery, pinned by a test). Area 08 also refuted five
+> items *other areas* had handed it — `SESS-041`, `SESS-042`, `SESS-044`, `TOOL-031` and `CFG-035`
+> were all already done in this crate.
+>
+> **`SEAM-061` is the backlog's only remaining high and it must not be split again.** The loader half
+> is area 08's; the cyrup-tui half is still absent at HEAD (`keymap.rs:888-909` has no `ToggleScope`,
+> so Tab is inert while `session_selector.rs:674` advertises it). Two sweeps have now split it across
+> areas 07 and 08 and neither took it. **Assign it to one agent holding both crates.**
+>
+> **`SEAM-073`'s mechanism claim is CORRECTED, which is the whole reason it was rated worth an ID.**
+> It asserts "direct evidence that some session-svc task still runs after the session and its whole
+> agent directory are gone". There is no such task: the only models-store access in this crate is
+> `SessionBuilder::load_persisted_catalog_overlay` (`builder.rs:528-545`), awaited inline by its
+> single caller at `builder.rs:1021`, and none of the crate's six `tokio::spawn` sites touch the
+> store. **Re-scope half (b) away from this crate before anyone hunts here.**
+>
+> **`SEAM-020` is re-rated medium → low** and narrowed to the `--help` half. That half is one line at
+> `main.rs:215` blocked on a startup reorder: pi's extension flag set comes off
+> `resourceLoader.getExtensions()` and pi's help exit is strictly AFTER `createAgentSessionRuntime`
+> (main.ts:793-810) — which in pi also means `--help` resolves project trust first. That user-visible
+> consequence is why two sweeps declined to do it blind under the no-run rule.
+>
+> **ONE CHANGE NOBODY ASKED FOR, disclosed rather than buried:** `print_timings()` was moved BELOW the
+> stdin-read / prompt-assembly block in the interactive and print/json arms of `main.rs`. It is a
+> stderr diagnostic and pi prints at exactly that position (main.ts:899/:902), but it is a behaviour
+> change beyond the marks `AGENT-027` asked for — and without it, seven of the eight new marks would
+> have been recorded and never printed.
+
+
 ## Status since prior analyses
 
 | ID | Status | Note |
@@ -156,53 +221,55 @@ This is the **complete** open set for area 08 — one table, deliberately. The `
 2026-08-12 pass starting its new ids at `SEAM-047`. See the repair-pass note in the header block for
 the check that establishes it. Do not "recover" them.
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 1 high, 3 medium, 4 low = 8** (`SEAM-058` remains under `## Trackers` and is not counted). 35 rows are now marked CLOSED. `SEAM-020` is re-rated medium → low with the reason in its row.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| SEAM-075 | **high** | parity-bug (regression) | M | **NEW 2026-08-13** — a credential-less INTERACTIVE launch hard-errors where pi opens the TUI so `/login` can be typed |
-| SEAM-051 | high | upstream-drift | S | **FIXED 2026-08-13** — `--tui-mode` rejected with exit 1 — the DEFAULT value makes the binary refuse to start |
-| SEAM-047 | high | parity-bug | M | **FIXED 2026-08-13** — First SIGTERM/SIGHUP neither tears down nor exits 143/129 — `--mode rpc` never returns |
-| SEAM-065 | high | parity-bug | M | Trust resolved pre-launch, inverting pi's tier order — the extension `project_trust` hook is skipped |
-| SEAM-064 | high | parity-bug | S | **FIXED 2026-08-13** — Pre-launch trust prompt omits both "(this session only)" options — every answer is persisted |
-| SEAM-063 | high | parity-bug | M | Session delete permanently unlinks where pi routes through `trash`; the failure is swallowed |
-| SEAM-061 | high | parity-bug | M | `--resume` picker lists every project's sessions under "Current Folder" with a dead `tab scope` toggle |
-| SEAM-062 | high | parity-bug | S | Pre-launch rename is accepted, echoed on screen, and silently discarded |
-| SEAM-006 | medium | not-ported | S | print/json `bind_extensions` passes no `onError` sink and no mode label |
-| SEAM-008 | medium | not-ported | S | Signal identity and 143/129 are computed but used only on the second delivery |
-| SEAM-011 | medium | parity-bug | M | setWidget goes on the wire with a cyrup-invented `{widget}` blob |
-| SEAM-012 | medium | not-ported | M | `session_before_switch` carries no reason, `session_before_fork` no position |
-| SEAM-014 | medium | not-ported | S | RPC verb `get_available_thinking_levels` not implemented |
-| SEAM-015 | medium | not-ported | M | RPC bash ignores the `operations` backend override |
-| SEAM-016 | medium | parity-bug | S | print-mode exit code derived by reverse-scanning the transcript |
-| SEAM-025 | medium | not-ported | M | Extension `session_start`/`session_shutdown` drop pi's session-file fields |
-| SEAM-027 | medium | parity-bug | M | `--mode json` subscribes per-run, dropping between-prompt events |
-| SEAM-033 | medium | parity-bug | M | RPC/interactive `session_start` still precedes `--name` and `--models` |
-| SEAM-048 | medium | parity-bug | S | `get_commands` enumerates a last-wins map; pi's `name:N` disambiguation is dead code |
-| SEAM-049 | medium | parity-bug | S | Fork before the first message drops pi's `parentSession` link |
-| SEAM-050 | medium | upstream-drift | M | `cyrup auth check` and the v0.84.1 auth-command surface unported |
-| SEAM-059 | medium | parity-bug | S | Signal watcher holds the startup session `Arc` and aborts a disposed session after any replacement |
-| SEAM-S03 | medium | not-ported | M | No detached-child registry: `setsid`-detached bash children survive teardown |
-| SEAM-020 | medium | parity-bug | M | `--list-models` prints the whole compiled catalog, not the auth-configured one; `--help` omits extension flags |
-| SEAM-066 | medium | parity-bug | M | Every pre-launch TUI surface hardwires the dark palette, ignoring `settings.theme` |
-| SEAM-067 | medium | not-ported | S | Pre-launch selectors never load `keybindings.json`, and their hint rows name the wrong keys |
-| SEAM-068 | medium | parity-bug | S | `--list-models <search>` uses a lossy hand-rolled fuzzy filter; the faithful port sits unused |
+| ~~SEAM-075~~ | ~~**high**~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug (regression) | M | **NEW 2026-08-13** — a credential-less INTERACTIVE launch hard-errors where pi opens the TUI so `/login` can be typed — **REFUTED, CLOSED 2026-08-14**: sweep 1 + 2 — **REFUTED at HEAD; the area's newest `high` no longer exists.** `resolve_model` returns `ResolvedModel = (Option<Model>, Option<ModelRef>, ModelThinkingLevel, Option<String>)` with the empty-catalog branch assigning `fallback = Some(format_no_models_available_message())` (builder.rs:1784) instead of `Err`, and the doc at builder.rs:1690-1706 cites SEAM-075 by name. main.rs:643 carries an explicit `SEAM-075: this arm deliberately has NO modelless hard stop` comment on the interactive arm, while the rpc (:847) and print/json (:973) arms both `return no_models_available()`. **The closure rests on the code path, not on a terminal — the item's Verify live-run is still UNPERFORMED.** |
+| ~~SEAM-051~~ | ~~high~~ **CLOSED 2026-08-14** | upstream-drift | S | **FIXED 2026-08-13** — `--tui-mode` rejected with exit 1 — the DEFAULT value makes the binary refuse to start — **CLOSED 2026-08-14**: closed pre-sweep (2026-08-13) — `--tui-mode` is parsed instead of rejected with exit 1. Closes DRIFT-022's flag half. |
+| ~~SEAM-047~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | M | **FIXED 2026-08-13** — First SIGTERM/SIGHUP neither tears down nor exits 143/129 — `--mode rpc` never returns — **CLOSED 2026-08-14**: closed pre-sweep (2026-08-13) — first SIGTERM/SIGHUP now tears down and exits 143/129; SEAM-008 and SEAM-059 both landed on its back. |
+| ~~SEAM-065~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | M | Trust resolved pre-launch, inverting pi's tier order — the extension `project_trust` hook is skipped — **CLOSED 2026-08-14**: sweep 1 — the Fix's own prediction held: the builder's `saved: None` and its "no trust store is wired" warning are both retired, and the extension `remember` verdict now really persists. |
+| ~~SEAM-064~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | S | **FIXED 2026-08-13** — Pre-launch trust prompt omits both "(this session only)" options — every answer is persisted — **CLOSED 2026-08-14**: closed pre-sweep (2026-08-13) — the pre-launch trust prompt now carries both "(this session only)" options; the one-character `includeSessionOnly: true` fix. |
+| ~~SEAM-063~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | M | Session delete permanently unlinks where pi routes through `trash`; the failure is swallowed — **CLOSED 2026-08-14**: sweep 1 — with a stated residual: the pre-launch status lines print AFTER teardown, not in the picker header with pi's 2 s/3 s dwell, because `cyrup_tui::SessionSelector` has no status channel (area 07). The live run in the Verify block is still owed. |
+| SEAM-061 | high | parity-bug | M | `--resume` picker lists every project's sessions under "Current Folder" with a dead `tab scope` toggle — **2026-08-14, still open**: sweep 2 — **the area's only remaining `high`, and it needs one agent holding BOTH crates.** The loader half is area 08's; the cyrup-tui half is still absent at HEAD — `crates/cyrup-tui/src/keymap.rs:888-909` has ToggleSort/ToggleNamedFilter/Delete/TogglePath/Rename and NO `ToggleScope`, so Tab is still inert and the `tab scope` hint (session_selector.rs:674) still names a dead control. The blocking evidence has NARROWED: `SessionScope`, `SessionSelector::set_scope` and `scope()` now exist (session_selector.rs:54, :250, :255), so only the action + handler + `show_path`-follows-scope wiring is missing. **Two sweeps have split this across areas 07 and 08 and neither took it.** |
+| ~~SEAM-062~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | S | Pre-launch rename is accepted, echoed on screen, and silently discarded — **CLOSED 2026-08-14**: sweep 1 — via the item's "preferred full fix" route (rename now persists) rather than the parity route (disable rename), because `set_rename_enabled` is cyrup-tui's file. If strict parity is wanted instead, it is one setter in area 07 plus deleting the `Rename` arm here. |
+| ~~SEAM-006~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | print/json `bind_extensions` passes no `onError` sink and no mode label — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-008~~ | ~~medium~~ **CLOSED 2026-08-14 — REFUTED** | not-ported | S | Signal identity and 143/129 are computed but used only on the second delivery — **REFUTED, CLOSED 2026-08-14**: sweep 1 + 2 — **REFUTED as tabled: nothing remains of the filed defect.** `first_delivery_exit_code` (signals.rs:149-154) hands 143/129 to the FIRST delivery in every non-interactive host and `spawn_abort_on_signal` exits with it at :214-217, pinned by `first_sigterm_and_sighup_exit_non_interactive_hosts`. The only residue is the SIGINT `CYRUP-DELTA` already documented at signals.rs:94-100 (pi registers no SIGINT handler at all; tokio's `ctrl_c()` future cannot decline to intercept) — a stated divergence with a stated cause, not an open item. |
+| ~~SEAM-011~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | setWidget goes on the wire with a cyrup-invented `{widget}` blob — **CLOSED 2026-08-14**: sweep 2 — the consumer halves of EXT-047, landed against the same signature area 06 derived independently. (1) `cyrup-session-svc/src/host_services.rs`: `HostServices::set_widget` now takes `(&str, Option<&[String]>, WidgetPlacement)` and builds the front-end `UiEffect::SetWidget` carrier under pi's own key names, with `lines: null` preserved as pi's remove-this-key. (2) `cyrup-modes/src/rpc.rs`: the wire emission is pi's union member — `widgetKey` always, `widgetLines` only when present (ABSENT, never null, for a removal), `widgetPlacement` only when `belowEditor`. One `[CYRUP-DELTA]`: `WidgetPlacement` has no unset state after the WIT resolves pi's `aboveEditor` default, so the default is emitted as an ABSENT key — which is what pi's `options?.placement` produces for every extension that does not set one. **FOR THE ORCHESTRATOR: `UiEffect::SetWidget { widget: Value }` was deliberately KEPT as the front-end carrier (populated under pi's key names) rather than split into typed fields, so `crates/cyrup-tui` keeps compiling while area 07 is editing it. Splitting it later is a scheduled cross-crate break, not an oversight.** |
+| ~~SEAM-012~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | `session_before_switch` carries no reason, `session_before_fork` no position — **CLOSED 2026-08-14**: sweep 1 — the WIT half arrived from area 06 mid-pass and the emit half is populated; the body saying both hooks are lossy is superseded. |
+| ~~SEAM-014~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | RPC verb `get_available_thinking_levels` not implemented — **CLOSED 2026-08-14**: sweep 1. |
+| SEAM-015 | medium | not-ported | M | RPC bash ignores the `operations` backend override — **2026-08-14, still open**: sweep 1 + 2 — Fix CORRECTED: the blocker is NOT `BashOptions`' shape, it is that a WASM guest has no way to return a callable `operations` backend across the WIT boundary. Its sibling DRIFT-004 needs a `BashOperations` trait in cyrup-tools before the session-svc/cyrup-modes ends are useful. Re-scope as an extension-capability item for area 06 before scheduling. `rpc.rs:1232` still passes a literal `None`. |
+| ~~SEAM-016~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | print-mode exit code derived by reverse-scanning the transcript — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-025~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | Extension `session_start`/`session_shutdown` drop pi's session-file fields — **CLOSED 2026-08-14**: sweep 1 — the WIT/event widening arrived from area 06 mid-pass and the host halves (`emit_session_start`, `dispose_with`'s new target parameter, `install_inner`) are done. |
+| ~~SEAM-027~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | `--mode json` subscribes per-run, dropping between-prompt events — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-033~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | RPC/interactive `session_start` still precedes `--name` and `--models` — **CLOSED 2026-08-14**: sweep 1. |
+| SEAM-048 | medium — **PARTIALLY CLOSED 2026-08-14** | parity-bug | S | `get_commands` enumerates a last-wins map; pi's `name:N` disambiguation is dead code — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the catalog + wasm command dispatcher use `resolved_commands`/`resolved_command_owner`; the Fix's `command_descriptions()`/`command_names()` rewrite is NOT what shipped — the caller was switched instead, which is less invasive. **RESIDUAL: the two `facade.rs` dispatch sites (area 06).** |
+| ~~SEAM-049~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Fork before the first message drops pi's `parentSession` link — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-050~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | M | `cyrup auth check` and the v0.84.1 auth-command surface unported — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-059~~ | ~~medium~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug | S | Signal watcher holds the startup session `Arc` and aborts a disposed session after any replacement — **REFUTED, CLOSED 2026-08-14**: sweep 1 + 2 — **REFUTED / verified fixed at HEAD.** `spawn_abort_on_signal(runtime: Arc<AgentSessionRuntime>, …)` dereferences the CURRENT session (`runtime.session().await.abort()`, signals.rs:182-211) with an in-source SEAM-059 citation block; all three call sites pass the runtime. It landed with SEAM-047, exactly as the item predicted. |
+| SEAM-S03 | medium | not-ported | M | No detached-child registry: `setsid`-detached bash children survive teardown — **2026-08-14, still open**: sweep 1 + 2 — `crates/cyrup/src/signals.rs:24-64` documents the exact residual and why it cannot land in the bin: pi's two tracking call sites are the spawn and its `finally` INSIDE the bash tool, which in cyrup is `cyrup-tools` — a crate `cyrup` depends on, so a registry living in the bin could never be written to. The drain point in `spawn_abort_on_signal` now exists (SEAM-047 created it); only the cyrup-tools half is owed. |
+| SEAM-020 | ~~medium~~ low — **PARTIALLY CLOSED 2026-08-14** | parity-bug | M | `--list-models` prints the whole compiled catalog, not the auth-configured one; `--help` omits extension flags — **PARTIALLY CLOSED 2026-08-14**: sweep 1 + 2 — the `--list-models` half is DONE (main.rs:398-407 builds the `has_configured_auth` closure and calls `cyrup::provider::available_models`, so the empty branch and its `formatNoModelsAvailableMessage()` guidance are reachable). **RESIDUAL: the `--help` half only, and it is RE-RATED medium → low.** It is one line at main.rs:215 (`render_help(&[])`) blocked on a startup reorder: pi's extension flag set comes off `resourceLoader.getExtensions()` and pi's help exit is strictly AFTER `createAgentSessionRuntime` (main.ts:793-810) — which in pi also means `--help` resolves project trust first. That user-visible consequence is why two sweeps declined to do it blind under the no-run rule. |
+| ~~SEAM-066~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | Every pre-launch TUI surface hardwires the dark palette, ignoring `settings.theme` — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-067~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | Pre-launch selectors never load `keybindings.json`, and their hint rows name the wrong keys — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-068~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `--list-models <search>` uses a lossy hand-rolled fuzzy filter; the faithful port sits unused — **CLOSED 2026-08-14**: sweep 1. |
 | ~~SEAM-071~~ | ~~medium~~ | parity-bug | S | **FIXED 2026-08-13** — `--no-extensions` now gates the AMBIENT natives, the package tier and the pre-trust vote; pi's inline-factory tier is correctly left alone; **live broker-count verification NOW DONE** (see the item) |
 | ~~SEAM-074~~ | ~~low~~ → medium | cyrup-original | S | **FIXED 2026-08-13** — the four shipped built-ins now answer `NativeExtension::is_ambient()`; `AMBIENT_NATIVE_IDS` deleted. Not cosmetic after all: the id list was dropping a hand-injected `FailingExt { id: "subagents" }` and turned `build_containment_and_flag_diagnostics` RED |
-| SEAM-072 | high | parity-bug | S | `build_inputs` owned fd 0 instead of taking `stdinContent` — indefinite hang on an inherited pipe — **fixed this pass** |
-| SEAM-073 | low | cyrup-original | S | 14 temp dirs leaked per session-svc run; `FileLock` never deletes its lock file |
-| SEAM-017 | low | not-ported | M | No `RpcClient` counterpart |
-| SEAM-028 | low | test-defect | S | `modes.rs` setWidget case pins SEAM-011's invented wire field |
-| SEAM-029 | low | stale-port | S | `ThinkingArg` doc comment claims the leniency path is unreachable |
-| SEAM-030 | low | test-defect | S | RPC tests assert wall-clock/scheduling outcomes they cannot control |
-| SEAM-034 | low | parity-bug | S | `CompactionResult` drops pi's `usage` field |
-| SEAM-052 | low | parity-bug | S | `--version` prints a program name and pre-empts the diagnostics gate |
-| SEAM-053 | low | parity-bug | S | Optional RPC fields emitted as explicit `null` where pi omits the key |
-| SEAM-054 | low | parity-bug | S | Blank stdin line dropped instead of answered with pi's `parse` error |
-| SEAM-055 | low | parity-bug | S | Extension commands advertised with an empty-path `sourceInfo` |
-| SEAM-056 | low | not-ported | S | pi's "session has not been saved yet" fork/clone guard absent |
-| SEAM-057 | low | cyrup-original | S | `--json`/`--rpc`/`--output-format` occupy the extension-flag namespace |
-| SEAM-060 | low | parity-bug | S | `get_tree` drops pi's `labelTimestamp` |
-| SEAM-069 | low | parity-bug | S | Trust prompt's saved-decision line never distinguishes an inherited ancestor decision |
-| SEAM-070 | low | not-ported | S | `process.title` role suffix unported — rpc and subagent children are indistinguishable in `ps` |
+| ~~SEAM-072~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | S | `build_inputs` owned fd 0 instead of taking `stdinContent` — indefinite hang on an inherited pipe — **fixed this pass** — **CLOSED 2026-08-14**: closed pre-sweep — `build_inputs` no longer owns fd 0; the stdin read moved to `main.rs`, matching main.ts:819-832. |
+| SEAM-073 | low | cyrup-original | S | 14 temp dirs leaked per session-svc run; `FileLock` never deletes its lock file — **2026-08-14, still open**: sweep 2 — **mechanism claim CORRECTED, which is the whole reason it was rated worth an ID.** It asserts "direct evidence that some session-svc task still runs after the session and its whole agent directory are gone". There is no such task: the ONLY models-store access in crates/cyrup-session-svc is `SessionBuilder::load_persisted_catalog_overlay` (builder.rs:528-545), awaited inline by its single caller at builder.rs:1021, and none of the crate's six `tokio::spawn` sites touch the store. **Re-scope half (b) away from this crate before anyone hunts here; half (a) is `crates/cyrup-config/src/lock.rs` — area 05.** |
+| SEAM-017 | low | not-ported | M | No `RpcClient` counterpart — **2026-08-14, still open**: sweep 2 — not started; `rpc-client.ts` is 600 lines at v0.83.0 and a faithful port is a subprocess-spawning client plus id-correlated request/response plus a typed event stream, then a retrofit of the whole `modes.rs` suite onto it. |
+| ~~SEAM-028~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | `modes.rs` setWidget case pins SEAM-011's invented wire field — **CLOSED 2026-08-14**: sweep 1 + 2 — the `#[ignore]` on `set_widget_carries_pis_three_fields_and_no_widget_blob` is removed and the inline case in the effect sequence asserts pi's member on BOTH a set and a remove, including that a removal OMITS `widgetLines` rather than sending null (SEAM-053's rule) and that a non-default placement IS emitted. No assertion was weakened — the old case asserted only `method`. |
+| ~~SEAM-029~~ | ~~low~~ **CLOSED 2026-08-14** | stale-port | S | `ThinkingArg` doc comment claims the leniency path is unreachable — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-030~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | RPC tests assert wall-clock/scheduling outcomes they cannot control — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-034~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `CompactionResult` drops pi's `usage` field — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-052~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `--version` prints a program name and pre-empts the diagnostics gate — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-053~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Optional RPC fields emitted as explicit `null` where pi omits the key — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-054~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Blank stdin line dropped instead of answered with pi's `parse` error — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-055~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Extension commands advertised with an empty-path `sourceInfo` — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-056~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | pi's "session has not been saved yet" fork/clone guard absent — **CLOSED 2026-08-14**: sweep 1. |
+| SEAM-057 | low — **PARTIALLY CLOSED 2026-08-14** | cyrup-original | S | `--json`/`--rpc`/`--output-format` occupy the extension-flag namespace — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — documented in-tree and listed in `render_help`. **RESIDUAL: the reserved-namespace half needs an OWNER DECISION, not an implementation — deleting `--json`/`--rpc`/`--output-format` breaks `cyrup-it`'s `--rpc` fixture. Not taken unilaterally in either sweep.** |
+| ~~SEAM-060~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `get_tree` drops pi's `labelTimestamp` — **CLOSED 2026-08-14**: sweep 1 — `cyrup_session::manager::TreeNode` gained `label_timestamp` from area 03 during the same pass, so the "the underlying TreeNode needs the field first" precondition is satisfied and `tree_json` now emits it. |
+| ~~SEAM-069~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Trust prompt's saved-decision line never distinguishes an inherited ancestor decision — **CLOSED 2026-08-14**: sweep 1. |
+| ~~SEAM-070~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `process.title` role suffix unported — rpc and subagent children are indistinguishable in `ps` — **CLOSED 2026-08-14**: sweep 1. |
 
 **43 items — 0 critical, 8 high, 20 medium, 15 low.** (SEAM-071, SEAM-072 and SEAM-073 were added by
 the later suite-verification pass, SEAM-072 closed on arrival; the 40/7/19/14 counts below predate

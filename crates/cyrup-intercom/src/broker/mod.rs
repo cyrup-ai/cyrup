@@ -30,8 +30,9 @@ use crate::config;
 use crate::paths;
 use crate::transport::framing::{FrameReader, encode_json};
 use crate::transport::protocol::{
-    BrokerMessage, ExtensionCapability, HealthMessage, Message, MessageReceipt, PROTOCOL_NAME,
-    PROTOCOL_VERSION, SessionInfo, SessionRegistration, now_ms,
+    BrokerMessage, ExtensionCapability, HealthMessage, Message, MessageControl,
+    MessageControlAction, MessageReceipt, PROTOCOL_NAME, PROTOCOL_VERSION, SessionInfo,
+    SessionRegistration, now_ms,
 };
 use ratelimit::TokenBucket;
 use routing::{AskEdge, find_session_ids};
@@ -46,6 +47,14 @@ const REGISTRATION_TIMEOUT_MS: u64 = 1000;
 const PRESENCE_HEARTBEAT_MS: u64 = 1000;
 /// Auto-shutdown delay after the last session leaves (`broker.ts:295`, 5000ms).
 const SHUTDOWN_DELAY_MS: u64 = 5000;
+/// `MESSAGE_RECEIPT_ROUTE_RETENTION_MS = 60 * 60 * 1000` (`v0.10.1 broker/broker.ts:39`).
+const MESSAGE_RECEIPT_ROUTE_RETENTION_MS: u64 = 60 * 60 * 1000;
+/// `DISCONNECTED_SESSION_RETENTION_MS = 24 * 60 * 60 * 1000` (`v0.10.1 broker/broker.ts:40`).
+const DISCONNECTED_SESSION_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// `MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000` (`v0.10.1 broker/broker.ts:41`).
+const MAILBOX_MESSAGE_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// `MAX_MAILBOX_MESSAGES = 256` (`v0.10.1 broker/broker.ts:42`).
+const MAX_MAILBOX_MESSAGES: usize = 256;
 /// Reader read-buffer size (implementation detail; framing reassembles across chunk boundaries).
 const READ_BUF: usize = 16 * 1024;
 /// `MAX_EXTENSIONS_PER_SESSION = 32` (`v0.9.2 broker/broker.ts:35`).
@@ -163,6 +172,16 @@ fn js_number_to_string(n: &serde_json::Number) -> String {
     }
 }
 
+/// `info.runtimeFallbackAlias` read as a JS **truthiness** test, the way the mailbox identity guard
+/// reads it (`v0.10.1 broker/broker.ts:1041`, `:1045`).
+///
+/// `undefined` and `false` are both falsy upstream, so an explicit `runtimeFallbackAlias: false` —
+/// which cyrup's own presence path can send (`transport/protocol.rs:727`) — must NOT disqualify a
+/// session from owning its mailbox identity. `Option::is_some` would.
+const fn js_truthy_alias(alias: Option<bool>) -> bool {
+    matches!(alias, Some(true))
+}
+
 /// One registered session + a handle to write to its socket (`broker.ts:32-36`).
 struct ConnectedSession {
     conn_id: u64,
@@ -178,6 +197,33 @@ struct ConnHandle {
     close: Arc<Notify>,
 }
 
+/// `interface DisconnectedSession` (`v0.10.1 broker/broker.ts:85-88`) — the last-known
+/// [`SessionInfo`] of a session that has left, kept for
+/// [`DISCONNECTED_SESSION_RETENTION_MS`] so a `send` naming it can still be routed to its mailbox.
+struct DisconnectedSession {
+    info: SessionInfo,
+    disconnected_at: u64,
+}
+
+/// `interface MailboxMessage` (`v0.10.1 broker/broker.ts:90-95`) — one message parked for a
+/// disconnected target, redelivered by [`BrokerState::flush_mailbox_for_session`] when that
+/// identity registers again.
+struct MailboxMessage {
+    from: SessionInfo,
+    target: SessionInfo,
+    message: Message,
+    queued_at: u64,
+}
+
+/// `interface MessageReceiptRoute` (`v0.10.1 broker/broker.ts:80-84`) — where a delivered message
+/// went, so a receipt from the receiver can be forwarded back to its original sender and so the
+/// sender can `cancel`/`supersede` it.
+struct MessageReceiptRoute {
+    from: String,
+    to: String,
+    created_at: u64,
+}
+
 /// The broker's in-memory routing state (`broker.ts:132-139`). Held behind a `std::sync::Mutex`;
 /// every handler is synchronous and never holds the guard across an `.await`.
 struct BrokerState {
@@ -189,6 +235,21 @@ struct BrokerState {
     /// the way `unregistered` already tracks connection insertion order below.
     session_order: Vec<String>,
     ask_edges: HashMap<String, AskEdge>,
+    /// `messageReceiptRoutes` (`v0.10.1 broker/broker.ts:100`), keyed by message id.
+    message_receipt_routes: HashMap<String, MessageReceiptRoute>,
+    /// `disconnectedSessions` (`v0.10.1 broker/broker.ts:101`), keyed by session id.
+    ///
+    /// pi holds this in a JS `Map`, whose iteration order is insertion order; a `HashMap`'s is
+    /// arbitrary. That is immaterial HERE, unlike [`BrokerState::session_order`]: the only consumer
+    /// is `findDisconnectedSessions` (`:1010-1024`) and every one of ITS consumers is gated on
+    /// `length === 1` or `length > 1` (`:596`, `:660`), so no branch can observe which element
+    /// came first. Same argument as `resolve_reply_target`'s (ICOM-001).
+    disconnected_sessions: HashMap<String, DisconnectedSession>,
+    /// `mailboxMessages` (`v0.10.1 broker/broker.ts:102`) — an ARRAY upstream, and the order is
+    /// load-bearing: [`BrokerState::queue_mailbox_message`] evicts from the FRONT at the cap
+    /// (`:892-898`, FIFO) and [`BrokerState::flush_mailbox_for_session`] redelivers front-to-back
+    /// (`:913`), so a peer receives its parked mail in the order it was sent.
+    mailbox_messages: Vec<MailboxMessage>,
     connections: HashMap<u64, ConnHandle>,
     /// Unregistered connection ids in insertion order (for oldest-eviction, `broker.ts:256-268`).
     unregistered: Vec<u64>,
@@ -259,6 +320,9 @@ impl BrokerState {
             sessions: HashMap::new(),
             session_order: Vec::new(),
             ask_edges: HashMap::new(),
+            message_receipt_routes: HashMap::new(),
+            disconnected_sessions: HashMap::new(),
+            mailbox_messages: Vec::new(),
             connections: HashMap::new(),
             unregistered: Vec::new(),
             ask_timeout_ms,
@@ -348,6 +412,224 @@ impl BrokerState {
         self.ask_edges.retain(|_, edge| now.saturating_sub(edge.created_at) <= timeout);
     }
 
+    /// `clearMessageReceiptRoutesForSession` (`v0.10.1 broker/broker.ts:979-985`).
+    fn clear_message_receipt_routes_for_session(&mut self, session_id: &str) {
+        self.message_receipt_routes
+            .retain(|_, route| route.from != session_id && route.to != session_id);
+    }
+
+    /// `pruneMessageReceiptRoutes` (`v0.10.1 broker/broker.ts:971-977`).
+    fn prune_message_receipt_routes(&mut self, now: u64) {
+        self.message_receipt_routes.retain(|_, route| {
+            now.saturating_sub(route.created_at) <= MESSAGE_RECEIPT_ROUTE_RETENTION_MS
+        });
+    }
+
+    /// `rememberDisconnectedSession` (`v0.10.1 broker/broker.ts:864-867`).
+    ///
+    /// pi stores a COPY (`{ ...info }`) because the live `ConnectedSession.info` it was read from
+    /// keeps being mutated by presence frames; the Rust `SessionInfo` is moved/cloned in, so the
+    /// same isolation is structural here.
+    fn remember_disconnected_session(&mut self, info: SessionInfo, now: u64) {
+        self.disconnected_sessions
+            .insert(info.id.clone(), DisconnectedSession { info, disconnected_at: now });
+        self.prune_disconnected_sessions(now);
+    }
+
+    /// `pruneDisconnectedSessions` (`v0.10.1 broker/broker.ts:869-875`).
+    fn prune_disconnected_sessions(&mut self, now: u64) {
+        self.disconnected_sessions.retain(|_, session| {
+            now.saturating_sub(session.disconnected_at) <= DISCONNECTED_SESSION_RETENTION_MS
+        });
+    }
+
+    /// `pruneMailboxMessages` (`v0.10.1 broker/broker.ts:877-888`).
+    ///
+    /// Dropping a parked ask must drop its ask edge too, or the sender's reply window stays open
+    /// against mail that no longer exists.
+    fn prune_mailbox_messages(&mut self, now: u64) {
+        let mut expired: Vec<(String, bool)> = Vec::new();
+        self.mailbox_messages.retain(|entry| {
+            if now.saturating_sub(entry.queued_at) > MAILBOX_MESSAGE_RETENTION_MS {
+                expired.push((entry.message.id.clone(), entry.message.expects_reply == Some(true)));
+                return false;
+            }
+            true
+        });
+        for (message_id, expects_reply) in expired {
+            if expects_reply {
+                self.ask_edges.remove(&message_id);
+            }
+            self.message_receipt_routes.remove(&message_id);
+        }
+    }
+
+    /// `queueMailboxMessage` (`v0.10.1 broker/broker.ts:890-906`).
+    ///
+    /// The `while (length >= MAX)` head-eviction is pi's, including that it drops the OLDEST entry
+    /// rather than refusing the new one, and that each eviction takes the same ask-edge and
+    /// receipt-route cleanup an expiry does.
+    fn queue_mailbox_message(
+        &mut self,
+        from: SessionInfo,
+        target: SessionInfo,
+        message: &Message,
+        broker_received_at: u64,
+    ) {
+        self.prune_mailbox_messages(broker_received_at);
+        while self.mailbox_messages.len() >= MAX_MAILBOX_MESSAGES {
+            let evicted = self.mailbox_messages.remove(0);
+            if evicted.message.expects_reply == Some(true) {
+                self.ask_edges.remove(&evicted.message.id);
+            }
+            self.message_receipt_routes.remove(&evicted.message.id);
+        }
+        // `{ ...message, brokerReceivedAt }` (`:903`): the parked envelope carries the time the
+        // BROKER accepted it, so a later flush can date the receipt route from it (`:948`).
+        let mut parked = message.clone();
+        parked.broker_received_at = Some(broker_received_at.into());
+        self.mailbox_messages.push(MailboxMessage {
+            from,
+            target,
+            message: parked,
+            queued_at: broker_received_at,
+        });
+    }
+
+    /// `findLiveSessionsSharingMailboxIdentity` (`v0.10.1 broker/broker.ts:1039-1048`), returning
+    /// ids because the caller needs `&mut self` afterwards. Upstream's own rationale, verbatim
+    /// (`:1029-1037`):
+    ///
+    /// ```text
+    /// Mailbox identity is an explicit name plus directory, never name alone. A
+    /// runtime fallback alias is derived from the session id rather than chosen as
+    /// a durable identity, so it must not transfer mail to another process. This
+    /// also prevents two unnamed UUIDv7 sessions started close together from
+    /// inheriting each other's mailbox through a shared short alias.
+    /// ```
+    ///
+    /// Both guards are JS **truthiness** tests, not presence tests: `!lowerName` rejects `""` as
+    /// well as `undefined`, and `info.runtimeFallbackAlias` is falsy when the flag is `false`.
+    /// [`js_truthy_alias`] and the `is_empty` filter reproduce that, so an empty name can never
+    /// become a mailbox identity every unnamed session shares.
+    fn find_live_sessions_sharing_mailbox_identity(&self, info: &SessionInfo) -> Vec<String> {
+        let Some(lower_name) =
+            info.name.as_deref().map(str::to_lowercase).filter(|n| !n.is_empty())
+        else {
+            return Vec::new();
+        };
+        if js_truthy_alias(info.runtime_fallback_alias) {
+            return Vec::new();
+        }
+        self.sessions_in_order()
+            .filter(|(_, s)| {
+                !js_truthy_alias(s.info.runtime_fallback_alias)
+                    && s.info.name.as_deref().map(str::to_lowercase).as_deref()
+                        == Some(lower_name.as_str())
+                    && crate::cwd::same_cwd(&s.info.cwd, &info.cwd)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// `findUniqueLiveSessionForDisconnectedSession` (`v0.10.1 broker/broker.ts:1022-1026`): the
+    /// sole live session sharing the disconnected target's mailbox identity, excluding the sender
+    /// (so a session that renamed itself onto a peer's identity cannot receive its own mail).
+    fn find_unique_live_session_for_disconnected_session(
+        &self,
+        info: &SessionInfo,
+        sender_id: &str,
+    ) -> Option<String> {
+        let matches: Vec<String> = self
+            .find_live_sessions_sharing_mailbox_identity(info)
+            .into_iter()
+            .filter(|id| id != sender_id)
+            .collect();
+        match matches.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
+    }
+
+    /// `findDisconnectedSessions` (`v0.10.1 broker/broker.ts:1010-1024`) — the same exact-id →
+    /// exact-name → id-prefix ladder `findSessions` uses, over the disconnected map.
+    fn find_disconnected_session_ids(&mut self, name_or_id: &str, now: u64) -> Vec<String> {
+        self.prune_disconnected_sessions(now);
+        let entries: Vec<(String, Option<String>)> = self
+            .disconnected_sessions
+            .values()
+            .map(|s| (s.info.id.clone(), s.info.name.clone()))
+            .collect();
+        find_session_ids(&entries, name_or_id)
+    }
+
+    /// `flushMailboxForSession` (`v0.10.1 broker/broker.ts:908-953`), called from `register` once
+    /// the joining session is in `this.sessions`.
+    ///
+    /// The three-way match is upstream's: by stored target **id**; or — only when this session is
+    /// the UNIQUE live holder of its mailbox identity — by target name+cwd; and never by an entry
+    /// this very identity SENT (`matchesSenderIdentity`), which is what stops a relaunched sender
+    /// from swallowing the mail it queued for a peer of the same name in the same directory.
+    fn flush_mailbox_for_session(&mut self, session_id: &str, now: u64) {
+        self.prune_mailbox_messages(now);
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        let info = session.info.clone();
+        let tx = session.tx.clone();
+        let session_name = info.name.as_deref().map(str::to_lowercase).filter(|n| !n.is_empty());
+        let unique_mailbox_identity =
+            self.find_live_sessions_sharing_mailbox_identity(&info).len() == 1;
+
+        let mut index = 0;
+        while index < self.mailbox_messages.len() {
+            let (matches_id, matches_unique_name) = {
+                let Some(entry) = self.mailbox_messages.get(index) else { break };
+                let matches_id = entry.target.id == info.id;
+                let matches_sender_identity = session_name.as_deref().is_some_and(|name| {
+                    entry.from.name.as_deref().map(str::to_lowercase).as_deref() == Some(name)
+                        && crate::cwd::same_cwd(&entry.from.cwd, &info.cwd)
+                });
+                let matches_unique_name = unique_mailbox_identity
+                    && session_name.as_deref().is_some_and(|name| {
+                        !matches_sender_identity
+                            && entry.target.name.as_deref().map(str::to_lowercase).as_deref()
+                                == Some(name)
+                            && crate::cwd::same_cwd(&entry.target.cwd, &info.cwd)
+                    });
+                (matches_id, matches_unique_name)
+            };
+            if !matches_id && !matches_unique_name {
+                index += 1;
+                continue;
+            }
+
+            let entry = self.mailbox_messages.remove(index);
+            // `edge.to = session.info.id` (`:936-939`): a parked ASK is re-pointed at the session
+            // that actually received it, so the reply the peer eventually sends still matches its
+            // edge. This is the one place an ask edge is MUTATED rather than created or dropped,
+            // and it is why a disconnect must NOT clear the edges (see `on_connection_closed`).
+            if let Some(edge) = self.ask_edges.get_mut(&entry.message.id)
+                && edge.to == entry.target.id
+            {
+                edge.to.clone_from(&info.id);
+            }
+            let mut delivered = entry.message.clone();
+            delivered.broker_delivered_at = Some(now_ms().into());
+            send_msg(&tx, &BrokerMessage::Message { from: entry.from.clone(), message: delivered });
+            self.message_receipt_routes.insert(entry.message.id.clone(), MessageReceiptRoute {
+                from: entry.from.id.clone(),
+                to: info.id.clone(),
+                created_at: entry
+                    .message
+                    .broker_received_at
+                    .as_ref()
+                    .and_then(serde_json::Number::as_u64)
+                    .unwrap_or(entry.queued_at),
+            });
+        }
+    }
+
     /// `Array.from(this.sessions.values()).map(s => s.info)` (`broker.ts:408`) — join-ordered,
     /// because pi's `Map` iterates in insertion order and neither `index.ts`'s `list` handler nor
     /// `ui/session-list.ts` re-sorts the reply.
@@ -355,17 +637,31 @@ impl BrokerState {
         self.sessions_in_order().map(|(_, s)| s.info.clone()).collect()
     }
 
-    /// Socket-close handler (`broker.ts:237-249`). Returns `true` if this owned session actually left
-    /// (so the caller schedules the auto-shutdown check). Guarded by `conn_id` equality so a
-    /// superseded socket cannot delete the replacement (pi `existing?.socket === socket`).
-    fn on_connection_closed(&mut self, conn_id: u64, session_id: &Option<String>) -> bool {
+    /// Socket-close handler (`v0.10.1 broker/broker.ts:210-224`). Returns `true` if this owned
+    /// session actually left (so the caller schedules the auto-shutdown check). Guarded by
+    /// `conn_id` equality so a superseded socket cannot delete the replacement
+    /// (pi `existing?.socket === socket`).
+    ///
+    /// **The departing session's ask edges are deliberately NOT cleared**, and that is upstream's
+    /// mechanism, not an omission: `clearAskEdgesForSession` has exactly one call site in
+    /// `broker.ts` — the register-time identity takeover at `:350` — at every tag from v0.9.2 to
+    /// v0.10.1. An edge toward a departed session is what `flushMailboxForSession` re-points at
+    /// `:936-939` when that identity comes back, so clearing it here would make every parked ask
+    /// undeliverable-as-a-reply ("Reply target does not match a pending ask") the moment the peer
+    /// reconnected. The edges instead expire on `pruneAskEdges`' `askTimeoutMs`, exactly as they do
+    /// for a live-but-silent peer.
+    fn on_connection_closed(&mut self, conn_id: u64, session_id: &Option<String>, now: u64) -> bool {
         self.connections.remove(&conn_id);
         self.remove_unregistered(conn_id);
         if let Some(sid) = session_id
             && self.sessions.get(sid).map(|s| s.conn_id) == Some(conn_id)
         {
+            if let Some(existing) = self.sessions.get(sid) {
+                let info = existing.info.clone();
+                self.remember_disconnected_session(info, now);
+            }
             self.remove_session(sid);
-            self.clear_ask_edges_for_session(sid);
+            self.clear_message_receipt_routes_for_session(sid);
             self.broadcast(&BrokerMessage::SessionLeft { session_id: sid.clone() }, Some(sid));
             return true;
         }
@@ -410,13 +706,13 @@ impl BrokerState {
 
         match ty {
             "register" => self.handle_register(conn_id, self_tx, value, session_id, now),
-            "unregister" => self.handle_unregister(conn_id, self_tx, session_id),
+            "unregister" => self.handle_unregister(conn_id, self_tx, session_id, now),
             "list" => self.handle_list(self_tx, value),
             "send" => self.handle_send(conn_id, self_tx, value, session_id, now),
             "cancel_ask" => self.handle_cancel_ask(conn_id, value, session_id),
             "presence" => self.handle_presence(conn_id, value, session_id, now),
-            "message_receipt" => Self::handle_message_receipt(value),
-            "cancel_message" => Self::handle_cancel_message(self_tx, value),
+            "message_receipt" => self.handle_message_receipt(conn_id, value, session_id, now),
+            "cancel_message" => self.handle_cancel_message(conn_id, self_tx, value, session_id, now),
             // Extension-bus frames (`v0.9.2 broker/broker.ts:551-585,961-969`). cyrup does not
             // implement the bus, so it never advertises `EXTENSION_BUS_FEATURE` on `registered` —
             // which is exactly what stops a conforming pi client from sending these
@@ -440,25 +736,45 @@ impl BrokerState {
         }
     }
 
-    /// `case "message_receipt"` (`v0.9.2 broker/broker.ts:801-820`).
+    /// `case "message_receipt"` (`v0.10.1 broker/broker.ts:676-696`).
     ///
     /// pi validates the receipt with `isMessageReceipt()` — a bad one THROWS, i.e. destroys the
     /// connection — then looks the message up in `messageReceiptRoutes` and forwards the receipt to
-    /// the original sender only if the route says this session was the receiver.
-    ///
-    /// cyrup has no `messageReceiptRoutes` table yet (it is populated at
-    /// `v0.9.2 broker/broker.ts:698`, alongside the message-lifecycle work this crate has not
-    /// ported), so every lookup misses and pi's own `route === undefined` branch applies: validate,
-    /// then fall through the `if` and `break` without writing anything. Shape validation is kept
-    /// because dropping it would make cyrup LOOSER than pi on a frame arriving over a socket other
-    /// sessions can reach.
-    fn handle_message_receipt(value: &serde_json::Value) -> FrameResult {
-        let Some(receipt) = value.get("receipt") else {
+    /// the original sender only if the route says this session was the receiver AND still owns this
+    /// socket. A miss on any of the three is a silent `break`, not an error frame.
+    fn handle_message_receipt(
+        &mut self,
+        conn_id: u64,
+        value: &serde_json::Value,
+        session_id: &Option<String>,
+        now: u64,
+    ) -> FrameResult {
+        let Some(current_id) = session_id.as_deref() else {
             return FrameResult::protocol_error();
         };
-        if serde_json::from_value::<MessageReceipt>(receipt.clone()).is_err() {
-            // `throw new Error("Invalid message_receipt message")` (`v0.9.2 broker/broker.ts:807`).
+        let Some(receipt_val) = value.get("receipt") else {
             return FrameResult::protocol_error();
+        };
+        let Ok(receipt) = serde_json::from_value::<MessageReceipt>(receipt_val.clone()) else {
+            // `throw new Error("Invalid message_receipt message")` (`v0.10.1 broker/broker.ts:681`).
+            return FrameResult::protocol_error();
+        };
+        self.prune_message_receipt_routes(now);
+        let route_from = self
+            .message_receipt_routes
+            .get(&receipt.message_id)
+            .filter(|route| route.to == current_id)
+            .map(|route| route.from.clone());
+        let receiver_info = self
+            .sessions
+            .get(current_id)
+            .filter(|s| s.conn_id == conn_id)
+            .map(|s| s.info.clone());
+        if let Some(from_id) = route_from
+            && let Some(from) = receiver_info
+            && let Some(sender) = self.sessions.get(&from_id)
+        {
+            send_msg(&sender.tx, &BrokerMessage::MessageReceipt { from, receipt });
         }
         FrameResult::cont()
     }
@@ -592,25 +908,84 @@ impl BrokerState {
         FrameResult::cont()
     }
 
-    /// `case "cancel_message"` (`v0.9.2 broker/broker.ts:822-869`).
+    /// `case "cancel_message"` (`v0.10.1 broker/broker.ts:698-745`).
     ///
-    /// A non-string `messageId` throws upstream (`:825-827`) and is fatal here for the same reason.
-    /// Past that, pi searches its mailbox and then `messageReceiptRoutes`; cyrup has neither table,
-    /// so both misses land on pi's `route?.from !== currentId` branch — `delivery_failed` with
-    /// pi's exact reason (`v0.9.2 broker/broker.ts:842-848`). Answering matters: pi's
-    /// `cancelMessage()` returns a promise settled only by `delivered`/`delivery_failed`
-    /// (`v0.9.2 broker/client.ts:738`), so a silent drop would hang the caller instead.
+    /// A non-string `messageId` throws upstream (`:701-703`) and is fatal here for the same reason.
+    /// Past that there are two cancellable states, in pi's order: a message still PARKED in the
+    /// mailbox (dropped in place, `:711-720`), and a message already DELIVERED whose receipt route
+    /// still names this sender (a `message_control{action:"cancel"}` to the receiver, `:731-743`).
+    /// Anything else is `delivery_failed` with pi's exact reason (`:735-741`).
+    ///
+    /// Answering matters: pi's `cancelMessage()` returns a promise settled only by
+    /// `delivered`/`delivery_failed` (`v0.9.2 broker/client.ts:738`), so a silent drop would hang
+    /// the caller instead.
     fn handle_cancel_message(
+        &mut self,
+        conn_id: u64,
         self_tx: &UnboundedSender<Vec<u8>>,
         value: &serde_json::Value,
+        session_id: &Option<String>,
+        now: u64,
     ) -> FrameResult {
-        let Some(message_id) = value.get("messageId").and_then(|v| v.as_str()) else {
+        let Some(current_id) = session_id.clone() else {
             return FrameResult::protocol_error();
         };
-        send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-            message_id: message_id.to_string(),
-            reason: "Message cannot be cancelled by this session".to_string(),
+        let Some(message_id) = value.get("messageId").and_then(|v| v.as_str()).map(str::to_string)
+        else {
+            return FrameResult::protocol_error();
+        };
+        self.prune_message_receipt_routes(now);
+        self.prune_mailbox_messages(now);
+        let sender_info = self
+            .sessions
+            .get(&current_id)
+            .filter(|s| s.conn_id == conn_id)
+            .map(|s| s.info.clone());
+
+        // The parked-mail arm (`:711-720`): the sender may withdraw its own queued message before
+        // the target ever comes back.
+        let queued_index = self
+            .mailbox_messages
+            .iter()
+            .position(|entry| entry.message.id == message_id && entry.from.id == current_id);
+        if let Some(index) = queued_index
+            && sender_info.is_some()
+        {
+            self.mailbox_messages.remove(index);
+            if self.ask_edges.get(&message_id).is_some_and(|edge| edge.from == current_id) {
+                self.ask_edges.remove(&message_id);
+            }
+            send_msg(self_tx, &BrokerMessage::Delivered { message_id });
+            return FrameResult::cont();
+        }
+
+        let route = self.message_receipt_routes.get(&message_id);
+        let receiver_tx = route
+            .filter(|route| route.from == current_id)
+            .and_then(|route| self.sessions.get(&route.to))
+            .map(|receiver| receiver.tx.clone());
+        let (Some(from), Some(receiver_tx)) = (sender_info, receiver_tx) else {
+            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                message_id,
+                reason: "Message cannot be cancelled by this session".to_string(),
+            });
+            return FrameResult::cont();
+        };
+        send_msg(&receiver_tx, &BrokerMessage::MessageControl {
+            from,
+            control: MessageControl {
+                message_id: message_id.clone(),
+                action: MessageControlAction::Cancel,
+                timestamp: now_ms().into(),
+                superseded_by: None,
+                detail: None,
+                extra: Default::default(),
+            },
         });
+        if self.ask_edges.get(&message_id).is_some_and(|edge| edge.from == current_id) {
+            self.ask_edges.remove(&message_id);
+        }
+        send_msg(self_tx, &BrokerMessage::Delivered { message_id });
         FrameResult::cont()
     }
 
@@ -654,6 +1029,11 @@ impl BrokerState {
             return FrameResult::protocol_error();
         }
 
+        // `pruneDisconnectedSessions(); pruneMailboxMessages();` in pi's own position — after the
+        // `extensions` guard, before the `MAX_SESSIONS` check (`v0.10.1 broker/broker.ts:340-341`).
+        self.prune_disconnected_sessions(now);
+        self.prune_mailbox_messages(now);
+
         let previous_conn = self.sessions.get(&id).map(|s| s.conn_id);
         if previous_conn.is_none() && self.sessions.len() >= MAX_SESSIONS {
             send_msg(self_tx, &BrokerMessage::Error {
@@ -662,8 +1042,11 @@ impl BrokerState {
             return FrameResult::close_self();
         }
         if previous_conn.is_some() {
-            // Identity takeover (broker.ts:359-362): clear the old edges + end the previous socket.
+            // Identity takeover (`v0.10.1 broker/broker.ts:348-352`): clear the old edges AND the
+            // old receipt routes, then end the previous socket. This is `clearAskEdgesForSession`'s
+            // ONLY call site upstream — see `on_connection_closed`.
             self.clear_ask_edges_for_session(&id);
+            self.clear_message_receipt_routes_for_session(&id);
             if let Some(prev_id) = previous_conn
                 && let Some(h) = self.connections.get(&prev_id)
             {
@@ -701,6 +1084,9 @@ impl BrokerState {
             tx: self_tx.clone(),
             last_presence_broadcast_at: now,
         });
+        // `this.disconnectedSessions.delete(id)` (`v0.10.1 broker/broker.ts:377`): this identity is
+        // live again, so it must no longer be a mailbox TARGET — only a mailbox recipient.
+        self.disconnected_sessions.remove(&id);
         // A register cancels any pending auto-shutdown (`v0.10.1 broker/broker.ts:378-381`):
         //   if (this.shutdownTimer) { clearTimeout(this.shutdownTimer); this.shutdownTimer = null; }
         // NULLING THE HANDLE is the load-bearing half — it is what lets a LATER disconnect arm a
@@ -714,6 +1100,11 @@ impl BrokerState {
 
         send_msg(self_tx, &BrokerMessage::Registered { session_id: id.clone(), features: None });
         self.broadcast(&BrokerMessage::SessionJoined { session: info }, Some(&id));
+        // `this.flushMailboxForSession(connectedSession)` (`v0.10.1 broker/broker.ts:392`), in pi's
+        // own position: AFTER `registered` and `session_joined`, so the client has already
+        // transitioned to connected and installed its message handler before its parked mail
+        // arrives on the same socket, in order.
+        self.flush_mailbox_for_session(&id, now);
         FrameResult::cont()
     }
 
@@ -722,14 +1113,22 @@ impl BrokerState {
         conn_id: u64,
         _self_tx: &UnboundedSender<Vec<u8>>,
         session_id: &mut Option<String>,
+        now: u64,
     ) -> FrameResult {
         let Some(sid) = session_id.clone() else {
             return FrameResult::protocol_error();
         };
         let mut schedule = false;
         if self.sessions.get(&sid).map(|s| s.conn_id) == Some(conn_id) {
+            // `case "unregister"` (`v0.10.1 broker/broker.ts:418-432`) is the socket-close body
+            // verbatim: remember the departing identity for its mailbox, drop its receipt routes,
+            // and — as at `on_connection_closed` — do NOT clear its ask edges.
+            if let Some(existing) = self.sessions.get(&sid) {
+                let info = existing.info.clone();
+                self.remember_disconnected_session(info, now);
+            }
             self.remove_session(&sid);
-            self.clear_ask_edges_for_session(&sid);
+            self.clear_message_receipt_routes_for_session(&sid);
             self.broadcast(&BrokerMessage::SessionLeft { session_id: sid.clone() }, Some(&sid));
             schedule = true;
         }
@@ -790,6 +1189,8 @@ impl BrokerState {
         };
 
         self.prune_ask_edges(now);
+        // `this.pruneMessageReceiptRoutes(brokerReceivedAt)` (`v0.10.1 broker/broker.ts:502`).
+        self.prune_message_receipt_routes(now);
         let reply_edge = message.reply_to.as_ref().and_then(|rt| self.ask_edges.get(rt).cloned());
 
         // Join-ordered, matching `findSessions`' `Array.from(this.sessions.values()/.entries())`
@@ -810,21 +1211,17 @@ impl BrokerState {
             return FrameResult::cont();
         }
         let Some(target_id) = targets.first().cloned() else {
-            // `v0.10.1 broker/broker.ts:631-638` (v0.10.0): a BLOCKING ask against a target the
-            // broker cannot route gets a reason that says so, because nothing queues it — the
-            // caller must switch to `send` or retry after the peer reconnects. A bare
-            // `Session not found` told the model nothing actionable, so it retried the same
-            // blocking ask.
-            let reason = if message.expects_reply == Some(true) {
-                "Target session is not currently connected; blocking asks are not queued"
-            } else {
-                "Session not found"
-            };
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: reason.to_string(),
-            });
-            return FrameResult::cont();
+            // No LIVE target — fall through to the mailbox ladder
+            // (`v0.10.1 broker/broker.ts:596-673`).
+            return self.handle_send_to_disconnected(
+                conn_id,
+                self_tx,
+                &to,
+                &message,
+                &current_id,
+                reply_edge.as_ref(),
+                now,
+            );
         };
 
         // A reply must match a pending edge (broker.ts:434-441).
@@ -848,6 +1245,26 @@ impl BrokerState {
             });
             return FrameResult::cont();
         };
+        // `if (message.supersedes)` (`v0.10.1 broker/broker.ts:522-533`): a supersede is only legal
+        // against a message THIS sender previously got delivered to THIS receiver, which is exactly
+        // what `messageReceiptRoutes` records. Without the table every supersede was accepted and
+        // silently dropped its `message_control`, so the receiver never learned the earlier message
+        // had been replaced.
+        if let Some(superseded) = &message.supersedes {
+            let route_ok = self
+                .message_receipt_routes
+                .get(superseded)
+                .is_some_and(|route| route.from == current_id && route.to == target_id);
+            if !route_ok {
+                send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason:
+                        "Supersede target does not match a previous message from this sender to this receiver"
+                            .to_string(),
+                });
+                return FrameResult::cont();
+            }
+        }
         // A reply edge must point exactly current←target (broker.ts:452-459).
         if let Some(edge) = &reply_edge
             && (edge.to != current_id || edge.from != target_id)
@@ -891,8 +1308,157 @@ impl BrokerState {
         delivered.broker_received_at = Some(now.into());
         delivered.broker_delivered_at = Some(now_ms().into());
         if let Some(target) = self.sessions.get(&target_id) {
+            // The `message_control{action:"supersede"}` notice precedes the replacement message
+            // (`v0.10.1 broker/broker.ts:558-571`), so a receiver that has not yet surfaced the
+            // superseded message can drop it before the new one lands.
+            if let Some(superseded) = &message.supersedes {
+                send_msg(&target.tx, &BrokerMessage::MessageControl {
+                    from: from_info.clone(),
+                    control: MessageControl {
+                        message_id: superseded.clone(),
+                        action: MessageControlAction::Supersede,
+                        timestamp: now_ms().into(),
+                        superseded_by: Some(message.id.clone()),
+                        detail: None,
+                        extra: Default::default(),
+                    },
+                });
+            }
             send_msg(&target.tx, &BrokerMessage::Message { from: from_info, message: delivered });
         }
+        if let Some(rt) = &message.reply_to {
+            self.ask_edges.remove(rt);
+        }
+        // `this.messageReceiptRoutes.set(...)` (`v0.10.1 broker/broker.ts:580`), dated from
+        // `brokerReceivedAt` — NOT from the delivery — so the 1 h retention measures how long ago
+        // the broker accepted the message.
+        self.message_receipt_routes.insert(message.id.clone(), MessageReceiptRoute {
+            from: current_id.clone(),
+            to: target_id.clone(),
+            created_at: now,
+        });
+        send_msg(self_tx, &BrokerMessage::Delivered { message_id: message.id.clone() });
+        FrameResult::cont()
+    }
+
+    /// The mailbox ladder for a `send` whose target is not connected
+    /// (`v0.10.1 broker/broker.ts:596-673`), reached only when `findSessions` returned nothing.
+    ///
+    /// Every refusal below is upstream's, in upstream's order, and the two shapes it does NOT queue
+    /// are load-bearing: a `supersedes` (the earlier message cannot be reached to be replaced) and
+    /// an `expectsReply` (a blocking ask parked for 24 h would hang the asker past its own
+    /// timeout). The mail itself either goes to the ONE live session that has taken over the
+    /// target's mailbox identity — name + cwd, never name alone — or is parked for it.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_send_to_disconnected(
+        &mut self,
+        conn_id: u64,
+        self_tx: &UnboundedSender<Vec<u8>>,
+        to: &str,
+        message: &Message,
+        current_id: &str,
+        reply_edge: Option<&AskEdge>,
+        now: u64,
+    ) -> FrameResult {
+        let disconnected = self.find_disconnected_session_ids(to, now);
+        let target_info = match disconnected.as_slice() {
+            [only] => self.disconnected_sessions.get(only).map(|s| s.info.clone()),
+            [] => {
+                send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Session not found".to_string(),
+                });
+                return FrameResult::cont();
+            }
+            _ => {
+                send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: format!(
+                        "Multiple disconnected sessions named \"{to}\" can receive queued mail. Use the session ID instead."
+                    ),
+                });
+                return FrameResult::cont();
+            }
+        };
+        let Some(target) = target_info else {
+            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                message_id: message.id.clone(),
+                reason: "Session not found".to_string(),
+            });
+            return FrameResult::cont();
+        };
+
+        // `:598-604`
+        if message.reply_to.is_some() && reply_edge.is_none() {
+            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                message_id: message.id.clone(),
+                reason: "Reply target does not match a pending ask".to_string(),
+            });
+            return FrameResult::cont();
+        }
+        // `:605-613`
+        let Some(from_info) = self
+            .sessions
+            .get(current_id)
+            .filter(|s| s.conn_id == conn_id)
+            .map(|s| s.info.clone())
+        else {
+            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                message_id: message.id.clone(),
+                reason: "Sender session not found".to_string(),
+            });
+            return FrameResult::cont();
+        };
+        // `:615-622`
+        if message.supersedes.is_some() {
+            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                message_id: message.id.clone(),
+                reason: "Supersede target is not connected".to_string(),
+            });
+            return FrameResult::cont();
+        }
+        // `:623-630`
+        if let Some(edge) = reply_edge
+            && (edge.to != current_id || edge.from != target.id)
+        {
+            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                message_id: message.id.clone(),
+                reason: "Reply target does not match the pending ask".to_string(),
+            });
+            return FrameResult::cont();
+        }
+        // `:631-638` — ICOM-045's reason, in pi's own position: it belongs to a target the broker
+        // KNOWS but cannot reach, not to a name it has never seen (that is `Session not found`).
+        if message.expects_reply == Some(true) {
+            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
+                message_id: message.id.clone(),
+                reason: "Target session is not currently connected; blocking asks are not queued"
+                    .to_string(),
+            });
+            return FrameResult::cont();
+        }
+
+        // `:640-655`
+        match self.find_unique_live_session_for_disconnected_session(&target, current_id) {
+            Some(live_id) => {
+                let mut delivered = message.clone();
+                delivered.broker_received_at = Some(now.into());
+                delivered.broker_delivered_at = Some(now_ms().into());
+                if let Some(live) = self.sessions.get(&live_id) {
+                    send_msg(&live.tx, &BrokerMessage::Message {
+                        from: from_info,
+                        message: delivered,
+                    });
+                }
+                self.message_receipt_routes.insert(message.id.clone(), MessageReceiptRoute {
+                    from: current_id.to_string(),
+                    to: live_id,
+                    created_at: now,
+                });
+            }
+            None => self.queue_mailbox_message(from_info, target, message, now),
+        }
+        // `:656-658`
         if let Some(rt) = &message.reply_to {
             self.ask_edges.remove(rt);
         }
@@ -1217,7 +1783,7 @@ async fn reader_task(
     // task's channel close so it half-closes the socket.
     let did_leave = {
         let mut g = lock(&state);
-        g.on_connection_closed(conn_id, &session_id)
+        g.on_connection_closed(conn_id, &session_id, now_ms())
     };
     if did_leave {
         schedule_shutdown_check(&state);
@@ -1253,6 +1819,13 @@ fn shutdown_broker(state: &Arc<Mutex<BrokerState>>, socket_path: &std::path::Pat
         g.sessions.clear();
         g.session_order.clear();
         g.ask_edges.clear();
+        // `shutdown()` clears every routing table, not just the sessions
+        // (`v0.10.1 broker/broker.ts:1411-1415`). Parked mail is in-memory only upstream too — a
+        // broker restart loses it by design, which is why `MAILBOX_MESSAGE_RETENTION_MS` is a
+        // liveness bound rather than a durability promise.
+        g.message_receipt_routes.clear();
+        g.disconnected_sessions.clear();
+        g.mailbox_messages.clear();
         g.unregistered.clear();
     }
     let _ = std::fs::remove_file(socket_path);
@@ -1439,7 +2012,7 @@ mod tests {
 
         // `this.sessions.delete(id)` drops it from the order and leaves the rest intact.
         let mut sid = Some("session-7".to_string());
-        state.handle_unregister(7, &make_tx(), &mut sid);
+        state.handle_unregister(7, &make_tx(), &mut sid, 0);
         let expected: Vec<String> = joined.iter().filter(|id| *id != "session-7").cloned().collect();
         let after_leave: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
         assert_eq!(after_leave, expected, "a departure must not disturb the surviving join order");
@@ -1483,7 +2056,7 @@ mod tests {
         // `armRegistrationTimeout`; the unregistered set must never exceed the cap.
         for (conn_id, sid) in session_ids.iter_mut().enumerate() {
             let tx = make_tx();
-            let result = state.handle_unregister(conn_id as u64, &tx, sid);
+            let result = state.handle_unregister(conn_id as u64, &tx, sid, 0);
             assert!(matches!(result.outcome, FrameOutcome::Continue));
             assert!(
                 state.unregistered.len() <= MAX_UNREGISTERED_CONNECTIONS,
@@ -1709,25 +2282,64 @@ mod presence_context_tests {
         ));
     }
 
-    /// ICOM-045's broker half (`v0.10.1 broker/broker.ts:631-638`, v0.10.0): an unroutable target
-    /// gets a reason that says blocking asks are not queued, so the model switches to `send` or
-    /// retries instead of re-issuing the same blocking ask.
+    /// ICOM-045's broker half (`v0.10.1 broker/broker.ts:631-638`, v0.10.0): a blocking ask against
+    /// a target the broker KNOWS but cannot reach gets a reason that says blocking asks are not
+    /// queued, so the model switches to `send` or retries instead of re-issuing the same ask.
+    ///
+    /// **The pre-ICOM-010 version of this test asserted that reason for a target the broker had
+    /// NEVER seen (`to: "ghost"`), which is not pi's behaviour**: upstream reaches `:631-638` only
+    /// inside `if (disconnectedTargets.length === 1)`, so an unknown name is `Session not found`
+    /// whether or not it expects a reply. That over-broad approximation was the only way to express
+    /// the message before the disconnected-session map existed; it is now placed where pi places
+    /// it, and the never-seen case is pinned separately below.
     #[test]
-    fn an_unroutable_blocking_ask_is_refused_with_the_not_queued_reason() {
+    fn a_blocking_ask_to_a_disconnected_peer_is_refused_with_the_not_queued_reason() {
         fn drive(expects_reply: bool) -> String {
-            let mut state = BrokerState::new(30_000, Arc::new(Notify::new()));
+            let mut state = make_state();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let mut sid = None;
+            let mut peer_sid = None;
+            register(&mut state, 1, &mut sid, "s1");
+            register(&mut state, 2, &mut peer_sid, "s2");
+            // s2 leaves; the broker remembers it for its mailbox.
+            state.on_connection_closed(2, &peer_sid, 1_500);
+            while rx.try_recv().is_ok() {}
             state.handle_frame(
                 1,
                 &tx,
                 &json!({
-                    "type": "register", "sessionId": "s1",
-                    "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+                    "type": "send", "to": "s2",
+                    "message": { "id": "m1", "timestamp": 1, "expectsReply": expects_reply,
+                                 "content": { "text": "hi" } },
                 }),
                 &mut sid,
-                1_000,
+                2_000,
             );
+            let frame = rx.try_recv().expect("a reply frame");
+            let payload: serde_json::Value =
+                serde_json::from_slice(frame.get(4..).unwrap_or_default()).expect("json");
+            payload["type"].as_str().unwrap_or_default().to_string()
+                + " "
+                + payload["reason"].as_str().unwrap_or_default()
+        }
+        assert_eq!(
+            drive(true),
+            "delivery_failed Target session is not currently connected; blocking asks are not queued"
+        );
+        // POSITIVE CONTROL: the same non-blocking send is ACCEPTED and parked, so the assertion
+        // above is about `expectsReply` and not about the target being unreachable.
+        assert_eq!(drive(false), "delivered ");
+    }
+
+    /// The never-registered target, which has no mailbox to queue into
+    /// (`v0.10.1 broker/broker.ts:669-673`): `Session not found` for both shapes.
+    #[test]
+    fn a_send_to_a_name_the_broker_has_never_seen_is_session_not_found() {
+        fn drive(expects_reply: bool) -> String {
+            let mut state = make_state();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut sid = None;
+            register(&mut state, 1, &mut sid, "s1");
             while rx.try_recv().is_ok() {}
             state.handle_frame(
                 1,
@@ -1745,9 +2357,607 @@ mod presence_context_tests {
                 serde_json::from_slice(frame.get(4..).unwrap_or_default()).expect("json");
             payload["reason"].as_str().unwrap_or_default().to_string()
         }
-        assert_eq!(drive(true), "Target session is not currently connected; blocking asks are not queued");
-        // POSITIVE CONTROL: a non-blocking send keeps pi's original wording.
+        assert_eq!(drive(true), "Session not found");
         assert_eq!(drive(false), "Session not found");
+    }
+
+    /// Local copies of `mod tests`' fixtures: a sibling test module cannot reach that module's
+    /// private items.
+    fn make_state() -> BrokerState {
+        BrokerState::new(30_000, Arc::new(Notify::new()))
+    }
+
+    fn make_tx() -> UnboundedSender<Vec<u8>> {
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tx
+    }
+
+    fn register(state: &mut BrokerState, conn_id: u64, session_id: &mut Option<String>, id: &str) {
+        let tx = make_tx();
+        let value = json!({
+            "type": "register",
+            "sessionId": id,
+            "session": {
+                "cwd": "/tmp", "model": "test-model", "pid": 1, "startedAt": 0, "lastActivity": 0,
+            }
+        });
+        let result = state.handle_register(conn_id, &tx, &value, session_id, 0);
+        assert!(matches!(result.outcome, FrameOutcome::Continue));
+    }
+
+    /// Decode every queued frame on `rx` as JSON, dropping the 4-byte length prefix.
+    fn payloads(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            out.push(
+                serde_json::from_slice(frame.get(4..).unwrap_or_default())
+                    .expect("a broker frame is JSON"),
+            );
+        }
+        out
+    }
+
+    /// Register `id` on `conn_id` with an explicit name + cwd, so the mailbox identity rules
+    /// (`v0.10.1 broker/broker.ts:1039-1048`) have something to match on.
+    fn register_named(
+        state: &mut BrokerState,
+        conn_id: u64,
+        session_id: &mut Option<String>,
+        tx: &UnboundedSender<Vec<u8>>,
+        id: &str,
+        name: &str,
+        cwd: &str,
+        now: u64,
+    ) {
+        let value = json!({
+            "type": "register",
+            "sessionId": id,
+            "session": {
+                "name": name, "cwd": cwd, "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0,
+            }
+        });
+        let result = state.handle_register(conn_id, tx, &value, session_id, now);
+        assert!(matches!(result.outcome, FrameOutcome::Continue));
+    }
+
+    fn send_frame(
+        state: &mut BrokerState,
+        conn_id: u64,
+        tx: &UnboundedSender<Vec<u8>>,
+        sid: &mut Option<String>,
+        to: &str,
+        message: serde_json::Value,
+        now: u64,
+    ) {
+        state.handle_frame(conn_id, tx, &json!({ "type": "send", "to": to, "message": message }), sid, now);
+    }
+
+    /// ICOM-010 — the broker mailbox (`v0.10.1 broker/broker.ts:890-953`). Before this landed, a
+    /// message sent during a peer's reconnect gap was answered `Session not found` and DROPPED;
+    /// `connect.rs:44-51` even documented "there is no mailbox, no queue, no redelivery" as an
+    /// invariant. Now it is parked and redelivered on the peer's next `register`.
+    #[test]
+    fn mail_for_a_disconnected_peer_is_parked_and_flushed_on_re_register() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+
+        // b leaves.
+        assert!(state.on_connection_closed(2, &b_sid, 1_500));
+        let _ = payloads(&mut a_rx);
+        let _ = payloads(&mut b_rx);
+
+        // a sends to b anyway.
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "m1", "timestamp": 1, "content": { "text": "while you were out" } }),
+            2_000,
+        );
+        let acks = payloads(&mut a_rx);
+        assert_eq!(acks.len(), 1, "the sender is acked exactly once");
+        assert_eq!(acks[0]["type"], "delivered", "parked mail is ACKED, not refused: {acks:?}");
+        assert_eq!(state.mailbox_messages.len(), 1);
+
+        // b comes back on a new connection with the same id.
+        let (b2_tx, mut b2_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut b2_sid = None;
+        register_named(&mut state, 3, &mut b2_sid, &b2_tx, "b", "bob", "/w", 3_000);
+        let delivered = payloads(&mut b2_rx);
+        let message = delivered
+            .iter()
+            .find(|p| p["type"] == "message")
+            .expect("the parked message is redelivered on register");
+        assert_eq!(message["message"]["id"], "m1");
+        assert_eq!(message["message"]["content"]["text"], "while you were out");
+        assert_eq!(message["from"]["id"], "a");
+        // `registered` and `session_joined` precede it (`:383-392`).
+        assert_eq!(delivered.first().map(|p| p["type"].clone()), Some(json!("registered")));
+        assert!(state.mailbox_messages.is_empty(), "the entry is consumed, not copied");
+        // The flush records where the message went, so a receipt can be routed home (`:945-952`).
+        assert_eq!(state.message_receipt_routes.get("m1").map(|r| r.to.clone()), Some("b".into()));
+    }
+
+    /// `flushMailboxForSession`'s `matchesUniqueName` arm (`:919-931`) and the identity guard it
+    /// rests on (`:1039-1048`): mail parked for a disconnected `bob` in `/w` is inherited by a
+    /// RELAUNCHED `bob` in `/w` under a brand-new session id — but not by a `bob` in another
+    /// directory, whose registration must leave the entry parked.
+    #[test]
+    fn a_relaunched_peer_inherits_mail_by_name_and_cwd_but_not_by_name_alone() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, _b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b-old", "bob", "/w", 1_000);
+        state.on_connection_closed(2, &b_sid, 1_500);
+        let _ = payloads(&mut a_rx);
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "bob",
+            json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } }),
+            2_000,
+        );
+        assert_eq!(state.mailbox_messages.len(), 1);
+
+        // NEGATIVE FIRST: same name, different directory — no inheritance.
+        let (other_tx, mut other_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut other_sid = None;
+        register_named(&mut state, 3, &mut other_sid, &other_tx, "b-elsewhere", "bob", "/elsewhere", 3_000);
+        assert!(
+            !payloads(&mut other_rx).iter().any(|p| p["type"] == "message"),
+            "a same-named peer in another directory must not inherit the mailbox"
+        );
+        assert_eq!(state.mailbox_messages.len(), 1, "the entry stays parked");
+
+        // Now the genuine relaunch: same name, same cwd, new id.
+        let (b2_tx, mut b2_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut b2_sid = None;
+        register_named(&mut state, 4, &mut b2_sid, &b2_tx, "b-new", "bob", "/w", 4_000);
+        assert!(
+            payloads(&mut b2_rx).iter().any(|p| p["type"] == "message"),
+            "a relaunch with the same name in the same directory inherits its mail"
+        );
+        assert!(state.mailbox_messages.is_empty());
+    }
+
+    /// `findUniqueLiveSessionForDisconnectedSession` (`:640-653`): when a peer has ALREADY
+    /// relaunched under a new id, mail addressed to the old id is delivered live rather than
+    /// parked — and the sender is excluded from that match, so a session cannot inherit the
+    /// mailbox of a peer it is itself writing to.
+    #[test]
+    fn mail_for_an_old_session_id_is_delivered_live_to_its_relaunched_identity() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, _b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b-old", "bob", "/w", 1_000);
+        state.on_connection_closed(2, &b_sid, 1_500);
+        let (b2_tx, mut b2_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut b2_sid = None;
+        register_named(&mut state, 3, &mut b2_sid, &b2_tx, "b-new", "bob", "/w", 2_000);
+        let _ = payloads(&mut a_rx);
+        let _ = payloads(&mut b2_rx);
+
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b-old",
+            json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } }),
+            3_000,
+        );
+        assert!(state.mailbox_messages.is_empty(), "a live identity holder takes it immediately");
+        let got = payloads(&mut b2_rx);
+        assert!(
+            got.iter().any(|p| p["type"] == "message" && p["message"]["id"] == "m1"),
+            "the relaunched session receives it: {got:?}"
+        );
+        assert_eq!(state.message_receipt_routes.get("m1").map(|r| r.to.clone()), Some("b-new".into()));
+    }
+
+    /// `MAX_MAILBOX_MESSAGES` head-eviction (`:892-898`): the cap drops the OLDEST parked entry, so
+    /// the newest 256 survive.
+    #[test]
+    fn the_mailbox_cap_evicts_the_oldest_entry() {
+        let mut state = make_state();
+        let (a_tx, _a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, _b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+        state.on_connection_closed(2, &b_sid, 1_500);
+        for n in 0..MAX_MAILBOX_MESSAGES + 3 {
+            send_frame(
+                &mut state,
+                1,
+                &a_tx,
+                &mut a_sid,
+                "b",
+                json!({ "id": format!("m{n}"), "timestamp": 1, "content": { "text": "x" } }),
+                2_000,
+            );
+        }
+        assert_eq!(state.mailbox_messages.len(), MAX_MAILBOX_MESSAGES);
+        assert_eq!(state.mailbox_messages.first().map(|e| e.message.id.clone()), Some("m3".into()));
+        assert_eq!(
+            state.mailbox_messages.last().map(|e| e.message.id.clone()),
+            Some(format!("m{}", MAX_MAILBOX_MESSAGES + 2))
+        );
+    }
+
+    /// Parked mail expires on `MAILBOX_MESSAGE_RETENTION_MS`, and a disconnected identity on
+    /// `DISCONNECTED_SESSION_RETENTION_MS` (`v0.10.1 broker/broker.ts:869-888`) — after which the
+    /// same `send` is `Session not found` again rather than queueing forever.
+    ///
+    /// **Mailbox expiry is LAZY, and `case "send"` is not one of its call sites.**
+    /// `pruneMailboxMessages` has exactly four callers upstream — `register` (`:342`),
+    /// `cancel_message` (`:709`), `queueMailboxMessage` (`:891`) and `flushMailboxForSession`
+    /// (`:909`) — while `case "send"` (`:484-680`) prunes only the ask edges and the receipt
+    /// routes (`:501-502`). A `send` refused `Session not found` therefore leaves the stale entry
+    /// sitting in `mailboxMessages`; it is the target's next `register` that drops it.
+    ///
+    /// So the guarantee worth pinning is not "the failing send emptied the mailbox" (pi never does
+    /// that) but "an expired entry is never REDELIVERED" — which is only observable by actually
+    /// re-registering the target. `park_then_rejoin` does that on both sides of pi's strict `>`
+    /// boundary, so the expiry assertion cannot pass vacuously: at exactly the retention the entry
+    /// must still flush, and one millisecond later it must not.
+    #[test]
+    fn parked_mail_and_the_disconnected_identity_both_expire_after_their_retention() {
+        /// Park `m1` at t=2_000 for a `b` that dropped at t=1_500, then re-register `b` at
+        /// `rejoin_at`, returning (message ids flushed to the rejoining session, entries left).
+        fn park_then_rejoin(rejoin_at: u64) -> (Vec<String>, usize) {
+            let mut state = make_state();
+            let (a_tx, _a_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (b_tx, _b_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut a_sid = None;
+            let mut b_sid = None;
+            register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+            register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+            state.on_connection_closed(2, &b_sid, 1_500);
+            send_frame(
+                &mut state,
+                1,
+                &a_tx,
+                &mut a_sid,
+                "b",
+                json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } }),
+                2_000,
+            );
+            assert_eq!(state.mailbox_messages.len(), 1, "m1 is parked for the disconnected b");
+
+            let (b2_tx, mut b2_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut b2_sid = None;
+            register_named(&mut state, 3, &mut b2_sid, &b2_tx, "b", "bob", "/w", rejoin_at);
+            let flushed = payloads(&mut b2_rx)
+                .into_iter()
+                .filter(|p| p["type"] == "message")
+                .map(|p| p["message"]["id"].as_str().unwrap_or_default().to_string())
+                .collect();
+            (flushed, state.mailbox_messages.len())
+        }
+
+        // `now - entry.queuedAt > MAILBOX_MESSAGE_RETENTION_MS` (`:880`) is STRICT: at exactly the
+        // retention the entry is still live, and the rejoin flushes it.
+        let (flushed, left) = park_then_rejoin(2_000 + MAILBOX_MESSAGE_RETENTION_MS);
+        assert_eq!(flushed, vec!["m1".to_string()], "at exactly the retention it still flushes");
+        assert_eq!(left, 0, "and the flush consumed it");
+
+        // One millisecond past it, `register`'s prune (`:342`) drops it before the flush loop ever
+        // sees it, so the rejoining session receives nothing at all.
+        let (flushed, left) = park_then_rejoin(2_000 + MAILBOX_MESSAGE_RETENTION_MS + 1);
+        assert!(flushed.is_empty(), "one ms later it is pruned, not redelivered: {flushed:?}");
+        assert_eq!(left, 0, "and it is gone from the mailbox");
+
+        // The disconnected identity's own retention, on the `send` path.
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, _b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+        state.on_connection_closed(2, &b_sid, 1_500);
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } }),
+            2_000,
+        );
+        assert_eq!(state.mailbox_messages.len(), 1);
+        let _ = payloads(&mut a_rx);
+
+        let later = 2_000 + MAILBOX_MESSAGE_RETENTION_MS + 1;
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "m2", "timestamp": 1, "content": { "text": "hi" } }),
+            later,
+        );
+        let reason = payloads(&mut a_rx)
+            .first()
+            .map(|p| p["reason"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        // `findDisconnectedSessions` prunes first (`:1005`), so the retained identity is gone and
+        // the ladder falls through to the empty-targets arm rather than queueing forever.
+        assert_eq!(reason, "Session not found", "the retained identity expired too");
+        assert_eq!(
+            state.mailbox_messages.len(),
+            1,
+            "`case \"send\"` prunes only ask edges and receipt routes (`:501-502`), so the stale \
+             entry is still parked here — the next `register` is what drops it"
+        );
+        assert_eq!(
+            state.mailbox_messages[0].message.id, "m1",
+            "and m2 was refused outright, never queued behind it"
+        );
+    }
+
+    /// **A disconnect must NOT clear the departing session's ask edges.** `clearAskEdgesForSession`
+    /// has exactly one call site in `broker.ts` at every tag v0.9.2…v0.10.1 — the register-time
+    /// identity takeover (`:350`) — and cyrup was additionally calling it from BOTH leave paths.
+    ///
+    /// Red before the fix: `a` asks `b`, `b`'s socket drops and reconnects (the routine state
+    /// ICOM-003's reconnect ladder creates), and `b`'s reply is then refused with "Reply target
+    /// does not match a pending ask" — the ask is unanswerable and `a` blocks until its own
+    /// timeout.
+    #[test]
+    fn a_disconnect_preserves_the_ask_edge_so_the_reply_still_lands_after_reconnect() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, _b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "ask1", "timestamp": 1, "expectsReply": true, "content": { "text": "?" } }),
+            1_100,
+        );
+        assert!(state.ask_edges.contains_key("ask1"), "the ask edge exists before the drop");
+
+        state.on_connection_closed(2, &b_sid, 1_500);
+        assert!(state.ask_edges.contains_key("ask1"), "a disconnect must not drop it");
+
+        let (b2_tx, _b2_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut b2_sid = None;
+        register_named(&mut state, 3, &mut b2_sid, &b2_tx, "b", "bob", "/w", 2_000);
+        let _ = payloads(&mut a_rx);
+        send_frame(
+            &mut state,
+            3,
+            &b2_tx,
+            &mut b2_sid,
+            "a",
+            json!({ "id": "r1", "timestamp": 1, "replyTo": "ask1", "content": { "text": "yes" } }),
+            2_100,
+        );
+        let got = payloads(&mut a_rx);
+        assert!(
+            got.iter().any(|p| p["type"] == "message" && p["message"]["id"] == "r1"),
+            "the reply reaches the asker after the reconnect: {got:?}"
+        );
+        assert!(!state.ask_edges.contains_key("ask1"), "and the satisfied edge is dropped");
+    }
+
+    /// `case "cancel_message"`'s two live arms (`v0.10.1 broker/broker.ts:711-743`), both of which
+    /// were unreachable while `messageReceiptRoutes` and the mailbox did not exist: the sender
+    /// could only ever be told "Message cannot be cancelled by this session".
+    #[test]
+    fn a_sender_can_cancel_both_parked_and_delivered_mail() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+
+        // (1) delivered mail → a `message_control{cancel}` reaches the receiver.
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "m1", "timestamp": 1, "content": { "text": "oops" } }),
+            1_100,
+        );
+        let _ = payloads(&mut a_rx);
+        let _ = payloads(&mut b_rx);
+        state.handle_frame(
+            1,
+            &a_tx,
+            &json!({ "type": "cancel_message", "messageId": "m1" }),
+            &mut a_sid,
+            1_200,
+        );
+        let control = payloads(&mut b_rx);
+        assert!(
+            control.iter().any(|p| p["type"] == "message_control"
+                && p["control"]["action"] == "cancel"
+                && p["control"]["messageId"] == "m1"),
+            "the receiver is told the message was withdrawn: {control:?}"
+        );
+        assert_eq!(payloads(&mut a_rx).first().map(|p| p["type"].clone()), Some(json!("delivered")));
+
+        // (2) parked mail → dropped in place, with no control frame to send anywhere.
+        state.on_connection_closed(2, &b_sid, 1_500);
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "m2", "timestamp": 1, "content": { "text": "recall me" } }),
+            1_600,
+        );
+        assert_eq!(state.mailbox_messages.len(), 1);
+        let _ = payloads(&mut a_rx);
+        state.handle_frame(
+            1,
+            &a_tx,
+            &json!({ "type": "cancel_message", "messageId": "m2" }),
+            &mut a_sid,
+            1_700,
+        );
+        assert!(state.mailbox_messages.is_empty(), "the parked entry is withdrawn");
+        assert_eq!(payloads(&mut a_rx).first().map(|p| p["type"].clone()), Some(json!("delivered")));
+
+        // NEGATIVE CONTROL: a message this session never sent is still refused.
+        state.handle_frame(
+            1,
+            &a_tx,
+            &json!({ "type": "cancel_message", "messageId": "never" }),
+            &mut a_sid,
+            1_800,
+        );
+        let refused = payloads(&mut a_rx);
+        assert_eq!(refused.first().map(|p| p["type"].clone()), Some(json!("delivery_failed")));
+        assert_eq!(refused[0]["reason"], "Message cannot be cancelled by this session");
+    }
+
+    /// `case "message_receipt"` (`v0.10.1 broker/broker.ts:676-696`) forwards a receipt back to the
+    /// ORIGINAL sender, which needs the `messageReceiptRoutes` entry the delivery wrote. Every pi
+    /// >= 0.9.0 client emits `receiver_received` unconditionally on its first inbound message
+    /// (`broker/client.ts:773-784`), so before the table existed every one of those receipts was
+    /// dropped on the floor.
+    #[test]
+    fn a_receipt_is_forwarded_to_the_original_sender() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, _b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } }),
+            1_100,
+        );
+        let _ = payloads(&mut a_rx);
+
+        state.handle_frame(
+            2,
+            &b_tx,
+            &json!({
+                "type": "message_receipt",
+                "receipt": { "messageId": "m1", "status": "receiver_received", "timestamp": 2 },
+            }),
+            &mut b_sid,
+            1_200,
+        );
+        let got = payloads(&mut a_rx);
+        assert!(
+            got.iter().any(|p| p["type"] == "message_receipt"
+                && p["receipt"]["messageId"] == "m1"
+                && p["from"]["id"] == "b"),
+            "the sender learns its message arrived: {got:?}"
+        );
+
+        // NEGATIVE CONTROL: a receipt for a message this session did not receive routes nowhere.
+        state.handle_frame(
+            2,
+            &b_tx,
+            &json!({
+                "type": "message_receipt",
+                "receipt": { "messageId": "other", "status": "receiver_received", "timestamp": 3 },
+            }),
+            &mut b_sid,
+            1_300,
+        );
+        assert!(payloads(&mut a_rx).is_empty());
+    }
+
+    /// `if (message.supersedes)` (`v0.10.1 broker/broker.ts:522-533,558-571`): a supersede is legal
+    /// only against a message this sender previously had delivered to this receiver, and when it is
+    /// legal the receiver gets a `message_control{supersede}` BEFORE the replacement.
+    #[test]
+    fn a_supersede_is_validated_against_the_receipt_route_and_announced_before_the_replacement() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+
+        // NEGATIVE FIRST: nothing to supersede.
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "m2", "timestamp": 1, "supersedes": "nope", "content": { "text": "v2" } }),
+            1_100,
+        );
+        let refused = payloads(&mut a_rx);
+        assert_eq!(refused.last().map(|p| p["type"].clone()), Some(json!("delivery_failed")));
+        assert_eq!(
+            refused[refused.len() - 1]["reason"],
+            "Supersede target does not match a previous message from this sender to this receiver"
+        );
+
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "m1", "timestamp": 1, "content": { "text": "v1" } }),
+            1_200,
+        );
+        let _ = payloads(&mut b_rx);
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            json!({ "id": "m3", "timestamp": 1, "supersedes": "m1", "content": { "text": "v2" } }),
+            1_300,
+        );
+        let got = payloads(&mut b_rx);
+        let control_at = got.iter().position(|p| p["type"] == "message_control");
+        let message_at = got.iter().position(|p| p["type"] == "message");
+        assert!(control_at.is_some() && message_at.is_some(), "both frames arrive: {got:?}");
+        assert!(control_at < message_at, "the supersede notice precedes the replacement");
+        let control = &got[control_at.unwrap_or(0)];
+        assert_eq!(control["control"]["action"], "supersede");
+        assert_eq!(control["control"]["messageId"], "m1");
+        assert_eq!(control["control"]["supersededBy"], "m3");
     }
 
     /// ICOM-005 — `register` must NULL the pending auto-shutdown handle

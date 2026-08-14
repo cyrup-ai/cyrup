@@ -969,3 +969,384 @@ async fn ext002_message_end_handler_runs_once_per_finalized_message() {
     );
     assert_eq!(starts.load(Ordering::SeqCst), 1, "the notify seam still delivers other kinds");
 }
+
+// ---------------------------------------------------------------------------
+// EXT-034: a `pi.events` emit from an EVENT handler is delivered.
+// ---------------------------------------------------------------------------
+
+/// Emits on the inter-extension bus from inside its `message_start` EVENT handler — the seam
+/// upstream delivers inline (`createEventBus().emit` runs every listener at the emit call,
+/// `pi/packages/coding-agent/src/core/event-bus.ts:12-32` @v0.83.0) and cyrup used to drain only in
+/// the command tier.
+struct BusEmitterOnEvent {
+    bus: Arc<crate::bus::SharedBus>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for BusEmitterOnEvent {
+    fn id(&self) -> ExtensionId {
+        "emitter".into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.subscribe(&[EventKind::MessageStart]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        if matches!(ev, HostEvent::MessageStart { .. }) {
+            self.bus.emit("demo:bus".into(), json!({"from": "event-handler"}));
+        }
+        HookOutcome::Noop
+    }
+}
+
+/// Listens on `demo:bus` and records every payload it is handed.
+struct BusListener {
+    seen: Arc<Mutex<Vec<Value>>>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for BusListener {
+    fn id(&self) -> ExtensionId {
+        "listener".into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.subscribe_bus("demo:bus");
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+    async fn on_bus_event(
+        &self,
+        topic: &str,
+        payload: &Value,
+        ctx: &HostCtx,
+    ) -> Result<(), crate::ExtError> {
+        assert_eq!(topic, "demo:bus");
+        // A bus listener is not a command: it must run at the EVENT tier.
+        assert_eq!(ctx.tier(), crate::native::CtxTier::Event, "bus delivery uses an event-tier ctx");
+        self.seen.lock().unwrap().push(payload.clone());
+        Ok(())
+    }
+}
+
+/// EXT-034 — the drain used to be wired into `run_command`/`run_shortcut` only, so `pi.events`
+/// silently worked from a slash-command handler and silently did NOT work from an event handler,
+/// which is where cross-extension coordination actually happens (a permission decision, a tool
+/// result, a session start). Upstream there is no drain point at all: `emit` runs every listener
+/// synchronously inside the emit call, so an emit can never go undelivered.
+///
+/// No manual `deliver_bus_events` here — that is the whole assertion.
+#[tokio::test]
+async fn ext034_bus_emit_from_an_event_handler_is_delivered_without_a_manual_drain() {
+    let host = ExtensionHost::new(cfg());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    host.load_native(Arc::new(BusListener { seen: seen.clone() })).await.unwrap();
+    host.load_native(Arc::new(BusEmitterOnEvent { bus: host.bus().clone() })).await.unwrap();
+
+    let sub = host.subscriber(CancelToken::new());
+    sub.on_event(&AgentEvent::MessageStart { message: AgentMessage::user_text("hi") }, CancelToken::new())
+        .await;
+
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(
+        got.len(),
+        1,
+        "an emit from an event handler must be delivered when the dispatch returns, not left \
+         queued until the next slash command"
+    );
+    assert_eq!(got[0], json!({"from": "event-handler"}));
+    assert_eq!(host.bus().pending_len(), 0, "the queue is empty after the dispatch seam drains");
+}
+
+/// The same emit on the block/mutate seam (`tool_call` — the permission gate's own event), whose
+/// first-block short-circuit returns before the end of the subscriber loop. That early return is
+/// the one an EXT-034 fix is most likely to miss, and it is the coordination case that matters:
+/// a gate announcing the decision it just made.
+struct BusEmitterOnBlock {
+    bus: Arc<crate::bus::SharedBus>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for BusEmitterOnBlock {
+    fn id(&self) -> ExtensionId {
+        "gate".into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.subscribe(&[EventKind::ToolCall]);
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        self.bus.emit("demo:bus".into(), json!({"from": "gate"}));
+        HookOutcome::Block { reason: Some("denied".into()), terminate: false }
+    }
+}
+
+#[tokio::test]
+async fn ext034_bus_emit_survives_the_first_block_short_circuit() {
+    let host = ExtensionHost::new(cfg());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    host.load_native(Arc::new(BusListener { seen: seen.clone() })).await.unwrap();
+    host.load_native(Arc::new(BusEmitterOnBlock { bus: host.bus().clone() })).await.unwrap();
+
+    let reduced = host
+        .dispatcher()
+        .dispatch_block_mutate(
+            HostEvent::ToolCall {
+                call_id: "tc-1".into(),
+                name: "bash".into(),
+                input: json!({"command": "rm -rf /"}),
+            },
+            &CancelToken::new(),
+        )
+        .await;
+    assert!(matches!(reduced, Reduced::Blocked { .. }), "the gate blocked");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "a gate that emits AND blocks must still have its emit delivered — pi's emit is inline, so \
+         the listener ran before the block was even returned"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// EXT-035: a native's shortcut/flag/provider registrations are reachable.
+// ---------------------------------------------------------------------------
+
+/// Registers one of each of the surfaces `InitApi` did not offer, and records the shortcut firing.
+struct FullRegistrar {
+    fired: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for FullRegistrar {
+    fn id(&self) -> ExtensionId {
+        "registrar".into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.register_shortcut("ctrl+alt+f", Some("Show the fleet".into()));
+        api.register_flag("fleet", json!({"type": "boolean", "description": "fleet mode"}));
+        // pi's `ProviderConfig.models` is `ProviderModelConfig[]` — OBJECTS carrying
+        // `id`/`name`/`reasoning`/`input`/`cost`/`contextWindow`/`maxTokens`, never bare id strings
+        // (`pi/packages/coding-agent/src/core/extensions/types.ts:1443` and `:1467-1492` @v0.83.0),
+        // and `ProviderHub::register` parses the typed shape.
+        api.register_provider(
+            "fleet-provider",
+            json!({
+                "baseUrl": "https://fleet.example.com",
+                "api": "openai-completions",
+                "models": [{
+                    "id": "fleet-1",
+                    "name": "Fleet One",
+                    "reasoning": false,
+                    "input": ["text"],
+                    "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+                    "contextWindow": 200_000,
+                    "maxTokens": 8_192
+                }]
+            }),
+        );
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+    async fn execute_shortcut(&self, key: &str, ctx: &HostCtx) -> Result<(), crate::ExtError> {
+        assert_eq!(key, "ctrl+alt+f");
+        // pi hands a shortcut handler the same `ExtensionContext` a command handler gets
+        // (`extensions/types.ts:1249-1255` @v0.83.0), so session-replacing ops must be permitted.
+        assert_eq!(ctx.tier(), crate::native::CtxTier::Command);
+        self.fired.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// EXT-035 — `run_shortcut` was `#[cfg(feature = "wasm-host")]` and resolved owners out of the
+/// live-WASM map only, so a native-owned shortcut registered, was advertised by `shortcut_keys()`
+/// and listed by `/hotkeys`, and then could never fire. pi has ONE extension kind and one
+/// `ExtensionAPI` (`extensions/loader.ts:274-410` @v0.83.0): there is no upstream notion of an
+/// extension that may register a shortcut but not have it invoked.
+#[tokio::test]
+async fn ext035_a_native_registered_shortcut_actually_fires() {
+    let host = ExtensionHost::new(cfg());
+    let fired = Arc::new(AtomicUsize::new(0));
+    host.load_native(Arc::new(FullRegistrar { fired: fired.clone() })).await.unwrap();
+
+    assert!(
+        host.shortcut_keys().contains(&"ctrl+alt+f".to_string()),
+        "the key is advertised to the TUI"
+    );
+    assert_eq!(
+        host.shortcut_specs()
+            .into_iter()
+            .find(|(k, _)| k == "ctrl+alt+f")
+            .and_then(|(_, d)| d)
+            .as_deref(),
+        Some("Show the fleet"),
+        "EXT-040: /hotkeys renders `shortcut.description ?? extensionPath`, never the key id"
+    );
+
+    host.run_shortcut("ctrl+alt+f", &CancelToken::new()).await.expect("the native handler runs");
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+    // The other two EXT-035 surfaces reached the registry from the same `init`.
+    assert!(host.registry().provider_ids().unwrap().contains(&"fleet-provider".to_string()));
+    assert!(host.registry().get_flag("fleet").unwrap().is_some());
+}
+
+/// An unregistered key is still a typed error, and a native with no `execute_shortcut` override
+/// reports one rather than succeeding silently.
+#[tokio::test]
+async fn ext035_an_unhandled_shortcut_is_a_typed_error_not_a_silent_success() {
+    let host = ExtensionHost::new(cfg());
+    let err = host.run_shortcut("ctrl+q", &CancelToken::new()).await.unwrap_err();
+    assert!(format!("{err}").contains("no such shortcut"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// EXT-019: registerMarkdownTransformer (pi v0.84.1).
+// ---------------------------------------------------------------------------
+
+/// Appends its own marker so the FOLD order is observable in the output.
+struct MarkTransformer {
+    id: &'static str,
+    marker: &'static str,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for MarkTransformer {
+    fn id(&self) -> ExtensionId {
+        self.id.into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.register_markdown_transformer();
+        // A second call must be idempotent — upstream ASSIGNS `extension.markdownTransformer`
+        // (`extensions/loader.ts:309-312` @v0.84.1), so an extension has at most one fold step.
+        api.register_markdown_transformer();
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+    fn transform_markdown(&self, markdown: &str, ctx: &Value) -> String {
+        format!(
+            "{markdown}{}[{}|{}|{}]",
+            self.marker,
+            ctx["messageType"].as_str().unwrap_or("?"),
+            ctx["isStreaming"].as_bool().unwrap_or(false),
+            ctx["availableWidth"].as_u64().unwrap_or(0),
+        )
+    }
+}
+
+/// EXT-019 — pi's `getMarkdownTransformers()` is
+/// `this.extensions.flatMap(ext => ext.markdownTransformer ? [..] : [])`
+/// (`pi/packages/coding-agent/src/core/extensions/runner.ts:589-591` @v0.84.1), so the fold order
+/// IS extension load order and each transformer's output feeds the next.
+#[tokio::test]
+async fn ext019_markdown_transformers_fold_in_load_order_with_pis_context_fields() {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(MarkTransformer { id: "first", marker: "-A" })).await.unwrap();
+    host.load_native(Arc::new(MarkTransformer { id: "second", marker: "-B" })).await.unwrap();
+
+    let out = host.transform_markdown("body", "assistant-thinking", true, 80).await;
+    assert_eq!(
+        out, "body-A[assistant-thinking|true|80]-B[assistant-thinking|true|80]",
+        "each transformer's output is the next one's input, in LOAD order"
+    );
+
+    // The three `MarkdownTransformContext` fields (`extensions/types.ts:1147-1151`) really vary.
+    let settled = host.transform_markdown("x", "user", false, 40).await;
+    assert!(settled.contains("[user|false|40]"), "{settled}");
+}
+
+/// With no transformer registered the markdown is returned untouched and no fold runs — the
+/// upstream `flatMap` over zero transformers.
+#[tokio::test]
+async fn ext019_no_registered_transformer_is_the_identity() {
+    let host = ExtensionHost::new(cfg());
+    assert_eq!(host.transform_markdown("as-is", "assistant", false, 10).await, "as-is");
+}
+
+/// A PANICKING transformer is contained and SKIPPED: its input passes through unchanged, and the
+/// rest of the fold still runs. A presentation hook must never be able to blank a line of
+/// transcript (R-08-036) — pi's transformers run inside the interactive renderer, where a throw is
+/// caught at the component.
+struct PanickingTransformer;
+
+#[async_trait::async_trait]
+impl NativeExtension for PanickingTransformer {
+    fn id(&self) -> ExtensionId {
+        "panics".into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.register_markdown_transformer();
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+    fn transform_markdown(&self, _markdown: &str, _ctx: &Value) -> String {
+        panic!("transformer bug");
+    }
+}
+
+#[tokio::test]
+async fn ext019_a_panicking_transformer_is_contained_and_the_text_survives() {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(PanickingTransformer)).await.unwrap();
+    host.load_native(Arc::new(MarkTransformer { id: "after", marker: "-B" })).await.unwrap();
+
+    let out = host.transform_markdown("keep", "assistant", false, 20).await;
+    assert_eq!(
+        out, "keep-B[assistant|false|20]",
+        "the panicking step passes its input through untouched and the chain continues"
+    );
+}
+
+/// EXT-034, the re-entrancy half. A `Some(exclude)` on a dispatch means a guest is SUSPENDED inside
+/// one of its own host imports (`provider-stream.on-payload`) holding its single-instance
+/// `tokio::Mutex` store guard — the forced divergence documented on
+/// `Dispatcher::dispatch_block_mutate_excluding`. Draining there would await the guard that guest
+/// already holds and HANG, because a re-entrant `tokio::Mutex::lock` has no deadlock detection.
+///
+/// pi cannot hit this: its runner is one JS process, `createEventBus().emit` runs listeners inline,
+/// and a re-entered handler is an ordinary nested call.
+///
+/// The events must therefore stay QUEUED across an excluded seam and go out at the next ordinary
+/// one. Asserted with natives (which have no store to deadlock on) because the assertion is about
+/// the dispatcher's rule, not about wasm: if the rule regresses, a wasm run hangs instead of
+/// failing, and a hang is exactly what a test cannot report.
+#[tokio::test]
+async fn ext034_an_excluded_seam_defers_the_drain_instead_of_re_entering() {
+    let host = ExtensionHost::new(cfg());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    host.load_native(Arc::new(BusListener { seen: seen.clone() })).await.unwrap();
+
+    // Queue an event as if a guest had emitted from inside its own import.
+    host.bus().emit("demo:bus".into(), json!({"from": "suspended-guest"}));
+
+    // An EXCLUDED dispatch must not drain: the excluded guest is mid-import.
+    host.dispatcher()
+        .dispatch_notify_excluding(
+            &HostEvent::MessageStart { message: json!({"role": "user"}) },
+            &CancelToken::new(),
+            Some(&ExtensionId::from("suspended")),
+        )
+        .await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        0,
+        "an excluded seam must leave the queue alone — draining there re-enters a held store"
+    );
+    assert_eq!(host.bus().pending_len(), 1, "the event is still queued, not dropped");
+
+    // The next ORDINARY seam delivers it.
+    host.dispatcher()
+        .dispatch_notify(
+            &HostEvent::MessageStart { message: json!({"role": "user"}) },
+            &CancelToken::new(),
+        )
+        .await;
+    assert_eq!(seen.lock().unwrap().len(), 1, "deferred, not lost");
+}

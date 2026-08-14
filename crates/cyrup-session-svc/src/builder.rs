@@ -1286,7 +1286,13 @@ impl SessionBuilder {
         // The rebuilder base = the prompt inputs with the per-run tool fields cleared (re-derived
         // from the active set on each `setActiveToolsByName`).
         let mut rebuild_base = prompt_inputs.clone();
-        rebuild_base.selected_tools = Some(Vec::new());
+        // CLEARED, not "explicitly zero tools": since SESS-016 `None` means "unset — use pi's
+        // `selectedTools || [read,bash,edit,write]` default" and `Some(vec![])` means "the caller
+        // genuinely restricted the agent to no tools", which suppresses the skills section and every
+        // tool guideline. This placeholder is overwritten on every call
+        // (`PromptRebuilder::rebuild` assigns `inputs.selected_tools = Some(active…)`, tools.rs:61),
+        // so the value is never observed — but it must not READ as the restricted case.
+        rebuild_base.selected_tools = None;
         rebuild_base.tool_contributions = Vec::new();
         // Shared with `host_services` so a loaded guest's `setActiveTools`/`getActiveTools`
         // capability read+mutates the SAME authoritative active-tool view the host/CLI toggle uses

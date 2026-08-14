@@ -89,6 +89,12 @@ macro_rules! export_extension {
                 ) -> ::core::option::Option<::std::string::String> {
                     $crate::guest::render_result(custom_type, result_json)
                 }
+                fn transform_markdown(
+                    markdown: ::std::string::String,
+                    ctx_json: ::std::string::String,
+                ) -> ::std::string::String {
+                    $crate::guest::transform_markdown(markdown, ctx_json)
+                }
 
                 // --- provider OAuth + streamSimple + autocomplete stacking ---
                 fn provider_login(

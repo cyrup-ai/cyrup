@@ -808,8 +808,12 @@ async fn a09_5_local_path_install_list_remove() {
 #[tokio::test]
 async fn a09_5_update_skips_pinned_and_one_moves_it() {
     // Construct two git installs directly in the registry: one Default (bulk-updatable), one
-    // Tag-pinned (bulk-skipped). No network: refresh re-reads HEAD from a (possibly absent) local
-    // clone and degrades gracefully.
+    // Tag-pinned (bulk-skipped). Neither URL resolves, so the evidence that a package was ATTEMPTED
+    // is its appearance in `report.failed` — Pi's `ensureGitRef` (package-manager.ts:1870-1896
+    // @v0.83.0) opens with `runCommand("git", fetchArgs)`, which rejects on a non-zero exit and
+    // propagates. This test used to assert `report.updated.contains(&default_id)` for a
+    // `file:///x/a` that cannot be cloned: it passed VACUOUSLY, pinning the exact defect that a
+    // failed fetch was reported to the user as a successful update.
     let tmp = tempfile::tempdir().unwrap();
     let global = tmp.path().join("global");
     let store = PackageStore::new(global.clone(), None);
@@ -860,20 +864,150 @@ async fn a09_5_update_skips_pinned_and_one_moves_it() {
         "bulk update skips pinned (R-09-020)"
     );
     assert!(
-        report.updated.contains(&default_id),
-        "bulk update moves unpinned"
+        report.failed.iter().any(|(id, _)| id == &default_id),
+        "bulk update ATTEMPTS the unpinned package, and an unreachable remote is a failure"
+    );
+    assert!(
+        !report.updated.contains(&default_id),
+        "an unreachable remote must never be reported as an update"
     );
     assert!(!report.updated.contains(&tag_id));
+    assert!(
+        !report.failed.iter().any(|(id, _)| id == &tag_id),
+        "the pinned package was skipped, so it cannot have been attempted"
+    );
 
-    // update(One) moves the pinned package regardless.
+    // update(One) targets the pinned package regardless of the pin.
     let one = mgr
         .update(UpdateTarget::One(tag_id.clone()), CancelToken::new())
         .await
         .unwrap();
     assert!(
-        one.updated.contains(&tag_id),
-        "explicit update(One) moves a pinned package"
+        one.skipped_pinned.is_empty(),
+        "explicit update(One) does not skip a pinned package"
     );
+    assert!(
+        one.failed.iter().any(|(id, _)| id == &tag_id),
+        "explicit update(One) attempts the pinned package"
+    );
+}
+
+/// A git fetch that fails must leave the installed working tree byte-identical, and must be
+/// reported as a failure rather than an update.
+///
+/// Pi never clones over an existing tree: `installGit` early-returns into a fetch when
+/// `existsSync(targetDir)` (package-manager.ts:1822-1830 @v0.83.0) and `updateGit` fetches IN PLACE
+/// and only `git reset --hard`s once the fetch succeeded (`:1853-1868` → `ensureGitRef`
+/// `:1870-1896`), so an unreachable remote throws with the tree untouched.
+///
+/// Red at HEAD: `git_clone_url` opened with an unconditional `remove_dir_all(dir)`, so the tree was
+/// destroyed BEFORE the fetch could fail — one offline `cyrup update` wiped every git package's
+/// working tree — and `refresh` then swallowed the error, re-read nothing, and returned `Ok(())`,
+/// which `update` recorded in `report.updated`.
+#[tokio::test]
+async fn a_failed_git_update_preserves_the_installed_tree_and_is_reported_as_failed() {
+    let Some((_tmp, repo_dir)) = make_local_git_repo() else {
+        eprintln!("skipping failed-update test: `git` CLI not available");
+        return;
+    };
+    let url = format!("file://{}", repo_dir.display());
+
+    let global = tempfile::tempdir().unwrap();
+    let store = PackageStore::new(global.path().to_path_buf(), None);
+    let mgr = PackageManager::new(store.clone());
+    let (rec, _notice) = mgr
+        .install(
+            PackageSource::Git {
+                url,
+                reff: PinRef::Default,
+            },
+            InstallScope::Global,
+            true,
+            CancelToken::new(),
+        )
+        .await
+        .expect("initial clone over file://");
+
+    let dir = store
+        .package_dir(InstallScope::Global, &rec.id)
+        .expect("package dir");
+    assert!(dir.is_dir(), "the install materialized a working tree");
+    let listing = |p: &std::path::Path| {
+        let mut names: Vec<_> = fs::read_dir(p)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing(&dir);
+    assert!(!before.is_empty(), "the clone produced files");
+
+    // Make the remote unreachable, exactly as an offline machine or a deleted repo would.
+    fs::remove_dir_all(&repo_dir).unwrap();
+
+    let report = mgr
+        .update(UpdateTarget::All, CancelToken::new())
+        .await
+        .unwrap();
+    assert!(
+        report.failed.iter().any(|(id, _)| id == &rec.id),
+        "an unreachable remote is a per-package failure, not an update"
+    );
+    assert!(!report.updated.contains(&rec.id));
+
+    assert!(dir.is_dir(), "the installed working tree must still exist");
+    assert_eq!(before, listing(&dir), "the working tree must be unchanged");
+
+    // No staging or backup residue is left beside it.
+    let root = store.packages_root(InstallScope::Global).unwrap();
+    for entry in fs::read_dir(&root).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.ends_with(".cyrup-incoming") && !name.ends_with(".cyrup-previous"),
+            "staging residue left behind: {name}"
+        );
+    }
+}
+
+/// A git install whose clone fails part-way must leave NOTHING at the target path — Pi's
+/// `installGit` catch is `rmSync(targetDir, { recursive: true, force: true })`
+/// (package-manager.ts:1847 @v0.83.0).
+///
+/// Red at HEAD: the bare-on-disk-repo arm of `git_clone` `copy_tree`d the source into `dir` and only
+/// THEN resolved the ref, so a directory that is not a git repo left a full copy of itself at
+/// exactly the path `installed_dir` resolves — with no `packages.json` row behind it. Because
+/// `resolve_configured_package` keys off the DIRECTORY and not the registry, the orphan then loads
+/// as an installed package on every later session.
+#[tokio::test]
+async fn a_failed_git_install_leaves_no_partial_tree_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("not-a-repo");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("SKILL.md"), "---\nname: ghost\n---\n").unwrap();
+
+    let global = tempfile::tempdir().unwrap();
+    let store = PackageStore::new(global.path().to_path_buf(), None);
+    let mgr = PackageManager::new(store.clone());
+    let source = PackageSource::Git {
+        url: src.to_string_lossy().into_owned(),
+        reff: PinRef::Default,
+    };
+    let id = source.package_id();
+
+    mgr.install(source, InstallScope::Global, true, CancelToken::new())
+        .await
+        .expect_err("a directory that is not a git repo cannot be installed");
+
+    let dir = store
+        .package_dir(InstallScope::Global, &id)
+        .expect("package dir");
+    assert!(
+        !dir.exists(),
+        "a failed install must leave nothing at {}",
+        dir.display()
+    );
+    assert!(mgr.list().is_empty(), "and no registry row");
 }
 
 #[tokio::test]
@@ -2832,10 +2966,25 @@ async fn cfg003_settings_declared_package_is_discovered_with_its_filter() {
     );
 }
 
-/// A settings-declared package that is not on disk is a LOUD diagnostic, never a silent drop and
-/// never a failed discovery pass.
+/// A settings-declared package that cyrup would have to INSTALL to resolve is a LOUD diagnostic,
+/// never a silent drop and never a failed discovery pass.
+///
+/// The source must be a git one. Pi installs an uninstalled npm/git source on demand
+/// (`resolvePackageSources`, package-manager.ts:1287-1291 → `installMissing` `:1260-1271`
+/// @v0.83.0) and cyrup does no network install during session assembly, so the diagnostic is
+/// cyrup's documented `[CYRUP-DELTA]` for exactly that arm. A missing LOCAL path is a different
+/// upstream path entirely and is silent — see
+/// `cfg027_a_missing_local_package_path_is_a_silent_skip`.
+///
+/// The source string must carry a PROTOCOL. Pi's `parseGitUrl` bails at
+/// `if (!hasGitPrefix && !/^(https?|ssh|git):\/\//i.test(url)) return null;` (git.ts:177-179
+/// @v0.83.0), so a bare `github:org/pkg` shorthand — even though `isLocalPath` rejects it
+/// (paths.ts:41-55) — falls out of `parseSource`'s git branch and lands on its terminal
+/// `return { type: "local", path: source }` (package-manager.ts:1449-1459). Pi therefore treats
+/// `github:org/pkg` as a LOCAL path and is SILENT about it, and so is cyrup; only a
+/// protocol-qualified URL reaches the install arm this delta replaces.
 #[tokio::test]
-async fn cfg003_missing_settings_declared_package_is_an_error_diagnostic() {
+async fn cfg003_uninstallable_settings_declared_package_is_an_error_diagnostic() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("project");
     fs::create_dir_all(&cwd).unwrap();
@@ -2845,7 +2994,7 @@ async fn cfg003_missing_settings_declared_package_is_an_error_diagnostic() {
     let mut cfg = DiscoveryConfig::new(cwd, global);
     cfg.trusted_project = true;
     cfg.configured_packages = vec![crate::ConfiguredPackage {
-        source: "./absent-package".into(),
+        source: "https://github.com/org/absent-package".into(),
         scope: InstallScope::Global,
         filter: crate::PackageFilter::default(),
     }];
@@ -2854,9 +3003,136 @@ async fn cfg003_missing_settings_declared_package_is_an_error_diagnostic() {
         .diagnostics
         .iter()
         .find(|d| d.message.contains("absent-package"))
-        .expect("a missing declared package must be reported");
+        .expect("an uninstalled declared package must be reported");
     assert_eq!(d.diagnostic_type, DiagnosticType::Error);
     assert_eq!(d.resource_type, crate::ResourceKind::Package);
+}
+
+/// CFG-027: a settings-declared LOCAL package path that does not exist contributes nothing and
+/// reports nothing — Pi's `resolveLocalExtensionSource` opens with
+/// `if (!existsSync(resolved)) return;` (package-manager.ts:1324-1326 @v0.83.0), reached before any
+/// diagnostic could be produced. cyrup routed it into the git arm's "not installed at this path —
+/// run `cyrup install`" error, which is doubly wrong: `cyrup install` cannot materialize a path the
+/// user typed, and Pi is silent here.
+///
+/// A bare `github:org/pkg` shorthand takes the SAME silent arm: `isLocalPath` rejects it
+/// (paths.ts:41-55 @v0.83.0) but `parseGitUrl` bails on
+/// `if (!hasGitPrefix && !/^(https?|ssh|git):\/\//i.test(url)) return null;` (git.ts:177-179), and
+/// `parseSource` falls through to `return { type: "local", path: source }`
+/// (package-manager.ts:1449-1459). Only a protocol-qualified url is a git source — see
+/// `cfg003_uninstallable_settings_declared_package_is_an_error_diagnostic`.
+#[tokio::test]
+async fn cfg027_a_missing_local_package_path_is_a_silent_skip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+    // A real sibling package, so the pass is proven to still be running after the skip.
+    let present = global.join("present-pack");
+    make_package_tree(&present, true, false);
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.trusted_project = true;
+    cfg.configured_packages = vec![
+        crate::ConfiguredPackage {
+            source: "./absent-package".into(),
+            scope: InstallScope::Global,
+            filter: crate::PackageFilter::default(),
+        },
+        // Not a git source in Pi — no protocol, so `parseGitUrl` returns null and `parseSource`
+        // files it as `{ type: "local" }`. Silent, exactly like the `./` form above.
+        crate::ConfiguredPackage {
+            source: "github:org/absent-shorthand".into(),
+            scope: InstallScope::Global,
+            filter: crate::PackageFilter::default(),
+        },
+        crate::ConfiguredPackage {
+            source: "present-pack".into(),
+            scope: InstallScope::Global,
+            filter: crate::PackageFilter::default(),
+        },
+    ];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("absent-shorthand")),
+        "a `github:` shorthand is a LOCAL path in Pi and must be silent too: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("absent-package")),
+        "a missing LOCAL path must be silent: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.reason.contains("absent-package")),
+        "…including as a warning"
+    );
+    assert!(
+        report.registry.skills.contains("alpha"),
+        "the sibling entry must still resolve"
+    );
+}
+
+/// CFG-027: a settings-declared LOCAL package path that is a FILE registers as an extension
+/// directly — Pi's `resolveLocalExtensionSource` `:1330-1334` @v0.83.0 sets
+/// `metadata.baseDir = dirname(resolved)` and calls
+/// `addResource(accumulator.extensions, resolved, metadata, true)` without going anywhere near
+/// `collectPackageResources`. cyrup demanded a directory and dropped the entry with a "not installed
+/// at this path" error.
+#[tokio::test]
+async fn cfg027_a_local_package_entry_that_is_a_file_registers_as_an_extension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+    let ext_file = global.join("solo-ext.wasm");
+    fs::write(&ext_file, b"\0asm").unwrap();
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.trusted_project = true;
+    cfg.configured_packages = vec![crate::ConfiguredPackage {
+        source: "solo-ext.wasm".into(),
+        scope: InstallScope::Global,
+        filter: crate::PackageFilter::default(),
+    }];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        report
+            .registry
+            .ext_crate_paths
+            .iter()
+            .any(|p| p.ends_with("solo-ext.wasm")),
+        "a FILE entry is the extension: {:?}",
+        report.registry.ext_crate_paths
+    );
+    assert!(
+        report.diagnostics.is_empty(),
+        "and it is not an error: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
 }
 
 /// CFG-004: a PROJECT-scope settings-declared package is trust-gated (fail closed), exactly like the
@@ -3237,5 +3513,132 @@ async fn cfg010_project_delta_resolves_against_the_global_entrys_install_locatio
     assert!(
         !report.registry.skills.contains("alpha"),
         "the delta's `-` pattern reached the same tree and kept `alpha` off"
+    );
+}
+
+// ===========================================================================
+// CFG-035 — `.cyrup/SYSTEM.md` / `APPEND_SYSTEM.md` discovery
+// ===========================================================================
+
+/// CFG-035: `discoverSystemPromptFile` (`resource-loader.ts:1022-1034` @v0.83.0) — the project file
+/// wins ONLY when the project is trusted; otherwise the global file is used; otherwise nothing.
+///
+/// Before this landed, `grep -rn 'SYSTEM\.md' crates/` found the two filenames ONLY as trust-gate
+/// MARKERS (`cyrup-config/src/trust.rs:194`, `:203-204`) — cyrup prompted the user to trust a
+/// project *because of* a file it then never read.
+#[test]
+fn cfg035_system_prompt_file_is_discovered_project_first_under_trust() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent = tmp.path().join("agent");
+    fs::create_dir_all(cwd.join(".cyrup")).unwrap();
+    fs::create_dir_all(&agent).unwrap();
+
+    // Nothing on disk → `None` (resource-loader.ts:1033).
+    assert_eq!(crate::discover_system_prompt_file(&cwd, &agent, true), None);
+
+    // Global only → the global file, regardless of trust (`:1028-1031` is NOT trust-gated).
+    let global = agent.join("SYSTEM.md");
+    fs::write(&global, "global").unwrap();
+    assert_eq!(
+        crate::discover_system_prompt_file(&cwd, &agent, false),
+        Some(global.clone())
+    );
+    assert_eq!(
+        crate::discover_system_prompt_file(&cwd, &agent, true),
+        Some(global.clone())
+    );
+
+    // Project file present: it wins when trusted (`:1023-1026`) and is INVISIBLE when not.
+    let project = cwd.join(".cyrup/SYSTEM.md");
+    fs::write(&project, "project").unwrap();
+    assert_eq!(
+        crate::discover_system_prompt_file(&cwd, &agent, true),
+        Some(project.clone())
+    );
+    assert_eq!(
+        crate::discover_system_prompt_file(&cwd, &agent, false),
+        Some(global),
+        "an untrusted project falls through to the global file, not to None"
+    );
+
+    // Trusted, project file present, no global file.
+    fs::remove_file(agent.join("SYSTEM.md")).unwrap();
+    assert_eq!(
+        crate::discover_system_prompt_file(&cwd, &agent, true),
+        Some(project)
+    );
+    assert_eq!(
+        crate::discover_system_prompt_file(&cwd, &agent, false),
+        None
+    );
+}
+
+/// CFG-035: `discoverAppendSystemPromptFile` (`resource-loader.ts:1036-1048` @v0.83.0) is the same
+/// two-tier pair over `APPEND_SYSTEM.md`, and picks exactly ONE file — the project one SHADOWS the
+/// global one. `cyrup-session/src/prompt/overrides.rs:15-16` documents accumulation of both tiers;
+/// upstream does not accumulate.
+#[test]
+fn cfg035_append_system_prompt_file_picks_exactly_one_tier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent = tmp.path().join("agent");
+    fs::create_dir_all(cwd.join(".cyrup")).unwrap();
+    fs::create_dir_all(&agent).unwrap();
+    let project = cwd.join(".cyrup/APPEND_SYSTEM.md");
+    let global = agent.join("APPEND_SYSTEM.md");
+    fs::write(&project, "project").unwrap();
+    fs::write(&global, "global").unwrap();
+
+    assert_eq!(
+        crate::discover_append_system_prompt_file(&cwd, &agent, true),
+        Some(project),
+        "trusted: the project file shadows the global one — they never accumulate"
+    );
+    assert_eq!(
+        crate::discover_append_system_prompt_file(&cwd, &agent, false),
+        Some(global)
+    );
+    // The SYSTEM.md pair is independent of the APPEND_SYSTEM.md pair.
+    assert_eq!(crate::discover_system_prompt_file(&cwd, &agent, true), None);
+}
+
+/// CFG-035: the discovery rides out on `DiscoveryReport`, off the same `cwd` / `global_dir` /
+/// `trusted_project` the registry was built from — Pi computes both inside the same `reload()`
+/// (`resource-loader.ts:525`, `:531-535` @v0.83.0). This is the field
+/// `cyrup-session-svc/src/builder.rs` must consume as the FALLBACK for `custom_prompt` /
+/// `append_system_prompt` (the CLI flags take precedence, per Pi's `??`).
+#[tokio::test]
+async fn cfg035_discovery_report_carries_the_discovered_prompt_overrides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(cwd.join(".cyrup")).unwrap();
+    fs::create_dir_all(&global).unwrap();
+    fs::write(cwd.join(".cyrup/SYSTEM.md"), "project system").unwrap();
+    fs::write(global.join("APPEND_SYSTEM.md"), "global append").unwrap();
+
+    let mut cfg = DiscoveryConfig::new(cwd.clone(), global.clone());
+    cfg.trusted_project = true;
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert_eq!(
+        report.system_prompt_file,
+        Some(cwd.join(".cyrup/SYSTEM.md"))
+    );
+    assert_eq!(
+        report.append_system_prompt_file,
+        Some(global.join("APPEND_SYSTEM.md"))
+    );
+
+    cfg.trusted_project = false;
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert_eq!(
+        report.system_prompt_file, None,
+        "an untrusted project's SYSTEM.md must not reach the prompt"
+    );
+    assert_eq!(
+        report.append_system_prompt_file,
+        Some(global.join("APPEND_SYSTEM.md")),
+        "the global tier is not trust-gated"
     );
 }

@@ -54,6 +54,63 @@ read onto live state without seeding it on the low-level API (AGENT-021) or reco
 per-turn model override (AGENT-029). AGENT-029 and AGENT-017 are coupled: shipping AGENT-017 alone
 turns AGENT-029 from latent into live.
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 02 — recount: 29 rows → 2 open (0 critical · 0 high · 0 medium · 2 low) + 1 tracker
+> (`AGENT-028`), and two new items filed and closed on arrival (`AGENT-034`, `AGENT-035`).** The
+> area's only high (`AGENT-030`) and 24 of its 26 counted items are closed. `AGENT-S01` promotes from
+> partially-closed to closed; `AGENT-S04` owes nothing here — its residual is area 01's.
+>
+> **The two remaining items are both blocked outside this crate**, and neither was declined on effort:
+> `AGENT-026` waits on `cyrup_provider::StreamOptions.sampling_params` (area 01, re-verified absent at
+> HEAD), and every fix site for `AGENT-027` is `crates/cyrup` or `crates/cyrup-ext` — two consecutive
+> sweeps reported it not-reached for that reason, and area 08 has now landed most of it.
+>
+> **The highest-yield finding here is a method, not a defect.** Sweep 2 exhausted the assigned backlog
+> before writing a line and then ran the verification this file's own Coverage section names as blind
+> spot 3 — reading pi's `packages/agent/test/agent-loop.test.ts` and `agent.test.ts`, which **no pass
+> had ever opened**. It produced `AGENT-034` immediately, because pi's suite asserts the exact throw
+> strings cyrup had rewritten. A second sweep comparing every literal error string in
+> `packages/agent/src/{agent,agent-loop,proxy}.ts` against the workspace produced `AGENT-035`.
+> **Blind spot 3 should be promoted: pi's own test suite is the highest-yield unexploited oracle in
+> this area.**
+>
+> **STRUCTURAL:** every path of the form `crates/cyrup-agent/tests/<x>.rs` in this file is stale —
+> there is no `crates/cyrup-agent/tests/` directory at all. Affects the citations in `AGENT-006`,
+> `-009`, `-016`, `-018`, `-019`, `-020`, `-021`, `-023`, `-024`, `-025`, `-029`, `DRIFT-039`'s body
+> and the Coverage "read first-hand" list. Add `crates/cyrup-agent/src/tests/area02_backlog.rs` to the
+> Coverage test list — it is where both sweeps' regressions live.
+>
+> **CROSS-CRATE, for whoever hits it:** `AgentError`'s `RunActive` and `NoMessages` variants now carry
+> payloads. The only consumer outside the crate is `SessionServiceError::Agent(#[from] …)`, which is
+> unaffected — but any `matches!(.., AgentError::RunActive)` written after 2026-08-14 needs
+> `RunActive(_)`.
+
+
 ## Status since the `1806375` / `9219dcd` baselines
 
 | ID | Status | Note |
@@ -107,37 +164,41 @@ turns AGENT-029 from latent into live.
 > `AGENT-028` is a **`tracker`** — it keeps its ID, its row and its full body, but proposes a scope
 > decision rather than work, so it is listed and **not counted**. Counted total: **26**.
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 0 medium, 2 low = 2** (`AGENT-026`, `AGENT-027`, both blocked outside this crate), plus the `AGENT-028` tracker and the two provenance rows. `AGENT-034` and `AGENT-035` were filed and closed in the same pass. "Counted total: **26**" above is superseded.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| AGENT-020 | low | parity-bug | S | `continue_run` drains the steering/follow-up queue before the run-active check — **REFUTED as filed 2026-08-13: the predicted loss does not occur on the normal path (5/5 delivered); critical → low** |
-| AGENT-030 | high | parity-bug | M | `AgentSession::prompt` gates on the agent's per-run flag, so a prompt in the post-run gap starts a second run |
-| AGENT-009 | medium | parity-bug | M | Error tool results diverge in `details` and in `tool_execution_end.result` shape |
-| AGENT-016 | medium | cyrup-original | S | Panicking tool in a parallel batch vanishes (unwind builds only) |
-| AGENT-017 | medium | stale-port | S | Per-turn refresh re-pushes only `tools`; mid-run model / thinking-level change never reaches the loop |
-| AGENT-021 | medium | parity-bug | S | `loop_fn::build_run_ctx` hardcodes `headers: None`, orphaning `AgentLoopConfig.gen_config.headers` |
-| AGENT-022 | medium | upstream-drift | M | `BeforeToolCallResult.terminate` — a blocking hook cannot stop the turn |
-| AGENT-029 | medium | parity-bug | S | A per-turn model override does not recompute the attribution header overlay |
-| AGENT-003 | low | parity-bug | S | `tool_execution_update` dropped when the bounded channel fills |
-| AGENT-010 | low | parity-bug | S | Loop-generated tool-error strings do not match pi's |
-| AGENT-011 | low | parity-bug | S | `state.error_message` gated wrongly and invents a message |
-| AGENT-012 | low | parity-bug | S | Abort checked before `before_tool_call`, and ordered below block |
-| AGENT-013 | low | parity-bug | S | Proxy HTTP failures lack pi's `Proxy error: …` message |
-| AGENT-015 | low | parity-bug | S | Aborted parallel batch: unprepared calls veto termination |
-| AGENT-018 | low | parity-bug | S | Reducer diverges on non-assistant `message_start` and on when `pendingToolCalls` clears |
-| AGENT-019 | low | test-defect | S | `a_02_2_parallel_completion_vs_source_order` asserts wall-clock latency and a sleep-derived order |
-| AGENT-023 | low | upstream-drift | S | `Agent::reset()` still wipes state under a live run; upstream now throws |
-| AGENT-024 | low | not-ported | S | The post-turn hooks receive no abort signal |
-| AGENT-025 | low | parity-bug | S | A `transform_context` / `convert_to_llm` failure emits the wrong `agent_end.messages` and never reports `aborted` |
-| AGENT-026 | low | upstream-drift | S | `samplingParams` absent from the proxy request body and from `StreamOptions` |
-| AGENT-027 | low | not-ported | S | `timings.ts` ported as one hardcoded namespace with 3 of 12 marks |
+| ~~AGENT-020~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `continue_run` drains the steering/follow-up queue before the run-active check — **REFUTED as filed 2026-08-13: the predicted loss does not occur on the normal path (5/5 delivered); critical → low** — **CLOSED 2026-08-14**: sweep 1 — the run-active guard is the first statement of `Agent::continue_run` and both drain sites restore via `PendingQueue::push_front` on `Err(RunActive)`; pinned by `src/tests/agent_loop.rs`. Re-verified by reading the code in sweep 2: the AGENT-020 comment cites agent.ts:351-353 @v0.83.0 and states plainly that it is a fast path only, because pi gets check-then-claim atomicity from single-threaded JS. |
+| ~~AGENT-030~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | M | `AgentSession::prompt` gates on the agent's per-run flag, so a prompt in the post-run gap starts a second run — **CLOSED 2026-08-14**: sweep 1 — `AgentSession::is_run_active()` exists (`cyrup-session-svc/src/session.rs:638`) as `!self.is_idle()` (driver_tx OR `agent.is_running()`), with an AGENT-030 citation block. |
+| ~~AGENT-009~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | Error tool results diverge in `details` and in `tool_execution_end.result` shape — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-016~~ | ~~medium~~ **CLOSED 2026-08-14** | cyrup-original | S | Panicking tool in a parallel batch vanishes (unwind builds only) — **CLOSED 2026-08-14**: sweep 1 — both batch modes wrap `tool.execute` in `AssertUnwindSafe(..).catch_unwind()` and convert an unwind into `Err(ToolError)`; pinned by `agent016_panicking_tool_keeps_its_slot_in_a_{parallel,sequential}_batch`. |
+| ~~AGENT-017~~ | ~~medium~~ **CLOSED 2026-08-14** | stale-port | S | Per-turn refresh re-pushes only `tools`; mid-run model / thinking-level change never reaches the loop — **CLOSED 2026-08-14**: sweep 1 — `cyrup-session-svc/src/hooks.rs:193-196` stamps `update.model` and `update.thinking_level` after the inner hook. The "Caveat from the refuter" about the hooks.rs:154-156 comment claiming the ordering "matches Pi exactly" was re-checked by area 08 in sweep 2 and is superseded by DRIFT-033's port. |
+| ~~AGENT-021~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `loop_fn::build_run_ctx` hardcodes `headers: None`, orphaning `AgentLoopConfig.gen_config.headers` — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-022~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | M | `BeforeToolCallResult.terminate` — a blocking hook cannot stop the turn — **CLOSED 2026-08-14**: sweep 1 — the extension half landed concurrently as EXT-049 (`cyrup-agent/src/hooks.rs:53-62`, `BeforeOutcome::Block{reason, terminate}`). Two areas fixed the two ends of one seam in one pass. |
+| ~~AGENT-029~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | A per-turn model override does not recompute the attribution header overlay — **CLOSED 2026-08-14**: sweep 1 — `HeaderFn`/`RunCtx::header_fn`/`Agent::set_header_fn` exist and `stream_assistant` resolves headers from the live per-turn model; guard `agent029_header_fn_is_keyed_on_the_dispatched_model`. |
+| ~~AGENT-003~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `tool_execution_update` dropped when the bounded channel fills — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-010~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Loop-generated tool-error strings do not match pi's — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-011~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `state.error_message` gated wrongly and invents a message — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-012~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Abort checked before `before_tool_call`, and ordered below block — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-013~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Proxy HTTP failures lack pi's `Proxy error: …` message — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-015~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Aborted parallel batch: unprepared calls veto termination — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-018~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Reducer diverges on non-assistant `message_start` and on when `pendingToolCalls` clears — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-019~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | `a_02_2_parallel_completion_vs_source_order` asserts wall-clock latency and a sleep-derived order — **CLOSED 2026-08-14**: sweep 1 — the 115 ms wall-clock bound is gone; the two tools rendezvous on a `tokio::sync::Barrier(2)` and `slow` parks on a oneshot released by a subscriber on `fast`'s `tool_execution_end`, so `ends == ["fast","slow"]` is a fact rather than a race. The only surviving `Duration` is a 10 s `timeout` documented in-source as a hang detector. Closes DRIFT-039 with it — one fix, two IDs. |
+| ~~AGENT-023~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | `Agent::reset()` still wipes state under a live run; upstream now throws — **CLOSED 2026-08-14**: sweep 1 — reset is refused while a run is in flight; pinned by `agent023_reset_is_refused_while_a_run_is_in_flight`. |
+| ~~AGENT-024~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | The post-turn hooks receive no abort signal — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-025~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | A `transform_context` / `convert_to_llm` failure emits the wrong `agent_end.messages` and never reports `aborted` — **CLOSED 2026-08-14**: sweep 1. |
+| AGENT-026 | low — **PARTIALLY CLOSED 2026-08-14** | upstream-drift | S | `samplingParams` absent from the proxy request body and from `StreamOptions` — **PARTIALLY CLOSED 2026-08-14**: sweep 1 + 2 — the proxy struct/wire/mapping half is done. **RE-VERIFIED BLOCKED in sweep 2, not deferred by choice**: a workspace-wide grep for `sampling_params\|samplingParams` hits ONLY `crates/cyrup-agent/src/proxy.rs`, so area 01's half is still entirely absent after its own sweep-2 pass. **RESIDUAL is area 01**: `cyrup_provider::StreamOptions.sampling_params` plus the merge over `Model.sampling_params` in the OpenAI-compatible adapters; then the one-line `ProxyStreamFn::options_from` copy (proxy.rs:677-682, currently `None`). Strike this area's "then thread it through `GenerationConfig` … and `AgentBuilder`" — landing that half alone is a field documented as live with no path to the wire, which is AGENT-021 verbatim. |
+| AGENT-027 | low — **PARTIALLY CLOSED 2026-08-14** | not-ported | S | `timings.ts` ported as one hardcoded namespace with 3 of 12 marks — **PARTIALLY CLOSED 2026-08-14**: sweep 2 (area 08) — `crates/cyrup/src/timings.rs` is now a namespaced port of `timings.ts` (process-global insertion-ordered table behind a `OnceLock<Mutex<..>>`, closed `TimingLabel { Main, Extensions }`, free `reset_timings`/`time`/`print_timings`, one titled group per namespace) and `main.rs` gained `createSessionManager`, `createRuntime`, `createAgentSessionRuntime`, `createAgentSession`, `resolveModelScope`, `readPipedStdin`, `prepareInitialMessage`. Two findings the item did not have: (a) `print_timings()` sat ABOVE the stdin-read/prompt-assembly block in the interactive and print/json arms, so any mark taken there was recorded and never printed — moved to pi's position (main.ts:899/:902); (b) `initTheme` has no cyrup counterpart at pi's position because cyrup's theme boot lives inside `run_interactive`, downstream of the print. **RESIDUAL: the `extensions` namespace producers in cyrup-ext's loader (`${extensionPath} module import` / `factory`) — area 06.** OWNERSHIP: nothing in crates/cyrup-agent marks or reads a timing; two consecutive sweeps reported it not-reached for that reason. |
 | AGENT-028 | *(tracker)* | upstream-drift | L | pi v0.84.x's typed telemetry contract has no cyrup counterpart — scope decision, not counted |
-| AGENT-031 | low | not-ported | S | `websocket_connect_timeout_ms` unreachable from the agent; the parsed setting has no consumer |
-| AGENT-032 | low | parity-bug | S | Two JS-falsy `||` fallbacks ported as `Option`-only fallbacks |
-| AGENT-033 | low | cyrup-original | S | A panicking event subscriber is swallowed where pi fails the run |
-| AGENT-S02 | low | not-ported | M | `Agent::subscribe` returns no detach handle and `on_event` receives no abort signal |
-| AGENT-S03 | low | not-ported | S | `StreamOptions.metadata` is unreachable from the agent loop |
-| AGENT-S01 | *(partially-closed)* | not-ported | S | Attribution headers — residuals filed as AGENT-021 / AGENT-029 |
-| AGENT-S04 | *(partially-closed)* | not-ported | S | `transport` — agent side done; downstream handed to area 01 |
+| ~~AGENT-031~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `websocket_connect_timeout_ms` unreachable from the agent; the parsed setting has no consumer — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-032~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Two JS-falsy `\|\|` fallbacks ported as `Option`-only fallbacks — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-033~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | A panicking event subscriber is swallowed where pi fails the run — **CLOSED 2026-08-14**: sweep 1 — disposition taken: option (a), pi parity. Records the resulting tension with cyrup's own R-02-048 wording ("a subscriber failure MUST NOT halt the loop"), which `spec/` is absent to adjudicate; the no-deadlock half of R-02-048 is preserved by `SettlementGuard` and is still asserted by the rewritten test. |
+| ~~AGENT-S02~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | M | `Agent::subscribe` returns no detach handle and `on_event` receives no abort signal — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-S03~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `StreamOptions.metadata` is unreachable from the agent loop — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-S01~~ | ~~*(partially-closed)*~~ **CLOSED 2026-08-14** | not-ported | S | Attribution headers — residuals filed as AGENT-021 / AGENT-029 — **CLOSED 2026-08-14**: sweep 1 — both residuals (AGENT-021, AGENT-029) are closed, so this promotes from partially-closed to closed. |
+| AGENT-S04 | *(partially-closed)* | not-ported | S | `transport` — agent side done; downstream handed to area 01 — **2026-08-14, still open**: sweep 2 — nothing owed by area 02. The agent-side wiring is present at HEAD (`StateInner.transport`, `Agent::set_transport`, the run-start snapshot overlay, and the read into `StreamOptions.transport` in `stream_assistant`); the residual is that nothing in crates/cyrup-provider consumes it — area 01. |
+| AGENT-034 | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2).** Six pi error strings collapsed into three generic Rust ones, and `prompt()` was missing pi's own run-active guard. pi keys FOUR distinct throws off `this.activeRun` (`prompt` agent.ts:341-343, `continue` :352, `reset` :335 @v0.84.1, `runWithLifecycle` :473) and TWO off the two `continue` surfaces' empty-transcript check (`Agent.continue` :357 = "No messages to continue from" vs agent-loop.ts:71/:128 = "Cannot continue: no messages in context"); `ContinueFromAssistant` is one string on all three pi sites and cyrup had a fourth. `AgentError::RunActive` became `RunActive(BusyEntry)` and `NoMessages` became `NoMessages(ContinueSurface)`. **The second half is CONTROL FLOW, not text: `Agent::prompt`/`prompt_with_images` had no guard at all and fell through to the latch, reporting the bare latch message instead of the one string in the family that tells the caller what to do.** User-visible because `SessionServiceError::Agent` re-emits `AgentError`'s Display verbatim (`"agent: {0}"`, cyrup-session-svc/src/error.rs:16-17), and pi's own suite asserts them. **Found by reading pi's `packages/agent/test/{agent,agent-loop}.test.ts` — an oracle NO pass had ever opened; blind spot 3 should be promoted accordingly.** |
+| AGENT-035 | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2).** An aborted proxy stream reported `"aborted"` where pi reports `Request aborted by user`, and a post-drain abort emitted NO terminal event at all. pi's `streamProxy` checks the abort signal by hand at two points (proxy.ts:186-190, :208-211) and its outer catch copies that literal into `partial.errorMessage` before pushing the terminal `error` event; cyrup surfaced `ProviderError::Aborted`'s bare Display, and pi's SECOND check — between the drained read loop and `stream.end()` — had no counterpart, so a cancel landing after the frame stream returned `None` closed SILENTLY. Both fixed in `crates/cyrup-agent/src/proxy.rs`. Sibling of AGENT-013 on the same seam and the same class. One `[CYRUP-DELTA]`: pi has a second abort string on this path (undici's AbortError, when the abort interrupts `fetch`/`reader.read()` mid-await) that cyrup cannot reproduce, because `open_sse`'s frame stream is itself cancel-aware (a `biased` select at cyrup-provider/src/stream/sse.rs:406-412), so both of pi's cases collapse onto one value. The string pi's own SOURCE contains is the one ported; the other is a JS-runtime artifact. |
 
 ## AGENT-020 — `continue_run` drains the steering/follow-up queue before the run-active check
 

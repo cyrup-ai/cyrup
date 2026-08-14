@@ -50,6 +50,7 @@ mod support;
 /// The live-guest component + `HostConfig` helper (was `crates/cyrup-ext/tests/fixture/mod.rs`).
 mod fixture;
 
+mod abi_fingerprint_invalidation;
 mod build_tier1;
 mod discover_load;
 mod guest_host_mode;

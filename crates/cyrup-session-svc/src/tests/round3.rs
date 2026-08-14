@@ -191,6 +191,117 @@ async fn execute_bash_records_result_and_persists() {
     session.abort_bash();
 }
 
+/// Poll until `path` exists — the "poll until observed" barrier, NOT a fixed sleep: the thing being
+/// waited on is a side effect of a real child PROCESS, which no in-process level-triggered primitive
+/// can observe. The bound converts a hang into a named failure; it is never the assertion.
+async fn await_marker(path: &std::path::Path) {
+    for _ in 0..5_000 {
+        if path.exists() {
+            return;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("marker {path:?} never appeared — the child never started");
+}
+
+/// A shell snippet that announces itself by creating `started` and then blocks until `go` appears,
+/// so the test can synchronize on the child's real state instead of on the clock.
+fn blocking_command(started: &std::path::Path, go: &std::path::Path) -> String {
+    format!(
+        "touch {}; while [ ! -f {} ]; do sleep 0.01; done; echo done",
+        started.display(),
+        go.display()
+    )
+}
+
+/// DRIFT-029 — `abort_bash` must cancel EVERY in-flight command, not just the most recent.
+///
+/// Pi holds `_bashAbortControllers = new Set<AbortController>()` (agent-session.ts:337 @v0.83.0),
+/// adds one handle per `executeBash` call (`:2771`), and aborts a spread COPY of the whole set
+/// (`:2833-2835`). cyrup held a single `Option<CancelToken>` slot that each call overwrote, so with
+/// two commands in flight the first was orphaned and ran on after the user asked to stop.
+///
+/// RED before the fix: the first command is never cancelled, so its join handle never resolves and
+/// the bounded await below reports the orphan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drift029_abort_bash_cancels_every_in_flight_command() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session =
+        Arc::new(SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap());
+
+    let started_a = fx.cwd.join("started-a");
+    let started_b = fx.cwd.join("started-b");
+    let never = fx.cwd.join("never-created");
+
+    let cmd_a = blocking_command(&started_a, &never);
+    let cmd_b = blocking_command(&started_b, &never);
+    let (sa, sb) = (Arc::clone(&session), Arc::clone(&session));
+    let task_a =
+        tokio::spawn(async move { sa.execute_bash(&cmd_a, BashOptions::default(), None).await });
+    let task_b =
+        tokio::spawn(async move { sb.execute_bash(&cmd_b, BashOptions::default(), None).await });
+
+    // Both children are genuinely running before the abort — no clock involved.
+    await_marker(&started_a).await;
+    await_marker(&started_b).await;
+    assert!(session.is_bash_running(), "two commands are in flight");
+
+    session.abort_bash();
+
+    let a = task_a.await.unwrap().expect("the cancelled command still returns a result");
+    let b = task_b.await.unwrap().expect("the cancelled command still returns a result");
+    assert!(a.cancelled, "the FIRST command must be cancelled too (it was orphaned): {a:?}");
+    assert!(b.cancelled, "the second command must be cancelled: {b:?}");
+    assert!(!session.is_bash_running(), "the set drains as each call's guard drops");
+}
+
+/// DRIFT-029, second half — `is_bash_running` must answer on the whole set (pi's
+/// `this._bashAbortControllers.size > 0`, agent-session.ts:2840 @v0.83.0), so the FIRST command to
+/// finish may not report the session idle while another is still executing.
+///
+/// RED before the fix: `execute_bash`'s completion path cleared the single slot unconditionally, so
+/// the assertion right after `task_a` finishes read `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drift029_is_bash_running_answers_on_the_whole_set() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session =
+        Arc::new(SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap());
+
+    let started_a = fx.cwd.join("started-a");
+    let started_b = fx.cwd.join("started-b");
+    let go_a = fx.cwd.join("go-a");
+    let go_b = fx.cwd.join("go-b");
+
+    let cmd_a = blocking_command(&started_a, &go_a);
+    let cmd_b = blocking_command(&started_b, &go_b);
+    let (sa, sb) = (Arc::clone(&session), Arc::clone(&session));
+    let task_a =
+        tokio::spawn(async move { sa.execute_bash(&cmd_a, BashOptions::default(), None).await });
+    let task_b =
+        tokio::spawn(async move { sb.execute_bash(&cmd_b, BashOptions::default(), None).await });
+
+    await_marker(&started_a).await;
+    await_marker(&started_b).await;
+    assert!(session.is_bash_running());
+
+    // Release ONLY the first command and wait for it to actually return.
+    std::fs::write(&go_a, b"").unwrap();
+    let a = task_a.await.unwrap().expect("the released command completes");
+    assert_eq!(a.exit_code, Some(0));
+    assert!(
+        session.is_bash_running(),
+        "the second command is still executing — a finished sibling may not report the session idle"
+    );
+
+    std::fs::write(&go_b, b"").unwrap();
+    let b = task_b.await.unwrap().expect("the released command completes");
+    assert_eq!(b.exit_code, Some(0));
+    assert!(!session.is_bash_running(), "both handles removed once both calls returned");
+}
+
 /// The immediate-bash (`!!`/RPC) seam must prepend the managed `agent_dir/bin` onto the child
 /// `PATH` exactly like the agent-loop `bash` tool does (Pi `getShellEnv()`'s unconditional
 /// `getBinDir()` prefix, `utils/shell.ts:122-128`, reached via `createLocalBashOperations`'s

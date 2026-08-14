@@ -74,7 +74,7 @@ async fn an_observed_idle_agent_always_accepts_the_next_run() {
 
         match result {
             Ok(()) => {}
-            Err(AgentError::RunActive) => panic!(
+            Err(AgentError::RunActive(_)) => panic!(
                 "round {round}: `is_running()` reported the agent idle and `prompt` was then \
                  refused with RunActive — the idle observation and the run-start guard are reading \
                  two different cells again"
@@ -156,7 +156,7 @@ async fn concurrent_starts_admit_exactly_one_run() {
     for task in tasks {
         match task.await.expect("no task panics") {
             Ok(()) => accepted += 1,
-            Err(AgentError::RunActive) => {}
+            Err(AgentError::RunActive(_)) => {}
             Err(other) => panic!("unexpected prompt failure: {other:?}"),
         }
     }

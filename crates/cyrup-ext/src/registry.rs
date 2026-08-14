@@ -223,6 +223,15 @@ struct RegistryInner {
     /// `CustomEntryComponent` (which draws a failure box on a throw, `custom-entry.ts:47-52`). Same
     /// custom type may legitimately be claimed by different extensions on the two surfaces.
     entry_renderer_owner: HashMap<String, ExtensionId>,
+    /// Extensions that registered a markdown transformer, in LOAD ORDER (EXT-019).
+    ///
+    /// pi stores AT MOST ONE per extension — `extension.markdownTransformer = transformer`
+    /// (`extensions/loader.ts:309-312` @v0.84.1, field at `types.ts:1703`) — and collects them with
+    /// `getMarkdownTransformers(): this.extensions.flatMap(ext => ext.markdownTransformer ? [..] :
+    /// [])` (`runner.ts:589-591`), so the fold order IS extension load order. A `Vec` (not a map)
+    /// for exactly that reason; re-registration by the same owner is idempotent rather than a
+    /// second fold step, because upstream's field ASSIGNMENT replaces rather than appends.
+    markdown_transformers: Vec<ExtensionId>,
 }
 
 impl ExtensionRegistry {
@@ -433,6 +442,24 @@ impl ExtensionRegistry {
     }
 
     /// The extension that renders custom messages of `custom_type` (first-wins), if any.
+    /// Record that `owner` registered a markdown transformer (EXT-019; pi
+    /// `registerMarkdownTransformer`, `extensions/loader.ts:309-312` @v0.84.1). Idempotent per
+    /// owner: upstream ASSIGNS `extension.markdownTransformer`, so a second registration by the
+    /// same extension replaces its single transformer rather than adding a fold step.
+    pub fn register_markdown_transformer(&self, owner: ExtensionId) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        if !g.markdown_transformers.contains(&owner) {
+            g.markdown_transformers.push(owner);
+        }
+        Ok(())
+    }
+
+    /// Extensions with a markdown transformer, in load order (pi
+    /// `ExtensionRunner.getMarkdownTransformers()`, `extensions/runner.ts:589-591` @v0.84.1).
+    pub fn markdown_transformer_owners(&self) -> Result<Vec<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.markdown_transformers.clone())
+    }
+
     pub fn message_renderer_owner(&self, custom_type: &str) -> Result<Option<ExtensionId>, ExtError> {
         Ok(self.lock_read()?.message_renderer_owner.get(custom_type).cloned())
     }
@@ -474,8 +501,20 @@ impl ExtensionRegistry {
         Ok(out)
     }
 
-    /// `ToolInfo[]` for every registered tool (Pi `getAllTools`, types.ts:1260): name + source +
-    /// parameter schema. First-registration-wins order (matches [`Self::all_registered_tool_names`]).
+    /// `ToolInfo[]` for every registered tool (Pi `getAllTools`, `extensions/types.ts:1323`,
+    /// implemented at `core/agent-session.ts:906-914` @v0.83.0). First-registration-wins order
+    /// (matches [`Self::all_registered_tool_names`]).
+    ///
+    /// EXT-060 — the emitted object is EXACTLY pi's five keys:
+    /// `ToolInfo = Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> &
+    /// {sourceInfo}` (`extensions/types.ts:1552-1554` @v0.83.0). It previously also carried a
+    /// cyrup-invented `source: "extension"|"guest"` discriminator, which leaked cyrup's
+    /// native-vs-WASM TIER onto a guest-facing parity surface — a distinction pi's one-extension-kind
+    /// model has no word for, and one a guest could read and branch on. Note that pi DOES have a
+    /// `source` on the sibling command info (`SlashCommandSource = "extension"|"prompt"|"skill"`,
+    /// `core/slash-commands.ts:4`), which is what makes the key look plausible here; it is not the
+    /// same field and does not license one. The tier a tool runs in is already recoverable from
+    /// `sourceInfo` if a guest genuinely needs provenance.
     pub fn tool_info(&self) -> Result<Vec<Value>, ExtError> {
         let g = self.lock_read()?;
         let mut out: Vec<Value> = Vec::new();
@@ -487,9 +526,16 @@ impl ExtensionRegistry {
             if let Some(t) = g.tools.get(n) {
                 out.push(serde_json::json!({
                     "name": t.name(),
-                    "source": "extension",
                     "description": t.description(),
                     "parameters": t.parameters(),
+                    // EXT-038: pi's `ToolInfo` is
+                    // `Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> &
+                    // {sourceInfo}` (`extensions/types.ts:1551-1553` @v0.83.0), produced by
+                    // `getAllTools()` at `core/agent-session.ts:906-914`. Both trailing fields were
+                    // simply absent, so an extension reading this API could not see the guidelines
+                    // a tool contributes to the system prompt, nor where a tool came from.
+                    "promptGuidelines": t.prompt_guidelines(),
+                    "sourceInfo": tool_source_info(g.tool_owner.get(n)),
                 }));
             }
         }
@@ -497,12 +543,13 @@ impl ExtensionRegistry {
             if !seen.insert(n.clone()) {
                 continue;
             }
-            if let Some((_, d)) = g.guest_tools.get(n) {
+            if let Some((owner, d)) = g.guest_tools.get(n) {
                 out.push(serde_json::json!({
                     "name": d.name,
-                    "source": "guest",
                     "description": d.description,
                     "parameters": d.parameters,
+                    "promptGuidelines": d.prompt_guidelines,
+                    "sourceInfo": tool_source_info(Some(owner)),
                 }));
             }
         }
@@ -1029,4 +1076,21 @@ pub fn build_builtin_keybindings(
         }
     }
     out
+}
+
+/// pi's `SourceInfo` for a registered tool (`core/source-info.ts:6-12` @v0.83.0:
+/// `{path, source, scope, origin, baseDir?}`), in the SYNTHETIC form
+/// `createSyntheticSourceInfo` produces (`:24-38`: scope "temporary", origin "top-level").
+///
+/// EXT-038: cyrup's registry knows the owning extension id and nothing else — a discovered
+/// extension's on-disk path is held by the loader, not here — so the id fills both `path` and
+/// `source`. That is still strictly more than the field being absent, which is what a guest saw.
+fn tool_source_info(owner: Option<&ExtensionId>) -> Value {
+    let name = owner.map(ToString::to_string).unwrap_or_default();
+    serde_json::json!({
+        "path": name,
+        "source": name,
+        "scope": "temporary",
+        "origin": "top-level",
+    })
 }

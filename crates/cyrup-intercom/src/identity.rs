@@ -22,6 +22,13 @@ pub const ENV_INTERCOM_SESSION_ID: &str = "CYRUP_INTERCOM_SESSION_ID";
 pub const ENV_INTERCOM_ASK_TIMEOUT_MS: &str = "CYRUP_INTERCOM_ASK_TIMEOUT_MS";
 /// `CYRUP_INTERCOM_NAME_POLL_MS` (`index.ts:420-429`, pi `PI_INTERCOM_NAME_POLL_MS`).
 pub const ENV_INTERCOM_NAME_POLL_MS: &str = "CYRUP_INTERCOM_NAME_POLL_MS";
+/// `CYRUP_INTERCOM_LIVENESS_INTERVAL_MS` (pi `PI_INTERCOM_LIVENESS_INTERVAL_MS`,
+/// `v0.10.1 broker/client.ts:48`). Declared here rather than in `transport/client.rs` because this
+/// module is the crate's single env inventory; the resolver below is the port of `client.ts:47-50`.
+pub const ENV_INTERCOM_LIVENESS_INTERVAL_MS: &str = "CYRUP_INTERCOM_LIVENESS_INTERVAL_MS";
+/// `CYRUP_INTERCOM_LIVENESS_TIMEOUT_MS` (pi `PI_INTERCOM_LIVENESS_TIMEOUT_MS`,
+/// `v0.10.1 broker/client.ts:53`).
+pub const ENV_INTERCOM_LIVENESS_TIMEOUT_MS: &str = "CYRUP_INTERCOM_LIVENESS_TIMEOUT_MS";
 /// `CYRUP_INTERCOM_STABLE_ID` (pi `STABLE_INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_STABLE_ID"`,
 /// `v0.10.1 index.ts:42`), resolved by `resolveConfiguredIntercomSessionId`
 /// (`v0.10.1 index.ts:434-436`) and consumed at register.
@@ -98,6 +105,83 @@ pub fn name_poll_ms_from(env: impl Fn(&str) -> Option<String>) -> u64 {
             _ => DEFAULT_NAME_POLL_MS,
         },
         None => DEFAULT_NAME_POLL_MS,
+    }
+}
+
+/// `Number.parseInt(raw, 10)` — the parse the liveness resolvers use, which is **not** the `Number()`
+/// [`name_poll_ms_from`] uses. `parseInt` skips leading whitespace, takes an optional sign, then
+/// consumes the longest run of decimal digits and STOPS at the first non-digit: `"30abc"` → 30,
+/// `"30.9"` → 30, `"1e3"` → 1, `"0x10"` (radix 10) → 0, `""`/`"abc"`/`" "` → `NaN`. The result is a
+/// JS `Number`, so an enormous digit run is a finite `f64`, never an error — hence `f64` here rather
+/// than an integer parse that would fall back to the default on overflow.
+fn js_parse_int_base10(raw: &str) -> Option<f64> {
+    let s = raw.trim_start();
+    let mut chars = s.chars().peekable();
+    let negative = match chars.peek() {
+        Some('-') => {
+            chars.next();
+            true
+        }
+        Some('+') => {
+            chars.next();
+            false
+        }
+        _ => false,
+    };
+    let digits: String = std::iter::from_fn(|| chars.next_if(char::is_ascii_digit)).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    // A digit-only string always parses as `f64` (saturating to `f64::INFINITY` past ~1e308, which
+    // `Number.isFinite` then rejects — exactly as JS does).
+    let value: f64 = digits.parse().unwrap_or(f64::INFINITY);
+    Some(if negative { -value } else { value })
+}
+
+/// `getLivenessIntervalMs()` (`v0.10.1 broker/client.ts:47-50`):
+///
+/// ```text
+/// const raw = Number.parseInt(process.env.PI_INTERCOM_LIVENESS_INTERVAL_MS ?? "", 10);
+/// return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
+/// ```
+#[must_use]
+pub fn liveness_interval_ms() -> u64 {
+    liveness_interval_ms_from(&|k| std::env::var(k).ok())
+}
+
+/// The pure core of [`liveness_interval_ms`].
+#[must_use]
+pub fn liveness_interval_ms_from(env: &dyn Fn(&str) -> Option<String>) -> u64 {
+    const DEFAULT_LIVENESS_INTERVAL_MS: u64 = 30_000;
+    match env(ENV_INTERCOM_LIVENESS_INTERVAL_MS).as_deref().and_then(js_parse_int_base10) {
+        Some(v) if v.is_finite() && v > 0.0 => v as u64,
+        _ => DEFAULT_LIVENESS_INTERVAL_MS,
+    }
+}
+
+/// `getLivenessTimeoutMs()` (`v0.10.1 broker/client.ts:52-55`):
+///
+/// ```text
+/// const raw = Number.parseInt(process.env.PI_INTERCOM_LIVENESS_TIMEOUT_MS ?? "", 10);
+/// return Number.isFinite(raw) && raw > 0 ? Math.min(raw, getLivenessIntervalMs()) : 5_000;
+/// ```
+///
+/// The `Math.min` clamp is inside the CONFIGURED branch only: an unset timeout is a flat 5 000 ms
+/// and is **not** clamped down to a shorter configured interval. That asymmetry is upstream's and is
+/// reproduced verbatim — a `PI_INTERCOM_LIVENESS_INTERVAL_MS=1000` with no timeout override really
+/// does probe every second under a 5 s deadline there.
+#[must_use]
+pub fn liveness_timeout_ms() -> u64 {
+    liveness_timeout_ms_from(&|k| std::env::var(k).ok())
+}
+
+/// The pure core of [`liveness_timeout_ms`].
+#[must_use]
+pub fn liveness_timeout_ms_from(env: &dyn Fn(&str) -> Option<String>) -> u64 {
+    const DEFAULT_LIVENESS_TIMEOUT_MS: u64 = 5_000;
+    match env(ENV_INTERCOM_LIVENESS_TIMEOUT_MS).as_deref().and_then(js_parse_int_base10) {
+        Some(v) if v.is_finite() && v > 0.0 => (v as u64).min(liveness_interval_ms_from(env)),
+        _ => DEFAULT_LIVENESS_TIMEOUT_MS,
     }
 }
 
@@ -187,6 +271,65 @@ pub fn presence_name(session_name: Option<&str>, session_id: &str) -> String {
 #[must_use]
 pub fn short_session_id(session_id: &str) -> String {
     session_id.chars().take(8).collect()
+}
+
+/// `duplicateSessionNames` (`v0.10.1 index.ts:379-386`): the lowercased names held by MORE THAN ONE
+/// session in a roster.
+///
+/// ```text
+/// new Set(
+///   sessions.map(s => s.name?.toLowerCase())
+///     .filter((name): name is string => Boolean(name))
+///     .filter((name, index, names) => names.indexOf(name) !== index)
+/// )
+/// ```
+///
+/// Two mechanism notes: the `Boolean(name)` filter drops `undefined` **and** `""`, so an empty name
+/// is never "duplicated"; and `names.indexOf(name) !== index` runs over the ALREADY-FILTERED array,
+/// so the surviving indices are the second and later occurrences. Counting occurrences reproduces
+/// that exactly and is what the `> 1` below expresses.
+#[must_use]
+pub fn duplicate_session_names<'a, I>(names: I) -> std::collections::HashSet<String>
+where
+    I: IntoIterator<Item = Option<&'a str>>,
+{
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for name in names {
+        let Some(name) = name.filter(|n| !n.is_empty()) else { continue };
+        *counts.entry(name.to_lowercase()).or_insert(0) += 1;
+    }
+    counts.into_iter().filter(|(_, count)| *count > 1).map(|(name, _)| name).collect()
+}
+
+/// `formatSessionLabel` (`v0.10.1 index.ts:440-446`): how a peer is NAMED back to the human in the
+/// picker, the compose header and the sent-confirmation.
+///
+/// ```text
+/// if (!session.name) return session.id;
+/// return duplicates.has(session.name.toLowerCase())
+///   ? `${session.name} (${session.id.slice(0, 8)})`
+///   : session.name;
+/// ```
+///
+/// `!session.name` is a truthiness test, so an empty name falls through to the raw id — the same
+/// `||`-shaped rule `formatSessionListRow` uses, but resolving to the **id** rather than to
+/// "Unnamed session". The 8-char suffix is deliberately [`short_session_id`] and not the
+/// distinguishing [`session_id_prefixes`]: the label is disambiguating text for a human who has the
+/// picker in front of them, not an addressable token.
+#[must_use]
+pub fn format_session_label(
+    name: Option<&str>,
+    session_id: &str,
+    duplicates: &std::collections::HashSet<String>,
+) -> String {
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return session_id.to_string();
+    };
+    if duplicates.contains(&name.to_lowercase()) {
+        format!("{name} ({})", short_session_id(session_id))
+    } else {
+        name.to_string()
+    }
 }
 
 /// `sessionIdPrefixes` (`v0.10.1 index.ts:387-406`, v0.9.3 `72309e0` "fix: show unique session ID
@@ -388,6 +531,43 @@ mod tests {
         assert_eq!(presence_name(None, b), "subagent-chat-0192f3c1-9a10-7f21");
     }
 
+    /// `formatSessionLabel` + `duplicateSessionNames` (`v0.10.1 index.ts:379-386,440-446`) —
+    /// ICOM-013's residual. The unique-name case must NOT carry an id suffix, or every peer label
+    /// in the picker, the compose header and the sent-confirmation would grow one.
+    #[test]
+    fn a_session_label_carries_its_id_suffix_only_when_the_name_is_ambiguous() {
+        let roster = [Some("reviewer"), Some("Reviewer"), Some("builder"), None, Some("")];
+        let duplicates = duplicate_session_names(roster);
+        // Case-insensitive: `reviewer` and `Reviewer` collide.
+        assert!(duplicates.contains("reviewer"));
+        assert!(!duplicates.contains("builder"));
+        // `Boolean(name)` drops both `undefined` and `""`, so neither can ever be "duplicated" —
+        // two unnamed sessions must not both start rendering an id suffix.
+        assert!(!duplicates.contains(""));
+        assert_eq!(duplicates.len(), 1);
+
+        let id = "0192f3c1-9a10-7000-8000-aaaaaaaaaaaa";
+        assert_eq!(format_session_label(Some("builder"), id, &duplicates), "builder");
+        assert_eq!(
+            format_session_label(Some("Reviewer"), id, &duplicates),
+            "Reviewer (0192f3c1)",
+            "the original casing is preserved; only the LOOKUP is lowercased"
+        );
+        // `!session.name` is a truthiness test, so an absent OR empty name is the raw id — not
+        // "Unnamed session", which is `formatSessionListRow`'s rule, not this one.
+        assert_eq!(format_session_label(None, id, &duplicates), id);
+        assert_eq!(format_session_label(Some(""), id, &duplicates), id);
+    }
+
+    /// A name held three times is still one duplicate entry — the `indexOf(name) !== index` filter
+    /// keeps occurrences 2..n, and the `Set` collapses them.
+    #[test]
+    fn duplicate_session_names_collapses_repeats() {
+        let duplicates = duplicate_session_names([Some("worker"), Some("worker"), Some("WORKER")]);
+        assert_eq!(duplicates.len(), 1);
+        assert!(duplicates.contains("worker"));
+    }
+
     /// `v0.10.1 index.ts:387-406`. Two ids sharing 20 characters must get prefixes that differ, are
     /// at least 8 chars, and are extended to (but excluding) the next `-` group boundary.
     #[test]
@@ -443,6 +623,61 @@ mod tests {
         assert_eq!(name_poll_ms_from(|_| Some("-5".to_string())), 1000);
         assert_eq!(name_poll_ms_from(|_| Some("250".to_string())), 250);
         assert_eq!(name_poll_ms_from(|_| Some("1500.5".to_string())), 1500);
+    }
+
+    /// ICOM-038 / `v0.10.1 broker/client.ts:47-50`. `Number.parseInt(x, 10)` semantics, which are
+    /// NOT `Number(x)`: it stops at the first non-digit instead of rejecting the whole string.
+    #[test]
+    fn liveness_interval_ports_parse_int_not_number() {
+        fn with(raw: &str) -> u64 {
+            let raw = raw.to_string();
+            liveness_interval_ms_from(&|k: &str| {
+                (k == ENV_INTERCOM_LIVENESS_INTERVAL_MS).then(|| raw.clone())
+            })
+        }
+        assert_eq!(liveness_interval_ms_from(&|_| None), 30_000);
+        assert_eq!(with(""), 30_000);
+        assert_eq!(with("   "), 30_000);
+        assert_eq!(with("abc"), 30_000);
+        assert_eq!(with("0"), 30_000);
+        assert_eq!(with("-5"), 30_000);
+        assert_eq!(with("250"), 250);
+        // `Number("30abc")` is NaN but `parseInt("30abc", 10)` is 30 — the distinguishing case.
+        assert_eq!(with("30abc"), 30);
+        // `Number("1e3")` is 1000 but `parseInt("1e3", 10)` is 1 — the other distinguishing case.
+        assert_eq!(with("1e3"), 1);
+        assert_eq!(with("30.9"), 30);
+        assert_eq!(with(" 40 "), 40);
+        // Radix 10 reads `0` and stops at `x`; `0 > 0` is false, so the default applies.
+        assert_eq!(with("0x10"), 30_000);
+    }
+
+    /// ICOM-038 / `v0.10.1 broker/client.ts:52-55`. The `Math.min(raw, interval)` clamp applies to a
+    /// CONFIGURED timeout only; the 5 000 ms default is never clamped by a shorter interval.
+    #[test]
+    fn liveness_timeout_clamps_only_when_configured() {
+        fn resolve(interval: Option<&str>, timeout: Option<&str>) -> u64 {
+            let interval = interval.map(str::to_string);
+            let timeout = timeout.map(str::to_string);
+            liveness_timeout_ms_from(&|k: &str| {
+                if k == ENV_INTERCOM_LIVENESS_INTERVAL_MS {
+                    interval.clone()
+                } else if k == ENV_INTERCOM_LIVENESS_TIMEOUT_MS {
+                    timeout.clone()
+                } else {
+                    None
+                }
+            })
+        }
+        assert_eq!(resolve(None, None), 5_000);
+        assert_eq!(resolve(None, Some("abc")), 5_000);
+        assert_eq!(resolve(None, Some("0")), 5_000);
+        // Clamped down to the configured interval.
+        assert_eq!(resolve(Some("1000"), Some("9000")), 1_000);
+        // Under the interval: kept as-is.
+        assert_eq!(resolve(Some("9000"), Some("1000")), 1_000);
+        // The asymmetry: an unset timeout is NOT clamped by a shorter interval.
+        assert_eq!(resolve(Some("1000"), None), 5_000);
     }
 
     #[test]

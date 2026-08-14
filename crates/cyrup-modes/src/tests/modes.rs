@@ -1124,22 +1124,42 @@ async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
     assert_eq!(req["statusKey"], "git");
     assert!(req.get("statusText").is_none(), "a cleared status must omit statusText: {req:?}");
 
-    // SEAM-028 — this case DOCUMENTS a divergence; it does not bless one. cyrup's WIT collapsed
-    // pi's 3-arg `setWidget(key, content, options)` into one opaque JSON payload
-    // (`set-widget: func(widget-json: string)`, both `wit/world.wit` copies), so the emitter sends a
-    // cyrup-invented `widget` blob where pi's `RpcExtensionUIRequest` member pins
-    // `widgetKey: string; widgetLines: string[] | undefined; widgetPlacement?: "aboveEditor" |
-    // "belowEditor"` (`modes/rpc/rpc-types.ts:264-271`) and has NO `widget` key at all.
-    //
-    // Asserting the collapse as CORRECT is what made this suite certify the divergence and invited
-    // a revert of the fix, so the assertion below is the pi-shaped one and the case is `#[ignore]`d
-    // until SEAM-011 widens the WIT. Do not re-point it at `req["widget"]`.
-    host_services.set_widget(&serde_json::json!({"widget": "text", "text": "hi"}));
+    // SEAM-028/SEAM-011 — the WIT now carries pi's three `setWidget` arguments separately, so this
+    // case asserts pi's real member: `widgetKey: string; widgetLines: string[] | undefined;
+    // widgetPlacement?: "aboveEditor" | "belowEditor"` (`modes/rpc/rpc-types.ts:264-271` @v0.83.0),
+    // with NO `widget` key on any member of the union. Do NOT re-point it at `req["widget"]`.
+    host_services.set_widget(
+        "todo",
+        Some(&["one".to_string(), "two".to_string()]),
+        cyrup_ext::host::WidgetPlacement::AboveEditor,
+    );
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "setWidget");
-    // The `method` is the only part of this member cyrup gets right, so it is the only part
-    // asserted. The pi-shaped payload assertion lives in
-    // `set_widget_carries_pis_three_fields_and_no_widget_blob`, `#[ignore]`d against SEAM-011.
+    assert_eq!(req["widgetKey"], "todo");
+    assert_eq!(req["widgetLines"], serde_json::json!(["one", "two"]));
+    assert!(
+        req.get("widget").is_none(),
+        "pi's setWidget union member carries no `widget` key: {req:?}"
+    );
+    // `aboveEditor` is pi's documented default for an ABSENT `options.placement`
+    // (`extensions/types.ts:107-110`), and pi's `widgetPlacement: options?.placement` then omits the
+    // key — see the `[CYRUP-DELTA]` on the emitter.
+    assert!(
+        req.get("widgetPlacement").is_none(),
+        "the default placement is emitted as an absent key, as pi's `options?.placement` is: {req:?}"
+    );
+
+    // `content: undefined` is pi's REMOVE (`interactive-mode.ts:1935-1938`), and `JSON.stringify`
+    // drops the property — so `widgetLines` is ABSENT, never `null` (SEAM-053's rule).
+    host_services.set_widget("todo", None, cyrup_ext::host::WidgetPlacement::BelowEditor);
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "setWidget");
+    assert_eq!(req["widgetKey"], "todo");
+    assert!(
+        req.get("widgetLines").is_none(),
+        "a widget removal omits widgetLines rather than sending null: {req:?}"
+    );
+    assert_eq!(req["widgetPlacement"], "belowEditor", "a non-default placement IS emitted: {req:?}");
 
     // set_title → `{method:"setTitle", title}` (rpc-mode.ts:216-223).
     host_services.set_title("My Session");
@@ -1902,19 +1922,17 @@ async fn rpc_bash_honors_a_partial_user_bash_result_override() {
 /// "aboveEditor" | "belowEditor" }` (`modes/rpc/rpc-types.ts:264-271` @v0.83.0). The whole
 /// `RpcExtensionUIRequest` union carries **no** `widget` key on any member.
 ///
-/// cyrup emits a cyrup-invented `{"widget": <blob>}` instead, because both `wit/world.wit` copies
-/// declare `set-widget: func(widget-json: string)` — one opaque payload where pi has three typed
-/// fields. An RPC client written to pi's contract therefore cannot render extension widgets at all:
-/// no key to key on, no lines to draw, no placement.
+/// cyrup emitted a cyrup-invented `{"widget": <blob>}` instead, because both `wit/world.wit` copies
+/// declared `set-widget: func(widget-json: string)` — one opaque payload where pi has three typed
+/// fields. An RPC client written to pi's contract could not render extension widgets at all: no key
+/// to key on, no lines to draw, no placement.
 ///
-/// Ignored, not deleted, and deliberately written in pi's shape: this is the assertion that must go
-/// green when SEAM-011 widens the WIT, and its presence is what stops the divergence being
-/// re-certified as correct by the sibling case above.
+/// This case was `#[ignore]`d against SEAM-011 and written in pi's shape so it would go green the
+/// moment the WIT widened. It has, so it runs.
 #[tokio::test]
-#[ignore = "SEAM-011: cyrup's WIT collapses pi's 3-arg setWidget into one opaque blob"]
 async fn set_widget_carries_pis_three_fields_and_no_widget_blob() {
     let effect = cyrup_session_svc::UiEffect::SetWidget {
-        widget: serde_json::json!({"widget": "text", "text": "hi"}),
+        widget: serde_json::json!({"key": "text", "lines": ["hi"], "placement": "aboveEditor"}),
     };
     let req = crate::rpc::extension_ui_effect_json(&effect).expect("setWidget reaches the wire");
     assert_eq!(req["method"], "setWidget");

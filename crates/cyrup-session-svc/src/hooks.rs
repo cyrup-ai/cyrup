@@ -165,9 +165,12 @@ impl Hooks for PolicyHooks {
     /// second half was false, because pi stamps the session's values OVER the extension's
     /// (AGENT-017).
     ///
-    /// Pi also re-pushes `context.systemPrompt` here. cyrup does not — see
-    /// [`crate::session::AgentSession::next_turn_tools`] for why (one prompt slot instead of Pi's
-    /// override/base pair, so re-pushing would undo a `before_agent_start` sanitization mid-run).
+    /// Pi also re-pushes `context.systemPrompt` here — `systemPrompt: this._systemPromptOverride ??
+    /// this._baseSystemPrompt` (agent-session.ts:534 @v0.83.0) — and so does cyrup now that the
+    /// session models both of pi's slots (DRIFT-033). Re-pushing the RESOLVED value is what makes a
+    /// mid-run tool addition describable to the model in the same run, without undoing a
+    /// `before_agent_start` handler's sanitization: the override slot is exactly what survives the
+    /// rebuild.
     ///
     /// This is the seam that makes a MID-RUN tool addition real. Without it the loop runs the whole
     /// prompt on the tool array it snapshotted at run start, so a `ToolResult::added_tool_names`
@@ -188,6 +191,11 @@ impl Hooks for PolicyHooks {
         };
         let mut update = previous.unwrap_or_default();
         update.tools = Some(session.next_turn_tools().await);
+        // DRIFT-033 — pi's refresh assigns `context.systemPrompt` in the SAME object literal as
+        // `context.tools` (agent-session.ts:534 vs `:535` @v0.83.0), so the prompt the model is sent
+        // always describes the tool array it is sent with. Read AFTER `next_turn_tools`, because the
+        // EXT-004 refresh that call performs is what rewrites the base slot for a late tool.
+        update.system_prompt = Some(session.effective_system_prompt());
         // AGENT-017 — pi's refresh returns THREE session-owned fields after the spread, not one:
         // `context.tools` (agent-session.ts:534 @v0.83.0), `model` (`:537`) and `thinkingLevel`
         // (`:538`). Only `tools` was re-pushed here, so `TurnUpdate::model` /

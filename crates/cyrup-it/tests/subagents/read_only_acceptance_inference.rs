@@ -124,6 +124,7 @@ fn run_options(cwd: &Path) -> RunOptions {
         timeout_ms: None,
         output_path: None,
         output_mode: OutputMode::Inline,
+        reads: None,
         structured_output_schema: None,
         model_override: ModelOverride::Inherit,
         preferred_provider: None,

@@ -67,6 +67,9 @@ reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
+# PROV-030: RS256 assertion signing for the Vertex ADC service-account arm (auth/google_adc.rs).
+# See the workspace manifest for why this adds nothing to the dependency graph.
+ring = { workspace = true }
 
 [dev-dependencies]
 # `net` is dev-only: the remote-catalog tests serve their fixtures off a raw loopback

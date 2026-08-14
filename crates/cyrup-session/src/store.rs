@@ -63,8 +63,17 @@ impl SessionStore for DiskStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Write to a temp sibling then atomically rename over the target, so a crash never leaves
-        // a half-rewritten file.
+        // [CYRUP-DELTA] Pi's `_rewriteFile` truncates the live file in place —
+        // `const fd = openSync(this.sessionFile, "w"); … writeFileSync(fd, …)`
+        // (`session-manager.ts:979-988` @v0.83.0) — so a crash between the truncate and the last
+        // `writeFileSync` leaves a half-rewritten session with no recovery path. cyrup writes a
+        // temp sibling and renames over the target instead. The reason this is not spelled pi's
+        // way: `rewrite` is only ever called to persist a MIGRATION (`manager.rs`'s
+        // `migrated && !recovered` gate) or an eager clone seed, i.e. exactly the two moments the
+        // file's only copy of the user's history is being rebuilt from memory, and cyrup has no
+        // equivalent of pi's `preloadedFileEntries` re-read to fall back on. The visible
+        // differences are confined to the failure path plus a new inode on success; the resulting
+        // bytes are identical.
         let tmp = self.path.with_extension("jsonl.tmp");
         let mut buf = String::new();
         buf.push_str(&serde_json::to_string(header)?);

@@ -106,6 +106,7 @@ fn run_options(cwd: &Path, output_path: &Path) -> RunOptions {
         timeout_ms: None,
         output_path: Some(output_path.to_path_buf()),
         output_mode: OutputMode::FileOnly,
+        reads: None,
         structured_output_schema: None,
         model_override: ModelOverride::Inherit,
         preferred_provider: None,

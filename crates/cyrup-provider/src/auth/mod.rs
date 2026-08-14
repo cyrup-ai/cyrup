@@ -1,6 +1,7 @@
 //! Authentication: credential store, provider auth strategies, and the resolution precedence
 //! engine (arch-01 §3.7 / func-01 §7).
 
+pub mod google_adc;
 pub mod helpers;
 pub mod oauth;
 pub mod resolve;

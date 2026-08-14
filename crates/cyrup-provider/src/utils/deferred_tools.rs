@@ -156,6 +156,7 @@ mod tests {
             name: name.to_string(),
             description: format!("The {name} tool"),
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+            constrained_sampling: None,
         }
     }
 
@@ -164,6 +165,7 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+            constrained_sampling: None,
         }
     }
 

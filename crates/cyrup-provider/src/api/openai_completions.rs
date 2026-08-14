@@ -22,6 +22,9 @@ use crate::model::Model;
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
+use crate::utils::constrained_sampling::{
+    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+};
 use crate::utils::hash::short_hash;
 use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{
@@ -98,13 +101,19 @@ impl ApiImpl for OpenAiCompletionsApi {
             _ => opts.session_id.as_ref().map(|s| s.as_str()),
         };
 
+        // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
+        // pi's own message — upstream `buildParams` throws into `stream`'s catch.
+        let params = match build_body_with_env(model, ctx, opts, auth.env.as_ref()) {
+            Ok(p) => p,
+            Err(e) => {
+                let e = ProviderError::from(e);
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
+                return;
+            }
+        };
         // gap-08 #2: let a `before_provider_request` extension inspect/replace the outbound body.
-        let body = crate::stream::apply_on_payload(
-            opts,
-            model,
-            build_body_with_env(model, ctx, opts, auth.env.as_ref()),
-        )
-        .await;
+        let body = crate::stream::apply_on_payload(opts, model, params).await;
         let headers = build_headers(model, ctx, auth, opts, &compat, cache_session_id);
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -282,6 +291,7 @@ fn reasoning_effort(level: ModelThinkingLevel) -> Option<&'static str> {
 #[cfg(test)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
     build_body_with_env(model, ctx, opts, None)
+        .expect("fixture declares no unsatisfiable constrained sampling")
 }
 
 /// Resolve a provider env value (Pi `getProviderEnvValue`, provider-env.ts:45-52): the scoped
@@ -313,12 +323,17 @@ fn resolve_cache_retention(
 
 /// Env-aware [`build_body`]: `env` is the provider-scoped overlay (Pi `options.env`) consulted by
 /// [`resolve_cache_retention`] for the `PI_CACHE_RETENTION` fallback.
+/// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws. `convertTools` can throw for a
+/// `strict: "require"` tool on a provider without strict mode (`constrained-sampling.ts:91-95`
+/// @v0.83.0); upstream that unwinds into `stream`'s catch and becomes the turn's terminal error
+/// message. cyrup returns the same message through `Result` and the caller emits the identical
+/// terminal event (PROV-011).
 pub(crate) fn build_body_with_env(
     model: &Model,
     ctx: &Context,
     opts: &StreamOptions,
     env: Option<&ProviderEnv>,
-) -> Value {
+) -> Result<Value, ConstrainedSamplingError> {
     let compat = get_compat(model);
     let cache = resolve_cache_retention(opts.cache_retention, env);
     let mut messages = convert_messages(model, ctx, &compat);
@@ -370,7 +385,7 @@ pub(crate) fn build_body_with_env(
     let has_tool_history = ctx.messages.iter().any(message_has_tool_use);
     let mut tools: Option<Vec<Value>> = None;
     if !ctx.tools.is_empty() {
-        tools = Some(convert_tools(&ctx.tools, &compat));
+        tools = Some(convert_tools(&ctx.tools, &compat)?);
         if compat.zai_tool_stream {
             obj.insert("tool_stream".to_string(), json!(true));
         }
@@ -419,7 +434,7 @@ pub(crate) fn build_body_with_env(
         }
     }
 
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 /// Apply the per-provider reasoning encoding (Pi `buildParams` reasoning chain, L594-668). Each
@@ -642,10 +657,19 @@ fn add_cache_control_to_system_prompt(messages: &mut [Value], cc: &Value) {
     }
 }
 
+/// Pi `addCacheControlToLastConversationMessage` — `openai-completions.ts:913-925` @**v0.83.0**
+/// (byte-identical at v0.84.1, `:964-976`), with pi's `addCacheControlToMessage` (`:946-954`
+/// @v0.83.0) inlined because its role test is the same three-way test.
+///
+/// DRIFT-028: the `"tool"` arm was dropped in the port, so in an agent loop — where the last
+/// message is almost always a tool result — the cache breakpoint landed one message too early on
+/// every turn. Filed `upstream-drift`; it is **not-ported**: `git show
+/// v0.83.0:packages/ai/src/api/openai-completions.ts` already has `message.role === "tool"` at
+/// `:918` and `:947`, inside the ported baseline, so no rebase would have swept it up.
 fn add_cache_control_to_last_conversation_message(messages: &mut [Value], cc: &Value) {
     for msg in messages.iter_mut().rev() {
         let role = msg.get("role").and_then(Value::as_str);
-        if (role == Some("user") || role == Some("assistant"))
+        if (role == Some("user") || role == Some("assistant") || role == Some("tool"))
             && let Some(o) = msg.as_object_mut()
             && add_cache_control_to_text_content(o, cc)
         {
@@ -698,20 +722,30 @@ fn message_has_tool_use(msg: &Message) -> bool {
     }
 }
 
-/// Map cyrup [`ToolDef`]s to OpenAI `tools` entries (Pi `convertTools`). `strict: false` is added
-/// only when the provider supports it.
-pub(crate) fn convert_tools(tools: &[ToolDef], compat: &ResolvedCompat) -> Vec<Value> {
+/// Map cyrup [`ToolDef`]s to OpenAI `tools` entries — Pi `convertTools`,
+/// `openai-completions.ts:1286-1320` @**v0.83.0**.
+///
+/// `strict` is emitted only when the provider supports it (some reject unknown fields), and its
+/// value is `resolveJsonSchemaStrictSampling(tool, …) ?? false` — so a tool that opted into
+/// JSON-schema constrained sampling gets `strict: true` and every other tool keeps `false`
+/// (PROV-011). A `strict: "require"` tool on a provider without strict mode fails the request with
+/// pi's exact message.
+pub(crate) fn convert_tools(
+    tools: &[ToolDef],
+    compat: &ResolvedCompat,
+) -> Result<Vec<Value>, ConstrainedSamplingError> {
     tools
         .iter()
         .map(|t| {
+            let strict = resolve_json_schema_strict_sampling(t, compat.supports_strict_mode)?;
             let mut function = Map::new();
             function.insert("name".to_string(), json!(t.name));
             function.insert("description".to_string(), json!(t.description));
             function.insert("parameters".to_string(), t.parameters.clone());
             if compat.supports_strict_mode {
-                function.insert("strict".to_string(), json!(false));
+                function.insert("strict".to_string(), json!(strict.unwrap_or(false)));
             }
-            json!({ "type": "function", "function": Value::Object(function) })
+            Ok(json!({ "type": "function", "function": Value::Object(function) }))
         })
         .collect()
 }
@@ -2395,6 +2429,7 @@ mod tests {
                     "properties": { "city": { "type": "string" } },
                     "required": ["city"],
                 }),
+                constrained_sampling: None,
             }],
         };
 
@@ -2556,6 +2591,7 @@ mod tests {
                 name: "t".into(),
                 description: "d".into(),
                 parameters: json!({}),
+                constrained_sampling: None,
             }],
             ..Default::default()
         };
@@ -2588,6 +2624,7 @@ mod tests {
                 name: "t".into(),
                 description: "d".into(),
                 parameters: json!({ "type": "object" }),
+                constrained_sampling: None,
             }],
             ..Default::default()
         };
@@ -3057,7 +3094,7 @@ mod tests {
             cache_retention: None,
             ..Default::default()
         };
-        let body = build_body_with_env(&m, &Context::default(), &opts, Some(&env));
+        let body = build_body_with_env(&m, &Context::default(), &opts, Some(&env)).unwrap();
         assert_eq!(body["prompt_cache_retention"], "24h");
 
         // Explicit caller value wins over env: Short stays Short (no 24h).
@@ -3065,7 +3102,7 @@ mod tests {
             cache_retention: Some(CacheRetention::Short),
             ..Default::default()
         };
-        let body = build_body_with_env(&m, &Context::default(), &opts, Some(&env));
+        let body = build_body_with_env(&m, &Context::default(), &opts, Some(&env)).unwrap();
         assert!(body.get("prompt_cache_retention").is_none());
 
         // resolve_cache_retention precedence, directly (overlay-driven, deterministic).
@@ -3082,6 +3119,103 @@ mod tests {
             resolve_cache_retention(None, Some(&empty)),
             CacheRetention::Short
         );
+    }
+
+    // PROV-011 — `openai-completions.ts:1309`/`:1317` @v0.83.0: `strict` is
+    // `resolveJsonSchemaStrictSampling(tool, compat.supportsStrictMode) ?? false`, emitted only
+    // when the provider supports strict mode.
+    #[test]
+    fn constrained_sampling_drives_completions_strict_flag() {
+        use crate::context::{ConstrainedSampling, ConstrainedSamplingConfig, StrictSampling};
+        use crate::utils::constrained_sampling::ConstrainedSamplingError;
+
+        let tool = |strict| ToolDef {
+            name: "calc".into(),
+            description: "calculate".into(),
+            parameters: json!({"type": "object", "properties": {}, "required": []}),
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema { strict },
+            )),
+        };
+
+        // openai detects `supportsStrictMode: true` ⇒ `strict: true` for a constrained tool…
+        let mut ctx = Context::default();
+        ctx.tools = vec![tool(StrictSampling::Prefer)];
+        let body = build_body(&openai_model(), &ctx, &StreamOptions::default());
+        assert_eq!(body["tools"][0]["function"]["strict"], json!(true));
+
+        // …and `false` for an unconstrained one, which is the pre-existing behaviour.
+        ctx.tools = vec![ToolDef {
+            name: "calc".into(),
+            description: "calculate".into(),
+            parameters: json!({"type": "object", "properties": {}, "required": []}),
+            constrained_sampling: None,
+        }];
+        let body = build_body(&openai_model(), &ctx, &StreamOptions::default());
+        assert_eq!(body["tools"][0]["function"]["strict"], json!(false));
+
+        // `model()` is a `together` model, which detects `supportsStrictMode: false`: no `strict`
+        // key at all, and a `require` tool fails the turn with pi's message.
+        ctx.tools = vec![tool(StrictSampling::Prefer)];
+        let body = build_body(&model(), &ctx, &StreamOptions::default());
+        assert!(body["tools"][0]["function"].get("strict").is_none());
+
+        ctx.tools = vec![tool(StrictSampling::Require)];
+        assert_eq!(
+            build_body_with_env(&model(), &ctx, &StreamOptions::default(), None),
+            Err(ConstrainedSamplingError(
+                "Tool \"calc\" requires JSON-schema constrained sampling, but strict tools are unsupported."
+                    .to_string()
+            ))
+        );
+    }
+
+    // DRIFT-028 — pi `addCacheControlToLastConversationMessage` (openai-completions.ts:913-925
+    // @v0.83.0) walks backwards accepting `user`, `assistant` AND `tool`. cyrup dropped the `tool`
+    // arm, so in an agent loop (where the last message is almost always a tool result) the
+    // breakpoint landed one message too early on every turn.
+    #[test]
+    fn cache_breakpoint_lands_on_a_trailing_tool_result() {
+        let cc = json!({"type": "ephemeral"});
+
+        // Conversation ending in a tool result: the breakpoint is on THAT message.
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "calling"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "tool output"}),
+        ];
+        add_cache_control_to_last_conversation_message(&mut messages, &cc);
+        assert_eq!(
+            messages[3]["content"][0]["cache_control"], cc,
+            "the trailing tool result must carry the breakpoint"
+        );
+        assert!(
+            messages[2].get("content").and_then(Value::as_array).is_none(),
+            "the assistant message must be left as a plain string — untouched"
+        );
+
+        // Conversation ending in an assistant message is unchanged by the widening.
+        let mut messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "answer"}),
+        ];
+        add_cache_control_to_last_conversation_message(&mut messages, &cc);
+        assert_eq!(messages[1]["content"][0]["cache_control"], cc);
+        assert_eq!(messages[0]["content"], json!("hi"));
+
+        // A `system`/`developer` message is still never a conversation breakpoint: an empty
+        // trailing tool result makes `addCacheControlToTextContent` return false and the walk
+        // continues past it to the user turn, skipping the system prompt entirely.
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": ""}),
+        ];
+        add_cache_control_to_last_conversation_message(&mut messages, &cc);
+        assert_eq!(messages[1]["content"][0]["cache_control"], cc);
+        assert_eq!(messages[2]["content"], json!(""));
+        assert_eq!(messages[0]["content"], json!("sys"));
     }
 
     // Gap 3: Pi `createClient` (openai-completions.ts:515-519) — session-affinity headers are

@@ -150,3 +150,127 @@ async fn proxy_stream_fn_streams_a_live_agent_turn() {
         "ProxyStreamFn must stream the live Agent turn over the wire"
     );
 }
+
+// ----------------------------------------------------------------------------------------------
+// 3. AGENT-035 — an abort mid-proxy-stream carries pi's own message.
+//
+// `streamProxy` checks the signal by hand and throws a LITERAL at both check points —
+// `proxy.ts:186-190` (between reads) and `:208-211` (after the read loop drains) @v0.83.0 — and
+// the outer catch copies that text into `partial.errorMessage` before pushing the terminal `error`
+// event (`:215-223`). cyrup emitted `ProviderError::Aborted`'s bare `Display` ("aborted"), so the
+// transcript of an aborted proxy turn read differently from pi's.
+// ----------------------------------------------------------------------------------------------
+
+/// A loopback SSE server that emits `frames`, then holds the connection open until the CLIENT
+/// closes it. No sleep and no timer: the server blocks in `read`, which returns 0 the moment the
+/// aborted request drops its response, so the thread exits on its own.
+fn spawn_stalling_proxy_server(frames: Vec<String>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("addr");
+    let url = format!("http://{addr}");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let mut acc: Vec<u8> = Vec::new();
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        acc.extend_from_slice(&buf[..n]);
+                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+            let mut head = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            for f in &frames {
+                head.push_str("data: ");
+                head.push_str(f);
+                head.push_str("\n\n");
+            }
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            // Deliberately send NO terminal frame: park until the client hangs up.
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn agent035_aborted_proxy_stream_reports_pis_request_aborted_by_user() {
+    use cyrup_core::{CancelToken, RunCancel};
+    use cyrup_provider::stream::ErrorReason;
+    use futures::StreamExt;
+
+    let frames = vec![
+        r#"{"type":"start"}"#.to_string(),
+        r#"{"type":"text_start","contentIndex":0}"#.to_string(),
+        r#"{"type":"text_delta","contentIndex":0,"delta":"partial"}"#.to_string(),
+    ];
+    let proxy_url = spawn_stalling_proxy_server(frames);
+
+    let run_cancel = RunCancel::new();
+    let token: CancelToken = run_cancel.token();
+    let opts = crate::ProxyStreamOptions {
+        auth_token: "test-token".into(),
+        proxy_url,
+        cancel: Some(token),
+        ..Default::default()
+    };
+    let mut stream = crate::stream_proxy(model_ref(), Context::default(), opts);
+
+    // Deterministic rendezvous: cancel only once the transport has actually delivered a body
+    // frame, so the abort is observed BETWEEN reads — pi's `proxy.ts:186-190` position — with no
+    // wall-clock sleep anywhere in the test.
+    let mut saw_delta = false;
+    // A generous ceiling used as a HANG detector, not a latency assertion: a regression that stops
+    // turning a cancel into a terminal event leaves the server parked and this loop awaiting
+    // forever, which must surface as a failure rather than a stuck suite.
+    let terminal: Option<StreamEvent> = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let mut terminal = None;
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    StreamEvent::TextDelta { .. } if !saw_delta => {
+                        saw_delta = true;
+                        run_cancel.cancel();
+                    }
+                    e @ StreamEvent::Error { .. } => {
+                        terminal = Some(e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            terminal
+        },
+    )
+    .await
+    .expect("a cancelled proxy stream must push its terminal error event, not hang");
+    assert!(saw_delta, "the stalling server delivered its text_delta frame before the abort");
+
+    let Some(StreamEvent::Error { reason, error }) = terminal else {
+        panic!("an aborted proxy stream must still push a terminal error event (proxy.ts:219-223)");
+    };
+    // `signal?.aborted ? "aborted" : "error"` (proxy.ts:216) — already correct before the fix.
+    assert_eq!(reason, ErrorReason::Aborted);
+    // RED before the fix: this was `ProviderError::Aborted`'s Display, the bare "aborted".
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Request aborted by user"),
+        "pi puts its own literal into partial.errorMessage (proxy.ts:189/:210 → :215-218)"
+    );
+}

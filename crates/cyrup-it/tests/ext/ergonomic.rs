@@ -288,9 +288,24 @@ fn define_tool_factory_bundles_descriptor_and_exec() {
 #[test]
 fn dialog_options_and_typed_command_options_serialize() {
     use cyrup_ext_sdk::{DialogOptions, ForkOptions, ForkPosition, NavigateOptions, NewSessionOptions};
-    // Dialog option bag (Pi {timeout, signal}).
+    // Dialog option bag (Pi `ExtensionUIDialogOptions { signal?, timeout? }`).
+    //
+    // EXT-048: the wire key is `timeout`, NOT `timeoutMs` — `timeout?: number` upstream, with no
+    // `timeoutMs` spelling anywhere in `packages/coding-agent/src` @v0.83.0. This assertion still
+    // pinned the pre-EXT-048 key and was RED at HEAD; it went unnoticed because `cyrup-it` is
+    // `required-features = ["it"]` and the merge gate never builds it (residual ledger, structural
+    // defect J). Production (`cyrup-ext-sdk/src/descriptor.rs:180`) is the correct side.
     let to = serde_json::to_value(DialogOptions::timeout(5000)).unwrap();
-    assert_eq!(to["timeoutMs"], json!(5000));
+    assert_eq!(to["timeout"], json!(5000), "EXT-048: the wire key is `timeout`");
+    assert!(
+        to.get("timeoutMs").is_none(),
+        "the pre-EXT-048 `timeoutMs` key must NOT be emitted: {to}"
+    );
+    // The alias survives for bags cyrup's own SDK already wrote (`descriptor.rs:180`), so a stored
+    // `timeoutMs` still round-trips into the canonical field.
+    let legacy: DialogOptions = serde_json::from_value(json!({ "timeoutMs": 5000 })).unwrap();
+    assert_eq!(legacy.timeout_ms, Some(5000), "the `timeoutMs` alias still deserializes");
+
     let sig = serde_json::to_value(DialogOptions::signal("abort-1")).unwrap();
     assert_eq!(sig["signalId"], json!("abort-1"));
 

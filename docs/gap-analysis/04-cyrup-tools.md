@@ -31,6 +31,59 @@ This area covers `crates/cyrup-tools` — the seven built-in tools (`read`, `wri
 > **Open count is a floor, not a total.** 29 open here (0 critical, **1 high**, 10 medium, 18 low),
 > 0 trackers.
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 04 — recount: 29 rows → 6 open (0 critical · 0 high · 1 medium · 5 low).** The area's only
+> high (`TOOL-039`) closed in sweep 1 by deleting the `CYRUP_SHELL` arm outright — option (i), the
+> item's own default recommendation — which also settles `TOOL-007` and `TOOL-038` and invalidates
+> handoff (g): they were one shell-surface decision and it has been taken.
+>
+> **Sweep 2 changed no code in this crate, and that is the correct outcome.** Every remaining id has
+> its fix site outside `crates/cyrup-tools/**`: `TOOL-015`/`TOOL-022` are cluster C5 (`render_kind`
+> needs a consumer), `TOOL-016` and `TOOL-017` are cross-crate, `TOOL-024` is
+> `crates/cyrup-ext/src/wrapper.rs:183`/`:333` (verified at HEAD — **it should be routed to area 06
+> rather than left in this table as if a tools agent could take it**), and `TOOL-031`'s residual is
+> the subagent re-exec half of PARITY-GAPS PB-5.
+>
+> **`TOOL-021` closed on the back of a refutation in another area.** Sweep 2's `EXT-007` work
+> established that the claimed blocker was stale: `Tool::prompt_guidelines` already returns
+> `Vec<&str>` (`crates/cyrup-core/src/tool.rs:130`) and `impl Tool for WasmTool` already overrides it
+> (`cyrup-ext/src/host/live.rs:1690`), with an in-source note recording that TOOL-021/EXT-007
+> unblocked it. Three separate places in the record were still planning around that blocker.
+>
+> **STRUCTURAL:** every path of the form `crates/cyrup-tools/tests/<x>.rs` in this file is stale —
+> only `tests/bash_env_scrub.rs` and `tests/shell_interpreter.rs` remain out-of-crate. Affects
+> `TOOL-004`, `-007`, `-008`, `-012`, `-019`, `-024`, `-025`, `-026` and the Coverage section. Add
+> `crates/cyrup-tools/src/tests/pi_tool_semantics.rs` to the Coverage test list — it carries sweep 1's
+> regressions for `TOOL-006`/`011`/`014`/`018`/`023`/`029`/`033`/`034`/`041` and the `render_kind`
+> assertion. Blind spot 3 is updated by `TOOL-036`'s Windows-scope answer (ADR-0007) and blind spot 4
+> is cleared by `TOOL-035`.
+
+
 ## Status since the 1806375 / 9219dcd baseline
 
 | ID | Status | Note |
@@ -92,37 +145,39 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 > this pass, so it no longer adds to the count. Do not delete it: the `-S` ids are load-bearing and
 > a closure must remain re-auditable. See structural defect A in `00-residual-ledger.md`.
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 1 medium, 5 low = 6.** 23 rows are now marked CLOSED. The `-S` table below remains fully closed.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| TOOL-039 | **high** | cyrup-original | S | `CYRUP_SHELL` silently redirects every `bash` call to an arbitrary interpreter; pi has no shell env var *(ships with TOOL-007)* |
-| TOOL-006 | medium | parity-bug | S | `write`/`edit` declare `Sequential`, serializing the whole batch |
-| TOOL-007 | medium | cyrup-original | M | Protected-path write block is on by default, has no pi analog, and `bash` bypasses it *(ships with TOOL-039)* |
-| TOOL-019 | medium | parity-bug | S | File-mutation-lock key is computed by a blocking canonicalize inside `guard()` (residual only) |
-| TOOL-020 | medium | test-defect | M | Forced-SIGKILL drain test asserts scheduling and shell-buffering outcomes |
-| TOOL-021 | medium | parity-bug | S | `Tool::prompt_guidelines` returns `&[&str]`, so guest tools lose their guidelines |
+| ~~TOOL-039~~ | ~~**high**~~ **CLOSED 2026-08-14** | cyrup-original | S | `CYRUP_SHELL` silently redirects every `bash` call to an arbitrary interpreter; pi has no shell env var *(ships with TOOL-007)* — **CLOSED 2026-08-14**: sweep 1 — the area's only `high` was stale. The ADR-0003 bash-surface landing deleted the `CYRUP_SHELL` arm entirely (option (i), the item's own default recommendation); `grep -rn CYRUP_SHELL crates/` now returns only the regression test `crates/cyrup-tools/tests/shell_interpreter.rs`. This also invalidates handoff (g) — TOOL-007/-038/-039 were one shell-surface decision and it has been taken. |
+| ~~TOOL-006~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `write`/`edit` declare `Sequential`, serializing the whole batch — **CLOSED 2026-08-14**: sweep 1 — both `execution_mode` overrides deleted; pinned by `mutators_do_not_declare_sequential_execution` in the new `src/tests/pi_tool_semantics.rs`. The item's second Verify limb (an agent-level test that one edit + two reads yields `sequential == false`) is NOT done and belongs to whoever owns crates/cyrup-agent. |
+| ~~TOOL-007~~ | ~~medium~~ **CLOSED 2026-08-14** | cyrup-original | M | Protected-path write block is on by default, has no pi analog, and `bash` bypasses it *(ships with TOOL-039)* — **CLOSED 2026-08-14**: sweep 1 — `builder.rs:239` now sets `protect_paths: false` (the item cites `:208` = true) and `isolation/mod.rs:11-17` is rewritten to match the wiring. All three cited facts were stale. |
+| ~~TOOL-019~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | File-mutation-lock key is computed by a blocking canonicalize inside `guard()` (residual only) — **CLOSED 2026-08-14**: sweep 1 — closed together (one fix, as both items state). `key` is async over `tokio::fs::canonicalize` with pi's narrow ENOENT/ENOTDIR catch; the ENOTDIR half required a raw-errno match (`libc::ENOTDIR`) because stable Rust exposes no `ErrorKind` for it. Handoff (d) discharged. |
+| ~~TOOL-020~~ | ~~medium~~ **CLOSED 2026-08-14** | test-defect | M | Forced-SIGKILL drain test asserts scheduling and shell-buffering outcomes — **CLOSED 2026-08-14**: sweep 1 — both defective assertions are gone: the run window is 250 ms decoupled from the 15 ms kill grace, and the shell-flush claim is REFUTED in-source and independently re-verified (`exec_argv` runs the argv it is handed, so `ShellConfig::detect()` is not consulted on this path at all). |
+| ~~TOOL-021~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `Tool::prompt_guidelines` returns `&[&str]`, so guest tools lose their guidelines — **CLOSED 2026-08-14**: sweep 2 (area 06, via the EXT-007 refutation) — the blocker is gone: `Tool::prompt_guidelines` returns `Vec<&str>` (`crates/cyrup-core/src/tool.rs:130`), `ToolDescriptor.prompt_guidelines: Vec<String>` exists (`cyrup-ext/src/registry.rs:27`), and `impl Tool for WasmTool` overrides it (`cyrup-ext/src/host/live.rs:1690`) with an in-source note recording that TOOL-021/EXT-007 unblocked it. Consumed by EXT-038's `promptGuidelines` half. The one remaining producer gap is EXT-007's, not this item's. |
 | TOOL-022 | medium | not-ported | L | `renderShell`, `prepareArguments` and `label` never reach a guest tool's behavior |
-| TOOL-023 | medium | parity-bug | S | `find` walks the whole tree then sorts and truncates; pi passes `--max-results` |
-| TOOL-033 | medium | parity-bug | S | `grep` walks the whole tree before searching; `limit` bounds neither cost nor selection |
-| TOOL-034 | medium | parity-bug | M | `grep` materializes every candidate file in memory, twice on the context path |
-| TOOL-038 | medium | cyrup-original | S | On Windows with no bash, `bash` silently falls back to `cmd.exe /C`; pi refuses to run |
-| TOOL-011 | low | parity-bug | S | `find` path-globs match the relative path; pi/fd match the absolute path |
-| TOOL-014 | low | parity-bug | S | `edit`'s access-failure body diverges from pi's `Error code: <ERRNO>` |
-| TOOL-015 | low | not-ported | M | `edit` does not declare `renderShell: "self"`; nothing reads `render_kind` (residual only) |
+| ~~TOOL-023~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `find` walks the whole tree then sorts and truncates; pi passes `--max-results` — **CLOSED 2026-08-14**: sweep 1 — option (i) chosen (bounded walk, sort DELETED), landed with TOOL-033, discharging handoff (e). Citations corrected: the empty-result check is find.ts:311 (not :172/:297) and `--max-results` is :252. |
+| ~~TOOL-033~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `grep` walks the whole tree before searching; `limit` bounds neither cost nor selection — **CLOSED 2026-08-14**: sweep 1 — walk and search fused; sort deleted. Citations corrected to the re-derived v0.84.1 offsets: the early-return guard is grep.ts:278 (the item implies :288) and the limit block is :292-295 (the item says :288-295). |
+| ~~TOOL-034~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | `grep` materializes every candidate file in memory, twice on the context path — **CLOSED 2026-08-14**: sweep 1 — the seam gained `FsOps::read_stream` with a whole-read default (decorators untouched) and a real-`File` override on `LocalFs`; grep drives `search_reader` from `spawn_blocking`. The item's premise that the FsOps seam "offers no alternative" is now false. The context-path re-read was NOT changed and needed no change. |
+| ~~TOOL-038~~ | ~~medium~~ **CLOSED 2026-08-14** | cyrup-original | S | On Windows with no bash, `bash` silently falls back to `cmd.exe /C`; pi refuses to run — **CLOSED 2026-08-14**: sweep 1 — `ops/shell.rs` `try_detect()`'s Windows arm is pi's verbatim `No bash shell found.` throw with the searched-paths list; no `cmd.exe` arm exists. `detect()` survives only as the infallible `Default` path, degrading to `bash -c` with a `[CYRUP-DELTA]`. |
+| ~~TOOL-011~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `find` path-globs match the relative path; pi/fd match the absolute path — **CLOSED 2026-08-14**: sweep 1 — and FIX THE ITEM'S VERIFY rather than copying it forward: "assert `/src/**/*.ts` returns the same set as `src/**/*.ts`" is wrong about fd, which compares the ABSOLUTE candidate path, so a leading-slash pattern anchors at the filesystem root and matches nothing under a tmp repo. The genuine divergence is case (a) — a pattern naming an ancestor above the search root — and that is what the landed test pins. The confidence-medium caveat (fd not vendored) still applies. |
+| ~~TOOL-014~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `edit`'s access-failure body diverges from pi's `Error code: <ERRNO>` — **CLOSED 2026-08-14**: sweep 1 — the errno mapping exists in `error.rs` (`errno_name`/`io_errno`/`errno_code_of`) and is consumed by `ops/local.rs`'s `access` AND `read_dir`, so TOOL-029 reuses it as the item anticipated. The factually-wrong comment at `edit.rs` is deleted. |
+| TOOL-015 | low | not-ported | M | `edit` does not declare `renderShell: "self"`; nothing reads `render_kind` (residual only) — **2026-08-14, still open**: sweep 1 — kept open as a pure TOOL-022 residual; the built-in half is done (`EditTool::render_kind()` returns `SelfRendered`, pinned). What remains is only "give the value a consumer", which is cluster C5. |
 | TOOL-016 | low | upstream-drift | M | `constrainedSampling` has no representation in cyrup's tool model |
 | TOOL-017 | low | not-ported | M | `read`'s compact `docs` classification arm is unported (residual only) |
-| TOOL-018 | low | parity-bug | S | `edit` fuzzy matcher returns not-found where pi returns duplicate-occurrences |
-| TOOL-024 | low | test-defect | S | `every_surface_method_delegates` proves nothing for 9 of its 11 assertions |
-| TOOL-025 | low | test-defect | S | The mutation-lock concurrency test is probabilistic and misnamed (residual only) |
-| TOOL-026 | low | test-defect | S | `bash_timeout_fractional_seconds` asserts a wall-clock upper bound |
-| TOOL-029 | low | parity-bug | S | `ls` swallows pi's `Cannot read directory: <message>` |
-| TOOL-030 | low | test-defect | S | `exec_pre_cancelled_never_spawns` carries a 200ms wall-clock ceiling |
-| TOOL-031 | low | not-ported | S | `bash` stamps no `AI_AGENT` / `PI_CODING_AGENT` into the child environment |
-| TOOL-032 | low | parity-bug | S | `FileMutationLocks::key` blocks on `std::fs::canonicalize` and swallows every error kind |
-| TOOL-035 | low | parity-bug | S | `read`'s image sniff scans the whole file where pi sniffs 4100 bytes |
-| TOOL-036 | low | parity-bug | S | `resolve_to_cwd` omits the win32 leg of `normalizePath` (`~`, Git Bash / WSL / Cygwin paths) |
-| TOOL-037 | low | not-ported | S | `output-guard`'s protocol-writer half (retry, serialized tail, flush) is unported |
-| TOOL-040 | low | parity-bug | S | `find_bash_on_path` runs `which bash` with no timeout; pi bounds it at 5s |
-| TOOL-041 | low | parity-bug | S | `write`/`edit` never re-check cancellation after the write lands |
+| ~~TOOL-018~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `edit` fuzzy matcher returns not-found where pi returns duplicate-occurrences — **CLOSED 2026-08-14**: sweep 1 — the CODE option was taken, not the documentation option: the divergence was not forced (Rust `str::find("")` is `Some(0)`, identical to JS), so a `[CYRUP-DELTA]` would have been an accepted-divergence in disguise. The one genuinely unobservable difference (empty content + empty needle: pi -1 vs cyrup 0) is documented in-source. |
+| TOOL-024 | low | test-defect | S | `every_surface_method_delegates` proves nothing for 9 of its 11 assertions — **2026-08-14, still open**: sweep 2 — RE-ROUTED. Both fix sites are `crates/cyrup-ext/src/wrapper.rs:183` (the `Fixed` double) and `:333` (`every_surface_method_delegates`), verified at HEAD. It is not actionable from `crates/cyrup-tools/**` at all and belongs to area 06. |
+| ~~TOOL-025~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | The mutation-lock concurrency test is probabilistic and misnamed (residual only) — **CLOSED 2026-08-14**: sweep 1 — renamed to `write_creates_dirs_and_holds_one_mutator_per_path` and made structural via a `MutexProbeFs` asserting max-concurrency 1 inside the guarded region — the exact "shared counter" fix the item specifies. |
+| ~~TOOL-026~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | `bash_timeout_fractional_seconds` asserts a wall-clock upper bound — **CLOSED 2026-08-14**: sweep 1 — the ceiling is `< 15s`, not the cited 4000 ms; the `>= 2300ms` lower bound and the message assertion are retained. |
+| ~~TOOL-029~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `ls` swallows pi's `Cannot read directory: <message>` — **CLOSED 2026-08-14**: sweep 1 — upstream citation corrected to ls.ts:147-152 (the item says :145/:150). |
+| ~~TOOL-030~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | `exec_pre_cancelled_never_spawns` carries a 200ms wall-clock ceiling — **CLOSED 2026-08-14**: sweep 1 — the 200 ms bound was replaced by the structural non-existent-cwd sentinel proof (only pi's ordering can yield `Ok(Killed)`), with the marker check explicitly retained as non-sufficient — the item's own "do NOT merely delete the timing assertion" warning was honoured. |
+| TOOL-031 | low — **PARTIALLY CLOSED 2026-08-14** | not-ported | S | `bash` stamps no `AI_AGENT` / `PI_CODING_AGENT` into the child environment — **PARTIALLY CLOSED 2026-08-14**: sweep 1 + 2 — the immediate-bash half is done: `cyrup-session-svc/src/bash.rs:107-109` pushes `PI_CODING_AGENT=true` and `AI_AGENT=cyrup` onto the `ExecSpec` env vector, OUTSIDE the `expose_session_environment` gate and outside the scrub list, with the `[CYRUP-DELTA, value only]` note on `AI_AGENT`. **RESIDUAL: the subagent re-exec half only (PARITY-GAPS PB-5).** |
+| ~~TOOL-032~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `FileMutationLocks::key` blocks on `std::fs::canonicalize` and swallows every error kind — **CLOSED 2026-08-14**: sweep 1 — closed together (one fix, as both items state). `key` is async over `tokio::fs::canonicalize` with pi's narrow ENOENT/ENOTDIR catch; the ENOTDIR half required a raw-errno match (`libc::ENOTDIR`) because stable Rust exposes no `ErrorKind` for it. Handoff (d) discharged. |
+| ~~TOOL-035~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `read`'s image sniff scans the whole file where pi sniffs 4100 bytes — **CLOSED 2026-08-14**: sweep 1 — clears blind spot 4: the >4100-byte pre-`acTL` PNG the prior pass only reasoned about is now constructed in `image_sniff_window_matches_pis_4100_bytes`. |
+| ~~TOOL-036~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `resolve_to_cwd` omits the win32 leg of `normalizePath` (`~`, Git Bash / WSL / Cygwin paths) — **CLOSED 2026-08-14**: sweep 1 + 2 — closed with its duplicate DRIFT-046. Both halves ported in `crates/cyrup-tools/src/path.rs`. **Sweep 2 found a SECOND live instance** in `crates/cyrup-config/src/paths.rs` — the 1:1 port of the very function upstream applies the rule inside — created AFTER this item was written, by CFG-025/CFG-036; that copy is now fixed too. See DRIFT-046. |
+| ~~TOOL-037~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `output-guard`'s protocol-writer half (retry, serialized tail, flush) is unported — **CLOSED 2026-08-14**: sweep 1 — location corrected: the retrying writer is `crates/cyrup-modes/src/raw_stdout.rs`, not `crates/cyrup/src/output_guard.rs` (the consumers are the protocol writers and `cyrup` depends on `cyrup-modes`, not the reverse); `output_guard.rs` re-exports it. |
+| ~~TOOL-040~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `find_bash_on_path` runs `which bash` with no timeout; pi bounds it at 5s — **CLOSED 2026-08-14**: sweep 1 — `BASH_PROBE_TIMEOUT = 5s` (citing shell.ts:47) with a deadline-polled `try_wait()` loop that kills, reaps and returns `None` on expiry — pi's `sh -c` fall-through. |
+| ~~TOOL-041~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `write`/`edit` never re-check cancellation after the write lands — **CLOSED 2026-08-14**: sweep 1. |
 
 ## TOOL-039 — `CYRUP_SHELL` silently redirects every `bash` tool call to an arbitrary interpreter; pi has no shell env var
 

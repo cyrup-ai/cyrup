@@ -41,11 +41,17 @@
 //!   its one sharp edge: `ensure_connected` clears a pending timer before attempting
 //!   (`clearReconnectTimer()`, `index.ts:824`), so a failed tool-triggered attempt leaves the
 //!   ladder disarmed until the next tool call or the next disconnect edge.
-//! - **Duplicate delivery is not possible and therefore not handled** — the broker is at-most-once
-//!   by construction (`broker/mod.rs::handle_send` answers every send synchronously with
-//!   `Delivered`/`DeliveryFailed`; there is no mailbox, no queue, no redelivery), exactly as
-//!   upstream `broker/broker.ts:422-494` at v0.7.0. A message in flight when a socket drops is
-//!   lost, never re-sent, so a reconnect cannot deliver it twice. What DOES need care is the
+//! - **Duplicate delivery is not possible and therefore not handled** — the broker answers every
+//!   send synchronously with `Delivered`/`DeliveryFailed` (`broker/mod.rs::handle_send`) and each
+//!   message is either handed to exactly one live socket or parked in the mailbox for exactly one
+//!   later `register`, never both: `flush_mailbox_for_session` SPLICES the entry out before it
+//!   writes (`v0.10.1 broker/broker.ts:933-943`). **Superseded 2026-08-14 (ICOM-010): this note
+//!   used to assert "there is no mailbox, no queue, no redelivery" — that was true of the v0.7.0
+//!   broker it was written against and is no longer true of this one.** A message in flight when a
+//!   socket drops is still lost rather than re-sent, so a reconnect cannot deliver it twice; what
+//!   changed is that a message the broker ACCEPTS for a departed peer is now retained for
+//!   `MAILBOX_MESSAGE_RETENTION_MS` instead of being refused `Session not found`. What DOES need
+//!   care is the
 //!   outbound reply waiter: pi rejects it on the disconnect edge BEFORE nulling the client
 //!   (`index.ts:784`) so an ask cannot hang across a reconnect — [`handle_disconnect`] does the
 //!   same via [`crate::reply_tracker::OutboundReplyWaiter::fail_pending`].
@@ -111,9 +117,23 @@ pub struct ConnectSupervisor {
     params: Mutex<Option<Arc<ConnectParams>>>,
     /// pi `shuttingDown || disposed` — refuses every connect once the session tears down.
     shutting_down: AtomicBool,
-    /// pi `runtimeStarted` — false until `SessionStart`, so a pre-session `schedule_reconnect` is a
-    /// no-op (pi's `getLiveContext()` returns null before `startSessionRuntime`).
+    /// "A runtime is CURRENTLY active" — set by [`begin_runtime`], **cleared** by [`shutdown`], so a
+    /// pre-session or post-shutdown `schedule_reconnect` is a no-op.
+    ///
+    /// This is deliberately NOT pi's `runtimeStarted` (see [`Self::runtime_ever_started`]), even
+    /// though an earlier comment here claimed it was: pi never clears `runtimeStarted`, and the two
+    /// meanings diverge exactly at shutdown.
     started: AtomicBool,
+    /// pi `runtimeStarted` (`v0.10.1 index.ts:522`, set at `:1253`) — a LATCH: it goes true at the
+    /// first `startSessionRuntime` and is never set back to false anywhere in upstream.
+    ///
+    /// Its one consumer is `sendIncomingMessage`'s guard (`:877`,
+    /// `if (runtimeStarted && !getLiveContext(runtimeContext, generation)) return;`) and the relay's
+    /// `relayStillLive` (`:1311`). Both read it as "is there a runtime this delivery could be stale
+    /// relative to" — and after a shutdown there certainly is, so folding this into
+    /// [`Self::started`] would let a post-shutdown delivery bypass the fence entirely, which is the
+    /// inverse of the guard's purpose.
+    runtime_ever_started: AtomicBool,
     /// pi `runtimeGeneration` (`index.ts:449,936,1062`): bumped by [`begin_runtime`]/[`shutdown`];
     /// an in-flight reconnect whose stamp no longer matches is dropped on the floor.
     generation: AtomicU64,
@@ -136,6 +156,15 @@ pub struct ConnectSupervisor {
     /// this session keeps its identity across the drop (broker identity takeover,
     /// `broker/mod.rs:303`; pi keeps `currentSessionId` stable for the same reason).
     last_session_id: Mutex<Option<String>>,
+    /// pi `currentSessionId` (`v0.10.1 index.ts:507`), captured from
+    /// `ctx.sessionManager.getSessionId()` at `startSessionRuntime` (`:1266`).
+    ///
+    /// Distinct from [`Self::last_session_id`], which is the id the BROKER last assigned. This one
+    /// is the HOST's session id at the moment the runtime started, and its only consumer is
+    /// [`is_live_at`]'s `ctx.sessionManager.getSessionId() !== currentSessionId` check (`:651`) —
+    /// the detector for "the extension context was swapped under an in-flight task", which the
+    /// generation counter alone does not catch.
+    runtime_session_id: Mutex<Option<String>>,
 }
 
 impl ConnectSupervisor {
@@ -192,6 +221,81 @@ impl ConnectSupervisor {
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
     }
+
+    /// `const messageGeneration = runtimeGeneration` (`v0.10.1 index.ts:903`) — the stamp an
+    /// in-flight task captures so it can tell, later, whether the runtime it started under is still
+    /// the live one.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// pi `runtimeStarted` (`v0.10.1 index.ts:522,1253`) — false until the FIRST `SessionStart` and
+    /// true forever after, which is what lets the local subagent relay deliver before any runtime
+    /// generation exists while still fencing every delivery once one does.
+    #[must_use]
+    pub fn runtime_ever_started(&self) -> bool {
+        self.runtime_ever_started.load(Ordering::SeqCst)
+    }
+
+    fn runtime_session_id(&self) -> Option<String> {
+        self.runtime_session_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// `getLiveContext(ctx, generation)` (`v0.10.1 index.ts:646-659`, 14 lines):
+///
+/// ```text
+/// if (disposed || shuttingDown || generation !== runtimeGeneration || !ctx) return null;
+/// try {
+///   if (currentSessionId && ctx.sessionManager.getSessionId() !== currentSessionId) return null;
+///   void ctx.hasUI;
+///   return ctx;
+/// } catch { return null; }
+/// ```
+///
+/// Upstream calls this at SIX points around a single inbound message, not once, because every
+/// `await` in that path is a place the runtime can be replaced underneath the task. Rust makes the
+/// hazard sharper, not softer: a future can be dropped at any `.await`, and `tokio::spawn`ed work
+/// outlives the runtime that spawned it unless something fences it.
+///
+/// Mapping, term by term:
+/// - `disposed || shuttingDown` → [`ConnectSupervisor::is_shutting_down`] (cyrup latches one flag
+///   where pi has two; `shutdown` sets it and `begin_runtime` clears it, so the pair is covered);
+/// - the `currentSessionId` mismatch → the id captured by [`begin_runtime`] vs the LIVE
+///   `HostServices::session_id()`;
+/// - `void ctx.hasUI` (a probe that a throwing context is caught) has no counterpart: cyrup's
+///   `HostServices` accessors return values, not exceptions.
+///
+/// # [CYRUP-DELTA] — pi's `!ctx` limb is deliberately NOT mapped to "no host services"
+///
+/// `runtimeContext` is non-null for every running pi session, so `!ctx` means "the extension was
+/// disposed". cyrup's [`crate::session_state::SharedIntercomState::host_services`] is an `Option`
+/// for a different reason — a headless or degraded session legitimately has none — and the crate
+/// already degrades through that state rather than treating it as dead: `send_incoming_message`
+/// returns `false`, and `auto_reply_non_interactive` still tells the SENDER the peer is busy, which
+/// is the one thing a headless session must keep doing. Folding `host_services().is_none()` into
+/// this predicate would have silently converted "no human surface" into "drop the message before it
+/// is even recorded", which is a regression pi does not have and ICOM-049 does not ask for. The
+/// "not started yet" half of `!ctx` is covered by [`ConnectSupervisor::runtime_ever_started`], which callers
+/// gate on exactly where upstream writes `runtimeStarted &&` (`v0.10.1 index.ts:877`).
+#[must_use]
+pub fn is_live_at(state: &SharedIntercomState, generation: u64) -> bool {
+    let sup = &state.connect;
+    if sup.shutting_down.load(Ordering::SeqCst) || sup.generation.load(Ordering::SeqCst) != generation
+    {
+        return false;
+    }
+    // `if (currentSessionId && ctx.sessionManager.getSessionId() !== currentSessionId)` — the guard
+    // is skipped entirely while `currentSessionId` is null (JS `&&` short-circuit), which is the
+    // pre-`startSessionRuntime` window. It is also skipped when there is no live `HostServices` to
+    // read the current id off, per the delta above.
+    match (sup.runtime_session_id(), state.host_services()) {
+        (Some(captured), Some(services)) => {
+            services.session_id().as_deref() == Some(captured.as_str())
+        }
+        _ => true,
+    }
 }
 
 /// `startSessionRuntime` (`index.ts:926-951`), connection half: drop any previous client, clear the
@@ -206,10 +310,16 @@ pub fn begin_runtime(state: &Arc<SharedIntercomState>, params: ConnectParams) {
     }
     sup.shutting_down.store(false, Ordering::SeqCst);
     sup.started.store(true, Ordering::SeqCst);
+    // `runtimeStarted = true` (`v0.10.1 index.ts:1253`) — latched, never cleared.
+    sup.runtime_ever_started.store(true, Ordering::SeqCst);
     sup.generation.fetch_add(1, Ordering::SeqCst);
     sup.attempt.store(0, Ordering::SeqCst);
     sup.set_timer(None);
     *sup.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // `currentSessionId = ctx.sessionManager.getSessionId()` (`v0.10.1 index.ts:1266`) — captured
+    // here, read only by `is_live_at`.
+    *sup.runtime_session_id.lock().unwrap_or_else(|e| e.into_inner()) =
+        state.host_services().and_then(|services| services.session_id());
     *sup.params.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(params));
 }
 
@@ -223,6 +333,7 @@ pub fn shutdown(state: &Arc<SharedIntercomState>) {
     sup.started.store(false, Ordering::SeqCst);
     sup.generation.fetch_add(1, Ordering::SeqCst);
     sup.set_timer(None);
+    *sup.runtime_session_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *sup.params.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 

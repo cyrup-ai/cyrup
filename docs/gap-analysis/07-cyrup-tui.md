@@ -72,6 +72,85 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 
 > **Structural note carried forward.** `cyrup/TUI-FIDELITY.md` (464 lines, ~150 presentation findings against v0.84.1) holds no stable IDs and no status table, so nothing in it reaches `00-residual-ledger.md`. That is not a hypothetical: TUI-FIDELITY's C14 recommendation to delete the `{n} queued` footer segment was applied, which is precisely what turned TUI-016 from "wrong surface" into "no surface at all". Merging that backlog into this file with real IDs remains the highest-value follow-up for this area.
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 07 — recount: 70 rows → 34 open (0 critical · 0 high · 14 medium · 20 low).** The header's
+> "62 open, 3 crit, 7 high" is stale in every column, and the 62 itself was off by one: 70 rows minus
+> the 7 already marked `FIXED 2026-08-13` is **63** counted, not 62.
+>
+> **All three criticals and six of the seven highs are closed.** `TUI-027` (crit) closed in sweep 1;
+> `TUI-042`, `TUI-043` were already fixed; `TUI-031`, `TUI-054`, `TUI-005` closed in sweep 1; and
+> `TUI-016`, `TUI-052`, `TUI-045`, `TUI-055` were **already FIXED at HEAD by commit `c8c86bc`** while
+> both their status rows and their item bodies still said still-open/regressed. `TUI-N13` was likewise
+> already fixed with its severity cell left at `high`. The only high-severity row left is none.
+>
+> **THIS AREA HAD NO SWEEP-2 PASS.** Sweep 2 covered areas 01, 02, 03, 05, 06, 08, 09/10 and 11/04;
+> area 07 was not assigned. Everything below is sweep 1 plus residuals handed here by other areas.
+>
+> **RESIDUALS FILED HERE BY OTHER AREAS IN SWEEP 2 — this is now the largest pile of one-crate work in
+> the backlog, and none of it has an area-07 item yet:**
+>
+> - **`EXT-019`** — the markdown render path must call
+>   `ExtensionHost::transform_markdown(markdown, message_type, is_streaming, available_width)`. The
+>   whole host side (WIT import + guest export, load-ordered owner list, the facade fold, the native
+>   trait method, the full SDK surface) is landed; this is the only reader missing.
+> - **`EXT-039`** — call `resolve_shortcuts`, invert `app.rs:1691-1703`, thread `shortcut_diagnostics`
+>   into `startup_diagnostics.extensions`. The registry half is landed and re-verified.
+> - **`EXT-040`** — `cyrup-tui/main.rs` consuming `shortcut_specs` (which exists).
+> - **`SEAM-061`** (the backlog's remaining high) — `SessionAction::ToggleScope` in
+>   `keymap.rs:888-909` plus its `handle` arm, and making `show_path` FOLLOW the scope. `SessionScope`,
+>   `SessionSelector::set_scope` and `scope()` already exist (`session_selector.rs:54`, `:250`,
+>   `:255`), so the missing piece has narrowed to the action + handler. **Two sweeps have split this
+>   across areas 07 and 08 and neither took it; it needs one agent holding both crates.**
+> - **`SESS-S05`** — the `label_timestamp` producer and the inline render + `formatLabelTimestamp`
+>   port. `cyrup_session::TreeNode.label_timestamp` is populated and `SessionManager::label_timestamp()`
+>   is public, so the 22-line comment at `app.rs:5553-5569` conceding there is no producer is STALE.
+> - **`SESS-013`** — collapse the cyrup-tui copy of `find_git_paths` onto `cyrup_session::git_paths`.
+> - **`CFG-038`, `CFG-045`, `CFG-047`** — `keymap.rs` `merge_json` skip-and-continue, `app.rs:1886-1913`
+>   Escape branches 3 and 4, and three built-in slash-command metadata divergences in `commands.rs`.
+> - **`CFG-048` read-time half** — `keybindings_object` (`:32-40`) must run `migrate_keybindings_config`
+>   on the parsed map before the entry loop (pi's keybindings.ts:366). **Ship it with `CFG-038` — both
+>   edit the adjacent function.**
+> - **`PROV-035`** — the `/session` `Cache Re-billed: $X (N tokens, M misses)` line at `app.rs:4192`
+>   under pi's `stats.cost > 0 || cacheWaste.missedTokens > 0` guard, now that
+>   `cyrup_provider::cache_stats` exists. Note the port keys misses by INDEX, not by message
+>   reference — the renderer must carry the index.
+> - **`CFG-044`** — the dangling doc at `auth_select.rs:39-42`, which still names `auth.rs::get_auth_status`.
+>
+> **`TUI-028`'s upstream citations are wrong and were not fixed** (area 05 could not edit this file):
+> `keybindings.ts:208-270` and `migrateKeybindingsConfig (:294-311)` should be **`:209-269`** and
+> **`:289-309`**, identical at both tags. `TUI-028` is now UNBLOCKED in the sense `CFG-048` required —
+> the alias table exists and maps to `tui.editor.*` — and **it must NOT delete the `editor.*` arms of
+> `EditorAction::from_id`**, which are what keeps shipped-cyrup configs working.
+>
+> **`TUI-055` is closed but its consequence is not**: `SESS-040` cannot be verified until a compaction
+> band actually renders, and `SESS-040`/`041`/`042` now differ only in wiring.
+
+
 ## Status of every item from prior analyses
 
 | ID | Status | Evidence |
@@ -159,74 +238,76 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 > 11 — which is how `SEAM-S01` escaped a full audit pass on 2026-08-07. One table now; `-S` ids keep
 > their suffix to mark provenance.
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 14 medium, 20 low = 34.** 29 rows are now marked CLOSED. This area had no sweep-2 pass; see the reconciliation block above for the residuals other areas filed here.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | TUI-042 | **FIXED 2026-08-13** | parity-bug | S | ~~The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message~~ |
 | TUI-043 | **FIXED 2026-08-13** | parity-bug | S | ~~Word motion and Ctrl+W are not paste-marker atomic — one Ctrl+W after a large paste orphans the marker and drops the paste~~ |
-| TUI-027 | **critical** | not-ported | M | `/tree` has no text search, its four action keys are the characters pi types *into* that search, and the resulting label edit is persisted to the session JSONL |
-| TUI-031 | **high** | not-ported | M | A prompt typed during compaction is sent immediately instead of queued |
-| TUI-045 | **high** | not-ported | M | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — a spurious `Escape` aborts the turn and the tail is typed as text — **observed 2026-08-13, raised from medium** |
-| TUI-016 | **high** | parity-bug | M | A queued message is echoed into the transcript as if delivered, and has no queue surface at all — **observed 2026-08-13, retitled and raised from medium** |
-| TUI-052 | **high** | parity-bug | S | A queued message dequeued by Escape stays in the transcript forever as a phantom user message that was never sent — **new, observed 2026-08-13** |
+| ~~TUI-027~~ | ~~**critical**~~ **CLOSED 2026-08-14** | not-ported | M | `/tree` has no text search, its four action keys are the characters pi types *into* that search, and the resulting label edit is persisted to the session JSONL — **CLOSED 2026-08-14**: sweep 1 — `/tree` gained a real text search, and two corrections to the item are recorded: (1) the `keymap.rs:908-915` offsets for `TreeKeymap::default` have moved; (2) the Fix asks for the digit-filter arm to be REPLACED, which is right, but does not say that `FilterMode::from_digit` becomes dead and must be deleted — upstream has no digit arm anywhere in `handleInput`. pi's help row and the standing `Type to search:` line are part of the surface and were ported with the search. |
+| ~~TUI-031~~ | ~~**high**~~ **CLOSED 2026-08-14** | not-ported | M | A prompt typed during compaction is sent immediately instead of queued — **CLOSED 2026-08-14**: sweep 1. |
+| ~~TUI-045~~ | ~~**high**~~ **CLOSED 2026-08-14** | not-ported | M | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — a spurious `Escape` aborts the turn and the tail is typed as text — **observed 2026-08-13, raised from medium** — **CLOSED 2026-08-14**: sweep 1 — FIXED at HEAD by commit c8c86bc (`src/pending_messages.rs`; `dispatch_submission` no longer calls `push_user`). Both the status-table row and the item body saying still-open/regressed were stale. |
+| ~~TUI-016~~ | ~~**high**~~ **CLOSED 2026-08-14** | parity-bug | M | A queued message is echoed into the transcript as if delivered, and has no queue surface at all — **observed 2026-08-13, retitled and raised from medium** — **CLOSED 2026-08-14**: sweep 1 — FIXED at HEAD by commit c8c86bc (`src/pending_messages.rs`; `dispatch_submission` no longer calls `push_user`). Both the status-table row and the item body saying still-open/regressed were stale. |
+| ~~TUI-052~~ | ~~**high**~~ **CLOSED 2026-08-14** | parity-bug | S | A queued message dequeued by Escape stays in the transcript forever as a phantom user message that was never sent — **new, observed 2026-08-13** — **CLOSED 2026-08-14**: sweep 1 — FIXED at HEAD by commit c8c86bc (`src/pending_messages.rs`; `dispatch_submission` no longer calls `push_user`). Both the status-table row and the item body saying still-open/regressed were stale. |
 | TUI-053 | **FIXED 2026-08-13** | parity-bug | S | ~~`Ctrl+-` (`editor.undo`) is unreachable from any terminal without the kitty keyboard protocol — pi maps the legacy `0x1F` byte, cyrup does not~~ — fixed by porting `keys.ts:1275-1281`; still wants a live non-kitty run to close by hand |
-| TUI-054 | **high** | parity-bug | S | A failed or aborted compaction is announced to the user as "compaction complete" — `CompactionEnd`'s `aborted`/`error_message` are destructured away — **new, observed 2026-08-13** |
-| TUI-055 | **high** | parity-bug | M | No status indicator renders for the entire duration of a compaction — the screen is blank for 10–20 s — **new, observed 2026-08-13** |
+| ~~TUI-054~~ | ~~**high**~~ **CLOSED 2026-08-14** | parity-bug | S | A failed or aborted compaction is announced to the user as "compaction complete" — `CompactionEnd`'s `aborted`/`error_message` are destructured away — **new, observed 2026-08-13** — **CLOSED 2026-08-14**: sweep 1 — with the residual named: cyrup's `/compact` returns a `CompactOutcome` that `apply_compact_outcome` renders on the COMMAND path, whereas pi's `handleCompactCommand` (:6030-6038) renders nothing and the event is upstream's only renderer. So the event arm handles the automatic reasons only, and a MANUAL abort still reads `compact error: …` where pi reads `Compaction cancelled`. **That residual is folded into SESS-040 rather than left dangling here.** |
+| ~~TUI-055~~ | ~~**high**~~ **CLOSED 2026-08-14** | parity-bug | M | No status indicator renders for the entire duration of a compaction — the screen is blank for 10–20 s — **new, observed 2026-08-13** — **CLOSED 2026-08-14**: sweep 1 — FIXED at HEAD by commit c8c86bc (`src/pending_messages.rs`; `dispatch_submission` no longer calls `push_user`). Both the status-table row and the item body saying still-open/regressed were stale. |
 | TUI-004 | medium | upstream-drift | M | No live colour-scheme sync; `/reload` does not re-apply themes |
-| TUI-005 | medium | not-ported | S | Escape branches: bash-mode clear missing; bash child killed while streaming |
+| ~~TUI-005~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | Escape branches: bash-mode clear missing; bash child killed while streaming — **CLOSED 2026-08-14**: sweep 1 — the fix also required porting pi's compaction Escape rebind (interactive-mode.ts:3080-3086 / :3094-3097), which no TUI item filed: once the chain is exclusive, `isStreaming` is false during a compaction, so Escape would otherwise fall to the empty-editor branch and abort nothing. Overlaps SESS-040 — 040 must not double-book it. |
 | TUI-006 | medium | not-ported | M | `[Extension issues]` renders 2 of pi's 4 diagnostic sources |
 | TUI-008 | medium | not-ported | M | Seven upstream global keybinding ids are unbound |
-| TUI-009 | medium | not-ported | S | Double-Escape → tree/fork never implemented although `doubleEscapeAction` ships in `/settings` |
+| ~~TUI-009~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | Double-Escape → tree/fork never implemented although `doubleEscapeAction` ships in `/settings` — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-012 | medium | not-ported | M | No argument autocomplete for `/model <prefix>` or `/login <prefix>` |
-| TUI-014 | medium | not-ported | M | Extension widgets (`ui.setWidget`) now reach the TUI and are stored where nothing renders them |
+| ~~TUI-014~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | Extension widgets (`ui.setWidget`) now reach the TUI and are stored where nothing renders them — **CLOSED 2026-08-14**: sweep 1 — the CYRUP-DELTA the item did not anticipate is recorded: cyrup's WIT collapsed pi's three-argument `setWidget(key, content, options)` into one opaque JSON payload. **Superseded in sweep 2 — EXT-047 re-signed the import to pi's three arguments, so the widget now arrives keyed, and the item's premise "there is no key to map by" is doubly retired.** |
 | TUI-015 | medium | cyrup-original | M | No render coalescing — one draw per streaming event, no frame budget |
-| TUI-017 | medium | parity-bug | S | Attachment image strip: rasterizes without a protocol, invented placeholder, no 60-cell cap |
-| TUI-028 | medium | parity-bug | S | Editor/input keybinding ids use an `editor.*` namespace upstream abandoned — 24 ids inert |
+| ~~TUI-017~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Attachment image strip: rasterizes without a protocol, invented placeholder, no 60-cell cap — **CLOSED 2026-08-14**: sweep 1. |
+| ~~TUI-028~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Editor/input keybinding ids use an `editor.*` namespace upstream abandoned — 24 ids inert — **CLOSED 2026-08-14**: sweep 1 — one deliberate deviation from the Fix: `app.pageUp`/`app.pageDown` were NOT folded onto the editor map, because `load_keybindings_json` fans one JSON document out to six maps, so accepting the id in both would make a single config entry rebind two different actions. They stay as cyrup-original ids on the global map and are listed as a new gap. The dependency line ("Must land after CFG-048") is satisfied by keeping the `editor.*` spellings as ALIASES rather than renaming them. **Sweep 2 (area 05) correction: this item's upstream cites are wrong — `keybindings.ts:208-270` and `migrateKeybindingsConfig (:294-311)` should be `:209-269` and `:289-309`, identical at both tags — and TUI-028 must NOT delete the `editor.*` arms of `EditorAction::from_id`, which are what keeps shipped-cyrup configs working.** |
 | TUI-029 | medium | not-ported | M | Extension autocomplete providers are never consulted by the interactive editor |
 | TUI-030 | medium | not-ported | L | Nine `ExtensionUIContext` methods have no cyrup counterpart at all |
-| TUI-032 | medium | not-ported | S | `/settings` is missing the `Warnings` and `Thinking level` submenus |
-| TUI-033 | medium | not-ported | M | `ui.setHeader` / `ui.setFooter` are delivered to the TUI and dropped into fields nothing renders |
+| ~~TUI-032~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | `/settings` is missing the `Warnings` and `Thinking level` submenus — **CLOSED 2026-08-14**: sweep 1. |
+| ~~TUI-033~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | `ui.setHeader` / `ui.setFooter` are delivered to the TUI and dropped into fields nothing renders — **CLOSED 2026-08-14**: sweep 1 — CYRUP-DELTA recorded: pi restores the built-in when the FACTORY is `undefined`; cyrup's WIT signature is `set-header(content: string)` with no `undefined`, so the empty string carries "restore the built-in". |
 | TUI-034 | medium | upstream-drift | L | No markdown-transformer hook — extension transformers and pi's Mermaid renderer both absent |
 | TUI-037 | medium | not-ported | S | `/reload` never persists an implicitly-granted project trust |
 | TUI-044 | **FIXED 2026-08-13** | parity-bug | S | ~~`undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read~~ |
 | TUI-046 | medium | parity-bug | M | cyrup pushes Kitty keyboard flag 1, pi pushes 7 — and neither guard flag 7 requires exists, so raising it alone would duplicate characters and leak CSI-u text |
-| TUI-051 | medium | parity-bug | S | `/reload` never re-reads `keybindings.json`, while the command's help text and its in-source comment both claim it does |
+| ~~TUI-051~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `/reload` never re-reads `keybindings.json`, while the command's help text and its in-source comment both claim it does — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-058 | **FIXED 2026-08-13** | parity-bug | S | ~~Deleting a paste marker does not renumber the pastes that follow it — ids diverge from pi's for the life of the session~~ — **new, found 2026-08-13** |
 | TUI-059 | **FIXED 2026-08-13** | parity-bug | S | ~~Only Left/Right clear `lastAction`, so a kill survives every other motion and the next kill accumulates into the same ring entry~~ — **new, found 2026-08-13** |
 | TUI-019 | medium | upstream-drift | L | No alt-screen UI mode, mouse, scrollbars, prompt navigation — **re-rated from low; the ADR-0001 justification does not hold** |
-| TUI-N01 | medium | parity-bug | S | Tool-result images rasterize on terminals with no image protocol |
+| ~~TUI-N01~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Tool-result images rasterize on terminals with no image protocol — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-N02 | medium | not-ported | S | `/reload` does not re-emit the loaded-resources / diagnostics panel |
-| TUI-N03 | medium | parity-bug | S | A theme chosen in `/settings` is applied live but never persisted |
+| ~~TUI-N03~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | A theme chosen in `/settings` is applied live but never persisted — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-N04 | medium | not-ported | S | The untrusted-project warning banner is never rendered at startup |
 | TUI-002 | low | parity-bug | M | Thinking blocks: fold-ordering and the visible-content spacer (markdown half closed) |
 | TUI-003 | low | parity-bug | S | Replay omits the compaction-count status |
-| TUI-010 | low | parity-bug | S | Ctrl+O pushes no `Tool output: …` status (committed-entry half closed) |
+| ~~TUI-010~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Ctrl+O pushes no `Tool output: …` status (committed-entry half closed) — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-011 | low | not-ported | M | `/changelog` is a hardcoded stub; no "What's New" startup notice |
-| TUI-013 | low | parity-bug | S | Quoted paths with spaces break `@`-mention autocomplete |
+| ~~TUI-013~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Quoted paths with spaces break `@`-mention autocomplete — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-018 | low | not-ported | M | Startup header has no logo/version line and no expanded body |
 | TUI-020 | low | not-ported | S | OSC-8 hyperlinks: capability now consulted, still never emitted |
 | TUI-021 | low | upstream-drift | M | Cache-miss notices not implemented |
-| TUI-025 | low | stale-port | S | Slash-command metadata one baseline behind |
-| TUI-035 | low | upstream-drift | S | `tui.editor.historyPrevious` / `historyNext` are unbound |
-| TUI-036 | low | parity-bug | S | `Show images` / `Image width` rows are offered on terminals with no image protocol |
-| TUI-038 | low | parity-bug | S | Ctrl+O is an if/else in cyrup and a fan-out upstream — a live bash block blocks tool expansion |
-| TUI-039 | low | parity-bug | S | Terminal geometry never falls back to `$COLUMNS` / `$LINES` |
+| TUI-025 | low — **PARTIALLY CLOSED 2026-08-14** | stale-port | S | Slash-command metadata one baseline behind — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the three `commands.rs` literals and the `/reload` status sentence are done. **RESIDUAL: the `; saved project trust` variant depends on TUI-037, whose write lives in `crates/cyrup`.** |
+| ~~TUI-035~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | `tui.editor.historyPrevious` / `historyNext` are unbound — **CLOSED 2026-08-14**: sweep 1. |
+| ~~TUI-036~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `Show images` / `Image width` rows are offered on terminals with no image protocol — **CLOSED 2026-08-14**: sweep 1. |
+| ~~TUI-038~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Ctrl+O is an if/else in cyrup and a fan-out upstream — a live bash block blocks tool expansion — **CLOSED 2026-08-14**: sweep 1. |
+| ~~TUI-039~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Terminal geometry never falls back to `$COLUMNS` / `$LINES` — **CLOSED 2026-08-14**: sweep 1 — but its Verify ("App test with a backend reporting no size and COLUMNS=200 set") CANNOT live in `crates/cyrup-tui/src/`: `std::env::set_var` is unsafe in edition 2024 and the crate is `#![forbid(unsafe_code)]`. It belongs in `crates/cyrup-tui/tests/`, next to `experimental_marker.rs`, which exists for exactly this reason. Same note applies to TUI-041's env half. |
 | TUI-040 | low | not-ported | S | No `PI_TUI_WRITE_LOG` equivalent — no escape-sequence write log |
-| TUI-041 | low | parity-bug | S | `/settings` shows env-overridden rows with the wrong value |
+| ~~TUI-041~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `/settings` shows env-overridden rows with the wrong value — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-047 | low | not-ported | M | A late or unsolicited DCS/APC frame is shredded into ~20 typed characters — `stray_reply.rs` recognises only OSC 11 |
 | TUI-048 | low — **partially fixed 2026-08-13** | parity-bug | M | Word navigation classifies by character class instead of Unicode word segmentation — CJK word motion jumps whole runs. Class-run motion replaced by UAX#29 + pi's punctuation sub-boundaries; the ICU dictionary pass for unspaced scripts remains |
 | TUI-049 | **FIXED 2026-08-13** | parity-bug | S | ~~`marker_at` accepts any text between `[paste #N ` and `]`, expanding markers pi's regex rejects~~ |
 | TUI-050 | low | not-ported | S | An 8-bit meta byte is silently dropped instead of being converted to `ESC` + char (depends on TUI-045) |
 | TUI-060 | low | parity-bug | M | The wrap / visual-line map is not paste-marker aware, so a marker can be torn across visual rows — pi passes a marker-merged `preSegmented` to `wordWrapLine` — **new, found 2026-08-13** |
-| TUI-061 | low | parity-bug | S | `set_text` collapses pi's `setText` and `setTextInternal`, so a programmatic buffer replacement leaves the paste registry live and is not undoable — **new, found 2026-08-13** |
+| ~~TUI-061~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `set_text` collapses pi's `setText` and `setTextInternal`, so a programmatic buffer replacement leaves the paste registry live and is not undoable — **new, found 2026-08-13** — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-N05 | low | parity-bug | S | Extension shortcuts can never override a built-in key; no conflict reported |
 | TUI-N06 | low | parity-bug | L | `Entry::Thinking` freezes hide/show at commit time |
 | TUI-N07 | low | parity-bug | L | Mid-session `/resume` cannot erase the previous session's scrollback |
-| TUI-N08 | low | test-defect | S | `tests/image.rs` pins the invented `🖼` placeholder and the rasterize-anyway fallback |
-| TUI-N09 | low | test-defect | S | `extension_dialog_countdown` asserts an exact countdown it cannot control |
+| ~~TUI-N08~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | `tests/image.rs` pins the invented `🖼` placeholder and the rasterize-anyway fallback — **CLOSED 2026-08-14**: sweep 1 — the proposed remedy (annotate + add an `#[ignore]`d companion) was NOT taken: TUI-017 landed in the same pass, so the assertions were retargeted to pi's real `[Image: …]` format outright and the `#[ignore]` is unnecessary. |
+| ~~TUI-N09~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | `extension_dialog_countdown` asserts an exact countdown it cannot control — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-N10 | low | test-defect | S | `bash_overlay`'s two hotkeys tests hard-code the non-macOS `alt` spelling — **fixed this pass** |
 | TUI-N11 | medium | test-defect | S | `m7_inline_formatting_survives_inside_a_table_cell` asserts a property of the ambient `TERM_PROGRAM` — **fixed this pass** |
-| TUI-N12 | low | not-ported | S | No `setCapabilities` / `resetCapabilitiesCache` seam; only markdown can drive both OSC-8 branches |
-| TUI-N13 | high | test-defect | S | `a_live_bash_run_names_its_spool_file` parses one wrapped line, so it is red wherever `TMPDIR` is long — **fixed this pass** |
+| ~~TUI-N12~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | No `setCapabilities` / `resetCapabilitiesCache` seam; only markdown can drive both OSC-8 branches — **CLOSED 2026-08-14**: sweep 1 — the secondary latent hazard ("if any earlier caller latches the lock first that seed is silently discarded for the process") is closed as a consequence: `set_capabilities` replaces rather than first-writer-wins, and `App::detect_image_support` seeds the whole record. |
+| ~~TUI-N13~~ | ~~high~~ **CLOSED 2026-08-14** | test-defect | S | `a_live_bash_run_names_its_spool_file` parses one wrapped line, so it is red wherever `TMPDIR` is long — **fixed this pass** — **CLOSED 2026-08-14**: closed pre-sweep (`a_live_bash_run_names_its_spool_file` parsed one wrapped line, red wherever `TMPDIR` is long). |
 | TUI-S02 | low | not-ported | S | No dead-terminal (EIO/EPIPE/ENOTCONN) emergency exit path (panic-hook half closed) |
 | TUI-S10 | low | not-ported | S | Shift+Ctrl+D global debug chord absent — `/debug` reachable only by typing into the editor |
 | TUI-056 | low | parity-bug | S | The context-usage meter resets to `0.0%` after an aborted turn while the conversation is still in the transcript — **new, observed 2026-08-13** |

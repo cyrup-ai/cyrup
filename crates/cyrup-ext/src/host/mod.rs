@@ -31,6 +31,6 @@ pub use services::{
     DENIED_EXEC, DENIED_NET, DENIED_UI,
     HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
     HumanInteractionLock, NotifyKind, OAuthEvent, ProcSpawnSpec, ProviderReduction,
-    RecordingServices, SharedBus, UiChrome,
+    RecordingServices, SharedBus, UiChrome, WidgetEffect, WidgetPlacement,
 };
 pub use store_state::HostState;

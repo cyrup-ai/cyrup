@@ -139,6 +139,8 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         timeout_ms: None,
         output_path: None,
         output_mode: OutputMode::Inline,
+        // SUBA-054: `None` is upstream's `false` — no `reads` instruction at all.
+        reads: None,
         structured_output_schema: None,
         model_override: ModelOverride::Inherit,
         preferred_provider: None,

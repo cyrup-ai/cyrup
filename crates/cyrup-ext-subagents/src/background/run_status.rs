@@ -543,6 +543,21 @@ fn list_rank(state: RunState) -> u8 {
 /// directory) is skipped rather than aborting the whole scan (graceful degradation, matching pi's
 /// `if (!status) continue`).
 ///
+/// # Session scoping (SUBA-031)
+///
+/// `session_id` is pi's `options.sessionId` and the filter is pi's literal one — `if
+/// (options.sessionId && status.sessionId !== options.sessionId) continue;`
+/// (`async-status.ts:432` @v0.43.0). Two consequences are upstream's, not incidental:
+///
+/// * `None` (a headless / unpersisted orchestrator with no live session identity) applies **no**
+///   filter at all, exactly as pi's falsy `options.sessionId` does — the async root is then scoped
+///   by cwd alone, which is the behaviour every reader had before this parameter existed.
+/// * When a filter IS supplied, a run whose own [`RunStatus::session_id`] is `None` is **dropped**.
+///   pi compares with `!==` against `undefined`, so an unattributed run is not "everyone's", it is
+///   nobody's. That is why [`crate::background::runner_main::RunnerConfig::session_id`] carries the
+///   launching session explicitly rather than leaving the runner to re-derive it from the
+///   permission-system-published anchor, which is absent whenever that extension is not loaded.
+///
 /// # Errors
 ///
 /// Returns [`SubagentError::Spawn`] only if `async_root` exists but its directory listing itself
@@ -550,6 +565,7 @@ fn list_rank(state: RunState) -> u8 {
 pub async fn list_active_runs(
     async_root: &Path,
     results_dir: &Path,
+    session_id: Option<&str>,
 ) -> Result<Vec<ActiveRun>, SubagentError> {
     let mut runs: Vec<ActiveRun> = Vec::new();
 
@@ -576,6 +592,14 @@ pub async fn list_active_runs(
         let Ok(status) = reconcile_before_control_op(&paths).await else {
             continue;
         };
+        // pi `if (options.sessionId && status.sessionId !== options.sessionId) continue;`
+        // (`async-status.ts:432`), applied AFTER the state filter for the same reason pi applies it
+        // there: both are cheap rejections that run before any further per-run work.
+        if let Some(wanted) = session_id
+            && status.session_id.as_deref() != Some(wanted)
+        {
+            continue;
+        }
         if matches!(status.state, RunState::Queued | RunState::Running) {
             runs.push(ActiveRun {
                 dir: paths.run_dir.clone(),
@@ -832,7 +856,7 @@ mod tests {
         done.advance_state(RunState::Complete).expect("-> Complete");
         write_status(&done_paths, &done).await;
 
-        let active = list_active_runs(&async_root, &results_dir)
+        let active = list_active_runs(&async_root, &results_dir, None)
             .await
             .expect("list active");
         let ids: Vec<&str> = active.iter().map(|r| r.status.run_id.as_str()).collect();
@@ -852,11 +876,72 @@ mod tests {
     #[tokio::test]
     async fn format_run_list_empty_is_the_no_active_sentinel() {
         let (_dir, async_root, results_dir) = roots();
-        let active = list_active_runs(&async_root, &results_dir)
+        let active = list_active_runs(&async_root, &results_dir, None)
             .await
             .expect("list active over a missing async root is empty, not an error");
         assert!(active.is_empty());
         assert_eq!(format_run_list(&active), "No active async runs.");
+    }
+
+    /// SUBA-031 — the session filter is pi's `if (options.sessionId && status.sessionId !==
+    /// options.sessionId) continue;` (`async-status.ts:432` @v0.43.0), all three of its arms.
+    ///
+    /// The `None` leg is asserted FIRST and deliberately: it establishes that all three runs are on
+    /// disk, active, and reachable, so the two filtered legs below are proving an exclusion rather
+    /// than passing vacuously on an empty root.
+    #[tokio::test]
+    async fn list_active_runs_scopes_to_the_requested_session() {
+        let (_dir, async_root, results_dir) = roots();
+
+        for (token, session) in [
+            ("run0sessa00", Some("session-a")),
+            ("run0sessb00", Some("session-b")),
+            ("run0noneses", None),
+        ] {
+            let id = RunId::from_token(token);
+            let paths = RunPaths::for_run(&async_root, &results_dir, &id);
+            let mut status = running_status(&id, RunMode::Single, vec![StepStatus::pending("a")]);
+            status.session_id = session.map(str::to_string);
+            write_status(&paths, &status).await;
+        }
+
+        async fn ids(async_root: &Path, results_dir: &Path, session: Option<&str>) -> Vec<String> {
+            let mut ids: Vec<String> = list_active_runs(async_root, results_dir, session)
+                .await
+                .expect("list active")
+                .iter()
+                .map(|r| r.status.run_id.as_str().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        // No filter (pi's falsy `options.sessionId`): every active run, whatever it recorded.
+        assert_eq!(
+            ids(&async_root, &results_dir, None).await,
+            vec!["run0noneses", "run0sessa00", "run0sessb00"],
+            "an unfiltered listing must still surface all three runs"
+        );
+
+        // A filter drops the OTHER session's run — the SUBA-031 defect itself: two cyrup sessions
+        // in the same repo used to see (and `wait` on) each other's background runs.
+        //
+        // It also drops the UNATTRIBUTED run, which is pi's `!==` against `undefined` and not an
+        // accident: a run nobody claimed is not everybody's.
+        assert_eq!(
+            ids(&async_root, &results_dir, Some("session-a")).await,
+            vec!["run0sessa00"]
+        );
+        assert_eq!(
+            ids(&async_root, &results_dir, Some("session-b")).await,
+            vec!["run0sessb00"]
+        );
+        assert!(
+            ids(&async_root, &results_dir, Some("session-c"))
+                .await
+                .is_empty(),
+            "a session that launched nothing sees nothing"
+        );
     }
 
     // ---------------------------------------------------------------------------------------

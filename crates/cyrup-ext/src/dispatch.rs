@@ -40,6 +40,11 @@ pub struct Dispatcher {
     budget: Duration,
     /// Error listeners notified when a guest fault is contained (Pi `onError`, R-08-036).
     error_listeners: RwLock<Vec<ErrorListener>>,
+    /// The inter-extension bus fan-out (EXT-034), held WEAKLY — the fan-out owns this dispatcher
+    /// (it needs [`Self::report_external`]), so a strong edge back would be a reference cycle.
+    /// `None` on a bare dispatcher built outside an `ExtensionHost` (tests), in which case every
+    /// drain is a no-op and nothing can be queued anyway.
+    bus_drain: RwLock<Option<std::sync::Weak<dyn crate::bus::BusDrain>>>,
 }
 
 #[derive(Default)]
@@ -62,6 +67,7 @@ impl Dispatcher {
             inner: RwLock::new(DispatchInner::default()),
             budget: DEFAULT_INVOKE_BUDGET,
             error_listeners: RwLock::new(Vec::new()),
+            bus_drain: RwLock::new(None),
         }
     }
 
@@ -70,6 +76,43 @@ impl Dispatcher {
             inner: RwLock::new(DispatchInner::default()),
             budget,
             error_listeners: RwLock::new(Vec::new()),
+            bus_drain: RwLock::new(None),
+        }
+    }
+
+    /// Attach the inter-extension bus fan-out (EXT-034). Called once by
+    /// [`crate::ExtensionHost::new`]; the last handle wins.
+    pub(crate) fn set_bus_drain(&self, drain: std::sync::Weak<dyn crate::bus::BusDrain>) {
+        if let Ok(mut g) = self.bus_drain.write() {
+            *g = Some(drain);
+        }
+    }
+
+    /// Fan out anything a just-finished handler chain put on the inter-extension bus (EXT-034).
+    ///
+    /// pi needs no such call: `createEventBus().emit` runs every listener inline at the emit
+    /// (`pi/packages/coding-agent/src/core/event-bus.ts:12-32` @v0.83.0), so a `pi.events.emit` from
+    /// inside an event handler is delivered before the handler returns. cyrup has to defer past the
+    /// emitting guest's own store, which makes THIS — after the subscriber loop, with no guest store
+    /// held — the equivalent point. It is a no-op when a drain is already in progress or when no
+    /// host attached a fan-out.
+    ///
+    /// `exclude` is the reason this takes an argument at all. A `Some` exclusion means a guest is
+    /// SUSPENDED inside one of its own host imports right now (the `provider-stream.on-payload`
+    /// path — see [`Self::dispatch_block_mutate_excluding`]), holding its single-instance
+    /// `tokio::Mutex` store guard. Delivering a bus event to that guest would await the guard it
+    /// already holds and HANG — not fail, hang, because a re-entrant `tokio::Mutex::lock` has no
+    /// deadlock detection. So the drain is skipped entirely on those seams; the events stay queued
+    /// and go out at the next seam that is not inside a guest, which is the same deferral the queue
+    /// exists for. Upstream has no equivalent hazard: pi's runner is one JS process and a
+    /// re-entered handler is an ordinary nested call.
+    async fn drain_bus(&self, cancel: &CancelToken, exclude: Option<&cyrup_core::ExtensionId>) {
+        if exclude.is_some() {
+            return;
+        }
+        let drain = self.bus_drain.read().ok().and_then(|g| g.as_ref().and_then(|w| w.upgrade()));
+        if let Some(drain) = drain {
+            drain.drain_bus(cancel).await;
         }
     }
 
@@ -199,18 +242,24 @@ impl Dispatcher {
         exclude: Option<&cyrup_core::ExtensionId>,
     ) {
         let kind = ev.kind();
-        if self.no_subscribers(kind) {
-            return;
-        }
-        for ext in self.subscribers_for(kind) {
-            if exclude.is_some_and(|x| ext.id() == x) {
-                continue;
+        // EXT-034: the subscription gate (R-08-034) skips the HANDLER loop, never the drain. The
+        // gate answers "does anyone subscribe to THIS event kind", which has nothing to do with
+        // whether a bus event is waiting: an extension that only listens on `pi.events` declares no
+        // event subscriptions at all, so gating the drain on it stranded the queue forever — pi
+        // cannot stall a delivery this way because `emit` runs its listeners inline at the emit
+        // (`pi/packages/coding-agent/src/core/event-bus.ts:12-32` @v0.83.0).
+        if !self.no_subscribers(kind) {
+            for ext in self.subscribers_for(kind) {
+                if exclude.is_some_and(|x| ext.id() == x) {
+                    continue;
+                }
+                // Fault-contained: an error is reported and skipped (R-08-036).
+                if let Err(e) = self.invoke_contained(&ext, ev, cancel).await {
+                    self.report(kind, ext.id(), &e);
+                }
             }
-            // Fault-contained: an error is reported and skipped (R-08-036).
-            if let Err(e) = self.invoke_contained(&ext, ev, cancel).await {
-                self.report(kind, ext.id(), &e);
-            }
         }
+        self.drain_bus(cancel, exclude).await;
     }
 
     /// Collect EVERY subscribed extension's `handled` contribution for a discovery/aggregation event
@@ -225,16 +274,17 @@ impl Dispatcher {
     ) -> Vec<(cyrup_core::ExtensionId, HandledValue)> {
         let kind = ev.kind();
         let mut out = Vec::new();
-        if self.no_subscribers(kind) {
-            return out;
-        }
-        for ext in self.subscribers_for(kind) {
-            match self.invoke_contained(&ext, ev, cancel).await {
-                Ok(HookOutcome::Handled(v)) => out.push((ext.id().clone(), v)),
-                Ok(_) => {}
-                Err(e) => self.report(kind, ext.id(), &e),
+        // EXT-034: gate the handler loop, not the drain — see `dispatch_notify_excluding`.
+        if !self.no_subscribers(kind) {
+            for ext in self.subscribers_for(kind) {
+                match self.invoke_contained(&ext, ev, cancel).await {
+                    Ok(HookOutcome::Handled(v)) => out.push((ext.id().clone(), v)),
+                    Ok(_) => {}
+                    Err(e) => self.report(kind, ext.id(), &e),
+                }
             }
         }
+        self.drain_bus(cancel, None).await;
         out
     }
 
@@ -252,16 +302,25 @@ impl Dispatcher {
         decided: impl Fn(&HandledValue) -> bool,
     ) -> Option<(cyrup_core::ExtensionId, HandledValue)> {
         let kind = ev.kind();
+        // EXT-034: gate the handler loop, not the drain — see `dispatch_notify_excluding`.
         if self.no_subscribers(kind) {
+            self.drain_bus(cancel, None).await;
             return None;
         }
         for ext in self.subscribers_for(kind) {
             match self.invoke_contained(&ext, ev, cancel).await {
-                Ok(HookOutcome::Handled(v)) if decided(&v) => return Some((ext.id().clone(), v)),
+                Ok(HookOutcome::Handled(v)) if decided(&v) => {
+                    // EXT-034: the short-circuit return still has to drain — a handler that emitted
+                    // AND decided is exactly the coordination case (a permission gate announcing its
+                    // decision), and upstream that emit was delivered inline before the return.
+                    self.drain_bus(cancel, None).await;
+                    return Some((ext.id().clone(), v));
+                }
                 Ok(_) => {}
                 Err(e) => self.report(kind, ext.id(), &e),
             }
         }
+        self.drain_bus(cancel, None).await;
         None
     }
 
@@ -282,6 +341,21 @@ impl Dispatcher {
     /// which is the whole point of EXT-052, since the observers that matter are the other
     /// extensions.
     pub async fn dispatch_block_mutate_excluding(
+        &self,
+        ev: HostEvent,
+        cancel: &CancelToken,
+        exclude: Option<&cyrup_core::ExtensionId>,
+    ) -> Reduced {
+        let reduced = self.block_mutate_chain(ev, cancel, exclude).await;
+        // EXT-034: drain on EVERY exit of the chain — including the first-block short-circuit,
+        // which is precisely the handler most likely to have announced itself on `pi.events`.
+        self.drain_bus(cancel, exclude).await;
+        reduced
+    }
+
+    /// The block/mutate chain proper. Split out of [`Self::dispatch_block_mutate_excluding`] so the
+    /// bus drain (EXT-034) covers its four early returns without four copies of the call.
+    async fn block_mutate_chain(
         &self,
         mut ev: HostEvent,
         cancel: &CancelToken,

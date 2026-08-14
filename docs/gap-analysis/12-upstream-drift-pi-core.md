@@ -70,6 +70,76 @@ This area tracks behavior that `pi/` core (packages `ai/`, `agent/`, `coding-age
 > 20 IDs restate work an owning area is already tracking. Use the deduplicated figure for planning
 > and the raw figure only for ID bookkeeping — see `## Coverage → Duplication census`.
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 12 — recount: 34 rows → 16 open (0 critical · 0 high · 7 medium · 9 low) + 4 trackers.** The
+> area's only high, `DRIFT-049`, was already FIXED via `SEAM-047` — its *kind* cell said so while its
+> *severity* cell still read `high`, which is why two recounts carried a phantom high. **Area 12 now
+> has no open high.**
+>
+> **FOUR MORE KIND CORRECTIONS, all in the same direction: items filed as `upstream-drift` that are
+> actually `not-ported` and that no rebase would ever have swept up.**
+>
+> - **`DRIFT-013`** — filed against openai-completions.ts:1478-1485 @v0.84.1, but
+>   `git show v0.83.0:packages/ai/src/api/openai-completions.ts` has the identical disjunction at
+>   `:1427-1435` with `isZai` at `:1435` — **inside the ported baseline**.
+> - **`DRIFT-029`** — filed against pi commit `2efa728d`, but `git grep -n _bashAbortController v0.83.0`
+>   shows the `Set`, its add, its delete-in-finally, the spread-copy abort and the `size > 0` getter
+>   **all present at the ported tag**. A port omission, not version lag.
+> - **`DRIFT-046`** — not a plain duplicate of `TOOL-036` after all: a SECOND live instance existed in
+>   `crates/cyrup-config/src/paths.rs`, the 1:1 port of the very function upstream applies the rule
+>   inside, created AFTER this item was written by `CFG-025`/`CFG-036`. cyrup ended sweep 1 with the
+>   rule in one copy of the normalizer and not the other. **Its own Fix sentence names the wrong
+>   crate** — `normalize_path` lives in cyrup-config, not cyrup-resources.
+> - **`DRIFT-033`** — its refuter caveat was CORRECT: not a one-line assignment, the prerequisite was
+>   modelling pi's two prompt slots, and both parts landed together.
+>
+> These join the `DRIFT-014`/`018`/`019`/`030`/`031`/`032` corrections the repair pass already made.
+> **The pattern is now measured, not suspected: this file's default assumption that a missing feature
+> is version lag is wrong more often than it is right, and every remaining `upstream-drift` row should
+> be re-derived at `v0.83.0` before it is scheduled.**
+>
+> **`DRIFT-001`'s status row still points at `DRIFT-033` as an open residual.** `DRIFT-033` is closed,
+> so `DRIFT-001` reads as fully closed. **`DRIFT-049`'s Bookkeeping note** (SEAM-S02 is stale and
+> should be re-audited as closed) is already reflected in area 08's status table and can be struck.
+> **`DRIFT-051`** carries `SEAM-070`'s caveat across: on macOS `pthread_setname_np` does not change
+> what `ps -o comm=` prints, so its Verify line holds verbatim only on Linux.
+>
+> **`DRIFT-014` is the one backlog row whose Verify cannot be satisfied under the standing
+> no-test-execution rule** — it requires observing what string reqwest/hyper actually emits on a
+> failed DNS lookup. Adding pi's seven Node-shaped literals alone would ship a test that passes while
+> the real Rust failure mode stays unretried. That warning is now in the row itself so the next agent
+> neither rediscovers it nor closes on the literals.
+>
+> **`DRIFT-048`'s own observation deserves promoting into Coverage as a recurring class**: "a
+> name-present, argument-wrong bug, invisible to an absence sweep". It is the second such finding in
+> this file after `DRIFT-026`, **in the same function**.
+
+
 ## Status since the c8bd2ab baseline
 
 | ID | Status | Note |
@@ -136,38 +206,40 @@ counts**: they propose no work and say so, so they are bookkeeping rather than b
 **Dedup** column names the item in another area that owns the same defect; see
 `## Coverage → Duplication census`. **No ID was renumbered, merged or deleted to produce it.**
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 7 medium, 9 low = 16**, plus the four `tracker` rows. 14 rows are now marked CLOSED, including the area's only high.
+
 | ID | Severity | Kind | Effort | Dedup | Title |
 |---|---|---|---|---|---|
-| DRIFT-049 | **high** | **FIXED 2026-08-13** *(via `SEAM-047`)* | M | duplicate-of: `SEAM-047` | SIGTERM/SIGHUP never disposes the runtime, and in RPC mode is never observed at all |
-| DRIFT-041 | medium | not-ported | L | — | Session HTML export is a 131-line text dump against pi's 5,021-line templated document |
-| DRIFT-048 | medium | parity-bug | S | — | Google converter picks the tool-call-id rule off the SOURCE message's model, not the target model |
-| DRIFT-004 | medium | upstream-drift | M | — | RPC `bash`: `UserBashEventResult.operations` backend seam unported |
+| ~~DRIFT-049~~ | ~~**high**~~ **CLOSED 2026-08-14** | **FIXED 2026-08-13** *(via `SEAM-047`)* | M | duplicate-of: `SEAM-047` | SIGTERM/SIGHUP never disposes the runtime, and in RPC mode is never observed at all — **CLOSED 2026-08-14**: closed pre-sweep (2026-08-13) via SEAM-047 — the row's kind cell already said so while its severity cell still read `high`, which is why two recounts carried a phantom high. Area 12 now has NO open high. |
+| DRIFT-041 | medium | not-ported | L | — | Session HTML export is a 131-line text dump against pi's 5,021-line templated document — **2026-08-14, still open**: sweep 2 — not started. Effort L: pi's `core/export-html/` is 5,021 lines across eight files including vendored `marked.min.js` and `highlight.min.js`, and the port needs a base64 `SessionData` payload, four template assets, a theme-colour feed and an ANSI-to-HTML converter. |
+| ~~DRIFT-048~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | — | Google converter picks the tool-call-id rule off the SOURCE message's model, not the target model — **CLOSED 2026-08-14**: sweep 2 — fixed exactly as the Fix specified: `include_id`, already computed from the TARGET model at `convert_messages:612` and already used for `functionResponse`, is now threaded into `assistant_parts`, which had been gating `functionCall.id` on `requires_tool_call_id(am.model)` — the model that PRODUCED the historical turn. On a mid-session `gemini-2.5-pro` → `gemini-3-pro` switch the two halves of a call/response pair therefore disagreed, silently. Verify implemented verbatim including the reverse-switch and both same-model control cases. **The item's observation that this is "a name-present, argument-wrong bug, invisible to an absence sweep" is worth promoting into the Coverage section as a recurring class — it is the second such finding in this file after DRIFT-026, in the same function.** |
+| DRIFT-004 | medium | upstream-drift | M | — | RPC `bash`: `UserBashEventResult.operations` backend seam unported — **2026-08-14, still open**: sweep 1 + 2 — kept open with the mechanism correction recorded under SEAM-015: the seam is a WIT capability, not a `BashOptions` field. Sweep 2 re-confirmed rather than overrode that reasoning — the trait would live in `crates/cyrup-tools/src/ops/`, but its two consumers (`cyrup-session-svc/src/bash.rs`'s per-call override and `cyrup-modes/src/rpc.rs`'s population from the user-bash event result) are in other crates, so landing the trait alone produces a seam with no caller. |
 | DRIFT-009 | medium | upstream-drift | M | duplicate-of: `PROV-018` | Embedded catalog floor is 4 catalogs short *(regeneration-source half struck — it was false)* |
-| DRIFT-013 | medium | upstream-drift | S | — | Z.AI sent `max_completion_tokens`, which it ignores |
-| DRIFT-014 | medium | **not-ported** | M | — | DNS/transport failures not classified retryable (seven literals, all predating the baseline) |
+| ~~DRIFT-013~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | — | Z.AI sent `max_completion_tokens`, which it ignores — **CLOSED 2026-08-14**: sweep 2 — the missing `\|\| is_zai` term added to `use_max_tokens` in `api/compat.rs`, so Z.AI models resolve `max_tokens_field == MaxTokens` instead of the `max_completion_tokens` Z.AI ignores. **KIND CORRECTED: filed `upstream-drift` citing openai-completions.ts:1478-1485 @v0.84.1, but `git show v0.83.0:packages/ai/src/api/openai-completions.ts` has the identical disjunction at :1427-1435 with `isZai` at :1435 — INSIDE the ported baseline. It is `not-ported`, and the item's implicit "a rebase will sweep this up" framing was wrong.** Same class as the DRIFT-014/018/019/030/031/032 kind corrections the repair pass already made; this one was missed. |
+| DRIFT-014 | medium | **not-ported** | M | — | DNS/transport failures not classified retryable (seven literals, all predating the baseline) — **2026-08-14, still open**: sweep 2 — **keep open, and STRENGTHEN the warning rather than the item: this is the one backlog row whose Verify cannot be satisfied under the standing no-test-execution rule**, because it requires observing what string reqwest/hyper actually emits on a failed DNS lookup. Adding pi's seven Node-shaped literals (`getaddrinfo`, `ENOTFOUND`) alone would produce a test that passes while the real Rust failure mode stays unretried — exactly the false close the item's own Verify warns against. |
 | DRIFT-015 | medium | upstream-drift | L | duplicate-of: `EXT-019` | Extension context surface: `scopedModels`, `outputPad`, markdown transformers still absent |
-| DRIFT-028 | medium | upstream-drift | S | — | OpenRouter Anthropic cache breakpoint skips tool results |
-| DRIFT-029 | medium | upstream-drift | M | — | Concurrent user bash: single cancel slot makes abort miss and `is_bash_running` lie |
+| DRIFT-028 | medium | upstream-drift | S | — | OpenRouter Anthropic cache breakpoint skips tool results — **2026-08-14, still open**: sweep 2 — half (a) (OpenRouter Anthropic cache breakpoint skipping tool results, in `openai_completions.rs`) is inside cyrup-provider and untouched; half (b) was already refuted upstream-side by the tracker. |
+| ~~DRIFT-029~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | M | — | Concurrent user bash: single cancel slot makes abort miss and `is_bash_running` lie — **CLOSED 2026-08-14**: sweep 2 — pi's `_bashAbortControllers` SET ported. `AgentSession.bash_cancel: Mutex<Option<CancelToken>>` became `bash_cancels: Mutex<Vec<(u64, CancelToken)>>` plus a `next_bash_cancel_id: AtomicU64` standing in for the `AbortController` OBJECT IDENTITY pi's Set keys on — **not `options.id`, which is optional and may repeat, and which the item's proposed `HashMap<BashId, CancelToken>` would have keyed on**. `execute_bash` pushes one entry per call and installs a `BashCancelGuard` whose `Drop` is pi's `finally`; `abort_bash` cancels a snapshot of the whole set (pi's spread copy); `is_bash_running` is `!is_empty()`; the unconditional clears at the shell-resolution error path and the completion path are deleted. **KIND CORRECTED: filed `upstream-drift` against pi commit `2efa728d`, but `git grep -n _bashAbortController v0.83.0` shows the Set, its add, its delete-in-finally, the spread-copy abort and the `size > 0` getter all present at the ported tag — this was a port omission, not version lag.** |
 | DRIFT-030 | medium | **not-ported** *(was upstream-drift)* | S | duplicate-of: `PROV-021` | `ANTHROPIC_AUTH_TOKEN` bearer-token auth unsupported |
-| DRIFT-033 | medium | port-divergence | M | — | A mid-run tool addition never reaches the system prompt |
-| DRIFT-010 | low | upstream-drift | S | — | `get_available_thinking_levels` RPC dispatch arm missing (the method exists) |
-| DRIFT-016 | low | **stale-port** *(was upstream-drift)* | S | duplicate-of: `SESS-019` | `Current date:` still injected into the system prompt |
+| ~~DRIFT-033~~ | ~~medium~~ **CLOSED 2026-08-14** | port-divergence | M | — | A mid-run tool addition never reaches the system prompt — **CLOSED 2026-08-14**: sweep 2 — its refuter caveat ("this is not a one-line assignment; the prerequisite is modelling pi's two prompt slots") was CORRECT, and both parts landed together in cyrup-session-svc: `AgentSession.system_prompt_override: Mutex<Option<String>>` beside `base_system_prompt`, with `system_prompt_override()` / `effective_system_prompt()` (pi's `override ?? base`); `assemble_run_messages` writes the slot on all three branches; `drive_run` clears it at the head of its settle path (pi's `_runAgentPrompt` finally, agent-session.ts:1069); `push_active_tools` sets the agent prompt from `effective_system_prompt()` so a mid-run rebuild can no longer clobber a `before_agent_start` sanitization; and `PolicyHooks::prepare_next_turn` assigns `update.system_prompt` beside `update.tools`. **STRIKE the interim instruction to "promote the hooks.rs:158-161 comment into a documented [CYRUP-DELTA]" — the divergence it described no longer exists.** The one remaining delta is narrower and documented in-source: cyrup's `BeforeAgentStart` carries the prompt as a mutated-in-place `String`, so equality with the base stands in for pi's `!== undefined`. |
+| ~~DRIFT-010~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | — | `get_available_thinking_levels` RPC dispatch arm missing (the method exists) — **CLOSED 2026-08-14**: sweep 1 — duplicate of SEAM-014, fixed in the same sweep. |
+| ~~DRIFT-016~~ | ~~low~~ **CLOSED 2026-08-14** | **stale-port** *(was upstream-drift)* | S | duplicate-of: `SESS-019` | `Current date:` still injected into the system prompt — **CLOSED 2026-08-14**: sweep 1 — duplicate of SESS-019(a), now fixed. Its own re-derivation (removal predates the ported baseline ⇒ `stale-port`) was independently confirmed by re-running `git grep 'Current date' v0.83.0 -- packages/coding-agent/src`, which returns nothing. |
 | DRIFT-018 | low | **not-ported** *(was upstream-drift)* | L | duplicate-of: `PROV-011` | Constrained sampling (strict JSON schema + Lark/regex grammars) absent |
 | DRIFT-019 | low | **not-ported** *(was upstream-drift)* | M | duplicate-of: `PROV-014` | Radius / Qwen Token Plan providers unregistered (the wire API and OAuth landed) |
 | DRIFT-020 | low | upstream-drift | S | duplicate-of: `PROV-024` | openai-responses affinity keys on removed `sendSessionIdHeader` |
-| DRIFT-024 | low | upstream-drift | S | duplicate-of: `SESS-013` | AGENTS.md loaded twice in nested git worktrees |
+| ~~DRIFT-024~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | duplicate-of: `SESS-013` | AGENTS.md loaded twice in nested git worktrees — **CLOSED 2026-08-14**: sweep 1 — duplicate of SESS-013, now fixed; both load-bearing guards (`:108`, `:113`) and the `isShadowed` gate (`:140-142`) are ported. |
 | DRIFT-025 | low | upstream-drift | S | duplicate-of: `CFG-017` | `${@:-default}` prompt-template defaults render literally |
 | DRIFT-027 | low | upstream-drift | S | duplicate-of: `PROV-025` | openai-completions has no `deferredToolsMode: "kimi"` |
 | DRIFT-031 | low | **not-ported** *(was upstream-drift)* | M | duplicate-of: `PROV-036` | No usage cost breakdown — per-model attribution and `Tools/summaries` unsurfaced |
-| DRIFT-035 | low | test-defect | S | duplicate-of: `SESS-019` | Prompt tests assert the `Current date:` footer, pinning DRIFT-016 |
-| DRIFT-036 | low | test-defect | S | — | `settle()` uses a fixed 50 ms sleep as the only synchronization |
-| DRIFT-039 | low | test-defect | S | duplicate-of: `AGENT-019` | `a_02_2_parallel_completion_vs_source_order` asserts a wall-clock bound and a completion ORDER |
+| ~~DRIFT-035~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | duplicate-of: `SESS-019` | Prompt tests assert the `Current date:` footer, pinning DRIFT-016 — **CLOSED 2026-08-14**: sweep 1 — both assertions at prompt/tests.rs are replaced, landed in the same change as the footer removal as the item requires. |
+| ~~DRIFT-036~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | — | `settle()` uses a fixed 50 ms sleep as the only synchronization — **CLOSED 2026-08-14**: sweep 2 — `settle()` in `cyrup-session-svc/src/tests/summarization_retry_events.rs` no longer sleeps 50 ms. It takes the collector buffer and polls until the length is unchanged across 64 consecutive `yield_now`s — an observation of the state the assertions read — with an outer bound that turns a stuck pipeline into a NAMED PANIC rather than a hang. All ten call sites updated. The correct poll-until-observed pattern already existed in the same file at :420-425. |
+| ~~DRIFT-039~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | duplicate-of: `AGENT-019` | `a_02_2_parallel_completion_vs_source_order` asserts a wall-clock bound and a completion ORDER — **CLOSED 2026-08-14**: sweep 1 — same test as AGENT-019 and closed by the same rewrite: the 115 ms bound is gone, a `Barrier(2)` plus a subscriber-driven oneshot make the completion order a fact, and the surviving 10 s `timeout` is documented in-source as a hang detector. **Sweep 2 additionally established that DRIFT-039 is the ONLY open DRIFT row whose fix lands in crates/cyrup-agent** — every row of this file's open table was read to confirm it, so no DRIFT work is owed by area 02. |
 | DRIFT-042 | low | not-ported | S | — | `/login` launches no browser and its "Cmd+click to open" hint is not a link |
 | DRIFT-045 | low | not-ported | S | — | Ctrl+V with text on the clipboard inserts nothing |
-| DRIFT-046 | low | upstream-drift | S | duplicate-of: `TOOL-036` | `normalizeWindowsShellPath` unported — Git-Bash/MSYS/Cygwin/WSL drive paths unconverted |
+| ~~DRIFT-046~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | duplicate-of: `TOOL-036` | `normalizeWindowsShellPath` unported — Git-Bash/MSYS/Cygwin/WSL drive paths unconverted — **CLOSED 2026-08-14**: sweep 1 + 2 — **REOPENED AND RE-CLOSED, not a plain duplicate.** Sweep 1 closed it on TOOL-036's landing in `cyrup-tools/src/path.rs`, but a SECOND live instance existed in `crates/cyrup-config/src/paths.rs` — which is the 1:1 port of the very function upstream applies the rule inside (`utils/paths.ts` `normalizePath`) and was created AFTER this item was written, by CFG-025/CFG-036 — so cyrup ended sweep 1 with the rule in one copy of the normalizer and not the other. Now ported and applied at paths.ts:83-85's exact position (before the tilde expansion, inside the shared normalizer), with `test/paths.test.ts:133-150` ported verbatim INCLUDING the pass-through list, plus six extra grammar cases pinning where pi's regex backtracks and a hand parse does not. **The item's own Fix sentence — "Port the function into cyrup-resources (wherever `normalize_path` lives)" — names the wrong crate: `normalize_path` lives in cyrup-config, and cyrup-resources depends on it.** |
 | DRIFT-047 | low | upstream-drift | L | duplicate-of: `VL-P5` | `packages/telemetry` and the `pi.ai.request` span contract absent |
-| DRIFT-050 | low | parity-bug | S | — | `CYRUP_TELEMETRY=` empty is an explicit OFF upstream and a silent no-op here |
-| DRIFT-051 | low | not-ported | S | — | `process.title`'s role suffix never set — RPC / runner / broker children are all bare `cyrup` in `ps` |
+| ~~DRIFT-050~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | — | `CYRUP_TELEMETRY=` empty is an explicit OFF upstream and a silent no-op here — **CLOSED 2026-08-14**: sweep 2 — `CYRUP_TELEMETRY=` / `PI_TELEMETRY=` (set but empty) is now an explicit OFF that beats the settings opt-in, restoring pi's tri-state (unset / set-empty / set-truthy): the telemetry field no longer goes through the `!v.is_empty()` filter and takes the first key that is SET AT ALL, while the two sibling flags (`offline`, `skip_version_chk`) keep the per-key empty filter, which is indistinguishable from pi for them. **MECHANISM NOTE the item could not anticipate: this could not be tested by mutating the process environment, because `std::env::set_var` is `unsafe` under Rust 2024 and `cyrup-config` is `#![forbid(unsafe_code)]`. `EnvVars::from_lookup(get)` was added as a pure seam and `from_process` reduced to `from_lookup(\|k\| std::env::var(k).ok())`; `first_env` no longer exists. Any area file citing `cyrup-config/src/env.rs:50-53 first_env` is now stale, and any future env-tier parity item in that crate needs the same seam.** |
+| ~~DRIFT-051~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | — | `process.title`'s role suffix never set — RPC / runner / broker children are all bare `cyrup` in `ps` — **CLOSED 2026-08-14**: sweep 1 — duplicate of SEAM-070, fixed in the same sweep. **Sweep 2 carries SEAM-070's own caveat across: on macOS `pthread_setname_np` does not change what `ps -o comm=` prints, so this item's Verify line holds verbatim only on Linux.** |
 | DRIFT-022 | **tracker** | **flag half FIXED 2026-08-13** *(via `SEAM-051`)*; renderer half still tracking | L | duplicate-of: `SEAM-051` | TUI mode (`--tui-mode`, alternate screen) not ported |
 | DRIFT-023 | **tracker** · *lead* | tracking | L | duplicate-of: `CFG-020` | Model registry → `ModelRuntime` refactor not absorbed — **evidence unverified** |
 | DRIFT-032 | **tracker** | **not-ported** *(was upstream-drift)* | L | duplicate-of: `EXT-027` | llama.cpp router integration and Hugging Face model search entirely unported |

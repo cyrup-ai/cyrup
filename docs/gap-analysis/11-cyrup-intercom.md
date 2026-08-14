@@ -34,6 +34,72 @@ This area covers `crates/cyrup-intercom` — the Unix-socket supervisor↔subage
 > both came back clean, which is recorded so the next pass spends its budget on the axes that are
 > still open rather than re-running these.
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 11 — recount: 45 rows → 14 open (0 critical · 0 high · 6 medium · 8 low).** 31 rows are
+> closed; the area has no critical and no high and never did.
+>
+> **`ICOM-013` is REOPENED IN PART, deliberately.** Sweep 1 closed four of its five sites and found a
+> fifth divergence while porting; sweep 2 fixed the `NON_INTERACTIVE_BUSY_NOTICE` half and **refuted
+> three more of the item's cyrup sites** (the "Cannot send an intercom message to yourself." /
+> "Cannot ask yourself." pair does not exist — all three arms already use pi's single "Cannot message
+> the current session"). One live instance remains and was NOT half-fixed on purpose:
+> `crates/cyrup-intercom/src/extension.rs:398` returns `format!("Message sent to {target}.")` where
+> v0.10.1 index.ts:2429 is `notifyIfLive(ctx, \`Message sent to ${targetLabel}\`, "info", overlayGeneration)`,
+> differing on BOTH the trailing period and the label (`formatSessionLabel`'s duplicate-aware
+> `name (id8)` form vs cyrup's raw caller token). Fixing only the period would leave the item open AND
+> red an off-gate `cyrup-it` assertion.
+>
+> **A STRUCTURAL FINDING ABOUT THE GATE, not just about `ICOM-026`.** Four `cyrup-it` assertions
+> (`tests/intercom/tool_actions.rs:319`, `:372`, `:502` and
+> `tests/intercom/intercom_command_transcript.rs:142`) pin a trailing period production stopped
+> emitting when `ICOM-013`'s closed half landed. **They are green only because `cyrup-it` is
+> `required-features = ["it"]` and is therefore not built or run by `cargo test --workspace` — its own
+> Cargo.toml states this at `:26-34`. The 6440-test gate gives NO coverage of the broker-socket seam
+> tests at all.** Filed as structural defect J in `00-residual-ledger.md`.
+>
+> **`ICOM-033` cannot be closed by the renderer half alone, and that blocker is not currently in the
+> item**: `tools/mod.rs::text_result` sets `details: None` and every arm of the `intercom` tool returns
+> through it, so `render_result`'s load-bearing `details.messageId` would have nothing to read. The
+> details-emission half must be sequenced first, and it is not purely mechanical — cyrup returns
+> `ToolError` where upstream returns a non-error result with `details.delivered === false`.
+>
+> **NEW BLIND SPOT, added to Coverage:** the crate's `#![forbid(unsafe_code)]` means no test can
+> `set_var`, so ANY env-driven behaviour here is untestable unless the code takes the value as a
+> parameter. `ICOM-038` had to add `IntercomClient::connect_target_with_liveness` for exactly this
+> reason, and `paths.rs:46` already records the same constraint. **A future env-reading port that does
+> not carry an injectable form will ship untested.**
+>
+> **`crates/cyrup-intercom/src/project_target.rs` is a NEW module** (sweep 2, `ICOM-042`) and should be
+> added to the Coverage file list; it carries that pass's regressions. `ICOM-012`'s baseline
+> correction (v0.7.0 → **v0.9.2**) is now applied to `PARITY-GAPS.md:19` and `README.md`'s baselines
+> table, which had both been carrying the wrong figure.
+
+
 ## Status table
 
 | ID | Status | Note |
@@ -94,53 +160,55 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 
 ## Open items
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 6 medium, 8 low = 14.** 31 rows are now marked CLOSED. `ICOM-013` is reopened in part with one named live instance.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| ICOM-052 | low | cyrup-original | S | The broker socket path has no `SUN_LEN` guard, so a long agent-dir path degrades intercom permanently with only a WARN that names neither cause nor path — **new, observed 2026-08-13** |
-| ICOM-004 | medium | not-ported | S | `skills/pi-intercom/SKILL.md` not ported |
-| ICOM-006 | medium | not-ported | M | No name poll; presence name fixed at registration |
-| ICOM-008 | medium | parity-bug | S | `ask` silently drops `replyTo` |
-| ICOM-009 | medium | parity-bug | M | Lifecycle status has no active-tool map and no `model_select` hook |
-| ICOM-010 | medium | not-ported | L | Broker mailbox for briefly-disconnected sessions absent |
-| ICOM-011 | medium | not-ported | M | Restart-stable session IDs absent; `stableId` silently ignored |
-| ICOM-023 | medium | parity-bug | S | `schedule_inbound_flush(state, 0)` races its own task and aborts the retry |
-| ICOM-024 | medium | not-ported | M | No `intercom_message` renderer; card frozen at width 80 |
-| ICOM-029 | medium | not-ported | M | `inject_message` carries no `details`, so a renderer would have nothing to render |
-| ICOM-030 | medium | not-ported | S | `contact_supervisor` registered alongside an active native supervisor channel |
-| ICOM-031 | medium | parity-bug | S | Presence identity never re-synced on `turn_start` or at a tool call |
-| ICOM-033 | medium | not-ported | M | No tool renderers for `intercom` / `contact_supervisor` |
-| ICOM-035 | medium | upstream-drift | M | Busy inbound parked until idle instead of steered |
-| ICOM-036 | medium | upstream-drift | S | No reply targeting by sender-ID prefix; four disambiguation errors absent |
-| ICOM-037 | medium | upstream-drift | S | A `send` to the sole pending asker is not treated as its reply |
-| ICOM-038 | medium | upstream-drift | M | No client liveness heartbeat |
-| ICOM-039 | medium | upstream-drift | S | `list` prints a fixed 8-char id, not a distinguishing prefix |
-| ICOM-040 | medium | upstream-drift | S | Unnamed-session alias uses 8 id characters, not 18 |
-| ICOM-042 | medium | upstream-drift | L | cwd-scoped `send`/`ask` and `openProjectPaneIfMissing` unported |
-| ICOM-044 | medium | upstream-drift | S | Malformed config fails closed silently |
-| ICOM-046 | medium | upstream-drift | S | `reply` silently drops attachments |
-| ICOM-048 | medium | parity-bug | S | Injected content omits the `_deliveryMetadata_` line (message id) |
-| ICOM-003 | low | not-ported | S | `IntercomClarifyChannel::ask` bypasses `ensure_connected` |
-| ICOM-005 | low | parity-bug | S | `register` inside the pending window leaves an idle broker alive forever |
-| ICOM-012 | low | stale-port | S | `lib.rs` claims v0.6.0 when the code is at v0.9.2 |
-| ICOM-013 | low | parity-bug | M | User-visible message strings still diverge at four sites |
-| ICOM-014 | low | parity-bug | S | Broker `presence` validation runs before the socket-ownership check |
-| ICOM-015 | low | not-ported | M | Broker listen half of the named-pipe / TCP transport absent |
-| ICOM-016 | low | not-ported | L | Silent namespaced extension bus: effects absent |
-| ICOM-017 | low | not-ported | L | Delivery diagnostics (receipts, dedupe, cancel/supersede) absent |
-| ICOM-018 | low | not-ported | M | `list-cwd` and cwd normalization absent |
-| ICOM-021 | low | parity-bug | S | Registration `status` is the raw config suffix, not the lifecycle status |
-| ICOM-025 | low | test-defect | S | Two tests assert fixed wall-clock sleeps instead of polled conditions |
-| ICOM-026 | low | test-defect | S | Three tests pin ICOM-013's trailing period |
-| ICOM-027 | low | parity-bug | S | Non-trigger inbound messages persisted with `display=false` |
-| ICOM-028 | low | cyrup-original | M | `intercom_message` entry surface has no renderer |
-| ICOM-032 | low | parity-bug | S | Session shutdown leaves the pending-idle queue populated |
-| ICOM-034 | low | parity-bug | S | Subagent relay has no self-target guard |
-| ICOM-041 | low | upstream-drift | S | `runtimeFallbackAlias` neither modelled nor applied |
-| ICOM-043 | low | upstream-drift | S | v0.10.0 copy revision unported (emoji still present) |
-| ICOM-045 | low | upstream-drift | S | Blocking `ask` not refused up front when the target is offline |
-| ICOM-047 | low | upstream-drift | S | Broker startup failures discard the broker's stderr |
-| ICOM-049 | low | parity-bug | M | Inbound delivery carries no runtime-generation guard |
-| ICOM-050 | low | parity-bug | S | `intercom_received` audit entry drops `messageId` and `attachments` |
+| ICOM-052 | low — **PARTIALLY CLOSED 2026-08-14** | cyrup-original | S | The broker socket path has no `SUN_LEN` guard, so a long agent-dir path degrades intercom permanently with only a WARN that names neither cause nor path — **new, observed 2026-08-13** — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — fix (b) is done (stderr capture + a bind error naming the path and its byte length). **RESIDUAL: fix (a), the hashed temp-dir fallback socket path, deliberately left open in BOTH sweeps — it relocates the socket out of the agent dir, changing where every peer looks for it, and the item itself gates it on "if the fallback path is acceptable to the design". An explicit design decision, not an agent's judgement call.** |
+| ICOM-004 | medium | not-ported | S | `skills/pi-intercom/SKILL.md` not ported — **2026-08-14, still open**: sweep 1 + 2 — **STILL BLOCKED, but only one of its two blockers moved.** ICOM-042's cwd half has landed; the v0.10.1 SKILL.md still documents `openProjectPaneIfMissing` (the Herdr half of ICOM-042, open) and `intercom({action:"cancel"})` (ICOM-017, open). Porting it now would ship a skill instructing the model to call actions the tool rejects. |
+| ~~ICOM-006~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | No name poll; presence name fixed at registration — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-008~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `ask` silently drops `replyTo` — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-009~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | Lifecycle status has no active-tool map and no `model_select` hook — **CLOSED 2026-08-14**: sweep 1. |
+| ICOM-010 | medium | not-ported | L | Broker mailbox for briefly-disconnected sessions absent — **2026-08-14, still open**: sweep 2 — genuinely UNBLOCKED (ICOM-045 and ICOM-041 landed in sweep 1) but not started: it is an L-sized broker port, and `connect.rs:44-51` documents "there is no mailbox, no queue, no redelivery" as an invariant the reconnect design rests on, which the port must revisit along with the `fail_pending`-on-disconnect decision. |
+| ~~ICOM-011~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | Restart-stable session IDs absent; `stableId` silently ignored — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-023~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `schedule_inbound_flush(state, 0)` races its own task and aborts the retry — **CLOSED 2026-08-14**: sweep 1 — closed as SUBSUMED by ICOM-035, not as independently fixed: the machinery they described (`pending_idle`, `flush_timer`, `schedule_inbound_flush`, `flush_idle_messages`, `PendingInbound`, `InboundPolicy::Queue`) no longer exists. |
+| ICOM-024 | medium | not-ported | M | No `intercom_message` renderer; card frozen at width 80 — **2026-08-14, still open**: sweep 2 — blocked behind ICOM-029 exactly as the item says: a renderer would receive a bare markdown string and hit upstream's `return undefined`. |
+| ICOM-029 | medium | not-ported | M | `inject_message` carries no `details`, so a renderer would have nothing to render — **2026-08-14, still open**: sweep 2 — blocked outside the crate: `HostServices::inject_message` carries no `details`; the seam is cyrup-ext + cyrup-session-svc. |
+| ~~ICOM-030~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | `contact_supervisor` registered alongside an active native supervisor channel — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-031~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Presence identity never re-synced on `turn_start` or at a tool call — **CLOSED 2026-08-14**: sweep 1. |
+| ICOM-033 | medium | not-ported | M | No tool renderers for `intercom` / `contact_supervisor` — **2026-08-14, still open**: sweep 2 — **the renderer half CANNOT close it alone, and that blocker is not currently in the item.** `tools/mod.rs::text_result` sets `details: None` and every arm of the `intercom` tool returns through it, so `render_result`'s load-bearing `details.messageId` — the value `intercom({action:"reply", replyTo})` needs — would have nothing to read. Sequence the details-emission half first, and note it is not purely mechanical: cyrup returns `ToolError` where upstream returns a non-error result with `details.delivered === false`. Also record that cyrup's `NativeExtension::render_call`/`render_result` receive no theme, no `isPartial` and no `context.isError`/`context.expanded`, so three of upstream's branches have no input and must be documented as unreachable, the way `cyrup-ext-subagents/src/extension.rs` already does for `subagent`. |
+| ~~ICOM-035~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | M | Busy inbound parked until idle instead of steered — **CLOSED 2026-08-14**: sweep 1 — the queue is DELETED, not merely fixed. Blind spot 7 ("confirm pi's `deliverAs:'steer'` means what `AgentSession::steer` means") is answered: `cyrup-session-svc/src/session.rs:3926-3928` routes any custom message to `agent.steer` whenever `is_streaming()`, so no HostServices change was needed. |
+| ~~ICOM-036~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | No reply targeting by sender-ID prefix; four disambiguation errors absent — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-037~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | A `send` to the sole pending asker is not treated as its reply — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-038~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | M | No client liveness heartbeat — **CLOSED 2026-08-14**: sweep 2 — pi's client liveness heartbeat ported end to end: `CYRUP_INTERCOM_LIVENESS_INTERVAL_MS`/`_TIMEOUT_MS` with defaults 30 s/5 s and the `Math.min(raw, interval)` clamp applied in the CONFIGURED branch only (an unset timeout is a flat 5000 and is NOT clamped by a shorter interval — upstream's asymmetry, reproduced); a real `Number.parseInt(x,10)` port (`js_parse_int_base10`), NOT the `Number()` that `getNamePollMs` uses; `LivenessConfig`, `ClientInner.liveness_abort` (pi's `livenessTimer`) started at the connect success arm (pi's `onRegistered`) and stopped in `teardown` (pi's `onClose`) and `disconnect()`; `liveness_task` as an `interval_at` tick loop under `MissedTickBehavior::Skip`; `force_close` (pi's `socket.destroy()`) feeding the shared onClose tail; and `list_sessions_inner(inner, timeout)` driving the existing `list` round trip under `getLivenessTimeoutMs()`. The env names live in `identity.rs` (the crate's single env inventory), as the Fix directed. Two mechanism notes recorded so nobody "restores" them: pi's `livenessInFlight` boolean has no counterpart because the probe is awaited inline and `MissedTickBehavior::Skip` reproduces the same observable schedule; and `tokio::time::interval` fires its first tick IMMEDIATELY where `setInterval` waits one period, hence `interval_at(now + interval, …)`. |
+| ~~ICOM-039~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | `list` prints a fixed 8-char id, not a distinguishing prefix — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-040~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | Unnamed-session alias uses 8 id characters, not 18 — **CLOSED 2026-08-14**: sweep 1. |
+| ICOM-042 | medium — **PARTIALLY CLOSED 2026-08-14** | upstream-drift | L | cwd-scoped `send`/`ask` and `openProjectPaneIfMissing` unported — **PARTIALLY CLOSED 2026-08-14**: sweep 2 — the cwd-targeting half landed independently, as the item's own Fix directs. New `crates/cyrup-intercom/src/project_target.rs` ports `ProjectTargetResolution`, `resolveTargetInCwd` and `formatSessionRefs` — the non-Herdr part of project-agent.ts — including all three distinct ambiguity errors; `tools/intercom.rs` gained `resolve_target_cwd` (the shared `cwd && cwd !== "." ? resolvePath(current.cwd, cwd) : current.cwd` rule, now used by `list-cwd` too instead of its inline copy), a `DeliveryTarget` struct and `resolve_cwd_delivery_target`; `send` and `ask` take pi's single `(!to && !cwd) \|\| !message` guard with pi's exact message and thread `targetDisplay = to ?? target.label` into the confirm dialog, the not-delivered error, the `intercom_sent` audit entry and the success text. **STRIKE the item's "No `project_agent.rs` or `cwd.rs` exists" evidence — both halves are stale.** **RESIDUAL: the Herdr half only — `openProjectPaneIfMissing` / `focus` / `openProjectPane` / `waitForProjectSession` / the `ProjectPaneLaunch` result details, still gated on the Herdr OQ.** The params were deliberately NOT added so the schema never advertises an action the tool rejects, and the missing-target error omits upstream's trailing "Pass openProjectPaneIfMissing: true …" sentence for the same reason; both are `[CYRUP-DELTA]`s in `project_target.rs`'s module doc. |
+| ~~ICOM-044~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | Malformed config fails closed silently — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-046~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | `reply` silently drops attachments — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-048~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Injected content omits the `_deliveryMetadata_` line (message id) — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-003~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `IntercomClarifyChannel::ask` bypasses `ensure_connected` — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-005~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `register` inside the pending window leaves an idle broker alive forever — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-012~~ | ~~low~~ **CLOSED 2026-08-14** | stale-port | S | `lib.rs` claims v0.6.0 when the code is at v0.9.2 — **CLOSED 2026-08-14**: sweep 1 — the ported baseline correction: `lib.rs:2` now records **v0.9.2**, not v0.7.0 (the area's own citation census is v0.9.2 × 272 against v0.7.0 × 14). PARITY-GAPS.md:19 and README.md's baselines table are corrected in this reconciliation. |
+| ICOM-013 | low — **PARTIALLY CLOSED 2026-08-14** | parity-bug | M | User-visible message strings still diverge at four sites — **PARTIALLY CLOSED 2026-08-14**: sweep 1 + 2 — sweep 1 closed four of the five sites and found a fifth divergence while porting (the `send` arm early-errored `Session not found: "{to}"` where upstream is `{ id: await resolveSessionTarget(...) ?? to }`, v0.10.1 index.ts:2002, and lets the broker answer; only the blocking `ask` refuses up front — do not "restore" the early error). Sweep 2 fixed the `NON_INTERACTIVE_BUSY_NOTICE` half with upstream's byte-for-byte text (the short form dropped the two facts the sender acts on: that the peer is WORKING, and that it will finish and EXIT), and **REFUTED three more of the item's cyrup sites**: `tools/intercom.rs:94` "Cannot send an intercom message to yourself." and `:164` "Cannot ask yourself." do not exist — all three arms use pi's single "Cannot message the current session" — and the trailing periods at `:157`/`:254` are gone. **RESIDUAL — ONE live instance, deliberately not half-fixed: `crates/cyrup-intercom/src/extension.rs:398` returns `format!("Message sent to {target}.")` where v0.10.1 index.ts:2429 is `notifyIfLive(ctx, \`Message sent to ${targetLabel}\`, "info", overlayGeneration)`, differing on BOTH the trailing period and the label (`formatSessionLabel(selectedSession, duplicates)`, the picker's duplicate-aware `name (id8)` form, vs cyrup's raw caller token). It needs `formatSessionLabel` ported and the four cyrup-it assertions updated in the same change — see ICOM-026.** |
+| ~~ICOM-014~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Broker `presence` validation runs before the socket-ownership check — **CLOSED 2026-08-14**: sweep 1. |
+| ICOM-015 | low | not-ported | M | Broker listen half of the named-pipe / TCP transport absent — **2026-08-14, still open**: sweep 2 — not started, and the reason is a hard one: the named-pipe arm is Windows-only code that cannot be type-checked on this host under the two permitted build commands, and landing only the TCP arm would leave `broker_listen_target` with one of three arms wired — the same half-landing shape this area file already criticises. |
+| ICOM-016 | low | not-ported | L | Silent namespaced extension bus: effects absent — **2026-08-14, still open**: sweep 2 — not started; the item's own instruction is that its fix sketch is directional and `broker/extension-state.ts` (186 lines) must be read in full first. |
+| ICOM-017 | low | not-ported | L | Delivery diagnostics (receipts, dedupe, cancel/supersede) absent — **2026-08-14, still open**: sweep 2 — not started. It is the second of ICOM-004's two blockers (the `cancel` action). |
+| ~~ICOM-018~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | M | `list-cwd` and cwd normalization absent — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-021~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Registration `status` is the raw config suffix, not the lifecycle status — **CLOSED 2026-08-14**: sweep 1. |
+| ICOM-025 | low — **PARTIALLY CLOSED 2026-08-14** | test-defect | S | Two tests assert fixed wall-clock sleeps instead of polled conditions — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the `inbound.rs:722-740` half is MOOT (those wall-clock sleeps were inside the flush tests ICOM-035 deleted). Only the `connect.rs` half was real, and it is now on a paused clock. **RESIDUAL: none in production; the item survives only as the standing rule that this crate's tests await an EVENT under a failsafe, never a sleep.** |
+| ICOM-026 | low | test-defect | S | Three tests pin ICOM-013's trailing period — **2026-08-14, still open**: sweep 1 + 2 — **STILL LIVE, at new addresses, and now DIVERGENT FROM PRODUCTION rather than merely pinning it.** Four assertions pin the trailing period: `crates/cyrup-it/tests/intercom/tool_actions.rs:319`, `:372`, `:502` and `crates/cyrup-it/tests/intercom/intercom_command_transcript.rs:142`. Production `tools/intercom.rs` emits NO period on any of the three. **They are green only because `cyrup-it` is `required-features = ["it"]` and is therefore not built or run by the workspace gate (its Cargo.toml states this at :26-34) — so the merge gate gives NO coverage of the broker-socket seam tests at all.** That is a structural finding about the gate, not just about these four lines. Ship the fix with ICOM-013's residual. |
+| ~~ICOM-027~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Non-trigger inbound messages persisted with `display=false` — **CLOSED 2026-08-14**: sweep 1. |
+| ICOM-028 | low | cyrup-original | M | `intercom_message` entry surface has no renderer — **2026-08-14, still open**: sweep 2 — not reached. |
+| ~~ICOM-032~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Session shutdown leaves the pending-idle queue populated — **CLOSED 2026-08-14**: sweep 1 — closed as SUBSUMED by ICOM-035, not as independently fixed: the machinery they described (`pending_idle`, `flush_timer`, `schedule_inbound_flush`, `flush_idle_messages`, `PendingInbound`, `InboundPolicy::Queue`) no longer exists. |
+| ~~ICOM-034~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Subagent relay has no self-target guard — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-041~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | `runtimeFallbackAlias` neither modelled nor applied — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-043~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | v0.10.0 copy revision unported (emoji still present) — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-045~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | Blocking `ask` not refused up front when the target is offline — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-047~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | Broker startup failures discard the broker's stderr — **CLOSED 2026-08-14**: sweep 1. |
+| ~~ICOM-049~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | M | Inbound delivery carries no runtime-generation guard — **CLOSED 2026-08-14**: sweep 2 — pi's `getLiveContext` fence ported into the inbound delivery path: `ConnectSupervisor.runtime_session_id` (pi's `currentSessionId`) captured by `begin_runtime` and cleared by `shutdown`, a new `runtime_ever_started` latch, `generation()`/`runtime_ever_started()` accessors and `is_live_at(state, generation)`; the inbound loop head stamps `message_generation` and re-checks liveness BEFORE the waiter match / record / surface, again at the head of the delivery decision, and a third time in the Trigger arm; the busy auto-reply's `dismissIncomingAsk` is gated on liveness AFTER its `await`. The FLUSH half is moot — ICOM-035 deleted the queue, exactly as the item's last line predicted. **A NEW LATCH WAS REQUIRED and the reason is on the record: pi's `runtimeStarted` (index.ts:522, set at :1253) is never cleared, whereas cyrup's `started` is cleared by `shutdown` because the reconnect ladder needs "is a runtime active right now". Reusing `started` makes `runtimeStarted &&` false after shutdown, which SKIPS the fence and lets a stale delivery through — the inverse of the guard. The pre-existing doc comment on `started` asserting it WAS pi's `runtimeStarted` is what made the wrong mapping look right, and is corrected.** |
+| ~~ICOM-050~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `intercom_received` audit entry drops `messageId` and `attachments` — **CLOSED 2026-08-14**: sweep 1. |
 
 ---
 

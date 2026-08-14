@@ -1300,16 +1300,90 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// SUBA-069 — the env var a hook script honours to exit before it does any work, so
+    /// [`warm_hook_exec`] can pay macOS's one-off first-`exec` verification cost for this exact
+    /// script content WITHOUT running the body (which would block on `cat`, create files, or
+    /// `sleep 30`).
+    ///
+    /// Same mechanism SUBA-068's `$WARMUP` guard uses in
+    /// `a_timed_out_setup_hook_is_killed_not_abandoned`; hoisted here so the whole hook family gets
+    /// it instead of the one test that was measured.
+    #[cfg(unix)]
+    const HOOK_WARMUP_ENV: &str = "CYRUP_HOOK_WARMUP";
+
+    /// SUBA-069 — pay macOS's first-`exec` verification for `hook` before any timed run touches it.
+    ///
+    /// macOS charges a one-off verification cost on the first `exec` of a freshly written
+    /// executable whose exact content it has not seen; measured in
+    /// `a_timed_out_setup_hook_is_killed_not_abandoned` at 197-242ms for unique content versus
+    /// ~0.2ms once seen. Every hook fixture here writes unique content (the body, and for the
+    /// repo-relative fixture a randomized tempdir path, differ per test), so that cost is paid
+    /// inside the hook's own timeout budget on EVERY run — which is the dominant term in the
+    /// load-induced `worktree setup hook timed out after …ms` failures SUBA-069 measured.
+    ///
+    /// Running it once here, outside any budget, removes that term instead of guessing a number.
+    /// Best-effort: a failure to warm only restores the old timing, it never fails the test.
+    #[cfg(unix)]
+    fn warm_hook_exec(hook: &Path) {
+        let _ = std::process::Command::new(hook)
+            .env(HOOK_WARMUP_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    #[cfg(not(unix))]
+    fn warm_hook_exec(_hook: &Path) {}
+
     fn write_hook_script(body: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("hook dir");
         let hook = dir.path().join("hook.sh");
-        std::fs::write(&hook, format!("#!/bin/sh\n{body}\n")).expect("write hook");
+        // SUBA-069: the warm-up guard is the FIRST line so `warm_hook_exec` returns before the body
+        // consumes stdin or writes anything. It is inert for the real run, which never sets the var.
+        #[cfg(unix)]
+        let source = format!("#!/bin/sh\n[ -n \"${HOOK_WARMUP_ENV}\" ] && exit 0\n{body}\n");
+        #[cfg(not(unix))]
+        let source = format!("#!/bin/sh\n{body}\n");
+        std::fs::write(&hook, source).expect("write hook");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
+        warm_hook_exec(&hook);
         (dir, hook)
+    }
+
+    /// SUBA-069 regression: the warm-up guard must short-circuit BEFORE the body runs, or
+    /// [`warm_hook_exec`] would execute the fixture's side effects (create `.env.local`, consume
+    /// stdin, `sleep 30`) once per test and the cure would be worse than the flake.
+    ///
+    /// RED before the fix: `write_hook_script` emitted no guard line at all, so this run would
+    /// create the marker.
+    #[cfg(unix)]
+    #[test]
+    fn a_warmed_hook_script_exits_before_its_body_runs() {
+        let (dir, hook) = write_hook_script("touch body-ran");
+        // `write_hook_script` already warmed it once; do it again explicitly so the assertion is
+        // about the guard rather than about how many times the helper happened to run.
+        warm_hook_exec(&hook);
+        assert!(
+            !dir.path().join("body-ran").exists(),
+            "the warm-up exec must not run the hook body"
+        );
+
+        // …and the same script without the guard variable DOES run its body, so the guard is the
+        // only thing suppressing it.
+        let status = std::process::Command::new(&hook)
+            .current_dir(dir.path())
+            .status()
+            .expect("run hook");
+        assert!(status.success());
+        assert!(
+            dir.path().join("body-ran").exists(),
+            "an unwarmed run must still execute the body"
+        );
     }
 
     // ---- structure / cwd mapping / base-dir ----
@@ -1519,7 +1593,7 @@ mod tests {
         let hook_in_repo = hook_rel_dir.join("hook.sh");
         std::fs::write(
             &hook_in_repo,
-            "#!/bin/sh\nmkdir -p .venv; echo cfg > .venv/pyvenv.cfg; printf '{\"syntheticPaths\":[\".venv\"]}'\n",
+            "#!/bin/sh\n[ -n \"$CYRUP_HOOK_WARMUP\" ] && exit 0\nmkdir -p .venv; echo cfg > .venv/pyvenv.cfg; printf '{\"syntheticPaths\":[\".venv\"]}'\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1527,6 +1601,9 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&hook_in_repo, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        // SUBA-069: this hook is copied into every worktree by git, but the CONTENT is what macOS
+        // verifies, so warming the committed copy warms every worktree's copy too.
+        warm_hook_exec(&hook_in_repo);
         git(repo.path(), &["add", "-A"]);
         git(repo.path(), &["commit", "-q", "-m", "add hook"]);
 
@@ -1534,7 +1611,11 @@ mod tests {
         let options = CreateWorktreesOptions {
             setup_hook: Some(WorktreeSetupHookConfig {
                 hook_path: "hooks/hook.sh".to_string(),
-                timeout_ms: Some(5_000),
+                // SUBA-069: this test's claim is about synthetic-path recording, not about the
+                // timeout, so it takes the SHIPPED default (30s, pi
+                // `worktree.ts:114 DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS` @v0.43.0/v0.47.1) rather
+                // than a 5s fixture constant that turned scheduling latency into a red.
+                timeout_ms: None,
             }),
             base_dir: Some(base.path().to_string_lossy().into_owned()),
             ..Default::default()
@@ -1691,7 +1772,10 @@ mod tests {
         let options = CreateWorktreesOptions {
             setup_hook: Some(WorktreeSetupHookConfig {
                 hook_path: hook.to_string_lossy().into_owned(),
-                timeout_ms: Some(5_000),
+                // SUBA-069: the shipped default (30s, pi `worktree.ts:114`
+                // `DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`). This test asserts nothing about the
+                // timeout, so it must not carry a 5s budget that machine load can blow.
+                timeout_ms: None,
             }),
             base_dir: Some(base.path().to_string_lossy().into_owned()),
             ..Default::default()
@@ -1719,7 +1803,10 @@ mod tests {
         let options = CreateWorktreesOptions {
             setup_hook: Some(WorktreeSetupHookConfig {
                 hook_path: hook.to_string_lossy().into_owned(),
-                timeout_ms: Some(5_000),
+                // SUBA-069: the shipped default (30s, pi `worktree.ts:114`
+                // `DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`). This test asserts nothing about the
+                // timeout, so it must not carry a 5s budget that machine load can blow.
+                timeout_ms: None,
             }),
             base_dir: Some(base.path().to_string_lossy().into_owned()),
             ..Default::default()
@@ -1749,7 +1836,10 @@ mod tests {
         let options = CreateWorktreesOptions {
             setup_hook: Some(WorktreeSetupHookConfig {
                 hook_path: hook.to_string_lossy().into_owned(),
-                timeout_ms: Some(5_000),
+                // SUBA-069: the shipped default (30s, pi `worktree.ts:114`
+                // `DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`). This test asserts nothing about the
+                // timeout, so it must not carry a 5s budget that machine load can blow.
+                timeout_ms: None,
             }),
             base_dir: Some(base.path().to_string_lossy().into_owned()),
             ..Default::default()

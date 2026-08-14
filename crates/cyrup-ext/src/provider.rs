@@ -30,15 +30,44 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub models: Vec<ProviderModelConfig>,
-    /// OAuth metadata (`{name}`): a static marker that this provider authenticates via OAuth. The
-    /// dynamic callbacks (login/refreshToken/getApiKey/modifyModels) are guest closures invoked via
-    /// the `provider-*` exports ([`crate::host::LiveExtension::provider_login`], etc.).
+    /// OAuth metadata (`{name, isSubscription?}`): a static marker that this provider
+    /// authenticates via OAuth. The dynamic callbacks (login/refreshToken/getApiKey/modifyModels)
+    /// are guest closures invoked via the `provider-*` exports
+    /// ([`crate::host::LiveExtension::provider_login`], etc.).
+    ///
+    /// Kept as an open `Value` because the callback keys are guest closures with no host mirror;
+    /// [`Self::oauth_is_subscription`] is the typed read of the one metadata key that has meaning
+    /// on this side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<Value>,
     /// Whether the guest supplied a custom `streamSimple` handler (drives the host to invoke the
     /// `provider-stream-simple` export rather than a built-in API stream).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_stream_simple: bool,
+}
+
+impl ProviderConfig {
+    /// Whether access through this provider's OAuth is backed by a SUBSCRIPTION rather than a
+    /// metered API key (EXT-051).
+    ///
+    /// pi added `isSubscription?: boolean` to the `oauth` block at
+    /// `pi/packages/coding-agent/src/core/extensions/types.ts:1475` @v0.84.1 (absent at v0.83.0),
+    /// documented "Whether access through this auth method is backed by a provider subscription."
+    /// cyrup already models the concept for BUILT-IN providers — `AuthProvider::is_subscription`
+    /// (`crates/cyrup-provider/src/auth/mod.rs:101`, overridden by anthropic / github_copilot /
+    /// kimi_coding / openai_codex / xai) — but an extension-supplied provider's key arrived inside
+    /// the opaque `oauth` blob with no reader, so a guest declaring `isSubscription` was still
+    /// presented like a metered API-key provider.
+    ///
+    /// Absent or non-boolean reads as `false`, matching an omitted optional upstream.
+    pub fn oauth_is_subscription(&self) -> bool {
+        self.oauth
+            .as_ref()
+            .and_then(|o| o.get("isSubscription"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
 }
 
 /// One long-context pricing tier for a registered model (Pi `ModelCostTier`, ai/types.ts:750-753).
@@ -144,6 +173,17 @@ impl ProviderRegistration {
             .and_then(|v| v.get("name"))
             .and_then(|n| n.as_str())
             .map(str::to_string)
+    }
+
+    /// Whether access through this provider's OAuth is backed by a SUBSCRIPTION rather than a
+    /// metered API key (EXT-051) — pi's `oauth.isSubscription`
+    /// (`extensions/types.ts:1475` @v0.84.1, absent at v0.83.0). The typed read of the key that
+    /// used to reach the host inside the opaque `oauth` blob with nothing to read it, so an
+    /// extension-supplied subscription provider was presented like a metered one. cyrup's
+    /// BUILT-IN providers already model this as `AuthProvider::is_subscription`
+    /// (`crates/cyrup-provider/src/auth/mod.rs:101`).
+    pub fn oauth_is_subscription(&self) -> bool {
+        self.config.oauth_is_subscription()
     }
 
     /// Whether the guest supplied a custom `streamSimple` handler (drives `provider-stream-simple`).

@@ -33,9 +33,85 @@ struct IntercomParams {
     attachments: Option<Vec<Attachment>>,
     #[serde(default)]
     reply_to: Option<String>,
-    /// `cwd` (`v0.10.1 index.ts:1832-1835`) — the working directory to filter `list-cwd` by.
+    /// `cwd` (`v0.10.1 index.ts:1831-1833`) — the working directory to filter `list-cwd` by, and
+    /// for `send`/`ask` the directory the target lookup is scoped to (omit `to` to address the sole
+    /// live peer there).
     #[serde(default)]
     cwd: Option<String>,
+}
+
+/// `DeliveryTarget` (`v0.10.1 index.ts:62-66`) — the id a message is actually sent to plus the
+/// label the result echoes back.
+///
+/// [CYRUP-DELTA] Upstream's third member `projectPane?: ProjectPaneLaunch` is absent: cyrup does
+/// not port the Herdr pane launcher (see [`crate::project_target`] for the full reason). Everywhere
+/// upstream branches on `target.projectPane` the cyrup code takes the non-pane arm, which is the
+/// arm every pane-less call already took upstream.
+struct DeliveryTarget {
+    id: String,
+    label: String,
+}
+
+/// `resolveCwdDeliveryTarget(activeClient, options)` (`v0.10.1 index.ts:1192-1217`), minus the
+/// `openProjectPaneIfMissing` half.
+///
+/// The three steps upstream takes before the lookup are load-bearing and all ported: the roster is
+/// fetched ONCE and reused (so `to` and `cwd` are resolved against one consistent snapshot), the
+/// caller's own row is required to be in it (the target cwd defaults to *its* cwd, not to the
+/// locally captured one), and a relative `cwd` resolves against that row's cwd with `"."` meaning
+/// "here".
+///
+/// [CYRUP-DELTA] `:1221` appends `Pass openProjectPaneIfMissing: true to open a Herdr project pane
+/// and start Pi there.` to the missing-target error. cyrup omits that sentence: the tool has no
+/// such parameter, and telling the model to pass one the schema rejects is worse than the shorter
+/// message. Everything before it is upstream's text verbatim.
+/// `options.cwd && options.cwd !== "." ? resolvePath(currentSession.cwd, options.cwd) : currentSession.cwd`
+/// (`v0.10.1 index.ts:1205-1207`, and the identical expression at `:1903-1907` for `list-cwd`).
+///
+/// `current_cwd` is the cwd the BROKER reports for this session, not the locally captured one — a
+/// relative `cwd` must resolve against the directory peers can actually see this session in.
+fn resolve_target_cwd(current_cwd: &str, cwd: &str) -> String {
+    match cwd {
+        "" | "." => current_cwd.to_string(),
+        other => crate::cwd::resolve_path(std::path::Path::new(current_cwd), other)
+            .to_string_lossy()
+            .to_string(),
+    }
+}
+
+async fn resolve_cwd_delivery_target(
+    client: &crate::transport::client::IntercomClient,
+    to: Option<&str>,
+    cwd: &str,
+) -> Result<DeliveryTarget, ToolError> {
+    let sessions = client.list_sessions().await.map_err(to_tool_err)?;
+    // `if (!currentSessionId) throw new Error("Current session is not registered with intercom.")`
+    let Some(current_session_id) = client.session_id() else {
+        return Err(ToolError::new("Current session is not registered with intercom."));
+    };
+    let Some(current_session) = sessions.iter().find(|s| s.id == current_session_id) else {
+        return Err(ToolError::new("Current session is missing from intercom session list."));
+    };
+    let target_cwd = resolve_target_cwd(&current_session.cwd, cwd);
+    let existing =
+        crate::project_target::resolve_target_in_cwd(&sessions, &current_session_id, &target_cwd, to)
+            .map_err(ToolError::new)?;
+    match existing {
+        crate::project_target::ProjectTargetResolution::Found { session, .. } => {
+            // `options.to || existing.session.name || existing.session.id` — JS `||`, so a blank
+            // `to` or a blank name falls through rather than echoing an empty label.
+            let label = to
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .or_else(|| session.name.clone().filter(|n| !n.is_empty()))
+                .unwrap_or_else(|| session.id.clone());
+            Ok(DeliveryTarget { id: session.id.clone(), label })
+        }
+        crate::project_target::ProjectTargetResolution::Missing { reason, .. } => {
+            Err(ToolError::new(reason))
+        }
+    }
 }
 
 impl IntercomTool {
@@ -117,12 +193,10 @@ impl IntercomTool {
                 // `v0.10.1 index.ts:1903-1907`: default to the current session's cwd; an explicit
                 // `cwd` overrides, with a relative path resolved AGAINST the current session's cwd
                 // and `"."` meaning the current cwd.
-                let filter_cwd = match params.cwd.as_deref().filter(|c| *c != ".") {
-                    Some(cwd) => crate::cwd::resolve_path(std::path::Path::new(&current_session.cwd), cwd)
-                        .to_string_lossy()
-                        .to_string(),
-                    None => current_session.cwd.clone(),
-                };
+                let filter_cwd = resolve_target_cwd(
+                    &current_session.cwd,
+                    params.cwd.as_deref().unwrap_or("."),
+                );
                 let other_sessions: Vec<&SessionInfo> = sessions
                     .iter()
                     .filter(|s| {
@@ -175,20 +249,48 @@ impl IntercomTool {
                 Ok(text_result(format!("{current_section}\n\n{other_section}")))
             }
             "send" => {
-                let to = require(params.to, "send requires `to`")?;
-                let message = require(params.message, "send requires `message`")?;
-                // `v0.10.1 index.ts:2002`: `{ id: await resolveSessionTarget(connectedClient, to) ?? to }`
-                // — a NON-blocking send that resolves to nothing is NOT refused here. It is handed to
-                // the broker as the raw `to`, whose own `findSessions` gets the last word, and an
-                // unroutable target comes back as the `Message to "…" was not delivered: …` result
-                // below. Only the blocking `ask` refuses up front (`:2103-2110`), because an ask has
-                // a waiter to hang.
-                let target = self
-                    .state
-                    .resolve_target(&client, &to)
-                    .await
-                    .map_err(to_tool_err)?
-                    .unwrap_or_else(|| to.clone());
+                // `v0.10.1 index.ts:1973-1978`: `if ((!to && !cwd) || !message)` — ONE guard and one
+                // message covering all three params, because `cwd` is an alternative addressing mode
+                // rather than an extra filter. A `to`-only requirement made cross-directory
+                // coordination impossible without knowing the peer's name in advance.
+                let to = params.to.clone().filter(|v| !v.trim().is_empty());
+                let cwd = params.cwd.clone().filter(|v| !v.trim().is_empty());
+                let message = match params.message.clone().filter(|v| !v.trim().is_empty()) {
+                    Some(message) if to.is_some() || cwd.is_some() => message,
+                    _ => {
+                        return Err(ToolError::new(
+                            "Missing 'to' or 'cwd', or missing 'message' parameter",
+                        ));
+                    }
+                };
+                // `v0.10.1 index.ts:2001-2003`. With a `cwd` the target is resolved inside that
+                // directory (`resolveCwdDeliveryTarget`); without one it is
+                // `{ id: await resolveSessionTarget(connectedClient, to) ?? to }` — a NON-blocking
+                // send that resolves to nothing is NOT refused here. It is handed to the broker as
+                // the raw `to`, whose own `findSessions` gets the last word, and an unroutable
+                // target comes back as the `Message to "…" was not delivered: …` result below. Only
+                // the blocking `ask` refuses up front (`:2103-2110`), because an ask has a waiter to
+                // hang.
+                let delivery = match cwd.as_deref() {
+                    Some(cwd) => resolve_cwd_delivery_target(&client, to.as_deref(), cwd).await?,
+                    None => {
+                        let to_value = to.clone().unwrap_or_default();
+                        DeliveryTarget {
+                            id: self
+                                .state
+                                .resolve_target(&client, &to_value)
+                                .await
+                                .map_err(to_tool_err)?
+                                .unwrap_or_else(|| to_value.clone()),
+                            label: to_value,
+                        }
+                    }
+                };
+                let DeliveryTarget { id: target, label } = delivery;
+                // `const targetDisplay = target.projectPane ? target.label : to ?? target.label;`
+                // (`:2004`). Pane-less, that is `to ?? target.label`: an explicit `to` is echoed
+                // back verbatim, and a cwd-addressed send reports the peer's resolved name.
+                let target_display = to.clone().unwrap_or(label);
                 // `v0.10.1 index.ts:2005-2010` — the SAME string as the `ask` and `reply` self-guards
                 // (`:2122`, `:2205`). pi has exactly one self-target message across all three arms.
                 if client.session_id().as_deref() == Some(target.as_str()) {
@@ -231,7 +333,10 @@ impl IntercomTool {
                         .unwrap_or_default();
                     let confirmed = services.confirm(
                         "Send Message",
-                        &format!("Send to \"{to}\":\n\n{message}{attachment_text}"),
+                        // `Send to "${targetDisplay}"` (`v0.10.1 index.ts:2016`) — the human is
+                        // asked about the peer the message will actually reach, which for a
+                        // cwd-addressed send is a name they never typed.
+                        &format!("Send to \"{target_display}\":\n\n{message}{attachment_text}"),
                         &cyrup_ext::DialogOptions::default(),
                     );
                     if !confirmed {
@@ -256,7 +361,7 @@ impl IntercomTool {
                         .reason
                         .unwrap_or_else(|| "Session may not exist or has disconnected.".to_string());
                     return Err(ToolError::new(format!(
-                        "Message to \"{to}\" was not delivered: {reason}"
+                        "Message to \"{target_display}\" was not delivered: {reason}"
                     )));
                 }
                 // `index.ts:1549-1557`: the audit entry + markReplied both run ONLY after a confirmed
@@ -265,7 +370,7 @@ impl IntercomTool {
                     let _ = services.append_entry(
                         "intercom_sent",
                         &serde_json::json!({
-                            "to": to,
+                            "to": target_display,
                             "message": {
                                 "text": message,
                                 "attachments": params.attachments,
@@ -290,25 +395,50 @@ impl IntercomTool {
                 // When the reply target was INFERRED the result says so, because the model needs to
                 // know its plain send just closed an ask.
                 Ok(text_result(if inferred_ask.is_some() {
-                    format!("Reply sent to {to} (inferred from pending ask)")
+                    format!("Reply sent to {target_display} (inferred from pending ask)")
                 } else {
-                    format!("Message sent to {to}")
+                    format!("Message sent to {target_display}")
                 }))
             }
             "ask" => {
-                let to = require(params.to, "ask requires `to`")?;
-                let message = require(params.message, "ask requires `message`")?;
-                // `v0.10.1 index.ts:2103-2110` (v0.10.0): an ask whose target is offline is refused
-                // UP FRONT with the actionable text, not with the bare `Session not found: "x"` the
-                // shared resolver produces — a blocking ask is not queued anywhere, so the model has
-                // to be told to use `send` or to retry after the peer reconnects.
-                let Some(target) =
-                    self.state.resolve_target(&client, &to).await.map_err(to_tool_err)?
-                else {
-                    return Err(ToolError::new(format!(
-                        "Session \"{to}\" is not currently connected. Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects."
-                    )));
+                // `v0.10.1 index.ts:2071-2076`: the same single `(!to && !cwd) || !message` guard
+                // and the same message as `send`.
+                let to = params.to.clone().filter(|v| !v.trim().is_empty());
+                let cwd = params.cwd.clone().filter(|v| !v.trim().is_empty());
+                let message = match params.message.clone().filter(|v| !v.trim().is_empty()) {
+                    Some(message) if to.is_some() || cwd.is_some() => message,
+                    _ => {
+                        return Err(ToolError::new(
+                            "Missing 'to' or 'cwd', or missing 'message' parameter",
+                        ));
+                    }
                 };
+                // `v0.10.1 index.ts:2103-2114`. With a `cwd` the target is resolved inside that
+                // directory, and `resolveCwdDeliveryTarget`'s own "no session there" error already
+                // says what happened — the offline refusal below belongs to the `to`-only branch.
+                let delivery = match cwd.as_deref() {
+                    Some(cwd) => resolve_cwd_delivery_target(&client, to.as_deref(), cwd).await?,
+                    None => {
+                        let to_value = to.clone().unwrap_or_default();
+                        // `v0.10.1 index.ts:2107-2113` (v0.10.0): an ask whose target is offline is
+                        // refused UP FRONT with the actionable text, not with the bare
+                        // `Session not found: "x"` the shared resolver produces — a blocking ask is
+                        // not queued anywhere, so the model has to be told to use `send` or to retry
+                        // after the peer reconnects.
+                        let Some(resolved) =
+                            self.state.resolve_target(&client, &to_value).await.map_err(to_tool_err)?
+                        else {
+                            return Err(ToolError::new(format!(
+                                "Session \"{to_value}\" is not currently connected. Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects."
+                            )));
+                        };
+                        DeliveryTarget { id: resolved, label: to_value }
+                    }
+                };
+                let DeliveryTarget { id: target, label } = delivery;
+                // `const targetDisplay = target.projectPane ? target.label : to ?? target.label;`
+                // (`v0.10.1 index.ts:2116`).
+                let to = to.unwrap_or(label);
                 // `v0.10.1 index.ts:2122-2127` — pi's single self-target string, shared with `send`
                 // and `reply`.
                 if client.session_id().as_deref() == Some(target.as_str()) {
@@ -588,11 +718,13 @@ fn parameters_schema() -> serde_json::Value {
                 "enum": ["list", "list-cwd", "send", "ask", "reply", "pending", "status"],
                 "description": "The intercom action to perform."
             },
+            // `v0.10.1 index.ts:1831-1833`, minus the sentence about `openProjectPaneIfMissing`
+            // (see `resolve_cwd_delivery_target`'s [CYRUP-DELTA]).
             "cwd": {
                 "type": "string",
-                "description": "Working directory to filter by (list-cwd). Relative paths resolve against this session's cwd; \".\" or omitted means this session's cwd."
+                "description": "Working directory filter for 'list-cwd'. For send/ask, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd."
             },
-            "to": { "type": "string", "description": "Target session name or id (send/ask/reply)." },
+            "to": { "type": "string", "description": "Target session name or id (send/ask/reply). Optional for send/ask when 'cwd' is given." },
             "message": { "type": "string", "description": "Message text (send/ask/reply)." },
             "attachments": {
                 "type": "array",
@@ -737,6 +869,38 @@ mod tests {
         let peer = session("peer-1", "/definitely/not/here/");
         let row = format_session_list_row(&peer, "/definitely/not/here", false, "peer-1");
         assert!(row.contains("[same cwd]"), "{row}");
+    }
+
+    /// ICOM-042 / `v0.10.1 index.ts:1205-1207`. `send`/`ask`/`list-cwd` share ONE target-cwd rule:
+    /// omitted or `"."` means the current session's own broker-reported cwd, a relative path
+    /// resolves against it, an absolute path replaces it.
+    #[test]
+    fn target_cwd_defaults_to_the_current_session_and_resolves_relatives_against_it() {
+        assert_eq!(resolve_target_cwd("/w/proj", "."), "/w/proj");
+        assert_eq!(resolve_target_cwd("/w/proj", ""), "/w/proj");
+        assert_eq!(resolve_target_cwd("/w/proj", "sub"), "/w/proj/sub");
+        assert_eq!(resolve_target_cwd("/w/proj", "../other"), "/w/other");
+        assert_eq!(resolve_target_cwd("/w/proj", "/abs"), "/abs");
+    }
+
+    /// ICOM-042 / `v0.10.1 index.ts:1214`. The echoed label is `to || session.name || session.id`
+    /// with JS-falsy fallthrough, which is what `send`'s `targetDisplay` reports back to the model.
+    /// A blank `to` and a blank name must both fall through rather than echo an empty string.
+    #[test]
+    fn cwd_delivery_label_falls_through_blank_to_and_blank_name() {
+        let label = |to: Option<&str>, name: Option<&str>| {
+            let peer = SessionInfo { name: name.map(str::to_string), ..session("peer-1", "/w/proj") };
+            to.map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .or_else(|| peer.name.clone().filter(|n| !n.is_empty()))
+                .unwrap_or_else(|| peer.id.clone())
+        };
+        assert_eq!(label(Some("reviewer"), Some("worker")), "reviewer");
+        assert_eq!(label(None, Some("worker")), "worker");
+        assert_eq!(label(Some("   "), Some("worker")), "worker");
+        assert_eq!(label(None, Some("")), "peer-1");
+        assert_eq!(label(None, None), "peer-1");
     }
 
     fn session(id: &str, cwd: &str) -> SessionInfo {

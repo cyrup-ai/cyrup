@@ -50,6 +50,32 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 
 ## 0. Census — every open item in the twelve area files, by class
 
+> **SUPERSEDED 2026-08-14 — the census below enumerates a set that no longer exists.** Two
+> whole-backlog parity sweeps (sweep 1: 232 items across 11 crates; sweep 2) closed **290 rows**. The
+> current set, re-derived from the twelve `## Open items` tables, is **173 open work items — 0
+> critical, 3 high, 75 medium, 95 low**, plus the same **9 `tracker` rows**. Eight rows are new:
+> `PROV-053`, `AGENT-034`, `AGENT-035`, `SESS-045`…`SESS-048` (filed and closed on arrival) and
+> `EXT-060` (filed open). **The three remaining highs are `SEAM-061`, `SESS-040` and `PROV-047`.**
+> The class *taxonomy* below is unchanged and still the right way to read the backlog; only the
+> per-class counts are dead, and they have not been re-derived because the disposition is recorded
+> per row in the area files rather than per class. See `00-residual-ledger.md`, top section.
+>
+> **Two class corrections landed that this file's §3 must absorb:** `DRIFT-013` and `DRIFT-029` were
+> filed as **version lag** and are **port omissions inside the ported baseline** (`isZai` is at
+> openai-completions.ts:1435 @v0.83.0; `_bashAbortControllers` is present in full at v0.83.0). With
+> `DRIFT-014`/`018`/`019`/`030`/`031`/`032`, that is **eight** rows moved out of §3 by re-derivation.
+> **Re-derive every remaining §3 entry at `v0.83.0` before scheduling it.**
+>
+> **`PB-13` is closed** with `SUBA-048`, as its own text instructed. **`PB-5`** is down to the
+> subagent re-exec half only — `TOOL-031`'s immediate-bash half landed in `cyrup-session-svc/src/bash.rs`.
+> **`VL-P22`** is half-addressed: `DiskStore::rewrite`'s temp-sibling-and-rename now carries a
+> `[CYRUP-DELTA]` naming pi's `_rewriteFile` (session-manager.ts:979-988) and the reason; the
+> torn-tail half is untouched.
+>
+> **One sweep-1 doc instruction against this file is REFUTED:** it asked for line 19's `pi-intercom`
+> ported baseline to be corrected from v0.7.0 to v0.9.2. The repair pass had already done it — `:26`
+> and the §1d baseline table at `:44` both say **v0.9.2**. No change was needed.
+
 **448 open work items: 6 critical, 22 high, 197 medium, 223 low.** Plus **9 `tracker` rows**, which
 keep their IDs and bodies but propose no schedulable work and are deliberately outside the
 arithmetic. Counted mechanically from the single `## Open items` table each area file now carries —
@@ -119,6 +145,15 @@ Where the re-audit moved an item to a different class, the id moves section and 
 ---
 
 ## 0a. Everything above medium, in one table
+
+> **SUPERSEDED 2026-08-14 — every row in this table is dispositioned.** All six criticals and 31 of
+> the 34 highs are closed. Three of the highs (`PROV-027`, `PROV-028`, `PROV-029`) turned out to have
+> been fixed before either sweep and were closed by **refutation**; four more (`SEAM-047`, `SEAM-051`,
+> `SEAM-064`, `SEAM-072`) plus `DRIFT-049` had been marked fixed in their *kind* cell while their
+> *severity* cell still read `high`, which is how this table published phantom highs across two
+> recounts. **The current above-medium set is three rows — `SEAM-061`, `SESS-040`, `PROV-047` —
+> tabled at the top of `00-residual-ledger.md`. Do not plan from the ranking below**; it is retained
+> because each row is still the best one-line statement of what the work was.
 
 A planner should not have to read six sections to find the twenty-eight items that outrank the rest.
 Port bugs still rank above everything at equal severity (§1); the two `cyrup-original` highs are here

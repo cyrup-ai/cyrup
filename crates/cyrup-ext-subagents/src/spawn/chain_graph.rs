@@ -758,6 +758,49 @@ fn resolve_chain_path_buf(file: &Path, chain_dir: &Path) -> PathBuf {
     }
 }
 
+/// pi `resolveExistingReadPaths(reads, cwd)` (`shared/settings.ts:365-367` @v0.47.1), which is
+/// `resolveExistingReadInstructionPaths(reads, cwd)` with both cwds collapsed
+/// (`:356-362`): resolve each declared read against `cwd` (`~` expanded first, absolute verbatim,
+/// relative joined) and KEEP only the ones that exist.
+///
+/// The existence filter is upstream's `flatMap`, so an all-missing list yields an EMPTY vector and
+/// the caller emits no `[Read from: …]` line at all rather than an empty one — telling a child to
+/// read a file that is not there burns a turn on a failed read (SUBA-058, upstream `bc1b689`).
+///
+/// SUBA-054 made this `pub(crate)`: the single-run path needs the identical resolution the chain
+/// path has always had, and a second implementation of "expand, resolve, filter, join" is exactly
+/// how the two would drift.
+pub(crate) fn resolve_existing_read_paths(reads: &[PathBuf], cwd: &Path) -> Vec<String> {
+    reads
+        .iter()
+        .filter(|f| resolve_chain_path_buf(f, cwd).exists())
+        .map(|f| resolve_chain_path(f, cwd))
+        .collect()
+}
+
+/// SUBA-054 — pi's single-run reads prefix (`runs/foreground/subagent-executor.ts:3870-3874`
+/// @v0.47.1):
+///
+/// ```text
+/// const readPaths = Array.isArray(reads) ? resolveExistingReadPaths(reads, effectiveCwd) : [];
+/// const readsInstruction = readPaths.length > 0 ? `[Read from: ${readPaths.join(", ")}]\n\n` : "";
+/// task = readsInstruction + task;
+/// ```
+///
+/// Note the separator: the SINGLE path ends the line with a BLANK line (`]\n\n`), where the chain
+/// path joins its prefix lines with single newlines and adds the blank line once at the end
+/// ([`build_chain_instructions`]). Both are upstream's; they are not interchangeable.
+///
+/// Returns the empty string when nothing survives, so a caller can prepend unconditionally.
+#[must_use]
+pub(crate) fn build_single_reads_instruction(reads: &[PathBuf], cwd: &Path) -> String {
+    let files = resolve_existing_read_paths(reads, cwd);
+    if files.is_empty() {
+        return String::new();
+    }
+    format!("[Read from: {}]\n\n", files.join(", "))
+}
+
 /// Build the prefix/suffix a chain step's task is wrapped with, a faithful port of pi's
 /// `buildChainInstructions` (`shared/settings.ts:312-357`):
 ///
@@ -797,11 +840,7 @@ fn build_chain_instructions(
         //
         // pi's `flatMap` also means an all-missing list emits NO read line at all, not an empty
         // one — hence the `is_empty()` re-check after filtering rather than before.
-        let files: Vec<String> = reads
-            .iter()
-            .filter(|f| resolve_chain_path_buf(f, chain_dir).exists())
-            .map(|f| resolve_chain_path(f, chain_dir))
-            .collect();
+        let files = resolve_existing_read_paths(reads, chain_dir);
         if !files.is_empty() {
             prefix_parts.push(format!("[Read from: {}]", files.join(", ")));
         }

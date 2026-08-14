@@ -36,7 +36,8 @@ pub mod guest;
 mod tests;
 
 pub use api::{
-    CommandExec, ContentBlock, ExtensionApi, MessageRenderer, Outcome, RawOutcome,
+    CommandExec, ContentBlock, ExtensionApi, MarkdownTransformContext, MarkdownTransformer,
+    MessageRenderer, Outcome, RawOutcome,
     RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, ShortcutExec,
     ToolExec, ToolOutput,
 };
@@ -59,12 +60,13 @@ pub use provider::{
     OAuthCallbacks, OAuthCredentials, OAuthProvider, ProviderHandlers, ProviderStream, StreamSimple,
 };
 pub use tool_factory::define_tool;
+pub use widget::WidgetPlacement;
 
 /// The author-facing import surface: `use cyrup_ext_sdk::prelude::*;`.
 pub mod prelude {
     pub use crate::api::{
-        CommandExec, ContentBlock, ExtensionApi, MessageRenderer, Outcome, ShortcutExec, ToolExec,
-        ToolOutput,
+        CommandExec, ContentBlock, ExtensionApi, MarkdownTransformContext, MarkdownTransformer,
+        MessageRenderer, Outcome, ShortcutExec, ToolExec, ToolOutput,
     };
     pub use crate::autocomplete::{
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
@@ -78,6 +80,7 @@ pub mod prelude {
         ForkPosition, NavigateOptions, NewSessionOptions, ProviderConfig, ProviderModelConfig,
         SwitchSessionOptions, ToolDescriptor,
     };
+    pub use crate::widget::WidgetPlacement;
     pub use crate::events::*;
     pub use crate::provider::{
         OAuthCallbacks, OAuthCredentials, OAuthProvider, ProviderHandlers, ProviderStream,

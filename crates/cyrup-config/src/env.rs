@@ -47,11 +47,6 @@ pub struct EnvVars {
     pub hardware_cursor: bool,
 }
 
-fn first_env(keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
-}
-
 /// Port of Pi `isTruthyEnvFlag` (telemetry.ts:3-6, main.ts:95-98, package-manager.ts:42-46):
 /// a flag env is truthy only when it is exactly `1`, or case-insensitively `true`/`yes`. Pi does
 /// NOT trim or accept `on`, so `CYRUP_TELEMETRY=on` / `PI_TELEMETRY=on` must NOT enable telemetry
@@ -63,37 +58,58 @@ fn truthy(s: &str) -> bool {
 impl EnvVars {
     /// Reads the process environment once.
     pub fn from_process() -> Self {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// The whole env mapping, driven by an arbitrary key lookup.
+    ///
+    /// `from_process` passes `std::env::var`. A test passes a fixed table: `std::env::set_var` is
+    /// `unsafe` under Rust 2024 and this crate is `#![forbid(unsafe_code)]`, so the process
+    /// environment is not writable from here at all — and would race sibling tests in the same
+    /// binary if it were. `get` returning `Some("")` is a **set but empty** variable, which is a
+    /// meaningful third state for `telemetry` (DRIFT-050).
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        // Pi's `first_env` shape: first key that is set to a NON-EMPTY value.
+        let first = |keys: &[&str]| keys.iter().find_map(|k| get(k).filter(|v| !v.is_empty()));
         // Pi normalizes every dir env var as it reads it — `getAgentDir()` is
         // `if (envDir) { return expandTildePath(envDir); }` (config.ts:515-521 @v0.83.0) and
         // `getPackageDir()` the same for `PI_PACKAGE_DIR` (`:367-372`); the session-dir env tier is
         // `expandTildePath(envSessionDir)` at main.ts:625-628. `expandTildePath` IS `normalizePath`
         // (config.ts:498-500). CFG-036.
-        let path =
-            |keys: &[&str]| first_env(keys).map(|raw| crate::paths::normalize_path_buf(&raw));
+        let path = |keys: &[&str]| first(keys).map(|raw| crate::paths::normalize_path_buf(&raw));
         Self {
             agent_dir: path(&["CYRUP_AGENT_DIR", "PI_CODING_AGENT_DIR"]),
             session_dir: path(&["CYRUP_SESSION_DIR", "PI_CODING_AGENT_SESSION_DIR"]),
             package_dir: path(&["CYRUP_PACKAGE_DIR", "PI_PACKAGE_DIR"]),
-            offline: first_env(&["CYRUP_OFFLINE", "PI_OFFLINE"])
+            offline: first(&["CYRUP_OFFLINE", "PI_OFFLINE"])
                 .as_deref()
                 .is_some_and(truthy),
-            skip_version_chk: first_env(&["CYRUP_SKIP_VERSION_CHECK", "PI_SKIP_VERSION_CHECK"])
+            skip_version_chk: first(&["CYRUP_SKIP_VERSION_CHECK", "PI_SKIP_VERSION_CHECK"])
                 .as_deref()
                 .is_some_and(truthy),
-            telemetry: first_env(&["CYRUP_TELEMETRY", "PI_TELEMETRY"])
+            // TRI-STATE, unlike its two siblings above: unset / set-empty / set-truthy. Pi's
+            // `isInstallTelemetryEnabled` branches on `telemetryEnv !== undefined`
+            // (telemetry.ts:8-12 @v0.83.0), so `PI_TELEMETRY=` takes the ENV branch and
+            // `isTruthyEnvFlag("")` is false at `:3-5` — an explicit OFF that beats the settings
+            // value at `policy.rs:25-27`. Filtering the empty string here silently kept telemetry
+            // ON for `PI_TELEMETRY= cyrup …`, the ordinary way to neutralise an inherited variable
+            // (DRIFT-050).
+            telemetry: ["CYRUP_TELEMETRY", "PI_TELEMETRY"]
+                .iter()
+                .find_map(|k| get(k))
                 .as_deref()
                 .map(truthy),
-            cache_retention: first_env(&["CYRUP_CACHE_RETENTION", "PI_CACHE_RETENTION"])
+            cache_retention: first(&["CYRUP_CACHE_RETENTION", "PI_CACHE_RETENTION"])
                 .as_deref()
                 .and_then(CacheRetention::parse)
                 .unwrap_or_default(),
-            visual: first_env(&["VISUAL"]),
-            editor: first_env(&["EDITOR"]),
-            http_proxy: first_env(&["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]),
+            visual: first(&["VISUAL"]),
+            editor: first(&["EDITOR"]),
+            http_proxy: first(&["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]),
             // Pi compares strictly to "1" (settings-manager.ts:1082,1166), not the broader truthy set.
-            clear_on_shrink: first_env(&["CYRUP_CLEAR_ON_SHRINK", "PI_CLEAR_ON_SHRINK"]).as_deref()
+            clear_on_shrink: first(&["CYRUP_CLEAR_ON_SHRINK", "PI_CLEAR_ON_SHRINK"]).as_deref()
                 == Some("1"),
-            hardware_cursor: first_env(&["CYRUP_HARDWARE_CURSOR", "PI_HARDWARE_CURSOR"]).as_deref()
+            hardware_cursor: first(&["CYRUP_HARDWARE_CURSOR", "PI_HARDWARE_CURSOR"]).as_deref()
                 == Some("1"),
         }
     }
@@ -413,5 +429,102 @@ mod flag_tests {
         // Pi does not trim, so surrounding whitespace is not truthy.
         assert!(!truthy(" 1"));
         assert!(!truthy("1 "));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod telemetry_tristate_tests {
+    use super::{CliConfigOverrides, EnvVars};
+    use crate::policy::NetworkPolicy;
+    use crate::settings::{EffectiveSettings, Settings};
+
+    fn env_with(pairs: &[(&str, &str)]) -> EnvVars {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        EnvVars::from_lookup(move |key| {
+            owned
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    }
+
+    /// Settings that ask for install telemetry, so the env tier is the only thing that can say no.
+    fn telemetry_on_settings() -> EffectiveSettings {
+        EffectiveSettings::from_settings(
+            Settings::parse(r#"{"enableInstallTelemetry": true}"#).expect("valid settings"),
+        )
+    }
+
+    /// DRIFT-050: Pi's `isInstallTelemetryEnabled` (telemetry.ts:8-12 @v0.83.0) branches on
+    /// `telemetryEnv !== undefined`, NOT on truthiness. `PI_TELEMETRY=` therefore takes the env
+    /// branch and `isTruthyEnvFlag("")` (`:3-5`) returns false — an explicit OFF that overrides the
+    /// settings value. cyrup filtered the empty string away, collapsing three states into two.
+    #[test]
+    fn drift050_a_set_but_empty_telemetry_var_is_an_explicit_off() {
+        assert_eq!(env_with(&[]).telemetry, None, "unset defers to settings");
+        assert_eq!(
+            env_with(&[("CYRUP_TELEMETRY", "")]).telemetry,
+            Some(false),
+            "set-but-empty is an explicit OFF, not an absent value"
+        );
+        assert_eq!(env_with(&[("CYRUP_TELEMETRY", "1")]).telemetry, Some(true));
+        // The alias carries the same tri-state.
+        assert_eq!(env_with(&[("PI_TELEMETRY", "")]).telemetry, Some(false));
+        assert_eq!(env_with(&[("PI_TELEMETRY", "true")]).telemetry, Some(true));
+        // Pi's precedence: the first key that is SET wins, even when it is empty.
+        assert_eq!(
+            env_with(&[("CYRUP_TELEMETRY", ""), ("PI_TELEMETRY", "1")]).telemetry,
+            Some(false)
+        );
+    }
+
+    /// The tri-state has to survive all the way to the gate — `policy.rs:25-27`'s
+    /// `env.telemetry.unwrap_or_else(|| s.enable_install_telemetry())`.
+    #[test]
+    fn drift050_an_empty_telemetry_var_beats_the_settings_opt_in() {
+        let settings = telemetry_on_settings();
+        let cli = CliConfigOverrides::default();
+
+        let unset = NetworkPolicy::resolve(&settings, &env_with(&[]), &cli);
+        assert!(unset.install_telemetry, "unset falls through to settings");
+
+        let emptied = NetworkPolicy::resolve(
+            &settings,
+            &env_with(&[("CYRUP_TELEMETRY", "")]),
+            &cli,
+        );
+        assert!(
+            !emptied.install_telemetry,
+            "`CYRUP_TELEMETRY= cyrup …` must ship no install telemetry"
+        );
+        assert!(!emptied.allow_install_telemetry());
+
+        let on = NetworkPolicy::resolve(&settings, &env_with(&[("CYRUP_TELEMETRY", "1")]), &cli);
+        assert!(on.install_telemetry);
+    }
+
+    /// The two SIBLING flags are plain truthiness tests upstream (`main.ts:95-98`,
+    /// `package-manager.ts:42-46`) and must NOT gain the tri-state.
+    #[test]
+    fn drift050_offline_and_skip_version_check_stay_two_state() {
+        let emptied = env_with(&[
+            ("CYRUP_OFFLINE", ""),
+            ("CYRUP_SKIP_VERSION_CHECK", ""),
+            ("CYRUP_CLEAR_ON_SHRINK", ""),
+        ]);
+        assert!(!emptied.offline);
+        assert!(!emptied.skip_version_chk);
+        assert!(!emptied.clear_on_shrink);
+        // And an EMPTY first key must still fall through to a set second key for these, which is
+        // exactly what the telemetry field must NOT do.
+        let fallthrough = env_with(&[("CYRUP_OFFLINE", ""), ("PI_OFFLINE", "1")]);
+        assert!(
+            fallthrough.offline,
+            "the non-tri-state fields keep Pi's per-key empty filter"
+        );
     }
 }

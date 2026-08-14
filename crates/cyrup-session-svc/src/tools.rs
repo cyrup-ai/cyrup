@@ -98,6 +98,17 @@ impl DynamicToolState {
         self.registry.values().map(|t| self.info_for(t)).collect()
     }
 
+    /// The enable-able tools themselves (Pi `_toolDefinitions.values()`), name-ordered.
+    ///
+    /// Distinct from [`Self::all`]: the guest-facing `getAllTools` capability must emit pi's
+    /// `ToolInfo` — `{name, description, parameters, promptGuidelines, sourceInfo}`
+    /// (`extensions/types.ts:1552-1554` @v0.83.0) — and [`ToolInfo`] carries neither
+    /// `promptGuidelines` nor `sourceInfo`, so `LiveHostServices::all_tools` reads the guidelines
+    /// off the `Tool` impl directly (EXT-038).
+    pub(crate) fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.registry.values().cloned().collect()
+    }
+
     /// One tool's [`ToolInfo`] by name (Pi `getToolDefinition`).
     pub(crate) fn get(&self, name: &str) -> Option<ToolInfo> {
         self.registry.get(name).map(|t| self.info_for(t))

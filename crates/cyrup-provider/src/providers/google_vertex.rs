@@ -26,19 +26,20 @@
 //! revision newer than `providers/catalog_manifest.json`'s `91585d9a` cannot violate the manifest's
 //! staleness *floor* invariant (`providers/all.rs:76-83`).
 //!
-//! # What is not here
+//! # Where the rest of Vertex lives
 //!
-//! * **The wire api — PROV-030, still open.** Every row's `api` is `google-vertex`, and this crate
-//!   has no `api/google_vertex.rs`: [`crate::api::register_builtins`] registers nine impls and that
-//!   is not among them. The provider IS registered in [`crate::providers::all`], so all 10 rows
-//!   resolve auth, list in `/model`, and then fail the registry lookup with a terminal
-//!   `StreamEvent::Error` (`wire.rs`, R-01-008/017/018) — the catalog and the auth precedence below
-//!   are complete and tested, the transport is not. Upstream's is
-//!   `packages/ai/src/api/google-vertex.ts` (591 lines at `v0.83.0`), which drives the
-//!   `@google/genai` SDK in Vertex mode; porting it additionally requires minting a bearer from the
-//!   ADC file (an `authorized_user` refresh-token exchange, and RS256 JWT signing for the
-//!   `service-account` arm this module's `login` can now store), which this crate has no dependency
-//!   for today.
+//! * **The wire api — PROV-030, CLOSED.** Every row's `api` is `google-vertex`, served by
+//!   [`crate::api::google_vertex`] and registered by [`crate::api::register_builtins`]. That module
+//!   owns the endpoint (`{location}` interpolation included — which is why the ADC arm below must
+//!   return the env overlay even though it returns no key), the express-mode vs ADC split, and the
+//!   delegation of the payload/decoder to the Gemini adapter the two share upstream via
+//!   `api/google-shared.ts`.
+//! * **The ADC bearer** upstream is minted inside `@google/genai` → `google-auth-library`
+//!   (`api/google-vertex.ts:327-339`). cyrup has no SDK to delegate to, so
+//!   [`crate::auth::google_adc`] reproduces it: the `GOOGLE_APPLICATION_CREDENTIALS` →
+//!   well-known-file → metadata-server search, the `authorized_user` refresh-token exchange, and
+//!   the RS256 JWT-bearer assertion for the `service-account` arm this module's `login` stores a
+//!   path to. Read that module's `[CYRUP-DELTA]` for the three credential types it rejects by name.
 //! * **`vertexAuth.login`** (`google-vertex.ts:15-61`) is ported below — the three-way interactive
 //!   picker (API key / ADC / service-account file) that *writes* the credential — on
 //!   [`crate::auth::ApiKeyAuth::login`], the trait member CFG-005 added beside `name` + `resolve`
@@ -56,9 +57,9 @@ use std::sync::Arc;
 pub const GOOGLE_VERTEX_PROVIDER_ID: &str = "google-vertex";
 
 /// The wire-protocol id every catalog row declares (pi `Provider<"google-vertex">`,
-/// `google-vertex.ts:89`). Not in [`crate::known_api`] because no impl is registered for it yet;
-/// see the module note.
-pub const GOOGLE_VERTEX_API: &str = "google-vertex";
+/// `google-vertex.ts:89`). Kept as an alias of [`crate::known_api::GOOGLE_VERTEX`], which is what
+/// [`crate::api::register_builtins`] registers [`crate::api::google_vertex::factory`] under.
+pub const GOOGLE_VERTEX_API: &str = crate::known_api::GOOGLE_VERTEX;
 
 /// The per-model base-URL template (pi `google-vertex.models.ts`). `{location}` is the GCP region.
 pub const GOOGLE_VERTEX_BASE_URL_TEMPLATE: &str = "https://{location}-aiplatform.googleapis.com";
@@ -126,8 +127,8 @@ pub fn google_vertex_auth() -> ProviderAuth {
 
 /// Construct the Vertex provider over the given credential store + shared api registry.
 ///
-/// The registry must provide the `google-vertex` impl; none is registered today (see the module
-/// note), so this provider resolves models and auth but cannot yet stream.
+/// The registry must provide the `google-vertex` impl; [`builtin_registry`] does
+/// ([`crate::api::google_vertex`]).
 pub fn google_vertex_provider_with(
     store: Arc<dyn CredentialStore>,
     registry: Arc<ApiRegistry>,

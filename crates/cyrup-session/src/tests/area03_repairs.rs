@@ -395,3 +395,284 @@ fn sess004_unknown_top_level_keys_round_trip() {
 
 // ── SESS-017 / SESS-022 / SESS-034 / SESS-042 live in `tests/compaction.rs` beside the other
 //    `Compactor` coverage, where the summarizer and hook doubles already exist.
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// 2026-08-14 second pass — items the area file recorded as candidates rather than findings, plus
+// the SESS-014 assertion its Verify clause asked for and never got.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `computeFileLists` (`compaction/utils.ts:62-67` @v0.83.0) sorts with a bare
+/// `Array.prototype.sort()`, i.e. by UTF-16 code units. cyrup collected from a `BTreeSet`, i.e. by
+/// UTF-8 bytes. The two relations disagree whenever one path carries an astral code point (encoded
+/// in UTF-16 as a surrogate pair beginning at `0xD800`) and the other a code point in
+/// `U+E000..=U+FFFF`: UTF-16 puts the astral path FIRST, UTF-8 puts it LAST.
+///
+/// The order is not internal — the lists are joined into the `<read-files>` / `<modified-files>`
+/// blocks appended to the persisted summary (`formatFileOperations`, `utils.ts:72-82`).
+#[test]
+fn compute_file_lists_sorts_by_utf16_code_units_like_pi() {
+    use crate::compaction::files::{format_file_operations, FileOps};
+
+    // U+1F600 GRINNING FACE — UTF-16 `D83D DE00`, UTF-8 `F0 9F 98 80`.
+    let astral = "/p/\u{1F600}.rs";
+    // U+E000 (private use) — UTF-16 `E000`, UTF-8 `EE 80 80`. `0xD83D < 0xE000` but `0xF0 > 0xEE`.
+    let bmp = "/p/\u{E000}.rs";
+    assert!(astral > bmp, "precondition: Rust byte order puts the astral path LAST");
+
+    let mut ops = FileOps::default();
+    ops.read.insert(bmp.to_string());
+    ops.read.insert(astral.to_string());
+    ops.edited.insert(format!("{bmp}x"));
+    ops.written.insert(format!("{astral}x"));
+
+    let (read, modified) = ops.compute_lists();
+    assert_eq!(
+        read,
+        vec![astral.to_string(), bmp.to_string()],
+        "Pi's `.sort()` orders the surrogate pair before U+E000"
+    );
+    assert_eq!(
+        modified,
+        vec![format!("{astral}x"), format!("{bmp}x")],
+        "the modified list takes the same comparator"
+    );
+
+    let block = format_file_operations(&read, &modified);
+    let read_body = block
+        .split("<read-files>\n")
+        .nth(1)
+        .and_then(|s| s.split("\n</read-files>").next())
+        .expect("read block present");
+    assert_eq!(
+        read_body,
+        format!("{astral}\n{bmp}"),
+        "the order reaches the persisted summary text, which is what makes it observable"
+    );
+}
+
+/// `generateSummaryWithUsage` (`compaction.ts:637-640` @v0.83.0) and `generateTurnPrefixSummary`
+/// (`:937-940`) are `Math.min(Math.floor(frac * reserveTokens), maxTokens > 0 ? maxTokens : ∞)`
+/// with **no lower bound**. cyrup carried a `.max(1)` clamp that has no upstream counterpart, so a
+/// small `CompactionSettings.reserve_tokens` asked for one token where pi asks for zero.
+#[test]
+fn summarization_max_tokens_has_no_lower_clamp() {
+    use crate::compaction::summarize::compute_max_tokens_frac;
+
+    // 0.8 fraction: floor(0.8 * 1) == 0 upstream.
+    assert_eq!(compute_max_tokens_frac(1, 0, 4, 5), 0, "unbounded model, floor is 0 not 1");
+    assert_eq!(compute_max_tokens_frac(1, 4096, 4, 5), 0, "bounded model, floor is 0 not 1");
+    // 0.5 fraction (turn prefix): floor(0.5 * 1) == 0.
+    assert_eq!(compute_max_tokens_frac(1, 4096, 1, 2), 0, "turn-prefix half takes the same rule");
+    assert_eq!(compute_max_tokens_frac(0, 4096, 4, 5), 0, "a zero reserve stays zero");
+    // The ordinary path is unchanged.
+    assert_eq!(compute_max_tokens_frac(16384, 0, 4, 5), 13107, "floor(0.8 * 16384)");
+    assert_eq!(compute_max_tokens_frac(16384, 4096, 4, 5), 4096, "model cap wins");
+    assert_eq!(compute_max_tokens_frac(16384, 0, 1, 2), 8192, "floor(0.5 * 16384)");
+}
+
+/// SESS-014's Verify clause — "point `read_header` at a multi-megabyte session and assert bytes
+/// read stay under the cap" — was never asserted when the bounded reader landed.
+///
+/// The cap is only observable as a difference in what the two readers FIND, so this drives both:
+/// pi's discovery path (`findMostRecentSession` → `readSessionHeaderForDiscovery` →
+/// `readSessionHeader`, `session-manager.ts:571-613`) gives up after
+/// `MAX_SESSION_HEADER_SCAN_BYTES` (1 MiB) and reports "not a session", while pi's listing path
+/// (`buildSessionInfo`, `:696-736`) streams the whole file and finds the header regardless. An
+/// unbounded `read_header` — cyrup's `read_to_string` before the fix — would find it in both.
+#[test]
+fn sess014_header_discovery_stops_at_pis_one_mebibyte_scan_cap() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let header = json!({
+        "type": "session",
+        "version": 3,
+        "id": "0193f0e1-0000-7000-8000-0000000000aa",
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "cwd": "/proj/capped",
+    })
+    .to_string();
+
+    // A skippable prefix: each line is non-blank and unparseable, so BOTH readers keep scanning.
+    // 1.5 MiB of it puts the real header past the 1 MiB cap.
+    let junk = "not json at all — keep scanning\n";
+    let prefix_bytes = 1_536 * 1024;
+
+    let capped = dir.path().join("capped.jsonl");
+    {
+        let mut f = std::fs::File::create(&capped).unwrap();
+        let mut written = 0usize;
+        while written < prefix_bytes {
+            f.write_all(junk.as_bytes()).unwrap();
+            written += junk.len();
+        }
+        f.write_all(header.as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+    }
+
+    assert_eq!(
+        crate::listing::newest_session(dir.path(), None),
+        None,
+        "the header sits past the 1 MiB cap, so bounded discovery must not find it"
+    );
+
+    let infos = crate::listing::list_in_dir(dir.path(), None, None);
+    assert_eq!(infos.len(), 1, "the unbounded listing scan still reads the file: {infos:?}");
+    assert_eq!(infos[0].cwd, "/proj/capped", "…and it is the same header the cap hid");
+
+    // Control: the identical header inside the cap IS discovered, so the assertion above is about
+    // the byte bound and not about the junk prefix being unreadable.
+    let dir2 = tempfile::tempdir().unwrap();
+    let small = dir2.path().join("small.jsonl");
+    std::fs::write(&small, format!("{junk}{junk}{header}\n")).unwrap();
+    assert_eq!(
+        crate::listing::newest_session(dir2.path(), None),
+        Some(small),
+        "a header within the cap is still found after skippable lines"
+    );
+}
+
+/// A header missing (or carrying a non-string) `cwd` / `timestamp` must still be a session.
+///
+/// pi's `interface SessionHeader` (`session-manager.ts:32-39` @v0.83.0) declares both as required,
+/// but that type is erased at runtime: the two header validators check `type` and `id` only
+/// (`:548-552`, `:566`), and every consumer re-checks the other fields by hand —
+/// `getSessionHeaderCwd` (`:625-628`) and `buildSessionInfo` (`:739`, `:742`). cyrup declared them
+/// as required `String`s, so serde rejected the line, `load` returned `NotASession` and the file
+/// disappeared from listings — the same TypeScript-is-compile-time-only mechanism gap as
+/// `SESS-001`.
+#[test]
+fn a_header_without_cwd_or_timestamp_still_opens_like_pi() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for (label, header) in [
+        (
+            "absent",
+            json!({"type": "session", "version": 3, "id": "0193f0e1-0000-7000-8000-00000000000b"}),
+        ),
+        (
+            "null",
+            json!({
+                "type": "session", "version": 3,
+                "id": "0193f0e1-0000-7000-8000-00000000000c",
+                "cwd": null, "timestamp": null,
+            }),
+        ),
+        (
+            "wrong type",
+            json!({
+                "type": "session", "version": 3,
+                "id": "0193f0e1-0000-7000-8000-00000000000d",
+                "cwd": 7, "timestamp": 7,
+            }),
+        ),
+    ] {
+        let sub = dir.path().join(label.replace(' ', "_"));
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = sub.join("s.jsonl");
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+
+        let m = SessionManager::open(&path)
+            .unwrap_or_else(|e| panic!("[{label}] pi opens this file; cyrup returned {e:?}"));
+        assert_eq!(
+            m.header().cwd,
+            "",
+            "[{label}] pi's `typeof cwd === \"string\" ? cwd : \"\"` lands on the empty string"
+        );
+        assert_ne!(
+            m.cwd(),
+            Path::new(""),
+            "[{label}] and the manager cwd falls through to the process cwd, per \
+             `cwdOverride ?? getSessionHeaderCwd(header) ?? process.cwd()` (`:1546`)"
+        );
+
+        // The listing side must agree with the loader — the SESS-007 invariant.
+        let infos = crate::listing::list_in_dir(&sub, None, None);
+        assert_eq!(infos.len(), 1, "[{label}] the file is still a listable session: {infos:?}");
+        assert_eq!(infos[0].cwd, "", "[{label}] `buildSessionInfo`'s `: \"\"` arm");
+        assert_eq!(
+            crate::listing::newest_session(&sub, None),
+            Some(path),
+            "[{label}] and discovery finds it too"
+        );
+    }
+
+    // The two checks pi DOES make on read are unchanged.
+    let bad = dir.path().join("bad.jsonl");
+    std::fs::write(&bad, "{\"type\":\"session\",\"id\":42}\n").unwrap();
+    assert!(
+        SessionManager::open(&bad).is_err(),
+        "a non-string `id` is pi's `typeof header.id !== \"string\"` rejection"
+    );
+}
+
+/// Pi's `migrateV1ToV2` guard is `typeof comp.firstKeptEntryIndex === "number"`
+/// (`session-manager.ts:245-247` @v0.83.0), and the `delete comp.firstKeptEntryIndex` inside it
+/// runs for EVERY number — negative and fractional included. cyrup matched on `as_u64`, so those
+/// two shapes returned early and left the dead v1 key on the entry, which the migration rewrite
+/// then persisted. `entries[1.0]` is also a hit upstream, because a JS property access stringifies
+/// the index and `String(1.0) === "1"`.
+#[test]
+fn v1_first_kept_entry_index_drops_for_every_json_number() {
+    use crate::header::SessionHeader;
+    use crate::migrate::to_current;
+
+    let build = |index: serde_json::Value| {
+        let mut header = SessionHeader::new(
+            cyrup_core::SessionId::from("sess-v1-nums"),
+            "/proj",
+            "2026-01-01T00:00:00Z",
+        );
+        header.version = None; // v1
+        let msg = |ts: &str, body: &str| {
+            serde_json::from_value::<Entry>(json!({
+                "type": "message",
+                "timestamp": ts,
+                "message": serde_json::to_value(
+                    crate::agent_message::AgentMessage::Core(user(body)),
+                )
+                .unwrap(),
+            }))
+            .unwrap()
+        };
+        let mut entries = vec![
+            msg("2026-01-01T00:00:01Z", "first"),
+            msg("2026-01-01T00:00:02Z", "kept"),
+            serde_json::from_value::<Entry>(json!({
+                "type": "compaction",
+                "timestamp": "2026-01-01T00:00:03Z",
+                "summary": "SUM",
+                "tokensBefore": 42,
+                "firstKeptEntryIndex": index,
+            }))
+            .unwrap(),
+        ];
+        assert!(to_current(&mut header, &mut entries));
+        entries
+    };
+
+    for index in [json!(-1), json!(-1.5), json!(1.5), json!(2.5)] {
+        let entries = build(index.clone());
+        let line = entries[2].to_line().expect("serializes");
+        assert!(
+            !line.contains("firstKeptEntryIndex"),
+            "pi deletes the key for any number, including {index}: {line}"
+        );
+        assert!(
+            !line.contains("firstKeptEntryId"),
+            "{index} resolves to no element upstream, so no id is assigned: {line}"
+        );
+    }
+
+    // `2.0` stringifies to "2" for the property access, so it resolves exactly like the integer.
+    let entries = build(json!(2.0));
+    let kept_id = entries[1].id();
+    match &entries[2] {
+        Entry::Known(KnownEntry::Compaction { first_kept_entry_id, .. }) => assert_eq!(
+            first_kept_entry_id.as_ref(),
+            Some(&kept_id),
+            "`entries[2.0]` is `entries[\"2\"]` upstream — the same element as `entries[2]`"
+        ),
+        other => panic!("expected a parsed compaction, got {other:?}"),
+    }
+}

@@ -128,6 +128,10 @@ struct ClientInner {
     /// Signalled once teardown has actually run, so `disconnect()` can await the real close
     /// (`client.ts:436-466`) instead of returning immediately.
     closed_notify: Notify,
+    /// The liveness-heartbeat task's abort handle — pi's `livenessTimer`
+    /// (`v0.10.1 broker/client.ts:72`). `Some` between `startLivenessHeartbeat` (`:106-112`) and
+    /// `stopLivenessHeartbeat` (`:114-120`).
+    liveness_abort: Mutex<Option<AbortHandle>>,
 }
 
 impl ClientInner {
@@ -143,6 +147,9 @@ fn teardown(inner: &Arc<ClientInner>, reason: String) {
     if inner.teardown_started.swap(true, Ordering::SeqCst) {
         return;
     }
+    // `onClose` calls `stopLivenessHeartbeat()` before failing pending work
+    // (`v0.10.1 broker/client.ts:216`).
+    stop_liveness_heartbeat(inner);
     inner.connected.store(false, Ordering::SeqCst);
     *guard(&inner.session_id) = None;
     for (_, tx) in guard(&inner.pending_sends).drain() {
@@ -157,6 +164,142 @@ fn teardown(inner: &Arc<ClientInner>, reason: String) {
 
 fn guard<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The liveness-heartbeat schedule (`getLivenessIntervalMs`/`getLivenessTimeoutMs`,
+/// `v0.10.1 broker/client.ts:47-55`), resolved once when the connection registers — the same point
+/// upstream calls the two getters from (`startLivenessHeartbeat` at `:108`, `runLivenessProbe` at
+/// `:128`).
+///
+/// Carried as a value rather than re-read from the process env inside the probe so tests can drive
+/// the heartbeat: this crate is `#![forbid(unsafe_code)]`, so a test cannot `set_var`.
+#[derive(Clone, Copy, Debug)]
+pub struct LivenessConfig {
+    /// How often to probe (`livenessTimer`'s `setInterval` period).
+    pub interval: Duration,
+    /// How long a probe's `list` round trip may take before the socket is judged half-open.
+    pub timeout: Duration,
+}
+
+impl LivenessConfig {
+    /// Resolve from the process environment (`CYRUP_INTERCOM_LIVENESS_INTERVAL_MS` /
+    /// `_TIMEOUT_MS`), defaulting to 30 s / 5 s.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            interval: Duration::from_millis(crate::identity::liveness_interval_ms()),
+            timeout: Duration::from_millis(crate::identity::liveness_timeout_ms()),
+        }
+    }
+}
+
+impl Default for LivenessConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+/// pi's `isConnected()` (`v0.10.1 broker/client.ts:94-97`) over the shared inner state, so the
+/// heartbeat task can consult it without holding an [`IntercomClient`] (which would keep the
+/// connection alive by ownership).
+fn inner_is_connected(inner: &ClientInner) -> bool {
+    !inner.disconnecting.load(Ordering::SeqCst)
+        && inner.connected.load(Ordering::SeqCst)
+        && guard(&inner.session_id).is_some()
+}
+
+/// `stopLivenessHeartbeat()` (`v0.10.1 broker/client.ts:114-120`). Idempotent; pi's
+/// `livenessInFlight = false` reset has no counterpart because the Rust probe is awaited inline (see
+/// [`liveness_task`]).
+fn stop_liveness_heartbeat(inner: &ClientInner) {
+    if let Some(handle) = guard(&inner.liveness_abort).take() {
+        handle.abort();
+    }
+}
+
+/// `startLivenessHeartbeat()` (`v0.10.1 broker/client.ts:106-112`) — called once the connection is
+/// registered (`onRegistered`, `:196`).
+fn start_liveness_heartbeat(inner: &Arc<ClientInner>, config: LivenessConfig) {
+    stop_liveness_heartbeat(inner);
+    let handle = tokio::spawn(liveness_task(inner.clone(), config));
+    *guard(&inner.liveness_abort) = Some(handle.abort_handle());
+}
+
+/// `socket.destroy()` on a dead connection (`v0.10.1 broker/client.ts:134-137`): kill the reader,
+/// stop the writer, and run the shared `onClose` tail so `Disconnected` reaches
+/// [`crate::connect::handle_disconnect`] and the reconnect ladder is armed.
+fn force_close(inner: &Arc<ClientInner>, reason: String) {
+    if let Some(h) = guard(&inner.read_abort).take() {
+        h.abort();
+    }
+    let _ = inner.writer.send(WriterCmd::Close);
+    teardown(inner, reason);
+}
+
+/// The heartbeat loop — `setInterval(() => this.runLivenessProbe(), getLivenessIntervalMs())` plus
+/// `runLivenessProbe` (`v0.10.1 broker/client.ts:108-141`).
+///
+/// **Mechanism note.** pi guards re-entry with a `livenessInFlight` boolean (`:73`, `:123-126`)
+/// because `setInterval` fires whether or not the previous probe's promise has settled. Here the
+/// probe is awaited inline inside the tick loop, so re-entry is structurally impossible; the
+/// corresponding behaviour — "a tick that lands while a probe is running is dropped, and the next
+/// probe starts at the next scheduled tick" — is what `MissedTickBehavior::Skip` produces. Same
+/// observable schedule, one fewer piece of shared mutable state.
+///
+/// `interval_at(now + interval, …)` rather than `interval(…)`: `tokio::time::interval` fires its
+/// first tick immediately, `setInterval` fires its first after one period.
+async fn liveness_task(inner: Arc<ClientInner>, config: LivenessConfig) {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.interval,
+        config.interval,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if inner.teardown_started.load(Ordering::SeqCst) {
+            return;
+        }
+        // `if (this.livenessInFlight || !this.isConnected()) return;` (`:123-125`) — a probe on a
+        // client that is already down is a no-op, NOT a teardown.
+        if !inner_is_connected(&inner) {
+            continue;
+        }
+        if let Err(e) = list_sessions_inner(&inner, config.timeout).await {
+            // "A timeout or write error means the socket is half-open: the broker is gone but the
+            // OS never delivered a close event." (`v0.10.1 broker/client.ts:130-132`)
+            force_close(&inner, e.to_string());
+            return;
+        }
+    }
+}
+
+/// The body of [`IntercomClient::list_sessions`], parameterized on the correlation deadline so the
+/// liveness probe can pass `getLivenessTimeoutMs()` (`listSessions({ timeoutMs })`,
+/// `v0.10.1 broker/client.ts:581-604`) and so the probe does not need an [`IntercomClient`] handle.
+async fn list_sessions_inner(inner: &Arc<ClientInner>, timeout: Duration) -> Result<Vec<SessionInfo>> {
+    if !inner_is_connected(inner) {
+        return Err(IntercomError::Client("not connected".to_string()));
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel();
+    guard(&inner.pending_lists).insert(request_id.clone(), tx);
+    let frame = encode_json(&ClientMessage::List { request_id: request_id.clone() })?;
+    if !inner.send_frame(frame) {
+        guard(&inner.pending_lists).remove(&request_id);
+        return Err(IntercomError::Client("client disconnected".to_string()));
+    }
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(Ok(sessions))) => Ok(sessions),
+        Ok(Ok(Err(msg))) => Err(IntercomError::Client(msg)),
+        Ok(Err(_)) => {
+            guard(&inner.pending_lists).remove(&request_id);
+            Err(IntercomError::Client("client disconnected".to_string()))
+        }
+        Err(_) => {
+            guard(&inner.pending_lists).remove(&request_id);
+            Err(IntercomError::Client("list sessions timeout".to_string()))
+        }
+    }
 }
 
 /// A per-session broker client.
@@ -204,6 +347,22 @@ impl IntercomClient {
         registration: SessionRegistration,
         session_id: Option<String>,
     ) -> Result<Self> {
+        Self::connect_target_with_liveness(target, registration, session_id, LivenessConfig::from_env())
+            .await
+    }
+
+    /// [`Self::connect_target`] with an explicit liveness schedule instead of the env-resolved one
+    /// (`v0.10.1 broker/client.ts:47-55`). Exists because this crate is `#![forbid(unsafe_code)]`,
+    /// so a test cannot `set_var` to shorten the 30 s heartbeat.
+    ///
+    /// # Errors
+    /// As [`Self::connect_target`].
+    pub async fn connect_target_with_liveness(
+        target: &BrokerConnectTarget,
+        registration: SessionRegistration,
+        session_id: Option<String>,
+        liveness: LivenessConfig,
+    ) -> Result<Self> {
         let state_id = target.state_id().map(str::to_string);
         let stream = BrokerStream::connect(target).await?;
         let (read_half, write_half) = stream.into_split();
@@ -222,6 +381,7 @@ impl IntercomClient {
             teardown_started: AtomicBool::new(false),
             read_abort: Mutex::new(None),
             closed_notify: Notify::new(),
+            liveness_abort: Mutex::new(None),
         });
 
         tokio::spawn(writer_task(write_half, wrx, inner.clone()));
@@ -245,6 +405,9 @@ impl IntercomClient {
                 *guard(&inner.session_id) = Some(sid);
                 inner.connected.store(true, Ordering::SeqCst);
                 inner.ever_registered.store(true, Ordering::SeqCst);
+                // `onRegistered` starts the heartbeat before resolving the connect promise
+                // (`v0.10.1 broker/client.ts:192-198`).
+                start_liveness_heartbeat(&inner, liveness);
                 Ok(Self { inner })
             }
             Ok(Ok(Err(msg))) => Err(IntercomError::Client(msg)),
@@ -326,29 +489,17 @@ impl IntercomClient {
     /// # Errors
     /// [`IntercomError::Client`] on a list timeout or if the client disconnected mid-list.
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
-        if !self.is_connected() {
-            return Err(IntercomError::Client("not connected".to_string()));
-        }
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = oneshot::channel();
-        guard(&self.inner.pending_lists).insert(request_id.clone(), tx);
-        let frame = encode_json(&ClientMessage::List { request_id: request_id.clone() })?;
-        if !self.inner.send_frame(frame) {
-            guard(&self.inner.pending_lists).remove(&request_id);
-            return Err(IntercomError::Client("client disconnected".to_string()));
-        }
-        match tokio::time::timeout(LIST_TIMEOUT, rx).await {
-            Ok(Ok(Ok(sessions))) => Ok(sessions),
-            Ok(Ok(Err(msg))) => Err(IntercomError::Client(msg)),
-            Ok(Err(_)) => {
-                guard(&self.inner.pending_lists).remove(&request_id);
-                Err(IntercomError::Client("client disconnected".to_string()))
-            }
-            Err(_) => {
-                guard(&self.inner.pending_lists).remove(&request_id);
-                Err(IntercomError::Client("list sessions timeout".to_string()))
-            }
-        }
+        list_sessions_inner(&self.inner, LIST_TIMEOUT).await
+    }
+
+    /// [`Self::list_sessions`] under an explicit correlation deadline
+    /// (`listSessions({ timeoutMs })`, `v0.10.1 broker/client.ts:581`); the default is the same
+    /// `options.timeoutMs ?? 5000` (`:604`).
+    ///
+    /// # Errors
+    /// As [`Self::list_sessions`].
+    pub async fn list_sessions_with_timeout(&self, timeout: Duration) -> Result<Vec<SessionInfo>> {
+        list_sessions_inner(&self.inner, timeout).await
     }
 
     /// Best-effort cancel of an outstanding ask edge this session owns (`cancelAsk`,
@@ -444,6 +595,8 @@ impl IntercomClient {
         if self.inner.disconnecting.swap(true, Ordering::SeqCst) {
             return;
         }
+        // `this.stopLivenessHeartbeat()` before `failPending` (`v0.10.1 broker/client.ts:539-540`).
+        stop_liveness_heartbeat(&self.inner);
         self.inner.connected.store(false, Ordering::SeqCst);
 
         let reason = "client disconnected".to_string();
@@ -724,6 +877,7 @@ mod tests {
             teardown_started: AtomicBool::new(false),
             read_abort: Mutex::new(None),
             closed_notify: Notify::new(),
+            liveness_abort: Mutex::new(None),
         });
         (inner, wrx)
     }
@@ -816,6 +970,104 @@ mod tests {
         let frame = broker.await.expect("broker task");
         assert_eq!(frame["type"], "register");
         assert!(frame.get("stateId").is_none(), "socket registers carry no credential: {frame}");
+    }
+
+    /// ICOM-038 / `v0.10.1 broker/client.ts:39-45,106-141`. A broker that registers and then goes
+    /// deaf — it keeps reading, so every write still succeeds and the OS never delivers a close —
+    /// is exactly the half-open shape upstream's doc comment names ("stays 'writable' indefinitely,
+    /// so passive close-event detection never fires"). Only the heartbeat can notice it.
+    ///
+    /// RED before the fix: with no probe there is no timer at all, so no `Disconnected` is ever
+    /// broadcast and the outer `timeout` expires. GREEN after: the first tick's `list` round trip
+    /// misses its deadline and `runLivenessProbe`'s `socket.destroy()` drives the shared `onClose`
+    /// tail. The 10 s bound is a failsafe on an event await, not a timing assertion.
+    #[tokio::test]
+    async fn liveness_probe_tears_down_a_half_open_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("broker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let broker = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut reader = FrameReader::new();
+            let mut buf = vec![0u8; 4096];
+            let mut registered_sent = false;
+            loop {
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let frames = reader.push(&buf[..n]).expect("frames");
+                if !registered_sent && !frames.is_empty() {
+                    let registered = encode_json(&BrokerMessage::Registered {
+                        session_id: "s1".to_string(),
+                        features: None,
+                    })
+                    .expect("encodes");
+                    stream.write_all(&registered).await.expect("write");
+                    registered_sent = true;
+                }
+                // Every later frame — including the probe's `list` — is read and swallowed.
+            }
+        });
+
+        let client = IntercomClient::connect_target_with_liveness(
+            &BrokerConnectTarget::Socket(socket_path.clone()),
+            registration(),
+            None,
+            LivenessConfig {
+                interval: Duration::from_millis(20),
+                timeout: Duration::from_millis(20),
+            },
+        )
+        .await
+        .expect("registers");
+        // No `.await` between the connect resolving and this subscribe, so the first tick (one full
+        // interval away) cannot have been missed.
+        let mut events = client.subscribe();
+        assert!(client.is_connected());
+
+        let reason = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(InboundEvent::Disconnected(reason)) => return Some(reason),
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .expect("the liveness heartbeat must tear a half-open socket down")
+        .expect("the event channel must stay open until Disconnected is broadcast");
+
+        // The probe's own error becomes the disconnect reason, so `handle_disconnect`'s log and the
+        // `Disconnected while waiting for reply: …` text name the real cause rather than a generic
+        // close. `IntercomError::Client`'s Display prefix is `error.rs:28`.
+        assert_eq!(reason, "intercom client error: list sessions timeout");
+        assert!(!client.is_connected(), "the ladder's `is_connected` gate must now be false");
+        broker.abort();
+    }
+
+    /// ICOM-038 / `v0.10.1 broker/client.ts:539` — a deliberate `disconnect()` calls
+    /// `stopLivenessHeartbeat()`, so a closing client never probes a socket it is tearing down and
+    /// never manufactures a spurious `Disconnected` that would arm the reconnect ladder.
+    #[tokio::test]
+    async fn disconnect_stops_the_liveness_heartbeat() {
+        let (inner, _wrx) = bare_inner();
+        *guard(&inner.session_id) = Some("s1".to_string());
+        inner.connected.store(true, Ordering::SeqCst);
+        start_liveness_heartbeat(
+            &inner,
+            LivenessConfig { interval: Duration::from_secs(30), timeout: Duration::from_secs(5) },
+        );
+        assert!(guard(&inner.liveness_abort).is_some(), "heartbeat armed");
+
+        let client = IntercomClient { inner };
+        client.disconnect();
+        assert!(
+            guard(&client.inner.liveness_abort).is_none(),
+            "disconnect() must clear livenessTimer (client.ts:114-118)"
+        );
     }
 
     // dossier item 1 (client.ts:426-467): `disconnect()` must synchronously fail every pending
@@ -1217,6 +1469,7 @@ mod tests {
             teardown_started: AtomicBool::new(false),
             read_abort: Mutex::new(None),
             closed_notify: Notify::new(),
+            liveness_abort: Mutex::new(None),
         });
         let (send_tx, send_rx) = oneshot::channel::<SendResult>();
         guard(&inner.pending_sends).insert("m1".to_string(), send_tx);

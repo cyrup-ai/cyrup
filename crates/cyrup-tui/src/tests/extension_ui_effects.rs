@@ -68,7 +68,13 @@ fn install_ui_sinks_delivers_all_eight_fire_and_forget_capabilities() {
 
     svc.notify("note", NotifyKind::Warning);
     svc.set_status("ext", Some("busy"));
-    svc.set_widget(&serde_json::json!({"key": "w", "lines": ["a"]}));
+    // SEAM-011: pi's `RpcExtensionUIRequest` pins widgetKey/widgetLines/widgetPlacement
+    // (`modes/rpc/rpc-types.ts:264-271` @v0.83.0) — not a cyrup-invented `widget` blob.
+    svc.set_widget(
+        "w",
+        Some(&["a".to_string()]),
+        cyrup_ext::host::services::WidgetPlacement::default(),
+    );
     svc.set_header("H");
     svc.set_footer("F");
     svc.set_title("cyrup — repo");
@@ -84,7 +90,11 @@ fn install_ui_sinks_delivers_all_eight_fire_and_forget_capabilities() {
         vec![
             UiEffect::Notify { message: "note".into(), kind: NotifyKind::Warning },
             UiEffect::SetStatus { key: "ext".into(), text: Some("busy".into()) },
-            UiEffect::SetWidget { widget: serde_json::json!({"key": "w", "lines": ["a"]}) },
+            UiEffect::SetWidget {
+                widget: serde_json::json!({
+                    "key": "w", "lines": ["a"], "placement": "aboveEditor",
+                }),
+            },
             UiEffect::SetHeader { content: "H".into() },
             UiEffect::SetFooter { content: "F".into() },
             UiEffect::SetTitle { title: "cyrup — repo".into() },
@@ -200,7 +210,11 @@ fn title_widget_header_footer_arrive_and_are_rendered() {
 
     let mut app = app();
     svc.set_title("cyrup — my-repo");
-    svc.set_widget(&serde_json::json!({"key": "todo", "content": ["WIDGET-A", "WIDGET-B"]}));
+    svc.set_widget(
+        "todo",
+        Some(&["WIDGET-A".to_string(), "WIDGET-B".to_string()]),
+        cyrup_ext::host::services::WidgetPlacement::default(),
+    );
     svc.set_header("HEADER-LINE");
     svc.set_footer("FOOTER-LINE");
     drain(&mut app, &mut effect_rx);
@@ -251,10 +265,10 @@ async fn an_extension_footer_swaps_the_built_in_one_out_and_back() {
 async fn a_second_widget_with_the_same_key_replaces_the_first() {
     let mut app = app();
     app.apply_ui_effect(UiEffect::SetWidget {
-        widget: serde_json::json!({"key": "todo", "content": "FIRST"}),
+        widget: serde_json::json!({"key": "todo", "lines": ["FIRST"], "placement": "aboveEditor"}),
     });
     app.apply_ui_effect(UiEffect::SetWidget {
-        widget: serde_json::json!({"key": "todo", "content": "SECOND"}),
+        widget: serde_json::json!({"key": "todo", "lines": ["SECOND"], "placement": "aboveEditor"}),
     });
     assert_eq!(app.state().extension_widgets.len(), 1, "same key must not append");
     let text = rendered(&mut app);
@@ -266,9 +280,14 @@ async fn a_second_widget_with_the_same_key_replaces_the_first() {
 async fn a_widget_with_no_content_is_removed() {
     let mut app = app();
     app.apply_ui_effect(UiEffect::SetWidget {
-        widget: serde_json::json!({"key": "todo", "content": "GONE"}),
+        widget: serde_json::json!({"key": "todo", "lines": ["GONE"], "placement": "aboveEditor"}),
     });
-    app.apply_ui_effect(UiEffect::SetWidget { widget: serde_json::json!({"key": "todo"}) });
+    assert_eq!(app.state().extension_widgets.len(), 1, "mounted before the removal");
+    // `lines: null` is what `LiveHostServices::set_widget` emits for pi's `content: undefined`
+    // (`host_services.rs:730-737`); an absent key reads the same.
+    app.apply_ui_effect(UiEffect::SetWidget {
+        widget: serde_json::json!({"key": "todo", "lines": null, "placement": "aboveEditor"}),
+    });
     assert!(app.state().extension_widgets.is_empty(), "an empty content list removes the widget");
     let text = rendered(&mut app);
     assert!(!text.contains("GONE"), "the removed widget must not paint:\n{text}");
@@ -280,7 +299,8 @@ fn a_widget_longer_than_ten_lines_is_truncated_with_pis_marker() {
     let content: Vec<String> = (0..15).map(|i| format!("row{i}")).collect();
     let w = crate::ExtensionWidget::from_json(&serde_json::json!({
         "key": "big",
-        "content": content,
+        "lines": content,
+        "placement": "aboveEditor",
     }));
     assert_eq!(w.lines.len(), 11, "10 rows plus the marker");
     assert_eq!(w.lines[10], crate::ExtensionWidget::TRUNCATED);
@@ -291,11 +311,17 @@ fn a_widget_longer_than_ten_lines_is_truncated_with_pis_marker() {
 #[test]
 fn placement_below_editor_is_recovered_from_the_payload() {
     let below = crate::ExtensionWidget::from_json(&serde_json::json!({
-        "key": "k", "content": "x", "options": {"placement": "belowEditor"},
+        "key": "k", "lines": ["x"], "placement": "belowEditor",
     }));
     assert!(below.below);
-    let above = crate::ExtensionWidget::from_json(&serde_json::json!({"key": "k", "content": "x"}));
+    let above = crate::ExtensionWidget::from_json(&serde_json::json!({
+        "key": "k", "lines": ["x"], "placement": "aboveEditor",
+    }));
     assert!(!above.below, "the default is `aboveEditor`");
+    // A carrier with no placement at all still reads as pi's documented default
+    // (`extensions/types.ts:107-110` @v0.83.0, `interactive-mode.ts:1925`).
+    let implicit = crate::ExtensionWidget::from_json(&serde_json::json!({"key": "k", "lines": ["x"]}));
+    assert!(!implicit.below, "an absent placement is `aboveEditor`");
 }
 
 fn drain(

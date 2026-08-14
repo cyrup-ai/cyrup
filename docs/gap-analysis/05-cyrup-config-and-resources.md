@@ -42,6 +42,75 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 > --include='*.rs'` resolves only to `crates/cyrup/src/migrations.rs`, `crates/cyrup-config/src/
 > settings.rs` (a faithful port of `migrateSettings`) and its `lib.rs:62` re-export.
 
+> ### Reconciliation 2026-08-14 — sweeps 1 and 2 applied, counts re-derived
+>
+> **cyrup HEAD `380c713`** (this file was written against `04c1ba2`), tree clean. Two whole-backlog
+> parity sweeps have landed since this file was last edited: **sweep 1 — 232 items across 11 crates**,
+> and **sweep 2**, run under the same rules. Area agents were forbidden from editing documentation so
+> that a single writer could reconcile all sixteen files in one pass; this block, and the dispositions
+> written into the `## Open items` rows below, are that reconciliation. **Every status in this file
+> that predates this block is stale — including the header notes above it and the
+> `## Status of every item…` table.**
+>
+> **No ID was renumbered, merged or deleted.** A refuted item keeps its ID with the refutation
+> recorded in its row, so nobody re-derives it. Refutations are corrections to *this analysis*, not
+> failures of the sweep — see `00-residual-ledger.md`, which now publishes the measured error rate.
+>
+> **The test architecture changed underneath every path citation in this file.** The integration
+> tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` / `d973906`), taking the
+> suite from **310 integration binaries to 6 + 8 gated** behind a new **`cyrup-it`** harness crate.
+> The gate is now **6440 tests / 6440 passed / 8 skipped in 16.4 s**. Any citation of the form
+> `crates/<crate>/tests/<x>.rs` in this file is stale unless it names `cyrup-it`, and note that
+> `cyrup-it` is `required-features = ["it"]`, so **the gate does not build or run it**.
+>
+> **Still a static analysis.** Neither sweep executed the suite: area agents were restricted to
+> `cargo check -p <crate> [--all-targets]` and the orchestrator ran the gate once over the combined
+> work. Every red-before/green-after claim below is a reasoned argument plus a type-check, and every
+> `Verify` line in this file remains a design, not an observation.
+>
+> **Area 05 — recount: 38 rows → 18 open (0 critical · 0 high · 11 medium · 7 low).** The area's only
+> high, `CFG-035`, is CLOSED: sweep 2 landed the discovery half here
+> (`crates/cyrup-resources/src/discovery.rs`, `discover_system_prompt_file` /
+> `discover_append_system_prompt_file` riding out on `DiscoveryReport`) and area 08 landed the wiring
+> half **concurrently and independently** (`cyrup-session-svc/src/builder.rs:1219-1258`), including
+> pi's REPLACE-not-accumulate rule for the append leg. Its one residual — a doc line at
+> `cyrup-session/src/prompt/overrides.rs:15-16` — is re-filed against area 03 rather than holding a
+> high open.
+>
+> **`CFG-048`'s mechanism landed in a new file the item did not anticipate**, `crates/cyrup-config/src/keybindings.rs`, and the reason is worth keeping: pi applies the migration table **twice** — write
+> time from `runMigrations` and read time from `loadFromFile` — and cyrup's two consumers
+> (`crates/cyrup/src/migrations.rs`, `crates/cyrup-tui/src/keymap.rs`) have no other common ancestor.
+> Same argument that put `migrate_settings` there. Two facts in the item are corrected in its row: the
+> instruction to respell 25 targets as `editor.*` is stale and was NOT followed, and `KEYBINDINGS` has
+> **42** app ids, not 41 (73 total).
+>
+> **`CFG-003`'s premise was wrong in the record and is corrected before anyone schedules it.** Sweep
+> 1's handoff says auto-install is "gated on an opt-in setting that does not exist"; at the tag,
+> `resolvePackageSources` (package-manager.ts:1260-1271 @v0.83.0) installs UNCONDITIONALLY unless
+> `isOfflineModeEnabled()` or the optional `onMissing` callback says otherwise. The real blocker is
+> structural — a three-crate async restructuring — which is what makes it L.
+>
+> **CROSS-CRATE BREAKAGE deliberately introduced by `CFG-027`, for the seam phase:**
+> `crates/cyrup-session-svc/src/tests/settings_resolve.rs::missing_settings_declared_package_is_reported_not_fatal`
+> declares `"packages": ["./nope-not-here"]` — a LOCAL path — and asserts a startup diagnostic, but pi
+> is SILENT for a missing local path (package-manager.ts:1324-1326) and cyrup now is too. Its own doc
+> cites `:1244-1283`, the npm/git install arm, not the arm its fixture hits. **The fix is to repoint
+> the fixture at `"github:org/nope-not-here"`, the arm cyrup's no-network `[CYRUP-DELTA]` actually
+> covers — NOT to weaken the assertion.** The in-crate twin was corrected the same way
+> (`cfg003_missing_settings_declared_package_is_an_error_diagnostic` →
+> `cfg003_uninstallable_settings_declared_package_is_an_error_diagnostic`).
+>
+> **Blind spots 2 and 3 are unchanged and must not be read as narrowing.** `login.rs` is untouched by
+> sweep 2; of blind spot 3's six files, sweep 2 read only `policy.rs:21-48` (`NetworkPolicy::resolve`,
+> for `DRIFT-050`) and `package/source.rs:60-118` (`PackageSource::parse`, for `CFG-027`).
+> `cyrup-resources/src/{theme.rs, scope.rs, key.rs}`, `cyrup-config/src/env_keys.rs` and
+> `cyrup-resources/src/package/git_url.rs` are still unread end to end.
+>
+> **STALE CITATION, workspace-wide:** `first_env` no longer exists in `cyrup-config/src/env.rs` — it
+> was folded into a closure inside the new `EnvVars::from_lookup(get)` seam (see `DRIFT-050`). Any
+> area file citing `cyrup-config/src/env.rs:50-53 first_env` is stale.
+
+
 ## Status since the c8bd2ab baseline
 
 | ID | Status | Note |
@@ -110,46 +179,48 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 > The 2026-08-07 undercount that structural defect A in `00-residual-ledger.md` describes came from
 > reading one table and ignoring the other — check both headings before quoting a count.
 
+> **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 11 medium, 7 low = 18.** 20 rows are now marked CLOSED, including the area's only high (`CFG-035`).
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| CFG-035 | high | not-ported | M | `.cyrup/SYSTEM.md` and `APPEND_SYSTEM.md` are never discovered — the trust-gated project system-prompt override is inert |
-| CFG-023 | medium | parity-bug | S | `find_initial_model` step 3 accepts a saved default whose provider has no configured auth |
-| CFG-025 | medium | parity-bug | S | Settings-declared paths and local package sources do not expand `~` or `file://` |
-| CFG-026 | medium | parity-bug | S | Settings packages deduped by raw source string, not resolved identity |
-| CFG-036 | medium | not-ported | S | `--session-dir` and the `CYRUP_*_DIR` env vars are not tilde-expanded |
-| CFG-037 | medium | not-ported | S | A project-scope git package install writes no `.gitignore`, so the clone lands in the user's working tree |
-| CFG-038 | medium | parity-bug | S | One unparseable key spec discards the whole `keybindings.json` — and applies it partially first |
-| CFG-045 | medium | not-ported | S | `doubleEscapeAction` is inert — the Escape handler has no double-escape and no bash-mode-exit branch |
-| CFG-046 | medium | parity-bug | S | models.json string fields are not length-validated, so `"baseUrl": ""` rewrites every model to an empty endpoint |
-| CFG-048 | medium | not-ported | S | pi's sixth startup migration (`migrateKeybindingsConfigFile`, 59 legacy names) is not ported at write time or read time |
-| CFG-049 | medium | not-ported | S | Deprecation warnings are printed and immediately painted over — pi blocks startup on a keypress |
-| CFG-018 | medium | parity-bug | S | Glob scope patterns no longer short-circuit on an exact model reference |
-| CFG-019 | medium | upstream-drift | S | `defaultModelPerProvider` still stale — `xai` id retired, `radius` arm missing |
-| CFG-007 | medium | parity-bug | M | `AuthStore` re-reads auth.json per query and coerces errors to "not configured" |
-| CFG-008 | medium | not-ported | M | Model-scope resolution drops every diagnostic |
-| CFG-006 | medium | not-ported | M | `websocketConnectTimeoutMs` never reaches the HTTP/stream layer |
-| CFG-039 | medium | upstream-drift | M | models.json `samplingParams` on model definitions and modelOverrides is silently dropped |
-| CFG-020 | medium | not-ported | L | No `ModelRuntime` type and no availability snapshot |
-| CFG-003 | medium | not-ported | L | Settings `packages` are resolved but never auto-installed |
-| CFG-005 | medium | not-ported | L | Two multi-prompt api-key login flows unported (`ApiKeyAuth` has no `login` member) |
-| CFG-009 | low | parity-bug | S | An `npm:` package source fails with the misleading message "unsupported source (OCI deferred)" |
-| CFG-013 | low | parity-bug | S | `TrustStore::nearest` reads trust.json without the file lock |
-| CFG-016 | low | parity-bug | S | `${0:-default}` emitted literally instead of substituting |
-| CFG-017 | low | parity-bug | S | `${@:-default}` / `${ARGUMENTS:-default}` prompt-template forms unsupported |
-| CFG-028 | low | cyrup-original | S | Config-value `!command` resolution blocks a tokio worker for up to 10 s |
-| CFG-030 | low | parity-bug | S | Non-object top-level `settings.json` degraded to `{}` with no load error |
-| CFG-040 | low | upstream-drift | S | `markdown.mermaid` settings key and its getter/setter are absent |
-| CFG-041 | low | upstream-drift | S | `default_model_per_provider` missing v0.84.1's `baseten` and `qwen-token-plan-individual` |
-| CFG-043 | low | parity-bug | S | An invalid `models.json` reports a serde parse error instead of pi's per-field schema report |
-| CFG-044 | low | cyrup-original | S | Three `auth-storage.ts` provenance cites resolve to nothing upstream, and `get_auth_status` is dead |
-| CFG-047 | low | parity-bug | S | Three built-in slash-command metadata divergences (`/model`, `/login`, `/reload`) |
-| CFG-050 | low | parity-bug | S | `migrate_tools_to_bin` moves the managed `fd`/`rg` binaries with no completion notice |
-| CFG-051 | low | parity-bug | S | The migrated-credentials notice is written to stderr pre-TUI instead of into the transcript, on a wrong cite |
-| CFG-014 | low | not-ported | M | `showCacheMissNotices` and prompt-cache-miss tracking absent |
-| CFG-015 | low | not-ported | M | Five unconsumed settings accessors, incl. `lastChangelogVersion` and `collapseChangelog` |
-| CFG-027 | low | not-ported | M | A local package that is a bare extension directory contributes nothing |
-| CFG-042 | low | upstream-drift | M | `FileModelsStore` does not normalize its path, cache by file revision, or accept cancellation |
-| CFG-021 | low | upstream-drift | L | `tuiMode` / `fullscreenScrollbar` not modelled |
+| ~~CFG-035~~ | ~~high~~ **CLOSED 2026-08-14** | not-ported | M | `.cyrup/SYSTEM.md` and `APPEND_SYSTEM.md` are never discovered — the trust-gated project system-prompt override is inert — **CLOSED 2026-08-14**: sweep 2 — the area's only `high`. The DISCOVERY half landed in `crates/cyrup-resources/src/discovery.rs` (`discover_system_prompt_file` / `discover_append_system_prompt_file` over a shared `discover_prompt_override`, both on `DiscoveryReport`), so `grep -rn 'SYSTEM\.md' crates/` no longer returns five hits none of which read a file; trust gates the PROJECT candidate only, so an untrusted project falls through to `<agent_dir>/SYSTEM.md` rather than to nothing. The WIRING half landed CONCURRENTLY in area 08 (`cyrup-session-svc/src/builder.rs:1219-1258`), including pi's REPLACE-not-accumulate rule for the append leg. **The one residual — the doc line at `cyrup-session/src/prompt/overrides.rs:15-16` — is re-filed against area 03 as SESS-035's residual rather than holding this item open.** |
+| ~~CFG-023~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `find_initial_model` step 3 accepts a saved default whose provider has no configured auth — **CLOSED 2026-08-14**: sweep 1. |
+| ~~CFG-025~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Settings-declared paths and local package sources do not expand `~` or `file://` — **CLOSED 2026-08-14**: sweep 1 — closed by one shared util, `crates/cyrup-config/src/paths.rs`, creating a new `cyrup-resources → cyrup-config` dependency edge (a second copy is what the `encode_cwd` handoff warns against). The util does NOT resolve relative paths — it is `normalizePath`, not `resolvePath`. **Sweep 2 amendment:** the module now ALSO carries the v0.84.1 `normalizeWindowsShellPath` step (paths.ts:66-73, applied at :83-85), so it is measured against v0.84.1 for that one function — a future auditor must not read the win32 branch as an invention. See DRIFT-046. |
+| CFG-026 | medium | parity-bug | S | Settings packages deduped by raw source string, not resolved identity — **2026-08-14, still open**: sweep 2 — urgency RAISED by CFG-027: a local entry can now resolve to a file, to a tree, or to nothing, so a raw-source-string dedupe key is further from pi's `getPackageIdentity` than it was. |
+| ~~CFG-036~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | `--session-dir` and the `CYRUP_*_DIR` env vars are not tilde-expanded — **CLOSED 2026-08-14**: sweep 1 — closed by one shared util, `crates/cyrup-config/src/paths.rs`, creating a new `cyrup-resources → cyrup-config` dependency edge (a second copy is what the `encode_cwd` handoff warns against). The util does NOT resolve relative paths — it is `normalizePath`, not `resolvePath`. **Sweep 2 amendment:** the module now ALSO carries the v0.84.1 `normalizeWindowsShellPath` step (paths.ts:66-73, applied at :83-85), so it is measured against v0.84.1 for that one function — a future auditor must not read the win32 branch as an invention. See DRIFT-046. |
+| ~~CFG-037~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | A project-scope git package install writes no `.gitignore`, so the clone lands in the user's working tree — **CLOSED 2026-08-14**: sweep 1 — closed with CFG-025/CFG-036 on the shared `crates/cyrup-config/src/paths.rs` util. |
+| CFG-038 | medium | parity-bug | S | One unparseable key spec discards the whole `keybindings.json` — and applies it partially first — **2026-08-14, still open**: sweep 2 — should ship in the same change as CFG-048's read-time half: both edit `keybindings_object`/`merge_json` in `crates/cyrup-tui/src/keymap.rs`. |
+| CFG-045 | medium | not-ported | S | `doubleEscapeAction` is inert — the Escape handler has no double-escape and no bash-mode-exit branch — **2026-08-14, still open**: sweep 2 — not reached, fix site outside cyrup-config/cyrup-resources. |
+| ~~CFG-046~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | models.json string fields are not length-validated, so `"baseUrl": ""` rewrites every model to an empty endpoint — **CLOSED 2026-08-14**: sweep 1 — `ModelDefinition`/`ModelOverride`'s `context_window`/`max_tokens` are now `Option<i64>` (pi's `Type.Number()` is signed and the per-provider `<= 0` rejection depends on it), and `apply_model_override` carries a new `[CYRUP-DELTA]`: pi stores a negative override verbatim, `Model::context_window` is `u64`, so it saturates to 0. |
+| CFG-048 | medium — **PARTIALLY CLOSED 2026-08-14** | not-ported | S | pi's sixth startup migration (`migrateKeybindingsConfigFile`, 59 legacy names) is not ported at write time or read time — **PARTIALLY CLOSED 2026-08-14**: sweep 2 — the whole keybindings-migration MECHANISM is ported into a NEW file, `crates/cyrup-config/src/keybindings.rs` (not `crates/cyrup/src/migrations.rs` as the Fix assumed): `KEYBINDING_NAME_MIGRATIONS` (all 59 renames), `KEYBINDING_IDS` (all 73 declared ids in pi's `{...TUI_KEYBINDINGS, ...app}` declaration order), `migrated_keybinding_name`, `migrate_keybindings_config`, `stringify_keybindings` (a byte-exact `JSON.stringify(x,null,2)`) and `migrate_keybindings_config_file`. It lives in cyrup-config because pi applies the table TWICE — write time from `runMigrations` and read time from `loadFromFile` — and cyrup's two consumers have no other common ancestor; the same argument that put `migrate_settings` there. **TWO FACTS IN THE ITEM ARE CORRECTED:** (1) its instruction to respell the 25 `tui.editor.*`/`tui.input.*` targets as `editor.*` is STALE and was NOT followed — `EditorAction::from_id` (keymap.rs:224-276) already accepts all three spellings, so pi's verbatim targets are used and TUI-028 needs no follow-up rewrite; (2) `KEYBINDINGS` has **42** app ids, not 41, for **73** declared ids total (31 tui + 42 app). **RESIDUAL — two call sites:** (a) `crates/cyrup/src/migrations.rs` must call `cyrup_config::migrate_keybindings_config_file(&dirs.agent_dir)` between `migrate_tools_to_bin` and `migrate_extension_system` (pi's :311→:312→:313 position) and DELETE the false claim at migrations.rs:9-10; (b) `crates/cyrup-tui/src/keymap.rs::keybindings_object` (:32-40) must run `migrate_keybindings_config` on the parsed map before the entry loop (pi's read-time application, keybindings.ts:366). Ship (b) with CFG-038 — both edit the adjacent function. |
+| CFG-049 | medium | not-ported | S | Deprecation warnings are printed and immediately painted over — pi blocks startup on a keypress — **2026-08-14, still open**: sweep 2 — not reached, fix site outside cyrup-config/cyrup-resources. |
+| ~~CFG-018~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Glob scope patterns no longer short-circuit on an exact model reference — **CLOSED 2026-08-14**: sweep 1. |
+| ~~CFG-019~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | `defaultModelPerProvider` still stale — `xai` id retired, `radius` arm missing — **CLOSED 2026-08-14**: sweep 1. |
+| ~~CFG-007~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | `AuthStore` re-reads auth.json per query and coerces errors to "not configured" — **CLOSED 2026-08-14**: sweep 1 — behavioural consequence for the verification phase: `AuthStore` no longer re-reads `auth.json` per query, so a test that constructs the store and then writes `auth.json` out of band must call the new `AuthStore::reload()`. This is pi's semantics (`read()` is `this.data[provider]`), not a shortcut. |
+| CFG-008 | medium — **PARTIALLY CLOSED 2026-08-14** | not-ported | M | Model-scope resolution drops every diagnostic — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the item's cyrup evidence is STALE and its headline wrong at HEAD: `crates/cyrup/src/main.rs:1010-1046` (`scope_diagnostics`) already emits both of pi's diagnostic codes with pi's text — it just replays the resolver's colon-stripping in the bin to do it. The cyrup-config half is fixed (`ModelResolver::resolve_scope_reporting` + `ModelScopeDiagnostic` exist). **RESIDUAL: the bin switching over (`crates/cyrup/src/main.rs:1010-1080`).** Re-read the item as "the diagnostic TYPE lives in the bin as a replay instead of on the resolver". |
+| CFG-006 | medium | not-ported | M | `websocketConnectTimeoutMs` never reaches the HTTP/stream layer — **2026-08-14, still open**: sweep 2 — not reached, fix site outside cyrup-config/cyrup-resources. |
+| CFG-039 | medium | upstream-drift | M | models.json `samplingParams` on model definitions and modelOverrides is silently dropped — **2026-08-14, still open**: sweep 2 — still blocked on `sampling_params` landing on `cyrup_provider::Model` first, which area 01 has now confirmed absent after its own sweep-2 pass (see AGENT-026). Deliberately NOT landed as a config-only field a later layer drops — that recreates AGENT-021's exact defect. |
+| CFG-020 | medium | not-ported | L | No `ModelRuntime` type and no availability snapshot — **2026-08-14, still open**: sweep 2 — not reached; L, three crates, requires reading model-runtime.ts at v0.84.1 (+356 lines). |
+| CFG-003 | medium | not-ported | L | Settings `packages` are resolved but never auto-installed — **2026-08-14, still open**: sweep 2 — **PREMISE CORRECTED before anyone schedules it.** Sweep 1's handoff says auto-install is "gated on an opt-in setting that does not exist"; that is wrong at the tag. `resolvePackageSources` (package-manager.ts:1260-1271 @v0.83.0) installs a missing npm/git source UNCONDITIONALLY unless `isOfflineModeEnabled()` returns true or the OPTIONAL `onMissing` callback answers "skip"/"error". The real blocker is structural: `discover_blocking` is synchronous inside `spawn_blocking`, `PackageManager::install` is async gix, and the `onMissing` prompt belongs to the session-svc builder — a three-crate async restructuring, which is what makes it L. |
+| CFG-005 | medium — **PARTIALLY CLOSED 2026-08-14** | not-ported | L | Two multi-prompt api-key login flows unported (`ApiKeyAuth` has no `login` member) — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the recorded residual ("`ApiKeyAuth` has no `login` member") is FALSE at HEAD: `supports_login`/`login` are on the trait (`cyrup-provider/src/auth/mod.rs:59-91`) and all four bespoke bodies have landed; the consumer-side defect (login.rs ran the generic one-secret flow for all four) is closed. **RESIDUAL: ADR-0010 step 2 only — `EnvKeyAuth` still lacks `supports_login`/`login`, which is what blocks deleting `api_key_strategy_supports_login`.** |
+| ~~CFG-009~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | An `npm:` package source fails with the misleading message "unsupported source (OCI deferred)" — **CLOSED 2026-08-14**: sweep 1 — the message half is fixed and the variant is `ResourceError::UnsupportedNpm`; any other area file quoting "unsupported source (OCI deferred)" for an npm source is stale. The "Dangling consequence" line (`EffectiveSettings::npm_command()` has zero consumers) is unchanged and points at CFG-015. |
+| ~~CFG-013~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `TrustStore::nearest` reads trust.json without the file lock — **CLOSED 2026-08-14**: sweep 1. |
+| ~~CFG-016~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `${0:-default}` emitted literally instead of substituting — **CLOSED 2026-08-14**: sweep 1 — `match_brace_form`'s signature now takes `all_args`, which is what CFG-017's Fix asked for; the `${@:N}` / `${@:N:L}` slice family was re-verified unaffected (`${@:1:-2}` matches neither of pi's alternatives and stays literal on both sides). |
+| ~~CFG-017~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `${@:-default}` / `${ARGUMENTS:-default}` prompt-template forms unsupported — **CLOSED 2026-08-14**: sweep 1 — `match_brace_form`'s signature now takes `all_args`, which is what CFG-017's Fix asked for; the `${@:N}` / `${@:N:L}` slice family was re-verified unaffected (`${@:1:-2}` matches neither of pi's alternatives and stays literal on both sides). |
+| ~~CFG-028~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | Config-value `!command` resolution blocks a tokio worker for up to 10 s — **CLOSED 2026-08-14**: sweep 1. |
+| ~~CFG-030~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Non-object top-level `settings.json` degraded to `{}` with no load error — **CLOSED 2026-08-14**: sweep 1. |
+| ~~CFG-040~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | `markdown.mermaid` settings key and its getter/setter are absent — **CLOSED 2026-08-14**: sweep 1. |
+| ~~CFG-041~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | `default_model_per_provider` missing v0.84.1's `baseten` and `qwen-token-plan-individual` — **CLOSED 2026-08-14**: sweep 1. |
+| ~~CFG-043~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | An invalid `models.json` reports a serde parse error instead of pi's per-field schema report — **CLOSED 2026-08-14**: sweep 1 — the one honest gap in the new schema validator is recorded: `compat` is left to serde with a `[CYRUP-DELTA]`, because upstream's `ProviderCompatSchema` is a three-arm union of ~40 optional keys whose cyrup definition lives in `cyrup_provider::api::compat`. The typebox message strings come from the LIBRARY and could not be verified against pi source at the tag — only the surrounding format (`  - <path>: <message>`) is cited, from model-config.ts:274-277. |
+| ~~CFG-044~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | Three `auth-storage.ts` provenance cites resolve to nothing upstream, and `get_auth_status` is dead — **CLOSED 2026-08-14**: sweep 1 — closed in cyrup-config. Its last clause (updating the dangling doc at `crates/cyrup-tui/src/auth_select.rs:39-42`, which still names `auth.rs::get_auth_status`) is handed to area 07 explicitly rather than left as a silent residual. |
+| CFG-047 | low | parity-bug | S | Three built-in slash-command metadata divergences (`/model`, `/login`, `/reload`) — **2026-08-14, still open**: sweep 2 — not reached, fix site outside cyrup-config/cyrup-resources. |
+| CFG-050 | low | parity-bug | S | `migrate_tools_to_bin` moves the managed `fd`/`rg` binaries with no completion notice — **2026-08-14, still open**: sweep 2 — not reached, fix site outside cyrup-config/cyrup-resources. |
+| CFG-051 | low | parity-bug | S | The migrated-credentials notice is written to stderr pre-TUI instead of into the transcript, on a wrong cite — **2026-08-14, still open**: sweep 2 — not reached, fix site outside cyrup-config/cyrup-resources. |
+| CFG-014 | low | not-ported | M | `showCacheMissNotices` and prompt-cache-miss tracking absent — **2026-08-14, still open**: sweep 2 — the accessors are trivial in cyrup-config; every consumer is in cyrup-tui / cyrup-provider. Landing them alone is the exact "a /settings row is not a consumer" failure this area's Coverage section records. |
+| CFG-015 | low | not-ported | M | Five unconsumed settings accessors, incl. `lastChangelogVersion` and `collapseChangelog` — **2026-08-14, still open**: sweep 2 — the accessors are trivial in cyrup-config; every consumer is in cyrup-tui / cyrup-provider. Landing them alone is the exact "a /settings row is not a consumer" failure this area's Coverage section records. |
+| ~~CFG-027~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | M | A local package that is a bare extension directory contributes nothing — **CLOSED 2026-08-14**: sweep 1 (CFG-004's residual) + sweep 2 — closed in full. `resolve_configured_package` grew the third outcome the sweep-1 note predicted, as a `ConfiguredPackageResolution` enum (Tree / ExtensionFile / Skip): (1) a settings-declared LOCAL path that does not exist — or cannot be stat'ed at all, pi's `try/catch` — is now a SILENT SKIP, where cyrup emitted `"is not installed at this path — run \`cyrup install\`"`, a message doubly wrong for a local path; (2) a local entry that is a regular file registers directly into `ext_crate_paths` as an extension, never walked for a manifest and never filtered. Citations corrected to the re-derived v0.83.0 offsets: the function is package-manager.ts:1316-1345 (the in-code comment said :1301-1327), the missing-path guard :1324-1326, the FILE case :1330-1334 (item says :1331-1335), the bare-directory fallback :1338-1340 (item says :1338-1341). |
+| CFG-042 | low — **PARTIALLY CLOSED 2026-08-14** | upstream-drift | M | `FileModelsStore` does not normalize its path, cache by file revision, or accept cancellation — **PARTIALLY CLOSED 2026-08-14**: sweep 1 + 2 — path normalization and the revision-checked snapshot landed. **RESIDUAL, two halves:** the `CancelToken`/`signal` parameter on the `ModelsStore` trait (cyrup-provider) and the `BTreeMap` → insertion-ordered map swap. Sweep 2 records WHY the map half was not taken: `serde_json::Map` is a `BTreeMap` in this workspace (no `preserve_order`) and there is no ordered-map dependency, so the swap needs `indexmap` in the root `[workspace.dependencies]` — a shared file no single area agent should edit mid-sweep. Concrete consequence, so it is not re-derived: `FileModelsStore::write_all` re-sorts provider ids alphabetically on every write where pi preserves file order. |
+| CFG-021 | low | upstream-drift | L | `tuiMode` / `fullscreenScrollbar` not modelled — **2026-08-14, still open**: sweep 2 — not reached; waits on the alt-screen renderer (ADR-0005 / area 07). The settings half alone would be another inert key. |
 
 ## CFG-035 — `.cyrup/SYSTEM.md` and `APPEND_SYSTEM.md` are never discovered — the trust-gated project system-prompt override is inert
 

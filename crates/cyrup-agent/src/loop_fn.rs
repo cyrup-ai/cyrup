@@ -14,7 +14,7 @@
 //! identical, already-tested loop, so behavior is bit-for-bit the same as the high-level agent.
 
 use crate::agent::{EntryStart, RunCtx};
-use crate::error::AgentError;
+use crate::error::{AgentError, ContinueSurface};
 use crate::event::{AgentEvent, AgentMessage};
 use crate::hooks::{DefaultHooks, Hooks};
 use crate::queue::{PendingQueue, ToolExecution};
@@ -189,7 +189,12 @@ pub async fn run_agent_loop_continue(
     stream_fn: Arc<dyn StreamFn>,
 ) -> Result<Vec<AgentMessage>, AgentError> {
     if context.messages.is_empty() {
-        return Err(AgentError::NoMessages);
+        // AGENT-034 — the low-level surface has its OWN string, distinct from
+        // `Agent::continue_run`'s: `throw new Error("Cannot continue: no messages in context")`
+        // (`agent-loop.ts:71` in `agentLoopContinue`, `:128` in `runAgentLoopContinue`, identical
+        // offsets at v0.83.0 and v0.84.1). Asserted verbatim by pi's own suite at
+        // `packages/agent/test/agent-loop.test.ts:1368-1385` @v0.83.0.
+        return Err(AgentError::NoMessages(ContinueSurface::Loop));
     }
     if context.messages.last().map(|m| m.is_assistant()).unwrap_or(false) {
         return Err(AgentError::ContinueFromAssistant);
@@ -264,7 +269,12 @@ pub fn agent_loop_continue(
     stream_fn: Arc<dyn StreamFn>,
 ) -> Result<AgentLoopStream, AgentError> {
     if context.messages.is_empty() {
-        return Err(AgentError::NoMessages);
+        // AGENT-034 — the low-level surface has its OWN string, distinct from
+        // `Agent::continue_run`'s: `throw new Error("Cannot continue: no messages in context")`
+        // (`agent-loop.ts:71` in `agentLoopContinue`, `:128` in `runAgentLoopContinue`, identical
+        // offsets at v0.83.0 and v0.84.1). Asserted verbatim by pi's own suite at
+        // `packages/agent/test/agent-loop.test.ts:1368-1385` @v0.83.0.
+        return Err(AgentError::NoMessages(ContinueSurface::Loop));
     }
     if context.messages.last().map(|m| m.is_assistant()).unwrap_or(false) {
         return Err(AgentError::ContinueFromAssistant);

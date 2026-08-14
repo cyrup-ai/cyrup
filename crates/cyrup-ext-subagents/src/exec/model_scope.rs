@@ -70,6 +70,40 @@ impl ModelScopeConfig {
     }
 }
 
+/// SUBA-035 — the one-line summary of the policy actually in force, for the surfaces an operator
+/// consults when a model choice "did not apply".
+///
+/// The models report and `/subagents-doctor` are two different surfaces (upstream has the same
+/// split: `checkModelScope` reports violations, the settings surface validates the config), so this
+/// renders the compact form and the doctor keeps its own remedy-bearing one. What both must agree
+/// on is the DECISION — armed vs. present-but-inert vs. absent — which is why this reads
+/// [`ModelScopeConfig::is_armed`] rather than re-deriving the condition.
+///
+/// `strict` is named because it changes what an inherited/fallback violation DOES (SUBA-050): with
+/// it, the model an operator did not choose explicitly is a hard error rather than a warning.
+#[must_use]
+pub fn model_scope_summary_line(scope: Option<&ModelScopeConfig>) -> String {
+    let Some(scope) = scope else {
+        return "  (none configured — every resolved model is in scope)".to_string();
+    };
+    let patterns = scope.allow.as_deref().unwrap_or(&[]);
+    if !scope.is_armed() {
+        return format!(
+            "  (not enforcing — {} allow pattern(s) are inert)",
+            patterns.len()
+        );
+    }
+    format!(
+        "  enforcing ({}): allow {}",
+        if scope.strict == Some(true) {
+            "strict"
+        } else {
+            "non-strict"
+        },
+        patterns.join(", ")
+    )
+}
+
 /// Where a resolved model originated, deciding enforcement severity (pi `ModelSource`,
 /// `model-scope.ts:24`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,6 +348,55 @@ mod tests {
             strict: None,
             allow: Some(patterns.iter().map(|p| (*p).to_string()).collect()),
         }
+    }
+
+    /// SUBA-035 — the summary must distinguish the three states an operator can be in, and in
+    /// particular must NOT call a present-but-inert policy "enforcing": the whole reason the item
+    /// exists is that a policy nobody can see gets blamed for the wrong things.
+    #[test]
+    fn the_scope_summary_separates_absent_inert_and_armed() {
+        assert_eq!(
+            model_scope_summary_line(None),
+            "  (none configured — every resolved model is in scope)"
+        );
+
+        // enforce: true with NO patterns — armed-looking, enforces nothing (upstream's
+        // `if (!allow || allow.length === 0) return undefined`).
+        let empty = ModelScopeConfig {
+            enforce: Some(true),
+            strict: None,
+            allow: Some(Vec::new()),
+        };
+        assert_eq!(
+            model_scope_summary_line(Some(&empty)),
+            "  (not enforcing — 0 allow pattern(s) are inert)"
+        );
+
+        // Patterns but no `enforce` — also inert, and the count is still reported so the operator
+        // can see the list exists.
+        let unarmed = ModelScopeConfig {
+            enforce: None,
+            strict: None,
+            allow: Some(vec!["anthropic/*".to_string()]),
+        };
+        assert_eq!(
+            model_scope_summary_line(Some(&unarmed)),
+            "  (not enforcing — 1 allow pattern(s) are inert)"
+        );
+
+        assert_eq!(
+            model_scope_summary_line(Some(&scope(&["anthropic/*", "openai/gpt-5"]))),
+            "  enforcing (non-strict): allow anthropic/*, openai/gpt-5"
+        );
+
+        let mut strict = scope(&["anthropic/*"]);
+        strict.strict = Some(true);
+        assert_eq!(
+            model_scope_summary_line(Some(&strict)),
+            "  enforcing (strict): allow anthropic/*",
+            "SUBA-050's strict flag changes what an inherited/fallback violation DOES, so it has \
+             to be visible here"
+        );
     }
 
     #[test]

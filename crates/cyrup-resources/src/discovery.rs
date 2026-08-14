@@ -323,6 +323,26 @@ fn subtract_delta_shadow<T>(
     });
 }
 
+/// What a settings-declared package entry resolved to.
+///
+/// Pi's `resolveLocalExtensionSource` (package-manager.ts:1316-1345 @v0.83.0) has THREE outcomes for
+/// a local source and only one of them is a working tree, so [`resolve_configured_package`] cannot
+/// return a bare [`PackageTree`]:
+///
+/// * `:1324-1326` — the resolved path does not exist ⇒ **silent return**, no diagnostic;
+/// * `:1330-1334` — the resolved path is a FILE ⇒ it *is* the extension, registered directly with
+///   `metadata.baseDir = dirname(resolved)`;
+/// * `:1335-1341` — the resolved path is a directory ⇒ the working-tree walk (with the bare-directory
+///   fallback at `:1338-1340`).
+enum ConfiguredPackageResolution {
+    /// A directory to walk for resources — Pi `:1335-1341`.
+    Tree(Box<PackageTree>),
+    /// A single file that is itself an extension — Pi `:1330-1334`.
+    ExtensionFile(PathBuf),
+    /// Nothing to do, and nothing to say about it — Pi `:1324-1326`.
+    Skip,
+}
+
 /// Resolve a settings-declared package entry to its on-disk working tree.
 ///
 /// Pi's `resolvePackageSources` (package-manager.ts:1224-1283) resolves a `local` source against the
@@ -342,7 +362,7 @@ fn resolve_configured_package(
     declared: &ConfiguredPackage,
     all: &[ConfiguredPackage],
     cfg: &DiscoveryConfig,
-) -> Result<PackageTree, Box<ResourceDiagnostic>> {
+) -> Result<ConfiguredPackageResolution, Box<ResourceDiagnostic>> {
     let tier = declared.scope.package_resource_scope();
     let delta_base = if declared.scope == InstallScope::Project && declared.filter.is_delta() {
         all.iter()
@@ -369,7 +389,8 @@ fn resolve_configured_package(
     let id = source.package_id();
     let dir = match &source {
         // A local path resolves against the scope base dir, exactly like Pi's
-        // `resolveLocalExtensionSource` (package-manager.ts:1301-1327).
+        // `resolveLocalExtensionSource` (package-manager.ts:1316-1345 @v0.83.0), reached from
+        // `resolvePackageSources` at `:1254-1257` for every `parsed.type === "local"` entry.
         crate::package::PackageSource::Path { path } => {
             // `resolvePathFromBase` normalizes before testing absoluteness (package-manager.ts:
             // 2069-2071 → paths.ts:57-85 @v0.83.0), so `"packages": ["~/pack"]` resolves under the
@@ -377,11 +398,32 @@ fn resolve_configured_package(
             // "not installed — run `cyrup install`" diagnostic below (CFG-025).
             let normalized =
                 PathBuf::from(cyrup_config::paths::normalize_path(&path.to_string_lossy()));
-            if normalized.is_absolute() {
+            let resolved = if normalized.is_absolute() {
                 normalized
             } else {
                 base.join(normalized)
+            };
+            // package-manager.ts:1329 `statSync(resolved)` inside a `try` whose `catch` is a bare
+            // `return` (`:1343-1345`), preceded by `if (!existsSync(resolved)) return;`
+            // (`:1324-1326`). BOTH are SILENT: a local path that is absent, or that cannot be
+            // stat'ed (a broken symlink, a permission error), contributes nothing and says nothing.
+            // The "run `cyrup install`" diagnostic below is cyrup's no-network DELTA and belongs
+            // only to the git/oci arm — Pi installs those, and cannot install a local path (CFG-027).
+            let Ok(meta) = std::fs::metadata(&resolved) else {
+                return Ok(ConfiguredPackageResolution::Skip);
+            };
+            // package-manager.ts:1330-1334 — a local entry that is a FILE *is* the extension:
+            // `metadata.baseDir = dirname(resolved)` then `addResource(accumulator.extensions,
+            // resolved, metadata, true)`. It is never walked for skills/prompts/themes.
+            if meta.is_file() {
+                return Ok(ConfiguredPackageResolution::ExtensionFile(resolved));
             }
+            // `:1335` gates the walk on `stats.isDirectory()`; anything else (a fifo, a socket)
+            // falls out of both branches and returns silently.
+            if !meta.is_dir() {
+                return Ok(ConfiguredPackageResolution::Skip);
+            }
+            resolved
         }
         // git/oci: use the tree a previous `cyrup install` materialized, if any.
         _ => installed_dir(
@@ -403,6 +445,8 @@ fn resolve_configured_package(
             ))
         })?,
     };
+    // Only reachable for a git/oci source now: the local arm above has already returned for every
+    // non-directory outcome, Pi-silently.
     if !dir.is_dir() {
         return Err(Box::new(ResourceDiagnostic::error(
             ResourceKind::Package,
@@ -414,14 +458,14 @@ fn resolve_configured_package(
             ),
         )));
     }
-    Ok(PackageTree {
+    Ok(ConfiguredPackageResolution::Tree(Box::new(PackageTree {
         dir,
         id,
         tier,
         disabled: DisabledSet::default(),
         filter: declared.filter.clone(),
         delta_shadow: None,
-    })
+    })))
 }
 
 /// Whether an auto-discovered loose resource file is enabled by a settings override list. The match
@@ -548,6 +592,77 @@ pub struct DiscoveryReport {
     /// Structured diagnostics (warning | error | collision), 1:1 with Pi's `ResourceDiagnostic`
     /// surface (skills.ts; resource-loader.ts:8). Surfaced at startup and on `/reload`.
     pub diagnostics: Vec<ResourceDiagnostic>,
+    /// The discovered project/global `SYSTEM.md`, or `None` — [`discover_system_prompt_file`].
+    ///
+    /// Pi computes this inside `reload()` (`resource-loader.ts:525` @v0.83.0) and it is consumed
+    /// **only when the CLI gave no `--system-prompt`**: `this.systemPromptSource ??
+    /// this.discoverSystemPromptFile()`. The caller therefore treats this as the *fallback* for
+    /// `custom_prompt`, never as an override of it (CFG-035).
+    pub system_prompt_file: Option<PathBuf>,
+    /// The discovered project/global `APPEND_SYSTEM.md`, or `None` —
+    /// [`discover_append_system_prompt_file`].
+    ///
+    /// Pi's `reload()` (`resource-loader.ts:531-535` @v0.83.0) uses it as the SOLE entry of
+    /// `appendSources` when `this.appendSystemPromptSource` is unset — an explicit
+    /// `--append-system-prompt` REPLACES it rather than accumulating with it (CFG-035).
+    pub append_system_prompt_file: Option<PathBuf>,
+}
+
+/// The project-or-global `SYSTEM.md` that overrides the built-in system prompt.
+///
+/// Port of `ResourceLoader.discoverSystemPromptFile` (`resource-loader.ts:1022-1034` @v0.83.0,
+/// unchanged at v0.84.1):
+///
+/// 1. `<cwd>/.cyrup/SYSTEM.md` when the project is trusted **and** the file exists (`:1023-1026`);
+/// 2. otherwise `<agent_dir>/SYSTEM.md` when it exists (`:1028-1031`);
+/// 3. otherwise `None` (`:1033`).
+///
+/// The trust gate is on the PROJECT candidate only — an untrusted project falls through to the
+/// global file rather than to nothing, and a trusted project without the file does the same.
+/// cyrup already ported the trust gate that names this file
+/// (`cyrup_config::trust::has_trust_requiring_resources`) without ever porting the read, so the
+/// user was answering a security question about a file cyrup would never open.
+#[must_use]
+pub fn discover_system_prompt_file(
+    cwd: &Path,
+    agent_dir: &Path,
+    project_trusted: bool,
+) -> Option<PathBuf> {
+    discover_prompt_override(cwd, agent_dir, project_trusted, "SYSTEM.md")
+}
+
+/// The project-or-global `APPEND_SYSTEM.md` appended to the system prompt.
+///
+/// Port of `ResourceLoader.discoverAppendSystemPromptFile` (`resource-loader.ts:1036-1048`
+/// @v0.83.0) — the identical two-tier, trust-gated pair as [`discover_system_prompt_file`].
+///
+/// Pi picks exactly **one** file: the project one shadows the global one, they never accumulate.
+#[must_use]
+pub fn discover_append_system_prompt_file(
+    cwd: &Path,
+    agent_dir: &Path,
+    project_trusted: bool,
+) -> Option<PathBuf> {
+    discover_prompt_override(cwd, agent_dir, project_trusted, "APPEND_SYSTEM.md")
+}
+
+/// The shared body of Pi's two byte-identical discover functions (`resource-loader.ts:1022-1048`).
+fn discover_prompt_override(
+    cwd: &Path,
+    agent_dir: &Path,
+    project_trusted: bool,
+    filename: &str,
+) -> Option<PathBuf> {
+    // `join(this.cwd, CONFIG_DIR_NAME, filename)` — CONFIG_DIR_NAME is `.pi` upstream, `.cyrup` here.
+    let project_path = cwd.join(".cyrup").join(filename);
+    if project_trusted && project_path.exists() {
+        return Some(project_path);
+    }
+    let global_path = agent_dir.join(filename);
+    if global_path.exists() {
+        return Some(global_path);
+    }
+    None
 }
 
 /// One-shot discovery. Blocking fs work runs on `spawn_blocking`; cancellation aborts the wait.
@@ -691,7 +806,8 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             continue; // fail-closed trust gate (Pi `assertProjectTrustedForScope`, 2055-2058)
         }
         match resolve_configured_package(declared, &cfg.configured_packages, cfg) {
-            Ok(mut tree) => {
+            Ok(ConfiguredPackageResolution::Tree(tree)) => {
+                let mut tree = *tree;
                 match declared.scope {
                     InstallScope::Project if declared.filter.is_delta() => project_deltas
                         .push((declared.source.trim().to_string(), declared.filter.clone())),
@@ -705,6 +821,18 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                 }
                 trees.push(tree);
             }
+            // package-manager.ts:1330-1334 — a local FILE entry registers as an extension directly,
+            // bypassing `collectPackageResources` entirely. No manifest is read, no filter applies
+            // (Pi hands `filter` only to `collectPackageResources`, `:1337`), and it takes no part in
+            // the `dedupePackages` delta pairing, because a delta base is looked up by source string
+            // and this entry never becomes a tree.
+            Ok(ConfiguredPackageResolution::ExtensionFile(file)) => {
+                if !ext_paths.contains(&file) {
+                    ext_paths.push(file);
+                }
+            }
+            // package-manager.ts:1324-1326 / `:1343-1345` — silent by construction.
+            Ok(ConfiguredPackageResolution::Skip) => {}
             Err(diag) => diagnostics.push(*diag),
         }
     }
@@ -1164,6 +1292,19 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
         registry,
         warnings,
         diagnostics,
+        // Pi computes both inside the same `reload()` that produces the registry
+        // (`resource-loader.ts:525`, `:531-535` @v0.83.0), off the same `cwd`, `agentDir` and
+        // `isProjectTrusted()` this config carries, so they ride out on the same report (CFG-035).
+        system_prompt_file: discover_system_prompt_file(
+            &cfg.cwd,
+            &cfg.global_dir,
+            cfg.trusted_project,
+        ),
+        append_system_prompt_file: discover_append_system_prompt_file(
+            &cfg.cwd,
+            &cfg.global_dir,
+            cfg.trusted_project,
+        ),
     })
 }
 

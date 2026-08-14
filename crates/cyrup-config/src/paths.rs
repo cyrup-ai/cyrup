@@ -7,6 +7,10 @@
 //!
 //! cyrup previously had one private `expand_tilde` in `settings.rs` wired to two getters, so every
 //! higher-precedence tier took its path raw (CFG-025, CFG-036).
+//!
+//! The body also carries `normalizeWindowsShellPath` (`paths.ts:66-73`, `:83-85` @v0.84.1), which is
+//! a v0.84.1 addition rather than part of the v0.83.0 baseline — see
+//! [`normalize_windows_shell_path`] and DRIFT-046.
 
 use std::path::PathBuf;
 
@@ -28,6 +32,16 @@ pub fn normalize_path(input: &str) -> String {
 /// (`paths.ts:66`). `home = None` reproduces the "no home resolvable" case by leaving a `~` form
 /// untouched.
 pub fn normalize_path_with_home(input: &str, home: Option<&std::path::Path>) -> String {
+    // `if (process.platform === "win32") { normalized = normalizeWindowsShellPath(normalized); }`
+    // (paths.ts:83-85 @v0.84.1) — BEFORE the tilde expansion, and inside the shared normalizer
+    // rather than at any call site. DRIFT-046.
+    let owned;
+    let input = if cfg!(windows) {
+        owned = normalize_windows_shell_path(input);
+        owned.as_str()
+    } else {
+        input
+    };
     if let Some(home) = home {
         if input == "~" {
             return home.to_string_lossy().into_owned();
@@ -50,6 +64,50 @@ pub fn normalize_path_with_home(input: &str, home: Option<&std::path::Path>) -> 
         return path;
     }
     input.to_string()
+}
+
+/// Convert Git Bash, MSYS, Cygwin and WSL drive paths to a form native Windows APIs accept.
+///
+/// Port of `normalizeWindowsShellPath` (`pi/packages/coding-agent/src/utils/paths.ts:66-73`
+/// @v0.84.1, added by `9524d3a58` — absent at v0.83.0). Upstream is a regex,
+/// `/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i`, behind three guard clauses; this is the same
+/// grammar hand-parsed, because `cyrup-config` carries no regex dependency.
+///
+/// The hand parse does not backtrack where the regex would, which is unobservable: the only inputs
+/// that would need a backtrack are ones where `mnt/`/`cygdrive/` is followed by something that is
+/// not a single drive letter (`/mnt/2`, `/mnt/mnt/e`), and the regex rejects those on the retry too.
+///
+/// Compiled on every platform so the upstream unit tests can drive it directly, exactly as
+/// `test/paths.test.ts:133-150` does; only its APPLICATION in [`normalize_path_with_home`] is
+/// `cfg!(windows)`-gated, mirroring `paths.ts:83-85`.
+#[must_use]
+pub fn normalize_windows_shell_path(file_path: &str) -> String {
+    // `if (!filePath.startsWith("/") || filePath.startsWith("//") || filePath.includes("\\"))`
+    // (paths.ts:68) — a relative path, a UNC path, and anything already in Windows form pass through.
+    if !file_path.starts_with('/') || file_path.starts_with("//") || file_path.contains('\\') {
+        return file_path.to_string();
+    }
+    let rest = &file_path[1..];
+    let rest = rest
+        .strip_prefix("mnt/")
+        .or_else(|| rest.strip_prefix("cygdrive/"))
+        .unwrap_or(rest);
+    let mut chars = rest.chars();
+    let Some(drive) = chars.next().filter(char::is_ascii_alphabetic) else {
+        return file_path.to_string();
+    };
+    let after = &rest[drive.len_utf8()..];
+    // `(?:\/(.*))?$` — either the drive letter ends the string, or a `/` and the rest.
+    let suffix = if after.is_empty() {
+        String::new()
+    } else if let Some(tail) = after.strip_prefix('/') {
+        // `match[2]?.replaceAll("/", "\\")` (paths.ts:71).
+        tail.replace('/', "\\")
+    } else {
+        return file_path.to_string();
+    };
+    // `${match[1].toUpperCase()}:\\${suffix ?? ""}` (paths.ts:72) — a bare `/c` becomes `C:\`.
+    format!("{}:\\{suffix}", drive.to_ascii_uppercase())
 }
 
 /// [`normalize_path`] returning a [`PathBuf`].
@@ -155,6 +213,39 @@ mod tests {
             normalize_path_with_home("file://localhost/abs/pack", None),
             "/abs/pack"
         );
+    }
+
+    /// `pi/packages/coding-agent/test/paths.test.ts:134-139` @v0.84.1, verbatim. DRIFT-046.
+    #[test]
+    fn converts_git_bash_msys_cygwin_and_wsl_drive_paths() {
+        assert_eq!(
+            normalize_windows_shell_path("/c/Users/example/project"),
+            "C:\\Users\\example\\project"
+        );
+        assert_eq!(normalize_windows_shell_path("/cygdrive/d/work"), "D:\\work");
+        assert_eq!(normalize_windows_shell_path("/mnt/e/source"), "E:\\source");
+        assert_eq!(normalize_windows_shell_path("/c"), "C:\\");
+    }
+
+    /// `test/paths.test.ts:141-150` @v0.84.1 — the pass-through list, which is what stops the rule
+    /// from mangling legitimate POSIX paths.
+    #[test]
+    fn leaves_other_path_forms_unchanged() {
+        for path in [
+            "C:/Users/example",
+            "C:\\Users\\example",
+            "//server/share/file",
+            "/c/Users\\example",
+            "relative/file",
+            "/tmp/file",
+        ] {
+            assert_eq!(normalize_windows_shell_path(path), path, "{path}");
+        }
+        // Cases the upstream list does not name but the grammar decides: a drive-letter prefix that
+        // is not a whole segment, and a `mnt`/`cygdrive` prefix not followed by a drive letter.
+        for path in ["/mnt", "/mnt/", "/mnt/2", "/mnt/mnt/e", "/", "/1/x"] {
+            assert_eq!(normalize_windows_shell_path(path), path, "{path}");
+        }
     }
 
     #[test]

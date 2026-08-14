@@ -22,6 +22,7 @@ pub mod azure_openai_responses;
 pub mod bedrock_converse_stream;
 pub mod github_copilot_headers;
 pub mod google_generative_ai;
+pub mod google_vertex;
 pub mod mistral_conversations;
 pub mod openai_codex_responses;
 pub mod openai_completions;
@@ -149,6 +150,10 @@ pub fn register_builtins(reg: &mut ApiRegistry) {
     reg.register(
         ApiId::from(crate::known_api::GOOGLE_GENERATIVE_AI),
         google_generative_ai::factory,
+    );
+    reg.register(
+        ApiId::from(crate::known_api::GOOGLE_VERTEX),
+        google_vertex::factory,
     );
     reg.register(ApiId::from(crate::known_api::PI_MESSAGES), pi_messages::factory);
     reg.register(

@@ -368,8 +368,13 @@ impl OpenRouterOAuth {
         format!("{}?{params}", self.authorize_url)
     }
 
-    fn client(&self) -> Result<reqwest::Client, OAuthError> {
-        crate::stream::sse::build_client().map_err(|e| OAuthError::Failed(e.to_string()))
+    /// PROV-047: proxy-aware, per target. `build_client()` consulted neither the ported resolver
+    /// nor the `httpProxy` setting, so every OAuth token exchange and silent refresh bypassed a
+    /// configured proxy while provider streaming used it.
+    async fn client(&self, target_url: &str) -> Result<reqwest::Client, OAuthError> {
+        crate::stream::sse::build_client_for(target_url)
+            .await
+            .map_err(|e| OAuthError::Failed(e.to_string()))
     }
 
     /// 1:1 port of `exchangeAuthorizationCode` (`openrouter.ts:80-133`).
@@ -386,7 +391,7 @@ impl OpenRouterOAuth {
         if cancel.is_some_and(CancelToken::is_cancelled) {
             return Err(OAuthError::Cancelled);
         }
-        let client = self.client()?;
+        let client = self.client(&self.token_url).await?;
         // `:100`
         let payload = serde_json::json!({
             "code": code,

@@ -26,6 +26,9 @@ use crate::model::{Modality, Model};
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
+use crate::utils::constrained_sampling::{
+    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+};
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
 use crate::utils::provider_retry::ProviderRetry;
@@ -109,9 +112,19 @@ impl ApiImpl for MistralConversationsApi {
             }
         };
 
+        // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
+        // pi's own message.
+        let params = match build_chat_payload(model, ctx, opts) {
+            Ok(p) => p,
+            Err(e) => {
+                let e = ProviderError::from(e);
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
+                return;
+            }
+        };
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
-        let body =
-            crate::stream::apply_on_payload(opts, model, build_chat_payload(model, ctx, opts)).await;
+        let body = crate::stream::apply_on_payload(opts, model, params).await;
         let headers = build_headers(model, opts, &api_key);
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -301,11 +314,16 @@ pub struct MistralOptions {
 #[cfg(test)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
     build_chat_payload(model, ctx, opts)
+        .expect("fixture declares no unsatisfiable constrained sampling")
 }
 
 /// Build the `chat/completions` request body (1:1 port of Pi `buildChatPayload` + the `streamSimple`
 /// reasoning lowering, mistral-conversations.ts:110-131,240-268).
-pub(crate) fn build_chat_payload(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
+pub(crate) fn build_chat_payload(
+    model: &Model,
+    ctx: &Context,
+    opts: &StreamOptions,
+) -> Result<Value, ConstrainedSamplingError> {
     let supports_images = model.input.contains(&Modality::Image);
 
     // Stateful 9-char tool-call-id normalizer (Pi createMistralToolCallIdNormalizer).
@@ -330,7 +348,7 @@ pub(crate) fn build_chat_payload(model: &Model, ctx: &Context, opts: &StreamOpti
     if !ctx.tools.is_empty() {
         obj.insert(
             "tools".to_string(),
-            Value::Array(to_function_tools(&ctx.tools)),
+            Value::Array(to_function_tools(&ctx.tools)?),
         );
     }
     if let Some(temp) = opts.temperature {
@@ -365,7 +383,7 @@ pub(crate) fn build_chat_payload(model: &Model, ctx: &Context, opts: &StreamOpti
         obj.insert("promptCacheKey".to_string(), json!(sid));
     }
 
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 /// Lower the unified reasoning level to Mistral's `promptMode`/`reasoningEffort` pair (Pi
@@ -435,20 +453,29 @@ fn map_tool_choice(tc: &ToolChoice) -> Value {
     }
 }
 
-/// Convert tools to Mistral `FunctionTool`s (Pi `toFunctionTools`, mistral-conversations.ts:485-495).
-pub(crate) fn to_function_tools(tools: &[ToolDef]) -> Vec<Value> {
+/// Convert tools to Mistral `FunctionTool`s (Pi `toFunctionTools`,
+/// `mistral-conversations.ts:495-507` @**v0.83.0**).
+///
+/// PROV-011 — `strict` is `resolveJsonSchemaStrictSampling(tool, true) ?? false` (`:497`). Mistral
+/// is the one route that passes `true` unconditionally: every Mistral model supports strict
+/// schemas, so a `strict: "require"` tool can never fail here and the resolver is infallible in
+/// practice — the `Result` is kept so the call reads exactly like pi's.
+pub(crate) fn to_function_tools(
+    tools: &[ToolDef],
+) -> Result<Vec<Value>, ConstrainedSamplingError> {
     tools
         .iter()
         .map(|t| {
-            json!({
+            let strict = resolve_json_schema_strict_sampling(t, true)?;
+            Ok(json!({
                 "type": "function",
                 "function": {
                     "name": t.name,
                     "description": t.description,
                     "parameters": t.parameters,
-                    "strict": false,
+                    "strict": strict.unwrap_or(false),
                 },
-            })
+            }))
         })
         .collect()
 }
@@ -1569,6 +1596,7 @@ mod tests {
             name: "read".to_string(),
             description: "Read a file".to_string(),
             parameters: json!({ "type": "object", "properties": { "p": { "type": "string" } } }),
+            constrained_sampling: None,
         }];
         let m = model_with("codestral-latest", false);
         let opts = StreamOptions {

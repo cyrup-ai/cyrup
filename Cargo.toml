@@ -185,6 +185,14 @@ reqwest              = { version = "0.13.4", default-features = false, features 
 eventsource-stream   = { version = "0.2.3" }
 bytes                = { version = "1" }
 base64               = { version = "0.22" }
+# PROV-030 — RS256 signing for the Google Vertex ADC `service_account` arm. pi delegates the whole
+# credential problem to `@google/genai` → `google-auth-library`, which mints a bearer by signing a
+# JWT assertion with the service account's RSA key (`api/google-vertex.ts:327-339` @v0.83.0); cyrup
+# has no SDK to delegate to, so `cyrup-provider/src/auth/google_adc.rs` performs that signature.
+# ADDS NO NEW CRATE TO THE GRAPH: `ring` 0.17 is already resolved in Cargo.lock as a transitive
+# dependency of `rustls` (via `reqwest`'s rustls feature) and `quinn-proto`, so this is a direct
+# edge onto something already compiled, not a new third-party surface.
+ring                 = { version = "0.17" }
 # `cyrup-ext-subagents`'s mission store validates a delivery receipt's URL by CONSTRUCTING one —
 # pi does `new URL(url)` and treats a throw as "not an absolute URL"
 # (`pi-subagents/src/missions/store.ts:170-174`, `actions.ts:161-165`). `url` implements the same

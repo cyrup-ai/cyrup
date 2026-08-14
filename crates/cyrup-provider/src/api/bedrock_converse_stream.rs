@@ -60,6 +60,9 @@ use crate::model::Model;
 use crate::stream::sse::build_client_for_target_forcing_http1;
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::compute_cost;
+use crate::utils::constrained_sampling::{
+    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+};
 use crate::utils::error_body::normalize_error_body;
 use crate::utils::provider_retry::{ProviderRetry, is_retryable_provider_error, retry_delay_ms};
 use crate::utils::json_parse::parse_streaming_json_object;
@@ -1207,7 +1210,16 @@ fn build_params(
     }
     obj.insert("inferenceConfig".to_string(), Value::Object(inference));
 
-    if let Some(tool_config) = convert_tool_config(&ctx.tools, bedrock.tool_choice.as_ref()) {
+    // pi `:238` reads `model.compat?.supportsStrictMode ?? false` at the call site.
+    let supports_strict_mode = model
+        .compat
+        .as_ref()
+        .and_then(|c| c.supports_strict_mode)
+        .unwrap_or(false);
+    if let Some(tool_config) =
+        convert_tool_config(&ctx.tools, bedrock.tool_choice.as_ref(), supports_strict_mode)
+            .map_err(|e| e.0)?
+    {
         obj.insert("toolConfig".to_string(), tool_config);
     }
     if let Some(extra) =
@@ -1606,33 +1618,45 @@ fn convert_messages(
     Ok(result)
 }
 
-/// pi `convertToolConfig` (`bedrock-converse-stream.ts:925-960`).
-fn convert_tool_config(tools: &[ToolDef], tool_choice: Option<&BedrockToolChoice>) -> Option<Value> {
+/// pi `convertToolConfig` (`bedrock-converse-stream.ts:925-960` @**v0.83.0**).
+///
+/// PROV-011 — `strict: true` is emitted only when `resolveJsonSchemaStrictSampling` resolves it
+/// (`:934`, `:940`), against `model.compat?.supportsStrictMode ?? false` read at `:238`.
+fn convert_tool_config(
+    tools: &[ToolDef],
+    tool_choice: Option<&BedrockToolChoice>,
+    supports_strict_mode: bool,
+) -> Result<Option<Value>, ConstrainedSamplingError> {
     if tools.is_empty() {
-        return None;
+        return Ok(None);
     }
     if matches!(tool_choice, Some(BedrockToolChoice::None)) {
-        return None;
+        return Ok(None);
     }
     let bedrock_tools: Vec<Value> = tools
         .iter()
         .map(|tool| {
-            json!({
-                "toolSpec": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": { "json": tool.parameters },
-                }
-            })
+            let strict = resolve_json_schema_strict_sampling(tool, supports_strict_mode)?;
+            let mut spec = Map::new();
+            spec.insert("name".to_string(), json!(tool.name));
+            spec.insert("description".to_string(), json!(tool.description));
+            spec.insert(
+                "inputSchema".to_string(),
+                json!({ "json": tool.parameters }),
+            );
+            if strict == Some(true) {
+                spec.insert("strict".to_string(), json!(true));
+            }
+            Ok(json!({ "toolSpec": Value::Object(spec) }))
         })
-        .collect();
+        .collect::<Result<Vec<Value>, ConstrainedSamplingError>>()?;
 
     let mut config = Map::new();
     config.insert("tools".to_string(), Value::Array(bedrock_tools));
     if let Some(choice) = tool_choice.and_then(BedrockToolChoice::to_wire) {
         config.insert("toolChoice".to_string(), choice);
     }
-    Some(Value::Object(config))
+    Ok(Some(Value::Object(config)))
 }
 
 /// pi `buildAdditionalModelRequestFields` (`bedrock-converse-stream.ts:1039-1087`).
@@ -3600,6 +3624,7 @@ mod tests {
                 name: "lookup".to_string(),
                 description: "Look up a value".to_string(),
                 parameters: json!({ "type": "object", "properties": {} }),
+                constrained_sampling: None,
             }],
         }
     }

@@ -94,12 +94,34 @@ fn collect(session: &crate::AgentSession) -> Arc<Mutex<Vec<AgentSessionEvent>>> 
     seen
 }
 
-/// Let the collector task drain whatever is already queued.
-async fn settle() {
-    for _ in 0..10 {
+/// Let the collector task drain whatever is already queued, detected by OBSERVING the buffer go
+/// quiescent instead of by sleeping a fixed 50 ms (DRIFT-036).
+///
+/// Every caller reaches here after the operation under test has already returned, so the only work
+/// left is in-process hops (fan-out → subscription → the collector task) with no timer anywhere in
+/// the chain. `yield_now` lets every ready task run, so "the length stopped changing across
+/// [`QUIESCENT_YIELDS`] consecutive yields" is an observation of the state the assertions read, not
+/// a guess about how long it takes. The outer bound turns a stuck pipeline into a named failure
+/// rather than a hang, and is never itself the assertion.
+async fn settle(seen: &Arc<Mutex<Vec<AgentSessionEvent>>>) {
+    /// Consecutive no-growth yields that count as drained.
+    const QUIESCENT_YIELDS: u32 = 64;
+    let mut last = usize::MAX;
+    let mut stable = 0u32;
+    for _ in 0..20_000 {
+        let now = seen.lock().unwrap().len();
+        if now == last {
+            stable += 1;
+            if stable >= QUIESCENT_YIELDS {
+                return;
+            }
+        } else {
+            last = now;
+            stable = 0;
+        }
         tokio::task::yield_now().await;
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    panic!("the event collector never went quiescent: {:?}", kinds(seen));
 }
 
 fn kinds(seen: &Arc<Mutex<Vec<AgentSessionEvent>>>) -> Vec<String> {
@@ -148,7 +170,7 @@ async fn a_retried_compaction_appends_exactly_one_compaction_entry() {
 
     let before = session.entries_json().await.len();
     let result = session.compact(None).await.expect("the drop is retried and the compaction lands");
-    settle().await;
+    settle(&seen).await;
 
     // The SUCCEEDING attempt's text is what got stored — not the failed attempt's empty body.
     assert!(
@@ -214,7 +236,7 @@ async fn a_dropped_summarization_emits_the_retry_events_in_pi_order() {
     let seen = collect(&session);
 
     session.compact(None).await.expect("compaction lands after the retry");
-    settle().await;
+    settle(&seen).await;
 
     let k = kinds(&seen);
     let idx = |name: &str| k.iter().position(|s| s == name).unwrap_or_else(|| panic!("{name} missing from {k:?}"));
@@ -243,7 +265,7 @@ async fn the_retry_events_serialize_to_pi_s_exact_shapes() {
     let seen = collect(&session);
 
     session.compact(None).await.expect("compaction lands after the retry");
-    settle().await;
+    settle(&seen).await;
 
     let json: Vec<serde_json::Value> =
         seen.lock().unwrap().iter().map(|e| serde_json::to_value(e).unwrap()).collect();
@@ -309,7 +331,7 @@ async fn a_first_try_success_emits_no_retry_events_at_all() {
 
     let seen = collect(&session);
     session.compact(None).await.expect("a clean compaction");
-    settle().await;
+    settle(&seen).await;
 
     let k = kinds(&seen);
     assert!(
@@ -349,7 +371,7 @@ async fn an_unrecoverable_drop_stops_after_exactly_max_retries() {
         .await
         .expect("a bounded retry MUST terminate — an unbounded one would wedge the session here")
         .expect_err("an unrecoverable summarization fails the compaction");
-    settle().await;
+    settle(&seen).await;
 
     assert!(err.to_string().contains("terminated"), "the final provider error surfaces: {err}");
     let k = kinds(&seen);
@@ -435,7 +457,7 @@ async fn aborting_during_the_retry_backoff_returns_promptly() {
         .expect("abort must cut through the 30s backoff sleep, not wait it out")
         .expect("join");
     assert!(outcome.is_err(), "an aborted compaction is a refusal, not a result");
-    settle().await;
+    settle(&seen).await;
     assert_eq!(
         session.entries_json().await.len(),
         before,
@@ -495,7 +517,7 @@ async fn a_dropped_branch_summarization_emits_retry_events_tagged_branch_summary
         )
         .await
         .expect("the drop is retried and the branch summary still lands");
-    settle().await;
+    settle(&seen).await;
 
     let entry = outcome.summary_entry.expect("a branch summary entry was appended");
     assert!(
@@ -570,7 +592,7 @@ async fn branch_with_summary_also_emits_the_retry_events() {
         .branch_with_summary(u1, true)
         .await
         .expect("the drop is retried and the branch summary still lands");
-    settle().await;
+    settle(&seen).await;
 
     assert!(
         summary.is_some_and(|s| s.contains("BRANCH-BODY")),
@@ -610,7 +632,7 @@ async fn execute_bash_emits_bash_execution_update_even_with_no_chunk_sink() {
         )
         .await
         .expect("bash runs");
-    settle().await;
+    settle(&seen).await;
     assert!(result.output.contains("alpha"), "sanity: the command produced output");
 
     let updates: Vec<serde_json::Value> = seen
@@ -651,7 +673,7 @@ async fn bash_execution_update_omits_id_when_the_caller_supplied_none() {
         )
         .await
         .expect("bash runs");
-    settle().await;
+    settle(&seen).await;
 
     let updates: Vec<serde_json::Value> = seen
         .lock()

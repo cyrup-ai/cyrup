@@ -71,6 +71,7 @@
 pub mod agent_start_cache;
 pub mod ask;
 pub mod common;
+pub mod config_modal;
 pub mod dedup;
 pub mod error;
 pub mod evaluate;

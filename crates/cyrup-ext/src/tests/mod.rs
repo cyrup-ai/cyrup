@@ -13,6 +13,7 @@
 //! moved (`cyrup_ext::X` -> `crate::X`).
 
 mod aggregation;
+mod capability_handle_ownership;
 mod entry_renderer;
 mod ext_fail_closed;
 mod extension_flag_diagnostics;
@@ -25,6 +26,7 @@ mod native_ctx_state;
 mod payload_and_seam_parity;
 mod native_dispatch;
 mod project_trust_shortcircuit;
+mod trust_gate_order;
 mod provider;
 mod wasm_host;
 mod wit_world_sync;

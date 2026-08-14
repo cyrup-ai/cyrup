@@ -34,6 +34,18 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
     }
     let v: &'static [&'static str] = match provider {
         "ant-ling" => &["ANT_LING_API_KEY"],
+        // env-api-keys.ts:81-82 @v0.83.0. Both were MISSING: `default_model_per_provider` and
+        // `KNOWN_PROVIDERS` already carry these two ids (CFG-019, `model.rs`), so cyrup knew the
+        // providers and then reported a user who had exported `QWEN_TOKEN_PLAN_API_KEY` as having
+        // no credential at all — `find_env_keys` returned `None`, so `provider_auth_status` said
+        // `configured: false`, `provider_is_configured` skipped the provider at launch steps 1/4,
+        // `/login` listed it as unconfigured, and `get_env_api_key` handed the request builder
+        // nothing.
+        "qwen-token-plan" => &["QWEN_TOKEN_PLAN_API_KEY"],
+        "qwen-token-plan-cn" => &["QWEN_TOKEN_PLAN_CN_API_KEY"],
+        // env-api-keys.ts:83 @v0.84.1 — deliberately the SAME variable as `qwen-token-plan`, not a
+        // `_INDIVIDUAL_` spelling. Upstream drift, landed with the id itself (CFG-041).
+        "qwen-token-plan-individual" => &["QWEN_TOKEN_PLAN_API_KEY"],
         "openai" => &["OPENAI_API_KEY"],
         "azure-openai-responses" => &["AZURE_OPENAI_API_KEY"],
         "nvidia" => &["NVIDIA_API_KEY"],
@@ -43,6 +55,10 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "groq" => &["GROQ_API_KEY"],
         "cerebras" => &["CEREBRAS_API_KEY"],
         "xai" => &["XAI_API_KEY"],
+        // env-api-keys.ts:92 @v0.83.0. Also missing, and `radius` is a first-class id in cyrup:
+        // `default_model_per_provider` (`model.rs`) maps it to `auto` and `models.json`'s
+        // `oauth: Type.Literal("radius")` is the only accepted oauth value there.
+        "radius" => &["RADIUS_API_KEY"],
         "openrouter" => &["OPENROUTER_API_KEY"],
         "vercel-ai-gateway" => &["AI_GATEWAY_API_KEY"],
         "zai" => &["ZAI_API_KEY"],
@@ -55,6 +71,8 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "huggingface" => &["HF_TOKEN"],
         "fireworks" => &["FIREWORKS_API_KEY"],
         "together" => &["TOGETHER_API_KEY"],
+        // env-api-keys.ts:106 @v0.84.1 — upstream drift, landed with the id itself (CFG-041).
+        "baseten" => &["BASETEN_API_KEY"],
         "opencode" => &["OPENCODE_API_KEY"],
         "opencode-go" => &["OPENCODE_API_KEY"],
         "kimi-coding" => &["KIMI_API_KEY"],
@@ -159,6 +177,80 @@ mod tests {
             Some(&["COPILOT_GITHUB_TOKEN"][..])
         );
         assert_eq!(api_key_env_vars("totally-unknown-provider"), None);
+    }
+
+    /// The whole `envMap` (`ai/src/env-api-keys.ts:79-114` @v0.84.1), key for key, so the next
+    /// upstream addition fails loudly instead of silently reporting a credentialled provider as
+    /// unconfigured.
+    ///
+    /// Red at HEAD for FIVE rows. Three were baseline misses present at **v0.83.0** —
+    /// `qwen-token-plan` (`:81`), `qwen-token-plan-cn` (`:82`) and `radius` (`:92`) — and two are
+    /// v0.84.1 additions whose sibling half already landed in `model.rs` under CFG-041:
+    /// `qwen-token-plan-individual` (`:83`) and `baseten` (`:106`). All five are ids cyrup already
+    /// knows in `default_model_per_provider` / `KNOWN_PROVIDERS`, so the effect was a user with the
+    /// documented variable exported being told the provider had no credential.
+    #[test]
+    fn the_env_var_map_matches_pi_key_for_key() {
+        // (provider, env vars) exactly as upstream declares them, in upstream's order.
+        let expected: &[(&str, &[&str])] = &[
+            ("github-copilot", &["COPILOT_GITHUB_TOKEN"]),
+            ("ant-ling", &["ANT_LING_API_KEY"]),
+            ("qwen-token-plan", &["QWEN_TOKEN_PLAN_API_KEY"]),
+            ("qwen-token-plan-cn", &["QWEN_TOKEN_PLAN_CN_API_KEY"]),
+            ("qwen-token-plan-individual", &["QWEN_TOKEN_PLAN_API_KEY"]),
+            ("openai", &["OPENAI_API_KEY"]),
+            ("azure-openai-responses", &["AZURE_OPENAI_API_KEY"]),
+            ("nvidia", &["NVIDIA_API_KEY"]),
+            ("deepseek", &["DEEPSEEK_API_KEY"]),
+            ("google", &["GEMINI_API_KEY"]),
+            ("google-vertex", &["GOOGLE_CLOUD_API_KEY"]),
+            ("groq", &["GROQ_API_KEY"]),
+            ("cerebras", &["CEREBRAS_API_KEY"]),
+            ("xai", &["XAI_API_KEY"]),
+            ("radius", &["RADIUS_API_KEY"]),
+            ("openrouter", &["OPENROUTER_API_KEY"]),
+            ("vercel-ai-gateway", &["AI_GATEWAY_API_KEY"]),
+            ("zai", &["ZAI_API_KEY"]),
+            ("zai-coding-cn", &["ZAI_CODING_CN_API_KEY"]),
+            ("mistral", &["MISTRAL_API_KEY"]),
+            ("minimax", &["MINIMAX_API_KEY"]),
+            ("minimax-cn", &["MINIMAX_CN_API_KEY"]),
+            ("moonshotai", &["MOONSHOT_API_KEY"]),
+            ("moonshotai-cn", &["MOONSHOT_API_KEY"]),
+            ("huggingface", &["HF_TOKEN"]),
+            ("fireworks", &["FIREWORKS_API_KEY"]),
+            ("together", &["TOGETHER_API_KEY"]),
+            ("baseten", &["BASETEN_API_KEY"]),
+            ("opencode", &["OPENCODE_API_KEY"]),
+            ("opencode-go", &["OPENCODE_API_KEY"]),
+            ("kimi-coding", &["KIMI_API_KEY"]),
+            ("cloudflare-workers-ai", &["CLOUDFLARE_API_KEY"]),
+            ("cloudflare-ai-gateway", &["CLOUDFLARE_API_KEY"]),
+            ("xiaomi", &["XIAOMI_API_KEY"]),
+            ("xiaomi-token-plan-cn", &["XIAOMI_TOKEN_PLAN_CN_API_KEY"]),
+            ("xiaomi-token-plan-ams", &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"]),
+            ("xiaomi-token-plan-sgp", &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"]),
+        ];
+        for (provider, vars) in expected {
+            assert_eq!(
+                api_key_env_vars(provider),
+                Some(*vars),
+                "{provider} does not match pi's envMap"
+            );
+        }
+
+        // `anthropic` is special-cased ahead of the map (`:75-77`). cyrup carries TWO of upstream's
+        // three names: `ANTHROPIC_AUTH_TOKEN` is deliberately absent because a request must send it
+        // as `Authorization: Bearer` rather than as an api key, and that provider-side half is
+        // PROV-021 / DRIFT-030 in `cyrup-provider`. Listing it here without that half would report
+        // a provider as configured and then fail every request — strictly worse than reporting it
+        // unconfigured. Pinned so the two halves land together.
+        assert_eq!(
+            api_key_env_vars("anthropic"),
+            Some(&["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"][..]),
+            "adding ANTHROPIC_AUTH_TOKEN here requires the bearer-header half (PROV-021) and \
+             `get_env_api_key`'s skip rule (env-api-keys.ts:147 @v0.83.0) in the same change"
+        );
     }
 
     #[test]

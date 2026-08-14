@@ -742,6 +742,25 @@ impl SubagentExecutor {
             .map(str::to_string)
     }
 
+    /// SUBA-031 — the LIVE session identity, cyrup's analog of pi's `state.currentSessionId` /
+    /// `ctx.currentSessionId` (`async-execution.ts:1042` @v0.43.0).
+    ///
+    /// Read straight off the bound P-1 backend on every call rather than off
+    /// [`Self::root_parent_session`], for two reasons: `root_parent_session` is captured once at a
+    /// PARENT-role `SessionStart` (so a fanout child, which legitimately owns its own async root,
+    /// has none), and a session SWITCH inside one process moves the live id while the captured
+    /// anchor deliberately keeps addressing the root. Everything that scopes a listing wants the
+    /// former; only forwarding wants the latter.
+    ///
+    /// `None`/empty (headless, unpersisted, or no host services bound) means "no session identity",
+    /// which every consumer treats as pi treats a falsy `sessionId`: no filter, no stamp.
+    #[must_use]
+    pub fn current_session_id(&self) -> Option<String> {
+        self.host_services()
+            .and_then(|services| services.session_id())
+            .filter(|id| !id.is_empty())
+    }
+
     /// Reserve `requested` subagent spawns against THIS session's budget (pi `reserveSubagentSpawns`,
     /// `runs/foreground/subagent-executor.ts:266-282`), returning pi's exact over-limit text on
     /// breach and `Ok(())` otherwise.
@@ -1916,7 +1935,17 @@ impl SubagentExecutor {
             enabled: overrides.artifacts != Some(false),
             ..crate::artifacts::ArtifactConfig::foreground()
         };
-        let art_dir = crate::artifacts::temp_artifacts_dir(cwd);
+        // SUBA-048 — pi `artifactsDir: getArtifactsDir(parentSessionFile, effectiveCwd,
+        // artifactConfig.dir)` (`subagent-executor.ts:1431`/`:1471`/`:5037` @v0.43.0). This site
+        // used to call `temp_artifacts_dir(cwd)` directly, which pinned every foreground run to the
+        // temp root and made all three `artifactDir` preferences — including upstream's `project`
+        // DEFAULT — unreachable.
+        let art_dir = crate::artifacts::resolve_artifacts_dir(
+            self.host_services().and_then(|s| s.session_file()).as_deref(),
+            Some(cwd),
+            cwd,
+            cfg.artifact_dir_preference(),
+        );
 
         // SUBA-041 / pi `resolveSingleRunOutputBaseDir` (`subagent-executor.ts:2838-2842`): the
         // configured `singleRunOutputBaseDir` (tilde-expanded, `path.resolve`d) wins, else
@@ -1964,6 +1993,15 @@ impl SubagentExecutor {
             timeout_ms,
             output_path,
             output_mode,
+            // SUBA-054 / pi `const reads = readsOverride !== undefined ? readsOverride :
+            // agentConfig.defaultReads ?? false` (`subagent-executor.ts:3869` @v0.47.1). cyrup's
+            // SINGLE surface advertises no top-level `reads` — and neither does upstream's
+            // (`extension/schemas.ts`'s `SubagentParamProperties` has no `reads` key; the three
+            // `reads` entries at `:144`, `:174` and `:204` are all per-ITEM), so the persona's own
+            // `defaultReads` IS the whole precedence chain here. Before this it never left
+            // frontmatter: the bundled `reviewer` shipped `defaultReads: plan.md, progress.md` and
+            // was never told to read either file.
+            reads: agent.default_reads.clone(),
             // SUBA-043 / pi `runSinglePath` (`subagent-executor.ts:3651,3671` @v0.43.0): the
             // top-level `outputSchema` param reaches the SINGLE run here. Pinned `None` until now,
             // which is what made SUBA-S01's capture machinery unreachable from the single surface.
@@ -2281,7 +2319,16 @@ impl SubagentExecutor {
             enabled: artifacts != Some(false),
             ..crate::artifacts::ArtifactConfig::foreground()
         };
-        let art_dir = crate::artifacts::temp_artifacts_dir(cwd);
+        // SUBA-048 (async half) — pi resolves `artifactsDir` the same way before handing it to
+        // `executeAsyncSingle` (`subagent-executor.ts:1471`, consumed at
+        // `async-execution.ts:989`/`:1037`). Same defect as the foreground site: a hard-coded temp
+        // root made the `artifactDir` preference, and upstream's `project` default, unreachable.
+        let art_dir = crate::artifacts::resolve_artifacts_dir(
+            self.host_services().and_then(|s| s.session_file()).as_deref(),
+            Some(cwd),
+            cwd,
+            cfg.artifact_dir_preference(),
+        );
         let output_base_dir = resolve_single_run_output_base_dir(&cfg, &art_dir, &run_id);
 
         // pi `async-execution.ts:905-907` (`normalizeSingleOutputOverride(params.output,
@@ -2550,6 +2597,10 @@ impl SubagentExecutor {
             steps,
             cwd: cwd.to_path_buf(),
             session_file,
+            // SUBA-031 (pi `sessionId: ctx.currentSessionId`, `async-execution.ts:1042`): the
+            // launching session, carried into the one-shot config so the detached runner can stamp
+            // it onto `status.json` and every session-scoped listing can honour it.
+            session_id: self.current_session_id(),
             global_concurrency_limit: cfg.global_concurrency_limit as usize,
             worktree_base_dir: cfg.worktree_base_dir,
             max_subagent_depth: cfg.max_subagent_depth,
@@ -2996,7 +3047,12 @@ impl SubagentExecutor {
         // step's relative `output` against it. The `unwrap_or_else` fallback keeps cyrup's existing
         // per-run subdirectory ([CYRUP-DELTA] vs pi's flat project chain-runs dir), which the block
         // below relies on for `{chain_dir}` uniqueness and which `cleanup_old_chain_dirs` housekeeps.
-        let chain_dir = resolve_chain_dir(chain_dir_override, cwd, &foreground_run_id);
+        let chain_dir = resolve_chain_dir(
+            chain_dir_override,
+            cwd,
+            &foreground_run_id,
+            cfg.artifact_dir_preference(),
+        );
         crate::background::ensure_accessible_dir(&chain_dir)
             .await
             .map_err(SubagentError::Spawn)?;
@@ -3364,6 +3420,13 @@ impl SubagentExecutor {
             }
             lines.push("Current session model:".to_string());
             lines.push(format!("  {}", current_model.unwrap_or("(unavailable)")));
+            // SUBA-035: the policy that decides whether the resolved model above is even allowed to
+            // run. Without it this report can show a model that enforcement will refuse, and say
+            // nothing about why.
+            lines.push("Model scope:".to_string());
+            lines.push(crate::exec::model_scope::model_scope_summary_line(
+                discovered.model_scope.as_ref(),
+            ));
             return lines.join("\n");
         }
 
@@ -3372,6 +3435,9 @@ impl SubagentExecutor {
             String::new(),
             "Current session model:".to_string(),
             format!("  {}", current_model.unwrap_or("(unavailable)")),
+            // SUBA-035 — see the single-agent view above; the same line, on the same report.
+            "Model scope:".to_string(),
+            crate::exec::model_scope::model_scope_summary_line(discovered.model_scope.as_ref()),
             String::new(),
         ];
         // pi's all-agents view walks the fixed `BUILTIN_AGENT_NAMES` list (agent-management.ts:608),
@@ -3688,7 +3754,7 @@ impl SubagentExecutor {
         }
         // (2) pi `run-status.ts:200`.
         if view == Some("fleet") {
-            let runs = run_status::list_active_runs(&async_root, &results_dir)
+            let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
             return crate::background::fleet_view::format_fleet(
@@ -3709,7 +3775,7 @@ impl SubagentExecutor {
                         .to_string(),
                 );
             }
-            let runs = run_status::list_active_runs(&async_root, &results_dir)
+            let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
             if !transcript {
@@ -3816,7 +3882,7 @@ impl SubagentExecutor {
                 // No id: interrupt the most-recently-updated running run (the list is already sorted
                 // running-first, most-recent-first), mirroring pi's "defaults to the most recently
                 // active controllable run" contract for interrupt.
-                let runs = run_status::list_active_runs(&async_root, &results_dir)
+                let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
                     .await
                     .map_err(|e| e.to_string())?;
                 runs.iter()
@@ -3988,7 +4054,7 @@ impl SubagentExecutor {
     pub async fn format_stop_targets(&self, cwd: &Path) -> Result<String, String> {
         let async_root = default_async_root(cwd);
         let results_dir = default_results_dir(cwd);
-        let runs = run_status::list_active_runs(&async_root, &results_dir)
+        let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
             .await
             .map_err(|e| e.to_string())?;
         if runs.is_empty() {
@@ -6809,11 +6875,27 @@ fn sj_control_overrides() -> serde_json::Value {
 /// relative `output` is what gets joined against it, at `chain-execution.ts:283`), so a relative
 /// `chainDir` stays relative here exactly as it does upstream.
 ///
-/// [CYRUP-DELTA] the fallback is a PER-RUN subdirectory rather than pi's flat project chain-runs
-/// dir, so `{chain_dir}` is unique per run and `artifacts::cleanup_old_chain_dirs` can housekeep by
-/// age. Only the default differs; the override path is pi-identical.
-fn resolve_chain_dir(override_dir: Option<PathBuf>, cwd: &Path, run_id: &RunId) -> PathBuf {
-    override_dir.unwrap_or_else(|| crate::artifacts::chain_runs_dir(cwd).join(run_id.as_str()))
+/// SUBA-048 / PARITY-GAPS PB-13: the fallback ROOT is now
+/// [`crate::artifacts::resolve_chain_runs_dir`], pi's `getChainRunsDir(effectiveCwd,
+/// artifactConfig.dir)` (`shared/artifacts.ts:145-158` @v0.43.0) — so the default `project`
+/// preference resolves to `<cwd>/.cyrup-subagents/chain-runs` as upstream's does, and `session` /
+/// `temp` collapse onto the scoped temp root. Before this, the fallback was unconditionally the
+/// temp root: a chain run's artifacts landed under `$TMPDIR/.../chain-runs/<cwd_key>/<runId>`,
+/// invisible to the project and swept by OS tmp cleanup, and `project_chain_runs_dir` had zero
+/// references anywhere in the crate.
+///
+/// [CYRUP-DELTA] the fallback is a PER-RUN subdirectory rather than pi's flat chain-runs dir, so
+/// `{chain_dir}` is unique per run and `artifacts::cleanup_old_chain_dirs` can housekeep by age.
+/// Only that extra level differs; the ROOT and the override path are now both pi-identical.
+fn resolve_chain_dir(
+    override_dir: Option<PathBuf>,
+    cwd: &Path,
+    run_id: &RunId,
+    preference: crate::artifacts::ArtifactDirPreference,
+) -> PathBuf {
+    override_dir.unwrap_or_else(|| {
+        crate::artifacts::resolve_chain_runs_dir(cwd, preference).join(run_id.as_str())
+    })
 }
 
 fn subagent_tool_parameters() -> serde_json::Value {
@@ -7129,7 +7211,14 @@ impl Tool for WaitTool {
         // Re-resolved per call (not cached from registration) so a mid-session config/env change
         // takes effect; the registration-time verdict only fixes the advertised description.
         let enabled = Self::resolve_enabled(&self.executor).await;
-        let deps = crate::background::wait::WaitDeps::for_cwd(&self.cwd, enabled);
+        // SUBA-031: re-read per call for the same reason `enabled` is — pi reads
+        // `deps.state.currentSessionId` at wait time, so a session switch between registration and
+        // the call scopes the wait to the session that actually issued it.
+        let deps = crate::background::wait::WaitDeps::for_cwd(
+            &self.cwd,
+            enabled,
+            self.executor.current_session_id(),
+        );
         match crate::background::wait::wait_for_subagents(&parsed, &cancel, &deps).await {
             Ok(text) => Ok(ToolResult {
                 content: vec![cyrup_core::Content::text(text)],
@@ -9882,10 +9971,14 @@ impl NativeExtension for SubagentsExtension {
                     widget.set_ui_available(false);
                 }
                 if let Some(services) = self.executor.host_services() {
-                    services.set_widget(&serde_json::json!({
-                        "key": crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY,
-                        "content": serde_json::Value::Null,
-                    }));
+                    // EXT-047: upstream's `setWidget(key, undefined)` is a REMOVAL. The old
+                    // hand-rolled `{"key": …, "content": null}` blob could not express one, so the
+                    // slot stayed occupied after dispose.
+                    services.set_widget(
+                        crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY,
+                        None,
+                        cyrup_ext::host::WidgetPlacement::default(),
+                    );
                 }
             }
             // pi `register-main.ts:415-418`.
@@ -10282,10 +10375,11 @@ impl SubagentsExtension {
                 // the status widget must be gone before the overlay paints.
                 let services = self.executor.host_services();
                 if let Some(services) = services.as_ref() {
-                    services.set_widget(&serde_json::json!({
-                        "key": clear_widget_key,
-                        "content": serde_json::Value::Null,
-                    }));
+                    services.set_widget(
+                        clear_widget_key,
+                        None,
+                        cyrup_ext::host::WidgetPlacement::default(),
+                    );
                 }
                 if let Ok(mut widget) = self.fleet_status.lock() {
                     widget.set_inspector_open(true);
@@ -10368,15 +10462,30 @@ impl SubagentsExtension {
                 return;
             }
             // Same 100-column fallback, and for the same reason, as `show_fleet` above.
-            widget.widget_payload(100, now)
+            // EXT-047: pi's `setWidget(key, content, { placement })` — three arguments, so the
+            // placement the fleet-status widget resolved is no longer lost inside an opaque blob.
+            (widget.widget_lines(100, now), widget.placement())
         };
-        match payload {
-            Some(payload) => services.set_widget(&payload),
-            // pi `ctx.ui.setWidget(FLEET_STATUS_WIDGET_KEY, undefined)` (`:309,320`).
-            None => services.set_widget(&serde_json::json!({
-                "key": crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY,
-                "content": serde_json::Value::Null,
-            })),
+        let placement = match payload.1 {
+            crate::tui::fleet_status::FleetViewPlacement::BelowEditor => {
+                cyrup_ext::host::WidgetPlacement::BelowEditor
+            }
+            crate::tui::fleet_status::FleetViewPlacement::AboveEditor => {
+                cyrup_ext::host::WidgetPlacement::AboveEditor
+            }
+        };
+        match payload.0 {
+            Some(lines) => services.set_widget(
+                crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY,
+                Some(&lines),
+                placement,
+            ),
+            // pi `ctx.ui.setWidget(FLEET_STATUS_WIDGET_KEY, undefined)` (`:309,320`) — a removal.
+            None => services.set_widget(
+                crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY,
+                None,
+                placement,
+            ),
         }
     }
 
@@ -13114,9 +13223,11 @@ mod tests {
         let cwd = std::path::Path::new("/tmp/cyrup-chain-dir-parity");
         let run = RunId::new();
 
+        use crate::artifacts::ArtifactDirPreference;
+
         let explicit = PathBuf::from("/somewhere/the/caller/picked");
         assert_eq!(
-            resolve_chain_dir(Some(explicit.clone()), cwd, &run),
+            resolve_chain_dir(Some(explicit.clone()), cwd, &run, ArtifactDirPreference::Project),
             explicit,
             "an explicit chainDir must be used EXACTLY as given — pi does not rewrite it either"
         );
@@ -13124,15 +13235,33 @@ mod tests {
         // A RELATIVE value also stays verbatim: upstream joins a step's relative `output` against
         // this dir (`chain-execution.ts:283`); it never normalizes the dir itself.
         let relative = PathBuf::from("artifacts/chain");
-        assert_eq!(resolve_chain_dir(Some(relative.clone()), cwd, &run), relative);
+        assert_eq!(
+            resolve_chain_dir(Some(relative.clone()), cwd, &run, ArtifactDirPreference::Temp),
+            relative
+        );
 
-        // ...and only the FALLBACK is cyrup's per-run subdir ([CYRUP-DELTA]).
-        let fallback = resolve_chain_dir(None, cwd, &run);
+        // SUBA-048 / PARITY-GAPS PB-13: the DEFAULT (`project`) fallback root is the PROJECT
+        // chain-runs dir, pi's `getChainRunsDir(cwd, "project") -> getProjectChainRunsDir(cwd)`
+        // (`shared/artifacts.ts:145-158` @v0.43.0). RED before the fix: `resolve_chain_dir` took no
+        // preference and always used the temp root, so this assertion could not even be written.
+        let fallback = resolve_chain_dir(None, cwd, &run, ArtifactDirPreference::Project);
         assert_eq!(
             fallback,
-            crate::artifacts::chain_runs_dir(cwd).join(run.as_str())
+            crate::artifacts::project_chain_runs_dir(cwd).join(run.as_str()),
+            "the default preference must put chain runs inside the project, as upstream does"
         );
         assert_ne!(fallback, explicit);
+
+        // `session` and `temp` both collapse onto the scoped temp root — upstream's own two-case
+        // arm (`case "session": case "temp": return CHAIN_RUNS_DIR;`), which deliberately does NOT
+        // mirror `getArtifactsDir`'s session-sibling branch.
+        for pref in [ArtifactDirPreference::Session, ArtifactDirPreference::Temp] {
+            assert_eq!(
+                resolve_chain_dir(None, cwd, &run, pref),
+                crate::artifacts::chain_runs_dir(cwd).join(run.as_str()),
+                "{pref:?} must fall back to the temp chain-runs root"
+            );
+        }
     }
 
     /// THE GUARD. Every property this tool advertises must actually be read somewhere outside
@@ -17157,6 +17286,13 @@ mod tests {
             "the report must be the runtime builtin->model mapping, not a catalog dump: {full}"
         );
         assert!(full.contains("Current session model:"), "{full}");
+        // SUBA-035: the report must say which scope policy is in force, not only which model
+        // resolved. With no `subagents.modelScope` configured that is the explicit "none" line —
+        // asserted here rather than only in the configured case so a silently-dropped block fails.
+        assert!(
+            full.contains("Model scope:\n  (none configured"),
+            "the models report must surface the active modelScope policy: {full}"
+        );
         // The old behavior dumped the static provider catalog ("... — context {n}k, reasoning=...");
         // the runtime mapping must not.
         assert!(
@@ -20480,6 +20616,7 @@ mod tests {
             steps: Vec::new(),
             cwd: PathBuf::from("/tmp"),
             session_file: None,
+            session_id: None,
             global_concurrency_limit: 4,
             worktree_base_dir: None,
             max_subagent_depth: 2,

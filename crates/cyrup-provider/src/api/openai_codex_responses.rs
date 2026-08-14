@@ -303,14 +303,18 @@ impl ApiImpl for CodexResponsesApi {
         let codex_session_id = codex_session_id(opts);
 
         let codex_opts = OpenAiCodexResponsesOptions::from_stream_options(opts);
+        // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP.
+        let params =
+            match build_request_body(model, ctx, opts, &codex_opts, codex_session_id.as_deref()) {
+                Ok(p) => p,
+                Err(e) => {
+                    sink.send(error_event(model, &self.api, e.0, false)).await;
+                    return;
+                }
+            };
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body (pi
         // `options?.onPayload?.(body, model)`, :284-287).
-        let body = crate::stream::apply_on_payload(
-            opts,
-            model,
-            build_request_body(model, ctx, opts, &codex_opts, codex_session_id.as_deref()),
-        )
-        .await;
+        let body = crate::stream::apply_on_payload(opts, model, params).await;
 
         let headers = build_sse_headers(
             model,
@@ -692,13 +696,16 @@ fn codex_user_agent() -> String {
 /// * `tool_choice` and `parallel_tool_calls` are always present;
 /// * `reasoning` is emitted purely from the requested effort, with no `model.reasoning` gate and no
 ///   `off`-branch `{effort}`-only body.
+/// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws: `convertResponsesTools` rejects a
+/// `strict: "require"` tool on a route without strict mode (`constrained-sampling.ts:91-95`
+/// @v0.83.0). PROV-011.
 pub fn build_request_body(
     model: &Model,
     ctx: &Context,
     opts: &StreamOptions,
     codex: &OpenAiCodexResponsesOptions,
     cache_session_id: Option<&str>,
-) -> Value {
+) -> Result<Value, crate::utils::constrained_sampling::ConstrainedSamplingError> {
     let supports_tool_search = model
         .compat
         .as_ref()
@@ -753,7 +760,7 @@ pub fn build_request_body(
                 .unwrap_or("You are a helpful assistant.")
         ),
     );
-    obj.insert("input".to_string(), Value::Array(messages));
+    obj.insert("input".to_string(), Value::Array(messages?));
     obj.insert(
         "text".to_string(),
         json!({ "verbosity": codex.text_verbosity.as_deref().filter(|s| !s.is_empty()).unwrap_or("low") }),
@@ -781,7 +788,7 @@ pub fn build_request_body(
     if !placement.immediate.is_empty() {
         obj.insert(
             "tools".to_string(),
-            Value::Array(convert_responses_tools(&placement.immediate, tool_options)),
+            Value::Array(convert_responses_tools(&placement.immediate, tool_options)?),
         );
     }
 
@@ -813,7 +820,7 @@ pub fn build_request_body(
         }
     }
 
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,7 +1506,7 @@ mod tests {
             max_tokens: Some(4096),
             ..Default::default()
         };
-        let body = build_request_body(&model, &ctx, &so, &opts(), None);
+        let body = build_request_body(&model, &ctx, &so, &opts(), None).unwrap();
 
         assert_eq!(body["model"], json!("gpt-5.5-codex"));
         assert_eq!(body["store"], json!(false));
@@ -1533,7 +1540,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let body = build_request_body(&model, &ctx, &StreamOptions::default(), &opts(), None);
+        let body = build_request_body(&model, &ctx, &StreamOptions::default(), &opts(), None).unwrap();
         assert_eq!(body["instructions"], json!("BE TERSE"));
         let raw = serde_json::to_string(&body["input"]).unwrap();
         assert!(
@@ -1553,7 +1560,7 @@ mod tests {
             system_prompt: Some(String::new()),
             ..Default::default()
         };
-        let body = build_request_body(&model, &ctx, &StreamOptions::default(), &opts(), None);
+        let body = build_request_body(&model, &ctx, &StreamOptions::default(), &opts(), None).unwrap();
         assert_eq!(body["instructions"], json!("You are a helpful assistant."));
     }
 
@@ -1565,6 +1572,7 @@ mod tests {
                 name: "bash".into(),
                 description: "run".into(),
                 parameters: json!({ "type": "object" }),
+                constrained_sampling: None,
             }],
             ..Default::default()
         };
@@ -1578,7 +1586,7 @@ mod tests {
             text_verbosity: Some("high".to_string()),
             ..OpenAiCodexResponsesOptions::from_stream_options(&so)
         };
-        let body = build_request_body(&model, &ctx, &so, &codex, Some("sess-9"));
+        let body = build_request_body(&model, &ctx, &so, &codex, Some("sess-9")).unwrap();
 
         assert_eq!(body["temperature"], json!(0.25));
         assert_eq!(body["service_tier"], json!("priority"));
@@ -1606,7 +1614,7 @@ mod tests {
             &so,
             &codex,
             None,
-        );
+        ).unwrap();
         assert_eq!(body["tool_choice"], json!("auto"));
     }
 
@@ -1644,7 +1652,7 @@ mod tests {
             reasoning: ModelThinkingLevel::High,
             ..Default::default()
         };
-        let body = build_request_body(&model, &Context::default(), &so, &opts(), None);
+        let body = build_request_body(&model, &Context::default(), &so, &opts(), None).unwrap();
         assert_eq!(
             body["reasoning"],
             json!({ "effort": "xhigh", "summary": "auto" })
@@ -1658,7 +1666,7 @@ mod tests {
             reasoning: ModelThinkingLevel::Medium,
             ..Default::default()
         };
-        let body = build_request_body(&model, &Context::default(), &so, &opts(), None);
+        let body = build_request_body(&model, &Context::default(), &so, &opts(), None).unwrap();
         assert_eq!(body["reasoning"]["effort"], json!("xhigh"));
 
         // `off` leaves `reasoningEffort` undefined (:516-517) — no reasoning key, and NO
@@ -1667,7 +1675,7 @@ mod tests {
             reasoning: ModelThinkingLevel::Off,
             ..Default::default()
         };
-        let body = build_request_body(&model, &Context::default(), &so, &opts(), None);
+        let body = build_request_body(&model, &Context::default(), &so, &opts(), None).unwrap();
         assert!(body.get("reasoning").is_none());
     }
 
@@ -1682,7 +1690,7 @@ mod tests {
             reasoning: ModelThinkingLevel::High,
             ..Default::default()
         };
-        let body = build_request_body(&model, &Context::default(), &so, &codex, None);
+        let body = build_request_body(&model, &Context::default(), &so, &codex, None).unwrap();
         assert_eq!(body["reasoning"]["summary"], json!("detailed"));
     }
 

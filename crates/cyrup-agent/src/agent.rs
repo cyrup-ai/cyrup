@@ -24,7 +24,7 @@
 //   `POST {proxyUrl}/api/stream` bearer-SSE transport (`stream_proxy`/`ProxyStreamFn`). Transport
 //   reuses cyrup-provider's existing SSE client (`open_sse`) — no new dependency.
 
-use crate::error::AgentError;
+use crate::error::{AgentError, BusyEntry, ContinueSurface};
 use crate::event::{AgentEvent, AgentMessage, ToolResultMessage};
 use crate::hooks::{
     AfterToolCall, AgentContextView, BeforeOutcome, BeforeToolCall, DefaultHooks, Hooks, PostTurn,
@@ -811,6 +811,11 @@ impl RunCtx {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 parameters: t.parameters().clone(),
+                // PROV-011: pi's `constrainedSampling` is a per-tool OPT-IN declared on the tool
+                // definition (`types.ts:484` @v0.83.0); `undefined` and `false` behave identically.
+                // `cyrup_core::Tool` exposes no such accessor, so an agent-loop tool never opts in
+                // — the field is absent, exactly as it is for a pi tool that does not declare it.
+                constrained_sampling: None,
             })
             .collect();
 
@@ -1913,7 +1918,7 @@ impl Agent {
     /// executing, so the run resumed writing into a cleared transcript.
     pub async fn reset(&self) -> Result<(), AgentError> {
         if self.is_running() {
-            return Err(AgentError::RunActive);
+            return Err(AgentError::RunActive(BusyEntry::Reset));
         }
         {
             let mut st = lock(&self.state);
@@ -1929,18 +1934,39 @@ impl Agent {
     }
 
     // --- run entry points (R-02-001..006) ---
+    /// Start a new run from a prompt (Pi `prompt`, `packages/agent/src/agent.ts:339-347`
+    /// @v0.83.0, `:350-358` @v0.84.1).
+    ///
+    /// AGENT-034 — pi's `prompt()` carries its **own** run-active guard at `:340-344`, ahead of
+    /// `normalizePromptInput` and of the latch claim inside `runWithLifecycle`, and it throws a
+    /// message distinct from every other entry point's:
+    /// `"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or
+    /// wait for completion."` — the one string in the family that tells the caller what to do
+    /// instead. Pinned upstream by `packages/agent/test/agent.test.ts:508-547` @v0.83.0. As in
+    /// [`Self::continue_run`], the check is a FAST PATH only: pi gets check-then-claim atomicity
+    /// from single-threaded JS, so the latch in [`Self::start_run`] stays authoritative and a run
+    /// claimed between the two yields [`BusyEntry::Run`].
     pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunHandle, AgentError> {
+        if self.is_running() {
+            return Err(AgentError::RunActive(BusyEntry::Prompt));
+        }
         let input = input.into();
         self.start_run(EntryStart::Prompt(input.messages), false).await
     }
 
     /// Start a prompt from text plus image attachments (Pi `prompt(input, images?)`,
     /// agent.ts:326,379-383): the images are appended to the user message content after the text.
+    ///
+    /// This is the same upstream method as [`Self::prompt`] — one overload set behind one guard —
+    /// so it carries the identical AGENT-034 fast-path check.
     pub async fn prompt_with_images(
         &self,
         text: impl Into<String>,
         images: Vec<Content>,
     ) -> Result<RunHandle, AgentError> {
+        if self.is_running() {
+            return Err(AgentError::RunActive(BusyEntry::Prompt));
+        }
         self.start_run(EntryStart::Prompt(vec![PromptInput::text_with_images(text, images).into_one()]), false)
             .await
     }
@@ -1955,11 +1981,14 @@ impl Agent {
         // this read and the latch CAS in `start_run`. The `push_front` restores below are the half
         // that actually makes the drains lossless.
         if self.is_running() {
-            return Err(AgentError::RunActive);
+            return Err(AgentError::RunActive(BusyEntry::Continue));
         }
         let messages = lock(&self.state).messages.clone();
         if messages.is_empty() {
-            return Err(AgentError::NoMessages);
+            // AGENT-034 — `Agent.continue()` says "No messages to continue from" (agent.ts:357
+            // @v0.83.0 / :368 @v0.84.1); the low-level `agentLoopContinue` says something else
+            // entirely, which is why the variant carries the surface.
+            return Err(AgentError::NoMessages(ContinueSurface::Agent));
         }
         let last_is_assistant = messages.last().map(|m| m.is_assistant()).unwrap_or(false);
         if last_is_assistant {
@@ -2018,7 +2047,12 @@ impl Agent {
             }
         });
         if !claimed {
-            return Err(AgentError::RunActive);
+            // AGENT-034 — pi's own latch guard (`runWithLifecycle`, agent.ts:472-474 @v0.83.0)
+            // carries the bare `"Agent is already processing."`; the entry-point-specific texts
+            // belong to the guards in `prompt`/`continue`/`reset`, which on a single JS thread
+            // always fire first. Here they are only a fast path, so this string is reachable —
+            // exactly on the check-then-claim race they cannot close.
+            return Err(AgentError::RunActive(BusyEntry::Run));
         }
         let cancel = RunCancel::new();
         *lock(&self.cancel_slot) = Some(cancel.clone());

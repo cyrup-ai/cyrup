@@ -419,16 +419,40 @@ pub(crate) fn extension_ui_effect_json(effect: &UiEffect) -> Option<Value> {
             }
             v
         }
-        // Pi `setWidget(key, content, options?)` → `{method:"setWidget", widgetKey, widgetLines,
-        // widgetPlacement}` (rpc-mode.ts:190-206); cyrup's WIT collapsed that 3-argument shape into
-        // ONE opaque JSON payload (see [`UiEffect::SetWidget`]'s doc), so `widget` carries it verbatim
-        // rather than a fabricated re-split into Pi's field names.
-        UiEffect::SetWidget { widget } => json!({
-            "type": "extension_ui_request",
-            "id": new_request_id(),
-            "method": "setWidget",
-            "widget": widget,
-        }),
+        // SEAM-011 — Pi `setWidget(key, content, options?)` → `{method:"setWidget", widgetKey,
+        // widgetLines, widgetPlacement}` (rpc-mode.ts:193-206 @v0.83.0, pinned by the union member at
+        // rpc-types.ts:264-271). cyrup emitted a single cyrup-invented `widget` blob because the WIT
+        // collapsed pi's three arguments into one opaque payload; the WIT now carries them
+        // separately, so this projects them onto pi's field names.
+        //
+        // Omission follows pi's `JSON.stringify`, which drops an `undefined` property:
+        //
+        // * `widgetLines` — absent when the extension passed `content: undefined`, i.e. asked for the
+        //   widget to be REMOVED. Never `null`.
+        // * `widgetPlacement` — pi emits `options?.placement`, so it is absent unless the extension
+        //   supplied one. **CYRUP-DELTA**: cyrup's `WidgetPlacement` (cyrup-ext
+        //   `host/services.rs:1341`) has no "unset" state — the WIT resolves an absent/malformed
+        //   `placement` to the documented default `aboveEditor` (`extensions/types.ts:107-110`
+        //   @v0.83.0) before the host sees it — so the default is emitted as an ABSENT key, which is
+        //   what pi produces for every extension that does not set one and renders identically for
+        //   the one that sets `"aboveEditor"` explicitly.
+        UiEffect::SetWidget { widget } => {
+            let mut v = json!({
+                "type": "extension_ui_request",
+                "id": new_request_id(),
+                "method": "setWidget",
+                "widgetKey": widget.get("key").and_then(Value::as_str).unwrap_or_default(),
+            });
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(lines) = widget.get("lines").filter(|l| !l.is_null()) {
+                    obj.insert("widgetLines".to_string(), lines.clone());
+                }
+                if widget.get("placement").and_then(Value::as_str) == Some("belowEditor") {
+                    obj.insert("widgetPlacement".to_string(), json!("belowEditor"));
+                }
+            }
+            v
+        }
         // Pi `setTitle(title)` → `{method:"setTitle", title}` (rpc-mode.ts:216-223).
         UiEffect::SetTitle { title } => json!({
             "type": "extension_ui_request",

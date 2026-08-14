@@ -326,6 +326,12 @@ impl IntercomExtension {
         else {
             return Ok("Current session is missing from the intercom session list.".to_string());
         };
+        // `duplicates = duplicateSessionNames(allSessions)` (`v0.10.1 index.ts:2393`) — computed
+        // over EVERY session including the current one, before the self-filter below, so a peer
+        // sharing this session's own name is still labelled with its id suffix.
+        let duplicates = crate::identity::duplicate_session_names(
+            sessions.iter().map(|s| s.name.as_deref()),
+        );
         let others: Vec<SessionInfo> = sessions
             .into_iter()
             .filter(|s| Some(s.id.as_str()) != my_id.as_deref())
@@ -351,7 +357,13 @@ impl IntercomExtension {
             if let Some(target_id) = self.state.resolve_target(client, &target).await?
                 && let Some(session) = others.iter().find(|s| s.id == target_id).cloned()
             {
-                let label = session.name.clone().unwrap_or_else(|| session.id.clone());
+                // pi hands the ComposeOverlay `targetLabel`, the SAME `formatSessionLabel` value
+                // the confirmation below uses (`v0.10.1 index.ts:2415-2419`) — not a bare name.
+                let label = crate::identity::format_session_label(
+                    session.name.as_deref(),
+                    &session.id,
+                    &duplicates,
+                );
                 let compose = ComposeOverlay::new(session, label)
                     .render(&PlainTheme, &DefaultKeybindings, COMPOSE_MAX_WIDTH)
                     .join("\n");
@@ -374,10 +386,10 @@ impl IntercomExtension {
         //
         // `to` is pi's `selectedSession.name || selectedSession.id` — the resolved peer's label, not
         // the caller-supplied token (JS `||`, so a blank name falls through to the id).
+        let selected = others.iter().find(|s| s.id == target_id).cloned();
         if let Some(services) = self.state.host_services() {
-            let to = others
-                .iter()
-                .find(|s| s.id == target_id)
+            let to = selected
+                .as_ref()
                 .map(|s| {
                     s.name
                         .clone()
@@ -395,7 +407,17 @@ impl IntercomExtension {
                 }),
             );
         }
-        Ok(format!("Message sent to {target}."))
+        // ICOM-013's residual: `notifyIfLive(ctx, \`Message sent to ${targetLabel}\`, "info", …)`
+        // (`v0.10.1 index.ts:2429`). Two divergences, and they had to be fixed together — cyrup
+        // printed a trailing period upstream does not have, AND echoed the caller's raw token where
+        // pi names the RESOLVED peer through `formatSessionLabel`. Fixing only the period would
+        // still have told a human who typed a prefix or an id which prefix they typed, not which
+        // session actually received the message.
+        let target_label = selected.as_ref().map_or_else(
+            || target.clone(),
+            |s| crate::identity::format_session_label(s.name.as_deref(), &s.id, &duplicates),
+        );
+        Ok(format!("Message sent to {target_label}"))
     }
 }
 

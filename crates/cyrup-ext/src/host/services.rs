@@ -246,9 +246,19 @@ pub trait HostServices: Send + Sync {
     fn theme(&self) -> Option<String> {
         None
     }
-    /// Available theme names (Pi `listThemes`).
+    /// Every available theme as `{name, path}` (Pi `getAllThemes(): {name, path}[]`,
+    /// `extensions/types.ts:269` @v0.83.0). `path` is `null` for a built-in theme, which is the
+    /// only way a guest can tell a built-in from a file-backed one — EXT-021: cyrup returned bare
+    /// names.
     fn theme_list(&self) -> Value {
         json!([])
+    }
+
+    /// Load one theme BY NAME without switching to it (Pi `getTheme(name): Theme | undefined`,
+    /// `extensions/types.ts:272` @v0.83.0). `None` = no such theme. Distinct from [`Self::theme`],
+    /// which reports the ACTIVE theme.
+    fn theme_by_name(&self, _name: &str) -> Option<Value> {
+        None
     }
     /// Switch the active theme (Pi `setTheme`); denied by default.
     fn set_theme(&self, _name: &str) -> Result<(), String> {
@@ -270,8 +280,42 @@ pub trait HostServices: Send + Sync {
     /// A keyed status-bar segment (Pi `setStatus(key, text?)`, types.ts:141-142); `None` clears the
     /// key.
     fn set_status(&self, _key: &str, _text: Option<&str>) {}
-    /// A custom status-line widget payload (Pi `setWidget`, types.ts:164-173).
-    fn set_widget(&self, _widget: &Value) {}
+    /// One keyed extension widget (Pi `setWidget(key, content, options?)`,
+    /// `extensions/types.ts:170-175` @v0.83.0).
+    ///
+    /// EXT-047: this took a single opaque `&Value` — the cyrup-invented collapse of pi's three
+    /// arguments — and its own doc admitted there was "no cyrup-side convention to re-derive them
+    /// from". Three concrete losses followed: two extensions setting a widget clobbered each other,
+    /// a widget could not be REMOVED (the shipped subagents extension hand-rolled
+    /// `{"key": …, "content": null}` for it and the slot stayed occupied), and `belowEditor`
+    /// placement was unexpressible.
+    ///
+    /// * `key` — the map key. One widget per key; upstream's `setWidget` is a map write, not a
+    ///   single slot.
+    /// * `lines` — pi's `content: string[] | undefined`. `None` REMOVES this key's widget.
+    /// * `placement` — [`WidgetPlacement`], upstream's `ExtensionWidgetOptions.placement`
+    ///   (`:107-110`), defaulting to `AboveEditor` (`:108`).
+    fn set_widget(&self, _key: &str, _lines: Option<&[String]>, _placement: WidgetPlacement) {}
+
+    /// The streaming working/loading MESSAGE (Pi `setWorkingMessage(message?)`,
+    /// `extensions/types.ts:151` @v0.83.0). `None` is upstream's no-argument call: "restore
+    /// default".
+    fn set_working_message(&self, _message: Option<&str>) {}
+
+    /// Show/hide the built-in working loader row (Pi `setWorkingVisible(visible)`,
+    /// `extensions/types.ts:154` @v0.83.0). Independent of the message — which is exactly what
+    /// cyrup's collapsed `working-start(label)`/`working-stop()` pair could not express.
+    fn set_working_visible(&self, _visible: bool) {}
+
+    /// Configure the working indicator's frames/interval (Pi `setWorkingIndicator(options?)`,
+    /// `extensions/types.ts:164` @v0.83.0; `WorkingIndicatorOptions {frames?, intervalMs?}` at
+    /// `:116-121`). `None` restores the default animated spinner; `Some` with `frames: []` hides
+    /// the indicator entirely.
+    fn set_working_indicator(&self, _opts: Option<&Value>) {}
+
+    /// The label shown for hidden thinking blocks (Pi `setHiddenThinkingLabel(label?)`,
+    /// `extensions/types.ts:167` @v0.83.0). `None` restores the default.
+    fn set_hidden_thinking_label(&self, _label: Option<&str>) {}
     /// Custom header content (Pi `setHeader`, types.ts:184).
     fn set_header(&self, _content: &str) {}
     /// Custom footer content (Pi `setFooter`, types.ts:174-177).
@@ -553,6 +597,43 @@ pub trait HostServices: Send + Sync {
     /// service routes this to the live agent's tool set + system-prompt rebuild — the SAME method the
     /// host/CLI tool-toggle path uses, so a guest's call has full, real effect.
     fn set_active_tools(&self, _names: &[String]) {}
+
+    /// The live session's FULL tool set as `ToolInfo` rows — `{name, description, parameters,
+    /// promptGuidelines, sourceInfo}` (EXT-038).
+    ///
+    /// pi's `getAllTools()` maps `this._toolDefinitions` — the MERGED registry including built-ins,
+    /// MCP and extension tools — at
+    /// `pi/packages/coding-agent/src/core/agent-session.ts:906-914` @v0.83.0; the type is `ToolInfo`
+    /// at `extensions/types.ts:1552` and the API doc at `:1323` reads "Get all configured tools with
+    /// parameter schema, prompt guidelines, and source metadata."
+    ///
+    /// Distinct from [`Self::all_tool_names`], which is the same set as bare names for the
+    /// permission companion's registry gate. This is the introspection row a plan-mode or
+    /// tool-restriction extension reads BEFORE calling [`Self::set_active_tools`] — and cyrup's
+    /// version reported extension tools only, so such an extension computed a restriction set that
+    /// silently omitted every built-in and then had that restriction honoured.
+    ///
+    /// `None` when no live session backend is attached; the guest binding then falls back to the
+    /// registry's extension-only view, which is at least honest about being a fallback.
+    fn all_tools(&self) -> Option<Vec<Value>> {
+        None
+    }
+
+    /// The live session's slash-command catalog as `SlashCommandInfo` rows — `{name, description,
+    /// source, sourceInfo}` (EXT-037).
+    ///
+    /// pi's `getCommands()` returns `[...extensionCommands, ...templates, ...skills]`, where an
+    /// extension command maps to `{name: command.invocationName, description, source: "extension",
+    /// sourceInfo}` (`pi/packages/coding-agent/src/core/agent-session.ts:2332-2354` @v0.83.0); the
+    /// type is `SlashCommandInfo` (`core/slash-commands.ts:6-11`), declared on the API at
+    /// `extensions/types.ts:1329`. Note `invocationName`, not `name`: a second extension registering
+    /// `deploy` is invocable only as `deploy:2`, and a guest handed the raw name cannot call it.
+    ///
+    /// `None` when no live session backend is attached; the guest binding then falls back to the
+    /// registry's RESOLVED commands, which at least carry the `name:N` invocation names.
+    fn commands(&self) -> Option<Vec<Value>> {
+        None
+    }
 }
 
 /// Recorded extended-UI chrome effects (Pi `ExtensionUIContext` mutators, types.ts:124-275). These
@@ -1172,8 +1253,8 @@ pub struct GuestState {
     /// `ui.set-status` log: keyed status segments (Pi `setStatus(key, text?)`, types.ts:141). A
     /// `None` text clears that key (Pi `setStatus(key, undefined)`).
     statuses: Mutex<Vec<(String, Option<String>)>>,
-    /// `ui.set-widget` payloads.
-    widgets: Mutex<Vec<Value>>,
+    /// `ui.set-widget` calls in pi's `(key, content, placement)` shape (EXT-047).
+    widgets: Mutex<Vec<WidgetEffect>>,
     /// Extended UI chrome effects (header/footer/title/editor/theme/working/tools-expanded).
     chrome: Mutex<UiChrome>,
     /// `bus.emit` topics + payloads this guest emitted (R-08-029). A per-guest observability log kept
@@ -1197,6 +1278,15 @@ pub struct GuestState {
     stream_events: Mutex<Vec<(String, Value)>>,
     /// The active-tool restriction set via `ext-tools.set-active-tools` (Pi `setActiveTools`).
     active_tools_restriction: Mutex<Option<Vec<String>>>,
+    /// `Some(reason)` once this instance's context has been invalidated (pi's
+    /// `runtime.state.staleMessage`, `extensions/loader.ts:177` @v0.84.1). See
+    /// [`GuestState::invalidate`].
+    stale: Mutex<Option<String>>,
+    /// Every `proc.spawn` handle minted FOR THIS GUEST, and every `http-client.request-stream`
+    /// handle likewise. See [`GuestState::own_proc_handle`] for why per-guest ownership is
+    /// load-bearing rather than bookkeeping.
+    proc_handles: Mutex<HashSet<u32>>,
+    stream_handles: Mutex<HashSet<u32>>,
     /// Named abort signals dismissed via `ui.abort-signal` (Pi `ExtensionUIDialogOptions.signal`,
     /// sdk gap #2): a dialog opened carrying an aborted signal id returns cancelled; a tool whose
     /// `call-id` matches polls `is-cancelled` true (Pi `ToolDefinition.execute` `signal`, sdk gap #1).
@@ -1253,6 +1343,45 @@ pub enum NotifyKind {
     Error,
 }
 
+/// Where an extension widget is drawn (Pi `WidgetPlacement = "aboveEditor" | "belowEditor"`,
+/// `extensions/types.ts:104` @v0.83.0). `AboveEditor` is upstream's default
+/// (`ExtensionWidgetOptions.placement`, `:107-110`: "Defaults to \"aboveEditor\"").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WidgetPlacement {
+    #[default]
+    AboveEditor,
+    BelowEditor,
+}
+
+impl WidgetPlacement {
+    /// Parse pi's `ExtensionWidgetOptions` bag. An absent, malformed or unknown `placement` falls
+    /// back to the documented default rather than erroring — upstream's optional field.
+    pub fn from_opts(opts: &Value) -> Self {
+        match opts.get("placement").and_then(Value::as_str) {
+            Some("belowEditor") => Self::BelowEditor,
+            _ => Self::AboveEditor,
+        }
+    }
+
+    /// The upstream wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AboveEditor => "aboveEditor",
+            Self::BelowEditor => "belowEditor",
+        }
+    }
+}
+
+/// One recorded `ui.set-widget` call in pi's shape (EXT-047).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WidgetEffect {
+    /// pi's `key` — the map key. One widget per key.
+    pub key: String,
+    /// pi's `content: string[] | undefined`; `None` REMOVES this key's widget.
+    pub lines: Option<Vec<String>>,
+    pub placement: WidgetPlacement,
+}
+
 /// An OAuth login-flow callback the guest invoked during `provider-login` (Pi `OAuthLoginCallbacks`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OAuthEvent {
@@ -1300,6 +1429,9 @@ impl GuestState {
             oauth_events: Mutex::new(Vec::new()),
             stream_events: Mutex::new(Vec::new()),
             active_tools_restriction: Mutex::new(None),
+            stale: Mutex::new(None),
+            proc_handles: Mutex::new(HashSet::new()),
+            stream_handles: Mutex::new(HashSet::new()),
             aborted_signals: Mutex::new(HashSet::new()),
             tool_cancel: Mutex::new(None),
             pending_with_session: Mutex::new(Vec::new()),
@@ -1370,6 +1502,73 @@ impl GuestState {
         }
     }
 
+    /// Record that `handle` was minted for THIS guest by `proc.spawn`.
+    ///
+    /// # Why handles need an owner (the second half of EXT-054)
+    ///
+    /// `capabilities.exec`/`net` decide whether a guest may open a child process or an HTTP stream.
+    /// They say nothing about WHOSE child or WHOSE stream, and the engines that mint the handles —
+    /// [`crate::caps::proc::ProcCaps`] / [`crate::caps::http::HttpCaps`] — are **one per session**,
+    /// living on the single `LiveHostServices` that every loaded guest shares
+    /// (`cyrup-session-svc/src/host_services.rs`), with handles allocated from one `AtomicU32`
+    /// counter. Without this set, a `u32` was ambient authority: extension B could
+    /// `proc.read-stdout(1)` extension A's child (its output, including anything A's subprocess
+    /// prints — tokens, file contents), `proc.write-stdin(1)` INTO it, `proc.kill(1)` it, or
+    /// `http-client.poll-stream-chunk(1)` A's response body, purely by counting from 1. Both guests
+    /// need the relevant grant, so this is not a grant bypass; it is a bypass of the ISOLATION the
+    /// grant model implies, and it is the exact shape of EXT-054 — a per-extension sandbox that is
+    /// declared and then not enforced across a boundary nobody looked at.
+    ///
+    /// pi has no analog in either direction: extensions there are ordinary JS in the agent's own
+    /// process with unrestricted `node:child_process`, so upstream has neither the handle table nor
+    /// the isolation it needs. That makes the invariant cyrup's own to state, exactly as EXT-054's
+    /// was: **a capability handle belongs to the extension that opened it.**
+    pub fn own_proc_handle(&self, handle: u32) {
+        if let Ok(mut g) = self.proc_handles.lock() {
+            g.insert(handle);
+        }
+    }
+
+    /// Refuse a `proc.*` handle this guest did not open (see [`Self::own_proc_handle`]).
+    ///
+    /// The message deliberately does NOT distinguish "belongs to another extension" from "never
+    /// existed": telling a guest which handles are live elsewhere is the same information leak in a
+    /// smaller package.
+    pub fn require_proc_handle(&self, handle: u32) -> Result<(), String> {
+        match self.proc_handles.lock() {
+            Ok(g) if g.contains(&handle) => Ok(()),
+            _ => Err(format!("proc handle {handle} is not open for this extension")),
+        }
+    }
+
+    /// Record that `handle` was minted for THIS guest by `http-client.request-stream`.
+    pub fn own_stream_handle(&self, handle: u32) {
+        if let Ok(mut g) = self.stream_handles.lock() {
+            g.insert(handle);
+        }
+    }
+
+    /// Refuse an `http-client` stream handle this guest did not open.
+    pub fn require_stream_handle(&self, handle: u32) -> Result<(), String> {
+        match self.stream_handles.lock() {
+            Ok(g) if g.contains(&handle) => Ok(()),
+            _ => Err(format!("http stream handle {handle} is not open for this extension")),
+        }
+    }
+
+    /// Forget a stream handle after `http-client.close-stream` — the engine drops the entry, so
+    /// keeping the id would let a LATER handle with the same number (the counter is monotonic, so
+    /// this cannot actually recur) look owned. Kept symmetrical rather than clever.
+    ///
+    /// `proc` handles are deliberately NOT released on `kill`: [`crate::caps::proc::ProcCaps`]
+    /// documents that `kill` terminates without evicting, precisely so the guest can still
+    /// `poll-exit` and drain trailing output afterwards.
+    pub fn release_stream_handle(&self, handle: u32) {
+        if let Ok(mut g) = self.stream_handles.lock() {
+            g.remove(&handle);
+        }
+    }
+
     /// Copy the host's run mode + dialog capability in from [`crate::HostConfig`] (Pi `ctx.mode` /
     /// `ctx.hasUI`, extensions/types.ts:311,313). Called by [`crate::ExtensionHost::load_wasm`]
     /// before `init`, so a guest reads the SAME pair the native built-ins get through `HostCtx`
@@ -1431,6 +1630,9 @@ impl GuestState {
 
     /// Record a `bus.subscribe(topic)` declaration into the shared bus (Pi `pi.events.on`).
     pub fn bus_subscribe(&self, topic: String) {
+        if !self.assert_active("bus.subscribe") {
+            return;
+        }
         self.bus.subscribe(self.owner.clone(), topic);
     }
 
@@ -1438,6 +1640,63 @@ impl GuestState {
     /// returns, `core/event-bus.ts:18-27`, tracked by the loader since v0.84.1).
     pub fn bus_unsubscribe(&self, topic: &str) {
         self.bus.unsubscribe(&self.owner, topic);
+    }
+
+    /// Mark this guest's context STALE — the port of pi's `runtime.invalidate(message?)`
+    /// (`extensions/loader.ts:208-214` @v0.84.1), which sets a one-shot `staleMessage` and then runs
+    /// every tracked event-bus unsubscribe and clears the set.
+    ///
+    /// Called when the instance leaves the host's live map ([`crate::ExtensionHost::reload`]), which
+    /// is cyrup's structural equivalent of the session replacement / reload pi invalidates on. Both
+    /// halves are ported: the flag, and the subscription teardown — which here is
+    /// [`SharedBus::unsubscribe_all`] for this owner rather than a set of closures, because cyrup's
+    /// bus keys subscriptions by `(owner, topic)` instead of handing back an unsubscribe function.
+    ///
+    /// Idempotent, exactly as upstream's `if (state.staleMessage) return;` is: the FIRST reason wins,
+    /// so a later, vaguer invalidation cannot overwrite a specific one.
+    pub fn invalidate(&self, message: Option<String>) {
+        if let Ok(mut g) = self.stale.lock() {
+            if g.is_some() {
+                return;
+            }
+            // pi's default text, `extensions/loader.ts:210-212` @v0.84.1, trimmed to the clauses that
+            // have a cyrup meaning: cyrup guests hold no capturable `ctx` OBJECT (every import reads
+            // ambient store state), so upstream's "do not use a captured pi or command ctx" advice is
+            // about a JS closure hazard that does not exist here — what survives is the fact itself.
+            *g = Some(message.unwrap_or_else(|| {
+                "This extension instance is stale after a session replacement or reload.".to_string()
+            }));
+        }
+        self.bus.unsubscribe_all(&self.owner);
+    }
+
+    /// The stale reason, if [`Self::invalidate`] has run (pi's `state.staleMessage`).
+    pub fn stale_reason(&self) -> Option<String> {
+        self.stale.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// pi's `runtime.assertActive()` (`extensions/loader.ts:180-184` @v0.84.1), which the v0.84.1
+    /// `events` wrapper calls before BOTH `emit` and `on`
+    /// (`loader.ts:413-421`). Returns whether the call may proceed.
+    ///
+    /// CYRUP-DELTA on the failure MODE only, not on the check: upstream THROWS, and the throw
+    /// reaches the extension because `pi.events` is a plain JS object call. `interface bus`'s
+    /// `emit`/`subscribe` are declared `func(...)` with no `result` (`world.wit`), so there is no
+    /// error channel to raise into and re-signing them would break every built guest at link time
+    /// (`HOST_WORLD`'s bump rule, `manifest.rs`). A refused call is therefore dropped with a
+    /// `tracing::warn!` instead — the same degradation the rest of the result-less import surface
+    /// takes (see [`GuestState::require_ui`]).
+    fn assert_active(&self, what: &str) -> bool {
+        match self.stale_reason() {
+            None => true,
+            Some(reason) => {
+                tracing::warn!(
+                    extension = %self.owner, call = what, %reason,
+                    "refused a capability call from a stale extension instance"
+                );
+                false
+            }
+        }
     }
 
     /// Set the dispatch tier (the loader sets `Event` before dispatching an event handler, keeps
@@ -1586,10 +1845,15 @@ impl GuestState {
             .and_then(|g| g.iter().rfind(|(k, _)| k == key).and_then(|(_, t)| t.clone()))
     }
 
-    pub fn set_widget(&self, widget: Value) {
+    pub fn set_widget(&self, effect: WidgetEffect) {
         if let Ok(mut g) = self.widgets.lock() {
-            g.push(widget);
+            g.push(effect);
         }
+    }
+
+    /// Every recorded `ui.set-widget` call, in call order (tests/diagnostics).
+    pub fn widgets(&self) -> Vec<WidgetEffect> {
+        self.widgets.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     // --- extended UI chrome (Pi ExtensionUIContext mutators) ---
@@ -1626,6 +1890,13 @@ impl GuestState {
     }
 
     pub fn bus_emit(&self, topic: String, payload: Value) {
+        // pi's `events.emit` runs `runtime.assertActive()` first (`extensions/loader.ts:414-417`
+        // @v0.84.1) — a stale instance may not publish, or it would be delivered to the FRESH set
+        // that replaced it. See `GuestState::assert_active` for why a refusal here is a dropped call
+        // rather than a raised error.
+        if !self.assert_active("bus.emit") {
+            return;
+        }
         // Per-guest observability log (tests/diagnostics) — a record of what THIS guest sent.
         if let Ok(mut g) = self.bus_emits.lock() {
             g.push((topic.clone(), payload.clone()));
@@ -2128,5 +2399,89 @@ mod tests {
         s.abort_signal("sig-0".to_string()); // already tracked — must remain a harmless no-op.
         assert!(s.is_signal_aborted("sig-0"));
         assert_eq!(s.aborted_signals().len(), MAX_ABORTED_SIGNALS);
+    }
+    /// EXT-047 — pi's `setWidget(key, content, options?)` is a MAP write
+    /// (`extensions/types.ts:170-175` @v0.83.0): one widget per key, `content: undefined` removes
+    /// that key's widget, `placement` chooses the chrome slot. cyrup collapsed all three into one
+    /// opaque `widget-json` blob, so two extensions clobbered each other, a widget could not be
+    /// removed, and `belowEditor` was unexpressible.
+    #[test]
+    fn ext047_set_widget_keeps_pis_key_content_and_placement() {
+        let s = state();
+        s.set_widget(WidgetEffect {
+            key: "fleet".into(),
+            lines: Some(vec!["a".into(), "b".into()]),
+            placement: WidgetPlacement::AboveEditor,
+        });
+        s.set_widget(WidgetEffect {
+            key: "todo".into(),
+            lines: Some(vec!["x".into()]),
+            placement: WidgetPlacement::BelowEditor,
+        });
+        // Upstream's removal: `setWidget(key, undefined)`.
+        s.set_widget(WidgetEffect { key: "fleet".into(), lines: None, placement: WidgetPlacement::default() });
+
+        let got = s.widgets();
+        assert_eq!(got.len(), 3, "each call is recorded — two keys never collapse into one slot");
+        assert_eq!(got[0].key, "fleet");
+        assert_eq!(got[0].lines.as_deref(), Some(["a".to_string(), "b".to_string()].as_slice()));
+        assert_eq!(got[1].placement, WidgetPlacement::BelowEditor, "belowEditor is expressible");
+        assert!(got[2].lines.is_none(), "a clear is a real removal, not a null-content payload");
+    }
+
+    /// The placement bag is pi's `ExtensionWidgetOptions` (`extensions/types.ts:107-110`), whose
+    /// `placement` is OPTIONAL and defaults to `"aboveEditor"` (`:108`).
+    #[test]
+    fn ext047_placement_parses_pis_optional_options_bag() {
+        assert_eq!(
+            WidgetPlacement::from_opts(&json!({"placement": "belowEditor"})),
+            WidgetPlacement::BelowEditor
+        );
+        assert_eq!(
+            WidgetPlacement::from_opts(&json!({"placement": "aboveEditor"})),
+            WidgetPlacement::AboveEditor
+        );
+        assert_eq!(
+            WidgetPlacement::from_opts(&json!({})),
+            WidgetPlacement::AboveEditor,
+            "an omitted placement is upstream's documented default, not an error"
+        );
+        assert_eq!(WidgetPlacement::from_opts(&Value::Null), WidgetPlacement::AboveEditor);
+        assert_eq!(WidgetPlacement::AboveEditor.as_str(), "aboveEditor");
+        assert_eq!(WidgetPlacement::BelowEditor.as_str(), "belowEditor");
+    }
+
+    /// EXT-021 — the four `ctx.ui` verbs that had no WIT representation at all, plus the theme
+    /// inspector. The default [`HostServices`] denies everything, so these assert only that the
+    /// trait CARRIES them (a backend that overrides them is what makes them visible); the point of
+    /// the test is that a rename or removal on the trait breaks here rather than silently
+    /// un-porting the capability again.
+    #[test]
+    fn ext021_the_missing_ctx_ui_verbs_exist_on_hostservices() {
+        let deny = DenyServices;
+        // pi `setWorkingMessage(message?)` types.ts:151 — `None` is the no-argument call.
+        deny.set_working_message(None);
+        deny.set_working_message(Some("thinking"));
+        // pi `setWorkingVisible(visible)` types.ts:154.
+        deny.set_working_visible(false);
+        // pi `setWorkingIndicator(options?)` types.ts:164, bag at :116-121.
+        deny.set_working_indicator(None);
+        deny.set_working_indicator(Some(&json!({"frames": [], "intervalMs": 80})));
+        // pi `setHiddenThinkingLabel(label?)` types.ts:167.
+        deny.set_hidden_thinking_label(Some("thought"));
+        // pi `getTheme(name)` types.ts:272 — inspect WITHOUT switching.
+        assert!(deny.theme_by_name("dracula").is_none(), "the default backend grants no theme read");
+        // pi `getAllThemes()` types.ts:269 — `{name, path}` rows, empty by default.
+        assert_eq!(deny.theme_list(), json!([]));
+    }
+
+    /// EXT-038 / EXT-037 — the two introspection accessors a live session backend fills in. Both
+    /// default to `None` so the guest binding falls back to the registry rather than reporting an
+    /// empty session.
+    #[test]
+    fn ext037_038_all_tools_and_commands_default_to_no_live_session() {
+        let deny = DenyServices;
+        assert!(deny.all_tools().is_none(), "no live session ⇒ fall back to the registry view");
+        assert!(deny.commands().is_none());
     }
 }

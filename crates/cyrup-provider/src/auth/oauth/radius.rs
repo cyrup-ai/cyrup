@@ -464,15 +464,21 @@ impl RadiusOAuth {
         &self.redirect_uri
     }
 
-    fn client(&self) -> Result<reqwest::Client, OAuthError> {
-        crate::stream::sse::build_client().map_err(|e| OAuthError::Failed(e.to_string()))
+    /// PROV-047: proxy-aware, per target. `build_client()` consulted neither the ported resolver
+    /// nor the `httpProxy` setting, so every OAuth token exchange and silent refresh bypassed a
+    /// configured proxy while provider streaming used it.
+    async fn client(&self, target_url: &str) -> Result<reqwest::Client, OAuthError> {
+        crate::stream::sse::build_client_for(target_url)
+            .await
+            .map_err(|e| OAuthError::Failed(e.to_string()))
     }
 
     /// `loadRadiusOAuthDiscovery` (`radius.ts:50-65`): `GET {gateway}/v1/oauth`.
     pub async fn load_oauth_discovery(&self) -> Result<RadiusOAuthDiscovery, OAuthError> {
         let url = gateway_url(&self.gateway, "/v1/oauth");
         let response = self
-            .client()?
+            .client(&url)
+            .await?
             .get(&url)
             .header("accept", "application/json")
             .send()
@@ -519,7 +525,10 @@ impl RadiusOAuth {
         cancel: Option<&CancelToken>,
     ) -> Result<Credential, TokenRequestError> {
         let url = gateway_url(&self.gateway, "/v1/oauth/token");
-        let client = self.client().map_err(TokenRequestError::Other)?;
+        let client = self
+            .client(&url)
+            .await
+            .map_err(TokenRequestError::Other)?;
 
         // `:106-112`
         let send = client
@@ -720,7 +729,7 @@ impl RadiusOAuth {
         cancel: Option<&CancelToken>,
     ) -> Result<DeviceAuthorizationResponse, OAuthError> {
         let url = gateway_url(&self.gateway, "/v1/oauth/device");
-        let client = self.client()?;
+        let client = self.client(&url).await?;
         // `:268-276`
         let body = encode_query([("client_id", OAUTH_CLIENT_ID), ("scope", OAUTH_SCOPE)]);
         let send = client

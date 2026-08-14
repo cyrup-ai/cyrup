@@ -125,3 +125,43 @@ impl SharedBus {
         }
     }
 }
+
+/// The fan-out seam (EXT-034).
+///
+/// Upstream there is nothing to abstract: `emit` runs every listener inline
+/// (`pi/packages/coding-agent/src/core/event-bus.ts:12-32` @v0.83.0), so pi has no entry point from
+/// which an emit can go undelivered. cyrup must defer (see [`SharedBus::emit`]), which means every
+/// seam that can have re-entered a guest has to drain afterwards — including
+/// [`crate::dispatch::Dispatcher`]'s event entry points, which know nothing about the host that owns
+/// the live/native maps. This trait is the handle the dispatcher holds so it can drain without
+/// depending on the facade.
+#[async_trait::async_trait]
+pub trait BusDrain: Send + Sync {
+    /// Fan out every queued event to its subscribers, then re-check for cascaded emits.
+    /// Re-entrant calls must be no-ops (the outer drain owns the queue).
+    async fn drain_bus(&self, cancel: &cyrup_core::CancelToken);
+}
+
+/// Re-entrancy latch for a drain in progress.
+///
+/// Deliberately RAII rather than a plain `store(false)` at the end of the drain: a Rust future can
+/// be dropped at any `.await` (an aborted run drops the whole dispatch tree), and a latch cleared
+/// only on the success path would then stay set forever and permanently disable bus delivery. pi
+/// cannot hit this — a node `EventEmitter` callback is synchronous and always runs to completion.
+pub(crate) struct DrainLatch<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> DrainLatch<'a> {
+    /// `Some` iff no drain was already in progress on this flag.
+    pub(crate) fn acquire(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for DrainLatch<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}

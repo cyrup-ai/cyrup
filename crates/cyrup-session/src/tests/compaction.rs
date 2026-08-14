@@ -543,7 +543,8 @@ async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
 #[test]
 fn prepare_branch_entries_fills_the_token_budget_newest_first() {
     // `prepare_branch_entries` fills the caller-supplied token budget newest-first
-    // (`branch-summarization.ts:315` @v0.83.0). The budget itself is
+    // (`prepareBranchEntries`, `branch-summarization.ts:195-241` @v0.83.0; `:315` is only its call
+    // site). The budget itself is
     // `(model.contextWindow || 128000) − reserveTokens` (`:312-313`), NOT `reserveTokens` — see
     // `branch::branch_token_budget`; this test passes the already-computed budget directly.
     let entries = vec![
@@ -885,7 +886,8 @@ fn m2_truncation_counts_utf16_code_units_like_pi() {
 async fn g3_empty_branch_appends_no_content_placeholder() {
     // Pi generateBranchSummary returns "No content to summarize" when the abandoned branch yields
     // no summarizable messages (branch-summarization.ts:309-311), and navigateTree's caller still
-    // APPENDS it because `if (summaryText)` is truthy (agent-session.ts:2844). cyrup must not drop
+    // APPENDS it because `if (summaryText)` is truthy (agent-session.ts:3038 @v0.83.0 — the
+    // inherited `:2844` matches neither tag). cyrup must not drop
     // the branch: it appends the placeholder entry too.
     let faux = Arc::new(FauxProvider::new()); // no scripted response needed: short-circuits the model
     let model = faux.model().clone();
@@ -2196,7 +2198,8 @@ async fn f6_c_thinking_is_withheld_from_non_reasoning_models_and_branch_summarie
 
 #[tokio::test]
 async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
-    // `const contextWindow = model.contextWindow || 128000` (`branch-summarization.ts:315`). Without
+    // `const contextWindow = model.contextWindow || 128000` (`branch-summarization.ts:312`
+    // @v0.83.0 — re-derived by counting; `:315` is the `prepareBranchEntries` call). Without
     // the fallback the budget is `0 - reserve` → saturates to 0, which `prepare_branch_entries`
     // reads as "no limit" — so a model with an unknown window would serialize an ENTIRE abandoned
     // branch into one prompt instead of capping it at 128000 − 16384 = 111616 tokens.

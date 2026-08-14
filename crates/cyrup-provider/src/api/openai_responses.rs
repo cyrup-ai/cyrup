@@ -26,6 +26,9 @@ use crate::model::Model;
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
+use crate::utils::constrained_sampling::{
+    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+};
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::parse_streaming_json_object;
@@ -169,13 +172,19 @@ impl ApiImpl for OpenAiResponsesApi {
             }
         };
 
+        // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
+        // pi's own message.
+        let params = match try_build_params(model, ctx, opts, auth.env.as_ref()) {
+            Ok(p) => p,
+            Err(e) => {
+                let e = ProviderError::from(e);
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
+                return;
+            }
+        };
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
-        let body = crate::stream::apply_on_payload(
-            opts,
-            model,
-            build_params(model, ctx, opts, auth.env.as_ref()),
-        )
-        .await;
+        let body = crate::stream::apply_on_payload(opts, model, params).await;
         let headers = build_headers(model, ctx, auth, opts, &api_key);
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -304,13 +313,30 @@ fn resolve_cache_retention(
     CacheRetention::Short
 }
 
-/// Build the Responses request body (1:1 port of Pi `buildParams`, openai-responses.ts:231-279).
+/// Test-only infallible view of [`try_build_params`]: every in-file fixture declares tools whose
+/// `constrainedSampling` is absent, so the resolver cannot fail.
+#[cfg(test)]
 pub(crate) fn build_params(
     model: &Model,
     ctx: &Context,
     opts: &StreamOptions,
     env: Option<&ProviderEnv>,
 ) -> Value {
+    try_build_params(model, ctx, opts, env)
+        .expect("fixture declares no unsatisfiable constrained sampling")
+}
+
+/// Build the Responses request body (1:1 port of Pi `buildParams`, openai-responses.ts:231-279).
+///
+/// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws: `convertResponsesTools` rejects a
+/// `strict: "require"` tool on a route without strict mode (`constrained-sampling.ts:91-95`
+/// @v0.83.0). PROV-011.
+pub(crate) fn try_build_params(
+    model: &Model,
+    ctx: &Context,
+    opts: &StreamOptions,
+    env: Option<&ProviderEnv>,
+) -> Result<Value, ConstrainedSamplingError> {
     let compat = get_responses_compat(model);
 
     // --- DRIFT-001 deferred-tool placement (Pi openai-responses.ts:267-274) ---
@@ -350,7 +376,7 @@ pub(crate) fn build_params(
                 supports_strict_mode: compat.supports_strict_mode,
                 default_strict: Some(false),
             },
-        );
+        )?;
     let cache = resolve_cache_retention(opts.cache_retention, env);
 
     let mut obj = Map::new();
@@ -419,7 +445,7 @@ pub(crate) fn build_params(
                     supports_strict_mode: compat.supports_strict_mode,
                     default_strict: Some(false),
                 },
-            )),
+            )?),
         );
     }
 
@@ -468,7 +494,7 @@ pub(crate) fn build_params(
         }
     }
 
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 /// Build the request headers: `Authorization: Bearer <key>` plus the model / session / opts header
@@ -581,7 +607,7 @@ pub(crate) fn convert_responses_messages(
     allowed_tool_call_providers: &[&str],
     deferred_tools: &[(String, ToolDef)],
     tool_options: ConvertResponsesToolsOptions,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ConstrainedSamplingError> {
     let provider = model.provider.as_str().to_string();
     let api = model.api.clone();
     let model_id = model.id.as_str().to_string();
@@ -856,7 +882,7 @@ pub(crate) fn convert_responses_messages(
                                 defer_loading: true,
                                 ..tool_options
                             },
-                        )),
+                        )?),
                     }));
                 }
             }
@@ -864,7 +890,7 @@ pub(crate) fn convert_responses_messages(
         msg_index += 1;
     }
 
-    messages
+    Ok(messages)
 }
 
 /// Pi `parseTextSignature` (openai-responses-shared.ts:46-64): structured V1 JSON or a legacy
@@ -914,15 +940,19 @@ pub(crate) struct ConvertResponsesToolsOptions {
 /// function-tool literal is built without it, so a model that does not opt in receives no `strict`
 /// key at all — where cyrup used to hard-code `"strict": false` on every tool of every request.
 ///
-/// Cyrup ports only pi's function-tool branch; the grammar/custom-tool branch (`:355-364`) needs
-/// `resolveGrammarConstrainedSampling`, which is PROV-011.
+/// PROV-011: `strict` is `resolveJsonSchemaStrictSampling(tool, supportsStrictMode) ?? defaultStrict`
+/// (`:365`, `:377`), so a tool that opted into JSON-schema constrained sampling gets `true` and
+/// every other tool keeps the caller's default. A `strict: "require"` tool on a route without
+/// strict mode fails the request with pi's exact message.
 pub(crate) fn convert_responses_tools(
     tools: &[ToolDef],
     options: ConvertResponsesToolsOptions,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ConstrainedSamplingError> {
     tools
         .iter()
         .map(|t| {
+            let constrained_strict =
+                resolve_json_schema_strict_sampling(t, options.supports_strict_mode)?;
             let mut o = Map::new();
             o.insert("type".to_string(), json!("function"));
             o.insert("name".to_string(), json!(t.name));
@@ -936,13 +966,13 @@ pub(crate) fn convert_responses_tools(
             if options.supports_strict_mode {
                 o.insert(
                     "strict".to_string(),
-                    match options.default_strict {
+                    match constrained_strict.or(options.default_strict) {
                         Some(b) => json!(b),
                         None => Value::Null,
                     },
                 );
             }
-            Value::Object(o)
+            Ok(Value::Object(o))
         })
         .collect()
 }
@@ -1895,6 +1925,7 @@ mod tests {
             name: "echo".into(),
             description: "echoes".into(),
             parameters: json!({"type": "object"}),
+            constrained_sampling: None,
         }];
         let body = build_params(&model(), &ctx, &StreamOptions::default(), None);
         assert_eq!(body["tools"][0]["type"], "function");
@@ -1925,6 +1956,7 @@ mod tests {
             name: "echo".into(),
             description: "e".into(),
             parameters: json!({"type": "object"}),
+            constrained_sampling: None,
         }];
         let body = build_params(&m, &ctx, &StreamOptions::default(), None);
         assert_eq!(body["tools"][0]["strict"], false);
@@ -2412,6 +2444,7 @@ mod tests {
                 "properties": { "value": { "type": "string" } },
                 "required": ["value"],
             }),
+            constrained_sampling: None,
         }
     }
 
@@ -2891,7 +2924,8 @@ mod tests {
                     supports_strict_mode: get_responses_compat(&model()).supports_strict_mode,
                     default_strict: Some(false),
                 },
-            ))
+            )
+            .unwrap())
         );
         assert!(
             !serde_json::to_string(&body)

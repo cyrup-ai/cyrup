@@ -517,7 +517,13 @@ async fn gap3_run_agent_loop_continue_rejects_empty_and_trailing_assistant() {
         sf.clone(),
     )
     .await;
-    assert!(matches!(empty, Err(crate::AgentError::NoMessages)));
+    // AGENT-034 — the LOW-LEVEL surface's string, distinct from `Agent::continue_run`'s
+    // (`agent-loop.ts:128` in `runAgentLoopContinue`, identical at both tags).
+    assert!(matches!(empty, Err(crate::AgentError::NoMessages(crate::ContinueSurface::Loop))));
+    assert_eq!(
+        empty.err().map(|e| e.to_string()).unwrap_or_default(),
+        "Cannot continue: no messages in context"
+    );
 
     // Trailing assistant => ContinueFromAssistant.
     let ctx = AgentContext {
@@ -537,6 +543,10 @@ async fn gap3_run_agent_loop_continue_rejects_empty_and_trailing_assistant() {
     )
     .await;
     assert!(matches!(trailing, Err(crate::AgentError::ContinueFromAssistant)));
+    assert_eq!(
+        trailing.err().map(|e| e.to_string()).unwrap_or_default(),
+        "Cannot continue from message role: assistant"
+    );
 }
 
 #[tokio::test]

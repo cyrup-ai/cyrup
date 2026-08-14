@@ -521,8 +521,13 @@ impl XaiOAuth {
         }
     }
 
-    fn client(&self) -> Result<reqwest::Client, OAuthError> {
-        crate::stream::sse::build_client().map_err(|e| OAuthError::Failed(e.to_string()))
+    /// PROV-047: proxy-aware, per target. `build_client()` consulted neither the ported resolver
+    /// nor the `httpProxy` setting, so every OAuth token exchange and silent refresh bypassed a
+    /// configured proxy while provider streaming used it.
+    async fn client(&self, target_url: &str) -> Result<reqwest::Client, OAuthError> {
+        crate::stream::sse::build_client_for(target_url)
+            .await
+            .map_err(|e| OAuthError::Failed(e.to_string()))
     }
 
     /// 1:1 port of `requestDeviceCode` (`xai.ts:145-159`).
@@ -530,7 +535,7 @@ impl XaiOAuth {
         &self,
         cancel: Option<&CancelToken>,
     ) -> Result<XaiDeviceCode, OAuthError> {
-        let client = self.client()?;
+        let client = self.client(&self.device_code_url).await?;
         // `:146-154`
         let response = post_form(
             &client,
@@ -558,7 +563,7 @@ impl XaiOAuth {
         cancel: Option<&CancelToken>,
     ) -> Result<Credential, OAuthError> {
         let poller = XaiTokenPoller {
-            client: self.client()?,
+            client: self.client(&self.token_url).await?,
             token_url: self.token_url.clone(),
             device_code: device.device_code.clone(),
             cancel: cancel.cloned(),
@@ -579,7 +584,7 @@ impl XaiOAuth {
         refresh_token: &str,
         cancel: Option<&CancelToken>,
     ) -> Result<Credential, OAuthError> {
-        let client = self.client()?;
+        let client = self.client(&self.token_url).await?;
         // `:214-222`
         let response = post_form(
             &client,

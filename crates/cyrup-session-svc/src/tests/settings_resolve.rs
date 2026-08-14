@@ -341,16 +341,26 @@ async fn malformed_models_json_is_reported_not_fatal() {
     assert!(!session.full_model_catalog().is_empty());
 }
 
-/// Constraint 6 (loud + safe), packages half: a package DECLARED in settings that is not installed
-/// must produce a startup diagnostic — never a silent drop and never a failed build. Pi would
-/// install it on demand (`resolvePackageSources`, package-manager.ts:1244-1283); cyrup does no
-/// network install during session assembly ([CYRUP-DELTA]) and says so instead.
+/// Constraint 6 (loud + safe), packages half: a package DECLARED in settings that cyrup would have
+/// to INSTALL to resolve must produce a startup diagnostic — never a silent drop and never a failed
+/// build. Pi installs it on demand (`resolvePackageSources` git arm, package-manager.ts:1287-1291 →
+/// `installMissing` `:1260-1271` @v0.83.0); cyrup does no network install during session assembly
+/// ([CYRUP-DELTA]) and says so instead.
+///
+/// The entry must be a protocol-qualified GIT url, because that is the only arm Pi installs. A
+/// missing LOCAL path is silent in Pi — `resolveLocalExtensionSource` opens with
+/// `if (!existsSync(resolved)) return;` (package-manager.ts:1324-1326 @v0.83.0) — and so is a bare
+/// `github:org/pkg` shorthand, which `parseGitUrl` rejects for want of a protocol
+/// (git.ts:177-179) and `parseSource` then files as `{ type: "local" }`
+/// (package-manager.ts:1449-1459). This test previously declared `"./nope-not-here"` and so pinned
+/// a diagnostic on Pi's silent arm; the loud arm is asserted here and its silent twin in
+/// cyrup-resources' `cfg027_a_missing_local_package_path_is_a_silent_skip`.
 #[tokio::test]
 async fn missing_settings_declared_package_is_reported_not_fatal() {
     let fx = fixture();
     write(
         &fx.agent_dir.join("settings.json"),
-        "{\"packages\": [\"./nope-not-here\"]}",
+        "{\"packages\": [\"https://github.com/org/nope-not-here\"]}",
     );
 
     let session = fx.session().await;
