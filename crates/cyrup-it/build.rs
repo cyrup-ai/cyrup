@@ -259,7 +259,13 @@ fn cargo_build_component(pkg: &str, target: &str, target_dir: &Path) -> PathBuf 
         if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
             continue;
         }
-        if v.pointer("/target/name").and_then(|n| n.as_str()) != Some(pkg) {
+        // A LIB target's name is the package name with `-` replaced by `_`
+        // (cargo-targets.html#configuring-a-target), so `cyrup-ext-sdk` reports as
+        // `cyrup_ext_sdk`. Comparing against the raw package name matched nothing and made this
+        // fall through to the panic below, whose message blames a missing `wasm32-wasip2`
+        // toolchain — the target was installed and the `.wasm` had just been built. Normalize.
+        // (The BIN loop above is unaffected: bin target names keep their hyphens.)
+        if v.pointer("/target/name").and_then(|n| n.as_str()) != Some(pkg.replace('-', "_").as_str()) {
             continue;
         }
         if let Some(files) = v.get("filenames").and_then(|f| f.as_array()) {

@@ -695,6 +695,33 @@ mod tests {
         }
     }
 
+    /// Poll until `host` has recorded at least `n` `inject_message` calls, or `budget` elapses.
+    ///
+    /// The pending-idle flush is a real `tokio::spawn` + `sleep` chain
+    /// ([`schedule_inbound_flush`]), so a fixed `sleep(DELAY + slack)` asserts that THIS MACHINE
+    /// scheduled that chain inside the slack — not that the code drained the backlog. Under a
+    /// loaded workspace run it did not:
+    /// `every_flushed_backlog_message_carries_its_own_attribution_header` failed with
+    /// `the whole backlog drains: [] left: 0 right: 2`, i.e. the flush task had not been polled at
+    /// all inside a 1 s budget whose real requirement is 200 ms. Waiting on the OUTCOME instead
+    /// takes the scheduler out of the assertion. It does NOT weaken anything: the callers still
+    /// assert the exact count, the exact order and the exact attribution, and still sleep a full
+    /// retry cycle afterwards so a spurious extra delivery has time to appear.
+    async fn injected_at_least(
+        host: &IdleControlledHost,
+        n: usize,
+        budget: std::time::Duration,
+    ) -> Vec<InjectedCall> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let injected = host.injected();
+            if injected.len() >= n || tokio::time::Instant::now() >= deadline {
+                return injected;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// ICOM-002's live half (pi `queueIdleMessage` → `flushIdleMessages`, `index.ts:685-714`): a
     /// BUSY interactive session must deliver NOTHING at arrival time, and once the run ends the
     /// whole backlog must be delivered in arrival order — the first as a turn-driving `"trigger"`
@@ -730,8 +757,11 @@ mod tests {
         );
         assert_eq!(s.pending_inbound_len(), 2, "the backlog is retained across a busy flush");
 
-        // The run ends → the retry (INBOUND_IDLE_RETRY_MS) drains the whole backlog.
+        // The run ends → the retry (INBOUND_IDLE_RETRY_MS) drains the whole backlog. Wait on the
+        // drain itself, not on a wall clock (see `injected_at_least`), then let a further full
+        // retry cycle elapse so any extra delivery would be visible to the exact-count assertion.
         host.set_idle(true);
+        let _ = injected_at_least(&host, 2, std::time::Duration::from_secs(10)).await;
         tokio::time::sleep(std::time::Duration::from_millis(
             INBOUND_IDLE_RETRY_MS + 200,
         ))
@@ -825,9 +855,14 @@ mod tests {
         queue_idle_message(&s, from(), ask("first"));
         queue_idle_message(&s, peer_b, ask("second"));
 
+        // Wait on the drain, not on a wall clock (see `injected_at_least`): the 1 s budget this
+        // used to sleep is what made the test flaky under a loaded run, and the flakiness was in
+        // the assertion, not in the flush. The settle sleep afterwards preserves the exact-count
+        // claim by giving a third delivery a full retry cycle to appear.
         host.set_idle(true);
+        let _ = injected_at_least(&host, 2, std::time::Duration::from_secs(10)).await;
         tokio::time::sleep(std::time::Duration::from_millis(
-            INBOUND_FLUSH_DELAY_MS + INBOUND_IDLE_RETRY_MS + 300,
+            INBOUND_IDLE_RETRY_MS + 200,
         ))
         .await;
 

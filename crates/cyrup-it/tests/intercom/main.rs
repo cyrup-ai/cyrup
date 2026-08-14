@@ -1,4 +1,4 @@
-//! Seam tests drained from **`crates/cyrup-intercom`** — 18 files.
+//! Seam tests drained from **`crates/cyrup-intercom`** — 20 files.
 //!
 //! What makes a test belong here: it runs the real `cyrup-intercom-broker` process over a real
 //! Unix socket. That includes the two hostile-`UnixListener` protocol files (number domain, array
@@ -18,6 +18,13 @@
 //!   behaviour rather than relocating it. `common.rs` carries the table.
 //! * `child_bridge_activation` lost its `#![cfg(feature = "test-fixtures")]`; the reason that
 //!   RESTORES the test rather than disabling it is written at the top of that file.
+//! * `tool_actions` (9) and `compose_send_leg` (2) arrived LATER than the other 18, and from a
+//!   different place: they were `#[cfg(test)]` modules inside `crates/cyrup-intercom/src/`, not
+//!   `tests/` files, and they only ever passed because a sibling integration target in that
+//!   package incidentally caused cargo to link `cyrup-intercom-broker` into `target/<profile>/`.
+//!   Once the 18 above moved here, `cargo test -p cyrup-intercom --lib` stopped producing that
+//!   binary and all 11 went red on the spawn. Each file's header records the one rewrite it needed
+//!   to reach the crate from outside.
 //! * Socket paths go under the test's own `TempDir` (§4 R1) and listeners bind `:0` (§4 R4) —
 //!   both already true throughout this crate's tests; keep it that way.
 //! * A detached `__intercom-broker` grandchild that inherits a harness pipe FD above 2 is the
@@ -44,6 +51,7 @@ mod broker_roundtrip;
 mod broker_runtime_claim;
 mod broker_startup_fail_fast;
 mod child_bridge_activation;
+mod compose_send_leg;
 mod dismiss_incoming_ask;
 mod human_surface;
 mod intercom_command_transcript;
@@ -57,6 +65,7 @@ mod reconnect;
 mod registers_under_session_id;
 mod session_info_context_fields;
 mod shared_human_lock;
+mod tool_actions;
 
 /// §4 R5 layer 3. Cheap, and it names the leak at the top of the run instead of letting a broker
 /// test quietly inherit an ambient `CYRUP_INTERCOM=1` — the variable that has already leaked 13

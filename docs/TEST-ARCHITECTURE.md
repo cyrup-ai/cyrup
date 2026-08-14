@@ -1081,6 +1081,27 @@ All three: a documented rule, a lint, and CI checks. Any one alone erodes.
 > crate-level `#![cfg(...)]` the rest of the suite must not get, or it needs process isolation
 > because it aborts, panics on unwind, installs a global handler, or mutates process-global state.
 
+**The rule cuts both ways, and the first post-migration run proved it.** Emptying `tests/` is only
+half the invariant: a `#[cfg(test)]` module inside `src/` that crosses one of the four seams is
+just as misfiled, and it is *harder* to see. Eleven such tests sat in
+`crates/cyrup-intercom/src/{tools/intercom.rs, ui/compose.rs}` — each spawning the real
+`cyrup-intercom-broker` — and they were green only because a sibling `tests/` target in the same
+package incidentally made cargo link that binary into `target/<profile>/`. The moment the siblings
+moved here, `cargo test -p cyrup-intercom --lib` stopped producing it and all eleven went red on
+`Os { code: 2, kind: NotFound }`. They now live in `tests/intercom/{tool_actions,
+compose_send_leg}.rs`, resolving the binary through `build.rs`/`support::bins` like everything
+else. Two consequences worth naming for the next contributor:
+>
+> * `CARGO_BIN_EXE_<name>` is **never** set for a library's own unit tests, in any package — the
+>   `option_env!` fallbacks those two modules carried were dead code that always took the
+>   `current_exe()` branch. A unit test cannot legitimately locate a workspace binary at all.
+> * Migrating a `#[cfg(test)]` module can hit private items an external crate cannot name. Rewrite
+>   through the public path when one exists and is the same code path (both `IntercomTool` tests
+>   went from the private `dispatch(IntercomParams)` to the public `Tool::execute(json)`), or add
+>   the missing read accessor when the assertion is genuinely about private state
+>   (`ComposeOverlay::is_sending`/`error`, the read halves of setters that were already public).
+>   Do not `#[ignore]` it and do not soften the assertion.
+
 ### 9.2 The lint
 
 `clippy.toml` at the workspace root, with the R2 `disallowed-methods` entries for

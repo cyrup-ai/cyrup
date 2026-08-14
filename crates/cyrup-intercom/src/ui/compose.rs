@@ -75,6 +75,23 @@ impl ComposeOverlay {
         self.sending = sending;
     }
 
+    /// Whether a broker send is in flight (pi's `private sending`). The read half of
+    /// [`Self::set_sending`]: the host that drives the overlay owns this flag across an `await`, so
+    /// it has to be able to read back what [`Self::send_message`] left it as — pi's overlay reads
+    /// `this.sending` in both `handleInput` and `render` for exactly that reason
+    /// (`compose.ts:34,76,112`).
+    #[must_use]
+    pub fn is_sending(&self) -> bool {
+        self.sending
+    }
+
+    /// The recorded delivery error, if any (pi's `private error`). The read half of
+    /// [`Self::set_error`], same rationale as [`Self::is_sending`].
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// Record a delivery error (pi `error = …; sending = false`).
     pub fn set_error(&mut self, error: impl Into<String>) {
         self.error = Some(error.into());
@@ -219,6 +236,11 @@ pub async fn compose_send(client: &Arc<IntercomClient>, target_id: &str, text: &
     Ok(result)
 }
 
+/// Unit tests only. The two `send_message` proofs that used to live here spawned the real
+/// `cyrup-intercom-broker` binary as a subprocess, which makes them seam tests; they now live in
+/// `crates/cyrup-it/tests/intercom/compose_send_leg.rs`. They reach the overlay's `sending`/`error`
+/// state through [`ComposeOverlay::is_sending`]/[`ComposeOverlay::error`], which is why those two
+/// accessors exist. See docs/TEST-ARCHITECTURE.md §9.1.
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -297,119 +319,5 @@ mod tests {
         let mut overlay = ComposeOverlay::new(session(), "label".to_string());
         overlay.handle_input(&kb, "   ");
         assert_eq!(overlay.handle_input(&kb, "\r"), ComposeAction::Ignore);
-    }
-
-    /// Locate the real `cyrup-intercom-broker` binary next to this test binary (mirrors
-    /// `tools/intercom.rs`'s identical `broker_bin_path` helper — see its doc for the full
-    /// `CARGO_BIN_EXE_*`-is-compile-time-only-for-integration-tests rationale).
-    fn broker_bin_path() -> std::path::PathBuf {
-        if let Some(compile_time) = option_env!("CARGO_BIN_EXE_cyrup-intercom-broker") {
-            return std::path::PathBuf::from(compile_time);
-        }
-        let mut exe = std::env::current_exe().expect("current test binary path");
-        exe.pop(); // drop the test binary's own file name
-        if exe.ends_with("deps") {
-            exe.pop(); // unit-test binaries build into target/<profile>/deps/
-        }
-        exe.push(format!("cyrup-intercom-broker{}", std::env::consts::EXE_SUFFIX));
-        exe
-    }
-
-    /// Spawn the REAL broker as a subprocess (mirrors `tools/intercom.rs`'s `spawn_broker` fixture
-    /// pattern) so `send_message` exercises the actual `client.send` round trip end to end.
-    async fn spawn_broker() -> (tokio::process::Child, tempfile::TempDir, std::path::PathBuf) {
-        let broker_bin = broker_bin_path();
-        let agent_dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = agent_dir.path().join("intercom").join("broker.sock");
-        let broker = tokio::process::Command::new(&broker_bin)
-            .env("CYRUP_CODING_AGENT_DIR", agent_dir.path())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the real intercom broker subprocess");
-        crate::transport::spawn::wait_for_broker(&socket_path, std::time::Duration::from_secs(5))
-            .await
-            .expect("broker becomes health-connectable");
-        (broker, agent_dir, socket_path)
-    }
-
-    fn registration(cwd: &str) -> crate::transport::protocol::SessionRegistration {
-        crate::transport::protocol::SessionRegistration {
-            name: None,
-            cwd: cwd.to_string(),
-            model: "test-model".to_string(),
-            pid: std::process::id().into(),
-            started_at: 0u64.into(),
-            last_activity: 0u64.into(),
-            status: None,
-            extra: Default::default(),
-        }
-    }
-
-    // Regression proof for the dossier item "ComposeOverlay's send leg (pi `sendMessage`,
-    // `compose.ts:76-103`) and its `ComposeResult` outcome (`compose.ts:7-11`) have no cyrup
-    // equivalent": against the PRE-FIX code neither `ComposeOverlay::send_message` nor `ComposeResult`
-    // existed, so this test would not even compile. Drives a real broker round trip and asserts the
-    // success shape matches pi exactly: `sent:true`, the broker message id, the trimmed sent text, no
-    // error, and (mirroring pi never resetting `sending` on success) `sending` left true.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn send_message_delivers_and_returns_the_compose_result() {
-        let (mut broker, _agent_dir, socket_path) = spawn_broker().await;
-        let me = Arc::new(
-            IntercomClient::connect(&socket_path, registration("/me"), Some("me-session".to_string()))
-                .await
-                .expect("connects"),
-        );
-        let target_client = Arc::new(
-            IntercomClient::connect(&socket_path, registration("/target"), Some("target-session".to_string()))
-                .await
-                .expect("connects"),
-        );
-
-        let mut target = session();
-        target.id = "target-session".to_string();
-        let mut overlay = ComposeOverlay::new(target, "target-session".to_string());
-        overlay.handle_input(&DefaultKeybindings, "hello there");
-
-        let result = overlay.send_message(&me).await.expect("a delivered send must return Some(ComposeResult)");
-        assert!(result.sent);
-        assert_eq!(result.text.as_deref(), Some("hello there"));
-        assert!(result.message_id.is_some(), "must carry the broker-assigned message id");
-        assert!(overlay.error.is_none(), "a successful send must not record an error");
-        assert!(overlay.sending, "pi never clears `sending` on the success path (the overlay is torn down instead)");
-
-        me.disconnect();
-        target_client.disconnect();
-        let _ = broker.kill().await;
-    }
-
-    // Regression proof for "sendMessage's failure path (error/`sending=false`, buffer preserved) has
-    // no cyrov equivalent": against the PRE-FIX code (no `send_message` method) this would not
-    // compile; asserts an undelivered send records the broker's reason as the overlay error, clears
-    // `sending` so a retry is possible, yields no `ComposeResult`, and — matching pi, which never
-    // touches `inputBuffer` on failure — leaves the typed text intact for the retry prompt.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn send_message_records_the_error_and_clears_sending_when_undelivered() {
-        let (mut broker, _agent_dir, socket_path) = spawn_broker().await;
-        let me = Arc::new(
-            IntercomClient::connect(&socket_path, registration("/me"), Some("me-session".to_string()))
-                .await
-                .expect("connects"),
-        );
-
-        let mut target = session();
-        target.id = "no-such-session".to_string();
-        let mut overlay = ComposeOverlay::new(target, "ghost".to_string());
-        overlay.handle_input(&DefaultKeybindings, "hi");
-
-        let result = overlay.send_message(&me).await;
-        assert!(result.is_none(), "an undelivered send must not yield a ComposeResult");
-        assert!(!overlay.sending, "a failed send must clear `sending` so the user can retry");
-        assert_eq!(overlay.error.as_deref(), Some("Session not found"));
-        assert_eq!(overlay.input(), "hi", "the typed text must survive the failure for the retry prompt");
-
-        me.disconnect();
-        let _ = broker.kill().await;
     }
 }
