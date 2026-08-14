@@ -166,7 +166,7 @@ impl ApiImpl for OpenAiResponsesApi {
             build_params(model, ctx, opts, auth.env.as_ref()),
         )
         .await;
-        let headers = build_headers(model, auth, opts, &api_key);
+        let headers = build_headers(model, ctx, auth, opts, &api_key);
         let req = SseRequest {
             method: reqwest::Method::POST,
             url,
@@ -411,6 +411,7 @@ pub(crate) fn build_params(
 /// < `model.headers` < session affinity < `opts.headers`.
 fn build_headers(
     model: &Model,
+    ctx: &Context,
     auth: &AuthResult,
     opts: &StreamOptions,
     api_key: &str,
@@ -431,6 +432,15 @@ fn build_headers(
             headers.insert(name.clone(), value.clone());
         }
     }
+
+    // PROV-028: the per-request Copilot headers (openai-responses.ts:223-230), applied where Pi's
+    // `Object.assign(headers, copilotHeaders)` sits — after `{ ...model.headers }`, before the
+    // session headers and the opts overlay.
+    crate::api::github_copilot_headers::apply_copilot_dynamic_headers(
+        &mut headers,
+        model.provider.as_str(),
+        &ctx.messages,
+    );
 
     // Session headers (openai-responses.ts:211-216). Gated on cache retention != none.
     let cache = resolve_cache_retention(opts.cache_retention, auth.env.as_ref());
@@ -1787,7 +1797,7 @@ mod tests {
             session_id: Some("sess-7".into()),
             ..Default::default()
         };
-        let h = build_headers(&m, &auth(), &opts, "sk-test");
+        let h = build_headers(&m, &Context::default(), &auth(), &opts, "sk-test");
         assert_eq!(
             h.get("Authorization"),
             Some(&Some("Bearer sk-test".to_string()))
@@ -1797,6 +1807,34 @@ mod tests {
             h.get("x-client-request-id"),
             Some(&Some("sess-7".to_string()))
         );
+    }
+
+    /// PROV-028 — `buildCopilotDynamicHeaders` on the `/responses` route
+    /// (openai-responses.ts:223-230). Copilot's GPT/Gemini/MAI families ride this api.
+    #[test]
+    fn copilot_dynamic_headers_on_the_responses_route() {
+        let mut m = model();
+        m.provider = "github-copilot".into();
+
+        let ctx = user_ctx("hi");
+        let h = build_headers(&m, &ctx, &auth(), &StreamOptions::default(), "tid=abc");
+        assert_eq!(h.get("X-Initiator"), Some(&Some("user".to_string())));
+        assert_eq!(
+            h.get("Openai-Intent"),
+            Some(&Some("conversation-edits".to_string()))
+        );
+        assert!(!h.contains_key("Copilot-Vision-Request"));
+
+        // Non-Copilot providers get none of them.
+        let plain = build_headers(
+            &model(),
+            &ctx,
+            &auth(),
+            &StreamOptions::default(),
+            "sk-test",
+        );
+        assert!(!plain.contains_key("X-Initiator"));
+        assert!(!plain.contains_key("Openai-Intent"));
     }
 
     #[test]

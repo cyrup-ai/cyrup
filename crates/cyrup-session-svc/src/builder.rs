@@ -166,7 +166,17 @@ pub struct SessionConfig {
     pub custom_tools: Vec<Arc<dyn cyrup_core::Tool>>,
     /// Opt-in permission policy gate (empty ⇒ YOLO default, R-12-001).
     pub permission_policy: PermissionPolicy,
-    /// Wrap the fs backend in [`ProtectedFs`] (blocks writes to `.env`/`.git`/… R-12-006).
+    /// [CYRUP-DELTA] Wrap the **fs** backend in [`ProtectedFs`], refusing `write`/`edit` to
+    /// `.env`, `.git/` and `node_modules/` (R-12-006). **Off by default** and embedder-only: there
+    /// is deliberately no CLI flag and no `settings.json` key, because pi has no protected-path
+    /// concept at all — `pi/packages/coding-agent/src/core/tools/write.ts:195-225` @v0.83.0
+    /// resolves the path and calls `ops.writeFile` with no path predicate (ADR-0003 D5/D6).
+    ///
+    /// Scope is the **fs seam only**: the process seam is passed through undecorated (see the
+    /// `Backend { fs, proc: base.proc.clone() }` construction below), so `bash 'echo x >> .env'`
+    /// is NOT covered by this flag even when it is on. That is intentional — deciding from command
+    /// text alone whether an arbitrary shell command mutates a protected path has no correct
+    /// solution — and it is why the default is `false`.
     pub protect_paths: bool,
     /// Wrap the fs backend in [`TraversalFs`] confined to `cwd` (R-03-006).
     pub confine_to_cwd: bool,
@@ -222,7 +232,10 @@ impl SessionConfig {
             exclude_tools: Vec::new(),
             custom_tools: Vec::new(),
             permission_policy: PermissionPolicy::new(),
-            protect_paths: true,
+            // ADR-0003 D5: pi has no protected-path concept (`write.ts:195-225` @v0.83.0 writes
+            // whatever path it is given), and `bash` bypassed the guard anyway, so on-by-default
+            // bought nothing and cost a failed turn. Inert embedder-only opt-in now.
+            protect_paths: false,
             confine_to_cwd: false,
             extension_flag_values: Vec::new(),
         }

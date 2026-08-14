@@ -119,3 +119,47 @@ fn wiring_oauth_keeps_the_api_key_strategy() {
         );
     }
 }
+
+/// PROV-029 — `/login` must REACH the ported flows.
+///
+/// `github-copilot` and `openai-codex` wired the *runtime half* of their upstream OAuth object
+/// (`refresh` + `to_auth` only), so `OAuthAuth::login` fell through to the trait default and
+/// `/login` reported `LoginUnsupported` for two providers whose device-code / PKCE flows are fully
+/// ported and tested. Both upstream definitions wire a login —
+/// `lazyOAuth({ name: "GitHub Copilot", load: loadGitHubCopilotOAuth })`
+/// (`providers/github-copilot.ts:16`) and
+/// `lazyOAuth({ name: "OpenAI (ChatGPT Plus/Pro)", load: loadOpenAICodexOAuth })`
+/// (`providers/openai-codex.ts:13`).
+///
+/// The probe cancels at the flow's FIRST prompt (Copilot's enterprise-domain text prompt,
+/// `oauth/github-copilot.ts:330-334`; Codex's login-method select, `oauth/openai-codex.ts:496-506`),
+/// so it never touches the network — it only proves the default was overridden.
+#[tokio::test]
+async fn copilot_and_codex_logins_are_reachable_from_all_providers() {
+    for (id, name) in [
+        ("github-copilot", "GitHub Copilot"),
+        ("openai-codex", "OpenAI (ChatGPT Plus/Pro)"),
+    ] {
+        let oauth = oauth_by_id(id).unwrap_or_else(|| panic!("{id} must expose an oauth strategy"));
+        assert_eq!(oauth.name(), name, "{id} oauth display name");
+
+        let interaction = cyrup_provider::auth::oauth::ScriptedInteraction::new(vec![Err(
+            cyrup_provider::auth::oauth::OAuthError::Cancelled,
+        )]);
+        let error = match oauth.login(&interaction).await {
+            Ok(_) => panic!("{id}: the cancelled probe must not produce a credential"),
+            Err(error) => error,
+        };
+        assert!(
+            !matches!(
+                error,
+                cyrup_provider::auth::oauth::OAuthError::LoginUnsupported { .. }
+            ),
+            "{id}: /login reached the trait default instead of the ported flow ({error})"
+        );
+        assert!(
+            !interaction.prompts().is_empty(),
+            "{id}: the ported flow must have asked the user something before failing"
+        );
+    }
+}

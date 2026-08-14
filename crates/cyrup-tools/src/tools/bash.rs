@@ -150,6 +150,22 @@ impl Tool for BashTool {
             None => input.command.clone(),
         };
         let mut env = shell_env(self.opts.bin_dir.as_deref());
+        // Agent-identity markers (TOOL-031). Pi sets them on `process.env` in `cli.ts` BEFORE
+        // `main()` runs — `PI_CODING_AGENT = "true"` at cli.ts:13 (present at the ported v0.83.0)
+        // and `AI_AGENT = "pi"` at cli.ts:14 (added at v0.84.1, mirrored in rpc-entry.ts:7-8) — so
+        // every child inherits them through `getShellEnv()`'s `{...process.env}` (shell.ts:130-133,
+        // consumed at bash.ts:100 `env: env ?? getShellEnv()`). cyrup's bin declines the
+        // process-GLOBAL mutation (`std::env::set_var` is `unsafe` under edition 2024, see
+        // `crates/cyrup/src/main.rs`), so the equivalent is a per-child push here — the same
+        // observable environment for the child, without mutating a live process env.
+        //
+        // Deliberately OUTSIDE the `expose_session_environment` gate: that flag is Pi's
+        // `exposeSessionEnvironment` and covers only the five session keys (bash.ts:171-181); these
+        // two come from `process.env` unconditionally and are never scrubbed.
+        env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));
+        // [CYRUP-DELTA, value only] `AI_AGENT` names WHICH agent is running (`"pi"` upstream), so
+        // cyrup names itself. The key and its semantics are pi's verbatim.
+        env.push(("AI_AGENT".to_string(), "cyrup".to_string()));
         let env_remove = crate::config::session_env_scrub_keys();
         if self.opts.expose_session_environment
             && let Some(handle) = &self.opts.session_env

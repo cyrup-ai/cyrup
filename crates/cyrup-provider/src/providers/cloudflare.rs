@@ -10,11 +10,18 @@
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::types::{AuthContext, AuthResult, Credential, ModelAuth, ProviderEnv};
+use crate::auth::oauth::AuthPrompt;
 use crate::auth::{ApiKeyAuth, CredentialStore, InMemoryCredentialStore, ProviderAuth};
 use crate::error::AuthError;
 use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
+
+/// The `/login` prompt strings, verbatim from `providers/cloudflare-auth.ts:51-52` and `:71-73`.
+/// They are the operator-visible contract, so they are pinned as constants rather than inlined.
+const ENTER_CLOUDFLARE_API_KEY: &str = "Enter Cloudflare API key";
+const ENTER_CLOUDFLARE_ACCOUNT_ID: &str = "Enter Cloudflare account ID";
+const ENTER_CLOUDFLARE_GATEWAY_ID: &str = "Enter Cloudflare AI Gateway ID";
 
 /// The provider id.
 pub const CLOUDFLARE_WORKERS_AI_PROVIDER_ID: &str = "cloudflare-workers-ai";
@@ -74,6 +81,35 @@ struct CloudflareWorkersAiAuth;
 impl ApiKeyAuth for CloudflareWorkersAiAuth {
     fn name(&self) -> &str {
         "Cloudflare API key"
+    }
+
+    fn supports_login(&self) -> bool {
+        true
+    }
+
+    /// 1:1 port of `cloudflareWorkersAIAuth().login` (`providers/cloudflare-auth.ts:50-54`): a
+    /// SECRET prompt for the api key, then a TEXT prompt for the account id, returned as one
+    /// `{ type: "api_key", key, env: { CLOUDFLARE_ACCOUNT_ID } }` credential.
+    ///
+    /// CFG-005: both values are required — [`CloudflareWorkersAiAuth::resolve`] returns `None`
+    /// unless the account id is present too — so a single-secret `/login` that stored only the key
+    /// produced a credential that can never resolve.
+    async fn login(
+        &self,
+        interaction: &dyn crate::auth::oauth::AuthInteraction,
+    ) -> Result<Credential, crate::auth::oauth::OAuthError> {
+        let key = interaction
+            .prompt(AuthPrompt::secret(ENTER_CLOUDFLARE_API_KEY))
+            .await?;
+        let account_id = interaction
+            .prompt(AuthPrompt::text(ENTER_CLOUDFLARE_ACCOUNT_ID))
+            .await?;
+        let mut env = ProviderEnv::new();
+        env.insert(CLOUDFLARE_ACCOUNT_ID.to_string(), account_id);
+        Ok(Credential::ApiKey {
+            key: Some(key),
+            env: Some(env),
+        })
     }
 
     async fn resolve(
@@ -144,6 +180,35 @@ struct CloudflareAiGatewayAuth;
 impl ApiKeyAuth for CloudflareAiGatewayAuth {
     fn name(&self) -> &str {
         "Cloudflare API key"
+    }
+
+    fn supports_login(&self) -> bool {
+        true
+    }
+
+    /// 1:1 port of `cloudflareAIGatewayAuth().login` (`providers/cloudflare-auth.ts:70-79`) — the
+    /// workers-ai flow plus a THIRD prompt for the gateway id, which
+    /// [`CloudflareAiGatewayAuth::resolve`] also requires.
+    async fn login(
+        &self,
+        interaction: &dyn crate::auth::oauth::AuthInteraction,
+    ) -> Result<Credential, crate::auth::oauth::OAuthError> {
+        let key = interaction
+            .prompt(AuthPrompt::secret(ENTER_CLOUDFLARE_API_KEY))
+            .await?;
+        let account_id = interaction
+            .prompt(AuthPrompt::text(ENTER_CLOUDFLARE_ACCOUNT_ID))
+            .await?;
+        let gateway_id = interaction
+            .prompt(AuthPrompt::text(ENTER_CLOUDFLARE_GATEWAY_ID))
+            .await?;
+        let mut env = ProviderEnv::new();
+        env.insert(CLOUDFLARE_ACCOUNT_ID.to_string(), account_id);
+        env.insert(CLOUDFLARE_GATEWAY_ID.to_string(), gateway_id);
+        Ok(Credential::ApiKey {
+            key: Some(key),
+            env: Some(env),
+        })
     }
 
     async fn resolve(

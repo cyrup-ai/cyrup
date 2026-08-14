@@ -37,17 +37,15 @@
 //! `generatedAt` only makes the pi.dev overlay MORE likely to be accepted, and the overlay can never
 //! remove an embedded model.
 //!
-//! # What is not here
+//! # Where the login lives
 //!
 //! `loginGitHubCopilot` (`auth/oauth/github-copilot.ts:331-357`) — the GitHub device-code flow, the
 //! `enableAllGitHubCopilotModels` policy-acceptance pass and the interactive enterprise-domain
-//! prompt — is NOT implemented here. [`GitHubCopilotOAuth`] implements only the two members of
-//! [`crate::auth::OAuthAuth`] that a *stored* credential needs, `refresh` and `to_auth`, so a
-//! Copilot credential must still arrive from Pi's `auth.json`; once it has, everything below
-//! refreshes and uses it exactly as Pi does. The login belongs in `crate::auth::oauth` alongside the
-//! other flows, built on that module's device-code poller and reached by flow id, which is what
-//! would let [`github_copilot_auth`] resolve it lazily the way Pi's `lazyOAuth({ load:
-//! loadGitHubCopilotOAuth })` does (`github-copilot.ts:18`).
+//! prompt — is ported in [`crate::auth::oauth::github_copilot::GitHubCopilotLogin`], beside the
+//! other flows and on that module's device-code poller. [`GitHubCopilotOAuth`] below is the
+//! *runtime half* of the same upstream object: the two [`crate::auth::OAuthAuth`] members a stored
+//! credential needs, `refresh` and `to_auth`, which `GitHubCopilotLogin` delegates to.
+//! [`github_copilot_auth`] wires the full flow, so `/login` reaches it (PROV-029).
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::types::{AuthContext, EnvAuthContext, ModelAuth};
@@ -139,10 +137,25 @@ pub fn github_copilot_models() -> Vec<Model> {
 /// The Copilot [`ProviderAuth`] (Pi `github-copilot.ts:16-19`): an API key from
 /// `$COPILOT_GITHUB_TOKEN`, **plus** the OAuth strategy — Copilot is one of the few providers Pi
 /// gives both.
+/// PROV-029: the strategy is the FULL flow
+/// ([`crate::auth::oauth::github_copilot::GitHubCopilotLogin`]) — `login` + `refresh` + `to_auth` —
+/// not the runtime half alone. Wiring [`GitHubCopilotOAuth`] here left `login` on the
+/// [`OAuthAuth`] trait default, so `/login github-copilot` reported `LoginUnsupported` even though
+/// the whole device-code flow was ported and tested.
+///
+/// `[CYRUP-DELTA]` pi wraps this in `lazyOAuth({ name, load: loadGitHubCopilotOAuth })`
+/// (`github-copilot.ts:16`) so a bundler cannot follow a *variable* dynamic `import()` into
+/// Node-only flow code (`auth/oauth/load.ts:9-12`). Rust links statically: the flow module is in
+/// the binary either way, there is no import to defer, and `auth/oauth/load.rs`'s own note records
+/// that the bundled-registration path is the only path here. Naming the flow directly is the same
+/// object pi's `load` resolves to, minus an indirection that in Rust can only *fail* — an
+/// unregistered loader yields `FlowUnavailable` where pi would always resolve.
 pub fn github_copilot_auth() -> ProviderAuth {
     ProviderAuth {
         api_key: Some(env_key([COPILOT_GITHUB_TOKEN_ENV])),
-        oauth: Some(Arc::new(GitHubCopilotOAuth::new())),
+        oauth: Some(Arc::new(
+            crate::auth::oauth::github_copilot::GitHubCopilotLogin::new(),
+        )),
     }
 }
 

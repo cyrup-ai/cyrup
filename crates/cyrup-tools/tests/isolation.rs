@@ -113,6 +113,71 @@ async fn protected_paths_block_writes_pass_reads() {
     assert!(first_text(&r).contains("API=abc"), "read should pass through: {}", first_text(&r));
 }
 
+/// ADR-0003 D8(4), the in-crate half — **the guard's scope is the fs seam only**.
+///
+/// pi has no protected-path concept at all (`pi/packages/coding-agent/src/core/tools/write.ts:
+/// 195-225` @v0.83.0 resolves the path and calls `ops.writeFile` with no predicate), so the
+/// default backend must write `.env` like any other file; and even when an embedder opts in via
+/// `SessionConfig::protect_paths`, only `fs` is decorated — `bash` reaches the same file, which is
+/// why the flag is no longer on by default (ADR-0003 D5/D6).
+///
+/// Executable documentation: this is the assertion that makes the fs-only scope a contract rather
+/// than a footnote.
+#[tokio::test]
+async fn protected_fs_is_fs_only_and_bash_is_never_covered() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+
+    // (a) Undecorated (the shipped default after ADR-0003 D5): `write` to `.env` succeeds, exactly
+    // like pi's `write.ts:195-225`.
+    let plain: Arc<dyn FsOps> = Arc::new(LocalFs);
+    let write_plain =
+        WriteTool::new(plain, Arc::new(FileMutationLocks::new()), cwd.clone(), WriteOpts);
+    let ok = write_plain
+        .execute(
+            cid(),
+            serde_json::json!({ "path": ".env", "content": "A=1\n" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    assert!(first_text(&ok).contains("Successfully wrote"), "got: {}", first_text(&ok));
+    assert_eq!(std::fs::read_to_string(cwd.join(".env")).unwrap(), "A=1\n");
+
+    // (b) Embedder opt-in: `write` is refused …
+    let write_guarded =
+        WriteTool::new(protected_fs(), Arc::new(FileMutationLocks::new()), cwd.clone(), WriteOpts);
+    let err = write_guarded
+        .execute(
+            cid(),
+            serde_json::json!({ "path": ".env", "content": "B=2\n" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("protected"), "got: {err}");
+
+    // … and `bash` reaches the very same file anyway, because the PROCESS seam is undecorated.
+    let bash =
+        BashTool::new(Backend::default().proc, ShellConfig::detect(), cwd.clone(), BashOpts::default());
+    bash.execute(
+        cid(),
+        serde_json::json!({ "command": "printf 'C=3\\n' >> .env" }),
+        CancelToken::new(),
+        noop_sink(),
+    )
+    .await
+    .unwrap();
+    let after = std::fs::read_to_string(cwd.join(".env")).unwrap();
+    assert!(
+        after.contains("C=3"),
+        "`bash` is not covered by ProtectedFs — that is the documented scope, and the reason the \
+         flag defaults to false (ADR-0003 D5). Got: {after:?}"
+    );
+}
+
 // ---------------------------------------------------------------- traversal root confinement
 
 #[tokio::test]

@@ -52,6 +52,9 @@ struct Captured {
     env: Option<cyrup_provider::ProviderEnv>,
     timeout_ms: Option<u64>,
     headers: Option<cyrup_provider::HeaderMap>,
+    /// The model this request was actually dispatched to — pi's `streamSimple(model, …)` argument,
+    /// the same value its `transformHeaders` closure is keyed on (`sdk.ts:312-328` @v0.83.0).
+    model: Option<ModelRef>,
 }
 
 /// A `StreamFn` that records the forwarded `Context`/`StreamOptions`, then delegates to a faux
@@ -82,6 +85,7 @@ impl StreamFn for RecordingStreamFn {
             env: opts.env.clone(),
             timeout_ms: opts.timeout_ms,
             headers: opts.headers.clone(),
+            model: Some(model.clone()),
         });
         self.inner.stream(model, ctx, opts)
     }
@@ -722,5 +726,135 @@ async fn set_headers_repoints_the_next_requests_header_overlay() {
         seen[1].headers.as_ref().and_then(|h| h.get("x-attribution")),
         Some(&Some("second-provider".to_string())),
         "the SECOND request must carry the repointed overlay, not the pinned build-time one"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// AGENT-029 — a per-turn model override must retarget the ATTRIBUTION HEADERS too.
+//
+// pi merges provider-attribution + session-affinity headers inside a per-request `transformHeaders`
+// closure that is closed over the `model` argument of that very `streamSimple` invocation
+// (`packages/coding-agent/src/core/sdk.ts:312-328` @v0.83.0 — byte- AND offset-identical at
+// v0.84.1), and that argument is `config.model`, i.e. the possibly-overridden
+// `nextTurnSnapshot.model ?? config.model` from `agent-loop.ts:237`. A model change of any origin
+// therefore gets the right headers by construction.
+//
+// cyrup read a LATCHED `StateInner::headers` snapshot whose only writers were `AgentBuilder::build`
+// and `Agent::set_headers` — the latter called only from the two SESSION-level model-change paths.
+// So a `TurnUpdate::model` override (which `run_loop` folds stickily into the run's baseline)
+// retargeted the request while the PREVIOUS provider's attribution rode along: an opencode
+// `x-opencode-session` to `api.anthropic.com`, or an OpenRouter `HTTP-Referer` to whoever came next.
+//
+// `Agent::set_header_fn` is cyrup's `transformHeaders`. Revert `RunCtx::headers_for` to the old
+// `lock(&self.state).headers.clone()` and the second assertion below goes RED: request #2 carries
+// request #1's overlay.
+// ----------------------------------------------------------------------------
+
+fn other_model_ref() -> ModelRef {
+    ModelRef { provider: "faux2".into(), api: Some("faux2".into()), model: "faux-2".into() }
+}
+
+/// A hook that retargets the model exactly once, after turn 1 — the shape `TurnUpdate::model` is for
+/// (and, once AGENT-017 landed, the shape the session's per-turn refresh itself produces).
+struct SwitchModelOnce {
+    to: ModelRef,
+    fired: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Hooks for SwitchModelOnce {
+    async fn prepare_next_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+    ) -> Result<Option<TurnUpdate>, HookError> {
+        if self.fired.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(Some(TurnUpdate { model: Some(self.to.clone()), ..Default::default() }));
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn agent029_a_per_turn_model_override_recomputes_the_header_overlay() {
+    let echo = Arc::new(DescribedTool {
+        name: "echo".into(),
+        params: obj_schema(),
+        inject: false,
+        seen: Arc::new(Mutex::new(None)),
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let (sf, captured) = recording_stream_fn(vec![
+        faux_assistant_message(vec![faux_tool_call("echo", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(vec![faux_text("two")], StopReason::Stop),
+    ]);
+
+    // The STATIC overlay: what the previous provider's attribution looked like when it was latched.
+    let mut stale = cyrup_provider::HeaderMap::new();
+    stale.insert("x-attribution".to_string(), Some("provider-of-model-faux-1".to_string()));
+
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![echo])
+        .headers(stale)
+        .hooks(Arc::new(SwitchModelOnce {
+            to: other_model_ref(),
+            fired: AtomicUsize::new(0),
+        }))
+        .build();
+
+    // cyrup's `transformHeaders`: attribution is a FUNCTION of the model the request is going to.
+    agent.set_header_fn(Some(Arc::new(|m: &ModelRef| {
+        let mut h = cyrup_provider::HeaderMap::new();
+        h.insert("x-attribution".to_string(), Some(format!("provider-of-model-{}", m.model)));
+        Some(h)
+    })));
+
+    agent.prompt("go").await.expect("run accepted");
+    agent.wait_for_idle().await;
+
+    let seen = captured.lock().unwrap();
+    assert_eq!(seen.len(), 2, "two turns were dispatched: {}", seen.len());
+    assert_eq!(seen[0].model.as_ref().map(|m| m.model.as_str()), Some("faux-1"));
+    assert_eq!(
+        seen[0].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        Some(&Some("provider-of-model-faux-1".to_string())),
+        "turn 1 carries turn 1's model's attribution"
+    );
+
+    // The sticky override took effect...
+    assert_eq!(
+        seen[1].model.as_ref().map(|m| m.model.as_str()),
+        Some("faux-2"),
+        "the TurnUpdate::model override retargeted turn 2"
+    );
+    // ...and the headers followed it, instead of the previous provider's riding along.
+    assert_eq!(
+        seen[1].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        Some(&Some("provider-of-model-faux-2".to_string())),
+        "turn 2 must carry the NEW model's attribution, not the latched overlay"
+    );
+    assert_ne!(
+        seen[1].headers, seen[0].headers,
+        "no header from the previous provider survives a cross-provider switch"
+    );
+}
+
+/// With no resolver installed — a bare embedder agent — the static [`Agent::set_headers`] overlay is
+/// still what reaches the request. The resolver is additive, not a replacement.
+#[tokio::test]
+async fn agent029_without_a_resolver_the_static_overlay_still_applies() {
+    let (sf, captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("one")],
+        StopReason::Stop,
+    )]);
+    let mut built = cyrup_provider::HeaderMap::new();
+    built.insert("x-attribution".to_string(), Some("static".to_string()));
+    let agent = Agent::builder(model_ref(), sf).headers(built).build();
+
+    agent.prompt("go").await.expect("run accepted");
+    agent.wait_for_idle().await;
+
+    assert_eq!(
+        captured.lock().unwrap()[0].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        Some(&Some("static".to_string()))
     );
 }

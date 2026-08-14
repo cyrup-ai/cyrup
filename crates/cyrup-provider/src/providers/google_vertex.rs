@@ -28,20 +28,21 @@
 //!
 //! # What is not here
 //!
-//! * **The wire api.** Every row's `api` is `google-vertex`, and this crate has no
-//!   `api/google_vertex.rs` (`api/mod.rs:129-155` registers six impls, not this one). Until it
-//!   lands a request against a Vertex model resolves auth and then fails the registry lookup with a
-//!   terminal `StreamEvent::Error` (`wire.rs`, R-01-008/017/018) — the catalog and the auth
-//!   precedence below are complete and tested, the transport is not. Upstream's is
-//!   `packages/ai/src/api/google-vertex.ts`.
-//! * **`vertexAuth.login`** (`google-vertex.ts:16-61`) — the three-way interactive picker
-//!   (API key / ADC / service-account file) that *writes* the credential. cyrup's
-//!   [`crate::auth::ApiKeyAuth`] trait has only `name` + `resolve` (`auth/mod.rs:56-71`); pi's
-//!   `ApiKeyAuth` additionally carries `login(interaction)` (`ai/src/auth/types.ts`). Adding it is a
-//!   change to `auth/mod.rs`, outside this module. Note the OAuth half of that gap is already
-//!   modelled — [`crate::auth::OAuthAuth::login`] exists and the prompt substrate it needs
-//!   ([`crate::auth::AuthInteraction`], `AuthPromptKind::Select`/`Text`/`Secret`) is ported, so the
-//!   missing piece is the trait member, not the machinery.
+//! * **The wire api — PROV-030, still open.** Every row's `api` is `google-vertex`, and this crate
+//!   has no `api/google_vertex.rs`: [`crate::api::register_builtins`] registers nine impls and that
+//!   is not among them. The provider IS registered in [`crate::providers::all`], so all 10 rows
+//!   resolve auth, list in `/model`, and then fail the registry lookup with a terminal
+//!   `StreamEvent::Error` (`wire.rs`, R-01-008/017/018) — the catalog and the auth precedence below
+//!   are complete and tested, the transport is not. Upstream's is
+//!   `packages/ai/src/api/google-vertex.ts` (591 lines at `v0.83.0`), which drives the
+//!   `@google/genai` SDK in Vertex mode; porting it additionally requires minting a bearer from the
+//!   ADC file (an `authorized_user` refresh-token exchange, and RS256 JWT signing for the
+//!   `service-account` arm this module's `login` can now store), which this crate has no dependency
+//!   for today.
+//! * **`vertexAuth.login`** (`google-vertex.ts:15-61`) is ported below — the three-way interactive
+//!   picker (API key / ADC / service-account file) that *writes* the credential — on
+//!   [`crate::auth::ApiKeyAuth::login`], the trait member CFG-005 added beside `name` + `resolve`
+//!   (pi `ai/src/auth/types.ts:166`).
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::types::{AuthContext, AuthResult, Credential, ModelAuth, ProviderEnv};
@@ -82,6 +83,25 @@ pub const GCLOUD_PROJECT_ENV: &str = "GCLOUD_PROJECT";
 
 /// The GCP region (pi `google-vertex.ts:74`).
 pub const GOOGLE_CLOUD_LOCATION_ENV: &str = "GOOGLE_CLOUD_LOCATION";
+
+/// The three `vertexAuth.login` option ids (pi `google-vertex.ts:20-22`). They are the values the
+/// select prompt returns, so they are the flow's contract with the UI.
+const METHOD_API_KEY: &str = "api-key";
+const METHOD_ADC: &str = "adc";
+const METHOD_SERVICE_ACCOUNT: &str = "service-account";
+
+/// The `vertexAuth.login` prompt/notify strings, verbatim from `google-vertex.ts:18`, `:28`,
+/// `:38-43` and `:47-51`.
+const SELECT_AUTH_METHOD_MESSAGE: &str = "Select Google Vertex AI authentication method:";
+const ENTER_GOOGLE_CLOUD_API_KEY: &str = "Enter Google Cloud API key";
+const ADC_INFO_MESSAGE: &str =
+    "Run `gcloud auth application-default login`, then provide the project and location.";
+const SERVICE_ACCOUNT_INFO_MESSAGE: &str =
+    "Provide a service account credentials file, project, and location.";
+const ADC_DOCS_URL: &str = "https://cloud.google.com/docs/authentication/provide-credentials-adc";
+const ENTER_PROJECT_MESSAGE: &str = "Enter Google Cloud project ID";
+const ENTER_LOCATION_MESSAGE: &str = "Enter Google Cloud location";
+const ENTER_CREDENTIALS_PATH_MESSAGE: &str = "Enter service account credentials file path";
 
 /// `source` when the value came off the stored credential (pi `google-vertex.ts:65`/`:81`).
 const SOURCE_STORED_CREDENTIAL: &str = "stored credential";
@@ -163,6 +183,109 @@ impl ApiKeyAuth for GoogleVertexApiKeyAuth {
     /// pi `vertexAuth.name` (`google-vertex.ts:17`).
     fn name(&self) -> &str {
         "Google Cloud credentials"
+    }
+
+    fn supports_login(&self) -> bool {
+        true
+    }
+
+    /// 1:1 port of `vertexAuth.login` (`google-vertex.ts:15-61`): a three-way picker, then either
+    /// one secret prompt (API key) or the project/location pair — plus the credentials-file path on
+    /// the `service-account` arm. An unknown option id is upstream's
+    /// `Unknown Google Vertex AI auth method: {method}` (`:32`).
+    ///
+    /// CFG-005: two of the three arms store NO key at all, only an env overlay — a `/login` that
+    /// assumes a single secret cannot express them.
+    async fn login(
+        &self,
+        interaction: &dyn crate::auth::oauth::AuthInteraction,
+    ) -> Result<Credential, crate::auth::oauth::OAuthError> {
+        use crate::auth::oauth::{
+            AuthEvent, AuthInfoLink, AuthPrompt, AuthSelectOption, OAuthError,
+        };
+
+        // `:16-24`
+        let method = interaction
+            .prompt(AuthPrompt::select(
+                SELECT_AUTH_METHOD_MESSAGE,
+                vec![
+                    AuthSelectOption {
+                        id: METHOD_API_KEY.to_string(),
+                        label: "Google Cloud API key".to_string(),
+                        description: None,
+                    },
+                    AuthSelectOption {
+                        id: METHOD_ADC.to_string(),
+                        label: "Application Default Credentials".to_string(),
+                        description: None,
+                    },
+                    AuthSelectOption {
+                        id: METHOD_SERVICE_ACCOUNT.to_string(),
+                        label: "Service account credentials file".to_string(),
+                        description: None,
+                    },
+                ],
+            ))
+            .await?;
+
+        // `:25-30`
+        if method == METHOD_API_KEY {
+            let key = interaction
+                .prompt(AuthPrompt::secret(ENTER_GOOGLE_CLOUD_API_KEY))
+                .await?;
+            return Ok(Credential::ApiKey {
+                key: Some(key),
+                env: None,
+            });
+        }
+        // `:31-33`
+        if method != METHOD_ADC && method != METHOD_SERVICE_ACCOUNT {
+            return Err(OAuthError::Failed(format!(
+                "Unknown Google Vertex AI auth method: {method}"
+            )));
+        }
+
+        // `:34-46`
+        interaction.notify(AuthEvent::Info {
+            message: if method == METHOD_ADC {
+                ADC_INFO_MESSAGE.to_string()
+            } else {
+                SERVICE_ACCOUNT_INFO_MESSAGE.to_string()
+            },
+            links: vec![AuthInfoLink {
+                label: Some("Application Default Credentials".to_string()),
+                url: ADC_DOCS_URL.to_string(),
+            }],
+        });
+
+        // `:47-52`
+        let project = interaction
+            .prompt(AuthPrompt::text(ENTER_PROJECT_MESSAGE))
+            .await?;
+        let location = interaction
+            .prompt(AuthPrompt::text(ENTER_LOCATION_MESSAGE))
+            .await?;
+        let credentials_path = if method == METHOD_SERVICE_ACCOUNT {
+            Some(
+                interaction
+                    .prompt(AuthPrompt::text(ENTER_CREDENTIALS_PATH_MESSAGE))
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        // `:53-60` — no `key` on either arm; the env overlay is the whole credential.
+        let mut env = ProviderEnv::new();
+        env.insert(GOOGLE_CLOUD_PROJECT_ENV.to_string(), project);
+        env.insert(GOOGLE_CLOUD_LOCATION_ENV.to_string(), location);
+        if let Some(path) = credentials_path {
+            env.insert(GOOGLE_APPLICATION_CREDENTIALS_ENV.to_string(), path);
+        }
+        Ok(Credential::ApiKey {
+            key: None,
+            env: Some(env),
+        })
     }
 
     async fn resolve(

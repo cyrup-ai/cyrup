@@ -328,6 +328,9 @@ pub(crate) struct RunCtx {
     /// queued steering message is not drained a turn too early (Pi `skipInitialSteeringPoll`,
     /// agent.ts:351,440-446).
     skip_initial_steering_poll: bool,
+    /// AGENT-029 — pi's per-request `transformHeaders` (`sdk.ts:318-327` @v0.83.0), consulted with
+    /// THIS turn's model. `None` keeps the pre-existing static-overlay read.
+    header_fn: Option<Arc<HeaderFn>>,
 }
 
 impl RunCtx {
@@ -373,7 +376,27 @@ impl RunCtx {
             messages,
             turn_index: 0,
             skip_initial_steering_poll,
+            header_fn: None,
         }
+    }
+
+    /// Install the per-turn header resolver on an assembled context (AGENT-029). Kept off
+    /// [`Self::new`]'s already-long parameter list; `crate::loop_fn` leaves it unset.
+    pub(crate) fn with_header_fn(mut self, f: Option<Arc<HeaderFn>>) -> Self {
+        self.header_fn = f;
+        self
+    }
+
+    /// The header overlay for `model` — pi's `transformHeaders` result for the request it is about
+    /// to make (`sdk.ts:318-327` @v0.83.0). Falls back to the static [`Agent::set_headers`] overlay
+    /// when no resolver is installed or the resolver has no opinion about this model.
+    fn headers_for(&self, model: &ModelRef) -> Option<cyrup_provider::HeaderMap> {
+        if let Some(f) = &self.header_fn {
+            if let Some(h) = f(model) {
+                return Some(h);
+            }
+        }
+        lock(&self.state).headers.clone()
     }
 
     /// The sole emission path (arch-02 §5.1): reduce managed state (lock released BEFORE awaiting),
@@ -728,9 +751,11 @@ impl RunCtx {
             cache_retention: self.gen_config.cache_retention,
             // LIVE, not `gen_config`: pi rebuilds these inside `streamFn` for the model the request
             // is actually going to (`sdk.ts:318-327`), so a cross-provider `/model` switch must not
-            // keep sending the previous provider's attribution headers. Read per TURN off the
-            // shared state the facade writes through `Agent::set_headers`.
-            headers: lock(&self.state).headers.clone(),
+            // keep sending the previous provider's attribution headers. AGENT-029: resolve them
+            // from `model` — the loop's OWN per-turn model, which a sticky `TurnUpdate::model`
+            // override may have retargeted since run start — rather than from the latched
+            // `state.headers` snapshot, which only the two session-level model-change paths write.
+            headers: self.headers_for(&model),
             transport: self.gen_config.transport,
             max_retry_delay_ms: self.gen_config.max_retry_delay_ms,
             max_retries: self.gen_config.max_retries,
@@ -1239,7 +1264,24 @@ impl RunCtx {
                         });
                     }
                 });
-                let outcome = tool.execute(cid.clone(), args, child, on_update).await;
+                // AGENT-016 — pi wraps EVERY execute in try/catch/finally and converts a throw into
+                // `{ result: createErrorToolResult(...), isError: true }`
+                // (`packages/agent/src/agent-loop.ts:700-703` @v0.83.0, inside
+                // `executePreparedToolCall` at `:666-707`), identically in the parallel and the
+                // sequential batch. Without `catch_unwind` here the spawned task dies before the
+                // `ftx.send` below, `remaining` never reaches zero, the slot stays `None`, and the
+                // batch emits NO tool-result message for this call — so the next request carries an
+                // assistant `tool_use` with no matching `tool_result`. `AssertUnwindSafe` is sound
+                // for the same reason as in `emit`: the tool owns no managed-state lock across this
+                // await (keeps the crate `#![forbid(unsafe_code)]`).
+                let outcome =
+                    match std::panic::AssertUnwindSafe(tool.execute(cid.clone(), args, child, on_update))
+                        .catch_unwind()
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(payload) => Err(ToolError::new(panic_message(payload.as_ref()))),
+                    };
                 accepting.store(false, Ordering::Release);
                 let _ = ftx
                     .send(ToolRuntimeMsg::Finished {
@@ -1356,7 +1398,19 @@ impl RunCtx {
                         }
                     });
                     let child = self.cancel.child();
-                    let exec = tool.execute(call.id.clone(), args.clone(), child, on_update);
+                    // AGENT-016 — the same `catch_unwind` the parallel batch takes, so the two
+                    // modes match pi's SINGLE try/catch in `executePreparedToolCall`
+                    // (`agent-loop.ts:666-707` @v0.83.0, the throw→error-result conversion at
+                    // `:700-703`). Sequential already unwound to the run task's own `catch_unwind`
+                    // and closed cleanly, but "closed cleanly" is not pi's behaviour either: pi
+                    // finishes the batch with an error tool-result and keeps going.
+                    let exec = std::panic::AssertUnwindSafe(tool.execute(
+                        call.id.clone(),
+                        args.clone(),
+                        child,
+                        on_update,
+                    ))
+                    .catch_unwind();
                     tokio::pin!(exec);
                     let outcome = loop {
                         tokio::select! {
@@ -1372,7 +1426,12 @@ impl RunCtx {
                                     .await;
                                 }
                             }
-                            r = &mut exec => break r,
+                            r = &mut exec => break match r {
+                                Ok(o) => o,
+                                Err(payload) => {
+                                    Err(ToolError::new(panic_message(payload.as_ref())))
+                                }
+                            },
                         }
                     };
                     accepting.store(false, Ordering::Release);
@@ -1474,7 +1533,28 @@ pub struct Agent {
     tool_execution: ToolExecution,
     session_id: Option<SessionId>,
     gen_config: GenerationConfig,
+    /// AGENT-029 — the per-request header resolver (see [`HeaderFn`]). Installed by the session
+    /// facade after construction; `None` for a bare embedder agent, which keeps reading the static
+    /// `state.headers` overlay.
+    header_fn: Arc<Mutex<Option<Arc<HeaderFn>>>>,
 }
+
+/// Resolve the per-request header overlay for the model a turn is ACTUALLY going to — cyrup's port
+/// of pi's `transformHeaders` closure (`packages/coding-agent/src/core/sdk.ts:312-328` @v0.83.0,
+/// byte- and offset-identical at v0.84.1).
+///
+/// pi merges attribution inside a per-request callback closed over the `model` argument of *that*
+/// `streamSimple` invocation — i.e. the model the loop chose for that turn
+/// (`agent-loop.ts:308`, whose `config.model` is the possibly-overridden
+/// `nextTurnSnapshot.model ?? config.model` from `:237`). A model change of ANY origin therefore
+/// gets the right headers by construction. cyrup previously read a latched `StateInner::headers`
+/// snapshot whose only writers were the two SESSION-level model-change paths, so a per-turn
+/// `TurnUpdate::model` override retargeted the request while the previous provider's attribution
+/// headers rode along.
+///
+/// Returning `None` means "no opinion for this model" and falls back to the static
+/// [`Agent::set_headers`] overlay.
+pub type HeaderFn = dyn Fn(&ModelRef) -> Option<cyrup_provider::HeaderMap> + Send + Sync;
 
 impl Agent {
     pub fn builder(model: ModelRef, stream_fn: Arc<dyn StreamFn>) -> AgentBuilder {
@@ -1502,6 +1582,14 @@ impl Agent {
     /// and opencode session-affinity headers follow the ACTIVE provider.
     pub async fn set_headers(&self, h: Option<cyrup_provider::HeaderMap>) {
         lock(&self.state).headers = h;
+    }
+    /// Install (or clear) the per-turn header resolver — pi's `transformHeaders` closure
+    /// (`sdk.ts:318-327` @v0.83.0). See [`HeaderFn`]. When installed it is consulted with the model
+    /// of the turn being dispatched, so a mid-run `TurnUpdate::model` override can no longer carry
+    /// the previous provider's attribution headers (AGENT-029). The static [`Self::set_headers`]
+    /// overlay remains the fallback for a model the resolver has no opinion about.
+    pub fn set_header_fn(&self, f: Option<Arc<HeaderFn>>) {
+        *lock(&self.header_fn) = f;
     }
     /// Replace the preferred transport on the RUNNING agent — pi's `this.session.agent.transport =
     /// transport` (`interactive-mode.ts:4215`), the second half of the `/settings` "Transport"
@@ -1633,6 +1721,17 @@ impl Agent {
     }
 
     pub async fn continue_run(&self) -> Result<RunHandle, AgentError> {
+        // AGENT-020 — pi's run-active guard is the FIRST statement of `continue()`
+        // (`packages/agent/src/agent.ts:351-353` @v0.83.0), ahead of both the "No messages to
+        // continue from" throw at `:355-358` and the two `drain()` calls at `:361`/`:367`. Ordering
+        // it that way is what makes a rejected continuation leave the queues intact. Hoist it here
+        // for the same reason — and note this is only a FAST PATH: pi gets check-then-claim
+        // atomicity from single-threaded JS, Rust does not, so a run can still be claimed between
+        // this read and the latch CAS in `start_run`. The `push_front` restores below are the half
+        // that actually makes the drains lossless.
+        if self.is_running() {
+            return Err(AgentError::RunActive);
+        }
         let messages = lock(&self.state).messages.clone();
         if messages.is_empty() {
             return Err(AgentError::NoMessages);
@@ -1645,13 +1744,29 @@ impl Agent {
             // agent.ts:349-352); a follow-up-drain continuation does NOT skip (agent.ts:354-357).
             let steering = lock(&self.steering).drain();
             if !steering.is_empty() {
-                return self.start_run(EntryStart::Prompt(steering), true).await;
+                // Restore on rejection so the drained batch is not dropped on the floor: pi's
+                // guard-first ordering leaves `steeringQueue` untouched when the continuation is
+                // refused, so the message is still delivered at the loop's next steering poll
+                // (`agent-loop.ts:259`). Clone only what the restore needs.
+                return match self.start_run(EntryStart::Prompt(steering.clone()), true).await {
+                    Ok(h) => Ok(h),
+                    Err(e) => {
+                        lock(&self.steering).push_front(steering);
+                        Err(e)
+                    }
+                };
             }
             let follow = lock(&self.follow_up).drain();
             if follow.is_empty() {
                 return Err(AgentError::ContinueFromAssistant);
             }
-            return self.start_run(EntryStart::Prompt(follow), false).await;
+            return match self.start_run(EntryStart::Prompt(follow.clone()), false).await {
+                Ok(h) => Ok(h),
+                Err(e) => {
+                    lock(&self.follow_up).push_front(follow);
+                    Err(e)
+                }
+            };
         }
         self.start_run(EntryStart::Continue, false).await
     }
@@ -1729,7 +1844,8 @@ impl Agent {
             messages,
             cancel,
             skip_initial_steering_poll,
-        );
+        )
+        .with_header_fn(lock(&self.header_fn).clone());
 
         let (tx, rx) = oneshot::channel();
         let state = self.state.clone();
@@ -2004,6 +2120,7 @@ impl AgentBuilder {
             running_rx,
             tool_execution: self.tool_execution,
             session_id: self.session_id,
+            header_fn: Arc::new(Mutex::new(None)),
             gen_config: self.gen_config,
         }
     }

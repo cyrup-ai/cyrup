@@ -51,6 +51,26 @@ fn live_region_text(app: &App<TestBackend>) -> String {
     out
 }
 
+/// Flatten only the **footer** — the bottom rows `region_constraints` gives `StatusBar`
+/// (`footer.ts`'s `statsParts` line, plus the extension-status line when one is set). This is the
+/// band `pi`'s `statsParts` (`footer.ts:129-164`) owns, and the only place a `{n} queued` segment
+/// could ever have appeared.
+fn footer_text(app: &App<TestBackend>) -> String {
+    let buf = app.terminal().backend().buffer();
+    let area = buf.area;
+    let start = area.height.saturating_sub(2);
+    let mut out = String::new();
+    for y in start..area.height {
+        for x in 0..area.width {
+            if let Some(cell) = buf.cell((x, y)) {
+                out.push_str(cell.symbol());
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// True if any non-blank cell carries the given foreground color.
 fn has_fg(app: &App<TestBackend>, color: Color) -> bool {
     let buf = app.terminal().backend().buffer();
@@ -228,7 +248,20 @@ fn ingest_events_drive_status_and_transcript() {
     // queue segment upstream under any name. The extra segment pushed the right-aligned model name
     // over at narrow widths. pi surfaces queued messages in the transcript instead.
     assert_eq!(app.state().status.queued, 3, "queue depth not tracked");
-    assert!(!text.contains("queued"), "pi's footer has no queue segment:\n{text}");
+    // Assert the FOOTER, not the whole screen. The old form was `!text.contains("queued")` over the
+    // entire buffer, which was only ever a proxy for "no footer segment" — and it also asserted, in
+    // its comment, that "pi surfaces queued messages in the transcript instead". That second claim is
+    // wrong (it is the TUI-FIDELITY C14 error `TUI-016` corrects): pi surfaces them in
+    // `pendingMessagesContainer` (`interactive-mode.ts:3974-3991`), whose hint line is literally
+    // `↳ {key} to edit all queued messages`. So the screen now legitimately contains the word.
+    // Tightened to the real invariant plus the row that was missing.
+    let footer_rows = footer_text(&app);
+    assert!(!footer_rows.contains("queued"), "pi's footer has no queue segment:\n{footer_rows}");
+    // …and the queue IS surfaced, where pi puts it (`TUI-016`).
+    assert!(text.contains("Steering: one"), "pending steering row missing:\n{text}");
+    assert!(text.contains("Follow-up: two"), "pending follow-up row missing:\n{text}");
+    assert!(text.contains("Follow-up: three"), "pending follow-up row missing:\n{text}");
+    assert!(text.contains("to edit all queued messages"), "dequeue hint missing:\n{text}");
     // The model-change notification is a committed entry: it lives in scrollback, not the live region.
     let sb = app.scrollback_text();
     assert!(sb.contains("model → openai/gpt"), "model change not logged to scrollback:\n{sb}");

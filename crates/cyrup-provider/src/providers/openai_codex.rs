@@ -39,17 +39,15 @@
 //!   credential. Both are ported where upstream puts them.
 //! * **`openaiCodexOAuth.login`** (`auth/oauth/openai-codex.ts:392-460`) — the login-method picker,
 //!   the PKCE browser flow against `https://auth.openai.com/oauth/authorize` with its fixed
-//!   `localhost:1455/auth/callback` listener, and the headless device-code alternative. Every piece
-//!   of substrate it needs is already ported ([`crate::auth::generate_pkce`],
+//!   `localhost:1455/auth/callback` listener, and the headless device-code alternative — is ported
+//!   in [`crate::auth::oauth::openai_codex::OpenAiCodexOAuthFlow`], beside `auth/oauth/anthropic.rs`
+//!   and on that module's substrate ([`crate::auth::generate_pkce`],
 //!   [`crate::auth::CallbackServer`], [`crate::auth::poll_oauth_device_code_flow`],
-//!   [`crate::auth::AuthInteraction`]); the flow itself belongs in `auth/oauth/openai_codex.rs`
-//!   beside `auth/oauth/anthropic.rs`, registered through
-//!   [`crate::auth::register_bundled_oauth_flow_loaders`] so
-//!   [`crate::auth::oauth::load_openai_codex_oauth`] resolves it the way pi's
-//!   `lazyOAuth({ load: loadOpenAICodexOAuth })` does (`openai-codex.ts:14`). [`OpenAiCodexOAuth`]
-//!   therefore implements only the two [`crate::auth::OAuthAuth`] members a *stored* credential
-//!   needs — `refresh` and `to_auth` — exactly as
-//!   [`super::github_copilot::GitHubCopilotOAuth`] does.
+//!   [`crate::auth::AuthInteraction`]). [`OpenAiCodexOAuth`] below is the *runtime half* of the same
+//!   upstream object — the two [`crate::auth::OAuthAuth`] members a stored credential needs,
+//!   `refresh` and `to_auth`, which the flow delegates to — exactly as
+//!   [`super::github_copilot::GitHubCopilotOAuth`] is. [`openai_codex_auth`] wires the full flow so
+//!   `/login` reaches it (PROV-029).
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::oauth::now_ms;
@@ -126,8 +124,18 @@ pub fn openai_codex_models() -> Vec<Model> {
 
 /// The Codex [`ProviderAuth`] (pi `openai-codex.ts:13-15`): OAuth **only** — there is no env API
 /// key for the ChatGPT subscription endpoint.
+///
+/// PROV-029: the strategy is the FULL flow
+/// ([`crate::auth::oauth::openai_codex::OpenAiCodexOAuthFlow`]) — the login-method picker, the PKCE
+/// browser flow and the device-code alternative, plus `refresh`/`to_auth` — not [`OpenAiCodexOAuth`]
+/// alone, which left `login` on the [`OAuthAuth`] trait default so `/login openai-codex` reported
+/// `LoginUnsupported` against a fully ported flow. See
+/// [`super::github_copilot::github_copilot_auth`] for the `lazyOAuth` `[CYRUP-DELTA]` note that
+/// applies identically here (`openai-codex.ts:13`).
 pub fn openai_codex_auth() -> ProviderAuth {
-    ProviderAuth::with_oauth(Arc::new(OpenAiCodexOAuth::new()))
+    ProviderAuth::with_oauth(Arc::new(
+        crate::auth::oauth::openai_codex::OpenAiCodexOAuthFlow::new(),
+    ))
 }
 
 /// Construct the Codex provider over the given credential store + shared api registry.

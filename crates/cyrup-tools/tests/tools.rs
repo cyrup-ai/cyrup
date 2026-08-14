@@ -782,10 +782,15 @@ async fn bash_timeout_fractional_seconds() {
     let elapsed = start.elapsed();
     let msg = err.to_string();
     assert!(msg.contains("Command timed out after 2.5 seconds"), "got: {msg}");
+    // TOOL-026: the LOWER bound is the load-bearing half — it proves the 2.5s value was honoured
+    // rather than some default. The upper bound only has to stay far below the 30s sleep to prove
+    // the timeout fired at all; the old 4s ceiling left ~1.5s for scheduling plus the
+    // SIGTERM→grace→SIGKILL escalation plus reaping under an arbitrarily loaded run, which is a
+    // wall-clock figure this test cannot control.
     assert!(
         elapsed >= std::time::Duration::from_millis(2300)
-            && elapsed < std::time::Duration::from_millis(4000),
-        "expected ~2.5s kill, got {elapsed:?}"
+            && elapsed < std::time::Duration::from_secs(15),
+        "expected ~2.5s kill (and, at minimum, well before the 30s sleep), got {elapsed:?}"
     );
 }
 

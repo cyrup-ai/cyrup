@@ -7,7 +7,9 @@
 //! over **stdin** (`bash -s`) rather than argv (shell.ts:15-22).
 
 use cyrup_core::ToolError;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// How the command text reaches the shell (R-03-025 dual transport).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,20 +55,63 @@ fn get_bash_shell_config(program: PathBuf) -> ShellConfig {
     }
 }
 
+/// Pi bounds BOTH probes — `spawnSync("which", ["bash"], { …, timeout: 5000 })` (shell.ts:47) and
+/// the Windows `spawnSync("where", ["bash.exe"], { …, timeout: 5000 })` (shell.ts:28-32) — and on
+/// expiry falls through to the next arm (`sh -c` on unix, shell.ts:119; the `No bash shell found`
+/// throw on Windows, shell.ts:100-106).
+const BASH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// `findBashOnPath` (shell.ts:24-58): `which bash` on unix / `where bash.exe` on Windows. Returns
 /// the first match (verified to exist on Windows, where `where` can print stale paths).
+///
+/// Bounded at [`BASH_PROBE_TIMEOUT`] exactly like Pi's `spawnSync` timeout: a `which` wedged on a
+/// stale automount PATH entry must not wedge session construction. Node's `spawnSync` kills the
+/// child on expiry and reports a non-zero status, which lands in Pi's `result.status === 0` guard
+/// (shell.ts:48) — i.e. "no bash on PATH" — so expiry maps to `None` here.
 fn find_bash_on_path() -> Option<PathBuf> {
     #[cfg(not(unix))]
     let (cmd, arg) = ("where", "bash.exe");
     #[cfg(unix)]
     let (cmd, arg) = ("which", "bash");
 
-    let output = std::process::Command::new(cmd).arg(arg).output().ok()?;
-    if !output.status.success() {
+    // stdout is piped and read only after the child exits. Both probes emit at most a handful of
+    // short lines, far under a pipe buffer, so this cannot deadlock on a full pipe; `spawnSync`
+    // has the same shape (it buffers the whole child output).
+    let mut child = std::process::Command::new(cmd)
+        .arg(arg)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + BASH_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Node's `spawnSync` sends SIGTERM on timeout; the probe result is discarded
+                    // either way, so reap and report "not found".
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let first = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let mut buf = String::new();
+    child.stdout.take()?.read_to_string(&mut buf).ok()?;
+    let first = buf.lines().map(str::trim).find(|l| !l.is_empty())?;
     let path = PathBuf::from(first);
     #[cfg(not(unix))]
     {
@@ -93,35 +138,41 @@ impl ShellConfig {
             }
             return Err(ToolError::new(format!("Custom shell path not found: {p}")));
         }
-        Ok(Self::detect())
+        Self::try_detect()
     }
 
-    /// Detect the platform default shell (R-03-025), mirroring Pi's no-`shellPath` branch.
-    pub fn detect() -> Self {
-        // `CYRUP_SHELL` is a cyrup-specific override (honored through `get_bash_shell_config` so a
-        // WSL-legacy override still selects stdin transport); it has no Pi analogue.
-        if let Some(explicit) = std::env::var_os("CYRUP_SHELL") {
-            return get_bash_shell_config(PathBuf::from(explicit));
-        }
+    /// Detect the platform default shell (R-03-025), mirroring Pi's no-`shellPath` branch
+    /// (`getShellConfig`, shell.ts:76-119) — and, exactly like Pi, reading **no environment
+    /// variable as a shell selector**. The only `process.env` reads in `getShellConfig` are the
+    /// Windows *installation-location* lookups `ProgramFiles` / `ProgramFiles(x86)` (shell.ts:79,
+    /// :83) that build the Git Bash candidate list; the sole caller-supplied override is
+    /// `customShellPath`, i.e. the `shellPath` setting ([`ShellConfig::resolve`]).
+    ///
+    /// Fallible because the Windows arm ends in a throw (shell.ts:100-106) rather than a fallback
+    /// (ADR-0003 D4). The unix arm cannot fail: `sh -c` is Pi's terminal fallback (shell.ts:119).
+    pub fn try_detect() -> Result<Self, ToolError> {
         #[cfg(unix)]
         {
             // Pi unix order (shell.ts:109-119): `/bin/bash`, then `which bash`, then `sh -c`.
             if Path::new("/bin/bash").exists() {
-                return get_bash_shell_config(PathBuf::from("/bin/bash"));
+                return Ok(get_bash_shell_config(PathBuf::from("/bin/bash")));
             }
             if let Some(found) = find_bash_on_path() {
-                return get_bash_shell_config(found);
+                return Ok(get_bash_shell_config(found));
             }
-            ShellConfig {
+            Ok(ShellConfig {
                 program: PathBuf::from("sh"),
                 args: vec!["-c".to_string()],
                 transport: Transport::Argv,
-            }
+            })
         }
         #[cfg(not(unix))]
         {
-            // Pi Windows order (shell.ts:76-106): Git Bash in known locations, then `where bash.exe`,
-            // then (cyrup pragmatic fallback) cmd.exe `/C`.
+            // Pi Windows order (shell.ts:76-106): Git Bash in known locations, then `where
+            // bash.exe`, then a hard stop carrying the three-option repair recipe AND the searched
+            // paths. cyrup previously substituted `cmd.exe /C` here, which runs model-authored
+            // bash with different (or no) quoting, redirection and `$VAR` semantics and tells
+            // nobody — ADR-0003 D4 / TOOL-038.
             let mut candidates: Vec<PathBuf> = Vec::new();
             if let Some(pf) = std::env::var_os("ProgramFiles") {
                 candidates.push(PathBuf::from(pf).join("Git").join("bin").join("bash.exe"));
@@ -129,20 +180,43 @@ impl ShellConfig {
             if let Some(pf86) = std::env::var_os("ProgramFiles(x86)") {
                 candidates.push(PathBuf::from(pf86).join("Git").join("bin").join("bash.exe"));
             }
-            for cand in candidates {
+            for cand in &candidates {
                 if cand.exists() {
-                    return get_bash_shell_config(cand);
+                    return Ok(get_bash_shell_config(cand.clone()));
                 }
             }
             if let Some(found) = find_bash_on_path() {
-                return get_bash_shell_config(found);
+                return Ok(get_bash_shell_config(found));
             }
-            ShellConfig {
-                program: PathBuf::from("cmd.exe"),
-                args: vec!["/C".to_string()],
-                transport: Transport::Argv,
-            }
+            // shell.ts:100-106 verbatim, including the `  ${p}`-indented searched-path list.
+            let searched = candidates
+                .iter()
+                .map(|p| format!("  {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(ToolError::new(format!(
+                "No bash shell found. Options:\n  1. Install Git for Windows: \
+                 https://git-scm.com/download/win\n  2. Add your bash to PATH (Cygwin, MSYS2, \
+                 etc.)\n  3. Set shellPath in settings.json\n\nSearched Git Bash in:\n{searched}"
+            )))
         }
+    }
+
+    /// Infallible detection for the `Default` impls and for embedders that cannot propagate an
+    /// error. Prefer [`ShellConfig::try_detect`] at every real construction site so a Windows box
+    /// with no bash reports Pi's `No bash shell found` at session construction.
+    ///
+    /// [CYRUP-DELTA] Pi has no infallible entry point at all — `getShellConfig` throws
+    /// (shell.ts:100-106) and every caller lives with that. Rust's `Default` cannot, so the
+    /// unreachable-on-unix arm degrades to a bare `bash -c`: still bash, never a *different*
+    /// interpreter, and it fails loudly at spawn ("program not found") rather than silently
+    /// executing bash text under `cmd.exe` (ADR-0003 D4's implementation note).
+    pub fn detect() -> Self {
+        Self::try_detect().unwrap_or_else(|_| ShellConfig {
+            program: PathBuf::from("bash"),
+            args: vec!["-c".to_string()],
+            transport: Transport::Argv,
+        })
     }
 }
 
@@ -181,7 +255,7 @@ pub fn shell_env(bin_dir: Option<&Path>) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -212,6 +286,76 @@ mod tests {
             assert_eq!(cfg.program, PathBuf::from("/bin/sh"));
             assert_eq!(cfg.transport, Transport::Argv);
         }
+    }
+
+    /// TOOL-038 / ADR-0003 D4 — on Windows with no Git Bash and no `bash.exe` on PATH, detection
+    /// is Pi's hard stop (`shell.ts:100-106`), never a silent `cmd.exe /C` substitution.
+    ///
+    /// RED before the fix (the arm returned `cmd.exe` and `try_detect` did not exist); GREEN after.
+    #[cfg(not(unix))]
+    #[test]
+    fn windows_without_bash_errors_with_pis_repair_recipe() {
+        // SAFETY: single-threaded test; the two variables are read only by `try_detect`.
+        unsafe {
+            std::env::remove_var("ProgramFiles");
+            std::env::remove_var("ProgramFiles(x86)");
+            std::env::set_var("PATH", "");
+        }
+        let err = ShellConfig::try_detect().expect_err("no bash anywhere ⇒ Pi throws");
+        let msg = err.to_string();
+        assert!(msg.starts_with("No bash shell found. Options:"), "got: {msg}");
+        assert!(msg.contains("1. Install Git for Windows: https://git-scm.com/download/win"));
+        assert!(msg.contains("2. Add your bash to PATH (Cygwin, MSYS2, etc.)"));
+        assert!(msg.contains("3. Set shellPath in settings.json"));
+        assert!(msg.contains("Searched Git Bash in:"));
+        assert!(!msg.contains("cmd.exe"), "cyrup must never name a non-bash interpreter here");
+    }
+
+    /// The unix arm is unaffected by TOOL-038: `sh -c` stays Pi's terminal fallback
+    /// (`shell.ts:119`), so detection there is infallible.
+    #[cfg(unix)]
+    #[test]
+    fn unix_detection_is_infallible_and_never_yields_cmd_exe() {
+        let cfg = ShellConfig::try_detect().expect("unix detection cannot fail (shell.ts:119)");
+        assert_ne!(cfg.program, PathBuf::from("cmd.exe"));
+        assert!(
+            cfg.program == PathBuf::from("/bin/bash")
+                || cfg.program == PathBuf::from("sh")
+                || cfg.program.file_name().is_some_and(|n| n == "bash"),
+            "got {:?}",
+            cfg.program
+        );
+    }
+
+    /// TOOL-040 — the PATH probe is bounded at Pi's 5s (`shell.ts:47`, `:30`). Verified against a
+    /// real long-running command rather than by reading the constant.
+    #[cfg(unix)]
+    #[test]
+    fn path_probe_is_bounded() {
+        assert_eq!(BASH_PROBE_TIMEOUT, Duration::from_secs(5), "shell.ts:47 `timeout: 5000`");
+        // A probe whose child never exits must be reaped at the deadline, not waited on forever.
+        let started = Instant::now();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "the poll loop must reap on expiry");
     }
 
     #[test]

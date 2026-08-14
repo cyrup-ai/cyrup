@@ -9,6 +9,11 @@
 //!
 //! - [`ProtectedFs`] / [`ProtectedPaths`] — backend-seam decorator that blocks writes/edits to
 //!   protected paths (`.env`, `.git/`, `node_modules/`) while passing reads through (R-12-006).
+//!   **[CYRUP-DELTA], and off by default** (`SessionConfig::protect_paths: false`, ADR-0003 D5):
+//!   pi has no protected-path concept — `core/tools/write.ts:195-225` @v0.83.0 writes whatever
+//!   path it is handed. It decorates the **fs** seam ONLY; an embedder that opts in still leaves
+//!   `bash 'echo x >> .env'` unaffected, because the process seam is passed through undecorated
+//!   and no correct guard can be derived from arbitrary command text (ADR-0003 D6).
 //! - [`TraversalFs`] — backend-seam decorator confining all fs operations to a root, rejecting
 //!   `../` and symlink escapes (R-03-006).
 //! - [`PermissionPolicy`] / [`PolicyDecision`] / [`Rule`] — the pure, unit-testable decision logic

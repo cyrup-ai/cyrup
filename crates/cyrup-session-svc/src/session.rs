@@ -596,6 +596,18 @@ impl AgentSession {
         arc.services
             .host_services
             .attach_session_activity(Arc::new(SessionActivityHandle(Arc::downgrade(&arc))));
+        // AGENT-029: install pi's per-request `transformHeaders` (sdk.ts:312-328 @v0.83.0,
+        // byte- and offset-identical at v0.84.1). pi merges provider-attribution + session-affinity
+        // headers inside a callback closed over the `model` argument of THAT `streamSimple` call —
+        // i.e. the model the loop chose for that turn (`agent-loop.ts:308`, whose `config.model` is
+        // the possibly-overridden `nextTurnSnapshot.model ?? config.model` from `:237`). cyrup
+        // latched them into `StateInner::headers`, written only by the two SESSION-level model-change
+        // paths, so a per-turn `TurnUpdate::model` override retargeted the request while the previous
+        // provider's attribution rode along. Weak, so the resolver never keeps the session alive.
+        let hw = Arc::downgrade(&arc);
+        arc.agent.set_header_fn(Some(Arc::new(move |m: &ModelRef| {
+            hw.upgrade().and_then(|s| s.headers_for_model_ref(m))
+        })));
         arc
     }
 
@@ -605,6 +617,26 @@ impl AgentSession {
     /// awaiting so the SYNC `ctx.isIdle()` host import can answer.
     pub fn is_idle(&self) -> bool {
         !*self.driver_tx.borrow() && !self.agent.is_running()
+    }
+
+    /// Whether the session is processing an agent run **or a post-run continuation** — pi's
+    /// `_isAgentRunActive` (`packages/coding-agent/src/core/agent-session.ts:313` @v0.83.0), set at
+    /// the top of `_runAgentPrompt` at `:1062` and cleared only in `_emitAgentSettled` at `:582`, so
+    /// it spans `_handlePostAgentRun()` and every `agent.continue()`.
+    ///
+    /// AGENT-030: this — not the agent's per-run streaming flag — is what pi's `get isStreaming()`
+    /// returns (`:876-877`) and what `prompt()` consults at `:1159` to route a submission to
+    /// `_queueSteer` / `_queueFollowUp` instead of starting a run. cyrup's
+    /// [`Self::is_streaming`] reads `agent.snapshot().is_streaming`, which `SettlementGuard::drop`
+    /// clears the moment each INDIVIDUAL run settles, so a prompt landing in the post-run gap (an
+    /// auto-retry, an auto-compaction, a queued continuation) started a SECOND run that raced
+    /// `drive_run`'s `continue_run()`.
+    ///
+    /// The two latches are the exact complement of [`Self::is_idle`]: `driver_tx` covers the whole
+    /// post-run loop on a BOUND session, and `agent.is_running()` covers an unbound session, where
+    /// `spawn_run` drives `agent.prompt` directly and no driver loop exists.
+    pub fn is_run_active(&self) -> bool {
+        !self.is_idle()
     }
 
     /// Lock a `std::sync::Mutex` ignoring poisoning (no panic; arch-00 no-panic).
@@ -629,7 +661,10 @@ impl AgentSession {
         &self,
         input: impl Into<UserInput>,
     ) -> Result<EventStream<AgentSessionEvent>, SessionServiceError> {
-        if self.is_streaming().await {
+        // AGENT-030: the session-level run latch, not the agent's per-run streaming flag — pi's
+        // `prompt()` consults `this.isStreaming`, which IS `_isAgentRunActive`
+        // (agent-session.ts:876-877 / :1159 @v0.83.0). See [`Self::is_run_active`].
+        if self.is_run_active() {
             return Err(SessionServiceError::StreamingNeedsBehavior);
         }
         // Register the run-scoped subscription BEFORE starting the run so no event is missed.
@@ -856,7 +891,11 @@ impl AgentSession {
         mut ui: UserInput,
         options: PromptOptions,
     ) -> Result<Prepared, SessionServiceError> {
-        let streaming = self.is_streaming().await;
+        // AGENT-030: pi's whole preflight reads `this.isStreaming` == `_isAgentRunActive`
+        // (agent-session.ts:1022 for the `input` event's `streamingBehavior`, `:1159` for the
+        // queue routing) — the latch that spans `_handlePostAgentRun` and every `agent.continue()`,
+        // not a per-run flag. See [`Self::is_run_active`].
+        let streaming = self.is_run_active();
         // 0. Slash extension-command exec FIRST (Pi `_tryExecuteExtensionCommand`,
         //    agent-session.ts:1004-1013): for `expandPromptTemplates && text.startsWith("/")`, if a
         //    registered command name matches, run its handler and short-circuit (no prompt sent).
@@ -2802,6 +2841,25 @@ impl AgentSession {
             Some(&self.session_id),
             &[],
         )
+    }
+
+    /// The attribution overlay for the model a TURN is actually going to, addressed by the loop's
+    /// [`ModelRef`] rather than by a resolved [`Model`] (AGENT-029). This is the body of the
+    /// `transform_headers` resolver installed in [`Self::into_shared`] — pi's per-request
+    /// `transformHeaders` closure (`sdk.ts:318-327` @v0.83.0), whose `model` argument is the model
+    /// of that very request.
+    ///
+    /// Fast path: the session's own resolved model, which is what every turn uses unless a
+    /// `prepare_next_turn` hook retargeted the loop. Only a genuinely different model pays for a
+    /// registry scan. `None` (an unknown model id) means "no opinion" and leaves the agent's static
+    /// [`cyrup_agent::Agent::set_headers`] overlay in place.
+    fn headers_for_model_ref(&self, m: &ModelRef) -> Option<cyrup_provider::HeaderMap> {
+        let matches = |c: &Model| c.provider == m.provider && c.id == m.model;
+        let current = Self::lock(&self.compaction_model).clone();
+        if let Some(cur) = current.as_ref().filter(|c| matches(c)) {
+            return self.attribution_headers(cur);
+        }
+        self.full_model_registry().into_iter().find(matches).and_then(|c| self.attribution_headers(&c))
     }
 
     /// Emit the `model_select` extension event when the model actually changes (Pi `_emitModelSelect`,
@@ -4909,6 +4967,18 @@ impl AgentSession {
             self.agent.set_tools(tools).await;
         }
         self.agent.tools().await
+    }
+
+    /// The agent's live model + thinking level, for the per-turn refresh to stamp over whatever the
+    /// extension seam returned (AGENT-017). pi reads exactly these two off the AGENT — `model:
+    /// this.agent.state.model` (`agent-session.ts:537` @v0.83.0) and `thinkingLevel:
+    /// this.agent.state.thinkingLevel` (`:538`) — not the session's mirrors, and stamps them AFTER
+    /// the `...previousSnapshot` spread so the session out-votes an extension override.
+    pub(crate) async fn next_turn_model_baseline(
+        &self,
+    ) -> (ModelRef, cyrup_core::ModelThinkingLevel) {
+        let snap = self.agent.snapshot().await;
+        (snap.model, snap.thinking_level)
     }
 
     /// Set the active tool set by name, rebuilding the base system prompt and re-pushing both the

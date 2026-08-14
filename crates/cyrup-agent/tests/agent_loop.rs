@@ -1150,3 +1150,244 @@ async fn agent_002_parallel_defers_execution_until_whole_batch_is_prepared() {
         "parallel batch must still run concurrently once started: {seen:?}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// AGENT-020 — a REJECTED `continue_run` must leave the steering / follow-up queue intact.
+//
+// pi's `continue()` throws its run-active guard as its FIRST statement
+// (`packages/agent/src/agent.ts:351-353` @v0.83.0), ahead of `steeringQueue.drain()` at `:361` and
+// `followUpQueue.drain()` at `:367`, so a refused continuation leaves both queues untouched and the
+// message is still delivered at the loop's next drain point (`agent-loop.ts:259`/`:263`). cyrup
+// drained FIRST and only then claimed the latch in `start_run`, dropping the drained
+// `Vec<AgentMessage>` on the floor on `Err(RunActive)` — no error, no log, no retry.
+//
+// The live-terminal repro of 2026-08-13 refuted the filed *Impact* (typing during a stream queues
+// and re-drives; it never enters this window — 5/5 delivered) but not the defect: on the AGENT API
+// itself the loss is DETERMINISTIC, not a race. Any embedder that calls `continue_run()` while a run
+// is in flight — exactly what this test does — loses the queued message outright. That is what these
+// two tests pin.
+// ----------------------------------------------------------------------------
+
+/// A tool that parks until released, so the run is provably in flight while the transcript already
+/// ends with the assistant `tool_use` message.
+struct GateTool {
+    params: Value,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Tool for GateTool {
+    fn name(&self) -> &str {
+        "gate"
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(ToolResult {
+            content: vec![Content::text("gated")],
+            details: None,
+            terminate: false,
+            ..Default::default()
+        })
+    }
+}
+
+fn gate_tool() -> (Arc<GateTool>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    (
+        Arc::new(GateTool {
+            params: obj_schema(),
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        entered,
+        release,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent020_rejected_continue_keeps_the_steering_message() {
+    let (gate, entered, release) = gate_tool();
+    let (_faux, sf) = faux_stream_fn(vec![
+        faux_assistant_message(vec![faux_tool_call("gate", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let agent = Agent::builder(model_ref(), sf).tools(vec![gate]).build();
+
+    let handle = agent.prompt("go").await.unwrap();
+    // The tool has started ⇒ the run holds the latch AND `state.messages` already ends with the
+    // assistant `tool_use` message, so `continue_run` takes its `last_is_assistant` branch.
+    entered.notified().await;
+    assert!(agent.is_running(), "the run is in flight");
+
+    agent.steer(AgentMessage::user_text("keep-me"));
+    let rejected = agent.continue_run().await;
+    assert!(
+        matches!(rejected, Err(cyrup_agent::AgentError::RunActive)),
+        "a continuation during an active run is refused, as pi throws at agent.ts:351-353"
+    );
+    // RED before the fix: `continue_run` had already drained the queue by the time `start_run`
+    // rejected it, so the message was gone.
+    assert!(
+        agent.has_queued_messages(),
+        "a REFUSED continuation must leave the steering queue intact (pi guards before draining)"
+    );
+
+    release.notify_one();
+    let _ = handle.finished().await;
+    agent.wait_for_idle().await;
+    // ...and because it survived, the running loop still delivers it.
+    assert!(!agent.has_queued_messages(), "the surviving message was delivered by the loop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent020_rejected_continue_keeps_the_follow_up_message() {
+    let (gate, entered, release) = gate_tool();
+    let (_faux, sf) = faux_stream_fn(vec![
+        faux_assistant_message(vec![faux_tool_call("gate", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let agent = Agent::builder(model_ref(), sf).tools(vec![gate]).build();
+
+    let handle = agent.prompt("go").await.unwrap();
+    entered.notified().await;
+
+    // Steering empty, follow-up populated ⇒ `continue_run` reaches its SECOND drain
+    // (pi `followUpQueue.drain()`, agent.ts:367).
+    agent.follow_up(AgentMessage::user_text("keep-me-too"));
+    let rejected = agent.continue_run().await;
+    assert!(matches!(rejected, Err(cyrup_agent::AgentError::RunActive)));
+    assert!(
+        agent.has_queued_messages(),
+        "a REFUSED continuation must leave the follow-up queue intact too"
+    );
+
+    release.notify_one();
+    let _ = handle.finished().await;
+    agent.wait_for_idle().await;
+}
+
+// ----------------------------------------------------------------------------
+// AGENT-016 — a panicking tool must not swallow its slot in EITHER batch mode.
+//
+// pi wraps every execute in try/catch/finally and converts a throw into
+// `{ result: createErrorToolResult(...), isError: true }` (`agent-loop.ts:700-703` @v0.83.0, inside
+// `executePreparedToolCall` at `:666-707`) — identically in the parallel and the sequential batch.
+// cyrup's PARALLEL path awaited the tool inside a `joinset.spawn` with no `catch_unwind`: on unwind
+// the finish message was never sent, `remaining` never reached zero, the drain exited via
+// `None => break`, the slot stayed `None` and NO tool-result message was emitted for that call — so
+// the next provider request carried an assistant `tool_use` with no matching `tool_result`.
+// Unwind builds only (`[profile.release] panic = "abort"` aborts instead), which is every
+// `cargo test` / `cargo run` and any embedder that does not opt into abort.
+// ----------------------------------------------------------------------------
+
+struct PanicTool {
+    name: String,
+    params: Value,
+}
+
+impl PanicTool {
+    fn new(name: &str) -> Arc<Self> {
+        Arc::new(Self { name: name.into(), params: obj_schema() })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for PanicTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        panic!("boom-42");
+    }
+}
+
+async fn agent016_batch(execution: ToolExecution) {
+    let (echo, _) = EchoTool::new("ok");
+    let (_faux, sf) = faux_stream_fn(vec![
+        faux_assistant_message(
+            vec![faux_tool_call("boom", json!({})), faux_tool_call("ok", json!({}))],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_message(vec![faux_text("after")], StopReason::Stop),
+    ]);
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![PanicTool::new("boom"), echo])
+        .tool_execution(execution)
+        .build();
+    let recorder = Arc::new(Recorder::default());
+    agent.subscribe(recorder.clone());
+
+    agent.prompt("go").await.unwrap();
+    agent.wait_for_idle().await;
+
+    let events = recorder.snapshot();
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionEnd { tool_name, result, is_error, .. } => {
+                Some((tool_name.clone(), result.clone(), *is_error))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 2, "both calls in the batch report a tool_execution_end: {ends:?}");
+    let (_, boom_result, boom_is_error) =
+        ends.iter().find(|(n, _, _)| n == "boom").expect("the panicking call reported an end");
+    assert!(*boom_is_error, "a panicking tool is an ERROR result, as pi's catch produces");
+    assert!(
+        boom_result.to_string().contains("boom-42"),
+        "the panic payload becomes the error text (pi surfaces the thrown message): {boom_result}"
+    );
+
+    // The invariant that actually breaks the conversation: one tool_result message per tool_use.
+    let tool_result_ends = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::MessageEnd { message: AgentMessage::ToolResult(_) }))
+        .count();
+    assert_eq!(tool_result_ends, 2, "two tool_use blocks ⇒ two tool_result messages");
+    let turn_end_results = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::TurnEnd { tool_results, .. } => Some(tool_results.len()),
+            _ => None,
+        })
+        .expect("a turn_end was emitted");
+    assert_eq!(turn_end_results, 2, "turn_end carries both results");
+
+    // And the pending set is drained, so the next request is well-formed.
+    assert!(
+        agent.snapshot().await.pending_tool_calls.is_empty(),
+        "no tool call is left pending after the batch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent016_panicking_tool_keeps_its_slot_in_a_parallel_batch() {
+    agent016_batch(ToolExecution::Parallel).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent016_panicking_tool_keeps_its_slot_in_a_sequential_batch() {
+    agent016_batch(ToolExecution::Sequential).await;
+}

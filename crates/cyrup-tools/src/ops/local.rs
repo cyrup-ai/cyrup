@@ -809,26 +809,39 @@ mod tests {
 
     /// An ALREADY-cancelled token must never spawn a process at all — Pi's real
     /// `createLocalBashOperations.exec` checks `signal?.aborted` and throws BEFORE calling `spawn()`
-    /// (`bash.ts:86-88`), ahead of even the cwd-exists check. Proven here the same way the sibling
-    /// SIGKILL tests prove immediacy: a marker file the child would create if it ever ran must stay
-    /// absent, and the call must return near-instantly (no real process start/teardown latency).
+    /// (`bash.ts:86-88`), ahead of even the cwd-exists check.
+    ///
+    /// TOOL-030: proven WITHOUT any wall-clock bound. The cwd is deliberately a path that does not
+    /// exist, which makes the short-circuit's position observable rather than merely fast: the
+    /// cancel check at `LocalProc::exec` sits strictly BEFORE the `Working directory does not
+    /// exist` guard, which itself sits before `spawn()`. So
+    ///   * short-circuit present ⇒ `Ok(ExitStatus::Killed)` (this assertion),
+    ///   * short-circuit removed ⇒ `Err("Working directory does not exist: …")`, and
+    ///   * short-circuit moved after `spawn()` ⇒ still `Err`, since the spawn itself fails.
+    /// No ordering other than Pi's can produce `Ok(Killed)` here. The marker check is kept as a
+    /// belt-and-braces witness (it is NOT sufficient on its own — a child that spawned and was
+    /// killed before `touch` completed also leaves it absent).
     #[tokio::test]
     async fn exec_pre_cancelled_never_spawns() {
         let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
         let marker = std::env::temp_dir().join(format!("cyrup-exec-precancel-{}", unique_suffix()));
+        let missing_cwd =
+            std::env::temp_dir().join(format!("cyrup-exec-precancel-cwd-{}", unique_suffix()));
+        assert!(!missing_cwd.exists(), "the sentinel cwd must not exist");
         let cancel = CancelToken::new();
         cancel.cancel();
-        let started = tokio::time::Instant::now();
+        let spec = ExecSpec {
+            cwd: missing_cwd,
+            ..exec_spec(&format!("touch {}", marker.display()))
+        };
         let status = proc
-            .exec(exec_spec(&format!("touch {}", marker.display())), cancel, None, &mut |_data: &[u8]| {})
+            .exec(spec, cancel, None, &mut |_data: &[u8]| {})
             .await
-            .expect("a pre-cancelled exec resolves Ok, not Err");
+            .expect(
+                "a pre-cancelled exec resolves Ok(Killed) — reaching the cwd-exists guard or \
+                 `spawn()` at all would have produced Err",
+            );
         assert_eq!(status, ExitStatus::Killed, "pre-cancelled reports the same reason as mid-run cancel");
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "must short-circuit before spawning, not pay real process start/teardown latency, got {:?}",
-            started.elapsed()
-        );
         assert!(
             !marker.exists(),
             "the shell command must NEVER have run — an already-cancelled token guarantees zero \
@@ -1025,11 +1038,19 @@ mod tests {
                  printf '%s\\n' \"$i\"; i=$((i+1)); done",
                 gt_path.display()
             );
+            // TOOL-030/TOOL-020: the RUN window (250ms) is decoupled from the KILL GRACE (15ms,
+            // configured above). The grace is what this test exercises — SIGTERM is trapped, so
+            // the forced-SIGKILL escalation still fires 15ms after the timeout — while the run
+            // window only has to guarantee the child completed at least one loop iteration before
+            // being killed. At 15ms that guarantee was a scheduling gamble (fork + exec of
+            // `/bin/sh` plus one iteration inside roughly 30ms); at 250ms it holds by construction
+            // on any host that can start a process at all, with the SIGKILL race the test is
+            // actually about completely unchanged.
             let out = proc
                 .exec_argv(
                     argv("sh", &["-c", &script]),
                     CancelToken::new(),
-                    Some(Duration::from_millis(15)),
+                    Some(Duration::from_millis(250)),
                 )
                 .await
                 .expect("exec_argv runs");
@@ -1046,8 +1067,15 @@ mod tests {
             assert!(
                 gt_last >= 0,
                 "trial {trial}: the child must have run at least one loop iteration before being \
-                 killed (ground truth file was empty)"
+                 killed (ground truth file was empty) — with a 250ms run window this is a real \
+                 failure, not the scheduling race the old 15ms window made it"
             );
+            // TOOL-020 claimed this bound "assumes the host `ShellConfig::detect()` shell flushes
+            // stdout once per iteration". That half is REFUTED at HEAD: `exec_argv` runs the
+            // program it is handed, and this call hands it `argv("sh", …)` literally — the
+            // `ShellConfig::detect()` passed to `with_kill_grace` is only consulted by `exec`, not
+            // by `exec_argv`. The dependence is on `/bin/sh`'s builtin `printf`, which flushes per
+            // command, and is identical on every POSIX host.
             assert!(
                 gt_last - stdout_last <= 1,
                 "trial {trial}: captured stdout (last line {stdout_last}) lagged the ground-truth \

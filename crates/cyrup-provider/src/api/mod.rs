@@ -20,6 +20,7 @@ pub mod compat;
 pub mod anthropic_messages;
 pub mod azure_openai_responses;
 pub mod bedrock_converse_stream;
+pub mod github_copilot_headers;
 pub mod google_generative_ai;
 pub mod mistral_conversations;
 pub mod openai_codex_responses;

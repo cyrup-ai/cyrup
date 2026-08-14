@@ -74,6 +74,7 @@ use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcom
 use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
+use crate::escape_reassembly::EscapeReassembler;
 use crate::stray_reply::StrayReplyFilter;
 use crate::terminal_title::session_terminal_title;
 use crate::text_input::TextInputSelector;
@@ -281,6 +282,12 @@ pub struct AppState {
     /// Images attached to the next prompt (the `@`-mention of an image file / a paste), rendered
     /// inline above the editor in the live region (`components/image.ts`), honoring `show_images`.
     pub pending_images: Vec<ImageBlock>,
+    /// Messages the session is HOLDING because a turn is streaming — Pi's
+    /// `pendingMessagesContainer` (`interactive-mode.ts:328`, filled by
+    /// `updatePendingMessagesDisplay` at `:3974-3991`), docked directly above the status band.
+    /// Fed from `queue_update`; see [`crate::pending_messages`] for why it exists and what it
+    /// replaced (TUI-016 / TUI-052).
+    pub pending_messages: crate::pending_messages::PendingMessages,
     /// Reserve the 2-row status band even when idle (spec/tui/01 §6.3). Default `false` (Pi's
     /// non-`clearOnShrink` behavior) so the editor/footer never reflow on idle viewports.
     pub reserve_status_rows: bool,
@@ -486,6 +493,7 @@ impl AppState {
             show_images: true,
             image_renderer: ImageRenderer::default(),
             pending_images: Vec::new(),
+            pending_messages: crate::pending_messages::PendingMessages::default(),
             reserve_status_rows: false,
             term_rows: 24,
             show_startup_hints: true,
@@ -778,7 +786,28 @@ pub struct App<B: Backend> {
     /// [`App::set_login_provider_source`] so a test can drive the whole `/login` path against a
     /// stub provider WITHOUT reaching a real endpoint (see `tests/login_flow.rs`).
     login_providers: Option<LoginProviderSource>,
+    /// Where a spawned `/compact` posts its outcome back to the run loop — installed by
+    /// [`App::install_compact_channel`], the same shape as [`Self::tree_nav_tx`].
+    ///
+    /// **TUI-055.** `session.compact(...)` is a 10–20 s provider call. Awaited inline in the run
+    /// loop's `AppAction::Command` arm — which is what cyrup did — that single task cannot reach any
+    /// other `select!` arm for the whole operation: the `compaction_start` event sits unread in
+    /// `events`, `IndicatorKind::Compaction` is never armed, and the 80 ms spinner arm never fires.
+    /// Measured live on 2026-08-13, sampled every 200 ms across a 10.5 s compaction: the status band
+    /// was empty in **every** sample. Spawning it and answering over this channel is the same
+    /// channel-back shape `/tree` and `/login` already use, and it is what lets the band Pi shows
+    /// for the whole operation (`interactive-mode.ts:3075-3087`) actually reach the screen.
+    ///
+    /// `None` (an embedder or a test driving `execute_command` directly) falls back to awaiting
+    /// inline, exactly as `/tree` does — correct, just without a live band, because there is no loop
+    /// to paint one.
+    compact_tx: Option<tokio::sync::mpsc::UnboundedSender<CompactOutcome>>,
 }
+
+/// What a spawned `/compact` hands back to the run loop — the `Ok`/`Err` of
+/// [`AgentSession::compact`](cyrup_session_svc::AgentSession::compact), with the error already
+/// rendered to a string so the message needs no session to interpret.
+pub type CompactOutcome = Result<cyrup_session_svc::CompactionResult, String>;
 
 /// Where `/login` reads the provider registry from — Pi's `modelRuntime.getProviders()`
 /// (`interactive-mode.ts:4943`). See [`App::set_login_provider_source`].
@@ -830,6 +859,7 @@ impl<B: Backend> App<B> {
             package_update_rx: None,
             login_tx: None,
             login_providers: None,
+            compact_tx: None,
         })
     }
 
@@ -1746,10 +1776,16 @@ impl<B: Backend> App<B> {
         }
         match dispatch {
             Dispatch::Empty => AppAction::Redraw,
-            Dispatch::Prompt(prompt) => {
-                self.state.transcript.push_user(prompt.clone());
-                AppAction::Submit(prompt)
-            }
+            // TUI-016 / TUI-052 — **no transcript echo here.** Pi's submit handler clears the editor
+            // and calls `updatePendingMessagesDisplay()` (`interactive-mode.ts:2827-2833`); it never
+            // writes the text into the chat container. The bubble is written when the session emits
+            // `message_start` for the user message (`:2915-2918`), which for a message the session
+            // QUEUES does not happen until the turn that carries it starts.
+            //
+            // cyrup used to `push_user` unconditionally right here, so a queued message was rendered
+            // as a delivered one — and a message dequeued by Escape stayed in the transcript forever
+            // as a phantom user turn that was never sent and is not in the session JSONL (TUI-052).
+            Dispatch::Prompt(prompt) => AppAction::Submit(prompt),
             Dispatch::Command { name, arg } => self.run_command(&name, arg),
             Dispatch::Bash { command, excluded } => {
                 // Open the live bash block (`bash-execution.ts`) and hand the spawn to the run loop.
@@ -2344,6 +2380,39 @@ impl<B: Backend> App<B> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<LoginUiMsg>();
         self.login_tx = Some(tx);
         rx
+    }
+
+    /// Install the off-task `/compact` channel and hand back its receiver (TUI-055).
+    ///
+    /// [`App::run`] calls this once at startup, exactly like [`Self::install_tree_nav_channel`].
+    /// Without it `C::Compact` awaits the compaction inline and the run loop is frozen for its whole
+    /// duration — see [`Self::compact_tx`] for the measurement that made this necessary. `pub` so a
+    /// test can drive the spawned path without standing up a run loop.
+    pub fn install_compact_channel(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<CompactOutcome> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<CompactOutcome>();
+        self.compact_tx = Some(tx);
+        rx
+    }
+
+    /// Render a settled `/compact` — the summary message on success, Pi's reason string on refusal.
+    ///
+    /// Shared by the inline and spawned paths so the two cannot drift; the run loop calls it from
+    /// the `compact_rx` arm.
+    pub fn apply_compact_outcome(&mut self, outcome: CompactOutcome) {
+        match outcome {
+            // Render the compaction-summary message (`compaction-summary-message.ts`): the
+            // `[compaction]` label + `**Compacted from N tokens**` markdown body produced by the
+            // op (Pi appends a `CompactionSummaryMessage` after a manual `/compact`).
+            Ok(result) => {
+                self.state.transcript.push_compaction_summary(result.tokens_before, result.summary);
+            }
+            // A refusal (nothing to compact / already compacted / an extension veto) carries Pi's
+            // reason string, so the status line names WHY instead of the old undifferentiated
+            // "nothing to compact".
+            Err(e) => self.state.transcript.push_status(format!("compact error: {e}")),
+        }
     }
 
     /// Override where `/login` sources its provider registry (default:
@@ -4124,19 +4193,25 @@ impl<B: Backend> App<B> {
                     Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
                 }
             }
-            C::Compact(arg) => match session.compact(arg).await {
-                // Render the compaction-summary message (`compaction-summary-message.ts`): the
-                // `[compaction]` label + `**Compacted from N tokens**` markdown body produced by the
-                // op (Pi appends a `CompactionSummaryMessage` after a manual `/compact`).
-                Ok(result) => {
-                    self.state
-                        .transcript
-                        .push_compaction_summary(result.tokens_before, result.summary);
+            // TUI-055 — SPAWNED when a run loop is servicing `compact_tx`. `session.compact` is a
+            // 10–20 s provider call; awaiting it here froze the loop for its whole duration, so the
+            // `compaction_start` event that arms `IndicatorKind::Compaction` was never read and the
+            // 80 ms spinner arm never fired — the screen was simply blank. Pi keeps its band on
+            // screen for the entire operation (`interactive-mode.ts:3075-3087`); this is what lets
+            // cyrup's reach the frame. The outcome comes back over the channel and is applied by
+            // [`Self::apply_compact_outcome`], which the inline fallback below also uses.
+            C::Compact(arg) => match self.compact_tx.clone() {
+                Some(tx) => {
+                    let session = session.clone();
+                    tokio::spawn(async move {
+                        let outcome = session.compact(arg).await.map_err(|e| e.to_string());
+                        let _ = tx.send(outcome);
+                    });
                 }
-                // A refusal (nothing to compact / already compacted / an extension veto) is now an
-                // `Err` carrying Pi's reason string, so the status line names WHY instead of the old
-                // undifferentiated "nothing to compact".
-                Err(e) => self.state.transcript.push_status(format!("compact error: {e}")),
+                None => {
+                    let outcome = session.compact(arg).await.map_err(|e| e.to_string());
+                    self.apply_compact_outcome(outcome);
+                }
             },
             C::Clone => match session.clone_at(None).await {
                 Ok(id) => self.state.transcript.push_status(format!("cloned session → {id}")),
@@ -4504,8 +4579,24 @@ impl<B: Backend> App<B> {
             // thing this arm has to reproduce is the LIFETIME — the bit `message_end` reads to know
             // an assistant message is open and unfinalized (`:3182`).
             AgentSessionEvent::MessageStart { .. } => {
-                if message_role_from_event(ev).as_deref() == Some("assistant") {
-                    self.state.streaming_assistant = true;
+                match message_role_from_event(ev).as_deref() {
+                    Some("assistant") => self.state.streaming_assistant = true,
+                    // Pi `:2915-2918`: `event.message.role === "user"` →
+                    // `this.addMessageToChat(event.message)` then
+                    // `this.updatePendingMessagesDisplay()`. **This is the only place a user bubble
+                    // is written** (TUI-016 / TUI-052) — the submission path deliberately does not,
+                    // because the session may queue it instead of sending it, and a queued message
+                    // belongs to the pending region until the turn that carries it actually starts.
+                    // The `queue_update` that drains the queue arrives around this event, so the row
+                    // and the bubble hand off without ever both being on screen.
+                    Some("user") => {
+                        if let Some(text) = user_message_text_from_event(ev)
+                            && !text.trim().is_empty()
+                        {
+                            self.state.transcript.push_user(text);
+                        }
+                    }
+                    _ => {}
                 }
             }
             // Pi `case "message_end"` (`interactive-mode.ts:3180-3216`). This is where an assistant
@@ -4615,8 +4706,13 @@ impl<B: Backend> App<B> {
                 // components scrolling up into native history as the turn proceeds.
                 self.state.transcript.commit_finished_leading_tools();
             }
+            // Pi `case "queue_update"` (`interactive-mode.ts:2888-2891`): rebuild the
+            // pending-messages region and re-render. TUI-016 — cyrup used to keep only the COUNT
+            // (`status.set_queued`) and, since the fidelity pass deleted the `{n} queued` footer
+            // segment, rendered it nowhere; the texts were dropped on the floor here.
             AgentSessionEvent::QueueUpdate { steering, follow_up } => {
-                self.state.status.set_queued(steering.len().saturating_add(follow_up.len()));
+                self.state.pending_messages.set(steering.clone(), follow_up.clone());
+                self.state.status.set_queued(self.state.pending_messages.len());
             }
             AgentSessionEvent::CompactionStart { reason } => {
                 // Pi `case "compaction_start"` (`interactive-mode.ts:3076-3078`): compaction is
@@ -4635,9 +4731,10 @@ impl<B: Backend> App<B> {
                     }
                     CompactionReason::Threshold => "Auto-compacting...".to_string(),
                 };
-                // X18 — the indicator is a BAND, not a message. `interactive-mode.ts:3286-3298`
-                // `case "compaction_start"` calls `showStatusIndicator(new
-                // CompactionStatusIndicator(...))` and nothing else; `StatusIndicator` extends
+                // X18 — the indicator is a BAND, not a message. `interactive-mode.ts:3075-3087`
+                // (citation re-derived at v0.83.0) `case "compaction_start"` calls
+                // `showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason))` at
+                // `:3084` and nothing else; `StatusIndicator` extends
                 // `Loader` (`status-indicator.ts:9-27`) and is mounted in the fixed status slot, so
                 // it disappears the moment `clearStatusIndicator` runs. cyrup was ALSO pushing the
                 // identical string into the transcript, which `insert_before` then froze into
@@ -5417,6 +5514,26 @@ fn message_role_from_event(ev: &AgentSessionEvent) -> Option<String> {
     Some(value.get("message")?.get("role")?.as_str()?.to_string())
 }
 
+/// The text of the USER message a `message_start` carries — Pi's `event.message` handed to
+/// `addMessageToChat` (`interactive-mode.ts:2916`). Returns `None` for any other event or role.
+///
+/// This is what writes the user bubble into the transcript, and the only thing that does for a live
+/// submission: a message the session decides to QUEUE produces no `message_start` until the turn
+/// that actually carries it begins, which is precisely the distinction TUI-016/TUI-052 turn on.
+fn user_message_text_from_event(ev: &AgentSessionEvent) -> Option<String> {
+    let value = serde_json::to_value(ev).ok()?;
+    let message = value.get("message")?;
+    if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+        return None;
+    }
+    // Same projection [`assistant_message_from_event`] uses: `cyrup_agent::AgentMessage` is not a
+    // direct dependency of this crate, and the serialized form is stable — it is the wire shape the
+    // `--json` stream and the session JSONL are both written from.
+    let content: Vec<cyrup_core::Content> =
+        serde_json::from_value(message.get("content")?.clone()).ok()?;
+    Some(crate::transcript::content_text(&content))
+}
+
 /// The authoritative [`AssistantMessage`](cyrup_core::AssistantMessage) a `message_end` carries, via
 /// the same projection. `AgentMessage::Assistant` is an internally-tagged newtype variant, so the
 /// serialized object is the assistant message's own fields plus `role` — which deserializes
@@ -5877,7 +5994,7 @@ pub(crate) fn max_visible_editor_lines(term_rows: u16) -> u16 {
     ((u32::from(term_rows) * 3 / 10).min(u32::from(u16::MAX)) as u16).max(5)
 }
 
-fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 6] {
+fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 7] {
     let avail = avail.max(1);
     let max_editor = avail.saturating_sub(2).max(3);
     // A selector owns the slot at its desired height; otherwise the editor sizes to its line count +
@@ -5973,6 +6090,13 @@ fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 6] {
     remaining = remaining.saturating_sub(band);
     let images = want_images.min(remaining);
     remaining = remaining.saturating_sub(images);
+    // TUI-016 — Pi's `pendingMessagesContainer`, docked immediately after `chatContainer` and
+    // immediately before `statusContainer` (`interactive-mode.ts:712-714`), i.e. the first
+    // live-region row after the message area. Its `VStack` entry is `shrink: 1, minSize: 0`, so it
+    // is one of the entries that gives its rows up before the editor does; taking it after the
+    // editor/footer floors, the popup, the band and the images reproduces that priority.
+    let pending = state.pending_messages.height().min(remaining);
+    remaining = remaining.saturating_sub(pending);
     // The message region = the active turn's content, plus the startup-hint block at idle, capped
     // to whatever rows remain (so the inline viewport stays content-sized, not full-screen).
     let active = state.transcript.content_height(width as usize, &state.theme).min(u16::MAX as usize)
@@ -5989,7 +6113,7 @@ fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 6] {
         0
     };
     let msg = active.max(hint).min(remaining);
-    [msg, band, images, slot, popup, footer]
+    [msg, pending, band, images, slot, popup, footer]
 }
 
 /// The inline-viewport height = the sum of the live-region rows (audit #1). Driven by
@@ -6008,19 +6132,21 @@ fn live_region_height(state: &AppState, width: u16, term_height: u16) -> u16 {
 /// Pure render: lay out conversation / editor / status and render each component (`state -> frame`).
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
-    let [msg_h, band_h, images_h, slot_h, popup_h, footer_h] =
+    let [msg_h, pending_h, band_h, images_h, slot_h, popup_h, footer_h] =
         region_constraints(state, area.width, area.height);
     let _ = msg_h; // the message region absorbs the remainder via `Min(0)` below.
-    let [msg_area, band_area, images_area, slot_area, popup_area, status_area] = Layout::vertical([
-        // `Min(0)` (not the old `Min(1)`): the empty turn must not balloon the viewport (audit #1).
-        Constraint::Min(0),
-        Constraint::Length(band_h),
-        Constraint::Length(images_h),
-        Constraint::Length(slot_h),
-        Constraint::Length(popup_h),
-        Constraint::Length(footer_h),
-    ])
-    .areas(area);
+    let [msg_area, pending_area, band_area, images_area, slot_area, popup_area, status_area] =
+        Layout::vertical([
+            // `Min(0)` (not the old `Min(1)`): the empty turn must not balloon the viewport (audit #1).
+            Constraint::Min(0),
+            Constraint::Length(pending_h),
+            Constraint::Length(band_h),
+            Constraint::Length(images_h),
+            Constraint::Length(slot_h),
+            Constraint::Length(popup_h),
+            Constraint::Length(footer_h),
+        ])
+        .areas(area);
     state.transcript.render(frame, msg_area, &state.theme);
     // The compact startup-help block (`compactInstructions` + `compactOnboarding` + `onboarding`,
     // the startup `ExpandableText`'s collapsed body at interactive-mode.ts:936-957, framed by
@@ -6045,6 +6171,15 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
             height: rows,
         };
         crate::chrome::render_compact_hints(frame, hint_row, &state.theme, &state.keymap);
+    }
+    if pending_h > 0 {
+        // `getAppKeyDisplay("app.message.dequeue")` (`interactive-mode.ts:3987`) — `keyDisplayText`,
+        // so ALL bound keys joined with `/` and title-cased (`keybinding-hints.ts:29-40`).
+        let dequeue = state
+            .keymap
+            .keys_label(Action::Dequeue)
+            .map(|k| crate::chrome::format_key_text(&k, true));
+        state.pending_messages.render(frame, pending_area, &state.theme, dequeue.as_deref());
     }
     if images_h > 0 {
         render_images(frame, images_area, state);
@@ -6489,6 +6624,10 @@ impl App<CrosstermBackend<Stdout>> {
         // events and final outcome. Installed for the same reason `tree_nav_rx` is — the flow must
         // not run on this task, or no keystroke could ever answer its prompts.
         let mut login_rx = self.install_login_channel();
+        // The `/compact` outcome channel (TUI-055). Installed for exactly the same reason as
+        // `tree_nav_rx`: a 10–20 s provider call awaited on THIS task freezes every other arm, so
+        // the compaction status band Pi shows for the whole operation never reaches a frame.
+        let mut compact_rx = self.install_compact_channel();
         // The startup package-update check's answer channel, moved out of `self` so the `select!`
         // arm's borrow does not collide with the `&mut self` the other arms take — the same
         // run-loop-local shape as `bash_rx` / `tree_nav_rx`. `None` when the binary wired no channel
@@ -6643,10 +6782,9 @@ impl App<CrosstermBackend<Stdout>> {
                             // as `Submit`.
                             self.state.editor.clear();
                             let streaming = session.is_streaming().await;
-                            if !streaming {
-                                // Idle → behaves like a normal prompt: echo optimistically before send.
-                                self.state.transcript.push_user(text.clone());
-                            }
+                            // TUI-016 / TUI-052 — no optimistic echo in EITHER branch. The idle
+                            // branch is Pi's plain submit, which also writes nothing to the chat
+                            // container; the bubble arrives with `message_start`.
                             let session = session.clone();
                             tokio::spawn(async move {
                                 let ui = UserInput::text(text, InputSource::Tui);
@@ -6818,6 +6956,12 @@ impl App<CrosstermBackend<Stdout>> {
                 }
                 Some(msg) = shortcut_status_rx.recv() => {
                     self.state.transcript.push_status(msg);
+                    self.draw_synchronized()?;
+                }
+                Some(outcome) = compact_rx.recv() => {
+                    // A spawned `/compact` settled (TUI-055). The band was cleared by the
+                    // `compaction_end` event that preceded this message on the `events` stream.
+                    self.apply_compact_outcome(outcome);
                     self.draw_synchronized()?;
                 }
                 maybe_updates = package_updates => {
@@ -7125,27 +7269,55 @@ const HELD_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
 /// `EventStream` feature is not enabled in this build; arch-10 §5 fallback). Maps `crossterm::Event`
 /// to [`InputEvent`] and forwards over an unbounded channel; stops when `cancel` fires.
 ///
-/// Every event first passes through [`StrayReplyFilter`], the port of Pi's
-/// `consumeOsc11BackgroundResponse` guard (`tui/src/tui.ts:788-794`): a terminal that answers the
-/// boot-time OSC 11 probe *after* [`crate::terminal_query`]'s deadline would otherwise have its
-/// reply decoded by crossterm into keystrokes and typed into the prompt. The filter only ever
-/// removes a complete, terminated OSC 11 frame; anything it holds is replayed the moment the match
-/// fails or the input goes idle — see that module's safety contract.
+/// Every event passes through two machines, in this order.
+///
+/// [`EscapeReassembler`] first — the cyrup half of Pi's `tui/src/stdin-buffer.ts`. crossterm emits a
+/// bare `Key(Esc)` and clears its buffer whenever a `read(2)` that did not fill its 1,024-byte
+/// buffer ends on `0x1B` (`parse.rs:34-41`), so an escape sequence split at the `ESC` byte reaches
+/// the app as `Esc` plus its tail typed as literal characters — and that `Esc` aborts a running turn
+/// (`TUI-045`, reproduced live 2026-08-13). The reassembler puts the CSI/SS3 sequence back together
+/// and emits the key that was actually pressed.
+///
+/// Then [`StrayReplyFilter`], the port of Pi's `consumeOsc11BackgroundResponse` guard
+/// (`tui/src/tui.ts:788-794`): a terminal that answers the boot-time OSC 11 probe *after*
+/// [`crate::terminal_query`]'s deadline would otherwise have its reply decoded by crossterm into
+/// keystrokes and typed into the prompt. The filter only ever removes a complete, terminated OSC 11
+/// frame; anything it holds is replayed the moment the match fails or the input goes idle — see that
+/// module's safety contract.
+///
+/// Both hold, so both are flushed on the *same* idle tick and in the same order: a lone `Escape`
+/// costs one [`HELD_FLUSH_INTERVAL`] in total, not one per machine.
 pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
     std::thread::spawn(move || {
+        let mut reassembler = EscapeReassembler::new();
         let mut filter = StrayReplyFilter::new();
+        let mut reassembled: Vec<Event> = Vec::new();
         let mut released: Vec<Event> = Vec::new();
         'reader: while !cancel.is_cancelled() {
-            let wait =
-                if filter.is_holding() { HELD_FLUSH_INTERVAL } else { INPUT_POLL_INTERVAL };
+            let wait = if reassembler.is_holding() || filter.is_holding() {
+                HELD_FLUSH_INTERVAL
+            } else {
+                INPUT_POLL_INTERVAL
+            };
             match event::poll(wait) {
                 Ok(true) => match event::read() {
-                    Ok(ev) => filter.push(ev, &mut released),
+                    Ok(ev) => {
+                        reassembler.push(ev, &mut reassembled);
+                        for ev in reassembled.drain(..) {
+                            filter.push(ev, &mut released);
+                        }
+                    }
                     Err(_) => break,
                 },
-                // Idle: nothing more is coming, so release whatever the filter is holding.
-                Ok(false) => filter.flush(&mut released),
+                // Idle: nothing more is coming, so release whatever either machine is holding.
+                Ok(false) => {
+                    reassembler.flush(&mut reassembled);
+                    for ev in reassembled.drain(..) {
+                        filter.push(ev, &mut released);
+                    }
+                    filter.flush(&mut released);
+                }
                 Err(_) => break,
             }
             for ev in released.drain(..) {
@@ -7213,18 +7385,27 @@ fn map_event_on(
 }
 
 /// The production input pipeline end-to-end: what [`crossterm_input_stream`]'s reader thread does
-/// to a burst of raw crossterm events, i.e. [`StrayReplyFilter`] followed by [`map_event`], with the
-/// idle flush at the end of the burst.
+/// to a burst of raw crossterm events, i.e. [`EscapeReassembler`] then [`StrayReplyFilter`] then
+/// [`map_event`], with the idle flush at the end of the burst.
 #[cfg(test)]
 fn input_pipeline(raw: Vec<Event>) -> Vec<InputEvent> {
+    let mut reassembler = EscapeReassembler::new();
     let mut filter = StrayReplyFilter::new();
+    let mut reassembled: Vec<Event> = Vec::new();
     let mut released: Vec<Event> = Vec::new();
     let mut out: Vec<InputEvent> = Vec::new();
     for ev in raw {
-        filter.push(ev, &mut released);
+        reassembler.push(ev, &mut reassembled);
+        for ev in reassembled.drain(..) {
+            filter.push(ev, &mut released);
+        }
         out.extend(released.drain(..).filter_map(map_event));
     }
     // Input has gone quiet: the reader thread's `Ok(false)` poll arm.
+    reassembler.flush(&mut reassembled);
+    for ev in reassembled.drain(..) {
+        filter.push(ev, &mut released);
+    }
     filter.flush(&mut released);
     out.extend(released.drain(..).filter_map(map_event));
     out
@@ -7326,6 +7507,37 @@ mod stray_reply_pipeline_tests {
             app.handle_input(ev);
         }
         assert_eq!(app.state().editor.text(), "", "the prompt must be untouched");
+    }
+
+    /// TUI-045's own Verify, at the pipeline level: "drive `input_pipeline` with the two-chunk form
+    /// and assert one `Up` arrives rather than `Esc` + `[` + `A`."
+    ///
+    /// RED before [`crate::escape_reassembly`] existed — this produced exactly `Esc`, `Char('[')`,
+    /// `Char('A')`, which at idle types `[A` into the prompt and mid-stream aborts the running turn
+    /// (reproduced live on 2026-08-13 with two `tmux send-keys -H` writes 60 ms apart).
+    #[test]
+    fn an_arrow_key_split_at_the_esc_byte_reaches_the_app_as_one_up() {
+        // What crossterm emits when a read ends on `0x1b` and the next read carries `[A`.
+        let raw = vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ch('['),
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+        ];
+        let delivered = input_pipeline(raw);
+        // `InputEvent` is not `PartialEq`, so match the shape (the same style the sibling test uses).
+        match delivered.as_slice() {
+            [InputEvent::Key(k)] => {
+                assert_eq!(*k, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            }
+            other => panic!("the split arrow must reassemble to one Up, got {other:?}"),
+        }
+
+        // And nothing lands in the prompt.
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+        for ev in &delivered {
+            app.handle_input(ev);
+        }
+        assert_eq!(app.state().editor.text(), "", "no `[A` may be typed into the prompt");
     }
 
     /// The safety half: the same pipeline must deliver ordinary typing byte-for-byte, including the
