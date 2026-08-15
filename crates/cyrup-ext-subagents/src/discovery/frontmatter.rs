@@ -106,6 +106,12 @@ const KNOWN_FIELDS: &[&str] = &[
     // omitted the corresponding parameter.
     "async",
     "timeoutMs",
+    // SUBA-008 — `turnBudget` (`agent-serializer.ts:22` @v0.43.0). Parsed into
+    // `default_turn_budget` and applied by `route_single`'s `applySingleAgentLaunchDefaults` port
+    // only when the call site omitted `turnBudget`. Same rule as `toolBudget` above: a key that is
+    // "known" but never emitted by `management::serialize_agent` is silently deleted on the first
+    // management rewrite, so the serializer arm lands with it.
+    "turnBudget",
 ];
 
 /// True iff `key` is one of the crate's first-class typed frontmatter fields (pi's `KNOWN_FIELDS`,
@@ -902,6 +908,45 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         }
     };
 
+    // SUBA-008 `turnBudget:` — pi `agents.ts:1555-1561` @v0.43.0: a present, non-blank value is
+    // `JSON.parse`d and handed to `resolveTurnBudgetConfig` with the label
+    // `Agent '<name>' turnBudget frontmatter`, and a validation error THROWS.
+    //
+    // Same `[CYRUP-DELTA]` as `toolBudget` above, and for the same reason: a per-file skip + warn
+    // instead of aborting the whole directory scan. The valid path is byte-identical to pi,
+    // including that `resolveTurnBudgetConfig` — not this function — supplies the `graceTurns`
+    // default, so an agent declaring `turnBudget: {"maxTurns":3}` gets grace 1 exactly as upstream.
+    //
+    // Note the label difference from `toolBudget`'s: upstream really does say "turnBudget
+    // frontmatter" here and plain "toolBudget" there (`agents.ts:1558` vs `:1163`), so the two
+    // messages are not symmetric and must not be made so.
+    let default_turn_budget = match parsed.get("turnBudget").filter(|v| !v.trim().is_empty()) {
+        None => None,
+        Some(raw) => {
+            let parsed_json = serde_json::from_str::<serde_json::Value>(raw).map_err(|err| {
+                format!(
+                    "Agent '{local_name}' turnBudget frontmatter must be an object with maxTurns and optional graceTurns. ({err})"
+                )
+            });
+            match parsed_json.and_then(|value| {
+                crate::exec::turn_budget::resolve_turn_budget_config(
+                    Some(&value),
+                    &format!("Agent '{local_name}' turnBudget frontmatter"),
+                )
+            }) {
+                Ok(budget) => budget,
+                Err(message) => {
+                    tracing::warn!(
+                        agent = %local_name,
+                        path = %file_path.display(),
+                        "{message} — skipping this agent file"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
     // `async:` — pi `agents.ts:1541-1546`: strictly `"true"`/`"false"`; anything else is an ERROR
     // upstream. Same `[CYRUP-DELTA]` as `toolBudget` above: a per-file skip + warn instead of
     // aborting the whole directory scan.
@@ -983,6 +1028,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         default_timeout_ms,
         memory,
         tool_budget,
+        default_turn_budget,
         disabled,
         system_prompt_body: parsed.body,
         source,

@@ -133,6 +133,138 @@ Recorded here rather than in an area file, because they are precisely the class 
    asserts a RENDERED transcript line. Needs a rendered-transcript assertion in
    `crates/cyrup-tui/tests/` plus a live confirmation.
 
+> **Both are now MEASURED — see §0c, which also re-measures `TOOL-042`.**
+
+---
+
+## 0c. AMENDMENT 2026-08-14 (third) — the three live gaps, DRIVEN
+
+**This is the first amendment that ran anything.** §0a and §0b changed statuses by reading; the three
+rows below were driven on this machine, and one of them changed verdict as a result.
+
+### Header for this amendment
+
+| | |
+|---|---|
+| **Repo** | `/Users/davidmaple/cyrup.ai/cyrup`, HEAD **`42e7117`** (`docs: rewrite README…`), tree **NOT clean** |
+| **Working tree, stated because it bounds the result** | 34 files carried other agents' in-flight sweep edits while these runs happened. `git status --short` on the two files the live rows measure — `crates/cyrup/src/main.rs` and `crates/cyrup/src/migrations.rs` — reported **no modification**, so `CFG-049`/`CFG-051` were driven against committed code. `crates/cyrup-tools/src/tests/isolation.rs` **did** change mid-measurement (+58 lines, another agent), which is why the `TOOL-042` blocks below split at 243 → 244 tests. |
+| **Binary** | `target/debug/cyrup`, `cargo build -p cyrup --bin cyrup`, exit 0, 19:00 local |
+| **Toolchain** | `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1`, macOS 26.5.2 (25F84), `arm64` |
+| **Instrument (live rows)** | **`tmux`** — a real terminal emulator on a real pty. `script -q /dev/null` remains unusable for exactly the reason §1's instrument note gives: nothing answers the TUI's `ESC[6n` cursor-position probe and the binary dies at startup. |
+| **Hygiene** | every live run used a scratch `HOME` under the session scratchpad and `env -i HOME=… PATH=… TERM=xterm-256color TMPDIR=/tmp`, i.e. no ambient provider key, no `CYRUP_*` gate, and the user's real `~/.cyrup` untouched. Credentials planted for `CFG-051` were literal non-secrets (`not-a-real-token`, `sk-not-a-real-key`) and the run was `--offline`. |
+
+### `CFG-049` — the startup keypress gate: **OBSERVED. The session waits.**
+
+Scratch `HOME` with a legacy `hooks/` dir, then `cyrup` with no arguments in a scratch cwd:
+
+```
+=== T+3s (no key sent yet) ===
+Warning: Global hooks/ directory found. Hooks have been renamed to extensions.
+
+Move your extensions to the extensions/ directory.
+Migration guide: https://github.com/earendil-works/pi-mono/…#extensions-migration
+Documentation: https://github.com/earendil-works/pi-mono/…/docs/extensions.md
+
+Press any key to continue...
+=== T+9s (still no key sent) ===          ← byte-identical; no TUI, no frame, pane alive
+=== sending a key (x) ===
+=== T+13s (after keypress) ===            ← the TUI has taken the terminal
+ Warning: No models available. Use /login to log into a provider via OAuth or API key. …
+ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+```
+
+Nine seconds with no TUI is the gate (`crates/cyrup/src/migrations.rs:292-303`, `wait_for_any_key`
+`:327-335`), awaited from the interactive arm at `crates/cyrup/src/main.rs:709` — pi's
+`main.ts:838-840` @v0.83.0 position.
+
+**Absence was measured too, and by accident, which is the useful part.** The first attempt planted
+`hooks/` at `$HOME/.cyrup/hooks` and the session did **not** block: the TUI painted immediately. The
+agent dir is `$HOME/.cyrup/**agent**` (`crates/cyrup-config/src/env.rs:178`), so that run produced no
+warnings at all — a null fixture that, read carelessly, would have been filed as "the gate is
+broken". It is kept here as the control: **no warnings → no wait; warnings → wait.**
+
+**Not exercised, and not claimed:** the `[CYRUP-DELTA]` zero-length-read path (pi hangs on an
+already-closed stdin, cyrup returns). Driving it needs a closed stdin on the interactive arm, which
+this run did not construct. The row's other residual — `MIGRATION_GUIDE_URL`/`EXTENSIONS_DOC_URL`
+still pointing at `github.com/earendil-works/pi-mono`, visible verbatim in the transcript above —
+is untouched and remains a product decision, not a port decision.
+
+### `CFG-051` — the migrated-credential notice: **OBSERVED, rendered, and now pinned.**
+
+Scratch `HOME` with a legacy `oauth.json` (anthropic) and `settings.json.apiKeys` (openai), `--offline`:
+
+```
+=== T+6s pane ===
+ Warning: Migrated credentials to auth.json: anthropic, openai
+ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+```
+
+with `auth.json` written, `oauth.json` renamed to `oauth.json.migrated`, and the `apiKeys` key
+stripped from `settings.json`. **The line is TUI-owned, not stderr residue** — a second run resized
+the window mid-session (120×40 → 90×28) and the notice re-laid-out from screen row 29 to row 4,
+which pre-TUI stderr cannot do; a following `Ctrl+O` grew the transcript beneath it and it stayed
+coherent. The one-provider case renders the singular form (`…: anthropic`).
+
+**New regression pin:** `the_migrated_credential_notice_renders_first_and_verbatim_in_the_transcript`
+in `crates/cyrup-tui/src/transcript.rs` — pushes both production warnings through
+`TranscriptView::push_warning` in `run_interactive` order and renders them through `entry_lines`,
+the production path `app.rs:1851` uses; asserts the notice renders BEFORE `modelFallbackMessage`
+(pi `:874-876` before `:883-885`), carries exactly ONE `Warning: ` (the renderer must not re-prefix
+a verbatim `Entry::Warning` — TUI-062), and lands in the warning colour. **Mutation-verified:**
+re-prefixing the renderer and swapping the colour to `dim` fails it with
+`the migrated-credential notice never rendered: [… " Warning: Warning: Migrated credentials …"]`.
+
+**Deviation from the row's wording, stated rather than smoothed:** the item asked for the assertion
+in `crates/cyrup-tui/tests/`. `TranscriptView::lines` and `entry_lines` are crate-private, so an
+integration test there could only assert on a widened public API invented for the test. The pin is
+in-src in the same crate, against the same render function the app calls.
+
+### `TOOL-042` — the intermittent `LEAK-FAIL`: **STILL REPRODUCES. The "cannot return" half is REFUTED.**
+
+286 runs of `cargo nextest run -p cyrup-tools`, ambient `TOGETHER_API_KEY`/`CYRUP_*`/`GITHUB_TOKEN`
+scrubbed on every one:
+
+| block | runs | condition | `LEAK-FAIL`s | test named |
+|---|---:|---|---:|---|
+| A | 1 | first run after the build, otherwise idle box | **1** | `tests::tools::bash_timeout_at_maximum_is_valid` |
+| B | 35 | sequential, idle box (the row's own ask) | 0 | — |
+| C | 50 | 25 concurrent pairs (one default, one `--test-threads 16`) | **1** | `ops::local::tests::terminate_pid_reports_true_and_the_real_process_dies` |
+| D | 80 | 40 pairs + a 100 ms orphan/`lsof` sampler | 0 | — |
+| E | 120 | 60 pairs + a **reactive** snapshot fired on the LEAK line | **1** | `ops::bash_operations_tests::local_bash_operations_forwards_command_cwd_and_env_onto_the_proc_seam` |
+| | **286** | | **3 (≈1.0%)** | three DIFFERENT tests |
+
+Sweep 6's historical rate was ~4 in 33 (~12%), so the fix moved it by an order of magnitude — but
+**block B, the 35 idle runs the row asked for, is not the whole picture: block A leaked on an idle
+box too.** A `LEAK-FAIL` is `fail-fast`: block A's run reported `243 tests run: 242 passed, 1 failed`
+because the remaining test was **cancelled**. This still reds the gate.
+
+**What the reactive snapshot showed, and why it changes the diagnosis.** The block-E leak names
+`local_bash_operations_forwards_command_cwd_and_env_onto_the_proc_seam` (`crates/cyrup-tools/src/ops/mod.rs:605`),
+which drives `RecordingProc` — an in-memory double. The only process that test can spawn at all is
+`find_bash_on_path`'s `which bash` (`ops/shell.rs:78-84`), which names **all three** stdio handles
+(stdin null, stdout piped, stderr null) and is reaped in-loop (`:88-105`). **There is no candidate
+holder of that test process's fd 1 or fd 2 anywhere in its subtree** — so the inherited-handle
+mechanism the source-scan pin closes cannot explain this occurrence. The leak wait ran its full
+500 ms (`LEAK-FAIL [ 0.513s]`).
+
+Corroborating, from block D's sampler: **69 distinct pipe addresses held by orphaned children vs 244
+sampled `cargo-nextest` pipe addresses — zero intersection.** No orphan was ever observed holding a
+harness pipe.
+
+**The orphans that do exist are real but are not this.** Under two concurrent suites the box carries
+orphaned `sleep 30`s (`ppid 1`, fd 0 `/dev/null`, fd 1 + fd 2 `PIPE`), one observed alive for its
+full `00:30`. They are the `exec`/`exec_argv` fixtures' deliberately backgrounded descendants
+(`ops/local.rs:1135`, `:1568`, `:1812`) and they hold the **tool's** pipes, whose read ends died with
+the test process. After a single idle run, `ps` shows **zero** orphan `sleep`s at t+1s through t+32s.
+
+**Verdict.** `TOOL-042`'s root cause and fix stand for the class they closed. Its closing claim —
+"pinned so it cannot return" — is **refuted by measurement**: the flake still fails the gate at
+≈1 run in 100, on at least one test that cannot possibly be leaking a handle. **Nothing here was
+weakened to make it go away:** the 500 ms `leak-timeout` tripwire is untouched, no test was
+`#[ignore]`d, and no retry was added. The open question this log hands back is whether nextest's
+leak detector can time out on a saturated box — which is a harness question, not a cyrup one, and
+is the next instrument to build rather than a line to relax.
+
 ---
 
 ## Header — what was run, where, and with what honesty about scope

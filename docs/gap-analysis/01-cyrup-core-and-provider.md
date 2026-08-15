@@ -192,8 +192,11 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 >
 > *(Previous edition: 0 / 1 / 5 / 6 = 12, 29 closed.)* The "0 critical, 6 high, 14 medium, 20 low = 40" above is superseded.
 
+> **RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set UNCHANGED at 0 critical, 1 high, 4 medium, 6 low = 11**, plus the one `tracker` (`PROV-004`). The table now carries **43 rows: 31 fully closed, 11 open (4 of them partially), 1 `tracker`**. Sweep 8 **filed and closed `PROV-M01` in the same pass** — a real live behaviour defect on `github-copilot`, found by the assigned audit of hand-written delegating trait impls, and the **third instance of the dropped-delegation class** after `TOOL-024` (`RegisteredTool`) and `EXT-M03` (`WasmTool`), and the **first on a non-`Tool` trait**. `PROV-036` and `PROV-037` stay open but their fix sites were corrected — **both land in `crates/cyrup-session-svc`, outside this area's crates**; scheduling either against a provider-only agent will produce a blocked pass, which is exactly the failure the ledger's orchestration section names.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
+| ~~PROV-M01~~ | ~~medium~~ **FILED AND CLOSED 2026-08-14** | parity-bug | S | Two hand-written `impl Provider` decorators dropped the trait-defaulted half of the surface pi's object spread carries — `github-copilot`'s credential filter was discarded in the overlay configuration — **FILED AND CLOSED 2026-08-14**: sweep 8. See the body below. |
 | ~~PROV-030~~ | ~~high~~ **CLOSED 2026-08-14** | not-ported | L | `google-vertex` is registered with 10 models and no wire API — every request dies with `NoApiImpl` — **CLOSED 2026-08-14**: sweep 2 — the area's headline `high`. `api/google_vertex.rs` + `auth/google_adc.rs` ported end to end (express-mode vs ADC split, `resolveProject`/`resolveLocation` with pi's two verbatim throw strings, `{location}` interpolation, ADC search order, refresh-token exchange, RS256 JWT-bearer assertion, google-auth-library's 5-minute eager refresh); body/decoder delegate to `api::google_generative_ai` because pi's two `buildParams` are line-for-line identical at v0.83.0. **Sweep 1's stated blocker was false**: `ring` 0.17 was already resolved in Cargo.lock via rustls, so RS256 needed no new crate. `KNOWN_DANGLING = ["google-vertex"]` deleted from `every_catalog_row_names_a_registered_api` — the Verify clause is now enforced with no carve-out. |
 | ~~PROV-027~~ | ~~high~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug | S | Copilot's Claude models send `x-api-key`; pi sends `Authorization: Bearer` — **REFUTED, CLOSED 2026-08-14**: sweep 2 — **REFUTED at HEAD**, and not in sweep 1's fixedIds, so it had been stale for at least one pass. `api/anthropic_messages.rs:434` carries the `model.provider === "github-copilot"` branch documented as "the branch Pi tests FIRST inside createClient", with a fixture at :2399. |
 | ~~PROV-029~~ | ~~high~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug | S | Copilot + Codex login flows written but unreachable; flow registry has no production caller — **REFUTED, CLOSED 2026-08-14**: sweep 2 — **REFUTED at HEAD.** `providers/github_copilot.rs:157` wires `GitHubCopilotLogin` (the flow WITH `login`) with an explanatory block at :141-146; `providers/openai_codex.rs:137` wires `OpenAiCodexOAuthFlow`. Both dead-ends are gone. |
@@ -754,6 +757,68 @@ Seventeen items. Four came from re-reading code that closed an earlier item — 
 
 **Verify** — A fixture session whose second assistant turn has `cache_read: 0` after a first turn with a large `cache_write` yields `missCount == 1` and `missedTokens` equal to the re-billed prefix; `/session` prints the line only when `missedTokens > 0`, and formats `$X` only when `missedCost >= 0.0001` (pi's threshold at `interactive-mode.ts:5708`).
 
+## PROV-M01 — Two hand-written `impl Provider` decorators dropped the trait-defaulted half of the surface pi's object spread carries — **FILED AND CLOSED 2026-08-14**
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed — **fixed and pinned in the same pass (sweep 8)**
+
+**upstream** — `withRemoteCatalog` is an **object spread**: `return { ...provider, getModels: …, refreshModels: … }`
+(`packages/coding-agent/src/core/remote-catalog-provider.ts:52-54` @v0.83.0). Every other member of the
+`Provider` interface — `id`, `name`, `baseUrl?`, `headers?`, `auth`, `getModels`, `refreshModels?`,
+`filterModels?` (`:105-110`), `stream`, `streamSimple` (`packages/ai/src/models.ts:76-119` @v0.83.0) —
+**survives by construction**. There is no upstream counterpart to `ConfigProvider` at all:
+`applyProviderConfig` folds the registration into the shared `ModelRegistry.models` array rather than
+wrapping anything (`packages/coding-agent/src/core/model-registry.ts:917-940` @v0.83.0), so nothing
+upstream can drop it.
+
+**cyrup** — Rust has no spread. `impl Provider for RemoteCatalogProvider` named **6 of the trait's
+11** methods, silently dropping `name`, `base_url`, `headers` and `filter_models`.
+`impl Provider for ConfigProvider` named **4 of 11**, additionally dropping `refresh_models` and
+`stream_simple`. **All the dropped members carry a trait DEFAULT, so the decorator returned a
+plausible answer rather than failing.**
+
+**Impact** — a live behaviour defect, not a latent one. `github-copilot` is the one built-in that
+installs a `filter_models` (`filter_github_copilot_models` via `WireProvider::with_filter_models`,
+`providers/github_copilot.rs:178`), and `all_providers_with_overlay` maps **every** built-in through
+`CatalogOverlay::apply` (`providers/all.rs:148-157`). So in the overlay configuration
+`Models::get_available` (`collection.rs:419`) called `filter_models` on the decorator, got the
+identity default, and **offered the user all 29 Copilot models regardless of what the OAuth
+credential's `availableModelIds` entitled**. Proven by running the new test against the pre-fix code:
+it returned all 29 ids instead of the 1 entitled id. The `ConfigProvider` `name` drop is directly
+observable and self-evidently wrong: `ConfigProvider::new(id, name, …)` **takes** a display name and
+stores it on the inner `WireProvider` (which overrides `Provider::name`, `wire.rs:113-115`), and no
+caller could ever read it back — `Provider::name()` fell through to the default `self.id().as_str()`,
+so a guest registration declaring `"Acme Machines, Inc."` displayed as `acme` in every provider
+picker and status line.
+
+**Fix — LANDED.** `crates/cyrup-provider/src/remote_catalog.rs:299-352` (verified at HEAD: `name`,
+`base_url`, `headers`, `filter_models` added, each carrying a `PROV-M01` doc block naming the
+mechanism and the consequence) and `crates/cyrup-provider/src/config_provider.rs:86-152` (`name`,
+`base_url`, `headers`, `filter_models`, `refresh_models`, `stream_simple`, plus the
+`#[async_trait::async_trait]` attribute the async arm requires). **`get_model` is deliberately NOT
+delegated on `RemoteCatalogProvider`, and the reason is recorded in-source**: its default derives from
+`models()`, which this type overrides to the MERGED catalog — which is what upstream's `Models` sees
+through the spread's `getModels`. Delegating it to `inner` would have been the bug.
+
+**Verify — DONE.** Three tests, each verified load-bearing by deleting the delegation and watching it
+fail. `remote_catalog.rs::the_decorator_forwards_every_surface_method_the_spread_carries` — a
+`Decorated` fixture whose every defaulted method carries a **distinct non-default** value (name ≠ id,
+`base_url` `Some`, `headers` `Some`, and a `filter_models` that really narrows), with
+presence-before-absence assertions on the inner first so the fixture cannot silently lose a
+declaration; it also pins that `get_model` still resolves against the merged catalog.
+`remote_catalog.rs::overlaying_github_copilot_keeps_its_credential_filter` — the **production** path:
+takes the real `github-copilot` built-in, asserts the bare provider narrows to 1 entitled id
+(presence first), then wraps it through `CatalogOverlay::apply` and asserts the narrowing survives.
+`config_provider.rs::the_registrations_display_name_survives_the_wrapper`.
+
+> **The invariant this row establishes, and it is wider than this area.** The omission is invisible
+> *precisely because* the trait default is a reasonable answer — `name`→id, `base_url`/`headers`→
+> `None`, `filter_models`→identity, `render_kind`→`Default`, `constrained_sampling`→`None`,
+> `read_stream`→a `Cursor` over the whole file, `detect_image_mime`→extension-based. Every one of
+> those is indistinguishable from a working delegation **for any fixture that leaves the inner at ITS
+> default**. The rule that holds the line is not "audit `Tool` impls": it is **every hand-written
+> same-trait decorator, every defaulted method, a fixture value that CONTRADICTS the default, ideally
+> in both directions.** See the register entry in `00-residual-ledger.md`.
+
 ## PROV-036 — `getUsageCostBreakdown` unported — `/session` shows one cost total
 
 **Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
@@ -768,6 +833,23 @@ Seventeen items. Four came from re-reading code that closed an earlier item — 
 
 **Verify** — A fixture session with turns on two different models yields two entries whose `cost` sums to `stats.cost` exactly; a turn whose assistant message carries `responseModel` is attributed to the response model, not the requested one; compaction usage lands in `Tools/summaries`; a single-model session renders no breakdown at all.
 
+> **FIX SITE CORRECTED 2026-08-14 (sweep 8) — this row is NOT schedulable against a provider-side or
+> `cyrup-session`-side agent, and it stays open only because sweep 8 declined to land half of it.**
+> Re-verified genuinely unported: `grep -rn 'usage_cost_breakdown|UsageCostBreakdown|cost_breakdown'
+> crates` returns **zero**. All the *input* data exists in `crates/cyrup-session`:
+> `KnownEntry::Message`/`Compaction`/`BranchSummary` are pi's exact three arms, `Compaction.usage` and
+> `BranchSummary.usage` are both present (`entry.rs:105-107`, `:118-121`), and `AssistantMessage`
+> carries `provider`/`model`/`response_model`/`usage` (`cyrup-core/src/message.rs:437-460`). The
+> sibling `addUsageToTotals` half is already ported **twice** (`cyrup-session-svc/src/state.rs:145`,
+> `cyrup-tui/src/status.rs:170`). **The blocker is the CONSUMER**: the reader is `SessionStats`, built
+> by `SessionStats::from_entries` in `crates/cyrup-session-svc/src/state.rs` and rendered by the
+> `/session` handler at `crates/cyrup-tui/src/app.rs:4778-4804`. Landing the pure function in
+> `cyrup-session` alone produces **a function with no reader** — the "declared surface with no
+> consumer" failure these area files repeatedly name. **Route to one agent owning
+> `cyrup-session` + `cyrup-session-svc` + `cyrup-tui`.** Port target `usage-totals.ts:31-69`
+> @v0.83.0; render only when the breakdown has more than one entry
+> (`interactive-mode.ts:5697-5702`).
+
 ## PROV-037 — Two `auth-guidance.ts` formatters unported; the preflight's message text and OAuth-expiry branch diverge
 
 **Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
@@ -780,7 +862,18 @@ Seventeen items. Four came from re-reading code that closed an earlier item — 
 > (`compaction_model` is kept in sync at `session.rs:3880`). What remains is message text plus one
 > branch.
 
-**cyrup** — `crates/cyrup/src/diagnostics.rs:155-166` ports exactly two of pi's four functions — `get_provider_login_help()` and `format_no_models_available_message()`. `formatNoModelSelectedMessage` and `formatNoApiKeyFoundMessage` have no counterpart: `rg 'No model selected|No API key found' crates/` returns nothing (the only near-match, `cyrup-config/src/login.rs:739`, is the unrelated "No API key providers available."). The OAuth-expiry branch is also absent: `rg 'Authentication failed for|re-authenticate' crates/` = 0 hits, and the preflight has no `checkAuth` second chance — it consults the cached `has_configured_auth` only.
+> **COUNT AND LOCATION CORRECTED 2026-08-14 (sweep 8) — the formatter half is ONE function short,
+> not two, and it does not live where this body says.** pi's `auth-guidance.ts` @v0.83.0 exports
+> **four**: `getProviderLoginHelp`, `formatNoModelsAvailableMessage`, `formatNoModelSelectedMessage`,
+> `formatNoApiKeyFoundMessage`. cyrup's port is `crates/cyrup-session-svc/src/auth_guidance.rs` and it
+> carries the **first three** (`:15`, `:25`, `:33`, read at HEAD). `crates/cyrup/src/diagnostics.rs`
+> still carries its own copies of the first two (`:210`, `:216`), which is why an earlier count said
+> "two of four". **The only missing formatter is `formatNoApiKeyFoundMessage`** —
+> `grep -rn 'No API key found' crates/` is still zero. **FIX SITE: `crates/cyrup-session-svc`,
+> outside this area's crates.** The OAuth-expiry preflight half below is untouched and was **not**
+> re-verified by sweep 8.
+
+**cyrup** — ~~`crates/cyrup/src/diagnostics.rs:155-166` ports exactly two of pi's four functions~~ — `get_provider_login_help()` and `format_no_models_available_message()`. `formatNoModelSelectedMessage` and `formatNoApiKeyFoundMessage` have no counterpart: `rg 'No model selected|No API key found' crates/` returns nothing (the only near-match, `cyrup-config/src/login.rs:739`, is the unrelated "No API key providers available."). The OAuth-expiry branch is also absent: `rg 'Authentication failed for|re-authenticate' crates/` = 0 hits, and the preflight has no `checkAuth` second chance — it consults the cached `has_configured_auth` only.
 
 **upstream** — `pi/packages/coding-agent/src/core/auth-guidance.ts:18-25` @v0.83.0 defines both missing formatters. Consumers, all in `core/agent-session.ts` @v0.83.0: `:418`/`:438` (`_getRequiredRequestAuth` throws `formatNoApiKeyFoundMessage(model.provider)` both when the resolver reports "authHeader requires a resolved API key" and when auth resolves to nothing), `:1179`/`:1791` (`throw new Error(formatNoModelSelectedMessage())`), `:1194` (the same after the `hasConfiguredAuth || await checkAuth(...)` preflight at `:1183-1185`), and the OAuth-specific branch at `:1186-1193`: `Authentication failed for "<provider>". Credentials may have expired or network is unavailable. Run '/login <provider>' to re-authenticate.`
 

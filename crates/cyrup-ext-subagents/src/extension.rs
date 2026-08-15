@@ -431,6 +431,14 @@ pub struct SingleRunOverrides {
     /// params.configToolBudget` (`runs/background/async-execution.ts:1298`) — i.e. caller wins,
     /// then frontmatter. cyrup has no extension-config rung yet, so the chain is two long.
     pub tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
+    /// SUBA-008: pi `params.turnBudget` (`extension/schemas.ts:328` @v0.43.0), already validated by
+    /// [`crate::exec::turn_budget::resolve_turn_budget_config`].
+    ///
+    /// Only the CALLER's rung of upstream's chain — the agent-frontmatter and extension-config
+    /// rungs below it are applied by `run_foreground_impl`, which is where the resolved persona and
+    /// the live config are both already in hand (pi resolves the same chain at
+    /// `subagent-executor.ts:4928`, immediately after `applySingleAgentLaunchDefaults`).
+    pub turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
 }
 
 /// The seven inputs one foreground single run needs, bundled into one borrowed request so
@@ -482,6 +490,10 @@ pub struct BackgroundSingleRequest<'a> {
     /// (`runs/background/async-execution.ts:1298` @v0.43.0), already validated. Folded onto the
     /// resolved persona in `spawn_background` so hop 2's dispatch sees it as that agent's budget.
     pub tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
+    /// SUBA-008: pi `params.turnBudget` on the async SINGLE path (`async-execution.ts:1469`),
+    /// already validated. Only the CALLER's rung — `spawn_background` applies the agent-frontmatter
+    /// and extension-config rungs below it, exactly as `run_foreground_impl` does.
+    pub turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
     /// The task's working directory (also the discovery root for the named persona).
     pub cwd: &'a Path,
     /// The persona name to resolve and run.
@@ -658,6 +670,14 @@ pub struct BackgroundStepsSpec {
     /// SUBA-N03: pi `artifactConfig` (`async-execution.ts:965`) — which of the four files each
     /// step's artifact write emits.
     pub artifact_config: crate::artifacts::ArtifactConfig,
+    /// SUBA-008: pi `params.turnBudget` on the async path (`async-execution.ts:1050`/`:1469`),
+    /// carried to hop 2 on [`crate::background::runner_main::RunnerConfig::turn_budget`] and
+    /// applied by the runner to EVERY step (`subagent-runner.ts:1409`).
+    ///
+    /// Already resolved (caller > agent frontmatter > extension config) by the dispatch site, for
+    /// the same reason the foreground path resolves it before building `RunOptions`: hop 2 has no
+    /// discovery and no live config to re-derive the chain from.
+    pub turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
 }
 
 impl SubagentExecutor {
@@ -1931,6 +1951,27 @@ impl SubagentExecutor {
         if let Some(budget) = overrides.tool_budget.clone() {
             agent_config.tool_budget = Some(budget);
         }
+        // SUBA-008 / pi `resolveTurnBudgetConfig(effectiveParams.turnBudget ?? deps.config.turnBudget)`
+        // (`subagent-executor.ts:4928-4929` @v0.43.0), where `effectiveParams.turnBudget` has
+        // already absorbed the agent's own frontmatter through `applySingleAgentLaunchDefaults`
+        // (`:1940-1942`). Flattened here into the one three-rung chain it really is —
+        // caller > agent frontmatter > extension config — resolved at the single point where all
+        // three are in hand.
+        //
+        // The config rung is validated (not merely parsed) at this seam, exactly as upstream
+        // validates it here rather than at config load: a malformed `subagents.turnBudget` refuses
+        // THIS call with upstream's own message instead of silently disarming the budget.
+        let turn_budget = match overrides.turn_budget.or(agent.default_turn_budget) {
+            Some(budget) => Some(budget),
+            None => crate::exec::turn_budget::resolve_turn_budget_config(
+                cfg.turn_budget.as_ref(),
+                "turnBudget",
+            )
+            // `Management` is this crate's "the message IS the user-facing text" variant, which is
+            // what upstream's `buildRequestedModeError(effectiveParams, turnBudget.error)`
+            // (`subagent-executor.ts:4929`) produces: the validation string verbatim, unprefixed.
+            .map_err(SubagentError::Management)?,
+        };
         // R-SA-038: `build_model_candidates` filters the ladder to `available_models`, so an
         // explicit `model` override (pi `slash-commands.ts:681` `/run [model=…]`, and the tool's
         // SINGLE-mode `model`) must be ADDED to the availability set — otherwise the override is
@@ -2067,6 +2108,12 @@ impl SubagentExecutor {
                 .map(|root| root.join("run-0"));
 
         let run_options = RunOptions {
+            // SUBA-008 — the resolved three-rung chain above (caller > frontmatter > config).
+            turn_budget,
+            // pi sets `enforceHardTurnLimit` only from the slash delegation adapter
+            // (`slash/delegation-adapters.ts:298`); the tool surface never does, so the
+            // mid-tool-work deferral stays armed here exactly as upstream leaves it.
+            enforce_hard_turn_limit: false,
             cwd: cwd.to_path_buf(),
             deadline_at,
             timeout_ms,
@@ -2339,6 +2386,7 @@ impl SubagentExecutor {
             timeout_ms,
             structured_output_schema,
             tool_budget,
+            turn_budget,
         } = request;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before agent discovery or
         // fork-context resolution below, and therefore also before `spawn_background_steps`' own
@@ -2497,6 +2545,18 @@ impl SubagentExecutor {
         self.spawn_background_steps(
             cwd,
             BackgroundStepsSpec {
+                // SUBA-008 — the same three-rung chain the foreground path resolves
+                // (`subagent-executor.ts:4928`): caller > this agent's `turnBudget:` frontmatter >
+                // `subagents.turnBudget`. Resolved HERE because hop 2 has neither discovery nor a
+                // live config to re-derive it from.
+                turn_budget: match turn_budget.or(agent.default_turn_budget) {
+                    Some(budget) => Some(budget),
+                    None => crate::exec::turn_budget::resolve_turn_budget_config(
+                        cfg.turn_budget.as_ref(),
+                        "turnBudget",
+                    )
+                    .map_err(SubagentError::Management)?,
+                },
                 steps: vec![RunnerStep::SingleStep(step)],
                 mode: RunMode::Single,
                 session_file: fork_context.session_file_path,
@@ -2593,6 +2653,7 @@ impl SubagentExecutor {
             share,
             artifacts_dir,
             artifact_config,
+            turn_budget,
         } = spec;
         let cfg = self.config_snapshot().await;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before run-directory creation
@@ -2671,6 +2732,8 @@ impl SubagentExecutor {
         // whole (by-then-partially-moved) `cfg`, so it must be evaluated first.
         let dynamic_fanout_max_items = cfg.dynamic_fanout_max_items();
         let runner_config = crate::background::runner_main::RunnerConfig {
+            // SUBA-008 — the run-level turn budget the orchestrator resolved, carried verbatim.
+            turn_budget,
             run_id: run_id.clone(),
             mode,
             steps,
@@ -3160,6 +3223,7 @@ impl SubagentExecutor {
                 .spawn_background_steps(
                     cwd,
                     BackgroundStepsSpec {
+                        turn_budget: None,
                         steps: graph,
                         mode,
                         session_file: first_session_file,
@@ -4507,6 +4571,7 @@ impl SubagentExecutor {
             .spawn_background_steps(
                 &effective_cwd,
                 BackgroundStepsSpec {
+                    turn_budget: None,
                     steps: vec![RunnerStep::SingleStep(step)],
                     mode: RunMode::Single,
                     session_file: Some(session_file.to_path_buf()),
@@ -4805,17 +4870,25 @@ impl SubagentExecutor {
     /// Same agent, same request, two behaviours. The shared owner both surfaces DO have is this
     /// executor, so the resolution lives here and each entry applies it once.
     ///
-    /// Returns `(default_async, default_timeout_ms)` — pi's `agent.defaultAsync` /
-    /// `agent.defaultTimeoutMs`, both `None` for an unknown agent name (pi `:1588`'s
-    /// `if (!agent) return params`, which leaves the existing "unknown agent" error path to
-    /// report it) and both `None` on a discovery failure.
+    /// Returns `(default_async, default_timeout_ms, default_turn_budget)` — pi's
+    /// `agent.defaultAsync` / `agent.defaultTimeoutMs` / `agent.defaultTurnBudget`, all `None` for
+    /// an unknown agent name (pi `:1588`'s `if (!agent) return params`, which leaves the existing
+    /// "unknown agent" error path to report it) and all `None` on a discovery failure.
     ///
     /// The APPLICATION rules stay at the call sites, because they are fill-unset-only and each
     /// site knows its own "was this supplied?" question (pi `:1591-1594`): `async` applies only
-    /// when the call omitted `async` entirely, and `timeout_ms` only when it omitted BOTH
-    /// `timeoutMs` and its alias `maxRuntimeMs`.
+    /// when the call omitted `async` entirely, `timeout_ms` only when it omitted BOTH `timeoutMs`
+    /// and its alias `maxRuntimeMs`, and `turn_budget` only when it omitted `turnBudget`
+    /// (SUBA-008, pi `:1940-1942`).
     #[must_use]
-    fn single_agent_launch_defaults(cwd: &Path, agent: &str) -> (Option<bool>, Option<u64>) {
+    fn single_agent_launch_defaults(
+        cwd: &Path,
+        agent: &str,
+    ) -> (
+        Option<bool>,
+        Option<u64>,
+        Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    ) {
         SubagentExecutor::discovery_config(cwd)
             .and_then(|cfg| discover_agents(&cfg, None))
             .ok()
@@ -4825,8 +4898,12 @@ impl SubagentExecutor {
                     .into_iter()
                     .find(|candidate| candidate.name == agent)
             })
-            .map_or((None, None), |found| {
-                (found.default_async, found.default_timeout_ms)
+            .map_or((None, None, None), |found| {
+                (
+                    found.default_async,
+                    found.default_timeout_ms,
+                    found.default_turn_budget,
+                )
             })
     }
 
@@ -5833,6 +5910,13 @@ struct SubagentToolParams {
     /// (`runs/background/async-execution.ts:1298-1299`) — so a malformed budget is refused before
     /// any child spawns rather than degrading to "no budget".
     tool_budget: Option<serde_json::Value>,
+    /// SUBA-008 / pi `params.turnBudget` (`extension/schemas.ts:328` @v0.43.0). Raw here and
+    /// validated at the dispatch boundary through
+    /// [`crate::exec::turn_budget::resolve_turn_budget_config`] — pi's own
+    /// `resolveTurnBudgetConfig(effectiveParams.turnBudget ?? deps.config.turnBudget)`
+    /// (`runs/foreground/subagent-executor.ts:4928-4929`) — so a malformed budget is refused
+    /// before any child spawns rather than degrading to "no budget".
+    turn_budget: Option<serde_json::Value>,
     acceptance: Option<serde_json::Value>,
     /// The six mission parameters (`extension/schemas.ts:297-301` + `:302-304` @v0.43.0), read by
     /// [`crate::missions`]: `missionId`/`mission` bind a launch to a mission and are also the
@@ -6049,6 +6133,7 @@ impl SubagentToolParams {
         if self.model.is_some() { keys.push("model"); }
         if self.output_schema.is_some() { keys.push("outputSchema"); }
         if self.tool_budget.is_some() { keys.push("toolBudget"); }
+        if self.turn_budget.is_some() { keys.push("turnBudget"); }
         if self.additional.is_some() { keys.push("additional"); }
         if self.acceptance.is_some() { keys.push("acceptance"); }
         if self.mission_id.is_some() { keys.push("missionId"); }
@@ -6681,6 +6766,24 @@ fn sj_json_schema_object() -> serde_json::Value {
     serde_json::json!({ "type": "object", "additionalProperties": true })
 }
 
+/// SUBA-008 — `TurnBudgetOverride` (`extension/schemas.ts:104-107` @v0.43.0), including its
+/// `additionalProperties: false` and its description, verbatim.
+///
+/// `maxTurns` is the SOFT limit and `graceTurns` (default 1) is how far past it the child may go
+/// before the supervisor aborts it — the description says so in upstream's own words.
+fn sj_turn_budget_override() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["maxTurns"],
+        "properties": {
+            "maxTurns": { "type": "integer", "minimum": 1 },
+            "graceTurns": { "type": "integer", "minimum": 0 }
+        },
+        "description": "Optional assistant-turn budget. At maxTurns the child is asked to wrap up; after graceTurns additional assistant turns it is aborted and partial output is returned."
+    })
+}
+
 /// SUBA-047 — `ToolBudgetOverride` (`extension/schemas.ts:116-120` @v0.43.0), including its
 /// `additionalProperties: false` and its description, verbatim. `block` is `ToolBudgetBlock`
 /// (`:112-117`): either an array of tool names or the literal `"*"`.
@@ -7131,6 +7234,11 @@ fn subagent_tool_parameters() -> serde_json::Value {
     // `discovery/frontmatter.rs:880` — but the param was never advertised, so the only way to bound
     // a delegation's tool spend was to edit the agent file on disk and a per-call budget passed by
     // an orchestrator was silently discarded.
+    // SUBA-008 / pi `extension/schemas.ts:328` @v0.43.0 — `turnBudget:
+    // Type.Optional(TurnBudgetOverride)`, the key immediately ABOVE `toolBudget` in upstream's own
+    // property order. Advertised together with its enforcement (`exec/turn_budget.rs` +
+    // `drive_attempt`'s per-turn fold), never ahead of it — SUBA-047's lesson.
+    props.insert("turnBudget".to_string(), sj_turn_budget_override());
     props.insert("toolBudget".to_string(), sj_tool_budget_override());
     // SUBA-046 / pi `extension/schemas.ts:283` @v0.43.0 — `additional`, with upstream's description
     // verbatim. `grant-spawn-budget` was advertised in the child-safe tool description while the
@@ -7669,6 +7777,15 @@ impl SubagentTool {
         // through pi's own `validateAcceptanceInput` (`subagent-executor.ts:1418`) so a malformed
         // policy is refused BEFORE agent resolution and before any child spawns.
         let overrides = SingleRunOverrides {
+            // SUBA-008 / pi `resolveTurnBudgetConfig(effectiveParams.turnBudget …)`
+            // (`subagent-executor.ts:4928`): a malformed budget is a hard refusal at the tool
+            // boundary with upstream's own message, not a silent downgrade to "unbudgeted". The
+            // frontmatter and config rungs below it are applied by `run_foreground_impl`.
+            turn_budget: crate::exec::turn_budget::resolve_turn_budget_config(
+                p.turn_budget.as_ref(),
+                "turnBudget",
+            )
+            .map_err(ToolError::new)?,
             output: p.output.clone(),
             output_mode: p.output_mode.clone(),
             skills: normalize_skill_input(p.skill.as_ref()),
@@ -7798,6 +7915,15 @@ impl SubagentTool {
             let run_id = self
                 .executor
                 .spawn_background(BackgroundSingleRequest {
+                    // SUBA-008 / pi `resolveTurnBudgetConfig(effectiveParams.turnBudget …)`
+                    // (`subagent-executor.ts:4928`): the async SINGLE branch validates the caller's
+                    // budget exactly as the foreground branch does, so `{…, turnBudget, async:true}`
+                    // is neither silently unbudgeted nor silently lenient.
+                    turn_budget: crate::exec::turn_budget::resolve_turn_budget_config(
+                        p.turn_budget.as_ref(),
+                        "turnBudget",
+                    )
+                    .map_err(ToolError::new)?,
                     // SUBA-043 / pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0):
                     // the async SINGLE branch forwards the top-level schema exactly as the
                     // foreground branch does, so `{agent, task, outputSchema, async:true}` is not a
@@ -10825,13 +10951,19 @@ impl SubagentsExtension {
                 // default is ALWAYS eligible; `--bg` is the only async signal, and an explicit
                 // `--bg` must beat an agent declaring `async: false`, so the default only decides
                 // the case where `--bg` was NOT typed.
-                let (default_async, default_timeout_ms) =
+                let (default_async, default_timeout_ms, _default_turn_budget) =
                     SubagentExecutor::single_agent_launch_defaults(cwd, &parsed.agent);
                 let background = parsed.flags.background || default_async.unwrap_or(false);
                 if background {
                     let run_id = self
                         .executor
                         .spawn_background(BackgroundSingleRequest {
+                            // SUBA-008: `/run` parses no `turnBudget=` token (upstream's
+                            // `slash-commands.ts:678-681` forwards only output/outputMode/skill/
+                            // model), so there is no CALLER rung here — but the agent's own
+                            // `turnBudget:` frontmatter and `subagents.turnBudget` still apply,
+                            // because `spawn_background` resolves those two itself.
+                            turn_budget: None,
                             structured_output_schema: None,
                             tool_budget: None,
                             cwd,
@@ -11229,6 +11361,9 @@ impl SubagentsExtension {
             let run_id = self
                 .executor
                 .spawn_background(BackgroundSingleRequest {
+                    // SUBA-008: same as the `/run` surface — no caller rung on this path; the
+                    // frontmatter and config rungs are applied inside `spawn_background`.
+                    turn_budget: None,
                     structured_output_schema: None,
                     tool_budget: None,
                     cwd: &effective_cwd,
@@ -15694,6 +15829,7 @@ mod tests {
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: None,
                 tool_budget: None,
                 cwd: dir.path(),
@@ -16024,6 +16160,75 @@ mod tests {
         assert!(keys.contains(&"toolBudget"), "{keys:?}");
     }
 
+    /// SUBA-008 — the `turnBudget` param must be advertised in upstream's exact schema shape AND
+    /// survive the permissive parse, or the enforcement in `exec/turn_budget.rs` is unreachable
+    /// from the tool surface. Landed together with that enforcement, never ahead of it (SUBA-047's
+    /// lesson: an advertised-but-unconsumed param is the defect, not the fix).
+    #[test]
+    fn turn_budget_is_advertised_with_upstreams_schema_and_deserializes_at_the_top_level() {
+        let props = subagent_tool_parameters()["properties"]
+            .as_object()
+            .expect("properties object")
+            .clone();
+        assert!(props.contains_key("turnBudget"), "the enforced param must be advertised");
+        // pi `extension/schemas.ts:104-107` @v0.43.0: `maxTurns` REQUIRED, `graceTurns` optional
+        // and >= 0 (NOT >= 1 — a zero grace is legal and means "abort at maxTurns"), object closed.
+        assert_eq!(props["turnBudget"]["required"], serde_json::json!(["maxTurns"]));
+        assert_eq!(props["turnBudget"]["additionalProperties"], serde_json::json!(false));
+        assert_eq!(props["turnBudget"]["properties"]["maxTurns"]["minimum"], serde_json::json!(1));
+        assert_eq!(props["turnBudget"]["properties"]["graceTurns"]["minimum"], serde_json::json!(0));
+        assert_eq!(
+            props["turnBudget"]["description"],
+            serde_json::json!(
+                "Optional assistant-turn budget. At maxTurns the child is asked to wrap up; after graceTurns additional assistant turns it is aborted and partial output is returned."
+            )
+        );
+
+        let parsed: SubagentToolParams = serde_json::from_value(serde_json::json!({
+            "agent": "x",
+            "task": "y",
+            "turnBudget": { "maxTurns": 4, "graceTurns": 2 }
+        }))
+        .expect("params parse");
+        assert_eq!(
+            parsed.turn_budget,
+            Some(serde_json::json!({ "maxTurns": 4, "graceTurns": 2 }))
+        );
+        assert!(parsed.provided_keys().contains(&"turnBudget"), "{:?}", parsed.provided_keys());
+    }
+
+    /// SUBA-008's refusal half — pi `resolveTurnBudgetConfig(...)` at
+    /// `subagent-executor.ts:4928-4929`, whose `error` becomes a `buildRequestedModeError`. A
+    /// malformed budget must refuse the call with the validator's own message rather than
+    /// silently degrading to "unbudgeted".
+    #[test]
+    fn a_malformed_turn_budget_param_is_refused_with_upstreams_own_message() {
+        let parsed: SubagentToolParams = serde_json::from_value(serde_json::json!({
+            "agent": "x", "task": "y", "turnBudget": { "maxTurns": 0 }
+        }))
+        .expect("params parse is permissive; validation happens at dispatch");
+        let err = crate::exec::turn_budget::resolve_turn_budget_config(
+            parsed.turn_budget.as_ref(),
+            "turnBudget",
+        )
+        .expect_err("maxTurns 0 must be refused");
+        assert_eq!(err, "turnBudget.maxTurns must be an integer >= 1.");
+
+        let parsed: SubagentToolParams = serde_json::from_value(serde_json::json!({
+            "agent": "x", "task": "y", "turnBudget": { "maxTurns": 2, "hard": 3 }
+        }))
+        .expect("params parse");
+        let err = crate::exec::turn_budget::resolve_turn_budget_config(
+            parsed.turn_budget.as_ref(),
+            "turnBudget",
+        )
+        .expect_err("an unknown key must be refused, not ignored");
+        assert_eq!(
+            err, "turnBudget.hard is not supported.",
+            "the tool budget's `hard` key is not a turn-budget key, and upstream says so by name"
+        );
+    }
+
     /// SUBA-047's refusal half — pi `validateToolBudgetConfig(params.toolBudget, "toolBudget")`
     /// (`runs/background/async-execution.ts:1299` @v0.43.0). A malformed budget must refuse the
     /// call with the validator's own message; silently downgrading to "unbudgeted" is the same
@@ -16102,6 +16307,7 @@ mod tests {
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: Some(serde_json::json!({ "type": "object" })),
                 tool_budget: Some(budget.clone()),
                 cwd: dir.path(),
@@ -16173,6 +16379,7 @@ mod tests {
         for artifacts in [None, Some(true), Some(false)] {
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    turn_budget: None,
                     structured_output_schema: None,
                     tool_budget: None,
                     cwd: dir.path(),
@@ -16250,6 +16457,7 @@ mod tests {
         let before = crate::background::now_epoch_ms();
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: None,
                 tool_budget: None,
                 cwd: dir.path(),
@@ -16305,6 +16513,7 @@ mod tests {
         // and CPU until a human noticed and issued `interrupt`.
         let untimed = executor
             .spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: None,
                 tool_budget: None,
                 cwd: dir.path(),
@@ -16361,6 +16570,7 @@ mod tests {
 
         let request = |exec: Arc<SubagentExecutor>, root: std::path::PathBuf| async move {
             exec.spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: None,
                 tool_budget: None,
                 cwd: &root,
@@ -16471,6 +16681,7 @@ mod tests {
 
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    turn_budget: None,
                     structured_output_schema: None,
                     tool_budget: None,
                     cwd: dir.path(),
@@ -16554,6 +16765,7 @@ mod tests {
 
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: None,
                 tool_budget: None,
                 cwd: dir.path(),
@@ -17009,6 +17221,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: None,
                 tool_budget: None,
                 cwd: dir.path(),
@@ -17061,6 +17274,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: None,
                 tool_budget: None,
                 cwd: dir.path(),
@@ -17122,6 +17336,7 @@ mod tests {
         });
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: None,
                 tool_budget: None,
                 cwd: dir.path(),
@@ -17195,6 +17410,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                turn_budget: None,
                 structured_output_schema: None,
                 tool_budget: None,
                 cwd: dir.path(),
@@ -17513,6 +17729,7 @@ mod tests {
             .spawn_background_steps(
                 dir.path(),
                 BackgroundStepsSpec {
+                    turn_budget: None,
                     steps: vec![step],
                     mode: RunMode::Single,
                     session_file: None,
@@ -21045,6 +21262,7 @@ mod tests {
             allow: Some(vec!["anthropic/*".to_string()]),
         };
         let config = crate::background::runner_main::RunnerConfig {
+            turn_budget: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,

@@ -119,6 +119,8 @@ fn agent_config(name: &str) -> AgentConfig {
 /// through `AcceptanceContract::heuristic_default` — pi's `level: "auto"` (`acceptance.ts:127`).
 fn run_options(cwd: &Path) -> RunOptions {
     RunOptions {
+        turn_budget: None,
+        enforce_hard_turn_limit: false,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,

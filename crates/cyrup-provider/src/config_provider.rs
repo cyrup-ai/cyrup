@@ -64,17 +64,67 @@ impl ConfigProvider {
     }
 }
 
+/// # PROV-M01 — every surface method is delegated, including the ones with trait defaults
+///
+/// Upstream a registration-backed provider is not a wrapper at all: `applyProviderConfig` folds the
+/// registration's models straight into the shared `ModelRegistry.models` array
+/// (`model-registry.ts:917-940` @v0.83.0), so `name`/`baseUrl`/`headers`/`filterModels` are read off
+/// the one `Provider` object that owns them. cyrup realizes the registration as a wrapper around a
+/// [`WireProvider`], and a hand-written delegating impl forwards only what it names — while
+/// `Provider`'s cyrup counterparts of those four members carry TRAIT DEFAULTS
+/// (`provider.rs:23-51`), which return a plausible answer instead of failing.
+///
+/// The display `name` proved it: [`ConfigProvider::new`] takes one, stores it on the inner
+/// `WireProvider` (which overrides `Provider::name`, `wire.rs:113-115`), and — with this delegation
+/// missing — no caller could ever read it back. `ConfigProvider::name()` fell through to the trait
+/// default `self.id().as_str()`, so a registration declaring `"Acme"` displayed as `acme` in every
+/// provider picker and status line. `base_url`, `headers` and `filter_models` were dropped by the
+/// same mechanism (`wire.rs:117-137`).
+///
+/// `get_model` is intentionally left on its default: it derives from `models()`, which IS delegated,
+/// so it already resolves against the inner catalog.
+#[async_trait::async_trait]
 impl Provider for ConfigProvider {
     fn id(&self) -> &ProviderId {
         self.inner.id()
+    }
+
+    /// PROV-M01 — the registration's display name. Without this the trait default reported the id.
+    fn name(&self) -> &str {
+        Provider::name(&self.inner)
+    }
+
+    /// PROV-M01 — trait default is `None`.
+    fn base_url(&self) -> Option<&str> {
+        self.inner.base_url()
+    }
+
+    /// PROV-M01 — trait default is `None`.
+    fn headers(&self) -> Option<&crate::HeaderMap> {
+        self.inner.headers()
     }
 
     fn models(&self) -> &[Model] {
         self.inner.models()
     }
 
+    /// PROV-M01 — trait default returns the catalog unchanged.
+    fn filter_models(
+        &self,
+        models: &[Model],
+        credential: Option<&Credential>,
+    ) -> Vec<Model> {
+        self.inner.filter_models(models, credential)
+    }
+
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         self.inner.provider_auth()
+    }
+
+    /// PROV-M01 — trait default is `None` ("static provider"). Delegated so the answer tracks the
+    /// inner rather than this wrapper's knowledge of what the inner currently implements.
+    async fn refresh_models(&self) -> Option<Result<(), crate::error::ProviderError>> {
+        self.inner.refresh_models().await
     }
 
     fn stream(
@@ -84,6 +134,18 @@ impl Provider for ConfigProvider {
         options: &StreamOptions,
     ) -> EventStream<StreamEvent> {
         self.inner.stream(model, context, options)
+    }
+
+    /// PROV-M01 — the trait default lowers and re-enters `self.stream`, which reaches the same
+    /// inner today. Delegated anyway: an inner that overrides `stream_simple` (the token-budget
+    /// providers do, `provider.rs:103-105`) must not have its override skipped by this wrapper.
+    fn stream_simple(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: &crate::utils::simple_options::SimpleStreamOptions,
+    ) -> EventStream<StreamEvent> {
+        self.inner.stream_simple(model, context, options)
     }
 }
 
@@ -119,6 +181,26 @@ mod tests {
         let p = ConfigProvider::new("acme", "Acme", Some("sk-acme".into()), vec![model("acme-1", "https://acme.test/v1")]);
         assert_eq!(p.id().as_str(), "acme");
         assert!(p.get_model("acme-1").is_some());
+    }
+
+    /// PROV-M01 — the registration's DISPLAY NAME must survive the wrapper.
+    ///
+    /// The fixture's name is deliberately distinct from its id (`"Acme Machines, Inc."` vs `acme`),
+    /// because `Provider::name`'s trait default is `self.id().as_str()` (`provider.rs:23-25`): a
+    /// fixture that named the provider `"acme"` would compare the default against the default and
+    /// stay green with the delegation deleted. Upstream there is no wrapper at all — the
+    /// registration's fields land on the one `Provider` object (`model-registry.ts:917-940`
+    /// @v0.83.0) — so nothing upstream can drop this.
+    #[test]
+    fn the_registrations_display_name_survives_the_wrapper() {
+        let p = ConfigProvider::new(
+            "acme",
+            "Acme Machines, Inc.",
+            Some("sk-acme".into()),
+            vec![model("acme-1", "https://acme.test/v1")],
+        );
+        assert_ne!("Acme Machines, Inc.", p.id().as_str(), "fixture must not agree with the default");
+        assert_eq!(Provider::name(&p), "Acme Machines, Inc.");
     }
 
     /// A seeded key resolves (auth does not short-circuit); the failure is a transport error against

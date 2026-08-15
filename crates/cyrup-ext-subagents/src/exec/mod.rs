@@ -93,6 +93,13 @@ pub mod tool_call_summary;
 /// `runs/shared/tool-budget.ts`. Enforcement lives child-side in [`crate::prompt_runtime`].
 pub mod tool_budget;
 
+/// SUBA-008 — per-run child assistant-TURN budgets (`turnBudget:` frontmatter, the `turnBudget`
+/// tool param and the `subagents.turnBudget` config key) — a port of pi-subagents'
+/// `runs/shared/turn-budget.ts`. Unlike [`tool_budget`] there is NO env hand-off and no child-side
+/// enforcement: the child is only *told* about the budget through a system-prompt block, and
+/// [`drive_attempt`] enforces it parent-side off the child's own assistant `message_end` events.
+pub mod turn_budget;
+
 /// SUBA-046 — the per-session subagent SPAWN budget, its snapshot, and the explicit grant path
 /// behind an exhausted cap: a port of pi-subagents' `runs/shared/spawn-budget.ts`. Consumed by
 /// `extension.rs`'s `reserve_subagent_spawns` and by the `grant-spawn-budget` dispatch arm.
@@ -677,6 +684,21 @@ pub struct RunOptions {
     /// raised event out to the notice channels. `None` (every non-tool caller, and tests) still
     /// records events on [`SingleResult::control_events`]; it just delivers none of them live.
     pub on_control_event: Option<crate::exec::control::ControlEventSink>,
+    /// SUBA-008 — pi `options.turnBudget` (`runs/foreground/execution.ts:326`/`:399`/`:734`, resolved
+    /// at `subagent-executor.ts:4928` from `effectiveParams.turnBudget ?? deps.config.turnBudget`
+    /// after `applySingleAgentLaunchDefaults` has folded in the agent's own `turnBudget:`
+    /// frontmatter): the assistant-TURN budget this run enforces.
+    ///
+    /// Already validated by [`crate::exec::turn_budget::resolve_turn_budget_config`], so `graceTurns`
+    /// is defaulted and nothing downstream re-derives it. `None` means unbudgeted, which is every
+    /// run that does not ask for one — upstream has no default budget.
+    pub turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-008 — pi `options.enforceHardTurnLimit` (`subagent-executor.ts:240`, `shared/types.ts:1648`):
+    /// suppress the mid-tool-work deferral so the hard limit really terminates.
+    ///
+    /// `false` for every tool-driven run, matching upstream's optional field being absent; pi's only
+    /// caller that sets it is the slash-command delegation adapter (`slash/delegation-adapters.ts:298`).
+    pub enforce_hard_turn_limit: bool,
 }
 
 /// A live per-line sink installed via [`RunOptions::live_events`]: [`run_sync`]'s per-attempt driver
@@ -827,6 +849,28 @@ pub struct SingleResult {
     /// discipline as [`Self::stopped`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_signal: Option<String>,
+    /// SUBA-008 — pi `SingleResult.turnBudget?: TurnBudgetState` (`shared/types.ts:1188`, assigned
+    /// by `updateTurnBudget` at `execution.ts:763`/`:773`/`:780`): the assistant-turn budget this
+    /// run ran under and how it ended.
+    ///
+    /// `None` for every run that declared no budget, and omitted from the wire when `None`, so a
+    /// `status.json`/result file written before this field existed still round-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_budget: Option<crate::exec::turn_budget::TurnBudgetState>,
+    /// SUBA-008 — pi `SingleResult.turnBudgetExceeded?: boolean` (`shared/types.ts:1189`, set at
+    /// `execution.ts:737`): the supervisor aborted this child for blowing its turn budget.
+    ///
+    /// Read by `resolveSubagentResultStatus` through `isUnexplainedProcessSignal`
+    /// (`result-intercom.ts:35`, `runs/shared/process-signal.ts:5-19`) — a turn-budget kill is an
+    /// EXPLAINED signal death, so without this field a budget abort was misreported as `stopped`.
+    #[serde(default, skip_serializing_if = "crate::exec::is_false")]
+    pub turn_budget_exceeded: bool,
+    /// SUBA-008 — pi `SingleResult.wrapUpRequested?: boolean` (`shared/types.ts`, set at
+    /// `execution.ts:768`/`:738`): the child was asked to wrap up because it reached the soft
+    /// limit. True for a deferred or exceeded run as well, matching upstream's own derivation
+    /// (`subagent-runner.ts:924`).
+    #[serde(default, skip_serializing_if = "crate::exec::is_false")]
+    pub wrap_up_requested: bool,
     pub error: Option<String>,
     /// pi `result.savedOutputPath` (`shared/types.ts:492`, assigned at
     /// `runs/foreground/execution.ts:963` from `resolveSingleOutput(...).savedPath`): the concrete
@@ -1716,6 +1760,19 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         opts.output_path.as_deref(),
         Some(&output_capabilities),
     );
+    // SUBA-008 — pi `appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget)`
+    // (`execution.ts:326` for the spawn inputs and `:350` for `effectiveSystemPrompt`). It is the
+    // OUTERMOST append: `shared.systemPrompt` is what `buildSharedRunInputs` returns at
+    // `execution.ts:1443`, i.e. after persona -> skills -> memory -> refinement -> output-path, so
+    // the budget block lands last and nothing composed above can displace it.
+    //
+    // This is the ONLY way the child learns about the budget — there is no
+    // `PI_SUBAGENT_TURN_BUDGET` and no child-side enforcement, unlike the tool budget's env
+    // hand-off two blocks below. See `exec/turn_budget.rs`'s module doc.
+    let persona_owned = crate::exec::turn_budget::append_turn_budget_system_prompt(
+        &persona_owned,
+        opts.turn_budget.as_ref(),
+    );
     let persona_body: &str = &persona_owned;
     let mut persona_temp_file: Option<std::path::PathBuf> = None;
     if !persona_body.is_empty() {
@@ -2215,6 +2272,13 @@ struct AttemptRecord {
     /// `runSingleAttempt` scope — and (b) fold its raised events onto
     /// [`SingleResult::control_events`] (pi `result.controlEvents = allControlEvents`, `:1314`).
     control: crate::exec::control::ControlMonitor,
+    /// SUBA-008 — this attempt's turn-budget latch, carried out of [`drive_attempt`] so `run_sync`
+    /// can fold pi's terminal composition (`execution.ts:1251-1258`) onto the delivered output and
+    /// publish `turnBudget`/`turnBudgetExceeded`/`wrapUpRequested` on the [`SingleResult`].
+    ///
+    /// Unarmed on every path that never reached the drive loop (a spawn failure) and on every run
+    /// that declared no budget.
+    turn_budget: crate::exec::turn_budget::TurnBudgetTracker,
 }
 
 #[async_trait::async_trait]
@@ -2311,6 +2375,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                         startup: StartupEvidence::default(),
                     },
                     AttemptRecord {
+                        turn_budget: Default::default(),
                         progress,
                         final_output: None,
                         interrupted: false,
@@ -2354,6 +2419,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                         startup: StartupEvidence::default(),
                     },
                     AttemptRecord {
+                        turn_budget: Default::default(),
                         progress,
                         final_output: None,
                         interrupted: false,
@@ -2394,6 +2460,8 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                     startup: StartupEvidence::default(),
                 },
                 AttemptRecord {
+                    // SUBA-008: an interrupted attempt still reports the budget it ran under.
+                    turn_budget: outcome.turn_budget.clone(),
                     progress,
                     final_output: Some(INTERRUPTED_FINAL_OUTPUT.to_string()),
                     interrupted: true,
@@ -2425,6 +2493,9 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                     startup: StartupEvidence::default(),
                 },
                 AttemptRecord {
+                    // SUBA-008: pi's timeout arm wins the terminal composition outright
+                    // (`execution.ts:1241`), but the state is still published.
+                    turn_budget: outcome.turn_budget.clone(),
                     progress,
                     final_output,
                     interrupted: false,
@@ -2440,10 +2511,27 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         // (a.0) The protocol-output-limit diagnostic outranks everything: pi's `failProtocol` sets
         //     `result.error` at the moment the cap trips, and the close handler only fills in a
         //     `closeError` when `result.error` is still unset (`execution.ts:1099`).
-        let mut error = outcome
-            .protocol_error
-            .as_ref()
-            .map(crate::exec::child_protocol::format_protocol_output_limit);
+        // (a.-1) SUBA-008 — a turn-budget abort sets `result.error = message` at the moment it
+        //     fires (`execution.ts:740`), i.e. strictly BEFORE the close handler runs, and the
+        //     close handler only fills in a `closeError` when `result.error` is still unset
+        //     (`:1099`). So the abort message outranks every diagnosis below it — including the
+        //     child's own trailing apology, which is exactly what a child that was signalled
+        //     mid-sentence tends to produce.
+        //
+        //     It cannot collide with the protocol-limit diagnostic below: the drive loop returns
+        //     on whichever of the two fires first, so at most one is ever set.
+        let mut error = match outcome.turn_budget.terminal_note() {
+            Some(crate::exec::turn_budget::TurnBudgetTerminalNote::Exceeded(message)) => {
+                Some(message)
+            }
+            _ => None,
+        };
+        if error.is_none() {
+            error = outcome
+                .protocol_error
+                .as_ref()
+                .map(crate::exec::child_protocol::format_protocol_output_limit);
+        }
         if error.is_none() {
             error = spawn_error;
         }
@@ -2587,17 +2675,20 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                     observed_mutation_attempt: crate::exec::completion_guard::has_mutation_tool_call(
                         &progress.all_events,
                     ),
-                    // cyrup's foreground executor has no `stopped`/`turnBudgetExceeded` analog
-                    // (pi carries both on the BACKGROUND runner's result). Neither can be true of
-                    // a child with zero messages, zero tools and zero usage anyway — both require
-                    // the child to have run turns — so leaving them false cannot widen the
-                    // predicate.
+                    // cyrup's foreground executor has no `stopped` analog (pi carries it on the
+                    // BACKGROUND runner's result). It cannot be true of a child with zero
+                    // messages, zero tools and zero usage anyway — it requires the child to have
+                    // run turns — so leaving it false cannot widen the predicate.
                     stopped: false,
-                    turn_budget_exceeded: false,
+                    // SUBA-008 — no longer hard-coded: a turn-budget abort is a deliberate
+                    // supervisor kill, and `is_retryable_subagent_startup_failure` must fail
+                    // closed on it rather than relaunching the model that was over budget.
+                    turn_budget_exceeded: outcome.turn_budget.exceeded(),
                     error_is_placeholder,
                 },
             },
             AttemptRecord {
+                turn_budget: outcome.turn_budget.clone(),
                 progress,
                 final_output,
                 interrupted: false,
@@ -2716,6 +2807,14 @@ struct DriveOutcome {
     /// bypasses acceptance/completion-guard/truncation, and the fallback ladder does not advance past
     /// it). `false` when no such ask was observed.
     detached: bool,
+    /// SUBA-008 — the run's turn-budget latch as it stood when this attempt ended: pi's
+    /// `result.turnBudget` / `result.turnBudgetExceeded` / `result.wrapUpRequested` trio
+    /// (`execution.ts:1087`/`:1251-1258`), carried out of the drive loop as one value.
+    ///
+    /// Unarmed (`TurnBudgetTracker::is_armed() == false`) for every run that declared no budget,
+    /// which is every run today that does not pass one — so this field changes nothing on those
+    /// paths.
+    turn_budget: crate::exec::turn_budget::TurnBudgetTracker,
 }
 
 /// pi's `missingStructuredOutput` analog (`execution.ts:1189-1191`) for the empty-output
@@ -2795,6 +2894,55 @@ fn contact_supervisor_block_prompt(event: &crate::exec::ndjson::SubagentEvent) -
     None
 }
 
+/// SUBA-008 — is this event an ASSISTANT `message_end`? pi's `evt.type === "message_end" &&
+/// evt.message && evt.message.role === "assistant"` (`execution.ts:910-912`), which is the ONLY
+/// shape that increments a turn.
+fn is_assistant_message_end(event: &SubagentEvent) -> bool {
+    let SubagentEvent::MessageEnd { message } = event else {
+        return false;
+    };
+    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+}
+
+/// SUBA-008 — every `toolCall` content part of a `message_end`, pi's `toolCalls` filter
+/// (`execution.ts:915-918`). Returns an empty slice for any other event shape.
+fn message_end_tool_calls(event: &SubagentEvent) -> Vec<&serde_json::Value> {
+    let SubagentEvent::MessageEnd { message } = event else {
+        return Vec::new();
+    };
+    message
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| {
+                    part.get("type").and_then(serde_json::Value::as_str) == Some("toolCall")
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// SUBA-008 — pi's `hasToolCall` (`execution.ts:919`).
+fn message_end_has_tool_call(event: &SubagentEvent) -> bool {
+    !message_end_tool_calls(event).is_empty()
+}
+
+/// SUBA-008 — pi's `terminalStructuredOutputCall` (`execution.ts:921-923`), minus the
+/// `Boolean(options.structuredOutput)` half its caller applies: EXACTLY one tool call, and it is
+/// `structured_output`.
+///
+/// This is the second way a turn counts as terminal. Without it, a child that answers by calling
+/// the structured-output tool — the normal ending for a `outputSchema` run, where `stopReason` is
+/// `toolUse`, not `stop` — would be treated as still working and could be aborted at the exact
+/// moment it delivered its answer.
+fn is_sole_structured_output_tool_call(event: &SubagentEvent) -> bool {
+    let calls = message_end_tool_calls(event);
+    calls.len() == 1
+        && calls[0].get("name").and_then(serde_json::Value::as_str) == Some("structured_output")
+}
+
 /// Drive one spawned child to completion, folding every NDJSON line into `progress` (R-SA-027/028)
 /// and racing the whole read loop against `opts.cancel`/`opts.interrupt`/an optional deadline
 /// timer, plus the final-stop grace-drain window (pi `execution.ts:333-367`, T3 group A). Returns a
@@ -2845,6 +2993,13 @@ async fn drive_attempt(
     // surfaced via `spawn_clarify` exactly once (the guard below), and this flag then rides out to
     // the attempt's `detached` outcome (bypassing acceptance; the ladder does not advance past it).
     let mut detached_seen = false;
+    // SUBA-008 — pi's four `updateTurnBudget` locals (`turnBudgetSoftReached` plus the three
+    // `result.turnBudget*` fields, `execution.ts:483`/`:567-569`/`:759-782`), gathered into one
+    // value. Unarmed (and therefore inert on every path below) unless this run declared a budget.
+    let mut turn_budget = crate::exec::turn_budget::TurnBudgetTracker::new(
+        opts.turn_budget,
+        opts.enforce_hard_turn_limit,
+    );
 
     loop {
         let deadline_arm = async {
@@ -2885,6 +3040,7 @@ async fn drive_attempt(
                     detached: detached_seen,
                     agent_settled,
                     protocol_error: None,
+                    turn_budget: turn_budget.clone(),
                 };
             }
             () = interrupt.cancelled() => {
@@ -2903,6 +3059,7 @@ async fn drive_attempt(
                     detached: detached_seen,
                     agent_settled,
                     protocol_error: None,
+                    turn_budget: turn_budget.clone(),
                 };
             }
             () = deadline_arm => {
@@ -2921,6 +3078,7 @@ async fn drive_attempt(
                     detached: detached_seen,
                     agent_settled,
                     protocol_error: None,
+                    turn_budget: turn_budget.clone(),
                 };
             }
             step = child.next_event_or_exit() => {
@@ -3025,7 +3183,114 @@ async fn drive_attempt(
                                 &event,
                                 crate::background::now_epoch_millis_pub(),
                             );
+                            // SUBA-008 — the two per-message inputs `updateTurnBudget` needs, read
+                            // BEFORE `record_event` consumes the event by value (same reason the
+                            // control fold above runs here).
+                            let assistant_turn = is_assistant_message_end(&event);
+                            let has_tool_call = message_end_has_tool_call(&event);
+                            let terminal_structured_output_call = opts
+                                .structured_output_schema
+                                .is_some()
+                                && is_sole_structured_output_tool_call(&event);
                             progress.record_event(event);
+
+                            // pi `execution.ts:910-924`: an ASSISTANT `message_end` is one turn,
+                            // and the budget is re-evaluated on it. `progress.turn_count()` is
+                            // this port's `result.usage.turns` — pi keeps the two in lockstep
+                            // (`:913-914`) and cyrup derives the one from the other rather than
+                            // carrying a second counter that could drift.
+                            if assistant_turn && turn_budget.is_armed() {
+                                let turn_count = u64::from(progress.turn_count());
+                                // pi's third argument: `hasToolCall || Boolean(progress.currentTool)`
+                                // (`:924`) — tool work either STARTING on this very message or
+                                // still in flight from an earlier one. This is what makes the
+                                // deferral arm reachable.
+                                let tool_work_active_or_starting =
+                                    has_tool_call || progress.current_tool.is_some();
+                                let effect = turn_budget.observe_assistant_turn(
+                                    turn_count,
+                                    terminal_stop || terminal_structured_output_call,
+                                    tool_work_active_or_starting,
+                                    false,
+                                );
+                                match effect {
+                                    crate::exec::turn_budget::TurnBudgetEffect::None => {}
+                                    crate::exec::turn_budget::TurnBudgetEffect::SoftNote(note) => {
+                                        // pi `appendRecentOutput(progress, [turnBudgetSoftNote(...)])`
+                                        // (`:769`) — the wrap-up request reaches the operator
+                                        // through the run's own output tail, once.
+                                        progress.append_recent_output(&note);
+                                    }
+                                    crate::exec::turn_budget::TurnBudgetEffect::Abort {
+                                        message,
+                                        soft_note,
+                                    } => {
+                                        if let Some(note) = soft_note {
+                                            progress.append_recent_output(&note);
+                                        }
+                                        // pi `requestTurnBudgetAbort` (`:733-757`): SIGINT now,
+                                        // SIGTERM 1 s later, SIGKILL 4 s after the SIGINT. That is
+                                        // exactly this ladder with the two graces pinned — 1 s to
+                                        // escalate off SIGINT and 3 s more to escalate off SIGTERM
+                                        // lands the kill at t+4 s, upstream's own instant.
+                                        //
+                                        // [CYRUP-DELTA]: pi ARMS the two timers and lets the run
+                                        // keep reading the child's stdout in the meantime, so a
+                                        // child that wraps up inside the window still delivers its
+                                        // final output; this ladder blocks the drive loop for the
+                                        // same wall-clock window instead, because
+                                        // `SpawnedChild::terminate` consumes the child and cyrup
+                                        // has no seam that signals without taking it. The observed
+                                        // outcome is the same on both timelines — the child either
+                                        // dies on SIGINT (the ladder returns immediately) or is
+                                        // escalated on upstream's schedule — but a late final
+                                        // message written after the SIGINT is dropped here where
+                                        // upstream would have read it, which is why the abort
+                                        // message doubles as `final_output` below.
+                                        let outcome = child
+                                            .terminate_with_graces(
+                                                &cancel,
+                                                crate::spawn::signal::EscalationGraces {
+                                                    sigint: Duration::from_millis(
+                                                        crate::exec::turn_budget::TURN_BUDGET_TERMINATION_DELAY_MS,
+                                                    ),
+                                                    sigterm: Duration::from_millis(
+                                                        crate::exec::turn_budget::TURN_BUDGET_HARD_KILL_DELAY_MS
+                                                            - crate::exec::turn_budget::TURN_BUDGET_TERMINATION_DELAY_MS,
+                                                    ),
+                                                },
+                                            )
+                                            .await;
+                                        // `message` is not carried on the outcome: it is
+                                        // recomputed verbatim from the tracker's own state by
+                                        // `TurnBudgetTracker::terminal_note`, which is the single
+                                        // place `run_attempt` reads it from, so there is exactly
+                                        // one producer of upstream's string.
+                                        debug_assert_eq!(
+                                            turn_budget.terminal_note(),
+                                            Some(
+                                                crate::exec::turn_budget::TurnBudgetTerminalNote::Exceeded(
+                                                    message.clone()
+                                                )
+                                            )
+                                        );
+                                        drop(message);
+                                        return DriveOutcome {
+                                            timed_out: false,
+                                            interrupted: false,
+                                            // NOT a forced drain: `forcedDrainAfterFinalSuccess`
+                                            // must never coerce a turn-budget abort to exit 0.
+                                            forced_termination: false,
+                                            clean_terminal_stop,
+                                            exit_status: outcome.map(|o| Some(o.status)),
+                                            detached: detached_seen,
+                                            agent_settled,
+                                            protocol_error: None,
+                                            turn_budget,
+                                        };
+                                    }
+                                }
+                            }
                         }
                     }
                     crate::spawn::ChildStep::ProtocolLimit(limit) => {
@@ -3049,6 +3314,7 @@ async fn drive_attempt(
                             detached: detached_seen,
                             agent_settled,
                             protocol_error: Some(limit),
+                            turn_budget: turn_budget.clone(),
                         };
                     }
                     crate::spawn::ChildStep::Line(Err(_)) | crate::spawn::ChildStep::Eof => {
@@ -3103,6 +3369,7 @@ async fn drive_attempt(
                     detached: detached_seen,
                     agent_settled,
                     protocol_error: None,
+                    turn_budget: turn_budget.clone(),
                 };
             }
             () = async {
@@ -3132,6 +3399,7 @@ async fn drive_attempt(
                 detached: detached_seen,
                 agent_settled,
                 protocol_error: None,
+                turn_budget: turn_budget.clone(),
             }
         }
         Ok(None) => {
@@ -3149,6 +3417,7 @@ async fn drive_attempt(
                 detached: detached_seen,
                 agent_settled,
                 protocol_error: None,
+                turn_budget: turn_budget.clone(),
             }
         }
         Err(err) => DriveOutcome {
@@ -3160,6 +3429,7 @@ async fn drive_attempt(
             detached: detached_seen,
             agent_settled,
             protocol_error: None,
+            turn_budget: turn_budget.clone(),
         },
     }
 }
@@ -3262,6 +3532,9 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             max: agent.depth.max_depth,
         };
         return SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: agent.name.clone(),
             task: task.to_string(),
             exit_code: 1,
@@ -3290,6 +3563,9 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     if let Some(err) = validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
     {
         return SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: agent.name.clone(),
             task: task.to_string(),
             exit_code: 1,
@@ -3332,6 +3608,9 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
 
     if candidates.is_empty() {
         return SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: agent.name.clone(),
             task: task.to_string(),
             exit_code: 1,
@@ -3394,6 +3673,9 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             .any(|m| m == crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL);
         if orchestration_requested && orchestration_missing {
             return SingleResult {
+                turn_budget: None,
+                turn_budget_exceeded: false,
+                wrap_up_requested: false,
                 agent: agent.name.clone(),
                 task: task.to_string(),
                 exit_code: 1,
@@ -3433,6 +3715,9 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     let scratch_dir = opts.cwd.join(".cyrup-subagent-scratch");
     if let Err(err) = std::fs::create_dir_all(&scratch_dir) {
         return SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: agent.name.clone(),
             task: task.to_string(),
             exit_code: 1,
@@ -3559,6 +3844,15 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // before the output-path handoff / truncation, exactly as pi applies it right after extracting
     // `fullOutput`. The nominal budget is `opts.timeout_ms` (pi `formatTimeoutMessage(options
     // .timeoutMs ?? 0)`), distinct from the wall-clock `deadline_at` that actually fired the timer.
+    //
+    // SUBA-008 — pi's `else if` chain continues from the SAME `if (result.timedOut)`
+    // (`execution.ts:1241-1258`), so a timed-out run never also gets a turn-budget preamble even
+    // when both fired. That is why the three turn-budget arms are `else` on this branch and not a
+    // second independent `if`.
+    let turn_budget_tracker = last_attempt
+        .as_ref()
+        .map(|record| record.turn_budget.clone())
+        .unwrap_or_default();
     if timed_out {
         let timeout_message = format_timeout_message(opts.timeout_ms.unwrap_or(0));
         let partial = final_output.clone().unwrap_or_default();
@@ -3566,6 +3860,20 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             timeout_message
         } else {
             format!("{timeout_message}\n\nPartial output before timeout:\n{partial}")
+        });
+    } else if let Some(note) = turn_budget_tracker.terminal_note() {
+        let body = final_output.clone().unwrap_or_default();
+        final_output = Some(match note {
+            // pi `formatTurnBudgetOutput(turnBudgetExceededMessage(...), fullOutput)` (`:1252`) —
+            // message first, whatever the child managed under a "Partial output" heading.
+            crate::exec::turn_budget::TurnBudgetTerminalNote::Exceeded(message) => {
+                crate::exec::turn_budget::format_turn_budget_output(&message, &body)
+            }
+            // pi `fullOutput.trim() ? `${note}\n\n${fullOutput}` : note` (`:1255`/`:1258`) — the
+            // note leads, and the child's real answer follows it intact.
+            crate::exec::turn_budget::TurnBudgetTerminalNote::Note(note) => {
+                crate::exec::turn_budget::prepend_turn_budget_note(&body, &note)
+            }
         });
     }
 
@@ -3941,6 +4249,12 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     }
 
     SingleResult {
+        // SUBA-008 — pi `result.turnBudget` / `result.turnBudgetExceeded` / `result.wrapUpRequested`
+        // (`execution.ts:1087`), published from the WINNING attempt's own latch. `None`/`false` for
+        // every run that declared no budget.
+        turn_budget: turn_budget_tracker.state(),
+        turn_budget_exceeded: turn_budget_tracker.exceeded(),
+        wrap_up_requested: turn_budget_tracker.wrap_up_requested(),
         agent: agent.name.clone(),
         task: task.to_string(),
         exit_code,
@@ -3987,6 +4301,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
 /// `AgentDefinition` is only ever valid for this one guard call, not as a general conversion.
 fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinition {
     AgentDefinition {
+        default_turn_budget: None,
         name: agent.name.clone(),
         local_name: agent.name.clone(),
         package_name: None,
@@ -4150,6 +4465,8 @@ mod tests {
 
     fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions {
         RunOptions {
+            turn_budget: None,
+            enforce_hard_turn_limit: false,
             model_scope: None,
             cwd: cwd.to_path_buf(),
             deadline_at: None,
@@ -6785,6 +7102,56 @@ mod tests {
             .expect("plan builds");
         // An empty persona name writes NO var (child resolves `None` — pi's top-level `""`).
         assert_eq!(plan.spec.env_overlay.get(AGENT_NAME_ENV_VAR), None);
+    }
+
+    /// SUBA-008 — the budget notice must reach the CHILD, and it must reach it through the system
+    /// prompt: there is no `CYRUP_SUBAGENT_TURN_BUDGET` env var to carry it (unlike the tool
+    /// budget), so if this composition is missing, the child is silently never told to self-pace
+    /// and only discovers the budget by being killed.
+    ///
+    /// Reads the spilled prompt FILE rather than the argv, because SUBA-030 moved the persona off
+    /// the command line — asserting on argv alone would pass while the file held anything at all.
+    #[test]
+    fn the_turn_budget_notice_reaches_the_child_through_the_spilled_system_prompt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_body = "You are a careful worker.".to_string();
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+
+        // Presence before absence: with NO budget the block must not appear at all, so the
+        // assertion below cannot be satisfied by some unrelated boilerplate.
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        let unbudgeted = read_system_prompt_arg(&plan);
+        assert_eq!(unbudgeted.trim(), "You are a careful worker.");
+        assert!(!unbudgeted.contains("## Turn budget"), "{unbudgeted}");
+
+        opts.turn_budget = Some(crate::exec::turn_budget::ResolvedTurnBudget {
+            max_turns: 4,
+            grace_turns: 2,
+        });
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        let budgeted = read_system_prompt_arg(&plan);
+        // The persona survives and the block is APPENDED after it (pi's outermost append,
+        // `execution.ts:326`), never substituted for it.
+        assert!(budgeted.starts_with("You are a careful worker.\n\n## Turn budget\n"), "{budgeted}");
+        assert!(budgeted.contains("a soft budget of 4 assistant turns."), "{budgeted}");
+        assert!(
+            budgeted.contains("After that, 2 additional assistant turns may be allowed only for a final wrap-up."),
+            "{budgeted}"
+        );
+    }
+
+    /// Read back the file `--system-prompt`/`--append-system-prompt` points at in a built plan.
+    fn read_system_prompt_arg(plan: &AttemptSpawnPlan) -> String {
+        let argv = plan.spec.build_argv();
+        let idx = argv
+            .iter()
+            .position(|a| a == SYSTEM_PROMPT_FLAG || a == APPEND_SYSTEM_PROMPT_FLAG)
+            .expect("a non-empty persona must push a system-prompt flag");
+        std::fs::read_to_string(&argv[idx + 1]).expect("the spilled prompt file must exist")
     }
 
     #[test]

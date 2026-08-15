@@ -955,6 +955,9 @@ mod tests {
     /// A `SingleResult` that was terminated by an explicit stop.
     fn stopped_child() -> crate::exec::SingleResult {
         crate::exec::SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: "researcher".to_string(),
             task: String::new(),
             exit_code: 1,
@@ -1320,6 +1323,9 @@ mod tests {
 
     fn child_result(agent: &str, final_output: Option<&str>, exit_code: i32) -> SingleResult {
         SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: agent.to_string(),
             task: String::new(),
             exit_code,

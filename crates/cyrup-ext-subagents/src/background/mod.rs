@@ -2739,6 +2739,9 @@ mod tests {
         let history_path = home.path().join("run-history.jsonl");
 
         let ok = SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: "researcher".to_string(),
             task: "look into the thing".to_string(),
             exit_code: 0,

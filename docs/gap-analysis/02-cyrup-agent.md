@@ -164,6 +164,8 @@ turns AGENT-029 from latent into live.
 > `AGENT-028` is a **`tracker`** — it keeps its ID, its row and its full body, but proposes a scope
 > decision rather than work, so it is listed and **not counted**. Counted total: **26**.
 
+> **RE-DERIVED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set UNCHANGED at 0 critical, 0 high, 0 medium, 2 low = 2** (31 rows: 27 fully closed, 2 open — both partially — 1 `tracker`, and `AGENT-S04`, which carries no severity and is in neither total). No sweep-7 or sweep-8 agent touched this area and no row moved. Both remaining rows are blocked outside this crate, as recorded.
+
 > **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 0 medium, 2 low = 2** (`AGENT-026`, `AGENT-027`, both blocked outside this crate), plus the `AGENT-028` tracker and the two provenance rows. `AGENT-034` and `AGENT-035` were filed and closed in the same pass. "Counted total: **26**" above is superseded.
 
 | ID | Severity | Kind | Effort | Title |

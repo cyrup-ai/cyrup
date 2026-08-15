@@ -217,6 +217,8 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 > `SESS-038` is a **`tracker`** (a scope decision, not work): it keeps its ID, this row and its full
 > body, and is **not counted**. Counted total: **29**.
 
+> **RE-DERIVED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set UNCHANGED at 0 critical, 1 high, 1 medium, 6 low = 8** (34 rows: 25 fully closed, 8 open — 4 of them partially — 1 `tracker`). No row moved in sweeps 7-8. **`SESS-040` is now one of only TWO open highs in the whole backlog** and is the #1 ranked item; note that a new cross-area dependency was recorded against this crate this edition — `PROV-036`'s input data all lives here (`entry.rs:105-107`, `:118-121`) while its consumer is `SessionStats::from_entries` in `cyrup-session-svc`, so the two should go to one agent.
+
 > **RECOUNTED 2026-08-14 — counted set: 0 critical, 1 high, 1 medium, 6 low = 8**, plus the `SESS-038` tracker. `SESS-045` … `SESS-048` were filed and closed in the same pass. "Counted total: **29**" above is superseded.
 
 | ID | Severity | Kind | Effort | Title |

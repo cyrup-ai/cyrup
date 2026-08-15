@@ -16,6 +16,67 @@ the evidence.
 > actually does. Closed items keep their IDs in each area file's status table so a closure can be
 > re-audited later.
 >
+> **RECONCILED 2026-08-14 (third edition) against cyrup HEAD `e5c6933`** (docs HEAD `0097149`,
+> branch `david/cyrup`). **EIGHT** whole-backlog sweeps have now landed. The second edition below
+> reconciled sweeps 3-6; this one reconciles **sweeps 7 and 8**, and — following that edition's own
+> instruction to *reconcile documentation every sweep, not every four* — the gap is now two, not six.
+> Every count is re-derived row by row from the twelve `## Open items` tables.
+>
+> **Open set: 145 work items — 0 critical, 2 high, 61 medium, 82 low** (was 153 = 0/2/63/88), plus
+> the same **10 `tracker` rows**, excluded as always. **503 rows now carry 349 full closure markers
+> and 35 partial ones — 384 of 503 (76%).** Three rows are new and all three are closed: `PROV-M01`
+> and `TOOL-M01` were **filed AND closed in the same pass**, both from one assigned audit rather than
+> from the backlog; **`EXT-M03` was filed RETROACTIVELY by this reconciliation, because the ID is
+> cited five times in `crates/cyrup-ext/src/host/live.rs` and had no row in any area file** — the
+> work landed in sweep 6 and only the bookkeeping was missing. **Grep the SOURCE for `AREA-NNN`
+> citations at every reconciliation, not just the docs.**
+> **One row was REOPENED by measurement: `TOOL-042`.** **No ID was renumbered, merged or deleted.**
+>
+> **The two highs are unchanged — `SESS-040` and `PROV-047`.** Areas 08, 09 and 10 still have zero
+> open criticals and zero open highs between them.
+>
+> **`PROV-M01` is the finding to read first.** It is the **third** instance of the dropped-delegation
+> class (after `RegisteredTool` and `WasmTool`) and the **first on a non-`Tool` trait** — and unlike
+> the other two it is a **live behaviour defect**: `github-copilot`'s credential filter was discarded
+> in the overlay configuration, so `Models::get_available` offered all 29 Copilot models regardless of
+> what the OAuth credential entitled. Proven by running the new test against the pre-fix code.
+> **The invariant is not "audit `Tool` impls": it is every hand-written same-trait decorator, every
+> defaulted method, and a fixture value that CONTRADICTS the default.**
+>
+> **The measured error rate is unchanged at ≈12%** (≈56 refutations against ~465 rows worked). It has
+> not moved in six editions and the honest reading is that **this is the method's floor, not a defect
+> to be driven out.** Sweep 8 produced clean instances of both failure modes the second edition
+> separated — doc staleness (`SEAM-017` read "not started" while the port was **1262 lines** at HEAD)
+> and genuine analysis error (**`CFG-052`'s entire premise about upstream is false**) — plus a **third
+> mode this edition names for the first time: a closure validated against the wrong signal.**
+> `TOOL-042`'s fix cut the LEAK rate from ~12% to ~1.0% but did not stop it, and the one instrumented
+> occurrence cannot be an inherited handle at all. **It was reopenable only because its closure wrote
+> down its own falsification condition. Do that on every closure resting on an argument rather than
+> an observation.**
+>
+> **ORCHESTRATION, for whoever runs sweep 9.** The feature partition still works — sweep 8's tail-a
+> agent held five crates and landed the turn-budget subsystem end to end, which no per-crate agent
+> could have done. **The new rule is: TREAT THE BRIEF AS A LEAD.** Two of three agents found a
+> load-bearing error in their own assignment text rather than in the code — one was a prescribed
+> mechanism that would have shipped a budget nothing enforced, and **one was a FABRICATED pi citation
+> in the orchestrator's own brief, caught by an agent opening the file.** Fabricated citations are not
+> confined to the area files. **Four fix sites recorded in the area files are wrong in the same
+> direction** — `EXT-013`, `TOOL-022`/`TOOL-015`/`EXT-024`, `PROV-036` all name `cyrup-tui` but need a
+> **producer in `cyrup-session-svc`** that does not exist, and `SEAM-020`'s "one line" is a **type
+> error**. Route sweep 9 by fix site; one owner spanning `cyrup-session-svc` + `cyrup-tui` closes five
+> rows. **Six rows are owner decisions, not agent work** (`SEAM-057`, `SUBA-025`, `SUBA-055`'s guide
+> action, `SUBA-054`'s async half, `PERM-032`, and `CFG-049`'s URL rebrand) — three sweeps have now
+> declined `SEAM-057` and two have declined `SUBA-025`.
+>
+> **The test architecture now has TWO gates, and both are green:** unit gate **6740 tests in 17.9 s**;
+> integration gate **473 tests in 92 s behind `cargo nextest run -p cyrup-it --features it`**. That is
+> new information for `ICOM-053`: the harness **does** run — what the row still names is that the
+> 17.9 s merge gate does not invoke it. **The integration suite carries guard tests that FAIL when
+> ambient credentials leak in** (`TOGETHER_API_KEY`, `CYRUP_INTERCOM`, `GITHUB_TOKEN`, …); scrub the
+> environment before running it, and it is 473/473.
+>
+> *Superseded second-edition figures, retained for provenance:*
+
 > **RECONCILED 2026-08-14 (second edition) against cyrup HEAD `bdcb0d0`.** **Six** whole-backlog
 > sweeps have now landed. The first edition of this block reconciled sweeps 1-2; **sweeps 3, 4, 5 and
 > 6 ran before any doc writer did**, and this edition reconciles them. Every count below is
@@ -52,7 +113,9 @@ the evidence.
 > foreign-filed rows that land in it.
 >
 > **The test architecture changed**: 310 integration binaries → **6 + 8 gated** behind the
-> `cyrup-it` harness crate, gate now at **6699 tests, 7 skipped, in 16.3 s** (was 6440 in 16.4 s).
+> `cyrup-it` harness crate, gate now at ~~**6699 tests, 7 skipped, in 16.3 s**~~ **6740 tests in
+> 17.9 s (2026-08-14, third edition), plus a second gate: 473 integration tests in 92 s behind
+> `--features it`** (was 6440 in 16.4 s).
 > Every `crates/<crate>/tests/<x>.rs` citation in this directory is stale unless it names `cyrup-it`
 > — **and `cyrup-it` is `required-features = ["it"]`, so the gate does not build or run it**
 > (structural defect J, now filed in its own right as `ICOM-053`; it also blocks `EXT-025` and hides
@@ -124,18 +187,30 @@ the evidence.
 | [`02-cyrup-agent.md`](02-cyrup-agent.md) | the turn loop, tool dispatch, hooks, abort | **2** | 0 | 0 |
 | [`03-cyrup-session.md`](03-cyrup-session.md) | JSONL session tree, compaction, system prompt | **8** | 0 | 1 |
 | [`04-cyrup-tools.md`](04-cyrup-tools.md) | the built-in tool set | **5** | 0 | 0 |
-| [`05-cyrup-config-and-resources.md`](05-cyrup-config-and-resources.md) | settings, model resolution, trust, skills, packages | **12** | 0 | 0 |
-| [`06-cyrup-ext.md`](06-cyrup-ext.md) | extension host, WIT world, event catalog | **24** | 0 | 0 |
+| [`05-cyrup-config-and-resources.md`](05-cyrup-config-and-resources.md) | settings, model resolution, trust, skills, packages | **9** | 0 | 0 |
+| [`06-cyrup-ext.md`](06-cyrup-ext.md) | extension host, WIT world, event catalog | **23** | 0 | 0 |
 | [`07-cyrup-tui.md`](07-cyrup-tui.md) | terminal UI application layer | **35** | 0 | 0 |
-| [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes | **7** | 0 | 0 |
-| [`09-cyrup-ext-subagents.md`](09-cyrup-ext-subagents.md) | subagent delegation | **20** | 0 | 0 |
+| [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes | **6** | 0 | 0 |
+| [`09-cyrup-ext-subagents.md`](09-cyrup-ext-subagents.md) | subagent delegation | **17** | 0 | 0 |
 | [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate | **4** | 0 | 0 |
 | [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker | **9** | 0 | 0 |
 | [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline | **16** | 0 | 0 |
-| | **total** | **153** | **0** | **2** |
+| | **total** | **145** | **0** | **2** |
 
-Counts are the `## Open items` table of each file, re-derived 2026-08-14 (second edition, after
-sweeps 3-6). **Every file now carries exactly one such table** — area 03's second table was the last
+*Third edition, 2026-08-14 (after sweeps 7-8). Changed from the second edition: area 05 12 → 9
+(`CFG-045`, `CFG-051`, `CFG-052`), area 06 24 → 23 (`EXT-060`), area 08 7 → 6 (`SEAM-017`), area 09
+20 → 17 (`SUBA-008`, `SUBA-030`, `SUBA-035`). Area 04 holds at 5 in a changed composition —
+`TOOL-024` closed, `TOOL-M01` filed+closed, and `TOOL-042` **reopened as medium**. Areas 01, 02, 03,
+07, 10, 11 and 12 did not move; `PROV-M01` was filed and closed inside area 01 without changing its
+count.* **Area 12 is now the least-worked file in the directory by closure rate (14 of 34 = 41%,
+against a directory average of 76%) — no sweep since 3 has owned it, which is a scheduling fact
+rather than a difficulty one.**
+
+Counts are the `## Open items` table of each file, re-derived 2026-08-14 (**third edition, after
+sweeps 7-8**), row by row with the counting rule stated in `00-residual-ledger.md`. **One row,
+`AGENT-S04`, carries `*(partially-closed)*` in place of a severity and is therefore in neither the
+open total nor the closed one** — that has been true for three editions and is recorded rather than
+silently rated. **Every file now carries exactly one such table** — area 03's second table was the last
 one and was folded in during the repair pass — so a single enumeration is complete. **Ten** `tracker`
 rows sit in those tables (or, in areas 08 and 09, in a separate `## Trackers` table) and are
 deliberately outside the arithmetic: one each in areas 01, 02, 03, 08, 09 and **10** (`PERM-017`,
@@ -163,7 +238,7 @@ tree is not in this workspace, so exact alignment with it is unverified.
 
 | repo | HEAD | cyrup ported baseline | latest tag | delta |
 |---|---|---|---|---|
-| `cyrup/` | **`04c1ba2`** (last code commit; docs `a9000b1`, branch `david/cyrup`, clean) | — | — | 18 crates, ~482k lines of Rust under `crates/` |
+| `cyrup/` | **`e5c6933`** — third edition, 2026-08-14 (docs `0097149`, branch `david/cyrup`). *Superseded: `bdcb0d0` at the second edition, `380c713` at the first, `04c1ba2` at the re-baseline.* | — | — | 18 crates, ~482k lines of Rust under `crates/` |
 | `pi/` | `581d75a89` = `v0.84.1-117-g581d75a89` | **v0.83.0** | **v0.84.1** | 627 files, +52 291 / −17 556 |
 | `pi-subagents/` | `9e9fd13` | **≈v0.43.0** (inferred — the crate records no version string) | **v0.47.1** | 151 files, +10 254 / −1 333 |
 | `pi-permission-system/` | `9affcc9` | **v0.7.1** | **v0.8.0** | 28 files, +4 023 / −1 851 |

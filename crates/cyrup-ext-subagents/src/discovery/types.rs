@@ -807,6 +807,14 @@ pub struct AgentDefinition {
     /// time encodes it into the child's `CYRUP_SUBAGENT_TOOL_BUDGET` env var and the child-side
     /// runtime enforces it (soft nudge + hard block).
     pub tool_budget: Option<ResolvedToolBudget>,
+    /// SUBA-008 — the agent's `turnBudget:` (pi `AgentConfig.defaultTurnBudget`, `agents.ts:1555`),
+    /// already resolved (so `graceTurns` is defaulted). `None` means the agent declared none.
+    ///
+    /// A LAUNCH DEFAULT, not an enforced property of the agent: it is folded into the call's
+    /// effective params only when the caller omitted `turnBudget`
+    /// (`subagent-executor.ts:1940-1942`), and the extension-config `subagents.turnBudget` sits
+    /// below it in the same chain.
+    pub default_turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
     pub disabled: Option<bool>,
     /// The agent's own frontmatter-body prose, prior to any orchestrator-injected scaffolding
     /// (acceptance contract, skill pointers, project context) — combined per `system_prompt_mode`
@@ -1069,6 +1077,7 @@ mod tests {
 
     fn sample_agent(tools: Option<Vec<ToolRef>>) -> AgentDefinition {
         AgentDefinition {
+            default_turn_budget: None,
             name: "reviewer".to_string(),
             local_name: "reviewer".to_string(),
             package_name: None,

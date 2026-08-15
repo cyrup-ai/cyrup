@@ -206,6 +206,8 @@ counts**: they propose no work and say so, so they are bookkeeping rather than b
 **Dedup** column names the item in another area that owns the same defect; see
 `## Coverage → Duplication census`. **No ID was renumbered, merged or deleted to produce it.**
 
+> **RE-DERIVED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set UNCHANGED at 0 critical, 0 high, 7 medium, 9 low = 16** (34 rows: 14 closed, 16 open, plus the four `tracker` rows). **No sweep since 3 has owned this area — it is now the LEAST-worked file in the directory by closure rate (14 of 34 = 41%, against a directory average of 76%), and that is a scheduling fact, not a difficulty fact.** One routing note added: **`DRIFT-004` needs the same `BashOperations` trait in `crates/cyrup-tools` that `SEAM-015` needs, so the two should go to ONE agent** (re-confirmed by sweep 8; see `08-cyrup-session-svc-and-modes.md`).
+
 > **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 7 medium, 9 low = 16**, plus the four `tracker` rows. 14 rows are now marked CLOSED, including the area's only high.
 
 | ID | Severity | Kind | Effort | Dedup | Title |

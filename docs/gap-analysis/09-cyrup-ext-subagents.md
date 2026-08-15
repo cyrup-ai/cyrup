@@ -218,7 +218,11 @@ Newly filed: **24**. Refuted and recorded: **1**.
 
 ## Open items
 
-> **RECOUNTED 2026-08-14 (sweeps 3-6 reconciliation) — counted set: 0 critical, 0 high, 10 medium, 10 low = 20** (`SUBA-005` remains under `## Trackers` and is not counted). 28 rows are now marked CLOSED, including all five of the area's highs. **Sweep 6 closed six as REFUTED — every one was already closed at HEAD by a sweep between 3 and 5** (`SUBA-046`, `SUBA-028`, `SUBA-031`, `SUBA-039`, `SUBA-045`, `SUBA-060`) — and discharged two recorded blockers (`SUBA-021`'s spawn-budget third, `SUBA-030`'s `cli.rs` prerequisite). *(Previous edition: 0 / 0 / 14 / 12 = 26, 22 closed.)*
+> **RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set: 0 critical, 0 high, 8 medium, 9 low = 17** (`SUBA-005` remains under `## Trackers` and is not counted). The table carries **48 rows: 31 fully closed, 17 open (2 partially)**. Sweep 8 closed three: **`SUBA-008`** — the whole turn-budget subsystem, the top-ranked remaining medium, landed end to end; **`SUBA-030`** and **`SUBA-035`** as already-done, both of which had been *partially* closed for an edition with residuals that were in fact already in (and `SUBA-035`'s residual named the wrong file). Four rows were re-confirmed as **decisions rather than work** — `SUBA-025` (second decline), `SUBA-054`'s async half, plus `PERM-032`-style blockers routed elsewhere. *(Previous edition: 0 / 0 / 10 / 10 = 20, 30 closed.)*
+>
+> **THE AREA'S REMAINING SET IS GENUINELY LARGE AND IN-AREA, and it partitions cleanly — record this so sweep 9 does not re-derive it.** `SUBA-016` (`scheduledRuns` + nine `schedule.*` verbs; **L**, and the gate is free — `AuthorityAction::ScheduleCreate` is already pre-wired by `SUBA-064`); `SUBA-021` (`capability-ceiling` + `usage-budget`; **L** — **the spawn-budget third is already closed with `SUBA-046`, so any plan quoting "all three" is stale**); and the guide/replay/dismiss trio `SUBA-055`+`SUBA-056`+`SUBA-057` (**M/L/M** — but `SUBA-055`'s guide action additionally requires AUTHORING a `resources/docs/` set, the same invention hazard as `SUBA-025`, so it needs the same sign-off, and **`SUBA-066` is its last mile, not an independent item**).
+
+> **SUPERSEDED — RECOUNTED 2026-08-14 (sweeps 3-6 reconciliation) — counted set: 0 critical, 0 high, 10 medium, 10 low = 20** (`SUBA-005` remains under `## Trackers` and is not counted). 28 rows are now marked CLOSED, including all five of the area's highs. **Sweep 6 closed six as REFUTED — every one was already closed at HEAD by a sweep between 3 and 5** (`SUBA-046`, `SUBA-028`, `SUBA-031`, `SUBA-039`, `SUBA-045`, `SUBA-060`) — and discharged two recorded blockers (`SUBA-021`'s spawn-budget third, `SUBA-030`'s `cli.rs` prerequisite). *(Previous edition: 0 / 0 / 14 / 12 = 26, 22 closed.)*
 >
 > **ONE OPEN ROW NEEDS A DECISION, NOT AN AGENT — `SUBA-025`.** Its Fix (port `toolDescriptionMode`, the 50 KiB file override and `withMandatorySafetyGuidance`) is mechanically portable, but **two of the three constants it selects between are not**: pi v0.43.0's FULL/COMPACT/SAFETY texts are written around `workflowScript`, which cyrup deliberately does not implement and documents as such (`extension.rs:5701-5716`), while cyrup's `SUBAGENT_TOOL_DESCRIPTION` is the v0.34.0-era SINGLE/CHAIN/PARALLEL text and correctly describes what cyrup can do. Landing the mechanism therefore requires **AUTHORING cyrup-specific compact and safety-guidance blocks — inventing model-facing text**, which is the class this directory blames for 29 of sweep 1's 32 fallout failures. Sweep 6 declined rather than invent it silently. It needs either owner sign-off on cyrup-original constants under a `CYRUP-DELTA`, or a decision to port `workflowScript` first.
 
@@ -226,12 +230,12 @@ Newly filed: **24**. Refuted and recorded: **1**.
 |---|---|---|---|---|
 | ~~SUBA-014~~ | ~~**high**~~ **CLOSED 2026-08-14** | not-ported | S | `requireReadTool` unported — a skill-carrying agent can be told to `read` a skill it has no `read` tool for — **CLOSED 2026-08-14**: sweep 1 — the seam is now `exec::build_attempt_spawn_plan_with_read_requirement`; the 7-arg `build_attempt_spawn_plan` survives as pi's `requireReadTool: undefined` form so no external caller broke. |
 | ~~SUBA-043~~ | ~~**high**~~ **CLOSED 2026-08-14** | not-ported | S | SINGLE-mode `outputSchema` is unadvertised and hardcoded `None` on both single paths — **CLOSED 2026-08-14**: sweep 1 — the schema/dispatch guard the Verify asked for already existed (`every_advertised_schema_property_is_read_outside_provided_keys`) and now covers `outputSchema` and `toolBudget` automatically — narrows blind spot 6. |
-| SUBA-008 | medium | not-ported | M | `turnBudget` unported; the only consumers read a hard-coded `false` — **2026-08-14, still open**: sweep 6 re-verified zero hits and rates it **the cheapest remaining medium in this area**: the three consumers already exist and are commented as having no source (`tui/intercom.rs:348-352`, `exec/fallback.rs`, `exec/mod.rs:2354-2360`), so this is WIRING plus a schema key, not a port. Duplicate of PARITY-GAPS PB-10. |
+| ~~SUBA-008~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | **M/L** *(re-rated from M — see the body; sweep 6's "cheapest remaining medium … WIRING plus a schema key, not a port" is measurably wrong)* | `turnBudget` unported; the only consumers read a hard-coded `false` — **CLOSED 2026-08-14 (sweep 8): the whole assistant-TURN-budget subsystem ported end to end**, ~888 lines of new module (`crates/cyrup-ext-subagents/src/exec/turn_budget.rs`, verified at HEAD) plus a new drive-loop arm, a signal ladder, three new `SingleResult` fields, a frontmatter field, a serializer arm and a config key. **14 new tests, incl. two `cyrup-it` end-to-end tests against real OS subprocesses.** Closes PARITY-GAPS PB-10. **FOUR ERRORS IN THIS ROW'S OWN BODY ARE CORRECTED THERE — read them before reading the body as history; one of them would have shipped a non-functioning feature.** |
 | SUBA-016 | medium | not-ported | L | `scheduledRuns` unported (+ **nine** `schedule.*` verbs, not four) |
 | SUBA-021 | medium | not-ported | L | `capability-ceiling` / `usage-budget` unported — both are **in-baseline** — **RESTATED 2026-08-14**: sweep 6 — **the `spawn-budget.ts` third is CLOSED with `SUBA-046`** (`exec/spawn_budget.rs`, the `grant-spawn-budget` verb, and the live `AuthorityAction::SpawnBudgetGrant` consult). What remains is the capability-ceiling half and the usage-budget half only; the title and any plan quoting "all three" is stale. |
-| SUBA-025 | medium | not-ported | S | `toolDescriptionMode`, the file override, and the mandatory safety-guidance appender unported |
+| SUBA-025 | medium | not-ported | S | `toolDescriptionMode`, the file override, and the mandatory safety-guidance appender unported — **NOT TAKEN by a SECOND sweep (2026-08-14, sweep 8), for the same reason, and this is a routing statement rather than a status change. DO NOT HAND THIS TO AN AGENT AS ORDINARY WORK — it will either invent the constants silently or stall.** The MECHANISM (`toolDescriptionMode`, the 50 KiB file override, `withMandatorySafetyGuidance`) is portable. **Two of the three constants it selects between are not:** upstream's FULL/COMPACT/SAFETY texts (`pi-subagents/src/extension/tool-description.ts` @v0.43.0) are written around `workflowScript`, which **cyrup deliberately does not implement** and documents at `extension.rs:5701-5716`. Landing this requires **AUTHORING cyrup-specific compact and safety-guidance blocks — inventing model-facing text**, the class this directory blames for 29 of sweep 1's 32 fallout failures. **NEEDS: owner sign-off on cyrup-original constants under a `CYRUP-DELTA`, or a decision to port `workflowScript` first.** |
 | ~~SUBA-028~~ | ~~medium~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug | S | Acceptance verification cannot be aborted — **REFUTED, CLOSED 2026-08-14**: sweep 6 — closed at HEAD. **The sweep-2 decline paragraph that stood here is deleted: the 40+ call sites of churn it was based on were AVOIDED, not paid.** `exec/acceptance.rs` now has BOTH `evaluate_acceptance` (`:1366`, the unchanged 7-arg entry) and `evaluate_acceptance_with_cancel` (`:1416`), so the cancellation seam exists without breaking the entry shape. vs pi-subagents v0.43.0 `runs/shared/acceptance.ts:1073`, `:1181-1182`, `:1290`, `:1295`. |
-| SUBA-030 | medium — **PARTIALLY CLOSED 2026-08-14** | parity-bug | S | Persona inline on argv; task spill written with the default umask under a doc asserting 0600 — **PARTIALLY CLOSED 2026-08-14**: sweeps 1 + 2 closed the task-spill 0600 half. **PREREQUISITE DISCHARGED 2026-08-14 (sweep 6): the row's hard blocker — "`crates/cyrup/src/cli.rs` must accept a path form for `--system-prompt` before an over-threshold persona can be spilled to a file" — is DONE.** `cli.rs`'s module doc at `:8` states it reads the `--system-prompt`/`--append-system-prompt` token to decide path-vs-literal, with `resolve_prompt_input` at `:419`/`:451`. **The persona/E2BIG residual is now ordinary in-crate work for area 09, not a cross-area dependency.** |
+| ~~SUBA-030~~ | ~~medium~~ **CLOSED 2026-08-14 — already-done** | parity-bug | S | Persona inline on argv; task spill written with the default umask under a doc asserting 0600 — **CLOSED 2026-08-14**: sweep 8 read the crate at HEAD and found the persona/E2BIG residual — the half sweep 6 called "now ordinary in-crate work" — **already closed**. `spawn/mod.rs:262-289` `ChildSpawnSpec::resolve_system_prompt_arg` writes the composed persona to a `0600` `<stem>.md` in the run scratch dir via `write_private`, with `sanitize_prompt_file_stem` reproducing upstream's `[\w.-]`→`_` rule (pi `runs/shared/pi-args.ts:570-585` @v0.43.0 — note upstream spills **unconditionally**, unlike the task spill at `:588`, so this is the literal mechanism and not a large-persona fallback). **And it is CALLED:** `exec/mod.rs:1802` pushes the flag and the PATH as two argv elements, with an in-source block at `:1783-1801` naming **both** halves the item filed — the `/proc/<pid>/cmdline` disclosure and the `MAX_ARG_STRLEN`/`E2BIG` spawn failure. The 0600 task spill closed earlier and is pinned by `spawn/mod.rs:1197`. **Superseded partial-closure text follows.** — ~~**PARTIALLY CLOSED 2026-08-14**~~: sweeps 1 + 2 closed the task-spill 0600 half. **PREREQUISITE DISCHARGED 2026-08-14 (sweep 6): the row's hard blocker — "`crates/cyrup/src/cli.rs` must accept a path form for `--system-prompt` before an over-threshold persona can be spilled to a file" — is DONE.** `cli.rs`'s module doc at `:8` states it reads the `--system-prompt`/`--append-system-prompt` token to decide path-vs-literal, with `resolve_prompt_input` at `:419`/`:451`. **The persona/E2BIG residual is now ordinary in-crate work for area 09, not a cross-area dependency.** |
 | ~~SUBA-031~~ | ~~medium~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug | M | `wait` scopes runs by cwd, not by session, and says "in this session" — **REFUTED, CLOSED 2026-08-14**: sweep 6 — closed at HEAD. `background/wait.rs:42-55` no longer states the delta; it carries a `# Scoping (SUBA-031)` section recording that the session filter landed via `WaitDeps::session_id` as the INNER partition under the cwd-derived `async_root`, and explicitly records that **this is what makes the "in this session" empty-set string true** — the exact contradiction the item was filed on. The in-tree delta comment the item quotes verbatim no longer exists. vs pi-subagents v0.43.0 `subagent-wait.ts:265` (`sessionId: deps.state.currentSessionId ?? undefined`). |
 | ~~SUBA-032~~ | ~~medium~~ **CLOSED 2026-08-14** | test-defect | S | Notice-debounce test asserts a wall-clock outcome with ~15 ms margin — **CLOSED 2026-08-14**: sweep 1 — `tokio` gained a `test-util` dev-feature in this crate's Cargo.toml, so `start_paused`/`advance` are available to any other wall-clock-marginal test here. |
 | ~~SUBA-044~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | Bundled `reviewer` agent still grants `bash`/`edit`/`write`; upstream made the lane read-only — **CLOSED 2026-08-14**: sweep 1 — including the second correction (the delegate/worker strict-allowlist paragraph, in-baseline at v0.43.0). All six bundled agents now diff clean against v0.47.1 except researcher.md, whose divergence carries a `[CYRUP-DELTA]` header per SUBA-062. |
@@ -244,7 +248,7 @@ Newly filed: **24**. Refuted and recorded: **1**.
 | ~~SUBA-051~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | Async **child** runs have no default wall-clock timeout; upstream bounds them at 30 minutes — **CLOSED 2026-08-14**: sweep 1. |
 | ~~SUBA-052~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | YAML literal block scalars (`\|`, `\|-`) parse to the literal string `"\|"` — **CLOSED 2026-08-14**: sweep 1 — the parser half. The second sentence (route `parseSkillDescription` through the shared parser, as `a4fc59a` did) is NOT done and is cross-crate: skill descriptions come from `cyrup_resources::Skill.front.description`, not from this crate's parser. Filed against the resources area. |
 | ~~SUBA-053~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | `~` never expanded in chain read/write paths — **CLOSED 2026-08-14**: sweep 1. |
-| SUBA-054 | medium — **PARTIALLY CLOSED 2026-08-14** | upstream-drift | M | `defaultReads` never reaches a single run — no `[Read from: …]` outside chains — **PARTIALLY CLOSED 2026-08-14**: sweep 2 — the FOREGROUND SINGLE half is closed, which is the item's headline and its whole Verify recipe: `RunOptions::reads` (the declared, unfiltered list, pi's `reads` binding) populated from `agent.default_reads`, and `build_task_text` prepending `[Read from: …]\n\n` through two new shared helpers in `spawn/chain_graph.rs` (`resolve_existing_read_paths`, `build_single_reads_instruction`); `build_chain_instructions` was refactored onto the same helper so the two paths cannot drift. The separator difference is deliberate and both forms are upstream's. **FIX LINE CORRECTED: "add the `reads` param on the async path" — upstream has NO top-level `reads` param.** `extension/schemas.ts`'s `SubagentParamProperties` has no such key and the three `reads` entries at :144/:174/:204 are all per-ITEM, so `defaultReads` is the entire SINGLE precedence chain and no new advertised param is owed. **RESIDUAL, and the blocker is written into `background/runner_main.rs` at the field rather than silently defaulted: the ASYNC half needs a decision — a runner step already gets its read line from `build_chain_instructions` resolved against the CHAIN dir, while upstream's async single resolves against `effectiveCwd`, so setting `RunOptions::reads` there would double-emit.** The SUBA-044 interaction is moot — reviewer.md no longer carries `defaultReads`. |
+| SUBA-054 | medium — **PARTIALLY CLOSED 2026-08-14** | upstream-drift | M | `defaultReads` never reaches a single run — no `[Read from: …]` outside chains — **PARTIALLY CLOSED 2026-08-14**: sweep 2 — the FOREGROUND SINGLE half is closed, which is the item's headline and its whole Verify recipe: `RunOptions::reads` (the declared, unfiltered list, pi's `reads` binding) populated from `agent.default_reads`, and `build_task_text` prepending `[Read from: …]\n\n` through two new shared helpers in `spawn/chain_graph.rs` (`resolve_existing_read_paths`, `build_single_reads_instruction`); `build_chain_instructions` was refactored onto the same helper so the two paths cannot drift. The separator difference is deliberate and both forms are upstream's. **FIX LINE CORRECTED: "add the `reads` param on the async path" — upstream has NO top-level `reads` param.** `extension/schemas.ts`'s `SubagentParamProperties` has no such key and the three `reads` entries at :144/:174/:204 are all per-ITEM, so `defaultReads` is the entire SINGLE precedence chain and no new advertised param is owed. **RESIDUAL, and the blocker is written into `background/runner_main.rs` at the field rather than silently defaulted: the ASYNC half needs a decision — a runner step already gets its read line from `build_chain_instructions` resolved against the CHAIN dir, while upstream's async single resolves against `effectiveCwd`, so setting `RunOptions::reads` there would double-emit.** **RE-CONFIRMED UNCHANGED 2026-08-14 (sweep 8): this needs a DECISION on which cwd an async single step's read instruction resolves against — closing it means teaching the step builder which of the two cwds applies. It is not agent work as filed** (`pi-subagents/src/runs/background/async-execution.ts:1300-1302` @v0.43.0). The SUBA-044 interaction is moot — reviewer.md no longer carries `defaultReads`. |
 | SUBA-055 | medium | upstream-drift | M | The `guide` action and its packaged version-matched docs unported |
 | SUBA-056 | medium | upstream-drift | L | Durable completion replay and output archives unported |
 | SUBA-057 | medium | upstream-drift | M | `dismiss` unported — a recovered workflow with no live controller is stuck "running" forever |
@@ -257,7 +261,7 @@ Newly filed: **24**. Refuted and recorded: **1**.
 | ~~SUBA-029~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | Management actions read-modify-write subagents `settings.json` unlocked — **CLOSED 2026-08-14**: sweep 1. |
 | ~~SUBA-033~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | Tests assert a lower bound on observed concurrency — **CLOSED 2026-08-14**: sweep 1 — both lower bounds removed; overlap is enforced by a `tokio::sync::Barrier` rendezvous inside the worker with a bounded wait, so a serialization regression fails loudly instead of hanging. |
 | SUBA-034 | low | not-ported | M | `wait`'s event-bus wake unported; pure polling at a 1 s floor |
-| SUBA-035 | low — **PARTIALLY CLOSED 2026-08-14** | not-ported | S | Active `subagents.modelScope` policy not surfaced by doctor/models — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the doctor half is closed. **RESIDUAL: the same line in the models-report header (`registration/mod.rs` / `profiles.rs`), a separate surface.** |
+| ~~SUBA-035~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED / already-done, and its residual's stated LOCATION was wrong too** | not-ported | S | Active `subagents.modelScope` policy not surfaced by doctor/models — **CLOSED 2026-08-14**: sweep 8. **Both halves are in at HEAD.** Doctor: `registration/doctor.rs:646-676` `model_scope_check` (four arms), called at `:603`, tests at `:1609`-`:1642`. Models report: `crates/cyrup-ext-subagents/src/extension.rs` — the single-agent view (~`:3565-3572`) and the all-agents view (~`:3579-3585`) each push a `Model scope:` line built by `crate::exec::model_scope::model_scope_summary_line`, and each **cites SUBA-035 by name in-source**. **CORRECTION THAT MUST SURVIVE THE CLOSURE: the residual's stated location — `registration/mod.rs` / `profiles.rs` — is wrong.** The models report is `extension.rs::run_models_report`, so anybody following this row would have hunted in two files that never carried the surface. Port target `pi-subagents/src/runs/shared/model-scope.ts` @v0.43.0. |
 | ~~SUBA-037~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | Doctor's `--version` probe leaks the probe process on timeout — **CLOSED 2026-08-14**: sweep 1 — no test was added and the reason is recorded: `VERSION_PROBE_TIMEOUT` is not injectable and the flag's effect is a tokio guarantee. |
 | ~~SUBA-038~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Three denial/unknown-action messages still diverge from pi's text — **CLOSED 2026-08-14**: sweep 1 — residual 2 was closed by porting the v0.47.1 message (SUBA-065) rather than the v0.43.0 text, since the two items rewrite the same three strings and the richer form supersedes the bare one. |
 | ~~SUBA-039~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED** | cyrup-original | M | `SpawnedChild` has no `Drop` guard, so a dropped drive future orphans a group — **REFUTED, CLOSED 2026-08-14**: sweep 6 — closed at HEAD. `spawn/mod.rs:849` is `impl Drop for SpawnedChild`, and `:394` documents the `Option` field that exists specifically to make that `Drop` work. **This is the JS→Rust guarantee-gap class (a dropped future orphaning a detached process group), which is why sweep 6 checked it first among the lows.** No upstream counterpart — pi's async functions always settle. |
@@ -323,7 +327,101 @@ other items own. A planner should not pick one up; the next audit pass maintains
 **Fix** — This item is the ledger, not the work: each subsystem absorbs its own dispatch half (enum entry at `extension.rs:6557`, arm in `route_management_action`/`route_control_action`, and the completeness assertion). What is owed *here* is (a) owners for the seven still-unowned verbs, and (b) restoring a completeness assertion that pins the enum against a checked-in copy of upstream's array so the count cannot silently drift again.
 **Verify** — The completeness assertion holds the same name vector as `shared/types.ts` at the pinned tag, and every advertised verb dispatches to something other than the unknown-action arm.
 
-## SUBA-008 — `turnBudget` unported; the only consumers read a hard-coded `false`
+## SUBA-008 — `turnBudget` unported; the only consumers read a hard-coded `false` — **CLOSED 2026-08-14**
+
+> **CLOSED 2026-08-14 (sweep 8). FOUR ERRORS IN THE BODY BELOW ARE CORRECTED HERE FIRST, because
+> following one of them would have shipped a budget that nothing enforced.**
+>
+> **(1) The `Fix` line's mechanism is WRONG, and it is the most valuable finding on this row.** It
+> says *"Port as `exec/turn_budget.rs` mirroring `exec/tool_budget.rs`'s env-handoff shape"*. The tool
+> budget is env-var plus **child-side refusal** (`tool-budget.ts:70-80`, `PI_SUBAGENT_TOOL_BUDGET`).
+> **The turn budget is the OPPOSITE shape.** `git grep -n TURN_BUDGET v0.43.0 -- src/` matches **only
+> `runs/shared/turn-budget.ts` itself** — there is no env var and no child-side enforcement. The child
+> is only **told**, via a system-prompt block; the **SUPERVISOR** enforces, by counting assistant
+> `message_end` events off the child's NDJSON stdout and signalling it down
+> (`foreground/execution.ts:910-924`, `:733-757`). A faithful-*looking* env-shaped port would have
+> advertised a budget nobody enforced.
+>
+> **(2) The `Verify` line's key is WRONG.** It says `turnBudget:{hard:2}`. **`hard` is the TOOL
+> budget's key.** The turn budget takes `{maxTurns, graceTurns}` (`extension/schemas.ts:104-107`
+> @v0.43.0), and upstream **rejects `hard` by name** — `turnBudget.hard is not supported.`
+>
+> **(3) The effort rating was WRONG, and sweep 6's recount doubled down on it** ("the cheapest
+> remaining medium in this area … WIRING plus a schema key, not a port"). Measurably false: **cyrup's
+> `Usage` carries no `turns` counter at all** — `exec/fallback.rs:919` says so in its own doc — so
+> there was no turn count to wire. **Re-rated M/L.**
+>
+> **(4) The "three consumers reading a hard-coded `false`" count was WRONG, and the miscount hid a
+> quieter failure.** Only **two** were reachable (`tui/intercom.rs:355`, `:448`).
+> `exec/fallback.rs:915` was **already reading the field correctly** and merely had no producer —
+> which means `is_retryable_subagent_startup_failure` would have **RELAUNCHED the very model that
+> blew its turn budget**. A correct consumer starved of a value is a different and quieter defect
+> than a consumer reading a constant.
+>
+> **WHAT LANDED.** New `crates/cyrup-ext-subagents/src/exec/turn_budget.rs` (888 lines, verified at
+> HEAD) plus its wiring. **Module:** `resolve_turn_budget_config` (upstream's verbatim error strings,
+> its first-unknown-key scan, its `?? DEFAULT_TURN_BUDGET_GRACE_TURNS`, and `Number.isInteger(2.0)
+> === true` so a fractionless float is accepted as upstream accepts it),
+> `append_turn_budget_system_prompt`, `turn_budget_soft_note` / `_exceeded_message` /
+> `_deferred_note`, `format_turn_budget_output`, `prepend_turn_budget_note`,
+> `initial_turn_budget_state` / `turn_budget_state` / `turn_budget_deferred_state`,
+> `turn_budget_decision`, and a `TurnBudgetTracker` gathering pi's four `updateTurnBudget` locals.
+> **Enforcement (`exec/mod.rs`):** `drive_attempt` counts assistant `message_end` events
+> (`progress.turn_count()` is this port's `result.usage.turns`), computes pi's
+> `terminalAssistantStop || terminalStructuredOutputCall` and `hasToolCall ||
+> Boolean(progress.currentTool)`, raises the one-time soft note into `progress.recent_output`, and on
+> abort walks `SpawnedChild::terminate_with_graces`. **Composition:** the budget block is appended
+> LAST onto the system prompt, after persona→skills→memory→refinement→output-path, matching
+> `execution.ts:326` reading `shared.systemPrompt` from `:1443`. The abort message is the run's error
+> at the TOP of the diagnosis chain (upstream sets `result.error` at abort time and its close handler
+> only fills an unset one, `:1099`). The terminal output fold is pi's `else if` chain off `if
+> (result.timedOut)`. **Surface:** `turnBudget` tool param + `TurnBudgetOverride` schema (in
+> upstream's own property slot, immediately above `toolBudget`), `turnBudget:` agent frontmatter →
+> `AgentDefinition::default_turn_budget` (+ `KNOWN_FIELDS` + a `serialize_agent` arm, so a management
+> rewrite cannot silently delete an author's budget), and the `subagents.turnBudget` config key,
+> resolving caller > frontmatter > config at one point per path (`subagent-executor.ts:4928` after
+> `applySingleAgentLaunchDefaults`). **Result shape:** `SingleResult` gained `turn_budget` /
+> `turn_budget_exceeded` / `wrap_up_requested`, all `skip_serializing_if`, so pre-existing
+> `status.json` round-trips byte-for-byte.
+>
+> **`[CYRUP-DELTA]`, recorded at the call site rather than silently matching the observable
+> outcome.** pi ARMS two `setTimeout`s inside `requestTurnBudgetAbort` and **keeps reading the
+> child's stdout during the window**, so a child that wraps up inside it still delivers output.
+> cyrup's `SpawnedChild::terminate` **CONSUMES** the child — there is no seam that signals without
+> taking it — so the ladder blocks the drive loop for the same wall-clock window instead. A late final
+> message written after the SIGINT is **dropped here where upstream would have read it**, which is why
+> the abort message doubles as `final_output`. **The graces are pinned to reproduce upstream's
+> ABSOLUTE instants: SIGINT, SIGTERM at +1 s, SIGKILL at +4 s** — pi arms both timers from the same
+> moment, so the real SIGTERM→SIGKILL gap is **3 s, not 4 s**. Reading `execution.ts:752` alone gives
+> the wrong number.
+>
+> **VERIFY — 14 new tests, all green.** `exec::turn_budget::tests` (10): the resolver's defaults and
+> every verbatim rejection message; the system-prompt block's exact text with both pluralisations;
+> the decision table including that a TERMINAL assistant stop is never aborted however far past the
+> hard limit; the tracker's within-budget→wrap-up→abort walk asserting the soft note fires exactly
+> ONCE and that `wrapUpRequestedAtTurn` (the THRESHOLD) differs from `exceededAtTurn` (the OBSERVED
+> turn); a repeated deferral keeping the FIRST deferral turn; an unarmed tracker being wholly inert;
+> the timed-out guard; and the wire shape omitting unset turn fields.
+> `exec::tests::the_turn_budget_notice_reaches_the_child_through_the_spilled_system_prompt_file`
+> reads back the SPILLED prompt file — **not the argv, which `SUBA-030` moved the persona off, so an
+> argv assertion would have passed vacuously** — and asserts absence before presence.
+> `extension::tests`: the schema shape incl. `graceTurns.minimum == 0` and upstream's verbatim
+> description, plus the refusal path asserting `turnBudget.hard is not supported.`
+> `discovery::management::tests::serialize_agent_round_trips_the_turn_budget_launch_default` pins the
+> `KNOWN_FIELDS`/serializer pair against silent deletion. **cyrup-it (2, real OS subprocesses):**
+> `a_turn_budget_wraps_up_at_max_turns_and_aborts_the_child_after_the_grace_turn` scripts a child that
+> emits four NON-terminal turns then sleeps 30 s, and asserts the run ends on turn 3 with upstream's
+> exact error string, `exceededAtTurn: 3` / `wrapUpRequestedAtTurn: 2`, the partial output preserved
+> under upstream's heading, and that the post-sleep turn was NEVER observed;
+> `a_child_that_finishes_inside_its_turn_budget_is_untouched` is the adversarial twin — the SAME
+> budget must be completely inert for a child that stops on its own, which an always-abort bug fails.
+>
+> **ONE VERIFY NOT PERFORMED, stated rather than smoothed.** The abort is proven against a real OS
+> subprocess, but **the soft-note text was never observed rendering in a live TUI.** Per this
+> directory's standing rule that a UI surface is not done until it has been RUN, the
+> `progress.recent_output` wrap-up note is **mechanism-verified, not eye-verified.**
+>
+> **Everything below is the filing text, retained for provenance and wrong on the four points above.**
 
 **Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
 **cyrup** — `turn_budget` appears in exactly three files, all as consumers of a value with no source: `tui/intercom.rs:348-352` and `exec/mod.rs:2354-2360` (both with in-tree comments saying the flag has no producer) and `exec/fallback.rs`. No `turnBudget` key among the 45 properties at `extension.rs:6543-6690`.
@@ -369,7 +467,14 @@ other items own. A planner should not pick one up; the next audit pass maintains
 **Fix** — Thread `CancelToken` from the `exec/mod.rs` caller into `evaluate_acceptance` → `run_verify_commands_memoized` → `model::run_memoized_verify_command`, check it before each command in the loop, and `select!` it against the per-command wait alongside the existing timeout. Add the field to `model::EvaluateAcceptanceInput` so both entry shapes carry it.
 **Verify** — Start a run whose verify command sleeps 60 s, cancel after 1 s; `evaluate_acceptance` must return within ~1 s and the child must be gone.
 
-## SUBA-030 — Persona passed inline on argv; task spill written with the default umask under a doc asserting 0600
+## SUBA-030 — Persona passed inline on argv; task spill written with the default umask under a doc asserting 0600 — **CLOSED 2026-08-14 (already-done)**
+
+> **CLOSED 2026-08-14 (sweep 8) as already-done — see the table row for the evidence. Everything
+> below is the filing text.** Both halves are in at HEAD: `spawn/mod.rs:262-289` spills the composed
+> persona to a `0600` `<stem>.md`, and `exec/mod.rs:1802` calls it, pushing the flag and the PATH as
+> two argv elements with an in-source block at `:1783-1801` naming the `/proc/<pid>/cmdline`
+> disclosure half and the `MAX_ARG_STRLEN`/E2BIG availability half by name.
+
 
 **Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed (E2BIG half reasoned, not observed)
 **cyrup** — Both halves confirmed at HEAD. **Persona:** `crates/cyrup-ext-subagents/src/exec/mod.rs:1597-1608` pushes `format!("{flag}={persona_body}")` as one argv element with no size check; the in-tree comment explains that the `=`-form is required by clap and says nothing about length. **Task spill:** `crates/cyrup-ext-subagents/src/spawn/mod.rs:248-260` — `resolve_task_arg` is a plain `std::fs::write(&path, task)` with the default umask, while `spawn/mod.rs:428`'s own doc calls these *"the 0600 task/system-prompt temp files"*. The code's documentation asserts a mode the code never sets; that internal contradiction is the strongest evidence in this item.
@@ -608,7 +713,14 @@ other items own. A planner should not pick one up; the next audit pass maintains
 **Fix** — Have `CompletionWatcher` (`background/watch.rs`) publish terminal transitions on a broadcast channel the wait loop `select!`s against, keeping the poll as reconciliation. Same seam as SUBA-017 and SUBA-056.
 **Verify** — A run that completes 50 ms into a wait must return in ~50 ms, not ~1 s.
 
-## SUBA-035 — Active `subagents.modelScope` policy not surfaced by doctor/models
+## SUBA-035 — Active `subagents.modelScope` policy not surfaced by doctor/models — **CLOSED 2026-08-14 (REFUTED / already-done)**
+
+> **CLOSED 2026-08-14 (sweep 8). Everything below is the filing text.** Doctor half:
+> `registration/doctor.rs:646-676` `model_scope_check`, called at `:603`, tests `:1609`-`:1642`.
+> Models-report half: `extension.rs::run_models_report`, both views, each citing SUBA-035 in-source.
+> **The residual's stated location (`registration/mod.rs` / `profiles.rs`) was wrong** — that
+> correction is the part of this row worth keeping.
+
 
 **Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
 **cyrup** — `rg 'model_scope|modelScope' crates/cyrup-ext-subagents/src/registration/doctor.rs` returns nothing across all 1803 lines; the models report reads only the current model. Enforcement itself is live (`exec/model_scope.rs:170-188`).
